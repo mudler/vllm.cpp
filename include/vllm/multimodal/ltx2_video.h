@@ -420,6 +420,45 @@ inline constexpr char kLtx2RetakeFrameRateExtra[] = "retake_frame_rate";
 inline constexpr char kLtx2RegenerateVideoExtra[] = "regenerate_video";
 inline constexpr char kLtx2RegenerateAudioExtra[] = "regenerate_audio";
 
+// ── TEXT-TO-AUDIO. Row LTX25-T2A-ONE-STAGE (#1005) ─────────────────────────
+//
+// These are read ONLY on a `pipeline_kind = t2a_one_stage` engine — that is a
+// LOAD extra, so which pipeline runs is fixed before a request arrives. Supplied
+// on any other pipeline they are REFUSED, because upstream's other entry points
+// have no counterpart for them and a knob that silently does nothing is the
+// defect this whole surface refuses by name elsewhere.
+//
+// `--negative-prompt` (ltx-pipelines utils/args.py:1083-1088). ABSENT MEANS the
+// recipe's own default, which is upstream's `DEFAULT_NEGATIVE_PROMPT`
+// (utils/constants.py:186) on the 2.4/2.5 rows.
+//
+// IT IS NOT COSMETIC ON THIS PIPELINE. T2A's CFG scale defaults to 7.0, so the
+// negative conditioning is one of the two tensors the guidance delta is computed
+// from (`(cfg_scale - 1) * (cond - uncond_text)`, guiders.py:262). An empty one
+// is refused rather than substituted with zeros: a zero `uncond_text` turns the
+// delta into `cfg_scale * cond`, which is a DIFFERENT render and not a missing
+// one.
+inline constexpr char kLtx2NegativePromptExtra[] = "negative_prompt";
+
+// The audio guider, one CLI flag each (utils/args.py:1089-1119). ABSENT MEANS the
+// params table's own value for the checkpoint's generation — 7.0 / 1.0 / 0.7 and
+// block 28 on the 2.3-and-later lineage (utils/constants.py:58-66, :82-87).
+//
+// `audio_stg_blocks` is a COMMA-SEPARATED list, mirroring `nargs="*"`. An EMPTY
+// value is upstream's empty list and means "perturb nothing" — which is refused
+// alongside a non-zero STG scale rather than silently running a perturbed pass
+// identical to the conditional one. Upstream's `blocks is None` ("every block",
+// guidance/perturbations.py:19-33) has no CLI spelling and none is invented here.
+//
+// There is deliberately NO `modality_scale` knob: the CLI pins it to 1.0 for this
+// pipeline and states the reason (t2a_one_stage.py:200-202), so exposing it would
+// offer a fourth forward over a modality that does not exist.
+inline constexpr char kLtx2AudioCfgScaleExtra[] = "audio_cfg_guidance_scale";
+inline constexpr char kLtx2AudioStgScaleExtra[] = "audio_stg_guidance_scale";
+inline constexpr char kLtx2AudioRescaleScaleExtra[] = "audio_rescale_scale";
+inline constexpr char kLtx2AudioSkipStepExtra[] = "audio_skip_step";
+inline constexpr char kLtx2AudioStgBlocksExtra[] = "audio_stg_blocks";
+
 // WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
 //
 // Every field is read off the exact f32 buffers `Ltx2ModalityInput::context`
@@ -660,6 +699,80 @@ struct Ltx2ConditioningTrace {
   uint64_t retake_latent_digest = 0;
   double retake_latent_absmax = 0.0;
 
+  // ── TEXT-TO-AUDIO: what the audio-only render actually ran (#1005) ────────
+  //
+  // Zero and false everywhere on a pipeline that is not `t2a_one_stage`.
+  //
+  // `t2a_video_stream_present` is the one that cannot be inferred from anything
+  // else here, and it is the field this block exists for. Upstream's own
+  // predicate is `run_v2a = run_ax and (video is not None and vx.numel() > 0)`
+  // (transformer.py:269): it tests PRESENCE, not `enabled`. So a build that
+  // handed the forward a present-but-DISABLED video stream would still feed
+  // video->audio cross attention from a latent T2A never meant to exist — and
+  // would return a waveform of exactly the right length, the right channel count
+  // and the right sample rate. There is no sample to compare and no digest of
+  // the output that says which happened.
+  //
+  // The three forward counters are incremented AT THE FORWARD, not derived from
+  // the guider parameters that were supposed to drive them. A field written off
+  // `cfg_scale` would report a healthy uncond count on a build that resolved the
+  // params and then ran one forward, which is the instrument failure
+  // `audio_sigma_max` above already paid for on this campaign.
+  //
+  // `t2a_perturbed_blocks` is read off the mask handed to the DiT rather than
+  // off the request's `stg_blocks`: a count alone cannot tell "perturbed block
+  // 1" from "perturbed block 0", and which block is perturbed is the whole of
+  // STG.
+  //
+  // The `t2a_first_*` block is everything step 0 produced, and it is the only
+  // observable that separates upstream's x0-space guidance combination from a
+  // velocity-space one (#1039). Every other field here — the forward counts,
+  // the perturbed blocks, the latent absmax, the waveform's length, channel
+  // count and sample rate — is identical between the two forms, and on a
+  // reduced fixture so is the rendered audio, because the guidance deltas are
+  // ~1e-5 of the prediction and the rescale factor lands within 1e-5 of 1.0 in
+  // BOTH spaces. What is not identical, and is not a matter of degree, is which
+  // tensor the guider was handed:
+  //
+  //     t2a_first_cond == t2a_first_latent - sigma * t2a_first_velocity
+  //
+  // holds in x0 space (`X0Model.forward`, ltx-core model/transformer/
+  // model.py:590-604) and fails in velocity space.
+  //
+  // ONE (velocity, x0) PAIR PER ARM. The default T2A guider runs THREE forwards
+  // per step, and the equation above decides only the pass it names. A build
+  // that converts the conditional pass and leaves the UNCONDITIONAL or the
+  // PERTURBED one in velocity space renders a different waveform with a healthy
+  // forward count, a correct `t2a_first_cond`, and nothing else to see it by —
+  // which is #1039 again, one arm over.
+  //
+  // `t2a_first_next_latent` is `Ltx2EulerStep`'s output, and it makes what the
+  // sampler CONSUMED checkable:
+  //
+  //     next == latent + (latent - denoised)/sigma * (sigma_next - sigma)
+  //
+  // A second `to_denoised` applied to the guider's result on the way into the
+  // step moves this field and no other.
+  //
+  // The uncond and perturbed vectors are EMPTY when the guider does not ask for
+  // that arm, because the forward did not run.
+  bool t2a_rendered = false;
+  bool t2a_video_stream_present = false;
+  int64_t t2a_cond_forwards = 0;
+  int64_t t2a_uncond_forwards = 0;
+  int64_t t2a_perturbed_forwards = 0;
+  std::vector<int64_t> t2a_perturbed_blocks;
+  std::vector<float> t2a_first_latent;
+  std::vector<float> t2a_first_velocity;
+  std::vector<float> t2a_first_cond;
+  std::vector<float> t2a_first_uncond_velocity;
+  std::vector<float> t2a_first_uncond;
+  std::vector<float> t2a_first_perturbed_velocity;
+  std::vector<float> t2a_first_perturbed;
+  std::vector<float> t2a_first_denoised;
+  std::vector<float> t2a_first_next_latent;
+  double t2a_first_sigma = 0.0;
+
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,
   // because that is the only point at which the exact buffers cross-attention
@@ -723,6 +836,21 @@ class Ltx2VideoEngine : public VideoEngine {
   Ltx2VideoEngine();
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  // `T2AOneStagePipeline.__call__` (ltx2_t2a.h), reached from `Generate` on an
+  // `audio_only` recipe and from nowhere else.
+  //
+  // A PRIVATE STATIC rather than a free function in the .cpp, because it needs
+  // `Impl` — a private nested type no non-member can name. The alternatives were
+  // a 150-line branch inside a function that is already 1900 lines, or a
+  // template whose only purpose is to deduce a type it is not allowed to spell.
+  //
+  // `audio_context` is the conditioning `Generate` already resolved: the audio
+  // half of the prompt encoding, after the connector. Passing it in rather than
+  // re-encoding is what keeps the audio-only arm from owning a second copy of
+  // the connector composition.
+  static VideoResult GenerateAudioOnly(Impl& im, const VideoGenParams& gen,
+                                       const float* audio_context, int64_t context_tokens);
 };
 
 // Does this checkpoint set hold an LTX-2.5 DiT? Exposed for the registry and for

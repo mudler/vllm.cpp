@@ -1068,6 +1068,23 @@ Ltx2PhaseRecipe OneStagePhase(const Ltx2PipelineParams& params) {
   phase.name = "generate";
   phase.video_guidance = params.video_guider;
   phase.audio_guidance = params.audio_guider;
+  // #1013. This was left at the struct's 0.0 default, and 0.0 is not "no extra
+  // noise": `Ltx2GaussianNoise` is `latent + noise_scale * (noise - latent)`, so
+  // at 0.0 the state stays exactly as `create_initial_state` wrote it, which
+  // with no initial latent is ALL ZEROS. A one_stage render therefore denoised a
+  // zero tensor.
+  //
+  // Upstream's `ModalitySpec.noise_scale` defaults to 1.0
+  // (ltx-pipelines/utils/types.py:110) and `TI2VidOneStagePipeline.__call__`
+  // constructs both specs without it (ti2vid_one_stage.py:233-239), so 1.0 is
+  // what reaches `GaussianNoiser.__call__`'s `torch.lerp(latent, noise,
+  // noise_scale)` (components/noisers.py:31). The two neighbouring recipes
+  // already set it explicitly, which is what made the omission legible.
+  //
+  // No gate saw it because every end-to-end test loads `distilled_two_stage`,
+  // and a zero-initialized denoise still returns a finite clip of the right
+  // size, frame count and sample rate.
+  phase.noise_scale = 1.0;
   return phase;
 }
 
@@ -1082,6 +1099,43 @@ Ltx2PipelineRecipe OneStageRecipe(const Ltx2PipelineParams& params,
   recipe.num_inference_steps = params.num_inference_steps;
   recipe.default_image_crf = params.default_image_crf;
   recipe.negative_prompt = negative_prompt;
+  return recipe;
+}
+
+// `T2AOneStagePipeline` (t2a_one_stage.py:43). Built FROM `OneStageRecipe`
+// rather than beside it, because upstream's difference between the two is not in
+// the schedule: both hard-code `LTX2Scheduler()` (`:67` against
+// ti2vid_one_stage.py:81) and both take `num_inference_steps` from the same
+// `PipelineParams`. What differs is that there is no video.
+//
+// The geometry fields are left at the params table's values and are DEAD on this
+// recipe — upstream fills the same slots with a 512x512 placeholder whose height
+// and width it documents as unused (t2a_one_stage.py:37-40). Only `num_frames`
+// and `frame_rate` are read, and they are read to derive the audio DURATION
+// (`AudioLatentShape.from_video_pixel_shape`, types.py:184-200).
+//
+// The VIDEO guider is deliberately left at its default and is never consumed:
+// upstream's T2A CLI constructs ONE `MultiModalGuiderParams` and it is the audio
+// one (`:196-205`). Zeroing it here would look tidier and would be a fabricated
+// value; leaving the params table's own entry says "this recipe does not read
+// it" without inventing a number.
+Ltx2PipelineRecipe T2aOneStageRecipe(const Ltx2PipelineParams& params,
+                                     const std::string& negative_prompt) {
+  Ltx2PipelineRecipe recipe = OneStageRecipe(params, negative_prompt);
+  recipe.audio_only = true;
+  // `video_output_phase` is already -1 on a fresh recipe; restated because on
+  // THIS recipe it is a statement rather than a default, and a later edit that
+  // gave the field a real value would otherwise silently ask for a video output
+  // from a pipeline that produces none.
+  recipe.video_output_phase = -1;
+  // `modality_scale=1.0` — the CLI pins it, and says why: "Audio-only generation
+  // has no video modality, so the video->audio (v2a) cross-modal guidance is
+  // meaningless here. 1.0 disables it" (t2a_one_stage.py:200-202). It is the ONE
+  // guider field T2A overrides against the params table's 3.0, and 1.0 is exactly
+  // the value `do_isolated_modality_generation` reads as OFF
+  // (guiders.py:283-285). Applied at the recipe rather than at the call site so
+  // no caller can reach the isolated-modality forward this port does not have.
+  recipe.phases[0].audio_guidance.modality_scale = 1.0;
   return recipe;
 }
 
@@ -1261,6 +1315,15 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
     if (model_version == "2" || model_version == "2.3") return PositiveOnlyRecipe();
   } else if (pipeline_kind == "retake") {
     if (model_version == "2" || model_version == "2.5") return RetakeRecipe(model_version);
+  } else if (pipeline_kind == "t2a_one_stage") {
+    if (model_version == "2") return T2aOneStageRecipe(Ltx2Params20(), kOmniNegativePrompt);
+    if (model_version == "2.3") return T2aOneStageRecipe(Ltx2Params23(), kOmniNegativePrompt);
+    if (model_version == "2.4") {
+      return T2aOneStageRecipe(Ltx2DetectPipelineParams("2.4"), LightricksNegativePrompt());
+    }
+    if (model_version == "2.5") {
+      return T2aOneStageRecipe(Ltx2DetectPipelineParams("2.5"), LightricksNegativePrompt());
+    }
   }
   Refuse("Unsupported LTX pipeline kind/version: '" + pipeline_kind + "'/'" + model_version +
          "'. Recipes are resolved from an EXACT (kind, version) table "

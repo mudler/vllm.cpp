@@ -946,6 +946,95 @@ TTFT improving 4.5x while decode did not is consistent with all of this: prefill
 touches a wide expert set once, where sequential order and slot reuse both help,
 while decode re-reads a fresh 6.9 GB every step.
 
+## One predicate, three switches, and only one of them grew (issue #1029)
+
+`#967` taught `IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu`) to
+return true for `kIQ1_S` and `kIQ1_XXXS`. Three dispatch switches consume that
+predicate and `#967` extended one of them, the dense `MatmulBTQuantKernelCuda`.
+
+The grouped GEMM used the same predicate to SKIP its CPU fallback and then
+dispatched through a `switch (w)` that had no case for either dtype and no
+`default:`. It quantized the activation, launched nothing, and returned;
+`CheckCuda(cudaGetLastError())` reported success, because a launch that never
+happened cannot fail; and the output tensor kept whatever it already held. An
+independent review measured this on GB10 through a poisoned output buffer: both
+IQ1 encodings left `-12345` in place, at NMSE `4.58e6` and `9.96e6` against the
+CPU oracle, while the `iq2_s` control passed. Before `#967` these dtypes took
+the CPU fallback and emitted correct tokens slowly, so `#967` converted
+correct-but-slow into silently wrong, which inverts its stated purpose.
+
+That path is the DEFAULT routed-expert path of the target checkpoint:
+`qwen3_5_gguf_weights.cpp` accepts any `KeepQuantDType`, which now includes ggml
+19 and 66, and `qwen3_5.cpp` `KqGrouped` reaches `vt::MatmulBTQuantGrouped` with
+`VT_QWEN35_GROUPED_MOE` on by default. The two encodings are 96.92 % of the
+model. The fused `MoeGateUpSwiGLUGroupedCuda` seam had the same hole, where the
+consequence was worse in kind: its guard previously threw a NAMED refusal, and
+`#967` turned that named refusal into silence.
+
+The repair is three things, and the third is the one that matters most.
+
+1. Both grouped switches gained the `kIQ1_S` and `kIQ1_XXXS` arms. No new kernel
+   code was needed: `QuantDotGemmGroupedKernel` and
+   `QuantDotGemmGroupedFusedSwiGLUKernel` are generic in `W` and depend only on
+   `DotSuperblock<W>` and `FinalFactor<W>`, both already specialized for these
+   two dtypes by the dense path.
+2. All three switches gained a `default:` that THROWS and names the dtype. This
+   is the general repair rather than the specific one: past the
+   `IsCudaKeepQuantSupported` gate there is no CPU fallback left, so any future
+   missing case is a silent no-op unless something refuses out loud.
+3. The grouped seams are now gated. They had NO test: `grep -rl
+   MatmulBTQuantGrouped tests/` found two files and neither mentioned `kCUDA`,
+   which is exactly why F1 and F2 landed green. `tests/vt/test_cuda_quant_dot.cpp`
+   now drives both grouped seams over the same case table the dense gate uses,
+   including the two new dtypes, against the CPU grouped golden, THROUGH A
+   POISONED OUTPUT BUFFER.
+
+The poison is not decoration and it is not redundant with the value comparison.
+Mutating `MatmulBTQuantKernel` to write nothing makes the golden AND the
+independent reconstruction both stay at the poison value, so the byte comparison
+passes with zero failures and only the poison assertion fires: 55 failed
+assertions, all of them `poisoned == 0`, and `memcmp` failures zero. Every value
+gate in that file would have read an unwritten buffer as a merely inaccurate
+result.
+
+Chosen against `-Wswitch` for CUDA (`cmake/CompilerWarnings.cmake`), which the
+issue proposed. CUDA gets `-Werror=all-warnings` and no `-Wall`, so `-Wswitch`
+never runs, but adding it would not have caught this defect either: `-Wswitch`
+is silent whenever a `default:` label exists, and a `default:` is exactly what
+the repair adds. The flag that would fire is `-Wswitch-enum`, which warns on
+every enum switch in the tree that omits any enumerator even with a default, and
+that is a tree-wide change with no measurement behind it here, on a lane this
+box cannot compile. Recorded rather than done.
+
+**Owed on this repair.** The CUDA arms of the new gate have NOT run on a device.
+`dgx.casa` was unreachable for the whole of this work (`No route to host`, ping
+100 % loss), this box has no CUDA toolkit and no NVIDIA device, and there is no
+second CUDA host. What ran is the CPU arm, which is real: it drives the same
+poisoned-buffer instrument through the CPU grouped golden on every host, and the
+mutations above are its evidence. What is still owed is the GB10 run of the three
+CUDA cases, including the confirmation that removing either new `case` turns the
+grouped gate red. Issue #1029 stays open until that runs.
+
+Also sealed here: `cuda_quant_iq_tables.cuh` claimed from the day it landed that
+"a runtime test memcmps these tables against the CPU host tables". No such test
+existed. The CPU tests digest the HOST symbols, and nothing read
+`vt::cuda::d_iq1s_grid` at all, so a device transcription slip was visible only
+when a weight sample happened to address the drifted entry. Replaying the CUDA
+gate's own `std::mt19937(0x5EED)` stream, 266 of the 2048 `d_iq1s_grid` entries
+(13.0 %) are never addressed, which is why drifting entry 0 is caught and
+drifting entry 3 stays green at 150032/150032 assertions. That figure came from
+the review and was re-derived here rather than quoted: replaying the stream over
+the dense gate's widest weight (16 rows times 8 super-blocks, 128 blocks, 4096
+grid draws) gives 1782 distinct entries and 266 never addressed.
+
+The new grouped gate widens the same weight to 64 rows (E=4, N=16), which is 512
+blocks and 16384 draws, and that reaches all 2048 entries. Recorded because it is
+true, not because it closes anything. It is coverage by accident of shape rather
+than by contract, one shape change away from shrinking again, and it says nothing
+at all about the other seven tables. The seal now exists
+(`src/vt/cuda/cuda_iq_table_seal.h` plus the gate case), it covers all eight
+device codebooks byte for byte, and both false comments were corrected.
+
 ## Risks/decisions
 
 | Risk / decision | Call |

@@ -873,6 +873,12 @@ add_library(vllm STATIC
   # truncate-or-pad conform, and the frame-directory source. Its own TU for the
   # same reason the two above are: ltx2_video.cpp is a concurrent-edit lock.
   src/vllm/model_executor/models/ltx2_retake.cpp
+  # LTX-2.5 (ROW LTX25-T2A-ONE-STAGE, issue #1005): text-to-audio — the
+  # audio-only pipeline and its guided denoiser. Its own TU for the same reason
+  # the two above are, plus one this row adds: it is the only LTX pipeline that
+  # runs the DiT with `video = nullptr`, and keeping that call in one file is
+  # what makes "does anything else pass a video stream" a readable question.
+  src/vllm/model_executor/models/ltx2_t2a.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.

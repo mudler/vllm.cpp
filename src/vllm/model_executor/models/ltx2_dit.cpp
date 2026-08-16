@@ -275,6 +275,7 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     a.pe = args.video_pe;
     a.bias = args.video_self_bias;
     a.bias_rows = args.video_self_bias_rows;
+    a.all_perturbed = args.video_self_attn_perturbed;
     const std::vector<float> msa = Ltx2Attention(device, w.attn1, norm_vx.data(), nullptr, a);
     PostSelfAttention(video_x, msa.data(), gate, batch * tv, dim, eps, &vx_normed);
 
@@ -312,6 +313,7 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     a.pe = args.audio_pe;
     a.bias = args.audio_self_bias;
     a.bias_rows = args.audio_self_bias_rows;
+    a.all_perturbed = args.audio_self_attn_perturbed;
     const std::vector<float> msa = Ltx2Attention(device, w.audio_attn1, norm_ax.data(), nullptr, a);
     PostSelfAttention(audio_x, msa.data(), gate, batch * ta, adim, eps, &ax_normed);
 
@@ -752,19 +754,27 @@ Ltx2PromptIdentity Ltx2PromptIdentityOf(const Ltx2DitParams& params,
 Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
                               const Ltx2ModalityInput* audio, vt::DType compute_dtype,
-                              Ltx2PromptKvCache* cache) {
+                              Ltx2PromptKvCache* cache, const Ltx2DitPerturbation* perturbations) {
   VT_CHECK(compute_dtype == vt::DType::kF32,
            "ltx2: phase L2 ships only the f32 parity forward; the bf16 / FP8 / NVFP4 stream "
            "dtypes are phase L6 and are refused rather than silently computed in f32");
-  // LTX-2.5 is an LTXModelType.AudioVideo checkpoint (model_configurator.py:47),
-  // and that is the only weight contract EnumerateLtx2DitTensors describes. The
-  // VideoOnly / AudioOnly types (model.py:31-33) build a DIFFERENT parameter set —
-  // no audio stream, no av_ca AdaLN embedders — so they are refused by name rather
-  // than served by a path no golden covers. Use `enabled` to run one stream of an
-  // AV model, which is what the pipeline itself does.
-  VT_CHECK(video != nullptr && audio != nullptr,
-           "ltx2: phase L2 ships the AudioVideo model type only; LTXModelType.VideoOnly and "
-           "LTXModelType.AudioOnly carry a different weight contract and are not ported");
+  // transformer.py:259-260 — upstream's own refusal, in its own words: "At least
+  // one of video or audio must be provided".
+  //
+  // ONE stream may be null, which is what `T2AOneStagePipeline` runs
+  // (t2a_one_stage.py:167, `video=None`) and what model.py:505 expresses.
+  // This check used to demand BOTH and blamed the AudioOnly / VideoOnly WEIGHT
+  // CONTRACT for it. That reason was re-derived at this tree and does not
+  // describe the case: T2A loads the ordinary AudioVideo FILE and restricts which
+  // keys it reads (LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP,
+  // model_configurator.py:228-239), so the contract EnumerateLtx2DitTensors
+  // describes is the one it satisfies. Every line below was ALREADY written
+  // against `video != nullptr` / `have_both`, so lifting the guard reaches a path
+  // this file already had. The weight-contract statement survives where it is
+  // true — at the loader, about the file.
+  VT_CHECK(video != nullptr || audio != nullptr,
+           "ltx2: at least one of the video and audio streams must be present "
+           "(transformer.py:259-260)");
   const int64_t dim = params.inner_dim();
   const int64_t adim = params.audio_inner_dim();
   // transformer_args.py:197 views the projected context to the STREAM width, so
@@ -812,8 +822,24 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                        params.audio_num_attention_heads, have_both ? video : nullptr);
   }
 
+  // `perturbations` (model.py:492). A vector that is not exactly `num_layers`
+  // long is REFUSED rather than indexed defensively: a config built for another
+  // layer count would otherwise perturb a prefix of the blocks and leave the rest
+  // alone, which is a legal-looking STG pass over the wrong blocks and renders.
+  if (perturbations != nullptr) {
+    for (const std::vector<uint8_t>* v :
+         {&perturbations->video_self_attn, &perturbations->audio_self_attn}) {
+      VT_CHECK(v->empty() || static_cast<int64_t>(v->size()) == params.num_layers,
+               "ltx2: a perturbation vector is neither empty nor one entry per block");
+    }
+  }
+
   const bool use_cache = cache != nullptr;
   if (use_cache) {
+    VT_CHECK(video != nullptr && audio != nullptr,
+             "ltx2: the prompt K/V cache keys on BOTH streams' context tensors "
+             "(Ltx2PromptIdentityOf), so it is refused on a one-stream call rather than keyed on "
+             "half an identity — two different renders would otherwise share a cache entry");
     // The cached K/V are a function of the PROMPT (and of nothing else on this
     // path — that is what use_prompt_adaln_single=false buys). A filled cache is
     // therefore bound to one prompt, and a call carrying another one is refused
@@ -837,6 +863,12 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
     a.audio_context_tokens = audio != nullptr ? audio->context_tokens : 0;
     a.video_enabled = video != nullptr && video->enabled;
     a.audio_enabled = audio != nullptr && audio->enabled;
+    if (perturbations != nullptr) {
+      a.video_self_attn_perturbed = !perturbations->video_self_attn.empty() &&
+                                    perturbations->video_self_attn[static_cast<size_t>(i)] != 0;
+      a.audio_self_attn_perturbed = !perturbations->audio_self_attn.empty() &&
+                                    perturbations->audio_self_attn[static_cast<size_t>(i)] != 0;
+    }
     a.video_timestep_modulation = vs.modulation.empty() ? nullptr : vs.modulation.data();
     a.audio_timestep_modulation = as.modulation.empty() ? nullptr : as.modulation.data();
     a.video_prompt_modulation =

@@ -1,8 +1,13 @@
 // AUTO-DERIVED from src/vt/cpu/cpu_quant_iq_tables.h (SAME literals, single
 // source of truth). Regenerate with the script in the QUANT-GGUF-CIQ-GEMM-CUDA
-// commit if the CPU tables ever change. A runtime test (test_cuda_quant_dot.cpp)
-// memcmps these __constant__ tables against the CPU host tables so any drift
-// fails loudly. These are the IQ2_XXS / IQ3_XXS codebook + shared sign tables,
+// commit if the CPU tables ever change. The drift seal is
+// `vt::cuda::SnapshotIqTablesFromDevice` (cuda_iq_table_seal.h): the CUDA gate
+// "CUDA device codebooks == the CPU host tables (byte-exact)" in
+// tests/vt/test_cuda_quant_dot.cpp copies every table below OUT of device memory
+// and memcmps it against the CPU host table, so a transcription slip fails on its
+// own rather than waiting for some weight sample to address the drifted entry.
+// This header asserted that test from the day it landed; it did not exist until
+// issue #1029. These are the IQ2_XXS / IQ3_XXS codebook + shared sign tables,
 // llama.cpp @ 237ad9b96 ggml-common.h:499/:503/:550/:1007 (see the CPU header).
 #ifndef VT_CUDA_QUANT_IQ_TABLES_CUH_
 #define VT_CUDA_QUANT_IQ_TABLES_CUH_
@@ -38,9 +43,11 @@ __device__ uint8_t d_ksigns_iq2xs[128] = {
 // bytes (-1/0/+1), so the device side needs no sign table for them.
 //
 // Deliberately the SAME u64 layout as the CPU tables rather than upstream's
-// packed u32 `*_grid_gpu` variants: one encoding to validate, and the device
-// dot is then a literal transcription of the CPU one. The digests the CPU tests
-// re-derive therefore cover these bytes too.
+// packed u32 `*_grid_gpu` variants: one encoding to validate, and the device dot
+// is then a literal transcription of the CPU one. The identical layout is what
+// makes the byte-exact seal above possible; it is NOT what the CPU digests
+// cover. Those digest `vt::cpu::kIq1sGrid`, a different object in a different
+// address space, and nothing reads these bytes on their behalf.
 __device__ uint64_t d_iq1s_grid[2048] = {  // GLOBAL (not __constant__)
     0xffffffffffffffffULL, 0xffffffffffffff01ULL, 0xffffffffffff0000ULL, 0xffffffffffff01ffULL,
     0xffffffffffff0101ULL, 0xffffffffff00ff00ULL, 0xffffffffff000000ULL, 0xffffffffff01ffffULL,

@@ -286,8 +286,9 @@ for path in subprocess.run(["git", "ls-files", "docs", ".agents", "benchmarks"],
             print(f"{path}:{n + 1}:{ln.strip()}")
 ```
 
-On this commit's tree it prints **960 candidate lines over 651 files**, and it
-printed 943 at `bab8e1fb3`, before this commit's own markers were added.
+On this commit's tree it prints **961 candidate lines**, drawn from 93 of the
+651 files it scans, and it printed 943 at `bab8e1fb3`, before this branch's own
+markers were added.
 
 **Stage 2, favourable by the page's own rule.** `docs/BENCHMARKS.md:32-34`
 states the convention: throughput is ours over the reference, latency is the
@@ -328,7 +329,6 @@ comparison is untouched.
 | 7 | `docs/BENCHMARKS.md` Vulkan `BENCH-VK-LLAMA`, with `.agents/environment.md:435` | decode 4.36 versus 4.35 `MET`, 7 clean legs, spread 0.69% | **yes**, and it is the most fragile verdict in this table | none of the 65 commits touch `ggml/src/ggml-vulkan/`, so the Vulkan sources match `b9827`. The build still came from the same dirty working tree, so the tree is unidentified and the number is unreproducible. The `21.5x` prefill quoted in the same cell is **not** a llama.cpp number: the source JSON says "Prefill is 21.5x its pre-campaign value on the same model", a self-comparison, so it survives the repin untouched |
 | 8 | `docs/bench-evidence/cpu-x86-llamacpp-20260811.md` | peak RSS 2.8281 GiB, giving `1.0022x` open gap. Its three throughput axes are already `PENDING` | **yes** | its provenance line names "local fork `237ad9b96`, build number 9892, the recorded pin". RSS is the axis least likely to move, because the fork's deltas are compute, but the binary is still unidentified |
 | 9 | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md` | prefill 27.77, decode 3.91, E2E 3.77 tok/s, peak RSS 3.747 GiB, giving `0.461x`, `0.653x`, `0.758x` | **yes**, for a different reason | **not fork-contaminated.** This file measured stock tag `b9892` at `ee445f93d` and recorded the substitution. It is a stock number against a revision that is neither the old pin nor the new one, and its record wrongly presents that tag as the project pin |
-
 | 10 | `docs/BENCHMARKS.md:29` Muse Glimmer 30B, `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md:24-32`, `docs/STATUS.md:502`, record `:19231` and `:19016` | in128 prefill 13.158, decode 5.026, in512 prefill 13.292, decode 5.091 tok/s, and the earlier 12.94 / 5.08 / 9.97 / 6.41 / 13.13 / 5.00 set with peak RSS 15.74 GiB, giving the `1.023x` prefill win, `0.194x`, `0.175x`, `0.997x` and `1.92x MORE` RSS | **yes**, for the same reason as row 9 | **not fork-contaminated.** Both runs measured stock master `704485942` (`b10362-5`, 2026-08-11), recorded in the record's own recipe block at `:18996`. It is a stock number against a third revision that is neither pin. Its `1.023x` is the fifth favourable verdict on the public page and was absent from every earlier draft of this table |
 | 11 | `.agents/kernel-matrix.md:162` `KERNEL-GEMM-CPU-TILED`, record `:13766-13782` | ggml no-llamafile 212.0, 214.4, 215.4, 208.1, 209.9, 159.2 GFLOP/s against our 222.1, 220.6, 216.8, 215.4, 241.7, 141.3 on six Arm shapes, giving "at parity with ggml's stock kernel and slightly ahead on four of six shapes", plus the stock-ggml column that sizes llamafile at ~1.9x f16 and ~1.2x f32 | **yes** | built from the same fork tree with `GGML_LLAMAFILE=OFF`. None of the 65 fork commits touch `llamafile/sgemm.cpp`, so the compared kernel matches `b9827`, but the tree is the same unidentified one as row 7. This verdict is load-bearing beyond its own row: it is the evidence that the Arm 16-bit deficit is an absent capability rather than a defect in `KERNEL-GEMM-CPU-ELEM` |
 
@@ -381,10 +381,14 @@ for f in $(git grep -l 237ad9b96 -- .); do \
 done | wc -l                                                   # path.ext:LINE within 3 lines
 ```
 
-They returned 109, 67 and 52 at `a2ede63a1`, then 110, 66 and 52 at
-`bab8e1fb3`, and **111**, **66** and **52** on this commit's tree, which gained
-one mention because `docs/BUILD.md` now names the fork it was measured against.
-Re-measure rather than quote. The second command is the subset
+They returned 109, 67 and 52 at `a2ede63a1`, 110, 66 and 52 at `bab8e1fb3`, 111,
+66 and 52 once `docs/BUILD.md` gained the fork it was measured against, and
+**112**, **69** and **52** on this commit's tree. The third move was not an edit
+at all. Merging `origin/main` brought in `tests/vt/iq1_golden_vectors.h` and 64
+new lines of `.agents/specs/expert-streaming.md`, both citing the same
+unfetchable object, and the restored `.agents/issue-index.md` carries the `@`
+form too. A number in this spec goes stale when somebody else's pull request
+lands. Re-measure rather than quote. The second command is the subset
 that attributes a path or a source tree to the object rather than merely
 discussing the SHA, and it is the size of the owed sweep: 66 files, not the
 "roughly 50" an earlier draft wrote, which counted only the narrowest reading and
@@ -631,17 +635,27 @@ build-number convention as §"Direction of the error" does and say so.
   passes on a pristine `origin/main` worktree. The record says so rather than
   keeping a stale waiver, because a stale exception is the same defect this row
   removes from the oracle.
-- `check-agent-record` and `test_agent_record` are **inherited red from
+- `check-agent-record` and `test_agent_record` were **inherited red from
   `origin/main` itself**, and they arrived with that same landing.
-  `.agents/issue-index.md` now carries two rows for #995, one appended by this
+  `.agents/issue-index.md` carried two rows for #995, one appended by this
   branch's base and one by `45b022cdc`, and the checker refuses a duplicate with
   "under `merge=union` a duplicate is what two branches appending the same issue
   look like". Proved on a pristine detached worktree at `45b022cdc` with
   `git status --porcelain` empty, not attributed: `scripts/check-agent-record.py`
-  returns `rc=1` there with the identical message. It is not this row's, and it
-  is not repaired here for two reasons. The index is append-only and a landed
-  row may not be edited or deleted, and choosing which of the two #995 texts
-  survives is a judgement for `ENG-EXPERT-STREAM`, which owns both.
+  returned `rc=1` there with the identical message. **Both are now green here.**
+  PR #1025 (issue #1022) landed as `ff264cb82` while this branch was in flight
+  and removed the malformed copy, and merging `origin/main` brings the repair in.
+  The record says so rather than keeping a stale waiver.
+
+  **The merge that clears it also reproduced it, and the automatic result was
+  accepted by nothing.** `ff264cb82` deletes one #995 row while this branch's
+  side leaves it untouched, which under `merge=union` reinstates it, and the
+  merge reports clean while carrying the duplicate again. `.agents/issue-index.md`
+  was therefore rebuilt as AGENTS.md §Records requires, by taking the complete
+  target-branch version and re-applying this branch's scoped edit, so
+  `git diff origin/main -- .agents/issue-index.md` shows exactly the two rows
+  this branch appends and no other key changes. A keyed record that union-merges
+  cleanly is not a keyed record that merged correctly.
 - `test_cpu_x86_llamacpp_floor` is a **third** inherited red, and an earlier
   draft of this section named only two while runs produced three. It is
   load-dependent: at high loadavg its contended-leg case takes the
@@ -653,9 +667,20 @@ build-number convention as §"Direction of the error" does and say so.
   owns both the flake and the re-measurement this repin makes owed. Measured in
   both directions rather than asserted, on this branch and on a pristine
   `origin/main` worktree: it PASSED at loadavg 12.47 and FAILED at 46, 61 and
-  216, with the failure text naming the load each time.
+  216, with the failure text naming the load each time. It FAILED again at 21.07
+  and PASSED at 14.82 and 8.36 during this pass, which is four more datapoints on
+  the same threshold and no new information about the diff.
 - **No benchmark gate.** Recorded `PENDING` on #1003 and on host access, not
   waived.
+- **What the gate run reports, by block.** The full run on the merged head is
+  `Session role` 1, `Record gates` 26, `Mutation suites` 44,
+  `Committed range vs origin/main` 3, and `Commit trailers vs origin/main` 2, so
+  76 results, all `ok`, and **zero SKIP**. The last block is the one this section
+  cares about: it is guarded on `git merge-base --is-ancestor origin/main HEAD`
+  (`scripts/agent-preflight.sh:226-234`) and it printed nothing at all before the
+  merge, which is what "silently skipping" looks like. It examined every commit in
+  `origin/main..HEAD`, 9 of them at this head, and the count is the thing to
+  re-derive rather than trust, for the same reason the anchor counts are.
 
 ## Stop conditions
 
@@ -684,9 +709,9 @@ build-number convention as §"Direction of the error" does and say so.
   that lets `gateable` become `yes`. Until then this oracle is visible debt.
 - Re-anchoring the files that cite `file:line @ 237ad9b96`. The set is the
   `@ <sha>` subset counted by the second command in §"The owed sweep, counted
-  reproducibly", which returns **66** on this commit's tree. Run the command
-  rather than trusting the number, because it moved inside this pull request
-  twice already. Tracked
+  reproducibly", which returns **69** on this commit's tree. Run the command
+  rather than trusting the number, because it moved three times inside this pull
+  request, once because another branch landed. Tracked
   under #1003, because it is the same object that cannot be fetched.
 - `KERNEL-GEMM-CPU-TILED`: its recorded "ahead on four of six shapes" reads as
   five of six in its own evidence table. Reported in §"Direction of the error",

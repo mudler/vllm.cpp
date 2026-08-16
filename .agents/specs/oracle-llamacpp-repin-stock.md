@@ -64,10 +64,19 @@ commit below the graft reports as absent whether it is absent or not.
 
 **Disproved with a control rather than reasoned about.** `b9827` is an upstream
 release tag, so it is beyond argument an ancestor of `origin/master`. In that
-clone `git branch -r --contains b9827` lists **68** remote branches and
+clone `git branch -r --contains b9827` lists **70** remote branches and
 `origin/master` is **not among them**. `--contains b9892` behaves the same way,
 listing 63 and omitting `origin/master`. The instrument returns a false negative
 for the one ref the question is about.
+
+**That branch count is 70 today and read 68 when this paragraph was first
+written, which changes nothing and is worth saying.** The count reads the
+developer's clone, a repository outside this row's control that gains
+remote-tracking refs whenever anyone fetches, so it is not reproducible from this
+tree at all. **The load-bearing half is, and it reproduces exactly**: the omission
+of `origin/master` from a list of branches containing an upstream release tag.
+Re-run the command rather than trusting either number, and read the omission, not
+the total.
 
 The result survives, and the evidence had to be replaced. The GitHub API does not
 walk local history:
@@ -93,9 +102,14 @@ happens to agree with the truth is still a false negative.
 **The rest of the §"Measured facts" table does not rest on a graft-crossing
 walk**, checked one row at a time rather than assumed. `describe`, `rev-list
 --count` and `merge-base` over `237ad9b96`, `b9827` and `b9892` all run on the
-fork line, which was fetched to full depth: `rev-list --count` returns 9827,
-9892 and 9892 for the three, complete values, against the truncated 122 that
-`b10451` returns through the graft. `merge-base 237ad9b96 b9892` found
+fork line, which was fetched to full depth: `rev-list --count` returns **9892,
+9827 and 9892** for the three, in that order, complete values, against the
+truncated 122 that `b10451` returns through the graft. An earlier draft printed
+the same multiset transposed, as "9827, 9892 and 9892", which reads as though the
+fork tip sat at the tag's depth and loses the one coincidence this whole section
+exists to explain: `237ad9b96` and `b9892` **both** count 9892, from the same
+`b9827` base 65 commits back, and that collision is what made `pin_label` wrong.
+`merge-base 237ad9b96 b9892` found
 `0ed235ea2`, and a merge base that is found is a positive result a truncation
 cannot manufacture. `git grep ... origin/master`, `git diff --numstat`, and the
 `src/models/qwen35.cpp` and `src/llama-arch.cpp` model-path checks read trees,
@@ -360,11 +374,22 @@ claim reaches a reader from a source comment as readily as from a page.
 
 Two objections, both measured rather than argued.
 
-*It will not scale.* It does. The path set goes from 651 files to **4514**, and
-the candidate output goes from 961 lines to **1008**, drawn from 117 files rather
-than 93. The extra 3863 files contribute 47 lines. Stage 1 is narrow enough that
-scanning everything costs 47 lines of adjudication, and the sweep runs in under
-two seconds.
+*It will not scale.* It does, but **not in the two seconds an earlier draft of
+this paragraph claimed**, and a wrong measurement inside a section headed "both
+measured rather than argued" is worse than no number. The path set goes from 651
+files to **4514**, and the candidate output goes from 961 lines to **1008**,
+drawn from 117 files rather than 93. The extra 3863 files contribute 47 lines, so
+scanning everything costs 47 lines of adjudication.
+
+Timed rather than asserted, six runs of the whole-tree sweep on this host:
+**40.4, 40.9 s** at loadavg 15, and **43.1, 45.5, 51.2, 54.4 s** at loadavg 62
+falling to 30. The three-directory path set runs in **3.1 to 3.4 s** on the same
+host. So the whole-tree sweep costs roughly **40 to 55 seconds**, is
+load-sensitive, and is **more than an order of magnitude** slower than the set it
+replaced, not "about the same". That is still cheap for an instrument run once
+per pass, which is what the objection was actually about, and it is the honest
+version of the answer: the cost is real and it is worth paying, rather than
+nil.
 
 *Binary fixtures will produce garbage.* They do not. The 456 `.npy`, 381 `.bin`
 and 252 `.i32` fixtures are read with `errors="replace"` and match nothing, since
@@ -392,10 +417,23 @@ becoming another file the tree has to keep true:
 import re, subprocess
 LLAMA = re.compile(r"llama[.\-_]?cpp|llama-bench", re.I)
 ROW, SEP = re.compile(r"^\s*\|"), re.compile(r"^\s*\|[\s:|-]+\|\s*$")
-CMP = re.compile(r"[0-9]+(?:\.[0-9]+)? *[x×]\b|[0-9]+(?:\.[0-9]+)? ?%"
+CMP = re.compile(r"[0-9]+(?:\.[0-9]+)? *(?:x\b|×)|[0-9]+(?:\.[0-9]+)? ?%"
                  r"|\bMET\b|\bPARITY\b|\bPASS\b|\bFAIL(?:ED|S)?\b|\btie\b|\bties\b"
                  r"|\bahead\b|\bbehind\b|\bbeats\b|\bparity\b|\bwin\b|\bwins\b"
                  r"|\bless\b|\bfaster\b|\bslower\b|\bmatch(?:es|ed)?\b")
+
+# SELF-TEST, and the sweep refuses to run without it. See §"A token can be
+# WRONG as well as MISSING". Every shape below is one this repository actually
+# writes, and the MUST_NOT strings are the recipe prose the sweep must NOT claim.
+MUST = ["1.18x llama.cpp", "1.18× llama.cpp", "| 1.023× |", "2× over llama.cpp",
+        "3.9×decode", "24.2 % less", "decode MET", "matches llama.cpp",
+        "at parity", "ahead of pp128", "0.97x tie", "24.4 t/s slower"]
+MUST_NOT = ["the llama.cpp build recipe", "unpacked at ~/lcpp-vk",
+            "llama-bench was built with GGML_CUDA=OFF"]
+bad = ([s for s in MUST if not CMP.search(s)]
+       + [s for s in MUST_NOT if CMP.search(s)])
+assert not bad, f"CMP self-test FAILED on {bad}"
+
 for path in subprocess.run(["git", "ls-files"],           # NO path arguments
                            capture_output=True, text=True).stdout.split():
     lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
@@ -434,6 +472,56 @@ has to be **written** in some vocabulary, so the honest record is that this
 token set is a known-incomplete instrument whose incompleteness is now visible
 in two places rather than none.
 
+### A token can be WRONG as well as MISSING, and that is the sixth hole
+
+The five holes above are all the same shape: something true was **absent** from
+a list. This one is different and it is sharper, because the token was
+**present** and did nothing.
+
+`CMP` read `[0-9]+(?:\.[0-9]+)? *[x×]\b`. `×` is U+00D7, which is not a `\w`
+character, so a `\b` immediately after it is satisfied only by a **following**
+word character. The alternative therefore fired on `3.9×decode` and on nothing
+else this repository writes. Measured on the numeric-ratio alternative in
+isolation, so that the other twenty tokens cannot mask it:
+
+| string | old `[x×]\b` | repaired `(?:x\b|×)` |
+|---|---|---|
+| `our kernel is 1.18x llama.cpp` | HIT | HIT |
+| `our kernel is 1.18× llama.cpp` | **MISS** | HIT |
+| `\| 1.023× \|` | **MISS** | HIT |
+| `speedup 2× over llama.cpp` | **MISS** | HIT |
+| `3.9×decode` | HIT | HIT |
+
+Three of the four `×` shapes are the ones this tree uses, and the one that
+worked is the one nobody writes. The repair is `(?:x\b|×)`: keep the word
+boundary where it is meaningful, drop it where it cannot be satisfied.
+
+**Why nothing caught it for five drafts.** The stage-2 filter at §"Stage 2"
+writes the same idea as `*[x×]` with **no trailing `\b`**, so stage 2 was live
+for `×` the whole time. The two expressions disagreed, only the narrower one
+gated, and stage 2 could never surface what stage 1 refused to hand it. A
+downstream filter that is correct is not evidence that the upstream one is,
+and a token that is spelled in two places is a token that can be right in one.
+
+**So the sweep now self-tests, and the assertion is the fix.** A handful of
+strings that must match and must not match run before the scan, and the sweep
+refuses to start when one fails. That is what distinguishes a wrong list from a
+short one: reading a regex confirms a token is *there*, and only executing it
+against a known-positive string confirms the token is *live*. The self-test is
+armed rather than decorative, proved by running it against the defective
+expression it replaces: it fails on exactly `1.18× llama.cpp`, `| 1.023× |` and
+`2× over llama.cpp`, and passes on the repair.
+
+**The lesson generalises past this row.** Every earlier hole here was found by
+someone noticing a missing site. A dead branch cannot be found that way, because
+the instrument reports the same clean output whether the branch is unreachable
+or the tree is clean. It is the `doctest -tc` comma trap and the mutation that
+never applied, in a third costume: a green result from an instrument that was
+never armed. Assert the instrument fires before you believe what it did not
+find.
+
+**What it hid.** A fifth llama.cpp revision, in the row below.
+
 ### What the three sweeps measure, side by side
 
 **All three rows are measured at `bf621287a`**, on a clean detached worktree with
@@ -449,6 +537,23 @@ tree" for a reason given below. Each stage is counted, not quoted:
 The middle row is the path widening on its own, so the two changes are
 separately attributable: the path set is worth +47 candidates over +24 files, and
 the token is worth a further +87 over +24 more.
+
+**The fourth change is the `×` repair, and it is measured at `85a9a7ae7`**, the
+head it was found at, on a clean tree. Two more commits had landed by then, so
+these are not comparable to the rows above and are not meant to be. Only the
+delta between them is, because both were taken in one pass over one tree:
+
+| Sweep at `85a9a7ae7` | Files scanned | Stage 1 candidates | Files hit | Stage 2 favourable |
+|---|---:|---:|---:|---:|
+| dead `[x×]\b` | 4514 | 1118 | 141 | 852 |
+| repaired `(?:x\b\|×)` | 4514 | **1225** | **144** | **958** |
+
+The repair is worth **+107 candidates over +3 files** and +106 favourable lines,
+which is a larger correction than the `match(es|ed)` token that prompted the
+previous pass. Three files enter the sweep that were never in it:
+`.agents/specs/deepseek-v4-flash.md`,
+`.agents/specs/spec-decode-scoping-2026-07-10.md`, and
+`src/vt/cuda/cuda_quant_iq_tables.cuh`.
 
 **The SHA is load-bearing, because this table is inside its own instrument.** The
 sweep scans every tracked file, and this spec is a tracked file, so writing a
@@ -497,6 +602,52 @@ enumeration again with a number in front of it.
 | **Harness code, no recorded number** | `scripts/cpu-x86-llamacpp-floor.sh:295`, which computes `"ours" / "tie" / "llama.cpp"` from a ratio | it pins no revision at all, so row 8's re-take can drive it unchanged |
 | **False positives** | the remaining 14 files, on `96.92 %` checkpoint fractions, `vLLM-parity goldens`, `parity/` in a test path, and `\bahead\b` inside a thread-race comment | the price of an over-inclusive stage 1, paid deliberately |
 
+### What the `×` repair surfaced, adjudicated the same way
+
+107 lines from 20 files. The great majority are the **same measurements already
+enumerated**, written with `×` instead of `x`, which is why the repair changed
+files hit by only 3: the dead branch was suppressing lines inside files the sweep
+already reached through some other token. That is its own warning. A hole that
+costs few new FILES can still hide a whole measurement, because the adjudicator
+reads the lines, not the file list.
+
+| Verdict | Sites | Disposition |
+|---|---|---|
+| **Contaminated, marked, and NEW to the enumeration** | `.agents/specs/laguna-s21-w7-speed-2026-07-31.md:15-16`, `:68`, `:100`, `:147`, `:175`, `:240`, with `.agents/benchmark-record.md:884`, `:898`, `:11753`, `:11759`, `:11761` | **row 13**, and a FIFTH llama.cpp revision. See §"Five llama.cpp revisions are in play" |
+| **New SITES of enumerated rows** | the L7 restatements at `.agents/benchmark-record.md:10731`, `:10733`, `:11077`, the L5/L6 RSS chain at `:11030`, `:11116`, `:11141`, `:11147`, the row 1 prefill at `:10792`, `:10810`, the row 3 refresh at `:10906`, and the row 2, 4, 5 and 6 spec restatements in `cpu-llamacpp-floor-remeasure`, `cpu-gdn-proj-orientation:74`, `cpu-elementwise-gemm`, `gguf-cpu-threadpool` and `gguf-compute-in-quant-gemm` | already owed a re-take under their own rows. No new obligation, and no number moves |
+| **A new SITE, and a deficit rather than a win** | `.agents/specs/cpu-thread-gdn-paged-2026-07-23.md:14`, `:86`, `:92`, which reads "prefill is 2.34× behind (73.97 vs 173.28 t/s)" | a site of row 5, not a thirteenth measurement: it re-uses row 5's own `pp128 173.28 ± 1.75` legs rather than taking its own. Recorded AGAINST us, so like row 8 it cannot flip from favourable to unfavourable. It can only widen or close |
+| **Ours-versus-ours or ours-versus-vLLM, stands** | `.agents/specs/deepseek-v4-flash.md:443`, `deepseek-v4-last-mile.md:63`, `spec-decode-scoping-2026-07-10.md:67`, `.agents/coordination.md:573`, `.agents/benchmark-record.md:665`, `:667`, `:1176`, `:11569` | no llama.cpp denominator. Caught by proximity to the word in adjacent prose |
+| **Superseded ledger and legacy history** | the 19 lines in `.agents/completed/state-events/0000-00/STATE-LEGACY-000001.md`, the 2 Kimi K3 rows in `.agents/parity-ledger.md`, and `.agents/completed/roadmap-v1-preamble-2026-07-18..2026-08-03.md` | history, which keeps saying what it said. `AGENTS.md` §Records forbids striking it |
+| **False positives** | `src/vt/cuda/cuda_quant_iq_tables.cuh:19` (`~32×` warp serialization), `.agents/model-matrix.md:453`, `.agents/specs/cuda-arch-ampere-fastpath.md:287`, `expansion-map-2026-07-10.md:40-41` | the same deliberate over-inclusion. Two of the three newly-hit FILES are here |
+
+### The sweep sees verdicts, not recipes, and that is a second surface
+
+Stated here so that the next reader does not mistake this instrument for a
+complete answer. The sweep requires a **comparison token**. A file that names
+llama.cpp without stating a verdict about it produces **zero** candidates, by
+design and correctly, because the sweep's question is "does this repository state
+a llama.cpp comparison". Measured at `85a9a7ae7` with the repaired `CMP`: **286**
+tracked files name llama.cpp, the sweep hits **144**, so **142 files name it and
+are invisible to the sweep.** Under the dead `[x×]\b` the invisible set was 145.
+
+Those 142 are build recipes, source citations, name-map references, porting
+notes, and environment pages. Most owe nothing. **One of them owed something and
+was found by hand.** `.agents/environment.md:435` is named in row 7's Evidence
+column and read "llama.cpp at pin `237ad9b96` is unpacked at `~/lcpp-vk` with
+`build-vk/bin/llama-bench` built". It carries no comparison token, so the sweep
+never saw it, and it is not in the `@ <sha>` subset either, so the owed
+re-anchoring sweep did not cover it. An agent taking #1003's Vulkan re-take, the
+**most fragile verdict in the whole enumeration**, reads that page for the recipe
+and rebuilds the superseded fork while believing it is following the pin. It is
+marked by this pass.
+
+**The general case is open, and no third stage is proposed for it.** A recipe
+sweep would be a different query with a different adjudication, and inventing it
+here without running it would be exactly the hand list this row keeps removing.
+What this section records is the boundary: **verdicts and recipes are two
+surfaces, this instrument covers one, and the pin reaches a reader through
+both.** It is listed under `## Owed`.
+
 ## Every measurement the fork pin contaminated
 
 "Contaminated" means the llama.cpp side of the comparison came from a build of
@@ -517,12 +668,120 @@ comparison is untouched.
 | 9 | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md` | prefill 27.77, decode 3.91, E2E 3.77 tok/s, peak RSS 3.747 GiB, giving `0.461x`, `0.653x`, `0.758x` | **yes**, for a different reason | **not fork-contaminated.** This file measured stock tag `b9892` at `ee445f93d` and recorded the substitution. It is a stock number against a revision that is neither the old pin nor the new one, and its record wrongly presents that tag as the project pin |
 | 10 | `docs/BENCHMARKS.md:29` Muse Glimmer 30B, `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md:24-32`, `docs/STATUS.md:502`, record `:19231` and `:19016` | in128 prefill 13.158, decode 5.026, in512 prefill 13.292, decode 5.091 tok/s, and the earlier 12.94 / 5.08 / 9.97 / 6.41 / 13.13 / 5.00 set with peak RSS 15.74 GiB, giving the `1.023x` prefill win, `0.194x`, `0.175x`, `0.997x` and `1.92x MORE` RSS | **yes**, for the same reason as row 9 | **not fork-contaminated.** Both runs measured stock master `704485942` (`b10362-5`, 2026-08-11), recorded in the record's own recipe block at `:18996`. It is a stock number against a third revision that is neither pin. Its `1.023x` is the fifth favourable verdict on the public page and was absent from every earlier draft of this table |
 | 11 | `.agents/kernel-matrix.md:162` `KERNEL-GEMM-CPU-TILED`, record `:13766-13782` | ggml no-llamafile 212.0, 214.4, 215.4, 208.1, 209.9, 159.2 GFLOP/s against our 222.1, 220.6, 216.8, 215.4, 241.7, 141.3 on six Arm shapes, giving "at parity with ggml's stock kernel and slightly ahead on four of six shapes", plus the stock-ggml column that sizes llamafile at ~1.9x f16 and ~1.2x f32 | **yes** | built from the same fork tree with `GGML_LLAMAFILE=OFF`. None of the 65 fork commits touch `llamafile/sgemm.cpp`, so the compared kernel matches `b9827`, but the tree is the same unidentified one as row 7. This verdict is load-bearing beyond its own row: it is the evidence that the Arm 16-bit deficit is an absent capability rather than a defect in `KERNEL-GEMM-CPU-ELEM` |
-| 12 | `.agents/specs/gguf-keep-quant-loader.md` L7 (`:128`, `:537`ff), restated in `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:184-189` and pinned beside a `CHECK` at `tests/vllm/test_gguf_keep_quant.cpp:480-481` | llama.cpp pp128 173.2, tg32 25.09 tok/s, peak RSS 2.798 GiB, giving "RSS gap CLOSED to `1.01x`", "prefill 204 t/s = `1.18x` AHEAD", "decode ~parity" | **yes** for the three ratios, **no** for the keep-f16 default | **the only site where a contaminated denominator reaches shipped behaviour.** `VT_GGUF_KEEP_F16` is DEFAULT ON and the comment justifying that default quotes `1.01x llama.cpp` and `1.16x AHEAD of pp128 176.6`. The default itself survives: its acceptance is the same-binary ours-versus-ours A/B, 3.885 to 2.832 GiB with tokens byte-identical, which no denominator move touches. What is owed is the framing. Its `173.2 / 25.09` legs are a distinct session from rows 2, 3 and 5, so this is a genuinely separate contaminated measurement rather than a restatement |
+| 12 | `.agents/specs/gguf-keep-quant-loader.md` L7 (`:128`, `:537`ff), restated in `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:173-228` and pinned beside a `CHECK` at `tests/vllm/test_gguf_keep_quant.cpp:478-494` | llama.cpp pp128 173.2, tg32 25.09 tok/s, peak RSS 2.798 GiB, giving "RSS gap CLOSED to `1.01x`", "prefill 204 t/s = `1.18x` AHEAD", "decode ~parity" | **yes** for the three ratios, **no** for the keep-f16 default | **the only site where a contaminated denominator reaches shipped behaviour, and the default is NOT safe from it.** `VT_GGUF_KEEP_F16` is DEFAULT ON. Its binding A/B has three axes and **two regress**: prefill about 10% worse (224 to 204 t/s) and decode about 1.4% worse, bought for 1.05 GiB of RSS. The recorded reason the prefill loss is acceptable is `:595`, "comfortably above the competitor floor", which IS the contaminated `pp128 173.2`. An earlier pass called the default safe by citing only the RSS leg. See §"The keep-f16 default rests on the contaminated floor". The product comment also quotes a `1.16x AHEAD of pp128 176.6` that no recorded run produces, see §"176.6 is not a number this tree measured". Its `173.2 / 25.09` legs are a distinct session from rows 2, 3 and 5, so this is a genuinely separate contaminated measurement rather than a restatement |
+
+| 13 | `.agents/specs/laguna-s21-w7-speed-2026-07-31.md:15-16`, `:68`, `:100`, `:147`, `:175`, `:240`, with `.agents/benchmark-record.md:884`, `:898`, `:11753`, `:11759`, `:11761` | Laguna-S-2.1 on the identical UD-Q4_K_XL GGUF: decode **27.8 tok/s** (36.0 ms/tok, 183 GB/s = 76% of the GB10 240 GB/s peak), giving the campaign's `15x` warm and `18x` cold gap, then `18x → 4.7x` at W8 and `18x → 3.6x` at W9 | **yes** | **a FIFTH revision, and the worst-identified of the five.** The denominator is a **Poolside fork** of llama.cpp, branch `laguna` (`.agents/specs/laguna-s21-w4-2026-07-31.md:65` names `github.com/poolsideai/llama.cpp@laguna`). A branch is not a revision. `git grep -i poolside` returns no SHA for it anywhere in this tree, so by this row's own definition the tree cannot be identified and the number is unreproducible. It is not fork-`237ad9b96`-contaminated and it is not stock. No verdict here is favourable to us, so it does not join the seven, but it is the **target** the whole Laguna speed campaign is ranked against |
 
 Row 9 is the one to read twice. It is the only arm whose author noticed the pin
 was unobtainable, and the correct handling of that discovery, a recorded explicit
 substitution, still produced a number attributed to a revision the registry never
 pinned. The defect is the registry, not that file.
+
+### The keep-f16 default rests on the contaminated floor, and an earlier pass said it did not
+
+This is the correction that reaches a user's bytes, so it is stated at length.
+
+An earlier pass of this row was asked whether the llama.cpp figure was
+load-bearing for `VT_GGUF_KEEP_F16` shipping DEFAULT ON. It answered no: the
+default stands on a same-binary ours-versus-ours A/B, `3.885 → 2.832 GiB` with
+tokens byte-identical, which no denominator move touches. That answer is
+**wrong**, and it is wrong in the most ordinary way an answer can be. It read one
+row of a three-row table.
+
+The owning A/B is `.agents/specs/gguf-keep-quant-loader.md:587-590`, mirrored at
+`.agents/benchmark-record.md:10726-10728`. It has **three** axes, and **two of
+them move against the default**:
+
+| arm | peak RSS | TTFT, 3 reps | prefill | TPOT | decode |
+|---|---|---|---|---|---|
+| base, keep-f16 OFF | 3.885 GiB | 570/571/574 ms | 224 t/s | 40.4 ms | 24.7 t/s |
+| **L7 default, keep-f16 ON** | **2.832 GiB** | 628/625/625 ms | **204 t/s** | 40.95 ms | 24.4 t/s |
+
+Peak RSS improves by 1.05 GiB. Prefill gets about **10% worse** (571 to 625 ms
+median TTFT, 224 to 204 t/s). Decode gets about **1.4% worse**. The default is a
+deliberate trade, which is fine and normal. What matters is the tie-break: **why
+is losing 10% of prefill acceptable?**
+
+The spec answers that question in the llama.cpp denominator's own terms, at
+`:595-597`:
+
+> Prefill 204 t/s = 1.18x AHEAD of pp128 173.2 (prefault removed L6's 0.72x
+> regression; ~9% under the keep-f16-off default's 224 t/s but **comfortably
+> above the competitor floor**).
+
+The clause "comfortably above the competitor floor" **is** the justification for
+accepting the prefill loss, and that floor is `pp128 173.2`, measured against the
+contaminated fork `237ad9b96`. So the contaminated denominator is not decoration
+on this default. It is the reason one of its two regressions was accepted.
+
+**The consequence, stated so the re-taking agent cannot miss it.** `b10451` is
+**624 commits** past `b9827` and carries upstream's own `fused_gdn`, so the
+direction is **not established** (§"Direction of the error"). If a re-taken stock
+`pp128` lands **above 204 t/s**, the "comfortably above the competitor floor"
+clause fails, and the default's only recorded justification for its prefill loss
+is gone. The RSS leg would still stand on its own, and it may well be enough. The
+point is that this would then be a **live decision** rather than a settled one,
+and nothing in the tree currently tells anyone to reopen it.
+
+**The default is NOT changed here, deliberately.** This row has measured nothing
+and holds no host authority, and flipping a shipped default on an argument rather
+than a measurement is the failure this row exists to remove. The decision belongs
+to `QUANT-GGUF-KEEPQ-LOADER` and needs the re-take first. What changes here is
+that the question is recorded as open in all four places that previously recorded
+it as closed: this spec, `docs/BENCHMARKS.md`, the product comment, and #1003's
+index row, which said "the default itself stands" and now says the default is
+owed a decision.
+
+**The general lesson, because it is not about keep-f16.** A default justified by
+a multi-axis trade is only as sound as the tie-break on its **worst** axis.
+Quoting the axis that improved and calling the acceptance ours-versus-ours is
+true about the axis quoted and false about the decision. When you are asked
+whether a denominator is load-bearing, find the axis that **regressed** and read
+why that was accepted, because the denominator is almost always hiding there.
+
+### 176.6 is not a number this tree measured
+
+Row 12 carries a second defect, independent of the repin and of the default
+question, and it is the same shape as the `b9892` collision this row exists to
+remove: **one claim with two denominators, and the one in the product code is
+unsourced.**
+
+| Where | Claim |
+|---|---|
+| `src/.../gguf_keep_quant.cpp`, before this pass | "restoring prefill to **~205 t/s** = **1.16x** AHEAD of pp128 **176.6**" |
+| `.agents/specs/gguf-keep-quant-loader.md:595`, the owning spec | "Prefill **204 t/s** = **1.18x** AHEAD of pp128 **173.2**" |
+| `.agents/benchmark-record.md:10722`, `:10733`, the binding record | llama.cpp fresh on the same host, **pp128 173.2 ± 2.7**, and our arm **204 t/s** at **1.18x AHEAD** |
+
+`git grep '176.6'` returns the two product-comment lines and exactly one other
+site, `.agents/benchmark-record.md:20688`, which is the mean of an unrelated MoE
+`bps` microbenchmark **in microseconds** and has nothing to do with llama.cpp.
+`git grep '173.2'` returns the binding record, the owning spec, the L7 session,
+and rows 2 and 5 of this enumeration, which is what a real denominator looks
+like.
+
+**No recorded llama.cpp run produces 176.6, and no recorded run of ours produces
+205 t/s.** The pair is internally consistent, since 205/176.6 = 1.16, so it was
+computed rather than mistyped, but neither operand appears in any evidence file.
+The row 1 arm did record a `pp128 177.32` in a **different** session
+(`.agents/benchmark-record.md:10792`), which is the nearest candidate and is
+still not 176.6, and pairing it with 205 does not give 1.16 either.
+
+**This row does not pick one.** Reconciling the pair by rewriting `176.6` to
+`173.2` and `205` to `204` would silently assert that the comment always meant
+the record's numbers, and that is exactly the undocumented re-derivation this row
+was opened to stop. Both denominators are superseded anyway, so the difference
+changes no decision today. What the comment now says is what is true: the figures
+it quotes **cannot be traced to any recorded run**, the owning record says 204
+against 173.2, and #1003 owes a single re-measured pair to replace both. If the
+re-take finds the session that produced 176.6, it can be recorded then, with
+provenance.
+
+**Row 13 is worse than row 9, and the `×` repair is the only reason it is here.**
+Row 9's author at least recorded which object they substituted. Row 13 names a
+GitHub org and a branch name, which resolves to a different commit every time
+anyone pushes to it, and it has driven a multi-week campaign's target since
+2026-07-31. It sat behind a dead regex branch for five drafts of this spec. The
+`27.8` is not a stale pin, it is a number with no pin at all.
 
 **Row 12 was missed by the adjudication, not by the sweep, and that distinction
 is the point.** `.agents/specs/gguf-keep-quant-loader.md:128` is inside the old
@@ -534,11 +793,15 @@ the path set decides what can be seen, and the adjudication decides what is
 looked at. Widening the first one repaired an instance of the second by
 accident, which is not a method anyone should rely on twice.
 
-### Four llama.cpp revisions are in play, not two
+### Five llama.cpp revisions are in play, and one of them is not a revision
 
-An earlier draft of this row wrote the replacement universal "all but the Pi 5
-arm ran `237ad9b96`, and the Pi 5 arm ran stock `b9892`". Stage 3 of the sweep
-disproves it. Read each revision from the evidence that produced it:
+This heading has now been wrong twice, in the same direction each time. The first
+draft wrote the universal "all but the Pi 5 arm ran `237ad9b96`, and the Pi 5 arm
+ran stock `b9892`". Stage 3 of the sweep disproved it and the heading became
+"four, not two". The `×` repair disproves that one too. A section written to
+replace a universal a sweep disproved was itself an undercount, which is what an
+enumeration does whenever the instrument behind it is not asserted. Read each
+revision from the evidence that produced it:
 
 | Revision | What it is | Binding measurements | Where the tree records it |
 |---|---|---|---|
@@ -546,11 +809,21 @@ disproves it. Read each revision from the evidence that produced it:
 | `ee445f93d` | stock tag `b9892` | row 9, the Pi 5 arm | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`, which records the substitution |
 | `704485942` | stock master, `b10362-5`, 2026-08-11 | row 10, Muse Glimmer and #391 | `.agents/benchmark-record.md:18964,18996,19221` |
 | `030ebb5` | stock tag `b10358` | none. One contended `pp32 9.79 / tg8 0.79` datapoint, recorded **NON-BINDING** with our own arm blocked in the tokenizer | `.agents/benchmark-record.md:18159` |
+| **none recorded** | a **Poolside fork**, branch `laguna` at `github.com/poolsideai/llama.cpp` | **row 13**, the entire Laguna speed campaign's `27.8 tok/s` target | `.agents/specs/laguna-s21-w4-2026-07-31.md:65` and `laguna-s21-scope-2026-07-30.md:161`, both of which name the branch and neither of which names a commit |
 
 `704485942` appeared nowhere in `docs/`, in this spec, or in the issue index
-before this pass, although it is the denominator of the only llama.cpp win on
-the public page besides the GB10 prefill. That is the cost of writing a universal
-instead of stating what a sweep found.
+before the previous pass, although it is the denominator of the only llama.cpp
+win on the public page besides the GB10 prefill. That is the cost of writing a
+universal instead of stating what a sweep found.
+
+**The fifth row is the one this section could not previously state, because it is
+the only entry with an empty first column.** The other four are pinnable: three
+are fetchable upstream objects and one is a local commit that at least names a
+tree. A branch name is a moving reference, so row 13's denominator was never
+capable of being reproduced, before or after this repin. `AGENTS.md` §"When vLLM
+has no implementation" calls an unpinned upstream "a moving target, not an
+oracle", and this is that, inside a campaign that has been ranking levers against
+it for weeks.
 
 ### The owed sweep, counted reproducibly
 
@@ -668,9 +941,12 @@ moves, not by the size of the margin:
    reason the other six do not have: it is quoted in
    `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp` as the
    justification for `VT_GGUF_KEEP_F16` shipping DEFAULT ON, so this is the one
-   verdict on the list that a user's bytes depend on rather than a page. The
-   default is safe, because its acceptance is the same-binary ours-versus-ours
-   A/B. The written justification is not.
+   verdict on the list that a user's bytes depend on rather than a page.
+   **The default is not safe from it**, which corrects an earlier draft of this
+   line. Its A/B trades about 10% of prefill and about 1.4% of decode for 1.05
+   GiB, and the recorded reason that prefill loss is acceptable is stated in the
+   contaminated floor's own terms. A re-taken stock `pp128` above 204 t/s removes
+   it. See §"The keep-f16 default rests on the contaminated floor".
 5. **`KERNEL-GEMM-CPU-TILED` "at parity with ggml's stock kernel, slightly ahead
    on four of six shapes"** (row 11), in `.agents/kernel-matrix.md:162`. The one
    entry not on the public page. The bands overlap (ours 216-242, ggml 208-215
@@ -826,6 +1102,29 @@ derived", §"The owed sweep, counted reproducibly", and the enumeration,
 reproducible by anyone with a clone of `ggml-org/llama.cpp` plus the developer's
 fork.
 
+**The sweep is the exception, and it carries a red-before/green-after pair like a
+checker change, because it behaves like one.** The `CMP` repair is the only edit
+in this row that changes what an instrument reports rather than what a document
+says, so asserting it would not be enough:
+
+1. **The self-test is armed, proved by mutation rather than by reading.** Extract
+   the spec's `python` block verbatim, replace `(?:x\b|×)` with the defective
+   `[x×]\b` it came from, and run it. It exits **`rc=1`** with
+   `AssertionError: CMP self-test FAILED on ['1.18× llama.cpp', '| 1.023× |', '2×
+   over llama.cpp']`, naming exactly the three shapes §"A token can be WRONG as
+   well as MISSING" measures. The mutation was confirmed to have **applied**, by
+   diffing the mutated source against the original before running it, because a
+   mutation that never applied reads as a passing test.
+2. **The repaired block runs green on the same extraction**, `rc=0`, with the
+   assertion reached and passed rather than skipped.
+3. **The block in this spec is the block that was run.** It is extracted from the
+   committed markdown and executed, not retyped, so the code a reader copies is
+   the code the evidence covers.
+
+That third point is the one worth keeping. A sweep that lives in a document is
+trustworthy only while the document's copy is the copy somebody ran, and this row
+spent five drafts trusting a copy nobody had executed.
+
 **One instrument precondition has to be asserted before any of the llama.cpp-side
 commands are trusted.** `/home/mudler/_git/llama.cpp` is a SHALLOW clone,
 grafted at `687e77892`. `git rev-parse --is-shallow-repository` returns `true`
@@ -909,8 +1208,11 @@ burned by twice.
   cares about: it is guarded on `git merge-base --is-ancestor origin/main HEAD`
   (`scripts/agent-preflight.sh:226-234`) and it printed nothing at all before the
   merge, which is what "silently skipping" looks like. It examined every commit in
-  `origin/main..HEAD`, 9 of them at this head, and the count is the thing to
-  re-derive rather than trust, for the same reason the anchor counts are.
+  `origin/main..HEAD`, **11** of them at `85a9a7ae7`, and the count is the thing
+  to re-derive rather than trust, for the same reason the anchor counts are. It
+  read 9 two commits earlier and the paragraph was not updated, which is the
+  measurement-of-one-file-inside-another coupling again, at the smallest possible
+  scale. Run `git rev-list --count origin/main..HEAD`.
 
 ## Stop conditions
 
@@ -928,16 +1230,29 @@ burned by twice.
 
 ## Owed
 
-- [#1003](https://github.com/mudler/vllm.cpp/issues/1003): re-take all **twelve**
-  contaminated measurements against `b10451`, on the host that produced each,
-  and run the `b9827` stock versus `237ad9b96` fork A/B that isolates our own 65
-  commits from upstream drift. **Seven** of the twelve carry a verdict favourable
-  to us, ranked by fragility in §"Direction of the error". Re-taking the GB10
-  prefill alone does not discharge this. The twelfth arrived with the widened
-  path set and is the one that reaches shipped behaviour: re-taking it also owes
-  the comment at
-  `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:184-203` and the one
-  beside the `CHECK` at `tests/vllm/test_gguf_keep_quant.cpp:480-485`.
+- [#1003](https://github.com/mudler/vllm.cpp/issues/1003): re-take all
+  **thirteen** contaminated measurements against `b10451`, on the host that
+  produced each, and run the `b9827` stock versus `237ad9b96` fork A/B that
+  isolates our own 65 commits from upstream drift. **Seven** of the thirteen
+  carry a verdict favourable to us, ranked by fragility in §"Direction of the
+  error". Re-taking the GB10 prefill alone does not discharge this. The twelfth
+  arrived with the widened path set and is the one that reaches shipped
+  behaviour: re-taking it also owes the comment at
+  `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:173-228` and the one
+  beside the `CHECK` at `tests/vllm/test_gguf_keep_quant.cpp:478-494`.
+- **The thirteenth cannot be re-taken the same way, and it is a different
+  obligation.** Row 13's denominator is a branch name, not a commit, so there is
+  no object to re-measure against. Re-taking it means choosing a revision first:
+  either stock `b10451` if it now carries `laguna`, or a named Poolside commit
+  recorded as a sixth entry in §"Five llama.cpp revisions are in play", and only
+  then running the arm. Until one is chosen, `27.8 tok/s` has no pin and the
+  Laguna campaign's `15x` to `18x` target is unreproducible.
+- **The keep-f16 default is owed a decision, not only a re-wording, and #1003's
+  index row now says so.** See §"The keep-f16 default rests on the contaminated
+  floor". Its prefill tie-break is stated in llama.cpp's own terms, so a re-taken
+  stock `pp128` above 204 t/s removes the default's only recorded justification.
+  The default is NOT changed here. That is `QUANT-GGUF-KEEPQ-LOADER`'s decision
+  and it needs the re-take first.
 - [#857](https://github.com/mudler/vllm.cpp/issues/857): build and run stock
   `b10451` on dgx.casa and record the measured identity, recipe, and evidence
   that lets `gateable` become `yes`. Until then this oracle is visible debt.
@@ -950,14 +1265,20 @@ burned by twice.
 - `KERNEL-GEMM-CPU-TILED`: its recorded "ahead on four of six shapes" reads as
   five of six in its own evidence table. Reported in §"Direction of the error",
   owned by that row, and settled by the row 11 re-take under #1003.
+- **The build recipes, which are a separate surface the sweep does not reach.**
+  `.agents/environment.md:435` is marked by this pass, but it was found by
+  reading row 7's Evidence column rather than by the sweep, and the general case
+  is not closed. See §"The sweep sees verdicts, not recipes".
 
 ## Now
 
 Records only. The pin moves to stock `b10451`, `gateable` drops to `no`, and
 every llama.cpp-side number in the tree is enumerated and marked owed. The
-enumeration is the output of a recorded sweep rather than a hand list, and the
-sweep now scans **every tracked file** rather than three named directories,
-because its own path set was a hand list and `README.md` fell outside it. Twelve
-contaminated measurements, seven favourable verdicts, four llama.cpp revisions.
-No row changes lifecycle state, and no number is re-taken. The oracle is
-deliberately ungateable until #857 builds and runs the new pin.
+enumeration is the output of a recorded sweep rather than a hand list, the sweep
+scans **every tracked file** rather than three named directories, and it now
+**self-tests before it runs**, because its `×` token was present and dead and
+that is a defect no amount of re-reading the list would find. Thirteen
+contaminated measurements, seven favourable verdicts, five llama.cpp revisions,
+one of which is a branch name with no commit behind it. No row changes lifecycle
+state, and no number is re-taken. The oracle is deliberately ungateable until
+#857 builds and runs the new pin.

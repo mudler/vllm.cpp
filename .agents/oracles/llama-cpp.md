@@ -25,10 +25,21 @@ a working tree carrying 27 uncommitted entries. Six of those 65 commits change
 discriminated SSM_CONV decode op default-on with CPU reference implementations
 that stock does not have, so the CPU arm was affected and not only the CUDA arm.
 The label `b9892` was derived from `git rev-list --count`, and upstream tag
-`b9892` is a real, different object at `ee445f93d`. All nine affected
-measurements are enumerated with a re-take verdict each in
-[`../specs/oracle-llamacpp-repin-stock.md`](../specs/oracle-llamacpp-repin-stock.md),
-and [#1003](https://github.com/mudler/vllm.cpp/issues/1003) owes the re-take. The
+`b9892` is a real, different object at `ee445f93d`.
+
+**The affected measurements are enumerated, with a re-take verdict each, in
+[`../specs/oracle-llamacpp-repin-stock.md`](../specs/oracle-llamacpp-repin-stock.md).
+That spec is the one source of truth for the set, and this file deliberately does
+not restate its size.** It used to say "all nine" while that spec listed twelve,
+and then thirteen. A count of one file kept inside another goes stale the moment
+the first file grows, which `AGENTS.md` §Records names as the coupling to avoid,
+and this is the first surface a reader of the pin reaches. The set has grown
+three times, each time because a sweep instrument was widened rather than because
+anything new was measured, so any number you remember is a lower bound. That spec
+also records **five** llama.cpp revisions in play, one of which is a fork branch
+with no commit recorded anywhere in this tree.
+
+[#1003](https://github.com/mudler/vllm.cpp/issues/1003) owes the re-take. The
 superseded measurements stay where they are, with their provenance, including
 [`../specs/cpu-llamacpp-floor-remeasure-2026-07-22.md`](../specs/cpu-llamacpp-floor-remeasure-2026-07-22.md)
 and the A76 dot-product, elementwise-GEMM, GDN-orientation and threadpool specs.

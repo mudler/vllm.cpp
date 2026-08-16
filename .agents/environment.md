@@ -431,8 +431,21 @@ inner 4096, state 128; context 262144.
   only `GL_KHR_cooperative_matrix`, and the build still configures and runs. A
   source-built shaderc `v2026.4-dev` lives at `/tmp/shaderc/b/glslc/glslc`; pass
   `-DVulkan_GLSLC_EXECUTABLE=` to it. **Verify the runtime banner says
-  `matrix cores: NV_coopmat2` before trusting any number.** llama.cpp at pin
-  `237ad9b96` is unpacked at `~/lcpp-vk` with `build-vk/bin/llama-bench` built.
+  `matrix cores: NV_coopmat2` before trusting any number.** llama.cpp is
+  unpacked at `~/lcpp-vk` with `build-vk/bin/llama-bench` built, **and that tree
+  is the SUPERSEDED fork `237ad9b96`, not the pin.** Do not reuse it. The
+  llama.cpp oracle is stock `b10451` since 2026-08-16
+  ([`oracles/llama-cpp.md`](oracles/llama-cpp.md)). `237ad9b96` is a local-only
+  commit on the developer's `localai-paged` branch, 65 of our own performance
+  commits past upstream `b9827`, built from a working tree with 27 uncommitted
+  entries. `~/lcpp-vk` therefore reproduces neither the pin nor any identifiable
+  object. The `BENCH-VK-LLAMA` decode `4.36 vs 4.35 MET` measured with it is the
+  **most fragile verdict** in the enumeration, a 0.23% margin inside a 0.69%
+  spread, and re-taking it is owed under
+  [#1003](https://github.com/mudler/vllm.cpp/issues/1003). Unpack the pinned SHA
+  fresh and assert `git status --porcelain` empty before recording any number.
+  Enumeration and the clean-tree rule:
+  [`specs/oracle-llamacpp-repin-stock.md`](specs/oracle-llamacpp-repin-stock.md).
 
 - **No Intel GPU exists on any box here**, so `BACKEND-XPU` end-to-end work is
   HW-BLOCKED; only policy-port, compile coverage and oneAPI CPU-device unit

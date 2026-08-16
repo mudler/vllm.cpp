@@ -26,6 +26,8 @@
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre: Qwen3_5MTPModel complete type for the owned draft member
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
+#include "vllm/v1/attention/backend.h"  // AttentionBackend / get_kv_cache_shape (M3)
+#include "vllm/v1/attention/registry.h"  // SelectAttentionBackendName / MakeAttentionBackend (M3)
 #include "vllm/v1/kv_cache_dtype.h"  // ResolveKvCacheDType (VT_KV_CACHE_F32 A/B)
 #include "vllm/v1/kv_offload/lmcache/lmcache_connector.h"  // KV-EXTERNAL-CACHE worker store/load
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
@@ -501,6 +503,19 @@ GPUModelRunner::CacheBuffer::~CacheBuffer() {
 }
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
+  // ENGINE-LEVEL ATTENTION-BACKEND SELECTION (M3, issue #41). This is the first
+  // runtime call of the selection seam: SelectAttentionBackendName walks the
+  // device platform's capability-ordered priority list and returns the first
+  // REGISTERED name (vllm/v1/attention/registry.h). On ROCm this now resolves to
+  // "ROCM_ATTN" (backend.cpp, M3); on CPU/CUDA/Metal/Vulkan it resolves to
+  // "FLASH_ATTN" — the name whose NHD KV layout every device kernel reads. The
+  // resolved name drives the per-layer PagedKvCache view geometry below (the
+  // backend's get_kv_cache_shape must describe the layout the engine allocates),
+  // so a future backend with a different layout fails LOUDLY at init instead of
+  // silently mis-viewing the cache. Mirrors upstream gpu_model_runner.py:289-293
+  // (attn_backend = get_attn_backend_cls(...) resolved once per runner).
+  attn_backend_name_ = vllm::v1::SelectAttentionBackendName(
+      vllm::platforms::GetPlatform(queue_.device.type));
   num_blocks_ = kv_cache_config.num_blocks;
   // GDN mamba-state slots = max concurrent sequences (one recurrent state per
   // sequence), decoupled from the attention num_blocks. Guard against a 0 (e.g.
@@ -912,6 +927,34 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.block_size = fa_block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
+    // M3: the backend that selection resolved (attn_backend_name_) must describe
+    // the NHD layout this view + KvSlice build — (num_blocks, 2, block_size,
+    // num_kv_heads, head_size) — or the engine is silently assuming a layout the
+    // backend does not claim. FLASH_ATTN and ROCM_ATTN both declare exactly this
+    // shape; a future backend with a different layout fails here at init.
+    if (const char* dbg = std::getenv("VT_ATTN_SELECT_LOG");
+        dbg != nullptr && dbg[0] == '1') {
+      std::fprintf(stderr,
+                   "[attn-select] backend=%s device=%d shape=[%lld,2,%lld,%lld,%lld]\n",
+                   attn_backend_name_.c_str(),
+                   static_cast<int>(queue_.device.type),
+                   static_cast<long long>(num_blocks_),
+                   static_cast<long long>(fa_block_size),
+                   static_cast<long long>(fa_dims[i].num_kv_heads),
+                   static_cast<long long>(fa_dims[i].head_size));
+    }
+    const auto shape = vllm::v1::MakeAttentionBackend(
+        queue_.device.type, attn_backend_name_)
+        ->get_kv_cache_shape(num_blocks_, fa_block_size,
+                             fa_dims[i].num_kv_heads, fa_dims[i].head_size);
+    const bool shape_matches =
+        shape.size() == 5 && shape[0] == num_blocks_ && shape[1] == 2 &&
+        shape[2] == fa_block_size && shape[3] == fa_dims[i].num_kv_heads &&
+        shape[4] == fa_dims[i].head_size;
+    VT_CHECK(shape_matches,
+             "runner: attention backend " + attn_backend_name_ +
+                 " declares a KV shape that does not match the engine's NHD "
+                 "PagedKvCache view");
     attn_kv_.push_back(kv);
   }
 

@@ -224,6 +224,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   InputBatch& input_batch() { return input_batch_; }
   const InputBatch& input_batch() const { return input_batch_; }
   const std::vector<PagedKvCache>& attn_kv() const { return attn_kv_; }
+  // The ENGINE-level attention backend selected for this runner's device
+  // (resolved once in initialize_kv_cache via vllm::v1::SelectAttentionBackendName
+  // — the same walk the registry test covers). Empty only if no full-attention
+  // group exists (a pure-GDN / pooling model caches no paged KV).
+  const std::string& attn_backend_name() const { return attn_backend_name_; }
   const std::vector<GdnStateCache>& gdn_state() const { return gdn_state_; }
   // The compact GDN state-slot pool size (== max_num_reqs). Exposed for the
   // state-slot uniqueness regression tests.
@@ -817,6 +822,8 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
+  // Selected attention backend name for queue_.device.type (see accessor).
+  std::string attn_backend_name_;
 
   // ── KV-EXTERNAL-CACHE (LMCache) worker-side store/load ──────────────────────
   // Non-owning; null (default) = inert. See set_kv_connector.

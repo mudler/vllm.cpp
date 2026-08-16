@@ -366,6 +366,23 @@ therefore run at `Release`, which is the configuration `scripts/build-cpu-releas
 itself uses. The three new suites were additionally run under `Debug` while they
 were being written, so the assertion-bearing arm is covered too.
 
+TWO checkers disagree about `.agents/issue-index.md` and neither is weakened
+here. `check-agent-record` refuses the duplicated `#995` row that arrived with
+the `origin/main` merge; `check-issue-index-append-only` refuses the deletion
+that would resolve it. Removing the line made the first green and the second red,
+so the line was RESTORED and the conflict is filed as
+[#1027](https://github.com/mudler/vllm.cpp/issues/1027) and listed under
+`## Owed`. Deciding which checker gives way is a semantic checker change, which
+AGENTS.md routes through its own spec, red-before test and fresh review, and
+explicitly excludes from the in-flow rule. `check-agent-record` is therefore red
+on this branch AND on `origin/main`, from the same two rows.
+
+`test_cpu_x86_llamacpp_floor`'s contended-leg case is load-dependent and is not
+repaired here either. It failed at loadavg 157 with `NO_QUIET_WINDOW` (4) instead
+of `GIVING_UP` (2) and passed at loadavg 21 on the same tree, which is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) verbatim. The load was this
+branch's own full build, so the attribution is measured rather than assumed.
+
 Known pre-existing red, NOT caused by this row and not repaired here.
 `check-env-doc` and `test_check_env_doc` failed on pristine `332aed738`
 (`VT_MOE_EXPERT_STREAM`, `VT_MOE_EXPERT_STREAM_SLOTS`,
@@ -440,6 +457,7 @@ upstream's own supported configuration.
 |---|---|---|
 | DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | our-ON == our-OFF == vLLM-ON, token for token on the golden prefix, at EACH depth, with nonzero acceptance and the per-depth counters populated at every depth up to k, plus spec-OFF byte-identical. It must run the DEFAULT bf16 GDN state, because the CPU gate here runs the f32 arm for the reason in section 4.5, so the GDN speculative rollback at depth is UNEXERCISED until this runs | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change, because today's single-query-length admission is the only thing that keeps the `S`-only key unambiguous (`qwen3_5.cpp:9214,9237`). Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
+| The duplicated `#995` row in `.agents/issue-index.md` ([#1027](https://github.com/mudler/vllm.cpp/issues/1027)) | A decision on WHICH checker gives way, with the spec, red-before test and fresh review a semantic checker change needs. `check-agent-record` refuses the duplicate; `check-issue-index-append-only` refuses the deletion that resolves it. The file cannot be made green by any edit to itself, so this is not an in-flow fix. When taken, delete the LATER row, for the merge-stability reason in the issue | `SPEC-MTP-K-GT-1`, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
 | M2 speed A/B at matched k | concurrency-1 and concurrency>1 throughput against vLLM same-config at matched k, plus the acceptance-versus-depth curve for prose and for code | [#81](https://github.com/mudler/vllm.cpp/issues/81) M2 |
 | M3 `SPEC-DYNAMIC` | `num_speculative_tokens_per_batch_size` and the dense batch-size to k lookup, mirrored from `vllm/config/speculative.py:177` and `vllm/v1/spec_decode/dynamic/utils.py:7,77` | [#81](https://github.com/mudler/vllm.cpp/issues/81) M3 |
 | M4 adaptive depth (acceptance EMA) | The controller is EXPLICITLY optional and out of scope here. It needs: an acceptance EMA that rises slowly and decays about twice as fast, a mapping from that EMA to a depth, default OFF, and an A/B on a mixed prose and code workload that it must WIN before it ships as a default. It is from-scratch, so it also owes a [porting-inventory.md](../porting-inventory.md) section 9 record. CONSTRAINT carried from #81: if the spec verify step is ever graphed, a graph is captured per K (`vllm/v1/worker/gpu/cudagraph_utils.py:200-220`), so K must be quantised to a small captured ladder and never a free 1..9. The ladder and the capture set are therefore designed together, not separately | [#81](https://github.com/mudler/vllm.cpp/issues/81) M4 |

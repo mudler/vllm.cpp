@@ -43,6 +43,23 @@
 // every upstream parameter to f32, so the oracle itself runs f32 and a dtype
 // comparison against it is vacuous by construction.
 //
+// ─── THE ARITHMETIC IS f32 TOO, AND USED NOT TO BE (#1008) ───────────────────
+// Storage being f32 says nothing about the width the arithmetic runs at, and
+// until #1008 this file accumulated every convolution, GEMM, norm and softmax in
+// `double` — a width no reference uses anywhere on this path. Upstream's ops are
+// plain `nn.Conv3d` / `nn.Conv2d` / `F.normalize` / SDPA, which accumulate in the
+// tensor dtype. That was MEASURED rather than assumed: on a reduction engineered
+// so the widths separate, `F.conv3d` returns 0.0 for f32 AND for bf16 tensors
+// while an f64 accumulator returns 2.5. The case
+// "the decode's convolution accumulates in f32" in tests/vllm/models/
+// test_ltx2_vae.cpp is that instrument, and it is the only gate here that can
+// see the width — for the reason the paragraph above gives.
+//
+// What deliberately stays f64, each annotated at its site: the pinned config
+// epsilons, the once-per-block scalars `sqrt(C)` and `1/sqrt(C)`, and the
+// TimestepEmbedding frequency table, which is a constant precompute rather than
+// a data path.
+//
 // PHASE L6 OWES THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
 // checkpoint dtype the way upstream does. Until it lands, this file is a
 // correctness reference, not the shipping path, and no memory or throughput
@@ -162,23 +179,38 @@ Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool
     for (int64_t ti = 0; ti < out.t; ++ti) {
       for (int64_t hi = 0; hi < out.h; ++hi) {
         for (int64_t wi = 0; wi < out.w; ++wi) {
-          double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
+          // f32, because that is the width `nn.Conv3d` accumulates in — MEASURED,
+          // not assumed: F.conv3d returns 0.0 on the separable reduction in
+          // tests/vllm/models/test_ltx2_vae.cpp for f32 AND for bf16 tensors,
+          // where an f64 accumulator returns 2.5 (#1008).
+          float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0f;
           for (int64_t ic = 0; ic < ci; ++ic) {
+            // BLOCKED, one partial sum per input channel, and this is the ORDER
+            // as well as the width. A single naive serial f32 sum over all
+            // `ci * kernel^3` taps accumulates error with sqrt of the whole
+            // length; splitting it into `ci` blocks of `kernel^3` accumulates
+            // with sqrt of each. That is not a local optimisation — torch's f32
+            // convolution is a blocked GEMM and sums exactly this way, which is
+            // why `torch.sum` on the separable reduction returns 2.0999999 where
+            // a naive serial f32 sum returns 0.0. Narrowing the width alone,
+            // with the naive order kept, pushed the non-causal tiled golden to
+            // 5.00679e-06 against a 5e-06 tolerance — MEASURED, and the reason
+            // this loop is shaped this way.
+            float tap = 0.0f;
             for (int64_t a = 0; a < kernel; ++a) {
               for (int64_t b = 0; b < kernel; ++b) {
                 for (int64_t d = 0; d < kernel; ++d) {
-                  acc += static_cast<double>(
-                             padded[static_cast<size_t>(((ic * pt + ti * stride_t + a) * ph +
-                                                         hi * stride_h + b) *
-                                                            pw +
-                                                        wi * stride_w + d)]) *
-                         static_cast<double>(weight[static_cast<size_t>(
-                             (((oc * ci + ic) * kernel + a) * kernel + b) * kernel + d)]);
+                  tap += padded[static_cast<size_t>(
+                             ((ic * pt + ti * stride_t + a) * ph + hi * stride_h + b) * pw +
+                             wi * stride_w + d)] *
+                         weight[static_cast<size_t>(
+                             (((oc * ci + ic) * kernel + a) * kernel + b) * kernel + d)];
                 }
               }
             }
+            acc += tap;
           }
-          out.data[out.At(oc, ti, hi, wi)] = static_cast<float>(acc);
+          out.data[out.At(oc, ti, hi, wi)] = acc;
         }
       }
     }
@@ -198,19 +230,25 @@ Volume Linear3d(const Volume& in, int64_t out_channels, const std::vector<float>
   const int64_t n = in.spatial();
   for (int64_t oc = 0; oc < out_channels; ++oc) {
     for (int64_t i = 0; i < n; ++i) {
-      double acc = bias[static_cast<size_t>(oc)];
+      // f32: this is an `nn.Conv3d` upstream too (make_linear_nd's dims==3
+      // branch, convolution.py:84-85), so it accumulates at the same width as
+      // every other conv on the path.
+      float acc = bias[static_cast<size_t>(oc)];
       for (int64_t ic = 0; ic < in.channels; ++ic) {
-        acc += static_cast<double>(in.data[static_cast<size_t>(ic * n + i)]) *
-               static_cast<double>(weight[static_cast<size_t>(oc * in.channels + ic)]);
+        acc += in.data[static_cast<size_t>(ic * n + i)] *
+               weight[static_cast<size_t>(oc * in.channels + ic)];
       }
-      out.data[static_cast<size_t>(oc * n + i)] = static_cast<float>(acc);
+      out.data[static_cast<size_t>(oc * n + i)] = acc;
     }
   }
   return out;
 }
 
 void Silu(std::vector<float>& x) {
-  for (float& v : x) v = static_cast<float>(v / (1.0 + std::exp(-static_cast<double>(v))));
+  // f32: `F.silu` computes in the activation dtype. `std::exp(-v)` on a float
+  // selects the float overload — spelling it `-static_cast<double>(v)` would
+  // quietly restore the f64 path this deliberately leaves.
+  for (float& v : x) v = v / (1.0f + std::exp(-v));
 }
 
 // PixelNorm() with its DEFAULT eps of 1e-8 (normalization.py:22, reached bare
@@ -218,16 +256,22 @@ void Silu(std::vector<float>& x) {
 // audio VAE gets through build_normalization_layer.
 void PixelNorm(std::vector<float>& x, int64_t channels, int64_t spatial, double eps) {
   for (int64_t i = 0; i < spatial; ++i) {
-    double mean_sq = 0.0;
+    // f32: `torch.mean(x**2, dim=...)` runs in the activation dtype
+    // (normalization.py:37-40).
+    float mean_sq = 0.0f;
     for (int64_t c = 0; c < channels; ++c) {
-      const double v = x[static_cast<size_t>(c * spatial + i)];
+      const float v = x[static_cast<size_t>(c * spatial + i)];
       mean_sq += v * v;
     }
-    mean_sq /= static_cast<double>(channels);
-    const double inv = 1.0 / std::sqrt(mean_sq + eps);
+    mean_sq /= static_cast<float>(channels);
+    // The reciprocal is f32 too: upstream is `x / torch.sqrt(mean_sq + eps)`
+    // with every term in the tensor dtype (normalization.py:37-40). `eps`
+    // remains an f64 PARAMETER because it is a pinned config threshold
+    // (Ltx2ConvVideoDecoderConfig::pixel_norm_eps); it is narrowed here, at the
+    // one point it enters the arithmetic.
+    const float inv = 1.0f / std::sqrt(mean_sq + static_cast<float>(eps));
     for (int64_t c = 0; c < channels; ++c) {
-      x[static_cast<size_t>(c * spatial + i)] =
-          static_cast<float>(x[static_cast<size_t>(c * spatial + i)] * inv);
+      x[static_cast<size_t>(c * spatial + i)] = x[static_cast<size_t>(c * spatial + i)] * inv;
     }
   }
 }
@@ -281,6 +325,12 @@ std::vector<float> TimestepEmbedding(double timestep, int64_t embedding_dim,
   constexpr int64_t kProjChannels = 256;
   constexpr double kMaxPeriod = 10000.0;
   const int64_t half = kProjChannels / 2;
+  // DELIBERATE f64 EXCEPTION, and the only one on this path. `proj` is a
+  // transcendental CONSTANT table — 256 cos/sin values built once per block from
+  // the timestep, never a per-element data-path accumulation — so it is off
+  // every hot path, and evaluating it in f64 sits closer to the exact value that
+  // upstream's f32 `torch.arange` table approximates. Everything downstream of
+  // it is f32 (#1008).
   std::vector<double> proj(static_cast<size_t>(kProjChannels));
   for (int64_t i = 0; i < half; ++i) {
     // downscale_freq_shift = 0, so the divisor is exactly half_dim.
@@ -298,23 +348,25 @@ std::vector<float> TimestepEmbedding(double timestep, int64_t embedding_dim,
   VT_CHECK(static_cast<int64_t>(w1.size()) == embedding_dim * kProjChannels,
            "ltx2 timestep embedding: linear_1 shape does not match the embedding dim");
 
-  std::vector<double> hidden(static_cast<size_t>(embedding_dim));
+  // f32 for both `nn.Linear` accumulators and for the hidden activation between
+  // them: upstream's TimestepEmbedder is two plain Linears with a SiLU, all in
+  // the activation dtype. The frequency table above stays f64 — see its note.
+  std::vector<float> hidden(static_cast<size_t>(embedding_dim));
   for (int64_t o = 0; o < embedding_dim; ++o) {
-    double acc = b1[static_cast<size_t>(o)];
+    float acc = b1[static_cast<size_t>(o)];
     for (int64_t i = 0; i < kProjChannels; ++i) {
-      acc += proj[static_cast<size_t>(i)] *
-             static_cast<double>(w1[static_cast<size_t>(o * kProjChannels + i)]);
+      acc += static_cast<float>(proj[static_cast<size_t>(i)]) *
+             w1[static_cast<size_t>(o * kProjChannels + i)];
     }
-    hidden[static_cast<size_t>(o)] = acc / (1.0 + std::exp(-acc));  // SiLU
+    hidden[static_cast<size_t>(o)] = acc / (1.0f + std::exp(-acc));  // SiLU
   }
   std::vector<float> out(static_cast<size_t>(embedding_dim));
   for (int64_t o = 0; o < embedding_dim; ++o) {
-    double acc = b2[static_cast<size_t>(o)];
+    float acc = b2[static_cast<size_t>(o)];
     for (int64_t i = 0; i < embedding_dim; ++i) {
-      acc += hidden[static_cast<size_t>(i)] *
-             static_cast<double>(w2[static_cast<size_t>(o * embedding_dim + i)]);
+      acc += hidden[static_cast<size_t>(i)] * w2[static_cast<size_t>(o * embedding_dim + i)];
     }
-    out[static_cast<size_t>(o)] = static_cast<float>(acc);
+    out[static_cast<size_t>(o)] = acc;
   }
   return out;
 }
@@ -330,12 +382,12 @@ void FeedSpatialNoise(Volume& x, const std::vector<float>& per_channel_scale,
   VT_CHECK(static_cast<int64_t>(plane.size()) == x.h * x.w,
            "ltx2 video vae: the noise stream returned the wrong element count");
   for (int64_t c = 0; c < x.channels; ++c) {
-    const double scale = per_channel_scale[static_cast<size_t>(c)];
+    // f32: upstream scales and adds the noise plane in the activation dtype.
+    const float scale = per_channel_scale[static_cast<size_t>(c)];
     for (int64_t ti = 0; ti < x.t; ++ti) {
       for (int64_t hi = 0; hi < x.h; ++hi) {
         for (int64_t wi = 0; wi < x.w; ++wi) {
-          x.data[x.At(c, ti, hi, wi)] += static_cast<float>(
-              static_cast<double>(plane[static_cast<size_t>(hi * x.w + wi)]) * scale);
+          x.data[x.At(c, ti, hi, wi)] += plane[static_cast<size_t>(hi * x.w + wi)] * scale;
         }
       }
     }
@@ -353,13 +405,15 @@ void ApplyAdaLn(Volume& x, const std::vector<float>& table, const std::vector<fl
            "ltx2 video vae: timestep embedding does not match rows x channels");
   const int64_t n = x.spatial();
   for (int64_t ch = 0; ch < c; ++ch) {
-    const double shift = static_cast<double>(table[static_cast<size_t>(shift_row * c + ch)]) +
-                         static_cast<double>(embed[static_cast<size_t>(shift_row * c + ch)]);
-    const double scale = static_cast<double>(table[static_cast<size_t>(scale_row * c + ch)]) +
-                         static_cast<double>(embed[static_cast<size_t>(scale_row * c + ch)]);
+    // f32: upstream adds two f32 tensors and applies `x * (1 + scale) + shift`
+    // in the activation dtype (resnet.py:135-147).
+    const float shift = table[static_cast<size_t>(shift_row * c + ch)] +
+                        embed[static_cast<size_t>(shift_row * c + ch)];
+    const float scale = table[static_cast<size_t>(scale_row * c + ch)] +
+                        embed[static_cast<size_t>(scale_row * c + ch)];
     for (int64_t i = 0; i < n; ++i) {
-      x.data[static_cast<size_t>(ch * n + i)] = static_cast<float>(
-          static_cast<double>(x.data[static_cast<size_t>(ch * n + i)]) * (1.0 + scale) + shift);
+      x.data[static_cast<size_t>(ch * n + i)] =
+          x.data[static_cast<size_t>(ch * n + i)] * (1.0f + scale) + shift;
     }
   }
 }
@@ -515,73 +569,87 @@ Volume AttnBlock3d(const Ltx2VaeWeights& weights, const std::string& prefix, con
   const double attn_scale = 1.0 / std::sqrt(static_cast<double>(c));
 
   Volume out = x;
-  std::vector<double> normed(static_cast<size_t>(c * n));
-  std::vector<double> q(static_cast<size_t>(c * n)), k(static_cast<size_t>(c * n)),
+  // f32 activations, not f64. Upstream holds q/k/v and the attention output in
+  // the tensor dtype (attention.py:63-67) and never promotes; these six buffers
+  // are the block's whole scratch footprint, so the width is bytes as well as
+  // arithmetic. `norm_scale` and `attn_scale` above stay f64 — upstream's
+  // `channels**0.5` is a Python float evaluated once per block.
+  std::vector<float> normed(static_cast<size_t>(c * n));
+  std::vector<float> q(static_cast<size_t>(c * n)), k(static_cast<size_t>(c * n)),
       v(static_cast<size_t>(c * n));
-  std::vector<double> scores(static_cast<size_t>(n));
-  std::vector<double> attended(static_cast<size_t>(c * n));
+  std::vector<float> scores(static_cast<size_t>(n));
+  std::vector<float> attended(static_cast<size_t>(c * n));
 
   for (int64_t frame = 0; frame < x.t; ++frame) {
     // _RMSNorm2D: F.normalize(x, dim=1) * (sqrt(C) * gamma) — an L2 normalize with
     // torch's 1e-12 floor, not a mean-square RMS.
     for (int64_t i = 0; i < n; ++i) {
-      double sum_sq = 0.0;
+      // f32: `F.normalize(x, dim=1)` computes its norm in the input dtype
+      // (attention.py:23). torch's 1e-12 floor stays f64 — it is a threshold.
+      float sum_sq = 0.0f;
       for (int64_t ch = 0; ch < c; ++ch) {
-        const double value = x.data[x.At(ch, frame, i / x.w, i % x.w)];
+        const float value = x.data[x.At(ch, frame, i / x.w, i % x.w)];
         sum_sq += value * value;
       }
-      const double inv = 1.0 / std::max(std::sqrt(sum_sq), kLtx2RmsNorm2dEps);
+      const float inv = static_cast<float>(
+          1.0 / std::max(std::sqrt(static_cast<double>(sum_sq)), kLtx2RmsNorm2dEps));
+      // Same left-to-right association the f64 arm used; only the width changes.
+      const float norm_scale_f = static_cast<float>(norm_scale);
       for (int64_t ch = 0; ch < c; ++ch) {
-        normed[static_cast<size_t>(ch * n + i)] =
-            x.data[x.At(ch, frame, i / x.w, i % x.w)] * inv * norm_scale *
-            static_cast<double>(gamma[static_cast<size_t>(ch)]);
+        normed[static_cast<size_t>(ch * n + i)] = x.data[x.At(ch, frame, i / x.w, i % x.w)] * inv *
+                                                  norm_scale_f * gamma[static_cast<size_t>(ch)];
       }
     }
     // to_qkv is a 1x1 Conv2d emitting [q | k | v] along the channel axis, and the
     // rearrange to tokens keeps that split on the LAST axis (attention.py:63-64).
+    // f32: `to_qkv` is a 1x1 nn.Conv2d (attention.py:55), the same accumulator
+    // width as every other conv here.
     for (int64_t oc = 0; oc < 3 * c; ++oc) {
-      std::vector<double>& dst = oc < c ? q : (oc < 2 * c ? k : v);
+      std::vector<float>& dst = oc < c ? q : (oc < 2 * c ? k : v);
       const int64_t row = oc % c;
       for (int64_t i = 0; i < n; ++i) {
-        double acc = qkv_b[static_cast<size_t>(oc)];
+        float acc = qkv_b[static_cast<size_t>(oc)];
         for (int64_t ic = 0; ic < c; ++ic) {
-          acc += normed[static_cast<size_t>(ic * n + i)] *
-                 static_cast<double>(qkv_w[static_cast<size_t>(oc * c + ic)]);
+          acc += normed[static_cast<size_t>(ic * n + i)] * qkv_w[static_cast<size_t>(oc * c + ic)];
         }
         dst[static_cast<size_t>(row * n + i)] = acc;
       }
     }
+    // f32: SDPA computes scores, softmax and the value-weighted sum in the
+    // tensor dtype (attention.py:65). `attn_scale` stays f64 for the same reason
+    // `norm_scale` does.
+    const float attn_scale_f = static_cast<float>(attn_scale);
     for (int64_t i = 0; i < n; ++i) {
-      double max_score = -std::numeric_limits<double>::infinity();
+      float max_score = -std::numeric_limits<float>::infinity();
       for (int64_t j = 0; j < n; ++j) {
-        double dot = 0.0;
+        float dot = 0.0f;
         for (int64_t ch = 0; ch < c; ++ch) {
           dot += q[static_cast<size_t>(ch * n + i)] * k[static_cast<size_t>(ch * n + j)];
         }
-        scores[static_cast<size_t>(j)] = dot * attn_scale;
+        scores[static_cast<size_t>(j)] = dot * attn_scale_f;
         max_score = std::max(max_score, scores[static_cast<size_t>(j)]);
       }
-      double sum = 0.0;
+      float sum = 0.0f;
       for (int64_t j = 0; j < n; ++j) {
         scores[static_cast<size_t>(j)] = std::exp(scores[static_cast<size_t>(j)] - max_score);
         sum += scores[static_cast<size_t>(j)];
       }
       for (int64_t ch = 0; ch < c; ++ch) {
-        double acc = 0.0;
+        float acc = 0.0f;
         for (int64_t j = 0; j < n; ++j) {
           acc += scores[static_cast<size_t>(j)] * v[static_cast<size_t>(ch * n + j)];
         }
         attended[static_cast<size_t>(ch * n + i)] = acc / sum;
       }
     }
+    // f32: `proj` is a 1x1 nn.Conv2d (attention.py:56).
     for (int64_t oc = 0; oc < c; ++oc) {
       for (int64_t i = 0; i < n; ++i) {
-        double acc = proj_b[static_cast<size_t>(oc)];
+        float acc = proj_b[static_cast<size_t>(oc)];
         for (int64_t ic = 0; ic < c; ++ic) {
-          acc += attended[static_cast<size_t>(ic * n + i)] *
-                 static_cast<double>(proj_w[static_cast<size_t>(oc * c + ic)]);
+          acc += attended[static_cast<size_t>(ic * n + i)] * proj_w[static_cast<size_t>(oc * c + ic)];
         }
-        out.data[out.At(oc, frame, i / x.w, i % x.w)] += static_cast<float>(acc);
+        out.data[out.At(oc, frame, i / x.w, i % x.w)] += acc;
       }
     }
   }
@@ -625,10 +693,12 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
     const std::vector<float> drawn = noise->Draw(static_cast<int64_t>(x.data.size()));
     VT_CHECK(drawn.size() == x.data.size(),
              "ltx2 video vae: the noise stream returned the wrong element count");
+    // f32: the blend runs in the activation dtype upstream. The two scalars are
+    // config values, so they are narrowed once rather than per element.
+    const float noise_scale = static_cast<float>(config.decode_noise_scale);
+    const float keep_scale = static_cast<float>(1.0 - config.decode_noise_scale);
     for (size_t i = 0; i < x.data.size(); ++i) {
-      x.data[i] = static_cast<float>(
-          static_cast<double>(drawn[i]) * config.decode_noise_scale +
-          (1.0 - config.decode_noise_scale) * static_cast<double>(x.data[i]));
+      x.data[i] = drawn[i] * noise_scale + keep_scale * x.data[i];
     }
   }
   {
@@ -640,12 +710,13 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
                  static_cast<int64_t>(mean_of_means.size()) == latent_channels,
              "ltx2 video vae: per-channel statistics must have one value per latent channel");
     const int64_t n = x.spatial();
+    // f32: upstream's de-normalize is `latent * std + mean` on f32/bf16 tensors.
     for (int64_t c = 0; c < latent_channels; ++c) {
+      const float std_c = std_of_means[static_cast<size_t>(c)];
+      const float mean_c = mean_of_means[static_cast<size_t>(c)];
       for (int64_t i = 0; i < n; ++i) {
-        x.data[static_cast<size_t>(c * n + i)] = static_cast<float>(
-            static_cast<double>(x.data[static_cast<size_t>(c * n + i)]) *
-                static_cast<double>(std_of_means[static_cast<size_t>(c)]) +
-            static_cast<double>(mean_of_means[static_cast<size_t>(c)]));
+        x.data[static_cast<size_t>(c * n + i)] =
+            x.data[static_cast<size_t>(c * n + i)] * std_c + mean_c;
       }
     }
   }
@@ -913,13 +984,12 @@ Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& w
   const int64_t n = skip.spatial();
   for (int64_t c = 0; c < out_channels; ++c) {
     for (int64_t i = 0; i < n; ++i) {
-      double acc = 0.0;
+      // f32: upstream's group mean runs in the activation dtype.
+      float acc = 0.0f;
       for (int64_t g = 0; g < group_size; ++g) {
-        acc += static_cast<double>(
-            folded_in.data[static_cast<size_t>((c * group_size + g) * n + i)]);
+        acc += folded_in.data[static_cast<size_t>((c * group_size + g) * n + i)];
       }
-      skip.data[static_cast<size_t>(c * n + i)] =
-          static_cast<float>(acc / static_cast<double>(group_size));
+      skip.data[static_cast<size_t>(c * n + i)] = acc / static_cast<float>(group_size);
     }
   }
 
@@ -1122,12 +1192,14 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   out.width = x.w;
   out.data.resize(static_cast<size_t>(out.elems()));
   const int64_t elems = x.spatial();
+  // f32: the encoder's normalize is the decoder de-normalize run backwards, and
+  // upstream computes it in the activation dtype on both sides.
   for (int64_t c = 0; c < latent_channels; ++c) {
-    const double mean = mean_of_means[static_cast<size_t>(c)];
-    const double denom = std_of_means[static_cast<size_t>(c)];
+    const float mean = mean_of_means[static_cast<size_t>(c)];
+    const float denom = std_of_means[static_cast<size_t>(c)];
     for (int64_t i = 0; i < elems; ++i) {
-      out.data[static_cast<size_t>(c * elems + i)] = static_cast<float>(
-          (static_cast<double>(x.data[static_cast<size_t>(c * elems + i)]) - mean) / denom);
+      out.data[static_cast<size_t>(c * elems + i)] =
+          (x.data[static_cast<size_t>(c * elems + i)] - mean) / denom;
     }
   }
   return out;

@@ -51,6 +51,35 @@ the [quantization format table](BUILD.md#quantization-formats).
 | `VT_H3_DROP_PAGES` | off (MiniMax-H3 device staging) | Set (to any value) to opt the mapping into page release while streaming the H3 DiT weights to the device, so the read-once file pages do not accumulate against the same unified pool the weights live in. Without it the `DropSpanResidency` calls are no-ops. **Off by default deliberately, not by oversight:** it was enabled once and the load was SIGKILLed early at only ~21 GB peak, which is not a memory ceiling, so it stays gated until that is understood rather than left on by faith |
 | `VT_H3_NVFP4_LOWNIBBLE` | off = swap ON (MiniMax-H3 NVFP4 loaders) | The community `lilcheaty/MiniMax-H3-NVFP4` checkpoint (metadata `converted_by: "Star Ultimate Model Converter Pro"`) packs the two fp4 elements per byte HIGH-first (element 2i in the high nibble) — the opposite of the modelopt standard `DequantNvfp4ToBf16` and the Marlin W4A16 path assume. By DEFAULT the three H3 NVFP4 loaders swap the two nibbles of every packed byte at load, turning the file's high-first bytes into the standard low-first (byte-verified against an independent oracle and the coherent FL2VA GGUF: reading low-first gives elementwise corr 0.000, high-first sign-agreement 1.000 over 115M+ weights). `=1` disables the swap (the pre-fix low-first read) for A/B. H3-scoped: the shared modelopt NVFP4 arms (Laguna / DeepSeek-V4 / Qwen3-32B) are low-first and untouched |
 
+## MoE expert streaming (CPU)
+
+Opt-in host-side residency cache for routed MoE experts on the CPU keep-quant
+path, used when a mixture-of-experts GGUF is served from a borrowed (mmap'd)
+weight tower larger than RAM — the `Qwen3.5`-family MoE decode path in
+`src/vllm/model_executor/models/qwen3_5.cpp`. Borrowing is what makes such a
+model fit; this cache is an attempt to make it fast, by serving each expert
+slice out of a fixed array of equal-sized slots filled by one contiguous copy
+instead of letting the kernel demand-page the mapping in router order.
+
+**Off by default, and honestly still experimental.** The W4 measurement on
+`Qwen3.8-2.4T-A95B UD-Q1_0` (`.agents/specs/expert-streaming.md`, "W4 measured")
+is token-identical output and a 4.5x TTFT improvement (3318 s to 733 s) with
+**no steady-state decode gain at all**, because the slot is filled by copying
+from the mapping and so still takes the page fault it was meant to avoid. Turn
+it on to reproduce or to work on that; it is not yet a deployment
+recommendation.
+
+The two budget knobs are read once, when the cache is first constructed, and
+only if streaming is on. Host memory reserved is `slots x slot_bytes`,
+allocated up front and never grown — the engine prints the resolved values as
+`[expert-stream] ON slots=... slot_bytes=... resident=... GiB` on stderr.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VT_MOE_EXPERT_STREAM` | off | `=1` serves routed expert slices from the bounded host slot cache instead of reading them straight out of the mmap'd tower. Read once per process, and only the FIRST character is examined: a value starting with `0`, and an empty value, are off; anything else is on. Only the CPU path streams — on a device platform the expert slice is already device-resident and is served unchanged. Turning it on also **disables the default-on grouped-MoE path** (`VT_QWEN35_GROUPED_MOE`), which stages the whole tower and therefore cannot stream; the engine says so once on stderr rather than silently doing no streaming. Set `VT_MOE_EXPERT_STREAM=0` to keep grouping |
+| `VT_MOE_EXPERT_STREAM_SLOTS` | `64` | How many expert slices stay resident. Parsed as a decimal integer; unset, empty, zero, negative and unparseable values all keep `64`. Every slot acquired during a step is protected from eviction until the step ends, so a budget smaller than one step's working set exhausts the cache: those slices fall back to reading the tower directly, which is correct but slow, and is counted. Sized against a real model this wants to be large — the measured run used `8000` |
+| `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | the size in bytes of the first expert slice streamed | Bytes reserved per slot, fixed for the process's life. Parsed as a decimal integer; unset, empty, zero, negative and unparseable values all keep the default. It must be at least the LARGEST slice that will be streamed: a slice that does not fit is refused by name (`vt: expert stream: a slice of N bytes exceeds the slot budget of M; raise VT_MOE_EXPERT_STREAM_SLOT_BYTES`) rather than truncated or silently routed back to the mmap path, so a streaming benchmark cannot quietly measure the mmap path instead |
+
 ## Rollback and bisect switches
 
 Default-on fast paths, each with an off switch. They exist so a suspected kernel

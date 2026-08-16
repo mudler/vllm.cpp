@@ -26,7 +26,7 @@
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 | **vLLM** | Kimi-Linear-48B-A3B, GB10 | no binding number: the published checkpoint is tiktoken-only, so it cannot drive the warm-server harness | golden 122/128, near-tie profile |
-| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10 | **vLLM axis is an OPEN GAP.** vs llama.cpp after the [#391](../.agents/specs/cpu-decode-barrier-and-attn-dispatch.md) fix: in128 prefill **1.023x** (was 0.878x); in512 decode **0.194x** (3.41x), prefill 0.175x flat | coherent, NOT token-exact |
+| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10, after the [#391 fix](../.agents/specs/cpu-decode-barrier-and-attn-dispatch.md) | **vLLM axis is an OPEN GAP.** vs llama.cpp: in128 prefill **1.023x** (was 0.878x); in512 decode **0.194x** (3.41x), prefill 0.175x flat. Denominator stock `7044859`, SUPERSEDED (#1003) | coherent, NOT token-exact |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page. Which architecture each number
@@ -300,16 +300,19 @@ Decode lands inside llama.cpp's own run-to-run spread, and the memory difference
 is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap and
 it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
-measured concurrent serving against llama.cpp's server. Four favourable
-llama.cpp verdicts on this page can flip when the denominator is re-taken, and
-prefill is not the most exposed of them. #1003 owes all four.
+measured concurrent serving against llama.cpp's server. Six favourable llama.cpp
+verdicts can flip when the denominator is re-taken, five of them on this page,
+and prefill is not the most exposed. #1003 owes all six. The set is swept, not
+listed: the query is in the [spec](../.agents/specs/oracle-llamacpp-repin-stock.md).
 
 | Flips first | Verdict | Exposure |
 |---|---|---|
 | 1 | Vulkan `BENCH-VK-LLAMA` decode 4.36 vs 4.35, `MET` | 0.23% margin inside a 0.69% 7-leg spread. Its own source calls it "a narrow pass, not a comfortable one", so any denominator move can flip it |
-| 2 | This table's peak memory `1.01x` PARITY and decode `0.97x` tie | ties by declaration, not wins. A denominator that moves at all in llama.cpp's favour turns both into recorded gaps |
-| 3 | This table's prefill `1.18x` PASS | an 18% margin. Flipping it needs upstream's 122-commit window to beat our fork's CPU GDN and SSM_CONV work outright |
-| 4 | Pi 5 peak RSS 2.841 vs 3.747 GiB, `0.758x` | a 24.2% margin, and its denominator was already stock `b9892`, so only `b9892`-to-`b10451` drift applies |
+| 2 | Muse Glimmer in128 prefill `1.023x` (also `STATUS.md`) | 2.3% margin inside our own arm's 4.5% leg spread, n=4. Its denominator is already stock `7044859`, 84 commits from `b10451`, so the noise floor is what exposes it |
+| 3 | This table's peak memory `1.01x` PARITY and decode `0.97x` tie | ties by declaration, not wins. A denominator that moves at all in llama.cpp's favour turns both into recorded gaps |
+| 4 | `KERNEL-GEMM-CPU-TILED` NEON vs stock ggml sgemm, "at parity, ahead on 4 of 6 shapes" | off this page, in the kernel matrix. Bands overlap, 216-242 vs 208-215 GFLOP/s, and one shape is already behind |
+| 5 | This table's prefill `1.18x` PASS | an 18% margin. Flipping it needs upstream's 624-commit window to beat our fork's CPU GDN and SSM_CONV work outright |
+| 6 | Pi 5 peak RSS 2.841 vs 3.747 GiB, `0.758x` | a 24.2% margin, and its denominator was already stock `b9892`, so only the 559 commits of `b9892`-to-`b10451` drift apply |
 
 **x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 
@@ -417,8 +420,8 @@ harness enforced until 2026-08-12 and are SUPERSEDED, never binding (#520).
 Correctness re-validated bit-identical across the advance, zero golden drift.
 The llama.cpp oracle is stock `b10451` since 2026-08-16, `gateable = no` until
 someone builds it (#857). Every llama.cpp figure here is SUPERSEDED and owed a
-re-take (#1003): all but the Pi 5 arm ran the former pin `237ad9b96`, our own
-fork, and the Pi 5 arm ran stock `b9892`, which is neither pin.
+re-take (#1003), and a sweep finds it ran one of **three** revisions, none of
+them the pin. The Reproduce table names all three.
 
 **Protocol.** Greedy, closed loop, three interleaved repetitions per point, one
 `flock` across the whole series, same-binary A/B for every lever, cold legs
@@ -518,6 +521,7 @@ built on it rather than keeping the flattering one.
 | DeepSeek-V4-Flash decode | `deepseek-v4-gen --gpu --kv-cache` on `ds4flash.gguf`, captured under tmux |
 | Metal vs MLX-LM | Paired A/B harness, interleaved runs, cold legs discarded |
 | Vulkan vs llama.cpp Vulkan | Same GGUF both arms: ours `-DVLLM_CPP_VULKAN=ON`, llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96`, SUPERSEDED, via `llama-bench`; clean legs only, one `flock $HOME/gpu.lock`. GEMV sweep: `benchmarks/vulkan_gemv_ab.cpp` |
+| Which llama.cpp a figure ran | Three revisions, all SUPERSEDED (#1003): fork `237ad9b96` (GB10 CPU, Vulkan, x86, kernel matrix), stock `b9892` (Pi 5), stock `7044859` (Muse Glimmer, #391). The pin is stock `b10451`, unbuilt (#857) |
 
 Build flags, environment variables, and the full gate list are in
 [BUILD.md](BUILD.md) and [ENVIRONMENT.md](ENVIRONMENT.md).

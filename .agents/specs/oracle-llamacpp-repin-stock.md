@@ -87,9 +87,15 @@ upstream does not have.
 1. `.agents/oracles/llama-cpp.md`: the pin, the label, `gateable`, the evidence
    pointer, the two factual errors in its prose, and a new clean-tree
    requirement.
-2. `docs/BENCHMARKS.md`, `docs/FEATURES.md`: the present-tense claims that name
-   `237ad9b96` as the reference a reader can build.
-3. `.agents/backend-matrix.md`, `.agents/feature-matrix.md`: the same
+2. `docs/BENCHMARKS.md`, `docs/FEATURES.md`, `docs/STATUS.md`, `docs/BUILD.md`:
+   the present-tense claims that name `237ad9b96` as the reference a reader can
+   build, or that state a live verdict derived from it. The last two were found
+   by the sweep, not by reading the row's own scope: `docs/STATUS.md:502` restates
+   the Muse Glimmer `1.023x` unmarked and `:159` the CPU-versus-llama.cpp
+   position, and `docs/BUILD.md:247` tells a reader building the project that CPU
+   is "at or ahead of llama.cpp on every GGUF axis".
+3. `.agents/backend-matrix.md`, `.agents/feature-matrix.md`,
+   `.agents/kernel-matrix.md`: the same
    present-tense claims in the authoritative records that the public documents
    project. `BACKEND-GATE-CUDA-LLAMACPP` states the pin and links to the very
    oracle file this row repins, and `BACKEND-GATE-CPU-LLAMACPP` carries the live
@@ -108,17 +114,11 @@ upstream does not have.
   box. This row has none of them and holds no GPU-lock authority. #1003 owns it.
 - **Building or running stock `b10451`.** Same reason, and it is exactly why
   `gateable` becomes `no` rather than moving across unchanged.
-- **Re-anchoring the `file:line @ 237ad9b96` source citations.** Measured at this
-  branch's head, not estimated. `git grep -l '237ad9b96'` returns **109 files**.
-  ``git grep -lE '@ *`?237ad9b96'`` returns **67**, which is the subset that
-  attributes a path or a source tree to the object rather than merely discussing
-  the SHA. **52** of the 109 carry a `path.ext:LINE` anchor within three lines of
-  the mention. The sweep is therefore 67 files, not the "roughly 50" an earlier
-  draft of this spec wrote, which counted only the narrowest reading and
-  undercounted the work by about a third. They are a real defect, because a
-  reviewer cannot fetch the object a citation names, but they are a mechanical
-  sweep with its own risk of silently re-pointing a line that moved. Listed under
-  `## Owed`.
+- **Re-anchoring the `file:line @ 237ad9b96` source citations.** They are a real
+  defect, because a reviewer cannot fetch the object a citation names, but they
+  are a mechanical sweep with its own risk of silently re-pointing a line that
+  moved. Listed under `## Owed`, with the counts and the commands that produce
+  them in §"The owed sweep, counted reproducibly".
 - **Touching the developer's llama.cpp checkouts.** `/home/mudler/_git/llama.cpp`
   and `/home/mudler/_git/llama.cpp-mtp-imatrix` are read-only to this row. No
   fetch, no commit, no build.
@@ -186,8 +186,9 @@ checkout is the developer's and read-only here, so a newer tag can exist
 upstream. That does not weaken the pin. The pin is a 40-hex commit, and a commit
 is reproducible whether or not a newer one exists.
 
-**Risk this introduces, stated rather than buried.** `b10451` is 122 stock
-commits past `b9827`, a window in which upstream landed its own `fused_gdn`
+**Risk this introduces, stated rather than buried.** `b10451` is 624 stock
+commits past `b9827` (see §"Direction of the error" for why the earlier 122 was a
+shallow-clone artefact), a window in which upstream landed its own `fused_gdn`
 (`git grep fused_gdn origin/master` hits `src/llama-context.cpp`,
 `src/llama-cparams.h`, `src/models/delta-net-base.cpp`, `src/models/qwen35.cpp`,
 and `src/models/qwen35moe.cpp`). A stock `b10451` denominator can therefore be
@@ -232,11 +233,89 @@ assertion beside the number. Record the built binary's sha256 either way.
 `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md` already records a
 `llama-bench` sha256, which is the shape the other arms owe.
 
+## How this set was derived
+
+**The set below is swept, not listed.** Two successive fresh reviews each found
+one favourable verdict a hand enumeration had missed, the Vulkan `MET` and the
+Pi 5 RSS in the first pass and Muse Glimmer in the second. A third hand pass
+would have the same failure mode, so the set is derived by a query anyone can
+re-run, and the query is recorded here rather than its output alone.
+
+**Stage 1, the candidate sites.** A line in `docs/`, `.agents/` or `benchmarks/`
+is a candidate when it carries a comparison token and llama.cpp is attributed to
+it, where attribution means the line names llama.cpp, or a line within three
+names it, or the line is a markdown table body row whose HEADER names it. The
+table-header clause is the one that matters: it is what catches
+`| Prefill | 223.8 tok/s | 177.3 | 1.18x | PASS |`, whose own text never says
+llama.cpp. A `git grep -C` alone cannot see that row's denominator.
+
+```sh
+git grep -n -C 3 -iE 'llama\.?cpp|llama-bench' -- docs .agents benchmarks
+```
+
+is the readable approximation and misses exactly the table-row class. The whole
+sweep is below. It is short on purpose, so that it lives in this spec rather than
+becoming another file the tree has to keep true:
+
+```python
+import re, subprocess
+LLAMA = re.compile(r"llama[.\-_]?cpp|llama-bench", re.I)
+ROW, SEP = re.compile(r"^\s*\|"), re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+CMP = re.compile(r"[0-9]+(?:\.[0-9]+)? *[x×]\b|[0-9]+(?:\.[0-9]+)? ?%"
+                 r"|\bMET\b|\bPARITY\b|\bPASS\b|\bFAIL(?:ED|S)?\b|\btie\b|\bties\b"
+                 r"|\bahead\b|\bbehind\b|\bbeats\b|\bparity\b|\bwin\b|\bwins\b"
+                 r"|\bless\b|\bfaster\b|\bslower\b")
+for path in subprocess.run(["git", "ls-files", "docs", ".agents", "benchmarks"],
+                           capture_output=True, text=True).stdout.split():
+    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    header, i = {}, 0
+    while i < len(lines):                 # map every table body row to its header
+        if ROW.match(lines[i]) and i + 1 < len(lines) and SEP.match(lines[i + 1]):
+            j = i + 2
+            while j < len(lines) and ROW.match(lines[j]):
+                header[j], j = i, j + 1
+            i = j
+        else:
+            i += 1
+    for n, ln in enumerate(lines):
+        if not CMP.search(ln):
+            continue
+        near = any(LLAMA.search(lines[k])
+                   for k in range(max(0, n - 3), min(len(lines), n + 4)))
+        if near or (n in header and LLAMA.search(lines[header[n]])):
+            print(f"{path}:{n + 1}:{ln.strip()}")
+```
+
+On this commit's tree it prints **960 candidate lines over 651 files**, and it
+printed 943 at `bab8e1fb3`, before this commit's own markers were added.
+
+**Stage 2, favourable by the page's own rule.** `docs/BENCHMARKS.md:32-34`
+states the convention: throughput is ours over the reference, latency is the
+reference over ours, so **1.0 or higher is a win**. Piping stage 1 through
+
+```sh
+grep -E '\b[1-9][0-9]*(\.[0-9]+)? *[x×]|\bMET\b|\bPARITY\b|\bPASS\b|\btie\b|\bahead\b|\bbeats\b|\bwin\b|% less|\bparity\b'
+```
+
+leaves **719 lines** on this commit's tree, and those are adjudicated one at a
+time below. Most fall out as ours-versus-vLLM, ours-versus-ours, or superseded
+ledger history.
+
+**Stage 3, the revision behind each survivor**, read from the evidence record
+that produced it rather than assumed from the pin. That is what surfaced a third
+and a fourth llama.cpp revision in the tree.
+
+The over-inclusive stage 1 is the point. A filter tuned to the verdicts already
+known would reproduce the enumeration it was meant to check. It is inclusive
+enough to count a few lines of its own regex, which is the correct direction for
+this instrument to err in.
+
 ## Every measurement the fork pin contaminated
 
 "Contaminated" means the llama.cpp side of the comparison came from a build of
-`237ad9b96`, or from a build whose tree cannot be identified. Our own side of
-each comparison is untouched.
+`237ad9b96`, or from a build whose tree cannot be identified, or from a stock
+revision that is neither the old pin nor the new one. Our own side of each
+comparison is untouched.
 
 | # | Evidence | Recorded llama.cpp numbers | Re-take? | Notes |
 |---|---|---|---|---|
@@ -250,22 +329,66 @@ each comparison is untouched.
 | 8 | `docs/bench-evidence/cpu-x86-llamacpp-20260811.md` | peak RSS 2.8281 GiB, giving `1.0022x` open gap. Its three throughput axes are already `PENDING` | **yes** | its provenance line names "local fork `237ad9b96`, build number 9892, the recorded pin". RSS is the axis least likely to move, because the fork's deltas are compute, but the binary is still unidentified |
 | 9 | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md` | prefill 27.77, decode 3.91, E2E 3.77 tok/s, peak RSS 3.747 GiB, giving `0.461x`, `0.653x`, `0.758x` | **yes**, for a different reason | **not fork-contaminated.** This file measured stock tag `b9892` at `ee445f93d` and recorded the substitution. It is a stock number against a revision that is neither the old pin nor the new one, and its record wrongly presents that tag as the project pin |
 
+| 10 | `docs/BENCHMARKS.md:29` Muse Glimmer 30B, `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md:24-32`, `docs/STATUS.md:502`, record `:19231` and `:19016` | in128 prefill 13.158, decode 5.026, in512 prefill 13.292, decode 5.091 tok/s, and the earlier 12.94 / 5.08 / 9.97 / 6.41 / 13.13 / 5.00 set with peak RSS 15.74 GiB, giving the `1.023x` prefill win, `0.194x`, `0.175x`, `0.997x` and `1.92x MORE` RSS | **yes**, for the same reason as row 9 | **not fork-contaminated.** Both runs measured stock master `704485942` (`b10362-5`, 2026-08-11), recorded in the record's own recipe block at `:18996`. It is a stock number against a third revision that is neither pin. Its `1.023x` is the fifth favourable verdict on the public page and was absent from every earlier draft of this table |
+| 11 | `.agents/kernel-matrix.md:162` `KERNEL-GEMM-CPU-TILED`, record `:13766-13782` | ggml no-llamafile 212.0, 214.4, 215.4, 208.1, 209.9, 159.2 GFLOP/s against our 222.1, 220.6, 216.8, 215.4, 241.7, 141.3 on six Arm shapes, giving "at parity with ggml's stock kernel and slightly ahead on four of six shapes", plus the stock-ggml column that sizes llamafile at ~1.9x f16 and ~1.2x f32 | **yes** | built from the same fork tree with `GGML_LLAMAFILE=OFF`. None of the 65 fork commits touch `llamafile/sgemm.cpp`, so the compared kernel matches `b9827`, but the tree is the same unidentified one as row 7. This verdict is load-bearing beyond its own row: it is the evidence that the Arm 16-bit deficit is an absent capability rather than a defect in `KERNEL-GEMM-CPU-ELEM` |
+
 Row 9 is the one to read twice. It is the only arm whose author noticed the pin
 was unobtainable, and the correct handling of that discovery, a recorded explicit
 substitution, still produced a number attributed to a revision the registry never
 pinned. The defect is the registry, not that file.
 
-### Source anchors are a separate class
+### Four llama.cpp revisions are in play, not two
 
-**67 files** attribute a path or a source tree to `237ad9b96` in the `@ <sha>`
-form, out of **109** that mention the SHA at all, and **52** carry a
-`path.ext:LINE` anchor within three lines of the mention. The set includes the
-Vulkan port map in `.agents/specs/vulkan-full-support.md`, the Arm quant dot
-anchors in `.agents/kernel-matrix.md`, `repack.cpp:4683`, `sgemm.cpp`, and the
-`ggml-quants.c` IQ2_S and MXFP4 ports. These are not measurements and the ports
-they justify are not invalidated. They are still broken, because no reviewer can
-fetch the object a citation names, so no citation in that set is checkable. Owed,
-not fixed here.
+An earlier draft of this row wrote the replacement universal "all but the Pi 5
+arm ran `237ad9b96`, and the Pi 5 arm ran stock `b9892`". Stage 3 of the sweep
+disproves it. Read each revision from the evidence that produced it:
+
+| Revision | What it is | Binding measurements | Where the tree records it |
+|---|---|---|---|
+| `237ad9b96` | our local-only fork, `b9827-65-g237ad9b96` | rows 1 to 8 and row 11 | the former `pin` in `.agents/oracles/llama-cpp.md` |
+| `ee445f93d` | stock tag `b9892` | row 9, the Pi 5 arm | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`, which records the substitution |
+| `704485942` | stock master, `b10362-5`, 2026-08-11 | row 10, Muse Glimmer and #391 | `.agents/benchmark-record.md:18964,18996,19221` |
+| `030ebb5` | stock tag `b10358` | none. One contended `pp32 9.79 / tg8 0.79` datapoint, recorded **NON-BINDING** with our own arm blocked in the tokenizer | `.agents/benchmark-record.md:18159` |
+
+`704485942` appeared nowhere in `docs/`, in this spec, or in the issue index
+before this pass, although it is the denominator of the only llama.cpp win on
+the public page besides the GB10 prefill. That is the cost of writing a universal
+instead of stating what a sweep found.
+
+### The owed sweep, counted reproducibly
+
+Source anchors are a separate class from measurements. The ports they justify are
+not invalidated, but no citation in the set is checkable, because no reviewer can
+fetch the object it names. The set includes the Vulkan port map in
+`.agents/specs/vulkan-full-support.md`, the Arm quant dot anchors in
+`.agents/kernel-matrix.md`, `repack.cpp:4683`, `sgemm.cpp`, and the
+`ggml-quants.c` IQ2_S and MXFP4 ports. Owed, not fixed here.
+
+**The commands matter more than the numbers, because the numbers go stale inside
+this pull request.** They already did once: `a2ede63a1` and `3f63066f0` measured
+109 and 67, and `24e47f265` moved them to 110 and 66 in the act of recording
+them, by adding a `237ad9b96` mention to `.agents/feature-matrix.md` and
+rewriting the #1003 index row so it no longer matches the `@ <sha>` form. A bare
+count in a spec is a measurement of one file stored inside another, which
+`AGENTS.md` §Records names as the coupling to avoid. Run these instead:
+
+```sh
+git grep -l '237ad9b96' -- .                                   # mentions
+git grep -lE '@ *`?237ad9b96' -- .                             # `@ <sha>` form
+for f in $(git grep -l 237ad9b96 -- .); do \
+  grep -C 3 -e 237ad9b96 -- "$f" \
+    | grep -qE '[A-Za-z0-9_/.+-]+\.[A-Za-z0-9_]+:[0-9]+' && echo "$f"; \
+done | wc -l                                                   # path.ext:LINE within 3 lines
+```
+
+They returned 109, 67 and 52 at `a2ede63a1`, then 110, 66 and 52 at
+`bab8e1fb3`, and **111**, **66** and **52** on this commit's tree, which gained
+one mention because `docs/BUILD.md` now names the fork it was measured against.
+Re-measure rather than quote. The second command is the subset
+that attributes a path or a source tree to the object rather than merely
+discussing the SHA, and it is the size of the owed sweep: 66 files, not the
+"roughly 50" an earlier draft wrote, which counted only the narrowest reading and
+undercounted the work by about a third.
 
 ### Direction of the error
 
@@ -280,16 +403,33 @@ wins are lower bounds. Rows 1 through 8 all understate our position relative to 
 `b9827` stock floor.
 
 Against `b10451` the direction is **not established**, and this row does not
-claim it. 122 stock commits landed after `b9827`, upstream now carries its own
+claim it. 624 stock commits landed after `b9827`, upstream now carries its own
 `fused_gdn`, and a re-measurement can move a ratio in either direction.
 
-**Four recorded verdicts can flip against us, and the prefill `1.18x` is not the
-most exposed of them.** An earlier draft of this spec said the GB10 prefill was
-"the only llama.cpp comparison in the tree recorded as a win", and #1003 was
-scoped by that sentence, so an agent reading it would have re-taken prefill
-alone. The counterexamples sit on the same page. Ordered by fragility, which is
-the margin measured against its own noise floor and against how much of the
-denominator moves, not by the size of the margin:
+**That window is 624, not the 122 an earlier draft of this section wrote, and the
+122 was an instrument defect rather than arithmetic.** It came from
+`git rev-list --count b9827..b10451` in the developer's clone, and that clone is
+SHALLOW: `.git/shallow` grafts at `687e77892` (2026-08-08), so
+`git rev-list --count b10451` returns 122 where a full clone returns 10451, and
+`git merge-base --is-ancestor b9827 b10451` answers **no** for the same reason.
+Every distance across that graft is truncated and every ancestry question across
+it is wrong. The real distance comes from llama.cpp's own build-number
+convention, which this row already established when it showed `pin_label` was a
+commit count: tag `bN` sits at depth `N`, verified in-clone for `b9827` (9827)
+and `b9892` (9892), so `b9827` to `b10451` is 624 and `b9892` to `b10451` is 559.
+Cross-checked against a distance the graft does NOT truncate: `704485942`
+describes as `b10362-5`, predicting depth 10367 and therefore 84 commits to
+`b10451`, and `git rev-list --count 704485942..10bf611e5` measures exactly 84.
+The prediction and the measurement agree, which is what licenses the convention.
+
+**Six recorded verdicts can flip against us, five of them on the public page, and
+the prefill `1.18x` is not the most exposed of them.** An earlier draft of this
+spec said the GB10 prefill was "the only llama.cpp comparison in the tree
+recorded as a win", and #1003 was scoped by that sentence, so an agent reading it
+would have re-taken prefill alone. Two later drafts enumerated by hand and each
+missed one more. This list is the stage-2 output of the sweep above. Ordered by
+fragility, which is the margin measured against its own noise floor and against
+how much of the denominator moves, not by the size of the margin:
 
 1. **Vulkan `BENCH-VK-LLAMA` decode, 4.36 versus 4.35 tok/s, `MET`** (row 7).
    The margin is 0.23%. Its own source,
@@ -298,25 +438,52 @@ denominator moves, not by the size of the margin:
    comfortable one". The verdict is already inside its own measurement
    resolution, which makes it far more exposed than an 18% prefill margin. Any
    denominator movement can flip it.
-2. **GB10 20-core peak memory `1.01x` PARITY and decode `0.97x` tie** (rows 1 and
+2. **Muse Glimmer 30B in128 prefill `1.023x`** (row 10), on the public page at
+   `docs/BENCHMARKS.md:29` and restated at `docs/STATUS.md:502`. The margin is
+   2.3%. Its own source, `.agents/benchmark-record.md:19231`, puts our arm's
+   median at 13.455 with a **4.5%** leg spread over n=4 against llama.cpp's
+   13.158 at 0.7%, so more than half the margin sits inside our own arm's spread
+   before the denominator moves at all. By this list's stated criterion that
+   ranks it second, above an 18% prefill margin and a 24.2% RSS margin, and the
+   honest other half is that its denominator is already stock `704485942`, 84
+   commits from `b10451`. What exposes this verdict is its noise floor, not its
+   denominator. It was absent from the first two enumerations of this list.
+3. **GB10 20-core peak memory `1.01x` PARITY and decode `0.97x` tie** (rows 1 and
    2). Neither is a win, and both are load-bearing for
    `BACKEND-GATE-CPU-LLAMACPP` reading closed. They are ties by declaration, so a
    denominator that moves at all in llama.cpp's favour converts them into
    recorded gaps.
-3. **GB10 20-core prefill `1.18x` PASS** (row 1). A pass by 0.18. Flipping it
-   needs upstream's own work in the 122-commit window to exceed our fork's on the
+4. **`KERNEL-GEMM-CPU-TILED` "at parity with ggml's stock kernel, slightly ahead
+   on four of six shapes"** (row 11), in `.agents/kernel-matrix.md:162`. The one
+   entry not on the public page. The bands overlap (ours 216-242, ggml 208-215
+   GFLOP/s) and one of the six shapes is already behind, so the verdict is split
+   4-2 before anything is re-taken. It is load-bearing for the row's attribution
+   that the Arm 16-bit deficit is an absent capability rather than a defect.
+5. **GB10 20-core prefill `1.18x` PASS** (row 1). A pass by 0.18. Flipping it
+   needs upstream's own work in the 624-commit window to exceed our fork's on the
    CPU Gated Delta Net and SSM_CONV path outright.
-4. **Pi 5 peak RSS 2.841 versus 3.747 GiB, 24.2% less, `0.758x`** (row 9). A
-   second favourable comparison, and the least fragile of the four: its
-   denominator was already stock `b9892`, so its only exposure is upstream drift
-   between `b9892` and `b10451` rather than the removal of 65 of our own commits.
+6. **Pi 5 peak RSS 2.841 versus 3.747 GiB, 24.2% less, `0.758x`** (row 9). The
+   least fragile of the six: its denominator was already stock `b9892`, so its
+   only exposure is upstream drift over the 559 commits to `b10451` rather than
+   the removal of 65 of our own.
 
 The x86 peak RSS `1.0022x` (row 8) is recorded as an open gap against us, so it
 cannot flip from favourable to unfavourable. It can only widen or close.
 
+**One discrepancy found by the sweep is left for its owning row, not repaired
+here.** Row 11's evidence at `.agents/benchmark-record.md:13771-13777` shows our
+kernel ahead on **five** of six Arm shapes, not the four both the record's own
+prose and `.agents/kernel-matrix.md:162` state. The narrowest of the five is
+216.8 against 215.4 GFLOP/s, 0.6%, which a reader may reasonably have called a
+tie. Quietly changing another row's recorded count on that guess is exactly the
+silent re-derivation this row exists to stop, so it is reported rather than
+edited. `KERNEL-GEMM-CPU-TILED` owns it, and the re-take under #1003 settles it
+with a measurement.
+
 ## Design
 
-Four record edits, no code.
+Record edits only, no code. Four kinds, and the sweep decides which files are in
+each kind rather than a list written from memory.
 
 1. **`.agents/oracles/llama-cpp.md`.** Rewrite the prose to state what the
    oracle is, drop the circular fork justification, add the clean-tree
@@ -349,14 +516,24 @@ Four record edits, no code.
    present-tense claim about which oracle is pinned is not narrative, and a past
    run keeps saying what it ran.
 
-   `docs/BENCHMARKS.md` also gains the four-row fragility ranking from
-   §"Direction of the error", so a reader of the page reaches the same scope
-   #1003 has. It goes in as a table rather than prose because
+   `docs/BENCHMARKS.md` also gains the fragility ranking from §"Direction of the
+   error", so a reader of the page reaches the same scope #1003 has. It goes in
+   as a table rather than prose because
    `scripts/check-public-doc-tables.py` holds that page at 35 of 35 prose
-   paragraphs, and a table row costs none. The `BENCH-VK-LLAMA` row pays for its
-   own new marker inside the 220-character cell cap by moving its `[source]` link
-   into the key cell, which is what the checker's `MAX_ROW_CHARS` comment asks
-   for: shorten your own row, never delete somebody else's.
+   paragraphs, and a table row costs none. Each row pays for its own new marker
+   inside the 220-character cell cap by shortening itself, which is what the
+   checker's `MAX_ROW_CHARS` comment asks for: shorten your own row, never delete
+   somebody else's. The `BENCH-VK-LLAMA` row moved its `[source]` link into the
+   key cell, and the Muse Glimmer row moved its `#391` link the same way. The
+   page's "Oracle pin" paragraph stops asserting a universal about which revision
+   every figure ran and names what the sweep found instead, in place, because a
+   new paragraph would cost somebody else's.
+
+   `docs/STATUS.md:159` and `:502` and `docs/BUILD.md:247` get the same marker.
+   They were found by the sweep rather than by this row's original scope, and
+   `:502` is the same Muse Glimmer verdict the page carries, so leaving it
+   unmarked would reproduce in `STATUS` exactly the projection-versus-record
+   disagreement item 3 exists to prevent.
 
    `docs/FEATURES.md` carries the same two defects in its Vulkan paragraph, which
    reads "decode 4.36 tok/s vs llama.cpp's 4.35, parity met narrowly" with an
@@ -380,7 +557,12 @@ Four record edits, no code.
    RPi5 clause in the same cell is marked separately because it ran stock
    `b9892`, and the verdicts are ordered by how easily the re-take flips them.
    `QUANT-GGUF` in the feature matrix repeats the same "parity or better on
-   every axis" claim and gets the same marker. The lifecycle state of every row
+   every axis" claim and gets the same marker. Two more sites carry it and were
+   found by the sweep: `BACKEND-CPU` in the same matrix says "the 20-core
+   Arm/i8mm Qwen3.5-2B single-stream llama.cpp floor is closed", and
+   `KERNEL-GEMM-CPU-TILED` in `.agents/kernel-matrix.md` says our NEON kernel is
+   "at parity with ggml's stock kernel", which is row 11 of the enumeration and a
+   measurement rather than a restatement. The lifecycle state of every row
    is left where it is, because that judgement belongs to the re-measurement.
    `.agents/quantization-matrix.md` needs no edit: its `QUANT-GGUF-COMPUTE` cell
    already defers to the backend matrix as the one place the live position
@@ -420,9 +602,20 @@ that rule are already covered by `tests/scripts/test_check_oracle_pins.py`, whic
 therefore owes no red-before checker test.
 
 The falsifiability this row does owe is of its own factual claims, and every one
-is a read-only command recorded in §"Measured facts" and in the enumeration,
+is a read-only command recorded in §"Measured facts", §"How this set was
+derived", §"The owed sweep, counted reproducibly", and the enumeration,
 reproducible by anyone with a clone of `ggml-org/llama.cpp` plus the developer's
 fork.
+
+**One instrument precondition has to be asserted before any of the llama.cpp-side
+commands are trusted.** `/home/mudler/_git/llama.cpp` is a SHALLOW clone,
+grafted at `687e77892`. `git rev-parse --is-shallow-repository` returns `true`
+there. Every depth, distance and ancestry answer that crosses the graft is wrong
+and looks exactly like a correct answer, which is how this spec came to record a
+122-commit window that is really 624 and how `merge-base --is-ancestor` reports
+that `b9827` is not an ancestor of `b10451`. Re-run the §"Measured facts" table
+against a full clone before extending it, or derive the distance from the
+build-number convention as §"Direction of the error" does and say so.
 
 ## Gates
 
@@ -480,19 +673,31 @@ fork.
 
 ## Owed
 
-- [#1003](https://github.com/mudler/vllm.cpp/issues/1003): re-take all nine
+- [#1003](https://github.com/mudler/vllm.cpp/issues/1003): re-take all **eleven**
   contaminated measurements against `b10451`, on the host that produced each,
   and run the `b9827` stock versus `237ad9b96` fork A/B that isolates our own 65
-  commits from upstream drift.
+  commits from upstream drift. Six of the eleven carry a verdict favourable to
+  us, ranked by fragility in §"Direction of the error". Re-taking the GB10
+  prefill alone does not discharge this.
 - [#857](https://github.com/mudler/vllm.cpp/issues/857): build and run stock
   `b10451` on dgx.casa and record the measured identity, recipe, and evidence
   that lets `gateable` become `yes`. Until then this oracle is visible debt.
-- Re-anchoring the roughly 50 files that cite `file:line @ 237ad9b96`. Tracked
+- Re-anchoring the files that cite `file:line @ 237ad9b96`. The set is the
+  `@ <sha>` subset counted by the second command in §"The owed sweep, counted
+  reproducibly", which returns **66** on this commit's tree. Run the command
+  rather than trusting the number, because it moved inside this pull request
+  twice already. Tracked
   under #1003, because it is the same object that cannot be fetched.
+- `KERNEL-GEMM-CPU-TILED`: its recorded "ahead on four of six shapes" reads as
+  five of six in its own evidence table. Reported in §"Direction of the error",
+  owned by that row, and settled by the row 11 re-take under #1003.
 
 ## Now
 
 Records only. The pin moves to stock `b10451`, `gateable` drops to `no`, and
-every llama.cpp-side number in the tree is enumerated and marked owed. No row
-changes lifecycle state, and no number is re-taken. The oracle is deliberately
-ungateable until #857 builds and runs the new pin.
+every llama.cpp-side number in the tree is enumerated and marked owed. The
+enumeration is now the output of a recorded sweep rather than a hand list, after
+two successive reviews each found one favourable verdict a hand list had missed.
+Eleven contaminated measurements, six favourable verdicts, four llama.cpp
+revisions. No row changes lifecycle state, and no number is re-taken. The oracle
+is deliberately ungateable until #857 builds and runs the new pin.

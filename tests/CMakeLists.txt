@@ -21,6 +21,9 @@ function(vllm_cpp_add_test name)
   # under tests/support/ as "support/<name>.h". No header name under tests/
   # collides with one under include/ or src/, so nothing else resolves here.
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # Some test-only portability helpers live under src/vllm/support/ on purpose:
+  # they are internal build shims, not installed public headers.
+  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
   if(TARGET vllm::sanitize_test_shared)
     target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
   else()

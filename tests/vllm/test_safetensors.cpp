@@ -24,6 +24,7 @@
 
 #include "vllm/model_executor/model_loader/read_only_file_mapping.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/support/platform_compat.h"
 
 namespace {
 
@@ -585,8 +586,7 @@ TEST_CASE("safetensors temp fixtures isolate simultaneous caller names") {
 namespace {
 
 size_t HostPageSize() {
-  const long p = ::sysconf(_SC_PAGESIZE);
-  return p > 0 ? static_cast<size_t>(p) : 4096;
+  return vllm::support::HostPageSize();
 }
 
 // Resident set (KiB) of the /proc/self/smaps VMA that contains `addr` — the

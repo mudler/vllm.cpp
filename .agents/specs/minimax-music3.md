@@ -1664,7 +1664,69 @@ tolerances still pass" and not "the RMS agrees to five digits" — the same byte
 Every gated Music3 number was taken on this path, so a path that emits identical
 bytes cannot have moved one.
 
-### 12.4 Speed — PENDING a quiet box, and said so rather than fudged
+### 12.4 Speed — a KERNEL A/B, because the e2e pair was spoiled twice
+
+**The whole vocoder convolution chain runs 10.7x faster on a 20-core box, and it
+emits the same bytes.** That number is a KERNEL measurement, said so plainly,
+and it is not offered as an end-to-end speedup.
+
+**Why not the e2e pair.** It was attempted first and both attempts are VOID, and
+naming which runs were spoiled is what makes the replacement honest. The 27 GB
+checkpoint is mmap'd from a CIFS mount, so the FIRST run of a series pays a
+fault-in no later run pays: `--duration 0.1` gave `d9441ef3` 369.5 s COLD
+against this tree 311.8 s warm, which is a statement about the page cache as
+much as about the kernels. The `--duration 0.4` pair (786.2 s against 524.0 s)
+was taken while another session's full `ctest` sat on the same 20 cores at a
+1-minute load average of **76.6**. A contention-guarded re-run is queued.
+
+**What replaces it, and why the statistic is defensible.** A kernel loop is
+short enough to repeat, so the MINIMUM over repetitions is available — and a
+minimum is the least-disturbed sample rather than an average of somebody else's
+contention. Five interleaved rounds (base, new, base, new, ...), the same driver
+source compiled twice against the two `libvllm.a` builds, at the vocoder's REAL
+geometry (`decoder_hidden_dim` 1536, ratios `[8,8,4,2]`, `kernel = 2*stride`,
+`padding = ceil(stride/2)`, exactly as `minimax_music3_acoustic.cpp:738-744`
+builds them) and the depth decoder's real 4096 -> 6144 projection.
+
+| kernel | shape | `d9441ef3` | this branch | speedup |
+|---|---|---|---|---|
+| `ConvTranspose1d` stage 0 | 1536->768, L=128, stride 8 | 0.3812 s | 0.1935 s | 1.97x |
+| `ConvTranspose1d` stage 1 | 768->384, L=1024, stride 8 | 0.7707 s | 0.4023 s | 1.92x |
+| `ConvTranspose1d` stage 2 | 384->192, L=8192, stride 4 | 8.4197 s | 0.4239 s | **19.86x** |
+| `ConvTranspose1d` stage 3 | 192->96, L=32768, stride 2 | 3.7413 s | 0.2342 s | **15.98x** |
+| `Conv1d` k=7 | 1536->1536, L=134 | 1.0334 s | 0.0859 s | **12.03x** |
+| `LinearNoBias` | 4096->6144, 16 rows, bf16 | 0.2045 s | 0.0188 s | **10.88x** |
+| **the convolution chain** | the five rows above it | **13.36 s** | **1.25 s** | **10.7x** |
+
+`uptime` 3.36 before the series and 12.64 after; the noisy rounds are visibly
+higher on BOTH arms, which is what the minimum exists to discard.
+
+**And the bit-identity holds AT THESE SHAPES**, which is a third leg under the
+correctness claim and the one taken where the vocoder actually calls. Each
+kernel printed an FNV-1a fingerprint of its raw output bytes and all six matched
+between the arms in every round: `8117c200e328c320`, `f85b530c211840c8`,
+`7ec0b57567ae1d1b`, `aebd8d61c6c7539e`, `9e23c0016f1b1cf3`, `be2376b0ebe5177e`.
+§12.2 gates small shapes against the serial loop, §12.3 gates the composition,
+and this gates production geometry.
+
+#### The two stages that are only ~2x, recorded because it is a finding
+
+Stages 0 and 1 gain 1.9x on 20 cores while stages 2 and 3 gain 16-20x, and the
+parallelism is identical in all four. What differs is which array each version
+streams. The old scatter's accumulator is `out_channels * full` doubles — **50 MB**
+at stage 2 — written in an order that touches every destination channel per
+input; the pivot gives each worker a scratch ONE channel wide (262 KB at stage
+2, L2-resident), so stages 2 and 3 collect a locality win on top of the thread
+win. Stages 0 and 1 do not: their accumulator was already small (6.4 MB) and
+their WEIGHTS are large (75 MB at stage 0) and are now read with a stride of
+`out_per_group * kernel` floats instead of contiguously.
+
+**The pivot trades weight locality for accumulator locality.** Named rather than
+left implicit: a weight pre-transpose, or blocking the `ic` loop, would recover
+stage 0/1's contiguity without touching a reduction order, and it is worth its
+own measurement. It is not in this change.
+
+### 12.5 The e2e pair — still PENDING, and said so rather than fudged
 
 The wall-clock pair this change owes is **not reported yet**, because the two
 runs that exist are not comparable and pretending otherwise would be worse than
@@ -1685,8 +1747,18 @@ which voided the `--duration 0.4` pair as well.
 The re-measurement is guarded: it waits for two consecutive quiet samples with
 no foreign compiler or test binary running before each arm, alternates the arms,
 takes two samples of each, and records `uptime` on both sides. Until it lands,
-the honest statement is that **the speed axis is PENDING and the correctness
-axis is CLOSED** (§12.3).
+the honest statement is that **the e2e axis is PENDING, the KERNEL axis is
+MEASURED at 10.7x on the convolution chain (§12.4), and the correctness axis is
+CLOSED (§12.3)**.
+
+**And the e2e axis will not be a large number even when it lands**, which is
+worth saying in advance so the result is not read as a disappointment. Five of
+six stages are host loops and only three of their kernels moved; the 8.6B
+language model's decode is elsewhere, the 2.4B fp32 DiT is untouched, and a
+short request is dominated by faulting in 27 GB of weights. The kernel A/B is
+the number that isolates what this change did; the e2e pair will be the number
+that says how much of a whole request that was, and the two answer different
+questions.
 
 What is *not* pending: the parallelism is real and asserted, not hoped for. The
 gate's thread-distinctness leg fails if the body runs on one thread, and

@@ -451,3 +451,37 @@ TEST_CASE("the static fp8 W8A8 pair resolves and runs end-to-end on a CPU queue"
   // residual gap recorded in the spec is visible rather than assumed closed.
   CHECK_FALSE(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, DeviceType::kCPU));
 }
+
+// ===========================================================================
+// G4 (issue #960) — THE REGISTRATION ITSELF, on every CUDA build.
+//
+// `QuantFp8Static`'s CUDA kernel is `x * (1/s)` plus a hardware e4m3 convert and
+// has no cutlass dependency of any kind, but it USED TO SHARE a translation unit
+// with the cutlass sm120 fp8 GEMM — and that TU is compiled only when
+// `VT_CUTLASS_FP8_ARCHS` resolves non-empty. So on every CUDA arch outside that
+// set (sm_110 is the measured one) `OpId::kQuantFp8Static` was not registered for
+// `DeviceType::kCUDA` at all, the resolver installed the portable CPU reference
+// tier for a CUDA queue, and the first real call dereferenced device pointers and
+// took the process down. G2 above cannot state that: on a host WITHOUT the native
+// kernel it crashes before it can report, and on a host WITH it the condition
+// never arises. This case is the one that reads the same on both.
+//
+// It deliberately does NOT need a CUDA DEVICE — `OpRegistered` is a table lookup
+// over registrars that ran before main, so it answers on any CUDA BUILD, which is
+// exactly the axis the defect lived on.
+#if defined(VLLM_CPP_CUDA)
+TEST_CASE("G4: QuantFp8Static is registered for CUDA independent of cutlass-fp8") {
+  CHECK(vt::OpRegistered(vt::OpId::kQuantFp8Static, DeviceType::kCUDA));
+  // NON-VACUITY, and the actual claim: the quant registration is INDEPENDENT of
+  // the cutlass one. Asserting only the line above would pass on a cutlass-fp8
+  // host for the old reason as well as the new one. Here the cutlass GEMM is
+  // required to track its own feature macro, so on a build where it is ABSENT
+  // (Thor/sm_110) this case still proves the quant survived the arch gate, and on
+  // a build where it is PRESENT (GB10/sm_121a) it proves nothing regressed.
+#if defined(VT_CUTLASS_FP8)
+  CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8Cutlass, DeviceType::kCUDA));
+#else
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kMatmulFp8Cutlass, DeviceType::kCUDA));
+#endif
+}
+#endif  // VLLM_CPP_CUDA

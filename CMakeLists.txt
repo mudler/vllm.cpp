@@ -1602,6 +1602,12 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_quant_dot.cu
+    # UNCONDITIONAL ON PURPOSE (issue #960). The static per-tensor fp8 activation
+    # quant has no cutlass dependency; it lived in the cutlass-fp8 TU below and so
+    # went unregistered for kCUDA on every arch outside VT_CUTLASS_FP8_ARCHS,
+    # where the resolver then ran the portable CPU tier over device pointers and
+    # segfaulted. scripts/check-cuda-op-arch-gate.py fails if it leaves this list.
+    src/vt/cuda/cuda_quant_fp8.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu

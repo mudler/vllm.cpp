@@ -490,6 +490,9 @@ class BudgetEnforcement(unittest.TestCase):
             # every case rather than quietly passing a reduced one.
             "scripts/check-container-matrix.py",
             "scripts/check-container-workflow.py",
+            # 2026-08-16: the CUDA arch-gate registration guard (#960). Its suite
+            # reaches into the checker's parser, so the disabled stub cannot load.
+            "scripts/check-cuda-op-arch-gate.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

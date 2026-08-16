@@ -22091,3 +22091,103 @@ spec §5 withdrew the token gate because the AR codes are a seeded
 `torch.multinomial` draw, so a different logit changes the drawn code and
 everything downstream. Sample-wise comparison of the two WAVs is meaningless and
 none is offered; the RMS/peak of each run are recorded in the spec instead.
+
+
+## MUSIC3-CPU-PARALLEL — the three host kernels, base vs parallelised, x86-64 20-core (2026-08-16, `row/MUSIC3-DEVICE-KERNELS`, base `origin/main` `0f8580e26`, #672)
+
+**Not a parity ratio, and not an end-to-end number.** This is a KERNEL A/B
+between two builds of this project: `d9441ef3` (the row-wise parallelisation's
+parent for these three files, byte-identical to `0f8580e26` in all four of them)
+and this branch. There is no reference leg; SGLang-Omni is still
+`gateable = no` and every axis in `docs/BENCHMARKS.md` against it stays
+`PENDING`.
+
+### Why a kernel A/B and not the e2e pair
+
+The e2e pair was attempted first and is recorded as VOID, because saying which
+runs were spoiled is the only thing that makes the replacement honest:
+
+* `--duration 0.1`: `d9441ef3` 369.5 s against this tree 311.8 s — but the 27 GB
+  checkpoint is mmap'd from a CIFS mount and the FIRST run of a series pays a
+  fault-in no later run pays. The base arm was cold and the new arm warm, so
+  that ratio is about the page cache as much as the kernels.
+* `--duration 0.4`: 786.2 s against 524.0 s — taken while another session's full
+  `ctest` was on the same 20-core box at a 1-minute load average of **76.6**.
+
+A short kernel loop can be repeated, so the MINIMUM over repetitions is
+available, and a minimum is the least-disturbed sample rather than an average of
+someone else's contention. Five interleaved rounds (base, new, base, new, ...),
+four to five repetitions inside each.
+
+### Recipe
+
+x86-64, 20 cores, 84 GB. Both arms are the SAME driver source compiled twice and
+linked against the two `libvllm.a` builds:
+
+    g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
+        -I<wt>/build/include -isystem <wt>/third_party \
+        kbench.cpp -o kbench-<arm> <wt>/build/libvllm.a \
+        <wt>/build/libblake3_vendored.a -lpthread
+
+Shapes are the vocoder's REAL geometry — `decoder_hidden_dim` 1536, upsampling
+ratios `[8,8,4,2]`, `kernel = 2*stride`, `padding = ceil(stride/2)`, exactly as
+`minimax_music3_acoustic.cpp:738-744` builds them — and the RVQ depth decoder's
+real 4096 -> 6144 projection at its 16-position window. `uptime` before the
+series 3.36, after 12.64; the timed minimums come from the quiet rounds and the
+noisy ones are visibly higher on BOTH arms.
+
+### Result — minimum of 5 interleaved rounds
+
+| kernel | shape | `d9441ef3` | this branch | speedup |
+|---|---|---|---|---|
+| `ConvTranspose1d` stage 0 | 1536->768, L=128, stride 8 | 0.3812 s | 0.1935 s | **1.97x** |
+| `ConvTranspose1d` stage 1 | 768->384, L=1024, stride 8 | 0.7707 s | 0.4023 s | **1.92x** |
+| `ConvTranspose1d` stage 2 | 384->192, L=8192, stride 4 | 8.4197 s | 0.4239 s | **19.86x** |
+| `ConvTranspose1d` stage 3 | 192->96, L=32768, stride 2 | 3.7413 s | 0.2342 s | **15.98x** |
+| `Conv1d` k=7 | 1536->1536, L=134 | 1.0334 s | 0.0859 s | **12.03x** |
+| `LinearNoBias` | 4096->6144, 16 rows, bf16 | 0.2045 s | 0.0188 s | **10.88x** |
+| **the whole vocoder convolution chain** | the five rows above it | **13.36 s** | **1.25 s** | **10.7x** |
+
+### The two stages that are only ~2x, and why that is a finding rather than noise
+
+Stages 0 and 1 gain 1.9x on 20 cores while stages 2 and 3 gain 16-20x. The
+difference is not parallelism, which is the same in all four; it is WHICH array
+each version streams.
+
+The old scatter's accumulator is `out_channels * full` doubles — **50 MB** at
+stage 2 — and it is written in an order that touches every destination channel
+per input. The pivot gives each worker a scratch ONE channel wide (262 KB at
+stage 2, an L2 resident), so stages 2 and 3 collect a locality win on top of the
+thread win. Stages 0 and 1 do not, because their accumulator was small already
+(6.4 MB) and their WEIGHTS are large (75 MB at stage 0) and are now read with a
+stride of `out_per_group * kernel` floats instead of contiguously. The pivot
+trades weight locality for accumulator locality, and the net is 2x where the
+weights dominate and 20x where the accumulator does.
+
+**Named as the next step rather than left implicit:** a weight pre-transpose (or
+blocking the `ic` loop) would recover stage 0/1's contiguity without touching a
+reduction order, and it is worth its own measurement. It is not in this change.
+
+### Bit-identity, at THESE shapes
+
+Every kernel above also printed an FNV-1a fingerprint of its raw output bytes,
+and **all six matched between the arms in every round**:
+
+    ConvTranspose1d stage0  8117c200e328c320      Conv1d k=7      9e23c0016f1b1cf3
+    ConvTranspose1d stage1  f85b530c211840c8      LinearNoBias    be2376b0ebe5177e
+    ConvTranspose1d stage2  7ec0b57567ae1d1b
+    ConvTranspose1d stage3  aebd8d61c6c7539e
+
+That is a third independent leg under the correctness claim, and it is the one
+taken at the PRODUCTION geometry: `test_host_parallel` gates small shapes
+against a verbatim copy of the serial loop, the e2e run gates the composition
+(`base-0.1.wav` and `new-0.1.wav` share sha256
+`12452152876072b280a7a2551dd182731a8475decc625758de28c345f194de9d`), and this
+gates the exact shapes the vocoder actually calls.
+
+### What is NOT claimed
+
+No end-to-end speedup is claimed from these numbers. The vocoder is one of six
+stages, the 8.6B language model's decode is elsewhere, and the checkpoint load
+dominates a short request. A contention-guarded e2e pair is running and will be
+appended when it lands. No reference comparison exists.

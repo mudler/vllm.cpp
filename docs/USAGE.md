@@ -114,6 +114,31 @@ requested value — but it sent a contributor looking in the wrong place
 ([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
 gencode line remains the ground truth if you want to double-check.
 
+### A DISABLED feature removes its kernels, not the ops that do not need it
+
+`cutlass-fp8: DISABLED` means this build has no CUTLASS sm120 FP8 **GEMM**. It
+does not mean the build has no FP8. The static per-tensor activation quant
+`vt::QuantFp8Static` is a hardware `e4m3` convert with no CUTLASS dependency, so
+it is compiled and registered on **every** CUDA architecture
+(`src/vt/cuda/cuda_quant_fp8.cu`), and the cuBLASLt FP8 GEMM it feeds is
+registered unconditionally too. FP8 W8A8 checkpoints therefore load and run on a
+CUDA build with no CUTLASS at all: `-DVLLM_CPP_CUTLASS_DIR` and
+`-DVLLM_CPP_CUTLASS_FETCH` are not required for that path.
+
+Until [#960](https://github.com/mudler/vllm.cpp/issues/960) the quant shared a
+translation unit with that CUTLASS GEMM, so it inherited the GEMM's architecture
+set and was simply absent on `110`. The engine then ran the portable CPU fallback
+over device pointers and the process died with `SIGSEGV` after printing
+
+```text
+[vt reference-tier] op=QuantFp8Static device=cuda has NO native kernel; running the PORTABLE CPU fallback (correct but slow)
+```
+
+If you ever see that banner naming an op on a `cuda` device, this build is
+missing a kernel it needs. Report it — it is not a slow path, and the message's
+"correct but slow" is not true when the device is not the CPU
+([#844](https://github.com/mudler/vllm.cpp/issues/844)).
+
 ## Using more than one engine in a process
 
 Constructing a `LoadedEngine`, destroying it, and constructing another in the

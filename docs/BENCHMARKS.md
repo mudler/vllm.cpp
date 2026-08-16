@@ -456,11 +456,6 @@ built on it rather than keeping the flattering one.
 
 **CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07).** On dgx aarch64 the `[K,N]` path beats `[N,K]` by 1.16x to 1.30x, byte-identically. The x86 arm is INDICATIVE ONLY, not binding: that box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. `VT_CPU_MATMUL_STEAL` ships default OFF and is NOT measured; it must justify itself by measurement and may measure neutral.
 
-**Darwin Qwen3.5 build repair (2026-08-16).** Benchmarking is NOT APPLICABLE.
-The change removes a redundant namespace-scope lambda capture that Apple Clang
-rejects under `-Werror`; it does not change generated refusal text, model math,
-or any runtime path. The binding gate is the Apple Clang build.
-
 ## Open gaps
 
 | Track | Status | Next gate |
@@ -517,6 +512,7 @@ or any runtime path. The binding gate is the Apple Clang build.
 | Async serving correctness (#323) | **FIXED**: the decode graph replayed stale HOST token ids, degenerating concurrent requests past slot 0 (classic-dense, graph on = default). Graph declines while the mirror is live; async 7/7, SACRED 184/184 | Graph to read ids at REPLAY |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
 | Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Full-library LINK at `sm_75` + `cuobjdump` SASS, then a build-supported row. The fp16 `fattn` port is speed-only now; its floor when a card exists is llama.cpp on that card |
+| Darwin Qwen3.5 build repair (2026-08-16) | **Benchmarking is NOT APPLICABLE.** Dropping a redundant namespace-scope lambda capture that Apple Clang rejects under `-Werror` changes no generated refusal text, no model math and no runtime path | None, and no number is owed. The binding gate is the Apple Clang build |
 
 ## Reproduce
 

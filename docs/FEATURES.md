@@ -148,10 +148,6 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
 
-The Qwen3.5 MoE loader also builds under Apple Clang with project warnings
-promoted to errors. Its layout-refusal path uses the same messages and behavior
-on every platform.
-
 ### Standalone and non-registered lanes
 
 These run through dedicated forwards, not the `REGISTER_VLLM_MODEL` registry, so
@@ -253,7 +249,7 @@ both refuse, naming what is missing.
 |---|---|---|---|---|
 | CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ | ◐ | ☐ | ✅ |
-| Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
+| Metal (Apple Silicon; Apple Clang builds the Qwen3.5 MoE loader with project warnings promoted to errors, and that loader's layout-refusal path uses the same messages and behavior on every platform) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |

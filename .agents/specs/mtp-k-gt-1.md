@@ -703,7 +703,7 @@ upstream's own supported configuration.
 | W3 | `prepare_decode_inputs` + `update_draft_inputs` + `draft_decode_slot_mapping`, the two Triton-kernel ports, mutation-gated | LANDED (`cb0bb2579`) |
 | W4 | `MtpProposeDrafts` (the multi-step loop) + `Qwen3_5MTPModel::GatherHiddenRows` + the runner emitting k drafts + per-depth telemetry, and the W2 refusal REMOVED rather than widened | LANDED (`cb0bb2579`) |
 | W5 | The CPU depth gate through the production loader at k=1..4, plus the public-document projections | LANDED (`cb0bb2579`), witness REPAIRED in `0d37de1ed` after a fresh review proved the first one blind: see `## Outcome` |
-| W6 | The DGX three-way at k=2..4 on the 27B and 35B, on the DEFAULT bf16 GDN state | OWED, see below. The GPU lock was held for the whole flow |
+| W6 | The DGX three-way at k=2..4 on the 27B and 35B, on the DEFAULT bf16 GDN state | PART-RUN 2026-08-16 on the 27B: depth, the per-depth counters and the PADDED CONTROL are MEASURED on real weights. The vLLM leg and the 35B lane are still OWED, blocked on a foreign GPU allocation. See `## Outcome (DGX half)` |
 | W7 | The matched-k throughput A/B and the acceptance-versus-depth curve | OWED, #81 M2 |
 
 ## Stop conditions
@@ -718,8 +718,8 @@ upstream's own supported configuration.
 
 | Owed | What it must show | Who |
 |---|---|---|
-| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | our-ON == our-OFF == vLLM-ON, token for token on the golden prefix, at EACH depth, with the per-depth counters populated at every depth up to k, plus spec-OFF byte-identical. It must run the DEFAULT bf16 GDN state, because the CPU gate here runs the f32 arm for the reason in section 4.5, so the GDN speculative rollback at depth is UNEXERCISED until this runs. **Do NOT gate provenance on `spec_drafts_accepted_by_depth()[1] > 0`.** Build the PADDED CONTROL below instead, and gate on the RATE | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
-| The PADDED CONTROL arm of that gate, and the RATE assertion it carries | Run the gate workload a second time on real weights with the padding mutation this row already wrote applied to `MtpProposeDrafts`: run all `k-1` draft decode forwards, DISCARD the sampled tokens, and write the step-0 draft into all k columns. Identical model, prompt, token count, k, batching and sampling in both arms. Record `spec_drafts_accepted_by_depth()` and `spec_drafts_proposed_by_depth()` for BOTH arms and report the per-depth RATE, accepted over proposed, at every depth. The reason this arm exists: a padded row is `t0 t0 ...`, so its column-1 entry is accepted exactly when the target's own greedy continuation repeats `t0`, which real text does routinely, and a non-zero entry at depth >= 1 in this CONTROL falsifies the naive count assertion outright. Expect that falsification and record the control's numbers even when they come back 0, because a control that measures 0 on ONE prompt is a fact about that prompt and never a licence to restore the count assertion. The gate PASSES when the real loop's rate at each depth >= 1 exceeds the control's by a margin stated before the run, and it FAILS on a real-loop rate that the control matches. A broken carry or an off-by-one column index lowers the real arm's rate toward the control without ever zeroing its count, which is exactly what a count cannot see | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| The PADDED CONTROL arm of that gate, and the RATE assertion it carries | **PAID 2026-08-16 on the 27B.** Margin fixed BEFORE the run at 0.10 absolute per depth. The real loop accepts at 0.507 to 0.750 at every depth >= 1. The padded control accepts at 0.000 at every depth >= 1 while its depth-0 rate MATCHES the real arm (0.892 to 0.925 against 0.868 to 0.878), which is what a control that isolates columns >= 1 must look like. Every margin clears by at least 0.41. The control measuring 0 is recorded as a fact about THIS prompt set and did not license restoring the count assertion. Still owed on the 35B | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
 | Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
 | M2 speed A/B at matched k | concurrency-1 and concurrency>1 throughput against vLLM same-config at matched k, plus the acceptance-versus-depth curve for prose and for code | [#81](https://github.com/mudler/vllm.cpp/issues/81) M2 |
@@ -974,3 +974,101 @@ makes the emission independent of k, so identity passes on a drafter clamped to
 changes no default. vLLM resolves the same default the same way
 (`speculative.py:977-979`), and until the owed throughput A/B says depth wins,
 raising the default would be a speed claim without a measurement.
+
+
+## Outcome (DGX half, 2026-08-16)
+
+**What ran.** `Qwen3.6-27B NVFP4` on `dgx.casa` (GB10, driver 580.173.02, CUDA
+13.0), the DEFAULT bf16 GDN state, greedy `temperature 0`, 4 prompts (2 prose,
+2 code), 128 output tokens, concurrency 1. Our binary is a full fast-path CUDA
+build: `fp4-mma`, `cutlass-nvfp4`, `cutlass-fp8` and `fa2` all ENABLED and
+Triton AOT on, checked in the configure log by a guard that ABORTS on any of
+them reading DISABLED, because a degraded build measures something we do not
+ship. `BUILD_EXIT=0`, zero warnings, zero ENOSPC hits.
+
+**The checkpoint carries the MTP head, verified by reading it rather than by
+its name.** Its safetensors header lists 2111 tensors of which 15 are `mtp.*`,
+all BF16, one `mtp.layers.0` head reused autoregressively. The body is genuine
+NVFP4 (304 `U8` packed + 304 `F8_E4M3` scales). This matters because this
+repository has changed what it ships before.
+
+**Depth reaches the verify path at every k, on real weights.** The per-depth
+counters are populated at EVERY depth up to k, and acceptance decays
+monotonically with depth, which is what a real autoregressive draft loop does:
+
+| k | depth 0 | depth 1 | depth 2 | depth 3 |
+|---|---|---|---|---|
+| 2 | 0.878 (173/197) | 0.731 (144/197) | | |
+| 3 | 0.868 (145/167) | 0.683 (114/167) | 0.539 (90/167) | |
+| 4 | 0.875 (119/136) | 0.750 (102/136) | 0.618 (84/136) | 0.507 (69/136) |
+
+**THE PADDED CONTROL, which is the point of this gate.** Same workload, same k,
+same everything, on a binary whose `MtpProposeDrafts` runs all `k-1` decode
+forwards, DISCARDS what they sampled and pads all k columns with the step-0
+draft. The two binaries differ (sha256 `97eb06c2...` real against `5527f5ce...`
+padded) and the source was restored byte-for-byte afterwards, verified by
+sha256, so neither a mutation that never applied nor a stale binary can be
+reading as a result here.
+
+| k | depth 1 real / control | depth 2 real / control | depth 3 real / control |
+|---|---|---|---|
+| 2 | 0.731 / 0.000 | | |
+| 3 | 0.683 / 0.000 | 0.539 / 0.000 | |
+| 4 | 0.750 / 0.000 | 0.618 / 0.000 | 0.507 / 0.000 |
+
+The control's depth-0 rate is 0.892 to 0.925 against the real arm's 0.868 to
+0.878. That is the control working: padding cannot touch column 0, so column 0
+must agree, and only columns >= 1 collapse. The margin was fixed at 0.10
+absolute BEFORE the run and every depth clears it by at least 0.41.
+
+**The control measured 0, and that is recorded as a fact about this prompt set
+rather than as a licence to go back to the count assertion.** The spec predicted
+a non-zero control here, on the argument that a padded row `t0 t0` is accepted
+at column 1 whenever the target's greedy continuation repeats `t0`. On these
+four prompts it never does. The prediction was reasonable and the measurement
+disagrees with it. The RATE comparison carries the gate either way,
+which is exactly why the spec asked for a rate.
+
+**A divergence this gate cannot yet attribute, recorded rather than explained
+away.** `our-ON` is NOT token-identical to `our-OFF`. Three of four prompts
+differ, at the SAME position for k=2, 3 and 4 and for the padded control too
+(request 0 at token 12, request 1 at token 1, request 2 at token 69, and
+request 3 matches everywhere). Depth-independence plus padded-arm agreement says this is
+one fixed spec-ON versus spec-OFF difference and NOT a depth defect, and the
+sites look like near-ties ("because:" against "because\n"). That reading is a
+HYPOTHESIS. The instrument that settles it is the oracle: if vLLM's own ON and
+OFF split at the same positions, the split belongs to the speculative verify
+path in both engines. That leg did not run, so nothing here claims the token
+gate passed.
+
+**VOID, recorded rather than deleted.** The throughput of `padded_k3` and
+`padded_k4` in the first pass (12.08 and 11.81 tok/s) is VOID: they started at
+loadavg 10.77 and 20.41 against 1.2 to 2.9 for every other arm, so the arms were
+not measured under comparable conditions. The acceptance RATES above survive
+that, because a rate is a deterministic function of the greedy token stream and
+does not move with host load, and the rates were re-derived from the token
+streams rather than from timing. The re-run that would put every arm in one
+window is the owed work below.
+
+**Throughput, from the arms that were uncontended (loadavg 1.2 to 2.9).**
+Decode 10.59 tok/s spec-OFF, 19.31 at k=2, 20.40 at k=3, 22.60 at k=4, SM clock
+pinned at 2100 MHz under `$HOME/gpu.lock` with the pin reset under a trap on
+every exit path (`CLOCKS_RESET=1` recorded by all 7 arms). These are OUR arms
+only. They are NOT a parity number, because the vLLM denominator did not run.
+
+**What blocked the rest, measured.** From 21:58:04 a neighbouring session's
+LTX-2.5 render held `$HOME/gpu.lock` and a 36396 MiB device allocation under a
+three-hour budget, and after 42 minutes it had produced zero frames with
+`gpu_util` reading 0 throughout. Our arms had all finished at 21:56:43, 81
+seconds before it took the lock, so they are uncontended. The vLLM leg never
+started, and its log is 0 bytes. The queued re-run was WITHDRAWN rather than
+left to take the lock unattended, and the foreign render was never signalled.
+
+**The harness gained a precondition this flow did not start with.** The lock is
+necessary and NOT sufficient: a neighbouring harness was observed releasing
+`$HOME/gpu.lock` while its render kept a 36 GiB allocation live. `run_all_inner.sh`
+now refuses to measure unless `nvidia-smi --query-compute-apps` is EMPTY and at
+least 45 GiB is available, samples the device before and after every leg so a
+leg that raced a foreign allocation can be voided by name, and releases the lock
+rather than holding one it cannot use. This box REBOOTS rather than OOM-killing,
+so that check protects both sessions' work and not just this measurement.

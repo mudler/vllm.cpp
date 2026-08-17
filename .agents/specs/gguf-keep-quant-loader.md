@@ -125,7 +125,7 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 | L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | **MEASURED, NOT MET** 2026-07-22 (see below) |
 | L5 | mmap residency + tied-head sharing | stop COPYING block bytes out of the mapped file (llama.cpp supports both; L2 chose copy deliberately) and stop materialising the vocab matrix twice for a tied `lm_head` — the two changes L4's measurement identifies as ~1.9 GiB of the remaining 3.6 GiB gap | L4 | **DONE** 2026-07-23 (peak RSS 6.401 → 3.884 GiB, 2.29× → 1.39× llama.cpp; byte-identical) |
 | L6 | keep-f16 residency | keep F16 matmul weights + F16 embed/tied-head resident as F16 (mmap-borrow, [N,K] nk=true), consumed by the f16 elementwise GEMM, instead of the bf16 re-expansion | L5, KERNEL-GEMM-CPU-ELEM | **LANDED OPT-IN** 2026-07-23; premise looked refuted (RSS-neutral) but L7 found WHY and reversed it. See L6 result. |
-| L7 | repack-source release + prefault + keep-f16 default ON | (a) release the DEAD q8_0 repack-source mmap pages (`OwnGgufQuantBlocks`, port of llama.cpp `unmap_fragment`) — removes the 1.0 GiB double-count; (b) `PrefaultBorrowedSpan` load-time prefault (port of llama.cpp mmap prefetch) — removes L6's prefill regression against llama.cpp; (c) flip keep-f16 default ON | L6 | **DONE** 2026-07-23 — CPU peak RSS **2.832 GiB = 1.01× llama.cpp** (was 1.39×), tokens byte-identical, bought with about 9% of prefill and about 1.4% of decode against our own keep-f16-off arm. See L7 result, and the **Decision** section for why that trade is accepted. |
+| L7 | repack-source release + prefault + keep-f16 default ON | (a) release the DEAD q8_0 repack-source mmap pages (`OwnGgufQuantBlocks`, port of llama.cpp `unmap_fragment`) — removes the 1.0 GiB double-count; (b) `PrefaultBorrowedSpan` load-time prefault (port of llama.cpp mmap prefetch) — removes L6's prefill regression against llama.cpp; (c) flip keep-f16 default ON | L6 | **DONE** 2026-07-23 — CPU peak RSS **2.832 GiB = 1.01× llama.cpp** (was 1.39×), tokens byte-identical, bought with about 9% of prefill and about 1.4% of decode against our own keep-f16-off arm. See L7 result, and §"Decision (2026-08-17)" for what the developer settled and what this record argues. |
 
 ## Risks/decisions
 
@@ -596,7 +596,7 @@ default, `Qwen3.5-2B-UD-Q8_K_XL.gguf`):**
   the prefault having removed L6's 0.72× regression against llama.cpp. The
   1.18× against pp128 173.2 is recorded, but it is **not** why the loss is
   accepted, because 173.2 is the contaminated local fork's number (#1003). The
-  tie-break is the product decision recorded below.
+  tie-break is the product decision in §"Decision (2026-08-17)".
 - **Decode 24.4 t/s ≈ parity** (llama 25.09; keep-f16 native-f16 compute costs
   ~1.4% vs the bf16 default — within the known decode-scaling item, floor lever 7).
 - **Tokens BYTE-IDENTICAL**: md5 `809f2d0d6aac93a11faecd68df8a131f` across base,
@@ -620,14 +620,31 @@ On CUDA the whole path is inert (keep_f16 rides `expand_nk`, false when
 
 ## Decision (2026-08-17): `VT_GGUF_KEEP_F16` stays DEFAULT ON
 
+### What the developer decided
+
+Two things, and nothing else. `VT_GGUF_KEEP_F16` keeps its `DEFAULT ON` value,
+and the default gets documented. The instruction, quoted verbatim including its
+typing:
+
+> vt _gguf keep f16 looks good to be dafault, but documen tit , and go ahead
+
 **This is a product decision from the developer, recorded as a decision and not
 as a measurement.** Nothing was measured for it and no code moved.
 `p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk`
 ([gguf_keep_quant.cpp:233](../../src/vllm/model_executor/model_loader/gguf_keep_quant.cpp#L233))
 is byte-for-byte what it was.
 
-The binding L7 A/B above has three axes and two of them regress. Read straight
-off that table:
+The developer gave no rationale, and a product call does not owe one. Only the
+quoted instruction and the two things it settles carry their authority. Every
+reason under the next two headings is this record's, written so a later reader
+can check the default instead of inheriting it. A reader who disagrees with that
+reasoning is arguing with this record. A reader who wants the default changed is
+asking the developer.
+
+### Why this record holds the trade to be the right one
+
+The binding L7 A/B earlier in this spec has three axes and two of them regress.
+Read straight off that table:
 
 | axis | keep-f16 OFF (base) | keep-f16 ON (the default) | move |
 |---|---|---|---|
@@ -635,30 +652,37 @@ off that table:
 | TTFT, 3 reps | 570/571/574 ms | 628/625/625 ms | about 9% worse |
 | TPOT | 40.4 ms | 40.95 ms | about 1.4% worse |
 
-**The call: 1.05 GiB of peak RSS is worth about 9% of prefill and about 1.4% of
-decode on this path.** A gigabyte of resident weight decides whether a model
-fits a fixed unified pool at all, which is a harder failure than a slower
-prefill, and neither regression moves a single token. The output md5 is
-`809f2d0d6aac93a11faecd68df8a131f` across the base arm, the default arm and the
-`VT_CPU_REF=1` oracle. A deployment that values prefill over resident bytes sets
-`VT_GGUF_KEEP_F16=0`, the same-binary opt-out that reproduces the 3.885 GiB
-base.
+Keeping the default ON keeps that trade, so **the decision costs about 9% of
+prefill and about 1.4% of decode on this path, and buys 1.05 GiB of peak RSS.**
+That restatement is what approving the default means. The argument for why the
+trade falls the right way is this record's: a gigabyte of resident weight
+decides whether a model fits a fixed unified pool at all, which is a harder
+failure than a slower prefill, and neither regression moves a single token. The
+output md5 is `809f2d0d6aac93a11faecd68df8a131f` across the base arm, the
+default arm and the `VT_CPU_REF=1` oracle. A deployment that values prefill over
+resident bytes sets `VT_GGUF_KEEP_F16=0`, the same-binary opt-out that
+reproduces the 3.885 GiB base.
 
-**The consequence, which is the part worth recording.** The tie-break used to be
-stated in the competitor's terms at the L7 result, where 204 t/s was called
-"comfortably above the competitor floor". That floor is `pp128 173.2`, measured
-against the local-only llama.cpp fork `237ad9b96` that exists on no remote. This
-is why [#1003](https://github.com/mudler/vllm.cpp/issues/1003) listed this
-default as owing a **decision** rather than only a re-measurement: a re-taken
-stock `pp128` landing above 204 t/s would have removed the only recorded reason
-the prefill loss was acceptable, and would have reopened a shipped default.
+### What the decision changes for #1003
 
-**That coupling is cut.** The tie-break is now a product judgment over our own
-same-binary arms, so **the default no longer depends on how the llama.cpp
-re-take turns out.** #1003 still owes that re-take, and it still matters for
-every published ratio on this path, including the `1.18×` prefill and `1.01×`
-peak-RSS figures this spec records against llama.cpp. What it can no longer do
-is invalidate this default.
+This reading of the consequence is also this record's, not the developer's.
+
+The tie-break used to be stated in the competitor's terms at the L7 result,
+where 204 t/s was called "comfortably above the competitor floor". That floor is
+`pp128 173.2`, measured against the local-only llama.cpp fork `237ad9b96` that
+exists on no remote. This is why
+[#1003](https://github.com/mudler/vllm.cpp/issues/1003) listed this default as
+owing a **decision** rather than only a re-measurement: a re-taken stock `pp128`
+landing above 204 t/s would have removed the only recorded reason the prefill
+loss was acceptable, and would have reopened a shipped default.
+
+**That coupling is cut**, because the default now rests on a product call and
+the trade is stated over our own same-binary arms. The llama.cpp floor is no
+longer the recorded tie-break, so **the default no longer depends on how the
+llama.cpp re-take turns out.** #1003 still owes that re-take, and it still
+matters for every published ratio on this path, including the `1.18×` prefill
+and `1.01×` peak-RSS figures this spec records against llama.cpp. What it can no
+longer do is invalidate this default.
 
 **Owed, and narrowed by this decision.** The comment at
 [`gguf_keep_quant.cpp:173-228`](../../src/vllm/model_executor/model_loader/gguf_keep_quant.cpp#L173)

@@ -41,10 +41,11 @@ Direction 2 probe recorded `python3=ABSENT`, `pip=ABSENT`, `gcc=ABSENT`,
 
 That reading came from one probe on `dgx:gpu0`, job
 `ff28ada1-0cd3-4867-bf9b-f67050d0608b`, taken on 2026-08-17. The worker image
-measured here on `thor:gpu0` the same day reports the opposite for three of those
-five names. The worker runs as `uid=0(root)`, carries `/usr/bin/gcc`,
-`/usr/bin/python3` and `/usr/bin/apt-get`, and installs a package as root
-(`APT_UPDATE_RC=0`, `APT_INSTALL_RC=0`).
+measured here on `thor:gpu0` the same day reports the opposite for two of those
+five names, `python3` and `gcc`. It runs as `uid=0(root)`, carries
+`/usr/bin/python3`, `/usr/bin/gcc` and `/usr/bin/apt-get`, and installs a package
+as root (`APT_UPDATE_RC=0`, `APT_INSTALL_RC=0`). `pip`, `curl` and `git` were not
+probed on `thor:gpu0`, so this row says nothing about them.
 
 The measurement was taken correctly. The fleet changed under it. So the recorded
 cause no longer holds, and the three fleet-side fixes #1129 names as the only

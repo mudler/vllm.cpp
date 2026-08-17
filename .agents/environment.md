@@ -77,9 +77,9 @@ labels at all. `class=train` and `gpu_model=GB10` do match. `rc run` has no
 Probed with one `rc run -d dgx:gpu0 --max-runtime 2m` job
 (`ff28ada1-0cd3-4867-bf9b-f67050d0608b`). Verify this again before you plan work
 around it, because the worker image can change under you. **It did change.** The
-`thor:gpu0` worker measured later the same day reports the opposite for three of
-the names below, so read this section as one box on one day. The `thor` reading
-is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
+`thor:gpu0` worker measured later the same day carries `python3` and `gcc`, which
+this list calls absent, so read this section as one box on one day. The `thor`
+reading is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
 
 - The command runs as user `rc` in a **k3s pod**, hostname `rc-worker-<id>`.
   `/.dockerenv` is absent and 8 `KUBERNETES_*` variables are set, so it is a pod

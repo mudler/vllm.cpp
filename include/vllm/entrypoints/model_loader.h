@@ -65,6 +65,12 @@ struct DflashDraft {
   int k = 0;
 };
 
+// vLLM CacheConfig.gpu_memory_utilization's own default (vllm/config/cache.py:68
+// @ 555967922). Named because EngineParams carries the knob as an optional, so
+// "the caller chose nothing" and "the caller chose 0.92" are different states
+// and only one of them has a value to fall back to.
+inline constexpr double kDefaultGpuMemoryUtilization = 0.92;
+
 // Knobs that size the engine stack. Zero/negative fields fall back to the
 // documented defaults (see below), so a default-constructed EngineParams is
 // valid.
@@ -86,8 +92,17 @@ struct EngineParams {
   int num_blocks = 0;      // 0 => auto (resolved: override > bytes > 256).
   // Fraction of free device memory the whole engine may consume (weights +
   // activations + KV), mirroring vLLM CacheConfig.gpu_memory_utilization
-  // (cache.py:68). Used only by the M3 profile path; inert until that lands.
-  double gpu_memory_utilization = 0.92;
+  // (cache.py:68). Still INERT: knob 3 needs the M3 profile run.
+  //
+  // TRI-STATE (FIX-GPU-MEM-UTIL-INERT, #1165), mirroring enable_prefix_caching
+  // below. nullopt means the caller never named a fraction and resolves to
+  // vLLM's kDefaultGpuMemoryUtilization; a value means the caller CHOSE one.
+  // The distinction exists because the value is discarded: ResolveNumBlocks
+  // warns on a chosen value, and stays silent on a default nobody set. Before
+  // this was tri-state the field defaulted to 0.92 and no surface could tell
+  // the two apart, so the engine accepted `--gpu-memory-utilization 0.85`,
+  // sized nothing, and said nothing.
+  std::optional<double> gpu_memory_utilization = std::nullopt;
   // Absolute KV-pool size in bytes (0 = unset). When > 0 it sizes the block
   // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
   // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
@@ -440,6 +455,13 @@ class LoadedEngine {
   // profile path (M3, not yet implemented) which falls back to 256. Throws
   // VLLM_ERR-shaped std::runtime_error when an absolute byte budget is smaller
   // than a single KV block.
+  //
+  // FIX-GPU-MEM-UTIL-INERT (#1165): the profile path also WARNS on stderr when
+  // it reaches knob 3 with an explicitly chosen gpu_memory_utilization, because
+  // that is the point at which the chosen fraction is discarded. Knobs 1 and 2
+  // return first, so a caller who sized the pool with --num-blocks or
+  // --kv-cache-memory is never warned -- and under knob 2 that also mirrors
+  // vLLM, which ignores the fraction there (cache.py:189).
   static int ResolveNumBlocks(const EngineParams& params,
                               const vllm::v1::KVCacheConfig& probe);
   // ROAD-V1-MEM M1: MakeKVCacheMaybeSpec with the block count resolved from the

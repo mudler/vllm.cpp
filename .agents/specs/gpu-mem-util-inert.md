@@ -119,9 +119,10 @@ the real fix.
 ```text
 vllm.cpp: WARNING --gpu-memory-utilization 0.85 was accepted but did NOT size the KV cache.
 vllm.cpp:   The profile run that turns a free-memory fraction into a block count is not
-vllm.cpp:   implemented (ROAD-V1-MEM M3, https://github.com/mudler/vllm.cpp/issues/83).
-vllm.cpp:   The pool fell back to 256 blocks. To size it today, pass --kv-cache-memory
-vllm.cpp:   <bytes> for an absolute KV budget, or --num-blocks <n> for an exact count.
+vllm.cpp:   implemented yet (ROAD-V1-MEM M3, https://github.com/mudler/vllm.cpp/issues/83).
+vllm.cpp:   The pool fell back to 256 blocks. To size it today, pass
+vllm.cpp:   --kv-cache-memory <bytes> for an absolute KV budget, or --num-blocks <n> for an
+vllm.cpp:   exact block count.
 ```
 
 ### The GB10 hazard belongs in the document, not in the notice

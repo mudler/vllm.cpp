@@ -123,14 +123,23 @@ constexpr double kQ4KIdenticalFloor = 0.02;  // measured 0.0284
 // is "too good" here is not a better port; it is a different set of weights.
 constexpr double kQ4KMeanAbsFloor = 5e-3;    // bf16 control is 1.659e-3
 
+// The checkpoint root comes from the environment, never from a literal. The
+// literal that stood here named `/mnt/nas_share/checkpoints`, which sits on the
+// ephemeral root overlay of the gate box's immutable OS and was deleted by a
+// reboot (issue #1073); `.agents/environment.md` records the live location and
+// why it cannot move back. An undeclared root now yields an EMPTY path, so the
+// skips below name the variables to set rather than a path nobody declared.
+std::string CheckpointRoot() {
+  const char* root = std::getenv("CHECKPOINT_ROOT");
+  return root != nullptr && *root != '\0' ? std::string(root) : std::string();
+}
+
 std::string GgufPath() {
   if (const char* direct = std::getenv("VLLM_CPP_MUSIC3_GGUF")) {
     if (*direct != '\0') return direct;
   }
-  const char* root = std::getenv("CHECKPOINT_ROOT");
-  const std::string base = root != nullptr && *root != '\0'
-                               ? std::string(root)
-                               : std::string("/mnt/nas_share/checkpoints");
+  const std::string base = CheckpointRoot();
+  if (base.empty()) return {};
   return (fs::path(base) / "minimax-music3-gguf" / "rvq_depth_decoder_q4_k.gguf").string();
 }
 
@@ -138,19 +147,27 @@ std::string SafetensorsRoot() {
   if (const char* direct = std::getenv("VLLM_CPP_MUSIC3_CHECKPOINT")) {
     if (*direct != '\0') return direct;
   }
-  const char* root = std::getenv("CHECKPOINT_ROOT");
-  const std::string base = root != nullptr && *root != '\0'
-                               ? std::string(root)
-                               : std::string("/mnt/nas_share/checkpoints");
+  const std::string base = CheckpointRoot();
+  if (base.empty()) return {};
   return (fs::path(base) / "minimax-music3").string();
 }
 
 // Skip loudly. A gate that silently passes when its asset is absent has not
 // reported (AGENTS.md); this says which file it wanted.
+//
+// `what` is streamed as a `std::string`, never as the `const char*` it arrives
+// as: doctest stringifies a `const char*` through its bool overload, so every
+// message here printed "SKIP 1" and named no case at all (issue #1079).
 bool SkipIfMissing(const char* what) {
+  const std::string gguf = GgufPath();
+  if (gguf.empty()) {
+    MESSAGE("SKIP " << std::string(what)
+                    << ": VLLM_CPP_MUSIC3_GGUF and CHECKPOINT_ROOT are both unset");
+    return true;
+  }
   std::error_code ec;
-  if (!fs::exists(GgufPath(), ec)) {
-    MESSAGE("SKIP " << what << ": no GGUF at " << GgufPath()
+  if (!fs::exists(gguf, ec)) {
+    MESSAGE("SKIP " << std::string(what) << ": no GGUF at " << gguf
                     << " (set VLLM_CPP_MUSIC3_GGUF or CHECKPOINT_ROOT)");
     return true;
   }
@@ -158,11 +175,17 @@ bool SkipIfMissing(const char* what) {
 }
 
 bool SkipIfNoSafetensors(const char* what) {
+  const std::string root = SafetensorsRoot();
+  if (root.empty()) {
+    MESSAGE("SKIP " << std::string(what)
+                    << ": VLLM_CPP_MUSIC3_CHECKPOINT and CHECKPOINT_ROOT are both unset");
+    return true;
+  }
   std::error_code ec;
   const fs::path shard =
-      fs::path(SafetensorsRoot()) / "rvq_depth_decoder" / "diffusion_pytorch_model.safetensors";
+      fs::path(root) / "rvq_depth_decoder" / "diffusion_pytorch_model.safetensors";
   if (!fs::exists(shard, ec)) {
-    MESSAGE("SKIP " << what << ": no bf16 reference at " << shard.string());
+    MESSAGE("SKIP " << std::string(what) << ": no bf16 reference at " << shard.string());
     return true;
   }
   return false;

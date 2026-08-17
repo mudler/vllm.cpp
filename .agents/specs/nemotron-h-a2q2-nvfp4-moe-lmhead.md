@@ -7,7 +7,11 @@
 owns the NVFP4 half of what that spec's §1 called `A2` and what the A2-R landing
 commit (`598226e96`) renamed `A2-Q`.
 **Sibling:** [`nemotron-h-a2q1-fp8-mamba.md`](nemotron-h-a2q1-fp8-mamba.md).
-**Base:** `origin/main` @ `0e1bee42f16b5f3fb3ae5a23869f6fd97bfc037d`.
+**Base:** `origin/main` @ `45b022cdc138ae15b77b0149093071353de8ad4e` (A2-Q2a's
+branch point). The value this line carried until A2-Q2a —
+`0e1bee42f16b5f3fb3ae5a23869f6fd97bfc037d` — was two commits stale by the time
+the spec landed, so the §5.4 baseline measured against it no longer described
+`main`; see §13.
 **Not blocked on a build.** Its constraint is a REPORTING one
 ([#962](https://github.com/mudler/vllm.cpp/issues/962), §6) plus one DESIGN
 decision ([#984](https://github.com/mudler/vllm.cpp/issues/984), §4.3).
@@ -396,13 +400,21 @@ removal condition is the device/paged runner path, which is A2-P's.
 
 ## 10. Now
 
-**State at this commit:** spec only. No product code, no lifecycle change.
+**State at this commit:** A2-Q2a's MoE device arm and its synthetic NVFP4
+fixture are written and CPU-clean. **No lifecycle change**, deliberately: the
+row cannot move while §13.6's gates are owed, and the arena has been compiled by
+no compiler (it is entirely under `#ifdef VT_MARLIN_NVFP4`). A2-Q2b — `lm_head` —
+is not started. See §13 for the split, the four corrections, and the owed list.
 
-A2-Q2 is **claimable now** — its constraints are a reporting one (§6) and a
-design decision (§4.3), neither of which blocks a build. A fresh implementer
-claims this file, captures a RED per §5.3 first, and lands the MoE and `lm_head`
-device arms with G-SAFE untouched. A fresh reviewer — never the implementer —
-runs the §5.3 mutations.
+**The next action is a GB10 window**, in this order, because the cheap arm must
+fail first: resume the incremental build at `~/work/nh-a2q2-base` (468 objects,
+recipe already proven), compile the arena for the first time, run
+`test_nemotron_h_moe_device` for a genuine RED — seconds, no 21 GB load — and
+only then the real-checkpoint per-layer gate. `dgx.casa` is unreachable and per
+`.agents/environment.md:188` needs a physical power cycle.
+
+A fresh reviewer — never the implementer — runs the §5.3 mutations, all seven of
+which are owed.
 
 **Three things to read before the first edit:** §3, so the arena is not sized as
 a pointer array; §4.3, so the `lm_head` residency is a decision rather than a
@@ -416,11 +428,241 @@ default; and §6, so the Thor leg is reported as pending rather than quoted.
 - [#984](https://github.com/mudler/vllm.cpp/issues/984) — `dense_nvfp4_gemm.h`
   keys the Marlin repack cache on the weight's address. A2-Q2 decides how to
   route around it (§4.3); the fix is not this unit's.
-- The device arm has **no production caller** until A2-P wires it through
-  `ModelRegistry::Forward` (§8). Tracked on
-  [#810](https://github.com/mudler/vllm.cpp/issues/810).
+- ★ **A2-Q2a LANDS UNREACHED — this is the disclosure CLAUDE.md's "Nothing lands
+  dead" requires, stated so it cannot be mistaken for a working decode path.**
+  `NemotronHMoeBlockDevice`, the whole device MoE arm this unit adds, has **no
+  production caller and is reachable by no configuration.** It is not merely
+  "not wired yet": **G-SAFE refuses first.** `MakeNemotronHKVCache` builds an
+  attention group over the 6 GQA layers (`nemotron_h_registry.cpp:232`), the
+  runner fills `attn_kv_` from those buffers (`runner.cpp:906-916`) and passes
+  `.attn_kv = attn_kv_` on **every** forward (`runner.cpp:1371`), while the
+  G-SAFE interlock requires `attn_kv.empty()` (`nemotron_h_registry.cpp:162`).
+  `vllm_engine_load` is the only text entry point, so no ABI path bypasses the
+  runner. **A NemotronH engine refuses before emitting a token.**
+  - **Owning row for the wiring: A2-P** — the single unlock for end-to-end
+    NemotronH, and what narrows G-SAFE's `attn_kv` / `gdn_state` clauses when it
+    consumes them.
+  - **Tracking issue: [#810](https://github.com/mudler/vllm.cpp/issues/810).**
+  - **What executes in production from this unit: nothing.**
+    `PrepareNemotronHForCausalLM` is deliberately left a no-op (§13.7) so the
+    lazy 16.5 GB repack cannot fire on a load whose forward will refuse.
+- **The real-checkpoint per-block numeric gate (§5.1) is DEFERRED to A2-Q2b**,
+  which owns it together with `lm_head`. A2-Q2a lands on the synthetic NVFP4
+  fixture alone; see [`nemotron-h-a2q2b-realckpt-lmhead.md`](nemotron-h-a2q2b-realckpt-lmhead.md)
+  and §13.6.1 for exactly what the synthetic result does and does not cover.
 
 ## 12. Outcome
 
-Not yet written. Filled when the unit reaches `DONE`: what was measured, what
-was rejected and why, and why each default is set the way it is.
+Not yet written for the whole of A2-Q2. §13 records what A2-Q2a measured,
+corrected and refused; the rest is filled when A2-Q2b lands and the unit reaches
+`DONE`.
+
+---
+
+## 13. A2-Q2a — the split, four corrections, and what is OWED
+
+A2-Q2 was **split** after a fresh implementer sized it against the code. The
+split was ratified before any product code was written, and it was taken for a
+reason that STRENGTHENS the gate rather than merely shortening a diff:
+
+| Unit | Scope | Why here |
+|---|---|---|
+| **A2-Q2a** (this change) | the 23 MoE blocks: expert + shared-expert arena, the lazy repack, `NemotronHMoeBlockDevice`, the synthetic NVFP4 fixture | `lm_head` staying on the host **preserves A2-R's attributability**: both arms still end in the identical host projection (`nemotron_h_forward.h:452-457`), so a token difference remains attributable to the MoE arm alone |
+| **A2-Q2b** (owed) | `lm_head` through the NVFP4 dense route, and the disclosure that §4.4's attributability property ends | it is the half that destroys the property above, so it should not ride along silently |
+
+§4.3 does **not** defer to A2-Q2b: the shared expert is dense NVFP4 too, so
+A2-Q2a had to make the residency decision. It is recorded in §13.2.
+
+### 13.1 ★ §3's freeing premise is WRONG, and a literal reading reboots the box
+
+§3 says the raw packed `ResidentNvfp4` copies "must be freed as the repack
+proceeds, as `qwen3_5.cpp` already does". **Measured: neither existing instance
+frees per expert.** `qwen3_5.cpp:5820-5857` and `laguna.cpp:638-660` both upload
+each expert through `ResidentNvfp4`, which CACHES the device copy on the weight,
+so both accumulate the whole raw fp4 tower and free it in a tail sweep after the
+loop.
+
+At NemotronH's geometry a whole-model loop written from §3's reading peaks at
+**16.5 GB arena + 15.8 GiB tower ≈ 32 GB** — on two unified-memory boxes, one of
+which reboots rather than OOM-kills.
+
+**A2-Q2a's build peaks at the arena plus 2.8 MB.** Each expert streams through
+ONE reused staging pair (`stage_w`/`stage_s`, sized for the largest projection
+the layer repacks), copied and repacked on the same stream so expert *e*'s
+repack reads its bytes before expert *e+1* overwrites them. The reasoning, not
+just the number: **there is no raw tower to accumulate, so there is nothing to
+tail-free and nothing to get wrong.** The failure mode §3 warns about is removed
+by construction rather than managed.
+
+This is better than the spec asked for, and it is why `rep.host_bytes` is
+untouched — see §13.3.
+
+### 13.2 ★ §4.3 answered: NEITHER `MarlinDenseResidentFor` is called
+
+§4.3 offered (a) the header's address-keyed cache, (b) the `resident_marlin`
+slot as `qwen3_5.cpp:2429` does, or (c) wait for
+[#984](https://github.com/mudler/vllm.cpp/issues/984). A2-Q2a takes **(b)'s
+property by a fourth route**: the shared expert runs as an **E=1 slice of the
+same arena** — the documented dense mechanism
+(`dense_nvfp4_gemm.h:38-43`, "the SINGLE-EXPERT grouped GEMM is how a dense
+[M,K]x[N,K]^T W4A16 linear runs on the MoE Marlin entry point"), which is also
+how vLLM reaches the same csrc kernel.
+
+Consequences, each of them the reason:
+
+- The arena lives in a `ResidentSlot` the weights own, so it is **slot-keyed**
+  and engine-scoped — the property (b) exists to buy.
+- **Neither** function named `MarlinDenseResidentFor` is reachable from this
+  model, so #984 cannot bite this row *however it is eventually resolved*. That
+  is provable by ABSENCE, which beats a call site a reviewer must inspect and
+  trust to stay correct.
+- It needs **no `Nvfp4Weight` copy** of the 23 shared pairs (258,177,024 B), so
+  the pinned `host_bytes` literal does not move.
+
+**Proving it — the grep form matters.** Grep the accessor's name immediately
+followed by an open parenthesis, restricted to `src include`: it hits
+`dense_nvfp4_gemm.h` and `qwen3_5.cpp` only, and no `nemotron_h*` file. The BARE
+name instead matches the explanatory comments in `nemotron_h_forward.h` and
+`nemotron_h_device.cpp`, leaving a reviewer to eyeball which hits are prose. No
+nemotron_h TU `#include`s that header either (anchored `#include` regex: 0).
+
+### 13.3 The `host_bytes` anchor TRIO, and why it did not move
+
+`rep.host_bytes` stays **`18888922112`**. Nothing copies the expert bytes: the
+arena reads `NemotronHOwned::bytes`/`::scale` directly, so there is no second
+host residency to account for and no re-derivation owed.
+
+The literal has **two siblings that must move together**, and changing one alone
+is the 15324-byte trap this row already paid for once:
+
+| `tests/vllm/models/test_nemotron_h_loader.cpp` | pins |
+|---|---|
+| `:309` | `rep.source_bytes == 18888937436` |
+| `:310` | `rep.host_bytes == 18888922112` |
+| `:311` | the difference, as `6039*4 - 69*64*2` |
+
+(The A2-Q brief circulated to implementers cited `:150` for the middle one. That
+was wrong; it is `:310`.)
+
+### 13.4 ★ `MoeGroupedGemmNvfp4Marlin` validates almost NOTHING
+
+`src/vt/ops.cpp:874-895` checks `a`/`c` rank and dtype, `size_k % 16`, that
+`b_q_weight` is rank-3, that the align tensors are i32 and the scale tensors
+f32 — and **no extent of `b_q_weight`, and nothing whatsoever about
+`b_scales`**. There is no `c` shape check, no device check and no contiguity
+check.
+
+So an expert stride off by one in the arena, and a transposed K/N in the repack,
+are **silent at the op boundary**: they reach the kernel and produce finite,
+correctly-shaped, plausible numbers. This is the single strongest argument for
+the split and for the per-block NUMERIC gate — a token comparison cannot see any
+of it, and neither can the op.
+
+### 13.5 `nemotron_h_forward.h:142-143`'s recorded intent is DEFERRED, not forgotten
+
+That comment promises the quantized arms "move to the shared `Nvfp4Weight` /
+`Fp8Weight`, never to OwnedTensor" when they land. A2-Q2a lands the NVFP4 MoE
+arm and **does not** move them, because §13.2's E=1 route needs no `Nvfp4Weight`
+and taking one would cost 258 MB of host copies plus a re-derivation of §13.3's
+trio for no property gained.
+
+**Deferred to A2-Q2b / A2-P**, with that reason. Recorded here so the next reader
+finds a decision rather than a recorded intent the code quietly does not follow.
+
+### 13.6 OWED — and the sharpest of it is that NOTHING HAS COMPILED THE ARENA
+
+- ~~**The Marlin block has been typechecked by no compiler.**~~ **RETIRED
+  2026-08-16.** `NemotronHMoeMarlinResident`, `BuildNemotronHMoeMarlinResident`,
+  `RepackOne`, `DenseMarlinE1` and `NemotronHMoeBlockDevice` are entirely inside
+  `#ifdef VT_MARLIN_NVFP4`, so no CPU build had ever seen them. The first GB10
+  run compiled them: `BUILD_RC=0`, 0 `error:`, with
+  `CUDA feature marlin-nvfp4: ENABLED for [121a]` and `cutlass-nvfp4: ENABLED
+  for [121a]` in the same log, so the result is not voided. **The proof is not
+  that the target linked** — it is that the test then RAN and FAILED on device
+  numerics, which is impossible if the guarded block had not entered the build.
+- **Both GB10 legs are OWED**, not pending-and-absent: the synthetic-fixture RED
+  and the real-checkpoint per-layer numeric gate (§5.1). `dgx.casa` went
+  unreachable mid-unit (100% packet loss, "no route to host", while the gateway
+  and Thor answer on the same subnet) and per `.agents/environment.md:188` that
+  state needs a physical power cycle. What the window DID buy before it went is
+  the build recipe, proven at the base SHA: `cutlass-nvfp4`, `cutlass-fp8`,
+  `marlin-nvfp4` and `fa2` all `ENABLED for [121a]`, `CUTLASS found at /cutlass`,
+  `Triton AOT ... sm_121a`, configure `rc=0` — the class of defect that voided
+  three earlier attempts on this row.
+- **The synthetic bit-exactness is a NARROW claim — see §13.6.1 before citing
+  it about anything.**
+- **The Thor leg stays PENDING [#962](https://github.com/mudler/vllm.cpp/issues/962)**
+  (§6). Thor is reachable and dgx is not, which is exactly the temptation §6
+  exists to refuse: `marlin-nvfp4` is ENABLED on sm_110 and disagrees with
+  itself there (`bitdiff=15/32768`), so a number from it would rest on a kernel
+  already known to contradict itself.
+- **The §5.3 mutation table is OWED in full.** Every row is `owed`, not blank:
+
+  | # | Mutation | Must RED | State |
+  |---|---|---|---|
+  | Q2-M1 | NVFP4 nibble order flipped | MoE numeric | **owed** — needs a GB10 build |
+  | Q2-M2 | `weight_scale_2` ignored | MoE numeric | **owed** |
+  | Q2-M3 | expert stride off by one | MoE numeric | **owed** — and §13.4 says the op will not catch it |
+  | Q2-M4 | `routed_scaling_factor` folded into the logits | MoE numeric | **owed** |
+  | Q2-M5 | shared expert added BEFORE the routed scale | MoE numeric | **owed** |
+  | Q2-M6 | `vt::MoeRelu2` replaced by plain relu | MoE numeric | **owed** |
+  | Q2-M7 | the device call site deleted | the gate | **owed** |
+
+  Q2-M1 and Q2-M2 are pre-armed by the fixture rather than left to luck:
+  `kWeightScale2 = 0.25` (never 1.0, so ignoring it must move the answer) and
+  nibbles that are never symmetric within a byte (so swapping halves cannot
+  leave a pair unchanged).
+- **A2-Q2b**: `lm_head`, per the split table above.
+
+### 13.6.1 ★ The synthetic bit-exactness is a NARROW claim — do not cite it about the real checkpoint
+
+The first GB10 run reported `device-vs-host worst relative deviation: 0` against
+`separation of a routed-scale defect: 0.6`. Two cautions travel with that number,
+and the second bounds what it may ever be used for.
+
+**It was unreadable as printed, and that is fixed.** A maximum over ZERO elements
+is `0.0`, and so is a bit-exact comparison — that line did not distinguish the
+strongest possible result from a loop that examined nothing. `MaxRel` now reports
+its element count and every caller asserts it **against the geometry**
+(`examined == T * H`), never against `dev.size()`, which would agree with itself
+if the buffer were short. Agreement, separation and the property guard must all
+report the SAME count, or the band between them is fiction.
+
+**Even when green, the claim is bounded.** This fixture's output is bf16, its
+contraction is K=128, its E2M1 codes are exactly representable and its group
+scales are powers of two. Those are PRECISELY the conditions under which a bf16
+store absorbs genuine reduction-order differences. So a bit-exact synthetic
+result says the composition and the arena indexing are right *at this geometry*.
+It says **nothing** about:
+
+- the real checkpoint's geometry (H=2688, I=1856, E=128, top_k=6), where the
+  contraction is 21x longer and the reduction order genuinely differs;
+- any Marlin thread config other than the two this fixture resolves on
+  (`{128,64,128}` for up, `{64,128,128}` for down);
+- the `weight_scale_2` and group-scale VALUES the real checkpoint ships, which
+  are neither powers of two nor uniform.
+
+**A red on the real-checkpoint per-block gate after a bit-exact synthetic is an
+EXPECTED possibility, not a contradiction** — it is what this caveat predicts.
+Report it as a result. Do not repair it silently, and do not widen a band to
+absorb it.
+
+### 13.7 What A2-Q2a did NOT touch
+
+- **G-SAFE**: all three clauses at `nemotron_h_registry.cpp:161-170` —
+  `input.attn_kv.empty() && input.gdn_state.empty() && input.num_reqs <= 1` —
+  are byte-unchanged. A2-Q2a creates no paging, no carried state and no
+  batching.
+- **`PrepareNemotronHForCausalLM` stays a no-op.** §4.2 puts the repack there;
+  A2-Q2a builds lazily on first device-MoE use instead, and the code says so as
+  an explicitly TRANSITIONAL choice naming A2-P as the unit that moves it. The
+  reason: §4.2's CUDA-graph justification is forward-looking and false today —
+  nothing captures `NemotronHDeviceForward`, which has no production caller —
+  while `ModelRegistry::Prepare` IS called unconditionally from both
+  `GPUModelRunner` constructors, so a repack there would make every production
+  engine load pay 16.5 GB for a path nothing reaches. "Nothing lands dead"
+  covers an unreached FORWARD, which costs nothing; it does not cover an
+  unreached ALLOCATION inside a REACHED hook.
+- **A `kDense` MoE layer still bounces to the host**, stated as a fallback so it
+  is not discovered later as a silent slow path. That is what keeps
+  `BuildTiny`'s all-dense fixture green.

@@ -54,7 +54,7 @@ TEKKEN = (
 
 # GPT-4o / o200k family (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O; GGUF pre names
 # "gpt-4o", "llama4", "kanana2", "talkie"). VERBATIM from
-# /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json
+# $CHECKPOINT_ROOT/muse-glimmer-30b/tokenizer.json
 # (pre_tokenizer.pretokenizers[0].pattern.Regex, read 2026-08-11) — byte-equal
 # to the string llama.cpp records as "original regex from tokenizer.json" at
 # src/llama-vocab.cpp:432 @ 153d324bcf.

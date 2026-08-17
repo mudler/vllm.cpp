@@ -274,6 +274,39 @@ struct NemotronHMoeWeights {
   // moe_shared_expert_intermediate_size * n_shared_experts (nemotron_h.py:176-190).
   NemotronHExpertWeights shared;
   bool has_shared = false;
+
+  // A2-Q2a (#810): this layer's device-resident Marlin arena, built ONCE on
+  // first device-MoE use and owned BY THE WEIGHTS (issue #237's `ResidentSlot`,
+  // qwen3_5_weights.h:183). Opaque here on purpose — the arena type is a CUDA
+  // implementation detail of nemotron_h_device.cpp, exactly as `MoeBlockWeights`
+  // keeps qwen3_5.cpp's out of its own header.
+  //
+  // KEYED ON THE SLOT, NEVER ON AN ADDRESS. `dense_nvfp4_gemm.h:379` caches its
+  // Marlin repack in a `static unordered_map<const Nvfp4Weight*, ...>`, and an
+  // address is only a valid identity while the object lives: across two engine
+  // builds in one process a hit returns the PREVIOUS engine's repacked buffer —
+  // plausible, wrong values (issue #984, whose fix is not this row's). A2-Q2a
+  // cannot inherit that defect, because it never calls EITHER function named
+  // `MarlinDenseResidentFor` — not even for the shared expert, which runs as an
+  // E=1 slice of this same arena (the documented dense route,
+  // dense_nvfp4_gemm.h:38-43).
+  //
+  // PROVE IT BY ABSENCE. Grep for the accessor's name immediately followed by an
+  // open parenthesis — the CALL form — restricted to `src include`; it hits
+  // `dense_nvfp4_gemm.h` and `qwen3_5.cpp` ONLY, and no `nemotron_h*` file.
+  //
+  // Two ways that grep lies if you take a shortcut, both of which bit this
+  // comment before it settled. The BARE NAME matches prose like this paragraph,
+  // so a reviewer ends up eyeballing which hits are comments. And spelling the
+  // call form out literally HERE would make this very line a hit — which is why
+  // the command is described rather than quoted. `scripts/check-fp4-resident-
+  // consistency.py` is the checker that owns this class of question if it ever
+  // needs to be mechanical rather than reviewed.
+  //
+  // Nor does any nemotron_h TU `#include` that header: the mentions here and in
+  // nemotron_h_device.cpp are citations, not directives (verified with an
+  // anchored `#include` regex, which returns 0).
+  ResidentSlot moe_marlin;
 };
 
 // The dense `-` block. No released in-scope NemotronH checkpoint ships one, so
@@ -444,6 +477,31 @@ std::vector<float> NemotronHAttnBlockHostIO(const NemotronHAttentionWeights& w,
                                             const std::vector<float>& hidden_normed,
                                             int64_t num_tokens, vt::DType act_dtype,
                                             vt::Queue& dev_queue);
+
+// A2-Q2a (#810): ONE NemotronH MoE block on the device, with host-side input and
+// output so a gate can drive a single block in isolation — the same per-block
+// equivalence seam `NemotronHAttnBlockHostIO` is, and for the same reason.
+//
+// WHY THE GATE IS NUMERIC AND NOT TOKENS. A token comparison cannot see a
+// flipped NVFP4 nibble order, an ignored `weight_scale_2`, an expert stride off
+// by one in the arena, or a `routed_scaling_factor` folded into the router
+// logits instead of the output — every one of those is finite, correctly shaped
+// and plausible. It is worse than that here: `vt::MoeGroupedGemmNvfp4Marlin`
+// validates almost nothing at the op boundary (ops.cpp:874-895 checks a/c rank
+// and dtype, `size_k % 16`, and that `b_q_weight` is rank-3 — it checks NO
+// extent of `b_q_weight` and NOTHING AT ALL about `b_scales`), so a transposed
+// K/N or a mis-strided expert reaches the kernel silently. The per-block numeric
+// comparison against `NemotronHMoeMixer` on the SAME weights is the only
+// instrument that sees them.
+//
+// Requires `act_dtype == kBF16`: Marlin's a/c operands are bf16 by contract
+// (ops.cpp:879), which is also the released checkpoint's model dtype. An f32
+// caller is refused BY NAME rather than silently widened or silently rounded.
+std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
+                                                 const NemotronHParams& params,
+                                                 const std::vector<float>& hidden_normed,
+                                                 int64_t num_tokens, vt::DType act_dtype,
+                                                 vt::Queue& dev_queue);
 
 // The final output projection, on the HOST, over `num_rows` already-gathered
 // and already-final-normed rows `[num_rows, hidden_size]` (f32 in, f32 logits

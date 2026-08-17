@@ -33,19 +33,20 @@ The reduced fixture is what CI checks. The full artifact is checked separately
 and by hand, against the GGUF itself:
 
     build-cpu/examples/tokenize \
-        /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/muse-glimmer-30B-kquant-17gb.gguf \
+        "$CHECKPOINT_ROOT/muse-glimmer-30b-gguf/muse-glimmer-30B-kquant-17gb.gguf" \
         tests/parity/goldens/tokenizer_muse_glimmer/corpus.txt > /tmp/gguf_cpp.txt
     python3 tools/parity/verify_tokenizer_gguf.py \
-        /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json \
+        "$CHECKPOINT_ROOT/muse-glimmer-30b/tokenizer.json" \
         tests/parity/goldens/tokenizer_muse_glimmer/corpus.txt > /tmp/hf_py.txt
     diff /tmp/hf_py.txt /tmp/gguf_cpp.txt   # expect no output
 
 Regenerate:
-    python3 tools/parity/dump_tokenizer_gpt4o.py
+    CHECKPOINT_ROOT=... python3 tools/parity/dump_tokenizer_gpt4o.py
 """
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import sys
 
@@ -53,8 +54,18 @@ from dump_tokenizer import read_corpus
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 GOLDEN_DIR = REPO / "tests/parity/goldens/tokenizer_muse_glimmer"
-DEFAULT_TOKENIZER_JSON = pathlib.Path(
-    "/mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json"
+
+# The checkpoint root comes from `CHECKPOINT_ROOT` (`.env`), never from a
+# literal here. The literal this replaced named `/mnt/nas_share`, which sits on
+# the ephemeral root overlay of the gate box's immutable OS and disappeared at a
+# reboot (issue #1073); `.agents/environment.md` records the live location and
+# the reason. With the variable unset, `--tokenizer-json` is required, so the
+# tool refuses by name instead of reading a path nobody declared.
+_CHECKPOINT_ROOT = os.environ.get("CHECKPOINT_ROOT") or ""
+DEFAULT_TOKENIZER_JSON = (
+    pathlib.Path(_CHECKPOINT_ROOT) / "muse-glimmer-30b" / "tokenizer.json"
+    if _CHECKPOINT_ROOT
+    else None
 )
 DEFAULT_LABEL = "meta/muse-glimmer-30b (HF snapshot on the NAS)"
 
@@ -70,7 +81,10 @@ def merge_pair(m) -> tuple[str, str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tokenizer-json", type=pathlib.Path,
-                    default=DEFAULT_TOKENIZER_JSON)
+                    default=DEFAULT_TOKENIZER_JSON,
+                    required=DEFAULT_TOKENIZER_JSON is None,
+                    help="the checkpoint's tokenizer.json; defaults to "
+                         "$CHECKPOINT_ROOT/muse-glimmer-30b/tokenizer.json")
     ap.add_argument("--golden-dir", type=pathlib.Path, default=GOLDEN_DIR)
     ap.add_argument("--label", default=DEFAULT_LABEL)
     args = ap.parse_args()

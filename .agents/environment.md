@@ -66,6 +66,23 @@ environment:
   never share a build tree between agents.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
+  - **The NAS mounts at `/usr/local/nas_share`, and `/mnt/nas_share` is GONE
+    (re-verified 2026-08-16).** `.env` sets
+    `CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints`, where 18 checkpoint
+    directories resolve, `nemotron-3.5-lightning-30b-nvfp4` and
+    `nemotron-3.5-lightning-30b-gguf` among them. **Do not restore the old path
+    as a convenience symlink.** `/mnt` is on the EPHEMERAL root overlay of this
+    immutable Kairos OS, so anything created there is gone after the next
+    reboot; `/usr/local` is `COS_PERSISTENT` and survives. That is the same
+    property that made an earlier `/oem` `rootfs`-stage change cost a boot (see
+    [[kairos-oem-rw-paths-change-cost-a-boot]]). Measured 2026-08-16, after the
+    box returned from an 8 h 19 min outage: the mount itself came back because
+    the `/oem` boot-stage unit worked and `findmnt /usr/local/nas_share` was
+    clean, and `/mnt/nas_share` did not come back. Every path built on `/mnt`
+    broke while `.env` still declared it, which blocks a checkpoint-loading gate
+    silently — a gate that reads a path `.env` does not declare is not the gate
+    its spec names. Check `findmnt /usr/local/nas_share` before you conclude
+    that a checkpoint is missing (#1073).
   - **MANDATORY gate-build flags on this box (re-proven 2026-07-29).** A model
     gate configured WITHOUT `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` and
     `-DVLLM_CPP_TRITON=ON` is NOT the production stack: cutlass-off silently

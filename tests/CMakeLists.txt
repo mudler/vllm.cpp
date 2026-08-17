@@ -771,6 +771,19 @@ vllm_cpp_add_test(test_nemotron_h_quantized_forms
 target_include_directories(test_nemotron_h_quantized_forms PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 
+# A2-Q2a (#810): the DEVICE MoE arm on a SYNTHETIC NVFP4 fixture — the cheap RED
+# in front of the real-checkpoint gate. It exists because `BuildTiny` in
+# test_nemotron_h_forward.cpp is all-`kDense` (:892 -> PackMoe :873) and so
+# cannot reach the NVFP4 arena at all; without it the 21 GB checkpoint would be
+# the ONLY instrument and every RED would cost a GB10 window. Its geometry
+# (hidden 128, moe_intermediate 64) is the smallest that resolves on Marlin's
+# thread configs, which `TinyParams` (24 / 10) does not. Skips LOUDLY with a
+# reason on a GPU-less box.
+vllm_cpp_add_test(test_nemotron_h_moe_device
+  vllm/models/test_nemotron_h_moe_device.cpp)
+target_include_directories(test_nemotron_h_moe_device PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole

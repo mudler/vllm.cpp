@@ -1299,6 +1299,53 @@ first hid the second, which is the finding worth carrying: **a known-red list
 tells you a job is often red, never that today's red is the same one.** Only
 reading the log does.
 
+### 10.7 `CleanCaption`'s italic unwrap ([#1083](https://github.com/mudler/vllm.cpp/issues/1083))
+
+The #672 sweep found `CleanCaption` diverging from `_clean_caption`
+(`encoders.py:72` @ `c6da9936`) on markdown italics, and this is the change that
+closes it.
+
+**A zero-width assertion is not a captured group.** `(^|[^*])\*([^*\n]+)\*($|[^*])`
+consumed the character after the closing `*`, so `regex_replace` resumed scanning
+*past* it and a span opening within one character of the previous close was never
+examined — the surviving asterisks then re-paired **across** the intended spans.
+`*a* *b* *c*` came out `a *b c*`, and
+`Warm *lo-fi* *jazzy* keys with a *soft* *brushed* snare` came out
+`Warm lo-fi *jazzy keys with a soft brushed* snare`: not a leftover marker but a
+string upstream would never emit, handed to the tokenizer as the caption. Since
+`encoders.py`'s own header states that whitespace-level prompt changes change the
+generated audio, that is a contract break rather than cosmetics.
+
+**The two sides are spelled differently on purpose.** std::regex's ECMAScript
+grammar has negative *lookahead* but no lookbehind, so the trailing `(?!\*)` is
+ported literally and only the leading `(?<!\*)` stays emulated as `(^|[^*])`.
+Consuming on the leading side is harmless because that character sits *before*
+the span, never between this span and the next one — which is the whole
+mechanism, and the reason a single fix could not be applied symmetrically.
+
+Gated in `tests/vllm/models/test_minimax_music3_ar.cpp`: two new prompt goldens
+(`adjacent_emphasis`, `unbalanced_emphasis`) produced by *executing* the pinned
+`_clean_caption`, plus an eight-row caption case carrying the issue's
+counter-examples and the negative side. RED first — 2 cases / 6 assertions
+failing on exactly the divergences the issue measured — then 26 cases / 352
+assertions green. Three mutations, all RED: consuming the trailing neighbour
+again (6), dropping the leading guard (3), and deleting the call site (12).
+
+**Differentially, on 16 012 inputs** (12 realistic markdown descriptions plus
+16 000 from a markdown-flavoured alphabet, our built `CleanCaption` against the
+pinned `_clean_caption`): **147 mismatches before, 85 after, 62 fixed and 0 newly
+broken**, with the after-set a strict subset of the before-set.
+
+**Owed, and deliberately not chased here.** All 85 residual mismatches are one
+degenerate class: a caption that is entirely a horizontal rule, where Python's
+`re.MULTILINE` `^\s*[-*_]{3,}\s*$` lets `\s` span a newline and collapse several
+lines at once, while we apply the rule per line (73 of the 85 match that regex
+directly; the other 12 are the same mechanic after tag rewriting). Upstream
+returns `''` where we return `'\n'`. Two smaller residues are owed with it and
+were already recorded: `std::tolower` is per byte, so non-ASCII uppercase
+survives where Python's `.lower()` would fold it, and we split lines on `\n`
+only where `splitlines()` also covers `\v`, `\f`, bare `\r`, U+2028 and U+2029.
+
 ---
 
 ## 11. The device arm (#672) — what a queue bought, and what it did not

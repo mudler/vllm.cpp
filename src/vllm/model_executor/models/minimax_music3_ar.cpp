@@ -82,7 +82,7 @@ std::string CleanCaption(const std::string& caption) {
   static const std::regex kBulletA(R"(^\s*[*+-]\s+)");
   static const std::regex kBulletB(R"(^\s*\*\s+)");
   static const std::regex kBold(R"(\*\*([^*]+)\*\*)");
-  static const std::regex kItalic(R"((^|[^*])\*([^*\n]+)\*($|[^*]))");
+  static const std::regex kItalic(R"((^|[^*])\*([^*\n]+)\*(?!\*))");
   std::vector<std::string> lines;
   {
     std::string line;
@@ -109,9 +109,20 @@ std::string CleanCaption(const std::string& caption) {
       if (updated == line) break;
       line = updated;
     }
-    // The lookarounds of `(?<!\*)\*([^*\n]+)\*(?!\*)` are emulated by capturing
-    // the neighbours; std::regex has no lookbehind.
-    line = std::regex_replace(line, kItalic, "$1$2$3");
+    // encoders.py:72 — `re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)`.
+    // std::regex's ECMAScript grammar has NEGATIVE LOOKAHEAD but no lookbehind,
+    // so the two sides are spelled differently ON PURPOSE: the trailing `(?!\*)`
+    // is a true zero-width assertion, and only the leading `(?<!\*)` is emulated
+    // by capturing a character.
+    //
+    // The trailing side MUST NOT be a captured `($|[^*])` (#1083): consuming the
+    // neighbour advances the scan past it, so a span opening within one
+    // character of the previous close is skipped and the leftover asterisks
+    // re-pair ACROSS the intended spans — `*a* *b* *c*` came out `a *b c*`
+    // rather than `a b c`. Consuming on the LEADING side is safe by contrast,
+    // because that character sits before the span rather than between this span
+    // and the next one.
+    line = std::regex_replace(line, kItalic, "$1$2");
     const size_t keep = line.find_last_not_of(" \t\n\r\f\v");
     line = keep == std::string::npos ? std::string() : line.substr(0, keep + 1);
     if (i != 0) joined += '\n';

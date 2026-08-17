@@ -199,17 +199,62 @@ m3::DepthDecoderWeights DepthWeights() {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("music3 ar: the assembled prompt matches upstream string for string") {
-  REQUIRE(vllm_test::kMusic3PromptGoldenCount == 2);
+  REQUIRE(vllm_test::kMusic3PromptGoldenCount == 4);
   int cases = 0;
+  int fields = 0;
   for (int64_t i = 0; i < vllm_test::kMusic3PromptGoldenCount; ++i) {
     const vllm_test::Music3PromptGolden& golden = vllm_test::kMusic3PromptGoldens[i];
     INFO("prompt golden " << golden.name);
     CHECK(m3::CleanCaption(golden.prompt) == std::string(golden.clean_caption));
     CHECK(m3::NormalizeLyrics(golden.lyrics) == std::string(golden.normalized_lyrics));
     CHECK(m3::AssembleArPrompt(golden.prompt, golden.lyrics) == std::string(golden.assembled));
+    fields += 3;
     ++cases;
   }
-  MESSAGE("prompt goldens checked: " << cases);
+  MESSAGE("prompt goldens checked: " << cases << " cases / " << fields << " string comparisons");
+}
+
+// #1083 / #672. `markdown_and_tags` above carries ONE italic span per line, so
+// the corpus could not see this class: emulating `(?!\*)` by CAPTURING the
+// trailing neighbour consumes it, `regex_replace` resumes scanning past it, and
+// a span that opens within one character of the previous close is skipped — the
+// surviving asterisks then re-pair ACROSS the intended spans. Row three below is
+// the one that matters: `*jazzy keys with a soft brushed*` is not a leftover
+// marker, it is a string upstream would never emit, and encoders.py's own header
+// says whitespace-level prompt changes change the generated audio.
+//
+// Every expectation is upstream's own output, not a reading of the regex:
+//   git -C <diffusers> worktree add --detach <dir> c6da9936e4bda83107943a16eb8682e9a37d8527
+//   PYTHONPATH=<dir>/src python3 -c "from diffusers.modular_pipelines.minimax_music3
+//       import encoders as up; print(repr(up._clean_caption(<row>)))"
+// (the two lines above are one shell command; they are split for the 100-column
+// limit and a backslash continuation is not spellable inside a `//` comment)
+TEST_CASE("music3 ar: adjacent italic spans unwrap the way upstream unwraps them") {
+  struct Case {
+    const char* caption;
+    const char* want;
+  };
+  static const Case kCases[] = {
+      {"a *b* *c* d", "a b c d"},
+      {"*dreamy* *ambient* pads", "dreamy ambient pads"},
+      {"Warm *lo-fi* *jazzy* keys with a *soft* *brushed* snare",
+       "Warm lo-fi jazzy keys with a soft brushed snare"},
+      {"*a* *b* *c*", "a b c"},
+      // The negative side of the same rule, which is why the LEADING guard has
+      // to survive the trailing one becoming a true lookahead: a span whose
+      // neighbour on either side is an asterisk is NOT a span.
+      {"a **b* c", "a **b* c"},
+      {"a *b** c", "a *b** c"},
+      {"***x*** y", "x y"},
+      {"*only* tail", "only tail"},
+  };
+  int checked = 0;
+  for (const Case& entry : kCases) {
+    INFO("caption " << entry.caption);
+    CHECK(m3::CleanCaption(entry.caption) == std::string(entry.want));
+    ++checked;
+  }
+  MESSAGE("italic captions checked: " << checked);
 }
 
 TEST_CASE("music3 ar: the prompt template constants are the checkpoint's, not ours") {

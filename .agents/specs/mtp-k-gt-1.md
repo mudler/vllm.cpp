@@ -718,8 +718,9 @@ upstream's own supported configuration.
 
 | Owed | What it must show | Who |
 |---|---|---|
-| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate. **2026-08-17 narrowed it to 3 forwards.** Only the FIRST divergence per arm and prompt is adjudicable, which reduces 1718 divergent positions to 18 and then to 3 distinct probe points. Prompt 1 position 1 resolves to THREE different tokens under three values of k, which no depth defect can produce. `scripts/mtp-k-gt-1-neartie-gap.py` is committed and decides each candidate against `kNearTieMnats = 500`. It still has not RUN: the oracle cannot be loaded while a foreign multi-tens-of-GiB container is resident | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
-| The PADDED CONTROL arm of that gate, and the RATE assertion it carries | **PAID 2026-08-16 on the 27B.** Margin fixed BEFORE the run at 0.10 absolute per depth. The real loop accepts at 0.507 to 0.750 at every depth >= 1. The padded control accepts at 0.000 at every depth >= 1 while its depth-0 rate MATCHES the real arm (0.892 to 0.925 against 0.868 to 0.878), which is what a control that isolates columns >= 1 must look like. Every margin clears by at least 0.41. The control measuring 0 is recorded as a fact about THIS prompt set and did not license restoring the count assertion. Still owed on the 35B | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate. **2026-08-17 narrowed it to 3 forwards.** Only the FIRST divergence per arm and prompt is adjudicable, which reduces 1718 divergent positions to 18 and then to 3 distinct probe points. Prompt 1 position 1 resolves to THREE different tokens under three values of k, which no depth defect can produce. `scripts/mtp-k-gt-1-neartie-gap.py` is committed and decides each candidate against `kNearTieMnats = 500`. It still has not RUN: the oracle cannot be loaded while a foreign multi-tens-of-GiB container is resident. **2026-08-17 third pass: the box was CLEAN, the run happened, and the divergence REPRODUCED exactly on independently generated streams (1718 positions, 18 adjudicable, 3 probe points, same tokens), so it is deterministic rather than a flake. The adjudication STILL did not report.** Its failure was an INSTRUMENT failure and is recorded as such rather than as a verdict: the reimaged host carries no C compiler at all, so Triton's JIT died after the weights loaded and vLLM surfaced it as `Engine core initialization failed`. Repaired by running the oracle inside a container carrying the toolchain, which is MEASURED loading the engine past that point; the box then stopped answering SSH mid-leg. Do NOT read this row as a passed token gate | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| The oracle's host-memory configuration on GB10, validated rather than assumed | `oracle_mtp.py` and `adjudicate.py` both build the engine with `gpu_memory_utilization=0.75`. **No oracle leg in any of the three passes has ever reached KV-cache allocation on this box, so that value has never actually been exercised here.** On GB10 the setting does not bound HOST RAM (a 27B load has been measured at 111.7 of 119 GB host while `nvidia-smi` showed 18.9 GiB), and the box reboots rather than OOM-killing. Owed: establish an oracle memory configuration that demonstrably reaches KV-cache allocation and completes a generate on this box, and record it in `.agents/environment.md` beside the toolchain recipe. Until then the vLLM leg is blocked on a resource question, not on a scheduling one | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| The PADDED CONTROL arm of that gate, and the RATE assertion it carries | **PAID 2026-08-16 on the 27B, and its throughput VOID LIFTED 2026-08-17.** The first pass could not quote `padded_k3`/`padded_k4` throughput because they started at loadavg 10.77 and 20.41 against real arms at 1.5 to 2.9. The third pass re-ran all seven arms inside ONE window in a load band of 0.16 to 1.86, every leg exit 0, so the real-arm against padded-control comparison is now quotable rather than merely computed. Detail below. Margin fixed BEFORE the run at 0.10 absolute per depth. The real loop accepts at 0.507 to 0.750 at every depth >= 1. The padded control accepts at 0.000 at every depth >= 1 while its depth-0 rate MATCHES the real arm (0.892 to 0.925 against 0.868 to 0.878), which is what a control that isolates columns >= 1 must look like. Every margin clears by at least 0.41. The control measuring 0 is recorded as a fact about THIS prompt set and did not license restoring the count assertion. Still owed on the 35B | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
 | Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
 | M2 speed A/B at matched k | concurrency-1 and concurrency>1 throughput against vLLM same-config at matched k, plus the acceptance-versus-depth curve for prose and for code | [#81](https://github.com/mudler/vllm.cpp/issues/81) M2 |
@@ -733,6 +734,13 @@ upstream's own supported configuration.
 flow, so no released state refuses a depth it can serve. The CPU evidence is
 complete and the GPU gate is owed above, so the row is NOT `DONE`: no speed
 number is claimed at k>1, which is the whole point of depth.
+
+As of the third DGX pass (2026-08-17) the remaining blocker is no longer
+scheduling. The box was clean, the window was taken, and every arm of ours ran.
+What is left is the ORACLE side: it has never reached KV-cache allocation on this
+host in any pass, first because the host has no C compiler and then because the
+box stopped answering under memory pressure. The token gate therefore remains
+unclaimed and `our-ON == our-OFF` remains FALSE and unattributed.
 
 ## Outcome (partial, CPU half)
 
@@ -1355,3 +1363,159 @@ Disk was checked before any verdict was read, because ENOSPC on this project
 presents as a policy refusal rather than as a full disk: 35 GiB free on the local
 checkout's filesystem at 92 percent used, and 2.5 TB free on `dgx.casa`. No GPU
 work ran inside the gate and the gate held no lock.
+
+## Outcome (DGX half, third pass, 2026-08-17)
+
+The box was clean for the first time in three passes: no compute apps, no
+containers, the mutex free, 115 GiB of 119 available and loadavg 0.16. This pass
+spent that window. It PAID the one-window re-measurement in full, it REPRODUCED
+the divergence exactly from an independent run, and it did NOT adjudicate the
+divergence, for a reason that is an instrument failure rather than a result.
+
+### Window 1 PAID the one-window re-measurement
+
+`~/mtpgate/final_window.log`, `WINDOW_RC=0`, 07:15:27Z to 07:47:55Z,
+`boot_id=5bbdc432-6a23-422f-8fc1-7f3477dd56ef`. All three preconditions passed on
+the acquire (`gpu_apps_at_acquire=[]`, `mem_avail_GiB=115`,
+`foreign_containers_at_acquire=[]`), clocks pinned at 2100, and the trap reset
+them (`CLOCKS_RESET=1`).
+
+| Leg | Exit | loadavg at start |
+|---|---|---|
+| `ours_off` | 0 | 0.16 |
+| `ours_on_k2` | 0 | 1.86 |
+| `ours_on_k3` | 0 | 1.77 |
+| `ours_on_k4` | 0 | 1.53 |
+| `padded_k2` | 0 | 1.19 |
+| `padded_k3` | 0 | 1.61 |
+| `padded_k4` | 0 | 1.86 |
+
+**This LIFTS the VOID the first pass recorded on `padded_k3` and `padded_k4`
+throughput.** That void existed because those two arms started at loadavg 10.77
+and 20.41 while the real arms ran at 1.5 to 2.9, so the arms were not comparable.
+Here every one of the seven arms ran inside ONE window in a band of 0.16 to 1.86,
+which is what makes the real-arm against padded-control comparison quotable
+rather than merely computed.
+
+### The divergence REPRODUCED exactly, from an independent run
+
+The instrument prints its own denominators, and this run's are identical to the
+first pass's on freshly generated token streams: **1718 divergent positions, 18
+adjudicable (the first per arm and prompt), 3 distinct probe points.** The tokens
+match too: prompt 0 position 12 `79733` to `279`, prompt 1 position 1 `25` to
+`7318` at k=2, prompt 2 position 69 `15336` to `1727`, prompt 3 identical at
+every position.
+
+That matters on its own. The divergence is DETERMINISTIC and reproducible across
+sessions, boots and separately generated streams. It is not a flake, and any
+account of it has to explain a fixed, repeatable split.
+
+### The blocker was NOT adjudicated, and the cause is an INSTRUMENT failure
+
+Both the adjudication and all four oracle legs failed in window 1. Neither
+failure says anything about the model, and neither is recorded as a verdict.
+
+**Failure 1, the one that cost the pass.** The reimaged `dgx.casa` host carries
+NO C compiler. Measured rather than inferred: no `gcc`, `cc`, `clang`, `ninja` or
+`nvcc` anywhere on the host, `/usr/include` with neither `stdio.h` nor
+`python3.12/Python.h`, no crt objects, and a Triton 3.7.1 in the pinned venv that
+ships only `ptxas`, `cuobjdump` and `nvdisasm`. Triton's JIT therefore died AFTER
+the weights loaded and vLLM reported it as
+`Engine core initialization failed. See root cause above. Failed core proc(s): {}`.
+
+That is exactly the shape this project keeps paying for: a broken instrument
+fails toward a verdict about the code. A reader who did not open the traceback
+would have scored four `ORACLE_EXIT=1` legs as "the oracle cannot run this
+configuration". `enforce_eager` would have walked straight past it and was NOT
+used, because it is forbidden as a denominator and this is the denominator.
+
+`.agents/environment.md` documented the cure as `export CC=/usr/bin/gcc`. **That
+record is STALE for this host and is corrected in this change**: the path names a
+file that does not exist after the 2026-08-14 reimage. The working shape is the
+one `~/rs35b/run_oracle.sh` already used, namely run the host venv INSIDE the
+CUDA container, which carries the toolchain and ships python 3.12.3, matching the
+venv's `pyvenv.cfg` exactly.
+
+**Failure 2, independent and cheaper.** `run_all_inner.sh` called
+`run_oracle off ""`, which reached `oracle_mtp.py` as an empty `argv[2]` and died
+on `int('')` before loading anything. It is a CALLER defect, so it is fixed at
+the caller and `oracle_mtp.py` stays byte-identical to what the previous pass
+staged.
+
+### A third defect, found by watching rather than by reading
+
+Window 1's driver excludes its own containers from the foreign-container refusal
+with the comment "our own arms are `--rm` and UNNAMED, so a name is foreign".
+**That premise is false.** Docker ALWAYS assigns a name, and window 1's own arm
+was observed running as `wizardly_allen`. The guard was harmless there only
+because it runs exactly once, before the first of our containers starts. Anyone
+moving that check inside the leg loop would have had it refuse on itself and read
+the refusal as a foreign load. The window 2 driver gives our containers an
+explicit `mtpgate-` prefix and excludes exactly that prefix, which strengthens
+the refusal and weakens nothing.
+
+### Window 2 proved the repair, and then the box stopped answering
+
+`~/mtpgate/oracle_window.log`. Window 2 was queued at 07:35:04Z with
+`flock -w 21600` and BLOCKED on the mutex rather than jumping it, acquiring at
+07:47:55Z in the same second window 1 released. All three preconditions passed
+again, clocks re-pinned at 2100.
+
+The toolchain repair is MEASURED working, not argued:
+
+```
+TOOLCHAIN gcc=13 ninja=1.11.1 CC=/usr/bin/gcc python=Python 3.12.3
+oracle identity OK: vllm=0.23.1rc1.dev1511+g555967922 flashinfer=0.6.15.post1 transformers=5.14.1
+arms loaded: 6/6 (ours_on_k2..k4, padded_k2..k4)
+divergent positions found: 1718, adjudicable: 18, distinct probe points: 3
+INFO [backends.py:1155] Dynamo bytecode transform time: 20.80 s
+```
+
+The window 2 driver is `~/mtpgate/run_oracle_inner.sh` on `dgx.casa` at sha256
+`7d2ba597b0a9e6bb7e9e9fff6daa9575f6c839a00801f83bdc5a9e814f0ec078`, with the
+image built from `~/mtpgate/Dockerfile.oracle` as `mtpgate-oracle:1`. The
+adjudicating instrument is UNCHANGED and still byte-identical to the committed
+`scripts/mtp-k-gt-1-neartie-gap.py` at sha256
+`869f922995c2bb7db73cb0549d4ec5b0554e6c9f6fa4cb3202f8d824c70b287c`, verified
+again this pass. Only the way it is LAUNCHED changed, never the instrument.
+
+The engine passed the point that killed every window 1 leg and went into
+`torch.compile`. At approximately 07:56Z the host stopped completing an SSH
+banner exchange while still answering ICMP, and it had not returned when this
+record was written. That is the signature of severe memory pressure on a box with
+`vm.overcommit_memory=1` and zero swap, which `.agents/environment.md` records as
+rebooting rather than OOM-killing.
+
+**The cause is NOT yet established and is deliberately not asserted here.** The
+open hypothesis is that `gpu_memory_utilization=0.75` in `oracle_mtp.py` and
+`adjudicate.py` is too aggressive on a 119 GiB UNIFIED-memory box, because on
+GB10 that setting does not bound host RAM and a 27B load has been measured at
+111.7 of 119 GB host. Note that no oracle leg in ANY of the three passes has ever
+reached KV-cache allocation, so this configuration has never actually run here
+and the 0.75 was never validated. Confirming it needs the box back: the gap in
+`journalctl --list-boots` is the evidence for a reboot, and `uptime` distinguishes
+a reboot from a recovery.
+
+Nothing was signalled and nothing was killed.
+
+### PENDING, and the resource each one waits on
+
+| Pending | Waits on |
+|---|---|
+| The adjudication verdict at the 3 probe points, meaning TIE or DEFECT against `kNearTieMnats = 500` | `dgx.casa` answering SSH again, then an oracle memory configuration that has been shown to reach KV-cache allocation on this box |
+| The vLLM leg (`vllm_off`, `vllm_on_k2/k3/k4`), the three-way token gate, and the oracle's OWN ON against OFF attribution | the same |
+| M2 concurrency>1 A/B at matched k | the two above, in order |
+| The 35B lane | a checkpoint that is not on this box, which is a large-asset download needing recorded authority |
+
+The token legs and the adjudication are DETERMINISTIC functions of the greedy
+stream, so they do not need an idle box, only a working one. Only the throughput
+axes need an idle box on top of that.
+
+### What this pass changes about the row's claims
+
+Nothing about `our-ON == our-OFF` is settled, and the row must still NOT be read
+as a passed token gate. What moved is that the divergence is now reproducible
+from an independent run, the one-window control comparison is no longer void, the
+instrument that adjudicates it is proven to LOAD and run on this host, and the
+two harness defects plus one stale environment record that stood between the
+instrument and its answer are repaired rather than described.

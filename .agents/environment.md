@@ -236,6 +236,34 @@ environment:
     `EngineCore failed to start`. Export **`CC=/usr/bin/gcc`** alongside the documented
     `ninja` PATH fix and it runs. The `vllm-oracle` symlink still points at the 0.25.0
     rollback rather than the pin (issue #375, open).
+  - **★ `CC=/usr/bin/gcc` is STALE for the reimaged host, and the correction is to
+    run the oracle IN A CONTAINER (2026-08-17, `SPEC-MTP-K-GT-1`).** The bullet above
+    is right about the failure and wrong about the cure on this host. Measured on
+    `kairos-17dd`: there is no `gcc`, no `cc`, no `clang`, no `ninja` and no `nvcc`
+    anywhere on the host, and `/usr/include` carries neither `stdio.h` nor
+    `python3.12/Python.h`, so there are no glibc headers and no crt objects either.
+    Exporting `CC=/usr/bin/gcc` therefore names a file that does not exist. Triton
+    3.7.1 in the pinned venv ships only `ptxas`/`cuobjdump`/`nvdisasm`, no C
+    compiler, so nothing in the venv supplies one.
+    **What this looks like if you do not know it:** the weights load, the engine
+    then dies `RuntimeError: Failed to find C compiler`, and vLLM reports
+    `Engine core initialization failed. See root cause above. Failed core proc(s): {}`.
+    That is an INSTRUMENT failure wearing the shape of a verdict about the model.
+    Do NOT reach for `enforce_eager` to get past it: it is forbidden as a
+    denominator, and it would silently change the thing being measured.
+    **The cure**, and the shape `~/rs35b/run_oracle.sh` already used: run the host
+    venv inside `nvidia/cuda:13.0.1-devel-ubuntu24.04` with
+    `python3 python3-dev ninja-build build-essential libnuma1` installed, `-v
+    $HOME:$HOME`, `CC=/usr/bin/gcc` and `/usr/local/cuda/bin` on `PATH`. The image
+    ships python **3.12.3**, which matches the venv's `pyvenv.cfg` exactly, so the
+    HOST venv resolves inside the container. Bake the toolchain into an image
+    (`~/mtpgate/Dockerfile.oracle`, `mtpgate-oracle:1`) rather than `apt-get`ing it
+    per leg: a leg that must reach the network to start can fail for a reason that
+    has nothing to do with the measurement. Assert `gcc` and `ninja` INSIDE the
+    container before the model loads, so a broken image aborts by name instead of
+    four minutes later as an engine error. Container egress WAS available on
+    2026-08-17; the box has been recorded without it before, which is the argument
+    for baking rather than installing.
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import

@@ -199,9 +199,9 @@ all seven arms in one uncontended window, k=2 gives depth-0 0.878, depth-1 0.731
 our spec-OFF on 3 of 4 prompts, at the same positions for every k, and the vLLM
 leg that would attribute the split has never run here. Three passes failed to run
 it: the reimaged box has no C compiler, so the oracle's Triton JIT dies after the
-weights load, and the oracle's `gpu_memory_utilization=0.75` then reserves about
-110 GiB of HOST RAM on a 119 GiB unified box. Both are measured, both have named
-repairs.
+weights load, and once that is fixed the oracle consumes the whole 119 GiB host
+in the step after `torch.compile`. `gpu_memory_utilization` does NOT control that
+second one; an A/B at 0.30 collapsed exactly as 0.75 did.
 
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
 `--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on

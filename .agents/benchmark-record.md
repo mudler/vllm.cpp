@@ -22324,10 +22324,24 @@ CONTAINER outlived it.
 
 Killing our own container took the host from 118 of 119 GiB used to 4 of 119 in
 under ten seconds. **The engine was holding roughly 110 GiB of HOST RAM while
-`nvidia-smi` showed 26 GiB on the device.** `gpu_memory_utilization=0.75` on
-GB10's UNIFIED memory reserves most of the whole machine, not 75 percent of a
-separate device pool. No oracle leg in any pass had ever reached KV-cache
-allocation, which is why three passes never exposed it.
+`nvidia-smi` showed 26 GiB on the device.** That much is measured and stands.
+
+**The attribution to `gpu_memory_utilization=0.75` was then TESTED AND REFUTED.**
+`adjudicate.py` exposes `--gpu-mem-util` as an argument, so a third window ran the
+byte-identical instrument at **0.30**, with a 5-second host-memory sampler that
+window 2 had lacked. It collapsed the same way: `avail_mb` 87683 at 09:00:47 and
+**0** at 09:02:25, loadavg 1.19 to 39.90. Weight loading finished with 66 GiB
+free (`Loading weights took 170.12 seconds`) and `torch.compile` finished with
+88 GiB free (`took 118.96 s in total`), so the collapse is in NEITHER. Lowering
+the fraction bought a later start and changed nothing.
+
+What the A/B did buy is a tighter localisation: the step immediately AFTER
+compilation, insensitive to the KV-pool fraction, which points at the profiling
+forward and graph capture (`max_num_batched_tokens=8192`,
+`cudagraph_capture_sizes: [1, 2, 4, 8]`, all host-backed on GB10). **That is a
+hypothesis with a located step, not a result.** Vary those one at a time with the
+sampler running. No oracle leg in any pass has reached KV-cache allocation here,
+so nothing about this step had been exercised on this box before.
 
 **A trap defect, found by watching it fail.** `SIGTERM` to the driver reset the
 clocks and the driver then started its NEXT leg on a box with no memory left,

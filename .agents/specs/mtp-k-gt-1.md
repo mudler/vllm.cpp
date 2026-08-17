@@ -719,7 +719,7 @@ upstream's own supported configuration.
 | Owed | What it must show | Who |
 |---|---|---|
 | DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate. **2026-08-17 narrowed it to 3 forwards.** Only the FIRST divergence per arm and prompt is adjudicable, which reduces 1718 divergent positions to 18 and then to 3 distinct probe points. Prompt 1 position 1 resolves to THREE different tokens under three values of k, which no depth defect can produce. `scripts/mtp-k-gt-1-neartie-gap.py` is committed and decides each candidate against `kNearTieMnats = 500`. It still has not RUN: the oracle cannot be loaded while a foreign multi-tens-of-GiB container is resident. **2026-08-17 third pass: the box was CLEAN, the run happened, and the divergence REPRODUCED exactly on independently generated streams (1718 positions, 18 adjudicable, 3 probe points, same tokens), so it is deterministic rather than a flake. The adjudication STILL did not report.** Its failure was an INSTRUMENT failure and is recorded as such rather than as a verdict: the reimaged host carries no C compiler at all, so Triton's JIT died after the weights loaded and vLLM surfaced it as `Engine core initialization failed`. Repaired by running the oracle inside a container carrying the toolchain, which is MEASURED loading the engine past that point; the box then stopped answering SSH mid-leg. Do NOT read this row as a passed token gate | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
-| The oracle's host-memory configuration on GB10, now MEASURED and owed a fix | `oracle_mtp.py` and `adjudicate.py` build the engine with `gpu_memory_utilization=0.75`, and on GB10's UNIFIED memory that reserves most of the whole machine rather than 75 percent of a separate device pool. **Measured 2026-08-17: the engine held about 110 GiB of HOST RAM while `nvidia-smi` reported 26 GiB on the device. Killing our container took the box from 118 of 119 GiB used to 4 of 119 in under ten seconds.** It hung for 45 minutes in the memory-profiling step after `torch.compile`, at loadavg 260 with 0 GiB available, and its own `timeout` fired (`ADJUDICATE_EXIT=124`). It did NOT reboot: `uptime` and `boot_id` were unchanged. No oracle leg in any of the three passes had ever reached KV-cache allocation, which is why this was never exposed before. Owed: an oracle memory configuration that demonstrably reaches KV-cache allocation and completes a generate here, verified against `MemAvailable` rather than `nvidia-smi`, recorded in `.agents/environment.md` beside the toolchain recipe | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| **THE BLOCKER: the pinned oracle cannot load a 27B on `dgx.casa` at all, and `gpu_memory_utilization` is NOT the lever** | Once the toolchain fix let an oracle reach this step for the first time, it consumed the entire host in the step AFTER `torch.compile`. **Measured 2026-08-17 at 0.75: about 110 GiB of HOST RAM held while `nvidia-smi` reported 26 GiB on the device, 45 minutes hung at loadavg 260 with 0 GiB available, its own timeout firing (`ADJUDICATE_EXIT=124`); killing the container took the box from 118 of 119 GiB used to 4 of 119 in under ten seconds.** The attribution to that 0.75 was then **TESTED AND REFUTED**: a third window ran the byte-identical instrument at `--gpu-mem-util 0.30` with a 5-second `MemAvailable` sampler and collapsed the same way (87683 MB free at 09:00:47, **0** at 09:02:25). Weight loading finished with 66 GiB free and compilation with 88 GiB free, so it is neither. Neither episode rebooted; `uptime` and `boot_id` were unchanged both times. Owed: identify the actual step by varying `max_num_batched_tokens` and `cudagraph_capture_sizes` ONE AT A TIME with the sampler running, then record a configuration that demonstrably reaches KV-cache allocation and completes a generate, in `.agents/environment.md` beside the toolchain recipe. Until then no vLLM leg of any row can run on this host | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | The cleanup trap in the DGX drivers does not stop the run | `run_all_inner.sh` and `run_oracle_inner.sh` both use `trap cleanup EXIT INT TERM` where `cleanup` resets the clocks and returns WITHOUT exiting, so bash resumes the script after the handler. **Observed 2026-08-17: `SIGTERM` reset the clocks and the driver then started its next leg, which immediately began re-filling a box that had 0 GiB available.** The chain had to be `SIGKILL`ed and the container stopped separately. A cleanup trap that does not terminate is not a stop button, and on a box that reboots rather than OOM-killing that difference is the box. Owed: `exit` from the signal path, and a `docker kill` of the current leg's named container inside `cleanup` so the container cannot outlive its driver | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | The PADDED CONTROL arm of that gate, and the RATE assertion it carries | **PAID 2026-08-16 on the 27B, and its throughput VOID LIFTED 2026-08-17.** The first pass could not quote `padded_k3`/`padded_k4` throughput because they started at loadavg 10.77 and 20.41 against real arms at 1.5 to 2.9. The third pass re-ran all seven arms inside ONE window in a load band of 0.16 to 1.86, every leg exit 0, so the real-arm against padded-control comparison is now quotable rather than merely computed. Detail below. Margin fixed BEFORE the run at 0.10 absolute per depth. The real loop accepts at 0.507 to 0.750 at every depth >= 1. The padded control accepts at 0.000 at every depth >= 1 while its depth-0 rate MATCHES the real arm (0.892 to 0.925 against 0.868 to 0.878), which is what a control that isolates columns >= 1 must look like. Every margin clears by at least 0.41. The control measuring 0 is recorded as a fact about THIS prompt set and did not license restoring the count assertion. Still owed on the 35B | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
@@ -1515,7 +1515,14 @@ record was written. That is the signature of severe memory pressure on a box wit
 `vm.overcommit_memory=1` and zero swap, which `.agents/environment.md` records as
 rebooting rather than OOM-killing.
 
-### The cause was then MEASURED, and it is `gpu_memory_utilization` on unified memory
+### The cause was then MEASURED, and the first attribution for it was REFUTED by an A/B
+
+Read this section together with the one after it. What follows is true and was
+measured. The ATTRIBUTION it originally carried, that
+`gpu_memory_utilization = 0.75` is the cause, was tested at 0.30 in a third
+window and did NOT hold. The refutation is recorded rather than the section
+rewritten, because the observation and the attribution are different claims and
+only the second one failed.
 
 The box came back at 08:38Z after roughly 42 minutes. **It did NOT reboot:**
 `uptime` read `up 11:28` and `boot_id` was still `5bbdc432`, the same value
@@ -1536,22 +1543,69 @@ fired: `ADJUDICATE_EXIT=124`, START 07:47:56Z, END 08:39:41Z. `timeout` had
 signalled `docker run` and the CONTAINER outlived it, which is the same
 lock-handle-on-a-wrapper shape this row already recorded once.
 
-**The measurement that settles it.** Killing our own container took host memory
-from 118 of 119 GiB used to 4 of 119 in under ten seconds, with 115 GiB
-available. The engine was therefore holding on the order of **110 GiB of HOST
-RAM** while `nvidia-smi` reported 26 GiB on the device. `gpu_memory_utilization
-= 0.75` on GB10's UNIFIED memory does not mean 75 percent of a separate device
-pool, it means most of the whole machine. That is the confirmed cause, and it is
-now a measurement rather than the hypothesis this section previously carried.
+**What IS measured.** Killing our own container took host memory from 118 of
+119 GiB used to 4 of 119 in under ten seconds, with 115 GiB available. The engine
+was therefore holding on the order of **110 GiB of HOST RAM** while `nvidia-smi`
+reported 26 GiB on the device. That much is a measurement and it stands.
 
-This also explains all three passes at once. **No oracle leg has ever reached
-KV-cache allocation on this box**, so 0.75 was never validated here; the first
-two passes died earlier, on the missing compiler, and never got far enough to
-expose it.
+**What was INFERRED from it, and is now refuted.** The obvious reading was that
+`gpu_memory_utilization = 0.75` is the cause, since on unified memory it would
+mean 75 percent of the whole machine rather than of a separate device pool. That
+reading was written here as a confirmed cause. It was wrong, and the next section
+is the A/B that says so.
+
+No oracle leg had ever reached KV-cache allocation on this box, so nothing about
+this step had been exercised here before; the first two passes died earlier, on
+the missing compiler.
 
 Only our own processes were signalled. The container, the driver, its `flock` and
 its queue wrapper were all ours, started by this session. Nothing belonging to
 another session was touched.
+
+### Window 3: the A/B at 0.30 REFUTED the attribution, and localised the step instead
+
+The box came back idle (loadavg 0.24, 115 GiB available, mutex free), so the
+hypothesis was tested rather than left standing. **`adjudicate.py` already exposes
+`--gpu-mem-util` as an ARGUMENT**, which is exactly why it exists: the value was
+lowered to **0.30** without editing the instrument, and the executing file stayed
+byte-identical to the committed `scripts/mtp-k-gt-1-neartie-gap.py` at sha256
+`869f9229...`, verified again before the run.
+
+Window 3 also added the instrument window 2 lacked: a host-memory sampler writing
+`avail_mb` and loadavg every 5 seconds, so a collapse would be MEASURED with a
+timestamp instead of reconstructed afterwards from a single `free -g`.
+
+It got further and then failed the same way:
+
+| Time | avail_mb | loadavg | what |
+|---|---:|---:|---|
+| 08:53:46 | ~117000 | 0.20 | window acquired, all three guards passed, clocks pinned 2100 |
+| 08:57:19 | ~66000 | 1.44 | `Loading weights took 170.12 seconds` |
+| 08:59:37 | ~88000 | 1.32 | `torch.compile took 118.96 s in total` |
+| 09:00:47 | 87683 | 1.19 | steady, well past where window 2 was already dead |
+| **09:02:25** | **0** | **39.90** | the whole machine gone in under 100 seconds |
+
+**So `gpu_memory_utilization` is NOT the cause.** At 0.30 the engine still
+consumed roughly 87 GiB of host RAM in the step after `torch.compile`, which is
+the same collapse window 2 showed at 0.75. Lowering the setting bought a later
+start and changed nothing about the outcome. The attribution in the previous
+section is withdrawn.
+
+**What the A/B did buy is a much tighter localisation.** The collapse is not in
+weight loading, which completed with 66 GiB still free, and not in compilation,
+which completed with 88 GiB still free. It is in the step immediately AFTER
+`torch.compile`, and it is insensitive to the KV-pool fraction. That points at
+the memory-profiling forward and the graph capture rather than at the cache
+sizing: this config carries `max_num_batched_tokens=8192` and
+`cudagraph_capture_sizes: [1, 2, 4, 8]`, and on GB10 every one of those
+allocations is host-backed. **That is a HYPOTHESIS with a located step, and it is
+explicitly not a result.** The next attempt should vary
+`max_num_batched_tokens` and the capture set, one at a time, with the memory
+sampler running, and it should stop believing any of it until an A/B says so.
+This row has now had one such story refuted by exactly that method.
+
+The box went unresponsive again while being stopped. Only our own processes were
+signalled.
 
 ### A fourth defect, in the trap, found by watching it fail
 
@@ -1575,14 +1629,17 @@ loadavg falling from 260 to 42. Everything window 1 produced is intact under
 
 | Pending | Waits on |
 |---|---|
-| The adjudication verdict at the 3 probe points, meaning TIE or DEFECT against `kNearTieMnats = 500` | an oracle memory configuration that demonstrably reaches KV-cache allocation on GB10. This is now a KNOWN quantity rather than a mystery: lower `gpu_memory_utilization` until the engine stops reserving most of host RAM, and prove it by watching `MemAvailable` rather than `nvidia-smi` |
+| The adjudication verdict at the 3 probe points, meaning TIE or DEFECT against `kNearTieMnats = 500` | an oracle configuration that survives the step after `torch.compile` on GB10. NOT the KV-pool fraction, which is refuted. Vary `max_num_batched_tokens` and the capture set one at a time with a `MemAvailable` sampler running |
 | The vLLM leg (`vllm_off`, `vllm_on_k2/k3/k4`), the three-way token gate, and the oracle's OWN ON against OFF attribution | the same |
 | M2 concurrency>1 A/B at matched k | the two above, in order |
 | The 35B lane | a checkpoint that is not on this box, which is a large-asset download needing recorded authority |
 
-The next attempt does NOT need to rediscover anything. The toolchain container
-works, the instrument loads and reaches `torch.compile`, the divergence and its 3
-probe points are stable, and the one remaining variable is the memory setting.
+The next attempt does not need to rediscover the path to the blocker. The
+toolchain container works, the instrument loads, asserts its pin and reaches
+`torch.compile` in about 5 minutes, the divergence and its 3 probe points are
+stable across runs, and the failing step is localised to what follows
+compilation. What it must NOT do is assume the memory fraction is the lever: this
+pass already believed that and the A/B said otherwise.
 
 The token legs and the adjudication are DETERMINISTIC functions of the greedy
 stream, so they do not need an idle box, only a working one. Only the throughput
@@ -1605,8 +1662,12 @@ quantity with a named repair rather than a mystery: a missing host toolchain
 (repaired), a cleanup trap that does not stop (recorded and owed), and an oracle
 memory setting that reserves most of a unified-memory box (measured and owed).
 
-The honest summary is that this pass converted a blocked gate into a gate that is
-one configuration value away from reporting.
+The honest summary is that this pass moved the blocker from "unknown" to
+"localised", and paid the control gate in full along the way. It did NOT solve
+the blocker, and it explicitly withdrew its own first answer for it after testing
+that answer. The seventh entry in this row's running list of claims that were
+written and then withdrawn is `gpu_memory_utilization`, and like the other six it
+was caught by executing the claim rather than by reading it.
 
 ### Gate for this pass
 

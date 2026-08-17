@@ -1703,25 +1703,32 @@ counted by block over ALL FOUR markers the script emits, because a grep for
 |---|---:|---:|---:|---:|
 | Session role | 1 | 0 | 0 | 0 |
 | Record gates | 27 | 0 | 0 | 0 |
-| Mutation suites | 45 | 1 | 0 | 0 |
+| Mutation suites | 46 | 0 | 0 | 0 |
 | Committed range vs `origin/main` | 3 | 0 | 0 | 0 |
 | Commit trailers vs `origin/main` | 2 | 0 | 0 | 0 |
-| TOTAL | 78 | 1 | 0 | 0 |
+| TOTAL | 79 | 0 | 0 | 0 |
 
-79 result lines, matching a raw marker count of 79. Both range blocks EXECUTED
-rather than skipping, asserted with `git merge-base --is-ancestor origin/main
-HEAD`.
+`All gates green.`, exit 0, 79 result lines matching a raw marker count of 79.
+Both range blocks EXECUTED rather than skipping, asserted with
+`git merge-base --is-ancestor origin/main HEAD`.
 
-**The one FAIL is `test_cpu_x86_llamacpp_floor`, and it is INHERITED rather than
-attributed.** It was proven on a pristine detached `origin/main` worktree on this
-same host: the baseline fails the SAME file with the same class of failure, at
-`NO_QUIET_WINDOW after 30s (busy=138% builders=0 load=49.29)`. The branch run
-failed the same file at load 105.78 with the same two cases. A neighbouring
-session was running a full `ctest -j 4`, which took this host's loadavg from 0.6
-to 127 during the gate. The harness is doing the right thing: it REFUSES to
-measure on a contended box and returns its contention code, and the unit test
-asserts a different code. A red that reproduces unchanged on `origin/main` is a
-property of the host, not of the diff.
+**Both range blocks executing is itself a repair.** An earlier run in this pass
+reported `RC=0` with 77 `ok` and **2 `SKIP`**, and the two SKIPs were the trailer
+gates, because `origin/main` had advanced and left the branch behind it. That is
+green printed by a gate that judged nothing, which is a shape this row has now
+paid for twice. `origin/main` was merged again and the gate re-run until those
+blocks reported.
+
+**`test_cpu_x86_llamacpp_floor` failed twice earlier in this pass and is
+INHERITED rather than attributed.** It was proven on a pristine detached
+`origin/main` worktree on this same host: the baseline fails the SAME file with
+the same class of failure, `NO_QUIET_WINDOW after 30s (busy=138% builders=0
+load=49.29)`. A neighbouring session running a full `ctest -j 4` took this host
+from loadavg 0.6 to 127. The harness is doing the right thing, refusing to
+measure on a contended box and returning its contention code while the unit test
+asserts a different one. It passes above at loadavg 18. A red that reproduces
+unchanged on `origin/main` and clears when only the LOAD changes is a property of
+the host, not of the diff.
 
 Two earlier reds in this pass WERE mine and were repaired rather than waived.
 `check-public-doc-tables` caught a `docs/BENCHMARKS.md` cell of 491 chars against

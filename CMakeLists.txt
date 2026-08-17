@@ -974,6 +974,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/phi_weights.cpp
   src/vllm/model_executor/models/phi.cpp
   src/vllm/model_executor/models/model_registry.cpp
+  src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp
   src/vllm/plugins/plugins.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp

@@ -86,6 +86,8 @@
 // the checkpoint is present.
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -99,7 +101,12 @@
 #include "npy.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
+#include "vllm/model_executor/models/minimax_music3_device.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
+#include "vllm/model_executor/models/minimax_music3_speech.h"  // kMusic3SpeechFamily
+#include "vllm/multimodal/speech_engine.h"                     // SpeechEngineDeviceType
+#include "vt/backend.h"
+#include "vt/device.h"
 
 namespace fs = std::filesystem;
 namespace m3 = vllm::models::music3;
@@ -353,16 +360,61 @@ m3::DitWeights LoadDit(const vllm::MiniMaxMusic3TransformerConfig& config) {
   return m3::DitWeightsFromTensors(config, tensors);
 }
 
+// WHERE this gate runs the 2.4B DiT. Default 0 = CPU, so an unset environment
+// reproduces every number this file has ever printed. `VLLM_CPP_MUSIC3_DEVICE=1`
+// runs the SAME comparison against the SAME goldens at the SAME bounds through
+// `DitForwardDevice` (#672, spec §11.4) — no tolerance is widened for it, which
+// is the claim that matters.
+//
+// Resolved through the SHARED `multimodal::SpeechEngineDeviceType` the engine
+// itself calls, not a private copy: a gate that resolved the device its own way
+// could pass while the engine bound a different one.
+struct DitArm {
+  vt::Queue queue{};
+  bool on_device = false;
+  std::string banner;
+};
+
+DitArm ResolveDitArm() {
+  DitArm arm;
+  const char* env = std::getenv("VLLM_CPP_MUSIC3_DEVICE");
+  const int32_t sel = (env != nullptr && env[0] == '1') ? 1 : 0;
+  const vt::DeviceType type =
+      vllm::multimodal::SpeechEngineDeviceType(sel, m3::kMusic3SpeechFamily);
+  arm.on_device = type != vt::DeviceType::kCPU;
+  arm.queue = arm.on_device ? vt::GetBackend(type).CreateQueue()
+                            : vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  // ONE std::string. Built as a MESSAGE chain, both fields collapse inside
+  // doctest and a CPU run prints the device arm's banner — the instrument defect
+  // #672 already hit once, where the CPU numbers would have been recorded as the
+  // device arm's had the line not been read.
+  arm.banner = std::string("music3 acoustic real: the 2.4B DiT ran on '") +
+               vt::DeviceTypeName(arm.queue.device.type) + "' (VLLM_CPP_MUSIC3_DEVICE=" +
+               (env == nullptr ? std::string("unset") : std::string(env)) + ")";
+  return arm;
+}
+
 // One guided velocity: the conditional and the zero-conditioned forward, mixed.
+// Both branches take the SAME arm — running one on each would make the guidance
+// mix a comparison between two numerics rather than between two conditionings.
 std::vector<float> GuidedVelocity(const std::vector<float>& latents,
                                   const std::vector<float>& condition, double timestep,
                                   const vllm::MiniMaxMusic3TransformerConfig& config,
-                                  const m3::DitWeights& weights) {
+                                  const m3::DitWeights& weights, DitArm* arm,
+                                  const m3::Music3DitDeviceWeights* staged) {
+  const std::vector<float> zeros(condition.size(), 0.0f);
+  if (arm != nullptr && arm->on_device) {
+    REQUIRE(staged != nullptr);
+    const std::vector<float> conditional = m3::DitForwardDevice(
+        arm->queue, latents, kLatentLength, condition, timestep, config, *staged);
+    const std::vector<float> unconditional = m3::DitForwardDevice(
+        arm->queue, latents, kLatentLength, zeros, timestep, config, *staged);
+    return m3::ClassifierFreeGuidanceMix(conditional, unconditional, m3::kDitGuidanceScale);
+  }
   const std::vector<float> conditional =
       m3::DitForward(latents, kLatentLength, condition, timestep, config, weights);
   const std::vector<float> unconditional =
-      m3::DitForward(latents, kLatentLength, std::vector<float>(condition.size(), 0.0f),
-                     timestep, config, weights);
+      m3::DitForward(latents, kLatentLength, zeros, timestep, config, weights);
   return m3::ClassifierFreeGuidanceMix(conditional, unconditional, m3::kDitGuidanceScale);
 }
 
@@ -492,17 +544,59 @@ TEST_CASE("music3 acoustic real: the DiT reproduces the capture's guided velocit
 
   std::vector<int64_t> shape;
   const std::vector<float> condition = LoadF32Npy("condition_chunk0.npy", &shape);
-  const m3::DitWeights weights = LoadDit(config.transformer);
+  m3::DitWeights weights = LoadDit(config.transformer);
+
+  DitArm arm = ResolveDitArm();
+  MESSAGE(arm.banner);
+  // `release_host` FALSE: this is a gate, and both arms must remain runnable in
+  // one process. The SERVING path is what passes true.
+  //
+  // TIMED, because this staging is the thing the speed claim is ABOUT. If the
+  // weights were re-uploaded per forward, the repeat sweep below would show it
+  // as slope rather than as intercept.
+  m3::Music3DitDeviceWeights staged;
+  const auto stage_t0 = std::chrono::steady_clock::now();
+  if (arm.on_device) {
+    staged = m3::StageMusic3DitWeights(arm.queue, config.transformer, weights,
+                                       /*release_host=*/false);
+    CHECK(static_cast<int64_t>(staged.layers.size()) == config.transformer.num_layers);
+  }
+  const double stage_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - stage_t0).count();
+  // Same one-string rule as DIT_TIMING below: the first revision printed
+  // `dit staging: 9.3e-08 s (1)` because the `const char*` arm tag went to
+  // doctest's bool overload.
+  const std::string staging_line = std::string("dit staging: ") + std::to_string(stage_s) +
+                                   " s (" +
+                                   (arm.on_device ? "device upload" : "host, no-op") + ")";
+  MESSAGE(staging_line);
+
+  // `VLLM_CPP_MUSIC3_DIT_REPEAT=R` runs the guided velocity R times per timestep
+  // instead of once, so a run at R and a run at R' give TWO POINTS on the same
+  // binary and the same weights. The slope is the per-forward cost and the
+  // intercept is everything paid once — which is the only way to state "the
+  // weights are staged once" as a MEASUREMENT rather than as a claim about the
+  // code. Default 1, so an unset environment runs exactly what it always did.
+  int64_t repeats = 1;
+  if (const char* r = std::getenv("VLLM_CPP_MUSIC3_DIT_REPEAT")) {
+    repeats = std::max<int64_t>(1, std::atoll(r));
+  }
 
   int64_t total_outside = 0;
+  int64_t forwards = 0;
+  const auto t0 = std::chrono::steady_clock::now();
   for (int64_t index : {static_cast<int64_t>(0), kDenoiseSteps - 1}) {
     const std::string tag = index == 0 ? "first" : "last";
     const double timestep = index == 0 ? kFirstTimestep : kLastTimestep;
     CAPTURE(tag);
     const std::vector<float> latents = LoadF32Npy("denoise_" + tag + "_sample_in.npy", &shape);
     const std::vector<float> want = LoadF32Npy("denoise_" + tag + "_velocity.npy", &shape);
-    const std::vector<float> got =
-        GuidedVelocity(latents, condition, timestep, config.transformer, weights);
+    std::vector<float> got;
+    for (int64_t r = 0; r < repeats; ++r) {
+      got = GuidedVelocity(latents, condition, timestep, config.transformer, weights, &arm,
+                           &staged);
+      forwards += 2;  // one guided velocity is the conditional AND the unconditional forward
+    }
     const Report report = Compare(got, want, kDitRelTol, kDitAbsFloor);
     ReportInto("dit guided velocity " + tag, report);
     CHECK(report.compared == kLatentChannels * kLatentLength);
@@ -510,6 +604,21 @@ TEST_CASE("music3 acoustic real: the DiT reproduces the capture's guided velocit
     CHECK(report.mean_abs < kDitMeanAbsTol);
     total_outside += report.outside;
   }
+  const double loop_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  // ONE line, ONE std::string — and this is not a style preference, it is the
+  // defect this row hit twice. A `const char*` handed to doctest's MESSAGE chain
+  // converts to BOOL and prints `1`: the first revision of this line reported
+  // `arm=1` on the CPU run, next to numbers that were themselves correct. That
+  // is #672's own recorded instrument defect (§11.5) reappearing in a new line,
+  // and the fix is the one that worked there: assemble the string, then print it.
+  std::string timing = "DIT_TIMING arm=";
+  timing += vt::DeviceTypeName(arm.queue.device.type);
+  timing += " repeats=" + std::to_string(repeats);
+  timing += " forwards=" + std::to_string(forwards);
+  timing += " loop_s=" + std::to_string(loop_s);
+  timing += " stage_s=" + std::to_string(stage_s);
+  timing += " per_forward_s=" + std::to_string(loop_s / static_cast<double>(forwards));
+  MESSAGE(timing);
   CHECK(total_outside == 0);
 }
 
@@ -520,13 +629,26 @@ TEST_CASE("music3 acoustic real: the DiT's two guidance branches are different t
   std::vector<int64_t> shape;
   const std::vector<float> condition = LoadF32Npy("condition_chunk0.npy", &shape);
   const std::vector<float> latents = LoadF32Npy("denoise_first_sample_in.npy", &shape);
-  const m3::DitWeights weights = LoadDit(config.transformer);
+  m3::DitWeights weights = LoadDit(config.transformer);
 
-  const std::vector<float> conditional = m3::DitForward(
-      latents, kLatentLength, condition, kFirstTimestep, config.transformer, weights);
+  DitArm arm = ResolveDitArm();
+  MESSAGE(arm.banner);
+  m3::Music3DitDeviceWeights staged;
+  if (arm.on_device) {
+    staged = m3::StageMusic3DitWeights(arm.queue, config.transformer, weights,
+                                       /*release_host=*/false);
+  }
+  const std::vector<float> zeros(condition.size(), 0.0f);
+  const std::vector<float> conditional =
+      arm.on_device ? m3::DitForwardDevice(arm.queue, latents, kLatentLength, condition,
+                                           kFirstTimestep, config.transformer, staged)
+                    : m3::DitForward(latents, kLatentLength, condition, kFirstTimestep,
+                                     config.transformer, weights);
   const std::vector<float> unconditional =
-      m3::DitForward(latents, kLatentLength, std::vector<float>(condition.size(), 0.0f),
-                     kFirstTimestep, config.transformer, weights);
+      arm.on_device ? m3::DitForwardDevice(arm.queue, latents, kLatentLength, zeros,
+                                           kFirstTimestep, config.transformer, staged)
+                    : m3::DitForward(latents, kLatentLength, zeros, kFirstTimestep,
+                                     config.transformer, weights);
   const int64_t identical = CountIdentical(conditional, unconditional);
   // A DiT that dropped its conditioning would still pass the velocity gate for
   // any guidance scale if the two branches were equal, because the mix would

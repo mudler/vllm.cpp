@@ -187,12 +187,21 @@ std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& fr
                                                     const MiniMaxMusic3Config& config,
                                                     const Music3AcousticWeights& weights,
                                                     const Music3DenoiseOptions& options,
-                                                    const Music3NoiseSource& noise) {
+                                                    const Music3NoiseSource& noise,
+                                                    const Music3DenoiseDeviceArm& device_arm) {
   if (!noise) Fail("MiniMax-Music3: the denoise loop needs a noise source");
   if (options.num_inference_steps <= 0) {
     Fail("MiniMax-Music3: `num_inference_steps` must be positive, got " +
          std::to_string(options.num_inference_steps));
   }
+  // Half a device arm is a caller that believes it asked for the GPU and got the
+  // host loops. Refused by name rather than ignored, because the failure it
+  // otherwise produces is a correct song delivered thirty hours late.
+  if (device_arm.half_set()) {
+    Fail("MiniMax-Music3: the denoise device arm needs BOTH a queue and staged DiT weights; "
+         "got only the " + std::string(device_arm.queue != nullptr ? "queue" : "weights"));
+  }
+  const bool on_device = device_arm.engaged();
 
   ConditionMixConfig mix;
   mix.condition_hidden_dim = config.condition_encoder.condition_hidden_dim;
@@ -275,10 +284,19 @@ std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& fr
         BlendOverlap(latents, channels, length, noise_prompt, previous_latent, previous_length,
                      overlap, time_value);
       }
+      // The ONLY line the device arm changes. Both CFG branches take the same
+      // arm — running one on each would make the guidance mix a comparison
+      // between two different numerics rather than between two conditionings.
       const std::vector<float> conditional =
-          DitForward(latents, length, condition, time_value, config.transformer, weights.dit);
+          on_device ? DitForwardDevice(*device_arm.queue, latents, length, condition, time_value,
+                                       config.transformer, *device_arm.dit)
+                    : DitForward(latents, length, condition, time_value, config.transformer,
+                                 weights.dit);
       const std::vector<float> unconditional =
-          DitForward(latents, length, zero_condition, time_value, config.transformer, weights.dit);
+          on_device ? DitForwardDevice(*device_arm.queue, latents, length, zero_condition,
+                                       time_value, config.transformer, *device_arm.dit)
+                    : DitForward(latents, length, zero_condition, time_value, config.transformer,
+                                 weights.dit);
       const std::vector<float> velocity =
           ClassifierFreeGuidanceMix(conditional, unconditional, options.guidance_scale);
       latents = FlowMatchStep(latents, velocity, step, schedule);
@@ -534,13 +552,40 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     (void)calls;
 
     // ── the ACOUSTIC half (before_denoise.py / denoise.py / decoders.py) ─────
-    const Music3AcousticWeights acoustic = Music3LoadAcousticWeights(paths_, config_);
+    //
+    // NON-const, because the device arm below STAGES OUT OF IT. The DiT is
+    // 9.7 GB of fp32 and Jetson Thor's ~122 GB is UNIFIED — host and device draw
+    // on one pool — so uploading while the host copy is still held is a real
+    // 19.4 GB peak on the only box this arm runs on, and that box reboots
+    // instead of OOM-killing (.agents/environment.md). `StageMusic3DitWeights`
+    // drops each host tensor as it lands, so the peak is one tensor over the
+    // 9.7 GB, not twice it.
+    Music3AcousticWeights acoustic = Music3LoadAcousticWeights(paths_, config_);
     Music3DenoiseOptions options;
     options.num_inference_steps = request.num_inference_steps;
     options.guidance_scale = request.guidance_scale;
+
+    // Staged ONCE per request, outside every loop in `Music3DenoiseChunks`. A
+    // 45 s clip runs the DiT 660 times over 11 windows; a per-window upload
+    // would move 9.7 GB eleven times and a per-step one 660 times, either of
+    // which costs more than the compute it enables.
+    //
+    // Not staged in the CONSTRUCTOR, unlike the queue: the acoustic weights are
+    // deliberately loaded per request and released with the request, so that the
+    // 18.5 GB autoregressive half and the 10 GB acoustic half are never
+    // co-resident (upstream drives the same split by hand, encoders.py:302-309).
+    // Staging follows the weights, not the engine.
+    Music3DitDeviceWeights staged_dit;
+    Music3DenoiseDeviceArm arm;
+    if (queue_.device.type != vt::DeviceType::kCPU) {
+      staged_dit = StageMusic3DitWeights(queue_, config_.transformer, acoustic.dit,
+                                         /*release_host=*/true);
+      arm.queue = &queue_;
+      arm.dit = &staged_dit;
+    }
     const std::vector<std::vector<float>> chunks =
         Music3DenoiseChunks(frame_hiddens, frames, config_, acoustic, options,
-                            Music3SeededNoise(request.seed));
+                            Music3SeededNoise(request.seed), arm);
 
     int64_t samples = 0;
     multimodal::SpeechResult out;

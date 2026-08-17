@@ -1,0 +1,33 @@
+// engine worker. Avoid global mutex + SetStream on every GEMM (100s×/token).
+BlasCtx GetBlas(int device, hipStream_t stream) {
+  struct Tls {
+    int dev = -1;
+    hipStream_t stream = nullptr;
+    hipblasHandle_t handle = nullptr;
+  };
+  // Per-device: layer-split pipe must not hipblasDestroy GPU0 while GPU0 GEMMs
+  // are still queued (same class as SameTls / LayerTls).
+  static thread_local Tls tls_slots[2];
+  Tls& tls = tls_slots[(device == 1) ? 1 : 0];
+  // Bind current device outside capture so create/setStream see the right GPU
+  // after peer-MoE left current on the expert device.
+  if (!StreamIsCapturing(stream)) {
+    int cur = -1;
+    if (hipGetDevice(&cur) != hipSuccess || cur != device) (void)hipSetDevice(device);
+  }
+  if (tls.handle == nullptr || tls.dev != device) {
+    if (tls.handle) {
+      (void)hipblasDestroy(tls.handle);
+      tls.handle = nullptr;
+    }
+    if (!StreamIsCapturing(stream)) (void)hipSetDevice(device);
+    CheckBlas(hipblasCreate(&tls.handle), "hipblasCreate");
+    tls.dev = device;
+    tls.stream = nullptr;
+  }
+  if (tls.stream != stream) {
+    CheckBlas(hipblasSetStream(tls.handle, stream), "hipblasSetStream");
+    tls.stream = stream;
+  }
+  return BlasCtx{tls.handle};
+}

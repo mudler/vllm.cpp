@@ -41,8 +41,14 @@
 #include <vector>
 
 #include "ltx2_pipeline_goldens.inc"
+// Row LTX25-RES2S-LOOP (#921). Its own file rather than rows appended to
+// `ltx2_pipeline_goldens.inc`: that file is written by
+// scripts/gen-ltx2-pipeline-goldens.py and edited by several concurrent rows of
+// this campaign, and a per-row file is the shape `AGENTS.md ## Records` asks for.
+#include "ltx2_res2s_goldens.inc"
 
 #include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_samplers.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_duration_head.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
@@ -1183,7 +1189,17 @@ TEST_CASE("ltx2 the recipe table mirrors vLLM-Omni's, and refuses everything els
            {"distilled_two_stage", "2.3"},
            {"dmd2", "2.5"},
            {"retake", "2.3"},
-           {"res2s_two_stage", "2.5"},
+           // WAS `{"res2s_two_stage", "2.5"}`, and it is repointed here rather
+           // than deleted. That pair was this list's stand-in for "a kind the
+           // table has never heard of", and row LTX25-RES2S-LOOP (#921) made it
+           // a SERVED row — so leaving it would have asserted a refusal for a
+           // capability that ships, which is the failure mode #923 retired an
+           // enumerator over. `res2s_two_stage` at 2.3 keeps the pair's job:
+           // 2.5 is the only version `LTX_2_3_HQ_PARAMS` resolves onto, because
+           // it is a plain constant with no `detect_params` lineage
+           // (constants.py:91-94).
+           {"res2s_two_stage", "2.3"},
+           {"hq_two_stage", "2.5"},
            {"", ""},
        }) {
     const std::string message = RefusalMessage(
@@ -2641,4 +2657,675 @@ TEST_CASE("ltx2 the processor's binary mask mirrors a comparison that looks back
       MaxAbsDiff(all_valid.video, got.video.data(), got.video.size());
   INFO("padded rows = ", pad, " max|diff| vs an all-valid mask = ", masked_vs_unmasked);
   CHECK(masked_vs_unmasked > 0.0);
+}
+
+// ===========================================================================
+// The res_2s sampler — row LTX25-RES2S-LOOP, issue #921
+//
+// Every golden below came out of UPSTREAM'S OWN CODE at Lightricks/LTX-2
+// fd4ded7f: `phi`, `get_res2s_coefficients`, `Res2sDiffusionStep`,
+// `post_process_latent` and `res2s_audio_video_denoising_loop` were imported
+// from the checkout and run. Three things were substituted and each is one this
+// port reproduces exactly — the denoiser (a fixed quadratic), the noise DRAW
+// (`torch.randn`, whose stream this port does not have) and two media-IO modules
+// the import chain pulls in and nothing numeric touches. The generator is
+// recorded in .agents/specs/ltx25-res2s-loop.md section 5.
+// ===========================================================================
+
+namespace {
+
+double MaxAbsDiffD(const std::vector<double>& got, const double* want, size_t count) {
+  REQUIRE(got.size() == count);
+  double worst = 0.0;
+  for (size_t i = 0; i < count; ++i) worst = std::max(worst, std::fabs(got[i] - want[i]));
+  return worst;
+}
+
+// The reduced fixture every loop case below runs on: 6 elements, a denoise mask
+// that is NOT all ones, and a clean latent that differs from the state, so
+// `post_process_latent` is not the identity and a build that dropped the blend
+// fails at the masked positions rather than passing.
+struct Res2sFixture {
+  std::vector<float> video_mask, video_clean, audio_mask, audio_clean;
+  int64_t evaluations = 0;
+  std::vector<double> eval_sigmas;
+  // The `step_index` each call was handed, recorded by the DENOISER rather than
+  // read back off `Ltx2Res2sLoopStats`. Two independent records of the same
+  // fact: the stats vector says what the loop believes it passed and this one
+  // says what arrived, so a build that recorded one value and passed another is
+  // visible. It matters because `should_skip_step` reads it
+  // (guiders.py:287-291) and nothing in the returned latents does.
+  std::vector<int64_t> eval_step_indices;
+  // One counter per upstream generator (samplers.py:267-268).
+  int64_t step_draws = 0, substep_draws = 0;
+
+  Res2sFixture() {
+    const size_t n = static_cast<size_t>(vllm_test::kLtx2Res2sLatentCount);
+    video_mask.assign(vllm_test::kLtx2Res2sMask, vllm_test::kLtx2Res2sMask + n);
+    video_clean.assign(vllm_test::kLtx2Res2sClean, vllm_test::kLtx2Res2sClean + n);
+    // The generator reverses both on the audio side, so a build that fed one
+    // modality's mask to the other is visible rather than symmetric.
+    audio_mask.assign(video_mask.rbegin(), video_mask.rend());
+    audio_clean.assign(video_clean.rbegin(), video_clean.rend());
+  }
+
+  vllm::Ltx2Res2sHooks Hooks() {
+    vllm::Ltx2Res2sHooks hooks;
+    // The substituted denoiser: `0.5x + 0.25 - 0.125x^2` on video and
+    // `-0.25x + 0.1 + 0.0625x^2` on audio, in the model dtype and in the same
+    // operation order the generator used. QUADRATIC and not affine on purpose,
+    // so a build that evaluated once and reused the result cannot land on the
+    // same trajectory by luck.
+    hooks.denoise = [this](const std::vector<float>& v, const std::vector<float>& a, double sigma,
+                           int64_t step_index, std::vector<float>& dv, std::vector<float>& da) {
+      evaluations += 1;
+      eval_sigmas.push_back(sigma);
+      eval_step_indices.push_back(step_index);
+      dv.resize(v.size());
+      for (size_t i = 0; i < v.size(); ++i) {
+        dv[i] = 0.5f * v[i] + 0.25f - 0.125f * (v[i] * v[i]);
+      }
+      da.resize(a.size());
+      for (size_t i = 0; i < a.size(); ++i) {
+        da[i] = -0.25f * a[i] + 0.1f - 0.0625f * (a[i] * a[i]);
+      }
+    };
+    hooks.post_process = [this](std::vector<double> x, bool is_video) {
+      const std::vector<float>& mask = is_video ? video_mask : audio_mask;
+      const std::vector<float>& clean = is_video ? video_clean : audio_clean;
+      for (size_t i = 0; i < x.size(); ++i) {
+        const double m = static_cast<double>(mask[i]);
+        x[i] = x[i] * m + static_cast<double>(clean[i]) * (1.0 - m);
+      }
+      return x;
+    };
+    // The generator's stand-in for `torch.randn`: a fixed pattern, offset by
+    // which of upstream's two generators would have drawn it
+    // (samplers.py:267-268) and by HOW MANY draws that generator has already
+    // made.
+    //
+    // STATEFUL ON PURPOSE, because upstream's generator is. `_get_new_noise`
+    // draws from a seeded `torch.Generator` that advances, so within one step
+    // the video draw and the audio draw are different tensors and the ORDER of
+    // the two calls decides which modality receives which. MEASURED: with this
+    // hook stateless — the same values for every call — swapping the video and
+    // audio injections left this whole suite green, because both modalities were
+    // being handed identical noise. The engine's own hook draws from one
+    // `SplitMixGaussian` per stream, where that swap is a real defect.
+    hooks.new_noise = [this](int64_t count, bool /*is_video*/, bool substep) {
+      int64_t& draw = substep ? substep_draws : step_draws;
+      std::vector<double> out(static_cast<size_t>(count));
+      for (int64_t i = 0; i < count; ++i) {
+        out[static_cast<size_t>(i)] =
+            static_cast<double>((i * 7 + 3 + (substep ? 1 : 0) + 13 * draw) % 11) / 5.0 - 1.0;
+      }
+      draw += 1;
+      return out;
+    };
+    return hooks;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("ltx2 res2s phi mirrors upstream AT THE SMALL-Z CLIFF") {
+  // THE POINT OF THIS CASE IS THAT A BETTER IMPLEMENTATION FAILS IT.
+  //
+  // `phi` (res2s.py:4-22) guards only `abs(z) < 1e-10` and otherwise evaluates
+  // `(exp(z) - remainder) / z^j` directly, which cancels catastrophically just
+  // outside the guard. Upstream's own phi2(-1e-10) is 0.0 and its phi2(-1e-8) is
+  // 1.1102230246251563. A port that used a Taylor series near zero — the
+  // numerically correct thing to do — returns 0.5 at both and DIVERGES FROM THE
+  // MODEL'S OWN RUNTIME. Asserted EXACTLY, not within a tolerance, because a
+  // tolerance wide enough to cover the cancellation would accept the series.
+  REQUIRE(vllm_test::kLtx2PhiCount == 14);
+  for (int64_t i = 0; i < vllm_test::kLtx2PhiCount; ++i) {
+    const double z = vllm_test::kLtx2PhiZ[i];
+    const double got1 = vllm::Ltx2Phi(1, z);
+    const double got2 = vllm::Ltx2Phi(2, z);
+    INFO("z = ", z, " phi1 got = ", got1, " want = ", vllm_test::kLtx2Phi1[i],
+         " phi2 got = ", got2, " want = ", vllm_test::kLtx2Phi2[i]);
+    CHECK(got1 == vllm_test::kLtx2Phi1[i]);
+    CHECK(got2 == vllm_test::kLtx2Phi2[i]);
+  }
+
+  // The threshold is EXACTLY 1e-10 and STRICT, so these two neighbouring inputs
+  // land on opposite branches. Stated apart from the sweep because it is the one
+  // constant the whole function turns on, and a sweep that happened to omit one
+  // side would not say so.
+  CHECK(vllm::Ltx2Phi(2, -1e-11) == 0.5);
+  CHECK(vllm::Ltx2Phi(2, -1e-10) == 0.0);
+  // phi_j(0) = 1/j! past the two values the coefficients use, so the factorial
+  // is gated rather than being correct only where it is inlined.
+  CHECK(vllm::Ltx2Phi(3, 0.0) == 1.0 / 6.0);
+  CHECK(vllm::Ltx2Phi(4, 0.0) == 1.0 / 24.0);
+  // j < 1 is not a value upstream's callers produce (res2s.py:49, :55, :59 pass
+  // 1 and 2), so it is refused rather than returning a plausible number.
+  CHECK_FALSE(RefusalMessage([] { (void)vllm::Ltx2Phi(0, -0.5); }).empty());
+}
+
+TEST_CASE("ltx2 res2s coefficients mirror upstream, cliff included") {
+  REQUIRE(vllm_test::kLtx2Res2sCoeffCount == 11);
+  for (int64_t i = 0; i < vllm_test::kLtx2Res2sCoeffCount; ++i) {
+    const double h = vllm_test::kLtx2Res2sCoeffH[i];
+    vllm::Ltx2PhiCache cache;
+    const vllm::Ltx2Res2sCoefficients got = vllm::Ltx2GetRes2sCoefficients(h, cache, 0.5);
+    INFO("h = ", h, " a21 = ", got.a21, " b1 = ", got.b1, " b2 = ", got.b2);
+    CHECK(got.a21 == vllm_test::kLtx2Res2sCoeffA21[i]);
+    CHECK(got.b1 == vllm_test::kLtx2Res2sCoeffB1[i]);
+    CHECK(got.b2 == vllm_test::kLtx2Res2sCoeffB2[i]);
+    // res2s.py:39 — three entries per distinct h: (1, -h*c2), (2, -h), (1, -h).
+    // Asserted because the cache is a mirrored STRUCTURE that changes no value,
+    // so nothing else here would notice it disappearing.
+    CHECK(cache.size() == 3u);
+    CHECK(cache.count(std::pair<int64_t, double>{1, -h * 0.5}) == 1u);
+    CHECK(cache.count(std::pair<int64_t, double>{1, -h}) == 1u);
+    CHECK(cache.count(std::pair<int64_t, double>{2, -h}) == 1u);
+  }
+
+  // The cliff carried INTO the coefficients, which is where it bites: at
+  // h = 1e-10 upstream's b2 collapses to 0 and b1 becomes phi1's own
+  // cancellation residue. A "fixed" phi gives b2 = 1.0 and b1 = 0.0 here.
+  vllm::Ltx2PhiCache cache;
+  const vllm::Ltx2Res2sCoefficients cliff = vllm::Ltx2GetRes2sCoefficients(1e-10, cache, 0.5);
+  CHECK(cliff.b2 == 0.0);
+  CHECK(cliff.b1 == 1.000000082740371);
+
+  // A cache SHARED across calls returns what a fresh one does. Upstream relies
+  // on this by threading one cache through the whole loop (samplers.py:287), and
+  // a keying defect — dropping `j`, say — shows here and nowhere else.
+  vllm::Ltx2PhiCache shared;
+  for (int64_t i = 0; i < vllm_test::kLtx2Res2sCoeffCount; ++i) {
+    const vllm::Ltx2Res2sCoefficients got =
+        vllm::Ltx2GetRes2sCoefficients(vllm_test::kLtx2Res2sCoeffH[i], shared, 0.5);
+    CHECK(got.a21 == vllm_test::kLtx2Res2sCoeffA21[i]);
+    CHECK(got.b1 == vllm_test::kLtx2Res2sCoeffB1[i]);
+    CHECK(got.b2 == vllm_test::kLtx2Res2sCoeffB2[i]);
+  }
+  // THIRTY, not thirty-three, and the shortfall is the cache doing its job.
+  // Three of these h values are twice another, and `a21` asks for phi at
+  // `-h * 0.5` while `b1` asks for it at `-h`: h = 0.25 reuses the entry
+  // h = 0.125 made, h = 0.5 reuses h = 0.25's, and h = 1.0 reuses h = 0.5's.
+  // So 11 * 3 - 3 = 30. Asserted as the exact number rather than as an
+  // inequality, because "fewer than 33" is also what a cache keyed on `neg_h`
+  // ALONE would report — and that cache would return phi_1 where phi_2 was
+  // asked for. The `count()` assertions in the sweep above pin the key's shape;
+  // this pins how many survived sharing.
+  CHECK(shared.size() == 30u);
+}
+
+TEST_CASE("ltx2 res2s the loop NORMALIZES its noise, unlike the ancestral loop") {
+  // `_get_new_noise` (samplers.py:164-170) against `_get_plain_noise`
+  // (:155-157). The res_2s loop defaults to the first and the ancestral loop to
+  // the second, ten lines apart in one file, so reading one off the other drops
+  // this step and nothing about the rendered clip says so.
+  const size_t n = static_cast<size_t>(vllm_test::kLtx2Res2sLatentCount);
+  const std::vector<double> raw(vllm_test::kLtx2Res2sNoiseRaw,
+                                vllm_test::kLtx2Res2sNoiseRaw + n);
+  const std::vector<double> got = vllm::Ltx2Res2sNormalizeNoise(raw);
+  const double worst = MaxAbsDiffD(got, vllm_test::kLtx2Res2sNoiseNormalized, n);
+  INFO("max|diff| against upstream's own _channelwise_normalize = ", worst);
+  CHECK(worst < 1e-12);
+
+  // THE EXPECTED VALUE IS NOT REACHABLE BY ACCIDENT, three ways. A pass-through
+  // returns `raw`, which is far from the golden; the golden's mean is 0 and its
+  // unbiased standard deviation is 1, and neither is true of the input.
+  CHECK(MaxAbsDiffD(raw, vllm_test::kLtx2Res2sNoiseNormalized, n) > 0.5);
+  double sum = 0.0, sq = 0.0;
+  for (const double v : got) sum += v;
+  for (const double v : got) sq += (v - sum / static_cast<double>(n)) * (v - sum / static_cast<double>(n));
+  CHECK(std::fabs(sum) < 1e-12);
+  CHECK(std::fabs(std::sqrt(sq / static_cast<double>(n - 1)) - 1.0) < 1e-12);
+  // A zero-filled buffer has no standard deviation to divide by, so it must NOT
+  // reproduce the golden — the shape a sibling row's width test passed on.
+  //
+  // ASSERTED ON `isnan` AND NOT THROUGH `MaxAbsDiffD`, because the distance
+  // instrument cannot see this. `std::max(worst, NaN)` returns `worst`, so a
+  // buffer of NaNs measures as max|diff| = 0 and the control reads as "the zeros
+  // reproduced the golden exactly" — which is how this assertion first passed
+  // for the opposite of its stated reason. This file's own header records the
+  // same NaN drop in `MaxAbsDiff`; the lesson had to be re-learned here.
+  const std::vector<double> zeros(n, 0.0);
+  const std::vector<double> from_zeros = vllm::Ltx2Res2sNormalizeNoise(zeros);
+  CHECK(std::isnan(from_zeros[0]));
+  CHECK_FALSE(std::isnan(got[0]));
+  // Fewer than two elements has no unbiased standard deviation, so it is refused
+  // rather than dividing by zero and handing the sampler a NaN latent.
+  CHECK_FALSE(
+      RefusalMessage([] { (void)vllm::Ltx2Res2sNormalizeNoise(std::vector<double>{1.0}); })
+          .empty());
+}
+
+TEST_CASE("ltx2 res2s the SDE coefficients run at TWO widths, as upstream hands them") {
+  // `Res2sDiffusionStep.get_sde_coeff` has no dtype of its own, and the res_2s
+  // loop reaches it at two: the SUBSTEP injection is handed
+  // `torch.stack([sigma, sub_sigma])`, both `hp` (samplers.py:342), and the STEP
+  // injection is handed the loop's own schedule, which `DiffusionStage` created
+  // as float32 (ti2vid_two_stages_hq.py:268, samplers.py:415).
+  //
+  // THE TWO ARMS MUST DISAGREE, or the split is a comment rather than a
+  // behaviour. They disagree by about one part in 1e7, which is exactly why the
+  // loop golden above needed a one-ulp bound to see it and why this case exists
+  // beside it: a golden that cannot separate two implementations is not gating
+  // the choice between them.
+  const double sigma_next = 0.62;
+  const double sigma_up = sigma_next * 0.5;
+  const vllm::Ltx2SdeCoeff f32 = vllm::Ltx2Res2sSdeCoeff(sigma_next, sigma_up);
+  const vllm::Ltx2SdeCoeff f64 = vllm::Ltx2Res2sSdeCoeffHp(sigma_next, sigma_up);
+  INFO("f32 alpha_ratio = ", f32.alpha_ratio, " f64 alpha_ratio = ", f64.alpha_ratio,
+       " f32 sigma_down = ", f32.sigma_down, " f64 sigma_down = ", f64.sigma_down);
+  CHECK(f32.alpha_ratio != f64.alpha_ratio);
+  CHECK(f32.sigma_down != f64.sigma_down);
+  // ...and they agree to float32 precision, so "they differ" is not a defect in
+  // one of them.
+  CHECK(std::fabs(f32.alpha_ratio - f64.alpha_ratio) < 1e-6);
+  CHECK(std::fabs(f32.sigma_down - f64.sigma_down) < 1e-6);
+  // `sigma_up` is clamped IN before anything else (diffusion_steps.py:138), on
+  // both arms.
+  const vllm::Ltx2SdeCoeff clamped = vllm::Ltx2Res2sSdeCoeffHp(0.5, 2.0);
+  CHECK(clamped.sigma_up <= 0.5 * vllm::kLtx2Res2sSigmaUpClamp);
+  // The float64 arm computes the residual in float64, so at the clamp boundary
+  // it is NOT the float32 arm's value — the residual scales as
+  // sqrt(1 - clamp^2), which is where the two widths part most visibly.
+  CHECK(vllm::Ltx2Res2sSdeCoeff(0.5, 2.0).sigma_down != clamped.sigma_down);
+}
+
+TEST_CASE("ltx2 res2s the loop evaluates the transformer TWICE per step") {
+  // THE DISCRIMINATOR THIS WHOLE ROW RESTS ON.
+  //
+  // The res_2s sampler calls the denoiser at `sigmas[i]` (samplers.py:301) and
+  // again at `sqrt(sigma * sigma_next)` (:315, :380-386), plus once more at the
+  // injected terminal sigma (:437). The already-shipped Euler arm calls it ONCE
+  // per step. The two return a clip of the same shape, the same frame count and
+  // the same sample rate, so this count is the only thing that separates them.
+  //
+  // The expected numbers are 6 and 9, chosen so that no stub reaches them: a
+  // build that evaluates nothing reports 0, a build that evaluates once per step
+  // reports 3 and 4, and `2 * steps` alone reports 8 on the terminal fixture.
+  struct Case {
+    const char* tag;
+    const float* sigmas;
+    int64_t sigma_count;
+    int64_t evaluations;
+    const double* eval_sigmas;
+    const int64_t* eval_step_indices;
+    int64_t full_steps;
+  };
+  const Case cases[] = {
+      {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount,
+       vllm_test::kLtx2Res2sBongOnEvaluations, vllm_test::kLtx2Res2sBongOnEvalSigmas,
+       vllm_test::kLtx2Res2sBongOnEvalStepIndices, 3},
+      {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
+       vllm_test::kLtx2Res2sBongOffByHSigmaCount, vllm_test::kLtx2Res2sBongOffByHEvaluations,
+       vllm_test::kLtx2Res2sBongOffByHEvalSigmas,
+       vllm_test::kLtx2Res2sBongOffByHEvalStepIndices, 3},
+      {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvaluations,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvalSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvalStepIndices, 3},
+      {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroSigmaCount,
+       vllm_test::kLtx2Res2sTerminalZeroEvaluations,
+       vllm_test::kLtx2Res2sTerminalZeroEvalSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroEvalStepIndices, 4},
+  };
+
+  for (const Case& c : cases) {
+    Res2sFixture fixture;
+    const std::vector<float> sigmas(c.sigmas, c.sigmas + c.sigma_count);
+    vllm::Ltx2Res2sModality video{
+        std::vector<float>(vllm_test::kLtx2Res2sVideo0,
+                           vllm_test::kLtx2Res2sVideo0 + vllm_test::kLtx2Res2sLatentCount),
+        true};
+    vllm::Ltx2Res2sModality audio{
+        std::vector<float>(vllm_test::kLtx2Res2sAudio0,
+                           vllm_test::kLtx2Res2sAudio0 + vllm_test::kLtx2Res2sLatentCount),
+        true};
+    const vllm::Ltx2Res2sLoopStats stats =
+        vllm::Ltx2Res2sDenoisingLoop(sigmas, video, audio, fixture.Hooks());
+
+    INFO("fixture = ", c.tag, " evaluations = ", stats.evaluations, " want ", c.evaluations);
+    // Upstream's count, measured by running upstream's loop with a counting
+    // denoiser. The loop's own tally and the hook's own tally must AGREE, so a
+    // build that reported the number without running the forwards fails.
+    CHECK(stats.evaluations == c.evaluations);
+    CHECK(fixture.evaluations == c.evaluations);
+    CHECK(stats.full_steps == c.full_steps);
+    // ...and it is not the first-order count. Asserted as an inequality against
+    // the step count so the case cannot pass by both numbers happening to match.
+    CHECK(stats.evaluations > 2 * stats.full_steps - 1);
+    CHECK(stats.evaluations != stats.full_steps);
+
+    // THE SIGMAS THEMSELVES, so a build that ran two forwards at the SAME sigma
+    // — which would keep the count right and the sampler wrong — fails here.
+    REQUIRE(stats.eval_sigmas.size() == static_cast<size_t>(c.evaluations));
+    REQUIRE(fixture.eval_sigmas.size() == static_cast<size_t>(c.evaluations));
+    for (int64_t i = 0; i < c.evaluations; ++i) {
+      INFO("fixture = ", c.tag, " evaluation ", i, " at sigma ", stats.eval_sigmas[i],
+           " want ", c.eval_sigmas[i]);
+      CHECK(std::fabs(stats.eval_sigmas[i] - c.eval_sigmas[i]) < 1e-12);
+      CHECK(stats.eval_sigmas[i] == fixture.eval_sigmas[i]);
+    }
+    // Every ODD entry is the geometric mean of its neighbours — `sqrt(sigma *
+    // sigma_next)`, upstream's "hardcode for c2 = 0.5" (samplers.py:314-315).
+    // Derived here rather than only read from the golden, so the golden and the
+    // rule check each other.
+    for (int64_t i = 0; i + 1 < c.full_steps * 2; i += 2) {
+      const double sigma = static_cast<double>(sigmas[static_cast<size_t>(i / 2)]);
+      const double next = (i / 2 + 1 < c.sigma_count - 1 || sigmas[c.sigma_count - 1] != 0.0f)
+                              ? static_cast<double>(sigmas[static_cast<size_t>(i / 2 + 1)])
+                              : static_cast<double>(vllm::kLtx2Res2sTerminalSigma);
+      CHECK(std::fabs(stats.eval_sigmas[i + 1] - std::sqrt(sigma * next)) < 1e-9);
+    }
+
+    // THE `step_index` EACH EVALUATION WAS HANDED, which is a SECOND argument
+    // upstream's `Denoiser` takes and which nothing about the returned latents,
+    // the evaluation count or a rendered frame records. Upstream passes three
+    // different things for it — `step_idx` at the first evaluation
+    // (samplers.py:301), a LITERAL 0 at the substep (samplers.py:385, beside a
+    // one-element schedule) and `n_full_steps` at the terminal one
+    // (samplers.py:437) — and the goldens carry the sequence upstream's own loop
+    // produced.
+    //
+    // IT IS NOT COSMETIC. The denoiser reads it through `should_skip_step`,
+    // which is `step % (skip_step + 1) != 0` (guiders.py:287-291). At the HQ
+    // preset's `skip_step = 0` every value behaves alike, so this whole
+    // distinction is INERT on the shipped arm — and it is live the moment a
+    // request sets `video_skip_step`, where passing the loop counter at the
+    // substep would skip half of a res_2s step's evaluations and render the
+    // first-order trajectory under the second-order sampler's schedule.
+    //
+    // Asserted against BOTH records: `stats` says what the loop believes it
+    // passed and `fixture` says what arrived, so a build that recorded one value
+    // and passed another fails rather than agreeing with itself.
+    REQUIRE(stats.eval_step_indices.size() == static_cast<size_t>(c.evaluations));
+    REQUIRE(fixture.eval_step_indices.size() == static_cast<size_t>(c.evaluations));
+    for (int64_t i = 0; i < c.evaluations; ++i) {
+      INFO("fixture = ", c.tag, " evaluation ", i, " step_index ", stats.eval_step_indices[i],
+           " want ", c.eval_step_indices[i]);
+      CHECK(stats.eval_step_indices[i] == c.eval_step_indices[i]);
+      CHECK(fixture.eval_step_indices[i] == c.eval_step_indices[i]);
+    }
+    // And the RULE the goldens encode, derived here rather than only read, so
+    // the two check each other: every substep evaluation is at index 0, every
+    // full-step evaluation is at its own step, and the terminal one is at
+    // `n_full_steps`.
+    for (int64_t step = 0; step < c.full_steps; ++step) {
+      CHECK(stats.eval_step_indices[2 * step] == step);
+      CHECK(stats.eval_step_indices[2 * step + 1] == 0);
+    }
+    if (c.evaluations == 2 * c.full_steps + 1) {
+      CHECK(stats.eval_step_indices[c.evaluations - 1] == c.full_steps);
+    }
+  }
+}
+
+TEST_CASE("ltx2 res2s the bong refinement runs in its own branch and nowhere else") {
+  // `bongmath and h < 0.5 and sigma > 0.03` (samplers.py:357), with both
+  // comparisons STRICT. Each branch is forced by a fixture that CANNOT be
+  // satisfying the other condition:
+  //
+  //   BongOn         h = 0.118, 0.134, 0.121   sigma = 0.9 .. 0.62   -> runs
+  //   BongOffByH     h = 0.588, 0.693, 0.734   sigma = 0.9 .. 0.12   -> h blocks it
+  //   BongOffBySigma h = 0.069, 0.074, 0.039   sigma = 0.03 .. 0.025 -> sigma blocks it
+  //
+  // The `h` fixture keeps every sigma above 0.03 and the sigma fixture keeps
+  // every h below 0.5, so neither is off for the other's reason.
+  //
+  // WHAT THIS CASE DOES *NOT* GATE, stated because it was claimed here and was
+  // false. The sigma fixture starts at the literal 0.03, and that was written as
+  // "pinning the inequality as strict". It does not. The schedule is float32, so
+  // `0.03f` widens to 0.029999999329447746, which is BELOW the double 0.03 the
+  // guard compares against — the boundary is a value no float32 schedule can
+  // hold, so `>` and `>=` are indistinguishable through this loop's interface.
+  // MEASURED: relaxing the guard to `>=` leaves this case green (mutation M5 in
+  // .agents/specs/ltx25-res2s-loop.md section 8). Upstream compares the same
+  // widened float32 against the same Python float (samplers.py:357), so the
+  // strictness is unobservable THERE too and no fixture can be built for it.
+  // Recorded as ungated rather than left reading as covered.
+  struct Case {
+    const char* tag;
+    const float* sigmas;
+    int64_t sigma_count;
+    int64_t bong_steps;
+    bool bong_moved;
+    const float* no_bong_video;
+  };
+  const Case cases[] = {
+      {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount, 3,
+       vllm_test::kLtx2Res2sBongOnBongMoved, vllm_test::kLtx2Res2sBongOnNoBongVideo},
+      {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
+       vllm_test::kLtx2Res2sBongOffByHSigmaCount, 0,
+       vllm_test::kLtx2Res2sBongOffByHBongMoved, vllm_test::kLtx2Res2sBongOffByHNoBongVideo},
+      {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount, 0,
+       vllm_test::kLtx2Res2sBongOffBySigmaBongMoved,
+       vllm_test::kLtx2Res2sBongOffBySigmaNoBongVideo},
+      {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroSigmaCount, 2,
+       vllm_test::kLtx2Res2sTerminalZeroBongMoved,
+       vllm_test::kLtx2Res2sTerminalZeroNoBongVideo},
+  };
+
+  for (const Case& c : cases) {
+    const std::vector<float> sigmas(c.sigmas, c.sigmas + c.sigma_count);
+    const auto run = [&](bool bongmath) {
+      Res2sFixture fixture;
+      vllm::Ltx2Res2sModality video{
+          std::vector<float>(vllm_test::kLtx2Res2sVideo0,
+                             vllm_test::kLtx2Res2sVideo0 + vllm_test::kLtx2Res2sLatentCount),
+          true};
+      vllm::Ltx2Res2sModality audio{
+          std::vector<float>(vllm_test::kLtx2Res2sAudio0,
+                             vllm_test::kLtx2Res2sAudio0 + vllm_test::kLtx2Res2sLatentCount),
+          true};
+      vllm::Ltx2Res2sLoopParams params;
+      params.bongmath = bongmath;
+      const vllm::Ltx2Res2sLoopStats stats =
+          vllm::Ltx2Res2sDenoisingLoop(sigmas, video, audio, fixture.Hooks(), params);
+      return std::pair<std::vector<float>, vllm::Ltx2Res2sLoopStats>{video.latent, stats};
+    };
+
+    const auto on = run(true);
+    const auto off = run(false);
+    INFO("fixture = ", c.tag, " bong steps = ", on.second.bong_steps, " want ", c.bong_steps);
+    // WHICH STEPS refined, counted. A build whose guard used `<=` on either
+    // comparison, or `or` for `and`, reports a different number here even where
+    // the latents happen to agree.
+    CHECK(on.second.bong_steps == c.bong_steps);
+    CHECK(off.second.bong_steps == 0);
+    // Turning the refinement off never changes how many forwards ran, which is
+    // why the evaluation count above cannot see this branch at all.
+    CHECK(on.second.evaluations == off.second.evaluations);
+
+    // The refinement's EFFECT, against upstream's own bongmath=False run rather
+    // than against a value this port computed. `bong_moved` came out of the
+    // generator, so "it changed the result" is upstream's observation.
+    const double moved = MaxAbsDiff(on.first, off.first.data(), off.first.size());
+    INFO("fixture = ", c.tag, " max|on - off| = ", moved, " upstream says moved = ",
+         c.bong_moved);
+    CHECK((moved > 0.0) == c.bong_moved);
+    // ...and the bongmath=False arm matches upstream's bongmath=False output, so
+    // "identical" is not being satisfied by both arms being broken the same way.
+    const double against_upstream =
+        MaxAbsDiff(off.first, c.no_bong_video, off.first.size());
+    INFO("fixture = ", c.tag, " max|diff| vs upstream (bongmath off) = ", against_upstream);
+    CHECK(against_upstream < kRoundOff);
+  }
+}
+
+TEST_CASE("ltx2 res2s the loop reproduces upstream") {
+  // THE BOUND IS ONE f32 ulp, NOT THIS FILE'S `kRoundOff`.
+  //
+  // Measured against upstream's own loop output, three of the five fixtures come
+  // back BIT-EXACT and the other two move by 2.98e-08, which is one ulp at 0.5.
+  // The bound is set there on purpose. At `kRoundOff` (5e-6) this case cannot
+  // see the float32/float64 split the step-level SDE coefficients run at
+  // (samplers.py:415 against :342), which shifts the result by about 1e-7
+  // relative — MEASURED: with the split collapsed onto float64 this case stayed
+  // GREEN at 5e-6 and REDS at 1e-7. A tolerance is a claim about how much
+  // disagreement is round-off, and 5e-6 was a claim this port could not defend.
+  constexpr double kOneUlp = 1e-7;
+  struct Case {
+    const char* tag;
+    const float* sigmas;
+    int64_t sigma_count;
+    double eta;
+    const float* video;
+    const float* audio;
+  };
+  const Case cases[] = {
+      {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount,
+       vllm_test::kLtx2Res2sBongOnEta, vllm_test::kLtx2Res2sBongOnVideo,
+       vllm_test::kLtx2Res2sBongOnAudio},
+      {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
+       vllm_test::kLtx2Res2sBongOffByHSigmaCount, vllm_test::kLtx2Res2sBongOffByHEta,
+       vllm_test::kLtx2Res2sBongOffByHVideo, vllm_test::kLtx2Res2sBongOffByHAudio},
+      {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount, vllm_test::kLtx2Res2sBongOffBySigmaEta,
+       vllm_test::kLtx2Res2sBongOffBySigmaVideo, vllm_test::kLtx2Res2sBongOffBySigmaAudio},
+      {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroSigmaCount, vllm_test::kLtx2Res2sTerminalZeroEta,
+       vllm_test::kLtx2Res2sTerminalZeroVideo, vllm_test::kLtx2Res2sTerminalZeroAudio},
+      // THE ONLY FIXTURE THAT SEPARATES THE TWO ETAS. The substep injection is
+      // pinned at 0.5 whatever the loop's own eta is (samplers.py:273-274), and
+      // with the loop at its own default of 0.5 the two are the same number, so
+      // a build that read `eta` at the substep is INVISIBLE on every fixture
+      // above. MEASURED: that build stayed green on all four before this row
+      // was added.
+      {"Eta1", vllm_test::kLtx2Res2sEta1Sigmas, vllm_test::kLtx2Res2sEta1SigmaCount,
+       vllm_test::kLtx2Res2sEta1Eta, vllm_test::kLtx2Res2sEta1Video,
+       vllm_test::kLtx2Res2sEta1Audio},
+  };
+
+  const size_t n = static_cast<size_t>(vllm_test::kLtx2Res2sLatentCount);
+  for (const Case& c : cases) {
+    Res2sFixture fixture;
+    const std::vector<float> sigmas(c.sigmas, c.sigmas + c.sigma_count);
+    vllm::Ltx2Res2sModality video{
+        std::vector<float>(vllm_test::kLtx2Res2sVideo0, vllm_test::kLtx2Res2sVideo0 + n), true};
+    vllm::Ltx2Res2sModality audio{
+        std::vector<float>(vllm_test::kLtx2Res2sAudio0, vllm_test::kLtx2Res2sAudio0 + n), true};
+    vllm::Ltx2Res2sLoopParams params;
+    params.eta = c.eta;
+    (void)vllm::Ltx2Res2sDenoisingLoop(sigmas, video, audio, fixture.Hooks(), params);
+
+    const double vworst = MaxAbsDiff(video.latent, c.video, n);
+    const double aworst = MaxAbsDiff(audio.latent, c.audio, n);
+    INFO("fixture = ", c.tag, " eta = ", c.eta, " video max|diff| = ", vworst,
+         " audio max|diff| = ", aworst);
+    CHECK(vworst < kOneUlp);
+    CHECK(aworst < kOneUlp);
+
+    // `post_process_latent` IS APPLIED, and the fixture's mask is what makes
+    // that checkable: at the two positions the video mask zeroes, the result
+    // must be the CLEAN latent exactly, whatever the sampler did. A build that
+    // dropped the blend returns a denoised value there and fails.
+    for (size_t i = 0; i < n; ++i) {
+      if (vllm_test::kLtx2Res2sMask[i] != 0.0f) continue;
+      INFO("fixture = ", c.tag, " masked video position ", i);
+      CHECK(video.latent[i] == vllm_test::kLtx2Res2sClean[i]);
+    }
+    // The two modalities did not receive each other's mask: the audio mask is
+    // the video one reversed, so the positions that must hold `clean` differ.
+    for (size_t i = 0; i < n; ++i) {
+      if (vllm_test::kLtx2Res2sMask[n - 1 - i] != 0.0f) continue;
+      INFO("fixture = ", c.tag, " masked audio position ", i);
+      CHECK(audio.latent[i] == vllm_test::kLtx2Res2sClean[n - 1 - i]);
+    }
+  }
+
+  // A loop with no modality at all is refused (samplers.py:258-259), rather than
+  // returning two empty latents that a caller would decode into a blank clip.
+  Res2sFixture fixture;
+  vllm::Ltx2Res2sModality absent_v{{}, false}, absent_a{{}, false};
+  const std::vector<float> sigmas{1.0f, 0.5f, 0.0f};
+  const std::string refusal = RefusalMessage(
+      [&] { (void)vllm::Ltx2Res2sDenoisingLoop(sigmas, absent_v, absent_a, fixture.Hooks()); });
+  INFO("refusal = ", refusal);
+  CHECK_FALSE(refusal.empty());
+  CHECK(Mentions(refusal, "samplers.py:258-259"));
+}
+
+TEST_CASE("ltx2 the res2s_two_stage recipe is upstream's HQ preset") {
+  const vllm::Ltx2PipelineRecipe hq = vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", "2.5");
+  REQUIRE(hq.phases.size() == 2u);
+
+  // THE THING THAT MAKES IT HQ. `stepper=Res2sDiffusionStep()` and
+  // `loop=res2s_audio_video_denoising_loop` on BOTH stages
+  // (ti2vid_two_stages_hq.py:258, :285/:292, :319/:335). Asserted against the
+  // distilled two-stage recipe in the same case, which selects a DIFFERENT
+  // sampler on each of its phases, so this cannot pass by every recipe having
+  // the same value.
+  CHECK(hq.phases[0].stepper == vllm::Ltx2StepperKind::kRes2s);
+  CHECK(hq.phases[1].stepper == vllm::Ltx2StepperKind::kRes2s);
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(distilled.phases[1].stepper == vllm::Ltx2StepperKind::kEuler);
+
+  // LTX_2_3_HQ_PARAMS (constants.py:95-115): 15 steps, STG OFF on both
+  // modalities, video rescale 0.45 and audio rescale 1.0. Fifteen against the
+  // 2.4 lineage's thirty is the whole economics of the preset — half the steps,
+  // twice the evaluations each.
+  CHECK(hq.num_inference_steps == 15);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").num_inference_steps == 30);
+  CHECK(hq.phases[0].video_guidance.stg_scale == 0.0);
+  CHECK(hq.phases[0].audio_guidance.stg_scale == 0.0);
+  CHECK(hq.phases[0].video_guidance.stg_blocks.empty());
+  CHECK(hq.phases[0].audio_guidance.stg_blocks.empty());
+  CHECK(hq.phases[0].video_guidance.cfg_scale == 3.0);
+  CHECK(hq.phases[0].audio_guidance.cfg_scale == 7.0);
+  CHECK(hq.phases[0].video_guidance.rescale_scale == 0.45);
+  CHECK(hq.phases[0].audio_guidance.rescale_scale == 1.0);
+
+  // Stage 1 halves (:238-243) and DERIVES its schedule from
+  // `num_inference_steps` (:260-267) — the one place this recipe differs in KIND
+  // from the distilled two-stage one, whose stage 1 carries frozen sigmas.
+  CHECK(hq.phases[0].spatial_downscale == 2);
+  CHECK(hq.phases[0].sigmas.empty());
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());
+  CHECK(hq.allow_request_sigmas);
+  CHECK_FALSE(hq.fixed_num_inference_steps);
+
+  // Stage 2 upsamples (:297), takes STAGE_2_DISTILLED_SIGMAS by DEFAULT ARGUMENT
+  // (:193), re-noises to its own first sigma (:327, :332) and runs a
+  // `SimpleDenoiser` (:316) that no request may re-arm.
+  CHECK(hq.phases[1].spatial_downscale == 1);
+  CHECK(hq.phases[1].input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  CHECK(hq.phases[1].sigmas == distilled.phases[1].sigmas);
+  CHECK(hq.phases[1].noise_scale == hq.phases[1].sigmas.front());
+  CHECK_FALSE(hq.phases[1].allow_guidance_override);
+
+  // :313-315, :339 — "Stage 2 refines video only; discard its audio". The audio
+  // that leaves is STAGE 1's, and taking stage 2's would decode a soundtrack the
+  // pipeline throws away: finite, the right length, the wrong take.
+  CHECK(hq.video_output_phase == 1);
+  CHECK(hq.audio_output_phase == 0);
+
+  // :210 — the prompt encoder is handed `[prompt, negative_prompt]` and stage 1
+  // builds a `GuidedDenoiser` with the negative encoding, so unlike the
+  // distilled arm this pipeline HAS a negative prompt.
+  CHECK(hq.allow_negative_prompt);
+  CHECK_FALSE(hq.negative_prompt.empty());
+  CHECK(distilled.negative_prompt.empty());
+
+  // The geometry is the FINAL output's; stage 1 runs at half of it.
+  // `assert_resolution(is_two_stage=True)` (:199) is what the engine then
+  // enforces against a request.
+  CHECK(hq.max_spatial_downscale() == 2);
+
+  // 2.5 ONLY. `LTX_2_3_HQ_PARAMS` is a plain constant with no `detect_params`
+  // lineage (constants.py:91-94), so there is no second version to resolve it
+  // onto and every other pair still refuses BY NAME.
+  for (const std::string& version : {std::string("2"), std::string("2.3"), std::string("2.4"),
+                                     std::string("2.6")}) {
+    const std::string message = RefusalMessage(
+        [&] { (void)vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", version); });
+    INFO("version = ", version, " refusal = ", message);
+    CHECK_FALSE(message.empty());
+    CHECK(Mentions(message, "Unsupported LTX pipeline kind/version"));
+    CHECK(Mentions(message, version));
+  }
 }

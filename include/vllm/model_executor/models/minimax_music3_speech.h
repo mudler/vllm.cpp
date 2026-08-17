@@ -69,6 +69,7 @@
 
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
 #include "vllm/model_executor/models/minimax_music3_ar.h"
+#include "vllm/model_executor/models/minimax_music3_device.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
 #include "vllm/multimodal/speech_engine.h"
 
@@ -198,10 +199,35 @@ struct Music3DenoiseOptions {
 //   * the carry span is taken from the RESTORED latents (denoise.py:252-256);
 //   * the scheduler is RESET per window (denoise.py:152-156), so step 0's sigma
 //     is the first of a fresh schedule and not a continuation.
+//
+// THE DEVICE ARM (#672, spec §11.4) is the optional trailing parameter and
+// NOTHING ELSE. Left default-constructed — which every caller written before it
+// does — the loop runs `DitForward`, the host reference every Music3 gate was
+// taken on, unchanged. Given a queue and the DiT staged onto that queue's
+// device, the two `DitForward` calls per step become `DitForwardDevice` and
+// nothing else in this function moves: the condition mix, the overlap blend, the
+// CFG mix, the Euler step and the carry stay on the host, in the same order,
+// computing the same numbers.
+//
+// The weights are staged by the CALLER, once, and handed in — not staged here.
+// A 45 s clip runs this loop's inner body 660 times over 11 windows, so staging
+// per window would upload 9.7 GB eleven times for one clip; the fixed cost has
+// to sit outside every loop in this function, and putting the parameter here
+// rather than a path inside is what makes that structural instead of careful.
+struct Music3DenoiseDeviceArm {
+  vt::Queue* queue = nullptr;
+  const Music3DitDeviceWeights* dit = nullptr;
+  // Both or neither. One alone is a caller that thinks it asked for the device
+  // arm and did not, so it is REFUSED rather than silently ignored.
+  bool engaged() const { return queue != nullptr && dit != nullptr; }
+  bool half_set() const { return (queue != nullptr) != (dit != nullptr); }
+};
+
 std::vector<std::vector<float>> Music3DenoiseChunks(
     const std::vector<float>& frame_hiddens, int64_t num_frames,
     const MiniMaxMusic3Config& config, const Music3AcousticWeights& weights,
-    const Music3DenoiseOptions& options, const Music3NoiseSource& noise);
+    const Music3DenoiseOptions& options, const Music3NoiseSource& noise,
+    const Music3DenoiseDeviceArm& device_arm = {});
 
 // The decode + stitch (decoders.py:75-92): each window's latents through the
 // vocoder, cropped by `VocoderCropSpan`, concatenated, and CLAMPED to [-1, 1]

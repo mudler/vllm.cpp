@@ -779,6 +779,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_quant.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_device.cpp
   src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
@@ -848,6 +849,13 @@ add_library(vllm STATIC
   # the latent spatial upsampler, the duration head and the embeddings
   # connector. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_pipeline.cpp
+  # LTX-2.5 (ROW LTX25-RES2S-LOOP, issue #921): the res_2s second-order sampler.
+  # Its own TU because upstream partitions it that way — a STEPPER advances one
+  # substep and lives in ltx-core/components/diffusion_steps.py, which
+  # ltx2_pipeline.cpp mirrors, while a SAMPLER decides how many substeps there
+  # are and what is evaluated between them and lives in
+  # ltx-pipelines/utils/samplers.py. Two upstream packages, two files here.
+  src/vllm/model_executor/models/ltx2_samplers.cpp
   src/vllm/model_executor/models/ltx2_upsampler.cpp
   # LTX-2.5 (ROW LTX25-DFR-PIPELINE, issue #986): the DFR canvas layout — the
   # keyframe segment grid, the temporal tile ranges and the latent stitch. Its

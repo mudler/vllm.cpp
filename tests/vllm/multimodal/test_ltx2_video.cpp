@@ -5887,6 +5887,313 @@ TEST_CASE("ltx2 t2a: rescale_scale 0 is the control because both spaces agree th
   CHECK(at_default > 100.0 * at_zero);
 }
 
+// ─── the HQ arm reaches the res_2s sampler (row LTX25-RES2S-LOOP, #921) ─────
+//
+// THIS IS THE REACHABILITY CASE, and it is deliberately not a unit test of the
+// loop — `test_ltx2_pipeline` already gates the arithmetic against upstream's
+// own output. This one enters through the production path a user arrives on:
+// `LoadVideoEngine` with the `pipeline_kind` LOAD extra, then
+// `VideoEngine::Generate`, which is what `vllm_video_generate`, `ltx2-gen` and
+// the server all call. Deleting the `kRes2s` dispatch in `ltx2_video.cpp`'s
+// phase loop must red this case; a unit test of `Ltx2Res2sDenoisingLoop` would
+// stay green, because it proves the class works and never that anything
+// reaches it.
+//
+// WHAT IT ASSERTS IS A COUNT, because a count is the only thing that separates
+// the two samplers. The rendered clip, its shape, its frame count and its
+// sample rate are identical whichever one ran.
+TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
+  Workspace ws;
+
+  // `steps` -> forwards, for each arm. The res_2s loop runs two evaluations per
+  // step plus one at the terminal sigma the schedule injects (samplers.py:281,
+  // :437), and the first-order loop runs one per step. TWO step counts, so an
+  // off-by-one cannot satisfy both, and the ratio is close to two rather than a
+  // difference of one.
+  const auto forwards = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    // Stage 1 only. Both recipes' second phase needs the latent spatial
+    // upsampler, which the fixture does not carry and which is refused BY NAME
+    // in its own case above — that refusal is not what this case is about.
+    mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + tag);
+    gen.steps = steps;
+    // `one_stage` resolves `stg_blocks = [28]` (constants.py:86-87) and this
+    // fixture's DiT has two blocks, so its PERTURBED pass is refused by name
+    // unless the request names a block that exists. The HQ preset ships
+    // `stg_blocks = []` beside `stg_scale = 0.0` (constants.py:105, :113) and
+    // asks for no perturbed pass at all, so it needs no override — and giving it
+    // one would put a request override on the arm this case is measuring.
+    if (kind == "one_stage") OneStageFixtureGuidance(&gen);
+    (void)engine->Generate(gen);
+    return ltx2->last_conditioning();
+  };
+
+  const vllm::multimodal::Ltx2ConditioningTrace hq3 = forwards("res2s_two_stage", 3, "hq3");
+  const vllm::multimodal::Ltx2ConditioningTrace hq5 = forwards("res2s_two_stage", 5, "hq5");
+  const vllm::multimodal::Ltx2ConditioningTrace euler3 = forwards("one_stage", 3, "e3");
+  const vllm::multimodal::Ltx2ConditioningTrace euler5 = forwards("one_stage", 5, "e5");
+
+  INFO("res2s: 3 steps -> " << hq3.dit_evaluations << " forwards, 5 steps -> "
+                            << hq5.dit_evaluations << "; euler: 3 -> "
+                            << euler3.dit_evaluations << ", 5 -> " << euler5.dit_evaluations);
+  // 2 * steps + 1. The schedule `Ltx2SigmaSchedule` builds terminates at exactly
+  // 0 (gated in test_ltx2_pipeline), so the terminal evaluation always happens.
+  CHECK(hq3.dit_evaluations == 7);
+  CHECK(hq5.dit_evaluations == 11);
+  // ...against the first-order arm on the SAME request. Both numbers are read
+  // off a real render rather than one being computed from the other, so the
+  // comparison cannot be satisfied by both arms sharing a defect.
+  CHECK(euler3.dit_evaluations == 3);
+  CHECK(euler5.dit_evaluations == 5);
+  CHECK(hq3.dit_evaluations > 2 * euler3.dit_evaluations);
+  CHECK(hq5.dit_evaluations > 2 * euler5.dit_evaluations);
+  // A ZERO WOULD ALSO BE "not equal to the Euler count", and zero is what a
+  // build that never ran the loop reports. Ruled out explicitly.
+  CHECK(euler3.dit_evaluations > 0);
+
+  // THE BONG REFINEMENT IS REACHED ON THE PRODUCTION SCHEDULE, not only on the
+  // hand-built fixtures in test_ltx2_pipeline. It changes the latent without
+  // changing how many forwards ran, so the counter above is blind to it and this
+  // is the only place a real render says it happened.
+  CHECK(hq3.res2s_bong_steps > 0);
+  CHECK(hq5.res2s_bong_steps > 0);
+  // ...and never on a first-order arm, which has no anchor to refine.
+  CHECK(euler3.res2s_bong_steps == 0);
+  CHECK(euler5.res2s_bong_steps == 0);
+
+  // THE NOISE THE ENGINE HANDED THE LOOP WAS NORMALIZED. `_get_new_noise`
+  // (samplers.py:164-170) is what the res_2s loop takes, against the ancestral
+  // loop's un-normalized `_get_plain_noise` (:155-157) ten lines away. That the
+  // FUNCTION normalizes is gated in test_ltx2_pipeline; that this engine calls
+  // it is a different claim, and MEASURED: with the hook handing over its raw
+  // draw instead, every assertion above stayed green.
+  //
+  // 1e-9 is unreachable for a raw Gaussian draw, whose sample moments miss by
+  // O(1/sqrt(n)) on any latent this fixture builds, and trivial for a
+  // normalized one, which is exact to rounding.
+  INFO("res2s noise moment error = " << hq3.res2s_noise_moment_error);
+  CHECK(hq3.res2s_noise_moment_error < 1e-9);
+  CHECK(hq5.res2s_noise_moment_error < 1e-9);
+  // Zero — not "small" — on an arm that runs no res_2s draw at all, so the
+  // field cannot read as satisfied by never having been written.
+  CHECK(euler3.res2s_noise_moment_error == 0.0);
+
+  // BOTH ARMS BUILT THEIR SCHEDULE THE SAME WAY, which is what lets the two
+  // counts be compared at all: each recipe leaves stage 1's sigmas empty and
+  // therefore derives them from `steps` through `Ltx2SigmaSchedule`, so the
+  // difference between 7 and 3 is the SAMPLER and not a different schedule.
+  // Their token counts differ — the HQ stage 1 halves the request
+  // (ti2vid_two_stages_hq.py:238-243) and `one_stage` does not — which is why
+  // the counts above are asserted absolutely rather than only as a ratio.
+  CHECK(hq3.schedule_tokens > 0);
+  CHECK(euler3.schedule_tokens > 0);
+  CHECK(hq3.video_tokens < euler3.video_tokens);
+}
+
+// ─── the HQ arm is GUIDED, and the evaluation count cannot see that ─────────
+//
+// THIS IS A SEPARATE CASE FROM THE ONE ABOVE BECAUSE IT IS A SEPARATE DEFECT,
+// and the one above is blind to it. A render's DiT work is
+// `evaluations x forwards-per-evaluation`. The sampler decides the first factor
+// and the denoiser decides the second, and `dit_evaluations` — the whole
+// instrument of the case above — is exactly the first factor. Route the res_2s
+// loop around a bare `Ltx2DitForward` instead of `Ltx2GuidedDenoise` and
+// `dit_evaluations` stays at 2n+1, `res2s_bong_steps` stays right, the eval
+// sigmas stay right, the clip keeps its shape, frame count, sample rate and file
+// size, and the preset renders at cfg 1.0 where upstream tuned it at 3.0.
+//
+// Upstream's HQ stage 1 runs a `GuidedDenoiser` (ti2vid_two_stages_hq.py:271-281)
+// built from `LTX_2_3_HQ_PARAMS` — cfg 3.0 video / 7.0 audio, rescale 0.45,
+// modality 3.0, stg 0.0, stg_blocks [] (utils/constants.py:99-114). So each of
+// stage 1's evaluations is THREE transformer forwards: `cond` always
+// (denoisers.py:100), `uncond` because cfg != 1.0 (:102-109, guiders.py:275-277)
+// and `mod` because modality_scale != 1.0 (:121-137, guiders.py:283-285). No
+// `ptb`, because stg_scale is 0.0.
+TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per evaluation") {
+  Workspace ws;
+
+  const auto render = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    // Stage 1 only, for the reason the case above gives: the second phase needs
+    // the latent spatial upsampler the fixture does not carry.
+    mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + tag);
+    gen.steps = steps;
+    // The HQ preset ships `stg_blocks = []` on both modalities beside
+    // `stg_scale = 0.0`, so unlike `one_stage` it needs no block override to run
+    // on a reduced-block fixture — the perturbed pass is not requested at all.
+    (void)engine->Generate(gen);
+    return ltx2->last_conditioning();
+  };
+
+  const vllm::multimodal::Ltx2ConditioningTrace hq3 = render("res2s_two_stage", 3, "ghq3");
+  const vllm::multimodal::Ltx2ConditioningTrace hq5 = render("res2s_two_stage", 5, "ghq5");
+
+  // THE GUIDER THE PHASE RESOLVED, so a recipe that quietly lost `LTX_2_3_HQ_PARAMS`
+  // fails here rather than rendering at the defaults.
+  CHECK(hq3.video_guidance_cfg_scale == 3.0);
+  CHECK(hq3.video_guidance_stg_scale == 0.0);
+  CHECK(hq3.video_guidance_rescale_scale == 0.45);
+  CHECK(hq3.video_guidance_modality_scale == 3.0);
+  // ...and the seam RAN, recorded at the call rather than copied from the params
+  // above. `RecordFirstGuidedStep` reads `pass_ran`, which the denoiser sets when
+  // it issues the forward.
+  REQUIRE(hq3.video_guided);
+  CHECK(hq3.video_cond_forwards == 1);
+  CHECK(hq3.video_uncond_forwards == 1);
+  CHECK(hq3.video_perturbed_forwards == 0);
+  CHECK(hq3.video_modality_forwards == 1);
+
+  // THE COUNT THAT MOVES WHEN GUIDANCE IS DROPPED, and the one that does not.
+  //
+  // `dit_evaluations` is 2n+1 whether or not the arm is guided; `dit_forwards`
+  // is three times that when it is and equal to it when it is not. Both are
+  // asserted EXACTLY and on TWO step counts, so neither an off-by-one nor a
+  // constant factor can satisfy both.
+  INFO("hq3: evaluations = " << hq3.dit_evaluations << " forwards = " << hq3.dit_forwards);
+  INFO("hq5: evaluations = " << hq5.dit_evaluations << " forwards = " << hq5.dit_forwards);
+  CHECK(hq3.dit_evaluations == 7);
+  CHECK(hq5.dit_evaluations == 11);
+  CHECK(hq3.dit_forwards == 21);
+  CHECK(hq5.dit_forwards == 33);
+  // The relation, derived rather than only read off the two numbers, so a change
+  // to one of the four constants above cannot be absorbed by changing another.
+  CHECK(hq3.dit_forwards == 3 * hq3.dit_evaluations);
+  CHECK(hq5.dit_forwards == 3 * hq5.dit_evaluations);
+  // AN UNGUIDED ARM IS EXACTLY `forwards == evaluations`, which is the mutation
+  // this case exists for. Stated as its own assertion rather than left implicit
+  // in the multiplier, because that is the sentence the RED has to print.
+  CHECK(hq3.dit_forwards != hq3.dit_evaluations);
+
+  // ...against the arm whose guidance this tree already gated. `one_stage`
+  // resolves cfg 3.0, stg 1.0 AND modality 3.0, so it runs all FOUR passes and
+  // the two arms differ in the pass SET as well as in the sampler. Read off a
+  // real render rather than computed from the HQ numbers.
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/g1s");
+  gen.steps = 3;
+  OneStageFixtureGuidance(&gen);
+  (void)engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace euler3 = ltx2->last_conditioning();
+  CHECK(euler3.dit_evaluations == 3);
+  CHECK(euler3.dit_forwards == 12);
+  CHECK(euler3.video_perturbed_forwards == 1);
+  // The HQ arm runs FEWER forwards per evaluation and MORE evaluations, so
+  // neither counter on its own separates the two arms and both are needed.
+  CHECK(hq3.dit_evaluations > euler3.dit_evaluations);
+  CHECK(hq3.dit_forwards > euler3.dit_forwards);
+}
+
+// ─── the SUBSTEP evaluation converts against the MIDPOINT it was handed ─────
+//
+// The res_2s second evaluation runs over `x_mid` (samplers.py:369-378), a state
+// that never becomes the stream's own latent. Everywhere else in `ltx2_video.cpp`
+// "the latent" and "the latent this evaluation was handed" are the same tensor,
+// which is what makes `ToDenoised(video.latent, ...)` an easy write here and an
+// invisible one: MEASURED, with that substitution in place this whole file
+// stayed GREEN at 74 cases and 2234 assertions. The clip, the evaluation count,
+// the forward count, the eval sigmas and the bong count are all blind to it, and
+// the loop's own arithmetic is gated with a FIXTURE denoiser that never performs
+// this conversion at all.
+TEST_CASE("ltx2 video: the res_2s SUBSTEP converts x0 against the midpoint, not the state") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/sub");
+  gen.steps = 3;
+  (void)engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx2->last_conditioning();
+
+  // The substep ran at all, and it ran on the res_2s arm.
+  REQUIRE(t.res2s_substep_latent.size() == t.video_first_latent.size());
+  REQUIRE(!t.res2s_substep_latent.empty());
+  REQUIRE(t.res2s_substep_cond.size() == t.res2s_substep_latent.size());
+  REQUIRE(t.res2s_substep_cond_velocity.size() == t.res2s_substep_latent.size());
+  // ONE TIMESTEP PER TOKEN, not per element: `timesteps_from_mask` is per token
+  // and `to_denoised` broadcasts it across the token's whole row. A conditioned
+  // token sits at timestep 0, which is why the scalar sigma cannot stand in.
+  const size_t tokens = t.res2s_substep_timesteps.size();
+  REQUIRE(tokens > 0);
+  REQUIRE(t.res2s_substep_latent.size() % tokens == 0);
+  const size_t width = t.res2s_substep_latent.size() / tokens;
+
+  // NON-VACUITY, twice, because both zeros make the assertion below trivially
+  // true. The midpoint MOVED — `x_mid = x_anchor + h * a21 * eps_1`
+  // (samplers.py:322) is not the anchor — so a build that evaluated the substep
+  // over the unmoved state would satisfy the invariant against either tensor and
+  // this case would prove nothing.
+  const auto abs_max = [](const std::vector<float>& v) {
+    double m = 0.0;
+    for (const float x : v) m = std::max(m, std::abs(static_cast<double>(x)));
+    return m;
+  };
+  const auto abs_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    double m = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      m = std::max(m, std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    }
+    return m;
+  };
+  const double moved = abs_diff(t.res2s_substep_latent, t.video_first_latent);
+  INFO("midpoint moved by " << moved);
+  REQUIRE(moved > 1e-6);
+  REQUIRE(abs_max(t.res2s_substep_cond_velocity) > 1e-6);
+  // ...and the substep sigma is the geometric mean, not the step's own
+  // (samplers.py:314-315), so this really is the second evaluation.
+  CHECK(t.res2s_substep_sigma < t.video_first_sigma);
+  CHECK(t.res2s_substep_sigma > 0.0);
+
+  // THE INVARIANT: `x0 == latent - timesteps * velocity` (model.py:590-604),
+  // over the latent THIS evaluation was handed. An equation between four
+  // recorded vectors, not a magnitude, so no fixture scale satisfies it by
+  // accident. With the conversion reading `video.latent` the residual is
+  // exactly `video_first_latent - res2s_substep_latent`, whose max is the
+  // `moved` printed above.
+  double worst = 0.0;
+  for (size_t token = 0; token < tokens; ++token) {
+    const double sigma = static_cast<double>(t.res2s_substep_timesteps[token]);
+    for (size_t w = 0; w < width; ++w) {
+      const size_t i = token * width + w;
+      const double want = static_cast<double>(t.res2s_substep_latent[i]) -
+                          sigma * static_cast<double>(t.res2s_substep_cond_velocity[i]);
+      worst = std::max(worst, std::abs(static_cast<double>(t.res2s_substep_cond[i]) - want));
+    }
+  }
+  INFO("substep |x0 - (latent - t*v)| = " << worst << " against a midpoint that moved " << moved);
+  CHECK(worst < 1e-5);
+  // And the residual is orders of magnitude below the displacement it would be
+  // if the wrong latent had been used, so the tolerance above cannot be
+  // absorbing the defect.
+  CHECK(worst < 0.01 * moved);
+}
+
 // ─── row LTX25-GUIDED-VIDEO (#1092): the guided VIDEO denoiser ──────────────
 //
 // The video denoise loop ran ONE unguided forward per step and applied

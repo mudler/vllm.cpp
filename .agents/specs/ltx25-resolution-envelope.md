@@ -513,6 +513,12 @@ takes a different path entirely.
   on the Euler loop would render a plausible clip that is quietly not HQ at
   roughly half the model evaluations the preset was tuned for. No HQ recipe row
   is added by this row, so nothing can select it and nothing lands dead.
+  **TAKEN by row `LTX25-RES2S-LOOP`, spec
+  [`ltx25-res2s-loop.md`](ltx25-res2s-loop.md).** The entry stays here rather
+  than being deleted, because this file is where the issue's owner was recorded
+  and the pointer is the provenance; that spec's own `## Owed` carries what
+  remains of it, which is a real-checkpoint render and the `legacy_mode=False`
+  arm.
 - `TI2VidTwoStagesPipeline` as a recipe row — stage 1 on the scheduler-derived
   schedule under full CFG, stage 2 on `STAGE_2_DISTILLED_SIGMAS` with guidance
   off (`ti2vid_two_stages.py:243-308`). Distinct from the distilled two-stage

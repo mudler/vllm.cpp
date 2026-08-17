@@ -22379,3 +22379,129 @@ oracle that never produced a file.
 **No parity number is claimed and the token gate is still unclaimed.**
 `our-ON == our-OFF` remains FALSE and unattributed. Owed detail lives under
 `## Owed` in [`mtp-k-gt-1.md`](specs/mtp-k-gt-1.md).
+## MUSIC3-DIT-DEVICE — the 2.4B fp32 DiT on `thor:gpu0`, per-forward A/B against the host reference (2026-08-17, `row/MUSIC3-DIT-DEVICE`, #672)
+
+**Not a parity ratio.** There is no reference leg: SGLang-Omni is `gateable = no`
+and serves the native layout, so this is an INTERNAL two-arm number about our own
+host reference vs our own device arm. Every axis in `docs/BENCHMARKS.md` against
+the reference stays `PENDING`.
+
+### Device, named because a number without one is meaningless here
+
+**`thor:gpu0` — NVIDIA Thor, sm_110, aarch64, 14 cores, ~122 GB UNIFIED, driver
+595.78.** Nothing below is compared to a `dgx:gpu0` (GB10) or `orin:gpu0` number;
+the three boxes are different machines. Image `vllmcpp-thor:cuda13.0.1`, nvcc
+13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF -DVLLM_CPP_SERVER=ON`, no cutlass. Checkpoint mounted
+read-only from the NAS. Same binary, same weights, same committed inputs on both
+arms; the arms never overlapped.
+
+**Lease discipline, recorded because it was imperfect.** The CUDA build, the
+two-arm correctness series and the first timing runs were driven over `ssh` under
+`flock $HOME/gpu.lock`, which is what this row's brief specified and which the
+`rc` lease system has since superseded — during that window the fleet reported
+`thor:gpu0` as FREE while it was in use. The device-arm timing series that the
+speed claim rests on was run under a real `rc hold` on `thor:gpu0`
+(`a91d21dc`, taken 10:32Z, released 10:54Z on completion). The hold carried no
+`--reason` string and a 75 m TTL for ~22 m of work; both are recorded as errors,
+and single commands should go through `rc run --max-runtime` instead.
+
+### What is timed
+
+`VLLM_CPP_MUSIC3_DIT_REPEAT=R` runs the guided velocity R times per timestep in
+`tests/parity/test_minimax_music3_acoustic_real.cpp`. The timer brackets ONLY
+that loop: the 9.7 GB checkpoint load and the weight staging are outside it, and
+staging is timed separately. NOTE, corrected in fresh review: the golden reads
+(4x `LoadF32Npy`, 2x `Compare`, 2x `ReportInto`) are INSIDE the bracket
+(`test_minimax_music3_acoustic_real.cpp:592-606`), which inflates the intercept
+and makes the reported per-forward number conservative, not inflated. One guided velocity is TWO
+DiT forwards (the conditional and the unconditional CFG branch).
+
+| arm | repeats | forwards | loop | per forward | staging | box load |
+|---|---|---|---|---|---|---|
+| CPU (`VLLM_CPP_MUSIC3_DEVICE=0`) | 1 | 4 | 819.818584 s | **204.954646 s** | 0 (no-op) | 3.42 |
+| CPU (`=0`) | 1 | 4 | 819.992 s | **204.998 s** | 0 (no-op) | 10.37 |
+| CUDA (`=1`) | 1 | 4 | 0.749077 s | **0.187269 s** | 0.603561 s | 4.79 |
+| CUDA (`=1`) | 3 | 12 | 2.110301 s | **0.175858 s** | 0.660600 s | 5.32 |
+| CUDA (`=1`) | 1 | 4 | 0.743367 s | **0.185842 s** | 0.609463 s | 5.1 |
+| CUDA (`=1`) | 1 | 4 | 0.743881 s | **0.185970 s** | 0.612787 s | 4.44 |
+
+Two-point fit over the device arm's 4- and 12-forward runs:
+
+    slope = 0.170607 s per forward        intercept = 0.063012 s
+
+**Per DiT forward at the capture's geometry (latent length 86, sequence 87):
+204.955 s host vs 0.1706-0.1873 s device — 1102x on the matched R=1 pair, 1201x
+on the fitted slope.** The device R=1 point was taken THREE times across two
+sessions, bracketing R=3, at 0.749077 / 0.743367 / 0.743881 s: a 0.77 % spread.
+
+**The contention asymmetry was measured away, not argued away.** The first CPU
+point sat at box load 10.37 against the device arm's 4.4-5.3, which would have
+inflated the ratio if it mattered. Re-taken on an idle box (load 3.42) with the
+fixed instrument it reads **204.954646 s against 204.998 s — 0.021 %**. The host
+DiT forward is single-threaded on a 14-core box, so a load of 10 still leaves it
+a core. Both points are in the table rather than the convenient one.
+
+### The weights are staged ONCE, as a measurement
+
+One staging costs 0.60-0.66 s. The entire FOUR-forward loop costs 0.745 s and the
+TWELVE-forward loop 2.110 s; twelve stagings would be 7.35 s by themselves. The
+loop's fitted intercept is 0.063 s, a tenth of a single staging. A per-forward
+or per-window upload is excluded arithmetically, not by reading the code.
+
+### The whole-process ratios — lower, and the honest ceiling on what a user sees
+
+Same gate binary end to end, including the identical 9.7 GB NAS load on both
+arms: 1054-1071 s (CPU) vs 238-298 s (CUDA), **3.5-4.5x** — the spread is NAS
+cache state, not compute. The earlier full two-arm
+correctness series, identical scripts throughout: 49 min 17 s vs 15 min 49 s,
+**3.12x**. Load averages across the series 4.0-5.1, box otherwise idle apart from
+`k3s`; `uptime` recorded on both sides of every run and the host never rebooted.
+
+The distance between 1100x on the DiT and 4x on the process IS the owed list: the
+checkpoint load, the DAC vocoder and the RVQ depth decoder are unchanged and now
+dominate.
+
+### Extrapolation, labelled as one
+
+The only geometry measured is the capture's single 86-frame window. Applying the
+fit to the 660 forwards a 45 s clip runs at the shipped defaults (30 steps x 2 CFG
+x 11 windows) gives **~37.6 h of DiT on the host against ~113 s on the device**,
+with the one-time staging 0.53 % of the device total. That is an extrapolation
+from one window geometry and is not a measured clip-level result.
+
+**No end-to-end song pair is offered, and that is a limit rather than an
+omission.** At 30 steps the host arm's DiT alone is ~37.6 h, so an e2e pair is
+not runnable on the CPU arm at a realistic setting; at a setting short enough to
+run, the DiT is a small enough share that the pair would be measuring the
+vocoder.
+
+### Correctness taken in the same series, at bounds that did not move
+
+Full scale, the real 2.4B fp32 checkpoint against the committed oracle capture,
+11 008 values per step, `kDitRelTol` 1e-4 / `kDitAbsFloor` 5e-5 /
+`kDitMeanAbsTol` 5e-6 — all unchanged:
+
+| arm | step | bit-identical | mean\|d\| | max\|d\| | outside |
+|---|---|---|---|---|---|
+| Thor CPU | first | 423 (3.843 %) | 1.71434e-06 | 2.38419e-05 | 0 |
+| Thor CPU | last | 235 (2.135 %) | 2.22396e-06 | 2.83718e-05 | 0 |
+| Thor CUDA | first | 473 (4.297 %) | 1.64344e-06 | 2.47955e-05 | 0 |
+| Thor CUDA | last | 222 (2.017 %) | 2.44677e-06 | 2.59876e-05 | 0 |
+| CONTROL torch-vs-torch | first | 15.416 % | 7.526e-07 | 7.153e-06 | — |
+| CONTROL torch-vs-torch | last | 5.596 % | 1.424e-06 | 1.335e-05 | — |
+
+The Thor CPU arm reproduces the x86-64 numbers already recorded for this gate
+VALUE FOR VALUE, so the CPU path is unchanged across two architectures.
+
+### Instrument defect found and fixed inside this series
+
+The first timing line printed `DIT_TIMING arm=1` on the CPU run: a `const char*`
+in a doctest `MESSAGE` chain takes the bool conversion. It is the SAME defect
+§11.5 recorded for this row's arm banner, reintroduced by a fresh `<<` chain.
+Both lines are now assembled as one `std::string`. EVERY number in the table was
+then re-taken with the fixed instrument, and the CPU arm's pre-fix point is kept
+beside its post-fix twin rather than replaced by it, because the pair is what
+proves the label defect never touched the values: 819.992 s against
+819.818584 s.
+

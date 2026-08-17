@@ -1988,11 +1988,16 @@ claimed. Ask for a short duration and few `num_inference_steps` while you are
 checking that it works.
 
 The part that dominates is *not* the one you would guess. The 8.6B language
-model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
-the DiT do not — they are scalar host loops with a double accumulator, written
-that way in W2-W5 so their reduction order is reproducible against torch, and
-they run single-threaded. In one 0.1 s request the depth decoder alone is the
-majority of the wall clock.
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder does
+not — it is a scalar host loop with a double accumulator, written that way in
+W2/W3 so its reduction order is reproducible against torch. In one 0.1 s request
+the depth decoder alone is the majority of the wall clock.
+
+At a *real* duration the DiT is the whole story instead, which is why it is the
+stage that moved first: a 45 s clip at the default 30 inference steps runs the
+DiT 660 times (30 steps x 2 CFG branches x 11 windows) for roughly 634 TFLOP
+against about 29 TFLOP for the entire autoregressive half. On the host loops
+that is measured in hours. `--speech-device 1` puts it on the accelerator.
 
 #### What runs on the device, and what does not
 
@@ -2005,20 +2010,34 @@ direction that matters.
 |---|---|
 | 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
 | guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
+| **2.4B fp32 flow-matching DiT** (every denoise step, both CFG branches) | **device**, weights staged ONCE |
 | 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
-| condition mix, 2.4B fp32 flow-matching DiT, scheduler | **host**, scalar loops |
+| condition mix (once per window), scheduler, CFG mix, Euler step | **host** |
 | DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
 
 The language model reaches the device because it is already routed through the
 shared `Qwen3DenseModel` forward that five text registrations ride — nothing was
 forked for it, and the only thing this option changes is which queue that
-forward is handed and where its KV cache is allocated. The other stages do not,
-for two different reasons, and both are owed rather than hidden:
+forward is handed and where its KV cache is allocated.
 
-* the depth decoder and the DiT are host `std::vector<float>` reference loops
-  under `-ffp-contract=off`, kept that way so their reduction order stays
-  reproducible against torch. Moving them means routing them through the shared
-  `vt` GEMM seam with device-resident weights, not adding a flag;
+The DiT reaches it the same way: through shared `vt` ops only
+(`MatmulBT`, `LayerNorm`, `AttentionCross`, `RopeFromCache`, `SiluAndMul`,
+`Add`), with **no new kernel**. Its 9.7 GB of fp32 weights are uploaded once per
+request, before the window loop, and the host copy is released as each tensor
+lands — a 45 s clip runs that forward 660 times, so a per-step or even
+per-window upload would cost more than the compute it enables. `fp32 stays
+fp32`: the acoustic half is float32 because upstream chose float32 for it, and
+this arm mirrors that rather than buying speed with a narrower dtype.
+
+The remaining stages do not move, for two different reasons, and both are owed
+rather than hidden:
+
+* the depth decoder and the condition mix are host `std::vector<float>`
+  reference loops under `-ffp-contract=off`, and they run at
+  `ArCompute::kBFloat16` — every op's *result* is rounded to bf16, which is what
+  upstream stores. Routing them through an f32 GEMM would silently drop that
+  rounding, so mirroring them needs bf16 storage, which is a dtype decision with
+  its own numeric evidence rather than a transcription;
 * the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
   1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
   are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
@@ -2026,10 +2045,16 @@ for two different reasons, and both are owed rather than hidden:
   this stage would need, so it is named here rather than hand-rolled outside the
   seam.
 
-Because the host stages are unchanged, the CPU arm is **bit-identical** to the
-one every Music3 correctness gate was taken on, and the device arm's output
-differs from it exactly where the language model's own arithmetic differs — one
-stage, not five.
+Because the host stages are unchanged — and because `--speech-device 0` takes
+the same `DitForward` it always did, source byte for source byte — the CPU arm
+is **bit-identical** to the one every Music3 correctness gate was taken on. The
+device arm's output differs from it exactly where the language model's and the
+DiT's own arithmetic differ: two stages, not six, and neither difference is a
+shape or an ordering defect. The DiT's device forward is gated against the same
+upstream goldens at the same tolerance as the host one; nothing was widened for
+it, and `VLLM_CPP_MUSIC3_DEVICE=1` runs that comparison on either arm
+(`tests/parity/test_minimax_music3_acoustic_real.cpp`, with
+`VLLM_CPP_MUSIC3_DIT=1`).
 
 **The two arms do not produce the same song, and that is structural.** The
 autoregressive stage has no greedy path upstream: it ends every draw in a seeded
@@ -2676,8 +2701,8 @@ or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its ow
 knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
-`t2a_one_stage`), `model_version` (only for a checkpoint that
+(default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
+`dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
 `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
 negative half of the same fallback, for the unconditional forward),
@@ -3168,13 +3193,14 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Fifteen** pairs
-resolve, derived from `ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:1288-1333`):
+schedule or guidance scale renders a video instead of failing. **Sixteen** pairs
+resolve, derived from `ResolveLtx2PipelineRecipe`:
 
 | `pipeline_kind` | resolving `model_version` |
 |---|---|
 | `one_stage` | 2, 2.3, 2.4, 2.5 |
 | `distilled_two_stage` | 2, 2.5 |
+| `res2s_two_stage` | **2.5 only** |
 | `dfr` | **2.5 only** |
 | `dmd2` | 2, 2.3 |
 | `retake` | 2, 2.5 |
@@ -3185,8 +3211,54 @@ This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 DFR's base stage rests on generated keyframe slots, which need a checkpoint
 declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
 that parameter — so resolving DFR onto it would build a recipe the engine must
-then refuse at load. Refusing at the recipe table names the version instead
-(`ltx2_pipeline.cpp:1306-1313`).
+then refuse at load. Refusing at the recipe table names the version instead.
+
+### `res2s_two_stage`: the high-quality preset, and why it is a sampler
+
+`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. Against the plain two-stage
+pipeline it changes the SAMPLER on both stages — the `res_2s` second-order
+method instead of Euler — and takes `LTX_2_3_HQ_PARAMS`: 15 steps, STG off,
+video rescale 0.45, cfg 3.0 video / 7.0 audio, modality 3.0. Those are not the
+only differences (stage 1 also loads the distilled LoRA, derives its schedule
+from the stage-1 latent shape, and runs a `GuidedDenoiser` where the plain
+pipeline runs a `FactoryGuidedDenoiser`), so do not read the sampler swap as an
+exhaustive list. It resolves at 2.5 only, because that preset is a plain
+constant upstream with no per-generation lineage to spread it over.
+
+Fifteen steps is not fewer forwards, and it is not even 15 model calls. The
+`res_2s` loop evaluates the denoiser TWICE per step — once at the step's sigma
+and once at the geometric mean of that sigma and the next — and once more at a
+terminal sigma the schedule injects. Stage 1's 15 steps is therefore 31 denoiser
+calls, and stage 2's frozen 3-step schedule adds 7, for **38 calls per render**.
+Stage 1 is also GUIDED, so each of its calls is three transformer forwards
+(conditional, unconditional, isolated-modality) against stage 2's one: **100
+transformer forwards** for a full render, where `one_stage` at its own 30-step
+default runs 30 calls. Expect the HQ preset to cost several times the 30-step
+arm and to look better, not to be faster.
+
+That is also why the preset cannot be reached by passing its numbers to another
+kind. `--steps 15` on `one_stage` renders a finished, correctly sized, plausible
+clip at a fraction of the model evaluations the preset was tuned for, and no
+property of the output says so. Ask for the pipeline, not for its step count.
+
+```sh
+ltx2-gen --pipeline-kind res2s_two_stage \
+         --prompt "a cinematic shot of ..." \
+         --height 1088 --width 1920 --frames 121
+```
+
+`pipeline_kind` is a LOAD knob, so this reaches the C API and the server too: a
+server started with `--video-extra pipeline_kind=res2s_two_stage` renders every
+request on the HQ preset.
+
+Three limits, stated rather than left to be found. The stage-2 spatial upsample
+is the same one `distilled_two_stage` uses and carries the same refusal when the
+checkpoint has no latent upsampler. The loop's SDE noise is drawn from this
+port's own generator rather than upstream's seeded `torch.randn`, so a render is
+not bit-comparable with Lightricks' — the same limit the ancestral arm already
+ships with. And stage 1's guidance asks for an isolated-modality pass, which the
+device-resident forward cannot perturb, so this preset is host-only until that
+is closed; both are recorded in `.agents/specs/ltx25-res2s-loop.md`.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3496,8 +3568,12 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
-This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
-(those stay lab-only until a CUDA token-exact gate can land them).
+GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
+so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
+test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
+restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
+until a CUDA token-exact gate can land them).
 
 ## LTX-2.5 text conditioning
 

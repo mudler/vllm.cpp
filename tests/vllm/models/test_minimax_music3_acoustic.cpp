@@ -29,7 +29,9 @@
 // (AGENTS.md; spec §5).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -37,6 +39,9 @@
 
 #include "minimax_music3_acoustic_goldens.inc"
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
+#include "vllm/model_executor/models/minimax_music3_device.h"
+#include "vt/backend.h"
+#include "vt/device.h"
 
 namespace {
 
@@ -713,6 +718,239 @@ TEST_CASE("music3 acoustic: the DiT refuses every wrong-shaped input by name") {
   CHECK_THROWS_AS(m3::DitForward(latents, vllm_test::kMusic3DitLength, condition, 0.25, config,
                                  broken),
                   std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// The DEVICE-RESIDENT DiT (#672, spec §11.4)
+//
+// THE TOLERANCE, AND THE CONTROL THAT JUSTIFIES IT. Nothing below is a new
+// bound. `DitForwardDevice` is checked against the SAME upstream float32
+// goldens, through the SAME `ExpectClose`, at the SAME kRelTol/kAbsFloor as
+// `DitForward` — because the question that matters is not "do the two arms
+// agree with each other" (a shared-helper comparison proves consistency, not
+// correctness) but "is the device arm as close to UPSTREAM as the host arm is".
+//
+// Each case therefore reports BOTH distances to the golden, host and device, on
+// the identical input. The host arm's distance is the measured control: it was
+// accepted with these goldens when the bound was set, so a device arm whose
+// distance is at or below it is inside a spread that already exists rather than
+// inside one this row widened. No tolerance is relaxed here, and the two
+// mutation cases below prove the bound still discriminates.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Both arms, same inputs, both against upstream. Returns nothing; every number
+// is asserted or printed, and the CASE count is what the suite reports.
+void CheckDeviceDit(vt::Queue& q, const char* arm) {
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+  const size_t latent_count =
+      static_cast<size_t>(config.in_channels * vllm_test::kMusic3DitLength);
+  const size_t condition_count =
+      static_cast<size_t>(vllm_test::kMusic3DitLength * config.condition_dim);
+  const std::vector<float> latents = ToVector(vllm_test::kMusic3DitLatents, latent_count);
+  const std::vector<float> condition = ToVector(vllm_test::kMusic3DitCondition, condition_count);
+  const std::vector<float> zeros(condition_count, 0.0f);
+
+  // `release_host` FALSE here on purpose: this gate needs the host arm too, and
+  // the serving path is the caller that passes true.
+  m3::DitWeights host = DitWeights();
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(q, config, host, /*release_host=*/false);
+  REQUIRE(staged.layers.size() == static_cast<size_t>(config.num_layers));
+
+  const std::vector<float> dev_cond = m3::DitForwardDevice(
+      q, latents, vllm_test::kMusic3DitLength, condition, vllm_test::kMusic3DitTimestep, config,
+      staged);
+  const std::vector<float> host_cond =
+      m3::DitForward(latents, vllm_test::kMusic3DitLength, condition,
+                     vllm_test::kMusic3DitTimestep, config, host);
+  const double dev_worst =
+      ExpectClose(dev_cond, vllm_test::kMusic3DitOut, latent_count,
+                  (std::string(arm) + " dit conditional (device)").c_str());
+  const double host_worst =
+      ExpectClose(host_cond, vllm_test::kMusic3DitOut, latent_count,
+                  (std::string(arm) + " dit conditional (host control)").c_str());
+  MESSAGE(std::string(arm) << " dit conditional: " << latent_count
+                           << " values; worst |device-upstream| = " << dev_worst
+                           << ", worst |host-upstream| = " << host_worst
+                           << " (bound " << kRelTol << " rel / " << kAbsFloor << " abs)");
+
+  const std::vector<float> dev_uncond =
+      m3::DitForwardDevice(q, latents, vllm_test::kMusic3DitLength, zeros,
+                           vllm_test::kMusic3DitTimestep, config, staged);
+  const double dev_worst_u =
+      ExpectClose(dev_uncond, vllm_test::kMusic3DitOutUncond, latent_count,
+                  (std::string(arm) + " dit unconditional (device)").c_str());
+  MESSAGE(std::string(arm) << " dit unconditional: " << latent_count
+                           << " values; worst |device-upstream| = " << dev_worst_u);
+
+  // The two branches must be DIFFERENT tensors on the device arm too: a forward
+  // that dropped its condition would match the conditional golden and this one
+  // identically, and both ExpectClose calls above would still be green.
+  size_t differing = 0;
+  for (size_t i = 0; i < latent_count; ++i) {
+    if (dev_cond[i] != dev_uncond[i]) ++differing;
+  }
+  MESSAGE(std::string(arm) << " dit branches: " << differing << " of " << latent_count
+                           << " values differ between conditional and unconditional");
+  CHECK(differing == latent_count);
+}
+
+}  // namespace
+
+TEST_CASE("music3 acoustic: the DEVICE-resident DiT matches upstream (CPU backend)") {
+  vt::Queue q{vt::Device{}, nullptr};
+  CheckDeviceDit(q, "cpu-backend");
+}
+
+TEST_CASE("music3 acoustic: the DEVICE-resident DiT matches upstream on CUDA") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered (this is a CPU-only build)");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  CheckDeviceDit(q, "cuda");
+}
+
+TEST_CASE("music3 acoustic: the ff_in HALF SWAP is load-bearing, and the gate sees it") {
+  // The device arm computes `value * silu(gate)` by handing vt::SiluAndMul — which
+  // computes `silu(first) * second` — a projection whose two ROW BLOCKS were
+  // exchanged at stage time. That exchange is an identity ONLY if it is applied
+  // exactly once. Pre-swapping the host weights makes the stage-time swap undo
+  // the test's, so the forward computes `silu(value) * gate` instead: the wrong
+  // network, same shapes, same finiteness.
+  //
+  // This is the mutation that proves the bound above discriminates. If the
+  // forward were routing `silu`/`mul` the other way round the RIGHT case would
+  // fail and this one would pass, so the pair pins the direction rather than
+  // just the magnitude.
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+  const size_t latent_count =
+      static_cast<size_t>(config.in_channels * vllm_test::kMusic3DitLength);
+  const std::vector<float> latents = ToVector(vllm_test::kMusic3DitLatents, latent_count);
+  const std::vector<float> condition = ToVector(
+      vllm_test::kMusic3DitCondition,
+      static_cast<size_t>(vllm_test::kMusic3DitLength * config.condition_dim));
+
+  m3::DitWeights mutated = DitWeights();
+  const size_t ff = static_cast<size_t>(config.ff_inner_dim);
+  const size_t inner = static_cast<size_t>(config.inner_dim());
+  for (m3::DitLayerWeights& layer : mutated.layers) {
+    std::vector<float> w(layer.ff_in_weight.size());
+    std::copy(layer.ff_in_weight.begin() + static_cast<ptrdiff_t>(ff * inner),
+              layer.ff_in_weight.end(), w.begin());
+    std::copy(layer.ff_in_weight.begin(),
+              layer.ff_in_weight.begin() + static_cast<ptrdiff_t>(ff * inner),
+              w.begin() + static_cast<ptrdiff_t>(ff * inner));
+    layer.ff_in_weight = w;
+    std::vector<float> b(layer.ff_in_bias.size());
+    std::copy(layer.ff_in_bias.begin() + static_cast<ptrdiff_t>(ff), layer.ff_in_bias.end(),
+              b.begin());
+    std::copy(layer.ff_in_bias.begin(), layer.ff_in_bias.begin() + static_cast<ptrdiff_t>(ff),
+              b.begin() + static_cast<ptrdiff_t>(ff));
+    layer.ff_in_bias = b;
+  }
+
+  vt::Queue q{vt::Device{}, nullptr};
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(q, config, mutated, /*release_host=*/false);
+  const std::vector<float> out = m3::DitForwardDevice(
+      q, latents, vllm_test::kMusic3DitLength, condition, vllm_test::kMusic3DitTimestep, config,
+      staged);
+
+  size_t outside = 0;
+  double worst = 0.0;
+  for (size_t i = 0; i < latent_count; ++i) {
+    const double a = out[i], b = vllm_test::kMusic3DitOut[i];
+    const double bound = std::max(kAbsFloor, kRelTol * std::max(std::abs(a), std::abs(b)));
+    if (!(std::abs(a - b) <= bound)) ++outside;
+    worst = std::max(worst, std::abs(a - b));
+  }
+  MESSAGE("half-swap mutation: " << outside << " of " << latent_count
+                                 << " values outside the bound, worst |diff| = " << worst);
+  // A defect that moves values by O(1) must move essentially all of them. This
+  // is the negative control for every ExpectClose above.
+  CHECK(outside > latent_count / 2);
+}
+
+TEST_CASE("music3 acoustic: the DEVICE DiT refuses every wrong-shaped input by name") {
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+  const size_t latent_count =
+      static_cast<size_t>(config.in_channels * vllm_test::kMusic3DitLength);
+  const std::vector<float> latents = ToVector(vllm_test::kMusic3DitLatents, latent_count);
+  const std::vector<float> condition = ToVector(
+      vllm_test::kMusic3DitCondition,
+      static_cast<size_t>(vllm_test::kMusic3DitLength * config.condition_dim));
+  vt::Queue q{vt::Device{}, nullptr};
+
+  m3::DitWeights host = DitWeights();
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(q, config, host, /*release_host=*/false);
+  CHECK_THROWS_AS(m3::DitForwardDevice(q, {1.0f}, vllm_test::kMusic3DitLength, condition, 0.25,
+                                       config, staged),
+                  std::runtime_error);
+  CHECK_THROWS_AS(m3::DitForwardDevice(q, latents, vllm_test::kMusic3DitLength, {1.0f}, 0.25,
+                                       config, staged),
+                  std::runtime_error);
+  CHECK_THROWS_AS(m3::DitForwardDevice(q, latents, 0, condition, 0.25, config, staged),
+                  std::runtime_error);
+
+  // A mis-sized weight is refused at STAGE time — before 9.7 GB moves at real
+  // dimensions — rather than 36 layers into the first of 660 forwards.
+  m3::DitWeights broken = DitWeights();
+  broken.layers.pop_back();
+  CHECK_THROWS_AS(m3::StageMusic3DitWeights(q, config, broken, /*release_host=*/false),
+                  std::runtime_error);
+  m3::DitWeights short_proj = DitWeights();
+  short_proj.proj_in_weight.pop_back();
+  CHECK_THROWS_AS(m3::StageMusic3DitWeights(q, config, short_proj, /*release_host=*/false),
+                  std::runtime_error);
+}
+
+TEST_CASE("music3 acoustic: release_host EMPTIES the source, and the staged copy still runs") {
+  // "Device-resident" has to mean the host copy is GONE, not that a second copy
+  // exists. On Jetson Thor the two pools are one pool: holding both is a real
+  // 19.4 GB peak on a box that reboots instead of OOM-killing.
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+  const size_t latent_count =
+      static_cast<size_t>(config.in_channels * vllm_test::kMusic3DitLength);
+  const std::vector<float> latents = ToVector(vllm_test::kMusic3DitLatents, latent_count);
+  const std::vector<float> condition = ToVector(
+      vllm_test::kMusic3DitCondition,
+      static_cast<size_t>(vllm_test::kMusic3DitLength * config.condition_dim));
+
+  vt::Queue q{vt::Device{}, nullptr};
+  m3::DitWeights host = DitWeights();
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(q, config, host, /*release_host=*/true);
+
+  size_t emptied = 0, total = 0;
+  for (const m3::DitLayerWeights& layer : host.layers) {
+    for (const std::vector<float>* v :
+         {&layer.to_q, &layer.to_k, &layer.to_v, &layer.to_out, &layer.ff_in_weight,
+          &layer.ff_out_weight}) {
+      ++total;
+      if (v->empty() && v->capacity() == 0) ++emptied;
+    }
+  }
+  MESSAGE("release_host: " << emptied << " of " << total
+                           << " per-layer host projections released (empty AND zero capacity)");
+  CHECK(emptied == total);
+  // The time embedder is the ONE thing deliberately kept — it runs on the host
+  // so that `temb` stays bit-identical to the CPU arm.
+  CHECK(staged.host_time_embed.time_embed_linear_2_weight.size() ==
+        static_cast<size_t>(config.inner_dim() * config.inner_dim()));
+
+  // And the staged copy is intact: a released host buffer that had been uploaded
+  // without a synchronize would read as garbage here rather than as the golden.
+  const std::vector<float> out = m3::DitForwardDevice(
+      q, latents, vllm_test::kMusic3DitLength, condition, vllm_test::kMusic3DitTimestep, config,
+      staged);
+  ExpectClose(out, vllm_test::kMusic3DitOut, latent_count, "dit after release_host");
 }
 
 // ---------------------------------------------------------------------------

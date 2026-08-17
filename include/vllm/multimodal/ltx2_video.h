@@ -746,6 +746,100 @@ struct Ltx2ConditioningTrace {
   uint64_t retake_latent_digest = 0;
   double retake_latent_absmax = 0.0;
 
+  // ── THE SAMPLER (row LTX25-RES2S-LOOP, #921) ──────────────────────────────
+  //
+  // TWO COUNTERS, BECAUSE THERE ARE TWO QUESTIONS AND ONE NUMBER CANNOT ANSWER
+  // BOTH. A render's DiT work is `evaluations x forwards-per-evaluation`. The
+  // sampler decides the first factor and the denoiser decides the second, and a
+  // build can get either wrong while producing a clip of the same shape, frame
+  // count, sample rate and file size.
+  //
+  // `dit_evaluations` is every DENOISER CALL this render made, across every
+  // phase and every step, and it is the only thing that separates the res_2s
+  // sampler from the first-order one. The two samplers differ in that one calls
+  // the denoiser TWICE per step (samplers.py:301 and :380-386) plus once at the
+  // terminal sigma (:437). Serving the HQ preset's 15 steps on the Euler loop
+  // would make 15 calls where upstream makes 31, and no output check in this
+  // tree could tell.
+  //
+  // The count is `2 * steps + 1` per res_2s phase when that phase's schedule
+  // ends at 0 and `2 * steps` when it does not, against `steps` for the Euler
+  // and ancestral arms — so a build that selected the wrong sampler reports a
+  // number that is close to half, not a number that is wrong by one.
+  //
+  // Incremented at ONE site, inside the shared `Evaluate` lambda that every
+  // sampler goes through, so no arm can make a call this misses. A second
+  // increment beside the res_2s loop's own returned `evaluations` would let the
+  // two drift; the engine asserts they agree instead.
+  int64_t dit_evaluations = 0;
+  // `dit_forwards` is every ACTUAL `Ltx2DitForward` this render ran, counted
+  // inside the `Ltx2X0Model` lambda the guided denoiser drives. One evaluation
+  // is one to four forwards — `cond`, `uncond`, `ptb`, `mod`
+  // (denoisers.py:100-137) — so this is the factor `dit_evaluations` cannot see.
+  //
+  // IT EXISTS BECAUSE THE EVALUATION COUNT IS BLIND TO GUIDANCE. Upstream's HQ
+  // stage 1 runs a `GuidedDenoiser` at cfg 3.0 / 7.0 with modality 3.0
+  // (ti2vid_two_stages_hq.py:271-281, constants.py:99-114), which is three
+  // forwards per evaluation. An arm that ran the res_2s sampler around a bare
+  // unguided forward keeps `dit_evaluations` at exactly `2 * steps + 1`, renders
+  // a plausible clip at cfg 1.0 where the preset was tuned at 3.0, and moves no
+  // other number in this struct. This one drops from `3 * (2 * steps + 1)` to
+  // `2 * steps + 1`, which is why it is asserted rather than described.
+  int64_t dit_forwards = 0;
+  // Steps on which the bong anchor refinement ran, i.e. on which
+  // `bongmath and h < 0.5 and sigma > 0.03` held (samplers.py:357). Zero on
+  // every non-res_2s pipeline. It is reported separately from the evaluation
+  // count because the refinement changes the latent WITHOUT changing how many
+  // forwards ran, so the counter above is blind to it.
+  int64_t res2s_bong_steps = 0;
+  // The largest deviation from a standardized draw across every noise tensor the
+  // res_2s loop was handed: `max(|mean|, |sd - 1|)` over each draw, maximum over
+  // all of them. Zero on every non-res_2s pipeline.
+  //
+  // IT EXISTS BECAUSE THE WIRING IS INVISIBLE OTHERWISE. `_get_new_noise`
+  // normalizes (samplers.py:164-170) and `_get_plain_noise` does not
+  // (:155-157); the res_2s loop takes the first and the ancestral loop takes
+  // the second, ten lines apart in one file. `Ltx2Res2sNormalizeNoise` is gated
+  // as a FUNCTION by `test_ltx2_pipeline`, but whether the engine's hook calls
+  // it is a different claim, and nothing about a rendered clip, a token count or
+  // an evaluation count can answer it. MEASURED: with the engine handing the
+  // loop its raw draw, the end-to-end suite stayed GREEN — mutation M10 in
+  // .agents/specs/ltx25-res2s-loop.md section 8 — which is why this field was
+  // added rather than the wiring being left as a claim.
+  //
+  // A NORMALIZED draw drives this to ~1e-15 by construction. A raw Gaussian
+  // draw cannot: its sample mean is O(1/sqrt(n)) and its sample deviation is
+  // O(1/sqrt(n)) away from 1, so on any latent this engine builds the two are
+  // orders of magnitude apart rather than close.
+  double res2s_noise_moment_error = 0.0;
+
+  // WHAT THE SECOND EVALUATION WAS HANDED, and what it returned for the
+  // conditional pass. Empty on every arm but `res2s_two_stage`, and written at
+  // phase 0's SECOND evaluation, which on that arm is the substep.
+  //
+  // IT EXISTS BECAUSE THE SUBSTEP'S x0 CONVERSION HAS NO OTHER OBSERVABLE. The
+  // res_2s substep runs over `x_mid` (samplers.py:369-378), a state that never
+  // becomes the stream's own latent, so `to_denoised` there must use the latent
+  // THAT EVALUATION was handed and not `video.latent`. Those are the same tensor
+  // everywhere else in this file, which is what makes the wrong one an easy
+  // write and an invisible one.
+  //
+  // MEASURED: with the conversion reading `video.latent`, the whole
+  // `test_ltx2_video` suite stayed GREEN at 74 cases and 2234 assertions. The
+  // loop's own arithmetic is gated against upstream with a FIXTURE denoiser, so
+  // that gate never sees the engine's conversion; the clip, the evaluation
+  // count, the eval sigmas and the bong count are all blind to it.
+  //
+  // The gate is the per-arm invariant `cond == latent - timesteps * velocity`
+  // over THESE tensors — an equation between four recorded vectors, not a
+  // magnitude — plus the non-vacuity that `res2s_substep_latent` differs from
+  // `video_first_latent`, which is what says the midpoint moved at all.
+  std::vector<float> res2s_substep_latent;
+  std::vector<float> res2s_substep_timesteps;
+  std::vector<float> res2s_substep_cond;
+  std::vector<float> res2s_substep_cond_velocity;
+  double res2s_substep_sigma = 0.0;
+
   // ── TEXT-TO-AUDIO: what the audio-only render actually ran (#1005) ────────
   //
   // Zero and false everywhere on a pipeline that is not `t2a_one_stage`.

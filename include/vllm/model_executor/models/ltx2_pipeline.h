@@ -210,6 +210,46 @@ std::vector<float> Ltx2Res2sStep(const float* sample, const float* denoised,
                                  const float* sigmas, int64_t sigma_count, int64_t step_index,
                                  int64_t count, const float* noise, double eta = 0.5);
 
+// ─── THE SAME STEP, AT THE PRECISION EACH CALL SITE ACTUALLY HANDS IT ────────
+//
+// `Res2sDiffusionStep.step` has no dtype of its own: it takes whatever its
+// tensors carry, and the res_2s loop hands it two DIFFERENT combinations. Both
+// are mirrored rather than unified onto one, because the difference is real
+// arithmetic and putting the conversion where upstream puts it is the rule.
+//
+//   SUBSTEP (samplers.py:337-352). `sigmas = torch.stack([sigma, sub_sigma])`,
+//   and both are `hp` (:291-292, :315). So `get_sde_coeff` runs in FLOAT64.
+//
+//   STEP (samplers.py:412-427). `sigmas` is the loop's own schedule, which
+//   `DiffusionStage` created as FLOAT32 (ti2vid_two_stages_hq.py:268). So
+//   `get_sde_coeff` runs in FLOAT32 — the residual `sqrt(sigma_next^2 -
+//   sigma_up^2)`, `alpha_ratio` and `sigma_down` are all f32 quantities — while
+//   the SAMPLE and the noise are still f64 and the result is f64.
+//
+// The values in both cases are f64, because `sample` is `x_anchor` (`hp`) and
+// `output_dtype = denoised_sample.dtype` is `hp` too (diffusion_steps.py:180).
+//
+// One implementation, instantiated at the two scalar types; there is no second
+// copy of the formula. The selection is an enum naming the two upstream call
+// sites rather than a bare bool, so a reader can check the claim.
+enum class Ltx2Res2sScheduleWidth {
+  // samplers.py:415, :425 — the loop's float32 schedule.
+  kF32Schedule,
+  // samplers.py:342, :350 — the [sigma, sub_sigma] pair, both float64.
+  kF64Schedule,
+};
+
+// `Res2sDiffusionStep.get_sde_coeff` computed in float64 rather than float32.
+// The f32 arm stays `Ltx2Res2sSdeCoeff` above and keeps its goldens.
+Ltx2SdeCoeff Ltx2Res2sSdeCoeffHp(double sigma_next, double sigma_up);
+
+// `Res2sDiffusionStep.step` over float64 samples. `width` decides only the
+// precision the SIGMAS and therefore the coefficients are computed at.
+std::vector<double> Ltx2Res2sStepHp(const double* sample, const double* denoised,
+                                    const double* sigmas, int64_t sigma_count,
+                                    int64_t step_index, int64_t count, const double* noise,
+                                    double eta, Ltx2Res2sScheduleWidth width);
+
 // _get_ancestral_step (diffusion_steps.py:7-22): the DDIM / variance-exploding
 // ancestral coefficients, in the rescaled `sigma / alpha` space. Used only by
 // CFG++.
@@ -518,7 +558,20 @@ bool Ltx2ShouldUseAncestralSampler(const std::string& version);
 // ltx2_recipes.py:38 — how a phase builds its input.
 enum class Ltx2PhaseInputTransform { kInitial, kSpatialUpsample };
 // Which stepper a phase samples with (distilled.py:170-185).
-enum class Ltx2StepperKind { kEuler, kEulerAncestral };
+//
+// `kRes2s` is not only a stepper: it selects a whole SAMPLER. Upstream keeps the
+// two choices separate — `DiffusionStage.__call__` takes `stepper` and `loop`
+// independently (utils/blocks.py:512-513) — but they are not independently
+// selectable in practice, because `res2s_audio_video_denoising_loop` REFUSES any
+// stepper that is not a `Res2sDiffusionStep` (samplers.py:276-277) and no other
+// loop constructs one. `TI2VidTwoStagesHQPipeline` passes both together, to both
+// stages (ti2vid_two_stages_hq.py:285/:292 and :319/:335). One enumerator
+// therefore carries both, and the alternative — a separate loop field whose only
+// legal combination is this one — would publish a selection surface upstream
+// does not have and three combinations that must then be refused.
+//
+// Row LTX25-RES2S-LOOP, issue #921. Spec .agents/specs/ltx25-res2s-loop.md.
+enum class Ltx2StepperKind { kEuler, kEulerAncestral, kRes2s };
 
 // LTXPhaseRecipe (ltx2_recipes.py:29-50).
 struct Ltx2PhaseRecipe {
@@ -624,6 +677,19 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //   ("one_stage",          "2.5")  Lightricks, via _PARAMS_SINCE_VERSION (:130-133)
 //   ("distilled_two_stage","2")    vLLM-Omni LTX2_DISTILLED_TWO_STAGE_RECIPE (:125-158)
 //   ("distilled_two_stage","2.5")  Lightricks distilled.py + constants.py:17-23
+//   ("res2s_two_stage",    "2.5")  Lightricks ti2vid_two_stages_hq.py:59-340 plus
+//                                  LTX_2_3_HQ_PARAMS (constants.py:95-115). Row
+//                                  LTX25-RES2S-LOOP, #921. The res_2s sampler on
+//                                  BOTH stages, 15 steps, STG off. 2.5 only, and
+//                                  not by analogy with the one_stage rows:
+//                                  `LTX_2_3_HQ_PARAMS` is a plain constant that
+//                                  overrides every generation-varying knob
+//                                  (constants.py:91-94 says so), so there is no
+//                                  `detect_params` lineage to spread it across
+//                                  versions. THE SAMPLER IS THE PRESET: this
+//                                  recipe on `kEuler` would render a finished,
+//                                  correctly sized, plausible clip at half the
+//                                  model evaluations 15 steps was tuned for
 //   ("dmd2",               "2")    vLLM-Omni LTX_POSITIVE_ONLY_RECIPE (:116-124)
 //   ("dmd2",               "2.3")  same
 //   ("dfr",                "2.5")  Lightricks dfr_pipeline.py:155-561 (row

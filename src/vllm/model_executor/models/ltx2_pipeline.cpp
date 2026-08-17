@@ -304,23 +304,32 @@ std::vector<float> Ltx2EulerAncestralStep(const float* sample, const float* deno
   return out;
 }
 
-Ltx2SdeCoeff Ltx2Res2sSdeCoeff(double sigma_next, double sigma_up) {
-  // diffusion_steps.py:136-155, the `sigma_up is not None` arm — the only one
-  // `Res2sDiffusionStep.step` reaches (:179).
-  const float next = static_cast<float>(sigma_next);
-  float up = static_cast<float>(sigma_up);
-  up = std::min(up, next * static_cast<float>(kLtx2Res2sSigmaUpClamp));
+namespace {
 
-  const float sigma_signal = 1.0f - next;  // `sigmax` defaults to ones_like
-  const float residual = std::sqrt(std::max(next * next - up * up, 0.0f));
-  float alpha_ratio = sigma_signal + residual;
-  float down = residual / alpha_ratio;
+// `Res2sDiffusionStep.get_sde_coeff` (diffusion_steps.py:136-155), the
+// `sigma_up is not None` arm — the only one `step` reaches (:179).
+//
+// TEMPLATED ON THE SIGMA TYPE, because upstream's has no dtype of its own and
+// the res_2s loop reaches it at TWO precisions: float64 from the substep's
+// `[sigma, sub_sigma]` pair (samplers.py:342) and float32 from the loop's own
+// schedule at step level (samplers.py:415). Instantiating one formula twice is
+// what keeps that from becoming a second copy.
+template <typename Sigma>
+Ltx2SdeCoeff Res2sSdeCoeffImpl(double sigma_next, double sigma_up) {
+  const Sigma next = static_cast<Sigma>(sigma_next);
+  Sigma up = static_cast<Sigma>(sigma_up);
+  up = std::min(up, next * static_cast<Sigma>(kLtx2Res2sSigmaUpClamp));
+
+  const Sigma sigma_signal = static_cast<Sigma>(1) - next;  // `sigmax` defaults to ones_like
+  const Sigma residual = std::sqrt(std::max(next * next - up * up, static_cast<Sigma>(0)));
+  Sigma alpha_ratio = sigma_signal + residual;
+  Sigma down = residual / alpha_ratio;
 
   // :149-153 — the NaN scrubbing, which is what keeps a degenerate schedule from
   // poisoning the whole latent.
-  if (std::isnan(up)) up = 0.0f;
+  if (std::isnan(up)) up = static_cast<Sigma>(0);
   if (std::isnan(down)) down = next;
-  if (std::isnan(alpha_ratio)) alpha_ratio = 1.0f;
+  if (std::isnan(alpha_ratio)) alpha_ratio = static_cast<Sigma>(1);
 
   Ltx2SdeCoeff coeff;
   coeff.alpha_ratio = alpha_ratio;
@@ -329,34 +338,83 @@ Ltx2SdeCoeff Ltx2Res2sSdeCoeff(double sigma_next, double sigma_up) {
   return coeff;
 }
 
-std::vector<float> Ltx2Res2sStep(const float* sample, const float* denoised,
-                                 const float* sigmas, int64_t sigma_count, int64_t step_index,
-                                 int64_t count, const float* noise, double eta) {
+// `Res2sDiffusionStep.step` (diffusion_steps.py:157-190). `Sigma` is the width
+// the SCHEDULE and therefore the coefficients are computed at; `Value` is the
+// width of the sample, the noise and the result. Upstream reaches three
+// combinations across this port's call sites and they are the three
+// instantiations below.
+template <typename Sigma, typename Value>
+std::vector<Value> Res2sStepImpl(const Value* sample, const Value* denoised,
+                                 const Sigma* sigmas, int64_t sigma_count, int64_t step_index,
+                                 int64_t count, const Value* noise, double eta) {
   RequireStepIndex(sigma_count, step_index);
-  const float sigma = sigmas[step_index];
-  const float sigma_next = sigmas[step_index + 1];
-  const Ltx2SdeCoeff coeff =
-      Ltx2Res2sSdeCoeff(sigma_next, static_cast<double>(sigma_next * static_cast<float>(eta)));
+  const Sigma sigma = sigmas[step_index];
+  const Sigma sigma_next = sigmas[step_index + 1];
+  const Ltx2SdeCoeff coeff = Res2sSdeCoeffImpl<Sigma>(
+      static_cast<double>(sigma_next),
+      static_cast<double>(sigma_next * static_cast<Sigma>(eta)));
 
   // :181-182 — returned UNCHANGED, not cast, when either is zero.
-  if (coeff.sigma_up == 0.0 || sigma_next == 0.0f) {
-    return std::vector<float>(denoised, denoised + count);
+  if (coeff.sigma_up == 0.0 || sigma_next == static_cast<Sigma>(0)) {
+    return std::vector<Value>(denoised, denoised + count);
   }
   Require(noise != nullptr, "ltx2 Res2s step: requires a noise tensor");
 
-  const float alpha_ratio = static_cast<float>(coeff.alpha_ratio);
-  const float sigma_down = static_cast<float>(coeff.sigma_down);
-  const float sigma_up = static_cast<float>(coeff.sigma_up);
-  const float denom = sigma - sigma_next;
+  const Sigma alpha_ratio = static_cast<Sigma>(coeff.alpha_ratio);
+  const Sigma sigma_down = static_cast<Sigma>(coeff.sigma_down);
+  const Sigma sigma_up = static_cast<Sigma>(coeff.sigma_up);
+  // The SUBTRACTION happens at the schedule's own width, which is what upstream
+  // does: `sigma - sigma_next` is a tensor op between two schedule entries
+  // before the f64 numerator ever divides by it (diffusion_steps.py:185).
+  const Sigma denom = sigma - sigma_next;
 
-  std::vector<float> out(static_cast<size_t>(count));
+  std::vector<Value> out(static_cast<size_t>(count));
   for (int64_t i = 0; i < count; ++i) {
     const size_t k = static_cast<size_t>(i);
-    const float eps_next = (sample[k] - denoised[k]) / denom;
-    const float denoised_next = sample[k] - sigma * eps_next;
-    out[k] = alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise[k];
+    const Value eps_next = (sample[k] - denoised[k]) / static_cast<Value>(denom);
+    const Value denoised_next = sample[k] - static_cast<Value>(sigma) * eps_next;
+    out[k] = static_cast<Value>(alpha_ratio) *
+                 (denoised_next + static_cast<Value>(sigma_down) * eps_next) +
+             static_cast<Value>(sigma_up) * noise[k];
   }
   return out;
+}
+
+}  // namespace
+
+Ltx2SdeCoeff Ltx2Res2sSdeCoeff(double sigma_next, double sigma_up) {
+  return Res2sSdeCoeffImpl<float>(sigma_next, sigma_up);
+}
+
+Ltx2SdeCoeff Ltx2Res2sSdeCoeffHp(double sigma_next, double sigma_up) {
+  return Res2sSdeCoeffImpl<double>(sigma_next, sigma_up);
+}
+
+std::vector<float> Ltx2Res2sStep(const float* sample, const float* denoised,
+                                 const float* sigmas, int64_t sigma_count, int64_t step_index,
+                                 int64_t count, const float* noise, double eta) {
+  return Res2sStepImpl<float, float>(sample, denoised, sigmas, sigma_count, step_index, count,
+                                     noise, eta);
+}
+
+std::vector<double> Ltx2Res2sStepHp(const double* sample, const double* denoised,
+                                    const double* sigmas, int64_t sigma_count,
+                                    int64_t step_index, int64_t count, const double* noise,
+                                    double eta, Ltx2Res2sScheduleWidth width) {
+  if (width == Ltx2Res2sScheduleWidth::kF64Schedule) {
+    return Res2sStepImpl<double, double>(sample, denoised, sigmas, sigma_count, step_index,
+                                         count, noise, eta);
+  }
+  // The step-level arm. The schedule really is float32 upstream, so it is
+  // narrowed HERE rather than at the call site: narrowing at the call site would
+  // put the conversion one frame away from the arithmetic it changes, and the
+  // next reader would have to reconstruct which of the two widths ran.
+  std::vector<float> narrowed(static_cast<size_t>(sigma_count));
+  for (int64_t i = 0; i < sigma_count; ++i) {
+    narrowed[static_cast<size_t>(i)] = static_cast<float>(sigmas[i]);
+  }
+  return Res2sStepImpl<float, double>(sample, denoised, narrowed.data(), sigma_count,
+                                      step_index, count, noise, eta);
 }
 
 Ltx2AncestralSigmas Ltx2AncestralStep(double sigma_from, double sigma_to, double eta) {
@@ -1283,6 +1341,134 @@ Ltx2PipelineRecipe RetakeRecipe(const std::string& version) {
   return recipe;
 }
 
+// `TI2VidTwoStagesHQPipeline` (ti2vid_two_stages_hq.py:59, `__call__` at :174).
+// Row LTX25-RES2S-LOOP, issue #921.
+//
+// ─── WHAT MAKES IT HQ, VERIFIED RATHER THAN INHERITED ────────────────────────
+// Two of the differences from `TI2VidTwoStagesPipeline` are the SAMPLER:
+// `stepper=Res2sDiffusionStep()` (:258) and
+// `loop=res2s_audio_video_denoising_loop` passed to BOTH stages (:292, :335).
+// A third is `LTX_2_3_HQ_PARAMS` (utils/constants.py:95-115). THEY ARE NOT THE
+// ONLY THREE, and this comment said they were until 2026-08-17. Diffing the two
+// files at `fd4ded7f` also shows: stage 1 loads the distilled LoRA at
+// `distilled_lora_strength_stage_1` (:92-101, :151-154) where the plain
+// pipeline loads none on that stage; stage 1's schedule is derived as
+// `execute(latent=empty_latent, steps=...)` (:260-267) against the plain
+// pipeline's `execute(steps=...)`, which `schedulers.py:32` turns into a
+// resolution-dependent shift instead of the 4096-token default; and
+// `GuidedDenoiser` (:271-281) replaces `FactoryGuidedDenoiser`.
+//
+// Two of those four are ALREADY what this recipe does and one is out of scope.
+// The schedule: this engine always derives from `target_tokens`
+// (`ltx2_video.cpp`'s `Ltx2SigmaSchedule` call), which is the latent-aware form,
+// so stage 1 coincides with upstream here — the divergence, if any, is on the
+// PLAIN two-stage arm and is not this recipe's to move. The denoiser: stage 1's
+// `video_guidance` below reaches `Ltx2GuidedDenoise`, which is
+// `_guided_denoise` — the one function `GuidedDenoiser` and
+// `FactoryGuidedDenoiser` share (utils/denoisers.py:61-211) — so the difference
+// between the two upstream classes is WHERE the params come from and not what
+// runs. The distilled LoRA per stage is out of scope for every LTX row here and
+// is named in the row's spec section 2 rather than silently absent.
+//
+// So this recipe is NOT the distilled two-stage one with different numbers. The
+// res_2s loop evaluates the transformer TWICE per step, which is the whole
+// reason the preset can afford 15 steps against the 2.4 lineage's 30. A recipe
+// that carried these guidance scales and this step count on `kEuler` would
+// render a finished, plausible, correctly-sized clip at half the model
+// evaluations it was tuned for, and no output check could tell.
+//
+// ─── 2.5 ONLY, AND NOT BY ANALOGY WITH THE ONE-STAGE ROWS ────────────────────
+// `LTX_2_3_HQ_PARAMS` is a plain constant, not a `replace` of a neighbour, and
+// upstream says why in its own comment (constants.py:91-94): "it overrides every
+// knob that varies between generations, so there is nothing for it to inherit
+// from a detected checkpoint". There is therefore no `detect_params` lineage to
+// spread this across versions the way `one_stage` and `t2a_one_stage` are
+// spread, and the one generation-dependent value it does NOT carry —
+// `default_image_crf` — is resolved from the checkpoint by the pipeline's own
+// `ImageConditioner` (the same comment), which is `Ltx2DetectPipelineParams`
+// here.
+Ltx2PipelineRecipe Res2sTwoStageRecipe(const std::string& version) {
+  Ltx2PipelineRecipe recipe;
+  const Ltx2PipelineParams params = Ltx2Params23Hq();
+
+  Ltx2PhaseRecipe stage1;
+  stage1.name = "generate_lowres_hq";
+  // :238-243 — `width // 2, height // 2`, the same halving the distilled
+  // two-stage arm applies.
+  stage1.spatial_downscale = 2;
+  // :260-267 — `stage_1_sigmas` defaults to None and is then built by
+  // `LTX2Scheduler().execute(latent, steps=num_inference_steps)`. So this phase
+  // has NO frozen schedule: it is derived, and 15 steps is what derives it. This
+  // is the one place this recipe differs in KIND from the distilled two-stage
+  // one, whose stage 1 carries `DISTILLED_SIGMAS` and cannot honour a step
+  // override.
+  stage1.noise_scale = 1.0;
+  // :271-281 — a `GuidedDenoiser` with a negative context and the HQ guider
+  // params, so guidance is live and a request may override it.
+  stage1.video_guidance = params.video_guider;
+  stage1.audio_guidance = params.audio_guider;
+  stage1.stepper = Ltx2StepperKind::kRes2s;
+
+  Ltx2PhaseRecipe stage2;
+  stage2.name = "refine_hq";
+  // :193 — `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS`, a DEFAULT
+  // ARGUMENT, so the schedule is frozen for this phase even though stage 1's is
+  // not.
+  stage2.sigmas = Stage2DistilledSigmas();
+  // :327, :332 — both modality specs re-noise to `stage_2_sigmas[0].item()`,
+  // which is what makes the upsampled latent valid at that noise level.
+  stage2.noise_scale = Stage2DistilledSigmas().front();
+  // :297 — `self.upsampler(video_state.latent[:1])`.
+  stage2.input_transform = Ltx2PhaseInputTransform::kSpatialUpsample;
+  // :316 — `SimpleDenoiser`, "single transformer call, no guidance"
+  // (utils/denoisers.py:215). Nothing a request sends can turn guidance back on.
+  stage2.allow_guidance_override = false;
+  stage2.use_official_sigma_schedule = false;
+  // :319/:335 — the SAME stepper and the SAME loop as stage 1. This is where the
+  // HQ pipeline parts company with the distilled two-stage one, whose stage 2 is
+  // always deterministic Euler because a 3-step refinement cannot remove freshly
+  // injected noise (distilled.py:206-209). That argument does not transfer: the
+  // HQ pipeline passes `stepper` and `loop` to `self.stage_2` explicitly, and
+  // "the schedule is short" is not a reason this port may substitute a different
+  // sampler than the one upstream hands it.
+  stage2.stepper = Ltx2StepperKind::kRes2s;
+
+  recipe.phases = {stage1, stage2};
+  // `assert_resolution(is_two_stage=True)` (:199), and the arguments describe
+  // the FINAL output — stage 1 runs at half of it.
+  recipe.height = params.stage_2_height();
+  recipe.width = params.stage_2_width();
+  recipe.num_frames = params.num_frames;
+  recipe.frame_rate = params.frame_rate;
+  // constants.py:96 — 15, against the 2.4 lineage's 30. Half the steps, and
+  // twice the evaluations per step.
+  recipe.num_inference_steps = params.num_inference_steps;
+  // NOT from the HQ params: constants.py:91-94 says `default_image_crf` is the
+  // one generation-dependent value this preset does not fix, and that the
+  // pipeline resolves it from the checkpoint instead.
+  recipe.default_image_crf = Ltx2DetectPipelineParams(version).default_image_crf;
+  // :210 — `self.prompt_encoder([prompt, negative_prompt], ...)`, and stage 1's
+  // guider consumes the negative encoding. Unlike the distilled arm, this
+  // pipeline HAS a negative prompt.
+  recipe.negative_prompt = LightricksNegativePrompt();
+  recipe.video_output_phase = 1;
+  // :313-314 — "Stage 2 refines video only; discard its audio", so the audio
+  // that leaves is STAGE 1's. `video_state, _ = self.stage_2(...)` at :315 is
+  // the discard, and `self.audio_decoder(audio_state.latent)` at :339 reads the
+  // name stage 1 bound. Writing 1 here would decode the audio the pipeline
+  // throws away — a soundtrack that is finite, the right length and the wrong
+  // take.
+  recipe.audio_output_phase = 0;
+  // Stage 1's schedule really is derived from `num_inference_steps`, so a
+  // request may set it. Stage 2's is frozen by its own default argument and is
+  // unaffected either way, exactly as upstream's two parameters are.
+  recipe.allow_request_sigmas = true;
+  recipe.allow_request_latents = true;
+  recipe.allow_negative_prompt = true;
+  recipe.fixed_num_inference_steps = false;
+  return recipe;
+}
+
 }  // namespace
 
 Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
@@ -1311,6 +1497,11 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
     // resolving DFR onto it would build a recipe whose first stage the engine
     // must then refuse at load. Refusing at the recipe table names the version.
     if (model_version == "2.5") return DfrRecipe(model_version);
+  } else if (pipeline_kind == "res2s_two_stage") {
+    // 2.5 only — see `Res2sTwoStageRecipe`: `LTX_2_3_HQ_PARAMS` is a plain
+    // constant with no `detect_params` lineage, so there is no second version to
+    // resolve it onto.
+    if (model_version == "2.5") return Res2sTwoStageRecipe(model_version);
   } else if (pipeline_kind == "dmd2") {
     if (model_version == "2" || model_version == "2.3") return PositiveOnlyRecipe();
   } else if (pipeline_kind == "retake") {

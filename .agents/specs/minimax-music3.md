@@ -1094,6 +1094,15 @@ language model is slow", and the language model is not the part that is slow —
 the LM's own weight load is 180 s of I/O and its forward is 12-14% of the AR
 profile.
 
+**One sentence above is now out of date on the device arm, and is corrected here
+rather than left to mislead.** *"the depth decoder and the DiT do not go through
+`vt` at all"* was true when it was written; it is still true of the DEPTH DECODER
+on both arms and of the DiT under `--speech-device 0`. It is NOT true of the DiT
+under `--speech-device 1`, which §13 routes through `vt::MatmulBT`,
+`vt::LayerNorm`, `vt::AttentionCross`, `vt::RopeFromCache`, `vt::SiluAndMul` and
+`vt::Add` with device-resident weights. Every profile number quoted above is the
+CPU arm's and still describes it exactly.
+
 ---
 
 ## 10. The parity sweep, the music-only server, and the weights record (#672)
@@ -1454,10 +1463,27 @@ own measurement and this change's evidence budget went to the device seam.
 **That last paragraph is now DONE — §12.** It landed with its own measurement and
 its own gate, and it took `vocoder1d::Conv1d` with it.
 
-**And the paragraph above it is now DONE too — §13.** `vt::Conv1d` and
-`vt::ConvTranspose1d` exist, with a CPU provider and a CUDA provider, and all
-four `vocoder1d` consumers route through them. The two REMAINING device rows are
-the depth decoder and the DiT, which are unchanged and owned elsewhere.
+**TWO of the three device rows are now DONE.** The vocoder row closed in §13:
+`vt::Conv1d` and `vt::ConvTranspose1d` exist with a CPU provider and a CUDA
+provider, and every `vocoder1d` consumer routes through them. The DiT row closed
+in §14.
+
+**A coverage hole in this row, found by fresh review and filed as #1131.** The
+DiT device arm's kernels and staging are gated — eight mutations against them go
+RED — but its **production switch is not**. Setting `on_device = false` in
+`Music3DenoiseChunks`, or disabling the half-set refusal, leaves every suite
+GREEN. A change that silently stopped the DiT reaching the device would be
+invisible, and the arm would run on the host with every number still looking
+right. The gate that closes it must assert the device path was TAKEN (invocation
+count or resident dtype), not merely that outputs agree — the two arms agree
+numerically by design.
+
+**Only the depth decoder remains, and its "blocked on" entry above is now known
+to be WRONG in one respect**, corrected in §14.5: it is not "nothing but the
+work". The shipped depth decoder runs `ArCompute::kBFloat16`, which rounds the
+RESULT of every op to bf16 (`minimax_music3_ar.cpp:36-40`), so routing it through
+an f32 `vt::MatmulBT` would silently drop that rounding. Mirroring it needs bf16
+STORAGE — a dtype decision with its own numeric evidence, not a transcription.
 
 ### 11.5 Evidence — Jetson Thor, sm_110, in the container
 
@@ -2181,3 +2207,308 @@ all six runs (`8250.57898`, `-633.539342`, `903.742105`, `657.314583`). The
 device arm shipping OFF by default was already the right call for numerics
 reasons (§13.6); this measurement says it would also have been the right call for
 speed.
+
+---
+
+## 14. The 2.4B fp32 DiT reaches the device (#672) — §11.4's second owed row
+
+§11.4 recorded three device rows as owed. §12 closed the arm-independent one.
+This closes the **DiT**, which is the one that mattered most, and it says up
+front which of the other two it does not close and why.
+
+### 14.1 Why this row and not another
+
+The DiT is not one stage among six; at a real duration it is the request.
+
+A 45 s clip at the shipped defaults (`num_inference_steps` 30) runs `DitForward`
+**660 times** — 30 steps x 2 CFG branches x 11 windows — and each call is 36
+blocks over `length + 1` tokens at inner dim 2048, ff 8192. That is on the order
+of **634 TFLOP in the DiT against ~29 TFLOP for the entire autoregressive half**:
+the DiT is roughly **20x everything else in the model put together**. On the
+scalar host loops it is measured in hours; one run was killed at 8 h 11 m having
+averaged 4.3 of 20 cores.
+
+That is also why §11.5's device arm reached only 0.946x. It moved the 8.6B
+language model, which is real work, and left the stage that is twenty times
+larger on the host. A device arm that does not include the DiT is a device arm
+for the minority of the profile.
+
+### 14.2 What moved, onto which shared op, and what did NOT
+
+**No new kernel.** Every op below already existed with a CUDA provider; this row
+adds a forward that composes them, not a kernel that competes with them.
+
+| reference helper (`minimax_music3_acoustic.cpp`) | shared op |
+|---|---|
+| `Linear` | `vt::MatmulBT` (+ `vt::Add` for the rank-1 bias) |
+| `LayerNorm` | `vt::LayerNorm` |
+| `ApplyPartialRotary` | `vt::RopeFromCache` over a `[seq, rotary_dim]` cache |
+| `Attention` (NON-causal) | `vt::AttentionCross`, `bias = nullptr` |
+| `value * silu(gate)` | `vt::SiluAndMul`, over a stage-time half swap |
+| residual adds | `vt::Add` |
+| `PointwiseConv` (both 1x1 convolutions) | `vt::MatmulBT` on the transposed activation |
+
+The stage table, after:
+
+| stage | `--speech-device 1` runs it |
+|---|---|
+| 8.6B `Qwen3ForCausalLM`, prefill + decode + paged KV | **device** (§11) |
+| guided logits, top-k draw, frame feedback | host |
+| 0.646B RVQ depth decoder | **host** — OWED, and §14.5 corrects why |
+| condition mix (once per WINDOW, not per step) | **host** — OWED |
+| **2.4B fp32 DiT, every step, both CFG branches** | **device — THIS ROW** |
+| scheduler, CFG mix, Euler step, overlap blend, carry | host (elementwise on `[128, length]`; not the cost) |
+| DAC Flow-VAE vocoder | **host — BLOCKED on a missing op** (§11.4) |
+
+### 14.3 Four things this had to get right
+
+**The 1x1 convolutions are GEMMs, and that is what unblocked the row.** `vt` has
+no CUDA 1-D convolution provider at all — the finding §11.4 recorded against the
+vocoder applies here too, because the DiT's `preprocess_conv` and
+`postprocess_conv` are `nn.Conv1d(kernel=1)`. But a kernel-1 convolution over
+`[C, L]` is a GEMM once the activation is transposed:
+
+    conv(x)[co][t] = SUM_ci W[co][ci] * x[ci][t]
+    transposed:     conv(x)^T[t][co] = SUM_ci x^T[t][ci] * W[co][ci] = MatmulBT(x^T, W)
+
+So the forward works FRAME-MAJOR `[length, channels]` throughout and transposes
+once on the host at each end, where the tensors are `[128, length]`. No
+convolution op is needed, nothing is hand-rolled outside the seam, and the
+vocoder's blocker does not transfer.
+
+**The half swap is an identity applied exactly once.** Upstream computes
+`ff_out(gate_states * silu(gate))` where `gate_states, gate = ff_in(x).chunk(2,
+-1)` — the FIRST half is the value, the SECOND is what SiLU runs on
+(`transformer_minimax_music3.py:142-143`). `vt::SiluAndMul` computes
+`silu(x[:, :D]) * x[:, D:]`: the opposite assignment. Exchanging the two ROW
+BLOCKS of the projection and the two halves of its bias — **once, at stage
+time** — makes the shared op compute upstream's expression exactly, with no
+per-step permutation. 660 forwards x 36 layers would otherwise permute a
+`[seq, 16384]` tensor 23 760 times per clip. The gate for this is a mutation, not
+an assertion: §14.4.
+
+**The rotary is the LEADING slice, and `vt::RopeFromCache` already rotates
+exactly that.** Music3 ships `rotary_dim` 32 of `head_dim` 64 and rotates only
+the leading window, leaving the tail copied through
+(`minimax_music3_acoustic.cpp:500-514`). `RopeFromCacheKernel` indexes
+`row + pair` and `row + pair + half` within each head and computes
+`x*c - y*s, x*s + y*c` — the same rotation over the same slice. `BuildDitRotaryTables`
+returns cos/sin already duplicated across both halves of the window, so the cache
+this forward builds is the FIRST half of each, packed `cos | sin`.
+
+**The attention is NON-causal and `vt::Attention` is not it.** Upstream
+dispatches with no mask (`:97-103`), so every token attends to every token
+INCLUDING the prepended timestep one. `vt::Attention` is the causal op; using it
+would have silently masked the future and still produced a finite, plausible
+tensor. `vt::AttentionCross` with a null bias is the op that means this.
+
+### 14.4 Correctness — same goldens, same bounds, nothing widened
+
+**The CPU arm is bit-identical, and structurally rather than by measurement.**
+`minimax_music3_acoustic.cpp`, `minimax_music3_ar.cpp`, `minimax_music3_llm.cpp`
+and `vocoder1d.cpp` have a **zero diff** in this change. `--speech-device 0`
+takes the same `DitForward`, source byte for source byte, so there is no number
+to move. The device forward is an ADDITIONAL entry point in a new file
+(`minimax_music3_device.cpp`), which is the shape `minimax_h3_device.cpp` and
+`ltx2_device.cpp` already use.
+
+**Reduced dimensions, against upstream's own goldens, at the EXISTING bound.**
+`DitForwardDevice` is checked through the SAME `ExpectClose` at the SAME
+`kRelTol` 1e-5 / `kAbsFloor` 1e-6 as `DitForward`, and each case reports BOTH
+arms' distance to the golden — because the question is not whether the two arms
+agree with each other (a shared-helper comparison proves consistency, not
+correctness) but whether the device arm is as close to UPSTREAM as the host arm
+already is:
+
+| arm | worst \|arm - upstream\| |
+|---|---|
+| host `DitForward` (the accepted control) | 1.565e-07 |
+| device forward, CPU backend | 1.192e-07 |
+| device forward, **CUDA sm_110** | 2.980e-07 |
+
+All three are inside the 1e-6 absolute floor with room to spare, and **no
+tolerance was relaxed**. The CPU-backend arm is closer to upstream than the host
+loops are; the CUDA arm is about 1.9x the host arm's distance and about a fifth
+of the bound.
+
+**Two mutations, because a bound that nothing violates has not been shown to
+discriminate.**
+
+* **The half swap.** Pre-swapping the host weights makes the stage-time swap undo
+  the test's, so the forward computes `silu(value) * gate` — the wrong network,
+  same shapes, same finiteness. **20 of 20 values outside the bound, worst
+  \|diff\| 1.538e-03**, four orders above the noise. The pair pins the DIRECTION,
+  not just the magnitude: routing it the other way round would fail the right
+  case and pass this one.
+* **The condition.** Conditional and unconditional forwards must be different
+  tensors — a DiT that dropped its conditioning would match both goldens
+  identically. 20 of 20 differ, on both backends.
+
+Two more cases guard the staging contract itself: every mis-sized weight is
+refused **at stage time** naming the tensor (before 9.7 GB moves at real
+dimensions), and `release_host` is asserted to leave the source vectors empty
+AND at zero capacity while the staged copy still reproduces the golden — which is
+also the check that would catch a released host buffer uploaded without a
+synchronize.
+
+**FULL SCALE — the real 2.4B fp32 checkpoint against the oracle capture, on
+sm_110.** `tests/parity/test_minimax_music3_acoustic_real.cpp` now takes
+`VLLM_CPP_MUSIC3_DEVICE` (default 0 = CPU, so an unset environment reproduces
+every number this file ever printed) resolved through the SAME
+`multimodal::SpeechEngineDeviceType` the engine calls. Both arms, same box, same
+binary, same goldens, **same bounds** — `kDitRelTol` 1e-4 / `kDitAbsFloor` 5e-5 /
+`kDitMeanAbsTol` 5e-6, all unchanged. 11 008 values per step:
+
+| arm | step | bit-identical | mean\|d\| | max\|d\| | outside |
+|---|---|---|---|---|---|
+| **Thor CPU** (`device 0`) | first | 423 (3.843 %) | 1.71434e-06 | 2.38419e-05 | **0** |
+| **Thor CPU** | last | 235 (2.135 %) | 2.22396e-06 | 2.83718e-05 | **0** |
+| **Thor CUDA** (`device 1`) | first | 473 (4.297 %) | **1.64344e-06** | 2.47955e-05 | **0** |
+| **Thor CUDA** | last | 222 (2.017 %) | 2.44677e-06 | **2.59876e-05** | **0** |
+| CONTROL (torch vs torch, `set_num_threads(1)`) | first | 15.416 % | 7.526e-07 | 7.153e-06 | — |
+| CONTROL | last | 5.596 % | 1.424e-06 | 1.335e-05 | — |
+
+**Three things this table shows that one arm could not.** The device arm sits
+ON TOP of the host arm rather than beside it — better on two of the four figures
+(more bit-identical and a lower mean at the first step, a lower max at the last)
+and marginally worse on the other two, which is what two correct float32
+implementations of the same graph look like. Both arms sit at the same
+multiple of the recorded torch-vs-torch control (about 1.2-1.7x its mean, 2-3.5x
+its max), so the device arm did not move the row's relationship to the control.
+And **the Thor CPU arm reproduces the x86-64 numbers this spec already recorded —
+3.843 %, 1.714e-06, 2.384e-05; 2.135 %, 2.224e-06, 2.837e-05 — VALUE FOR VALUE**,
+so the CPU path is unchanged across two architectures, not merely unchanged on
+the box that measured it.
+
+The four ARM=1 cases that print those numbers are 464 assertions against the
+CPU arm's 461; the three extra are this row's staging `CHECK` and the two
+`REQUIRE`s that refuse a device arm with no staged weights.
+
+### 14.6 Speed — MEASURED, on one named device, per DiT forward
+
+**Device: `thor:gpu0` — NVIDIA Thor, sm_110, aarch64, 14 cores, ~122 GB UNIFIED,
+driver 595.78.** Every number below is from that one box. No number here is
+compared to one from `dgx:gpu0` (GB10) or `orin:gpu0`, because those are
+different machines and a ratio across them would mean nothing.
+
+Image `vllmcpp-thor:cuda13.0.1`, nvcc 13.0.88, configured `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_SERVER=ON`,
+no cutlass. Checkpoint read-only from the NAS. Same binary, same weights, same
+committed inputs on both arms; the arms never overlapped.
+
+**What is timed is the DiT and only the DiT.** `VLLM_CPP_MUSIC3_DIT_REPEAT=R`
+makes the gate run its guided velocity R times per timestep instead of once, and
+the timer brackets that loop — the 9.7 GB checkpoint load and the weight staging
+are outside it, and the staging is timed separately.
+
+**Corrected in fresh review:** an earlier revision of this paragraph also claimed
+the GOLDEN READS were outside the bracket. They are not — four `LoadF32Npy`
+calls, two `Compare` and two `ReportInto` sit INSIDE the `t0`/`loop_s` bracket
+(`test_minimax_music3_acoustic_real.cpp:592-606`). That inflates the intercept and
+makes the per-forward number SLOWER than the pure forward, so the headline ratio
+is conservative rather than inflated — but the sentence was wrong as written, and
+a reader checking the intercept against the fit would have been misled.
+
+| arm | repeats | forwards | loop | per forward | staging | box load |
+|---|---|---|---|---|---|---|
+| CPU (`device 0`) | 1 | 4 | **819.818584 s** | **204.954646 s** | 0 (host, no-op) | 3.42 |
+| CPU (`device 0`) | 1 | 4 | **819.992 s** | **204.998 s** | 0 (host, no-op) | 10.37 |
+| CUDA (`device 1`) | 1 | 4 | **0.749077 s** | **0.187269 s** | 0.603561 s | 4.79 |
+| CUDA (`device 1`) | 3 | 12 | **2.110301 s** | **0.175858 s** | 0.660600 s | 5.32 |
+| CUDA (`device 1`) | 1 | 4 | **0.743367 s** | **0.185842 s** | 0.609463 s | 5.1 |
+| CUDA (`device 1`) | 1 | 4 | **0.743881 s** | **0.185970 s** | 0.612787 s | 4.44 |
+
+**Per DiT forward at the capture's geometry (latent length 86, seq 87):
+204.955 s on the host, 0.1706-0.1873 s on the device — between 1094x and
+1201x.** (An earlier revision wrote the low end as 1102x. That is the ratio at
+the FASTEST R=1 point, 0.185970 s; the range's slow end is 0.187269 s, and
+204.954646 / 0.187269 = 1094x. Caught in fresh review.) The two-point fit over the device arm's 4- and 12-forward runs gives
+
+    slope = 0.170607 s per forward     intercept = 0.063012 s
+
+so the ratio is 1102x taken on the matched R=1 pair and 1201x taken on the
+fitted per-forward slope. The device R=1 point was taken THREE times across two
+sessions, bracketing the R=3 point, at 0.749077 / 0.743367 / 0.743881 s — a
+0.77 % spread.
+
+**The contention asymmetry was checked rather than assumed, and it is nil.** The
+first CPU point was taken at box load 10.37 while the device points sat at
+4.4-5.3, which would have inflated the ratio if it mattered. It was re-taken on
+an idle box (load 3.42) with the fixed instrument: **204.954646 s vs 204.998 s,
+agreeing to 0.021 %**. The host DiT forward is single-threaded and this box has
+14 cores, so a load of 10 still leaves it a core. Both CPU points are reported
+above rather than the convenient one.
+
+**The weights are staged ONCE, and this is the measurement that says so rather
+than the code comment.** One staging costs 0.60-0.66 s. The ENTIRE four-forward
+loop costs 0.745 s and the twelve-forward loop 2.110 s; twelve stagings would be
+7.35 s on their own. The loop's fitted intercept is 0.063 s — a tenth of one
+staging. A per-forward upload is arithmetically excluded by the numbers, not
+argued away.
+
+Extrapolated to a full clip — and it is an EXTRAPOLATION, labelled as one,
+because the only geometry measured is the capture's single 86-frame window — the
+660 forwards of a 45 s clip at the shipped defaults are **~37.6 h of DiT on the
+host against ~113 s on the device, with the one-time staging 0.54 % of the
+latter**.
+
+**The whole-process ratios, which are lower and are the honest ceiling on what a
+user sees today.** The same gate binary end to end, including the identical
+9.7 GB NAS load on both arms, ran 1054-1071 s (CPU) vs 238-298 s (CUDA) —
+**3.5-4.5x**, the spread being NAS cache state rather than compute;
+and the earlier full two-arm correctness series, identical scripts throughout,
+ran 49 min 17 s vs 15 min 49 s — **3.12x**. The gap between 1100x on the DiT and
+4x on the process is the point of §14.5: the load, the host vocoder and the depth
+decoder are unchanged, and they now dominate.
+
+**No end-to-end song pair is offered.** At the shipped 30 steps the host arm's
+DiT alone is ~37.6 h, so an e2e pair at a realistic setting is not runnable on
+the CPU arm; at a setting short enough to run, the DiT is a small enough share
+that the pair would measure the vocoder. The per-forward A/B above is the
+measurement that isolates what this row changed, and no clip-level speed claim is
+made from it.
+
+**No parity claim.** SGLang-Omni is still `gateable = no`; every reference axis
+in `docs/BENCHMARKS.md` stays `PENDING`.
+
+### 14.7 One instrument defect, found inside this change
+
+The first revision of the timing line printed **`DIT_TIMING arm=1`** on the CPU
+run. `vt::DeviceTypeName` returns `const char*`, and a `const char*` fed to
+doctest's `MESSAGE` chain takes the **bool** conversion and prints `1`. The
+staging line had it too, printing `(1)` where it meant `(host, no-op)`.
+
+**This is #672's own §11.5 defect reappearing in a new line**, which is the
+reason it is recorded here rather than quietly fixed: the lesson from the first
+occurrence was written down, and a fresh `<<` chain reintroduced it anyway. Both
+lines are now assembled as one `std::string` and printed, which is what the arm
+banner beside them already did — and the banner is why the numbers survived,
+because it said `ran on 'cpu' (VLLM_CPP_MUSIC3_DEVICE=0)` correctly while the
+line below it said `arm=1`.
+
+**Every number in §14.6 was re-taken with the fixed instrument**, and the CPU
+arm's pre-fix point is kept beside its post-fix twin rather than replaced by it,
+because the pair is what proves the label defect never touched the values:
+819.992 s (pre-fix, `arm=1` printed, load 10.37) against 819.818584 s (post-fix,
+`arm=cpu` printed, load 3.42). The correct banner sat above both, the process
+wall clocks corroborate both, and the correctness numbers both runs printed match
+the x86-64 values this spec already recorded value for value.
+
+### 14.5 What is still OWED, and a correction to §11.4
+
+§11.4 said the depth decoder was blocked on "nothing but the work". **That is
+wrong, and this row is where it was found out.** The shipped depth decoder and
+condition mix run at `ArCompute::kBFloat16`, which rounds the RESULT of every op
+to bf16 (`minimax_music3_ar.cpp:36-40`) because that is what torch stores.
+Routing them through an f32 `vt::MatmulBT` would silently drop that rounding — a
+change to the numbers wearing a refactor's clothes. Mirroring them needs bf16
+STORAGE so the shared op rounds where the reference's `Store` rounds, which is a
+dtype decision with its own numeric evidence, not a transcription. It is also
+worth ~15 TFLOP against the DiT's 634, so it is second in size as well as second
+in order.
+
+The condition mix has a further reason to be second: it runs **once per window**,
+not once per step, so it is outside the 660-forward loop entirely.
+
+The vocoder row is unchanged: `vt` still has no `ConvTranspose1d` with any
+provider, that op has three consumers, and it is its own row.

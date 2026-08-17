@@ -21,9 +21,6 @@ function(vllm_cpp_add_test name)
   # under tests/support/ as "support/<name>.h". No header name under tests/
   # collides with one under include/ or src/, so nothing else resolves here.
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  # Some test-only portability helpers live under src/vllm/support/ on purpose:
-  # they are internal build shims, not installed public headers.
-  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
   if(TARGET vllm::sanitize_test_shared)
     target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
   else()
@@ -2200,3 +2197,18 @@ target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
 # CPU-only and needs no checkpoint.
 vllm_cpp_add_test(test_registry_downcast_refusal
   vllm/models/test_registry_downcast_refusal.cpp)
+
+# The five suites that reach src/vllm/support/platform_compat.h, granted per
+# target rather than globally: the file already carries 123 explicit
+# ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
+# convert that deliberate opt-in into a repo-wide default (#503).
+foreach(_pc_target
+        test_safetensors
+        test_minimax_h3
+        test_minimax_h3_video_fold
+        test_kv_offload_connector
+        test_kv_offload_tiering)
+  if(TARGET ${_pc_target})
+    target_include_directories(${_pc_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  endif()
+endforeach()

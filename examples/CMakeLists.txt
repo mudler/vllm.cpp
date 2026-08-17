@@ -20,7 +20,6 @@ vllm_cpp_set_warnings(deepseek-v4-gen)
 # driver (W5 RUNNABLE vehicle — 3-shard keep-quant load + stateless recompute).
 add_executable(laguna-gen laguna_gen/main.cpp)
 target_link_libraries(laguna-gen PRIVATE vllm::vllm)
-target_include_directories(laguna-gen PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_set_warnings(laguna-gen)
 
 # kimi-linear-gen: the Kimi-Linear-48B-A3B golden token battery, a THIN CLIENT

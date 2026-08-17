@@ -35,6 +35,11 @@ inline int FileDescriptorFromFile(std::FILE* file) { return _fileno(file); }
 
 inline bool TruncateFile(int fd, std::uint64_t size) { return _chsize_s(fd, size) == 0; }
 
+// DIVERGENT ON AN EMPTY VALUE, and deliberately not normalised: `_putenv_s(name,
+// "")` REMOVES the variable, where POSIX `setenv(name, "", 1)` defines it empty.
+// No caller passes an empty value today. A test that needs defined-but-empty must
+// say so at its call site rather than relying on this — the same contract
+// `tests/support/test_env.h` records for the test-side seam.
 inline bool SetEnvVar(const char* name, const char* value) {
   return _putenv_s(name, value) == 0;
 }

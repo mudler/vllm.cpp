@@ -11,13 +11,27 @@
 // WHAT IS UNDER TEST.
 //
 //   1. `ForwardLayers` is not the only MoE entry point, and its comment used to
-//      say it was. `Qwen3_5Model::ForwardDense`, both MTP forwards (the
-//      production spec-decode DRAFT path) and `Qwen3_5ReplayLayer` all reach
-//      `ExpertMlpKq -> KqExpertSlice` and none of them marked a step. A forward
-//      that takes slices and never ends its step leaves every entry it acquired
-//      `protected_this_step` forever, which is defect F1 with a smaller blast
-//      radius: on a draft+target pair the draft's slots stay pinned across the
-//      target's forward and shrink the evictable set for the whole run.
+//      say it was. `Qwen3_5Model::ForwardDense`, both MTP forwards and
+//      `Qwen3_5ReplayLayer` all reach `ExpertMlpKq -> KqExpertSlice` and none of
+//      them marked a step. A forward that takes slices and never ends its step
+//      leaves every entry it acquired `protected_this_step` forever, which is
+//      defect F1 with a smaller blast radius: on a draft+target pair the draft's
+//      slots stay pinned across the target's forward and shrink the evictable
+//      set for the whole run.
+//
+//      WHICH OF THE FOUR PRODUCTION ACTUALLY RUNS: one. Only
+//      `Qwen3_5MTPModel::ForwardPaged` has a production caller (`runner.cpp:2183`
+//      -> `spec_decode/mtp/speculator.cpp:107,262`), and that caller runs only
+//      when a speculator is configured (`runner.cpp:2120`), so no
+//      default-configuration run reaches any of the four. `Qwen3_5MTPModel::Forward`
+//      is reached only through `ForwardLogitsHost`, which `qwen3_5_mtp.h:135`
+//      calls a "standalone parity convenience" and which has no caller outside
+//      `tests/`; `ForwardDense` and `Qwen3_5ReplayLayer` are parity references
+//      the same way. An earlier revision of this comment called both MTP
+//      forwards the production draft path (#1106 finding 2). So for three of the
+//      four guards this binary is the ONLY driver there is: the cases below pin
+//      the boundary, they do not demonstrate reach, and #1108 plus the spec's
+//      `## Owed` carry that debt.
 //
 //      ONE FORWARD IS ONE STEP. That is the definition the cache is built
 //      against, and it is why the draft gets its own step rather than sharing

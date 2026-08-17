@@ -1230,9 +1230,12 @@ stable over 50 consecutive runs before being asserted, rather than after.
 **"Every MoE entry point funnels through here exactly once per forward" was
 false.** Four more forwards reach `ExpertMlpKq -> KqExpertSlice`:
 `Qwen3_5Model::ForwardDense`, `Qwen3_5MTPModel::Forward`,
-`Qwen3_5MTPModel::ForwardPaged` and `Qwen3_5ReplayLayer`. The MTP pair is the
-production spec-decode DRAFT path, so a draft's acquisitions stayed
-`protected_this_step` across the following target forward — F1 at draft scale.
+`Qwen3_5MTPModel::ForwardPaged` and `Qwen3_5ReplayLayer`. One of them,
+`Qwen3_5MTPModel::ForwardPaged`, is the production spec-decode DRAFT forward, so
+a draft's acquisitions stayed `protected_this_step` across the following target
+forward — F1 at draft scale. This paragraph said "the MTP pair" until #1106
+finding 2 measured it; the other three are parity-only entry points, and that is
+recorded below and under `## Owed` as #1108.
 
 ONE FORWARD IS ONE STEP, and that is the call the draft forced. Folding a draft
 into the target's step would pin the draft's slots across a second forward for no
@@ -1288,9 +1291,14 @@ carries: a store must have been BUILT, and the process must RUN its static
 destructors. This is #1091 finding 5 — a comment promising more than the code —
 reintroduced one file away in the change that fixes it, which is the strongest
 argument on record that the class is a habit rather than an accident.
-`~Qwen35ExpertStream` is now named as the only production caller, with both
-qualifiers, and the note says what calling the exposed seam costs: it takes the
-once-flag, so it suppresses the teardown line for the rest of the process.
+`~Qwen35ExpertStream` is now named as the only production path to the LINE, with
+both qualifiers, and the note says what calling the exposed seam costs: it takes
+the once-flag, so it suppresses the teardown line for the rest of the process.
+The header says that `ExpertStreamFlushStats` itself has ZERO production callers
+and that the destructor does not route through it, because the first repair of
+this finding headed that comment "`~Qwen35ExpertStream` IS THE ONLY PRODUCTION
+CALLER" — true of the line, and read as a call that the destructor deliberately
+does not make.
 
 **"Nothing lands dead" was claimed for four step guards and holds for one.**
 Only `Qwen3_5MTPModel::ForwardPaged` has a production caller
@@ -1360,8 +1368,8 @@ Carried debt for this row. Each item names why it is not closed here.
 |---|---|
 | **Re-measure decode on a LIVE cache.** The `docs/BENCHMARKS.md` decode figure for this row was taken with the step clock dead from token 3 onward and is void. | Needs `dgx.casa` and the 370 GiB checkpoint. The box was unreachable for this repair (`No route to host`), and this host has no CUDA device and cannot hold the model. |
 | **The `pread` path has never run on the model.** `EnsureFile` now has a CPU-local gate that drives it through the production seam from a temp file and proves the `file_offset + offset` composition (#1091 finding 4), so it is no longer UNREACHED. It is still unmeasured on a real checkpoint. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
-| **A run that REQUESTS streaming and never builds a store prints no statistics line.** The `[expert-stream] ON ...` banner is absent in that case too, so no-banner means "nothing reached the lane" and banner-without-line means "the process died"; the docs state all four shapes. | A teardown hook that could report it is not reachable from any test on a CPU-only host, because `Reserve` and `Get` sit in one call chain and a device platform is what separates them. Landing it would have been an untestable branch added to fix an untestable-branch problem. Needs `dgx.casa` (see #1091). There is NO such hook in the tree: `~Qwen35ExpertStream` is the only production caller of the final line, and the header now says so rather than describing the hook that was rejected (#1106). |
-| **Three of the four step guards land UNREACHED.** `Qwen3_5MTPModel::Forward`, `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity-only entry points with no caller outside `tests/`, so their `Qwen35ExpertStreamStep` guard is reached by no production path. Only `Qwen3_5MTPModel::ForwardPaged` is (`runner.cpp:2183` -> `spec_decode/mtp/speculator.cpp:107,262`). Owning row `ENG-EXPERT-STREAM`; tracked as [#1108](https://github.com/mudler/vllm.cpp/issues/1108). | Nothing is deleted, because the guards are correct where they sit and cost nothing, and the alternative — add the guard later, together with the caller — is precisely how this row lost its step boundary in the first place. It closes when one of those entry points gains a production caller, or when they are retired as parity references. Neither is scheduled and neither should be forced by the record. |
+| **A run that REQUESTS streaming and never builds a store prints no statistics line.** The `[expert-stream] ON ...` banner is absent in that case too, so no-banner means "nothing reached the lane" and banner-without-line means "the process died"; the docs state all four shapes. | A teardown hook that could report it is not reachable from any test on a CPU-only host, because `Reserve` and `Get` sit in one call chain and a device platform is what separates them. Landing it would have been an untestable branch added to fix an untestable-branch problem. Needs `dgx.casa` (see #1091). There is NO such hook in the tree: `~Qwen35ExpertStream` is the only production path to the final line, and it prints it directly rather than through `ExpertStreamFlushStats`, which has no production caller at all. The header now says both, rather than describing the hook that was rejected (#1106). |
+| **Three of the four step guards land UNREACHED.** `Qwen3_5MTPModel::Forward`, `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity-only entry points with no caller outside `tests/`, so their `Qwen35ExpertStreamStep` guard is reached by no production path. Only `Qwen3_5MTPModel::ForwardPaged` is (`runner.cpp:2183` -> `spec_decode/mtp/speculator.cpp:107,262`), and even that caller is "UNREACHABLE unless a speculator is configured" (`runner.cpp:2120`) — so a DEFAULT-configuration run reaches none of the four, which is a weaker statement than "one of four is reached" and is recorded here rather than rounded up. Owning row `ENG-EXPERT-STREAM`; tracked as [#1108](https://github.com/mudler/vllm.cpp/issues/1108). | Nothing is deleted, because the guards are correct where they sit and cost nothing, and the alternative — add the guard later, together with the caller — is precisely how this row lost its step boundary in the first place. It closes when one of those entry points gains a production caller, or when they are retired as parity references. Neither is scheduled and neither should be forced by the record. |
 | **`check-windows-portability.py` cannot see this class.** It scans only the sources reachable from the shipped server target, so no test translation unit at all, and `setenv`/`unsetenv` are in none of its patterns. Tracked as [#1107](https://github.com/mudler/vllm.cpp/issues/1107) against `ENG-RELEASE-WINDOWS`. | Changing a checker's semantics needs its own spec, a red-before test and green-after evidence, which is a different unit of work from repairing two test files. Widening the scan to `tests/` also has to separate a guarded POSIX call from an unguarded one across a large surface, and that wants measurement rather than a guess. |
 | **The Windows repair is not mutation-proven.** Both gates now use `vllm_test::SetEnv`, and nothing here executed an MSVC compile of them. | No MSVC is reachable from this host, and the Windows CI lanes fail earlier in the product library on #1068, so they cannot report a test translation unit either way. The static checker that could have is #1107. |
 | **The `MADV_WILLNEED` readahead is unmeasured.** It is now well formed and counted; whether it moves decode is unknown. | Same host and the same OOM contention. No speedup is claimed anywhere for it. |

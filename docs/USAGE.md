@@ -3156,8 +3156,15 @@ once when the lane builds its store. The four shapes are:
 |---|---|---|
 | absent | absent | Nothing reached the streamed seam. A CUDA run (a device-resident expert is served unchanged), a checkpoint whose experts are not keep-quant towers, or a prompt that never reached an MoE layer |
 | present | present | The lane ran. Read `steps` and `exhausted` |
-| present | absent | The process did not reach its static destructors: a crash, a signal, or `_exit` |
-| present | absent, but a statistics line already appeared mid-run | The line was flushed early and the teardown one is suppressed. Only a gate does this: the line is printed once per process, and the internal `ExpertStreamFlushStats` seam takes that one print. No shipped command or server path calls it, so an operator does not see this shape |
+| present | absent, and nothing called `ExpertStreamFlushStats` | The process did not reach its static destructors: a crash, a signal, or `_exit` |
+| present | absent, because `ExpertStreamFlushStats` was called | The internal gate seam took the process's single print, so teardown had none left to make. No shipped command or server path calls it, so an operator never reaches this shape |
+
+The last two shapes are keyed on the CALL and not on what stderr looks like,
+because stderr cannot separate them. `ExpertStreamFlushStats` prints the same
+line in the same shape as the periodic report, so "a statistics line already
+appeared mid-run" is also what a healthy run of 16 steps that then crashes
+produces. What distinguishes the two is whether the seam was called, and only a
+gate calls it.
 
 A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See

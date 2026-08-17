@@ -419,13 +419,22 @@ void EndExpertStreamStep();
 
 // Print the streamed-expert statistics line NOW, once, whatever the run did.
 //
-// `~Qwen35ExpertStream` IS THE ONLY PRODUCTION CALLER. The store is a
-// function-local static, so it is destroyed on the normal exit path and prints
-// what the run ended up doing. There is no second hook: nothing registers an
-// `atexit` handler when streaming is merely REQUESTED, and none was landed —
-// that shape is recorded under the spec's `## Owed` with its reason, and this
-// comment claimed the hook existed while the change that wrote it was fixing
-// exactly this class of overclaim one file away (#1091).
+// THIS FUNCTION HAS ZERO PRODUCTION CALLERS, and a grep-and-quote reader should
+// get that before anything else: it exists for the gate. The only production
+// path to the LINE is `~Qwen35ExpertStream`, which does NOT route through here —
+// the store is a function-local static, so it is destroyed on the normal exit
+// path and prints what the run ended up doing directly. The two share the
+// once-flag rather than a call, so exactly one of them prints; an earlier
+// revision headed this comment "~Qwen35ExpertStream IS THE ONLY PRODUCTION
+// CALLER", which reads as a call that is not there (#1106).
+//
+// There is no second hook either: nothing registers an `atexit` handler when
+// streaming is merely REQUESTED, and none was landed — that shape is recorded
+// under the spec's `## Owed` with its reason. An even earlier revision of this
+// comment claimed the hook existed, while the change that wrote it was fixing
+// exactly this class of overclaim one file away (#1091). Two revisions, two
+// overstatements of the same four lines, which is why they now name the
+// mechanism rather than summarise it.
 //
 // So the guarantee carries the same two qualifiers `docs/USAGE.md` does, and it
 // is one line per process under both: a store must have been BUILT, and the

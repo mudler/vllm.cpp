@@ -5356,11 +5356,14 @@ class Qwen35ExpertStream {
 
   // The final line, printed exactly ONCE per process.
   //
-  // TEARDOWN IS THE REAL CALLER, in `~Qwen35ExpertStream` below: the store is a
-  // function-local static, so it is destroyed on the normal exit path and prints
-  // whatever the run ended up doing. This entry exists so a gate can observe the
-  // same guarantee from inside a running process, because a static destructor
-  // fires after main returns and nothing in the process can assert on it.
+  // NOTHING IN PRODUCTION CALLS THIS, and read the destructor below before you
+  // conclude otherwise. Teardown produces the LINE but does not route through
+  // here: the store is a function-local static, so `~Qwen35ExpertStream` runs on
+  // the normal exit path and calls `ReportStats` itself, for the reason stated
+  // there. The two share the once-flag, not a call, so exactly one of them
+  // prints. This entry exists so a GATE can observe the same guarantee from
+  // inside a running process, because a static destructor fires after main
+  // returns and nothing in the process can assert on it.
   //
   // A once-flag rather than two independent prints, so "one line" is a property
   // of the process and not of which caller happened to win. The flag is a plain
@@ -7509,12 +7512,25 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   // (#1091 finding 3). Four more forwards reach `ExpertMlpKq -> KqExpertSlice`
   // without passing through here — `Qwen3_5Model::ForwardDense`,
   // `Qwen3_5MTPModel::Forward`, `Qwen3_5MTPModel::ForwardPaged` and
-  // `Qwen3_5ReplayLayer` — and each now carries its own guard. The MTP pair is
-  // the production spec-decode DRAFT path, so the shape that was actually
-  // running is draft forwards that pin every slot they touch across the
-  // following target forward. `RunMoeBlock` is the deliberate exception: it is
-  // one block, not a forward, and qwen3_moe.cpp owns the boundary for the model
-  // that composes it (qwen3_moe.cpp:150).
+  // `Qwen3_5ReplayLayer` — and each now carries its own guard.
+  //
+  // ONE OF THOSE FOUR HAS A PRODUCTION CALLER, not all of them, and an earlier
+  // revision of this comment said "the MTP pair" (#1106 finding 2, #1108). It is
+  // `Qwen3_5MTPModel::ForwardPaged`, the spec-decode DRAFT forward, reached from
+  // `runner.cpp:2183` through `spec_decode/mtp/speculator.cpp:107,262` — so the
+  // shape that was actually running is draft forwards that pin every slot they
+  // touch across the following target forward. That caller is itself
+  // "UNREACHABLE unless a speculator is configured" (`runner.cpp:2120`), so a
+  // DEFAULT-configuration run reaches none of these four guards; one of them has
+  // a production caller, which is not the same claim. `Qwen3_5MTPModel::Forward`,
+  // `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity entry
+  // points whose every caller is under `tests/`, and per `.agents/reachability.md`
+  // a call site inside a test is not reach: their guards land UNREACHED, which
+  // the spec's `## Owed` records as a staged slice rather than claiming.
+  //
+  // `RunMoeBlock` is the deliberate exception: it is one block, not a forward,
+  // and qwen3_moe.cpp owns the boundary for the model that composes it
+  // (qwen3_moe.cpp:150).
   //
   // Inert unless a store exists, which needs both VT_MOE_EXPERT_STREAM and a
   // slice taken.
@@ -8163,6 +8179,14 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
   // — F1 at draft scale (#1091 finding 3). A spec-decode iteration therefore
   // advances the clock once per draft plus once for the target, which is what
   // "one step is one forward" means for a draft+target pair.
+  //
+  // THAT PAIR IS RUN BY `ForwardPaged`, NOT BY THIS OVERLOAD. This one is
+  // reached only through `ForwardLogitsHost`, a standalone parity convenience
+  // (qwen3_5_mtp.h:135) whose every caller is under `tests/`, so the guard here
+  // lands unreached and is recorded as a staged slice (#1108). It is kept
+  // because the reasoning above is what makes it correct the moment this
+  // overload gains a caller, and adding the guard later with the caller is how
+  // this row lost its step boundary the first time.
   const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 

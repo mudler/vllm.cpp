@@ -1,19 +1,23 @@
-// Shared synthetic Qwen3.5-MoE model builders for the expert-streaming gates
-// (ENG-EXPERT-STREAM, issue #912, repairs #1091).
+// The synthetic Qwen3.5-MoE model that `test_expert_stream_wiring` and
+// `test_expert_stream_steps` both drive (ENG-EXPERT-STREAM, issue #912, repairs
+// #1091).
 //
 // WHY A HEADER AND NOT A DUPLICATE. `VT_MOE_EXPERT_STREAM` is read ONCE into a
 // function-local static, and the store behind it is a process-lifetime
-// singleton, so each question about the lane needs its own PROCESS and
-// therefore its own test binary. The model these binaries drive is the same
-// one: a four-layer hybrid MoE whose routed experts are keep-quant STACKED
-// towers, which is the only shape `KqExpertSlice` slices. Copying it per binary
-// would let the copies drift, and a gate that no longer drives the shape the
-// seam serves reports on nothing.
+// singleton, so each question about the lane needs its own PROCESS and therefore
+// its own test binary. Those two ask different questions of the SAME model — a
+// four-layer hybrid MoE whose routed experts are uniform Q8_0 keep-quant STACKED
+// towers, which is the shape `KqExpertSlice` slices — and a copy per binary
+// would let the copies drift apart from the shape the seam serves.
 //
-// Each binary keeps its OWN environment setup, because that is exactly what
-// differs between them: `test_expert_stream_mixed_slot` deliberately does not
-// set `VT_MOE_EXPERT_STREAM_SLOT_BYTES`, since that override is what would hide
-// the defect it exists for.
+// `test_expert_stream_mixed_slot` is deliberately NOT a client: its whole
+// subject is a tower set whose gate/up and down slices differ in size (Q4_0
+// against Q8_0), and it must not set `VT_MOE_EXPERT_STREAM_SLOT_BYTES`, because
+// that override is what would hide the defect it exists for. Its model is a
+// different model, not a copy of this one.
+//
+// Each client keeps its own environment setup, since which knobs a binary sets
+// is part of what it is asking.
 #ifndef VLLM_TESTS_SUPPORT_EXPERT_STREAM_MODEL_H_
 #define VLLM_TESTS_SUPPORT_EXPERT_STREAM_MODEL_H_
 

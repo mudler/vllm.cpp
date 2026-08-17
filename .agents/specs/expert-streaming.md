@@ -1360,6 +1360,191 @@ boundary). The Windows repair is NOT mutation-proven: no MSVC is reachable from
 this host, and the checker that would have caught it statically is the subject of
 #1107.
 
+## `--device cuda` loads for 26 minutes and then dies: the allocation, named (#1123)
+
+17 August 2026. The same checkpoint that serves on `--device cpu` reaches a
+serving state on `--device cuda` on the same box and the same binary, and then
+dies on the first request with `vt cuda: cudaMalloc: out of memory` inside the
+EngineCore busy loop. The load succeeded, so the failure is the forward.
+
+The log line cannot say which allocation failed or how big it was:
+`CudaBackend::Alloc` is `Check(cudaMalloc(&p, bytes), "cudaMalloc")`
+(`src/vt/cuda/cuda_backend.cu:75-81`) and `Check` composes
+`"vt cuda: " + what + ": " + cudaGetErrorString(err)`
+(`cuda_backend.cu:48-52`), where `what` is the literal `"cudaMalloc"`. `bytes`
+is in scope and discarded. So the size was established from the code and the
+checkpoint rather than from the message.
+
+### The allocation
+
+`ResidentWeight` (`src/vllm/model_executor/models/qwen3_5.cpp:963-1024`) aliases
+the host bytes when `GetPlatform(...).is_cpu()` and otherwise **uploads the whole
+tensor**: `const size_t nb = w.bytes.size(); void* p = d.b.Alloc(nb);`
+(`qwen3_5.cpp:1012-1013`). For a routed-expert weight, `w` is the STACKED
+`[E*N,K]` keep-quant tower, so `nb` is one tower — every expert of one matrix of
+one layer, in one contiguous `cudaMalloc`.
+
+**Both switch positions of the keep-quant MoE path reach that same line**, which
+is why no knob avoids it:
+
+| Configuration | Path | Reaches |
+|---|---|---|
+| default (`VT_QWEN35_GROUPED_MOE` unset ⇒ on) | `MoeBlock:6615,6616,6620` → `KqGrouped:5694` | `ResidentWeight(d, w_kq)` |
+| `VT_MOE_EXPERT_STREAM=1` (which DISABLES grouping, `:5670-5676`) | `ExpertMlpKq:5651` → `MatmulF32Slice:5611` → `KqExpertSlice:5595` | `KqResidentSlice:5111` → `ResidentWeight` |
+
+`KqExpertSlice`'s slot arm is guarded by `is_cpu()` (`qwen3_5.cpp:5578`), so on a
+device platform it falls through before the store is even constructed. That is
+the `## Owed` line "Streaming serves the CPU-resident borrowed tower only"
+observed from the other end: the lane that makes the model fit has no device arm,
+and the device path therefore asks `cudaMalloc` for every expert byte.
+
+Ruled out by reading, not by assumption. `src/vt/cuda/cuda_moe.cu` and
+`cuda_glue.cu` contain no allocation at all. `BuildMoeMarlinResident`
+(`qwen3_5.cpp:6010-6062`) does allocate `E ×` per-expert bytes unpooled, and it
+is NOT on this path: `MoeBlock:6555` takes the Marlin arm only when
+`!w.expert_gate_fp4.empty()`, and a GGUF keep-quant load populates
+`expert_*_kq`, not `expert_*_fp4`.
+
+### The size, measured from the checkpoint
+
+Both GGUF tensor tables of `unsloth/Qwen3.8-2.4T-A95B-GGUF` at revision
+`567d3e6ac26c5474b18311e619c04350fb9a5556` were re-censused independently of the
+earlier census in this spec, by HTTP range request over all ten shards, with no
+tensor data downloaded: **1702 tensor records parsed against the 1702 declared in
+`split.tensors.count`**, and the two numbers agreeing is the coverage claim.
+Shard 1 carries the 58 metadata keys and ZERO tensors; shards 2-10 carry the
+table.
+
+| Encoding | ggml | Tensors | Bytes | % bytes |
+|---|---|---|---|---|
+| IQ1_XXXS (routed experts) | 66 | 276 | 351,918,882,816 | 88.59 |
+| Q5_K | 13 | 420 | 23,391,633,408 | 5.89 |
+| Q6_K | 14 | 162 | 8,876,851,200 | 2.23 |
+| Q2_K (the `nextn` MTP block's 3 towers) | 10 | 3 | 8,455,716,864 | 2.13 |
+| Q4_K | 12 | 2 | 2,288,517,120 | 0.58 |
+| F32 | 0 | 838 | 2,171,133,440 | 0.55 |
+| Q8_0 | 8 | 1 | 142,606,336 | 0.04 |
+| total | | 1702 | 397,245,341,184 | 369.96 GiB |
+
+`expert_count = 512`, `embedding_length = 8192`,
+`expert_feed_forward_length = 2048`, `expert_used_count = 10`,
+`block_count = 93`. So one tower is:
+
+| Tower | Bytes | | Count |
+|---|---|---|---|
+| IQ1_XXXS `ffn_{gate,up,down}_exps`, dims `[8192,2048,512]` / `[2048,8192,512]` | **1,275,068,416** | 1.1875 GiB | 276 |
+| Q2_K `ffn_{gate,up,down}_exps` (block 92, the MTP layer) | **2,818,572,288** | 2.6250 GiB | 3 |
+| all `*_exps` | **360,374,599,680** | **335.62 GiB** | 279 |
+
+`1,275,068,416 / 512 = 2,490,368` bytes per expert slice, which is exactly the
+`slot_bytes=2490368` the W4 banner printed, so the arithmetic here and the
+running lane agree on the same weight.
+
+**So the answer to "which allocation and how big" is: `qwen3_5.cpp:1013`,
+1,275,068,416 bytes at a time (2,818,572,288 for three of them), 279 times,
+335.62 GiB in total.**
+
+### Why it fails, and why the loader does not
+
+The budget is measurable, and `nvidia-smi` is the wrong instrument for it: on
+this box it answers `[N/A], [N/A], [N/A]` for `memory.total,memory.free,
+memory.used`, and the `rc` fleet label likewise records `vram=[N/A]M`.
+`cudaMemGetInfo` answers honestly. Measured on `dgx:gpu0` under an `rc` hold,
+through `libcudart.so.13` in the `vllmcpp-build:gb10` image:
+
+```
+cudaGetDeviceCount rc = 0 count = 1
+cudaMemGetInfo     rc = 0
+free  = 122059919360 (113.677 GiB)
+total = 128452956160 (119.631 GiB)
+attr Integrated           rc=0 value=1
+attr UnifiedAddressing    rc=0 value=1
+```
+
+`total` equals `/proc/meminfo MemTotal` rounded to the physical 128 GB and equals
+the fleet's own `mem_total_bytes=128452956160`. **One unified pool, correctly
+reported by the CUDA runtime and not by `nvidia-smi`.**
+
+Against that pool, 335.62 GiB of tower staging is 2.8x the whole machine, and
+the total device-resident weight demand (towers plus the dense remainder, which
+this spec measured at 62 GiB resident on the CPU arm) is over 3x. The load
+survives because a borrowed tower costs ZERO anonymous bytes — that is the
+finding in "Why a 370 GiB model fits in 119 GiB" above. Staging converts each
+borrow into a real allocation, so the pool is exhausted after roughly
+`(119.6 - 62) / 1.1875 ≈ 48` towers, i.e. partway through layer 16 of 93, on the
+first forward. Hence: 26 minutes to READY, then death mid-stream.
+
+### The refusal: what it keys on, and what it deliberately does not
+
+Loading for 26 minutes and dying mid-stream is the worst of the three available
+behaviours, and AGENTS.md already says which one is right: refuse an
+unimplemented arm at load with a message that names the missing part. This
+change lands that refusal and nothing else. It does NOT build the device-slot
+arm; that stays owed below.
+
+The predicate is keyed on the MEASURED condition, never on "CUDA + GGUF" and
+never on an architecture name, because a GGUF that genuinely fits the pool must
+still load:
+
+```
+refuse  ⇔  needs_weight_staging()  ∧  budget_known  ∧  staged_lower_bound > budget
+```
+
+Three properties are deliberate.
+
+**A LOWER bound on the footprint, so the refusal can never over-refuse.** Per
+tensor the bound is `min(gguf_bytes, elems × model_dtype_bytes)`. A weight the
+loader keeps quantized is staged verbatim, which is `gguf_bytes`; a weight it
+expands is staged at the model dtype, which is `elems × 2` for bf16. Taking the
+minimum means the real device footprint is always at least the number compared,
+so a checkpoint that would have fitted cannot be refused by an over-estimate. It
+also costs honesty in the other direction and that is stated rather than hidden:
+the bound omits KV cache, activations, scratch pools and the CUDA context, so a
+checkpoint at 0.95x of the pool still passes here and still dies later. Closing
+that needs the startup memory profile `KV-WARMUP-PROFILE` owns, and a headroom
+fraction invented here would be the guess this bound exists to avoid.
+
+**`total`, not `free`.** `free` at load time carries the page cache and whatever
+else the box is doing, so it makes the refusal a function of contention. `total`
+is a device property.
+
+**Unknown is not a verdict.** `ResidencyPolicy::device_memory_total_bytes` is 0
+on every platform that does not probe one, and 0 means UNKNOWN. A caller that
+cannot learn the budget declines to decide, so no non-CUDA device and no CUDA
+build without the probe changes behaviour. This is the polarity
+`gemma4_moe.cpp:494-506` chose for the opposite reason (it refuses the device
+allocation on unknown, because a hung `hipMalloc` is worse than a host
+fallback); here the risk runs the other way, since refusing a load on an unknown
+budget would break every device whose budget nothing reports.
+
+The probe is added to `CudaPlatform`, which already includes `<cuda_runtime.h>`
+and already probes device attributes at registration, and NOT to
+`Backend::DeviceMemoryInfo`. That seam's comment claims "ROCm/CUDA override with
+hipMemGetInfo/cudaMemGetInfo" (`include/vt/backend.h:79-83`) and only ROCm does,
+which is a false comment corrected here in prose; overriding it would also
+silently wake `Gemma4MoE`'s device-expert LRU, which returns `false` from
+`MakeRoom` on CUDA today precisely because the query is absent
+(`gemma4_moe.cpp:439-447`). Waking another model's residency policy is a
+behaviour change with its own measurement, so it is filed rather than done.
+
+### Tests, and how the device branch is reached on a CPU-only host
+
+`needs_weight_staging()` is true on exactly one platform in this tree
+(`src/vllm/platforms/cuda.cpp:67`), so the branch is unreachable from the real
+loader on a host with no CUDA device — the untestable-device-branch shape this
+row has hit repeatedly. It is reached here by registering a FAKE staging
+platform in the CUDA lookup slot, which is the instrument
+`tests/vllm/entrypoints/test_device_selection.cpp` already established for
+exactly this reason, in its own executable so the global registry cannot leak
+into other suites.
+
+| Case | Instrument |
+|---|---|
+| the arithmetic, both directions and the boundary | `GgufStagedFootprint` / `CheckGgufDeviceFit` over a table: `>` refuses, `==` and `<` do not, unknown budget does not, a non-staging platform does not, an F32 tensor is counted at bf16 and a quantized one at its GGUF size |
+| the refusal is REACHED from the loader | `LoadedEngine::FromModelDir` on a synthetic `qwen35moe` GGUF with the fake staging platform registered and a small `VT_DEVICE_WEIGHT_BUDGET_BYTES`: the thrown message is the fit refusal |
+| a fitting GGUF still loads | the SAME call with a generous budget: the throw is a LATER, different one (the synthetic file has no tokenizer), which is what proves the check let it through rather than that it never ran |
+| the CPU arm is untouched | the same file with `device=cpu` never refuses, whatever the budget |
+
 ## Owed
 
 Carried debt for this row. Each item names why it is not closed here.
@@ -1377,6 +1562,11 @@ Carried debt for this row. Each item names why it is not closed here.
 | **The CUDA arms of [#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s grouped gate have not run on a device.** | Recorded in that issue, which stays open for it. Unchanged by this repair. |
 | **Streaming serves the CPU-resident borrowed tower only.** A staged device weight takes `KqResidentSlice`, so there is no device-slot arm. | Deliberate for phase 1 (copying a device-resident weight through host slots moves MORE bytes); W7 owns the pluggable backing store. |
 | **The grouped keep-quant MoE path and streaming are mutually exclusive.** `VT_MOE_EXPERT_STREAM=1` disables grouping and says so once on stderr. | Grouping stages the whole tower, which is what streaming exists to avoid. Making them compose needs a slot-aware grouped GEMM, which is its own row. |
+| **`--device cuda` still cannot SERVE a larger-than-pool GGUF; it only refuses by name now.** The device-slot arm is the missing capability: a `DeviceExpertSlotStore` behind `ExpertSlotStore`, a read accessor on that interface (`KqExpertSlice` reads `HostExpertSlotStore::Slot()`, the CONCRETE class, so the seam cannot be swapped today), a device filler that is not `pread`-into-host (`ExpertSlotStore::SlotForWrite` is handed straight to `::pread`, `expert_streamer.cpp:76-94`), and lifting the `is_cpu()` guard at `qwen3_5.cpp:5578`. Sized by the measurement above: 2790 slices per token at 2,490,368 bytes is 6.95 GB per token against a 119.631 GiB pool that already holds the dense remainder. Tracked as [#1124](https://github.com/mudler/vllm.cpp/issues/1124). | It is a campaign, not a fix: W7 (the pluggable backing store) is its declared owner in the work breakdown, and the CPU arm's own I/O rate is still unmeasured on a live cache two rows above. Building a device lane on top of a host lane whose bandwidth number is void would be optimising against a number nobody has. |
+| **The fit bound omits everything that is not a weight.** KV cache, activations, the scratch pools and the CUDA context are not counted, so a checkpoint at 0.95x of the pool passes the refusal and still dies on the first forward. | A headroom fraction invented here would be exactly the guess the lower bound exists to avoid. The number wants the startup memory profile that `KV-WARMUP-PROFILE` owns (`INVENTORIED`, `vllm/v1/worker/gpu/model_runner.py:504,647`), which is a different row. |
+| **The budget is known only where a platform probes one.** `ResidencyPolicy::device_memory_total_bytes` is 0 = UNKNOWN everywhere except `CudaPlatform`, so a discrete GPU, ROCm, Vulkan, Metal and XPU all get the old late `cudaMalloc`/`hipMalloc` failure. | ROCm already has `hipMemGetInfo` behind `Backend::DeviceMemoryInfo`, and reading it here would ALSO change `Gemma4MoE`'s device-expert LRU, which is dead on CUDA today only because that query returns false (`gemma4_moe.cpp:439-447`). Waking another model's residency policy needs its own measurement. Tracked as [#1126](https://github.com/mudler/vllm.cpp/issues/1126). |
+| **`include/vt/backend.h:79-83` still says "ROCm/CUDA override with hipMemGetInfo/cudaMemGetInfo".** Only ROCm does. | The comment is corrected in the same change; the CAPABILITY it describes is #1126. Recorded here because the false comment is what made the absent CUDA query look present, and this row's history says that class recurs. |
+| **The budget knob is an environment variable, not a config key.** `VT_DEVICE_WEIGHT_BUDGET_BYTES`. | `ENG-RESIDENCY-CONFIG` ([#1110](https://github.com/mudler/vllm.cpp/issues/1110), PR #1119) is in flight and adds exactly the `vllm_cpp` namespace inside `--offload-config` this key belongs in. Landing a second, competing config surface while that one is unmerged would create the conflict both changes then have to resolve. Migrate once #1119 lands; tracked as [#1127](https://github.com/mudler/vllm.cpp/issues/1127). |
 
 ## Risks/decisions
 

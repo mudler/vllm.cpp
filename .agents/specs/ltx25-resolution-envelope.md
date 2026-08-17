@@ -516,8 +516,15 @@ takes a different path entirely.
 - `TI2VidTwoStagesPipeline` as a recipe row — stage 1 on the scheduler-derived
   schedule under full CFG, stage 2 on `STAGE_2_DISTILLED_SIGMAS` with guidance
   off (`ti2vid_two_stages.py:243-308`). Distinct from the distilled two-stage
-  recipe that ships. Covered by #644 row scope; not separately filed, because
-  #644 already owns "close every refused arm".
+  recipe that ships. **Now filed separately as
+  [#1093](https://github.com/mudler/vllm.cpp/issues/1093)** (2026-08-17). This
+  bullet said "not separately filed, because #644 already owns 'close every
+  refused arm'", and that was a fair call at the time — it is what kept this arm
+  from ever being silent debt. It changed for one reason: #644 is an umbrella
+  over every refused arm and cannot carry what THIS one is blocked on, which is a
+  guided VIDEO denoise loop plus two checkpoints absent from the NAS. The
+  campaign spec's `## Owed` now lists it beside the three sibling pipelines that
+  had no record at all.
 - Attribution of the 60 GiB decode loss and the single-threaded decode
   throughput (§4). Both need the GPU; both are measurement rows. **Both moved,
   and neither closed. See §4.1.** The decode throughput was answered by

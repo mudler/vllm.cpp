@@ -976,13 +976,16 @@ void CheckMoeQuantLayoutSupported(const std::vector<std::string>& names,
   // ...and the three NON-routed components, refused by the dtype the probe
   // RESOLVED rather than discovered as a complaint from inside a reader (#490).
   // Each of these already failed before #864; naming it is the whole change.
+  // Names the namespace-scope constant, not the function-local `kRequired`
+  // reference bound to it: a local reference is odr-used here and would need a
+  // capture, which MSVC enforces (#1068).
   const auto refuse = [](const char* what, MoeProjDtype got,
-                                   const char* supported) {
+                         const char* supported) {
     VT_CHECK(false, std::string("qwen3_5 weights: a ") +
                         MoeProjDtypeName(got) + " " + what +
                         " is not implemented for the safetensors MoE arm -- it "
                         "reads " +
-                        supported + " there." + kRequired);
+                        supported + " there." + kMoeExpertLayoutHelp);
   };
   if (tower.gdn == MoeProjDtype::kNvfp4) {
     refuse("GDN tower (<layer>.linear_attn.{in_proj_qkv,in_proj_z,out_proj})",

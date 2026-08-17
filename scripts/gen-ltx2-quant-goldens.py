@@ -45,7 +45,7 @@ sections and their provenance is recorded separately.
 Usage:
     python3 scripts/gen-ltx2-quant-goldens.py \\
         --vllm ~/_git/vllm \\
-        --checkpoint-root /mnt/nas_share/checkpoints \\
+        --checkpoint-root "$CHECKPOINT_ROOT" \\
         --out tests/vllm/models/ltx2_quant_goldens.inc
 
 Needs torch + numpy (CPU only).

@@ -3095,7 +3095,7 @@ checkout (the two nibble-order authorities); it reads a few hundred bytes at
 their own offsets and never a payload:
 
 ```sh
-python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2 --checkpoint-root /mnt/nas_share/checkpoints --out tests/vllm/models/ltx2_quant_goldens.inc
+python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2 --checkpoint-root "$CHECKPOINT_ROOT" --out tests/vllm/models/ltx2_quant_goldens.inc
 cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
 ```
 
@@ -3522,7 +3522,7 @@ The Q4_K arm's own gate needs the pinned GGUF and the bf16 checkpoint, and skips
 loudly without them:
 
 ```sh
-CHECKPOINT_ROOT=/mnt/nas_share/checkpoints \
+CHECKPOINT_ROOT=... \
   ./build/tests/test_minimax_music3_quant_real
 ```
 

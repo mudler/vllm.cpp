@@ -316,7 +316,7 @@ size_t MatchWs(std::string_view t, size_t pos) {
 // 2294-2299 @ 153d324bcf).
 //
 // The pattern is transcribed VERBATIM from the checkpoint that forced it in,
-// /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json (read 2026-08-11),
+// $CHECKPOINT_ROOT/muse-glimmer-30b/tokenizer.json (read 2026-08-11),
 // pre_tokenizer.pretokenizers[0].pattern.Regex, behavior=Isolated. It is the
 // same string llama.cpp records as "original regex from tokenizer.json" above
 // its own GPT4O entry (llama.cpp/src/llama-vocab.cpp:432 @ 153d324bcf):

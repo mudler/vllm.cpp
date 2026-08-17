@@ -73,6 +73,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -83,6 +85,17 @@
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"  // kFusedAddRmsNormStd
+
+// DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- vt/cuda/marlin_repack.h is BUILT ONLY under VT_MARLIN_NVFP4 (its own header note), so this include cannot be resolved by a runtime query. This is the platform leg for the CUDA Marlin repack.
+#ifdef VT_MARLIN_NVFP4
+// A2-Q2a: the load-time NVFP4 -> Marlin repack primitives. DELIBERATELY NOT
+// `dense_nvfp4_gemm.h`: that header's `MarlinDenseResidentFor` (:379) keys its
+// repack cache on the WEIGHT'S ADDRESS, which is issue #984, and including it
+// here would put the unsafe accessor one unqualified call away from a reviewer's
+// eye. These four functions are the same primitives it and qwen3_5.cpp both
+// drive, with no cache attached.
+#include "vt/cuda/marlin_repack.h"
+#endif
 
 namespace vllm {
 namespace {
@@ -303,6 +316,431 @@ DBuf NemotronHAttnBlock(Dev d, const NemotronHAttentionWeights& w,
   return out;
 }
 
+// Refuse by name unless every expert projection is the NVFP4 W4A16 g16 form the
+// arena is built from. The synthetic `BuildTiny` fixture is all `kDense`, so
+// this is what keeps it on the host reference arm instead of reaching a kernel
+// with garbage.
+bool MoeIsNvfp4(const NemotronHMoeWeights& w) {
+  auto q = [](const NemotronHOwned& t) {
+    return t.form == NemotronHWeightForm::kNvfp4W4A16G16 && !t.bytes.empty() &&
+           !t.scale.empty();
+  };
+  if (w.experts.empty()) return false;
+  for (const NemotronHExpertWeights& e : w.experts) {
+    if (!q(e.up_proj) || !q(e.down_proj)) return false;
+  }
+  if (w.has_shared && (!q(w.shared.up_proj) || !q(w.shared.down_proj))) return false;
+  return true;
+}
+
+// DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- the whole arena region names vt::cuda::Marlin* functions declared only in the guarded header above, so it cannot compile on a build without them. vt::OpRegistered answers availability, never declaration. Mirrors laguna.cpp:456, the same CUDA-leg arena.
+#ifdef VT_MARLIN_NVFP4
+
+// Fetch (building on first use) the resident state a weight owns. A VERBATIM
+// copy of qwen3_5.cpp:680, which is file-local `static` there and so cannot be
+// called from here. The duplication is deliberate and is the same call this file
+// already makes for `FusedChainAdoptEnabled` (:125): hoisting a helper out of
+// qwen3_5.cpp into a shared header is a tree-wide change that would put an
+// unrelated diff on this row's critical path. What matters is the PROPERTY, and
+// it is identical — the state is keyed on the slot the weights own, never on
+// their address (issue #237).
+template <typename R>
+R& ResidentIn(const ResidentSlot& slot) {
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!slot.state) slot.state = std::make_shared<R>();
+  return *static_cast<R*>(slot.state.get());
+}
+
+// ─── A2-Q2a: one MoE layer's device-resident Marlin arena ───────────────────
+//
+// THE SHAPE IS AN ARENA, NOT A POINTER ARRAY, and that distinction is the whole
+// size of this work. `vt::MoeGroupedGemmBf16` (ops.h:1642) takes an `[E]` i64
+// device array of per-expert `[K,N]` pointers and needs no repack.
+// `vt::MoeGroupedGemmNvfp4Marlin` (ops.h:1685) takes a rank-3 STRIDED arena
+// validated at ops.cpp:884, so every expert must be repacked into Marlin's
+// interleaved layout at load. The two are not interchangeable.
+//
+// Sizes at this checkpoint's geometry (H=2688, I=1856, E=128), per MoE layer:
+//   w_up   [E, H/16=168, I*2=3712] i32  319.0 MB     s_up   [E,168,1856] i8  39.9 MB
+//   w_down [E, I/16=116, H*2=5376] i32  319.3 MB     s_down [E,116,2688] i8  39.9 MB
+// = 718 MB per layer x 23 layers = 16.5 GB device-resident, plus 11.2 MB per
+// layer for the shared expert's E=1 slice.
+//
+// PEAK IS THE ARENA PLUS 2.8 MB, NOT PLUS THE RAW TOWER. qwen3_5.cpp:5751 and
+// laguna.cpp:638 upload each expert's packed fp4 through `ResidentNvfp4`, which
+// CACHES the device copy on the weight, so both accumulate the whole raw tower
+// and free it in a tail sweep after the loop (qwen3_5.cpp:5820-5857). The A2-Q2
+// spec's §3 read that as "freed as the repack proceeds"; it is not, and a
+// whole-model loop written from that reading would peak at 16.5 + 15.8 = 32 GB
+// on a box that reboots rather than OOM-kills. This build instead streams each
+// expert through ONE REUSED 2.8 MB staging pair, so there is no tower to free
+// and no accumulation to get wrong.
+struct NemotronHMoeMarlinResident {
+  void* w_up = nullptr;    // i32 [E, H/16, I*2]
+  void* s_up = nullptr;    // fp8 [E, H/16, I]
+  void* g_up = nullptr;    // f32 [E]
+  void* w_down = nullptr;  // i32 [E, I/16, H*2]
+  void* s_down = nullptr;  // fp8 [E, I/16, H]
+  void* g_down = nullptr;  // f32 [E]
+  // The shared expert, as an E=1 slice of the same machinery — the documented
+  // dense route (dense_nvfp4_gemm.h:38-43: "the SINGLE-EXPERT grouped GEMM is
+  // how a dense [M,K]x[N,K]^T W4A16 linear runs on the MoE Marlin entry point",
+  // which is also how vLLM reaches the same csrc kernel). Using it here means
+  // NO second mechanism, no `Nvfp4Weight` copy of the 23 shared pairs, and
+  // therefore no change to the pinned `rep.host_bytes`.
+  void* sw_up = nullptr;   // i32 [1, H/16, Is*2]
+  void* ss_up = nullptr;   // fp8 [1, H/16, Is]
+  void* sg_up = nullptr;   // f32 [1]
+  void* sw_down = nullptr;  // i32 [1, Is/16, H*2]
+  void* ss_down = nullptr;  // fp8 [1, Is/16, H]
+  void* sg_down = nullptr;  // f32 [1]
+  void* workspace = nullptr;  // i32 [sms*4] reduction locks
+  int sms = 0;
+  bool ready = false;
+};
+
+
+// Upload one DENSE `NemotronHOwned` to the device, refusing by name on the same
+// three properties `RequireWeight` checks on the host arm (nemotron_h.cpp:180),
+// so an absent or mis-shaped router weight fails identically on both arms rather
+// than reaching a kernel with a null pointer. Uploaded per call, not resident:
+// the router gate is 1.4 MB and A2-Q2a makes no speed claim (:39).
+DBuf UploadOwned(Dev d, const NemotronHOwned& w, const char* what, DType want,
+                 const std::vector<int64_t>& shape) {
+  VT_CHECK(!w.Empty(),
+           std::string("NemotronH device moe: weight '") + what + "' is not materialized");
+  VT_CHECK(w.IsDense(),
+           std::string("NemotronH device moe: weight '") + what +
+               "' is not dense; the router is bf16/f32 on this checkpoint, never quantized");
+  VT_CHECK(w.dtype == want, std::string("NemotronH device moe: weight '") + what +
+                                "' has the wrong dtype for this arm");
+  VT_CHECK(w.shape == shape,
+           std::string("NemotronH device moe: weight '") + what + "' has the wrong shape");
+  DBuf b(d, want, shape, w.bytes.data());
+  d.b.Synchronize(d.q);  // `w.bytes` outlives this, but the copy is async; see UploadAs
+  return b;
+}
+
+// Repack ONE projection into `dst_w`/`dst_s`, streaming its packed codes and
+// group scales through the caller's reused staging buffers. `K`/`N` are the
+// LOGICAL in/out features: the on-disk weight is [N, K/2] packed and
+// [N, K/16] scales, which is exactly what `MarlinRepackExpertWeight` and
+// `MarlinProcessExpertScales` read (marlin_repack.h:15,:21).
+void RepackOne(Dev d, const NemotronHOwned& src, void* stage_w, void* stage_s,
+               uint32_t* dst_w, uint8_t* dst_s, int K, int N, float sf) {
+  const size_t packed_b = static_cast<size_t>(N) * (static_cast<size_t>(K) / 2);
+  const size_t scale_b = static_cast<size_t>(N) * (static_cast<size_t>(K) / 16);
+  VT_CHECK(src.bytes.size() == packed_b,
+           "NemotronH MoE repack: packed byte count does not match [N, K/2]");
+  VT_CHECK(src.scale.size() == scale_b,
+           "NemotronH MoE repack: group-scale byte count does not match [N, K/16]");
+  // Copy then repack on the SAME stream, so this expert's repack reads its
+  // staging bytes before the next expert's copy overwrites them — the ordering
+  // qwen3_5.cpp:5765 relies on for its fused-w13 staging.
+  d.b.Copy(d.q, stage_w, src.bytes.data(), packed_b);
+  d.b.Copy(d.q, stage_s, src.scale.data(), scale_b);
+  vt::cuda::MarlinRepackExpertWeight(d.q.handle, d.q.device.index, dst_w,
+                                     static_cast<const uint8_t*>(stage_w), K, N);
+  vt::cuda::MarlinProcessExpertScales(d.q.handle, static_cast<const uint8_t*>(stage_s), dst_s,
+                                      K, N, sf);
+}
+
+// `combined_scale_factor` over every expert sharing ONE Marlin GEMM — up
+// together, down together, mirroring qwen3_5.cpp:5716's gu/dn split. It reads
+// HOST scale buffers (marlin_repack.h:38), which is what `NemotronHOwned::scale`
+// already is, so nothing round-trips.
+float CombinedSfOver(const NemotronHMoeWeights& w, bool up) {
+  std::vector<const uint8_t*> bufs;
+  std::vector<size_t> lens;
+  for (const NemotronHExpertWeights& e : w.experts) {
+    const NemotronHOwned& t = up ? e.up_proj : e.down_proj;
+    bufs.push_back(t.scale.data());
+    lens.push_back(t.scale.size());
+  }
+  return vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+}
+
+void BuildNemotronHMoeMarlinResident(Dev d, const NemotronHMoeWeights& w,
+                                     const NemotronHParams& params,
+                                     NemotronHMoeMarlinResident& mr) {
+  if (mr.ready) return;
+  const int E = static_cast<int>(params.n_routed_experts);
+  const int H = static_cast<int>(params.hidden_size);
+  const int I = static_cast<int>(params.moe_intermediate_size);
+  const int Is = static_cast<int>(params.moe_shared_expert_intermediate_size *
+                                  params.n_shared_experts);
+
+  mr.sms = vt::cuda::MarlinDeviceSms(d.q.device.index);
+
+  const size_t wu_i32 = static_cast<size_t>(H / 16) * (static_cast<size_t>(I) * 2);
+  const size_t wd_i32 = static_cast<size_t>(I / 16) * (static_cast<size_t>(H) * 2);
+  const size_t su_b = static_cast<size_t>(H / 16) * static_cast<size_t>(I);
+  const size_t sd_b = static_cast<size_t>(I / 16) * static_cast<size_t>(H);
+
+  mr.w_up = d.b.Alloc(static_cast<size_t>(E) * wu_i32 * 4);
+  mr.s_up = d.b.Alloc(static_cast<size_t>(E) * su_b);
+  mr.g_up = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.w_down = d.b.Alloc(static_cast<size_t>(E) * wd_i32 * 4);
+  mr.s_down = d.b.Alloc(static_cast<size_t>(E) * sd_b);
+  mr.g_down = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.workspace = d.b.Alloc(static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+
+  // ONE staging pair, sized for the LARGEST projection this layer repacks (the
+  // shared expert's, at Is > I), reused by every expert.
+  const size_t stage_w_b = static_cast<size_t>(Is > I ? Is : I) * static_cast<size_t>(H) / 2;
+  const size_t stage_s_b = static_cast<size_t>(Is > I ? Is : I) * static_cast<size_t>(H) / 16;
+  void* stage_w = d.b.Alloc(stage_w_b > (static_cast<size_t>(H) * static_cast<size_t>(Is) / 2)
+                                ? stage_w_b
+                                : static_cast<size_t>(H) * static_cast<size_t>(Is) / 2);
+  void* stage_s = d.b.Alloc(stage_s_b > (static_cast<size_t>(H) * static_cast<size_t>(Is) / 16)
+                                ? stage_s_b
+                                : static_cast<size_t>(H) * static_cast<size_t>(Is) / 16);
+
+  const float sf_up = CombinedSfOver(w, /*up=*/true);
+  const float sf_down = CombinedSfOver(w, /*up=*/false);
+
+  std::vector<float> gu(static_cast<size_t>(E)), gd(static_cast<size_t>(E));
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    const NemotronHExpertWeights& x = w.experts[se];
+    RepackOne(d, x.up_proj, stage_w, stage_s, static_cast<uint32_t*>(mr.w_up) + se * wu_i32,
+              static_cast<uint8_t*>(mr.s_up) + se * su_b, H, I, sf_up);
+    RepackOne(d, x.down_proj, stage_w, stage_s, static_cast<uint32_t*>(mr.w_down) + se * wd_i32,
+              static_cast<uint8_t*>(mr.s_down) + se * sd_b, I, H, sf_down);
+    gu[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(x.up_proj.global_scale, sf_up);
+    gd[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(x.down_proj.global_scale, sf_down);
+  }
+  d.b.Copy(d.q, mr.g_up, gu.data(), gu.size() * sizeof(float));
+  d.b.Copy(d.q, mr.g_down, gd.data(), gd.size() * sizeof(float));
+
+  if (w.has_shared) {
+    const size_t swu_i32 = static_cast<size_t>(H / 16) * (static_cast<size_t>(Is) * 2);
+    const size_t swd_i32 = static_cast<size_t>(Is / 16) * (static_cast<size_t>(H) * 2);
+    const size_t ssu_b = static_cast<size_t>(H / 16) * static_cast<size_t>(Is);
+    const size_t ssd_b = static_cast<size_t>(Is / 16) * static_cast<size_t>(H);
+    mr.sw_up = d.b.Alloc(swu_i32 * 4);
+    mr.ss_up = d.b.Alloc(ssu_b);
+    mr.sg_up = d.b.Alloc(sizeof(float));
+    mr.sw_down = d.b.Alloc(swd_i32 * 4);
+    mr.ss_down = d.b.Alloc(ssd_b);
+    mr.sg_down = d.b.Alloc(sizeof(float));
+    // Its own combined scale factor: it is its own one-expert GEMM, so it shares
+    // the factor with nobody (the E=1 case of qwen3_5.cpp:5716).
+    std::vector<const uint8_t*> ub{w.shared.up_proj.scale.data()};
+    std::vector<size_t> ul{w.shared.up_proj.scale.size()};
+    std::vector<const uint8_t*> db{w.shared.down_proj.scale.data()};
+    std::vector<size_t> dl{w.shared.down_proj.scale.size()};
+    const float sf_su = vt::cuda::MarlinNvfp4CombinedScaleFactor(ub, ul);
+    const float sf_sd = vt::cuda::MarlinNvfp4CombinedScaleFactor(db, dl);
+    RepackOne(d, w.shared.up_proj, stage_w, stage_s, static_cast<uint32_t*>(mr.sw_up),
+              static_cast<uint8_t*>(mr.ss_up), H, Is, sf_su);
+    RepackOne(d, w.shared.down_proj, stage_w, stage_s, static_cast<uint32_t*>(mr.sw_down),
+              static_cast<uint8_t*>(mr.ss_down), Is, H, sf_sd);
+    const float g_su = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.shared.up_proj.global_scale, sf_su);
+    const float g_sd =
+        vt::cuda::MarlinNvfp4ProcessGlobalScale(w.shared.down_proj.global_scale, sf_sd);
+    d.b.Copy(d.q, mr.sg_up, &g_su, sizeof(float));
+    d.b.Copy(d.q, mr.sg_down, &g_sd, sizeof(float));
+  }
+
+  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+  d.b.Synchronize(d.q);  // every repack has landed -> the staging pair is dead
+  d.b.Free(stage_w);
+  d.b.Free(stage_s);
+  mr.ready = true;
+}
+
+// The E=1 grouped GEMM every dense NVFP4 projection here runs on: all `M` rows
+// route to expert 0. Buffers are pooled `DBuf`s rather than a process-lifetime
+// cache — A2-Q2a makes NO speed claim of any kind (the same posture A2-R took,
+// :39), and a per-token-count static cache is state whose lifetime A2-P would
+// have to revisit the moment this arm is reached from production.
+DBuf DenseMarlinE1(Dev d, const Tensor& x, void* w, void* s, void* g, void* ws, int sms,
+                   int64_t M, int64_t K, int64_t N) {
+  const int Mi = static_cast<int>(M);
+  const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(Mi, 1, 1);
+  int max_tok = 0, max_blk = 0;
+  vt::cuda::MarlinMoeAlignSizes(Mi, 1, 1, block, &max_tok, &max_blk);
+  DBuf ids(d, DType::kI32, {M});
+  d.b.Memset(d.q, ids.t().data, 0, static_cast<size_t>(M) * sizeof(int32_t));  // all -> expert 0
+  DBuf sorted(d, DType::kI32, {max_tok});
+  DBuf experts(d, DType::kI32, {max_blk});
+  DBuf npad(d, DType::kI32, {1});
+  vt::cuda::MarlinMoeAlignBlockSize(d.q.handle, static_cast<const int32_t*>(ids.t().data), Mi, 1, 1,
+                                    block, static_cast<int32_t*>(sorted.t().data),
+                                    static_cast<int32_t*>(experts.t().data),
+                                    static_cast<int32_t*>(npad.t().data));
+  // `mul_topk_weights` is false, so these are read by nothing; the op still
+  // requires an f32 tensor of the right extent.
+  const std::vector<float> ones(static_cast<size_t>(M), 1.0F);
+  DBuf tw(d, DType::kF32, {M}, ones.data());
+  DBuf out(d, DType::kBF16, {M, N});
+  Tensor wq = MakeTensor(w, DType::kI32, d.q.device, {1, K / 16, N * 2});
+  Tensor sc = MakeTensor(s, DType::kI8, d.q.device, {1, K / 16, N});
+  Tensor gg = MakeTensor(g, DType::kF32, d.q.device, {1});
+  Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+  vt::MoeGroupedGemmNvfp4Marlin(
+      d.q, out.t(), x, wq, sc, gg, wst, sorted.t(), experts.t(), npad.t(), tw.t(),
+      vt::MoeMarlinArgs{block, 1, Mi, static_cast<int>(N), static_cast<int>(K), false});
+  return out;
+}
+
+// ONE NemotronH MoE block on the device. Statement for statement the host arm's
+// composition (nemotron_h.cpp:689-824), with the per-(token,slot) MatmulBT loop
+// replaced by the grouped Marlin GEMM and NOTHING ELSE changed:
+//
+//   f32 router GEMM -> MoeRouterTopK(sigmoid, grouped, bias, factor 1.0)
+//     -> moe_align -> grouped GEMM (up) -> MoeRelu2 -> grouped GEMM (down)
+//     -> shared expert (E=1) -> MoeCombine(routed_scale)
+//
+// The three properties the whole block exists to gate, unchanged from the host
+// arm and each carried by an argument rather than reimplemented:
+//   * the router runs in f32 — MIRRORED from `force_fp32_compute=True`
+//     (nemotron_h.py:150-156), not a local precision choice;
+//   * `routed_scaling_factor` reaches `MoeCombine`'s `routed_scale`, so it
+//     multiplies the ROUTED sum on the OUTPUT; the ROUTER's own factor is forced
+//     to 1.0 in exactly this case (layer.py:291-300);
+//   * the shared expert is added UNSCALED, after the routed sum is scaled
+//     (moe_runner.py:402-406 then :722-725) — which is what `MoeCombine`'s
+//     `shared` argument does (ops.h:2438-2446).
+DBuf NemotronHMoeBlockDevice(Dev d, const NemotronHMoeWeights& w,
+                             const NemotronHParams& params, const Tensor& dh, int64_t T) {
+  const int64_t H = params.hidden_size;
+  const int64_t E = params.n_routed_experts;
+  const int64_t Kk = params.num_experts_per_tok;
+  const int64_t I = params.moe_intermediate_size;
+  const int64_t P = T * Kk;
+
+  VT_CHECK(!params.moe_latent_size.has_value(),
+           "NemotronH device moe: moe_latent_size is out of scope "
+           "(fc1_latent_proj/fc2_latent_proj); it is null in the released checkpoint");
+  VT_CHECK(static_cast<int64_t>(w.experts.size()) == E,
+           "NemotronH device moe: expert count does not match n_routed_experts");
+  VT_CHECK(dh.dtype == DType::kBF16,
+           "NemotronH device moe: the Marlin arm requires a bf16 activation "
+           "(ops.cpp:879), which is the released checkpoint's model dtype");
+
+  NemotronHMoeMarlinResident& mr = ResidentIn<NemotronHMoeMarlinResident>(w.moe_marlin);
+  // ── LAZY, AND EXPLICITLY TRANSITIONAL (A2-P owns moving it) ────────────────
+  // The A2-Q2 spec's §4.2 puts this repack in `PrepareNemotronHForCausalLM`,
+  // because a 16.5 GB allocation inside a forward would land inside a CUDA-graph
+  // capture. That reason is FORWARD-LOOKING and is false today: nothing captures
+  // `NemotronHDeviceForward`, which has no production caller at all
+  // (`ForwardNemotronHForCausalLM` still routes to the host reference,
+  // nemotron_h_registry.cpp:185-187). Putting it in `Prepare` NOW would instead
+  // make every production NemotronH engine load pay 16.5 GB of device memory for
+  // a path nothing reaches — `ModelRegistry::Prepare` is called unconditionally
+  // from both `GPUModelRunner` constructors (runner.cpp:414, :455) — on a
+  // unified-memory box that REBOOTS rather than OOM-kills.
+  //
+  // "Nothing lands dead" covers an unreached FORWARD, which costs nothing. It
+  // does not cover an unreached ALLOCATION inside a REACHED hook. So A2-Q2a
+  // builds on first use and `PrepareNemotronHForCausalLM` stays a no-op.
+  //
+  // THIS IS NOT THE INTENDED END STATE. A2-P moves it to `Prepare` at exactly
+  // the moment §4.2's justification stops being false — when a production caller
+  // and a capture both exist. Do not read a lazy build here as a decision that
+  // the forward is the right home for it.
+  if (!mr.ready) BuildNemotronHMoeMarlinResident(d, w, params, mr);
+
+  // --- router. f32 END TO END, exactly as the host arm does it
+  // (nemotron_h.cpp:712-733): the activation reaching the router is the
+  // MODEL-DTYPE one widened, never a separately-computed f32 activation, so the
+  // bf16 rounding the host arm applies first is applied here too by construction
+  // (`dh` is already bf16).
+  DBuf gate = UploadOwned(d, w.gate, "mixer.gate.weight", DType::kF32, {E, H});
+  DBuf bias = UploadOwned(d, w.e_score_correction_bias,
+                          "mixer.gate.e_score_correction_bias", DType::kF32, {E});
+  DBuf hf32(d, DType::kF32, {T, H});
+  vt::CastF32(d.q, hf32.t(), dh);
+  DBuf logits(d, DType::kF32, {T, E});
+  vt::MatmulBT(d.q, logits.t(), hf32.t(), gate.t());
+
+  DBuf topk_w(d, DType::kF32, {T, Kk});
+  DBuf topk_id(d, DType::kI32, {T, Kk});
+  {
+    vt::MoeRouterTopKArgs args;
+    args.top_k = static_cast<int>(Kk);
+    args.renormalize = params.norm_topk_prob;
+    args.scoring_func = vt::MoeScoringFunc::kSigmoid;  // nemotron_h.py:225
+    args.num_expert_group = static_cast<int>(params.n_group);
+    args.topk_group = static_cast<int>(params.topk_group);
+    // NOT params.routed_scaling_factor — see the block comment above.
+    args.routed_scaling_factor = 1.0f;
+    Tensor bt = bias.t();
+    vt::MoeRouterTopK(d.q, topk_w.t(), topk_id.t(), logits.t(), args, &bt);
+  }
+
+  // --- moe_align over the router's top-k ids.
+  const int Ti = static_cast<int>(T), Hi = static_cast<int>(H), Ii = static_cast<int>(I);
+  const int tki = static_cast<int>(Kk), Ei = static_cast<int>(E), Pi = static_cast<int>(P);
+  const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(Ti, tki, Ei);
+  int max_tok = 0, max_blk = 0;
+  vt::cuda::MarlinMoeAlignSizes(Ti, tki, Ei, block, &max_tok, &max_blk);
+  DBuf sorted(d, DType::kI32, {max_tok});
+  DBuf expert_ids(d, DType::kI32, {max_blk});
+  DBuf npad(d, DType::kI32, {1});
+  vt::cuda::MarlinMoeAlignBlockSize(d.q.handle, static_cast<const int32_t*>(topk_id.t().data), Ti,
+                                    tki, Ei, block, static_cast<int32_t*>(sorted.t().data),
+                                    static_cast<int32_t*>(expert_ids.t().data),
+                                    static_cast<int32_t*>(npad.t().data));
+
+  Tensor wst = MakeTensor(mr.workspace, DType::kI32, d.q.device, {mr.sms * 4});
+
+  // --- up, relu², down. NON-GATED: `ckpt_names=("up_proj","down_proj","")`
+  // (nemotron_h.py:220), so there is no gate half, the fused
+  // `kMoeGroupedGemmBf16GateUpSilu` does not apply, and the activation is
+  // `vt::MoeRelu2` — which exists FOR this architecture (ops.h:1728-1738).
+  DBuf dup(d, DType::kBF16, {P, I});
+  {
+    Tensor wq = MakeTensor(mr.w_up, DType::kI32, d.q.device, {E, H / 16, I * 2});
+    Tensor sc = MakeTensor(mr.s_up, DType::kI8, d.q.device, {E, H / 16, I});
+    Tensor gg = MakeTensor(mr.g_up, DType::kF32, d.q.device, {E});
+    vt::MoeGroupedGemmNvfp4Marlin(d.q, dup.t(), dh, wq, sc, gg, wst, sorted.t(), expert_ids.t(),
+                                  npad.t(), topk_w.t(),
+                                  vt::MoeMarlinArgs{block, tki, Ti, Ii, Hi, false});
+  }
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeRelu2(d.q, dact.t(), dup.t());
+  DBuf ddown(d, DType::kBF16, {P, H});
+  {
+    Tensor wq = MakeTensor(mr.w_down, DType::kI32, d.q.device, {E, I / 16, H * 2});
+    Tensor sc = MakeTensor(mr.s_down, DType::kI8, d.q.device, {E, I / 16, H});
+    Tensor gg = MakeTensor(mr.g_down, DType::kF32, d.q.device, {E});
+    vt::MoeGroupedGemmNvfp4Marlin(d.q, ddown.t(), dact.t(), wq, sc, gg, wst, sorted.t(),
+                                  expert_ids.t(), npad.t(), topk_w.t(),
+                                  vt::MoeMarlinArgs{block, 1, Pi, Hi, Ii, false});
+  }
+
+  // --- shared expert (nemotron_h.py:176-190): the SAME non-gated shape, at
+  // moe_shared_expert_intermediate_size * n_shared_experts.
+  DBuf shared_out(d, DType::kBF16, {T, H});
+  bool have_shared = false;
+  if (w.has_shared) {
+    VT_CHECK(params.n_shared_experts > 0,
+             "NemotronH device moe: shared expert weights present but n_shared_experts is 0");
+    const int64_t Is = params.moe_shared_expert_intermediate_size * params.n_shared_experts;
+    DBuf su = DenseMarlinE1(d, dh, mr.sw_up, mr.ss_up, mr.sg_up, mr.workspace, mr.sms, T, H, Is);
+    DBuf sa(d, DType::kBF16, {T, Is});
+    vt::MoeRelu2(d.q, sa.t(), su.t());
+    shared_out = DenseMarlinE1(d, sa.t(), mr.sw_down, mr.ss_down, mr.sg_down, mr.workspace, mr.sms,
+                               T, Is, H);
+    have_shared = true;
+  }
+
+  DBuf out(d, DType::kBF16, {T, H});
+  {
+    Tensor eo = Reshape(ddown.t(), {T, Kk, H});
+    Tensor st = shared_out.t();
+    vt::MoeCombine(d.q, out.t(), eo, topk_w.t(), have_shared ? &st : nullptr,
+                   static_cast<float>(params.routed_scaling_factor));
+  }
+  return out;
+}
+
+#endif  // VT_MARLIN_NVFP4
+
 }  // namespace
 
 // ─── the per-block equivalence seam ─────────────────────────────────────────
@@ -331,6 +769,46 @@ std::vector<float> NemotronHAttnBlockHostIO(const NemotronHAttentionWeights& w,
   DBuf x = UploadAs(d, hidden_normed, act_dtype, {T, H});
   DBuf out = NemotronHAttnBlock(d, w, params, x.t(), T, act_dtype);
   return DownloadF32(d, out, act_dtype, T * H);
+}
+
+std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
+                                                 const NemotronHParams& params,
+                                                 const std::vector<float>& hidden_normed,
+                                                 int64_t num_tokens, DType act_dtype,
+                                                 Queue& dev_queue) {
+  const int64_t T = num_tokens;
+  const int64_t H = params.hidden_size;
+  VT_CHECK(T > 0, "NemotronH device moe: empty token sequence");
+  VT_CHECK(static_cast<int64_t>(hidden_normed.size()) == T * H,
+           "NemotronH device moe: hidden size mismatch");
+  VT_CHECK(dev_queue.device.type != vt::DeviceType::kCPU,
+           "NemotronH device moe: this is the DEVICE arm and requires a non-CPU "
+           "queue; the host reference is NemotronHMoeMixer");
+// DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- this arm calls NemotronHMoeBlockDevice, which does not EXIST without the guarded region. It carries an #else that refuses by name, so a build without Marlin reports the missing arm rather than silently computing on the host.
+#ifdef VT_MARLIN_NVFP4
+  VT_CHECK(act_dtype == DType::kBF16,
+           "NemotronH device moe: the NVFP4 Marlin arm requires act_dtype=bf16 "
+           "(ops.cpp:879), which is the released checkpoint's model dtype");
+  VT_CHECK(MoeIsNvfp4(w),
+           "NemotronH device moe: this layer's experts are not NVFP4 W4A16 g16, "
+           "which is the only form A2-Q2a's arena is built from");
+  Dev d{vt::GetBackend(dev_queue.device.type), dev_queue};
+  // Round the input through act_dtype on the way in, exactly as the host arm
+  // does with `PackF32` (nemotron_h.cpp:759). Feeding the device f32 values the
+  // host arm would have rounded first is the deviation that makes an
+  // equivalence gate quietly meaningless.
+  DBuf x = UploadAs(d, hidden_normed, act_dtype, {T, H});
+  DBuf out = NemotronHMoeBlockDevice(d, w, params, x.t(), T);
+  return DownloadF32(d, out, act_dtype, T * H);
+#else
+  (void)w;
+  (void)params;
+  (void)act_dtype;
+  VT_CHECK(false,
+           "NemotronH device moe: this build has no Marlin NVFP4 grouped GEMM "
+           "(VT_MARLIN_NVFP4 is off), so the device MoE arm is not compiled in");
+  return {};
+#endif
 }
 
 // ─── the hybrid forward ─────────────────────────────────────────────────────
@@ -419,8 +897,25 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
     // bounce: download the normed hidden, run the HOST mixer on `host_queue`,
     // upload the result. One helper, one place, so the scaffold is visible and
     // deletable rather than scattered through the loop.
+    // A2-Q2a: a MoE layer whose experts are NVFP4 runs on the DEVICE now, so it
+    // needs no host bounce. A `kDense` MoE layer (the synthetic `BuildTiny`
+    // fixture, and any future unquantized NemotronH) still bounces, because the
+    // arena is built from the NVFP4 form alone — the fallback is stated here
+    // rather than discovered as a silent slow path.
+    // NO `#ifdef` HERE. This site only SELECTS a path, and every term it reads
+    // is available in every build: `MoeIsNvfp4` names only NemotronHWeightForm,
+    // and `vt::OpRegistered` IS the op/provider table's own answer to "is the
+    // Marlin arm realized for this device". Asking the table rather than the
+    // preprocessor is what `check-device-leakage.py` asks for, and it is
+    // correct by construction here -- a build without VT_MARLIN_NVFP4 does not
+    // register kMoeGroupedGemmNvfp4Marlin, so this resolves false on exactly the
+    // builds the guard used to exclude.
+    const bool moe_on_device =
+        lw.block == NemotronHBlock::kMoe && adt == DType::kBF16 && MoeIsNvfp4(lw.moe) &&
+        vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
     std::vector<float> nvec;
-    const bool needs_host = lw.block != NemotronHBlock::kAttention;
+    const bool needs_host =
+        lw.block != NemotronHBlock::kAttention && !moe_on_device;
     if (needs_host || (trace != nullptr && trace->capture)) {
       nvec = DownloadF32(d, normed, adt, T * H);
     }
@@ -437,6 +932,14 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
       if (trace != nullptr && trace->capture) {
         mvec = DownloadF32(d, carry, adt, T * H);
       }
+// DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- same call, same reason: the symbol is absent without the guarded region. The SELECTION is already a runtime op-table query (moe_on_device above); only the call site needs the build guard. Mirrors laguna.cpp:1187, a dispatch branch with an else fallback.
+#ifdef VT_MARLIN_NVFP4
+    } else if (moe_on_device) {
+      carry = NemotronHMoeBlockDevice(d, lw.moe, params, normed.t(), T);
+      if (trace != nullptr && trace->capture) {
+        mvec = DownloadF32(d, carry, adt, T * H);
+      }
+#endif
     } else {
       switch (lw.block) {
         case NemotronHBlock::kMamba:

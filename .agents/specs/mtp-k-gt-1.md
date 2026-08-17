@@ -1110,3 +1110,174 @@ Disk and load were checked before attributing anything to code, because ENOSPC
 on this project presents as a policy refusal rather than as a full disk: 2.66 TB
 free on `$HOME`, loadavg 1.59 at launch. The GPU lock was NOT held during the
 gate, and no GPU work ran inside it.
+
+## Outcome (DGX half, second pass, 2026-08-17)
+
+This pass set out to adjudicate the `our-ON` against `our-OFF` divergence the
+first pass recorded but could not attribute, and to run the vLLM leg that never
+started. Both are GPU legs and both are queued behind the box mutex. What
+follows separates what is MEASURED from what is still PENDING, and names the
+resource each pending item waits on.
+
+### The divergence, characterised exactly, before any oracle call
+
+Re-derived from the first pass's committed token streams rather than from its
+prose. The counts are printed by the instrument rather than asserted:
+
+- 1718 divergent positions across the six ON arms.
+- 18 of them are ADJUDICABLE, being the first divergence for each arm and
+  prompt pair. Every later position compares two different conditionings,
+  because the arms no longer share a prefix once they have split, so a gap
+  measured there says nothing about either arm.
+- Those 18 collapse to 3 DISTINCT PROBE POINTS, because arms that first split
+  at the same position of the same prompt share one prefix and one forward
+  answers all of them.
+
+| Prompt | Kind | Position | OFF token | ON token, and which arms |
+|---|---|---:|---:|---|
+| 0 | prose | 12 | 79733 | 279 for all six ON arms |
+| 1 | prose | 1 | 25 | 7318 for k=2 and k=3 real and padded, 198 for k=4 real and padded |
+| 2 | code | 69 | 15336 | 1727 for all six ON arms |
+| 3 | code | n/a | n/a | matches OFF at every position |
+
+Prompt 1 position 1 is the load-bearing observation. The SAME position resolves
+to THREE different tokens (25, 7318 and 198) under three different values of k.
+A depth defect cannot produce that, because the accept walk is a prefix walk and
+k does not enter the emitted VALUE. A flat distribution whose argmax is decided
+by the last bits of the logits can produce exactly that.
+
+### The mechanism this points at, located in the tree rather than guessed
+
+`include/vllm/v1/spec_decode/rejection_sampler.h:36-41` states the accept-iff-equal
+property as "every emitted token is a token the non-speculative greedy run would
+have emitted". That property is CONDITIONAL on one thing the comment does not
+name: the verify forward's logits must equal the plain decode forward's logits at
+the same position. `src/vllm/v1/worker/gpu/cudagraph_dispatch.h:13-16` records
+that they are not the same forward. The verify runs at query length `1 + k` and
+EAGER, while plain decode runs at `query_len == 1`. A different shape reaches a
+different kernel with a different reduction order, and a different reduction order
+moves the last bits.
+
+This is a HYPOTHESIS with a located mechanism, and it is NOT a result. The
+instrument that settles it is below, and it did not get to run.
+
+### The instrument, committed rather than left on the host
+
+`scripts/mtp-k-gt-1-neartie-gap.py` mirrors `scripts/qwen3-apc-neartie-gap.py`.
+It teacher-forces the pinned oracle on the shared prefix at each probe point and
+records, for the OFF token and for every ON token, the gap in milli-nats to the
+oracle's own argmax and the rank inside the oracle's top-K. The verdict is the
+ratified band, `kNearTieMnats = 500`, decided per candidate:
+
+- IN_BAND at or below 500 milli-nats and inside the top-K.
+- OUTSIDE_BAND above 500 milli-nats.
+- OUTSIDE_TOPK, which is a real forward divergence rather than a tie.
+
+The file that executed on `dgx.casa` and the file in this tree are byte-identical
+at sha256 `869f922995c2bb7db73cb0549d4ec5b0554e6c9f6fa4cb3202f8d824c70b287c`. The
+harness root and the model are arguments for exactly that reason. A script edited
+into a commitable shape after it reported is not the instrument that reported.
+
+It asserts its own preconditions before it measures anything, because a broken
+instrument presents as a verdict about the code. It asserts the oracle pin, it
+asserts that our prompt tokenization equals vLLM's at every probe point, it builds
+the engine with `max_logprobs` headroom rather than sitting on vLLM's default
+limit of 20 where the engine refuses the request, and it ABORTS by name when the
+oracle returns an empty distribution rather than letting `max()` raise into a
+traceback that a reader could score either way.
+
+### The harness gained the adjudication leg, and the legs were reordered
+
+`run_all_inner.sh` runs our arms, then ADJUDICATION, then the oracle arms, then
+the padded control. The change is additive and every device guard the first pass
+added is byte-for-byte intact, verified by diff: the empty-compute-apps
+precondition, the 45 GiB headroom refusal, the before-and-after device sample on
+every leg, the clock pin and the reset trap.
+
+The padded control moved to LAST deliberately. Its acceptance rates are already
+established and a rate is a deterministic function of the greedy token stream, so
+a window that runs short costs the least there. The two things this row is
+blocked on run first.
+
+### PENDING, and the resource each one waits on
+
+| Pending | Waits on |
+|---|---|
+| The adjudication verdict at the 3 probe points | the box mutex |
+| The vLLM leg, meaning `vllm_off` and `vllm_on_k2/k3/k4`, and with it the three-way token gate and the oracle's OWN ON against OFF attribution | the box mutex |
+| The re-run that puts every arm in ONE window, which is what would lift the VOID on `padded_k3` and `padded_k4` throughput | the box mutex |
+| M2 concurrency>1 A/B at matched k | the three above, in order |
+| The 35B lane | a checkpoint that is NOT on `dgx.casa`. The box carries `unsloth/Qwen3.6-27B-NVFP4`, `Qwen/Qwen3-Coder-30B-A3B-Instruct`, `nemotron-3.5-lightning-30b-nvfp4` and `qwen3.8-q1_0` and no 35B. Fetching one is a large-asset download and needs recorded authority |
+
+### What held the mutex, measured rather than inferred from one PID
+
+The gate was queued at 2026-08-17T00:48:57Z with `flock -w 21600` and never
+jumped the lock. It did not start, and the reason is worth recording because the
+lock LOOKED stale and was not what a single `ps` said it was.
+
+`nvidia-smi --query-compute-apps` was EMPTY and loadavg was near 1.1 throughout,
+which reads as an idle holder. Reading the whole process chain and
+`/proc/<pid>/fd` instead says something different:
+
+- The holder is PID 333128, `bash -s 8000`, holding `fd 3 -> $HOME/gpu.lock`.
+- It is ORPHANED. `PPid: 1`. Its entire wrapper chain is gone: the driving script
+  178924, the `flock` 178928 that took the lock, and the `tee` 178929 that was
+  writing the log.
+- Its `fd 1` and `fd 2` still point at `pipe:[822227]`, the pipe the dead `tee`
+  was reading. Whatever it measures is written into a pipe with no reader, so it
+  cannot report a result.
+- Its owner has already RESTARTED the job. The replacement run truncated the log
+  and is itself queued on the same mutex at `flock` 343146.
+- It is not idle. It holds a live container and is inside a readiness poll.
+
+So the mutex is held by an orphan of an abandoned run, and it blocks its own
+owner's restart as well as this gate. The GPU being empty is consistent with
+that and is not evidence the holder is finished, which is the trap: this harness
+puts the lock handle on a subshell rather than on a `timeout` wrapper, so the
+holder outlives every process a reader would think to check.
+
+Nothing was signalled. The orphan belongs to another session and clearing it is
+that session's call or the operator's, not this one's.
+
+### Gate for this pass
+
+`scripts/agent-preflight.sh`, exit 0, on the merge of `origin/main` into this
+branch. Counted rather than read, and counted over ALL FOUR markers the script
+emits, because it reports `--` for an undeclared role and a grep for `ok`,
+`FAIL` and `SKIP` alone silently drops that line:
+
+| Block | ok | FAIL | SKIP | -- |
+|---|---:|---:|---:|---:|
+| Session role | 1 | 0 | 0 | 0 |
+| Record gates | 27 | 0 | 0 | 0 |
+| Mutation suites | 46 | 0 | 0 | 0 |
+| Committed range vs `origin/main` | 3 | 0 | 0 | 0 |
+| Commit trailers vs `origin/main` | 2 | 0 | 0 | 0 |
+| TOTAL | 79 | 0 | 0 | 0 |
+
+`All gates green.` Both range blocks EXECUTED rather than skipping, asserted with
+`git merge-base --is-ancestor origin/main HEAD` rather than inferred from the
+blocks being present.
+
+**The three reds the first pass recorded are ABSENT on this host, which settles
+their attribution independently.** The first pass reproduced them on a pristine
+`origin/main` worktree on `dgx.casa` and concluded they were inherited. This pass
+ran the SAME tree on an x86_64 host that carries `cmake`, and
+`check-test-registration`, `test_check_test_registration` and
+`test_release_metadata` are all `ok`. A red that disappears when only the HOST
+changes is a property of the host, not of the diff.
+
+A pristine `origin/main` worktree was also run on this host as the baseline:
+73 `ok`, 0 `FAIL`, 2 `SKIP`, 1 `--`, 76 result lines, exit 1. Both differences
+from the branch run are explained and neither is a record defect. The `--` is
+`role-undeclared`, because a detached baseline worktree has no claim. The 2 SKIPs
+are the trailer gates, because `origin/main` ADVANCED from `e9dfa6319` to
+`b5756ea8c` mid-session and left the detached baseline behind it. That movement
+is also why this branch merged `origin/main` a second time before its own gate.
+A skipped gate reports nothing about the tree, and a run that skips while
+printing green is a shape this row has already paid for once.
+
+Disk was checked before any verdict was read, because ENOSPC on this project
+presents as a policy refusal rather than as a full disk: 35 GiB free on the local
+checkout's filesystem at 92 percent used, and 2.5 TB free on `dgx.casa`. No GPU
+work ran inside the gate and the gate held no lock.

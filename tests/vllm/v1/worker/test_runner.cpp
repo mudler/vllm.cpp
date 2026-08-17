@@ -451,11 +451,13 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(runner.num_blocks() == kNumBlocks);
   CHECK_FALSE(runner.kv_cache_backend_resident());
 
-  // M3: the runner resolves the ENGINE-level attention backend at init. On CPU
-  // the priority walk (cpu.cpp) is [CPU_ATTN (unregistered), FLASH_ATTN] so it
-  // lands on FLASH_ATTN — behavior-preserving, and the proof that selection is
-  // now part of the runtime path, not just the registry test.
-  CHECK(runner.attn_backend_name() == "FLASH_ATTN");
+  // M3: the runner resolves the ENGINE-level attention backend at init, per
+  // attention group. On CPU the dense priority walk (cpu.cpp) is
+  // [CPU_ATTN (unregistered), FLASH_ATTN] so it lands on FLASH_ATTN —
+  // behavior-preserving, and the proof that selection is now part of the
+  // runtime path, not just the registry test. One name per attention layer.
+  REQUIRE(runner.attn_backend_names().size() == 1);
+  CHECK(runner.attn_backend_names()[0] == "FLASH_ATTN");
 
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);

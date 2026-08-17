@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -26,8 +27,6 @@
 #include <map>
 #include <memory>
 #include <set>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +49,7 @@
 #include "support/max_abs_diff.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/support/platform_compat.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/multimodal/qwen3vl_processor.h"
 #include "../gguf_builder.h"
@@ -82,6 +82,8 @@ using vllm::MiniMaxH3UnpatchifyVideoTokens;
 using vllm::ParseMiniMaxH3DitParams;
 
 namespace {
+
+namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
 // H3Rand — the exact mirror of the generator's deterministic stream
@@ -560,7 +562,7 @@ std::map<std::string, std::string> WriteMiniMaxH3ShardedDit(
     const std::set<std::string>& omit_payload = {}) {
   REQUIRE(num_shards > 0);
   REQUIRE(entries.size() >= num_shards);
-  ::mkdir(dir.c_str(), 0755);
+  fs::create_directories(dir);
 
   std::map<std::string, std::string> weight_map;
   std::vector<std::vector<H3StEntry>> per_shard(num_shards);
@@ -593,7 +595,7 @@ std::map<std::string, std::string> WriteMiniMaxH3ShardedDit(
 uint64_t WriteMiniMaxH3SparseShardedRelease(const std::vector<vllm::MiniMaxH3TensorSpec>& specs,
                                             const std::string& dir, size_t num_shards) {
   REQUIRE(num_shards > 0);
-  ::mkdir(dir.c_str(), 0755);
+  fs::create_directories(dir);
   std::vector<std::vector<const vllm::MiniMaxH3TensorSpec*>> per_shard(num_shards);
   std::map<std::string, std::string> weight_map;
   for (size_t i = 0; i < specs.size(); ++i) {
@@ -635,7 +637,10 @@ uint64_t WriteMiniMaxH3SparseShardedRelease(const std::vector<vllm::MiniMaxH3Ten
     std::fwrite(header.data(), 1, header.size(), fh);
     std::fflush(fh);
     // The payload is a HOLE: declared in full, allocated not at all.
-    REQUIRE(::ftruncate(fileno(fh), static_cast<off_t>(sizeof(n) + header.size() + offset)) == 0);
+    const auto declared_size =
+        static_cast<std::uint64_t>(sizeof(n) + header.size() + offset);
+    REQUIRE(vllm::support::TruncateFile(
+        vllm::support::FileDescriptorFromFile(fh), declared_size));
     std::fclose(fh);
     declared += offset;
   }
@@ -656,7 +661,8 @@ void RemoveShardedDit(const std::string& dir, size_t num_shards) {
     std::remove((dir + "/" + ShardFileName(s, num_shards)).c_str());
   }
   std::remove((dir + "/model.safetensors.index.json").c_str());
-  ::rmdir(dir.c_str());
+  std::error_code ec;
+  fs::remove(dir, ec);
 }
 
 }  // namespace

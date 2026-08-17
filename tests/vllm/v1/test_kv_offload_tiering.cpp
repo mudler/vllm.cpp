@@ -23,8 +23,7 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
+#include "vllm/support/platform_compat.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/kv_offload/base.h"
 #include "vllm/v1/kv_offload/cache_identity.h"
@@ -42,7 +41,7 @@ class TempDir {
   explicit TempDir(const std::string& tag) {
     static int counter = 0;
     path_ = std::filesystem::temp_directory_path() /
-            ("vllmcpp_kvtier_" + tag + "_" + std::to_string(::getpid()) + "_" +
+            ("vllmcpp_kvtier_" + tag + "_" + std::to_string(vllm::support::CurrentProcessId()) + "_" +
              std::to_string(counter++));
     std::filesystem::create_directories(path_);
   }

@@ -435,6 +435,14 @@ Args ParseArgs(int argc, char** argv) {
       a.served_model_name = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--block-size") {
       a.block_size = std::stoi(NextArg(argc, argv, i, argv[0]));
+      // The attention backends (FLASH_ATTN / ROCM_ATTN get_kv_cache_shape)
+      // enforce block_size % 16 == 0 and the runner validates at init — fail
+      // here with a clear message rather than at engine init.
+      if (a.block_size <= 0 || a.block_size % 16 != 0) {
+        std::cerr << argv[0] << ": --block-size must be a positive multiple of 16"
+                  << " (got " << a.block_size << ")\n";
+        Usage(argv[0], 2);
+      }
     } else if (flag == "--num-blocks") {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--gpu-memory-utilization") {

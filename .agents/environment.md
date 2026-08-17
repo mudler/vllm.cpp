@@ -196,11 +196,11 @@ as root with a working `apt-get`, so a job provisions its own container.
 
 ### A relocated CUDA runtime starts on `thor:gpu0`, measured 2026-08-17
 
-Probed with five `rc run` jobs on `thor:gpu0`: `6f4bdb03`, `9c0ebeac`,
-`8beba132`, `f60d945f` and `63c60a90`. A `torch` and `triton` tree staged on
-`/workspace` imports, initializes CUDA, runs a bf16 matmul, and compiles and
-executes a Triton kernel. The job IDs in full, the staged-script sha256 values,
-the four walls and the working recipe are in
+Probed with six `rc run` jobs on `thor:gpu0`: `6f4bdb03`, `9c0ebeac`, `8beba132`,
+`f60d945f`, `63c60a90` and `fd5654c0`. A `torch`, `triton` and `numpy` tree
+staged on `/workspace` imports, initializes CUDA, runs a bf16 matmul, and
+compiles and executes a Triton kernel. The job IDs in full, the staged-script
+sha256 values, the four walls and the working recipe are in
 [`lease-runtime-staging.md`](specs/lease-runtime-staging.md)
 ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
 
@@ -223,12 +223,23 @@ export CPATH=/workspace/oracle-probe/pyhdr/python3.12:${CPATH:-}
 
 **Read the scope before you quote it.** This is `thor:gpu0` at capability (11,0)
 and nothing else. The GB10 is `sm_121a` and is UNMEASURED, so nothing here
-licenses a claim about the Spark. Only `torch` and `triton` are staged, so the
-pinned vLLM oracle is still not shown to run: it is a source build with compiled
-extensions and it needs `nvcc`, which the worker lacks. The torch wheel is
-`+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`, and that skew
-is recorded as observed rather than adjudicated. `numpy` is absent from the
-staged tree.
+licenses a claim about the Spark. Only `torch`, `triton` and `numpy` are staged,
+so the pinned vLLM oracle is still not shown to run: it is a source build with
+compiled extensions and it needs `nvcc`, which the worker lacks. The torch wheel
+is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`, and that
+skew is recorded as observed rather than adjudicated.
+
+**A prebuilt wheel does not remove the `nvcc` requirement, and that is measured.**
+An aarch64 vLLM wheel exists in general: `pip download --no-deps vllm` on the
+worker fetched `vllm-0.27.1-cp38-abi3-manylinux_2_28_aarch64.whl`, 307,180,998
+bytes. Our pin is not reachable that way, because
+`https://wheels.vllm.ai/nightly/vllm/` lists wheels for exactly ONE commit and is
+a moving pointer rather than an archive, and because the pin is a development
+version that is not on PyPI. Four 404s under a per-commit URL scheme were also
+seen, and they prove nothing, because that scheme was never confirmed against a
+known-good case. So reproducing the pinned oracle needs a source build or a
+deliberate pin advance. Nobody established that vLLM never retains per-commit
+wheels.
 
 ### The `flock` orphan hazard that motivated the replacement
 

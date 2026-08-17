@@ -40,12 +40,25 @@ Direction 2 probe recorded `python3=ABSENT`, `pip=ABSENT`, `gcc=ABSENT`,
 `curl=ABSENT` and `git=ABSENT` inside the worker.
 
 That reading came from one probe on `dgx:gpu0`, job
-`ff28ada1-0cd3-4867-bf9b-f67050d0608b`, taken on 2026-08-17. The worker image
-measured here on `thor:gpu0` the same day reports the opposite for two of those
-five names, `python3` and `gcc`. It runs as `uid=0(root)`, carries
-`/usr/bin/python3`, `/usr/bin/gcc` and `/usr/bin/apt-get`, and installs a package
-as root (`APT_UPDATE_RC=0`, `APT_INSTALL_RC=0`). `pip`, `curl` and `git` were not
-probed on `thor:gpu0`, so this row says nothing about them.
+`ff28ada1-0cd3-4867-bf9b-f67050d0608b`, taken on 2026-08-17. Three of its five
+names are now contradicted, and the contradictions come from TWO different boxes.
+Keep them apart, because a name proven on one worker proves nothing about the
+other.
+
+On `thor:gpu0`, job `8beba132` reports `python3` and `gcc` present. The worker
+runs as `uid=0(root)`, carries `/usr/bin/python3`, `/usr/bin/gcc` and
+`/usr/bin/apt-get`, and installs a package as root (`APT_UPDATE_RC=0`,
+`APT_INSTALL_RC=0`). Job `fd5654c0` then ran `python3 -m pip install --target`
+there to completion, so `pip` is present on `thor:gpu0` too.
+
+On `dgx:gpu0`, job `609c4944-594b-4617-967b-fb3d3d8c09f6` invoked
+`python3 -m pip install --quiet --target /workspace/oracle-probe/site torch`, so
+`python3` and `pip` are present on that worker as well. Read that job no further:
+it ended on `max_runtime exceeded (35m0s)`, so it is evidence that `pip` STARTS
+on `dgx:gpu0` and not that this install finished.
+
+`curl` and `git` were probed on neither worker after #1129, so this row says
+nothing about them.
 
 The measurement was taken correctly. The fleet changed under it. So the recorded
 cause no longer holds, and the three fleet-side fixes #1129 names as the only
@@ -100,6 +113,39 @@ export PYTHONPATH=/tmp/tp:/workspace/oracle-probe/site
 export CPATH=/workspace/oracle-probe/pyhdr/python3.12:${CPATH:-}
 ```
 
+## The prebuilt-wheel route is closed for our pin
+
+The spec says the oracle needs `nvcc`. A reader can reasonably ask whether a
+prebuilt wheel sidesteps that, so the question was measured on 2026-08-17 rather
+than argued. It does not.
+
+**An aarch64 vLLM wheel exists in general, so the architecture is not the
+obstacle.** On the worker, `python3 -m pip download --no-deps vllm` fetched
+`vllm-0.27.1-cp38-abi3-manylinux_2_28_aarch64.whl`, 307,180,998 bytes,
+`VLLM_DL_RC=0`. The same job reported `aarch64 linux-aarch64` from
+`platform.machine()` and `sysconfig.get_platform()`.
+
+**Our pin is not reachable that way.** `https://wheels.vllm.ai/nightly/vllm/` is
+a PEP 503 index, and it lists FOUR wheels for exactly ONE commit, `402547d7f`,
+aarch64 and x86_64, each also in its percent-encoded form. It is a moving
+pointer and not an archive, so the pin
+`5559679229bc961848b121ccdeaa8fa5d79bec98` is absent from it. The pin is also a
+development commit, `0.23.1rc1.dev1511+g555967922`, so it is not on PyPI.
+
+**The 404s are NOT the evidence, and this is the part to read carefully.** Four
+candidate filenames under `https://wheels.vllm.ai/<sha>/` returned 404 by GET
+and by HEAD, on the pin and on a current `main` sha `c1e438728c55`. That URL
+scheme was never confirmed against a known-good case, and the host's own root
+404s while `/nightly` returns 200. A 404 from an unconfirmed path therefore
+proves nothing about whether a per-commit wheel exists. The load-bearing
+evidence is the nightly index listing one commit.
+
+**So the consequence is narrow.** Reproducing the pinned oracle needs a source
+build, which is why it needs `nvcc`, or a deliberate advance of the pin to a
+commit a wheel exists for. A wheel cannot substitute for either. **This does NOT
+establish that vLLM never retains per-commit wheels.** Nobody measured that, and
+the unconfirmed URL scheme is exactly why.
+
 ## What this does NOT establish
 
 Read this section before you quote any line above it. Every claim here is
@@ -109,17 +155,24 @@ narrower than the sentence a reader wants to write from it.
   `sm_121a` and is UNMEASURED. Nothing here licenses a claim about the Spark.
   A probe is queued at lowest priority behind a human hold on `dgx:gpu0`. Until
   that probe returns, `dgx:gpu0` keeps the reading its own last probe gave it.
-- **The pinned vLLM oracle is NOT staged.** Only `torch` and `triton` are, so
-  this does not show that the oracle runs. vLLM at `555967922` is a source build
-  with compiled extensions, and it needs `nvcc`, which the worker still lacks.
-  #1129's consequence for the oracle-dependent rows is therefore NARROWED and not
-  closed.
+- **The pinned vLLM oracle is NOT staged.** Only `torch`, `triton` and `numpy`
+  are, so this does not show that the oracle runs. vLLM at `555967922` is a
+  source build with compiled extensions, and it needs `nvcc`, which the worker
+  still lacks. #1129's consequence for the oracle-dependent rows is therefore
+  NARROWED and not closed. A prebuilt wheel does not remove the `nvcc`
+  requirement either, and that is measured rather than assumed. See
+  `## The prebuilt-wheel route is closed for our pin`.
 - **The CUDA version skew is recorded as observed, not adjudicated.** The torch
   wheel is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`. It
   compiled and ran a correct kernel here. Nobody has read whether the skew
   changes a numerical result, and this row does not.
-- **`numpy` is absent** from the staged tree. Torch warns about it on every
-  import, and vLLM would require it.
+- **`numpy` WAS absent from the staged tree, and no longer is.** Job `fd5654c0`
+  installed it into the same tree on 2026-08-17: `NUMPY_RC=0`, then
+  `numpy 2.5.2 /workspace/oracle-probe/site/numpy/__init__.py`,
+  `NUMPY_IMPORT_RC=0`. The five jobs above ran BEFORE that install, which is why
+  each of their logs carries torch's `Failed to initialize NumPy: No module
+  named 'numpy'` warning. A job that stages the tree today should not see that
+  warning, and a job that still does is reading a different tree.
 
 ## Risks
 
@@ -149,13 +202,16 @@ device.
 
 ## Evidence
 
-Five `rc run` jobs on `thor:gpu0`, 2026-08-17. Every job after the first ran a
-script staged on the NAS rather than fed on stdin. That is a harness detail and
-not one of the four walls: `@triton.jit` calls `inspect.getsourcelines`, which
-raises `OSError: could not get source code` on a function read from stdin. The
-sha256 values are taken over the staged files at
-`/mnt/nas_share/rc/oracle-probe/`, which is the same folder the worker reads as
-`/workspace/oracle-probe/`.
+Six `rc run` jobs on `thor:gpu0`, 2026-08-17. The first five staged and ran the
+runtime. The sixth added `numpy` and asked the wheel question, and it was
+submitted separately as `claude/mudler-ubuntu-box/vllm-probe`.
+
+Every job after the first ran a script staged on the NAS rather than fed on
+stdin. That is a harness detail and not one of the four walls: `@triton.jit`
+calls `inspect.getsourcelines`, which raises `OSError: could not get source code`
+on a function read from stdin. The sha256 values are taken over the staged files
+at `/mnt/nas_share/rc/oracle-probe/`, which is the same folder the worker reads
+as `/workspace/oracle-probe/`.
 
 | Job | Script | sha256 prefix | Result |
 |---|---|---|---|
@@ -164,8 +220,17 @@ sha256 values are taken over the staged files at
 | `8beba132-c682-4b11-aa47-a682f2cce096` | `hdr.sh` | `fb02d1a1f45f` | `uid=0(root)`, `apt-get` installs `python3-dev`, headers staged, wall 3 appears as `PermissionError` on `ptxas-blackwell` |
 | `f60d945f-f5ec-49c5-9452-c214a50a0043` | `hdr2.sh` | `37c9dcad4c64` | `TRITON_PTXAS_PATH` to a `/tmp` copy is insufficient, and the staged `ptxas` reports `release 12.8, V12.8.93` |
 | `63c60a90-29b8-4115-88c5-d82be2126136` | `hdr3.sh` | `e11a540d23b8` | wall 4 removed, `TRITON_JIT_OK = 4096.0 PASS`, `PROBE5_RC=0` |
+| `fd5654c0-d522-498c-8800-ca4df9a36944` | `vllmprobe.sh` | `58fa03543810` | `NUMPY_RC=0`, `numpy 2.5.2` imports from the staged tree, `NUMPY_IMPORT_RC=0`, `VLLM_DL_RC=0` on a 307,180,998-byte aarch64 vLLM wheel, `aarch64 linux-aarch64` |
 
 The kernel each Triton job ran is `tritontest.py`, sha256 prefix `df9861c9f86d`.
+
+One `rc run` job on `dgx:gpu0` is cited above for a different purpose:
+`609c4944-594b-4617-967b-fb3d3d8c09f6` invoked `python3 -m pip install --target`
+and then ended on `max_runtime exceeded (35m0s)`. It is evidence that `python3`
+and `pip` exist on that worker. It is not evidence that its install completed.
+
+The `wheels.vllm.ai` reads have no `rc` job, because they are host-side network
+reads rather than device work.
 
 ## Stop conditions
 
@@ -181,9 +246,14 @@ The kernel each Triton job ran is `tritontest.py`, sha256 prefix `df9861c9f86d`.
 - [#1146](https://github.com/mudler/vllm.cpp/issues/1146) stays open. Re-run the
   identical staged probe on `dgx:gpu0` at `sm_121a`.
 - Stage the pinned vLLM oracle itself, which is what #1129 actually blocks. It
-  needs `nvcc` first.
+  needs `nvcc` first, because no wheel carries our pin.
 - Read whether the `+cu130` and `12.8` skew changes a numerical result.
-- Stage `numpy`, which vLLM requires and the current tree lacks.
+- Confirm the `https://wheels.vllm.ai/<sha>/` URL scheme against a known-good
+  case before anyone reads the four 404s as evidence of absence. Until then those
+  404s carry no weight, and the nightly index is the only load-bearing reading.
+
+Paid since this spec was written: `numpy` is staged (job `fd5654c0`), so the
+former `## Owed` line asking for it is removed rather than left to read as debt.
 
 ## Now
 
@@ -191,4 +261,7 @@ The four walls and the working recipe are recorded here.
 `.agents/environment.md`, `.agents/specs/mtp-k-gt-1.md` and
 `.agents/specs/gpu-lease-methodology.md` no longer carry "cannot start Python" as
 the live cause, and each now names the box and the date its reading came from.
-The next step is the `dgx:gpu0` probe, which the coordinator has queued.
+The staged tree now holds `torch`, `triton` and `numpy`. It does not hold the
+oracle, and a prebuilt wheel cannot put it there for our pin, so `nvcc` and a
+source build remain the route. The next step is the `dgx:gpu0` probe, which the
+coordinator has queued.

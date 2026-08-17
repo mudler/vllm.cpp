@@ -806,11 +806,27 @@ into the weights and cannot vary between generations - upstream takes it as a
 The adapter is a safetensors file of `.lora_A.weight` / `.lora_B.weight` pairs,
 with or without ComfyUI's `diffusion_model.` prefix. It works on every arm the
 DiT loads - bf16, FP8 and NVFP4 alike - because those are all dequantized to
-bf16 before the delta is added. Three things REFUSE by name rather than
+bf16 before the delta is added. Two things REFUSE by name rather than
 proceeding quietly: an adapter naming a module this port does not bind (upstream
-would skip it, and a skip cannot be told apart from a typo), an adapter that
-fuses into nothing at all, and a second `--lora`, since only one adapter is
-accepted so far.
+would skip it, and a skip cannot be told apart from a typo), and an adapter that
+fuses into nothing at all.
+
+**A second `--lora` does NOT refuse, and this page said it did until 2026-08-17.**
+Only one adapter is accepted, and the library enforces that
+(`ltx2_lora.cpp:243-248` fails on more than one, citing `dubit.py:364-365` and
+`hdr_ic_lora.py:271-272`). But `ltx2-gen` cannot construct the two-adapter vector
+that trips it: `SetExtra` (`examples/ltx2_gen/main.cpp:212-221`) overwrites an
+existing key in place, so `--lora a --lora b` leaves one `lora_path` extra
+holding `b`, silently fuses `b`, and exits 0. Pass one adapter.
+
+The C ABI cannot reach it either, and that is the wider half of the finding:
+`ltx2_video.cpp:813` is the ONLY `dit_options.loras.push_back` in the tree and it
+runs at most once, under `if (!lora_path.empty())`. So `loras.size()` is 0 or 1
+on every production path — CLI, `vllm_video_engine_load` and the server alike —
+and the more-than-one refusal is reached only by `test_ltx2_lora`. It is correct
+code guarding a state nothing can currently construct, which is the shape
+N-adapter fusion ([#932](https://github.com/mudler/vllm.cpp/issues/932)) will
+need. Tracked as [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
 
 Supplying an adapter also reads its `reference_downscale_factor` and
 `reference_temporal_scale_factor` metadata (`iclora_utils.py:30-49`). Those are
@@ -875,10 +891,12 @@ all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
 `--video-extra pipeline_kind=dfr` at launch. A server started that way renders
 every `/v1/videos` request through DFR.
 
-The two knobs beside it are per-GENERATION and therefore CLI and ABI only, because
+The two knobs beside it are per-GENERATION and therefore **ABI only**, because
 `/v1/videos` forwards no per-generation extra to any engine yet (issue #928):
 `num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
-below.
+below. This paragraph said "CLI and ABI only" until 2026-08-17, and the CLI half
+was never true — `examples/ltx2_gen/main.cpp` carries no flag for either name, so
+`vllm_video_gen_params.extra_keys` is the only surface that reaches them.
 
 ### LTX-2.5 text-to-audio: a render with no picture
 
@@ -892,9 +910,18 @@ ltx2-gen --dit ltx-2.5-dit.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --encoder gemma4-12b-with-proj.safetensors --encoder-config gemma4.json \
          --pipeline-kind t2a_one_stage --device cpu \
-         --frames 121 --steps 30 --prompt "rain on a tin roof, distant thunder" \
+         --frames 121 --prompt "rain on a tin roof, distant thunder" \
          --workdir /tmp/t2a
 ```
+
+**`ltx2-gen` has no `--steps` flag, and this recipe carried one until 2026-08-17.**
+The step count comes from the resolved recipe (`ltx2_video.cpp:2900`), and the
+`vllm_video_gen_params.num_inference_steps` field that would override it
+(`include/vllm.h:1072`) has no flag on this binary — `minimax-h3-gen` and
+`music3-gen` both expose `--steps`, which is where the published line came from.
+An unknown argument is not ignored here: `examples/ltx2_gen/main.cpp:318-321`
+prints `unknown argument` and exits 2, so the command as published could not run
+at all. Overriding the step count needs the C ABI today.
 
 **These file names are not a checkpoint pin, and no LTX-2.5 recipe in this
 document is.** None of them names a HuggingFace repo, a revision or a sha256,
@@ -1038,8 +1065,19 @@ one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
 not, and asking for it fails with a message naming the missing
 neighborhood-attention kernel. It never falls back to the convolutional decoder,
 because that would hand back a lower quality render as if it were the one you
-asked for. Keyframe and reference conditioning is refused for the same reason: it
-runs through the video VAE's encoder, and only the decoder is ported.
+asked for.
+
+**The sentence that used to follow was stale and is retired here.** It said
+keyframe and reference conditioning were refused because "only the decoder is
+ported". The video VAE **encoder** is ported and is kept resident
+(`ltx2_video.cpp:1007-1012`), the first-frame and last-frame keyframe arms are
+SERVED — the same page says so at the image-conditioning section above — and what
+remains refused is REFERENCE conditioning, for reasons that have nothing to do
+with the encoder: the reference clip has no pixel path and stage 2 must run
+unfused (`ltx2_video.cpp:1955-1990`,
+[#975](https://github.com/mudler/vllm.cpp/issues/975)). Reference AUDIO is refused
+separately (`ltx2_video.cpp:1991-2004`). A refusal whose stated reason has been
+removed is worse than no reason, because a reader plans around it.
 
 **The convolutional decode is TILED and STREAMED, on upstream's own defaults, and
 there is no knob.** The layout is the one `ltx_pipelines` builds for a Conv VAE
@@ -1073,8 +1111,8 @@ memory number:
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT
 file, were among the modules the DiT loader would not load. They are loaded
-(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1221`, enumerates their own
-contract at `:1224`, outside the DiT's),
+(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1292 @ b5756ea8c`, enumerates their
+own contract at `:1295`, outside the DiT's),
 so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
 needs a matching pair of embeds files. The gap that remains is a numeric one: the
 tower, the connector's forward and both caption projections each have an oracle
@@ -2407,8 +2445,11 @@ something else this port does not.
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`,
-36 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 21`,
+`include/vllm.h:273`; **46** exported functions, the count of `^VLLM_API `
+declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
+This line read `19` and `36` until 2026-08-17; both numbers were last true
+several ABI additions ago, and neither is derived by any gate.
 
 ```c
 #include "vllm.h"
@@ -2500,7 +2541,12 @@ seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
-`upsampler_path` and `duration_head_path`. An extra a family does not define is
+`upsampler_path`, `duration_head_path`, `lora_path` and `lora_strength` — twelve
+keys, which is `kKnownLoadExtras` (`ltx2_video.cpp:377-383`) in order. The two
+LoRA keys landed with issue #923 and were missing from this list until
+2026-08-17; the array's own neighbouring comment still says "nine of these ten",
+which is [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
+An extra a family does not define is
 refused, never ignored. One caveat inside that set: `duration_head_path` is
 defined but UNSERVED — the duration head is ported and gated as a brick, and
 nothing in the video engine constructs one — so supplying it is **refused by
@@ -2516,11 +2562,16 @@ spatiotemporal upsampler is the arm with `spatial_upsample` AND
 `temporal_upsample` set, which upstream builds as a different operator
 (`Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`). The temporal-only x2 upsampler is
 **ported** and is not refused; nothing shipped drives it yet, so it is gated
-rather than served. Four more are
+rather than served. **Three** more are
 recorded as out of scope but are **not requestable**, so no flag or extra can
 reach them: `int8-convrot`, single-node multi-GPU, and
 `BetaScheduler`. (LoRA fusion was in that list until 2026-08-15 and is now
-SERVED - see `--lora` above - so its marker was retired rather than moved.) Their messages
+SERVED - see `--lora` above - so its marker was retired rather than moved. This
+sentence still said "Four more" until 2026-08-17, counting the retired marker in
+the same breath as it explained the retirement.) That is four
+`Ltx2UnportedPipelineFeature` enumerators in total, one reachable and three
+markers (`ltx2_pipeline.h:768-803`), and the split is derived from the tree by
+`test_ltx2_pipeline` rather than restated here. Their messages
 say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
 `BetaScheduler` is in that group rather than the reachable one because upstream
 selects it nowhere: every `ltx-pipelines` entry point hard-codes
@@ -2864,9 +2915,9 @@ routes stay unregistered.
 render path ships and is documented above under
 [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do):
 `ltx-2.5` is one of the two registered video families
-(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:1529`), the
-Gemma-4 text tower loads from `--encoder` and sets `has_encoder`
-(`ltx2_video.cpp:893`), both VAEs and the pipeline layer are implemented
+(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:3723 @ b5756ea8c`), the
+Gemma-4 text tower loads from `--encoder` (`ltx2_video.cpp:1149`) and sets
+`has_encoder` (`ltx2_video.cpp:1191`), both VAEs and the pipeline layer are implemented
 (`ltx2_video_vae.cpp`, `ltx2_audio_vae.cpp`, `ltx2_pipeline.cpp`), and the
 `/v1/videos` routes register for whatever family `--video-dit` resolves —
 `server_main.cpp` calls the family-agnostic `LoadVideoEngine` and then prints the
@@ -2976,9 +3027,25 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. The pairs that
-resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
-2.5, `dmd2` at 2 and 2.3, and `retake` at 2 and 2.5.
+schedule or guidance scale renders a video instead of failing. **Fifteen** pairs
+resolve, derived from `ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:1288-1333`):
+
+| `pipeline_kind` | resolving `model_version` |
+|---|---|
+| `one_stage` | 2, 2.3, 2.4, 2.5 |
+| `distilled_two_stage` | 2, 2.5 |
+| `dfr` | **2.5 only** |
+| `dmd2` | 2, 2.3 |
+| `retake` | 2, 2.5 |
+| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 |
+
+This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
+`t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
+DFR's base stage rests on generated keyframe slots, which need a checkpoint
+declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
+that parameter — so resolving DFR onto it would build a recipe the engine must
+then refuse at load. Refusing at the recipe table names the version instead
+(`ltx2_pipeline.cpp:1306-1313`).
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3032,9 +3099,26 @@ LTX-2.5 checkpoints: the FP8 DiT, both NVFP4 DiTs, and the torchao-NVFP4 Gemma-4
 text encoder with its embedded tokenizer. These are the entry points the render
 path itself drives: `--dit` (`--video-dit` on the server) reaches
 `Ltx2StreamDitToDevice` / `Ltx2LoadDitFromSafetensors` at
-`ltx2_video.cpp:576-577`, and `--encoder` (`--video-encoder`) reaches
-`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:851`. This section
+`ltx2_video.cpp:815-816 @ b5756ea8c`, and `--encoder` (`--video-encoder`) reaches
+`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:1149`. This section
 documents them at the library level, where the gate below runs.
+
+**Ten coordinates into `ltx2_video.cpp` and `ltx2_loader.cpp` were wrong, at
+eleven citation sites on this page** — `ltx2_video.cpp:893` was cited twice.
+Five of the replacements carry `@ b5756ea8c`, one per affected passage; the bare
+`:NNN` beside a pinned one belongs to the same file at the same revision.
+Nothing else on this page is pinned, so read an unpinned coordinate as
+unverified.
+
+They were re-derived on 2026-08-17 from the sentence making each claim rather
+than by reading whatever sat at the cited line, and they were off by 40 to 2200
+lines: the family registry was cited at `:1529` and lives at `:3723`, and
+`has_encoder` was cited at `:893` where the assignment is at `:1191`. Every
+symbol existed, so every citation looked plausible; the tell was only that
+nothing at the cited line mentioned it. No gate here checks a documentation
+anchor ([#632](https://github.com/mudler/vllm.cpp/issues/632),
+[#911](https://github.com/mudler/vllm.cpp/issues/911)), so a pin is the only
+thing that lets a reader tell a stale coordinate from a moved one.
 
 The two NVFP4 checkpoints were written by different producers that disagree about
 both the group-scale framing and which nibble holds which weight, so the loader
@@ -3074,9 +3158,9 @@ nothing": upstream builds the parameter on the meta device and
 actually carries rather than refusing it or inventing a zero. The two
 `*_embeddings_connector` towers are
 **not** among them and never will be:
-`UnportedFamilies` filters them out at `ltx2_loader.cpp:527` through
-`LoadedElsewhere` (`ltx2_loader.cpp:514`), `RefuseUnported`
-(`ltx2_loader.cpp:537`) says so in its own message at `ltx2_loader.cpp:553-557`,
+`UnportedFamilies` (`ltx2_loader.cpp:573 @ b5756ea8c`) filters them out at `:582`
+through `LoadedElsewhere` (`ltx2_loader.cpp:569`), `RefuseUnported`
+(`ltx2_loader.cpp:592`) says so in its own message at `ltx2_loader.cpp:608-611`,
 and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
 what the video engine calls, so a checkpoint this port reads completely is never
 made to ask for `allow_unported_modules` on their account. (The "five" this
@@ -3200,7 +3284,7 @@ This documents **one brick of the shipped render path** — the text conditionin
 the DiT consumes — and how to reproduce its gate. The render itself is above
 under [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do);
 `--encoder` is what puts this brick on that path, and `has_encoder` is set at
-`ltx2_video.cpp:893` once the tower loads.
+`ltx2_video.cpp:1191 @ b5756ea8c` once the tower loads.
 
 LTX-2.5 does not condition on a text encoder's last hidden state. It takes every
 Gemma-4 hidden state (the embedding output plus all 48 decoder outputs, 49 in

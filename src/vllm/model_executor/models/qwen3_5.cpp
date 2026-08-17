@@ -5279,6 +5279,16 @@ class Qwen35ExpertStream {
     // way. `advised_` counts the calls that were actually accepted, so a run
     // can tell a working hint from a silently rejected one.
     //
+    // ROUNDING THE END UP CAN LEAVE THE ALLOCATION, and that is the one way
+    // this call still fails: madvise(2) returns ENOMEM when any page in the
+    // range is unmapped, so a tower whose last byte sits near the end of its
+    // final mapped page would not be counted. In production the tower is a
+    // borrowed view into a file mapping many pages larger than one slice, so
+    // the trailing page is mapped. On the heap-backed towers the gates build it
+    // holds because the allocator's arena page is mapped, not because the
+    // allocation reaches it — which is why `advised == fills` is asserted
+    // against a measured run rather than assumed from the arithmetic.
+    //
     // NO SPEEDUP IS CLAIMED HERE. This makes the call well-formed; whether
     // readahead moves decode is a measurement the spec records as owed.
 #if defined(__unix__)
@@ -5512,18 +5522,38 @@ class Qwen35ExpertStream {
 // `MatmulF32Slice` states `expert >= 0`: the flag is per-thread because a
 // decode step runs on one host thread, which is the assumption the store's own
 // locking already makes.
+//
+// THE REFUSAL IS NOT GATED ON `Qwen35ExpertStreamRequested()`, deliberately.
+// "One forward is one step" is a property of the CALL GRAPH, not of the
+// streaming lane: a nest is a defect whether or not a store exists, and the
+// streamed run is the rare configuration. Arming it only there would let the
+// default-on path establish a nest that nobody sees until someone turns
+// streaming on, which is the shape this row keeps finding. The cost is that a
+// nest reds every Qwen3.5 forward rather than only the streamed ones, and that
+// is the intended polarity: loud on the default path is what makes it a gate.
+//
+// `Begin`/`End` are named rather than living only in the constructor and
+// destructor bodies so that `detail::ExpertStreamStepScope` can hold THE SAME
+// boundary. A gate that re-implemented the refusal would prove its own copy;
+// this way deleting the `VT_CHECK` below is one edit that both changes
+// production and takes the gate red.
 struct Qwen35ExpertStreamStep {
-  Qwen35ExpertStreamStep() {
+  Qwen35ExpertStreamStep() { Begin(); }
+  ~Qwen35ExpertStreamStep() { End(); }
+  Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
+  Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
+
+  // Open the step. Throws when one is already open on this thread; the flag is
+  // then left as it was, so the outer guard's `End` still closes exactly one.
+  static void Begin() {
     VT_CHECK(!Open(), "qwen3_5: a decode step is already open; the expert-stream "
                       "step guard marks ONE forward and must not nest");
     Open() = true;
   }
-  ~Qwen35ExpertStreamStep() {
+  static void End() {
     Open() = false;
     Qwen35ExpertStream::EndStepIfActive();
   }
-  Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
-  Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
 
  private:
   static bool& Open() {
@@ -7331,6 +7361,17 @@ void detail::ExpertStreamSetForceFallback(bool on) {
 void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
 
 void detail::ExpertStreamFlushStats() { Qwen35ExpertStream::FlushFinalStats(); }
+
+// The step guard as a scope a gate can hold. These forward to the SAME
+// `Begin`/`End` the production guard's constructor and destructor call, so the
+// nesting refusal a gate observes here is the one every forward in this file is
+// protected by, not a re-statement of it.
+detail::ExpertStreamStepScope::ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::Begin();
+}
+detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::End();
+}
 
 // ENG-ASYNC-SCHED W4: overwrite the REAL prefix of a freshly uploaded input-id
 // buffer with the device-resident ids the async runner's combine produced.

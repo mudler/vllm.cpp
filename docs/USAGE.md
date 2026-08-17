@@ -3150,13 +3150,14 @@ Two of the fields decide whether the run is measuring anything at all:
   raise `VT_MOE_EXPERT_STREAM_SLOTS`.
 
 Read it together with the `[expert-stream] ON slots=...` banner, which is printed
-once when the lane builds its store. The three shapes are:
+once when the lane builds its store. The four shapes are:
 
 | Banner | Final line | What happened |
 |---|---|---|
 | absent | absent | Nothing reached the streamed seam. A CUDA run (a device-resident expert is served unchanged), a checkpoint whose experts are not keep-quant towers, or a prompt that never reached an MoE layer |
 | present | present | The lane ran. Read `steps` and `exhausted` |
 | present | absent | The process did not reach its static destructors: a crash, a signal, or `_exit` |
+| present | absent, but a statistics line already appeared mid-run | The line was flushed early and the teardown one is suppressed. Only a gate does this: the line is printed once per process, and the internal `ExpertStreamFlushStats` seam takes that one print. No shipped command or server path calls it, so an operator does not see this shape |
 
 A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See

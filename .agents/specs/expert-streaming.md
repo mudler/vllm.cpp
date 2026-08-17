@@ -1212,7 +1212,10 @@ is not reachable by any test, because `Reserve` and `Get` are called from the sa
 call chain. It would have been an untestable branch added to fix an
 untestable-branch problem. What replaces it is a protocol the docs now state:
 the `[expert-stream] ON ...` banner says a store was built, the final line says
-what it did, and the three combinations of present/absent each mean one thing.
+what it did, and each combination of present/absent means one thing. The docs
+carry four rather than three: an in-process flush through the exposed seam takes
+the once-flag, so a gate that calls it leaves the teardown line absent, and only
+a gate can produce that shape (#1106).
 
 **`CHECK(s.advised > 0)` could not fail for the defect it named.** Reinjecting the
 pre-fix unaligned `madvise` address exits 0 in 40 of 40 runs. The measured reason
@@ -1238,7 +1241,9 @@ clock once per draft plus once for the target. The opposite mistake is the one
 adding guards invites — a guard nested inside another ends the step twice, which
 decays every resident entry an extra tick for a step that never happened — so the
 guard now REFUSES to nest, stated as a precondition in the same idiom
-`MatmulF32Slice` uses for `expert >= 0` rather than handled. `RunMoeBlock` stays
+`MatmulF32Slice` uses for `expert >= 0` rather than handled. That refusal was
+STATED here and pinned by nothing, which the next review measured; see #1106
+below. `RunMoeBlock` stays
 deliberately unguarded: it is one block, not a forward, and qwen3_moe.cpp owns
 the boundary for the model that composes it. That exemption is what makes the
 `steps == 0` case above constructible without breaking anything.
@@ -1265,6 +1270,88 @@ first attempt at two of them was INVALID rather than passing — one did not bui
 summary because a failing case dumps the child's output into the parent's log,
 so the first `test cases:` match in the file belonged to the child.
 
+## The review of that repair (#1106): three claims outran the code
+
+17 August 2026. A fresh review of the pull request above returned FAIL. The six
+functional repairs are correct and all thirteen mutation claims reproduce
+independently. What failed is what was said about them, and three of the four
+findings are the class that pull request was fixing.
+
+**The comment asserted a mechanism that does not exist.**
+`qwen3_5_internal.h` said the final line is reached "at process teardown: a
+static registered the first time streaming is requested, plus the store's own
+destructor, whichever runs first". There is no such static — the same pull
+request says in its own body that the hook was deliberately not built, and the
+grep for `atexit` returns nothing. It also claimed "exactly one line per
+process, even on a run with zero steps" without the two qualifiers `docs/USAGE.md`
+carries: a store must have been BUILT, and the process must RUN its static
+destructors. This is #1091 finding 5 — a comment promising more than the code —
+reintroduced one file away in the change that fixes it, which is the strongest
+argument on record that the class is a habit rather than an accident.
+`~Qwen35ExpertStream` is now named as the only production caller, with both
+qualifiers, and the note says what calling the exposed seam costs: it takes the
+once-flag, so it suppresses the teardown line for the rest of the process.
+
+**"Nothing lands dead" was claimed for four step guards and holds for one.**
+Only `Qwen3_5MTPModel::ForwardPaged` has a production caller
+(`runner.cpp:2183` -> `spec_decode/mtp/speculator.cpp:107,262`). The other three
+sit in parity-only entry points: `Qwen3_5MTPModel::Forward` is reached only
+through `ForwardLogitsHost`, itself a "standalone parity convenience" with no
+caller outside `tests/`; `Qwen3_5Model::ForwardDense` is the parity reference by
+its own header; `Qwen3_5ReplayLayer` is per-layer parity replay. A call site
+inside a test is not reach. Nothing is deleted — the guards are correct where
+they sit and become live the moment any of those entry points gains a production
+caller, and adding the guard later WITH the caller is exactly how this row lost
+its step boundary the first time. What changes is the record: they are named as a
+staged slice that lands unreached, in the commit body, in the pull request body
+and under `## Owed` below, tracked as #1108.
+
+**The nesting refusal was asserted everywhere and pinned nowhere.** The source,
+the spec and the pull request body all stated that the guard refuses to nest.
+Deleting its `VT_CHECK` left both focused binaries fully green — 6/6 and 4/4 —
+and it appeared in none of the thirteen mutations. It is unreachable through
+production code by construction: every forward that takes expert slices is a
+complete forward that no other one contains, so no legitimate call graph nests
+one. `detail::ExpertStreamStepScope` exists for that and nothing else, and it
+forwards to the guard's own `Begin`/`End` rather than restating the flag, so a
+gate holding it measures the production boundary. The case asserts the refusal
+twice: a second scope throws, AND a real `ForwardDense` entered while the scope
+is held throws too — the second is what proves the two share a boundary rather
+than agreeing by coincidence, and a mutation that gives the scope a parallel flag
+kills only that pair.
+
+The refusal is deliberately NOT gated on `Qwen35ExpertStreamRequested()`. "One
+forward is one step" is a property of the call graph, not of the streaming lane,
+so a nest is a defect whether or not a store exists. Arming it only under
+streaming — the rare configuration — would let the default path establish a nest
+that nobody sees until someone turns streaming on, which is this row's recurring
+shape. The cost is that a nest reds every Qwen3.5 forward and not merely the
+streamed ones, and that is the intended polarity.
+
+**The MSVC repair was incomplete.** `::setenv` sat at namespace scope in both new
+gates with no `_WIN32` guard. It is POSIX; MSVC's CRT has only `_putenv_s`, the
+targets are added unconditionally, and `build-windows-release.ps1` configures
+`VLLM_CPP_BUILD_TESTS=ON` — so the translation units did not compile there at
+all, and the claim that the step-clock cases are "built everywhere" was false.
+Both now use `vllm_test::SetEnv` from `support/test_env.h`, which has been the
+one place that branch lives since #603. CI could not report it because the
+Windows lanes fail earlier, inside the product library, on #1068; a lane that
+never reaches a test translation unit cannot fail in one. The static checker that
+could have is blind to it twice over — it scans only the shipped-server sources
+and knows neither `setenv` nor `unsetenv` — filed as #1107 against
+`ENG-RELEASE-WINDOWS` and not fixed here, because changing a checker's semantics
+needs its own spec and red-before evidence.
+
+Three mutations on the added guarantee, three caught, each with a changed sha256,
+a zero compile status and a non-zero doctest case count: deleting the `VT_CHECK`
+(7 cases, 1 failed, all six assertions of the new case red, and `Steps()` reading
+3 where 1 is correct — the double-count the guard exists to stop); dropping
+`Open() = false` from `End` (7 cases, 4 failed); and giving the scope its own
+parallel flag (7 cases, 1 failed, exactly the two assertions that pin the shared
+boundary). The Windows repair is NOT mutation-proven: no MSVC is reachable from
+this host, and the checker that would have caught it statically is the subject of
+#1107.
+
 ## Owed
 
 Carried debt for this row. Each item names why it is not closed here.
@@ -1273,7 +1360,10 @@ Carried debt for this row. Each item names why it is not closed here.
 |---|---|
 | **Re-measure decode on a LIVE cache.** The `docs/BENCHMARKS.md` decode figure for this row was taken with the step clock dead from token 3 onward and is void. | Needs `dgx.casa` and the 370 GiB checkpoint. The box was unreachable for this repair (`No route to host`), and this host has no CUDA device and cannot hold the model. |
 | **The `pread` path has never run on the model.** `EnsureFile` now has a CPU-local gate that drives it through the production seam from a temp file and proves the `file_offset + offset` composition (#1091 finding 4), so it is no longer UNREACHED. It is still unmeasured on a real checkpoint. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
-| **A run that REQUESTS streaming and never builds a store prints no statistics line.** The `[expert-stream] ON ...` banner is absent in that case too, so no-banner means "nothing reached the lane" and banner-without-line means "the process died"; the docs state all three shapes. | A teardown hook that could report it is not reachable from any test on a CPU-only host, because `Reserve` and `Get` sit in one call chain and a device platform is what separates them. Landing it would have been an untestable branch added to fix an untestable-branch problem. Needs `dgx.casa` (see #1091). |
+| **A run that REQUESTS streaming and never builds a store prints no statistics line.** The `[expert-stream] ON ...` banner is absent in that case too, so no-banner means "nothing reached the lane" and banner-without-line means "the process died"; the docs state all four shapes. | A teardown hook that could report it is not reachable from any test on a CPU-only host, because `Reserve` and `Get` sit in one call chain and a device platform is what separates them. Landing it would have been an untestable branch added to fix an untestable-branch problem. Needs `dgx.casa` (see #1091). There is NO such hook in the tree: `~Qwen35ExpertStream` is the only production caller of the final line, and the header now says so rather than describing the hook that was rejected (#1106). |
+| **Three of the four step guards land UNREACHED.** `Qwen3_5MTPModel::Forward`, `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity-only entry points with no caller outside `tests/`, so their `Qwen35ExpertStreamStep` guard is reached by no production path. Only `Qwen3_5MTPModel::ForwardPaged` is (`runner.cpp:2183` -> `spec_decode/mtp/speculator.cpp:107,262`). Owning row `ENG-EXPERT-STREAM`; tracked as [#1108](https://github.com/mudler/vllm.cpp/issues/1108). | Nothing is deleted, because the guards are correct where they sit and cost nothing, and the alternative — add the guard later, together with the caller — is precisely how this row lost its step boundary in the first place. It closes when one of those entry points gains a production caller, or when they are retired as parity references. Neither is scheduled and neither should be forced by the record. |
+| **`check-windows-portability.py` cannot see this class.** It scans only the sources reachable from the shipped server target, so no test translation unit at all, and `setenv`/`unsetenv` are in none of its patterns. Tracked as [#1107](https://github.com/mudler/vllm.cpp/issues/1107) against `ENG-RELEASE-WINDOWS`. | Changing a checker's semantics needs its own spec, a red-before test and green-after evidence, which is a different unit of work from repairing two test files. Widening the scan to `tests/` also has to separate a guarded POSIX call from an unguarded one across a large surface, and that wants measurement rather than a guess. |
+| **The Windows repair is not mutation-proven.** Both gates now use `vllm_test::SetEnv`, and nothing here executed an MSVC compile of them. | No MSVC is reachable from this host, and the Windows CI lanes fail earlier in the product library on #1068, so they cannot report a test translation unit either way. The static checker that could have is #1107. |
 | **The `MADV_WILLNEED` readahead is unmeasured.** It is now well formed and counted; whether it moves decode is unknown. | Same host and the same OOM contention. No speedup is claimed anywhere for it. |
 | **Windows has no streaming.** `EnsureFile` throws `"EnsureFile needs pread"` on `_WIN32`, and `SourceOfSpan` returns `fd = -1` there, so the lane falls back to the mapping copy. | No `pread(2)`; needs an `OVERLAPPED`/`ReadFile` arm. Refused by name rather than silently degraded. |
 | **The CUDA arms of [#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s grouped gate have not run on a device.** | Recorded in that issue, which stays open for it. Unchanged by this repair. |

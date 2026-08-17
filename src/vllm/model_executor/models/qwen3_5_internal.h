@@ -419,12 +419,49 @@ void EndExpertStreamStep();
 
 // Print the streamed-expert statistics line NOW, once, whatever the run did.
 //
-// Production reaches this at process teardown: a static registered the first
-// time streaming is requested, plus the store's own destructor, whichever runs
-// first. It is exposed because the guarantee — exactly one line per process,
-// even on a run with zero steps and even with the periodic report silenced —
-// cannot be observed from inside a test any other way, and that guarantee is
-// what makes `steps == 0` readable at all. A second call prints nothing.
+// `~Qwen35ExpertStream` IS THE ONLY PRODUCTION CALLER. The store is a
+// function-local static, so it is destroyed on the normal exit path and prints
+// what the run ended up doing. There is no second hook: nothing registers an
+// `atexit` handler when streaming is merely REQUESTED, and none was landed —
+// that shape is recorded under the spec's `## Owed` with its reason, and this
+// comment claimed the hook existed while the change that wrote it was fixing
+// exactly this class of overclaim one file away (#1091).
+//
+// So the guarantee carries the same two qualifiers `docs/USAGE.md` does, and it
+// is one line per process under both: a store must have been BUILT, and the
+// process must RUN its static destructors. No store means no line — and no
+// `[expert-stream] ON ...` banner either, which is how the absent pair is read
+// — and a crash, a signal or `_exit` prints nothing. Under those it holds even
+// on a run with zero steps and with the periodic report silenced, which is what
+// makes `steps == 0` readable at all.
+//
+// This entry exists because a static destructor fires after main returns and
+// nothing inside the process can assert on it. Calling it TAKES the once-flag,
+// so it suppresses the teardown line for the rest of the process and the caller
+// becomes the one place the line appears. A second call prints nothing.
 void ExpertStreamFlushStats();
+
+// ONE decode step, as a scope, for a gate that needs to hold the boundary
+// itself rather than reach it through a forward.
+//
+// It exists for one question: the step guard REFUSES TO NEST, and no legitimate
+// call graph in the tree can ask it to. Every forward that takes expert slices
+// is a complete forward that no other one contains, so the refusal was asserted
+// in three places and pinned in none — deleting its `VT_CHECK` left both
+// focused binaries fully green (#1091 review of #1100). A gate cannot reach it
+// through production code, and a gate that re-implemented the flag would prove
+// its own copy, so the guard's boundary is exposed here and this scope forwards
+// to it.
+//
+// Constructing a second scope, or entering a forward while one is held, throws
+// `std::runtime_error`. That is armed on the DEFAULT path and not only on the
+// streaming lane, on purpose: see the note on `Qwen35ExpertStreamStep`.
+class ExpertStreamStepScope {
+ public:
+  ExpertStreamStepScope();
+  ~ExpertStreamStepScope();
+  ExpertStreamStepScope(const ExpertStreamStepScope&) = delete;
+  ExpertStreamStepScope& operator=(const ExpertStreamStepScope&) = delete;
+};
 
 }  // namespace vllm::detail

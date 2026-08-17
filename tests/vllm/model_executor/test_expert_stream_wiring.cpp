@@ -47,11 +47,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
 
 #include "support/expert_stream_model.h"
+#include "support/test_env.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -71,23 +73,33 @@ namespace {
 // Turn the lane on BEFORE anything can read the environment. The read happens in
 // a function-local static on the first slice, so setting it inside a test body
 // would work today and break the moment a case ordering changed.
+//
+// Through `vllm_test::SetEnv` and not `::setenv`. `setenv(3)` is POSIX, MSVC's
+// CRT has only `_putenv_s`, and this file is compiled on Windows too: the target
+// is added unconditionally and `scripts/build-windows-release.ps1` configures
+// `VLLM_CPP_BUILD_TESTS=ON`. The shim in `support/test_env.h` is the one place
+// that branch lives (#603). CI cannot currently see the difference, because the
+// Windows lanes fail earlier in the product library on #1068 and never reach a
+// test translation unit at all.
 struct EnableExpertStreaming {
   EnableExpertStreaming() {
-    ::setenv("VT_MOE_EXPERT_STREAM", "1", 1);
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1");
     // Comfortably more than one step's working set: 4 experts x 3 towers x 4
     // layers = 48 distinct slices per forward. A budget BELOW that would make
     // `exhausted` nonzero for an honest reason and mask the defect under test.
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "64", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192", 1);
-    // Quiet under ctest, but overwrite=0 so an operator who sets this var
-    // still gets the line -- which is the only way to SEE the statistics
-    // this row added, and a gate that suppresses its own evidence is a
-    // smaller version of the defect it was written for.
-    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 0);  // quiet under ctest
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOTS", "64");
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192");
+    // Quiet under ctest, but only when the operator has not asked otherwise --
+    // seeing the line is the only way to SEE the statistics this row added, and
+    // a gate that suppresses its own evidence is a smaller version of the defect
+    // it was written for. `vllm_test::SetEnv` has no overwrite=0 form (it is a
+    // two-argument shim on purpose), so the condition is stated here.
+    if (std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY") == nullptr)
+      vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0");
     // The grouped keep-quant path stages the whole tower and cannot stream; the
     // production code already disables it when streaming is requested. Being
     // explicit here keeps the test honest about which path it is measuring.
-    ::setenv("VT_QWEN35_GROUPED_MOE", "0", 1);
+    vllm_test::SetEnv("VT_QWEN35_GROUPED_MOE", "0");
   }
 };
 const EnableExpertStreaming kEnableExpertStreaming;
@@ -176,6 +188,25 @@ TEST_CASE("decode REACHES the expert streamer, and the step clock advances") {
   // every fill here is a span fill.
   //
   // NO SPEEDUP IS ASSERTED, here or anywhere. This says the call is well formed.
+  //
+  // TWO RESIDUALS THE EQUALITY RESTS ON, stated rather than left to be
+  // rediscovered.
+  //
+  // (1) `Slice` rounds the advised range's END UP to a page, which for a
+  // heap-backed tower goes past the allocation. madvise(2) returns ENOMEM if
+  // any page in the range is unmapped, so this holds because the allocator's
+  // arena page is mapped, not because the arithmetic guarantees it. Production
+  // towers are file mappings many pages larger than a slice and do not have the
+  // question. If this ever fails with `advised` short by a small count, that is
+  // the first thing to check, not the fill path.
+  //
+  // (2) The counters are CUMULATIVE over the process, so this equality is a
+  // statement about everything that ran BEFORE it — and the pread case at the
+  // end of this file fills without advising, which would break it. The order
+  // holds under doctest's default file order, and it is not left implicit: the
+  // `CHECK_FALSE(s0.active)` at the top of this case fails loudly if anything
+  // ran first, so a reordering shows up as that assertion rather than as a
+  // confusing `advised != fills` here.
   CHECK(s.advised == s.fills);
   CHECK(s.advised > 0);
 #endif

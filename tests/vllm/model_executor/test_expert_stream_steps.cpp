@@ -38,8 +38,20 @@
 #if !defined(_WIN32)
 // The two questions about the statistics LINE need POSIX: one redirects stderr
 // across the flush, the other runs this binary again as a child. The step-clock
-// questions below need neither and are built everywhere. Streaming itself is a
-// POSIX lane anyway — `EnsureFile` refuses on _WIN32 by name.
+// questions below need neither and are built everywhere — which they were NOT
+// when this comment was first written. `::setenv` sat at namespace scope with
+// no guard, and it is POSIX: MSVC's CRT has only `_putenv_s`, so the whole
+// translation unit failed to compile there and none of the cases existed on
+// Windows at all. `tests/CMakeLists.txt` adds this target unconditionally and
+// `scripts/build-windows-release.ps1` configures `VLLM_CPP_BUILD_TESTS=ON`, so
+// the only reason CI stayed quiet is that the Windows lanes already fail
+// earlier, inside the product library, on #1068 and never reach a test
+// translation unit. The repair is `vllm_test::SetEnv` from
+// `support/test_env.h`, which is where the `_putenv_s` branch already lived.
+//
+// Streaming itself is a POSIX lane — `EnsureFile` refuses on _WIN32 by name —
+// but the STEP CLOCK is not: it advances on the mapping-copy fallback too, so
+// these cases have something to measure there.
 #include <unistd.h>
 #endif
 
@@ -47,10 +59,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "support/expert_stream_model.h"
+#include "support/test_env.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"
@@ -77,13 +91,18 @@ namespace {
 // Same knobs as the reachability binary, and for the same reasons. The one that
 // matters here is `STATS_EVERY=0`: it SILENCES the periodic line, so any
 // statistics line this process emits can only have come from the final flush.
+//
+// Through `vllm_test::SetEnv` and not `::setenv`, which is what this file did
+// and is the whole of the Windows defect: the shim in `support/test_env.h` is
+// the one place the `_putenv_s` branch lives (#603), and a new env-flipping
+// test is exactly what it says to use.
 struct EnableExpertStreaming {
   EnableExpertStreaming() {
-    ::setenv("VT_MOE_EXPERT_STREAM", "1", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "64", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 1);
-    ::setenv("VT_QWEN35_GROUPED_MOE", "0", 1);
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1");
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOTS", "64");
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192");
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0");
+    vllm_test::SetEnv("VT_QWEN35_GROUPED_MOE", "0");
   }
 };
 const EnableExpertStreaming kEnableExpertStreaming;
@@ -349,4 +368,80 @@ TEST_CASE("Qwen3_5ReplayLayer marks exactly one step") {
       vllm::Qwen3_5ReplayLayer(w.layers[3], c, hidden_in, pos, T, q);
   REQUIRE(out.size() == hidden_in.size());
   CHECK(Steps() - before == 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The nesting refusal, which every case above depends on and none of them can
+// reach.
+//
+// WHY IT NEEDED ITS OWN CASE. "One forward is one step, and the guard REFUSES
+// to nest" was stated in the source, in the spec and in the pull request body,
+// and deleting the `VT_CHECK` that implements it left BOTH focused binaries
+// fully green — 6/6 and 4/4. That is the same shape as every other finding this
+// row has carried: an asserted guarantee no gate could see. It is unreachable
+// through production code by construction, because every forward that takes
+// expert slices is a complete forward that no other one contains, so there is
+// no legitimate call graph that nests one. `detail::ExpertStreamStepScope`
+// exists for exactly this, and it forwards to the guard's own `Begin`/`End`
+// rather than re-stating the flag, so what is measured here is the production
+// boundary and not a copy of it.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("the step guard REFUSES to nest, and the refusal reaches a real forward") {
+  if (IsFlushChild()) return;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const std::vector<int32_t> ids = {5, 9, 2};
+  const std::vector<int32_t> pos = {0, 1, 2};
+
+  const int64_t before = Steps();
+  {
+    const vllm::detail::ExpertStreamStepScope outer;
+
+    // A SECOND scope on this thread is refused by name. Not `CHECK_THROWS_WITH_AS`:
+    // VT_CHECK appends " at <file>:<line>", so an exact-message match would
+    // break on any edit above it and say nothing about the guarantee.
+    bool nested_threw = false;
+    std::string nested_what;
+    try {
+      const vllm::detail::ExpertStreamStepScope inner;
+      (void)inner;
+    } catch (const std::runtime_error& e) {
+      nested_threw = true;
+      nested_what = e.what();
+    }
+    CHECK(nested_threw);
+    CHECK(nested_what.find("must not nest") != std::string::npos);
+
+    // AND THE SCOPE IS THE PRODUCTION GUARD, not a parallel flag. A real
+    // forward entered while the scope is held is refused too — which is the
+    // only way to show that the two share a boundary, and which also measures
+    // the breadth of the refusal: it is armed on the DEFAULT path, so a nest
+    // reds every Qwen3.5 forward and not merely the streamed ones. That is the
+    // intended polarity (the note on `Qwen35ExpertStreamStep` argues it): a
+    // nest is a defect in the call graph whether or not a store exists, and
+    // arming it only on the rare configuration would let the default path
+    // establish one that nobody sees until streaming is switched on.
+    bool forward_threw = false;
+    std::string forward_what;
+    try {
+      (void)Qwen3_5Model::ForwardDense(ids, pos, w, c, q);
+    } catch (const std::runtime_error& e) {
+      forward_threw = true;
+      forward_what = e.what();
+    }
+    CHECK(forward_threw);
+    CHECK(forward_what.find("must not nest") != std::string::npos);
+  }
+
+  // The refusal is NOT sticky. A constructor that throws leaves no object, so
+  // no destructor runs and no step is charged for it; the outer scope closed
+  // exactly one. Two refused opens plus one closed scope must therefore be one
+  // step, and the same forward must now succeed — a guard that leaked its flag
+  // on the throw would fail here rather than at some unrelated later case.
+  CHECK(Steps() - before == 1);
+  const std::vector<float> logits = Qwen3_5Model::ForwardDense(ids, pos, w, c, q);
+  CHECK(logits.size() ==
+        static_cast<size_t>(ids.size()) * static_cast<size_t>(c.vocab_size));
+  CHECK(Steps() - before == 2);
 }

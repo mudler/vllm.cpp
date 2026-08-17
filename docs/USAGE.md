@@ -3123,8 +3123,8 @@ silently doing no streaming.
 
 **Read the statistics line before you believe any number you measure with it.**
 The engine prints one every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default
-16, `0` silences the periodic line), and **one more when the process ends,
-always**:
+16, `0` silences the periodic line), and **exactly one more when the process
+ends**, whatever the run did:
 
 ```text
 [expert-stream] steps=64 hits=141230 misses=37312 evictions=29312 fills=37312 bytes=92876505088 exhausted=0 advised=37312
@@ -3136,8 +3136,8 @@ multiple of the interval, so a healthy five-token run prints none of them at the
 default 16; and it used to be skipped on `steps == 0` as well, which meant the
 one run that most needed reporting — the one where the step boundary is never
 reached — printed nothing at all. Treating absence as failure therefore reported
-VOID on a working lane. Absence now means only that the process did not reach its
-static destructors: a crash, a signal, or `_exit`.
+VOID on a working lane. The final line crosses both of those skips, so it is
+printed even on a run of zero steps.
 
 Two of the fields decide whether the run is measuring anything at all:
 

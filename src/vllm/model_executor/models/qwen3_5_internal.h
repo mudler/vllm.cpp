@@ -391,6 +391,12 @@ struct ExpertStreamStats {
   // means the budget is smaller than one step's working set, OR that the step
   // boundary is not being called at all.
   int64_t exhausted = 0;
+  // Slices refused because a GATE asked for the unstreamed arm through
+  // `ExpertStreamSetForceFallback`, which no production path calls. It is
+  // separate from `exhausted` because that number is an operator-facing budget
+  // diagnosis, and a test switch inflating it says "raise
+  // VT_MOE_EXPERT_STREAM_SLOTS" about a budget that was never the reason.
+  int64_t forced = 0;
   // madvise(MADV_WILLNEED) calls the kernel ACCEPTED. Zero while slices are
   // being filled from a mapping means the hint is being rejected, which is what
   // an unaligned address does silently.
@@ -410,5 +416,61 @@ void ExpertStreamSetForceFallback(bool on);
 // (qwen3_moe.cpp) composes the same block from another translation unit and
 // calls it from its layer driver for the same reason.
 void EndExpertStreamStep();
+
+// Print the streamed-expert statistics line NOW, once, whatever the run did.
+//
+// THIS FUNCTION HAS ZERO PRODUCTION CALLERS, and a grep-and-quote reader should
+// get that before anything else: it exists for the gate. The only production
+// path to the LINE is `~Qwen35ExpertStream`, which does NOT route through here —
+// the store is a function-local static, so it is destroyed on the normal exit
+// path and prints what the run ended up doing directly. The two share the
+// once-flag rather than a call, so exactly one of them prints; an earlier
+// revision headed this comment "~Qwen35ExpertStream IS THE ONLY PRODUCTION
+// CALLER", which reads as a call that is not there (#1106).
+//
+// There is no second hook either: nothing registers an `atexit` handler when
+// streaming is merely REQUESTED, and none was landed — that shape is recorded
+// under the spec's `## Owed` with its reason. An even earlier revision of this
+// comment claimed the hook existed, while the change that wrote it was fixing
+// exactly this class of overclaim one file away (#1091). Two revisions, two
+// overstatements of the same four lines, which is why they now name the
+// mechanism rather than summarise it.
+//
+// So the guarantee carries the same two qualifiers `docs/USAGE.md` does, and it
+// is one line per process under both: a store must have been BUILT, and the
+// process must RUN its static destructors. No store means no line — and no
+// `[expert-stream] ON ...` banner either, which is how the absent pair is read
+// — and a crash, a signal or `_exit` prints nothing. Under those it holds even
+// on a run with zero steps and with the periodic report silenced, which is what
+// makes `steps == 0` readable at all.
+//
+// This entry exists because a static destructor fires after main returns and
+// nothing inside the process can assert on it. Calling it TAKES the once-flag,
+// so it suppresses the teardown line for the rest of the process and the caller
+// becomes the one place the line appears. A second call prints nothing.
+void ExpertStreamFlushStats();
+
+// ONE decode step, as a scope, for a gate that needs to hold the boundary
+// itself rather than reach it through a forward.
+//
+// It exists for one question: the step guard REFUSES TO NEST, and no legitimate
+// call graph in the tree can ask it to. Every forward that takes expert slices
+// is a complete forward that no other one contains, so the refusal was asserted
+// in three places and pinned in none — deleting its `VT_CHECK` left both
+// focused binaries fully green (#1091 review of #1100). A gate cannot reach it
+// through production code, and a gate that re-implemented the flag would prove
+// its own copy, so the guard's boundary is exposed here and this scope forwards
+// to it.
+//
+// Constructing a second scope, or entering a forward while one is held, throws
+// `std::runtime_error`. That is armed on the DEFAULT path and not only on the
+// streaming lane, on purpose: see the note on `Qwen35ExpertStreamStep`.
+class ExpertStreamStepScope {
+ public:
+  ExpertStreamStepScope();
+  ~ExpertStreamStepScope();
+  ExpertStreamStepScope(const ExpertStreamStepScope&) = delete;
+  ExpertStreamStepScope& operator=(const ExpertStreamStepScope&) = delete;
+};
 
 }  // namespace vllm::detail

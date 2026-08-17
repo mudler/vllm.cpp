@@ -5138,9 +5138,11 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
 // A slot is filled by ONE contiguous copy of a whole slice, so the read is
 // sequential, and a slice already resident costs nothing at all.
 //
-// The cache is keyed by (tower, expert). A tower's identity is its base
-// pointer, which is stable for the model's life because the tower is a borrowed
-// view into the mapping; the id map is built once per pointer.
+// The cache is keyed by (tower, expert). A tower's identity is `TowerUid()`, a
+// process-unique counter, NOT the buffer's address: the store outlives any one
+// model, and the allocator hands a freed tower's address to the next one (#1066,
+// and the note on TowerId below).
+
 // Whether the operator ASKED for streaming, independent of whether a store has
 // been built yet. The grouped-MoE gate needs this before any expert is touched.
 inline bool Qwen35ExpertStreamRequested() {
@@ -5234,7 +5236,14 @@ class Qwen35ExpertStream {
   uint8_t* Slice(const uint8_t* base, uint64_t tower_uid, int64_t expert,
                  size_t offset, size_t bytes, int fd, size_t file_offset) {
     if (ForceFallback()) {
-      ++exhausted_;
+      // COUNTED SEPARATELY FROM `exhausted_`, on purpose (#1091 finding 6).
+      // `exhausted` is the operator-facing number and both docs define it as
+      // "the budget is smaller than one step's working set; raise
+      // VT_MOE_EXPERT_STREAM_SLOTS". This switch has no production caller at
+      // all, so charging it to that counter told an operator to raise a budget
+      // that was never the reason. It stays out of the stderr line for the same
+      // reason: in a production process it is always zero.
+      ++forced_;
       return nullptr;
     }
     const int32_t tower = TowerId(tower_uid);
@@ -5270,6 +5279,16 @@ class Qwen35ExpertStream {
     // way. `advised_` counts the calls that were actually accepted, so a run
     // can tell a working hint from a silently rejected one.
     //
+    // ROUNDING THE END UP CAN LEAVE THE ALLOCATION, and that is the one way
+    // this call still fails: madvise(2) returns ENOMEM when any page in the
+    // range is unmapped, so a tower whose last byte sits near the end of its
+    // final mapped page would not be counted. In production the tower is a
+    // borrowed view into a file mapping many pages larger than one slice, so
+    // the trailing page is mapped. On the heap-backed towers the gates build it
+    // holds because the allocator's arena page is mapped, not because the
+    // allocation reaches it — which is why `advised == fills` is asserted
+    // against a measured run rather than assumed from the arithmetic.
+    //
     // NO SPEEDUP IS CLAIMED HERE. This makes the call well-formed; whether
     // readahead moves decode is a measurement the spec records as owed.
 #if defined(__unix__)
@@ -5302,6 +5321,7 @@ class Qwen35ExpertStream {
   const ExpertStreamer& streamer() const { return *streamer_; }
   const ExpertSlotCache& cache() const { return *cache_; }
   int64_t exhausted() const { return exhausted_; }
+  int64_t forced() const { return forced_; }
   int64_t advised() const { return advised_; }
 
   // ONE line a benchmark can read to prove the lane stayed live.
@@ -5314,24 +5334,61 @@ class Qwen35ExpertStream {
   // immediately are `steps` and `exhausted`: steps==0 means the step clock never
   // advanced, and exhausted>0 means slices were refused and silently served from
   // the mapping instead. Both are on this line, and either is wrong at a glance.
+  //
+  // `final` IS THE WHOLE POINT AND IT USED TO HAVE NO CALLER (#1091 finding 1).
+  // The periodic report is skipped on `steps == 0` — so the one run that most
+  // needs the line, the one where the step boundary is never reached, printed
+  // nothing at all, and both docs told an operator to read a zero off a line
+  // that could not exist. It is skipped again whenever `stats_every_` does not
+  // divide the step count, and the default is 16, so a healthy five-token run
+  // printed nothing either and a benchmark reading absence as failure reported
+  // VOID on a working lane. The final report crosses both early returns.
   void ReportStats(bool final) const {
     const int64_t steps = cache_->steps();
     if (!final) {
       if (stats_every_ <= 0) return;
       if (steps == 0 || steps % stats_every_ != 0) return;
     }
-    std::fprintf(stderr,
-                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
-                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
-                 "advised=%lld\n",
-                 static_cast<long long>(steps),
-                 static_cast<long long>(cache_->hits()),
-                 static_cast<long long>(cache_->misses()),
-                 static_cast<long long>(cache_->evictions()),
-                 static_cast<long long>(streamer_->fills()),
-                 static_cast<long long>(streamer_->bytes_filled()),
-                 static_cast<long long>(exhausted_),
-                 static_cast<long long>(advised_));
+    PrintStatsLine(steps, cache_->hits(), cache_->misses(), cache_->evictions(),
+                   streamer_->fills(), streamer_->bytes_filled(), exhausted_,
+                   advised_);
+  }
+
+  // The final line, printed exactly ONCE per process.
+  //
+  // NOTHING IN PRODUCTION CALLS THIS, and read the destructor below before you
+  // conclude otherwise. Teardown produces the LINE but does not route through
+  // here: the store is a function-local static, so `~Qwen35ExpertStream` runs on
+  // the normal exit path and calls `ReportStats` itself, for the reason stated
+  // there. The two share the once-flag, not a call, so exactly one of them
+  // prints. This entry exists so a GATE can observe the same guarantee from
+  // inside a running process, because a static destructor fires after main
+  // returns and nothing in the process can assert on it.
+  //
+  // A once-flag rather than two independent prints, so "one line" is a property
+  // of the process and not of which caller happened to win. The flag is a plain
+  // bool with constant initialisation and no destructor of its own, so it cannot
+  // itself be lost to static-destruction ordering.
+  //
+  // No store means no line, and that is not a gap: a store that exists always
+  // announced itself with `[expert-stream] ON ...` first, so banner-without-line
+  // is a process that died, and no-banner is a lane nothing ever reached.
+  static void FlushFinalStats() {
+    if (FinalReported()) return;
+    Qwen35ExpertStream* s = Existing();
+    if (s == nullptr) return;
+    FinalReported() = true;
+    s->ReportStats(/*final=*/true);
+  }
+
+  ~Qwen35ExpertStream() {
+    // The store holds the numbers, so it prints them before it goes away. Not
+    // routed through FlushFinalStats: that reads `Existing()`, and the unique_ptr
+    // this object lives in does not clear itself before running this destructor.
+    if (!FinalReported()) {
+      FinalReported() = true;
+      ReportStats(/*final=*/true);
+    }
   }
 
  private:
@@ -5353,6 +5410,30 @@ class Qwen35ExpertStream {
   static bool& ForceFallback() {
     static bool on = false;
     return on;
+  }
+  // Constant-initialised and destructor-free, so the "has the final line been
+  // printed" answer survives every other static's destruction.
+  static bool& FinalReported() {
+    static bool done = false;
+    return done;
+  }
+
+  // The one place the statistics line's format lives, so the final report and
+  // the periodic report cannot drift apart into two shapes a parser has to
+  // know about.
+  static void PrintStatsLine(int64_t steps, int64_t hits, int64_t misses,
+                             int64_t evictions, int64_t fills, int64_t bytes,
+                             int64_t exhausted, int64_t advised) {
+    std::fprintf(stderr,
+                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
+                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
+                 "advised=%lld\n",
+                 static_cast<long long>(steps), static_cast<long long>(hits),
+                 static_cast<long long>(misses),
+                 static_cast<long long>(evictions),
+                 static_cast<long long>(fills), static_cast<long long>(bytes),
+                 static_cast<long long>(exhausted),
+                 static_cast<long long>(advised));
   }
 
   explicit Qwen35ExpertStream(size_t slot_bytes) {
@@ -5407,6 +5488,11 @@ class Qwen35ExpertStream {
   std::unordered_map<uint64_t, int32_t> tower_ids_;
   int32_t next_tower_id_ = 0;
   int64_t exhausted_ = 0;
+  // Slices the FORCED-fallback switch refused. Separate from `exhausted_`
+  // because that one is an operator-facing budget diagnosis and this one is a
+  // gate asking for the unstreamed arm; see the note at the ForceFallback
+  // branch in Slice.
+  int64_t forced_ = 0;
   int64_t advised_ = 0;
   int64_t stats_every_ = 16;
 };
@@ -5427,11 +5513,56 @@ class Qwen35ExpertStream {
 //
 // A guard rather than a call at the end of the body: ForwardLayers has two
 // returns and can throw, and a step that ended by throwing still ended.
+//
+// ONE FORWARD IS ONE STEP, AND THE GUARD REFUSES TO NEST (#1091 finding 3).
+// Five forwards in this file take expert slices — `ForwardLayers`,
+// `Qwen3_5Model::ForwardDense`, both MTP forwards and `Qwen3_5ReplayLayer` —
+// and each is a complete forward that no other one contains. A nested guard
+// would end the step twice, which advances the hotness clock for a step that
+// never happened and decays every resident entry an extra tick; that is a
+// quieter defect than the missing boundary and it is the one adding guards
+// invites. So the precondition is stated rather than handled, the same way
+// `MatmulF32Slice` states `expert >= 0`: the flag is per-thread because a
+// decode step runs on one host thread, which is the assumption the store's own
+// locking already makes.
+//
+// THE REFUSAL IS NOT GATED ON `Qwen35ExpertStreamRequested()`, deliberately.
+// "One forward is one step" is a property of the CALL GRAPH, not of the
+// streaming lane: a nest is a defect whether or not a store exists, and the
+// streamed run is the rare configuration. Arming it only there would let the
+// default-on path establish a nest that nobody sees until someone turns
+// streaming on, which is the shape this row keeps finding. The cost is that a
+// nest reds every Qwen3.5 forward rather than only the streamed ones, and that
+// is the intended polarity: loud on the default path is what makes it a gate.
+//
+// `Begin`/`End` are named rather than living only in the constructor and
+// destructor bodies so that `detail::ExpertStreamStepScope` can hold THE SAME
+// boundary. A gate that re-implemented the refusal would prove its own copy;
+// this way deleting the `VT_CHECK` below is one edit that both changes
+// production and takes the gate red.
 struct Qwen35ExpertStreamStep {
-  Qwen35ExpertStreamStep() = default;
-  ~Qwen35ExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+  Qwen35ExpertStreamStep() { Begin(); }
+  ~Qwen35ExpertStreamStep() { End(); }
   Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
   Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
+
+  // Open the step. Throws when one is already open on this thread; the flag is
+  // then left as it was, so the outer guard's `End` still closes exactly one.
+  static void Begin() {
+    VT_CHECK(!Open(), "qwen3_5: a decode step is already open; the expert-stream "
+                      "step guard marks ONE forward and must not nest");
+    Open() = true;
+  }
+  static void End() {
+    Open() = false;
+    Qwen35ExpertStream::EndStepIfActive();
+  }
+
+ private:
+  static bool& Open() {
+    static thread_local bool open = false;
+    return open;
+  }
 };
 
 // The expert-slice seam. Identical to KqResidentSlice except that, when
@@ -7221,6 +7352,7 @@ detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
   s.fills = st->streamer().fills();
   s.bytes_filled = st->streamer().bytes_filled();
   s.exhausted = st->exhausted();
+  s.forced = st->forced();
   s.advised = st->advised();
   return s;
 }
@@ -7230,6 +7362,19 @@ void detail::ExpertStreamSetForceFallback(bool on) {
 }
 
 void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+
+void detail::ExpertStreamFlushStats() { Qwen35ExpertStream::FlushFinalStats(); }
+
+// The step guard as a scope a gate can hold. These forward to the SAME
+// `Begin`/`End` the production guard's constructor and destructor call, so the
+// nesting refusal a gate observes here is the one every forward in this file is
+// protected by, not a re-statement of it.
+detail::ExpertStreamStepScope::ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::Begin();
+}
+detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::End();
+}
 
 // ENG-ASYNC-SCHED W4: overwrite the REAL prefix of a freshly uploaded input-id
 // buffer with the device-resident ids the async runner's combine produced.
@@ -7358,11 +7503,37 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
                           const Tensor* aux_out = nullptr,
                           StepDevInputs* persistent_sdi = nullptr) {
-  // ONE decode step. Every MoE entry point funnels through here exactly once
-  // per forward — ForwardBody, the VL path, and the graph driver's eager
-  // fallback — so this is the step boundary the expert slot cache is defined
-  // against, and it is neither once per layer nor once per expert. Inert unless
-  // a store exists, which needs both VT_MOE_EXPERT_STREAM and a slice taken.
+  // ONE decode step, for the PAGED forwards: ForwardBody, the VL path and the
+  // graph driver's eager fallback all funnel through here exactly once per
+  // forward. This is the step boundary the expert slot cache is defined against,
+  // and it is neither once per layer nor once per expert.
+  //
+  // IT IS NOT THE ONLY ENTRY POINT, and the comment this replaces said it was
+  // (#1091 finding 3). Four more forwards reach `ExpertMlpKq -> KqExpertSlice`
+  // without passing through here — `Qwen3_5Model::ForwardDense`,
+  // `Qwen3_5MTPModel::Forward`, `Qwen3_5MTPModel::ForwardPaged` and
+  // `Qwen3_5ReplayLayer` — and each now carries its own guard.
+  //
+  // ONE OF THOSE FOUR HAS A PRODUCTION CALLER, not all of them, and an earlier
+  // revision of this comment said "the MTP pair" (#1106 finding 2, #1108). It is
+  // `Qwen3_5MTPModel::ForwardPaged`, the spec-decode DRAFT forward, reached from
+  // `runner.cpp:2183` through `spec_decode/mtp/speculator.cpp:107,262` — so the
+  // shape that was actually running is draft forwards that pin every slot they
+  // touch across the following target forward. That caller is itself
+  // "UNREACHABLE unless a speculator is configured" (`runner.cpp:2120`), so a
+  // DEFAULT-configuration run reaches none of these four guards; one of them has
+  // a production caller, which is not the same claim. `Qwen3_5MTPModel::Forward`,
+  // `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity entry
+  // points whose every caller is under `tests/`, and per `.agents/reachability.md`
+  // a call site inside a test is not reach: their guards land UNREACHED, which
+  // the spec's `## Owed` records as a staged slice rather than claiming.
+  //
+  // `RunMoeBlock` is the deliberate exception: it is one block, not a forward,
+  // and qwen3_moe.cpp owns the boundary for the model that composes it
+  // (qwen3_moe.cpp:150).
+  //
+  // Inert unless a store exists, which needs both VT_MOE_EXPERT_STREAM and a
+  // slice taken.
   const Qwen35ExpertStreamStep expert_stream_step;
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
@@ -7869,6 +8040,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
            "qwen3_5 forward: positions length must equal token count");
   VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
            "qwen3_5 forward: weights.layers size must equal num_hidden_layers");
+  // ONE decode step. This forward does NOT go through ForwardLayers — it runs
+  // its own unpaged layer loop — so it needs its own boundary, and every MoE
+  // layer it runs takes expert slices (#1091 finding 3).
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = static_cast<float>(config.rms_norm_eps);
 
@@ -7998,6 +8173,21 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
            "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
 
   (void)vocab_size;
+  // ONE decode step. A DRAFT forward is a complete forward with its own working
+  // set: its slices are finished with when it returns, and leaving them pinned
+  // across the target's forward would shrink the evictable set for the whole run
+  // — F1 at draft scale (#1091 finding 3). A spec-decode iteration therefore
+  // advances the clock once per draft plus once for the target, which is what
+  // "one step is one forward" means for a draft+target pair.
+  //
+  // THAT PAIR IS RUN BY `ForwardPaged`, NOT BY THIS OVERLOAD. This one is
+  // reached only through `ForwardLogitsHost`, a standalone parity convenience
+  // (qwen3_5_mtp.h:135) whose every caller is under `tests/`, so the guard here
+  // lands unreached and is recorded as a staged slice (#1108). It is kept
+  // because the reasoning above is what makes it correct the moment this
+  // overload gains a caller, and adding the guard later with the caller is how
+  // this row lost its step boundary the first time.
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 
   // Qwen3_5MultiTokenPredictor.forward head: shared embedding + independent Gemma
@@ -8050,6 +8240,8 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                draft_kv.head_size == config_->head_dim,
            "qwen3_5 MTP paged forward: draft KV cache dims mismatch config");
 
+  // ONE decode step, for the same reason as the unpaged draft forward above.
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 
   // Same head math as Forward; the difference is the DECODER LAYER, which runs
@@ -8975,6 +9167,10 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   const int64_t H = config.hidden_size;
   VT_CHECK(static_cast<int64_t>(hidden_in.size()) == T * H,
            "qwen3_5 replay: hidden_in must be [T*H]");
+  // ONE decode step. This replays a single layer as a self-contained unit of
+  // work, so the slices it takes are finished with when it returns; without a
+  // boundary they stay pinned for the life of the process (#1091 finding 3).
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev d{vt::GetBackend(queue.device.type), queue};
 
   // Seed the fused stream with the combined residual input: res = hidden_in,

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -716,9 +717,48 @@ TEST_CASE("a tower's identity survives an address the allocator hands out again"
   vllm::OwnedTensor c = a;
   CHECK(c.TowerUid() != uid_a);
 
-  // And re-stamping is keyed on the buffer, so replacing the bytes yields a new
-  // identity rather than silently reusing the old one.
+  // And re-stamping is keyed on the buffer, so replacing the bytes with a
+  // DIFFERENTLY ADDRESSED buffer yields a new identity rather than silently
+  // reusing the old one.
   const uint64_t uid_c = c.TowerUid();
   c.bytes = vllm::OwnedBytes(std::vector<uint8_t>(128, 0x33));
+  REQUIRE(c.bytes.data() != nullptr);
   CHECK(c.TowerUid() != uid_c);
+}
+
+TEST_CASE("a tower's identity is keyed on its ADDRESS, and says so") {
+  // #1091 finding 5. The field comment used to promise an identity for "this
+  // tensor's CURRENT bytes"; the implementation keys on `bytes.data()` and
+  // re-stamps only when that address moves. The two are not the same claim, and
+  // the case above cannot tell them apart because a fresh `std::vector` lands
+  // somewhere else and so satisfies both readings.
+  //
+  // This one separates them, deterministically, by borrowing: a borrowed view
+  // names an address the test controls, so "same address, different contents"
+  // is constructible rather than a matter of allocator luck. #1066 was a comment
+  // on this exact field that promised more than the code delivered, so the limit
+  // is pinned here rather than left to be rediscovered.
+  auto one = std::make_shared<std::vector<uint8_t>>(64, 0x44);
+  auto two = std::make_shared<std::vector<uint8_t>>(64, 0x55);
+
+  vllm::OwnedTensor t;
+  t.dtype = vt::DType::kI8;
+  t.rank = 1;
+  t.shape[0] = 64;
+  t.bytes = vllm::OwnedBytes::Borrow(one->data(), one->size(), one);
+  const uint64_t uid = t.TowerUid();
+  CHECK(uid != 0u);
+
+  // Same address, wholly different contents. The uid does NOT move — which is
+  // the documented limit, not a defect, because nothing rewrites a tower in
+  // place. A future caller that did would need a different key.
+  std::fill(one->begin(), one->end(), 0x99);
+  CHECK(t.bytes.data() == one->data());
+  CHECK(t.TowerUid() == uid);
+
+  // A different address is a different tower, which is the half the cache
+  // depends on.
+  t.bytes = vllm::OwnedBytes::Borrow(two->data(), two->size(), two);
+  REQUIRE(t.bytes.data() != one->data());
+  CHECK(t.TowerUid() != uid);
 }

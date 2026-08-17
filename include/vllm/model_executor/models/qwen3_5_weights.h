@@ -104,8 +104,19 @@ struct OwnedTensor {
   mutable int mmap_fd = -1;
   mutable size_t mmap_file_offset = 0;
 
-  // A process-unique identity for this tensor's CURRENT bytes, for a cache that
-  // outlives the model.
+  // A process-unique identity for the BUFFER this tensor currently points at,
+  // for a cache that outlives the model.
+  //
+  // READ THAT LITERALLY: the identity is keyed on `bytes.data()`, so it is an
+  // identity for the address, not for the contents. Replacing a buffer's bytes
+  // IN PLACE — same address, different weights — keeps the old uid, and the
+  // cache would then serve the old entries for the new contents. Nothing does
+  // that today: a tower's `bytes` is assigned once when the model loads and is
+  // only ever replaced wholesale, which moves the address. This comment says
+  // where the guarantee stops rather than rounding it up, because #1066 was
+  // caused by a comment on this exact field that rounded it up (it claimed a
+  // base pointer was a stable identity, which is true for one model's life and
+  // false for the cache's). `test_qwen36_weights` pins both halves.
   //
   // The expert slot cache is a process-lifetime singleton keyed by (tower,
   // expert), and it used to derive the tower half from the buffer's ADDRESS.

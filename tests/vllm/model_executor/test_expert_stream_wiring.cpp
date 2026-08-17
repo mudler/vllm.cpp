@@ -40,314 +40,70 @@
 
 #include <doctest/doctest.h>
 
+#if !defined(_WIN32)
+#include <unistd.h>  // ::fileno, for the pread case below
+#endif
+
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
+#include "support/expert_stream_model.h"
+#include "support/test_env.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
-#include "vllm/transformers_utils/hf_config.h"
-#include "vllm/v1/attention/backend.h"
-#include "vllm/v1/attention/backends/gdn_attn.h"
-#include "vt/backend.h"
-#include "vt/dtype.h"
-#include "vt/tensor.h"
 
-using vllm::GdnStateCache;
+using expert_stream_test::CachePool;
+using expert_stream_test::MakeConfig;
+using expert_stream_test::MakeWeights;
+using expert_stream_test::PrefillAttnMeta;
+using expert_stream_test::PrefillGdnMeta;
+using expert_stream_test::Q;
 using vllm::HfConfig;
-using vllm::PagedKvCache;
 using vllm::Qwen3_5MoeWeights;
 using vllm::Qwen3_5Model;
-using vllm::v1::CommonAttentionMetadata;
-using vllm::v1::GDNAttentionMetadata;
-using vt::DType;
 
 namespace {
 
 // Turn the lane on BEFORE anything can read the environment. The read happens in
 // a function-local static on the first slice, so setting it inside a test body
 // would work today and break the moment a case ordering changed.
+//
+// Through `vllm_test::SetEnv` and not `::setenv`. `setenv(3)` is POSIX, MSVC's
+// CRT has only `_putenv_s`, and this file is compiled on Windows too: the target
+// is added unconditionally and `scripts/build-windows-release.ps1` configures
+// `VLLM_CPP_BUILD_TESTS=ON`. The shim in `support/test_env.h` is the one place
+// that branch lives (#603). CI cannot currently see the difference, because the
+// Windows lanes fail earlier in the product library on #1068 and never reach a
+// test translation unit at all.
 struct EnableExpertStreaming {
   EnableExpertStreaming() {
-    ::setenv("VT_MOE_EXPERT_STREAM", "1", 1);
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1");
     // Comfortably more than one step's working set: 4 experts x 3 towers x 4
     // layers = 48 distinct slices per forward. A budget BELOW that would make
     // `exhausted` nonzero for an honest reason and mask the defect under test.
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "64", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192", 1);
-    // Quiet under ctest, but overwrite=0 so an operator who sets this var
-    // still gets the line -- which is the only way to SEE the statistics
-    // this row added, and a gate that suppresses its own evidence is a
-    // smaller version of the defect it was written for.
-    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 0);  // quiet under ctest
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOTS", "64");
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192");
+    // Quiet under ctest, but only when the operator has not asked otherwise --
+    // seeing the line is the only way to SEE the statistics this row added, and
+    // a gate that suppresses its own evidence is a smaller version of the defect
+    // it was written for. `vllm_test::SetEnv` has no overwrite=0 form (it is a
+    // two-argument shim on purpose), so the condition is stated here.
+    if (std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY") == nullptr)
+      vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0");
     // The grouped keep-quant path stages the whole tower and cannot stream; the
     // production code already disables it when streaming is requested. Being
     // explicit here keeps the test honest about which path it is measuring.
-    ::setenv("VT_QWEN35_GROUPED_MOE", "0", 1);
+    vllm_test::SetEnv("VT_QWEN35_GROUPED_MOE", "0");
   }
 };
 const EnableExpertStreaming kEnableExpertStreaming;
 
-float RandV(uint64_t s) {
-  s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-  s ^= s >> 33;
-  return (static_cast<float>((s >> 40) & 0xFFFF) / 32768.0f) - 1.0f;
-}
-
-vllm::OwnedTensor MakeOwned(DType dt, const std::vector<int64_t>& shape, uint64_t seed) {
-  vllm::OwnedTensor t;
-  t.dtype = dt;
-  t.rank = static_cast<int>(shape.size());
-  int64_t n = 1;
-  for (int i = 0; i < t.rank; ++i) {
-    t.shape[i] = shape[static_cast<size_t>(i)];
-    n *= shape[static_cast<size_t>(i)];
-  }
-  if (dt == DType::kBF16) {
-    std::vector<uint8_t> b(static_cast<size_t>(n) * 2);
-    auto* p = reinterpret_cast<uint16_t*>(b.data());
-    for (int64_t i = 0; i < n; ++i) p[i] = vt::F32ToBF16(RandV(seed + static_cast<uint64_t>(i)));
-    t.bytes = vllm::OwnedBytes(std::move(b));
-  } else {
-    std::vector<uint8_t> b(static_cast<size_t>(n) * 4);
-    auto* p = reinterpret_cast<float*>(b.data());
-    for (int64_t i = 0; i < n; ++i) p[i] = RandV(seed + static_cast<uint64_t>(i));
-    t.bytes = vllm::OwnedBytes(std::move(b));
-  }
-  return t;
-}
-
-// A keep-quant STACKED expert tower: [rows, cols] Q8_0, `nk = true`, exactly the
-// shape the GGUF keep-quant loader produces and the only shape KqExpertSlice
-// slices.
-//
-// The blocks are BUILT, not filled with noise. A Q8_0 block is an fp16 scale
-// followed by 32 int8 weights, and random bytes put random bit patterns in the
-// scale — including the fp16 encodings of inf and NaN, which propagate straight
-// through the GEMM and make every later comparison vacuous. The values are
-// arbitrary but well-formed, which is all this test needs: every arm decodes the
-// SAME bytes, so equality between arms is a real comparison.
-vllm::OwnedTensor MakeKqTower(int64_t rows, int64_t cols, uint64_t seed) {
-  vllm::OwnedTensor t;
-  t.dtype = DType::kQ8_0;
-  t.nk = true;
-  t.rank = 2;
-  t.shape[0] = rows;
-  t.shape[1] = cols;
-  const size_t row_bytes = vt::RowSizeBytes(DType::kQ8_0, cols);
-  const int64_t blocks_per_row = cols / 32;
-  REQUIRE(cols % 32 == 0);          // Q8_0 is a 32-element block quant
-  REQUIRE(row_bytes == static_cast<size_t>(blocks_per_row) * 34);
-  std::vector<uint8_t> b(static_cast<size_t>(rows) * row_bytes);
-  size_t o = 0;
-  for (int64_t r = 0; r < rows; ++r) {
-    for (int64_t blk = 0; blk < blocks_per_row; ++blk) {
-      const uint16_t d = vt::F32ToF16(0.004f + 0.001f * RandV(seed + static_cast<uint64_t>(r * 131 + blk)));
-      std::memcpy(b.data() + o, &d, 2);
-      o += 2;
-      for (int j = 0; j < 32; ++j) {
-        const int8_t q = static_cast<int8_t>(
-            static_cast<int>(100.0f * RandV(seed + static_cast<uint64_t>((r * 131 + blk) * 32 + j))));
-        std::memcpy(b.data() + o, &q, 1);
-        o += 1;
-      }
-    }
-  }
-  t.bytes = vllm::OwnedBytes(std::move(b));
-  return t;
-}
-
-HfConfig MakeConfig() {
-  HfConfig c;
-  c.model_type = "qwen3_5_moe_text";
-  c.architectures = {"Qwen3_5MoeForConditionalGeneration"};
-  c.hidden_size = 32;
-  c.num_hidden_layers = 4;
-  c.vocab_size = 40;
-  c.num_attention_heads = 4;
-  c.num_key_value_heads = 2;
-  c.head_dim = 8;
-  c.layer_types = {"linear_attention", "linear_attention", "linear_attention",
-                   "full_attention"};
-  c.num_experts = 4;
-  c.num_experts_per_tok = 2;
-  c.moe_intermediate_size = 32;
-  c.shared_expert_intermediate_size = 16;
-  c.linear_num_key_heads = 2;
-  c.linear_num_value_heads = 4;
-  c.linear_key_head_dim = 8;
-  c.linear_value_head_dim = 8;
-  c.linear_conv_kernel_dim = 4;
-  c.rope_theta = 10000.0;
-  c.rotary_dim = 4;
-  c.rms_norm_eps = 1e-6;
-  c.max_position_embeddings = 64;
-  return c;
-}
-
-vllm::MoeBlockWeights MakeKqMoe(const HfConfig& c, uint64_t s) {
-  vllm::MoeBlockWeights m;
-  const int64_t H = c.hidden_size, E = c.num_experts, I = c.moe_intermediate_size,
-                Is = c.shared_expert_intermediate_size;
-  m.router_gate = MakeOwned(DType::kBF16, {H, E}, s + 1);
-  m.shared_gate = MakeOwned(DType::kBF16, {H, 1}, s + 2);
-  // The routed experts are STACKED keep-quant towers, and the per-expert vectors
-  // stay empty — the A3 layout the streaming seam is defined against.
-  m.expert_gate_kq = MakeKqTower(E * I, H, s + 100);
-  m.expert_up_kq = MakeKqTower(E * I, H, s + 200);
-  m.expert_down_kq = MakeKqTower(E * H, I, s + 300);
-  m.shared_gate_proj = MakeOwned(DType::kBF16, {H, Is}, s + 3);
-  m.shared_up_proj = MakeOwned(DType::kBF16, {H, Is}, s + 4);
-  m.shared_down_proj = MakeOwned(DType::kBF16, {Is, H}, s + 5);
-  return m;
-}
-
-Qwen3_5MoeWeights MakeWeights(const HfConfig& c, uint64_t base_seed = 0) {
-  Qwen3_5MoeWeights w;
-  const int64_t H = c.hidden_size, V = c.vocab_size;
-  const int64_t Hq = c.num_attention_heads, Hkv = c.num_key_value_heads,
-                Dh = c.head_dim;
-  const int64_t Hk = c.linear_num_key_heads, Hv = c.linear_num_value_heads,
-                Dk = c.linear_key_head_dim, Dv = c.linear_value_head_dim,
-                Kw = c.linear_conv_kernel_dim;
-  const int64_t key_dim = Hk * Dk, value_dim = Hv * Dv,
-                conv_dim = 2 * key_dim + value_dim;
-  w.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 11);
-  w.final_norm = MakeOwned(DType::kBF16, {H}, 12);
-  w.lm_head = MakeOwned(DType::kBF16, {H, V}, 13);
-  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
-    const uint64_t s = base_seed + 1000 + static_cast<uint64_t>(l) * 5000;
-    vllm::Qwen3_5MoeLayerWeights lw;
-    lw.is_linear_attention = (c.layer_types[static_cast<size_t>(l)] == "linear_attention");
-    lw.input_layernorm = MakeOwned(DType::kBF16, {H}, s + 1);
-    lw.post_attention_layernorm = MakeOwned(DType::kBF16, {H}, s + 2);
-    if (lw.is_linear_attention) {
-      lw.gdn.in_proj_qkv = MakeOwned(DType::kBF16, {H, conv_dim}, s + 10);
-      lw.gdn.in_proj_z = MakeOwned(DType::kBF16, {H, value_dim}, s + 20);
-      lw.gdn.in_proj_b = MakeOwned(DType::kBF16, {H, Hv}, s + 30);
-      lw.gdn.in_proj_a = MakeOwned(DType::kBF16, {H, Hv}, s + 40);
-      lw.gdn.conv1d_weight = MakeOwned(DType::kBF16, {conv_dim, Kw}, s + 50);
-      lw.gdn.a_log = MakeOwned(DType::kF32, {Hv}, s + 60);
-      lw.gdn.dt_bias = MakeOwned(DType::kF32, {Hv}, s + 70);
-      lw.gdn.norm_weight = MakeOwned(DType::kBF16, {Dv}, s + 80);
-      lw.gdn.out_proj = MakeOwned(DType::kBF16, {value_dim, H}, s + 90);
-    } else {
-      lw.attn.q_proj = MakeOwned(DType::kBF16, {H, 2 * Hq * Dh}, s + 10);
-      lw.attn.k_proj = MakeOwned(DType::kBF16, {H, Hkv * Dh}, s + 20);
-      lw.attn.v_proj = MakeOwned(DType::kBF16, {H, Hkv * Dh}, s + 30);
-      lw.attn.o_proj = MakeOwned(DType::kBF16, {Hq * Dh, H}, s + 40);
-      lw.attn.q_norm = MakeOwned(DType::kBF16, {Dh}, s + 50);
-      lw.attn.k_norm = MakeOwned(DType::kBF16, {Dh}, s + 60);
-    }
-    lw.moe = MakeKqMoe(c, s + 500);
-    w.layers.push_back(std::move(lw));
-  }
-  return w;
-}
-
-struct CachePool {
-  const HfConfig& c;
-  int64_t num_blocks;
-  int64_t block_size;
-  std::vector<std::vector<float>> full_attn_buf;
-  std::vector<std::vector<float>> gdn_ssm_buf;
-  std::vector<std::vector<float>> gdn_conv_buf;
-  std::vector<PagedKvCache> attn_kv;
-  std::vector<GdnStateCache> gdn_state;
-
-  CachePool(const HfConfig& cfg, int64_t nb, int64_t bs)
-      : c(cfg), num_blocks(nb), block_size(bs) {
-    const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
-    const int64_t Hv = c.linear_num_value_heads, Dv = c.linear_value_head_dim,
-                  Dk = c.linear_key_head_dim, Kw = c.linear_conv_kernel_dim;
-    const int64_t key_dim = c.linear_num_key_heads * Dk, value_dim = Hv * Dv;
-    const int64_t conv_dim = 2 * key_dim + value_dim;
-    for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
-      if (c.layer_types[static_cast<size_t>(l)] == "linear_attention") {
-        gdn_ssm_buf.emplace_back(static_cast<size_t>(nb * Hv * Dv * Dk), 0.0f);
-        gdn_conv_buf.emplace_back(static_cast<size_t>(nb * conv_dim * (Kw - 1)), 0.0f);
-      } else {
-        full_attn_buf.emplace_back(static_cast<size_t>(nb * 2 * bs * Hkv * Dh), 0.0f);
-      }
-    }
-    Rebind();
-  }
-
-  void Rebind() {
-    const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
-    const int64_t Hv = c.linear_num_value_heads, Dv = c.linear_value_head_dim,
-                  Dk = c.linear_key_head_dim, Kw = c.linear_conv_kernel_dim;
-    const int64_t key_dim = c.linear_num_key_heads * Dk, value_dim = Hv * Dv;
-    const int64_t conv_dim = 2 * key_dim + value_dim;
-    attn_kv.clear();
-    gdn_state.clear();
-    for (auto& b : full_attn_buf) {
-      PagedKvCache kv;
-      kv.data = b.data();
-      kv.dtype = DType::kF32;
-      kv.num_blocks = num_blocks;
-      kv.block_size = block_size;
-      kv.num_kv_heads = Hkv;
-      kv.head_size = Dh;
-      attn_kv.push_back(kv);
-    }
-    for (size_t g = 0; g < gdn_ssm_buf.size(); ++g) {
-      GdnStateCache gs;
-      gs.ssm_state = vt::Tensor::Contiguous(gdn_ssm_buf[g].data(), DType::kF32,
-                                            vt::Device{vt::DeviceType::kCPU, 0},
-                                            {num_blocks, Hv, Dv, Dk});
-      gs.conv_state = vt::Tensor::Contiguous(gdn_conv_buf[g].data(), DType::kF32,
-                                             vt::Device{vt::DeviceType::kCPU, 0},
-                                             {num_blocks, conv_dim, Kw - 1});
-      gdn_state.push_back(gs);
-    }
-  }
-};
-
-vt::Queue Q() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
-
-CommonAttentionMetadata PrefillAttnMeta(int64_t T, const std::vector<int32_t>& blocks,
-                                        int64_t block_size, int64_t start_slot) {
-  CommonAttentionMetadata m;
-  m.num_reqs = 1;
-  m.num_actual_tokens = static_cast<int>(T);
-  m.query_start_loc = {0, static_cast<int32_t>(T)};
-  m.query_start_loc_cpu = m.query_start_loc;
-  m.seq_lens = {static_cast<int32_t>(T)};
-  m.seq_lens_cpu = m.seq_lens;
-  m.max_query_len = static_cast<int>(T);
-  m.max_seq_len = static_cast<int>(T);
-  m.block_table_num_cols = static_cast<int>(blocks.size());
-  m.block_table_tensor = blocks;
-  for (int64_t t = 0; t < T; ++t) {
-    const int64_t blk = blocks[static_cast<size_t>(t / block_size)];
-    m.slot_mapping.push_back(blk * block_size + (start_slot + t) % block_size);
-  }
-  m.causal = true;
-  return m;
-}
-
-GDNAttentionMetadata PrefillGdnMeta(int64_t T, int32_t sidx) {
-  GDNAttentionMetadata g;
-  g.num_prefills = 1;
-  g.num_prefill_tokens = static_cast<int>(T);
-  g.num_decodes = 0;
-  g.num_decode_tokens = 0;
-  g.num_actual_tokens = static_cast<int>(T);
-  g.has_initial_state = std::vector<uint8_t>{0};
-  g.non_spec_state_indices_tensor = std::vector<int32_t>{sidx};
-  g.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
-  g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
-  g.prefill_state_indices = std::vector<int32_t>{sidx};
-  g.prefill_has_initial_state = std::vector<uint8_t>{0};
-  const auto conv =
-      vllm::v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
-  g.batch_ptr = conv.batch_ptr;
-  g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
-  return g;
-}
 
 // One full paged forward through the PRODUCTION entry point, over a fresh cache
 // so every call is independent.
@@ -408,7 +164,7 @@ TEST_CASE("decode REACHES the expert streamer, and the step clock advances") {
   CHECK(s.exhausted == 0);
 
 #if defined(__unix__)
-  // F5: the MADV_WILLNEED hint is ACCEPTED, not merely issued.
+  // F5: the MADV_WILLNEED hint is ACCEPTED on EVERY fill, not merely issued.
   //
   // madvise(2) returns EINVAL on an address that is not page-aligned, and GGUF
   // tensor data is aligned to `general.alignment`, default 32
@@ -417,7 +173,41 @@ TEST_CASE("decode REACHES the expert streamer, and the step clock advances") {
   // discarded, which is a hint that never fired and never said so. This counts
   // only the calls the kernel took.
   //
+  // WHY `== fills` AND NOT `> 0` (#1091 finding 2). `> 0` over 48 calls is
+  // satisfied whenever heap layout happens to page-align a single slice, and
+  // measured here it is: reinjecting the pre-fix unaligned address exits 0 in
+  // 40 of 40 runs against `> 0`, so the assertion the fix shipped with cannot
+  // fail for the defect it names. The equality can: 0 != 48.
+  //
+  // AND `fills` IS THE RIGHT DENOMINATOR, not a literal 48. madvise runs on the
+  // mapping-copy arm only (the pread arm needs no readahead hint) and only when
+  // the key is NOT already resident, which is exactly the condition under which
+  // `EnsureSpan` goes on to fill. The two counters therefore move together for
+  // as long as nothing is refused, and `exhausted == 0` above is that premise
+  // asserted. Every weight in this test owns its bytes (`mmap_fd == -1`), so
+  // every fill here is a span fill.
+  //
   // NO SPEEDUP IS ASSERTED, here or anywhere. This says the call is well formed.
+  //
+  // TWO RESIDUALS THE EQUALITY RESTS ON, stated rather than left to be
+  // rediscovered.
+  //
+  // (1) `Slice` rounds the advised range's END UP to a page, which for a
+  // heap-backed tower goes past the allocation. madvise(2) returns ENOMEM if
+  // any page in the range is unmapped, so this holds because the allocator's
+  // arena page is mapped, not because the arithmetic guarantees it. Production
+  // towers are file mappings many pages larger than a slice and do not have the
+  // question. If this ever fails with `advised` short by a small count, that is
+  // the first thing to check, not the fill path.
+  //
+  // (2) The counters are CUMULATIVE over the process, so this equality is a
+  // statement about everything that ran BEFORE it — and the pread case at the
+  // end of this file fills without advising, which would break it. The order
+  // holds under doctest's default file order, and it is not left implicit: the
+  // `CHECK_FALSE(s0.active)` at the top of this case fails loudly if anything
+  // ran first, so a reordering shows up as that assertion rather than as a
+  // confusing `advised != fills` here.
+  CHECK(s.advised == s.fills);
   CHECK(s.advised > 0);
 #endif
 }
@@ -450,7 +240,15 @@ TEST_CASE("a streamed slice and the tower view produce IDENTICAL logits") {
   // The unstreamed arm really did NOT stream: no new bytes moved, and every
   // slice it asked for was refused into the fallback.
   CHECK(off.fills == fills_after_streamed);
-  CHECK(off.exhausted > 0);
+  CHECK(off.forced > on.forced);
+
+  // AND IT WAS NOT COUNTED AS A BUDGET REFUSAL (#1091 finding 6). `exhausted` is
+  // the operator-facing number, documented as "the budget is smaller than one
+  // step's working set". The forced-fallback switch has no production caller, so
+  // every increment it contributed to `exhausted` was a gate telling an operator
+  // that a knob they never turned is too small. The budget here is 64 slots
+  // against 48 slices and nothing was ever genuinely refused, so this stays 0.
+  CHECK(off.exhausted == 0);
 
   // BIT-EXACT, not close. The slot holds a byte copy of the same tower bytes, so
   // the two arms feed the kernel identical inputs; anything but equality means
@@ -505,3 +303,88 @@ TEST_CASE("a SECOND model does not inherit the first model's slots") {
     if (!(streamed[i] == truth[i])) ++differing;
   CHECK(differing == 0);
 }
+
+#if !defined(_WIN32)
+TEST_CASE("a FILE-backed tower is served by pread, at file_offset + slice offset") {
+  // #1091 finding 4: `ExpertStreamer::EnsureFile` is the arm every REAL GGUF
+  // checkpoint takes, because a borrowed mmap tower carries a descriptor, and
+  // no test reached it. The other cases in this file build owned host vectors,
+  // so `w.mmap_fd` is -1 and every one of them exercises `EnsureSpan` instead.
+  // The spec's `## Owed` framed this as unmeasured on the model, which it also
+  // is; it was additionally UNREACHED, and that part needs neither the box nor
+  // the 370 GiB checkpoint.
+  //
+  // WHAT IS ACTUALLY UNVERIFIED HERE is the address arithmetic. `Slice` preads
+  // at `file_offset + offset`: the tensor's own position in the shard plus the
+  // routed expert's row offset within the tower. Get either term wrong and the
+  // read still succeeds, still returns exactly the bytes asked for, and the GEMM
+  // multiplies a different expert -- the "wrong shard at a plausible offset"
+  // shape F4 named. So the tower is written at a deliberately AWKWARD file
+  // offset: nonzero, not page-aligned and not a multiple of the 34-byte Q8_0
+  // block, which makes dropping the term or rounding it detectable.
+  const HfConfig c = MakeConfig();
+  Qwen3_5MoeWeights w = MakeWeights(c, /*base_seed=*/31000);
+
+  std::FILE* f = std::tmpfile();
+  REQUIRE(f != nullptr);
+  const int fd = ::fileno(f);
+  REQUIRE(fd >= 0);
+
+  // 4109 = 4096 + 13: past a page, not on a page, not on a Q8_0 block.
+  size_t at = 4109;
+  const std::vector<uint8_t> pad(at, 0xA5);
+  REQUIRE(std::fwrite(pad.data(), 1, pad.size(), f) == pad.size());
+
+  // Keep-alives for the borrowed views. A borrow with no owner is exactly the
+  // dangling view OwnedBytes exists to make unrepresentable.
+  std::vector<std::shared_ptr<std::vector<uint8_t>>> holds;
+
+  auto to_file_backed = [&](vllm::OwnedTensor& t) {
+    auto hold = std::make_shared<std::vector<uint8_t>>(t.bytes.begin(),
+                                                       t.bytes.end());
+    REQUIRE(std::fwrite(hold->data(), 1, hold->size(), f) == hold->size());
+    t.bytes = vllm::OwnedBytes::Borrow(hold->data(), hold->size(), hold);
+    t.mmap_fd = fd;
+    t.mmap_file_offset = at;
+    at += hold->size();
+    holds.push_back(std::move(hold));
+  };
+  for (auto& layer : w.layers) {
+    to_file_backed(layer.moe.expert_gate_kq);
+    to_file_backed(layer.moe.expert_up_kq);
+    to_file_backed(layer.moe.expert_down_kq);
+  }
+  REQUIRE(std::fflush(f) == 0);  // the pread must see the bytes, not the buffer
+
+  const std::vector<int32_t> ids = {13, 6, 28, 2};
+
+  const vllm::detail::ExpertStreamStats before =
+      vllm::detail::ExpertStreamSnapshot();
+  const std::vector<float> streamed = OneForward(c, w, ids);
+  const vllm::detail::ExpertStreamStats after =
+      vllm::detail::ExpertStreamSnapshot();
+
+  // THE ARM IS PROVEN, not assumed. Slices really were filled, and NOT ONE of
+  // them was advised: `Slice` issues MADV_WILLNEED only on the mapping-copy arm,
+  // because a pread needs no readahead hint. Equal `advised` across a forward
+  // that filled slots is therefore the signature of the pread path, and it is
+  // the one number that separates it from EnsureSpan.
+  CHECK(after.fills > before.fills);
+  CHECK(after.advised == before.advised);
+
+  // The ground truth for the same weights, read straight from the borrowed host
+  // bytes through the fallback. Those bytes and the file's are the same bytes by
+  // construction, so any difference is the pread landing somewhere else.
+  vllm::detail::ExpertStreamSetForceFallback(true);
+  const std::vector<float> truth = OneForward(c, w, ids);
+  vllm::detail::ExpertStreamSetForceFallback(false);
+
+  REQUIRE(streamed.size() == truth.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < streamed.size(); ++i)
+    if (!(streamed[i] == truth[i])) ++differing;
+  CHECK(differing == 0);
+
+  std::fclose(f);
+}
+#endif  // !_WIN32

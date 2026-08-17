@@ -124,6 +124,11 @@ green. Both sites therefore take the calibrated form that
 close it, the relocated virtual environment is UNMEASURED, and the load-bearing
 reason is that nothing has staged a runtime on the NAS.
 
+**The UNMEASURED clause in that form was answered on the same day, and both sites
+were corrected again.** A relocated runtime does start inside a worker, on
+`thor:gpu0`. What is still not staged is the ORACLE. See
+[`lease-runtime-staging.md`](lease-runtime-staging.md) and #1146.
+
 The same substitution repairs the derivation in the how-to. The old sentence
 read "no host toolchain, the worker has no compiler, SO no lease-compliant
 path". Those premises stopped entailing that conclusion once the later probe

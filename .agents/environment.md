@@ -172,7 +172,7 @@ this `dgx:gpu0` worker cannot do is produce or fetch that runtime, because it ha
 no `curl`, `wget`, `git`, `gcc`, `nvcc`, `cmake` or `python3`. Present and useful
 for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **The
 `thor:gpu0` worker does produce one**, because it is root and carries `apt-get`
-and `gcc`. That is the section two below.
+and `gcc`. That is the section below.
 
 **This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
 not close it.** The pinned oracle stays unreachable because its virtual

@@ -7,6 +7,193 @@ credentials, or assuming its paths exist. The untracked
 workspace and supplies local path/lock overrides. If no profile is selected,
 use only the current local host and mark unavailable hardware gates `PENDING`.
 
+## Reaching a GPU: claim a lease, never `ssh`
+
+The shared GPUs are managed by
+[resource-controller](https://github.com/mudler/resource-controller), whose
+client is `rc`. **Claim a device with `rc run` or `rc hold` before any GPU work,
+and never `ssh` to a GPU box to run work directly.** A bypass makes the fleet
+report the box free while somebody is on it, which is the exact failure the
+lease exists to remove. The procedure is in the `leasing-a-gpu` skill, which
+this repository deliberately does not copy, because a copy goes stale without
+saying so.
+
+`AGENTS.md` §`Work on a GPU happens inside a lease` holds the rule, and its
+condition is the DEVICE rather than the shell you are typing in. `dgx:gpu0`,
+`thor:gpu0` and `orin:gpu0` are the fleet devices, so a lease is the required
+path to each of them and it replaces the file mutex as the default. The three
+names are listed in both files so that membership stays checkable when the
+client is not at hand, and they are a lower bound rather than an upper one: a
+device that `rc devices` reports is a fleet device even when this list has not
+caught up. On a GPU that is not one of them, take
+`${GPU_LOCK:-$HOME/gpu.lock}` as before.
+
+`rc devices` lists the fleet when your shell has the client AND the controller
+answers, so it reports your access and not the device's membership. It fails in
+at least three ways that a reader must not collapse into one: `command not
+found` means this shell lacks the client, and a timeout or a refused
+authentication means the controller is not answering. `thor:gpu0` read `unknown
+(no contact 1m0s)` on 2026-08-17, so lost contact is a live state. On a fleet
+device every one of those answers means get the client or report the controller
+down. None of them means take the file mutex over `ssh`, because that is the
+collision below, in which two mutexes could not see each other.
+
+**This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
+in this file still describe.** Read a historical recipe as evidence of what ran
+at the time, not as an instruction for what to run now. The file mutex is still
+real and still required, and it now lives INSIDE a lease rather than instead of
+one.
+
+**The bypass has already voided a measurement, so this is a measured cost and
+not a rule for its own sake.** `.agents/specs/minimax-music3.md` §13.10 records
+a whole speed axis retained as VOID on 2026-08-17: those runs went in by `ssh`
+plus `docker run` serialised by the old mutex, while a concurrent session held
+the SAME box through `rc`. The two sessions took different mutexes and neither
+excluded the other, which is verbatim the #777 failure, and it is the likely
+cause of a 3x swing in the samples. `.agents/benchmark-record.md` records the
+other half of that row taking a real `rc hold` on `thor:gpu0` and reports the
+window in which the fleet showed `thor:gpu0` FREE while it was in use.
+
+The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
+
+| Device | Labels | `/workspace` on it |
+|---|---|---|
+| `dgx:gpu0` | `gpu_model=GB10`, `class=train`, `k8s=true`, driver 580.173.02, `cpus=20`, 128 GB | the house NAS |
+| `thor:gpu0` | `gpu_model=NVIDIA-Thor`, `class=train`, `k8s=true`, driver 595.78, `cpus=14`, 132 GB | the house NAS, the SAME folder as `dgx` |
+| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, and NO detected GPU labels because Jetson carries no `nvidia-smi` | LOCAL disk, invisible from `dgx` and `thor` |
+
+**Select on `class` or `gpu_model`, never on `vram`.** `rc describe` reports
+`vram=[N/A]M` and `vram_free=[N/A]M` on this fleet. That is a probe reporting
+"unknown", not a value, so a selector such as `vram>=40G` matches nothing and
+the job is rejected with `no_matching_device`. A device that carries no label
+never matches, INCLUDING for `!=`, and `orin:gpu0` carries no detected GPU
+labels at all. `class=train` and `gpu_model=GB10` do match. `rc run` has no
+`--image` flag. Its flags are `--as`, `--cwd`, `-d`, `--explain`,
+`--idle-timeout`, `--max-runtime`, `--no-wait`, `--priority`, `--select` and
+`--timeout`.
+
+### What a leased worker can and cannot do, measured 2026-08-17
+
+Probed with one `rc run -d dgx:gpu0 --max-runtime 2m` job
+(`ff28ada1-0cd3-4867-bf9b-f67050d0608b`). Verify this again before you plan work
+around it, because the worker image can change under you.
+
+- The command runs as user `rc` in a **k3s pod**, hostname `rc-worker-<id>`.
+  `/.dockerenv` is absent and 8 `KUBERNETES_*` variables are set, so it is a pod
+  rather than a docker container. The toolchain question is therefore a
+  worker-image question, not a per-job one.
+- Present: `bash`, `sh`, `ls`, **`nvidia-smi`** (which reports the GB10 by UUID),
+  `flock`, and **`/workspace`**.
+- **Absent: `gcc`, `cc`, `clang`, `nvcc`, `ninja`, `cmake`, `make`, `python3`,
+  `python`, `pip`, `docker`, `sudo`, `git`, `ssh`, `curl`,
+  `/usr/include/stdio.h`, and any `/usr/local/cuda*` toolkit.** A worker cannot
+  compile, cannot start Python, and cannot install anything.
+- **The host filesystem is not visible.** `/home/mudler` does not exist inside
+  the worker.
+- `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,
+  4.0T available, 46% used`, writable from the job, mounted on the dgx host at
+  `/usr/local/nas_share/rc` (SMB, NodePort 31516, subfolder `rc/`). It is the
+  SAME folder from `dgx` and from `thor`, and it is the one surface both ends
+  can see. It is NOT shared with `orin`.
+
+**The consequence, and it is a blocker rather than an inconvenience.** The
+pinned oracle venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST,
+and a leased worker cannot see it. The dgx host has carried no toolchain since
+the 2026-08-14 reimage, so host-side oracle work needs `sudo -n docker run`
+against `vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached
+over `ssh`, which is the bypass. **No vLLM leg of any row can currently run on
+`dgx.casa` by a lease-compliant path, because nothing has staged a runtime on
+the NAS** ([#1129](https://github.com/mudler/vllm.cpp/issues/1129)). Read that
+reason carefully, because it is no longer the worker's missing toolchain. "The
+lease carries bytes, and the exec bit is a mount option" below measures staged
+content starting under the dynamic loader and after a copy to `/tmp`, so what
+blocks the oracle is that nothing has put a runtime where a lease can see it.
+That is why recent GPU work reached for `ssh`, and the bypass is a symptom of
+this gap rather than a discipline problem. Do not design the migration here. The
+row that takes #1129 owns it.
+
+**This confirms and extends a finding that already landed, rather than making a
+new one.** `.agents/specs/minimax-music3.md` §13.10 probed `thor`'s worker on
+2026-08-17 and found the same absence (`no gcc / g++ / cmake / ninja / nvcc /
+make`), reported that the `$HOME` build tree is not mounted inside the worker,
+and named what a valid re-measurement needs: either a worker image carrying the
+CUDA devel toolchain, or the build placed on `/workspace` by something that
+already has one. This row measured `dgx`'s worker and adds the part that turns
+an open gap into a blocker for the parity gates, which is that the ORACLE VENV
+is also unreachable from a lease.
+
+### The lease carries bytes, and the exec bit is a mount option, measured 2026-08-17
+
+Probed with two `rc run -d dgx:gpu0 --max-runtime 3m` jobs,
+`1cb56f84-62bf-4c90-b138-9bd4c3b0617a` and
+`c692d5a0-ec3d-4498-86e4-e86a2864e91a`. Verify this again before you plan work
+around it, because the worker image and the mount options can change under you.
+
+`/workspace` in the worker and `/mnt/nas_share/rc/` on a local host are the same
+folder. A file written from the worker appeared locally under that path, and a
+file staged locally was read by the worker. The worker's `df` reported
+`//192.168.68.102/Data`, 7.3T total, 4.0T available, 46% used.
+
+**Direct execution off `/workspace` is refused, and the mount causes it rather
+than a `noexec` flag.** The worker mounts the share with `file_mode=0664`,
+`dir_mode=0775`, `nounix`, `forceuid` and `forcegid`, and the option list holds
+no `noexec`. The same bytes read `-rwxr-xr-x` on the local host, which mounts
+the share with `file_mode=0755`, and `-rw-rw-r--` in the worker, so the exec bit
+is a presentation of each mount and not stored state. In the worker, `chmod +x`
+failed with `Operation not permitted`, and a staged shell script and a copied
+ELF binary each failed to start with `Permission denied` and exit code 126.
+
+**Three routes ran staged content anyway, and each measured green.** Record the
+distinction, because a missing exec bit reads like a wall and is not one.
+
+| Route | Measured |
+|---|---|
+| `sh /workspace/staged.sh` | printed the script's output, exit 0 |
+| `/lib/ld-linux-aarch64.so.1 /workspace/echo_copy` | ran the ELF, exit 0 |
+| `cp` to `/tmp`, then `chmod +x`, then run | ran the script and the ELF, exit 0 |
+
+`/tmp`, `/var/tmp` and `$HOME`, which is `/home/rc`, are writable, take a real
+exec bit, and sit on a 3.6T overlay with 2.5T available. `/dev/shm` is 64M. The
+job's working directory `/` is not writable.
+
+**So the lease carries bytes, and bytes are enough to run.** A runtime staged on
+`/workspace` can start under the dynamic loader, or after a copy to `/tmp`. What
+the worker cannot do is produce or fetch that runtime, because it has no `curl`,
+`wget`, `git`, `gcc`, `nvcc`, `cmake` or `python3`. Present and useful for
+staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`.
+
+**This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
+not close it.** The pinned oracle stays unreachable because its virtual
+environment lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx host, which
+no lease can see, and only a host-side actor reached over `ssh` can place a copy
+on the NAS. Whether that copy then starts is UNMEASURED. A CUDA virtual
+environment holds absolute paths in its shebangs and its `RECORD` files, so
+treat the relocation as an open question rather than a solved step.
+
+**Three fleet-side changes would each remove the staging problem, and none of
+them is ours to make.** Whoever owns the fleet picks one.
+
+1. The worker image gains a toolchain and a Python interpreter.
+2. `rc run` gains an `--image` flag, so a job selects an image that has them.
+3. `/workspace` is mounted so that a file there can carry an exec bit. This one
+   removes the copy step only, because the two routes above already execute.
+
+### The `flock` orphan hazard that motivated the replacement
+
+The harness family in this repository puts the `flock` handle on a **subshell**,
+not on the `timeout` or wrapper process a reader would check. Kill the wrapper
+and an ORPHAN survives holding the mutex, with its output pipe severed, and it
+looks perfectly idle to every instrument a reader reaches for.
+
+Measured 2026-08-17 (`.agents/specs/mtp-k-gt-1.md`, "What held the mutex"):
+`nvidia-smi --query-compute-apps` was EMPTY and loadavg stayed near 1.1, which
+reads as a finished holder. The holder was PID 333128, `bash -s 8000`, `PPid: 1`,
+holding `fd 3` on the lock file, with `fd 1` and `fd 2` still pointing at the
+pipe its dead `tee` had been reading. It was not idle. It held a live container
+and was inside a readiness poll, and it blocked its own owner's restart for about
+50 minutes as well as the queued gate. Read the whole process chain and
+`/proc/<pid>/fd` before you call a lock stale, and never kill an unowned PID.
+
 ## Registering your own environment
 
 The profiles below are per-developer facts, not requirements: nothing here is
@@ -57,7 +244,9 @@ environment:
   vendored target `sm_120`, CUTLASS and FlashAttention-2 enabled.
 - **CPU development path:** CPU reference backend + engine logic + CI
   development.
-- **Ettore DGX release-gate profile**: `ssh dgx.casa` — DGX Spark, GB10 (Blackwell, **sm_121**),
+- **Ettore DGX release-gate profile**: device `dgx:gpu0`, host `dgx.casa` (claim
+  it with `rc`, and read "Reaching a GPU" earlier in this file before you use the
+  `ssh` recipes recorded here). DGX Spark, GB10 (Blackwell, **sm_121**),
   ~119 GB unified memory, 20 cores, CUDA toolkit 13.0.88 (nvcc); compute
   capability 12.1 → sm_121. Unified memory: both gate models fit
   in bf16; the machine is memory-bandwidth-bound (~273 GB/s class) — decode
@@ -147,7 +336,9 @@ environment:
     parallel-flake advice in the Apple/Metal profile below does not transfer
     here. Serialising also means every other probe queues behind the suite, so
     run attribution arms BEFORE a full suite, never during one.
-  - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds the
+  - **GPU mutex:** this runs INSIDE an `rc` lease, never instead of one. The
+    lease decides who gets the box. The mutex serialises the work of whoever
+    holds it. Every CUDA test/model/serve/benchmark/profile holds the
     `${GPU_LOCK}` file mutex — **`$HOME/gpu.lock`**, which is what `.env.example`
     ships and what every script here falls back to via
     `${GPU_LOCK:-$HOME/gpu.lock}` — for the whole job or multi-arm series WHEN
@@ -168,7 +359,8 @@ environment:
     gate checkpoints, APEX GGUF evidence and sources were preserved; the volume
     had 359 GB free afterward. Maintain at least 200 GB headroom before adding
     competitor images.
-- **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: `ssh 192.168.68.23`
+- **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: device `thor:gpu0`,
+  host `192.168.68.23` (claim it with `rc` first)
   — NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, 14 CPU cores, ~122 GB
   UNIFIED memory. `nvidia-smi --query-gpu=compute_cap` returns **11.0**. Host of
   the first non-GB10 runtime proof (`CLAIM-CUDA-SM110-RUNTIME`, 2026-07-27).

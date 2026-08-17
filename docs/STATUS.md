@@ -503,7 +503,10 @@ on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
 Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
 oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
-contributor-measured on 2x R9700 and CPU-link-verified our side;
+contributor-measured on 2x R9700 and CPU-link-verified our side; a `head_dim=128`
+decode arm lands opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves
+gfx1200 per-token decode from 6.35x to 1.75x slower than the pinned vLLM oracle
+on one shape, a directional figure that leaves the ROCm throughput axis PENDING;
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
 ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
 validator's two errors and three warnings, and the dot-anchored segment match),

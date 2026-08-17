@@ -1447,6 +1447,16 @@ add_test(NAME test_vulkan_loader COMMAND test_vulkan_loader)
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
 # exactness checks) on a plain CPU build.
 vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
+# The head_dim-128 decode arm (#382) ships default OFF, and its flag is read into
+# a `static const bool` -- once per process. The default registration above
+# therefore only ever gates the PagedAttnOnline fallback; the arm that runs the new
+# kernel needs its own INVOCATION with the flag set. Same shape as the
+# test_dense_gateup_fused_marlin_off_* lever pair above. The filter avoids commas:
+# doctest reads them as filter separators and the case name contains three.
+add_test(NAME test_backend_cross_device_vt_attn_decode_d128
+  COMMAND test_backend_cross_device "--test-case=*head_dim 128*")
+set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
+  ENVIRONMENT "VT_ATTN_DECODE_D128=1" SKIP_RETURN_CODE 77)
 # The ROCm GCN-arch capability parse (BACKEND-ROCM W0). UNCONDITIONAL by design:
 # include/vt/rocm/rocm_arch.h is deliberately free of HIP headers so the one part
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no

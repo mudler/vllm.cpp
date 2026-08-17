@@ -22505,3 +22505,73 @@ beside its post-fix twin rather than replaced by it, because the pair is what
 proves the label defect never touched the values: 819.992 s against
 819.818584 s.
 
+---
+
+## BACKEND-ROCM — the `d=128` decode arm against the pinned oracle: 6.35x -> 1.75x slower on per-token decode, both sides in ONE container; the "container/glibc" blocker was RETRACTED (2026-08-14, `row/ROCM-DECODE-ATTN-D128-IMPL`, gfx1200 / RX 9060 XT / ROCm 7.2.3, PR #767, issues #382 / #488)
+
+Recorded here from [the #767 comment of
+2026-08-14](https://github.com/mudler/vllm.cpp/pull/767#issuecomment-5295395139)
+because it was the strongest evidence in that pull request and lived only in a
+GitHub thread, which a squash merge does not carry into the tree. Spec:
+[`specs/rocm-decode-attn-d128.md`](specs/rocm-decode-attn-d128.md) §5.
+
+**The blocker this row previously recorded does not exist.** PR #767's body and
+the spec's §6 said the post-change oracle re-measure was blocked on a
+Nix-glibc-vs-container ABI mismatch. Its author retracted that diagnosis in the
+comment above: our binary runs inside the pinned oracle container, and the
+earlier failures were self-inflicted — `LD_LIBRARY_PATH` exported
+container-wide, which breaks the container's own tools, plus a bind mount that
+silently yielded nothing and presented as a missing ELF interpreter. A false
+blocker in the record is worse than no record, because it stops the next person
+from trying. §6 of the spec now says "not run — NOT blocked".
+
+### The substitution was proved inert before it was used
+
+Running our binary against the CONTAINER's ROCm rather than the host's is a
+substitution, so it gets a control. Qwen3-0.6B, 1024 in / 128 out, concurrency 1:
+
+| TPOT | native | in container |
+|---|---|---|
+| flag unset | 42.53 ms | 42.79 ms |
+| `VT_ATTN_DECODE_D128=1` | 11.78 ms | 12.03 ms |
+
+### Both sides in that container, matched workload
+
+Qwen3-0.6B, 1024 in / 128 out, concurrency 1, **8 prompts**, warmup discarded,
+**3 reps**. Oracle = vLLM `555967922` — the parity pin — in its PRODUCTION
+configuration, driven by `vllm bench serve`.
+
+| | TPOT reps | mean | vs oracle |
+|---|---|---|---|
+| ours, flag unset (`PagedAttnOnline`) | 42.54 / 42.46 / 42.19 | 42.40 ms | 6.35x slower |
+| ours, `VT_ATTN_DECODE_D128=1` | 11.97 / 11.38 / 11.66 | **11.67 ms** | **1.75x slower** |
+| vLLM `555967922` | 6.57 / 6.90 / 6.58 | 6.68 ms | — |
+
+The `d=128` decode arm closes the ROCm decode gap on this shape from **6.35x to
+1.75x**. It is the first oracle-relative ROCm decode figure this row has, and
+the arm ships **default OFF**, so it is not a shipped-behaviour number.
+
+### What this is NOT, carried forward verbatim from the author's own caveats
+
+- **Not the same-tool per-call kernel trace.** This is LATENCY, taken with each
+  side's own harness. AGENTS.md wants matching traces before a throughput
+  comparison. `rocprofv3` is present in the container and our binary traces
+  under it, but the oracle side still needs decode-phase windowing — bucket
+  dispatches over time, take the final burst — or it compares our decode
+  against vLLM's model load and graph capture. Reachable, and still owed.
+- **Harness asymmetry.** The oracle runs over HTTP via `vllm bench serve`; ours
+  is in-process. TPOT is the comparable axis. TTFT, E2EL and end-to-end
+  throughput carry the oracle's HTTP and tokenizer overhead and are
+  DIRECTIONAL ONLY.
+- **Not a #488 closure.** [#488](https://github.com/mudler/vllm.cpp/issues/488)
+  asks for a PER-CALL kernel comparison; this is PER-TOKEN latency. The ROCm
+  throughput axis in `docs/BENCHMARKS.md` stays **PENDING/OPEN**.
+- Single board, single model shape, one host.
+
+### The prompt count is load-bearing, and this is why
+
+At `--num-prompts 2` the oracle returned TPOT **6.96 ms and 13.45 ms on
+consecutive reps** — a ~2x spread that averages to a plausible-looking and
+entirely fictional number. The figures above use 8 prompts with a discarded
+warmup, where both sides hold to ~±0.3 ms. A two-request rate harness is not a
+measurement of this axis; it is a coin flip with a mean.

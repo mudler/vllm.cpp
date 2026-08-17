@@ -262,32 +262,48 @@ __global__ void PagedAttnOnline(TO* out, const TQ* query, const TKV* k_cache,
 constexpr int kDecWarps = 8;
 constexpr int kDecEpl = 8;  // 32 lanes * 8 = 256 head_dim
 
-// EPL elems/lane: 8 → d=256, 16 → d=512 (32 lanes).
+// EPL elems/lane: 4 → d=128 (Qwen3/Llama-class GQA), 8 → d=256, 16 → d=512
+// (32 lanes). d=128 (#488, ROCM-DECODE-ATTN-D128): the kernel body below is
+// already generic in EPL; only the 4/8/16-element vectorized load/store and
+// the host dispatch needed a new case, not a new kernel.
 template <int EPL>
 __device__ inline void LoadRowEplBf16(const __hip_bfloat16* p, int64_t base, int lane, float r[EPL]) {
-  static_assert(EPL == 8 || EPL == 16, "EPL");
-  const uint4* u = reinterpret_cast<const uint4*>(p + base);
-  if constexpr (EPL == 8) {
-    const uint4 w = u[lane];
+  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
+  if constexpr (EPL == 4) {
+    const uint2* u = reinterpret_cast<const uint2*>(p + base);
+    const uint2 w = u[lane];
     const __hip_bfloat16* h = reinterpret_cast<const __hip_bfloat16*>(&w);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) r[i] = __bfloat162float(h[i]);
+    for (int i = 0; i < 4; ++i) r[i] = __bfloat162float(h[i]);
   } else {
-    const uint4 w0 = u[lane];
-    const uint4 w1 = u[lane + 32];
-    const __hip_bfloat16* h0 = reinterpret_cast<const __hip_bfloat16*>(&w0);
-    const __hip_bfloat16* h1 = reinterpret_cast<const __hip_bfloat16*>(&w1);
+    const uint4* u = reinterpret_cast<const uint4*>(p + base);
+    if constexpr (EPL == 8) {
+      const uint4 w = u[lane];
+      const __hip_bfloat16* h = reinterpret_cast<const __hip_bfloat16*>(&w);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) r[i] = __bfloat162float(h0[i]);
+      for (int i = 0; i < 8; ++i) r[i] = __bfloat162float(h[i]);
+    } else {
+      const uint4 w0 = u[lane];
+      const uint4 w1 = u[lane + 32];
+      const __hip_bfloat16* h0 = reinterpret_cast<const __hip_bfloat16*>(&w0);
+      const __hip_bfloat16* h1 = reinterpret_cast<const __hip_bfloat16*>(&w1);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) r[i + 8] = __bfloat162float(h1[i]);
+      for (int i = 0; i < 8; ++i) r[i] = __bfloat162float(h0[i]);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) r[i + 8] = __bfloat162float(h1[i]);
+    }
   }
 }
 
 template <int EPL>
 __device__ inline void StoreRowEplBf16(__hip_bfloat16* p, int64_t base, int lane, const float r[EPL]) {
-  static_assert(EPL == 8 || EPL == 16, "EPL");
-  if constexpr (EPL == 8) {
+  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
+  if constexpr (EPL == 4) {
+    __hip_bfloat16 tmp[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) tmp[i] = __float2bfloat16(r[i]);
+    reinterpret_cast<uint2*>(p + base)[lane] = *reinterpret_cast<const uint2*>(tmp);
+  } else if constexpr (EPL == 8) {
     __hip_bfloat16 tmp[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) tmp[i] = __float2bfloat16(r[i]);
@@ -311,7 +327,8 @@ __device__ inline void StoreRow8Bf16(__hip_bfloat16* p, int64_t base, int lane, 
   StoreRowEplBf16<8>(p, base, lane, r);
 }
 
-// BF16 Q/K/V/Out; EPL=8 → d=256, EPL=16 → d=512. No per-key block sync (decode+prefill).
+// BF16 Q/K/V/Out; EPL=4 → d=128, EPL=8 → d=256, EPL=16 → d=512. No per-key block sync
+// (decode+prefill). The d=128 case is opt-in behind VT_ATTN_DECODE_D128 (default OFF).
 template <int EPL>
 __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat16* query,
                                         const __hip_bfloat16* k_cache, const __hip_bfloat16* v_cache,
@@ -436,7 +453,8 @@ __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat1
 }
 
 // GQA-fused decode: one CTA per KV head; load K/V once, attend QG q-heads.
-// Gemma-4: hq=16, kv=8 → QG=2. EPL=8→d=256, EPL=16→d=512. grid=(total_q, num_kv_heads).
+// Gemma-4: hq=16, kv=8 → QG=2. EPL=4→d=128, EPL=8→d=256, EPL=16→d=512.
+// grid=(total_q, num_kv_heads). The d=128 case is opt-in behind VT_ATTN_DECODE_D128 (default OFF).
 template <int QG, int EPL = 8, int NWARPS = kDecWarps>
 __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16* query,
                                        const __hip_bfloat16* k_cache, const __hip_bfloat16* v_cache,
@@ -1638,7 +1656,6 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
 #endif  // VT_ROCWMMA_OK
 }
 
-
 }  // namespace
 
 void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
@@ -1681,8 +1698,26 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
     return true;  // default ON when decode_opt
   }();
 
+  // head_dim-128 arm (#382) -- the Qwen3-dense / Llama / Mistral head size.
+  // Same kernels as d==256/512, EPL=4 instead of 8/16; before this, bf16 decode
+  // at d==128 fell all the way to the generic PagedAttnOnline (#488 measured
+  // that fallback at 41.1us/call against vLLM's 5.10us on gfx1200).
+  //
+  // DEFAULT OFF, opt in with VT_ATTN_DECODE_D128=1 -- the SAME flag, default and
+  // reason as the merged CUDA arm (cuda_paged_attn.cu, DecodeD128Enabled, #382 /
+  // PR #425). It is correctness-complete but NOT byte-exact against the kernel it
+  // replaces: warp-strided online softmax reduces the KV sequence in a different
+  // ORDER than PagedAttnOnline's per-tile loop, so a greedy anchor can move at an
+  // exact bf16 tie. Shipping OFF keeps every existing golden byte-identical. The
+  // flip owes the near-tie razor + distributional gate + regen under the ratified-
+  // tie rule, on both backends, and is a separate change.
+  static const bool decode_d128 = [] {
+    const char* e = std::getenv("VT_ATTN_DECODE_D128");
+    return e != nullptr && e[0] == '1';
+  }();
   const bool bf16_decode_opt =
-      decode_opt && (d == 256 || d == 512) && query.dtype == DType::kBF16 &&
+      decode_opt && ((d == 128 && decode_d128) || d == 256 || d == 512) &&
+      query.dtype == DType::kBF16 &&
       k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 && out.dtype == DType::kBF16 &&
       kc_hd % 8 == 0;
 
@@ -1690,7 +1725,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
     const int64_t qg = hq / num_kv_heads;
     // GQA fuse: sliding QG=2. Global QG=8: tile as DecodeGqa QG=2 × z=4
     // (proven kernel; halves K/V reloads vs DecodeOpt's 8×). QG=4/8 CTAs lost A/B.
-    if (decode_gqa && ((qg == 2 && (d == 256 || d == 512)) || (qg == 8 && d == 512))) {
+    if (decode_gqa &&
+        ((qg == 2 && (d == 128 || d == 256 || d == 512)) || (qg == 8 && d == 512))) {
       // Prefill SharedK (scoreless). Default ON for long single-req prefill (lab win
       // ~1.09× @11k vs DecodeGqa-z4). Set VT_ATTN_PREFILL_FLASH_SHAREDK=0 to disable.
       // SHAREDK_WMMA=1: rocWMMA QK + online V (lab; keep only if beats scalar SharedK).
@@ -1871,7 +1907,14 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       const unsigned z_groups = (qg == 8 && d == 512) ? 4u : 1u;
       dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), z_groups);
       dim3 block(static_cast<unsigned>(nwarps * 32));
-      if (d == 256) {
+      if (d == 128) {
+        PagedAttnDecodeGqaBf16<2, 4, 8><<<grid, block, smem, st>>>(
+            out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+            bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+            args.causal, window_left, window_right);
+      } else if (d == 256) {
         PagedAttnDecodeGqaBf16<2, 8, 8><<<grid, block, smem, st>>>(
             out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
             v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
@@ -1893,7 +1936,14 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         sizeof(float) * (static_cast<size_t>(kDecWarps) * static_cast<size_t>(d) +
                          2 * static_cast<size_t>(kDecWarps));
     dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(hq));
-    if (d == 256) {
+    if (d == 128) {
+      PagedAttnDecodeOptBf16T<4><<<grid, kDecWarps * 32, smem, st>>>(
+          out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+          v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+          query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row, bt_col,
+          kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap, args.causal,
+          window_left, window_right);
+    } else if (d == 256) {
       PagedAttnDecodeOptBf16T<8><<<grid, kDecWarps * 32, smem, st>>>(
           out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
           v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),

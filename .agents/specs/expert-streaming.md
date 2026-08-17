@@ -1377,10 +1377,10 @@ checkpoint rather than from the message.
 
 ### The allocation
 
-`ResidentWeight` (`src/vllm/model_executor/models/qwen3_5.cpp:963-1024`) aliases
+`ResidentWeight` (`src/vllm/model_executor/models/qwen3_5.cpp:963-1025`) aliases
 the host bytes when `GetPlatform(...).is_cpu()` and otherwise **uploads the whole
 tensor**: `const size_t nb = w.bytes.size(); void* p = d.b.Alloc(nb);`
-(`qwen3_5.cpp:1012-1013`). For a routed-expert weight, `w` is the STACKED
+(`qwen3_5.cpp:1010-1011`). For a routed-expert weight, `w` is the STACKED
 `[E*N,K]` keep-quant tower, so `nb` is one tower — every expert of one matrix of
 one layer, in one contiguous `cudaMalloc`.
 
@@ -1390,7 +1390,7 @@ is why no knob avoids it:
 | Configuration | Path | Reaches |
 |---|---|---|
 | default (`VT_QWEN35_GROUPED_MOE` unset ⇒ on) | `MoeBlock:6615,6616,6620` → `KqGrouped:5694` | `ResidentWeight(d, w_kq)` |
-| `VT_MOE_EXPERT_STREAM=1` (which DISABLES grouping, `:5670-5676`) | `ExpertMlpKq:5651` → `MatmulF32Slice:5611` → `KqExpertSlice:5595` | `KqResidentSlice:5111` → `ResidentWeight` |
+| `VT_MOE_EXPERT_STREAM=1` (which DISABLES grouping, `:5670-5676`) | `ExpertMlpKq:5638` → `MatmulF32Slice:5611` → `KqExpertSlice:5595` | `KqResidentSlice:5112` → `ResidentWeight` |
 
 `KqExpertSlice`'s slot arm is guarded by `is_cpu()` (`qwen3_5.cpp:5578`), so on a
 device platform it falls through before the store is even constructed. That is
@@ -1440,7 +1440,7 @@ table.
 `slot_bytes=2490368` the W4 banner printed, so the arithmetic here and the
 running lane agree on the same weight.
 
-**So the answer to "which allocation and how big" is: `qwen3_5.cpp:1013`,
+**So the answer to "which allocation and how big" is: `qwen3_5.cpp:1011`,
 1,275,068,416 bytes at a time (2,818,572,288 for three of them), 279 times,
 335.62 GiB in total.**
 
@@ -1461,7 +1461,7 @@ attr Integrated           rc=0 value=1
 attr UnifiedAddressing    rc=0 value=1
 ```
 
-`total` equals `/proc/meminfo MemTotal` rounded to the physical 128 GB and equals
+`total` is EXACTLY `/proc/meminfo MemTotal` (125442340 kB) times 1024, and equals
 the fleet's own `mem_total_bytes=128452956160`. **One unified pool, correctly
 reported by the CUDA runtime and not by `nvidia-smi`.**
 
@@ -1530,7 +1530,7 @@ behaviour change with its own measurement, so it is filed rather than done.
 ### Tests, and how the device branch is reached on a CPU-only host
 
 `needs_weight_staging()` is true on exactly one platform in this tree
-(`src/vllm/platforms/cuda.cpp:67`), so the branch is unreachable from the real
+(`src/vllm/platforms/cuda.cpp:71`), so the branch is unreachable from the real
 loader on a host with no CUDA device — the untestable-device-branch shape this
 row has hit repeatedly. It is reached here by registering a FAKE staging
 platform in the CUDA lookup slot, which is the instrument

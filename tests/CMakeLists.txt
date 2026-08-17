@@ -384,6 +384,16 @@ target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
+# ENG-EXPERT-STREAM #1123: the load-time GGUF device-fit refusal, in two targets
+# for two different questions. The arithmetic runs everywhere; the REACHABILITY
+# gate needs a fake WEIGHT-STAGING platform in the CUDA lookup slot, because
+# `needs_weight_staging()` is true on exactly one platform in this tree and the
+# branch is otherwise unreachable on a host with no CUDA device. Its own
+# executable for the same reason test_device_selection is one.
+vllm_cpp_add_test(test_gguf_device_fit
+  vllm/model_executor/test_gguf_device_fit.cpp)
+vllm_cpp_add_test(test_gguf_device_fit_reach
+  vllm/entrypoints/test_gguf_device_fit_reach.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)

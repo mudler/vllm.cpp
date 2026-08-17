@@ -1,0 +1,117 @@
+// ENG-EXPERT-STREAM, issue #1123. See the header for what this decides and why.
+#include "vllm/model_executor/model_loader/gguf_device_fit.h"
+
+#include <cerrno>
+#include <cstdlib>
+#include <string>
+
+namespace vllm {
+namespace {
+
+// Bytes -> "N.NN GiB", so a refusal reads as a size rather than as 19 digits.
+// Both the raw byte count and the GiB appear in the message: the first is what a
+// reader can grep for in the code, the second is what an operator compares
+// against the box.
+std::string Gib(size_t bytes) {
+  const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  std::string s = std::to_string(gib);
+  const size_t dot = s.find('.');
+  if (dot != std::string::npos && s.size() > dot + 3) s.resize(dot + 3);
+  return s + " GiB";
+}
+
+}  // namespace
+
+GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
+                                              size_t model_dtype_bytes) {
+  GgufStagedFootprint out;
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    size_t elems = 1;
+    for (const int64_t d : t.shape) {
+      if (d <= 0) {  // A malformed dim cannot be reasoned about; contribute the
+        elems = 0;   // on-disk size alone rather than a bogus expanded size.
+        break;
+      }
+      elems *= static_cast<size_t>(d);
+    }
+    // The expanded size, when it is knowable. `elems == 0` means the shape was
+    // unusable, and then the on-disk size is the only defensible term.
+    const size_t expanded = elems == 0 ? t.nbytes : elems * model_dtype_bytes;
+    const size_t staged = expanded < t.nbytes ? expanded : t.nbytes;
+    out.lower_bound_bytes += staged;
+    ++out.tensor_count;
+    if (staged > out.largest_tensor_bytes) {
+      out.largest_tensor_bytes = staged;
+      out.largest_tensor_name = t.name;
+    }
+  }
+  return out;
+}
+
+size_t DeviceWeightBudgetBytes(size_t device_memory_total_bytes) {
+  const char* override_env = std::getenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  // A malformed value is IGNORED, never read as 0. Reading it as 0 would
+  // silently disable the guard on a typo, which is the invisible-fallback shape
+  // this tree refuses elsewhere. `strtoull` alone is not enough for that: it
+  // skips leading whitespace, and it ACCEPTS a leading '-' and wraps it to
+  // ULLONG_MAX, so "-1" would parse as an effectively infinite budget. The
+  // accepted grammar is therefore explicit: one or more decimal digits, nothing
+  // else, no sign and no space.
+  if (override_env != nullptr && override_env[0] >= '0' &&
+      override_env[0] <= '9') {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed =  // NOLINT(runtime/int) strtoull's type
+        std::strtoull(override_env, &end, 10);
+    if (*end == '\0' && errno == 0) return static_cast<size_t>(parsed);
+  }
+  return device_memory_total_bytes;
+}
+
+DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
+                                     std::string_view device_name,
+                                     bool needs_weight_staging,
+                                     size_t budget_bytes,
+                                     size_t model_dtype_bytes) {
+  DeviceWeightFit fit;
+  fit.budget_bytes = budget_bytes;
+  // A platform that does not stage weights reads them where they already are, so
+  // a borrowed tower costs it nothing and there is nothing to compare. This is
+  // the branch every CPU load takes, and it must be free of any behaviour
+  // change: no footprint is even computed.
+  if (!needs_weight_staging) return fit;
+  // 0 == UNKNOWN, and unknown is not a verdict. Refusing a load because nothing
+  // reported a budget would break every device whose budget nothing probes.
+  if (budget_bytes == 0) return fit;
+
+  const GgufStagedFootprint fp =
+      GgufStagedWeightFootprint(gguf, model_dtype_bytes);
+  fit.needed_bytes = fp.lower_bound_bytes;
+  if (fp.lower_bound_bytes <= budget_bytes) return fit;
+
+  fit.refuse = true;
+  fit.message =
+      "device '" + std::string(device_name) +
+      "' cannot serve this GGUF: staging its weights needs at least " +
+      std::to_string(fp.lower_bound_bytes) + " bytes (" +
+      Gib(fp.lower_bound_bytes) + ") of device memory across " +
+      std::to_string(fp.tensor_count) + " tensors, the largest single "
+      "allocation being " + std::to_string(fp.largest_tensor_bytes) + " bytes (" +
+      Gib(fp.largest_tensor_bytes) + ", '" + fp.largest_tensor_name +
+      "'), and this device's memory pool is " + std::to_string(budget_bytes) +
+      " bytes (" + Gib(budget_bytes) + "). THE MISSING PART: the "
+      "larger-than-memory lane that makes a checkpoint like this fit is "
+      "HOST-ONLY. The GGUF mapping is borrowed in place on the CPU path and "
+      "costs no resident bytes, while a weight-staging device copies every "
+      "expert tower into device memory; there is no device-side expert slot "
+      "store and no device streaming lane (ENG-EXPERT-STREAM, issues #1123 and "
+      "#1124). Use device=cpu, which serves this checkpoint today, or a "
+      "checkpoint that fits the pool. This is refused at LOAD on purpose: "
+      "before this check the load succeeded and the FIRST forward died with "
+      "'vt cuda: cudaMalloc: out of memory'. Setting "
+      "VT_DEVICE_WEIGHT_BUDGET_BYTES higher (or to 0) suppresses this refusal "
+      "and restores that late failure; it does not make the model fit.";
+  return fit;
+}
+
+}  // namespace vllm

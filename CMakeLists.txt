@@ -717,6 +717,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
   src/vllm/model_executor/model_loader/gguf_keep_quant.cpp
+  src/vllm/model_executor/model_loader/gguf_device_fit.cpp
   src/vllm/model_executor/model_loader/nvfp4_dequant.cpp
   src/vllm/model_executor/model_loader/awq_gptq_dequant.cpp
   src/vllm/model_executor/model_loader/mxfp4_dequant.cpp

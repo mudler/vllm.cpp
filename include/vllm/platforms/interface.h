@@ -53,6 +53,23 @@ struct ResidencyPolicy {
   // Optional soft cap (bytes) on pooled device scratch; 0 == uncapped (today).
   // Consumed by the DevicePool: a discrete GPU sets a bound; GB10 leaves it 0.
   size_t device_pool_cap_bytes = 0;
+  // Total device memory this platform can draw weight allocations from (bytes).
+  // 0 == UNKNOWN, and unknown must never be read as "unlimited" or as "nothing
+  // fits": a caller that cannot learn the budget declines to decide. Consumed by
+  // the load-time GGUF fit refusal (`gguf_device_fit.h`, issue #1123).
+  //
+  // TOTAL rather than FREE, because `free` at load time carries the page cache
+  // and whatever else the box is doing, which would make a load-time verdict a
+  // function of contention.
+  //
+  // This is NOT `vt::Backend::DeviceMemoryInfo`, which is a live free/total
+  // probe whose only consumer is `Gemma4MoE`'s device-expert LRU and which
+  // `CudaBackend` does not override at all -- so wiring CUDA into that seam
+  // would wake a landed residency policy that is currently dead on CUDA, which
+  // is a behaviour change with its own measurement to make (issue #1126).
+  // Probed once at platform registration; on a GB10 `cudaMemGetInfo` reports
+  // 128452956160 (119.631 GiB) where `nvidia-smi` reports `[N/A]`.
+  size_t device_memory_total_bytes = 0;
 };
 
 // Residency DECISIONS derived from a ResidencyPolicy — the single, testable place

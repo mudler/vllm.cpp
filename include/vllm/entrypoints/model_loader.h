@@ -199,6 +199,17 @@ struct EngineParams {
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device);
 
+// The device type `SelectQueueForModel` will pick, resolved WITHOUT creating a
+// queue. `SelectQueueForModel` itself calls this, so the two cannot drift.
+//
+// It exists because the load-time GGUF device-fit refusal (issue #1123) has to
+// know the target device BEFORE any weight I/O, and the queue is not created
+// until after the weights are loaded. Throws for an explicitly named device that
+// this build/process cannot serve, exactly as the queue selector does; the auto
+// arm falls back to `kCPU` instead of throwing, also exactly as it does.
+vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
+                                      vllm::Device device);
+
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
 // runner -> Executor -> EngineCore; Input/OutputProcessor -> LLMEngine) for a
 // registered model. The concrete weights/forward are held behind LoadedModel;

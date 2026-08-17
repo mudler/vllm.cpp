@@ -2691,6 +2691,13 @@ declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
 This line read `19` and `36` until 2026-08-17; both numbers were last true
 several ABI additions ago, and neither is derived by any gate.
 
+On native Windows/MSVC, the shared-library packaging lane keeps the runtime DLL
+name at `vllm` and gives the import/static archive the distinct name
+`vllm_shared`, so one build tree can hold the shared C ABI package and the
+static `vllm` archive without a filename collision. The same ABI smoke test
+therefore resolves the exported symbols through `LoadLibraryA` /
+`GetProcAddress` on Windows and `dlopen` / `dlsym` on POSIX.
+
 ```c
 #include "vllm.h"
 

@@ -264,6 +264,24 @@ environment:
     four minutes later as an engine error. Container egress WAS available on
     2026-08-17; the box has been recorded without it before, which is the argument
     for baking rather than installing.
+    **★ AND SIZE THE ORACLE FOR UNIFIED MEMORY: `gpu_memory_utilization=0.75`
+    reserves most of the WHOLE MACHINE here.** Measured the same day, once the
+    toolchain fix let an oracle get that far for the first time: a pinned-vLLM 27B
+    engine at 0.75 held about **110 GiB of HOST RAM** while `nvidia-smi` reported
+    only 26 GiB on the device. It hung 45 minutes in the memory-profiling step
+    right after `torch.compile` (which had itself completed in 122 s), at loadavg
+    **260** with **0 GiB available**, and `sshd` stopped completing a banner
+    exchange while the box still answered ICMP. Killing the container took it from
+    118 of 119 GiB used to 4 of 119 in under ten seconds. **It did NOT reboot**:
+    `uptime` and `boot_id` were unchanged, so this is the thrash case rather than
+    the OOM-reboot case above, and the two want different cures. Watch
+    `MemAvailable`, never `nvidia-smi`, when sizing anything here.
+    **A cleanup trap is not a stop button.** Both DGX drivers used
+    `trap cleanup EXIT INT TERM` where `cleanup` resets the clocks and RETURNS, so
+    `SIGTERM` reset the clocks and the script then started its NEXT leg on a box
+    with no memory left. Put an `exit` on the signal path, and `docker kill` the
+    current named container inside the handler: `timeout` signals `docker run`, and
+    the container outlives it.
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import

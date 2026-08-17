@@ -719,7 +719,8 @@ upstream's own supported configuration.
 | Owed | What it must show | Who |
 |---|---|---|
 | DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate. **2026-08-17 narrowed it to 3 forwards.** Only the FIRST divergence per arm and prompt is adjudicable, which reduces 1718 divergent positions to 18 and then to 3 distinct probe points. Prompt 1 position 1 resolves to THREE different tokens under three values of k, which no depth defect can produce. `scripts/mtp-k-gt-1-neartie-gap.py` is committed and decides each candidate against `kNearTieMnats = 500`. It still has not RUN: the oracle cannot be loaded while a foreign multi-tens-of-GiB container is resident. **2026-08-17 third pass: the box was CLEAN, the run happened, and the divergence REPRODUCED exactly on independently generated streams (1718 positions, 18 adjudicable, 3 probe points, same tokens), so it is deterministic rather than a flake. The adjudication STILL did not report.** Its failure was an INSTRUMENT failure and is recorded as such rather than as a verdict: the reimaged host carries no C compiler at all, so Triton's JIT died after the weights loaded and vLLM surfaced it as `Engine core initialization failed`. Repaired by running the oracle inside a container carrying the toolchain, which is MEASURED loading the engine past that point; the box then stopped answering SSH mid-leg. Do NOT read this row as a passed token gate | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
-| The oracle's host-memory configuration on GB10, validated rather than assumed | `oracle_mtp.py` and `adjudicate.py` both build the engine with `gpu_memory_utilization=0.75`. **No oracle leg in any of the three passes has ever reached KV-cache allocation on this box, so that value has never actually been exercised here.** On GB10 the setting does not bound HOST RAM (a 27B load has been measured at 111.7 of 119 GB host while `nvidia-smi` showed 18.9 GiB), and the box reboots rather than OOM-killing. Owed: establish an oracle memory configuration that demonstrably reaches KV-cache allocation and completes a generate on this box, and record it in `.agents/environment.md` beside the toolchain recipe. Until then the vLLM leg is blocked on a resource question, not on a scheduling one | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| The oracle's host-memory configuration on GB10, now MEASURED and owed a fix | `oracle_mtp.py` and `adjudicate.py` build the engine with `gpu_memory_utilization=0.75`, and on GB10's UNIFIED memory that reserves most of the whole machine rather than 75 percent of a separate device pool. **Measured 2026-08-17: the engine held about 110 GiB of HOST RAM while `nvidia-smi` reported 26 GiB on the device. Killing our container took the box from 118 of 119 GiB used to 4 of 119 in under ten seconds.** It hung for 45 minutes in the memory-profiling step after `torch.compile`, at loadavg 260 with 0 GiB available, and its own `timeout` fired (`ADJUDICATE_EXIT=124`). It did NOT reboot: `uptime` and `boot_id` were unchanged. No oracle leg in any of the three passes had ever reached KV-cache allocation, which is why this was never exposed before. Owed: an oracle memory configuration that demonstrably reaches KV-cache allocation and completes a generate here, verified against `MemAvailable` rather than `nvidia-smi`, recorded in `.agents/environment.md` beside the toolchain recipe | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| The cleanup trap in the DGX drivers does not stop the run | `run_all_inner.sh` and `run_oracle_inner.sh` both use `trap cleanup EXIT INT TERM` where `cleanup` resets the clocks and returns WITHOUT exiting, so bash resumes the script after the handler. **Observed 2026-08-17: `SIGTERM` reset the clocks and the driver then started its next leg, which immediately began re-filling a box that had 0 GiB available.** The chain had to be `SIGKILL`ed and the container stopped separately. A cleanup trap that does not terminate is not a stop button, and on a box that reboots rather than OOM-killing that difference is the box. Owed: `exit` from the signal path, and a `docker kill` of the current leg's named container inside `cleanup` so the container cannot outlive its driver | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | The PADDED CONTROL arm of that gate, and the RATE assertion it carries | **PAID 2026-08-16 on the 27B, and its throughput VOID LIFTED 2026-08-17.** The first pass could not quote `padded_k3`/`padded_k4` throughput because they started at loadavg 10.77 and 20.41 against real arms at 1.5 to 2.9. The third pass re-ran all seven arms inside ONE window in a load band of 0.16 to 1.86, every leg exit 0, so the real-arm against padded-control comparison is now quotable rather than merely computed. Detail below. Margin fixed BEFORE the run at 0.10 absolute per depth. The real loop accepts at 0.507 to 0.750 at every depth >= 1. The padded control accepts at 0.000 at every depth >= 1 while its depth-0 rate MATCHES the real arm (0.892 to 0.925 against 0.868 to 0.878), which is what a control that isolates columns >= 1 must look like. Every margin clears by at least 0.41. The control measuring 0 is recorded as a fact about THIS prompt set and did not license restoring the count assertion. Still owed on the 35B | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
 | Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
@@ -1397,6 +1398,34 @@ Here every one of the seven arms ran inside ONE window in a band of 0.16 to 1.86
 which is what makes the real-arm against padded-control comparison quotable
 rather than merely computed.
 
+### The padded control, PAID at every depth in that one window
+
+Margin fixed at 0.10 absolute inside `compare.py` before the run, per depth
+`d >= 1`. Real acceptance against the control, both measured here:
+
+| k | depth 0 | depth 1 | depth 2 | depth 3 |
+|---|---|---|---|---|
+| real k=2 | 0.878173 (173/197) | 0.730964 (144/197) | | |
+| real k=3 | 0.868263 (145/167) | 0.682635 (114/167) | 0.538922 (90/167) | |
+| real k=4 | 0.875000 (119/136) | 0.750000 (102/136) | 0.617647 (84/136) | 0.507353 (69/136) |
+| control k=2 | 0.892193 (240/269) | 0.000000 (0/269) | | |
+| control k=3 | 0.892193 (240/269) | 0.000000 (0/269) | 0.000000 (0/269) | |
+| control k=4 | 0.924528 (245/265) | 0.000000 (0/265) | 0.000000 (0/265) | 0.000000 (0/265) |
+
+All six margins clear, by +0.5074 to +0.7500 against a required +0.10. The
+control's depth-0 rate MATCHES or slightly exceeds the real arm's (0.892 to 0.925
+against 0.868 to 0.878), which is exactly what a control that isolates columns
+`>= 1` has to look like: it is the same step-0 draft, so it must accept at the
+same rate there and nowhere after. The k=4 figures reproduce the first pass's
+0.875/0.750/0.618/0.507 exactly.
+
+`compare.py` over the whole window: **`CHECKS_RUN=21 CHECKS_FAILED=11
+VERDICT=FAIL`**. The 10 that pass are the three per-depth counter checks and all
+six control margins. The 11 that fail are the three `ours_on_kN == ours_off`
+token-identity checks, which is the unadjudicated divergence, and eight checks
+that report `arm missing` because the oracle never produced a file. **The gate
+verdict is FAIL and is recorded as FAIL.**
+
 ### The divergence REPRODUCED exactly, from an independent run
 
 The instrument prints its own denominators, and this run's are identical to the
@@ -1486,26 +1515,74 @@ record was written. That is the signature of severe memory pressure on a box wit
 `vm.overcommit_memory=1` and zero swap, which `.agents/environment.md` records as
 rebooting rather than OOM-killing.
 
-**The cause is NOT yet established and is deliberately not asserted here.** The
-open hypothesis is that `gpu_memory_utilization=0.75` in `oracle_mtp.py` and
-`adjudicate.py` is too aggressive on a 119 GiB UNIFIED-memory box, because on
-GB10 that setting does not bound host RAM and a 27B load has been measured at
-111.7 of 119 GB host. Note that no oracle leg in ANY of the three passes has ever
-reached KV-cache allocation, so this configuration has never actually run here
-and the 0.75 was never validated. Confirming it needs the box back: the gap in
-`journalctl --list-boots` is the evidence for a reboot, and `uptime` distinguishes
-a reboot from a recovery.
+### The cause was then MEASURED, and it is `gpu_memory_utilization` on unified memory
 
-Nothing was signalled and nothing was killed.
+The box came back at 08:38Z after roughly 42 minutes. **It did NOT reboot:**
+`uptime` read `up 11:28` and `boot_id` was still `5bbdc432`, the same value
+window 1 recorded. So this was thrashing, not the documented OOM-reboot, and the
+distinction is worth keeping because the two have different cures.
+
+State on return: `load average: 260.22`, and **119 GiB total with 118 used and 0
+available**. The adjudication process was still alive and still holding the
+mutex, its container `mtpgate-adjudicate` up 51 minutes with 26147 MiB on the
+device and the clocks still pinned at 2086 MHz.
+
+It was not progressing. `torch.compile` finished at 07:53:41 (`took 122.46 s in
+total`) and the log had **not advanced in the 45 minutes since**, while the
+process burned CPU. It was stuck in the memory-profiling and KV-cache sizing step
+that follows compilation, which is precisely the step that tries to reserve
+`gpu_memory_utilization` of device memory. Its own `timeout 2400` had already
+fired: `ADJUDICATE_EXIT=124`, START 07:47:56Z, END 08:39:41Z. `timeout` had
+signalled `docker run` and the CONTAINER outlived it, which is the same
+lock-handle-on-a-wrapper shape this row already recorded once.
+
+**The measurement that settles it.** Killing our own container took host memory
+from 118 of 119 GiB used to 4 of 119 in under ten seconds, with 115 GiB
+available. The engine was therefore holding on the order of **110 GiB of HOST
+RAM** while `nvidia-smi` reported 26 GiB on the device. `gpu_memory_utilization
+= 0.75` on GB10's UNIFIED memory does not mean 75 percent of a separate device
+pool, it means most of the whole machine. That is the confirmed cause, and it is
+now a measurement rather than the hypothesis this section previously carried.
+
+This also explains all three passes at once. **No oracle leg has ever reached
+KV-cache allocation on this box**, so 0.75 was never validated here; the first
+two passes died earlier, on the missing compiler, and never got far enough to
+expose it.
+
+Only our own processes were signalled. The container, the driver, its `flock` and
+its queue wrapper were all ours, started by this session. Nothing belonging to
+another session was touched.
+
+### A fourth defect, in the trap, found by watching it fail
+
+`SIGTERM` to the driver reset the clocks and then **the driver carried on to the
+next leg**, which immediately began re-filling memory with `vllm_off`. The cause
+is that `trap cleanup EXIT INT TERM` runs `cleanup` and never exits, so bash
+resumes the script after the handler returns. Window 1's `run_all_inner.sh` has
+the same shape and the same defect. A cleanup trap that does not terminate is not
+a stop button, and on this box the difference is a reboot. The driver chain had
+to be killed with `SIGKILL` and the container stopped separately.
+
+### Final state on the box, verified rather than assumed
+
+After cleanup: **0 matching processes, no containers, `fuser $HOME/gpu.lock`
+returns no holders so the mutex is FREE**, no compute apps on the device, clocks
+reset with `nvidia-smi -rgc` reporting `All done.`, 115 GiB available, and
+loadavg falling from 260 to 42. Everything window 1 produced is intact under
+`~/mtpgate/final/`.
 
 ### PENDING, and the resource each one waits on
 
 | Pending | Waits on |
 |---|---|
-| The adjudication verdict at the 3 probe points, meaning TIE or DEFECT against `kNearTieMnats = 500` | `dgx.casa` answering SSH again, then an oracle memory configuration that has been shown to reach KV-cache allocation on this box |
+| The adjudication verdict at the 3 probe points, meaning TIE or DEFECT against `kNearTieMnats = 500` | an oracle memory configuration that demonstrably reaches KV-cache allocation on GB10. This is now a KNOWN quantity rather than a mystery: lower `gpu_memory_utilization` until the engine stops reserving most of host RAM, and prove it by watching `MemAvailable` rather than `nvidia-smi` |
 | The vLLM leg (`vllm_off`, `vllm_on_k2/k3/k4`), the three-way token gate, and the oracle's OWN ON against OFF attribution | the same |
 | M2 concurrency>1 A/B at matched k | the two above, in order |
 | The 35B lane | a checkpoint that is not on this box, which is a large-asset download needing recorded authority |
+
+The next attempt does NOT need to rediscover anything. The toolchain container
+works, the instrument loads and reaches `torch.compile`, the divergence and its 3
+probe points are stable, and the one remaining variable is the memory setting.
 
 The token legs and the adjudication are DETERMINISTIC functions of the greedy
 stream, so they do not need an idle box, only a working one. Only the throughput
@@ -1513,9 +1590,66 @@ axes need an idle box on top of that.
 
 ### What this pass changes about the row's claims
 
-Nothing about `our-ON == our-OFF` is settled, and the row must still NOT be read
-as a passed token gate. What moved is that the divergence is now reproducible
-from an independent run, the one-window control comparison is no longer void, the
-instrument that adjudicates it is proven to LOAD and run on this host, and the
-two harness defects plus one stale environment record that stood between the
-instrument and its answer are repaired rather than described.
+Nothing about `our-ON == our-OFF` is settled, the gate verdict is `FAIL` at
+`CHECKS_RUN=21 CHECKS_FAILED=11`, and the row must still NOT be read as a passed
+token gate.
+
+What moved is that the blocker changed shape from unknown to known. The
+divergence is reproducible from an independent run and stable at 3 probe points.
+The padded control is PAID at every depth in one uncontended window, with all six
+margins clearing by +0.51 to +0.75 against a required +0.10. The adjudicating
+instrument is proven to load, assert its pin, and reach `torch.compile` on this
+host. And every obstacle between the instrument and its answer is now a MEASURED
+quantity with a named repair rather than a mystery: a missing host toolchain
+(repaired), an empty `k` at the caller (repaired), a self-blind container guard
+(repaired), a cleanup trap that does not stop (recorded and owed), and an oracle
+memory setting that reserves most of a unified-memory box (measured and owed).
+
+The honest summary is that this pass converted a blocked gate into a gate that is
+one configuration value away from reporting.
+
+### Gate for this pass
+
+`scripts/agent-preflight.sh` on the merge of `origin/main` into this branch,
+counted by block over ALL FOUR markers the script emits, because a grep for
+`ok`, `FAIL` and `SKIP` alone silently drops the `--` line:
+
+| Block | ok | FAIL | SKIP | -- |
+|---|---:|---:|---:|---:|
+| Session role | 1 | 0 | 0 | 0 |
+| Record gates | 27 | 0 | 0 | 0 |
+| Mutation suites | 45 | 1 | 0 | 0 |
+| Committed range vs `origin/main` | 3 | 0 | 0 | 0 |
+| Commit trailers vs `origin/main` | 2 | 0 | 0 | 0 |
+| TOTAL | 78 | 1 | 0 | 0 |
+
+79 result lines, matching a raw marker count of 79. Both range blocks EXECUTED
+rather than skipping, asserted with `git merge-base --is-ancestor origin/main
+HEAD`.
+
+**The one FAIL is `test_cpu_x86_llamacpp_floor`, and it is INHERITED rather than
+attributed.** It was proven on a pristine detached `origin/main` worktree on this
+same host: the baseline fails the SAME file with the same class of failure, at
+`NO_QUIET_WINDOW after 30s (busy=138% builders=0 load=49.29)`. The branch run
+failed the same file at load 105.78 with the same two cases. A neighbouring
+session was running a full `ctest -j 4`, which took this host's loadavg from 0.6
+to 127 during the gate. The harness is doing the right thing: it REFUSES to
+measure on a contended box and returns its contention code, and the unit test
+asserts a different code. A red that reproduces unchanged on `origin/main` is a
+property of the host, not of the diff.
+
+Two earlier reds in this pass WERE mine and were repaired rather than waived.
+`check-public-doc-tables` caught a `docs/BENCHMARKS.md` cell of 491 chars against
+a 220 limit, and later a `docs/STATUS.md` paragraph of 748 against a 700 ratchet;
+both were shortened, with the forensics moved to
+[`benchmark-record.md`](../benchmark-record.md) where that checker says they
+belong. `doc-checkpoint` caught a measurement commit that did not update
+`docs/STATUS.md` and then one that did not update `docs/BENCHMARKS.md`; both were
+folded into the commit that made the claim, because that gate is per-commit and a
+follow-up commit does not answer it.
+
+Disk was checked before any verdict was read, because ENOSPC here presents as a
+policy refusal rather than as a full disk: the local filesystem ran between 44
+and 12 GiB free at 90 to 98 percent used, and `dgx.casa` had 2.5 TB free. The
+local scratchpad is SHARED across sessions and holds other sessions' artefacts,
+so nothing in it was reclaimed.

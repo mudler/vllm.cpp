@@ -22311,14 +22311,45 @@ loaded, and the engine passed the point that killed every window 1 leg into
 07:56Z the host stopped completing an SSH banner exchange while still answering
 ICMP, and had not returned when this entry was written.
 
-**NOT asserted: the cause of that.** The open hypothesis is
-`gpu_memory_utilization=0.75` on a 119 GiB UNIFIED box, where that setting does
-not bound host RAM and a 27B load has been measured at 111.7 of 119 GB host. The
-load-bearing observation is that **no oracle leg in any of the three passes has
-ever reached KV-cache allocation here, so 0.75 has never actually been exercised
-on this box.** Confirming it needs the box back: the gap in
-`journalctl --list-boots` is the reboot evidence and `uptime` separates a reboot
-from a recovery. Nothing was signalled and nothing was killed.
+**The cause was then MEASURED.** The box returned at 08:38Z after about 42
+minutes and had NOT rebooted: `uptime` read `up 11:28` and `boot_id` was still
+`5bbdc432`, so this is the thrash case, not the documented OOM-reboot. It came
+back at `load average: 260.22` with 118 of 119 GiB used and 0 available, our
+container still up and still holding the mutex, 26147 MiB on the device, clocks
+still pinned. It was not progressing: `torch.compile` finished at 07:53:41 in
+122.46 s and the log did not advance for the 45 minutes after, stuck in the
+memory-profiling and KV-sizing step that follows. Its own timeout had fired,
+`ADJUDICATE_EXIT=124`, and `timeout` had signalled `docker run` while the
+CONTAINER outlived it.
+
+Killing our own container took the host from 118 of 119 GiB used to 4 of 119 in
+under ten seconds. **The engine was holding roughly 110 GiB of HOST RAM while
+`nvidia-smi` showed 26 GiB on the device.** `gpu_memory_utilization=0.75` on
+GB10's UNIFIED memory reserves most of the whole machine, not 75 percent of a
+separate device pool. No oracle leg in any pass had ever reached KV-cache
+allocation, which is why three passes never exposed it.
+
+**A trap defect, found by watching it fail.** `SIGTERM` to the driver reset the
+clocks and the driver then started its NEXT leg on a box with no memory left,
+because `trap cleanup EXIT INT TERM` runs `cleanup` and returns without exiting.
+The chain needed `SIGKILL` and the container needed stopping separately. Both DGX
+drivers share this shape.
+
+Only our own processes were signalled. Final state verified: no matching
+processes, no containers, `fuser $HOME/gpu.lock` with no holders so the mutex is
+FREE, no compute apps, clocks reset (`nvidia-smi -rgc` reporting `All done.`),
+115 GiB available, loadavg falling 260 to 42.
+
+**Padded control, PAID at every depth in that one window.** Margin fixed at 0.10
+absolute before the run. Real depth-1 acceptance 0.730964 (k=2), 0.682635 (k=3),
+0.750000 (k=4); depth-2 0.538922 (k=3), 0.617647 (k=4); depth-3 0.507353 (k=4).
+Control 0.000000 at every depth >= 1 while its depth-0 rate MATCHES the real arm
+(0.892 to 0.925 against 0.868 to 0.878), which is what a control isolating
+columns >= 1 must look like. All six margins clear by +0.5074 to +0.7500.
+`compare.py`: **`CHECKS_RUN=21 CHECKS_FAILED=11 VERDICT=FAIL`** — 10 pass (three
+per-depth counter checks, six control margins, one token-production check), 3
+fail on the unadjudicated ON/OFF divergence and 8 on `arm missing` from the
+oracle that never produced a file.
 
 **No parity number is claimed and the token gate is still unclaimed.**
 `our-ON == our-OFF` remains FALSE and unattributed. Owed detail lives under

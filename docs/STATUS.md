@@ -194,13 +194,14 @@ provenance and the accept path both await the owed DGX gate. The DEFAULT is
 unchanged at k=1 and **no speed number is claimed above it**.
 
 On real 27B NVFP4 weights the depth arms DO accept: re-measured 2026-08-17 with
-all seven arms in one uncontended window, k=2 gives depth-0 0.878 and depth-1
-0.731. **The token gate is still NOT claimed**: our spec-ON is not token-identical
-to our spec-OFF on 3 of 4 prompts, at the same positions for every k and for the
-padded control alike, and the vLLM leg that would attribute the split has never
-run on this host. Three passes have now failed to run it, most recently because
-the reimaged gate box carries no C compiler at all, so the pinned oracle's Triton
-JIT dies after the weights load.
+all seven arms in one uncontended window, k=2 gives depth-0 0.878, depth-1 0.731.
+**The token gate is still NOT claimed**: our spec-ON is not token-identical to
+our spec-OFF on 3 of 4 prompts, at the same positions for every k, and the vLLM
+leg that would attribute the split has never run here. Three passes failed to run
+it: the reimaged box has no C compiler, so the oracle's Triton JIT dies after the
+weights load, and the oracle's `gpu_memory_utilization=0.75` then reserves about
+110 GiB of HOST RAM on a 119 GiB unified box. Both are measured, both have named
+repairs.
 
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
 `--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on

@@ -148,11 +148,13 @@ device.
 
 ## Evidence
 
-Five `rc run` jobs on `thor:gpu0`, 2026-08-17. Each ran a script staged on the
-NAS rather than fed on stdin, because wall 1 of the first probe was that a
-`@triton.jit` function read from stdin has no source file. The sha256 values are
-taken over the staged files at `/mnt/nas_share/rc/oracle-probe/`, which is the
-same folder the worker reads as `/workspace/oracle-probe/`.
+Five `rc run` jobs on `thor:gpu0`, 2026-08-17. Every job after the first ran a
+script staged on the NAS rather than fed on stdin. That is a harness detail and
+not one of the four walls: `@triton.jit` calls `inspect.getsourcelines`, which
+raises `OSError: could not get source code` on a function read from stdin. The
+sha256 values are taken over the staged files at
+`/mnt/nas_share/rc/oracle-probe/`, which is the same folder the worker reads as
+`/workspace/oracle-probe/`.
 
 | Job | Script | sha256 prefix | Result |
 |---|---|---|---|

@@ -284,8 +284,13 @@ TEST_CASE("the ROCm platform self-registers and is selected over CPU") {
   // rocm.py:424-434 (AITER entries gated off on RDNA3). The dense walk resolves
   // to the first REGISTERED name — ROCM_ATTN — and constructs the named backend.
   const auto dense_prio = rocm.get_attn_backend_priority({});
+  // Verbatim mirror of rocm.py:407-441 _get_backend_priorities (dense branch)
+  // at pin 555967922 — the AITER entries are gated on is_mha_enabled() /
+  // is_aiter_found_and_supported() upstream (:434,:436) and are named-but-
+  // unregistered placeholders here, skipped by the walk.
   const std::vector<std::string> expected_dense{
-      "ROCM_ATTN", "TRITON_ATTN", "TURBOQUANT"};
+      "ROCM_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN",
+      "TRITON_ATTN", "TURBOQUANT"};
   CHECK(dense_prio == expected_dense);
   CHECK(vllm::v1::HasAttentionBackend(DeviceType::kROCM, "ROCM_ATTN"));
   CHECK(vllm::v1::SelectAttentionBackendName(rocm) == "ROCM_ATTN");

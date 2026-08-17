@@ -91,26 +91,30 @@ class RocmPlatform final : public Platform {
   // discrete board actually loads weights, with the measurement in the record.
   ResidencyPolicy residency_policy() const override { return {}; }
 
-  // Attention-backend priority — M3 (issue #41). Mirrors rocm.py:407-434
-  // _get_backend_priorities at pin 555967922. The non-MLA list is [ROCM_ATTN,
-  // (ROCM_AITER_FA if AITER MHA), (ROCM_AITER_UNIFIED_ATTN if AITER),
-  // TRITON_ATTN, TURBOQUANT]. AITER is gfx9-only in practice (rocm.py:661-665
-  // gates the FA path on on_gfx9()), so on the RDNA3 boards of issue #41 the
-  // AITER entries drop and the list is [ROCM_ATTN, TRITON_ATTN, TURBOQUANT].
-  // ROCM_ATTN is REGISTERED (backend.cpp, M3); TRITON_ATTN and TURBOQUANT are
-  // named but unregistered, and SelectAttentionBackendName skips unregistered
-  // names — so a dense request resolves to ROCM_ATTN today, exactly the walk
-  // contract the registry test covers. Same for MLA: rocm.py:414-419 returns
-  // [TRITON_MLA] when AITER MLA is off, and TRITON_MLA is unregistered for
-  // kROCM (registered for CUDA only), so a use_mla=true request correctly
-  // throws rather than silently falling back to a dense backend — the honest
-  // answer until a ROCm MLA kernel lands. use_sparse mirrors rocm.py:410
-  // ([ROCM_AITER_MLA_SPARSE], AITER-only) and is likewise unregistered.
+  // Attention-backend priority — M3 (issue #41). Mirrors rocm.py:407-441
+  // `_get_backend_priorities` at pin 555967922. The dense branch is
+  // [ROCM_ATTN, (ROCM_AITER_FA if `rocm_aiter_ops.is_mha_enabled()`, :434),
+  // (ROCM_AITER_UNIFIED_ATTN if `is_aiter_found_and_supported()`, :436),
+  // TRITON_ATTN, TURBOQUANT] — mirrored VERBATIM below. Upstream appends
+  // ROCM_ATTN only `if not use_kv_connector` (:432-433); our registration uses
+  // the shared symmetric NHD layout (see the KV-LAYOUT DEVIATION record in
+  // backend.h), which is immune to the asymmetric-view concern that guard
+  // protects, so the guard does not apply here — recorded, not implied.
+  // SelectAttentionBackendName skips unregistered names, so the AITER entries
+  // and TRITON_ATTN/TURBOQUANT are placeholders that cost nothing and need no
+  // gfx9 reasoning: a dense request resolves to the first REGISTERED name,
+  // ROCM_ATTN. MLA mirrors rocm.py:414-419 ([TRITON_MLA] when AITER MLA is
+  // off); TRITON_MLA is unregistered for kROCM (registered for CUDA only), so
+  // a use_mla=true request throws loudly rather than silently falling back to
+  // a dense backend — the honest answer until a ROCm MLA kernel lands.
+  // use_sparse mirrors rocm.py:410 ([ROCM_AITER_MLA_SPARSE], AITER-only) and
+  // is likewise unregistered.
   std::vector<std::string> get_attn_backend_priority(
       const AttnSelectorConfig& cfg) const override {
     if (cfg.use_sparse) return {"ROCM_AITER_MLA_SPARSE"};
     if (cfg.use_mla) return {"TRITON_MLA"};
-    return {"ROCM_ATTN", "TRITON_ATTN", "TURBOQUANT"};
+    return {"ROCM_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN",
+            "TRITON_ATTN", "TURBOQUANT"};
   }
 };
 

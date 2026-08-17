@@ -83,7 +83,7 @@ std::vector<int64_t> FlashAttentionBackend::get_kv_cache_shape(
 std::vector<int64_t> RocmAttentionBackend::get_kv_cache_shape(
     int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
     int64_t head_size, const std::string& /*cache_dtype_str*/) const {
-  // rocm_attn.py:188-194 enforces block_size % 16 == 0 (the native ROCm
+  // rocm_attn.py:249-251 enforces block_size % 16 == 0 (the native ROCm
   // paged-attn kernel supports LDS-bound block sizes 16/32). The SHAPE is the
   // shared NHD layout, not upstream's (2, num_blocks, ...) — see the class
   // comment in backend.h (KV-LAYOUT DEVIATION). Deliberately identical to

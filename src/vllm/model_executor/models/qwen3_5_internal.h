@@ -391,6 +391,12 @@ struct ExpertStreamStats {
   // means the budget is smaller than one step's working set, OR that the step
   // boundary is not being called at all.
   int64_t exhausted = 0;
+  // Slices refused because a GATE asked for the unstreamed arm through
+  // `ExpertStreamSetForceFallback`, which no production path calls. It is
+  // separate from `exhausted` because that number is an operator-facing budget
+  // diagnosis, and a test switch inflating it says "raise
+  // VT_MOE_EXPERT_STREAM_SLOTS" about a budget that was never the reason.
+  int64_t forced = 0;
   // madvise(MADV_WILLNEED) calls the kernel ACCEPTED. Zero while slices are
   // being filled from a mapping means the hint is being rejected, which is what
   // an unaligned address does silently.
@@ -410,5 +416,15 @@ void ExpertStreamSetForceFallback(bool on);
 // (qwen3_moe.cpp) composes the same block from another translation unit and
 // calls it from its layer driver for the same reason.
 void EndExpertStreamStep();
+
+// Print the streamed-expert statistics line NOW, once, whatever the run did.
+//
+// Production reaches this at process teardown: a static registered the first
+// time streaming is requested, plus the store's own destructor, whichever runs
+// first. It is exposed because the guarantee — exactly one line per process,
+// even on a run with zero steps and even with the periodic report silenced —
+// cannot be observed from inside a test any other way, and that guarantee is
+// what makes `steps == 0` readable at all. A second call prints nothing.
+void ExpertStreamFlushStats();
 
 }  // namespace vllm::detail

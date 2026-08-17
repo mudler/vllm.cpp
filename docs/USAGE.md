@@ -3122,23 +3122,43 @@ and therefore cannot stream. The engine says that once on stderr rather than
 silently doing no streaming.
 
 **Read the statistics line before you believe any number you measure with it.**
-Every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default 16, `0` silences it) the
-engine prints:
+The engine prints one every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default
+16, `0` silences the periodic line), and **one more when the process ends,
+always**:
 
 ```text
 [expert-stream] steps=64 hits=141230 misses=37312 evictions=29312 fills=37312 bytes=92876505088 exhausted=0 advised=37312
 ```
 
-Two of those fields decide whether the run is measuring anything at all:
+**The final line is the one to read**, because it is the only one you are
+guaranteed to get. The periodic line is skipped whenever the step count is not a
+multiple of the interval, so a healthy five-token run prints none of them at the
+default 16; and it used to be skipped on `steps == 0` as well, which meant the
+one run that most needed reporting — the one where the step boundary is never
+reached — printed nothing at all. Treating absence as failure therefore reported
+VOID on a working lane. Absence now means only that the process did not reach its
+static destructors: a crash, a signal, or `_exit`.
 
-- `steps` must advance. If it stays at 0 the decode step boundary is not being
-  reached and the cache will stop serving as soon as it fills.
+Two of the fields decide whether the run is measuring anything at all:
+
+- `steps` must advance. If the final line says `steps=0` the decode step
+  boundary is not being reached, and the cache stops serving as soon as it
+  fills — it will fall back to the memory mapping for the rest of the run.
 - `exhausted` must stay 0. Anything above 0 means slices were refused and read
   from the memory mapping instead, which is the slow path streaming exists to
   replace. The usual cause is a budget smaller than one step's working set:
   raise `VT_MOE_EXPERT_STREAM_SLOTS`.
 
-A run whose `steps` is 0 or whose `exhausted` is large is not a measurement of
+Read it together with the `[expert-stream] ON slots=...` banner, which is printed
+once when the lane builds its store. The three shapes are:
+
+| Banner | Final line | What happened |
+|---|---|---|
+| absent | absent | Nothing reached the streamed seam. A CUDA run (a device-resident expert is served unchanged), a checkpoint whose experts are not keep-quant towers, or a prompt that never reached an MoE layer |
+| present | present | The lane ran. Read `steps` and `exhausted` |
+| present | absent | The process did not reach its static destructors: a crash, a signal, or `_exit` |
+
+A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See
 [`docs/ENVIRONMENT.md`](ENVIRONMENT.md) for every knob and its parsing rules.
 

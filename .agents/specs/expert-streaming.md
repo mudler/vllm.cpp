@@ -1184,6 +1184,87 @@ funnels through exactly once per forward, as an RAII guard so a step that ends b
 throwing still ends. `qwen3_moe.cpp` composes the same MoE block from another
 translation unit and marks its own step for the same reason.
 
+## The observability review (#1091): the instrument could not report its own defect
+
+17 August 2026. A fresh review of the F1-F11 repair above returned FAIL on six
+findings. None of them was a red test. Every one was a gap in what the gate could
+see, which is the same class as the defect the repair had just fixed.
+
+**The statistics line could not print the number the docs told an operator to
+read.** `ReportStats` had exactly one caller, `EndStep`, and it returned early on
+`steps == 0`. So a run whose step boundary is never reached — F1, the reason the
+line exists — printed nothing at all. Measured on one binary with
+`VT_MOE_EXPERT_STREAM_STATS_EVERY=1`: healthy, 8 lines; F1 reinjected, 0 lines
+and only the startup banner. `docs/ENVIRONMENT.md` and `docs/USAGE.md` both told
+the operator to read `steps == 0` off a line that could not exist, and the
+**absence** was the signature.
+
+A second consequence found while acting on it: `stats_every_` defaults to 16, so
+a short healthy run prints nothing either. A benchmark that reads absence as
+failure therefore reports VOID on a working lane, which is what happened to the
+streaming benchmark and is why it had to be restarted.
+
+The repair is one final line, printed from the store's own destructor, once per
+process, crossing both early returns. Not a second teardown hook registered when
+streaming is REQUESTED, which was the first shape tried: on a CPU-only host that
+hook's only unique job — a run that asks for streaming and never builds a store —
+is not reachable by any test, because `Reserve` and `Get` are called from the same
+call chain. It would have been an untestable branch added to fix an
+untestable-branch problem. What replaces it is a protocol the docs now state:
+the `[expert-stream] ON ...` banner says a store was built, the final line says
+what it did, and the three combinations of present/absent each mean one thing.
+
+**`CHECK(s.advised > 0)` could not fail for the defect it named.** Reinjecting the
+pre-fix unaligned `madvise` address exits 0 in 40 of 40 runs. The measured reason
+is that `> 0` over 48 calls is satisfied whenever heap layout happens to
+page-align a single slice, and one did: `advised=1` against `fills=48`. The
+assertion is now `advised == fills`, which is the true healthy invariant on this
+arm — madvise is issued on the mapping-copy path only, and only when the key is
+not already resident, which is exactly the condition under which `EnsureSpan`
+goes on to fill, with `exhausted == 0` asserted beside it as the premise. Verified
+stable over 50 consecutive runs before being asserted, rather than after.
+
+**"Every MoE entry point funnels through here exactly once per forward" was
+false.** Four more forwards reach `ExpertMlpKq -> KqExpertSlice`:
+`Qwen3_5Model::ForwardDense`, `Qwen3_5MTPModel::Forward`,
+`Qwen3_5MTPModel::ForwardPaged` and `Qwen3_5ReplayLayer`. The MTP pair is the
+production spec-decode DRAFT path, so a draft's acquisitions stayed
+`protected_this_step` across the following target forward — F1 at draft scale.
+
+ONE FORWARD IS ONE STEP, and that is the call the draft forced. Folding a draft
+into the target's step would pin the draft's slots across a second forward for no
+benefit, so each draft gets its own step and a spec-decode iteration advances the
+clock once per draft plus once for the target. The opposite mistake is the one
+adding guards invites — a guard nested inside another ends the step twice, which
+decays every resident entry an extra tick for a step that never happened — so the
+guard now REFUSES to nest, stated as a precondition in the same idiom
+`MatmulF32Slice` uses for `expert >= 0` rather than handled. `RunMoeBlock` stays
+deliberately unguarded: it is one block, not a forward, and qwen3_moe.cpp owns
+the boundary for the model that composes it. That exemption is what makes the
+`steps == 0` case above constructible without breaking anything.
+
+**Three more, smaller.** `EnsureFile` — the arm every real GGUF-mmap checkpoint
+takes — was reached by no test, so the `file_offset + offset` composition was
+unverified; it is now driven from a temp file at a deliberately awkward offset
+(4109 bytes: past a page, not on a page, not on a 34-byte Q8_0 block), and the
+arm is PROVEN rather than assumed by `advised` staying flat while `fills` grows,
+which is the one number that separates a pread from an `EnsureSpan`.
+`OwnedTensor::TowerUid`'s comment promised an identity for "this tensor's CURRENT
+bytes" while the code keys on `bytes.data()`; the comment now states where the
+guarantee stops, and a borrowed-buffer case pins both halves, because #1066 was
+that same overclaim on that same field. `SetForceFallback` has no production
+caller and was incrementing the operator-facing `exhausted_`, so a gate asking for
+the unstreamed arm told an operator to raise a budget that was never the reason
+(measured: `exhausted=42` from the switch alone); it has its own counter now, kept
+off the stderr line because in a production process it is always zero.
+
+Thirteen mutations, thirteen caught, each recorded with a non-empty
+`git diff --stat`, a zero compile status and a non-zero doctest case count. The
+first attempt at two of them was INVALID rather than passing — one did not build
+(`-Werror` on an unused variable), and two reported the CHILD process's doctest
+summary because a failing case dumps the child's output into the parent's log,
+so the first `test cases:` match in the file belonged to the child.
+
 ## Owed
 
 Carried debt for this row. Each item names why it is not closed here.
@@ -1191,7 +1272,8 @@ Carried debt for this row. Each item names why it is not closed here.
 | Owed | Why it is open |
 |---|---|
 | **Re-measure decode on a LIVE cache.** The `docs/BENCHMARKS.md` decode figure for this row was taken with the step clock dead from token 3 onward and is void. | Needs `dgx.casa` and the 370 GiB checkpoint. The box was unreachable for this repair (`No route to host`), and this host has no CUDA device and cannot hold the model. |
-| **The `pread` path has never run on the model.** `EnsureFile` is gated by unit tests only. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
+| **The `pread` path has never run on the model.** `EnsureFile` now has a CPU-local gate that drives it through the production seam from a temp file and proves the `file_offset + offset` composition (#1091 finding 4), so it is no longer UNREACHED. It is still unmeasured on a real checkpoint. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
+| **A run that REQUESTS streaming and never builds a store prints no statistics line.** The `[expert-stream] ON ...` banner is absent in that case too, so no-banner means "nothing reached the lane" and banner-without-line means "the process died"; the docs state all three shapes. | A teardown hook that could report it is not reachable from any test on a CPU-only host, because `Reserve` and `Get` sit in one call chain and a device platform is what separates them. Landing it would have been an untestable branch added to fix an untestable-branch problem. Needs `dgx.casa` (see #1091). |
 | **The `MADV_WILLNEED` readahead is unmeasured.** It is now well formed and counted; whether it moves decode is unknown. | Same host and the same OOM contention. No speedup is claimed anywhere for it. |
 | **Windows has no streaming.** `EnsureFile` throws `"EnsureFile needs pread"` on `_WIN32`, and `SourceOfSpan` returns `fd = -1` there, so the lane falls back to the mapping copy. | No `pread(2)`; needs an `OVERLAPPED`/`ReadFile` arm. Refused by name rather than silently degraded. |
 | **The CUDA arms of [#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s grouped gate have not run on a device.** | Recorded in that issue, which stays open for it. Unchanged by this repair. |

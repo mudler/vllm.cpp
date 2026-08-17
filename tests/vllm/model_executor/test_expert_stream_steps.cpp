@@ -1,0 +1,344 @@
+// ENG-EXPERT-STREAM (#912, repairs #1091): the step clock, at every MoE entry
+// point, and the one statistics line that always prints.
+//
+// WHY A SECOND WIRING BINARY. `test_expert_stream_wiring` asks whether the paged
+// forward reaches the lane at all. It cannot ask these two questions, because
+// both need a process whose step clock starts at zero and stays there: the
+// singleton store and the once-read `VT_MOE_EXPERT_STREAM` are process-scoped,
+// so a case that must observe `steps == 0` has to run before anything ends a
+// step, and the reachability case ends three.
+//
+// WHAT IS UNDER TEST.
+//
+//   1. `ForwardLayers` is not the only MoE entry point, and its comment used to
+//      say it was. `Qwen3_5Model::ForwardDense`, both MTP forwards (the
+//      production spec-decode DRAFT path) and `Qwen3_5ReplayLayer` all reach
+//      `ExpertMlpKq -> KqExpertSlice` and none of them marked a step. A forward
+//      that takes slices and never ends its step leaves every entry it acquired
+//      `protected_this_step` forever, which is defect F1 with a smaller blast
+//      radius: on a draft+target pair the draft's slots stay pinned across the
+//      target's forward and shrink the evictable set for the whole run.
+//
+//      ONE FORWARD IS ONE STEP. That is the definition the cache is built
+//      against, and it is why the draft gets its own step rather than sharing
+//      the target's: the draft is a complete forward whose slices are finished
+//      with when it returns, and folding it into the target's step would pin
+//      them across a second forward for no benefit. Each case below asserts a
+//      DELTA of exactly one, so ordering between cases cannot flatter it, and
+//      an entry point that marked its step twice would fail just as loudly as
+//      one that never marked it.
+//
+//   2. The statistics line has to print even when the run did nothing. It used
+//      to be emitted only from `EndStep`, and only on a step that was a
+//      multiple of `VT_MOE_EXPERT_STREAM_STATS_EVERY` — so the one run that
+//      most needed it, the one where the step boundary is never reached, was
+//      exactly the run that printed nothing at all. Both docs told an operator
+//      to read `steps == 0` off a line that could not exist.
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <doctest/doctest.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "support/expert_stream_model.h"
+#include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/models/qwen3_5_moe_block.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
+#include "vllm/model_executor/models/qwen3_5_weights.h"
+
+using expert_stream_test::CachePool;
+using expert_stream_test::MakeConfig;
+using expert_stream_test::MakeKqMoe;
+using expert_stream_test::MakeOwned;
+using expert_stream_test::MakeWeights;
+using expert_stream_test::PrefillAttnMeta;
+using expert_stream_test::Q;
+using vllm::HfConfig;
+using vllm::Qwen3_5MoeWeights;
+using vllm::Qwen3_5Model;
+using vllm::Qwen3_5MTPKind;
+using vllm::Qwen3_5MTPModel;
+using vllm::Qwen3_5MTPWeights;
+using vt::DType;
+
+namespace {
+
+// Same knobs as the reachability binary, and for the same reasons. The one that
+// matters here is `STATS_EVERY=0`: it SILENCES the periodic line, so any
+// statistics line this process emits can only have come from the final flush.
+struct EnableExpertStreaming {
+  EnableExpertStreaming() {
+    ::setenv("VT_MOE_EXPERT_STREAM", "1", 1);
+    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "64", 1);
+    ::setenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192", 1);
+    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 1);
+    ::setenv("VT_QWEN35_GROUPED_MOE", "0", 1);
+  }
+};
+const EnableExpertStreaming kEnableExpertStreaming;
+
+// This process was spawned by the teardown case below and must do the one thing
+// that case measures — build a store and exit — and nothing else.
+bool IsFlushChild() { return ::getenv("VT_ES_FLUSH_CHILD") != nullptr; }
+
+int64_t Steps() { return vllm::detail::ExpertStreamSnapshot().steps; }
+
+// A full-attention MoE layer, which is the only layer type an MTP head has
+// (qwen3_5.cpp: "The MTP layer is always layer_type=full_attention").
+vllm::Qwen3_5MoeLayerWeights MakeFullAttnMoeLayer(const HfConfig& c, uint64_t s) {
+  const int64_t H = c.hidden_size, Hq = c.num_attention_heads,
+                Hkv = c.num_key_value_heads, Dh = c.head_dim;
+  vllm::Qwen3_5MoeLayerWeights lw;
+  lw.is_linear_attention = false;
+  lw.input_layernorm = MakeOwned(DType::kBF16, {H}, s + 1);
+  lw.post_attention_layernorm = MakeOwned(DType::kBF16, {H}, s + 2);
+  lw.attn.q_proj = MakeOwned(DType::kBF16, {H, 2 * Hq * Dh}, s + 10);
+  lw.attn.k_proj = MakeOwned(DType::kBF16, {H, Hkv * Dh}, s + 20);
+  lw.attn.v_proj = MakeOwned(DType::kBF16, {H, Hkv * Dh}, s + 30);
+  lw.attn.o_proj = MakeOwned(DType::kBF16, {Hq * Dh, H}, s + 40);
+  lw.attn.q_norm = MakeOwned(DType::kBF16, {Dh}, s + 50);
+  lw.attn.k_norm = MakeOwned(DType::kBF16, {Dh}, s + 60);
+  lw.moe = MakeKqMoe(c, s + 500);
+  return lw;
+}
+
+Qwen3_5MTPWeights MakeMtpWeights(const HfConfig& c, uint64_t s) {
+  const int64_t H = c.hidden_size;
+  Qwen3_5MTPWeights w;
+  w.kind = Qwen3_5MTPKind::kMoe;
+  w.fc = MakeOwned(DType::kBF16, {H, 2 * H}, s + 1);
+  w.fc.nk = true;  // raw torch Linear [H,2H], as the forward's precondition says
+  w.pre_fc_norm_embedding = MakeOwned(DType::kBF16, {H}, s + 2);
+  w.pre_fc_norm_hidden = MakeOwned(DType::kBF16, {H}, s + 3);
+  w.final_norm = MakeOwned(DType::kBF16, {H}, s + 4);
+  w.moe_layers.push_back(MakeFullAttnMoeLayer(c, s + 1000));
+  return w;
+}
+
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+// This case runs FIRST on purpose: it is the only place in this binary where
+// `steps` is still 0, which is the state the whole finding is about.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("the final statistics line prints on a run whose step clock never advanced") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+
+  // `RunMoeBlock` is the seam qwen3_moe.cpp composes the same MoE block
+  // through, and it deliberately carries NO step guard: that model's own layer
+  // driver owns the boundary (qwen3_moe.cpp:150). Driving it directly therefore
+  // reproduces the exact production shape this line exists to report — expert
+  // slices taken, no step ended — without having to break anything.
+  const int64_t T = 2, H = c.hidden_size;
+  std::vector<uint16_t> hidden(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < hidden.size(); ++i)
+    hidden[i] = vt::F32ToBF16(expert_stream_test::RandV(7 + i));
+  const vt::Tensor dh = vt::Tensor::Contiguous(
+      hidden.data(), DType::kBF16, vt::Device{vt::DeviceType::kCPU, 0}, {T, H});
+  const vllm::MoeBlockOutput out =
+      vllm::RunMoeBlock(q, w.layers[0].moe, c, dh, T);
+  REQUIRE(out.storage != nullptr);
+
+  const vllm::detail::ExpertStreamStats s = vllm::detail::ExpertStreamSnapshot();
+  REQUIRE(s.active);      // a store was built, so there ARE numbers to print
+  REQUIRE(s.fills > 0);   // and slices really were taken
+  REQUIRE(s.steps == 0);  // and no step ended: the F1 signature, reproduced
+
+  // The child's job ends here. Its remaining line has to come from teardown, so
+  // it must not call the flush itself.
+  if (IsFlushChild()) return;
+
+  // Capture stderr across the flush. Everything this process printed before now
+  // (the one-off `[expert-stream] ON ...` banner) is outside the redirect, so a
+  // statistics line inside it can only be the one under test.
+  std::FILE* cap = std::tmpfile();
+  REQUIRE(cap != nullptr);
+  std::fflush(stderr);
+  const int saved = ::dup(STDERR_FILENO);
+  REQUIRE(saved >= 0);
+  REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+  vllm::detail::ExpertStreamFlushStats();
+
+  std::fflush(stderr);
+  REQUIRE(::dup2(saved, STDERR_FILENO) >= 0);
+  ::close(saved);
+
+  std::rewind(cap);
+  std::string captured;
+  char buf[512];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+  std::fclose(cap);
+
+  // EXACTLY ONE line, and it carries the zero. `stats_every_` is 0 here, which
+  // silences the periodic report entirely, and `steps` is 0, which the periodic
+  // report skips as well — so both of the early returns that made this line
+  // unreachable are being crossed at once.
+  size_t lines = 0;
+  for (size_t at = captured.find("[expert-stream] steps=");
+       at != std::string::npos;
+       at = captured.find("[expert-stream] steps=", at + 1))
+    ++lines;
+  INFO("captured stderr: ", captured);
+  CHECK(lines == 1);
+  CHECK(captured.find("[expert-stream] steps=0 ") != std::string::npos);
+  CHECK(captured.find(" fills=") != std::string::npos);
+}
+
+TEST_CASE("Qwen3_5Model::ForwardDense marks exactly one step") {
+  if (IsFlushChild()) return;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const std::vector<int32_t> ids = {5, 9, 2};
+  const std::vector<int32_t> pos = {0, 1, 2};
+
+  const int64_t before = Steps();
+  const std::vector<float> logits =
+      Qwen3_5Model::ForwardDense(ids, pos, w, c, q);
+  REQUIRE(logits.size() ==
+          static_cast<size_t>(ids.size()) * static_cast<size_t>(c.vocab_size));
+  CHECK(Steps() - before == 1);
+}
+
+TEST_CASE("Qwen3_5MTPModel::Forward marks exactly one step") {
+  if (IsFlushChild()) return;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights target = MakeWeights(c);
+  const Qwen3_5MTPWeights mtp = MakeMtpWeights(c, 4242);
+  const Qwen3_5MTPModel model(mtp, target, c);
+  vt::Queue q = Q();
+
+  const int64_t T = 3, H = c.hidden_size;
+  std::vector<uint16_t> th(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < th.size(); ++i)
+    th[i] = vt::F32ToBF16(expert_stream_test::RandV(31 + i));
+  const vt::Tensor target_hidden = vt::Tensor::Contiguous(
+      th.data(), DType::kBF16, vt::Device{vt::DeviceType::kCPU, 0}, {T, H});
+  const std::vector<int32_t> ids = {1, 2, 3};
+  const std::vector<int32_t> pos = {0, 1, 2};
+
+  const int64_t before = Steps();
+  const vllm::Qwen3_5MTPHiddenStates h =
+      model.Forward(ids, pos, target_hidden, q);
+  REQUIRE(h.storage != nullptr);
+  CHECK(Steps() - before == 1);
+}
+
+TEST_CASE("Qwen3_5MTPModel::ForwardPaged marks exactly one step") {
+  if (IsFlushChild()) return;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights target = MakeWeights(c);
+  const Qwen3_5MTPWeights mtp = MakeMtpWeights(c, 909);
+  const Qwen3_5MTPModel model(mtp, target, c);
+  vt::Queue q = Q();
+
+  const int64_t T = 3, H = c.hidden_size;
+  std::vector<uint16_t> th(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < th.size(); ++i)
+    th[i] = vt::F32ToBF16(expert_stream_test::RandV(57 + i));
+  const vt::Tensor target_hidden = vt::Tensor::Contiguous(
+      th.data(), DType::kBF16, vt::Device{vt::DeviceType::kCPU, 0}, {T, H});
+  const std::vector<int32_t> ids = {4, 5, 6};
+  const std::vector<int32_t> pos = {0, 1, 2};
+
+  // The draft KV cache: one full-attention layer's worth, which is all an MTP
+  // head has.
+  CachePool pool(c, /*num_blocks=*/4, /*block_size=*/8);
+  REQUIRE(!pool.attn_kv.empty());
+  const std::vector<int32_t> blocks = {0};
+
+  const int64_t before = Steps();
+  const vllm::Qwen3_5MTPHiddenStates h =
+      model.ForwardPaged(ids, pos, target_hidden,
+                         PrefillAttnMeta(T, blocks, 8, 0), pool.attn_kv[0], q);
+  REQUIRE(h.storage != nullptr);
+  CHECK(Steps() - before == 1);
+}
+
+#if defined(__linux__)
+TEST_CASE("the final statistics line is wired to process TEARDOWN") {
+  // The case above proves the flush prints what it should when something calls
+  // it. This one proves something calls it, which is the part an in-process
+  // assertion cannot reach: the flush runs from a static destructor, after
+  // doctest's main has returned.
+  //
+  // So it runs THIS BINARY again as a child with `VT_ES_FLUSH_CHILD` set. In
+  // that mode every case returns early except the first, which builds a store,
+  // takes slices, ends no step and — crucially — does NOT call the flush. Any
+  // statistics line in the child's output therefore came from teardown, and
+  // `VT_MOE_EXPERT_STREAM_STATS_EVERY=0` rules out the periodic report.
+  //
+  // /proc/self/exe rather than argv[0], because doctest's main owns argv and a
+  // relative argv[0] would depend on the working directory ctest chose. It is
+  // RESOLVED here rather than handed to the shell: `popen` runs `/bin/sh`, so a
+  // literal /proc/self/exe in the command line names the SHELL and the child
+  // would print nothing at all — which looks exactly like the defect.
+  if (IsFlushChild()) return;
+
+  char exe[4096];
+  const ssize_t len = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  REQUIRE(len > 0);
+  exe[len] = '\0';
+  const std::string cmd =
+      std::string("VT_ES_FLUSH_CHILD=1 '") + exe + "' 2>&1";
+
+  std::FILE* child = ::popen(cmd.c_str(), "r");
+  REQUIRE(child != nullptr);
+  std::string out;
+  char buf[512];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), child)) > 0) out.append(buf, n);
+  const int status = ::pclose(child);
+
+  INFO("child output: ", out);
+  CHECK(status == 0);
+
+  // The child really ran, and really built a store. Without this a filter or a
+  // crash that produced no output at all would read as "one line, absent",
+  // which is the same shape as the defect.
+  CHECK(out.find("[expert-stream] ON slots=") != std::string::npos);
+  CHECK(out.find("0 failed") != std::string::npos);
+
+  size_t lines = 0;
+  for (size_t at = out.find("[expert-stream] steps=");
+       at != std::string::npos;
+       at = out.find("[expert-stream] steps=", at + 1))
+    ++lines;
+  CHECK(lines == 1);
+  CHECK(out.find("[expert-stream] steps=0 ") != std::string::npos);
+
+  // And it carries the STORE's numbers. The child filled slots, so a line
+  // reporting `fills=0` would mean something other than the store printed it —
+  // exactly what a well-meaning second teardown hook would produce, and it would
+  // otherwise satisfy every assertion above.
+  CHECK(out.find(" fills=0 ") == std::string::npos);
+}
+#endif  // __linux__
+
+TEST_CASE("Qwen3_5ReplayLayer marks exactly one step") {
+  if (IsFlushChild()) return;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+
+  const int64_t T = 2, H = c.hidden_size;
+  std::vector<float> hidden_in(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < hidden_in.size(); ++i)
+    hidden_in[i] = expert_stream_test::RandV(99 + i);
+  const std::vector<int32_t> pos = {0, 1};
+
+  const int64_t before = Steps();
+  const std::vector<float> out =
+      vllm::Qwen3_5ReplayLayer(w.layers[3], c, hidden_in, pos, T, q);
+  REQUIRE(out.size() == hidden_in.size());
+  CHECK(Steps() - before == 1);
+}

@@ -1179,7 +1179,7 @@ comparison is untouched.
 | 9 | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md` | prefill 27.77, decode 3.91, E2E 3.77 tok/s, peak RSS 3.747 GiB, giving `0.461x`, `0.653x`, `0.758x` | **yes**, for a different reason | **not fork-contaminated.** This file measured stock tag `b9892` at `ee445f93d` and recorded the substitution. It is a stock number against a revision that is neither the old pin nor the new one, and its record wrongly presents that tag as the project pin |
 | 10 | `docs/BENCHMARKS.md:29` Muse Glimmer 30B, `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md:24-32`, `docs/STATUS.md:502`, `.agents/benchmark-record.md:19231` and `:19016` | in128 prefill 13.158, decode 5.026, in512 prefill 13.292, decode 5.091 tok/s, and the earlier 12.94 / 5.08 / 9.97 / 6.41 / 13.13 / 5.00 set with peak RSS 15.74 GiB, giving the `1.023x` prefill win, `0.194x`, `0.175x`, `0.997x` and `1.92x MORE` RSS | **yes**, for the same reason as row 9 | **not fork-contaminated.** Both runs measured stock master `704485942` (`b10362-5`, 2026-08-11), recorded in that file's own recipe block at `benchmark-record.md:18996`. It is a stock number against a third revision that is neither pin. Its `1.023x` is the fifth favourable verdict on the public page and was absent from every earlier draft of this table |
 | 11 | `.agents/kernel-matrix.md:162` `KERNEL-GEMM-CPU-TILED`, `.agents/benchmark-record.md:13765-13781` | ggml no-llamafile 212.0, 214.4, 215.4, 208.1, 209.9, 159.2 GFLOP/s against our 222.1, 220.6, 216.8, 215.4, 241.7, 141.3 on six Arm shapes, giving "at parity with ggml's stock kernel and slightly ahead on four of six shapes", plus the stock-ggml column that sizes llamafile at ~1.9x f16 and ~1.2x f32 | **yes** | built from the same fork tree with `GGML_LLAMAFILE=OFF`. None of the 65 fork commits touch `llamafile/sgemm.cpp`, so the compared kernel matches `b9827`, but the tree is the same unidentified one as row 7. This verdict is load-bearing beyond its own row: it is the evidence that the Arm 16-bit deficit is an absent capability rather than a defect in `KERNEL-GEMM-CPU-ELEM` |
-| 12 | `.agents/specs/gguf-keep-quant-loader.md` L7 (`:128`, `:537`ff), restated in `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:173-228` and pinned beside a `CHECK` at `tests/vllm/test_gguf_keep_quant.cpp:478-494` | llama.cpp pp128 173.2, tg32 25.09 tok/s, peak RSS 2.798 GiB, giving "RSS gap CLOSED to `1.01x`", "prefill 204 t/s = `1.18x` AHEAD", "decode ~parity" | **yes** for the three ratios, **no** for the keep-f16 default | **the only site where a contaminated denominator reaches shipped behaviour, and the default is NOT safe from it.** `VT_GGUF_KEEP_F16` is DEFAULT ON. Its binding A/B has three axes and **two regress**: prefill about 10% worse (224 to 204 t/s) and decode about 1.4% worse, bought for 1.05 GiB of RSS. The recorded reason the prefill loss is acceptable is `gguf-keep-quant-loader.md:595`, "comfortably above the competitor floor", which IS the contaminated `pp128 173.2`. An earlier pass called the default safe by citing only the RSS leg. See §"The keep-f16 default rests on the contaminated floor". The product comment also quotes a `1.16x AHEAD of pp128 176.6` that no recorded run produces, see §"176.6 is not a number this tree measured". Its `173.2 / 25.09` legs are a distinct session from rows 2, 3 and 5, so this is a genuinely separate contaminated measurement rather than a restatement |
+| 12 | `.agents/specs/gguf-keep-quant-loader.md` L7 (`:128`, `:537`ff), restated in `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:173-228` and pinned beside a `CHECK` at `tests/vllm/test_gguf_keep_quant.cpp:478-494` | llama.cpp pp128 173.2, tg32 25.09 tok/s, peak RSS 2.798 GiB, giving "RSS gap CLOSED to `1.01x`", "prefill 204 t/s = `1.18x` AHEAD", "decode ~parity" | **yes** for the three ratios, **no** for the keep-f16 default (settled 2026-08-17) | **the only site where a contaminated denominator reached shipped behaviour, and the default was NOT safe from it until the decision landed.** `VT_GGUF_KEEP_F16` is DEFAULT ON. Its binding A/B has three axes and **two regress**: prefill about 9% worse (224 to 204 t/s) and decode about 1.4% worse, bought for 1.05 GiB of RSS. The recorded reason the prefill loss was acceptable USED to be `gguf-keep-quant-loader.md:595`, "comfortably above the competitor floor", which IS the contaminated `pp128 173.2`. An earlier pass called the default safe by citing only the RSS leg. **On 2026-08-17 the developer kept the default ON as a product call, and the keep-quant record replaced that clause with a tie-break over our own arms, so the default no longer depends on this re-take.** See §"The keep-f16 default rests on the contaminated floor". The product comment also quotes a `1.16x AHEAD of pp128 176.6` that no recorded run produces, see §"176.6 is not a number this tree measured". Its `173.2 / 25.09` legs are a distinct session from rows 2, 3 and 5, so this is a genuinely separate contaminated measurement rather than a restatement |
 
 | 13 | `.agents/specs/laguna-s21-w7-speed-2026-07-31.md:15-16` (the `27.8 tok/s` itself), `:91` (the roofline reference row), `:123` (the §4 verdict), `:170-171` and `:196-198` (the W8 and W9 gap restatements), `:263` (the GEMV ceiling), with `.agents/benchmark-record.md:884`, `:898`, `:11753`, `:11759`, `:11761` | Laguna-S-2.1 on the identical UD-Q4_K_XL GGUF: decode **27.8 tok/s** (36.0 ms/tok, 183 GB/s = 76% of the GB10 240 GB/s peak), giving the campaign's `15x` warm and `18x` cold gap, then `18x → 4.7x` at W8 and `18x → 3.6x` at W9 | **yes** | **a FIFTH revision, and the worst-identified of the five.** The denominator is a **Poolside fork** of llama.cpp, branch `laguna` (`.agents/specs/laguna-s21-w4-2026-07-31.md:65` names `github.com/poolsideai/llama.cpp@laguna`). A branch is not a revision. `git grep -i poolside` returns no SHA for it anywhere in this tree, so by this row's own definition the tree cannot be identified and the number is unreproducible. It is not fork-`237ad9b96`-contaminated and it is not stock. No verdict here is favourable to us, so it does not join the seven, but it is the **target** the whole Laguna speed campaign is ranked against |
 
@@ -1242,6 +1242,19 @@ that the question is recorded as open in all four places that previously recorde
 it as closed: this spec, `docs/BENCHMARKS.md`, the product comment, and #1003's
 index row, which said "the default itself stands" and now says the default is
 owed a decision.
+
+**RESOLVED 2026-08-17, and by the route this section asked for.** The developer
+took the decision on `QUANT-GGUF-KEEPQ-LOADER`, and it is exactly two things:
+`VT_GGUF_KEEP_F16` stays DEFAULT ON, and the default gets documented. They gave
+no rationale, so nothing beyond those two things is theirs. Keeping the default
+keeps its trade, which is 1.05 GiB of peak RSS against about 9% of prefill and
+about 1.4% of decode over our own arms. **The argument for why that trade falls
+the right way belongs to the keep-quant record, not to the developer**, and it
+is in [`gguf-keep-quant-loader.md`](gguf-keep-quant-loader.md) §"Decision
+(2026-08-17)", which REPLACES the `:595` clause quoted earlier. So the paragraph
+before this one no longer describes a live exposure: a re-taken stock `pp128`
+above 204 t/s is now a correction to three published ratios and to two source
+comments, and not a reopened default. Nothing else in row 12 is discharged.
 
 **The general lesson, because it is not about keep-f16.** A default justified by
 a multi-axis trade is only as sound as the tie-break on its **worst** axis.
@@ -1474,11 +1487,15 @@ moves, not by the size of the margin:
    `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp` as the
    justification for `VT_GGUF_KEEP_F16` shipping DEFAULT ON, so this is the one
    verdict on the list that a user's bytes depend on rather than a page.
-   **The default is not safe from it**, which corrects an earlier draft of this
-   line. Its A/B trades about 10% of prefill and about 1.4% of decode for 1.05
-   GiB, and the recorded reason that prefill loss is acceptable is stated in the
-   contaminated floor's own terms. A re-taken stock `pp128` above 204 t/s removes
-   it. See §"The keep-f16 default rests on the contaminated floor".
+   Its A/B trades about 9% of prefill and about 1.4% of decode for 1.05 GiB.
+   The default WAS exposed, because the recorded reason that prefill loss is
+   acceptable was stated in the contaminated floor's own terms.
+   **That exposure is CLOSED as of 2026-08-17**: the default is now a product
+   call, and the record states its tie-break over our own same-binary arms, so
+   this re-take corrects three published ratios and two source comments and
+   cannot reopen the default. See
+   §"The keep-f16 default rests on the contaminated floor" and its RESOLVED
+   paragraph.
 5. **`KERNEL-GEMM-CPU-TILED` "at parity with ggml's stock kernel, slightly ahead
    on four of six shapes"** (row 11), in `.agents/kernel-matrix.md:162`. The one
    entry not on the public page. The bands overlap (ours 216-242, ggml 208-215
@@ -1850,12 +1867,21 @@ burned by twice.
   recorded as a sixth entry in §"Five llama.cpp revisions are in play", and only
   then running the arm. Until one is chosen, `27.8 tok/s` has no pin and the
   Laguna campaign's `15x` to `18x` target is unreproducible.
-- **The keep-f16 default is owed a decision, not only a re-wording, and #1003's
-  index row now says so.** See §"The keep-f16 default rests on the contaminated
-  floor". Its prefill tie-break is stated in llama.cpp's own terms, so a re-taken
-  stock `pp128` above 204 t/s removes the default's only recorded justification.
-  The default is NOT changed here. That is `QUANT-GGUF-KEEPQ-LOADER`'s decision
-  and it needs the re-take first.
+- **The keep-f16 default was owed a decision, not only a re-wording. It is
+  TAKEN, 2026-08-17, and it did not need the re-take after all.** The developer
+  keeps `VT_GGUF_KEEP_F16` DEFAULT ON and asked for the default documented. That
+  is the decision, and no rationale came with it. The keep-quant record then
+  states the tie-break over our own same-binary arms, which is the record's
+  reasoning: 1.05 GiB of peak RSS (3.885 to 2.832 GiB) against about 9% of
+  prefill (224 to 204 t/s) and about 1.4% of decode (TPOT 40.4 to 40.95 ms),
+  with tokens byte-identical on all three arms. Recorded in
+  [`gguf-keep-quant-loader.md`](gguf-keep-quant-loader.md)
+  §"Decision (2026-08-17)", which replaces the "comfortably above the competitor
+  floor" clause rather than sitting beside it. **A re-taken stock `pp128` can no
+  longer reopen this default**, which is exactly what §"The keep-f16 default
+  rests on the contaminated floor" warned it could. What row 12 still owes is
+  unchanged and ordinary: the three published RATIOS, and the wording of the two
+  source comments named in the first bullet.
 - [#857](https://github.com/mudler/vllm.cpp/issues/857): build and run stock
   `b10451` on dgx.casa and record the measured identity, recipe, and evidence
   that lets `gateable` become `yes`. Until then this oracle is visible debt.

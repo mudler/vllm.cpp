@@ -19,6 +19,109 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## MODEL-NEMOTRON-H-ABI-A3-E2E — the A3 token gate did NOT run, and the cause on record was NOT the cause (2026-08-17, `row/MODEL-NEMOTRON-H-ABI-A3-E2E`, base `origin/main` `a6df72777`, #810)
+
+**No number is recorded, on any axis. This entry exists so the pending cause is
+the measured one rather than the inherited one.**
+
+`.agents/specs/nemotron-h-a2p-paged-forward.md` §10 recorded the A3 gate as
+pending on **contention**: `dgx.casa` observed at loadavg 211 with 3 of 119 GB
+available, which is a real reason a 20.1 GiB checkpoint cannot load. Re-measured
+on 2026-08-17 under an `rc` lease, that box answers at **loadavg 0.36, 115 of
+119 GB available, GPU utilisation 0%**, with nothing of ours running on it. The
+recorded cause is no longer true, and this is the #775 shape the governing spec
+§5.5 warns about: a pending reason that outlives its own truth and gets
+subtracted by everyone who reads it afterwards.
+
+**★ THIS ENTRY WAS FIRST WRITTEN WITH A FALSE BLOCKER AND IS CORRECTED IN PLACE.**
+It claimed "no CUDA binary can be built for that host" over three closed paths.
+**Two of those three were wrong**, and the error has one root: *the dgx HOST and
+the `rc` worker CONTAINER are different machines, and host findings were reported
+as container findings.* The correction is kept beside the claim rather than
+substituted for it, because the failure mode is the interesting part.
+
+1. **The host toolchain — this part was RIGHT and stands.** Measured on
+   `ssh dgx.casa`: `nvcc ABSENT   cmake ABSENT   g++ ABSENT   ninja ABSENT`.
+   Already filed as [#1019](https://github.com/mudler/vllm.cpp/issues/1019),
+   whose title says the dgx profile "mandates a CUDA toolkit and a CUTLASS path
+   that do not exist". **But the host is not where work runs**, so this never
+   blocked the gate the way this entry first said.
+2. **The `rc` worker container — the original claim here was FALSE.** It said
+   `gcc`, `g++`, `cc`, `cmake`, `ninja`, `make`, `python3`, `git` were all
+   absent, that `/usr/include/stdio.h` did not exist, and that DNS failed.
+   Measured inside `rc run`, the container is Ubuntu 24.04, runs as **uid 0**,
+   and carries `gcc`, `g++`, `cmake`, `ninja`, `make`, `python3`, `pip3`, `git`
+   and `apt`; `nvidia-smi` reports the GB10; DNS resolves and
+   `developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/arm64/` answers
+   `HTTP/2 200`. **Only `nvcc` is genuinely absent**, and apt's own
+   `nvidia-cuda-toolkit` is 12.0.140, too old for sm_121a (GB10 needs 12.8+/13.x)
+   — so the toolkit is installed from the NVIDIA repo, which is a step, not a
+   wall.
+3. **`docker` and `sudo` are NOT NEEDED AT ALL, and asking for them was the
+   error compounding.** You are root in the container; the recorded
+   `sudo -n docker run …` recipe in `$HOME/a2r/gb10_build.sh` belongs to the
+   pre-`rc` era.
+
+**The lesson, stated plainly for the next reader:** a probe that runs somewhere
+other than where the work will run answers a question nobody asked. Re-derive
+inside `rc run`, and do not let a host `ssh` result stand in for it.
+
+**What WAS verified on the gate host**, all of it cheap and under short leases:
+
+- **The checkpoint is present under BOTH paths, and `.env` is CORRECT.** An
+  earlier revision of this entry claimed the opposite — that only
+  `/home/mudler/ckpt/...` held it and that "there are no cifs/nfs mounts at
+  all". `findmnt` on the host says otherwise:
+
+  ```
+  /usr/local/nas_share //192.168.68.102/Data cifs rw,relatime,vers=3.1.1,
+    cache=strict,username=anonymous,uid=0,forceuid,gid=10001,forcegid,
+    addr=192.168.68.102,file_mode=0664,dir_mode=0775,iocharset=utf8,soft,nounix
+  ```
+
+  and the checkpoint resolves at
+  `/usr/local/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4`,
+  `/usr/local/nas_share/checkpoints/nemotron-3.5-lightning-30b-gguf` and
+  `/home/mudler/ckpt/nemotron-3.5-lightning-30b-nvfp4`. So
+  `CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints` in `.env` is right and must
+  not be "fixed".
+- **Whether the container can SEE that path is still OPEN.** No probe has
+  answered it: the one queued to do so was killed to free the queue. Nothing is
+  claimed here either way, and step 6 of the A3 job is what will answer it.
+- **21 583 809 748 bytes**, 52 safetensors shards.
+- The revision is **verified, not copied**:
+  `model-00001-of-00052.safetensors` hashes to
+  `672c8bda10fdec0256e0819e112d2aa3a936cc3e5d311a05fd3ff773ca9a44b9`, which is
+  what that file's own HF sidecar records for commit
+  `29f2d1746d8f41e316523194b19018707749b1b1`, the golden's revision.
+
+**The driver was built and its instrument proven armed, off the gate host.**
+`examples/nemotron_h_gen` compiles and links against the real `vllm::shared` in
+a CPU build (`BUILD_RC=0`, 0 compile errors). Its guards were then exercised
+against a **real engine** on `opt-125m-bf16-st` rather than argued for, because
+the driver is model-agnostic and the assertions are what a NemotronH run will
+depend on:
+
+| arm | result |
+|---|---|
+| golden width 8, all 8 match | `STRICT PASS`, exit **0** |
+| golden width 8, 0 of 8 match | `DIVERGENCE`, exit **1** |
+| `--steps 4` against golden width 8, **4/4 matched** | `SHORT`, exit **4** |
+| 5 malformed goldens (empty array, empty prompt, empty tokens, no array, truncated) | parse refusal, exit **2** each |
+
+The third row is the one worth keeping: it matched **every token it looked at**
+and still refused, because it had looked at half the golden. A driver without
+that check would have reported `4/4` as a pass.
+
+The committed golden's geometry, read by the driver itself (`--golden-info`):
+**3 entries, prompt widths 5 / 8 / 13, golden width 32 each**, so a full A3 run
+compares **96 tokens**. Any "compared" number below 96 is a short run and exits 4.
+
+**Also blocked, and by design rather than by a host:** the governing spec §5.2
+arm 2 (the three prompts submitted concurrently and interleaved). G-SAFE refuses
+`input.num_reqs > 1` and A2-B owns that clause, so only arm 1 (multi-step,
+single request) is reachable even once a build host exists.
+
 ## KIMI-BF16-STREAM — bf16 residual stream end-to-end REFUTED (122→4/128, KDA repeat-loop destabilization, no speed win); STRICT is NOT reachable by residual-precision (§14-§20 all closed); 122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best; SERVER runner fold scoped (runner aborts on Kimi's KV today) (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, base `origin/main` `2f029a10`, GB10 sm_121a, PR #118)
 
 The #113 follow-on tested the §19-named residual #1 — the bf16 residual stream END-TO-END, framed as

@@ -1104,13 +1104,65 @@ lifecycle write.
 
 ## 9. Now
 
-**State at this commit:** spec only. No product code, no lifecycle change. Per
-§1.4 the implementation is a **separate** pull request by a **different** agent;
-this one carries the spec.
+**State at 2026-08-17.** A1 (`c1d02bfbe`), A2-R (`598226e96`), A2-Q2a
+(`6abc769c6`) and A2-P (`a6df72777`) have all landed. G-SAFE is narrowed to
+`input.num_reqs <= 1` and `ForwardNemotronHForCausalLM` selects
+`NemotronHPagedForward` whenever the runner supplies paged KV and recurrent
+state, which was verified in the tree rather than inherited from this sentence.
 
-A1 is claimable now against `main` + `bc570da0d`, with PR #868 as its base
-(§7 R2). A2 is blocked on #496 W2, and that block must be re-verified rather than
-inherited from this sentence.
+**§6.1's driver EXISTS: `examples/nemotron_h_gen`.** One project include
+(`vllm.h`), linked `vllm::shared`, no `example-abi-allowlist.txt` row, modelled
+on `kimi_linear_gen` and not on the two allowlisted examples §6.1 warns about.
+It builds and links against the real shared library, and its counting guards are
+proven armed against a **real engine** on a small local checkpoint rather than
+argued for: a full-width match exits 0, a divergence exits 1, a row that matched
+every token it looked at while looking at HALF the golden's width exits 4, and
+five malformed-golden shapes each exit 2. That last one is the guard this
+section's own §5.2 is really about — a comparison over too few elements reports
+a perfect score, and here it cannot.
+
+**§5.2's A3 token gate has NOT RUN. Its recorded cause was wrong twice, and both
+corrections are kept here because the second one is a trap this section can save
+the next reader from.**
+
+*First cause, dead:* contention. Re-measured, `dgx.casa` is idle (loadavg 0.36,
+115 of 119 GB available, GPU 0%), the checkpoint is present, and its first shard
+hashes to revision `29f2d174`'s own LFS record.
+
+*Second cause, also dead:* "nothing can build a gate binary". **That was a HOST
+measurement reported as a CONTAINER measurement, and the two are different
+machines for this purpose.** The host genuinely has no `nvcc`/`cmake` since the
+14 Aug reimage ([#1019](https://github.com/mudler/vllm.cpp/issues/1019)) — but
+the host is not where work runs. Inside `rc run` the worker container is Ubuntu
+24.04 as **uid 0**, carrying `gcc`, `g++`, `cmake`, `ninja`, `make`, `python3`,
+`git`, `apt`, with the GB10 visible and DNS working. **Only `nvcc` is missing**,
+and apt's `nvidia-cuda-toolkit` 12.0.140 is too old for sm_121a, so CUDA 13.x
+comes from `developer.download.nvidia.com/…/ubuntu2404/arm64`. Neither `docker`
+nor `sudo` is involved.
+
+> **Rule this cost two cycles to learn: re-derive every environment fact INSIDE
+> `rc run`.** A probe that runs somewhere other than where the work will run
+> answers a question nobody asked, and it fails toward a confident verdict about
+> the code's environment rather than toward an obvious error.
+
+*What is genuinely outstanding:* install `nvcc` in the build container, and
+whether that container can see `$CHECKPOINT_ROOT`, which is **OPEN** — no probe
+has answered it, and none is claimed. `docs/BENCHMARKS.md` records the gate as
+**pending a named resource**, never as a pass.
+
+**§5.2 arm 2 (multi-request) is additionally blocked by design, not by a host.**
+G-SAFE refuses `input.num_reqs > 1` and A2-B owns that clause, so the three
+prompts cannot yet be submitted concurrently and interleaved. Arm 1 (multi-step,
+single request, all 32 tokens) is what the driver is built for.
+
+**§6.2's allowlist entry STAYS, and that was decided on evidence.**
+`nemotron_h.cpp:1031-1034` still refuses the NVFP4 `lm_head` on a non-CPU queue,
+so the forward's last step is a host projection and it returns `HostLogits`.
+Deleting `scripts/runner-routing-allowlist.txt:26` was tried in a scratch copy:
+`check-runner-routing-consistency.py` goes from `OK` to `ERROR` naming
+`ForwardNemotronHForCausalLM returns HostLogits`, exit 1, tree restored
+byte-for-byte. A2-Q2b removes the entry; widening the allowlist to satisfy the
+checker is the defect the checker exists to stop.
 
 **Three things to read before the first edit**, because each has already cost
 somebody a cycle: §5.5, so the six `#873` gates are subtracted rather than
@@ -1118,10 +1170,12 @@ chased; §5.4, so the token gate is planned for `dgx.casa` and Thor and not for
 the local box, which cannot see anything device-side; and §7 R2, so #775 is
 consumed rather than re-fixed.
 
-**Next action:** a fresh implementer claims A1 from §1, captures the §3.1 red
-first, and lands A1 with the G-SAFE interlock opened through
-`vllm::ModelAs<NemotronHLoadedModel>`. A fresh reviewer — never the implementer —
-runs the §3.4 mutations and reports M3 as a pair.
+**Next action:** repair a build host (#1019), then run
+`nemotron-h-gen --model <staged dir> --golden
+tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json` with
+`VT_NEMOTRON35_SNAPSHOT` unset, and record the resolved directory. Expect 96
+tokens compared over 3 prompts of width 32; a "compared" number below 96 is a
+short run and the driver exits 4 rather than reporting it as a match.
 
 ## 10. Outcome
 

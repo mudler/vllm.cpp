@@ -535,7 +535,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. **That refusal is UNCHANGED by A2-R (#810)**: A2-R adds a partial device arm (embedding lookup, the 52 layer norms + `norm_f`, and the 6 GQA attention blocks; Mamba2, MoE and `lm_head` stay on the host), but it is non-paged and single-request, so it creates none of the capability the refusal guards and is not reachable through `include/vllm.h`. It is exercised only by `test_nemotron_h_forward`, and it records no throughput number. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | **Only BATCHED decode still refuses.** A2-P (#810) narrowed this: `ForwardNemotronHForCausalLM` now selects the paged forward whenever the runner supplies paged KV and recurrent state, so K/V go into the runner's pages and the conv/SSM rows are carried across steps, and `examples/nemotron_h_gen` reaches all of it through `include/vllm.h` alone. What is left is `num_reqs > 1`, refused by name because one request's pages and one request's recurrent state are carried per step and a multi-request step would be decoded as ONE concatenated causal sequence — plausible wrong tokens rather than a failure. Owed to A2-B. **The end-to-end token gate against the pinned oracle has NOT run**, so no claim is made here about what this checkpoint emits; `docs/BENCHMARKS.md` records that as pending rather than as silence. `lm_head` and the FP8 Mamba2 projections still compute on the host, and a GGUF file is refused by name since no GGUF arm exists for it. See *Nemotron-3.5-Lightning-30B: the exact weights, and which arms run* below |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -862,8 +862,10 @@ existing key in place, so `--lora a --lora b` leaves one `lora_path` extra
 holding `b`, silently fuses `b`, and exits 0. Pass one adapter.
 
 The C ABI cannot reach it either, and that is the wider half of the finding:
-`ltx2_video.cpp:813` is the ONLY `dit_options.loras.push_back` in the tree and it
-runs at most once, under `if (!lora_path.empty())`. So `loras.size()` is 0 or 1
+`Ltx2VideoEngine::Load` carries the ONLY `dit_options.loras.push_back` in the
+tree and it runs at most once, under `if (!lora_path.empty())` — named by symbol
+rather than by line, because the line moved with #1118 and a stale anchor is what
+this paragraph already had to correct once. So `loras.size()` is 0 or 1
 on every production path — CLI, `vllm_video_engine_load` and the server alike —
 and the more-than-one refusal is reached only by `test_ltx2_lora`. It is correct
 code guarding a state nothing can currently construct, which is the shape
@@ -2294,6 +2296,80 @@ Set `VLLM_MUSE_GGUF=<file>` (or `VLLM_MUSE_GGUF_LOAD=<file>` for the full
 materialization) to run `test_muse_glimmer_gguf` against a real checkpoint;
 without them the gate runs off committed header-only manifests.
 
+## Nemotron-3.5-Lightning-30B: the exact weights, and which arms run
+
+`NemotronHForCausalLM` is a hybrid: 6 GQA attention layers over a paged KV cache
+and 23 Mamba2 layers over a recurrent conv/SSM state, with MoE blocks between
+them. `examples/nemotron_h_gen` (`nemotron-h-gen`) drives it through the public
+C ABI and nothing else — `vllm_engine_load` + `vllm_complete_tokens` — against
+the committed oracle golden:
+
+```sh
+nemotron-h-gen --model "$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4" \
+               --golden tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json
+```
+
+`--golden-info` parses the golden and prints its geometry without loading a
+model, which is how you check the battery's shape before spending a 20.1 GiB
+load. `--load-only` stops after `vllm_engine_load`.
+
+### The checkpoint
+
+| field | value |
+|---|---|
+| repo | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) — first party |
+| revision | `29f2d1746d8f41e316523194b19018707749b1b1` |
+| staged as | `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4` (a `hf download --local-dir` tree) |
+| on-disk total | 21 583 809 748 bytes (20.1 GiB) |
+| weights | `model-000{01..52}-of-00052.safetensors` + `model.safetensors.index.json` |
+| quantization | `config.json` (1 337 760 B) + `hf_quant_config.json` (928 085 B), the `modelopt_mixed` layout |
+| tokenizer | `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `chat_template.jinja` |
+| sha256 (first shard) | `672c8bda10fdec0256e0819e112d2aa3a936cc3e5d311a05fd3ff773ca9a44b9` for `model-00001-of-00052.safetensors` (743 427 168 B) |
+
+**A repo id alone is not a pin** — checkpoints get re-quantized in place under an
+unchanged name — so the revision is recorded, and it was verified rather than
+copied: the first shard on the gate host hashes to the value above, which is
+that revision's own LFS record for the file
+(`.cache/huggingface/download/model-00001-of-00052.safetensors.metadata`, whose
+sidecar names commit `29f2d174`). `tests/parity/hf_snapshot.h` resolves the
+directory and refuses a tree staged at any other revision, so
+`VT_NEMOTRON35_SNAPSHOT` is left UNSET for a gate run: setting it takes the
+explicit-directory escape, which is deliberately not revision-checked.
+
+    hf download nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
+      --revision 29f2d1746d8f41e316523194b19018707749b1b1 \
+      --local-dir "$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4"
+
+### The arms, and what each one costs you today
+
+The loader materializes all 18 487 tensors in the memory format the checkpoint
+ships them in, so nothing is silently widened at load. What differs between arms
+is **where the arithmetic happens**, and that is not something a token
+comparison can see, so it is written down here instead.
+
+| arm | state |
+|---|---|
+| bf16 layers, norms, the 6 GQA attention blocks | **device** |
+| MoE experts, NVFP4 W4A16 g16 | **device** (Marlin arena) |
+| FP8 W8A8 static Mamba2 input projections | **host** — the device arm is owed, [#940](https://github.com/mudler/vllm.cpp/issues/940) |
+| `lm_head`, NVFP4 W4A16 g16 | **host** — it refuses a non-CPU queue by name, so the forward's last step is a host projection and the model still returns host logits. Owed to A2-Q2b, [#810](https://github.com/mudler/vllm.cpp/issues/810) |
+
+And the arms that are **refused by name** rather than substituted:
+
+| arm | the refusal |
+|---|---|
+| GGUF k-quants / i-quants | not ported. A GGUF path is refused at load naming `.agents/specs/nemotron-h-model.md` §5b W7, because silently dequantizing to a supported path is exactly what a token gate cannot see |
+| the MTP draft head | deferred by name at load (W5) |
+| batched decode (`num_reqs > 1`) | refused at the forward. One request's KV pages and one request's recurrent state are carried per step; a multi-request step would be decoded as ONE concatenated causal sequence and would return plausible wrong tokens instead of failing. Owed to A2-B, [#810](https://github.com/mudler/vllm.cpp/issues/810) |
+
+### What has NOT been measured
+
+**No token gate result exists for this checkpoint yet.** The example above is the
+vehicle for it and the golden is committed, but the run itself is pending; the
+current state is recorded in `docs/BENCHMARKS.md` rather than left as silence,
+and nothing about the released checkpoint's output is claimed here until it is
+green.
+
 ## MiniMax-H3: video + audio generation
 
 ### The exact weights (so a render is reproducible)
@@ -3301,14 +3377,40 @@ Three things this kind demands, each refused by name rather than defaulted:
 defaults to the clip's own duration. A take shorter than the clip is refused
 rather than padded, and a longer one keeps its leading frames.
 
-**One divergence, and it is not repairable from the request.** Upstream fuses
-the distilled adapter into stage 2 alone and leaves stage 1 on the base weights;
-this engine fuses adapters once at load, so stage 1 sees it too. Expect frames
-that differ from the ones upstream renders for the same checkpoint, take and
-seed. Nothing in the shape of the output shows it — the clip comes back at the
-size, frame count and sample rate you asked for, and no error is raised — so the
-only instrument that sees this is a side-by-side render against upstream.
-Tracked as [#1118](https://github.com/mudler/vllm.cpp/issues/1118).
+**The distilled adapter rides stage 2 alone**, as upstream's does: stage 1 is
+built with `loras=tuple(loras)` (`a2vid_two_stage.py:107`) and stage 2 with
+`(*tuple(loras), *tuple(distilled_lora))` (`:114`), and
+`ltx-pipelines/CLAUDE.md:48` states the convention for TI2Vid, A2Vid and
+Keyframe alike. Until 2026-08-17 this page recorded the opposite as an
+unrepairable divergence, because adapters fused once at load and every phase saw
+them; [#1118](https://github.com/mudler/vllm.cpp/issues/1118) closed that. The
+engine still holds ONE DiT — upstream does too, since both of its
+`from_checkpoint` calls name the same `model_paths.transformer()` — and
+re-materializes the adapter's target tensors at the phase boundary instead of
+keeping a second weight set.
+
+**What that costs you, per render.** Moving one DiT between the two states is
+paid in wall-clock rather than in memory: a two-stage render does **two**
+rebinds, one at each phase boundary, and each re-opens `--lora` and reads every
+`lora_A`/`lora_B` factor pair before re-materializing the tensors they target.
+The adapter above is 8,899,889,568 bytes, so this is not free, and the DiT is
+left in stage 2's state so the next render pays the same two. **No number is
+published for it** — this recipe is gated on reduced fixtures and nothing has
+timed the boundary on real weights. Upstream spends memory here instead, holding
+two `DiffusionStage`s over one checkpoint, which does not fit one GB10.
+
+**The adapter `--lora` wants**, pinned by content rather than by name, because a
+LoRA repository can be re-quantized in place under an unchanged filename:
+`ltx-2.5-22b-distilled-lora-450-bf16.safetensors`, 8,899,889,568 bytes, 3320
+BF16 tensors forming 1660 `lora_A`/`lora_B` pairs,
+`__metadata__` `lora_rank` and `lora_alpha` both `450` and `model_version`
+`2.5.0`. This is upstream's `distilled_lora`, the one `--distilled-lora`
+(`required=True`) names. It is **not** the IC-LoRA
+(`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`, 327,322,640
+bytes), which is a different adapter for a different arm. Nothing here checks
+which one you passed: `requires_distilled_lora` refuses a load carrying **no**
+`--lora`, and that is the whole of it, so the two are told apart by the header
+facts above and not by the engine.
 
 The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
 `video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored

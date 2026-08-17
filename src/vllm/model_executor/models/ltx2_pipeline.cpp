@@ -1541,10 +1541,24 @@ Ltx2PipelineRecipe A2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   // per request at `:353-360`.
   stage1.denoiser = Ltx2PhaseDenoiser::kGuided;
   stage1.allow_guidance_override = true;
+  // `loras=tuple(loras)` (`:107`) — stage 1 runs WITHOUT the distilled adapter,
+  // against stage 2's `(*loras, *distilled_lora)` (`:114`). The adapter this
+  // engine's single `lora_path` slot carries for this recipe IS that
+  // `distilled_lora`, which is what `requires_distilled_lora` declares by
+  // mirroring `--distilled-lora required=True` (utils/args.py:1140-1153).
+  //
+  // THIS LINE IS THE ROW. Deleting it reverts to one fused weight set for both
+  // stages, which is #1118 exactly, and it renders: stage 1's 40-step guided
+  // schedule would run against base + distilled where upstream runs it against
+  // the base alone. The gate that sees it is "the distilled adapter rides stage
+  // 2 ALONE" in test_ltx2_video.
+  stage1.loras = Ltx2PhaseLoraScope::kNoAdapters;
   stage1.stepper = Ltx2StepperKind::kEuler;
 
   Ltx2PhaseRecipe stage2;
   stage2.name = "stage_2";
+  // Left at `kAllAdapters`: `(*loras, *distilled_lora)` (`:114`) is every
+  // adapter this engine holds.
   stage2.spatial_downscale = 1;
   // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (`:164`).
   stage2.sigmas = Stage2DistilledSigmas();

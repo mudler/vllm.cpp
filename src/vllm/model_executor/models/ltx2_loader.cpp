@@ -760,6 +760,112 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
   return out;
 }
 
+void Ltx2RebindDitLoras(vt::Queue* queue, const SafetensorsFile& file,
+                        const Ltx2DitLoadOptions& options, bool fuse,
+                        Ltx2DitCheckpoint& checkpoint) {
+  // No adapter was ever supplied, so every phase runs the same base weights and
+  // there is no state to move. Checked first so that a `kNoAdapters` phase on a
+  // load with no `lora_path` costs nothing at all.
+  if (options.loras.empty()) return;
+
+  // The state the checkpoint is in. `CheckLorasWereApplied` refuses a load whose
+  // adapters fused into ZERO tensors, so with an adapter present a non-zero
+  // count means fused and zero means rebound-off — the count is a faithful state
+  // bit and needs no field of its own.
+  const bool currently_fused = checkpoint.lora_fused_tensors > 0;
+  if (currently_fused == fuse) return;
+
+  const bool staged = !checkpoint.device_storage.empty();
+  if (staged != (queue != nullptr)) {
+    Fail(std::string("Ltx2RebindDitLoras was given ") +
+         (queue != nullptr ? "a queue for a HOST-resident checkpoint"
+                           : "no queue for a DEVICE-STAGED checkpoint") +
+         ". The two write to different address spaces, and guessing which one a "
+         "view points at is how a rebind would corrupt the weights silently "
+         "instead of refusing.");
+  }
+
+  const DitPlan plan = PlanDit(file);
+  const std::vector<Ltx2TensorSpec> contract = ContractOf(checkpoint.params);
+  // Opened per rebind rather than cached on the checkpoint: the A/B factors are
+  // the adapter's whole payload, and holding them resident for the life of the
+  // engine would spend most of what the second-weight-set shape was rejected
+  // for. This is the wall-clock half of that trade, paid once per phase
+  // boundary.
+  const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
+
+  vt::Backend* backend = queue != nullptr ? &vt::GetBackend(queue->device.type) : nullptr;
+  std::vector<uint8_t> host;
+  int64_t fused_count = 0;
+  for (const Ltx2TensorSpec& spec : contract) {
+    // Only a tensor some adapter TARGETS can differ between the two states. For
+    // every other tensor the fused and unfused images are equal by construction,
+    // so re-materializing it would be work with no observable result.
+    bool targeted = false;
+    for (const Ltx2LoraAdapter& lora : loras) {
+      if (lora.Find(spec.name) != nullptr) {
+        targeted = true;
+        break;
+      }
+    }
+    if (!targeted) continue;
+
+    const auto it = checkpoint.views.find(spec.name);
+    if (it == checkpoint.views.end()) {
+      Fail("Ltx2RebindDitLoras: '" + spec.name +
+           "' is a LoRA target in this checkpoint's own contract but is not bound. "
+           "Refusing rather than rebinding a subset and reporting success.");
+    }
+    vt::Tensor& view = it->second;
+
+    // The SAME materialize the load uses, from the pristine file, so the base
+    // this fuses onto is the base the load fused onto — bit for bit.
+    const vt::DType dtype = MaterializeDitTensor(file, plan, spec, host);
+    if (fuse && FuseLorasInto(loras, spec, dtype, host)) ++fused_count;
+
+    const int64_t numel = view.Numel();
+    if (view.dtype == dtype) {
+      const size_t bytes = static_cast<size_t>(numel) * vt::SizeOf(dtype);
+      if (bytes != host.size()) {
+        Fail("Ltx2RebindDitLoras: '" + spec.name + "' re-materialized to " +
+             std::to_string(host.size()) + " bytes but the bound view holds " +
+             std::to_string(bytes));
+      }
+      if (backend != nullptr) {
+        backend->Copy(*queue, view.data, host.data(), bytes);
+        backend->Synchronize(*queue);  // `host` is reused by the next iteration
+      } else {
+        std::memcpy(view.data, host.data(), bytes);
+      }
+    } else if (view.dtype == vt::DType::kF32 && dtype == vt::DType::kBF16) {
+      // `Ltx2WidenDitToF32` ran on this checkpoint, so the bound view is the f32
+      // copy and the materialization is still bf16. Widening HERE keeps the
+      // rebind's arithmetic identical to the load's: fuse in bf16 first, widen
+      // second, exactly as `Ltx2LoadDitFromSafetensors` then `Ltx2WidenDitToF32`
+      // do. Widening before the fuse would accumulate in f32 and quietly undo
+      // the dtype `ltx2_lora.h` pins.
+      if (static_cast<size_t>(numel) * sizeof(uint16_t) != host.size()) {
+        Fail("Ltx2RebindDitLoras: '" + spec.name + "' re-materialized to " +
+             std::to_string(host.size()) + " bf16 bytes but the bound f32 view holds " +
+             std::to_string(numel) + " elements");
+      }
+      const uint16_t* src = reinterpret_cast<const uint16_t*>(host.data());
+      float* dst = static_cast<float*>(view.data);
+      for (int64_t i = 0; i < numel; ++i) dst[i] = Bf16ToF32(src[static_cast<size_t>(i)]);
+    } else {
+      Fail("Ltx2RebindDitLoras: '" + spec.name + "' materializes as " +
+           std::string(vt::Name(dtype)) + " but its bound view is " +
+           std::string(vt::Name(view.dtype)) +
+           ", and this rebind knows no conversion between them");
+    }
+  }
+
+  // The same refusal the load makes, for the same reason: an adapter that fused
+  // into nothing renders identically to no adapter while reporting success.
+  if (fuse) CheckLorasWereApplied(loras, fused_count);
+  checkpoint.lora_fused_tensors = fused_count;
+}
+
 // ---------------------------------------------------------------------------
 // The text encoder
 // ---------------------------------------------------------------------------

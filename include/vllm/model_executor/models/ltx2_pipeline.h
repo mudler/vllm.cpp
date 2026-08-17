@@ -603,6 +603,59 @@ enum class Ltx2StepperKind { kEuler, kEulerAncestral, kRes2s };
 enum class Ltx2PhaseDenoiser { kGuided, kSimple };
 
 // LTXPhaseRecipe (ltx2_recipes.py:29-50).
+// WHICH of the load's adapters a PHASE runs.
+//
+// Upstream states this by building a second `DiffusionStage` from the same
+// checkpoint with a different `loras=` argument, read at Lightricks/LTX-2
+// fd4ded7f: `a2vid_two_stage.py:107` against `:114`, `ti2vid_two_stages.py:140`
+// against `:151`, `ti2vid_two_stages_hq.py:154` against `:165`, and — the mirror
+// image — `ic_lora.py:108` against `:119`, where the adapter rides stage 1 and
+// stage 2 runs bare.
+//
+// UPSTREAM NEEDS TWO PLACEMENTS, not one, which is why this is a SET and not a
+// "does this phase get the distilled adapter" boolean.
+// `ltx-pipelines/CLAUDE.md:48` scopes the adapter to "stage 2 only in
+// TI2Vid/A2Vid/Keyframe", while `:49` has HQ apply it to BOTH stages and
+// `:50-51` says the same of DFR. Stage 1 `kNoAdapters` with stage 2 defaulted is
+// the first; both phases defaulted is the second.
+//
+// TWO ENUMERATORS, and two is the COMPLETE space rather than a boolean wearing
+// an enum's clothes: `Ltx2ResolveLoraReferenceFactors` refuses more than one
+// adapter by name (`ltx2_lora.h:167-172`, mirroring `dubit.py:364-365` and
+// `hdr_ic_lora.py:271-272`), so the powerset of the load's adapters has exactly
+// two members. "Some of them" has no spelling here because it has no spelling
+// anywhere in this engine yet; the day that arity cap lifts, the third value
+// goes here.
+//
+// AND UPSTREAM HOLDS ONE TRANSFORMER, not two. Both `from_checkpoint` calls name
+// the same `model_paths.transformer()` (`a2vid_two_stage.py:104` and `:116`,
+// `ti2vid_two_stages.py:137` and `:148`) and differ only in the adapter tuple.
+// So a phase-scoped adapter over one resident DiT is what upstream does, and a
+// second resident weight set would be a heavier architecture than the reference
+// rather than a faithful port of it.
+//
+// NO PER-PHASE STRENGTH, deliberately. `ti2vid_two_stages_hq.py` needs one —
+// 0.25 at `:92-96` and 0.5 at `:97-101` — and no recipe this tree ships would
+// set it, so adding the field now lands a branch nothing can select. That is the
+// argument `ltx2_lora.h:41-44` already makes for the second product form. Owed
+// by https://github.com/mudler/vllm.cpp/issues/1144 — NOT #921, which was closed
+// as completed the same day this landed and would have left the debt looking
+// owned while owning nothing. The trap that makes it more than a new field is
+// written beside `Ltx2RebindDitLoras` in `ltx2_loader.h`: that function's no-op
+// test is a BOOLEAN, and HQ needs both stages fused at different strengths.
+enum class Ltx2PhaseLoraScope {
+  // Every adapter the load supplied. The DEFAULT, because `distilled.py:131`
+  // builds ONE stage set and so every recipe that predates this field —
+  // `distilled_two_stage`, `dfr`, `retake`, `one_stage`, `res2s`, `t2a_one_stage`
+  // — is upstream-correct running the adapters on all of its phases. A different
+  // default would silently move six gated arms.
+  kAllAdapters,
+  // The base weights. `ic_lora.py:119`'s `loras=()`, and
+  // `a2vid_two_stage.py:107`'s stage 1 relative to the distilled adapter that
+  // `requires_distilled_lora` identifies.
+  kNoAdapters,
+};
+
 struct Ltx2PhaseRecipe {
   std::string name;
   Ltx2MultiModalGuiderParams video_guidance;
@@ -619,6 +672,11 @@ struct Ltx2PhaseRecipe {
   // recipe that refuses an override can reach it.
   Ltx2PhaseDenoiser denoiser = Ltx2PhaseDenoiser::kGuided;
   bool use_official_sigma_schedule = true;
+  // The adapter set this phase runs. Read in exactly one place — the phase
+  // loop's rebind, immediately before the phase's first DiT forward — and
+  // honoured by `Ltx2RebindDitLoras`, which re-materializes only the tensors an
+  // adapter targets so that no second weight set ever exists.
+  Ltx2PhaseLoraScope loras = Ltx2PhaseLoraScope::kAllAdapters;
   Ltx2StepperKind stepper = Ltx2StepperKind::kEuler;
   double stepper_eta = 0.0;
   double stepper_s_noise = 1.0;
@@ -683,12 +741,16 @@ struct Ltx2PipelineRecipe {
   // carrying no adapter without running a distilled schedule on undistilled
   // weights.
   //
-  // What this flag CANNOT express is upstream's placement:
-  // `stage_2_loras = (*loras, *distilled_lora)` (a2vid_two_stage.py:114) puts
-  // the adapter on stage 2 ALONE, against `loras=tuple(loras)` for stage 1
-  // (`:107`), and this engine fuses at load into one weight set. Owed by
-  // https://github.com/mudler/vllm.cpp/issues/1118 and recorded in
-  // .agents/specs/ltx25-a2vid-recipe.md section 4.4.
+  // THE PLACEMENT IS NOT THIS FLAG'S JOB, and it is no longer missing. This
+  // comment used to end "this engine fuses at load into one weight set", owed by
+  // #1118. Row LTX25-PHASE-LORA closed that: `Ltx2PhaseRecipe::loras` carries
+  // upstream's per-stage adapter set, and `A2VidTwoStageRecipe` gives stage 1
+  // `kNoAdapters` (`a2vid_two_stage.py:107`) against stage 2's default
+  // (`:114`, `stage_2_loras = (*loras, *distilled_lora)`).
+  //
+  // What this flag says is only that the load must CARRY an adapter, mirroring
+  // `--distilled-lora required=True`. What the phase field says is which stage
+  // runs it. The two were conflated while only one placement existed.
   bool requires_distilled_lora = false;
 
   int64_t max_spatial_downscale() const;

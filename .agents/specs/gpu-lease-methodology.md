@@ -92,8 +92,19 @@ The limit is now precise, measured on 2026-08-17 through two
 carries bytes and not executables. The worker reads and writes the shared
 `/workspace`, refuses direct execution from it because the mount pins
 `file_mode=0664`, and runs staged content through `sh FILE`, through the dynamic
-loader, or after a copy to `/tmp`. It cannot produce or fetch a runtime, because
-it has no compiler, no downloader and no Python.
+loader, or after a copy to `/tmp`.
+
+**The last clause of this section said the worker cannot produce or fetch a
+runtime, because it has no compiler, no downloader and no Python. That is a
+`dgx:gpu0` reading and it does not generalise.** Later the same day, five
+`rc run` jobs on `thor:gpu0` measured a worker running as `uid=0(root)` with
+`/usr/bin/gcc`, `/usr/bin/python3` and a working `apt-get`, and a `torch` and
+`triton` tree staged on `/workspace` imported, initialized CUDA and compiled and
+ran a Triton kernel. See
+[`lease-runtime-staging.md`](lease-runtime-staging.md)
+([#1146](https://github.com/mudler/vllm.cpp/issues/1146)), which also states what
+that result does not establish: it is `thor:gpu0` at capability (11,0) only, the
+GB10 is `sm_121a` and UNMEASURED, and the pinned vLLM oracle is not staged.
 
 ## The correction has to reach the spec that owns the blocker
 
@@ -112,6 +123,11 @@ green. Both sites therefore take the calibrated form that
 `.agents/environment.md` already carries: the probe NARROWS #1129 and does not
 close it, the relocated virtual environment is UNMEASURED, and the load-bearing
 reason is that nothing has staged a runtime on the NAS.
+
+**The UNMEASURED clause in that form was answered on the same day, and both sites
+were corrected again.** A relocated runtime does start inside a worker, on
+`thor:gpu0`. What is still not staged is the ORACLE. See
+[`lease-runtime-staging.md`](lease-runtime-staging.md) and #1146.
 
 The same substitution repairs the derivation in the how-to. The old sentence
 read "no host toolchain, the worker has no compiler, SO no lease-compliant
@@ -168,9 +184,12 @@ is the row gate.
 
 ## Owed
 
-- #1129 stays open. No vLLM leg runs on `dgx.casa` by a lease-compliant path
-  today, because nothing has staged a runtime on the NAS. Whether a relocated
-  CUDA virtual environment starts inside a worker is UNMEASURED.
+- #1129 is now closed, and its recorded cause was falsified on 2026-08-17. No
+  vLLM leg runs on `dgx.casa` by a lease-compliant path today, because nothing
+  has staged the ORACLE on the NAS. The "UNMEASURED" clause this line used to
+  carry is answered: a relocated CUDA runtime does start inside a worker, on
+  `thor:gpu0` and not yet on `dgx:gpu0`. `ENV-LEASE-RUNTIME-STAGING` and
+  [#1146](https://github.com/mudler/vllm.cpp/issues/1146) own the rest.
 
 ## Now
 
@@ -178,5 +197,7 @@ The rule is stated in `AGENTS.md` and the conditional is in
 `.agents/environment.md`, keyed on the device and naming the three fleet
 devices. The narrowing of #1129 now reads the same way in
 `.agents/environment.md` and in `.agents/specs/mtp-k-gt-1.md`, so the blocked
-row's owner is told that staging is untried rather than futile. The next step
-belongs to whoever takes #1129, which is staging a runtime the lease can start.
+row's owner is told that staging is untried rather than futile. Staging was then
+tried, and it worked on `thor:gpu0`
+([`lease-runtime-staging.md`](lease-runtime-staging.md), #1146). The next step is
+the same probe on `dgx:gpu0`, and after it the pinned oracle itself.

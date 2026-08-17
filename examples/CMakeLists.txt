@@ -30,6 +30,17 @@ add_executable(kimi-linear-gen kimi_linear_gen/main.cpp)
 target_link_libraries(kimi-linear-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(kimi-linear-gen)
 
+# nemotron-h-gen: the Nemotron-3.5-Lightning-30B (NemotronHForCausalLM) A3
+# end-to-end token battery against the PINNED vLLM ORACLE golden, and a THIN
+# CLIENT of the public C ABI in exactly the kimi-linear-gen shape above:
+# vllm_engine_load + the v13 vllm_complete_tokens over the golden's
+# pre-tokenized prompts, linking the packaged shared library so it reaches no
+# internal header and needs no example-abi-allowlist row. #810,
+# .agents/specs/nemotron-h-abi-e2e.md §6.1.
+add_executable(nemotron-h-gen nemotron_h_gen/main.cpp)
+target_link_libraries(nemotron-h-gen PRIVATE vllm::shared)
+vllm_cpp_set_warnings(nemotron-h-gen)
+
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
 # measurement tool. Links the full C++ engine (vllm::vllm) so it can build both a
 # synthetic CPU engine (no --model) and a real loaded engine (--model on dgx).

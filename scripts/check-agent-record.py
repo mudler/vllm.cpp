@@ -1524,8 +1524,21 @@ def main() -> int:
         check_row_contracts(rows, by_id, errors)
         check_model_invariants(errors)
         spec_paths = [path for row in rows if row.state in READY_STATES for path in local_spec_paths(row)]
+        # ISSUE_INDEX is here for the same reason every other record table is:
+        # nothing else counts its cells. It was the ONE record surface every
+        # change must write and the only markdown table in the set with no shape
+        # gate, so a row that lost its trailing pipe, or carried an unescaped one
+        # inside a code span, mis-rendered on GitHub while every gate stayed
+        # green (#1033). The constant is reused rather than respelled so this
+        # gate and check_issue_index cannot drift onto different files.
         check_table_shapes(
-            [AGENTS / "roadmap_v1.md", AGENTS / "coordination.md", *MATRIX_PATHS, *spec_paths],
+            [
+                AGENTS / "roadmap_v1.md",
+                AGENTS / "coordination.md",
+                ISSUE_INDEX,
+                *MATRIX_PATHS,
+                *spec_paths,
+            ],
             errors,
         )
         check_spec_location(errors)

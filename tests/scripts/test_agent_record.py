@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import re
 import sys
 import tempfile
@@ -1334,6 +1335,92 @@ class IssueIndexTests(unittest.TestCase):
         # A per-row surface by construction: one file per spec, so filing an
         # owed issue never makes two branches write the same line.
         self.assertIsInstance(agent_record.owed_issues(), set)
+
+
+class IssueIndexTableShape(unittest.TestCase):
+    """The index is a TABLE, and until #1033 nothing counted its cells.
+
+    `check_issue_index` reads the index by regex, row by row, and answers about
+    KEYS: is the number well-formed, does it link to itself, is it listed twice,
+    does it name an owner. None of that is the table's SHAPE. A row that lost
+    its trailing pipe still matches `ISSUE_ROW`, and a row carrying an unescaped
+    pipe inside a code span matches it too -- both mis-render on GitHub while
+    every gate in the tree stays green.
+
+    `check_table_shapes` is the function that measures shape, it already carried
+    the right regex, and its call site simply did not name this path.
+    """
+
+    def paths_main_hands_the_shape_gate(self) -> list:
+        """The paths the REAL call site passes, captured from the real call.
+
+        Read from the call rather than from the source text on purpose. A test
+        that greps `check-agent-record.py` for the string `issue-index` passes
+        on a line that is commented out, on a second call site that is never
+        reached, and on a constant that is defined and never used.
+        """
+
+        captured: list = []
+
+        def capture(paths, errors) -> None:
+            captured.extend(paths)
+
+        with mock.patch.object(agent_record, "check_table_shapes", capture):
+            with mock.patch.object(sys, "stdout", io.StringIO()):
+                with mock.patch.object(sys, "stderr", io.StringIO()):
+                    agent_record.main()
+        return captured
+
+    def test_check_table_shapes_covers_the_issue_index(self) -> None:
+        paths = self.paths_main_hands_the_shape_gate()
+        # A run that handed the gate NOTHING would satisfy any assertNotIn and
+        # would satisfy an assertIn only by accident, so the count is asserted
+        # first. It is the same "how many things did you examine" question the
+        # index itself went two days without an answer to.
+        self.assertGreater(
+            len(paths), 1, "main() handed check_table_shapes no paths at all"
+        )
+        # assertTrue rather than assertIn: the path list runs to ~180 entries
+        # and assertIn prints all of them, which buries the sentence that says
+        # what is wrong under the evidence that it is.
+        self.assertTrue(
+            agent_record.ISSUE_INDEX in paths,
+            f"{agent_record.ISSUE_INDEX.name} is not among the {len(paths)} "
+            "paths main() hands check_table_shapes, so nothing counts the "
+            "cells of the one record surface every change must write (#1033)",
+        )
+
+    def test_the_shipped_issue_index_is_a_well_formed_table(self) -> None:
+        # The case that would have fired in the offending PR's own preflight.
+        errors: list[str] = []
+        agent_record.check_table_shapes([agent_record.ISSUE_INDEX], errors)
+        self.assertEqual(errors, [])
+
+    def test_a_malformed_index_row_is_caught(self) -> None:
+        """The mutation. Without it the two cases above prove only that a list
+        contains a path and that a file happens to be clean today.
+
+        The copy lives under ROOT because `check_table_shapes` reports through
+        `relative_to(ROOT)`; a path outside the tree would raise instead of
+        reporting, and an exception in the harness is not the gate firing.
+        """
+
+        text = agent_record.ISSUE_INDEX.read_text(encoding="utf-8")
+        rows = text.rstrip("\n").split("\n")
+        self.assertTrue(rows[-1].endswith("|"), "the last index row is not a row")
+        rows[-1] = rows[-1][:-1]
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            mutated = Path(tmp) / "issue-index.md"
+            mutated.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            # The mutation APPLIED: one byte shorter, one pipe fewer.
+            self.assertEqual(
+                len(mutated.read_text(encoding="utf-8")), len(text) - 1
+            )
+            errors: list[str] = []
+            agent_record.check_table_shapes([mutated], errors)
+
+        require(errors, rf"issue-index\.md:{len(rows)}: table has 4 pipes; expected 5")
 
 
 if __name__ == "__main__":

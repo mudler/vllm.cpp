@@ -384,7 +384,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 809 819 820 882 978 994 1029 1120 1145 1250 1291 1333 1335
+// 823 833 834 896 992 1008 1043 1134 1159 1264 1305 1347 1349
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -591,6 +591,18 @@ struct Ltx2VideoEngine::Impl {
   std::optional<vt::Queue> queue;
 
   Ltx2DitCheckpoint dit;
+  // The adapter set the LOAD supplied, kept so the phase loop can put the DiT
+  // into the state each phase asks for (`Ltx2PhaseRecipe::loras`). Upstream
+  // instead builds a second `DiffusionStage` per adapter set
+  // (a2vid_two_stage.py:103 and :115); this engine holds one DiT and
+  // re-materializes the adapter's target tensors at the boundary, because a
+  // second resident weight set is 18.7-39 GB and one GB10 has 119 GB with no
+  // swap. `Ltx2RebindDitLoras` carries the whole argument.
+  //
+  // The SPECS only — the adapter file itself is re-read per rebind rather than
+  // held, since its A/B factors are its whole payload and keeping them resident
+  // would spend most of what the second-weight-set shape was rejected for.
+  Ltx2DitLoadOptions dit_options;
   std::string model_version, pipeline_kind;
   Ltx2PipelineRecipe recipe;
   int64_t max_phase = -1;  // -1 => every phase
@@ -805,7 +817,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
 
   // ── the DiT ───────────────────────────────────────────────────────────────
   const SafetensorsFile dit_file = SafetensorsFile::Open(params.dit_path);
-  Ltx2DitLoadOptions dit_options;
+  // ON THE IMPL, not a local: the phase loop re-reads these to put the DiT into
+  // the adapter state each phase declares (`Ltx2PhaseRecipe::loras`).
+  Ltx2DitLoadOptions& dit_options = im.dit_options;
   dit_options.allow_unported_modules = VideoExtra(params.extras, kLtx2AllowUnportedExtra) == "1";
   // On the CPU, f32 is what `Ltx2DitForward` requires: it is the PARITY dtype,
   // not a widening of a bf16 path. On an accelerator nothing is widened at all —
@@ -2219,16 +2233,34 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     //    temporal subsample, neither of which retake performs and neither of
     //    which any reader supplies.
     //
-    // 2. THE REFERENCE ITEM BELONGS TO STAGE 1, AND STAGE 2 MUST RUN UNFUSED.
-    //    `ICLoraPipeline` builds two `DiffusionStage`s from the same checkpoint
-    //    and gives stage 1 `loras=tuple(loras)` (ic_lora.py:108) and stage 2
-    //    `loras=()` (:119); stage 1 takes `_create_conditionings`, which appends
-    //    the reference item (:269-278, :377-402), and stage 2 takes plain
-    //    `combined_image_conditionings` with no reference item at all
-    //    (:314-321). This engine holds ONE `Ltx2Dit`, fused at load, that every
-    //    phase of the recipe runs. Serving the arm on a two-phase recipe needs a
-    //    second unfused DiT or a phase-scoped adapter, and serving it on one
-    //    phase only is upstream's `skip_stage_2` (:302-308), a different request.
+    //    THE SECOND REASON THIS MESSAGE GAVE IS NOW FALSE, and it is recorded
+    //    here rather than deleted because it is the third reason in this block
+    //    to come true and a reader needs to know which. It said: "the reference
+    //    item belongs to stage 1 and stage 2 must run unfused —
+    //    `ICLoraPipeline` gives stage 1 `loras=tuple(loras)` (ic_lora.py:108)
+    //    and stage 2 `loras=()` (:119), and this engine holds ONE `Ltx2Dit`,
+    //    fused at load, that every phase of the recipe runs. Serving the arm
+    //    needs a second unfused DiT or a phase-scoped adapter."
+    //
+    //    Row LTX25-PHASE-LORA (#1118) landed the phase-scoped adapter.
+    //    `Ltx2PhaseRecipe::loras` (ltx2_pipeline.h) carries upstream's per-stage
+    //    set and the phase loop in this file honours it through
+    //    `Ltx2RebindDitLoras`, which re-materializes only the tensors an adapter
+    //    targets — so a two-phase recipe CAN now give stage 1 the adapter and
+    //    stage 2 none, which is exactly `ic_lora.py:108` against `:119`, and it
+    //    does so without a second resident weight set. `A2VidTwoStageRecipe` is
+    //    the executable proof it exists: it gives stage 1 `kNoAdapters` and the
+    //    gate "the distilled adapter rides stage 2 ALONE" renders both states
+    //    through this ABI and compares the pixels.
+    //
+    //    What that leaves is reason 1 ALONE, and reason 1 is unrelated to
+    //    weights: it is the reference clip's own geometry. The conditioning
+    //    split is also still upstream's — stage 1 takes `_create_conditionings`,
+    //    which appends the reference item (:269-278, :377-402), and stage 2
+    //    takes plain `combined_image_conditionings` with no reference item
+    //    (:314-321) — but that is a conditioning question, not a fused-weight
+    //    one, and serving the arm on one phase only is upstream's `skip_stage_2`
+    //    (:302-308), a different request.
     std::string factors = "no adapter was supplied, so none were read";
     if (im.dit.lora_fused_tensors > 0) {
       factors = "the supplied adapter declares downscale=" +
@@ -2250,13 +2282,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "`minimax_h3_video.cpp:650` — and is doubly false now that row LTX25-RETAKE (#924) "
         "reads it on this side through `Ltx2ReadFrameDirectory`. What is missing is the "
         "reference item's own geometry, the downscale resize and the temporal subsample, "
-        "which no reader supplies. SECOND, the reference item is a STAGE-1 item "
-        "and stage 2 must run with NO adapter: `ICLoraPipeline` gives stage 1 "
-        "`loras=tuple(loras)` (ic_lora.py:108) and the reference conditioning (:269-278), "
-        "and gives stage 2 `loras=()` (:119) and `combined_image_conditionings` with no "
-        "reference item (:314-321) — and this engine holds one DiT, fused at load, that "
-        "every phase runs. WHAT IS *NOT* THE REASON, because this refusal has now given two "
-        "reasons that later became false: (a) the IC-LoRA METADATA. Row LTX25-IC-LORA (#923) "
+        "which no reader supplies. SECOND, the reference item is a STAGE-1 item and stage 2 "
+        "takes `combined_image_conditionings` with no reference item at all: `ICLoraPipeline` "
+        "gives stage 1 the reference conditioning (ic_lora.py:269-278) and stage 2 none "
+        "(:314-321), and this phase loop appends the same conditioning set to every phase. "
+        "That is a CONDITIONING gap and not a weights one. WHAT IS *NOT* THE REASON, because "
+        "this refusal has now given THREE reasons that later became false: (a) the IC-LoRA "
+        "METADATA. Row LTX25-IC-LORA (#923) "
         "closed that; supply `lora_path` and the factors are read at load "
         "(iclora_utils.py:30-49) — right now, " + factors +
         ". (b) the TOKEN-APPEND machinery. This message blamed it on 2026-08-15 and row "
@@ -2270,7 +2302,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "`conditioning_attention_strength >= 1.0` with no latent mask `attn_mask` is None "
         "(iclora_utils.py:159-160) and `ConditioningItemAttentionStrengthWrapper` is "
         "applied only `if attn_mask is not None` (:168-169). The sub-1.0 arm is owed by "
-        "#932, and it is not what blocks this one. Use first_frame_ppm / first_frame_path "
+        "#932, and it is not what blocks this one. (d) the FUSED-AT-LOAD adapter. This "
+        "message said until 2026-08-17 that stage 2 must run with no adapter while \"this "
+        "engine holds one DiT, fused at load, that every phase runs\", and row "
+        "LTX25-PHASE-LORA (#1118) closed it: `Ltx2PhaseRecipe::loras` carries upstream's "
+        "per-stage set and the phase loop rebinds the DiT through `Ltx2RebindDitLoras`, so "
+        "`loras=tuple(loras)` on stage 1 against `loras=()` on stage 2 (ic_lora.py:108, "
+        ":119) is now expressible with no second weight set. `a2vid_two_stage`'s stage 1 "
+        "runs `kNoAdapters` on exactly that machinery, which is the executable proof it "
+        "exists. Use first_frame_ppm / first_frame_path "
         "for image-to-video, and last_frame_path for a closing keyframe.");
   }
   if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
@@ -2774,6 +2814,41 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
   for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
     const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
+
+    // THE PER-PHASE ADAPTER SET (row LTX25-PHASE-LORA, issue #1118). Upstream
+    // hands each `DiffusionStage` its own `loras=` argument
+    // (a2vid_two_stage.py:107 against :114) and pays for it with a second
+    // resident weight set; this engine holds ONE DiT and moves it between the
+    // two states here, re-materializing only the tensors an adapter targets.
+    //
+    // BEFORE any conditioning, encode or forward of this phase, so no work is
+    // ever paid against weights the phase did not ask for. A no-op when the
+    // load supplied no adapter, and a no-op when the DiT is already in the
+    // requested state — so a one-stage recipe and every recipe that predates
+    // this field cost nothing.
+    //
+    // WHAT A TWO-STAGE RENDER PAYS IS TWO REBINDS, not one, and the count is
+    // written out because it is the wall-clock half of the trade the row's spec
+    // accepted. `a2vid_two_stage` loads FUSED, phase 0 asks `kNoAdapters` and
+    // rebinds off, phase 1 asks `kAllAdapters` and rebinds back on; the DiT is
+    // left fused, so the NEXT render pays the same two. Each one re-opens the
+    // adapter and reads every A/B factor pair (`Ltx2LoraAdapter::Open` ->
+    // `ReadFactorAsBf16`), and the shipped distilled adapter is 8.9 GB. That
+    // cost is UNMEASURED on real weights; the row claims no wall-clock result
+    // and a later perf row owns the number.
+    //
+    // The emptiness test is HERE as well as inside the rebind so that a load
+    // with no adapter does not re-open the checkpoint once per phase to be told
+    // there is nothing to do.
+    {
+      const bool want_fused = phase.loras == Ltx2PhaseLoraScope::kAllAdapters;
+      if (!im.dit_options.loras.empty() && want_fused != (im.dit.lora_fused_tensors > 0)) {
+        Ltx2RebindDitLoras(im.on_device ? &*im.queue : nullptr,
+                           SafetensorsFile::Open(im.params.dit_path), im.dit_options,
+                           want_fused, im.dit);
+      }
+    }
+
     const int64_t phase_h = height / phase.spatial_downscale;
     const int64_t phase_w = width / phase.spatial_downscale;
 
@@ -4253,6 +4328,15 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
                                                int64_t context_tokens) {
   const Ltx2PipelineRecipe& recipe = im.recipe;
   VT_CHECK(recipe.audio_only, "ltx2 t2a: reached the audio-only path on a video recipe");
+  // This path does NOT run the phase loop — it reads `phases.front()` and
+  // denoises once — so it is the one place a per-phase adapter set could be
+  // declared and silently ignored. Upstream's `T2AOneStagePipeline` builds ONE
+  // stage set (t2a_one_stage.py:67), so no audio-only recipe has a reason to ask
+  // for anything but the load's own adapters, and this asserts that rather than
+  // assuming it. Row LTX25-PHASE-LORA (#1118).
+  VT_CHECK(recipe.phases.front().loras == Ltx2PhaseLoraScope::kAllAdapters,
+           "ltx2 t2a: an audio-only phase asked for a per-phase adapter set, and this path "
+           "never runs the rebind that would honour it");
 
   // Upstream's T2A CLI has no --height/--width, and its pipeline substitutes a
   // 512x512 PLACEHOLDER whose height and width it documents as unused

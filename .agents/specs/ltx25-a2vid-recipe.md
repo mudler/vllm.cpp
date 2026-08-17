@@ -439,9 +439,14 @@ Report `NEEDS_DECISION` rather than narrowing silently if:
 ## Owed
 
 - **[#1118](https://github.com/mudler/vllm.cpp/issues/1118) — the per-phase
-  adapter.** §4.4. Owned by this row. It also bounds
-  [#1093](https://github.com/mudler/vllm.cpp/issues/1093) and
-  [#921](https://github.com/mudler/vllm.cpp/issues/921).
+  adapter.** §4.4. Filed by this row and CLOSED by row `LTX25-PHASE-LORA`
+  ([`ltx25-phase-lora.md`](ltx25-phase-lora.md)), which puts the distilled
+  adapter on stage 2 alone and makes `A2VidTwoStageRecipe`'s stage 1 run the
+  base weights, as `a2vid_two_stage.py:107` does against `:114`. That row also
+  unbounds [#1093](https://github.com/mudler/vllm.cpp/issues/1093) and
+  [#921](https://github.com/mudler/vllm.cpp/issues/921) on this seam; both
+  remain blocked on their own checkpoints and, for #921, on a per-phase adapter
+  STRENGTH that the seam deliberately does not carry.
 - **A real-checkpoint A2V render.** Gated on fixtures only. The artifacts exist
   now — `/usr/local/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/` holds the
   NVFP4 DiT, both video VAEs, the audio VAE, both upscalers and

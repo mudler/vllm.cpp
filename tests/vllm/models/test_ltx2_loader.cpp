@@ -2370,3 +2370,179 @@ TEST_CASE("ltx2 loader: an adapter that fuses into NOTHING refuses rather than l
   std::remove(dit_path.c_str());
   std::remove(lora_path.c_str());
 }
+
+// ─── LTX25-PHASE-LORA (#1118) ────────────────────────────────────────────────
+
+namespace {
+
+// Every bound view of `a` against `b`, byte for byte. Returns the number of
+// views that DIFFER, so a caller can assert both directions and neither
+// assertion is vacuous.
+//
+// Byte-for-byte and not a tolerance: the claim `Ltx2RebindDitLoras` makes is
+// that a rebound checkpoint is INDISTINGUISHABLE from one the loader produced,
+// and a tolerance would pass an implementation that reconstructs the base by
+// subtracting the delta — which is the wrong implementation this case exists to
+// catch.
+int64_t ViewsDiffering(const vllm::Ltx2DitCheckpoint& a, const vllm::Ltx2DitCheckpoint& b) {
+  REQUIRE(a.views.size() == b.views.size());
+  int64_t differing = 0;
+  for (const auto& kv : a.views) {
+    const auto it = b.views.find(kv.first);
+    REQUIRE(it != b.views.end());
+    const vt::Tensor& x = kv.second;
+    const vt::Tensor& y = it->second;
+    REQUIRE(x.dtype == y.dtype);
+    REQUIRE(x.Numel() == y.Numel());
+    const size_t bytes = static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype);
+    if (std::memcmp(x.data, y.data, bytes) != 0) ++differing;
+  }
+  return differing;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 loader: a phase rebind reproduces the load BYTE-FOR-BYTE in both directions") {
+  // THE EXACTNESS CLAIM of row LTX25-PHASE-LORA (#1118), made executable.
+  //
+  // Upstream gives each `DiffusionStage` its own adapter set by building a
+  // SECOND stage from the same checkpoint (ic_lora.py:104 and :115). This port
+  // holds one DiT and moves it between the two states, so the thing that has to
+  // be proved is that "moved back" and "loaded that way" are the same bytes —
+  // otherwise the seam buys per-phase adapters at the cost of a silent numeric
+  // drift, which is the trade this row rejected when it rejected unfused runtime
+  // LoRA.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string dit_path = TmpPath("rebind_dit");
+  WriteSafetensors(syn.entries, dit_path);
+
+  const std::string target = "transformer_blocks.0.attn1.to_q.weight";
+  const std::string lora_path = WriteLoraFor(p, target, kLoraScale, TmpPath("rebind_lora"));
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+
+  vllm::Ltx2DitLoadOptions options;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  spec.strength = 1.0;
+  options.loras.push_back(spec);
+
+  // The two REFERENCE images, each produced by the loader itself.
+  const vllm::Ltx2DitCheckpoint plain = vllm::Ltx2LoadDitFromSafetensors(file);
+  const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  REQUIRE(plain.lora_fused_tensors == 0);
+  REQUIRE(fused.lora_fused_tensors == 1);
+  // The instrument is armed: the two references genuinely differ, in exactly the
+  // one tensor the adapter targets. Without this line every equality below could
+  // pass on a checkpoint where the adapter did nothing.
+  REQUIRE(ViewsDiffering(plain, fused) == 1);
+
+  // The one under test, loaded FUSED exactly as `Ltx2VideoEngine::Load` loads it.
+  vllm::Ltx2DitCheckpoint live = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  REQUIRE(live.lora_fused_tensors == 1);
+  // The pointer the bound weights read through. `Ltx2DitWeights` is a pure view
+  // struct, so a rebind that reallocated would leave `live.weights` dangling and
+  // every forward would read freed memory. Captured before, checked after.
+  const void* const target_before = live.views.at(target).data;
+
+  SUBCASE("rebound OFF, it is the checkpoint the loader builds with no adapter") {
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/false, live);
+    CHECK(live.lora_fused_tensors == 0);
+    CHECK(live.views.at(target).data == target_before);
+    // The whole claim, in one number: nothing distinguishes it from `plain`.
+    CHECK(ViewsDiffering(live, plain) == 0);
+    // And it really moved — this is what fails if the rebind quietly did nothing.
+    CHECK(ViewsDiffering(live, fused) == 1);
+  }
+
+  SUBCASE("rebound OFF then ON, it is the checkpoint the loader builds WITH the adapter") {
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/false, live);
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/true, live);
+    CHECK(live.lora_fused_tensors == 1);
+    CHECK(live.views.at(target).data == target_before);
+    // THE ROUND TRIP. An implementation that reconstructed the base by
+    // SUBTRACTING the delta would land here at
+    // `round_bf16(round_bf16(W + d) - d) + d`, which is not `round_bf16(W + d)`
+    // for every element, and this line is what tells the two apart.
+    CHECK(ViewsDiffering(live, fused) == 0);
+    CHECK(ViewsDiffering(live, plain) == 1);
+  }
+
+  SUBCASE("a rebind to the state it is already in changes nothing") {
+    // The no-op a one-stage recipe and every recipe predating the phase field
+    // relies on: they never ask for a different set, and they must not pay a
+    // re-materialization to be told so.
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/true, live);
+    CHECK(live.lora_fused_tensors == 1);
+    CHECK(ViewsDiffering(live, fused) == 0);
+  }
+
+  SUBCASE("a queue for a HOST checkpoint refuses by name") {
+    // The two address spaces. Guessing which one a view points at is how a
+    // rebind would corrupt weights silently instead of refusing.
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    std::string what;
+    try {
+      vllm::Ltx2RebindDitLoras(&queue, file, options, /*fuse=*/false, live);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    INFO("what: ", what);
+    CHECK(what.find("a queue for a HOST-resident checkpoint") != std::string::npos);
+    // It refused BEFORE touching anything.
+    CHECK(live.lora_fused_tensors == 1);
+    CHECK(ViewsDiffering(live, fused) == 0);
+  }
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}
+
+TEST_CASE("ltx2 loader: a rebind of a WIDENED checkpoint fuses in bf16 and stores f32") {
+  // The host arm the CPU parity forward actually runs: `widen_to_f32` is set
+  // whenever the engine is off-device (`ltx2_video.cpp`), so the bound view is
+  // an f32 copy while `MaterializeDitTensor` still returns bf16. If the rebind
+  // widened BEFORE fusing it would accumulate the delta in f32 and quietly undo
+  // the accumulator dtype `ltx2_lora.h` pins — which no token gate and no
+  // golden could see, because the numbers would still be finite and close.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string dit_path = TmpPath("rebind_wide_dit");
+  WriteSafetensors(syn.entries, dit_path);
+
+  const std::string target = "transformer_blocks.0.attn1.to_q.weight";
+  const std::string lora_path = WriteLoraFor(p, target, kLoraScale, TmpPath("rebind_wide_lora"));
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+
+  vllm::Ltx2DitLoadOptions options;
+  options.widen_to_f32 = true;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  spec.strength = 1.0;
+  options.loras.push_back(spec);
+
+  vllm::Ltx2DitLoadOptions plain_options;
+  plain_options.widen_to_f32 = true;
+
+  const vllm::Ltx2DitCheckpoint plain = vllm::Ltx2LoadDitFromSafetensors(file, plain_options);
+  const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  REQUIRE(plain.views.at(target).dtype == vt::DType::kF32);
+  REQUIRE(ViewsDiffering(plain, fused) == 1);
+
+  vllm::Ltx2DitCheckpoint live = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  const void* const target_before = live.views.at(target).data;
+
+  vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/false, live);
+  CHECK(live.views.at(target).data == target_before);
+  CHECK(live.views.at(target).dtype == vt::DType::kF32);
+  CHECK(ViewsDiffering(live, plain) == 0);
+
+  vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/true, live);
+  CHECK(ViewsDiffering(live, fused) == 0);
+  CHECK(ViewsDiffering(live, plain) == 1);
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}

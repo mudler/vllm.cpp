@@ -72,11 +72,14 @@ labels at all. `class=train` and `gpu_model=GB10` do match. `rc run` has no
 `--idle-timeout`, `--max-runtime`, `--no-wait`, `--priority`, `--select` and
 `--timeout`.
 
-### What a leased worker can and cannot do, measured 2026-08-17
+### What the `dgx:gpu0` leased worker can and cannot do, measured 2026-08-17
 
 Probed with one `rc run -d dgx:gpu0 --max-runtime 2m` job
 (`ff28ada1-0cd3-4867-bf9b-f67050d0608b`). Verify this again before you plan work
-around it, because the worker image can change under you.
+around it, because the worker image can change under you. **It did change.** The
+`thor:gpu0` worker measured later the same day carries `python3` and `gcc`, which
+this list calls absent, so read this section as one box on one day. The `thor`
+reading is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
 
 - The command runs as user `rc` in a **k3s pod**, hostname `rc-worker-<id>`.
   `/.dockerenv` is absent and 8 `KUBERNETES_*` variables are set, so it is a pod
@@ -86,8 +89,11 @@ around it, because the worker image can change under you.
   `flock`, and **`/workspace`**.
 - **Absent: `gcc`, `cc`, `clang`, `nvcc`, `ninja`, `cmake`, `make`, `python3`,
   `python`, `pip`, `docker`, `sudo`, `git`, `ssh`, `curl`,
-  `/usr/include/stdio.h`, and any `/usr/local/cuda*` toolkit.** A worker cannot
-  compile, cannot start Python, and cannot install anything.
+  `/usr/include/stdio.h`, and any `/usr/local/cuda*` toolkit.** This `dgx:gpu0`
+  worker cannot compile, cannot start Python, and cannot install anything.
+  **Do not carry that clause to another device.** On `thor:gpu0` the same day the
+  worker ran as `uid=0(root)` with `/usr/bin/gcc`, `/usr/bin/python3` and a
+  working `apt-get` ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
 - **The host filesystem is not visible.** `/home/mudler` does not exist inside
   the worker.
 - `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,
@@ -109,8 +115,12 @@ lease carries bytes, and the exec bit is a mount option" below measures staged
 content starting under the dynamic loader and after a copy to `/tmp`, so what
 blocks the oracle is that nothing has put a runtime where a lease can see it.
 That is why recent GPU work reached for `ssh`, and the bypass is a symptom of
-this gap rather than a discipline problem. Do not design the migration here. The
-row that takes #1129 owns it.
+this gap rather than a discipline problem. Do not design the migration here.
+`ENV-LEASE-RUNTIME-STAGING` owns the design, and
+[`lease-runtime-staging.md`](specs/lease-runtime-staging.md) holds the working
+recipe. That recipe stages `torch` and `triton`, not the pinned oracle, and it
+ran on `thor:gpu0` and not here, so the sentence above still stands for
+`dgx.casa` today.
 
 **This confirms and extends a finding that already landed, rather than making a
 new one.** `.agents/specs/minimax-music3.md` §13.10 probed `thor`'s worker on
@@ -158,25 +168,78 @@ job's working directory `/` is not writable.
 
 **So the lease carries bytes, and bytes are enough to run.** A runtime staged on
 `/workspace` can start under the dynamic loader, or after a copy to `/tmp`. What
-the worker cannot do is produce or fetch that runtime, because it has no `curl`,
-`wget`, `git`, `gcc`, `nvcc`, `cmake` or `python3`. Present and useful for
-staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`.
+this `dgx:gpu0` worker cannot do is produce or fetch that runtime, because it has
+no `curl`, `wget`, `git`, `gcc`, `nvcc`, `cmake` or `python3`. Present and useful
+for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **The
+`thor:gpu0` worker does produce one**, because it is root and carries `apt-get`
+and `gcc`. That is the section below.
 
 **This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
 not close it.** The pinned oracle stays unreachable because its virtual
 environment lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx host, which
 no lease can see, and only a host-side actor reached over `ssh` can place a copy
-on the NAS. Whether that copy then starts is UNMEASURED. A CUDA virtual
-environment holds absolute paths in its shebangs and its `RECORD` files, so
-treat the relocation as an open question rather than a solved step.
+on the NAS. **Whether a relocated CUDA runtime then starts is no longer
+UNMEASURED. It starts, on `thor:gpu0`.** The section below has the reading. A
+CUDA virtual environment still holds absolute paths in its shebangs and its
+`RECORD` files, so a `pip install --target` tree is the shape that was measured
+and a copied venv is not.
 
 **Three fleet-side changes would each remove the staging problem, and none of
-them is ours to make.** Whoever owns the fleet picks one.
+them is ours to make.** Whoever owns the fleet picks one. **A fourth route was
+then measured, and it needs nobody's permission:** the `thor:gpu0` worker runs
+as root with a working `apt-get`, so a job provisions its own container.
 
 1. The worker image gains a toolchain and a Python interpreter.
 2. `rc run` gains an `--image` flag, so a job selects an image that has them.
 3. `/workspace` is mounted so that a file there can carry an exec bit. This one
    removes the copy step only, because the two routes above already execute.
+
+### A relocated CUDA runtime starts on `thor:gpu0`, measured 2026-08-17
+
+Probed with six `rc run` jobs on `thor:gpu0`: `6f4bdb03`, `9c0ebeac`, `8beba132`,
+`f60d945f`, `63c60a90` and `fd5654c0`. A `torch`, `triton` and `numpy` tree
+staged on `/workspace` imports, initializes CUDA, runs a bf16 matmul, and
+compiles and executes a Triton kernel. The job IDs in full, the staged-script
+sha256 values, the four walls and the working recipe are in
+[`lease-runtime-staging.md`](specs/lease-runtime-staging.md)
+([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
+
+```
+torch.__version__= 2.13.0+cu130      cuda available = True
+device 0         = NVIDIA Thor       capability     = (11, 0)
+triton.__version__ = 3.7.1           TRITON_JIT_OK  = 4096.0 PASS
+```
+
+The recipe, once per worker container:
+
+```sh
+apt-get update -qq && apt-get install -y -qq python3-dev
+mkdir -p /tmp/tp && cp -a /workspace/oracle-probe/site/triton /tmp/tp/
+chmod -R +x /tmp/tp/triton/backends/nvidia/bin/
+
+export PYTHONPATH=/tmp/tp:/workspace/oracle-probe/site
+export CPATH=/workspace/oracle-probe/pyhdr/python3.12:${CPATH:-}
+```
+
+**Read the scope before you quote it.** This is `thor:gpu0` at capability (11,0)
+and nothing else. The GB10 is `sm_121a` and is UNMEASURED, so nothing here
+licenses a claim about the Spark. Only `torch`, `triton` and `numpy` are staged,
+so the pinned vLLM oracle is still not shown to run: it is a source build with
+compiled extensions and it needs `nvcc`, which the worker lacks. The torch wheel
+is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`, and that
+skew is recorded as observed rather than adjudicated.
+
+**A prebuilt wheel does not remove the `nvcc` requirement, and that is measured.**
+An aarch64 vLLM wheel exists in general: `pip download --no-deps vllm` on the
+worker fetched `vllm-0.27.1-cp38-abi3-manylinux_2_28_aarch64.whl`, 307,180,998
+bytes. Our pin is not reachable that way, because
+`https://wheels.vllm.ai/nightly/vllm/` lists wheels for exactly ONE commit and is
+a moving pointer rather than an archive, and because the pin is a development
+version that is not on PyPI. Four 404s under a per-commit URL scheme were also
+seen, and they prove nothing, because that scheme was never confirmed against a
+known-good case. So reproducing the pinned oracle needs a source build or a
+deliberate pin advance. Nobody established that vLLM never retains per-commit
+wheels.
 
 ### The `flock` orphan hazard that motivated the replacement
 

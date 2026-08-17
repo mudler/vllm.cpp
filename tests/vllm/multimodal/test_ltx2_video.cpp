@@ -7342,3 +7342,125 @@ TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISS
     CHECK_THROWS((void)fixed->Generate(gen_fixed));
   }
 }
+
+// ─── LTX25-PHASE-LORA (#1118) ────────────────────────────────────────────────
+
+TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
+  // THE ROW, and the one case that separates a PER-PHASE adapter set from
+  // fusion at load. A gate that only asserted "a LoRA was applied" passes on the
+  // defect this row fixes, because the defect DOES apply the LoRA — to every
+  // phase.
+  //
+  // Upstream, read at Lightricks/LTX-2 fd4ded7f: two `DiffusionStage`s are built
+  // from the SAME `model_paths.transformer()` (a2vid_two_stage.py:104, :116) and
+  // differ only in their adapter tuple — stage 1 takes `loras=tuple(loras)`
+  // (`:107`) and stage 2 takes `(*tuple(loras), *tuple(distilled_lora))`
+  // (`:114`, passed at `:119`). `ltx-pipelines/CLAUDE.md:48` states the same
+  // convention in prose: the distilled adapter is "applied to stage 2 only in
+  // TI2Vid/A2Vid/Keyframe".
+  //
+  // ENTRY POINT: `LoadVideoEngine` with the documented `pipeline_kind`,
+  // `lora_path`, `lora_strength` and `max_phase` LOAD extras, then `Generate`.
+  // Nothing here constructs a recipe, a phase or a checkpoint by hand.
+  //
+  // WHY STRENGTH 0 IS THE CONTROL and not "no adapter": `requires_distilled_lora`
+  // refuses an a2vid load carrying no `lora_path` at all (upstream's
+  // `--distilled-lora required=True`, utils/args.py:1140-1153), so the base-
+  // weights arm has to be spelled some other way. Strength 0 fuses a ZERO delta,
+  // and that it reproduces the base model is already gated independently by
+  // "ltx2 video: the IC-LoRA strength reaches the PIXELS, and 0 is a no-op".
+  Workspace ws;
+  const std::string wav = WriteWav(ws.root + "/take.wav", 2, kFixtureAudioRate, 2.0);
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  // `max_phase` is a LOAD extra, so each arm is its own engine.
+  const auto render = [&](const char* strength, const char* max_phase, const char* out) {
+    vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = strength;
+    if (max_phase != nullptr) mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = max_phase;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    REQUIRE(engine != nullptr);
+    const std::string dir = std::string(ws.root) + "/" + out;
+    const vllm::multimodal::VideoResult result = engine->Generate(A2VidGen(dir, wav));
+    return A2VidArtifacts(dir, result);
+  };
+
+  // ── stage 1 ALONE, adapter at full strength against a zero delta ───────────
+  const std::string s1_full = render("1.0", "0", "s1_full");
+  const std::string s1_zero = render("0.0", "0", "s1_zero");
+  REQUIRE(s1_full.size() > 0);
+  REQUIRE(s1_full.size() == s1_zero.size());
+
+  size_t s1_differing = 0;
+  for (size_t i = 0; i < s1_full.size(); ++i) {
+    if (s1_full[i] != s1_zero[i]) ++s1_differing;
+  }
+  MESSAGE("stage 1 alone: the adapter moves " << s1_differing << " of " << s1_full.size()
+                                              << " artifact bytes");
+  // THE HALF THAT REDS ON TODAY'S DEFECT. Under fusion at load, stage 1 runs
+  // base + distilled and this count is non-zero. `loras=tuple(loras)` at
+  // `:107` names no distilled adapter, so stage 1 must be the base model and
+  // the adapter's strength must be invisible to it.
+  CHECK(s1_differing == 0);
+
+  // ── both stages, the same two strengths ───────────────────────────────────
+  const std::string both_full = render("1.0", nullptr, "both_full");
+  const std::string both_zero = render("0.0", nullptr, "both_zero");
+  REQUIRE(both_full.size() == both_zero.size());
+
+  size_t both_differing = 0;
+  for (size_t i = 0; i < both_full.size(); ++i) {
+    if (both_full[i] != both_zero[i]) ++both_differing;
+  }
+  MESSAGE("both stages: the adapter moves " << both_differing << " of " << both_full.size()
+                                            << " artifact bytes");
+  // THE HALF THAT REDS ON "STOPPED FUSING ALTOGETHER". `stage_2_loras` at `:114`
+  // DOES carry the distilled adapter, so it must reach the pixels through stage
+  // 2. Without this line the case above is satisfied by an engine that ignores
+  // `lora_path` entirely, which is the same shape of green-but-proves-nothing
+  // the row's spec rejects.
+  //
+  // Strictly greater than zero and no count floor above it: a count-based
+  // tolerance would bound nothing.
+  CHECK(both_differing > 0);
+
+  // ── and the two arms are not the same render ──────────────────────────────
+  // Stage 2 upsamples, so a stage-1-only artifact cannot equal a two-stage one.
+  // This is what proves `max_phase = 0` actually stopped after stage 1 rather
+  // than the whole comparison having run twice on the same pixels.
+  CHECK(s1_full != both_full);
+}
+
+TEST_CASE("ltx2 a2vid: the rebind leaves the DiT where the NEXT generation expects it") {
+  // A phase-scoped adapter mutates weights the engine keeps across calls, so the
+  // question load-time fusion never had to answer is whether generation N+1 sees
+  // what generation N left behind. `Ltx2RebindDitLoras` is driven from the TOP
+  // of the phase loop and keys off the checkpoint's own state, so every
+  // generation re-establishes stage 1's before it denoises anything.
+  //
+  // Rendered through the ABI twice on ONE engine, which is the shape a server
+  // runs and the shape no single-generation case can see.
+  Workspace ws;
+  const std::string wav = WriteWav(ws.root + "/take.wav", 2, kFixtureAudioRate, 2.0);
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(A2VidParams(ws.paths, lora));
+  REQUIRE(engine != nullptr);
+
+  const vllm::multimodal::VideoResult first =
+      engine->Generate(A2VidGen(ws.root + "/gen_a", wav));
+  const std::string a = A2VidArtifacts(ws.root + "/gen_a", first);
+  const vllm::multimodal::VideoResult second =
+      engine->Generate(A2VidGen(ws.root + "/gen_b", wav));
+  const std::string b = A2VidArtifacts(ws.root + "/gen_b", second);
+
+  REQUIRE(a.size() > 0);
+  // Same request, same seed, same engine: byte-identical. A rebind that left the
+  // DiT unfused after the first render would make the second render's stage 2
+  // run on base weights, and these would differ.
+  CHECK(a == b);
+}

@@ -92,6 +92,31 @@ inline bool ShouldInterleaveLoadStream(const ResidencyPolicy& policy,
   return marlin_committed && policy.release_host_weights_after_upload;
 }
 
+// The CUDA platform's residency policy, assembled from the values its registrar
+// probes. `src/vllm/platforms/cuda.cpp` calls this and supplies
+// `cudaMemGetInfo`'s `total`; it holds no policy of its own.
+//
+// A free function HERE, rather than a body inside that file, because that
+// translation unit compiles ONLY in a CUDA build. While the assembly lived there,
+// nothing on a host without a CUDA toolkit could reach it — no test, and no
+// mutation, which is why "delete the `device_memory_total_bytes` assignment" was
+// recorded as an owed mutation by #1123 instead of being proven. This header
+// compiles everywhere, so tests/vllm/platforms/test_platform.cpp pins the
+// assembly on every host and `cuda.cpp` is left holding only the probe it alone
+// can make (#1136). The probe itself is still not mutation-proven; a CUDA build
+// is the only thing that reaches the `cudaMemGetInfo` call.
+//
+// `device_memory_total_bytes` is 0 when the probe failed, which the load-time
+// GGUF fit refusal reads as UNKNOWN and never as "nothing fits".
+inline ResidencyPolicy CudaResidencyPolicy(size_t device_memory_total_bytes) {
+  ResidencyPolicy p;
+  p.release_host_weights_after_upload = true;  // freed after the Marlin build
+  p.uses_device_memory_pool = true;            // qwen3_5.cpp DevicePool
+  p.device_pool_cap_bytes = 0;                 // uncapped
+  p.device_memory_total_bytes = device_memory_total_bytes;
+  return p;
+}
+
 // The selection inputs of vllm/platforms/cuda.py::_get_backend_priorities @ pin
 // e24d1b24 (`use_mla`, `device_capability`, `num_heads`, `kv_cache_dtype`) plus
 // the sparse flag that `AttentionBackend.is_sparse()` /

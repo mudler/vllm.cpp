@@ -98,13 +98,16 @@ class CudaPlatform final : public Platform {
   //     GGUF fit refusal; nothing that read this struct before sees a change.
   // A discrete GPU sets different values (e.g. a pool cap) and NO model code is
   // touched — that is the item-2 additive win.
+  //
+  // The four assignments themselves live in `CudaResidencyPolicy`
+  // (`vllm/platforms/interface.h`), not here, because this translation unit
+  // compiles only in a CUDA build: while they were inline, nothing on a host
+  // without a CUDA toolkit could reach them, which is why #1123 had to record
+  // "delete the device_memory_total_bytes assignment" as an unproven mutation.
+  // test_platform.cpp now pins the assembly on every host (#1136). What stays
+  // CUDA-only here is the `cudaMemGetInfo` probe below and the value it threads.
   ResidencyPolicy residency_policy() const override {
-    ResidencyPolicy p;
-    p.release_host_weights_after_upload = true;   // freed after Marlin build (today)
-    p.uses_device_memory_pool = true;             // qwen3_5.cpp DevicePool
-    p.device_pool_cap_bytes = 0;                  // uncapped
-    p.device_memory_total_bytes = device_memory_total_bytes_;  // #1123
-    return p;
+    return CudaResidencyPolicy(device_memory_total_bytes_);
   }
 
   // Capability-ordered attention-backend priority — a faithful port of

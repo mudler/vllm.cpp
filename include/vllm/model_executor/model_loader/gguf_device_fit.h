@@ -1,7 +1,16 @@
-// vllm.cpp original. Pinned vLLM has no GGUF load format, so there is no
-// upstream counterpart to mirror; the closest upstream idea is the startup
-// memory profile (`vllm/v1/worker/gpu/model_runner.py:504,647`), which measures
-// the NON-weight footprint and is a different question from the one here.
+// vllm.cpp original. Pinned vLLM (555967922) has no GGUF load format — the whole
+// tree carries two incidental mentions of the word and no loader — so there is no
+// upstream counterpart to mirror.
+//
+// The closest upstream idea is the startup memory profile, and it answers a
+// different question. `GPUWorker.determine_available_memory`
+// (`vllm/v1/worker/gpu_worker.py:451-495`) runs `memory_profiling` around
+// `profile_run` (`vllm/v1/worker/gpu/model_runner.py:682`) and passes the weight
+// bytes IN as a known quantity, `weights_memory=model_memory_usage`
+// (`gpu_worker.py:493`). That quantity is recorded AFTER the load has finished
+// (`gpu/model_runner.py:315`). So upstream measures what is left once the weights
+// are resident; it never asks whether they will fit, because by then it has paid
+// for them. This file asks the question upstream does not.
 //
 // ENG-EXPERT-STREAM, issue #1123: a load-time answer to "can this device
 // actually hold this checkpoint's weights?".
@@ -28,8 +37,12 @@
 
 namespace vllm {
 
-// A bound on the device-resident weight bytes a weight-staging platform must
-// allocate for this GGUF, built to be WRONG LOW rather than wrong high.
+// A lower bound on the device-resident bytes a weight-staging platform must
+// allocate to stage EVERY TENSOR IN THIS FILE.
+//
+// Read that scope literally, because it is where the one over-count comes from: it
+// is NOT a lower bound on what a particular load stages, since a load may stage a
+// subset of the file. The per-tensor term is exact-or-low; the SET is exact-or-high.
 //
 // Per tensor the bound is `min(gguf_bytes, elems * model_dtype_bytes)`: a weight
 // the loader keeps quantized is staged verbatim (`gguf_bytes`), a weight it
@@ -41,22 +54,31 @@ namespace vllm {
 // Both directions of error are named here rather than claimed away, because a
 // bound whose error direction is unstated is not a bound.
 //
-//   * It can over-count, by including a tensor the loader never stages. The one
-//     such class in this tree is the MTP / `nextn` block, which is loaded only
-//     when a speculator is configured. Measured on the target checkpoint, that
-//     is block 92: 20 tensors, 8,940,488,704 of 397,245,341,184 bytes, so
-//     2.2506 %.
-//   * It under-counts by everything that is NOT a weight: KV cache,
+//   * It can OVER-count, by including a tensor the loader never stages. The one
+//     such class in this tree is the MTP / `nextn` block, which is attached only
+//     when a speculator is configured
+//     (`model_loader.cpp`, the `speculative_config->method == "mtp"` guard).
+//     Measured on the target checkpoint, that is block 92: 20 tensors,
+//     8,940,488,704 of 397,245,341,184 bytes, so 2.2506 %.
+//   * It UNDER-counts by everything that is NOT a weight: KV cache,
 //     activations, the device scratch pool and the driver context. That term is
 //     far larger than 2.2506 %.
 //
-// So the two errors point in opposite directions and the under-count dominates.
-// The refusal built on this therefore fires only well above the budget, never on
-// a marginal case, and the marginal cases stay owed to the startup memory
-// profile (`KV-WARMUP-PROFILE`) rather than being covered by an invented
-// headroom fraction here.
+// The two errors are on DIFFERENT quantities and do not cancel, so neither
+// rescues the other. In particular the refusal CAN over-refuse: a budget in
+// [what a default load stages, what this counts) rejects a weight set that fits.
+// On the target checkpoint that window is 8.33 GiB wide on a 369.96 GiB
+// checkpoint, `VT_DEVICE_WEIGHT_BUDGET_BYTES` is the operator's way out of it,
+// and `test_gguf_device_fit` pins the direction rather than leaving it described
+// (issue #1136). Closing it means teaching the bound which tensors THIS load will
+// stage, which is load policy and not a property of the file, so it is owed and
+// not invented here. The under-count is owed to the startup memory profile
+// (`KV-WARMUP-PROFILE`) for the same reason: an invented headroom fraction here
+// would be the guess this bound exists to avoid.
 struct GgufStagedFootprint {
-  // The bound, in bytes.
+  // The bound, in bytes. The name is accurate for what it measures — the sum of
+  // per-tensor lower bounds over the file's whole tensor table — and it is NOT a
+  // lower bound on one load's staging, for the reason above.
   size_t lower_bound_bytes = 0;
   // How many tensor records went into it. A caller that reports a footprint
   // without this cannot say how many things it examined.
@@ -107,9 +129,9 @@ struct DeviceWeightFit {
 //
 // Keyed on the MEASURED condition, never on "CUDA + GGUF" and never on an
 // architecture name, so a GGUF that genuinely fits the pool still loads.
-// Strictly greater than: a checkpoint that exactly equals the budget is not
-// refused here, because the bound is a lower bound and the equality case is not
-// evidence of anything.
+// Strictly greater than: a checkpoint whose footprint exactly equals the budget is
+// not refused here. The footprint is approximate in both directions, so equality is
+// not evidence of anything, and the tie goes to attempting the load.
 DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      std::string_view device_name,
                                      bool needs_weight_staging,

@@ -3561,13 +3561,24 @@ things it deliberately does not do:
 
 - it never fires on a platform that does not stage weights, so every
   `--device cpu` load is unchanged;
-- it never fires when no budget is known, and a budget is known today only on
-  CUDA (`cudaMemGetInfo`), so a discrete GPU, ROCm, Vulkan and Metal still get
-  the late allocation failure
-  ([#1126](https://github.com/mudler/vllm.cpp/issues/1126));
+- it never fires when no budget is known. Today exactly one platform stages
+  weights (CUDA) and exactly one probes a budget (CUDA, with `cudaMemGetInfo`),
+  so **every NVIDIA GPU this build runs on — discrete or GB10 — gets both the
+  probe and the refusal**, while ROCm, Vulkan and Metal answer
+  `needs_weight_staging() == false`: they read the GGUF mapping where it already
+  lies, so there is no staging allocation to fail and nothing for this check to
+  decide. What is owed there is the `Backend::DeviceMemoryInfo` probe CUDA does
+  not implement ([#1126](https://github.com/mudler/vllm.cpp/issues/1126)), which
+  is a different capability;
 - it counts **weights only**. The KV cache, activations, scratch pools and the
   driver context are not in the bound, so a checkpoint just under the pool
-  passes this check and can still fail later.
+  passes this check and can still fail later;
+- it can also count a little **too much**: a tensor present in the file that this
+  load will not stage — the MTP / `nextn` block on a load with no speculator, 8.33
+  GiB of the measured 369.96 GiB checkpoint — is still in the sum, so a budget in
+  that narrow window refuses a weight set that would have fitted. Raise
+  `VT_DEVICE_WEIGHT_BUDGET_BYTES` if you land in it
+  ([#1136](https://github.com/mudler/vllm.cpp/issues/1136)).
 
 `VT_DEVICE_WEIGHT_BUDGET_BYTES` moves the budget: lower it when something else
 lives in the pool, or raise it (or set `0`) to suppress the refusal and get the

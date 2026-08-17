@@ -22,6 +22,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,9 +57,30 @@ class HostBackend final : public vt::Backend {
   void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
     std::memcpy(dst, src, bytes);
   }
+  // "A platform can be registered while CreateQueue still fails" is the reason
+  // `SelectQueueForModel`'s AUTO arm wraps this call in a try/catch and falls
+  // back to CPU (`ResolveAutoDevice`, `model_loader.cpp:100-115`). This flag
+  // reproduces that box on a
+  // host with no CUDA device, so the resolver the fit refusal reads can be
+  // checked against the queue the load will actually run on. A flag rather than
+  // a second backend, because the registry is global and process-wide: a second
+  // registration would leak into the other cases in this file.
+  bool create_queue_throws = false;
   vt::Queue CreateQueue() override {
+    if (create_queue_throws) {
+      throw std::runtime_error("fake backend: no usable device");
+    }
+    ++queues_created;
     return vt::Queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
   }
+  // Counted so a case can prove the resolver ATTEMPTED a queue rather than
+  // merely returning the same answer for another reason, and that it handed the
+  // probe queue back. `vt::Queue` is a non-owning handle with no destructor, so a
+  // resolver that dropped the value would leak the stream and nothing would say
+  // so; these two counters are what makes that observable on a fake backend.
+  int queues_created = 0;
+  int queues_destroyed = 0;
+  void DestroyQueue(vt::Queue&) override { ++queues_destroyed; }
   bool UnifiedMemory() const override { return true; }
 };
 
@@ -139,7 +161,7 @@ std::string BuildSyntheticMoeGguf() {
   b.AddKv(U32Kv("qwen35moe.full_attention_interval", 4));
   b.AddKv(U32Kv("qwen35moe.context_length", 256));
   // Both of these are REQUIRED by HfConfigFromGguf (`ReqFloat`,
-  // qwen3_5_gguf_weights.cpp:843-845), which runs BEFORE the fit check. Omitting
+  // qwen3_5_gguf_weights.cpp:843-847), which runs BEFORE the fit check. Omitting
   // them made the load throw "missing metadata key" during the config parse and
   // the refusing case never reached the check at all — caught because the case
   // asserted the MESSAGE rather than merely that something threw.
@@ -213,6 +235,65 @@ TEST_CASE("device fit: a GGUF that FITS the budget is let through to the next st
   // this file passed while the config parse was throwing.
   REQUIRE_FALSE(message.empty());
   CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  CHECK(message.find("HOST-ONLY") == std::string::npos);
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+// --- The AUTO arm: the refusal must name the device the load will RUN on ------
+//
+// `SelectQueueForModel`'s auto arm falls back to CPU when `CreateQueue()` throws,
+// and its own comment says why: "a platform can be registered while CreateQueue
+// still fails, and CPU must remain reachable". A resolver that only asked
+// `CurrentPlatform()` answered `kCUDA` on such a box, so the fit refusal REFUSED
+// a checkpoint by naming a device nothing was going to run on — a load that
+// previously served on CPU. These two cases are the pair: the same file, the same
+// budget, the same platform, differing only in whether the queue can be created.
+TEST_CASE("device fit: the AUTO arm refuses when the accelerator queue CAN be created") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  Backend().create_queue_throws = false;
+  const int created_before = Backend().queues_created;
+  const int destroyed_before = Backend().queues_destroyed;
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kStagedLowerBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kAuto);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  // The POSITIVE control for the case below. Without it, "no refusal" there could
+  // mean the auto arm never selects the fake platform at all, and the pair would
+  // prove nothing.
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find("HOST-ONLY") != std::string::npos);
+  // The resolution went through an ATTEMPTED queue rather than a bare platform
+  // query, which is the only way it can agree with the queue selector.
+  CHECK(Backend().queues_created == created_before + 1);
+  // And it gave the probe queue back. The refusal throws before
+  // `SelectQueueForModel` runs, so this load creates exactly one queue and
+  // destroys exactly one: a resolver that leaked it reads 1 created, 0 destroyed.
+  CHECK(Backend().queues_destroyed == destroyed_before + 1);
+}
+
+TEST_CASE("device fit: the AUTO arm refuses NOTHING when the accelerator queue cannot be created") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  Backend().create_queue_throws = true;
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kStagedLowerBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kAuto);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Backend().create_queue_throws = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  // This load runs on CPU, and the CPU platform does not stage weights, so there
+  // is nothing to refuse. Asserting the LATER tokenizer error positively rather
+  // than merely the absence of the refusal: a case that only checked the absence
+  // would also pass if the loader had died earlier for an unrelated reason.
   CHECK(message.find("cannot serve this GGUF") == std::string::npos);
   CHECK(message.find("HOST-ONLY") == std::string::npos);
   CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);

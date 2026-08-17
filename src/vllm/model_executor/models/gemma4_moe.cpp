@@ -437,7 +437,15 @@ struct DevExpertLru {
 
   bool Enabled() { return BudgetBytes() > 0; }
 
-  // Free VRAM via Backend::DeviceMemoryInfo (ROCm/CUDA). No HIP in this TU.
+  // Free VRAM via Backend::DeviceMemoryInfo. No HIP in this TU.
+  //
+  // ROCm ONLY: `CudaBackend` does not override that seam, so this returns false on
+  // every CUDA device and `MakeRoom` below then refuses the device upload, which
+  // makes this whole cache dead on CUDA today. That is issue #1126, not an
+  // accident of this call site — the refuse-on-unknown polarity here is correct,
+  // because an Alloc without headroom has hung hipMalloc. This comment said
+  // "(ROCm/CUDA)" until #1123 measured it (the same false claim as the one on
+  // `vt::Backend::DeviceMemoryInfo` itself).
   static bool FreeBytes(Dev d, size_t* free_out) {
     *free_out = 0;
     size_t free_b = 0, tot_b = 0;

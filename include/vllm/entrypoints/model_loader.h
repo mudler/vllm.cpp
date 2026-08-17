@@ -199,14 +199,28 @@ struct EngineParams {
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device);
 
-// The device type `SelectQueueForModel` will pick, resolved WITHOUT creating a
-// queue. `SelectQueueForModel` itself calls this, so the two cannot drift.
+// The device type `SelectQueueForModel` will pick.
 //
 // It exists because the load-time GGUF device-fit refusal (issue #1123) has to
-// know the target device BEFORE any weight I/O, and the queue is not created
-// until after the weights are loaded. Throws for an explicitly named device that
-// this build/process cannot serve, exactly as the queue selector does; the auto
-// arm falls back to `kCPU` instead of throwing, also exactly as it does.
+// know the target device BEFORE any weight I/O, and the load's own queue is not
+// created until after the weights are loaded. Throws for an explicitly named
+// device that this build/process cannot serve, exactly as the queue selector
+// does; the auto arm falls back to `kCPU` instead of throwing, also exactly as it
+// does.
+//
+// The two agree because both arms run one implementation, and on the AUTO arm
+// that implementation CREATES A QUEUE and destroys it. #1136 measured why the
+// cheaper version was wrong: `SelectQueueForModel`'s auto arm falls back to CPU
+// when `CreateQueue()` throws, so a resolver that only asked `CurrentPlatform()`
+// answered `'cuda'` on a box where the load would run on CPU, and the fit refusal
+// then rejected a checkpoint by naming a device nothing was going to run on.
+//
+// The cost of agreeing is one extra stream created and destroyed, and it is bounded
+// by where this function is called: the load-time GGUF fit check is the only caller
+// outside `SelectQueueForModel` itself, so a safetensors load pays nothing, an
+// explicitly named device pays nothing (that arm creates no queue here), and an
+// auto-arm GGUF load pays one `CreateQueue`/`DestroyQueue` pair. That is not free,
+// and it is smaller than removing a working load.
 vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
                                       vllm::Device device);
 

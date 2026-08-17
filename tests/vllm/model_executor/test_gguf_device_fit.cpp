@@ -53,6 +53,25 @@ std::string BuildTwoTensorGguf() {
   return b.Build();
 }
 
+// The same file plus one tensor of the MTP / `nextn` block, which a DEFAULT load
+// never stages: the head is attached only under
+// `params.speculative_config.has_value() && method == "mtp"`
+// (`src/vllm/entrypoints/model_loader.cpp:1452-1453`), and the main model reads
+// `block_count - nextn_predict_layers` blocks
+// (`qwen3_5_gguf_weights.cpp:877-878`), so the head's blocks are outside its
+// range. The footprint counts it anyway, because it takes the whole tensor
+// table. A second Q8_0 block, so its staged term is min(34, 64) = 34.
+constexpr size_t kNextnStaged = 34;
+
+std::string BuildGgufWithUnstagedNextnBlock() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "llama"));
+  b.AddTensor("t_q8", {32}, /*ggml_type=*/8, Q8Block());
+  b.AddTensor("t_f32", {4, 2}, /*ggml_type=*/0, std::string(32, '\1'));
+  b.AddTensor("blk.1.nextn.eh_proj.weight", {32}, /*ggml_type=*/8, Q8Block());
+  return b.Build();
+}
+
 }  // namespace
 
 TEST_CASE("gguf_device_fit: the footprint takes min(on-disk, expanded) per tensor") {
@@ -83,6 +102,54 @@ TEST_CASE("gguf_device_fit: a wider model dtype cannot raise the on-disk term") 
       vllm::GgufStagedWeightFootprint(gguf, /*model_dtype_bytes=*/4);
   CHECK(fp.tensor_count == kExpectedTensors);
   CHECK(fp.lower_bound_bytes == 66);
+}
+
+// The bound's ONE over-count direction, made executable rather than only
+// described. Every other case in this file runs on a fixture whose tensors are
+// all staged, so the footprint there happens to EQUAL the true staged size and
+// the boundary cases cannot tell an exact quantity from an over-counted one.
+//
+// This case separates them. It exists because the spec and the commit body for
+// this change asserted the bound was a lower bound "so the refusal can never
+// over-refuse", which is false: a tensor counted and never staged is a positive
+// over-count, and one is present on every default load. On the measured
+// checkpoint that is the `nextn` block, 8,940,488,704 of 397,245,341,184 bytes
+// (2.2506 %). The two error directions are on DIFFERENT quantities and do not
+// cancel, so "the under-count dominates" does not rescue the claim. Recorded and
+// owned by issue #1136; the header states the direction, and this pins it.
+//
+// NOTE for whoever closes #1136 by teaching the bound which tensors this load will
+// stage: this case is SUPPOSED to go red then, and it is not an obstacle. It
+// characterises today's contract, so changing the contract means changing it here
+// too — deliberately, in the same commit, rather than discovering later that the
+// bound quietly stopped counting something.
+TEST_CASE("gguf_device_fit: a tensor the loader never stages is COUNTED, so the bound can over-refuse") {
+  TempFile f(BuildGgufWithUnstagedNextnBlock());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+  REQUIRE(gguf.Tensors().size() == kExpectedTensors + 1);
+
+  const vllm::GgufStagedFootprint fp = vllm::GgufStagedWeightFootprint(gguf);
+  CHECK(fp.tensor_count == kExpectedTensors + 1);
+  CHECK(fp.lower_bound_bytes == kExpectedLowerBound + kNextnStaged);
+
+  // The consequence at the boundary: a default load stages
+  // `kExpectedLowerBound` bytes, the predicate compares
+  // `kExpectedLowerBound + kNextnStaged`, and every budget in between refuses a
+  // weight set that fits. Both ends of that window are asserted, so a change
+  // that narrowed or widened the over-count moves this case.
+  for (const size_t budget :
+       {kExpectedLowerBound, kExpectedLowerBound + kNextnStaged - 1}) {
+    CAPTURE(budget);
+    const vllm::DeviceWeightFit fit =
+        vllm::CheckDeviceWeightFit(gguf, "cuda", true, budget);
+    CHECK(fit.refuse);
+    CHECK(fit.needed_bytes == kExpectedLowerBound + kNextnStaged);
+  }
+  // At the counted total it does not refuse, which pins the over-count to
+  // exactly this tensor and nothing more.
+  const vllm::DeviceWeightFit ok = vllm::CheckDeviceWeightFit(
+      gguf, "cuda", true, kExpectedLowerBound + kNextnStaged);
+  CHECK_FALSE(ok.refuse);
 }
 
 TEST_CASE("gguf_device_fit: a non-staging platform is never refused, at any budget") {

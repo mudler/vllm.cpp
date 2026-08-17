@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -78,6 +79,41 @@ vt::DeviceType AutoAcceleratorDeviceType(std::string_view architecture) {
   return vt::DeviceType::kCPU;
 }
 
+// The AUTO arm, resolved by ATTEMPTING the queue. One implementation, so
+// `ResolveModelDeviceType` and `SelectQueueForModel` cannot answer differently.
+//
+// Asking `CurrentPlatform()` alone is not enough, and #1136 measured why. This
+// arm has always fallen back to CPU when `CreateQueue()` throws — "a platform can
+// be registered while CreateQueue still fails, and CPU must remain reachable" —
+// so on such a box a platform query answers `kCUDA` while the load runs on the
+// CPU queue. The load-time device-fit refusal reads the query, and it therefore
+// refused a checkpoint by naming a device nothing was going to run on, removing a
+// load that previously served on CPU. Whether `CreateQueue()` fails is knowable
+// only by calling it, so it is called here, once, and the queue goes to whichever
+// caller wants one.
+struct AutoDeviceResolution {
+  vt::DeviceType device = vt::DeviceType::kCPU;
+  // Set exactly when `device != kCPU`: the queue whose creation PROVED it.
+  std::optional<vt::Queue> queue;
+};
+
+AutoDeviceResolution ResolveAutoDevice(std::string_view architecture) {
+  AutoDeviceResolution out;
+  try {
+    const vt::DeviceType dev = AutoAcceleratorDeviceType(architecture);
+    if (dev != vt::DeviceType::kCPU) {
+      // Order matters: `device` is set only AFTER the queue exists, so a throw
+      // leaves the CPU answer rather than a device nothing can serve.
+      vt::Queue q = vt::GetBackend(dev).CreateQueue();
+      out.queue = q;
+      out.device = dev;
+    }
+  } catch (const std::exception&) {
+    // No usable accelerator; CPU, which is what this arm has always returned.
+  }
+  return out;
+}
+
 }  // namespace
 
 vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
@@ -92,11 +128,21 @@ vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
                     ? std::nullopt
                     : std::optional{named_platform->device_type()});
   }
-  try {
-    return AutoAcceleratorDeviceType(architecture);
-  } catch (const std::exception&) {
-    return vt::DeviceType::kCPU;  // no usable accelerator
-  }
+  AutoDeviceResolution resolved = ResolveAutoDevice(architecture);
+  // The queue was created only to learn whether it CAN be created. `vt::Queue` is
+  // a NON-OWNING handle (a raw `cudaStream_t`) with no destructor, so dropping the
+  // value would leak the stream.
+  //
+  // Through the FREE `vt::DestroyQueue`, not `Backend::DestroyQueue`: that is what
+  // this file's only other queue teardown does (`load_queue`, below), it is what
+  // `vt/backend.h` asks of new code so device index and queue cleanup are never
+  // ambient, and it adds the `Synchronize` and the handle/id clearing the method
+  // does not. The CREATE side deliberately stays `GetBackend(...).CreateQueue()`,
+  // because that is the call this arm has always made and switching it would move
+  // the production queue-selection path onto the drop-in resource ABI — a
+  // behaviour change, which this repair is not.
+  if (resolved.queue.has_value()) vt::DestroyQueue(*resolved.queue);
+  return resolved.device;
 }
 
 vt::Queue SelectQueueForModel(std::string_view architecture,
@@ -121,19 +167,14 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
   // the single line that stood between the Metal backend and running a model.
   // It now asks the PLATFORM seam, which is the tree's own answer to "which
   // device is this process running on": CurrentPlatform() walks
-  // {kCUDA, kXPU, kVULKAN, kMETAL, kCPU} and returns the first whose backend
-  // actually probed a device (src/vllm/platforms/platform.cpp:38-40), so on a
-  // CUDA box this selects EXACTLY the queue the old code did, byte for byte,
-  // and on the M4 it selects Metal. The try/catch stays: a platform can be
+  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU} and returns the
+  // first whose backend actually probed a device
+  // (src/vllm/platforms/platform.cpp:91-98), so on a CUDA box this selects
+  // EXACTLY the queue the old code did, byte for byte, and on the M4 it selects
+  // Metal. The try/catch stays, now inside `ResolveAutoDevice`: a platform can be
   // registered while CreateQueue still fails, and CPU must remain reachable.
-  try {
-    const vt::DeviceType dev = AutoAcceleratorDeviceType(architecture);
-    if (dev != vt::DeviceType::kCPU) {
-      return vt::GetBackend(dev).CreateQueue();
-    }
-  } catch (const std::exception&) {
-    // No usable accelerator; fall through to CPU.
-  }
+  AutoDeviceResolution resolved = ResolveAutoDevice(architecture);
+  if (resolved.queue.has_value()) return *resolved.queue;
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 

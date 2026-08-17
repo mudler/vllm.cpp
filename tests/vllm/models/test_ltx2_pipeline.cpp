@@ -3329,3 +3329,191 @@ TEST_CASE("ltx2 the res2s_two_stage recipe is upstream's HQ preset") {
     CHECK(Mentions(message, version));
   }
 }
+
+// ─── LTX25-A2VID-RECIPE (#1117) ──────────────────────────────────────────────
+
+TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled one") {
+  // EVERY FIELD HERE RENDERS WHETHER IT IS RIGHT OR WRONG. A wrong sigma set, a
+  // wrong downscale, a wrong stepper and a wrong guider all produce a finished
+  // clip of the right size, frame count and sample rate, so each is asserted
+  // against its own upstream anchor rather than against a neighbouring recipe.
+  const vllm::Ltx2PipelineRecipe a2v =
+      vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe one = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(a2v.phases.size() == 2u);
+
+  // ── stage 1 (a2vid_two_stage.py:225-258) ──────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s1 = a2v.phases[0];
+  CHECK(s1.name == "stage_1");
+  // `width // 2, height // 2` (:206-212), which is also what makes
+  // `assert_resolution(is_two_stage=True)` (:168) the 64-divisor arm.
+  CHECK(s1.spatial_downscale == 2);
+  CHECK(a2v.max_spatial_downscale() == 2);
+  CHECK(s1.input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+  // `self._scheduler.execute(steps=num_inference_steps)` (:225-227): DERIVED at
+  // run time. The distilled recipe's stage 1 carries a frozen 9-sigma list, and
+  // handing that to a full model that was never distilled is the difference
+  // between 30 steps and 8 on the 2.5 row resolved above — LTX_2_3_PARAMS sets
+  // num_inference_steps=30 (utils/constants.py:85) and 2.4, which 2.5 resolves
+  // onto, inherits it (:124). 40 is 2.0's own default (:47), not this row's.
+  CHECK(s1.sigmas.empty());
+  CHECK(s1.use_official_sigma_schedule);
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control for that claim
+  // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :247-250
+  // sets none. #1013: at 0.0 the state stays as `create_initial_state` wrote it,
+  // which with no initial latent is all zeros, and a zero-initialised denoise
+  // still returns a finite clip.
+  CHECK(s1.noise_scale == 1.0);
+  // `:229-258` passes no `stepper`, so `EulerDiffusionStep()` applies
+  // (utils/blocks.py:526-527). The neighbouring distilled recipe selects the
+  // ANCESTRAL stepper on this very generation (distilled.py:76-84), which
+  // reaches a2vid through nothing, so the two are asserted side by side.
+  CHECK(s1.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(s1.stepper_eta == 0.0);
+  CHECK(s1.noise_seed_offset == 0);
+  // `MultiModalGuider(params=video_guider_params, ...)` (:233-236), whose six
+  // fields are the params table's video row through the CLI defaults
+  // (utils/args.py:947-1006). Asserted against `one_stage`'s phase, which is
+  // built from the same row, so a change to the table moves both.
+  CHECK(s1.video_guidance.cfg_scale == one.phases[0].video_guidance.cfg_scale);
+  CHECK(s1.video_guidance.stg_scale == one.phases[0].video_guidance.stg_scale);
+  CHECK(s1.video_guidance.rescale_scale == one.phases[0].video_guidance.rescale_scale);
+  CHECK(s1.video_guidance.modality_scale == one.phases[0].video_guidance.modality_scale);
+  CHECK(s1.video_guidance.stg_blocks == one.phases[0].video_guidance.stg_blocks);
+  // ...and the values themselves, so this case still says which arm it is on if
+  // both recipes were changed together. `rescale_scale = 0.7` is what makes the
+  // x0-space question live (guiders.py:268-271).
+  CHECK(s1.video_guidance.cfg_scale == 3.0);
+  CHECK(s1.video_guidance.stg_scale == 1.0);
+  CHECK(s1.video_guidance.rescale_scale == 0.7);
+  CHECK(s1.video_guidance.modality_scale == 3.0);
+
+  // THE AUDIO GUIDER IS THE DEFAULT ONE (:237-239) AND NOT THE TABLE'S ROW, and
+  // this is the field a reader is most likely to "fix" by symmetry with
+  // `OneStagePhase`, which takes the table's row and is right to
+  // (ti2vid_one_stage.py:215-218). A2Vid's audio stream is FROZEN, so the
+  // table's cfg 7.0 would buy an unconditional forward and a negative text
+  // encode for a delta multiplied into a latent the sampler cannot move.
+  CHECK(s1.audio_guidance.cfg_scale == 1.0);
+  CHECK(s1.audio_guidance.stg_scale == 0.0);
+  CHECK(s1.audio_guidance.rescale_scale == 0.0);
+  CHECK(s1.audio_guidance.modality_scale == 1.0);
+  CHECK(s1.audio_guidance.stg_blocks.empty());
+  CHECK_FALSE(s1.audio_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s1.audio_guidance.DoPerturbedGeneration());
+  CHECK_FALSE(s1.audio_guidance.DoIsolatedModalityGeneration());
+  // The control: `one_stage` DOES take the table's audio row, so the assertions
+  // above are not passing because every recipe carries defaults.
+  CHECK(one.phases[0].audio_guidance.cfg_scale == 7.0);
+  // The CLI passes six video guider fields per request (:353-360).
+  CHECK(s1.allow_guidance_override);
+
+  // ── stage 2 (a2vid_two_stage.py:277-297) ──────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s2 = a2v.phases[1];
+  CHECK(s2.name == "stage_2");
+  CHECK(s2.spatial_downscale == 1);
+  // `self.upsampler(video_state.latent[:1])` (:261).
+  CHECK(s2.input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (:164) — byte for
+  // byte the distilled recipe's stage 2, which is the ONE thing the two share.
+  CHECK(s2.sigmas == distilled.phases[1].sigmas);
+  CHECK_FALSE(s2.use_official_sigma_schedule);
+  // `noise_scale=stage_2_sigmas[0].item()` (:288).
+  REQUIRE_FALSE(s2.sigmas.empty());
+  CHECK(s2.noise_scale == s2.sigmas.front());
+  CHECK(s2.stepper == vllm::Ltx2StepperKind::kEuler);
+  // `SimpleDenoiser(v_context_p, a_context_p)` (:278) takes no params at all, so
+  // both guider fields stay at the positive-only defaults.
+  CHECK(s2.denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  CHECK(s1.denoiser == vllm::Ltx2PhaseDenoiser::kGuided);
+  // AND the override is ALLOWED here, which is the pair a boolean alone cannot
+  // express. The guider flags DO exist on this pipeline's parser (`:311` selects
+  // `default_2_stage_arg_parser`), so a request carrying one is legal — it just
+  // reaches stage 1 and nothing else (`:233-236`). Refusing would reject a
+  // request upstream accepts; applying would switch on guidance upstream's
+  // stage 2 does not run, and `kSimple` above is what stops that.
+  CHECK(s2.allow_guidance_override);
+  // The control on the OTHER polarity: `distilled.py` selects
+  // `default_2_stage_distilled_arg_parser` (utils/args.py:1188), which never adds
+  // the flags at all, so both of its phases REFUSE — and they are `kSimple` too,
+  // which is exactly why the refusal has to be tested before the skip.
+  CHECK_FALSE(distilled.phases[1].allow_guidance_override);
+  CHECK(distilled.phases[1].denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  CHECK_FALSE(s2.video_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s2.video_guidance.DoPerturbedGeneration());
+  CHECK_FALSE(s2.video_guidance.DoIsolatedModalityGeneration());
+
+  // ── the recipe (a2vid_two_stage.py:143-166, utils/args.py:1123-1128) ───────
+  CHECK(a2v.height == distilled.height);
+  CHECK(a2v.width == distilled.width);
+  CHECK(a2v.num_frames == distilled.num_frames);
+  CHECK(a2v.frame_rate == distilled.frame_rate);
+  CHECK(a2v.video_output_phase == 1);
+  CHECK(a2v.audio_output_phase == 1);
+  CHECK_FALSE(a2v.audio_only);
+  // Stage 1's schedule IS the step count (:226), so `--num-inference-steps` is
+  // honoured. The distilled recipe fixes both stages and refuses the override.
+  CHECK(a2v.allow_request_sigmas);
+  CHECK_FALSE(a2v.fixed_num_inference_steps);
+  CHECK(a2v.num_inference_steps == one.num_inference_steps);
+  CHECK_FALSE(distilled.allow_request_sigmas);  // the control
+  // `:146` takes a negative prompt and `:183` reads `ctx_n` into the video
+  // guider's `negative_context`; the distilled recipe has no negative half at
+  // all, so both polarities are exercised here.
+  CHECK(a2v.allow_negative_prompt);
+  CHECK(a2v.negative_prompt == one.negative_prompt);
+  CHECK_FALSE(a2v.negative_prompt.empty());
+  CHECK_FALSE(distilled.allow_negative_prompt);
+  CHECK_FALSE(a2v.allow_request_latents);
+  // `--audio-path` (:312-317) and `--distilled-lora` (utils/args.py:1140-1153)
+  // are BOTH `required=True`, and neither has a value this port can invent.
+  CHECK(a2v.requires_audio_input);
+  CHECK(a2v.requires_distilled_lora);
+  // The controls: no other recipe demands either, so a build that set the flags
+  // unconditionally is caught.
+  CHECK_FALSE(distilled.requires_audio_input);
+  CHECK_FALSE(distilled.requires_distilled_lora);
+  CHECK_FALSE(one.requires_audio_input);
+  CHECK_FALSE(one.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 a2vid: all four generations resolve and nothing else does") {
+  // FOUR ROWS, mirroring the `t2a_one_stage` rows one for one and for the same
+  // reason: `A2VidPipelineTwoStage` takes whatever `resolve_cli_params()` read
+  // off the checkpoint (a2vid_two_stage.py:311), exactly as
+  // `T2AOneStagePipeline` does at t2a_one_stage.py:178-179. There is no "which
+  // generations support audio-to-video" question upstream, so restricting these
+  // rows would be a local invention.
+  for (const char* version : {"2", "2.3", "2.4", "2.5"}) {
+    INFO("version = ", std::string(version));
+    CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", version));
+    const vllm::Ltx2PipelineRecipe r =
+        vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", version);
+    REQUIRE(r.phases.size() == 2u);
+    CHECK(r.requires_audio_input);
+    CHECK(r.requires_distilled_lora);
+    CHECK(r.phases[0].spatial_downscale == 2);
+    CHECK(r.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+  }
+  // The 2.4 and 2.5 rows take Lightricks' negative prompt and the older two take
+  // vLLM-Omni's, which is the split every other Lightricks-sourced row makes:
+  // the negative prompt travels with the GENERATION, not the pipeline.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5").negative_prompt !=
+        vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2").negative_prompt);
+
+  // A version the table does not carry is REFUSED by name, never defaulted onto
+  // a neighbouring generation's guidance scales.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.9"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", ""));
+  // ...and so is the near-miss spelling, which is what a reader who knows the
+  // upstream FILE name rather than the pipeline kind would type.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2v_two_stage", "2.5"));
+}

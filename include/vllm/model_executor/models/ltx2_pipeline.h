@@ -573,6 +573,35 @@ enum class Ltx2PhaseInputTransform { kInitial, kSpatialUpsample };
 // Row LTX25-RES2S-LOOP, issue #921. Spec .agents/specs/ltx25-res2s-loop.md.
 enum class Ltx2StepperKind { kEuler, kEulerAncestral, kRes2s };
 
+// Which denoiser upstream CONSTRUCTS for this phase — the two classes in
+// ltx-pipelines `utils/denoisers.py`. `kGuided` is `GuidedDenoiser`, built from
+// a `MultiModalGuider` per stream; `kSimple` is `SimpleDenoiser`, "single
+// transformer call, no guidance" (`utils/denoisers.py:3`).
+//
+// THIS DOES NOT GATE THE SEAM, and reading it as if it did is the mistake worth
+// naming here. `Ltx2GuidedDenoise` runs on EVERY phase, because a phase whose
+// recipe sets no guidance keeps `Ltx2MultiModalGuiderParams`'s own defaults and
+// those ARE `_POSITIVE_ONLY_GUIDER` (denoisers.py:25-28) — one pass, and a
+// `calculate` whose every term is zero, which is `SimpleDenoiser`'s output.
+// That equivalence is measured rather than argued; see
+// .agents/specs/ltx25-guided-video.md section 10.
+//
+// What it DOES decide is where a request's guider override lands, and it exists
+// because `allow_guidance_override` alone cannot express the a2vid case. That
+// field answers "does this pipeline's CLI carry the guider flags at all":
+// `distilled.py` selects `default_2_stage_distilled_arg_parser`
+// (utils/args.py:1188), which never adds them, so an override there names a knob
+// the pipeline has no surface for and is REFUSED. `a2vid_two_stage.py:311`
+// selects `default_2_stage_arg_parser` (utils/args.py:1123), which DOES carry
+// them (utils/args.py:947-1006, the six video-guider flags) — and they reach
+// stage 1's guider alone (`:233-236`),
+// because stage 2 constructs `SimpleDenoiser(v_context_p, a_context_p)`
+// (`:278`) and takes no params at all. So on that phase the flag is legal and
+// simply does not arrive. Neither value of a boolean says that: refusing would
+// reject a request upstream accepts, and applying would switch on guidance
+// upstream's stage 2 does not have.
+enum class Ltx2PhaseDenoiser { kGuided, kSimple };
+
 // LTXPhaseRecipe (ltx2_recipes.py:29-50).
 struct Ltx2PhaseRecipe {
   std::string name;
@@ -585,6 +614,10 @@ struct Ltx2PhaseRecipe {
   double noise_scale = 0.0;
   Ltx2PhaseInputTransform input_transform = Ltx2PhaseInputTransform::kInitial;
   bool allow_guidance_override = true;
+  // See `Ltx2PhaseDenoiser`. Read in exactly one place — where a request's
+  // guider overrides are applied — and only AFTER the refusal above, so no
+  // recipe that refuses an override can reach it.
+  Ltx2PhaseDenoiser denoiser = Ltx2PhaseDenoiser::kGuided;
   bool use_official_sigma_schedule = true;
   Ltx2StepperKind stepper = Ltx2StepperKind::kEuler;
   double stepper_eta = 0.0;
@@ -625,6 +658,38 @@ struct Ltx2PipelineRecipe {
   // "t2a_one_stage"` tests are four chances for one of them to be missed on the
   // next audio-only recipe. The recipe table is the one place that knows.
   bool audio_only = false;
+
+  // `A2VidPipelineTwoStage` (a2vid_two_stage.py:53). TRUE means a driving
+  // waveform is not optional: `--audio-path` is `required=True` (`:312-317`) and
+  // the whole pipeline is "denoise video AROUND this take", with the audio
+  // stream frozen at both stages (`:251-256`, `:291-296`).
+  //
+  // FLAGS ON THE RECIPE, not `pipeline_kind` string compares at the two call
+  // sites, for the reason `audio_only` gives above. The second one already has a
+  // second user waiting: `ti2vid_two_stages` (#1093) and
+  // `keyframe_interpolation` (#1096) both select a parser where
+  // `--distilled-lora` is `required=True` (utils/args.py:1140-1153).
+  //
+  // WITHOUT THE TAKE the render still finishes. It returns a clip of the right
+  // size, the right frame count and the right sample rate, with the soundtrack
+  // generated rather than supplied — which is the ordinary joint-generation
+  // behaviour and is indistinguishable from audio-to-video that ignored its
+  // input.
+  bool requires_audio_input = false;
+  // `--distilled-lora` is `required=True` on the two-stage parser this pipeline
+  // selects (utils/args.py:1140-1153, `default_2_stage_arg_parser` at `:1123`),
+  // and stage 2's three-sigma refinement (`:164`) is what that adapter was
+  // trained for. A recipe that fixes this flag cannot render on a checkpoint
+  // carrying no adapter without running a distilled schedule on undistilled
+  // weights.
+  //
+  // What this flag CANNOT express is upstream's placement:
+  // `stage_2_loras = (*loras, *distilled_lora)` (a2vid_two_stage.py:114) puts
+  // the adapter on stage 2 ALONE, against `loras=tuple(loras)` for stage 1
+  // (`:107`), and this engine fuses at load into one weight set. Owed by
+  // https://github.com/mudler/vllm.cpp/issues/1118 and recorded in
+  // .agents/specs/ltx25-a2vid-recipe.md section 4.4.
+  bool requires_distilled_lora = false;
 
   int64_t max_spatial_downscale() const;
 };
@@ -704,6 +769,21 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //                                  `use_keyframes_abs_pos_embedding`
 //   ("retake",             "2")    Lightricks retake.py:85,287,290-294,313-324
 //   ("retake",             "2.5")  same
+//   ("a2vid_two_stage",    "2")    Lightricks a2vid_two_stage.py:53,143 (row
+//   ("a2vid_two_stage",    "2.3")  LTX25-A2VID-RECIPE, #1117). Stage 1 denoises
+//   ("a2vid_two_stage",    "2.4")  VIDEO at half resolution, guided by the
+//   ("a2vid_two_stage",    "2.5")  params table's video row and a scheduler-
+//                                  DERIVED schedule (:225-227), with the audio
+//                                  stream frozen on the caller's own take
+//                                  (:251-256); stage 2 upsamples 2x and refines
+//                                  with STAGE_2_DISTILLED_SIGMAS and no guider
+//                                  at all (:277-297). It is NOT
+//                                  `distilled_two_stage` with a take attached:
+//                                  that recipe fixes both stages' sigmas, fixes
+//                                  its guidance, and samples stage 1 with the
+//                                  ANCESTRAL stepper on 2.5, where A2Vid passes
+//                                  no `stepper` and gets `EulerDiffusionStep()`
+//                                  (utils/blocks.py:526-527)
 //   ("t2a_one_stage",      "2")    Lightricks t2a_one_stage.py:43,109 (row
 //   ("t2a_one_stage",      "2.3")  LTX25-T2A-ONE-STAGE, #1005). The one_stage
 //   ("t2a_one_stage",      "2.4")  rows' own schedule with `audio_only` set:

@@ -384,7 +384,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 809 819 820 882 978 994 996 1087 1112 1217 1258 1300 1302
+// 809 819 820 882 978 994 1029 1120 1145 1250 1291 1333 1335
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -993,6 +993,39 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   im.model_version = RecipeVersionKey(version);
   im.pipeline_kind = VideoExtra(params.extras, kLtx2PipelineKindExtra, "distilled_two_stage");
   im.recipe = ResolveLtx2PipelineRecipe(im.pipeline_kind, im.model_version);
+  // ── the adapter a two-stage pipeline cannot run without (#1117) ───────────
+  //
+  // `--distilled-lora` is `required=True` on the parser `A2VidPipelineTwoStage`
+  // selects (utils/args.py:1140-1153, reached through `default_2_stage_arg_parser`
+  // at `:1123` from a2vid_two_stage.py:311), and the reason is what stage 2 is:
+  // a THREE-sigma refinement (`:164`) that only the distilled weights can
+  // complete. Run it on a checkpoint carrying no adapter and it returns a clip
+  // of the right size, the right frame count and the right sample rate.
+  //
+  // Keyed on `recipe.requires_distilled_lora` rather than on the kind STRING, so
+  // the next recipe off this parser inherits it — `ti2vid_two_stages` (#1093)
+  // and `keyframe_interpolation` (#1096) are both already waiting.
+  //
+  // WHAT THIS CANNOT MIRROR, and it is filed rather than left here:
+  // `stage_2_loras = (*loras, *distilled_lora)` (`:114`) puts the adapter on
+  // stage 2 ALONE, against `loras=tuple(loras)` for stage 1 (`:107`). This
+  // engine fuses at load into ONE weight set, so the adapter reaches both
+  // phases. Owed by https://github.com/mudler/vllm.cpp/issues/1118.
+  if (im.recipe.requires_distilled_lora &&
+      VideoExtra(params.extras, kLtx2LoraPathExtra).empty()) {
+    Fail("the '" + im.pipeline_kind +
+         "' pipeline needs a distilled LoRA and none was supplied. Upstream's "
+         "`--distilled-lora` is `required=True` on the parser this pipeline selects "
+         "(ltx-pipelines utils/args.py:1140-1153) and its stage 2 is a three-sigma "
+         "refinement (a2vid_two_stage.py:164) that the base weights were never distilled "
+         "for. Supply it through the '" +
+         std::string(kLtx2LoraPathExtra) +
+         "' load extra. Refused rather than rendered, because a distilled schedule on "
+         "undistilled weights returns a clip of the right size, frame count and sample rate. "
+         "NOTE the divergence this cannot express: upstream fuses that adapter into stage 2 "
+         "ALONE (a2vid_two_stage.py:114 against :107) and this engine fuses once at load, so "
+         "stage 1 sees it too — https://github.com/mudler/vllm.cpp/issues/1118.");
+  }
   im.max_phase = ExtraInt(params.extras, kLtx2MaxPhaseExtra, -1);
   if (im.max_phase >= static_cast<int64_t>(im.recipe.phases.size())) {
     Fail("the '" + std::string(kLtx2MaxPhaseExtra) + "' extra is " +
@@ -1563,6 +1596,16 @@ void ApplyGuidanceOverrides(const std::map<std::string, std::string>& extras,
     }
     return;
   }
+  // IGNORED, not refused, on a phase whose denoiser takes no params. This is
+  // `SimpleDenoiser` (utils/denoisers.py:3) and the a2vid stage 2 is the one
+  // phase in the table that reaches it: the flags exist on that pipeline's
+  // parser (a2vid_two_stage.py:311 -> utils/args.py:947-1006) and they reach
+  // stage 1's guider alone (`:233-236`), because stage 2 constructs
+  // `SimpleDenoiser(v_context_p, a_context_p)` (`:278`). Applying them here
+  // instead would switch on a guidance pass upstream's stage 2 does not run —
+  // and it would do it invisibly, since an extra forward changes no output
+  // shape, frame count or sample rate.
+  if (phase.denoiser == Ltx2PhaseDenoiser::kSimple) return;
   video->cfg_scale = ExtraDouble(extras, kLtx2VideoCfgScaleExtra, video->cfg_scale);
   video->stg_scale = ExtraDouble(extras, kLtx2VideoStgScaleExtra, video->stg_scale);
   video->rescale_scale = ExtraDouble(extras, kLtx2VideoRescaleScaleExtra, video->rescale_scale);
@@ -2468,6 +2511,31 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // already has through an encoder and a vocoder can only lose to it.
   Ltx2DecodedAudio a2v_source;
   const std::string a2v_audio_path = VideoExtra(gen.extras, kLtx2AudioPathExtra);
+  // REQUIRED on a recipe that says so (#1117). `--audio-path` is `required=True`
+  // (a2vid_two_stage.py:312-317), and the pipeline's whole shape is "denoise
+  // video AROUND this take": both stages freeze the audio stream on it
+  // (`:251-256`, `:291-296`) and the soundtrack handed back is the caller's own
+  // file (`:301-303`).
+  //
+  // Checked HERE and not at load, because `pipeline_kind` is a LOAD extra and
+  // `audio_path` is a per-generation one, so the question is only decidable once
+  // a request exists. Keyed on the recipe flag rather than on the kind string,
+  // for the reason `audio_only` gives in the header.
+  //
+  // WITHOUT THE TAKE THE RENDER STILL FINISHES. The audio stream is generated
+  // rather than supplied, which is ordinary joint generation, and the result is
+  // a clip of the right size with the right frame count and the right sample
+  // rate — indistinguishable from audio-to-video that ignored its input.
+  if (im.recipe.requires_audio_input && a2v_audio_path.empty()) {
+    Fail("the '" + im.pipeline_kind + "' pipeline is driven BY a waveform and no '" +
+         std::string(kLtx2AudioPathExtra) +
+         "' extra was supplied. Upstream's `--audio-path` is `required=True` "
+         "(ltx-pipelines a2vid_two_stage.py:312-317) and both of its stages freeze the audio "
+         "stream on the encoded take (`:251-256`, `:291-296`). Refused rather than rendered: "
+         "without it the soundtrack is GENERATED, and a generated one is a finished clip at the "
+         "right size, frame count and sample rate with nothing to show that the input was "
+         "ignored. Supply the take, or load with a `pipeline_kind` that generates audio.");
+  }
   if (!a2v_audio_path.empty()) {
     if (!im.has_audio_encoder) {
       Fail("'" + std::string(kLtx2AudioPathExtra) + "' names '" + a2v_audio_path +

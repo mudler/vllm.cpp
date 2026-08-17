@@ -6984,3 +6984,361 @@ TEST_CASE("ltx2 guided video: the refusals that would otherwise RENDER (#1092)")
     CHECK(t.video_first_denoised == t.video_first_cond);
   }
 }
+
+// ─── LTX25-A2VID-RECIPE (#1117) ──────────────────────────────────────────────
+
+namespace {
+
+// An `a2vid_two_stage` engine on the shipped fixture. Both load-side
+// requirements the recipe carries are met here: the spatial upsampler stage 2
+// needs (through `ConditioningParams`) and the distilled adapter upstream's
+// `--distilled-lora required=True` demands.
+vllm::multimodal::VideoModelParams A2VidParams(const ltx2_fixture::Paths& paths,
+                                               const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "a2vid_two_stage";
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+// The request. Two things beside the take, and each is a property of the FIXTURE
+// rather than of this row:
+//
+//   * `steps = 2`, because stage 1's schedule is DERIVED from the step count
+//     (a2vid_two_stage.py:225-227) and two sigma intervals exercise the loop.
+//     That this is accepted at all is part of what the case asserts — the
+//     distilled recipe refuses a `steps` override.
+//   * the STG block list, because the reduced DiT has TWO blocks and the params
+//     row this recipe resolves names block 28 — LTX_2_3_PARAMS overrides 2.0's
+//     [29] to [28] (utils/constants.py:86) and 2.4, the row 2.5 resolves onto,
+//     inherits it (:124). `OneStageFixtureGuidance` carries the whole
+//     argument; the override reaching stage 1 and being IGNORED by stage 2 is
+//     itself gated below.
+vllm::multimodal::VideoGenParams A2VidGen(const std::string& out_dir, const std::string& wav,
+                                          double start_time = 0.0) {
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.steps = 2;
+  OneStageFixtureGuidance(&gen);
+  gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+  if (start_time != 0.0) {
+    gen.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = std::to_string(start_time);
+  }
+  return gen;
+}
+
+// Every artifact a render wrote, concatenated. Downstream of the DiT weights and
+// of every guidance decision, which is what makes it able to see a pass that ran
+// on a phase the trace does not record.
+std::string A2VidArtifacts(const std::string& out_dir,
+                           const vllm::multimodal::VideoResult& result) {
+  std::string bytes;
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    bytes += ReadAll(out_dir + name);
+  }
+  bytes += ReadAll(std::string(result.audio_path));
+  return bytes;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 a2vid: the pipeline renders through vllm.h and CONSUMES its take") {
+  // THE REACHABILITY CLAIM, and it is the point of this case rather than a note
+  // beside it. Entry point: `LoadVideoEngine` with a documented value of the
+  // documented `pipeline_kind` LOAD extra, then `Generate` with the documented
+  // `audio_path` per-generation extra. Nothing here constructs a recipe, a
+  // guider, a phase or a modality by hand. Deleting the `a2vid_two_stage`
+  // dispatch row in `ResolveLtx2PipelineRecipe` REDs this case at the load,
+  // which is what separates measuring a capability from measuring a class
+  // (.agents/reachability.md).
+  //
+  // `ltx2-gen --pipeline-kind a2vid_two_stage --audio-path ...` is the same two
+  // calls through the ABI, as a thin client that includes no internal header.
+  // The `/v1/videos` route CANNOT drive it: `VideoGenParamsFromRequest` never
+  // writes `gen.extras` (#928), so no per-generation extra reaches any engine
+  // over HTTP. Stated here because the reach claim has to exclude it.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+  const std::string wav = WriteWav(ws.root + "/take.wav", 2, kFixtureAudioRate, 2.0);
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(A2VidParams(ws.paths, lora));
+  REQUIRE(engine != nullptr);
+  auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  CHECK(ltx->pipeline_kind() == "a2vid_two_stage");
+
+  const vllm::multimodal::VideoResult result = engine->Generate(A2VidGen(ws.root + "/a2v", wav));
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+  CHECK(result.frame_count == 9);
+  // Upstream returns the caller's own waveform rather than a VAE round trip of
+  // it (`:301-303`), and the observable consequence is the SAMPLE RATE: the
+  // vocoder's BWE arm emits 48 kHz where the take went in at the audio VAE's own
+  // rate.
+  CHECK(result.sample_rate == kFixtureAudioRate);
+
+  // ── the take was CONSUMED, not merely carried ─────────────────────────────
+  //
+  // A recipe-level assertion proves `noise_scale = 0.0` and `frozen = True` are
+  // SET. These four say the DiT saw the consequence, and they are read off the
+  // LAST phase — so stage 2's own `noise_scale` of 0.909375, which the loop
+  // applies to both streams, is inside what they measure.
+  CHECK(t.audio_conditioned);
+  CHECK_MESSAGE(t.audio_frozen,
+                "the audio denoise mask was not all zeros at the last phase, so the sampler was "
+                "free to move the caller's take (utils/types.py:104-106)");
+  CHECK_MESSAGE(t.audio_sigma_max == 0.0,
+                "the scalar `Modality.sigma` was left at the schedule's value on some step; the "
+                "zeroed mask cannot reach that input, and a DiT told its clean conditioning is "
+                "noisy still renders");
+  CHECK(t.audio_latent_absmax > 0.0);
+  CHECK(t.audio_latent_digest != 0);
+
+  // THE CONTROL THAT MAKES THOSE MEAN SOMETHING. Same take, same request, a
+  // DIFFERENT seed: the audio latent must be BIT-IDENTICAL, because it is the
+  // encoded file and not a sample. A build that noised the audio stream — or
+  // that generated it and let the take decorate the trace — moves this digest,
+  // and moves nothing a caller can see.
+  vllm::multimodal::VideoGenParams reseeded = A2VidGen(ws.root + "/a2v_seed", wav);
+  reseeded.seed = 99;
+  (void)engine->Generate(reseeded);
+  const vllm::multimodal::Ltx2ConditioningTrace t_seed = ltx->last_conditioning();
+  REQUIRE(t_seed.completed);
+  CHECK_MESSAGE(t_seed.audio_latent_digest == t.audio_latent_digest,
+                "the audio latent changed with the SEED, so it is being sampled rather than "
+                "taken from the caller's file");
+  // ...and the second control, so the first cannot be passing because the latent
+  // is a constant: a different WINDOW of the same file gives a different latent.
+  const vllm::multimodal::VideoResult windowed =
+      engine->Generate(A2VidGen(ws.root + "/a2v_window", wav, 0.5));
+  (void)windowed;
+  const vllm::multimodal::Ltx2ConditioningTrace t_window = ltx->last_conditioning();
+  REQUIRE(t_window.completed);
+  CHECK_MESSAGE(t_window.audio_latent_digest != t.audio_latent_digest,
+                "windowing the take 0.5s later produced the SAME latent, so the samples are not "
+                "reaching the encoder");
+
+  // ── stage 1 ran upstream's GUIDED denoiser, in x0 space, on every arm ──────
+  //
+  // The trace's guided fields are recorded at step 0 of phase 0, which is
+  // a2vid's stage 1. Its guider is the params table's video row — cfg 3.0,
+  // stg 1.0, rescale 0.7, modality 3.0 — so all four passes run and the rescale
+  // branch, the one term that is NOT invariant between the two spaces, is live.
+  REQUIRE_MESSAGE(t.video_guided, "stage 1 did not go through the guided seam at all");
+  CHECK(t.video_cond_forwards == 1);
+  CHECK(t.video_uncond_forwards == 1);
+  CHECK(t.video_perturbed_forwards == 1);
+  CHECK(t.video_modality_forwards == 1);
+  CHECK(t.video_guidance_cfg_scale == 3.0);
+  CHECK(t.video_guidance_stg_scale == 1.0);
+  CHECK(t.video_guidance_rescale_scale == 0.7);
+  CHECK(t.video_guidance_modality_scale == 3.0);
+
+  // AND STAGE 1'S SCHEDULE WAS DERIVED, not read off a frozen list.
+  // `schedule_tokens` is written only on the branch that calls
+  // `Ltx2SigmaSchedule`, and stays 0 on a recipe carrying its own distilled
+  // sigmas — which is the difference between upstream's
+  // `self._scheduler.execute(steps=num_inference_steps)` (a2vid_two_stage.py:225-227)
+  // and the eight-step distilled list. Without this the recipe case is the only
+  // thing that can see a stage 1 handed the wrong schedule, and a wrong schedule
+  // renders.
+  CHECK_MESSAGE(t.schedule_tokens > 0,
+                "stage 1 did not derive its schedule from the step count, so it is running a "
+                "frozen sigma list upstream does not give it");
+
+  const size_t n = t.video_first_latent.size();
+  REQUIRE(n > 0);
+  const size_t tokens = t.video_first_timesteps.size();
+  REQUIRE(tokens > 0);
+  const size_t width = n / tokens;
+  REQUIRE(width * tokens == n);
+  // THE FIXTURE CAN DECIDE THIS AT ALL: `latent - sigma*velocity` and `velocity`
+  // coincide when the sample is zero. A REQUIRE, because nothing below
+  // discriminates once it fails.
+  double latent_span = 0.0;
+  for (const float x : t.video_first_latent) {
+    latent_span = std::max(latent_span, std::abs(static_cast<double>(x)));
+  }
+  REQUIRE_MESSAGE(latent_span > 1e-3, "the step-0 sample is zero, so the two candidate tensors "
+                                      "coincide and nothing below discriminates");
+
+  struct Arm {
+    const char* name;
+    const std::vector<float>& velocity;
+    const std::vector<float>& x0;
+  };
+  const Arm arms[] = {
+      {"cond", t.video_first_cond_velocity, t.video_first_cond},
+      {"uncond", t.video_first_uncond_velocity, t.video_first_uncond},
+      {"perturbed", t.video_first_perturbed_velocity, t.video_first_perturbed},
+      {"modality", t.video_first_modality_velocity, t.video_first_modality},
+  };
+  for (const Arm& arm : arms) {
+    INFO("arm = " << std::string(arm.name));
+    REQUIRE(arm.velocity.size() == n);
+    REQUIRE(arm.x0.size() == n);
+    // A zeroed velocity makes `to_denoised` the identity on this arm alone and
+    // would satisfy the equation while proving nothing.
+    double velocity_span = 0.0;
+    for (const float x : arm.velocity) {
+      velocity_span = std::max(velocity_span, std::abs(static_cast<double>(x)));
+    }
+    REQUIRE_MESSAGE(velocity_span > 1e-6, "this arm's velocity is zero, so the equation below "
+                                          "holds for a reason that is not the one it tests");
+    // `x0 = latent - sigma_token * velocity` (model.py:590-604), with the
+    // PER-TOKEN timestep and not the schedule scalar.
+    double residual = 0.0;
+    double against_velocity = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double sigma = static_cast<double>(t.video_first_timesteps[i / width]);
+      const double expected = static_cast<double>(t.video_first_latent[i]) -
+                              sigma * static_cast<double>(arm.velocity[i]);
+      residual = std::max(residual, std::abs(static_cast<double>(arm.x0[i]) - expected));
+      against_velocity = std::max(
+          against_velocity,
+          std::abs(static_cast<double>(arm.x0[i]) - static_cast<double>(arm.velocity[i])));
+    }
+    INFO("max|x0 - (latent - sigma*v)| = " << residual);
+    INFO("max|x0 - velocity| = " << against_velocity);
+    // In VELOCITY space the first number is the whole sample and the second is
+    // exactly 0, which is what the RED prints.
+    CHECK(residual < 1e-4);
+    CHECK(against_velocity > 1e-6);
+  }
+}
+
+TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISSING") {
+  // Three refusals, and each one guards a configuration that would otherwise
+  // RENDER — a finished clip at the right size, frame count and sample rate,
+  // with nothing in any output to show what was dropped.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+  const std::string wav = WriteWav(ws.root + "/take.wav", 2, kFixtureAudioRate, 2.0);
+
+  // ── no distilled adapter, refused at LOAD (utils/args.py:1140-1153) ────────
+  {
+    vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
+    mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+    try {
+      const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+          vllm::multimodal::LoadVideoEngine(mp);
+      FAIL_CHECK("an a2vid load with no distilled LoRA must be refused");
+    } catch (const std::exception& e) {
+      const std::string message = e.what();
+      INFO("message = " << message);
+      CHECK(message.find("distilled LoRA") != std::string::npos);
+      CHECK(message.find("lora_path") != std::string::npos);
+      CHECK(message.find("args.py:1140-1153") != std::string::npos);
+      // The divergence this refusal cannot repair is named in the same breath,
+      // so a reader who hits it is told where it is tracked.
+      CHECK(message.find("1118") != std::string::npos);
+    }
+    // THE CONTROL: the same load on the DEFAULT kind is fine without an adapter,
+    // so this is the recipe's requirement and not a new global one.
+    vllm::multimodal::VideoModelParams distilled = ConditioningParams(ws.paths);
+    CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(distilled));
+  }
+
+  // ── no take, refused at GENERATE (a2vid_two_stage.py:312-317) ──────────────
+  {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(A2VidParams(ws.paths, lora));
+    vllm::multimodal::VideoGenParams gen = A2VidGen(ws.root + "/no_take", wav);
+    gen.extras.erase(vllm::multimodal::kLtx2AudioPathExtra);
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("an a2vid render with no audio_path must be refused");
+    } catch (const std::exception& e) {
+      const std::string message = e.what();
+      INFO("message = " << message);
+      CHECK(message.find("audio_path") != std::string::npos);
+      CHECK(message.find("a2vid_two_stage.py:312-317") != std::string::npos);
+      CHECK(message.find("GENERATED") != std::string::npos);
+    }
+    // THE CONTROL: the take is what the refusal is about, and supplying it on
+    // the same engine renders.
+    CHECK_NOTHROW((void)engine->Generate(A2VidGen(ws.root + "/with_take", wav)));
+  }
+
+  // ── the guider override REACHES stage 1 and is IGNORED by stage 2 ──────────
+  //
+  // Upstream's `--video-cfg-guidance-scale` exists on this pipeline's parser
+  // (a2vid_two_stage.py:311 -> utils/args.py:947-1006) and reaches stage 1's
+  // guider alone (`:233-236`), because stage 2 is `SimpleDenoiser(...)` (`:278`).
+  // A build that REFUSED it would reject a request upstream accepts; a build
+  // that applied it to stage 2 would run an unconditional forward upstream's
+  // stage 2 does not, and neither shows up in any output.
+  {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(A2VidParams(ws.paths, lora));
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = A2VidGen(ws.root + "/override", wav);
+    gen.extras[vllm::multimodal::kLtx2VideoCfgScaleExtra] = "1.0";
+    CHECK_NOTHROW((void)engine->Generate(gen));
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // It reached STAGE 1: the trace's guidance fields are phase 0's, and the
+    // recipe's own value is 3.0.
+    CHECK_MESSAGE(t.video_guidance_cfg_scale == 1.0,
+                  "the override did not reach stage 1's guider, so a2vid's caller-configured "
+                  "guidance is unreachable");
+    CHECK(t.video_uncond_forwards == 0);
+
+    // AND IT DID NOT REACH STAGE 2, measured on the artifacts because no trace
+    // field records what the second phase did.
+    //
+    // The instrument is a pair of renders whose difference is a value that is
+    // ALREADY stage 1's. `video_stg_scale = 1.0` is exactly what this recipe's
+    // stage 1 carries (`utils/constants.py:52`), so applying it there changes
+    // nothing; stage 2's own STG scale is 0.0, so applying it THERE adds a
+    // perturbed forward per step and moves every pixel downstream of it. Equal
+    // bytes therefore mean the override stopped at stage 1, and that is a claim
+    // an `allow_guidance_override` boolean cannot make either way.
+    const vllm::Ltx2PipelineRecipe recipe =
+        vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5");
+    REQUIRE(recipe.phases.size() == 2u);
+    REQUIRE_MESSAGE(recipe.phases[0].video_guidance.stg_scale == 1.0,
+                    "the value below is no longer stage 1's own, so the two renders differ for "
+                    "a second reason and the comparison proves nothing");
+    REQUIRE(recipe.phases[1].video_guidance.stg_scale == 0.0);
+
+    vllm::multimodal::VideoGenParams plain = A2VidGen(ws.root + "/stg_plain", wav);
+    const vllm::multimodal::VideoResult plain_result = engine->Generate(plain);
+    const std::string plain_bytes = A2VidArtifacts(ws.root + "/stg_plain", plain_result);
+
+    vllm::multimodal::VideoGenParams restated = A2VidGen(ws.root + "/stg_restated", wav);
+    restated.extras[vllm::multimodal::kLtx2VideoStgScaleExtra] = "1.0";
+    const vllm::multimodal::VideoResult restated_result = engine->Generate(restated);
+    const std::string restated_bytes = A2VidArtifacts(ws.root + "/stg_restated", restated_result);
+
+    REQUIRE(plain_bytes.size() > 0);
+    REQUIRE(plain_bytes.size() == restated_bytes.size());
+    // A COUNT of differing bytes, never the two buffers. These are PPM pixels
+    // and a WAV, so a failing `CHECK(a == b)` dumps raw binary into the report —
+    // which killed a mutation harness on the sibling row between applying a
+    // mutation and restoring it, and left the tree mutated.
+    size_t differing = 0;
+    for (size_t i = 0; i < plain_bytes.size(); ++i) {
+      if (plain_bytes[i] != restated_bytes[i]) ++differing;
+    }
+    CHECK_MESSAGE(differing == 0,
+                  "restating stage 1's OWN stg_scale moved " << differing << " of "
+                      << plain_bytes.size()
+                      << " artifact bytes, so the override reached stage 2 — which runs "
+                         "`SimpleDenoiser` upstream (a2vid_two_stage.py:278) and has no "
+                         "guidance to switch on");
+    // THE CONTROL for the same request on a recipe that FIXES its guidance: the
+    // distilled kind refuses the identical extra, so the acceptance above is
+    // this recipe's and not a weakening of that refusal.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> fixed =
+        vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+    vllm::multimodal::VideoGenParams gen_fixed = FixtureGen(ws.root + "/override_fixed");
+    gen_fixed.extras[vllm::multimodal::kLtx2VideoCfgScaleExtra] = "1.0";
+    CHECK_THROWS((void)fixed->Generate(gen_fixed));
+  }
+}

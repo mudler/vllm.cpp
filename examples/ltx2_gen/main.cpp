@@ -195,7 +195,21 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "--negative-prompt-embeds with --negative-audio-prompt-embeds. Absent both, a\n"
       "cfg scale other than 1.0 is refused by name. --pipeline-kind\n"
       "distilled_two_stage and retake distil their guidance INTO the weights and\n"
-      "refuse every one of these flags rather than applying it.\n");
+      "refuse every one of these flags rather than applying it.\n\n"
+      "AUDIO-TO-VIDEO renders a clip AROUND a soundtrack you supply.\n"
+      "--pipeline-kind a2vid_two_stage selects it: stage 1 denoises video at half\n"
+      "resolution, guided by the checkpoint generation's own scales on a schedule\n"
+      "derived from the step count, and stage 2 upsamples 2x and refines with the\n"
+      "distilled three-sigma schedule. The take is encoded once and frozen at both\n"
+      "stages, and the audio.wav you get back is your own file. --audio-path is\n"
+      "REQUIRED on every request and --lora is REQUIRED at load, because upstream\n"
+      "makes both required and stage 2 is a refinement the base weights were never\n"
+      "distilled for; --upsampler is needed for stage 2 as on any two-stage recipe.\n"
+      "The guidance flags above reach stage 1 and are IGNORED by stage 2, which runs\n"
+      "no guider at all -- unlike distilled_two_stage, which refuses them. ONE\n"
+      "divergence you cannot fix from the command line: upstream puts the distilled\n"
+      "adapter on stage 2 alone and leaves stage 1 on the base weights, and this\n"
+      "engine fuses adapters once at load, so stage 1 sees it too (issue 1118).\n");
   std::exit(code);
 }
 

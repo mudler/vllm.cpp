@@ -433,10 +433,12 @@ ROW, SEP = re.compile(r"^\s*\|"), re.compile(r"^\s*\|[\s:|-]+\|\s*$")
 # not only tokens, because a NARROWING keeps a token live while dropping a
 # shape: `15x` guards the integer ratio and `0.69%` the spaceless percentage,
 # and both shapes are written in this tree. See §"A live token is not a covered
-# shape" for what this still does not cover.
-FAV = {r"[0-9]+(?:\.[0-9]+)? *x\b": ["1.18x llama.cpp", "0.461x RSS",
-                                     "a 15x to 18x target"],
-       r"[0-9]+(?:\.[0-9]+)? *×": ["| 1.023× |", "2× over llama.cpp", "3.9×decode"],
+# shape" for what this still does not cover. The LEADING `\b` on each ratio is
+# what keeps `C2x`, `sm_12x` and `Q8_0 x Q8_0` out. It drops 18 lines, every one
+# adjudicated in §"The leading word boundary is restored".
+FAV = {r"\b[0-9]+(?:\.[0-9]+)? *x\b": ["1.18x llama.cpp", "0.461x RSS",
+                                       "a 15x to 18x target"],
+       r"\b[0-9]+(?:\.[0-9]+)? *×": ["| 1.023× |", "2× over llama.cpp", "3.9×decode"],
        r"\bMET\b": ["decode MET"], r"\bPARITY\b": ["peak memory PARITY"],
        r"\bPASS\b": ["prefill PASS"], r"\btie\b": ["a tie on decode"],
        r"\bties\b": ["two ties on RSS"], r"\bahead\b": ["ahead of pp128"],
@@ -658,7 +660,8 @@ ratio's polarity and the sweep cannot see the axis.
 
 **Dropping that prefix is a stage-2 PRECISION regression, and no earlier draft
 named it.** The retired pipe read `\b[1-9][0-9]*(\.[0-9]+)? *[x×]`, and `FAV`
-reads `[0-9]+(?:\.[0-9]+)? *x\b` beside `[0-9]+(?:\.[0-9]+)? *×`. The leading `\b` is gone
+read `[0-9]+(?:\.[0-9]+)? *x\b` beside `[0-9]+(?:\.[0-9]+)? *×` when this section
+was written. The leading `\b` was gone
 along with the value rule, and the leading `\b` is what kept `C2x` out. Separated
 by measurement rather than by reading, because the two changes are in one
 expression: restoring the leading `\b` to `FAV`'s ratio branch and changing
@@ -670,10 +673,13 @@ and under-counting is the direction that matters, so 18 extra lines arriving at
 adjudication cost a reader eighteen rejections and cost the enumeration nothing.
 It is still a real loss of precision that this spec asserted the opposite of, and
 that is the same conclusion-right, evidence-wrong shape as §"176.6 is not a number
-this tree measured" two sections down. **The tightening is not taken in this
-pass** and is recorded under `## Owed`, because re-narrowing the gating
-expression a second time in one pass owes its own before-and-after count and its
-own mutation sweep, and the error runs in the safe direction meanwhile.
+this tree measured" two sections down. **The tightening was deferred when this
+section was written**, because re-narrowing the gating expression a second time
+in one pass owes three things: its own before-and-after count, an adjudication of
+every line the narrowing drops, and its own mutation sweep. The error runs in the
+safe direction meanwhile. **It is taken now**, and it carries all three. See
+§"The leading word boundary is restored", which also answers the question this
+section left open about whether the 18 are the same 18.
 
 **The fix is not to add four tokens to stage 2.** That leaves two spellings that
 can drift again, which is the whole defect. Stage 2 is now `FAVOURABLE`, compiled
@@ -702,7 +708,11 @@ assertion proves liveness per alternative. It does not prove shape coverage.**
 Measured at `fa94b10ae` on a clean detached worktree, against a baseline of
 **1263 candidates in 145 files and 1033 favourable**. Each row is a one-token
 narrowing applied to the block in this spec, and every one left the self-test
-**green** before this pass:
+**green** before this pass. The block has since gained a leading `\b` on both
+ratio branches, so the first row's one-token narrowing is now spelled
+`\b[0-9]+\.[0-9]+ *x\b`. The counts stay as they were read at `fa94b10ae`,
+because what this table records is what each narrowing cost while the self-test
+could not see it:
 
 | narrowing | self-test | stage 1 | stage 2 |
 |---|---|---:|---:|
@@ -728,8 +738,12 @@ lists, and `scan()` is extracted so that three line fixtures bind the attributio
 half: `WINDOW` for the plus-or-minus-3 reach in both directions **and its far
 edge**, `TABLE` for the header clause with llama.cpp deliberately out of window
 reach so only the header can find it, and `BENCH` for `llama-bench` as a spelling
-of `LLAMA`. All six narrowings above now exit `rc=1`, and the 38 token mutations
-still do, so the sweep is **43 mutations red, one unmutated run green**.
+of `LLAMA`. All **five** narrowings above now exit `rc=1`, and the 38 token
+mutations still do, so the sweep is **43 mutations red, one unmutated run
+green**. The count was written as "all six narrowings" when this section
+was authored, which double-counts the table's baseline row. Five narrowings plus
+38 token mutations is 43, and 43 is the number the same paragraph already
+carried, so the arithmetic was right and the word was wrong.
 
 **The residual is real, it is not closed here, and a later reader should assume
 it rather than trust the green.** Two shapes are covered because they were known
@@ -744,6 +758,247 @@ rather than by the instrument reporting anything. Every pass has hardened it and
 every pass has found the previous pass incomplete. The useful record is therefore
 not the current green. It is that the base rate of a further hole in this sweep is
 high, so re-derive a count before you build on it and read §"Owed".
+
+### The leading word boundary is restored, and every line it drops is adjudicated
+
+This is the first of the two pieces §"Owed" left open, and it is taken here.
+`FAV`'s two ratio branches carry a leading `\b` again, so `C2x`, `sm8x` and
+`Q8_0 x Q8_0` stop counting as ratios. Nothing else in the block moves.
+
+**The instrument is the block above. The tree it scans is `0f8580e269`**, a
+clean detached worktree with `git status --porcelain` empty. Those are two
+different objects and this row has confused them before, so the recipe states
+both. The `sed` reverses the change rather than restating the old expression,
+which is what keeps the before and the after one edit apart:
+
+```sh
+git worktree add --detach /tmp/sweep 0f8580e269
+git -C /tmp/sweep status --porcelain              # must print nothing
+python3 - .agents/specs/oracle-llamacpp-repin-stock.md > /tmp/after.py <<'PY'
+import re, sys
+b = re.findall(r"^```python\n(.*?)^```$", open(sys.argv[1]).read(), re.M | re.S)
+[block] = [x for x in b if "FAVOURABLE" in x and "ls-files" in x]
+sys.stdout.write(block)
+PY
+sed 's/r"\\b\[0-9\]/r"[0-9]/' /tmp/after.py > /tmp/before.py    # undo, 2 lines
+cd /tmp/sweep && python3 /tmp/before.py | tail -1
+cd /tmp/sweep && python3 /tmp/after.py  | tail -1
+```
+
+| Ratio branches at `0f8580e269` | Files scanned | Stage 1 candidates | Files hit | Stage 2 favourable |
+|---|---:|---:|---:|---:|
+| `[0-9]+(?:\.[0-9]+)? *x\b` and `… *×` | 4525 | 1278 | 146 | 1042 |
+| **with the leading `\b` restored** | 4525 | **1260** | **145** | **1024** |
+
+**18 lines each way and one file, which is what `## Owed` predicted from the
+`fa94b10ae` reading of 1263 to 1245 and 1033 to 1015.** The prediction and this
+measurement are different trees and the absolute counts differ accordingly. The
+delta is what reproduced.
+
+**Nothing is added.** The diff of the two candidate lists is 18 removals and
+**zero** insertions, which it has to be for a narrowing and is worth asserting
+rather than assuming. Every one of the 18 is here, because §"What the widened
+path set surfaced" already established that an unadjudicated count is a hand
+enumeration with a number in front of it:
+
+| shape | where | count |
+|---|---|---:|
+| `C2x`, `C3x`, the CUTLASS API generations | `.agents/backend-matrix.md:168`, `:169`, `:171`, `:172`, `.agents/parity-ledger.md:20`, `:768`, `.agents/specs/cuda-arch-ampere-fastpath.md:275`, `:371`, `:373`, `:375`, `.agents/specs/best-gemm-path-2026-07-30.md:34`, `docs/STATUS.md:1822`, `.agents/completed/state-events/0000-00/STATE-LEGACY-000001.md:27492`, `:27493` | 14 |
+| `sm8x`, `sm_12x`, arch wildcards | `.agents/specs/cuda-arch-ampere-fastpath.md:274`, `.agents/specs/metal-mlx-reuse-study.md:534` | 2 |
+| `Q8_0 x Q8_0`, `Q8_0×Q8_0` | `src/vt/cpu/cpu_quant_dot_sdot.cpp:1`, `src/vt/cuda/cuda_quant_dot.cu:1067` | 2 |
+
+**No verdict is among them, and no real candidate is lost.** All 18 are
+architecture names, a CUTLASS API generation, or a quantization type. The one
+file that leaves the sweep, `src/vt/cpu/cpu_quant_dot_sdot.cpp`, reached it on
+that single `Q8_0 x Q8_0` comment and on nothing else.
+
+**The table files each line under one shape, so its counts are LINE counts and
+not token counts.** `sm_12x` is on five of the 18 and the arch row names one of
+them. The other four carry a CUTLASS generation in the same line and are filed
+above: `.agents/backend-matrix.md:172`, `.agents/parity-ledger.md:768`,
+`STATE-LEGACY-000001.md:27492` and `:27493`. Reading `2` off the arch row as the
+number of `sm_12x` matches therefore under-counts it by four. Nothing about the
+adjudication moves, because all five are glued text under either filing, which is
+the property that decides them. Count a token with `grep` over the removal list
+rather than off this table.
+
+**One anchor went stale inside this pull request and a nineteenth removal joined
+the list, which is the same warning §"The SHA is load-bearing" gives about the
+counts.** Merging `origin/main` at `b493f4981` added 67 lines to
+`src/vt/cuda/cuda_quant_dot.cu`, so its `Q8_0×Q8_0` comment moved from `:1067` to
+`:1068`. That is the anchor, and it is the only one that moved. This section's
+own new prose then entered the sweep as a nineteenth removal, which is a new line
+rather than a stale anchor. Re-run on the merged tree the drop reads 19 removals
+and still **zero** insertions, still no verdict, and the largest single
+contributor to the change is again this spec. The table above stays as it was
+read at `0f8580e269`. Re-derive rather than quote it.
+
+**Is it the same 18 that §"The two stages were one idea spelled twice" names?**
+That section could not say, because its 18 were read at `85a9a7ae7` and it had
+no second reading to compare against. Re-derived at `0f8580e269` with the two
+files the recipe above wrote, which is what a reader has to run to get the same
+partition rather than a number to take on trust:
+
+```sh
+cd /tmp/sweep && python3 - <<'PY'          # the partition, and the two splits
+import contextlib, io, re
+def run(p):                        # the recipe's own two files, imported rather
+    d = {"__name__": "__main__"}   # than re-spelled, so this cannot drift
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(open(p).read(), d)
+    return d
+b, a = run("/tmp/before.py"), run("/tmp/after.py")
+pick = lambda d: [k for k in d["FAV"] if "[0-9]" in k]     # the ratio branches,
+assert len(pick(b)) == len(pick(a)) == 2, (pick(b), pick(a))   # counted, not read
+rb, ra = (re.compile("|".join(pick(d))) for d in (b, a))
+old = re.compile(r"\b[1-9][0-9]*(\.[0-9]+)? *[x×]")     # the retired stage-2 pipe
+key = lambda c: (c.split(":", 2)[0], int(c.split(":", 2)[1]))
+cand, keep, src = list(map(key, b["cand"])), set(map(key, a["cand"])), {}
+def line(p, n):
+    src.setdefault(p, open(p, errors="replace").read().splitlines())
+    return src[p][n - 1]
+stop = [k for k in cand if rb.search(line(*k)) and not ra.search(line(*k))]
+blind = [k for k in cand if rb.search(line(*k)) and not old.search(line(*k))]
+print("stop", len(stop), "leave", sum(k not in keep for k in stop),
+      "survive", sum(k in keep for k in stop))
+print("blind", len(blind), "dropped", sum(not ra.search(line(*k)) for k in blind))
+print(*[f"{p}:{n} {ra.findall(line(p, n))}"
+        for p, n in blind if ra.search(line(p, n))], sep="\n")
+PY
+```
+
+**Yes in kind, and the answer that matters is the one about the ratios the `\b`
+KEEPS.** Of the baseline's 1278 candidates, **38** match a ratio branch and are
+invisible to the retired pipe's `\b[1-9][0-9]*(\.[0-9]+)? *[x×]`. The leading
+`\b` drops **34** of those 38 and keeps **4**. The four are four LINES carrying
+three spellings, because one line carries two ratios:
+
+| kept line | ratios on it |
+|---|---|
+| `.agents/benchmark-record.md:19021` | `0.058x` |
+| `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md:33` | `0.058x` |
+| `.agents/specs/muse-glimmer.md:918` | `0.058x` |
+| `.agents/specs/gguf-compute-in-quant-gemm.md:528` | `0.086×` and `0.029×` |
+
+An earlier draft wrote that set as "`0.058x` twice, `0.086×` and `0.029×`", which
+is a 2+1+1 partition of four lines. The composition is 3+1. The spellings and the
+total are the parts that were right, and the spellings are exactly the
+fractional-leading-zero measurements §"The two stages" identified as the retired
+pipe's own 7-line miss. So the two changes really are separable: **restoring the
+boundary removes the glued text and leaves every real ratio, including every
+ratio below 1.0.** The value rule stays deleted, because the axis and not the
+value decides a ratio's polarity.
+
+The 34 and the 18 differ for a reason worth stating, since a reader will
+otherwise read one of them as wrong. A line can lose its ratio match and stay a
+candidate on another comparison token. Over every baseline candidate, with no
+scope on it: **35 candidate lines stop matching a ratio, 18 of them had no other
+token and leave the sweep, and 17 survive.** Stage 2 falls by the same 18. Inside
+the 38 above the same split reads 34, 18 and 16, and an earlier draft gave that
+scoped pair with the scope left off. The line the two readings differ by is
+`.agents/coordination.md:1759`, which the retired pipe already saw on the `2x` of
+`SM100_MMA_F8F6F4_{SS,2x1SM_SS}`, so it is outside the 38 and it survives on
+another token.
+
+**The mutation pass this owed.** Re-narrowing the gating expression owes proof
+that the self-test still detects a dead alternative, so all 43 were re-run
+against the python block this spec carries rather than against a copy of it, at
+`0f8580e269`:
+**43 red, 0 defects.** The 38 token mutations are each alternative neutered to
+`(?!)` and each deleted outright. The 5 narrowings are the rows of the table in
+the section before this one, with the ratio row now spelled
+`\b[0-9]+\.[0-9]+ *x\b` so that it stays a one-token narrowing.
+
+Every row reports four things, because three separate shapes of green-that-proves-nothing
+have bitten this project: a mutation that never applied, a mutation that fails to
+build, and a mutation that exits non-zero for some reason other than the
+assertion. So each row prints whether the source bytes changed, whether the
+result still compiles, the exit code, **and the exception class**. A row counts
+as red only when all four agree. Two further runs are controls rather than
+mutations: `FAV` and `REST` each regenerated from their own parsed entries with
+no semantic change, both **green**, which is what shows the harness that rewrites
+those dicts is not itself what turns the other 38 red. With the unmutated run
+that is **43 red and 3 green**.
+
+### The instrument stays in this document, and here is what decided it
+
+This is the second piece `## Owed` left open: whether a per-shape control belongs
+on every alternative, or whether the sweep should stop living in a markdown
+fence. **Neither. Both are refused, and a third option was measured and refused
+too.** The residual under §"A live token is not a covered shape" stays open and
+stays stated.
+
+**Moving it to `tools/` is refused, and not for the reason the question
+assumed.** The concern was that a `tools/` script would be classed as a checker
+and would then owe paired semantic mutation evidence on a gate the local
+preflight cannot run. Checked rather than assumed: `scripts/check-pr-size.py:510`
+attaches that contract to the class `governance_checker` alone, and
+`:162` defines that class as `scripts/check-[a-z0-9-]+\.(py|sh)`. A file at
+`tools/*.py` falls through to `:448` and classes as `product`, as does
+`tests/tools/test_*.py`. **The mutation-evidence contract would not attach.** The
+gate is CI-only, absent from `scripts/agent-preflight.sh`, but that turns out not
+to bear on the decision.
+
+What refuses the move is what CI would actually enforce. `tests/CMakeLists.txt:12`
+runs `unittest discover -s tests/tools -p "test_*.py"`, so a suite there is picked
+up with no registration and runs on every `build-test-cpu`. **What it would run is
+the self-test, and the self-test proves liveness, not shape coverage.** That is
+the open defect, not a solved one. All five defects in this instrument were found
+by a person reading it, and the self-test reported none of them. Scheduling that
+green on every push raises its authority without changing its content, and this
+spec would then carry a standing CI-green beside a paragraph telling the reader to
+treat the green as no evidence at all about coverage. That is worse than no gate.
+
+Two smaller reasons agree with it. `scripts/check-role-discipline.py:63-71` lists
+`tools/` and `tests/` among `FEATURE_PREFIXES` while `.agents/` is an integration
+prefix, so every future edit to the sweep would need a reviewed `row/*` pull
+request. And the sweep is evidence for one row's enumeration rather than a
+standing gate. Its consumer is #1003, and it has no reader after #1003 discharges
+the thirteen re-takes. `AGENTS.md` §"Nothing lands dead" is about exactly this
+shape: a class reachable only from its own test proves the class works and never
+that anything reaches it.
+
+**The fresh review agreed with the refusal and ranked the three reasons in a
+different order, which is recorded here because it makes the refusal conditional
+rather than absolute.** It reads the §"Nothing lands dead" argument as the
+decisive one and the `row/*` friction as second, and it calls "raises its
+authority" the weakest of the three, because that reason is about how a reader
+weighs a green rather than about the tree. It also names what the paragraph above
+under-weights: a scheduled self-test WOULD catch a recurrence of the sixth hole,
+a token that is present and dead, which is a real defect class this instrument
+has already carried once. **The condition to revisit is therefore stated rather
+than left implicit. If #1003 gains a second consumer, the decisive argument
+evaporates and the move to `tools/` is to be taken again.**
+
+**Keeping the instrument in a markdown fence has one cost a later editor has to
+know about.** The extraction in the section above ends
+`[block] = [x for x in b if "FAVOURABLE" in x and "ls-files" in x]`, so a second
+python fence in this file carrying both strings makes that unpacking raise
+`ValueError` and the recipe stops. It fails loud rather than selecting the wrong
+block, which is the acceptable direction and is why the filter stays as it is. No
+fence in this spec matches today, and the derivation fence the section above adds
+is `sh` and cannot. An editor who adds a second matching one narrows the filter
+rather than deleting it.
+
+**A per-shape control on every alternative is refused because a control is a
+string its author writes.** It proves the shape the author thought of is matched.
+The two that exist were added because this tree demonstrably writes them, `15x` in
+row 13 and `0.69%` in this spec's own argument, and that provenance is the whole
+of their value. Seventeen invented shapes would lengthen the fence and would read
+as coverage while establishing nothing about the prose nobody has written yet.
+
+**The third option was a per-alternative census, and measuring it is what killed
+it.** The idea was to print how many lines each alternative reaches, on the theory
+that a live-but-near-empty alternative is the `×` signature and a reader would see
+it. Measured at `0f8580e269` over every tracked file rather than argued: the
+historical dead branch `[0-9]+(?:\.[0-9]+)? *[x×]\b` reaches **5312** lines,
+because its `x` half was always healthy. Split into the halves the current block
+uses, the dead `×\b` spelling still reaches **470** lines against the repaired
+branch's **2121**. A census would have printed 470, not 1. **There is no threshold
+a reader could have applied to that**, so the census would have shown the sixth
+hole as a number nobody could act on. It is not added. This is the same finding
+one level up: an instrument that cannot say what it failed to examine has not
+reported, and a count is not a coverage claim just because it is a number.
 
 ### What the four sweeps measure, side by side
 
@@ -1527,12 +1782,16 @@ burned by twice.
   gates on instantaneous contention.
 - **No benchmark gate.** Recorded `PENDING` on #1003 and on host access, not
   waived.
-- **What the gate run reports, by block.** On the merged head at the review-repair
-  pass: `Session role` 1, `Record gates` 26, `Mutation suites` **45**,
+- **What the gate run reports, by block.** On the merged head at the F1-F3 repair
+  pass: `Session role` 1, `Record gates` **27**, `Mutation suites` **46**,
   `Committed range vs origin/main` 3, and `Commit trailers vs origin/main` 2, so
-  **77 results and zero SKIP**. Mutation suites moved 44 to 45 because
-  `origin/main` landed `test_agent_preflight_skip_report` with #1030, which is
-  another count in this file that a foreign merge changes.
+  **79 results, zero FAIL and zero SKIP**, against `origin/main`
+  `10002648199cfbbaf1e423f7c80cacb2f4b56366`. The two moving blocks have now
+  moved twice for the same reason. Mutation suites read 44, then 45 when
+  `origin/main` landed `test_agent_preflight_skip_report` with #1030, and 46 with
+  `test_check_cuda_op_arch_gate`, whose checker takes `Record gates` from 26 to 27
+  at the same time (#960, merged as `d607fec4c`). Re-derive this pair per run.
+  Neither number says anything about this branch.
 
   **The same head reports two different results, and the difference is the box,
   not the tree.** At loadavg 64.88 and again at 84.95 it returns `rc=1` with
@@ -1619,19 +1878,19 @@ burned by twice.
   known live, `15x` and `0.69%`, and three line fixtures now bind the attribution
   half. Nothing establishes that the other seventeen alternatives carry the
   shapes this tree writes, and exhaustive coverage is not reachable for a token
-  set whose purpose is to match prose nobody has written yet. Two concrete pieces
-  are owed and neither is taken here. **First**, restore a leading `\b` to `FAV`'s
-  two ratio branches. Applied to both at `fa94b10ae` it takes stage 1 from 1263
-  in 145 files to **1245 in 144** and stage 2 from 1033 to **1015**, which is 18
-  lines each way and the same size as the false-positive set §"The two stages
-  were one idea spelled twice" names. Whether it is the same 18 is not measured
-  here, and it owes a mutation pass of its own because it re-narrows the gating
-  expression. **Second**, decide whether a per-shape control belongs on
-  every alternative or whether this instrument should stop living in a document.
-  Tracked under [#1003](https://github.com/mudler/vllm.cpp/issues/1003), because
-  the enumeration that issue owes is what rests on the sweep. Until one of those
-  lands, treat a green self-test as evidence that the tokens fire and as no
-  evidence at all about what they cover.
+  set whose purpose is to match prose nobody has written yet. **The two concrete
+  pieces this bullet used to owe are both taken**, and neither closes the
+  residual. The leading `\b` is restored on both ratio branches, measured before
+  and after at `0f8580e269`, with all 18 dropped lines adjudicated and the 43
+  mutations re-run: §"The leading word boundary is restored". The open question
+  about per-shape controls is decided against, along with moving the instrument
+  out of this document and a per-alternative census that was measured and
+  refused: §"The instrument stays in this document". What is still owed is the
+  residual itself, which no amount of control-writing reaches. Tracked under
+  [#1003](https://github.com/mudler/vllm.cpp/issues/1003), because the
+  enumeration that issue owes is what rests on the sweep. **Treat a green
+  self-test as evidence that the tokens fire and as no evidence at all about what
+  they cover**, and re-derive any count before you build on it.
 
 ## Now
 
@@ -1646,6 +1905,10 @@ and they disagreed. Its attribution half now carries controls too, because that
 half had none while the token half had nineteen, and a narrowing there could
 delete 64% of the output with the self-test green. **That green still proves
 liveness and not shape coverage**, which is the standing bound under `## Owed`.
+Its ratio branches carry a leading `\b` again, which costs 18 false positives
+and keeps every real ratio, including the four lines below 1.0 that the retired
+stage-2 pipe could not see, and the instrument stays in this document for a
+decided reason rather than an undecided one.
 Thirteen
 contaminated measurements, seven favourable verdicts, five llama.cpp revisions,
 one of which is a branch name with no commit behind it. No row changes lifecycle

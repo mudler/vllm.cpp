@@ -203,7 +203,13 @@ Ltx2LatentState ToLatentState(const StreamState& s, int64_t pos_dims) {
   out.latent = s.latent;
   out.clean = s.clean;
   out.mask = s.mask;
-  out.positions.assign(s.positions.begin(), s.positions.end());
+  // Explicit cast: StreamState stores positions as double for the DiT surface,
+  // Ltx2LatentState keeps float32. Range-assign would narrow implicitly and
+  // trip MSVC C4244 under /WX (mudler/vllm.cpp#968).
+  out.positions.resize(s.positions.size());
+  for (size_t i = 0; i < s.positions.size(); ++i) {
+    out.positions[i] = static_cast<float>(s.positions[i]);
+  }
   out.keyframes_mask = s.keyframes_mask;
   return out;
 }
@@ -214,7 +220,10 @@ void FromLatentState(const Ltx2LatentState& in, StreamState* s) {
   s->latent = in.latent;
   s->clean = in.clean;
   s->mask = in.mask;
-  s->positions.assign(in.positions.begin(), in.positions.end());
+  s->positions.resize(in.positions.size());
+  for (size_t i = 0; i < in.positions.size(); ++i) {
+    s->positions[i] = static_cast<double>(in.positions[i]);
+  }
   s->keyframes_mask = in.keyframes_mask;
 }
 
@@ -364,7 +373,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 782 792 793 855 951 967 969 1060 1085 1190 1231
+// 791 801 802 864 960 976 978 1069 1094 1199 1240
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,

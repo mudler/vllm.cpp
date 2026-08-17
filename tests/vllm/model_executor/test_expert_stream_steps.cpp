@@ -35,7 +35,13 @@
 //      exactly the run that printed nothing at all. Both docs told an operator
 //      to read `steps == 0` off a line that could not exist.
 #include <stdlib.h>
+#if !defined(_WIN32)
+// The two questions about the statistics LINE need POSIX: one redirects stderr
+// across the flush, the other runs this binary again as a child. The step-clock
+// questions below need neither and are built everywhere. Streaming itself is a
+// POSIX lane anyway — `EnsureFile` refuses on _WIN32 by name.
 #include <unistd.h>
+#endif
 
 #include <doctest/doctest.h>
 
@@ -155,6 +161,7 @@ TEST_CASE("the final statistics line prints on a run whose step clock never adva
   // it must not call the flush itself.
   if (IsFlushChild()) return;
 
+#if !defined(_WIN32)
   // Capture stderr across the flush. Everything this process printed before now
   // (the one-off `[expert-stream] ON ...` banner) is outside the redirect, so a
   // statistics line inside it can only be the one under test.
@@ -191,6 +198,7 @@ TEST_CASE("the final statistics line prints on a run whose step clock never adva
   CHECK(lines == 1);
   CHECK(captured.find("[expert-stream] steps=0 ") != std::string::npos);
   CHECK(captured.find(" fills=") != std::string::npos);
+#endif  // !_WIN32
 }
 
 TEST_CASE("Qwen3_5Model::ForwardDense marks exactly one step") {

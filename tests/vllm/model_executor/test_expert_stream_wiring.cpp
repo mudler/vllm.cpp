@@ -40,7 +40,9 @@
 
 #include <doctest/doctest.h>
 
-#include <unistd.h>
+#if !defined(_WIN32)
+#include <unistd.h>  // ::fileno, for the pread case below
+#endif
 
 #include <cmath>
 #include <cstdint>

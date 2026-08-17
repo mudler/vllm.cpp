@@ -718,7 +718,7 @@ upstream's own supported configuration.
 
 | Owed | What it must show | Who |
 |---|---|---|
-| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | **PART-PAID 2026-08-16, and the remaining half is the vLLM leg.** On the 27B NVFP4 at the DEFAULT bf16 GDN state, depth REACHES the verify path at k=2, 3 and 4 on real weights and the per-depth counters are populated at EVERY depth up to k. What is NOT established is `our-ON == our-OFF`: it is FALSE here on 3 of 4 prompts, at the SAME token positions for every k and for the padded control alike, which is the signature of a fixed spec-ON/OFF difference rather than a depth defect. Attributing it needs the oracle leg, which did not run. Do NOT read this row as a passed token gate. **2026-08-17 narrowed it to 3 forwards.** Only the FIRST divergence per arm and prompt is adjudicable, which reduces 1718 divergent positions to 18 and then to 3 distinct probe points. Prompt 1 position 1 resolves to THREE different tokens under three values of k, which no depth defect can produce. `scripts/mtp-k-gt-1-neartie-gap.py` is committed and decides each candidate against `kNearTieMnats = 500`. It still has not RUN: the oracle cannot be loaded while a foreign multi-tens-of-GiB container is resident | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | The PADDED CONTROL arm of that gate, and the RATE assertion it carries | **PAID 2026-08-16 on the 27B.** Margin fixed BEFORE the run at 0.10 absolute per depth. The real loop accepts at 0.507 to 0.750 at every depth >= 1. The padded control accepts at 0.000 at every depth >= 1 while its depth-0 rate MATCHES the real arm (0.892 to 0.925 against 0.868 to 0.878), which is what a control that isolates columns >= 1 must look like. Every margin clears by at least 0.41. The control measuring 0 is recorded as a fact about THIS prompt set and did not license restoring the count assertion. Still owed on the 35B | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
 | Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
@@ -1199,14 +1199,55 @@ established and a rate is a deterministic function of the greedy token stream, s
 a window that runs short costs the least there. The two things this row is
 blocked on run first.
 
+### The harness gained a THIRD precondition, because two were not enough
+
+The first pass added an empty-compute-apps refusal and a 45 GiB headroom
+refusal. This pass met a case that clears BOTH and is still the reboot scenario,
+so a third refusal was added. It STRENGTHENS the guard and weakens nothing:
+every earlier refusal, the per-leg before-and-after device sample, the clock pin
+and the reset trap are byte-for-byte intact, verified by diff.
+
+A neighbouring CPU benchmark left container `q1v2` resident at **53.54 GiB**.
+Because it runs `--device cpu`, `nvidia-smi --query-compute-apps` was EMPTY, so
+the device check passed. `MemAvailable` read 61 GiB, so the 45 GiB floor passed
+too. Both instruments were blind to it, which is the same shape as the
+`gpu_memory_utilization` finding: on GB10 that setting does NOT bound host RAM,
+and a 27B load has been measured at 111.7 of 119 GB host while `nvidia-smi`
+showed 18.9 GiB. `.agents/environment.md` records that this box REBOOTS rather
+than OOM-killing and that a load near 52 GB has taken it down three times, so
+45 GiB of headroom against a foreign 53 GiB resident is not a margin. The house
+rule for this box is to refuse rather than try, and a reboot would destroy BOTH
+sessions' work rather than only this measurement.
+
+The refusal is IMMEDIATE rather than a bounded wait, and that correction matters.
+A wait would DEADLOCK. The only actor that removes a foreign container here is
+the neighbouring harness's own `run_arm`, and that harness cannot start while
+this process holds the mutex. A bounded wait would therefore burn its budget,
+refuse anyway, and block the one run that could have cleared the very condition
+it was waiting on. Refusing at once hands the mutex straight back, which is what
+lets the box make progress.
+
+Our own arms run `docker run --rm` with no `--name`, so a named container is
+foreign by construction and the check cannot see itself.
+
+The driver that produced the refusal below is `~/mtpgate/run_all_inner.sh`
+on `dgx.casa` at sha256 `329192f7ba09a3942d0cac52b25e1d6a83064c14d9e3a7b5f7a3801ae3aa4f12`.
+
 ### PENDING, and the resource each one waits on
 
 | Pending | Waits on |
 |---|---|
-| The adjudication verdict at the 3 probe points | the box mutex |
-| The vLLM leg, meaning `vllm_off` and `vllm_on_k2/k3/k4`, and with it the three-way token gate and the oracle's OWN ON against OFF attribution | the box mutex |
-| The re-run that puts every arm in ONE window, which is what would lift the VOID on `padded_k3` and `padded_k4` throughput | the box mutex |
+| The adjudication verdict at the 3 probe points | a CLEAN box. Not the mutex alone. Both the mutex and the foreign container have to clear |
+| The vLLM leg, meaning `vllm_off` and `vllm_on_k2/k3/k4`, and with it the three-way token gate and the oracle's OWN ON against OFF attribution | the same |
+| The re-run that puts every arm in ONE window, which is what would lift the VOID on `padded_k3` and `padded_k4` throughput | the same |
 | M2 concurrency>1 A/B at matched k | the three above, in order |
+Worth separating, because the two are not the same wait. The adjudication and
+the token legs are DETERMINISTIC functions of the greedy stream and do not move
+with host load, so a merely contended box would still answer them. What stops
+them is not contention, it is the refusal above: the oracle cannot be loaded at
+all while a foreign multi-tens-of-GiB container is resident, because that is the
+reboot case. Only the THROUGHPUT axes need an uncontended box on top of that.
+
 | The 35B lane | a checkpoint that is NOT on `dgx.casa`. The box carries `unsloth/Qwen3.6-27B-NVFP4`, `Qwen/Qwen3-Coder-30B-A3B-Instruct`, `nemotron-3.5-lightning-30b-nvfp4` and `qwen3.8-q1_0` and no 35B. Fetching one is a large-asset download and needs recorded authority |
 
 ### What held the mutex, measured rather than inferred from one PID
@@ -1238,6 +1279,39 @@ holder outlives every process a reader would think to check.
 
 Nothing was signalled. The orphan belongs to another session and clearing it is
 that session's call or the operator's, not this one's.
+
+### The window RAN, refused by name, and handed the mutex back
+
+The orphan released at 2026-08-17T01:38:49Z, at the deadline its own readiness
+poll implied. The queued gate acquired the mutex at 01:38:43Z and refused:
+
+```
+WINDOW_START_UTC=2026-08-17T01:38:43Z
+gpu_apps_at_acquire=[]  mem_avail_GiB=52
+foreign_containers_at_acquire=[q1v2 ]
+ABORT: foreign container(s) resident: [q1v2 ]
+WINDOW_RESULT=BLOCKED_FOREIGN_CONTAINER
+CLOCKS_RESET=1
+WINDOW_RC=6
+```
+
+**That transcript is the argument for the third precondition, and it is measured
+rather than reasoned.** Both earlier refusals PASSED on this acquire.
+`gpu_apps_at_acquire` was EMPTY, because the foreign load is a `--device cpu`
+container and never appears as a compute app. `mem_avail_GiB` was 52, which
+clears the 45 GiB floor. A window with only the first two guards would therefore
+have proceeded to load a 27B on top of a container holding 53.54 GiB on a
+119 GiB box that REBOOTS rather than OOM-kills. The guard did not prevent a
+hypothetical. It caught the case both existing instruments were blind to, on the
+first acquire after it was added.
+
+Nothing was measured, nothing was signalled, the clock pin was reset by the trap
+and the mutex was handed back in the same second. The neighbouring session's
+restarted benchmark took it at 01:38:43Z and holds it for its own two-arm series,
+so the box is committed for the next several hours and this session has no path
+to a clean window. The queue was NOT left armed: it recorded `QUEUE_END_UTC` and
+exited, which matches what the first pass did when it withdrew rather than leave
+a run to take the mutex unattended.
 
 ### Gate for this pass
 

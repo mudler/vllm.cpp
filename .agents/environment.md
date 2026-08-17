@@ -283,10 +283,16 @@ environment:
     `cudagraph_capture_sizes: [1, 2, 4, 8]`, every allocation host-backed here).
     **That last part is a hypothesis with a located step, not a result.** Vary
     those one at a time with the sampler running and believe nothing without an
-    A/B. **Neither episode REBOOTED**: `uptime` and `boot_id` were unchanged, so
-    this is the thrash case rather than the OOM-reboot case above, and the two
-    want different cures. Always run a `MemAvailable` sampler beside any load
-    here; `nvidia-smi` is blind to all of it.
+    A/B. **The 0.75 run THRASHED for 42 minutes and survived (`boot_id` and
+    `uptime` unchanged); the 0.30 run REBOOTED THE BOX** — `boot_id` moved
+    `5bbdc432…` to `bd5c6e7a…` and `journalctl --list-boots` shows boot `-1`
+    ending 09:10:15Z against boot `0` beginning 09:13:55Z. So a lower fraction is
+    NOT a safety margin: assume the box is at risk on every attempt. Always run a
+    `MemAvailable` sampler beside any load here; `nvidia-smi` is blind to all of
+    it, and the sampler is what turned a 45-minute mystery into a timestamped
+    100-second collapse. While sshd was answering intermittently one connection
+    returned `Permission denied (publickey)`; that is a memory-pressure artefact,
+    not a credential problem, and the same key worked seconds after the reboot.
     **A cleanup trap is not a stop button.** Both DGX drivers used
     `trap cleanup EXIT INT TERM` where `cleanup` resets the clocks and RETURNS, so
     `SIGTERM` reset the clocks and the script then started its NEXT leg on a box

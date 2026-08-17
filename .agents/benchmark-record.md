@@ -22343,6 +22343,17 @@ hypothesis with a located step, not a result.** Vary those one at a time with th
 sampler running. No oracle leg in any pass has reached KV-cache allocation here,
 so nothing about this step had been exercised on this box before.
 
+**And the 0.30 run REBOOTED the box, which the 0.75 run did not.** Evidenced
+rather than inferred: `boot_id` moved `5bbdc432...` to `bd5c6e7a...` and
+`journalctl --list-boots` shows boot `-1` ending 09:10:15Z against boot `0`
+beginning 09:13:55Z. The lower fraction therefore did not merely fail to help,
+it did not prevent the worst outcome either: 0.75 thrashed 42 minutes and
+survived, 0.30 took the machine down. Treat every attempt here as at risk.
+
+State after the reboot, verified: mutex FREE, no containers, no compute apps,
+115 GiB available, loadavg 0.71, clocks at the boot default 208 MHz, 0 of our
+processes, and everything under `~/mtpgate/final/` intact.
+
 **A trap defect, found by watching it fail.** `SIGTERM` to the driver reset the
 clocks and the driver then started its NEXT leg on a box with no memory left,
 because `trap cleanup EXIT INT TERM` runs `cleanup` and returns without exiting.

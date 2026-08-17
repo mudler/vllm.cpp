@@ -201,7 +201,7 @@ leg that would attribute the split has never run here. Three passes failed to ru
 it: the reimaged box has no C compiler, so the oracle's Triton JIT dies after the
 weights load, and once that is fixed the oracle consumes the whole 119 GiB host
 in the step after `torch.compile`. `gpu_memory_utilization` does NOT control that
-second one; an A/B at 0.30 collapsed exactly as 0.75 did.
+second one: an A/B at 0.30 collapsed as 0.75 did, and rebooted the box.
 
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
 `--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on

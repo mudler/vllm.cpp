@@ -764,7 +764,7 @@ Omitting all three renders the recipe default, which is 1024x1536 at 121 frames
 and is a much larger request than it looks.
 
 **What is legal is not what fits.** The first two rows below are a property of
-this port and are enforced. The rest are scale markers, and the last two are
+this port and are enforced. The rest are scale markers, and the last three are
 measurements of one box rather than limits of the code:
 
 | | Value |
@@ -773,14 +773,27 @@ measurements of one box rather than limits of the code:
 | Legal frame counts | any; non-`8k + 1` values floor onto the temporal grid |
 | Upstream's default output | 1024x1536 at 121 frames (`utils/constants.py:42-76`) |
 | Upstream's HQ preset output | 1088x1920 at 121 frames (`utils/constants.py:95-98`) |
-| **Measured to complete on one GB10** | **320x192 at 25 frames** |
-| Measured NOT to complete | 448x256 at 25 frames — the denoise finishes, then the decode loses about 59 GB in 24 s |
+| **Measured to complete on one GB10** | **704x448 at 25 frames** in 4231 s, 448x256 at 25 frames in 3085 s, and 320x192 at 25 frames. One run each, 16 to 17 August 2026, `main` `0b0b8900f` |
+| Largest size tried | 704x448 at 25 frames. 1024x576 was not attempted to completion because another session claimed the box. That is scheduling and not an envelope, so 704x448 is not a ceiling |
+| Superseded, kept for the record | 448x256 at 25 frames was published here as *not* completing, on a run that lost about 59 GB in 24 s after its denoise. It completes, and that loss did not recur |
 
-That gap between the legal envelope and the measured one is a decode problem, not
-a resolution cap: there is no maximum-size check anywhere in this path, and the
-60 GB is **not attributed** — the decode's own heap peak at that size is 361.72
-MiB, some 170x too small to account for it. See the note below on what bounds a
-render, and `.agents/specs/ltx25-tiled-decode.md`.
+Those three completions are one run each on one contended box, with no oracle on
+either side, so read them as what has been observed and not as a limit. There is
+no maximum-size check anywhere in this path.
+
+The 59 GB stays on the page because it is the reason the old row gave, and it
+belongs to its own run: a prompt-embeds render with no text tower that an armed
+watchdog ended at 13.77 GiB against an 18 GiB floor, rather than the engine
+failing. That run is rung F1 in `.agents/benchmark-record.md`. The loss was never
+attributed to the decode, whose own heap peak at that size is 361.72 MiB, some
+170x too small, and attributing it is still open as
+[#1014](https://github.com/mudler/vllm.cpp/issues/1014). It did **not** reproduce
+on `0b0b8900f` under a 2 s memory guard that would have seen it: the 448x256 rung
+floors `MemAvailable` at 38.96 GiB over 1289 samples and the 704x448 rung at
+38.89 GiB over 1743 samples, with no sample under 34 GiB on either and a peak use
+of 80 of 119 GiB. See the note below on what bounds a render, and
+`.agents/specs/ltx25-tiled-decode.md` and
+`.agents/specs/ltx25-resolution-envelope.md`.
 
 `--lora ic-lora.safetensors [STRENGTH]` fuses an IC-LoRA adapter into the DiT at
 load, mirroring upstream's `--lora PATH [STRENGTH]`
@@ -952,31 +965,47 @@ knobs the flags above map onto. Both are described under
 
 **Three things about that command are worth knowing before you run it.**
 
-*It is bounded by the VIDEO DECODE, well below the recipe's own defaults.*
+*It is bounded by HOST WALL CLOCK, well below the recipe's own defaults.*
 Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10, and
 `--encoder` adds the text tower on top of that — roughly 24 GB of host bf16 that
 stays resident, because a prompt arrives per request. Every memory figure here
 was measured WITHOUT the tower, on the prompt-embeds path, so budget for both.
-**320x192 at 25 frames completes** through both distilled phases; 448x256 at 25
-frames finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
-and has to be stopped. The denoise itself is flat at either size. Unified memory
-makes those host bytes and this class of box reboots rather than OOM-killing, so
-start small and grow, and put a memory watchdog in front of anything larger. The
-recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
-Expect minutes, not seconds: most of a 320x192/25f render is spent in the host
-VAE decode at 0% GPU, because that decode has no device arm
+**320x192, 448x256 and 704x448 at 25 frames all complete** through both distilled
+phases. The upper two took 3085 s and 4231 s, measured on 16 to 17 August 2026 at
+`0b0b8900f`. This page used to say 448x256 did not complete, and that is what
+changed. Unified memory makes those host bytes and this class of box reboots
+rather than OOM-killing, so start small and grow, and put a memory watchdog in
+front of anything larger. Those runs kept one at a 2 s cadence and it never came
+near firing: the `MemAvailable` floor was 38.9 GiB and no sample fell under
+34 GiB. The recipe default of 1024x1536 at 121 frames is far beyond what one
+GB10 holds today.
+
+Expect tens of minutes, not seconds, and expect much of that to be independent of
+the resolution you asked for. Most of a render is no longer the host VAE decode.
+[#1041](https://github.com/mudler/vllm.cpp/issues/1041) threaded that decode, and
+what dominates now is a **single-threaded phase of about 1731 s that barely moves
+with size**: 1731 s and 1732 s across two rungs whose voxel counts differ by
+2.75x, which is 57 to 66% of wall on each. Which phase that is has not been
+identified, and [#1087](https://github.com/mudler/vllm.cpp/issues/1087) owns
+naming it. The decode itself still has no device arm and still runs at 0% GPU
 ([#1007](https://github.com/mudler/vllm.cpp/issues/1007)).
 
-It is no longer *single-threaded*, which is what this paragraph used to say. The
-decode's convolutions now dispatch across `VLLM_CPP_CPU_THREADS` workers
+Read every figure in the last two paragraphs as one run per geometry on a shared
+box that was contended, with no oracle on either side. Two rungs establish no
+scaling law, and 704x448 is not a ceiling: the next rung up was stopped by
+another session claiming the box, not by the machine.
+
+The decode is no longer *single-threaded*, which is what this section used to
+say. The decode's convolutions now dispatch across `VLLM_CPP_CPU_THREADS` workers
 (default `hardware_concurrency`), bit-identical at every worker count —
 [#1009](https://github.com/mudler/vllm.cpp/issues/1009), measured at **roughly
 9x on 16 to 20 workers** against one. Take the band rather than a decimal: the
 medians are 9.15x at 16 and 9.14x at 20, but those two counts spread 21-23% run
 to run on a box that was not idle, where every count at or below 8 spreads under
-7%. Read it as a decode figure and not a render one: the wall above was recorded
-on GB10 before the change and has not been re-measured, and the ~9x was taken on
-a synthetic decode shape on a contended 20-core x86 host. Set
+7%. Read it as a decode figure and not a render one: the ~9x was taken on a
+synthetic decode shape on a contended 20-core x86 host, and end to end it does
+not appear, because the phase #1041 never touched is now most of the wall
+(#1087). The renders above are the post-change re-measurement of that wall. Set
 `VLLM_CPP_CPU_THREADS` lower if the render has to share the box.
 
 *The render behind those numbers was NOT prompted, and it renders a scene without

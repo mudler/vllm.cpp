@@ -360,6 +360,66 @@ Set against upstream's own defaults — 1024x1536 and 1088x1920 at 121 frames �
 320x192 practical ceiling is the story, and the envelope states both numbers next
 to each other rather than only the legal one.
 
+### 4.1 Superseded on 16 to 17 August 2026: 448x256 completes, and so does 704x448
+
+[#1088](https://github.com/mudler/vllm.cpp/issues/1088). The bullets above are
+**kept as written** because they were true of the runs that produced them; this
+subsection records what replaced them, and `docs/USAGE.md` now publishes the
+newer envelope. Deleting the old bullets would remove the evidence the newer
+result is measured against.
+
+Measured on `dgx.casa` against `main` `0b0b8900f`, which carries
+[#1041](https://github.com/mudler/vllm.cpp/issues/1041) (threaded decode),
+[#1032](https://github.com/mudler/vllm.cpp/issues/1032) (T2A) and
+[#1036](https://github.com/mudler/vllm.cpp/issues/1036) (f32 decode
+accumulators). Container `vllmcpp-build:gb10`, `Release`, `VLLM_CPP_CUDA=ON`,
+arch `121a`, `TRITON=ON`, CUTLASS absent so FlashAttention-2 was not built, which
+is like for like with the earlier renders. `VLLM_CPP_CPU_THREADS=20`. NVFP4
+transformer. No `--allow-unported`.
+
+| Geometry | Result | Wall |
+|---|---|---|
+| 448x256 / 25 frames | **completed** | 3085 s |
+| **704x448 / 25 frames** | **completed** | 4231 s |
+| 1024x576 / 25 frames | not attempted to completion, another session claimed the box | n/a |
+
+The 1024x576 rung stopped for scheduling and not for memory or an envelope, so
+**704x448 is not a ceiling**, on the standard AGENTS.md applies to every
+measured limit and that §4 applied to 320x192.
+
+**The ~59 GiB cliff did not recur, under an instrument that would have seen it.**
+A memory guard at a 2 s cadence: the 448x256 rung floors `MemAvailable` at
+**38.96 GiB** over 1289 samples, the 704x448 rung at **38.89 GiB** over 1743
+samples, and **zero** samples on either fall below 34 GiB. Peak use was 80 of
+119 GiB, and the box did not reboot. This does not close
+[#1014](https://github.com/mudler/vllm.cpp/issues/1014), which owns attributing
+the original fall; it records that the fall is not reproducible on this build.
+Note also what the original run actually was: `benchmark-record.md` rung F1 is a
+prompt-embeds render with no text tower that ended in a **watchdog kill** at
+`avail_kB=13774472` against an armed 18 GiB floor, not in an engine failure.
+
+**The 704x448 artifact was verified, not assumed from an exit code.** Global mean
+90.34, std 60.54, per-frame variance 3630-3706, **0 near-uniform and 0 near-black
+frames**; **25/25 distinct md5s**, adjacent-frame mean-abs-diff 4.381 against a
+uniform-noise reference of 85.3 on the same shape, **0/24 zero-motion pairs**;
+audio 48 kHz stereo, 1.010 s, RMS **-37.29 dBFS**, 20/20 windows above threshold.
+The mp4 is at `benchmarks/media/ltx25-704x448-25f-audio.mp4` on the render host
+and is gitignored by `.gitignore:35` (`*.mp4`), so it is not committed.
+
+**What is not claimed.** One run per geometry, on a shared box that was
+contended, with no oracle on either side. Two points do not establish a scaling
+law. Nothing here says what the frames depict. That question is still the one
+§0 and `docs/USAGE.md` leave open.
+
+**The bound moved off the decode.** §4 named the decode's single-threaded
+throughput as owed measurement. #1041 answered it, and the same run shows the
+position was inherited rather than removed: a **resolution-independent ~1731 s
+single-threaded phase** (1731 s and 1732 s across two rungs whose voxel counts
+differ 2.75x) is now 57-66% of wall.
+[#1087](https://github.com/mudler/vllm.cpp/issues/1087) owns identifying it, and
+the sampler classified by CPU-time rate rather than by symbol, so what is
+measured is a duration and a scaling law and **not** a named function.
+
 ## 5. Tests
 
 Red-first, entering through the production entry point per
@@ -459,7 +519,13 @@ takes a different path entirely.
   recipe that ships. Covered by #644 row scope; not separately filed, because
   #644 already owns "close every refused arm".
 - Attribution of the 60 GiB decode loss and the single-threaded decode
-  throughput (§4). Both need the GPU; both are measurement rows.
+  throughput (§4). Both need the GPU; both are measurement rows. **Both moved,
+  and neither closed. See §4.1.** The decode throughput was answered by
+  [#1041](https://github.com/mudler/vllm.cpp/issues/1041), which handed the
+  position to an unidentified serial phase
+  ([#1087](https://github.com/mudler/vllm.cpp/issues/1087)). The 60 GiB loss did
+  not reproduce on `0b0b8900f` under a 2 s guard, which is not an attribution:
+  [#1014](https://github.com/mudler/vllm.cpp/issues/1014) still owns it.
 - **The lcm form of the divisor** (§3.1). `max_spatial_downscale()` is the
   maximum where the correct quantity is the least common multiple of the phase
   downscales. The two agree on every shipped recipe and part on a recipe with

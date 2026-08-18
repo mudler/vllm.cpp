@@ -55,6 +55,8 @@
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vt/backend.h"
+#include "vt/op_provider.h"
+#include "vt/ops.h"
 
 using vllm::Ltx2DitLoadOptions;
 using vllm::Ltx2DitParams;
@@ -2467,9 +2469,25 @@ void CheckArmFuses(Ltx2DitQuant quant, const char* tag) {
   spec.path = lora_path;
   spec.strength = 1.0;
   options.loras.push_back(spec);
+
+  // REACHABILITY for LTX25-LORA-FUSE-SEAM (#1202). `test_ltx2_lora` calls
+  // `Ltx2FuseLoraIntoTensor` directly, which proves the function works and NOT
+  // that a checkpoint load reaches it — and the seam this row put under that
+  // function is only worth anything on the load path, which is where the hours
+  // were spent. So the count is taken around `Ltx2LoadDitFromSafetensors`, a
+  // production entry point, and it is an EQUALITY against the tensor count the
+  // same call reports: one shared GEMM dispatch per fused tensor, no more.
+  vt::EnableOpProviderCallStats(true);
+  const unsigned long long matmuls_before =
+      vt::GetOpProviderStats(vt::OpId::kMatmul, vt::DeviceType::kCPU).selections;
   const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  const unsigned long long matmuls_after =
+      vt::GetOpProviderStats(vt::OpId::kMatmul, vt::DeviceType::kCPU).selections;
+  vt::EnableOpProviderCallStats(false);
 
   INFO("arm = ", std::string(tag));
+  CHECK(matmuls_after == matmuls_before + static_cast<unsigned long long>(
+                                              fused.lora_fused_tensors));
   // Exactly one contract tensor was touched.
   CHECK(fused.lora_fused_tensors == 1);
   // No adapter metadata, so both factors are upstream's default of 1.

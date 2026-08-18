@@ -23149,3 +23149,238 @@ reads max abs 2.12e-05 / mean rel 2.88e-05, f64-then-store reads 5.88e-08 /
 below one bf16 ulp of the value it produces. Ten of twelve goldens are unchanged;
 the two that moved are the V1 arm at 1.19e-07 and 7.45e-08 against a 1e-5 bound.
 No tolerance was widened.
+
+## ROCM-GEMMA4-PREFILL-PEER-BARRIER — incremental Finish success-path barrier cost at T=2029 (2026-08-18, #1047 item 3)
+
+**Attribution only. Not a product ship number. Deleting the two Finish barriers is not authorized to land.**
+
+Under the frozen dual-R9700 T=2029 prefill-peer recipe, deleting only the two
+explicit Finish success-path `hipEventSynchronize(tls.ev_e)` +
+`hipStreamSynchronize(cst)` barriers improved end-to-end throughput by 2.55%
+(1122.10 vs 1094.24 tok/s; about 46.05 ms/request). This measures the incremental
+aggregate cost of those barriers relative to the retained RecordedEvent wait in
+`RetirePinThenUnpin`. It does not measure total blocking-retirement cost, prove
+asynchronous overlap recovery, or generalize beyond this recipe.
+
+Researcher verdict `20260818T040236-Researcher-fa20`: active T=2029 timing GREEN.
+T=19 remains an optional unused negative control.
+
+### Construction
+
+| Arm | Role | Source | BIN sha256 | Size |
+|-----|------|--------|------------|------|
+| A / BEFORE | wait-only (no extra Finish barriers) | parent `1de7b132` | `4526f3f9122444c8e10d564a7fa87d3ab60b87a5bc6f1cae5e9b411f20a96dca` | 27153608 |
+| B / AFTER | two Finish success-path barriers | `cf31e5e98` | `3324394bb1bf1368e86882aa267c2054e53cbbe26dd739f27c636b241b05bf62` | 27153608 |
+
+Timing BINs are counter-free. Separate identical witness pair (not used for timing):
+
+| Witness | HEAD | BIN sha256 | Size |
+|---------|------|------------|------|
+| BEFORE-W | `2b69f6f4` | `a40137930a8652920901abed9be8b71ec65eec8ca4bfef7c9a35b8440dac92a7` | 27155560 |
+| AFTER-W | `3aa12542` | `a38e57238920738397140aa90cfd5cabc865ca9bfac2504a27b3b7647020fc71` | 27155560 |
+
+Harness (frozen at fire):
+
+| Artifact | SHA256 |
+|----------|--------|
+| `prefill_peer_client.py` | `adc497419a98e13a1413fea1f64db5060b71900aac945117d7b06061385f027a` |
+| `run-1047-item3-timing.sh` | `3c482c6ee6ae27227dd9092cb8d17df916b34fc138c274ac78cc645a2e4ef196` |
+| `compare_1047_item3.py` | `e33c2273190f6b3ea5db98e2b6e94b4d06bb972ecb3bd67a9aabbc10b2d38dbc` |
+| `parse_prefill_peer_witness.py` | `8ca3cf58c5c192fa142acfad1c24d425d1a3642adb58949de4d3544a40709430` |
+
+### Recipe
+
+Isolated `:8012` only. Never `:8010`. Dual Radeon AI PRO R9700 (gfx1201). Model
+`gemma-4-26B-A4B-it-fp8`. Order calib then A1 -> B1 -> B2 -> A2, separate
+processes, teardown between each.
+
+Env: `HIP_VISIBLE_DEVICES=0,1` `PREFIX_CACHE=0` `MAX_MODEL_LEN=65536`
+`NUM_BLOCKS=2048` `MAX_NUM_SEQS=4` `MAX_BATCHED_TOKENS=8192`
+`VT_GEMMA4_PREFILL_PEER_ACT=1` `VT_GEMMA4_SWA_PHYSICAL=0`
+`VT_GEMMA4_GPU0_HEADROOM_GB=16`. `VT_GEMMA4_PREFILL_PEER_WITNESS` and
+`VT_GEMMA4_PROFILE` unset on every timing arm.
+
+Counter-free calibration on the BEFORE timing BIN froze prompt SHA
+`bdd0bfac665d250ede60f1f49f6a77106736afac01a80c559bf2143142ec54b8`
+(`usage.prompt_tokens=2029` exact). Same file reused on all four legs.
+
+Identity gate (all four legs): HTTP 200, `prompt_tokens=2029`,
+`completion_tokens=2`, tokens `["**","Count"]`, `seq_sha=cf33d9bd3b418e54e49f2358`.
+
+Each timing leg: 3 discarded warmups, 5 measured bursts (`burst=1`,
+`out-tokens=1`). `n_tok` from API `usage` only. `dirty_excluded=0`, `resets=[]`.
+Zero `prefill_peer_witness:` lines in timing serve logs.
+
+### 20 raw measured samples (tok_sum=2030 each)
+
+| leg | i0 | i1 | i2 | i3 | i4 |
+|-----|---:|---:|---:|---:|---:|
+| A1 | 1125.2743 | 1122.6271 | 1122.5586 | 1121.6334 | 1119.2061 |
+| B1 | 1092.3775 | 1095.8747 | 1092.4946 | 1092.6152 | 1089.7476 |
+| B2 | 1096.5926 | 1099.3896 | 1084.0359 | 1096.2230 | 1098.4552 |
+| A2 | 1120.4249 | 1117.9151 | 1123.3178 | 1121.0147 | 1125.8531 |
+
+### Comparator (independent recompute matches)
+
+- A pool median **1122.0960** tok/s, range 7.9380
+- B pool median **1094.2450** tok/s, range 15.3537
+- A/B **1.025452x** (+2.5452% without the barriers)
+- Median request wall: A **1.809115 s**, B **1.855165 s**; delta **46.050 ms**
+- Effect **27.8510** tok/s; max pooled arm range **15.3537**; effect/max-range **1.814x**; `inside_disp=false`
+- Leg medians keep direction across the interleave: A1 1122.5586, B1 1092.4946, B2 1096.5926, A2 1121.0147
+- A1<->A2 drift 1.5439; B1<->B2 drift 4.0980
+- dirty A1=0 B1=0 B2=0 A2=0
+- `PROTOCOL_OK`; comparator printed `CANDIDATE_PROMOTE`; lab did not self-promote
+
+### Live witness (equal-call proof, unmeasured)
+
+Event-derived each arm: `n_lines=4844`, `launch_ok=finish_ok=2422`, fails=0,
+`y_host_fb=0`. A/B M histograms identical (639 keys, sum 2422, M in [1,2020]).
+`witness-compare.json` sha256
+`74ae4180db5a3d0b499c371932f71e4fa50f2cc31b267fafb394f0a689a38101`.
+WITNESS absent during calib, present on both witness arms.
+
+### Artifacts
+
+`/home/don/.cache/hermes-builds/pr1047-cost/ab-out-item3-timing/`
+(orchestrator.log, compare.txt, timing-arm{A1,B1,B2,A2}-T2029.json,
+ident-arm*-T2029.json, serve-arm*.log, environ-arm*.txt, frozen prompt).
+Witness pack: `ab-out-item3-witness/`. Bus RESULT `20260818T040119-hermes-1f25`.
+
+### What this is NOT
+
+- Not a license to delete the Finish waits in product.
+- Not total blocking-retirement cost vs a no-host-wait baseline.
+- Not overlap / async-unpin recovery.
+- Not a KEEP `:8010` or p42k number.
+- Not T=19 (control not authorized).
+
+## LTX25-LORA-FUSE-SEAM — the IC-LoRA delta product, 143x and byte-identical (2026-08-18, `row/LTX25-LORA-FUSE-SEAM`, base `origin/main` `7b9e207b1`, #1202)
+
+`Ltx2FuseLoraIntoTensor` computed `(B * strength) @ A` with a scalar
+single-threaded triple loop. It is now `vt::Matmul`, the row-major member of the
+GEMM seam whose transposed member `LTX25-TEXT-LINEAR-SEAM` took the same day.
+**The output is byte-identical, and that is measured rather than argued.**
+
+### Recipe
+
+x86 development box, **not GB10 and not a fleet device** — 20 vCPU under KVM on
+an AMD Ryzen 9 9950X3D, AVX-512 present, 84 GiB RAM, Ubuntu 24.04, GCC 13.3.0.
+CMake `Release` (`-DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF`; no CUDA
+compiler present, so the CPU tier), `-O3 -DNDEBUG -ffp-contract=off`; the harness
+itself `-O2 -std=c++17 -ffp-contract=off`. **Box NOT idle:** loadavg 1.73 at the
+start of the A/B and 2.09 at the end.
+
+The harness drives the **production** fuser: it writes a real safetensors
+adapter, opens it with `vllm::Ltx2LoraAdapter::Open`, and times
+`vllm::Ltx2FuseLoraIntoTensor`. Identical harness source and flags on both arms;
+only `libvllm.a` differs. Geometry is one real `to_q`-shaped module of the
+shipped DiT — `inner_dim = num_attention_heads * attention_head_dim = 32 * 128 =
+4096` — at the shipped distilled adapter's rank 450, so `4096 x 450 x 4096` =
+7.55e9 MAC. Five repeats per arm.
+
+### The A/B
+
+| arm | wall (median of 5) | spread | fuser throughput | FNV-1a of the fused buffer |
+|---|---:|---:|---:|---|
+| before, scalar triple loop | **17.7761 s** | 17.7324 – 18.1529 | 0.4247 GMAC/s | `a23e7f876694c537` |
+| after, `vt::Matmul` | **0.1242 s** | 0.1235 – 0.1355 | 60.86 GMAC/s | `a23e7f876694c537` |
+
+**17.7761 s -> 0.1242 s, 143.1x.** The digest is over the whole 4096x4096 bf16
+result and it is the same on all ten runs across the two binaries, so the
+correctness claim is byte equality at production scale and not a tolerance.
+
+The 0.4247 GMAC/s before-arm rate is the independent cross-check on #1202's GB10
+attribution, which derived ~0.53 GFLOP/s from an f32 working-set growth rate.
+Same order, different box, different method.
+
+### Where the time goes now, because it is no longer the GEMM
+
+Re-running the same harness at `rank = 1` keeps the output size and makes the
+product negligible, so what it measures is the surrounding per-element work:
+
+| | `rank = 450` | `rank = 1` |
+|---|---:|---:|
+| after | 0.1242 s | **0.0733 s** |
+| before | 17.7761 s | 0.0955 s |
+
+So the GEMM is now ~0.046 s (~164 GMAC/s) and **~0.073 s, 59% of the call, is the
+aggregator zero-fill plus the single-threaded bf16 add-back loop** — three
+out-of-line conversions per element. Before this row that loop was 0.5% of the
+call and was correctly ignored. Filed as
+[#1254](https://github.com/mudler/vllm.cpp/issues/1254) and owed by this row's
+spec; NOT fixed here, because `vt::Add` matches the bf16 branch exactly and does
+NOT match the f32 branch, which rounds its sum through bf16 before an f32 store
+to mirror `fuse_loras.py:67-68`.
+
+### Decomposing the 143x
+
+Standalone probe at `3072x450x3072`, same box. Each row carries its OWN paired
+scalar arm, computed in the same process immediately before the seam arm, so
+every ratio is against that number and not against another row's:
+
+| configuration | scalar arm | seam wall | ratio |
+|---|---:|---:|---:|
+| default (20 threads, AVX-512 tier) | 9.8942 s | 0.0247 s | **400.4x** |
+| `VLLM_CPP_CPU_THREADS=1` | 9.8694 s | 0.3593 s | 27.5x |
+| `VT_CPU_MATMUL_TIER=ref`, 1 thread | 9.8397 s | 18.088 s | **0.54x — SLOWER** |
+
+So 27.5x is the micro-kernel, the 16-lane output blocking, the inlined widening
+and an operand order that stops striding a cache line per innermost load; the
+remaining 14.5x is the threadpool over 20 cores. The `ref` row is kept because it
+is the one configuration in which routing through the seam LOSES, and it is still
+bit-identical — the determinism contract holding, not a coincidence.
+
+`mismatched = 0` in every configuration above and at every shape tried:
+`3072x450x3072`, `128x450x3072`, `3072x32x8192`, `37x7x29`, `64x1x64`.
+
+### Full-model projection, stated as a projection
+
+Across the 1660 targeted modules of the 21.004 B DiT (#1202's 8.53e12 MAC, and
+~1.9e10 output elements if the whole adapter is rank 450) the product falls from
+~20,280 s to ~52 s **on this box**, and #1254's loop is ~79 s of the ~131 s that
+remains. This is arithmetic on measured rates. **No full-model fusion pass has
+run here**, and #1202's own number was itself a rate extrapolated over a
+10.4-minute window.
+
+### What is NOT claimed
+
+**No GB10 number.** #1202's stacks, thread count and rate are from GB10; every
+number above is from a 20-core Zen 5, and the per-core ratio between them is the
+same unmeasured quantity `LTX25-TEXT-LINEAR-SEAM` carries. The threading half of
+the win is available on GB10, which also has 20 cores; the SIMD half is not
+transferable, because GB10 is Arm and takes the NEON tier rather than AVX-512.
+
+**Nothing about the shipped 8.9 GB distilled adapter.** No real adapter was read
+on this box. The harness adapter is synthetic at the real geometry.
+
+### Mutations
+
+Five, each restored byte-for-byte (`git checkout -- .`, then `git diff --stat`
+empty). `compile_err` counts `error:` lines in the build log.
+
+| # | mutation | `git diff --stat` | `BUILT` | `compile_err` | verdict |
+|---|---|---|---|---|---|
+| M1 | `vt::Matmul` -> the pre-row scalar triple loop | 1 file, +12 / -10 | YES | 0 | **RED.** `test_ltx2_lora` 15 cases / 1 failed: `CHECK(stats.selections == matmuls_before + fused_tensors)` read `0 == 3`, `REQUIRE(stats.last_selected != nullptr)` read `nullptr != nullptr`. `test_ltx2_loader` 37 / 3 failed: `CHECK(matmuls_after == matmuls_before + fused.lora_fused_tensors)` read `0 == 1` on all three arms. The byte-equality assertions stayed GREEN, which is the point — they are the oracle, not the discriminator |
+| M2 | `FuseLorasInto` no longer calls the fuser (the production call site) | 1 file, +3 / -2 | YES | 0 | **RED in the loader only.** `test_ltx2_loader` 37 / **5** failed, every one a thrown `fused into ZERO tensors of this checkpoint`. `test_ltx2_lora` stayed 15/15 — which is exactly why the loader assertion had to exist: the direct-call suite cannot see reachability. Note the reporting trap: the loader run printed `assertions: 5975 | 0 failed` beside `Status: FAILURE!`, because a thrown case fails without failing an assertion |
+| M3 | `strength` applied AFTER the product instead of rounding `B * strength` to bf16 before it — mathematically the same product, different roundings | 1 file, +5 / -4 | YES | 0 | **RED.** `test_ltx2_lora` 15 / 2 failed, 5 assertions. New case: `CHECK(mismatched == 0)` read `207 == 0` at `19x5x37` and `2228 == 0` at `64x13x96`. The pre-existing rank-192 accumulator case also red (`got[0] == Approx(192.0)`), so the two gates are independent and agree |
+| M4 | shape-mismatch `Fail` deleted | 1 file, +1 / -6 | YES | 0 | **RED.** `CHECK(Mentions(err, "[2, 2] delta"))` and `CHECK(Mentions(err, "[4, 4]"))` |
+| M5 | second-adapter `Fail` disarmed (`adapters.size() > 1` -> `false`) | 1 file, +1 / -1 | YES | 0 | **RED.** `CHECK(Mentions(err, "exactly ONE adapter"))` and `CHECK(Mentions(err, "LTX25-IC-LORA"))` |
+
+**The first attempt at M2 did not build**, and it is recorded because a mutation
+that fails to build reads exactly like a passing test. Deleting the call left
+`buffer` unused and `-Werror=unused-parameter` failed the compile; the harness
+reported `BUILT=NO` and refused to draw a verdict, and the mutant was fixed with
+a `(void)buffer` rather than believed. This is the same trap #1252's reviewer hit
+on the same day.
+
+### Red-then-green counts
+
+| suite | red (pre-change source, tests in place) | green |
+|---|---|---|
+| `test_ltx2_lora` | 15 cases / 14 passed / **1 failed**; 113 assertions / 2 failed | 15 / 15; 114 assertions |
+| `test_ltx2_loader` | 37 cases / 34 passed / **3 failed**; 64204 assertions / 3 failed | 37 / 37; 64204 assertions |
+
+The case counts moved on both suites, so neither run is a filter that matched
+nothing. The red assertion-count is 113 rather than 114 because the `REQUIRE` on
+`last_selected` aborted the case before its last `CHECK`.

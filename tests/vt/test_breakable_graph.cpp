@@ -560,6 +560,75 @@ TEST_CASE("Lifetime rule 1: the destination survives the frame that declared it"
   CHECK(seen == std::vector<int32_t>{99, 99});
 }
 
+// The ALIASING half of the SAME rule, which `BreakSlot` did NOT close. The type
+// closed the LIFETIME half: the seam owns the storage, so no caller can hand the
+// break a destination that dies first. It left the other half expressible. ONE
+// slot reused for TWO break points inside one capture compiled, and
+// `PinForCapture` returned the cell it had already made, so BOTH replay closures
+// wrote through the SAME address: break 0's writeback was overwritten by break
+// 1's on every replay, and any segment that baked break 0's destination read
+// break 1's data. Measured on the head before this repair, `&*slot` was byte
+// identical after break 0 and after break 1, and after `Replay` the slot held
+// only break 1's value. That is the shape of the defect the review already
+// found once at the production site, with the lifetime half fixed and this half
+// open — and W2 through W5 add nine more callers.
+//
+// The rule is one destination per break point, and registration now REFUSES the
+// second. Refusing at `AppendBreak` rather than at the slot is deliberate: every
+// form of `GraphBreak` must state its destination to register at all, so a form
+// added later cannot opt out by forgetting.
+TEST_CASE("Aliasing: one BreakSlot reused for TWO break points in one capture is REFUSED") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  int32_t feed = 3;
+
+  auto two_breaks_into_one_slot = [&] {
+    GraphCaptureScope scope(b, q, g);
+    BreakSlot<vt::Tensor> shared;
+    GraphBreak([&] { return MakeBuf(b, {feed, feed}).t; }, shared);
+    GraphBreak([&] { return MakeBuf(b, {feed * 10, feed * 10}).t; }, shared);
+  };
+  CHECK_THROWS_AS(two_breaks_into_one_slot(), std::runtime_error);
+  // The refusal leaves NO capture behind. The exception propagates out of the
+  // scope, so the drain sees it and destroys the half-built container rather
+  // than handing back a forward that replays two segments of three.
+  CHECK_FALSE(g.captured());
+  CHECK(g.break_count() == 0);
+  CHECK(GraphCaptureScope::Current() == nullptr);
+
+  // CONTROL 1: two DISTINCT slots in the same capture are accepted, and each
+  // keeps its own destination. A refusal that fired here would be a mute switch
+  // on the whole destination form.
+  BreakableGraph g2;
+  BreakSlot<vt::Tensor> first, second;
+  {
+    GraphCaptureScope scope(b, q, g2);
+    GraphBreak([&] { return MakeBuf(b, {feed, feed}).t; }, first);
+    GraphBreak([&] { return MakeBuf(b, {feed * 10, feed * 10}).t; }, second);
+  }
+  CHECK(g2.segment_count() == 3);
+  CHECK(g2.break_count() == 2);
+  CHECK(first->data != second->data);
+  feed = 5;
+  g2.Replay(q);
+  CHECK(ReadT(*first) == std::vector<int32_t>{5, 5});
+  CHECK(ReadT(*second) == std::vector<int32_t>{50, 50});
+
+  // CONTROL 2: the constraint is per CAPTURE, not per slot for life. Reusing one
+  // slot in a LATER capture is legal, because the later capture bakes its own
+  // addresses and there is only one closure writing through the cell.
+  BreakableGraph g3;
+  {
+    GraphCaptureScope scope(b, q, g3);
+    GraphBreak([&] { return MakeBuf(b, {feed + 1, feed + 1}).t; }, first);
+  }
+  CHECK(g3.segment_count() == 2);
+  CHECK(g3.break_count() == 1);
+  CHECK(ReadT(*first) == std::vector<int32_t>{6, 6});
+}
+
 // ---------------------------------------------------------------------------
 // TestBreakGraphHelper (`:230`).
 // ---------------------------------------------------------------------------

@@ -206,8 +206,8 @@ via an `rc` lease, driver 12060, three replays with fresh inputs, zero
 mismatches).
 
 Gates: `tests/vt/test_breakable_graph.cpp` ports SGLang's unit suite case for
-case, with its arithmetic chains and its post-replay assertions intact (23
-cases, 150 assertions); `tests/vllm/models/test_qwen3_break_point.cpp` drives
+case, with its arithmetic chains and its post-replay assertions intact (24
+cases, 163 assertions); `tests/vllm/models/test_qwen3_break_point.cpp` drives
 the production forward with a scope open, counts one segment per layer plus one,
 and compares the logits BIT FOR BIT against the unscoped forward (500 values, 0
 differing).
@@ -217,10 +217,18 @@ takes a `vt::BreakSlot` whose storage the seam owns, because the following
 segment bakes that address and a caller's local dies first; a destination with no
 `CopyOutput` overload is a compile error naming the type rather than a silent
 drop into the no-writeback path; a second capture scope on one thread and a
-re-entered container are refused; and a forward that throws mid-capture leaves no
-partial graph reporting itself as captured. Interleaved replay, the
-`VLLM_CPP_CUDAGRAPH=0` kill switch and each refusal above are gated, every one
-proven by a mutation that reds them.
+re-entered container are refused; and a forward that throws OUT OF the scope
+mid-capture leaves no partial graph reporting itself as captured. Interleaved
+replay, the `VLLM_CPP_CUDAGRAPH=0` kill switch and each refusal above are gated,
+every one proven by a mutation that reds them.
+
+Two break points in one capture writing through ONE destination are refused as
+well, at registration. `BreakSlot` closed the lifetime half of that rule and
+left the aliasing half writable: both replay closures bound to the same address,
+so the earlier writeback was overwritten. One shape still escapes, and the spec
+names it and assigns it to W2 — an exception CAUGHT INSIDE the scope leaves the
+rest of the forward uncaptured while `captured()` stays true, because nothing is
+unwinding at scope exit for the drain to see.
 
 **Not yet entered from a production step.** No driver opens a capture scope
 until W2 migrates `Qwen3DenseDecodeGraph`; the break point itself runs on every

@@ -236,7 +236,8 @@ class BreakableGraph {
 // `VLLM_CPP_CUDAGRAPH=0`. An inert scope captures nothing, every `GraphBreak`
 // inside it is a pass-through, and the forward runs eager exactly as today.
 //
-// TWO THINGS IT REFUSES, both `VT_CHECK`, both before any backend call:
+// THREE THINGS IT REFUSES, all `VT_CHECK`. The first two are refused at
+// construction, before any backend call:
 //
 //   * A NESTED scope on the same thread. `BeginCapture` on a stream that is
 //     already capturing is `CUDA_ERROR_ILLEGAL_STATE` on a real backend, and the
@@ -244,12 +245,26 @@ class BreakableGraph {
 //   * A container that already holds a capture. Re-entering appends to it, and
 //     the result has `break_count() == segment_count()`, whose last break
 //     `Replay` would silently drop. Call `Reset()` first.
+//   * TWO BREAK POINTS SHARING ONE DESTINATION, refused at registration. Both
+//     replay closures would write through the same address, so the earlier
+//     writeback is overwritten and any segment that baked the earlier
+//     destination reads the later break's data. See lifetime rule 1 below;
+//     this one throws from `AppendBreak`, mid-capture, and the drain below is
+//     what turns it into no capture at all.
 //
 // AND ONE THING IT DRAINS. If the scope exits by EXCEPTION — a break function
 // that throws, or ordinary model code between two break points — the stream is
 // taken out of capture and the half-built container is `Reset()`. A partial
 // capture must never be reported as `captured()`, because a partial capture is
 // replayable, and replaying half a forward is silently wrong numerics.
+//
+// THE DRAIN'S LIMIT, stated because it is not obvious. It compares
+// `std::uncaught_exceptions()` against the depth at entry, so it sees an
+// exception that is PROPAGATING at scope exit. An exception CAUGHT INSIDE the
+// scope leaves `segment_open_ == false` with the rest of the forward
+// uncaptured, and nothing is unwinding at scope exit, so `captured()` stays
+// true over a forward missing its tail. Do not `try` around a break point
+// inside a capture scope. Owed to W2 in the spec's `## Owed`.
 class GraphCaptureScope {
  public:
   GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out);
@@ -267,7 +282,19 @@ class GraphCaptureScope {
   // point, and opens a fresh one for the remainder of the forward.
   void EndSegment();
   void BeginSegment();
-  void AppendBreak(std::function<void()> fn);
+  // `destination` is the CELL this break's replay closure writes through, or
+  // `nullptr` for a form whose replay writes back nowhere. It is a REQUIRED
+  // parameter, not an optional one, so a break cannot be registered without
+  // stating where it lands: two breaks naming one destination are refused here
+  // (see the aliasing paragraph at lifetime rule 1).
+  //
+  // The CELL and not the SLOT, because a slot's ADDRESS is not its identity.
+  // The production site declares its slot as a local of `RunLayer`, so every
+  // layer's slot occupies the SAME stack address and slot-address identity
+  // refuses the correct program on layer 2. The cell is heap storage the
+  // replay closures keep alive for the whole capture, so two live cells cannot
+  // share an address — and the cell is what actually aliases.
+  void AppendBreak(std::function<void()> fn, const void* destination);
 
  private:
   Backend* b_;
@@ -276,6 +303,10 @@ class GraphCaptureScope {
   bool active_ = false;
   bool segment_open_ = false;
   int uncaught_on_entry_ = 0;
+  // One entry per registered break that names a destination, for the life of
+  // this capture. A capture has as many breaks as the model has split points,
+  // so a linear scan here is cheaper than the map that would replace it.
+  std::vector<const void*> destinations_;
 };
 
 // ---------------------------------------------------------------------------
@@ -296,11 +327,24 @@ class GraphCaptureScope {
 // new model author is least likely to know, and both produce wrong numbers
 // rather than a fault:
 //
-//   1. The DESTINATION must outlive the `BreakableGraph`, and no replay may
-//      reallocate it. ENFORCED: the destination form takes a `vt::BreakSlot<T>`
-//      and the seam owns its storage for the life of the replay closure. There
-//      is no overload taking a bare reference, so the rule cannot be broken by
-//      writing the obvious thing.
+//   1. The DESTINATION must outlive the `BreakableGraph`, no replay may
+//      reallocate it, and no two break points may share it. ENFORCED in two
+//      different ways, because the rule has two halves and only one of them is
+//      a lifetime:
+//        * LIFETIME, by the TYPE. The destination form takes a
+//          `vt::BreakSlot<T>` and the seam owns its storage for the life of the
+//          replay closure. There is no overload taking a bare reference, so
+//          handing the break a destination that dies first is not writable.
+//        * ALIASING, by a REFUSAL. One slot reused for two break points in one
+//          capture is still writable — `PinForCapture` hands back the cell it
+//          already made — and it binds BOTH replay closures to the SAME
+//          address, so the earlier writeback is overwritten and any segment
+//          that baked the earlier destination reads the later break's data.
+//          `AppendBreak` throws on the second registration naming a cell
+//          already registered in this capture. The constraint is per CAPTURE,
+//          not per slot for life: a later capture bakes its own addresses and
+//          may reuse the slot. The NON-COPYABLE fallback is outside this
+//          refusal and says so at its own declaration.
 //   2. A closure must capture DEVICE POINTERS or `Tensor` views that are stable
 //      across replays, never a reference to a host temporary that dies with the
 //      capturing call.
@@ -330,7 +374,7 @@ void GraphBreak(Fn&& fn) {
   }
   s->EndSegment();
   fn();  // run once eagerly, so the outputs hold real data (`:222-223`)
-  s->AppendBreak([f = std::forward<Fn>(fn)]() mutable { f(); });
+  s->AppendBreak([f = std::forward<Fn>(fn)]() mutable { f(); }, nullptr);
   s->BeginSegment();
   detail::CountBreakPoint();
 }
@@ -368,9 +412,9 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
   *cell = fn();
   Backend* b = &s->backend();
   Queue* q = &s->queue();
-  s->AppendBreak([b, q, cell, f = std::forward<Fn>(fn)]() mutable {
-    CopyOutput(*b, *q, *cell, f());
-  });
+  s->AppendBreak(
+      [b, q, cell, f = std::forward<Fn>(fn)]() mutable { CopyOutput(*b, *q, *cell, f()); },
+      cell.get());
   s->BeginSegment();
   detail::CountBreakPoint();
 }
@@ -379,6 +423,12 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
 // Upstream returns `src` and leaves the destination untouched; so does this. The
 // slot then holds the CAPTURE-TIME value forever, which is correct only when
 // nothing downstream of the break reads it on replay.
+//
+// It registers NO destination, and that is not an oversight: this form pins no
+// cell and its replay closure writes back nowhere, so the aliasing refusal has
+// nothing to compare. Two of these sharing one slot still overwrite each other
+// at CAPTURE time, which is a narrower hazard than the writeback one and is not
+// gated here.
 template <class Fn, class Out>
 void GraphBreak(Fn&& fn, BreakSlot<Out>& out, NoWriteback) {
   GraphCaptureScope* s = GraphCaptureScope::Current();
@@ -389,7 +439,7 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out, NoWriteback) {
   }
   s->EndSegment();
   *out = fn();
-  s->AppendBreak([f = std::forward<Fn>(fn)]() mutable { (void)f(); });
+  s->AppendBreak([f = std::forward<Fn>(fn)]() mutable { (void)f(); }, nullptr);
   s->BeginSegment();
   detail::CountBreakPoint();
 }

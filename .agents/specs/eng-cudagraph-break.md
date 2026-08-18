@@ -675,9 +675,11 @@ W1's exit criterion and it needs a GPU lease.** It is named rather than skipped.
 `src/vt/breakable_graph.cpp`, with tests 1 through 5 of `## Tests to port` plus
 the `TestCopyOutput` set (T7 through T10), the bare marker (T11), the
 replay-order case (test 12), the capture-failure drain (test 13, all three
-arms), the non-capturing backend (test 14) and the ownership case that proves
-every segment is released through `Backend::DestroyGraph`.
-`tests/vt/test_breakable_graph.cpp`, 23 cases, 150 assertions, exit 0.
+arms), the non-capturing backend (test 14), the aliasing refusal with its two controls,
+and the ownership case that proves every segment is released through
+`Backend::DestroyGraph`. `tests/vt/test_breakable_graph.cpp`, 24 cases, 163
+assertions, exit 0, re-derived by `ninja test_breakable_graph &&
+./build/tests/test_breakable_graph`.
 
 **A fresh review returned FAIL on the first head and the repairs are part of
 W1.** What the review found, and what closed it, because each one is a class of
@@ -688,8 +690,34 @@ defect a later stage can repeat:
   a frame that was gone before the scope closed, and the pooled block it named
   went back on the `DevicePool` free list. Inert at W1 because no driver opens a
   scope, and wrong the moment W2 does. Closed structurally: the destination is a
-  `vt::BreakSlot` the seam owns, there is no reference-taking overload left, and
-  the rule the header spent a paragraph on is now unexpressible to violate.
+  `vt::BreakSlot` the seam owns and there is no reference-taking overload left.
+
+  **That closed the LIFETIME half of the rule, and this spec claimed the whole
+  rule was "unexpressible to violate". It was not, and a scoped re-review
+  measured the other half still open.** One slot reused for TWO break points in
+  one capture compiled: `PinForCapture` returns the cell it already made, so
+  both replay closures bind to the SAME address, `&*slot` is byte identical
+  after break 0 and after break 1, and after `Replay` the slot holds only break
+  1's value — break 0's writeback overwritten, and any segment that baked break
+  0's destination reading break 1's data. The production site is correct today
+  because its slot is a `RunLayer` local, but W2 through W5 add nine more
+  callers and the prose was telling them the shape was unwritable. Closed by a
+  REFUSAL rather than by the type, and the prose now names which half is which:
+  `GraphCaptureScope::AppendBreak` takes the destination as a REQUIRED
+  parameter, so no form can register without stating where it lands, and it
+  throws when a second break in the same capture names a cell already
+  registered. Two things the repair had to get right, both measured rather than
+  reasoned. The identity is the CELL and not the SLOT: the production slot is a
+  per-call local, every layer's slot lands at the same STACK address, and
+  slot-address identity therefore refused the correct program on layer 2 and
+  reddened the G2 gate. And the non-copyable fallback registers no destination,
+  because it pins no cell and its replay writes back nowhere. Red-first: the
+  case failed on the unrepaired head with the aliased capture ACCEPTED,
+  `break_count() == 2` into one slot. Two mutations, both detected — deleting
+  the refusal reds only the new case (23 of 24 still pass and G2 stays green,
+  which is exactly why nothing caught this before), and making it over-fire reds
+  two unit cases AND the G2 reachability gate, so the controls are not
+  vacuous.
 - Interleaved replay was claimed, spec'd, and NOT gated. Replacing the
   interleaved loop with "replay all segments, then run all breaks" left the suite
   green, because break markers went into a vector the backend log knew nothing
@@ -955,6 +983,17 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   scope open, 500 logits and 0 differing — which proves the seam changed no
   numerics, and does NOT prove a replayed segmented capture matches. Owner:
   **W2**, on the leased GPU its gate models already need.
+- **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
+  drain cannot see.** The `uncaught_exceptions()` comparison in
+  `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A
+  break function that throws and is caught between two break points inside the
+  scope leaves `segment_open_ == false`, so the remainder of the forward is
+  never captured, and nothing is unwinding at scope exit, so the drain does not
+  fire and `captured()` stays true over a forward that is missing its tail. The
+  header and this spec state the guarantee only for the propagating case, so
+  this is a RESIDUAL rather than a false claim — but a driver that wraps a break
+  in a `try` gets silently wrong numerics on replay, and W2 is the first stage
+  that opens a scope from a driver. Owner: **W2**.
 - **The reuse hazard the seam must close** (D1): making the intermediates a
   segment reads unavailable to the `DevicePool` free list for the life of the
   `BreakableGraph`. W1 states the lifetime rules at the `GraphBreak` declaration

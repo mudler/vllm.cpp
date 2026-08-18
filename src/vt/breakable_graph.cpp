@@ -209,8 +209,24 @@ void GraphCaptureScope::EndSegment() {
   g_segments.fetch_add(1, std::memory_order_relaxed);
 }
 
-void GraphCaptureScope::AppendBreak(std::function<void()> fn) {
+void GraphCaptureScope::AppendBreak(std::function<void()> fn, const void* destination) {
   if (!active_) return;
+  // The ALIASING half of lifetime rule 1, refused rather than documented. Two
+  // break points writing through one CELL bind both replay closures to the same
+  // address: the earlier writeback is overwritten on every replay, and any
+  // segment that baked the earlier destination reads the later break's data.
+  // Nothing faults and the token gate cannot see it, which is why this is a
+  // refusal and not a comment. The check is here, at the ONE registration
+  // point, so a `GraphBreak` form added later cannot opt out of it.
+  if (destination != nullptr) {
+    for (const void* d : destinations_) {
+      VT_CHECK(d != destination,
+               "GraphBreak: this destination is already the target of another break point "
+               "in the open capture; both replays would write through the SAME address. "
+               "Give each break point its own BreakSlot");
+    }
+    destinations_.push_back(destination);
+  }
   g_->break_fns_.push_back(std::move(fn));
   g_breaks.fetch_add(1, std::memory_order_relaxed);
 }
@@ -223,7 +239,7 @@ void GraphBreak() {
     return;
   }
   s->EndSegment();
-  s->AppendBreak([] {});
+  s->AppendBreak([] {}, nullptr);
   s->BeginSegment();
   detail::CountBreakPoint();
 }

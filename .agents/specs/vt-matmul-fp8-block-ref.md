@@ -289,8 +289,98 @@ scoped so that it does not.
 
 ## Evidence
 
-Recorded below at completion: the RED before the implementation existed, the
-GREEN after, the per-block gate counts, and the mutation table. Every mutation
-prints `compile_rc` **and** `git diff --stat`, because a mutation that fails to
-build and a mutation that never applied both read as a passing test, and M1 hit
-each of those once.
+Taken on the merged tree, `origin/main` at `2d26da5a1`.
+
+**RED.** With the test present and the implementation reversed out — the reverse
+of the implementation diff applied to the four source files, `git diff --stat`
+printing `4 files changed, 200 deletions(-)` so the revert is proven to have
+landed — the focused build fails, `compile_rc=1`, with 29 errors: 23
+``'MatmulFp8BlockScaled' is not a member of 'vt'`` and 6
+``'kMatmulFp8BlockScaled' is not a member of 'vt::OpId'``. Restoring the four
+files returns `git status --porcelain` to empty and the build to green.
+
+**GREEN.** `test_ops_matmul_fp8_block_cpu` reports 6 cases, 80 assertions, 0
+failed, in 3.5 s under `ctest`. Per block, each run through a `-tc` prefix
+filter that contains no comma, because doctest splits `-tc` on commas and a
+name that contains one yields `0 cases ran` under a `SUCCESS!` banner:
+
+| Block | Cases | Assertions |
+|---|---:|---:|
+| G1 registration and name | 1 | 2 |
+| G2 the ported grid | 1 | 22 |
+| G3 the ragged edges | 1 | 13 |
+| G4 the mainloop constraint | 1 | 14 |
+| G5 the refusals | 1 | 25 |
+| G6 the M1 seam | 1 | 4 |
+| **sum** | **6** | **80** |
+
+The buckets sum to the whole-run count, so no block is silently empty and no
+filter selected nothing.
+
+The other declared gates on the same tree: `test_op_provider` passed,
+`test_ops_quant_fp8_group_cpu` passed (M1 unchanged),
+`test_ops_fp8_cpu` passed (the per-tensor sibling unchanged).
+`scripts/agent-preflight.sh --fail-on-skip` reports **All gates green** with 80
+`ok` results, no `FAIL` and no `SKIP` before the verdict line.
+`test_cpu_x86_llamacpp_floor` (#618) passed on this run rather than reporting
+`NO_QUIET_WINDOW`, so this row needed no pristine-baseline reproduction.
+
+### The ragged edge, specifically
+
+`N=576` is `4*128 + 64` and `K=3884` is `30*128 + 44`, the two non-round shapes
+from upstream's own grid (`test_block_fp8.py:49-50`). G3 runs each separately
+and both together, plus upstream's dedicated DSV3 `kv_a_proj_with_mqa` case
+`M=32, N=576, K=7168` (`test_block_fp8.py:156-200`). This is load-bearing and
+measured, not asserted: mutation M2 (floor `k_tiles`) and mutation M3 (a floor
+N-block index) each leave **G2 entirely green** and fail only G3, because every
+`N` and every `K` in G2 is a multiple of 128. A grid of round shapes passes
+while being wrong.
+
+### Mutation results
+
+Every mutation printed `compile_rc` **and** `git diff --stat` before the run,
+because a mutation that fails to build and a mutation that never applied both
+read as a passing test, and M1 of #1189 hit each of those once. Each was
+restored with `git checkout --` and the restore verified.
+
+| Mutation | `compile_rc` | Result |
+|---|---|---|
+| the scales folded into ONE epilogue alpha, `part` collapsed into `acc` | 0 | 4 of 6 cases fail, 26 of 80 assertions. G4's `got != got_swapped` fires, which is the epilogue signature exactly |
+| `k_tiles = k / block_k`, floor instead of cdiv, in the kernel | 0 | **only G3 fails**, 4 assertions. G2 stays green: every K in it is a multiple of 128 |
+| the b_scale row index forced to 0 | **1** | proves nothing: `-Werror=unused-parameter` on `block_n` |
+| the same defect with the parameter kept live: `nb = min(col / block_n, n / block_n - 1)`, a floor tile count that makes a short final N-block reuse the previous scale row | 0 | 3 of 6 cases fail, 13 assertions: G3, G4, G6. **G2 stays green**, for the same reason |
+| `a_scale` dropped from the scale product | 0 | 4 of 6 cases fail, 24 assertions |
+| the CPU registration deleted, the kernel symbol kept live | 0 | all 6 cases fail after 7 assertions. G1's `REQUIRE(OpRegistered(...))` is what catches it |
+| `n_tiles = n / block_n`, floor, in the wrapper's validation | 0 | 4 of 6 cases fail. G5's floor-sized `b_scale` refusal stops firing and G3's well-formed ragged calls are refused instead |
+| the `block_n > 0 && block_k > 0` check removed | 0 | **SIGFPE, core dumped, `run_rc=136`**. The check converts undefined behaviour into a named refusal |
+| the `a_scale` shape check widened to a rank check | 0 | G5's narrow and tall `a_scale` refusals both stop firing, 2 assertions |
+| the store zeroed, `acc * 0.0F` | 0 | 4 of 6 cases fail, 29 assertions, including G4's two vacuity guards — the guards are live |
+
+Three results are worth keeping.
+
+**The epilogue mutation is the row's whole claim, and it is now measured.**
+Folding the per-block scales into a single alpha compiles, runs, and produces the
+identical number for a scale tensor and for that same tensor with its two
+K-block entries swapped. G4 is the only block that can see that, and it does.
+
+**A grid of round shapes is blind to the ragged bug in both directions.** Two
+different floor-vs-ceil mutations — one on the K tiling in the kernel, one on the
+N-block index — left G2 completely green and were caught only by G3. That is the
+argument for keeping `N=576` and `K=3884` in the grid rather than the shapes the
+target checkpoint happens to use, which are all multiples of 128.
+
+**A refusal removed can crash rather than report.** With the block-size
+positivity check deleted, the process took SIGFPE on integer division and doctest
+had already printed `assertions: 52 | 52 passed | 0 failed` before it died. The
+run's exit status is the verdict; its printed summary is not.
+
+### A false red, recorded because it cost a cycle
+
+Mid-run, a direct invocation of the test binary reproduced the zeroed-store
+mutation's exact signature — 4 failed cases, 29 failed assertions — against a
+tree whose sources were clean. The binary was the one the mutation harness had
+last linked; the whole-tree build that followed had not reached the test target
+before the run. Nothing was wrong with the code. The control is the one
+`.agents/verification.md` already names: rebuild explicitly, require
+`ninja: no work to do`, and check that the executable's mtime is newer than
+every source it links, before believing any verdict about it.

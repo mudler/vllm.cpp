@@ -124,6 +124,7 @@ SUITES=(
   test_agent_role
   test_agent_onboard
   test_agent_start
+  test_gate_bringup
   test_claim_view
   test_upstream_inventory
   test_doc_checkpoint

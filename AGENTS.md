@@ -33,6 +33,17 @@ gate `PENDING`. Never convert a missing value into an assumption. Preferences
 control operations only. They cannot reduce a correctness, evidence,
 attribution, or testing obligation.
 
+**Create both files on first use.** Neither is tracked, so a fresh checkout has
+neither, and `scripts/agent-start.py` reports the absence and routes you to ask.
+Ask the developer for the one value the current gate needs. Record an
+environment value with `scripts/agent-onboard.py --env-set KEY=VALUE`, which
+refuses any key `.env.example` does not declare. Record a preference by copying
+`.agents/developer-preferences.example.md` and editing the one entry. Leave
+every key you did not ask about empty, because empty means unavailable and its
+gate stays `PENDING`. A host name, a share path, or a checkout path written in
+a repository document is another developer's resolved value. It is never a
+default, and reading one instead of asking is the failure this rule names.
+
 ## History is git
 
 The project has no state log. Git is the history, and the history must agree

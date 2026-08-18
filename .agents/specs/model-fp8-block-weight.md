@@ -348,8 +348,125 @@ download. The row is scoped so that it needs neither.
 
 ## Evidence
 
-Recorded after the implementation, below the `## Owed` list, so that a reader
-who stops at the design has read the design.
+Taken on the merged tree, `origin/main` at `65d6cdaed`. No GPU lease, no
+checkpoint download, no snapshot.
+
+**RED.** With both test files present and no implementation, the focused build
+fails, `compile_rc=1`, with **50 errors**: 6 ``'Fp8BlockWeight' does not name a
+type``, 4 + 2 + 1 + 1 ``has no member named 'q_proj_fp8_block'`` /
+`'o_proj_fp8_block'` / `'v_proj_fp8_block'` / `'k_proj_fp8_block'` on
+`FullAttnLayerWeights`, 3 more on `DenseMlpWeights`, and the cascade of
+undeclared locals that follows. `test_fp8_block_quant` compiled but reported
+**4 cases, 2 failed, 19 assertions, 9 failed** against the narrowed refusal,
+which is the same red seen from the other side.
+
+**GREEN.** `test_fp8_block_weight_load` reports **7 cases, 102 assertions, 0
+failed**; `test_fp8_block_quant` reports **8 cases, 35 assertions, 0 failed**.
+Per block, each run through a `-tc` prefix filter that contains no comma,
+because doctest splits `-tc` on commas and a name that contains one yields
+`0 cases ran` under a `SUCCESS!` banner:
+
+| Block | Cases | Assertions |
+|---|---:|---:|
+| G1 the rung is selected | 1 | 24 |
+| G2 the scale is widened not reinterpreted | 1 | 17 |
+| G3 the ragged grid | 1 | 11 |
+| G4 the config/tensor disagreements | 1 | 19 |
+| G5 the unsupported configs | 1 | 17 |
+| G6 the per-tensor and bf16 negative controls | 1 | 9 |
+| G7 the M4 gap at `Prepare` | 1 | 5 |
+| **sum** | **7** | **102** |
+
+The buckets sum to the whole-run count, so no block is silently empty and no
+filter selected nothing.
+
+The other declared gates on the same tree, all passing:
+`test_ops_quant_fp8_group_cpu` (M1 unchanged), `test_ops_matmul_fp8_block_cpu`
+(M2 unchanged), `test_ops_fp8_cpu`, `test_qwen36_weights`, `test_linear_method`,
+`test_model_registry`, `test_op_provider`. The whole tree builds clean, 609
+targets, `build_rc=0`.
+
+### The reachability mutation
+
+`.agents/reachability.md`: delete the **production call site**, not the
+implementation, and rerun the focused gate.
+
+The chain is `ModelRegistry::Load` -> `LoadQwen3_5DenseModel`
+(`qwen3_5_dense.cpp:101`) -> `LoadQwen3_5Dense` -> `LoadQwen3_5DenseLayer` ->
+`LoadAttnDense`'s `load_projection`. Deleting the `LoadFp8BlockRaw` call there
+reds **6 of 7 cases**, and the sentence it reds with is issue #1166 verbatim:
+
+```text
+vt: qwen3_5 dense: tensor not found: model.layers.0.self_attn.q_proj.weight_scale
+```
+
+That is the whole point of the rung. Without it the block-wise projection falls
+into the per-tensor arm and asks for a tensor the checkpoint spells
+`weight_scale_inv`.
+
+### Mutation results
+
+Every mutation printed `git diff --stat` **and** `compile_rc` before the run,
+because a mutation that fails to build and a mutation that never applied both
+read as a passing test, and M1 and M2 of #1189 each hit one. Each was restored
+with `git checkout -- .` and the restore verified by comparing
+`git ls-files -s | sha256sum` before and after; every row below restored to
+`fdb713f0...`.
+
+| Mutation | `compile_rc` | Result |
+|---|---|---|
+| the attn block rung call site deleted | **1** | proves nothing: `-Werror=unused-parameter` on `block` |
+| the same with `block` kept live | 0 | **6 of 7 cases fail**, 10 assertions; the failure is `tensor not found: ...q_proj.weight_scale` |
+| the block rung moved AFTER the per-tensor rung, i.e. the #1166 ordering | 0 | 6 of 7 cases fail, 10 assertions, same sentence. Ordering is load-bearing and measured |
+| the BF16 scale `memcpy`'d instead of converted, i.e. the #1181 defect | 0 | 2 cases fail, 5 assertions, all in G2 |
+| the scale-dtype refusal widened to a silent f32 read for any dtype | 0 | 1 case fails, 1 assertion (G2's F16 refusal) |
+| `cdiv` replaced by floor on both axes | 0 | **only G3 fails**, and by THROWING: the run reports 91 assertions instead of 102 with `Status: FAILURE!` and `run_rc=1`. G1, G2 and G6 stay green, because every dimension in them is a multiple of 128 |
+| the config/tensor cross-check reduced to a probe | 0 | **only G4 fails**, 5 assertions |
+| the 128x128 and `dynamic` refusals removed | 0 | G5 fails 1 assertion and `test_fp8_block_quant` fails **3 of 8 cases, 12 assertions** |
+| the `Prepare` refusal's `is_linear_attention` branch flipped to `if (false)` | 0 | **everything stays green** — see below |
+| the `Prepare` call site deleted | 0 | 1 case fails (G7), 1 assertion |
+| the packed fp8 bytes zeroed instead of copied | 0 | 1 case fails, 1 assertion (G1's verbatim-bytes check) |
+
+Three results are worth keeping.
+
+**A mutation that applies cleanly can still change nothing.** Guarding the
+`if (layer.is_linear_attention)` arm with `if (false)` looked like deleting the
+refusal. It took the `else` arm instead, which runs every attention check, and
+the MLP checks sit outside the branch entirely — so the refusal still fired and
+the gate stayed green over a two-line diff that `git diff --stat` happily
+reported. The verdict was re-taken against the actual call site, where it reds.
+`compile_rc` and `git diff --stat` do not catch this class; only asking what the
+mutated code now does catches it.
+
+**`-Werror` turns the natural reachability mutation into a non-event.** Deleting
+the rung call orphans the `block` parameter, `-Werror=unused-parameter` fires,
+the build fails, and the STALE binary from the previous link then prints
+`SUCCESS!`. That is a green over a mutation that never ran. The re-run keeps
+`block.block_n` live.
+
+**A grid of round shapes is blind to the ragged defect.** Replacing `cdiv` with
+floor left G1, G2, G4, G5, G6 and both of `test_fp8_block_quant`'s halves
+entirely green and failed only G3, which is why `N=576` and `K=3884` are in the
+grid rather than the shapes the target checkpoint happens to use — all of which
+are multiples of 128. This is the same measurement M2 recorded for its own
+kernel, reproduced one layer up.
+
+### The known-red gate on this host
+
+`scripts/agent-preflight.sh --staged --fail-on-skip` reports
+`test_cpu_x86_llamacpp_floor` FAIL:
+`NO_QUIET_WINDOW after 30s (busy=114% builders=0 load=134.83 146.63 122.42)`,
+the harness exiting 4 where the case expects 2. That is
+[#618](https://github.com/mudler/vllm.cpp/issues/618): the harness refuses to
+measure while the box is loaded, and the refusal itself reads as a defect in
+whatever diff is in flight.
+
+It is a property of the host and not of this change, and that was **measured
+rather than argued**. A pristine detached worktree at `origin/main`
+`65d6cdaed`, with no part of this row applied, ran the same suite: `Ran 10
+tests`, `FAILED (failures=2)`, both `NO_QUIET_WINDOW after 30s` at `busy=154%`
+and `busy=177%`, `builders=0`, 1-minute load 50 to 60. The worktree was removed
+afterwards. Every other preflight gate is `ok`.
 
 ## Now
 

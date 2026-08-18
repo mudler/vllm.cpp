@@ -5,12 +5,27 @@
 // packages/ltx-core/src/ltx_core/text_encoders/gemma/{feature_extractor,
 // embeddings_processor,gemma_assets}.py and encoders/encoder_configurator.py.
 //
-// Reduction accumulators are `double`. That is an accumulator width, not a memory
-// format: every buffer this file produces, stores or returns is f32, so it does
-// not widen the stream the way AGENTS.md's dtype-polarity rule is about. Upstream
-// reduces in the tensor dtype; at the shipped 3840 x 49 = 188160-wide projection a
-// naive f32 accumulation would be materially worse than torch's blocked GEMM, and
-// a double accumulator lands strictly closer to it than a naive f32 one does.
+// The NORMALIZATION reductions accumulate in `double`. That is an accumulator
+// width, not a memory format: every buffer this file produces, stores or returns
+// is f32, so it does not widen the stream the way AGENTS.md's dtype-polarity rule
+// is about. Each of those accumulators carries its own reason where it is
+// written, and both reduce over the 3840-wide hidden axis or over one masked
+// slice, not over the projection's 188160.
+//
+// The PROJECTION does not, and the reason is a mirror decision rather than a
+// numeric preference (LTX25-TEXT-LINEAR-SEAM, #1208). It is `vt::MatmulBT`, the
+// shared f32 GEMM seam, exactly as the LTX-2.5 DiT's own `Linear` is
+// (ltx2.cpp:29-48). `F.linear` on f32 inputs accumulates in f32, and the goldens
+// beside this file were produced by executing that very module in
+// `torch.float32`, so f32 is what upstream does. This file previously argued the
+// other way — that at 188160 wide an f64 accumulator lands closer to torch's
+// BLOCKED f32 GEMM than a naive f32 one does. That is true and it is not
+// decisive: closer to exact is not the same as closer to what upstream computes,
+// upstream's own blocked sum carries error of the same order, and the cost of the
+// f64 loop was measured at 671.8 s of ONE core per conditioning pass at the
+// shipped geometry against the seam's 78.4 s, paid twice on a guided render. See
+// .agents/specs/ltx25-text-linear-seam.md for both numbers and for the error each
+// accumulator carries at K = 188160.
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 
 #include <algorithm>
@@ -27,6 +42,7 @@
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/ops.h"
 
 namespace vllm {
 namespace {
@@ -45,9 +61,13 @@ void RequireF32(vt::DType dtype) {
   }
 }
 
-// `torch.nn.functional.linear`: out[b, o] = sum_i x[b, i] * W[o, i] + bias[o].
-// `weight` is row-major [out_features, in_features], torch's own layout.
-std::vector<float> Linear(const std::vector<float>& x, int64_t rows,
+// `torch.nn.functional.linear`: out[b, o] = sum_i x[b, i] * W[o, i] + bias[o],
+// through `vt::MatmulBT` — `out[M,N] = a[M,K] @ b^T` with `b` `[N,K]` row-major,
+// which is torch's own `nn.Linear` weight orientation, so the weight is handed to
+// the seam exactly as the checkpoint stores it. The same seam and the same
+// bias-add shape as the LTX-2.5 DiT's `Linear` (ltx2.cpp:29-48); see the file
+// header for the accumulator decision this carries.
+std::vector<float> Linear(vt::Queue& q, const std::vector<float>& x, int64_t rows,
                           const Ltx2TextAggregateEmbed& w) {
   if (static_cast<int64_t>(x.size()) != rows * w.in_features)
     Fail("linear: input size does not match in_features");
@@ -58,14 +78,35 @@ std::vector<float> Linear(const std::vector<float>& x, int64_t rows,
     Fail("linear: bias size does not match out_features");
 
   std::vector<float> out(static_cast<size_t>(rows * w.out_features));
-  for (int64_t r = 0; r < rows; ++r) {
-    const float* xr = x.data() + static_cast<size_t>(r * w.in_features);
-    for (int64_t o = 0; o < w.out_features; ++o) {
-      const float* wr = w.weight.data() + static_cast<size_t>(o * w.in_features);
-      double acc = has_bias ? static_cast<double>(w.bias[static_cast<size_t>(o)]) : 0.0;
-      for (int64_t i = 0; i < w.in_features; ++i)
-        acc += static_cast<double>(xr[i]) * static_cast<double>(wr[i]);
-      out[static_cast<size_t>(r * w.out_features + o)] = static_cast<float>(acc);
+  // `out` is empty in both of these cases, so there is nothing to write and no
+  // zero-shaped tensor to hand vt::MatmulBT.
+  if (rows == 0 || w.out_features == 0) return out;
+
+  // A zero-width reduction is not a GEMM either, but it is NOT the same as
+  // writing nothing: the loop this replaced seeded its accumulator with the bias
+  // and skipped the inner loop, so every output was the bias alone. Skipping only
+  // the GEMM and still running the bias add below reproduces that exactly. None
+  // of this is reachable through the extractor — RequireDeclaredProjection pins
+  // `in_features` to `embedding_dim * num_layers` and both are refused at zero —
+  // and it is written this way so the replacement is behaviour-preserving rather
+  // than merely equivalent where the tests happen to look.
+  if (w.in_features > 0) {
+    const vt::Device dev{vt::DeviceType::kCPU, 0};
+    vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
+                                          dev, {rows, w.in_features});
+    vt::Tensor b = vt::Tensor::Contiguous(const_cast<float*>(w.weight.data()),
+                                          vt::DType::kF32, dev,
+                                          {w.out_features, w.in_features});
+    vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, dev,
+                                          {rows, w.out_features});
+    vt::MatmulBT(q, o, a, b);
+  }
+
+  if (has_bias) {
+    for (int64_t r = 0; r < rows; ++r) {
+      float* dst = out.data() + static_cast<size_t>(r * w.out_features);
+      for (int64_t i = 0; i < w.out_features; ++i)
+        dst[i] += w.bias[static_cast<size_t>(i)];
     }
   }
   return out;
@@ -398,11 +439,17 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
           : Ltx2NormAndConcatPerTokenRms(stacked.data(), mask, B, T, states.hidden,
                                          config.num_layers);
 
+  // The text tower is host-only by construction — `Ltx2TextEncoderWeights` holds
+  // `std::vector<float>` — so the projection's queue is the CPU one, which is what
+  // every caller of `Ltx2EncodePromptToConditioning` already builds for the tower
+  // itself (ltx2_video.cpp:2085, :2799, :4479).
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
   Ltx2TextFeatures features;
   if (config.variant == Ltx2TextNormVariant::kPaddedBatchV1) {
     // feature_extractor.py:93-97 — ONE projection, no rescale, and `is_av` returns
     // the same tensor twice rather than running a second projection.
-    features.video = Linear(normed, B * T, weights.video);
+    features.video = Linear(q, normed, B * T, weights.video);
     if (config.is_av) features.audio = features.video;
     return features;
   }
@@ -414,7 +461,7 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
     const float scale = static_cast<float>(Ltx2RescaleNorm(out_features, config.embedding_dim));
     std::vector<float> scaled(normed.size());
     for (size_t i = 0; i < normed.size(); ++i) scaled[i] = normed[i] * scale;
-    return Linear(scaled, B * T, w);
+    return Linear(q, scaled, B * T, w);
   };
   features.video = project(weights.video, config.video_out_features);
   if (config.audio_out_features > 0)

@@ -389,11 +389,16 @@ Three facts follow, and they are recorded rather than worked around.
    122 GB of RAM and its 123 GiB of free disk — the checkpoint will not even
    land. Designating the host does not change §6.2; it fixes *where our arm and
    our unit gates run*, which is a real and separate thing.
-2. **Thor needs provisioning first** (W0.5): CUDA toolkit, cmake/ninja, the
-   `nvidia-smi` permission for the agent's ssh session, and — if any oracle work
-   is ever to run there — a vLLM build. Per
-   [environment.md](../environment.md) the box was reimaged 2026-08-11 and came
-   back with no host CUDA toolkit; this probe confirms that is still true.
+2. **Thor needed provisioning first** (W0.5) — **DONE 2026-08-15**, recipe and
+   `ctest` baseline in [environment.md](../environment.md). Two corrections to
+   the read-only probe above. `nvidia-smi` was never broken: it works under
+   `sudo -n` and fails only unprivileged, so `NvRmMemInitNvmap failed:
+   Permission denied` was a privilege problem, not a driver one. And the
+   toolchain does not go on the host at all — `/` is a read-only loop on an
+   immutable image, so the CUDA toolkit lives in a digest-pinned container and
+   the box keeps no host CUDA. Free disk on `/home` measured 362 GB, not the
+   123 GiB the earlier probe read. Still owed if oracle work is ever wanted
+   here: a vLLM build, which §6.2 says cannot serve THIS model regardless.
 3. **Thor's standing traps apply.** `vm.overcommit_memory=1` with zero swap: the
    kernel grants memory it cannot back and touching those pages takes the whole
    machine down (observed three times on 2026-08-11). Any run here is sized
@@ -445,13 +450,48 @@ Whichever is chosen, **no ceiling is declared** and the gap stays open.
 
 ## 7. Phases
 
-W0 is this document. Nothing past it is dispatched until §6.4 is answered.
+W0 is this document. §6.4 is answered — option B — so the phases below are
+dispatchable in order, under the constraints that answer imposes.
 
 - **W0 — scope (this).** Arch map, reuse-vs-new, config traps, quant/HW fit,
   oracle plan, rows. **DONE.**
-- **W0.5 — provision Thor.** CUDA toolkit, cmake/ninja, `nvidia-smi` under the
-  agent's ssh, a built vllm.cpp, and the ctest baseline green on sm_110. Gate:
-  the existing suite passes there before this row adds anything to it.
+- **W0.5 — provision Thor. DONE 2026-08-15.** The recipe is
+  [environment.md](../environment.md), under the Jetson Thor profile: a
+  digest-pinned CUDA 13.0.1 container (nvcc 13.0.88, cmake 3.28.3, ninja 1.11.1)
+  run `--runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1` over a `git archive`
+  checkout on `/home`. A HOST toolchain was rejected on evidence, not taste:
+  `/` is a read-only 4.4 G loop on an immutable Kairos image, so `apt install`
+  into it does not exist. The build is CUDA-real and proved three ways —
+  configure prints `CUDA target architectures: 110`, all 30 `*.cu.o` carry
+  exactly one `sm_110` cubin each, and `libvllm.so` links `libcudart.so.13`. A
+  kernel ran on the device: `test_cuda_backend` reports `sm_110`,
+  `integrated=1`, `UnifiedMemory=true`, 25/25 assertions.
+
+  **The gate as written — "the existing suite passes there" — is NOT met, and
+  it was the wrong gate.** At `2daa3287f` the baseline is 485 tests, **468
+  passed / 2 skipped / 15 red**. Four are the build correctly refusing what
+  sm_110 does not have (no vendored FA-2), two are tests that hardcode GB10, two
+  are already red on GB10, and six are one FP8 defect
+  ([#960](https://github.com/mudler/vllm.cpp/issues/960)). None of those can be
+  made green by this row and none is this row's debt. Asking for "all green" on
+  a host whose arch legitimately lacks features would either block every brick
+  forever or invite someone to weaken a test to pass. **The gate that actually
+  binds is therefore differential: a row regresses on Thor only if it lengthens
+  that list.** The list itself, with per-test first-failing assertions, is
+  [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110 counterpart
+  of [#907](https://github.com/mudler/vllm.cpp/issues/907).
+
+  That gate has to be re-derived, not remembered: the baseline was measured at
+  two SHAs a few hours apart and it MOVED (484/14 → 485/15), because a change on
+  `main` turned a clean FP8 refusal into a segfault. **Re-measure whenever the
+  base moves across `src/`, `tests/` or `CMakeLists.txt`.**
+
+  Two consequences this row carries forward. Thor's MLA prefill throws rather
+  than computes, so the W3/W4 attention bricks cannot be verified end to end
+  here on the FA-2 path at all — their gate stays the in-test double-precision
+  reference of §5, exactly as §6.4 requires under option B. And W9's
+  blockwise-FP8 arm has no native kernel on this box, and the fallback that
+  stands in for it currently crashes, so that arm is owed rather than pending.
 - **W1 — config + registry.** `dots3_note` in `hf_config.cpp` with RED-first
   assertions on all six §4 traps; `dots3_note_registry.cpp` as an additive TU
   registering `Dots3NoteForCausalLM` (and `Dots3NoteMTPModel` as INVENTORIED).
@@ -541,20 +581,26 @@ Carried openly under option B (§6.4), not waived:
 ## Now
 
 W0 complete; **§6.4 answered on 2026-08-15 with option B**, so the row is no
-longer blocked on a decision. It stays `SPIKE` until W1 lands code.
+longer blocked on a decision. **W0.5 landed the same day.** The row stays
+`SPIKE` until W1 lands code — provisioning a host is not porting a model.
 
-In flight: **W0.5 — provision Thor at `192.168.68.23`**. Measured 2026-08-15,
-and it shapes the work: Thor runs a Kairos-style immutable OS with `/` mounted
-READ-ONLY (4.4G loop, 1.3G free), so `apt install` is unavailable; but Docker is
-present, `/home` has 362G, the driver is at
-`/opt/nvidia/l4t-gpu-libs/nvgpu/libcuda.so*`, and `nvidia-smi` under `sudo`
-reports `NVIDIA Thor, 11.0` — compute capability **11.0 = sm_110**. The earlier
-"NvRmMemInitNvmap failed: Permission denied" was a privilege problem, not a
-broken driver. There is no CUDA toolkit on the box at all.
+**W0.5 — DONE.** Thor at `192.168.68.23` builds vllm.cpp with CUDA ON for
+sm_110 in a digest-pinned CUDA 13.0.1 container, runs kernels on the device, and
+has a recorded `ctest` baseline of 468 passed / 2 skipped / **15 red** of 485 at
+`2daa3287f`. The full recipe — image digest, the three container flags, the
+build command, why `nvidia-smi` needs `sudo -n`, and the per-test failure table
+— is in [environment.md](../environment.md) under the Jetson Thor profile, not
+here: Thor is the project's only non-GB10 CUDA host, so it belongs to every row
+that wants sm_110 coverage rather than to this one. The earlier probe's
+"`nvidia-smi` refuses" reading was a privilege problem, and the toolchain lives
+in a container because `/` is a read-only loop on an immutable image.
 
-W0.5 is not dots3-specific: Thor is the project's only non-GB10 CUDA host, so
-its recipe and `ctest` baseline belong in `.agents/environment.md` and unblock
-any row that wants sm_110 coverage.
+The W0.5 gate as originally written ("the existing suite passes there") is not
+met and was the wrong gate; §7 records the differential gate that replaces it
+and the reasoning for it. The lane earned its keep immediately by finding
+[#960](https://github.com/mudler/vllm.cpp/issues/960) — an FP8 refusal on `main`
+that became a silent portable-CPU fallback and a segfault, invisible on GB10.
 
-After W0.5, W1 (config + registry, with the six §4 traps RED-first) is the first
-dots3 brick.
+**Next dispatchable: W1 — `dots3_note` config + registry**, with the six §4
+traps RED-first, and owing the §8.1 heading restructure in the same change as
+the lifecycle move to `ACTIVE`.

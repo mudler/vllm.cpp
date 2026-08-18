@@ -172,6 +172,33 @@ carries no `n_predict`), and it must be at least the checkpoint's block size —
 a smaller value produces incorrect output rather than merely lower acceptance,
 so it is rejected.
 
+### Which DSpark draft the loader will take
+
+The lane is decided by the DRAFT's own `config.json`, not by the method string
+you typed. Three architecture spellings route to the Qwen3 DSpark lane:
+
+| The draft declares | Routes to |
+|---|---|
+| `architectures: ["Qwen3DSparkModel"]` | the Qwen3 DSpark lane |
+| `architectures: ["Gemma4DSparkModel"]` | the Qwen3 DSpark lane (same loader) |
+| `architectures: ["DSparkDraftModel"]` with `model_type: "qwen3"` | the Qwen3 DSpark lane |
+
+The third row is vLLM PR
+[52197](https://github.com/vllm-project/vllm/pull/52197), merged 2026-08-17,
+which is AHEAD of the pinned oracle; it is mirrored here because the pinned
+behavior is wrong for a checkpoint that is already published
+(`RadixArk/Qwen3.8-27B-DSpark` declares exactly that pair).
+
+A draft config that carries no `architectures` key at all is not classified. It
+loads exactly as it did before, because an absent key is not evidence of a lane.
+
+Anything else that names an architecture is the DeepSeek-V4 DSpark draft, whose weights ship inside the
+DeepSeek-V4 target rather than in a separate checkpoint. vLLM rewrites such a
+config onto `model_type: "deepseek_v4"` and loads it; **this engine refuses it by
+name** instead, because it carries only a stub for that model and the lane needs
+two DGX Sparks. A refusal that names the missing arm is what you get, rather than
+a load that fails later on a missing key.
+
 ## The flag
 
 On the OpenAI server:

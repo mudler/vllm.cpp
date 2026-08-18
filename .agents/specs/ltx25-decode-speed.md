@@ -1418,6 +1418,51 @@ authority and no fresh review (§8).
 | [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | 5c — DiT staging is 7.5 min at 70.5 MiB/s, against 127.8 on rung 2; GPU idle, 0.15 cores | owed |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | 0 — the GPU is idle for the WHOLE post-load render, not only the decode | owed; carries the owed `utilization.gpu` positive control |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | none — the evidence for rungs 1 and 2 and for §1.4 is on an unreachable host, and neither rung's sampler cadence closes | owed |
+| [#1210](https://github.com/mudler/vllm.cpp/issues/1210) | 9 — the two-stage rebind fuses, un-fuses and re-fuses; the load-time pass is provably wasted | owed; supplies the number `ltx2_video.cpp:2849` records as UNMEASURED |
+
+**[#1202](https://github.com/mudler/vllm.cpp/issues/1202) is NOT owed here. It
+landed**, and it is removed from the table above for the reason argued twice
+below: a closed issue listed as owed by a row that did not close it
+misattributes the work and leaves a fixed defect reading as open debt. It was
+filed as lever 7 and taken by `LTX25-LORA-FUSE-SEAM`
+([spec](ltx25-lora-fuse-seam.md)), which routed the `(B * strength) @ A` product
+through `vt::Matmul` — the row-major member of the same seam lever 8 took the
+transposed member of — and measured one real projection-shaped module at
+**17.7761 s -> 0.1242 s, 143.1x**, with the whole fused buffer byte-identical
+across the two builds.
+
+**Two things that row establishes bear on this one's ranking.** First, the
+fusion's remaining cost is no longer the product: **59% of a fused tensor is now
+the single-threaded loop that adds the delta back into the weight**, which is
+[#1254](https://github.com/mudler/vllm.cpp/issues/1254), filed by that row and
+owed there. Before it, that loop was 0.5% of the call. Second,
+[#1210](https://github.com/mudler/vllm.cpp/issues/1210) is **unchanged in kind
+and much smaller in cost**: the two-stage rebind still fuses, un-fuses and
+re-fuses, but each wasted pass is now ~143x cheaper on x86, so it should be
+re-ranked rather than read against #1202's original hours. As with lever 8, the
+GB10-to-x86 per-core ratio is unmeasured and no GB10 number is claimed.
+
+**[#1208](https://github.com/mudler/vllm.cpp/issues/1208) is NOT owed here
+either. It landed**, and it is removed from the table above for the same reason
+[#1008](https://github.com/mudler/vllm.cpp/issues/1008) is, argued below: a
+closed issue listed as owed by a row that did not close it misattributes the
+work and leaves a fixed defect reading as open debt. It was filed as lever 8 and
+taken by `LTX25-TEXT-LINEAR-SEAM`
+([spec](ltx25-text-linear-seam.md)), which routed the caption projection through
+`vt::MatmulBT` and measured the lever this row could only name: one conditioning
+pass at the shipped geometry is **671.777 s of one core, 78.421 s through the
+seam (8.57x)**, and `rows` is the constant 1024 rather than a prompt length, so
+the cost is fixed and paid twice on a guided render.
+
+**Two things that row establishes are corrections to this one's framing, not
+additions to it.** First, the text tower runs on a **hard-coded CPU queue**
+(`ltx2_video.cpp:2085`, `:2799`, `:4479`), so `--device cuda` never moved it;
+that is filed under that row's `## Owed`. Second, the single-threaded buffer work
+around the projection — this row's natural next suspect — is **1.861-2.066 s at
+the shipped geometry against the pass's 671.777 s, i.e. 0.28%**, so it is
+refuted as an explanation for anything minute-scale. What that row could NOT
+close, and carries as owed, is the GB10-to-x86 per-core ratio, which bounds the
+projection to **39-100%** of each single-core stretch.
 
 **[#1008](https://github.com/mudler/vllm.cpp/issues/1008) is NOT owed here. It
 landed.** It was filed by this row as lever 2 and taken by `LTX25-DECODE-DTYPE`,

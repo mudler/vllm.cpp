@@ -1,0 +1,221 @@
+
+  // PEER path: dual-slot Launch+Finish (slot 0). Pipeline uses Launch/Finish directly.
+  if (!LaunchGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0, expert_dev, x_compute, fp8_gu,
+                                             s_gu, fp8_dn, s_dn, M, I, H))
+    return false;
+  return FinishGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0, y_compute, M, H);
+}
+
+bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int expert_dev,
+                                           const void* x_compute, const void* fp8_gu,
+                                           const void* s_gu, const void* fp8_dn, const void* s_dn,
+                                           int M, int I, int H) {
+  if (slot < 0 || slot > 1 || !x_compute || !fp8_gu || !s_gu || !fp8_dn || !s_dn || M <= 0 ||
+      I <= 0 || H <= 0 || expert_dev < 0)
+    return false;
+  const int compute_dev = compute_q.device.index;
+  if (compute_dev < 0 || expert_dev == compute_dev) return false;
+
+  static const bool prefill_fp8_lt = [] {
+    if (const char* e = std::getenv("VT_GEMMA4_PREFILL_FP8_LT")) return e[0] == '1';
+    return false;
+  }();
+  static const bool gu_pair = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return e && e[0] == '1';
+  }();
+
+  PeerSlot& tls = PeerPipeTls().s[slot];
+
+  auto freep = [](int dev, void*& p) {
+    if (!p) return;
+    (void)hipSetDevice(dev);
+    (void)hipFree(p);
+    p = nullptr;
+  };
+  const size_t row_b = static_cast<size_t>(H) * 2;
+  const size_t xy_need = static_cast<size_t>(M) * row_b;
+  vt::Device edev{vt::DeviceType::kROCM, expert_dev};
+  hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
+
+  if (tls.pending_M > 0) {
+    std::fprintf(stderr, "WARN gemma4-moe PEER Launch slot=%d still pending\n", slot);
+    return false;
+  }
+
+  if (tls.edev != expert_dev || tls.cdev != compute_dev || tls.I != I || tls.H != H ||
+      tls.Mcap < M || !tls.x) {
+    freep(tls.edev >= 0 ? tls.edev : expert_dev, tls.x);
+    freep(tls.edev >= 0 ? tls.edev : expert_dev, tls.y);
+    freep(tls.edev >= 0 ? tls.edev : expert_dev, tls.gu_act);
+    freep(tls.edev >= 0 ? tls.edev : expert_dev, tls.act);
+    if (tls.eq_live) {
+      vt::DestroyQueue(tls.eq);
+      tls.eq_live = false;
+    }
+    if (tls.ev_c) {
+      (void)hipEventDestroy(tls.ev_c);
+      tls.ev_c = nullptr;
+    }
+    if (tls.ev_e) {
+      (void)hipEventDestroy(tls.ev_e);
+      tls.ev_e = nullptr;
+    }
+    const int Mcap = std::max(M, 64);
+    Check(hipSetDevice(expert_dev), "peer-pipe expert alloc");
+    if (hipMalloc(&tls.x, static_cast<size_t>(Mcap) * row_b) != hipSuccess) return false;
+    if (hipMalloc(&tls.y, static_cast<size_t>(Mcap) * row_b) != hipSuccess) return false;
+    if (hipMalloc(&tls.gu_act, static_cast<size_t>(Mcap) * static_cast<size_t>(2 * I) * 2) !=
+        hipSuccess)
+      return false;
+    if (hipMalloc(&tls.act, static_cast<size_t>(Mcap) * static_cast<size_t>(I) * 2) != hipSuccess)
+      return false;
+    tls.eq = vt::CreateQueue(edev);
+    tls.eq_live = true;
+    Check(hipSetDevice(compute_dev), "peer-pipe ev_c");
+    Check(hipEventCreateWithFlags(&tls.ev_c, hipEventDisableTiming), "ev_c");
+    Check(hipSetDevice(expert_dev), "peer-pipe ev_e");
+    Check(hipEventCreateWithFlags(&tls.ev_e, hipEventDisableTiming), "ev_e");
+    Check(hipSetDevice(compute_dev), "p2p c");
+    EnablePeerAccessQuiet(expert_dev);
+    Check(hipSetDevice(expert_dev), "p2p e");
+    EnablePeerAccessQuiet(compute_dev);
+    tls.edev = expert_dev;
+    tls.cdev = compute_dev;
+    tls.I = I;
+    tls.H = H;
+    tls.Mcap = Mcap;
+  }
+
+  hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
+  if (hipEventRecord(tls.ev_c, cst) != hipSuccess) return false;
+  if (hipStreamWaitEvent(est, tls.ev_c, 0) != hipSuccess) return false;
+
+  bool x_ok = hipMemcpyPeerAsync(tls.x, expert_dev, const_cast<void*>(x_compute), compute_dev,
+                                 xy_need, est) == hipSuccess;
+  if (!x_ok) {
+    std::vector<char> tmp(xy_need);
+    Check(hipSetDevice(compute_dev), "x d2h");
+    if (hipStreamSynchronize(cst) != hipSuccess) return false;
+    if (hipMemcpy(tmp.data(), x_compute, xy_need, hipMemcpyDeviceToHost) != hipSuccess) return false;
+    Check(hipSetDevice(expert_dev), "x h2d");
+    if (hipMemcpyAsync(tls.x, tmp.data(), xy_need, hipMemcpyHostToDevice, est) != hipSuccess)
+      return false;
+  }
+
+  Check(hipSetDevice(expert_dev), "geglu setdev");
+  auto try_fp8_lt = [&](vt::Queue& q, void* y, const void* x, int m) -> bool {
+    if (!prefill_fp8_lt || m < 16) return false;
+    struct LtTls {
+      int dev = -1;
+      int I = 0, H = 0, Mcap = 0;
+      void* gu_act = nullptr;
+      void* act = nullptr;
+    };
+    static thread_local LtTls lt;
+    const int dev = q.device.index;
+    if (lt.dev != dev || lt.I != I || lt.H != H || lt.Mcap < m || !lt.gu_act) {
+      auto freep2 = [&](void*& p) {
+        if (p) {
+          (void)hipFree(p);
+          p = nullptr;
+        }
+      };
+      freep2(lt.gu_act);
+      freep2(lt.act);
+      Check(hipSetDevice(dev), "lt alloc");
+      const int Mcap = std::max(m, 64);
+      if (hipMalloc(&lt.gu_act, static_cast<size_t>(Mcap) * static_cast<size_t>(2 * I) * 2) !=
+          hipSuccess)
+        return false;
+      if (hipMalloc(&lt.act, static_cast<size_t>(Mcap) * static_cast<size_t>(I) * 2) != hipSuccess)
+        return false;
+      lt.dev = dev;
+      lt.I = I;
+      lt.H = H;
+      lt.Mcap = Mcap;
+    }
+    if (!vt::MatmulBTFp8ActWeightLt(q, lt.gu_act, x, fp8_gu, s_gu, m, 2 * I, H, 1.f, 0.f))
+      return false;
+    vt::Tensor act = vt::Tensor::Contiguous(lt.act, vt::DType::kBF16, q.device, {m, I});
+    vt::Tensor gu_act = vt::Tensor::Contiguous(lt.gu_act, vt::DType::kBF16, q.device, {m, 2 * I});
+    if (gu_pair)
+      vt::rocm::GeluAndMulPairRocm(q, act, gu_act);
+    else
+      vt::GeluAndMul(q, act, gu_act);
+    if (!vt::MatmulBTFp8ActWeightLt(q, y, lt.act, fp8_dn, s_dn, m, H, I, 1.f, 0.f)) return false;
+    return true;
+  };
+
+  bool lt_ok = try_fp8_lt(tls.eq, tls.y, tls.x, M);
+  if (!lt_ok) {
+    auto& wslot = DequantCacheSlotFor(expert_dev);
+    void* gu_w = nullptr;
+    void* dn_w = nullptr;
+    int pin = -1;
+    {
+      std::lock_guard<std::mutex> lk(wslot.cache.mu);
+      if (!wslot.cache.Ensure(expert_dev, I, H)) return false;
+      Check(hipSetDevice(expert_dev), "dequant setdev");
+      if (!wslot.cache.GetLocked(tls.eq, fp8_gu, fp8_gu, s_gu, fp8_dn, s_dn, &gu_w, &dn_w, &pin))
+        return false;
+    }
+    vt::Tensor x = vt::Tensor::Contiguous(tls.x, vt::DType::kBF16, edev, {M, H});
+    vt::Tensor gu_wt = vt::Tensor::Contiguous(gu_w, vt::DType::kBF16, edev, {2 * I, H});
+    vt::Tensor gu_act = vt::Tensor::Contiguous(tls.gu_act, vt::DType::kBF16, edev, {M, 2 * I});
+    vt::Tensor act = vt::Tensor::Contiguous(tls.act, vt::DType::kBF16, edev, {M, I});
+    vt::MatmulBT(tls.eq, gu_act, x, gu_wt);
+    if (gu_pair)
+      vt::rocm::GeluAndMulPairRocm(tls.eq, act, gu_act);
+    else
+      vt::GeluAndMul(tls.eq, act, gu_act);
+    vt::MatmulBTAlphaBeta(tls.eq, tls.y, act.data, dn_w, M, H, I, 1.f, 0.f, vt::DType::kBF16);
+    {
+      std::lock_guard<std::mutex> lk(wslot.cache.mu);
+      wslot.cache.UnpinLocked(pin);
+    }
+  }
+
+  if (hipEventRecord(tls.ev_e, est) != hipSuccess) return false;
+  tls.pending_M = M;
+  if (hipSetDevice(compute_dev) != hipSuccess) return false;
+  return true;
+}
+
+bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void* y_compute, int M,
+                                           int H) {
+  if (slot < 0 || slot > 1 || !y_compute || M <= 0 || H <= 0) return false;
+  PeerSlot& tls = PeerPipeTls().s[slot];
+  if (tls.pending_M <= 0 || !tls.y || !tls.ev_e) return false;
+  if (M > tls.pending_M) return false;
+  const int compute_dev = compute_q.device.index;
+  const int expert_dev = tls.edev;
+  const size_t xy_need = static_cast<size_t>(M) * static_cast<size_t>(H) * 2;
+  hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
+
+  if (hipStreamWaitEvent(cst, tls.ev_e, 0) != hipSuccess) return false;
+  bool y_ok =
+      hipMemcpyPeerAsync(y_compute, compute_dev, tls.y, expert_dev, xy_need, cst) == hipSuccess;
+  if (!y_ok) {
+    std::vector<char> tmp(xy_need);
+    Check(hipSetDevice(expert_dev), "y d2h");
+    hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
+    if (hipStreamSynchronize(est) != hipSuccess) return false;
+    if (hipMemcpy(tmp.data(), tls.y, xy_need, hipMemcpyDeviceToHost) != hipSuccess) return false;
+    Check(hipSetDevice(compute_dev), "y h2d");
+    if (hipMemcpyAsync(y_compute, tmp.data(), xy_need, hipMemcpyHostToDevice, cst) != hipSuccess)
+      return false;
+  }
+  tls.pending_M = 0;
+  if (hipSetDevice(compute_dev) != hipSuccess) return false;
+  return true;
+}
+
+void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex) {
+  if (ex.host_pinned) return;
+  if (ex.cached_gu.empty() || ex.cached_dn.empty()) return;
+  const size_t gu_b = ex.cached_gu.size() * sizeof(uint16_t);
+  const size_t dn_b = ex.cached_dn.size() * sizeof(uint16_t);
+  hipError_t e1 =
+      hipHostRegister(const_cast<uint16_t*>(ex.cached_gu.data()), gu_b, hipHostRegisterDefault);
+  hipError_t e2 =

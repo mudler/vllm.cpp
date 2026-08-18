@@ -250,16 +250,28 @@ void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor
         kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(),
         t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps, na.gemma);
   };
-  // Validated combos (mirror the CUDA lane): (f32 src, f32 out); (bf16 src,
-  // bf16 out + bf16 gate); (bf16 src, bf16 out + f32 gate).
-  if (qgate.dtype == DType::kBF16) {
+  // Dispatch on the OUTPUT dtype like the CUDA lane (cuda_ops.cu
+  // LaunchAttnPreambleOut): the caller picks f32 out (token-exact path) or bf16
+  // out (FA-2 combos) INDEPENDENTLY of the source dtype — the 0.8B bf16 model
+  // runs bf16 src + f32 q/k out + f32 gate on the f32-attention path, which the
+  // old src-keyed dispatch silently mis-launched as all-bf16 (writing bf16 bits
+  // through the f32 out pointer; issue #41 M4 W2 finding). Validated combos
+  // (mirror CUDA): (f32 src, f32 out); (bf16 src, f32 out + f32 gate);
+  // (bf16 src, bf16 out + bf16 gate); (bf16 src, bf16 out + f32 gate).
+  const bool src_bf16 = qgate.dtype == DType::kBF16;
+  if (q_out.dtype == DType::kF32) {
+    if (src_bf16) {
+      launch(__hip_bfloat16{}, float{}, float{});
+    } else {
+      launch(float{}, float{}, float{});
+    }
+  } else {
+    VT_CHECK(src_bf16, "rocm attn_qk_norm_rope_gate: bf16 out needs bf16 src");
     if (gate_out.dtype == DType::kF32) {
       launch(__hip_bfloat16{}, __hip_bfloat16{}, float{});
     } else {
       launch(__hip_bfloat16{}, __hip_bfloat16{}, __hip_bfloat16{});
     }
-  } else {
-    launch(float{}, float{}, float{});
   }
   Check(hipGetLastError(), "attn_qk_norm_rope_gate launch");
 }

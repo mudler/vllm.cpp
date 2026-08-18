@@ -16,6 +16,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -2357,6 +2358,13 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
 #endif
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
+  // the same dtype every other arm of this o_proj returns.
+  if (!w.o_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated.t(),
+                                                        w.o_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
          : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
                : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
@@ -2379,10 +2387,46 @@ struct FullAttnQkvOutput {
 FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                                      const Tensor& h, int64_t t,
                                      const Tensor* h_fp8,
-                                     [[maybe_unused]] bool packed_consumers) {
+                                     bool packed_consumers) {
   FullAttnQkvOutput out;
   out.fp4 = !w.q_proj_fp4.Empty();
   const bool fp8 = !w.q_proj_fp8.Empty();
+
+  // MODEL-FP8-BLOCK-MERGED (#1189 M6): vLLM's QKVParallelLinear, as ONE
+  // block-scaled GEMM over the N-concatenated q|k|v operand
+  // (`linear.py:1247-1260` @ `5559679229`). FIRST, before the fp4 and
+  // per-tensor fp8 branches, mirroring the loader's own rung order: a
+  // block-wise weight is `F8_E4M3` on disk and the per-tensor probe would
+  // otherwise claim it (#1166 seen from the forward's end).
+  //
+  // `packed_consumers` is the site's own precondition and predates this row:
+  // the merged output exposes ROW-STRIDED q/k/v views, which only the fused
+  // attn preamble reads correctly, so the fp4 and per-tensor fp8 merged arms
+  // carry the same gate. It is a property of the consumer, not of the scales.
+  if (!w.q_proj_fp8_block.Empty() && packed_consumers) {
+    const dense_fp8_block::Fp8BlockShard qkv_shards[3] = {
+        {&w.q_proj_fp8_block, "q_proj"},
+        {&w.k_proj_fp8_block, "k_proj"},
+        {&w.v_proj_fp8_block, "v_proj"}};
+    const dense_fp8_block::Fp8BlockMergedView qkv =
+        dense_fp8_block::ResidentFp8BlockMerged(
+            d, vt::kFp8BlockQkv, "qkv_proj", qkv_shards, 3,
+            w.qkv_fp8_block_merged);
+    // bf16, which is upstream's `out_dtype` at this site and what the split
+    // block arm below already emits, so the merge moves no dtype.
+    out.packed_owner.emplace(dense_fp8_block::MatmulFp8BlockMergedD<DBuf>(
+        d, h, qkv, DType::kBF16, vt::kFp8BlockQkv));
+    Tensor all = out.packed_owner->t();
+    const int64_t qn = w.q_proj_fp8_block.n;
+    const int64_t kn = w.k_proj_fp8_block.n;
+    const int64_t vn = w.v_proj_fp8_block.n;
+    VT_CHECK(all.shape[1] == qn + kn + vn,
+             "qwen3_5 packed block-wise FP8 QKV: output shape mismatch");
+    out.qgate = all.Slice(1, 0, qn);
+    out.key = all.Slice(1, qn, qn + kn);
+    out.value = all.Slice(1, qn + kn, qn + kn + vn);
+    return out;
+  }
 #ifdef VT_CUTLASS_NVFP4
   if (out.fp4 && MergedQkvEligible(w, d, packed_consumers)) {
     out.packed_owner.emplace(MergedQkvCutlassD(d, h, w));
@@ -2464,7 +2508,18 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
       (Bf16GemmOutEnabled() && out.fp4) ? DType::kBF16 : DType::kF32;
   const auto project = [&](const Nvfp4Weight& fp4_weight,
                            const Fp8Weight& fp8_weight,
+                           const Fp8BlockWeight& block_weight,
                            const OwnedTensor& plain_weight) -> DBuf {
+    // MODEL-FP8-BLOCK-LINEAR (#1189 M4). FIRST, and exclusive: M3's loader
+    // fills the block field and leaves the bf16, per-tensor fp8 and fp4 ones
+    // EMPTY (qwen3_5_dense_weights.cpp), so a non-empty block weight IS the
+    // scheme. `out_dtype` is bf16 because that is upstream's `out_dtype` here
+    // -- the MODEL dtype (fp8.py:284) -- not the f32 the per-tensor arm below
+    // happens to use; a token gate cannot see a dtype that is too wide.
+    if (!block_weight.Empty()) {
+      return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, h, block_weight,
+                                                          DType::kBF16);
+    }
     if (fuse_qkv) {
       return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
                                     fp4_weight, q_out_dt, qkv_sf_sw_p);
@@ -2487,11 +2542,11 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                            : MatmulF32D(d, h, plain_weight);
   };
   out.q_owner.emplace(
-      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));
+      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj_fp8_block, w.q_proj));
   out.k_owner.emplace(
-      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj));
+      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj_fp8_block, w.k_proj));
   out.v_owner.emplace(
-      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj));
+      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj_fp8_block, w.v_proj));
   out.qgate = out.q_owner->t();
   out.key = out.k_owner->t();
   out.value = out.v_owner->t();
@@ -3777,6 +3832,19 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                                      GdnFp8MergedInProjDType(indt, outdt)}),
              "qwen3_5 split FP8 GDN qkv: the allocated mixed_qkv dtype and the "
              "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first on both projections.
+  // `indt`/`outdt` rather than a literal bf16 here, because the packed-decode
+  // predictor above derives the SAME dtype for this arm and a disagreement
+  // makes vt::GdnPackedDecode throw.
+  if (!w.in_proj_qkv_fp8_block.Empty()) {
+    out.mixed_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_qkv_fp8_block, indt));
+    out.z_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_z_fp8_block, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -3971,6 +4039,13 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4439,6 +4514,13 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4892,6 +4974,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -5186,6 +5275,34 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   pa_args.query_start_loc_host = meta.query_start_loc.data();
   pa_args.max_seq_len = meta.max_seq_len;
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
+
+  // VT_DUMP_ATTN (issue #41, 0.8B ROCm divergence spike W1/W2): dump the
+  // full-attn block's internals per full-attn-layer call index (0-based), as
+  // raw little-endian dumps under $VT_DUMP_ATTN/fa<k>_{qkv,q,attn,gate}.bin.
+  // Inert when unset; the Downloads sync, so never set on a graph path.
+  static thread_local int64_t dump_fa_idx = -1;
+  dump_fa_idx++;
+  if (std::getenv("VT_DUMP_ATTN") != nullptr) {
+    auto DumpT = [&](const char* stage, const Tensor& t) {
+      int64_t n = 1;
+      for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
+      const size_t es = vt::SizeOf(t.dtype);
+      // contiguous check: innermost stride 1 and packed
+      std::vector<uint8_t> raw(static_cast<size_t>(n) * es);
+      DBuf tmp(d, t.dtype, {n});
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ATTN")) +
+                               "/fa" + std::to_string(dump_fa_idx) + "_" +
+                               stage + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    };
+    DumpT("qkv", qgate);
+    DumpT("q", qn3);
+    DumpT("attn", dattn.t());
+    DumpT("gate", gatef.t());
+  }
 
   // Sigmoid output gate, folded into the o_proj activation quant on the true-W4A4
   // path (§5) — see SigmoidGateOProjD.
@@ -7006,6 +7123,35 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
   const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4). The dense SwiGLU MLP's three
+  // projections, exclusive and first. bf16 out on all three -- upstream's
+  // `out_dtype` is the model dtype (fp8.py:284) and `vt::MoeSiluMul` is
+  // templated on its input dtype, so gate/up feed it unchanged; down_proj's
+  // bf16 is what every other arm of this return already produces.
+  if (!w.gate_proj_fp8_block.Empty()) {
+    // MODEL-FP8-BLOCK-MERGED (#1189 M6). ONE gate_up GEMM, which is vLLM's own
+    // topology (`MergedColumnParallelLinear`, named for this model at
+    // `models/qwen3_5.py:288-298`, loaded at `layers/linear.py:660`). Unlike the
+    // per-tensor fp8 merge two screens up, this needs no alpha vector and no
+    // shared-scale guard: block scales concatenate losslessly along N. The
+    // merged GEMM is byte-identical to the two split ones, so the ONLY
+    // instrument that can see the merge is the dispatch counter, which
+    // `tests/vllm/model_executor/models/test_fp8_block_merged.cpp` reads.
+    const dense_fp8_block::Fp8BlockShard gate_up_shards[2] = {
+        {&w.gate_proj_fp8_block, "gate_proj"},
+        {&w.up_proj_fp8_block, "up_proj"}};
+    const dense_fp8_block::Fp8BlockMergedView gate_up =
+        dense_fp8_block::ResidentFp8BlockMerged(
+            d, vt::kFp8BlockGateUpSwiGLU, "gate_up_proj", gate_up_shards, 2,
+            w.gate_up_fp8_block_merged);
+    VT_CHECK(gate_up.n_total == 2 * I,
+             "qwen3_5 dense MLP: the merged block-wise FP8 gate_up operand's N "
+             "does not match twice the intermediate size");
+    DBuf bact = dense_fp8_block::Fp8BlockGateUpSwiGLUD<DBuf>(d, dh, gate_up,
+                                                            DType::kBF16);
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, bact.t(), w.down_proj_fp8_block, DType::kBF16);
+  }
   DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out,
                                               gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
@@ -7138,9 +7284,27 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
+  // VT_DUMP_ACT layer index: the paged loop's per-layer counter (0-based), used
+  // by the sub-stage dump below. Declared per-process; only the dump reads it.
+  static thread_local int64_t dump_layer_idx = -1;
+  dump_layer_idx++;
+  const bool dump_sub = std::getenv("VT_DUMP_ACT_SUB") != nullptr;
+  auto DumpStage = [&](const char* stage, DBuf& buf) {
+    if (!dump_sub) return;
+    std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                             vt::SizeOf(buf.t().dtype));
+    buf.Download(d, raw.data());
+    const std::string path = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                             "/layer_" + std::to_string(dump_layer_idx) + "_" +
+                             stage + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+  };
+
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_input_norm", dhn);
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -7153,12 +7317,15 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
                               *attn_kv, T);
   }();
+  DumpStage("block_out", attn);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_attn_norm", dh2);
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DumpStage("mlp_out", hidden);
 }
 
 // ── Qwen3.5/3.6 MTP head shared preamble (SPEC-MTP I5c). ────────────────────
@@ -8630,6 +8797,24 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
+    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1): dump
+    // the residual stream after each layer as raw little-endian bf16 to
+    // $VT_DUMP_ACT/layer_<l>.bin (inert when unset; a debug hook, never the
+    // hot path — the Download forces a sync, so capture-graph paths must not
+    // set the env).
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(hidden.t().dtype));
+      hidden.Download(d, raw.data());  // Copy + Synchronize
+      const char* dir = std::getenv("VT_DUMP_ACT");
+      const std::string path =
+          std::string(dir) + "/layer_" + std::to_string(l) + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) {
+        std::fwrite(raw.data(), 1, raw.size(), f);
+        std::fclose(f);
+      }
+    }
   }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.

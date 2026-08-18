@@ -515,6 +515,182 @@ environment:
     - `nsys` from `nsight-systems-cli` in that image is **2024.2.3 and cannot
       trace CUDA here** ("does not contain CUDA trace data"). Do not plan a
       graph/kernel-count measurement on Thor without first installing a newer one.
+  - **★ PROVISIONED AS A BUILD-AND-TEST HOST, 2026-08-15**
+    (`dots3-note` W0.5, issue [#699](https://github.com/mudler/vllm.cpp/issues/699)).
+    The recipe below was executed end to end that day: toolchain, CUDA-ON build
+    for sm_110, a kernel that ran on the device, and a full `ctest` baseline.
+    Copy it rather than re-deriving it.
+
+    **Why a container and not a host toolchain.** `/` is a **read-only** 4.4 G
+    `ext2` loop (`/dev/loop0`, 1.3 G free) — `kairos-4db2` is an immutable
+    Kairos image, so `apt install` into `/` is not available at all. `/home` is
+    the only writable volume (918 G, ~362 G free). A `/home`-prefix CUDA
+    runfile install would work but would have to be re-derived after every
+    reimage; the container carries the whole toolchain in one pinned digest and
+    the NVIDIA container runtime injects the host driver, so it survives
+    reimages.
+
+    **1. Toolchain image.** Build it once from a 4-line Dockerfile pinned to the
+    base image *by digest* (not by tag — the `13.0.1` tag moves):
+
+    ```dockerfile
+    FROM nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92
+    ENV DEBIAN_FRONTEND=noninteractive
+    RUN apt-get update -qq \
+     && apt-get install -y -qq --no-install-recommends \
+          cmake ninja-build git python3 python3-dev ca-certificates \
+     && rm -rf /var/lib/apt/lists/*
+    ```
+
+    That digest is `nvidia/cuda:13.0.1-devel-ubuntu24.04` as resolved on Thor on
+    2026-08-15. `sudo -n docker build -t vllmcpp-thor:cuda13.0.1 .` (docker
+    needs `sudo`; the user is in group `admin`, not `docker`). Inside:
+    **nvcc 13.0.88, cmake 3.28.3, ninja 1.11.1, python 3.12.3**. A live copy of
+    the Dockerfile and the three driver scripts sits in `/home/mudler/thor-w05/`
+    on the box; the repo is the authority if they disagree.
+
+    **2. Every container invocation needs the same three flags:**
+    `--runtime=nvidia` (NOT `--gpus all`), `-e NVIDIA_DISABLE_REQUIRE=1`, and
+    `sudo -n`. The pre-existing `/home/mudler/_build_thor.sh` says the runtime
+    "REFUSES this image on its driver" and therefore omits `--runtime`; that is
+    **wrong, and it is wrong only because it also omits
+    `NVIDIA_DISABLE_REQUIRE=1`**. With the flag, `cudaGetDeviceCount` returns 1,
+    `cudaGetDeviceProperties` reports `NVIDIA Thor sm_110`, and a hand-written
+    `nvcc -arch=sm_110` kernel launches and returns correct values.
+
+    **3. Source transfer.** `git archive --format=tar HEAD` from the dev box,
+    `scp`, untar into a FRESH directory under `/home` (never rsync — see
+    [[dgx-transfer-git-archive-not-rsync]]). Record the base SHA beside it.
+
+    **4. Configure and build** (bind-mount the checkout, no GPU needed to
+    compile but the flags are harmless):
+
+    ```sh
+    sudo -n docker run --rm --runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1 \
+      -v "$SRC":/src -w /src vllmcpp-thor:cuda13.0.1 \
+      cmake -S /src -B /src/build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+    sudo -n docker run --rm --runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1 \
+      -e CMAKE_BUILD_PARALLEL_LEVEL=4 -v "$SRC":/src -w /src \
+      vllmcpp-thor:cuda13.0.1 cmake --build /src/build-cuda -j 4
+    ```
+
+    **`-j4` is deliberate** — see the overcommit warning below. 1460/1460
+    targets in **~20 minutes** at `-j4`, peak host memory ~6 GB of 122 GB, so
+    the conservative setting costs almost nothing here.
+
+    **5. Prove the build is really a CUDA build, because a silent CPU fallback
+    is the failure mode.** Three independent checks, all measured 2026-08-15:
+    - configure prints `CUDA target architectures: 110` and finds
+      `/usr/local/cuda/bin/nvcc` (NVIDIA 13.0.88);
+    - **30 `*.cu.o` objects** are compiled and every one of them contains
+      exactly one cubin, `sm_110` —
+      `for f in $(find build-cuda -name '*.cu.o'); do cuobjdump --list-elf $f; done | grep -o 'sm_[0-9]*' | sort | uniq -c`
+      reads `30 sm_110`. 30 of the tree's 53 `.cu` files is CORRECT, not a
+      partial build: configure says `feature TUs narrowed by
+      VT_CUDA_FEATURE_TABLE`, and on sm_110 `fa2`, `cutlass-nvfp4`,
+      `cutlass-nvfp4-sm100`, `cutlass-fp8`, `scaledmm-c3x-sm90`,
+      `scaledmm-c3x-sm100` and `fp4-mma` all resolve DISABLED. Only
+      `marlin-nvfp4` is ENABLED for `[110]`. CUTLASS is absent and supplying it
+      would change nothing — the cells are arch-gated, not CUTLASS-gated.
+    - `ldd build-cuda/libvllm.so` resolves `libcudart.so.13` and
+      `libcublasLt.so.13`.
+
+    **6. Runtime proof, on the device.** `./tests/test_cuda_backend` under
+    `--runtime=nvidia` reports `CUDA compute capability: sm_110` and
+    `pageable=1 integrated=1 UnifiedMemory=true`, 6/6 cases and 25/25
+    assertions. `test_cuda_ops` executes the op kernels themselves.
+
+    **7. `nvidia-smi` on the host** works under `sudo -n` and only under it —
+    unprivileged it dies with `NvRmMemInitNvmap failed: error Permission
+    denied`, which is a PRIVILEGE problem and was previously mis-recorded as a
+    broken driver. Its memory columns read `[N/A]`: this is an integrated GPU
+    with no separate VRAM counters, the same shape as
+    [[gb10-has-no-dram-counters-ncu-memory-pct-is-a-lie]]. Do not build a
+    memory-headroom check on `nvidia-smi` here; read `free -g` instead.
+
+    **`~/gpu.lock` EXISTS again** (the 2026-08-11 line above saying it does not
+    is stale). Wrap GPU work as
+    `flock /home/mudler/gpu.lock -c '<docker run ...>'`. A host `./local-ai
+    worker` process is also back and was running throughout this baseline; it
+    was idle and did not perturb it, but stop it before any measurement.
+
+    **8. `ctest` BASELINE — `2daa3287f`, 2026-08-15, `ctest -j4 --timeout 1800`
+    inside the image above, 103.35 s wall:**
+
+    ```text
+    485 tests: 468 passed | 2 skipped | 15 FAILED
+    ```
+
+    Skipped: `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e`,
+    both for an absent checkpoint. Reproduce with
+    `/home/mudler/thor-w05/ctest.sh`. These are the sm_110 baseline and are NOT
+    to be "fixed" by a row that merely builds here; **a row is a regression on
+    Thor only if it lengthens this list.** Recorded as
+    [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110
+    counterpart of [#907](https://github.com/mudler/vllm.cpp/issues/907).
+
+    | # | Test | First failing assertion | Root cause |
+    |---|---|---|---|
+    | 80 | `test_platform` | `test_platform.cpp:307` `CHECK(cu.is_device_capability_family(120))` false | the TEST hardcodes the sm_12x family. Thor is 11.0 |
+    | 82 | `test_linear_method` | `:246` `after == before + 1` → `0 == 1`, case "MXFP4 fused gate_up … fused path ran" | the MXFP4 fused path does not run on sm_110. Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
+    | 86 | `test_qwen3_5_gdn_spec_routing` | **SEGFAULT** | FP8 fallback crash, [#960](https://github.com/mudler/vllm.cpp/issues/960) |
+    | 91 | `…_glue_fuse_off` | **SEGFAULT** | same |
+    | 92 | `…_fused_chain_off` | **SEGFAULT** | same |
+    | 124 | `test_deepseek_v2_forward` | `:559` THREW `cuda mla_prefill_attention: built without the vendored FlashAttention-2` | no FA-2 on sm_110 |
+    | 335 | `test_capi` | `test_capi.cpp:487` SIGSEGV | pre-existing, arch-independent; same crash on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
+    | 381 | `test_ops_fp8_cutlass` | **SEGFAULT** | FP8 fallback crash, [#960](https://github.com/mudler/vllm.cpp/issues/960) |
+    | 382 | `test_ops_fp8_cpu` | `:279` SIGSEGV in "G2: CPU QuantFp8Static equals CUDA QuantFp8Static byte for byte" | same, and this is the test that names the mechanism |
+    | 385 | `test_ops_moe_grouped` | `:1144` `bitdiff == 0` → `15`, logged `NVFP4 block8-vs-block16 M=8 K=4096 N=4096 bitdiff=15/32768` | **the one substantive standing sm_110 finding.** `marlin-nvfp4` IS enabled for `[110]`, so this is a live kernel disagreeing with itself across block sizes, not an absent feature |
+    | 390 | `test_ops_fused_chain` | **SEGFAULT** | FP8 fallback crash, [#960](https://github.com/mudler/vllm.cpp/issues/960) |
+    | 415 | `test_ops_mla_prefill` | `:340`, `:437` FA-2 absent | no FA-2 on sm_110 |
+    | 416 | `test_ops_mla_chunked_context` | `:790` FA-2 absent | same |
+    | 418 | `test_mla_attention_block` | `:999`, `:1044` FA-2 absent | same |
+    | 433 | `test_op_parity` | `:2487` `output_cbor_sha256` mismatch in "qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle (**dgx-only**, CUDA)" | a dgx-captured golden replayed on Thor; the case names itself dgx-only and runs anyway |
+
+    So the 15 collapse into four causes: **six** are
+    [#960](https://github.com/mudler/vllm.cpp/issues/960), **four** are the
+    missing vendored FA-2, **two** are tests that hardcode GB10
+    (`test_platform`'s capability family, `test_op_parity`'s dgx-only golden),
+    and **three** stand alone — `test_capi`'s segfault and `test_linear_method`,
+    both already red on GB10, plus `test_ops_moe_grouped`.
+
+    **The FIRST thing this lane found, and the argument for keeping it.** The
+    baseline was measured twice, at `5a0ffe9e3` and again at `2daa3287f` after a
+    rebase, and it MOVED. At the earlier SHA the FP8 group failed by throwing
+    `vt: no kernel for op QuantFp8Static (id 52) on device cuda` — a loud,
+    correct refusal, 484 tests / 14 red. At the later SHA the same request
+    silently takes the portable CPU reference tier and **segfaults**, 485 tests /
+    15 red. `cutlass-fp8` is ENABLED on GB10 and DISABLED for `[110]`, so on the
+    GB10 host the native kernel exists, the fallback is unreachable, and nothing
+    in CI could see it. Full detail and the attribution in
+    [#960](https://github.com/mudler/vllm.cpp/issues/960).
+
+    Two lessons for whoever runs this next. **Re-measure the baseline whenever
+    the base SHA moves across `src/`, `tests/` or `CMakeLists.txt`** — a stale
+    baseline is worse than none, because the next agent reads a regression as
+    the floor. And an earlier full run at `5a0ffe9e3` confirmed all 14 failures
+    of that generation reproduced serially at `-j1`, so `ctest -j4` is not
+    producing starvation artefacts on this box; re-confirm that only if a NEW
+    name appears.
+
+    Two things NOT to conclude from this table. The FP8 and FA-2 groups are
+    **feature absence surfacing as a thrown exception**, which is the loud
+    failure the seam is supposed to produce — they are not sm_110 numerical
+    bugs. And the FA-2 message reads *"MLA prefill on **sm_121** IS
+    FlashAttention"* while running on sm_110: the text is hardcoded to the GB10
+    arch, so do not read an arch out of it.
+
+    **A trap this baseline walked into first.** `test_serve_low_tools` failed
+    the initial run with `FileNotFoundError: 'shellcheck'` —
+    `tests/tools/test_online_gate_startup.py:260` shells out to `shellcheck` and
+    raises rather than skipping when the binary is absent. That is an ABSENT
+    INSTRUMENT reading as a code verdict, and it was a property of the image,
+    not of Thor. `shellcheck` is in the Dockerfile above for exactly that reason
+    and the test passes; if you build the image without it, expect an extra
+    failure that means nothing. The harness defect is real and is NOT fixed by
+    that Dockerfile line — putting the binary in the image hides it here and
+    leaves it armed everywhere else.
   - **★ THIS BOX REBOOTS INSTEAD OF OOM-KILLING — size every load for it.**
     `vm.overcommit_memory=1` ("always overcommit") with **zero swap**: the kernel
     grants memory it cannot back, and touching those pages takes the WHOLE MACHINE

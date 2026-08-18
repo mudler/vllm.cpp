@@ -794,6 +794,41 @@ lifecycle write.
 
 ## 10. Now
 
+**State at this commit: A2-P's PRODUCT CODE HAS LANDED, its A3 end-to-end token
+gate HAS RUN on the released checkpoint, and the divergence it found has a
+measured cause and a fix (#1157).**
+
+**The A3 gate PASSES on the host: `TOKEN MATCH: 96/96 over 3 prompts, full
+rows=3, short rows=0`, `STRICT PASS`** (2026-08-18, the released
+`nemotron-3.5-lightning-30b-nvfp4` at revision `29f2d174`, the committed oracle
+golden, through `include/vllm.h` alone). Engine load 209.0 s, peak RSS
+20 142 392 KB, per-prompt wall 928.93 / 839.42 / 1081.16 s. That is the whole
+paged forward — the recurrent carry, the paged KV, the FP8 Mamba2 projections,
+the NVFP4 MoE and `lm_head` — token-exact against the pinned oracle.
+
+**On GB10 the same binary read 4/24, and the cause was NOT the recurrent
+carry.** `NemotronHPagedForward` embedded the HOST `input.token_ids` while
+`ModelForwardInput::device_token_ids` was non-null, and that field's contract is
+that the host vector is STALE for decode rows (`model_registry.h:314-324`). Every
+decode step therefore embedded the same placeholder id. Three measurements name
+it rather than infer it: fresh-prefill mode on the SAME GB10 binary, which takes
+no decode step at all, read 24/24; the per-layer trace agrees to six digits
+between CPU and GB10 at the prefill step across all 52 layers; and at the first
+decode step the gathered conv/SSM state is IDENTICAL on the two while layer 0's
+embedding row reads 0.228135 on GB10 at BOTH decode steps, which consumed
+different tokens.
+
+**The cause recorded on #1157 was wrong, and this is the part worth keeping.**
+It reasoned that `gm.num_decodes` might classify a decode as a prefill so the
+gather would hand the mixer zeros. The trace reports `nd=1 np=0 init=[1]` on
+every decode step on real weights, and mutating that mask to 0 turns this row's
+CPU gate RED (1 case, 6 assertions) — so the gate was never blind to that
+defect. It was blind to this one for a structural reason: the runner sets
+`device_token_ids` only under `VLLM_CPP_CUDA` with a live device mirror, so no
+CPU gate can reach the branch at all.
+
+**Superseded record below, kept because its corrections are still useful.**
+
 **State at this commit: A2-P's PRODUCT CODE HAS LANDED, and its A3 end-to-end
 token gate has NOT RUN.** `ForwardNemotronHForCausalLM` selects
 `NemotronHPagedForward` whenever the runner supplies paged KV and recurrent
@@ -863,8 +898,20 @@ nobody routes this architecture through a block that ropes.
 
 ## 11. Owed
 
+- **[#1217](https://github.com/mudler/vllm.cpp/issues/1217) — the seam that let
+  #1157 land.** `ModelForwardInput::device_token_ids` says a forward that ignores
+  it "is simply never given one", but `runner.cpp:1408` sets the pointer for
+  whatever model the step routes to, with no per-model opt-in and no check. Two
+  models have now been cut from the identical divergence: Kimi-Linear
+  (`kimi_linear_device.cpp:2270-2280`) and this one. Not fixed in the #1157 flow
+  because both closes — an explicit `ModelFactory::honors_device_token_ids` with
+  a runner fallback, or a checker over the registered `.forward` entry points —
+  change a shared seam or checker semantics, which is the case AGENTS.md sends
+  through its own spec rather than in flow.
 - **The §5.4 A3 end-to-end token gate**, and the §5.7 sm_121a leg with it. Owned
   by this row, tracked on [#810](https://github.com/mudler/vllm.cpp/issues/810).
+  **The HOST leg is now GREEN (96/96, `STRICT PASS`, §10); the sm_121a leg's
+  green-after re-run under the #1157 fix is what remains.**
   Nothing about the released checkpoint is claimed until it runs. **The recorded
   PENDING CAUSE IS NO LONGER TRUE and was re-measured rather than inherited**
   (2026-08-17): §10 records contention — `dgx.casa` at loadavg 211 with 3 of

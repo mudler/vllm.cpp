@@ -33,6 +33,104 @@ append-only and carries `merge=union`, because a table every pull request
 writes is a lock when it lives beside keyed records. The portfolio table below
 remains the ordering surface, and it remains a keyed record: update in place,
 never append.
+| [#534](https://github.com/mudler/vllm.cpp/issues/534) | `SERVE-ASYNC-LLM` | Punch-list item 9 (`ROAD-V1-C6`) directs a depth-2 throughput lever the project refuted (`6ea7856`) and a `runner_supports_async` flip that landed (`a0013a2`) 10 days before the item was written; the one real residual is `ENG-PRIORITY-SCHED`'s priority-vs-FCFS gate, which does not exist | bug |
+| [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
+| [#433](https://github.com/mudler/vllm.cpp/issues/433) | `BACKEND-GATE-CPU-LLAMACPP` | No x86_64 arm: the closed CPU floor is Arm/i8mm-only and every lever that closed it is Arm-specific | perf |
+| [#529](https://github.com/mudler/vllm.cpp/issues/529) | `BACKEND-GATE-CPU-LLAMACPP` | `test_cpu_x86_llamacpp_floor` fails on a BUSY host, so preflight can fail itself: the contended-leg test asserts exit 2 but the unpinned real-loadavg quiet window exits 4 first | bug |
+| [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |
+| [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
+| [#132](https://github.com/mudler/vllm.cpp/issues/132) | `BACKEND-ROCM` | ROCm `-O0` RmsNorm CLR HostcallListener teardown deadlock | bug |
+| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | `hipblasGemmEx` overload mismatch in `rocm_matmul_hipblaslt.hip` | bug |
+| [#269](https://github.com/mudler/vllm.cpp/issues/269) | `BACKEND-ROCM` | ROCm gfx1200: Gemma-3 is 48/48 exact vs two vLLM-ROCm oracles; Qwen3-0.6B exposes a deterministic cross-version near-tie, not a backend defect | verification |
+| [#332](https://github.com/mudler/vllm.cpp/issues/332) | `BACKEND-ROCM` | ROCm: no decode-graph capture — the hipGraph seam is unimplemented, costing ~3x decode throughput vs vLLM on gfx1200 | perf |
+| [#125](https://github.com/mudler/vllm.cpp/issues/125) | `BACKEND-VULKAN` | Vulkan on AMD Strix Halo (gfx1151) does not load | bug |
+| [#203](https://github.com/mudler/vllm.cpp/issues/203) | `BACKEND-VULKAN` | Vulkan on unified memory holds TWO copies of the weights: 27B peaks at 100.8 GiB RSS and OOM-reboots a Spark | bug |
+| [#310](https://github.com/mudler/vllm.cpp/issues/310) | `BACKEND-VULKAN` | docs/FEATURES.md understates Vulkan: says decode 4.24 vs 4.35 where the binding figure is 4.36 vs 4.35 | bug |
+| [#224](https://github.com/mudler/vllm.cpp/issues/224) | `ENG-DOCS-SITE` | Publish `docs/` as a GitHub Pages site without owning a second copy | feature |
+| [#418](https://github.com/mudler/vllm.cpp/issues/418) | `ENG-FORGE-COAUTHOR` | The forge's Co-authored-by line is attribution, not an authorship claim: bot-opened PRs red main on merge | bug |
+| [#150](https://github.com/mudler/vllm.cpp/issues/150) | `ENG-LOAD-DIRECT-UPLOAD` | Model load / cold start time: measure properly, then cut | perf |
+| [#301](https://github.com/mudler/vllm.cpp/issues/301) | `ENG-LOAD-DIRECT-UPLOAD` | `main` is RED on ASan/UBSan: five misaligned BF16 reads from borrowed mmap weights | bug |
+| [#374](https://github.com/mudler/vllm.cpp/issues/374) | `ENG-NOW-DERIVED` | NOW.md is still a surface every PR must write: the doc-checkpoint gate marches them into it | bug |
+| [#364](https://github.com/mudler/vllm.cpp/issues/364) | `ENG-RECORD-CONFLICT-SURFACES` | Shared record surfaces are a lock: 16/29 open PRs conflict, 13 of them in bookkeeping only | bug |
+| [#460](https://github.com/mudler/vllm.cpp/issues/460) | `ENG-RECORD-CONFLICT-SURFACES` | `docs/BENCHMARKS.md` cannot be compacted: `check_links` validates links inside fenced blocks, so no row with a `docs/`-relative link can be archived byte-for-byte | bug |
+| [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-WINDOWS` | Binary release, including requested native Windows CPU/AVX2 and Vulkan bundles | feature |
+| [#447](https://github.com/mudler/vllm.cpp/issues/447) | `ENG-RELEASE-WINDOWS` | Native Windows release PR exposed stale version and archive-format contracts in hosted CI | bug |
+| [#448](https://github.com/mudler/vllm.cpp/issues/448) | `ENG-RELEASE-WINDOWS` | PR #446 device-leakage repair violates the per-commit documentation checkpoint | bug |
+| [#450](https://github.com/mudler/vllm.cpp/issues/450) | `ENG-RELEASE-WINDOWS` | PR #446 archive-target repair lacks its usage projection | bug |
+| [#453](https://github.com/mudler/vllm.cpp/issues/453) | `ENG-RELEASE-WINDOWS` | PR #446 exact-range gate lacks closed creation evidence for its new Windows checkers | bug |
+| [#454](https://github.com/mudler/vllm.cpp/issues/454) | `ENG-RELEASE-WINDOWS` | Native Windows portability audit mishandles Vulkan command-buffer identifiers and PowerShell script paths | bug |
+| [#455](https://github.com/mudler/vllm.cpp/issues/455) | `ENG-RELEASE-WINDOWS` | PR #446 agent-record ratchet change lacks semantic mutation evidence in its recognized suite | bug |
+| [#456](https://github.com/mudler/vllm.cpp/issues/456) | `ENG-RELEASE-WINDOWS` | PR-size isolated evidence PATH hides Ninja and falsely reds the Windows portability HEAD suite | bug |
+| [#457](https://github.com/mudler/vllm.cpp/issues/457) | `ENG-RELEASE-WINDOWS` | PR-size sanitized-PATH test constructs its asserted environment after the hostile ambient context exits | bug |
+| [#458](https://github.com/mudler/vllm.cpp/issues/458) | `ENG-RELEASE-WINDOWS` | PR-size portability evidence allowlist omits CMake from the CMake-plus-Ninja codemodel toolchain | bug |
+| [#459](https://github.com/mudler/vllm.cpp/issues/459) | `ENG-RELEASE-WINDOWS` | Native MSVC CPU and Vulkan release builds fail under the required strict warning gate | bug |
+| [#462](https://github.com/mudler/vllm.cpp/issues/462) | `ENG-RELEASE-WINDOWS` | Central MSVC NOMINMAX contract conflicts with redundant unguarded source-local definitions under `/WX` | bug |
+| [#464](https://github.com/mudler/vllm.cpp/issues/464) | `ENG-RELEASE-WINDOWS` | DeepSeek V4 expert probe narrows double sine values under native MSVC `/WX` | bug |
+| [#465](https://github.com/mudler/vllm.cpp/issues/465) | `ENG-RELEASE-WINDOWS` | LogprobsTensors per-request slice parameter shadows its member under native MSVC `/WX` | bug |
+| [#474](https://github.com/mudler/vllm.cpp/issues/474) | `ENG-RELEASE-WINDOWS` | MSVC stringizes a backslash-bearing raw literal inside CHECK and rejects the Windows argv expectation | bug |
+| [#475](https://github.com/mudler/vllm.cpp/issues/475) | `ENG-RELEASE-WINDOWS` | PR #446 release benchmark projection exceeds its page budget after merging current main | bug |
+| [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
+| [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
+| [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
+| [#466](https://github.com/mudler/vllm.cpp/issues/466) | `GATE-27B-FP8-TOWER-GOLDEN` | The SACRED 27B gate cannot execute the FP8 tower: it pins unsloth@890bdef7 (zero FP8 tensors) while every fp8 lever targets nvidia@0893e160 | bug |
+| [#470](https://github.com/mudler/vllm.cpp/issues/470) | `GATE-27B-FP8-TOWER-GOLDEN` | `PackedGdnDecodeEnvSelected` mirrors only the ENV; the real predicate also requires `in_proj_qkv_fp8.Empty()`, so the 27B gate throws for the wrong reason on any fp8 tower | bug |
+| [#476](https://github.com/mudler/vllm.cpp/issues/476) | `GATE-27B-FP8-TOWER-GOLDEN` | The 27n fp8-tower arm cannot see a dequant fallback on `out_proj_fp8` or the four `self_attn.*_proj_fp8`: `GdnFp8InProjDebugStats` counts GDN `in_proj` only, and `6603356a` proves that defect is token-invisible | bug |
+| [#477](https://github.com/mudler/vllm.cpp/issues/477) | `GATE-27B-FP8-TOWER-GOLDEN` | CI silences all three of the 27n arm's refusal defences: `ctest --output-on-failure` prints nothing for a passing skip, so the `NO-FP8-TOWER-COVERAGE` banner and the assertion count never reach the log | bug |
+| [#478](https://github.com/mudler/vllm.cpp/issues/478) | `GATE-27B-FP8-TOWER-GOLDEN` | The 27n arm refuses the packed-decode ENV mirror but trusts the qkvz one: expected counts come from `MergedGdnFp8QkvzEnvSelected`'s 3 env probes where `GdnMergedFp8QkvzEligibilityFor` has 6 terms including checkpoint data | bug |
+| [#479](https://github.com/mudler/vllm.cpp/issues/479) | `GATE-27B-FP8-TOWER-GOLDEN` | `dump_qwen36.py` labels every golden manifest `pip-vllm` because it detects the pinned oracle by a `pinenv` path substring the oracle's real path lacks | bug |
+| [#382](https://github.com/mudler/vllm.cpp/issues/382) | `KERNEL-ATTN-PAGED` | decode-opt attention kernel is head_dim-256 only; head_dim 128 (Qwen3-dense, Llama, Mistral) falls to the block kernel | perf |
+| [#206](https://github.com/mudler/vllm.cpp/issues/206) | `KERNEL-SSM-MAMBA` | RTX 5070 Ti: close Qwen3.5-4B TTFT, TPOT and VRAM gaps vs vLLM — owns the sm_120 post-conv token tile and the K=4 causal-conv arm (PR #155) | feature |
+| [#305](https://github.com/mudler/vllm.cpp/issues/305) | `KERNEL-SSM-MAMBA` | GDN causal-conv: the `conv_state` initial-state read races the final-state write across blocks (`VT_CONV_REG` + exact chunks, both default ON) | bug |
+| [#352](https://github.com/mudler/vllm.cpp/issues/352) | `KV-EVENTS` | The batch envelope is never published and `kv_cache_report_mode` does not exist — events can only be observed by reaching into the `BlockPool` | feature |
+| [#353](https://github.com/mudler/vllm.cpp/issues/353) | `KV-EVENTS` | `KVEventsConfig` has no `__post_init__`: an enabled config with an unset publisher reports `unknown event publisher ''` instead of resolving to zmq | bug |
+| [#396](https://github.com/mudler/vllm.cpp/issues/396) | `KV-EXTERNAL-CACHE` | `test_lmcache_connector` data race under TSan: `MockLmcacheServer` writes non-atomic `listen_fd_` before joining its accept thread | bug |
+| [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |
+| [#278](https://github.com/mudler/vllm.cpp/issues/278) | `LORA-RUNTIME` | LoRA W2: packed adapters, merged qkv/gate_up layers, TP slicing, embedding + logits LoRA | feature |
+| [#395](https://github.com/mudler/vllm.cpp/issues/395) | `LORA-RUNTIME` | `main` is RED on `sanitize-cpu (address,undefined)`: `test_punica_cpu` `RefShrink` reads past `a_stacked` for an out-of-range slot | bug |
+| [#400](https://github.com/mudler/vllm.cpp/issues/400) | `LORA-RUNTIME` | `test_punica_cpu` does not cover the out-of-range slot guard in `BgmvShrink` or `BgmvExpandSlice`: dropping either leaves the suite green | bug |
+| [#432](https://github.com/mudler/vllm.cpp/issues/432) | `MODEL-MM-voxtral-voxtral-for-conditional-generation` | Voxtral audio TTFT is ~17x vLLM: the Whisper encoder attention is a scalar warp kernel where vLLM runs FA-2 | enhancement |
+| [#268](https://github.com/mudler/vllm.cpp/issues/268) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer (Meta, 30B agentic multimodal): text tower, perception encoder, DFlash drafter | feature |
+| [#329](https://github.com/mudler/vllm.cpp/issues/329) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quants: text arm lands; mmproj blocked by a converter axis drop | feature |
+| [#333](https://github.com/mudler/vllm.cpp/issues/333) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer speed: no number on any axis; benchmark vs llama.cpp, HF, and ourselves | perf |
+| [#347](https://github.com/mudler/vllm.cpp/issues/347) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | GGUF tokenizer: no pre-tokenizer for the GPT-4o family, so `tokenizer.ggml.pre "llama4"` files cannot generate at all | bug |
+| [#359](https://github.com/mudler/vllm.cpp/issues/359) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quant generates INCOHERENT text where llama.cpp on the same file is coherent | bug |
+| [#412](https://github.com/mudler/vllm.cpp/issues/412) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer config defaults are neutral values, not the architecture's constants: the released GGUF's sandwich post-norms ran at 1e-5 instead of 1e-8 | bug |
+| [#298](https://github.com/mudler/vllm.cpp/issues/298) | `PERF-27B-LMHEAD-DSR` | `main` is RED on the `device-leakage` DSR ratchet: `PrepareLmHeadResident` added a 33rd `vt_ifdef` to the shared layer | bug |
+| [#213](https://github.com/mudler/vllm.cpp/issues/213) | `PERF-27B-LMHEAD-FP4` | Qwen3.6 NVFP4 baselines (27B and 35B-A3B) must reach vLLM speed parity | perf |
+| [#391](https://github.com/mudler/vllm.cpp/issues/391) | `PERF-CPU-DECODE-BARRIER` | CPU backend: batch-1 decode is barrier-bound (47% sync), and paged attention branches per element | perf |
+| [#299](https://github.com/mudler/vllm.cpp/issues/299) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: 5 dense SwiGLU models bypass the MUST-route merged-GEMM seam with no stated blocker (spec [`fusion-dense-migrate.md`](specs/fusion-dense-migrate.md)) | bug |
+| [#314](https://github.com/mudler/vllm.cpp/issues/314) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE` glue half: `glm4`/`phi3` still hand-call add+RMSNorm instead of `vt::FusedChain` (split out of #299, which closed the merged-GEMM half only) | bug |
+| [#337](https://github.com/mudler/vllm.cpp/issues/337) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: the five dgx SACRED paged-engine gates are OWED after the merged-GEMM fold (`test_{commandr,glm4,minicpm,minicpm3,phi3}_paged_engine` SKIP on a CPU box) | bug |
+| [#338](https://github.com/mudler/vllm.cpp/issues/338) | `ROAD-V1-C1` | MiniCPM/MiniCPM3 hard-code SiLU: upstream `MiniCPMMLP` (`minicpm.py:219-226`) selects `FatreluAndMul` on `hidden_act == "fatrelu"` and raises otherwise; our `parse_config` never reads `hidden_act` | bug |
+| [#527](https://github.com/mudler/vllm.cpp/issues/527) | `ROAD-V1-C2-LOCAL-BF16` | Punch-list item 14 directs work that landed 2026-07-27 (`deed7c2a1`, default-ON `1718bf155`), on a 497-`cudaStreamSynchronize` premise the same commit refuted | bug |
+| [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
+| [#238](https://github.com/mudler/vllm.cpp/issues/238) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprobs_mode`: three of four modes are runtime-refused stubs | bug |
+| [#264](https://github.com/mudler/vllm.cpp/issues/264) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprob_token_ids`: generative scoring over an explicit token set is unported | feature |
+| [#365](https://github.com/mudler/vllm.cpp/issues/365) | `PERF-27B-DENSE-MARLIN-GATEUP` | 27B gap decomposed vs vLLM's own decode profile; dense W4A16 MLP bypassed the fused gate_up seam (spec `specs/perf-27b-dense-marlin-gateup.md`) | bug |
+| [#362](https://github.com/mudler/vllm.cpp/issues/362) | — | First VALID 27B per-kernel decode attribution: whole-run trace windowed by the profiler's own cudaProfilerStart/Stop | bug |
+| [#378](https://github.com/mudler/vllm.cpp/issues/378) | `KERNEL-MOE-ROUTING` | MoE router top-k as one warp per token, byte-exact via a stride-32 lane map; a lever inside the routing family, so no new stable row (spec `specs/moe-router-topk-single-warp.md`) | perf |
+| [#223](https://github.com/mudler/vllm.cpp/issues/223) | `SAMPLE-PROMPT-LOGPROBS` | `prompt_logprobs` is a silent no-op: the runner never computes logits at prompt positions | bug |
+| [#294](https://github.com/mudler/vllm.cpp/issues/294) | `SERVE-ASYNC-LLM` | `test_async_llm`: reusing an aborted request id races the core abort — 26% failure rate under contention, on main | bug |
+| [#222](https://github.com/mudler/vllm.cpp/issues/222) | `SERVE-GATE-ONLINE` | The online-serving gate aborts on current main: harness looks for `examples/server`, the build produces `examples/vllm-server` — paths repaired by `2b262622`/`8fce04d3`; residue is the drift guard, the `27n` key and a model gate that recorded a skip as passed | bug |
+| [#277](https://github.com/mudler/vllm.cpp/issues/277) | `SERVE-METRICS` | `/metrics` is dead on the production server: AsyncLLM never folds IterationStats into the logger | bug |
+| [#321](https://github.com/mudler/vllm.cpp/issues/321) | `SERVE-METRICS` | AsyncLLM output thread outlives metrics logger and uses freed PromRegistry | bug |
+| [#81](https://github.com/mudler/vllm.cpp/issues/81) | `SPEC-MTP` | Speculative decoding: MTP k>1, dynamic and adaptive depth | feature |
+| [#83](https://github.com/mudler/vllm.cpp/issues/83) | — | Auto-size memory to the workload; pre-flight error instead of OOM | feature |
+| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | In-source `cmake .` collides every examples/ target with its own source directory and dies in the linker | bug |
+| [#146](https://github.com/mudler/vllm.cpp/issues/146) | — | Pascal support | feature |
+| [#147](https://github.com/mudler/vllm.cpp/issues/147) | — | Multi-GPU tensor parallel on real hardware | feature |
+| [#148](https://github.com/mudler/vllm.cpp/issues/148) | — | Volta (sm_70) and Turing (sm_75) support | feature |
+| [#149](https://github.com/mudler/vllm.cpp/issues/149) | — | CPU/RAM offload and CPU-MoE hybrid execution | feature |
+| [#192](https://github.com/mudler/vllm.cpp/issues/192) | — | `OrEmpty` C-linkage returns `std::string` (fixed by #195) | bug |
+| [#193](https://github.com/mudler/vllm.cpp/issues/193) | — | A100 (sm_80): crashes and wrong GDN output in fast paths | bug |
+| [#230](https://github.com/mudler/vllm.cpp/issues/230) | — | `test_agent_record.py`: 7 issue-intake tests never run, and error when they do | bug |
+| [#242](https://github.com/mudler/vllm.cpp/issues/242) | — | `docs/FEATURES.md` drift: arch counts say 30 (registry has 35), multimodal-over-HTTP marked ☐ though W1-W3 landed | bug |
+| [#243](https://github.com/mudler/vllm.cpp/issues/243) | — | `vllm-feature-gap-analysis.md` is a stale 2026-07-28 snapshot: 9 of 16 HIGH/MED gaps have since landed | bug |
+| [#250](https://github.com/mudler/vllm.cpp/issues/250) | — | `a5b52047` reached main without a task branch, and `check-role-discipline` cannot be waived | bug |
+| [#274](https://github.com/mudler/vllm.cpp/issues/274) | — | `main` is not verified by its own CI: the per-job `github.ref` concurrency groups cancel every long job on the next push, so the suite never completes (spec `specs/main-verifiability.md`) | bug |
+| [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
+| [#296](https://github.com/mudler/vllm.cpp/issues/296) | — | Two limitations recorded when #285 landed: a stale TTL comment, and a publish-NAME pin `os.rename` escapes (spec `specs/operator-record.md`, "Follow-up") | bug |
+| [#408](https://github.com/mudler/vllm.cpp/issues/408) | — | 12 of 54 `tests/scripts` suites are executed by nothing, and `check-test-registration.py`'s fixed `REQUIRED_TESTS` cannot see the class (found while repairing #274) | bug |
 
 ## Top-level portfolio
 

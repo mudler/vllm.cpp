@@ -5,11 +5,11 @@
 // WHAT THIS REPLACES. Backend::EndCaptureGraph instantiates one graph executable per
 // capture and destroys the raw graph immediately (src/vt/cuda/cuda_backend.cu, and the
 // same shape on hipGraph). A model therefore holds one executable per padded decode
-// bucket — 7 of them at max_num_seqs=32 and 11 at 64 — and nine hand-rolled drivers
-// each hold their own set (count corrected 2026-08-18, issue #1179). The decode graphs of two padded batch sizes are usually the
-// same node topology with different parameters, which is exactly the case
-// cudaGraphExecUpdate exists for: re-point ONE executable instead of instantiating a
-// second.
+// bucket — 7 of them at max_num_seqs=32 and 11 at 64 — and nine hand-rolled drivers each
+// hold their own set (count corrected 2026-08-18, issue #1179). The decode graphs of two
+// padded batch sizes are usually the same node topology with different parameters, which
+// is exactly the case cudaGraphExecUpdate exists for: re-point ONE executable instead of
+// instantiating a second.
 //
 // This is a MEMORY and CAPTURE-TIME change, not a throughput change. A deduped replay
 // launches the same nodes with the same parameters; if it launched anything else that
@@ -20,9 +20,9 @@
 // signature, but never trusts it: every candidate match is PROBED with the real driver
 // update before it is honoured, on a throwaway executable, and a probe the driver
 // refuses gives that capture its own executable. So a signature that is too coarse
-// costs a wasted probe, or at worst the loud Replay-time VT_CHECK described there when
-// update compatibility turns out not to be transitive across a group -- never a wrong
-// replay. A signature can only cost a fold, it can never make a replay wrong.
+// costs a wasted probe, or at worst the loud Replay-time VT_CHECK explained at that
+// call site when update compatibility turns out not to be transitive across a group.
+// A signature can cost a fold; it can never make a replay wrong.
 // The alternative — a signature exhaustive enough to be trusted — would make this file
 // a correctness surface that has to track every node-parameter class the driver knows.
 //

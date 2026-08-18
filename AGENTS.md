@@ -33,6 +33,17 @@ gate `PENDING`. Never convert a missing value into an assumption. Preferences
 control operations only. They cannot reduce a correctness, evidence,
 attribution, or testing obligation.
 
+**Create both files on first use.** Neither is tracked, so a fresh checkout has
+neither, and `scripts/agent-start.py` reports the absence and routes you to ask.
+Ask the developer for the one value the current gate needs. Record an
+environment value with `scripts/agent-onboard.py --env-set KEY=VALUE`, which
+refuses any key `.env.example` does not declare. Record a preference by copying
+`.agents/developer-preferences.example.md` and editing the one entry. Leave
+every key you did not ask about empty, because empty means unavailable and its
+gate stays `PENDING`. A host name, a share path, or a checkout path written in
+a repository document is another developer's resolved value. It is never a
+default, and reading one instead of asking is the failure this rule names.
+
 ## History is git
 
 The project has no state log. Git is the history, and the history must agree
@@ -443,9 +454,20 @@ speed axis as VOID because of it. That is the #777 failure again, in which this
 repository carried two GPU mutexes and neither serialised the other. A bypass
 also makes the fleet report the box free while somebody is on it.
 
-**A lease carries bytes, not executables.** The leased worker reads and writes
-the shared `/workspace`, and it has no compiler, no downloader and no Python, so
-it cannot produce a runtime in place. Plan staging around that limit.
+**A lease runs as root, and the worker provisions itself.** The leased worker
+reads and writes the shared `/workspace`, and on `dgx:gpu0` it is an Ubuntu 24.04
+container carrying `git`, `curl`, `wget`, `gcc`, `cmake`, `ninja`, `python3` and
+`pip`. It installs what it lacks and it compiles in place. On 2026-08-18 one job
+apt-installed `cuda-nvcc-13-0` and built this tree for `sm_121a`
+([#1213](https://github.com/mudler/vllm.cpp/issues/1213)).
+
+**Four limits are still real, and they shape staging.** No CUDA toolkit is
+preinstalled, so a job that compiles CUDA installs one first. A global install
+leaks into the next job, so put project dependencies in a virtual environment
+under `/workspace`. `/workspace` is CIFS and holds no symlink, so build in `/tmp`
+and copy out with `cp -rL`. Unconstrained parallelism has OOM-rebooted this box,
+so use `-j 4`. The HOST `dgx.casa` has no egress to `github.com` while the
+container does, so name the side you mean.
 [`.agents/environment.md`](.agents/environment.md) carries the fleet, the
 measurement, and the procedure.
 

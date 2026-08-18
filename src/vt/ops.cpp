@@ -642,6 +642,37 @@ void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scal
   reinterpret_cast<QuantFp8StaticFn>(GetOp(OpId::kQuantFp8Static, q.device.type))(q, out_fp8, x,
                                                                                   input_scale);
 }
+void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                   int group_size) {
+  VT_CHECK(x.rank == 2 && out_fp8.rank == 2 && out_scale.rank == 2,
+           "quant_fp8_group: x/out_fp8/out_scale must be rank-2");
+  // group_size is validated BEFORE it divides anything: `K % 0` is undefined
+  // behaviour, so a zero here must refuse rather than trap.
+  VT_CHECK(group_size > 0, "quant_fp8_group: group_size must be positive");
+  const int64_t m = x.shape[0], k = x.shape[1];
+  // Mirrors upstream's assert text at
+  // vllm/model_executor/layers/quantization/utils/fp8_utils.py:596-599.
+  VT_CHECK(k % group_size == 0,
+           "quant_fp8_group: the last dimension of x must be divisible by group_size");
+  VT_CHECK(out_fp8.shape[0] == m && out_fp8.shape[1] == k,
+           "quant_fp8_group: out_fp8 must match x shape [M,K]");
+  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == k / group_size,
+           "quant_fp8_group: out_scale must be [M, K/group_size]");
+  VT_CHECK(IsFloat(x.dtype), "quant_fp8_group: float x (f32/bf16) required");
+  VT_CHECK(out_fp8.dtype == DType::kI8,
+           "quant_fp8_group: out_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  // f32, not the model dtype: upstream allocates the scale f32 (fp8_utils.py:631)
+  // and the block-scaled GEMM multiplies it into an f32 accumulator.
+  VT_CHECK(out_scale.dtype == DType::kF32, "quant_fp8_group: out_scale must be f32");
+  // Upstream asserts `x.stride(-1) == 1` (fp8_utils.py:600); a group that is not
+  // contiguous would read across rows.
+  VT_CHECK(x.IsContiguous() && out_fp8.IsContiguous() && out_scale.IsContiguous(),
+           "quant_fp8_group: contiguous tensors required");
+  VT_CHECK(x.device == q.device && out_fp8.device == q.device && out_scale.device == q.device,
+           "quant_fp8_group: device mismatch (x/out_fp8/out_scale/queue)");
+  reinterpret_cast<QuantFp8GroupFn>(GetOp(OpId::kQuantFp8Group, q.device.type))(
+      q, out_fp8, out_scale, x, group_size);
+}
 void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
                      const Tensor& weight, const RmsNormArgs& args, Tensor* residual,
                      float input_scale) {

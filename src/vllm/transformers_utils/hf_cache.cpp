@@ -2,11 +2,18 @@
 // for the llama.cpp `b10451` anchors it mirrors.
 #include "vllm/transformers_utils/hf_cache.h"
 
+#if !defined(_WIN32)
+#include <pwd.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -40,11 +47,33 @@ const char* NonEmptyEnv(const char* name) {
   return (value != nullptr && value[0] != '\0') ? value : nullptr;
 }
 
-// Degraded mode is process-wide on purpose: a file system that refused one
-// symbolic link refuses the next one too, and a 300-shard repository must not
-// pay 300 failed system calls or print 300 identical warnings.
-std::atomic<bool> g_symlinks_disabled{false};
+// Degraded mode is keyed on the DIRECTORY the blob lives in, never on the
+// process. The reasoning behind the latch is "a file system that refused one
+// symbolic link refuses the next one too", and that reasoning holds per file
+// system. A directory sits on exactly one file system, so the blobs directory
+// of one repository is the largest scope the evidence covers: a 300-shard
+// repository still pays one failed system call and prints one warning, while a
+// CIFS mount can no longer degrade a second cache root on a disk that holds
+// symbolic links perfectly well.
+std::mutex g_symlink_state_mu;
+std::set<std::string> g_symlink_disabled_dirs;
 std::atomic<int> g_symlink_fallback_logs{0};
+
+std::string SymlinkLatchKey(const fs::path& blob_path) {
+  return blob_path.parent_path().lexically_normal().string();
+}
+
+bool SymlinksDisabledFor(const std::string& key) {
+  const std::lock_guard<std::mutex> lock(g_symlink_state_mu);
+  return g_symlink_disabled_dirs.count(key) != 0;
+}
+
+// True when this call is the one that switched `key` into degraded mode, which
+// is the call that owns the single log line.
+bool DisableSymlinksFor(const std::string& key) {
+  const std::lock_guard<std::mutex> lock(g_symlink_state_mu);
+  return g_symlink_disabled_dirs.insert(key).second;
+}
 
 }  // namespace
 
@@ -69,6 +98,22 @@ std::filesystem::path HfHubCacheDir() {
       return entry.suffix.empty() ? base : base / entry.suffix;
     }
   }
+#if !defined(_WIN32)
+  // llama.cpp `common/hf-cache.cpp:56-62 @ b10451`. A container started with
+  // `--user` and no HOME still has a passwd entry, and huggingface_hub finds a
+  // cache there, so refusing here would answer "this host has no cache" about a
+  // host that has one.
+  if (const struct passwd* pw = ::getpwuid(::getuid())) {
+    if (pw->pw_dir != nullptr && pw->pw_dir[0] != '\0') {
+      return fs::path(pw->pw_dir) / ".cache" / "huggingface" / "hub";
+    }
+  }
+#endif
+  // Upstream throws here (`:63`). This returns an empty path instead, which
+  // every caller reads as "this host has no cache": the cache directory is
+  // resolved eagerly by callers that may never need it, and a throw would turn
+  // a passwd-less container into a failure on a code path that has no cache
+  // work to do.
   return {};
 }
 
@@ -175,8 +220,9 @@ bool HfFinalizeSnapshotEntry(const std::filesystem::path& blob_path,
     return false;
   }
 
+  const std::string latch_key = SymlinkLatchKey(blob_path);
   std::error_code link_ec;
-  if (!g_symlinks_disabled.load()) {
+  if (!SymlinksDisabledFor(latch_key)) {
     // A RELATIVE target keeps the whole cache tree movable, which is how
     // huggingface_hub writes it.
     const fs::path target =
@@ -185,11 +231,13 @@ bool HfFinalizeSnapshotEntry(const std::filesystem::path& blob_path,
     if (!link_ec) return true;
   }
 
-  if (!g_symlinks_disabled.exchange(true)) {
+  if (DisableSymlinksFor(latch_key)) {
     g_symlink_fallback_logs.fetch_add(1);
-    std::cerr << "vllm.cpp: this file system holds no symbolic link ("
+    std::cerr << "vllm.cpp: " << latch_key
+              << " is on a file system that holds no symbolic link ("
               << link_ec.message()
-              << "); moving or copying HuggingFace cache entries instead\n";
+              << "); moving or copying HuggingFace cache entries there "
+                 "instead\n";
   }
 
   ec.clear();
@@ -210,7 +258,10 @@ bool HfFinalizeSnapshotEntry(const std::filesystem::path& blob_path,
 int HfSymlinkFallbackLogCount() { return g_symlink_fallback_logs.load(); }
 
 void HfResetSymlinkFallbackStateForTesting() {
-  g_symlinks_disabled.store(false);
+  {
+    const std::lock_guard<std::mutex> lock(g_symlink_state_mu);
+    g_symlink_disabled_dirs.clear();
+  }
   g_symlink_fallback_logs.store(0);
 }
 
@@ -227,9 +278,29 @@ std::string ResolveCachedSnapshotDir(const std::string& path,
 
   const fs::path snapshots = HfRepoPath(hub_dir, path) / "snapshots";
   if (!fs::is_directory(snapshots, ec)) return path;
+  // The NEWEST snapshot that holds a config.json wins, and the path breaks a
+  // tie. `std::filesystem::directory_iterator` does not order its entries, so
+  // the relocated walk's "the last one the iterator yielded" answered a
+  // repository with two revisions differently on different hosts and could
+  // answer one host differently on two runs. The order here is total, so two
+  // runs of one command load one checkpoint.
   std::string best;
+  fs::file_time_type best_time{};
   for (const fs::directory_entry& entry : fs::directory_iterator(snapshots, ec)) {
-    if (fs::exists(entry.path() / "config.json", ec)) best = entry.path().string();
+    std::error_code entry_ec;
+    if (!fs::exists(entry.path() / "config.json", entry_ec)) continue;
+    const fs::file_time_type written =
+        fs::last_write_time(entry.path(), entry_ec);
+    // An unreadable timestamp must not win over a readable one, and must still
+    // be usable when it is the only candidate.
+    const fs::file_time_type stamp =
+        entry_ec ? fs::file_time_type::min() : written;
+    const std::string candidate = entry.path().string();
+    if (best.empty() || stamp > best_time ||
+        (stamp == best_time && candidate > best)) {
+      best = candidate;
+      best_time = stamp;
+    }
   }
   return best.empty() ? path : best;
 }

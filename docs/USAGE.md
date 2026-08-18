@@ -1795,10 +1795,15 @@ they mean what `huggingface_hub` means by them:
 The cache is HuggingFace's documented layout,
 `{hub}/models--org--repo/` with `refs`, `blobs` and
 `snapshots/{commit}/{path}`, so a host that already holds a Python
-`huggingface_hub` cache is read rather than re-downloaded. Where the file system
-holds no symbolic link, which is the case for a CIFS mount and can be the case
-for the `/cache` container volume, a snapshot entry becomes a real file and the
-server logs the switch one time.
+`huggingface_hub` cache is read rather than re-downloaded. A repository holding
+more than one snapshot resolves to the one written most recently.
+
+Reading that layout is what the server does today. Writing into it is landed
+code with no caller yet: where the file system holds no symbolic link, which is
+the case for a CIFS mount and can be the case for the `/cache` container volume,
+a snapshot entry will become a real file, and the switch will be logged one time
+for each cache directory it happens in. The fetcher that calls it is W3 of the
+row, so nothing prints that line at this commit.
 
 Two limits are worth stating plainly. No command-line surface reaches any of
 this yet, so setting `HF_TOKEN` today changes nothing a server does. And the

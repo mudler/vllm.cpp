@@ -32,7 +32,8 @@ struct HfHubOptions {
   std::string endpoint;
   // `HF_TOKEN`, else the first line of the file named by `HF_TOKEN_PATH`.
   std::string token;
-  // `HF_HUB_OFFLINE`. Resolve from the cache and open no socket.
+  // `HF_HUB_OFFLINE`. Resolve from the cache and open no socket: every call in
+  // this header refuses rather than reaching the hub, and names the variable.
   bool offline = false;
   // Where `models--org--repo` lives. Defaults to `HfHubCacheDir()`.
   std::filesystem::path hub_dir;
@@ -68,16 +69,26 @@ struct HfFile {
 // listing offers it. A 40 character hexadecimal `revision` is already a commit
 // and is returned without a request.
 //
+// A redirect is NOT followed. See the client in hf_hub.cpp: httplib forwards
+// the request headers to the redirect target, and the bearer token must not
+// reach a host the caller never named.
+//
 // Throws std::runtime_error on a refusal. HTTP 401 and 403 name the repository
-// and `HF_TOKEN`.
+// and `HF_TOKEN`, and `opts.offline` refuses before any socket is opened.
 std::string HubResolveRefToCommit(const std::string& repo_id,
                                   const std::string& revision,
                                   const HfHubOptions& opts);
 
 // GET `{endpoint}api/models/{repo}/tree/{commit}?recursive=true`.
 //
-// The listing is REFUSED, not filtered, when two distinct files carry the same
-// object identifier. A hub that hands out one identifier for every file is
+// `commit` must be a 40 character hexadecimal commit, because every call after
+// the reference resolution names one; asking for a branch here would let a
+// moving `main` change what a second run loads.
+//
+// The listing is REFUSED, not filtered, when two DISTINCT files carry the same
+// object identifier. One file listed twice is not that case. An identifier that
+// is neither 40 nor 64 hexadecimal characters is dropped and its file is kept,
+// because the file is still addressable by path. A hub that hands out one identifier for every file is
 // answering something other than the truth about the repository, and a
 // per-entry filter would let the rest of that answer through.
 //

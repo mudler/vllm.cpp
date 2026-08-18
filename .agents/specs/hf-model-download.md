@@ -325,6 +325,30 @@ Windows Schannel path. Decision: W5 produces a per-lane table of lane, TLS
 source, and feature state. The Linux lanes that the quickstart targets do not
 wait for it.
 
+**Two divergences in the cache directory, and one restored fallback.**
+`HfHubCacheDir` mirrors llama.cpp `common/hf-cache.cpp:37-63 @ b10451`,
+including the passwd-database fallback at `:56-62`, which a container started
+with `--user` and no `HOME` needs. Two things differ, and both are deliberate.
+The value is resolved on every call rather than cached in a function-local
+static, because a process that changes `HF_HOME` must see the change and the
+upstream freezes the first reader's environment for the whole process. And a
+host with no environment variable and no passwd home gets an empty path rather
+than upstream's throw at `:63`, because callers resolve the cache directory
+eagerly on paths that may never touch the cache, and every caller reads an empty
+path as "this host has no cache". `LLAMA_CACHE` is that project's own name and
+is not read.
+
+**The multi-snapshot winner is now defined.** The walk that moved out of
+`model_loader.cpp` returned the last entry `std::filesystem::directory_iterator`
+happened to yield, and that iterator does not order its entries, so a repository
+holding two revisions could resolve differently on two hosts and, after the
+directory was re-written, on two runs of one command. The relocation preserved
+that, and W7's repair replaced it with the newest entry holding a config.json,
+with the greater path breaking a tie. "Newest" is what the comment on the
+relocated function always claimed the function did. A repository with one
+snapshot, which is every case the DFlash draft path has been run against,
+resolves identically either way.
+
 **A null grep is not absence.** This spec states that no document pins a runtime
 dependency list, based on a grep of `docs/RELEASES.md`, `docs/BUILD.md`, and
 `scripts/check-release-binary-contract.py`. That grep proves the search terms
@@ -344,9 +368,13 @@ divergence. `docs/USAGE.md` states which upstream defines which form.
 - The quickstart page, issue
   [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
 - **Wiring `hf_hub` to a production entry point.** W2 lands `hf_hub` reached
-  only by its own suite. `hf_cache` is reached, because the DFlash draft path in
-  `model_loader.cpp` calls `ResolveCachedSnapshotDir`, but the refs, blobs,
-  snapshot-entry and hub-protocol surface is not. W4 wires it through
+  only by its own suite. Of `hf_cache`, only `ResolveCachedSnapshotDir` is
+  reached, through the DFlash draft path in `model_loader.cpp`, and
+  `tests/vllm/entrypoints/test_dflash_draft_hf_cache.cpp` gates that reach by
+  entering the loader with a repository identifier. `HfReadRef`, `HfWriteRef`,
+  `HfBlobPath`, `HfSnapshotPath` and `HfFinalizeSnapshotEntry` have no
+  production caller at all, and neither does any hub call. W3 gives the
+  snapshot-entry and blob surface its first caller, and W4 wires the hub through
   `model_resolver` and `server_main.cpp:433`. Row `ENG-HF-MODEL-DOWNLOAD`,
   issue [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 - **The DFlash draft path does not honor `HF_HOME`.** `ResolveDflashDraftDir`
@@ -359,4 +387,19 @@ divergence. `docs/USAGE.md` states which upstream defines which form.
 
 ## Now
 
-State `READY`. The spec is committed and no code has landed.
+State `READY`, and W1 and W2 have landed. W1 corrected the llama.cpp anchor
+table onto stock tag `b10451`. W2 landed `hf_hub` and `hf_cache` under
+`src/vllm/transformers_utils/`, with `include/vllm/transformers_utils/`
+headers, and moved the DFlash draft path's copy of the cache walk onto the
+shared `ResolveCachedSnapshotDir`. Three suites cover them:
+`tests/vllm/transformers_utils/test_hf_cache.cpp`,
+`tests/vllm/transformers_utils/test_hf_hub.cpp` against an in-process fake hub,
+and `tests/vllm/entrypoints/test_dflash_draft_hf_cache.cpp`, which enters the
+production loader with a repository identifier so that deleting the call site
+turns it red.
+
+The row stays `READY` rather than moving to `ACTIVE`, because an `ACTIVE` row
+needs a `CLAIM-*` owner recorded in a claim source and that is the operator's
+record to write, not an implementer's. W3 through W7 have not been done: there
+is no downloader, no `--model` grammar, no transport layer security option, and
+no user-facing workflow. `--model` still takes a local path only.

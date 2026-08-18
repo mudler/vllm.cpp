@@ -1305,6 +1305,11 @@ vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
+# ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
+# the production loader, with a repository identifier rather than a path. The
+# transformers_utils suite calls the function directly and cannot see a deleted
+# call site; this one can. Named `dflash` so `ctest -R "dflash|dspark"` runs it.
+vllm_cpp_add_test(test_dflash_draft_hf_cache vllm/entrypoints/test_dflash_draft_hf_cache.cpp)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses

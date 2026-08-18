@@ -127,6 +127,19 @@ std::string FormatHost(const std::string& host) {
 // a message that does not name the repository cannot be acted on.
 json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
             const std::string& repo_id) {
+  // The offline check sits HERE, on the one function that opens a socket,
+  // rather than on each caller. `HubResolveCommitCached` has its own offline
+  // refusal, which names the cache directory it searched and fires before this
+  // one; every other path through the hub used to reach the network under a
+  // setting that forbids it.
+  if (opts.offline) {
+    throw std::runtime_error(
+        "vllm.cpp: HF_HUB_OFFLINE is set, so repository '" + repo_id +
+        "' cannot be read from " + opts.endpoint +
+        ". Unset HF_HUB_OFFLINE, or point HF_HOME at a cache that already "
+        "holds the repository.");
+  }
+
   const ParsedUrl url = ParseUrl(opts.endpoint);
 
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -143,7 +156,14 @@ json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
 
   httplib::Client client(url.scheme + "://" + FormatHost(url.host) + ":" +
                          std::to_string(url.port));
-  client.set_follow_location(true);
+  // NO `set_follow_location(true)`. httplib copies the whole request, headers
+  // included, when it follows a redirect (third_party/httplib/httplib.h:7774)
+  // and routes a cross-host redirect through `create_redirect_client` with it
+  // (:13537), so following one here would hand the bearer token to whatever
+  // host the answer names. llama.cpp does not set it on its API client either
+  // (`common/hf-cache.cpp:198-226 @ b10451`). The redirect this row does follow
+  // is the content-delivery-network address for the BYTES, which W3 owns and
+  // which carries no credential.
   client.set_connection_timeout(opts.connect_timeout_seconds, 0);
   client.set_read_timeout(opts.read_timeout_seconds, 0);
 

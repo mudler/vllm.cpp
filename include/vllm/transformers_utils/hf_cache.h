@@ -25,9 +25,13 @@ namespace transformers_utils {
 // The directory that holds the `models--org--repo` folders. Mirrors
 // `huggingface_hub`, and llama.cpp `common/hf-cache.cpp:37-67`, in this order:
 // `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`/hub,
-// `XDG_CACHE_HOME`/huggingface/hub, `HOME`/.cache/huggingface/hub. Returns an
-// empty path when none of the five is set, which every caller reads as "this
-// host has no cache" rather than as a directory named by the empty string.
+// `XDG_CACHE_HOME`/huggingface/hub, `HOME`/.cache/huggingface/hub, and then the
+// passwd database (`common/hf-cache.cpp:56-62`), because a container started
+// with `--user` and no HOME still has one. Returns an empty path only when none
+// of the five is set AND the passwd database offers no home directory, which
+// every caller reads as "this host has no cache" rather than as a directory
+// named by the empty string. Upstream throws at `:63` instead; the divergence
+// is argued at the return statement.
 //
 // The value is resolved on every call and never cached in a function-local
 // static, because a process that changes `HF_HOME` must see the change. The
@@ -74,8 +78,13 @@ struct HfCacheFsHooks {
 const HfCacheFsHooks& DefaultHfCacheFsHooks();
 
 // Place the snapshot entry for `blob_path` at `final_path`: a symbolic link
-// first, then a move, then a copy. Once any link fails the process stays in
-// degraded mode and stops trying, and the switch is logged exactly once.
+// first, then a move, then a copy. Once a link fails, the DIRECTORY holding
+// `blob_path` stays in degraded mode and no later entry there tries again, and
+// the switch is logged exactly once for that directory. The latch is keyed on
+// the directory rather than on the process because the evidence is about a file
+// system, and a directory sits on exactly one: a 300-shard repository still
+// pays one failed system call, while a CIFS cache root can no longer degrade a
+// second cache root on a disk that holds symbolic links.
 // Returns false only when all three placements failed.
 bool HfFinalizeSnapshotEntry(
     const std::filesystem::path& blob_path,
@@ -86,9 +95,10 @@ bool HfFinalizeSnapshotEntry(
 // time" rule is a behavior, so it needs something a test can read.
 int HfSymlinkFallbackLogCount();
 
-// Clear the degraded-mode latch and its counter. This exists for tests. The
-// latch is deliberately process-wide, so a case that must observe the FIRST
-// fallback would otherwise depend on the order the runner happened to pick.
+// Clear every degraded-mode latch and the counter. This exists for tests: the
+// latches and the counter outlive one case, so a case that must observe the
+// FIRST fallback would otherwise depend on the order the runner happened to
+// pick.
 void HfResetSymlinkFallbackStateForTesting();
 
 // Resolve a model path to a local snapshot directory, opening no socket.
@@ -96,12 +106,16 @@ void HfResetSymlinkFallbackStateForTesting();
 // A `.gguf` file is returned unchanged, because it carries no config.json and
 // would otherwise fall through to the cache search and be reported as missing.
 // A directory that holds a config.json is returned unchanged. Anything else is
-// read as a repository id, and the winner is the LAST entry that
-// `{hub_dir}/models--org--repo/snapshots` yields that holds a config.json.
-// `std::filesystem::directory_iterator` does not order its entries, so "last"
-// is the iterator's order and not a modification time. That is the behavior the
-// DFlash draft path has shipped with, and it is preserved here rather than
-// improved, because this move is a relocation.
+// read as a repository id, and the winner is the NEWEST entry under
+// `{hub_dir}/models--org--repo/snapshots` that holds a config.json, with the
+// greater path breaking a tie.
+//
+// The order is total on purpose. The DFlash draft path shipped with "the last
+// entry `std::filesystem::directory_iterator` yielded", and that iterator does
+// not order its entries, so a repository holding two revisions could resolve
+// differently on two hosts and, after a re-write of the directory, on two runs
+// of one command. "Newest" is also what the relocated comment always claimed
+// the function did.
 //
 // Returns `path` unchanged on any miss, so the caller reports what the user
 // typed. An empty `hub_dir` is a miss.

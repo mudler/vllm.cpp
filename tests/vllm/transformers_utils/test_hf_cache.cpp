@@ -13,7 +13,13 @@
 // the "return what the user typed" answer on every miss.
 #include <doctest/doctest.h>
 
+#if !defined(_WIN32)
+#include <pwd.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -132,8 +138,26 @@ TEST_CASE("HfRepoPath, HfSnapshotPath and HfBlobPath build the documented tree")
 TEST_CASE("HfHubCacheDir follows the huggingface_hub resolution order") {
   EnvGuard guard;
 
-  // Nothing set at all: an empty path, never a relative one.
+  // Nothing set at all. llama.cpp `common/hf-cache.cpp:56-62 @ b10451` asks the
+  // passwd database before it gives up, and a container started with `--user`
+  // and no HOME is exactly the case that needs it. The precondition is read
+  // from the passwd database directly, so the branch this case takes is decided
+  // by the host and never by the answer under test.
+#if defined(_WIN32)
+  // No passwd database. The documented "this host has no cache" answer stands.
   CHECK(HfHubCacheDir().empty());
+#else
+  const struct passwd* pw = ::getpwuid(::getuid());
+  const bool passwd_has_home =
+      pw != nullptr && pw->pw_dir != nullptr && pw->pw_dir[0] != '\0';
+  if (passwd_has_home) {
+    REQUIRE_FALSE(HfHubCacheDir().empty());
+    CHECK(HfHubCacheDir() ==
+          fs::path(pw->pw_dir) / ".cache" / "huggingface" / "hub");
+  } else {
+    CHECK(HfHubCacheDir().empty());
+  }
+#endif
 
   vllm_test::SetEnv("HOME", "/home/u");
   CHECK(HfHubCacheDir() == fs::path("/home/u/.cache/huggingface/hub"));
@@ -149,6 +173,28 @@ TEST_CASE("HfHubCacheDir follows the huggingface_hub resolution order") {
 
   vllm_test::SetEnv("HF_HUB_CACHE", "/hub");
   CHECK(HfHubCacheDir() == fs::path("/hub"));
+}
+
+TEST_CASE("an empty cache variable reads as unset, not as the working directory") {
+  // Emptying a variable is how a container clears an inherited setting, and
+  // `HF_HOME=` resolving to a path rooted at "" would write the cache into the
+  // working directory. `vllm_test::SetEnv` DELETES on an empty value by design
+  // (tests/support/test_env.h), so this case has to call setenv itself, and it
+  // is POSIX-only because `_putenv_s(name, "")` deletes on Windows and a
+  // defined-but-empty variable cannot exist there at all.
+  EnvGuard guard;
+  vllm_test::SetEnv("HOME", "/home/u");
+#if !defined(_WIN32)
+  REQUIRE(::setenv("HF_HOME", "", /*overwrite=*/1) == 0);
+  REQUIRE(std::getenv("HF_HOME") != nullptr);
+  CHECK(HfHubCacheDir() == fs::path("/home/u/.cache/huggingface/hub"));
+  REQUIRE(::setenv("HF_HUB_CACHE", "", /*overwrite=*/1) == 0);
+  CHECK(HfHubCacheDir() == fs::path("/home/u/.cache/huggingface/hub"));
+#endif
+  // The same variable with a value still wins, so the case above is measuring
+  // the empty check and not a variable the resolution never reads.
+  vllm_test::SetEnv("HF_HOME", "/cache");
+  CHECK(HfHubCacheDir() == fs::path("/cache/hub"));
 }
 
 TEST_CASE("HfHubCacheDir is re-read, not frozen on the first call") {
@@ -238,6 +284,9 @@ TEST_CASE("no symbolic link: the entry falls back and is a real file") {
   CHECK(fs::is_regular_file(final_a));
   CHECK_FALSE(fs::is_symlink(final_a));
   CHECK(ReadFile(final_a) == "first");
+  // The MOVE ran, so the blob is gone. Without this the case cannot tell a move
+  // from the copy that follows it, and deleting the rename step leaves it green.
+  CHECK_FALSE(fs::exists(blob_a));
 
   const fs::path blob_b = HfBlobPath(repo, "bbbb");
   WriteFile(blob_b, "second");
@@ -246,6 +295,7 @@ TEST_CASE("no symbolic link: the entry falls back and is a real file") {
   CHECK(fs::is_regular_file(final_b));
   CHECK_FALSE(fs::is_symlink(final_b));
   CHECK(ReadFile(final_b) == "second");
+  CHECK_FALSE(fs::exists(blob_b));
 
   // Two fallbacks, ONE line. A per-file warning on a repository with 300 shards
   // is 300 lines that say the same thing.
@@ -275,6 +325,44 @@ TEST_CASE("no symbolic link and no move: the entry is copied and the blob stays"
   CHECK(ReadFile(final_path) == "payload");
   // A copy leaves the blob in place; a move would have taken it.
   CHECK(fs::is_regular_file(blob));
+}
+
+TEST_CASE("one file system with no symbolic link does not degrade another") {
+  // The latch is evidence about a FILE SYSTEM, and a directory lives on exactly
+  // one of them. A process-wide latch generalizes one CIFS mount onto every
+  // later cache root, including one that holds symbolic links perfectly well,
+  // and never retries.
+  HfResetSymlinkFallbackStateForTesting();
+  TempDir cifs;
+  TempDir local;
+
+  HfCacheFsHooks refusing = DefaultHfCacheFsHooks();
+  refusing.create_symlink = [](const fs::path&, const fs::path&,
+                               std::error_code& ec) {
+    ec = std::make_error_code(std::errc::function_not_supported);
+  };
+
+  const fs::path cifs_repo = HfRepoPath(cifs.path(), "org/repo");
+  const fs::path cifs_blob = HfBlobPath(cifs_repo, "aaaa");
+  WriteFile(cifs_blob, "first");
+  const fs::path cifs_entry = HfSnapshotPath(cifs_repo, "c0ffee") / "a.safetensors";
+  REQUIRE(HfFinalizeSnapshotEntry(cifs_blob, cifs_entry, refusing));
+  CHECK_FALSE(fs::is_symlink(cifs_entry));
+  CHECK(HfSymlinkFallbackLogCount() == 1);
+
+  // A DIFFERENT cache root, with a file system that does hold symbolic links.
+  const fs::path local_repo = HfRepoPath(local.path(), "org/repo");
+  const fs::path local_blob = HfBlobPath(local_repo, "bbbb");
+  WriteFile(local_blob, "second");
+  const fs::path local_entry =
+      HfSnapshotPath(local_repo, "c0ffee") / "b.safetensors";
+  REQUIRE(HfFinalizeSnapshotEntry(local_blob, local_entry));
+  CHECK(fs::is_symlink(local_entry));
+  CHECK(ReadFile(local_entry) == "second");
+  // The blob is still there: a symbolic link neither moves nor copies it.
+  CHECK(fs::is_regular_file(local_blob));
+  // ...and the second root logged nothing, because nothing was degraded there.
+  CHECK(HfSymlinkFallbackLogCount() == 1);
 }
 
 TEST_CASE("finalizing an entry that already exists is a no-op that reports success") {
@@ -332,6 +420,57 @@ TEST_CASE("ResolveCachedSnapshotDir maps a repo id to its cache snapshot") {
       hub / "models--z-lab--Qwen3.6-27B-DFlash" / "snapshots" / "abc123";
   WriteFile(snapshot / "config.json", "{}");
   CHECK(ResolveCachedSnapshotDir(repo_id, hub) == snapshot.string());
+}
+
+TEST_CASE("ResolveCachedSnapshotDir picks the newest snapshot") {
+  // A repository can hold more than one snapshot, because a second revision is
+  // fetched beside the first. The winner is the one written most recently,
+  // which is what the DFlash comment at model_loader.cpp always claimed ("the
+  // newest ... snapshots/<hash>/ dir") and what the relocated walk did not do:
+  // it returned whatever `std::filesystem::directory_iterator` happened to
+  // yield last, and that order is unspecified. This case swaps the timestamps
+  // and asserts the answer follows them, so it cannot pass by name order or by
+  // iterator order.
+  TempDir tmp;
+  const fs::path hub = tmp.path() / "hub";
+  const std::string repo_id = "org/repo";
+  const fs::path a = hub / "models--org--repo" / "snapshots" / "aaaa";
+  const fs::path b = hub / "models--org--repo" / "snapshots" / "bbbb";
+  WriteFile(a / "config.json", "{}");
+  WriteFile(b / "config.json", "{}");
+
+  const fs::file_time_type now = fs::file_time_type::clock::now();
+  fs::last_write_time(a, now - std::chrono::hours(48));
+  fs::last_write_time(b, now - std::chrono::hours(1));
+  CHECK(ResolveCachedSnapshotDir(repo_id, hub) == b.string());
+
+  fs::last_write_time(a, now);
+  CHECK(ResolveCachedSnapshotDir(repo_id, hub) == a.string());
+
+  // A snapshot with no config.json never wins, however new it is.
+  const fs::path partial = hub / "models--org--repo" / "snapshots" / "cccc";
+  fs::create_directories(partial);
+  fs::last_write_time(partial, now + std::chrono::hours(1));
+  CHECK(ResolveCachedSnapshotDir(repo_id, hub) == a.string());
+}
+
+TEST_CASE("two snapshots written at the same instant resolve to one stable answer") {
+  // The timestamp cannot separate them, so the path does. The requirement is
+  // that the answer is the SAME on every call: two runs of one command must not
+  // load two different checkpoints.
+  TempDir tmp;
+  const fs::path hub = tmp.path() / "hub";
+  const fs::path a = hub / "models--org--repo" / "snapshots" / "aaaa";
+  const fs::path b = hub / "models--org--repo" / "snapshots" / "bbbb";
+  WriteFile(a / "config.json", "{}");
+  WriteFile(b / "config.json", "{}");
+  const fs::file_time_type stamp = fs::file_time_type::clock::now();
+  fs::last_write_time(a, stamp);
+  fs::last_write_time(b, stamp);
+
+  const std::string first = ResolveCachedSnapshotDir("org/repo", hub);
+  CHECK(first == b.string());
+  CHECK(ResolveCachedSnapshotDir("org/repo", hub) == first);
 }
 
 TEST_CASE("ResolveCachedSnapshotDir reports the original path on every miss") {

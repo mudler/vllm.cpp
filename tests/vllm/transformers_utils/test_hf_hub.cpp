@@ -80,6 +80,11 @@ class FakeHub {
     server_.Get("/api/models/(.*)/refs", [this](const httplib::Request& req,
                                                 httplib::Response& res) {
       Record(req);
+      if (!redirect_.empty()) {
+        res.status = 302;
+        res.set_header("Location", redirect_);
+        return;
+      }
       if (gated_ && AuthHeader(req).empty()) {
         res.status = 401;
         res.set_content(R"({"error":"Invalid credentials in Authorization header"})",
@@ -130,6 +135,8 @@ class FakeHub {
   }
 
   void set_gated(bool gated) { gated_ = gated; }
+  // Answer the refs call with a 302 to `url` instead of a body.
+  void set_redirect(std::string url) { redirect_ = std::move(url); }
   void set_refs_body(std::string body) { refs_body_ = std::move(body); }
   void set_tree_anonymous(std::string body) { tree_anonymous_ = std::move(body); }
   void set_tree_authenticated(std::string body) {
@@ -162,6 +169,7 @@ class FakeHub {
   std::vector<std::string> paths_;
   std::string last_authorization_;
   bool gated_ = false;
+  std::string redirect_;
   std::string refs_body_ =
       std::string(R"({"branches":[{"name":"main","ref":"refs/heads/main",)") +
       R"("targetCommit":")" + kCommit + R"("}],"tags":[]})";
@@ -170,6 +178,59 @@ class FakeHub {
       R"({"type":"file","path":"model.safetensors","size":4096,)"
       R"("lfs":{"oid":"2222222222222222222222222222222222222222222222222222222222222222"}}])";
   std::string tree_authenticated_ = tree_anonymous_;
+};
+
+// A SECOND server, on its own port and therefore a different authority. It
+// answers every path with a usable refs body and records what it was sent, so a
+// case can ask the one question that matters about a redirect: did the bearer
+// token leave for another host.
+class TokenTrap {
+ public:
+  TokenTrap() {
+    server_.Get(".*", [this](const httplib::Request& req,
+                             httplib::Response& res) {
+      {
+        const std::lock_guard<std::mutex> lock(mu_);
+        requests_ += 1;
+        authorization_ = req.has_header("Authorization")
+                             ? req.get_header_value("Authorization")
+                             : std::string();
+      }
+      res.set_content(
+          std::string(R"({"branches":[{"name":"main","targetCommit":")") +
+              kCommit + R"("}]})",
+          "application/json");
+    });
+    port_ = server_.bind_to_any_port("127.0.0.1");
+    thread_ = std::thread([this] { server_.listen_after_bind(); });
+    server_.wait_until_ready();
+  }
+  ~TokenTrap() {
+    server_.stop();
+    if (thread_.joinable()) thread_.join();
+  }
+  TokenTrap(const TokenTrap&) = delete;
+  TokenTrap& operator=(const TokenTrap&) = delete;
+
+  std::string url() const {
+    return "http://127.0.0.1:" + std::to_string(port_) + "/redirected";
+  }
+  int request_count() const {
+    const std::lock_guard<std::mutex> lock(mu_);
+    return requests_;
+  }
+  std::string authorization() const {
+    const std::lock_guard<std::mutex> lock(mu_);
+    return authorization_;
+  }
+
+ private:
+  httplib::Server server_;
+  std::thread thread_;
+  int port_ = 0;
+  mutable std::mutex mu_;
+  int requests_ = 0;
+  std::string authorization_;
 };
 
 // Options aimed at a fake hub and a scratch cache, with nothing read from the
@@ -254,13 +315,95 @@ TEST_CASE("HfHubOptionsFromEnv reads the documented environment") {
   vllm_test::UnsetEnv("HF_TOKEN");
   const fs::path token_file = tmp.path() / "token";
   {
+    // The carriage return, the space and the tab matter: `std::getline` already
+    // drops the newline on its own, so a file ending in "\n" alone does not
+    // reach the trim at all. The sibling case at
+    // tests/vllm/transformers_utils/test_hf_cache.cpp writes the same shape for
+    // the same reason.
     std::ofstream out(token_file, std::ios::binary);
-    out << kToken << "\n";
+    out << kToken << " \t\r\n";
   }
   vllm_test::SetEnv("HF_TOKEN_PATH", token_file.string());
   CHECK(HfHubOptionsFromEnv().token == kToken);
 
   for (const auto& [name, value] : saved) vllm_test::SetEnv(name.c_str(), value);
+}
+
+TEST_CASE("an empty hub variable reads as unset") {
+  // Emptying a variable is how a container clears an inherited setting.
+  // `HF_ENDPOINT=` must not become the endpoint "" and `HF_TOKEN=` must not
+  // become an `Authorization: Bearer ` header with nothing after it.
+  // `vllm_test::SetEnv` DELETES on an empty value by design
+  // (tests/support/test_env.h), so this case calls setenv itself, and it is
+  // POSIX-only because a defined-but-empty variable cannot exist on Windows.
+  const char* kNames[] = {"HF_ENDPOINT", "HF_TOKEN", "HF_TOKEN_PATH",
+                          "HF_HUB_OFFLINE"};
+  std::vector<std::pair<std::string, std::string>> saved;
+  for (const char* name : kNames) {
+    const char* v = std::getenv(name);
+    saved.emplace_back(name, v == nullptr ? std::string() : std::string(v));
+    vllm_test::UnsetEnv(name);
+  }
+
+#if !defined(_WIN32)
+  REQUIRE(::setenv("HF_ENDPOINT", "", /*overwrite=*/1) == 0);
+  REQUIRE(::setenv("HF_TOKEN", "", /*overwrite=*/1) == 0);
+  REQUIRE(::setenv("HF_HUB_OFFLINE", "", /*overwrite=*/1) == 0);
+  REQUIRE(std::getenv("HF_ENDPOINT") != nullptr);
+  const HfHubOptions opts = HfHubOptionsFromEnv();
+  CHECK(opts.endpoint == "https://huggingface.co/");
+  CHECK(opts.token.empty());
+  CHECK_FALSE(opts.offline);
+#endif
+
+  // The same variables with values still land, so the case above measures the
+  // empty check and not a variable nothing reads.
+  vllm_test::SetEnv("HF_ENDPOINT", "http://mirror.internal/");
+  vllm_test::SetEnv("HF_TOKEN", kToken);
+  const HfHubOptions set = HfHubOptionsFromEnv();
+  CHECK(set.endpoint == "http://mirror.internal/");
+  CHECK(set.token == kToken);
+
+  for (const auto& [name, value] : saved) vllm_test::SetEnv(name.c_str(), value);
+}
+
+TEST_CASE("a bracketed IPv6 authority is split into a host and a port") {
+  // llama.cpp `common/http.h:75-83 @ b10451` splits it, and W1's anchor
+  // correction is the row that found that line. The colon inside an IPv6
+  // literal is not the port separator, so the bracket arm has to run before the
+  // colon search or `std::stoi` is handed ":1" and throws a std::invalid_argument
+  // from inside the parser.
+  TempDir tmp;
+  HfHubOptions opts;
+  opts.hub_dir = tmp.path();
+  opts.connect_timeout_seconds = 2;
+  opts.read_timeout_seconds = 2;
+
+  // Port 1 on the IPv6 loopback: nothing listens there, and a host with no IPv6
+  // at all fails to resolve it, so both hosts reach the same transport refusal.
+  // What neither host may produce is a parse failure.
+  opts.endpoint = "http://[::1]:1/";
+  std::string message;
+  try {
+    HubResolveRefToCommit("org/repo", "", opts);
+    FAIL("a dead port must refuse");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find("cannot reach") != std::string::npos);
+
+  // An unterminated literal is named for what it is, rather than reaching the
+  // network with a host that is missing its closing bracket.
+  opts.endpoint = "http://[::1/";
+  std::string unterminated;
+  try {
+    HubResolveRefToCommit("org/repo", "", opts);
+    FAIL("an unterminated IPv6 host must refuse");
+  } catch (const std::runtime_error& e) {
+    unterminated = e.what();
+  }
+  CHECK(unterminated.find("unterminated IPv6 host") != std::string::npos);
 }
 
 TEST_CASE("the reference resolves to a commit over the fake hub") {
@@ -520,4 +663,152 @@ TEST_CASE("an https endpoint is refused by name when the build cannot speak TLS"
   CHECK(message.find("VLLM_CPP_OPENSSL") == std::string::npos);
   CHECK(message.find("127.0.0.1") != std::string::npos);
 #endif
+}
+
+TEST_CASE("a redirected API answer is refused and the token does not follow it") {
+  // `set_follow_location(true)` forwards the whole request, headers included,
+  // to wherever the answer points: third_party/httplib/httplib.h:7774 copies
+  // the request and :13537 hands a cross-host redirect to
+  // `create_redirect_client`. The bearer token would then reach a host the
+  // caller never named. llama.cpp's `api_get` at `common/hf-cache.cpp:198-226 @
+  // b10451` does not set it either. The redirect that this row does want to
+  // follow is the content-delivery-network address for the BYTES, which is W3
+  // and a different client.
+  TokenTrap trap;
+  FakeHub hub;
+  TempDir tmp;
+  hub.set_redirect(trap.url());
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+
+  std::string message;
+  try {
+    HubResolveRefToCommit("org/repo", "", opts);
+    FAIL("a redirected API answer must refuse rather than be followed");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find("302") != std::string::npos);
+  // The one assertion that matters: nothing was sent to the other authority.
+  CHECK(trap.request_count() == 0);
+  CHECK(trap.authorization().empty());
+}
+
+TEST_CASE("offline opens no socket in the reference call") {
+  // The spec's `## Scope` says HF_HUB_OFFLINE resolves from the cache and opens
+  // no socket. `HubResolveCommitCached` checked it; the two calls that speak to
+  // the hub did not, so any caller reaching them directly went to the network
+  // under a setting that forbids it.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.offline = true;
+
+  std::string message;
+  try {
+    HubResolveRefToCommit("org/repo", "", opts);
+    FAIL("offline must refuse before a request is made");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  CHECK(hub.request_count() == 0);
+  CHECK(message.find("HF_HUB_OFFLINE") != std::string::npos);
+  CHECK(message.find("org/repo") != std::string::npos);
+}
+
+TEST_CASE("offline opens no socket in the tree listing") {
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.offline = true;
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("offline must refuse before a request is made");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  CHECK(hub.request_count() == 0);
+  CHECK(message.find("HF_HUB_OFFLINE") != std::string::npos);
+}
+
+TEST_CASE("the tree listing refuses a revision that is not a commit") {
+  // Every call after the reference resolution names the commit, so that a
+  // moving `main` cannot change what a second run loads. A listing asked for
+  // "main" would defeat that, and it must not reach the hub to find out.
+  FakeHub hub;
+  TempDir tmp;
+  const HfHubOptions opts = OptionsFor(hub, tmp.path());
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", "main", opts);
+    FAIL("a tree listing must be asked for a commit");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  CHECK(message.find("is not a commit") != std::string::npos);
+  CHECK(hub.request_count() == 0);
+
+  // A 64 character identifier is a large-file-storage object, not a commit.
+  CHECK_THROWS_AS(HubListRepoFiles("org/repo", std::string(64, 'a'), opts),
+                  std::runtime_error);
+  // ...and a 40 character non-hexadecimal string is not one either.
+  CHECK_THROWS_AS(HubListRepoFiles("org/repo", std::string(40, 'z'), opts),
+                  std::runtime_error);
+  CHECK(hub.request_count() == 0);
+}
+
+TEST_CASE("a malformed object identifier is dropped and the file is kept") {
+  // The other arm of "no hexadecimal string is proof of anything". The refusal
+  // arm covers a listing that repeats ONE identifier; this one covers a value
+  // that is not an identifier at all. The file stays, because it is still
+  // addressable by path and only content addressing is lost.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  hub.set_tree(
+      std::string(R"([{"type":"file","path":"short.safetensors","size":1,)") +
+      R"("lfs":{"oid":"abc123"}},)" +
+      R"({"type":"file","path":"notes.txt","size":2,)" +
+      R"("lfs":{"oid":")" + std::string(64, 'z') + R"("}},)" +
+      R"({"type":"file","path":"good.safetensors","size":3,)" +
+      R"("lfs":{"oid":")" + std::string(64, '4') + R"("}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 3);
+  CHECK(files.at(0).path == "short.safetensors");
+  CHECK(files.at(0).oid.empty());
+  CHECK(files.at(1).path == "notes.txt");
+  CHECK(files.at(1).oid.empty());
+  // The well-formed one is untouched, so the case measures the drop and not a
+  // listing that carries no identifiers at all.
+  CHECK(files.at(2).oid == std::string(64, '4'));
+}
+
+TEST_CASE("one identifier repeated on ONE path is not a duplicate") {
+  // The refusal is about two DIFFERENT files sharing an identifier, which would
+  // make them share a blob. The same file listed twice carries the same
+  // identifier by definition, and refusing that would turn a redundant listing
+  // into an unusable repository.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string oid(64, '5');
+  hub.set_tree(
+      std::string(R"([{"type":"file","path":"model.safetensors","size":4096,)") +
+      R"("lfs":{"oid":")" + oid + R"("}},)" +
+      R"({"type":"file","path":"model.safetensors","size":4096,)" +
+      R"("lfs":{"oid":")" + oid + R"("}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).path == "model.safetensors");
+  CHECK(files.at(1).path == "model.safetensors");
+  CHECK(files.at(0).oid == oid);
+  CHECK(files.at(1).oid == oid);
 }

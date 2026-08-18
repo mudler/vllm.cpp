@@ -1,5 +1,6 @@
 #if defined(__unix__)
 #include <sys/mman.h>
+#include <unistd.h>  // ::sysconf(_SC_PAGESIZE) in the readahead hint below
 #endif
 // vllm.cpp original; see qwen3_5.h. Forward math mirrored 1:1 from the pinned
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,

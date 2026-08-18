@@ -319,7 +319,9 @@ typedef struct vllm_model_params {
    * --tokenizer-config. Ignored for a .gguf model_path, whose template comes
    * from the GGUF `tokenizer.chat_template` metadata. */
   const char* tokenizer_config_path;
-  /* KV-cache block size (tokens per block). <= 0 => 32. */
+  /* KV-cache block size (tokens per block). <= 0 => 32.
+     MUST be a multiple of 16: the attention backends' get_kv_cache_shape
+     refuses any other value, so a non-multiple throws from vllm_engine_load. */
   int32_t block_size;
   /* KV-cache block count OVERRIDE (vLLM num_gpu_blocks_override). > 0 pins the
    * pool to exactly this many blocks. <= 0 => AUTO: the pool is sized by the

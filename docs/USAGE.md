@@ -22,6 +22,22 @@ example targets are named after the directories they are built from, so an
 in-source build makes the linker write each executable over its own source
 directory (issue #85).
 
+### Host compilers
+
+gcc 13 and 14 and clang are exercised by CI, and **gcc 16 builds the tree,
+including the OpenAI server**. Before this it did not: several files, one of
+them the server's own `main`, called `getpid()` without including `<unistd.h>`
+and compiled only because an older libstdc++ happened to pull that header in
+for them. A compile-only CI lane on the newest released gcc now guards this,
+because every other Linux lane uses the distro compiler and cannot see it.
+
+On gcc 16 the `array-bounds` warning is reported but is **not** treated as an
+error, unlike on every earlier gcc. That release emits it inside libstdc++ and
+the vendored JSON library for code that is correct, and no change to the
+calling code avoids it (`cmake/CompilerWarnings.cmake` explains the mechanism
+and cites the upstream gcc bug). A genuine out-of-bounds still fails the build
+on gcc 15 and earlier, which is what the rest of CI enforces.
+
 ### Setting the compiled build identity
 
 `vllm-server --version` reports the CMake project version by default. Release
@@ -2251,7 +2267,7 @@ a stop token early.
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
-| `--block-size N` | `32` | KV block size |
+| `--block-size N` | `32` | KV block size. **Must be a multiple of 16** — the attention backends' `get_kv_cache_shape` refuses anything else, and the server now rejects it at startup rather than throwing during engine init |
 | `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |
 | `--kv-cache-memory BYTES` | `0` (unset) | Absolute KV-pool size in bytes, vLLM's `kv_cache_memory_bytes`. The block count is this budget divided by the model's own bytes per block, summed across its KV groups, so it is correct on MLA and heterogeneous-KV architectures too. It ignores `--gpu-memory-utilization`, as vLLM does. A budget smaller than one KV block is refused at startup |
 | `--gpu-memory-utilization F` | `0.92` | **Accepted, and it does not size anything yet.** See [What `--gpu-memory-utilization` does not do yet](#what---gpu-memory-utilization-does-not-do-yet) |

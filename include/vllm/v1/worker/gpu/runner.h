@@ -224,6 +224,20 @@ class GPUModelRunner final : public ModelRunnerBase {
   InputBatch& input_batch() { return input_batch_; }
   const InputBatch& input_batch() const { return input_batch_; }
   const std::vector<PagedKvCache>& attn_kv() const { return attn_kv_; }
+  // The ENGINE-level attention backend selected PER full-attention KV GROUP
+  // (resolved inside initialize_kv_cache's full-attn region via
+  // vllm::v1::SelectAttentionBackendName — the same walk the registry test
+  // covers), parallel to attn_kv(): one name per attention layer, in layer
+  // order. Dense groups always resolve (a platform with no registered dense
+  // backend throws loudly at init). An MLA group resolves TRITON_MLA where one
+  // is registered (CUDA); on a device without a registered MLA backend (CPU,
+  // ROCm today) the entry is EMPTY and that group's execution stays op-driven
+  // (TritonMLAImpl on the fused cache — not registry-gated), which is why the
+  // vector as a whole is empty only when no full-attention group exists at all
+  // (a pure-GDN / pooling model caches no paged KV).
+  const std::vector<std::string>& attn_backend_names() const {
+    return attn_backend_names_;
+  }
   const std::vector<GdnStateCache>& gdn_state() const { return gdn_state_; }
   // The compact GDN state-slot pool size (== max_num_reqs). Exposed for the
   // state-slot uniqueness regression tests.
@@ -817,6 +831,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
+  // Per-layer attention backend names, parallel to attn_kv_ (see accessor).
+  // A dense entry is never empty; an MLA entry may be (op-driven execution).
+  std::vector<std::string> attn_backend_names_;
 
   // ── KV-EXTERNAL-CACHE (LMCache) worker-side store/load ──────────────────────
   // Non-owning; null (default) = inert. See set_kv_connector.

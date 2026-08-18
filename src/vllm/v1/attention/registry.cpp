@@ -120,4 +120,34 @@ std::unique_ptr<AttentionBackend> SelectAttentionBackend(
                               SelectAttentionBackendName(platform, selected, cfg));
 }
 
+void CheckKvCacheShape(vt::DeviceType device, const std::string& name,
+                       int64_t num_blocks, int64_t block_size,
+                       int64_t num_kv_heads, int64_t head_size, bool is_mla) {
+  std::vector<int64_t> expected;
+  if (is_mla) {
+    expected = {num_blocks, block_size, head_size};
+  } else {
+    expected = {num_blocks, 2, block_size, num_kv_heads, head_size};
+  }
+  const std::vector<int64_t> declared =
+      MakeAttentionBackend(device, name)->get_kv_cache_shape(
+          num_blocks, block_size, num_kv_heads, head_size);
+  if (declared != expected) {
+    std::string got;
+    for (size_t i = 0; i < declared.size(); ++i) {
+      if (i) got += ",";
+      got += std::to_string(declared[i]);
+    }
+    std::string want;
+    for (size_t i = 0; i < expected.size(); ++i) {
+      if (i) want += ",";
+      want += std::to_string(expected[i]);
+    }
+    throw std::invalid_argument(
+        "attention backend '" + name + "' declares a KV cache shape [" + got +
+        "] that does not match the engine's " +
+        (is_mla ? "fused MLA" : "NHD") + " view [" + want + "]");
+  }
+}
+
 }  // namespace vllm::v1

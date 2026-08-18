@@ -1543,6 +1543,25 @@ class RecordAnchorRatchet(unittest.TestCase):
         agent_record.check_record_anchors(result, errors)
         require(errors, r"RECORD ANCHOR REGRESSION in bucket 'broken'")
 
+    def test_a_baseline_is_never_banked_from_a_tree_with_record_errors(self) -> None:
+        """`--write-baseline` must not run before the checker finishes.
+
+        The mode returned as soon as it had a number. That return happened
+        before the `if errors:` gate, so a tree that failed any other record
+        check could still bank its rot. The banked figure then carried the
+        authority of a run that never passed. The write now happens after the
+        gate.
+        """
+        digest = agent_record.RECORD_ANCHOR_BASELINE.read_bytes()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            agent_record, "check_roadmap", side_effect=lambda *a: a[1].append("SYNTHETIC")
+        ), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            code = agent_record.main(["--write-baseline"])
+        self.assertEqual(code, 1)
+        self.assertIn("SYNTHETIC", stderr.getvalue())
+        self.assertEqual(agent_record.RECORD_ANCHOR_BASELINE.read_bytes(), digest)
+
 
 class IssueIndexTableShape(unittest.TestCase):
     """The index is a TABLE, and until #1033 nothing counted its cells.

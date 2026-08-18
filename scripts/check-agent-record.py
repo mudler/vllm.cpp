@@ -1939,12 +1939,11 @@ def main(argv: list[str] | None = None) -> int:
         anchors = scan_record_anchors(rows)
         if args.report:
             print(record_anchor_report(anchors))
-        if args.write_baseline:
+        if not args.write_baseline:
             # Writing is a MODE, not a step: it must not also report the gate it
             # is about to move, or a run that lowered the baseline would print a
             # regression against the value it just replaced.
-            return write_record_anchor_baseline(anchors)
-        check_record_anchors(anchors, errors)
+            check_record_anchors(anchors, errors)
     elif args.write_baseline:
         print(
             "REFUSING to write a baseline from a tree whose record does not parse.",
@@ -1955,6 +1954,14 @@ def main(argv: list[str] | None = None) -> int:
         for error in dict.fromkeys(errors):
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
+
+    if args.write_baseline:
+        # AFTER the error gate, deliberately. The mode used to return the moment
+        # it had a number, so a tree that failed some OTHER record check could
+        # still bank its rot, and the banked figure would carry the authority of
+        # a run that never passed. A baseline is a measurement of the record, so
+        # it is only taken from a record that checks out.
+        return write_record_anchor_baseline(anchors)
 
     counts = [
         "ENGINE="

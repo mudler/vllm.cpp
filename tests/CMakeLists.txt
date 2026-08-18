@@ -416,6 +416,12 @@ vllm_cpp_add_test(test_fp8_block_weight_load
 # dense forward that reaches it.
 vllm_cpp_add_test(test_fp8_block_linear
   vllm/model_executor/models/test_fp8_block_linear.cpp)
+
+# MODEL-FP8-BLOCK-MERGED (#1189 M6): the merged gate_up and QKV projections of
+# the block-wise FP8 arm. Enters at `ModelRegistry::Forward`, so deleting either
+# production merge call site reds this target.
+vllm_cpp_add_test(test_fp8_block_merged
+  vllm/model_executor/models/test_fp8_block_merged.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)

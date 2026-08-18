@@ -65,12 +65,21 @@ struct DenseMlpWeights {
   // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise (128x128) FP8 MLP
   // projections. This block had NO fp8 rung at all before that row, so a
   // block-wise MLP fell through to `LoadMergedBf16RawNK` and died on
-  // "expected BF16". Loaded UNMERGED: block scales concatenate losslessly along
-  // N, so merging gate+up is simpler here than in the per-tensor case and
-  // #1189 M6 owns it.
+  // "expected BF16". Loaded as separate shards and MERGED at first use (#1189
+  // M6, `gate_up_fp8_block_merged` below): block scales concatenate losslessly
+  // along N, so the merge is a device-residency step rather than a loader one.
   Fp8BlockWeight gate_proj_fp8_block;  // [N=I, K=H]
   Fp8BlockWeight up_proj_fp8_block;    // [N=I, K=H]
   Fp8BlockWeight down_proj_fp8_block;  // [N=H, K=I]
+
+  // MODEL-FP8-BLOCK-MERGED (#1189 M6): vLLM's MergedColumnParallelLinear
+  // `gate_up_proj` as ONE device operand, gate rows first. Block scales
+  // concatenate losslessly along N, so this is the whole merge — no alpha
+  // vector, no shared-scale guard, no opt-in flag, which is what the per-tensor
+  // fp8 QKV merge beside it needs and this one does not. Built lazily-once by
+  // `dense_fp8_block::ResidentFp8BlockMerged`; the per-shard residents are then
+  // never built. Empty on every non-block owner.
+  Fp8BlockMergedResident gate_up_fp8_block_merged;
 
   // CUDA resident for vLLM's MergedColumnParallelLinear gate_up_proj. The
   // checkpoint stores gate/up separately; production concatenates their packed

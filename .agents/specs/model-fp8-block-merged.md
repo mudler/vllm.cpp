@@ -102,8 +102,9 @@ of a 4-row parameter, and `sum_i cdiv(N_i,128) == 4 == cdiv(484,128)`.
 
 | What | Where |
 |---|---|
-| `gate_up_proj` is ONE `MergedColumnParallelLinear`, `output_sizes = [I, I]` | `vllm/model_executor/layers/linear.py:735-760`, `models/qwen3_5.py` MLP |
-| `q`/`k`/`v` are ONE `QKVParallelLinear`, shard offsets `0`, `Hq*Dh`, `(Hq+Hkv)*Dh` | `linear.py:1247-1260`, `:1314-1332` |
+| the model declares BOTH merges, `qkv_proj` and `gate_up_proj` | `vllm/model_executor/models/qwen3_5.py:288-298` (`packed_modules_mapping`) |
+| `gate_up_proj` is ONE `MergedColumnParallelLinear`, `output_sizes = [I, I]` | `vllm/model_executor/layers/linear.py:660`, block-scale slice at `:797-801`, `:835-839` |
+| `q`/`k`/`v` are ONE `QKVParallelLinear`, shard offsets `0`, `Hq*Dh`, `(Hq+Hkv)*Dh` | `linear.py:1021`, `:1247-1260`, `:1314-1332` |
 | the block scale shard slice, ceil-divided on offset AND size | `linear.py:86-95` (`adjust_block_scale_shard`) |
 | the merged-partition divisibility rule, last shard exempt | `fp8_utils.py:1229-1244` (`validate_fp8_block_shape`) |
 | the escape hatch that skips that validation | `linear.py:532-557`, read at `fp8_utils.py:1207` |
@@ -195,7 +196,10 @@ under which this row takes the split path.
 `tests/CMakeLists.txt`, plus the M4 suite updated for the new GEMM count.
 
 - **G1** merged `gate_up` is BYTE-IDENTICAL to the split gate/up GEMMs plus the
-  same SwiGLU tail, over shards whose scale grids differ along both axes.
+  same SwiGLU tail, over shards whose scale grids differ from EACH OTHER. That
+  last condition is asserted, not assumed: the shared fixture's grid is a
+  function of position alone, so two same-shaped shards share it and a
+  wrong-order concatenation would be invisible.
 - **G2** merged QKV is BYTE-IDENTICAL to the three split GEMMs, per shard.
 - **G3** a ragged NON-final shard is refused by name, at both group shapes.
 - **G4** a ragged FINAL shard merges, and is byte-identical to the split path.
@@ -284,10 +288,82 @@ download. The row is scoped so that it needs neither.
 
 ## Evidence
 
-Filled in when the row lands.
+CPU only, no GPU lease, no checkpoint. Default configure
+(`cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON`), which is CI's, so
+`NDEBUG` is not defined and asserts are live.
+
+**RED before.** `test_fp8_block_merged`, the dispatch-count case alone, against
+the unmerged tree: `CHECK( 13 == 9 )`, `1 failed`, `Status: FAILURE!`.
+
+**GREEN after.** `test_fp8_block_merged` 9 cases / 852 assertions / 0 failed,
+`Status: SUCCESS!`. `test_fp8_block_linear` 8 / 66 / 0, unchanged in shape from
+before the row (its expected count moved 13 -> 9, which is the merge).
+
+**Mutations.** Each printed `compile_rc` and the mutation delta before the
+verdict, ran the focused gate, restored from a tar snapshot and verified the
+restore by `sha256sum`. `git checkout -- .` was not used, because it reads the
+index rather than the working tree.
+
+| mutation | compile_rc | result |
+|---|---|---|
+| the merged `gate_up` production call site deleted (M4's split pair restored) | 0 | RED, the reachability case, 9 -> 10 GEMMs |
+| the merged QKV production call site deleted | 0 | RED, the reachability case, 9 -> 11 GEMMs |
+| the ragged-non-final guard neutered (`if (false)`) | 0 | RED, the refusal case, 5 assertions |
+| the scale-grid concatenation reversed | 0 | RED, 4 cases: both byte-identity cases, the ragged-final case, the row-mapping case |
+| the packed-byte concatenation reversed | 0 | RED, 3 cases |
+
+**A measured weakness in the fixture, found by a mutation that did NOT red.**
+The scale-grid reversal first left the `gate_up` byte-identity case GREEN.
+`MakeFp8Block`'s grid is `0.0625 + 0.125*((r*3 + c*5) % 5)`, a function of the
+POSITION only, so two shards of the same shape get byte-identical grids whatever
+their seeds — and a wrong-order concatenation of two identical grids is
+invisible. The suite now gives each shard its own grid and asserts that
+precondition (`RequireScalesDiffer`) before comparing anything. This is recorded
+because the first run of that mutation is exactly what a green gate over nothing
+looks like.
+
+**What is NOT established.** No token gate, no CUDA kernel, no throughput,
+latency or memory number. The model-level case asserts the TOPOLOGY (one GEMM
+per merged group) and the forward's health and bit-reproducibility; the merged
+GEMM's VALUES are gated at the GEMM boundary, byte-for-byte against the split
+arm.
+
+## Outcome
+
+**What the row measured.** The merge is exact: `memcmp`-equal to the split arm
+at both group shapes and at a ragged final shard, over shards whose scale grids
+differ. Nine block GEMMs per forward where M4 ran thirteen.
+
+**What was rejected, and why.**
+
+- *Falling back to the split path when a group is not concatenable.* Rejected.
+  Upstream's `validate_fp8_block_shape` declares that geometry invalid and its
+  scale-parameter slicing indexes off the end of the parameter, so a split
+  fallback would accept a checkpoint vLLM cannot load. No token gate can see
+  that, which is what makes it a divergence rather than a convenience.
+- *An opt-in flag, mirroring `VT_FP8_MERGED_QKV`.* Rejected. That flag exists
+  because the per-tensor merge is only byte-identical under a shared
+  `input_scale` and needs an alpha vector; neither is true here, so a flag would
+  name a choice with no second side.
+- *A tolerance-based comparison.* Rejected as a stop condition in the spec and
+  never used. A scale row read one index off produces SMALL errors.
+- *Widening `vt::MergedGemm` to carry this group.* Rejected. Its operand list is
+  the grouped-MoE one and a dense block-FP8 group has no `expert_ids`, no
+  `[E*N,K]` towers and no broadcast activation. The descriptor is shared; the
+  realization function is a sibling.
+- *Merging the GDN `in_proj_qkvz` in the same change.* Deferred, under
+  `## Owed`. The machinery covers it, but the site has its own packed-decode
+  dtype predictor that the merged operand has to agree with, which is a second
+  question.
+
+**Why each default has its value.** The merge is unconditional because block
+scales concatenate losslessly and there is nothing to trade. `out_dtype` is bf16
+at both sites because that is upstream's `out_dtype` there. `fast_op` is
+`kNoMergedFastOp` on both descriptors because no fused kernel exists, and naming
+one that does not would make the tiering rule a lie.
 
 ## Now
 
-`ACTIVE` — M6 of #1189. M1 (`ad5f175e7`), M2 (`770e49486`), M3 (`09597106e`)
-and M4 (`281b4bc76`) are `DONE`; M5 is open and is the only milestone that needs
-a GPU.
+`DONE` — M6 of #1189. M1 (`ad5f175e7`), M2 (`770e49486`), M3 (`09597106e`) and
+M4 (`281b4bc76`) are `DONE`; **M5 is open and is the only milestone that needs a
+GPU**, and until it lands a CUDA device refuses this checkpoint at `Prepare`.

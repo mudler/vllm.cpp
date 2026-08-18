@@ -74,9 +74,30 @@ void ResetQwen3_5MixedSpecInvocations() {
   g_mixed_spec_invocations.store(0, std::memory_order_relaxed);
 }
 
+// GDN-MOE-BF16-OUT (#1168) Edit 2 dropped the `e.dense_model` term. It entered at
+// f344decf4 ("dispatch exact packed decode") as one of that change's "real-model
+// safety gates", was never revisited, and neither reference has an equivalent:
+// VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE defaults True with no shape term
+// (vllm/envs.py:124 @ 5559679) and SGLang keys supports_packed_decode on the
+// platform alone (gdn_triton.py:43 @ f63458b5be). It became REDUNDANT once
+// GdnOutDType stopped branching on model shape: `core_out` is `outdt`, and
+// GdnPackedDecodeDTypesCompatible below already pins it to BF16, so an f32
+// recurrence output is what deselects packed decode on either arm. Removing it
+// BEFORE the dtype change would have removed a term that the dtype rule did not
+// yet subsume, which is why the two edits are one change and in this order.
+//
+// Do not read that as "and now the removal is observable in production", because
+// it is not, in either order (fresh-review finding). `has_packed_ba` needs
+// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
+// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// false before the shape term is ever read. Removing it therefore reaches packed
+// decode on NO checkpoint; it removes a contradiction with both references and a
+// second answer to a question the dtype rule already answers. Reaching packed
+// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
+// which is #1169, and it is owed.
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
-  return e.runtime_enabled && e.cuda && e.dense_model && e.has_packed_ba &&
+  return e.runtime_enabled && e.cuda && e.has_packed_ba &&
          e.merged_ba_enabled && e.dtype_compatible && e.has_state_indices &&
          e.num_prefills == 0 && e.num_prefill_tokens == 0 &&
          e.num_spec_decodes == 0 && e.num_spec_decode_tokens == 0 &&
@@ -101,7 +122,12 @@ vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
 // in the ONE place both the producer and the predictor read. See the header for
 // why each term is required; the short version is that the toggle is the opt-in,
 // `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
-// confines the narrowing to the dense 27B.
+// keeps the chain dtype-uniform. `outdt` used to be described as what "confines
+// the narrowing to the dense 27B"; GDN-MOE-BF16-OUT (#1168) removed the
+// model-shape argument from `GdnOutDType`, so `outdt` is BF16 on BOTH arms at
+// the default and confines nothing. The DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle
+// (`GdnFp8InBf16Enabled`, which requires a leading '1') is now the only term
+// keeping this inert on the 35B.
 vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
                                            vt::DType in_dtype,
                                            vt::DType out_dtype) {
@@ -125,6 +151,28 @@ bool detail::GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& d) {
 // Default OFF: ON only for a '1'-leading value (vt::cuda::GdnPackedRegTileFlagIsOn).
 bool detail::PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] == '1';
+}
+
+// GDN-MOE-BF16-OUT (#1168) — VT_GDN_OUT_BF16, default ON, parsed here so the CPU
+// tier can pin the truth table that GdnOutDType() caches. There is no model-shape
+// term: the environment is the whole decision, on the dense and the MoE arms
+// alike, exactly as upstream resolves one model dtype for every layer.
+bool detail::GdnOutBf16FlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
+// ...and the RESOLVER that consumes it, here rather than in the anonymous
+// namespace below so the CPU tier can call the thing the model calls. Pinning
+// the parser alone does not pin that anything reads it: a `GdnOutDType()`
+// hardwired to BF16 keeps every default-environment gate green, and the
+// documented `VT_GDN_OUT_BF16=0` rollback then silently stops rolling back. See
+// the header for why that matters more here than coverage — the variable is the
+// denominator of this row's same-binary A/B. The full derivation of WHAT this
+// dtype is stays at the `using` declaration below, next to the call sites.
+vt::DType detail::GdnOutDType() {
+  static const bool bf16 =
+      detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
+  return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -182,6 +230,40 @@ void detail::DisableGdnFp8InProjDebugStats() {
   g_gdn_fp8_inproj_debug_enabled.store(false, std::memory_order_release);
 }
 
+namespace {
+// GDN-MOE-BF16-OUT (#1168). What the last NON-MIXED-SPEC paged GDN layer actually
+// allocated and projected, recorded off the tensors themselves rather than off
+// the predicate. `GdnBlockPagedMixedSpec` is a paged GDN layer too and records
+// nothing, the stores are unconditional (the fp8 sibling above is default-off),
+// and they happen at graph CAPTURE and not at replay. The header states all
+// three; none of them is what the shape of this code suggests.
+std::atomic<bool> g_gdn_out_dtypes_observed{false};
+std::atomic<int> g_gdn_out_core_dtype{static_cast<int>(vt::DType::kF32)};
+std::atomic<int> g_gdn_out_z_dtype{static_cast<int>(vt::DType::kF32)};
+
+void RecordGdnOutActivationDTypes(vt::DType core_out, vt::DType z_gate) {
+  g_gdn_out_core_dtype.store(static_cast<int>(core_out), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(z_gate), std::memory_order_relaxed);
+  g_gdn_out_dtypes_observed.store(true, std::memory_order_release);
+}
+}  // namespace
+
+void detail::ResetGdnOutActivationDTypes() {
+  g_gdn_out_dtypes_observed.store(false, std::memory_order_release);
+  g_gdn_out_core_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+}
+
+detail::GdnOutActivationDTypes detail::LastGdnOutActivationDTypes() {
+  GdnOutActivationDTypes out;
+  out.observed = g_gdn_out_dtypes_observed.load(std::memory_order_acquire);
+  out.core_out =
+      static_cast<vt::DType>(g_gdn_out_core_dtype.load(std::memory_order_relaxed));
+  out.z_gate =
+      static_cast<vt::DType>(g_gdn_out_z_dtype.load(std::memory_order_relaxed));
+  return out;
+}
+
 bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
   const bool runtime_enabled =
@@ -191,8 +273,8 @@ bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
       !(env.merged_proj != nullptr && env.merged_proj[0] == '0') &&
       (env.merged_ba == nullptr || env.merged_ba[0] != '0');
   // Mirror the dtype_compatible expression on the real 27B dense gate:
-  // GdnInDType (default BF16), GdnOutDType dense default (BF16; override
-  // '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
+  // GdnInDType (default BF16), GdnOutDType (default BF16 on every arm since
+  // #1168; override '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
   // override '0' -> F32). The SSM cache dtype term is always a float dtype.
   const bool in_bf16 = env.in_bf16 == nullptr || env.in_bf16[0] != '0';
   const bool out_bf16 = env.out_bf16 == nullptr || env.out_bf16[0] != '0';
@@ -3169,8 +3251,8 @@ bool GdnFp8InBf16Enabled() {
   return on;
 }
 
-// GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
-// f32 default; VT_GDN_OUT_BF16=0/1 overrides both for diagnostics).
+// GDN recurrence-OUTPUT + z-gate in bf16, on EVERY arm (default ON;
+// VT_GDN_OUT_BF16=0 is the same-binary f32 rollback).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
 // upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
@@ -3185,18 +3267,26 @@ bool GdnFp8InBf16Enabled() {
 // this lever is the f32 `dcore` recurrence output that attempt left untouched.
 // This is correctness-significant for the 27B: with the repaired full NVFP4
 // tactic stack, f32 core/z takes the alternate whitespace near-tie branch while
-// bf16 reproduces native vLLM 16/16. Keep every unmeasured 35B arm, including
-// GGUF, on its prior f32 default; the explicit env override remains available
-// for its later independently gated campaign.
-DType GdnOutDType(bool dense_model) {
-  static const int override = [] {
-    const char* e = std::getenv("VT_GDN_OUT_BF16");
-    if (e == nullptr) return -1;
-    return e[0] == '0' ? 0 : 1;
-  }();
-  const bool bf16 = override >= 0 ? override != 0 : dense_model;
-  return bf16 ? DType::kBF16 : DType::kF32;
-}
+// bf16 reproduces native vLLM 16/16.
+//
+// GDN-MOE-BF16-OUT (#1168) removed the `bool dense_model` parameter this used to
+// default to. It resolved bf16 for a dense checkpoint and f32 for a MoE one, and
+// all three call sites passed `cfg.num_experts == 0`, so every MoE checkpoint
+// carried `dcore`, `z` and the gated-norm weight at double width. Upstream does
+// not branch on model shape anywhere on this path — `Qwen3_5ForCausalLMBase`
+// (vllm/model_executor/models/qwen3_5.py:280-297 @ 5559679) is the shared base of
+// the dense and MoE causal-LM arms — and the deferral quoted above ("keep every
+// unmeasured 35B arm on its prior f32 default") named its own successor campaign,
+// which this is. The parameter is gone rather than defaulted because a signature
+// that accepts a model shape makes the default unreadable at the definition and
+// lets a new call site reintroduce the split silently. VT_GDN_OUT_BF16=0 is now
+// the f32 rollback for BOTH arms rather than for the dense one alone.
+//
+// Fresh-review repair: the definition moved up beside `GdnOutBf16FlagIsOn` and
+// into `detail::`, so that a gate can observe the RESOLVER and not only its
+// parser. Nothing about the resolution changed. The call sites below are
+// unqualified and keep reading it through this declaration.
+using detail::GdnOutDType;
 
 // bf16 residual stream (default ON). vLLM runs the 35B in bf16
 // (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
@@ -3530,8 +3620,11 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
 // resident owner is shared by both arms: the fallback slices its output ROWS
 // (dim-0 raw-NK slices stay contiguous) and issues the two legacy GEMMs at
 // their independent dtypes, never retaining duplicate split weights. The
-// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType; the
-// 27B default is BF16/BF16, matching vLLM's model-dtype projection).
+// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType, and
+// since GDN-MOE-BF16-OUT (#1168) that is BF16/BF16 on every arm, matching vLLM's
+// model-dtype projection). The uniformity term therefore no longer excludes a
+// MoE checkpoint; `has_packed_qkvz` still does, because no MoE or GGUF loader
+// builds the merged `in_proj_qkvz` owner either — the same gap as #1169's.
 // VT_GDN_MERGED_QKVZ=0 (or master VT_GDN_MERGED_PROJ=0) restores the split
 // GEMMs from the same binary and the same resident owner.
 bool MergedGdnQkvzEnabled(Dev d) {
@@ -3596,11 +3689,17 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   //      narrowing is not value-neutral),
   //   2. indt == BF16, i.e. VT_GDN_IN_BF16 is on (its default) — this IS the
   //      lever being unblocked, so honouring its rollback is mandatory,
-  //   3. outdt == BF16. This is what confines the change to the 27B: the 35B is
-  //      MoE, so GdnOutDType(dense_model=false) is f32 by default and this stays
-  //      inert there. It also keeps the whole chain dtype-uniform, which the
-  //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
+  //   3. outdt == BF16, which keeps the whole chain dtype-uniform — the
+  //      downstream contracts need that: vt::RmsNormGatedQuantFp8 requires
   //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
+  //      This term USED to read "confines the change to the 27B, because the
+  //      35B is MoE and GdnOutDType(dense_model=false) is f32 there". #521
+  //      asked for that correction and GDN-MOE-BF16-OUT (#1168) is what makes
+  //      it wrong: outdt is BF16 on every arm now. What still keeps this leaf
+  //      inert on the 35B is condition 1, the DEFAULT-OFF VT_GDN_FP8_IN_BF16
+  //      toggle — a toggle term, not a model-shape one. Nothing moves by
+  //      default in either merge order, but whoever turns that toggle on owns
+  //      measuring the 35B too (#417).
   // PERF-GDN-PACKED-BRIDGE (#365): PERF-FP8-ALPHA-FOLD's three-term decision,
   // moved into the shared `GdnFp8MergedInProjDType` so the PRODUCER (this line,
   // which reaches MergedFp8QkvzD and allocates the buffer) and the PREDICTOR
@@ -3747,7 +3846,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // and on the merged fp8 branch too under VT_GDN_FP8_IN_BF16 (default OFF, see
   // GdnFp8InBf16Enabled). See GdnInDType().
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   GdnQkvzOutput qkvz =
       ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
   Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
@@ -4153,7 +4252,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const DType convdt = mixed.dtype;
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   const DType actdt = GdnActDType();
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   g_mixed_spec_invocations.fetch_add(1, std::memory_order_relaxed);
@@ -4384,7 +4483,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const bool mixed_spec = spec && np > 0;
 
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   // PERF-27B-GDN-PACKED-REACHABLE (#365). `dtype_compatible` is decided by the
   // ACTIVATION dtypes vt::GdnPackedDecode requires, not by how the GDN weights
   // are stored. `mixed_qkv` has to be PREDICTED because this decision runs
@@ -4407,7 +4506,6 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
           vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
-          cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
           detail::GdnPackedDecodeDTypesCompatible(
@@ -4586,6 +4684,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // intermediates are allocated. This mirrors vLLM v0.25.0
   // _forward_core_decode_non_spec:1644-1695.
   DBuf dcore(d, outdt, {T, Hv, Dv});
+  // GDN-MOE-BF16-OUT (#1168): read off the tensors, not off GdnOutDType, so a
+  // gate entering through ModelRegistry::Forward observes what this layer RAN.
+  // This is the ONLY recording site. The mixed spec+non-spec batch returns into
+  // GdnBlockPagedMixedSpec above and never reaches it, so a mixed step leaves
+  // the record untouched rather than stale-free — see the header's limits.
+  RecordGdnOutActivationDTypes(dcore.t().dtype, z.dtype);
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   if (packed_decode) {
     Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
@@ -10353,8 +10457,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // Drain the capture if the forward throws — see the 35B driver above for why
     // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
     // is the 27B DENSE driver, and it is the one that matters most here: the
-    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is confined to the
-    // 27B by construction, since the 35B is MoE and its GdnOutDType is f32.
+    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is off by DEFAULT
+    // (GdnFp8InBf16Enabled), which is the only thing keeping it inert on the
+    // 35B. It used to read "confined to the 27B by construction, since the 35B
+    // is MoE and its GdnOutDType is f32"; GDN-MOE-BF16-OUT (#1168) made outdt
+    // BF16 on both arms, so the bound is a toggle now, not a model shape.
     DBuf lg = [&] {
       try {
         return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,

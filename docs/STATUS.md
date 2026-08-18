@@ -1628,6 +1628,25 @@ regression.
 
 ## Performance detail
 
+**GDN recurrence output and z gate at the model dtype on every arm
+(`GDN-MOE-BF16-OUT`, `GATING`,
+[#1168](https://github.com/mudler/vllm.cpp/issues/1168)):** `GdnOutDType`
+resolved bf16 from a dense checkpoint and f32 from a MoE one, so every MoE
+checkpoint held the recurrence output `dcore`, the `z` gate and the gated-RMSNorm
+weight at double width. vLLM branches on no model shape here. The shape term is
+gone from the resolver and from packed-decode eligibility, and
+`VT_GDN_OUT_BF16=0` is the f32 rollback for both arms now, not the dense one
+alone ([spec](../.agents/specs/gdn-moe-bf16-out.md)).
+
+**Nothing is measured and no GPU gate has run**, so no axis is claimed in either
+direction. The CPU tier enters through `ModelRegistry::Forward` on a MoE config
+and reads the dtypes off the tensors, in the default and the `=0` arm alike. The
+35B correctness gate, the `315/315` and `235/235` engine counts, the same-binary
+A/B and the `nsys` memory-format confirmation are owed to a GPU host. Dropping
+the shape term reaches packed GDN decode on no MoE checkpoint either:
+`in_proj_ba` has one writer, the dense loader
+([#1169](https://github.com/mudler/vllm.cpp/issues/1169), owed).
+
 **Local Qwen3.5-4B plain BF16 direct loader; throughput ahead, acceptance
 `PENDING`, latency and VRAM open:** production `AsyncLLM` uses default-ON exact
 `(sequence, 8-token chunk)` causal-conv dispatch. Graph-node `nsys` measures

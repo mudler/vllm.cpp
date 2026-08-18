@@ -1754,8 +1754,9 @@ void RunRmsNormGatedFastContiguous(int64_t rows, bool sigmoid_gate, uint32_t see
                                    DType in_dt = DType::kBF16, DType out_dt = DType::kBF16) {
   constexpr int64_t d = 128;  // Dv, the only production gated-norm shape
   // Adversarial: wide x/z ranges exercise variance magnitude and silu/sigmoid
-  // saturation; w spans [-1,1] like the real norm weight. in_dt=bf16 is the 27B
-  // dense core/z/weight; in_dt=f32 is the 35B MoE core/z/weight (GdnOutDType f32).
+  // saturation; w spans [-1,1] like the real norm weight. in_dt=bf16 is the
+  // core/z/weight both arms carry by default; in_dt=f32 is the VT_GDN_OUT_BF16=0
+  // rollback arm, which was the 35B MoE's DEFAULT before #1168.
   const auto xf = RandomF32(static_cast<size_t>(rows * d), seed, -6.0f, 6.0f);
   const auto zf = RandomF32(static_cast<size_t>(rows * d), seed + 1, -6.0f, 6.0f);
   const auto wf = RandomF32(static_cast<size_t>(d), seed + 2, -1.0f, 1.0f);
@@ -3413,7 +3414,7 @@ TEST_CASE("CUDA rmsnorm_gated decode-fast (VT_RMSNORM_GATED_FAST) matches rollba
   // Real GDN decode shapes: [T*Hv, Dv=128] (27B Hv=48, 35B Hv=32) at c1-c16, both
   // silu (sigmoid_gate=false, the production gate) and sigmoid. fast==shipped 0-ulp.
   // dtype combos: bf16->bf16 (27B dense core/z), f32->bf16 (35B MoE core/z under
-  // GlueFuse — GdnOutDType f32, gated-norm stores bf16), f32->f32 (35B GlueFuse off).
+  // GlueFuse — the VT_GDN_OUT_BF16=0 f32 arm, gated-norm stores bf16), f32->f32.
   struct DtCombo {
     DType in, out;
   };

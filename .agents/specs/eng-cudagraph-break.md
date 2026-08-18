@@ -170,9 +170,11 @@ out to eager with no log and no counter.
 
 ### Defect 2: the drivers, enumerated
 
-Eight production drivers exist, and a ninth already landed. Six are batched decode
-drivers with a padded-bucket ring; three are single-shape drivers. Every one of
-them re-derives the same machinery.
+NINE production drivers exist. Six are batched decode drivers with a padded-bucket
+ring; three are single-shape drivers. Every one of them re-derives the same
+machinery. The count is nine and not the eight recorded in `9bc4d7f44`
+([#1179](https://github.com/mudler/vllm.cpp/issues/1179)): the DFlash draft graph is
+file-local with no header declaration, which is why the parent analysis missed it.
 
 | Driver | Declaration | Implementation | Shape |
 |---|---|---|---|
@@ -244,7 +246,8 @@ failure that forced it: "depth-2, graph ON FAIL, slots 1-3 degenerate". The same
 comment names the real fix as reading the identifiers at replay time from a stable
 device buffer, which is precisely what `StepDevInputs` already does in the sibling
 driver. One capability, written once, unavailable to four models. That is the cost
-of eight drivers stated as a defect rather than as an aesthetic complaint.
+of nine drivers stated as a defect rather than as an aesthetic complaint. It is also
+why this row is a CORRECTNESS row and not only a coverage one.
 
 **What is genuinely model-specific**, and must stay in the model:
 
@@ -611,9 +614,9 @@ recorded here and in `## Risks/decisions`. What it established:
   capture call log of `Begin End` three times, an identical replay order on two
   consecutive replays, and a pure pass-through with zero backend calls when no
   scope was active. Compiled and ran at exit status 0.
-- The inventory in `## Our baseline` is the real one: eight drivers plus a ninth
-  already written, and the persistent-device-input capability present in exactly
-  one of them.
+- The inventory in `## Our baseline` is the real one: NINE drivers, not the eight
+  the parent analysis recorded, and the persistent-device-input capability present
+  in exactly one of them.
 
 **W0 did NOT establish** that CUDA permits `cudaStreamEndCapture` followed by
 `cudaStreamBeginCapture` on the same stream mid-forward with eager work between

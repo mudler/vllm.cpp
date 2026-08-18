@@ -738,10 +738,22 @@ mutations, and every restore was verified byte-identical by sha256.
 `test_serve_residency_config` 11 / 126, `test_cli_offload_config` 4 / 31,
 `test_weight_residency_reach` 7 / 76, `test_expert_stream_latch` 1 / 9 — each rc 0.
 
-**Full gate.** `cmake --build build -j 6` rc 0, ENOSPC 0.
-`ctest --test-dir build -j 6` rc 0: **100% tests passed, 0 failed out of 523**,
-466.09 s, with `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e`
-skipped as they are on this host.
+**Full gate, twice, because `origin/main` moved between them.** Both runs are the
+declared recipe on the same host.
+
+| tree | build rc | ENOSPC | `ctest --test-dir build -j 6` |
+|---|---|---|---|
+| the repair on `65d6cdaed` | 0 | 0 | rc 0, **100% tests passed, 0 failed out of 523**, 466.09 s |
+| the repair merged onto `c20018f8d` | 0 | 0 | rc 0, **100% tests passed, 0 failed out of 523**, 587.09 s |
+
+`test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e` are Skipped in
+both, as they are on this host. The second run is the one that counts: a clean
+merge is not a merge that builds, so the gate is rerun on the merged tree rather
+than inherited. The second run is slower for contention reasons only — the box's
+1-minute load average was above 200 for much of it, and `test_ltx2_video` alone
+took 542.97 s against 461.46 s. `scripts/check-symbol-anchors.py`, which
+`origin/main` added in the interval, reports OK: 618 citations, 93 in-repo checked,
+93 fresh, 0 stale. `scripts/agent-preflight.sh` is rc 0 with no failing gate.
 
 ### W1 (#1110, #1109, #1122, #1133)
 

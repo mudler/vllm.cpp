@@ -37,6 +37,7 @@
 
 #include "doctest/doctest.h"
 #include "support/max_abs_diff.h"
+#include "support/process_id.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/gemma4.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
@@ -1457,7 +1458,7 @@ TEST_CASE("ltx2 text: a non-f32 compute dtype is REFUSED, never silently widened
 
 TEST_CASE("ltx2 text: the tokenizer and HF sidecars come out of TENSORS, not files") {
   const fs::path dir =
-      fs::temp_directory_path() / ("ltx2_text_assets_" + std::to_string(::getpid()));
+      fs::temp_directory_path() / ("ltx2_text_assets_" + std::to_string(vllm_test::ProcessId()));
   fs::create_directories(dir);
 
   const std::string tokenizer = R"({"version":"1.0","model":{"type":"BPE"}})";

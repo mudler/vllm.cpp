@@ -1,0 +1,97 @@
+rc: job cbfa6469-875d-4451-a7a6-d6ad59e4fb97 on orin:gpu0
+=== identity ===
+0
+aarch64
+rc-worker-lnvw6
+f7d323651cf1a5720f0ce712b802a10248278566e1abb9ecdbae8e62fcf0f4b3  /workspace/replayssm-w0b/probe.cu
+377bb25bf8900ffa70728a0a44bb52861926d07642bea9eade9b226463208172  /workspace/replayssm-w0b/count_sass.sh
+=== toolkit ===
+NVCC: Cuda compilation tools, release 13.0, V13.0.88
+NVCC: Build cuda_13.0.r13.0/compiler.36424714_0
+PTXAS: Cuda compilation tools, release 13.0, V13.0.88
+PTXAS: Build cuda_13.0.r13.0/compiler.36424714_0
+=== compile ===
+COMPILE_CMD=nvcc -std=c++20 -O3 -arch=sm_121a -Xptxas -v -c /tmp/replayssm-w0b-sass/probe.cu -o /tmp/replayssm-w0b-sass/probe.o
+COMPILE_RC=0
+/tmp/replayssm-w0b-sass/probe.cu(118): warning #177-D: function "<unnamed>::Store(__half *, int64_t, float)" was declared but never referenced
+  __attribute__((device)) inline void Store(__half* p, int64_t i, float v) {
+                                      ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/replayssm-w0b-sass/probe.cu(132): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=__half]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<__half>(float v) {
+                                       ^
+
+/tmp/replayssm-w0b-sass/probe.cu(128): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=float]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<float>(float v) {
+                                       ^
+
+/tmp/replayssm-w0b-sass/probe.cu(118): warning #177-D: function "<unnamed>::Store(__half *, int64_t, float)" was declared but never referenced
+  __attribute__((device)) inline void Store(__half* p, int64_t i, float v) {
+                                      ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/replayssm-w0b-sass/probe.cu(132): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=__half]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<__half>(float v) {
+                                       ^
+
+/tmp/replayssm-w0b-sass/probe.cu(128): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=float]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<float>(float v) {
+                                       ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 95 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 202.963 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 177.414 ms
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 178.391 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 42 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 121.377 ms
+ptxas info    : Compiling entry function '_Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    96 bytes stack frame, 96 bytes spill stores, 96 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 96 bytes cumulative stack size, 1224 bytes smem
+ptxas info    : Compile time = 270.526 ms
+ptxas info    : Compiling entry function '_Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_PKilllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_PKilllllllllf
+    56 bytes stack frame, 56 bytes spill stores, 56 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 56 bytes cumulative stack size, 1024 bytes smem
+ptxas info    : Compile time = 187.930 ms
+OBJECT_BYTES=435296
+=== arch verification ===
+ARCH_HITS_IN_RES_USAGE=2
+=== sass ===
+SASS_RC=0
+SASS_BYTES=3018425
+SASS_SHA256=b452d21124d2f1cd12a64850d6d14acf7c8ddb2bf7fac005b519539ab37c81a9
+sass_functions=6
+=== per-function SASS instruction count ===
+2816 		Function : _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+2320 		Function : _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+2000 		Function : _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_PKilllllllllf
+1872 		Function : _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+1872 		Function : _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+1688 		Function : _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__a8522eac_8_probe_cu_92d839e4_34835DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+=== sass.txt, gzip+base64, for retrieval off a box with no share ===
+SASS_GZ_B64_BEGIN
+[323540 base64 characters elided when this log was committed; the payload they
+ carried is the file sass.txt.gz beside this log. Decompressing it yields
+ sass.txt, 3,018,425 bytes, sha256 b452d21124d2f1cd12a64850d6d14acf7c8ddb2bf7fac005b519539ab37c81a9,
+ which is the SASS_SHA256 printed above. Nothing else in this log is edited.]
+SASS_GZ_B64_END
+=== JOB DONE ===

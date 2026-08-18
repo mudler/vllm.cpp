@@ -20,6 +20,7 @@
 #include "vllm/model_executor/models/indextts2_config.h"
 #include "vllm/model_executor/models/indextts2_s2mel_loader.h"
 
+#include "support/process_id.h"
 namespace {
 
 std::string U64Le(uint64_t v) {
@@ -117,7 +118,7 @@ std::string BuildTail(int64_t hidden = 8, int64_t in_ch = 4, int64_t wn = 8,
 std::string WriteTemp(const std::string& bytes, const std::string& tag) {
   const std::filesystem::path path =
       std::filesystem::temp_directory_path() /
-      ("indextts2_s2mel_" + tag + "_" + std::to_string(::getpid()) + ".safetensors");
+      ("indextts2_s2mel_" + tag + "_" + std::to_string(vllm_test::ProcessId()) + ".safetensors");
   std::ofstream out(path, std::ios::binary);
   out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   out.close();

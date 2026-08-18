@@ -73,7 +73,8 @@ TEST_CASE("the config type CARRIES a depth above 1, it never clamps it") {
   // The user-facing JSON seam (what --speculative-config and the C ABI parse) is
   // a pure shape step: it carries the user k without knowing the checkpoint's
   // n_predict. The loader hands exactly this value to ResolveMtp against the
-  // checkpoint's mtp_num_hidden_layers (model_loader.cpp:831).
+  // checkpoint's mtp_num_hidden_layers
+  // (`src/vllm/entrypoints/model_loader.cpp::ResolveMtp`).
   const SpeculativeConfig parsed = ParseSpeculativeConfigJson(
       R"({"method":"mtp","num_speculative_tokens":4})");
   CHECK(parsed.method == "mtp");

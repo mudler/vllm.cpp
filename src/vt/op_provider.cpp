@@ -489,6 +489,10 @@ const char* OpNameImpl(OpId op) {
       return "ConvTranspose1d";
     case OpId::kAttentionRelPos:
       return "AttentionRelPos";
+    case OpId::kQuantFp8Group:
+      return "QuantFp8Group";
+    case OpId::kMatmulFp8BlockScaled:
+      return "MatmulFp8BlockScaled";
     case OpId::kCount:
       break;
   }

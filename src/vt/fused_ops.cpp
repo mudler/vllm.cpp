@@ -1,6 +1,7 @@
 #include "vt/fused_ops.h"
 
 #include <stdexcept>
+#include <string>
 
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -98,15 +99,25 @@ void GeluMulSeparate(Queue& q, void* out, const void* gate, const void* up, int6
   b.Free(tmp);
 }
 
+bool HasMatmulBTAlphaBeta(const Queue& q) {
+#if defined(VLLM_CPP_HIP)
+  return q.device.type == DeviceType::kROCM;
+#else
+  (void)q;
+  return false;
+#endif
+}
+
 void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M, int N, int K,
                        float alpha, float beta, DType dtype) {
 #if defined(VLLM_CPP_HIP)
-  if (q.device.type == DeviceType::kROCM) {
+  // Dispatch on the predicate rather than on a second copy of its condition, so
+  // `HasMatmulBTAlphaBeta` cannot drift from what this function actually does.
+  if (HasMatmulBTAlphaBeta(q)) {
     rocm::MatmulBTAlphaBetaRocm(q, out, a, b, M, N, K, alpha, beta, dtype);
     return;
   }
 #endif
-  (void)q;
   (void)out;
   (void)a;
   (void)b;
@@ -116,7 +127,33 @@ void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M,
   (void)alpha;
   (void)beta;
   (void)dtype;
-  throw std::runtime_error("vt::MatmulBTAlphaBeta: ROCm-only in this build");
+  // Two different absences reach this line, and telling a caller the wrong one
+  // sends them to fix the wrong thing.
+  //
+  // A kROCM queue arrives here only when the build was configured without
+  // `-DVLLM_CPP_HIP`, so the 'rocm' arm exists in the tree and is compiled out.
+  // That is a build-configuration problem, not a missing kernel, and it is not
+  // #1205 — the previous "ROCm-only in this build" got exactly this case right.
+  if (q.device.type == DeviceType::kROCM) {
+    throw std::runtime_error(
+        "vt::MatmulBTAlphaBeta: the 'rocm' arm "
+        "(src/vt/rocm/rocm_matmul_hipblaslt.hip) is compiled out of this build; "
+        "reconfigure with -DVLLM_CPP_HIP to enable it.");
+  }
+  // Every other device arrives here because no such kernel was ever written:
+  // the only implementation in the tree is rocm::MatmulBTAlphaBetaRocm. Name the
+  // device that asked, name the one arm that exists, and name the issue that
+  // owes the rest — "ROCm-only" alone left the caller unable to tell a missing
+  // kernel from a missing build flag. Reaching this on CUDA is issue #1205 and
+  // blocks #1126 step 1: waking Gemma4's device-expert LRU would route decode
+  // into ExpertGeGLUDeviceAccum, which lands here outside the upload's
+  // try/catch. `EnsureGemma4Fp8ExpertOnDevice` now refuses before that upload
+  // (gemma4_moe.cpp), so this throw is the backstop rather than the guard.
+  throw std::runtime_error(
+      std::string("vt::MatmulBTAlphaBeta: no implementation for device '") +
+      DeviceTypeName(q.device.type) + "'; no '" + DeviceTypeName(q.device.type) +
+      "' kernel has been written and the only arm in the tree is 'rocm' "
+      "(src/vt/rocm/rocm_matmul_hipblaslt.hip); see issue #1205.");
 }
 
 void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,

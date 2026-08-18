@@ -21,6 +21,19 @@ void DualRmsNormPlusRes(Queue& q, Tensor& out, const Tensor& x1, const Tensor& w
 void GeluMulSeparate(Queue& q, void* out, const void* gate, const void* up, int64_t n,
                      DType dtype);
 
+// Does `MatmulBTAlphaBeta` have an arm for this queue's device in THIS build?
+// It answers the question a caller has to ask BEFORE committing to a device
+// path, because the alternative is finding out from a throw: the only
+// implementation in the tree is `rocm::MatmulBTAlphaBetaRocm`, so on every other
+// device — and on ROCm in a build configured without `-DVLLM_CPP_HIP` — the call
+// below refuses instead of computing (issue #1205).
+//
+// It is not a device-name test that a reader has to keep in sync by hand.
+// `MatmulBTAlphaBeta` itself dispatches on this predicate, so the two cannot
+// disagree: false here means the very next line throws, and a future CUDA arm
+// makes both true in one edit.
+bool HasMatmulBTAlphaBeta(const Queue& q);
+
 void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M, int N, int K,
                        float alpha, float beta, DType dtype);
 

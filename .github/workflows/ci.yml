@@ -290,6 +290,22 @@ jobs:
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
+      - name: A citation that names a symbol still finds it (#1143, #1139)
+        # The tree already carried 539 `path::Symbol` citations and had never
+        # checked one. Line anchors are what rot: one 45-line insertion near the
+        # top of `model_loader.cpp` moved 203 references at once, in files that
+        # change never opened (#1143), and a pin advance left three upstream
+        # line anchors on one row pointing at unrelated code (#1139).
+        #
+        # NOT the #911 shape. The expectation is the symbol name written by the
+        # citing author and read from the CITING file; only the evidence comes
+        # from the cited one. `--self-test` sweeps the fixture corpus in both
+        # directions. The upstream half needs an oracle checkout this runner
+        # does not have, so it stays opt-in behind `--upstream-root`.
+        run: |
+          python3 scripts/check-symbol-anchors.py
+          python3 scripts/check-symbol-anchors.py --self-test
+          python3 tests/scripts/test_check_symbol_anchors.py
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py
@@ -961,6 +977,46 @@ jobs:
             echo "Running test_ops_matmul_elem with VT_CPU_MATMUL_TIER=${tier}"
             VT_CPU_MATMUL_TIER="${tier}" build/tests/test_ops_matmul_elem
           done
+  build-newest-gcc:
+    # COMPILE-ONLY coverage on a compiler NEWER than any other lane's. Every
+    # other Linux lane installs the distro `g++`, which on ubuntu-latest is
+    # gcc 13, so a header that only compiles because of a TRANSITIVE include
+    # goes green here and red on a current distro. That is not hypothetical:
+    # ::getpid without <unistd.h> was fixed once and came back in five more
+    # files, one of them src/vllm/entrypoints/openai/server_main.cpp — a
+    # SHIPPED binary that does not build on gcc 16 (reported on issue #41).
+    #
+    # Deliberately does NOT run ctest: this lane exists to catch compile-time
+    # portability, and build-test-cpu already owns execution. Keeping it to a
+    # build is roughly one extra compile per PR.
+    concurrency:
+      group: ci-build-newest-gcc-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container: gcc:16
+    steps:
+      - name: Install build tools
+        # The gcc image ships the toolchain only; git is needed BEFORE checkout
+        # so actions/checkout uses git rather than the slower tarball path.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates cmake git ninja-build python3
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v4
+      - name: Report the compiler this lane is actually pinning
+        run: g++ --version
+      - name: Configure
+        run: |
+          cmake -S . -B build-newest-gcc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVLLM_CPP_BUILD_TESTS=ON
+      - name: Build
+        # Same bounded parallelism as build-test-cpu: a bare -j OOM-kills the
+        # runner during the parallel link of the test executables.
+        run: cmake --build build-newest-gcc -j 2
   build-test-cpu-arm64:
     # Independent Arm execution evidence: the x86 lane cannot prove HWCAP
     # dispatch, Arm instructions, or the host ABI. The native runner exercises

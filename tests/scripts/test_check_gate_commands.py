@@ -641,6 +641,112 @@ class RatchetTests(unittest.TestCase):
         self.assertIn("scripts/check-gate-commands.py --check", ci)
         self.assertIn("tests/scripts/test_check_gate_commands.py", ci)
 
+    def test_cudagraph_dedup_is_credited_for_real_commands(self):
+        # ENG-CUDAGRAPH-DEDUP (#1162) is a NEW row arriving at ACTIVE, which is
+        # the first state that puts it in GATED_STATES at all, so it joins the
+        # runnable population on arrival. TWO things are pinned, not one: the
+        # row is in the exact pin, AND its Gates section really does yield a
+        # command that can fail. A row pinned without the second half is a
+        # certificate for nothing, which is the failure the checker's own header
+        # admits to for five older credits.
+        self.assertIn("ENG-CUDAGRAPH-DEDUP", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-CUDAGRAPH-DEDUP"), "runnable")
+
+        spec = (ROOT / ".agents/specs/eng-cudagraph-dedup.md").read_text(encoding="utf-8")
+        section = gates.gates_section(spec)
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        # The credit rests on the focused suite, not on the preflight line: that
+        # suite detected 9 of 9 negative mutations of the registry this row adds,
+        # so it genuinely goes red when the row regresses. `git diff --stat` is
+        # also extracted from the mutation bullet and is one of the weak credits
+        # this checker's header names; it is deliberately not what is asserted.
+        self.assertIn("ctest -R test_graph_dedup", commands)
+        self.assertIn("./scripts/agent-preflight.sh", commands)
+
+        # BOTH credited commands are CPU-tier, so the credit says nothing about
+        # the DEVICE tier, and the record must not go silent about the leg the
+        # credit does not cover. That was the point of the assertion that used to
+        # sit here, and it read the SENTENCE: `"Device byte-identity A/B (owed"`.
+        # fe24a3029 legitimately rewrote that sentence when the A/B ran, and took
+        # main red (#1229). `owed` was the leg's value on the day, not the
+        # property. Re-pinning onto `RAN 2026-08-18, PASS` would only move the pin
+        # and the rerun owed under #1226 would red it again, so this keys on what a
+        # correct record edit PRESERVES: the numbered item, its SUBJECT, and
+        # whether the checker's own extractor finds a command in it.
+        items = gates.gate_items(section)
+        device = [it for it in items if "byte-identity" in (gates.item_lead(it) or "")]
+        # Uniqueness, not existence: a positional match would silently move onto a
+        # second device gate if the row ever grows one.
+        self.assertEqual(len(device), 1, [gates.item_lead(i) for i in items])
+        # STRUCTURAL, and the load-bearing half: the classifier itself extracts
+        # nothing runnable from this item, which is what proves the credit above
+        # rests entirely on the CPU tier rather than on a reader's belief.
+        self.assertEqual(gates.runnable_commands(device[0]), [])
+        # ...and the record therefore has to say what became of it. Satisfied by
+        # `owed` before fe24a3029 and by `RAN` after it, which is the whole point.
+        self.assertIsNotNone(gates.gate_disposition(device[0]))
+
+    def test_gate_disposition_reads_the_lead_not_the_body(self):
+        # Why the LEAD and not the whole item. A status word in the lead is a
+        # declaration ABOUT the gate; the same word in the body is ordinary prose
+        # describing what the gate does. Widen the search and the anti-silence
+        # rule above starts crediting items that declare nothing.
+        #
+        # This is MEASURED, and the first measurement REFUTED the reason this
+        # test was originally written with. eng-cudagraph-dedup.md was the claimed
+        # example and it is not one: all 7 of its gate items agree under both
+        # scopes, so widening the scope leaves the assertion above green and that
+        # spec cannot pin this. Surveyed instead over every `Gates` section in
+        # .agents/specs/ on 2026-08-18: 32 of 323 gate items GAIN a disposition
+        # when the search widens, among them `**No regression:**` in
+        # cpu-elementwise-gemm.md and `**Correctness gate:**` in dropin-kernel-abi.md,
+        # both of which pick up `pass` out of body prose.
+        #
+        # The fixture is that shape, written out rather than read from another
+        # row's spec: pinning a live sentence in a file this row does not own is
+        # the defect #1229 exists to remove, and it would put this suite back in
+        # the path of somebody else's correct record edit.
+        body_only = "3. **Correctness gate:** the ported cases all pass on CPU."
+        self.assertIsNone(gates.gate_disposition(body_only))
+        self.assertIsNotNone(gates._DISPOSITION.search(body_only))
+
+        # STATE-INDEPENDENCE, which is what makes this a repair and not a re-pin.
+        # Both wordings the device leg has ever carried are fixtures here, quoted
+        # from 2a976eb9f and fe24a3029. The assertion above holds on BOTH, so it is
+        # not describing today's sentence.
+        owed = "6. **Device byte-identity A/B (owed, see below).** Same binary."
+        ran = (
+            "6. **Device byte-identity A/B \u2014 RAN 2026-08-18, PASS; see "
+            "[`## Outcome`](#outcome).** Same binary."
+        )
+        self.assertEqual(gates.gate_disposition(owed), "owed")
+        self.assertEqual(gates.gate_disposition(ran), "RAN")
+        self.assertEqual(gates.runnable_commands(owed), [])
+        self.assertEqual(gates.runnable_commands(ran), [])
+
+        # A lead stripped of its status is the SILENCE this rule exists to catch,
+        # and it must read as undeclared rather than as some default.
+        silent = "6. **Device byte-identity A/B.** Same binary."
+        self.assertIsNone(gates.gate_disposition(silent))
+        # An item with no bold lead at all is undeclared too, never green by
+        # accident: an unparsed record takes the gate RED, not past it.
+        self.assertIsNone(gates.item_lead("6. Device byte-identity A/B, owed."))
+        self.assertIsNone(gates.gate_disposition("6. Device byte-identity A/B, owed."))
+
+    def test_dropping_cudagraph_dedup_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1162 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and set equality has to go red, which is what proves the row
+        # was pinned because it entered the population and not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-CUDAGRAPH-DEDUP"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-DEDUP"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
 
 if __name__ == "__main__":
     unittest.main()

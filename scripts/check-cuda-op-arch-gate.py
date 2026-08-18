@@ -92,6 +92,12 @@ REQUIRED = (
     # trapped in the cutlass-fp8 TU; unreachable on every non-cutlass-fp8 CUDA
     # arch, where it fell to the reference tier and segfaulted (#844).
     ("kQuantFp8Static", "src/vt/cuda/cuda_quant_fp8.cu", "#960"),
+    # #1189 M1: the dynamic per-token, per-group fp8 activation quant. Same
+    # property as its neighbour and the same consequence if it moves -- a max,
+    # two divides and a hardware e4m3 convert, with no cutlass dependency, so a
+    # CUDA queue must never fall through to the host reference tier and
+    # dereference device pointers. It shares the TU deliberately.
+    ("kQuantFp8Group", "src/vt/cuda/cuda_quant_fp8.cu", "#1189"),
 )
 
 # Where a stray duplicate registration could hide. Every CUDA-side source.

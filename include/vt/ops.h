@@ -423,6 +423,24 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kConv1d,
   kConvTranspose1d,
+  // --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 milestone M1). The DYNAMIC
+  // per-token, per-group fp8 activation quant that a 128x128 block-scaled FP8
+  // GEMM consumes. It is not a parameter of kQuantFp8Static: that op takes ONE
+  // static per-tensor scale from the checkpoint and emits no scale tensor at
+  // all, while this one derives a scale per (row, group) at run time and emits
+  // an f32 [M, K/group_size] second output. The nearest existing shape is
+  // kScaledFp4Quant, which is dynamic per-token with a 2-D scale as well.
+  // See vt::QuantFp8Group below for the contract.
+  // Appended before kCount so no existing op's id shifts.
+  kQuantFp8Group,
+  // --- Block-wise FP8 (VT-MATMUL-FP8-BLOCK-REF, #1189 milestone M2). The
+  // 128x128 block-scaled fp8 GEMM that consumes kQuantFp8Group's output. It is
+  // NOT a parameter of kMatmulFp8Cutlass and cannot be: that op folds ONE
+  // scalar alpha into the epilogue, which has exactly one degree of freedom per
+  // output element, while this scheme has cdiv(K, block_k) of them and applies
+  // them in the MAINLOOP. See vt::MatmulFp8BlockScaled below for the contract.
+  // Appended before kCount so no existing op's id shifts.
+  kMatmulFp8BlockScaled,
   kCount
 };
 
@@ -922,6 +940,17 @@ using MatmulFp8CublasLtFn =
 using MatmulFp8CublasLtAlphaVecFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/, bool);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
+// Two outputs, because the scale is computed rather than supplied: the fp8 bytes
+// and the f32 [M, K/group_size] per-group scale.
+using QuantFp8GroupFn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor& /*out_scale*/,
+                                 const Tensor& /*x*/, int /*group_size*/);
+// Two scale streams and the block geometry, where the per-tensor fp8 GEMMs above
+// carry one scalar alpha. The geometry is not a convenience: it is what selects
+// which scale pair each K-block multiplies by.
+using MatmulFp8BlockScaledFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*a_fp8*/,
+                                        const Tensor& /*a_scale*/, const Tensor& /*b_fp8*/,
+                                        const Tensor& /*b_scale*/, int /*block_n*/,
+                                        int /*block_k*/);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
                                    const RmsNormArgs&, Tensor* /*residual*/, float /*input_scale*/);
@@ -1520,6 +1549,116 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
 // i8 (raw fp8-e4m3fn bytes). CUDA + CPU (the CPU arm is the portable reference
 // that makes the fp8 seam testable without a GPU, #468).
 void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale);
+
+// --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 M1,
+// .agents/specs/vt-quant-fp8-group.md). QuantFp8Group is the DYNAMIC per-token,
+// per-group sibling of QuantFp8Static: the scale is derived from the data, once
+// per contiguous run of `group_size` elements inside a row, and written out.
+//
+//   amax = max(1e-10, max |x_f32| over the group)
+//   y_s  = amax / 448.0f
+//   out_fp8[i] = fp8_e4m3( min(max(x_f32[i] / y_s, -448.0f), 448.0f) )
+//   out_scale[row, group] = y_s
+//
+// x [M,K] f32/bf16, out_fp8 [M,K] i8 (raw fp8-e4m3fn bytes), out_scale
+// [M, K/group_size] F32 — f32 because upstream allocates it f32 and the GEMM
+// that consumes it multiplies in f32 (fp8_utils.py:629-631). K must be a
+// multiple of group_size; the op refuses any other K by name, as upstream
+// asserts at fp8_utils.py:596-599. CPU + CUDA.
+//
+// WHICH UPSTREAM ARM THIS MIRRORS, because there are two and they DISAGREE.
+// `per_token_group_quant_fp8` reads like a Triton kernel with a C++ fast path
+// and it is the other way round: on a CUDA-alike platform with a contiguous
+// input it calls the C++ custom op and RETURNS (fp8_utils.py:635-650), so the
+// Triton kernel never executes there. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps           — eps SEEDS the reduction, so an
+//                                             all-zero group cannot divide by 0
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit                    — a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)     — a DIVIDE
+//   :86  DST_DTYPE(q)                       — hardware e4m3 RNE, saturating
+// DO NOT "correct" either divide into a hoisted reciprocal multiply to match
+// QuantFp8Static's form. That form is right for QuantFp8Static because upstream
+// ships it there (common.cuh:62 with the reciprocal formed by the caller); here
+// upstream ships a divide, the scale changes per group so nothing is
+// loop-invariant, and the Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) carries an upstream comment naming the 1-ULP gap it opens.
+// One f32 ulp before an e4m3 round changes the emitted byte near a tie, and
+// upstream's own test cannot see it: it compares values at rtol=0.15 and the
+// scale at rtol=1e-5 (test_block_fp8.py:112-115). Only a byte comparison can,
+// which is what tests/vt/test_ops_quant_fp8_group_cpu.cpp G1 is.
+//
+// The column-major and TMA-aligned scale layouts (fp8_utils.py:610-628) and the
+// `use_ue8m0` DeepGEMM scale rounding (per_token_group_quant.cu:69-71) are NOT
+// implemented. Both are recorded under `## Owed` in the row's spec; no consumer
+// in this tree can read either yet, and upstream excludes the target model from
+// DeepGEMM on family 120 (vllm/utils/deep_gemm.py:27-46).
+void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                   int group_size);
+
+// MatmulFp8BlockScaled (VT-MATMUL-FP8-BLOCK-REF, #1189 M2,
+// .agents/specs/vt-matmul-fp8-block-ref.md) — the 128x128 block-scaled fp8 GEMM,
+// mirroring native_w8a8_block_matmul (tests/kernels/quant_utils.py:91-154):
+//
+//   for each (m, n):
+//     acc = 0                                              f32
+//     for kt in [0, cdiv(K, block_k)):
+//       part = 0                                           f32, a SEPARATE register
+//       for k in the k-tile:  part += f8(a[m,k]) * f8(b[n,k])
+//       acc += part * ( a_scale[m, kt] * b_scale[n / block_n, kt] )
+//     out[m, n] = acc                                      stored to out's dtype
+//
+// THE SCALES APPLY IN THE MAINLOOP, ONCE PER K-BLOCK, INTO AN F32 ACCUMULATOR —
+// NOT IN THE EPILOGUE, and that is a correctness constraint rather than an
+// optimisation choice. MatmulFp8Cutlass above folds one scalar alpha after the
+// whole K reduction. An epilogue has exactly ONE degree of freedom per output
+// element; this scheme has cdiv(K, block_k) of them. An epilogue-only
+// application therefore cannot express a per-K-block scale AT ALL, which is why
+// this is a separate op. DO NOT "simplify" `part` away into `acc`: that IS the
+// epilogue form, and tests/vt/test_ops_matmul_fp8_block_cpu.cpp G4 is built so
+// that no single-alpha implementation can pass it.
+//
+// WHICH UPSTREAM ARM THIS MIRRORS. The Triton kernel at fp8_utils.py:826-836 is
+// not what executes on the target architecture; CUTLASS is
+// (vllm/model_executor/kernels/linear/__init__.py:355-377 ranks it third,
+// DeepGEMM is auto-disabled for qwen3_5_text on family 120 at
+// vllm/utils/deep_gemm.py:27-46, and Marlin is excluded at cc >= 89). Unlike the
+// QuantFp8Group case above, the two AGREE: csrc/.../c3x/
+// scaled_mm_blockwise_sm120_fp8_dispatch.cuh:56-58,218-235 hands both scale
+// pointers to the MAINLOOP arguments over an `ElementAccumulator = float`, and
+// cutlass 4.5.0's sm120_mma_tma_blockwise_scaling.hpp:714-717 is literally
+// `accum(i) += tmp_accum(i) * tCrScaleAViewAsC(i) * tCrScaleBViewAsC(i)`.
+// CUTLASS associates the two scale multiplies left to right where the reference
+// forms their product first (quant_utils.py:150-151); the difference is at most
+// one f32 ULP per K-block and upstream's own gate admits it, comparing the two
+// at rel_diff < 0.001 (test_block_fp8.py:194-200). We mirror the reference's
+// association, because this op IS the reference port and the CUDA kernel that
+// #1189 milestone M5 lands will be measured against it.
+//
+// SHAPES, with CEIL on every tiling, so a ragged final block is legal and must
+// work (upstream asserts exactly this at fp8_utils.py:935-936):
+//   a_fp8   [M,K]                              i8, raw fp8-e4m3fn bytes
+//   a_scale [M, cdiv(K, block_k)]              F32
+//   b_fp8   [N,K]                              i8, raw fp8-e4m3fn bytes
+//   b_scale [cdiv(N, block_n), cdiv(K, block_k)] F32
+//   out     [M,N]                              f32 or bf16
+// The scales are f32 because upstream refuses any other dtype on this path
+// (csrc/.../c3x/scaled_mm_helper.hpp:15-18) and the accumulator is f32.
+// a_scale's K axis is a CEIL too, so this op accepts a K that vt::QuantFp8Group
+// would refuse; that asymmetry is upstream's own (fp8_utils.py:930 uses cdiv
+// where fp8_utils.py:596-599 demands divisibility).
+//
+// No bias: upstream refuses one outright on the blockwise path
+// (scaled_mm_helper.hpp:54), so this mirrors a refusal rather than deferring a
+// feature.
+//
+// CPU only. A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH — it is the
+// numerical oracle #1189 milestone M5's CUTLASS kernel is measured against, and
+// it makes no speed claim. M5 owns the CUDA arm.
+void MatmulFp8BlockScaled(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
+                          const Tensor& b_fp8, const Tensor& b_scale, int block_n,
+                          int block_k);
 
 // RmsNormQuantFp8 (fused fp8 RMSNorm -> static per-tensor activation quant). One
 // HBM pass mirrors vLLM's Inductor `fused_add_rms_norm_static_fp8_quant`

@@ -33,6 +33,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, GdnStateCache + v1 attention metadata
 #include <functional>
 
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Gdn/FullAttn weights, TensorResolver
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
@@ -60,6 +61,16 @@ struct DenseMlpWeights {
   Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
   Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
   Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
+
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise (128x128) FP8 MLP
+  // projections. This block had NO fp8 rung at all before that row, so a
+  // block-wise MLP fell through to `LoadMergedBf16RawNK` and died on
+  // "expected BF16". Loaded UNMERGED: block scales concatenate losslessly along
+  // N, so merging gate+up is simpler here than in the per-tensor case and
+  // #1189 M6 owns it.
+  Fp8BlockWeight gate_proj_fp8_block;  // [N=I, K=H]
+  Fp8BlockWeight up_proj_fp8_block;    // [N=I, K=H]
+  Fp8BlockWeight down_proj_fp8_block;  // [N=H, K=I]
 
   // CUDA resident for vLLM's MergedColumnParallelLinear gate_up_proj. The
   // checkpoint stores gate/up separately; production concatenates their packed
@@ -201,6 +212,19 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
 // or an FP8/BF16 projection next to an NVFP4 one) needs the real probe. Exposed
 // so the loader gate can drive a whole synthetic layer through the SAME routing
 // production takes.
+// MODEL-FP8-BLOCK-WEIGHT (#1189 M3): `block` carries the checkpoint's declared
+// `weight_block_size`, `activation_scheme` and `modules_to_not_convert`, read
+// ONCE by `LoadQwen3_5Dense` from the quantization config. A default-constructed
+// value means "not block-wise", which is byte-identical to the routing before
+// that row. The two seams above default to it; the production loader passes the
+// value it read, because a dtype probe alone cannot detect a config/tensor
+// DISAGREEMENT and that is where a silent wrong-scale bug lives.
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::function<bool(const std::string&)>& has,
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix,
+    const Fp8BlockQuantConfig& block);
+
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::function<bool(const std::string&)>& has,
     const std::string& layer_type, int64_t layer_idx,
@@ -218,6 +242,13 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // Host-lifetime helpers for ordinary dense CUDA models. The release function
 // drops only tensors whose authoritative raw/F32 device representation exists;
 // unused fallbacks stay host-resident. The caller synchronizes first.
+// MODEL-FP8-BLOCK-WEIGHT (#1189 M3), the M3/M4 seam. Throws by name when the
+// load produced a block-wise FP8 weight, because nothing in this build can read
+// one yet. Called from `PrepareQwen3_5Dense`, i.e. `ModelRegistry::Prepare`, so
+// a block-wise checkpoint LOADS and declines to run rather than falling through
+// to an empty bf16 tensor. Milestone M4 deletes it along with the gap.
+void RefuseUnconsumedQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights);
+
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights);
 size_t ReleaseResidentQwen3_5DenseHostWeights(Qwen3_5DenseWeights& weights);
 

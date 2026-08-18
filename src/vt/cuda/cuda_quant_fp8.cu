@@ -110,6 +110,88 @@ void QuantFp8StaticKernelCuda(Queue& q, Tensor& out_fp8, const Tensor& x, float 
   Check(cudaGetLastError(), "quant_fp8_static launch");
 }
 
+// ---- Dynamic per-token, per-GROUP fp8 activation quant -----------------------
+// VT-QUANT-FP8-GROUP (#1189 M1, .agents/specs/vt-quant-fp8-group.md).
+//
+// Mirror of the kernel that ACTUALLY EXECUTES upstream on this architecture.
+// `per_token_group_quant_fp8` calls `torch.ops._C.per_token_group_fp8_quant`
+// and returns whenever the platform is CUDA-alike and the input is contiguous
+// (vllm/model_executor/layers/quantization/utils/fp8_utils.py:635-650), so its
+// Triton kernel never runs here. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps                  eps SEEDS the reduction
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit                    a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)     a DIVIDE
+//   :86  DST_DTYPE(q)                              hardware e4m3 RNE
+//
+// THE TWO DIVIDES ARE THE CONTRACT. QuantFp8StaticKernel above multiplies by a
+// hoisted reciprocal because that is upstream's shipped form for the static
+// per-tensor path; here upstream divides, and the scale changes per group, so
+// nothing is loop-invariant. The Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) differs by up to one f32 ulp and says so in its own
+// comment. Near an e4m3 tie that ulp changes the emitted byte. Do not "optimise"
+// either divide into a reciprocal: tests/vt/test_ops_quant_fp8_group_cpu.cpp G6
+// compares this kernel with the CPU arm BYTE FOR BYTE, and G1 compares the CPU
+// arm with a reference that spells the divide out.
+//
+// STRUCTURE. Upstream splits one group across 16 lanes and reduces with
+// `__shfl_xor_sync` (:21-40, :106). This kernel gives ONE THREAD the whole
+// group instead. The two agree bit for bit because `fmaxf` is exact and
+// associative over finite inputs, so the reduction ORDER cannot change the
+// result, unlike a floating-point sum. That keeps the arm a correctness mirror
+// with no shared memory and no intra-group synchronisation; a lane-parallel
+// rewrite is a performance question for #1189 M5, which needs a GPU to measure.
+//
+// This TU is in the UNCONDITIONAL CUDA source list and this kernel, like its
+// neighbour, has no cutlass dependency of any kind — it is a max, two divides
+// and a hardware convert. `scripts/check-cuda-op-arch-gate.py` pins that, for
+// the reason #960 records at the top of this file.
+template <typename Tin>
+__global__ void QuantFp8GroupKernel(uint8_t* out, float* scale, const Tin* x, int group_size,
+                                    int64_t num_groups) {
+  constexpr float kEps = 1e-10f;      // fp8_utils.py:570
+  constexpr float kFp8MaxV = 448.0f;  // quant_utils.py:27-35 finfo(e4m3fn).max
+  constexpr float kFp8MinV = -448.0f;
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       gid < num_groups; gid += step) {
+    const int64_t base = gid * group_size;
+    float amax = kEps;  // :47 — eps SEEDS the reduction, so an all-zero group
+                        // yields 1e-10/448 rather than dividing by zero
+    for (int i = 0; i < group_size; ++i) amax = fmaxf(amax, fabsf(LoadIn(x, base + i)));  // :53
+    const float y_s = amax / kFp8MaxV;                                                    // :68
+    scale[gid] = y_s;
+    for (int i = 0; i < group_size; ++i)
+      out[base + i] =
+          F32ToFp8Dev(fminf(fmaxf(LoadIn(x, base + i) / y_s, kFp8MinV), kFp8MaxV));  // :85
+  }
+}
+
+void QuantFp8GroupKernelCuda(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                             int group_size) {
+  const int64_t m = x.shape[0], k = x.shape[1];
+  const int64_t groups_per_row = k / group_size;
+  const int64_t num_groups = m * groups_per_row;
+  if (num_groups == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int blocks = static_cast<int>(std::min<int64_t>((num_groups + 255) / 256, 65535));
+  switch (x.dtype) {
+    case DType::kF32:
+      QuantFp8GroupKernel<float><<<blocks, 256, 0, s>>>(out_fp8.Ptr<uint8_t>(),
+                                                        out_scale.Ptr<float>(), x.Ptr<float>(),
+                                                        group_size, num_groups);
+      break;
+    case DType::kBF16:
+      QuantFp8GroupKernel<__nv_bfloat16><<<blocks, 256, 0, s>>>(
+          out_fp8.Ptr<uint8_t>(), out_scale.Ptr<float>(), x.Ptr<__nv_bfloat16>(), group_size,
+          num_groups);
+      break;
+    default: VT_CHECK(false, "cuda quant_fp8_group: unsupported x dtype (f32/bf16 only)");
+  }
+  Check(cudaGetLastError(), "quant_fp8_group launch");
+}
+
 // Table fill only, no CUDA calls (see cuda_ops.cu for the rationale). This
 // registration must stay at preprocessor-conditional depth 0 in a TU that is
 // unconditionally compiled for CUDA — that IS the fix for #960.
@@ -117,6 +199,8 @@ struct Registrar {
   Registrar() {
     RegisterOp(OpId::kQuantFp8Static, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernelCuda)));
+    RegisterOp(OpId::kQuantFp8Group, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<QuantFp8GroupFn>(&QuantFp8GroupKernelCuda)));
   }
 };
 Registrar g_registrar;

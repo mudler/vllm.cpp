@@ -2297,6 +2297,32 @@ if(VLLM_CPP_SERVER)
   # is already a SYSTEM include on the vllm target).
 endif()
 
+# ── BIT-ROT GUARD: the MiniMax-Music3 depth-stage A/B driver (#672, #1246) ────
+# `tools/bench/music3_depth_stage_ab.cpp` is the sole artifact behind spec §16.6's
+# 3.50x and its `f0cfeed6eee4f55d` fingerprint. Its own header argues, correctly,
+# that CI must never RUN it: it allocates 2.5 GB of weights, spends seconds per
+# round, and is a TWO-BUILD A/B that one target could not express anyway. None of
+# that is a reason for it to be UNCOMPILABLE — it reaches internal headers and
+# `LinearNoBias`, so the next signature change would rot the one file a reader
+# has to compile to reproduce the measurement, silently.
+#
+# So both arms are compiled and NOTHING is linked or registered as a test. An
+# OBJECT library builds the TU and discards it; `main` is never linked, so no
+# weight is ever allocated and the build stays byte-identical to what it was.
+# Two targets rather than one because the arms are `#if defined(MUSIC3_AFTER)`
+# alternatives and a single configuration would leave the other half unchecked.
+foreach(_music3_ab_arm before after)
+  add_library(vllm_music3_depth_stage_ab_${_music3_ab_arm} OBJECT
+    tools/bench/music3_depth_stage_ab.cpp)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_music3_depth_stage_ab_${_music3_ab_arm})
+endforeach()
+target_compile_definitions(vllm_music3_depth_stage_ab_after PRIVATE MUSIC3_AFTER)
+
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and
 # reach internal C++ symbols). Here we ALSO package a SHARED libvllm.so that

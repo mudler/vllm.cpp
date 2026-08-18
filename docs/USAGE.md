@@ -2293,6 +2293,15 @@ Read it as follows.
   page-fault I/O with the copy inside a single call — so the load total on its
   own cannot say whether a slow load is storage or CPU, and `load.ac.dit_build`
   in particular touches no file at all.
+* the `calls` column on `ar.depth_forward` and `ar.depth_projection` changed
+  meaning in #672, so **two profile tables from different builds are not directly
+  comparable on those two rows**. The depth decoder used to re-run the whole
+  growing depth sequence at each of the seven codebook steps, separately per
+  guidance branch — 14 calls per frame, 70 rows of work to read 14 of them. It
+  now appends one position at a time against a K/V cache, both branches in one
+  batch-2 call: **8 calls per frame, 16 rows**. The seconds fell with the rows;
+  the call count fell for a different reason, and reading the drop in `calls` as
+  the speedup would double-count it. The output is bit-identical either way.
 
 It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
 other value, including a near miss like `y`, leaves it off — an operator who
@@ -2302,6 +2311,16 @@ changed. With it off, no clock is read and no `/proc` file is opened.
 This is an attribution instrument, not a benchmark harness: it takes no GPU
 clock window, so its rows are a within-run **split** and must not be quoted as
 per-kernel or cross-box figures.
+
+If you want to price the depth stage on your own box without generating a song,
+`tools/bench/music3_depth_stage_ab.cpp` drives one frame of it directly. Nothing
+RUNS it — it allocates 2.5 GB and is a two-build A/B, which one target could not
+express — but both arms are COMPILED, as the never-linked OBJECT libraries
+`vllm_music3_depth_stage_ab_{before,after}`, so it cannot rot behind a signature
+change while still being the artifact the §16.6 measurement is reproducible from
+(#1246). Its header carries the exact `g++` and run lines. Alternate the arms and
+take the minimum; it prints one fingerprint per process, after its round loop, so
+a "speedup" that changed the answer cannot be mistaken for one that did not.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request

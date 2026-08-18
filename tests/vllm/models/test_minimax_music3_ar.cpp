@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -32,6 +33,8 @@
 
 #include "minimax_music3_ar_goldens.inc"
 #include "vllm/model_executor/models/minimax_music3_ar.h"
+#include "vllm/model_executor/models/minimax_music3_llm.h"
+#include "vt/dtype.h"
 
 namespace {
 
@@ -643,6 +646,531 @@ TEST_CASE("music3 ar: the position window binds at its boundary and one past it"
   // The REAL configuration's depth sequence (8) fits inside its window (16).
   m3::DepthDecoderConfig real;
   CHECK(real.num_codebooks <= real.max_position_embeddings);
+}
+
+// ---------------------------------------------------------------------------
+// The INCREMENTAL depth decode (#672) — the fast schedule, and the proof that
+// it is the same arithmetic rather than merely a close one.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bit-for-bit, not within a tolerance. Returns how many values were compared so
+// a caller can report the count: a gate that cannot say how many things it
+// examined has not reported.
+size_t ExpectBitIdentical(const std::vector<float>& got, const std::vector<float>& want,
+                          const std::string& what) {
+  REQUIRE_MESSAGE(got.size() == want.size(), what);
+  size_t differing = 0;
+  size_t first = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+      if (differing == 0) first = i;
+      ++differing;
+    }
+  }
+  CHECK_MESSAGE(differing == 0, what << ": " << differing << " of " << got.size()
+                                    << " values differ, first at index " << first << " ("
+                                    << (differing == 0 ? 0.0f : got[first]) << " vs "
+                                    << (differing == 0 ? 0.0f : want[first]) << ")");
+  return got.size();
+}
+
+}  // namespace
+
+TEST_CASE("music3 ar: the incremental depth decode is BIT-IDENTICAL to the whole sequence") {
+  // The claim the generation loop rests on. `DepthDecoderForward` is the
+  // MIRRORED reference and stays gated against upstream above; this asserts the
+  // incremental schedule that replaced it in `Music3DepthStage` returns the same
+  // BYTES for the row that schedule actually reads, at every prefix length and
+  // at both compute widths.
+  const m3::DepthDecoderConfig config = DepthConfig();
+  const m3::DepthDecoderWeights weights = DepthWeights();
+  const size_t hidden = static_cast<size_t>(config.hidden_size);
+  const size_t count = static_cast<size_t>(config.max_position_embeddings) * hidden;
+  const std::vector<float> all_in = ToVector(vllm_test::kMusic3DepthBoundaryIn, count);
+
+  size_t compared = 0;
+  for (const m3::ArCompute compute : {m3::ArCompute::kFloat32, m3::ArCompute::kBFloat16}) {
+    m3::DepthDecoderCache cache;
+    for (int64_t prefix = 1; prefix <= config.max_position_embeddings; ++prefix) {
+      const std::vector<float> whole(
+          all_in.begin(), all_in.begin() + static_cast<int64_t>(hidden) * prefix);
+      const std::vector<float> reference =
+          m3::DepthDecoderForward(whole, prefix, config, weights, compute);
+      const std::vector<float> row(
+          all_in.begin() + static_cast<int64_t>(hidden) * (prefix - 1),
+          all_in.begin() + static_cast<int64_t>(hidden) * prefix);
+      const std::vector<float> got =
+          m3::DepthDecoderAppend(row, /*batch=*/1, config, weights, compute, &cache);
+      CHECK(cache.positions == prefix);
+      compared += ExpectBitIdentical(
+          got, std::vector<float>(reference.end() - static_cast<int64_t>(hidden), reference.end()),
+          std::string("incremental depth position ") + std::to_string(prefix - 1) + " compute=" +
+              (compute == m3::ArCompute::kFloat32 ? "f32" : "bf16"));
+    }
+  }
+  MESSAGE("incremental depth decode: " << compared << " values compared BITWISE over "
+                                       << config.max_position_embeddings
+                                       << " positions x 2 compute widths");
+}
+
+TEST_CASE("music3 ar: the incremental depth decode holds at a WIDER geometry") {
+  // COVERAGE BREADTH, not a blind spot in the case above. An earlier revision of
+  // this comment said the goldens are "8-wide with ONE head", so that a head
+  // stride is invisible there. That is FALSE (#1247) and the correction is
+  // measured:
+  // `minimax_music3_ar_goldens.inc` sets `kMusic3DepthHeads` = 2 over
+  // `kMusic3DepthHidden` = 8, so the goldens are 2 heads of 4 and
+  // `heads * head_dim` (8) is NOT `head_dim` (4). Dropping the head stride from
+  // the cached KEY index — every head reading head 0's keys — reds 4 cases / 32
+  // assertions here, and TWO of them are golden-geometry cases: the bit-identity
+  // case above and the batched one below.
+  //
+  // What this case adds is reach, which is worth having on its own. 8 heads of
+  // 8, three layers, the real 8-position schedule and pseudo-random weights:
+  // 1024 values compared where the goldens compare 96, at a head count and a
+  // head_dim that differ from each other AND from the goldens'. It is also one
+  // of the two cases that catch a batch-history defect.
+  m3::DepthDecoderConfig config;
+  config.hidden_size = 64;
+  config.num_layers = 3;
+  config.num_attention_heads = 8;
+  config.intermediate_size = 96;
+  config.audio_vocab_size = 4;
+  config.num_codebooks = 8;
+  config.max_position_embeddings = 8;
+  const size_t hidden = static_cast<size_t>(config.hidden_size);
+  const size_t inter = static_cast<size_t>(config.intermediate_size);
+
+  // A cheap deterministic spread in [-1, 1); the values only have to be generic.
+  uint32_t state = 0x9E3779B9u;
+  const auto draw = [&state]() {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<double>(state >> 8) / 8388608.0 - 1.0);
+  };
+  const auto fill = [&draw](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = draw();
+    return v;
+  };
+
+  m3::DepthDecoderWeights weights;
+  weights.audio_embeddings = fill(
+      static_cast<size_t>(config.audio_vocab_size * config.residual_codebooks()) * hidden);
+  weights.projection = fill(hidden * hidden);
+  weights.pos_embedding = fill(static_cast<size_t>(config.max_position_embeddings) * hidden);
+  weights.norm = fill(hidden);
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    m3::DepthDecoderLayerWeights layer;
+    layer.input_layernorm = fill(hidden);
+    layer.post_attention_layernorm = fill(hidden);
+    layer.to_q = fill(hidden * hidden);
+    layer.to_k = fill(hidden * hidden);
+    layer.to_v = fill(hidden * hidden);
+    layer.to_out = fill(hidden * hidden);
+    layer.gate_proj = fill(inter * hidden);
+    layer.up_proj = fill(inter * hidden);
+    layer.down_proj = fill(hidden * inter);
+    weights.layers.push_back(std::move(layer));
+  }
+  for (int64_t h = 0; h < config.residual_codebooks(); ++h) {
+    weights.audio_heads.push_back(fill(static_cast<size_t>(config.audio_vocab_size) * hidden));
+  }
+
+  const int64_t positions = config.num_codebooks;
+  std::vector<float> rows[2];
+  rows[0] = fill(static_cast<size_t>(positions) * hidden);
+  rows[1] = rows[0];
+  for (size_t c = 0; c < hidden; ++c) rows[1][c] = draw();  // position 0 only, as CFG does
+
+  size_t compared = 0;
+  m3::DepthDecoderCache cache;
+  for (int64_t p = 0; p < positions; ++p) {
+    std::vector<float> batched;
+    batched.reserve(2 * hidden);
+    for (int row = 0; row < 2; ++row) {
+      batched.insert(batched.end(), rows[row].begin() + static_cast<int64_t>(hidden) * p,
+                     rows[row].begin() + static_cast<int64_t>(hidden) * (p + 1));
+    }
+    const std::vector<float> got = m3::DepthDecoderAppend(
+        batched, /*batch=*/2, config, weights, m3::ArCompute::kBFloat16, &cache);
+    for (int row = 0; row < 2; ++row) {
+      const std::vector<float> whole(rows[row].begin(),
+                                     rows[row].begin() + static_cast<int64_t>(hidden) * (p + 1));
+      const std::vector<float> want =
+          m3::DepthDecoderForward(whole, p + 1, config, weights, m3::ArCompute::kBFloat16);
+      compared += ExpectBitIdentical(
+          std::vector<float>(got.begin() + static_cast<int64_t>(hidden) * row,
+                             got.begin() + static_cast<int64_t>(hidden) * (row + 1)),
+          std::vector<float>(want.end() - static_cast<int64_t>(hidden), want.end()),
+          std::string("wide depth row ") + std::to_string(row) + " position " +
+              std::to_string(p));
+    }
+  }
+  MESSAGE("wide incremental depth: " << compared << " values compared BITWISE, "
+                                     << config.num_attention_heads << " heads of "
+                                     << config.head_dim() << " over " << positions
+                                     << " positions x 2 rows");
+}
+
+TEST_CASE("music3 ar: the incremental depth decode keeps its BATCH rows independent") {
+  // The two CFG branches share every appended row and differ ONLY at position 0
+  // (encoders.py:125-127), so a cache that mixed them would still return
+  // plausible numbers. Each batch row is compared against its OWN whole-sequence
+  // forward, which is the only comparison that can see the mixing.
+  const m3::DepthDecoderConfig config = DepthConfig();
+  const m3::DepthDecoderWeights weights = DepthWeights();
+  const size_t hidden = static_cast<size_t>(config.hidden_size);
+  const size_t count = static_cast<size_t>(config.max_position_embeddings) * hidden;
+  const std::vector<float> all_in = ToVector(vllm_test::kMusic3DepthBoundaryIn, count);
+  const int64_t positions = config.num_codebooks;  // the real schedule's depth
+
+  // Row 1's position 0 is a DIFFERENT vector; every later position is shared.
+  std::vector<float> shared[2];
+  shared[0].assign(all_in.begin(), all_in.begin() + static_cast<int64_t>(hidden) * positions);
+  shared[1] = shared[0];
+  for (size_t c = 0; c < hidden; ++c) {
+    shared[1][c] = -0.5f * all_in[c] + 0.25f;
+  }
+
+  m3::DepthDecoderCache cache;
+  std::vector<std::vector<float>> reference(2);
+  size_t compared = 0;
+  for (int64_t p = 0; p < positions; ++p) {
+    std::vector<float> batched;
+    batched.reserve(2 * hidden);
+    for (int row = 0; row < 2; ++row) {
+      batched.insert(batched.end(), shared[row].begin() + static_cast<int64_t>(hidden) * p,
+                     shared[row].begin() + static_cast<int64_t>(hidden) * (p + 1));
+    }
+    const std::vector<float> got = m3::DepthDecoderAppend(
+        batched, /*batch=*/2, config, weights, m3::ArCompute::kBFloat16, &cache);
+    REQUIRE(got.size() == 2 * hidden);
+    for (int row = 0; row < 2; ++row) {
+      const std::vector<float> whole(shared[row].begin(),
+                                     shared[row].begin() + static_cast<int64_t>(hidden) * (p + 1));
+      const std::vector<float> want_all =
+          m3::DepthDecoderForward(whole, p + 1, config, weights, m3::ArCompute::kBFloat16);
+      compared += ExpectBitIdentical(
+          std::vector<float>(got.begin() + static_cast<int64_t>(hidden) * row,
+                             got.begin() + static_cast<int64_t>(hidden) * (row + 1)),
+          std::vector<float>(want_all.end() - static_cast<int64_t>(hidden), want_all.end()),
+          std::string("batched depth row ") + std::to_string(row) + " position " +
+              std::to_string(p));
+    }
+  }
+  // The two rows must not have COLLAPSED into each other, or the check above
+  // would be satisfied by a cache that served row 0 to both.
+  const std::vector<float> last = m3::DepthDecoderAppend(
+      std::vector<float>(2 * hidden, 0.125f), /*batch=*/2, config, weights,
+      m3::ArCompute::kBFloat16, &cache);
+  size_t row_differences = 0;
+  for (size_t c = 0; c < hidden; ++c) {
+    if (std::memcmp(&last[c], &last[hidden + c], sizeof(float)) != 0) ++row_differences;
+  }
+  CHECK_MESSAGE(row_differences > 0,
+                "the two batch rows are identical, so nothing here could see them mixed");
+  MESSAGE("batched incremental depth: " << compared << " values compared BITWISE over "
+                                        << positions << " positions x 2 rows; "
+                                        << row_differences << " of " << hidden
+                                        << " components still separate the rows");
+}
+
+TEST_CASE("music3 ar: the incremental depth attention keeps its REDUCTION ORDER") {
+  // WHY THIS CASE EXISTS. Every accumulator either side of the comparison above
+  // is a `double` stored through a `float`, so a reassociated sum of well-scaled
+  // terms differs by ~2^-53 relative while the store rounds at 2^-24 and the
+  // narrowing swallows it — the recorded trap, one dtype up. The bit-identity
+  // case above therefore CANNOT see the attention's value sweep walk `j` the
+  // other way, and a gate that cannot see its own defect is not a gate.
+  //
+  // So this engineers the cancellation. A one-layer decoder with `to_q` and
+  // `to_k` zero makes every softmax weight exactly 1/seq, and an
+  // `input_layernorm` whose FIRST component is 2^60 makes positions 0 and 1
+  // carry +2^60 and -2^60 into `v` while every later position carries 0 there
+  // and O(1) elsewhere. Ascending `j` cancels the pair immediately and keeps the
+  // remainder exactly; any order that carries 2^60 through the remainder
+  // annihilates it, because the gap is 57 bits and a double has 53.
+  m3::DepthDecoderConfig config;
+  config.hidden_size = 8;
+  config.num_layers = 1;
+  config.num_attention_heads = 1;
+  config.intermediate_size = 8;
+  config.audio_vocab_size = 2;
+  config.num_codebooks = 4;
+  config.max_position_embeddings = 8;
+  const size_t hidden = static_cast<size_t>(config.hidden_size);
+
+  m3::DepthDecoderWeights weights;
+  weights.audio_embeddings.assign(
+      static_cast<size_t>(config.audio_vocab_size * config.residual_codebooks()) * hidden, 0.0f);
+  weights.projection.assign(hidden * hidden, 0.0f);
+  weights.pos_embedding.assign(
+      static_cast<size_t>(config.max_position_embeddings) * hidden, 0.0f);
+  weights.norm.assign(hidden, 1.0f);
+  m3::DepthDecoderLayerWeights layer;
+  layer.input_layernorm.assign(hidden, 1.0f);
+  layer.input_layernorm[0] = std::ldexp(1.0f, 60);
+  layer.post_attention_layernorm.assign(hidden, 1.0f);
+  layer.to_q.assign(hidden * hidden, 0.0f);
+  layer.to_k.assign(hidden * hidden, 0.0f);
+  layer.to_v.assign(hidden * hidden, 1.0f);
+  layer.to_out.assign(hidden * hidden, 0.0f);
+  for (size_t d = 0; d < hidden; ++d) layer.to_out[d * hidden + d] = 1.0f;
+  layer.gate_proj.assign(static_cast<size_t>(config.intermediate_size) * hidden, 0.0f);
+  layer.up_proj.assign(static_cast<size_t>(config.intermediate_size) * hidden, 0.0f);
+  layer.down_proj.assign(hidden * static_cast<size_t>(config.intermediate_size), 0.0f);
+  weights.layers.push_back(layer);
+  weights.audio_heads.assign(static_cast<size_t>(config.residual_codebooks()),
+                             std::vector<float>(static_cast<size_t>(config.audio_vocab_size) *
+                                                    hidden, 0.0f));
+
+  // Position 0 carries +1 in the amplified component, position 1 its exact
+  // negation, and every later position carries ZERO there so its `v` stays O(1).
+  const int64_t positions = 6;
+  std::vector<float> embeds(static_cast<size_t>(positions) * hidden, 1.0f);
+  for (size_t c = 0; c < hidden; ++c) embeds[hidden + c] = -embeds[c];
+  for (int64_t p = 2; p < positions; ++p) {
+    embeds[static_cast<size_t>(p) * hidden] = 0.0f;
+    for (size_t c = 1; c < hidden; ++c) {
+      embeds[static_cast<size_t>(p) * hidden + c] = 1.0f + 0.25f * static_cast<float>(p + c);
+    }
+  }
+
+  size_t compared = 0;
+  size_t nonzero = 0;
+  m3::DepthDecoderCache cache;
+  for (int64_t p = 0; p < positions; ++p) {
+    const std::vector<float> row(embeds.begin() + static_cast<int64_t>(hidden) * p,
+                                 embeds.begin() + static_cast<int64_t>(hidden) * (p + 1));
+    const std::vector<float> got =
+        m3::DepthDecoderAppend(row, /*batch=*/1, config, weights, m3::ArCompute::kFloat32, &cache);
+    const std::vector<float> whole(embeds.begin(),
+                                   embeds.begin() + static_cast<int64_t>(hidden) * (p + 1));
+    const std::vector<float> want =
+        m3::DepthDecoderForward(whole, p + 1, config, weights, m3::ArCompute::kFloat32);
+    compared += ExpectBitIdentical(
+        got, std::vector<float>(want.end() - static_cast<int64_t>(hidden), want.end()),
+        std::string("cancellation position ") + std::to_string(p));
+    if (p >= 2) {
+      for (const float value : got) {
+        if (value != 0.0f && std::isfinite(value)) ++nonzero;
+      }
+    }
+  }
+  // The teeth check. If the cancelled remainder were zero — or infinite — the
+  // case above would be satisfied by any order at all, and the whole apparatus
+  // would be vacuous while still printing green.
+  CHECK_MESSAGE(nonzero > 0,
+                "the cancelled remainder is zero or non-finite, so no order can be distinguished");
+  MESSAGE("cancellation case: " << compared << " values compared BITWISE, " << nonzero
+                                << " finite non-zero remainder components");
+}
+
+TEST_CASE("music3 ar: the incremental depth cache refuses what it cannot hold, by name") {
+  const m3::DepthDecoderConfig config = DepthConfig();
+  const m3::DepthDecoderWeights weights = DepthWeights();
+  const size_t hidden = static_cast<size_t>(config.hidden_size);
+  const std::vector<float> row(hidden, 0.5f);
+
+  m3::DepthDecoderCache cache;
+  CHECK_THROWS_AS(m3::DepthDecoderAppend(row, 1, config, weights, m3::ArCompute::kFloat32,
+                                         nullptr),
+                  std::runtime_error);
+  CHECK_THROWS_AS(m3::DepthDecoderAppend(row, 0, config, weights, m3::ArCompute::kFloat32,
+                                         &cache),
+                  std::runtime_error);
+  CHECK_THROWS_AS(m3::DepthDecoderAppend(std::vector<float>(hidden + 1, 0.5f), 1, config, weights,
+                                         m3::ArCompute::kFloat32, &cache),
+                  std::runtime_error);
+  // A cache opened at batch 1 may not be continued at batch 2: the K/V blocks
+  // for the second row do not exist and a silent resize would serve row 0's
+  // history to it.
+  m3::DepthDecoderAppend(row, 1, config, weights, m3::ArCompute::kFloat32, &cache);
+  CHECK(cache.positions == 1);
+  CHECK_THROWS_AS(m3::DepthDecoderAppend(std::vector<float>(2 * hidden, 0.5f), 2, config, weights,
+                                         m3::ArCompute::kFloat32, &cache),
+                  std::runtime_error);
+  // The learned position table is the ceiling, exactly as it is for the
+  // whole-sequence forward.
+  for (int64_t p = 1; p < config.max_position_embeddings; ++p) {
+    m3::DepthDecoderAppend(row, 1, config, weights, m3::ArCompute::kFloat32, &cache);
+  }
+  CHECK(cache.positions == config.max_position_embeddings);
+  CHECK_THROWS_AS(m3::DepthDecoderAppend(row, 1, config, weights, m3::ArCompute::kFloat32, &cache),
+                  std::runtime_error);
+}
+
+TEST_CASE("music3 ar: the COMPOSED depth stage is BIT-IDENTICAL to the schedule it replaced") {
+  // WHY THIS CASE EXISTS, and why the four above do not cover it. Those gate
+  // `DepthDecoderAppend` — ONE row against ONE whole-sequence forward. They say
+  // nothing about the SCHEDULE `Music3DepthStage` composes out of it: the 3-row
+  // prefix projection, position 0 fed for its K/V alone, the batch-2 call
+  // sequencing, and the fed-back `(index-1) * audio_vocab_size + drawn`
+  // projection row. Silently dropping the feedback row changes the generated
+  // song and leaves every other case in this file GREEN, and so does deleting
+  // the prefix append; both were measured, not supposed (#1246).
+  //
+  // So this drives the PRODUCTION function — `Music3DepthStage`, the one
+  // `Music3GenerateFrameHiddens` calls, which is how the registered speech
+  // family reaches this row's change — against a TRANSCRIPTION of the
+  // whole-sequence schedule it replaced (`DepthSequenceEmbeds` +
+  // `DepthDecoderForward` per CFG branch, encoders.py:117-142), with the same
+  // sampler, the same weights and the same order of draws. No checkpoint: this
+  // path reads `lm_config.hidden_size` and the embedding rows `EmbedRow`
+  // serves, and nothing else.
+  //
+  // The geometry is WIDER than any committed golden — 8 heads of 8, the full
+  // 8-codebook schedule, a 32-entry audio vocabulary — so the head stride, all
+  // seven steps and the feedback row index are exercised together.
+  m3::DepthDecoderConfig config;
+  config.hidden_size = 64;
+  config.num_layers = 2;
+  config.num_attention_heads = 8;
+  config.intermediate_size = 96;
+  config.audio_vocab_size = 32;
+  config.num_codebooks = 8;
+  config.max_position_embeddings = 16;
+  const int64_t H = config.hidden_size;
+  const size_t hidden = static_cast<size_t>(H);
+  const size_t inter = static_cast<size_t>(config.intermediate_size);
+
+  uint32_t state = 0x9E3779B9u;
+  const auto draw = [&state]() {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<double>(state >> 8) / 8388608.0 - 1.0) * 0.5f;
+  };
+  const auto fill = [&draw](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = draw();
+    return v;
+  };
+
+  m3::DepthDecoderWeights depth;
+  depth.audio_embeddings =
+      fill(static_cast<size_t>(config.audio_vocab_size * config.residual_codebooks()) * hidden);
+  depth.projection = fill(hidden * hidden);
+  depth.pos_embedding = fill(static_cast<size_t>(config.max_position_embeddings) * hidden);
+  depth.norm = fill(hidden);
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    m3::DepthDecoderLayerWeights layer;
+    layer.input_layernorm = fill(hidden);
+    layer.post_attention_layernorm = fill(hidden);
+    layer.to_q = fill(hidden * hidden);
+    layer.to_k = fill(hidden * hidden);
+    layer.to_v = fill(hidden * hidden);
+    layer.to_out = fill(hidden * hidden);
+    layer.gate_proj = fill(inter * hidden);
+    layer.up_proj = fill(inter * hidden);
+    layer.down_proj = fill(hidden * inter);
+    depth.layers.push_back(std::move(layer));
+  }
+  for (int64_t h = 0; h < config.residual_codebooks(); ++h) {
+    depth.audio_heads.push_back(fill(static_cast<size_t>(config.audio_vocab_size) * hidden));
+  }
+
+  m3::Music3ArWeights weights;
+  weights.depth_config = config;
+  weights.depth = depth;
+  weights.lm_config.hidden_size = H;
+  const int64_t vocab = m3::kAudioCodeOffset + 64;
+  weights.lm_config.vocab_size = vocab;
+  {
+    // bf16 rows, because `EmbedRow` reads the table as the loader stores it. Only
+    // the audio-code window can be reached from here, so only it is filled.
+    std::vector<uint8_t> bytes(static_cast<size_t>(vocab) * hidden * sizeof(uint16_t), 0);
+    uint16_t* const rows = reinterpret_cast<uint16_t*>(bytes.data());
+    for (int64_t t = m3::kAudioCodeOffset; t < vocab; ++t) {
+      for (int64_t j = 0; j < H; ++j) rows[t * H + j] = vt::F32ToBF16(draw());
+    }
+    weights.lm.embed_tokens.bytes = vllm::OwnedBytes(std::move(bytes));
+    weights.lm.embed_tokens.dtype = vt::DType::kBF16;
+    weights.lm.embed_tokens.rank = 2;
+    weights.lm.embed_tokens.shape[0] = vocab;
+    weights.lm.embed_tokens.shape[1] = H;
+  }
+
+  const int32_t semantic_code = 7;
+  const int64_t frame_index = 3;
+  // DISTINCT per branch, which is the whole of what the unconditional row
+  // contributes: two equal rows would hide a schedule that served one to both.
+  const std::vector<float> last_conditional = fill(hidden);
+  const std::vector<float> last_unconditional = fill(hidden);
+
+  // A sampler keyed on the LOGITS rather than on the call order: argmax, ties to
+  // the lowest index. The two schedules agree on a drawn code only if they ask
+  // the same question, in the same order, from the same hidden state.
+  int64_t calls_new = 0;
+  int64_t calls_old = 0;
+  const auto make_sampler = [](int64_t* counter) {
+    return m3::Music3CodeSampler(
+        [counter](const std::vector<float>& probs, const m3::Music3Draw&) -> int64_t {
+          ++*counter;
+          size_t best = 0;
+          for (size_t i = 1; i < probs.size(); ++i) {
+            if (probs[i] > probs[best]) best = i;
+          }
+          return static_cast<int64_t>(best);
+        });
+  };
+
+  std::vector<int32_t> codes_new{semantic_code};
+  const std::vector<float> got =
+      m3::Music3DepthStage(last_conditional, last_unconditional, frame_index, weights,
+                           make_sampler(&calls_new), &codes_new);
+
+  const std::vector<float> semantic_embed =
+      weights.EmbedRow(static_cast<int64_t>(semantic_code) + m3::kAudioCodeOffset);
+  std::vector<float> want;
+  std::vector<int32_t> codes_old{semantic_code};
+  std::vector<int32_t> fed_back;
+  const m3::Music3CodeSampler sampler_old = make_sampler(&calls_old);
+  for (int64_t index = 1; index < config.num_codebooks; ++index) {
+    std::vector<float> hidden_rows[2];
+    for (int row = 0; row < 2; ++row) {
+      const std::vector<float>& last = row == 0 ? last_conditional : last_unconditional;
+      const std::vector<float> embeds = m3::DepthSequenceEmbeds(
+          last, semantic_embed, fed_back, config, depth, m3::ArCompute::kBFloat16);
+      const std::vector<float> states = m3::DepthDecoderForward(
+          embeds, /*seq_len=*/index + 1, config, depth, m3::ArCompute::kBFloat16);
+      hidden_rows[row].assign(states.end() - H, states.end());
+    }
+    // `hidden_parts.append(hidden[:1])` — the CONDITIONAL row alone.
+    want.insert(want.end(), hidden_rows[0].begin(), hidden_rows[0].end());
+    const std::vector<float> conditional =
+        m3::AudioHeadLogits(hidden_rows[0], index - 1, config, depth, m3::ArCompute::kBFloat16);
+    const std::vector<float> unconditional =
+        m3::AudioHeadLogits(hidden_rows[1], index - 1, config, depth, m3::ArCompute::kBFloat16);
+    const std::vector<float> guided =
+        m3::GuidedDepthLogits(conditional, unconditional, m3::kArCfgScale);
+    const std::vector<float> probs = m3::TopKProbabilities(guided, m3::kArSamplingTopK);
+    const int64_t drawn = sampler_old(probs, m3::Music3Draw{frame_index, index});
+    codes_old.push_back(static_cast<int32_t>(drawn));
+    // c7 is only ever PREDICTED (encoders.py:139).
+    if (index < config.num_codebooks - 1) fed_back.push_back(static_cast<int32_t>(drawn));
+  }
+
+  const size_t compared =
+      ExpectBitIdentical(got, want, "composed depth stage, conditional hidden rows");
+  CHECK_MESSAGE(codes_new == codes_old, "the two schedules drew different residual codes");
+  CHECK(calls_new == calls_old);
+  CHECK(calls_new == config.residual_codebooks());
+  CHECK(static_cast<int64_t>(codes_new.size()) == config.num_codebooks);
+  CHECK(codes_new[0] == semantic_code);
+  // The teeth, twice over. An all-zero reference block would satisfy the
+  // comparison while proving nothing, and a stage that drew nothing would
+  // satisfy the code check the same way.
+  size_t nonzero = 0;
+  for (const float value : want) {
+    if (value != 0.0f) ++nonzero;
+  }
+  CHECK_MESSAGE(nonzero > 0, "the reference block is all zeros, so nothing here is comparable");
+  CHECK_MESSAGE(calls_new > 0, "no code was drawn, so the draw order is untested");
+  MESSAGE("composed depth stage: " << compared << " values compared BITWISE over "
+                                   << config.residual_codebooks() << " codebook steps x 2 CFG rows, "
+                                   << nonzero << " of " << want.size()
+                                   << " reference values non-zero, " << calls_new << " draws");
 }
 
 TEST_CASE("music3 ar: the audio heads match upstream, one per residual codebook") {

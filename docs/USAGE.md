@@ -524,6 +524,33 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
+### Block-wise FP8 is refused at load
+
+This build reads per-tensor FP8, where one scale covers a whole weight. It does
+not read block-wise FP8, also called fine-grained FP8, where one scale covers
+each 128x128 block of the weight. A block-wise checkpoint declares
+`quantization_config.weight_block_size` in its `config.json`, and it stores its
+scales under `weight_scale_inv` rather than under `weight_scale`.
+
+`Qwen/Qwen3.8-27B-FP8` is such a checkpoint. At revision
+`017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` it declares `weight_block_size`
+`[128, 128]` with `activation_scheme` `dynamic`, and it stores
+`self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
+`self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
+
+Loading it stops with a message that names the key:
+
+```text
+quantization_config.weight_block_size [128, 128] selects block-wise
+(fine-grained) FP8, which is not implemented. This build implements per-tensor
+FP8 only.
+```
+
+The refusal is deliberate. Nothing is wrong with that checkpoint, and the
+missing arm is in this project. To run the same model here, use a per-tensor
+FP8, BF16, NVFP4, or GGUF checkpoint of it. Issue
+[#1166](https://github.com/mudler/vllm.cpp/issues/1166) tracks the port.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are

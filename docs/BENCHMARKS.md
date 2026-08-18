@@ -272,7 +272,7 @@ Qwen3.6-27B NVFP4, GB10, whole serving window.
 | Peak `MemAvailable` drop | 68.35 GiB | 80.66 GiB | 1.180x | **PASS** |
 | Weight offload, resident device bytes (`ENG-WEIGHT-OFFLOAD` W6) | not measured | not measured | n/a | **BLOCKED**, not pending: unmeasurable on every host we own (GB10 shares one pool, so `cpu_offload_gb` frees nothing). Needs a discrete-GPU rig ([record](../.agents/benchmark-record.md)) |
 | Disk residency via `--offload-config` (`ENG-RESIDENCY-CONFIG`, [#1110](https://github.com/mudler/vllm.cpp/issues/1110)) | not measured | n/a (no disk tier upstream) | n/a | **PENDING** a GB10 run. The row changes no kernel, dtype or allocation, so it claims no throughput axis; the 370 GiB reproduction through the JSON form is owed ([spec](../.agents/specs/weight-residency-config.md)) |
-| Decode-graph executables, `VT_CUDA_GRAPH_DEDUP` on vs off (`ENG-CUDAGRAPH-DEDUP`) | not measured | n/a | n/a | **PENDING**, not blocked: needs a leased CUDA box for the same-binary A/B (token-identity first, then the exec-count ratio) ([spec](../.agents/specs/eng-cudagraph-dedup.md)) |
+| Decode-graph executables, `VT_CUDA_GRAPH_DEDUP` on vs off (`ENG-CUDAGRAPH-DEDUP`, [#1226](https://github.com/mudler/vllm.cpp/issues/1226)) | 3 execs / 3 captures; 2/2; 2/2 | n/a | 1.00x | **MEASURED, NEGATIVE**: GB10, 10/10 token-byte-identical, #1184 gone; N==M, the key carries the padded batch dim so buckets never fold. No speed/memory number ([record](../.agents/benchmark-record.md)) |
 
 35B steady-serving PSS is 3.53 GiB against vLLM's 13.3 GiB after the routed-expert
 host mirror is freed once the device Marlin resident is built.

@@ -262,7 +262,13 @@ MATRICES = {
     # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
     # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
     # the broad CPU-backend row.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
+    # 52 since 2026-08-18 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
+    # output-only GDN decode. A genuinely new family, not a variant of the packed
+    # decode row: it changes WHEN the state is written (every L steps, from a ring
+    # of rank-1 factors) rather than how one step is tiled, and it adds three cache
+    # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
+    # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

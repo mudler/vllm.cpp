@@ -12,6 +12,7 @@
 // rather than a fixed in-file array.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/weight_offloader.h"
 
 #include <algorithm>
@@ -322,6 +323,24 @@ ModelRegistry::OutOfTreeSupportedModels() {
 std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
                                                  const ModelSource& source) {
   const ModelRegistration& registration = Resolve(config);
+  // FIX-FP8-BLOCKWISE-REFUSAL (#1166): a block-wise (fine-grained) FP8
+  // checkpoint is refused BY NAME here, before any weight loader runs.
+  //
+  // AFTER `Resolve`, so an unsupported architecture still reports the
+  // architecture rather than its quantization. BEFORE `load_weights`, because
+  // that is what makes the message about the missing ARM instead of about the
+  // first tensor whose name does not resolve: the dense loader branches on the
+  // weight dtype alone and pulls a block-wise projection into the per-tensor
+  // arm, which then asks for a `weight_scale` a block-wise checkpoint spells
+  // `weight_scale_inv` and dies on `tensor not found`.
+  //
+  // Sited on the registry rather than per model loader on purpose.
+  // `weight_block_size` is a property of the checkpoint's quantization config
+  // and not of one architecture, so a per-loader refusal would have to be
+  // written again for every architecture and would be missing from whichever
+  // one is added next. This also covers the GGUF arm, which reaches this
+  // function too and where the key is simply absent.
+  RefuseUnsupportedFp8BlockQuant(config);
   const ModelFactory& factory = *registration.factory;
   factory.parse_config(config);
   std::unique_ptr<LoadedModel> model =

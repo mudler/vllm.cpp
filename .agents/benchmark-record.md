@@ -22765,3 +22765,198 @@ verdict above therefore rests on the recorded reading, and the only way to
 re-derive it is to re-run the committed source under the recipe above on a leased
 GPU. Nothing here was re-run for this record: the repair pass that added it had
 no GPU lease.
+
+## ENG-CUDAGRAPH-DEDUP W4 — the device A/B: correctness PASSES, and the fold NEVER HAPPENS (2026-08-18, `row/ENG-CUDAGRAPH-DEDUP-RESULT`, gated commit `72de552c8`, GB10 sm_121a, #1162 / #1184 / #1226)
+
+**No throughput or memory number is recorded, on any axis, and none is owed.** Two
+independent reasons and either alone is sufficient: the clocks were not pinned, and the
+`VT_CUDA_GRAPH_DEDUP=1` arm allocated exactly as many graph executables as the OFF arm,
+so there is no memory delta to claim. The `replay branch avg` figures in the cell logs
+(0.033-0.120 ms/step) are diagnostics, not a measurement. This row was never a
+throughput row; its load-bearing gate is byte-identity, and its headline number is an
+executable count.
+
+### The commit that was gated is NOT the commit that landed
+
+`72de552c8` was built and run. The merge is `2a976eb9f`, and the row squashed, so the
+gated tree is not an ancestor of it. What carries the claim across that gap is a content
+equality that was checked rather than assumed: all four dedup sources — `src/vt/graph_dedup.h`,
+`src/vt/graph_dedup_runtime.h`, `src/vt/graph_dedup_latch.h` and
+`src/vt/graph_dedup_signature.h` — are **byte-identical** at the two commits. The merge
+commit itself was not executed, and this record does not claim it was.
+
+### Environment
+
+Device `dgx:gpu0`, leased through `rc`, job `f88d484b`, never ssh. Worker pod
+`rc-worker-4b8lj`, aarch64, root, 20 cores. boot_id
+`1cf6179f-0150-4052-b507-506fd6751953` for the build and every cell. GPU NVIDIA GB10,
+driver `580.173.02`, `clocks.sm` 208 MHz idle / 3003 MHz max, `applications.graphics`
+2418 MHz, persistence Disabled. **Clocks NOT pinned.** loadavg `1.82 3.22 4.07` at
+series start and `2.88 3.98 3.98` at series end, per-cell range 2.94-3.45; the box was
+quiet at both ends.
+
+**The in-pod toolkit CHANGED under us between the two attempts.**
+`/usr/local/cuda/bin/nvcc` measured **CUDA 13.0.88** here and **13.3.73** on the same
+pod and the same boot at the first attempt, because a neighbouring session held the box
+for about two hours immediately before with a job named `oracle-build130`. The toolkit
+is a property of the shared pod, not of the job. 13.0.88 is the version the recorded dgx
+gate stack names. The lesson generalizes past this row: a job that needs a known toolkit
+must ASSERT it, not assume it. This one recorded it.
+
+Runtime cuBLASLt was the staged cu130 `/tmp/tsite/nvidia/cu13/lib/libcublasLt.so.13`
+(629,945,952 bytes), selected by a smoke probe (rc=0, 0 cuBLAS errors, a graph
+captured). **Honest gap:** the probe tried that prefix FIRST and it worked, so the
+container's own cuBLASLt was never re-tested at 13.0. The reason the shim existed — a
+13.6.0.2 cuBLASLt that could not capture — may no longer apply.
+
+### Build recipe
+
+```sh
+cmake -S /tmp/dedup72/src -B /tmp/dedup72/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DVLLM_CPP_CUTLASS_DIR=/tmp/dedup72/cutlass -DVLLM_CPP_TRITON=ON \
+  -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON
+ninja -C /tmp/dedup72/build -j 4 vllm-bench
+```
+
+`rc=0`. All four mandatory production-stack assertions present in the configure log:
+`CUTLASS found … enabling sm120a NVFP4 cutlass GEMM`; `FlashAttention-2
+prefill/decode: ENABLED for arch(es) [121a]`; `Triton AOT: gdn_deltah_h48 <- sm_121a`;
+`VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a`. Built on local disk, never the NAS.
+
+| Artifact | sha256 |
+|---|---|
+| `vllm-bench` binary, copied out of the build tree | `e166ed8d7b39ff131bf832bdef0c3ddb26b0e38ea7cddf3eedb54e7d417666fb` |
+| model `model.safetensors`, Qwen3ForCausalLM 0.6B bf16 | `11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641` |
+| source tar `src-72de552c8.tar` | `5e940df5bd94edd94da19048b8c864e697b100971f3fe91c9c35edda337ce62f` |
+
+Evidence directory `/mnt/nas_share/rc/dedup-gate2/` — `EVIDENCE.md`, `logs-ab/`,
+`out-ab/`, `build72.sh`, `run72.sh`, `probe_orin.sh`.
+
+### Method, and the knob the FIRST attempt got wrong
+
+One binary in every cell. The only variable is `VT_CUDA_GRAPH_DEDUP`.
+`VT_ASYNC_RUNNER=0` in every cell, and that is THE knob: `qwen3.cpp`
+`DenseDecodeGraphForward` declines the graph while `input.device_token_ids != nullptr`
+(the #323 mitigation), and that pointer is owned by the async RUNNER, not by
+`VT_ASYNC_SCHED`. The first attempt's runs 1-2 were VOID because they used the wrong
+knob and captured no graph at all. `VT_DECODE_GRAPH_STATS=1` throughout. The compared
+artifact is `--output-token-ids`, the generated identifiers per request index — a real
+byte artifact, not a summary statistic and not an exit code.
+
+**Multi-bucket design, which the first attempt lacked.** Buckets come from
+`vllm::DecodeGraphSizes(max_num_seqs)`; `examples/bench` sets `max_num_seqs =
+--concurrency` and refills to `concurrency` each poll, so the shapes seen are `pad(C)`
+and `pad(N mod C)`. Workload A "drain" C=24 N=24 in=64 out=40 seed=4242 captured
+24/16/8; B "tail" C=16 N=21 out=32 seed=777 captured 16/8; C "tail2" C=32 N=49 out=24
+seed=31337 captured 32/24. The first attempt captured ONE size in every cell, so its 1:1
+ratio measured nothing.
+
+### The 12 cells
+
+| cell | DEDUP | exit | dedup final line | sizes | replays | ids sha256 |
+|---|---|---|---|---|---|---|
+| a_off_a | unset | 0 | (none) | 24 16 8 | 33 | `d3b7028b…` |
+| a_off_b | unset | 0 | (none) | 24 16 8 | 33 | `d3b7028b…` |
+| a_on_a | 1 | 0 | captured 3 graphs, deduped to 3 execs | 24 16 8 | 33 | `d3b7028b…` |
+| a_on_b | 1 | 0 | captured 3 graphs, deduped to 3 execs | 24 16 8 | 33 | `d3b7028b…` |
+| a_zero | 0 | 0 | (none) | 24 16 8 | 33 | `d3b7028b…` |
+| b_off_a | unset | 0 | (none) | 16 8 | 60 | `02a1add6…` |
+| b_off_b | unset | 0 | (none) | 16 8 | 60 | `02a1add6…` |
+| b_on_a | 1 | 0 | captured 2 graphs, deduped to 2 execs | 16 8 | 60 | `02a1add6…` |
+| b_on_b | 1 | 0 | captured 2 graphs, deduped to 2 execs | 16 8 | 60 | `02a1add6…` |
+| c_off_a | unset | 0 | (none) | 32 24 | 43 | `4f8714db…` |
+| c_on_a | 1 | 0 | captured 2 graphs, deduped to 2 execs | 32 24 | 43 | `4f8714db…` |
+| c_off_b | unset | 0 | (none) | 32 24 | 43 | `4f8714db…` |
+
+Every cell: successful requests = N, `empty_rows` 0, token counts 960 / 672 / 1176.
+
+### Result 1 — #1184 is FIXED, on the device
+
+All 12 cells exit 0. `grep -c "invalid device function"` and `grep -c "engine-fatal"`
+return **zero** in every cell log. On the pre-fix head `e4ce5571a` every `dedup=1` cell
+died after exactly one replay. The ON arms now replay as often as the OFF arms: **60 =
+60** on B, **33 = 33** on A, **43 = 43** on C. A CPU suite drives a fake runtime and
+cannot observe the real latched error, so this run is what closes the issue, not the
+suite that proved the guard's structure.
+
+### Result 2 — byte-identity, 10/10, controls first
+
+```text
+-- OFF/OFF controls, which must pass before any OFF-vs-ON comparison means anything
+IDENTICAL  a_off_a == a_off_b        IDENTICAL  b_off_a == b_off_b
+IDENTICAL  c_off_a == c_off_b
+-- OFF vs ON
+IDENTICAL  a_off_a == a_on_a         IDENTICAL  a_off_a == a_on_b
+IDENTICAL  a_on_a  == a_on_b         IDENTICAL  a_off_a == a_zero
+IDENTICAL  b_off_a == b_on_a         IDENTICAL  b_off_a == b_on_b
+IDENTICAL  c_off_a == c_on_a
+```
+
+The three workloads hash to three DIFFERENT values, so the identity is not the vacuous
+kind a constant artifact would produce.
+
+### Result 3 — THE NEGATIVE: the fold never happens, and the cause is structural
+
+`N == M` in every ON cell, now with 2 and 3 *distinct* padded buckets per process:
+
+```text
+a_on_a / a_on_b: captured 3 graphs, deduped to 3 execs   sizes=[24 16 8]
+b_on_a / b_on_b: captured 2 graphs, deduped to 2 execs   sizes=[16 8]
+c_on_a:          captured 2 graphs, deduped to 2 execs   sizes=[32 24]
+```
+
+The registry logs one line per registration and the count CLIMBS — `1 -> 1`, `2 -> 2`,
+`3 -> 3` — which is the proof that more than one capture reached it. This was
+pre-registered in `EVIDENCE.md` BEFORE the run rather than reasoned backwards from it:
+`AppendKernelPayload` hashes `(func, gridDim.{x,y,z}, blockDim.{x,y,z}, sharedMemBytes)`
+(`src/vt/graph_dedup_runtime.h:121-128`) and the memcpy payload hashes the copy extent.
+The padded batch dimension is in BOTH, so two decode buckets never share a key, no
+candidate group forms, and `cudaGraphExecUpdate` is **never attempted**.
+
+**This refutes the row's own premise.** `graph_dedup.h`'s header comment says the fold
+exists because "the decode graphs of two padded batch sizes are usually the same node
+topology with different parameters", and the signature as written cannot group exactly
+those. SGLang hashes the same fields (`cuda_graph_dedup_mixin.py:105-114`), so whatever
+folds upstream is not decode buckets either. The machinery is correct and does nothing
+on the workload it was built for. `VT_CUDA_GRAPH_DEDUP` therefore stays OFF: a default
+is a measurement, and this measurement does not support one.
+
+**The next traceable hypothesis, filed rather than decided** ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)):
+a coarser key that keeps the function addresses and the topology but drops the launch
+dimensions and the memcpy extents would let two padded buckets form a candidate group at
+all. The probe-before-fold design means such a key costs one wasted `cudaGraphExecUpdate`
+probe and a private executable when the driver refuses, rather than a wrong replay, so it
+is a cost question and not an obviously unsafe one. "Unreachable with THIS key" is not
+"unreachable", and nothing here declares a ceiling.
+
+### Honest gaps a reviewer must weigh
+
+- **Per-shape replay counts are unavailable.** The driver prints a TOTAL only. Workload
+  B's ~30 replays per shape is arithmetic over that total (60 replays, 2 captured
+  shapes, a 16-request wave then a 5-request wave each decoding 31 steps). Stated as
+  arithmetic, not as a measurement. The ON and OFF arms report the SAME totals.
+- **The driver's "N captured size(s)" figure counts SLOTS, not captures.** Workload A
+  reports 6 sizes and emits only 3 `captured dense decode graph for padded size S=`
+  lines, because the smallest buckets appeared for too few steps to pass warm-up.
+- **The container's own cuBLASLt was never re-tested at CUDA 13.0**, as recorded above.
+- **Only the Qwen3 dense decode driver was exercised.** Whether any other capture site,
+  or two models sharing the process-singleton registry, can produce a fold is untested.
+- **The model is a Qwen3ForCausalLM 0.6B derivative from the NAS**, not a SACRED gate
+  checkpoint.
+- **The merge commit `2a976eb9f` was not run**; `72de552c8` was, with the four dedup
+  sources verified byte-identical between them.
+
+### The supporting `orin:gpu0` lane — BLOCKED, cleanly
+
+Two `rc run` jobs on `orin:gpu0`. Job 1 exited `FATAL_NO_CUDA_PKG` because the script
+hardcoded the ubuntu2404 suite without checking. Job 2 measured the worker properly:
+Ubuntu 24.04.4, root, 12 cores, 29 GiB, `gcc`/`g++`/`cmake`/`ninja`/`git`/`python3`/`curl`
+present, `/workspace` a LOCAL 1.8T disk and not the NAS, driver "NVIDIA UNIX Open Kernel
+Module for aarch64 540.4.0", `/dev/nvidia0` present, `nvcc` 13.0 V13.0.88 present. The
+CUDA smoke then failed: `cudaGetDeviceCount err=35 CUDA driver version is insufficient
+for CUDA runtime version`. The Jetson 540.4.0 driver cannot run a CUDA 13 runtime. The
+untried route is a CUDA 12.x toolkit for that driver; it was not pursued, because the
+dgx gate had already answered the question orin was there to support. No lease held;
+`orin:gpu0` returned to ready.

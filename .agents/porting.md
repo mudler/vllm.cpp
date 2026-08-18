@@ -45,6 +45,27 @@ Anything genuinely written from scratch is recorded as such in
 [`porting-inventory.md`](porting-inventory.md) §9. "I couldn't find it upstream"
 is a search result, not a conclusion — say which paths you searched.
 
+### Name the symbol, not only the line
+
+A line number is a coordinate into a moving file, so it decays. Write
+`` `path/to/file.cpp::SymbolName` `` whenever a citation crosses a file
+boundary. Keep the line number beside it only while you are reading; a citation
+that has to survive somebody else's edit carries the symbol.
+
+`src/vllm/entrypoints/model_loader.cpp` is the measured case
+([#1143](https://github.com/mudler/vllm.cpp/issues/1143)): cited by line from
+109 sites in 45 files, and one 45-line insertion near its top moved 203 of those
+references at once, in files that change never opened. The same defect at
+upstream scale is [#1139](https://github.com/mudler/vllm.cpp/issues/1139), where
+a pin advance left three `vllm/v1/worker/**` line anchors pointing at unrelated
+code and two of them had already been copied elsewhere.
+
+`scripts/check-symbol-anchors.py` gates the in-repo half of the convention: the
+symbol a citation names must still be in the file it names. `--upstream-root
+<vllm-checkout>` runs the same question against the pinned oracle, which CI
+cannot do because it has no checkout. Design, limits, and what the two runs
+measured: [`specs/citation-anchor-freshness.md`](specs/citation-anchor-freshness.md).
+
 ## Mirror the memory format, not just the math
 
 **A token-exactness gate cannot catch a dtype that is too WIDE.** F32 where

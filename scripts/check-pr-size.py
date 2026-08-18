@@ -317,6 +317,12 @@ CREATION_MUTATIONS = {
     # reduced one.
     "scripts/check-container-matrix.py": DISABLED_CREATION_CHECKER,
     "scripts/check-container-workflow.py": DISABLED_CREATION_CHECKER,
+    # GATE-SYMBOL-ANCHORS (#1143). Created here, so there is no BASE version to
+    # mutate. The empty stub exits 0 and prints nothing, which fails 20 of the
+    # 21 cases in tests/scripts/test_check_symbol_anchors.py -- including the
+    # clean-tree case, which asserts a checked count at or above the recorded
+    # floor and so cannot be satisfied by silence.
+    "scripts/check-symbol-anchors.py": DISABLED_CREATION_CHECKER,
     # 2026-08-16: the CUDA arch-gate registration guard (#960). Created in the
     # same PR, so there is no BASE version to mutate; its own suite loads the
     # checker as a module and calls into it, so the disabled stub fails at import

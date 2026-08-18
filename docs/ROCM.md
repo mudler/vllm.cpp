@@ -9,8 +9,11 @@ Gemma-3-1B-it is 48/48 token-identical to two independent vLLM-ROCm oracles;
 Qwen3-0.6B exposed a deterministic cross-version near-tie. Qwen3.5-0.8B also
 runs all-native through the GDN stack, but its CPU/ROCm divergence is still an
 open correctness gap. The Gemma-4 FP8 MoE and SharedK-WMMA path has contributor
-runtime evidence on 2x R9700; this repository has only CPU link coverage for
-that path, and no matched oracle performance result.
+runtime evidence on 2x R9700 (KEEP fair ~2014 t/s @~11k / ~1099 @~42k,
+`PREFIX_CACHE=0`; decode ~55 t/s). This repository has only CPU link coverage
+for that path, and no matched vLLM-ROCm oracle performance result. Vulkan Q8
+prefill on the same box is faster (~3503 / ~2714); the ROCm path is the
+reliable recipe, not that bar.
 
 This page exists because several people offered hardware in
 [issue #41](https://github.com/mudler/vllm.cpp/issues/41), and it answers the

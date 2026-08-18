@@ -45,3 +45,67 @@ the sentinel band and the case fails; with it restored, green.
   reduction, gated the same way.
 - `VT_ROCM_SKINNY=0` remains the A/B rollback; the allowlist carries it once,
   in main's re-sorted layout.
+
+## Issue #1183 repair
+
+[Issue #1183](https://github.com/mudler/vllm.cpp/issues/1183) found that the
+architecture guard cached the first device's architecture for the process.
+
+### Diagnosis
+
+`SkinnyGemmArchOk(int device_index)` stored `DeviceArchName(device_index)` in a
+function-static string. A gfx11 call initialized that string as eligible. A
+later gfx9 or unknown device then reused the gfx11 result and could reach the
+wave32-only kernel. The four devices on the repair host are gfx1100, so the
+test uses a controlled resolver instead of claiming heterogeneous hardware.
+
+### Decision
+
+The production call and the test now use the same HIP-free predicate. A
+per-thread vector keys each result by resolver and device index. The first call
+for a key resolves and parses the architecture. Later calls read one boolean
+without a HIP query or a process-wide mutex. The resolver key prevents the test
+resolver from contaminating a production result in the same process.
+
+The guard continues to accept only gfx11 and gfx12. It refuses gfx9 and every
+unknown architecture. The shape, dtype, rollback, fallback, and GetBlas rules
+remain unchanged.
+
+### Rejected alternatives
+
+- A single first-device value repeats the defect and is unsafe after a device
+  hop.
+- An uncached `DeviceArchName` call adds a HIP property query to every skinny
+  GEMM dispatch.
+- A process-wide keyed map needs synchronization on the decode path.
+
+### Evidence
+
+The test-only refactor first preserved the faulty cache. This command compiled
+the production predicate and its deterministic device-hop test:
+
+```sh
+env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib flock /home/vikash/gpu.lock cmake --build build-hip --target test_rocm_arch -j2
+```
+
+The build exited 0. The next command exited 1 before the fix:
+
+```sh
+env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib flock /home/vikash/gpu.lock build-hip/tests/test_rocm_arch '--test-case=skinny GEMM architecture eligibility follows device hops'
+```
+
+The gfx9 and unknown checks received `true`. Resolver counts were `{1,0,0,0}`
+instead of `{1,1,1,1}`. After the keyed cache change, the same test passed 1 of
+1 cases and 6 of 6 assertions with exit 0.
+
+The mutation replaced the keyed cache call with one function-static resolved
+architecture. The build exited 0, and the same focused test exited 1 with the
+same three assertion failures. After restoration, SHA-256 values for the
+header, production caller, and test matched their pre-mutation values. A fresh
+rebuild and focused run then passed 1 of 1 cases and 6 of 6 assertions.
+
+### Outcome
+
+Architecture eligibility follows the requested device on every device-hop
+sequence. A repeated key does not query the resolver again. The gfx9 wave64 arm
+remains refused and owed as recorded in `## Boundaries`.

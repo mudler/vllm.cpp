@@ -2184,7 +2184,9 @@ a stop token early.
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
 | `--block-size N` | `32` | KV block size |
-| `--num-blocks N` | `256` | KV blocks |
+| `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |
+| `--kv-cache-memory BYTES` | `0` (unset) | Absolute KV-pool size in bytes, vLLM's `kv_cache_memory_bytes`. The block count is this budget divided by the model's own bytes per block, summed across its KV groups, so it is correct on MLA and heterogeneous-KV architectures too. It ignores `--gpu-memory-utilization`, as vLLM does. A budget smaller than one KV block is refused at startup |
+| `--gpu-memory-utilization F` | `0.92` | **Accepted, and it does not size anything yet.** See [What `--gpu-memory-utilization` does not do yet](#what---gpu-memory-utilization-does-not-do-yet) |
 | `--max-model-len N` | `0` (config default) | Max sequence length |
 | `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set. On a GDN/Mamba model under speculative decoding this also multiplies the recurrent state, which is sized `max-num-seqs x (k+1)`; an unservable budget is refused at load with the arithmetic |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
@@ -2244,6 +2246,43 @@ aborts with `server: unknown argument '<flag>'`, including flags that are inert
 only because the capability is missing (`--tensor-parallel-size` and the other
 parallelism flags) — silently accepting those would let you believe you got
 tensor parallelism when you did not.
+
+#### What `--gpu-memory-utilization` does not do yet
+
+The flag is accepted, keeps vLLM's exact name and fraction semantics, and is
+then discarded. It does not size the KV pool. Passing
+`--gpu-memory-utilization 0.85` gives the same 256-block pool as passing
+nothing.
+
+Turning a free-memory fraction into a block count needs a profile run that
+measures what the weights and activations cost on the device first. That run is
+not implemented. It is `ROAD-V1-MEM` M3, tracked by
+[issue #83](https://github.com/mudler/vllm.cpp/issues/83), and it needs a GPU to
+gate.
+
+The flag is accepted rather than refused so that a published `vllm serve`
+command line runs here unchanged. Setting it prints this warning at startup, so
+a log never implies it took effect:
+
+```text
+vllm.cpp: WARNING --gpu-memory-utilization 0.85 was accepted but did NOT size the KV cache.
+vllm.cpp:   The profile run that turns a free-memory fraction into a block count is not
+vllm.cpp:   implemented yet (ROAD-V1-MEM M3, https://github.com/mudler/vllm.cpp/issues/83).
+vllm.cpp:   The pool fell back to 256 blocks. To size it today, pass
+vllm.cpp:   --kv-cache-memory <bytes> for an absolute KV budget, or --num-blocks <n> for an
+vllm.cpp:   exact block count.
+```
+
+To size the pool today, use `--kv-cache-memory` for an absolute byte budget or
+`--num-blocks` for an exact count. A run that never sets the flag prints
+nothing.
+
+**Warning.** On a unified-memory board such as NVIDIA GB10, a fraction of
+"device" memory is a fraction of the one pool the host shares, so it reserves
+host RAM as well. A value of 0.85 has hard-rebooted a GB10 box. When M3 lands
+and this flag starts to bind, choose the fraction on such a board against the
+whole 119 GiB pool and leave the host its headroom. Until then the flag reserves
+nothing, on any board.
 
 #### Context length vs the KV pool
 

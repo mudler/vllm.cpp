@@ -181,7 +181,13 @@ struct Args {
   // engine (needs the M3 profile run; inert until then). --kv-cache-memory: an
   // absolute KV-pool size in bytes that sizes the block count directly (0 =>
   // unset).
-  double gpu_memory_utilization = 0.92;
+  //
+  // TRI-STATE (FIX-GPU-MEM-UTIL-INERT, #1165), like enable_prefix_caching
+  // below: nullopt means the flag was NOT passed. It carries a value only when
+  // the user typed one, which is what lets the engine warn that a chosen
+  // fraction sized nothing without warning on a default nobody chose. A plain
+  // double pre-filled with 0.92 could not express the difference.
+  std::optional<double> gpu_memory_utilization = std::nullopt;
   long long kv_cache_memory_bytes = 0;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.

@@ -19,10 +19,14 @@
 //   LoadBf16Transposed   — BF16 [out,in] -> owned bf16 [in,out] (Matmul-B).
 //   LoadMergedBf16RawNK  — concat BF16 torch-Linear shards [N_i,K] along output
 //                          rows, kept RAW [N,K] with nk=true for vt::MatmulBT.
+//   ProbeThroughResolver — a tensor-presence probe built from a resolver.
+//   CheckProbeCanAnswerNo — refuse a presence probe that cannot answer
+//                          `false`.
 #pragma once
 
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <string>
@@ -63,6 +67,65 @@ inline std::string ShapeString(const std::vector<int64_t>& shape) {
     s += std::to_string(shape[i]);
   }
   return s + "]";
+}
+
+// --- Tensor-presence probes (FIX-PROBE-CANNOT-SAY-NO, issue #1258) -----------
+//
+// A name no checkpoint carries. Its ONLY use is asking a presence probe whether
+// it is capable of its negative answer.
+inline constexpr const char* kAbsentProbeSentinel =
+    "__vllm_cpp__a_tensor_no_checkpoint_carries__";
+
+// "Does this checkpoint carry `name`?", built from the ONE thing a resolver-only
+// loader seam is given.
+//
+// `TensorResolver` returns a REFERENCE, so absence has exactly one
+// representation in its contract: it throws. `SafetensorsFile::Get` documents
+// that (`safetensors_reader.h`), and every fixture resolver in the tree mirrors
+// it. Probing the resolver is therefore the honest answer AND the only one
+// available where no name index is in scope.
+//
+// ONE implementation on purpose. Issue #1256 was two copies of an always-true
+// stub; the repair for the first (#1257) was a hand-written `try`/`catch`, and a
+// second hand-written copy of that is the same mistake pointed the other way.
+//
+// The resolver is captured BY VALUE. A returned lambda holding a reference to a
+// caller's `std::function` is the next subtle lifetime bug in a helper that
+// exists because a subtle bug got shipped twice; a `std::function` copy costs
+// one allocation, once per seam call, against a load that reads gigabytes.
+inline std::function<bool(const std::string&)> ProbeThroughResolver(
+    const TensorResolver& get) {
+  return [get](const std::string& name) {
+    try {
+      (void)get(name);
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  };
+}
+
+// A presence predicate that cannot answer `false` is a DEFECT, not a
+// conservative default: it reports every optional tensor as present, and the
+// first guard to ask about one refuses a checkpoint over a tensor that does not
+// exist. That is issue #1256, twice, in one file.
+//
+// This is deliberately independent of HOW the probe was built, which is what a
+// stronger type could not be: it also catches a name index populated from the
+// wrong shard list and a probe a refactor detached from its data.
+//
+// `VT_CHECK` and not `assert`: Release defines `NDEBUG`, and a guard that
+// evaporates in the configuration everything ships in is not a guard.
+inline void CheckProbeCanAnswerNo(
+    const std::function<bool(const std::string&)>& has, const char* seam) {
+  VT_CHECK(!has(kAbsentProbeSentinel),
+           std::string("dense loader: ") + seam +
+               " was given a tensor-presence probe that answered YES for '" +
+               kAbsentProbeSentinel +
+               "', a name no checkpoint carries. A probe that cannot answer NO "
+               "reports every optional tensor as present, so the next guard to "
+               "ask about one refuses the checkpoint over a tensor that is not "
+               "there (issues 1256, 1258)");
 }
 
 // THE per-tensor f32 scale read. One implementation, because six hand-written

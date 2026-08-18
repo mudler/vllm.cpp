@@ -4,6 +4,13 @@
 // A separate translation unit from `ltx2_loader.cpp` for the reason that file's
 // siblings already record: `ltx2_loader.cpp` is 1500 lines that several rows
 // edit concurrently, and a new family does not need to lock it.
+//
+// The `(B * strength) @ A` product is `vt::Matmul`, the shared row-major GEMM
+// seam, and NOT a loop in this file (LTX25-LORA-FUSE-SEAM, #1202). The seam
+// changes nothing about the arithmetic — the rounding pattern the header's dtype
+// note argues for is byte-identical either way, and the row's gate asserts that
+// as byte equality — it changes only who executes it. The reason is written
+// beside the call.
 #include "vllm/model_executor/models/ltx2_lora.h"
 
 #include <algorithm>
@@ -15,6 +22,8 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
+#include "vt/tensor.h"
 
 namespace vllm {
 namespace {
@@ -318,19 +327,43 @@ bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
     for (size_t i = 0; i < bs.size(); ++i) {
       bs[i] = vt::F32ToBF16(vt::BF16ToF32(pair->b[i]) * static_cast<float>(lora.strength()));
     }
-    // torch's bf16 matmul accumulates in f32 and stores bf16; mirrored.
-    for (int64_t o = 0; o < rows; ++o) {
-      const uint16_t* brow = bs.data() + static_cast<size_t>(o) * static_cast<size_t>(pair->rank);
-      for (int64_t i = 0; i < cols; ++i) {
-        float acc = 0.0F;
-        for (int64_t k = 0; k < pair->rank; ++k) {
-          acc += vt::BF16ToF32(brow[k]) *
-                 vt::BF16ToF32(pair->a[static_cast<size_t>(k) * static_cast<size_t>(cols) +
-                                       static_cast<size_t>(i)]);
-        }
-        agg[static_cast<size_t>(o) * static_cast<size_t>(cols) + static_cast<size_t>(i)] =
-            vt::F32ToBF16(acc);
-      }
+    // torch's bf16 matmul accumulates in f32 and stores bf16; mirrored — and
+    // that is `vt::Matmul`'s written contract, not an approximation of it
+    // (`vt/ops.h`: "a/b float dtypes (f32/f16/bf16), out f32 or bf16, f32
+    // accumulation"). The seam's CPU kernel vectorizes ACROSS OUTPUT COLUMNS
+    // rather than along K, so every output element keeps the same strictly
+    // sequential f32 reduction the scalar loop this replaced had, with mul+add
+    // and never an FMA (`cpu_matmul_elem.h`, the recorded deviation from ggml);
+    // its store is the same `vt::F32ToBF16` through `StoreF32`. So this is the
+    // same ARITHMETIC on a different execution strategy, and the row's gate
+    // asserts that as byte equality rather than as a tolerance.
+    //
+    // The operand orientation needs no transpose: `bs` is [rows, rank] and A is
+    // [rank, cols], both row-major, which is exactly kMatmul's `out[M,N] =
+    // a[M,K] @ b[K,N]`. (`vt::MatmulBT` would need A as [cols, rank] and is
+    // therefore the wrong member of the pair here, notwithstanding that it is
+    // the one the sibling text-tower row took.)
+    //
+    // The guard is not reachable through `Ltx2LoraAdapter::Open`, which is the
+    // only way a pair is built: `ReadFactorAsBf16` refuses an empty factor, and
+    // A is [rank, in], so `rank == 0` is already a refusal by the time anything
+    // gets here — as is a zero-sized target, whose `agg` would be empty. It is
+    // written anyway because the loop this replaced HANDLED both: a zero trip
+    // count left every output at its zero-seeded accumulator, and `agg` is
+    // zero-filled, so skipping the GEMM reproduces that exactly. That makes the
+    // replacement behaviour-preserving rather than merely equivalent wherever
+    // the tests happen to look, and it keeps a zero-shaped tensor away from
+    // `vt::Matmul`, whose contract does not speak to one.
+    if (pair->rank > 0 && !agg.empty()) {
+      vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+      const vt::Device dev{vt::DeviceType::kCPU, 0};
+      vt::Tensor b_t = vt::Tensor::Contiguous(bs.data(), vt::DType::kBF16, dev,
+                                              {rows, pair->rank});
+      vt::Tensor a_t = vt::Tensor::Contiguous(const_cast<uint16_t*>(pair->a.data()),
+                                              vt::DType::kBF16, dev, {pair->rank, cols});
+      vt::Tensor o_t = vt::Tensor::Contiguous(agg.data(), vt::DType::kBF16, dev,
+                                              {rows, cols});
+      vt::Matmul(q, o_t, b_t, a_t);
     }
     has_delta = true;
   }

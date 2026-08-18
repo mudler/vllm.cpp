@@ -1077,22 +1077,40 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
 # Records cite code as `server_main.cpp:505`. Code moves; the citation does not.
 # The checker above LOOKS like it catches that and does not:
 #
-#   1. FORM. `is_code_anchor` walks `local_line_anchors`, which sees markdown
-#      links and the `RAW_LOCAL_ANCHOR_RE` prefixes -- and then only to decide
-#      whether SOME anchor is good. Re-measured over the five matrices at
-#      0e8b15d56: 479 link anchors carrying an `#L` fragment against 2134 bare
-#      `path:line` citations inside backtick spans, so 17.2% of the citation
-#      forms a reader sees were ever examined AS citations.
+#   1. NO REPORT, not "no parser". `local_line_anchors` reads BOTH citation
+#      forms: the markdown link through `LINK_RE`, and the bare
+#      `file.cpp:123` form through `RAW_LOCAL_ANCHOR_RE` since ee511ca8a. It
+#      range-checks each one. What it does not do is REPORT: on a missing file
+#      and on an out-of-range line the loop runs `continue`, so the bad anchor
+#      never enters the returned list, and `is_code_anchor`'s `any()` swallows
+#      what is left. There was no symbol test either, which is the gap that
+#      matters: 32 of the 39 offenders recorded here are IN RANGE, so a range
+#      check could not have found them.
 #   2. `any`, NOT `all`. `is_code_anchor` returns true if ONE anchor in a cell
 #      qualifies, so a single good link covers arbitrarily many rotted citations
 #      beside it. That is not a bug in the STATE gate -- a row IS evidenced by
 #      one good anchor, and the `any` stays -- but it is why nothing counted the
 #      others.
-#   3. STATE. `EVIDENCED_STATES` omits `ACTIVE` and `READY`, so 83 live rows got
+#   3. STATE. `EVIDENCED_STATES` omits `ACTIVE` and `READY`, so 92 live rows got
 #      no anchor check at all.
 #
-# And inside the fraction that WAS examined, `local_line_anchors` only checks
-# that the line EXISTS. A range check is not the fix: every stale anchor found
+# TWO POPULATIONS, TWO RATIOS, and quoting one without its denominator is what
+# produced the false "the bare form was never parsed" claim this comment
+# replaces. Measured at this head, counting a citation only where it is the
+# WHOLE of a backtick span, which is what the parser requires:
+#
+#   * ALL citation forms in the five matrices, ours and upstream: 492 links and
+#     1708 bare, 2200 in total. 525 of the bare forms sit under a
+#     `RAW_LOCAL_ANCHOR_RE` prefix, so 1017 of 2200 (46.2%) were already parsed.
+#     Most of the remainder are upstream paths that reach no local checker.
+#   * The citations this ratchet CLASSIFIES, which is the population that
+#     matters: 867. Of those 832 (96.0%) were already parsed AND range-checked
+#     before this row, and 35 (4.0%) are genuinely new to parsing, under
+#     `.agents/`, `docs/` and `website/`. All 39 recorded offenders sit in the
+#     96%. The value this row adds is the symbol test and the report, not the
+#     parser.
+#
+# A range check is not the fix: every stale anchor found
 # by hand during the 2026-08-13/14 campaign was IN RANGE --
 # `docs/USAGE.md:902` (the count line had moved to :1126), `multimodal.py:17-43`
 # (the block ends at :45) and `server_main.cpp:308` (a different table entry
@@ -1113,9 +1131,9 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
 # four-figure backlog, so every rule below prefers a missed rot to a false one:
 #
 #   * ONLY the `code` and `tests` cells of rows in RECORD_ANCHOR_STATES. The
-#     `upstream` column is never read. That is what keeps 1623 upstream
-#     references (`vllm/model_executor/...py:123`, `csrc/...cu:44`) from being
-#     mistaken for our tree -- structurally, not by a path heuristic.
+#     `upstream` column is never read. That is what keeps the upstream
+#     references (`vllm/model_executor/...py:123`, `csrc/...cu:44`) out of the
+#     count structurally, rather than by a path heuristic.
 #   * A bare citation must be the WHOLE of a backtick span, so running prose can
 #     never be parsed as a path.
 #   * It must resolve to a file in the tree, or be a near miss: at least two path
@@ -1131,9 +1149,17 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
 #     carrying `_`, `::`, `()` or an uppercase letter. `bf16` and `nvfp4` sit
 #     next to citations constantly and are not symbols; `MoeAuxStream`,
 #     `evict_blocks` and `Scheduler::shutdown()` are.
-#   * With no inferable symbol the citation is OK by construction. Roughly six
-#     in seven land there, and that is the intended polarity: this gate exists
-#     to be believed when it does fire.
+#   * With no inferable symbol the citation is OK by construction. 801 of the
+#     867 in-scope citations land there, which is 92.4%, or about 13 in 14.
+#     That is the intended polarity: this gate exists to be believed when it
+#     does fire.
+#   * The symbol test asks whether the cited LINES CONTAIN the name. A comment
+#     that mentions the symbol therefore reads OK. That is a measured limit and
+#     not a defect: `KERNEL-ATTN-MLA-SPARSE` cites
+#     `include/vllm/v1/attention/backend.h:271` for `get_kv_cache_shape`, whose
+#     real declaration is at :341, and drift on `main` moved a ROCm comment
+#     naming the symbol onto :271. Tightening this would need a parser per
+#     language, which is the cry-wolf trade this whole block refuses.
 RECORD_ANCHOR_BASELINE = ROOT / "scripts/record-anchor-baseline.json"
 RECORD_ANCHOR_VERDICTS = ("ok", "stale", "broken")
 # The BUDGET is the rot only. `ok` is counted and printed but deliberately NOT
@@ -1142,10 +1168,12 @@ RECORD_ANCHOR_VERDICTS = ("ok", "stale", "broken")
 # forbids. Per-bucket rather than one total, so a repaired BROKEN cannot pay for
 # a new STALE.
 RECORD_ANCHOR_BUCKETS = ("stale", "broken")
-# Gap 3. `EVIDENCED_STATES` itself is deliberately NOT widened: making ACTIVE and
-# READY *require* an anchor fails 71 rows that carry prose evidence today, which
-# is the bulk cleanup this row exists to avoid. They join the COUNT instead, and
-# the ratchet absorbs what that surfaces.
+# Gap 3. `EVIDENCED_STATES` itself is deliberately NOT widened. Making ACTIVE and
+# READY *require* an anchor raises 82 errors across 46 rows that carry prose
+# evidence today, which is the bulk cleanup this row exists to avoid. (The unit
+# is errors, not rows: the contract check emits one per missing anchor field, so
+# a row can raise more than one.) They join the COUNT instead, and the ratchet
+# absorbs what that surfaces.
 RECORD_ANCHOR_STATES = EVIDENCED_STATES | {"ACTIVE", "READY"}
 RECORD_ANCHOR_FIELDS = ("code", "tests")
 BARE_CITATION_RE = re.compile(

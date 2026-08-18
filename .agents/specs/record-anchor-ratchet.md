@@ -1,4 +1,4 @@
-# ENG-RECORD-ANCHOR-RATCHET — the anchor checker sees 18% of its own citations
+# ENG-RECORD-ANCHOR-RATCHET — the anchor checker range-checks its own citations and reports nothing
 
 Issue: [#632](https://github.com/mudler/vllm.cpp/issues/632)
 Row: `ENG-RECORD-ANCHOR-RATCHET` ([engine-matrix.md](../engine-matrix.md))
@@ -6,45 +6,80 @@ Row: `ENG-RECORD-ANCHOR-RATCHET` ([engine-matrix.md](../engine-matrix.md))
 ## The defect
 
 Records cite code as `` `server_main.cpp:505` ``. Code moves; the citation does
-not. Nothing catches it — and the checker that appears to is looking at a
-different thing.
+not. The checker that appears to catch that reports nothing.
 
-`scripts/check-agent-record.py:545`:
+**This section was wrong when it was written, and the correction is the point of
+this row.** It claimed the checker "walks **only** `LINK_RE` matches", so the
+bare `` `file.cpp:123` `` form "is never parsed". That is false.
+`RAW_LOCAL_ANCHOR_RE` has parsed the bare form since `ee511ca8a` (2026-07-10),
+under the prefixes `src`, `include`, `tests`, `examples`, `cmake`, `scripts`,
+`tools` and `.github/workflows`, plus `CMakeLists.txt`, and it range-checks each
+one. Every one of the 39 offenders this row records sits under those prefixes,
+so every one was already parsed. The false premise reached six surfaces before a
+fresh review caught it. It is corrected here rather than appended to, so nobody
+reads the wrong version first.
 
-```python
-LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
-```
-
-`local_line_anchors` (`:941`) walks **only** `LINK_RE` matches, and only those
-carrying an `#L<n>` fragment (`LINE_FRAGMENT_RE`, `:553`). So the only citation
-form it can see is the markdown link `[label](path#L505)`.
-
-Measured across the five matrices:
-
-| Matrix | link anchors (seen) | bare `path:line` (invisible) |
-|---|---:|---:|
-| `engine-matrix.md` | 19 | **1064** |
-| `model-matrix.md` | 14 | **662** |
-| `kernel-matrix.md` | 144 | 215 |
-| `quantization-matrix.md` | 182 | 44 |
-| `backend-matrix.md` | 121 | 152 |
-| **total** | **480** | **2137** |
-
-**18.3%** of citations are examined. The dominant form in this repo is the one
-the checker never looks at.
+**What the checker actually did.** `local_line_anchors` reads both forms and
+range-checks both. What it does not do is REPORT. On a missing file and on an
+out-of-range line the loop runs `continue`, so the failing anchor never enters
+the returned list. `is_code_anchor` then answers with `any()`, so one good
+sibling in the same cell satisfies the row. A bad anchor is therefore invisible
+twice: dropped by the parser, then covered by a neighbour.
 
 Three gaps compound:
 
-1. **Form.** Bare `` `path:line` `` is not parsed at all (`:941-950`).
-2. **`any`, not `all`.** `is_code_anchor` (`:979-985`) returns true if **any**
-   anchor in the cell qualifies, so one good link covers arbitrarily many rotted
-   citations beside it.
-3. **State.** `EVIDENCED_STATES` (`:530`) omits `ACTIVE` and `READY`, so those
-   rows get no anchor check at all.
+1. **No symbol test.** The check asks whether the line EXISTS, never whether it
+   holds what the prose says. **32 of the 39** offenders recorded here are IN
+   RANGE, so a range check could not have found any of them.
+2. **`any`, not `all`.** `is_code_anchor` returns true if any anchor in the cell
+   qualifies, so one good link covers arbitrarily many rotted citations beside
+   it. That is correct for the STATE gate and the `any` stays; it is why nothing
+   counted the others.
+3. **State.** `EVIDENCED_STATES` omits `ACTIVE` and `READY`, so 92 live rows got
+   no anchor check at all.
 
-And even inside the 18%, `local_line_anchors:957` validates only
-`start >= 1 and end <= line_count` — that the line **exists**, never that it is
-what the prose says it is.
+And a fourth, which is what kept the first three invisible: **there was no
+report.** A dropped anchor produced no output at any verbosity.
+
+### Two populations, two ratios
+
+Quoting one population's ratio as if it were the other's is what produced the
+false claim above, so both are stated with their denominator. Measured at this
+head, counting a citation only where it is the WHOLE of a backtick span, which
+is what the parser requires. An earlier count of 2134 used a looser method that
+matched a `path:line` token anywhere inside a span, which is why it is larger.
+
+**Population A — every citation form a reader sees in the five matrices, ours
+and upstream:**
+
+| Matrix | link anchors | bare `path:line` | bare under a `RAW_LOCAL_ANCHOR_RE` prefix |
+|---|---:|---:|---:|
+| `engine-matrix.md` | 24 | 733 | 366 |
+| `model-matrix.md` | 14 | 629 | 82 |
+| `quantization-matrix.md` | 182 | 47 | 4 |
+| `kernel-matrix.md` | 144 | 155 | 30 |
+| `backend-matrix.md` | 128 | 144 | 43 |
+| **total** | **492** | **1708** | **525** |
+
+**1017 of 2200 forms (46.2%) were already parsed.** Most of the rest are
+upstream paths (`vllm/model_executor/...py:123`, `csrc/...cu:44`) that no local
+checker can validate, which is why this ratio answers no question about coverage
+on its own.
+
+**Population B — the citations this ratchet classifies**, meaning the `code` and
+`tests` cells of rows in `RECORD_ANCHOR_STATES` that resolve against this tree.
+This is the population that matters:
+
+| | count | share |
+|---|---:|---:|
+| in scope | 867 | 100% |
+| already parsed AND range-checked before this row | 832 | **96.0%** |
+| genuinely new to parsing (`.agents/`, `docs/`, `website/`) | 35 | 4.0% |
+| yield no inferable symbol, `OK` by construction | 801 | 92.4% |
+
+**All 39 offenders sit in the 96%.** What this row adds is the symbol test and
+the report, not the parser. The parser extension is real but small, and claiming
+it as the defect was the error.
 
 ## Why a range check is not enough
 
@@ -67,8 +102,8 @@ Every gate stayed green.
 
 ## Design — ratchet, not cleanup
 
-Enforcing correctness over 2137 previously-unchecked citations would surface an
-unknown backlog in one landing, unrelated to the change itself. Mirror the
+Enforcing the symbol test over the whole backlog in one landing would surface an
+unknown amount of unrelated rot. Mirror the
 `device-leakage` shape instead (`scripts/device-leakage-baseline.json`), which
 this repo already trusts:
 
@@ -89,8 +124,14 @@ ambiguous stays OK. A checker that cries wolf gets disabled.
 
 ## Scope
 
-- `ACTIVE`/`READY` join the anchor check as part of this row, since gap 3 is
+- `ACTIVE`/`READY` join the anchor COUNT as part of this row, since gap 3 is
   cheap and the ratchet absorbs whatever it surfaces.
+- `EVIDENCED_STATES` itself is deliberately NOT widened, and that is a scope
+  decision rather than an oversight. Making `ACTIVE` and `READY` *require* an
+  anchor raises 82 errors across 46 rows that carry prose evidence today, which
+  is the bulk cleanup this row exists to avoid. (The unit is errors, not rows:
+  the contract check emits one per missing anchor field.) `RECORD_ANCHOR_STATES`
+  is therefore a separate, wider set.
 - `is_code_anchor`'s `any` semantics stay for the STATE gate (a row is still
   evidenced if it has one good anchor); the ratchet counts **every** citation
   independently, which is where `any` was hiding rot.
@@ -110,28 +151,34 @@ rather than aspirational.
 
 ## Our baseline
 
-Re-derived at `0e8b15d56`, not carried from the numbers this spec was written
-with. Across the five matrices, counting `path:line` tokens inside backtick
-spans:
+Re-derived at this head after merging 161 commits of `main`, not carried from
+any earlier number. The population tables are in `## The defect` above and are
+not repeated here.
 
-| Matrix | link anchors (seen) | bare `path:line` (invisible) |
-|---|---:|---:|
-| `engine-matrix.md` | 19 | 1100 |
-| `model-matrix.md` | 14 | 658 |
-| `kernel-matrix.md` | 143 | 179 |
-| `quantization-matrix.md` | 182 | 52 |
-| `backend-matrix.md` | 121 | 145 |
-| **total** | **479** | **2134** |
+**Rot: 39 — 32 `STALE`, 7 `BROKEN`, against 828 `OK`.**
 
-**17.2%** of citation forms were examined. Of the 2134 bare citations, only 688
-resolve to a file in this tree; the other 1446 are upstream paths
-(`vllm/model_executor/...py:123`, `csrc/...cu:44`) that no local checker can
-validate. That is what fixes the classifier's scope: the ratchet reads the
-`code` and `tests` cells only, never the `upstream` column.
+The set is the 40 the fresh review verified by hand, minus one.
+`KERNEL-ATTN-MLA-SPARSE` cites `include/vllm/v1/attention/backend.h:271` for
+`get_kv_cache_shape` and now reads `OK`. That is not a repair. The real
+declaration is at `:341`; drift on `main` moved a ROCm comment naming the symbol
+onto `:271`, and the symbol test asks only whether the cited lines contain the
+name. It is a measured limit of the conservative rule, recorded rather than
+worked around, because tightening it would need a parser per language.
 
-Measured rot at the same commit: **40** — 33 `STALE`, 7 `BROKEN`, against 800
-`OK`. Every one of the 40 was verified by hand against the cited file before the
-baseline was written.
+The merge also turned this row's own seven anchors `STALE`, by moving the lines
+they cite in `check-agent-record.py` and `test_agent_record.py`. Those were
+repaired, not banked: a row arguing that stale anchors matter may not carry
+seven. **No new offender was banked.**
+
+By top-level directory the 39 are: `src` 24, `examples` 5, `include` 5,
+`scripts` 2, `tests` 2, `cmake` 1. Every one is under a prefix the old parser
+already read.
+
+**Specs are not policed by this ratchet.** `RECORD_ANCHOR_FIELDS` reads matrix
+row cells, and no spec body is in `MATRIX_PATHS`, so the `file:line` citations
+in THIS file are checked by nothing. #911 tracks that gap over 315 spec files.
+The anchors here are therefore pinned by hand at the final head and will rot the
+same way. Read them as of the commit that lands them.
 
 ## Port map
 
@@ -150,7 +197,7 @@ record surface, and is recorded as such.
 
 ## Tests to port
 
-None to port — vLLM has no such checker. The six cases below are written
+None to port — vLLM has no such checker. The seven cases below are written
 RED-first against the shape of the defect, in the file
 `scripts/check-pr-size.py` already names as this checker's companion evidence
 (`tests/scripts/test_agent_record.py`).
@@ -187,6 +234,7 @@ RED-first, in `tests/scripts/`:
 | a cell with one good link and one rotted bare citation | the rotted one is still counted (kills `any`) |
 | an `ACTIVE` row with a rotted anchor | counted (fails today: state excluded) |
 | baseline raised without a reduction | REFUSED |
+| `--write-baseline` on a tree with other record errors | REFUSED, file unchanged (#1270) |
 
 The fourth is the load-bearing one — it is the exact shape that let rot hide.
 Mutate the ratchet into a report-only pass and prove the count case reds.
@@ -199,7 +247,7 @@ exact invocations, each of which genuinely fails when the row regresses:
 - `python3 scripts/check-agent-record.py --report` — the gate itself; prints
   every offender and reds on either direction of the ratchet.
 - `python3 tests/scripts/test_agent_record.py` — the mutation suite, including
-  the nine `RecordAnchorRatchet` cases.
+  the ten `RecordAnchorRatchet` cases.
 - `scripts/agent-preflight.sh --staged` — the whole record gate over the staged
   change.
 - `python3 scripts/check-pr-size.py --base origin/main --head HEAD` — proves the
@@ -207,6 +255,11 @@ exact invocations, each of which genuinely fails when the row regresses:
 - `python3 scripts/check-commit-trailers.py --range "$(git merge-base origin/main HEAD)..HEAD"`
   — run EXPLICITLY over the merge-base range, because `agent-preflight.sh`
   silently skips it when the branch is behind `main` (#653).
+- `python3 scripts/check-commit-style.py --range "$(git merge-base origin/main HEAD)..HEAD"`
+  — the same skip applies to the style gate that landed with
+  `POLICY-SINGLE-PR-AND-STYLE`, so it is run explicitly for the same reason.
+- `python3 scripts/check-public-doc-tables.py` — this row writes `docs/STATUS.md`
+  and `docs/BENCHMARKS.md`, which carry a size ratchet and a per-cell limit.
 
 ## Risks / decisions
 
@@ -232,7 +285,7 @@ implemented and green; the gate is wired into `scripts/agent-preflight.sh` (via
 chosen over recall at five points, each measured rather than guessed:
 
 1. **Columns, not paths.** Only `code` and `tests` cells are read. This is what
-   keeps 1446 upstream citations out of the count structurally; a path-prefix
+   keeps the upstream citations out of the count structurally; a path-prefix
    heuristic would have had to guess, and `tests/`, `cmake/`, `docs/`, `src/`
    and `tools/` all collide with upstream references in this record.
 2. **Whole-span citations only.** A bare citation must be the entire content of
@@ -251,9 +304,16 @@ chosen over recall at five points, each measured rather than guessed:
    `_ModelInfo` `qwen3_5_common.h:42` `` names the `ModelInfo` on that line, and
    the anchor was right.
 
-About six citations in seven yield no inferable symbol and are `OK` by
-construction. That polarity is the point: a gate that fires is believed.
+801 of the 867 in-scope citations yield no inferable symbol and are `OK` by
+construction, which is 92.4%, or about 13 in 14. That polarity is the point: a
+gate that fires is believed.
 
-Next: fresh scoped review of the immutable head, then merge. The 40 recorded
-offenders are deliberately NOT repaired here — they are the backlog the ratchet
-exists to hand to whoever next touches each row.
+The 39 recorded offenders are deliberately NOT repaired here. They are the
+backlog the ratchet exists to hand to whoever next touches each row.
+
+The first fresh review returned FAIL on the recorded justification and PASS on
+the design, so nothing here was redesigned. What changed is the defect
+statement, corrected on six surfaces, every ratio restated against its
+denominator, and the numbers re-derived after 161 commits of `main`. #1270 was
+found and fixed in the same flow: `--write-baseline` banked a baseline from a
+tree that had failed other record checks.

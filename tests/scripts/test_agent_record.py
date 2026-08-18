@@ -1397,10 +1397,12 @@ class IssueIndexTests(unittest.TestCase):
 class RecordAnchorRatchet(unittest.TestCase):
     """ENG-RECORD-ANCHOR-RATCHET (#632), .agents/specs/record-anchor-ratchet.md.
 
-    Six cases, one per row of the spec's test table. Each builds a SYNTHETIC
-    tree and a synthetic row rather than asserting against the live matrices:
-    the live count is a moving backlog, and a case that reds when somebody else
-    repairs an unrelated anchor teaches people to ignore this suite.
+    Ten cases. Seven cover a row of the spec's test table; the other three pin
+    the two gate directions and the tree-against-baseline agreement. The
+    table-driven cases build a SYNTHETIC tree and a synthetic row rather than
+    asserting against the live matrices, because the live count is a moving
+    backlog and a case that reds when somebody else repairs an unrelated anchor
+    teaches people to ignore this suite.
 
     The fourth case is the load-bearing one. `is_code_anchor` answers with
     `any()`, so before this row one good link in a cell made every rotted

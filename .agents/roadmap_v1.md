@@ -33,6 +33,7 @@ append-only and carries `merge=union`, because a table every pull request
 writes is a lock when it lives beside keyed records. The portfolio table below
 remains the ordering surface, and it remains a keyed record: update in place,
 never append.
+| [#534](https://github.com/mudler/vllm.cpp/issues/534) | `SERVE-ASYNC-LLM` | Punch-list item 9 (`ROAD-V1-C6`) directs a depth-2 throughput lever the project refuted (`6ea7856`) and a `runner_supports_async` flip that landed (`a0013a2`) 10 days before the item was written; the one real residual is `ENG-PRIORITY-SCHED`'s priority-vs-FCFS gate, which does not exist | bug |
 
 ## Top-level portfolio
 

@@ -273,6 +273,92 @@ only. No GPU lease, no checkpoint download.
 - Explicit narrow-dtype conversion for a one-element `BF16` or `F16` scale, if
   a checkpoint is ever measured that ships one.
 
+## Outcome
+
+Measured on the CPU gate at `ab6e65216` plus this branch, `x86_64`, Ninja,
+default `CMAKE_BUILD_TYPE`.
+
+### RED before, at commit `8cff76113`
+
+`test_qwen3_8_text_only`, one case, 29 assertions: **16 failed, 6 of 6 refusal
+subcases failed**, the positive control passed.
+
+The SHAPE of that red is the finding, and it is stronger than the issue
+predicted. Eleven of the sixteen failed assertions logged `message := ` with
+nothing after it. A per-output-channel `weight_scale [8] F32`, a block-wise
+grid `[2, 4] F32`, a per-output-channel `[8] BF16` and a multi-element
+`weight_scale_2 [2] F32` did not merely read the wrong element. They LOADED, and
+`LoadQwen3_5Moe` returned a complete model built on a number nobody wrote.
+
+The two one-element BF16 cases did stop, on
+`vt: qwen3_5 weights: scalar tensor too small for f32 at
+src/vllm/model_executor/models/qwen3_5_weights.cpp:313`. That message names no
+tensor and describes a truncation rather than a dtype, so it cannot tell a
+reader which of hundreds of scales was wrong. And it only fires because ONE bf16
+value is two bytes. Eight bf16 values are sixteen bytes, which is the layout
+that is actually published, and the floor never saw it.
+
+### GREEN after, at commit `60aefbca6`
+
+- focused: `test_qwen3_8_text_only -tc="...REFUSED by name"`, 1 case, **29 of 29
+  assertions**, `SUCCESS`
+- whole file: 19 cases, **67,845 of 67,845 assertions**, `SUCCESS`
+- full suite: `ctest --test-dir build -j 2`, **511 of 511 passed, 0 failed**,
+  181 s, with `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e`
+  skipped for missing checkpoints as they are on an unmodified tree
+- `scripts/agent-preflight.sh --fail-on-skip`: 81 gates, **81 ok, 0 FAIL, 0
+  SKIP**
+
+### Mutations, each with its build status and its applied diff
+
+Run in place against a clean tree, restored with `git checkout --` and verified
+by `sha256sum`. A mutation that fails to build and a mutation that never applied
+both read as a passing test, so both are printed rather than assumed.
+
+| Mutation | diff stat | `compile_rc` | Result | Restore |
+|---|---|---|---|---|
+| R1 reachability: `LoadFp8Transposed`'s call site replaced by `1.0F` | 1 file, +1 -1 | 0 | RED, 11 of 29, the 4 `weight_scale` subcases | byte-identical |
+| R2 reachability: `LoadNvfp4Raw`'s call site replaced by `1.0F` | 1 file, +1 -1 | 0 | RED, 5 of 29, the 2 `weight_scale_2` subcases | byte-identical |
+| G1: the element-count check deleted | 1 file, +1 -4 | 0 | RED, 7 of 29, the 4 multi-element subcases | byte-identical |
+| G2: the dtype check deleted | 1 file, -3 | 0 | RED, 2 of 29, the 2 one-element BF16 subcases | byte-identical |
+| G3: the exact-byte-count check deleted | 1 file, -3 | 0 | **GREEN, 29 of 29** | byte-identical |
+
+R1 is the reachability proof the `Nothing lands dead` rule asks for. The guard
+is reached from `vllm::LoadQwen3_5Moe` over a real synthetic checkpoint, and
+`LoadFp8Transposed` rather than `LoadFp8Raw` is the arm a CPU build takes,
+because `DenseNativeEnabled()` needs `VT_CUTLASS_FP8`. R2 proves the same
+through a second, unrelated loader, which is what makes the guard shared rather
+than local.
+
+### The negative result, recorded rather than quietly kept
+
+**G3 stayed green, so the exact-byte-count check is NOT independently gated.**
+No fixture built by `BuildSafetensors` can reach it, because the safetensors
+reader already rejects a header whose shape times dtype width does not equal its
+data span, so `numel == 1` and `dtype == "F32"` together imply four bytes for
+any file that parses. What the check still buys is the `t.data != nullptr` half,
+against a default-constructed `StTensor`, which
+`safetensors_reader.h:20-33` documents as a real state in tests. It is kept
+because the in-tree reference `nemotron_h_weights.cpp:566-568` carries the same
+check, and because a `memcpy` from `nullptr` is worse than a refusal. It is
+recorded here as an ungated line rather than presented as a tested one.
+
+### What surprised us
+
+The issue framed this as latent, protected by #1166's name miss. The audit says
+otherwise on two counts, and both are in the tree already rather than inferred.
+`dense_weight_loaders.h:73-74` and `docs/BENCHMARKS.md:52` both record
+`unsloth/Qwen3.6-27B-NVFP4` @`ccdaab7e` as FP8 W8A8 throughout with BF16
+per-output-channel scales, and `LoadAttnDense` branches on the weight dtype
+alone, so that revision reaches both defects at once under the tensor name the
+loader asked for. Nothing was misspelled and nothing stopped it.
+
+And the reader had SIX copies, not five. `ReadCtF32Scalar` carried the identical
+defect under a different name, inside the shared header that exists to stop
+exactly that, and it was reached from a sixth model file the issue's file list
+did not name. A grep for one identifier measured five sixths of a class defect.
+
 ## Now
 
-`ACTIVE`. Spec committed before implementation.
+`ACTIVE`, PR open, awaiting fresh review. Spec committed before implementation
+at `30f704f6c`, red tests at `8cff76113`, guard at `60aefbca6`.

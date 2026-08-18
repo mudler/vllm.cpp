@@ -1,0 +1,85 @@
+ARCH=sm_121a
+ARCH_HITS_IN_RES_USAGE=2
+COMPILE_RC=0
+CUOBJDUMP_RC=0
+LINEINFO_COMPILE_RC=0
+OBJECT_BYTES=435184
+NVCC_VERSION=Cuda compilation tools, release 13.0, V13.0.88 Build cuda_13.0.r13.0/compiler.36424714_0 
+PTXAS_VERSION=Cuda compilation tools, release 13.0, V13.0.88 Build cuda_13.0.r13.0/compiler.36424714_0 
+COMPILE_CMD=nvcc -std=c++20 -O3 -arch=sm_121a -Xptxas -v -c /tmp/replayssm-w0b/probe.cu -o /tmp/replayssm-w0b/probe.o
+PROBE_SHA256=f7d323651cf1a5720f0ce712b802a10248278566e1abb9ecdbae8e62fcf0f4b3
+SCRIPT_SHA256=c5218d087949e94647e28d6799b2f870e34643bc754dfaec084b562fd979ef55
+--- ptxas -v ---
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 95 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 203.592 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 178.604 ms
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 178.771 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 42 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 123.199 ms
+ptxas info    : Compiling entry function '_Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    96 bytes stack frame, 96 bytes spill stores, 96 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 96 bytes cumulative stack size, 1224 bytes smem
+ptxas info    : Compile time = 269.512 ms
+ptxas info    : Compiling entry function '_Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_PKilllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_PKilllllllllf
+    56 bytes stack frame, 56 bytes spill stores, 56 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 56 bytes cumulative stack size, 1024 bytes smem
+ptxas info    : Compile time = 187.856 ms
+--- cuobjdump -res-usage ---
+
+Fatbin ptx code:
+================
+arch = sm_121
+code version = [9,0]
+host = linux
+compile_size = 64bit
+compressed
+ptxasOptions = -v  
+
+Fatbin elf code:
+================
+arch = sm_121a
+code version = [1,8]
+host = linux
+compile_size = 64bit
+
+Resource usage:
+ Common:
+  GLOBAL:0
+ Function _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:95 STACK:0 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:94 STACK:0 SHARED:2180 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:94 STACK:0 SHARED:2180 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:42 STACK:0 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:255 STACK:96 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_24629ce9_31385DTypeES6_S8_PT0_PKilllllllllf:
+  REG:255 STACK:56 SHARED:2048 LOCAL:0 CONSTANT[0]:1052 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+Fatbin ptx code:
+================
+arch = sm_121a
+code version = [9,0]
+host = linux
+compile_size = 64bit
+compressed
+ptxasOptions = -v  

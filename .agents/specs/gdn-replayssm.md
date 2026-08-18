@@ -168,7 +168,7 @@ implementation", and vLLM's Mamba2 kernel as the mirror source for the
 | What | Anchor |
 |---|---|
 | Legacy shared-memory packed decode | `src/vt/cuda/cuda_gdn.cu:2312-2427` (state read `:2393`, write `:2425`) |
-| Register-tiled packed decode, default **OFF** after a failed proof | `:2505-2630` |
+| Register-tiled packed decode, default **OFF** after a failed proof | `:2516-2639` |
 | Fused decode | `:2793` |
 | Sequential scan decode | `:2209` |
 | CUDA dispatch, incl. the Triton bridge | `:2668-2760` |
@@ -183,21 +183,45 @@ implementation", and vLLM's Mamba2 kernel as the mirror source for the
 ### The constraint that shapes the whole design
 
 The 27B GDN decode default is a **vendored vLLM FLA cubin**, not our own kernel.
-`TryTritonPackedDecode` fires first (`cuda_gdn.cu:2696-2706`), and it hard-guards
-`state.dtype == kF32` (`:5212`) plus every stride and the exact
-`Dk=Dv=128, H_k=16, HV in {32,48}` geometry (`:5206-5216`). A ReplaySSM kernel
+`TryTritonPackedDecode` fires first (`cuda_gdn.cu:2714-2718`), and it hard-guards
+`state.dtype == kF32` (`:5224`) plus every stride and the exact
+`Dk=Dv=128, H_k=16, HV in {32,48}` geometry (`:5216-5226`). A ReplaySSM kernel
 cannot be that cubin — no such cubin exists upstream, because upstream's
 ReplaySSM is Mamba2-only Triton and SGLang's lives in a third repository.
 
 This is not a packaging inconvenience. The header at
 `src/vt/cuda/gdn_packed_decode_triton.h:9-14` records a **measured** codegen
-result: the identical register-resident `[BV=32, BK=128]` fp32 state tile is
-`REG:205` with zero spill under Triton/ptxas, and `REG:255 + STACK:48` (spilling)
-as hand-written CUDA. The register-tiled hand kernel that this measurement came
+result: the register-resident `[BV=32, BK=128]` fp32 state tile is `REG:205`
+with zero spill under Triton/ptxas, and `REG:255 + STACK:48` (spilling) as
+hand-written CUDA. The register-tiled hand kernel that this measurement came
 from is default-OFF today precisely because it lost, `c16` 700 against
-794 tok/s (`cuda_gdn.cu:2710`). A hand ReplaySSM kernel carries strictly
-*more* register state than that one, because it must also hold the reconstruction
-accumulator. *Traffic model* R1 makes this the top risk.
+794 tok/s (`cuda_gdn.cu:2722`).
+
+**The paragraph that used to follow was wrong, and W0 measured it wrong.** It
+said that a hand ReplaySSM kernel "carries strictly *more* register state than
+that one, because it must also hold the reconstruction accumulator", and it made
+R1 the top risk on that basis. Both halves presuppose that a ReplaySSM kernel
+holds the `[BK=128]` state row in registers the way `GdnPackedDecodeRegTileKernel`
+does. **The mirror source deliberately does not.** vLLM streams the decayed
+checkpoint readout "over NF dstate tiles so the (M, N) state slice is never held
+whole" (`selective_state_update_replayssm_output_only.py:309-311`), streams the
+flush route "over FL dstate tiles" (`:361`, `:395`), gives the two routes
+**distinct** tile locals on purpose because differing widths "would force a
+shape-mismatched merge at the if/else exit" (`:391-393`), and tunes Blackwell at
+`dstate == 128` to `nf_dstate_tile = 32` and `fl_dstate_tile = 64` — never 128
+(`replayssm_config.py:47-52`).
+
+The reason it does not need a register row is visible in the algebra above. The
+non-flush route computes only `dot_q += S_0[c] q[c]` and `dot_k += S_0[c] k[c]`:
+each state element is touched twice **in one pass**, so two scalar accumulators
+suffice and no register array is required at all. That route runs on 15 of every
+16 steps and carries the whole bandwidth case.
+
+`## Outcome` records what happened when the two structures were compiled side by
+side. The buffered form with a resident `float sh[128]` spills, as this
+paragraph predicted; the streamed form the pin actually specifies compiles at
+`REG:42` (non-flush) and `REG:95` (both routes fused) with **zero** spill. R1 is
+retired, and *Traffic model* is again the risk that decides the row.
 
 ## Design
 
@@ -312,7 +336,7 @@ different answers, and they must not be collapsed:
    The ring overhead ratio is near-invariant to the dtype — 18.85% of the state
    at fp32 and 18.94% at bf16 for the 27B shape, because only `g` stays fp32.
 2. **On the executed path they already conflict, today, without ReplaySSM.**
-   `TryTritonPackedDecode` requires `state.dtype == kF32` (`cuda_gdn.cu:5212`),
+   `TryTritonPackedDecode` requires `state.dtype == kF32` (`cuda_gdn.cu:5224`),
    so `VT_GDN_STATE_BF16=1` silently drops the 27B off the vendored cubin and
    onto the hand kernel. Any measurement that varies the state dtype and reads
    the result as a bandwidth effect is confounded by a kernel swap. This is a
@@ -556,7 +580,7 @@ own.
 
 | W | Work | Completion condition |
 |---|---|---|
-| **W0** | Register-pressure probe (R1). Write the buffered inner loop far enough to compile for the `[BV=32, BK=128]` 27B tile; `cuobjdump` it | A register count against the recorded REG:205 / REG:255+STACK:48 pair. **If it spills, STOP** and record the negative result under `## Outcome` |
+| **W0** — **DONE, see `## Outcome`** | Register-pressure probe (R1). Compile the decode step in the shape the pin specifies — the readout streamed over `nf_dstate_tile = 32` / `fl_dstate_tile = 64` with disjoint per-branch locals, *not* a resident `[BK=128]` row — and `cuobjdump` it | A register count against the recorded REG:205 / REG:255+STACK:48 pair, **for each route separately**, because the non-flush route is 15 of every 16 steps and carries the whole saving. **If the streamed form spills, STOP** and record the negative result under `## Outcome`. A resident-array form that spills proves nothing, because the mirror source avoids that structure |
 | **W1** | Confirm `MambaSpec` accepts five tensors; widen it if not | A test constructing a five-tensor GDN spec and a runner that allocates it |
 | **W2** | Ring in the state spec, cursor and flush flag on the metadata, host-side derivation. No kernel yet | The ring is allocated and the cursor advances; the existing gates stay byte-identical with the lever OFF |
 | **W3** | The kernel: non-flush and flush routes, `L=1` identity first | T1 green, then T2 |
@@ -564,17 +588,21 @@ own.
 | **W5** | Inertness gates, then the A/B | Gate 3 first; then *The A/B* with `failed == 0` on every leg |
 
 W0 before everything. It is a few hours and it can end the row, which is the
-cheapest possible ordering.
+cheapest possible ordering. It did not end the row: `## Outcome` records the
+measurement and W1 is now the next item.
 
 ## Risks
 
-**R1 (HIGH) — register pressure kills the kernel.** *The constraint that shapes the whole design*: the same
-register-resident fp32 state tile is `REG:205`/no-spill under Triton and
-`REG:255 + STACK:48` as hand CUDA, measured in this tree, and the hand kernel
-built on it lost `c16` 700 against 794 tok/s (`cuda_gdn.cu:2710`). A ReplaySSM kernel holds
-strictly more live state. *Mitigation:* measure the register count with
-`cuobjdump` **before** any A/B, and stop if it spills. A spilling kernel cannot
-win a bandwidth argument.
+**R1 (RETIRED by W0 — see `## Outcome`) — register pressure kills the kernel.**
+As written, this risk assumed the kernel would hold the `[BV=32, BK=128]` fp32
+state row in registers, which is the structure the mirror source avoids. In the
+pin's streamed shape the decode step compiles at `REG:42` (non-flush route),
+`REG:94` (flush route) and `REG:95` (both routes fused), all with zero spill, on
+`nvcc 13.0.88` for `sm_121a`. The register file is not the wall. *Mitigation
+discharged:* the count was measured before any A/B, as this risk required, and it
+came back clean. What replaces it is not a register question at all — see R2 and
+*Traffic model*, and the open question in `## Outcome` about whether a streamed
+kernel's exposed load latency costs more than the traffic it saves.
 
 **R2 (HIGH) — leaving the vendored-cubin path is itself a regression.** The 27B
 default is vLLM's exact token-identical FLA kernel. Any ReplaySSM arm is a
@@ -615,11 +643,24 @@ the default path has already failed.
 
 ## Evidence
 
-**Evidence that exists today: source only.** Every anchor in *Upstream chain (vLLM)*, *Upstream chain (SGLang)* and *Our baseline* was
-read at the two pinned revisions named in the header, and each was re-verified
-with `sed -n` against the file before this spec was committed. That is the whole
-evidence base. It establishes what upstream does and what this tree lacks. It
+**Evidence that exists today: source, plus one compile-only probe.** Every
+anchor in *Upstream chain (vLLM)*, *Upstream chain (SGLang)* and *Our baseline*
+was read at the two pinned revisions named in the header, and each was
+re-verified with `sed -n` against the file before this spec was committed. That
+reading establishes what upstream does and what this tree lacks, and it
 establishes nothing about speed.
+
+On 2026-08-18 exactly one measurement joined it, and it remains the only one.
+Six kernels were compiled in a single translation unit by `nvcc`/`ptxas` 13.0.88
+for `sm_121a`, read with `cuobjdump -res-usage`, `cuobjdump -sass` and
+`nvdisasm -g`. It yields per-kernel register, stack, spill-byte, shared-memory
+and SASS instruction counts, and a `probe.cu` line for every `LDL`/`STL`.
+`## Outcome` carries the numbers and
+[`docs/bench-evidence/gdn-replayssm-w0-20260818/`](../../docs/bench-evidence/gdn-replayssm-w0-20260818/)
+carries the probe source, the scripts and the raw logs. **That is a static
+property of compiled code and nothing else.** The probe was never launched, on
+any device, so it is not evidence of correctness either: its algebra was checked
+against *Design* by reading it, which T1 still owes a real gate for.
 
 Two structural claims carry their own commands, so a reader can re-run them
 rather than trust this document:
@@ -629,9 +670,13 @@ rather than trust this document:
 | This tree has no ReplaySSM | `grep -rniE 'replayssm' src include tests` (empty) |
 | vLLM has no GDN ReplaySSM, at the pin or 877 commits past it | `git -C /home/mudler/_git/vllm ls-tree -r --name-only origin/main \| grep -i replayssm` (Mamba2 files only) |
 
-**Evidence that does not exist and must not be implied:** any timing, any
-kernel-level attribution, any register count for a kernel that has not been
-written, and any statement about the GDN share of a 27B decode step. The numbers
+**Evidence that does not exist and must not be implied:** any timing; any
+throughput, latency, TPOT, occupancy or memory measurement; any statement about
+the GDN share of a 27B decode step; and any numeric or token output, because
+nothing has been executed. *The A/B* is still **UNMEASURED** and a static count
+is not a substitute for it in either direction. The counts above are facts about
+`probe.cu`, not about anything this tree ships: no ReplaySSM product code exists,
+and `grep -rniE 'replayssm' src include tests` is still empty. The numbers
 in *Traffic model* are *derivations from shapes*, explicitly labelled as such; they are
 arithmetic over `HV=32, V=128, K=128, H_k=16`, not observations. A derivation is
 a prediction to be tested, and *The A/B* is the test.
@@ -649,8 +694,13 @@ clock manifests and nsys windows stay under an evidence directory named in
 Stop, record the negative result in this spec's `## Outcome`, and do not land the
 kernel, if any of these hold:
 
-- The kernel spills registers (R1). A spilling kernel is a closed door, and
-  *The constraint that shapes the whole design*'s measurement says which door.
+- The kernel spills registers (R1) **in the shape the pin specifies** — the
+  readout streamed over `nf_dstate_tile`/`fl_dstate_tile` with disjoint
+  per-branch locals. A spill of a hand-written resident `[BK=128]` row does not
+  satisfy this condition, because the mirror source deliberately does not write
+  that structure; W0's first attempt measured exactly that and the negative
+  result did not follow. **Measured 2026-08-18: it does not spill. This
+  condition is not met** (`## Outcome`).
 - Lever OFF is not byte-identical (gate 3).
 - The A/B shows no win at c1 or c4 on an idle, clock-pinned host — the cells
   where our gap actually is (*Three reasons the end-to-end win is smaller again*).
@@ -681,26 +731,268 @@ A negative result here is a result. Record it; do not retry it silently.
   not take a lock on a second shared record surface.
 - **The GDN share of the 27B decode step is unmeasured** (*Three reasons the end-to-end win is smaller again*). Until it is, the
   0.627x state-traffic ratio bounds nothing end to end. Owned by #1171.
+- **The bare line anchors in this row's `.agents/kernel-matrix.md` cell are not
+  gate-checkable.** Eight `cuda_gdn.cu` anchors, ten line numbers between them,
+  had all drifted by a uniform **+12** under one unrelated edit to that file
+  (`5ae2c100f`, three hunks between lines 1879 and 1985), and two anchors in
+  other files had drifted by +84 (`qwen3_5.cpp`) and +139 (`ops.h`). Every one
+  is re-derived and correct as of this change, and the three that name a symbol
+  now use the `path::Symbol` form that `scripts/check-symbol-anchors.py`
+  verifies. The rest are still line numbers, which that gate deliberately does
+  not check, because a bare number carries no claim to check against.
+  Converting them is a per-citation judgement about intent, so it rides with the
+  implementation change that next touches the cell rather than with this repair.
+  Owned by #1171.
 - **Whether a pin advance changes the mirror source.** SGLang cites a vLLM
   `layers/fla/ops/fused_recurrent_replayssm.py` at commit `3c85112` that resolves
   nowhere in the pinned clone (*Upstream chain (SGLang)*). Re-check at the next pin advance; if vLLM
   lands a GDN ReplaySSM, this row reconciles onto vLLM and SGLang stops being
   cited, per `AGENTS.md`.
 
+## Outcome
+
+**W0 is done and the answer is positive: the kernel does not spill. R1 is
+retired, the row is NOT closed, and W1 is the next item.** No product code was
+written, and nothing here is a speed number.
+
+This section replaces an earlier reading of W0 that concluded the opposite. That
+reading was withdrawn on fresh review, and the withdrawal is recorded below
+rather than deleted, because the mistake is the reusable part.
+
+### What was measured
+
+Six kernels in one translation unit, compiled once, so every number comes from
+one `ptxas` invocation. Source, submission script and raw logs:
+[`docs/bench-evidence/gdn-replayssm-w0-20260818/`](../../docs/bench-evidence/gdn-replayssm-w0-20260818/)
+(`probe.cu`, `build_w0.sh`, `run_on_lease.sh`, `job1.log`, `job2.log`,
+`RESULT.txt`, and for the instruction counts below `count_sass.sh`,
+`run_sass_on_lease.sh`, `job3_sass.log`, `sass.txt.gz`). `count_sass.sh` is a
+separate script rather than two more lines in `build_w0.sh` because
+`build_w0.sh`'s recorded sha256 is the provenance of `job1.log` and `job2.log`,
+and editing it would retroactively invalidate that for runs it did not
+produce.
+
+| Kernel | What it is |
+|---|---|
+| `ProbeControlRegTileKernel` | verbatim transcription of the shipped `GdnPackedDecodeRegTileKernel` (`src/vt/cuda/cuda_gdn.cu:2516-2612`) — the kernel the recorded `REG:255 + STACK:48` was measured on, so its number under this `nvcc` is the control |
+| `ProbeReplaySsmRegTileKernel` | the **first attempt**, kept verbatim: the decode step written with a resident `float sh[BK=128]` array shared by both routes |
+| `ProbeReplaySsmNonFlushKernel` | the non-flush route **alone**, with no register array: the checkpoint streamed and reduced into two scalars, plus the ring loop and the ring append. 15 of every 16 steps |
+| `ProbeReplaySsmFlushKernel` | the flush route **alone**, streaming `dk` in `FL_DSTATE_TILE = 64` tiles and re-loading the checkpoint per tile. 1 of every 16 steps |
+| `ProbeReplaySsmFlushSeqKernel` | the same, with the outer tile loop pinned to `#pragma unroll 1` |
+| `ProbeReplaySsmFusedKernel` | both routes, transcribing the pin: `NF_DSTATE_TILE = 32`, `FL_DSTATE_TILE = 64`, disjoint per-branch locals (`:391-393`) |
+
+The per-tile re-load in the flush kernels is semantically identical to the
+resident-array form, and the identity was checked rather than assumed: in the
+resident form `sh[c] * total_decay` reads values loaded before any store, and the
+only write to `state` is the final `Store` after the ring fold, so HBM still
+holds exactly those values when a tile is re-read; tiles are disjoint in `c`, so
+an earlier tile's store cannot alias a later tile's load.
+
+| Field | Value |
+|---|---|
+| Date | 2026-08-18 |
+| Device | `orin:gpu0` (Jetson AGX Orin, aarch64), leased with `rc run` |
+| Toolkit | `nvcc`/`ptxas` release 13.0, V13.0.88, build `cuda_13.0.r13.0/compiler.36424714_0` |
+| Target arch | `sm_121a` (the repo default, `CMakeLists.txt:169`), asserted present in the ELF rather than assumed |
+| Compile command | `nvcc -std=c++20 -O3 -arch=sm_121a -Xptxas -v -c probe.cu -o probe.o` |
+| Read with | `cuobjdump -res-usage`, and `nvdisasm -g` on the extracted cubin for the source attribution |
+| `COMPILE_RC` | **0**, object produced, 435,184 bytes |
+| `CUOBJDUMP_RC` / `LINEINFO_COMPILE_RC` | **0** / **0** |
+| `probe.cu` sha256 | `f7d323651cf1a5720f0ce712b802a10248278566e1abb9ecdbae8e62fcf0f4b3` |
+| `build_w0.sh` sha256 | `c5218d087949e94647e28d6799b2f870e34643bc754dfaec084b562fd979ef55` |
+| `count_sass.sh` sha256 | `377bb25bf8900ffa70728a0a44bb52861926d07642bea9eade9b226463208172` (the committed file is byte-identical to the one that ran; `job3_sass.log` prints it) |
+| `sass.txt` sha256 | `b452d21124d2f1cd12a64850d6d14acf7c8ddb2bf7fac005b519539ab37c81a9`, 3,018,425 bytes, committed gzipped as `sass.txt.gz` |
+| Reproduced | three separate `rc run` jobs — `629f4fd6` (`job1.log`), `1ef2dbe4` (`job2.log`) and `cbfa6469` (`job3_sass.log`) — with byte-identical register, stack and LDL/STL numbers. All three landed on the same worker `rc-worker-lnvw6`, the same box and the same toolkit, so what this reproduces is **compiler determinism on one host**, not independence of host, toolkit or `nvcc` version. A second toolkit or a second box would be a different claim, and it is not made |
+
+The lease was taken on `orin` rather than a Blackwell box because **this is
+compile-only**: `cuobjdump` and `nvdisasm` read a compiled object and never
+execute the kernel, so `sm_121a` needs the toolkit and the `-arch` flag, not a
+GB10. Every fleet box is aarch64, so the host does not enter the codegen either.
+`orin` has local storage only and cannot see the NAS, so `probe.cu` and
+`build_w0.sh` are staged by base64 on the `rc run` command line
+(`run_on_lease.sh`).
+
+### The numbers
+
+| Kernel | REG | STACK | spill st | spill ld | SHARED |
+|---|---|---|---|---|---|
+| `ProbeReplaySsmNonFlushKernel` — 15-of-16 route | **42** | **0** | 0 | 0 | 2248 |
+| `ProbeReplaySsmFlushKernel` — 1-of-16 route | **94** | **0** | 0 | 0 | 2180 |
+| `ProbeReplaySsmFlushSeqKernel` — same, `unroll 1` | **94** | **0** | 0 | 0 | 2180 |
+| `ProbeReplaySsmFusedKernel` — both routes, pin's tiling | **95** | **0** | 0 | 0 | 2248 |
+| `ProbeReplaySsmRegTileKernel` — first attempt, resident `sh[128]` | 255 | 96 | 96 | 96 | 2248 |
+| `ProbeControlRegTileKernel` — the shipped hand kernel | 255 | 56 | 56 | 56 | 2048 |
+
+Against the pair recorded at `src/vt/cuda/gdn_packed_decode_triton.h:9-14`:
+
+| Arm | REG | STACK | Spills? |
+|---|---|---|---|
+| Triton/ptxas, resident `[BV=32,BK=128]` fp32 tile | 205 | 0 | no |
+| hand CUDA, recorded dgx phase1 2026-07-16 | 255 | 48 | yes |
+| hand CUDA control, re-measured here | 255 | 56 | yes |
+| hand CUDA ReplaySSM, resident `sh[128]` (first attempt) | 255 | 96 | yes |
+| **hand CUDA ReplaySSM, the pin's streamed shape** | **95** | **0** | **no** |
+
+The control reproduces the recorded spill under a newer toolkit — 48 to 56 bytes
+is toolkit drift, while the saturated 255 registers and the spilling itself are
+unchanged. So the new numbers are read against a live control, not against a
+figure from another month.
+
+**Verdict: the structure was the whole story.** The same algebra, the same tile,
+the same toolkit and the same translation unit go from `REG:255 + STACK:96` to
+`REG:95 + STACK:0` when the state slice is streamed over `32`/`64`-wide dstate
+tiles instead of held whole — which is what the mirror source does, and why it
+does it. The register file is not the wall for ReplaySSM.
+
+The Triton row sits in the table above for reference and nothing is concluded
+from it. `gdn_packed_decode_triton.h:9-14` records `REG:205` for a **resident**
+`[BV=32,BK=128]` fp32 tile, while the fused probe streams `32`/`64`-wide slices;
+the two counts describe different structures, which is the finding of this
+section, so reading `95 < 205` as a win would be the same category error in the
+other direction.
+
+### The `REG:42` kernel is not a stub
+
+A low register count has an uninteresting explanation available: `ptxas` deleted
+the work. The W0 review closed that question by inference, from three
+independent arguments over the source and the other kernels' numbers. That
+reasoning stands and is not restated here, because a count answers the question
+outright, and a count costs one line. So it was taken:
+`cuobjdump -sass` on the same object, and one line of `awk` counting the
+`/*ffff*/` address comments that mark each SASS instruction, per `Function :`
+header (`count_sass.sh`, `job3_sass.log`).
+
+| Kernel | REG | SASS instructions |
+|---|---|---|
+| `ProbeReplaySsmNonFlushKernel` | 42 | **1,688** |
+| `ProbeReplaySsmFlushKernel` | 94 | 1,872 |
+| `ProbeReplaySsmFlushSeqKernel` | 94 | 1,872 |
+| `ProbeReplaySsmFusedKernel` | 95 | 2,320 |
+| `ProbeControlRegTileKernel` | 255 | 2,000 |
+| `ProbeReplaySsmRegTileKernel` | 255 | 2,816 |
+
+`REG:42` buys 1,688 instructions, within a factor of 1.2 of the 2,000-instruction
+control, so nothing was folded away. The ordering is the one the structure
+predicts: the non-flush route alone is the smallest, adding the flush route costs
+about 630 instructions, and the first attempt's resident `sh[128]` is the largest
+of all — it pays for the spill traffic the previous subsection attributes. That
+run also re-emitted every register, stack and spill figure identically, so it is
+a third reproduction as well as a new count. It is still a static property of the
+object: an instruction count is not a cycle count and says nothing about speed.
+
+The compile produced 435,296 bytes against the 435,184 recorded above, from the
+same `probe.cu` (sha256 `f7d3236…`) and the same command. The difference is the
+output path baked into the object — `/tmp/replayssm-w0b-sass/` against
+`/tmp/replayssm-w0b/` — and not a codegen difference, which is why every
+per-kernel number is byte-identical.
+
+### Where the spill actually was — a static count is not a per-step cost
+
+The withdrawn reading asserted that "a kernel that spills pays local-memory
+traffic on every step". `ptxas -v` cannot support that: it reports one static
+byte count for a whole kernel and says nothing about which branch the
+instructions sit in. So the object was recompiled with `-lineinfo`, the cubin
+extracted, and every `LDL`/`STL` attributed to its `probe.cu` line with
+`nvdisasm -g` (`job1.log`, section *every LDL/STL with the probe.cu line it came
+from*). Splitting at the first attempt's `if (is_flush) {`:
+
+| Kernel | STL every-step | STL flush-only | LDL every-step | LDL flush-only |
+|---|---|---|---|---|
+| `ProbeReplaySsmRegTileKernel` | 21 | 3 | 0 | **24** |
+| `ProbeControlRegTileKernel` | 14 | — | 14 | — |
+| the four streamed kernels | 0 | 0 | 0 | 0 |
+
+So the claim was half right and the half that was wrong is the half it argued
+from. Every one of the first attempt's 24 spill **loads** sits inside the flush
+branch, which runs on 1 step in 16; its spill **stores** are mostly on the
+non-flush readout (`dot_q += sh[c] * bq[c]` / `dot_k += sh[c] * bk[c]`) and are
+paid every step. A spilling kernel with a write-only spill on the hot path and
+its reload behind a 1-in-16 branch is a much weaker case than "pays local-memory
+traffic on every step", and no inference about ReplaySSM's viability could rest
+on it. The control has no flush route at all, so all 28 of its spill
+instructions are every-step — which is consistent with the recorded fact that it
+lost its A/B.
+
+### What the first attempt got wrong, and why it looked convincing
+
+The measurement itself was sound: same translation unit, live control,
+reproduced, provenance verified. What failed was the object under measurement.
+`probe.cu`'s first version declared `float sh[BK]` with `BK == 128`, filled it
+fully unrolled, and reused the same array in the flush branch, keeping 128 floats
+live across the entire step — and its own comment said that was deliberate. The
+pin does the opposite on purpose, on the exact axis being measured, and says so
+in three places (`:309-311`, `:361`/`:395`, `:391-393`) plus a tuned config that
+never reaches 128 (`replayssm_config.py:47-52`). The non-flush route — 15 of
+every 16 steps, and where 100% of the claimed saving lives — was never compiled
+on its own, although it needs no register array at all.
+
+The lesson is not "check the tile width". It is that **a probe measures the
+structure you wrote, not the structure the row is about**, and a negative result
+is only as strong as the transcription under it. A spill number is a fact about
+`probe.cu`; the row's question is a fact about the mirror source.
+
+### What was deliberately not done
+
+- **No product code.** W1 through W5 are not started. The probe is an evidence
+  artifact and nothing links it.
+- **No performance number of any kind.** *The A/B* remains **UNMEASURED**.
+  Nothing here supports a speed, throughput, latency or TPOT claim in either
+  direction, and a register count is not one.
+- **No numeric gate.** The probe is compiled, never run. Its algebra was checked
+  by inspection against *Design*; that is not a correctness proof and T1 still
+  owes one.
+- **No occupancy or launch-config work.** `REG:95` implies a theoretical
+  occupancy, not an achieved one.
+- **No claim that a 32-wide resident NF tile is separately affordable.**
+  `ProbeReplaySsmNonFlushKernel` is *lighter* than the pin, not equal to it: it
+  reduces the checkpoint into two scalars and declares no NF tile array at all,
+  so its `REG:42` bounds that route's arithmetic and its memory pattern, not the
+  pin's storage. The pin-shaped tiling — `NF_DSTATE_TILE = 32` and
+  `FL_DSTATE_TILE = 64` as disjoint per-branch locals — is measured only in
+  `ProbeReplaySsmFusedKernel`, at `REG:95`, and `ptxas` has very likely
+  scalarized that kernel's `st[32]` too, since a fully unrolled loop over a
+  compile-time-sized local array is exactly what it promotes. What the six
+  kernels jointly establish is that **no shape tried here spills**, which is
+  what R1 asked. They do not establish the register cost of a 32-wide array the
+  compiler is forced to keep resident, and no such kernel was written.
+
+### The question W0 replaces R1 with
+
+Registers were the wrong wall, so name the right one before W1 starts. A streamed
+kernel buys its low register count by re-reading the state from HBM inside a loop
+the compiler cannot fully unroll, which exposes load latency the resident form
+hides behind instruction-level parallelism. A low register count is therefore not
+a free win: it is a different trade, and this probe measures only one side of it.
+Nothing about which side wins on this shape can be read off `cuobjdump`.
+
+That question belongs to *The A/B*, against the vendored FLA cubin denominator
+(R2), and it is the first thing that can still close the row.
+
 ## Now
 
-Row `KERNEL-GDN-REPLAYSSM` is **`READY`**. This change commits the spec and the
-issue only. No product code, no kernel, no measurement.
+Row `KERNEL-GDN-REPLAYSSM` stays **`READY`**. W0 is complete and its answer is
+positive, so the row remains claimable and the state does not move: nothing was
+implemented, and no lifecycle transition happened that would owe
+`docs/STATUS.md` or `docs/BENCHMARKS.md`. A register count is not a throughput,
+latency or memory measurement.
 
-The gap is verified: `grep -rniE 'replayssm' src include tests` is empty, no open
-issue or pull request covers it, and the two nearby unmerged branches
-`row/PERF-GDN-BF16-CHAIN` and `row/PERF-27B-BF16-FP8-OUT` were checked
-individually and carry no ReplaySSM.
+The gap is still verified: `grep -rniE 'replayssm' src include tests` is empty.
 
-Next action, for a fresh implementer: **do not start with the kernel.** Start
-with R1, because it can close the row on its own. Write the buffered kernel far
-enough to compile for the `[BV=32, BK=128]` 27B tile, run `cuobjdump`, and read
-the register count against the recorded `REG:205` (Triton) and `REG:255 +
-STACK:48` (hand CUDA) at `src/vt/cuda/gdn_packed_decode_triton.h:9-14`. If it
-spills, stop and record the negative result under `## Outcome`. Only if it does
-not spill is T1 (*Tests to port*) worth writing.
+What changed is the risk picture, and it changed twice. R1 — register pressure —
+is **retired by measurement**: in the shape the pin specifies, the decode step
+compiles at `REG:42` (non-flush route), `REG:94` (flush route) and `REG:95` (both
+fused), with zero spill, under `nvcc 13.0.88` for `sm_121a`, against a
+same-toolkit control of `REG:255 + STACK:56` for the shipped hand kernel. An
+earlier W0 reading concluded the opposite from a kernel that held the `[BK=128]`
+state row in registers — a structure the mirror source deliberately avoids — and
+that reading is withdrawn. `## Outcome` carries both, the command, the toolkit
+and the raw numbers.
+
+Next action, for a fresh implementer: **W1**, and read `## Outcome` first — in
+particular *The question W0 replaces R1 with*. Do not re-run the register probe;
+it is done, its numbers re-emitted identically across three jobs on the same
+worker and toolkit, and its artifacts are committed. The
+open wall is R2 and *Traffic model*: whether a streamed kernel's exposed load
+latency costs more than the traffic it saves, measured against the vendored FLA
+cubin denominator in *The A/B*. Nothing in W0 licenses a speed claim in either
+direction.

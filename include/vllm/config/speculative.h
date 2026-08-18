@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vllm {
@@ -153,9 +154,20 @@ struct SpeculativeConfig {
   //
   // `n_predict` / `dspark_block_size` are std::nullopt when the draft's HF config
   // carries no such key, mirroring upstream's getattr(..., None).
-  static SpeculativeConfig ResolveDspark(std::optional<int> n_predict,
-                                         std::optional<int> dspark_block_size,
-                                         std::optional<int> user_num_speculative_tokens) {
+  //
+  // `block_size_key` names the config key `dspark_block_size` was read from, and
+  // exists only so the refusal can quote it. Upstream has one key and can name it
+  // literally; we have two, because the fallback below reads `block_size` on the
+  // published Qwen3 drafts (the divergence argued in
+  // .agents/specs/dspark-block-size-guard.md section 2). A message that says
+  // `dspark_block_size` when the 7 came from `block_size` sends the user looking
+  // for a key their checkpoint does not carry, which on both published drafts is
+  // always the case. It defaults to upstream's key, so a caller that supplies the
+  // upstream field gets upstream's wording unchanged.
+  static SpeculativeConfig ResolveDspark(
+      std::optional<int> n_predict, std::optional<int> dspark_block_size,
+      std::optional<int> user_num_speculative_tokens,
+      std::string_view block_size_key = "dspark_block_size") {
     SpeculativeConfig cfg;
     cfg.method = "dspark";
     cfg.parallel_drafting = true;
@@ -177,11 +189,17 @@ struct SpeculativeConfig {
           "\"num_speculative_tokens\" was not provided");
     }
     if (dspark_block_size.has_value() && *k < *dspark_block_size) {
+      // speculative.py:1021-1026 verbatim, including the third sentence that
+      // says which value to use. It was dropped when the check was first ported
+      // and is restored here: the first two sentences tell the user the k is
+      // wrong, and only the third tells them what to type.
       throw std::invalid_argument(
-          "speculative-config: DSpark requires num_speculative_tokens >= "
-          "dspark_block_size (" +
+          "speculative-config: DSpark requires num_speculative_tokens >= " +
+          std::string(block_size_key) + " (" +
           std::to_string(*dspark_block_size) + "); got " + std::to_string(*k) +
-          ". Smaller values produce incorrect output.");
+          ". Smaller values produce incorrect output. Use "
+          "num_speculative_tokens=" +
+          std::to_string(*dspark_block_size) + " or larger (e.g. 7).");
     }
     cfg.num_speculative_tokens = k;
     return cfg;

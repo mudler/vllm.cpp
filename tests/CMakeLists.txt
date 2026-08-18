@@ -565,6 +565,13 @@ vllm_cpp_add_test(test_gemma_load vllm/models/test_gemma_load.cpp)
 vllm_cpp_add_test(test_gemma_forward vllm/models/test_gemma_forward.cpp)
 target_include_directories(test_gemma_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
+# #1205: the Gemma-4 device-expert upload must refuse where `vt::MatmulBTAlphaBeta`
+# has no arm, entered through `vllm::RunGemma4Moe`. Its own binary: the layer's
+# env knobs are frozen into function-local statics on the first call, so the arm
+# it measures has to be decided before main() and cannot share a process with a
+# case that wants a different one.
+vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
+                  vllm/models/test_gemma4_moe_device_arm_guard.cpp)
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1261,6 +1268,7 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses

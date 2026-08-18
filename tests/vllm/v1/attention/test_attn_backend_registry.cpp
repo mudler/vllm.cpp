@@ -42,6 +42,7 @@ using vllm::v1::HasAttentionBackend;
 using vllm::v1::MakeAttentionBackend;
 using vllm::v1::RegisterAttentionBackend;
 using vllm::v1::SelectAttentionBackend;
+using vllm::v1::CheckKvCacheShape;
 using vllm::v1::SelectAttentionBackendName;
 using vt::DeviceType;
 using vt::DType;
@@ -435,6 +436,49 @@ TEST_CASE("selection stops at the first registered name (not always FLASH_ATTN)"
                            });
   TopIsTestBackendPlatform p;
   CHECK(SelectAttentionBackendName(p) == "TEST_ONLY_ATTN");
+}
+
+TEST_CASE("the runner's KV-shape contract rejects a mis-shaped backend (M3)") {
+  // The guarantee behind the runner's init-time validation: a backend that
+  // declares a KV layout the engine does not allocate must fail LOUDLY, not
+  // silently mis-view the cache. Register a deliberately mis-shaped scratch
+  // backend (upstream's K/V-outermost ROCM_ATTN shape, rocm_attn.py:247-256)
+  // and assert vllm::v1::CheckKvCacheShape — the exact check the runner runs
+  // per attention group — throws on both expected views.
+  // No static members: this is a LOCAL class (a static constexpr data member
+  // is ill-formed there), so the name is spelled inline.
+  class MisShapedAttentionBackend final : public AttentionBackend {
+   public:
+    std::string get_name() const override { return "TEST_MISSHAPED_ATTN"; }
+    std::vector<int64_t> get_kv_cache_shape(
+        int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+        int64_t head_size, const std::string& /*cache_dtype_str*/) const override {
+      // A "future backend with a different layout": K/V split OUTERMOST.
+      return {2, num_blocks, block_size, num_kv_heads, head_size};
+    }
+  };
+  RegisterAttentionBackend(DeviceType::kCUDA, "TEST_MISSHAPED_ATTN",
+                           []() -> std::unique_ptr<AttentionBackend> {
+                             return std::make_unique<MisShapedAttentionBackend>();
+                           });
+  // Dense group expects the NHD 5-dim; MLA group the fused 3-dim — the
+  // mis-shaped backend declares neither.
+  CHECK_THROWS_AS(CheckKvCacheShape(DeviceType::kCUDA, "TEST_MISSHAPED_ATTN", 8, 16, 2,
+                                    128, /*is_mla=*/false),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(CheckKvCacheShape(DeviceType::kCUDA, "TEST_MISSHAPED_ATTN", 8, 16, 1,
+                                    576, /*is_mla=*/true),
+                  std::invalid_argument);
+  // Positive controls — the comparison is real, not an echo of the engine's
+  // own numbers: FLASH_ATTN matches the dense NHD view, TRITON_MLA the fused
+  // MLA view, and FLASH_ATTN against the WRONG (MLA) expected view throws.
+  CHECK_NOTHROW(CheckKvCacheShape(DeviceType::kCUDA, "FLASH_ATTN", 8, 16, 2,
+                                  128, /*is_mla=*/false));
+  CHECK_NOTHROW(CheckKvCacheShape(DeviceType::kCUDA, "TRITON_MLA", 8, 16, 1,
+                                  576, /*is_mla=*/true));
+  CHECK_THROWS_AS(CheckKvCacheShape(DeviceType::kCUDA, "FLASH_ATTN", 8, 16, 2,
+                                    128, /*is_mla=*/true),
+                  std::invalid_argument);
 }
 
 TEST_CASE("CPU selection: CPU_ATTN preference falls through to FLASH_ATTN") {

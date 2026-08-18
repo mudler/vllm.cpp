@@ -425,7 +425,17 @@ int main(int argc, char** argv) {
   // Each retake knob rides the SAME per-generation array. Supplying one without
   // the window is refused by the engine rather than ignored, so a half-typed
   // retake reports what is missing instead of rendering the ordinary path.
-  for (const auto& kv : {std::make_pair("retake_start_time", &retake_start),
+  // The knobs are a NAMED array rather than a braced-init-list iterated in
+  // place. Both are correct -- a braced-init-list bound to the range variable
+  // has its backing array lifetime-extended for the whole loop -- but the
+  // in-place form draws -Wdangling-reference from gcc 16, which
+  // `build-newest-gcc` found on its first run. The warning is a false positive
+  // and it is not silenced: the range now has automatic storage and a name, so
+  // no reference binds to a temporary and the question does not arise. Making
+  // the loop variable a copy does NOT help; the diagnostic is about the range
+  // reference, not the element.
+  const std::pair<const char*, std::string*> retake_knobs[] = {
+      std::make_pair("retake_start_time", &retake_start),
                          std::make_pair("retake_end_time", &retake_end),
                          std::make_pair("retake_frame_rate", &retake_fps),
                          std::make_pair("regenerate_video", &regen_video),
@@ -452,7 +462,8 @@ int main(int argc, char** argv) {
                          std::make_pair("video_skip_step", &video_skip_step),
                          std::make_pair("video_stg_blocks", &video_stg_blocks),
                          std::make_pair("a2v_guidance_scale", &a2v_scale),
-                         std::make_pair("v2a_guidance_scale", &v2a_scale)}) {
+                         std::make_pair("v2a_guidance_scale", &v2a_scale)};
+  for (const auto& kv : retake_knobs) {
     if (kv.second->empty()) continue;
     gen_keys.emplace_back(kv.first);
     gen_values.push_back(*kv.second);

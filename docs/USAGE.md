@@ -2228,6 +2228,13 @@ Read it as follows.
 * the `calls` column on `denoise.dit_device` counts *steps*, not forwards: one
   bracket covers both classifier-free-guidance branches, so the forward count is
   twice it.
+* the `load.ar.*` and `load.ac.*` rows break the two weight loads down further.
+  They are spans *inside* the `load.ar_weights` / `load.acoustic_weights` leaves,
+  so they are printed and never summed. They exist because the safetensors
+  reader is an **mmap** whose tensors are copied out, which interleaves
+  page-fault I/O with the copy inside a single call — so the load total on its
+  own cannot say whether a slow load is storage or CPU, and `load.ac.dit_build`
+  in particular touches no file at all.
 
 It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
 other value, including a near miss like `y`, leaves it off — an operator who

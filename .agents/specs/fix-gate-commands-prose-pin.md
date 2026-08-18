@@ -89,10 +89,23 @@ titles it. Every disposition this row has ever recorded lives in that lead:
 | `fe24a3029` | `Device byte-identity A/B — RAN 2026-08-18, PASS; see [...](#outcome).` |
 
 A status word in the lead is a declaration about the gate. The same word in the
-body is ordinary prose. That distinction is what makes the lead the anchor, and
-it is measured rather than assumed. Item 5 contains the word `fail` in its body,
-in the phrase "proving the instrument can fail", and a whole-item search credits
-item 5 with a disposition it does not declare. A lead-scoped search does not.
+body is ordinary prose describing what the gate does. That distinction is what
+makes the lead the anchor, and it is measured rather than assumed.
+
+**The first measurement refuted the first hypothesis, and the record keeps both.**
+The drafted reason was that item 5 of this row's spec picks up the word `fail`
+from the body phrase "proving the instrument can fail". It does not, because the
+shipped vocabulary carries `failed` and not `fail`. All 7 gate items of
+`eng-cudagraph-dedup.md` agree under both scopes, so that spec cannot pin
+lead-scoping and a mutation widening the scope stayed green against it.
+
+Surveyed instead over every `Gates` section in `.agents/specs/` on 2026-08-18:
+**32 of 323 gate items gain a disposition when the search widens from the lead to
+the whole item.** Among them are `**No regression:**` in `cpu-elementwise-gemm.md`
+and `**Correctness gate:**` in `dropin-kernel-abi.md`, which both pick up `pass`
+out of body prose. Lead-scoping is load-bearing across the corpus and is pinned by
+a written-out fixture of that shape, not by another row's live sentence. Pinning a
+sentence in a file this row does not own is the defect this row exists to remove.
 
 Three functions land in `scripts/check-gate-commands.py`:
 
@@ -140,9 +153,10 @@ rule is recorded as owed below rather than shipped loose.
 - `tests/scripts/test_check_gate_commands.py::test_cudagraph_dedup_is_credited_for_real_commands`,
   rewritten onto the structural anchor.
 - `tests/scripts/test_check_gate_commands.py::test_gate_disposition_reads_the_lead_not_the_body`,
-  new. It pins the item-5 false positive that lead-scoping removes, and it pins
-  both historical wordings of item 6 as fixtures, which is what proves the
-  assertion is state-independent rather than re-pinned to today's sentence.
+  new. It pins lead-scoping against a written-out fixture of the shape the survey
+  found, and it pins both historical wordings of item 6 as fixtures, which is what
+  proves the assertion is state-independent rather than re-pinned to today's
+  sentence.
 
 ## Gates
 
@@ -173,6 +187,19 @@ rule is recorded as owed below rather than shipped loose.
 | Containing the stderr that `test_check_mode_is_never_silently_swallowed_by_json` prints on every green run | [#1229](https://github.com/mudler/vllm.cpp/issues/1229) | the line `ERROR: these baseline rows left the gated population: ROW-THAT-IS-NOT-THERE` is that fixture's expected negative-path output and not a defect, established by running the fixture alone. It is still an error message on a green run, which is the shape that lets a real one hide. Changing a passing test needs its own red-before evidence, so it is filed rather than folded in |
 
 ## Outcome
+
+**Refuted hypothesis, recorded rather than dropped.** The design first justified
+lead-scoping with item 5 of `eng-cudagraph-dedup.md`, on the reading that its body
+phrase "proving the instrument can fail" would credit it under a wider search. The
+mutation that widens `gate_disposition` from the lead to the whole item stayed
+GREEN, which is how the claim was caught. The shipped vocabulary carries `failed`
+and not `fail`, and all 7 gate items of that spec agree under both scopes. The
+survey over all 323 gate items replaced the anecdote and found the real figure,
+32, along with two examples that do behave the way the anecdote predicted. The
+mutation goes red now because the test pins a fixture of that measured shape.
+
+The lesson repeats the row's own: the first rationale was a plausible sentence,
+and a sentence is not a measurement. The mutation is what told them apart.
 
 The assertion was not wrong when it was written. It named the right leg and the
 right hazard. It encoded the hazard as the sentence that happened to express it,

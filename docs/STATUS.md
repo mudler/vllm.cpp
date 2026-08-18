@@ -203,8 +203,16 @@ W2 (2026-08-18, #1261) migrates the first driver: the shared dense decode graph
 now captures and replays through the seam instead of its own `BeginCapture` pair
 and raw handle. It captures in FULL mode, mirroring vLLM's decode arm, so a
 decode step keeps the single graph it already had; the PIECEWISE arm has no
-production driver yet. Bit-exactness against a REPLAYED capture on a real GPU is
-owed, not met.
+production driver yet, because the break closure W1 registered reads a returned
+frame on replay. Bit-exactness against a REPLAYED capture on a real GPU is owed,
+not met.
+
+A capture that FAILS is now distinguishable from a scope that was INERT. The
+capture scope has to swallow a throwing `EndCaptureGraph` — a destructor that
+propagates terminates — and both states left the container reporting
+"not captured", so a driver reading only that bit could return uncomputed device
+memory as a decode step's logits. The container records the failure and the
+exception, and the driver propagates it.
 
 The stage's exit criterion was measured rather than assumed: ending a capture
 and BEGINNING A NEW ONE on the same stream mid-forward, with eager work between,

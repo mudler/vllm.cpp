@@ -1002,3 +1002,124 @@ TEST_CASE("Mode: registering a break into a kFull scope is REFUSED") {
   CHECK(g2.break_count() == 1);
   CHECK(g2.segment_count() == 2);
 }
+
+// ---------------------------------------------------------------------------
+// Test 13d, the DISTINCTION the drain owed a driver. W2's fresh review found the
+// HIGH this closes.
+// ---------------------------------------------------------------------------
+//
+// The drain (13a/13b/13c) is correct and stays: a destructor that propagated
+// would terminate. But it leaves the container in the SAME observable state as a
+// scope that was never active — `captured() == false` — and those two states have
+// OPPOSITE meanings for the caller. An INERT scope ran the forward EAGERLY, so
+// the values the caller holds are real. A FAILED capture ran NOTHING: under
+// stream capture every operation between `BeginCapture` and the failure was
+// RECORDED, not executed, so the caller's buffers hold whatever the pool last
+// left there. A driver that cannot tell the two apart returns uncomputed memory
+// as its step's result, silently, and no token gate can see it
+// (`src/vllm/model_executor/models/qwen3.cpp`, the HIGH this case gates).
+//
+// `capture_failed()` is that distinction, and `capture_error()` carries the
+// ORIGINAL exception where the seam holds it, so a driver can propagate the
+// runtime's own diagnosis instead of inventing one.
+TEST_CASE("Test 13d: a DRAINED capture records that it drained; an INERT scope does not") {
+  RequireCaptureLane();
+
+  // ARM 1, the FAILED capture: the close refuses, the destructor swallows (it
+  // must), and the container says so.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE(scope.active());
+      b.FailNextEndCapture();
+    }
+    CHECK_FALSE(g.captured());
+    CHECK(g.capture_failed());
+    REQUIRE(g.capture_error() != nullptr);
+    // The ORIGINAL error, not a substitute: a driver rethrows this so the
+    // runtime's own message reaches the operator.
+    CHECK_THROWS_AS(std::rethrow_exception(g.capture_error()), std::runtime_error);
+  }
+
+  // ARM 2, an exception PROPAGATING through the scope. The drain fires on the
+  // uncaught-depth comparison rather than on a throwing close, and the container
+  // records the FAILURE but not a cause — pinned here because it is the one
+  // place the two accessors disagree, and the disagreement is a language rule,
+  // not a bug. No handler has been entered for an exception that is still
+  // unwinding, so `std::current_exception()` in `~GraphCaptureScope` is null.
+  // Nothing is lost: on this arm the real exception reaches the caller under its
+  // own power, which is what `CHECK_THROWS_AS` below observes.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    CHECK_THROWS_AS(
+        [&] {
+          GraphCaptureScope scope(b, q, g);
+          throw std::runtime_error("model code blew up");
+        }(),
+        std::runtime_error);
+    CHECK_FALSE(g.captured());
+    CHECK(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+  }
+
+  // ARM 3, the INERT scope — the CONTROL, and the arm that makes this a
+  // distinction rather than a flag that is always set. The backend cannot
+  // capture, the forward ran eager, and there is no error to report. Without
+  // this arm a driver that treated `!captured()` as failure would look gated.
+  {
+    RecordingCaptureBackend b(/*supports_capture=*/false);
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      CHECK_FALSE(scope.active());
+    }
+    CHECK_FALSE(g.captured());
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+  }
+
+  // ARM 4, a CLEAN capture. Nothing failed, so nothing is recorded — and
+  // `Reset()` returns the container to its as-constructed state, error included,
+  // so a stale failure cannot outlive the capture that produced it.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE(scope.active());
+    }
+    REQUIRE(g.captured());
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+
+    g.Reset();
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+
+    // Now FAIL a capture on the same container, and then SUCCEED on it without
+    // an intervening `Reset()` — which is legal, because the drain already reset
+    // it. The clear at scope ENTRY is what this pins: without it the container
+    // would report a graph it holds AND a failure it recovered from, and a
+    // driver reading the failure first would refuse a step that captured fine.
+    {
+      GraphCaptureScope scope(b, q, g);
+      b.FailNextEndCapture();
+    }
+    REQUIRE(g.capture_failed());
+    REQUIRE(g.capture_error() != nullptr);
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE(scope.active());
+    }
+    REQUIRE(g.captured());
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+  }
+}

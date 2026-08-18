@@ -788,6 +788,13 @@ argument, not a performance one.** No throughput is claimed and none was
 measured; `kFull` is what keeps the migrated step's shape the one it already
 had.
 
+**That degradation is a CONDITIONAL, and the order matters.** It is what a
+piecewise decode capture costs once the capture WORKS. Today it does not: the
+same one-token change faults on the first replay for the lifetime reason in the
+next paragraph, measured as mutation D in `## Outcome`. Both are true and only
+the second is currently observable; W2's first head stated the first as though
+the second did not exist.
+
 **The piecewise arm does not reach this driver at W2, and the reason is a
 lifetime, not a preference.** The registered break point's closure captures
 `RunLayer`'s frame by reference — `dhn`, `si`, `meta`, `T` — every one of which
@@ -1096,7 +1103,19 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   header and this spec state the guarantee only for the propagating case, so
   this is a RESIDUAL rather than a false claim — but a driver that wraps a break
   in a `try` gets silently wrong numerics on replay, and W2 is the first stage
-  that opens a scope from a driver. Owner: **W2**.
+  that opens a scope from a driver. **W2 did not close it and did not need to:**
+  its scope is `kFull`, so it has ONE segment and no `try` anywhere inside it,
+  and a `kFull` capture has no between-segments window for a caught exception to
+  truncate. The residual becomes live for the first driver that captures
+  PIECEWISE. Owner: **W4**, with the piecewise arm it unblocks.
+  What W2 DID close is the adjacent hole the fresh review found, and it is
+  recorded here because the two are easy to confuse: the drain leaves a FAILED
+  capture reporting exactly what an INERT scope reports, and the first W2 head
+  read that one bit and returned the uncomputed layer output as the step's
+  logits. `vt::BreakableGraph::capture_failed()` / `capture_error()` separate the
+  two states, the driver rethrows, and
+  `tests/vt/test_breakable_graph.cpp` test 13d plus
+  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp` gate both.
 - **The reuse hazard the seam must close** (D1): making the intermediates a
   segment reads unavailable to the `DevicePool` free list for the life of the
   `BreakableGraph`. W1 states the lifetime rules at the `GraphBreak` declaration
@@ -1161,6 +1180,31 @@ and `## Owed` and `## Outcome` are new. The framing is unchanged and is not
 negotiable — coverage and correctness, never speed. No throughput gate is
 declared and none was measured.
 
+Revised 2026-08-18 a fifth time, after a fresh review of the W2 head returned
+`FAIL` (one HIGH, one MEDIUM, two LOW). What changed. **The HIGH:** the driver
+read `captured() == false` as "the scope was inert" and returned the layer
+output as the step's logits, which on CUDA is uncomputed device memory, because
+`~GraphCaptureScope` must swallow a throwing `EndCaptureGraph` and the container
+had no way to say WHICH of the two states it was in. `BreakableGraph` now
+records `capture_failed()` and `capture_error()`, the driver rethrows the
+runtime's own exception, and both the seam-level and driver-level arms are gated
+(`tests/vt/test_breakable_graph.cpp` test 13d;
+`tests/vllm/models/test_qwen3_decode_graph_seam.cpp`). **The MEDIUM:** the
+counterfactual carrying the W2 record was stated as fact, never run, and is
+false; `## Outcome` now carries the measured mutation D and separates the two
+claims it had merged. **The LOWs:** the caught-inside-scope residual is
+reassigned from W2 to W4 with W2's disposition recorded, and a test justification
+in the G2 file that could not apply to a `kFull` container is corrected.
+
+**Disclosure, because a reader would look for it here.** The three
+`vt::GraphCaptureMode` unit cases in `tests/vt/test_breakable_graph.cpp` were
+written AFTER the implementation they cover, not red-first. The fresh review
+mutated both load-bearing halves (the `splits()` gate and the `AppendBreak`
+refusal) and each was detected, so no test-quality finding follows — but the
+order is recorded rather than left to be inferred from a green suite. The
+capture-failure gate added in the repair WAS red-first: it failed with
+`CHECK_THROWS_AS(...) did NOT throw at all!` before the driver change.
+
 Revised 2026-08-18 a fourth time, when W2 landed (#1261): `## Work breakdown`
 W2 records what shipped, `## Now` moves the owner to the W2 claim, `## Owed`
 retires the staged slice W1 left and files four new items (the piecewise arm's
@@ -1198,21 +1242,48 @@ is the PIECEWISE mode, and W1's records read as though migrating a driver onto
 the seam and splitting its capture were one act. They are two, and the primary
 oracle keeps them apart: `splitting_ops` says WHERE a graph may be split,
 `cudagraph_mode` says WHETHER this batch's graph is split at all, and for a
-decode batch vLLM's own default answers "not at all". A migration that had
-simply opened the scope would have been bit-exact, would have passed every gate
-in this tree, and would have quietly converted a shipped, default-ON, fully
-graphed decode step into twenty-eight eager attention calls per step. Nothing in
-this row's framing — coverage and correctness, never speed — licenses that, and
-no gate here could have seen it, because a token gate cannot see a segment
-count. That is D7 stated as a lived case rather than as a risk.
+decode batch vLLM's own default answers "not at all".
 
-**And the break point W1 registered is not replay-safe, which is a second thing
-counting segments could not show.** Its closure captures `RunLayer`'s frame by
-reference. W1's G2 gate opens a scope, runs the forward and counts segments; it
-never calls `Replay`, so a closure that reads a returned frame on replay N is
-invisible to it. W2 found this by asking what the driver would do if it opened
-`kPiecewise`, not by running anything — which is the argument for reading a
-closure's captures at the site rather than trusting the gate that was green.
+**What a naive piecewise migration actually does, CORRECTED and MEASURED.** W2's
+first head asserted that opening the scope `kPiecewise` and changing nothing else
+"would have been bit-exact and would have passed every gate in this tree". That
+was reasoned, never run, and it is FALSE — the fresh review ran it and so did the
+repair. Mutation D, one token (`kFull` -> `kPiecewise`) at
+`src/vllm/model_executor/models/qwen3.cpp`, compiles clean and dies on the FIRST
+replay, which the capture step itself performs:
+
+```
+vt: matmul_bt: rank-2 tensors required   (src/vt/ops.cpp:158)
+  vllm::dense_attn::AttnBlock(...)
+  vt::GraphBreak<RunLayer::{lambda#1}, std::optional<DBuf>>::{lambda#1}::operator()()
+  vt::BreakableGraph::Replay(vt::Queue&)
+  vllm::Qwen3DenseDecodeGraph::Step(...)
+```
+
+`test_qwen3_decode_graph_seam` goes 4/4 -> 1/4 with three cases THROWN, G2 having
+passed only its four cold-step assertions before the capture step's own replay
+faulted. So the naive migration is a USE-AFTER-SCOPE, loud, on the first step
+that captures — not a quiet degradation. The cause is the very next item below,
+which the same section already identified: W1's break closure captures
+`RunLayer`'s frame by reference. The two statements contradicted each other two
+paragraphs apart, and the false one UNDERSTATED the hazard.
+
+**The part that was true, and is worth keeping separately.** HAD the closure been
+replay-safe, the piecewise split would have converted a shipped, default-ON,
+fully graphed decode step into twenty-eight eager attention calls per step, and
+no gate here could have seen it, because a token gate cannot see a segment count.
+Nothing in this row's framing — coverage and correctness, never speed — licenses
+that. That is why `kFull` is a MIRRORING requirement and not a preference. But it
+is a conditional, not the observed behaviour: today the same change faults first.
+D7 therefore stands as a risk with one measured half, not as a lived case.
+
+**And the break point W1 registered is not replay-safe, which is what mutation D
+exposes.** Its closure captures `RunLayer`'s frame by reference. W1's G2 gate
+opens a scope, runs the forward and counts segments; it never calls `Replay`, so
+a closure that reads a returned frame on replay N was invisible to it. W2 found
+this by READING the closure's captures at the site rather than by trusting the
+gate that was green; mutation D is the run that confirms it, and it is recorded
+here so a later stage does not have to re-derive either half.
 
 **The finding worth keeping at the top level.** The seam's most-documented rule —
 that the destination must outlive the graph — was broken by the ONLY site that

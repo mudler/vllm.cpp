@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -946,12 +947,47 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
             static_cast<int64_t>(pam.num_reqs));
       }
     }  // ~GraphCaptureScope closes the segment and files it on s.graph
-    // A capture that threw is DRAINED by the scope rather than reported: the
-    // container is Reset() and `captured()` is false, so this step falls through
-    // to the same eager result the cold path returns and the next same-size step
-    // re-warms. That is the recovery three drivers wrote by hand.
+    // NOT CAPTURED covers TWO states, and returning `*lg` is correct for exactly
+    // one of them. `~GraphCaptureScope` must swallow a throwing
+    // `EndCaptureGraph` — a destructor that propagates terminates — so a FAILED
+    // capture leaves the container reporting what an INERT scope reports.
+    //
+    //   * INERT (`capture_failed() == false`): the backend cannot capture, or
+    //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, the layer
+    //     region above ran EAGERLY, and `*lg` is a real result. Return it and
+    //     go back to cold so the next same-size step re-warms.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph`
+    //     threw — `cudaStreamEndCapture` returning
+    //     `cudaErrorStreamCaptureInvalidated`/`WrongThread`, or a failing
+    //     `cudaGraphInstantiate` (`src/vt/cuda/cuda_backend.cu:229`, `Check()`
+    //     at `:50`). Under stream capture NOTHING between `BeginCapture` and
+    //     the throw executed: every kernel was RECORDED, so `*lg` is
+    //     pool-recycled memory. Returning it would hand this step uncomputed
+    //     device memory as its logits — silently wrong tokens, no fault, and a
+    //     token gate cannot see it.
+    //
+    // So the failure PROPAGATES, carrying the runtime's own exception. This is
+    // what the pre-seam driver did (`s.graph = b.EndCaptureGraph(...)` was
+    // unguarded), and it is not a recovery this stage can justify inventing: a
+    // stream whose capture was INVALIDATED has not told us it is usable, and the
+    // three hand-rolled drains this migration cites drain and RETHROW THE
+    // ORIGINAL ERROR (`qwen3_5.cpp:10184`, `:10609`, `qwen3_dflash.cpp:1106`)
+    // rather than returning a value. Gated at
+    // `tests/vllm/models/test_qwen3_decode_graph_seam.cpp`.
     if (!s.graph.captured()) {
-      s.warm = false;
+      s.warm = false;  // either way this slot goes back to cold
+      if (s.graph.capture_failed()) {
+        const std::exception_ptr err = s.graph.capture_error();
+        s.graph.Reset();  // clear the failure with the graph it described
+        // The runtime's OWN diagnosis where the seam holds it. It is empty only
+        // on the arm where an exception was already propagating THROUGH the
+        // scope, which cannot reach this line; the refusal below is what makes
+        // that unreachability an assertion rather than a claim.
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "Qwen3DenseDecodeGraph: the decode capture was ABANDONED and its logits "
+                 "were never computed; refusing to return uncaptured device memory");
+      }
       ForwardLogits drained = WrapDeviceLogits(d, std::move(*lg), B, vocab);
       drained.device_tensor =
           MakeTensor(drained.device_storage.get(), DType::kF32, d.q.device, {B, vocab});

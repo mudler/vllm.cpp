@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -110,6 +111,14 @@ class CaptureCapableCpuBackend final : public vt::Backend {
   bool SupportsGraphCapture() const override { return true; }
   void BeginCapture(vt::Queue&) override { log_.push_back("Begin"); }
   void* EndCaptureGraph(vt::Queue&) override {
+    // Arm-once refusal, the shape of a real `cudaStreamEndCapture` returning
+    // `cudaErrorStreamCaptureInvalidated` / `WrongThread`, or a failing
+    // `cudaGraphInstantiate` — all three of which `Check()`
+    // (`src/vt/cuda/cuda_backend.cu:50,229`) turns into a throw.
+    if (fail_next_end_) {
+      fail_next_end_ = false;
+      throw std::runtime_error("capture-capable CPU backend: EndCaptureGraph refused");
+    }
     log_.push_back("EndCaptureGraph");
     void* tag = std::malloc(1);
     tags_.push_back(tag);
@@ -125,6 +134,8 @@ class CaptureCapableCpuBackend final : public vt::Backend {
     for (void* p : tags_) std::free(p);
   }
 
+  void FailNextEndCapture() { fail_next_end_ = true; }
+
   size_t Count(std::string_view what) const {
     size_t n = 0;
     for (const auto& e : log_)
@@ -134,6 +145,7 @@ class CaptureCapableCpuBackend final : public vt::Backend {
 
  private:
   vt::Backend& inner_;
+  bool fail_next_end_ = false;
   std::vector<std::string> log_;
   std::vector<void*> tags_;
 };
@@ -359,8 +371,12 @@ TEST_CASE("G2: Qwen3DenseDecodeGraph captures and replays THROUGH the vt seam") 
     CHECK(graph.replay_count() >= 1);
   }
 
-  // Step 4: a SECOND replay of the same captured graph, because one replay
-  // cannot distinguish a correct container from one that dropped its tail.
+  // Step 4: a SECOND replay of the same captured graph. NOT because one replay
+  // could have dropped a tail — this container is `kFull`, so `break_count()`
+  // is 0 and there is no tail to drop. What a second replay pins is that the
+  // driver's REPLAY branch is re-entrant: the third step is the first that takes
+  // it, so a branch that re-captured, reset the container, or left `warm` set
+  // would still look correct after one step and only diverge on the next.
   graph.Step({14}, {3}, DecodeMeta(3), pool.attn_kv);
   {
     const vt::GraphBreakStats s = vt::GetGraphBreakStats();
@@ -472,4 +488,66 @@ TEST_CASE("The async device-token decline still holds, and only for that conditi
   const int32_t dev_ids[1] = {11};
   in.device_token_ids = dev_ids;
   CHECK_FALSE(DenseDecodeGraphForward(graph, w, in).has_value());
+}
+
+// THE CAPTURE-FAILURE GATE, and it is the one W2's first head did not have.
+//
+// WHAT GOES WRONG WITHOUT IT. `~GraphCaptureScope` must swallow a throwing
+// `EndCaptureGraph` — a destructor that propagates terminates — so after a
+// FAILED capture the container reports exactly what an INERT scope reports:
+// `captured() == false`. The first W2 head read that one bit and returned the
+// value `ForwardLayers` had produced. On a non-capturing backend that value is a
+// real eager result. On CUDA it is not: `Backend::EndCaptureGraph`
+// (`src/vt/cuda/cuda_backend.cu:229`, `Check()` at `:50`) throws when
+// `cudaStreamEndCapture` returns `cudaErrorStreamCaptureInvalidated` or
+// `WrongThread`, or when `cudaGraphInstantiate` fails — and under stream capture
+// NOTHING between `BeginCapture` and the throw executed. Every kernel was
+// RECORDED. So the buffer held whatever the `DevicePool` last left there, and
+// the step returned pool-recycled memory as its logits: silently wrong tokens,
+// no fault, and a token gate cannot see it. The PRE-W2 driver propagated,
+// because its `s.graph = b.EndCaptureGraph(...)` was unguarded.
+//
+// WHAT THE DRIVER DOES NOW. `vt::BreakableGraph::capture_error()` separates the
+// two states the drain had merged, and the driver RETHROWS the runtime's own
+// exception rather than inventing a recovery for a stream whose state the
+// failure has not described. That restores pre-W2 behaviour exactly.
+//
+// WHAT THIS HARNESS CANNOT SEE, named rather than claimed away: a CPU "capture"
+// EXECUTES, so `lg` here holds real numbers and this file cannot exhibit the
+// uncomputed memory itself. It gates the observable that separates the two
+// behaviours — whether the failure REACHES the caller — which is exactly the
+// mutation shape the fresh review used.
+TEST_CASE("A capture that FAILS reaches the caller; the step never returns it as logits") {
+  const HfConfig c = TinyConfig();
+  const Qwen3DenseWeights w = TinyWeights(c);
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
+
+  StaticGraphCpu harness;
+  vt::Queue q = Q();
+  CachePool pool(c, /*num_blocks=*/2, /*block_size=*/8);
+  vllm::Qwen3DenseDecodeGraph graph(w, c, q, /*max_num_reqs=*/8);
+
+  // Step 1, COLD: the eager pre-warm. No capture is attempted yet.
+  graph.Step({11}, {0}, DecodeMeta(0), pool.attn_kv);
+  REQUIRE_FALSE(graph.captured());
+
+  // Step 2, WARM: the driver captures, and the close REFUSES. The failure must
+  // leave `Step`. A step that returns normally here is the defect: its result is
+  // whatever the pool held.
+  harness.backend().FailNextEndCapture();
+  CHECK_THROWS_AS(graph.Step({12}, {1}, DecodeMeta(1), pool.attn_kv), std::runtime_error);
+  CHECK_FALSE(graph.captured());
+
+  // AND THE DRIVER RECOVERS. The failed capture is not sticky: the slot went
+  // back to cold, so the next step is eager and the one after it captures
+  // cleanly. Without this arm the fix could be "throw forever" and look gated.
+  graph.Step({13}, {2}, DecodeMeta(2), pool.attn_kv);
+  const vllm::ForwardLogits after =
+      graph.Step({14}, {3}, DecodeMeta(3), pool.attn_kv);
+  CHECK(graph.captured());
+  REQUIRE(after.on_device());
+  const auto* p = static_cast<const float*>(after.device_tensor.data);
+  REQUIRE(p != nullptr);
+  for (int64_t i = 0; i < c.vocab_size; ++i) REQUIRE(std::isfinite(p[i]));
 }

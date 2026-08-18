@@ -1,6 +1,7 @@
 #include "vt/fused_ops.h"
 
 #include <stdexcept>
+#include <string>
 
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -106,7 +107,6 @@ void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M,
     return;
   }
 #endif
-  (void)q;
   (void)out;
   (void)a;
   (void)b;
@@ -116,7 +116,18 @@ void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M,
   (void)alpha;
   (void)beta;
   (void)dtype;
-  throw std::runtime_error("vt::MatmulBTAlphaBeta: ROCm-only in this build");
+  // No CUDA arm exists: the only implementation in the tree is
+  // rocm::MatmulBTAlphaBetaRocm (src/vt/rocm/rocm_matmul_hipblaslt.hip), so this
+  // is a missing kernel and not a missing build flag. Name the device that asked
+  // and where the implementation lives, because the caller cannot tell those two
+  // apart from "ROCm-only" alone. Reaching this on CUDA is issue #1205 and blocks
+  // #1126 step 1: waking Gemma4's device-expert LRU routes decode into
+  // ExpertGeGLUDeviceAccum, which lands here outside the upload's try/catch.
+  throw std::runtime_error(
+      std::string("vt::MatmulBTAlphaBeta: no implementation for device '") +
+      DeviceTypeName(q.device.type) +
+      "'; this arm is implemented for 'rocm' only (src/vt/rocm/rocm_matmul_hipblaslt.hip). "
+      "A CUDA implementation is missing; see issue #1205.");
 }
 
 void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,

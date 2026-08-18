@@ -4,8 +4,11 @@
 #include <doctest/doctest.h>
 
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 
+#include "vt/device.h"
+#include "vt/dtype.h"
 #include "vt/fused_ops.h"
 
 namespace {
@@ -74,5 +77,54 @@ TEST_CASE("gemma4 rocm fp8 seams: recipe env knobs parse inert defaults") {
     EnvRestorer a("VT_GEMMA4_FP8_HW_CVT");
     ::setenv("VT_GEMMA4_FP8_HW_CVT", "0", 1);
     CHECK(EnvInt("VT_GEMMA4_FP8_HW_CVT", 1) == 0);
+  }
+}
+
+// #1205: `vt::MatmulBTAlphaBeta` has NO CUDA implementation. The only one in the
+// tree is `rocm::MatmulBTAlphaBetaRocm` (rocm_matmul_hipblaslt.hip:516), reached
+// through a `#if defined(VLLM_CPP_HIP)` + `kROCM` guard in fused_ops.cpp; every
+// other device falls through to a throw. That is the actual blocker under #1126:
+// adding `CudaBackend::DeviceMemoryInfo` alone would let the Gemma4 expert LRU
+// admit (gemma4_moe.cpp:565,575), take ExpertGeGLUDeviceAccum at :1487, and reach
+// this call at :90 — outside the upload's try/catch (:563-585), so mid-decode.
+//
+// AGENTS.md requires an unimplemented arm to refuse with a message that NAMES the
+// missing part. "ROCm-only in this build" names neither the device that asked nor
+// where the implementation would go, so a caller who hits it on CUDA cannot tell a
+// missing kernel from a missing build flag. This pins the contract; when the CUDA
+// arm is written, this is what it has to satisfy.
+TEST_CASE("gemma4 rocm fp8 seams: MatmulBTAlphaBeta refuses a non-ROCm queue by name") {
+  // The refusal reads `q.device.type` and nothing else, so a CPU build can pose
+  // as any device here. Buffers are never dereferenced on the refusing path.
+  auto refusal_for = [](vt::DeviceType type) -> std::string {
+    vt::Queue q;
+    q.device.type = type;
+    q.device.index = 0;
+    try {
+      vt::MatmulBTAlphaBeta(q, nullptr, nullptr, nullptr, /*M=*/1, /*N=*/1, /*K=*/1,
+                            /*alpha=*/1.f, /*beta=*/0.f, vt::DType::kBF16);
+    } catch (const std::runtime_error& e) {
+      return e.what();
+    }
+    return std::string();
+  };
+
+  // CUDA is the device #1126 would wake, so it is the one the message must name.
+  const std::string cuda_msg = refusal_for(vt::DeviceType::kCUDA);
+  REQUIRE_FALSE(cuda_msg.empty());
+  INFO("cuda refusal: " << cuda_msg);
+  CHECK(cuda_msg.find("MatmulBTAlphaBeta") != std::string::npos);
+  CHECK(cuda_msg.find("cuda") != std::string::npos);
+  CHECK(cuda_msg.find("rocm") != std::string::npos);
+  CHECK(cuda_msg.find("1205") != std::string::npos);
+
+  // Not a CUDA special case: every non-ROCm device refuses, naming itself.
+  for (const auto type : {vt::DeviceType::kCPU, vt::DeviceType::kVULKAN,
+                          vt::DeviceType::kMETAL}) {
+    const std::string msg = refusal_for(type);
+    // std::string, not the char* — doctest stringifies a bare char* as a bool.
+    INFO("refusal for " << std::string(vt::DeviceTypeName(type)) << ": " << msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find(vt::DeviceTypeName(type)) != std::string::npos);
   }
 }

@@ -26,6 +26,7 @@
 // and is recorded in .agents/specs/eng-cudagraph-dedup.md, not claimed here.
 #include <doctest/doctest.h>
 
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -195,6 +196,60 @@ struct FakeSigRuntime {
 
 std::string SignatureOf(const SigGraph& graph) {
   return vt::graph_dedup_sig::Signature<FakeSigRuntime>(&graph);
+}
+
+// ===================================================================================
+// Part 3 — the key's coarseness (issue #1226).
+// ===================================================================================
+//
+// These helpers call the PRODUCTION field-selection functions. `AppendKernelFields` is
+// the one src/vt/graph_dedup_runtime.h reaches after cudaGraphKernelNodeGetParams fills
+// its struct, so what is exercised below is the code that decides the real key and not a
+// restatement of it in a fake. The device half that stays unreachable from here is the
+// runtime query itself, and that limit is the same one the file's header note states.
+
+std::string KernelPayloadFull(long long func, unsigned grid_x, unsigned grid_y,
+                              unsigned grid_z, unsigned block_x, unsigned block_y,
+                              unsigned block_z, unsigned shared, bool coarse) {
+  std::string out;
+  vt::graph_dedup_sig::AppendKernelFields(&out, func, grid_x, grid_y, grid_z, block_x,
+                                          block_y, block_z, shared, coarse);
+  return out;
+}
+
+// The one-dimensional shorthand every case below used before the y and z components
+// were gated. It delegates rather than repeating the call, so a case that reaches for
+// the short form and a case that reaches for the full one drive one code path.
+std::string KernelPayload(long long func, unsigned grid, unsigned block, unsigned shared,
+                          bool coarse) {
+  return KernelPayloadFull(func, grid, 1, 1, block, 1, 1, shared, coarse);
+}
+
+std::string MemcpyPayloadFull(long long kind, long long width, long long height,
+                              long long depth, bool coarse) {
+  std::string out;
+  vt::graph_dedup_sig::AppendMemcpyFields(&out, kind, width, height, depth, coarse);
+  return out;
+}
+
+std::string MemcpyPayload(long long kind, long long width, bool coarse) {
+  return MemcpyPayloadFull(kind, width, 1, 1, coarse);
+}
+
+std::string MemsetPayload(long long element_size, long long width, long long height,
+                          bool coarse) {
+  std::string out;
+  vt::graph_dedup_sig::AppendMemsetFields(&out, element_size, width, height, coarse);
+  return out;
+}
+
+// A one-kernel-node graph carrying `payload`, which is what the whole question reduces
+// to: two padded decode buckets are the same topology with different parameters.
+std::string OneNodeSignature(const std::string& payload) {
+  const SigNode node{payload};
+  SigGraph graph;
+  graph.nodes = {&node};
+  return SignatureOf(graph);
 }
 
 }  // namespace
@@ -476,4 +531,240 @@ TEST_CASE("each runtime failure degrades the key instead of aborting inside a ca
 TEST_CASE("an empty graph still produces a signature") {
   SigGraph graph;
   CHECK(SignatureOf(graph) == "[]");
+}
+
+// --- the exact key, which is the SHIPPED DEFAULT ------------------------------------
+
+TEST_CASE("the exact key discriminates every launch dimension and every copy extent") {
+  // COVERAGE OF THE DEFAULT, and it was absent. Every helper in this file passed 1 for
+  // grid_y, grid_z, block_y, block_z and the memcpy height and depth, so those six
+  // fields were EXECUTED by every case and DISCRIMINATED by none: deleting `grid_z` from
+  // the exact key -- a silent coarsening of the key that ships ON, on a path no token
+  // gate and no device count can see -- left this suite 22/22 green. Three of the six
+  // siblings were caught only incidentally, by `-Werror=unused-parameter`, which is a
+  // build guard rather than a test and which a mutation that renames instead of removing
+  // walks straight past.
+  const std::string base = KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 1, 0, false);
+  CHECK(base != KernelPayloadFull(0x1000, 8, 3, 1, 128, 1, 1, 0, false));  // grid.y
+  CHECK(base != KernelPayloadFull(0x1000, 8, 1, 5, 128, 1, 1, 0, false));  // grid.z
+  CHECK(base != KernelPayloadFull(0x1000, 8, 1, 1, 128, 7, 1, 0, false));  // block.y
+  CHECK(base != KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 9, 0, false));  // block.z
+  // Through the whole signature, not only the payload helper: the walk is what
+  // production calls, and a field that separates two payloads must separate two graphs.
+  CHECK(OneNodeSignature(base) !=
+        OneNodeSignature(KernelPayloadFull(0x1000, 8, 1, 5, 128, 1, 1, 0, false)));
+
+  // A 2-D and a 3-D copy are different copies, and the exact key says so.
+  CHECK(OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 1, false)) !=
+        OneNodeSignature(MemcpyPayloadFull(2, 64, 4, 1, false)));   // extent.height
+  CHECK(OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 1, false)) !=
+        OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 4, false)));   // extent.depth
+}
+
+TEST_CASE("the coarse key drops the y and z components too, not only x") {
+  // The other half of the same gap. The coarse key exists to join two padded decode
+  // buckets, and a bucket that grew a second grid dimension would still separate if only
+  // the x components were dropped -- so the drop is asserted componentwise rather than
+  // inferred from the grid_x case.
+  const std::string base = KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 1, 0, true);
+  CHECK(base == KernelPayloadFull(0x1000, 8, 3, 1, 128, 1, 1, 0, true));
+  CHECK(base == KernelPayloadFull(0x1000, 8, 1, 5, 128, 1, 1, 0, true));
+  CHECK(base == KernelPayloadFull(0x1000, 8, 1, 1, 128, 7, 1, 0, true));
+  CHECK(base == KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 9, 0, true));
+  CHECK(OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 1, true)) ==
+        OneNodeSignature(MemcpyPayloadFull(2, 64, 4, 7, true)));
+}
+
+// --- the coarse key, issue #1226 ----------------------------------------------------
+
+TEST_CASE("the coarse key groups two decode buckets that differ only in launch dimensions") {
+  // THE CASE THE ROW WAS FILED FOR, and the one the 2026-08-18 device gate measured never
+  // happening. Two padded decode buckets run the same kernel over a different number of
+  // sequences, so `gridDim` differs and nothing else does. Under the shipped key those are
+  // two signatures, two buckets in `groups_`, no candidate, and cudaGraphExecUpdate is
+  // never even attempted -- which is why that gate could report `N == M` with the driver
+  // never having been asked.
+  const std::string small_exact = KernelPayload(0x1000, 8, 128, 0, false);
+  const std::string large_exact = KernelPayload(0x1000, 24, 128, 0, false);
+  CHECK(OneNodeSignature(small_exact) != OneNodeSignature(large_exact));
+
+  const std::string small_coarse = KernelPayload(0x1000, 8, 128, 0, true);
+  const std::string large_coarse = KernelPayload(0x1000, 24, 128, 0, true);
+  CHECK(OneNodeSignature(small_coarse) == OneNodeSignature(large_coarse));
+
+  // The block dimension is dropped for the same reason and by the same branch.
+  CHECK(OneNodeSignature(KernelPayload(0x1000, 8, 128, 0, true)) ==
+        OneNodeSignature(KernelPayload(0x1000, 8, 256, 0, true)));
+  CHECK(OneNodeSignature(KernelPayload(0x1000, 8, 128, 0, false)) !=
+        OneNodeSignature(KernelPayload(0x1000, 8, 256, 0, false)));
+}
+
+TEST_CASE("the coarse key still separates two different kernel functions") {
+  // The discrimination the coarsening must NOT give up. `func` is a host function
+  // pointer, strictly stronger than the demangled name SGLang keys, and dropping it would
+  // collapse every same-shaped node in the process into one candidate group -- turning a
+  // cheap wasted probe into a probe against every capture ever taken.
+  CHECK(OneNodeSignature(KernelPayload(0x1000, 8, 128, 0, true)) !=
+        OneNodeSignature(KernelPayload(0x2000, 8, 128, 0, true)));
+}
+
+TEST_CASE("the coarse key keeps sharedMemBytes") {
+  // ARGUED, not swept in. A dynamic shared-memory size is a kernel-node parameter like the
+  // dimensions are, so the same reasoning would drop it. It is kept because it is not
+  // where the batch dimension lives -- so dropping it buys the hypothesis nothing -- and
+  // because a size above the 48 KiB static limit is legal only for a function that opted
+  // in through cudaFuncAttributeMaxDynamicSharedMemorySize, an attribute of the FUNCTION
+  // and not of the node. It is therefore the field most likely to make the driver
+  // re-instantiate rather than re-point, and keeping it holds this experiment to one
+  // variable.
+  CHECK(OneNodeSignature(KernelPayload(0x1000, 8, 128, 1024, true)) !=
+        OneNodeSignature(KernelPayload(0x1000, 8, 128, 2048, true)));
+  // And it is kept in a way that does not accidentally re-admit the dimensions.
+  CHECK(OneNodeSignature(KernelPayload(0x1000, 8, 128, 1024, true)) ==
+        OneNodeSignature(KernelPayload(0x1000, 24, 256, 1024, true)));
+}
+
+TEST_CASE("the coarse key drops the memcpy extent and keeps the kind") {
+  // The gate named the copy extent alongside the launch dimensions as the second place the
+  // padded batch size enters the key. `kind` stays because cudaGraphExecUpdate explicitly
+  // refuses a changed memcpy memory type, so a key that dropped it would manufacture
+  // refusals rather than folds.
+  CHECK(OneNodeSignature(MemcpyPayload(2, 64, false)) !=
+        OneNodeSignature(MemcpyPayload(2, 192, false)));
+  CHECK(OneNodeSignature(MemcpyPayload(2, 64, true)) ==
+        OneNodeSignature(MemcpyPayload(2, 192, true)));
+  CHECK(OneNodeSignature(MemcpyPayload(1, 64, true)) !=
+        OneNodeSignature(MemcpyPayload(2, 64, true)));
+}
+
+TEST_CASE("the coarse key drops the memset width and keeps the element size and height") {
+  // `height` stays because the update contract will only change a 1-D memset, so it is a
+  // field the driver itself treats as identity; `elementSize` stays for the same reason.
+  CHECK(OneNodeSignature(MemsetPayload(4, 64, 1, false)) !=
+        OneNodeSignature(MemsetPayload(4, 192, 1, false)));
+  CHECK(OneNodeSignature(MemsetPayload(4, 64, 1, true)) ==
+        OneNodeSignature(MemsetPayload(4, 192, 1, true)));
+  CHECK(OneNodeSignature(MemsetPayload(4, 64, 1, true)) !=
+        OneNodeSignature(MemsetPayload(2, 64, 1, true)));
+  CHECK(OneNodeSignature(MemsetPayload(4, 64, 1, true)) !=
+        OneNodeSignature(MemsetPayload(4, 64, 8, true)));
+}
+
+TEST_CASE("the coarse key does not weaken the topology half of the signature") {
+  // Coarsening the PAYLOADS must not coarsen the WALK. Two graphs whose nodes are now
+  // payload-identical still have to separate on their edges, or the key would offer the
+  // driver a fold across genuinely different graphs and pay a probe for every one.
+  const std::string payload = KernelPayload(0x1000, 8, 128, 0, true);
+  const SigNode a{payload};
+  const SigNode b{payload};
+  const SigNode c{payload};
+
+  SigGraph chain;
+  chain.nodes = {&a, &b, &c};
+  chain.edges = {{0, 1}, {1, 2}};
+
+  SigGraph fan;
+  fan.nodes = {&a, &b, &c};
+  fan.edges = {{0, 1}, {0, 2}};
+
+  CHECK(SignatureOf(chain) != SignatureOf(fan));
+  // And a different node COUNT is still a different key.
+  SigGraph pair;
+  pair.nodes = {&a, &b};
+  pair.edges = {{0, 1}};
+  CHECK(SignatureOf(pair) != SignatureOf(chain));
+}
+
+TEST_CASE("the coarse key is off unless the environment asks for it") {
+  // Same polarity function as VT_CUDA_GRAPH_DEDUP, stated once so the two knobs cannot
+  // drift, and OFF by default so the shipped key is exactly the one the device gate ran
+  // and the two arms are a same-binary A/B.
+  CHECK_FALSE(vt::GraphDedupEnabledFor(nullptr));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("0"));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("true"));
+  CHECK(vt::GraphDedupEnabledFor("1"));
+  // The suite runs with VT_CUDA_GRAPH_DEDUP_COARSE_KEY unset, so this reads the default.
+  CHECK_FALSE(vt::GraphDedupCoarseKeyEnabled());
+}
+
+TEST_CASE("two captures the coarse key groups share one executable when the driver accepts") {
+  // The end of the chain: a coarser key is worth nothing unless the registry actually
+  // folds on it. Same signature, driver accepts, ONE executable for two captures -- which
+  // is the `M < N` the device run is being asked for.
+  FakeLatch latch;
+  g_latch = &latch;
+  vt::GraphDedupRegistry registry(GuardedTable(), nullptr);
+
+  const std::string coarse = OneNodeSignature(KernelPayload(0x1000, 8, 128, 0, true));
+  const std::string coarse_other = OneNodeSignature(KernelPayload(0x1000, 24, 128, 0, true));
+  REQUIRE(coarse == coarse_other);
+
+  LatchGraph small{coarse, 1};
+  LatchGraph large{coarse_other, 2};
+  registry.Register(&small);
+  registry.Register(&large);
+
+  CHECK(registry.CapturedCount() == 2);
+  CHECK(registry.ExecCount() == 1);
+  CHECK(registry.ProbeCount() == 1);
+  CHECK(registry.ProbeRefusalCount() == 0);
+
+  registry.Close();
+  g_latch = nullptr;
+}
+
+TEST_CASE("the probe counters tell a key that never grouped from a driver that refused") {
+  // THE MEASUREMENT INSTRUMENT, and the reason it is in the product rather than in a
+  // script. `N == M` has two opposite causes -- the key never grouped, so the driver was
+  // never asked; or it grouped and the driver said no -- and the 2026-08-18 gate could
+  // only separate them by reading the signature's source afterwards. A device run that
+  // cannot separate them measures nothing, so the counters are asserted here on both
+  // shapes and printed on the registry's own log line.
+  FakeLatch latch;
+  g_latch = &latch;
+
+  SUBCASE("distinct signatures: the driver is never asked") {
+    vt::GraphDedupRegistry registry(GuardedTable(), nullptr);
+    LatchGraph first{"topology-A", 1};
+    LatchGraph second{"topology-B", 2};
+    registry.Register(&first);
+    registry.Register(&second);
+    CHECK(registry.ExecCount() == 2);
+    CHECK(registry.ProbeCount() == 0);
+    CHECK(registry.ProbeRefusalCount() == 0);
+    registry.Close();
+  }
+
+  SUBCASE("one signature, driver refuses: asked once, refused once, and the reason kept") {
+    std::FILE* log = std::tmpfile();
+    REQUIRE(log != nullptr);
+    {
+      vt::GraphDedupRegistry registry(GuardedTable(), log);
+      LatchGraph first{"same", 1};
+      LatchGraph second{"same", 2};
+      registry.Register(&first);
+      latch.refuse_update = true;
+      registry.Register(&second);
+      latch.refuse_update = false;
+      CHECK(registry.ExecCount() == 2);
+      CHECK(registry.ProbeCount() == 1);
+      CHECK(registry.ProbeRefusalCount() == 1);
+      registry.Close();
+    }
+    std::fflush(log);
+    std::rewind(log);
+    std::string text;
+    char buffer[512];
+    while (std::fgets(buffer, sizeof(buffer), log) != nullptr) text += buffer;
+    std::fclose(log);
+    // The driver's own cudaError_t / cudaGraphExecUpdateResult pair, verbatim. This is
+    // the evidence the 2026-08-18 record could not produce, because the fold was never
+    // attempted and so no refusal existed to quote.
+    CHECK(text.find("probe refused a fold (err=1 result=1)") != std::string::npos);
+    CHECK(text.find("captured 2 graphs, deduped to 2 execs (probes=1 refused=1)") !=
+          std::string::npos);
+  }
+
+  CHECK_NOTHROW(NextUnrelatedKernelLaunch());
+  g_latch = nullptr;
 }

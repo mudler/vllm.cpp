@@ -1772,6 +1772,41 @@ static tuple is the CPU-only `linux-x86_64-musl-cpu-static` experiment; normal
 CPU and accelerator archives are static-core bundles with audited host runtime
 dependencies.
 
+## HuggingFace cache and credentials
+
+`--model` takes a local directory or a `.gguf` file. It does not take a
+repository identifier yet, and nothing in the tree fetches a checkpoint over the
+network. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+[#1280](https://github.com/mudler/vllm.cpp/issues/1280), adds that, and this
+section records the part of it that has landed.
+
+The library now reads the HuggingFace environment. The values below are resolved
+in `vllm/transformers_utils/hf_hub` and `vllm/transformers_utils/hf_cache`, and
+they mean what `huggingface_hub` means by them:
+
+| Variable | Effect |
+|---|---|
+| `HF_TOKEN` | Bearer token for a private or gated repository |
+| `HF_TOKEN_PATH` | A file holding that token, read when `HF_TOKEN` is unset |
+| `HF_ENDPOINT` | Alternate hub host. A missing trailing slash is added |
+| `HF_HUB_OFFLINE` | Resolve from the cache and open no socket |
+| `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, `HOME` | The cache root, resolved in that order. `HF_HOME` contributes `$HF_HOME/hub` |
+
+The cache is HuggingFace's documented layout,
+`{hub}/models--org--repo/` with `refs`, `blobs` and
+`snapshots/{commit}/{path}`, so a host that already holds a Python
+`huggingface_hub` cache is read rather than re-downloaded. Where the file system
+holds no symbolic link, which is the case for a CIFS mount and can be the case
+for the `/cache` container volume, a snapshot entry becomes a real file and the
+server logs the switch one time.
+
+Two limits are worth stating plainly. No command-line surface reaches any of
+this yet, so setting `HF_TOKEN` today changes nothing a server does. And the
+DFlash draft path, which is the one caller that already resolves a repository
+identifier against the cache, still reads `$HOME/.cache/huggingface/hub` and
+ignores `HF_HOME`. Both are recorded under `## Owed` in
+`.agents/specs/hf-model-download.md`.
+
 ## Container images
 
 Published to one GHCR package with the lane in the tag. Every lane is a

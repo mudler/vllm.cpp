@@ -61,25 +61,37 @@ which vLLM does not implement. `.agents/oracles/llama-cpp.md` pins stock tag
 protocol. It cites no llama.cpp measurement, so the `gateable = no` value does
 not block the work.
 
-Warning: the anchors in the table below were read on 18 August 2026 in the
-developer checkout at `/home/mudler/_git/llama.cpp`, commit `237ad9b96` on
-branch `localai-paged`, which is 27 commits ahead of its fork point and is not
-the pinned stock tag. W1 re-reads every anchor at stock `b10451` and corrects
-this table before any code lands.
+W1 read every anchor in the table below on 18 August 2026 at stock tag
+`b10451`, fetched from `https://github.com/ggml-org/llama.cpp` into a scratch
+directory outside this repository. `b10451` is a lightweight tag, `git cat-file
+-t b10451` answers `commit`, and it resolves to commit
+`10bf611e533d81f739128304991c5e133c6aebd8`, dated 2026-08-16, subject `llama :
+check LoRA tensor data is within file bounds (#27056)`. The checked-out `HEAD`
+was verified equal to that object id before any line was read. Every behavior in
+the table exists at `b10451`. Four anchors moved against the earlier reading in
+the developer fork `237ad9b96`, and the moved rows are marked.
 
-| Behavior | llama.cpp anchor at `237ad9b96`, to re-verify at `b10451` |
+| Behavior | llama.cpp anchor at `b10451` |
 |---|---|
-| Transport is cpp-httplib, not libcurl | `CMakeLists.txt:170`, `common/CMakeLists.txt:138` |
-| TLS selection | `vendor/cpp-httplib/CMakeLists.txt:40-155` |
-| Refusal with no TLS | `common/http.h:75-83` |
+| Transport is cpp-httplib, not libcurl | `CMakeLists.txt:195,229`, `common/CMakeLists.txt:144` (moved) |
+| TLS selection | `vendor/cpp-httplib/CMakeLists.txt:38-154` (moved) |
+| Refusal with no TLS | `common/http.h:107-116` (moved) |
 | Reference to commit | `common/hf-cache.cpp:233` |
 | Recursive file listing | `common/hf-cache.cpp:311` |
 | Byte download address | `common/hf-cache.cpp:347` |
-| Cache layout, link then move then copy | `common/hf-cache.cpp:456-493` |
-| Repository and tag split | `common/download.h` |
-| Range resume | `common/download.cpp:224-233` |
-| Size, entity tag, and range probe | `common/download.cpp:331-348` |
-| Object identifier validation | `common/hf-cache.cpp:161` |
+| Cache layout, link then move then copy | `common/hf-cache.cpp:455-496` |
+| Repository and tag split | `common/download.h:39-42` (moved) |
+| Range resume | `common/download.cpp:222-235` |
+| Size, entity tag, and range probe | `common/download.cpp:321-349` |
+| Object identifier validation | `common/hf-cache.cpp:161-163` |
+
+The three CMake rows and the `common/http.h` row moved because the fork adds
+files and options above them. `CMakeLists.txt:170` at `b10451` sets
+`GGML_CUDA_GRAPHS_DEFAULT`, and `common/http.h:75-83` at `b10451` splits a
+bracketed IPv6 authority. Neither is the behavior the row names, so the earlier
+citations were wrong rather than merely shifted. The `common/hf-cache.cpp` and
+`common/download.cpp` line numbers are unchanged between the fork and stock,
+because the fork does not touch either file.
 
 ## Our baseline
 
@@ -267,7 +279,7 @@ asserts a non-zero case count, reads the `Status:` line rather than grepping
 | `libssl3` in the runtime image | Added by this row |
 | BoringSSL through `FetchContent` | Opt-in, network access at configure time |
 | vLLM pin `5559679229` | Present and verified 18 August 2026 |
-| llama.cpp stock tag `b10451` | Not checked out here. W1 obtains it |
+| llama.cpp stock tag `b10451` | Read by W1 on 18 August 2026 at commit `10bf611e533d81f739128304991c5e133c6aebd8` |
 | Issue [#1281](https://github.com/mudler/vllm.cpp/issues/1281) | Depends on this row. Not a dependency of it |
 
 ## Work breakdown
@@ -331,6 +343,19 @@ divergence. `docs/USAGE.md` states which upstream defines which form.
 - The macOS and Windows TLS lanes, resolved as a table in W5.
 - The quickstart page, issue
   [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
+- **Wiring `hf_hub` to a production entry point.** W2 lands `hf_hub` reached
+  only by its own suite. `hf_cache` is reached, because the DFlash draft path in
+  `model_loader.cpp` calls `ResolveCachedSnapshotDir`, but the refs, blobs,
+  snapshot-entry and hub-protocol surface is not. W4 wires it through
+  `model_resolver` and `server_main.cpp:433`. Row `ENG-HF-MODEL-DOWNLOAD`,
+  issue [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **The DFlash draft path does not honor `HF_HOME`.** `ResolveDflashDraftDir`
+  reads `$HOME/.cache/huggingface/hub` and passes that root to the shared
+  resolver, because W2 is a relocation and must not change what a DFlash run
+  resolves. A container that sets `HF_HOME=/cache` therefore still gets the home
+  directory for the draft. Migrating it onto `HfHubCacheDir()` is a behavior
+  change and needs its own gate. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 
 ## Now
 

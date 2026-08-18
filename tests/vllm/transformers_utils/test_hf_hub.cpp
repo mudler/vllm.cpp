@@ -1,0 +1,523 @@
+// ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace hub protocol.
+//
+// Every case runs against an IN-PROCESS FAKE HUB: a real `httplib::Server` on
+// an ephemeral port, reached through `HF_ENDPOINT` over plain hypertext
+// transfer protocol. The fixture follows
+// `tests/vllm/entrypoints/openai/test_api_server.cpp`, which already starts a
+// server inside a test. There is no TLS here on purpose; TLS has its own
+// instruments in W5, and a hermetic test that speaks plain HTTP proves protocol
+// and refusal, not transport security.
+//
+// The fake hub COUNTS its requests. "Zero requests" is the only honest way to
+// state a cache hit, and a mock that merely records the last call cannot say it.
+#include <doctest/doctest.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <httplib/httplib.h>
+#include <nlohmann/json.hpp>
+
+#include "support/process_id.h"
+#include "support/test_env.h"
+#include "vllm/transformers_utils/hf_cache.h"
+#include "vllm/transformers_utils/hf_hub.h"
+
+namespace fs = std::filesystem;
+using vllm::transformers_utils::HfHubOptions;
+using vllm::transformers_utils::HfHubOptionsFromEnv;
+using vllm::transformers_utils::HfFile;
+using vllm::transformers_utils::HfReadRef;
+using vllm::transformers_utils::HfRepoPath;
+using vllm::transformers_utils::HubFileUrl;
+using vllm::transformers_utils::HubListRepoFiles;
+using vllm::transformers_utils::HubResolveCommitCached;
+using vllm::transformers_utils::HubResolveRefToCommit;
+using vllm::transformers_utils::IsValidHfRepoId;
+
+namespace {
+
+constexpr const char* kCommit = "1111111111111111111111111111111111111111";
+constexpr const char* kToken = "hf_testtokentesttokentesttokentesttoken";
+
+class TempDir {
+ public:
+  TempDir() {
+    static std::atomic<int> counter{0};
+    path_ = fs::temp_directory_path() /
+            ("vllm_hf_hub_test_" + std::to_string(vllm_test::ProcessId()) + "_" +
+             std::to_string(counter.fetch_add(1)));
+    fs::remove_all(path_);
+    fs::create_directories(path_);
+  }
+  ~TempDir() {
+    std::error_code ec;
+    fs::remove_all(path_, ec);
+  }
+  TempDir(const TempDir&) = delete;
+  TempDir& operator=(const TempDir&) = delete;
+  const fs::path& path() const { return path_; }
+
+ private:
+  fs::path path_;
+};
+
+// A real HTTP server standing in for huggingface.co. It answers the three
+// protocol calls, counts every request it received, and records the
+// Authorization header it observed.
+class FakeHub {
+ public:
+  FakeHub() {
+    server_.Get("/api/models/(.*)/refs", [this](const httplib::Request& req,
+                                                httplib::Response& res) {
+      Record(req);
+      if (gated_ && AuthHeader(req).empty()) {
+        res.status = 401;
+        res.set_content(R"({"error":"Invalid credentials in Authorization header"})",
+                        "application/json");
+        return;
+      }
+      res.set_content(refs_body_, "application/json");
+    });
+    server_.Get("/api/models/(.*)/tree/(.*)", [this](const httplib::Request& req,
+                                                     httplib::Response& res) {
+      Record(req);
+      if (gated_ && AuthHeader(req).empty()) {
+        res.status = 401;
+        res.set_content(R"({"error":"Invalid credentials in Authorization header"})",
+                        "application/json");
+        return;
+      }
+      res.set_content(AuthHeader(req).empty() ? tree_anonymous_ : tree_authenticated_,
+                      "application/json");
+    });
+    port_ = server_.bind_to_any_port("127.0.0.1");
+    thread_ = std::thread([this] { server_.listen_after_bind(); });
+    server_.wait_until_ready();
+  }
+
+  ~FakeHub() {
+    server_.stop();
+    if (thread_.joinable()) thread_.join();
+  }
+
+  FakeHub(const FakeHub&) = delete;
+  FakeHub& operator=(const FakeHub&) = delete;
+
+  std::string endpoint() const {
+    return "http://127.0.0.1:" + std::to_string(port_) + "/";
+  }
+
+  int request_count() const { return requests_.load(); }
+
+  std::vector<std::string> paths() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return paths_;
+  }
+
+  std::string last_authorization() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_authorization_;
+  }
+
+  void set_gated(bool gated) { gated_ = gated; }
+  void set_refs_body(std::string body) { refs_body_ = std::move(body); }
+  void set_tree_anonymous(std::string body) { tree_anonymous_ = std::move(body); }
+  void set_tree_authenticated(std::string body) {
+    tree_authenticated_ = std::move(body);
+  }
+  // Both arms at once, for a listing whose shape does not depend on the caller.
+  void set_tree(const std::string& body) {
+    tree_anonymous_ = body;
+    tree_authenticated_ = body;
+  }
+
+ private:
+  static std::string AuthHeader(const httplib::Request& req) {
+    return req.has_header("Authorization") ? req.get_header_value("Authorization")
+                                           : std::string();
+  }
+
+  void Record(const httplib::Request& req) {
+    requests_.fetch_add(1);
+    std::lock_guard<std::mutex> lock(mu_);
+    paths_.push_back(req.target);
+    last_authorization_ = AuthHeader(req);
+  }
+
+  httplib::Server server_;
+  std::thread thread_;
+  int port_ = 0;
+  std::atomic<int> requests_{0};
+  mutable std::mutex mu_;
+  std::vector<std::string> paths_;
+  std::string last_authorization_;
+  bool gated_ = false;
+  std::string refs_body_ =
+      std::string(R"({"branches":[{"name":"main","ref":"refs/heads/main",)") +
+      R"("targetCommit":")" + kCommit + R"("}],"tags":[]})";
+  std::string tree_anonymous_ =
+      R"([{"type":"file","path":"config.json","size":12},)"
+      R"({"type":"file","path":"model.safetensors","size":4096,)"
+      R"("lfs":{"oid":"2222222222222222222222222222222222222222222222222222222222222222"}}])";
+  std::string tree_authenticated_ = tree_anonymous_;
+};
+
+// Options aimed at a fake hub and a scratch cache, with nothing read from the
+// environment, so a case states exactly the configuration it exercises.
+HfHubOptions OptionsFor(const FakeHub& hub, const fs::path& hub_dir) {
+  HfHubOptions opts;
+  opts.endpoint = hub.endpoint();
+  opts.hub_dir = hub_dir;
+  opts.connect_timeout_seconds = 5;
+  opts.read_timeout_seconds = 5;
+  return opts;
+}
+
+// A tree in which every large-file-storage entry carries the SAME identifier.
+// This is the measured shape, not an invented one: on 17 August 2026 the tree
+// API answered an unauthenticated caller on the gated repository
+// `Lightricks/LTX-2.5` with an `lfs.oid` of one character repeated 64 times,
+// identical for all 14 large-file-storage files.
+std::string FabricatedOidTree() {
+  const std::string oid(64, 'a');
+  return std::string(R"([{"type":"file","path":"model-00001-of-00002.safetensors",)") +
+         R"("size":4096,"lfs":{"oid":")" + oid + R"("}},)" +
+         R"({"type":"file","path":"model-00002-of-00002.safetensors",)" +
+         R"("size":4096,"lfs":{"oid":")" + oid + R"("}}])";
+}
+
+}  // namespace
+
+TEST_CASE("IsValidHfRepoId accepts a repository id and refuses everything else") {
+  CHECK(IsValidHfRepoId("org/repo"));
+  CHECK(IsValidHfRepoId("z-lab/Qwen3.6-27B-DFlash"));
+  CHECK(IsValidHfRepoId("Lightricks/LTX-2.5"));
+  CHECK_FALSE(IsValidHfRepoId(""));
+  CHECK_FALSE(IsValidHfRepoId("norepo"));
+  CHECK_FALSE(IsValidHfRepoId("a/b/c"));
+  CHECK_FALSE(IsValidHfRepoId("/repo"));
+  CHECK_FALSE(IsValidHfRepoId("org/"));
+  CHECK_FALSE(IsValidHfRepoId("org/../etc"));
+  CHECK_FALSE(IsValidHfRepoId("org/re po"));
+}
+
+TEST_CASE("HubFileUrl is the byte address form") {
+  CHECK(HubFileUrl("https://huggingface.co/", "org/repo", kCommit,
+                   "model.safetensors") ==
+        std::string("https://huggingface.co/org/repo/resolve/") + kCommit +
+            "/model.safetensors");
+}
+
+TEST_CASE("HfHubOptionsFromEnv reads the documented environment") {
+  TempDir tmp;
+  const char* kNames[] = {"HF_ENDPOINT", "HF_TOKEN", "HF_TOKEN_PATH",
+                          "HF_HUB_OFFLINE", "HF_HUB_CACHE"};
+  std::vector<std::pair<std::string, std::string>> saved;
+  for (const char* name : kNames) {
+    const char* v = std::getenv(name);
+    saved.emplace_back(name, v == nullptr ? std::string() : std::string(v));
+    vllm_test::UnsetEnv(name);
+  }
+
+  {
+    const HfHubOptions defaults = HfHubOptionsFromEnv();
+    CHECK(defaults.endpoint == "https://huggingface.co/");
+    CHECK(defaults.token.empty());
+    CHECK_FALSE(defaults.offline);
+  }
+
+  // A host name with no trailing slash still composes into a request path.
+  vllm_test::SetEnv("HF_ENDPOINT", "http://mirror.internal");
+  vllm_test::SetEnv("HF_TOKEN", kToken);
+  vllm_test::SetEnv("HF_HUB_OFFLINE", "1");
+  vllm_test::SetEnv("HF_HUB_CACHE", tmp.path().string());
+  {
+    const HfHubOptions opts = HfHubOptionsFromEnv();
+    CHECK(opts.endpoint == "http://mirror.internal/");
+    CHECK(opts.token == kToken);
+    CHECK(opts.offline);
+    CHECK(opts.hub_dir == tmp.path());
+  }
+
+  // HF_TOKEN_PATH is the fallback, and its trailing newline is not part of the
+  // token: a token with a newline in it produces a malformed request header.
+  vllm_test::UnsetEnv("HF_TOKEN");
+  const fs::path token_file = tmp.path() / "token";
+  {
+    std::ofstream out(token_file, std::ios::binary);
+    out << kToken << "\n";
+  }
+  vllm_test::SetEnv("HF_TOKEN_PATH", token_file.string());
+  CHECK(HfHubOptionsFromEnv().token == kToken);
+
+  for (const auto& [name, value] : saved) vllm_test::SetEnv(name.c_str(), value);
+}
+
+TEST_CASE("the reference resolves to a commit over the fake hub") {
+  FakeHub hub;
+  TempDir tmp;
+  const HfHubOptions opts = OptionsFor(hub, tmp.path());
+
+  CHECK(HubResolveRefToCommit("org/repo", "", opts) == kCommit);
+  REQUIRE(hub.request_count() == 1);
+  CHECK(hub.paths().at(0) == "/api/models/org/repo/refs");
+}
+
+TEST_CASE("a revision that is already a commit costs no request") {
+  FakeHub hub;
+  TempDir tmp;
+  const HfHubOptions opts = OptionsFor(hub, tmp.path());
+  CHECK(HubResolveRefToCommit("org/repo", kCommit, opts) == kCommit);
+  CHECK(hub.request_count() == 0);
+}
+
+TEST_CASE("main wins over another branch, whatever order the listing has") {
+  FakeHub hub;
+  TempDir tmp;
+  const std::string other(40, '3');
+  hub.set_refs_body(std::string(R"({"branches":[)") +
+                    R"({"name":"dev","ref":"refs/heads/dev","targetCommit":")" +
+                    other + R"("},)" +
+                    R"({"name":"main","ref":"refs/heads/main","targetCommit":")" +
+                    kCommit + R"("}]})");
+  CHECK(HubResolveRefToCommit("org/repo", "", OptionsFor(hub, tmp.path())) ==
+        kCommit);
+}
+
+TEST_CASE("a named revision selects that branch") {
+  FakeHub hub;
+  TempDir tmp;
+  const std::string other(40, '3');
+  hub.set_refs_body(std::string(R"({"branches":[)") +
+                    R"({"name":"dev","ref":"refs/heads/dev","targetCommit":")" +
+                    other + R"("},)" +
+                    R"({"name":"main","ref":"refs/heads/main","targetCommit":")" +
+                    kCommit + R"("}]})");
+  CHECK(HubResolveRefToCommit("org/repo", "dev", OptionsFor(hub, tmp.path())) ==
+        other);
+  CHECK_THROWS_AS(HubResolveRefToCommit("org/repo", "absent", OptionsFor(hub, tmp.path())),
+                  std::runtime_error);
+}
+
+TEST_CASE("a gated repository refuses with the repository and HF_TOKEN named") {
+  FakeHub hub;
+  TempDir tmp;
+  hub.set_gated(true);
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+
+  std::string message;
+  try {
+    HubResolveRefToCommit("org/gated", "", opts);
+    FAIL("an unauthenticated call on a gated repository must refuse");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  CHECK(message.find("org/gated") != std::string::npos);
+  CHECK(message.find("HF_TOKEN") != std::string::npos);
+  CHECK(message.find("401") != std::string::npos);
+}
+
+TEST_CASE("the token is sent and the hub observes it") {
+  FakeHub hub;
+  TempDir tmp;
+  hub.set_gated(true);
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+
+  CHECK(HubResolveRefToCommit("org/gated", "", opts) == kCommit);
+  CHECK(hub.last_authorization() == std::string("Bearer ") + kToken);
+}
+
+TEST_CASE("no token means no Authorization header at all") {
+  FakeHub hub;
+  TempDir tmp;
+  CHECK(HubResolveRefToCommit("org/repo", "", OptionsFor(hub, tmp.path())) ==
+        kCommit);
+  CHECK(hub.last_authorization().empty());
+}
+
+TEST_CASE("the second run is a cache hit and issues zero requests") {
+  FakeHub hub;
+  TempDir tmp;
+  const HfHubOptions opts = OptionsFor(hub, tmp.path());
+
+  CHECK(HubResolveCommitCached("org/repo", "", opts) == kCommit);
+  const int after_first = hub.request_count();
+  REQUIRE(after_first == 1);
+  // The commit was recorded, so a moving `main` cannot change what a second run
+  // loads.
+  CHECK(HfReadRef(HfRepoPath(tmp.path(), "org/repo"), "main") == kCommit);
+
+  CHECK(HubResolveCommitCached("org/repo", "", opts) == kCommit);
+  CHECK(hub.request_count() == after_first);
+}
+
+TEST_CASE("offline with a warm cache succeeds and opens no socket") {
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  REQUIRE(HubResolveCommitCached("org/repo", "", opts) == kCommit);
+  const int warm = hub.request_count();
+
+  opts.offline = true;
+  CHECK(HubResolveCommitCached("org/repo", "", opts) == kCommit);
+  CHECK(hub.request_count() == warm);
+}
+
+TEST_CASE("offline with a cold cache refuses and names the directory it searched") {
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.offline = true;
+
+  std::string message;
+  try {
+    HubResolveCommitCached("org/repo", "", opts);
+    FAIL("offline with a cold cache must refuse");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  CHECK(hub.request_count() == 0);
+  CHECK(message.find(HfRepoPath(tmp.path(), "org/repo").string()) !=
+        std::string::npos);
+  CHECK(message.find("HF_HUB_OFFLINE") != std::string::npos);
+}
+
+TEST_CASE("the recursive listing carries paths, sizes and the byte address") {
+  FakeHub hub;
+  TempDir tmp;
+  const std::vector<HfFile> files =
+      HubListRepoFiles("org/repo", kCommit, OptionsFor(hub, tmp.path()));
+
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).path == "config.json");
+  CHECK(files.at(0).size == 12);
+  CHECK(files.at(1).path == "model.safetensors");
+  CHECK(files.at(1).size == 4096);
+  CHECK(files.at(1).url == hub.endpoint() + "org/repo/resolve/" + kCommit +
+                               "/model.safetensors");
+  const std::vector<std::string> paths = hub.paths();
+  REQUIRE(paths.size() == 1);
+  CHECK(paths.at(0) ==
+        std::string("/api/models/org/repo/tree/") + kCommit + "?recursive=true");
+}
+
+TEST_CASE("an unauthenticated listing carries NO object identifier") {
+  FakeHub hub;
+  TempDir tmp;
+  const std::vector<HfFile> files =
+      HubListRepoFiles("org/repo", kCommit, OptionsFor(hub, tmp.path()));
+  REQUIRE(files.size() == 2);
+  // The hub served an lfs.oid. Without a token it is not evidence about the
+  // repository, so it is dropped rather than used as a blob name.
+  for (const HfFile& file : files) CHECK(file.oid.empty());
+}
+
+TEST_CASE("an authenticated listing keeps distinct object identifiers") {
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  hub.set_tree_authenticated(
+      std::string(R"([{"type":"file","path":"a.safetensors","size":1,)") +
+      R"("lfs":{"oid":")" + std::string(64, '2') + R"("}},)" +
+      R"({"type":"file","path":"b.safetensors","size":2,)" +
+      R"("lfs":{"oid":")" + std::string(64, '3') + R"("}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).oid == std::string(64, '2'));
+  CHECK(files.at(1).oid == std::string(64, '3'));
+}
+
+TEST_CASE("a fabricated object identifier is refused, not filtered") {
+  // The regression test for the 17 August 2026 event. llama.cpp's is_valid_oid
+  // at common/hf-cache.cpp:161 accepts any 40 or 64 character hexadecimal
+  // string, so a verbatim port of that function turns this case red.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  hub.set_tree(FabricatedOidTree());
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("a listing whose files share one object identifier must be refused");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  CHECK(message.find(std::string(64, 'a')) != std::string::npos);
+  CHECK(message.find("model-00002-of-00002.safetensors") != std::string::npos);
+}
+
+TEST_CASE("a fabricated object identifier is dropped when no token was sent") {
+  // The same tree, read without a token. The oid never becomes a blob name, so
+  // the fabricated value cannot address anything. This is the primary defense
+  // and the duplicate check is the second one.
+  FakeHub hub;
+  TempDir tmp;
+  hub.set_tree(FabricatedOidTree());
+  const std::vector<HfFile> files =
+      HubListRepoFiles("org/repo", kCommit, OptionsFor(hub, tmp.path()));
+  REQUIRE(files.size() == 2);
+  for (const HfFile& file : files) CHECK(file.oid.empty());
+}
+
+TEST_CASE("the listing skips directories and refuses a path that escapes the snapshot") {
+  FakeHub hub;
+  TempDir tmp;
+  hub.set_tree(
+      R"([{"type":"directory","path":"original"},)"
+      R"({"type":"file","path":"../escape.bin","size":1},)"
+      R"({"type":"file","path":"/absolute.bin","size":1},)"
+      R"({"type":"file","path":"config.json","size":12}])");
+  const std::vector<HfFile> files =
+      HubListRepoFiles("org/repo", kCommit, OptionsFor(hub, tmp.path()));
+  REQUIRE(files.size() == 1);
+  CHECK(files.at(0).path == "config.json");
+}
+
+TEST_CASE("an https endpoint is refused by name when the build cannot speak TLS") {
+  // W5 owns the TLS build options themselves. This case exists in W2 because
+  // the DEFAULT endpoint is https, so a build with no TLS would otherwise fail
+  // with a transport error that says nothing about why. Both arms are asserted,
+  // so the case keeps counting once W5 turns TLS on rather than compiling away.
+  TempDir tmp;
+  HfHubOptions opts;
+  // Port 1 refuses immediately, so the TLS-capable arm does not wait on a real
+  // host and reaches no network.
+  opts.endpoint = "https://127.0.0.1:1/";
+  opts.hub_dir = tmp.path();
+  opts.connect_timeout_seconds = 2;
+  opts.read_timeout_seconds = 2;
+
+  std::string message;
+  try {
+    HubResolveRefToCommit("org/repo", "", opts);
+    FAIL("an https endpoint on a dead port must refuse");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+  CHECK(message.find("VLLM_CPP_HF_DOWNLOAD") != std::string::npos);
+  CHECK(message.find("VLLM_CPP_OPENSSL") != std::string::npos);
+  CHECK(message.find("VLLM_CPP_BUILD_BORINGSSL") != std::string::npos);
+#else
+  // With TLS in the build the refusal is a transport failure, and it must NOT
+  // send the reader to rebuild something that is already there.
+  CHECK(message.find("VLLM_CPP_OPENSSL") == std::string::npos);
+  CHECK(message.find("127.0.0.1") != std::string::npos);
+#endif
+}

@@ -63,6 +63,9 @@ vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
+# ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache layout. No socket,
+# so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
+vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_load_direct_upload vllm/test_load_direct_upload.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
@@ -1434,6 +1437,10 @@ target_compile_definitions(test_chat_template PRIVATE
   VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
+  # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the hub protocol against an in-process fake
+  # hub. It starts a REAL cpp-httplib server on an ephemeral port, so it shares
+  # api_server.cpp's gate and the RUN_SERIAL treatment two rows below.
+  vllm_cpp_add_test(test_hf_hub vllm/transformers_utils/test_hf_hub.cpp)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1457,7 +1464,7 @@ if(VLLM_CPP_SERVER)
   # parallel suite is deterministic. (A shared RESOURCE_LOCK would only serialize
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
-  set_tests_properties(test_openai_api_server test_openai_conformance
+  set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same

@@ -1,0 +1,423 @@
+// See include/vllm/transformers_utils/hf_hub.h for the protocol this speaks and
+// for the llama.cpp `b10451` anchors it mirrors, and for the three integrity
+// rules it deliberately does not port.
+#include "vllm/transformers_utils/hf_hub.h"
+
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <stdexcept>
+#include <utility>
+
+#include <httplib/httplib.h>
+#include <nlohmann/json.hpp>
+
+#include "vllm/transformers_utils/hf_cache.h"
+
+namespace vllm {
+namespace transformers_utils {
+
+namespace fs = std::filesystem;
+using nlohmann::json;
+
+namespace {
+
+const char* NonEmptyEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return (value != nullptr && value[0] != '\0') ? value : nullptr;
+}
+
+bool IsHexString(const std::string& s, size_t length) {
+  if (s.size() != length) return false;
+  for (const char c : s) {
+    const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                     (c >= 'A' && c <= 'F');
+    if (!hex) return false;
+  }
+  return true;
+}
+
+bool IsAlphanumeric(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9');
+}
+
+// An entry path arrives from the network and becomes a path component under the
+// snapshot directory. It must be relative, must carry no "." or ".." component,
+// and must carry no empty component.
+bool IsSafeEntryPath(const std::string& path) {
+  if (path.empty()) return false;
+  const fs::path p(path);
+  if (p.is_absolute()) return false;
+  for (const fs::path& part : p) {
+    const std::string s = part.string();
+    if (s.empty() || s == "." || s == "..") return false;
+  }
+  return true;
+}
+
+struct ParsedUrl {
+  std::string scheme;
+  std::string host;
+  int port = 0;
+  std::string path;  // always begins with '/'
+};
+
+// Mirrors llama.cpp `common/http.h:33-98 @ b10451`, narrowed to what an
+// endpoint needs: no user information, because a hub endpoint carries none.
+ParsedUrl ParseUrl(const std::string& url) {
+  ParsedUrl parts;
+  const size_t scheme_end = url.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+                             "' has no scheme; expected http:// or https://");
+  }
+  parts.scheme = url.substr(0, scheme_end);
+  std::string rest = url.substr(scheme_end + 3);
+
+  const size_t slash = rest.find('/');
+  if (slash != std::string::npos) {
+    parts.host = rest.substr(0, slash);
+    parts.path = rest.substr(slash);
+  } else {
+    parts.host = rest;
+    parts.path = "/";
+  }
+
+  std::string port_text;
+  if (!parts.host.empty() && parts.host.front() == '[') {
+    const size_t close = parts.host.find(']');
+    if (close == std::string::npos) {
+      throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+                               "' has an unterminated IPv6 host");
+    }
+    const std::string after = parts.host.substr(close + 1);
+    if (!after.empty() && after.front() == ':') port_text = after.substr(1);
+    parts.host = parts.host.substr(1, close - 1);
+  } else {
+    const size_t colon = parts.host.find(':');
+    if (colon != std::string::npos) {
+      port_text = parts.host.substr(colon + 1);
+      parts.host = parts.host.substr(0, colon);
+    }
+  }
+
+  if (!port_text.empty()) {
+    parts.port = std::stoi(port_text);
+  } else if (parts.scheme == "http") {
+    parts.port = 80;
+  } else if (parts.scheme == "https") {
+    parts.port = 443;
+  } else {
+    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+                             "' uses the unsupported scheme '" + parts.scheme +
+                             "'");
+  }
+  if (parts.host.empty()) {
+    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url + "' has no host");
+  }
+  return parts;
+}
+
+std::string FormatHost(const std::string& host) {
+  return host.find(':') != std::string::npos ? "[" + host + "]" : host;
+}
+
+// GET a JSON document from the hub. `repo_id` appears in every refusal, because
+// a message that does not name the repository cannot be acted on.
+json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
+            const std::string& repo_id) {
+  const ParsedUrl url = ParseUrl(opts.endpoint);
+
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+  if (url.scheme == "https") {
+    throw std::runtime_error(
+        "vllm.cpp: this build cannot speak HTTPS, so it cannot reach " +
+        opts.endpoint +
+        ". Rebuild with -DVLLM_CPP_HF_DOWNLOAD=ON and one of "
+        "-DVLLM_CPP_OPENSSL=ON (default, needs the OpenSSL development files) "
+        "or -DVLLM_CPP_BUILD_BORINGSSL=ON, or set HF_ENDPOINT to an http:// "
+        "mirror.");
+  }
+#endif
+
+  httplib::Client client(url.scheme + "://" + FormatHost(url.host) + ":" +
+                         std::to_string(url.port));
+  client.set_follow_location(true);
+  client.set_connection_timeout(opts.connect_timeout_seconds, 0);
+  client.set_read_timeout(opts.read_timeout_seconds, 0);
+
+  httplib::Headers headers = {{"User-Agent", "vllm.cpp"},
+                              {"Accept", "application/json"}};
+  // vLLM hands `huggingface_hub` whatever token the environment holds and lets
+  // the hub judge it. llama.cpp additionally requires an `hf_` prefix at
+  // `common/hf-cache.cpp:144-155`, which silently drops a valid token issued by
+  // a self-hosted mirror, so that check is not ported.
+  if (!opts.token.empty()) {
+    headers.emplace("Authorization", "Bearer " + opts.token);
+  }
+
+  const std::string request_path = url.path + relative_path;
+  const httplib::Result res = client.Get(request_path, headers);
+  if (!res) {
+    throw std::runtime_error("vllm.cpp: cannot reach " + opts.endpoint +
+                             " for repository '" + repo_id +
+                             "': " + httplib::to_string(res.error()));
+  }
+
+  if (res->status == 401 || res->status == 403) {
+    throw std::runtime_error(
+        "vllm.cpp: HuggingFace refused repository '" + repo_id + "' with HTTP " +
+        std::to_string(res->status) +
+        ". The repository is private or gated. Set HF_TOKEN (or HF_TOKEN_PATH) "
+        "to a token that has been granted access to it.");
+  }
+  if (res->status == 404) {
+    throw std::runtime_error("vllm.cpp: HuggingFace answered HTTP 404 for '" +
+                             request_path + "'. Repository '" + repo_id +
+                             "' or the revision it was asked for does not "
+                             "exist.");
+  }
+  if (res->status != 200) {
+    throw std::runtime_error("vllm.cpp: HuggingFace answered HTTP " +
+                             std::to_string(res->status) + " for repository '" +
+                             repo_id + "'");
+  }
+
+  try {
+    return json::parse(res->body);
+  } catch (const json::exception& e) {
+    throw std::runtime_error("vllm.cpp: HuggingFace answered '" + request_path +
+                             "' with a body that is not JSON: " + e.what());
+  }
+}
+
+// Collect (name, commit) pairs from the "branches" and "tags" arrays, skipping
+// any entry whose name would escape the refs directory or whose commit is not a
+// commit. `--revision` names a branch or a tag, so both are read.
+std::vector<std::pair<std::string, std::string>> CollectRefs(const json& doc) {
+  std::vector<std::pair<std::string, std::string>> refs;
+  for (const char* key : {"branches", "tags"}) {
+    if (!doc.is_object() || !doc.contains(key) || !doc[key].is_array()) continue;
+    for (const json& item : doc[key]) {
+      if (!item.is_object() || !item.contains("name") ||
+          !item["name"].is_string() || !item.contains("targetCommit") ||
+          !item["targetCommit"].is_string()) {
+        continue;
+      }
+      const std::string name = item["name"].get<std::string>();
+      const std::string commit = item["targetCommit"].get<std::string>();
+      if (!IsSafeEntryPath(name) || !IsHexString(commit, 40)) continue;
+      refs.emplace_back(name, commit);
+    }
+  }
+  return refs;
+}
+
+}  // namespace
+
+bool IsValidHfRepoId(const std::string& repo_id) {
+  // Mirrors llama.cpp `common/hf-cache.cpp:121-142 @ b10451`: base characters
+  // [A-Za-z0-9_] are always valid, the special characters [/.-] must sit
+  // between two base characters, and exactly one '/' is required.
+  if (repo_id.empty() || repo_id.length() > 256) return false;
+  int slashes = 0;
+  bool previous_was_special = true;
+  for (const char c : repo_id) {
+    if (IsAlphanumeric(c) || c == '_') {
+      previous_was_special = false;
+    } else if (c == '/' || c == '.' || c == '-') {
+      if (previous_was_special) return false;
+      slashes += (c == '/');
+      previous_was_special = true;
+    } else {
+      return false;
+    }
+  }
+  return !previous_was_special && slashes == 1;
+}
+
+HfHubOptions HfHubOptionsFromEnv() {
+  HfHubOptions opts;
+
+  // Mirrors llama.cpp `common/common.cpp:1530-1542 @ b10451`, minus that
+  // project's own MODEL_ENDPOINT name.
+  opts.endpoint = "https://huggingface.co/";
+  if (const char* endpoint = NonEmptyEnv("HF_ENDPOINT")) {
+    opts.endpoint = endpoint;
+    if (opts.endpoint.back() != '/') opts.endpoint += '/';
+  }
+
+  if (const char* token = NonEmptyEnv("HF_TOKEN")) {
+    opts.token = token;
+  } else if (const char* token_path = NonEmptyEnv("HF_TOKEN_PATH")) {
+    std::ifstream in(token_path, std::ios::binary);
+    std::getline(in, opts.token);
+    while (!opts.token.empty() &&
+           (opts.token.back() == '\r' || opts.token.back() == '\n' ||
+            opts.token.back() == ' ' || opts.token.back() == '\t')) {
+      opts.token.pop_back();
+    }
+  }
+
+  if (const char* offline = NonEmptyEnv("HF_HUB_OFFLINE")) {
+    const std::string value(offline);
+    opts.offline = value != "0" && value != "false" && value != "False";
+  }
+
+  opts.hub_dir = HfHubCacheDir();
+  return opts;
+}
+
+std::string HubFileUrl(const std::string& endpoint, const std::string& repo_id,
+                       const std::string& commit, const std::string& path) {
+  return endpoint + repo_id + "/resolve/" + commit + "/" + path;
+}
+
+std::string HubResolveRefToCommit(const std::string& repo_id,
+                                  const std::string& revision,
+                                  const HfHubOptions& opts) {
+  if (!IsValidHfRepoId(repo_id)) {
+    throw std::runtime_error("vllm.cpp: '" + repo_id +
+                             "' is not a HuggingFace repository identifier; "
+                             "expected the form org/repo");
+  }
+  // A revision that is already a commit names itself, and costs no request.
+  if (IsHexString(revision, 40)) return revision;
+
+  const json doc = ApiGet(opts, "api/models/" + repo_id + "/refs", repo_id);
+  const std::vector<std::pair<std::string, std::string>> refs = CollectRefs(doc);
+  if (refs.empty()) {
+    throw std::runtime_error("vllm.cpp: repository '" + repo_id +
+                             "' offered no usable branch or tag");
+  }
+
+  if (!revision.empty()) {
+    for (const auto& [name, commit] : refs) {
+      if (name == revision) return commit;
+    }
+    throw std::runtime_error("vllm.cpp: repository '" + repo_id +
+                             "' has no branch or tag named '" + revision + "'");
+  }
+
+  for (const auto& [name, commit] : refs) {
+    if (name == "main") return commit;
+  }
+  return refs.front().second;
+}
+
+std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
+                                     const std::string& commit,
+                                     const HfHubOptions& opts) {
+  if (!IsValidHfRepoId(repo_id)) {
+    throw std::runtime_error("vllm.cpp: '" + repo_id +
+                             "' is not a HuggingFace repository identifier; "
+                             "expected the form org/repo");
+  }
+  if (!IsHexString(commit, 40)) {
+    throw std::runtime_error("vllm.cpp: '" + commit +
+                             "' is not a commit; the reference must be resolved "
+                             "before the tree is listed");
+  }
+
+  const json doc = ApiGet(
+      opts, "api/models/" + repo_id + "/tree/" + commit + "?recursive=true",
+      repo_id);
+  if (!doc.is_array()) {
+    throw std::runtime_error("vllm.cpp: the tree listing for repository '" +
+                             repo_id + "' is not an array");
+  }
+
+  // The identifier a listing entry carries is trusted only when the request
+  // carried a token. See HfFile::oid: an unauthenticated caller on a gated
+  // repository has been answered with a fabricated identifier.
+  const bool trust_oids = !opts.token.empty();
+
+  std::vector<HfFile> files;
+  std::map<std::string, std::string> oid_owner;
+  for (const json& item : doc) {
+    if (!item.is_object() || !item.contains("type") || !item["type"].is_string() ||
+        item["type"].get<std::string>() != "file" || !item.contains("path") ||
+        !item["path"].is_string()) {
+      continue;
+    }
+
+    HfFile file;
+    file.path = item["path"].get<std::string>();
+    if (!IsSafeEntryPath(file.path)) continue;
+
+    if (item.contains("size") && item["size"].is_number_unsigned()) {
+      file.size = item["size"].get<uint64_t>();
+    }
+
+    if (trust_oids) {
+      if (item.contains("lfs") && item["lfs"].is_object() &&
+          item["lfs"].contains("oid") && item["lfs"]["oid"].is_string()) {
+        file.oid = item["lfs"]["oid"].get<std::string>();
+      } else if (item.contains("oid") && item["oid"].is_string()) {
+        file.oid = item["oid"].get<std::string>();
+      }
+      // A malformed identifier is dropped, not used, and the file is kept: it
+      // is still addressable by path, and only content addressing is lost.
+      if (!file.oid.empty() && !IsHexString(file.oid, 40) &&
+          !IsHexString(file.oid, 64)) {
+        file.oid.clear();
+      }
+      if (!file.oid.empty()) {
+        const auto [it, inserted] = oid_owner.emplace(file.oid, file.path);
+        if (!inserted && it->second != file.path) {
+          // REFUSED, not filtered. A hub that hands out one identifier for
+          // several files is answering something other than the truth about the
+          // repository, and letting the rest of that answer through would make
+          // two different files share one blob.
+          throw std::runtime_error(
+              "vllm.cpp: the tree listing for repository '" + repo_id +
+              "' gives object identifier " + file.oid +
+              " to two different files, '" + it->second + "' and '" + file.path +
+              "'. The listing is not usable.");
+        }
+      }
+    }
+
+    file.url = HubFileUrl(opts.endpoint, repo_id, commit, file.path);
+    files.push_back(std::move(file));
+  }
+  return files;
+}
+
+std::string HubResolveCommitCached(const std::string& repo_id,
+                                   const std::string& revision,
+                                   const HfHubOptions& opts) {
+  if (!IsValidHfRepoId(repo_id)) {
+    throw std::runtime_error("vllm.cpp: '" + repo_id +
+                             "' is not a HuggingFace repository identifier; "
+                             "expected the form org/repo");
+  }
+  if (IsHexString(revision, 40)) return revision;
+
+  const std::string ref = revision.empty() ? "main" : revision;
+  const fs::path repo_path = HfRepoPath(opts.hub_dir, repo_id);
+
+  if (!repo_path.empty()) {
+    const std::string cached = HfReadRef(repo_path, ref);
+    if (!cached.empty()) return cached;
+  }
+
+  if (opts.offline) {
+    throw std::runtime_error(
+        "vllm.cpp: HF_HUB_OFFLINE is set and repository '" + repo_id +
+        "' has no recorded '" + ref + "' reference under " +
+        (repo_path.empty() ? std::string("(this host has no HuggingFace cache "
+                                         "directory)")
+                           : repo_path.string()) +
+        ". Fetch it once with HF_HUB_OFFLINE unset, or point HF_HOME at a cache "
+        "that already holds it.");
+  }
+
+  const std::string commit = HubResolveRefToCommit(repo_id, revision, opts);
+  if (!repo_path.empty()) HfWriteRef(repo_path, ref, commit);
+  return commit;
+}
+
+}  // namespace transformers_utils
+}  // namespace vllm

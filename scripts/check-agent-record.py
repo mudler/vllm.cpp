@@ -536,8 +536,8 @@ ENGINE_PREFIXES = (
 # -- markdown links, and (since ee511ca8a) bare `file.cpp:123` under the
 # `RAW_LOCAL_ANCHOR_RE` prefixes -- but on a missing file or an out-of-range line
 # it `continue`s, so the bad anchor is omitted from the list and swallowed by
-# `is_code_anchor`'s `any()`. There was no symbol test and no report. 33 of the
-# 40 offenders this row banks are IN RANGE, so range-checking alone could never
+# `is_code_anchor`'s `any()`. There was no symbol test and no report. 32 of the
+# 38 offenders this row banks are IN RANGE, so range-checking alone could never
 # have found them. Found by three stale anchors that humans caught by reading
 # during the 2026-08-13/14 campaign, all of them IN RANGE. Issue #632.
 # It lands `ACTIVE`, not `SPIKE`: the same change carries the parser, the

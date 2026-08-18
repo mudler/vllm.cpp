@@ -124,26 +124,50 @@ const int32_t* AsI32(const parity::NpyArray& a) {
   std::exit(77);
 }
 
+enum class GateArtifactState { kReady, kBootstrap };
+
+GateArtifactState RequireGateArtifacts(const fs::path& gdir, const char* label,
+                                       bool dump) {
+  if (!fs::exists(gdir / "greedy_ids.npy")) {
+    SkipGate(label,
+             "required greedy_ids.npy is absent. Capture it with the pinned "
+             "ROCm oracle using qwen3-oracle-capture.py --per-prompt");
+  }
+
+  const bool have_anchor = fs::exists(gdir / "our_ids.npy");
+  const bool have_gap = fs::exists(gdir / "neartie_gap_mnats.npy");
+  if (have_anchor && have_gap) return GateArtifactState::kReady;
+  if (dump) return GateArtifactState::kBootstrap;
+
+  std::string missing;
+  if (!have_anchor) missing = "our_ids.npy";
+  if (!have_gap) {
+    if (!missing.empty()) missing += " and ";
+    missing += "neartie_gap_mnats.npy";
+  }
+  SkipGate(label, "required " + missing +
+                      " is absent. Run with VT_DUMP_IDS=1, then run "
+                      "qwen3-neartie-gap.py");
+}
+
 void RunGate(const std::string& golden_subdir, const char* label) {
-  const std::string snap = parity::Qwen35_08BSnapshot();
-  if (snap.empty()) {
+  const char* probe_dir = std::getenv("VT_QWEN35_GATE_PREREQ_PROBE_DIR");
+  const bool probe = probe_dir != nullptr;
+  const std::string snap = probe ? std::string() : parity::Qwen35_08BSnapshot();
+  if (!probe && snap.empty()) {
     SkipGate(label, "models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision "
                     "2fc06364 not cached — this gate runs where the ROCm oracle "
                     "was captured (gfx1100)");
   }
-  const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / golden_subdir;
-  const bool dump = std::getenv("VT_DUMP_IDS") != nullptr;
-  const bool have_gap = fs::exists(gdir / "our_ids.npy") &&
-                        fs::exists(gdir / "neartie_gap_mnats.npy");
-  if (!fs::exists(gdir / "greedy_ids.npy")) {
-    MESSAGE(label << " greedy golden absent; skipping — capture with the pinned "
-            "ROCm oracle: qwen3-oracle-capture.py --per-prompt for "
-            << golden_subdir);
-    return;
-  }
+  const fs::path gdir = probe ? fs::path(probe_dir)
+                              : fs::path(PARITY_GOLDENS_DIR) / golden_subdir;
+  const bool dump = !probe && std::getenv("VT_DUMP_IDS") != nullptr;
+  const GateArtifactState artifacts =
+      RequireGateArtifacts(gdir, label, dump);
+  if (probe) return;
   // BOOTSTRAP: with VT_DUMP_IDS set and no gap golden yet, generate + dump OUR
   // token ids (our_ids.i32) so qwen3-neartie-gap.py can build the gap golden.
-  if (dump && !have_gap) {
+  if (artifacts == GateArtifactState::kBootstrap) {
     MESSAGE(label << ": BOOTSTRAP dump (gap golden absent) via FromModelDir(" << snap << ")...");
     std::unique_ptr<vllm::entrypoints::LoadedEngine> le =
         vllm::entrypoints::LoadedEngine::FromModelDir(
@@ -163,12 +187,8 @@ void RunGate(const std::string& golden_subdir, const char* label) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f != nullptr) { std::fwrite(buf.data(), sizeof(int32_t), buf.size(), f); std::fclose(f); }
     MESSAGE(label << " BOOTSTRAP dumped our token ids -> " << path);
-    return;
-  }
-  if (!have_gap) {
-    MESSAGE(label << " gap goldens absent; skipping — run the gate under "
-            "VT_DUMP_IDS=1 then qwen3-neartie-gap.py for " << golden_subdir);
-    return;
+    SkipGate(label, "bootstrap does not run the correctness gate. Run "
+                    "qwen3-neartie-gap.py, then rerun without VT_DUMP_IDS");
   }
 
   const parity::NpyArray g = parity::LoadNpy((gdir / "greedy_ids.npy").string());

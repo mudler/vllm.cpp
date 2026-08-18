@@ -1957,6 +1957,11 @@ target_compile_definitions(test_qwen35_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen35_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_qwen35_paged_engine_prerequisites
+  COMMAND ${CMAKE_COMMAND}
+    "-DTEST_EXE=$<TARGET_FILE:test_qwen35_paged_engine>"
+    "-DPROBE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/qwen35_paged_engine_prerequisites"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/parity/test_qwen35_paged_engine_prerequisites.cmake")
 
 # ROW-SERVE-ASYNC-DENSE-MIRROR — the classic-dense async-serving greedy gate:
 # Qwen3-0.6B/4B async batch-1 + concurrency reproduce the race-free SYNC engine

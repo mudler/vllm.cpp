@@ -147,8 +147,33 @@ so malformed arrays remain hard failures rather than becoming skips.
 
 ### Evidence
 
-The implementation commit records command lines, exact exits, mutation source
-and binary hashes, the real model-gate result, and the final preflight result.
+- RED build: `flock /home/vikash/gpu.lock env
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib cmake --build build-hip
+  --target test_qwen35_paged_engine --parallel 4` exited 0. The new test then
+  ran with `ctest --test-dir build-hip --output-on-failure -R
+  '^test_qwen35_paged_engine_prerequisites$'`. CTest exited 8 because the
+  greedy, anchor, and gap children each exited 0 with zero assertions and
+  doctest `Status: SUCCESS!`.
+- Focused GREEN: the same build command compiled the changed test object and
+  linked the HIP executable, then exited 0. The same CTest command exited 0.
+  Direct CMake-script execution exited 0 and printed child exit 77 for
+  `greedy_ids.npy`, `our_ids.npy`, and `neartie_gap_mnats.npy`.
+- Real model gate: `flock /home/vikash/gpu.lock env
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib
+  ./build-hip/tests/test_qwen35_paged_engine` exited 0. It loaded snapshot
+  `2fc06364715b967f1860aea9cf38778875588b17`, ran on device type 5, passed
+  16 of 16 prompts and 137 of 137 assertions, and reported zero declines.
+- Mutation: the repaired greedy branch changed to a normal return. The source
+  hash changed from `7d7dfede853fe46746cbefec087130b17dc7e65b93376f28ff932ee32739bc8e`
+  to `27cbf5cba2bce704c2df737da9397f6d42afa92232f1c3bad0715ac745508116`.
+  A fresh rebuild exited 0 and changed the binary hash from
+  `a5fcd67f7d926efd90ce50732a6eb667fab045ccc0036248a9647f89cc1f3df4`
+  to `b758bcb7ab8af04d22c5f99dcefdc5c0d5db802f28d1543f79f755a8f33bed6d`.
+  CTest exited 8 because the greedy child exited 0. The other two children
+  still exited 77. Restoration recovered both original hashes, the same
+  tracked status, and CTest exit 0 after a fresh rebuild.
+- Full gate: `PATH=/usr/bin:$PATH GIT_CONFIG_GLOBAL=/dev/null
+  scripts/agent-preflight.sh` exited 0 and printed literal `All gates green.`
 
 ### Stop conditions
 
@@ -157,3 +182,21 @@ actual executable, if absent artifacts cannot be distinguished from malformed
 present arrays, if the pinned local snapshot or ROCm gate cannot run under the
 required mutex, or if any change outside this test, its registration, this
 specification, and the issue-index append is required.
+
+### Outcome
+
+Issue #1222 was the two normal returns named by the finding. The greedy branch
+returned directly, and one shared branch returned when either the anchor or gap
+was absent. Both paths produced a zero-assertion doctest success.
+
+The gate now uses one existence-only helper. The helper exits 77 for each
+missing required artifact and returns only when all three paths exist. Array
+loading and dtype and shape checks remain after the helper, so a malformed
+present array still takes the hard-failure path. `VT_DUMP_IDS` remains the one
+bootstrap opt-in. Its model run and `our_ids.i32` write remain intact, but the
+bootstrap path now exits 77 after the dump because it did not run correctness.
+
+The test uses an environment probe in the real executable instead of a second
+artifact predicate. A separate validator was rejected because it could drift
+from the gate. Exit 77 remains the existing CTest unavailable-gate contract.
+No numerical threshold, snapshot pin, model setting, or device default changed.

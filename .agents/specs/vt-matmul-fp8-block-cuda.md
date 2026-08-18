@@ -403,7 +403,131 @@ rather than deferred silently.
 
 ## Evidence
 
-Filled in when the row lands.
+Taken on `origin/main` at `27d5432f9`, in a linked worktree, Debug, no CUDA
+toolkit and no device on the host. **Nothing below is a device measurement, and
+the absence is itself recorded rather than glossed.**
+
+**RED.** With both test files present and `src/vt/cuda/fp8_block_scaled_dispatch.h`
+deleted — `ls` on it returning `No such file or directory`, which is the proof
+available for a file `git` has not yet tracked — the focused build fails,
+`compile_rc=1`, with
+``tests/vt/test_fp8_block_scaled_dispatch.cpp:42:10: fatal error:
+vt/cuda/fp8_block_scaled_dispatch.h: No such file or directory``. Restoring it
+from a tar snapshot and rebuilding returns `compile_rc=0`.
+
+The checker half was red first in the same way. `check-cuda-fat-gencode.py` falls
+through to `ALL_SMS` for a source it does not know, so with the new test case
+added and the checker untouched, `python3 -m unittest
+tests.scripts.test_check_cuda_fat_gencode` reported **2 failures**: the new
+`test_the_block_scaled_fp8_cutlass_tu_is_audited_as_sm12x`, and the pre-existing
+`test_exact_source_and_archive_matrix_passes`, whose message was
+``src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu: gencode ['120a', '121a'] !=
+expected ['80', ... '121a']`` — the ten-SM fat build audit failing on a
+correctly-compiled TU, which is #394's failure in the other direction. With the
+checker's two lines added: 8 tests, `OK`.
+
+**GREEN, host tier.** `test_fp8_block_scaled_dispatch` reports 4 cases, 79
+assertions, 0 failed, `Status: SUCCESS!`, in 0.00 s under `ctest`. Per block,
+each through a `-tc` prefix filter containing no comma, because doctest splits
+`-tc` on commas and a name with one yields `0 cases ran` under a `SUCCESS!`
+banner:
+
+| Block | Cases | Assertions |
+|---|---:|---:|
+| G1 the tile-config heuristic | 1 | 22 |
+| G3 the deduced scale layouts | 1 | 17 |
+| G4 the refusals, and what is NOT refused | 1 | 33 |
+| G5 the dispatch counter | 1 | 7 |
+| **sum** | **4** | **79** |
+
+The buckets sum to the whole-run count, so no block is silently empty and no
+filter selected nothing.
+
+**GREEN, and NOT A RESULT, device tier.** `test_ops_matmul_fp8_block_cuda`
+reports 5 cases, 27 assertions, `Status: SUCCESS!` — and **all 27 come from G6
+alone**. G2, G7, G8 and G9 each report `assertions: 0` under a `-tc` filter and
+each printed `NO CUDA DEVICE: ... #1189 M5's on-hardware leg is OWED, not
+passed.` **`assertions: 0` is a skip wearing a pass**, and it is recorded here as
+the measurement it is: the load-bearing comparison of this row did not run.
+
+| Block | Cases | Assertions | What that means |
+|---|---:|---:|---|
+| G6 the grid's own precondition | 1 | 27 | ran, and is host-only by design |
+| G2 upstream's CUTLASS case | 1 | **0** | **did not run** |
+| G7 the M sweep and the counter | 1 | **0** | **did not run** |
+| G8 the f32 sink | 1 | **0** | **did not run** |
+| G9 the refusals on a device | 1 | **0** | **did not run** |
+
+**The other declared gates on the same tree**, all `Passed` under `ctest`:
+`test_ops_matmul_fp8_block_cpu` (M2 unchanged, 4.79 s),
+`test_ops_quant_fp8_group_cpu` (M1 unchanged, 47.61 s),
+`test_fp8_block_linear` (M4 unchanged, 1.09 s), `test_op_provider`,
+`test_ops_fp8_cpu`. `python3 scripts/check-cuda-op-arch-gate.py` reports
+`OK (2 op(s) pinned to an unconditional CUDA TU)` — unchanged, and correctly so:
+its `REQUIRED` set is for ops whose CUDA registration must not depend on a
+feature, and its own docstring excludes "the cutlass GEMMs", of which this is
+one.
+
+### Mutation results
+
+Every mutation printed `compile_rc` **and** evidence that it applied, because a
+mutation that fails to build and a mutation that never applied both read as a
+passing test. The tree was snapshotted to **tar** and restored from tar, never
+with `git checkout -- .`, which reads the index; the restore was verified by
+`sha256sum -c` against a digest taken before the first mutation, and every source
+was `touch`ed afterwards so `ninja` could not skip the rebuild and leave a
+mutated binary to be re-run.
+
+| Mutation | `compile_rc` | Result |
+|---|---|---|
+| the heuristic's `\|\|` becomes `&&` | 0 | 1 of 4 cases, **9 assertions** fail. This is the one-character bug the two clauses exist to separate: `&&` agrees with `\|\|` on every M below 65 and every M divisible by 4 |
+| `M <= 256` tested before the swap | 0 | 9 host assertions AND 1 device-tier assertion — G6's own coverage check notices the grid stopped exercising three configs |
+| the activation-scale index loses its stride, `row + k_tile` | **1** | **proves nothing**: `-Werror=unused-parameter` on `m` |
+| the same defect with the parameter kept live, `row * m + k_tile` | 0 | **8 assertions** fail. G3's hand-derived table is what catches it |
+| the weight-scale index transposed | 0 | 2 assertions fail |
+| **`N % 16` becomes `N % 128`** | 0 | 4 host assertions AND 2 device-tier assertions fail. This is the ragged-block claim, measured: the mutation refuses `N = 576`, which is the one shape upstream's own CUTLASS test runs |
+| `K % 16` becomes `K % 4` | 0 | 2 assertions fail: `K = 3884` is divisible by 4 and would be accepted into a kernel that cannot tile it |
+| the refusal order: alignment asked before block geometry | 0 | 1 assertion fails |
+| a refusal counted as a dispatch | 0 | 2 assertions fail. A build whose every call was refused would otherwise look identical to one whose every call ran |
+| the `kCount` sentinel guard's `>=` becomes `>` | 0 | 1 assertion fails |
+| the K refusal stops naming upstream's reroute | 0 | **NOT CAUGHT** — see below |
+
+Three results are worth keeping.
+
+**One mutation was not caught, and the test was repaired rather than the record
+edited.** Deleting the phrase "reroutes it to triton" from the K-alignment
+message left the suite green, because the same message's NEXT sentence contains
+the bare word "triton" ("there is no triton block arm here") and the assertion
+was a bare-word `find`. The assertion now requires the whole clause and
+`cutlass_compatible_b` beside it; re-run, the same mutation fails 1 assertion.
+That is the assertion count moving from 78 to 79 between the first and final
+runs.
+
+**A mutation that fails to build proves nothing, and this row hit it on the
+first try.** The obvious spelling of the scale-index bug drops the `m`
+parameter, and `-Werror=unused-parameter` rejects it before any test runs. The
+mutation was re-expressed to keep the parameter live, which is the only form
+that measures anything.
+
+**The ragged-block decision is measured, not asserted.** Two mutations move the
+alignment constant in opposite directions and each is caught by a different half
+of G4 — the `% 128` one by the shapes that must NOT be refused, the `% 4` one by
+the shape that must be. A refusal test that only listed refusals would have
+passed the first, which is how a correct kernel gets narrowed until it no longer
+runs the checkpoint it was written for.
+
+### A shared scratch directory nearly voided this run
+
+The mutation harness was written to the session scratchpad as `mutate.sh`. That
+directory is shared across concurrent sessions, and #1189's own M6 row — running
+at the same time on `row/MODEL-FP8-BLOCK-MERGED` — wrote its own `mutate.sh` to
+the same path while this harness was executing. `bash` reads a script file
+incrementally, so a replaced file can make a running job execute another
+session's commands against another session's `WT`. The run was killed, the four
+files verified byte-for-byte against a `sha256` digest taken beforehand, and the
+two repaired mutations re-run from a uniquely named script in a private
+subdirectory. Nothing was lost, and the control that caught it is the digest,
+not the harness's own "RESTORED" banner.
 
 ## Now
 

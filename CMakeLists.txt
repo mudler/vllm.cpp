@@ -1712,9 +1712,18 @@ if(VLLM_CPP_CUDA)
     # different upstream arch set from the NVFP4 block-scaled collective (vLLM
     # keeps them as separate SCALED_MM_ARCHS / FP4_SM120_ARCHS intersections), so
     # it is resolved separately here rather than riding on the NVFP4 gate.
+    # cuda_matmul_fp8_block_cutlass.cu (#1189 M5) rides the SAME cell: it is the
+    # BLOCK-scaled (fine-grained 128x128) sibling of the per-tensor GEMM above,
+    # built from the same ArchTag=Sm120 family -- upstream keeps both in
+    # csrc/.../w8a8/cutlass/c3x behind one SCALED_MM_ARCHS intersection. It is a
+    # separate TU rather than a second kernel in the same file because the two
+    # share no template (dense layout tags vs cute::tuple<Layout, LayoutSF>), so
+    # one file would only serialise two heavy cutlass compiles.
     set(_FP8_CUTLASS_SOURCES)
     if(VT_CUTLASS_FP8_ARCHS)
-      set(_FP8_CUTLASS_SOURCES src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
+      set(_FP8_CUTLASS_SOURCES
+        src/vt/cuda/cuda_matmul_fp8_cutlass.cu
+        src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu)
     endif()
     target_sources(vllm PRIVATE
       ${_NVFP4_CUTLASS_SOURCES}

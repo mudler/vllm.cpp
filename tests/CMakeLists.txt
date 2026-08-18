@@ -1810,6 +1810,23 @@ vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.c
 # against. Its G4 holds the constraint the row exists for: the scales apply in
 # the MAINLOOP, once per K-block, which an epilogue-folded alpha cannot express.
 vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu.cpp)
+# VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5): the HOST-SIDE contract of the same op's
+# CUDA arm — the tile-config heuristic, the refusal predicate, the two scale
+# layouts cutlass DEDUCES from the problem shape, and the dispatch counter. Runs
+# on every machine including one with no GPU and no CUDA toolkit, which is the
+# whole point: those four are the parts of an sm_12xa-only kernel that can be
+# wrong in a way a successful compile cannot see. Reaches the internal header
+# under src/ (not public API), exactly like its test_fp8_plan_cache neighbour.
+vllm_cpp_add_test(test_fp8_block_scaled_dispatch vt/test_fp8_block_scaled_dispatch.cpp)
+target_include_directories(test_fp8_block_scaled_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5), the DEVICE tier: the CUDA arm against the
+# CPU reference arm of the SAME op, carrying upstream's own
+# test_w8a8_block_fp8_cutlass_matmul whole (M=32, N=576, K=7168, rel_diff <
+# 0.001). IT HAS NEVER RUN: no GPU was leased for that row and it skips without a
+# device. The row's spec lists the on-hardware leg under `## Owed`; a skip here
+# is not a pass and must not be reported as one.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_cuda vt/test_ops_matmul_fp8_block_cuda.cpp)
+target_include_directories(test_ops_matmul_fp8_block_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the

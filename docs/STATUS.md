@@ -572,7 +572,7 @@ output-dtype dispatch fix; gfx1201 Gemma-4 FP8 MoE is contributor-measured on
 2x R9700 and CPU-link-verified our side; a `head_dim=128` decode arm lands
 opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves gfx1200 per-token
 decode from 6.35x to 1.75x slower than the pinned vLLM oracle on one shape, a
-directional figure that leaves the ROCm throughput axis PENDING;
+directional figure that leaves the ROCm throughput axis PENDING; #1047 item 3 on gfx1201 Gemma-4 FP8 prefill-peer is attribution only (T=2029: deleting two Finish success-path barriers is +2.55% / 46.05 ms/req vs the retained RetirePinThenUnpin wait, not a license to land the deletion and not a ROCm throughput pin; [BENCHMARKS](BENCHMARKS.md));
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
 ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
 validator's two errors and three warnings, and the dot-anchored segment match),

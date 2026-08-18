@@ -10,12 +10,17 @@ is why the load-bearing gate below is byte-identity rather than a speed ratio.
 
 ## Now
 
-`ACTIVE`. The shared registry, its CPU contract suite and the CUDA wiring land here,
-together with the [#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair: the
-runtime binding is allowed to see calls fail and never consumed the runtime's latched
-error, so the first unrelated kernel after a capture reported our refusal as its own
-failure and every `VT_CUDA_GRAPH_DEDUP=1` run died. The device-level byte-identity A/B
-and the ROCm leg are named under [`## Owed`](#owed) with the issue that owns each.
+`ACTIVE`, and the state is argued rather than inherited. The shared registry, its CPU
+contract suite, the CUDA wiring and the
+[#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair all landed. The owed
+device A/B ran on 2026-08-18 and split in two: the correctness half PASSED, and the
+benefit half was REFUTED for exactly the case this row was filed for. `N == M` in every
+`VT_CUDA_GRAPH_DEDUP=1` cell, because the signature carries the padded batch dimension,
+so no two decode buckets ever group. The row is not `DONE`, because its stated saving
+does not occur; it is not `PARTIAL`, because nothing upstream is omitted — SGLang keys
+the same fields. It stays `ACTIVE` on one open, traceable hypothesis
+([#1226](https://github.com/mudler/vllm.cpp/issues/1226)) and the items under
+[`## Owed`](#owed). Full result: [`## Outcome`](#outcome).
 
 ## Scope
 
@@ -218,11 +223,14 @@ raises rather than latching, so the whole error-latch class does not exist there
    with a negative control proving the instrument can fail. A proxy is not the gate: the
    CUDA 13 `cudaGraphGetEdges` break this file already took was invisible to exactly
    this kind of local check and only `cuda-fat-build` reported it.
-6. **Device byte-identity A/B (owed, see below).** Same binary, `VT_CUDA_GRAPH_DEDUP`
+6. **Device byte-identity A/B — RAN 2026-08-18, PASS; see [`## Outcome`](#outcome).** Same binary, `VT_CUDA_GRAPH_DEDUP`
    off then on, identical prompts and sampling, token-exact equality, with **more than
    one replay per padded bucket** — a first replay can be correct by accident, and the
    whole hazard of a shared executable is that the *second* visit to a shape is the one
-   that has to re-point it.
+   that has to re-point it. **Stated limit on how that clause was satisfied:** the driver
+   prints a replay TOTAL and no per-shape breakdown, so "more than one replay per bucket"
+   rests on the total over the captured shapes (workload B, 60 replays over 2 shapes,
+   ~30 each) and is arithmetic rather than a direct measurement.
 7. **Not gated, deliberately:** throughput. This row must not be sold as a speed
    change. The reportable numbers are executable count and capture wall time.
 
@@ -390,17 +398,115 @@ raises rather than latching, so the whole error-latch class does not exist there
   general lesson for this file: a header-shape check is only as current as the toolkit
   it ran against, and the CI job is the gate, not the local proxy.
 
+## Outcome
+
+The device gate ran on 2026-08-18 on `dgx:gpu0` through an `rc` lease (job `f88d484b`,
+pod `rc-worker-4b8lj`, boot_id `1cf6179f-0150-4052-b507-506fd6751953`), GB10, driver
+`580.173.02`, nvcc `13.0.88`, runtime cuBLASLt the staged cu130
+`/tmp/tsite/nvidia/cu13/lib/libcublasLt.so.13`. Twelve cells of one binary
+(sha256 `e166ed8d…7666fb`), `VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1`
+throughout, the only variable `VT_CUDA_GRAPH_DEDUP`. Recipe, hashes, per-cell table and
+caveats: [`.agents/benchmark-record.md`](../benchmark-record.md), entry
+`ENG-CUDAGRAPH-DEDUP W4`.
+
+**The commit gated is `72de552c8`, not the merge `2a976eb9f`.** The row squashed, so the
+gated tree is not an ancestor of what landed. What carries the claim instead is a
+content equality that was checked rather than assumed: all four dedup sources —
+`src/vt/graph_dedup.h`, `graph_dedup_runtime.h`, `graph_dedup_latch.h` and
+`graph_dedup_signature.h` — are byte-identical at the two commits.
+
+### What was measured
+
+1. **[#1184](https://github.com/mudler/vllm.cpp/issues/1184) is fixed on the device.**
+   All 12 cells exit 0. `grep -c "invalid device function"` and `grep -c "engine-fatal"`
+   return zero in every cell log. On the pre-fix head `e4ce5571a` every `dedup=1` cell
+   died after exactly one replay. The ON arms now replay as often as the OFF arms:
+   60 = 60 on workload B, 33 = 33 on A, 43 = 43 on C.
+2. **Byte-identity holds, 10/10.** The OFF/OFF controls passed first — `a_off_a ==
+   a_off_b`, `b_off_a == b_off_b`, `c_off_a == c_off_b` — and then every OFF-vs-ON pair
+   was identical. The artifact is `--output-token-ids`, real generated identifiers, 0
+   empty rows, 960 / 672 / 1176 tokens. The three workloads hash to three DIFFERENT
+   values (`d3b7028b…`, `02a1add6…`, `4f8714db…`), so the identity is not vacuous.
+3. **The fold never happens.** `N == M` in every ON cell, now with two and three
+   *distinct* padded buckets per process, where the first attempt managed only one and
+   could therefore prove nothing:
+
+```text
+a_on_a / a_on_b: captured 3 graphs, deduped to 3 execs   sizes=[24 16 8]
+b_on_a / b_on_b: captured 2 graphs, deduped to 2 execs   sizes=[16 8]
+c_on_a:          captured 2 graphs, deduped to 2 execs   sizes=[32 24]
+```
+
+The registry's own line climbs `1 -> 1`, `2 -> 2`, `3 -> 3`, which is the proof that
+more than one capture reached it.
+
+### What was refuted, and why the row's premise was wrong
+
+The cause is structural rather than a tuning miss. `AppendKernelPayload` hashes
+`(func, gridDim.{x,y,z}, blockDim.{x,y,z}, sharedMemBytes)`
+(`src/vt/graph_dedup_runtime.h:121-128`) and the memcpy payload hashes the copy extent.
+The padded batch dimension is in both, so two decode buckets never share a key, no
+candidate group ever forms, and `cudaGraphExecUpdate` is **never attempted**.
+
+This refutes the row's own premise. `graph_dedup.h`'s header comment says the fold
+exists because "the decode graphs of two padded batch sizes are usually the same node
+topology with different parameters", and the signature as written cannot group exactly
+those. SGLang hashes the same fields (`cuda_graph_dedup_mixin.py:105-114`), so whatever
+folds upstream is not decode buckets either. The machinery is correct and does nothing
+on the workload it was built for.
+
+### Why the defaults have their values
+
+`VT_CUDA_GRAPH_DEDUP` stays **OFF**. The flip was gated on this A/B, and the A/B says
+the ON arm allocates exactly as many executables as the OFF arm on the only driver
+exercised. A default is a measurement, and this measurement does not support one.
+
+**No throughput or memory number is recorded, on any axis.** Two independent reasons,
+and either alone is sufficient: the clocks were not pinned (208 MHz idle, 3003 MHz max,
+2418 MHz applications), and dedup allocated the same number of executables as OFF, so
+there is no memory delta to claim. The `replay branch avg` figures in the logs
+(0.033-0.120 ms/step) are diagnostics, not a measurement.
+
+### Honest gaps in this run
+
+- **Per-shape replay counts are unavailable.** The driver prints a total only.
+  Workload B's ~30 replays per shape is arithmetic over that total (60 replays, 2
+  shapes), stated as arithmetic and not as a measurement.
+- **The driver's "N captured size(s)" line counts SLOTS, not captures.** Workload A
+  reports 6 sizes and emits only 3 `captured … padded size S=` lines.
+- **The container's own cuBLASLt was never re-tested at CUDA 13.0.** The smoke probe
+  tried the staged cu130 prefix first and it worked, so the original reason for the shim
+  — a 13.6.0.2 cuBLASLt that could not capture — may no longer apply.
+- **Only the Qwen3 dense decode driver was exercised.** Whether any other capture site,
+  or two models sharing the process-singleton registry, can produce a fold is untested.
+- **The in-pod toolkit changed under us**, from 13.3.73 at the first attempt to 13.0.88
+  here, on the same pod and the same boot, because a neighbouring session held the box
+  first. A job that needs a known toolkit must assert it rather than assume it.
+- **The supporting `orin:gpu0` lane is BLOCKED**, cleanly: the Jetson `540.4.0` driver
+  cannot run a CUDA 13 runtime (`cudaGetDeviceCount err=35`). A CUDA 12.x toolkit is the
+  untried route. It is recorded, not pursued, because the dgx gate answered the question
+  orin was there to support.
+
 ## Owed
+
+**DELIVERED by W4, 2026-08-18 — see [`## Outcome`](#outcome).** The device
+byte-identity A/B: **PASS**, 10/10, OFF/OFF controls first. The `#1184` re-run
+confirming that `VT_CUDA_GRAPH_DEDUP=1` completes a decode step on a device: **PASS**,
+12/12 cells exit 0, zero `invalid device function`, zero `engine-fatal`. The
+executable-count ratio: **DELIVERED AND NEGATIVE**, `N == M` in every ON cell over two
+and three distinct padded buckets, so the row's headline saving is measured NOT to
+occur with the current signature. What remains owed is below.
 
 | Item | Issue | Why not here |
 |---|---|---|
-| The device byte-identity A/B and the executable-count measurement (W4) | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | needs a leased CUDA box; the CPU tier proves the registry's launch-sequence identity, not the device's |
-| Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | gated on W4. A default is a measurement, not a preference |
+| Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | **NOT JUSTIFIED on this evidence.** W4 delivered and the ON arm allocated exactly as many executables as OFF, so the flip would ship a probe cost for no measured saving. It is gated now on a key that can actually group two decode buckets ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)), not on a rerun of the same A/B |
 | Probing `group.current_raw` rather than `raws.front()`, retiring the transitivity assumption above | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it changes probe behaviour, and the device A/B is measuring the current one. Land it with the A/B rerun, not before |
 | Executable coverage for the signature builder's DEVICE half — stability and discrimination on a real `cudaGraph_t`, plus the five node-payload cases and their query escapes | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | the device-free half is now covered by `tests/vt/test_graph_dedup_runtime.cpp`; what remains needs a real `cudaGraph_t`, so it rides with the leased box the A/B already needs |
-| Re-running the device A/B after the [#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair, and confirming that `VT_CUDA_GRAPH_DEDUP=1` now completes a decode step | [#1184](https://github.com/mudler/vllm.cpp/issues/1184) | the CPU suite proves the guard's structure over a fake runtime; only a device can prove that `cudaGetLastError` clears the real latch and that the run survives. #1184 stays open until that run exists |
 | Reaching the feature from the DEFAULT serving path. Dedup engages only under `VT_ASYNC_RUNNER=0`, because the async path captures no decode graph at all ([#323](https://github.com/mudler/vllm.cpp/issues/323) mitigation) | [#1179](https://github.com/mudler/vllm.cpp/issues/1179) | the repair is the `StepDevInputs`-shaped one `ENG-CUDAGRAPH-BREAK` already owns; until it lands, this row's saving is unreachable on the configuration users serve with |
 | The ROCm leg's compile and run verification | [#41](https://github.com/mudler/vllm.cpp/issues/41) | no ROCm hardware or `hipcc` is reachable from this session and CI has no ROCm job, so the HIP wiring is written against the same shared header but is compile-unverified |
+| **THE NEXT TRACEABLE HYPOTHESIS, not decided here.** A COARSER signature key — one that keeps the function addresses and the topology but drops the launch dimensions and the memcpy extents — would let two padded decode buckets form a candidate group at all. It is not obviously unsafe: the registry probes with `cudaGraphExecUpdate` BEFORE it folds, so a key that groups two graphs the driver then refuses costs one wasted probe and a private executable rather than a wrong replay. That makes it a cost question. It needs its own spec, a red-first discrimination test proving the coarser key still separates two genuinely different topologies, and a device run measuring the probe-refusal rate | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it changes what the row optimizes, so it is a design decision with its own evidence, not a repair to fold into the record of the run that found it. AGENTS.md forbids declaring a ceiling, and "unreachable with THIS key" is not "unreachable" |
+| Whether ANY capture site can fold. W4 exercised only the Qwen3 dense decode driver. The other hand-rolled drivers, and two models sharing the process-singleton registry, are untested | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | the same lease that answers the key question answers this one, and answering it before the key is settled measures the wrong thing |
+| A supporting device leg on `orin:gpu0` | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | BLOCKED, cleanly: the Jetson `540.4.0` driver cannot run a CUDA 13 runtime (`cudaGetDeviceCount err=35`). A CUDA 12.x toolkit is the untried route. Not needed now that the dgx gate answered |
 
 ## Stop conditions
 

@@ -140,9 +140,9 @@ class Scheduler {
 
   // VIRTUAL destructor — REQUIRED, not cosmetic. `AsyncScheduler` derives from
   // this class and production/test code owns the derived object through a
-  // `std::unique_ptr<Scheduler>` base pointer (src/vllm/entrypoints/
-  // model_loader.cpp:176 `MakeScheduler`, include/vllm/entrypoints/
-  // model_loader.h:206 `scheduler_`, tests/vllm/v1/
+  // `std::unique_ptr<Scheduler>` base pointer
+  // (`src/vllm/entrypoints/model_loader.cpp::MakeScheduler`,
+  // `include/vllm/entrypoints/model_loader.h::scheduler_`, tests/vllm/v1/
   // test_async_admission_timing.cpp:167-170). Deleting a derived object through
   // a base pointer whose destructor is non-virtual is UNDEFINED BEHAVIOUR
   // ([expr.delete]/3) — the derived destructor never runs. GCC does not

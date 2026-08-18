@@ -190,6 +190,22 @@ int main(int argc, char** argv) {
   // entry count and per-entry widths — is the number every count assertion
   // below is measured against.
   bool golden_info = false;
+  // ── #1157 DISCRIMINATOR ────────────────────────────────────────────────────
+  // Generate the SAME token stream WITHOUT ever taking a decode step: ask for
+  // one token at a time, each from a FRESH request whose prompt is the original
+  // prompt plus every token generated so far. Every token then comes out of a
+  // PREFILL, and the recurrent state and paged KV each start empty.
+  //
+  // It is the same engine, the same weights and the same public entry point, so
+  // the two runs differ in exactly one thing: whether a token was produced by
+  // continuing a sequence or by recomputing it. A stream that is right this way
+  // and wrong the normal way localises the defect to the CARRY and rules out
+  // the tower; a stream that is wrong BOTH ways rules the carry out instead.
+  bool fresh_prefill = false;
+  // Run BOTH modes over one engine load, which is the only affordable shape
+  // when a load is minutes long: the two streams then differ in nothing except
+  // whether a token came from a decode step or from a re-prefill.
+  bool both_modes = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -200,6 +216,8 @@ int main(int argc, char** argv) {
     else if (a == "--max-model-len") max_model_len = std::atoi(next());
     else if (a == "--load-only") load_only = true;
     else if (a == "--golden-info") golden_info = true;
+    else if (a == "--fresh-prefill") fresh_prefill = true;
+    else if (a == "--both-modes") both_modes = true;
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty() && !golden_info) {
@@ -291,22 +309,57 @@ int main(int argc, char** argv) {
                     : static_cast<int>(gold.entries.size());
 
   int total_compared = 0, total_matched = 0, rows_full = 0, rows_short = 0;
+  const int n_modes = both_modes ? 2 : 1;
+  for (int mi = 0; mi < n_modes; ++mi) {
+  if (both_modes) {
+    fresh_prefill = (mi == 1);
+    total_compared = 0; total_matched = 0; rows_full = 0; rows_short = 0;
+    std::fprintf(stderr, "\n[nemotron-h] ===== MODE %s =====\n",
+                 fresh_prefill ? "fresh-prefill" : "decode");
+  }
   for (int pi = 0; pi < n_prompts; ++pi) {
     const GoldenEntry& e = gold.entries[static_cast<size_t>(pi)];
     std::vector<int32_t> gen(static_cast<size_t>(steps), 0);
     int32_t n_gen = 0;
     const auto ts = std::chrono::steady_clock::now();
+    if (fresh_prefill) {
+      // One token per completion, from a prompt that grows by the token the
+      // previous completion returned. `n_gen` still counts what THIS driver
+      // produced, so every count assertion below is unchanged.
+      std::vector<int32_t> ctx = e.prompt_token_ids;
+      vllm_sampling_params one = sp;
+      one.max_tokens = 1;
+      for (int t = 0; t < steps; ++t) {
+        int32_t got = 0, n_one = 0;
+        const vllm_status s1 = vllm_complete_tokens(
+            eng, ctx.data(), static_cast<int32_t>(ctx.size()), &one, &got, 1,
+            &n_one, nullptr);
+        if (s1 != VLLM_OK || n_one != 1) {
+          std::fprintf(stderr,
+                       "[nemotron-h] prompt %d fresh-prefill step %d FAILED "
+                       "(status=%d n=%d): %s\n",
+                       pi, t, static_cast<int>(s1), static_cast<int>(n_one),
+                       vllm_last_error());
+          vllm_engine_free(eng);
+          return 1;
+        }
+        gen[static_cast<size_t>(t)] = got;
+        ctx.push_back(got);
+        ++n_gen;
+      }
+    } else {
     const vllm_status st = vllm_complete_tokens(
         eng, e.prompt_token_ids.data(),
         static_cast<int32_t>(e.prompt_token_ids.size()), &sp, gen.data(),
         static_cast<int32_t>(gen.size()), &n_gen, nullptr);
-    const auto te = std::chrono::steady_clock::now();
     if (st != VLLM_OK) {
       std::fprintf(stderr, "[nemotron-h] prompt %d FAILED: %s\n", pi,
                    vllm_last_error());
       vllm_engine_free(eng);
       return 1;
     }
+    }
+    const auto te = std::chrono::steady_clock::now();
 
     const int expected = static_cast<int>(e.token_ids.size());
     const int n = std::min(expected, static_cast<int>(n_gen));
@@ -336,8 +389,10 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr,
                "\n[nemotron-h] TOKEN MATCH: %d/%d over %d prompt(s) "
-               "(full rows=%d, short rows=%d)\n",
-               total_matched, total_compared, n_prompts, rows_full, rows_short);
+               "(full rows=%d, short rows=%d, mode=%s)\n",
+               total_matched, total_compared, n_prompts, rows_full, rows_short,
+               fresh_prefill ? "fresh-prefill" : "decode");
+  }
   vllm_engine_free(eng);
 
   // A pass needs three things to be true at once, and each is checked here

@@ -133,6 +133,8 @@ and it must resolve on every CUDA architecture. It is added to
 | a ragged `K` is accepted and reads past the row | the op refuses `K % group_size != 0` by name; G5 asserts the refusal |
 | an all-zero output passes every value comparison | G2 and G3 carry a `nonzero == numel` vacuity guard |
 | the CPU and CUDA arms drift apart | G6, which is CUDA-gated and currently **owed** |
+| the CUDA arm does not compile, and this host cannot say so | the `cuda-fat-build` CI job compiles it on the pull request; its verdict is the gate, and this row did not take that measurement itself |
+| the CUDA arm compiles and computes the wrong bytes | **not covered here.** G6 is the instrument and it needs a device. Named under `## Owed` |
 
 ## Tests
 
@@ -172,14 +174,28 @@ and it must resolve on every CUDA architecture. It is added to
 | structural | `python3 scripts/check-cuda-op-arch-gate.py` |
 | record | `scripts/agent-preflight.sh --fail-on-skip` |
 
-The CUDA arm compiles in this change. It does not run in this change.
+**Where the CUDA arm is compiled, and where it is not.** The implementing host
+has no CUDA toolkit (`nvcc` is absent), so this row did not compile the kernel
+locally. Continuous integration does: the `cuda-fat-build` job
+(`.github/workflows/ci.yml:669-710`) configures `-DVLLM_CPP_CUDA=ON` for ten
+architectures in an `nvidia/cuda` devel container and builds the `vllm` target
+on every non-closed `pull_request` event, and `src/vt/cuda/cuda_quant_fp8.cu` is
+in the unconditional CUDA source list, so the compile leg is gated there. Its
+verdict is the pull request's, not a measurement this row took before opening
+it.
+
+Nothing runs the kernel. That job states it uses no GPU, and no other lane
+executes a CUDA kernel, so the arm's first execution belongs to #1189 milestone
+M5. `## Owed` records that.
 
 ## Owed
 
-- The CUDA arm's on-hardware leg. The kernel is written and it compiles, and
-  G6 measures nothing without a device. Owed by #1189 milestone M5, which needs
-  a GPU anyway; the case is already written, so the debt is a run and not a
-  test.
+- **The CUDA arm's on-hardware leg.** The kernel compiles in the
+  `cuda-fat-build` continuous-integration job and executes nowhere: no lane runs
+  a CUDA kernel, and this host has neither a toolkit nor a device. G6 is written
+  and prints a `PENDING` banner that names what was not measured. Owed by #1189
+  milestone M5, which needs a GPU anyway. The debt is a run, not a test: the
+  case selects itself as soon as a device exists.
 - **Nothing reaches this op yet.** `vt::QuantFp8Group` is dispatched by no
   production entry point at this merge commit: `include/vllm.h` does not expose
   it, no loader builds a `Fp8BlockWeight`, and `ModelRegistry::Forward` has no
@@ -211,6 +227,51 @@ scoped so that it does not.
 
 ## Evidence
 
-Recorded in the pull request body: the RED capture before the implementation
-existed, the GREEN capture after, and the per-block gate counts from
-`scripts/agent-preflight.sh --fail-on-skip`.
+RED before the implementation existed: the focused build failed with
+``'QuantFp8Group' is not a member of 'vt'`` and ``'kQuantFp8Group' is not a
+member of 'vt::OpId'`` at 12 sites.
+
+GREEN after: `test_ops_quant_fp8_group_cpu` reports 6 cases, 476 assertions, 0
+failed. `scripts/agent-preflight.sh --fail-on-skip` reports **All gates green**
+with no `FAIL` and no `SKIP`.
+
+### Mutation results
+
+Every mutation prints `git diff --stat` and `compile_rc`, because a mutation
+that never applied and a mutation that failed to build both read as a passing
+test. Two of the ten did exactly that and are reported here rather than
+dropped.
+
+| Mutation | `compile_rc` | Result |
+|---|---|---|
+| the Triton arm's scale form, `amax * (1/448)` | 0 | G1 fails 49/146; G2 fails 6/48 shape checks |
+| the Triton arm's value form, `x * (1/y_s)` | 0 | G1 fails 14/146; **G2 passes 50/50** |
+| `float amax = 0.0F` | **1** | proves nothing: `-Werror=unused-variable` on `kEps` |
+| the same with `kEps` kept live | 0 | G3 fails 260/269; G1 passes |
+| per-group scale collapsed to per-row | 0 | G3 fails 7/269; G1 fails 60/146 |
+| the divisibility refusal, applied with a shell-escaped pattern | n/a | **never applied**; the harness reported `MUTATION_NOT_UNIQUE count=0` and the case then read `SUCCESS` |
+| the divisibility refusal, applied | 0 | G5 fails |
+| `out_scale` f32 refusal widened to any float | 0 | G4 fails |
+| the CPU registration deleted | **1** | proves nothing: `-Werror=unused-function` |
+| the same with the kernel kept live | 0 | G1 fails at its `REQUIRE`; **G5 still passes** |
+
+Three results are worth keeping.
+
+**Upstream's tolerances are not a substitute for a byte comparison, and the
+measurement is more specific than the argument for it.** The scale assertion at
+`rtol=1e-5` never fired for either 1-ULP form: a 1-ULP scale difference is about
+6e-8 relative. The value assertion at `rtol=0.15` fired for the scale-form
+change in 6 of 24 shapes, every one of them at `num_tokens=2050` and none at
+`num_tokens=7`, which is sample size deciding whether any element lands on an
+e4m3 boundary. It did not fire at all for the value-divide change. G1 fired for
+both, on every shape.
+
+**A refusal test cannot stand in for a registration test.** With the CPU
+registration deleted, G5 still passed: the refusals live in `vt::QuantFp8Group`'s
+validation and fire before dispatch. Only G1's `REQUIRE(OpRegistered(...))`
+caught it.
+
+**`-Werror` turns two natural mutations into non-events.** Deleting the eps seed
+orphans `kEps`, and deleting the registration orphans the kernel. Both fail to
+build, and a harness that reported only the case verdict would have recorded two
+passes. Each was re-run in a form that keeps the symbol live.

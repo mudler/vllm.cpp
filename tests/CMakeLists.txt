@@ -1713,6 +1713,10 @@ vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
 # box with NO GPU by construction — that is the point of the row — and carries a
 # CUDA-gated arm (G2) for CPU-vs-CUDA byte agreement wherever a device exists.
 vllm_cpp_add_test(test_ops_fp8_cpu vt/test_ops_fp8_cpu.cpp)
+# VT-QUANT-FP8-GROUP (#1189 M1): the dynamic per-token per-group fp8 activation
+# quant. CPU-gateable by construction; its CPU-vs-CUDA byte-identity arm (G6) is
+# CUDA-gated and reports PENDING rather than skipping where no device exists.
+vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.cpp)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the

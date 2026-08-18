@@ -299,8 +299,12 @@ def check_tree(root: Path) -> tuple[Counts, list[str]]:
     counts = Counts()
     errors: list[str] = []
     tracked = set(tracked_files(root))
+    # SORTED, and over a sorted walk. `tracked` is a set, so an unsorted walk
+    # gives each basename's candidate list an arbitrary order -- which decides
+    # which path a stale ambiguous citation NAMES, and made one mutation catch
+    # depend on the iteration order of a hash set.
     by_base: dict[str, list[str]] = {}
-    for rel in tracked:
+    for rel in sorted(tracked):
         by_base.setdefault(rel.rsplit("/", 1)[-1], []).append(rel)
 
     for cite in collect(root, counts):

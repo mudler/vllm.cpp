@@ -9,10 +9,11 @@ owning capability row and does not belong in a capability matrix.
 
 ## Now
 
-`GATE-SYMBOL-ANCHORS` ships green. 91 in-repo symbol anchors are checked on
+`GATE-SYMBOL-ANCHORS` ships green. 93 in-repo symbol anchors are checked on
 every run against a recorded floor of 85, 26 of them converted here.
 `model_loader.cpp` line references in tracked, non-frozen, non-locked files fell
-from 112 in 47 files to 92 in 35; the 92 that remain are listed under `## Owed`.
+from 112 in 47 files to 92 in 35 on this branch; the residue is listed under
+`## Owed`.
 
 ## Scope
 
@@ -60,7 +61,7 @@ Option 4 wins on one observation the other three miss: **the convention already
 exists in this tree.** 539 `` `path::Symbol` `` citations are already written,
 `.agents/model-matrix.md` uses the form for every upstream model anchor, and
 they had never been checked. This change is not an invention, it is finishing
-something half-adopted — which is why the gate lands green over 91 anchors
+something half-adopted — which is why the gate lands green over 93 anchors
 instead of needing a flag day.
 
 It also resolves the tautology hazard structurally rather than by care. Under
@@ -164,7 +165,11 @@ already gets.
 
 ## Tests
 
-`tests/scripts/test_check_symbol_anchors.py`, 21 cases. The load-bearing one is
+`tests/scripts/test_check_symbol_anchors.py`, 21 cases. Candidate lists are
+sorted, so a citation's verdict and the path a stale one names do not depend on
+the iteration order of a hash set; `test_an_ambiguous_basename_is_checked_against_every_candidate`
+puts the symbol in the LAST candidate so that a first-candidate-only checker
+reds deterministically. The load-bearing one is
 `test_verdict_depends_on_the_citing_text`: one cited file, unchanged, cited
 twice with different symbols, asserting the two verdicts DIFFER. A #911-shaped
 checker cannot pass it, because nothing it reads varies between the two runs.
@@ -209,10 +214,10 @@ reproduces as 364/353, the residue as 106 in 46 to 86 in 34 and reproduces as
 and reports ENGINE=162. Every DELTA in that set was right and every ABSOLUTE was
 not, which is the shape a number quoted from an earlier run takes.
 
-**Tree.** 616 citations in 2754 scanned files, 180 frozen files skipped, 0
-untracked files carrying citations; in-repo checked 91 (fresh 91, stale 0), of
+**Tree.** 618 citations in 2758 scanned files, 180 frozen files skipped, 0
+untracked files carrying citations; in-repo checked 93 (fresh 93, stale 0), of
 which 5 resolved an ambiguous basename; upstream/unknown 525; missing local path
-0; buckets sum 616 vs 616; floor 85. `rc=0`.
+0; buckets sum 618 vs 618; floor 85. `rc=0`.
 
 **Upstream mode, at the pin.** 364 upstream anchors checked against
 `5559679229bc961848b121ccdeaa8fa5d79bec98`: 353 fresh, **0 stale**, 11 naming a
@@ -222,8 +227,8 @@ symbol anchor was stale across the same pin advance that broke every line anchor
 
 **The perturbation control.** "0 stale" says nothing until the corpus is shown
 capable of going stale. Appending `Zq` to every cited symbol name, applied and
-compiling, reports `in-repo checked 91 (fresh 0, stale 91)` and
-`upstream checked 364 (fresh 0, stale 353, file absent 11)`: not one of the 444
+compiling, reports `in-repo checked 93 (fresh 0, stale 93)` and
+`upstream checked 364 (fresh 0, stale 353, file absent 11)`: not one of the 446
 fresh anchors survives the rename. Freshness is therefore a property this corpus
 has to earn, not one the check hands it.
 
@@ -244,8 +249,11 @@ git grep -I -o -E 'model_loader\.cpp:[0-9]' <rev> -- "${excl[@]}" | wc -l
 git grep -I -l -E 'model_loader\.cpp:[0-9]' <rev> -- "${excl[@]}" | wc -l
 ```
 
-At `1f4878fdc`: 112 references in 47 files. At this head: 92 in 35. 20
-converted.
+At the branch base `1f4878fdc`: 112 references in 47 files. On this branch
+before merging: 92 in 35, so 20 converted. At `origin/main` `5af6e7631`: 112 in
+47 again, and at this merged head 93 in 35, because `origin/main` independently
+added one back in a file that already carried some. The 20 are the twenty rows
+of the conversion table; the extra one is not this change's to explain away.
 
 **Mutation, thirteen mutations, each applied and compiling, over 21 executed
 cases.** `applied` is a moved sha256 plus a non-empty `git diff --stat`;
@@ -265,11 +273,16 @@ and one that fails to build both read as a passing test otherwise.
 | M9 the floor comparison removed | yes | 0 | 21 | 1 | `test_the_floor_reds_when_the_population_collapses` |
 | M10 one `FROZEN_PREFIXES` entry collapses the population | yes | 0 | 21 | 1 | 3 cases incl. `test_this_tree_meets_the_recorded_floor` |
 | M11 one bucket dropped from the sum | yes | 0 | 21 | 1 | `test_the_buckets_sum_to_the_citation_count` |
-| M12 only the first candidate of an ambiguous basename is consulted | yes | 0 | 21 | 1 | 4 cases |
+| M12 only the first candidate of an ambiguous basename is consulted | yes | 0 | 21 | 1 | 4 cases, over three repeat runs |
 | M13 the leading dot removed from the grammar | yes | 0 | 21 | 1 | `test_a_dot_leading_path_is_a_citation` |
 
 Zero invalid mutations. Every one restored byte-for-byte against the baseline
-sha256. M11 was NOT caught on the first pass: this tree has zero missing local
+sha256. Two of the thirteen did not report honestly on the first pass, and both
+are recorded because a mutation that reads green for the wrong reason is the
+failure this table exists to prevent. M12's catch depended on the iteration
+order of a hash set, so `by_base` is now built over a sorted walk and the case
+puts the symbol in the last candidate; it was then re-run three times. M11 was
+not caught at all: this tree has zero missing local
 paths, so dropping that bucket left the arithmetic intact — the case now runs a
 fixture tree that populates all three buckets, and the mutation reds.
 
@@ -350,8 +363,9 @@ conversion that also tells the reader where to look is the point.
 ## Owed
 
 - [#1143](https://github.com/mudler/vllm.cpp/issues/1143) stays OPEN and owns
-  the residue: 92 `model_loader.cpp:NNN` references in 35 files, down from 112
-  in 47, over the population and command recorded under `## Evidence`. They were
+  the residue: 93 `model_loader.cpp:NNN` references in 35 files at this merged
+  head, down from 112 in 47, over the population and command recorded under
+  `## Evidence`. They were
   left because converting one requires deciding what the author meant: a
   heuristic pass that scanned a two-line context window around each of 92 such
   citations found 62 naming no `model_loader.cpp` symbol at all, so there is

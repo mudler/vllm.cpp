@@ -288,17 +288,25 @@ class SymbolAnchorTests(unittest.TestCase):
         self.assertIn("buckets sum 3 vs 3 citations", three.stdout)
 
     def test_an_ambiguous_basename_is_checked_against_every_candidate(self):
-        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+        """The symbol lives in the LAST candidate, not the first.
+
+        Candidate order is sorted, so `alpha/beta/a.cpp` is consulted first and
+        does not carry `Widget`. A checker that stops at the first candidate
+        therefore reds here, deterministically.
+        """
+
+        with Tree("alpha/beta/a.cpp", "struct Other {};\n",
                   "`a.cpp::Widget`\n") as root:
             (root / "alpha/gamma").mkdir(parents=True, exist_ok=True)
-            (root / "alpha/gamma/a.cpp").write_text("struct Other {};\n", encoding="utf-8")
+            (root / "alpha/gamma/a.cpp").write_text("struct Widget {};\n", encoding="utf-8")
             good = run("--root", str(root))
-        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+        with Tree("alpha/beta/a.cpp", "struct Other {};\n",
                   "`a.cpp::Ghost`\n") as root:
             (root / "alpha/gamma").mkdir(parents=True, exist_ok=True)
-            (root / "alpha/gamma/a.cpp").write_text("struct Other {};\n", encoding="utf-8")
+            (root / "alpha/gamma/a.cpp").write_text("struct Widget {};\n", encoding="utf-8")
             bad = run("--root", str(root))
         self.assertEqual(good.returncode, 0, good.stdout)
+        self.assertIn("of which ambiguous basename 1", good.stdout)
         self.assertEqual(bad.returncode, 1, bad.stdout)
         self.assertIn("no file named `a.cpp`", bad.stdout)
 

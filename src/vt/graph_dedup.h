@@ -212,14 +212,24 @@ class GraphDedupRegistry {
     if (group.current_raw != entry.raw) {
       std::string detail;
       const bool ok = ops_.update(group.exec, entry.raw, &detail);
-      // THIS IS NOT THE FOLD Register PROBED. Register probes (group.raws.front(),
-      // raw_graph); this update is (group.current_raw, entry.raw), and from the third
-      // member of a group onwards those pairs differ. Accepting the fold on the probe's
-      // word therefore treats cudaGraphExecUpdate compatibility as TRANSITIVE across a
-      // group's members -- if the driver can re-point A onto B and A onto C, then it can
-      // re-point B onto C. Neither the CUDA nor the HIP documentation says so, and this
-      // file does not assert it; it is an assumption, recorded as such under
+      // THIS IS NOT THE FOLD Register PROBED. Register probes exactly
+      // (group.raws.front(), raw_graph) -- the group's executable is instantiated from
+      // its FIRST capture, so raws.front() is the only graph any probe was ever made
+      // from. This update is (group.current_raw, entry.raw). EVERY replay whose pair is
+      // not one of those probed pairs is a re-point nothing tested, and the first of
+      // them arrives at group size TWO, not three: once a two-member group has
+      // re-pointed onto its second member, an alternation back to the first asks the
+      // driver for the REVERSE re-point, (second -> first), which no probe ever made.
+      // Alternating between two padded decode buckets is the ordinary case, not the
+      // exotic one, so this boundary is reached by the smallest group the registry can
+      // form. Accepting a fold on the probe's word therefore treats cudaGraphExecUpdate
+      // compatibility as TRANSITIVE and SYMMETRIC across a group's members -- if the
+      // driver can re-point A onto B and A onto C, then it can re-point B onto C and B
+      // back onto A. Neither the CUDA nor the HIP documentation says so, and this file
+      // does not assert it; it is an assumption, recorded as such under
       // `## Risks/decisions` in .agents/specs/eng-cudagraph-dedup.md and owed there.
+      // Both shapes are gated, at size two and at size three, by
+      // tests/vt/test_graph_dedup.cpp.
       // The reason it is safe to hold it here anyway is the polarity of the failure: a
       // refusal is either an invariant violation or that transitivity not holding, and
       // both land on this VT_CHECK. What must never happen is the alternative --

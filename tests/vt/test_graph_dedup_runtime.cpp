@@ -208,18 +208,32 @@ std::string SignatureOf(const SigGraph& graph) {
 // restatement of it in a fake. The device half that stays unreachable from here is the
 // runtime query itself, and that limit is the same one the file's header note states.
 
+std::string KernelPayloadFull(long long func, unsigned grid_x, unsigned grid_y,
+                              unsigned grid_z, unsigned block_x, unsigned block_y,
+                              unsigned block_z, unsigned shared, bool coarse) {
+  std::string out;
+  vt::graph_dedup_sig::AppendKernelFields(&out, func, grid_x, grid_y, grid_z, block_x,
+                                          block_y, block_z, shared, coarse);
+  return out;
+}
+
+// The one-dimensional shorthand every case below used before the y and z components
+// were gated. It delegates rather than repeating the call, so a case that reaches for
+// the short form and a case that reaches for the full one drive one code path.
 std::string KernelPayload(long long func, unsigned grid, unsigned block, unsigned shared,
                           bool coarse) {
+  return KernelPayloadFull(func, grid, 1, 1, block, 1, 1, shared, coarse);
+}
+
+std::string MemcpyPayloadFull(long long kind, long long width, long long height,
+                              long long depth, bool coarse) {
   std::string out;
-  vt::graph_dedup_sig::AppendKernelFields(&out, func, grid, 1, 1, block, 1, 1, shared,
-                                          coarse);
+  vt::graph_dedup_sig::AppendMemcpyFields(&out, kind, width, height, depth, coarse);
   return out;
 }
 
 std::string MemcpyPayload(long long kind, long long width, bool coarse) {
-  std::string out;
-  vt::graph_dedup_sig::AppendMemcpyFields(&out, kind, width, 1, 1, coarse);
-  return out;
+  return MemcpyPayloadFull(kind, width, 1, 1, coarse);
 }
 
 std::string MemsetPayload(long long element_size, long long width, long long height,
@@ -517,6 +531,48 @@ TEST_CASE("each runtime failure degrades the key instead of aborting inside a ca
 TEST_CASE("an empty graph still produces a signature") {
   SigGraph graph;
   CHECK(SignatureOf(graph) == "[]");
+}
+
+// --- the exact key, which is the SHIPPED DEFAULT ------------------------------------
+
+TEST_CASE("the exact key discriminates every launch dimension and every copy extent") {
+  // COVERAGE OF THE DEFAULT, and it was absent. Every helper in this file passed 1 for
+  // grid_y, grid_z, block_y, block_z and the memcpy height and depth, so those six
+  // fields were EXECUTED by every case and DISCRIMINATED by none: deleting `grid_z` from
+  // the exact key -- a silent coarsening of the key that ships ON, on a path no token
+  // gate and no device count can see -- left this suite 22/22 green. Three of the six
+  // siblings were caught only incidentally, by `-Werror=unused-parameter`, which is a
+  // build guard rather than a test and which a mutation that renames instead of removing
+  // walks straight past.
+  const std::string base = KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 1, 0, false);
+  CHECK(base != KernelPayloadFull(0x1000, 8, 3, 1, 128, 1, 1, 0, false));  // grid.y
+  CHECK(base != KernelPayloadFull(0x1000, 8, 1, 5, 128, 1, 1, 0, false));  // grid.z
+  CHECK(base != KernelPayloadFull(0x1000, 8, 1, 1, 128, 7, 1, 0, false));  // block.y
+  CHECK(base != KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 9, 0, false));  // block.z
+  // Through the whole signature, not only the payload helper: the walk is what
+  // production calls, and a field that separates two payloads must separate two graphs.
+  CHECK(OneNodeSignature(base) !=
+        OneNodeSignature(KernelPayloadFull(0x1000, 8, 1, 5, 128, 1, 1, 0, false)));
+
+  // A 2-D and a 3-D copy are different copies, and the exact key says so.
+  CHECK(OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 1, false)) !=
+        OneNodeSignature(MemcpyPayloadFull(2, 64, 4, 1, false)));   // extent.height
+  CHECK(OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 1, false)) !=
+        OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 4, false)));   // extent.depth
+}
+
+TEST_CASE("the coarse key drops the y and z components too, not only x") {
+  // The other half of the same gap. The coarse key exists to join two padded decode
+  // buckets, and a bucket that grew a second grid dimension would still separate if only
+  // the x components were dropped -- so the drop is asserted componentwise rather than
+  // inferred from the grid_x case.
+  const std::string base = KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 1, 0, true);
+  CHECK(base == KernelPayloadFull(0x1000, 8, 3, 1, 128, 1, 1, 0, true));
+  CHECK(base == KernelPayloadFull(0x1000, 8, 1, 5, 128, 1, 1, 0, true));
+  CHECK(base == KernelPayloadFull(0x1000, 8, 1, 1, 128, 7, 1, 0, true));
+  CHECK(base == KernelPayloadFull(0x1000, 8, 1, 1, 128, 1, 9, 0, true));
+  CHECK(OneNodeSignature(MemcpyPayloadFull(2, 64, 1, 1, true)) ==
+        OneNodeSignature(MemcpyPayloadFull(2, 64, 4, 7, true)));
 }
 
 // --- the coarse key, issue #1226 ----------------------------------------------------

@@ -213,6 +213,18 @@ welcome that the agent should relay. An explicit request can use
 claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
 The entrypoint is non-interactive and does not mutate the checkout.
 
+`scripts/agent-preflight.sh` now also runs `scripts/check-symbol-anchors.py`,
+which reads every citation written as `` `path/to/file.cpp::SymbolName` `` and
+requires that the file it names still contains that symbol. Write citations in
+that form rather than as `file.cpp:412`: a line number is a coordinate into a
+moving file, so an edit anywhere above it retargets the citation in files the
+edit never opened. Add `--upstream-root <vllm-checkout>` to ask the same
+question of the pinned oracle; that run is opt-in, because CI has no checkout to
+resolve upstream paths against. Both runs print every bucket they left out --
+frozen files, untracked files, upstream paths -- and refuse a checked count
+below the recorded floor, so a run that quietly stopped examining anything
+cannot report as a pass.
+
 The operator role is a coordinator, and **several may run at once**:
 `scripts/agent-role.py claim operator` records this worktree and is never
 refused, `scripts/agent-role.py show` lists the other live coordinators, and

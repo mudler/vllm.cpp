@@ -8,17 +8,23 @@
 // in `qwen3_5_dense_weights.cpp`. What is still refused here is what no build in
 // this tree can execute, and each refusal names the part.
 //
-// EVERY case enters through `ModelRegistry::Load`, the production loader
-// `src/vllm/entrypoints/model_loader.cpp:1706` calls, and NOT through the
-// predicate. That is deliberate and it is the reachability proof AGENTS.md
-// `## Nothing lands dead` asks for: a unit test that called the predicate
+// EVERY case here enters through `ModelRegistry::Load`, which the production
+// loader `src/vllm/entrypoints/model_loader.cpp::FromModelDir` calls, and NOT
+// through the predicate. That is deliberate and it is the reachability proof
+// AGENTS.md `## Nothing lands dead` asks for: a unit test that called the predicate
 // directly would prove the function works and never that a load reaches it.
 // Deleting the call site in `ModelRegistry::Load` must red this file.
 //
-// The LOADING half — the rung, the weight, the scale dtype, the config/tensor
-// cross-check — is gated by `test_fp8_block_weight_load`, which needs a
-// synthetic checkpoint. This file needs none: the config gate runs before
-// `factory.load_weights`, so an EMPTY shard vector reaches it.
+// No checkpoint, no GPU, and no model directory: the refusal fires before
+// `factory.load_weights`, so an EMPTY shard vector is all a load needs to reach
+// it. That is why the guard sits in `ModelRegistry::Load` rather than at the
+// other pre-load refusal site,
+// `src/vllm/entrypoints/model_loader.cpp::RefuseUnsupportedWeightOffload`,
+// which needs a directory on disk.
+//
+// The LOADING half -- the rung, the weight, the scale dtype, the config/tensor
+// cross-check -- is gated by `test_fp8_block_weight_load`, which needs a
+// synthetic checkpoint. This file needs none.
 #include <doctest/doctest.h>
 
 #include <string>

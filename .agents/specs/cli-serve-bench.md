@@ -22,7 +22,7 @@ schedules a new batch before consuming the oldest result
 (`${VLLM_SOURCE}/vllm/v1/engine/core.py:622-669`).  Our production
 equivalent is already implemented behind `LoadedEngine::async_engine()`:
 `AsyncLLM` constructs `EngineCoreProc` with the resolved queue depth
-(`src/vllm/entrypoints/model_loader.cpp:800-811`), and `EngineCoreProc` selects
+(`src/vllm/entrypoints/model_loader.cpp::async_engine`), and `EngineCoreProc` selects
 `step_with_batch_queue` at depth greater than one
 (`src/vllm/v1/engine/core_proc.cpp:22-37`).
 
@@ -40,7 +40,7 @@ a binding parity result, because the frontends were mismatched.
 | Layer | Pinned vLLM / dependency behavior | Our anchor |
 |---|---|---|
 | CLI/client | `LLM.llm_engine.add_request` + `engine.step`, DELTA output (`tools/bench/vllm_closed_loop_metrics.py:59-102`) | closed-loop admission and metrics (`examples/bench/bench_core.h:416-589`) |
-| engine dispatch | queue size and `step_fn` selection (`vllm/v1/engine/core.py:200-231`) | `LoadedEngine::async_engine` passes resolved depth (`src/vllm/entrypoints/model_loader.cpp:800-811`) |
+| engine dispatch | queue size and `step_fn` selection (`vllm/v1/engine/core.py:200-231`) | `LoadedEngine::async_engine` passes resolved depth (`src/vllm/entrypoints/model_loader.cpp::async_engine`) |
 | batch queue | schedule-before-oldest-result (`vllm/v1/engine/core.py:622-669`) | `EngineCore::step_with_batch_queue` (`src/vllm/v1/engine/core.cpp:115-185`) |
 | scheduler | `AsyncScheduler` placeholder accounting (`vllm/v1/core/sched/async_scheduler.py`) | `src/vllm/v1/core/sched/async_scheduler.cpp` |
 | runner/sample | non-blocking sampled-token copy and device input update (`vllm/v1/worker/gpu/async_utils.py`, `gpu_model_runner.py`) | `GPUModelRunner::sample_tokens_async` and device mirror (`src/vllm/v1/worker/gpu/runner.cpp`) |

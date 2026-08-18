@@ -6,10 +6,22 @@
 **Parent analysis:** [sglang-breakable-cuda-graph.md](sglang-breakable-cuda-graph.md) `## Owed`.
 **Kind:** scoping spike plus structured spec. No production code lands with this spec.
 
-**This is a coverage row, not a throughput row.** The spike claims no speed and
-measures none. `## Gates` below states what would have to be named and measured
-before any speed claim is admissible, and `## Risks/decisions` D5 records why no
-such path is named today.
+**This is a coverage row and a CORRECTNESS row, and it is not a throughput row.**
+The spike claims no speed and measures none. `## Gates` below states what would have
+to be named and measured before any speed claim is admissible, and
+`## Risks/decisions` D5 records why no such path is named today.
+
+The correctness half is not a framing device, it is already shipped damage
+([#1179](https://github.com/mudler/vllm.cpp/issues/1179)). `src/vllm/model_executor/models/qwen3.cpp:961-986`
+DECLINES its decode graph outright whenever the asynchronous device-token mirror is
+live, and its comment records the measurement that forced it: `depth-1, graph ON
+PASS 78/78`, `depth-2, graph OFF PASS 82/82`, `depth-2, graph ON FAIL, slots 1-3
+degenerate`. The comment names the real fix — read the identifiers at REPLAY time
+from a stable device buffer — and that fix already exists, in the sibling driver,
+as `StepDevInputs` (`qwen3_5.cpp:3894`). One driver has the capability and a shipped
+model lost its decode graph because it does not. That is duplication producing a
+correctness regression, not a tidiness complaint, and it is the second reason this
+row exists.
 
 ## Scope
 
@@ -73,17 +85,25 @@ spec ports. Verified in the pinned tree at
 `/home/mudler/_git/sglang` (`git rev-parse HEAD` =
 `f63458b5beaceabbd9d749b9fc956370e1b649e6`):
 
-| Mechanism | Anchor in `python/sglang/srt/` |
+Every bare `:N` anchor below is a line in the one file that implements BCG,
+spelled here once in full:
+`python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py`.
+That file is 374 lines at the pin (`wc -l` = 374), so no anchor past `:374` exists.
+
+| Mechanism | Anchor |
 |---|---|
-| Break-point wrapper | `.../breakable_cuda_graph/breakable_cuda_graph.py:204-241` (`eager_on_graph`) |
-| Active-capture context | `:60` (`_current_capture_var`, a `ContextVar`) |
-| Segment container | `:246-253` (`BreakableCUDAGraph`, `_segments` plus `_break_fns`) |
-| Interleaved replay | `:255-263` |
-| Capture scope enter and exit | `:307-331` (`__enter__`, `__exit__`) |
-| Segment open and close | `:335-350`, `:352-365` |
-| Bare break marker | `:370-375` (`break_graph`, an empty body under the decorator) |
+| Break-point wrapper | `:204-243` (`eager_on_graph`), whose `wrapper` body is `:209-241` |
+| Output writeback on replay | `:231-235` (`replay_fn`), `:172-201` (`_copy_output`) |
+| Active-capture context | `:63` (`_current_capture_var`, a `ContextVar`) |
+| Segment container | `:246-274` (`BreakableCUDAGraph`); fields at `:251-252`; `_append_segment` at `:266-274` |
+| Interleaved replay | `:255-264` |
+| Capture scope enter and exit | `:309-320` (`__enter__`), `:322-333` (`__exit__`) |
+| Segment open and close | `:335-350` (`_begin_new_segment`), `:352-367` (`_end_current_segment`) |
+| Auxiliary-stream fork tracking | `:101-153` (the `wait_stream` hook), installed at `:310` and removed at `:332` |
+| Auxiliary-stream auto-join before a segment ends | `:353-361` |
+| Bare break marker | `:370-374` (`break_graph`, an empty body under the decorator) |
 | Shared mempool and weak refs | `:14-23` doc, `:156-169` (`_weak_ref_if_tensor`) |
-| No-compiler backend | `.../runner_backend/breakable_cuda_graph_backend.py:14-17` |
+| No-compiler backend | `python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py:14-17` |
 
 The break points SGLang registers, all through the same one-line wrapper:
 
@@ -121,7 +141,9 @@ ends the stream capture, instantiates the graph, and returns the executable as a
 opaque handle the caller owns. That property is what makes a segmented capture
 expressible with **no new backend virtual**: a segment is one `BeginCapture` and
 `EndCaptureGraph` pair, and N break points produce N+1 such pairs on the same queue.
-The spike confirmed this shape end to end; see `## Work breakdown` W0.
+The spike confirmed this SHAPE in C++, on a recording backend with no GPU
+attached; whether CUDA permits the re-begin mid-forward is W1's exit criterion, not
+a W0 result. See `## Work breakdown` W0.
 
 ### Defect 1: capture is all or nothing
 
@@ -155,7 +177,7 @@ them re-derives the same machinery.
 | Driver | Declaration | Implementation | Shape |
 |---|---|---|---|
 | `Qwen3_5DecodeGraph` | `include/vllm/model_executor/models/qwen3_5.h:275` | `src/vllm/model_executor/models/qwen3_5.cpp:9540,9563,9712,9893,9918,9922` | batched, padded ring |
-| `Qwen3_5DenseDecodeGraph` | `include/vllm/model_executor/models/qwen3_5_dense.h:391` | `src/vllm/model_executor/models/qwen3_5.cpp:9974,9986,10321,10340,10348` | batched, padded ring |
+| `Qwen3_5DenseDecodeGraph` | `include/vllm/model_executor/models/qwen3_5_dense.h:391` | `src/vllm/model_executor/models/qwen3_5.cpp:9969,9986,10321,10340,10348` | batched, padded ring |
 | `Qwen3MoeDecodeGraph` | `include/vllm/model_executor/models/qwen3_moe.h:117` | `src/vllm/model_executor/models/qwen3_moe.cpp:385,404,469,512,515,524` | batched, padded ring |
 | `Qwen3DenseDecodeGraph` | `include/vllm/model_executor/models/qwen3.h:243` | `src/vllm/model_executor/models/qwen3.cpp:583,613,682,866,888,897` | batched, padded ring |
 | `DeepseekV2DecodeGraph` | `include/vllm/model_executor/models/deepseek_v2.h:324` | `src/vllm/model_executor/models/deepseek_v2.cpp:887,902,963,980` | batched, padded ring |
@@ -167,28 +189,39 @@ them re-derives the same machinery.
 **What every driver re-derives.** Each item below was read in at least two drivers
 and the anchors give one instance each.
 
-1. The environment kill switch. Five drivers read `VLLM_CPP_CUDAGRAPH` themselves:
-   `qwen3_5.cpp:9540`, `qwen3_5.cpp:9974`, `qwen3_moe.cpp:385`, `qwen3.cpp:583`,
-   `deepseek_v2.cpp:887`, `voxtral.cpp:448`. The three single-shape drivers each
-   invented their own instead: `VT_V4_DECODE_GRAPH` at `deepseek_v4.cpp:1680`,
-   `VT_DFLASH_GRAPH` at `qwen3_dflash.cpp:870`, and the Laguna cluster at
-   `laguna.cpp:104,116,140`. There is no one switch that turns capture off.
+1. The environment kill switch. SIX drivers read `VLLM_CPP_CUDAGRAPH` themselves:
+   `qwen3_5.cpp:9540`, `qwen3_5.cpp:9969`, `qwen3_moe.cpp:385`, `qwen3.cpp:583`,
+   `deepseek_v2.cpp:887`, `voxtral.cpp:448`. Instrument:
+   `grep -rn 'std::getenv("VLLM_CPP_CUDAGRAPH")' src/` returns exactly those six.
+   (`grep -rn VLLM_CPP_CUDAGRAPH src/` returns seven, because `qwen3.cpp:947`
+   mentions the name in a comment and is not a read site.) The three single-shape
+   drivers each invented their own switch instead: `VT_V4_DECODE_GRAPH` at
+   `deepseek_v4.cpp:1680`, `VT_DFLASH_GRAPH` at `qwen3_dflash.cpp:870`, and
+   `VT_LAGUNA_DECODE_GRAPH` at `laguna.cpp:1684`. There is no one switch that
+   turns capture off.
 2. The cold, warm, captured state machine. `qwen3_5.cpp:9563` carries `warm` and
    `captured` flags on the slot; `deepseek_v4.cpp:1719` spells the same thing as
    `int gstate = 0`; `qwen3_dflash.cpp:771` spells it as `int g_state = 0`. Three
    spellings of one three-state machine.
-3. The pad-to-bucket selection. Five call sites of `PadToCaptureSize`:
-   `qwen3_5.cpp:9712`, `qwen3_moe.cpp:469`, `qwen3.cpp:682`, `deepseek_v2.cpp:963`,
-   `voxtral.cpp:535`. The function itself is already shared, at
-   `include/vllm/model_executor/models/decode_graph_sizes.h:47-56`, which is the
-   proof that extraction works and is the pattern this row extends.
+3. The pad-to-bucket selection. SIX call sites of `PadToCaptureSize`:
+   `qwen3_5.cpp:9712`, `qwen3_5.cpp:10140`, `qwen3_moe.cpp:469`, `qwen3.cpp:682`,
+   `deepseek_v2.cpp:963`, `voxtral.cpp:535`. Instrument: `grep -rn PadToCaptureSize
+   src/` returns 16 lines, of which four are `#include` comments and six are prose
+   comments; the six above are the invocations. The function itself is already
+   shared, at `include/vllm/model_executor/models/decode_graph_sizes.h:47-54`, which
+   is the proof that extraction works and is the pattern this row extends.
 4. The per-slot persistent buffer set. `qwen3_5.cpp:9563-9600` holds `token_ids`,
    `positions`, the two metadata structs, `hidden`, `logits`, `aux`, `graph`,
    `fa_cols`, `captured`, `warm`, `replays`, `reuse_event`, `dev` and `pin`. Every
    other batched driver holds a subset of the same fields under the same name
    `SizeSlot`.
-5. The diagnostics pair `captured()` and `replay_count()`, at `qwen3_5.cpp:9680`,
-   `qwen3_moe.cpp:454`, `qwen3.cpp:667`, `deepseek_v2.cpp:948`, `voxtral.cpp:519`.
+5. The diagnostics pair `captured()` and `replay_count()`, SIX times. The
+   `replay_count()` definitions are at `qwen3_5.cpp:9680`, `qwen3_5.cpp:10110`,
+   `qwen3_moe.cpp:454`, `qwen3.cpp:667`, `deepseek_v2.cpp:948`, `voxtral.cpp:519`,
+   each preceded one line above by its `captured()` sibling
+   (`qwen3_5.cpp:9679`, `qwen3_5.cpp:10109`, `qwen3_moe.cpp:453`, `qwen3.cpp:666`,
+   `deepseek_v2.cpp:947`, `voxtral.cpp:518`). Instrument:
+   `grep -rn '::captured() const' src/vllm/model_executor/models/*.cpp` returns six.
 6. The capture-failure recovery. `qwen3_5.cpp:9913`, `qwen3_5.cpp:10335` and
    `qwen3_dflash.cpp:1106` each carry their own copy of the same
    `try { g = EndCaptureGraph(); } catch (...) {}` drain, because a skipped
@@ -199,9 +232,12 @@ and the anchors give one instance each.
 
 **The divergence that proves the cost.** The persistent DEVICE input path, called
 "Option A" in the tree, exists in exactly one driver. `StepDevInputs`
-(`qwen3_5.cpp:3894`) is referenced 33 times in `qwen3_5.cpp` and **zero** times in
-`qwen3_moe.cpp`, `qwen3.cpp`, `deepseek_v2.cpp` and `voxtral.cpp` (`grep -c`, all
-four returned `0`). The other four replay against host vectors. One of them,
+(`qwen3_5.cpp:3894`) appears on **41** lines of `qwen3_5.cpp` and **zero** lines of
+`qwen3_moe.cpp`, `qwen3.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`. Instrument:
+`grep -c StepDevInputs <file>`, which counts MATCHING LINES, not occurrences; the
+occurrence count on the same file is 47 (`grep -o StepDevInputs qwen3_5.cpp | wc -l`).
+An earlier draft of this spec recorded 33, which is neither number and is withdrawn.
+The four zeros reproduce under both instruments and the conclusion is unchanged. The other four replay against host vectors. One of them,
 `qwen3.cpp:961-986`, therefore has to DECLINE the graph outright whenever the
 asynchronous device-token mirror is live, and its comment records the measured
 failure that forced it: "depth-2, graph ON FAIL, slots 1-3 degenerate". The same
@@ -243,7 +279,8 @@ Three types, all under `vt`, all backend-agnostic, none of them a new virtual on
 
 1. **`vt::BreakableGraph`** — the container. Holds `std::vector<void*> segments`
    (each an opaque handle from `Backend::EndCaptureGraph`) and
-   `std::vector<std::function<void()>> break_fns`. Invariant, asserted:
+   `std::vector<std::function<void()>> break_fns` (each a seam-built replay
+   closure, see item 3, never a caller's raw `fn`). Invariant, asserted:
    `segments.size() == break_fns.size() + 1`. `Replay(Queue&)` walks
    `ReplayGraph(segments[i])` then `break_fns[i]()` for each `i`, mirroring
    `breakable_cuda_graph.py:255-263`. The destructor calls `DestroyGraph` on every
@@ -253,18 +290,83 @@ Three types, all under `vt`, all backend-agnostic, none of them a new virtual on
    scope. Its constructor sets one `thread_local GraphCaptureScope*` and calls
    `Backend::BeginCapture`; its destructor calls `Backend::EndCaptureGraph`, pushes
    the final segment, and clears the pointer. This is `BreakableCUDAGraphCapture`
-   at `:277-331`, with the destructor doing what `__exit__` does at `:320-331`. The
+   at `:277-367`, with the destructor doing what `__exit__` does at `:322-333`. The
    thread-local replaces SGLang's `ContextVar` at `:60`. It must be
    `thread_local`, not a global, for the same reason SGLang chose a `ContextVar`
    and CUDA chose `cudaStreamCaptureModeThreadLocal` (`cuda_backend.cu:204-206`):
    capture is a property of one thread's stream, and a process-wide flag would
    make an unrelated thread's forward observe a capture it is not part of.
 
-3. **`vt::GraphBreak(fn)`** — the break point. Outside a capture scope it calls
-   `fn` and returns, so a non-capturing forward is byte-identical to today. Inside
-   a scope it closes the current segment, runs `fn` once eagerly so the outputs
-   hold real data, appends `fn` to `break_fns`, and opens a new segment. This is
-   `eager_on_graph` at `:204-241`, minus the decorator syntax we cannot write.
+3. **`vt::GraphBreak(fn, out)`** — the break point. Outside a capture scope it
+   calls `fn` and returns, so a non-capturing forward is byte-identical to today.
+   Inside a scope it closes the current segment, runs `fn` once eagerly so the
+   outputs hold real data, appends a REPLAY CLOSURE to `break_fns`, and opens a
+   new segment. This is `eager_on_graph` at `:204-243`.
+
+   **The appended function is not `fn`.** Upstream builds a `replay_fn` closure at
+   `:231-235` that calls the captured inner function and then writes its result
+   back into the capture-time destination:
+
+   ```python
+   def replay_fn():
+       new_out = captured_inner(*captured_args, **captured_kwargs)
+       return _copy_output(captured_output, new_out)
+   ```
+
+   `_copy_output` (`:172-201`) does an in-place `dst.copy_(src)` for a tensor, and
+   recurses field-wise over an object's `__dict__` or a dict's values; it returns
+   `src` only when neither side is copyable. The companion `_weak_ref_if_tensor`
+   (`:156-169`) is what makes the capture-time destination outlive the eager call.
+
+   **This is load-bearing, not decorator sugar.** On replay N the eager operation
+   returns a FRESH allocation, whose address is not the one segment `i+1` baked at
+   capture time. A container that replays the raw `fn` and discards its return value
+   drops that guarantee silently: the next segment keeps reading the capture-time
+   address while the break function writes somewhere else. The failure is WRONG
+   NUMERICS, not a fault, which is exactly the class `## Risks/decisions` D1 records
+   `compute-sanitizer` cannot see.
+
+   **Contract this seam adopts, stated at the `vt::GraphBreak` declaration.** One of
+   the two, and the seam must make the choice explicit rather than leave it to the
+   caller:
+
+   - `GraphBreak(fn, out)` takes the destination the following segment reads, and
+     the seam copies `fn`'s result into `out` on every replay. This is the direct
+     port of `replay_fn` plus `_copy_output`.
+   - `GraphBreak(fn)` with no destination requires `fn` to write IN PLACE into a
+     persistent buffer that the model owns and that no replay reallocates. The
+     no-destination form is then only legal for a break function with no return
+     value; the bare marker below is its degenerate case.
+
+   `vt::BreakableGraph` therefore holds `std::vector<std::function<void()>>` whose
+   elements are the SEAM's closures, never the caller's `fn` — and D9 records the
+   hazard the distinction removes.
+
+**The fork-join rule the scope owns.** Closing a segment is illegal while a side
+stream forked inside it is still participating in the capture. Upstream solves this
+inside `_end_current_segment` (`:353-361`): before `capture_end()` it walks the set
+of streams forked but not rejoined and issues the join itself. Tracking that set is
+the entire purpose of the `torch.cuda.Stream.wait_stream` hook (`:101-153`), which
+`__enter__` installs at `:310` and `__exit__` removes at `:332`.
+
+**This is live for us, in both drivers W4 and W5 migrate.** Our CUDA backend reports
+`SupportsAuxStream() == true` (`src/vt/cuda/cuda_backend.cu:200`, against the base
+`false` at `include/vt/backend.h:166`), and two model paths fork on it. Qwen3.5's MoE
+shared-expert overlap records a fork event on the main queue and makes the auxiliary
+queue wait it at `src/vllm/model_executor/models/qwen3_5.cpp:6254-6255`, records the
+completion event at `:6261`, and joins the main queue back at `:6384` — so any break
+point placed between `:6255` and `:6384` closes a segment with the fork outstanding.
+Laguna's decode-graph class owns its own auxiliary queue and event pair
+(`src/vllm/model_executor/models/laguna.cpp:2362-2367`, torn down at `:2374-2378`),
+forks at `:2572-2573`, records at `:2576` and joins at `:2612` — and unlike Qwen3.5's
+that fork is INSIDE the captured region by construction, because the class is the
+capture driver.
+
+**Rule: `GraphCaptureScope` owns the set of queues forked since the current segment
+opened, and joins every outstanding one before it calls `EndCaptureGraph`.** We need
+no `wait_stream` monkey-patch to populate that set, because our fork and join are
+explicit `Backend::RecordEvent` and `Backend::QueueWaitEvent` calls on a seam we
+control, not an implicit torch API. D10 records what happens if the rule is omitted.
 
 **Why a thread-local and not a parameter.** The break site sits inside an attention
 call, several frames below the forward entry point. Threading a capture context
@@ -273,8 +375,9 @@ call for the same reason. The spike proved the thread-local carries the context
 across three frames with no intermediate signature change; see `## Work breakdown` W0.
 
 **A bare marker.** `vt::GraphBreak()` with no argument splits the segment and runs
-nothing, mirroring `break_graph` at `breakable_cuda_graph.py:370-375`. It is the
+nothing, mirroring `break_graph` at `breakable_cuda_graph.py:370-374`. It is the
 form a model uses when the host-dependent work already ran outside the forward.
+It has no output, so the writeback contract above is vacuous for it.
 
 ### How the boundary is registered
 
@@ -322,10 +425,67 @@ its break-point set and its output buffers.
 ## Tests to port
 
 vLLM's own tests do not transfer. Its piecewise split is verified through
-`torch.compile` configuration tests, and we have no compiler to configure. SGLang's
-BCG carries no unit test at the pinned revision that exercises the segment
-container in isolation. So the primary tests here are written against OUR seam, and
-the anchors above are the behavioral specification they encode.
+`torch.compile` configuration tests, and we have no compiler to configure.
+
+**SGLang's BCG DOES carry a unit suite at the pin, and it ports.** An earlier draft
+of this spec asserted there was nothing to port, which was wrong and is withdrawn.
+The file is
+`test/registered/cuda_graph/breakable/test_breakable_cuda_graph.py` at
+`f63458b5be`, 305 lines, four classes. AGENTS.md requires the upstream tests in the
+same change that ports the behavior, so the table below maps every upstream case to
+the local test that owes it. Parameters, modes and failure cases are preserved; the
+harness adaptation is stated once at the bottom.
+
+**`TestBreakableCUDAGraphBasic` (`:30`) — the capture and replay mechanism.**
+
+| Upstream case | Anchor | What it pins | Local test |
+|---|---|---|---|
+| `test_no_break_capture_replay` | `:49-63` | zero breaks captures and replays exactly like a plain graph: `y = x + 1`, refill `x` to 5.0, replay, expect 6.0 | T1: a scope with no `GraphBreak` yields 1 segment, 0 break functions, and one `Begin`/`EndCaptureGraph` pair |
+| `test_single_break` | `:65-87` | one break splits into two segments and the chain composes: `x=10 -> +1=11 -> eager *2=22 -> +3=25` | T2: 1 break yields 2 segments and 1 break function, and the arithmetic chain holds |
+| `test_multiple_breaks` | `:89-115` | two breaks, three segments, chained: `x=5 -> +1=6 -> +1=7 -> +1=8 -> *2=16` | T3: N breaks yield N+1 segments and N break functions, asserted at N=2 with the same values |
+| `test_eager_on_graph_disabled` | `:117-129` | with the wrapper DISABLED the function is returned unchanged and runs normally | T4: `VLLM_CPP_CUDAGRAPH=0` (item 1 of `## Our baseline`) makes `GraphBreak(fn)` call `fn` and make zero backend calls |
+| `test_eager_on_graph_outside_capture` | `:131-142` | outside any capture the wrapper is a pass-through | T5: with no scope active, `GraphBreak(fn)` runs `fn` and makes zero backend calls |
+| `test_replay_updates_output` | `:144-169` | TWO replays with different inputs give different outputs: `3.0` then, after `x.fill_(10)`, `33.0` | T6: the multi-replay case. This is the upstream anchor for G1's "more than one replay" requirement, and the one case that can see a break function writing to a stale address |
+
+**`TestCopyOutput` (`:172`) — the output-writeback contract of `## Port map` §3.**
+This class is why F2's writeback is not optional: upstream tests `_copy_output`
+separately from the capture machinery, because it is a separate guarantee.
+
+| Upstream case | Anchor | What it pins | Local test |
+|---|---|---|---|
+| `test_tensor_copy` | `:187-192` | a tensor destination is written IN PLACE and the SAME object is returned (`assertIs(result, dst)`) | T7: `GraphBreak(fn, out)` copies into `out`; the device pointer `out` held before the call is the one holding the data after it |
+| `test_dict_copy` | `:194-208` | a keyed set of destinations is copied field by field | T8: a multi-output break (logits plus an auxiliary tap, the `qwen3_5.cpp:9570-9577` shape) writes every destination |
+| `test_object_copy` | `:210-223` | a struct destination copies its tensor fields in place and ASSIGNS its non-tensor fields (`dst.label == "new"`) | T9: a struct-valued break preserves the in-place/assign split |
+| `test_non_tensor_fallback` | `:225-227` | with nothing copyable, `_copy_output` returns `src`, the documented fallback | T10: a break function with no device output is legal and the seam does not fabricate a copy |
+
+**`TestBreakGraphHelper` (`:230`).**
+
+| Upstream case | Anchor | What it pins | Local test |
+|---|---|---|---|
+| `test_break_graph_inserts_segment` | `:249-265` | the BARE marker splits the segment even though its body does nothing: `x=10 -> +1=11 -> break -> +2=13` | T11: `vt::GraphBreak()` with no argument yields 2 segments and 1 (empty) break function, and the value chain is unaffected |
+
+**`TestBreakableCudaGraph` (`:268`) — `test_gsm8k_accuracy` (`:288`) is DELIBERATELY
+EXCLUDED from this row**, and the reason is not cost. It launches a Qwen3-8B server
+with `--cuda-graph-backend-prefill=breakable` (`:279-281`) and asserts `mgsm_en >=
+0.80` over 1319 examples (`:289-301`). That is a DISTRIBUTIONAL accuracy floor on a
+PREFILL capture path. Both halves are wrong for us. Our gate polarity for a migrated
+model is BIT-EXACTNESS against the model's own eager forward (`## Gates` G1), which
+is strictly stronger than an accuracy floor and is the gate AGENTS.md requires when a
+greedy path exists. And prefill capture is REFUTED as a lever here and is not what
+this row builds (`## Risks/decisions` D5). The upstream case's PURPOSE — an
+end-to-end model-level check that a segmented capture does not corrupt generation —
+is carried by G1 against `tests/parity/test_qwen36_paged_engine.cpp:140`, per
+migrated model. Excluded as redundant to a stronger gate, not as unaffordable.
+
+**The one unavoidable harness adaptation.** Every upstream class's `setUpClass`
+raises `unittest.SkipTest` without CUDA (`:34-36`, `:177-178`, `:235-236`), so
+upstream runs all eleven cases on a real device. T1 through T5, and T7 through T11,
+run instead against a test backend that RECORDS the call sequence, so they gate on
+this box and in continuous integration with no GPU. T6, the multi-replay case, has
+both arms: the recording arm asserts the replay ORDER, and the GPU arm under G1
+asserts the VALUES. Nothing else about the upstream cases is adapted: the same break
+counts, the same segment counts, the same arithmetic chains, the same in-place versus
+assign split, and the same non-copyable fallback.
 
 The existing test surface the migration must keep green:
 
@@ -338,26 +498,32 @@ The existing test surface the migration must keep green:
 | Retire-on-grow bookkeeping | `tests/vt/test_graph_safe_scratch.cpp` | the lifetime rule the seam enforces |
 | 35B paged engine gate | `tests/parity/test_qwen36_paged_engine.cpp:140` | the model gate the first migration must hold |
 
-New tests this row owes, each written red first:
+**Tests this row owes with no upstream counterpart**, each written red first,
+numbered on from the ported set:
 
-1. **Segment arithmetic.** N break points in one capture scope produce exactly
-   N+1 segments and N break functions. Red first by asserting N segments.
-2. **Replay order.** Replay emits segment 0, break 0, segment 1, break 1, and so
-   on, in that exact order, and the order is identical on the second and third
-   replay. This is the multi-replay requirement stated in `## Gates`.
-3. **Pass-through outside capture.** With no scope active, `vt::GraphBreak(fn)`
-   runs `fn` and makes zero backend calls. Red first by asserting a backend call.
-4. **Capture-failure drain.** A break function that throws leaves the stream
-   un-poisoned and the partially built `BreakableGraph` destroyed with every
-   already-instantiated segment released. This ports the recovery that
-   `qwen3_5.cpp:9913` and `qwen3_dflash.cpp:1106` each hand-rolled.
-5. **Non-capturing backend.** On a backend where `SupportsGraphCapture()` is
-   false, the scope is inert and the forward runs eager. Vulkan
-   (`vulkan_backend.cpp:16`) and Metal (`metal_backend.mm:13`) are the live cases.
-6. **Bit-exactness per migrated model**, over more than one replay. See `## Gates`.
+12. **Replay ORDER, not only replay arithmetic.** Replay emits segment 0, break 0,
+    segment 1, break 1, and so on, in that exact order, and the order is identical on
+    the second and third replay. Upstream asserts the composed VALUE (T2, T3), which
+    a wrong order could in principle still satisfy for a commutative chain; this
+    asserts the sequence directly.
+13. **Capture-failure drain.** A break function that throws leaves the stream
+    un-poisoned and the partially built `BreakableGraph` destroyed with every
+    already-instantiated segment released. This ports the recovery that
+    `qwen3_5.cpp:9913` and `qwen3_dflash.cpp:1106` each hand-rolled. Upstream has no
+    equivalent because Python's `finally` in `__exit__` (`:323-332`) covers it.
+14. **Non-capturing backend.** On a backend where `SupportsGraphCapture()` is
+    false, the scope is inert and the forward runs eager. Vulkan
+    (`vulkan_backend.cpp:16`) and Metal (`metal_backend.mm:13`) are the live cases.
+    Upstream has no equivalent because BCG is CUDA and HIP only.
+15. **Auxiliary-stream auto-join.** A segment that forks a queue and does not join
+    it before a break point is joined by the scope, per `## Port map`. This is the
+    port of `_end_current_segment` `:353-361`, which upstream exercises only
+    indirectly through its model-level integration test.
+16. **Bit-exactness per migrated model**, over more than one replay. See `## Gates`.
 
-Tests 1 through 5 need no graphics processing unit (GPU). They run against a test
-backend that records the call sequence. Test 6 needs a GPU and an `rc` lease.
+Tests 1 through 15 need no graphics processing unit (GPU), except T6's value arm.
+They run against a test backend that records the call sequence. Test 16 needs a GPU
+and an `rc` lease.
 
 ## Gates
 
@@ -418,7 +584,7 @@ same-binary A/B, not as a win.
 | Dependency | State | Effect on this row |
 |---|---|---|
 | `vt::Backend` capture vocabulary | landed, `include/vt/backend.h:208-222` | the seam needs no new virtual |
-| `DecodeGraphSizes` and `PadToCaptureSize` | landed, `decode_graph_sizes.h:47-56` | reused unchanged |
+| `DecodeGraphSizes` and `PadToCaptureSize` | landed, `decode_graph_sizes.h:47-54` | reused unchanged |
 | Retire-on-grow scratch | landed, `src/vt/cuda/graph_safe_scratch.h` | the lifetime rule the seam enforces |
 | `DevicePool` never-free discipline | landed, `device_pool.h:16` | replaces SGLang's mempool pinning |
 | `ENG-CUDAGRAPH-DEDUP` (#1162) | in flight, parallel agent | touches the same handles; see D4 |
@@ -545,7 +711,7 @@ signature hit, instead of instantiating one executable per padded bucket. The tw
 rows touch the same handle: dedup changes what `EndCaptureGraph` hands back and
 who owns it, and this row multiplies the number of such handles by the segment
 count. They compose in SGLang, where `BreakableCUDAGraph._append_segment`
-(`breakable_cuda_graph.py:266-276`) registers each segment with an optional
+(`breakable_cuda_graph.py:266-274`) registers each segment with an optional
 `_deduped_cuda_graph`, and `_begin_new_segment` (`:335-350`) asks for
 `keep_graph=True` only when dedup is active. **Decision: this row lands first and
 treats a segment handle as opaque.** `vt::BreakableGraph` must store the handle,
@@ -572,12 +738,26 @@ path and the measurement, not on this spec to pre-refute an unnamed one.
 **D6, the non-CUDA backends.** Tenstorrent implements capture as ttnn mesh-trace
 (`tenstorrent_backend.cpp:18,75-81`), which is a different runtime concept from a
 CUDA stream capture. A segmented capture assumes that ending a trace and starting
-another on the same queue mid-forward is legal and cheap. That holds for CUDA by
-SGLang's production use and is UNVERIFIED for ttnn traces. **Decision: the seam is
+another on the same queue mid-forward is legal. **That assumption is UNVERIFIED on
+both runtimes and this spec claims it on neither.** For CUDA, SGLang does it on a
+production path at the pinned revision (`breakable_cuda_graph.py:352-367` then
+`:335-350`), which is strong evidence and is not our measurement; confirming it on a
+leased GPU is W1's exit criterion, in `## Work breakdown` W0's own words. For ttnn
+traces there is not even that evidence. Nothing here measures the COST of a re-begin
+on either runtime, so no cost claim is made; what would settle it is a same-binary
+A/B of an N-segment capture against a 1-segment capture of the same forward, on the
+leased GPU that W1 already needs. **Decision: the seam is
 defined against the existing `vt::Backend` vocabulary and asks nothing new of any
 backend, so a backend that cannot segment reports `SupportsGraphCapture()` and
 runs one segment, which is exactly today's behavior.** No backend is required to
 change for W1.
+
+**D7, a break point is a correctness boundary, not only a coverage knob.** Every
+break point converts a graphed operation into a host-dispatched one, so a
+mis-registered break point is invisible in a token gate and visible only as a
+segment count. G3 exists for this reason. A model whose break-point set is wrong
+still produces correct tokens; it produces them from more segments than it needs,
+or from a graph that was never entered at all.
 
 **D8, this row states no runnable gate command, and that is the honest record.**
 Moving the row to `READY` puts it in the gated population, where the gate-command
@@ -593,16 +773,59 @@ names no command. **Decision: do not manufacture a command to satisfy the
 classifier, and do not re-pin the runnable set for a row with nothing to run.** W1
 earns the entry and re-pins the baseline in the same change.
 
-**D7, a break point is a correctness boundary, not only a coverage knob.** Every
-break point converts a graphed operation into a host-dispatched one, so a
-mis-registered break point is invisible in a token gate and visible only as a
-segment count. G3 exists for this reason. A model whose break-point set is wrong
-still produces correct tokens; it produces them from more segments than it needs,
-or from a graph that was never entered at all.
+**D9, the break function's OUTPUT is a lifetime surface, and D1 and D2 do not cover
+it.** D1 covers the device intermediates a SEGMENT reads and D2 covers the host
+source of a captured upload. Both are about break-function INPUTS. The output is a
+third case and it is the one upstream spends the most machinery on. On replay N the
+eager function allocates a fresh result, so unless the seam copies that result back
+into the destination the following segment baked at capture time, segment `i+1` reads
+capture-time data forever while the break function writes into a buffer nobody reads.
+Upstream closes it with `replay_fn` plus `_copy_output`
+(`breakable_cuda_graph.py:231-235,172-201`) and keeps the destination alive with
+`_weak_ref_if_tensor` (`:156-169`). **Decision: `vt::GraphBreak` states the writeback
+contract at its declaration, per `## Port map` §3 — either it takes the destination
+and the seam copies into it, or the break function writes in place into a persistent
+model-owned buffer and returns nothing.** A `BreakableGraph` that stores the caller's
+raw `fn` cannot express either, so it stores the seam's closure instead.
+
+This defect is invisible to every gate that runs ONE replay, and it produces wrong
+numbers rather than a fault, so it is in the same detection class D1 describes: a
+clean `compute-sanitizer` run says nothing about it. The ported `TestCopyOutput`
+cases T7 through T10 and the multi-replay case T6 in `## Tests to port` are what pin
+it, and G1's more-than-one-replay requirement is what catches it at model level.
+
+**D10, a segment cannot close while a forked queue is still capturing.** Upstream
+auto-joins outstanding side streams inside `_end_current_segment` before
+`capture_end()` (`breakable_cuda_graph.py:353-361`) and maintains the whole
+`wait_stream` hook (`:101-153`, installed `:310`, removed `:332`) for no other
+purpose. This is live here, not hypothetical: `SupportsAuxStream()` is `true` on
+CUDA (`src/vt/cuda/cuda_backend.cu:200`) and two model paths fork on it — Qwen3.5's
+MoE shared-expert overlap (`src/vllm/model_executor/models/qwen3_5.cpp:6254-6255`
+fork, `:6384` join) and Laguna's decode graph, whose auxiliary queue is owned by the
+capture class itself (`src/vllm/model_executor/models/laguna.cpp:2362-2367`,
+`:2572-2576` fork, `:2612` join). W4 migrates the first and W5 the second.
+**Decision: `GraphCaptureScope` owns the outstanding-fork set and joins it before
+every `EndCaptureGraph`, and test 15 of `## Tests to port` gates it.** We need no
+hook to populate that set, because our fork and join are explicit
+`Backend::RecordEvent` and `Backend::QueueWaitEvent` calls rather than an implicit
+torch API — which makes this cheaper for us than for SGLang, not harder. A break
+point registered inside an unjoined fork window without this rule fails at
+`EndCaptureGraph`, which is the one failure mode in this spec that is LOUD.
 
 ## Now
 
 `READY`. The spec is committed, the design is grounded in both oracles, the
-inventory is enumerated with anchors, and the work is decomposed into six landable
-stages. No production code exists for this row. W1 needs an `rc` GPU lease to
-confirm its exit criterion before implementation starts.
+inventory is enumerated with anchors, the upstream unit suite is mapped case for
+case in `## Tests to port`, and the work is decomposed into six landable stages. No
+production code exists for this row. W1 needs an `rc` GPU lease to confirm its exit
+criterion — that CUDA permits `cudaStreamEndCapture` followed by
+`cudaStreamBeginCapture` mid-forward on our stream configuration — before
+implementation starts.
+
+Revised 2026-08-18 after a fresh review returned `FAIL`. What changed: the upstream
+test suite is ported rather than declared absent; `## Port map` §3 states the output
+writeback contract that the raw-`fn` description had dropped (D9); the auxiliary
+stream fork-join rule is stated and gated (D10); four enumerations in
+`## Our baseline` and one `grep` count were re-derived and corrected against printed
+instruments; D6 now defers to W1's exit criterion instead of asserting it; and the
+row is recorded as coverage AND correctness per #1179.

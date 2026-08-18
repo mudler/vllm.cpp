@@ -140,3 +140,77 @@ TEST_CASE("DSpark method resolution from the draft checkpoint identity") {
   CHECK_FALSE(SpeculativeConfig::IsDsparkDraft("z-lab/Qwen3.6-27B-DFlash",
                                                {"DFlashDraftModel"}));
 }
+
+// ─── SPEC-DSPARK-QWEN3-ROUTING (#1193) ───────────────────────────────────────
+//
+// BEYOND-PIN. Both cases below mirror vllm-project/vllm#52197, merged
+// 2026-08-17 at 7075ddac28c25d4fd2b84bc2a9a6c5ffde0345c8, which is AHEAD of the
+// pin 555967922. The PR ships no test of its own — its "Test Plan" is empty and
+// its "Test Result" is a pasted gsm8k serve log — so there is nothing to port
+// one-for-one and these are written here. .agents/porting.md requires the
+// adaptation to be recorded, and this paragraph is that record;
+// .agents/specs/dspark-qwen3-routing.md §2 carries the pin decision.
+//
+// The REACHABILITY of both functions — that the loader calls them at all — is
+// tests/vllm/entrypoints/test_dspark_draft_routing.cpp, because a case here
+// proves the predicate works and never that anything reaches it.
+
+TEST_CASE("a DSparkDraftModel draft with model_type qwen3 IS a DSpark draft") {
+  // vllm#52197 hunk 1. The model id carries no "dspark" substring, so only the
+  // architecture arm can answer: with the id spelled the other way the case
+  // would pass on speculative.py:882 alone and prove nothing about the
+  // architecture list — the mute switch this test set has to avoid.
+  CHECK(SpeculativeConfig::IsDsparkDraft("RadixArk/Qwen3.8-27B-Draft",
+                                         {"DSparkDraftModel"}, "qwen3"));
+  // The PAIR is the condition. The same architecture string names a DeepSeek-V4
+  // draft under any other model_type, and upstream's leading branch does not
+  // claim it.
+  CHECK_FALSE(SpeculativeConfig::IsDsparkDraft("RadixArk/Qwen3.8-27B-Draft",
+                                               {"DSparkDraftModel"},
+                                               "deepseek_v4"));
+  // And the pinned two-argument question keeps the pinned answer.
+  CHECK_FALSE(
+      SpeculativeConfig::IsDsparkDraft("RadixArk/Qwen3.8-27B-Draft",
+                                       {"DSparkDraftModel"}));
+}
+
+TEST_CASE("DSpark architecture normalization routes the three implemented names") {
+  // vllm#52197 hunk 2 branch 1, and speculative.py:934-944's two survivors. All
+  // three answer with the one draft lane this engine implements
+  // (LoadQwen3DSpark), which is what upstream's update_arch_() writes back onto
+  // the draft config.
+  CHECK(SpeculativeConfig::ResolveDsparkArchitecture({"DSparkDraftModel"},
+                                                     "qwen3") ==
+        "Qwen3DSparkModel");
+  CHECK(SpeculativeConfig::ResolveDsparkArchitecture({"Qwen3DSparkModel"},
+                                                     "qwen3") ==
+        "Qwen3DSparkModel");
+  CHECK(SpeculativeConfig::ResolveDsparkArchitecture({"Gemma4DSparkModel"},
+                                                     "gemma4") ==
+        "Qwen3DSparkModel");
+}
+
+TEST_CASE("DSpark architecture normalization REFUSES the DeepSeek-V4 fallback") {
+  // The one tracked divergence from speculative.py:940-944 (§7 R2): upstream
+  // rewrites the config onto model_type "deepseek_v4" and lets the DeepSeek-V4
+  // path take it; we have only a stub for that path, so the arm is refused with
+  // the missing part NAMED, as AGENTS.md requires.
+  std::string message;
+  try {
+    SpeculativeConfig::ResolveDsparkArchitecture({"DSparkDraftModel"},
+                                                 "deepseek_v4");
+  } catch (const std::invalid_argument& e) {
+    message = e.what();
+  }
+  REQUIRE_FALSE(message.empty());
+  CHECK(message.find("DeepSeek-V4") != std::string::npos);
+  CHECK(message.find("not implemented") != std::string::npos);
+
+  // The catch-all is upstream's, so an architecture list that names nothing
+  // DSpark at all lands in the same refusal rather than loading as a Qwen3
+  // draft.
+  CHECK_THROWS_AS(
+      SpeculativeConfig::ResolveDsparkArchitecture({"DeepseekV4ForCausalLM"},
+                                                   "deepseek_v4"),
+      std::invalid_argument);
+}

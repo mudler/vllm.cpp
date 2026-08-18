@@ -544,7 +544,7 @@ ENGINE_PREFIXES = (
 # ported here, so this row records a divergence that already exists rather than
 # introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 162
+ENGINE_ROWS = 163
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

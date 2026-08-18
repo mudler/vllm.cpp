@@ -23,7 +23,8 @@
 //
 //   {"vllm_cpp": {"mmap":          {"enabled": bool, "prefault": bool},
 //                 "expert_stream": {"enabled": bool, "slots": int,
-//                                   "slot_bytes": int}}}
+//                                   "slot_bytes": int},
+//                 "device_fit":    {"weight_budget_bytes": int}}}
 //
 // Every field is optional and an absent field means UNCHANGED. That sentence
 // binds TWO pieces of code, and the first two shapes of this row broke it in both
@@ -58,8 +59,8 @@
 // and it is the thing an operator flips while watching a run. Recorded so a
 // later reader sees a decision rather than an omission.
 //
-// THE LATCH, which is the one real hazard here — and it covers TWO of the five
-// knobs, not all five. What genuinely freezes:
+// THE LATCH, which is the one real hazard here — and it covers THREE of the six
+// knobs, not all six. What genuinely freezes:
 //
 //   * `expert_stream`, because `ResolveExpertStreamRequested` below caches the
 //     answer in a function-local static. (`Qwen35ExpertStreamRequested` is the
@@ -72,9 +73,11 @@
 //     two sizes freezes nothing; building the store does.
 //
 // What does NOT freeze: `mmap`, because `GgufLoadPolicy::FromEnv()` is called per
-// load and always has been, and `prefault`, because this row deliberately removed
-// that site's function-local static (see `ResolveGgufPrefault` below). A second
-// engine in one process may therefore still set either of them.
+// load and always has been; `prefault`, because this row deliberately removed
+// that site's function-local static (see `ResolveGgufPrefault` below); and
+// `device_fit.weight_budget_bytes`, which one GGUF load reads once at its fit
+// check through no static at all. A second engine in one process may therefore
+// still set any of the three.
 //
 // So the refusal is scoped to what it can actually justify, and it took three
 // shapes to get there. `SetWeightResidencyConfig` THROWS only when the incoming
@@ -100,6 +103,7 @@
 #ifndef VLLM_CONFIG_WEIGHT_RESIDENCY_H_
 #define VLLM_CONFIG_WEIGHT_RESIDENCY_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -136,6 +140,20 @@ struct WeightResidencyConfig {
   // (UD) quant whose `down_proj` outweighs its gate/up pair is precisely the
   // case where the computed default is wrong.
   std::optional<int64_t> expert_stream_slot_bytes;
+
+  // `device_fit.weight_budget_bytes` -> VT_DEVICE_WEIGHT_BUDGET_BYTES. The device
+  // memory pool that a GGUF's staged weight bytes are compared against at LOAD
+  // time (issue #1123), overriding the platform's own probe. Set it LOWER when
+  // something else lives in the pool.
+  //
+  // ZERO IS LEGAL HERE AND NOWHERE ELSE IN THIS STRUCT, and it is not a
+  // degenerate size. `CheckDeviceWeightFit` reads a zero budget as UNKNOWN and
+  // decides nothing, so `0` is the documented spelling of "suppress the refusal
+  // and get the late failure back" — exactly what
+  // `VT_DEVICE_WEIGHT_BUDGET_BYTES=0` already means. `slots` and `slot_bytes` are
+  // sizes and refuse a zero, because a slot count that silently became 64 is a
+  // cache the operator does not have. A NEGATIVE budget is still refused.
+  std::optional<int64_t> device_weight_budget_bytes;
 
   // True when the operator set nothing, i.e. the byte-identical default path.
   bool empty() const;
@@ -175,10 +193,15 @@ struct WeightResidencyConfig {
 //
 // Throws std::invalid_argument on a malformed document, a non-object document, a
 // `vllm_cpp` that is not an object, an UNKNOWN key at ANY level of the document, a
-// field of the wrong type, or a non-positive `slots` / `slot_bytes`. "Any level"
-// means the top level, the inside of `vllm_cpp`, the inside of `vllm_cpp.mmap` and
-// `vllm_cpp.expert_stream`, and the inside of the two MIRRORED sub-objects `uva` and
-// `prefetch`. The last of those was missing while this comment already claimed it,
+// field of the wrong type, a non-positive `slots` / `slot_bytes`, or a NEGATIVE
+// `device_fit.weight_budget_bytes`. "Any level" means the top level, the inside of
+// `vllm_cpp`, the inside of `vllm_cpp.mmap`, `vllm_cpp.expert_stream` and
+// `vllm_cpp.device_fit`, and the inside of the two MIRRORED sub-objects `uva` and
+// `prefetch`. A `weight_budget_bytes` of ZERO is accepted, and it is the only zero
+// this parser accepts in a field it OWNS: it is the documented spelling of
+// "suppress the device-fit refusal", which `CheckDeviceWeightFit` implements by
+// reading a zero budget as UNKNOWN. (Values inside `uva` and `prefetch` are not
+// this parser's to accept or refuse; it reads their NAMES only.) The last of those was missing while this comment already claimed it,
 // so `{"uva":{"cpu_offload_GB":10}}` started a server with a 0 GiB budget the
 // operator believed was set (#1133 H3). TYPE checking inside `uva`/`prefetch` stays
 // with the mirrored parser that owns those fields; this one only enumerates names.
@@ -194,6 +217,10 @@ struct WeightResidencyConfig {
 // all, because every flag around it is hyphenated. A typo that quietly disables the
 // tier keeping a 370 GiB model in 119 GB is worse than a startup error, so it is an
 // error.
+//
+// `{"vllm_cpp":{"device-fit":...}}` and `{"vllm_cpp":{"device_fit":{"weight_budget_byte":1}}}`
+// are refused on the same terms, and for the same consequence one level down: a
+// budget the operator believes is set, with the platform probe silently in force.
 //
 // The four legal top-level keys are `offload_backend`, `uva`, `prefetch` and
 // `vllm_cpp`: the three the mirrored parser reads by name, plus this extension.
@@ -231,7 +258,7 @@ void SetWeightResidencyConfig(const WeightResidencyConfig& config);
 
 // The installed config, BY VALUE. Empty until something installs one. A reference
 // would be read after the lock was released, which is an unsynchronised read behind
-// a lock that looks like it covers one; the copy is five optionals.
+// a lock that looks like it covers one; the copy is six optionals.
 WeightResidencyConfig ActiveWeightResidencyConfig();
 
 // The decisions that genuinely freeze, one enumerator each. There is no `kMmap` or
@@ -282,10 +309,10 @@ int64_t ResolveResidencyCount(const char* env_name,
                               std::optional<int64_t> configured,
                               int64_t builtin_default);
 
-// ── The five knobs, one named resolver each ───────────────────────────────────
+// ── The six knobs, one named resolver each ────────────────────────────────────
 //
 // Each one owns its environment NAME and its exact historical POLARITY, and each
-// is the SOLE reader of its variable after this row. Two reasons this is five
+// is the SOLE reader of its variable after this row. Two reasons this is six
 // functions and not one call at each site with a string literal.
 //
 // First, the polarities are NOT the same and one of them is deliberately odd.
@@ -380,6 +407,28 @@ int64_t ResolveExpertStreamSlots();
 // `computed_default` (the largest gate/up/down slice the caller is about to
 // take).
 int64_t ResolveExpertStreamSlotBytes(int64_t computed_default);
+
+// `VT_DEVICE_WEIGHT_BUDGET_BYTES` > `vllm_cpp.device_fit.weight_budget_bytes` >
+// `probed_total_bytes` (the platform's own `device_memory_total_bytes`).
+//
+// THE SIXTH KNOB, and the only one of the three integers that does NOT go through
+// `ResolveResidencyCount`. That helper ignores a non-positive ENVIRONMENT value,
+// which is right for a slot count and wrong here: `0` is this knob's suppression
+// spelling and has to survive as a budget of zero, which `CheckDeviceWeightFit`
+// then reads as UNKNOWN. (Neither helper filters the CONFIGURED value, because
+// the parser already refused what each field considers out of range.) So this function transcribes the environment grammar
+// `DeviceWeightBudgetBytes` has used since #1123 — one or more decimal digits and
+// nothing else, no sign and no space — and inserts the config UNDER it. A value
+// outside that grammar is ignored and falls through to the config, where it used
+// to fall through to the probe; a run with no config therefore resolves
+// byte-for-byte as before. `strtoull` alone is not enough for the grammar: it
+// skips leading whitespace and it ACCEPTS a leading '-' and wraps it to
+// ULLONG_MAX, so "-1" would parse as an effectively infinite budget.
+//
+// NOT LATCHING. It is read once per GGUF load, at the fit check in
+// `LoadedEngine::FromModelDir`, through no static, so `ResidencyLatch` gains no
+// enumerator and a second engine may still set it.
+size_t ResolveDeviceWeightBudgetBytes(size_t probed_total_bytes);
 
 }  // namespace vllm
 

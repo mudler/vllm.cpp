@@ -41,6 +41,13 @@ struct Args {
   bool stream = false;
   int repeat = 1;  // load once, complete N times (warm tok/s)
   std::string speculative_config;  // vLLM --speculative-config JSON; "" => off.
+  // --offload-config (#1135): the same JSON document `vllm-server` takes, and
+  // the same ABI field. It carries TWO halves — vLLM's mirrored `uva`/`prefetch`
+  // weight offload, and vllm.cpp's `vllm_cpp` weight-residency tier, which is
+  // what makes a checkpoint larger than host RAM loadable. `vllm-cli` had no
+  // such flag, so the only way to reach the residency tier from it was the
+  // `VT_*` environment variables. "" => NULL => the byte-identical default.
+  std::string offload_config;
   // --device (ABI v14): "auto" (default probe), "cpu", or "cuda" — the names
   // of vLLM's DeviceConfig.device this build serves. Mapped to the int the ABI
   // takes (0/1/2) in ParseArgs; an unknown name is rejected there.
@@ -72,7 +79,7 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--seed S] [--stream] [--repeat N]\n"
       "          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]\n"
       "          [--max-num-seqs N]\n"
-      "          [--speculative-config '<json>']\n"
+      "          [--speculative-config '<json>'] [--offload-config '<json>']\n"
       "\n"
       "Runs completion(s) over the vllm.cpp C ABI (libvllm). <dir> holds\n"
       "config.json, tokenizer.json and the *.safetensors shards.\n"
@@ -121,6 +128,8 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       if (a.repeat < 1) a.repeat = 1;
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i);
+    } else if (flag == "--offload-config") {
+      a.offload_config = NextArg(argc, argv, i);
     } else if (flag == "--gpu-memory-utilization") {
       a.gpu_memory_utilization = std::atof(NextArg(argc, argv, i));
     } else if (flag == "--kv-cache-memory") {
@@ -206,6 +215,15 @@ int main(int argc, char** argv) {
   // document fails the load below with the parse error.
   if (!args.speculative_config.empty()) {
     mp.speculative_config = args.speculative_config.c_str();
+  }
+  // --offload-config (#1135): one string, both halves, parsed by the library at
+  // `vllm_engine_load` (src/capi/vllm_c.cpp) exactly as `vllm-server` parses it.
+  // This example stays a thin ABI client and adds no parsing of its own, so a
+  // malformed document, an unknown key at any level of it, or a residency
+  // document that a decision has already fixed all fail the load below with the
+  // library's own message.
+  if (!args.offload_config.empty()) {
+    mp.offload_config = args.offload_config.c_str();
   }
   // --device: explicit device selection (ABI v14). 0 (the default) keeps the
   // accelerator-first probe; an explicitly named absent device fails the load

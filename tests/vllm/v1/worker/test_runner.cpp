@@ -594,7 +594,8 @@ TEST_CASE("runner: MambaSpec is the allocation source of truth") {
 // ─── #810: THE BYTE-NEUTRALITY ARM ───────────────────────────────────────────
 //
 // `initialize_kv_cache` serves EVERY architecture — the engine builds exactly
-// one `GPUModelRunner` (model_loader.cpp:1007-1023) — so a refactor of it owes
+// one `GPUModelRunner` (`src/vllm/entrypoints/model_loader.cpp::runner_`, built
+// in the `LoadedEngine` member-init list) — so a refactor of it owes
 // a proof that it changes nothing for the models that already work. This
 // mirrors the BYTE-NEUTRALITY CONTRACT stated for the `per_layer_attn_specs`
 // seam at include/vllm/v1/kv_cache_interface.h:354-374: byte-identical

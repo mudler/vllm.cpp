@@ -201,8 +201,13 @@ TEST_CASE("G7 repacked GEMM matches plain at real model shapes / dtypes") {
   for (const Shape& s : shapes) {
     for (vt::DType odt : {vt::DType::kF32, vt::DType::kBF16}) {
       for (bool strided : {false, true}) {
-        CAPTURE(s.m); CAPTURE(s.n); CAPTURE(s.k);
-        CAPTURE(static_cast<int>(odt)); CAPTURE(strided);
+        // One CAPTURE per line: same-line groups collide on
+        // DOCTEST_CAPTURE_<line> (clang/hipcc reject the redefinition).
+        CAPTURE(s.m);
+        CAPTURE(s.n);
+        CAPTURE(s.k);
+        CAPTURE(static_cast<int>(odt));
+        CAPTURE(strided);
         const int64_t nblocks = s.k / vt::cpu::kQK8_0;
         const std::vector<uint8_t> plain = MakePlainQ8_0(s.n, nblocks, 0x11U);
         // Optionally over-allocate the activation row stride (a column slice of

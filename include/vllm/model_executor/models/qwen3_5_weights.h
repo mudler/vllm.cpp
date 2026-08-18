@@ -329,6 +329,58 @@ struct Fp8Weight {
   mutable std::shared_ptr<void> d_packed;
 };
 
+// Block-wise (fine-grained) FP8 weight — MODEL-FP8-BLOCK-WEIGHT, #1189 M3, spec
+// `.agents/specs/model-fp8-block-weight.md`. One fp8-e4m3fn scale per
+// `block_n` x `block_k` tile of the weight, the layout `Qwen/Qwen3.8-27B-FP8`
+// ships and vLLM registers as `weight_scale_inv`
+// (`vllm/model_executor/layers/quantization/fp8.py:378-379,511` @ `555967922`).
+//
+// A SIBLING of `Fp8Weight` above, deliberately, not an extension of it. That
+// struct is three host floats whose whole point is the `alpha = input_scale *
+// weight_scale` folded once at load; a block scheme has NO `input_scale` at all
+// (the activation scheme is `dynamic`, and the target checkpoint ships zero such
+// tensors) and its weight scale is a 2-D tensor, so there is no value `alpha`
+// could take. Adding an optional tensor to `Fp8Weight` would make every existing
+// reader of `alpha` — the cutlass and cuBLASLt fp8 wrappers, the merged-QKV alpha
+// vector, `PrepareGdnFp8Resident` — carry a silent which-arm branch, and the one
+// that forgets it returns a plausible number instead of an error. A distinct type
+// makes the wrong call site fail to COMPILE. The shape mirrors `Nvfp4Weight`
+// above: an OwnedTensor scale beside the packed values plus lazy device handles.
+//
+// `scale` is f32 and that is the MIRROR rather than a widening
+// (`.agents/porting.md` §"Mirror the memory format"). Upstream allocates the
+// parameter `torch.float32` (`utils/fp8_utils.py:1276,1283-1296`; `scale_dtype`
+// is None unless `is_scale_e8m0`, which `Fp8Config` does not define) and loads
+// the checkpoint tensor into it with `self.data.copy_()`
+// (`vllm/model_executor/parameter.py:97`), a CONVERTING copy. A `BF16` tensor on
+// disk is therefore widened to f32 once, at load, losslessly. `LoadFp8BlockRaw`
+// switches on the on-disk dtype explicitly and has no default branch, because
+// #1181 landed a guard for a reader that memcpy'd four bytes whatever the dtype
+// was.
+//
+// `block_n`/`block_k` are carried ON the weight rather than looked up from the
+// config at use time: the consumer needs them per GEMM, and a weight that knows
+// its own geometry cannot be paired with the wrong one.
+//
+// NOTHING CONSUMES THIS YET. #1189 milestone M4 owns `Fp8BlockLinearMethod` and
+// the forward wiring; `PrepareQwen3_5Dense` refuses a populated one by name so a
+// block-wise checkpoint declines to run rather than running wrong.
+struct Fp8BlockWeight {
+  OwnedTensor packed;  // i8  [N, K]  one fp8-e4m3fn byte per element, verbatim
+  OwnedTensor scale;   // f32 [cdiv(N, block_n), cdiv(K, block_k)]
+  int64_t n = 0;       // out_features
+  int64_t k = 0;       // in_features
+  int64_t block_n = 0;
+  int64_t block_k = 0;
+  bool Empty() const { return packed.Empty(); }
+
+  // Lazily-populated device-resident copies (CUDA forward only; null on host or
+  // before first use). Declared here so M4/M5 upload through the same seam every
+  // other quantized weight uses; owed and unpopulated at this merge commit.
+  mutable std::shared_ptr<void> d_packed;
+  mutable std::shared_ptr<void> d_scale;
+};
+
 // Gated-DeltaNet (linear_attention) layer weights. Projections in Matmul-B
 // layout [in, out]; conv1d [conv_dim, K]; a_log/dt_bias f32 [Hv]; norm bf16.
 struct GdnLayerWeights {
@@ -356,6 +408,14 @@ struct GdnLayerWeights {
   OwnedTensor dt_bias;        // f32  [Hv]
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
+
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise FP8 GDN projections. The
+  // target checkpoint lists the GDN small tensors under
+  // `modules_to_not_convert`, so these stay empty for it; the rung exists
+  // because the SITE probes `F8_E4M3` and a block-wise weight is one.
+  Fp8BlockWeight in_proj_qkv_fp8_block;
+  Fp8BlockWeight in_proj_z_fp8_block;
+  Fp8BlockWeight out_proj_fp8_block;
 
   // 27B W4A4 fp4-resident variant of out_proj (compressed-tensors NVFP4, notes
   // §3.6). When populated (real 27B CUDA load) the forward calls vt::MatmulNvfp4
@@ -430,6 +490,17 @@ struct FullAttnLayerWeights {
   Fp8Weight k_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight o_proj_fp8;  // [N=H,       K=Hq*Dh]
+
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): the block-wise (128x128) FP8 variants,
+  // populated by the `weight_scale_inv` rung in `qwen3_5_dense_weights.cpp`
+  // BEFORE the per-tensor rung, because a block-wise weight is also `F8_E4M3`
+  // (#1166). The bf16, fp4 and per-tensor fp8 slots are left EMPTY when these
+  // are populated, and vice versa. Nothing reads them yet -- M4 owns the linear
+  // method and `PrepareQwen3_5Dense` refuses a populated one by name.
+  Fp8BlockWeight q_proj_fp8_block;  // [N=2*Hq*Dh, K=H]
+  Fp8BlockWeight k_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
+  Fp8BlockWeight v_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
+  Fp8BlockWeight o_proj_fp8_block;  // [N=H,       K=Hq*Dh]
 
   // CUDA resident for the FP8 (W8A8) analog of QKVParallelLinear (VT_FP8_MERGED
   // _QKV, opt-in). The checkpoint owns logical Q/K/V shards separately with a

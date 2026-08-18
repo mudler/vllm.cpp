@@ -154,10 +154,38 @@ class ReadmeStructureTests(unittest.TestCase):
         errors = readme_structure.readme_errors(mutated)
         self.assertEqual(errors, [])
 
-    def test_oversized_readme_fails(self) -> None:
+    def test_oversized_readme_passes_when_every_entry_is_small(self) -> None:
+        # #498: the landing page carries no whole-file budget. A README far past
+        # the retired 30,000-char cap is valid so long as every ENTRY is small,
+        # because a shared-file budget makes each addition evict someone else's
+        # content and lets two individually-valid edits merge into a failure.
         mutated = VALID + "\n" + ("- a filler bullet line\n" * 3000)
-        errors = readme_structure.readme_errors(mutated)
-        self.assertTrue(any("landing-page budget" in e for e in errors), errors)
+        self.assertGreater(len(mutated), 30000)
+        self.assertEqual(readme_structure.readme_errors(mutated), [])
+
+    def test_checker_declares_no_whole_file_budget(self) -> None:
+        # The anti-regression tooth: fails if the constant returns under ANY
+        # value, not merely if the current threshold is raised.
+        self.assertFalse(
+            hasattr(readme_structure, "MAX_README_CHARS"),
+            "MAX_README_CHARS is back; AGENTS.md Records forbids a budget on a "
+            "whole shared file (see .agents/specs/readme-budget-retire.md)",
+        )
+
+    def test_entry_budgets_survive_the_file_budget_removal(self) -> None:
+        # Mutation guard: removing the file cap must not disable the per-entry
+        # caps. An oversized paragraph and an oversized cell must still fail,
+        # each on its own, inside a document that is otherwise valid.
+        long_para = VALID.replace("Measured numbers.", "word " * 300)
+        self.assertTrue(
+            any("wall-of-prose" in e for e in readme_structure.readme_errors(long_para)),
+            readme_structure.readme_errors(long_para),
+        )
+        long_cell = VALID.replace("| Thing | Works |", f"| Thing | {'x' * 300} |")
+        self.assertTrue(
+            any("wall-of-prose" in e for e in readme_structure.readme_errors(long_cell)),
+            readme_structure.readme_errors(long_cell),
+        )
 
     def test_missing_status_link_fails(self) -> None:
         mutated = VALID.replace("Status ledger: docs/STATUS.md", "No ledger.")

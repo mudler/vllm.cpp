@@ -595,13 +595,13 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 is refused at load
+### Block-wise FP8 loads and does not run yet
 
-This build reads per-tensor FP8, where one scale covers a whole weight. It does
-not read block-wise FP8, also called fine-grained FP8, where one scale covers
-each 128x128 block of the weight. A block-wise checkpoint declares
-`quantization_config.weight_block_size` in its `config.json`, and it stores its
-scales under `weight_scale_inv` rather than under `weight_scale`.
+Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
+block of a weight rather than one scale for the whole weight. A block-wise
+checkpoint declares `quantization_config.weight_block_size` in its
+`config.json` and stores its scales under `weight_scale_inv` rather than under
+`weight_scale`.
 
 `Qwen/Qwen3.8-27B-FP8` is such a checkpoint. At revision
 `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` it declares `weight_block_size`
@@ -609,18 +609,27 @@ scales under `weight_scale_inv` rather than under `weight_scale`.
 `self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
 `self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
 
-Loading it stops with a message that names the key:
+That checkpoint now LOADS. The weights are read into a block-wise FP8 weight,
+the `BF16` scale is widened to `F32` by value the way vLLM widens it, and the
+config is cross-checked against the tensors so a disagreement is named rather
+than guessed at. Nothing can execute the weight yet, so the model refuses to
+finish preparing:
 
 ```text
-quantization_config.weight_block_size [128, 128] selects block-wise
-(fine-grained) FP8, which is not implemented. This build implements per-tensor
-FP8 only.
+block-wise (fine-grained) 128x128 FP8 weights LOADED for
+model.layers.0.self_attn.q_proj and nothing in this build can execute them
 ```
 
-The refusal is deliberate. Nothing is wrong with that checkpoint, and the
-missing arm is in this project. To run the same model here, use a per-tensor
-FP8, BF16, NVFP4, or GGUF checkpoint of it. Issue
-[#1166](https://github.com/mudler/vllm.cpp/issues/1166) tracks the port.
+Two block-wise configurations are refused earlier, at load, because no build
+here implements them: an `activation_scheme` other than `dynamic`, and a
+`weight_block_size` other than `[128, 128]`. Both messages name the key and the
+value your `config.json` declares.
+
+Nothing is wrong with those checkpoints; the missing arm is in this project. To
+run the same model today, use a per-tensor FP8, BF16, NVFP4, or GGUF checkpoint
+of it. Issue [#1189](https://github.com/mudler/vllm.cpp/issues/1189) tracks the
+remaining milestones, and
+[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
 
 ### A per-tensor scale has to be one F32 number
 
@@ -2190,6 +2199,44 @@ language model's own hidden state against the oracle capture, and
 arm — `VLLM_CPP_MUSIC3_DEVICE=1` selects the device one, unset is the CPU one —
 at the same bounds, with the same negative control. Numbers for both are in
 [BENCHMARKS](BENCHMARKS.md).
+
+#### Where the time actually goes: `VLLM_CPP_MUSIC3_PROFILE`
+
+The table above says which stage runs where. It does not say what each one
+*costs*, and at a real duration that is the only question anyone asks. Set
+
+```sh
+VLLM_CPP_MUSIC3_PROFILE=1 minimax-music3-gen --model ... --duration 20 --steps 30 --device 1
+```
+
+and the engine prints a `MUSIC3_PROFILE` table to **stderr** when the request
+finishes: one row per stage with seconds, a call count, and its share of the
+request, then the resident-set size at each stage boundary.
+
+Read it as follows.
+
+* `leaf` rows partition the request and are the ones that add up. `span` rows
+  enclose leaves — `ar.TOTAL_loop`, `denoise.TOTAL` — and are printed for
+  context but never summed, so the table cannot claim more work than the run
+  contained.
+* `cnt` rows carry no time at all. They are the counts a split has to state to
+  be readable: frames, windows, requested steps.
+* `unattributed` is the glue between the leaves — chunk slicing, the overlap
+  blend, the Euler step, the WAV assembly. It is printed rather than spread
+  silently over the measured stages, so a bracket in the wrong place shows up as
+  a number instead of as a plausible share somewhere else.
+* the `calls` column on `denoise.dit_device` counts *steps*, not forwards: one
+  bracket covers both classifier-free-guidance branches, so the forward count is
+  twice it.
+
+It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
+other value, including a near miss like `y`, leaves it off — an operator who
+mistypes gets a run with no table rather than a run whose meaning quietly
+changed. With it off, no clock is read and no `/proc` file is opened.
+
+This is an attribution instrument, not a benchmark harness: it takes no GPU
+clock window, so its rows are a within-run **split** and must not be quoted as
+per-kernel or cross-box figures.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request

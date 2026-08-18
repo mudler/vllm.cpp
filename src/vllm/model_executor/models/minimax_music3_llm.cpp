@@ -16,6 +16,8 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
+#include "vllm/model_executor/models/music3_profile.h"
+
 namespace vllm {
 namespace models {
 namespace music3 {
@@ -412,6 +414,7 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   if (out_frame_codes->size() != 1) {
     Fail("MiniMax-Music3: the depth stage starts from the frame's semantic code alone");
   }
+  profile::Timer depth_timer("ar.depth_stage", /*span=*/true);
   const int32_t semantic = (*out_frame_codes)[0];
   const std::vector<float> semantic_embed =
       weights.EmbedRow(static_cast<int64_t>(semantic) + kAudioCodeOffset);
@@ -426,24 +429,36 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
     for (int row = 0; row < 2; ++row) {
       const std::vector<float>& last =
           row == 0 ? last_hidden_conditional : last_hidden_unconditional;
-      const std::vector<float> embeds = DepthSequenceEmbeds(
-          last, semantic_embed, fed_back, config, weights.depth, ArCompute::kBFloat16);
-      const std::vector<float> states = DepthDecoderForward(
-          embeds, seq_len, config, weights.depth, ArCompute::kBFloat16);
+      std::vector<float> embeds;
+      {
+        profile::Timer embed_timer("ar.depth_projection");
+        embeds = DepthSequenceEmbeds(last, semantic_embed, fed_back, config, weights.depth,
+                                     ArCompute::kBFloat16);
+      }
+      std::vector<float> states;
+      {
+        profile::Timer forward_timer("ar.depth_forward");
+        states =
+            DepthDecoderForward(embeds, seq_len, config, weights.depth, ArCompute::kBFloat16);
+      }
       hidden_rows[row].assign(states.end() - H, states.end());
     }
     // `hidden_parts.append(hidden[:1])` — the CONDITIONAL row only, which is why
     // `frame_hiddens` can be reproduced from a golden that stores no other.
     depth_hidden.insert(depth_hidden.end(), hidden_rows[0].begin(), hidden_rows[0].end());
 
-    const std::vector<float> conditional = AudioHeadLogits(
-        hidden_rows[0], index - 1, config, weights.depth, ArCompute::kBFloat16);
-    const std::vector<float> unconditional = AudioHeadLogits(
-        hidden_rows[1], index - 1, config, weights.depth, ArCompute::kBFloat16);
-    const std::vector<float> guided =
-        GuidedDepthLogits(conditional, unconditional, kArCfgScale);
-    const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
-    const int64_t drawn = sampler(probs, Music3Draw{frame_index, index});
+    int64_t drawn = 0;
+    {
+      profile::Timer head_timer("ar.depth_head_and_draw");
+      const std::vector<float> conditional = AudioHeadLogits(
+          hidden_rows[0], index - 1, config, weights.depth, ArCompute::kBFloat16);
+      const std::vector<float> unconditional = AudioHeadLogits(
+          hidden_rows[1], index - 1, config, weights.depth, ArCompute::kBFloat16);
+      const std::vector<float> guided =
+          GuidedDepthLogits(conditional, unconditional, kArCfgScale);
+      const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
+      drawn = sampler(probs, Music3Draw{frame_index, index});
+    }
     if (drawn < 0 || drawn >= config.audio_vocab_size) {
       Fail("MiniMax-Music3: the sampler returned residual code " + std::to_string(drawn) +
            " for codebook " + std::to_string(index) + ", outside the " +
@@ -492,7 +507,11 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
 
   std::vector<float> hidden;  // [2, H]
   std::vector<float> logits;  // [2, vocab]
-  session.Prefill(prompt_ids, unconditional_ids, &hidden, &logits);
+  {
+    profile::Timer prefill_timer("ar.lm_prefill");
+    session.Prefill(prompt_ids, unconditional_ids, &hidden, &logits);
+  }
+  profile::Count("ar.prompt_tokens", static_cast<int64_t>(prompt_ids.size()));
 
   Music3ArResult result;
   result.frame_hiddens.reserve(
@@ -505,15 +524,22 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
            " logits, 2 rows x " + std::to_string(vocab) + " expected");
     }
     // encoders.py:312 — the head's output is bf16 before `.float()`.
-    RoundToBf16(logits);
-    const std::vector<float> conditional(logits.begin(),
-                                         logits.begin() + static_cast<ptrdiff_t>(vocab));
-    const std::vector<float> unconditional(logits.begin() + static_cast<ptrdiff_t>(vocab),
-                                           logits.end());
-    const std::vector<float> guided =
-        GuidedSemanticLogits(conditional, unconditional, blocked, kArCfgTopK, kArCfgScale);
-    const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
-    const int64_t sampled = sampler(probs, Music3Draw{frame_index, 0});
+    int64_t sampled = 0;
+    {
+      // The guided-logits half of the frame: two 200 000-wide rows, a top-k over
+      // each, and the draw. §11.1's table calls this "not the cost"; that was an
+      // argument, and this bracket is what turns it into a number.
+      profile::Timer semantic_timer("ar.semantic_guide_and_draw");
+      RoundToBf16(logits);
+      const std::vector<float> conditional(logits.begin(),
+                                           logits.begin() + static_cast<ptrdiff_t>(vocab));
+      const std::vector<float> unconditional(logits.begin() + static_cast<ptrdiff_t>(vocab),
+                                             logits.end());
+      const std::vector<float> guided =
+          GuidedSemanticLogits(conditional, unconditional, blocked, kArCfgTopK, kArCfgScale);
+      const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
+      sampled = sampler(probs, Music3Draw{frame_index, 0});
+    }
     if (sampled < 0 || sampled >= vocab) {
       Fail("MiniMax-Music3: the sampler returned token " + std::to_string(sampled) +
            ", outside the language model's " + std::to_string(vocab) + "-entry vocabulary");
@@ -574,7 +600,10 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
         weights.EmbedRow(sampled), residual, depth, weights.depth, ArCompute::kBFloat16);
     std::vector<float> both(feedback);
     both.insert(both.end(), feedback.begin(), feedback.end());
-    session.Step(both, &hidden, &logits);
+    {
+      profile::Timer step_timer("ar.lm_decode_step");
+      session.Step(both, &hidden, &logits);
+    }
   }
 
   if (result.frames == 0) {

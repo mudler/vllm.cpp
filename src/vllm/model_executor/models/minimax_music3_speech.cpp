@@ -16,6 +16,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/indextts2.h"
 #include "vllm/model_executor/models/minimax_music3_llm.h"
+#include "vllm/model_executor/models/music3_profile.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -241,8 +242,12 @@ std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& fr
         frame_hiddens.begin() + static_cast<ptrdiff_t>(chunk.frame_end * row));
     // The condition encoder runs bf16 (spec §2.1); its OUTPUT is then consumed
     // by an fp32 DiT, which is upstream's one cast at denoise.py:83.
-    std::vector<float> condition =
-        ConditionMix(window, chunk.frames(), mix, weights.condition, ArCompute::kBFloat16);
+    std::vector<float> condition;
+    {
+      profile::Timer condition_timer("denoise.condition_mix");
+      condition = ConditionMix(window, chunk.frames(), mix, weights.condition,
+                               ArCompute::kBFloat16);
+    }
     const int64_t length = static_cast<int64_t>(condition.size()) / condition_dim;
     if (length * condition_dim != static_cast<int64_t>(condition.size())) {
       Fail("MiniMax-Music3: the condition mix returned a non-rectangular tensor");
@@ -287,16 +292,24 @@ std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& fr
       // The ONLY line the device arm changes. Both CFG branches take the same
       // arm — running one on each would make the guidance mix a comparison
       // between two different numerics rather than between two conditionings.
-      const std::vector<float> conditional =
-          on_device ? DitForwardDevice(*device_arm.queue, latents, length, condition, time_value,
-                                       config.transformer, *device_arm.dit)
-                    : DitForward(latents, length, condition, time_value, config.transformer,
-                                 weights.dit);
-      const std::vector<float> unconditional =
-          on_device ? DitForwardDevice(*device_arm.queue, latents, length, zero_condition,
-                                       time_value, config.transformer, *device_arm.dit)
-                    : DitForward(latents, length, zero_condition, time_value, config.transformer,
-                                 weights.dit);
+      std::vector<float> conditional;
+      std::vector<float> unconditional;
+      {
+        // ONE bracket over BOTH CFG branches, and the call count is therefore
+        // half the DiT forwards. `calls` x 2 is the forward count the spec
+        // (§14.6) quotes a per-forward figure against.
+        profile::Timer dit_timer(on_device ? "denoise.dit_device" : "denoise.dit_host");
+        conditional =
+            on_device ? DitForwardDevice(*device_arm.queue, latents, length, condition, time_value,
+                                         config.transformer, *device_arm.dit)
+                      : DitForward(latents, length, condition, time_value, config.transformer,
+                                   weights.dit);
+        unconditional =
+            on_device ? DitForwardDevice(*device_arm.queue, latents, length, zero_condition,
+                                         time_value, config.transformer, *device_arm.dit)
+                      : DitForward(latents, length, zero_condition, time_value,
+                                   config.transformer, weights.dit);
+      }
       const std::vector<float> velocity =
           ClassifierFreeGuidanceMix(conditional, unconditional, options.guidance_scale);
       latents = FlowMatchStep(latents, velocity, step, schedule);
@@ -359,7 +372,11 @@ std::vector<float> Music3DecodeChunks(const std::vector<std::vector<float>>& lat
       Fail("MiniMax-Music3: latent window " + std::to_string(k) + " is not rectangular");
     }
     int64_t samples = 0;
-    const std::vector<float> waveform = VocoderDecode(latents, length, config, weights, &samples);
+    std::vector<float> waveform;
+    {
+      profile::Timer vocoder_timer("vocoder.decode_window");
+      waveform = VocoderDecode(latents, length, config, weights, &samples);
+    }
     const WaveformCropSpan span = VocoderCropSpan(k, num_chunks, samples, hop);
     if (span.length() <= 0) {
       Fail("MiniMax-Music3: window " + std::to_string(k) + " crops to nothing (" +
@@ -515,7 +532,11 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
   multimodal::SpeechResult Synthesize(const multimodal::SpeechGenParams& params) override {
     // Validate FIRST: every field refusal is free, and a caller learns its
     // request was malformed without waiting for 28.5 GB to stage.
+    profile::Begin();
+    profile::Mark("synthesize.enter");
     const Music3Request request = Music3ResolveRequest(params, config_.condition_encoder);
+    profile::Count("request.max_frames", request.max_frames);
+    profile::Count("request.steps", request.num_inference_steps);
 
     // ── the AUTOREGRESSIVE half (encoders.py) ────────────────────────────────
     //
@@ -541,10 +562,18 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
       // DOES NOT: the 0.65B RVQ depth decoder and the whole acoustic half,
       // which are host reference loops — see minimax_music3_ar.h and
       // vocoder1d.h for exactly which pieces are owed and why.
+      const auto load_t0 = profile::Now();
       const Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
+      profile::AddSince("load.ar_weights", load_t0);
+      profile::Mark("ar.weights_loaded");
       const std::vector<int32_t> prompt_ids = ar.Encode(request.prompt);
-      Music3ArResult generated = Music3GenerateFrameHiddens(
-          prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue_);
+      Music3ArResult generated;
+      {
+        profile::Timer ar_timer("ar.TOTAL_loop", /*span=*/true);
+        generated = Music3GenerateFrameHiddens(
+            prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue_);
+      }
+      profile::Mark("ar.loop_done");
       frame_hiddens = std::move(generated.frame_hiddens);
       frames = generated.frames;
       calls = generated.calls;
@@ -560,7 +589,12 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     // instead of OOM-killing (.agents/environment.md). `StageMusic3DitWeights`
     // drops each host tensor as it lands, so the peak is one tensor over the
     // 9.7 GB, not twice it.
+    profile::Mark("ar.weights_released");
+    profile::Count("ar.frames", frames);
+    const auto acoustic_t0 = profile::Now();
     Music3AcousticWeights acoustic = Music3LoadAcousticWeights(paths_, config_);
+    profile::AddSince("load.acoustic_weights", acoustic_t0);
+    profile::Mark("acoustic.weights_loaded");
     Music3DenoiseOptions options;
     options.num_inference_steps = request.num_inference_steps;
     options.guidance_scale = request.guidance_scale;
@@ -578,19 +612,29 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     Music3DitDeviceWeights staged_dit;
     Music3DenoiseDeviceArm arm;
     if (queue_.device.type != vt::DeviceType::kCPU) {
+      profile::Timer stage_timer("acoustic.dit_staging");
       staged_dit = StageMusic3DitWeights(queue_, config_.transformer, acoustic.dit,
                                          /*release_host=*/true);
       arm.queue = &queue_;
       arm.dit = &staged_dit;
     }
-    const std::vector<std::vector<float>> chunks =
-        Music3DenoiseChunks(frame_hiddens, frames, config_, acoustic, options,
-                            Music3SeededNoise(request.seed), arm);
+    profile::Mark("acoustic.dit_staged");
+    std::vector<std::vector<float>> chunks;
+    {
+      profile::Timer denoise_timer("denoise.TOTAL", /*span=*/true);
+      chunks = Music3DenoiseChunks(frame_hiddens, frames, config_, acoustic, options,
+                                   Music3SeededNoise(request.seed), arm);
+    }
+    profile::Mark("denoise.done");
+    profile::Count("denoise.windows", static_cast<int64_t>(chunks.size()));
 
     int64_t samples = 0;
     multimodal::SpeechResult out;
-    out.samples =
-        Music3DecodeChunks(chunks, config_.vocoder, acoustic.vocoder, &samples);
+    {
+      profile::Timer decode_timer("vocoder.TOTAL", /*span=*/true);
+      out.samples = Music3DecodeChunks(chunks, config_.vocoder, acoustic.vocoder, &samples);
+    }
+    profile::Mark("vocoder.done");
     // spec §1.1: the vocoder's NATIVE rate, resample-free. The 32 kHz form is a
     // downstream delivery transform and the caller's decision, which is exactly
     // what `SpeechResult`'s own contract says `sample_rate` means.
@@ -602,6 +646,8 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
            " values for " + std::to_string(samples) + " frames of " +
            std::to_string(kMusic3Channels) + "-channel audio");
     }
+    profile::Count("output.samples_per_channel", samples);
+    profile::Report("MiniMax-Music3 synthesize");
     return out;
   }
 

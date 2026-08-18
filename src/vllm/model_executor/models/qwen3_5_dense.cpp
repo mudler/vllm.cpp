@@ -103,6 +103,16 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
 
 void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
                          vt::Queue& queue) {
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3). FIRST, before any resident is built: the
+  // loader can now produce `Fp8BlockWeight`s and no forward path reads one, so
+  // an unwired block-wise checkpoint is refused BY NAME here instead of running
+  // through an empty bf16 tensor. `ModelRegistry::Prepare` is called by every
+  // runner before the first forward and before graph capture. Inert on every
+  // other checkpoint. Milestone M4 removes this along with the gap.
+  RefuseUnconsumedQwen3_5DenseFp8Block(
+      ModelAs<Qwen3_5DenseLoadedModel>(model,
+                                        "Qwen3_5ForConditionalGeneration")
+          .weights());
   // PERF-27B-LMHEAD-FP4 (issue #213): build the packed lm_head's resident HERE —
   // on CUDA before the runner captures a decode graph, elsewhere before the first
   // forward pays the dequant. Inert on every BF16/FP8/GGUF/tied checkpoint.

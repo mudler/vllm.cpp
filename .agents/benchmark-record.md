@@ -23210,13 +23210,15 @@ to mirror `fuse_loras.py:67-68`.
 
 ### Decomposing the 143x
 
-Standalone probe at `3072x450x3072`, same box:
+Standalone probe at `3072x450x3072`, same box. Each row carries its OWN paired
+scalar arm, computed in the same process immediately before the seam arm, so
+every ratio is against that number and not against another row's:
 
-| configuration | seam wall | vs the scalar loop's 9.87 s |
-|---|---:|---:|
-| default (20 threads, AVX-512 tier) | 0.0247 s | **400x** |
-| `VLLM_CPP_CPU_THREADS=1` | 0.3593 s | 27.5x |
-| `VT_CPU_MATMUL_TIER=ref`, 1 thread | 18.088 s | **0.54x — SLOWER** |
+| configuration | scalar arm | seam wall | ratio |
+|---|---:|---:|---:|
+| default (20 threads, AVX-512 tier) | 9.8942 s | 0.0247 s | **400.4x** |
+| `VLLM_CPP_CPU_THREADS=1` | 9.8694 s | 0.3593 s | 27.5x |
+| `VT_CPU_MATMUL_TIER=ref`, 1 thread | 9.8397 s | 18.088 s | **0.54x — SLOWER** |
 
 So 27.5x is the micro-kernel, the 16-lane output blocking, the inlined widening
 and an operand order that stops striding a cache line per innermost load; the

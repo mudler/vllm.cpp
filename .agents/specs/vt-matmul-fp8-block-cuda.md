@@ -536,6 +536,23 @@ the shape that must be. A refusal test that only listed refusals would have
 passed the first, which is how a correct kernel gets narrowed until it no longer
 runs the checkpoint it was written for.
 
+### The one preflight gate that is red, and why it is not this change
+
+`scripts/agent-preflight.sh --fail-on-skip` on the merge result reports
+**1 gate failed: `test_cpu_x86_llamacpp_floor`**, and every other gate `ok` with
+no `SKIP` before the verdict line. That is [#618](https://github.com/mudler/vllm.cpp/issues/618),
+which the issue index already describes as load-dependent: at high load the
+harness exits `NO_QUIET_WINDOW` (4) where the case expects `GIVING_UP` (2).
+
+It is measured as environmental here rather than assumed. The **same gate passed**
+earlier in this session, on the same shared checkout at the base SHA, when the
+box was quiet. It then failed twice in a row under load, and the harness printed
+its own reason the second time: `waiting for quiet: 15s busy=114% builders=0
+load=69.45`, at a one-minute load average between 40 and 103. The failing case
+lives in `tests/scripts/test_cpu_x86_llamacpp_floor.py`, which this change does
+not touch — the only file under `tests/scripts/` it edits is
+`test_check_cuda_fat_gencode.py`.
+
 ### A shared scratch directory nearly voided this run
 
 The mutation harness was written to the session scratchpad as `mutate.sh`. That

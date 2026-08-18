@@ -394,6 +394,12 @@ vllm_cpp_add_test(test_gguf_device_fit
   vllm/model_executor/test_gguf_device_fit.cpp)
 vllm_cpp_add_test(test_gguf_device_fit_reach
   vllm/entrypoints/test_gguf_device_fit_reach.cpp)
+# FIX-FP8-BLOCKWISE-REFUSAL #1166: block-wise (128x128) FP8 is refused BY NAME
+# at load. Every case enters through `ModelRegistry::Load` rather than through
+# the predicate, so deleting that call site reds this target. That is the
+# reachability proof and not a class test.
+vllm_cpp_add_test(test_fp8_block_quant
+  vllm/model_executor/layers/test_fp8_block_quant.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)

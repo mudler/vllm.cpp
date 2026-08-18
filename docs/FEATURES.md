@@ -78,7 +78,8 @@ are our reading of their documented behavior, not measurements.
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
-| fp8 weights | ✅ | ✅ | ✅ | ☐ |
+| fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
+| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ☐ REFUSED BY NAME at load (#1166): `Qwen/Qwen3.8-27B-FP8` declares `weight_block_size` [128, 128] and this build is per-tensor FP8 only ([spec](../.agents/specs/fp8-blockwise-refusal.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
 | FP8 W8A8 works on a CUDA arch without `cutlass-fp8` | ✅ `vt::QuantFp8Static` registers from an unconditional TU (#960); sm_110 measured ([spec](../.agents/specs/vt-fp8-quant-arch-gate.md)) | ✅ | ✅ | ☐ |
 | fp8-tower GDN `in_proj` emits bf16, unlocking packed GDN decode | ◐ `VT_GDN_FP8_IN_BF16` + `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert alone), both default **OFF**, ungated (#339) ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
@@ -114,7 +115,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 <!-- supported-arch-table:begin -->
 | Architecture | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
-| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16; **Qwen3.8-27B BF16** @`1d4bf0f2` | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3; Qwen3.8-27B 4/7 strict, 3 exact fp32 ties in band (#915) | `unsloth` 27B at/above vLLM, ModelOpt 0.85x; 4B 1.021x; 3.8-27B c4 **0.963x**, c1/c8 withheld (#931). Loads BF16/FP8/NVFP4 (CT + ModelOpt); `modelopt_mixed` FP8 tower NATIVE (#164), GDN `in_proj_qkvz` merged. CUDA/CPU |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16; **Qwen3.8-27B BF16** @`1d4bf0f2` | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3; Qwen3.8-27B 4/7 strict, 3 exact fp32 ties in band (#915) | `unsloth` 27B at/above vLLM, ModelOpt 0.85x; 4B 1.021x; 3.8-27B c4 **0.963x**, c1/c8 withheld (#931). Loads BF16/per-tensor FP8/NVFP4 (CT + ModelOpt); `modelopt_mixed` FP8 tower NATIVE (#164), GDN qkvz merged. CUDA/CPU |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4 text; published BF16 text + vision tower) | NVFP4 strict 315/315 vs vLLM 0.25.0; published BF16 6/7 prompts strict 16/16 vs the pin, 7th an exact tie (#910). Image/video IMPLEMENTED, NOT GATED (#891): the tower loads and runs, mm gate OWED | gate model: 0.93x to 1.03x grid; NO BF16 or mm speed claim |
 | `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | none: no text-only Qwen3.5 checkpoint fits this hardware | **NO RUN GATE, OWED.** Gated on `test_qwen3_8_text_only.cpp`; NO token claim. Loader reads stacked BF16 experts (#740) plus BF16 towers, shared expert and `lm_head` (#864), so both published indices satisfy the load plan | not measured |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |

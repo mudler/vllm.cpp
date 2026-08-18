@@ -1641,6 +1641,10 @@ target_link_libraries(test_parallel_layout PRIVATE Threads::Threads)
 vllm_cpp_add_test(test_backend_multidevice vt/test_backend_multidevice.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
+# #839 host lifetime + source invariants (no GPU).
+vllm_cpp_add_test(test_ops_gemma4_prefill_peer vt/test_ops_gemma4_prefill_peer.cpp)
+target_compile_definitions(test_ops_gemma4_prefill_peer PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # D1 (fold plan Tier D1): the merged-QKV == separate-q/k/v A/B — one MatmulBT over
 # the merged [Nq+Nk+Nv,H] owner + a contiguous QkvSplit is BYTE-IDENTICAL to three
 # separate MatmulBT (bit-exact GEMM math, wider N; RED-first). CPU-only.

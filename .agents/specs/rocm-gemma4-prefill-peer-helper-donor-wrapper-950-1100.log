@@ -1,0 +1,151 @@
+  {
+    const hipError_t e = hipSetDevice(compute_dev);
+    if (e != hipSuccess) return fail("restore_cdev", e);
+  }
+  return true;
+}
+
+// Prefill: run ExpertGeGLU for M rows on expert_dev (weights resident there).
+// Peer only activations M×H bf16 — not multi-GB FP8 expert packs.
+bool RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice(vt::Queue& compute_q, int expert_dev,
+                                                  void* y_compute, const void* x_compute,
+                                                  const void* fp8_gu, const void* s_gu,
+                                                  const void* fp8_dn, const void* s_dn, int M,
+                                                  int I, int H) {
+  const int compute_dev = compute_q.device.index;
+  if (expert_dev < 0 || compute_dev < 0 || !y_compute || !x_compute || !fp8_gu || !s_gu ||
+      !fp8_dn || !s_dn || M <= 0 || I <= 0 || H <= 0)
+    return false;
+
+  static const bool prefill_fp8_lt = [] {
+    if (const char* e = std::getenv("VT_GEMMA4_PREFILL_FP8_LT")) return e[0] == '1';
+    return false;
+  }();
+  static const bool gu_pair = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return e && e[0] == '1';
+  }();
+
+  auto try_fp8_lt = [&](vt::Queue& q, void* y, const void* x, int m) -> bool {
+    if (!prefill_fp8_lt || m < 16) return false;
+    // gu_act[M, 2I] then GeluAndMul → act[M,I] then down → y[M,H]
+    // Scratch for gu_act/act via TLS-like statics on sticky device of q.
+    struct LtTls {
+      int dev = -1;
+      int I = 0, H = 0, Mcap = 0;
+      void* gu_act = nullptr;
+      void* act = nullptr;
+    };
+    static thread_local LtTls lt;
+    const int dev = q.device.index;
+    const size_t gu_act_b = static_cast<size_t>(m) * static_cast<size_t>(2 * I) * 2;
+    const size_t act_b = static_cast<size_t>(m) * static_cast<size_t>(I) * 2;
+    if (lt.dev != dev || lt.I != I || lt.H != H || lt.Mcap < m || !lt.gu_act) {
+      auto freep = [&](void*& p) {
+        if (p) {
+          (void)hipFree(p);
+          p = nullptr;
+        }
+      };
+      freep(lt.gu_act);
+      freep(lt.act);
+      Check(hipSetDevice(dev), "lt alloc");
+      const int Mcap = std::max(m, 64);
+      if (hipMalloc(&lt.gu_act, static_cast<size_t>(Mcap) * static_cast<size_t>(2 * I) * 2) !=
+          hipSuccess)
+        return false;
+      if (hipMalloc(&lt.act, static_cast<size_t>(Mcap) * static_cast<size_t>(I) * 2) != hipSuccess)
+        return false;
+      lt.dev = dev;
+      lt.I = I;
+      lt.H = H;
+      lt.Mcap = Mcap;
+    }
+    if (!vt::MatmulBTFp8ActWeightLt(q, lt.gu_act, x, fp8_gu, s_gu, m, 2 * I, H, 1.f, 0.f))
+      return false;
+    vt::Tensor act = vt::Tensor::Contiguous(lt.act, vt::DType::kBF16, q.device, {m, I});
+    vt::Tensor gu_act = vt::Tensor::Contiguous(lt.gu_act, vt::DType::kBF16, q.device, {m, 2 * I});
+    if (gu_pair)
+      vt::rocm::GeluAndMulPairRocm(q, act, gu_act);
+    else
+      vt::GeluAndMul(q, act, gu_act);
+    if (!vt::MatmulBTFp8ActWeightLt(q, y, lt.act, fp8_dn, s_dn, m, H, I, 1.f, 0.f)) return false;
+    static thread_local int ok_log = 0;
+    if (ok_log++ < 3) {
+      std::fprintf(stderr, "INFO gemma4-moe prefill FP8×FP8 Lt path M=%d I=%d H=%d\n", m, I, H);
+    }
+    return true;
+  };
+
+  // Same device: caller should use local ExpertGeGLU; still support for safety.
+  if (expert_dev == compute_dev) {
+    if (try_fp8_lt(compute_q, y_compute, x_compute, M)) return true;
+    vt::Device dev = compute_q.device;
+    // Multi-slot sticky dequant (see PrefillDequantCache) + act scratch.
+    struct SameTls {
+      int dev = -1;
+      int I = 0, H = 0, Mcap = 0;
+      void* gu_act = nullptr;
+      void* act = nullptr;
+    };
+    static thread_local SameTls tls_slots[2];
+    SameTls& tls = tls_slots[(compute_dev == 1) ? 1 : 0];
+    if (tls.dev != compute_dev || tls.I != I || tls.H != H || tls.Mcap < M || !tls.gu_act) {
+      auto freep = [&](void*& p) {
+        if (p) {
+          (void)hipFree(p);
+          p = nullptr;
+        }
+      };
+      freep(tls.gu_act);
+      freep(tls.act);
+      Check(hipSetDevice(compute_dev), "same alloc");
+      size_t gu_act_cap = static_cast<size_t>(std::max(M, 64)) * static_cast<size_t>(2 * I) * 2;
+      size_t act_cap = static_cast<size_t>(std::max(M, 64)) * static_cast<size_t>(I) * 2;
+      if (hipMalloc(&tls.gu_act, gu_act_cap) != hipSuccess) return false;
+      if (hipMalloc(&tls.act, act_cap) != hipSuccess) return false;
+      tls.dev = compute_dev;
+      tls.I = I;
+      tls.H = H;
+      tls.Mcap = std::max(M, 64);
+    }
+    auto& wslot = DequantCacheSlotFor(compute_dev);
+    void* gu_w = nullptr;
+    void* dn_w = nullptr;
+    int pin = -1;
+    {
+      std::lock_guard<std::mutex> lk(wslot.cache.mu);
+      if (!wslot.cache.Ensure(compute_dev, I, H)) return false;
+      if (!wslot.cache.GetLocked(compute_q, fp8_gu, fp8_gu, s_gu, fp8_dn, s_dn, &gu_w, &dn_w,
+                                 &pin))
+        return false;
+    }
+    vt::Tensor x = vt::Tensor::Contiguous(const_cast<void*>(x_compute), vt::DType::kBF16, dev,
+                                          {M, H});
+    vt::Tensor gu_wt = vt::Tensor::Contiguous(gu_w, vt::DType::kBF16, dev, {2 * I, H});
+    vt::Tensor gu_act = vt::Tensor::Contiguous(tls.gu_act, vt::DType::kBF16, dev, {M, 2 * I});
+    vt::Tensor act = vt::Tensor::Contiguous(tls.act, vt::DType::kBF16, dev, {M, I});
+    vt::MatmulBT(compute_q, gu_act, x, gu_wt);
+    if (gu_pair)
+      vt::rocm::GeluAndMulPairRocm(compute_q, act, gu_act);
+    else
+      vt::GeluAndMul(compute_q, act, gu_act);
+    vt::MatmulBTAlphaBeta(compute_q, y_compute, act.data, dn_w, M, H, I, 1.f, 0.f,
+                          vt::DType::kBF16);
+    {
+      std::lock_guard<std::mutex> lk(wslot.cache.mu);
+      wslot.cache.UnpinLocked(pin);
+    }
+    return true;
+  }
+
+  // PEER path: dual-slot Launch+Finish (slot 0). Pipeline uses Launch/Finish directly.
+  if (!LaunchGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0, expert_dev, x_compute, fp8_gu,
+                                             s_gu, fp8_dn, s_dn, M, I, H))
+    return false;
+  return FinishGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0, y_compute, M, H);
+}
+
+bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int expert_dev,
+                                           const void* x_compute, const void* fp8_gu,
+                                           const void* s_gu, const void* fp8_dn, const void* s_dn,

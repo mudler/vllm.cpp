@@ -104,7 +104,11 @@ ran a Triton kernel. See
 [`lease-runtime-staging.md`](lease-runtime-staging.md)
 ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)), which also states what
 that result does not establish: it is `thor:gpu0` at capability (11,0) only, the
-GB10 is `sm_121a` and UNMEASURED, and the pinned vLLM oracle is not staged.
+GB10 is `sm_121a` and UNMEASURED, and the pinned vLLM oracle is not in that tree.
+The oracle itself was then built inside a lease on `dgx:gpu0`, on 2026-08-18
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+[`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). A model run is still
+untested.
 
 ## The correction has to reach the spec that owns the blocker
 
@@ -126,8 +130,18 @@ reason is that nothing has staged a runtime on the NAS.
 
 **The UNMEASURED clause in that form was answered on the same day, and both sites
 were corrected again.** A relocated runtime does start inside a worker, on
-`thor:gpu0`. What is still not staged is the ORACLE. See
-[`lease-runtime-staging.md`](lease-runtime-staging.md) and #1146.
+`thor:gpu0`. See [`lease-runtime-staging.md`](lease-runtime-staging.md) and
+#1146.
+
+**The ORACLE clause was answered the next day, and both sites were corrected a
+third time.** On 2026-08-18 a lease on `dgx:gpu0` BUILT the pinned oracle from
+source against a staged CUDA toolkit, and the installed wheel imports and
+reports `cuda True NVIDIA GB10`
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+[`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). The correction that
+reaches the blocked rows is the exact one: they are unblocked for the BUILD step
+and still blocked for a MODEL RUN. A reader who rounds that to "unblocked"
+schedules a measurement that cannot be taken.
 
 The same substitution repairs the derivation in the how-to. The old sentence
 read "no host toolchain, the worker has no compiler, SO no lease-compliant
@@ -184,12 +198,16 @@ is the row gate.
 
 ## Owed
 
-- #1129 is now closed, and its recorded cause was falsified on 2026-08-17. No
-  vLLM leg runs on `dgx.casa` by a lease-compliant path today, because nothing
-  has staged the ORACLE on the NAS. The "UNMEASURED" clause this line used to
-  carry is answered: a relocated CUDA runtime does start inside a worker, on
-  `thor:gpu0` and not yet on `dgx:gpu0`. `ENV-LEASE-RUNTIME-STAGING` and
-  [#1146](https://github.com/mudler/vllm.cpp/issues/1146) own the rest.
+- #1129 is now closed, and its recorded cause was falsified on 2026-08-17. The
+  "UNMEASURED" clause this line used to carry is answered: a relocated CUDA
+  runtime does start inside a worker, on `thor:gpu0`. The follow-on claim that
+  nothing has staged the ORACLE is answered too, on 2026-08-18 and on
+  `dgx:gpu0`, where a lease built the pin and imported it
+  ([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+  [`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). What is still owed is
+  a MODEL RUN inside a lease. `ENV-LEASE-RUNTIME-STAGING` with
+  [#1146](https://github.com/mudler/vllm.cpp/issues/1146), and
+  `ENV-ORACLE-WHEEL-IN-LEASE` with #1185, own the rest.
 
 ## Now
 
@@ -199,5 +217,8 @@ devices. The narrowing of #1129 now reads the same way in
 `.agents/environment.md` and in `.agents/specs/mtp-k-gt-1.md`, so the blocked
 row's owner is told that staging is untried rather than futile. Staging was then
 tried, and it worked on `thor:gpu0`
-([`lease-runtime-staging.md`](lease-runtime-staging.md), #1146). The next step is
-the same probe on `dgx:gpu0`, and after it the pinned oracle itself.
+([`lease-runtime-staging.md`](lease-runtime-staging.md), #1146). The pinned
+oracle itself was then built inside a lease on `dgx:gpu0`
+([`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md), #1185), so the blocked
+rows are unblocked for the build step and still blocked for a model run. The
+next step is a model run.

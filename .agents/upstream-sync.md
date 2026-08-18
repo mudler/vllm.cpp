@@ -42,6 +42,19 @@ from a release number. If a future pin is genuinely a released wheel, give the
 commit its own asserted field first; do not delete the assertion to make the
 block parse.
 
+**One measured source build does NOT match the full `vllm_runtime_version`
+string, and the discrepancy is OPEN.** A build of this pin inside an `rc` lease
+on `dgx:gpu0`, 2026-08-18, reports `vllm.__version__ = 0.1.dev1+g555967922`
+against the `0.23.1rc1.dev1511+g555967922` recorded above
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+[`specs/oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md)). The binding
+constraint holds, because the `+g<sha>` segment names `vllm_commit`. The cause of
+the prefix difference is the shallow fetch that build used: `setuptools_scm`
+cannot count the commits since the last tag and falls back to a default. A gate
+that compares the FULL string needs either a deeper fetch or an explicit
+pretend-version carrying that reason. Do NOT edit the block above to match a
+build. The block records the pin, and a shallow clone is a property of one job.
+
 **vLLM-Omni's pin does NOT live here.** It is a separate repository, and under
 AGENTS.md §"When vLLM has no implementation" every oracle carries its own file:
 [`.agents/oracles/vllm-omni.md`](oracles/vllm-omni.md), whose `oracle-pin` block

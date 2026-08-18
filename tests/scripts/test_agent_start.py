@@ -232,6 +232,42 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn(secret, unreadable + missing)
 
 
+    def test_unresolved_environment_routes_to_ask_and_record(self):
+        """Issue #1190. Status alone left the session with no next action.
+
+        `environment: missing` was printed and nothing told the agent what to
+        do about it, so the fallback in practice was a host name copied from a
+        document. The route must send the agent to ASK and then RECORD.
+        """
+        for status in ("missing", "incomplete", "unreadable"):
+            for route in (
+                state(env=status, env_missing=["VLLM_ORACLE"]),
+                state(env=status, env_missing=["VLLM_ORACLE"], role="operator",
+                      reason="declared"),
+            ):
+                with self.subTest(status=status, role=route["role"]):
+                    out = self.start.render_route(route, None, None, False)
+                    self.assertIn("NO ENVIRONMENT", out)
+                    self.assertIn(f".env is {status}", out)
+                    self.assertIn("ask the developer", out.lower())
+                    self.assertIn(
+                        "scripts/agent-onboard.py --env-set KEY=VALUE", out
+                    )
+                    self.assertIn("never infer", out.lower())
+                    # The unset key names are the caller's own state and can
+                    # carry a secret, so the ask names none of them.
+                    self.assertNotIn("VLLM_ORACLE", out)
+                    self.assertTrue(out.isascii())
+                    self.assertLessEqual(max(map(len, out.splitlines())), 72)
+
+    def test_resolved_environment_adds_no_ask_route(self):
+        # The other side of the key: a hardcoded block would tell a session
+        # with a complete .env to go and ask for a value it already has.
+        out = self.render(state(env="present"))
+        self.assertNotIn("NO ENVIRONMENT", out)
+        self.assertNotIn("--env-set", out)
+
+
 class MainTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,9 +1,9 @@
 // ENG-EXPERT-STREAM, issue #1123. See the header for what this decides and why.
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 
-#include <cerrno>
-#include <cstdlib>
 #include <string>
+
+#include "vllm/config/weight_residency.h"
 
 namespace vllm {
 namespace {
@@ -49,23 +49,20 @@ GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
 }
 
 size_t DeviceWeightBudgetBytes(size_t device_memory_total_bytes) {
-  const char* override_env = std::getenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
-  // A malformed value is IGNORED, never read as 0. Reading it as 0 would
-  // silently disable the guard on a typo, which is the invisible-fallback shape
-  // this tree refuses elsewhere. `strtoull` alone is not enough for that: it
-  // skips leading whitespace, and it ACCEPTS a leading '-' and wraps it to
-  // ULLONG_MAX, so "-1" would parse as an effectively infinite budget. The
-  // accepted grammar is therefore explicit: one or more decimal digits, nothing
-  // else, no sign and no space.
-  if (override_env != nullptr && override_env[0] >= '0' &&
-      override_env[0] <= '9') {
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed =  // NOLINT(runtime/int) strtoull's type
-        std::strtoull(override_env, &end, 10);
-    if (*end == '\0' && errno == 0) return static_cast<size_t>(parsed);
-  }
-  return device_memory_total_bytes;
+  // THE PRECEDENCE LIVES IN ONE PLACE, and since #1127 that place is
+  // `vllm/config/weight_residency.h`: `VT_DEVICE_WEIGHT_BUDGET_BYTES` >
+  // `vllm_cpp.device_fit.weight_budget_bytes` > this probe. The environment
+  // grammar is unchanged — decimal digits only, so a malformed value is IGNORED
+  // rather than read as 0, which would silently disable the guard on a typo —
+  // and what it now falls through to is the config rather than straight to the
+  // probe. A run with no config therefore resolves byte-for-byte as it did
+  // before the key existed.
+  //
+  // This function keeps its name and its callers. Moving the rule rather than
+  // the entry point is what lets `ResolveDeviceWeightBudgetBytes` be the SOLE
+  // reader of the variable, which is the contract every knob in that header has
+  // and the reason `DescribeEnvOverrides` cannot drift from the resolver.
+  return ResolveDeviceWeightBudgetBytes(device_memory_total_bytes);
 }
 
 DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
@@ -109,7 +106,9 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
       "checkpoint that fits the pool. This is refused at LOAD on purpose: "
       "before this check the load succeeded and the FIRST forward died with "
       "'vt cuda: cudaMalloc: out of memory'. Setting "
-      "VT_DEVICE_WEIGHT_BUDGET_BYTES higher (or to 0) suppresses this refusal "
+      "VT_DEVICE_WEIGHT_BUDGET_BYTES higher (or to 0), or "
+      "--offload-config '{\"vllm_cpp\":{\"device_fit\":"
+      "{\"weight_budget_bytes\":0}}}', suppresses this refusal "
       "and restores that late failure; it does not make the model fit.";
   return fit;
 }

@@ -2382,3 +2382,15 @@ endif()
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. The test is SKIPPED when examples are not built, so this guard
+# is the only thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
+endif()

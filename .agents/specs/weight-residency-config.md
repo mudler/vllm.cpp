@@ -83,7 +83,7 @@ Three findings shape the change:
 |---|---|
 | Row ID | `ENG-RESIDENCY-CONFIG` (engine-matrix, KV cache and memory). Issue [#1110](https://github.com/mudler/vllm.cpp/issues/1110); fixes [#1109](https://github.com/mudler/vllm.cpp/issues/1109) in flow |
 | In | W2 adds the sixth knob and the three unreached entry points; W1 is everything below it. A vllm.cpp-original `WeightResidencyConfig` under the `vllm_cpp` key of the existing `--offload-config` document; its parser, which refuses an unknown key at every level of the document (the four legal top-level keys included) and a wrong-typed or non-positive field; a process-global install/resolve seam with a defined config-vs-env precedence and a late-install refusal; the three call sites that resolve these knobs today (`GgufLoadPolicy::FromEnv` for `mmap`, `PrefaultBorrowedSpan` for `prefault`, `Qwen35ExpertStreamRequested` + the `Qwen35ExpertStream` constructor for the streaming lane); the flag→`EngineParams`→install chain through both production entry points (`server_main.cpp` and the C ABI's `offload_config`); `docs/USAGE.md` and `docs/ENVIRONMENT.md`. **W2** ([#1127](https://github.com/mudler/vllm.cpp/issues/1127), [#1135](https://github.com/mudler/vllm.cpp/issues/1135)): a sixth key, `vllm_cpp.device_fit.weight_budget_bytes`, which takes over `VT_DEVICE_WEIGHT_BUDGET_BYTES`'s middle tier at `DeviceWeightBudgetBytes`; and the `--offload-config` document reaching `vllm-cli` and the server's pooling path, with the transcription-only path refusing the flag by name instead of dropping it |
-| Out | Any change to `OffloadConfig`, `UVAOffloadConfig`, `PrefetchOffloadConfig` or their validator — the mirror stays byte-faithful. Any change to what the knobs *do*: this row moves where their value comes from and nothing else. A new flag NAME: W2 gives `vllm-cli` the `--offload-config` spelling the server already uses, and adds no second flag for either tier. `VT_MOE_EXPERT_STREAM_STATS_EVERY` (see below). Honouring a weight-residency document on the transcription-only server path, which has no loader to honour it with (see `## Owed`). The nine other engine flags the pooling path also drops (see `## Owed`). `VT_GGUF_KEEP_QUANT`, `VT_CPU_REF`, `VT_GGUF_KEEP_F16` and the rest of the load-transform family — they are a different tier and a different row |
+| Out | Any change to `OffloadConfig`, `UVAOffloadConfig`, `PrefetchOffloadConfig` or their validator — the mirror stays byte-faithful. Any change to what the knobs *do*: this row moves where their value comes from and nothing else. A new flag NAME: W2 gives `vllm-cli` the `--offload-config` spelling the server already uses, and adds no second flag for either tier. `VT_MOE_EXPERT_STREAM_STATS_EVERY` (see below). Honouring a weight-residency document on the transcription-only server path, which has no loader to honour it with (see `## Owed`). The six other `EngineParams` fields the pooling path also drops (see `## Owed`). `VT_GGUF_KEEP_QUANT`, `VT_CPU_REF`, `VT_GGUF_KEEP_F16` and the rest of the load-transform family — they are a different tier and a different row |
 | Supported modes | `{"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},"expert_stream":{"enabled":bool,"slots":int,"slot_bytes":int},"device_fit":{"weight_budget_bytes":int}}}`. Every field is optional and every absent field means "unchanged", so an absent `vllm_cpp` key is byte-identical to today. `slots` and `slot_bytes` must be positive; `weight_budget_bytes` must be non-negative, because `0` is the documented spelling of "suppress the device-fit refusal" |
 | Dispatch behavior | Resolved from **env var if set, else config if set, else the built-in default**, at each read. `mmap` and `prefault` are read per load and per span; `expert_stream` is cached on first read and the two sizes are fixed when the slot store is built; `weight_budget_bytes` is read once per GGUF load, at the fit check, and caches nothing. Nothing is resolved when neither input is set, so the default engine path is byte-identical |
 | Regimes served | A checkpoint larger than host RAM on a single box: the mmap-borrowed weight tower plus the bounded expert slot cache. CPU keep-quant expert towers today; a device platform serves the slice device-resident and is unaffected |
@@ -398,7 +398,7 @@ argument block and `weight_residency.cpp`'s parser at the same time.
 |---|---|
 | W2a | `device_fit.weight_budget_bytes` ([#1127](https://github.com/mudler/vllm.cpp/issues/1127)): the parser key, the merge, the announce line, `ResolveDeviceWeightBudgetBytes`, and `DeviceWeightBudgetBytes` delegating to it |
 | W2b | The three entry points ([#1135](https://github.com/mudler/vllm.cpp/issues/1135)): the server's offload parse hoisted ahead of the architecture branch, the pooling path taking both halves, the transcription-only path refusing the flag, and `vllm-cli` gaining `--offload-config` |
-| W2c | `docs/USAGE.md`, `docs/ENVIRONMENT.md`, and this spec |
+| W2c | `docs/USAGE.md`, `docs/ENVIRONMENT.md`, and this spec. Also [#1206](https://github.com/mudler/vllm.cpp/issues/1206) in flow: five `docs/USAGE.md` command lines named `./build/vllm-server` or `./build/vllm-cli`, and both binaries are built under `build/examples/` |
 
 ## Risks and decisions
 
@@ -517,6 +517,76 @@ argument block and `weight_residency.cpp`'s parser at the same time.
   hidden.
 
 ## Evidence
+
+### W2 (#1127, #1135)
+
+CPU host, documented recipe (`cmake -S . -B build -G Ninja`, no build type, so
+asserts are live), 20 cores, shared with three concurrent agent builds. Every
+build below reports its own exit status and an ENOSPC count, because
+`ld: final link failed: No space left on device` reads exactly like broken code
+and free disk moved between 42 GB and 7.3 GB during the run. **No build in this
+wave hit ENOSPC: the count is 0 on every one.**
+
+**Red first, for the budget key.** The field and `ResolveDeviceWeightBudgetBytes`
+were declared and the resolver stubbed to `return probed_total_bytes;`, then the
+suite was built (rc 0) and run: `test_weight_residency_config` rc **1**, 24 cases
+/ 17 passed / **7 failed**, 271 assertions / 15 failed. The seven are exactly the
+seven cases W2 adds. With the real implementation: rc **0**, 24 cases / 24 passed,
+315 assertions.
+
+**Red first, for the three entry points, is the M8/M10/M11 row of the mutation
+table.** Each of those deletes the assignment the wave adds, which is the state of
+the tree before the wave, and each turns its suite red.
+
+**The three `test_gguf_device_fit_reach` cases were written AFTER the resolver, so
+their red is M7 rather than a pre-implementation run.** M7 restores
+`DeviceWeightBudgetBytes`'s pre-#1127 body — the environment grammar and the probe,
+with no config tier — and the suite goes red with 8 cases. Recorded as the weaker
+order it was, not as a red-first run it was not.
+
+**Mutations.** Twelve, each applied alone from a pristine byte copy, with the
+file's sha256 printed before and after so a never-applied edit cannot read as a
+pass, the build's exit status printed beside every result so a non-building
+mutation is INVALID rather than a pass, a NON-ZERO doctest case count required, the
+LAST `test cases:` line taken, and the tree restored by byte copy with the sha256
+compared against the pre-mutation value. All twelve built (rc 0) and all twelve
+were killed.
+
+| id | what it breaks | suite | rc | cases |
+|---|---|---|---|---|
+| M1 | `device_fit` drops out of the `vllm_cpp` enumeration | `test_weight_residency_config` | 1 | 24 |
+| M2 | the parsed budget is never stored on the config | `test_weight_residency_config` | 1 | 24 |
+| M3 | `ExtNonNegativeInt` refuses zero, losing the suppression spelling | `test_weight_residency_config` | 1 | 24 |
+| M4 | the config beats the environment, inverting the precedence | `test_weight_residency_config`, `test_gguf_device_fit_reach` | 1, 1 | 24, 8 |
+| M5 | the merge assigns wholesale, so an absent budget CLEARS the installed one | `test_weight_residency_config` | 1 | 24 |
+| M6 | the override note reports PRESENCE, announcing a value the resolver ignores | `test_weight_residency_config` | 1 | 24 |
+| M7 | **the #1127 call site**: `DeviceWeightBudgetBytes` reverts to environment-only | `test_gguf_device_fit_reach` | 1 | 8 |
+| M8 | **the #1135 pooling call site**: `embed_params` drops both halves again | `test_serve_residency_config` | 1 | 11 |
+| M9 | the transcription-only refusal never fires | `test_serve_residency_config` | 1 | 11 |
+| M10 | **the #1135 `vllm-cli` call site**: the flag is parsed and never passed on | `test_cli_offload_config` | 1 | 4 |
+| M11 | the TEXT path drops the residency half of the hoisted parse | `test_serve_residency_config` | 1 | 11 |
+| M12 | **the reachability mutation**: `SetWeightResidencyConfig` is never called | `test_serve_residency_config`, `test_cli_offload_config`, `test_gguf_device_fit_reach` | 1, 1, 1 | 11, 4, 8 |
+
+**Focused suites, green, with case counts:** `test_weight_residency_config` 24,
+`test_gguf_device_fit` 8, `test_gguf_device_fit_reach` 8,
+`test_serve_residency_config` 11, `test_cli_offload_config` 4 — each rc 0.
+
+**Full gate.** `cmake --build build -j 6` rc 0, ENOSPC 0.
+`ctest --test-dir build -j 6` rc 0: **100% tests passed, 0 failed out of 516**,
+735.62 s, with `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e`
+skipped as they are on this host.
+
+**A doctest filter trap, recorded because it cost a reading.** Two W2 case names
+contain a comma, and `--test-case=` splits its argument on commas, so filtering to
+one of them ran 0 cases and printed `Status: SUCCESS!`. Every result above comes
+from running a whole binary and reading its case count, never from a filtered run.
+
+**Not measured, and not claimed.** This wave moves where a value comes from and
+which entry points carry a document. It changes no kernel, no dtype and no
+allocation, so it has no throughput axis, and the 370 GiB reproduction stays owed
+above.
+
+### W1 (#1110, #1109, #1122, #1133)
 
 CPU host, documented recipe (`cmake -S . -B build -G Ninja`, no build type, so
 asserts are live), 20 cores. Executables are linked with `-Wl,-s`; that strips
@@ -811,12 +881,16 @@ count from the last `test cases:` match.
   rather than being dropped in silence. Owned by
   `ARCH-ONE-SURFACE`, issue
   [#1195](https://github.com/mudler/vllm.cpp/issues/1195).
-- **The pooling path builds `EngineParams` from 8 of the server's engine
-  flags.** W2 adds `offload_config` and `weight_residency` to it, because those
-  two are #1135's subject. The same block still drops `--device`,
+- **The pooling path drops six of the server's `EngineParams` fields.** W2 adds
+  `offload_config` and `weight_residency` to that block, because those two are
+  #1135's subject; it built eight fields before and builds ten now. The same
+  block still drops `device`, `policy`, `kv_transfer_config`,
+  `speculative_config`, `enable_jump_forward` and `multimodal`, so the flags
+  behind them — `--device`,
   `--scheduling-policy`, `--kv-transfer-config`, `--speculative-config`,
-  `--enable-jump-forward` and the multimodal limits, so `vllm-server --device
-  cuda` on an embedding model runs the accelerator-first probe instead of the
+  `--enable-jump-forward` / `--disable-jump-forward` and the multimodal limits —
+  are accepted and honoured by nothing. `vllm-server --device cuda` on an
+  embedding model therefore runs the accelerator-first probe instead of the
   named device. That is the same shape as #1135 over a wider set of flags, it
   predates this row, and the pooling dispatch block is `ARCH-ONE-SURFACE ROW 6`'s
   surface rather than this row's. Owned by `SERVE-POOLING-ENDPOINTS`, issue

@@ -491,6 +491,8 @@ const char* OpNameImpl(OpId op) {
       return "AttentionRelPos";
     case OpId::kQuantFp8Group:
       return "QuantFp8Group";
+    case OpId::kMatmulFp8BlockScaled:
+      return "MatmulFp8BlockScaled";
     case OpId::kCount:
       break;
   }

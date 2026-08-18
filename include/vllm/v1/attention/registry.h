@@ -85,6 +85,21 @@ std::unique_ptr<AttentionBackend> SelectAttentionBackend(
     const platforms::Platform& platform, const std::string& selected = "",
     const platforms::AttnSelectorConfig& cfg = platforms::AttnSelectorConfig{});
 
+// The runner's per-KV-group layout contract (M3, issue #41): the backend that
+// selection resolved must declare EXACTLY the view geometry the engine
+// allocates for one attention group — the NHD 5-dim
+// (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group, or
+// the fused MLA 3-dim (num_blocks, block_size, head_size) for an MLA group
+// (mla_attention.py:1216-1224; deepseek_v2.cpp views the cache exactly so) —
+// or the engine would silently view a cache the backend does not claim to own.
+// Throws std::invalid_argument on mismatch (and on the backend's own
+// precondition violations, e.g. block_size % 16), so a future backend with a
+// different layout fails LOUDLY at runner init instead of mis-viewing.
+// `is_mla` selects which view is expected.
+void CheckKvCacheShape(vt::DeviceType device, const std::string& name,
+                       int64_t num_blocks, int64_t block_size,
+                       int64_t num_kv_heads, int64_t head_size, bool is_mla);
+
 // Static-init self-registration helper (copies the vt-op / platform Registrar
 // idiom). Declare one file-scope instance per (device, backend) in the backend's
 // own TU: `const AttentionBackendRegistrar kReg{DeviceType::kCUDA, "FLASH_ATTN",

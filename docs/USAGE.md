@@ -22,6 +22,22 @@ example targets are named after the directories they are built from, so an
 in-source build makes the linker write each executable over its own source
 directory (issue #85).
 
+### Host compilers
+
+gcc 13 and 14 and clang are exercised by CI, and **gcc 16 builds the tree,
+including the OpenAI server**. Before this it did not: several files, one of
+them the server's own `main`, called `getpid()` without including `<unistd.h>`
+and compiled only because an older libstdc++ happened to pull that header in
+for them. A compile-only CI lane on the newest released gcc now guards this,
+because every other Linux lane uses the distro compiler and cannot see it.
+
+On gcc 16 the `array-bounds` warning is reported but is **not** treated as an
+error, unlike on every earlier gcc. That release emits it inside libstdc++ and
+the vendored JSON library for code that is correct, and no change to the
+calling code avoids it (`cmake/CompilerWarnings.cmake` explains the mechanism
+and cites the upstream gcc bug). A genuine out-of-bounds still fails the build
+on gcc 15 and earlier, which is what the rest of CI enforces.
+
 ### Setting the compiled build identity
 
 `vllm-server --version` reports the CMake project version by default. Release
@@ -2252,7 +2268,7 @@ a stop token early.
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
-| `--block-size N` | `32` | KV block size |
+| `--block-size N` | `32` | KV block size. **Must be a multiple of 16** — the attention backends' `get_kv_cache_shape` refuses anything else, and the server now rejects it at startup rather than throwing during engine init |
 | `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |
 | `--kv-cache-memory BYTES` | `0` (unset) | Absolute KV-pool size in bytes, vLLM's `kv_cache_memory_bytes`. The block count is this budget divided by the model's own bytes per block, summed across its KV groups, so it is correct on MLA and heterogeneous-KV architectures too. It ignores `--gpu-memory-utilization`, as vLLM does. A budget smaller than one KV block is refused at startup |
 | `--gpu-memory-utilization F` | `0.92` | **Accepted, and it does not size anything yet.** See [What `--gpu-memory-utilization` does not do yet](#what---gpu-memory-utilization-does-not-do-yet) |
@@ -4117,6 +4133,42 @@ parser refuses it at startup.
 on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
 honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 (125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
+## Turning CUDA graph capture off, including the break seam
+
+`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It always did for the six
+batched decode drivers that each read it, and as of `ENG-CUDAGRAPH-BREAK` W1
+(#1192) it is also the switch the shared break-point seam reads, once per
+process, into a function-local static — so a process is in exactly one lane for
+its whole life and nothing can toggle it mid-run.
+
+With capture off, or on a backend that reports no capture support (Vulkan,
+Metal, and the CPU backend), a `vt::GraphCaptureScope` is INERT: it captures
+nothing, every `vt::GraphBreak` inside it calls its function and returns, and
+the forward runs eager exactly as before. That path is byte-identical to the
+non-capturing forward and makes zero backend calls, which is what makes each
+migration stage reversible.
+
+Nothing about this is new configuration to learn: there is no new flag, no new
+config key and no new command. The seam is a library surface
+(`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
+attention entry of `Qwen3ForCausalLM`. No production step opens a capture scope
+yet — that arrives when the decode drivers migrate onto the seam — so today the
+switch changes nothing about the break point beyond what it already changed
+about the decode graphs.
+
+Building it needs no option. `src/vt/breakable_graph.cpp` is part of the core
+`vllm` library on every platform, because the seam is backend-agnostic and asks
+nothing new of any backend.
+
+The switch is GATED, and it is gated in a child process, because it is read once
+per process into a function-local static and no test in a running process can
+toggle it. `tests/vt/test_breakable_graph.cpp` re-executes itself with
+`VLLM_CPP_CUDAGRAPH=0` and requires the inert behaviour on a backend that CAN
+capture — the arm that proves the switch itself is what turns capture off, rather
+than the backend's own lack of support. Asserting the backend arm instead
+substitutes a different condition, and dropping the switch from the seam left the
+whole suite green.
 
 ## SSE keepalives on long prefill
 

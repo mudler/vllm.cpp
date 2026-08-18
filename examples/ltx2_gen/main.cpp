@@ -101,7 +101,8 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--lora <ic-lora.safetensors> [STRENGTH]]  fused at load; 1.0\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
-      "                [--first-frame <image.ppm>] [--image-crf 0]\n"
+      "                [--first-frame <image.ppm>] [--last-frame <image.ppm>]\n"
+      "                [--image-crf 0]\n"
       "                [--audio-path <in.wav>] [--audio-start-time S]\n"
       "                [--audio-max-duration S]\n"
       "                [--device cpu|cuda]\n\n"
@@ -135,7 +136,12 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "round trip needs libx264 and none is vendored here, so leaving --image-crf out\n"
       "resolves 18 and REFUSES by name. --image-crf 0 is upstream-legal and OUT OF\n"
       "DISTRIBUTION: the model sees pixels it was not trained on. That is a quality\n"
-      "cost, and this tool states it rather than turning it on quietly.\n\n"
+      "cost, and this tool states it rather than turning it on quietly.\n"
+      "--last-frame takes a second PPM and pins the CLOSING frame. It is a KEYFRAME\n"
+      "rather than a replacement: its tokens are APPENDED to the sequence, carrying\n"
+      "the temporal position of pixel frame N-1, and are trimmed off again before the\n"
+      "clip is decoded. Both slots share one --image-crf and one strength, and a\n"
+      "keyframe at an INTERIOR frame is not requestable (#1187).\n\n"
       "AUDIO-TO-VIDEO. --audio-path takes a 16-bit PCM WAV and CONDITIONS the render\n"
       "on it: the take is decoded, encoded through the audio VAE\'s encoder, truncated\n"
       "to the clip\'s duration, and then held FROZEN through every denoise phase, so\n"
@@ -221,7 +227,19 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "divide 64, since stage 1 halves them. Upstream runs this on the FULL\n"
       "(non-distilled) transformer; pointing it at a distilled checkpoint renders a\n"
       "plausible clip on a trajectory those weights were never trained for, and\n"
-      "nothing in the output says so.\n");
+      "nothing in the output says so.\n\n"
+      "KEYFRAME INTERPOLATION generates the motion BETWEEN keyframes you pin.\n"
+      "--pipeline-kind keyframe_interpolation selects it. Its two stages are the\n"
+      "ti2vid_two_stage ones -- guided half-res stage 1 on the UNADAPTED model, then a\n"
+      "distilled three-sigma refinement -- and it needs the same --lora and\n"
+      "--upsampler for the same reasons. TWO fields differ and both of them render\n"
+      "either way. First, --first-frame is a KEYFRAME here rather than a frame that\n"
+      "overwrites the opening latent: upstream drops the frame-0 special case, so the\n"
+      "image is appended as guidance the model interpolates FROM instead of replacing\n"
+      "what it would otherwise generate. Second, the audio.wav you get back is STAGE\n"
+      "2\'s, not stage 1\'s as on ti2vid_two_stage. Use --first-frame and --last-frame\n"
+      "together to pin both ends of the clip; a keyframe at an INTERIOR frame is not\n"
+      "requestable yet.\n");
   std::exit(code);
 }
 
@@ -233,7 +251,7 @@ int main(int argc, char** argv) {
   std::string workdir = "/tmp/ltx2_gen", out_path, ffmpeg = "ffmpeg", device = "cuda";
   // BORROWED by `vllm_video_generate`, like the extras below, so it is owned
   // here and pointed at only after parsing.
-  std::string prompt, first_frame, image_crf;
+  std::string prompt, first_frame, last_frame, image_crf;
   std::string audio_path, audio_start_time, audio_max_duration;
   // RETAKE (row LTX25-RETAKE, #924): a source clip DIRECTORY and the window to
   // regenerate. `--ref-video` is a directory of frame_%06d.ppm, not a container.
@@ -319,6 +337,15 @@ int main(int argc, char** argv) {
     // own 18 and refuse, which is the point: this CLI must not be the thing that
     // quietly turns an out-of-distribution render on.
     else if (f == "--first-frame") first_frame = Need(argc, argv, ++i, "--first-frame");
+    // `--last-frame` pins the CLOSING keyframe, at pixel frame `frames - 1`. The
+    // ABI has carried `last_frame` and the engine has served it since row
+    // LTX25-TOKEN-APPEND (#930); this CLI simply never read the field, which
+    // #1191 records. It matters from `keyframe_interpolation` on, because a
+    // pipeline whose whole job is the motion BETWEEN two pinned frames could
+    // otherwise only be asked for one of them. Same `--image-crf` and the same
+    // strength as the first frame, because the request surface carries one of
+    // each (#1187).
+    else if (f == "--last-frame") last_frame = Need(argc, argv, ++i, "--last-frame");
     else if (f == "--image-crf") image_crf = Need(argc, argv, ++i, "--image-crf");
     // AUDIO-TO-VIDEO (#922). Upstream's `--audio-path` is REQUIRED because that
     // CLI drives the A2V pipeline and nothing else (a2vid_two_stage.py:312-317);
@@ -399,6 +426,7 @@ int main(int argc, char** argv) {
   vp.output_dir = workdir.c_str();
   if (!prompt.empty()) vp.prompt = prompt.c_str();
   if (!first_frame.empty()) vp.first_frame = first_frame.c_str();
+  if (!last_frame.empty()) vp.last_frame = last_frame.c_str();
   if (!ref_video.empty()) vp.ref_video = ref_video.c_str();
 
   // The PER-GENERATION extras are a SEPARATE array from the load-time ones, and

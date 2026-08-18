@@ -3229,11 +3229,49 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     if (wants_first_frame) {
       const Ltx2LatentVolume encoded = encode_conditioning_image("first_frame", image_bytes);
 
-      // `frame_idx == 0` -> `VideoConditionByLatentIndex` (helpers.py:295-300).
-      // It REPLACES tokens that already exist and the token count never changes.
+      // WHICH ITEM FRAME 0 TAKES IS THE RECIPE'S TO SAY, and it is the ONE line
+      // on which upstream's two image-conditioning builders differ (row
+      // LTX25-KEYFRAME-INTERP, #1096):
+      //
+      //   combined_image_conditionings (helpers.py:295-300)
+      //       frame_idx == 0 -> VideoConditionByLatentIndex. REPLACES tokens
+      //       that already exist; the token count never changes.
+      //   image_conditionings_by_adding_guiding_latent (helpers.py:343-367)
+      //       NO branch. Frame 0 takes VideoConditionByKeyframeIndex like every
+      //       other frame, and APPENDS a latent frame of tokens.
+      //
+      // A `pipeline_kind` string test here would be one more place for the next
+      // recipe on the second builder to be missed, so the flag rides the recipe
+      // — see `Ltx2ImageConditioningBuilder`.
+      //
+      // NOTHING ABOUT THE RENDER'S SHAPE CAN SEE THIS. Both arms condition on
+      // the same image and both return a clip of the right size, the right frame
+      // count and the right sample rate; the only observable is the sequence
+      // LENGTH the DiT ran over, which is `im.trace.video_tokens`.
+      const bool frame0_appends =
+          recipe.image_conditioning == Ltx2ImageConditioningBuilder::kAddGuidingLatent;
+      // The sequence length BEFORE this item, so the digest below can be taken
+      // from the tokens the append actually grew. On the replace arm it is also
+      // the length after, which the assertion under `frame0_appends` states.
+      const int64_t before_first_frame = video.tokens;
+
       Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
-      Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
-                                      /*latent_idx=*/0);
+      if (frame0_appends) {
+        // `frame_idx = 0` is not a formality: `VideoConditionByKeyframeIndex`
+        // offsets its positions by `frame_idx` (keyframe_cond.py:52) and gates
+        // the causal fix on `frame_idx == 0` (`:49`,
+        // `latent_tools.causal_fix if self.frame_idx == 0 else False`). Passing
+        // `causal_fix = true` here is therefore the one combination in which the
+        // fix APPLIES, which is upstream's for this item; `Ltx2ConditionVideo-
+        // ByKeyframe` mirrors that gate itself, so passing false would silently
+        // drop it rather than being refused.
+        Ltx2ConditionVideoByKeyframe(&state, encoded, /*patch_size=*/1, factors, fps,
+                                     /*frame_idx=*/0, image_strength,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+      } else {
+        Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
+                                        /*latent_idx=*/0);
+      }
       FromLatentState(state, &video);
 
       // The witness, taken from the TOKENS THAT WERE WRITTEN rather than from
@@ -3254,12 +3292,41 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const int64_t placed = Ltx2VideoTokenCount({1, vshape.channels, 1, vshape.height,
                                                   vshape.width},
                                                  1);
+      // AND WHERE THEY LANDED DEPENDS ON THE ARM. The replace arm writes latent
+      // frame 0, which is the FRONT of the clean tensor; the append arm writes
+      // the tokens it just added, which are the TAIL. Reading the front on the
+      // append arm would digest unconditioned tokens and report a healthy
+      // conditioning for a state the keyframe never reached — exactly the
+      // failure the paragraph above says this field exists to prevent.
+      const ptrdiff_t first = frame0_appends
+                                  ? static_cast<ptrdiff_t>(before_first_frame * video.width)
+                                  : 0;
       const std::vector<float> written(
-          video.clean.begin(),
-          video.clean.begin() + static_cast<ptrdiff_t>(placed * video.width));
+          video.clean.begin() + first,
+          video.clean.begin() + first + static_cast<ptrdiff_t>(placed * video.width));
       im.trace.image_tokens = placed;
       im.trace.image_digest = DigestF32(written);
       im.trace.image_absmax = AbsMax(written);
+
+      // THE ARM DID WHAT ITS NAME SAYS. Asserted rather than assumed for the
+      // reason the last-frame arm below asserts the same thing: a build whose
+      // append did not grow the sequence leaves buffers longer than the count
+      // that describes them, and the DiT then reads a prefix, renders a
+      // plausible clip and never mentions the keyframe. The replace polarity is
+      // asserted too, because the two arms share one digest slice above and that
+      // slice is only correct while each arm moves the count the way this says.
+      if (frame0_appends) {
+        VT_CHECK(video.tokens == before_first_frame + placed,
+                 "ltx2 video: this recipe takes `image_conditionings_by_adding_guiding_latent` "
+                 "(ltx-pipelines/utils/helpers.py:343-367), whose frame-0 item APPENDS "
+                 "(keyframe_cond.py:79-82), and the sequence did not grow by one latent frame "
+                 "of tokens");
+      } else {
+        VT_CHECK(video.tokens == before_first_frame,
+                 "ltx2 video: `combined_image_conditionings` sends frame 0 to "
+                 "`VideoConditionByLatentIndex` (helpers.py:295-300), which REPLACES tokens that "
+                 "already exist (latent_cond.py:38-39), so the sequence length must not move");
+      }
     }
 
     // ── the LAST-frame keyframe (row LTX25-TOKEN-APPEND, issue #930) ────────

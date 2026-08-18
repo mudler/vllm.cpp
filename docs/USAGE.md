@@ -3367,7 +3367,7 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Twenty-four**
+schedule or guidance scale renders a video instead of failing. **Twenty-eight**
 pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 
 | `pipeline_kind` | resolving `model_version` | what it also needs |
@@ -3381,6 +3381,7 @@ pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 | `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
 | `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
 | `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
+| `keyframe_interpolation` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3587,6 +3588,82 @@ All three knobs this arm needs are LOAD extras, so a server supplies them with
 of `/v1/videos`. That is a statement about the request surface: the gated path
 is `vllm_video_engine_load` plus `vllm_video_generate`, which is what `ltx2-gen`
 drives, and no test here exercises the HTTP route end to end.
+
+### `keyframe_interpolation`: generating the motion between pinned frames
+
+`KeyframeInterpolationPipeline` — you supply the keyframes, the model generates
+what happens between them. Its two stages are `ti2vid_two_stage`'s: a guided
+half-resolution stage 1 on the **unadapted** model, then a 2x latent upsample and
+a distilled three-sigma refinement. It needs the same `--lora-path` and
+`--upsampler-path`, for the same reasons.
+
+```sh
+ltx2-gen \
+  --pipeline-kind keyframe_interpolation \
+  --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
+  --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
+  --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
+  --prompt 'the balloon drifts from the left ridge to the right one' \
+  --first-frame open.ppm --last-frame close.ppm --image-crf 0 \
+  --height 704 --width 1216 --num-frames 121 --steps 30 \
+  --output-dir out/
+```
+
+**Two fields separate it from `ti2vid_two_stage`, and both render either way.**
+
+**The first frame is a KEYFRAME, not a replacement.** Every other pipeline maps a
+conditioning image at frame 0 onto a latent-index item, which overwrites the
+tokens of latent frame 0 in place. This one drops that special case: the image is
+appended as keyframe guidance the model interpolates *from*, and the sequence the
+transformer runs over grows by one latent frame. Nothing about a rendered clip
+shows which mapping was used — both return the right size, the right frame count
+and the right sample rate with the image visibly present — so the difference is
+gated on the token count the transformer actually ran over.
+
+**The soundtrack that leaves is stage 2's**, where `ti2vid_two_stage` keeps stage
+1's and discards its refinement stage's audio. Upstream says so by what it binds
+rather than in a comment, and the two pipelines bind opposite ways.
+
+Everything else is shared. `--lora-path` is **required** and the load is refused
+without it: upstream makes the distilled adapter a positional, non-defaulted
+constructor argument as well as a required flag, and the adapter rides **stage 2
+alone** while stage 1 runs the base weights. There is no `--audio-path`; the
+soundtrack is generated. Height and width describe the FINAL output and must
+divide 64, because stage 1 halves them. Its stage-1 sigma shift is fitted on the
+scheduler's fixed 4096-token anchor rather than on the target latent grid, which
+is what upstream's `execute(steps=...)` with no latent resolves to.
+
+**`--last-frame` is new with this kind** and works on every pipeline that takes
+images: the ABI and the engine have served a closing keyframe since
+[#930](https://github.com/mudler/vllm.cpp/issues/930), and `ltx2-gen` had never
+read the field ([#1191](https://github.com/mudler/vllm.cpp/issues/1191)). Both
+image slots share one `--image-crf` and one strength, and a keyframe at an
+**interior** frame is not requestable — upstream's `--image PATH FRAME_IDX
+STRENGTH [CRF]` is repeatable and this request surface carries two fixed slots
+([#1187](https://github.com/mudler/vllm.cpp/issues/1187)).
+
+**Which weights this was gated against: reduced CPU fixtures, and nothing else.**
+Upstream runs this pipeline on the FULL model
+(`ltx-2.5-22b-dev-transformer-bf16.safetensors`, 42,018,190,584 bytes, 4349
+tensors, 21.004 B parameters, pure BF16, `model_version` `2.5.0`), which is on
+the NAS and header-verified, and which `LTX25-BF16-DIT`
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)) made loadable. **What
+is owed is the run**: a comparison against upstream's own render on the same
+checkpoint, prompt and seed. Do **not** substitute a distilled transformer to try
+the arm out — the distilled scales are trained into those weights, so a
+CFG-guided stage 1 on top samples a trajectory they were never trained for and
+renders a plausible clip with nothing in its size, frame count, sample rate or
+errors to show it ([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
+
+All three knobs this arm needs are LOAD extras, so a server supplies them with
+`--video-extra pipeline_kind=keyframe_interpolation` and the same for
+`lora_path` and `upsampler_path`. Like `ti2vid_two_stage` and unlike
+`a2vid_two_stage` it needs no per-generation extra, so
+[#928](https://github.com/mudler/vllm.cpp/issues/928) does not stand in the way
+of `/v1/videos` — though `/v1/videos` forwards no image either, so a server
+render is unconditioned. That is a statement about the request surface: the gated
+path is `vllm_video_engine_load` plus `vllm_video_generate`, which is what
+`ltx2-gen` drives, and no test here exercises the HTTP route end to end.
 
 ### Retake: regenerating a time window of an existing clip
 

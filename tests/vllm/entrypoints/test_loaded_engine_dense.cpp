@@ -24,6 +24,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -242,6 +245,40 @@ SamplingParams Greedy(int max_tokens) {
   sp.output_kind = RequestOutputKind::kCumulative;
   return sp;
 }
+
+// FIX-GPU-MEM-UTIL-INERT (#1165): build ONE engine with std::cerr captured and
+// return what it wrote. Scope-guarded, mirroring test_async_llm.cpp:130-144 —
+// the restore must survive an exception out of the constructor, because two of
+// the cases below build engines that log other things (the auto-fit INFO line)
+// and a leaked rdbuf swap would silently redirect every later case.
+class CerrRedirect {
+ public:
+  explicit CerrRedirect(std::streambuf* target)
+      : previous_(std::cerr.rdbuf(target)) {}
+  ~CerrRedirect() { std::cerr.rdbuf(previous_); }
+  CerrRedirect(const CerrRedirect&) = delete;
+  CerrRedirect& operator=(const CerrRedirect&) = delete;
+
+ private:
+  std::streambuf* previous_;
+};
+
+// The engine is built INSIDE the capture and destroyed inside it too, so a
+// notice emitted from any part of construction is seen.
+std::string CerrOfEngineLoad(const HfConfig& c, const EngineParams& params) {
+  std::ostringstream captured;
+  {
+    CerrRedirect guard(captured.rdbuf());
+    LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+    std::cerr.flush();
+  }
+  return captured.str();
+}
+
+// The one substring that identifies the notice. Deliberately NOT the whole
+// message: the cases assert the individual facts separately, so a reworded
+// sentence fails on the fact it dropped rather than on all of them at once.
+constexpr const char* kInertNotice = "--gpu-memory-utilization";
 
 }  // namespace
 
@@ -645,4 +682,84 @@ TEST_CASE("loaded_engine: an over-long prompt is REFUSED, not left waiting") {
   CHECK_THROWS_AS(eng.engine().generate(long_prompt, Greedy(1), "toolong"),
                   vllm::v1::InputValidationError);
   CHECK_FALSE(eng.engine().has_unfinished_requests());
+}
+
+// ─── --gpu-memory-utilization must not be silently inert (#1165) ─────────────
+// The flag is parsed, threaded to both engines, carried on the C ABI and then
+// read by NOTHING: ResolveNumBlocks falls through to `return 256` under a
+// TODO(ROAD-V1-MEM M3). Implementing the utilization path is #83 and is
+// dgx-gated. What is gated HERE is only that the engine stops reporting
+// success for a budget it discarded.
+//
+// These cases enter through the LOADER, not through the resolver:
+// ResolveNumBlocks is private, and a test that called it would prove the
+// function works rather than that anything reaches it. The chain under test is
+// LoadedEngine ctor -> MakeKVCacheResolved -> ResolveNumBlocks
+// (model_loader.cpp:1081-1083,972).
+
+TEST_CASE(
+    "loaded_engine: an EXPLICIT --gpu-memory-utilization says it did not size "
+    "the KV pool") {
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.gpu_memory_utilization = 0.85;  // the flag a user actually types
+
+  const std::string logged = CerrOfEngineLoad(c, params);
+
+  // It fired at all.
+  REQUIRE(logged.find(kInertNotice) != std::string::npos);
+  // It names the value the caller chose, so a reader can tell WHICH knob is
+  // being reported when several are set.
+  CHECK(logged.find("0.85") != std::string::npos);
+  // It names what actually sized the pool instead.
+  CHECK(logged.find("256") != std::string::npos);
+  // It names the two flags that DO bind today, so the reader is left with an
+  // action rather than a complaint.
+  CHECK(logged.find("--kv-cache-memory") != std::string::npos);
+  CHECK(logged.find("--num-blocks") != std::string::npos);
+  // It names the row and the issue that own the real fix, so the notice cannot
+  // be mistaken for a permanent limitation.
+  CHECK(logged.find("ROAD-V1-MEM") != std::string::npos);
+  CHECK(logged.find("83") != std::string::npos);
+}
+
+TEST_CASE(
+    "loaded_engine: an UNSET --gpu-memory-utilization is silent") {
+  // The noise case, and the one that fails if the notice is made
+  // unconditional. A default nobody chose has nothing to warn about: the pool
+  // resolves to 256 blocks, which is exactly what the default documents.
+  const HfConfig c = MakeDenseConfig();
+  const EngineParams params;  // gpu_memory_utilization untouched
+
+  CHECK(CerrOfEngineLoad(c, params).find(kInertNotice) == std::string::npos);
+}
+
+TEST_CASE(
+    "loaded_engine: --gpu-memory-utilization beside --kv-cache-memory is "
+    "silent, because vLLM ignores the fraction there too") {
+  // cache.py:189 @ 555967922: kv_cache_memory_bytes IGNORES
+  // gpu_memory_utilization. A caller who set both gets vLLM's exact semantics,
+  // so there is no lie to report. This case fails if the notice is hoisted
+  // above ResolveNumBlocks' early returns.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.gpu_memory_utilization = 0.85;
+  // One block's worth of bytes for this model's own geometry, so knob 2
+  // resolves to a servable pool rather than throwing.
+  params.kv_cache_memory_bytes = 1LL << 30;
+
+  CHECK(CerrOfEngineLoad(c, params).find(kInertNotice) == std::string::npos);
+}
+
+TEST_CASE(
+    "loaded_engine: --gpu-memory-utilization beside a --num-blocks override is "
+    "silent") {
+  // Same argument at knob 1 (vLLM num_gpu_blocks_override): the override sized
+  // the pool, so the fraction was not the thing that got discarded.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.gpu_memory_utilization = 0.85;
+  params.num_blocks = 4;
+
+  CHECK(CerrOfEngineLoad(c, params).find(kInertNotice) == std::string::npos);
 }

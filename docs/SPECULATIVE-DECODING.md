@@ -24,6 +24,39 @@ the list of accepted ones (`src/vllm/config/speculative.cpp`).
 MTP and DFlash are the two with binding numbers behind them; the per-method
 detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
 
+## Which keys the JSON accepts
+
+The object is checked key by key and **nothing is dropped**. A name this engine
+cannot honour is refused at startup, by name, before a byte of weights is read.
+Until [#1160](https://github.com/mudler/vllm.cpp/issues/1160) an unrecognised key
+was silently discarded, so `"draft_sample_method":"probabilistic"` started a
+server that drafted greedily and reported nothing, and a typo such as
+`"num_speculatve_tokens"` quietly took the resolved default instead of the value
+that was typed.
+
+| Key | Accepted |
+|---|---|
+| `method` | `mtp`, `dflash`, `dspark`, `ngram`, `draft_model` |
+| `num_speculative_tokens` | a positive integer, or absent for the method's own default |
+| `model` | the draft checkpoint path or HF repo id |
+| `prompt_lookup_min`, `prompt_lookup_max` | an integer of at least 1, `ngram` only |
+| `draft_sample_method` | `greedy` only, which is upstream's default and what this engine does |
+| `rejection_sample_method` | `standard` only, which is upstream's default and what this engine does |
+
+There are two kinds of refusal, worded differently on purpose. A name vLLM's own
+`SpeculativeConfig` declares, such as `quantization` or `max_model_len`, is
+reported as a real vLLM field this engine does not implement. Any other name is
+reported as unknown, together with the list above, because that one is usually a
+typo. `draft_sample_method: probabilistic` and the `synthetic` and `block`
+acceptance variants name row `SPEC-ACCEPT-VARIANTS`, which owes them.
+
+The distinction matters beyond ergonomics. Draft sampling and verify are greedy
+here, so a dropped `probabilistic` produced a **deterministic** run when a sampled
+draft was asked for, and a deterministic run is adjudicable by the token-exact
+greedy gate while the configuration the user actually requested is not. A
+silently downgraded flag therefore lets a parity or benchmark number be taken
+under a configuration nobody chose.
+
 ## MTP
 
 - **Models:** the Qwen3.5 / 3.6 gate checkpoints that ship an `mtp.*` draft head

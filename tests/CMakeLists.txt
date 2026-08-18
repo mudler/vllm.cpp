@@ -1104,6 +1104,11 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
+# refused by name, and an upstream key this engine does not implement is refused
+# with the missing part named, instead of being silently dropped.
+vllm_cpp_add_test(test_speculative_unknown_keys
+  vllm/config/test_speculative_unknown_keys.cpp)
 # SPEC-MTP-K-GT-1 (#81): the MTP speculation-DEPTH config contract — the k=1
 # default, the upstream divisibility rule, and that a configured k above 1 is
 # carried rather than silently degraded.

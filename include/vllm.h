@@ -482,7 +482,20 @@ typedef struct vllm_model_params {
    * the non-KV footprint; that profile run is not implemented yet
    * (ROAD-V1-MEM M3), so until it lands a struct with both other knobs unset
    * still falls back to the historical 256-block default — the zero-initialized
-   * struct's behaviour is unchanged from pre-v16. */
+   * struct's behaviour is unchanged from pre-v16.
+   *
+   * Since #1165 that fallback is no longer SILENT: a value > 0.0 here, with
+   * num_blocks and kv_cache_memory_bytes both unset, prints one warning per
+   * vllm_engine_load naming the block count that resolved instead and the two
+   * knobs that do bind today. Accepting a fraction and sizing nothing without
+   * saying so left callers believing they had sized the pool.
+   *
+   * Note that vllm_model_params_default() pre-fills this field with 0.92, so a
+   * caller who never touched it is indistinguishable from one who chose 0.92
+   * and does get the warning. That is deliberate: on this ABI there is no
+   * "flag not typed" state, and a struct carrying 0.92 into an engine that
+   * ignores it is exactly the case the warning is for. To opt out, spell the
+   * unset sentinel: set the field to 0.0. */
   double gpu_memory_utilization;
   /* kv_cache_memory_bytes: an ABSOLUTE KV-pool size in bytes. When > 0 it sizes
    * the block count directly (num_blocks = kv_cache_memory_bytes / bytes-per-

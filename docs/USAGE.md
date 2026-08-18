@@ -248,7 +248,7 @@ build/examples/vllm-cli \
 | `--top-k K` | `0` | Top-k (`0` means all) |
 | `--seed S` | (unset) | RNG seed (enables seeded sampling) |
 | `--stream` | off | Stream token deltas to stdout |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. Every key is checked and none is dropped: an unknown or misspelled name is refused at startup by name, and a real vLLM key this engine does not implement is refused as such ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
@@ -2184,7 +2184,9 @@ a stop token early.
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
 | `--block-size N` | `32` | KV block size |
-| `--num-blocks N` | `256` | KV blocks |
+| `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |
+| `--kv-cache-memory BYTES` | `0` (unset) | Absolute KV-pool size in bytes, vLLM's `kv_cache_memory_bytes`. The block count is this budget divided by the model's own bytes per block, summed across its KV groups, so it is correct on MLA and heterogeneous-KV architectures too. It ignores `--gpu-memory-utilization`, as vLLM does. A budget smaller than one KV block is refused at startup |
+| `--gpu-memory-utilization F` | `0.92` | **Accepted, and it does not size anything yet.** See [What `--gpu-memory-utilization` does not do yet](#what---gpu-memory-utilization-does-not-do-yet) |
 | `--max-model-len N` | `0` (config default) | Max sequence length |
 | `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set. On a GDN/Mamba model under speculative decoding this also multiplies the recurrent state, which is sized `max-num-seqs x (k+1)`; an unservable budget is refused at load with the arithmetic |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
@@ -2197,7 +2199,7 @@ a stop token early.
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -2244,6 +2246,43 @@ aborts with `server: unknown argument '<flag>'`, including flags that are inert
 only because the capability is missing (`--tensor-parallel-size` and the other
 parallelism flags) — silently accepting those would let you believe you got
 tensor parallelism when you did not.
+
+#### What `--gpu-memory-utilization` does not do yet
+
+The flag is accepted, keeps vLLM's exact name and fraction semantics, and is
+then discarded. It does not size the KV pool. Passing
+`--gpu-memory-utilization 0.85` gives the same 256-block pool as passing
+nothing.
+
+Turning a free-memory fraction into a block count needs a profile run that
+measures what the weights and activations cost on the device first. That run is
+not implemented. It is `ROAD-V1-MEM` M3, tracked by
+[issue #83](https://github.com/mudler/vllm.cpp/issues/83), and it needs a GPU to
+gate.
+
+The flag is accepted rather than refused so that a published `vllm serve`
+command line runs here unchanged. Setting it prints this warning at startup, so
+a log never implies it took effect:
+
+```text
+vllm.cpp: WARNING --gpu-memory-utilization 0.85 was accepted but did NOT size the KV cache.
+vllm.cpp:   The profile run that turns a free-memory fraction into a block count is not
+vllm.cpp:   implemented yet (ROAD-V1-MEM M3, https://github.com/mudler/vllm.cpp/issues/83).
+vllm.cpp:   The pool fell back to 256 blocks. To size it today, pass
+vllm.cpp:   --kv-cache-memory <bytes> for an absolute KV budget, or --num-blocks <n> for an
+vllm.cpp:   exact block count.
+```
+
+To size the pool today, use `--kv-cache-memory` for an absolute byte budget or
+`--num-blocks` for an exact count. A run that never sets the flag prints
+nothing.
+
+**Warning.** On a unified-memory board such as NVIDIA GB10, a fraction of
+"device" memory is a fraction of the one pool the host shares, so it reserves
+host RAM as well. A value of 0.85 has hard-rebooted a GB10 box. When M3 lands
+and this flag starts to bind, choose the fraction on such a board against the
+whole 119 GiB pool and leave the host its headroom. Until then the flag reserves
+nothing, on any board.
 
 #### Context length vs the KV pool
 

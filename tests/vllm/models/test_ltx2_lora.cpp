@@ -35,6 +35,8 @@
 
 #include "vllm/model_executor/models/ltx2_lora.h"
 #include "vt/dtype.h"
+#include "vt/op_provider.h"
+#include "vt/ops.h"
 
 namespace {
 
@@ -652,4 +654,164 @@ TEST_CASE("ltx2 lora: the f32 target branch rounds through the bf16 accumulator"
   // Not 2.001953125: that is what an f32-throughout add would produce.
   CHECK(got != doctest::Approx(weight + 1.0F));
   std::remove(path.c_str());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE EXECUTION SEAM (row LTX25-LORA-FUSE-SEAM, issue #1202)
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Deterministic values with a FULL f32 mantissa, so every one of them rounds
+// when the adapter writer narrows it to bf16, and so essentially no product of
+// two of them is bf16-representable. A case built from small exact integers
+// cannot see a rounding difference at all, which is what makes the byte-equality
+// claim below worth asserting on these values instead.
+std::vector<float> Spread(size_t n, uint32_t seed) {
+  std::vector<float> out(n);
+  uint32_t s = seed;
+  for (size_t i = 0; i < n; ++i) {
+    s = s * 1664525U + 1013904223U;  // Numerical Recipes LCG
+    out[i] = static_cast<float>(s >> 8) / 8388608.0F - 1.0F;
+  }
+  return out;
+}
+
+// `(B * strength) @ A`, written as the scalar triple loop this fuser ran before
+// LTX25-LORA-FUSE-SEAM: `fuse_loras.py:113` transcribed, with `B * strength`
+// ROUNDED TO BF16 before the product, an f32 accumulator, and a bf16 store.
+// Deliberately a second transcription rather than a call back into the fuser —
+// it is the oracle the seam is measured against, so it must not share code with
+// the thing it measures. Inputs are given as floats and narrowed here exactly
+// where `WriteAdapter` narrows them, so both arms start from the same bf16 bits.
+std::vector<uint16_t> ScalarDeltaPlusWeight(const std::vector<float>& b,
+                                            const std::vector<float>& a,
+                                            const std::vector<float>& w, int64_t rows,
+                                            int64_t rank, int64_t cols, float strength) {
+  std::vector<uint16_t> bs(b.size());
+  for (size_t i = 0; i < b.size(); ++i) {
+    bs[i] = vt::F32ToBF16(vt::BF16ToF32(vt::F32ToBF16(b[i])) * strength);
+  }
+  std::vector<uint16_t> ab(a.size());
+  for (size_t i = 0; i < a.size(); ++i) ab[i] = vt::F32ToBF16(a[i]);
+
+  std::vector<uint16_t> out(static_cast<size_t>(rows * cols));
+  for (int64_t o = 0; o < rows; ++o) {
+    const uint16_t* brow = bs.data() + static_cast<size_t>(o * rank);
+    for (int64_t i = 0; i < cols; ++i) {
+      float acc = 0.0F;
+      for (int64_t k = 0; k < rank; ++k) {
+        acc += vt::BF16ToF32(brow[k]) * vt::BF16ToF32(ab[static_cast<size_t>(k * cols + i)]);
+      }
+      // `deltas.add_(weight)` in the bf16 aggregator, then the bf16 store
+      // (fuse_loras.py:67-68) — the same two roundings the fuser performs.
+      const uint16_t delta = vt::F32ToBF16(acc);
+      out[static_cast<size_t>(o * cols + i)] = vt::F32ToBF16(
+          vt::BF16ToF32(delta) + vt::BF16ToF32(vt::F32ToBF16(w[static_cast<size_t>(o * cols + i)])));
+    }
+  }
+  return out;
+}
+
+// Fuse into a bf16 buffer and hand back the BIT PATTERNS. `FuseBf16` above
+// widens to float, which is lossless and so would serve — but this case claims
+// byte equality, and it should read as the byte comparison it is.
+std::vector<uint16_t> FuseBf16Bits(const std::vector<vllm::Ltx2LoraAdapter>& adapters,
+                                   const std::string& target, int64_t rows, int64_t cols,
+                                   const std::vector<float>& weight) {
+  std::vector<uint16_t> buffer(weight.size());
+  for (size_t i = 0; i < weight.size(); ++i) buffer[i] = vt::F32ToBF16(weight[i]);
+  REQUIRE(vllm::Ltx2FuseLoraIntoTensor(adapters, target, vt::DType::kBF16, rows, cols,
+                                       reinterpret_cast<uint8_t*>(buffer.data()),
+                                       buffer.size() * sizeof(uint16_t)));
+  return buffer;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 lora: the delta product runs on the shared vt::Matmul seam") {
+  // WHAT THIS CASE GATES, and why the arithmetic cases above cannot.
+  //
+  // Every case above hands the fuser a 1x1 or 2x2 problem and checks a VALUE.
+  // None of them can see WHICH code produced it, and the defect this row fixes
+  // (#1202) is exactly that: a correct mirror of `fuse_loras.py:103-116`
+  // executed by a scalar single-threaded triple loop, measured at ~0.43 GMAC/s,
+  // which put the full 21.004 B DiT's 8.53e12-MAC fusion hours away from any
+  // LoRA-bearing render. So this case asserts TWO things that must both hold:
+  //
+  //   1. ROUTING. `vt::Matmul` — the shared `out[M,N] = a[M,K] @ b[K,N]` GEMM
+  //      seam — is dispatched exactly once per fused tensor. Counted through
+  //      `vt::GetOpProviderStats`, the seam's own positive signal, because a
+  //      green value assertion does not prove which provider executed. Put a
+  //      hand-rolled loop back and this drops to zero.
+  //   2. THE ARITHMETIC IS UNCHANGED, BYTE FOR BYTE. Not a tolerance: the seam
+  //      accumulates each output in f32 over K in strict increasing order and
+  //      stores through the same `vt::F32ToBF16`, so it computes the same
+  //      numbers the loop did and the gate can say so exactly. A tolerance here
+  //      would be the place a real reduction-order change went unnoticed.
+  //
+  // THE SHAPES. Three, all rank-`r` with `r` small, because that is the regime
+  // (the shipped distilled adapter is rank 450 and the DiT's projections are
+  // thousands wide). 37 and 96 columns straddle the seam's 16-wide output block,
+  // so the ragged column tail and the blocked path both run; 19 and 64 rows
+  // straddle its 16-row activation tile the same way. All are tiny enough to be
+  // instant — this case gates the arithmetic, not the speed, which is measured
+  // in the row's spec.
+  struct Shape {
+    int64_t rows, rank, cols;
+  };
+  const Shape shapes[] = {{19, 5, 37}, {64, 13, 96}, {1, 192, 1}};
+  const float kStrength = 0.75F;
+
+  vt::EnableOpProviderCallStats(true);
+  unsigned long long fused_tensors = 0;
+  const unsigned long long matmuls_before =
+      vt::GetOpProviderStats(vt::OpId::kMatmul, vt::DeviceType::kCPU).selections;
+
+  for (const Shape& s : shapes) {
+    INFO("shape ", s.rows, "x", s.rank, "x", s.cols);
+    const std::vector<float> b = Spread(static_cast<size_t>(s.rows * s.rank), 12345U);
+    const std::vector<float> a = Spread(static_cast<size_t>(s.rank * s.cols), 67890U);
+    const std::vector<float> w = Spread(static_cast<size_t>(s.rows * s.cols), 24680U);
+
+    const std::string path = WriteAdapter(s.rows, s.rank, s.cols, b, a);
+    vllm::Ltx2LoraSpec spec;
+    spec.path = path;
+    spec.strength = kStrength;
+    std::vector<vllm::Ltx2LoraAdapter> adapters;
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+
+    const std::vector<uint16_t> got = FuseBf16Bits(adapters, kTarget, s.rows, s.cols, w);
+    ++fused_tensors;
+    const std::vector<uint16_t> want =
+        ScalarDeltaPlusWeight(b, a, w, s.rows, s.rank, s.cols, kStrength);
+    REQUIRE(got.size() == want.size());
+
+    size_t mismatched = 0;
+    size_t moved = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      if (got[i] != want[i]) ++mismatched;
+      if (got[i] != vt::F32ToBF16(w[i])) ++moved;
+    }
+    CHECK(mismatched == 0);
+    // NOT VACUOUS. `Spread` gives a dense non-degenerate delta, so a fuser that
+    // wrote nothing — or one whose GEMM never ran — leaves every element equal
+    // to the weight it started from and this fails. Stated as a proportion
+    // rather than "> 0", because one moved element out of 703 would satisfy
+    // "> 0" while 702 outputs stayed untouched.
+    CHECK(moved > got.size() * 3 / 4);
+    std::remove(path.c_str());
+  }
+
+  // ROUTING. Exactly one dispatch of the shared GEMM per fused tensor. An
+  // EQUALITY on both sides: fewer means something did not route through the
+  // seam, and more means the fuser is running a GEMM it does not need.
+  const vt::OpProviderStats stats =
+      vt::GetOpProviderStats(vt::OpId::kMatmul, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+  CHECK(stats.selections == matmuls_before + fused_tensors);
+  // And the dispatch bound the first-party kernel rather than falling through to
+  // the portable reference tier, which would be correct and slow.
+  REQUIRE(stats.last_selected != nullptr);
+  CHECK(std::string(stats.last_selected) == std::string(vt::kNativeProviderName));
 }

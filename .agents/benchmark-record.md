@@ -22960,3 +22960,128 @@ for CUDA runtime version`. The Jetson 540.4.0 driver cannot run a CUDA 13 runtim
 untried route is a CUDA 12.x toolkit for that driver; it was not pursued, because the
 dgx gate had already answered the question orin was there to support. No lease held;
 `orin:gpu0` returned to ready.
+
+## LTX25-TEXT-LINEAR-SEAM — the LTX-2.5 caption projection, attributed and then measured (2026-08-18, `row/LTX25-TEXT-LINEAR-SEAM`, base `origin/main` `b626be75a`, #1208)
+
+**This entry exists because #1208's own second comment withdrew the attribution
+its first comment implied, and the row was dispatched to settle that by
+measurement before fixing anything.** It is PARTLY settled. The projection is a
+fixed, serial, twice-paid 1.1838e12-MAC cost and it accounts for **39% to 100%**
+of each single-core stretch; the range is what one unmeasured per-core ratio
+buys, and the residual is named rather than absorbed.
+
+### Recipe
+
+x86 development box, **not GB10 and not a fleet device** — 20-core AMD Ryzen 9
+9950X3D under KVM, AVX-512 present, 84 GiB RAM, Ubuntu 24.04, GCC 13.3.0.
+Release CPU tier (`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_HIP=OFF -DVLLM_CPP_METAL=OFF
+-DVLLM_CPP_TENSTORRENT=OFF`), `-O3 -DNDEBUG -ffp-contract=off`. **Box NOT idle:**
+other agents built concurrently and `uptime` read load average 4.1 to 10.1 across
+the runs. A scratch `main` calls the production
+`vllm::Ltx2TextFeatureExtractorForward` once at the shipped geometry — gemma
+hidden 3840, 49 states, `flat = 188160`, video 4096, audio 2048, V2 variant,
+every position valid — and times that call. Same harness source and flags on both
+arms; only `libvllm.a` differs.
+
+### The A/B
+
+| arm | rows | wall | rate | CPU | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| before, scalar `double` | 8 / 16 / 32 | 4.964 / 10.152 / 20.113 s | 1.86 / 1.82 / 1.84 GMAC/s | one core | 4.54 GB @ 8 |
+| before, scalar `double` | **1024** | **671.777 s** | **1.7622 GMAC/s** | **99%** | 7.56 GB |
+| after, `vt::MatmulBT` | 32 | 2.320 s | 15.945 GMAC/s | many | |
+| after, `vt::MatmulBT` | 256 | 20.342 s | 14.549 GMAC/s | 1431% of 2000% | 5.52 GB |
+| after, `vt::MatmulBT` | **1024** | **78.421 s** | **15.095 GMAC/s** | many | 7.79 GB |
+
+`rows = 1024` is not a chosen size. `Ltx2EncodePromptToConditioning` sets
+`out.seq = max_length` and `kLtx2GemmaTokenizerMaxLength = 1024`, so the
+projection costs `1024 x 1,156,055,040 = 1.1838e12` MACs on **every** render
+regardless of prompt length or resolution. **671.777 s -> 78.421 s, 8.57x.**
+
+### How much of the GB10 stretch this is — BOUNDED, not a point claim
+
+1738 s for 1.1838e12 MACs is **0.681 GMAC/s**, against 1.7622 measured here. The
+conversion needs `R`, the per-core ratio between this box and GB10 on this loop,
+and **`R` was not measured**. It is bounded instead: `R >= 1` because a GB10 Arm
+core does not out-run a 5.7 GHz-class Zen 5 on a scalar `double`-widening loop,
+and `R <= 2.587` because the projection runs INSIDE the stretch and cannot exceed
+it.
+
+| `R` | share of one 1738 s stretch | residual |
+|---:|---:|---:|
+| 1.0 | 671.8 s (39%) | 1066 s |
+| 2.0 | 1343.6 s (77%) | 394 s |
+| 2.587 | 1738 s (100%) | 0 |
+
+**So 0-1066 s per stretch is still unattributed, and this entry says so rather
+than rounding it into the projection.**
+
+**One residual hypothesis was offered and is REFUTED here.** The candidate was
+the surrounding single-threaded buffer work. Timed directly at the shipped
+geometry through the same exported entry points, two runs: `Ltx2StackHiddenStates`
+0.839 / 0.910 s, `Ltx2NormAndConcatPerTokenRms` 0.632 / 0.688 s, the `scaled`
+copy x2 (once per `project()`) 0.390 / 0.468 s — **total 1.861 / 2.066 s, i.e.
+0.28% of the 671.777 s pass, with the two GEMMs at 99.7%.** A core ten times
+slower would still put it at ~20 s. It is also *inside* the 671.777 s rather than
+beside it.
+
+**A double-count that changes the conclusion, recorded so it is not repeated.**
+671.777 s is ONE WHOLE conditioning pass: one
+`Ltx2TextFeatureExtractorForward` call with `video_out_features = 4096` AND
+`audio_out_features = 2048`, so both `project()` calls are already in it
+(`per_row = (4096 + 2048) * 188160`). Doubling it "for the two projections"
+counts the pass twice and inflates the projection's share from 39% to 77% on a
+box-equality assumption.
+
+Remaining candidates if `R` is near 1, claimed for none: the U8/NVFP4 caption
+weights being unpacked to the f32 4.6 GB — the only candidate of the right
+magnitude, and this row did not establish when that happens; the caller's padded
+hidden-state buffers (~1.5 GB of `assign` + `memcpy`, so seconds); and the
+tower's serial host glue between its threaded GEMMs, which a 1 Hz max-sampler
+would still read near 101%.
+
+**Settled regardless of `R`:** the equal-cost pair is the guided render's two
+text-conditioning passes — `ltx2_video.cpp:2085` and `:2799` build a CPU queue and
+call `Ltx2EncodePromptToConditioning` — so the two projections' 2:1 size ratio
+sits INSIDE one stretch and cannot split it; the Gemma-4 tower cannot be a 101%
+stretch, because its vt ops run on `hardware_concurrency()` threads; and the
+projection is a fixed 1.1838e12-MAC serial cost paid twice per render whatever
+shares the stretch with it.
+
+Two soft corroborations of the high end, neither a ratio measurement: #1202
+DERIVED ~0.53 GFLOP/s for a *different* scalar host loop on GB10 (from RSS growth,
+not timed, and that loop converts bf16 per multiply and strides its inner
+operand), and the trace's own RSS discriminator (paired stretches climb ~8.5 GiB,
+the third does not) matches this function's measured 7.79 GB peak — a magnitude,
+not a cause.
+
+**Owed: one `rc` lease on `dgx:gpu0` running this harness measures `R` and
+collapses the table to one row.**
+
+### Refuted and left open
+
+- **`R` itself.** The single quantity that would close the attribution, and the
+  one this row could not get: no GB10 access was taken.
+- **NOT refuted, not established: the third single-core stretch** (2589 s+, RSS
+  flat at 31 GiB). Different signature; unattributed, and a separate question
+  from the residual above.
+- **The after arm is memory-bound and NO ceiling is declared.** Per busy core it
+  reads ~1.0 GMAC/s against the before arm's 1.84 on one core, so the seam wins
+  on parallelism and loses on per-core throughput. `MatmulOneChunk` reduces over
+  the whole `K = 188160` inside one micro-kernel call, so a 752 KB weight row and
+  a 752 KB activation row each exceed the 1 MB L2 — about 1.25 bytes per MAC at
+  `mr = 4`, i.e. ~18 GB/s at the measured rate. **Next hypothesis: K-blocking**,
+  L2-resident K panels so a weight panel serves more output columns before
+  eviction. Belongs to the CPU GEMM row.
+- **No GB10 number.** The LTX-2.5 speed axis stays `PENDING` and the GB10
+  re-measure is owed.
+
+### Accumulator cost, measured at K = 188160
+
+Against a `long double` reference on this path's magnitudes (unit-RMS
+activations, `U(-1/sqrt(fan_in))` weights, 256 sampled outputs): f32 sequential
+reads max abs 2.12e-05 / mean rel 2.88e-05, f64-then-store reads 5.88e-08 /
+2.26e-08. f64 is ~360x nearer exact; the f32 arm's worst absolute error is ~330x
+below one bf16 ulp of the value it produces. Ten of twelve goldens are unchanged;
+the two that moved are the V1 arm at 1.19e-07 and 7.45e-08 against a 1e-5 bound.
+No tolerance was widened.

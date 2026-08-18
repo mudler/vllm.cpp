@@ -1419,8 +1419,29 @@ authority and no fresh review (§8).
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | 0 — the GPU is idle for the WHOLE post-load render, not only the decode | owed; carries the owed `utilization.gpu` positive control |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | none — the evidence for rungs 1 and 2 and for §1.4 is on an unreachable host, and neither rung's sampler cadence closes | owed |
 | [#1202](https://github.com/mudler/vllm.cpp/issues/1202) | 7 — `Ltx2FuseLoraIntoTensor` is a scalar single-threaded loop, ~0.53 GFLOP/s | owed, MEASURED on the full model: 2.3% of one pass in 10.4 min |
-| [#1208](https://github.com/mudler/vllm.cpp/issues/1208) | 8 — the text tower's `Linear` is scalar, single-threaded and `double`-accumulating | owed, MEASURED at 1073 s of byte-identical RSS; also a dtype-polarity divergence from `F.linear` |
 | [#1210](https://github.com/mudler/vllm.cpp/issues/1210) | 9 — the two-stage rebind fuses, un-fuses and re-fuses; the load-time pass is provably wasted | owed; supplies the number `ltx2_video.cpp:2849` records as UNMEASURED |
+
+**[#1208](https://github.com/mudler/vllm.cpp/issues/1208) is NOT owed here
+either. It landed**, and it is removed from the table above for the same reason
+[#1008](https://github.com/mudler/vllm.cpp/issues/1008) is, argued below: a
+closed issue listed as owed by a row that did not close it misattributes the
+work and leaves a fixed defect reading as open debt. It was filed as lever 8 and
+taken by `LTX25-TEXT-LINEAR-SEAM`
+([spec](ltx25-text-linear-seam.md)), which routed the caption projection through
+`vt::MatmulBT` and measured the lever this row could only name: one conditioning
+pass at the shipped geometry is **671.777 s of one core, 78.421 s through the
+seam (8.57x)**, and `rows` is the constant 1024 rather than a prompt length, so
+the cost is fixed and paid twice on a guided render.
+
+**Two things that row establishes are corrections to this one's framing, not
+additions to it.** First, the text tower runs on a **hard-coded CPU queue**
+(`ltx2_video.cpp:2085`, `:2799`, `:4479`), so `--device cuda` never moved it;
+that is filed under that row's `## Owed`. Second, the single-threaded buffer work
+around the projection — this row's natural next suspect — is **1.861-2.066 s at
+the shipped geometry against the pass's 671.777 s, i.e. 0.28%**, so it is
+refuted as an explanation for anything minute-scale. What that row could NOT
+close, and carries as owed, is the GB10-to-x86 per-core ratio, which bounds the
+projection to **39-100%** of each single-core stretch.
 
 **[#1008](https://github.com/mudler/vllm.cpp/issues/1008) is NOT owed here. It
 landed.** It was filed by this row as lever 2 and taken by `LTX25-DECODE-DTYPE`,

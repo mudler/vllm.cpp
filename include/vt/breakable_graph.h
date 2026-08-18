@@ -30,12 +30,14 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
 
 namespace vt {
@@ -55,9 +57,9 @@ namespace vt {
 // Overload `CopyOutput` for a break function's output type; it is found by
 // argument-dependent lookup. The tensor overload copies IN PLACE and preserves
 // the destination's address, mirroring upstream's `assertIs(result, dst)`
-// (`:190`). A type with NO overload is the documented non-copyable fallback
-// (`:201`): the seam fabricates no copy, and such a break must use the in-place
-// form of `GraphBreak` instead.
+// (`:190`). A type with NO overload cannot use the destination form at all: the
+// static assertion in `GraphBreak` below refuses it by name, and the documented
+// non-copyable fallback (`:201`) has to be asked for with `vt::NoWriteback{}`.
 void CopyOutput(Backend& b, Queue& q, Tensor& dst, const Tensor& src);
 void CopyOutput(Backend& b, Queue& q, std::vector<Tensor>& dst,
                 const std::vector<Tensor>& src);
@@ -77,6 +79,74 @@ struct HasCopyOutput<
 // GraphBreak templates are header-defined and the counter is not.
 void CountBreakPoint();
 }  // namespace detail
+
+// The EXPLICIT opt-in to upstream's non-copyable fallback (`:201`), where
+// `_copy_output` returns `src` and the destination is left untouched. Passing it
+// says "this break has no device output and I know the seam writes nothing
+// back". Without it a destination type with no `CopyOutput` overload is a
+// COMPILE error rather than a silent downgrade to the wrong-numerics path, which
+// is the whole reason the tag exists: `HasCopyOutput` as a plain `if constexpr`
+// default made a misspelled, moved or shadowed overload compile clean and be
+// wrong only on replay N.
+struct NoWriteback {};
+
+// ---------------------------------------------------------------------------
+// vt::BreakSlot<T> — the destination of a destination-carrying break point.
+// Port of `captured_output = _weak_ref_if_tensor(output)` (`:156-169`, `:225`).
+// ---------------------------------------------------------------------------
+//
+// WHY THIS TYPE EXISTS AND A REFERENCE DOES NOT. The destination must outlive
+// the `BreakableGraph`, because the following segment bakes its address at
+// capture time and every replay writes through that address. Upstream gets that
+// for free: `captured_output` is held BY VALUE in the replay closure and its
+// storage is pinned by the segment graphs' mempool. A C++ seam taking a bare
+// `Out&` gets the opposite — the natural call site declares the destination as a
+// local of the function containing the break, which dies on the very next
+// `return`, and the first such site did exactly that. A comment at the
+// declaration is not a mechanism; every caller re-derives it and one of them is
+// wrong.
+//
+// So the seam takes a slot whose storage it can OWN. On the capturing path the
+// value is moved into a heap cell before the eager call produces it, and the
+// replay closure holds a `shared_ptr` to that cell, so the destination lives
+// exactly as long as the break function that writes into it — by construction,
+// not by convention.
+//
+// On the NON-capturing path (every production step until a driver opens a
+// scope) the cell is never allocated and the value lives inline in the slot, so
+// a pass-through forward allocates nothing extra and is byte-identical to the
+// plain local it replaces.
+//
+// Read the value through `*slot` or `slot->`, never through a pointer cached
+// before the break: pinning moves the value, exactly as the destination form's
+// `out = fn()` rebinds it (`:222-227`).
+template <class T>
+class BreakSlot {
+ public:
+  BreakSlot() = default;
+  explicit BreakSlot(T v) : inline_(std::move(v)) {}
+
+  T& operator*() { return cell_ ? *cell_ : inline_; }
+  const T& operator*() const { return cell_ ? *cell_ : inline_; }
+  T* operator->() { return cell_ ? cell_.get() : &inline_; }
+  const T* operator->() const { return cell_ ? cell_.get() : &inline_; }
+
+  // True once the slot's storage is owned by the seam rather than by this
+  // object, which is the state the writeback contract requires.
+  bool pinned() const { return static_cast<bool>(cell_); }
+
+  // Called by GraphBreak ONLY, and only on the capturing path, BEFORE the eager
+  // result is produced. Moving an as-yet-unwritten value is free, and from this
+  // point the address is stable for the life of the closure that holds the cell.
+  const std::shared_ptr<T>& PinForCapture() {
+    if (!cell_) cell_ = std::make_shared<T>(std::move(inline_));
+    return cell_;
+  }
+
+ private:
+  T inline_{};
+  std::shared_ptr<T> cell_;
+};
 
 // ---------------------------------------------------------------------------
 // G3 observability (spec `## Gates` G3).
@@ -109,7 +179,11 @@ class GraphCaptureScope;
 //
 // Holds one opaque handle per segment (each from `Backend::EndCaptureGraph`) and
 // one seam-built replay closure per break. The invariant is
-// `segment_count() == break_count() + 1` for any capture that completed.
+// `segment_count() == break_count() + 1` for any capture that completed, and it
+// is ASSERTED in two places rather than documented: `GraphCaptureScope` refuses
+// to open on a container that already holds a capture, and `Replay` refuses a
+// container whose counts disagree. A graph with `break_count() == segment_count()`
+// would otherwise replay with its last break silently dropped.
 //
 // A segment handle is treated as OPAQUE and every acquisition and release goes
 // through `Backend::EndCaptureGraph` and `Backend::DestroyGraph`, so
@@ -131,7 +205,10 @@ class BreakableGraph {
   bool captured() const { return !segments_.empty(); }
   int64_t replay_count() const { return replays_; }
 
-  // Releases every segment through Backend::DestroyGraph and clears the breaks.
+  // Releases every segment through Backend::DestroyGraph, clears the breaks, and
+  // returns the container to its as-constructed state — replay count included,
+  // because a stale count on a reset container is a number that describes a
+  // graph that no longer exists.
   void Reset();
 
  private:
@@ -158,6 +235,21 @@ class BreakableGraph {
 // is Vulkan `vulkan_backend.cpp:16` and Metal `metal_backend.mm:13`) or when
 // `VLLM_CPP_CUDAGRAPH=0`. An inert scope captures nothing, every `GraphBreak`
 // inside it is a pass-through, and the forward runs eager exactly as today.
+//
+// TWO THINGS IT REFUSES, both `VT_CHECK`, both before any backend call:
+//
+//   * A NESTED scope on the same thread. `BeginCapture` on a stream that is
+//     already capturing is `CUDA_ERROR_ILLEGAL_STATE` on a real backend, and the
+//     sequence a nested pair traces is not a legal capture on any of them.
+//   * A container that already holds a capture. Re-entering appends to it, and
+//     the result has `break_count() == segment_count()`, whose last break
+//     `Replay` would silently drop. Call `Reset()` first.
+//
+// AND ONE THING IT DRAINS. If the scope exits by EXCEPTION — a break function
+// that throws, or ordinary model code between two break points — the stream is
+// taken out of capture and the half-built container is `Reset()`. A partial
+// capture must never be reported as `captured()`, because a partial capture is
+// replayable, and replaying half a forward is silently wrong numerics.
 class GraphCaptureScope {
  public:
   GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out);
@@ -183,7 +275,7 @@ class GraphCaptureScope {
   BreakableGraph* g_;
   bool active_ = false;
   bool segment_open_ = false;
-  GraphCaptureScope* prev_ = nullptr;
+  int uncaught_on_entry_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -199,12 +291,16 @@ class GraphCaptureScope {
 // OUTSIDE a capture scope every form calls the function and returns, so a
 // non-capturing forward is byte-identical to today and makes ZERO backend calls.
 //
-// THREE LIFETIME RULES, stated here because they are the rules a new model
-// author is least likely to know, and because two of the three produce wrong
-// numbers rather than a fault:
+// THREE LIFETIME RULES. Rule 1 used to be a comment; it is now the type system,
+// because the one site that had to obey it did not. Rules 2 and 3 remain rules a
+// new model author is least likely to know, and both produce wrong numbers
+// rather than a fault:
 //
 //   1. The DESTINATION must outlive the `BreakableGraph`, and no replay may
-//      reallocate it. The following segment bakes its address at capture time.
+//      reallocate it. ENFORCED: the destination form takes a `vt::BreakSlot<T>`
+//      and the seam owns its storage for the life of the replay closure. There
+//      is no overload taking a bare reference, so the rule cannot be broken by
+//      writing the obvious thing.
 //   2. A closure must capture DEVICE POINTERS or `Tensor` views that are stable
 //      across replays, never a reference to a host temporary that dies with the
 //      capturing call.
@@ -221,7 +317,7 @@ class GraphCaptureScope {
 // `break_graph` (`:370-374`), an empty body under the decorator.
 void GraphBreak();
 
-// Form ONE, in place. `fn` writes into a PERSISTENT buffer the model owns and
+// The IN-PLACE form. `fn` writes into a PERSISTENT buffer the model owns and
 // that no replay reallocates, and returns nothing. The writeback contract is
 // vacuous for it, because there is no fresh allocation to write back.
 template <class Fn, class = std::enable_if_t<std::is_void_v<decltype(std::declval<Fn&>()())>>>
@@ -239,33 +335,61 @@ void GraphBreak(Fn&& fn) {
   detail::CountBreakPoint();
 }
 
-// Form TWO, destination-carrying. `fn` returns a fresh result and the seam
-// copies it into `out` on every replay. Direct port of `replay_fn` plus
-// `_copy_output` (`:231-235`, `:172-201`), with `out` playing the part
+// The DESTINATION form. `fn` returns a fresh result and the seam copies it into
+// the slot on every replay. Direct port of `replay_fn` plus `_copy_output`
+// (`:231-235`, `:172-201`), with `BreakSlot` playing the part
 // `_weak_ref_if_tensor` (`:156-169`) plays upstream: the capture-time
 // destination that outlives the eager call.
+//
+// The static assertion is the one MEDIUM the fallback branch used to hide. When
+// selecting the fallback was a silent `if constexpr` default, renaming or moving
+// a `CopyOutput` overload left both suites green while the break dropped into
+// the branch whose own comment says such a break must use the in-place form —
+// the D9 wrong-numerics path, reached by a typo.
 template <class Fn, class Out>
-void GraphBreak(Fn&& fn, Out& out) {
+void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
+  static_assert(detail::HasCopyOutput<Out>::value,
+                "vt::GraphBreak destination form: no CopyOutput(Backend&, Queue&, Out&, "
+                "const Out&) is visible for this destination type. Declare one (found by "
+                "argument-dependent lookup) so every replay writes back into the address "
+                "the following segment baked, or use the in-place form GraphBreak(fn), or "
+                "ask for the non-copyable fallback explicitly with vt::NoWriteback{}.");
   GraphCaptureScope* s = GraphCaptureScope::Current();
   if (s == nullptr || !s->active()) {
-    out = fn();  // pass-through: a move, never a copy
+    *out = fn();  // pass-through: a move, never a copy, and the cell stays unpinned
     detail::CountBreakPoint();
     return;
   }
   s->EndSegment();
-  out = fn();  // the capture-time destination IS this first result (`:222-227`)
-  if constexpr (detail::HasCopyOutput<Out>::value) {
-    Backend* b = &s->backend();
-    Queue* q = &s->queue();
-    Out* dst = &out;  // lifetime rule 1 above
-    s->AppendBreak([b, q, dst, f = std::forward<Fn>(fn)]() mutable {
-      CopyOutput(*b, *q, *dst, f());
-    });
-  } else {
-    // The non-copyable fallback (`:201`). Upstream returns `src` and leaves the
-    // destination untouched; so does this. Such a break must use form ONE.
-    s->AppendBreak([f = std::forward<Fn>(fn)]() mutable { (void)f(); });
+  // Pin BEFORE the eager call, so the address the following segment bakes is the
+  // one the replay closure owns. `:222-227`: the capture-time destination IS the
+  // first eager result.
+  std::shared_ptr<Out> cell = out.PinForCapture();
+  *cell = fn();
+  Backend* b = &s->backend();
+  Queue* q = &s->queue();
+  s->AppendBreak([b, q, cell, f = std::forward<Fn>(fn)]() mutable {
+    CopyOutput(*b, *q, *cell, f());
+  });
+  s->BeginSegment();
+  detail::CountBreakPoint();
+}
+
+// The DESTINATION form's non-copyable fallback (`:201`), asked for by name.
+// Upstream returns `src` and leaves the destination untouched; so does this. The
+// slot then holds the CAPTURE-TIME value forever, which is correct only when
+// nothing downstream of the break reads it on replay.
+template <class Fn, class Out>
+void GraphBreak(Fn&& fn, BreakSlot<Out>& out, NoWriteback) {
+  GraphCaptureScope* s = GraphCaptureScope::Current();
+  if (s == nullptr || !s->active()) {
+    *out = fn();
+    detail::CountBreakPoint();
+    return;
   }
+  s->EndSegment();
+  *out = fn();
+  s->AppendBreak([f = std::forward<Fn>(fn)]() mutable { (void)f(); });
   s->BeginSegment();
   detail::CountBreakPoint();
 }

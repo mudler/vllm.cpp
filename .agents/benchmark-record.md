@@ -22728,3 +22728,40 @@ forward run with a capture scope open produces logits BIT-IDENTICAL to the same
 forward with no scope — 500 values compared, 0 differing
 (`tests/vllm/models/test_qwen3_break_point.cpp`). That is what makes the stage
 reversible, and it is the polarity AGENTS.md requires when a greedy path exists.
+
+**THE PROBE IS IN THE TREE, and here is how to run it.** A measurement that
+produced two false refusals, each presenting as a verdict about the design, is
+the last one anybody should have to reconstruct from prose. The first record of
+it named neither an artifact nor a recipe; this one does.
+
+| Artifact | Path | sha256 | Lines |
+|---|---|---|---|
+| driver-API probe (`dlsym`, no toolkit, no headers) | `scripts/probe_cudagraph_rebegin.c` | `dbf95d69d396e7f3a41c754ccedda59ef076a1dd30960d2c738a1c26fe238297` | 246 |
+| runtime-API probe (needs `nvcc`) | `scripts/probe_cudagraph_rebegin.cu` | `ce73250331af5bc3eb8b560176e60a07f77476dcff60b81a0b0d7caea6f20bed` | 167 |
+
+Both exercise the SEAM's shape rather than a toy — segment, host-dependent eager
+break on the same stream, RE-BEGIN, segment, bare zero-work re-begin, segment,
+then three replays with fresh inputs — and both print a single
+`VERDICT: REBEGIN_HOLDS` or a named refusal. Recipe, on a leased device:
+
+```sh
+# driver-API build: no CUDA toolkit needed, links libdl and binds libcuda at run time
+cc -O1 -o probe scripts/probe_cudagraph_rebegin.c -ldl && ./probe; echo "PROBE_EXIT=$?"
+
+# runtime-API build
+nvcc -O1 -arch=native -o probe scripts/probe_cudagraph_rebegin.cu || \
+  nvcc -O1 -o probe scripts/probe_cudagraph_rebegin.cu
+echo "BUILD_STATUS=$?"; ./probe; echo "PROBE_EXIT=$?"
+```
+
+Build it on CONTAINER-LOCAL disk. The `dgx:gpu0` run compiled under `/workspace`,
+which on that host is a CIFS mount storing `file_mode=0664`, and exited 126
+`Permission denied` — `BUILD_STATUS=0` with nothing executed, which is a build
+result wearing a measurement's clothes.
+
+**What is NOT recoverable, stated plainly rather than reconstructed.** The
+`orin:gpu0` run's own driver script and its raw stdout were not retained. The
+verdict above therefore rests on the recorded reading, and the only way to
+re-derive it is to re-run the committed source under the recipe above on a leased
+GPU. Nothing here was re-run for this record: the repair pass that added it had
+no GPU lease.

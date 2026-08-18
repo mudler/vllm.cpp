@@ -4079,6 +4079,15 @@ Building it needs no option. `src/vt/breakable_graph.cpp` is part of the core
 `vllm` library on every platform, because the seam is backend-agnostic and asks
 nothing new of any backend.
 
+The switch is GATED, and it is gated in a child process, because it is read once
+per process into a function-local static and no test in a running process can
+toggle it. `tests/vt/test_breakable_graph.cpp` re-executes itself with
+`VLLM_CPP_CUDAGRAPH=0` and requires the inert behaviour on a backend that CAN
+capture — the arm that proves the switch itself is what turns capture off, rather
+than the backend's own lack of support. Asserting the backend arm instead
+substitutes a different condition, and dropping the switch from the seam left the
+whole suite green.
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams can emit SSE **comment** frames (`:\n\n`) while

@@ -55,6 +55,7 @@
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIds seam
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vllm/model_executor/models/dense_attn_graph_break.h"  // CopyOutput(optional<DBuf>)
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK: the break-point seam
 #include "vt/ops.h"
 #include "vt/tenstorrent/tenstorrent_device.h"  // WarmRopeCosSin (item-5 TT-only)
@@ -78,35 +79,6 @@ using v1::CommonAttentionMetadata;
 // definitions are byte-for-byte the same and the dense-only MLP / decoder-layer
 // / forward-body machinery below composes them via `using namespace dense_attn`,
 // so the Qwen3-dense (0.6B/4B) forward is byte-identical (same vt:: op order).
-using namespace dense_attn;
-
-}  // namespace
-}  // namespace vllm
-
-namespace vllm {
-namespace dense_attn {
-// The writeback contract for a break point whose destination is a POOLED DEVICE
-// BUFFER — the `vt::CopyOutput` customization point, the port of `_copy_output`
-// (`breakable_cuda_graph.py:172-201`). It lives in `dense_attn` so
-// argument-dependent lookup finds it for `std::optional<DBuf>`.
-//
-// Why it cannot be a rebind. On replay N the attention call returns a FRESH
-// `DBuf` from the device pool, whose address is not the one the FOLLOWING
-// segment baked at capture time. Rebinding the destination would leave that
-// segment reading capture-time data forever while the break wrote elsewhere —
-// wrong numerics, not a fault, and invisible to `compute-sanitizer` (spec D9).
-// So the bytes are copied INTO the destination and the destination's address
-// never moves.
-inline void CopyOutput(vt::Backend& b, vt::Queue& q, std::optional<DBuf>& dst,
-                       const std::optional<DBuf>& src) {
-  if (!dst.has_value() || !src.has_value()) return;
-  vt::CopyOutput(b, q, dst->t(), src->t());
-}
-}  // namespace dense_attn
-}  // namespace vllm
-
-namespace vllm {
-namespace {
 using namespace dense_attn;
 
 // TT-only dump. The getenv is paid only on kTENSTORRENT so a CUDA replay
@@ -172,20 +144,30 @@ void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
   // REGISTRATION.
   //
   // Destination form, because `AttnBlock` returns a FRESH pooled buffer on every
-  // call. Outside a capture scope — which is every production step today, until
-  // W2 migrates this model's decode driver onto the seam — `GraphBreak` moves
-  // that result into `attn` and returns, so this is byte-identical to the
-  // `DBuf attn = AttnBlock(...)` it replaces and makes zero backend calls.
-  std::optional<DBuf> attn;
+  // call. The destination is a `vt::BreakSlot`, not a local `std::optional<DBuf>`:
+  // the following segment bakes the destination's address, and a plain local
+  // dies on this function's `return` while the pooled block it named goes back
+  // on the `DevicePool` free list — a host use-after-scope plus D1's reuse
+  // hazard, at the one site that has to obey the rule. The slot hands its
+  // storage to the seam on the capturing path and keeps it inline on the
+  // pass-through path.
+  //
+  // Outside a capture scope — which is every production step today, until W2
+  // migrates this model's decode driver onto the seam — `GraphBreak` moves the
+  // result into the slot and returns, so this is byte-identical to the
+  // `DBuf attn = AttnBlock(...)` it replaces, allocates nothing extra, and makes
+  // zero backend calls.
+  vt::BreakSlot<std::optional<DBuf>> attn;
   vt::GraphBreak([&] { return AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T, tp); },
                  attn);
+  DBuf& attn_buf = attn->value();
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   if (FusedChainAdoptEnabled()) {
-    vt::FusedChain(d.q, dh2.t(), attn->t(), w_post, &res.t(), vt::kFusedAddRmsNormStd, eps);
+    vt::FusedChain(d.q, dh2.t(), attn_buf.t(), w_post, &res.t(), vt::kFusedAddRmsNormStd, eps);
   } else {
-    vt::RmsNorm(d.q, dh2.t(), attn->t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
+    vt::RmsNorm(d.q, dh2.t(), attn_buf.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
   hidden = MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);

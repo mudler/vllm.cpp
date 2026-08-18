@@ -206,10 +206,21 @@ via an `rc` lease, driver 12060, three replays with fresh inputs, zero
 mismatches).
 
 Gates: `tests/vt/test_breakable_graph.cpp` ports SGLang's unit suite case for
-case (14 cases, 81 assertions); `tests/vllm/models/test_qwen3_break_point.cpp`
-drives the production forward with a scope open, counts one segment per layer
-plus one, and compares the logits BIT FOR BIT against the unscoped forward (500
-values, 0 differing).
+case, with its arithmetic chains and its post-replay assertions intact (23
+cases, 150 assertions); `tests/vllm/models/test_qwen3_break_point.cpp` drives
+the production forward with a scope open, counts one segment per layer plus one,
+and compares the logits BIT FOR BIT against the unscoped forward (500 values, 0
+differing).
+
+The seam ENFORCES what it used to document. A destination-carrying break point
+takes a `vt::BreakSlot` whose storage the seam owns, because the following
+segment bakes that address and a caller's local dies first; a destination with no
+`CopyOutput` overload is a compile error naming the type rather than a silent
+drop into the no-writeback path; a second capture scope on one thread and a
+re-entered container are refused; and a forward that throws mid-capture leaves no
+partial graph reporting itself as captured. Interleaved replay, the
+`VLLM_CPP_CUDAGRAPH=0` kill switch and each refusal above are gated, every one
+proven by a mutation that reds them.
 
 **Not yet entered from a production step.** No driver opens a capture scope
 until W2 migrates `Qwen3DenseDecodeGraph`; the break point itself runs on every

@@ -26,10 +26,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_attn_graph_break.h"  // the writeback overload
 #include "vllm/model_executor/models/qwen3.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
@@ -37,6 +39,17 @@
 #include "vt/dtype.h"
 #include "vt/recording_capture_backend.h"
 #include "vt/tensor.h"
+
+// THE WRITEBACK BRANCH IS SELECTED, asserted at COMPILE TIME rather than
+// believed. The destination form's `static_assert` already refuses a type with
+// no `CopyOutput`, so a renamed, moved or shadowed overload is now a build
+// failure at the model — but only this line says WHICH branch the production
+// destination type takes, and it is the branch the D9 wrong-numerics path hides
+// behind. Renaming `vllm::dense_attn::CopyOutput` reds here and at the model,
+// where it used to leave both suites green.
+static_assert(vt::detail::HasCopyOutput<std::optional<vllm::dense_attn::DBuf>>::value,
+              "the qwen3 break point's destination must have a CopyOutput overload; without "
+              "one every replay leaves the following segment reading capture-time data");
 
 namespace {
 
@@ -159,6 +172,11 @@ std::vector<float> RunForward(const HfConfig& c, const Qwen3DenseWeights& w,
   if (rec == nullptr)
     return vllm::Qwen3DenseModel::Forward(tokens, positions, am, pool.attn_kv, w, c, q);
   vt::Queue rq = rec->CreateQueue();
+  // The CAPTURING lane is this gate's precondition: with VLLM_CPP_CUDAGRAPH=0
+  // exported the scope is inert by design, and an environment red must not read
+  // as a code red.
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
   vt::GraphCaptureScope scope(*rec, rq, *g);
   REQUIRE(scope.active());
   return vllm::Qwen3DenseModel::Forward(tokens, positions, am, pool.attn_kv, w, c, q);
@@ -181,7 +199,9 @@ TEST_CASE("G2: the Qwen3 dense forward REACHES the break seam, once per layer") 
   CHECK(g.segment_count() == static_cast<size_t>(c.num_hidden_layers) + 1);
   CHECK(rec.Count("Begin") == c.num_hidden_layers + 1);
   CHECK(rec.Count("EndCaptureGraph") == c.num_hidden_layers + 1);
-  // The invariant BreakableGraph asserts, restated where a model produced it.
+  // The invariant the seam ASSERTS — `GraphCaptureScope` refuses a container that
+  // already holds a capture, and `Replay` refuses counts that disagree —
+  // restated here where a real model produced them.
   CHECK(g.segment_count() == g.break_count() + 1);
 
   // G4: the seam changed no numerics. Bit for bit, not approximately.

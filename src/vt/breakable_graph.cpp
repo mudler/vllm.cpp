@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
 
 namespace vt {
@@ -61,12 +62,25 @@ bool GraphCaptureEnabled() {
 // CopyOutput — port of `_copy_output` (`:172-201`).
 // ---------------------------------------------------------------------------
 
+static size_t Numel(const Tensor& t) {
+  size_t n = 1;
+  for (int i = 0; i < t.rank; ++i) n *= static_cast<size_t>(t.shape[i]);
+  return n;
+}
+
 void CopyOutput(Backend& b, Queue& q, Tensor& dst, const Tensor& src) {
   if (dst.data == nullptr || src.data == nullptr) return;
   if (dst.data == src.data) return;  // already the same storage: nothing to do
-  size_t numel = 1;
-  for (int i = 0; i < dst.rank; ++i) numel *= static_cast<size_t>(dst.shape[i]);
-  const size_t bytes = numel * SizeOf(dst.dtype);
+  // The two sides must AGREE before a byte moves. Sizing the copy from `dst`
+  // alone turns a break function that returned the wrong shape or dtype into an
+  // out-of-bounds read of `src` — a fault at best and someone else's data at
+  // worst — where upstream's `dst.copy_(src)` raises. This is the refusal that
+  // makes a mis-registered break point loud instead of silently wrong.
+  VT_CHECK(dst.dtype == src.dtype,
+           "CopyOutput: break output dtype does not match its destination");
+  VT_CHECK(Numel(dst) == Numel(src),
+           "CopyOutput: break output element count does not match its destination");
+  const size_t bytes = Numel(dst) * SizeOf(dst.dtype);
   // In place, into the address the FOLLOWING SEGMENT baked. `dst` is not
   // rebound, which is upstream's `assertIs(result, dst)` (`:190`).
   b.Copy(q, dst.data, src.data, bytes);
@@ -103,14 +117,23 @@ void BreakableGraph::Reset() {
   }
   segments_.clear();
   break_fns_.clear();
+  // The replay count describes the graph that was just released. Leaving it
+  // behind makes the next capture report replays it never ran, and G3's whole
+  // job is to be the number nobody has to trust twice.
+  replays_ = 0;
 }
 
 void BreakableGraph::Replay(Queue& q) {
   if (backend_ == nullptr || segments_.empty()) return;
+  // The invariant, asserted where violating it would be SILENT. A container with
+  // `break_count() == segment_count()` replays with its last break dropped, and
+  // the only symptom is a forward that skips one host-dependent operation.
+  VT_CHECK(break_fns_.size() + 1 == segments_.size(),
+           "BreakableGraph::Replay: segment_count() must equal break_count() + 1");
   // Interleaved, mirroring `:255-263`: segment i, then break i.
   for (size_t i = 0; i < segments_.size(); ++i) {
     backend_->ReplayGraph(q, segments_[i]);
-    if (i < break_fns_.size()) break_fns_[i]();
+    if (i + 1 < segments_.size()) break_fns_[i]();
   }
   ++replays_;
   g_replays.fetch_add(1, std::memory_order_relaxed);
@@ -123,11 +146,23 @@ void BreakableGraph::Replay(Queue& q) {
 GraphCaptureScope* GraphCaptureScope::Current() { return t_current_scope; }
 
 GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out)
-    : b_(&b), q_(&q), g_(&out) {
+    : b_(&b), q_(&q), g_(&out), uncaught_on_entry_(std::uncaught_exceptions()) {
+  // Refused before ANY backend call, and refused in both lanes so the switch
+  // cannot change which programs are legal.
+  //
+  // NESTING. `prev_`-style save and restore made a nested pair look contemplated;
+  // it is not. Two scopes on one queue trace `Begin Begin EndCaptureGraph Begin
+  // EndCaptureGraph EndCaptureGraph ...`, whose second `BeginCapture` lands on an
+  // already-capturing stream — `CUDA_ERROR_ILLEGAL_STATE` on a real backend.
+  VT_CHECK(t_current_scope == nullptr,
+           "GraphCaptureScope: a capture scope is already open on this thread");
+  // RE-ENTRY. Appending to a container that already holds a capture yields
+  // `break_count() == segment_count()`, whose last break Replay drops. Reset it.
+  VT_CHECK(!out.captured() && out.break_count() == 0,
+           "GraphCaptureScope: this BreakableGraph already holds a capture; Reset() it first");
   active_ = GraphCaptureEnabled() && b.SupportsGraphCapture();
   if (!active_) return;  // inert: the forward runs eager, exactly as today
   g_->backend_ = b_;
-  prev_ = t_current_scope;
   t_current_scope = this;
   BeginSegment();
 }
@@ -139,12 +174,25 @@ GraphCaptureScope::~GraphCaptureScope() {
   // propagates would terminate, and a skipped close poisons the stream
   // permanently — which is why three drivers hand-rolled this same drain
   // (`qwen3_5.cpp:9913`, `qwen3_5.cpp:10335`, `qwen3_dflash.cpp:1106`).
+  //
+  // THE DRAIN IS ABOUT THE EXCEPTION, NOT ONLY ABOUT THE CLOSE. Catching a
+  // throwing `EndCaptureGraph` covers one failure. The failure that actually
+  // happens is a break function, or ordinary model code between two break
+  // points, throwing MID-CAPTURE: the close then succeeds, the stream is clean,
+  // and the container is left holding a PARTIAL forward that reports
+  // `captured() == true` and replays as half a step. Comparing the uncaught
+  // depth against the one recorded at entry is what tells the two apart, and the
+  // partial container is destroyed rather than handed back.
+  const bool unwinding = std::uncaught_exceptions() > uncaught_on_entry_;
   try {
     EndSegment();
   } catch (...) {
     g_->Reset();
+    t_current_scope = nullptr;
+    return;
   }
-  t_current_scope = prev_;
+  if (unwinding) g_->Reset();
+  t_current_scope = nullptr;
 }
 
 void GraphCaptureScope::BeginSegment() {

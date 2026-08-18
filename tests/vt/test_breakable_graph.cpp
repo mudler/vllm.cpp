@@ -7,24 +7,39 @@
 //
 // Row ENG-CUDAGRAPH-BREAK W1, issue #1192, parent #1163.
 //
-// The one harness adaptation is stated in `tests/vt/recording_capture_backend.h`
-// and nowhere else: upstream skips without CUDA, we record the call sequence.
-// Parameters, modes, fixtures, break counts, segment counts, arithmetic chains,
-// the in-place-versus-assign split and the non-copyable fallback are preserved.
+// THE HARNESS ADAPTATION is stated in `tests/vt/recording_capture_backend.h` and
+// nowhere else: upstream skips without CUDA, we record the call sequence and
+// simulate the graph, so a captured operation is filed at capture and RUN at
+// replay. Upstream's arithmetic chains and its post-replay assertions therefore
+// port literally — `x.fill_(5); graph.replay(); y == 6` is the same assertion
+// here — as do the break counts, the segment counts, the in-place-versus-assign
+// split and the non-copyable fallback.
 //
-// `TestBreakableCudaGraph::test_gsm8k_accuracy` (`:288`) is DELIBERATELY
-// EXCLUDED, with the reason recorded in the spec: it is a distributional
-// accuracy floor (`mgsm_en >= 0.80`) on a PREFILL capture path, and both halves
-// are wrong for us. Our gate polarity is bit-exactness against the model's own
-// eager forward (spec `## Gates` G1), which is strictly stronger.
+// TWO deliberate deviations, named rather than claimed away:
+//   * Upstream's `eager_on_graph` always returns a fresh tensor, so every
+//     upstream break is the DESTINATION form. The in-place form has no upstream
+//     case; it is exercised alongside T2 and by the bare marker.
+//   * `test_gsm8k_accuracy` (`:288`) is EXCLUDED with the reason recorded in the
+//     spec: it is a distributional accuracy floor (`mgsm_en >= 0.80`) on a
+//     PREFILL capture path, and both halves are wrong for us. Our gate polarity
+//     is bit-exactness against the model's own eager forward (spec `## Gates`
+//     G1), which is strictly stronger.
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <unistd.h>  // readlink("/proc/self/exe"), getpid, for T4's child arm
+#endif
 
 #include "vt/breakable_graph.h"
 #include "vt/recording_capture_backend.h"
@@ -32,9 +47,20 @@
 namespace {
 
 using vt::BreakableGraph;
+using vt::BreakSlot;
 using vt::GraphBreak;
 using vt::GraphCaptureScope;
 using vt_test::RecordingCaptureBackend;
+
+// THE SUITE'S OWN PRECONDITION. Every capturing case below asserts the CAPTURING
+// lane, so exporting `VLLM_CPP_CUDAGRAPH=0` around a run must not read as a code
+// failure: an environment red and a code red are different verdicts and a suite
+// that cannot tell them apart reports neither. The kill-switch case is the one
+// that deliberately runs in the other lane, and it does so in a CHILD process.
+void RequireCaptureLane() {
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this suite gates the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
+}
 
 // A device-resident int32 vector on the recording backend, so a case can talk
 // about a tensor's ADDRESS as well as its contents. The address is the whole
@@ -60,24 +86,36 @@ IntBuf MakeBuf(RecordingCaptureBackend& b, const std::vector<int32_t>& v) {
 }
 
 // Always read THROUGH the tensor view, never through a cached pointer. The
-// capture-time semantic of the destination form is `out = fn()` — the
-// destination BECOMES the first eager result (`:222-227`, and upstream's
-// `captured_output = _weak_ref_if_tensor(output)`) — so a cached pointer taken
-// before the break names a buffer nothing writes to afterwards.
-std::vector<int32_t> Read(const IntBuf& b) {
-  std::vector<int32_t> v(static_cast<size_t>(b.t.shape[0]));
-  std::memcpy(v.data(), b.t.data, v.size() * sizeof(int32_t));
+// capture-time semantic of the destination form is that the slot BECOMES the
+// first eager result (`:222-227`, upstream's
+// `captured_output = _weak_ref_if_tensor(output)`), so a pointer cached before
+// the break names a buffer nothing writes to afterwards.
+std::vector<int32_t> ReadT(const vt::Tensor& t) {
+  std::vector<int32_t> v(static_cast<size_t>(t.shape[0]));
+  std::memcpy(v.data(), t.data, v.size() * sizeof(int32_t));
   return v;
 }
+std::vector<int32_t> Read(const IntBuf& b) { return ReadT(b.t); }
 
 int32_t* Data(IntBuf& b) { return static_cast<int32_t*>(b.t.data); }
 
-void AddInPlace(IntBuf& b, int32_t k) {
-  for (int64_t i = 0; i < b.t.shape[0]; ++i) Data(b)[i] += k;
+void Fill(IntBuf& b, int32_t v) {
+  for (int64_t i = 0; i < b.t.shape[0]; ++i) Data(b)[i] = v;
 }
 
-void MulInPlace(IntBuf& b, int32_t k) {
-  for (int64_t i = 0; i < b.t.shape[0]; ++i) Data(b)[i] *= k;
+// `dst = src + k`, the shape of every captured segment in the upstream cases.
+void AddInto(IntBuf& dst, const vt::Tensor& src, int32_t k) {
+  const std::vector<int32_t> s = ReadT(src);
+  for (size_t i = 0; i < s.size(); ++i) Data(dst)[i] = s[i] + k;
+}
+
+// An eager break function: reads its input, scales it, and returns a FRESH
+// allocation — which is exactly what makes the writeback contract load-bearing.
+vt::Tensor FreshScaled(RecordingCaptureBackend& b, const vt::Tensor& src, int32_t mul,
+                       int32_t add) {
+  std::vector<int32_t> v = ReadT(src);
+  for (int32_t& e : v) e = e * mul + add;
+  return MakeBuf(b, v).t;
 }
 
 }  // namespace
@@ -87,102 +125,159 @@ void MulInPlace(IntBuf& b, int32_t k) {
 // ---------------------------------------------------------------------------
 
 // T1 <- test_no_break_capture_replay (`:49-63`). Zero breaks captures and
-// replays exactly like a plain graph.
-TEST_CASE("T1 breakable graph: no break yields ONE segment and zero break fns") {
+// replays exactly like a plain graph: `y = x + 1`, refill x to 5, replay, 6.
+TEST_CASE("T1 breakable graph: no break yields ONE segment and replays like a plain graph") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
+
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf y = MakeBuf(b, {0, 0, 0, 0});
   {
     GraphCaptureScope scope(b, q, g);
     REQUIRE(scope.active());
+    b.Record([&] { AddInto(y, x.t, 1); });  // captured, NOT run
   }
   CHECK(g.segment_count() == 1);
   CHECK(g.break_count() == 0);
   CHECK(g.captured());
   // Exactly one Begin/EndCaptureGraph pair, in that order.
   CHECK(b.Trace() == "Begin EndCaptureGraph");
+  CHECK(Read(y) == std::vector<int32_t>{0, 0, 0, 0});  // capture executed nothing
 
+  Fill(x, 5);  // upstream's x.fill_(5.0)
   b.ClearLog();
   g.Replay(q);
   CHECK(b.Trace() == "ReplayGraph");
+  CHECK(Read(y) == std::vector<int32_t>{6, 6, 6, 6});  // upstream's y == 6.0
   CHECK(g.replay_count() == 1);
 }
 
-// T2 <- test_single_break (`:65-87`). One break splits capture into two
-// segments and the chain composes: x=10 -> +1=11 -> eager *2=22 -> +3=25.
+// T2 <- test_single_break (`:65-87`). One break splits capture into two segments
+// and the chain composes: x=10 -> +1=11 -> eager *2=22 -> +3=25.
 TEST_CASE("T2 breakable graph: ONE break yields two segments and the chain composes") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
 
-  IntBuf x = MakeBuf(b, {10, 10, 10, 10});
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
   IntBuf mid = MakeBuf(b, {0, 0, 0, 0});
   IntBuf y = MakeBuf(b, {0, 0, 0, 0});
+  BreakSlot<vt::Tensor> broken;
 
   {
     GraphCaptureScope scope(b, q, g);
-    // segment 0: mid = x + 1
-    for (int i = 0; i < 4; ++i) Data(mid)[i] = Data(x)[i] + 1;
-    // the break: eager *2. This is the IN-PLACE form of the contract — the
-    // break function writes into a persistent buffer the model owns and that no
-    // replay reallocates, and returns nothing (spec `## Port map` §3, form two).
-    GraphBreak([&] { MulInPlace(mid, 2); });
-    // segment 1: y = mid + 3
-    for (int i = 0; i < 4; ++i) Data(y)[i] = Data(mid)[i] + 3;
+    b.Record([&] { AddInto(mid, x.t, 1); });                      // segment 0: mid = x + 1
+    GraphBreak([&] { return FreshScaled(b, mid.t, 2, 0); }, broken);  // the break: eager *2
+    b.Record([&] { AddInto(y, *broken, 3); });                    // segment 1: y = broken + 3
   }
 
   CHECK(g.segment_count() == 2);
   CHECK(g.break_count() == 1);
   CHECK(b.Trace() == "Begin EndCaptureGraph Begin EndCaptureGraph");
+
+  Fill(x, 10);  // upstream's x.fill_(10.0)
+  g.Replay(q);
   // x=10 -> +1=11 -> eager *2=22 -> +3=25, the upstream chain and values.
-  CHECK(Read(mid) == std::vector<int32_t>{22, 22, 22, 22});
+  CHECK(ReadT(*broken) == std::vector<int32_t>{22, 22, 22, 22});
   CHECK(Read(y) == std::vector<int32_t>{25, 25, 25, 25});
 }
 
 // T3 <- test_multiple_breaks (`:89-115`). Two breaks, three segments, chained:
-// x=5 -> +1=6 -> +1=7 -> +1=8 -> *2=16.
-TEST_CASE("T3 breakable graph: N breaks yield N+1 segments (N=2)") {
+// x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16.
+TEST_CASE("T3 breakable graph: N breaks yield N+1 segments and the chain composes (N=2)") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
+
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf t1 = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf t3 = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf y = MakeBuf(b, {0, 0, 0, 0});
+  BreakSlot<vt::Tensor> t2, t4;
+
   {
     GraphCaptureScope scope(b, q, g);
-    GraphBreak();
-    GraphBreak();
+    b.Record([&] { AddInto(t1, x.t, 1); });                    // segment 0: t1 = x + 1
+    GraphBreak([&] { return FreshScaled(b, t1.t, 1, 1); }, t2);  // break 1: add_one
+    b.Record([&] { AddInto(t3, *t2, 1); });                    // segment 1: t3 = t2 + 1
+    GraphBreak([&] { return FreshScaled(b, t3.t, 2, 0); }, t4);  // break 2: double
+    b.Record([&] { AddInto(y, *t4, 0); });                     // segment 2: y = t4
   }
   CHECK(g.segment_count() == 3);
   CHECK(g.break_count() == 2);
   CHECK(b.Count("Begin") == 3);
   CHECK(b.Count("EndCaptureGraph") == 3);
+
+  Fill(x, 5);  // upstream's x.fill_(5.0)
+  g.Replay(q);
+  // x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16, the upstream chain and values.
+  CHECK(Read(y) == std::vector<int32_t>{16, 16, 16, 16});
 }
 
 // T4 <- test_eager_on_graph_disabled (`:117-129`). With the wrapper DISABLED the
-// function is returned unchanged and runs normally. Our disable switch is the
-// one item 1 of the spec's `## Our baseline` enumerates: VLLM_CPP_CUDAGRAPH=0,
-// which six drivers each read for themselves today.
-TEST_CASE("T4 breakable graph: VLLM_CPP_CUDAGRAPH=0 makes the scope inert") {
-  // The switch is read once per process into a function-local static, exactly as
-  // DevicePool reads its own lanes, so a case cannot toggle it mid-run. The
-  // observable consequence is asserted through the INERT-BACKEND arm instead,
-  // which reaches the same predicate from the other side.
-  CHECK(vt::GraphCaptureEnabled() == (std::getenv("VLLM_CPP_CUDAGRAPH") == nullptr ||
-                                      std::string(std::getenv("VLLM_CPP_CUDAGRAPH")) != "0"));
-
-  // A backend that cannot capture is the second way the scope goes inert; the
-  // forward then runs eager and GraphBreak makes ZERO backend calls.
-  RecordingCaptureBackend no_capture(/*supports_capture=*/false);
-  vt::Queue q = no_capture.CreateQueue();
-  BreakableGraph g;
-  int ran = 0;
-  {
-    GraphCaptureScope scope(no_capture, q, g);
-    CHECK_FALSE(scope.active());
-    GraphBreak([&] { ++ran; });
+// function is returned unchanged and runs normally. Our disable switch is item 1
+// of the spec's `## Our baseline`: VLLM_CPP_CUDAGRAPH=0.
+//
+// IT RUNS IN A CHILD PROCESS, and that is the point. The switch is read once per
+// process into a function-local static, so no case can toggle it. Asserting the
+// OTHER inert arm instead — a backend that cannot capture — substitutes a
+// different conjunct of `active_ = GraphCaptureEnabled() && SupportsGraphCapture()`,
+// and deleting `GraphCaptureEnabled()` from that expression left the whole suite
+// green. `docs/USAGE.md` sells this switch to users; a switch nothing executes is
+// a claim, not a feature.
+TEST_CASE("T4 breakable graph: the VLLM_CPP_CUDAGRAPH kill switch makes a capture-capable "
+          "backend inert") {
+  const char* sentinel_path = std::getenv("VLLM_CPP_BREAK_KILLSWITCH_SENTINEL");
+  if (sentinel_path != nullptr) {
+    // ---- CHILD ARM: this process was started with VLLM_CPP_CUDAGRAPH=0. ----
+    REQUIRE_FALSE(vt::GraphCaptureEnabled());
+    RecordingCaptureBackend b(/*supports_capture=*/true);  // the backend CAN capture
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    int ran = 0;
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE_FALSE(scope.active());  // inert anyway: the switch is the only reason
+      GraphBreak([&] { ++ran; });
+    }
+    REQUIRE(ran == 1);                 // the break function still runs
+    REQUIRE(g.segment_count() == 0);
+    REQUIRE(g.break_count() == 0);
+    REQUIRE(b.Trace().empty());        // zero backend calls
+    std::ofstream out(sentinel_path);
+    out << "INERT-OK";
+    return;
   }
-  CHECK(ran == 1);              // the break function still runs
-  CHECK(g.segment_count() == 0);
-  CHECK(g.break_count() == 0);
-  CHECK(no_capture.Trace().empty());  // zero backend calls
+
+  // ---- PARENT ARM. ----
+#ifdef __linux__
+  char exe[4096] = {0};
+  const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  REQUIRE_MESSAGE(n > 0, "cannot resolve this test binary; the child arm cannot be run");
+  const std::filesystem::path sentinel =
+      std::filesystem::temp_directory_path() /
+      ("vllm_cpp_break_killswitch_" + std::to_string(::getpid()) + ".txt");
+  std::filesystem::remove(sentinel);
+  const std::string cmd = "VLLM_CPP_CUDAGRAPH=0 VLLM_CPP_BREAK_KILLSWITCH_SENTINEL='" +
+                          sentinel.string() + "' '" + std::string(exe) +
+                          "' -tc='*kill switch*' >/dev/null 2>&1";
+  const int rc = std::system(cmd.c_str());
+  CHECK(rc == 0);
+  // The sentinel is what defeats "0 cases ran, SUCCESS!": a filter that matched
+  // nothing exits 0 and writes no file.
+  REQUIRE(std::filesystem::exists(sentinel));
+  std::ifstream in(sentinel);
+  std::string got;
+  in >> got;
+  CHECK(got == "INERT-OK");
+  std::filesystem::remove(sentinel);
+#else
+  MESSAGE("kill-switch child arm needs /proc/self/exe; not run on this platform");
+#endif
 }
 
 // T5 <- test_eager_on_graph_outside_capture (`:131-142`). Outside any capture
@@ -198,44 +293,57 @@ TEST_CASE("T5 breakable graph: OUTSIDE a scope GraphBreak runs fn and calls no b
   CHECK(b.Trace().empty());
 
   // The destination form is a pass-through too, and it does NOT fabricate a
-  // copy: `out` takes the value the break function produced.
-  int out = 0;
-  GraphBreak([] { return 7; }, out);
-  CHECK(out == 7);
+  // copy: the slot takes the value the break function produced, and its storage
+  // is never pinned, so a non-capturing forward allocates nothing extra.
+  BreakSlot<int> out;
+  GraphBreak([] { return 7; }, out, vt::NoWriteback{});
+  CHECK(*out == 7);
+  CHECK_FALSE(out.pinned());
   CHECK(b.copies() == 0);
 }
 
 // T6 <- test_replay_updates_output (`:144-169`). TWO replays with different
-// inputs give different outputs. This is the upstream anchor for G1's
-// "more than one replay" requirement, and (spec test 12) it asserts the replay
-// ORDER directly rather than only a composed value, which a wrong order could
-// still satisfy for a commutative chain.
-TEST_CASE("T6 breakable graph: replay emits seg,break,seg,break,seg IN ORDER, every time") {
+// inputs give different outputs: 3.0, then after x.fill_(10), 33.0. It is the
+// upstream anchor for G1's "more than one replay" requirement and the one case
+// that can see a break function writing to a stale address — and it asserts the
+// break's POSITION in the same log as the segments, not in a second sequence.
+TEST_CASE("T6 breakable graph: two replays with different inputs give different outputs") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
-  std::vector<std::string> order;
+
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf t = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf y = MakeBuf(b, {0, 0, 0, 0});
+  BreakSlot<vt::Tensor> t2;
   {
     GraphCaptureScope scope(b, q, g);
-    GraphBreak([&] { order.push_back("break0"); });
-    GraphBreak([&] { order.push_back("break1"); });
+    b.Record([&] { AddInto(t, x.t, 1); });                        // t = x + 1
+    GraphBreak(
+        [&] {
+          b.Note("scale");
+          return FreshScaled(b, t.t, 3, 0);
+        },
+        t2);                                                      // eager: t * 3
+    b.Record([&] { AddInto(y, *t2, 0); });                        // y = t2
   }
-  REQUIRE(g.segment_count() == 3);
-  REQUIRE(g.break_count() == 2);
-  // The two break functions ran ONCE eagerly during capture, so the outputs hold
-  // real data (breakable_cuda_graph.py:222-223).
-  CHECK(order == std::vector<std::string>{"break0", "break1"});
+  REQUIRE(g.segment_count() == 2);
+  REQUIRE(g.break_count() == 1);
 
-  for (int rep = 0; rep < 3; ++rep) {
-    order.clear();
-    b.ClearLog();
-    g.Replay(q);
-    CHECK(b.Trace() == "ReplayGraph ReplayGraph ReplayGraph");
-    CHECK(order == std::vector<std::string>{"break0", "break1"});
-    CHECK(g.replay_count() == rep + 1);
-  }
-  // Interleaved, not batched: segment i replays before break i.
-  CHECK(b.replayed().size() == 3);
+  // First replay: x=0 -> 0+1=1 -> 1*3=3.
+  b.ClearLog();
+  g.Replay(q);
+  CHECK(b.Trace() == "ReplayGraph scale ReplayGraph");
+  CHECK(Read(y) == std::vector<int32_t>{3, 3, 3, 3});
+
+  // Second replay: x=10 -> 10+1=11 -> 11*3=33.
+  Fill(x, 10);
+  b.ClearLog();
+  g.Replay(q);
+  CHECK(b.Trace() == "ReplayGraph scale ReplayGraph");
+  CHECK(Read(y) == std::vector<int32_t>{33, 33, 33, 33});
+  CHECK(g.replay_count() == 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +367,24 @@ TEST_CASE("T7 CopyOutput: a tensor destination is written IN PLACE, address pres
   CHECK(dst.t.data == dst_addr);  // assertIs(result, dst): identity preserved
   CHECK(Read(dst) == std::vector<int32_t>{5, 5, 5, 5});
   CHECK(b.copies() == 1);  // a real device copy, not a pointer assignment
+}
+
+// The two sides have to AGREE first. Sizing the copy from the destination alone
+// makes a break function that returned the wrong shape or dtype an out-of-bounds
+// READ of the source, where upstream's `dst.copy_(src)` raises. This is the
+// refusal that keeps a mis-registered break point loud (spec D7).
+TEST_CASE("T7c CopyOutput: a destination the break output does not match is REFUSED") {
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  IntBuf dst = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf small = MakeBuf(b, {1, 1});
+  CHECK_THROWS_AS(vt::CopyOutput(b, q, dst.t, small.t), std::runtime_error);
+  CHECK(b.copies() == 0);  // nothing moved
+
+  IntBuf other = MakeBuf(b, {2, 2, 2, 2});
+  other.t.dtype = vt::DType::kF32;  // same element count, different dtype
+  CHECK_THROWS_AS(vt::CopyOutput(b, q, dst.t, other.t), std::runtime_error);
+  CHECK(b.copies() == 0);
 }
 
 // T8 <- test_dict_copy (`:194-208`). A keyed set of destinations is copied
@@ -322,21 +448,24 @@ TEST_CASE("T9 CopyOutput: a struct copies tensor fields in place and ASSIGNS the
 }
 
 // T10 <- test_non_tensor_fallback (`:225-227`). With nothing copyable,
-// `_copy_output` returns `src` — the documented fallback. Here: a break function
-// with no device output is legal and the seam FABRICATES NO COPY.
-TEST_CASE("T10 CopyOutput: a break with no device output is legal, no copy fabricated") {
+// `_copy_output` returns `src` — the documented fallback. Here it must be ASKED
+// FOR: `vt::NoWriteback{}` is the opt-in, and without it the destination form
+// refuses this type at compile time rather than degrading into the branch whose
+// own comment says such a break must use the in-place form.
+TEST_CASE("T10 CopyOutput: the non-copyable fallback is legal and must be asked for") {
+  RequireCaptureLane();
   CHECK_FALSE(vt::detail::HasCopyOutput<int>::value);
   CHECK(vt::detail::HasCopyOutput<vt::Tensor>::value);
 
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
-  int out = 0;
+  BreakSlot<int> out;
   {
     GraphCaptureScope scope(b, q, g);
-    GraphBreak([] { return 42; }, out);
+    GraphBreak([] { return 42; }, out, vt::NoWriteback{});
   }
-  CHECK(out == 42);
+  CHECK(*out == 42);
   CHECK(g.segment_count() == 2);  // it still splits
   CHECK(g.break_count() == 1);
   CHECK(b.copies() == 0);  // and it fabricates no copy
@@ -347,9 +476,9 @@ TEST_CASE("T10 CopyOutput: a break with no device output is legal, no copy fabri
   // the in-place form instead. Asserting the ABSENCE of the writeback is the
   // point: it is the warning a future author needs.
   b.ClearLog();
-  out = 0;
+  *out = 0;
   g.Replay(q);
-  CHECK(out == 0);
+  CHECK(*out == 0);
   CHECK(b.copies() == 0);
 }
 
@@ -359,38 +488,76 @@ TEST_CASE("T10 CopyOutput: a break with no device output is legal, no copy fabri
 // the new data. A container that replayed the caller's raw `fn` and dropped its
 // return value would leave the destination holding capture-time data forever —
 // wrong numerics, not a fault.
-TEST_CASE("T7b GraphBreak(fn,out): every REPLAY writes back into the capture-time address") {
+TEST_CASE("T7b GraphBreak(fn slot): every REPLAY writes back into the capture-time address") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
 
-  IntBuf dst = MakeBuf(b, {0, 0, 0, 0});
+  BreakSlot<vt::Tensor> dst;
   int32_t feed = 11;
   // The break returns a FRESH buffer every call, exactly as an eager operation
   // allocating its own output does.
-  auto fresh = [&] {
-    IntBuf n = MakeBuf(b, {feed, feed, feed, feed});
-    return n.t;
-  };
+  auto fresh = [&] { return MakeBuf(b, {feed, feed, feed, feed}).t; };
 
   void* baked = nullptr;
   {
     GraphCaptureScope scope(b, q, g);
-    GraphBreak(fresh, dst.t);
+    GraphBreak(fresh, dst);
     // The destination is now the CAPTURE-TIME result, and this address is what
     // the following segment bakes. Upstream does the same: `output = inner(...)`
     // then `captured_output = _weak_ref_if_tensor(output)` (`:222-227`).
-    baked = dst.t.data;
+    baked = dst->data;
   }
   CHECK(baked != nullptr);
-  CHECK(Read(dst) == std::vector<int32_t>{11, 11, 11, 11});
+  CHECK(dst.pinned());  // the seam owns the destination, not this frame
+  CHECK(ReadT(*dst) == std::vector<int32_t>{11, 11, 11, 11});
 
   for (int32_t v : {22, 33, 44}) {
     feed = v;
     g.Replay(q);
-    CHECK(dst.t.data == baked);  // the address never moved
-    CHECK(Read(dst) == std::vector<int32_t>{v, v, v, v});
+    CHECK(dst->data == baked);  // the address never moved
+    CHECK(ReadT(*dst) == std::vector<int32_t>{v, v, v, v});
   }
+}
+
+// The destination OUTLIVES the frame that declared it. This is the rule the
+// header used to state in a comment and the first production site broke: a
+// `std::optional<DBuf>` local of the function containing the break dies on that
+// function's `return`, while the following segment goes on reading its address
+// on every replay. With `BreakSlot` the seam owns the storage, so the slot's
+// frame can be gone and the writeback still lands.
+TEST_CASE("Lifetime rule 1: the destination survives the frame that declared it") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  int32_t feed = 7;
+  void* baked = nullptr;
+  std::vector<int32_t> seen;
+
+  {
+    GraphCaptureScope scope(b, q, g);
+    // The slot is a local of THIS block, exactly as the qwen3 site's was a local
+    // of RunLayer, and it is destroyed before the replay below.
+    {
+      BreakSlot<vt::Tensor> inner;
+      GraphBreak([&] { return MakeBuf(b, {feed, feed}).t; }, inner);
+      baked = inner->data;
+      // The following segment BAKES THE ADDRESS, which is what a real capture
+      // records: a pointer, not a reference to whatever frame declared it.
+      const vt::Tensor baked_view = *inner;
+      b.Record([&, baked_view] { seen = ReadT(baked_view); });  // NOT run at capture
+    }
+  }
+  REQUIRE(baked != nullptr);
+
+  feed = 99;
+  g.Replay(q);
+  // The break wrote into the cell the closure owns, and the following segment
+  // read the same address. A destination that died with its frame would have
+  // been read after its storage was recycled.
+  CHECK(seen == std::vector<int32_t>{99, 99});
 }
 
 // ---------------------------------------------------------------------------
@@ -400,27 +567,186 @@ TEST_CASE("T7b GraphBreak(fn,out): every REPLAY writes back into the capture-tim
 // T11 <- test_break_graph_inserts_segment (`:249-265`). The BARE marker splits
 // the segment even though its body does nothing: x=10 -> +1=11 -> break -> +2=13.
 TEST_CASE("T11 GraphBreak(): the BARE marker splits the segment and runs nothing") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   BreakableGraph g;
 
-  IntBuf x = MakeBuf(b, {10, 10, 10, 10});
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf t = MakeBuf(b, {0, 0, 0, 0});
   IntBuf y = MakeBuf(b, {0, 0, 0, 0});
   {
     GraphCaptureScope scope(b, q, g);
-    AddInPlace(x, 1);  // segment 0: x = 10 + 1 = 11
-    GraphBreak();      // the bare marker
-    for (int i = 0; i < 4; ++i) Data(y)[i] = Data(x)[i] + 2;  // segment 1: 13
+    b.Record([&] { AddInto(t, x.t, 1); });  // segment 0: t = x + 1
+    GraphBreak();                           // the bare marker
+    b.Record([&] { AddInto(y, t.t, 2); });  // segment 1: y = t + 2
   }
   CHECK(g.segment_count() == 2);
   CHECK(g.break_count() == 1);
-  CHECK(Read(y) == std::vector<int32_t>{13, 13, 13, 13});
   CHECK(b.Trace() == "Begin EndCaptureGraph Begin EndCaptureGraph");
 
-  // The bare marker's break function is empty, so replay is segments only.
+  Fill(x, 10);  // upstream's x.fill_(10.0)
   b.ClearLog();
   g.Replay(q);
+  // The bare marker's break function is empty, so replay is segments only.
   CHECK(b.Trace() == "ReplayGraph ReplayGraph");
+  CHECK(Read(y) == std::vector<int32_t>{13, 13, 13, 13});  // x=10 -> 11 -> 13
+}
+
+// ---------------------------------------------------------------------------
+// Tests this row owes with no upstream counterpart, numbered on from the ported
+// set in the spec's `## Tests to port`.
+// ---------------------------------------------------------------------------
+
+// Test 12, REPLAY ORDER rather than replay arithmetic. Upstream asserts the
+// composed VALUE, which a wrong order can still satisfy for a commutative chain.
+// The break markers go into the BACKEND's own log, so segments and breaks form
+// ONE sequence: a container that replayed every segment and then ran every break
+// would satisfy two independent assertions and fails this one.
+TEST_CASE("Test 12: replay emits segment break segment break segment IN THAT ORDER every time") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g);
+    GraphBreak([&] { b.Note("break0"); });
+    GraphBreak([&] { b.Note("break1"); });
+  }
+  REQUIRE(g.segment_count() == 3);
+  REQUIRE(g.break_count() == 2);
+  // The two break functions ran ONCE eagerly during capture, so the outputs hold
+  // real data (breakable_cuda_graph.py:222-223).
+  CHECK(b.Trace() ==
+        "Begin EndCaptureGraph break0 Begin EndCaptureGraph break1 Begin EndCaptureGraph");
+
+  for (int rep = 0; rep < 3; ++rep) {
+    b.ClearLog();
+    g.Replay(q);
+    CHECK(b.Trace() == "ReplayGraph break0 ReplayGraph break1 ReplayGraph");
+    CHECK(g.replay_count() == rep + 1);
+  }
+  CHECK(b.replayed().size() == 3);
+}
+
+// Test 13, the CAPTURE-FAILURE DRAIN. The spec recorded this as "the destructor
+// already catches and resets; what is owed is the test", and that was not true:
+// the catch only ever guarded a throwing `EndCaptureGraph`. An exception from
+// ordinary user code mid-capture left a partial 2-segment graph reporting
+// `captured() == true`, which is replayable as HALF A FORWARD. All three arms
+// below are the behaviour, not only its test.
+TEST_CASE("Test 13a: a break function that THROWS during capture leaves nothing captured") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  CHECK_THROWS_AS(
+      [&] {
+        GraphCaptureScope scope(b, q, g);
+        GraphBreak([] { throw std::runtime_error("break blew up"); });
+      }(),
+      std::runtime_error);
+
+  CHECK_FALSE(g.captured());
+  CHECK(g.segment_count() == 0);
+  CHECK(g.break_count() == 0);
+  CHECK(b.live_graphs() == 0);       // every instantiated segment released
+  CHECK(b.Count("EndCaptureGraph") == 1);  // and the stream taken out of capture
+  CHECK(b.Count("DestroyGraph") == 1);
+  CHECK(GraphCaptureScope::Current() == nullptr);
+}
+
+TEST_CASE("Test 13b: ORDINARY code throwing mid-segment leaves no partial capture") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  CHECK_THROWS_AS(
+      [&] {
+        GraphCaptureScope scope(b, q, g);
+        GraphBreak();  // one clean break: two segments are now in flight
+        throw std::runtime_error("model code blew up");
+      }(),
+      std::runtime_error);
+
+  CHECK_FALSE(g.captured());
+  CHECK(g.segment_count() == 0);
+  CHECK(b.live_graphs() == 0);
+  CHECK(b.Count("EndCaptureGraph") == 2);
+  CHECK(GraphCaptureScope::Current() == nullptr);
+}
+
+TEST_CASE("Test 13c: a throwing EndCaptureGraph never propagates out of the destructor") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g);
+    GraphBreak();
+    b.FailNextEndCapture();  // the FINAL close refuses
+  }  // a destructor that propagated would terminate
+  CHECK_FALSE(g.captured());
+  CHECK(b.live_graphs() == 0);
+  CHECK(GraphCaptureScope::Current() == nullptr);
+}
+
+// The invariant `segment_count() == break_count() + 1`, asserted rather than
+// documented. Re-entering a scope on an already-captured container appended to
+// it and produced `seg == brk`, whose last break `Replay` silently drops.
+TEST_CASE("Invariant: a scope REFUSES a BreakableGraph that already holds a capture") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g);
+    GraphBreak();
+  }
+  REQUIRE(g.segment_count() == 2);
+  REQUIRE(g.break_count() == 1);
+
+  CHECK_THROWS_AS(GraphCaptureScope(b, q, g), std::runtime_error);
+  CHECK(g.segment_count() == 2);  // untouched
+  CHECK(g.break_count() == 1);
+  CHECK(GraphCaptureScope::Current() == nullptr);
+
+  g.Replay(q);
+  REQUIRE(g.replay_count() == 1);
+
+  g.Reset();  // the documented way to capture into it again
+  CHECK_FALSE(g.captured());
+  // A released graph's replay count goes with it. A count left behind describes
+  // a graph that no longer exists, and G3's whole job is to be the number nobody
+  // has to trust twice.
+  CHECK(g.replay_count() == 0);
+  {
+    GraphCaptureScope scope(b, q, g);
+    GraphBreak();
+  }
+  CHECK(g.segment_count() == 2);
+  CHECK(g.break_count() == 1);
+}
+
+// Nesting is REFUSED. `BeginCapture` on a stream that is already capturing is
+// CUDA_ERROR_ILLEGAL_STATE on a real backend, and the trace a nested pair emits
+// is not a legal capture sequence on any backend.
+TEST_CASE("Nesting: a second scope on the same thread is REFUSED before any backend call") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph outer_g, inner_g;
+  {
+    GraphCaptureScope outer(b, q, outer_g);
+    REQUIRE(outer.active());
+    CHECK_THROWS_AS(GraphCaptureScope(b, q, inner_g), std::runtime_error);
+    // The refusal made no backend call: still exactly one Begin.
+    CHECK(b.Count("Begin") == 1);
+    CHECK(b.Count("EndCaptureGraph") == 0);
+  }
+  CHECK(outer_g.segment_count() == 1);  // the outer scope closed normally
+  CHECK(inner_g.segment_count() == 0);
+  CHECK(GraphCaptureScope::Current() == nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +756,7 @@ TEST_CASE("T11 GraphBreak(): the BARE marker splits the segment and runs nothing
 // without editing the container (spec `## Risks/decisions` D4).
 // ---------------------------------------------------------------------------
 TEST_CASE("BreakableGraph: destruction releases EVERY segment through DestroyGraph") {
+  RequireCaptureLane();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
   {
@@ -446,10 +773,31 @@ TEST_CASE("BreakableGraph: destruction releases EVERY segment through DestroyGra
   CHECK(b.live_graphs() == 0);
 }
 
+// Test 14, the NON-CAPTURING BACKEND (spec `## Tests to port`). Vulkan
+// (`vulkan_backend.cpp:16`) and Metal (`metal_backend.mm:13`) are the live
+// cases: the scope is inert, the forward runs eager, and GraphBreak makes ZERO
+// backend calls. This is the OTHER conjunct of `active_`; T4 covers the switch.
+TEST_CASE("Test 14: on a backend that cannot capture the scope is inert and the forward is eager") {
+  RecordingCaptureBackend no_capture(/*supports_capture=*/false);
+  vt::Queue q = no_capture.CreateQueue();
+  BreakableGraph g;
+  int ran = 0;
+  {
+    GraphCaptureScope scope(no_capture, q, g);
+    CHECK_FALSE(scope.active());
+    GraphBreak([&] { ++ran; });
+  }
+  CHECK(ran == 1);  // the break function still runs
+  CHECK(g.segment_count() == 0);
+  CHECK(g.break_count() == 0);
+  CHECK(no_capture.Trace().empty());  // zero backend calls
+}
+
 // The G3 observability counters (spec `## Gates` G3): without them there is no
 // way to tell a two-segment capture from a fully eager step, and "the graph ran"
 // is exactly the claim a broken instrument fabricates.
 TEST_CASE("G3: the seam reports segments captured, breaks registered and replays run") {
+  RequireCaptureLane();
   vt::ResetGraphBreakStats();
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();

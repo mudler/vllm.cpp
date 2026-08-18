@@ -438,28 +438,62 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
 
   std::vector<float> depth_hidden;  // [ (num_codebooks-1) * H ], conditional row
   depth_hidden.reserve(static_cast<size_t>(config.residual_codebooks() * H));
-  std::vector<int32_t> fed_back;  // c1..c(i-1), the codes already in the sequence
+
+  // THE SCHEDULE, AND WHY IT IS INCREMENTAL (#672). Upstream re-runs the whole
+  // growing depth sequence at every step and keeps `hidden[:, -1]`
+  // (encoders.py:125-141); so did this loop, through `DepthSequenceEmbeds` +
+  // `DepthDecoderForward`, which re-projected and re-forwarded 70 rows per frame
+  // to read 14 of them. The decoder is causal with a LEARNED position table, so
+  // a row's every intermediate is fixed the moment it is appended:
+  // `DepthDecoderAppend` computes each row ONCE and is bit-identical to the
+  // whole-sequence forward it replaces (minimax_music3_ar.h, and
+  // `test_minimax_music3_ar.cpp` asserts it bitwise at every prefix length).
+  //
+  // The two CFG rows go through as ONE batch-2 call — which is upstream's own
+  // shape, `(2, 2..8, 4096)` — so every weight sweep serves both branches.
+  DepthDecoderCache cache;
+
+  // The depth sequence's first two rows: each branch's own
+  // `projection(last_hidden)` at position 0, and the SHARED
+  // `projection(semantic_embed)` at position 1. Three rows, ONE weight sweep,
+  // and the projection is never recomputed for a row already in the cache —
+  // upstream keeps its projected rows in `sequence` for exactly this reason
+  // (encoders.py:125,127,141).
+  std::vector<float> prefix_rows;
+  prefix_rows.reserve(static_cast<size_t>(3 * H));
+  prefix_rows.insert(prefix_rows.end(), last_hidden_conditional.begin(),
+                     last_hidden_conditional.end());
+  prefix_rows.insert(prefix_rows.end(), last_hidden_unconditional.begin(),
+                     last_hidden_unconditional.end());
+  prefix_rows.insert(prefix_rows.end(), semantic_embed.begin(), semantic_embed.end());
+  std::vector<float> prefix;
+  {
+    profile::Timer embed_timer("ar.depth_projection");
+    prefix = LinearNoBias(prefix_rows, 3, H, weights.depth.projection, H, ArCompute::kBFloat16);
+  }
+
+  // Position 0 is fed for its K/V only: `_generate_depth_codes` reads the last
+  // row of a length-2 sequence first, so position 0's own output is never used.
+  {
+    profile::Timer forward_timer("ar.depth_forward");
+    DepthDecoderAppend(std::vector<float>(prefix.begin(), prefix.begin() + 2 * H), /*batch=*/2,
+                       config, weights.depth, ArCompute::kBFloat16, &cache);
+  }
+
+  std::vector<float> next(static_cast<size_t>(2 * H));
+  std::copy(prefix.begin() + 2 * H, prefix.begin() + 3 * H, next.begin());
+  std::copy(prefix.begin() + 2 * H, prefix.begin() + 3 * H, next.begin() + H);
 
   for (int64_t index = 1; index < config.num_codebooks; ++index) {
-    const int64_t seq_len = index + 1;
-    std::vector<float> hidden_rows[2];
-    for (int row = 0; row < 2; ++row) {
-      const std::vector<float>& last =
-          row == 0 ? last_hidden_conditional : last_hidden_unconditional;
-      std::vector<float> embeds;
-      {
-        profile::Timer embed_timer("ar.depth_projection");
-        embeds = DepthSequenceEmbeds(last, semantic_embed, fed_back, config, weights.depth,
-                                     ArCompute::kBFloat16);
-      }
-      std::vector<float> states;
-      {
-        profile::Timer forward_timer("ar.depth_forward");
-        states =
-            DepthDecoderForward(embeds, seq_len, config, weights.depth, ArCompute::kBFloat16);
-      }
-      hidden_rows[row].assign(states.end() - H, states.end());
+    std::vector<float> states;
+    {
+      profile::Timer forward_timer("ar.depth_forward");
+      states = DepthDecoderAppend(next, /*batch=*/2, config, weights.depth,
+                                  ArCompute::kBFloat16, &cache);
     }
+    std::vector<float> hidden_rows[2];
+    hidden_rows[0].assign(states.begin(), states.begin() + H);
+    hidden_rows[1].assign(states.begin() + H, states.end());
     // `hidden_parts.append(hidden[:1])` — the CONDITIONAL row only, which is why
     // `frame_hiddens` can be reproduced from a golden that stores no other.
     depth_hidden.insert(depth_hidden.end(), hidden_rows[0].begin(), hidden_rows[0].end());
@@ -484,7 +518,26 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
     out_frame_codes->push_back(static_cast<int32_t>(drawn));
     // c7 is only ever PREDICTED (encoders.py:139): feeding it back would need a
     // 17th position the decoder's `pos_embedding` does not have.
-    if (index < config.num_codebooks - 1) fed_back.push_back(static_cast<int32_t>(drawn));
+    if (index < config.num_codebooks - 1) {
+      // encoders.py:140 — `index` there is ONE-based, so the offset is (index-1),
+      // the same row `DepthSequenceEmbeds` builds for `fed_back[index-1]`.
+      const int64_t row = (index - 1) * config.audio_vocab_size + drawn;
+      const size_t at = static_cast<size_t>(row * H);
+      if (at + static_cast<size_t>(H) > weights.depth.audio_embeddings.size()) {
+        Fail("MiniMax-Music3: audio_embeddings row " + std::to_string(row) +
+             " is past the end of a table of " +
+             std::to_string(weights.depth.audio_embeddings.size() / static_cast<size_t>(H)) +
+             " rows");
+      }
+      const std::vector<float> embed(
+          weights.depth.audio_embeddings.begin() + static_cast<int64_t>(at),
+          weights.depth.audio_embeddings.begin() + static_cast<int64_t>(at) + H);
+      profile::Timer embed_timer("ar.depth_projection");
+      const std::vector<float> projected =
+          LinearNoBias(embed, 1, H, weights.depth.projection, H, ArCompute::kBFloat16);
+      std::copy(projected.begin(), projected.end(), next.begin());
+      std::copy(projected.begin(), projected.end(), next.begin() + H);
+    }
   }
   return depth_hidden;
 }

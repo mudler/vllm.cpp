@@ -23449,3 +23449,430 @@ the 0.25.0 rollback — the caveat #378 already carries.
 into a measurement; then the gate-GEMM epilogue fold and batching the 40 per-step launches.
 No ceiling is declared. **Owed:** gate 5 `compute-sanitizer memcheck`; the 35B canonical
 regrid on current main; a vLLM denominator re-measured against the pin.
+## MUSIC3-DEPTH-INCREMENTAL — the depth stage, whole-sequence vs incremental, x86-64 20-core (2026-08-18, `row/MUSIC3-DEPTH-SPEED`, BEFORE arm `fc163f62b`, #672)
+
+**Not a parity ratio and not an end-to-end number.** A STAGE A/B between two
+builds of this project: `fc163f62b` (the `row/MUSIC3-PERF-VS-ORACLE` head this
+change was measured against) and that commit plus `row/MUSIC3-DEPTH-SPEED`,
+which differ in exactly four files. No reference leg; SGLang-Omni is still
+`gateable = no` and every axis in `docs/BENCHMARKS.md` against it stays
+`PENDING`.
+
+**ONE base, and which one (#1247).** An earlier revision of this heading named
+`origin/main` `727163997` while the paragraph above named `fc163f62b`, and the
+two are not the same commit. The BEFORE arm that was BUILT AND TIMED is
+**`fc163f62b`**; `727163997` is only the `origin/main` commit it had merged, so
+it belongs in this sentence rather than in the heading. The delta between them is
+`7a2dabd65`, #1231's per-stage profiler and nothing else, and the driver never
+enters it: every function the driver calls lives in
+`src/vllm/model_executor/models/minimax_music3_ar.cpp`, which contains zero
+`profile::` uses, while `music3_profile.h` is included only by
+`minimax_music3_llm.cpp` and `minimax_music3_speech.cpp`. So the measurement
+stands as taken; what was wrong was the record. `fc163f62b` is reachable from
+`origin/row/MUSIC3-PERF-VS-ORACLE` and is NOT an ancestor of this row's head —
+that profiler reached `main` as the squashed `aba8d5ffb`, which is.
+
+### What is timed
+
+ONE frame of the depth stage as `Music3DepthStage` drives it: seven codebook
+steps, two CFG rows, the projection and the decoder, with a fixed code per step
+so the two arms traverse identical rows. `DepthDecoderConfig`'s defaults are the
+REAL geometry — hidden 4096, 4 layers, 16 heads, ffn 6144, 8 codebooks — and the
+2.5 GB of weights are seeded pseudo-random floats drawn identically on both arms.
+
+* BEFORE arm: `DepthSequenceEmbeds` + `DepthDecoderForward` over the whole
+  growing sequence, twice per step. 70 row-forwards, 70 weight sweeps.
+* AFTER arm: one 3-row prefix projection, then eight `DepthDecoderAppend` calls
+  at batch 2. 16 row-forwards, 8 weight sweeps.
+
+### Recipe
+
+x86-64, 20 cores, 84 GB. ONE driver source compiled twice and linked against the
+two `libvllm.a` builds, the shape §12.4 used:
+
+    g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
+        -I<wt>/build/include -isystem <wt>/third_party [-DMUSIC3_AFTER] \
+        tools/bench/music3_depth_stage_ab.cpp -o depthbench-<arm> \
+        <wt>/build/libvllm.a <wt>/build/libblake3_vendored.a -lpthread
+
+### Why the minimum, and what was NOT run
+
+The box was carrying three other sessions' `test_ltx2_video` runs and two full
+`ctest` builds throughout, at a 1-minute load average of **39.30 before the
+series and 51.98 after** (5-minute 71-92) on 20 cores. A wall-clock e2e pair
+taken there measures somebody else's scheduler — the same confound that voided
+§12.5's pair — so the e2e pair was NOT attempted. A short stage loop can be
+repeated, so the MINIMUM over rounds is available and is the least-disturbed
+sample.
+
+The Thor per-stage pair, which is the one that prices this against #1231's own
+`ar.depth_forward` = 347.3 s / 1414 calls, is **QUEUED on `thor:gpu0`** behind
+two other jobs and is PENDING, not estimated.
+
+### Result — 8 alternating pairs, 17 timed rounds per arm
+
+| series | BEFORE (s) | AFTER (s) | pair ratio |
+|---|---|---|---|
+| A pair 1 | 6.7769 | 1.7795 | 3.81 |
+| A pair 2 | 6.6714 | 2.0487 | 3.26 |
+| A pair 3 | 6.9562 | 2.5047 | 2.78 |
+| A pair 4 | 7.5485 | 2.4196 | 3.12 |
+| A pair 5 | 6.4413 | 2.1171 | 3.04 |
+| B pair 1 | 6.5467 5.8667 6.2444 6.0943 | 1.9943 2.0208 1.8607 1.6766 | 3.50 |
+| B pair 2 | 6.3505 5.9991 5.8783 6.5534 | 2.0193 2.1022 1.6981 1.8891 | 3.46 |
+| B pair 3 | 6.3186 6.3508 8.6671 7.6575 | 3.3631 3.0259 3.4770 3.7275 | 2.09 |
+| **minimum over all rounds** | **5.8667** | **1.6766** | **3.50x** |
+| median of the 8 pair ratios | | | **3.19x** |
+
+B pair 3 is the loudest on BOTH arms and is kept rather than dropped.
+
+### Bit-identity at production geometry
+
+**16 processes, one printed fingerprint each, all `f0cfeed6eee4f55d`.** The
+denominator is stated exactly because it is the evidence (#1247). The table above
+is 8 alternating pairs x 2 arms = **16 processes**, carrying 5 + 12 = **17 timed
+rounds per arm**; `music3_depth_stage_ab.cpp` computes the FNV-1a fingerprint of
+the frame's 28 672 depth hidden values every round but prints ONE line per
+process, after the round loop, so 16 fingerprints were printed and every one of
+them read `f0cfeed6eee4f55d`. An earlier revision said "all 20 runs", which is
+neither the round count nor the process count.
+
+The unit gate (`test_minimax_music3_ar`, 32 cases / 470 assertions) proves the
+identity against the reference forward at reduced dimensions; this proves it
+4096-wide, across two separately compiled libraries.
+
+### 3.5x, not the 8.75x the byte accounting predicts
+
+Weight traffic falls 8.75x per frame (70 sweeps to 8) and arithmetic 4.375x (70
+row-forwards to 16). The measured 3.5x sits just below the ARITHMETIC ratio, so
+on this box the stage is closer to compute-bound than the ~4 bytes per
+multiply-accumulate suggested. That inference came from a 14-core Jetson Thor
+with unified LPDDR5X; a 20-core x86-64 with a large L3 is a different regime, and
+which side of the bound each box sits on is exactly what the queued Thor pair
+would say. Two costs are also real: the incremental arm makes 8 pooled calls per
+frame where the old one made 14 larger ones, so it pays proportionally more
+`Threadpool::Barrier`, and its per-step attention is a scalar loop over one query
+row that no longer rides the output-row partition. Both show up as the after
+arm's wider relative spread (1.68-3.73 against 5.87-8.67).
+## MUSIC3-DEPTH-THOR-PAIR-1 — VOID: the two arms were the same binary (2026-08-18, `thor:gpu0`, job `56848b2e`, #672)
+
+**Status: VOID. This pair measured nothing about the depth schedule, and its
+numbers must not be quoted.** It is recorded because a voided measurement with
+its cause named is evidence, and a silently dropped one is not.
+
+**The cause, from the job's own log:**
+
+```text
+gen_before: 72744 bytes sha=b98a5dbba37a67f1
+gen_after:  72744 bytes sha=b98a5dbba37a67f1
+```
+
+The job used ONE source tree and ONE build dir for both arms. After the first
+build, the second configure-and-build found the tree up to date and emitted no
+distinct binary, so `gen_before` and `gen_after` are the same program under two
+names. Both arms hashed `b98a5dbba37a67f1`.
+
+**What it reported, marked as not a result:** `ar.depth_forward` 77.930 s on the
+nominal BEFORE arm against 77.726 s on the nominal AFTER arm, at **808 calls on
+both**. That is a 0.26 % spread between two runs of one binary. The identical
+call count is the internal control that catches it: the whole claim of
+`MUSIC3-DEPTH-INCREMENTAL` is that the schedule goes from 14 depth calls per
+frame to 8, so **a pair whose call count does not move cannot contain the
+change**. Taken at face value this pair reads as a refutation of the 3.50x in
+`MUSIC3-DEPTH-INCREMENTAL`, and it is not one.
+
+**Generalisation, because this is the third shape of the same defect in this
+tree.** A mutation that fails to rebuild reads as a passing test; a restore
+without a rebuild leaves the previous mutation's object in `libvllm.a`; an A/B
+that fails to rebuild reads as a levelled speedup. In every case the instrument
+measures the previous artifact and returns a confident verdict about the code.
+**Whenever two artifacts are required to differ, assert that they differ — by
+hash — before reading anything downstream of them.**
+
+**Replacement in flight:** job `7b22b5b0`, `thor:gpu0`, `--max-runtime 150m`.
+Separate clones and separate build dirs per arm; a hard `FATAL_ARMS_IDENTICAL`
+guard on the two binaries' `sha256` so this failure aborts rather than tabulates;
+the checkpoint staged to local disk first (spec §15.6); three alternating pairs;
+and a cross-arm comparison of the output WAV `sha256`, which puts the
+bit-identity claim at Thor geometry alongside the speed. Arms `c802dba8d` (the
+`row/MUSIC3-DEPTH-SPEED` merge-base, so the delta is exactly the 10 files the row
+touches) and `4568c6e71`. Spec §16.6a.
+
+## MUSIC3-DEPTH-THOR-PAIR-2 — the real-checkpoint Thor pair: 4.45x depth, 2.74x wall, byte-identical audio (2026-08-18, `thor:gpu0` sm_110, job `7b22b5b0`, arms `c802dba8d` / `4568c6e71`, #672)
+
+**Status: TAKEN. This replaces the PENDING left by `MUSIC3-DEPTH-THOR-PAIR-1`,
+which is VOID and stays on the record above.**
+
+Thor sm_110, `--device 1 --duration 4 --steps 4 --seed 7`, 100 frames, three
+alternating pairs. Arms are `c802dba8d` (the `row/MUSIC3-DEPTH-SPEED`
+merge-base, so the delta is exactly the 10 files the row touches) and
+`4568c6e71`.
+
+**Preconditions asserted before any timing was read**, which is the entire point
+of this second pair:
+
+```text
+gen_before sha=33f5c5fb18a7e91a5fe7b2fe26f7f5c1 size=72744
+gen_after  sha=d2fdac95a34ce177bbdd9e766e87078a size=72744
+ARMS_DIFFER=yes
+STAGE_SECONDS=815 SRC_BYTES=28517617303 DST_BYTES=28517617303
+```
+
+The checkpoint was staged to local disk with source and destination byte counts
+asserted equal, so the cold-CIFS load is outside these figures.
+
+| bucket | BEFORE mean of 3 | AFTER mean of 3 | ratio | calls |
+|---|---|---|---|---|
+| `ar.depth_forward` | 348.273 s | 78.316 s | **4.45x** | 1414 -> 808 |
+| `ar.depth_projection` | 10.102 s | 1.307 s | **7.73x** | 1414 -> 707 |
+| `ar.depth_stage` | 359.090 s | 80.221 s | **4.48x** | 101 -> 101 |
+| `ar.TOTAL_loop` | 375.687 s | 94.084 s | **3.99x** | 1 -> 1 |
+| **wall clock** | **446.33 s** | **163.00 s** | **2.74x** | — |
+| `vocoder.decode_window` | 53.648 s | 53.605 s | 1.00x | 1 -> 1 |
+| `ar.lm_decode_step` | 14.989 s | 12.339 s | 1.21x | 100 -> 100 |
+
+Per-run, so the spread is visible rather than implied. `depth_forward` before
+348.076 / 349.588 / 347.154, after 78.190 / 78.627 / 78.131. Wall before
+450 / 446 / 443 s, after 164 / 163 / 162 s. The bands do not approach each other.
+
+**The call count is the control the void pair failed.** `depth_forward` goes
+1414 -> 808, which is 101 frames x 14 against 101 frames x 8; `depth_projection`
+goes 1414 -> 707, which is 101 x 14 against 101 x 7. That is the schedule change
+exactly. `MUSIC3-DEPTH-THOR-PAIR-1`'s 808-calls-on-both-arms is
+now positively explained as the AFTER binary run twice.
+
+**Decomposition.** `depth_forward` costs 246.30 ms per call before and 96.93 ms
+after, so 4.45x is **1.75x fewer calls times 2.54x cheaper per call**. The
+per-call figures are not like-for-like by design: a BEFORE call re-forwards the
+whole growing depth sequence, an AFTER call appends one position against a cache.
+
+### Quote 2.74x to a user, not 4.45x
+
+The depth stage was **80.5 % of wall before and is 49.2 % after**. What now
+dominates is a term this change does not touch: `vocoder.decode_window` is
+**53.6 s on both arms**, moving from 12.0 % of wall to **32.9 %**. A fixed serial
+phase does not shrink when the parallel one does. The stage saved 278.9 s and
+wall fell 283.3 s, so the wall saving is accounted for and nothing unexplained is
+hiding in the total.
+
+**One delta is unexplained and is recorded, not smoothed.** `ar.lm_decode_step`
+fell 14.989 -> 12.339 s over an unchanged 100 calls, and this change does not
+touch the LM decode. A smaller AR working set is the plausible reading and it is
+a **hypothesis**: 2.65 s of the 283.3 s saving has no established cause.
+
+### E2E byte-identity, at full scale
+
+**All three pairs wrote `sha 5e81fc133d653560` on BOTH arms — six runs, one
+hash**, with identical `RMS 0.01350`, `peak 0.25180` and geometry (3.994 s,
+44100 Hz, 2 channels, 176 128 samples/channel). This runs the real checkpoint
+through every stage including the vocoder and compares the finished file, so it
+is strictly stronger than the unit gate or than `MUSIC3-DEPTH-INCREMENTAL`'s
+in-process fingerprint. The leg the spec carried as owed is closed.
+
+### 4.45x here against 3.50x in `MUSIC3-DEPTH-INCREMENTAL` — two measurements
+
+Different boxes, different weight sources, different arms, and neither confirms
+the other. `MUSIC3-DEPTH-INCREMENTAL` is a synthetic in-process bench on a
+20-core x86-64 under load 39-52 driving seeded pseudo-random weights, arms
+`fc163f62b` and that commit plus the change. This is the shipped binary on a
+14-core Jetson Thor against the real 28.5 GB checkpoint.
+
+**Why Thor is higher is a labelled HYPOTHESIS.** The byte accounting predicts
+8.75x and the arithmetic 4.375x; Thor's 4.45x sits just above the arithmetic
+ratio and x86's 3.50x just below it, the direction a unified-LPDDR5X box against
+a large-L3 x86 box would give. The prediction matching is not a measurement, and
+the ~46 GB/s figure it reasons from was itself inferred from Thor, so this is the
+same argument returning rather than independent support. Settling it needs a
+measured bandwidth on both boxes.
+
+## ENG-CUDAGRAPH-DEDUP W5 — the coarse-key experiment: the fold HAPPENS, the driver refuses NOTHING, and the OFF/OFF control VOIDED one workload (2026-08-18, `row/ENG-CUDAGRAPH-DEDUP-KEY-RESULT`, experiment branch `row/ENG-CUDAGRAPH-DEDUP-KEY` at `b48b51df1`, PR #1232 DRAFT, GB10 sm_121a, #1226 / #1162 / #1283)
+
+**This does not supersede `ENG-CUDAGRAPH-DEDUP W4`. It answers the one hypothesis
+W4 left open.** W4 measured the SHIPPED exact key and found `N == M` in every ON
+cell. That result stands, unchanged, for that key. W5 measures a DIFFERENT key,
+behind its own opt-in, on a branch that has not landed.
+
+### What was being tested
+
+W4's negative was attributed, from source, to `AppendKernelPayload`
+(`src/vt/graph_dedup_runtime.h:119-129`) hashing `(func, gridDim.{x,y,z},
+blockDim.{x,y,z}, sharedMemBytes)` while decode buckets differ precisely in launch
+dimensions, so no candidate group ever forms. The hypothesis filed as
+[#1226](https://github.com/mudler/vllm.cpp/issues/1226): `cudaGraphExecUpdate`
+requires *topology* to match and is designed to permit *parameter* changes, and a
+kernel's launch configuration is a parameter. Because the registry probes BEFORE it
+folds, a coarser key that groups two graphs the driver then refuses costs one wasted
+probe and a private executable, never a wrong replay. That makes it a cost question.
+
+### Recipe
+
+`dgx:gpu0` through an `rc` lease, pod `rc-worker-4b8lj`, boot_id
+`3fd9745a-d25a-426c-ba3c-97c958a85515` — **the same value at both ends of the log**,
+so the box did not reboot mid-series. GB10, driver `580.173.02`. `### AB_KEY START
+2026-08-18T20:49:31Z` to `### DONE_AB_KEY 2026-08-18T20:58:46Z`.
+
+Source: `git archive` of `b48b51df1`, tar sha256
+`7aa50f3bc165bb471f4e9b45512127716a2e603450dbe76a149ac2d382c772ad`, **asserted by
+the harness before extraction** (`got=7aa50f3b…`). The coarse-key assertion strings,
+which exist only at that commit, were verified before configure. Binary sha256
+`ca114abb6055223c24127beb414ee033c562c17deee0223de91c641242240b63`, copied out of the
+build tree before anything ran it. Model Qwen3-0.6B bf16 (`Qwen3ForCausalLM`, 28
+layers, hidden 1024), `model.safetensors` sha256
+`11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641`.
+
+All four mandatory production-stack configure assertions GREEN, quoted from
+`ab.log`:
+
+```text
+-- CUTLASS found at /tmp/dedupkey/cutlass; enabling sm120a NVFP4 cutlass GEMM
+-- FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)
+-- Triton AOT: gdn_deltah_h48 <- sm_121a as vt_aot_sm_121a_gdn_deltah_h48_default
+VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a
+```
+
+`### BUILD END 2026-08-18T20:56:08Z rc=0`, `compile_errors=0`. Both CPU dedup suites
+green before any cell ran: `test_graph_dedup` 13/13 cases / 65 assertions,
+`test_graph_dedup_runtime` 22/22 cases / 88 assertions, `Status: SUCCESS!` on both.
+Loader path `/tmp/dedupkey/cu13lt:/usr/local/cuda/targets/sbsa-linux/lib:/tmp/dedupkey/run`
+(oracle cuBLASLt + toolkit cudart), qualified by a preflight that had to exit 0,
+capture a decode graph AND write its token artifact: `smoke c1 rc=0
+captured_graphs=1 cublas_errors=0 loader_errors=0 ids=present`.
+
+Every cell: `vllm-bench --model <qwen3-0.6b> --input-len 64 --temperature 0
+--output-token-ids <ids>` with `VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1`
+throughout. **Greedy, fixed seed.** The only variables are `VT_CUDA_GRAPH_DEDUP` and
+`VT_CUDA_GRAPH_DEDUP_COARSE_KEY`.
+
+| Workload | `--concurrency` | `--num-prompts` | `--output-len` | `--seed` | `--max-num-batched-tokens` | captured padded sizes |
+|---|---:|---:|---:|---:|---|---|
+| A | 24 | 24 | 40 | 4242 | 128 | 24, 16, 8 |
+| B | 16 | 21 | 32 | 777 | not passed | 16, 8 |
+| C | 32 | 49 | 24 | 31337 | not passed | 32, 24 |
+
+### Result 1 — THE HYPOTHESIS IS CONFIRMED
+
+The `### FOLD SUMMARY` block, verbatim from `logs-ab/ab.log`:
+
+```text
+a_exact:    captured 3 graphs, deduped to 3 execs  (probes=0 refused=0)
+a_coarse_a: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+a_coarse_b: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+b_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+b_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+c_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+c_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+```
+
+Each COARSE cell announced itself: `vt graph dedup: key mode = COARSE (launch
+dimensions and extents dropped)`; each EXACT cell announced `key mode = EXACT`. The
+harness VOIDs a cell that fails to announce the arm it claims, and no cell did.
+
+**`probes=0` on every exact-key cell is the direct proof of W4's diagnosis, not a
+restatement of it.** W4 concluded from reading `graph_dedup_runtime.h` that no
+candidate group forms and `cudaGraphExecUpdate` is never asked. The probe counter says
+exactly that, from the running process, which is a different and stronger kind of
+evidence. Drop the launch dimensions and the driver is asked once per fold and
+**accepts every time**. So on this hardware `cudaGraphExecUpdate` does tolerate a
+grid-dimension change, and the benefit W4 recorded as unreachable **is reachable via
+the key**.
+
+**`refused=0` is one driver on one hardware and toolkit pair.** AGENTS.md forbids
+declaring a ceiling; it equally forbids declaring a floor from one box. Nothing here
+says the driver accepts a grid change elsewhere, and a refusal elsewhere would be a
+cost, not a correctness failure.
+
+### Result 2 — byte-identity holds on A and C
+
+`--output-token-ids`, real generated identifiers, `empty_rows=0` everywhere.
+
+| Workload | cells | `ids_sha256` | bytes | requests x tokens |
+|---|---|---|---:|---|
+| A | `off_a`, `off_b`, `exact`, `coarse_a`, `coarse_b` — all five | `59ebff4a22362086b9fcf426feba847b15b0dc7bf31b37892b1bfc7221b435dc` | 3655 | 24 x 40 = 960 |
+| C | `off_a`, `off_b`, `exact`, `coarse_a` — all four | `ff205260c1fa41a8cc10ad1b8fd0c29f40bd6a2324aa8a64f5192f62cedbd76b` | 4608 | 49 x 24 = 1176 |
+
+A and C hash to two different values, so the identity is not vacuous. On both, the
+OFF/OFF control passed FIRST (`IDENTICAL a_off_a == a_off_b`, `IDENTICAL c_off_a ==
+c_off_b`) and only then were the ON arms compared.
+
+### Result 3 — WORKLOAD B IS VOID, and the cause is a NEW DEFECT
+
+```text
+*** DIFFERS *** b_off_a vs b_off_b
+b_off_a  = 5973c5a10a6210085417fb25a29edbd0dc15fe61d7d4f774dd8ff3883dae1d64  bytes=2638
+b_off_b  = 4cf7923080db6aa29759537f2192f3d9500db11c0e8d72bbb2b4ac6e4614af7c  bytes=2650
+ids_b_off_a.json ids_b_off_b.json differ: char 2166, line 1
+```
+
+Both cells had `VT_CUDA_GRAPH_DEDUP` **unset** — this is the OFF/OFF control. One
+binary, one workload, greedy `--temperature 0 --seed 777`, 23 seconds apart
+(`20:57:42Z` and `20:58:05Z`), same captured sizes `16 8`, same 59 replays across 3
+slots. Different token ids.
+
+What the divergence is, read out of the artifacts rather than inferred: both runs emit
+`ids_requests=21 ids_total_tokens=672 empty_rows=0`, so **the token counts are
+identical** and the 2638-vs-2650 delta is JSON decimal width, not a truncation and not
+an early stop. Exactly two of the 21 rows differ, and both diverge mid-decode rather
+than at the first token — row 17 at token index 11, row 18 at token index 5. Rows 17
+and 18 sit in the ragged tail that `--num-prompts 21` at `--concurrency 16` leaves.
+
+**Consequence: B's `b_off_a == b_exact` and `b_off_a == b_coarse_a` lines are
+worthless**, because they compare against a baseline that does not reproduce itself.
+**B is VOID, not a pass.** Only the OFF/OFF control makes that visible; without it, B
+would have read as three more byte-identity confirmations. This is the second time on
+this row that a control, not a result, carried the finding.
+
+This is **not** a dedup defect — the feature is off in both cells that disagree — and
+it is not diagnosed here beyond what the evidence shows. Filed as
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283) with the hashes, the exact cell
+configuration, and an isolation plan: establish the rate over N repetitions; re-run with
+`VLLM_CPP_CUDAGRAPH=0` to separate the scheduler from the graph path; test the
+ragged-tail hypothesis with `--num-prompts` an exact multiple of `--concurrency`;
+compare per-step batch composition for the two diverging requests; and check the top-2
+logit margin at the divergence step, because a near-tie a reduction order can flip is a
+different defect from a wrong value.
+
+### Caveats — every one of these bounds the result above
+
+- **The toolkit is NOT the one the completed baseline ran on.** W5 built under nvcc
+  **`13.3.73`** (`### NVCC_RELEASE=13.3`); the completed baseline gate recorded in
+  `fe24a3029` ran under **`13.0.88`**, which is the version the recorded dgx gate stack
+  names. The pod's toolkit is a property of the shared pod, not of the job — the
+  16:43Z attempt on this same boot saw 13.0.88 and the 20:49Z run saw 13.3.73. The
+  OFF-vs-ON and EXACT-vs-COARSE comparisons **within this one binary** are valid.
+  **This run and that baseline are not directly comparable to each other.**
+- **Clocks were NOT pinned:** 2405 MHz current, 3003 MHz max, 2418 MHz applications,
+  53 °C, throttling `Disabled`. **No throughput number is claimed or implied.** The
+  `Benchmark duration` figures (2.52-2.72 s) and `replay branch avg` figures
+  (0.038-0.124 ms/step) in the logs are diagnostics, not measurements.
+- **No memory number either, and this one is not about the clocks.** Nothing in this
+  run measured bytes. The fold counts EXECUTABLES. What one `cudaGraphExec_t` costs on
+  this model, and therefore what 3→2 returns, is unmeasured on both keys.
+- **Load was not controlled**, only recorded: `loadavg_series_start=10.63 9.15 6.73`,
+  `loadavg_series_end=2.11 4.82 5.80`, falling monotonically across the series. Cell
+  order is fixed in the harness, so a load-correlated effect is not separable from a
+  cell-order effect here.
+- **Only the Qwen3 dense decode driver was exercised**, as in W4. Whether any other
+  capture site, or two models sharing the process-singleton registry, folds under
+  either key is untested.
+- **PR [#1232](https://github.com/mudler/vllm.cpp/pull/1232) is a DRAFT.** The coarse
+  key is behind `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`, default OFF, inside
+  `VT_CUDA_GRAPH_DEDUP`, itself default OFF. **Nothing on `main` folds today**, and
+  this entry must not be read as though it does.
+
+### Evidence
+
+`/mnt/nas_share/rc/dedup-key/` — `README.md` (the harness, its guards, and the
+2026-08-18T15:47Z VOID it was repaired after), `run.sh`, `build.sh`,
+`src-b48b51df1.tar`, `logs/` (configure, build, unit suites, binary and model sha256,
+nvcc version), `logs-ab/ab.log` and `logs-ab/run_<tag>.log` for all 13 cells, and
+`out-ab/ids_<tag>.json` for the token artifacts.
+
+### Next traceable hypotheses
+
+No ceiling and no floor is declared. **Owed:** the byte measurement that would price
+the fold, on pinned clocks; the probe cost at the bucket churn a real serving grid
+produces (7 or 11 buckets across nine capture drivers, not the 2-3 measured here); a
+second driver and a second CUDA release for the `refused=0` rate; landing #1232 before
+any of that, because the key it would default to is still a draft; and
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283), without which no future A/B on
+this row can use a ragged-tail workload shape.

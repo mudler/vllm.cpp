@@ -39,7 +39,7 @@ now says so.
 | C ABI field | `include/vllm.h:474-486` |
 | C ABI mapping | `src/capi/vllm_c.cpp:577-580` |
 | Engine field and default | `include/vllm/entrypoints/model_loader.h:87-90` |
-| The place it is discarded | `src/vllm/entrypoints/model_loader.cpp:954-959` |
+| The place it is discarded | `src/vllm/entrypoints/model_loader.cpp::ResolveNumBlocks` |
 | Upstream knob this mirrors | `vllm/config/cache.py:68` @ `555967922` |
 | Upstream override precedence | `vllm/config/cache.py:189` @ `555967922` |
 
@@ -64,7 +64,7 @@ plain `double` that defaults to 0.92 cannot.
 `nullopt` means unset and resolves to vLLM's 0.92. This mirrors the tri-state
 `enable_prefix_caching` already in the same struct
 (`include/vllm/entrypoints/model_loader.h:120`, resolved at
-`src/vllm/entrypoints/model_loader.cpp:718-728`). Nothing in the tree reads the
+`src/vllm/entrypoints/model_loader.cpp::ResolveEnablePrefixCaching`). Nothing in the tree reads the
 field today, so the type change moves no behavior.
 
 Each surface then says what it means:
@@ -95,7 +95,8 @@ that discards the value. That is the one seam every entry point reaches: the
 server, `examples/cli` through the C ABI, and any `include/vllm.h` client all
 build a `LoadedEngine`, whose constructor calls `MakeKVCacheResolved`, which
 calls `ResolveNumBlocks`
-(`src/vllm/entrypoints/model_loader.cpp:1081-1083,972`).
+(`src/vllm/entrypoints/model_loader.cpp::MakeKVCacheResolved`,
+`src/vllm/entrypoints/model_loader.cpp::ResolveNumBlocks`).
 
 It fires once per engine load, not once per process. A server that loads a text
 engine and an embedding engine reports twice, because there are two pools and

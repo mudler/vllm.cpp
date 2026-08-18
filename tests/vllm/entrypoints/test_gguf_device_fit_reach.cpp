@@ -59,7 +59,7 @@ class HostBackend final : public vt::Backend {
   }
   // "A platform can be registered while CreateQueue still fails" is the reason
   // `SelectQueueForModel`'s AUTO arm wraps this call in a try/catch and falls
-  // back to CPU (`ResolveAutoDevice`, `model_loader.cpp:100-115`). This flag
+  // back to CPU (`src/vllm/entrypoints/model_loader.cpp::ResolveAutoDevice`). This flag
   // reproduces that box on a
   // host with no CUDA device, so the resolver the fit refusal reads can be
   // checked against the queue the load will actually run on. A flag rather than

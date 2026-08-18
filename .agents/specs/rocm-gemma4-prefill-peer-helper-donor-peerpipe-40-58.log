@@ -1,0 +1,19 @@
+struct PeerSlot {
+  int cdev = -1, edev = -1;
+  int I = 0, H = 0, Mcap = 0;
+  int pending_M = 0;
+  vt::Queue eq{};
+  bool eq_live = false;
+  void* x = nullptr;
+  void* y = nullptr;
+  void* gu_act = nullptr;
+  void* act = nullptr;
+  hipEvent_t ev_c = nullptr, ev_e = nullptr;
+};
+struct PeerPipe {
+  PeerSlot s[2];
+};
+inline PeerPipe& PeerPipeTls() {
+  static thread_local PeerPipe pipe;
+  return pipe;
+}

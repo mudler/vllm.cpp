@@ -62,7 +62,7 @@ Unbroken chain, every hop read:
 | into `EngineParams` | `server_main.cpp:806` |
 | resolved (explicit override wins) | `src/vllm/entrypoints/model_loader.cpp::ResolveMaxNumBatchedTokens` |
 | into `SchedulerConfig` | `src/vllm/entrypoints/model_loader.cpp::MakeSchedulerConfig` |
-| into the `Scheduler` | `src/vllm/entrypoints/model_loader.cpp::max_num_batched_tokens_` |
+| into the `Scheduler` | `src/vllm/entrypoints/model_loader.cpp::MakeScheduler` |
 | into `max_num_scheduled_tokens` | `src/vllm/v1/core/sched/scheduler.cpp:233-234` |
 | into the per-step budget | `scheduler.cpp:465` |
 

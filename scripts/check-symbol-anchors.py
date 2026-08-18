@@ -78,8 +78,14 @@ UPSTREAM_SYNC = ROOT / ".agents/upstream-sync.md"
 # `::`, and a (possibly qualified) identifier. The extension requirement is what
 # keeps ordinary C++ prose out: `Qwen3_5MTPKind::kMoe` has no path in front of
 # it and never matches.
+#
+# The leading class admits a DOT. It did not, and every path beginning with one
+# therefore matched zero times and said nothing about it -- so a citation of
+# a spec or a workflow by symbol -- a dot-leading path -- was silently unchecked.
+# That was latent while nobody wrote one, and `.agents/porting.md` now invites
+# exactly that.
 CITATION_RE = re.compile(
-    r"`([A-Za-z0-9_][A-Za-z0-9_./+-]*\.(?:cpp|cc|h|hpp|cu|cuh|py|sh|md))"
+    r"`([A-Za-z0-9_.][A-Za-z0-9_./+-]*\.(?:cpp|cc|h|hpp|cu|cuh|py|sh|md))"
     r"::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_~][A-Za-z0-9_]*)*)`"
 )
 
@@ -121,6 +127,17 @@ FROZEN_FILES = (".agents/issue-index.md",)
 # red for the wrong reason.
 BASENAME_SUFFIXES = {".cpp", ".cc", ".h", ".hpp", ".cu", ".cuh"}
 
+# The recorded floor on the in-repo population. `checked == 0` alone is a mute
+# switch: one added FROZEN_PREFIXES entry, or a narrowed CITATION_RE, takes the
+# count from 91 to 1 and a zero-guard stays green the whole way down. This is a
+# ratchet with headroom, not a per-PR record lock -- no change has to edit it,
+# and it is raised only when the population has grown durably.
+#
+# It applies to THIS tree. A `--root` fixture holds one citation by design, so
+# the floor there is `--min-checked` if given and 1 otherwise; the zero-guard
+# still covers every root.
+MIN_IN_REPO_CHECKED = 85
+
 
 @dataclass(frozen=True)
 class Citation:
@@ -137,6 +154,7 @@ class Citation:
 class Counts:
     scanned_files: int = 0
     frozen_files: int = 0
+    untracked_with_citations: int = 0
     citations: int = 0
     checked: int = 0
     fresh: int = 0
@@ -165,6 +183,65 @@ def tracked_files(root: Path) -> list[str]:
             if p.is_file() and ".git/" not in p.as_posix()
         )
     return sorted(result.stdout.split())
+
+
+def untracked_files(root: Path) -> list[str]:
+    """Files git can see but has not been told about."""
+
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return sorted(result.stdout.split())
+
+
+def count_untracked_citations(root: Path) -> int:
+    """How many UNTRACKED files carry a citation this run will not see.
+
+    This change reported the blind spot about itself and then closed it only for
+    its own fixtures: the first version of the test file wrote them as real
+    local paths, was untracked, and ran green -- `git ls-files` does not list an
+    untracked file, so neither its citations nor its existence as a cited PATH
+    reach the walk. CI is sound because everything is tracked there. The local
+    pre-commit run is not, and a green run before `git add` is not a green run.
+    The skip is not closed here, because scanning the working tree would change
+    what the gate's subject IS. It is COUNTED and PRINTED, the same discipline
+    `frozen_files` already gets: a gate that cannot say how many things it left
+    out has not reported.
+    """
+
+    total = 0
+    for rel in untracked_files(root):
+        if rel.startswith(FROZEN_PREFIXES) or rel in FROZEN_FILES:
+            continue
+        path = root / rel
+        if path.suffix not in SCAN_SUFFIXES or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "::" in text and CITATION_RE.search(text):
+            total += 1
+    return total
+
+
+def evidence(body: str) -> str:
+    """The cited file's text with its OWN citation spans removed.
+
+    A citation span is a claim about some file, never a definition or a call, so
+    it may not stand as evidence for one. Leaving it in reopened #911 for a
+    self-citation: when the citing and cited files are the SAME file, the
+    expectation is read from the file under test and the citation text supplies
+    its own evidence, so `` `a.cpp::GhostSymbol` `` written inside `a.cpp` read
+    as fresh over a symbol that exists nowhere else. Stripping every citation
+    span, not only the self-citing one, also closes the cross-file form, where
+    `a.cpp` names `Ghost` only inside its citation of `b.cpp`.
+    """
+
+    return CITATION_RE.sub(" ", body)
 
 
 def contains_symbol(body: str, symbol: str) -> bool:
@@ -234,21 +311,41 @@ def check_tree(root: Path) -> tuple[Counts, list[str]]:
                 f"{cite.render()}: names a path under this repository that does not exist"
             )
             continue
-        if verdict == "ambiguous":
-            counts.ambiguous += 1
-            continue
         if verdict == "upstream":
             counts.upstream += 1
             continue
+        # An ambiguous basename used to be counted and dropped, so five live
+        # citations were skipped for naming a file that exists twice. A
+        # basename is checked against EVERY candidate instead: one of them
+        # containing the symbol is what the citation claims, and reporting only
+        # when NONE does keeps the ambiguity from becoming a false accusation.
+        if verdict == "ambiguous":
+            counts.ambiguous += 1
         counts.checked += 1
-        body = (root / candidates[0]).read_text(encoding="utf-8", errors="replace")
-        if contains_symbol(body, cite.symbol):
+        hit = next(
+            (
+                rel
+                for rel in candidates
+                if contains_symbol(
+                    evidence((root / rel).read_text(encoding="utf-8", errors="replace")),
+                    cite.symbol,
+                )
+            ),
+            None,
+        )
+        if hit is not None:
             counts.fresh += 1
         else:
             counts.stale += 1
-            errors.append(
-                f"{cite.render()}: {candidates[0]} does not contain `{cite.symbol}`"
+            where = (
+                candidates[0]
+                if len(candidates) == 1
+                else f"no file named `{cite.path}` ({len(candidates)} candidates)"
             )
+            errors.append(
+                f"{cite.render()}: {where} does not contain `{cite.symbol}`"
+            )
+    counts.untracked_with_citations = count_untracked_citations(root)
     return counts, errors
 
 
@@ -303,7 +400,7 @@ def check_upstream(root: Path, upstream_root: Path, counts: Counts) -> list[str]
             counts.upstream_missing += 1
             if key not in seen:
                 errors.append(f"{cite.render()}: absent from vLLM at {pin}")
-        elif contains_symbol(body, cite.symbol):
+        elif contains_symbol(evidence(body), cite.symbol):
             counts.upstream_fresh += 1
         else:
             counts.upstream_stale += 1
@@ -315,9 +412,34 @@ def check_upstream(root: Path, upstream_root: Path, counts: Counts) -> list[str]
     return errors
 
 
-# (name, citing text, cited path, cited body, stale)
+# (name, citing text, cited path, cited body, stale[, the citing file IS the
+# cited file]). The last field defaults to False, which puts the citation in a
+# separate `note.md`.
 FIXTURES = (
     ("fresh", "`alpha/beta/a.cpp::Widget`", "alpha/beta/a.cpp", "struct Widget {};\n", False),
+    (
+        "self-citation is not its own evidence",
+        "`alpha/beta/a.cpp::GhostSymbol`",
+        "alpha/beta/a.cpp",
+        "struct Widget {};\n",
+        True,
+        True,
+    ),
+    (
+        "self-citation of a symbol that IS there",
+        "`alpha/beta/a.cpp::Widget`",
+        "alpha/beta/a.cpp",
+        "struct Widget {};\n",
+        False,
+        True,
+    ),
+    (
+        "a citation in the cited file is not evidence",
+        "`alpha/beta/a.cpp::Ghost`",
+        "alpha/beta/a.cpp",
+        "// see `alpha/beta/b.cpp::Ghost`\n",
+        True,
+    ),
     ("renamed", "`alpha/beta/a.cpp::Widget`", "alpha/beta/a.cpp", "struct Gadget {};\n", True),
     ("call site counts", "`alpha/beta/a.cpp::Load`", "alpha/beta/a.cpp", "  Registry::Load(x);\n", False),
     ("qualified", "`alpha/beta/a.cpp::Registry::Load`", "alpha/beta/a.cpp", "  Registry::Load(x);\n", False),
@@ -337,12 +459,21 @@ def self_test() -> int:
     import tempfile
 
     failures: list[str] = []
-    for name, citing, cited_path, cited_body, stale in FIXTURES:
+    for fixture in FIXTURES:
+        name, citing, cited_path, cited_body, stale = fixture[:5]
+        self_cite = fixture[5] if len(fixture) > 5 else False
         with tempfile.TemporaryDirectory() as raw:
             box = Path(raw)
             (box / "alpha/beta").mkdir(parents=True, exist_ok=True)
-            (box / cited_path).write_text(cited_body, encoding="utf-8")
-            (box / "note.md").write_text(f"see {citing} for the shape\n", encoding="utf-8")
+            if self_cite:
+                (box / cited_path).write_text(
+                    f"// see {citing} for the shape\n{cited_body}", encoding="utf-8"
+                )
+            else:
+                (box / cited_path).write_text(cited_body, encoding="utf-8")
+                (box / "note.md").write_text(
+                    f"see {citing} for the shape\n", encoding="utf-8"
+                )
             counts, errors = check_tree(box)
             if counts.checked != 1:
                 failures.append(f"{name}: checked={counts.checked}, expected 1")
@@ -367,6 +498,13 @@ def main() -> int:
         help="path to a vLLM checkout containing the parity pin; enables upstream mode",
     )
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--min-checked",
+        type=int,
+        default=None,
+        help="floor on the in-repo checked count; defaults to the recorded "
+             "MIN_IN_REPO_CHECKED for this tree and to 1 for a --root fixture",
+    )
     args = parser.parse_args()
 
     if args.self_test:
@@ -375,21 +513,44 @@ def main() -> int:
     root = Path(args.root).resolve()
     counts, errors = check_tree(root)
 
+    if args.min_checked is not None:
+        floor = args.min_checked
+    else:
+        floor = MIN_IN_REPO_CHECKED if root == ROOT else 1
+
+    buckets = counts.checked + counts.upstream + counts.missing_local
     print(
         f"symbol anchors: {counts.citations} citations in {counts.scanned_files} scanned files "
-        f"({counts.frozen_files} frozen files skipped)"
+        f"({counts.frozen_files} frozen files skipped, "
+        f"{counts.untracked_with_citations} untracked files carrying citations NOT scanned)"
     )
     print(
         f"  in-repo checked {counts.checked} (fresh {counts.fresh}, stale {counts.stale}); "
-        f"upstream/unknown {counts.upstream}; ambiguous basename {counts.ambiguous}; "
+        f"upstream/unknown {counts.upstream}; "
+        f"of which ambiguous basename {counts.ambiguous}; "
         f"missing local path {counts.missing_local}"
     )
+    print(f"  buckets sum {buckets} vs {counts.citations} citations; floor {floor}")
 
     if counts.checked == 0:
         errors.append(
             "0 in-repo citations were checked. The tree carries symbol anchors, so a "
             "zero here means the citation grammar or the file walk stopped matching, "
             "not that everything is fresh."
+        )
+    elif counts.checked < floor:
+        errors.append(
+            f"in-repo checked {counts.checked} is below the recorded floor {floor}. "
+            "A population that collapses is the grammar or the file walk failing, "
+            "not the tree losing citations -- a floor of zero over a population of "
+            "ninety is a mute switch."
+        )
+
+    if buckets != counts.citations:
+        errors.append(
+            f"buckets sum to {buckets} but {counts.citations} citations were found. "
+            "Every citation must land in exactly one of checked / upstream / "
+            "missing, or a citation has stopped being counted anywhere."
         )
 
     if args.upstream_root is not None:

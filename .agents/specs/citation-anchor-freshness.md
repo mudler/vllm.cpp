@@ -9,10 +9,10 @@ owning capability row and does not belong in a capability matrix.
 
 ## Now
 
-`GATE-SYMBOL-ANCHORS` ships green. 86 in-repo symbol anchors are checked on
-every run, 26 of them converted here. `model_loader.cpp` line references in
-tracked, non-frozen, non-locked files fell from 106 to 86; the 86 that remain
-are listed under `## Owed`.
+`GATE-SYMBOL-ANCHORS` ships green. 91 in-repo symbol anchors are checked on
+every run against a recorded floor of 85, 26 of them converted here.
+`model_loader.cpp` line references in tracked, non-frozen, non-locked files fell
+from 112 in 47 files to 92 in 35; the 92 that remain are listed under `## Owed`.
 
 ## Scope
 
@@ -33,7 +33,10 @@ copied into `gguf_device_fit.h` and `expert-streaming.md`, so staleness was
 propagating by copy-paste.
 
 Out of scope: splitting `model_loader.cpp`, and any change to
-`.agents/engine-matrix.md` or `scripts/check-agent-record.py` (see `## Owed`).
+`scripts/check-agent-record.py`. The `.agents/engine-matrix.md` exclusion was
+lifted after review: the fix is one CELL inside an existing row, which adds no
+row and moves no counter, so it cannot collide with a concurrent session that
+appends one.
 
 ## The options, and why option 4
 
@@ -57,7 +60,7 @@ Option 4 wins on one observation the other three miss: **the convention already
 exists in this tree.** 539 `` `path::Symbol` `` citations are already written,
 `.agents/model-matrix.md` uses the form for every upstream model anchor, and
 they had never been checked. This change is not an invention, it is finishing
-something half-adopted — which is why the gate lands green over 86 anchors
+something half-adopted — which is why the gate lands green over 91 anchors
 instead of needing a flag day.
 
 It also resolves the tautology hazard structurally rather than by care. Under
@@ -77,21 +80,67 @@ ordinary C++ prose out: `Qwen3_5MTPKind::kMoe` has no path in front of it.
 
 | Bucket | Rule | Verdict |
 |---|---|---|
-| in-repo | path is a tracked file, or a bare basename with our own source extension matching exactly one tracked file | the FULL cited symbol must appear in that file with word boundaries on both sides |
+| in-repo | path is a tracked file, or a bare basename with our own source extension matching a tracked file | the FULL cited symbol must appear in that file with word boundaries on both sides |
 | missing local | the path's directory is at least two components deep AND exists here, but the file does not | FAIL |
 | upstream / unknown | anything else | counted, skipped |
-| ambiguous basename | basename matches more than one tracked file | counted, skipped |
 
-Every bucket is printed. A gate that cannot say how many things it examined has
-not reported, so a run that checks ZERO in-repo citations FAILS: the tree
-carries symbol anchors, and a zero means the grammar or the walk stopped
-matching, not that everything is fresh.
+Three counts ride alongside: how many of the in-repo checks resolved an
+AMBIGUOUS basename, how many FROZEN files were skipped by prefix, and how many
+UNTRACKED files carry a citation this run cannot see.
+
+Every bucket is printed, and the three buckets must SUM to the citation count,
+so a citation that stops being counted anywhere is arithmetic rather than
+judgement. A run that checks ZERO in-repo citations FAILS, and so does one below
+the recorded floor `MIN_IN_REPO_CHECKED` — a zero-guard over a population of
+ninety is a mute switch, because one added `FROZEN_PREFIXES` entry or one
+narrowed `CITATION_RE` takes the count from 91 to 1 and stays green the whole
+way down. The floor carries headroom on purpose: no change has to edit it, so it
+is a ratchet and not a per-PR record lock. `--min-checked` overrides it, and a
+`--root` fixture tree defaults to 1.
 
 `--upstream-root <vllm-checkout>` additionally resolves `vllm/...` citations
 against the parity pin, read with `git show <pin>:<path>` after asserting the
 checkout CONTAINS that commit. Opt-in and never a CI gate, because CI has no
 oracle checkout — it is the instrument that would have found #1139 before a
 reader did.
+
+### A citation span is not evidence
+
+The tautology immunity is "expectation from the CITING file, evidence from the
+CITED file". Those two sides COLLAPSE when they are the same file: the
+expectation is then read from the file under test, and the citation text itself
+contains the symbol, so `` `a.cpp::GhostSymbol` `` written inside `a.cpp` read as
+fresh over a symbol that exists nowhere else. That is #911 again, reached by a
+different door, and `.agents/porting.md` now tells authors to write the full
+path — which makes a file documenting its own symbols the most natural next
+thing anyone writes.
+
+Every citation span is therefore stripped from the cited file before the search.
+Stripping all of them, not only the self-citing one, also closes the cross-file
+form, where `a.cpp` names `Ghost` only inside its own citation of `b.cpp`. A
+citation is a claim about some file; it is never a definition or a call, so it
+may not stand as evidence for one.
+
+### An ambiguous basename is checked, not skipped
+
+A basename matching more than one tracked file used to be counted and dropped,
+which silently skipped five live citations. It is checked against EVERY
+candidate instead, and reported only when NONE of them contains the symbol: one
+candidate containing it is exactly what the citation claims, and reporting on
+the ambiguity itself would be a false accusation.
+
+### The untracked blind spot is counted, not closed
+
+An untracked file is absent from `git ls-files`, so neither its citations nor
+its existence as a cited PATH reaches the walk. This change found that out about
+itself: the first version of the test file wrote its fixtures as real local
+paths, was untracked, and ran green. CI is sound because everything is tracked
+there. A local pre-commit run is not, and a green run before `git add` is not a
+green run.
+
+Scanning the working tree instead would change what the gate's SUBJECT is, so
+the skip stays. It is COUNTED and PRINTED, the same discipline `frozen_files`
+already gets.
 
 ### What it deliberately does not do
 
@@ -107,17 +156,36 @@ reader did.
   one-component directory falls through to the upstream bucket — a miss, never a
   false accusation.
 - **No network.**
+- **A dot-leading path is a citation.** It was not: the grammar's first
+  character class excluded `.`, so a citation of anything under `.agents/` or
+  `.github/` matched zero times and said nothing about it. Latent while nobody
+  wrote one, and live the moment somebody cites a spec by symbol — which
+  `.agents/porting.md` now invites.
 
 ## Tests
 
-`tests/scripts/test_check_symbol_anchors.py`, 13 cases. The load-bearing one is
+`tests/scripts/test_check_symbol_anchors.py`, 21 cases. The load-bearing one is
 `test_verdict_depends_on_the_citing_text`: one cited file, unchanged, cited
 twice with different symbols, asserting the two verdicts DIFFER. A #911-shaped
 checker cannot pass it, because nothing it reads varies between the two runs.
 
-`test_this_tree_is_green_over_a_non_zero_population` parses the checked count
-out of the run and asserts it is above zero, so a green that examined nothing
-cannot be reported as a pass.
+That case cannot see the self-citation door, because it uses two DIFFERENT
+files. `test_a_citation_span_is_not_its_own_evidence` and
+`test_a_citation_in_the_cited_file_is_not_evidence_either` close it from both
+sides.
+
+`test_this_tree_meets_the_recorded_floor` asserts the checked count against a
+LITERAL 85, not against the checker's own constant. Reading the constant would
+make the case a tautology: lowering the floor would lower the expectation with
+it. `test_the_floor_reds_when_the_population_collapses` drives `--min-checked`
+over a one-citation tree so the comparison itself is executable, and
+`test_the_buckets_sum_to_the_citation_count` runs a fixture tree that populates
+all three buckets at once — this tree has zero missing local paths, so asserting
+the sum only here would leave that bucket droppable without a red.
+
+`test_untracked_files_carrying_citations_are_counted` builds a real repository,
+because outside one `git ls-files` fails, the checker falls back to walking the
+filesystem, and the blind spot cannot exist to be measured.
 
 ## Gates
 
@@ -126,6 +194,7 @@ python3 scripts/check-symbol-anchors.py
 python3 scripts/check-symbol-anchors.py --self-test
 python3 tests/scripts/test_check_symbol_anchors.py
 python3 scripts/check-symbol-anchors.py --upstream-root /path/to/vllm   # opt-in
+python3 scripts/check-symbol-anchors.py --min-checked N                # override the floor
 ```
 
 Registered in `scripts/agent-preflight.sh` (`CHECKERS` and `SUITES`) and in
@@ -133,32 +202,80 @@ Registered in `scripts/agent-preflight.sh` (`CHECKERS` and `SUITES`) and in
 
 ## Evidence
 
-**Tree, after conversion and after merging `origin/main`.** 592 citations in
-2754 scanned files, 180 frozen files skipped; in-repo checked 86 (fresh 86,
-stale 0); upstream/unknown 501; ambiguous basename 5; missing local path 0.
-`rc=0`. 59 of the 86 were already in the tree and had never been checked; 26
-were converted here, and one arrived with `origin/main`.
+Every absolute below was re-measured at the final head of this branch. The first
+recorded set was not reproducible: the upstream run was recorded as 354/343 and
+reproduces as 364/353, the residue as 106 in 46 to 86 in 34 and reproduces as
+112 in 47 to 92 in 35, and `check-agent-record.py` was recorded as ENGINE=161
+and reports ENGINE=162. Every DELTA in that set was right and every ABSOLUTE was
+not, which is the shape a number quoted from an earlier run takes.
 
-**Upstream mode, at the pin.** 354 upstream anchors checked against
-`5559679229bc961848b121ccdeaa8fa5d79bec98`: 343 fresh, 0 stale, 11 naming a file
-absent at the pin (#1199). Not one symbol anchor was stale across the same pin
-advance that broke every line anchor #1139 examined. That is the measurement
-that decides the convention.
+**Tree.** 616 citations in 2754 scanned files, 180 frozen files skipped, 0
+untracked files carrying citations; in-repo checked 91 (fresh 91, stale 0), of
+which 5 resolved an ambiguous basename; upstream/unknown 525; missing local path
+0; buckets sum 616 vs 616; floor 85. `rc=0`.
 
-**Mutation, six mutations, each applied, compiling, over 13 executed cases:**
+**Upstream mode, at the pin.** 364 upstream anchors checked against
+`5559679229bc961848b121ccdeaa8fa5d79bec98`: 353 fresh, **0 stale**, 11 naming a
+file absent at the pin, which dedupe to the 10 reported lines (#1199). Not one
+symbol anchor was stale across the same pin advance that broke every line anchor
+#1139 examined. That is the measurement that decides the convention.
 
-| Mutation | compile_rc | cases_ran | rc | caught by |
-|---|---|---|---|---|
-| M1 every symbol declared present | 0 | 13 | 1 | 4 cases |
-| M2 the #911 tautology (expectation from the CITED file) | 0 | 13 | 1 | 4 cases incl. `test_verdict_depends_on_the_citing_text` |
-| M3 vacuity guard removed | 0 | 13 | 1 | `test_zero_checked_citations_is_a_failure` |
-| M4 missing local path downgraded to a skip | 0 | 13 | 1 | `test_a_local_path_that_does_not_exist_is_reported` |
-| M5 frozen archive no longer skipped | 0 | 13 | 1 | `test_the_frozen_archive_is_skipped_and_counted` |
-| M6 word boundaries dropped | 0 | 13 | 1 | 2 cases |
+**The perturbation control.** "0 stale" says nothing until the corpus is shown
+capable of going stale. Appending `Zq` to every cited symbol name, applied and
+compiling, reports `in-repo checked 91 (fresh 0, stale 91)` and
+`upstream checked 364 (fresh 0, stale 353, file absent 11)`: not one of the 444
+fresh anchors survives the rename. Freshness is therefore a property this corpus
+has to earn, not one the check hands it.
 
-Every mutation restored byte-for-byte, verified by sha256. The
-`DISABLED_CREATION_CHECKER` stub registered in `scripts/check-pr-size.py` fails
-12 of the 13 cases, so the creation contract is rejected rather than satisfied.
+**`scripts/check-agent-record.py`.** `rc=0`, ENGINE=162 MODEL=377 QUANT=82
+KERNEL=52 BACKEND=85.
+
+**The residue instrument, spelled so somebody else gets the number.** Population
+is `git ls-tree -r --name-only <rev>` minus four surfaces: `.agents/completed/**`
+(frozen archive), `.agents/issue-index.md` (append-only, an edit is forbidden),
+`.agents/benchmark-record.md` and `.agents/parity-ledger.md` (append-only
+records). Counted is every occurrence of `model_loader\.cpp:[0-9]`, plus the
+number of distinct files carrying one:
+
+```sh
+excl=(':!.agents/completed' ':!.agents/issue-index.md'
+      ':!.agents/benchmark-record.md' ':!.agents/parity-ledger.md')
+git grep -I -o -E 'model_loader\.cpp:[0-9]' <rev> -- "${excl[@]}" | wc -l
+git grep -I -l -E 'model_loader\.cpp:[0-9]' <rev> -- "${excl[@]}" | wc -l
+```
+
+At `1f4878fdc`: 112 references in 47 files. At this head: 92 in 35. 20
+converted.
+
+**Mutation, thirteen mutations, each applied and compiling, over 21 executed
+cases.** `applied` is a moved sha256 plus a non-empty `git diff --stat`;
+`cases` is the LAST `Ran N tests` line, because a mutation that never applied
+and one that fails to build both read as a passing test otherwise.
+
+| Mutation | applied | compile_rc | cases | rc | caught by |
+|---|---|---|---|---|---|
+| M1 every symbol declared present | yes | 0 | 21 | 1 | 7 cases |
+| M2 the #911 tautology (expectation read from the CITED file) | yes | 0 | 21 | 1 | 7 cases incl. `test_verdict_depends_on_the_citing_text` |
+| M3 vacuity guard removed | yes | 0 | 21 | 1 | `test_zero_checked_citations_is_a_failure` |
+| M4 missing local path downgraded to a skip | yes | 0 | 21 | 1 | 3 cases |
+| M5 frozen archive no longer skipped | yes | 0 | 21 | 1 | `test_the_frozen_archive_is_skipped_and_counted` |
+| M6 word boundaries dropped | yes | 0 | 21 | 1 | 2 cases |
+| M7 a citation span is evidence again | yes | 0 | 21 | 1 | 3 cases incl. both self-citation cases |
+| M8 untracked files no longer counted | yes | 0 | 21 | 1 | `test_untracked_files_carrying_citations_are_counted` |
+| M9 the floor comparison removed | yes | 0 | 21 | 1 | `test_the_floor_reds_when_the_population_collapses` |
+| M10 one `FROZEN_PREFIXES` entry collapses the population | yes | 0 | 21 | 1 | 3 cases incl. `test_this_tree_meets_the_recorded_floor` |
+| M11 one bucket dropped from the sum | yes | 0 | 21 | 1 | `test_the_buckets_sum_to_the_citation_count` |
+| M12 only the first candidate of an ambiguous basename is consulted | yes | 0 | 21 | 1 | 4 cases |
+| M13 the leading dot removed from the grammar | yes | 0 | 21 | 1 | `test_a_dot_leading_path_is_a_citation` |
+
+Zero invalid mutations. Every one restored byte-for-byte against the baseline
+sha256. M11 was NOT caught on the first pass: this tree has zero missing local
+paths, so dropping that bucket left the arithmetic intact — the case now runs a
+fixture tree that populates all three buckets, and the mutation reds.
+
+The `DISABLED_CREATION_CHECKER` stub registered in `scripts/check-pr-size.py`
+fails 20 of the 21 cases, so the creation contract is rejected rather than
+satisfied.
 
 ### The gate caught this change
 
@@ -171,7 +288,9 @@ stops it, and it is why the fixtures are now `alpha/beta/...`: a directory that
 exists in no tree falls into the skipped bucket in the real repository while
 still resolving inside each temporary one. It also says something about the
 instrument: an untracked file is not scanned, so a green run before `git add` is
-not a green run.
+not a green run. That lesson was first applied only to the
+fixtures. It is now applied to the tool as well, which COUNTS and PRINTS the
+untracked files carrying citations rather than passing over them in silence.
 
 ## Converted here, and verified how
 
@@ -193,12 +312,12 @@ is given where it differs from the cited one.
 | `tests/vllm/model_executor/test_gguf_device_fit.cpp` | `:1452-1453` | `::FromModelDir` | condition at 1533/1546 |
 | `tests/vllm/v1/worker/test_runner.cpp` | `:1007-1023` | `::runner_` | 1135 |
 | `tests/vllm/config/test_speculative_mtp_depth.cpp` | `:831` | `::ResolveMtp` | 911 |
-| `tests/parity/test_qwen36_spec_decode.cpp` | `:582` | `::Qwen3_5MTPKind` | 1550, 1663 |
+| `tests/parity/test_qwen36_spec_decode.cpp` | `:582` | `::is_dense_model` | 1548, 1661 |
 | `.agents/specs/cli-serve-bench.md` ×2 | `:800-811` | `::async_engine` | 1342 |
 | `.agents/specs/vt-fp8-shared-seam.md` | `:133` | `::PrintLoadBytes`, `::LoadStatsEnabled` | 206, 188 |
 | `.agents/specs/perf-chunked-prefill-budget-2026-08-13.md` ×2 | `:626-641` | `::ResolveMaxNumBatchedTokens` | 701 |
 | `.agents/specs/perf-chunked-prefill-budget-2026-08-13.md` | `:704-717` | `::MakeSchedulerConfig` | 779 |
-| `.agents/specs/perf-chunked-prefill-budget-2026-08-13.md` | `:1051-1058` | `::max_num_batched_tokens_` | 1166/1173/1188 |
+| `.agents/specs/perf-chunked-prefill-budget-2026-08-13.md` | `:1051-1058` | `::MakeScheduler` | 812, called at 1184 |
 | `.agents/specs/perf-chunked-prefill-budget-2026-08-13.md` | `:711` | `::MakeSchedulerConfig` | 786 |
 | `.agents/specs/gpu-mem-util-inert.md` | `:954-959` | `::ResolveNumBlocks` | 928 |
 | `.agents/specs/gpu-mem-util-inert.md` | `:718-728` | `::ResolveEnablePrefixCaching` | 718 (was correct) |
@@ -206,6 +325,14 @@ is given where it differs from the cited one.
 
 Two were already correct and are converted anyway, because a correct line
 anchor is one edit away from a wrong one.
+
+Two more were WEAKER than what they replaced and were repaired after review. A
+symbol that occurs eight times localises nothing: `::max_num_batched_tokens_`
+named the value being traced rather than the hop the row describes, and is now
+`::MakeScheduler`, which is the hop. `::Qwen3_5MTPKind` named the enum where the
+selection is a ternary on the factory flag, and is now `::is_dense_model`, which
+is the thing that decides. A conversion that reds on a rename is the minimum; a
+conversion that also tells the reader where to look is the point.
 
 ## Risks
 
@@ -223,34 +350,45 @@ anchor is one edit away from a wrong one.
 ## Owed
 
 - [#1143](https://github.com/mudler/vllm.cpp/issues/1143) stays OPEN and owns
-  the residue. Measured over tracked files, excluding the frozen and locked
-  surfaces below, `model_loader.cpp:NNN` references fell from 106 in 46 files to
-  86 in 34 — 20 converted, 86 left. They were left because converting one
-  requires deciding what the author meant: a heuristic pass that scanned a
-  two-line context window around each of 92 such citations found 62 naming no
-  `model_loader.cpp` symbol at all, so there is nothing to convert them TO
-  without re-deriving the claim. The other 30 could not be converted mechanically
-  either, because the window pulls in symbols from adjacent table rows; every
-  conversion here was made by hand and verified individually. Deliberately excluded surfaces: `.agents/completed/**` (frozen
-  archive), `.agents/issue-index.md` (append-only, an edit is forbidden),
-  `.agents/benchmark-record.md` and `.agents/parity-ledger.md` (append-only
-  records).
-- [#1139](https://github.com/mudler/vllm.cpp/issues/1139) stays OPEN. Its
-  remaining fix is one cell, `.agents/engine-matrix.md:115`, which this change
-  was instructed not to touch because concurrent sessions hold that file
-  alongside the hardcoded `ENGINE` count in `scripts/check-agent-record.py`. The
-  replacement text is verified and ready to paste: the anchors are
+  the residue: 92 `model_loader.cpp:NNN` references in 35 files, down from 112
+  in 47, over the population and command recorded under `## Evidence`. They were
+  left because converting one requires deciding what the author meant: a
+  heuristic pass that scanned a two-line context window around each of 92 such
+  citations found 62 naming no `model_loader.cpp` symbol at all, so there is
+  nothing to convert them TO without re-deriving the claim. The other 30 could
+  not be converted mechanically either, because the window pulls in symbols from
+  adjacent table rows; every conversion here was made by hand and verified
+  individually.
+- [#1139](https://github.com/mudler/vllm.cpp/issues/1139) is CLOSED by this
+  change. Its last cell, the `KV-WARMUP-PROFILE` row in
+  `.agents/engine-matrix.md`, now carries
   `vllm/v1/worker/gpu_worker.py::determine_available_memory`,
-  `vllm/v1/worker/gpu/model_runner.py::profile_run`, and
-  `vllm/v1/worker/gpu/model_runner.py::model_memory_usage`. All three resolve at
-  the pin under `scripts/check-symbol-anchors.py --upstream-root`; the three
-  line anchors they replace do not.
-- [#1198](https://github.com/mudler/vllm.cpp/issues/1198) — three specs assert
-  loader behaviour the loader no longer has, found while verifying anchors for
-  conversion.
-- [#1199](https://github.com/mudler/vllm.cpp/issues/1199) — 10 upstream symbol
-  citations name vLLM files absent at the pin, six of them `.agents/model-matrix.md`
-  rows whose repair is a claim about vLLM, not a path edit.
+  `vllm/v1/worker/gpu/model_runner.py::profile_run` and
+  `vllm/v1/worker/gpu/model_runner.py::model_memory_usage` in place of the three
+  line anchors that pointed at unrelated code at the pin. All three resolve
+  under `--upstream-root`; the upstream count moved 360 to 364 checked and 349
+  to 353 fresh, with stale still zero. The edit is a CELL inside an existing
+  row: it adds no row and moves no counter, so `check-agent-record.py` reports
+  the same ENGINE=162 before and after.
+- [#1198](https://github.com/mudler/vllm.cpp/issues/1198) - now FOUR specs
+  assert loader behaviour the loader no longer has, found while verifying
+  anchors for conversion. The fourth is
+  `.agents/specs/gguf-mtp-spec-decode.md`, which says in the present tense that
+  `LoadedEngine::FromModelDir` refuses a GGUF speculative target at
+  `model_loader.cpp:717-723` - the same removed refusal and the same stale range
+  as the `gguf-dflash-draft.md` row already on that issue. `717-723` is
+  `ResolveEnablePrefixCaching`.
+- [#1199](https://github.com/mudler/vllm.cpp/issues/1199) - 11 upstream symbol
+  citations, deduping to 10 reported lines, name vLLM files absent at the pin;
+  six of them are `.agents/model-matrix.md` rows whose repair is a claim about
+  vLLM, not a path edit.
+- **One-component directories still fall through to the upstream bucket.** A
+  typo in `tests/foo.cpp` is not reported, because vLLM has real files sitting
+  directly under top-level names we share and nothing in the path separates
+  them. This is a deliberate miss and never a false accusation; it is recorded
+  here rather than fixed, because narrowing it needs a rule that can tell the
+  two trees apart, which is what `--upstream-root` already does for the paths it
+  covers.
 
 ## Stop conditions
 

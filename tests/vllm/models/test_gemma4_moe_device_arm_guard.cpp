@@ -4,7 +4,8 @@
 //
 // WHAT MAKES THIS A REACHABILITY GATE AND NOT A UNIT TEST. The guard is entered
 // through `vllm::RunGemma4Moe` — the Gemma-4 MoE layer entry point that
-// `gemma4.cpp:634` calls — with a real `Gemma4MoeLayerWeights`, the real router,
+// `src/vllm/model_executor/models/gemma4.cpp:634` calls — with a real
+// `Gemma4MoeLayerWeights`, the real router,
 // the real device-expert LRU and the real fallback. Nothing here constructs the
 // LRU, the `Dev`, or `vt::MatmulBTAlphaBeta` by hand. Delete the `if
 // (!vt::HasMatmulBTAlphaBeta(d.q)) return false;` line from
@@ -26,10 +27,20 @@
 // under which deleting the guard is observable.
 //
 // The decoration is a real `vt::Backend` registered through the public
-// `vt::RegisterBackend`, restored byte-for-byte in a destructor, and the test
-// asserts BOTH directions of the probe (real backend: false; wrapped: true)
-// before it concludes anything — an instrument that silently failed to arm would
-// otherwise report the guard as proven when the run never reached it.
+// `vt::RegisterBackend`, restored in a destructor, and the test asserts BOTH
+// directions of the probe (real backend: false; wrapped: true) before it
+// concludes anything — an instrument that silently failed to arm would otherwise
+// report the guard as proven when the run never reached it.
+//
+// `vt::RegisterBackend` documents that all registration completes before
+// `main()`, and this call is after it. What that contract buys is the absence of
+// synchronization on the read path: the registry is a plain pointer store and
+// lock-free reads thereafter. This binary is single-threaded across the swap —
+// one doctest case, no queue with a worker, no other case touching the CPU
+// backend — so there is no concurrent reader to race, and the pointer is put
+// back before the case returns. It is the narrowest way to reach the state the
+// guard exists for; the alternative is a ROCm device, which no host running this
+// suite has.
 #include "vllm/model_executor/models/gemma4_moe.h"
 
 #include <doctest/doctest.h>

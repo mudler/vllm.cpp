@@ -626,13 +626,31 @@ leased through `rc`. SGLang's `_end_current_segment` and `_begin_new_segment`
 pinned revision, which is strong evidence but is not our measurement. **This is
 W1's exit criterion and it needs a GPU lease.** It is named rather than skipped.
 
-**W1, the seam plus its unit gate, and one break point on one model.** Land
-`vt::BreakableGraph`, `vt::GraphCaptureScope` and `vt::GraphBreak` with tests 1
-through 5 of `## Tests to port`. Register exactly one break point, on one model,
-reached from `ModelRegistry::Forward`. Confirm the CUDA re-begin behavior on a
-leased GPU first; if it does not hold, W1 stops and reports rather than working
-around it. G2's mutation applies from this stage on, because W1 is the first stage
-that can be dead.
+**W1, the seam plus its unit gate, and one break point on one model. DONE
+2026-08-18, [#1192](https://github.com/mudler/vllm.cpp/issues/1192).** Landed
+`vt::BreakableGraph`, `vt::GraphCaptureScope` and `vt::GraphBreak` in
+`include/vt/breakable_graph.h` and `src/vt/breakable_graph.cpp`, with tests 1
+through 5 of `## Tests to port` plus the `TestCopyOutput` set (T7 through T10),
+the bare marker (T11), the replay-order case (test 12, folded into T6) and the
+ownership case that proves every segment is released through
+`Backend::DestroyGraph`. `tests/vt/test_breakable_graph.cpp`, 14 cases, 81
+assertions, exit 0.
+
+**The exit criterion was answered FIRST, and it holds.** `cudaStreamEndCapture`
+followed by `cudaStreamBeginCapture` on the SAME stream mid-forward with EAGER
+work between them is legal under `cudaStreamCaptureModeThreadLocal`, which is the
+mode `src/vt/cuda/cuda_backend.cu:204-206` uses. Measured on `orin:gpu0` through
+an `rc` lease, driver `12060`: segment, host-dependent break, re-begin, segment,
+bare zero-work re-begin, segment; then three replays with fresh inputs and
+0 mismatches on every one. The BARE re-begin — end then immediately begin with no
+work between, the degenerate case of `breakable_cuda_graph.py:370-374` — is legal
+too. See `## Outcome` for what the first, refused probe actually measured.
+
+**The break point is the dense attention entry of `Qwen3ForCausalLM`**
+(`src/vllm/model_executor/models/qwen3.cpp`, inside `RunLayer`), in its
+destination-carrying form because `AttnBlock` returns a fresh pooled buffer on
+every call. G2's mutation applies from this stage on and was performed; see
+`## Outcome`.
 
 **W2, migrate `Qwen3DenseDecodeGraph` first.** It goes first for three reasons,
 in order. It is the SMALLEST batched driver by machinery, holding no
@@ -817,13 +835,94 @@ point registered inside an unjoined fork window without this rule fails at
 
 ## Now
 
-`READY`. The spec is committed, the design is grounded in both oracles, the
-inventory is enumerated with anchors, the upstream unit suite is mapped case for
-case in `## Tests to port`, and the work is decomposed into six landable stages. No
-production code exists for this row. W1 needs an `rc` GPU lease to confirm its exit
-criterion — that CUDA permits `cudaStreamEndCapture` followed by
-`cudaStreamBeginCapture` mid-forward on our stream configuration — before
-implementation starts.
+`ACTIVE`. W0 (spike) and W1 (the seam, its ported unit gate, and one registered
+break point) have landed; W2 through W6 remain, and `## Work breakdown` states
+each. Owner: `.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W1.md`.
+
+W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
+`cudaStreamBeginCapture` mid-forward on our stream configuration — is
+CONFIRMED on a leased GPU and is no longer an open question for any later stage.
+
+## Owed
+
+Each item names the stage that owns it. Nothing here is claimed by W1.
+
+- **The seam is not yet ENTERED from a production step.** `GraphCaptureScope` and
+  `BreakableGraph` are constructed by the gates, not by a driver, because no
+  driver opens a scope until **W2** migrates `Qwen3DenseDecodeGraph`. The break
+  point itself IS on the production path — every `Qwen3ForCausalLM` forward
+  executes it and takes the pass-through arm — and
+  `tests/vllm/models/test_qwen3_break_point.cpp` is what holds that. This is the
+  staged slice AGENTS.md allows, named here rather than left silent. Owner: W2,
+  [#1192](https://github.com/mudler/vllm.cpp/issues/1192) tracks the handoff.
+- **The auxiliary-stream auto-join before every segment close** (D10, the port of
+  `breakable_cuda_graph.py:353-361`). W1 registers its break point on a model
+  that forks no auxiliary queue, so the rule is not exercised and untested
+  machinery was not landed for it. A break point placed inside an unjoined fork
+  window today fails LOUDLY at `EndCaptureGraph`, which is the one failure mode
+  in this spec that is not silent. Owners: **W4** (`qwen3_5.cpp:6254-6255,6384`)
+  and **W5** (`laguna.cpp:2572-2576,2612`).
+- **The capture-failure drain as a GATED case** (test 13). `GraphCaptureScope`'s
+  destructor already catches and resets, because a destructor that propagates
+  terminates and a skipped `EndCaptureGraph` poisons the stream permanently. What
+  is owed is the test that proves it, which needs a backend arm that throws.
+  Owner: **W2**.
+- **The non-capturing arm on the OTHER capture backends** (G5). The inert path is
+  gated here through a recording backend reporting `SupportsGraphCapture()`
+  false; ROCm (`rocm_backend.hip:248`) and Tenstorrent
+  (`tenstorrent_backend.cpp:75-81`) are not exercised, and D6 records that
+  segmenting a ttnn mesh trace is UNVERIFIED on that runtime. Owner: **W3**.
+- **G1, bit-exactness against eager on a real GPU over MORE than one replay.**
+  W1's bit-exactness is against the model's own eager forward on CPU, with the
+  scope open, 500 logits and 0 differing — which proves the seam changed no
+  numerics, and does NOT prove a replayed segmented capture matches. Owner:
+  **W2**, on the leased GPU its gate models already need.
+- **The reuse hazard the seam must close** (D1): making the intermediates a
+  segment reads unavailable to the `DevicePool` free list for the life of the
+  `BreakableGraph`. W1 states the lifetime rules at the `GraphBreak` declaration
+  and enforces the OUTPUT half through the writeback contract; the INPUT half is
+  a pool change with its own argument. Owner: **W2**.
+
+## Outcome
+
+**What the first probe measured, and what it did not.** The exit-criterion probe
+refused twice before it held, and neither refusal was CUDA's. Bound through
+`dlsym` on the BARE symbol name, `libcuda` hands back the LEGACY v1 entry points,
+which are not capture-aware: `cuMemcpyDtoDAsync` (v1) returned
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` inside a legal capture, and
+`cuStreamBeginCapture` (v1) takes NO capture-mode argument, so the probe believed
+it was testing the thread-local mode while testing the global one. Preferring
+`_v3` blindly then bound `cuCtxCreate_v3`, which takes two extra parameters, and
+context creation failed with `CUDA_ERROR_INVALID_DEVICE`. Both readings presented
+as a verdict about the design. Bound by EXACT versioned name the probe passes,
+and the rule that survives is the general one: an instrument that can fail toward
+a code verdict must assert its own precondition first.
+
+**Why the destination form, and not the in-place one, at the qwen3 site.**
+`AttnBlock` returns a fresh `DBuf` from the device pool on every call, so the
+in-place form's contract — write into a persistent buffer no replay reallocates —
+is one the site cannot meet. Registering it in the in-place form would have
+compiled, run, and been wrong on replay in exactly the way D9 describes. The
+destination is `std::optional<DBuf>` with a `CopyOutput` overload in
+`vllm::dense_attn`, found by argument-dependent lookup.
+
+**Why the writeback is a customization point rather than a fixed signature.**
+Upstream's `_copy_output` (`:172-201`) reaches an object's fields through
+`__dict__`; C++ has no reflection. Overloading on the output type reproduces the
+three branches upstream has — in-place for a tensor, field-wise for a keyed set,
+in-place-or-assign for a struct — and reproduces the fourth, the non-copyable
+fallback (`:201`), as a type with no overload, for which the seam fabricates no
+copy. T10 asserts the ABSENCE of that writeback deliberately: it is the warning a
+future author needs, and asserting only its presence would have left the case
+mute.
+
+**Why the counters exist.** G3 is not decoration. Without a segment count there
+is no way to tell a two-segment capture from a fully eager step, and the second
+G2 case uses `break_points_reached` to prove the model REACHES the seam even on
+the pass-through arm, which is the only observable that distinguishes a
+registered break point from a deleted one while no driver opens a scope.
+
+---
 
 Revised 2026-08-18 after a fresh review returned `FAIL`. What changed: the upstream
 test suite is ported rather than declared absent; `## Port map` §3 states the output
@@ -832,3 +931,9 @@ stream fork-join rule is stated and gated (D10); four enumerations in
 `## Our baseline` and one `grep` count were re-derived and corrected against printed
 instruments; D6 now defers to W1's exit criterion instead of asserting it; and the
 row is recorded as coverage AND correctness per #1179.
+
+Revised 2026-08-18 again, when W1 landed (#1192): `## Work breakdown` W1 records
+the confirmed exit criterion and what shipped, `## Now` moves the row to `ACTIVE`,
+and `## Owed` and `## Outcome` are new. The framing is unchanged and is not
+negotiable — coverage and correctness, never speed. No throughput gate is
+declared and none was measured.

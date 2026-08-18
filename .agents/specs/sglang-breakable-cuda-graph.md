@@ -108,16 +108,36 @@ only `pure_decode` batches to a graph, so one host-dependent op forces the whole
 eager. Coverage is a cliff, not a slope, and
 [#1020](https://github.com/mudler/vllm.cpp/issues/1020) is one instance of it.
 
-Eight call sites hand-roll capture: `Qwen3_5DecodeGraph`, `Qwen3_5DenseDecodeGraph`,
-`Qwen3MoeDecodeGraph`, `Qwen3DenseDecodeGraph`, `DeepseekV2DecodeGraph`,
-`VoxtralDecodeGraph`, plus graph code in `deepseek_v4.cpp` and `laguna.cpp`. Each
-re-derives capture, bucket padding, persistent-input threading and the pure-decode
-predicate. AGENTS.md names this shape: a parallel path written by hand instead of a
-shared seam.
+**NINE call sites hand-roll capture**, corrected 2026-08-18
+([#1179](https://github.com/mudler/vllm.cpp/issues/1179)); this section recorded
+eight when it landed in `9bc4d7f44`. They are `Qwen3_5DecodeGraph`,
+`Qwen3_5DenseDecodeGraph`, `Qwen3MoeDecodeGraph`, `Qwen3DenseDecodeGraph`,
+`DeepseekV2DecodeGraph`, `VoxtralDecodeGraph`, plus file-local graph code in
+`deepseek_v4.cpp`, `laguna.cpp` and — the one this section missed — the DFlash draft
+graph at `src/vllm/model_executor/models/qwen3_dflash.cpp:771,870,1038,1091,1095,1106`.
+The full table with a declaration and implementation anchor per driver is
+[eng-cudagraph-break.md](eng-cudagraph-break.md) `## Our baseline`. Each re-derives
+capture, bucket padding, persistent-input threading and the pure-decode predicate.
+AGENTS.md names this shape: a parallel path written by hand instead of a shared seam.
+
+**The duplication has already cost a shipped model its decode graph, so this is a
+correctness finding and not only a coverage one.** The persistent DEVICE input path
+`StepDevInputs` (`src/vllm/model_executor/models/qwen3_5.cpp:3894`) exists in exactly
+one driver — `grep -c StepDevInputs` returns 41 lines in `qwen3_5.cpp` and 0 in each
+of `qwen3_moe.cpp`, `qwen3.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`. Because
+`Qwen3DenseDecodeGraph` lacks it, `src/vllm/model_executor/models/qwen3.cpp:961-986`
+DECLINES the graph outright whenever the asynchronous device-token mirror is live,
+with its own measured comment: `depth-1, graph ON PASS 78/78`, `depth-2, graph OFF
+PASS 82/82`, `depth-2, graph ON FAIL, slots 1-3 degenerate`. The comment names the
+real fix as reading the identifiers at replay time from a stable device buffer, which
+is precisely what the sibling driver already does. That is one capability, written
+once, unavailable to four models, and a live mitigation standing in its place.
 
 BCG is the right construction for the fix, because vLLM gets its split from
-`torch.compile` and we have no compiler. The value is **coverage and one seam instead
-of eight**. It is not throughput on its own, and it must not be sold as throughput.
+`torch.compile` and we have no compiler. The value is **coverage, one seam instead of
+nine, and the correctness capability that seam makes shared**. It is not throughput
+on its own, and it must not be sold as throughput. §3's refutation stands unchanged:
+3.8% host idle in prefill, GPU-busy above 96%, and 92.5% non-GEMM glue.
 
 ## 5. Diffusion is the one shape where the lever is real, and it is blocked
 
@@ -162,7 +182,7 @@ collapse. **Capturing now would measure nothing.**
 | Item | Issue | Row |
 |---|---|---|
 | Graph executable dedup via `cudaGraphExecUpdate` | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | `ENG-CUDAGRAPH-DEDUP` |
-| A shared capture seam with break points, retiring the eight hand-rolled drivers | [#1163](https://github.com/mudler/vllm.cpp/issues/1163) | `ENG-CUDAGRAPH-BREAK` |
+| A shared capture seam with break points, retiring the NINE hand-rolled drivers | [#1163](https://github.com/mudler/vllm.cpp/issues/1163) | `ENG-CUDAGRAPH-BREAK` |
 | Denoise-loop capture, blocked on #1010, #1087, #1024, #1007 | [#1164](https://github.com/mudler/vllm.cpp/issues/1164) | `ENG-CUDAGRAPH-DIFFUSION` |
 
 ## Stop conditions
@@ -184,6 +204,18 @@ surfaced rather than the claim.
 What was rejected and why: porting BCG as a prefill throughput lever, because our
 prefill has 3.8% host idle and is 92.5% glue-GPU-bound; and scoping the diffusion
 capture now, because the render does no device compute to capture.
+
+Corrected 2026-08-18 ([#1179](https://github.com/mudler/vllm.cpp/issues/1179)). Two
+repairs to what this spec recorded on 2026-08-17. First, the hand-rolled driver count
+is NINE, not eight: the `ENG-CUDAGRAPH-BREAK` scoping spike found the DFlash draft
+graph (`src/vllm/model_executor/models/qwen3_dflash.cpp:771,870,1038,1091,1095,1106`)
+that §4 had missed. Second, `ENG-CUDAGRAPH-BREAK` was recorded here as a COVERAGE row
+only, and it is also a CORRECTNESS row: `qwen3.cpp:961-986` declines its decode graph
+outright while the async device-token mirror is live, on a measured degeneration
+(`depth-2, graph ON FAIL, slots 1-3 degenerate`), because the fix the comment names
+lives in one sibling driver as `StepDevInputs` and nowhere else. A shipped model has
+already lost its decode graph to this duplication. Neither repair touches the framing
+rule: the row still makes no throughput claim, and §3's refutation is unchanged.
 
 Why the defaults are what they are: `ENG-CUDAGRAPH` stays `PARTIAL` rather than moving,
 because nothing shipped. `SGLANG-BCG` is classified `INVENTORIED` rather than `OWED`,

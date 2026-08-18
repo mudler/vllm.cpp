@@ -283,10 +283,16 @@ Three types, all under `vt`, all backend-agnostic, none of them a new virtual on
 1. **`vt::BreakableGraph`** — the container. Holds `std::vector<void*> segments`
    (each an opaque handle from `Backend::EndCaptureGraph`) and
    `std::vector<std::function<void()>> break_fns` (each a seam-built replay
-   closure, see item 3, never a caller's raw `fn`). Invariant, asserted:
-   `segments.size() == break_fns.size() + 1`. `Replay(Queue&)` walks
-   `ReplayGraph(segments[i])` then `break_fns[i]()` for each `i`, mirroring
-   `breakable_cuda_graph.py:255-263`. The destructor calls `DestroyGraph` on every
+   closure, see item 3, never a caller's raw `fn`). Invariant:
+   `segments.size() == break_fns.size() + 1`. It is ASSERTED, in the two places
+   where violating it would otherwise be silent: `GraphCaptureScope` refuses to
+   open on a container that already holds a capture (re-entry appended to it and
+   produced `break_count() == segment_count()`), and `Replay` refuses counts that
+   disagree (such a graph replays with its LAST BREAK DROPPED, whose only symptom
+   is a forward that skips one host-dependent operation). Documenting it was not
+   enough: the first draft said "asserted" in three records and asserted it
+   nowhere. `Replay(Queue&)` walks `ReplayGraph(segments[i])` then
+   `break_fns[i]()` for each `i`, mirroring `breakable_cuda_graph.py:255-263`. The destructor calls `DestroyGraph` on every
    segment. This is the direct analogue of `BreakableCUDAGraph` at `:246`.
 
 2. **`vt::GraphCaptureScope`** — a resource-acquisition-is-initialization (RAII)
@@ -333,13 +339,30 @@ Three types, all under `vt`, all backend-agnostic, none of them a new virtual on
    the two, and the seam must make the choice explicit rather than leave it to the
    caller:
 
-   - `GraphBreak(fn, out)` takes the destination the following segment reads, and
-     the seam copies `fn`'s result into `out` on every replay. This is the direct
-     port of `replay_fn` plus `_copy_output`.
+   - `GraphBreak(fn, slot)` takes the destination the following segment reads, and
+     the seam copies `fn`'s result into it on every replay. This is the direct
+     port of `replay_fn` plus `_copy_output`. **The destination is a
+     `vt::BreakSlot<T>`, never a bare `Out&`,** and that is a correctness
+     requirement rather than a style choice. The destination must outlive the
+     `BreakableGraph`, because the following segment bakes its address; upstream
+     gets that from holding `captured_output` BY VALUE with its storage pinned by
+     the segment graphs' mempool (`:156-169,225-227`). A C++ seam taking a
+     reference gets the opposite, because the natural call site declares the
+     destination as a local of the function containing the break — which is
+     exactly what the first W1 site did, registering a stack slot that died on
+     the next `return` while the pooled block it named went back on the free
+     list. `BreakSlot` moves the value into a cell the replay closure owns, so
+     the rule holds by construction and the obvious call site cannot break it.
+     A destination type with no `CopyOutput` overload is a COMPILE error naming
+     the type, not a silent downgrade into the fallback below.
    - `GraphBreak(fn)` with no destination requires `fn` to write IN PLACE into a
      persistent buffer that the model owns and that no replay reallocates. The
      no-destination form is then only legal for a break function with no return
-     value; the bare marker below is its degenerate case.
+     value; the bare marker below is its degenerate case. Upstream's own
+     non-copyable fallback (`:201`, "return `src`, leave the destination alone")
+     stays reachable, but it has to be ASKED FOR by passing `vt::NoWriteback{}`,
+     because a fallback that is the DEFAULT makes a renamed, moved or misspelled
+     `CopyOutput` overload compile clean and be wrong only on replay N.
 
    `vt::BreakableGraph` therefore holds `std::vector<std::function<void()>>` whose
    elements are the SEAM's closures, never the caller's `fn` — and D9 records the
@@ -483,12 +506,23 @@ migrated model. Excluded as redundant to a stronger gate, not as unaffordable.
 **The one unavoidable harness adaptation.** Every upstream class's `setUpClass`
 raises `unittest.SkipTest` without CUDA (`:34-36`, `:177-178`, `:235-236`), so
 upstream runs all eleven cases on a real device. T1 through T5, and T7 through T11,
-run instead against a test backend that RECORDS the call sequence, so they gate on
-this box and in continuous integration with no GPU. T6, the multi-replay case, has
-both arms: the recording arm asserts the replay ORDER, and the GPU arm under G1
-asserts the VALUES. Nothing else about the upstream cases is adapted: the same break
-counts, the same segment counts, the same arithmetic chains, the same in-place versus
-assign split, and the same non-copyable fallback.
+run instead against a test backend that RECORDS the call sequence and SIMULATES the
+graph: `Record(fn)` files one captured operation against the open segment and does
+NOT execute it, exactly as a real stream capture files a kernel without running it,
+and `ReplayGraph` runs the filed work in order. That is what keeps upstream's
+POST-REPLAY assertions literal — `x.fill_(5); graph.replay(); y == 6` is the same
+assertion here — rather than degrading them into capture-time value checks, which
+assert something upstream never asserted. The same break counts, the same segment
+counts, the same arithmetic chains (`x=10 -> 11 -> 22 -> 25`, `x=5 -> 6 -> 7 -> 8 ->
+16`, `3.0` then `33.0`, `x=10 -> 11 -> 13`), the same in-place versus assign split
+and the same non-copyable fallback.
+
+**Two things the harness does NOT model, named rather than claimed away.** Real
+device memory, asynchrony, and any error a real runtime would raise are absent; a
+case that needs those is a GPU case and is owed rather than approximated. And
+upstream's `eager_on_graph` always returns a fresh tensor, so every upstream break
+is the DESTINATION form — the in-place form has no upstream case and is exercised
+beside T2 and by the bare marker.
 
 The existing test surface the migration must keep green:
 
@@ -514,6 +548,14 @@ numbered on from the ported set:
     already-instantiated segment released. This ports the recovery that
     `qwen3_5.cpp:9913` and `qwen3_dflash.cpp:1106` each hand-rolled. Upstream has no
     equivalent because Python's `finally` in `__exit__` (`:323-332`) covers it.
+    **The BEHAVIOUR was owed too, not only the test**, and an earlier draft of
+    `## Owed` said otherwise. The destructor's `catch` guarded a throwing
+    `EndCaptureGraph` and nothing else: an exception from a break function, or
+    from ordinary model code between two break points, left a PARTIAL capture
+    reporting `captured() == true`, which is replayable as half a forward.
+    Comparing `std::uncaught_exceptions()` against the depth recorded at scope
+    entry is what separates the two, and all three arms are gated (13a break
+    throws, 13b ordinary code throws mid-segment, 13c `EndCaptureGraph` throws).
 14. **Non-capturing backend.** On a backend where `SupportsGraphCapture()` is
     false, the scope is inert and the forward runs eager. Vulkan
     (`vulkan_backend.cpp:16`) and Metal (`metal_backend.mm:13`) are the live cases.
@@ -626,13 +668,92 @@ leased through `rc`. SGLang's `_end_current_segment` and `_begin_new_segment`
 pinned revision, which is strong evidence but is not our measurement. **This is
 W1's exit criterion and it needs a GPU lease.** It is named rather than skipped.
 
-**W1, the seam plus its unit gate, and one break point on one model.** Land
-`vt::BreakableGraph`, `vt::GraphCaptureScope` and `vt::GraphBreak` with tests 1
-through 5 of `## Tests to port`. Register exactly one break point, on one model,
-reached from `ModelRegistry::Forward`. Confirm the CUDA re-begin behavior on a
-leased GPU first; if it does not hold, W1 stops and reports rather than working
-around it. G2's mutation applies from this stage on, because W1 is the first stage
-that can be dead.
+**W1, the seam plus its unit gate, and one break point on one model. DONE
+2026-08-18, [#1192](https://github.com/mudler/vllm.cpp/issues/1192).** Landed
+`vt::BreakableGraph`, `vt::GraphCaptureScope`, `vt::BreakSlot` and
+`vt::GraphBreak` in `include/vt/breakable_graph.h` and
+`src/vt/breakable_graph.cpp`, with tests 1 through 5 of `## Tests to port` plus
+the `TestCopyOutput` set (T7 through T10), the bare marker (T11), the
+replay-order case (test 12), the capture-failure drain (test 13, all three
+arms), the non-capturing backend (test 14), the aliasing refusal with its two controls,
+and the ownership case that proves every segment is released through
+`Backend::DestroyGraph`. `tests/vt/test_breakable_graph.cpp`, 24 cases, 163
+assertions, exit 0, re-derived by `ninja test_breakable_graph &&
+./build/tests/test_breakable_graph`.
+
+**A fresh review returned FAIL on the first head and the repairs are part of
+W1.** What the review found, and what closed it, because each one is a class of
+defect a later stage can repeat:
+
+- The production break point's destination was a function-local
+  `std::optional<DBuf>`, so both scoped layers registered the SAME stack slot in
+  a frame that was gone before the scope closed, and the pooled block it named
+  went back on the `DevicePool` free list. Inert at W1 because no driver opens a
+  scope, and wrong the moment W2 does. Closed structurally: the destination is a
+  `vt::BreakSlot` the seam owns and there is no reference-taking overload left.
+
+  **That closed the LIFETIME half of the rule, and this spec claimed the whole
+  rule was "unexpressible to violate". It was not, and a scoped re-review
+  measured the other half still open.** One slot reused for TWO break points in
+  one capture compiled: `PinForCapture` returns the cell it already made, so
+  both replay closures bind to the SAME address, `&*slot` is byte identical
+  after break 0 and after break 1, and after `Replay` the slot holds only break
+  1's value — break 0's writeback overwritten, and any segment that baked break
+  0's destination reading break 1's data. The production site is correct today
+  because its slot is a `RunLayer` local, but W2 through W5 add nine more
+  callers and the prose was telling them the shape was unwritable. Closed by a
+  REFUSAL rather than by the type, and the prose now names which half is which:
+  `GraphCaptureScope::AppendBreak` takes the destination as a REQUIRED
+  parameter, so no form can register without stating where it lands, and it
+  throws when a second break in the same capture names a cell already
+  registered. Two things the repair had to get right, both measured rather than
+  reasoned. The identity is the CELL and not the SLOT: the production slot is a
+  per-call local, every layer's slot lands at the same STACK address, and
+  slot-address identity therefore refused the correct program on layer 2 and
+  reddened the G2 gate. And the non-copyable fallback registers no destination,
+  because it pins no cell and its replay writes back nowhere. Red-first: the
+  case failed on the unrepaired head with the aliased capture ACCEPTED,
+  `break_count() == 2` into one slot. Two mutations, both detected — deleting
+  the refusal reds only the new case (23 of 24 still pass and G2 stays green,
+  which is exactly why nothing caught this before), and making it over-fire reds
+  two unit cases AND the G2 reachability gate, so the controls are not
+  vacuous.
+- Interleaved replay was claimed, spec'd, and NOT gated. Replacing the
+  interleaved loop with "replay all segments, then run all breaks" left the suite
+  green, because break markers went into a vector the backend log knew nothing
+  about and the two sequences were asserted independently. Closed by putting the
+  markers into the backend's OWN log and asserting one trace.
+- The writeback branch degraded SILENTLY: renaming `CopyOutput` dropped the site
+  into the non-copyable fallback, which is the D9 wrong-numerics path, with both
+  suites green. Closed by a `static_assert` in the destination form plus the
+  explicit `vt::NoWriteback` opt-in, and by moving the model's overload into a
+  header so the G2 gate can `static_assert` that the writeback branch is the one
+  selected.
+- The `VLLM_CPP_CUDAGRAPH=0` kill switch was ungated (the existing case
+  substituted the OTHER conjunct), nesting was accepted and traced an illegal
+  capture sequence, the invariant three records called "asserted" was asserted
+  nowhere, and `Reset()` left the replay count stale. Each is now gated, the
+  switch through a child process because it is read once per process.
+- Upstream fidelity was overstated. T3 had lost its arithmetic chain and T1 its
+  post-replay value, because a recording backend cannot re-execute a segment. The
+  backend now SIMULATES the graph, so every upstream chain and every post-replay
+  assertion ports literally, and the two remaining deviations are named above.
+
+**The exit criterion was answered FIRST, and it holds.** `cudaStreamEndCapture`
+followed by `cudaStreamBeginCapture` on the SAME stream mid-forward with EAGER
+work between them is legal under `cudaStreamCaptureModeThreadLocal`, which is the
+mode `src/vt/cuda/cuda_backend.cu:204-206` uses. Measured on `orin:gpu0` through
+an `rc` lease, driver `12060`: segment, host-dependent break, re-begin, segment,
+bare zero-work re-begin, segment; then three replays with fresh inputs and
+0 mismatches on every one. The BARE re-begin — end then immediately begin with no
+work between, the degenerate case of `breakable_cuda_graph.py:370-374` — is legal
+too. See `## Outcome` for what the first, refused probe actually measured.
+
+**The break point is the dense attention entry of `Qwen3ForCausalLM`**
+(`src/vllm/model_executor/models/qwen3.cpp`, inside `RunLayer`), in its
+destination-carrying form because `AttnBlock` returns a fresh pooled buffer on
+every call. G2's mutation applies from this stage on and was performed; see
+`## Outcome`.
 
 **W2, migrate `Qwen3DenseDecodeGraph` first.** It goes first for three reasons,
 in order. It is the SMALLEST batched driver by machinery, holding no
@@ -817,13 +938,108 @@ point registered inside an unjoined fork window without this rule fails at
 
 ## Now
 
-`READY`. The spec is committed, the design is grounded in both oracles, the
-inventory is enumerated with anchors, the upstream unit suite is mapped case for
-case in `## Tests to port`, and the work is decomposed into six landable stages. No
-production code exists for this row. W1 needs an `rc` GPU lease to confirm its exit
-criterion — that CUDA permits `cudaStreamEndCapture` followed by
-`cudaStreamBeginCapture` mid-forward on our stream configuration — before
-implementation starts.
+`ACTIVE`. W0 (spike) and W1 (the seam, its ported unit gate, and one registered
+break point) have landed; W2 through W6 remain, and `## Work breakdown` states
+each. Owner: `.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W1.md`.
+
+W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
+`cudaStreamBeginCapture` mid-forward on our stream configuration — is
+CONFIRMED on a leased GPU and is no longer an open question for any later stage.
+
+## Owed
+
+Each item names the stage that owns it. Nothing here is claimed by W1.
+
+- **The seam is not yet ENTERED from a production step.** `GraphCaptureScope` and
+  `BreakableGraph` are constructed by the gates, not by a driver, because no
+  driver opens a scope until **W2** migrates `Qwen3DenseDecodeGraph`. The break
+  point itself IS on the production path — every `Qwen3ForCausalLM` forward
+  executes it and takes the pass-through arm — and
+  `tests/vllm/models/test_qwen3_break_point.cpp` is what holds that. This is the
+  staged slice AGENTS.md allows, named here rather than left silent. Owner: W2,
+  [#1163](https://github.com/mudler/vllm.cpp/issues/1163) tracks the handoff —
+  the parent, because #1192 CLOSES with W1 and a tracker that dies at merge
+  tracks nothing.
+- **The auxiliary-stream auto-join before every segment close** (D10, the port of
+  `breakable_cuda_graph.py:353-361`). W1 registers its break point on a model
+  that forks no auxiliary queue, so the rule is not exercised and untested
+  machinery was not landed for it. A break point placed inside an unjoined fork
+  window today fails LOUDLY at `EndCaptureGraph`, which is the one failure mode
+  in this spec that is not silent. Owners: **W4** (`qwen3_5.cpp:6254-6255,6384`)
+  and **W5** (`laguna.cpp:2572-2576,2612`).
+- ~~**The capture-failure drain as a GATED case** (test 13).~~ DELIVERED in W1,
+  and the record it replaces was wrong twice over. The destructor did NOT already
+  behave: its `catch` guarded a throwing `EndCaptureGraph` alone, and an
+  exception from a break function or from ordinary model code left a partial
+  capture reporting `captured() == true`. The behaviour and all three gated arms
+  landed together; see `## Tests to port` test 13.
+- **The non-capturing arm on the OTHER capture backends** (G5). The inert path is
+  gated here through a recording backend reporting `SupportsGraphCapture()`
+  false; ROCm (`rocm_backend.hip:248`) and Tenstorrent
+  (`tenstorrent_backend.cpp:75-81`) are not exercised, and D6 records that
+  segmenting a ttnn mesh trace is UNVERIFIED on that runtime. Owner: **W3**.
+- **G1, bit-exactness against eager on a real GPU over MORE than one replay.**
+  W1's bit-exactness is against the model's own eager forward on CPU, with the
+  scope open, 500 logits and 0 differing — which proves the seam changed no
+  numerics, and does NOT prove a replayed segmented capture matches. Owner:
+  **W2**, on the leased GPU its gate models already need.
+- **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
+  drain cannot see.** The `uncaught_exceptions()` comparison in
+  `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A
+  break function that throws and is caught between two break points inside the
+  scope leaves `segment_open_ == false`, so the remainder of the forward is
+  never captured, and nothing is unwinding at scope exit, so the drain does not
+  fire and `captured()` stays true over a forward that is missing its tail. The
+  header and this spec state the guarantee only for the propagating case, so
+  this is a RESIDUAL rather than a false claim — but a driver that wraps a break
+  in a `try` gets silently wrong numerics on replay, and W2 is the first stage
+  that opens a scope from a driver. Owner: **W2**.
+- **The reuse hazard the seam must close** (D1): making the intermediates a
+  segment reads unavailable to the `DevicePool` free list for the life of the
+  `BreakableGraph`. W1 states the lifetime rules at the `GraphBreak` declaration
+  and enforces the OUTPUT half through the writeback contract; the INPUT half is
+  a pool change with its own argument. Owner: **W2**.
+
+## Outcome
+
+**What the first probe measured, and what it did not.** The exit-criterion probe
+refused twice before it held, and neither refusal was CUDA's. Bound through
+`dlsym` on the BARE symbol name, `libcuda` hands back the LEGACY v1 entry points,
+which are not capture-aware: `cuMemcpyDtoDAsync` (v1) returned
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` inside a legal capture, and
+`cuStreamBeginCapture` (v1) takes NO capture-mode argument, so the probe believed
+it was testing the thread-local mode while testing the global one. Preferring
+`_v3` blindly then bound `cuCtxCreate_v3`, which takes two extra parameters, and
+context creation failed with `CUDA_ERROR_INVALID_DEVICE`. Both readings presented
+as a verdict about the design. Bound by EXACT versioned name the probe passes,
+and the rule that survives is the general one: an instrument that can fail toward
+a code verdict must assert its own precondition first.
+
+**Why the destination form, and not the in-place one, at the qwen3 site.**
+`AttnBlock` returns a fresh `DBuf` from the device pool on every call, so the
+in-place form's contract — write into a persistent buffer no replay reallocates —
+is one the site cannot meet. Registering it in the in-place form would have
+compiled, run, and been wrong on replay in exactly the way D9 describes. The
+destination is `std::optional<DBuf>` with a `CopyOutput` overload in
+`vllm::dense_attn`, found by argument-dependent lookup.
+
+**Why the writeback is a customization point rather than a fixed signature.**
+Upstream's `_copy_output` (`:172-201`) reaches an object's fields through
+`__dict__`; C++ has no reflection. Overloading on the output type reproduces the
+three branches upstream has — in-place for a tensor, field-wise for a keyed set,
+in-place-or-assign for a struct — and reproduces the fourth, the non-copyable
+fallback (`:201`), as a type with no overload, for which the seam fabricates no
+copy. T10 asserts the ABSENCE of that writeback deliberately: it is the warning a
+future author needs, and asserting only its presence would have left the case
+mute.
+
+**Why the counters exist.** G3 is not decoration. Without a segment count there
+is no way to tell a two-segment capture from a fully eager step, and the second
+G2 case uses `break_points_reached` to prove the model REACHES the seam even on
+the pass-through arm, which is the only observable that distinguishes a
+registered break point from a deleted one while no driver opens a scope.
+
+---
 
 Revised 2026-08-18 after a fresh review returned `FAIL`. What changed: the upstream
 test suite is ported rather than declared absent; `## Port map` §3 states the output
@@ -832,3 +1048,40 @@ stream fork-join rule is stated and gated (D10); four enumerations in
 `## Our baseline` and one `grep` count were re-derived and corrected against printed
 instruments; D6 now defers to W1's exit criterion instead of asserting it; and the
 row is recorded as coverage AND correctness per #1179.
+
+Revised 2026-08-18 again, when W1 landed (#1192): `## Work breakdown` W1 records
+the confirmed exit criterion and what shipped, `## Now` moves the row to `ACTIVE`,
+and `## Owed` and `## Outcome` are new. The framing is unchanged and is not
+negotiable — coverage and correctness, never speed. No throughput gate is
+declared and none was measured.
+
+Revised 2026-08-18 a third time, after a fresh review of the W1 head returned
+`FAIL`. What changed: the destination-carrying break point takes a
+`vt::BreakSlot` the seam owns instead of a caller reference it cannot outlive
+(the rule the header stated and the only site using it broke); the interleaved
+replay, the `VLLM_CPP_CUDAGRAPH=0` kill switch, the capture-failure drain, the
+`segment == break + 1` invariant, the nesting refusal and the writeback-branch
+selection are each GATED rather than described; the recording backend simulates
+the graph so upstream's arithmetic chains and post-replay assertions port
+literally; and the exit-criterion probe is committed with its recipe and hashes.
+The framing is unchanged and is not negotiable — coverage and correctness, never
+speed. No throughput gate is declared and none was measured.
+
+**The probe is COMMITTED, because the measurement that produced two false
+refusals is the one that most needs a re-runnable form.** Both sources are in the
+tree: `scripts/probe_cudagraph_rebegin.c` (the `dlsym` driver-API build, which
+needs no CUDA toolkit and no headers, and is the one the exit criterion was
+answered with) and `scripts/probe_cudagraph_rebegin.cu` (the runtime-API build,
+which needs `nvcc`). `.agents/benchmark-record.md` carries their sha256 sums and
+the exact recipe. **What was NOT retained is the leased run's own driver script
+and its raw stdout**, so the verdict recorded above is reproducible only by
+re-running the committed source under the recorded recipe on a leased GPU — which
+is what a later claimant has to do rather than cite this paragraph.
+
+**The finding worth keeping at the top level.** The seam's most-documented rule —
+that the destination must outlive the graph — was broken by the ONLY site that
+used it, in the same change that wrote the paragraph explaining it. A rule stated
+at a declaration and re-derived by every caller is not a mechanism. Where a
+contract can be encoded in a type, encode it: W2 through W5 add nine more callers
+and none of them should have to read that paragraph to be correct.
+

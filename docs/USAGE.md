@@ -675,6 +675,29 @@ per-output-channel arm itself is not implemented yet.
 `lm_head` is not affected. It has always read a per-output-channel scale
 correctly, as the table above records.
 
+### One load refusal that is about this code, not your checkpoint
+
+Almost every load refusal in this document names something your `config.json`
+or your tensors actually declare. Exactly one does not:
+
+```text
+dense loader: LoadQwen3_5DenseLayer was given a tensor-presence probe that
+answered YES for '__vllm_cpp__a_tensor_no_checkpoint_carries__', a name no
+checkpoint carries.
+```
+
+That name is not in your checkpoint and is not supposed to be. The loader asks
+about it to find out whether its own "is this tensor present?" predicate is
+capable of answering `no`, and this message means it is not. Your checkpoint is
+fine; please report it with the model you were loading
+([#1258](https://github.com/mudler/vllm.cpp/issues/1258)).
+
+The check exists because a predicate that only ever said yes shipped twice in one
+file, and what a reader saw was the *opposite* of the truth: a refusal naming a
+block-wise FP8 scale tensor the checkpoint had never contained
+([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
+the wrong side costs more than the failure does.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are

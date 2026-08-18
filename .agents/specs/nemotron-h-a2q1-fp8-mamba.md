@@ -418,23 +418,68 @@ stated removal condition is the device/paged runner path, which is A2-P's.
 
 ## 10. Now
 
-**State at this commit:** spec only. No product code, no lifecycle change.
+**State at this commit:** the device arm is IMPLEMENTED and REACHED, and its
+binding measurement is PENDING a lease.
 
-A2-Q1 is **BLOCKED on #960** and is not claimable until it lands. When it does, a
-fresh implementer claims this file, captures a RED per §5.3 first, and lands the
-mamba device arm with G-SAFE untouched. A fresh reviewer — never the implementer
-— runs the §5.3 mutations.
+`NemotronHMamba2MixerDevice` (`nemotron_h_device.cpp`) runs the whole block on
+the device on the shared FP8 W8A8 seam, and BOTH forwards select it at runtime:
+`NemotronHDeviceForward` (non-paged, discarding the recurrence) and
+`NemotronHPagedForward` (production, advancing the gathered recurrent rows in
+place). The selection is a runtime op-table query plus a weight-form predicate,
+never a preprocessor guard, so a dense NemotronH or a device without the fp8 pair
+keeps the host bounce.
 
-**Three things to read before the first edit:** §3, so the Thor dependency is
-consumed rather than re-derived; §1.1, so the conv-state dtype is left to A2-P;
-and §5.2, so the bands are measured rather than chosen.
+**Three design points differ from §4 and the reasons are recorded here rather
+than left to be re-derived:**
+
+1. **The `Fp8Weight` pair is built ON FIRST DEVICE USE, not by the loader**
+   (§4.1/§4.2 put it in the loader). Building it in a `ResidentSlot` the weights
+   own is A2-Q2a's newer idiom and it is strictly better here: it does not double
+   the 890 MB fp8 tower in host memory at load, it does not upload anything on a
+   host-only run, and it leaves `rep.host_bytes` — the literal `18888922112` that
+   `test_nemotron_h_loader.cpp:310` pins — untouched, so §4.2's re-derivation
+   obligation does not arise at all. The e4m3 staging copy is released as soon as
+   `ResidentFp8` has uploaded it, so the peak cost of the conversion is one
+   projection.
+2. **The upload IS accounted** (§4.4 expected the report to say it was short).
+   `dense_fp8::ResidentFp8` still does not call `load_stats::AddDeviceUpload`
+   — that is [#974](https://github.com/mudler/vllm.cpp/issues/974), unchanged, and
+   the shared header is not touched — so A2-Q1 accounts what IT uploads at the
+   site that causes it, exactly as `ResidentWeight` and `ResidentNvfp4` do. The
+   counter is then also the instrument the residency case reads, because an arm
+   that re-uploaded the tower every step returns identical numbers to one that
+   uploads it once.
+3. **The paged selection carries an `ssm_dtype == f32` term.**
+   `vt::GdnStateGather` widens the page into an f32 working buffer by op
+   contract, and the HOST arm then narrows it back to `ssm_dtype` before the
+   mixer sees it. On a checkpoint whose `mamba_ssm_cache_dtype` is not f32 the
+   two arms would round differently and the per-block numeric gate would be
+   comparing two different computations. The released checkpoint resolves f32.
+
+**The comparison is NOT bit-comparable by construction, and §5.2's "measure the
+band" is therefore binding rather than cautionary.** The host reference is
+W8A16 — `DenseFor` dequantizes the fp8 weight to bf16 and leaves the activation
+alone, as `DenseBf16` says outright — while the device arm is W8A8 as vLLM is.
+The difference between them is the e4m3 activation quantization, and every band
+in `tests/vllm/models/test_nemotron_h_mamba_device.cpp` is measured in the run
+against a defect the fixture separates.
+
+**What is still owed, and it is the acceptance test rather than a formality:**
+the §5.1 per-block numeric gate on the real checkpoint on both hosts, the A3
+`96/96 mode=decode STRICT PASS` re-run, the §5.3 mutations, and the GPU busy
+fraction — which must RISE from the measured 6.31% baseline, sampled with its
+denominator reported. `scripts/nemotron-h-a2q1-dgx-gate.sh` is the recipe.
 
 ## 11. Owed
 
-- [#974](https://github.com/mudler/vllm.cpp/issues/974) — the fp8 resident
-  helpers upload without `AddDeviceUpload` / `AdoptDeviceBytesAsHost`. A2-Q1
-  consumes them and reports its accounting as short (§4.4); the fix is not this
-  unit's.
+- [#974](https://github.com/mudler/vllm.cpp/issues/974) — `dense_fp8::ResidentFp8`
+  uploads without `AddDeviceUpload` / `AdoptDeviceBytesAsHost`. A2-Q1 consumes it
+  and accounts its own upload at its own call site (§10.2); the fix INSIDE the
+  shared header is not this unit's, and every other caller of the seam is
+  byte-unchanged.
+- The §5.1 real-checkpoint per-block numeric gate, the §5.3 mutation pass and the
+  GPU-occupancy measurement are PENDING a GB10 lease. They are the unit's
+  acceptance test, not paperwork.
 - The device arm has **no production caller** until A2-P wires it through
   `ModelRegistry::Forward` (§7). Tracked on
   [#810](https://github.com/mudler/vllm.cpp/issues/810).

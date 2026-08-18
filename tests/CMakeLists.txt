@@ -847,6 +847,21 @@ vllm_cpp_add_test(test_nemotron_h_moe_device
 target_include_directories(test_nemotron_h_moe_device PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 
+# A2-Q1 (#810, .agents/specs/nemotron-h-a2q1-fp8-mamba.md): the DEVICE Mamba2 arm
+# on a SYNTHETIC FP8 W8A8 fixture — the cheap RED in front of the
+# real-checkpoint per-block gate, and the same reason A2-Q2a's file above exists:
+# `BuildTiny` is all-`kDense`, so nothing in the existing device suite can reach
+# the FP8 W8A8 arm at all. The two arms are NOT bit-comparable by construction —
+# the host reference dequantizes the weight and leaves the activation in bf16
+# (W8A16), the device arm is W8A8 as vLLM is — so every band is measured in the
+# run against a defect the fixture separates. Every GEMM extent is a multiple of
+# 16 so a cuBLASLt fp8 plan resolves and a refusal is about VALUES. Skips LOUDLY
+# with a reason on a GPU-less box.
+vllm_cpp_add_test(test_nemotron_h_mamba_device
+  vllm/models/test_nemotron_h_mamba_device.cpp)
+target_include_directories(test_nemotron_h_mamba_device PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
 # A2-P (#810, .agents/specs/nemotron-h-a2p-paged-forward.md): the PAGED forward,
 # gated through the PRODUCTION entry point. Every case builds a real
 # NemotronHLoadedModel from a synthetic checkpoint, hands it to a real

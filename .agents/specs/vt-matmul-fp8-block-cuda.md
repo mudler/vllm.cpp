@@ -246,6 +246,26 @@ It also means a `sm_12xa` CUDA user stops being refused and starts running a
 kernel **that has never executed**. `docs/USAGE.md` and `docs/FEATURES.md` say
 so in this change, in those words, and `## Owed` is the record.
 
+### Why it ships registered rather than behind an opt-in flag
+
+The obvious hedge for an unrun kernel is to register it behind an environment
+flag, default off. It is rejected, and the reason is that the flag would carry no
+information. Neither position has a measurement behind it: OFF is not "the safe
+one", it is "the refusal, still", and the refusal is exactly what M5 exists to
+remove. A default-off lever would therefore be a switch nobody could ever be told
+when to flip, which is the shape `.agents/parity-lever-protocol.md` calls a lever
+with no premise, and this tree already carries several of those.
+
+The honest control is a LABEL rather than a flag, and the tree has one:
+`cmake/CudaArchFeatures.cmake` already ships `scaledmm-c3x-sm90` and
+`cutlass-nvfp4-sm100` as `DERIVED+BUILD-VERIFIED (testing-welcome)` — compiled
+and gencode-proven, never run on the board they target. This arm is in exactly
+that state and is described in exactly those words in `docs/USAGE.md`,
+`docs/FEATURES.md`, the commit body, the pull request body and `## Owed`. What
+makes that acceptable rather than reckless is that the first person to run it
+gets a written, registered test that says what to compare against and what the
+criterion is, instead of a kernel and a shrug.
+
 ### `check-cuda-op-arch-gate`: checked, and correctly NOT extended
 
 `scripts/check-cuda-op-arch-gate.py`'s `REQUIRED` set is for ops whose CUDA

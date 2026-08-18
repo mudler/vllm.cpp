@@ -143,6 +143,15 @@ coincidence.
 the whole fused 4096x4096 bf16 buffer. All ten runs, across the before and after
 builds, printed `a23e7f876694c537`.
 
+**d. The focused gate on every CPU GEMM tier.** `VT_CPU_MATMUL_TIER` selects the
+micro-kernel without a rebuild, and `test_ltx2_lora` is 15/15 with 114 assertions
+under `portable`, `sse2`, `avx2`, `avx512` and `ref` alike. This is here because
+the obvious objection to a byte-equality gate is that it was written on one
+machine's ISA: CI builds arm64, and a gate that only held on AVX-512 would red
+there. It holds on the portable tier, which is the one with no arch SIMD at all
+and the closest available stand-in for a different micro-kernel. The Arm tier
+itself is not exercisable on this box and is left to CI.
+
 So the byte-equality assertion in the gate is a genuine oracle rather than a
 tolerance that was widened until it passed, and no existing golden or tolerance
 moved.

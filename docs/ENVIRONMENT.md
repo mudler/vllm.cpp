@@ -278,7 +278,7 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
 | `VT_GEMMA4_MLP_MOE_PARALLEL` | off | `=1` run Gemma4 MLP and MoE on two HIP streams (lab; wall ~flat on R9700). Not wired in this PR tip (decode-graph-free split) |
 | `VT_ATTN_PREFILL_FLASH` | off | `=1` SGLang-style BM×BN GQA flash prefill (lab A/B) |
-| `VT_GEMMA4_PREFILL_GEMM_M` | `256` | Tokens per expert in prefill-batch GEMM chunks (`16..2048`). Larger M → fewer launches; lab `512` ~+37% prefill vs `64` |
+| `VT_GEMMA4_PREFILL_GEMM_M` | `2048` | Tokens per expert in prefill-batch GEMM chunks (`16..8192`; out-of-range values are ignored and the default is used). Larger M → fewer launches; lab `512` ~+37% prefill vs `64`, and `512`→`2048` ~+80 eng @11k vs the WMMA baseline (2026-08-10), which is why the default is `2048`. Lab KEEP on dual R9700 uses the default |
 | `VT_GEMMA4_HOST_EXPERT_MB` | `512` | Host-side expert staging budget (MiB) for non-resident paths |
 | `VT_GEMMA4_LAYER_TRACE` | off | `=1` layer GPU-synced phase timers; `=2` per-layer heartbeats |
 | `VLLM_CPP_HTTP_FIXED_POOL` | `1` (fixed) | `=0` reverts the HTTP worker pool to the legacy dynamic mode. Production uses the capacity-derived fixed pool; the opt-out exists for same-binary A/B attribution |

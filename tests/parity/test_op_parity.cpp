@@ -1836,6 +1836,9 @@ const std::set<std::string>& PendingRunnerOps() {
       // Full-engine GGUF greedy acceptance fixture consumed by
       // test_qwen36_gguf_engine.cpp.
       "qwen36_gguf_greedy",
+      // Full-engine paged greedy gate fixture consumed by
+      // test_qwen35_paged_engine.cpp (the ROCm M4 0.8B GDN gate, issue #41).
+      "qwen35_0_8b_greedy",
   };
   return kPending;
 }

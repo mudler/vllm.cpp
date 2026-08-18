@@ -560,18 +560,25 @@ recurrences + fused attn preamble; 27B prefill 21.5x, decode
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
 Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
-oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
-but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
-contributor-measured on 2x R9700 and CPU-link-verified our side; a `head_dim=128`
-decode arm lands opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves
-gfx1200 per-token decode from 6.35x to 1.75x slower than the pinned vLLM oracle
-on one shape, a directional figure that leaves the ROCm throughput axis PENDING;
+oracles and Qwen3 in a measured near-tie regime; on gfx1100 the M4 gate now
+runs against the **pinned vLLM-ROCm oracle built on the same box**
+(`555967922` / `0.23.1rc1.dev1511+g555967922`): Qwen3-0.6B **16/16 PASS**
+(11/16 strict token-exact, 5/16 near-tie band, max teacher-forced gap 0.125
+nats, 0 forward-divergent; oracle K=10 deterministic in every cell) with the
+ROCm device-golden lane in `test_qwen3_paged_engine`; Qwen3.5-0.8B GDN runs
+all-native and is gated **16/16 against the same-box pinned oracle** (15/16
+strict token-exact, max gap 0.125 nats) since the `AttnQkNormRopeGate`
+output-dtype dispatch fix; gfx1201 Gemma-4 FP8 MoE is contributor-measured on
+2x R9700 and CPU-link-verified our side; a `head_dim=128` decode arm lands
+opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves gfx1200 per-token
+decode from 6.35x to 1.75x slower than the pinned vLLM oracle on one shape, a
+directional figure that leaves the ROCm throughput axis PENDING;
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
 ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
 validator's two errors and three warnings, and the dot-anchored segment match),
 all UNREACHABLE for now because nothing constructs an `OffloadConfig` yet, so
-no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
-`cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
+no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with
+dotted-segment `cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
 pure mirror floor, and #149's dense half. Its memory and speed gates need a
 discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
 nothing, so those gates are blocked rather than pending

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "gguf_builder.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -1810,6 +1811,16 @@ TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") 
   // The prefault (VT_GGUF_PREFAULT) only READS the borrowed pages to fault them
   // in at load, off the timed prefill path. It must change no byte and must leave
   // the weight borrowed in place. A/B the two env settings on the SAME file.
+  //
+  // ENG-RESIDENCY-CONFIG (#1110) MADE THIS CASE MEAN SOMETHING. Two problems, both
+  // measured. The site cached its answer in a function-local static, so the second
+  // `setenv` below could not affect anything and both arms ran identically — the
+  // A/B was vacuous. And byte-transparency holds whether the prefault runs or not,
+  // so with the site mutated to never consult its resolver at all this whole suite
+  // stayed green (39/39), as did test_gguf_qwen36_loader (6/6) and
+  // test_gguf_expert_span (11/11). The static is gone and the span counter below is
+  // the observable: it is the only thing that separates "prefaulted" from
+  // "skipped", because the operation reads pages and writes nothing.
   const DenseDims d;
   const TempFile f(BuildDenseF16Gguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
@@ -1820,16 +1831,39 @@ TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") 
   mmap.mmap_residency = true;
 
   ::setenv("VT_GGUF_PREFAULT", "0", 1);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights woff =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  const uint64_t spans_off = vllm::GgufPrefaultedSpanCount();
+
   ::setenv("VT_GGUF_PREFAULT", "1", 1);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
   const vllm::Qwen3_5DenseWeights won =
       vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  const uint64_t spans_on = vllm::GgufPrefaultedSpanCount();
   ::unsetenv("VT_GGUF_PREFAULT");
 
   CHECK(won.lm_head.bytes.borrowed());        // still an in-place borrow
   CHECK(won.lm_head.bytes.data() == oh.data);
   CHECK(won.lm_head.bytes == woff.lm_head.bytes);  // byte-identical to no-prefault
+
+  // THE ARMS ACTUALLY DIFFER. Without these two the case asserts only that the
+  // prefault is harmless, which is equally true of a prefault that never ran.
+  CHECK(spans_off == 0);
+  CHECK(spans_on > 0);
+
+  // And the CONFIG reaches the same site: `vllm_cpp.mmap.prefault` turns it off
+  // with no environment variable in play, which is the whole point of #1110.
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm::WeightResidencyConfig cfg;
+  cfg.prefault = false;
+  vllm::SetWeightResidencyConfig(cfg);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
+  const vllm::Qwen3_5DenseWeights wcfg =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  CHECK(vllm::GgufPrefaultedSpanCount() == 0);
+  CHECK(wcfg.lm_head.bytes == woff.lm_head.bytes);  // still byte-identical
+  vllm::ResetWeightResidencyConfigForTesting();
 }
 
 TEST_CASE("a borrowed F16 weight OUTLIVES the GgufFile and the file") {

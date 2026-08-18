@@ -255,6 +255,63 @@ class FlashAttentionBackend final : public AttentionBackend {
       const std::string& cache_dtype_str = "auto") const override;
 };
 
+// The dense ROCm paged-attention backend (issue #41 M3). Upstream ROCM_ATTN
+// (vllm/v1/attention/backends/rocm_attn.py) is the FlashAttention-family
+// backend the ROCm platform prefers on non-AITER boards, and its NAME is what
+// rocm.py:407-441 `_get_backend_priorities` puts first in the dense branch
+// (verified at pin 555967922). The concrete kernel is selected at the vt::
+// op-table level (vt::PagedAttention -> GetOp(kPagedAttention, kROCM),
+// registered in src/vt/rocm/rocm_ops.hip) — exactly the FlashAttention
+// division of labour on CUDA. The host metadata here is device-agnostic, so the
+// class lives alongside FLASH_ATTN and self-registers for kROCM in backend.cpp
+// (same footing as the kMETAL / kVULKAN / kTENSTORRENT rows).
+//
+// --- KV-LAYOUT DEVIATION (one exact tracked exception — recorded decision,
+// issue #41 M3, spec rocm-attn-backend.md §3): ---
+// Upstream rocm_attn.py:247-256 (`get_kv_cache_shape`) returns
+// (2, num_blocks, block_size, num_kv_heads, head_size) — K/V split OUTERMOST —
+// and rocm.py:521-522 says it outright: "ROCM_ATTN still uses a legacy
+// attention layout (KV is the outer dimension)". Our ROCm paged-attn kernel
+// (src/vt/rocm/rocm_paged_attn.hip) is a port of the CPU/CUDA pair and reads
+// the SAME NHD layout FlashAttentionBackend::get_kv_cache_shape allocates
+// (num_blocks, 2, block_size, num_kv_heads, head_size), indexed by TENSOR
+// strides (kc_blk/kc_pg/kc_hd) — the identical precondition the Metal and
+// Vulkan legs document at their registration lines. Registering the NAME
+// ROCM_ATTN therefore inverts upstream's defining property: upstream's
+// K/V-outermost cache cannot exist here because the engine allocates NHD and
+// the local kernel reads NHD. The alternatives were (a) register FLASH_ATTN
+// for kROCM, as Metal/Vulkan/Tenstorrent do, leaving "ROCM_ATTN" in the
+// priority list as a permanently-skipped placeholder, or (b) keep the name and
+// record the deviation as ONE exact tracked exception. We chose (b): the name
+// identifies the KERNEL FAMILY that actually runs (the ROCm paged-attn kernel
+// behind kPagedAttention/kROCM), the selection log then reports ROCM_ATTN on
+// real silicon, and the deviation is what this record + spec pins. When (if) a
+// real upstream-layout ROCm attention kernel lands, this shape flips with it.
+//
+// --- KV-CONNECTOR GUARD (why upstream's `use_kv_connector` gate does not
+// apply — recorded, spec §4): ---
+// Upstream appends ROCM_ATTN to the priority list only `if not use_kv_connector`
+// (rocm.py:432-433), because connector transfer semantics are unvalidated for
+// its ASYMMETRIC native K/V views. We ship a KV connector (LMCache,
+// include/vllm/v1/kv_offload/kv_connector.h), but our registered shape is the
+// SHARED SYMMETRIC NHD layout — the same one FLASH_ATTN (which upstream does
+// use with connectors) allocates — so the asymmetric-view premise of the guard
+// does not exist for this registration. The guard therefore needs no
+// AttnSelectorConfig field here; if a future ROCm kernel adopts upstream's
+// asymmetric layout, this registration flips shape AND the guard becomes
+// load-bearing (that is the tracked-exception escape hatch).
+class RocmAttentionBackend final : public AttentionBackend {
+ public:
+  static constexpr const char* kName = "ROCM_ATTN";
+
+  std::string get_name() const override { return kName; }
+
+  std::vector<int64_t> get_kv_cache_shape(
+      int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+      int64_t head_size,
+      const std::string& cache_dtype_str = "auto") const override;
+};
+
 // The dense-MLA backend, and the ONLY one reachable on GB10 — read from
 // vllm/platforms/cuda.py:129-133 (sm_12x → [TRITON_MLA,
 // FLASHINFER_MLA_SPARSE_SM120]) and OBSERVED at W0 from the vLLM 0.25.0 oracle

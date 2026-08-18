@@ -362,6 +362,58 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
 
+    def test_residency_config_is_credited_for_real_commands(self):
+        # ENG-RESIDENCY-CONFIG (#1110) is a NEW row arriving at ACTIVE, which is
+        # the first state that puts it in GATED_STATES at all, so it joins the
+        # runnable population on arrival and earns the credit the same way the
+        # rows above earn it. The entry in RUNNABLE_BASELINE is the WHOLE of what
+        # this row changed in the checker, so without these two cases the
+        # constant is the only artifact and the credit is plausible rather than
+        # checkable -- which is what `scripts/check-pr-size.py`'s
+        # `governance_checker` contract refuses, and it refused this row's first
+        # commit by name.
+        #
+        # THREE things are pinned, not one. The row is in the exact pin; its
+        # Gates section really does yield a command that can fail; and the spec
+        # says why no GPU, oracle or throughput leg is implicated, because a
+        # CPU-only credit whose record is silent about the missing arms reads as
+        # coverage. This row's claim for that silence is unusually strong and is
+        # worth holding: it moves where a value comes from and changes no kernel,
+        # dtype, allocation or token, so there is no throughput axis to gate.
+        self.assertIn("ENG-RESIDENCY-CONFIG", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-RESIDENCY-CONFIG"), "runnable")
+
+        spec = (ROOT / ".agents/specs/weight-residency-config.md").read_text(
+            encoding="utf-8"
+        )
+        section = gates.gates_section(spec)
+        self.assertIsNotNone(section)
+        # EXACT strings, because `runnable_commands` returns whole commands and
+        # `assertIn` on a list is membership rather than a substring search. The
+        # first draft of this case asserted the bare `scripts/agent-preflight.sh`
+        # and went red for that reason, not because the spec lacked a gate.
+        commands = gates.runnable_commands(section)
+        self.assertIn("scripts/agent-preflight.sh --staged", commands)
+        self.assertIn("ctest --test-dir build -j 6", commands)
+        # No throughput axis, said in the record rather than left as an absence.
+        self.assertIn("no throughput axis of its own and", spec)
+        # And the GPU leg that IS owed is recorded as owed, not skipped.
+        self.assertIn("## Owed", spec)
+        self.assertIn("370 GiB", spec)
+
+    def test_dropping_residency_config_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1110 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and set equality has to go red, which is what proves the row
+        # was pinned because it entered the population and not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-RESIDENCY-CONFIG"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-RESIDENCY-CONFIG"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
     def test_mtp_depth_is_credited_for_real_commands(self):
         # SPEC-MTP-K-GT-1 (#81) is a NEW row arriving at ACTIVE, which is the
         # first state that puts it in GATED_STATES at all, so it joins the

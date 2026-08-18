@@ -1117,6 +1117,22 @@ vllm_cpp_add_test(test_speculative_mtp_depth vllm/config/test_speculative_mtp_de
 # language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
 vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
+# ENG-RESIDENCY-CONFIG (#1110): the `vllm_cpp` extension of --offload-config.
+vllm_cpp_add_test(test_weight_residency_config
+  vllm/config/test_weight_residency_config.cpp)
+# ...and the expert-stream knob's own binary (#1122). `ResolveExpertStreamRequested`
+# caches its answer in a function-local static, so a process can observe what it
+# resolved exactly ONCE. That one observation is spent here, on the field the
+# resolver reads — rewiring it to the adjacent `.mmap` left every other suite green.
+vllm_cpp_add_test(test_expert_stream_latch
+  vllm/config/test_expert_stream_latch.cpp)
+# ...and its REACHABILITY: the loader and the C ABI install it. `vllm.h` is the
+# public surface, so this suite needs src/ on the include path exactly as
+# test_capi does (it reaches the internal MakeEngineHandle hook there; here it is
+# the internal weight_residency header beside the public one).
+vllm_cpp_add_test(test_weight_residency_reach
+  vllm/entrypoints/test_weight_residency_reach.cpp)
+target_include_directories(test_weight_residency_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
 vllm_cpp_add_test(test_expert_slot_cache vllm/model_executor/test_expert_slot_cache.cpp)
@@ -1388,6 +1404,11 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_mm_limits
     vllm/entrypoints/openai/test_serve_mm_limits.cpp)
   target_include_directories(test_serve_mm_limits PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-RESIDENCY-CONFIG (#1110): --offload-config's vllm_cpp key reaching the
+  # loader through the REAL VllmServerMain. Same include path for server_main.h.
+  vllm_cpp_add_test(test_serve_residency_config
+    vllm/entrypoints/openai/test_serve_residency_config.cpp)
+  target_include_directories(test_serve_residency_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

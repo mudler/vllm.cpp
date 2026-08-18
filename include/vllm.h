@@ -426,12 +426,47 @@ typedef struct vllm_model_params {
    * when prefetch is enabled) fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT.
    *
-   * ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD` W0b wires the config
-   * surface end to end (CLI -> ABI -> EngineParams) and validates it; the
-   * offloader that would MOVE a weight is W2/W5. So a valid config parses,
-   * validates and is recorded, and no weight moves yet. It is spelled out here
-   * rather than left silent because a user who sets cpu_offload_gb and sees no
-   * memory change deserves to know it was accepted and is inert, not ignored.
+   * THE MIRRORED KEYS ARE ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD`
+   * W0b wires the `offload_backend`/`uva`/`prefetch` half end to end (CLI -> ABI
+   * -> EngineParams) and validates it; the offloader that would MOVE a weight to
+   * host RAM is W2/W5. So that half parses, validates and is recorded, and no
+   * weight moves yet. It is spelled out here rather than left silent because a
+   * user who sets cpu_offload_gb and sees no memory change deserves to know it
+   * was accepted and is inert, not ignored. This sentence covers ONLY those three
+   * keys.
+   *
+   * THE `vllm_cpp` KEY IS LIVE, and it moves weights (ABI v21, row
+   * `ENG-RESIDENCY-CONFIG`). The same string carries a vllm.cpp-ORIGINAL object
+   * for the tier BELOW upstream's: weights borrowed out of the GGUF file mapping
+   * rather than copied to host RAM, plus a bounded host slot cache for routed
+   * expert slices. Upstream has no disk tier, so there is nothing to mirror and
+   * the key names itself. Schema, every field optional and an absent field
+   * meaning unchanged:
+   *   {"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},
+   *                "expert_stream":{"enabled":bool,"slots":int,
+   *                                 "slot_bytes":int}}}
+   * Precedence per field is environment variable > this document > built-in
+   * default, so an exported VT_GGUF_MMAP / VT_GGUF_PREFAULT / VT_MOE_EXPERT_STREAM
+   * / VT_MOE_EXPERT_STREAM_SLOTS / VT_MOE_EXPERT_STREAM_SLOT_BYTES still wins; the
+   * engine prints one line on stderr naming what it installed, plus a second line
+   * naming the variables that override it when there are any. The engine acts on it
+   * during weight load, so it must be installed before then, which vllm_engine_load
+   * does. Loading a SECOND engine in one process is legal: an absent field means
+   * unchanged, so a partial document is merged over what is installed rather than
+   * replacing it, and only a document that would CHANGE a decision the process has
+   * already taken — the streaming answer, or the slot store's geometry — is refused.
+   *
+   * REFUSALS ADDED WITH THAT KEY, all VLLM_ERR_INVALID_ARGUMENT before any model
+   * I/O: an UNKNOWN key anywhere in the document — a misspelled top-level key
+   * (`{"vllm-cpp":...}` with a hyphen, `{"uvaa":...}`), a misspelled key inside
+   * `vllm_cpp` (`{"vllm_cpp":{"mmapp":...}}`), and a misspelled key inside the
+   * mirrored `uva` or `prefetch` object (`{"uva":{"cpu_offload_GB":10}}`); a
+   * wrong-typed field; and a non-positive `slots` or `slot_bytes`. A typo is refused
+   * rather than defaulted because a silently disabled residency tier, or a budget
+   * the operator believes is set, is met as an out-of-memory kill rather than as an
+   * error. Upstream refuses one too: every vLLM config dataclass carries
+   * `extra="forbid"`. The four legal top-level keys are `offload_backend`, `uva`,
+   * `prefetch` and `vllm_cpp`. See docs/USAGE.md.
    * Borrowed for the call only. */
   const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────

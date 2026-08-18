@@ -30,6 +30,8 @@
 #include <vector>
 
 #include "vllm/platforms/interface.h"
+#include "vllm/v1/attention/backend.h"
+#include "vllm/v1/attention/registry.h"
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -278,11 +280,31 @@ TEST_CASE("the ROCm platform self-registers and is selected over CPU") {
     CHECK(&CurrentPlatform() == &rocm);
   }
 
-  // W0 registers no attention backend, so the priority list is EMPTY and
-  // selection throws loudly rather than naming a backend whose kernels are
-  // absent. When M3 lands ROCM_ATTN/TRITON_ATTN this flips, and this assertion
-  // is the reminder to update it deliberately.
-  CHECK(rocm.get_attn_backend_priority({}).empty());
+  // M3: ROCM_ATTN is registered for kROCM and the priority list mirrors
+  // rocm.py:424-434 (AITER entries gated off on RDNA3). The dense walk resolves
+  // to the first REGISTERED name — ROCM_ATTN — and constructs the named backend.
+  const auto dense_prio = rocm.get_attn_backend_priority({});
+  // Verbatim mirror of rocm.py:407-441 _get_backend_priorities (dense branch)
+  // at pin 555967922 — the AITER entries are gated on is_mha_enabled() /
+  // is_aiter_found_and_supported() upstream (:434,:436) and are named-but-
+  // unregistered placeholders here, skipped by the walk.
+  const std::vector<std::string> expected_dense{
+      "ROCM_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN",
+      "TRITON_ATTN", "TURBOQUANT"};
+  CHECK(dense_prio == expected_dense);
+  CHECK(vllm::v1::HasAttentionBackend(DeviceType::kROCM, "ROCM_ATTN"));
+  CHECK(vllm::v1::SelectAttentionBackendName(rocm) == "ROCM_ATTN");
+  std::unique_ptr<vllm::v1::AttentionBackend> b =
+      vllm::v1::SelectAttentionBackend(rocm);
+  REQUIRE(b != nullptr);
+  CHECK(b->get_name() == "ROCM_ATTN");
+  // The NHD KV shape the local ROCm kernel reads (KV-layout deviation, backend.h).
+  const std::vector<int64_t> shape = b->get_kv_cache_shape(10, 16, 2, 128);
+  const std::vector<int64_t> expected_shape{10, 2, 16, 2, 128};
+  CHECK(shape == expected_shape);
+  // TRITON_ATTN / TURBOQUANT are named but unregistered -> skipped, not picked.
+  CHECK_FALSE(vllm::v1::HasAttentionBackend(DeviceType::kROCM, "TRITON_ATTN"));
+  CHECK_FALSE(vllm::v1::HasAttentionBackend(DeviceType::kROCM, "TURBOQUANT"));
 }
 
 // Mirrors "CUDA backend: graph capture/replay re-executes captured ops" in

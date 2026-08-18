@@ -146,6 +146,14 @@ commit a wheel exists for. A wheel cannot substitute for either. **This does NOT
 establish that vLLM never retains per-commit wheels.** Nobody measured that, and
 the unconfirmed URL scheme is exactly why.
 
+**The source build was then run, and it worked.** On 2026-08-18, inside an `rc`
+lease on `dgx:gpu0`, that build produced our own wheel from the pin against a
+staged CUDA toolkit, and the installed package imports and sees the GB10
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+[`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). So this section's
+conclusion holds and its cost estimate does not: the source build is the route,
+and the route is open.
+
 ## What this does NOT establish
 
 Read this section before you quote any line above it. Every claim here is
@@ -155,13 +163,20 @@ narrower than the sentence a reader wants to write from it.
   `sm_121a` and is UNMEASURED. Nothing here licenses a claim about the Spark.
   A probe is queued at lowest priority behind a human hold on `dgx:gpu0`. Until
   that probe returns, `dgx:gpu0` keeps the reading its own last probe gave it.
-- **The pinned vLLM oracle is NOT staged.** Only `torch`, `triton` and `numpy`
-  are, so this does not show that the oracle runs. vLLM at `555967922` is a
-  source build with compiled extensions, and it needs `nvcc`, which the worker
-  still lacks. #1129's consequence for the oracle-dependent rows is therefore
-  NARROWED and not closed. A prebuilt wheel does not remove the `nvcc`
-  requirement either, and that is measured rather than assumed. See
-  `## The prebuilt-wheel route is closed for our pin`.
+- **The pinned vLLM oracle is not in THIS staged tree.** Only `torch`, `triton`
+  and `numpy` are, so nothing measured on `thor:gpu0` shows that the oracle
+  runs. vLLM at `555967922` is a source build with compiled extensions, and a
+  prebuilt wheel does not remove that requirement, which is measured rather than
+  assumed. See `## The prebuilt-wheel route is closed for our pin`.
+- **The `nvcc` clause this section used to carry is FALSIFIED.** It read "it
+  needs `nvcc`, which the worker still lacks". On 2026-08-18 a lease on
+  `dgx:gpu0` ran the source build against a staged CUDA toolkit and produced a
+  434 MiB wheel that imports and reports `cuda True NVIDIA GB10`
+  ([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+  [`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). #1129's consequence
+  for the oracle-dependent rows narrows again and does not close: those rows are
+  UNBLOCKED for the build step and STILL BLOCKED for a model run, which nobody
+  has measured.
 - **The CUDA version skew is recorded as observed, not adjudicated.** The torch
   wheel is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`. It
   compiled and ran a correct kernel here. Nobody has read whether the skew
@@ -245,8 +260,11 @@ reads rather than device work.
 
 - [#1146](https://github.com/mudler/vllm.cpp/issues/1146) stays open. Re-run the
   identical staged probe on `dgx:gpu0` at `sm_121a`.
-- Stage the pinned vLLM oracle itself, which is what #1129 actually blocks. It
-  needs `nvcc` first, because no wheel carries our pin.
+- PAID for the build step. The pinned oracle itself now builds, installs and
+  imports inside a lease on `dgx:gpu0`, against a staged `nvcc`
+  ([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+  [`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). A MODEL RUN is still
+  owed, and #1185 owns it.
 - Read whether the `+cu130` and `12.8` skew changes a numerical result.
 - Confirm the `https://wheels.vllm.ai/<sha>/` URL scheme against a known-good
   case before anyone reads the four 404s as evidence of absence. Until then those
@@ -262,6 +280,10 @@ The four walls and the working recipe are recorded here.
 `.agents/specs/gpu-lease-methodology.md` no longer carry "cannot start Python" as
 the live cause, and each now names the box and the date its reading came from.
 The staged tree now holds `torch`, `triton` and `numpy`. It does not hold the
-oracle, and a prebuilt wheel cannot put it there for our pin, so `nvcc` and a
-source build remain the route. The next step is the `dgx:gpu0` probe, which the
-coordinator has queued.
+oracle, and a prebuilt wheel cannot put it there for our pin, so a source build
+against `nvcc` is the route. That build was then run, inside a lease on
+`dgx:gpu0`, and it produced a wheel that imports and sees the GB10
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
+[`oracle-wheel-in-lease.md`](oracle-wheel-in-lease.md)). A model run stays
+untested. The next step for this row is the `dgx:gpu0` runtime probe at
+`sm_121a`, which the coordinator has queued.

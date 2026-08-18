@@ -80,6 +80,21 @@ std::vector<int64_t> FlashAttentionBackend::get_kv_cache_shape(
   return {num_blocks, 2, block_size, num_kv_heads, head_size};
 }
 
+std::vector<int64_t> RocmAttentionBackend::get_kv_cache_shape(
+    int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+    int64_t head_size, const std::string& /*cache_dtype_str*/) const {
+  // rocm_attn.py:249-251 enforces block_size % 16 == 0 (the native ROCm
+  // paged-attn kernel supports LDS-bound block sizes 16/32). The SHAPE is the
+  // shared NHD layout, not upstream's (2, num_blocks, ...) — see the class
+  // comment in backend.h (KV-LAYOUT DEVIATION). Deliberately identical to
+  // FlashAttentionBackend::get_kv_cache_shape above; kept as its own function
+  // so the deviation reads in one place.
+  if (block_size % 16 != 0) {
+    throw std::invalid_argument("Block size must be a multiple of 16.");
+  }
+  return {num_blocks, 2, block_size, num_kv_heads, head_size};
+}
+
 std::vector<int64_t> TritonMLABackend::get_kv_cache_shape(
     int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
     int64_t head_size, const std::string& /*cache_dtype_str*/) const {
@@ -193,6 +208,21 @@ const AttentionBackendRegistrar kTritonMlaCuda{
 AttentionBackendFactory MakeFlashAttentionBackend = []() -> std::unique_ptr<AttentionBackend> {
   return std::make_unique<FlashAttentionBackend>();
 };
+// ...and kROCM (issue #41 M3). The ROCm paged-attn kernel
+// (src/vt/rocm/rocm_paged_attn.hip) reads and writes the SAME NHD layout
+// get_kv_cache_shape allocates — the shared layout is the precondition for this
+// line, exactly as the kMETAL / kVULKAN / kTENSTORRENT rows document. The
+// factory returns the ROCM_ATTN class (not the FlashAttention one): the name a
+// backend answers to IS its identity here, and the test asserts the constructed
+// backend's get_name() == "ROCM_ATTN". RocmPlatform::get_attn_backend_priority
+// is what decides whether the name is reached (rocm.py:424-434 puts ROCM_ATTN
+// first on non-AITER boards).
+AttentionBackendFactory MakeRocmAttentionBackend = []() -> std::unique_ptr<AttentionBackend> {
+  return std::make_unique<RocmAttentionBackend>();
+};
+const AttentionBackendRegistrar kRocmAttn{vt::DeviceType::kROCM,
+                                          RocmAttentionBackend::kName,
+                                          MakeRocmAttentionBackend};
 const AttentionBackendRegistrar kFlashAttnCuda{vt::DeviceType::kCUDA,
                                                FlashAttentionBackend::kName,
                                                MakeFlashAttentionBackend};

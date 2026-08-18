@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "vllm/config/weight_residency.h"
 #include "vllm/platforms/interface.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
@@ -245,7 +246,13 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.
-  p.mmap_residency = EnvOnOr("VT_GGUF_MMAP", p.keep_quant) && !p.cpu_ref;
+  // ENG-RESIDENCY-CONFIG (#1110): `VT_GGUF_MMAP` is now `--offload-config`'s
+  // `vllm_cpp.mmap.enabled` as well, and ResolveGgufMmap holds the precedence —
+  // env var > config > this availability default. It is the SOLE reader of the
+  // variable, and it applies the same whole-value polarity `EnvOnOr` did, so an
+  // environment-only run resolves byte-for-byte as before. `VT_CPU_REF` still wins
+  // over both: the oracle switch is not a residency preference.
+  p.mmap_residency = ResolveGgufMmap(p.keep_quant) && !p.cpu_ref;
   p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", p.expand_nk) && p.expand_nk;
   // GDN split-projection orientation. Rides expand_nk (so VT_CPU_REF=1
   // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow

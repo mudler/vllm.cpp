@@ -285,11 +285,19 @@ What to report on #41, in the M0/M1 table shape already in use there:
 
 **M3 — kernels + attention.** Hipify `src/vt/cuda/` family by family, starting
 with what M2's fallback log actually hit: layernorm, rope, activations, glue,
-reshape-cache, sampling, then paged attention. Register a ROCm attention backend
-and put its name in the platform priority in the same change. For what upstream
-selects on your arch, read `_get_backend_priorities` (`rocm.py:407`) and
-`get_attn_backend_cls` (`rocm.py:545`): AITER FA is gfx9-only, RDNA3 goes down
-the Triton/ROCm attention path.
+reshape-cache, sampling, then paged attention. **The attention half LANDED
+(2026-08-17):** the engine-level `ROCM_ATTN` backend self-registers for `kROCM`
+([#1056](https://github.com/mudler/vllm.cpp/pull/1056)) and the runner selects it
+per attention group, validating each group's KV view against the backend's
+declared shape ([#1065](https://github.com/mudler/vllm.cpp/pull/1065)). Upstream
+anchors at pin `555967922`: the priority list is `_get_backend_priorities`
+(`rocm.py:407-441`), whose AITER entries are gated on
+`rocm_aiter_ops.is_mha_enabled()` / `is_aiter_found_and_supported()`
+(`rocm.py:434,436`) — NOT `on_gfx9()` (that lives only in the separate
+`get_vit_attn_backend`, `rocm.py:642`); `get_attn_backend_cls` is `rocm.py:545`.
+The registered shape deliberately deviates from upstream's K/V-outermost
+`rocm_attn.py:247-256` — one exact tracked exception, recorded in
+[specs/rocm-attn-backend.md](../.agents/specs/rocm-attn-backend.md) §3.
 
 **M4 — correctness gate.** Greedy token parity against a vLLM-ROCm oracle on the
 same hardware, same workload, following

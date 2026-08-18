@@ -17,6 +17,7 @@
 #include <unistd.h>
 #endif
 
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vt/dtype.h"
@@ -24,8 +25,8 @@
 
 namespace vllm {
 
-// Load-time PREFAULT of a mmap-borrowed weight span (VT_GGUF_PREFAULT, default
-// ON with mmap residency). A weight left BORROWED in the read-only mapping is not
+// Load-time PREFAULT of a mmap-borrowed weight span (VT_GGUF_PREFAULT or
+// `--offload-config`'s `vllm_cpp.mmap.prefault`, default ON with mmap residency). A weight left BORROWED in the read-only mapping is not
 // resident until first touch; without a prefault those page faults land in the
 // TIMED prefill (the L6 keep-f16 TTFT regression). Faulting them in at load —
 // off the timed path — mirrors llama.cpp, which prefetches its mmap at load with
@@ -35,19 +36,31 @@ namespace vllm {
 // not merely queued. Read-only, so it changes no bytes. No-op on the copy arm.
 inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
 #if defined(__unix__)
-  static const bool enabled = [] {
-    const char* v = std::getenv("VT_GGUF_PREFAULT");
-    return v == nullptr || !(v[0] == '0' || v[0] == '\0' ||
-                             std::strcmp(v, "false") == 0 ||
-                             std::strcmp(v, "off") == 0);
-  }();
-  if (!enabled || bytes == 0) return;
+  // ENG-RESIDENCY-CONFIG (#1110): the decision now comes from
+  // `ResolveGgufPrefault()`, which holds `VT_GGUF_PREFAULT` >
+  // `--offload-config`'s `vllm_cpp.mmap.prefault` > ON, and which is the SOLE
+  // reader of that variable.
+  //
+  // THE `static` IS GONE ON PURPOSE. Caching the answer cost one `getenv` per
+  // prefaulted span, which is nothing beside the megabytes of pages this function
+  // then reads, and it bought two defects: a config installed at load could be
+  // ignored by whichever caller happened to ask first, and the existing A/B case
+  // (tests/vllm/test_gguf_keep_quant.cpp, "L7 load-time prefault is
+  // byte-transparent") was silently vacuous, because its second `setenv` could not
+  // change an already-latched value and both of its arms ran identically.
+  if (!ResolveGgufPrefault() || bytes == 0) return;
   (void)::madvise(const_cast<uint8_t*>(src), bytes, MADV_WILLNEED);
   const long ps_l = ::sysconf(_SC_PAGESIZE);
   const size_t ps = static_cast<size_t>(ps_l > 0 ? ps_l : 4096);
   volatile uint8_t sink = 0;
   for (size_t off = 0; off < bytes; off += ps) sink = sink ^ src[off];
   (void)sink;
+  // Count the span AFTER faulting it, so the counter means "this actually
+  // happened". It is the only way a test can tell a prefault from a skip: the
+  // prefault reads pages and changes no byte, which is why the pre-existing
+  // byte-transparency case could not see the difference and a site mutated to
+  // never consult its resolver left the whole GGUF suite green.
+  NoteGgufPrefaultedSpan();
 #else
   (void)src;
   (void)bytes;

@@ -300,7 +300,19 @@ def audit() -> list[dict]:
 # no CUDA or SACRED gate is claimed here, and the DGX three-way at k=2..4 is
 # recorded as OWED rather than skipped. Growth, so the set is re-pinned in the
 # same change.
+# 2026-08-17: +ENG-RESIDENCY-CONFIG. A NEW row arriving at ACTIVE (issue #1110),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names the
+# documented CPU configure/build recipe, `ctest -j 6`, the three focused doctest
+# binaries by name, `scripts/agent-preflight.sh --staged`, and the reachability
+# mutation (delete the install call site in `LoadedEngine::FromModelDir`, require
+# the server-level suite red). It also records what is NOT implicated and why: the
+# row moves where a value comes from and changes no kernel, dtype, allocation or
+# token, so it claims no CUDA, SACRED or throughput gate, and the 370 GiB
+# reproduction through the JSON form is recorded as OWED rather than skipped
+# because dgx.casa was unreachable at the SSH layer. Growth, so the set is
+# re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-RESIDENCY-CONFIG",
     "SPEC-MTP-K-GT-1",
     "ATTN-CHUNKED-LOCAL",
     "SERVE-RECIPE-ARGS",

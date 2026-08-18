@@ -10,8 +10,9 @@ owning capability row and does not belong in a capability matrix.
 ## Now
 
 `GATE-SYMBOL-ANCHORS` ships green. 86 in-repo symbol anchors are checked on
-every run, 26 of them converted here; 96 `model_loader.cpp` line citations
-remain unconverted and are listed under `## Owed`.
+every run, 26 of them converted here. `model_loader.cpp` line references in
+tracked, non-frozen, non-locked files fell from 106 to 86; the 86 that remain
+are listed under `## Owed`.
 
 ## Scope
 
@@ -222,11 +223,15 @@ anchor is one edit away from a wrong one.
 ## Owed
 
 - [#1143](https://github.com/mudler/vllm.cpp/issues/1143) stays OPEN and owns
-  the residue: 96 of the 120 touchable `model_loader.cpp:NNN` line citations are
-  unconverted. They were left because converting one requires deciding what the
-  author meant, and 62 of the 102 measured citations name no symbol at all in
-  their sentence, so there is nothing to convert them TO without re-deriving the
-  claim. Deliberately excluded surfaces: `.agents/completed/**` (frozen
+  the residue. Measured over tracked files, excluding the frozen and locked
+  surfaces below, `model_loader.cpp:NNN` references fell from 106 in 46 files to
+  86 in 34 — 20 converted, 86 left. They were left because converting one
+  requires deciding what the author meant: a heuristic pass that scanned a
+  two-line context window around each of 92 such citations found 62 naming no
+  `model_loader.cpp` symbol at all, so there is nothing to convert them TO
+  without re-deriving the claim. The other 30 could not be converted mechanically
+  either, because the window pulls in symbols from adjacent table rows; every
+  conversion here was made by hand and verified individually. Deliberately excluded surfaces: `.agents/completed/**` (frozen
   archive), `.agents/issue-index.md` (append-only, an edit is forbidden),
   `.agents/benchmark-record.md` and `.agents/parity-ledger.md` (append-only
   records).

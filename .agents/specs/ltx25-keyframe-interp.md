@@ -401,7 +401,7 @@ splits on. Assert a non-zero case AND assertion count. A thrown case prints
 
 Report `CONFIGURE_EXIT`, `BUILD_EXIT`, the `: error:` count, `ctest -N`,
 `CTEST_EXIT`, the pass/fail line, and `No space left` / `BFD` greps WITH live
-positive controls, plus load and free disk. ~506 tests registered.
+positive controls, plus load and free disk. 511 tests registered at this head.
 
 `READER ANCHORS` (`ltx2_video.cpp`) is gated by `test_ltx2_video` and shifts
 whenever the readers above it move. This row edits the conditioning block, which
@@ -411,6 +411,10 @@ confirming MISMATCH.
 
 **No GPU.** Another agent holds `dgx:gpu0` for a render, and a recipe row is
 correctly gated by the CPU goldens.
+
+`ltx2-gen` gains `--last-frame` in this change ([#1191](https://github.com/mudler/vllm.cpp/issues/1191)),
+fixed in flow. The ABI field and the engine's reader both predate it; only the
+CLI was missing, and this is the first row a missing CLOSING keyframe narrows.
 
 ## What is NOT verified
 
@@ -433,6 +437,114 @@ no diagnostic (#1137).
 
 So the claim this row makes is: gated on CPU goldens, correct against the
 upstream SOURCE line by line, and NOT measured against upstream's own render.
+
+## Outcome
+
+Row `DONE`. Recorded here because neither the code nor the Git history carries
+it: what the gate MEASURED, and the two things this row found that its scoping
+pass did not know.
+
+### The audit was wrong about WHICH blocker, in both directions
+
+#1096 named a per-sigma denoiser and two absent checkpoints, both stale, and a
+multi-keyframe surface, which is true and is not what stops the pipeline. It did
+not name the conditioning builder, which is the one difference that makes
+`KeyframeInterpolationPipeline` a different pipeline rather than a second
+`ti2vid_two_stage`.
+
+Both errors have the same shape and it is worth naming: the audit read the
+pipeline's IMPORTS and the machinery they reach, and inferred what would be hard.
+`FactoryGuidedDenoiser` resolves guiders per sigma, so a per-sigma guider looked
+required — and the same file's `main()` passes plain params, so the factory has
+one bin. `image_conditionings_by_adding_guiding_latent` and
+`combined_image_conditionings` are both one-line imports of a helper, so neither
+looked like anything. **The import list says which machinery is reachable; only
+the call site says which behaviour runs.**
+
+### What the gate measured
+
+Focused, at the head this row pushes:
+
+| Binary | cases | assertions | exit |
+|---|---|---|---|
+| `test_ltx2_pipeline` | 56 | 3316 | 0 |
+| `test_ltx2_video` | 87 | 2713 | 0 |
+
+RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline`
+56 cases / 54 passed / 3183 assertions, `Status: FAILURE!`, exit 1, both new
+cases throwing `Unsupported LTX pipeline kind/version:
+'keyframe_interpolation'/'2.5'`; `test_ltx2_video` 87 / 83 passed / 2593, exit 1.
+
+Full gate at the same head: `CONFIGURE_EXIT=0`, `BUILD_EXIT=0`, `: error:` count
+0, `ctest -N` **511**, `CTEST_EXIT=0`, `100% tests passed, 0 tests failed out of
+511`, `No space left` and `BFD` each 0 against injected controls that returned 1.
+Load average 14 to 36 across the run and 13 GiB free at its start, and none of
+the four load-dependent gates (#618, #294, #1052, #428) went red.
+
+The conditioning case's own `MESSAGE` line is the row in one measurement:
+
+```text
+video_tokens  keyframe 12  ti2vid 8  bare 8
+```
+
+`image_tokens` is 4 on both arms — the same image, the same encode, 8 + 4 on one
+and 8 on the other. And the anchor case reports `keyframe: 4096 / 4096   res2s:
+2 / 8`, the same split `ltx25-ti2vid-recipe.md` measured.
+
+### The reachability mutation FAILED TO BUILD on its first shape, and that is the finding
+
+Deleting the whole `keyframe_interpolation` arm from `ResolveLtx2PipelineRecipe`
+left `KeyframeInterpolationRecipe` unreferenced in an anonymous namespace, and
+`-Werror` killed the build: `BUILT=NO`, 1 error, **no test result at all**. A
+harness that printed only a diff stat and an exit code would have shown a clean
+26-line deletion and nothing else, which is the third shape of green-that-proves-
+nothing this campaign has paid for.
+
+The mutation that measures the thing is a rename of the dispatch KEY —
+`"keyframe_interpolation"` to `"keyframe_interpolation__UNREACHABLE"`. Every line
+stays compiled and referenced; the recipe simply stops being selectable through
+the request surface, which is what "delete the production call site" is asking.
+Under it all six new cases go RED **by name**, four in `test_ltx2_video` and two
+in `test_ltx2_pipeline`.
+
+Both runs are in the pull request body. The first is not a failed attempt to be
+tidied away: it is the reason the harness prints four facts.
+
+### The trace digest had to follow the tokens, and nothing would have said so
+
+`im.trace.image_tokens` / `image_digest` / `image_absmax` are digested from the
+tokens the conditioning item WROTE, and the replace arm reads them off the FRONT
+of `video.clean`. Under the append arm the written tokens are at the TAIL.
+
+Left as it was, the digest would have described unconditioned tokens on this
+recipe and reported a healthy conditioning for a state the keyframe never
+reached — which is precisely what the field's own comment in `ltx2_video.h` says
+it exists to prevent, one arm down from where it was written. No test in this row
+compares the digest's VALUE, so nothing here would have caught it; it is correct
+because the range was derived, not because a gate held it. Recorded so the next
+reader knows which half is measured.
+
+### Two things a later reader should not re-derive
+
+- **`causal_fix` is passed `true` at the frame-0 keyframe call and that is not a
+  copy of the last-frame arm.** `VideoConditionByKeyframeIndex` gates it itself
+  — `latent_tools.causal_fix if self.frame_idx == 0 else False`
+  (`keyframe_cond.py:49`) — and `Ltx2ConditionVideoByKeyframe` mirrors that gate
+  at `ltx2_conditioning.cpp:548`. So `frame_idx = 0` is the ONE combination in
+  which the fix applies, and passing `false` would silently drop it rather than
+  being refused.
+- **`ltx2-gen` gained `--last-frame` (#1191) and the ABI did not change.**
+  `vllm_video_params::last_frame` has existed since #930 and the engine has
+  served it since; the CLI had simply never read the field. Nothing about this
+  row required an ABI change, and a reader who sees the flag appear in the same
+  commit should not infer one.
+
+### A number this row moved that no checker owns
+
+`docs/USAGE.md` says how many `(kind, version)` pairs resolve. It said
+**twenty-four** and now says **twenty-eight**. It is derived by hand from
+`ResolveLtx2PipelineRecipe` and nothing recomputes it, so the next four-key kind
+has to move it again.
 
 ## Dependencies
 

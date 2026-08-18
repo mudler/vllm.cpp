@@ -2432,6 +2432,9 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
       CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
       dev.DestroyQueue(q);
     }
+  }
+}
+
 TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
   // The "paged attention" case above hand-builds a contiguous KV cache; the
   // real model path writes it with ReshapeAndCache and reads it back. This

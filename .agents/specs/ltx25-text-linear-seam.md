@@ -8,10 +8,22 @@ takes #1208 out of that spec's orbit and owns it.
 
 ## Now
 
-`Linear` in `src/vllm/model_executor/models/ltx2_text_encoder.cpp` is a scalar,
-single-threaded triple loop that widens **both** operands to `double` per
-multiply, so it cannot reach an f32 FMA and no thread but the caller's ever
-enters it. It is the caption projection of every LTX-2.5 pipeline kind.
+**DONE.** `Linear` in
+`src/vllm/model_executor/models/ltx2_text_encoder.cpp` is `vt::MatmulBT` plus a
+bias add, and it accumulates in f32. At the shipped geometry one conditioning
+pass went from **671.777 s of one core to 78.421 s on about fourteen (8.57x)**,
+and a guided render pays that pass twice.
+
+The attribution it was dispatched to settle is **bounded, not closed**: the
+projection is 39% to 100% of each of the trace's single-core stretches, because
+the GB10-to-x86 per-core ratio could not be measured here. `## Outcome` §1 has
+the bound and its argument, and `## Owed` carries the one lease that would close
+it.
+
+What it replaced: a scalar, single-threaded triple loop that widened **both**
+operands to `double` per multiply, so it could not reach an f32 FMA and no
+thread but the caller's ever entered it. It is the caption projection of every
+LTX-2.5 pipeline kind.
 
 ## 0. Attribution first, because the issue's own record retracted it
 
@@ -215,8 +227,20 @@ substitutes for the other.
   GMAC/s**, stop and report that the attribution fails, per the dispatch. The
   defect is still real on its own terms, but the render narrative would not be
   its justification.
+  **NOT TRIGGERED, and the reason is stated rather than assumed.** The local rate
+  is 1.7622 GMAC/s, which is consistent with 0.681 for any per-core ratio in
+  [1.0, 2.587], and `## Outcome` §1 shows both ends of that interval are closed
+  by argument. The condition asked whether the projection could be the cost; the
+  answer is that it is 39-100% of it, so the fix belongs here and the residual is
+  carried as owed rather than absorbed.
 - If the goldens move at all, stop and decide the tolerance here rather than in
   the assertion.
+  **TRIGGERED, and decided here.** Two of twelve moved, both on the V1 arm:
+  5.96e-08 -> 1.19e-07 (left) and 5.96e-08 -> 7.45e-08 (right), against the
+  file's 1e-5 bound, i.e. 84x and 134x inside it. `## Outcome` §4 records why the
+  V1 arm is the one that moves. **No tolerance was changed**, and the decision is
+  to accept the movement because it is f32 round-off on a reduction whose width
+  now matches the oracle.
 
 ## Outcome
 

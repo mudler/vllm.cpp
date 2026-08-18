@@ -10,9 +10,12 @@ is why the load-bearing gate below is byte-identity rather than a speed ratio.
 
 ## Now
 
-`ACTIVE`. The shared registry, its CPU contract suite and the CUDA wiring land here.
-The device-level byte-identity A/B and the ROCm leg are named under
-[`## Owed`](#owed) with the issue that owns each.
+`ACTIVE`. The shared registry, its CPU contract suite and the CUDA wiring land here,
+together with the [#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair: the
+runtime binding is allowed to see calls fail and never consumed the runtime's latched
+error, so the first unrelated kernel after a capture reported our refusal as its own
+failure and every `VT_CUDA_GRAPH_DEDUP=1` run died. The device-level byte-identity A/B
+and the ROCm leg are named under [`## Owed`](#owed) with the issue that owns each.
 
 ## Scope
 
@@ -138,7 +141,9 @@ instantiate were never a source of baked pointers.
 | New / changed | What |
 |---|---|
 | `src/vt/graph_dedup.h` (new) | `GraphDedupOps` (six function pointers: signature, instantiate, update, destroy exec, destroy graph, launch) and `GraphDedupRegistry`. Header-only, no device dependency, CPU-unit-testable — the same shape `src/vt/cuda/graph_safe_scratch.h` used for the graph-safe scratch bookkeeping. Also `GraphDedupEnabled()`, the `VT_CUDA_GRAPH_DEDUP` read, and the `CapturedCount()` / `ExecCount()` accessors. There is no single `Stats()` method: two accessors read at the call site beat one struct nobody stores. |
-| `src/vt/graph_dedup_runtime.h` (new) | The CUDA / HIP ops table, written **once** and bound to either runtime by a macro alias block. `GraphSignature()` lives here. This is the file that must not become two hand-written copies. |
+| `src/vt/graph_dedup_runtime.h` (new) | The CUDA / HIP ops table, written **once** and bound to either runtime by a macro alias block. This is the file that must not become two hand-written copies. After [#1184](https://github.com/mudler/vllm.cpp/issues/1184) it holds only what is device-shaped: the `GetEdges` version binding, the five node-payload cases, the six raw operations, and the `Runtime` policy that carries `ClearLatchedError`. `Ops()` is its only export. |
+| `src/vt/graph_dedup_latch.h` (new, #1184) | `ScopedLatchClear<Rt>` and `MakeLatchGuardedOps`. Device-free. Every `GraphDedupOps` field is a wrapper address, so a runtime error latched anywhere inside the binding is consumed before control leaves it — on a plain return, on a degradation escape, and on a `VT_CHECK` unwinding. |
+| `src/vt/graph_dedup_signature.h` (new, #1184) | The device-free half of the structural signature: Kahn ordering, the topological re-index, the sorted edge emission, the child-graph depth bound and the four degradation escapes, templated on the `Rt` policy above. Split out so a CPU test can drive it; it was previously reachable by no test on any tier. |
 | `src/vt/cuda/cuda_backend.cu` | `EndCaptureGraph` routes through the registry when enabled and retains the raw graph; `ReplayGraph` and `DestroyGraph` dispatch on `registry->Owns(handle)`. |
 | `src/vt/rocm/rocm_backend.hip` | The same three edits against the same shared header. |
 | `docs/ENVIRONMENT.md` | `VT_CUDA_GRAPH_DEDUP`. Required: `scripts/check-env-doc.py` fails a `VT_*` name that is neither documented nor allowlisted, and this is a user-facing behaviour knob rather than kernel-internal tuning. |
@@ -174,11 +179,32 @@ an assertion about intent.
 | `a probe the driver cannot instantiate degrades instead of driving a null exec` | a failed probe answers "cannot fold" rather than passing a null executable to `cudaGraphExecUpdate` | ours; added by the fresh review of #1178 |
 | `a replay update the driver refuses fails loudly rather than launching stale nodes` | a refusal on the fold `Register` never probed throws, and the executable's previous contents are NOT launched under the asking handle | ours; pins the safety claim that makes the transitivity assumption below survivable |
 
+A second suite, `tests/vt/test_graph_dedup_runtime.cpp`, was added by
+[#1184](https://github.com/mudler/vllm.cpp/issues/1184) over the two device-free halves
+of the runtime binding. It has no upstream twin: SGLang runs on a Python runtime that
+raises rather than latching, so the whole error-latch class does not exist there.
+
+| Case | Guarantee |
+|---|---|
+| `every guarded operation consumes the latch its own failure set` | five arms, one per fallible operation; after each the latch is clean and a stand-in for the next unrelated kernel launch does not throw. The refusal still carries the driver's `detail` string, so clearing does not swallow the reason the caller acts on |
+| `the clear survives an operation that throws` | `Launch` reports a failed `cudaGraphLaunch` by throwing. This case is what decides between a clear placed after the call and a clear placed in a destructor: only the destructor runs on the unwinding path |
+| `a refused fold leaves nothing latched for the next kernel` | #1184 in the shape a CPU tier can hold: a registry whose probe the driver REFUSES — the feature's normal operation — leaves nothing for the next caller to misread |
+| `no table field holds an address that skips the guard` | each of the six `GraphDedupOps` fields differs from the raw function's address |
+| `an operation the guarded builder does not wire cannot reach the registry` | a `GraphDedupOps` member that `MakeLatchGuardedOps` does not set stays null, and the registry's constructor refuses an incomplete table |
+| `the signature is independent of the order the runtime reports nodes in` | the load-bearing property of the walk: `cudaGraphGetNodes` promises no order, so without the Kahn re-index two captures of one topology key differently and fold nothing, observable only in the device-side log line |
+| `the signature is independent of the order the runtime reports edges in` | a diamond with its edges scrambled keys identically |
+| `the signature separates topologies that differ only in their edges` / `only in a node payload` | discrimination in both directions |
+| `a child graph contributes its own signature, bounded at depth four` | the bound is exact on both sides: level 4's payload is emitted and its child is not walked |
+| `a child graph is walked, not merely noted` | the nested signature appears inside the parent's, in the exact byte form |
+| `each runtime failure degrades the key instead of aborting inside a capture` | five escapes, five exact strings: `nodes?;`, `edges?;`, `edge?;`, `cycle?;`, `[A,;node?;` |
+| `an empty graph still produces a signature` | `[]` rather than an escape |
+
 ## Gates
 
 1. **Red first.** Every case above is written and run against the un-implemented
    registry, and the red output is captured, before the implementation exists.
-2. **Focused green.** `ctest -R test_graph_dedup`.
+2. **Focused green.** `ctest -R test_graph_dedup`, which now selects both
+   `test_graph_dedup` and `test_graph_dedup_runtime`.
 3. **Mutation.** Each guarantee is deleted or inverted in a scratch copy, the focused
    suite is proven to fail, and the tree is restored byte-for-byte. `git diff --stat`
    and the compile status are printed for every mutation, because a mutation that fails
@@ -186,6 +212,12 @@ an assertion about intent.
 4. **Full gate.** `./scripts/agent-preflight.sh`.
 5. **CUDA compile.** The `cuda-fat-build` CI job (`.github/workflows/ci.yml:669-712`,
    container `nvidia/cuda:13.3.0-devel-ubuntu24.04`) compiles the CUDA leg on the PR.
+   This is the gate. The #1184 session had no local toolkit and used a scratch
+   header-shape stub as a proxy — `graph_dedup_runtime.h` instantiated through `Ops()`
+   at `CUDART_VERSION` 12090 and 13030 and on the HIP arm, `-Werror`, all three clean,
+   with a negative control proving the instrument can fail. A proxy is not the gate: the
+   CUDA 13 `cudaGraphGetEdges` break this file already took was invisible to exactly
+   this kind of local check and only `cuda-fat-build` reported it.
 6. **Device byte-identity A/B (owed, see below).** Same binary, `VT_CUDA_GRAPH_DEDUP`
    off then on, identical prompts and sampling, token-exact equality, with **more than
    one replay per padded bucket** — a first replay can be correct by accident, and the
@@ -265,21 +297,87 @@ an assertion about intent.
   because the engine drives one device from one thread. A lock belongs at the registry
   the moment that stops being true, and `ENG-CUDAGRAPH-BREAK` must not widen who
   captures without adding one.
-- **The signature builder has no executable coverage; it is compile-gated only.** The
-  13 cases in `tests/vt/test_graph_dedup.cpp` drive `GraphDedupRegistry` through a fake
-  ops table, so they gate the registry's launch-sequence identity and nothing else.
-  `src/vt/graph_dedup_runtime.h` — the Kahn ordering, the topological re-index, the
-  sorted edge emission, the five node-payload cases, the depth-4 child-graph bound and
-  the five degradation escapes — is reached by no test on any tier; `cuda-fat-build`
-  proves only that it compiles. "13/13 negative mutations detected" is a statement about
-  `graph_dedup.h`, and must not be read as coverage of that file. The probe caps the
-  blast radius, so an unstable signature can never produce a wrong replay — but it has
-  exactly one silent mode: a signature that is unstable for some topology folds nothing,
+- **A file allowed to see the runtime fail must consume the runtime's latched error,
+  and this one did not.** [#1184](https://github.com/mudler/vllm.cpp/issues/1184). The
+  whole safety argument above rests on a refused `cudaGraphExecUpdate` being NORMAL —
+  the signature is a lookup key, the driver is the authority, and a refusal means "do
+  not fold". A CUDA call that fails also LATCHES its code in the runtime's sticky
+  per-thread slot, and none of the twelve fallible calls in `graph_dedup_runtime.h`
+  consumed it. The rest of this tree launches kernels with the ordinary
+  `kernel<<<>>>(...); Check(cudaGetLastError())` pattern, so the next unrelated kernel
+  read our routine refusal and reported it as its own failure. On GB10 that was 6/6
+  deterministic:
+
+      vt graph dedup: captured 1 graphs, deduped to 1 execs
+      [Qwen3DenseDecodeGraph] captured dense decode graph for padded size S=8 (real B=8)
+      engine-fatal: EngineCore busy loop threw:
+        vt cuda: greedy_argmax launch: invalid device function
+
+  from a `greedy_argmax` launch that had SUCCEEDED. Every symptom follows from the
+  mechanism and none of them from `greedy_argmax`: it needs both `dedup=1` and a real
+  capture (no capture, no probe, no latch); `CUDA_LAUNCH_BLOCKING=1` does not move it,
+  because the latch is host-side and synchronous rather than a deferred async error; and
+  `cudaGraphLaunch` itself returns success, because reading a return value does not
+  consume the latch. The two sites that mattered most were the ones whose failure is by
+  design — the `cudaGraphExecUpdate` probe, and the `cudaGraphInstantiate` the earlier
+  review made fatal — which is the general shape: the more deliberate a "this may fail"
+  path is, the more reliably it poisons the next caller.
+
+  **The repair is a scope guard, not twelve clears.** Twelve hand-placed
+  `cudaGetLastError()` calls are a fix the thirteenth fallible call silently misses, and
+  a file whose design is "these calls are allowed to fail" will grow a thirteenth. The
+  clear therefore lives in `ScopedLatchClear`'s destructor
+  (`src/vt/graph_dedup_latch.h`), installed at the binding's entry points, which are
+  exactly the six `GraphDedupOps` members. Every exit runs it: a plain return, a
+  degradation escape, and the `VT_CHECK` unwinding out of `Launch`. `MakeLatchGuardedOps`
+  is the only constructor of the table and takes the raw functions as template
+  arguments, so no raw address reaches a field; a seventh operation wired anywhere else
+  leaves its field null and `GraphDedupRegistry`'s constructor refuses the table. One
+  line covers both arms because there is one source: `VTGD_FN(GetLastError)` resolves to
+  `cudaGetLastError` or `hipGetLastError`.
+
+  **What the CPU suite proves and what it does not.** A CPU test drives a fake runtime,
+  so it cannot observe the CUDA runtime's real latched-error state and it cannot prove
+  #1184 is gone on a device. It proves the structure the fix rests on, red-first: with
+  the destructor emptied to the pre-fix state the suite reports 22 failed assertions
+  including `CHECK_NOTHROW(NextUnrelatedKernelLaunch()) THREW exception: "greedy_argmax
+  launch: invalid device function"`, which is the production message reproduced from the
+  mechanism alone. The device half stays owed.
+
+- **The signature builder had no executable coverage, and now has most of one.**
+  Previously the 13 cases in `tests/vt/test_graph_dedup.cpp` gated `GraphDedupRegistry`
+  and nothing else, and all of `src/vt/graph_dedup_runtime.h` was reached by no test on
+  any tier — the gap that hid #1184 for a whole review cycle. The device-free half is now
+  `src/vt/graph_dedup_signature.h` and is driven by `tests/vt/test_graph_dedup_runtime.cpp`
+  over a fake `Rt`: the Kahn ordering, the topological re-index, the sorted edge
+  emission, the child-graph depth bound and the four graph-level degradation escapes.
+  Seven negative mutations were detected, each with its `git diff --stat`, compile status
+  and exit status recorded; one first attempt failed to build under `-Werror` and was
+  re-run in a compiling form, because a mutation that fails to build reads as a passing
+  test. **Still uncovered on any tier:** the five node-payload cases (kernel, memcpy,
+  memset, child graph, default) and their four query escapes, which read CUDA parameter
+  structs and stay behind the policy. And the silent mode the original note named is
+  unchanged in kind: a signature that is unstable for some real topology folds nothing,
   every CPU test stays green, and the only observable is the device-side
-  `"captured N graphs, deduped to N execs"` log line. What would cover it: a CUDA-tier
-  test that captures the same trivial graph twice and asserts the two signatures are
-  byte-equal, and a second that captures two deliberately different topologies and
-  asserts they differ. Both need a device, so both are owed with the A/B.
+  `"captured N graphs, deduped to N execs"` line. What would close it is still
+  device-tier — capture one trivial graph twice and assert the signatures are byte-equal,
+  capture two different topologies and assert they differ — so both remain owed with the
+  A/B.
+
+- **The shipped async serving path never reaches this feature, which bounds the row's
+  value.** Measured during the #1184 device gate: `vllm-bench` on the async path captures
+  NO decode graph at all, because `DenseDecodeGraphForward` returns `nullopt` whenever
+  `input.device_token_ids != nullptr` (`src/vllm/model_executor/models/qwen3.cpp`, the
+  [#323](https://github.com/mudler/vllm.cpp/issues/323) mitigation that
+  [#1179](https://github.com/mudler/vllm.cpp/issues/1179) re-derived). No capture means
+  no registration, so dedup engages only under `VT_ASYNC_RUNNER=0` — which is not the
+  default and not what a user serves with. This does not change the row's correctness
+  argument and it does change its worth: the executables this row folds are, on the
+  default path, executables that are never instantiated in the first place. The saving is
+  real only for the drivers and configurations that still capture. Recorded here rather
+  than filed separately because the fix is `StepDevInputs`-shaped and already owned by
+  `ENG-CUDAGRAPH-BREAK` / #1179; this row must not be sold on a number the default path
+  cannot produce.
 - **Two runtime-API calls changed shape across CUDA major versions, and only one was
   foreseen.** `cudaGraphExecUpdate` took the 3-argument `cudaGraphExecUpdateResultInfo`
   form at CUDA 12, so both it and the legacy 4-argument form are bound; HIP has only
@@ -299,7 +397,9 @@ an assertion about intent.
 | The device byte-identity A/B and the executable-count measurement (W4) | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | needs a leased CUDA box; the CPU tier proves the registry's launch-sequence identity, not the device's |
 | Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | gated on W4. A default is a measurement, not a preference |
 | Probing `group.current_raw` rather than `raws.front()`, retiring the transitivity assumption above | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it changes probe behaviour, and the device A/B is measuring the current one. Land it with the A/B rerun, not before |
-| Executable coverage for `src/vt/graph_dedup_runtime.h`'s signature builder (stability and discrimination, both device-tier) | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it needs a real `cudaGraph_t`, so it rides with the leased box the A/B already needs |
+| Executable coverage for the signature builder's DEVICE half — stability and discrimination on a real `cudaGraph_t`, plus the five node-payload cases and their query escapes | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | the device-free half is now covered by `tests/vt/test_graph_dedup_runtime.cpp`; what remains needs a real `cudaGraph_t`, so it rides with the leased box the A/B already needs |
+| Re-running the device A/B after the [#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair, and confirming that `VT_CUDA_GRAPH_DEDUP=1` now completes a decode step | [#1184](https://github.com/mudler/vllm.cpp/issues/1184) | the CPU suite proves the guard's structure over a fake runtime; only a device can prove that `cudaGetLastError` clears the real latch and that the run survives. #1184 stays open until that run exists |
+| Reaching the feature from the DEFAULT serving path. Dedup engages only under `VT_ASYNC_RUNNER=0`, because the async path captures no decode graph at all ([#323](https://github.com/mudler/vllm.cpp/issues/323) mitigation) | [#1179](https://github.com/mudler/vllm.cpp/issues/1179) | the repair is the `StepDevInputs`-shaped one `ENG-CUDAGRAPH-BREAK` already owns; until it lands, this row's saving is unreachable on the configuration users serve with |
 | The ROCm leg's compile and run verification | [#41](https://github.com/mudler/vllm.cpp/issues/41) | no ROCm hardware or `hipcc` is reachable from this session and CI has no ROCm job, so the HIP wiring is written against the same shared header but is compile-unverified |
 
 ## Stop conditions

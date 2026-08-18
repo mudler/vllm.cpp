@@ -1,17 +1,29 @@
 // vllm.cpp original — the CUDA / HIP binding for the graph-executable dedup registry.
 //
-// Row ENG-CUDAGRAPH-DEDUP, issue #1162, spec .agents/specs/eng-cudagraph-dedup.md.
+// Row ENG-CUDAGRAPH-DEDUP, issues #1162 and #1184, spec
+// .agents/specs/eng-cudagraph-dedup.md.
 // Ported from SGLang's dedup mixin at pin f63458b5be:
 // python/sglang/srt/model_executor/runner_backend/cuda_graph_dedup_mixin.py
 //   :27-37   dedup_update            -> Update
 //   :105-114 kernel_node_payload     -> AppendKernelPayload
-//   :117-136 graph_node_payload      -> AppendNodePayload
-//   :139-179 graph_signature         -> AppendGraphSignature
+//   :117-136 graph_node_payload      -> Runtime::AppendNodePayload
+//   :139-179 graph_signature         -> graph_dedup_sig::AppendGraphSignature
 //
 // ONE source, two runtimes. The CUDA and HIP graph APIs differ only by symbol prefix
 // and by two call shapes, so binding them with an alias block keeps this a single path
 // instead of the hand-written parallel path AGENTS.md forbids. Include it from a .cu
 // for the CUDA leg, or define VT_GRAPH_DEDUP_HIP first and include it from a .hip.
+//
+// THIS FILE IS ALLOWED TO SEE THE RUNTIME FAIL, AND THAT IS WHY IT NEEDS A LATCH GUARD.
+// The cudaGraphExecUpdate probe refusing a fold is the feature working, not an
+// exception, and the topology walk has four more escapes that degrade the key rather
+// than abort inside a capture. Every one of those latches an error code in the runtime's
+// sticky per-thread slot, and until #1184 nothing here consumed it, so the next
+// unrelated kernel reported OUR refusal as its own failure. The clear is therefore not
+// placed beside each fallible call — a thirteenth fallible call would miss it — but in a
+// destructor wrapped around every entry point, by `vt/graph_dedup_latch.h`. Ops() below
+// is the file's ONLY export, and it is built solely through MakeLatchGuardedOps, so no
+// raw function address in this file ever reaches a GraphDedupOps field.
 //
 // DELIBERATE ADAPTATIONS, both recorded in the spec's `## Upstream chain`:
 //  * kernel identity is the host function POINTER (cudaKernelNodeParams::func) rather
@@ -26,16 +38,14 @@
 #ifndef VT_GRAPH_DEDUP_RUNTIME_H_
 #define VT_GRAPH_DEDUP_RUNTIME_H_
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <queue>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "vt/graph_dedup.h"
+#include "vt/graph_dedup_latch.h"
+#include "vt/graph_dedup_signature.h"
 
 #if defined(VT_GRAPH_DEDUP_HIP)
 #include <hip/hip_runtime.h>
@@ -77,12 +87,14 @@ using Stream = cudaStream_t;
 
 namespace vt::graph_dedup_rt {
 
+using vt::graph_dedup_sig::AppendNumber;
+
 // cudaGraphGetEdges gained a fifth `cudaGraphEdgeData*` parameter in CUDA 13; the
 // four-argument form is what CUDA 12 and HIP ship. Both shapes are bound here rather
-// than at the call sites so the topology walk below stays one piece of code. This is
+// than at the call sites so the topology walk stays one piece of code. This is
 // the one place a local compile against CUDA 12 headers could not have caught, and did
 // not: the `cuda-fat-build` job on nvidia/cuda:13.3.0 is what reported it.
-inline bool GetEdges(Graph graph, Node* from, Node* to, std::size_t* num_edges) {
+inline bool GetEdgesRaw(Graph graph, Node* from, Node* to, std::size_t* num_edges) {
 #if defined(VT_GRAPH_DEDUP_HIP)
   return hipGraphGetEdges(graph, from, to, num_edges) == hipSuccess;
 #elif CUDART_VERSION >= 13000
@@ -101,13 +113,6 @@ inline bool GetEdges(Graph graph, Node* from, Node* to, std::size_t* num_edges) 
 #endif
 }
 
-inline void AppendNumber(std::string* out, long long value) {
-  out->append(std::to_string(value));
-  out->push_back(',');
-}
-
-inline void AppendGraphSignature(Graph graph, std::string* out, int depth);
-
 // (func, gridDim, blockDim, sharedMemBytes) — cuda_graph_dedup_mixin.py:105-114 minus
 // the driver-API attribute tuple, per the header note.
 inline bool AppendKernelPayload(Node node, std::string* out) {
@@ -124,150 +129,87 @@ inline bool AppendKernelPayload(Node node, std::string* out) {
   return true;
 }
 
-// cuda_graph_dedup_mixin.py:117-136, the same five cases in the same order.
-inline bool AppendNodePayload(Node node, std::string* out, int depth) {
-  NodeType type{};
-  if (VTGD_FN(GraphNodeGetType)(node, &type) != VTGD_SUCCESS) return false;
-  AppendNumber(out, static_cast<long long>(type));
-  switch (type) {
-    case VTGD_NODE_KERNEL:
-      return AppendKernelPayload(node, out);
-    case VTGD_NODE_MEMCPY: {
-      MemcpyNodeParams params{};
-      if (VTGD_FN(GraphMemcpyNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
-      AppendNumber(out, static_cast<long long>(params.kind));
-      AppendNumber(out, static_cast<long long>(params.extent.width));
-      AppendNumber(out, static_cast<long long>(params.extent.height));
-      AppendNumber(out, static_cast<long long>(params.extent.depth));
-      return true;
+// The `Rt` policy vt/graph_dedup_signature.h walks a graph through. Everything
+// device-shaped lives here; the ordering, re-indexing and edge emission do not.
+struct Runtime {
+  using Graph = vt::graph_dedup_rt::Graph;
+  using Node = vt::graph_dedup_rt::Node;
+
+  // Consume the runtime's sticky per-thread error. Called from a destructor at every
+  // entry point (vt/graph_dedup_latch.h) rather than beside each fallible call. On the
+  // HIP leg VTGD_FN resolves this to hipGetLastError, which has the same latch
+  // semantics; one line covers both arms because there is one source.
+  static void ClearLatchedError() { VTGD_FN(GetLastError)(); }
+
+  static bool GetNodes(Graph graph, std::vector<Node>* out) {
+    std::size_t num_nodes = 0;
+    if (VTGD_FN(GraphGetNodes)(graph, nullptr, &num_nodes) != VTGD_SUCCESS) return false;
+    out->assign(num_nodes, Node{});
+    if (num_nodes > 0 &&
+        VTGD_FN(GraphGetNodes)(graph, out->data(), &num_nodes) != VTGD_SUCCESS) {
+      return false;
     }
-    case VTGD_NODE_MEMSET: {
-      MemsetNodeParams params{};
-      if (VTGD_FN(GraphMemsetNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
-      AppendNumber(out, static_cast<long long>(params.elementSize));
-      AppendNumber(out, static_cast<long long>(params.width));
-      AppendNumber(out, static_cast<long long>(params.height));
-      return true;
+    return true;
+  }
+
+  static bool GetEdges(Graph graph, std::vector<Node>* from, std::vector<Node>* to) {
+    std::size_t num_edges = 0;
+    if (!GetEdgesRaw(graph, nullptr, nullptr, &num_edges)) return false;
+    from->assign(num_edges, Node{});
+    to->assign(num_edges, Node{});
+    if (num_edges > 0 && !GetEdgesRaw(graph, from->data(), to->data(), &num_edges)) {
+      return false;
     }
-    case VTGD_NODE_GRAPH: {
-      Graph child = nullptr;
-      if (VTGD_FN(GraphChildGraphNodeGetGraph)(node, &child) != VTGD_SUCCESS) return false;
-      // Bounded: a capture nested past this depth degrades to a coarser key, which the
-      // probe still guards. Unbounded recursion over driver-owned structure is not a
-      // risk worth taking inside a capture path.
-      if (depth >= 4) return true;
-      AppendGraphSignature(child, out, depth + 1);
-      return true;
-    }
-    default:
-      return true;
-  }
-}
-
-// cuda_graph_dedup_mixin.py:139-179. Node order as the runtime reports it is not a
-// contract, so the nodes are re-indexed by a deterministic topological order (Kahn,
-// always taking the lowest available index, exactly as the upstream heapq does) and the
-// edge set is emitted in that order's terms.
-inline void AppendGraphSignature(Graph graph, std::string* out, int depth) {
-  std::size_t num_nodes = 0;
-  if (VTGD_FN(GraphGetNodes)(graph, nullptr, &num_nodes) != VTGD_SUCCESS) {
-    out->append("nodes?;");
-    return;
-  }
-  std::vector<Node> nodes(num_nodes);
-  if (num_nodes > 0 &&
-      VTGD_FN(GraphGetNodes)(graph, nodes.data(), &num_nodes) != VTGD_SUCCESS) {
-    out->append("nodes?;");
-    return;
+    return true;
   }
 
-  std::size_t num_edges = 0;
-  if (!GetEdges(graph, nullptr, nullptr, &num_edges)) {
-    out->append("edges?;");
-    return;
-  }
-  std::vector<Node> from(num_edges);
-  std::vector<Node> to(num_edges);
-  if (num_edges > 0 && !GetEdges(graph, from.data(), to.data(), &num_edges)) {
-    out->append("edges?;");
-    return;
-  }
-
-  std::unordered_map<const void*, int> index;
-  index.reserve(num_nodes * 2);
-  for (std::size_t i = 0; i < num_nodes; ++i) index[nodes[i]] = static_cast<int>(i);
-
-  std::vector<std::vector<int>> children(num_nodes);
-  std::vector<int> indegree(num_nodes, 0);
-  std::vector<std::pair<int, int>> edges;
-  edges.reserve(num_edges);
-  for (std::size_t e = 0; e < num_edges; ++e) {
-    const auto src = index.find(from[e]);
-    const auto dst = index.find(to[e]);
-    if (src == index.end() || dst == index.end()) {
-      out->append("edge?;");
-      return;
-    }
-    children[static_cast<std::size_t>(src->second)].push_back(dst->second);
-    ++indegree[static_cast<std::size_t>(dst->second)];
-    edges.emplace_back(src->second, dst->second);
-  }
-
-  std::priority_queue<int, std::vector<int>, std::greater<int>> ready;
-  for (std::size_t i = 0; i < num_nodes; ++i) {
-    if (indegree[i] == 0) ready.push(static_cast<int>(i));
-  }
-  std::vector<int> order;
-  order.reserve(num_nodes);
-  while (!ready.empty()) {
-    const int current = ready.top();
-    ready.pop();
-    order.push_back(current);
-    for (int child : children[static_cast<std::size_t>(current)]) {
-      if (--indegree[static_cast<std::size_t>(child)] == 0) ready.push(child);
+  // cuda_graph_dedup_mixin.py:117-136, the same five cases in the same order. `*child`
+  // is set only for a child-graph node; the depth bound that governs recursing into it
+  // belongs to the walk, not to this switch.
+  static bool AppendNodePayload(Node node, std::string* out, Graph* child) {
+    NodeType type{};
+    if (VTGD_FN(GraphNodeGetType)(node, &type) != VTGD_SUCCESS) return false;
+    AppendNumber(out, static_cast<long long>(type));
+    switch (type) {
+      case VTGD_NODE_KERNEL:
+        return AppendKernelPayload(node, out);
+      case VTGD_NODE_MEMCPY: {
+        MemcpyNodeParams params{};
+        if (VTGD_FN(GraphMemcpyNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
+        AppendNumber(out, static_cast<long long>(params.kind));
+        AppendNumber(out, static_cast<long long>(params.extent.width));
+        AppendNumber(out, static_cast<long long>(params.extent.height));
+        AppendNumber(out, static_cast<long long>(params.extent.depth));
+        return true;
+      }
+      case VTGD_NODE_MEMSET: {
+        MemsetNodeParams params{};
+        if (VTGD_FN(GraphMemsetNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
+        AppendNumber(out, static_cast<long long>(params.elementSize));
+        AppendNumber(out, static_cast<long long>(params.width));
+        AppendNumber(out, static_cast<long long>(params.height));
+        return true;
+      }
+      case VTGD_NODE_GRAPH: {
+        Graph nested = nullptr;
+        if (VTGD_FN(GraphChildGraphNodeGetGraph)(node, &nested) != VTGD_SUCCESS) {
+          return false;
+        }
+        *child = nested;
+        return true;
+      }
+      default:
+        return true;
     }
   }
-  if (order.size() != num_nodes) {
-    // A cycle is impossible in a captured graph; if the runtime ever reports one, the
-    // key degrades rather than the process aborting inside capture.
-    out->append("cycle?;");
-    return;
-  }
+};
 
-  std::vector<int> topo(num_nodes, 0);
-  for (std::size_t i = 0; i < order.size(); ++i) {
-    topo[static_cast<std::size_t>(order[i])] = static_cast<int>(i);
-  }
-
-  out->push_back('[');
-  for (int node_index : order) {
-    if (!AppendNodePayload(nodes[static_cast<std::size_t>(node_index)], out, depth)) {
-      out->append("node?;");
-      return;
-    }
-    out->push_back(';');
-  }
-  out->push_back(']');
-
-  std::vector<std::pair<int, int>> topo_edges;
-  topo_edges.reserve(edges.size());
-  for (const auto& edge : edges) {
-    topo_edges.emplace_back(topo[static_cast<std::size_t>(edge.first)],
-                            topo[static_cast<std::size_t>(edge.second)]);
-  }
-  std::sort(topo_edges.begin(), topo_edges.end());
-  for (const auto& edge : topo_edges) {
-    AppendNumber(out, edge.first);
-    AppendNumber(out, edge.second);
-    out->push_back(';');
-  }
-}
+// The six operations, BEFORE the latch guard. Ops() is what the backends see, and it
+// wraps every one of these; nothing outside this namespace takes their addresses.
+namespace unguarded {
 
 inline std::string Signature(void* raw_graph) {
-  std::string out;
-  out.reserve(4096);
-  AppendGraphSignature(static_cast<Graph>(raw_graph), &out, 0);
-  return out;
+  return vt::graph_dedup_sig::Signature<Runtime>(static_cast<Graph>(raw_graph));
 }
 
 inline void* Instantiate(void* raw_graph) {
@@ -337,17 +279,16 @@ inline void Launch(void* exec, void* stream) {
            "graph dedup: graph launch failed");
 }
 
+}  // namespace unguarded
+
 inline const GraphDedupOps& Ops() {
-  static const GraphDedupOps ops = [] {
-    GraphDedupOps table;
-    table.signature = &Signature;
-    table.instantiate = &Instantiate;
-    table.update = &Update;
-    table.destroy_exec = &DestroyExec;
-    table.destroy_graph = &DestroyGraph;
-    table.launch = &Launch;
-    return table;
-  }();
+  static const GraphDedupOps ops =
+      vt::graph_dedup_latch::MakeLatchGuardedOps<Runtime, &unguarded::Signature,
+                                                 &unguarded::Instantiate,
+                                                 &unguarded::Update,
+                                                 &unguarded::DestroyExec,
+                                                 &unguarded::DestroyGraph,
+                                                 &unguarded::Launch>();
   return ops;
 }
 

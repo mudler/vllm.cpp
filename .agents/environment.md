@@ -80,6 +80,9 @@ around it, because the worker image can change under you. **It did change.** The
 `thor:gpu0` worker measured later the same day carries `python3` and `gcc`, which
 this list calls absent, so read this section as one box on one day. The `thor`
 reading is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
+**The `dgx:gpu0` worker then changed as well**, so read the whole section as
+history and take the toolchain from
+[#1213](https://github.com/mudler/vllm.cpp/issues/1213).
 
 - The command runs as user `rc` in a **k3s pod**, hostname `rc-worker-<id>`.
   `/.dockerenv` is absent and 8 `KUBERNETES_*` variables are set, so it is a pod
@@ -87,13 +90,20 @@ reading is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
   worker-image question, not a per-job one.
 - Present: `bash`, `sh`, `ls`, **`nvidia-smi`** (which reports the GB10 by UUID),
   `flock`, and **`/workspace`**.
-- **Absent: `gcc`, `cc`, `clang`, `nvcc`, `ninja`, `cmake`, `make`, `python3`,
-  `python`, `pip`, `docker`, `sudo`, `git`, `ssh`, `curl`,
-  `/usr/include/stdio.h`, and any `/usr/local/cuda*` toolkit.** This `dgx:gpu0`
-  worker cannot compile, cannot start Python, and cannot install anything.
-  **Do not carry that clause to another device.** On `thor:gpu0` the same day the
-  worker ran as `uid=0(root)` with `/usr/bin/gcc`, `/usr/bin/python3` and a
-  working `apt-get` ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
+- **Absent on 2026-08-17: `gcc`, `cc`, `clang`, `nvcc`, `ninja`, `cmake`,
+  `make`, `python3`, `python`, `pip`, `docker`, `sudo`, `git`, `ssh`, `curl`,
+  `/usr/include/stdio.h`, and any `/usr/local/cuda*` toolkit.** That probe read
+  the worker as unable to compile, to start Python, or to install anything.
+  **That reading is SUPERSEDED.** `rc describe dgx:gpu0` now states that the job
+  runs as root in an Ubuntu 24.04 container carrying `git`, `curl`, `wget`,
+  `ssh`, `gcc`, `g++`, `make`, `cmake`, `ninja`, `pkg-config`, `python3`, `pip`
+  and `venv`, and it instructs the reader to install anything missing. The one
+  limit the sheet names is the CUDA toolkit, which a job apt-installs per run
+  ([#1213](https://github.com/mudler/vllm.cpp/issues/1213)).
+  **Do not carry a one-box reading to another device either.** On `thor:gpu0`
+  the same day the worker ran as `uid=0(root)` with `/usr/bin/gcc`,
+  `/usr/bin/python3` and a working `apt-get`
+  ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
 - **The host filesystem is not visible.** `/home/mudler` does not exist inside
   the worker.
 - `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,
@@ -170,12 +180,16 @@ exec bit, and sit on a 3.6T overlay with 2.5T available. `/dev/shm` is 64M. The
 job's working directory `/` is not writable.
 
 **So the lease carries bytes, and bytes are enough to run.** A runtime staged on
-`/workspace` can start under the dynamic loader, or after a copy to `/tmp`. What
-this `dgx:gpu0` worker cannot do is produce or fetch that runtime, because it has
-no `curl`, `wget`, `git`, `gcc`, `nvcc`, `cmake` or `python3`. Present and useful
+`/workspace` can start under the dynamic loader, or after a copy to `/tmp`.
+**This paragraph used to add that the `dgx:gpu0` worker cannot produce or fetch
+that runtime, because it had no `curl`, `wget`, `git`, `gcc`, `nvcc`, `cmake` or
+`python3`. That clause is SUPERSEDED.** The worker runs as root and carries every
+one of those names except the CUDA toolkit, and a job apt-installs `nvcc` from
+`developer.download.nvidia.com` per run
+([#1213](https://github.com/mudler/vllm.cpp/issues/1213)). Present and useful
 for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **The
-`thor:gpu0` worker does produce one**, because it is root and carries `apt-get`
-and `gcc`. That is the section below.
+`thor:gpu0` worker produces one as well**, because it is root and carries
+`apt-get` and `gcc`. That is the section below.
 
 **This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
 not close it.** The HOST venv at `~/venvs/vllm-oracle-pin-555967922` stays

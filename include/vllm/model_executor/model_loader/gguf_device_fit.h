@@ -100,12 +100,22 @@ GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
 //
 // `device_memory_total_bytes` is the platform's own probe
 // (`ResidencyPolicy::device_memory_total_bytes`), which is 0 on every platform
-// that does not probe one. `VT_DEVICE_WEIGHT_BUDGET_BYTES` overrides it, for an
-// operator whose pool is smaller than the probe reports because something else
-// lives in it, and for an operator who wants to attempt the load anyway. A
-// value of 0 in the environment means "unknown", i.e. disables the check, and
-// an unparseable value is ignored rather than treated as 0, because silently
-// disabling a guard on a typo is the failure shape this tree refuses.
+// that does not probe one. Two things override it, for an operator whose pool is
+// smaller than the probe reports because something else lives in it, and for an
+// operator who wants to attempt the load anyway:
+// `--offload-config '{"vllm_cpp":{"device_fit":{"weight_budget_bytes":N}}}'`, and
+// `VT_DEVICE_WEIGHT_BUDGET_BYTES`, which beats the config. A value of 0 from
+// either means "unknown", i.e. disables the check, and an unparseable
+// ENVIRONMENT value is ignored rather than treated as 0, because silently
+// disabling a guard on a typo is the failure shape this tree refuses; a
+// malformed CONFIG value cannot get this far, because the parser refuses it at
+// startup.
+//
+// THE RULE ITSELF LIVES IN `vllm/config/weight_residency.h`
+// (`ResolveDeviceWeightBudgetBytes`), and this function is a delegation to it
+// (issue #1127). That keeps one reader for the variable, which is what stops the
+// install-time override announcement from drifting away from what the resolver
+// does with the value.
 //
 // TOTAL rather than FREE on purpose: `free` at load time carries the page cache
 // and whatever else the box is doing, which would make the verdict a function

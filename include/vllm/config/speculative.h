@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vllm {
@@ -117,8 +118,22 @@ struct SpeculativeConfig {
   // RedHatAI/Qwen3.6-35B-A3B-speculator.dspark) OR whose architectures name
   // "Qwen3DSparkModel" / "Gemma4DSparkModel". Kept separate from ResolveDspark so
   // the loader can classify a checkpoint before building any config.
+  //
+  // BEYOND-PIN (SPEC-DSPARK-QWEN3-ROUTING, #1193): the fourth arm — the
+  // "DSparkDraftModel" + model_type "qwen3" PAIR — is vllm-project/vllm#52197
+  // hunk 1, merged 2026-08-17 at 7075ddac28c25d4fd2b84bc2a9a6c5ffde0345c8 and
+  // absent from the pin 555967922. It is mirrored AHEAD of the pin because the
+  // pinned behavior is wrong for a checkpoint that is published and loads here
+  // today (RadixArk/Qwen3.8-27B-DSpark declares exactly that pair);
+  // .agents/specs/dspark-qwen3-routing.md §2 carries the decision and the three
+  // model-matrix precedents for the mark.
+  //
+  // `model_type` defaults to the empty string so a caller holding only the
+  // architecture list asks exactly the pinned question and gets the pinned
+  // answer.
   static bool IsDsparkDraft(const std::string& draft_model_id,
-                            const std::vector<std::string>& architectures) {
+                            const std::vector<std::string>& architectures,
+                            const std::string& model_type = "") {
     std::string lowered = draft_model_id;
     for (char& c : lowered) {
       c = static_cast<char>(
@@ -131,8 +146,89 @@ struct SpeculativeConfig {
       if (arch == "Qwen3DSparkModel" || arch == "Gemma4DSparkModel") {
         return true;
       }
+      // vllm#52197 hunk 1 (BEYOND-PIN): the same architecture string names a
+      // DeepSeek-V4 draft when model_type is "deepseek_v4", so the PAIR is the
+      // condition and the architecture alone is not.
+      if (arch == "DSparkDraftModel" && model_type == "qwen3") {
+        return true;
+      }
     }
     return false;
+  }
+
+  // ResolveDsparkArchitecture: the architecture normalization upstream performs
+  // before a DSpark draft loads (speculative.py:934-944 @ 555967922, plus
+  // vllm-project/vllm#52197 hunk 2, BEYOND-PIN). Upstream writes the result back
+  // onto the draft's hf_config and calls update_arch_(); this returns it,
+  // because our loader dispatches on the value instead of mutating a config
+  // object it will read again.
+  //
+  // Upstream's three branches, in upstream's own order:
+  //   1. "DSparkDraftModel" + model_type "qwen3" -> ["Qwen3DSparkModel"] (#52197)
+  //   2. neither "Qwen3DSparkModel" nor "Gemma4DSparkModel" -> the DeepSeek-V4
+  //      rewrite (model_type "deepseek_v4", architectures ["DSparkDraftModel"])
+  //   3. "Gemma4DSparkModel" -> key normalization only; the architecture stands
+  //
+  // The order is the whole of #52197: branch 1 is a guard in front of a
+  // catch-all, so the specific case is claimed before the general one rewrites
+  // it.
+  //
+  // TWO TRACKED DIVERGENCES, and both are deliberate.
+  //
+  // DIVERGENCE 1, at branch 2. Upstream rewrites the config and lets the
+  // DeepSeek-V4 model path take it. That path does not exist here:
+  // DeepseekV4Model is a stub that fails a VT_CHECK
+  // (src/vllm/model_executor/models/deepseek_v4_registry.cpp) and the lane needs
+  // two Sparks. Mirroring the rewrite would send the draft into the stub and
+  // fail on an internal check instead of naming the missing arm, so branch 2
+  // REFUSES by name — which is what AGENTS.md requires of an unimplemented arm.
+  // .agents/specs/dspark-qwen3-routing.md §7 R2 records the decision.
+  //
+  // DIVERGENCE 2, at branch 3. Upstream leaves a Gemma4 draft's architecture
+  // ALONE — "Gemma4DSparkModel" stands and only its keys are normalized
+  // (speculative.py:945-961) — because upstream has a Gemma4 DSpark model class
+  // to dispatch to. This engine does not: LoadQwen3DSpark is the one DSpark
+  // draft lane, and both published layouts load through it
+  // (src/vllm/entrypoints/model_loader.cpp::LoadDsparkDraft). So branch 3
+  // COLLAPSES onto "Qwen3DSparkModel" together with branch 1, and this function
+  // answers exactly one lane or throws. The collapse is what makes a
+  // lane-dispatch guard at the call site dead code today; it is undone by the
+  // change that lands a second lane, not before.
+  // .agents/specs/dspark-qwen3-routing.md §3 designs it this way.
+  static std::string ResolveDsparkArchitecture(
+      const std::vector<std::string>& architectures,
+      const std::string& model_type) {
+    bool has_draft_model = false;
+    bool has_qwen3 = false;
+    bool has_gemma4 = false;
+    for (const std::string& arch : architectures) {
+      if (arch == "DSparkDraftModel") has_draft_model = true;
+      if (arch == "Qwen3DSparkModel") has_qwen3 = true;
+      if (arch == "Gemma4DSparkModel") has_gemma4 = true;
+    }
+    if (has_draft_model && model_type == "qwen3") {
+      return "Qwen3DSparkModel";  // #52197 hunk 2, the leading branch
+    }
+    if (!has_qwen3 && !has_gemma4) {
+      std::string listed;
+      for (const std::string& arch : architectures) {
+        if (!listed.empty()) listed += ", ";
+        listed += "\"" + arch + "\"";
+      }
+      throw std::invalid_argument(
+          "speculative-config: this DSpark draft routes to the DeepSeek-V4 "
+          "DSpark lane, which is not implemented here. Upstream rewrites a "
+          "draft whose architectures name neither \"Qwen3DSparkModel\" nor "
+          "\"Gemma4DSparkModel\" onto model_type \"deepseek_v4\" and "
+          "architectures [\"DSparkDraftModel\"] "
+          "(vllm/config/speculative.py:934-944 @ 555967922), and this engine "
+          "carries only a DeepseekV4Model stub for that lane, which also needs "
+          "two Sparks. Got architectures [" +
+          listed + "] with model_type \"" + model_type +
+          "\". Owed by row SPEC-DSPARK-QWEN3-ROUTING "
+          "(.agents/specs/dspark-qwen3-routing.md).");
+    }
+    return "Qwen3DSparkModel";
   }
 
   // ResolveDspark: build the scheduler-facing SpeculativeConfig for a DSpark
@@ -153,9 +249,20 @@ struct SpeculativeConfig {
   //
   // `n_predict` / `dspark_block_size` are std::nullopt when the draft's HF config
   // carries no such key, mirroring upstream's getattr(..., None).
-  static SpeculativeConfig ResolveDspark(std::optional<int> n_predict,
-                                         std::optional<int> dspark_block_size,
-                                         std::optional<int> user_num_speculative_tokens) {
+  //
+  // `block_size_key` names the config key `dspark_block_size` was read from, and
+  // exists only so the refusal can quote it. Upstream has one key and can name it
+  // literally; we have two, because the fallback below reads `block_size` on the
+  // published Qwen3 drafts (the divergence argued in
+  // .agents/specs/dspark-block-size-guard.md section 2). A message that says
+  // `dspark_block_size` when the 7 came from `block_size` sends the user looking
+  // for a key their checkpoint does not carry, which on both published drafts is
+  // always the case. It defaults to upstream's key, so a caller that supplies the
+  // upstream field gets upstream's wording unchanged.
+  static SpeculativeConfig ResolveDspark(
+      std::optional<int> n_predict, std::optional<int> dspark_block_size,
+      std::optional<int> user_num_speculative_tokens,
+      std::string_view block_size_key = "dspark_block_size") {
     SpeculativeConfig cfg;
     cfg.method = "dspark";
     cfg.parallel_drafting = true;
@@ -177,11 +284,17 @@ struct SpeculativeConfig {
           "\"num_speculative_tokens\" was not provided");
     }
     if (dspark_block_size.has_value() && *k < *dspark_block_size) {
+      // speculative.py:1021-1026 verbatim, including the third sentence that
+      // says which value to use. It was dropped when the check was first ported
+      // and is restored here: the first two sentences tell the user the k is
+      // wrong, and only the third tells them what to type.
       throw std::invalid_argument(
-          "speculative-config: DSpark requires num_speculative_tokens >= "
-          "dspark_block_size (" +
+          "speculative-config: DSpark requires num_speculative_tokens >= " +
+          std::string(block_size_key) + " (" +
           std::to_string(*dspark_block_size) + "); got " + std::to_string(*k) +
-          ". Smaller values produce incorrect output.");
+          ". Smaller values produce incorrect output. Use "
+          "num_speculative_tokens=" +
+          std::to_string(*dspark_block_size) + " or larger (e.g. 7).");
     }
     cfg.num_speculative_tokens = k;
     return cfg;

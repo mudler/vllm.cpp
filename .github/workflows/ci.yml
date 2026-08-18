@@ -290,6 +290,22 @@ jobs:
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
+      - name: A citation that names a symbol still finds it (#1143, #1139)
+        # The tree already carried 539 `path::Symbol` citations and had never
+        # checked one. Line anchors are what rot: one 45-line insertion near the
+        # top of `model_loader.cpp` moved 203 references at once, in files that
+        # change never opened (#1143), and a pin advance left three upstream
+        # line anchors on one row pointing at unrelated code (#1139).
+        #
+        # NOT the #911 shape. The expectation is the symbol name written by the
+        # citing author and read from the CITING file; only the evidence comes
+        # from the cited one. `--self-test` sweeps the fixture corpus in both
+        # directions. The upstream half needs an oracle checkout this runner
+        # does not have, so it stays opt-in behind `--upstream-root`.
+        run: |
+          python3 scripts/check-symbol-anchors.py
+          python3 scripts/check-symbol-anchors.py --self-test
+          python3 tests/scripts/test_check_symbol_anchors.py
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py

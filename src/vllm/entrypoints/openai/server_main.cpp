@@ -921,6 +921,55 @@ int VllmServerMain(int argc, char** argv) {
                                           : dir.parent_path().filename())
             : args.served_model_name;
 
+    // ── --offload-config, PARSED ONCE, AHEAD OF THE TASK BRANCH (#1135) ───────
+    //
+    // It used to be parsed after the branch below, in the text path only, so the
+    // pooling and transcription-only paths built their engine parameters without
+    // it. An embedding server started with `--offload-config` placed its weights
+    // as though the flag were absent and said nothing. That dropped BOTH halves
+    // of the document — vLLM's mirrored `uva`/`prefetch` weight offload and the
+    // vllm.cpp `vllm_cpp` residency extension — and had done so since before the
+    // extension existed.
+    //
+    // ONE PARSE, and every branch below now answers for the document: the text
+    // path and the pooling path take both halves, and the transcription-only
+    // path refuses a non-empty flag rather than dropping it.
+    //
+    // Both halves come out of the SAME string:
+    // `parse_offload_config_json` reads vLLM's three keys and
+    // `parse_weight_residency_extension_json` reads the extension and closes the
+    // document against a typo at every level. Two parsers over one string is what
+    // keeps `include/vllm/config/offload.h` a byte-faithful transcription of
+    // `vllm/config/offload.py` (which has no disk tier) while the operator still
+    // types one flag for one concept.
+    //
+    // Parsing HERE also refuses a malformed document, an unknown key or a
+    // validator violation BEFORE the architecture is peeked and before the
+    // `server: loading model from` line, rather than after both. Upstream's three
+    // backend/field mismatches are WARNINGS in vLLM and stay warnings here.
+    std::optional<vllm::OffloadConfig> parsed_offload_config;
+    std::optional<vllm::WeightResidencyConfig> parsed_weight_residency;
+    if (!args.offload_config.empty()) {
+      vllm::OffloadConfig off_cfg =
+          vllm::parse_offload_config_json(args.offload_config);
+      off_cfg.Validate();
+      for (const std::string& w : off_cfg.warnings) {
+        std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
+      }
+      parsed_offload_config = std::move(off_cfg);
+      // ENG-RESIDENCY-CONFIG (#1110): the SAME document also carries the
+      // vllm.cpp-original `vllm_cpp` key, which governs the tier BELOW vLLM's —
+      // weights borrowed out of the file mapping rather than moved to host RAM.
+      //
+      // Its parser REFUSES a key it does not know, which the mirrored parser does
+      // not do, and that refusal is load-bearing: a silently ignored
+      // `{"vllm_cpp":{"mmapp":...}}` starts a server running this tier at its
+      // defaults and is met as an out-of-memory kill instead of an error.
+      vllm::WeightResidencyConfig res_cfg =
+          vllm::parse_weight_residency_extension_json(args.offload_config);
+      if (!res_cfg.empty()) parsed_weight_residency = std::move(res_cfg);
+    }
+
     // ── TASK DISPATCH (ARCH-ONE-SURFACE ROW 1): a model dir whose
     // architectures resolve to a SupportsTranscription-ONLY registration
     // (Parakeet CTC/RNNT/TDT) serves /v1/audio/transcriptions through the ONE
@@ -970,6 +1019,18 @@ int VllmServerMain(int argc, char** argv) {
         embed_params.max_num_seqs = args.max_num_seqs;
         embed_params.max_num_batched_tokens = args.max_num_batched_tokens;
         embed_params.enable_prefix_caching = args.enable_prefix_caching;
+        // #1135: BOTH halves of `--offload-config`, on the same terms as the text
+        // path. This branch reaches `LoadedEngine::FromModelDir`, which installs
+        // the residency document and the weight offloader ahead of every path and
+        // weight operation it performs — so an embedding model is loaded by the
+        // same loader and nothing about pooling makes either half inapplicable.
+        // Before this, both were dropped here in silence.
+        //
+        // The other engine flags this block still drops, `--device` among them,
+        // are #1196. They are the same shape over a wider set and belong to the
+        // row that owns this dispatch.
+        embed_params.offload_config = parsed_offload_config;
+        embed_params.weight_residency = parsed_weight_residency;
         auto loaded_embed = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
             vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                           embed_params));
@@ -1017,6 +1078,33 @@ int VllmServerMain(int argc, char** argv) {
       }
 
       if (transcription_only) {
+        // #1135, and this arm is a REFUSAL rather than a wiring. The
+        // transcription stack has no seam either half of `--offload-config`
+        // could reach: `ParakeetTranscriber::FromDir` builds no `EngineParams`
+        // and calls no `LoadedEngine::FromModelDir`, so this path runs no
+        // `SetWeightResidencyConfig`, no `CreateWeightOffloader`, no GGUF
+        // mapping and no expert slot store. There is no field of either half
+        // that any code here could read.
+        //
+        // AGENTS.md: refuse an unimplemented arm with a message that names the
+        // missing part, and record the arm as owed. Accepting the flag and
+        // warning would leave a server running while it holds a placement
+        // instruction it does not follow, which is the failure #1135 was filed
+        // about. The document is still PARSED above, so a typo in it is refused
+        // here on the same terms as everywhere else.
+        if (!args.offload_config.empty()) {
+          throw std::invalid_argument(
+              "--offload-config is not supported on a transcription-only model "
+              "(" + archs[0] +
+              "). THE MISSING PART: this path serves /v1/audio/transcriptions "
+              "through ParakeetTranscriber, which loads its own weights and "
+              "never builds an engine, so neither vLLM's uva/prefetch weight "
+              "offload nor vllm.cpp's vllm_cpp weight-residency tier has a call "
+              "site on it. Both halves of the document would be accepted and "
+              "then ignored, which is issue #1135. Remove the flag, or serve a "
+              "text-generation or embedding model, which honour it. Tracked as "
+              "issue #1195");
+        }
         std::cerr << "server: transcription-only model (" << archs[0]
                   << "); serving /v1/audio/transcriptions\n";
         auto transcriber =
@@ -1108,37 +1196,14 @@ int VllmServerMain(int argc, char** argv) {
       }
       engine_params.kv_transfer_config = std::move(kv_cfg);
     }
-    // --offload-config: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b). Empty (default)
-    // leaves the optional unset — the byte-identical no-offload path. Parsed and
-    // VALIDATED here so a malformed document or a validator violation is refused
-    // at startup rather than surfacing later. Upstream's three backend/field
-    // mismatches are WARNINGS in vLLM and stay warnings here.
-    if (!args.offload_config.empty()) {
-      vllm::OffloadConfig off_cfg =
-          vllm::parse_offload_config_json(args.offload_config);
-      off_cfg.Validate();
-      for (const std::string& w : off_cfg.warnings) {
-        std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
-      }
-      engine_params.offload_config = std::move(off_cfg);
-      // ENG-RESIDENCY-CONFIG (#1110): the SAME document also carries the
-      // vllm.cpp-original `vllm_cpp` key, which governs the tier BELOW vLLM's —
-      // weights borrowed out of the file mapping rather than moved to host RAM.
-      // Two parsers over one string, each reading only its own half, is what keeps
-      // `include/vllm/config/offload.h` a byte-faithful transcription of
-      // `vllm/config/offload.py` (which has no disk tier) while still giving the
-      // operator one flag for one concept.
-      //
-      // Parsed HERE, beside the mirrored half, for the same reason: a mistyped key
-      // costs a second rather than a full load. The extension REFUSES a key it
-      // does not know, which the mirrored parser does not do — and that refusal is
-      // load-bearing, because a silently ignored `{"vllm_cpp":{"mmapp":...}}`
-      // starts a server running this tier at its defaults and is discovered as an
-      // out-of-memory kill instead of an error.
-      vllm::WeightResidencyConfig res_cfg =
-          vllm::parse_weight_residency_extension_json(args.offload_config);
-      if (!res_cfg.empty()) engine_params.weight_residency = std::move(res_cfg);
-    }
+    // --offload-config: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b) and the
+    // vllm.cpp `vllm_cpp` residency tier (ENG-RESIDENCY-CONFIG). Both halves were
+    // parsed and validated above, ahead of the task branch, so that the pooling
+    // path gets them too and a malformed document is refused before the
+    // architecture peek (#1135). Empty (default) leaves both optionals unset —
+    // the byte-identical no-offload path.
+    engine_params.offload_config = parsed_offload_config;
+    engine_params.weight_residency = parsed_weight_residency;
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The
     // parse validates method/k here; n_predict + the resolved k are finalized in

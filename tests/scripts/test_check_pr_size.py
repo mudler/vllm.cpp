@@ -493,6 +493,12 @@ class BudgetEnforcement(unittest.TestCase):
             # 2026-08-16: the CUDA arch-gate registration guard (#960). Its suite
             # reaches into the checker's parser, so the disabled stub cannot load.
             "scripts/check-cuda-op-arch-gate.py",
+            # 2026-08-18: the symbol-anchor freshness gate (#1143, #1139). Created
+            # in the same range, so it has no BASE version to mutate. The disabled
+            # stub exits 0 and prints nothing, which fails 20 of its 21 cases --
+            # including the clean-tree case, which asserts a checked count at or
+            # above the recorded floor and so cannot be satisfied by silence.
+            "scripts/check-symbol-anchors.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

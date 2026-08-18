@@ -674,7 +674,7 @@ enum class Ltx2PhaseLoraScope {
 //   retake.py:287                no latent      our `retake`, non-distilled arm
 //   a2vid_two_stage.py:226       no latent      our `a2vid_two_stage` stage 1
 //   ti2vid_two_stages.py:244     no latent      our `ti2vid_two_stage` stage 1
-//   keyframe_interpolation.py:200 no latent     unported (#1096)
+//   keyframe_interpolation.py:200 no latent     our `keyframe_interpolation` stage 1
 //   ti2vid_two_stages_hq.py:267  latent=empty_latent   our `res2s_two_stage`
 //
 // So the LATENT-DERIVED anchor is upstream's exception, not its rule — which is
@@ -735,6 +735,50 @@ struct Ltx2PhaseRecipe {
 
   // ltx2_recipes.py:48-50: `None` when the schedule is not explicit. -1 here.
   int64_t num_inference_steps() const;
+};
+
+// WHICH OF UPSTREAM'S TWO IMAGE-CONDITIONING BUILDERS this recipe runs over its
+// `images` list. Row LTX25-KEYFRAME-INTERP, issue #1096.
+//
+// The two functions live side by side in
+// `ltx-pipelines/utils/helpers.py` and differ by exactly one branch:
+//
+//                       combined_image_conditionings   ..._by_adding_guiding_latent
+//                       (:272-308)                     (:343-367)
+//   frame_idx == 0      VideoConditionByLatentIndex    VideoConditionByKeyframeIndex
+//   any other frame_idx VideoConditionByKeyframeIndex  VideoConditionByKeyframeIndex
+//
+// The second has no branch at all — one loop, one item type. And the two items
+// do different things to the state: `VideoConditionByLatentIndex` REPLACES the
+// clean tokens of latent frame 0 and the token count never changes
+// (latent_cond.py:38-39), while `VideoConditionByKeyframeIndex` APPENDS a latent
+// frame of tokens at the end (keyframe_cond.py:79-82).
+//
+// A RECIPE FIELD RATHER THAN A PHASE ONE, because upstream picks the builder per
+// PIPELINE: `keyframe_interpolation.py` calls the same one for both of its
+// stages (`:211` and `:260`, differing only in the height and width they pass).
+// A per-phase field would offer a combination upstream has no call site for.
+//
+// AND NOT A `pipeline_kind` STRING COMPARE at the reader, for the reason
+// `audio_only` and `requires_audio_input` give below: the recipe table is the
+// one place that knows, and a string test at the call site is one more chance
+// for the next recipe on this builder to be missed.
+//
+// WHY THIS IS INVISIBLE WITHOUT A DELIBERATE GATE. A `keyframe_interpolation`
+// render built on the replace arm returns a clip of the right size, the right
+// frame count and the right sample rate, with the supplied image pinned into it.
+// It IS conditioned — it is conditioned as a different pipeline. The only
+// observable is the sequence LENGTH the DiT ran over, which is
+// `Ltx2ConditioningTrace::video_tokens`; no pixel comparison and no shape check
+// reads it.
+enum class Ltx2ImageConditioningBuilder {
+  // `combined_image_conditionings` (helpers.py:272-308). Frame 0 REPLACES. Every
+  // other pipeline in `ltx-pipelines`, so this is upstream's majority as well as
+  // this engine's incumbent behaviour — the default moves nothing.
+  kCombined,
+  // `image_conditionings_by_adding_guiding_latent` (helpers.py:343-367). Frame 0
+  // APPENDS, like every other frame. `keyframe_interpolation.py:211`, `:260`.
+  kAddGuidingLatent,
 };
 
 // LTXPipelineRecipe (ltx2_recipes.py:53-87).
@@ -803,6 +847,12 @@ struct Ltx2PipelineRecipe {
   // `--distilled-lora required=True`. What the phase field says is which stage
   // runs it. The two were conflated while only one placement existed.
   bool requires_distilled_lora = false;
+
+  // See `Ltx2ImageConditioningBuilder`. Read in exactly one place — the phase
+  // loop's first-frame arm, which is the only site where the two builders
+  // disagree. The last-frame arm below it is unchanged, because `frame_idx != 0`
+  // takes the keyframe item under BOTH of them.
+  Ltx2ImageConditioningBuilder image_conditioning = Ltx2ImageConditioningBuilder::kCombined;
 
   int64_t max_spatial_downscale() const;
 };

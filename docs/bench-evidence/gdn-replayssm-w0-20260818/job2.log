@@ -1,0 +1,326 @@
+rc: job 1ef2dbe4-6e06-4e01-8b6b-a39ba8e7da23 on orin:gpu0
+=== identity ===
+0
+aarch64
+rc-worker-lnvw6
+f7d323651cf1a5720f0ce712b802a10248278566e1abb9ecdbae8e62fcf0f4b3  /workspace/replayssm-w0b/probe.cu
+c5218d087949e94647e28d6799b2f870e34643bc754dfaec084b562fd979ef55  /workspace/replayssm-w0b/build_w0.sh
+=== toolkit ===
+NVCC_VERSION=Cuda compilation tools, release 13.0, V13.0.88 Build cuda_13.0.r13.0/compiler.36424714_0 
+PTXAS_VERSION=Cuda compilation tools, release 13.0, V13.0.88 Build cuda_13.0.r13.0/compiler.36424714_0 
+=== compile (container-local /tmp; /workspace may be a network share) ===
+COMPILE_CMD=nvcc -std=c++20 -O3 -arch=sm_121a -Xptxas -v -c /tmp/replayssm-w0b/probe.cu -o /tmp/replayssm-w0b/probe.o
+COMPILE_RC=0
+/tmp/replayssm-w0b/probe.cu(118): warning #177-D: function "<unnamed>::Store(__half *, int64_t, float)" was declared but never referenced
+  __attribute__((device)) inline void Store(__half* p, int64_t i, float v) {
+                                      ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/replayssm-w0b/probe.cu(132): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=__half]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<__half>(float v) {
+                                       ^
+
+/tmp/replayssm-w0b/probe.cu(128): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=float]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<float>(float v) {
+                                       ^
+
+/tmp/replayssm-w0b/probe.cu(118): warning #177-D: function "<unnamed>::Store(__half *, int64_t, float)" was declared but never referenced
+  __attribute__((device)) inline void Store(__half* p, int64_t i, float v) {
+                                      ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/replayssm-w0b/probe.cu(132): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=__half]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<__half>(float v) {
+                                       ^
+
+/tmp/replayssm-w0b/probe.cu(128): warning #177-D: function "<unnamed>::RoundToStorage<T>(float) [with T=float]" was declared but never referenced
+  __attribute__((device)) inline float RoundToStorage<float>(float v) {
+                                       ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 95 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 204.110 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 179.144 ms
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 180.145 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 42 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 122.847 ms
+ptxas info    : Compiling entry function '_Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    96 bytes stack frame, 96 bytes spill stores, 96 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 96 bytes cumulative stack size, 1224 bytes smem
+ptxas info    : Compile time = 269.709 ms
+ptxas info    : Compiling entry function '_Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf
+    56 bytes stack frame, 56 bytes spill stores, 56 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 56 bytes cumulative stack size, 1024 bytes smem
+ptxas info    : Compile time = 186.753 ms
+=== cuobjdump -res-usage ===
+CUOBJDUMP_RC=0
+
+Fatbin ptx code:
+================
+arch = sm_121
+code version = [9,0]
+host = linux
+compile_size = 64bit
+compressed
+ptxasOptions = -v  
+
+Fatbin elf code:
+================
+arch = sm_121a
+code version = [1,8]
+host = linux
+compile_size = 64bit
+
+Resource usage:
+ Common:
+  GLOBAL:0
+ Function _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:95 STACK:0 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:94 STACK:0 SHARED:2180 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:94 STACK:0 SHARED:2180 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:42 STACK:0 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:255 STACK:96 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf:
+  REG:255 STACK:56 SHARED:2048 LOCAL:0 CONSTANT[0]:1052 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+Fatbin ptx code:
+================
+arch = sm_121a
+code version = [9,0]
+host = linux
+compile_size = 64bit
+compressed
+ptxasOptions = -v  
+=== arch verification (the -arch flag must have taken effect) ===
+ARCH_REQUESTED=sm_121a
+ARCH_HITS_IN_RES_USAGE=2
+ELF: arch = sm_121
+ELF: arch = sm_121a
+ELF: 	Tool Command Line Arguments: -v  -arch sm_121a -m 64 
+ELF: 	CUDA Virtual SM: sm_121
+ARCH_VERIFIED=yes
+=== sass: function inventory (all six kernels must be present) ===
+sass_functions=6
+		Function : _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+		Function : _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+		Function : _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+		Function : _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+		Function : _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+		Function : _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf
+=== compile again with -lineinfo, for SASS attribution ===
+LINEINFO_COMPILE_CMD=nvcc -std=c++20 -O3 -arch=sm_121a -lineinfo -Xptxas -v -c /tmp/replayssm-w0b/probe.cu -o /tmp/replayssm-w0b/probe_li.o
+LINEINFO_COMPILE_RC=0
+--- res-usage diff, plain object vs -lineinfo object (REG/STACK lines only) ---
+RESUSAGE_IDENTICAL=yes  (-lineinfo did not change codegen)
+=== nvdisasm -g (source-attributed SASS) ===
+XELF_RC=0
+cubin: /tmp/replayssm-w0b/xelf/probe.sm_121a.cubin
+NVDISASM_RC=0
+LINE_MARKERS=3277
+--- route line map in probe.cu (so an attributed line can be classified) ---
+148:__global__ void ProbeControlRegTileKernel(
+241:__global__ void ProbeReplaySsmRegTileKernel(
+384:  // Non-flush route: y and (g_t S_{t-1}) k_t are read out of the checkpoint and
+418:  // Flush route: reconstruct S_t in the same registers, persist it, and only
+421:  if (is_flush) {
+572:__global__ void ProbeReplaySsmNonFlushKernel(PROBE_REPLAYSSM_PARAMS) {
+575:  // Streamed checkpoint readout. Each element is loaded once and folded into
+623:__global__ void ProbeReplaySsmFlushKernel(PROBE_REPLAYSSM_PARAMS) {
+638:  // Reconstruct, persist, then read y off the reconstructed tile (:395-434).
+670:__global__ void ProbeReplaySsmFlushSeqKernel(PROBE_REPLAYSSM_PARAMS) {
+723:__global__ void ProbeReplaySsmFusedKernel(PROBE_REPLAYSSM_PARAMS) {
+760:  } else {
+--- every LDL/STL with the probe.cu line it came from ---
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*4f60*/                   STL [R1+0x34], R27 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*4f80*/                   STL [R1+0x38], R26 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*4fe0*/                   STL [R1+0x40], R25 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*5010*/                   STL [R1+0x44], R24 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*5070*/                   STL [R1+0x48], R36 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*5090*/                   STL [R1+0x4c], R23 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*50b0*/                   STL [R1+0x50], R22 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*5110*/                   STL [R1+0x3c], R21 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*5140*/                   STL [R1+0x30], R20 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:105   | /*5250*/                   STL [R1+0x2c], R68 ; | __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*52c0*/                   STL [R1+0x28], R35 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*52d0*/                   STL [R1+0x24], R34 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*5300*/                   STL [R1+0x20], R33 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*5320*/                   STL [R1+0x1c], R32 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:105   | /*5370*/                   STL [R1+0x18], R72 ; | __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*53e0*/                   STL [R1+0x14], R43 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*53f0*/                   STL [R1+0x10], R42 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:392   | /*5420*/                   STL [R1+0xc], R41 ; | dot_q += sh[c] * bq[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*5440*/                   STL [R1+0x8], R40 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*5490*/                   STL [R1+0x4], R77 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:393   | /*54a0*/                   STL [R1], R76 ; | dot_k += sh[c] * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:421   | /*74f0*/                   LDL.LU R193, [R1+0x34] ; | if (is_flush) {
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7530*/                   LDL.LU R192, [R1+0x38] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7570*/                   STL [R1+0x5c], R157 ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*75b0*/                   STL [R1+0x58], R173 ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*75f0*/                   STL [R1+0x54], R172 ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7630*/                   LDL.LU R157, [R1+0x40] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7670*/                   LDL.LU R44, [R1+0x44] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e10*/                   LDL.LU R157, [R1+0x48] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e20*/                   LDL.LU R173, [R1+0x4c] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e30*/                   LDL.LU R172, [R1+0x50] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e40*/                   LDL.LU R159, [R1+0x3c] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e50*/                   LDL.LU R252, [R1+0x30] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e60*/                   LDL.LU R171, [R1+0x2c] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e70*/                   LDL.LU R244, [R1+0x28] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e80*/                   LDL.LU R193, [R1+0x24] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7e90*/                   LDL.LU R199, [R1+0x20] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7ea0*/                   LDL.LU R195, [R1+0x1c] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7eb0*/                   LDL.LU R197, [R1+0x18] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7ec0*/                   LDL.LU R196, [R1+0x14] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7ee0*/                   LDL.LU R194, [R1+0x10] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7ef0*/                   LDL.LU R192, [R1+0xc] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7f00*/                   LDL.LU R170, [R1+0x8] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7f10*/                   LDL.LU R158, [R1+0x4] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7f20*/                   LDL.LU R44, [R1] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7f40*/                   LDL.LU R157, [R1+0x5c] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7f60*/                   LDL.LU R173, [R1+0x58] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeReplaySsmRegTileKernel    probe.cu:423   | /*7f80*/                   LDL.LU R172, [R1+0x54] ; | for (int c = 0; c < BK; ++c) sh[c] = sh[c] * total_decay + d_now * bk[c];
+ProbeControlRegTileKernel      probe.cu:209   | /*2b10*/                   STL [R1+0x30], R0 ; | ((static_cast<int64_t>(slot) * hv_n + hv) * dv + vrow) * dk;
+ProbeControlRegTileKernel      probe.cu:217   | /*2b60*/                   STL [R1+0x2c], R170 ; | dot += sh[c] * bk[c];
+ProbeControlRegTileKernel      probe.cu:209   | /*2ba0*/                   STL [R1+0x28], R171 ; | ((static_cast<int64_t>(slot) * hv_n + hv) * dv + vrow) * dk;
+ProbeControlRegTileKernel      probe.cu:216   | /*3e50*/                   STL [R1+0x34], R236 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:217   | /*4720*/                   STL [R1+0x4], R149 ; | dot += sh[c] * bk[c];
+ProbeControlRegTileKernel      probe.cu:216   | /*47a0*/                   STL [R1], R150 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:217   | /*47c0*/                   STL [R1+0x24], R236 ; | dot += sh[c] * bk[c];
+ProbeControlRegTileKernel      probe.cu:216   | /*47e0*/                   STL [R1+0x20], R0 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:216   | /*47f0*/                   STL [R1+0x1c], R238 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:217   | /*4810*/                   STL [R1+0x18], R237 ; | dot += sh[c] * bk[c];
+ProbeControlRegTileKernel      probe.cu:216   | /*4830*/                   STL [R1+0x14], R163 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:216   | /*4840*/                   STL [R1+0x10], R162 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:216   | /*4850*/                   STL [R1+0xc], R155 ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:217   | /*4870*/                   STL [R1+0x8], R154 ; | dot += sh[c] * bk[c];
+ProbeControlRegTileKernel      probe.cu:216   | /*4890*/                   LDL.LU R236, [R1+0x34] ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:216   | /*48a0*/                   LDL.LU R0, [R1+0x30] ; | sh[c] *= decay;
+ProbeControlRegTileKernel      probe.cu:224   | /*4c20*/                   LDL.LU R227, [R1] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*4c40*/                   LDL.LU R226, [R1+0x4] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*4eb0*/                   LDL.LU R225, [R1+0x10] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*50e0*/                   LDL.LU R220, [R1+0x14] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*5110*/                   LDL.LU R219, [R1+0x18] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*5150*/                   LDL.LU R214, [R1+0x1c] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:225   | /*5190*/                   LDL.LU R213, [R1+0x20] ; | output += sh[c] * bq[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*51c0*/                   LDL.LU R54, [R1+0x24] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*5690*/                   LDL.LU R226, [R1+0xc] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*56a0*/                   LDL.LU R227, [R1+0x8] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*56b0*/                   LDL.LU R170, [R1+0x2c] ; | sh[c] += vp * bk[c];
+ProbeControlRegTileKernel      probe.cu:224   | /*56d0*/                   LDL.LU R171, [R1+0x28] ; | sh[c] += vp * bk[c];
+FIRST_RUN_KERNEL_FLUSH_BRANCH_STARTS_AT=probe.cu:421
+--- LDL/STL count per kernel, split at that line ---
+ProbeReplaySsmFusedKernel      STL everystep=0    STL flush=0    LDL everystep=0    LDL flush=0    unattributed=0   
+ProbeReplaySsmFlushSeqKernel   STL everystep=0    STL flush=0    LDL everystep=0    LDL flush=0    unattributed=0   
+ProbeReplaySsmFlushKernel      STL everystep=0    STL flush=0    LDL everystep=0    LDL flush=0    unattributed=0   
+ProbeReplaySsmNonFlushKernel   STL everystep=0    STL flush=0    LDL everystep=0    LDL flush=0    unattributed=0   
+ProbeReplaySsmRegTileKernel    STL everystep=21   STL flush=3    LDL everystep=0    LDL flush=24   unattributed=0   
+ProbeControlRegTileKernel      STL everystep=14   STL flush=0    LDL everystep=14   LDL flush=0    unattributed=0   
+=== RESULT.txt ===
+ARCH=sm_121a
+ARCH_HITS_IN_RES_USAGE=2
+COMPILE_RC=0
+CUOBJDUMP_RC=0
+LINEINFO_COMPILE_RC=0
+OBJECT_BYTES=435312
+NVCC_VERSION=Cuda compilation tools, release 13.0, V13.0.88 Build cuda_13.0.r13.0/compiler.36424714_0 
+PTXAS_VERSION=Cuda compilation tools, release 13.0, V13.0.88 Build cuda_13.0.r13.0/compiler.36424714_0 
+COMPILE_CMD=nvcc -std=c++20 -O3 -arch=sm_121a -Xptxas -v -c /tmp/replayssm-w0b/probe.cu -o /tmp/replayssm-w0b/probe.o
+PROBE_SHA256=f7d323651cf1a5720f0ce712b802a10248278566e1abb9ecdbae8e62fcf0f4b3
+SCRIPT_SHA256=c5218d087949e94647e28d6799b2f870e34643bc754dfaec084b562fd979ef55
+--- ptxas -v ---
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 95 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 204.110 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 179.144 ms
+ptxas info    : Compiling entry function '_Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 0 barriers, 1156 bytes smem
+ptxas info    : Compile time = 180.145 ms
+ptxas info    : Compiling entry function '_Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 42 registers, used 0 barriers, 1224 bytes smem
+ptxas info    : Compile time = 122.847 ms
+ptxas info    : Compiling entry function '_Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf
+    96 bytes stack frame, 96 bytes spill stores, 96 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 96 bytes cumulative stack size, 1224 bytes smem
+ptxas info    : Compile time = 269.709 ms
+ptxas info    : Compiling entry function '_Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf' for 'sm_121a'
+ptxas info    : Function properties for _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf
+    56 bytes stack frame, 56 bytes spill stores, 56 bytes spill loads
+ptxas info    : Used 255 registers, used 0 barriers, 56 bytes cumulative stack size, 1024 bytes smem
+ptxas info    : Compile time = 186.753 ms
+--- cuobjdump -res-usage ---
+
+Fatbin ptx code:
+================
+arch = sm_121
+code version = [9,0]
+host = linux
+compile_size = 64bit
+compressed
+ptxasOptions = -v  
+
+Fatbin elf code:
+================
+arch = sm_121a
+code version = [1,8]
+host = linux
+compile_size = 64bit
+
+Resource usage:
+ Common:
+  GLOBAL:0
+ Function _Z25ProbeReplaySsmFusedKernelI13__nv_bfloat16fLi128ELi16ELi32ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:95 STACK:0 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z28ProbeReplaySsmFlushSeqKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:94 STACK:0 SHARED:2180 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z25ProbeReplaySsmFlushKernelI13__nv_bfloat16fLi128ELi16ELi64EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:94 STACK:0 SHARED:2180 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z28ProbeReplaySsmNonFlushKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:42 STACK:0 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z27ProbeReplaySsmRegTileKernelI13__nv_bfloat16fLi128ELi16EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_SA_SA_PfPKiSD_lllllllllf:
+  REG:255 STACK:96 SHARED:2248 LOCAL:0 CONSTANT[0]:1084 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z25ProbeControlRegTileKernelI13__nv_bfloat16fLi128EEvPT_PKS1_S4_S4_PKvN45_GLOBAL__N__f6ac47b2_8_probe_cu_9117ece4_32655DTypeES6_S8_PT0_PKilllllllllf:
+  REG:255 STACK:56 SHARED:2048 LOCAL:0 CONSTANT[0]:1052 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+Fatbin ptx code:
+================
+arch = sm_121a
+code version = [9,0]
+host = linux
+compile_size = 64bit
+compressed
+ptxasOptions = -v  
+=== W0 JOB DONE ===

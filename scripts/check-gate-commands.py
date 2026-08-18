@@ -152,6 +152,61 @@ def runnable_commands(section: str) -> list[str]:
     return good
 
 
+# A `Gates` section is a numbered list, and each item opens with a BOLD LEAD that
+# titles it. These three functions exist so a test can key on that structure
+# instead of on a sentence -- see .agents/specs/fix-gate-commands-prose-pin.md.
+#
+# They are DELIBERATELY not wired into `ratchet_errors`. A rule saying every gate
+# item without a runnable command must declare a disposition is red on arrival for
+# items this repo writes in prose rather than quoting (`Red first.`,
+# `CUDA compile.`), and this file's own header records that a gate which has to be
+# relaxed to pass is worse than no gate. That sweep is owed with its own survey.
+_GATE_ITEM = re.compile(r"(?m)^\d+\.\s")
+# The lead is a single-line title. A lead that does not close on its own line
+# returns None, which reads downstream as "declares no disposition" and takes a
+# gate RED rather than green. That is the safe direction for an unparsed record.
+_ITEM_LEAD = re.compile(r"^\d+\.\s+\*\*(.+?)\*\*")
+# A CLOSED, small vocabulary, matched in the LEAD ONLY. A status word in the lead
+# is a declaration ABOUT the gate. The same word in the body is ordinary prose
+# describing what the gate does, and crediting it would make this stop detecting
+# silence. Scope is MEASURED, not assumed: surveyed over every `Gates` section in
+# .agents/specs/ on 2026-08-18, 32 of 323 gate items GAIN a disposition when the
+# search widens from the lead to the whole item -- `**No regression:**` in
+# cpu-elementwise-gemm.md and `**Correctness gate:**` in dropin-kernel-abi.md both
+# pick up `pass` out of body prose. The row that motivated this file is NOT one of
+# the 32; that was the first hypothesis and the survey refuted it.
+_DISPOSITION = re.compile(
+    r"(?i)\b(owed|waived|blocked|deferred|superseded|not gated|ran|pass|passed|failed)\b"
+)
+
+
+def gate_items(section: str) -> list[str]:
+    """The numbered items of a `Gates` section, in order."""
+    starts = [m.start() for m in _GATE_ITEM.finditer(section)]
+    ends = starts[1:] + [len(section)]
+    return [section[a:b].rstrip() for a, b in zip(starts, ends)]
+
+
+def item_lead(item: str) -> str | None:
+    """The bold lead that titles one gate item, or None if it has no closed lead."""
+    match = _ITEM_LEAD.match(item)
+    return match.group(1) if match else None
+
+
+def gate_disposition(item: str) -> str | None:
+    """The status this gate item DECLARES in its lead, or None if it declares none.
+
+    `None` is the finding this exists to report: a gate item that names no
+    disposition and yields no runnable command is a leg the record is silent
+    about, and a reader of a credited row infers coverage nobody claimed.
+    """
+    lead = item_lead(item)
+    if lead is None:
+        return None
+    match = _DISPOSITION.search(lead)
+    return match.group(1) if match else None
+
+
 def classify_row(row) -> tuple[str, str]:
     specs = [p for p in record.local_spec_paths(row) if p.is_file()]
     if not specs:

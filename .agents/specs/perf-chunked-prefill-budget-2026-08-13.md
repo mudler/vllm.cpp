@@ -60,13 +60,14 @@ Unbroken chain, every hop read:
 |---|---|
 | CLI flag parsed | `src/vllm/entrypoints/openai/server_main.cpp:400` |
 | into `EngineParams` | `server_main.cpp:806` |
-| resolved (explicit override wins) | `src/vllm/entrypoints/model_loader.cpp:626-641` |
-| into `SchedulerConfig` | `model_loader.cpp:704-717` (`MakeSchedulerConfig`) |
-| into the `Scheduler` | `model_loader.cpp:1051-1058` |
+| resolved (explicit override wins) | `src/vllm/entrypoints/model_loader.cpp::ResolveMaxNumBatchedTokens` |
+| into `SchedulerConfig` | `src/vllm/entrypoints/model_loader.cpp::MakeSchedulerConfig` |
+| into the `Scheduler` | `src/vllm/entrypoints/model_loader.cpp::MakeScheduler` |
 | into `max_num_scheduled_tokens` | `src/vllm/v1/core/sched/scheduler.cpp:233-234` |
 | into the per-step budget | `scheduler.cpp:465` |
 
-`enable_chunked_prefill` is hard-`true` for this path (`model_loader.cpp:711`).
+`enable_chunked_prefill` is hard-`true` for this path
+(`src/vllm/entrypoints/model_loader.cpp::MakeSchedulerConfig`).
 The encoder-decoder disable (`src/vllm/config/scheduler.cpp:52-57`) is not on it.
 `AsyncScheduler` — the production default — does not override `schedule()`
 (`include/vllm/v1/core/sched/async_scheduler.h:46-52`), so the budget path is the
@@ -290,7 +291,7 @@ cannot move a token, but the gates are owed before merge regardless.
 ## Risks / decisions
 
 No vLLM-defined behavior is reopened. Our `ResolveMaxNumBatchedTokens` default
-(`model_loader.cpp:626-641`: MoE 8192 at `max_num_seqs >= 32` else 4096; dense
+(`src/vllm/entrypoints/model_loader.cpp::ResolveMaxNumBatchedTokens`: MoE 8192 at `max_num_seqs >= 32` else 4096; dense
 2048) does NOT clearly diverge from upstream. The `2048` at
 `vllm/config/scheduler.py:49` is a **pydantic testing default**;
 `EngineArgs._set_default_args` overrides it to **8192/16384 on a >=70 GiB GPU**,

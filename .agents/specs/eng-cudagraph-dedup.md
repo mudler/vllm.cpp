@@ -377,7 +377,10 @@ name — so nothing proved WHICH variable the device A/B's coarse arm was asking
   exhausted the batch falls to the remainder and never climbs back. A bucket is therefore
   replayed only before the next, smaller one is captured. The one pair each coarse group
   ever issued is `(raws.front() -> second member)`, which is precisely the pair the probe
-  tested. Two further limits follow from the instrument rather than from the workload:
+  tested. **This is a derivation, and it is stated as one.** No log records the replay
+  SEQUENCE: the driver prints a replay total and a slot count, the registry prints
+  capture and executable counts, and neither says which handle was replayed when. The
+  capture order and the harness's fixed prompt pool are the whole of the evidence. Two further limits follow from the instrument rather than from the workload:
   the registry counts PROBE refusals only, so a replay-time re-point is not counted at
   all, and a replay-time refusal would have aborted the process on `Replay`'s `VT_CHECK`
   rather than incrementing anything. Every cell completed, so no replay-time refusal

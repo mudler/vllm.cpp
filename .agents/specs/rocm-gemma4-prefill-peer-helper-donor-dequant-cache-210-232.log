@@ -1,0 +1,23 @@
+  }
+
+  void UnpinLocked(int idx) {
+    if (idx < 0 || idx >= nslots) return;
+    if (slots[idx].pins > 0) slots[idx].pins--;
+  }
+
+  std::mutex mu;
+};
+
+// Process-wide per-device caches (NOT thread_local — engine worker threads would
+// each thrash a private 1-slot-effective working set and never hit).
+struct DequantCacheSlot {
+  PrefillDequantCache cache;
+};
+DequantCacheSlot& DequantCacheSlotFor(int device) {
+  static DequantCacheSlot slots[8];
+  if (device < 0 || device >= 8) {
+    static DequantCacheSlot fallback;
+    return fallback;
+  }
+  return slots[device];
+}

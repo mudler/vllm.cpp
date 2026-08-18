@@ -1284,6 +1284,7 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses

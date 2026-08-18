@@ -396,6 +396,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
 | DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: **0.835x** paired on kairos-17dd (matched 89 tokens, warm oracle cache). Prior 0.957-0.989 came from a different machine with a cold oracle (#442) | `ACTIVE` |
+| DSpark block floor | Qwen3.8-27B + `RadixArk/Qwen3.8-27B-DSpark` @ `85ef153b` | a `k` below the draft's block is refused instead of drafted; the run gate that exhibits the garbling is **owed** and needs a GPU lease (#1225) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

@@ -14,7 +14,7 @@ bare `` `file.cpp:123` `` form "is never parsed". That is false.
 `RAW_LOCAL_ANCHOR_RE` has parsed the bare form since `ee511ca8a` (2026-07-10),
 under the prefixes `src`, `include`, `tests`, `examples`, `cmake`, `scripts`,
 `tools` and `.github/workflows`, plus `CMakeLists.txt`, and it range-checks each
-one. Every one of the 39 offenders this row records sits under those prefixes,
+one. Every one of the 38 offenders this row records sits under those prefixes,
 so every one was already parsed. The false premise reached six surfaces before a
 fresh review caught it. It is corrected here rather than appended to, so nobody
 reads the wrong version first.
@@ -29,7 +29,7 @@ twice: dropped by the parser, then covered by a neighbour.
 Three gaps compound:
 
 1. **No symbol test.** The check asks whether the line EXISTS, never whether it
-   holds what the prose says. **32 of the 39** offenders recorded here are IN
+   holds what the prose says. **32 of the 38** offenders recorded here are IN
    RANGE, so a range check could not have found any of them.
 2. **`any`, not `all`.** `is_code_anchor` returns true if any anchor in the cell
    qualifies, so one good link covers arbitrarily many rotted citations beside
@@ -44,9 +44,10 @@ report.** A dropped anchor produced no output at any verbosity.
 ### Two populations, two ratios
 
 Quoting one population's ratio as if it were the other's is what produced the
-false claim above, so both are stated with their denominator. Measured at this
-head, counting a citation only where it is the WHOLE of a backtick span, which
-is what the parser requires. An earlier count of 2134 used a looser method that
+false claim above, so both are stated with their denominator. Measured at
+`8daa67b39`, the head before this branch merged `main` a second time, counting a
+citation only where it is the WHOLE of a backtick span, which is what the parser
+requires. An earlier count of 2134 used a looser method that
 matched a `path:line` token anywhere inside a span, which is why it is larger.
 
 **Population A — every citation form a reader sees in the five matrices, ours
@@ -77,7 +78,7 @@ This is the population that matters:
 | genuinely new to parsing (`.agents/`, `docs/`, `website/`) | 35 | 4.0% |
 | yield no inferable symbol, `OK` by construction | 801 | 92.4% |
 
-**All 39 offenders sit in the 96%.** What this row adds is the symbol test and
+**Every offender recorded then sat in the 96%.** What this row adds is the symbol test and
 the report, not the parser. The parser extension is real but small, and claiming
 it as the defect was the error.
 
@@ -128,10 +129,12 @@ ambiguous stays OK. A checker that cries wolf gets disabled.
   cheap and the ratchet absorbs whatever it surfaces.
 - `EVIDENCED_STATES` itself is deliberately NOT widened, and that is a scope
   decision rather than an oversight. Making `ACTIVE` and `READY` *require* an
-  anchor raises 82 errors across 46 rows that carry prose evidence today, which
+  anchor raises 85 errors across 53 rows that carry prose evidence today, which
   is the bulk cleanup this row exists to avoid. (The unit is errors, not rows:
-  the contract check emits one per missing anchor field.) `RECORD_ANCHOR_STATES`
-  is therefore a separate, wider set.
+  the contract check emits one per missing anchor field, so 32 of the 53 raise
+  two and 21 raise one.) The 53 are 37 `ACTIVE` and 16 `READY`, and by matrix
+  26 engine, 11 backend, 7 model, 6 kernel and 3 quantization.
+  `RECORD_ANCHOR_STATES` is therefore a separate, wider set.
 - `is_code_anchor`'s `any` semantics stay for the STATE gate (a row is still
   evidenced if it has one good anchor); the ratchet counts **every** citation
   independently, which is where `any` was hiding rot.
@@ -155,7 +158,7 @@ Re-derived at this head after merging 161 commits of `main`, not carried from
 any earlier number. The population tables are in `## The defect` above and are
 not repeated here.
 
-**Rot: 39 — 32 `STALE`, 7 `BROKEN`, against 828 `OK`.**
+**Rot: 38 — 32 `STALE`, 6 `BROKEN`, against 844 `OK`.**
 
 The set is the 40 the fresh review verified by hand, minus one.
 `KERNEL-ATTN-MLA-SPARSE` cites `include/vllm/v1/attention/backend.h:271` for
@@ -164,13 +167,24 @@ declaration is at `:341`; drift on `main` moved a ROCm comment naming the symbol
 onto `:271`, and the symbol test asks only whether the cited lines contain the
 name. It is a measured limit of the conservative rule, recorded rather than
 worked around, because tightening it would need a parser per language.
+[#1287](https://github.com/mudler/vllm.cpp/issues/1287) tracks that false
+negative, and the second-order cost it carries: because the ratchet fails when a
+bucket FALLS without the baseline being lowered in the same commit, unrelated
+drift that parks a comment on a cited line forces the next contributor to bank
+an improvement that never happened.
 
-The merge also turned this row's own seven anchors `STALE`, by moving the lines
-they cite in `check-agent-record.py` and `test_agent_record.py`. Those were
-repaired, not banked: a row arguing that stale anchors matter may not carry
-seven. **No new offender was banked.**
+Each merge also turns this row's own anchors `STALE`, by moving the lines they
+cite in `check-agent-record.py`. Seven moved on the first merge and five on the
+second; both times they were repaired, not banked, because a row arguing that
+stale anchors matter may not carry them. **No new offender was banked.**
 
-By top-level directory the 39 are: `src` 24, `examples` 5, `include` 5,
+The `BROKEN` bucket fell 7 to 6 on the second merge, and `72bd06a5a` is why:
+that record reconciliation replaced the `SERVE-ASYNC-LLM` citation
+`` `examples/server/main.cpp:230-247` `` with a bare `` `examples/server/main.cpp` ``,
+so the anchor stopped being counted rather than being repaired. Banking it was
+mandatory under the two-way rule, and it is the worked example behind #1287.
+
+By top-level directory the 38 are: `src` 24, `include` 5, `examples` 4,
 `scripts` 2, `tests` 2, `cmake` 1. Every one is under a prefix the old parser
 already read.
 
@@ -215,7 +229,7 @@ had to re-derive `parse_claim_rows` and `field_index`, and would have dragged a
 
 | Work | Item |
 |---|---|
-| W1 | The six RED-first cases, run and captured red before any implementation |
+| W1 | The seven RED-first cases, run and captured red before any implementation |
 | W2 | Parser: bare citations beside the existing link form |
 | W3 | Classifier: OK / STALE / BROKEN, with the conservative symbol rule |
 | W4 | Baseline file, the two-way gate, `--report` and `--write-baseline` |
@@ -308,7 +322,7 @@ chosen over recall at five points, each measured rather than guessed:
 construction, which is 92.4%, or about 13 in 14. That polarity is the point: a
 gate that fires is believed.
 
-The 39 recorded offenders are deliberately NOT repaired here. They are the
+The 38 recorded offenders are deliberately NOT repaired here. They are the
 backlog the ratchet exists to hand to whoever next touches each row.
 
 The first fresh review returned FAIL on the recorded justification and PASS on
@@ -317,3 +331,14 @@ statement, corrected on six surfaces, every ratio restated against its
 denominator, and the numbers re-derived after 161 commits of `main`. #1270 was
 found and fixed in the same flow: `--write-baseline` banked a baseline from a
 tree that had failed other record checks.
+
+The second fresh review returned FAIL on the record text alone, and the four
+findings were record corrections rather than design changes. Two counts were
+stale by exactly the case #1270 added, so `## Gates`, the claim and the commit
+said ten cases while the row said nine and `## Work breakdown` said six.
+`46 rows` was wrong when it was written: `22e6294c6` presented it as re-derived,
+and the figure was 50 at that commit and at `8daa67b39`. It is re-derived again
+here after the second merge of `main`, which added three `READY` rows and made
+it 53. The fourth finding is #1287, filed for the comment-satisfies-symbol false
+negative that `## Our baseline` had recorded honestly but without naming its
+downstream cost.

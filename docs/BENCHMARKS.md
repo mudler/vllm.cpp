@@ -212,6 +212,15 @@ record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fi
 | Host memory after warmup | **42.5 vs 110.1 GiB = 2.59x**, but vLLM's is set by `--gpu-memory-utilization 0.85` pre-reserving KV, so it is what the configured engine holds, not what the model needs | | |
 | Why only c4 counts | `output_throughput` divides tokens by a wall duration that still contains the dead request, so a cell where one arm dropped requests is withheld, not quoted | 3 paired reps, clocks 2184 MHz | token gate: 4/7 strict, 3 exact fp32 ties ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 
+### Qwen3.8-27B quantized arms, both gates PENDING and no number quoted
+
+| Arm | Oracle, and why that one | Gate | Blocked on |
+|---|---|---|---|
+| `Qwen3.8-27B-Q4_K_M.gguf` (`unsloth` @`fe1e2a23`) | llama.cpp `b10451`, the ONLY comparator: vLLM has no in-tree GGUF reader at pin `555967922` and SGLang's aliases miss `qwen3_5` ([#979](https://github.com/mudler/vllm.cpp/issues/979)). Its oracle, never its mirror | **PENDING**, no number | [#857](https://github.com/mudler/vllm.cpp/issues/857): `.agents/oracles/llama-cpp.md` records the pin `gateable = no` and #857 owes that measurement |
+| `unsloth/Qwen3.8-27B-NVFP4` @`7d6f8d4d` | vLLM `555967922`, the MIRROR and primary oracle, which runs this format | **PENDING**, no number | [#1185](https://github.com/mudler/vllm.cpp/issues/1185): the pinned oracle builds, installs and imports in an `rc` lease, but RUNNING a model there is untested |
+| Why no number may be quoted yet | Correctness precedes speed and neither arm loads: the "NVFP4" file is `mixed-precision` with ZERO `*.input_scale` tensors, and the Q4_K_M file's block 64 is the MTP drafter (`nextn_predict_layers = 1`) | spec'd, not implemented | [#821](https://github.com/mudler/vllm.cpp/issues/821), [spec](../.agents/specs/qwen38-27b-quant-arms.md) |
+| What a token gate alone would miss | Each arm owes a resident-bytes assertion beside its tokens: a Q4_K_M arm that silently dequantizes to bf16 passes every token gate and defeats the point of the arm | owed, not measured | [#821](https://github.com/mudler/vllm.cpp/issues/821) |
+
 ### DeepSeek-V2-Lite (MLA)
 
 Medians of 3 reps, 1,024 in / 128 out. The vLLM arm runs `--moe-backend triton`,

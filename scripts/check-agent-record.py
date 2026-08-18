@@ -141,7 +141,19 @@ MATRICES = {
     # ADVANCED to `ACTIVE` (keep-quant compute landed) by `CLAIM-DEEPSEEK-V4-W8` —
     # the `UD-IQ2_XXS` down-projection routed experts (`ffn_down_exps`) are IQ3_XXS;
     # no row count change (an in-place advance, not a new row).
-    "QUANT": (AGENTS / "quantization-matrix.md", 82),
+    # 84 since 2026-08-18: +`QUANT-QWEN38-27B-GGUF-ARM` and
+    # +`QUANT-QWEN38-27B-NVFP4-ARM`, the two quantized arms of Qwen3.8-27B whose bf16
+    # arm is already gated (#915) and which #821 has owned with no row of its own.
+    # Two rows and not one: they share nothing but a model name -- different file
+    # format, different loader translation unit, different oracle (llama.cpp for the
+    # GGUF arm, because vLLM has no in-tree GGUF at the pin and SGLang's alias table
+    # does not reach `qwen3_5`; pinned vLLM for NVFP4, which it runs), different
+    # external blockers (#857 vs #1185), and even different tokenizers on disk.
+    # Merging them would let one external blocker hold the other's work. Neither is
+    # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
+    # encoding rather than on a checkpoint. Both `READY`, spec
+    # `specs/qwen38-27b-quant-arms.md`, issue #821.
+    "QUANT": (AGENTS / "quantization-matrix.md", 84),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
@@ -553,8 +565,20 @@ ENGINE_PREFIXES = (
 # 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
 # ported here, so this row records a divergence that already exists rather than
 # introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
+# 164 since 2026-08-18: +`LOAD-GGUF-MMPROJ` (a SECOND, `clip`-architecture GGUF
+# projector file beside the language file, and the Qwen3-VL vision tower loaded out
+# of it). Genuinely new and not expressible by `LOAD-GGUF` beside it: that row owns
+# the reader, the dequantization and the Qwen name transforms for ONE file, and the
+# single-file assumption it was built on is structural rather than incidental --
+# `ModelSource` carries a vector of safetensors shards and exactly one `GgufFile*`
+# (`model_registry.h:98`), and `EngineParams` has no projector field, so an mmproj
+# has nowhere to arrive. Sharding is already handled and is not this: `DetectSplit`
+# merges shards of ONE split, never a second, differently-architected file. Nothing
+# in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
+# whose only caller is a test, and that refusal becomes reachable production code the
+# moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 163
+ENGINE_ROWS = 164
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
@@ -1084,7 +1108,7 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
 #      and on an out-of-range line the loop runs `continue`, so the bad anchor
 #      never enters the returned list, and `is_code_anchor`'s `any()` swallows
 #      what is left. There was no symbol test either, which is the gap that
-#      matters: 32 of the 39 offenders recorded here are IN RANGE, so a range
+#      matters: 32 of the 38 offenders recorded here are IN RANGE, so a range
 #      check could not have found them.
 #   2. `any`, NOT `all`. `is_code_anchor` returns true if ONE anchor in a cell
 #      qualifies, so a single good link covers arbitrarily many rotted citations
@@ -1096,8 +1120,9 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
 #
 # TWO POPULATIONS, TWO RATIOS, and quoting one without its denominator is what
 # produced the false "the bare form was never parsed" claim this comment
-# replaces. Measured at this head, counting a citation only where it is the
-# WHOLE of a backtick span, which is what the parser requires:
+# replaces. Measured at `8daa67b39`, the head before this branch merged `main` a
+# second time, counting a citation only where it is the WHOLE of a backtick
+# span, which is what the parser requires:
 #
 #   * ALL citation forms in the five matrices, ours and upstream: 492 links and
 #     1708 bare, 2200 in total. 525 of the bare forms sit under a
@@ -1106,8 +1131,8 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
 #   * The citations this ratchet CLASSIFIES, which is the population that
 #     matters: 867. Of those 832 (96.0%) were already parsed AND range-checked
 #     before this row, and 35 (4.0%) are genuinely new to parsing, under
-#     `.agents/`, `docs/` and `website/`. All 39 recorded offenders sit in the
-#     96%. The value this row adds is the symbol test and the report, not the
+#     `.agents/`, `docs/` and `website/`. Every offender recorded then sat in
+#     the 96%. The value this row adds is the symbol test and the report, not the
 #     parser.
 #
 # A range check is not the fix: every stale anchor found
@@ -1169,11 +1194,11 @@ RECORD_ANCHOR_VERDICTS = ("ok", "stale", "broken")
 # a new STALE.
 RECORD_ANCHOR_BUCKETS = ("stale", "broken")
 # Gap 3. `EVIDENCED_STATES` itself is deliberately NOT widened. Making ACTIVE and
-# READY *require* an anchor raises 82 errors across 46 rows that carry prose
+# READY *require* an anchor raises 85 errors across 53 rows that carry prose
 # evidence today, which is the bulk cleanup this row exists to avoid. (The unit
 # is errors, not rows: the contract check emits one per missing anchor field, so
-# a row can raise more than one.) They join the COUNT instead, and the ratchet
-# absorbs what that surfaces.
+# a row can raise more than one -- 32 rows raise two here and 21 raise one.)
+# They join the COUNT instead, and the ratchet absorbs what that surfaces.
 RECORD_ANCHOR_STATES = EVIDENCED_STATES | {"ACTIVE", "READY"}
 RECORD_ANCHOR_FIELDS = ("code", "tests")
 BARE_CITATION_RE = re.compile(

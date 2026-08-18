@@ -381,6 +381,26 @@ struct Fp8BlockWeight {
   mutable std::shared_ptr<void> d_scale;
 };
 
+// The N-concatenated device operand of a MERGED block-wise FP8 group —
+// MODEL-FP8-BLOCK-MERGED (#1189 milestone M6, spec
+// `.agents/specs/model-fp8-block-merged.md`).
+//
+// vLLM loads `gate_proj`/`up_proj` into ONE MergedColumnParallelLinear and
+// `q`/`k`/`v` into ONE QKVParallelLinear, so one GEMM runs where this tree ran
+// two and three. Unlike the per-tensor fp8 case beside it, no alpha vector is
+// needed: a block scale is indexed by `n / block_n`, so the shard scale grids
+// row-concatenate exactly when each shard's rows begin on a block boundary,
+// which is upstream's own merged-partition rule (`fp8_utils.py:1229-1244`).
+//
+// Built lazily-once by `dense_fp8_block::ResidentFp8BlockMerged`, exactly like
+// `Fp8BlockWeight::d_packed`. The per-shard residents are then never built, so
+// the merged arm costs no duplicate device bytes. Empty on every non-block
+// owner.
+struct Fp8BlockMergedResident {
+  mutable std::shared_ptr<void> d_packed;  // i8  [sum N_i, K]
+  mutable std::shared_ptr<void> d_scale;   // f32 [sum cdiv(N_i,bn), cdiv(K,bk)]
+};
+
 // Gated-DeltaNet (linear_attention) layer weights. Projections in Matmul-B
 // layout [in, out]; conv1d [conv_dim, K]; a_log/dt_bias f32 [Hv]; norm bf16.
 struct GdnLayerWeights {
@@ -513,6 +533,14 @@ struct FullAttnLayerWeights {
   // The split fp8 weights above remain available for VT_FP8_MERGED_QKV=0.
   mutable std::shared_ptr<void> d_qkv_fp8_packed;  // i8 [Nq+Nk+Nv, K] raw e4m3fn
   mutable std::shared_ptr<void> d_qkv_fp8_alpha;   // f32 [Nq+Nk+Nv] per-column
+
+  // MODEL-FP8-BLOCK-MERGED (#1189 M6): the BLOCK-wise analog of the resident
+  // above, and a much smaller one. Block scales concatenate losslessly along N,
+  // so there is no alpha vector and no shared-input_scale guard; the merged
+  // operand is the three shards' bytes and scale grids end to end. Default ON
+  // wherever the site exposes packed q/k/v views, because there is nothing to
+  // trade off. Empty on every non-block owner.
+  Fp8BlockMergedResident qkv_fp8_block_merged;
 };
 
 // Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.

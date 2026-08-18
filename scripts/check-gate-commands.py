@@ -311,8 +311,18 @@ def audit() -> list[dict]:
 # reproduction through the JSON form is recorded as OWED rather than skipped
 # because dgx.casa was unreachable at the SSH layer. Growth, so the set is
 # re-pinned in the same change.
+# 2026-08-18: +ENG-CUDAGRAPH-DEDUP. A NEW row arriving at ACTIVE (issue #1162),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `ctest -R test_graph_dedup` and `scripts/agent-preflight.sh`, both of which
+# genuinely fail when the row regresses -- the focused suite detected 9 of 9
+# negative mutations of the registry it gates. It also records what is NOT
+# claimed and why: the device byte-identity A/B needs a leased CUDA box this
+# session did not have, so it is carried under the spec's `## Owed` rather than
+# reported as run, and the CUDA leg's compile rests on the `cuda-fat-build` CI
+# job. Growth, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ENG-RESIDENCY-CONFIG",
+    "ENG-CUDAGRAPH-DEDUP",
     "SPEC-MTP-K-GT-1",
     "ATTN-CHUNKED-LOCAL",
     "SERVE-RECIPE-ARGS",

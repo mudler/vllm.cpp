@@ -367,14 +367,19 @@ GDNAttentionMetadata ChunkGdnMeta(int64_t qlen, int32_t sidx, bool has_initial) 
 // Mirrors vLLM v0.25.0
 // qwen_gdn_linear_attn.py::_forward_core:1286-1298. The packed branch is
 // selected only for enabled, pure non-spec decode; every prefill/mixed/spec
-// shape remains on the standard recurrence. Local W1D2 additionally scopes the
-// first model consumer to the real dense packed-BA path and requires compatible
-// BF16 storage plus persistent device indices.
+// shape remains on the standard recurrence. Locally it additionally requires the
+// packed-BA owner, compatible BF16 activation dtypes, and persistent device
+// indices.
+//
+// W1D2's `dense_model` term is gone (GDN-MOE-BF16-OUT, #1168). The `rejects`
+// case that pinned it is replaced below by the argument for its removal rather
+// than deleted: the term is redundant behind the dtype rule, and what still
+// keeps a MoE checkpoint off this path is `has_packed_ba` (#1169), which the
+// case below now names.
 TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
   vllm::detail::GdnPackedDecodeEligibility e;
   e.runtime_enabled = true;
   e.cuda = true;
-  e.dense_model = true;
   e.has_packed_ba = true;
   e.merged_ba_enabled = true;
   e.dtype_compatible = true;
@@ -399,11 +404,16 @@ TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
     rejects(x);
   }
   {
-    auto x = e;
-    x.dense_model = false;
-    rejects(x);  // 35B/MoE is deliberately inert in W1D2.
-  }
-  {
+    // W1D2 asserted here that `dense_model = false` deselects, which was the
+    // record of f344decf4's day-one staging gate. GDN-MOE-BF16-OUT (#1168)
+    // removed that term, so the assertion is replaced by the two terms that
+    // ACTUALLY keep a MoE checkpoint off this path, neither of which is a model
+    // shape. The merged BA owner below is built only by the dense loader
+    // (qwen3_5_dense_weights.cpp:436) — that is #1169, and it is owed. The
+    // second is the dtype rule, already pinned by the `dtype_compatible` case
+    // further down: `core_out` is `outdt` and GdnPackedDecodeDTypesCompatible
+    // pins it to BF16, so an f32 recurrence output deselects on EITHER arm,
+    // which is what made the shape term redundant rather than merely unmeasured.
     auto x = e;
     x.has_packed_ba = false;
     rejects(x);
@@ -520,9 +530,17 @@ TEST_CASE("qwen27 packed GDN predicts the mixed_qkv dtype ProjectGdnQkvz emits")
 //
 // The three terms are PERF-FP8-ALPHA-FOLD's own, kept verbatim: the opt-in
 // toggle, `indt == BF16` (honouring VT_GDN_IN_BF16's documented rollback, since
-// that lever is the one being unblocked), and `outdt == BF16` (which is what
-// confines this to the dense 27B — the 35B is MoE, so GdnOutDType is f32 there
-// and the whole arm stays inert).
+// that lever is the one being unblocked), and `outdt == BF16`, which keeps the
+// chain dtype-uniform.
+//
+// GDN-MOE-BF16-OUT (#1168), and #521 asked for exactly this correction. That
+// third term USED to be described here as what "confines this to the dense 27B —
+// the 35B is MoE, so GdnOutDType is f32 there and the whole arm stays inert".
+// `GdnOutDType()` no longer branches on model shape, so `outdt == BF16` is now
+// unconditional at the default and the term excludes NO checkpoint. What keeps
+// this arm inert on the 35B is the DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle, and
+// that is the only remaining bound — which is why the toggle case below is the
+// one a reader must not mistake for a shape guard.
 TEST_CASE("qwen27 fp8 merged in_proj dtype is one decision, all three terms") {
   using vllm::detail::GdnFp8MergedMixedQkvDType;
   using vt::DType;
@@ -539,7 +557,7 @@ TEST_CASE("qwen27 fp8 merged in_proj dtype is one decision, all three terms") {
   CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kBF16) ==
         DType::kF32);  // VT_GDN_IN_BF16=0 rollback.
   CHECK(GdnFp8MergedMixedQkvDType(true, DType::kBF16, DType::kF32) ==
-        DType::kF32);  // VT_GDN_OUT_BF16=0 / the 35B MoE default.
+        DType::kF32);  // the VT_GDN_OUT_BF16=0 rollback, on EITHER arm (#1168).
   CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kF32) ==
         DType::kF32);
   CHECK(GdnFp8MergedMixedQkvDType(false, DType::kF32, DType::kF32) ==
@@ -652,6 +670,67 @@ TEST_CASE("qwen27 packed GDN fp8-tower toggle defaults OFF") {
   CHECK(PackedGdnDecodeFp8TowerFlagIsOn("1x"));
 }
 
+// GDN-MOE-BF16-OUT (#1168), Edit 1. The GDN recurrence-output dtype is resolved
+// from the ENVIRONMENT alone, and the resolver has no model-shape input to give
+// it a second answer. `GdnOutDType()` used to take a `bool dense_model` and
+// default to it, so a reader had to visit every call site to learn what the
+// default was and a new call site could reintroduce the dense/MoE split
+// silently. vLLM has no such parameter because it has no such decision: it
+// resolves ONE model dtype and every layer inherits it
+// (qwen_gdn_linear_attn.py:870-873, :843, :459-465 @ 5559679).
+//
+// The truth table is asked of the pure helper the production resolver reads,
+// mirroring PackedGdnDecodeFp8TowerFlagIsOn: `GdnOutDType()` caches its getenv
+// in a function-local static, so one process can only ever observe one value of
+// it. `nullptr` IS the production default, and it answers bf16 with nothing in
+// the signature that could say dense or MoE. Default-ON — anything that is not
+// a leading '0' is bf16 — the polarity VT_GDN_IN_BF16 uses and the one
+// PackedGdnDecodeEnvSelected already mirrors for VT_GDN_OUT_BF16.
+//
+// What this case CANNOT say is what the model runs; that is
+// `test_qwen35_paged_forward`'s "the GDN recurrence output and z gate are bf16",
+// which enters through ModelRegistry::Forward on a MoE config.
+TEST_CASE("qwen27 GDN out dtype is bf16 by default and keys on no model shape") {
+  using vllm::detail::GdnOutBf16FlagIsOn;
+
+  CHECK(GdnOutBf16FlagIsOn(nullptr));  // unset -> bf16, on EITHER arm.
+  CHECK_FALSE(GdnOutBf16FlagIsOn("0"));
+  CHECK_FALSE(GdnOutBf16FlagIsOn("0x"));  // leading char decides, as elsewhere.
+  CHECK(GdnOutBf16FlagIsOn("1"));
+  CHECK(GdnOutBf16FlagIsOn(""));  // not a leading '0'.
+}
+
+// GDN-MOE-BF16-OUT (#1168), Edit 2. The eligibility carries NO model-shape term:
+// an eligibility whose every remaining term is true selects packed decode, and
+// nothing in it can say whether the checkpoint is dense or MoE.
+//
+// The `dense_model` term this replaces entered at f344decf4 as one of that
+// change's "real-model safety gates" and was never revisited. Neither reference
+// has an equivalent: VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE defaults True with
+// no shape term (vllm/envs.py:124 @ 5559679), and SGLang keys
+// `supports_packed_decode` on the platform alone (gdn_triton.py:43 @ f63458b5be).
+// It became REDUNDANT rather than merely unsupported once GdnOutDType stopped
+// branching on model shape: `core_out` is `outdt` and
+// GdnPackedDecodeDTypesCompatible already pins it to BF16, so the dtype rule is
+// what excludes an f32 recurrence output on either arm.
+//
+// This case deliberately never NAMES a model-shape field, so it says the same
+// thing before and after the field exists.
+TEST_CASE("qwen27 packed GDN selection carries no model-shape term") {
+  vllm::detail::GdnPackedDecodeEligibility e;
+  e.runtime_enabled = true;
+  e.cuda = true;
+  e.has_packed_ba = true;
+  e.merged_ba_enabled = true;
+  e.dtype_compatible = true;
+  e.has_state_indices = true;
+  e.num_actual_tokens = 4;
+  e.num_decodes = 4;
+  e.num_decode_tokens = 4;
+
+  CHECK(vllm::detail::ShouldUsePackedGdnDecode(e));
+}
+
 // THE ROW. The eligibility must key on the dtypes the packed op needs and NOT
 // on "the GDN weights happen to be fp8". Composing the three helpers exactly as
 // GdnBlockPaged does, an fp8 tower and a bf16 tower that produce the SAME
@@ -678,7 +757,6 @@ TEST_CASE("qwen27 packed GDN selection keys on dtypes, not on fp8 weights") {
     GdnPackedDecodeEligibility e;
     e.runtime_enabled = true;
     e.cuda = true;
-    e.dense_model = true;
     e.has_packed_ba = true;
     e.merged_ba_enabled = true;
     e.dtype_compatible =

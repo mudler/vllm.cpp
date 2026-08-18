@@ -641,6 +641,46 @@ class RatchetTests(unittest.TestCase):
         self.assertIn("scripts/check-gate-commands.py --check", ci)
         self.assertIn("tests/scripts/test_check_gate_commands.py", ci)
 
+    def test_cudagraph_dedup_is_credited_for_real_commands(self):
+        # ENG-CUDAGRAPH-DEDUP (#1162) is a NEW row arriving at ACTIVE, which is
+        # the first state that puts it in GATED_STATES at all, so it joins the
+        # runnable population on arrival. TWO things are pinned, not one: the
+        # row is in the exact pin, AND its Gates section really does yield a
+        # command that can fail. A row pinned without the second half is a
+        # certificate for nothing, which is the failure the checker's own header
+        # admits to for five older credits.
+        self.assertIn("ENG-CUDAGRAPH-DEDUP", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-CUDAGRAPH-DEDUP"), "runnable")
+
+        spec = (ROOT / ".agents/specs/eng-cudagraph-dedup.md").read_text(encoding="utf-8")
+        section = gates.gates_section(spec)
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        # The credit rests on the focused suite, not on the preflight line: that
+        # suite detected 9 of 9 negative mutations of the registry this row adds,
+        # so it genuinely goes red when the row regresses. `git diff --stat` is
+        # also extracted from the mutation bullet and is one of the weak credits
+        # this checker's header names; it is deliberately not what is asserted.
+        self.assertIn("ctest -R test_graph_dedup", commands)
+        self.assertIn("./scripts/agent-preflight.sh", commands)
+        # The row's DEVICE leg is OWED, not skipped, and the spec has to say so.
+        # Without this the credit could rest on the CPU tier while the record
+        # stayed silent about the arm nobody ran, which reads as coverage.
+        self.assertIn("Device byte-identity A/B (owed", spec)
+
+    def test_dropping_cudagraph_dedup_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1162 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and set equality has to go red, which is what proves the row
+        # was pinned because it entered the population and not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-CUDAGRAPH-DEDUP"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-DEDUP"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
 
 if __name__ == "__main__":
     unittest.main()

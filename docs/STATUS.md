@@ -181,6 +181,61 @@ token-for-token correctness against the pinned oracle.
 
 | SGLang parity (competitor floor + oracle) | Oracle STOOD UP + first floor MEASURED (cache-neutral, 27B, c8/c16): throughput/TTFT WIN, TPOT/ITL open GAP | SGLang v0.5.15 (`f63458b`) whole runtime surface inventoried (44 rows: 23 FUSED into our vLLM-derived engine, 8 SGLANG-DISTINCT opt-ins, 5 inventoried, 8 out-of-scope). The `v0.5.15-cu130` arm64 image (`@sha256:d0a667e`) PULLED and RAN the 27B-NVFP4 gate model on GB10 sm_121a with no from-source build. First reproduced SGLang-vs-ours cache-neutral comparison (27B, 3 reps, idle box, one flock, engines sequential): **ours beats the SGLang floor on total/output throughput + req/s (2.21×@c16, 1.44×@c8) and TTFT (6–12× lower), but SGLang wins per-token latency (TPOT/ITL 1.18–1.49× below ours) — a reproduced OPEN GAP.** SGLang is a competitor, not the mirror source (vLLM stays behavior truth). Residuals: 35B, c1/c2/c4 low-conc sweep, shared-prefix cache-ON arm, token-exact cross-check. Numbers + repro: `docs/BENCHMARKS.md`, `.agents/sglang-matrix.md`, `.agents/specs/sglang-parity-oracle.md`. **UPDATE 2026-07-28 (`CLAIM-DECODE-LATENCY-EXPLORE`, measurement only, no source changed): the TPOT/ITL gap is CONFIRMED batch-composition, NOT a decode-kernel deficiency** — on our engine ITL(decode-batch=1)=101.75 ms is already ≤ SGLang's op-point 104–105 ms and rises monotonically with batch (→158.5 ms @ B16); nsys shows every hot decode kernel sub-linear in batch (per-token cost ↓~10×); SGLang's effective decode concurrency is ~4 (not 16) due to its 33 s admission queue, so its low ITL is simply the ITL of a small batch. Our throughput win IS the ITL cost — same lever; knob `max_num_seqs`/`max_num_batched_tokens` already exists, latency-oriented point `max_num_seqs≈8` = ITL −21% at 1.38× SGLang throughput; default stays throughput-oriented. Full data: `.agents/specs/decode-latency-lever.md` **UPDATE 2026-08-16 ([#979](https://github.com/mudler/vllm.cpp/issues/979), records only, nothing measured): two entries were stale and are corrected.** `BACKEND-GATE-CUDA-SGLANG` moves `BLOCKED` to `PARTIAL`: its recorded blocker `SERVE-ASYNC-LLM` is discharged, so the reason "HTTP TTFT/ITL cannot be measured honestly yet" is retracted. The production server streams incrementally over `AsyncLLM` (`serving_completion.h:9`, `api_server.cpp:971-981`), the benchmark harness ENFORCES it rather than assuming it (`tools/bench/run_serve_low.py:296-310` refuses `first_chunk_s >= total_s`), and the run above demonstrates it: c16 mean TTFT 2980 ms against mean ITL 154.4 ms over 128 tokens means first byte preceded completion by about twenty seconds, which a buffered server cannot do. That run is NOT voided by [#931](https://github.com/mudler/vllm.cpp/issues/931), because the keepalive frame needs 15 s of silence and the worst observed p99 TTFT was 7220 ms. The SGLang oracle also moves to `gateable = yes`: `.agents/oracles/sglang.md` still said "no SGLang run has been recorded on this project's hardware" two and a half weeks after this measurement, and `docs/BENCHMARKS.md` still said "Never ran". This discharges the SGLang third of [#647](https://github.com/mudler/vllm.cpp/issues/647). A new `BACKEND-GATE-CUDA-LLAMACPP` row is filed `INVENTORIED` for the llama.cpp-on-current-CUDA arm, which had no owner. Campaign spec: `.agents/specs/bench-qwen38-27b-four-way.md` |
 
+**CUDA graph capture takes BREAK POINTS** as of `ENG-CUDAGRAPH-BREAK` W1
+(`ACTIVE`, 2026-08-18, [spec](../.agents/specs/eng-cudagraph-break.md), #1192,
+parent #1163). A forward can be captured as a SEQUENCE of segments split at
+break points, so a forward containing a host-dependent operation is still
+graphed except at that operation instead of falling out to eager for the whole
+step.
+
+`vt::BreakableGraph`, `vt::GraphCaptureScope` and `vt::GraphBreak`
+(`include/vt/breakable_graph.h`) replace the nine hand-rolled per-model drivers
+as those migrate. **Coverage and correctness, not speed**: no throughput gate is
+declared, because our prefill has no launch bubbles to collapse (3.8% host idle,
+GPU-busy above 96%) and decode already banked its launch-overhead win.
+
+The boundary is vLLM's — its v1 default splits at `splitting_ops`, defaulted to
+the attention family — and only the registration form is SGLang's, because vLLM
+gets its split from Dynamo and FX and we have no compiler. W1 registers ONE
+break point, at the dense attention entry of `Qwen3ForCausalLM`.
+
+The stage's exit criterion was measured rather than assumed: ending a capture
+and BEGINNING A NEW ONE on the same stream mid-forward, with eager work between,
+is legal under the thread-local capture mode our CUDA backend uses (`orin:gpu0`
+via an `rc` lease, driver 12060, three replays with fresh inputs, zero
+mismatches).
+
+Gates: `tests/vt/test_breakable_graph.cpp` ports SGLang's unit suite case for
+case, with its arithmetic chains and its post-replay assertions intact (24
+cases, 163 assertions); `tests/vllm/models/test_qwen3_break_point.cpp` drives
+the production forward with a scope open, counts one segment per layer plus one,
+and compares the logits BIT FOR BIT against the unscoped forward (500 values, 0
+differing).
+
+The seam ENFORCES what it used to document. A destination-carrying break point
+takes a `vt::BreakSlot` whose storage the seam owns, because the following
+segment bakes that address and a caller's local dies first; a destination with no
+`CopyOutput` overload is a compile error naming the type rather than a silent
+drop into the no-writeback path; a second capture scope on one thread and a
+re-entered container are refused; and a forward that throws OUT OF the scope
+mid-capture leaves no partial graph reporting itself as captured. Interleaved
+replay, the `VLLM_CPP_CUDAGRAPH=0` kill switch and each refusal above are gated,
+every one proven by a mutation that reds them.
+
+Two break points in one capture writing through ONE destination are refused as
+well, at registration. `BreakSlot` closed the lifetime half of that rule and
+left the aliasing half writable: both replay closures bound to the same address,
+so the earlier writeback was overwritten. One shape still escapes, and the spec
+names it and assigns it to W2 — an exception CAUGHT INSIDE the scope leaves the
+rest of the forward uncaptured while `captured()` stays true, because nothing is
+unwinding at scope exit for the drain to see.
+
+**Not yet entered from a production step.** No driver opens a capture scope
+until W2 migrates `Qwen3DenseDecodeGraph`; the break point itself runs on every
+forward and takes the pass-through arm. The spec's `## Owed` names that with its
+owner, along with the auxiliary-stream auto-join, the ROCm and Tenstorrent arms,
+and GPU bit-exactness over more than one replay.
+
 ## Speculative decoding
 
 **MTP draft DEPTH is configurable** as of `SPEC-MTP-K-GT-1` (`ACTIVE`,
@@ -1573,6 +1628,25 @@ regression.
 
 ## Performance detail
 
+**GDN recurrence output and z gate at the model dtype on every arm
+(`GDN-MOE-BF16-OUT`, `GATING`,
+[#1168](https://github.com/mudler/vllm.cpp/issues/1168)):** `GdnOutDType`
+resolved bf16 from a dense checkpoint and f32 from a MoE one, so every MoE
+checkpoint held the recurrence output `dcore`, the `z` gate and the gated-RMSNorm
+weight at double width. vLLM branches on no model shape here. The shape term is
+gone from the resolver and from packed-decode eligibility, and
+`VT_GDN_OUT_BF16=0` is the f32 rollback for both arms now, not the dense one
+alone ([spec](../.agents/specs/gdn-moe-bf16-out.md)).
+
+**Nothing is measured and no GPU gate has run**, so no axis is claimed in either
+direction. The CPU tier enters through `ModelRegistry::Forward` on a MoE config
+and reads the dtypes off the tensors, in the default and the `=0` arm alike. The
+35B correctness gate, the `315/315` and `235/235` engine counts, the same-binary
+A/B and the `nsys` memory-format confirmation are owed to a GPU host. Dropping
+the shape term reaches packed GDN decode on no MoE checkpoint either:
+`in_proj_ba` has one writer, the dense loader
+([#1169](https://github.com/mudler/vllm.cpp/issues/1169), owed).
+
 **Local Qwen3.5-4B plain BF16 direct loader; throughput ahead, acceptance
 `PENDING`, latency and VRAM open:** production `AsyncLLM` uses default-ON exact
 `(sequence, 8-token chunk)` causal-conv dispatch. Graph-node `nsys` measures
@@ -1630,6 +1704,8 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 `BACKEND-TENSTORRENT-TRACE-RUNNER`: `SPIKE`: NO-GO for T=1 decode capture. Measured `to_vector` abort. Decode capture moved to `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`. Prefill capture still unaudited.
 
 `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
+
+`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The shared `vt` registry hashes a captured graph's structure and re-points a single executable with `cudaGraphExecUpdate` on a hit, falling back to a private executable when the driver rejects the update. A memory and capture-time change, NOT a throughput change. Default OFF until a leased-GPU same-binary A/B proves a deduped replay token-identical; that A/B and the ROCm compile are owed ([#1162](https://github.com/mudler/vllm.cpp/issues/1162)).
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

@@ -1215,6 +1215,7 @@ add_library(vllm STATIC
   src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
+  src/vt/breakable_graph.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/op_provider.cpp

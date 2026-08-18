@@ -547,6 +547,28 @@ DevExpertLru& ExpertLru() {
 
 bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I,
                                    int64_t H) {
+  // Refuse BEFORE the upload on a device whose down-projection GEMM does not
+  // exist. Returning true here is a PROMISE that the caller may run the
+  // device-resident arm, and every caller that takes that promise ends in
+  // `vt::MatmulBTAlphaBeta` — `ExpertGeGLUDeviceAccum` (:76-93) and
+  // `ExpertGeGLUTopKFusedGelu` (:181-234) both do. That call has exactly one
+  // implementation in the tree, `rocm::MatmulBTAlphaBetaRocm`, so off ROCm it
+  // throws (issue #1205). The upload's own `try`/`catch (...)` below does NOT
+  // cover the compute, so without this line the exception leaves the decode step
+  // instead of degrading: the `else` arms at the call sites already fall back to
+  // `EnsureGemma4Fp8ExpertCached` + `ExpertGeGLUHost`, which is slower and
+  // rounds twice more, but answers.
+  //
+  // It is latent rather than live today only because `MakeRoom` needs
+  // `Backend::DeviceMemoryInfo`, which only ROCm overrides. #1126 step 1 is
+  // exactly the change that adds the CUDA override, which is why the refusal has
+  // to be here before it lands and not after.
+  //
+  // Keyed on whether the arm EXISTS, not on a device name or a build macro:
+  // `vt::HasMatmulBTAlphaBeta` is the same predicate the dispatch itself uses, so
+  // writing the CUDA kernel wakes this path with no edit here, and on ROCm the
+  // answer is true and nothing about this function changes.
+  if (!vt::HasMatmulBTAlphaBeta(d.q)) return false;
   // When device LRU disabled, do NOT host-cache-dequant here — that path was
   // unbounded (every expert forever) and OOM'd the 30G host (~27G RSS) under pollution.
   if (!ExpertLru().Enabled()) return false;

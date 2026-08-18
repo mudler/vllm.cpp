@@ -695,7 +695,8 @@ TEST_CASE("loaded_engine: an over-long prompt is REFUSED, not left waiting") {
 // ResolveNumBlocks is private, and a test that called it would prove the
 // function works rather than that anything reaches it. The chain under test is
 // LoadedEngine ctor -> MakeKVCacheResolved -> ResolveNumBlocks
-// (model_loader.cpp:1081-1083,972).
+// (`src/vllm/entrypoints/model_loader.cpp::MakeKVCacheResolved`,
+// `src/vllm/entrypoints/model_loader.cpp::ResolveNumBlocks`).
 
 TEST_CASE(
     "loaded_engine: an EXPLICIT --gpu-memory-utilization says it did not size "

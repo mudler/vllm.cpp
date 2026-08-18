@@ -1785,6 +1785,190 @@ Ltx2PipelineRecipe Ti2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   return recipe;
 }
 
+// `KeyframeInterpolationPipeline` (keyframe_interpolation.py:55, `__call__` at
+// :147). Row LTX25-KEYFRAME-INTERP, issue #1096.
+//
+// UPSTREAM'S INTERPOLATION PIPELINE: the caller pins keyframes and the model
+// generates the motion between them. Structurally it is `ti2vid_two_stage` —
+// same parser, same two stages, same Euler stepper, same frozen stage-2 sigma
+// set, same unadapted guided stage 1 — and it differs in exactly TWO fields.
+// Both differences render either way, which is why each one is commented at
+// length where it is set.
+//
+// ─── DIFFERENCE 1: THE IMAGE-CONDITIONING BUILDER ────────────────────────────
+// `:211` and `:260` call `image_conditionings_by_adding_guiding_latent`
+// (helpers.py:343-367). `ti2vid_two_stages.py:231` and `:276` call
+// `combined_image_conditionings` (:272-308). The two functions differ by ONE
+// branch: the second sends `frame_idx == 0` to `VideoConditionByLatentIndex`,
+// which REPLACES latent frame 0's clean tokens; the first has no branch at all
+// and sends every image, frame 0 included, to `VideoConditionByKeyframeIndex`,
+// which APPENDS. See `Ltx2ImageConditioningBuilder`.
+//
+// That is the pipeline's NAME: the first image is a keyframe to interpolate
+// FROM, not a frame to overwrite.
+//
+// ─── DIFFERENCE 2: STAGE 2'S SOUNDTRACK IS THE ONE THAT LEAVES ───────────────
+// `:271` binds `video_state, audio_state = self.stage_2(...)` and `:293` decodes
+// that name. `ti2vid_two_stages.py:289` binds `video_state, _` under its own
+// comment at `:287-288` — "Stage 2 refines video only; discard its audio" — and
+// `:311` decodes the name `:247` bound instead. There is no comment either way
+// in this file; the BINDING is the statement, and it is the opposite one.
+//
+// ─── WHAT IS THE SAME, AND IS STILL DERIVED RATHER THAN COPIED ───────────────
+// The stepper is Euler because neither `self.stage_1(...)` (:231-252) nor
+// `self.stage_2(...)` (:271-290) passes `stepper` or `loop`, so
+// `DiffusionStage.__call__`'s defaults apply (utils/blocks.py:524-527).
+// `distilled.py:76-84` selects the ANCESTRAL stepper on generation 2.5 and
+// reaches this pipeline through nothing.
+//
+// ─── `FactoryGuidedDenoiser` IS `GuidedDenoiser` ON THE DEFAULT PATH ─────────
+// `:232` builds a `FactoryGuidedDenoiser`, which resolves a guider per step from
+// sigma (utils/denoisers.py:332-343). On this pipeline's default path it
+// resolves ONE: `main()` passes plain `MultiModalGuiderParams` (:325-340), so
+// `create_multimodal_guider_factory` takes `MultiModalGuiderFactory.constant`
+// (guiders.py:360), which builds a single `(inf, params)` bin (:312-315) and
+// returns the same guider at every sigma. `_guided_denoise`
+// (utils/denoisers.py:61-211) is then what runs, and that is `Ltx2GuidedDenoise`.
+// #1096 named the per-sigma denoiser as a blocker on this row without deriving
+// that; the sigma-BINNED arm — `MultiModalGuiderFactory.from_dict`
+// (guiders.py:317-330), which no CLI flag builds — is owed under #1187.
+Ltx2PipelineRecipe KeyframeInterpolationRecipe(const Ltx2PipelineParams& params,
+                                              const std::string& negative_prompt) {
+  Ltx2PipelineRecipe recipe;
+
+  Ltx2PhaseRecipe stage1;
+  // Upstream's own attribute names (`:100`, `:112`), which is what a refusal
+  // quotes back to a caller.
+  stage1.name = "stage_1";
+  // `width // 2, height // 2` (`:203-209`). This is also what makes
+  // `assert_resolution(is_two_stage=True)` (`:170`) the 64-divisor arm here:
+  // `max_spatial_downscale()` derives the divisor from this field.
+  stage1.spatial_downscale = 2;
+  // EMPTY on purpose: `self._scheduler.execute(steps=num_inference_steps)`
+  // (`:199-200`) is resolved at run time from the request's step count.
+  stage1.sigmas = {};
+  stage1.use_official_sigma_schedule = true;
+  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:31` reads as
+  // `default_number_of_tokens` = 4096 rather than as the target grid. The ONE
+  // upstream site that goes the other way is `ti2vid_two_stages_hq.py:267`, i.e.
+  // `Res2sTwoStageRecipe`, which leaves this at the default. That three shipped
+  // arms still take the target grid is #1150, not this line.
+  stage1.schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
+  // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and
+  // `:244-247` sets none, so stage 1 starts from pure noise. #1013 is the defect
+  // this line exists to not repeat: at 0.0 the state stays as
+  // `create_initial_state` wrote it, which with no initial latent is all zeros,
+  // and a zero-initialized denoise still returns a finite clip.
+  stage1.noise_scale = 1.0;
+  // `create_multimodal_guider_factory(params=video_guider_params, ...)`
+  // (`:222-225`), whose six fields are the params table's video row through the
+  // CLI defaults (`:325-332`, utils/args.py:947-1006).
+  stage1.video_guidance = params.video_guider;
+  // THE PARAMS TABLE'S AUDIO ROW, as on `Ti2VidTwoStageRecipe` and NOT as on
+  // `A2VidTwoStageRecipe`. All three come off the same parser; the difference is
+  // that A2Vid's audio stream is the caller's FROZEN take, so it builds a
+  // default `MultiModalGuiderParams()` (a2vid_two_stage.py:237-239). This
+  // pipeline GENERATES its soundtrack, and `:226-229` hands the audio guider
+  // factory the real params, filled from six `--audio-*` /
+  // `--v2a-guidance-scale` flags at `:333-340`.
+  stage1.audio_guidance = params.audio_guider;
+  // `FactoryGuidedDenoiser(...)` at `:232-237` — see the header comment for why
+  // that is `Ltx2GuidedDenoise` here.
+  stage1.denoiser = Ltx2PhaseDenoiser::kGuided;
+  stage1.allow_guidance_override = true;
+  // `loras=tuple(loras)` (`:104`) — stage 1 runs WITHOUT the distilled adapter,
+  // against stage 2's `stage_2_loras = (*tuple(loras), *tuple(distilled_lora))`
+  // (`:111`, taken at `:116`). Upstream's own pipeline table says the same:
+  // `2 | Full + distilled LoRA | Euler | Keyframe interpolation`
+  // (packages/ltx-pipelines/CLAUDE.md:24), and its LoRA-conventions section
+  // scopes the adapter to stage 2 for TI2Vid, A2Vid and Keyframe alike.
+  //
+  // Deleting this line reverts to one fused weight set for both stages, which is
+  // #1118 exactly, and it renders: stage 1's guided schedule would run against
+  // base + distilled where upstream runs it against the base alone.
+  stage1.loras = Ltx2PhaseLoraScope::kNoAdapters;
+  stage1.stepper = Ltx2StepperKind::kEuler;
+
+  Ltx2PhaseRecipe stage2;
+  stage2.name = "stage_2";
+  stage2.spatial_downscale = 1;
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (`:166`) — a
+  // DEFAULT ARGUMENT, so this phase's schedule is frozen even though stage 1's
+  // is not (utils/constants.py:19-23).
+  stage2.sigmas = Stage2DistilledSigmas();
+  stage2.use_official_sigma_schedule = false;
+  // `noise_scale=stage_2_sigmas[0].item()` on BOTH modality specs (`:282`,
+  // `:287`) — the upsampled latent is only valid at the noise level this stage
+  // starts from.
+  stage2.noise_scale = Stage2DistilledSigmas().front();
+  // `self.upsampler(video_state.latent[:1])` (`:255`).
+  stage2.input_transform = Ltx2PhaseInputTransform::kSpatialUpsample;
+  // `SimpleDenoiser(v_context_p, a_context_p)` (`:272`) takes no params at all,
+  // so both guider fields stay at the positive-only defaults.
+  stage2.denoiser = Ltx2PhaseDenoiser::kSimple;
+  // TRUE, and this is the pair `allow_guidance_override` alone cannot express.
+  // The flags DO exist on this pipeline's parser (`:301` selects
+  // `default_2_stage_arg_parser`), so a request carrying one is legal — it
+  // reaches stage 1's guider and nothing else. Refusing would reject a request
+  // upstream accepts; applying would switch on guidance upstream's stage 2 does
+  // not have, and `kSimple` above is what stops that.
+  stage2.allow_guidance_override = true;
+  // Left at `kAllAdapters`: `stage_2_loras` (`:111`) is every adapter this
+  // engine holds.
+  stage2.stepper = Ltx2StepperKind::kEuler;
+
+  recipe.phases = {stage1, stage2};
+  // `default_2_stage_arg_parser` sets the request geometry to the FINAL output
+  // (utils/args.py:1128); stage 1 runs at half through `spatial_downscale`.
+  recipe.height = params.stage_2_height();
+  recipe.width = params.stage_2_width();
+  recipe.num_frames = params.num_frames;
+  recipe.frame_rate = params.frame_rate;
+  recipe.num_inference_steps = params.num_inference_steps;
+  recipe.default_image_crf = params.default_image_crf;
+  // `:178-186` encodes `[prompt, negative_prompt]` and reads `ctx_n` into BOTH
+  // guider factories' `negative_context` (`:224`, `:228`).
+  recipe.negative_prompt = negative_prompt;
+  recipe.video_output_phase = 1;
+  // ONE, AND `Ti2VidTwoStageRecipe` ABOVE CARRIES ZERO. `:271` is `video_state,
+  // audio_state = self.stage_2(...)` — the audio name is REBOUND, not discarded
+  // — and `:293` is `self.audio_decoder(audio_state.latent)`, which therefore
+  // decodes stage 2's take. `ti2vid_two_stages.py:289` binds `video_state, _`
+  // under its own comment at `:287-288` and decodes stage 1's.
+  //
+  // COPYING THE TI2VID LINE HERE WOULD RENDER: a soundtrack that is finite, the
+  // right length, at the right sample rate, and one refinement stage stale.
+  recipe.audio_output_phase = 1;
+  // Stage 1's schedule IS the step count (`:200`), so a `steps` override is
+  // upstream's `--num-inference-steps` and is honoured. Stage 2 carries its own
+  // explicit `sigmas`, which the engine reads before it consults this flag, so
+  // the override cannot reach the distilled refinement.
+  recipe.allow_request_sigmas = true;
+  recipe.fixed_num_inference_steps = false;
+  // `__call__` (`:147-168`) has no initial-latent parameter at all: stage 1's
+  // video spec carries none (`:244-247`) and stage 2's is the upsampler's output
+  // (`:283`).
+  recipe.allow_request_latents = false;
+  recipe.allow_negative_prompt = true;
+  // `distilled_lora` is a POSITIONAL, non-defaulted parameter (`:68`) — this
+  // pipeline cannot even be CONSTRUCTED without one — and `--distilled-lora` is
+  // `required=True` (utils/args.py:1140-1155) on the parser `:301` selects.
+  recipe.requires_distilled_lora = true;
+  // ...and NOT `requires_audio_input`: there is no `--audio-path` here, the
+  // soundtrack is GENERATED, and `__call__` takes `images` rather than a
+  // waveform. A recipe written by copying `A2VidTwoStageRecipe` would inherit
+  // that flag and refuse every render.
+  //
+  // THE FIELD THIS ROW ADDS, and the one that makes this recipe the pipeline it
+  // is rather than a second `ti2vid_two_stage`. `:211` and `:260` both call
+  // `image_conditionings_by_adding_guiding_latent` (helpers.py:343-367), so
+  // frame 0 APPENDS as a keyframe instead of REPLACING latent frame 0. See the
+  // header comment on `Ltx2ImageConditioningBuilder`, and the phase loop's
+  // first-frame arm, which is the one reader.
+  recipe.image_conditioning = Ltx2ImageConditioningBuilder::kAddGuidingLatent;
+  return recipe;
+}
+
 }  // namespace
 
 Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
@@ -1865,6 +2049,32 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
     }
     if (model_version == "2.5") {
       return Ti2VidTwoStageRecipe(Ltx2DetectPipelineParams("2.5"), LightricksNegativePrompt());
+    }
+  } else if (pipeline_kind == "keyframe_interpolation") {
+    // All four generations, mirroring the `ti2vid_two_stage` rows above line for
+    // line: `main()` calls `resolve_cli_params()` (keyframe_interpolation.py:300)
+    // and hands the result to `default_2_stage_arg_parser(params=params)`
+    // (`:301`), so the generation comes off the CHECKPOINT. Restricting these
+    // rows would be a local invention.
+    //
+    // THE KIND IS UPSTREAM'S FILE AND CLASS NAME, not a `*_two_stage` shorthand,
+    // and that is deliberate rather than an inconsistency: `keyframe_two_stage`
+    // would describe the STRUCTURE this recipe shares with three others and hide
+    // the two fields that separate it from them. Every plausible misspelling is
+    // refused by name rather than defaulted.
+    if (model_version == "2") {
+      return KeyframeInterpolationRecipe(Ltx2Params20(), kOmniNegativePrompt);
+    }
+    if (model_version == "2.3") {
+      return KeyframeInterpolationRecipe(Ltx2Params23(), kOmniNegativePrompt);
+    }
+    if (model_version == "2.4") {
+      return KeyframeInterpolationRecipe(Ltx2DetectPipelineParams("2.4"),
+                                         LightricksNegativePrompt());
+    }
+    if (model_version == "2.5") {
+      return KeyframeInterpolationRecipe(Ltx2DetectPipelineParams("2.5"),
+                                         LightricksNegativePrompt());
     }
   } else if (pipeline_kind == "t2a_one_stage") {
     if (model_version == "2") return T2aOneStageRecipe(Ltx2Params20(), kOmniNegativePrompt);

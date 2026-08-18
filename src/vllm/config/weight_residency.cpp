@@ -4,9 +4,11 @@
 #include "vllm/config/weight_residency.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -39,6 +41,33 @@ std::optional<int64_t> EnvCountThatWins(const char* env_name) {
   const long long parsed = std::atoll(v);
   if (parsed <= 0) return std::nullopt;
   return static_cast<int64_t>(parsed);
+}
+
+// `VT_DEVICE_WEIGHT_BUDGET_BYTES`'s value, if and only if it would beat a
+// configured budget. The grammar is transcribed verbatim from the reader this row
+// took over (`DeviceWeightBudgetBytes`, gguf_device_fit.cpp @ #1123): one or more
+// DECIMAL DIGITS and nothing else, no sign and no space. Anything else is
+// IGNORED, so an environment-only run resolves exactly as before.
+//
+// It is NOT `EnvCountThatWins`. That helper drops a non-positive value, and `0` is
+// this knob's suppression spelling — the operator asking for the refusal to be
+// switched off — so dropping it would silently restore the guard the operator
+// turned off. `strtoull` alone is not enough for the grammar either: it skips
+// leading whitespace, and it ACCEPTS a leading '-' and wraps it to ULLONG_MAX, so
+// "-1" would parse as an effectively infinite budget.
+//
+// ONE rule with two callers, for the same reason the count rule has two: the
+// resolver below, and `DescribeEnvOverrides`, which must not announce a value the
+// resolver ignores (#1122 L7).
+std::optional<size_t> DeviceWeightBudgetEnvThatWins() {
+  const char* v = std::getenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  if (v == nullptr || v[0] < '0' || v[0] > '9') return std::nullopt;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed =  // NOLINT(runtime/int) strtoull's type
+      std::strtoull(v, &end, 10);
+  if (*end != '\0' || errno != 0) return std::nullopt;
+  return static_cast<size_t>(parsed);
 }
 
 struct Global {
@@ -226,12 +255,42 @@ std::optional<int64_t> ExtPositiveInt(const nlohmann::json& obj, const char* key
   return v;
 }
 
+// The SAME type check, with ZERO accepted. It exists for exactly one field, and
+// the difference from `ExtPositiveInt` is the field's meaning rather than a
+// looser rule. `slots` and `slot_bytes` are sizes: a zero there is a degenerate
+// cache, so the parser refuses it where the operator can still read the message.
+// `device_fit.weight_budget_bytes` is a BUDGET that `CheckDeviceWeightFit` reads
+// as UNKNOWN when it is zero, so `0` means "make no fit decision" — the same
+// suppression `VT_DEVICE_WEIGHT_BUDGET_BYTES=0` has meant since #1123. Refusing
+// it would delete the escape hatch the key exists to give. A NEGATIVE budget is
+// still refused, and the message says "must not be negative" rather than "must be
+// positive", because the second sentence would be false about a value this parser
+// accepts.
+std::optional<int64_t> ExtNonNegativeInt(const nlohmann::json& obj,
+                                         const char* key, const char* path) {
+  auto it = obj.find(key);
+  if (it == obj.end() || it->is_null()) return std::nullopt;
+  if (!it->is_number_integer()) {
+    throw std::invalid_argument(std::string("offload config: \"") + path + "." +
+                                key + "\" must be an integer");
+  }
+  const int64_t v = it->get<int64_t>();
+  if (v < 0) {
+    throw std::invalid_argument(std::string("offload config: \"") + path + "." +
+                                key + "\" must not be negative (got " +
+                                std::to_string(v) +
+                                "); 0 means \"suppress the device-fit refusal\"");
+  }
+  return v;
+}
+
 }  // namespace
 
 bool WeightResidencyConfig::empty() const {
   return !mmap.has_value() && !prefault.has_value() &&
          !expert_stream.has_value() && !expert_stream_slots.has_value() &&
-         !expert_stream_slot_bytes.has_value();
+         !expert_stream_slot_bytes.has_value() &&
+         !device_weight_budget_bytes.has_value();
 }
 
 bool WeightResidencyConfig::operator==(
@@ -239,7 +298,8 @@ bool WeightResidencyConfig::operator==(
   return mmap == other.mmap && prefault == other.prefault &&
          expert_stream == other.expert_stream &&
          expert_stream_slots == other.expert_stream_slots &&
-         expert_stream_slot_bytes == other.expert_stream_slot_bytes;
+         expert_stream_slot_bytes == other.expert_stream_slot_bytes &&
+         device_weight_budget_bytes == other.device_weight_budget_bytes;
 }
 
 std::string WeightResidencyConfig::Describe() const {
@@ -263,6 +323,11 @@ std::string WeightResidencyConfig::Describe() const {
   add_bool("expert_stream", expert_stream);
   add_int("expert_stream_slots", expert_stream_slots);
   add_int("expert_stream_slot_bytes", expert_stream_slot_bytes);
+  // Under the FIELD name rather than the document path, like its five siblings,
+  // so the line reads as one list of knobs. A budget of 0 prints as
+  // `device_weight_budget_bytes=0`, which is what the operator asked for and is
+  // distinguishable from the field being absent, where nothing prints at all.
+  add_int("device_weight_budget_bytes", device_weight_budget_bytes);
   return out;
 }
 
@@ -302,6 +367,13 @@ std::string WeightResidencyConfig::DescribeEnvOverrides() const {
       {expert_stream_slot_bytes.has_value(),
        count_wins("VT_MOE_EXPERT_STREAM_SLOT_BYTES"),
        "VT_MOE_EXPERT_STREAM_SLOT_BYTES", "expert_stream_slot_bytes"},
+      // The budget asks its OWN predicate, not `count_wins`: `0` wins here and is
+      // dropped there, and `0` is the one value an operator is most surprised to
+      // have inherited from an exported variable, because it switches the
+      // device-fit refusal off entirely.
+      {device_weight_budget_bytes.has_value(),
+       DeviceWeightBudgetEnvThatWins().has_value(),
+       "VT_DEVICE_WEIGHT_BUDGET_BYTES", "device_weight_budget_bytes"},
   };
   std::string out;
   for (const Pair& p : pairs) {
@@ -378,7 +450,7 @@ WeightResidencyConfig parse_weight_residency_extension_json(
 
   const nlohmann::json* ext = ExtObject(doc, "vllm_cpp", "");
   if (ext == nullptr) return cfg;
-  RejectUnknownKeys(*ext, "vllm_cpp", {"mmap", "expert_stream"});
+  RejectUnknownKeys(*ext, "vllm_cpp", {"mmap", "expert_stream", "device_fit"});
 
   if (const nlohmann::json* m = ExtObject(*ext, "mmap", "vllm_cpp")) {
     RejectUnknownKeys(*m, "vllm_cpp.mmap", {"enabled", "prefault"});
@@ -393,6 +465,19 @@ WeightResidencyConfig parse_weight_residency_extension_json(
         ExtPositiveInt(*s, "slots", "vllm_cpp.expert_stream");
     cfg.expert_stream_slot_bytes =
         ExtPositiveInt(*s, "slot_bytes", "vllm_cpp.expert_stream");
+  }
+  // A THIRD knob family: the load-time device-fit check (#1123), whose budget
+  // used to be reachable only as `VT_DEVICE_WEIGHT_BUDGET_BYTES` (#1127). It is an
+  // OBJECT rather than a scalar beside `mmap` and `expert_stream` for two reasons.
+  // `vllm_cpp` maps a name to an object today and `ExtObject` walks it on that
+  // assumption, so one scalar sibling would make the level heterogeneous. And this
+  // is a family, not a member of either existing one — the field name drops the
+  // family prefix exactly as `VT_GGUF_MMAP` -> `mmap.enabled` and
+  // `VT_MOE_EXPERT_STREAM_SLOTS` -> `expert_stream.slots` already do.
+  if (const nlohmann::json* d = ExtObject(*ext, "device_fit", "vllm_cpp")) {
+    RejectUnknownKeys(*d, "vllm_cpp.device_fit", {"weight_budget_bytes"});
+    cfg.device_weight_budget_bytes =
+        ExtNonNegativeInt(*d, "weight_budget_bytes", "vllm_cpp.device_fit");
   }
   return cfg;
 }
@@ -475,9 +560,52 @@ std::string DecisionSummary(const Global& g) {
   return out;
 }
 
+// THE SETTER REFUSES WHAT THE PARSER REFUSES, because there are TWO doors into
+// this struct and only one of them had range rules.
+// `parse_weight_residency_extension_json` refuses a non-positive `slots` or
+// `slot_bytes` and a negative budget, and every production caller goes through
+// it. But `SetWeightResidencyConfig` is declared in a PUBLIC header and takes the
+// struct, so a hand-built config reaches the process-global having passed no
+// parser at all.
+//
+// The budget is the dangerous one rather than merely the wrong one.
+// `ResolveDeviceWeightBudgetBytes` casts the configured `int64_t` to `size_t`, so
+// an installed `-1` resolves to SIZE_MAX: an effectively infinite budget that
+// switches the load-time device-fit refusal OFF and says nothing — precisely the
+// "a budget the operator believes is set" failure that refusal's own text names.
+// The resolver's comment justified that cast by trusting a parser that this door
+// does not run, so the trust is made true here instead of being narrated there.
+//
+// `0` still installs. It is this field's suppression spelling, and a guard that
+// refused it would delete the escape hatch the key exists to give.
+void RejectOutOfRangeFields(const WeightResidencyConfig& c) {
+  const auto positive = [](const char* name, std::optional<int64_t> v) {
+    if (v.has_value() && *v <= 0) {
+      throw std::invalid_argument(std::string("weight residency config: ") +
+                                  name + " must be positive (got " +
+                                  std::to_string(*v) + ")");
+    }
+  };
+  positive("expert_stream_slots", c.expert_stream_slots);
+  positive("expert_stream_slot_bytes", c.expert_stream_slot_bytes);
+  if (c.device_weight_budget_bytes.has_value() &&
+      *c.device_weight_budget_bytes < 0) {
+    throw std::invalid_argument(
+        "weight residency config: device_weight_budget_bytes must not be "
+        "negative (got " +
+        std::to_string(*c.device_weight_budget_bytes) +
+        "); 0 means \"suppress the device-fit refusal\", and a negative value "
+        "would resolve to SIZE_MAX and switch that refusal off silently");
+  }
+}
+
 }  // namespace
 
 void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
+  // BEFORE the lock and before the latch check: a value this struct may not hold
+  // is refused whatever the process has already decided, and the refusal reads the
+  // argument only.
+  RejectOutOfRangeFields(config);
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
   // REFUSE ONLY WHAT CANNOT BE HONOURED. A document that sets a decided field to a
@@ -520,11 +648,18 @@ void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
   if (config.expert_stream_slot_bytes.has_value()) {
     g.config.expert_stream_slot_bytes = config.expert_stream_slot_bytes;
   }
+  // `has_value()`, not a truth test on the number: `0` is a value the operator
+  // SET, and it is this field's suppression spelling. A merge that skipped it
+  // would keep an older budget in force while the operator believed the refusal
+  // was off.
+  if (config.device_weight_budget_bytes.has_value()) {
+    g.config.device_weight_budget_bytes = config.device_weight_budget_bytes;
+  }
 }
 
 // BY VALUE, and copied under the lock. Returning a reference and then releasing
 // the mutex gave the caller an unsynchronised read behind a lock that looked like
-// it covered one (#1122 L3). The copy is five optionals; the callers are per load,
+// it covered one (#1122 L3). The copy is six optionals; the callers are per load,
 // per prefaulted span (against megabytes of pages) and once per store.
 WeightResidencyConfig ActiveWeightResidencyConfig() {
   Global& g = State();
@@ -668,6 +803,19 @@ int64_t ResolveExpertStreamSlotBytes(int64_t computed_default) {
   return ResolveResidencyCount(
       "VT_MOE_EXPERT_STREAM_SLOT_BYTES",
       ActiveWeightResidencyConfig().expert_stream_slot_bytes, computed_default);
+}
+
+size_t ResolveDeviceWeightBudgetBytes(size_t probed_total_bytes) {
+  if (const std::optional<size_t> winner = DeviceWeightBudgetEnvThatWins()) {
+    return *winner;
+  }
+  const std::optional<int64_t> configured =
+      ActiveWeightResidencyConfig().device_weight_budget_bytes;
+  // `has_value()`, not `> 0`. A configured `0` is the operator suppressing the
+  // refusal, and `CheckDeviceWeightFit` reads a zero budget as UNKNOWN. The parser
+  // already refused a negative value at startup, so the cast is in range.
+  if (configured.has_value()) return static_cast<size_t>(*configured);
+  return probed_total_bytes;
 }
 
 }  // namespace vllm

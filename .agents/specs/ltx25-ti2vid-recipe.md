@@ -164,7 +164,7 @@ inverts how #1093 and `ltx25-res2s-loop.md:80-88` both framed it.
 | `retake.py:287` | no | `retake`, non-distilled arm | **no** |
 | `a2vid_two_stage.py:226` | no | `a2vid_two_stage` stage 1 | **no** |
 | `ti2vid_two_stages.py:244` | no | **this row** | this row makes it yes |
-| `keyframe_interpolation.py:200` | no | unported (#1096) | n/a |
+| `keyframe_interpolation.py:200` | no | `keyframe_interpolation` stage 1 | yes, since row LTX25-KEYFRAME-INTERP (#1096) |
 | `ti2vid_two_stages_hq.py:267` | **yes** | `res2s_two_stage` stage 1 | yes |
 
 So the engine mirrors the exception and diverges from the rule. That is #1150,
@@ -538,7 +538,13 @@ RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline
   (`:151`'s `*tuple(loras)`). This engine's one adapter slot is upstream's
   `distilled_lora`; the second list has no spelling here until the adapter arity
   refusal lifts (`ltx2_lora.h:167-172`).
-- **`keyframe_interpolation`** (#1096), the fourth pipeline on this parser.
+- ~~**`keyframe_interpolation`** (#1096), the fourth pipeline on this parser.~~
+  Landed as row `LTX25-KEYFRAME-INTERP`, which took this row as its template and
+  set `schedule_tokens = kSchedulerDefault` on its own stage 1. That moved the
+  keyframe line of the table above from `n/a` to `yes` and left the count owed to
+  #1150 at **three**, where it already stood: the six-to-one split is the
+  `latent` column, which no port can change, and the keyframe arm was never one
+  of the divergent three because it was unported rather than wrong.
 - **`allow_request_latents` has no reader in `src/`**, on any recipe, owned by
   [#1152](https://github.com/mudler/vllm.cpp/issues/1152). Four assignments on
   `origin/main` and five with this row's, zero readers in either count, against

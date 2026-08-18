@@ -184,8 +184,8 @@ Consequences, both plausible and neither measured here: the 35B fp8 tower's
 upload is missing from load accounting, and its device pages are never re-tagged,
 which is the shape of the GB10 weight-residency ATS penalty. The first is
 BOUNDED, and #974 says so: `load_stats` has exactly one non-test consumer,
-`PrintLoadBytes` (`src/vllm/entrypoints/model_loader.cpp:133`), a stderr
-diagnostic line behind `LoadStatsEnabled()`. Nothing allocates, sizes or
+`src/vllm/entrypoints/model_loader.cpp::PrintLoadBytes`, a stderr
+diagnostic line behind `src/vllm/entrypoints/model_loader.cpp::LoadStatsEnabled`. Nothing allocates, sizes or
 schedules on that counter, so the under-report costs the accuracy of a
 diagnostic, not a decision. The second consequence carries no such bound.
 

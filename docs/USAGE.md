@@ -55,6 +55,15 @@ or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
 ### ROCm op coverage is incremental (and throws are by design)
 
+ROCm now also carries an **engine-level attention backend name**. Until #1056 the
+kernels were registered (`kPagedAttention`, `kReshapeAndCache`) but
+`RocmPlatform::get_attn_backend_priority` returned an empty list, so
+`SelectAttentionBackendName` had nothing to resolve for `kROCM` — ROCm was the
+only platform in that state. It now returns upstream's dense order verbatim, and
+`ROCM_ATTN` is registered against the NHD layout this tree uses. Nothing routes
+to that name until the runner asks for it (#1065), and no user-facing flag
+changes: this is what the engine picks, not something you select.
+
 The ROCm backend registers native ops family by family
 ([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
 the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal

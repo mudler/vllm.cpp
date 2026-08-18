@@ -337,6 +337,54 @@ std::vector<float> DepthDecoderForward(const std::vector<float>& inputs_embeds,
                                        const DepthDecoderWeights& weights,
                                        ArCompute compute = ArCompute::kFloat32);
 
+// The K and V of every depth position already fed, for `batch` INDEPENDENT rows
+// that share one weight set. Owned by the caller and reset by destroying it;
+// there is no eviction because `max_position_embeddings` is 16.
+struct DepthDecoderCache {
+  int64_t batch = 0;
+  int64_t hidden = 0;
+  int64_t layers = 0;
+  int64_t positions = 0;
+  // [layer * batch + row] -> [positions * hidden], one row appended per call.
+  std::vector<std::vector<float>> keys;
+  std::vector<std::vector<float>> values;
+};
+
+// ONE depth position, appended to `cache`, for `batch` rows at once. Returns the
+// post-`norm` hidden state of the appended position for each row, [batch,
+// hidden_size] — which is the ONLY row the generation schedule reads
+// (encoders.py:131-132 takes `hidden[:, -1]` at every depth step).
+//
+// BIT-IDENTICAL to `DepthDecoderForward` over the same prefix, and by an
+// algebraic identity rather than by a tolerance. Attention here is causal and
+// position is carried by a LEARNED table rather than by RoPE, so the input to
+// position `t` never changes once appended; by induction over the layers, every
+// intermediate of positions 0..t-1 is bit-for-bit what a whole-sequence forward
+// would recompute, and `CausalAttentionStep` walks `j` ascending into one
+// sequential double per output component exactly as `CausalAttention` does at
+// its last query row. `test_minimax_music3_ar.cpp` asserts the equality
+// BITWISE at every prefix length and at both `ArCompute` widths rather than
+// taking the argument on trust.
+//
+// WHY IT EXISTS (#672). The generation loop ran the WHOLE growing sequence
+// through the decoder at every one of the seven depth steps and kept only its
+// last row: 70 row-forwards per frame where 16 carry information, and each
+// row-forward streams 2.28 GB of f32 weights. Upstream re-runs the sequence too
+// (`depth.forward` shapes `(2, 2..8, 4096)`), so this is OUR optimisation and
+// not a port — which is why `DepthDecoderForward` stays in the tree as the
+// mirrored reference and stays gated against the committed goldens.
+//
+// `batch` is the CFG pair: upstream runs the conditional and unconditional rows
+// as one batch-2 forward, and the two differ ONLY at position 0.
+//
+// Throws when the cache already holds `max_position_embeddings` positions, when
+// the batch/hidden/layer geometry disagrees with the cache, or when the cache's
+// key block is not exactly `positions * hidden` long.
+std::vector<float> DepthDecoderAppend(const std::vector<float>& inputs_embeds, int64_t batch,
+                                      const DepthDecoderConfig& config,
+                                      const DepthDecoderWeights& weights,
+                                      ArCompute compute, DepthDecoderCache* cache);
+
 // The depth SEQUENCE `_generate_depth_codes` assembles (encoders.py:125-141):
 //
 //   [ projection(last_hidden),

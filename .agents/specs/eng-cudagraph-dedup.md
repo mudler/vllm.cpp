@@ -13,14 +13,26 @@ is why the load-bearing gate below is byte-identity rather than a speed ratio.
 `ACTIVE`, and the state is argued rather than inherited. The shared registry, its CPU
 contract suite, the CUDA wiring and the
 [#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair all landed. The owed
-device A/B ran on 2026-08-18 and split in two: the correctness half PASSED, and the
+device A/B ran on 2026-08-18 (W4) and split in two: the correctness half PASSED, and the
 benefit half was REFUTED for exactly the case this row was filed for. `N == M` in every
 `VT_CUDA_GRAPH_DEDUP=1` cell, because the signature carries the padded batch dimension,
-so no two decode buckets ever group. The row is not `DONE`, because its stated saving
-does not occur; it is not `PARTIAL`, because nothing upstream is omitted — SGLang keys
-the same fields. It stays `ACTIVE` on one open, traceable hypothesis
-([#1226](https://github.com/mudler/vllm.cpp/issues/1226)) and the items under
-[`## Owed`](#owed). Full result: [`## Outcome`](#outcome).
+so no two decode buckets ever group.
+
+**W5, the same day, tested the hypothesis that negative produced and CONFIRMED it.**
+A COARSE key that drops the launch dimensions and the memcpy extents folds every bucket
+the exact key left alone — 3 graphs to 2 execs, 2 to 1, 2 to 1 — with
+`cudaGraphExecUpdate` probed once per fold and **accepted every time**, `refused=0`. The
+benefit W4 recorded as unreachable is reachable via the key
+([#1226](https://github.com/mudler/vllm.cpp/issues/1226) DELIVERED).
+
+The row stays `ACTIVE`, and the argument moved rather than stayed still. It is still not
+`DONE`: the coarse key is behind its own opt-in in **PR #1232, which has not landed**,
+so nothing on `main` folds today, and the row's stated saving is a MEMORY saving that
+**nobody has measured in bytes on either key**. It is still not `PARTIAL`, because
+nothing upstream is omitted; the coarse key is our own extension past SGLang, which keys
+the same fields we started from. It is not `BLOCKED`, because nothing external stops the
+next step. What is owed is now a DECISION about the default, and that decision needs a
+measurement that does not exist. Full result: [`## Outcome`](#outcome).
 
 ## Scope
 
@@ -487,6 +499,96 @@ there is no memory delta to claim. The `replay branch avg` figures in the logs
   untried route. It is recorded, not pursued, because the dgx gate answered the question
   orin was there to support.
 
+### W5, 2026-08-18: the coarse key, and the hypothesis W4 left open
+
+The W4 result above named one traceable hypothesis: `cudaGraphExecUpdate` requires
+*topology* to match and is documented to permit *parameter* changes, and a kernel's
+launch configuration is a parameter, so a key that drops the launch dimensions might
+group two decode buckets the exact key cannot. The probe-before-fold design makes that a
+COST question rather than a safety question — a key that groups two graphs the driver
+then refuses costs one wasted probe and a private executable, never a wrong replay.
+
+**The hypothesis is CONFIRMED.** The experiment ran on `dgx:gpu0` through an `rc` lease,
+pod `rc-worker-4b8lj`, boot_id `3fd9745a-d25a-426c-ba3c-97c958a85515` at both ends, GB10,
+driver `580.173.02`, `### DONE_AB_KEY 2026-08-18T20:58:46Z`. Thirteen cells of one binary
+(sha256 `ca114abb…c772ad`) built from `b48b51df1` (tar sha256 `7aa50f3b…2ad`, asserted
+before extraction), `VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1` throughout, the only
+variables `VT_CUDA_GRAPH_DEDUP` and `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`. Recipe, cell table
+and caveats: [`.agents/benchmark-record.md`](../benchmark-record.md), entry
+`ENG-CUDAGRAPH-DEDUP W5`.
+
+```text
+a_exact:    captured 3 graphs, deduped to 3 execs  (probes=0 refused=0)
+a_coarse_a: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+a_coarse_b: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+b_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+b_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+c_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+c_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+```
+
+**`probes=0` on every exact-key cell is the direct proof of W4's diagnosis, not a
+restatement of it.** W4 concluded from source that with the launch dimensions in the key
+no candidate group ever forms and `cudaGraphExecUpdate` is never asked. The probe counter
+says exactly that, from the running process. Drop those fields and the driver is asked
+once per fold and accepts every time. So on this hardware the driver does tolerate a
+grid-dimension change across an exec update, and the benefit W4 recorded as unreachable is
+reachable via the key.
+
+**`refused=0` is one driver on one hardware and toolkit combination.** AGENTS.md forbids
+declaring a ceiling; it equally forbids declaring a floor from one box. Nothing here says
+`cudaGraphExecUpdate` accepts a grid change on another driver, another architecture, or
+another CUDA release, and a refusal elsewhere is a cost, not a correctness failure.
+
+**Byte-identity holds on A and C.** Workload A (`--concurrency 24 --num-prompts 24
+--output-len 40 --seed 4242 --max-num-batched-tokens 128`, captured sizes 24/16/8): all
+five cells `ids_sha256=59ebff4a22362086b9fcf426feba847b15b0dc7bf31b37892b1bfc7221b435dc`,
+3655 bytes, 960 tokens, 0 empty rows. Workload C (`--concurrency 32 --num-prompts 49
+--output-len 24 --seed 31337`, captured sizes 32/24): all four cells
+`ids_sha256=ff205260c1fa41a8cc10ad1b8fd0c29f40bd6a2324aa8a64f5192f62cedbd76b`, 4608 bytes,
+1176 tokens.
+
+**Workload B is VOID, and the reason is a NEW DEFECT that is not this row's.** The two
+OFF/OFF control cells — `VT_CUDA_GRAPH_DEDUP` unset in both — disagreed:
+
+```text
+*** DIFFERS *** b_off_a vs b_off_b
+b_off_a  = 5973c5a10a6210085417fb25a29edbd0dc15fe61d7d4f774dd8ff3883dae1d64  bytes=2638
+b_off_b  = 4cf7923080db6aa29759537f2192f3d9500db11c0e8d72bbb2b4ac6e4614af7c  bytes=2650
+```
+
+Same binary, same workload (`--concurrency 16 --num-prompts 21 --output-len 32 --seed
+777`, greedy `--temperature 0`), 23 seconds apart, different token ids. Both runs emit 672
+tokens with 0 empty rows, so the 2638-vs-2650 byte delta is JSON decimal width and **not**
+a length difference; exactly two of 21 rows differ, rows 17 and 18, and both diverge
+mid-decode (at token 11 and token 5) rather than at the first token. Those two rows are in
+the ragged tail that `21 % 16` produces. B's `b_off_a == b_exact` and `b_off_a ==
+b_coarse_a` lines therefore compare against a baseline that does not reproduce itself and
+are worth nothing: **B is VOID, not a pass.** Only the OFF/OFF control makes that visible;
+without it B would have read as three more confirmations. Filed as
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283), which is a decode-path defect
+unrelated to dedup — the feature is off in both control cells — and is NOT diagnosed here
+beyond what the evidence shows.
+
+**The toolkit is not the one W4 ran on.** W5 built under nvcc **`13.3.73`**; the completed
+baseline gate in `fe24a3029` ran under **`13.0.88`**, which is the version the recorded dgx
+gate stack names. The pod's toolkit is a property of the pod, not of the job. The OFF-vs-ON
+and EXACT-vs-COARSE comparisons **within this one binary** are valid, and **this run and
+that baseline are not directly comparable to each other.**
+
+**Nothing on `main` folds today.** The coarse key lives behind `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`,
+default OFF, inside `VT_CUDA_GRAPH_DEDUP`, itself default OFF, on **PR #1232, still a
+draft**. This record measures a configuration that has not landed.
+
+**No throughput and no memory number is claimed or implied, on any axis.** The clocks were
+not pinned (2405 MHz current, 3003 max, 2418 applications, 53 °C) and nothing in this run
+measured bytes saved — the fold count is a count of executables, not of memory. The
+`Benchmark duration` figures (2.52-2.72 s) and the `replay branch avg` figures
+(0.038-0.124 ms/step) in the logs are diagnostics.
+
+**Only the Qwen3 dense decode driver was exercised**, as in W4. Whether any other capture
+site folds under either key is untested.
+
 ## Owed
 
 **DELIVERED by W4, 2026-08-18 — see [`## Outcome`](#outcome).** The device
@@ -497,14 +599,25 @@ executable-count ratio: **DELIVERED AND NEGATIVE**, `N == M` in every ON cell ov
 and three distinct padded buckets, so the row's headline saving is measured NOT to
 occur with the current signature. What remains owed is below.
 
+**DELIVERED by W5, 2026-08-18 — the [#1226](https://github.com/mudler/vllm.cpp/issues/1226)
+hypothesis: CONFIRMED.** A coarse key folds every decode bucket the exact key left alone
+(3→2, 2→1, 2→1) and the driver accepted every probe, `refused=0`. That closes the
+*question*. It does not close the *decision*, and the two are now the whole of what this
+row owes: **whether the coarse key becomes the default, which needs a MEMORY measurement
+nobody has taken.** Every number so far counts executables. Nothing has measured bytes.
+
 | Item | Issue | Why not here |
 |---|---|---|
-| Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | **NOT JUSTIFIED on this evidence.** W4 delivered and the ON arm allocated exactly as many executables as OFF, so the flip would ship a probe cost for no measured saving. It is gated now on a key that can actually group two decode buckets ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)), not on a rerun of the same A/B |
+| Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | **STILL NOT JUSTIFIED, and the reason CHANGED.** W4's reason was that the ON arm allocated as many executables as OFF. W5 removed that reason: with the coarse key the ON arm allocates FEWER. The reason now is that nobody has priced the saving. A default is a measurement, and "2 execs instead of 3" is a count, not bytes. See the row below |
+| **THE DECISION, and the measurement it needs: does the COARSE key become the default?** Two numbers are missing and neither is optional. (1) **Bytes.** What does one `cudaGraphExec_t` cost on this model at this bucket set, and what does the fold actually return — device allocation at steady state, ON versus OFF, on a pinned-clock idle box. Every W4 and W5 figure counts executables. (2) **The probe cost at real bucket churn.** W5 probed once per fold on a 2-3 bucket process. A serving grid with 7 or 11 buckets across nine capture drivers churns differently, and the probe runs on the capture path. Only then is the flip a measurement rather than a preference | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it needs a leased GPU, pinned clocks, and PR #1232 landed first — the key it would default to is still a draft. Deliberately NOT decided by this record, exactly as W5's own hypothesis was not decided by W4's |
+| Landing PR [#1232](https://github.com/mudler/vllm.cpp/pull/1232), the coarse-key mode itself. It is a DRAFT, so nothing on `main` folds today and this row's saving is unreachable on every configuration that ships | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | the experiment measured whether the key works before asking whether it should land, which is the correct order. It needs its own fresh review, and its red-first discrimination test — that the coarse key still SEPARATES two genuinely different topologies — is the load-bearing one |
+| A second driver, a second architecture, a second CUDA release. `refused=0` is one driver (`580.173.02`) on one GB10 under nvcc `13.3.73`. A refusal elsewhere costs a wasted probe rather than a wrong replay, but the rate is unknown and the default decision depends on it | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | no second CUDA box with a different driver is reachable from this session, and `orin:gpu0` stays BLOCKED on the CUDA 13 runtime |
+| **[#1283](https://github.com/mudler/vllm.cpp/issues/1283): greedy decode is not reproducible at concurrency 16.** W5's OFF/OFF control caught it and it VOIDED workload B. NOT this row's defect — `VT_CUDA_GRAPH_DEDUP` is unset in both cells that disagree — but this row's future A/Bs cannot use that workload shape until it is understood | [#1283](https://github.com/mudler/vllm.cpp/issues/1283) | it is a decode-path defect with its own issue and its own isolation plan. Folding it into this row would hide it behind a graph feature it has nothing to do with |
 | Probing `group.current_raw` rather than `raws.front()`, retiring the transitivity assumption above | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it changes probe behaviour, and the device A/B is measuring the current one. Land it with the A/B rerun, not before |
 | Executable coverage for the signature builder's DEVICE half — stability and discrimination on a real `cudaGraph_t`, plus the five node-payload cases and their query escapes | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | the device-free half is now covered by `tests/vt/test_graph_dedup_runtime.cpp`; what remains needs a real `cudaGraph_t`, so it rides with the leased box the A/B already needs |
 | Reaching the feature from the DEFAULT serving path. Dedup engages only under `VT_ASYNC_RUNNER=0`, because the async path captures no decode graph at all ([#323](https://github.com/mudler/vllm.cpp/issues/323) mitigation) | [#1179](https://github.com/mudler/vllm.cpp/issues/1179) | the repair is the `StepDevInputs`-shaped one `ENG-CUDAGRAPH-BREAK` already owns; until it lands, this row's saving is unreachable on the configuration users serve with |
 | The ROCm leg's compile and run verification | [#41](https://github.com/mudler/vllm.cpp/issues/41) | no ROCm hardware or `hipcc` is reachable from this session and CI has no ROCm job, so the HIP wiring is written against the same shared header but is compile-unverified |
-| **THE NEXT TRACEABLE HYPOTHESIS, not decided here.** A COARSER signature key — one that keeps the function addresses and the topology but drops the launch dimensions and the memcpy extents — would let two padded decode buckets form a candidate group at all. It is not obviously unsafe: the registry probes with `cudaGraphExecUpdate` BEFORE it folds, so a key that groups two graphs the driver then refuses costs one wasted probe and a private executable rather than a wrong replay. That makes it a cost question. It needs its own spec, a red-first discrimination test proving the coarser key still separates two genuinely different topologies, and a device run measuring the probe-refusal rate | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it changes what the row optimizes, so it is a design decision with its own evidence, not a repair to fold into the record of the run that found it. AGENTS.md forbids declaring a ceiling, and "unreachable with THIS key" is not "unreachable" |
+| ~~**THE NEXT TRACEABLE HYPOTHESIS, not decided here.**~~ **ANSWERED by W5, 2026-08-18.** A coarser signature key — function addresses and topology kept, launch dimensions and memcpy extents dropped — does let two padded decode buckets form a candidate group, and the driver accepts the resulting `cudaGraphExecUpdate` every time on this hardware (`probes=1 refused=0` per fold, 3→2 / 2→1 / 2→1). It was a cost question and it remains one; what moved is that the cost is now the only open half. See [`## Outcome`](#outcome), W5 | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | DELIVERED. The red-first discrimination test and the landing of PR #1232 are tracked in the rows above |
 | Whether ANY capture site can fold. W4 exercised only the Qwen3 dense decode driver. The other hand-rolled drivers, and two models sharing the process-singleton registry, are untested | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | the same lease that answers the key question answers this one, and answering it before the key is settled measures the wrong thing |
 | A supporting device leg on `orin:gpu0` | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | BLOCKED, cleanly: the Jetson `540.4.0` driver cannot run a CUDA 13 runtime (`cudaGetDeviceCount err=35`). A CUDA 12.x toolkit is the untried route. Not needed now that the dgx gate answered |
 

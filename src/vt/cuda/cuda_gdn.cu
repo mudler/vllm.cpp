@@ -1876,8 +1876,9 @@ __global__ void RmsNormGatedRowKernel(Tout* out, const Tin* x, const Tin* gate, 
 // ---------------------------------------------------------------------------
 // Fast gated-RMSNorm variant (VT_RMSNORM_GATED_FAST). BIT-IDENTICAL (0-ulp) to the
 // shipped RmsNormGatedRowKernel above for the d==128 gated-norm path — covering BOTH
-// the 27B dense bf16 core/z/weight AND the 35B MoE f32 core/z/weight (GdnOutDType is
-// f32 for the MoE), mirroring the RMSNorm decode-fast bit-safety technique (cuda_ops.cu
+// the bf16 core/z/weight both arms carry by default AND the f32 core/z/weight the
+// VT_GDN_OUT_BF16=0 rollback restores (before #1168 that f32 arm was the MoE 35B's
+// DEFAULT), mirroring the RMSNorm decode-fast bit-safety technique (cuda_ops.cu
 // RmsNormRowFastKernel, 348d12d). Templated over (Tin,Tout) via the shared Load/Store
 // helpers so a single kernel is bit-exact for every dispatched dtype pair.
 //
@@ -1916,10 +1917,11 @@ __global__ void RmsNormGatedRowKernel(Tout* out, const Tin* x, const Tin* gate, 
 //
 // Scope: d==128 (both gate models' Dv), core/gate/weight one shared dtype in {f32,bf16},
 // out in {f32,bf16}. Templated over (Tin,Tout) so ONE bit-identical kernel covers BOTH
-// the 27B dense bf16 core/z/weight path AND the 35B MoE f32 core/z/weight path:
-// GdnOutDType returns bf16 for the dense 27B but f32 for the MoE 35B, so the 35B's
-// gated-norm inputs are f32 and the former bf16-only guard sent it to the slow shipped
-// kernel. The kernel below uses the SAME Load/Store helpers as the shipped
+// the default bf16 core/z/weight path AND the f32 one: GdnOutDType returns bf16 on
+// every arm since #1168 and f32 under the VT_GDN_OUT_BF16=0 rollback, and before #1168
+// f32 was the MoE 35B's DEFAULT — either way f32 gated-norm inputs were sent to the
+// slow shipped kernel by the former bf16-only guard.
+// The kernel below uses the SAME Load/Store helpers as the shipped
 // RmsNormGatedRowKernel<Tin,Tout>, so for EVERY (Tin,Tout) the float op sequence is
 // byte-for-byte identical to shipped (Load(float) is the identity; Load(bf16) is the
 // same __bfloat162float; Store the same rounding) — the bit-identity argument above
@@ -1970,8 +1972,18 @@ inline void LaunchGatedFast(cudaStream_t s, Tensor& out, const Tensor& x, const 
 // Runtime predicate + launch for the gated fast path. Returns true iff it ran.
 // Guard: d==128 (the GDN Dv used by both gate models); core/gate/weight share one dtype
 // (the caller VT_CHECKs gate.dtype==x.dtype==w.dtype) in {f32,bf16}; out in {f32,bf16}.
-// This covers the 27B (bf16 core/z, bf16 out) AND the 35B (f32 core/z; bf16 out under
-// GlueFuse, else f32 out). Out-of-scope shapes keep RmsNormGatedRowKernel. The launch
+// This covers BOTH the bf16 core/z/weight both gate models carry by default since
+// #1168 (GdnOutDType stopped branching on model shape, so the 35B is no longer the
+// f32 arm) AND the f32 core/z/weight the VT_GDN_OUT_BF16=0 rollback restores on
+// either of them; `out` is bf16 exactly when GlueFuseEnabled() and f32
+// UNCONDITIONALLY otherwise -- it does NOT follow the input. All three
+// non-GlueFuse gated-norm call sites allocate `DBuf dgated(d, DType::kF32, ...)`
+// whatever the input dtype (qwen3_5.cpp:3965, :4435, :4886), so this row's own
+// VT_GDN_OUT_BF16=1 default plus the documented VT_GLUE_FUSE=0 rollback makes
+// bf16-in/f32-out a REACHABLE pair. That is why all four (Tin,Tout)
+// instantiations below are live: the dispatch reads out.dtype independently of
+// x.dtype, and narrowing it to the diagonal would drop a shipped combination.
+// Out-of-scope shapes keep RmsNormGatedRowKernel. The launch
 // uses kGatedFastBlock (=128) threads and reproduces shipped's reduction ORDER, so the
 // output is bit-identical for every dispatched (Tin,Tout).
 inline bool TryLaunchRmsNormGatedFast(cudaStream_t s, Tensor& out, const Tensor& x,

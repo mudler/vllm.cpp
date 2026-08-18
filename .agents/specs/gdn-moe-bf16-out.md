@@ -14,21 +14,81 @@ Secondary oracle: `sglang` @ `f63458b5be`, see [`.agents/oracles/sglang.md`](../
 
 ## Now
 
-Spec only. No product code is in this change, and nothing is measured. The next
-step belongs to a fresh implementer: write the red tests in `## Tests`, make the
-two coupled edits in `## Design`, and hand the result to a fresh reviewer. The
-speed and correctness gates in `## Gates` need the GPU host and belong to the
-operator.
+Both edits in `## Design` are implemented, on `row/GDN-MOE-BF16-OUT-IMPL` off
+`fd64c76ee`. `GdnOutDType()` takes no model-shape argument and resolves bf16 from
+`VT_GDN_OUT_BF16` alone, the three call sites drop `cfg.num_experts == 0`, and
+`detail::ShouldUsePackedGdnDecode` no longer carries `e.dense_model`. The env
+decision is extracted into the pure `detail::GdnOutBf16FlagIsOn(const char*)`,
+the second shape `## Tests` offers, because the resolver caches its `getenv` and
+a process can only observe one value of it.
 
-The row is `SPEC` until a fresh implementer claims the implementation. It cannot
-reach `DONE` on the 2.4T arm at all; see `## Scope`.
+**Nothing here is measured, and no GPU gate has run.** The row cannot reach
+`DONE` on this evidence. What ran and what is owed:
 
-Read `## Evidence` before starting. Four unmerged local branches touch activation
-dtypes on this model and none of them covers this row, but two of them collide
-with it: `row/REFACTOR-DTYPE-CONSISTENCY` relocates `GdnOutDType` verbatim into
-`activation_dtype.h`, and `row/PERF-GDN-BF16-CHAIN` uses the MoE f32 default as
-an eligibility bound that Edit 1 removes. Check which of them has landed before
-you edit.
+| Gate | Result |
+|---|---|
+| `test_qwen35_paged_forward` (CPU, the MoE reachability vehicle) | 5/5 cases, 13/13 assertions |
+| `test_qwen27_paged_forward` (CPU, the two predicates) | 31/31 cases, 770/770 assertions |
+| `test_ops_gdn`, `test_qwen27_dense_forward`, `test_qwen3_5_gdn_spec_routing`, `test_model_registry`, `test_runner`, the three expert-stream suites | all green on the CPU tier |
+| `scripts/agent-preflight.sh` | `PASS`, exit 0 |
+| full `ctest` | **not run.** The implementer's host had 6 GB free, and a full test build does not fit. `PENDING`, named resource |
+| `test_qwen27_paged_engine` 235/235 | **not run.** Skipped with `assertions: 0` — no 27B checkpoint and no GPU on the implementer's host. `PENDING` |
+| `test_qwen36_paged_engine` 315/315 | **not run.** `PENDING`, same reason. This is the row's ONE measurable checkpoint |
+| correctness on `nvidia/Qwen3.6-35B-A3B-NVFP4` | `PENDING`, GPU host |
+| `VT_GDN_OUT_BF16=0|1` same-binary speed A/B, per leaf | `PENDING`, GPU host |
+| `nsys --cuda-graph-trace=node` memory-format confirmation | `PENDING`, GPU host |
+| bf16 into `vt::RmsNormGatedQuantFp8` (the 35B's fp8 `out_proj` gated norm) | **not run.** Unreachable on the CPU tier: no fp8 `out_proj` on the synthetic model and no fp8 platform. `PENDING`, GPU host |
+| GGUF MoE | `PENDING`. See `## Stop conditions`: if it cannot be gated, do NOT reintroduce a shape term |
+| 2.4T | `PENDING`, named resource, by construction |
+
+The GPU gates belong to the operator, and the correctness gate comes first. A
+fresh reviewer sees the immutable head next; the mutation `## Design` names is to
+restore the `dense_model` form of `GdnOutDType` in a scratch copy, which must
+turn `test_qwen35_paged_forward`'s bf16 case red.
+
+**Fresh review 1 -> repair.** The reviewer confirmed both edits correct and bound
+by tests, and found the LEVER unpinned in one direction and a false-red generator
+in the other. `GdnOutDType()` mutated to `return DType::kBF16;` — severed from its
+parser and from `VT_GDN_OUT_BF16` entirely — left `test_qwen35_paged_forward` 5/5
+13/13 and `test_qwen27_paged_forward` 31/31 770/770 GREEN, while
+`VT_GDN_OUT_BF16=0` on the unmutated binary FAILED 4/5 cases 11/13 assertions
+because the new case asserted bf16 unconditionally and the resolver's cached
+`getenv` cannot be neutralised in-process. The rollback that the A/B above is
+built on was therefore both ungated and a red an operator would read as a
+regression. Repaired by giving the resolver a `detail::` declaration, asserting
+against the environment as the test file reads it directly, and registering the
+same binary a second time under `VT_GDN_OUT_BF16=0` — the shape
+`tests/CMakeLists.txt` already uses for a read-once lever. Both arms are now
+6/6 cases 15/15 assertions, and the severing mutation is RED in the `=0` arm
+(3 assertions across 2 cases).
+
+**The row now has a lifecycle surface.** `GDN-MOE-BF16-OUT` existed only in
+`.agents/issue-index.md` and in this file, so there was nothing to move when its
+state changed. It is recorded in [`.agents/kernel-matrix.md`](../kernel-matrix.md)
+beside `KERNEL-GDN-AOT-BF16`, at `GATING`: implemented, CPU tier green, every GPU
+gate `PENDING`. That gap came from the spec pull request rather than from the
+implementation. `KERNEL-GDN-AOT-BF16`'s own "Every 35B path stays f32" is
+corrected in the same edit, because Edit 1 is what makes it false — the same
+obligation as `## A record consequence outside this row`. `docs/STATUS.md` and
+`docs/BENCHMARKS.md` are written with it, because a new lifecycle state is a
+claim about the project and `scripts/check-doc-checkpoint.py` says so at the
+gate. Both entries say the same thing this section does: **no number, none
+claimed, every measurable axis owed to a GPU host.** An entry that recorded a
+capability without recording that nothing is measured would be the more
+misleading half.
+
+**The fp8-fused gated norm is OWED, not tested.** See `## Risks`: Test 3 cannot
+reach `vt::RmsNormGatedQuantFp8`, so bf16 has never entered that op on a real
+checkpoint. It belongs to the 35B GPU gate together with the rows above.
+
+**Collision check, run against `origin/main` at `fd64c76ee` before the edits:**
+neither collides yet. `row/REFACTOR-DTYPE-CONSISTENCY` has not landed —
+`include/vllm/model_executor/models/activation_dtype.h` does not exist on `main`,
+and the branch is still local. `row/PERF-GDN-BF16-CHAIN` has not landed either;
+the only `main` commit whose message names it is `918d4546e`
+(`PERF-FP8-ALPHA-FOLD`), which merely says it composes with that branch. Both
+still have to be reconciled onto this row's result when they land, which is what
+`## Owed` records.
 
 ## Scope
 
@@ -273,6 +333,13 @@ RED first, in this order. Capture each red result before the change.
    Assert: the default resolves bf16 with no model-shape input; `VT_GDN_OUT_BF16=0`
    resolves f32; `=1` resolves bf16. RED today for the MoE case.
    Mutation proof: restoring the `dense_model` branch must turn it red.
+   **Fresh review 1 added the missing half.** Pinning the extracted parser does
+   not pin that the RESOLVER reads it, and the two are separable in silence: see
+   `## Now`. The resolver therefore gets a `detail::` declaration and its own
+   case, and because it caches its `getenv` the two env values are two ctest
+   registrations of the same binary rather than two assertions in one process —
+   the `_glue_fuse_off` / `test_dense_gateup_fused_marlin_off_*` shape. Neither
+   case computes its expectation through the parser under test.
 2. **CPU tier, the eligibility predicate.** In
    `tests/vllm/models/test_qwen27_paged_forward.cpp`, a `GdnPackedDecodeEligibility`
    with every remaining term true selects packed decode without any model-shape
@@ -340,9 +407,16 @@ than as an omission.
   the merged arm slower while the split arm gets faster. It is a measurement, not
   a blocker, and it is why the A/B reports the two leaves separately.
 - **First bf16 exposure of the fp8-fused gated norm.** The 35B's `out_proj` is
-  W8A8 fp8, so it takes `vt::RmsNormGatedQuantFp8` (`:4768`); the 27B's is fp4 and
-  never did (`:4747-4748`). The op accepts bf16 and the CUDA kernel dispatches it,
-  but no gate has run that combination on a real checkpoint. Test 3 must reach it.
+  W8A8 fp8, so it takes `vt::RmsNormGatedQuantFp8` (`:4873`); the 27B's is fp4 and
+  never did (`:4896-4897`). The op accepts bf16 and the CUDA kernel dispatches it,
+  but no gate has run that combination on a real checkpoint. Test 3 was assigned
+  to reach it and **cannot**: the call is guarded by FOUR terms,
+  `!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+  supports_fp8()` (`:4854-4855`), the synthetic CPU model carries no
+  fp8 `out_proj`, and the CPU platform does not report fp8. So Test 3 exercises
+  the plain `vt::RmsNormGated` arm and this risk is UNMET on the CPU tier by
+  construction, not by omission. It is owed to the 35B GPU gate and recorded
+  under `## Now` and `## Owed`; do not read the sentence above as satisfied.
 - **GGUF MoE is unmeasured.** The comment being replaced named GGUF explicitly as
   an arm to leave alone. If the GGUF MoE arm cannot be gated in this row, see
   `## Stop conditions`.
@@ -451,6 +525,15 @@ mistake the silence for absence, and contradicts none of it.
   AOT arms are pinned to 48 or 32 linear V-heads, so `Qwen3.8-2.4T-A95B` (128)
   runs the hand CUDA kernels the vendoring exists to replace. Not measurable on
   this hardware.
+- **The first bf16 pass through `vt::RmsNormGatedQuantFp8`** (guard
+  `qwen3_5.cpp:4854-4855`, call `:4873`; reached only when
+  `!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+  supports_fp8()`). `## Risks` names
+  it and `## Tests` assigned it to Test 3, which cannot reach it on the CPU tier
+  for the two structural reasons recorded there. The op accepts bf16 and the CUDA
+  kernel dispatches it, so this is an unexercised combination rather than a known
+  defect — but nothing here has run it, and the 35B correctness gate is where it
+  first will. Owed to that gate; do not treat the Risks entry as discharged.
 - `row/PERF-GDN-BF16-CHAIN` (local, unmerged) — its lever's third term is
   `outdt == BF16` and it uses the MoE f32 default as an eligibility bound. Edit 1
   removes that bound. The branch's eligibility rule and Risks section need

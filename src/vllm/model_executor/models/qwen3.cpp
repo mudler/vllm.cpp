@@ -55,6 +55,8 @@
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIds seam
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vllm/model_executor/models/dense_attn_graph_break.h"  // CopyOutput(optional<DBuf>)
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK: the break-point seam
 #include "vt/ops.h"
 #include "vt/tenstorrent/tenstorrent_device.h"  // WarmRopeCosSin (item-5 TT-only)
 #include "vt/recipes.h"
@@ -132,14 +134,40 @@ void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
-  DBuf attn = AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T, tp);
+  // ENG-CUDAGRAPH-BREAK (#1163) W1 (#1192): THE DENSE ATTENTION ENTRY IS A BREAK
+  // POINT. The boundary is vLLM's, not ours to invent: its v1 default splits at
+  // `splitting_ops`, defaulted to the attention family
+  // (`vllm/config/compilation.py:517,764-772,1145` @ pin `5559679229`). The
+  // registration form is SGLang's, because vLLM gets its split from Dynamo and
+  // FX and we have no compiler: one line at the site, exactly as
+  // `layers/radix_attention.py:256` @ `f63458b5be`. THE SITE IS THE
+  // REGISTRATION.
+  //
+  // Destination form, because `AttnBlock` returns a FRESH pooled buffer on every
+  // call. The destination is a `vt::BreakSlot`, not a local `std::optional<DBuf>`:
+  // the following segment bakes the destination's address, and a plain local
+  // dies on this function's `return` while the pooled block it named goes back
+  // on the `DevicePool` free list — a host use-after-scope plus D1's reuse
+  // hazard, at the one site that has to obey the rule. The slot hands its
+  // storage to the seam on the capturing path and keeps it inline on the
+  // pass-through path.
+  //
+  // Outside a capture scope — which is every production step today, until W2
+  // migrates this model's decode driver onto the seam — `GraphBreak` moves the
+  // result into the slot and returns, so this is byte-identical to the
+  // `DBuf attn = AttnBlock(...)` it replaces, allocates nothing extra, and makes
+  // zero backend calls.
+  vt::BreakSlot<std::optional<DBuf>> attn;
+  vt::GraphBreak([&] { return AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T, tp); },
+                 attn);
+  DBuf& attn_buf = attn->value();
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   if (FusedChainAdoptEnabled()) {
-    vt::FusedChain(d.q, dh2.t(), attn.t(), w_post, &res.t(), vt::kFusedAddRmsNormStd, eps);
+    vt::FusedChain(d.q, dh2.t(), attn_buf.t(), w_post, &res.t(), vt::kFusedAddRmsNormStd, eps);
   } else {
-    vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
+    vt::RmsNorm(d.q, dh2.t(), attn_buf.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
   hidden = MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);

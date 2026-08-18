@@ -62,6 +62,31 @@ def _status_lines(state: dict) -> list[str]:
     return lines
 
 
+def _environment_actions(state: dict) -> list[str]:
+    """Route an unresolved .env to ask-and-record, never to a default.
+
+    Status was the whole report until issue #1190: a session read
+    `environment: missing` and got no next action, so what it fell back to in
+    practice was a host name copied out of a document. The route never names
+    WHICH key is unset, because that is the caller's own state and can carry a
+    secret, and it never writes the file here, because the value has to come
+    from the developer. agent-onboard.py owns the write and refuses any key
+    .env.example does not declare.
+    """
+    status = state.get("env")
+    if status == "present":
+        return []
+    return [
+        f"NO ENVIRONMENT: .env is {status or 'unavailable'}.",
+        "  Ask the developer for the ONE value the current gate needs,",
+        "  then record it, and leave every other key empty:",
+        "  scripts/agent-onboard.py --env-set KEY=VALUE",
+        "  An unanswered key stays empty and its gate stays PENDING.",
+        "  Never infer a value, and never take a host or a path from a",
+        "  document instead of asking.",
+    ]
+
+
 def _claim_command(intent: str, row: str | None, headless: bool) -> str:
     parts = ["scripts/agent-role.py", "claim", intent]
     if intent == "helper" and row:
@@ -102,7 +127,8 @@ def _declared_actions(
             "1. Confirm this inherited role fits the current request.",
             "2. Run scripts/agent-preflight.sh.",
             "3. Use the printed .agents/NOW.md as the live snapshot.",
-            "4. Read .agents/developer-preferences.md when it exists.",
+            "4. Read .agents/developer-preferences.md, and create it from",
+            "   .agents/developer-preferences.example.md when it is absent.",
             "5. Resume the row from .agents/coordination.md and",
             "   structured state event anchors that apply to this claim.",
         ]
@@ -178,6 +204,9 @@ def render_route(
         actions = _declared_actions(state, intent, headless)
     else:
         actions = _undeclared_actions(state, intent, row, headless)
+    # Appended to every route, declared or not, because an unresolved .env
+    # blocks the same gates whatever role the session holds.
+    actions.extend(_environment_actions(state))
     sections.append(f"{ACTIONS_BEGIN}\n" + "\n".join(actions) + f"\n{ACTIONS_END}")
     return "\n\n".join(sections)
 

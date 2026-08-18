@@ -204,6 +204,40 @@ refused, `scripts/agent-role.py show` lists the other live coordinators, and
 concurrent coordinators safe is that `main` is never force-pushed, so a plain
 `git push` refuses any non-fast-forward.
 
+### `.env`: your values, and what happens when it is missing
+
+`.env` is untracked, so a fresh clone and every linked worktree start without
+one. `scripts/agent-start.py` reports that as `environment: missing`,
+`incomplete`, or `unreadable`, and prints what to do about it. The route is ask
+and then record. It never guesses a value, and it never falls back to a host
+name or a path written in a repository document, because that is another
+developer's resolved value.
+
+Record one answered value with the writer that owns the file:
+
+```sh
+scripts/agent-onboard.py --env-set GATE_HOST=my-gate-box
+```
+
+It seeds `.env` from `.env.example` on first use, so every other key survives
+commented and empty, and it refuses any key `.env.example` does not declare.
+Leave a key empty when your setup does not have the thing. Empty means
+unavailable, and the gates that need it stay `PENDING` for you.
+
+Three keys name where the hardware gate runs, and a gate script refuses by name
+rather than guessing when one it needs is unset:
+
+| Key | Value |
+|---|---|
+| `GATE_HOST` | The box the hardware gates run on |
+| `GATE_DEVICE` | Its resource-controller device, as `<box>:<device>`, for example `dgx:gpu0`. `rc devices` lists the fleet |
+| `GATE_CHECKOUT` | The repository checkout on that box, which remote gate commands enter before they build |
+
+`SHARED_STORAGE_ROOT` names the mount point of shared storage when it is a
+network share, and `CHECKPOINT_ROOT` names the checkpoint directory inside it.
+The two are separate because a leased worker or a container can see the same
+folder under a different path.
+
 ### `GPU_LOCK`: one file mutex, and only one
 
 Copy `.env.example` to `.env` and load it with `set -a; . ./.env; set +a`. Every
@@ -4051,6 +4085,42 @@ late failure back. It does not make the model fit.
 on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
 honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 (125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
+## Turning CUDA graph capture off, including the break seam
+
+`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It always did for the six
+batched decode drivers that each read it, and as of `ENG-CUDAGRAPH-BREAK` W1
+(#1192) it is also the switch the shared break-point seam reads, once per
+process, into a function-local static — so a process is in exactly one lane for
+its whole life and nothing can toggle it mid-run.
+
+With capture off, or on a backend that reports no capture support (Vulkan,
+Metal, and the CPU backend), a `vt::GraphCaptureScope` is INERT: it captures
+nothing, every `vt::GraphBreak` inside it calls its function and returns, and
+the forward runs eager exactly as before. That path is byte-identical to the
+non-capturing forward and makes zero backend calls, which is what makes each
+migration stage reversible.
+
+Nothing about this is new configuration to learn: there is no new flag, no new
+config key and no new command. The seam is a library surface
+(`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
+attention entry of `Qwen3ForCausalLM`. No production step opens a capture scope
+yet — that arrives when the decode drivers migrate onto the seam — so today the
+switch changes nothing about the break point beyond what it already changed
+about the decode graphs.
+
+Building it needs no option. `src/vt/breakable_graph.cpp` is part of the core
+`vllm` library on every platform, because the seam is backend-agnostic and asks
+nothing new of any backend.
+
+The switch is GATED, and it is gated in a child process, because it is read once
+per process into a function-local static and no test in a running process can
+toggle it. `tests/vt/test_breakable_graph.cpp` re-executes itself with
+`VLLM_CPP_CUDAGRAPH=0` and requires the inert behaviour on a backend that CAN
+capture — the arm that proves the switch itself is what turns capture off, rather
+than the backend's own lack of support. Asserting the backend arm instead
+substitutes a different condition, and dropping the switch from the seam left the
+whole suite green.
 
 ## SSE keepalives on long prefill
 

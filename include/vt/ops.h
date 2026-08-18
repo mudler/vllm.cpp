@@ -423,6 +423,16 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kConv1d,
   kConvTranspose1d,
+  // --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 milestone M1). The DYNAMIC
+  // per-token, per-group fp8 activation quant that a 128x128 block-scaled FP8
+  // GEMM consumes. It is not a parameter of kQuantFp8Static: that op takes ONE
+  // static per-tensor scale from the checkpoint and emits no scale tensor at
+  // all, while this one derives a scale per (row, group) at run time and emits
+  // an f32 [M, K/group_size] second output. The nearest existing shape is
+  // kScaledFp4Quant, which is dynamic per-token with a 2-D scale as well.
+  // See vt::QuantFp8Group below for the contract.
+  // Appended before kCount so no existing op's id shifts.
+  kQuantFp8Group,
   kCount
 };
 
@@ -922,6 +932,10 @@ using MatmulFp8CublasLtFn =
 using MatmulFp8CublasLtAlphaVecFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/, bool);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
+// Two outputs, because the scale is computed rather than supplied: the fp8 bytes
+// and the f32 [M, K/group_size] per-group scale.
+using QuantFp8GroupFn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor& /*out_scale*/,
+                                 const Tensor& /*x*/, int /*group_size*/);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
                                    const RmsNormArgs&, Tensor* /*residual*/, float /*input_scale*/);
@@ -1520,6 +1534,53 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
 // i8 (raw fp8-e4m3fn bytes). CUDA + CPU (the CPU arm is the portable reference
 // that makes the fp8 seam testable without a GPU, #468).
 void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale);
+
+// --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 M1,
+// .agents/specs/vt-quant-fp8-group.md). QuantFp8Group is the DYNAMIC per-token,
+// per-group sibling of QuantFp8Static: the scale is derived from the data, once
+// per contiguous run of `group_size` elements inside a row, and written out.
+//
+//   amax = max(1e-10, max |x_f32| over the group)
+//   y_s  = amax / 448.0f
+//   out_fp8[i] = fp8_e4m3( min(max(x_f32[i] / y_s, -448.0f), 448.0f) )
+//   out_scale[row, group] = y_s
+//
+// x [M,K] f32/bf16, out_fp8 [M,K] i8 (raw fp8-e4m3fn bytes), out_scale
+// [M, K/group_size] F32 — f32 because upstream allocates it f32 and the GEMM
+// that consumes it multiplies in f32 (fp8_utils.py:629-631). K must be a
+// multiple of group_size; the op refuses any other K by name, as upstream
+// asserts at fp8_utils.py:596-599. CPU + CUDA.
+//
+// WHICH UPSTREAM ARM THIS MIRRORS, because there are two and they DISAGREE.
+// `per_token_group_quant_fp8` reads like a Triton kernel with a C++ fast path
+// and it is the other way round: on a CUDA-alike platform with a contiguous
+// input it calls the C++ custom op and RETURNS (fp8_utils.py:635-650), so the
+// Triton kernel never executes there. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps           — eps SEEDS the reduction, so an
+//                                             all-zero group cannot divide by 0
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit                    — a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)     — a DIVIDE
+//   :86  DST_DTYPE(q)                       — hardware e4m3 RNE, saturating
+// DO NOT "correct" either divide into a hoisted reciprocal multiply to match
+// QuantFp8Static's form. That form is right for QuantFp8Static because upstream
+// ships it there (common.cuh:62 with the reciprocal formed by the caller); here
+// upstream ships a divide, the scale changes per group so nothing is
+// loop-invariant, and the Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) carries an upstream comment naming the 1-ULP gap it opens.
+// One f32 ulp before an e4m3 round changes the emitted byte near a tie, and
+// upstream's own test cannot see it: it compares values at rtol=0.15 and the
+// scale at rtol=1e-5 (test_block_fp8.py:112-115). Only a byte comparison can,
+// which is what tests/vt/test_ops_quant_fp8_group_cpu.cpp G1 is.
+//
+// The column-major and TMA-aligned scale layouts (fp8_utils.py:610-628) and the
+// `use_ue8m0` DeepGEMM scale rounding (per_token_group_quant.cu:69-71) are NOT
+// implemented. Both are recorded under `## Owed` in the row's spec; no consumer
+// in this tree can read either yet, and upstream excludes the target model from
+// DeepGEMM on family 120 (vllm/utils/deep_gemm.py:27-46).
+void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                   int group_size);
 
 // RmsNormQuantFp8 (fused fp8 RMSNorm -> static per-tensor activation quant). One
 // HBM pass mirrors vLLM's Inductor `fused_add_rms_norm_static_fp8_quant`

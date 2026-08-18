@@ -402,8 +402,25 @@ vllm_cpp_add_test(test_fp8_block_quant
   vllm/model_executor/layers/test_fp8_block_quant.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
+# GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
+# lives in the not-installed qwen3_5_internal.h, beside the other detail:: seams.
+target_include_directories(test_qwen35_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# GDN-MOE-BF16-OUT (#1168), fresh-review repair. `GdnOutDType()` caches its
+# getenv in a function-local static, so one process observes exactly ONE value of
+# VT_GDN_OUT_BF16 and a single run cannot tell a resolver that READS the lever
+# from one that was hardwired to its default answer — the mutation
+# `return DType::kBF16;` left this binary 5/5 13/13. Re-run the SAME binary with
+# the lever forced to 0, the shape `_glue_fuse_off` and
+# `test_dense_gateup_fused_marlin_off_*` above already use. This is also the
+# documented f32 rollback and the denominator of the row's same-binary A/B, so
+# without this entry the arm an operator is told to run is ungated.
+add_test(NAME test_qwen35_paged_forward_gdn_out_f32
+  COMMAND test_qwen35_paged_forward)
+set_tests_properties(test_qwen35_paged_forward_gdn_out_f32 PROPERTIES
+  ENVIRONMENT "VT_GDN_OUT_BF16=0")
 # MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
 # and the forked VL forward actually CONSUMES the merger rows.
 vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)
@@ -1670,6 +1687,7 @@ target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src
 # resident), never freed, so a device pointer baked into a captured pure-decode CUDA
 # graph stays valid — the fix for the 35B c2+ online-serving illegal-memory-access.
 # The device proof is the DGX serving harness; this pins the never-free guarantee.
+vllm_cpp_add_test(test_breakable_graph vt/test_breakable_graph.cpp)
 vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
 target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_graph_dedup vt/test_graph_dedup.cpp)
@@ -1721,6 +1739,10 @@ vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
 # box with NO GPU by construction — that is the point of the row — and carries a
 # CUDA-gated arm (G2) for CPU-vs-CUDA byte agreement wherever a device exists.
 vllm_cpp_add_test(test_ops_fp8_cpu vt/test_ops_fp8_cpu.cpp)
+# VT-QUANT-FP8-GROUP (#1189 M1): the dynamic per-token per-group fp8 activation
+# quant. CPU-gateable by construction; its CPU-vs-CUDA byte-identity arm (G6) is
+# CUDA-gated and reports PENDING rather than skipping where no device exists.
+vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.cpp)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the

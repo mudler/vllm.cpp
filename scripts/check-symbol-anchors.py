@@ -317,19 +317,19 @@ def check_upstream(root: Path, upstream_root: Path, counts: Counts) -> list[str]
 
 # (name, citing text, cited path, cited body, stale)
 FIXTURES = (
-    ("fresh", "`src/a.cpp::Widget`", "src/a.cpp", "struct Widget {};\n", False),
-    ("renamed", "`src/a.cpp::Widget`", "src/a.cpp", "struct Gadget {};\n", True),
-    ("call site counts", "`src/a.cpp::Load`", "src/a.cpp", "  Registry::Load(x);\n", False),
-    ("qualified", "`src/a.cpp::Registry::Load`", "src/a.cpp", "  Registry::Load(x);\n", False),
+    ("fresh", "`alpha/beta/a.cpp::Widget`", "alpha/beta/a.cpp", "struct Widget {};\n", False),
+    ("renamed", "`alpha/beta/a.cpp::Widget`", "alpha/beta/a.cpp", "struct Gadget {};\n", True),
+    ("call site counts", "`alpha/beta/a.cpp::Load`", "alpha/beta/a.cpp", "  Registry::Load(x);\n", False),
+    ("qualified", "`alpha/beta/a.cpp::Registry::Load`", "alpha/beta/a.cpp", "  Registry::Load(x);\n", False),
     (
         "qualified miss",
-        "`src/a.cpp::Registry::Load`",
-        "src/a.cpp",
+        "`alpha/beta/a.cpp::Registry::Load`",
+        "alpha/beta/a.cpp",
         "  Other::Load(x);\n",
         True,
     ),
-    ("prefix is not a word", "`src/a.cpp::Load`", "src/a.cpp", "  LoadShards(x);\n", True),
-    ("suffix is not a word", "`src/a.cpp::Shards`", "src/a.cpp", "  LoadShards(x);\n", True),
+    ("prefix is not a word", "`alpha/beta/a.cpp::Load`", "alpha/beta/a.cpp", "  LoadShards(x);\n", True),
+    ("suffix is not a word", "`alpha/beta/a.cpp::Shards`", "alpha/beta/a.cpp", "  LoadShards(x);\n", True),
 )
 
 
@@ -340,7 +340,7 @@ def self_test() -> int:
     for name, citing, cited_path, cited_body, stale in FIXTURES:
         with tempfile.TemporaryDirectory() as raw:
             box = Path(raw)
-            (box / "src").mkdir(parents=True, exist_ok=True)
+            (box / "alpha/beta").mkdir(parents=True, exist_ok=True)
             (box / cited_path).write_text(cited_body, encoding="utf-8")
             (box / "note.md").write_text(f"see {citing} for the shape\n", encoding="utf-8")
             counts, errors = check_tree(box)

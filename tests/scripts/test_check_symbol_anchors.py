@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Unit and mutation checks for scripts/check-symbol-anchors.py (#1143, #1139).
 
+Fixture paths are `alpha/beta/...`, not `src/vllm/...`, and that is load-bearing.
+This file is scanned by the checker it tests, so a fixture written as a real
+local path is a real citation of a file that does not exist -- twelve of them,
+which is how the first committed version reported itself red. `alpha/` exists
+in no tree, so the fixtures fall into the skipped upstream bucket in the real
+repository while still resolving inside each temporary one.
+
 The case this suite exists to pin is `test_verdict_depends_on_the_citing_text`.
 #911 shipped an anchor checker that read its expectation out of the file it was
 checking and reported 27/27 FRESH while five anchors pointed at unrelated code.
@@ -74,15 +81,15 @@ class SymbolAnchorTests(unittest.TestCase):
         self.assertEqual(int(match.group(3)), 0, result.stdout)
 
     def test_fresh_symbol_passes(self):
-        with Tree("src/vllm/a.cpp", "struct Widget {};\n",
-                  "see `src/vllm/a.cpp::Widget`\n") as root:
+        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+                  "see `alpha/beta/a.cpp::Widget`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("in-repo checked 1 (fresh 1, stale 0)", result.stdout)
 
     def test_renamed_symbol_is_reported(self):
-        with Tree("src/vllm/a.cpp", "struct Gadget {};\n",
-                  "see `src/vllm/a.cpp::Widget`\n") as root:
+        with Tree("alpha/beta/a.cpp", "struct Gadget {};\n",
+                  "see `alpha/beta/a.cpp::Widget`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("does not contain `Widget`", result.stdout)
@@ -96,9 +103,9 @@ class SymbolAnchorTests(unittest.TestCase):
         """
 
         body = "struct Widget {};\n"
-        with Tree("src/vllm/a.cpp", body, "`src/vllm/a.cpp::Widget`\n") as root:
+        with Tree("alpha/beta/a.cpp", body, "`alpha/beta/a.cpp::Widget`\n") as root:
             good = run("--root", str(root))
-        with Tree("src/vllm/a.cpp", body, "`src/vllm/a.cpp::Gadget`\n") as root:
+        with Tree("alpha/beta/a.cpp", body, "`alpha/beta/a.cpp::Gadget`\n") as root:
             bad = run("--root", str(root))
         self.assertEqual(good.returncode, 0, good.stdout)
         self.assertEqual(bad.returncode, 1, bad.stdout)
@@ -106,50 +113,50 @@ class SymbolAnchorTests(unittest.TestCase):
         self.assertIn("fresh 0, stale 1", bad.stdout)
 
     def test_a_call_site_satisfies_a_citation(self):
-        with Tree("src/vllm/a.cpp", "  ModelRegistry::Load(config);\n",
-                  "`src/vllm/a.cpp::ModelRegistry::Load`\n") as root:
+        with Tree("alpha/beta/a.cpp", "  ModelRegistry::Load(config);\n",
+                  "`alpha/beta/a.cpp::ModelRegistry::Load`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_a_longer_identifier_does_not_satisfy_a_shorter_citation(self):
-        with Tree("src/vllm/a.cpp", "  LoadShards(dir);\n",
-                  "`src/vllm/a.cpp::Load`\n") as root:
+        with Tree("alpha/beta/a.cpp", "  LoadShards(dir);\n",
+                  "`alpha/beta/a.cpp::Load`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 1, result.stdout)
 
     def test_a_local_path_that_does_not_exist_is_reported(self):
-        with Tree("src/vllm/a.cpp", "struct Widget {};\n",
-                  "`src/vllm/a.cpp::Widget` and `src/vllm/gone.cpp::Widget`\n") as root:
+        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+                  "`alpha/beta/a.cpp::Widget` and `alpha/beta/gone.cpp::Widget`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("names a path under this repository that does not exist", result.stdout)
 
     def test_an_upstream_path_is_bucketed_not_failed(self):
-        with Tree("src/vllm/a.cpp", "struct Widget {};\n",
-                  "`src/vllm/a.cpp::Widget` and `vllm/config/model.py::ModelConfig`\n") as root:
+        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+                  "`alpha/beta/a.cpp::Widget` and `vllm/config/model.py::ModelConfig`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("upstream/unknown 1", result.stdout)
 
     def test_zero_checked_citations_is_a_failure(self):
-        with Tree("src/vllm/a.cpp", "struct Widget {};\n",
+        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
                   "`vllm/config/model.py::ModelConfig` only\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("0 in-repo citations were checked", result.stdout)
 
     def test_the_frozen_archive_is_skipped_and_counted(self):
-        with Tree("src/vllm/a.cpp", "struct Widget {};\n",
-                  "`src/vllm/a.cpp::Gadget` is stale here\n",
+        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+                  "`alpha/beta/a.cpp::Gadget` is stale here\n",
                   citing_path=".agents/completed/old/STATE-1.md") as root:
-            (root / "live.md").write_text("`src/vllm/a.cpp::Widget`\n", encoding="utf-8")
+            (root / "live.md").write_text("`alpha/beta/a.cpp::Widget`\n", encoding="utf-8")
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("1 frozen files skipped", result.stdout)
 
     def test_prose_without_a_path_is_not_a_citation(self):
-        with Tree("src/vllm/a.cpp", "struct Widget {};\n",
-                  "`Qwen3_5MTPKind::kMoe` and `src/vllm/a.cpp::Widget`\n") as root:
+        with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
+                  "`Qwen3_5MTPKind::kMoe` and `alpha/beta/a.cpp::Widget`\n") as root:
             result = run("--root", str(root))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("1 citations", result.stdout)

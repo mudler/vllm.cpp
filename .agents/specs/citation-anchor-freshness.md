@@ -9,7 +9,7 @@ owning capability row and does not belong in a capability matrix.
 
 ## Now
 
-`GATE-SYMBOL-ANCHORS` ships green. 85 in-repo symbol anchors are checked on
+`GATE-SYMBOL-ANCHORS` ships green. 86 in-repo symbol anchors are checked on
 every run, 26 of them converted here; 96 `model_loader.cpp` line citations
 remain unconverted and are listed under `## Owed`.
 
@@ -56,7 +56,7 @@ Option 4 wins on one observation the other three miss: **the convention already
 exists in this tree.** 539 `` `path::Symbol` `` citations are already written,
 `.agents/model-matrix.md` uses the form for every upstream model anchor, and
 they had never been checked. This change is not an invention, it is finishing
-something half-adopted — which is why the gate lands green over 85 anchors
+something half-adopted — which is why the gate lands green over 86 anchors
 instead of needing a flag day.
 
 It also resolves the tautology hazard structurally rather than by care. Under
@@ -132,9 +132,11 @@ Registered in `scripts/agent-preflight.sh` (`CHECKERS` and `SUITES`) and in
 
 ## Evidence
 
-**Tree, after conversion.** 565 citations in 2750 scanned files, 180 frozen
-files skipped; in-repo checked 85 (fresh 85, stale 0); upstream/unknown 475;
-ambiguous basename 5; missing local path 0. `rc=0`.
+**Tree, after conversion and after merging `origin/main`.** 592 citations in
+2754 scanned files, 180 frozen files skipped; in-repo checked 86 (fresh 86,
+stale 0); upstream/unknown 501; ambiguous basename 5; missing local path 0.
+`rc=0`. 59 of the 86 were already in the tree and had never been checked; 26
+were converted here, and one arrived with `origin/main`.
 
 **Upstream mode, at the pin.** 354 upstream anchors checked against
 `5559679229bc961848b121ccdeaa8fa5d79bec98`: 343 fresh, 0 stale, 11 naming a file
@@ -156,6 +158,19 @@ that decides the convention.
 Every mutation restored byte-for-byte, verified by sha256. The
 `DISABLED_CREATION_CHECKER` stub registered in `scripts/check-pr-size.py` fails
 12 of the 13 cases, so the creation contract is rejected rather than satisfied.
+
+### The gate caught this change
+
+`tests/scripts/test_check_symbol_anchors.py` first wrote its fixtures as
+`src/vllm/a.cpp`. Untracked, it was invisible to `git ls-files` and the run was
+green. The first commit made it tracked, and the checker immediately reported
+twelve citations of a file that does not exist — in its own test file. That is
+the failure this change exists to stop, arriving inside the pull request that
+stops it, and it is why the fixtures are now `alpha/beta/...`: a directory that
+exists in no tree falls into the skipped bucket in the real repository while
+still resolving inside each temporary one. It also says something about the
+instrument: an untracked file is not scanned, so a green run before `git add` is
+not a green run.
 
 ## Converted here, and verified how
 

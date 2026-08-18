@@ -22678,3 +22678,90 @@ consecutive reps** — a ~2x spread that averages to a plausible-looking and
 entirely fictional number. The figures above use 8 prompts with a discarded
 warmup, where both sides hold to ~±0.3 ms. A two-request rate harness is not a
 measurement of this axis; it is a coin flip with a mean.
+
+## ENG-CUDAGRAPH-BREAK W1 — the measurement that was NOT taken, and the one that was (2026-08-18, #1192)
+
+**No throughput number was taken, and none is owed.** This is a coverage and
+correctness row. A speed claim from the break-point seam is admissible only after
+naming a path that is BOTH currently eager AND currently host-bound, and stating
+how the host-bound part is measured. Our prefill is neither: GB10 measured idle
+between launches at 3.8% with GPU-busy above 96%, and the 27B prefill gap at
+92.5% non-GEMM glue GPU work. Decode is already captured and already banked its
+launch-overhead win. The refutation is dated and hardware-specific rather than
+permanent; the burden is on a later claimant to name the path.
+
+**What W1 did measure is a CAPABILITY, not a rate.** W0 deliberately left open
+whether CUDA permits `cudaStreamEndCapture` followed by `cudaStreamBeginCapture`
+on the same stream mid-forward with eager work between them, on our stream
+configuration. SGLang does exactly this on a production path at the pinned
+revision, which is strong evidence and was not our measurement.
+
+Measured on `orin:gpu0` through an `rc` lease, driver `12060`, under
+`cudaStreamCaptureModeThreadLocal` — the mode `src/vt/cuda/cuda_backend.cu:204`
+uses. The probe runs the seam's own shape rather than a toy: segment,
+host-dependent eager break on the same stream, RE-BEGIN, segment, bare zero-work
+re-begin, segment. Then three replays with fresh inputs. Result: every re-begin
+legal, 0 mismatches on all three replays. The bare re-begin
+(`breakable_cuda_graph.py:370-374`) is legal too.
+
+**The first two probe runs REFUSED, and both refusals were the probe's.** This is
+the entry worth reading before anyone re-runs this lever. Binding the CUDA driver
+API through `dlsym` on the BARE symbol name gets `libcuda`'s LEGACY v1 entry
+points, which are not capture-aware: `cuMemcpyDtoDAsync` (v1) returned
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` inside a capture that is in fact legal,
+and `cuStreamBeginCapture` (v1) takes NO capture-mode argument, so the probe
+believed it was exercising the thread-local mode while exercising the global one.
+Preferring `_v3` blindly then bound `cuCtxCreate_v3`, which takes two extra
+parameters, and context creation failed `CUDA_ERROR_INVALID_DEVICE`. Both
+readings presented as a verdict about the DESIGN. Bound by exact versioned name,
+the criterion holds. An instrument that can fail toward a code verdict has to
+assert its own precondition first.
+
+**A second run on GB10 (`dgx:gpu0`) compiled and did not execute**, for a reason
+that is also not CUDA's: `nvcc` produced the binary under `/workspace`, which on
+that host is a CIFS mount storing `file_mode=0664`, so the run exited 126
+`Permission denied`. `BUILD_STATUS=0` on `NVIDIA GB10` is recorded; the execution
+belongs on container-local disk.
+
+**The correctness number that IS recorded** is not a rate either: the Qwen3 dense
+forward run with a capture scope open produces logits BIT-IDENTICAL to the same
+forward with no scope — 500 values compared, 0 differing
+(`tests/vllm/models/test_qwen3_break_point.cpp`). That is what makes the stage
+reversible, and it is the polarity AGENTS.md requires when a greedy path exists.
+
+**THE PROBE IS IN THE TREE, and here is how to run it.** A measurement that
+produced two false refusals, each presenting as a verdict about the design, is
+the last one anybody should have to reconstruct from prose. The first record of
+it named neither an artifact nor a recipe; this one does.
+
+| Artifact | Path | sha256 | Lines |
+|---|---|---|---|
+| driver-API probe (`dlsym`, no toolkit, no headers) | `scripts/probe_cudagraph_rebegin.c` | `dbf95d69d396e7f3a41c754ccedda59ef076a1dd30960d2c738a1c26fe238297` | 246 |
+| runtime-API probe (needs `nvcc`) | `scripts/probe_cudagraph_rebegin.cu` | `ce73250331af5bc3eb8b560176e60a07f77476dcff60b81a0b0d7caea6f20bed` | 167 |
+
+Both exercise the SEAM's shape rather than a toy — segment, host-dependent eager
+break on the same stream, RE-BEGIN, segment, bare zero-work re-begin, segment,
+then three replays with fresh inputs — and both print a single
+`VERDICT: REBEGIN_HOLDS` or a named refusal. Recipe, on a leased device:
+
+```sh
+# driver-API build: no CUDA toolkit needed, links libdl and binds libcuda at run time
+cc -O1 -o probe scripts/probe_cudagraph_rebegin.c -ldl && ./probe; echo "PROBE_EXIT=$?"
+
+# runtime-API build
+nvcc -O1 -arch=native -o probe scripts/probe_cudagraph_rebegin.cu || \
+  nvcc -O1 -o probe scripts/probe_cudagraph_rebegin.cu
+echo "BUILD_STATUS=$?"; ./probe; echo "PROBE_EXIT=$?"
+```
+
+Build it on CONTAINER-LOCAL disk. The `dgx:gpu0` run compiled under `/workspace`,
+which on that host is a CIFS mount storing `file_mode=0664`, and exited 126
+`Permission denied` — `BUILD_STATUS=0` with nothing executed, which is a build
+result wearing a measurement's clothes.
+
+**What is NOT recoverable, stated plainly rather than reconstructed.** The
+`orin:gpu0` run's own driver script and its raw stdout were not retained. The
+verdict above therefore rests on the recorded reading, and the only way to
+re-derive it is to re-run the committed source under the recipe above on a leased
+GPU. Nothing here was re-run for this record: the repair pass that added it had
+no GPU lease.

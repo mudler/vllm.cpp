@@ -673,6 +673,50 @@ void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x
   reinterpret_cast<QuantFp8GroupFn>(GetOp(OpId::kQuantFp8Group, q.device.type))(
       q, out_fp8, out_scale, x, group_size);
 }
+void MatmulFp8BlockScaled(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
+                          const Tensor& b_fp8, const Tensor& b_scale, int block_n,
+                          int block_k) {
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && a_scale.rank == 2 && b_fp8.rank == 2 &&
+               b_scale.rank == 2,
+           "matmul_fp8_block_scaled: out/a_fp8/a_scale/b_fp8/b_scale must be rank-2");
+  // Validated BEFORE either one divides anything: `x / 0` and `x % 0` are
+  // undefined behaviour, so a zero must refuse rather than trap.
+  VT_CHECK(block_n > 0 && block_k > 0,
+           "matmul_fp8_block_scaled: block_n and block_k must be positive");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1];
+  const int64_t n = b_fp8.shape[0];
+  // Upstream: `assert A.shape[-1] == B.shape[-1]` (quant_utils.py:111).
+  VT_CHECK(b_fp8.shape[1] == k,
+           "matmul_fp8_block_scaled: a_fp8 [M,K] and b_fp8 [N,K] must share K");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_fp8_block_scaled: out must be [M,N]");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_block_scaled: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  // f32, not the model dtype: upstream refuses any other scale dtype on this
+  // path (csrc/.../w8a8/cutlass/c3x/scaled_mm_helper.hpp:15-18) and the
+  // accumulator these multiply into is f32.
+  VT_CHECK(a_scale.dtype == DType::kF32 && b_scale.dtype == DType::kF32,
+           "matmul_fp8_block_scaled: a_scale/b_scale must be f32");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "matmul_fp8_block_scaled: out must be f32 or bf16");
+  // CEIL on every tiling, so a ragged final block is legal: upstream asserts
+  // `triton.cdiv(N, block_n) == Bs.shape[0]` and
+  // `triton.cdiv(K, block_k) == Bs.shape[1]` (fp8_utils.py:935-936), and
+  // `triton.cdiv(A.shape[-1], block_k) == As.shape[-1]` (fp8_utils.py:930).
+  const int64_t k_tiles = (k + block_k - 1) / block_k;
+  const int64_t n_tiles = (n + block_n - 1) / block_n;
+  VT_CHECK(a_scale.shape[0] == m && a_scale.shape[1] == k_tiles,
+           "matmul_fp8_block_scaled: a_scale must be [M, cdiv(K, block_k)]");
+  VT_CHECK(b_scale.shape[0] == n_tiles && b_scale.shape[1] == k_tiles,
+           "matmul_fp8_block_scaled: b_scale must be [cdiv(N, block_n), cdiv(K, block_k)]");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && a_scale.IsContiguous() &&
+               b_fp8.IsContiguous() && b_scale.IsContiguous(),
+           "matmul_fp8_block_scaled: contiguous tensors required");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && a_scale.device == q.device &&
+               b_fp8.device == q.device && b_scale.device == q.device,
+           "matmul_fp8_block_scaled: device mismatch (out/a_fp8/a_scale/b_fp8/b_scale/queue)");
+  reinterpret_cast<MatmulFp8BlockScaledFn>(GetOp(OpId::kMatmulFp8BlockScaled, q.device.type))(
+      q, out, a_fp8, a_scale, b_fp8, b_scale, block_n, block_k);
+}
 void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
                      const Tensor& weight, const RmsNormArgs& args, Tensor* residual,
                      float input_scale) {

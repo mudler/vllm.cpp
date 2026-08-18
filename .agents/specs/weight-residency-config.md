@@ -539,10 +539,30 @@ table.** Each of those deletes the assignment the wave adds, which is the state 
 the tree before the wave, and each turns its suite red.
 
 **The three `test_gguf_device_fit_reach` cases were written AFTER the resolver, so
-their red is M7 rather than a pre-implementation run.** M7 restores
-`DeviceWeightBudgetBytes`'s pre-#1127 body — the environment grammar and the probe,
-with no config tier — and the suite goes red with 8 cases. Recorded as the weaker
-order it was, not as a red-first run it was not.
+their red is a mutation rather than a pre-implementation run — and it takes THREE
+mutations, not one.** This first said "their red is M7", which is true of ONE case
+out of the three. M7 restores `DeviceWeightBudgetBytes`'s pre-#1127 body — the
+environment grammar and the probe, with no config tier — and it kills the case that
+carries the budget in as a config key with no variable set. The other two are pinned
+elsewhere. Measured in the review repair, whole binaries, the failing case names read
+off the doctest output rather than inferred:
+
+| case | killed by | and NOT by, because |
+|---|---|---|
+| the budget arrives as a CONFIG KEY, with no variable set | M7, M12 | M4 — the case sets no variable, so inverting the precedence changes nothing |
+| a config budget of ZERO suppresses the refusal | M12 alone | M7 — it touches neither the install nor the read-back; M4 — there is no variable for the config to beat |
+| the VARIABLE beats the config key, through the loader | M4 alone | M7 and M12 — both leave the variable in force, and the variable winning is what this case asserts |
+
+**And the ZERO case's "no refusal" half is VACUOUS on that fixture.** The fake
+staging platform probes 0 and `CheckDeviceWeightFit` reads a zero budget as
+UNKNOWN, so no refusal fires whether the configured zero arrives or not. That half
+distinguishes nothing there. The case's one discriminating assertion is the
+read-back `installed.device_weight_budget_bytes == 0`, which is exactly why M12 —
+the mutation that removes the install — is the only one of the three that kills it.
+The case comment in the file says this; the spec did not, and a reader of the spec
+alone would have counted a guarantee the fixture cannot give. The positive control
+for the refusal direction is the CONFIG KEY case above it, on the same file and the
+same platform.
 
 **Mutations.** Twelve, each applied alone from a pristine byte copy, with the
 file's sha256 printed before and after so a never-applied edit cannot read as a
@@ -585,6 +605,143 @@ from running a whole binary and reading its case count, never from a filtered ru
 which entry points carry a document. It changes no kernel, no dtype and no
 allocation, so it has no throughput axis, and the 370 GiB reproduction stays owed
 above.
+
+### W2 review repair (PR #1216)
+
+Same host and same recipe: `cmake -S . -B build -G Ninja`, no build type so asserts
+are live, `-j 6`, 20 cores, shared with several concurrent agent builds. Free disk
+moved between 30 GB and 17 GB during the run, so every build below reports an ENOSPC
+count beside its exit status; **every one is 0**. `ctest -N` reports 523
+tests on this branch, not the 516 W2 recorded, because `origin/main` added test
+binaries between the two runs.
+
+**Two results that were previously reported as one run, separated.** The pull
+request body said "100% tests passed, 0 failed out of 516" and, two paragraphs
+later, an A/B with "3 failures against this branch's 2". Those are different runs,
+different instruments, different times and different lanes.
+`test_cpu_x86_llamacpp_floor` is not a ctest test at all: `ctest -N | grep -i floor`
+matches nothing. It is `tests/scripts/test_cpu_x86_llamacpp_floor.py`, a Python
+harness contract run by `ci.yml:210` and `scripts/agent-preflight.sh:145`, and it can
+never appear in a ctest count.
+
+**The concurrent A/B measured the A/B, not either tree.** Running this branch and a
+clean `origin/main` worktree at the same moment makes each arm the other's
+contention, and the failure lands on whichever loses the race. The review's own rerun
+of that A/B put the failure on the CONTROL arm, inverting the 3-versus-2 recorded
+here. Both readings are artefacts of the method and neither is evidence. **The
+3-versus-2 claim is withdrawn.**
+
+**What does isolate it, because neither half races.** First, byte identity of the
+three files the harness reads, on this branch and on `origin/main`:
+
+| file | blob at `aed3aa5e9` | blob at `origin/main` `65d6cdaed` |
+|---|---|---|
+| `tests/scripts/test_cpu_x86_llamacpp_floor.py` | `358927d17` | `358927d17` |
+| `scripts/cpu-x86-llamacpp-floor.sh` | `bd7a51925` | `bd7a51925` |
+| `docs/bench-evidence/cpu-x86-llamacpp-20260811.md` | `94f8509c4` | `94f8509c4` |
+
+A branch that changes none of the three cannot be why the harness reads them
+differently. Second, a SINGLE-arm sweep on this branch alone, one run at a time:
+
+| 1-minute load average | rc | what fired |
+|---|---|---|
+| 172.06 before, 194.47 after | 1 | the harness's own quiet gate: `waiting for quiet: 15s busy=920% builders=0 load=194.47`, then `NO_QUIET_WINDOW after 15s`. 2 of its 10 unittest cases failed and the run took 114.7 s |
+| 53.41 before, 49.45 after | 0 | nothing: `Ran 10 tests in 3.338s` / `OK` — the same three files, the same tree, 34x faster |
+
+The assertion that fires is the harness's own quiet gate, not a figure it computed,
+which is the signature `.agents/environment.md` already records for this box.
+
+**A gate that claimed to SKIP actually FAILED, and the mutation that proves the
+repair.** `CMakeLists.txt` said `test_cli_offload_config` "is SKIPPED when examples
+are not built". With `VLLM_CLI_BINARY` undefined the file defined it as `""` and all
+four cases ran `REQUIRE(std::string(kCliBinary) != "")`, which is a failure. The
+suite now exits 77 — the `SKIP_RETURN_CODE` `vllm_cpp_add_test` already sets on every
+test — and CTest reports **Skipped**. `cmake -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_BUILD_EXAMPLES=OFF` throughout the first two rows:
+
+| | build rc | run rc | doctest / ctest |
+|---|---|---|---|
+| repaired | 0 | 77 | `ctest -R '^test_cli_offload_config$'` reports `***Skipped` and itself exits 0 |
+| **mutated** back to the PR-head file | 0 | 1 | `test cases: 4` / `0 passed` / `4 failed` / `0 skipped` |
+| repaired, examples ON (the declared recipe) | 0 | 0 | `test cases: 4` / `4 passed` / `0 failed`, 31 assertions |
+
+The mutation is the whole pre-repair file taken from the PR head, because a PARTIAL
+revert — swapping only the four `RequireCliBinary()` calls back to `REQUIRE` — does
+**not compile**: `SkipGate` then trips `-Werror=unused-function`, build rc 1. That
+attempt is recorded rather than dropped, because a mutation that fails to build is
+INVALID and reads exactly like a passing test if only the suite's exit code is
+printed. It also means the repaired shape cannot be half-reverted by accident.
+
+**`include/vllm.h`.** The `vllm_cpp` block documented the pre-#1127 schema in the one
+file AGENTS.md names for a shipped capability, and `vllm-cli` — this wave's own new
+entry point and a pure ABI client — passes exactly the document that block called
+invalid. Measured: `git grep device_fit aed3aa5e9 -- include/vllm.h src/capi/` matches
+nothing, while `include/vllm/config/weight_residency.h` has seven hits at the same
+commit, so the key existed everywhere except the one file that is the public surface.
+Three statements were wrong and all three are fixed: the schema omitted `device_fit`,
+the precedence list omitted `VT_DEVICE_WEIGHT_BUDGET_BYTES`, and the refusal list
+never said that `weight_budget_bytes` refuses a negative while accepting `0`.
+
+**`docs/USAGE.md` quoted a refusal message the parser had stopped printing.** W2 added
+`device_fit` to the `vllm_cpp` level, so `RejectUnknownKeys` enumerates three names;
+the sample output still read `(expected one of: mmap expert_stream)`, in the section
+whose subject is that a typo is named rather than ignored. Found by
+`scripts/check-doc-checkpoint.py` refusing the repair commit for touching
+`include/vllm.h` and `CMakeLists.txt` without touching `docs/USAGE.md`. The gate was
+owed a real edit and this is it. No separate issue: the defect was introduced by this
+unlanded pull request and is repaired inside it.
+
+**The setter now refuses what the parser refuses.** `SetWeightResidencyConfig` is
+declared in a public header and takes the struct, so a hand-built config reaches the
+process-global having run no parser, and `ResolveDeviceWeightBudgetBytes` casts its
+`int64_t` to `size_t`: an installed `-1` resolved to `SIZE_MAX`, an effectively
+infinite budget that switched the load-time device-fit refusal off in silence — the
+failure that refusal's own text warns about. The resolver's comment justified the
+cast by trusting a parser this door does not run, so the trust is made true rather
+than narrated. Red first, whole binary, `test_weight_residency_config`: rc
+1, 25 cases / 1 failed, 324 assertions / 7 failed, the failing
+message logged as `ACCEPTED (no throw)`. With the guard: rc 0,
+25 cases, 324 assertions / 324 passed. The suite's case count moves 24 → 25, which
+is the check that the case was added rather than silently skipped. `0` still installs,
+because it is this field's suppression spelling; `slots` and `slot_bytes` get the same
+rule at the same door, so the two doors into one struct state one thing.
+
+**Counts.** #1206 said five `docs/USAGE.md` command lines and it is three
+(`grep -c 'build/vllm-' docs/USAGE.md` is 3 at the branch base `fd64c76ee`, 3 at the
+merge base `5af6e763`, at lines 2354, 3835 and 3848, and 0 at head); corrected in the
+index row, in `## Work breakdown` W2c, in the pull request body and on the issue,
+while the pull request is still open, because an append-only index row cannot be
+corrected after it. The sixth knob also invalidated six "five" statements the wave did
+not repair — `weight_residency.h:62`, `:261`, `:312`, `:315`,
+`weight_residency.cpp:618` and `test_serve_residency_config.cpp:58` — and left "These
+two" above three cases in `test_gguf_device_fit_reach.cpp:321`.
+`weight_residency.h:92` is historical and `weight_residency.cpp:325` is relative to
+the budget's own siblings; both are still true and both are untouched.
+
+**The repair's own mutations**, run with the same harness the wave used, plus one
+correction to it: the restore is `cp` + `touch` + a rebuild, never `cp -p`, because
+`cp -p` preserves the mtime and ninja then skips the rebuild — a stale mutated binary
+then produces a kill it has not earned. The baseline was re-run green between
+mutations, and every restore was verified byte-identical by sha256.
+
+| id | what it breaks | applied | build rc | suite | rc | cases | cases it killed |
+|---|---|---|---|---|---|---|---|
+| M7 | `DeviceWeightBudgetBytes` reverts to environment-only | YES | 0 | `test_gguf_device_fit_reach` | 1 | 8 | the CONFIG KEY case, alone |
+| M4 | the config beats the environment | YES | 0 | `test_gguf_device_fit_reach`, `test_weight_residency_config` | 1, 1 | 8, 25 | the VARIABLE-beats-config case, alone; and `the budget resolves env > config > probed total` |
+| M12 | the install call site is deleted | YES | 0 | `test_gguf_device_fit_reach`, `test_cli_offload_config`, `test_serve_residency_config` | 1, 1, 1 | 8, 4, 11 | the CONFIG KEY case and the ZERO case; 1 of 4; 4 of 11 |
+| F2 | only the four `RequireCliBinary()` calls reverted | YES | **1** | — | — | — | **INVALID: did not build** (`-Werror=unused-function` on `SkipGate`) |
+| F2b | the whole pre-repair `test_cli_offload_config.cpp` | YES | 0 | `test_cli_offload_config` (EXAMPLES=OFF) | 1 | 4 | all 4 |
+
+**Focused suites after the repair, whole binaries, each with its case count:**
+`test_weight_residency_config` 25 cases / 324 assertions,
+`test_gguf_device_fit` 8 / 61, `test_gguf_device_fit_reach` 8 / 38,
+`test_serve_residency_config` 11 / 126, `test_cli_offload_config` 4 / 31,
+`test_weight_residency_reach` 7 / 76, `test_expert_stream_latch` 1 / 9 — each rc 0.
+
+**Full gate.** `cmake --build build -j 6` rc 0, ENOSPC 0.
+`ctest --test-dir build -j 6` rc 0: **100% tests passed, 0 failed out of 523**,
+466.09 s, with `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e`
+skipped as they are on this host.
 
 ### W1 (#1110, #1109, #1122, #1133)
 

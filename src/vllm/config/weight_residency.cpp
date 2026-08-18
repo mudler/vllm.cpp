@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -559,9 +560,52 @@ std::string DecisionSummary(const Global& g) {
   return out;
 }
 
+// THE SETTER REFUSES WHAT THE PARSER REFUSES, because there are TWO doors into
+// this struct and only one of them had range rules.
+// `parse_weight_residency_extension_json` refuses a non-positive `slots` or
+// `slot_bytes` and a negative budget, and every production caller goes through
+// it. But `SetWeightResidencyConfig` is declared in a PUBLIC header and takes the
+// struct, so a hand-built config reaches the process-global having passed no
+// parser at all.
+//
+// The budget is the dangerous one rather than merely the wrong one.
+// `ResolveDeviceWeightBudgetBytes` casts the configured `int64_t` to `size_t`, so
+// an installed `-1` resolves to SIZE_MAX: an effectively infinite budget that
+// switches the load-time device-fit refusal OFF and says nothing — precisely the
+// "a budget the operator believes is set" failure that refusal's own text names.
+// The resolver's comment justified that cast by trusting a parser that this door
+// does not run, so the trust is made true here instead of being narrated there.
+//
+// `0` still installs. It is this field's suppression spelling, and a guard that
+// refused it would delete the escape hatch the key exists to give.
+void RejectOutOfRangeFields(const WeightResidencyConfig& c) {
+  const auto positive = [](const char* name, std::optional<int64_t> v) {
+    if (v.has_value() && *v <= 0) {
+      throw std::invalid_argument(std::string("weight residency config: ") +
+                                  name + " must be positive (got " +
+                                  std::to_string(*v) + ")");
+    }
+  };
+  positive("expert_stream_slots", c.expert_stream_slots);
+  positive("expert_stream_slot_bytes", c.expert_stream_slot_bytes);
+  if (c.device_weight_budget_bytes.has_value() &&
+      *c.device_weight_budget_bytes < 0) {
+    throw std::invalid_argument(
+        "weight residency config: device_weight_budget_bytes must not be "
+        "negative (got " +
+        std::to_string(*c.device_weight_budget_bytes) +
+        "); 0 means \"suppress the device-fit refusal\", and a negative value "
+        "would resolve to SIZE_MAX and switch that refusal off silently");
+  }
+}
+
 }  // namespace
 
 void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
+  // BEFORE the lock and before the latch check: a value this struct may not hold
+  // is refused whatever the process has already decided, and the refusal reads the
+  // argument only.
+  RejectOutOfRangeFields(config);
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
   // REFUSE ONLY WHAT CANNOT BE HONOURED. A document that sets a decided field to a

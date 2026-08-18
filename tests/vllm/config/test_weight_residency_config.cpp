@@ -1130,3 +1130,63 @@ TEST_CASE("residency config: the budget LATCHES NOTHING, so a late install is ac
           R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":16384}}})")));
   CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 16384U);
 }
+
+TEST_CASE("residency config: the SETTER refuses what the PARSER refuses") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  // THE OTHER DOOR. Every production caller reaches the process-global through
+  // `parse_weight_residency_extension_json`, which refuses a negative budget and a
+  // non-positive slot size. But `SetWeightResidencyConfig` is declared in a public
+  // header and takes the STRUCT, so a hand-built config is a legal way in that
+  // skips those rules entirely, and the resolver's own comment used to justify its
+  // cast by trusting a parser that had not necessarily run.
+  //
+  // The budget is the dangerous one rather than merely the wrong one:
+  // `ResolveDeviceWeightBudgetBytes` casts to `size_t`, so an installed `-1`
+  // resolves to SIZE_MAX — an effectively infinite budget that switches the
+  // load-time device-fit refusal OFF without a word. That is the exact
+  // "a budget the operator believes is set" failure the parser's own refusal text
+  // names.
+  vllm::WeightResidencyConfig negative_budget;
+  negative_budget.device_weight_budget_bytes = -1;
+  std::string message;
+  try {
+    vllm::SetWeightResidencyConfig(negative_budget);
+    message = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    message = e.what();
+  } catch (const std::exception& e) {
+    message = std::string("WRONG EXCEPTION TYPE: ") + e.what();
+  }
+  CAPTURE(message);
+  CHECK(Mentions(message, "device_weight_budget_bytes"));
+  CHECK(Mentions(message, "must not be negative"));
+  CHECK(Mentions(message, "-1"));
+
+  // ...and nothing was installed, so the check the refusal protects still reads
+  // the probe. Without this the case would pass on an implementation that threw
+  // AFTER writing the value.
+  CHECK_FALSE(
+      vllm::ActiveWeightResidencyConfig().device_weight_budget_bytes.has_value());
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 4096U);
+
+  // The two sizes get the parser's rule at this door too, so the two doors into
+  // one struct state one rule.
+  vllm::WeightResidencyConfig zero_slots;
+  zero_slots.expert_stream_slots = 0;
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(zero_slots),
+                  std::invalid_argument);
+  vllm::WeightResidencyConfig negative_slot_bytes;
+  negative_slot_bytes.expert_stream_slot_bytes = -8;
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(negative_slot_bytes),
+                  std::invalid_argument);
+
+  // Everything the PARSER accepts, the setter still accepts — `0` for the budget
+  // above all, because it is this field's suppression spelling and a guard that
+  // refused it would delete the escape hatch the key exists to give.
+  vllm::WeightResidencyConfig zero_budget;
+  zero_budget.device_weight_budget_bytes = 0;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(zero_budget));
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 0U);
+}

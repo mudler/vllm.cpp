@@ -227,10 +227,22 @@ TEST_CASE("NemotronH A2-Q2a: the device MoE block matches the host reference on 
   const NemotronHParams p = MoeParams();
   Queue hq{Device{DeviceType::kCPU, 0}, nullptr};
   const DType dt = DType::kBF16;  // Marlin's a/c contract (ops.cpp:879)
-  const int64_t T = 4;
   const int64_t H = p.hidden_size;
 
   const NemotronHMoeWeights w = MakeNvfp4Moe(p, dt);
+
+  // ★ T == 1 IS THE DECODE SHAPE, AND UNTIL #1157 THIS CASE NEVER RAN IT.
+  // The widths here were 4 and 2, both of them PREFILL shapes. Every token
+  // after the first comes out of a step with exactly one token, so the arm this
+  // model spends its whole decode in was the one width the gate did not cover —
+  // and `MarlinMoeAlignBlockSizeSelect` / `MarlinMoeAlignSizes` take different
+  // branches at a token count below the expert count, which is what T=1 with
+  // 128 experts is. A width loop rather than a third copy, so the three cannot
+  // drift apart, and the count is asserted afterwards: a loop that ran over
+  // nothing would otherwise report a clean pass.
+  int64_t widths_covered = 0;
+  for (const int64_t T : {int64_t{1}, int64_t{2}, int64_t{4}}) {
+  INFO("token count T=" << T);
   const std::vector<float> x = SynthVec(static_cast<size_t>(T * H), 77, 0.5F);
 
   // The HOST arm dequantizes each touched expert to bf16 and runs the per-pair
@@ -301,6 +313,10 @@ TEST_CASE("NemotronH A2-Q2a: the device MoE block matches the host reference on 
   REQUIRE(guard_examined == examined);
   INFO("does the band " << band << " REJECT a routed-scale defect?");
   CHECK(guard >= band);
+  ++widths_covered;
+  }
+  // Three widths, or the loop did not run the one this case was extended for.
+  REQUIRE(widths_covered == 3);
 }
 
 // A separate case so a `-tc` run can select it alone. Same no-comma rule.

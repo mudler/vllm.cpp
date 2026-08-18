@@ -79,6 +79,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1111,6 +1112,49 @@ std::vector<float> OwnedToF32(const NemotronHOwned& w) {
   return out;
 }
 
+// ─── #1157 DIAGNOSTIC (VT_NEMOTRON_H_DIAG, documented in ENVIRONMENT.md) ────
+//
+// Off unless `VT_NEMOTRON_H_DIAG` is set to something other than "0", and every
+// download it does is inside that guard, so a production step pays nothing.
+//
+// It exists to answer the question no CPU gate on this model can: the runner
+// hands a decode step a device-resident input id and a recurrent page, and when
+// the tokens come out wrong, only the per-layer numbers say WHICH of the two the
+// step actually read. On #1157 they said the carry was exact — the state
+// gathered at step k+1 equalled the state written at step k, on host and on
+// GB10 alike — and that layer 0's embedding row was constant across two decode
+// steps that consumed different tokens. It stays for the next reader of this
+// model, because the next divergence here will be diagnosed the same way.
+bool NemotronHDiagEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NEMOTRON_H_DIAG");
+    return e != nullptr && e[0] != '0';
+  }();
+  return on;
+}
+
+// #1157 BISECT SWITCH. The device MoE arm is 23 of this model's 52 layers and
+// has never run at T=1 anywhere: its own gate (test_nemotron_h_moe_device.cpp)
+// exercises T=4 and T=2. Setting `VT_NEMOTRON_H_DEVICE_MOE=0` routes those
+// layers back through the host reference the CPU arm already proves token-exact
+// on this checkpoint, so one run says whether the device MoE is the difference.
+bool NemotronHDeviceMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NEMOTRON_H_DEVICE_MOE");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+double DiagL2(const std::vector<float>& v, int64_t off, int64_t n) {
+  double acc = 0.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double x = v[static_cast<size_t>(off + i)];
+    acc += x * x;
+  }
+  return std::sqrt(acc);
+}
+
 // ─── the per-step device inputs ─────────────────────────────────────────────
 //
 // Uploaded ONCE per step and shared by all 6 attention layers and all 23
@@ -1213,6 +1257,24 @@ NemotronHPagedStep BuildNemotronHPagedStep(Dev d, const ModelForwardInput& input
   // for the same hazard and the same remedy). Waiting here costs nothing this
   // unit measures: A2-P records no throughput number on any axis (spec §5).
   d.b.Synchronize(d.q);
+  if (NemotronHDiagEnabled()) {
+    std::fprintf(stderr, "[NH-DIAG] step T=%lld R=%lld nd=%lld np=%lld idx=[",
+                 static_cast<long long>(T), static_cast<long long>(R),
+                 static_cast<long long>(nd), static_cast<long long>(np));
+    for (int64_t r = 0; r < R; ++r)
+      std::fprintf(stderr, "%d%s", idx[static_cast<size_t>(r)], r + 1 < R ? "," : "");
+    std::fprintf(stderr, "] init=[");
+    for (int64_t r = 0; r < R; ++r)
+      std::fprintf(stderr, "%d%s", init[static_cast<size_t>(r)], r + 1 < R ? "," : "");
+    std::fprintf(stderr, "] qsl_attn=[");
+    for (size_t i = 0; i < am.query_start_loc.size(); ++i)
+      std::fprintf(stderr, "%d%s", am.query_start_loc[i],
+                   i + 1 < am.query_start_loc.size() ? "," : "");
+    std::fprintf(stderr, "] seq_lens=[");
+    for (size_t i = 0; i < am.seq_lens.size(); ++i)
+      std::fprintf(stderr, "%d%s", am.seq_lens[i], i + 1 < am.seq_lens.size() ? "," : "");
+    std::fprintf(stderr, "]\n");
+  }
   return sdi;
 }
 
@@ -1467,14 +1529,47 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
   RequireDeviceWeight(host.norm_f, "backbone.norm_f.weight", adt, {H});
   DBuf residual(d, adt, {T, H});
   {
-    std::vector<int32_t> ids = input.token_ids;
-    for (int32_t id : ids) {
-      VT_CHECK(id >= 0 && id < V, "NemotronH paged forward: token id out of range");
-    }
-    DBuf it(d, DType::kI32, {T}, ids.data());
-    d.b.Synchronize(d.q);  // `ids` is a local; see UploadAs.
     Tensor tab = ResidentWeight(d, host.embeddings);
-    vt::Embedding(d.q, residual.t(), tab, it.t());
+    Tensor rt = residual.t();
+    if (input.device_token_ids != nullptr) {
+      // ★ ENG-ASYNC-SCHED W4 (#1157). `ModelForwardInput::device_token_ids` is
+      // non-null exactly when the async runner's device combine has already
+      // spliced each DECODE row's sampled token into ITS device buffer and left
+      // the host `token_ids` STALE on purpose — materializing it on the host is
+      // the synchronize W4 exists to remove (model_registry.h:314-324,
+      // runner.cpp:1175-1194). A forward that embeds the host vector therefore
+      // embeds the same placeholder id on every decode step.
+      //
+      // That is not a hypothesis. With the host vector, this model's A3 token
+      // gate read 4/24 on GB10 while the SAME binary read 24/24 in
+      // fresh-prefill mode (no decode step is ever taken) and 96/96 on CPU
+      // (where this pointer is always null), and the per-layer trace showed the
+      // layer-0 embedding row identical across two consecutive decode steps
+      // that consumed different tokens.
+      //
+      // Kimi-Linear was cut from this same divergence
+      // (kimi_linear_device.cpp:2270-2280) and every other registered forward
+      // already honours the field. This one did not, and nothing could see it:
+      // the runner sets the pointer only under VLLM_CPP_CUDA with a live device
+      // mirror, so no CPU gate can reach the branch at all.
+      //
+      // The host-side range check below is deliberately NOT repeated here. The
+      // ids live on the device and validating them would need the D2H
+      // synchronize this path exists to delete; `LaunchCombineSampledAndDraft
+      // Tokens` produces them from the sampler's own output, and vt::Embedding
+      // bounds-checks the gather.
+      Tensor ids = MakeTensor(const_cast<int32_t*>(input.device_token_ids),
+                              DType::kI32, d.q.device, {T});
+      vt::Embedding(d.q, rt, tab, ids);
+    } else {
+      std::vector<int32_t> ids = input.token_ids;
+      for (int32_t id : ids) {
+        VT_CHECK(id >= 0 && id < V, "NemotronH paged forward: token id out of range");
+      }
+      DBuf it(d, DType::kI32, {T}, ids.data());
+      d.b.Synchronize(d.q);  // `ids` is a local; see UploadAs.
+      vt::Embedding(d.q, rt, tab, it.t());
+    }
   }
 
   vt::RmsNormArgs nargs;
@@ -1512,6 +1607,7 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
 
     const bool moe_on_device =
         lw.block == NemotronHBlock::kMoe && adt == DType::kBF16 && MoeIsNvfp4(lw.moe) &&
+        NemotronHDeviceMoeEnabled() &&
         vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
     const bool needs_host = lw.block != NemotronHBlock::kAttention && !moe_on_device;
     std::vector<float> nvec;
@@ -1540,6 +1636,12 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
           params.mamba_num_heads * params.mamba_head_dim * params.ssm_state_size;
       std::vector<float> conv_all = DownloadF32(d, io.conv, DType::kF32, R * conv_row);
       std::vector<float> ssm_all = DownloadF32(d, io.ssm, DType::kF32, R * ssm_row);
+      if (NemotronHDiagEnabled()) {
+        std::fprintf(stderr,
+                     "[NH-DIAG]   L%lld mamba GATHERED |conv|=%.6g |ssm|=%.6g\n",
+                     static_cast<long long>(l), DiagL2(conv_all, 0, conv_row),
+                     DiagL2(ssm_all, 0, ssm_row));
+      }
 
       // At `num_reqs == 1` this loop runs once, and it is written as a loop for
       // the reason §4.1 gives: the indexing machinery lands here, only the
@@ -1587,6 +1689,14 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
                   ssm_all.begin() + static_cast<std::ptrdiff_t>(r * ssm_row));
       }
 
+      if (NemotronHDiagEnabled()) {
+        std::fprintf(stderr,
+                     "[NH-DIAG]   L%lld mamba WROTE    |conv|=%.6g |ssm|=%.6g "
+                     "|out|=%.6g\n",
+                     static_cast<long long>(l), DiagL2(conv_all, 0, conv_row),
+                     DiagL2(ssm_all, 0, ssm_row),
+                     DiagL2(mvec, (T - 1) * H, H));
+      }
       io.conv = UploadAs(d, conv_all, DType::kF32, {R, params.conv_dim(),
                                                     params.conv_kernel - 1});
       io.ssm = UploadAs(d, ssm_all, DType::kF32,
@@ -1610,6 +1720,18 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
       carry = UploadAs(d, mvec, adt, {T, H});
     }
 
+    if (NemotronHDiagEnabled()) {
+      const std::vector<float> cv = DownloadF32(d, carry, adt, T * H);
+      const std::vector<float> rs = DownloadF32(d, residual, adt, T * H);
+      const char* kind = lw.block == NemotronHBlock::kAttention ? "attn"
+                         : lw.block == NemotronHBlock::kMamba   ? "mamba"
+                         : lw.block == NemotronHBlock::kMoe     ? "moe"
+                                                                : "mlp";
+      std::fprintf(stderr,
+                   "[NH-DIAG]   L%lld %-5s |mixer_last|=%.6g |resid_last|=%.6g\n",
+                   static_cast<long long>(l), kind, DiagL2(cv, (T - 1) * H, H),
+                   DiagL2(rs, (T - 1) * H, H));
+    }
     if (trace != nullptr && trace->capture) {
       trace->normed[static_cast<size_t>(l)] = std::move(nvec);
       std::vector<float> h = DownloadF32(d, residual, adt, T * H);

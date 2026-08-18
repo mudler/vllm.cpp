@@ -19,6 +19,70 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
+
+**This supersedes the entry that recorded the A3 gate as a 6/96 device failure
+with an unknown cause. The cause is known, it is not the recurrent carry, and
+the host leg of the gate is a PASS.**
+
+**Host leg, `STRICT PASS`.** `TOKEN MATCH: 96/96 over 3 prompts (full rows=3,
+short rows=0)`, driven through `include/vllm.h` alone by
+`examples/nemotron_h_gen` against the committed oracle golden, on the released
+`nemotron-3.5-lightning-30b-nvfp4` at revision `29f2d174`. Engine load 209.0 s;
+peak RSS 20 142 392 KB; per-prompt wall 928.93 / 839.42 / 1081.16 s.
+`--max-model-len 512`, greedy, `ignore_eos`. **No number on any speed axis is
+claimed or implied** — this is a correctness result on a host that is not the
+performance target.
+
+**Device leg, GB10 sm_121a, and the three measurements that name the mechanism.**
+The build was not degraded: CUDA 13.x from the `ubuntu2404/sbsa` lane,
+`CFG_RC=0`, `cutlass-nvfp4` / `cutlass-fp8` / `marlin-nvfp4` / `fa2` all
+`ENABLED for [121a]`, `BUILD_RC=0`, `compile_errors=0`, binary sha256
+`b4677cdb7cf521250c5325fa10e5eadc80134763621d187af1f9b380c7d70140`.
+
+| arm | same binary, same weights, same golden | result |
+|---|---|---|
+| decode | the shipped path | **4/24** over the first 8 tokens of 3 prompts |
+| fresh-prefill | one token per completion, so no decode step is ever taken | **24/24** |
+| host | the same driver on a CPU queue, where `device_token_ids` is always null | **96/96** |
+
+The `got` streams in the decode arm are byte-identical to the earlier recorded
+run, so the failure reproduced on a fresh build rather than drifting.
+
+**The per-layer trace (`VT_NEMOTRON_H_DIAG`) localises it to the first
+operation of the decode step.** At the prefill step CPU and GB10 agree to six
+digits on every one of the 52 layers, including bit-identical layer-0 numbers.
+At the first decode step the gathered conv/SSM state is IDENTICAL on the two
+(`|conv|=310.374`, `|ssm|=3985.8` on both), so the recurrent carry is exact —
+and layer 0's embedding row differs. It reads `0.228135` on GB10 at BOTH decode
+steps, which consumed different tokens. A constant embedding is a constant
+input id.
+
+**Cause:** `NemotronHPagedForward` embedded the host `input.token_ids` while
+`ModelForwardInput::device_token_ids` was non-null. That field's contract is
+that the host vector is STALE for decode rows (`model_registry.h:314-324`),
+because not materialising it on the host is the synchronize ENG-ASYNC-SCHED W4
+exists to remove. Kimi-Linear was cut from the same divergence
+(`kimi_linear_device.cpp:2270-2280`); the seam that allows a third is
+[#1217](https://github.com/mudler/vllm.cpp/issues/1217).
+
+**What this REFUTES, recorded because the wrong cause was on the record for a
+day.** [#1157](https://github.com/mudler/vllm.cpp/issues/1157) reasoned that
+`gm.num_decodes` might classify a decode as a prefill so the gather would hand
+the mixer zeros. On real weights the trace reports `nd=1 np=0 init=[1]` on every
+decode step, and mutating that mask to 0 turns the A2-P CPU gate RED (1 case,
+6 assertions) — so that gate was never blind to that defect. It was blind to the
+real one for a structural reason: the runner sets `device_token_ids` only under
+`VLLM_CPP_CUDA` with a live device mirror, so no CPU gate reaches the branch.
+
+**Two things this run established about the environment, both cheap to lose.**
+The released checkpoint LOADS AND DECODES ON A CPU-ONLY BOX — 20.1 GB peak RSS,
+209-304 s from a CIFS mount — which is what made a same-binary host/device A/B
+affordable at all and should be the first instrument reached for the next
+device-only divergence on this model. And `/workspace` on the `rc` worker
+persists between runs, so a cloned source tree and a CMake build directory under
+`/root` survive long enough for an incremental rebuild between arms.
+
 ## MODEL-NEMOTRON-H-ABI-A3-E2E — the A3 token gate did NOT run, and the cause on record was NOT the cause (2026-08-17, `row/MODEL-NEMOTRON-H-ABI-A3-E2E`, base `origin/main` `a6df72777`, #810)
 
 **No number is recorded, on any axis. This entry exists so the pending cause is

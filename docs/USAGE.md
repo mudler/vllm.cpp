@@ -551,6 +551,31 @@ missing arm is in this project. To run the same model here, use a per-tensor
 FP8, BF16, NVFP4, or GGUF checkpoint of it. Issue
 [#1166](https://github.com/mudler/vllm.cpp/issues/1166) tracks the port.
 
+### A per-tensor scale has to be one F32 number
+
+Every scale this build reads as a single number is required to be exactly one
+element and exactly `F32`. That covers `weight_scale`, `input_scale`,
+`weight_scale_2`, `weight_global_scale`, `input_global_scale`, `k_scale` and
+`v_scale`. A checkpoint that stores one of them as an array, or in a narrower
+dtype, is refused at load with a message naming the tensor, the shape it
+shipped, and the dtype it shipped:
+
+```text
+dense loader: 'model.layers.0.self_attn.q_proj.weight_scale' ships shape
+[12288, 1] (12288 elements), not the ONE element a per-tensor scale is
+```
+
+The two layouts this refuses in practice are per-output-channel FP8, which
+stores one scale per output row, and block-wise FP8, which stores a grid. Both
+used to load. The reader took the first four bytes and used them as the scale
+of the whole matrix, which is a finite plausible number and therefore fluent
+plausible wrong output rather than a failure. Issue
+[#1181](https://github.com/mudler/vllm.cpp/issues/1181) has the detail, and the
+per-output-channel arm itself is not implemented yet.
+
+`lm_head` is not affected. It has always read a per-output-channel scale
+correctly, as the table above records.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are

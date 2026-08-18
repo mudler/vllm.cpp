@@ -171,6 +171,9 @@ jobs:
         run: |
           python3 scripts/check-env-doc.py
           python3 tests/scripts/test_check_env_doc.py
+      - name: The gate bring-up script resolves its values or refuses
+        run: |
+          python3 tests/scripts/test_gate_bringup.py
       - name: The docs site's content invariants hold
         run: |
           python3 scripts/check-site.py

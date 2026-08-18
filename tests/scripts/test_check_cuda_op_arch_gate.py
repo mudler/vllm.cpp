@@ -51,6 +51,16 @@ REGISTRATION = (
     "               reinterpret_cast<void*>("
     "static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernelCuda)));\n"
 )
+# The miniature describes the REAL tree, and the real TU now registers a second
+# op from the same Registrar (#1189 M1, kQuantFp8Group). Without this line the
+# baseline miniature is red for a reason that has nothing to do with the
+# mutation each case applies, which would hide what those cases measure. Every
+# mutation below still targets REGISTRATION, so nothing they assert is widened.
+GROUP_REGISTRATION = (
+    "    RegisterOp(OpId::kQuantFp8Group, DeviceType::kCUDA,\n"
+    "               reinterpret_cast<void*>("
+    "static_cast<QuantFp8GroupFn>(&QuantFp8GroupKernelCuda)));\n"
+)
 
 
 class FakeTree:
@@ -94,9 +104,10 @@ BASE_HOME = f"""\
 namespace vt::cuda {{
 namespace {{
 void QuantFp8StaticKernelCuda(Queue&, Tensor&, const Tensor&, float) {{}}
+void QuantFp8GroupKernelCuda(Queue&, Tensor&, Tensor&, const Tensor&, int) {{}}
 struct Registrar {{
   Registrar() {{
-{REGISTRATION}  }}
+{REGISTRATION}{GROUP_REGISTRATION}  }}
 }};
 Registrar g_registrar;
 }}

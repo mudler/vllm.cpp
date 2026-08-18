@@ -564,6 +564,70 @@ void QuantFp8StaticKernel(Queue&, Tensor& out_fp8, const Tensor& x, float input_
   });
 }
 
+// --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 M1). QuantFp8Group CPU kernel:
+// the DYNAMIC per-token, per-group activation quant.
+//
+// MIRROR OF THE KERNEL THAT ACTUALLY EXECUTES, which is the C++ custom op and
+// not the Triton kernel. `per_token_group_quant_fp8` calls
+// `torch.ops._C.per_token_group_fp8_quant` and RETURNS whenever the platform is
+// CUDA-alike and the input is contiguous
+// (vllm/model_executor/layers/quantization/utils/fp8_utils.py:635-650), so the
+// Triton kernel below it never runs there. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps                  eps SEEDS the reduction
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit       a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)   a DIVIDE
+//   :86  DST_DTYPE(q)                              hardware e4m3 RNE
+//
+// TWO DIVIDES, DELIBERATELY, and this is the opposite of QuantFp8StaticKernel
+// forty lines above. That kernel multiplies by a hoisted reciprocal because
+// upstream ships the reciprocal there (common.cuh:62, with `1.0f / scale`
+// formed by the caller at common.cu:31). Here upstream ships a divide, and the
+// scale changes per group, so there is no loop-invariant reciprocal to hoist in
+// the first place. The Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) differs by up to one f32 ulp and carries an upstream
+// comment saying so. Near an e4m3 tie that ulp changes the emitted byte.
+// tests/vt/test_ops_quant_fp8_group_cpu.cpp G1 compares BYTES for this reason;
+// upstream's own test compares values at rtol=0.15 and cannot see it.
+//
+// eps is the reduction's INITIAL value rather than a clamp afterwards. The two
+// are numerically identical, and writing it upstream's way makes it visible
+// that an all-zero group yields y_s = 1e-10/448 instead of dividing by zero.
+//
+// LoadF32 widens a bf16 x to f32 before the absolute value and before the
+// divide, matching `fabsf(static_cast<float>(src))` at :53 and
+// `static_cast<float>(src) / y_s` at :85, so a bf16 input rounds at one point.
+// Parallel over ROWS: each row's groups are independent, and the reduction
+// order inside a group is fixed and sequential, so the result does not depend
+// on the thread count.
+void QuantFp8GroupKernel(Queue&, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                         int group_size) {
+  const int64_t m = x.shape[0], k = x.shape[1];
+  const int64_t groups = k / group_size;
+  constexpr float kEps = 1e-10F;      // fp8_utils.py:570, the only value any
+                                      // upstream call site passes
+  constexpr float kFp8MaxV = 448.0F;  // quant_utils.py:27-35 finfo(e4m3fn).max
+  constexpr float kFp8MinV = -448.0F;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  float* sp = out_scale.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      for (int64_t g = 0; g < groups; ++g) {
+        const int64_t base = r * k + g * group_size;
+        float amax = kEps;
+        for (int64_t i = 0; i < group_size; ++i)
+          amax = std::fmax(amax, std::fabs(LoadF32(x, base + i)));
+        const float y_s = amax / kFp8MaxV;
+        sp[r * groups + g] = y_s;
+        for (int64_t i = 0; i < group_size; ++i)
+          op[base + i] =
+              F32ToFp8(std::fmin(std::fmax(LoadF32(x, base + i) / y_s, kFp8MinV), kFp8MaxV));
+      }
+    }
+  });
+}
+
 // MatmulFp8Cutlass CPU kernel: out[m,n] = alpha * Sum_k f8val(a[m,k])*f8val(b[n,k]),
 // f32 accumulate, ONE folded alpha (= input_scale*weight_scale — our recorded
 // deviation from upstream's two epilogue scalars, see include/vt/ops.h).
@@ -3188,6 +3252,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
     RegisterOp(OpId::kQuantFp8Static, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernel)));
+    RegisterOp(OpId::kQuantFp8Group, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QuantFp8GroupFn>(&QuantFp8GroupKernel)));
     RegisterOp(OpId::kMatmulFp8Cutlass, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulFp8CutlassFn>(&MatmulFp8CutlassKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,

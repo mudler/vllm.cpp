@@ -22,6 +22,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/support/platform_compat.h"
+
 namespace vllm {
 
 namespace {
@@ -280,10 +282,7 @@ namespace {
 
 #if !defined(_WIN32)
 long HostPageSize() {
-  static const long page = [] {
-    const long p = ::sysconf(_SC_PAGESIZE);
-    return p > 0 ? p : 4096;
-  }();
+  static const long page = support::HostPageSize();
   return page;
 }
 #endif

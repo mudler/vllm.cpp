@@ -245,13 +245,10 @@ std::string LagunaGgufMoeName(int64_t layer, const char* which) {
 
 namespace {
 
-// F32 scalar read (weight/input global scales are F32 scalars).
-float LnReadF32Scalar(const StTensor& t) {
-  VT_CHECK(t.dtype == "F32" && t.nbytes >= 4, "laguna nvfp4: F32 scalar expected");
-  float v;
-  std::memcpy(&v, t.data, 4);
-  return v;
-}
+// F32 scalar read (weight/input global scales are F32 scalars), from the shared
+// seam. The local copy this replaces checked the dtype but bounded the size with
+// `nbytes >= 4`, a FLOOR, so a scale ARRAY was read as element 0 (#1181).
+using dense_loaders::ReadF32Scalar;
 
 // F32 tensor materialized (the e_score_correction_bias is F32 [E] on most shards, but
 // some poolside NVFP4 shards store it BF16 — upconvert those so the router/topk always
@@ -293,14 +290,14 @@ Nvfp4Weight LnLoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj)
   VT_CHECK(in_dim % 16 == 0, "laguna nvfp4: in_dim must be %16 for " + proj);
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3", "laguna nvfp4: F8_E4M3 weight_scale for " + proj);
-  const float wgs = LnReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs = ReadF32Scalar(get, proj + ".weight_global_scale");
   VT_CHECK(wgs != 0.0F, "laguna nvfp4: zero weight_global_scale for " + proj);
   Nvfp4Weight r;
   r.n = out_dim;
   r.k = in_dim;
   r.weight_global_scale_inv = wgs;
   r.scale2 = 1.0F / wgs;
-  const float igs = LnReadF32Scalar(get(proj + ".input_global_scale"));
+  const float igs = ReadF32Scalar(get, proj + ".input_global_scale");
   VT_CHECK(igs != 0.0F, "laguna nvfp4: zero input_global_scale for " + proj);
   r.input_global_scale_inv = igs;
   r.alpha = r.scale2 * (1.0F / igs);
@@ -323,7 +320,7 @@ OwnedTensor LnLoadSharedExpertBf16(const TensorResolver& get,
   if (!has(proj + ".weight_packed"))
     return dense_loaders::LoadBf16Direct(get, proj + ".weight");  // S-2.1 bf16 path
   const Nvfp4Weight r = LnLoadCtNvfp4Raw(get, proj);              // XS NVFP4 path
-  const float wgs = LnReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs = ReadF32Scalar(get, proj + ".weight_global_scale");
   std::vector<float> f32(static_cast<size_t>(r.n) * static_cast<size_t>(r.k));
   DequantCtNvfp4WeightToF32(reinterpret_cast<const uint8_t*>(r.packed.bytes.data()),
                             reinterpret_cast<const uint8_t*>(r.scale.bytes.data()), wgs, r.n, r.k,

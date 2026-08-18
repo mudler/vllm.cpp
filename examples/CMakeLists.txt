@@ -277,6 +277,46 @@ if(VLLM_CPP_SERVER)
               --speech-family minimax-music3)
     set_tests_properties(test_server_speech_family_still_needs_a_checkpoint PROPERTIES
       PASS_REGULAR_EXPRESSION "--speech-family names a family but --speech-model names no checkpoint")
+
+    # --speculative-config key ADMISSION, from the production entry point (#1160).
+    # `tests/vllm/config/test_speculative_unknown_keys.cpp` calls the parser
+    # directly, so it localizes a failure and proves NOTHING about reach: it stays
+    # green with the server's call site deleted. These three enter through the
+    # server binary on its default configuration, which is where a user meets this
+    # flag, and go RED when `server_main.cpp` stops calling
+    # `ParseSpeculativeConfigJson`. All three exit before a byte of weights is
+    # read, because the parse runs before `LoadedEngine::FromModelDir`.
+    #
+    # 1. The issue's reproduction. Before the fix this key was DROPPED, so the
+    #    server started and drafted greedy, and the run reached the model-load
+    #    error below instead of this refusal.
+    add_test(NAME test_server_speculative_rejects_probabilistic_draft
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speculative-config
+              "{\"method\":\"dspark\",\"model\":\"d\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}")
+    set_tests_properties(test_server_speculative_rejects_probabilistic_draft PROPERTIES
+      PASS_REGULAR_EXPRESSION "speculative-config: draft_sample_method \"probabilistic\" is not implemented.*SPEC-ACCEPT-VARIANTS"
+      FAIL_REGULAR_EXPRESSION "model path is not a directory")
+
+    # 2. A MISSPELLED key. `num_speculatve_tokens` used to fall through to the
+    #    resolved default, so the user silently got a k they did not ask for.
+    add_test(NAME test_server_speculative_rejects_a_misspelled_key
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speculative-config "{\"method\":\"mtp\",\"num_speculatve_tokens\":7}")
+    set_tests_properties(test_server_speculative_rejects_a_misspelled_key PROPERTIES
+      PASS_REGULAR_EXPRESSION "speculative-config: unknown key \"num_speculatve_tokens\""
+      FAIL_REGULAR_EXPRESSION "model path is not a directory")
+
+    # 3. The CONTROL, and the case that makes the two above mean something. A
+    #    valid config gets PAST the admission check and on to the model load, so
+    #    an admission check that refused everything would go red here rather than
+    #    passing the two refusal cases for the wrong reason.
+    add_test(NAME test_server_speculative_accepts_a_valid_config
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":1}")
+    set_tests_properties(test_server_speculative_accepts_a_valid_config PROPERTIES
+      PASS_REGULAR_EXPRESSION "model path is not a directory: /nonexistent-model-dir"
+      FAIL_REGULAR_EXPRESSION "speculative-config")
   endif()
 endif()
 

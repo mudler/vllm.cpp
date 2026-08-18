@@ -24,15 +24,15 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include <nlohmann/json.hpp>
 
 #include "capi/engine_handle.h"
+#include "support/test_env.h"
 #include "vllm/config/device.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/platforms/interface.h"
+#include "vllm/support/platform_compat.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/bpe.h"
@@ -414,7 +414,7 @@ TEST_CASE("capi: vllm_complete_tokens matches the string-prompt completion (ABI 
   // reports six zero-initialized buffer entries must not satisfy ABI v12.
   const int32_t expected_ids[6] = {22, 12, 14, 9, 13, 2};
   for (int i = 0; i < 6; ++i) {
-    INFO("generated token index ", i);
+    CAPTURE(i);
     CHECK(out_tokens[i] == expected_ids[i]);
   }
   REQUIRE(via_tok.text != nullptr);
@@ -1222,7 +1222,7 @@ TEST_CASE("capi: enable_jump_forward defaults to 0 and validates (ABI v10)") {
 TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (ABI v10)") {
   // Resolution reads VT_ENABLE_JUMP_FORWARD as an override; clear it so this
   // test asserts the FIELD's effect, not an ambient env override.
-  ::unsetenv("VT_ENABLE_JUMP_FORWARD");
+  vllm_test::UnsetEnv("VT_ENABLE_JUMP_FORWARD");
   const HfConfig c = MakeConfig();
 
   // Default (nullopt): jump-forward resolves OFF — byte-identical to before v10.
@@ -1697,8 +1697,12 @@ struct VideoFoldWorkspace {
   std::string root, fixture;
   VideoFoldWorkspace() {
     static int counter = 0;
-    root = "/tmp/vllm_capi_video_" + std::to_string(::getpid()) + "_" +
-           std::to_string(counter++);
+    root =
+        (std::filesystem::temp_directory_path() /
+         ("vllm_capi_video_" +
+          std::to_string(vllm::support::CurrentProcessId()) + "_" +
+          std::to_string(counter++)))
+            .string();
     std::filesystem::create_directories(root);
     fixture = root + "/fixture";
     minimax_h3_fold::WriteFoldFixture(fixture);
@@ -1812,7 +1816,7 @@ TEST_CASE("capi v12: vllm_video_generate reproduces the pre-fold goldens") {
   for (int f = 0; f < 8; ++f) {
     char name[64];
     std::snprintf(name, sizeof(name), "/frame_%06d.ppm", f);
-    INFO("frame ", f);
+    CAPTURE(f);
     CHECK(ReadAllBytes(out_dir + name) == ReadAllBytes(golden_dir + name));
   }
   CHECK(ReadAllBytes(out_dir + "/audio.wav") ==

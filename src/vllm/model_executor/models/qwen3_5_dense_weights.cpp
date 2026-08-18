@@ -29,18 +29,13 @@ namespace vllm {
 using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
 using dense_loaders::MakeOwned;
+// The per-tensor scale read (#1181). The local copy this replaces checked
+// neither the element count nor the dtype.
+using dense_loaders::ReadF32Scalar;
 
 namespace {
 
 using TensorExists = std::function<bool(const std::string&)>;
-
-float ReadF32Scalar(const StTensor& t) {
-  VT_CHECK(t.data != nullptr && t.nbytes >= sizeof(float),
-           "qwen3_5 dense: scalar tensor too small for f32");
-  float v = 0.0F;
-  std::memcpy(&v, t.data, sizeof(float));
-  return v;
-}
 
 // The GDN in-projections stay RAW in the on-disk torch Linear [out, in]
 // orientation (nk=true, via LoadMergedBf16RawNK), consumed by vt::MatmulBT —
@@ -177,7 +172,7 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3",
            "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
-  const float wgs_disk = ReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs_disk = ReadF32Scalar(get, proj + ".weight_global_scale");
   VT_CHECK(wgs_disk != 0.0F,
            "qwen3_5 dense: zero weight_global_scale (divisor) for " + proj);
 
@@ -190,7 +185,7 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   // (used DIRECTLY), and alpha folds both reciprocated globals for the fp4xfp4
   // GEMM: alpha = (1/input_divisor)·(1/weight_divisor). input_global_scale is a
   // per-tensor F32 scalar present on every 27B quantized Linear (§3.2).
-  const float igs_disk = ReadF32Scalar(get(proj + ".input_global_scale"));
+  const float igs_disk = ReadF32Scalar(get, proj + ".input_global_scale");
   VT_CHECK(igs_disk != 0.0F,
            "qwen3_5 dense: zero input_global_scale (divisor) for " + proj);
   r.input_global_scale_inv = igs_disk;   // on-disk divisor, used directly
@@ -302,14 +297,14 @@ OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get, const TensorExists& ha
     // spells it `weight_global_scale` and stores the reciprocal.
     float disk_divisor = 0.0F;
     if (has(name + "_scale_2")) {
-      const float ws2 = ReadF32Scalar(get(name + "_scale_2"));
+      const float ws2 = ReadF32Scalar(get, name + "_scale_2");
       VT_CHECK(ws2 != 0.0F, "qwen3_5 dense: zero " + name + "_scale_2");
       disk_divisor = 1.0F / ws2;  // ModelOpt scale -> CT divisor convention
     } else {
       VT_CHECK(has(name + "_global_scale"),
                "qwen3_5 dense: NVFP4 " + name + " requires " + name +
                    "_scale_2 (ModelOpt) or " + name + "_global_scale (CT)");
-      disk_divisor = ReadF32Scalar(get(name + "_global_scale"));
+      disk_divisor = ReadF32Scalar(get, name + "_global_scale");
       VT_CHECK(disk_divisor != 0.0F,
                "qwen3_5 dense: zero " + name + "_global_scale (divisor)");
     }
@@ -374,7 +369,7 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3",
            "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
-  const float ws2 = ReadF32Scalar(get(proj + ".weight_scale_2"));
+  const float ws2 = ReadF32Scalar(get, proj + ".weight_scale_2");
   VT_CHECK(ws2 != 0.0F, "qwen3_5 dense: zero weight_scale_2 for " + proj);
 
   Nvfp4Weight r;
@@ -390,7 +385,7 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   // fp4-activation GEMM; leaving alpha at 0 keeps the weight-only dispatcher.
   const bool w4a4_opt_in = ModelOptW4A4OptIn();
   if (w4a4_opt_in && has(proj + ".input_scale")) {
-    const float is = ReadF32Scalar(get(proj + ".input_scale"));
+    const float is = ReadF32Scalar(get, proj + ".input_scale");
     if (is != 0.0F) {
       r.input_global_scale_inv = is;
       r.alpha = r.scale2 * (1.0F / is);
@@ -608,7 +603,7 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
   const StTensor& wscale = get(proj + ".weight_scale");
   VT_CHECK(wscale.dtype == "F8_E4M3",
            "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
-  const float wgs_disk = ReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs_disk = ReadF32Scalar(get, proj + ".weight_global_scale");
 
   // Dequant to f32 [out, in] (the divisor is reciprocated inside), then round to
   // bf16 while transposing to Matmul-B layout [in, out].

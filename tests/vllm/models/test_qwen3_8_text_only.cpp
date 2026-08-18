@@ -2148,6 +2148,168 @@ TEST_CASE("qwen3_8: the MoE and dense probes classify a projection identically")
 }
 
 // ===========================================================================
+// 4l. A PER-TENSOR SCALE IS READ AS A PER-TENSOR SCALE (issue #1181)
+//
+//     `ReadF32Scalar` used to bound its input with `t.nbytes >= sizeof(float)`,
+//     a LOWER bound, and then copy four bytes into a `float` whatever the
+//     tensor's dtype said. Two wrong-value paths followed and NEITHER failed:
+//     an array was reduced to element 0, and a narrow dtype was reinterpreted
+//     rather than converted. Both return a finite, plausible float, so the
+//     model emits fluent wrong tokens instead of stopping, which is exactly the
+//     failure a token gate cannot see.
+//
+//     WHY THERE IS NO HAPPY-PATH CASE FOR THIS. Both defects ARE the happy
+//     path: the load succeeded, every tensor was found, every dtype the loader
+//     asked about was right, and the only wrong thing was a number. So each
+//     case below FEEDS the shape or dtype that used to pass and requires a
+//     refusal that NAMES the tensor. The positive control exists only to prove
+//     the guard did not start refusing everything.
+//
+//     THE MUTATION IS THE FIXTURE, NOT A HAND-BUILT `StTensor`. Every case runs
+//     the production `vllm::LoadQwen3_5Moe` over a synthetic checkpoint, so
+//     deleting the production call site inside `LoadFp8Raw` / `LoadNvfp4Raw`
+//     turns these red. A unit test that called the reader directly would prove
+//     the function works and nothing about anything reaching it.
+//
+//     UPSTREAM MAKES BOTH CHECKS STRUCTURAL, at pin `555967922`. A per-tensor
+//     scale is its own parameter TYPE, and `PerTensorScaleParameter` asserts
+//     `loaded_weight.shape[0] == 1` (`vllm/model_executor/parameter.py:304-309`,
+//     with the sibling shape assert in `_assert_and_load` at `:93-96`). The
+//     slot is allocated `torch.float32` (`utils/fp8_utils.py:1276`), so a
+//     narrower on-disk dtype is value-converted by `copy_` and never
+//     reinterpreted. And the declared strategy picks the parameter type before
+//     a byte is read (`compressed_tensors_w8a8_fp8.py:63,128`), so upstream
+//     never infers a scale's shape from its byte count.
+// ===========================================================================
+namespace {
+
+// Return `specs` with the entry named `name` re-declared at `shape`/`dtype`.
+//
+// The `REQUIRE` is load-bearing, not decoration. An anchor that matched zero
+// entries would hand the case an UNMODIFIED fixture, which loads, and a
+// refusal case whose fixture was never mutated reads exactly like a test that
+// passed.
+std::vector<Spec> Redeclared(std::vector<Spec> specs, const std::string& name,
+                            const std::vector<int64_t>& shape,
+                            const std::string& dtype) {
+  size_t hits = 0;
+  for (Spec& s : specs) {
+    if (s.name != name) continue;
+    s.shape = shape;
+    s.dtype = dtype;
+    ++hits;
+  }
+  CAPTURE(name);
+  REQUIRE(hits == 1);
+  return specs;
+}
+
+}  // namespace
+
+TEST_CASE("qwen3_8: a per-tensor scale that is not ONE F32 element is REFUSED by name") {
+  auto load = [](const std::vector<Spec>& specs, const char* tag) {
+    return CaptureThrow([&specs, tag] {
+      const TempFile file(BuildSafetensors(specs), tag);
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      (void)vllm::LoadQwen3_5Moe(shards, OneLayerMoeConfig());
+    });
+  };
+
+  const std::vector<Spec> good = MoeOneLayerSpecs("model.");
+  // The FP8 attention scale, read on BOTH arms of `DenseNativeEnabled()`:
+  // `LoadFp8Raw` on a CUDA + cutlass build, `LoadFp8Transposed` otherwise. That
+  // is why this case anchors on `weight_scale` rather than on `input_scale`,
+  // which only the fp8-resident arm reads and which a CPU gate never reaches.
+  const std::string kWeightScale =
+      "model.layers.0.self_attn.q_proj.weight_scale";
+  // The ModelOpt NVFP4 global, read by `LoadNvfp4Raw` — a different function,
+  // so the two anchors together prove the guard is shared rather than local.
+  const std::string kWeightScale2 =
+      "model.layers.0.mlp.experts.0.gate_proj.weight_scale_2";
+
+  SUBCASE("POSITIVE CONTROL: one F32 element still loads") {
+    CHECK(load(good, "scale_ok").empty());
+  }
+
+  SUBCASE("a PER-OUTPUT-CHANNEL F32 weight_scale is refused, and the shape is in the message") {
+    // The shape `unsloth/Qwen3.6-27B-NVFP4` @ccdaab7e ships across its FP8
+    // tower. `LoadAttnDense` branches on the WEIGHT dtype alone, so a
+    // projection like this enters the per-tensor arm, and before this guard
+    // element (0, 0) silently became the scale of the whole matrix.
+    const std::string message =
+        load(Redeclared(good, kWeightScale, {kMoeQ}, "F32"), "scale_rows");
+    CAPTURE(message);
+    CHECK(Mentions(message, kWeightScale.c_str()));
+    CHECK(Mentions(message, "[8]"));
+    CHECK(Mentions(message, "8 elements"));
+    // The two shapes it must NOT degrade into: a complaint about some other
+    // tensor, or a bare lookup miss.
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("a BLOCK-WISE F32 weight_scale grid is refused, and the shape is in the message") {
+    // The `[ceil(N/128), ceil(K/128)]` form measured on `Qwen/Qwen3.8-27B-FP8`
+    // as `[96, 40]` (#1166). At this fixture's toy dimensions the grid is
+    // `[2, 4]`, and the point is the RANK and the count, not the divisor.
+    const std::string message =
+        load(Redeclared(good, kWeightScale, {2, 4}, "F32"), "scale_grid");
+    CAPTURE(message);
+    CHECK(Mentions(message, kWeightScale.c_str()));
+    CHECK(Mentions(message, "[2, 4]"));
+    CHECK(Mentions(message, "8 elements"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("a PER-OUTPUT-CHANNEL BF16 weight_scale is refused, and the message names it") {
+    // THE SHAPE AND THE DTYPE THAT ARE ACTUALLY PUBLISHED TOGETHER, and the one
+    // combination the old byte floor could not even trip over: eight bf16
+    // values are SIXTEEN bytes, comfortably past `nbytes >= sizeof(float)`, so
+    // the load used to succeed while reading the first two scales as the
+    // mantissa and exponent of a number nobody wrote.
+    const std::string message =
+        load(Redeclared(good, kWeightScale, {kMoeQ}, "BF16"), "scale_rows_bf16");
+    CAPTURE(message);
+    CHECK(Mentions(message, kWeightScale.c_str()));
+    CHECK(Mentions(message, "[8]"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("a ONE-ELEMENT BF16 weight_scale is refused, and the dtype is in the message") {
+    // This one the old byte floor DID stop, at two bytes, and that is the point:
+    // it stopped with "scalar tensor too small for f32", which names no tensor
+    // and describes a truncation rather than a dtype. A reader cannot tell from
+    // it which of hundreds of scales was wrong, or in what way.
+    const std::string message =
+        load(Redeclared(good, kWeightScale, {1}, "BF16"), "scale_bf16");
+    CAPTURE(message);
+    CHECK(Mentions(message, kWeightScale.c_str()));
+    CHECK(Mentions(message, "BF16"));
+    CHECK(Mentions(message, "F32"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("a multi-element NVFP4 weight_scale_2 is refused, and the message names it") {
+    const std::string message =
+        load(Redeclared(good, kWeightScale2, {2}, "F32"), "scale2_multi");
+    CAPTURE(message);
+    CHECK(Mentions(message, kWeightScale2.c_str()));
+    CHECK(Mentions(message, "[2]"));
+    CHECK(Mentions(message, "2 elements"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("a ONE-ELEMENT BF16 NVFP4 weight_scale_2 is refused, and the dtype is in the message") {
+    const std::string message =
+        load(Redeclared(good, kWeightScale2, {1}, "BF16"), "scale2_bf16");
+    CAPTURE(message);
+    CHECK(Mentions(message, kWeightScale2.c_str()));
+    CHECK(Mentions(message, "BF16"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+}
+
+// ===========================================================================
 // 5. INERTNESS of the gated rows. 27B / 35B / Coder are VL-prefixed
 //    checkpoints; the per-layer public seams keep the VL prefix as their
 //    DEFAULT, so every existing caller is unchanged by construction.

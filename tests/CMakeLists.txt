@@ -394,6 +394,12 @@ vllm_cpp_add_test(test_gguf_device_fit
   vllm/model_executor/test_gguf_device_fit.cpp)
 vllm_cpp_add_test(test_gguf_device_fit_reach
   vllm/entrypoints/test_gguf_device_fit_reach.cpp)
+# FIX-FP8-BLOCKWISE-REFUSAL #1166: block-wise (128x128) FP8 is refused BY NAME
+# at load. Every case enters through `ModelRegistry::Load` rather than through
+# the predicate, so deleting that call site reds this target. That is the
+# reachability proof and not a class test.
+vllm_cpp_add_test(test_fp8_block_quant
+  vllm/model_executor/layers/test_fp8_block_quant.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
@@ -1098,6 +1104,11 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
+# refused by name, and an upstream key this engine does not implement is refused
+# with the missing part named, instead of being silently dropped.
+vllm_cpp_add_test(test_speculative_unknown_keys
+  vllm/config/test_speculative_unknown_keys.cpp)
 # SPEC-MTP-K-GT-1 (#81): the MTP speculation-DEPTH config contract — the k=1
 # default, the upstream divisibility rule, and that a configured k above 1 is
 # carried rather than silently degraded.
@@ -2197,3 +2208,18 @@ target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
 # CPU-only and needs no checkpoint.
 vllm_cpp_add_test(test_registry_downcast_refusal
   vllm/models/test_registry_downcast_refusal.cpp)
+
+# The five suites that reach src/vllm/support/platform_compat.h, granted per
+# target rather than globally: the file already carries 123 explicit
+# ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
+# convert that deliberate opt-in into a repo-wide default (#503).
+foreach(_pc_target
+        test_safetensors
+        test_minimax_h3
+        test_minimax_h3_video_fold
+        test_kv_offload_connector
+        test_kv_offload_tiering)
+  if(TARGET ${_pc_target})
+    target_include_directories(${_pc_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  endif()
+endforeach()

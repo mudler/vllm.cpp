@@ -29,21 +29,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
-
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — the seam device 1 resolves through
+#include "vllm/support/platform_compat.h"
 #include "minimax_h3_video_fold_fixture.h"
 #include "vt/backend.h"
 
 namespace {
+
+namespace fs = std::filesystem;
 
 std::string ReadAll(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -58,18 +59,20 @@ struct FoldWorkspace {
   std::string root;
   FoldWorkspace() {
     static int counter = 0;
-    root = "/tmp/vllm_h3_video_fold_" + std::to_string(::getpid()) + "_" +
-           std::to_string(counter++);
-    ::mkdir(root.c_str(), 0755);
+    root = (fs::temp_directory_path() /
+            ("vllm_h3_video_fold_" +
+             std::to_string(vllm::support::CurrentProcessId()) + "_" +
+             std::to_string(counter++)))
+               .string();
+    fs::create_directories(root);
     fixture = root + "/fixture";
     minimax_h3_fold::WriteFoldFixture(fixture);
   }
   ~FoldWorkspace() {
-    // Best-effort cleanup; a leftover /tmp dir on abort is diagnosable, not
+    // Best-effort cleanup; a leftover temp dir on abort is diagnosable, not
     // harmful.
-    const std::string cmd = "rm -rf '" + root + "'";
-    const int rc = std::system(cmd.c_str());
-    (void)rc;
+    std::error_code ec;
+    fs::remove_all(root, ec);
   }
   std::string fixture;
 };

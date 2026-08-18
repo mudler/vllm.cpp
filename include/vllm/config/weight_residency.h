@@ -59,8 +59,8 @@
 // and it is the thing an operator flips while watching a run. Recorded so a
 // later reader sees a decision rather than an omission.
 //
-// THE LATCH, which is the one real hazard here — and it covers TWO of the five
-// knobs, not all five. What genuinely freezes:
+// THE LATCH, which is the one real hazard here — and it covers THREE of the six
+// knobs, not all six. What genuinely freezes:
 //
 //   * `expert_stream`, because `ResolveExpertStreamRequested` below caches the
 //     answer in a function-local static. (`Qwen35ExpertStreamRequested` is the
@@ -258,7 +258,7 @@ void SetWeightResidencyConfig(const WeightResidencyConfig& config);
 
 // The installed config, BY VALUE. Empty until something installs one. A reference
 // would be read after the lock was released, which is an unsynchronised read behind
-// a lock that looks like it covers one; the copy is five optionals.
+// a lock that looks like it covers one; the copy is six optionals.
 WeightResidencyConfig ActiveWeightResidencyConfig();
 
 // The decisions that genuinely freeze, one enumerator each. There is no `kMmap` or
@@ -309,10 +309,10 @@ int64_t ResolveResidencyCount(const char* env_name,
                               std::optional<int64_t> configured,
                               int64_t builtin_default);
 
-// ── The five knobs, one named resolver each ───────────────────────────────────
+// ── The six knobs, one named resolver each ────────────────────────────────────
 //
 // Each one owns its environment NAME and its exact historical POLARITY, and each
-// is the SOLE reader of its variable after this row. Two reasons this is five
+// is the SOLE reader of its variable after this row. Two reasons this is six
 // functions and not one call at each site with a string literal.
 //
 // First, the polarities are NOT the same and one of them is deliberately odd.

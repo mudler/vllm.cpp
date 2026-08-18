@@ -25,6 +25,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -34,6 +35,35 @@ namespace {
 #endif
 
 constexpr const char* kCliBinary = VLLM_CLI_BINARY;
+
+// `cmake -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_BUILD_EXAMPLES=OFF` is a legal
+// configuration, and there `VLLM_CLI_BINARY` is the empty string above: there is
+// no `vllm-cli` to run and this gate cannot be run at all.
+//
+// It must not FAIL there, and it must not PASS there either. A `REQUIRE` on the
+// define reported four failed cases on a build that simply did not include the
+// binary — a verdict about the configuration wearing the shape of a verdict about
+// the code — and returning early would have printed doctest's
+// `assertions: 0 ... Status: SUCCESS!` banner, which is the same trap issue #463
+// files. So the process exits with CTest's SKIP_RETURN_CODE (77, registered on
+// every test by `vllm_cpp_add_test` in tests/CMakeLists.txt) and `ctest` reports
+// **Skipped**, which is the true result. Exiting rather than skipping one case is
+// right because the define is a build-time constant: if it is empty, every case in
+// this file is unrunnable, so the first one to ask ends the process for all of them.
+[[noreturn]] void SkipGate() {
+  std::fprintf(stderr,
+               "\n*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***\n"
+               "*** test_cli_offload_config: built without VLLM_CPP_BUILD_EXAMPLES,"
+               " so there is no vllm-cli binary to run\n\n");
+  std::fflush(stderr);
+  std::exit(77);
+}
+
+// Called first in every case. Named rather than inlined so that a case added later
+// cannot get the polarity wrong by writing a bare `REQUIRE`.
+void RequireCliBinary() {
+  if (std::string(kCliBinary).empty()) SkipGate();
+}
 
 // Combined stdout and stderr, plus the child's exit status. `vllm-cli` writes
 // its own progress to stderr and the engine writes the install line there too,
@@ -72,7 +102,7 @@ constexpr const char* kInstallLine = "engine: weight residency";
 }  // namespace
 
 TEST_CASE("vllm-cli: --offload-config's vllm_cpp half reaches the loader") {
-  REQUIRE(std::string(kCliBinary) != "");
+  RequireCliBinary();
   const CliRun run = RunCli(
       std::string(kMissingModel) +
       R"( --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},)"
@@ -103,7 +133,7 @@ TEST_CASE("vllm-cli: the MIRRORED half of the document reaches the loader too") 
   // line `CreateWeightOffloader` prints when it CONSTRUCTS a backend
   // (`model_loader.cpp`, the `choice.offloader->moves_weights()` arm), which is
   // printed only for a document that selects one.
-  REQUIRE(std::string(kCliBinary) != "");
+  RequireCliBinary();
   const std::string kOffloaderInstalled =
       "engine: offload_config installed UvaWeightOffloader";
   const CliRun run =
@@ -132,7 +162,7 @@ TEST_CASE("vllm-cli: a mistyped key in the document fails the load, naming the k
   // by parsing nothing itself: the refusal comes out of `vllm_engine_load`. A
   // typo that quietly disabled this tier would be met as an out-of-memory kill
   // minutes later instead of as a message.
-  REQUIRE(std::string(kCliBinary) != "");
+  RequireCliBinary();
   const CliRun run =
       RunCli(std::string(kMissingModel) +
              R"( --offload-config '{"vllm_cpp":{"device_fitt":{"weight_budget_bytes":1}}}')");
@@ -147,7 +177,7 @@ TEST_CASE("vllm-cli: a mistyped key in the document fails the load, naming the k
 TEST_CASE("vllm-cli: no --offload-config prints no residency line at all") {
   // The inertness case. Nearly every run passes no such flag, and those runs must
   // print nothing new and install nothing.
-  REQUIRE(std::string(kCliBinary) != "");
+  RequireCliBinary();
   const CliRun run = RunCli(kMissingModel);
   INFO("vllm-cli output:\n" << run.output);
   CHECK(Contains(run.output, "vllm-cli: loading model from"));

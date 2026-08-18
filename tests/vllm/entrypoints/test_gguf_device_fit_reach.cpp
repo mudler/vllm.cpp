@@ -320,9 +320,11 @@ TEST_CASE("device fit: an explicit CPU load is never refused, at any budget") {
 
 // --- The budget as a CONFIG KEY (#1127), through the same loader --------------
 //
-// The cases above move the budget with `VT_DEVICE_WEIGHT_BUDGET_BYTES`. These two
-// move it with `--offload-config`'s `vllm_cpp.device_fit.weight_budget_bytes`,
-// arriving as `EngineParams::weight_residency`, and they set NO variable at all.
+// The cases above move the budget with `VT_DEVICE_WEIGHT_BUDGET_BYTES`. The three
+// below move it with `--offload-config`'s `vllm_cpp.device_fit.weight_budget_bytes`,
+// arriving as `EngineParams::weight_residency`. The first two set NO variable at
+// all; the third sets one DELIBERATELY, because its subject is the precedence
+// between the two inputs rather than the config tier on its own.
 //
 // This is the reachability half of #1127 and not a second unit test of the
 // resolver: `test_weight_residency_config` already builds the config by hand and

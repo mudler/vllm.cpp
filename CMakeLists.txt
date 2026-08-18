@@ -2390,8 +2390,10 @@ endif()
 # `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
 # that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
 # there, because a generator expression is evaluated after every directory has
-# been processed. The test is SKIPPED when examples are not built, so this guard
-# is the only thing that has to know about the ordering.
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
 if(TARGET test_cli_offload_config AND TARGET vllm-cli)
   add_dependencies(test_cli_offload_config vllm-cli)
 endif()

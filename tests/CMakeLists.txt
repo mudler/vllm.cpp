@@ -1156,6 +1156,10 @@ target_include_directories(test_weight_residency_reach PRIVATE ${CMAKE_SOURCE_DI
 # ABI here would re-prove the ABI. `$<TARGET_FILE:vllm-cli>` resolves at generate
 # time, after every directory is processed; the build ORDER dependency is declared
 # in the top-level CMakeLists, where the `vllm-cli` target already exists.
+# Registered UNCONDITIONALLY, and with examples off it leaves `VLLM_CLI_BINARY`
+# undefined: the suite then exits 77 and CTest reports it Skipped, which is what
+# `SKIP_RETURN_CODE` above is for. Registering it only under the option would hide
+# the gate's absence instead of reporting it.
 vllm_cpp_add_test(test_cli_offload_config
   vllm/entrypoints/test_cli_offload_config.cpp)
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)

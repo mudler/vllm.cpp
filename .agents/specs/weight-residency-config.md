@@ -398,7 +398,7 @@ argument block and `weight_residency.cpp`'s parser at the same time.
 |---|---|
 | W2a | `device_fit.weight_budget_bytes` ([#1127](https://github.com/mudler/vllm.cpp/issues/1127)): the parser key, the merge, the announce line, `ResolveDeviceWeightBudgetBytes`, and `DeviceWeightBudgetBytes` delegating to it |
 | W2b | The three entry points ([#1135](https://github.com/mudler/vllm.cpp/issues/1135)): the server's offload parse hoisted ahead of the architecture branch, the pooling path taking both halves, the transcription-only path refusing the flag, and `vllm-cli` gaining `--offload-config` |
-| W2c | `docs/USAGE.md`, `docs/ENVIRONMENT.md`, and this spec. Also [#1206](https://github.com/mudler/vllm.cpp/issues/1206) in flow: five `docs/USAGE.md` command lines named `./build/vllm-server` or `./build/vllm-cli`, and both binaries are built under `build/examples/` |
+| W2c | `docs/USAGE.md`, `docs/ENVIRONMENT.md`, and this spec. Also [#1206](https://github.com/mudler/vllm.cpp/issues/1206) in flow: THREE `docs/USAGE.md` command lines named `./build/vllm-server` or `./build/vllm-cli` (lines 2354, 3835, 3848 at the branch base `fd64c76ee`; `grep -c 'build/vllm-' docs/USAGE.md` is 3 there and at the merge base, and 0 at head), and both binaries are built under `build/examples/`. W2 first wrote FIVE here and in three other places; the number was never counted, and the review of PR #1216 corrected it |
 
 ## Risks and decisions
 

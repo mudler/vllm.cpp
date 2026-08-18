@@ -615,7 +615,7 @@ void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
 
 // BY VALUE, and copied under the lock. Returning a reference and then releasing
 // the mutex gave the caller an unsynchronised read behind a lock that looked like
-// it covered one (#1122 L3). The copy is five optionals; the callers are per load,
+// it covered one (#1122 L3). The copy is six optionals; the callers are per load,
 // per prefaulted span (against megabytes of pages) and once per store.
 WeightResidencyConfig ActiveWeightResidencyConfig() {
   Global& g = State();

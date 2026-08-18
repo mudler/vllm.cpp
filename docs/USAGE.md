@@ -3978,7 +3978,7 @@ spelling is the likeliest typo of all, because every flag around it is hyphenate
 So the whole document is enumerated and the offender is named:
 
 ```text
-offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream)
+offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream device_fit)
 offload config: unknown key "vllm-cpp" (expected one of: offload_backend uva prefetch vllm_cpp)
 offload config: unknown key "uva.cpu_offload_GB" (expected one of: cpu_offload_gb cpu_offload_params)
 ```

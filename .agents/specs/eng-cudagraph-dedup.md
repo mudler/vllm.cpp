@@ -233,6 +233,36 @@ raises rather than latching, so the whole error-latch class does not exist there
    ~30 each) and is arithmetic rather than a direct measurement.
 7. **Not gated, deliberately:** throughput. This row must not be sold as a speed
    change. The reportable numbers are executable count and capture wall time.
+8. **The coarse-key device experiment (W5, #1226).** The same harness, the same three
+   multi-bucket workloads, the same OFF/OFF controls first, one binary and three arms:
+   `VT_CUDA_GRAPH_DEDUP` unset, `=1` with the EXACT key, and `=1` with
+   `VT_CUDA_GRAPH_DEDUP_COARSE_KEY=1`. A cell is VOID unless its log carries the
+   `key mode = ` line for the arm it claims and a `captured N graphs, deduped to M execs`
+   line, because an A/B where nothing engaged is not a pass. Three outcomes, all of them
+   a complete result:
+   - **`M < N` and the arms are byte-identical** — the row delivers. Record the ratio and
+     the probe-refusal rate; the default flip becomes arguable on that evidence rather
+     than on a rerun.
+   - **`probes > 0` and `refused == probes`** — the driver will not re-point across
+     launch dimensions on this driver. A REAL negative: it closes #1226 with a
+     driver-level reason and prints the exact `cudaGraphExecUpdateResult`, which is the
+     evidence the W4 record could not produce because the fold was never attempted.
+     `AGENTS.md` forbids declaring a ceiling, so a negative names the next traceable
+     hypothesis rather than closing the question.
+   - **`M < N` and the arms DIFFER** — stop and report, do not repair. That is a
+     correctness finding about `cudaGraphExecUpdate`, and it outranks the row.
+   A fourth reading is a defect in the run rather than a result: `probes == 0` with more
+   than one distinct captured bucket in a coarse cell means the key still did not group
+   and the hypothesis was never tested.
+9. **Reachability for W5 is the DEVICE run, and the CPU suite cannot supply it.** Deleting
+   the `AppendKernelFields` call in `src/vt/graph_dedup_runtime.h` leaves
+   `tests/vt/test_graph_dedup_runtime.cpp` green, because that suite calls the
+   field-selection functions directly. It measures the functions, not the path. What
+   proves the path is the `key mode = ` line and the fold counts in the cell logs: both
+   are emitted from `Runtime::AppendNodePayload` through `graph_dedup_rt::Ops().signature`,
+   `GraphDedupRegistry::Register` and `CudaBackend::EndCaptureGraph`, which is a
+   production entry point. Stated here rather than left for the reviewer to find, because
+   this is exactly the shape `.agents/reachability.md` warns about.
 
 ## Dependencies
 
@@ -252,7 +282,19 @@ raises rather than latching, so the whole error-latch class does not exist there
   Compile-gated by `cuda-fat-build`.
 - **W3 — the ROCm wiring.** The same three edits in `rocm_backend.hip`.
 - **W4 — the device A/B.** A leased GPU, both arms of the same binary, token-exact
-  comparison and the executable-count ratio.
+  comparison and the executable-count ratio. **DONE, and it split**: see
+  [`## Outcome`](#outcome).
+- **W5 — the coarse key** ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)).
+  W4 refuted the row's premise by measuring `N == M` with `cudaGraphExecUpdate` never
+  attempted, because the key carried the padded batch dimension. W5 tests the one
+  hypothesis that can still deliver the benefit: **the key is stricter than the operation
+  it guards.** `cudaGraphExecUpdate` requires the TOPOLOGY to match and exists to permit
+  PARAMETER changes; a kernel node's launch configuration is a parameter, its function is
+  not. `VT_CUDA_GRAPH_DEDUP_COARSE_KEY` drops the launch dimensions, the memcpy extent
+  and the memset width so two padded buckets group at all, and the probe then decides.
+  Default OFF, so the arms are a same-binary A/B. Its three legitimate outcomes and what
+  each one closes are in [`## Gates`](#gates); the design argument for what is dropped
+  and what is kept lives beside the code in `src/vt/graph_dedup_signature.h`.
 
 ## Risks/decisions
 
@@ -269,6 +311,37 @@ raises rather than latching, so the whole error-latch class does not exist there
   `cudaGraphExecUpdate` per step. This is the reason the row is `T2` and the reason the
   default is off until W4 measures it: shipping it on by default without that number
   would be trading an unmeasured latency for an unmeasured memory saving.
+- **A COARSER key cannot make a replay wrong, and can make it LOUD.** The safety
+  argument is unchanged and unweakened: `Register` probes every candidate with the real
+  driver update on a throwaway executable before it folds, so a key that groups two
+  graphs the driver rejects costs one wasted probe and a private executable. What a
+  coarser key DOES raise is exposure to the transitivity assumption recorded below. A
+  group with three or more members re-points `(current_raw, entry.raw)` at replay, a pair
+  the probe never tested, and a refusal there lands on `Replay`'s `VT_CHECK`. That is a
+  loud failure rather than a wrong answer, which is the polarity the row wants, but it is
+  a failure a coarse key reaches sooner than an exact one. The device run therefore
+  records the probe-refusal rate rather than only the executable count, and the counters
+  are in the product for that reason.
+- **`N == M` had two indistinguishable causes, and now has one each.** W4 could not tell
+  "the key never grouped, so the driver was never asked" from "it grouped and the driver
+  refused" without reading the signature's source afterwards. `probes=` and `refused=`
+  on the registry's own line separate them, and the driver's `cudaError_t` and
+  `cudaGraphExecUpdateResult` pair is printed verbatim on each refusal. A device run that
+  cannot make that distinction measures nothing, which is why the instrument landed with
+  the flag rather than after it.
+- **`sharedMemBytes` is KEPT under the coarse key, and this was decided rather than
+  swept.** It is a kernel-node parameter like the dimensions are, so the same reasoning
+  would drop it. Two facts say do not. It is not where the batch dimension lives — decode
+  dynamic shared memory is sized by head dimension and block geometry — so dropping it
+  buys the hypothesis nothing. And a dynamic size above the 48 KiB static limit is legal
+  only for a function that opted in through `cudaFuncAttributeMaxDynamicSharedMemorySize`,
+  an attribute of the FUNCTION rather than of the node, which makes a changed size the
+  field most likely to force a re-instantiate instead of a re-point. Keeping it preserves
+  a real discriminator at no cost to what is being measured and holds the experiment to
+  one variable. The memcpy `kind` and the memset `elementSize` and `height` are kept for
+  the harder version of the same reason: the update contract itself refuses a changed
+  memcpy memory type and refuses to change a memset that is not 1-D, so a key that
+  dropped them would manufacture refusals rather than folds.
 - **Retaining the raw graph costs host memory.** A `cudaGraph_t` holds the node
   descriptions, not the device-side executable image; it is retained only while dedup is
   on, and it is released with its handle. The direction is safe with respect to

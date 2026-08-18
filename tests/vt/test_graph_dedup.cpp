@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <set>
 #include <stdexcept>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,11 @@ struct FakeDevice {
   int graph_destroyed = 0;
   int updates = 0;
   std::set<int> reject_update_for;  // graph ids the driver refuses to update onto
+  // (currently-reflected graph id, target graph id) pairs the driver refuses. This is
+  // the shape reject_update_for cannot express and the shape that matters: whether an
+  // update is accepted can depend on WHICH graph the executable currently holds, not
+  // only on the one it is being pointed at.
+  std::set<std::pair<int, int>> reject_update_pair;
   // Graph ids the driver refuses to INSTANTIATE. cudaGraphInstantiate fails for reasons
   // that have nothing to do with the topology -- out of memory is the common one on the
   // unified-memory box this row exists for -- so it is a distinct outcome from a refused
@@ -108,7 +114,9 @@ bool FakeUpdate(void* exec_handle, void* graph_handle, std::string* detail) {
   }
   auto* exec = static_cast<FakeExec*>(exec_handle);
   auto* graph = static_cast<FakeGraph*>(graph_handle);
-  if (g_dev->reject_update_for.count(graph->id) != 0 || exec->sig != graph->sig) {
+  if (g_dev->reject_update_for.count(graph->id) != 0 ||
+      g_dev->reject_update_pair.count({exec->id, graph->id}) != 0 ||
+      exec->sig != graph->sig) {
     if (detail != nullptr) *detail = "fake driver refused the update";
     return false;
   }
@@ -388,6 +396,39 @@ TEST_CASE("a probe the driver cannot instantiate degrades instead of driving a n
     registry.Replay(second, nullptr);
   }
   CHECK(scope.dev.launch_log == std::vector<int>{1, 2, 1, 2});
+
+  registry.Close();
+}
+
+TEST_CASE("a replay update the driver refuses fails loudly rather than launching stale nodes") {
+  DeviceScope scope;
+  // Register probes (group.raws.front(), candidate) but Replay issues
+  // (group.current_raw, target), and from the third group member onwards those pairs
+  // differ -- so honouring the probe assumes update compatibility is TRANSITIVE across a
+  // group. Nothing asserts that. Refusing exactly the pair Register never asks about
+  // reproduces the case: every probe succeeds, the group folds to one executable, and
+  // the SECOND replay is where the assumption is tested for real.
+  scope.dev.reject_update_pair.insert({2, 3});
+  auto registry = MakeRegistry();
+
+  void* g1 = registry.Register(MakeGraph("decode", 1));
+  void* g2 = registry.Register(MakeGraph("decode", 2));
+  void* g3 = registry.Register(MakeGraph("decode", 3));
+  // Every probe was (graph 1, candidate), and the driver accepts those.
+  REQUIRE(registry.ExecCount() == 1);
+
+  registry.Replay(g2, nullptr);  // (1 -> 2), accepted; the executable now reflects 2
+
+  // And now the fold nobody probed. What must NOT happen is the silent alternative:
+  // leaving the executable pointing at graph 2 and launching it under g3's handle, which
+  // is a wrong answer rather than a loud one. This VT_CHECK is the entire reason the
+  // transitivity assumption is survivable, so it is gated rather than asserted in prose.
+  CHECK_THROWS_AS(registry.Replay(g3, nullptr), std::runtime_error);
+  CHECK(scope.dev.launch_log == std::vector<int>{2});
+
+  // g1 is unaffected: its own fold is one the driver still accepts.
+  registry.Replay(g1, nullptr);
+  CHECK(scope.dev.launch_log == std::vector<int>{2, 1});
 
   registry.Close();
 }

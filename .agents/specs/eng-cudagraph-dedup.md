@@ -172,6 +172,7 @@ an assertion about intent.
 | `is off unless the environment asks for it` | `GraphDedupEnabledFor()` polarity, including the values that only the terminator check rejects (`"10"`, `"11"`, `"1 "`, `"1x"`) | `:321` |
 | `a capture the driver cannot instantiate fails at the capture site` | a null `instantiate` throws inside `Register`, mints no handle, counts nothing, and releases the capture it took ownership of | ours; added by the fresh review of #1178 |
 | `a probe the driver cannot instantiate degrades instead of driving a null exec` | a failed probe answers "cannot fold" rather than passing a null executable to `cudaGraphExecUpdate` | ours; added by the fresh review of #1178 |
+| `a replay update the driver refuses fails loudly rather than launching stale nodes` | a refusal on the fold `Register` never probed throws, and the executable's previous contents are NOT launched under the asking handle | ours; pins the safety claim that makes the transitivity assumption below survivable |
 
 ## Gates
 
@@ -248,7 +249,9 @@ an assertion about intent.
   demonstrated it with a driver refusal keyed on the `(current, target)` pair: every
   `Register` probe succeeded and the **second** `Replay` threw. The failure polarity is
   what makes it survivable — a refusal lands on the `VT_CHECK` in `Replay`, loudly, and
-  never on a silent launch of the executable's previous contents. The stronger fix is to
+  never on a silent launch of the executable's previous contents — which the case
+  `a replay update the driver refuses fails loudly rather than launching stale nodes`
+  now gates, by refusing exactly the pair `Register` never asks about. The stronger fix is to
   probe `group.current_raw` instead of `raws.front()`, which removes the assumption
   entirely; it is **not** taken here because it changes probe behaviour while the device
   A/B (below) is measuring this exact commit. It is owed.
@@ -263,12 +266,12 @@ an assertion about intent.
   the moment that stops being true, and `ENG-CUDAGRAPH-BREAK` must not widen who
   captures without adding one.
 - **The signature builder has no executable coverage; it is compile-gated only.** The
-  12 cases in `tests/vt/test_graph_dedup.cpp` drive `GraphDedupRegistry` through a fake
+  13 cases in `tests/vt/test_graph_dedup.cpp` drive `GraphDedupRegistry` through a fake
   ops table, so they gate the registry's launch-sequence identity and nothing else.
   `src/vt/graph_dedup_runtime.h` — the Kahn ordering, the topological re-index, the
   sorted edge emission, the five node-payload cases, the depth-4 child-graph bound and
   the five degradation escapes — is reached by no test on any tier; `cuda-fat-build`
-  proves only that it compiles. "12/12 negative mutations detected" is a statement about
+  proves only that it compiles. "13/13 negative mutations detected" is a statement about
   `graph_dedup.h`, and must not be read as coverage of that file. The probe caps the
   blast radius, so an unstable signature can never produce a wrong replay — but it has
   exactly one silent mode: a signature that is unstable for some topology folds nothing,

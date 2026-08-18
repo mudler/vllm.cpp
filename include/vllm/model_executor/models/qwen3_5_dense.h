@@ -206,12 +206,21 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // The same load with an EXPLICIT presence probe — what `LoadQwen3_5Dense` calls
-// per layer. The resolver-only overload above answers `has` with a constant
-// `true`, which forces every routed projection down the compressed-tensors
-// spelling; a checkpoint that mixes namings (the ModelOpt `weight_scale_2` form,
-// or an FP8/BF16 projection next to an NVFP4 one) needs the real probe. Exposed
-// so the loader gate can drive a whole synthetic layer through the SAME routing
-// production takes.
+// per layer, and the cheapest one to pass when the caller HAS a name index.
+// FIX-PROBE-CANNOT-SAY-NO (#1258): the resolver-only overload above used to
+// answer `has` with a constant `true`, which forced every routed projection down
+// the compressed-tensors spelling and, after #1189 M3 taught the loader to
+// cross-check the config against the tensors, made that seam refuse every
+// checkpoint that has no block-wise FP8 scale — which is all of them but one.
+// It now derives the probe from the resolver (`dense_loaders::
+// ProbeThroughResolver`), so both overloads answer the same question truthfully
+// and differ only in cost. Exposed so the loader gate can drive a whole
+// synthetic layer through the SAME routing production takes.
+//
+// A probe handed here must be able to answer `false`: this overload refuses one
+// that cannot (`dense_loaders::CheckProbeCanAnswerNo`), because a predicate that
+// only says yes reports every optional tensor as present and the next guard to
+// ask about one blames the checkpoint.
 // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): `block` carries the checkpoint's declared
 // `weight_block_size`, `activation_scheme` and `modules_to_not_convert`, read
 // ONCE by `LoadQwen3_5Dense` from the quantization config. A default-constructed

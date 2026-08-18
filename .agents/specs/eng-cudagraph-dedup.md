@@ -230,10 +230,17 @@ an assertion about intent.
   hit is probed with the real driver call before it is honoured. This is deliberate:
   a signature that had to be exhaustive would be a correctness surface, and it is
   instead a lookup key.
-- **`cudaGraphExecUpdate` changed signature at CUDA 12.** The 3-argument
-  `cudaGraphExecUpdateResultInfo` form is used at `CUDART_VERSION >= 12000` and the
-  legacy 4-argument form below it, so the file compiles on both. HIP has only the
-  4-argument form.
+- **Two runtime-API calls changed shape across CUDA major versions, and only one was
+  foreseen.** `cudaGraphExecUpdate` took the 3-argument `cudaGraphExecUpdateResultInfo`
+  form at CUDA 12, so both it and the legacy 4-argument form are bound; HIP has only
+  the 4-argument form. `cudaGraphGetEdges` gained a fifth `cudaGraphEdgeData*`
+  parameter at **CUDA 13**, which was NOT foreseen: the local syntax check ran against
+  CUDA 12.9 headers and passed, and `cuda-fat-build` on `nvidia/cuda:13.3.0` is what
+  reported it (4 errors, `graph_dedup_runtime.h:161,168`). Both shapes are now bound in
+  one `GetEdges` helper so the topology walk stays one piece of code, and the 5-argument
+  shape is verified locally against CUDA 12.9's identical `cudaGraphGetEdges_v2`. The
+  general lesson for this file: a header-shape check is only as current as the toolkit
+  it ran against, and the CI job is the gate, not the local proxy.
 
 ## Owed
 

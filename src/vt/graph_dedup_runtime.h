@@ -77,6 +77,30 @@ using Stream = cudaStream_t;
 
 namespace vt::graph_dedup_rt {
 
+// cudaGraphGetEdges gained a fifth `cudaGraphEdgeData*` parameter in CUDA 13; the
+// four-argument form is what CUDA 12 and HIP ship. Both shapes are bound here rather
+// than at the call sites so the topology walk below stays one piece of code. This is
+// the one place a local compile against CUDA 12 headers could not have caught, and did
+// not: the `cuda-fat-build` job on nvidia/cuda:13.3.0 is what reported it.
+inline bool GetEdges(Graph graph, Node* from, Node* to, std::size_t* num_edges) {
+#if defined(VT_GRAPH_DEDUP_HIP)
+  return hipGraphGetEdges(graph, from, to, num_edges) == hipSuccess;
+#elif CUDART_VERSION >= 13000
+  // Queried with every pointer null; filled with a real buffer, because passing null
+  // edge data to the filling call is not a shape the documentation promises. The data
+  // is discarded: an edge's annotation is not part of the identity this key needs.
+  std::vector<cudaGraphEdgeData> edge_data;
+  cudaGraphEdgeData* data = nullptr;
+  if (from != nullptr) {
+    edge_data.resize(*num_edges);
+    data = edge_data.data();
+  }
+  return cudaGraphGetEdges(graph, from, to, data, num_edges) == cudaSuccess;
+#else
+  return cudaGraphGetEdges(graph, from, to, num_edges) == cudaSuccess;
+#endif
+}
+
 inline void AppendNumber(std::string* out, long long value) {
   out->append(std::to_string(value));
   out->push_back(',');
@@ -158,14 +182,13 @@ inline void AppendGraphSignature(Graph graph, std::string* out, int depth) {
   }
 
   std::size_t num_edges = 0;
-  if (VTGD_FN(GraphGetEdges)(graph, nullptr, nullptr, &num_edges) != VTGD_SUCCESS) {
+  if (!GetEdges(graph, nullptr, nullptr, &num_edges)) {
     out->append("edges?;");
     return;
   }
   std::vector<Node> from(num_edges);
   std::vector<Node> to(num_edges);
-  if (num_edges > 0 && VTGD_FN(GraphGetEdges)(graph, from.data(), to.data(),
-                                              &num_edges) != VTGD_SUCCESS) {
+  if (num_edges > 0 && !GetEdges(graph, from.data(), to.data(), &num_edges)) {
     out->append("edges?;");
     return;
   }

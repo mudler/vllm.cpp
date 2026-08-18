@@ -323,16 +323,24 @@ ModelRegistry::OutOfTreeSupportedModels() {
 std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
                                                  const ModelSource& source) {
   const ModelRegistration& registration = Resolve(config);
-  // FIX-FP8-BLOCKWISE-REFUSAL (#1166): a block-wise (fine-grained) FP8
-  // checkpoint is refused BY NAME here, before any weight loader runs.
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3), narrowing FIX-FP8-BLOCKWISE-REFUSAL
+  // (#1166): the block-wise (fine-grained) FP8 config is READ and VALIDATED
+  // here, before any weight loader runs, and only what this build cannot
+  // execute is refused BY NAME -- a `quant_method` that is not fp8, a
+  // `weight_block_size` that is not exactly two dimensions, an
+  // `activation_scheme` other than `dynamic`, and a block shape other than
+  // 128x128. A supported `[128, 128]` `dynamic` checkpoint now passes and its
+  // projections load through the `weight_scale_inv` rung in
+  // `qwen3_5_dense_weights.cpp`. Nothing READS the resulting weight yet, and
+  // that gap is refused by name one step later, at `ModelRegistry::Prepare`.
   //
   // AFTER `Resolve`, so an unsupported architecture still reports the
   // architecture rather than its quantization. BEFORE `load_weights`, because
-  // that is what makes the message about the missing ARM instead of about the
-  // first tensor whose name does not resolve: the dense loader branches on the
-  // weight dtype alone and pulls a block-wise projection into the per-tensor
-  // arm, which then asks for a `weight_scale` a block-wise checkpoint spells
-  // `weight_scale_inv` and dies on `tensor not found`.
+  // that is what makes the message about the unsupported SHAPE instead of about
+  // the first tensor whose name does not resolve: the dense loader branches on
+  // the weight dtype alone and a block-wise weight really is `F8_E4M3`, so it
+  // used to enter the per-tensor arm, ask for a `weight_scale` the checkpoint
+  // spells `weight_scale_inv`, and die on `tensor not found`.
   //
   // Sited on the registry rather than per model loader on purpose.
   // `weight_block_size` is a property of the checkpoint's quantization config

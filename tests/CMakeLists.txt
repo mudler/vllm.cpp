@@ -400,6 +400,12 @@ vllm_cpp_add_test(test_gguf_device_fit_reach
 # reachability proof and not a class test.
 vllm_cpp_add_test(test_fp8_block_quant
   vllm/model_executor/layers/test_fp8_block_quant.cpp)
+# MODEL-FP8-BLOCK-WEIGHT #1189 M3: `Fp8BlockWeight`, the `weight_scale_inv`
+# loader rung, and the config reader. Every case enters through
+# `ModelRegistry::Load` or `LoadQwen3_5Dense` -- the loader that call reaches --
+# and never through `LoadFp8BlockRaw`, so deleting the rung reds this target.
+vllm_cpp_add_test(test_fp8_block_weight_load
+  vllm/model_executor/models/test_fp8_block_weight_load.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)

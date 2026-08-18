@@ -1418,6 +1418,9 @@ authority and no fresh review (§8).
 | [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | 5c — DiT staging is 7.5 min at 70.5 MiB/s, against 127.8 on rung 2; GPU idle, 0.15 cores | owed |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | 0 — the GPU is idle for the WHOLE post-load render, not only the decode | owed; carries the owed `utilization.gpu` positive control |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | none — the evidence for rungs 1 and 2 and for §1.4 is on an unreachable host, and neither rung's sampler cadence closes | owed |
+| [#1202](https://github.com/mudler/vllm.cpp/issues/1202) | 7 — `Ltx2FuseLoraIntoTensor` is a scalar single-threaded loop, ~0.53 GFLOP/s | owed, MEASURED on the full model: 2.3% of one pass in 10.4 min |
+| [#1208](https://github.com/mudler/vllm.cpp/issues/1208) | 8 — the text tower's `Linear` is scalar, single-threaded and `double`-accumulating | owed, MEASURED at 1073 s of byte-identical RSS; also a dtype-polarity divergence from `F.linear` |
+| [#1210](https://github.com/mudler/vllm.cpp/issues/1210) | 9 — the two-stage rebind fuses, un-fuses and re-fuses; the load-time pass is provably wasted | owed; supplies the number `ltx2_video.cpp:2849` records as UNMEASURED |
 
 **[#1008](https://github.com/mudler/vllm.cpp/issues/1008) is NOT owed here. It
 landed.** It was filed by this row as lever 2 and taken by `LTX25-DECODE-DTYPE`,

@@ -145,8 +145,13 @@ void BreakableGraph::Replay(Queue& q) {
 
 GraphCaptureScope* GraphCaptureScope::Current() { return t_current_scope; }
 
-GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out)
-    : b_(&b), q_(&q), g_(&out), uncaught_on_entry_(std::uncaught_exceptions()) {
+GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out,
+                                     GraphCaptureMode mode)
+    : b_(&b),
+      q_(&q),
+      g_(&out),
+      mode_(mode),
+      uncaught_on_entry_(std::uncaught_exceptions()) {
   // Refused before ANY backend call, and refused in both lanes so the switch
   // cannot change which programs are legal.
   //
@@ -211,6 +216,16 @@ void GraphCaptureScope::EndSegment() {
 
 void GraphCaptureScope::AppendBreak(std::function<void()> fn, const void* destination) {
   if (!active_) return;
+  // A `kFull` scope has ONE segment by definition, so a registered break would
+  // leave `break_count() == segment_count()` and `Replay` would drop it. Every
+  // `GraphBreak` form already takes the pass-through arm here (`splits()` is
+  // false), and this refusal is what stops a form added later from opting out of
+  // that — the same reason the aliasing check lives at this one registration
+  // point rather than in each form.
+  VT_CHECK(mode_ == GraphCaptureMode::kPiecewise,
+           "GraphBreak: this capture scope is kFull (vLLM CUDAGraphMode.FULL), which "
+           "captures the forward as ONE segment; a break point cannot be registered "
+           "in it. Open the scope in kPiecewise to split");
   // The ALIASING half of lifetime rule 1, refused rather than documented. Two
   // break points writing through one CELL bind both replay closures to the same
   // address: the earlier writeback is overwritten on every replay, and any
@@ -234,7 +249,7 @@ void GraphCaptureScope::AppendBreak(std::function<void()> fn, const void* destin
 // The bare marker (`:370-374`).
 void GraphBreak() {
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     detail::CountBreakPoint();
     return;
   }

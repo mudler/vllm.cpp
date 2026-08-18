@@ -883,3 +883,122 @@ TEST_CASE("G3: the seam reports segments captured, breaks registered and replays
   CHECK(s.breaks_registered == 1);
   CHECK(s.replays == 2);
 }
+
+// ---------------------------------------------------------------------------
+// vt::GraphCaptureMode — the second half of vLLM's capture contract, added by
+// W2 (#1261). Upstream has no counterpart: SGLang's BCG IS the piecewise mode
+// and has no full-graph arm to select. The primary oracle does, and it is the
+// one a decode driver reaches for.
+// ---------------------------------------------------------------------------
+
+// The DEFAULT is piecewise, stated as a case rather than left to the twenty-odd
+// cases above that construct the three-argument scope. A default that silently
+// changed would turn every one of them into a one-segment capture whose break
+// assertions then fail for a reason none of them names.
+TEST_CASE("Mode: the default scope is kPiecewise and it splits") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g);
+    CHECK(scope.mode() == vt::GraphCaptureMode::kPiecewise);
+    CHECK(scope.active());
+    CHECK(scope.splits());
+    vt::GraphBreak();
+  }
+  CHECK(g.segment_count() == 2);
+  CHECK(g.break_count() == 1);
+}
+
+// kFULL <- vLLM `CUDAGraphMode.FULL` (`vllm/config/compilation.py:61`), the half
+// of `FULL_AND_PIECEWISE` (`:63`) that `decode_mode()` (`:65-66`) selects for a
+// uniform decode batch, documented at `:630-632`. A break point inside such a
+// scope runs its function INSIDE the single segment and splits nothing, which is
+// exactly what a captured decode step has always done.
+//
+// The break function issues its work through `Record`, so the assertion is not
+// "the break was skipped" but the stronger "the break's work landed in the ONE
+// segment and runs on every replay" — the difference between a full capture and
+// a step that quietly lost an operation.
+TEST_CASE("Mode: a kFull scope captures ONE segment and the break's work is INSIDE it") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf mid = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf y = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf broken_dst = MakeBuf(b, {0, 0, 0, 0});
+  BreakSlot<vt::Tensor> broken;
+
+  const vt::GraphBreakStats before = vt::GetGraphBreakStats();
+  {
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kFull);
+    REQUIRE(scope.active());
+    CHECK(scope.mode() == vt::GraphCaptureMode::kFull);
+    CHECK_FALSE(scope.splits());
+    b.Record([&] { AddInto(mid, x.t, 1); });  // mid = x + 1
+    GraphBreak(
+        [&] {
+          // Work a real break function would issue on the queue. In kFull the
+          // stream is still capturing, so it belongs to the one segment.
+          b.Record([&] { AddInto(broken_dst, mid.t, 0); });
+          return broken_dst.t;
+        },
+        broken);
+    b.Record([&] { AddInto(y, *broken, 3); });  // y = broken + 3
+  }
+  const vt::GraphBreakStats after = vt::GetGraphBreakStats();
+
+  // ONE segment, NO break function, and ONE Begin/EndCaptureGraph pair: the
+  // capture never re-began.
+  CHECK(g.segment_count() == 1);
+  CHECK(g.break_count() == 0);
+  CHECK(b.Trace() == "Begin EndCaptureGraph");
+  CHECK(after.segments_captured - before.segments_captured == 1);
+  CHECK(after.breaks_registered - before.breaks_registered == 0);
+  // The site was still REACHED, which is the counter that separates a kFull
+  // capture from one whose break-point registration was deleted.
+  CHECK(after.break_points_reached - before.break_points_reached == 1);
+  // The slot took the pass-through path, so the seam owns no cell for it.
+  CHECK_FALSE(broken.pinned());
+
+  Fill(x, 10);
+  b.ClearLog();
+  g.Replay(q);
+  CHECK(b.Trace() == "ReplayGraph");
+  // x=10 -> +1=11 -> break copies 11 -> +3=14. The break's operation ran at
+  // replay, from inside the segment.
+  CHECK(Read(mid) == std::vector<int32_t>{11, 11, 11, 11});
+  CHECK(Read(broken_dst) == std::vector<int32_t>{11, 11, 11, 11});
+  CHECK(Read(y) == std::vector<int32_t>{14, 14, 14, 14});
+}
+
+// The refusal at the ONE registration point. Every `GraphBreak` form already
+// takes the pass-through arm in kFull, so this is what stops a form added later
+// from registering a break into a capture that has a single segment — where
+// `break_count() == segment_count()` and `Replay` drops the last break.
+TEST_CASE("Mode: registering a break into a kFull scope is REFUSED") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kFull);
+    REQUIRE(scope.active());
+    CHECK_THROWS(scope.AppendBreak([] {}, nullptr));
+    // The CONTROL: the identical call on a piecewise scope is accepted, so the
+    // refusal is about the mode and not about the arguments.
+  }
+  BreakableGraph g2;
+  {
+    GraphCaptureScope scope(b, q, g2, vt::GraphCaptureMode::kPiecewise);
+    CHECK_NOTHROW(scope.AppendBreak([] {}, nullptr));
+    scope.EndSegment();
+    scope.BeginSegment();
+  }
+  CHECK(g2.break_count() == 1);
+  CHECK(g2.segment_count() == 2);
+}

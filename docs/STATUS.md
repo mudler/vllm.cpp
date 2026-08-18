@@ -199,6 +199,13 @@ the attention family — and only the registration form is SGLang's, because vLL
 gets its split from Dynamo and FX and we have no compiler. W1 registers ONE
 break point, at the dense attention entry of `Qwen3ForCausalLM`.
 
+W2 (2026-08-18, #1261) migrates the first driver: the shared dense decode graph
+now captures and replays through the seam instead of its own `BeginCapture` pair
+and raw handle. It captures in FULL mode, mirroring vLLM's decode arm, so a
+decode step keeps the single graph it already had; the PIECEWISE arm has no
+production driver yet. Bit-exactness against a REPLAYED capture on a real GPU is
+owed, not met.
+
 The stage's exit criterion was measured rather than assumed: ending a capture
 and BEGINNING A NEW ONE on the same stream mid-forward, with eager work between,
 is legal under the thread-local capture mode our CUDA backend uses (`orin:gpu0`

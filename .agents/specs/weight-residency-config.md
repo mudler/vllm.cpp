@@ -745,15 +745,27 @@ declared recipe on the same host.
 |---|---|---|---|
 | the repair on `65d6cdaed` | 0 | 0 | rc 0, **100% tests passed, 0 failed out of 523**, 466.09 s |
 | the repair merged onto `c20018f8d` | 0 | 0 | rc 0, **100% tests passed, 0 failed out of 523**, 587.09 s |
+| the same, merged onto `727163997` | 0 (`ninja: no work to do`) | 0 | rc 0, **100% tests passed, 0 failed out of 523**, 2218.79 s |
 
 `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e` are Skipped in
-both, as they are on this host. The second run is the one that counts: a clean
-merge is not a merge that builds, so the gate is rerun on the merged tree rather
-than inherited. The second run is slower for contention reasons only — the box's
-1-minute load average was above 200 for much of it, and `test_ltx2_video` alone
-took 542.97 s against 461.46 s. `scripts/check-symbol-anchors.py`, which
-`origin/main` added in the interval, reports OK: 618 citations, 93 in-repo checked,
-93 fresh, 0 stale. `scripts/agent-preflight.sh` is rc 0 with no failing gate.
+all three, as they are on this host. **The LAST run is the one that counts**: a
+clean merge is not a merge that builds, so the gate is rerun on each merged tree
+rather than inherited. The third run's build reported `ninja: no work to do`,
+because `727163997` changes only records and checkers, so its binaries are the
+second run's binaries; it was rerun anyway rather than argued.
+
+The three wall times differ for contention only, and the difference is the box
+rather than the tree: the 1-minute load average ranged from about 40 to above 220
+across them, and `test_ltx2_video` alone took 461.46 s, 542.97 s and 2147.17 s —
+three worktrees on this host were running that same test at once.
+
+`scripts/check-symbol-anchors.py`, which `origin/main` added in the interval,
+reports OK: 618 citations, 93 in-repo checked, 93 fresh, 0 stale.
+`scripts/agent-preflight.sh` is rc 0 with no failing gate. It was rc 1 before the
+last merge, on `test_check_gate_commands`; the spec that assertion reads is
+byte-identical on this branch and on `origin/main` (`eebe438b1` both sides), so it
+was measuring `origin/main`, and `origin/main`'s own `FIX-GATE-COMMANDS-PROSE-PIN`
+(#1229) is the repair. Merging it was the whole fix.
 
 ### W1 (#1110, #1109, #1122, #1133)
 

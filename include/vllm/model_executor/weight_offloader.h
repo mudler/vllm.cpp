@@ -38,8 +38,10 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "vllm/config/offload.h"
+#include "vllm/model_executor/weight_offload_policy.h"
 
 namespace vllm {
 
@@ -50,15 +52,29 @@ class WeightOffloader {
  public:
   virtual ~WeightOffloader() = default;
 
-  // The wrap-site analogue. Upstream's `wrap_modules` receives the layer
-  // modules and rewrites each parameter's storage; ours receives the loaded
-  // model at the point it materialises resident weights. A backend that
-  // offloads acts here. The no-op returns without touching the model.
-  virtual void PrepareModel(LoadedModel& model) = 0;
+  // THE DECISION SEAM. A loader asks this for each weight it is about to
+  // materialise, and keeps the weight off the device when the answer is
+  // kOffload. This is the one place that answers "is this weight offloaded",
+  // and it is asked DURING loading rather than after, because a materialised
+  // weight has already paid the allocation the feature exists to avoid.
+  //
+  // `canonical_name` must be the dotted parameter name upstream matches against
+  // (`mlp.experts.w2_weight`), not a format-specific tensor name. See
+  // weight_offload_policy.h for why the caller owns that conversion.
+  //
+  // Upstream has no equivalent call because it rewrites parameter storage in
+  // `wrap_modules` after construction; the recorded reason we cannot is in the
+  // spec's port map.
+  virtual WeightOffloadDecision ConsiderWeight(const std::string& canonical_name,
+                                               int64_t bytes) = 0;
 
-  // Upstream: post_init (base.py:68-76). Called after model construction
-  // completes so a backend can finalise storage or start a first prefetch.
-  virtual void PostInit() {}
+  // Upstream: post_init (base.py:68-76). Called once after the model is built
+  // and prepared, so a backend can finalise storage, report a total, or start a
+  // first prefetch. This REPLACES the earlier `PrepareModel` hook, which was a
+  // port of `wrap_modules` and became a lie the moment the decision moved into
+  // the loaders: nothing could implement it meaningfully, and it duplicated
+  // this one.
+  virtual void OnModelPrepared(LoadedModel& model) { (void)model; }
 
   // Upstream: sync_prev_onload / join_after_forward (base.py:79-85). vLLM calls
   // these around CUDA-graph capture and replay
@@ -72,9 +88,16 @@ class WeightOffloader {
   // (base.py:118-125).
   virtual const char* name() const = 0;
 
-  // True when this offloader can move a weight. False for the no-op and for a
-  // backend that is selected but not yet implemented. The engine reports the
-  // difference rather than leaving a configured budget silently inert.
+  // Bytes this offloader has kept off the device so far. Upstream reports the
+  // same total once at the end of wrap_modules (uva.py:57-61).
+  virtual int64_t offloaded_bytes() const = 0;
+
+  // How many weights this offloader was ASKED about. It is the evidence that a
+  // loader which declares `supports_weight_offload` actually consulted the
+  // seam. A model can declare the capability and then never ask, and without
+  // this counter that lie is invisible: the run simply offloads nothing.
+  virtual int64_t weights_considered() const = 0;
+
   virtual bool moves_weights() const = 0;
 };
 
@@ -82,9 +105,57 @@ class WeightOffloader {
 // unchanged, which is the current engine path.
 class NoopWeightOffloader final : public WeightOffloader {
  public:
-  void PrepareModel(LoadedModel&) override {}
+  // Every weight stays resident, so the engine's existing path is unchanged BY
+  // CONSTRUCTION rather than by a flag a caller has to remember to check.
+  WeightOffloadDecision ConsiderWeight(const std::string&, int64_t) override {
+    ++considered_;
+    return WeightOffloadDecision::kBudgetExhausted;
+  }
   const char* name() const override { return "NoopWeightOffloader"; }
+  int64_t offloaded_bytes() const override { return 0; }
+  int64_t weights_considered() const override { return considered_; }
   bool moves_weights() const override { return false; }
+
+ private:
+  int64_t considered_ = 0;
+};
+
+// Upstream: class UVAOffloader (offloader/uva.py:21-137). The concrete arm that
+// keeps a weight off the device under a byte budget.
+//
+// WHAT THIS CLASS DOES AND DOES NOT DO. It answers the DECISION, delegating to
+// the `WeightOffloadPolicy` it owns, and it counts the bytes it has approved.
+// It does not copy, pin, or map anything: the caller that asked keeps the
+// weight in host memory instead of materialising it on the device, so the move
+// is an ABSENCE of work rather than work. That is the whole reason the decision
+// had to move into the loaders (see weight_offload_policy.h).
+//
+// The pinned-host-copy and device-view halves of upstream's UVA arm
+// (uva.py:97-105) have no equivalent yet and are NOT silently skipped: they
+// belong to the loader-side application, which owns the buffer.
+class UvaWeightOffloader final : public WeightOffloader {
+ public:
+  explicit UvaWeightOffloader(WeightOffloadPolicy policy)
+      : policy_(std::move(policy)) {}
+
+  WeightOffloadDecision ConsiderWeight(const std::string& canonical_name,
+                                       int64_t bytes) override {
+    ++considered_;
+    return policy_.Consider(canonical_name, bytes);
+  }
+  const char* name() const override { return "UvaWeightOffloader"; }
+  int64_t offloaded_bytes() const override { return policy_.offloaded_bytes(); }
+  int64_t weights_considered() const override { return considered_; }
+  bool moves_weights() const override { return policy_.active(); }
+
+  // Upstream logs the total once when wrap_modules finishes (uva.py:57-61). We
+  // have no single finish point, so the engine reports it here after the model
+  // is prepared.
+  int64_t max_bytes() const { return policy_.max_bytes(); }
+
+ private:
+  WeightOffloadPolicy policy_;
+  int64_t considered_ = 0;
 };
 
 // Upstream: get_offloader / set_offloader and the module-global `_instance`
@@ -115,6 +186,34 @@ struct WeightOffloaderChoice {
   std::string selected_backend_pending;
 };
 WeightOffloaderChoice CreateWeightOffloader(const OffloadConfig& config);
+
+// THE TOTALITY GUARD. Throws std::invalid_argument when `config` would offload
+// a weight but `supports_weight_offload` is false for the resolved model.
+//
+// This exists because there is no single upload seam to enforce the obligation
+// structurally: each model allocates its own device buffers. Without the guard,
+// a model nobody wired accepts a budget and keeps every weight on the device,
+// with no error anywhere. Refusing names the architecture, which is what turns
+// an invisible memory bug into a message the operator can act on.
+//
+// Mirrors the project rule that an unimplemented arm is refused with a message
+// naming the missing piece, rather than silently doing nothing.
+void RefuseUnsupportedWeightOffload(const OffloadConfig& config,
+                                    std::string_view architecture,
+                                    bool supports_weight_offload);
+
+// THE SECOND HALF OF THE GUARD, checked after the model is loaded. A model can
+// declare `supports_weight_offload` and then never call `ConsiderWeight`, and
+// the first guard cannot see that lie: the run just offloads nothing. Throws
+// std::invalid_argument when the offloader would move weights, the model
+// declared support, and it was asked about ZERO weights.
+//
+// Zero is the only value that proves a defect. Any other count means the loader
+// consulted the seam, and whether it asked about every weight is the loader's
+// own test to make.
+void VerifyWeightOffloadWasConsulted(const WeightOffloader& offloader,
+                                     std::string_view architecture,
+                                     bool supports_weight_offload);
 
 }  // namespace vllm
 

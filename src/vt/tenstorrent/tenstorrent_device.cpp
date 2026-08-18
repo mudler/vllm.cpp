@@ -27,8 +27,15 @@ MeshDevice& SharedMeshDevice() {
   // OS/kernel driver reclaim the PCIe device's file descriptors and hardware
   // state on process exit regardless of a userspace close() call, the same
   // assumption CUDA processes routinely rely on), if not textbook-clean.
-  static std::shared_ptr<MeshDevice>* device =
-      new std::shared_ptr<MeshDevice>(ttnn::open_mesh_device(/*device_id=*/0));
+  // ITEM 5: reserve a dedicated DRAM trace region (50 MB, the tt-metal vLLM
+  // plugin's value — worker.py:710) so allocations during trace capture can
+  // never overlap the trace buffer. With the default (0), the trace buffer
+  // is carved from the general pool and ANY capture-time allocation fatals
+  // with "Trace buffer ... overlaps with DRAM activity".
+  static std::shared_ptr<MeshDevice>* device = new std::shared_ptr<MeshDevice>(
+      ttnn::open_mesh_device(
+          /*device_id=*/0, /*l1_small_size=*/DEFAULT_L1_SMALL_SIZE,
+          /*trace_region_size=*/50 * 1024 * 1024));
   return **device;
 }
 

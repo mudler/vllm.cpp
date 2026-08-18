@@ -86,6 +86,36 @@ llama.cpp comparison needs.
 - [ ] A structural gate accounts for **every** tensor in the real checkpoint
       index — enumerated == present, zero unaccounted — reading headers only,
       env-gated so CI never needs the asset.
+- [ ] **The weights are DOCUMENTED, by repo and revision, in `docs/USAGE.md`.**
+      See §2.1 — this is a shipping obligation, not a nicety.
+
+### 2.1 Say which weights, from where — a port nobody can feed is not shipped
+
+**Every ported model documents the checkpoints it was built and gated against, in
+`docs/USAGE.md`, in the same change that makes the capability reachable.** Mirror
+the table MiniMax-H3 already carries (`docs/USAGE.md`, the H3 sections): one row
+per artifact, with the **file name, its size, and a link to the exact HuggingFace
+repo**, grouped by arm (bf16/fp16, GGUF, NVFP4, …).
+
+What a row owes:
+
+- [ ] The **repo id and the revision** it was fetched at. A repo id alone is not
+      a pin: `unsloth/Qwen3.6-27B-NVFP4` was silently re-quantized in place under
+      an unchanged name, and a Music3 GGUF lineage was published four different
+      ways under one model. For a quantized artifact, record the **sha256** too.
+- [ ] Which arm the artifact belongs to, and **which arms are refused**, so a
+      user reads the refusal here rather than discovering it at load time.
+- [ ] The **total resident size** of the set, because that is what decides
+      whether a reader can run it at all.
+- [ ] Where a **third party** published it rather than the model's own authors,
+      say so — community quant repos are the arm most users will actually reach
+      for, and they carry different provenance from a first-party release.
+
+**Why this is a rule.** Weights are the part of a port a reader cannot infer from
+the code. A checkpoint that is 57 GB in total but ~28 GB in the arm we actually
+load, split across six component directories, with a native layout we refuse by
+name, is not something anyone reconstructs from a header file. The port is the
+easy half to publish; saying *what to feed it* is the half that makes it usable.
 
 ## 3. Forward
 
@@ -100,6 +130,10 @@ llama.cpp comparison needs.
 - [ ] Numeric bounds, not just token equality. A mechanism can be missing while
       the argmax is unchanged — that has happened here — so a tokens-only gate
       can pass a model that dropped one.
+- [ ] A production entry point reaches each mechanism, and a test enters through
+      that entry point rather than constructing the type by hand. Anything not
+      reached yet names its owning row and issue in the commit and under
+      `## Owed` in the spec ([`reachability.md`](reachability.md)).
 
 ## 4. Correctness gates
 

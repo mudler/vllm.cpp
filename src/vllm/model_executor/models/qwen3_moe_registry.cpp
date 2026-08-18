@@ -84,7 +84,7 @@ void PrepareQwen3MoeForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3MoeForCausalLM(LoadedModel& model,
                                          const ModelForwardInput& input) {
-  auto& qwen = static_cast<Qwen3MoeLoadedModel&>(model);
+  auto& qwen = ModelAs<Qwen3MoeLoadedModel>(model, "Qwen3MoeForCausalLM");
   const Qwen3MoeWeights& weights = qwen.weights();
 
   // DECODE CUDA-GRAPH path (W7): route a PURE-DECODE CUDA step through the

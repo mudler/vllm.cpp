@@ -250,6 +250,25 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 98, "IQ3_XXS"};
       return &t;
     }
+    case 19: {
+      // block_iq1_s (ggml-common.h:414-419): f16 d + QK_K/8 u8 qs
+      // + QK_K/32 u16 qh = 2 + 32 + 16 = 50, i.e. 1.5625 bpw. Carries the
+      // routed experts (ffn_down/gate/up_exps) of the Qwen3.8-2.4T-A95B
+      // UD-IQ1_S checkpoint, which is 96.92 % of that model's parameters
+      // (codebook dequant in cpu_quant_dequant.cpp / vt DType kIQ1_S).
+      static constexpr GgmlTypeTraits t{256, 50, "IQ1_S"};
+      return &t;
+    }
+    case 66: {
+      // block_iq1_xxxs, from the PINNED FORK oracle `llama-cpp-unsloth`
+      // (.agents/oracles/llama-cpp-unsloth.md, ggml-common.h:478-483):
+      // f16 d + QK_K/8 u8 qs + QK_K/64 u8 sc = 2 + 32 + 4 = 38, i.e.
+      // 1.1875 bpw. NO upstream llama.cpp defines type 66. It carries the
+      // routed experts of the Qwen3.8-2.4T-A95B UD-Q1_0 checkpoint, 96.92 % of
+      // that model's parameters.
+      static constexpr GgmlTypeTraits t{256, 38, "IQ1_XXXS"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.
@@ -589,6 +608,32 @@ bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
     for (const auto& s : map_->siblings)
       if (in(s.get())) return true;
   return false;
+}
+
+GgufFile::SpanSource GgufFile::SourceOfSpan(const uint8_t* data,
+                                            size_t nbytes) const {
+  SpanSource out;
+#if !defined(_WIN32)
+  const auto try_map = [&](const GgufMapping* m) {
+    if (m == nullptr || m->file == nullptr) return false;
+    const uint8_t* base = m->file->data();
+    const size_t size = m->file->size();
+    if (base == nullptr || data < base) return false;
+    const size_t off = static_cast<size_t>(data - base);
+    if (nbytes > size || off > size - nbytes) return false;
+    out.fd = m->file->fd();
+    out.offset = off;
+    return out.fd >= 0;
+  };
+  if (try_map(map_.get())) return out;
+  if (map_ != nullptr)
+    for (const auto& s : map_->siblings)
+      if (try_map(s.get())) return out;
+#else
+  (void)data;
+  (void)nbytes;
+#endif
+  return out;
 }
 
 void GgufFile::DropSpanResidency(const uint8_t* data, size_t nbytes) const {

@@ -1,13 +1,18 @@
 // Definitions for the shared 1-D BigVGAN vocoder core. See vocoder1d.h.
 #include "vllm/model_executor/models/vocoder1d.h"
 
+#include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 
 #include <algorithm>
 #include <cmath>
 #include <numbers>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace vllm {
@@ -49,6 +54,137 @@ std::vector<double> KaiserWindow(int64_t length, double beta) {
   return window;
 }
 
+// --- The convolution seam (#672) -------------------------------------------
+//
+// `Conv1d` and `ConvTranspose1d` below are no longer loops. They are thin
+// callers of `vt::Conv1d` / `vt::ConvTranspose1d`, whose CPU providers
+// (src/vt/cpu/cpu_conv1d_general.cpp) ARE those loops, moved statement for
+// statement. Two things follow, and both are the point of the change:
+//
+//   * on the CPU device nothing moved. Same accumulator width, same visit
+//     order, same zero-skip, same output-channel partition over the same
+//     threadpool, and the tensors are views over the caller's `std::vector`
+//     rather than copies. `tests/vllm/models/test_host_parallel.cpp` proves it
+//     against a verbatim copy of the pre-op loop.
+//   * a device provider now EXISTS to route to. Before this, the transposed
+//     convolution — 88.5 % of MiniMax-Music3's acoustic-half profile — had no
+//     `vt` op of any kind behind it, so there was nothing to offload to and
+//     hand-rolling a kernel outside the shared seam is what AGENTS.md forbids.
+
+vt::DeviceType ResolveConvDevice() {
+  // OPT-IN, and default CPU. Turning the device arm on by default would move
+  // the numerics of FOUR shipped models at once — MiniMax-Music3, MiniMax-H3's
+  // audio VAE, LTX-2.5's audio VAE and IndexTTS-2.5 all decode through here,
+  // and their goldens were taken on the host loop. The CUDA provider is written
+  // to reproduce the host reduction order exactly (see cuda_conv1d_general.cu),
+  // but "written to" is not "measured on every consumer's goldens", and a
+  // default that silently re-gates four models is not a default this row is
+  // entitled to set. `.agents/specs/minimax-music3.md` §13.6 names what is not
+  // reached, the row that owns the wiring, and the issue (#672).
+  //
+  // AND IT NAMES NO DEVICE. The first draft spelled `kCUDA` here and
+  // `check-device-leakage.py` refused it — correctly, because this is the
+  // device-agnostic shared layer, and its advice is to ask the op/provider
+  // table the question instead. Doing that turned out BETTER than the narrower
+  // spelling: the knob now accepts any device whose name `vt` knows and that
+  // actually carries both providers, so a Metal, Vulkan or ROCm provider becomes
+  // reachable by registering it and touching nothing here. The name->enum walk
+  // lives in `vt::DeviceTypeFromName` (include/vt/device.h) rather than here,
+  // because enumerating the device list is the seam's job and an
+  // `static_cast<DeviceType>(i)` in this file is the same leak wearing a
+  // different hat.
+  static const vt::DeviceType resolved = [] {
+    const char* env = std::getenv("VLLM_CPP_VOCODER_DEVICE");
+    if (env == nullptr || env[0] == '\0') return vt::DeviceType::kCPU;
+    vt::DeviceType device = vt::DeviceType::kCPU;
+    VT_CHECK(vt::DeviceTypeFromName(env, &device),
+             "vocoder1d: VLLM_CPP_VOCODER_DEVICE names no device vt knows: '" + std::string(env) +
+                 "'");
+    // Refused BY NAME rather than silently falling back to the host. A fallback
+    // would post a plausible set of timings that mean nothing, and an operator
+    // who asked for a device would never learn they did not get one.
+    VT_CHECK(vt::OpRegistered(vt::OpId::kConv1d, device) &&
+                 vt::OpRegistered(vt::OpId::kConvTranspose1d, device),
+             "vocoder1d: VLLM_CPP_VOCODER_DEVICE='" + std::string(env) +
+                 "' has no registered vt::Conv1d / vt::ConvTranspose1d provider in this build");
+    return device;
+  }();
+  return resolved;
+}
+
+vt::Tensor HostView(const float* data, std::initializer_list<int64_t> shape) {
+  return vt::Tensor::Contiguous(const_cast<float*>(data), vt::DType::kF32,
+                                vt::Device{vt::DeviceType::kCPU, 0}, shape);
+}
+
+// Runs `launch` on the resolved device. On CPU the tensors are views over the
+// caller's own buffers and nothing is copied; on a device the inputs are staged
+// across, the op runs, and the output comes back. `launch(q, out, x, w, bias)`
+// receives tensors already resident on `q.device`.
+//
+// The device arm allocates, uploads, downloads and frees PER CALL, and creates
+// a queue per call with it. That is deliberately literal for a first landing:
+// `cuda` means cuda, with no size threshold quietly sending small shapes back to
+// the host — a threshold would make the gate below report on a state it was not
+// given, which is the exact failure this project keeps re-learning. The cost is
+// real and is OWED rather than hidden: device-resident weights (they are
+// loop-invariant and re-uploaded every call), one persistent queue, and a
+// chain that stays on the device between stages instead of round-tripping. See
+// `.agents/specs/minimax-music3.md` §13.
+template <typename Launch>
+void RunConv(const std::vector<float>& in, std::initializer_list<int64_t> in_shape,
+             const std::vector<float>& weight, std::initializer_list<int64_t> weight_shape,
+             const std::vector<float>* bias, std::vector<float>& out,
+             std::initializer_list<int64_t> out_shape, const Launch& launch) {
+  const vt::DeviceType type = ResolveConvDevice();
+  if (type == vt::DeviceType::kCPU) {
+    vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    vt::Tensor xt = HostView(in.data(), in_shape);
+    vt::Tensor wt = HostView(weight.data(), weight_shape);
+    vt::Tensor ot = HostView(out.data(), out_shape);
+    vt::Tensor bt;
+    if (bias != nullptr) bt = HostView(bias->data(), {static_cast<int64_t>(bias->size())});
+    launch(q, ot, xt, wt, bias != nullptr ? &bt : nullptr);
+    return;
+  }
+
+  vt::Backend& backend = vt::GetBackend(type);
+  vt::Queue q = backend.CreateQueue();
+  const vt::Device dev{type, 0};
+  void* xd = backend.Alloc(in.size() * sizeof(float));
+  void* wd = backend.Alloc(weight.size() * sizeof(float));
+  void* od = backend.Alloc(out.size() * sizeof(float));
+  void* bd = bias != nullptr ? backend.Alloc(bias->size() * sizeof(float)) : nullptr;
+  try {
+    backend.Copy(q, xd, in.data(), in.size() * sizeof(float));
+    backend.Copy(q, wd, weight.data(), weight.size() * sizeof(float));
+    if (bd != nullptr) backend.Copy(q, bd, bias->data(), bias->size() * sizeof(float));
+    vt::Tensor xt = vt::Tensor::Contiguous(xd, vt::DType::kF32, dev, in_shape);
+    vt::Tensor wt = vt::Tensor::Contiguous(wd, vt::DType::kF32, dev, weight_shape);
+    vt::Tensor ot = vt::Tensor::Contiguous(od, vt::DType::kF32, dev, out_shape);
+    vt::Tensor bt;
+    if (bd != nullptr) {
+      bt = vt::Tensor::Contiguous(bd, vt::DType::kF32, dev,
+                                  {static_cast<int64_t>(bias->size())});
+    }
+    launch(q, ot, xt, wt, bd != nullptr ? &bt : nullptr);
+    backend.Copy(q, out.data(), od, out.size() * sizeof(float));
+    backend.Synchronize(q);
+  } catch (...) {
+    backend.Free(xd);
+    backend.Free(wd);
+    backend.Free(od);
+    if (bd != nullptr) backend.Free(bd);
+    backend.DestroyQueue(q);
+    throw;
+  }
+  backend.Free(xd);
+  backend.Free(wd);
+  backend.Free(od);
+  if (bd != nullptr) backend.Free(bd);
+  backend.DestroyQueue(q);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -65,27 +201,21 @@ std::vector<float> Conv1d(const std::vector<float>& in, int64_t in_channels,
                                    const std::vector<float>* bias, int64_t out_channels,
                                    int64_t kernel, int64_t stride, int64_t dilation,
                                    int64_t groups, int64_t* out_len) {
-  const int64_t effective = dilation * (kernel - 1) + 1;
-  const int64_t length = (in_len - effective) / stride + 1;
+  // The input arrives ALREADY padded (callers pad through `Pad1d`, which can
+  // also replicate), so the op's `padding` is 0 and its shape arithmetic
+  // collapses to the one this function has always used.
+  vt::Conv1dArgs args;
+  args.stride = stride;
+  args.padding = 0;
+  args.dilation = dilation;
+  args.groups = groups;
+  const int64_t length = vt::Conv1dOutLength(in_len, kernel, args);
   VT_CHECK(length > 0, "minimax_h3 audio vae: conv1d output length is empty");
-  const int64_t in_per_group = in_channels / groups;
-  const int64_t out_per_group = out_channels / groups;
   std::vector<float> out(static_cast<size_t>(out_channels * length), 0.0f);
-  for (int64_t oc = 0; oc < out_channels; ++oc) {
-    const int64_t g = oc / out_per_group;
-    for (int64_t t = 0; t < length; ++t) {
-      double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
-      for (int64_t ic = 0; ic < in_per_group; ++ic) {
-        const int64_t src_c = g * in_per_group + ic;
-        for (int64_t k = 0; k < kernel; ++k) {
-          const int64_t pos = t * stride + k * dilation;
-          acc += static_cast<double>(in[static_cast<size_t>(src_c * in_len + pos)]) *
-                 static_cast<double>(weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
-        }
-      }
-      out[static_cast<size_t>(oc * length + t)] = static_cast<float>(acc);
-    }
-  }
+  RunConv(in, {1, in_channels, in_len}, weight, {out_channels, in_channels / groups, kernel}, bias,
+          out, {1, out_channels, length},
+          [&](vt::Queue& q, vt::Tensor& o, const vt::Tensor& x, const vt::Tensor& w,
+              const vt::Tensor* b) { vt::Conv1d(q, o, x, w, b, args); });
   *out_len = length;
   return out;
 }
@@ -97,34 +227,22 @@ std::vector<float> ConvTranspose1d(const std::vector<float>& in, int64_t in_chan
                                             const std::vector<float>* bias, int64_t out_channels,
                                             int64_t kernel, int64_t stride, int64_t padding,
                                             int64_t groups, int64_t* out_len) {
-  const int64_t full = (in_len - 1) * stride + kernel;
-  const int64_t length = full - 2 * padding;
+  vt::ConvTranspose1dArgs args;
+  args.stride = stride;
+  args.padding = padding;
+  args.output_padding = 0;
+  args.dilation = 1;
+  args.groups = groups;
+  const int64_t length = vt::ConvTranspose1dOutLength(in_len, kernel, args);
   VT_CHECK(length > 0, "minimax_h3 audio vae: conv_transpose1d output length is empty");
-  const int64_t in_per_group = in_channels / groups;
-  const int64_t out_per_group = out_channels / groups;
-  std::vector<double> acc(static_cast<size_t>(out_channels * full), 0.0);
-  for (int64_t ic = 0; ic < in_channels; ++ic) {
-    const int64_t g = ic / in_per_group;
-    for (int64_t t = 0; t < in_len; ++t) {
-      const double value = in[static_cast<size_t>(ic * in_len + t)];
-      if (value == 0.0) continue;
-      for (int64_t oc = 0; oc < out_per_group; ++oc) {
-        const int64_t dst_c = g * out_per_group + oc;
-        for (int64_t k = 0; k < kernel; ++k) {
-          acc[static_cast<size_t>(dst_c * full + t * stride + k)] +=
-              value * static_cast<double>(weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)]);
-        }
-      }
-    }
-  }
   std::vector<float> out(static_cast<size_t>(out_channels * length));
-  for (int64_t c = 0; c < out_channels; ++c) {
-    for (int64_t t = 0; t < length; ++t) {
-      double value = acc[static_cast<size_t>(c * full + t + padding)];
-      if (bias != nullptr) value += (*bias)[static_cast<size_t>(c)];
-      out[static_cast<size_t>(c * length + t)] = static_cast<float>(value);
-    }
-  }
+  // torch's ConvTranspose1d parameter is [Cin, Cout/groups, K] — dim 0 is the
+  // INPUT channel, the opposite of nn.Conv1d, which is the same trap
+  // `MaterializeWeightNorm`'s `dim0` naming exists for (see vocoder1d.h).
+  RunConv(in, {1, in_channels, in_len}, weight, {in_channels, out_channels / groups, kernel}, bias,
+          out, {1, out_channels, length},
+          [&](vt::Queue& q, vt::Tensor& o, const vt::Tensor& x, const vt::Tensor& w,
+              const vt::Tensor* b) { vt::ConvTranspose1d(q, o, x, w, b, args); });
   *out_len = length;
   return out;
 }

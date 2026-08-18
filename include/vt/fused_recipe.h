@@ -44,7 +44,9 @@ namespace vt {
 //      kSigmoidGate -> vt::SigmoidGateBf16  (a·sigmoid(b))
 //      kRmsNormGated-> vt::RmsNormGated     (gated rms-normalize)
 //      kRope        -> vt::RopeFromCache    (partial NeoX RoPE from a cos/sin cache)
-//      kQuantFp8    -> vt::QuantFp8Static   (static per-tensor fp8 terminal; CUDA-only)
+//      kQuantFp8    -> vt::QuantFp8Static   (static per-tensor fp8 terminal; CUDA + CPU
+//                                            since #468 — the fp8-terminal recipes now
+//                                            realize END-TO-END on CPU, not negotiated)
 //      kQuantFp4    -> vt::ScaledFp4Quant   (dynamic per-group fp4 terminal)
 //      kAttnQkNormRopeGate -> vt::AttnQkNormRopeGate (fused full-attention preamble)
 //

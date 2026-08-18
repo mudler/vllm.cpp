@@ -41,9 +41,9 @@ opt-in, separated from what is already covered and what is research/niche.
 |---|---|
 | FUSED | 23 |
 | SGLANG-DISTINCT | 8 |
-| INVENTORIED | 5 |
+| INVENTORIED | 6 |
 | OUT-OF-SCOPE | 8 |
-| **Total** | **44** |
+| **Total** | **45** |
 
 **Headline SGLANG-DISTINCT items (the opt-in worklist), ranked in the oracle
 spec §6:** cache-aware **LPM scheduling** (`--schedule-policy=lpm`,
@@ -141,6 +141,12 @@ share the idea) or OUT-OF-SCOPE.
 | `SGLANG-TOOLPARSE` | model-specific tool-call parser matrix (~26 detectors: qwen25/qwen3_coder, deepseek v3/v31/v32/v4, glm4/45/47, kimi_k2, hermes, mistral, llama3, gemma4, gpt-oss, pythonic, step3, minimax-m2, ...) | registry `function_call/function_call_parser.py:60`; `function_call/<name>_detector.py` | our 36 parser families / 40 accepted names (every vLLM tool parser at the pin except 3 Rust/Harmony) | FUSED | We already ported vLLM's overlapping set, held to the upstream test suites. Selection via `--tool-call-parser`. |
 | `SGLANG-REASONING` | reasoning parsers (deepseek-r1, harmony, think-tag) | `parser/reasoning_parser.py`, `parser/harmony_parser.py` | our 7 reasoning parsers (think_auto, deepseek_r1, mistral, minimax_m2, step3, olmo3), streamed as `reasoning` deltas | FUSED | Same reasoning-split-before-tool-parse model. |
 | `SGLANG-GRPC` | gRPC serving front-end (+ Anthropic / Ollama compat, Realtime/ASR) | `entrypoints/grpc_server.py:156`; `entrypoints/anthropic/`, `entrypoints/ollama/` | none (we ship the OpenAI HTTP + C-ABI surfaces) | OUT-OF-SCOPE | vLLM has no gRPC front-end either; niche protocol breadth, not a parity behavior. |
+
+## Graph capture and runtime execution
+
+| ID | SGLang surface | SGLang anchor (`file:line`) | Our mapping / anchor | Class | Notes |
+|---|---|---|---|---|---|
+| `SGLANG-BCG` | **Breakable CUDA Graph** — one forward captured as a SEQUENCE of `torch.cuda.CUDAGraph` segments split at eager break points, with no `torch.compile`; plus per-phase backend selection (`FULL`/`BREAKABLE`/`TC_PIECEWISE`/`DISABLED`, decode defaults `FULL`, prefill defaults `BREAKABLE` on CUDA) and graph-executable dedup via `cudaGraphExecUpdate` | `runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py:204-241` (segment split), `:244-260` (replay), `:14-23,156-169` (shared mempool + weak-ref intermediates); `runner_backend/breakable_cuda_graph_backend.py:14-17` ("No torch.compile"); break points `layers/radix_attention.py:256`, `attention_forward_methods/forward_mla.py:1092`, `layers/radix_linear_attention.py:159`, `models/nemotron_h.py:1240`, `dsa/dsa_indexer.py:2414`; config `cuda_graph_config.py:38-45,95-112`; dedup `runner_backend/cuda_graph_dedup_mixin.py:219-242,358` | our capture primitive `src/vt/cuda/cuda_backend.cu:203-232`; bucket set `include/vllm/model_executor/models/decode_graph_sizes.h:32-41`; pure-decode routing `src/vllm/v1/worker/gpu/runner.cpp:1338-1341`; NINE hand-rolled drivers (`Qwen3_5DecodeGraph`, `Qwen3_5DenseDecodeGraph`, `Qwen3MoeDecodeGraph`, `Qwen3DenseDecodeGraph`, `DeepseekV2DecodeGraph`, `VoxtralDecodeGraph`, `deepseek_v4.cpp`, `laguna.cpp`, and the DFlash draft graph `src/vllm/model_executor/models/qwen3_dflash.cpp:771,870,1038,1091,1095,1106` — count corrected 2026-08-18, [#1179](https://github.com/mudler/vllm.cpp/issues/1179); `9bc4d7f44` recorded eight, and the DFlash driver is file-local with no header declaration, which is why it was missed) | INVENTORIED | **The CAPABILITY is vLLM-derived, not SGLang-distinct**: vLLM's v1 default is already `FULL_AND_PIECEWISE`, splitting at `splitting_ops` (`vllm/config/compilation.py:60-63,517,615,630` @ `555967922`), so it is in our benchmark denominator. What SGLang landed FIRST is the CONSTRUCTION — piecewise coverage from runtime stream capture plus a decorator, no Dynamo/Inductor/FX. That construction is the part worth mirroring, because we have no compiler either. **Prefill capture is REFUTED as a lever here** (GB10 2026-07-09: prefill GPU-idle-between-launches 3.8%, GPU-busy >96%, 27B gap 92.5% non-GEMM GLUE) — do not re-derive. Exec dedup is unported (`cudaGraphExecUpdate` appears nowhere in `src/` or `include/`). Spec [sglang-breakable-cuda-graph.md](specs/sglang-breakable-cuda-graph.md); issues [#1161](https://github.com/mudler/vllm.cpp/issues/1161), [#1162](https://github.com/mudler/vllm.cpp/issues/1162), [#1163](https://github.com/mudler/vllm.cpp/issues/1163), [#1164](https://github.com/mudler/vllm.cpp/issues/1164). |
 
 ## Structurally distinctive / research (vLLM has no native analogue)
 

@@ -112,6 +112,21 @@ class Qwen3_5MTPModel {
       const v1::CommonAttentionMetadata& attn_meta, PagedKvCache& draft_kv,
       vt::Queue& queue, int64_t spec_step_idx = 0) const;
 
+  // Gather `rows` of a [T,H] bf16 device hidden-state tensor into a fresh,
+  // owning [rows.size(), H] bf16 device buffer (SPEC-MTP-K-GT-1, #81).
+  //
+  // The mirror of `self.hidden_states[:num_reqs] = hidden_states[
+  // last_token_indices]` (autoregressive/speculator.py:367-371 @ 555967922),
+  // which is how the draft PREFILL hands its per-request hidden state to the
+  // first multi-step draft DECODE. It lives on the model, not in the speculator,
+  // because the device-buffer pool and the row-copy idiom are private to
+  // qwen3_5.cpp; a copy in the speculator would be a second, parallel path to
+  // the same allocator. `hidden_states` must be contiguous bf16 [T,H] on the
+  // queue's device and every row index must be in [0, T).
+  Qwen3_5MTPHiddenStates GatherHiddenRows(const vt::Tensor& hidden_states,
+                                          const std::vector<int64_t>& rows,
+                                          vt::Queue& queue) const;
+
   // Apply the shared target lm_head to a direct MTP hidden-state return. Logits
   // remain device-resident in ForwardLogits, matching the target hot-path API.
   ForwardLogits ComputeLogits(const vt::Tensor& hidden_states,

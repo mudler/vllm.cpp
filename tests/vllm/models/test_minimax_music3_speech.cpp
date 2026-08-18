@@ -266,7 +266,20 @@ TEST_CASE("music3 speech: the loaded engine declares 44100 stereo and needs NO r
   fs::remove_all(root, ec);
 }
 
-TEST_CASE("music3 speech: the AR head is REFUSED BY NAME, not silently absent") {
+// W6 REFUSED here by name: the 8.6B `Qwen3ForCausalLM` forward it needed had no
+// `inputs_embeds` entry on the landed dense path. That entry now exists
+// (`Qwen3DenseModel::ForwardEmbeds`, qwen3.h) and the loop that drives it is
+// `Music3GenerateFrameHiddens` (minimax_music3_llm.h), so this case is INVERTED:
+// what it proves is that a valid request no longer stops at a missing stage.
+//
+// A synthetic checkpoint has valid CONFIGS and empty weight files, so the
+// request runs the whole contract and then fails ON THE ARTIFACT — naming the
+// file it could not read. That is exactly the boundary this case exists to pin:
+// the message must be about these bytes, and must NOT be about an unimplemented
+// forward. Whether the pipeline actually produces a song is a question only the
+// real 28.5 GB checkpoint can answer, and
+// tests/parity/test_minimax_music3_e2e_real.cpp is where it is asked.
+TEST_CASE("music3 speech: the AR head RUNS, and a valid request reaches the weights") {
   const fs::path root = Scratch("ar_owed");
   WriteSyntheticCheckpoint(root);
   SpeechRegistry registry;
@@ -277,14 +290,29 @@ TEST_CASE("music3 speech: the AR head is REFUSED BY NAME, not silently absent") 
   std::unique_ptr<SpeechEngine> engine = registry.Load(params, &why);
   REQUIRE_MESSAGE(engine != nullptr, why);
 
-  // A VALID request reaches the refusal, which is what proves the refusal is
-  // about the missing stage rather than about the request.
-  CHECK_THROWS_WITH_AS(engine->Synthesize(ValidRequest()),
-                       doctest::Contains("Qwen3ForCausalLM"), std::runtime_error);
-  CHECK_THROWS_WITH_AS(engine->Synthesize(ValidRequest()), doctest::Contains("inputs_embeds"),
-                       std::runtime_error);
-  CHECK_THROWS_WITH_AS(engine->Synthesize(ValidRequest()), doctest::Contains("#672"),
-                       std::runtime_error);
+  std::string message;
+  CHECK_THROWS_AS(
+      [&] {
+        try {
+          engine->Synthesize(ValidRequest());
+        } catch (const std::runtime_error& e) {
+          message = e.what();
+          throw;
+        }
+      }(),
+      std::runtime_error);
+  MESSAGE("a valid request against a synthetic checkpoint stops at: " << message);
+
+  // It reached the LANGUAGE MODEL's own weight file — the first thing the AR
+  // head touches, and the thing this checkpoint does not really have.
+  CHECK(message.find("language_model") != std::string::npos);
+  // And it is NOT the by-name refusal W6 shipped. Both spellings are asserted
+  // absent because either one surviving would mean the stage is still owed;
+  // "not found in this message" is the whole claim, and the message is printed
+  // above so the reader can check it rather than take it on trust.
+  CHECK(message.find("inputs_embeds") == std::string::npos);
+  CHECK(message.find("not implemented") == std::string::npos);
+
   std::error_code ec;
   fs::remove_all(root, ec);
 }

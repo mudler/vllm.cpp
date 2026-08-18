@@ -226,6 +226,170 @@ TEST_CASE("qwen3 dense decode-graph: CPU eager-fallback Step == Forward (pure de
   CHECK_FALSE(graph.captured());  // no capture on CPU
 }
 
+// --- The `inputs_embeds` ENTRY (MODEL-MUSIC-MUSIC3 W2, #672) -----------------
+//
+// Qwen3DenseModel::ForwardEmbeds starts the hidden stream from caller-supplied
+// [T, H] bf16 rows instead of an embed_tokens lookup — the door
+// `Qwen3Model.forward(inputs_embeds=...)` has upstream and that the DENSE
+// registration never wired, which MiniMax-Music3's frame feedback needs because
+// its input is a SUM of embedding rows and corresponds to no vocabulary entry.
+//
+// The claim these cases make is ADDITIVITY, and it is the whole reason the entry
+// can exist on a token-exact row: feeding the embedding OF THE SAME IDS through
+// the new entry must reproduce Forward BIT FOR BIT, in the logits AND in the
+// paged KV it wrote, because the only thing that differs is where the first
+// [T, H] buffer came from. A non-additive change — an extra scale, a norm, a
+// different residual init, a dropped gather — moves those bytes.
+namespace {
+
+// embed_tokens[id] for each id, as the raw bf16 rows the entry consumes. The
+// table is the checkpoint layout [vocab, H], NOT transposed.
+std::vector<uint16_t> EmbedRows(const Qwen3DenseWeights& w, const HfConfig& c,
+                                const std::vector<int32_t>& ids) {
+  const int64_t H = c.hidden_size;
+  const auto* table = reinterpret_cast<const uint16_t*>(w.embed_tokens.bytes.data());
+  std::vector<uint16_t> rows(ids.size() * static_cast<size_t>(H));
+  for (size_t t = 0; t < ids.size(); ++t) {
+    for (int64_t j = 0; j < H; ++j) {
+      rows[t * static_cast<size_t>(H) + static_cast<size_t>(j)] =
+          table[static_cast<size_t>(ids[t]) * static_cast<size_t>(H) + static_cast<size_t>(j)];
+    }
+  }
+  return rows;
+}
+
+}  // namespace
+
+TEST_CASE("qwen3 dense inputs_embeds: the embedding of the same ids is BIT-IDENTICAL") {
+  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  const HfConfig c = TinyConfig();
+  const Qwen3DenseWeights w = TinyWeights(c);
+  vt::Queue q = Q();
+
+  const int64_t T = 5;
+  const std::vector<int32_t> tokens = {3, 17, 42, 8, 61};
+  const std::vector<int32_t> positions = {0, 1, 2, 3, 4};
+  const CommonAttentionMetadata am = PrefillMeta(T, 8);
+
+  // Two independent, identically zero-initialised caches so the two forwards'
+  // KV writes never alias — the second arm must not read the first's residue.
+  CachePool pool_ids(c, /*num_blocks=*/2, /*block_size=*/8);
+  CachePool pool_emb(c, /*num_blocks=*/2, /*block_size=*/8);
+
+  const std::vector<float> by_ids =
+      vllm::Qwen3DenseModel::Forward(tokens, positions, am, pool_ids.attn_kv, w, c, q);
+  std::vector<float> hidden;
+  const std::vector<float> by_embeds = vllm::Qwen3DenseModel::ForwardEmbeds(
+      EmbedRows(w, c, tokens), positions, am, pool_emb.attn_kv, w, c, q, {}, &hidden);
+
+  REQUIRE(by_ids.size() == static_cast<size_t>(T * c.vocab_size));
+  REQUIRE(by_embeds.size() == by_ids.size());
+  int64_t compared = 0;
+  int64_t differing = 0;
+  for (size_t i = 0; i < by_ids.size(); ++i) {
+    ++compared;
+    if (by_ids[i] != by_embeds[i]) ++differing;
+  }
+  MESSAGE("inputs_embeds vs token ids: " << compared << " logits compared, " << differing
+                                         << " differing");
+  CHECK(compared == T * c.vocab_size);
+  CHECK(differing == 0);
+
+  // The KV the two arms wrote is the same too — a forward that agreed on logits
+  // while writing a different cache would decode differently on the NEXT step,
+  // which no logits comparison at this step can see.
+  int64_t kv_values = 0;
+  int64_t kv_differing = 0;
+  for (size_t l = 0; l < pool_ids.buf.size(); ++l) {
+    REQUIRE(pool_ids.buf[l].size() == pool_emb.buf[l].size());
+    for (size_t i = 0; i < pool_ids.buf[l].size(); ++i) {
+      ++kv_values;
+      if (pool_ids.buf[l][i] != pool_emb.buf[l][i]) ++kv_differing;
+    }
+  }
+  MESSAGE("paged KV: " << kv_values << " values compared, " << kv_differing << " differing");
+  CHECK(kv_values > 0);
+  CHECK(kv_differing == 0);
+
+  // `out_hidden` is the SAME post-final-norm tensor ForwardHidden returns, taken
+  // from the forward that produced the logits rather than from a second pass.
+  CachePool pool_hid(c, /*num_blocks=*/2, /*block_size=*/8);
+  const vllm::ForwardLogits pooled = vllm::Qwen3DenseModel::ForwardHidden(
+      tokens, positions, am, pool_hid.attn_kv, w, c, q);
+  REQUIRE(pooled.rows == T);
+  REQUIRE(pooled.vocab == c.hidden_size);
+  REQUIRE(hidden.size() == pooled.host.size());
+  int64_t hidden_differing = 0;
+  for (size_t i = 0; i < hidden.size(); ++i) {
+    if (hidden[i] != pooled.host[i]) ++hidden_differing;
+  }
+  MESSAGE("out_hidden vs ForwardHidden: " << hidden.size() << " values compared, "
+                                          << hidden_differing << " differing");
+  CHECK(hidden.size() == static_cast<size_t>(T * c.hidden_size));
+  CHECK(hidden_differing == 0);
+}
+
+TEST_CASE("qwen3 dense inputs_embeds: the logits_indices gather still binds") {
+  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  const HfConfig c = TinyConfig();
+  const Qwen3DenseWeights w = TinyWeights(c);
+  vt::Queue q = Q();
+
+  const int64_t T = 5;
+  const std::vector<int32_t> tokens = {3, 17, 42, 8, 61};
+  const std::vector<int32_t> positions = {0, 1, 2, 3, 4};
+  const CommonAttentionMetadata am = PrefillMeta(T, 8);
+  const std::vector<int32_t> last_only = {4};
+
+  CachePool pool_full(c, 2, 8);
+  CachePool pool_gathered(c, 2, 8);
+  std::vector<float> hidden_full;
+  std::vector<float> hidden_gathered;
+  const std::vector<float> full = vllm::Qwen3DenseModel::ForwardEmbeds(
+      EmbedRows(w, c, tokens), positions, am, pool_full.attn_kv, w, c, q, {}, &hidden_full);
+  const std::vector<float> gathered = vllm::Qwen3DenseModel::ForwardEmbeds(
+      EmbedRows(w, c, tokens), positions, am, pool_gathered.attn_kv, w, c, q, last_only,
+      &hidden_gathered);
+
+  // The gather returns ONE row, and it is the LAST one of the ungathered set —
+  // which is the row Music3's loop reads (`last_hidden_state[:, -1]`).
+  REQUIRE(gathered.size() == static_cast<size_t>(c.vocab_size));
+  REQUIRE(hidden_gathered.size() == static_cast<size_t>(c.hidden_size));
+  int64_t logit_diff = 0;
+  for (int64_t v = 0; v < c.vocab_size; ++v) {
+    if (gathered[static_cast<size_t>(v)] !=
+        full[static_cast<size_t>((T - 1) * c.vocab_size + v)]) {
+      ++logit_diff;
+    }
+  }
+  int64_t hidden_diff = 0;
+  for (int64_t j = 0; j < c.hidden_size; ++j) {
+    if (hidden_gathered[static_cast<size_t>(j)] !=
+        hidden_full[static_cast<size_t>((T - 1) * c.hidden_size + j)]) {
+      ++hidden_diff;
+    }
+  }
+  MESSAGE("gathered last row: " << c.vocab_size << " logits compared, " << logit_diff
+                                << " differing; " << c.hidden_size << " hidden compared, "
+                                << hidden_diff << " differing");
+  CHECK(logit_diff == 0);
+  CHECK(hidden_diff == 0);
+}
+
+TEST_CASE("qwen3 dense inputs_embeds: a non-rectangular embedding is refused BY NAME") {
+  const HfConfig c = TinyConfig();
+  const Qwen3DenseWeights w = TinyWeights(c);
+  vt::Queue q = Q();
+  CachePool pool(c, 2, 8);
+  const CommonAttentionMetadata am = PrefillMeta(2, 8);
+  // One value short of two full rows: the shape is unrecoverable, so it is named
+  // rather than silently truncated to one row.
+  std::vector<uint16_t> ragged(static_cast<size_t>(2 * c.hidden_size - 1), 0);
+  CHECK_THROWS_WITH_AS(
+      vllm::Qwen3DenseModel::ForwardEmbeds(ragged, {0, 1}, am, pool.attn_kv, w, c, q),
+      doctest::Contains("inputs_embeds"), std::runtime_error);
+}
+
 // --- NVFP4 W4A16 synthetic forward (the QUANT-SCHEME additivity doctest) -----
 // ADDITIVE-QUANT W3 for Qwen3-32B-NVFP4A16 (`Qwen3ForCausalLM` +
 // compressed-tensors NVFP4A16). Builds the SAME tiny model twice — once with

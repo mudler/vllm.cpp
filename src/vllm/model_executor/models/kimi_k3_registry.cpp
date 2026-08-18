@@ -78,7 +78,7 @@ void PrepareKimiK3ForConditionalGeneration(LoadedModel& model,
 
 ForwardLogits ForwardKimiK3ForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  auto& k3 = static_cast<KimiK3LoadedModel&>(model);
+  auto& k3 = ModelAs<KimiK3LoadedModel>(model, "KimiK3ForConditionalGeneration");
   const KimiK3Weights& weights = k3.weights();
   if (input.gather_logits) {
     return KimiK3Model::ForwardDevice(input.token_ids, input.positions,

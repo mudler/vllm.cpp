@@ -5,6 +5,7 @@
 // usable GPU). Compiled only in CUDA builds (CMake target_sources gate).
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <vector>
 
 #include "vllm/platforms/cuda_attn_priority.h"
@@ -17,8 +18,11 @@ namespace {
 
 class CudaPlatform final : public Platform {
  public:
-  CudaPlatform(int cc_major, int cc_minor, bool integrated)
-      : cap_{cc_major, cc_minor}, integrated_{integrated} {}
+  CudaPlatform(int cc_major, int cc_minor, bool integrated,
+               size_t device_memory_total_bytes)
+      : cap_{cc_major, cc_minor},
+        integrated_{integrated},
+        device_memory_total_bytes_{device_memory_total_bytes} {}
 
   DeviceType device_type() const override { return DeviceType::kCUDA; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kCUDA); }
@@ -89,14 +93,21 @@ class CudaPlatform final : public Platform {
   //     still overrides (house A/B convention).
   //   * uses_device_memory_pool = true + device_pool_cap_bytes = 0: the DevicePool
   //     scratch reuse, uncapped, exactly as today.
+  //   * device_memory_total_bytes = cudaMemGetInfo's `total`, probed at
+  //     registration (issue #1123). NEW data, consumed only by the load-time
+  //     GGUF fit refusal; nothing that read this struct before sees a change.
   // A discrete GPU sets different values (e.g. a pool cap) and NO model code is
   // touched — that is the item-2 additive win.
+  //
+  // The four assignments themselves live in `CudaResidencyPolicy`
+  // (`vllm/platforms/interface.h`), not here, because this translation unit
+  // compiles only in a CUDA build: while they were inline, nothing on a host
+  // without a CUDA toolkit could reach them, which is why #1123 had to record
+  // "delete the device_memory_total_bytes assignment" as an unproven mutation.
+  // test_platform.cpp now pins the assembly on every host (#1136). What stays
+  // CUDA-only here is the `cudaMemGetInfo` probe below and the value it threads.
   ResidencyPolicy residency_policy() const override {
-    ResidencyPolicy p;
-    p.release_host_weights_after_upload = true;   // freed after Marlin build (today)
-    p.uses_device_memory_pool = true;             // qwen3_5.cpp DevicePool
-    p.device_pool_cap_bytes = 0;                  // uncapped
-    return p;
+    return CudaResidencyPolicy(device_memory_total_bytes_);
   }
 
   // Capability-ordered attention-backend priority — a faithful port of
@@ -125,6 +136,8 @@ class CudaPlatform final : public Platform {
  private:
   DeviceCapability cap_;
   bool integrated_ = false;
+  // cudaMemGetInfo's `total`, probed once at registration; 0 == UNKNOWN.
+  size_t device_memory_total_bytes_ = 0;
 };
 
 // Registers kCUDA during static init (registration must complete before main()
@@ -151,13 +164,31 @@ struct Registrar {
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) != cudaSuccess) {
       integrated = 0;
     }
+    // ResidencyPolicy::device_memory_total_bytes (issue #1123) — probe once here,
+    // beside the other device probes. `nvidia-smi` is the WRONG instrument for
+    // this on a GB10: `--query-gpu=memory.total,memory.free,memory.used` answers
+    // `[N/A], [N/A], [N/A]` because host and device share one pool, and the `rc`
+    // fleet label records `vram=[N/A]M` for the same reason. `cudaMemGetInfo`
+    // answers honestly. Measured on dgx:gpu0 through libcudart.so.13:
+    // total = 128452956160 (119.631 GiB), free = 122059919360 (113.677 GiB),
+    // and `total` is EXACTLY `/proc/meminfo MemTotal` (125442340 kB) times 1024.
+    //
+    // A query failure leaves 0 = UNKNOWN, which the consumer treats as "do not
+    // decide" rather than as "nothing fits". `free_bytes` is read and discarded:
+    // this is a load-time budget, and `free` makes it a function of contention.
+    size_t total_bytes = 0;
+    size_t free_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+      total_bytes = 0;
+    }
     // GCC 13 false-positive: -Wdangling-pointer mis-flags a static local with a
     // vtable constructed from automatic ints, though CudaPlatform copies both
     // into cap_ by value (no pointer/reference to major/minor is retained). The
     // static outlives the registrar as RegisterPlatform requires.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
-    static CudaPlatform platform(major, minor, integrated != 0);  // device 0 only
+    static CudaPlatform platform(major, minor, integrated != 0,
+                                 total_bytes);  // device 0 only
 #pragma GCC diagnostic pop
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }

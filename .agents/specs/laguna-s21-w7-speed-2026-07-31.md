@@ -17,6 +17,29 @@ llama.cpp Poolside-fork on the IDENTICAL UD-Q4_K GGUF = **27.8 tok/s** (36 ms/to
 keep-quant forward, `.agents/specs/deepseek-v4-device-decode.md` / `deepseek-v4-last-mile.md`), and
 the same playbook applies.
 
+> **SUPERSEDED DENOMINATOR (2026-08-16, #1003).** The `27.8 tok/s` above, and
+> every ratio in this spec derived from it (the §2 roofline reference row, the
+> §4 reachable verdict, the W8 and W9 SPEED lines, and the GEMV-ceiling lever in
+> §W11), came from a **Poolside fork** of llama.cpp on branch `laguna`
+> (`github.com/poolsideai/llama.cpp@laguna`, named at
+> `laguna-s21-w4-2026-07-31.md:65`). **No commit SHA for it is recorded anywhere
+> in this tree.** A branch is a moving reference, not a revision, so this
+> denominator cannot be reproduced and never could be. It is neither the former
+> pin `237ad9b96` nor the current stock pin `b10451`. Our own side of every
+> comparison here is untouched, and the same-binary W8 and W9 A/B ratios
+> (`3.9×`, `1.38×`, `5.1×`) are ours-versus-ours and stand unchanged. What is
+> owed is the `15x`, `18x`, `4.7x` and `3.6x` framing against llama.cpp.
+> Enumerated as **row 13** in
+> [`oracle-llamacpp-repin-stock.md`](oracle-llamacpp-repin-stock.md), re-take
+> owed under [#1003](https://github.com/mudler/vllm.cpp/issues/1003). Do not
+> quote `27.8` without re-measuring the reference arm against a named commit.
+>
+> Sections rather than line numbers. The first version of this list cited five
+> line numbers in this file, and inserting the mark that carried them pushed
+> every one of those lines down by the mark's own length. A citation into the
+> file it is written in is stale before it is saved, so it should not be a line
+> number.
+
 ## 1. MEASURED attribution (nsys, 8-step forward, 5.14 s wall = 1.41 prefill + 3.73 decode)
 
 **Where the time is (GPU vs host):**

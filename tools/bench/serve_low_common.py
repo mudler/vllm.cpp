@@ -223,6 +223,79 @@ def require_number(value: Any, field: str) -> float:
     return result
 
 
+def _require_count(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HarnessError(f"{field} must be an integer request count")
+    if value < 0:
+        raise HarnessError(f"{field} must not be negative")
+    return value
+
+
+def require_complete_request_set(
+    record: Mapping[str, Any],
+    *,
+    expected_requests: int | None = None,
+    source: str = "benchmark result",
+) -> int:
+    """Refuse to derive any rate from a request set that is not whole (#931).
+
+    A benchmark client divides tokens by the leg's WALL duration, and that
+    duration still contains every second a dead request spent before it failed.
+    The Qwen3.8-27B c1 leg read 0.675x output throughput against vLLM while
+    median TPOT in the same file read 1.017x in OUR favour; the difference was
+    one request of six that never completed. The number was not noisy, it was
+    wrong, and it was wrong in a direction nobody can predict from the record.
+
+    So this is a precondition of DERIVING a number, not a property of a
+    validator that some caller may or may not have run first. Call it at the
+    site that computes the rate.
+
+    Returns the completed count so the caller can use it as the numerator
+    instead of an assumed request count.
+    """
+
+    completed = _require_count(record.get("completed"), f"{source}: completed")
+
+    declared = record.get("num_prompts")
+    if declared is None:
+        expected = expected_requests
+    else:
+        expected = _require_count(declared, f"{source}: num_prompts")
+        if expected_requests is not None and expected_requests != expected:
+            raise HarnessError(
+                f"{source}: num_prompts={expected} contradicts the expected "
+                f"request count {expected_requests}"
+            )
+    if expected is None:
+        raise HarnessError(
+            f"{source}: cannot establish that the request set is complete -- the "
+            "record declares no num_prompts and the caller named no expected "
+            "count. An unprovable request set is not a complete one."
+        )
+
+    # `failed` is absent from the SGLang schema and present in the pinned vLLM
+    # client's. When it is there, an unexamined non-zero value is exactly how
+    # #931 stayed invisible, so it voids the leg on its own.
+    failed = record.get("failed")
+    failed_count = 0 if failed is None else _require_count(failed, f"{source}: failed")
+    if completed != expected or failed_count != 0:
+        raise HarnessError(
+            f"{source}: request set is partial: completed={completed!r}, "
+            f"failed={failed_count!r}, expected={expected!r}. No throughput, "
+            "latency or memory number may be derived from it."
+        )
+
+    errors = record.get("errors")
+    if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)):
+        reported = [str(value) for value in errors if value]
+        if reported:
+            raise HarnessError(
+                f"{source}: the request set records {len(reported)} request "
+                f"error(s); first: {reported[0][:200]!r}"
+            )
+    return completed
+
+
 def percentile(values: Sequence[float], percent: float) -> float:
     """NumPy-compatible linear percentile without a NumPy dependency."""
 

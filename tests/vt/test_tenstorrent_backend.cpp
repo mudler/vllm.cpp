@@ -1520,3 +1520,65 @@ TEST_CASE("kTENSTORRENT kRmsNorm residual: device vs CPU f32 oracle across the r
     CHECK(max_abs < 0.05f);
   }
 }
+
+// BACKEND-TENSTORRENT-HOST-FREE-R1: guard the env-gated host-free helpers'
+// DEFAULT-PATH INERTNESS. The helpers (CopyDeviceDeviceIfCapture /
+// MemsetDeviceIfCapture, vt/tenstorrent/tenstorrent_device.h) must DECLINE
+// unless VT_TT_HOST_FREE_DECODE is set (or capture is active). Without this
+// case that property is enforced by code review alone: a removed gate flips
+// ordinary eager Copy/Memset to device variants silently (review mutation M1)
+// and a capture flag stuck true after a failed EndCapture does the same (M4).
+// Both buffers below carry CURRENT device shadows with equal byte sizes, so
+// the flag gate is the ONLY thing that can make the helpers decline.
+#include "../../src/vt/tenstorrent/tenstorrent_device.h"
+
+TEST_CASE("kTENSTORRENT host-free helpers decline by default (inertness guard)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ::unsetenv("VT_TT_HOST_FREE_DECODE");  // the guard is about the UNSET case
+  Backend& backend = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+
+  // Two same-shaped outputs, each given a current device shadow by a device
+  // Matmul (CommitDevice2D leaves device_current=true, host_current=false).
+  constexpr int64_t M = 8, K = 32, N = 8;
+  auto shadowed = [&](std::vector<float>& host) {
+    std::vector<float> a(M * K, 0.5f), b(K * N, 0.25f);
+    host.assign(static_cast<size_t>(M * N), -1.0f);
+    void* ma = backend.Alloc(a.size() * sizeof(float));
+    void* mb = backend.Alloc(b.size() * sizeof(float));
+    void* mo = backend.Alloc(host.size() * sizeof(float));
+    Queue q = backend.CreateQueue();
+    backend.Copy(q, ma, a.data(), a.size() * sizeof(float));
+    backend.Copy(q, mb, b.data(), b.size() * sizeof(float));
+    Tensor ta = Tensor::Contiguous(ma, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {K, N});
+    Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+    reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmul, DeviceType::kTENSTORRENT))(q, to, ta, tb);
+    return mo;  // caller keeps the allocation; shadow lives in the slot map
+  };
+  std::vector<float> h1, h2;
+  void* m1 = shadowed(h1);
+  void* m2 = shadowed(h2);
+
+  // The gate: same bytes, both shadows current -> only the env/capture gate
+  // can decline. These CHECKs go RED if the gate is removed (M1) or if the
+  // capture flag is stuck true (M4).
+  CHECK_FALSE(vt::tenstorrent::CopyDeviceDeviceIfCapture(m2, m1));
+  CHECK_FALSE(vt::tenstorrent::MemsetDeviceIfCapture(m2, 0));
+  // value!=0 always declines (host memset is the only path for it).
+  CHECK_FALSE(vt::tenstorrent::MemsetDeviceIfCapture(m2, 1));
+
+  // And the default host path still works: Copy m1 -> m2 yields identical
+  // host bytes once materialized.
+  Queue q = backend.CreateQueue();
+  std::vector<float> got(h1.size(), -7.0f);
+  backend.Copy(q, m2, m1, h1.size() * sizeof(float));
+  backend.Copy(q, got.data(), m2, got.size() * sizeof(float));
+  // 0.5f * 0.25f summed over K=32 == 4.0f per element (bf16 device acc).
+  CHECK(got == std::vector<float>(static_cast<size_t>(M * N), 4.0f));
+
+  backend.Free(m1);
+  backend.Free(m2);
+}

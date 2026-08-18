@@ -22,6 +22,7 @@
 #include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft bundle
@@ -38,6 +39,7 @@
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/config/offload.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/runner.h"
@@ -64,6 +66,12 @@ struct DflashDraft {
   int k = 0;
 };
 
+// vLLM CacheConfig.gpu_memory_utilization's own default (vllm/config/cache.py:68
+// @ 555967922). Named because EngineParams carries the knob as an optional, so
+// "the caller chose nothing" and "the caller chose 0.92" are different states
+// and only one of them has a value to fall back to.
+inline constexpr double kDefaultGpuMemoryUtilization = 0.92;
+
 // Knobs that size the engine stack. Zero/negative fields fall back to the
 // documented defaults (see below), so a default-constructed EngineParams is
 // valid.
@@ -85,8 +93,17 @@ struct EngineParams {
   int num_blocks = 0;      // 0 => auto (resolved: override > bytes > 256).
   // Fraction of free device memory the whole engine may consume (weights +
   // activations + KV), mirroring vLLM CacheConfig.gpu_memory_utilization
-  // (cache.py:68). Used only by the M3 profile path; inert until that lands.
-  double gpu_memory_utilization = 0.92;
+  // (cache.py:68). Still INERT: knob 3 needs the M3 profile run.
+  //
+  // TRI-STATE (FIX-GPU-MEM-UTIL-INERT, #1165), mirroring enable_prefix_caching
+  // below. nullopt means the caller never named a fraction and resolves to
+  // vLLM's kDefaultGpuMemoryUtilization; a value means the caller CHOSE one.
+  // The distinction exists because the value is discarded: ResolveNumBlocks
+  // warns on a chosen value, and stays silent on a default nobody set. Before
+  // this was tri-state the field defaulted to 0.92 and no surface could tell
+  // the two apart, so the engine accepted `--gpu-memory-utilization 0.85`,
+  // sized nothing, and said nothing.
+  std::optional<double> gpu_memory_utilization = std::nullopt;
   // Absolute KV-pool size in bytes (0 = unset). When > 0 it sizes the block
   // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
   // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
@@ -153,6 +170,21 @@ struct EngineParams {
   // offloader that consumes it is W2/W5, so today this is recorded and inert.
   std::optional<vllm::OffloadConfig> offload_config = std::nullopt;
 
+  // ENG-RESIDENCY-CONFIG (#1110): the host-RAM -> DISK residency tier, parsed out
+  // of the `vllm_cpp` key of the SAME `--offload-config` document `offload_config`
+  // above comes from. Absent (default) == every knob resolves from the environment
+  // and its built-in default, i.e. the byte-identical engine.
+  //
+  // It is a SEPARATE field rather than an arm of `OffloadConfig` because that
+  // struct is a 1:1 transcription of `vllm/config/offload.py` and upstream has no
+  // disk tier — see include/vllm/config/weight_residency.h for the whole argument,
+  // the schema, and the env-beats-config precedence.
+  //
+  // FromModelDir installs it in its FIRST statement block, ahead of every path,
+  // config and weight operation, because each knob it feeds is read through a
+  // static that latches on first use.
+  std::optional<vllm::WeightResidencyConfig> weight_residency = std::nullopt;
+
   // SPEC-MTP I5d-pre: opt-in speculative-decoding configuration. Empty/absent
   // (default) == NO speculation == byte-identical production engine (mirrors
   // vLLM's --speculative-config being unset). When set to an MTP config,
@@ -198,6 +230,31 @@ struct EngineParams {
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device);
 
+// The device type `SelectQueueForModel` will pick.
+//
+// It exists because the load-time GGUF device-fit refusal (issue #1123) has to
+// know the target device BEFORE any weight I/O, and the load's own queue is not
+// created until after the weights are loaded. Throws for an explicitly named
+// device that this build/process cannot serve, exactly as the queue selector
+// does; the auto arm falls back to `kCPU` instead of throwing, also exactly as it
+// does.
+//
+// The two agree because both arms run one implementation, and on the AUTO arm
+// that implementation CREATES A QUEUE and destroys it. #1136 measured why the
+// cheaper version was wrong: `SelectQueueForModel`'s auto arm falls back to CPU
+// when `CreateQueue()` throws, so a resolver that only asked `CurrentPlatform()`
+// answered `'cuda'` on a box where the load would run on CPU, and the fit refusal
+// then rejected a checkpoint by naming a device nothing was going to run on.
+//
+// The cost of agreeing is one extra stream created and destroyed, and it is bounded
+// by where this function is called: the load-time GGUF fit check is the only caller
+// outside `SelectQueueForModel` itself, so a safetensors load pays nothing, an
+// explicitly named device pays nothing (that arm creates no queue here), and an
+// auto-arm GGUF load pays one `CreateQueue`/`DestroyQueue` pair. That is not free,
+// and it is smaller than removing a working load.
+vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
+                                      vllm::Device device);
+
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
 // runner -> Executor -> EngineCore; Input/OutputProcessor -> LLMEngine) for a
 // registered model. The concrete weights/forward are held behind LoadedModel;
@@ -214,13 +271,23 @@ class LoadedEngine {
   // tests construct it directly with synthetic in-memory weights (no disk). The
   // pieces are moved into members that outlive every collaborator that
   // references them.
+  // `mtp_weights` is the in-memory mirror of FromModelDir's `maybe_attach_mtp`
+  // (SPEC-MTP-K-GT-1, #81): with a speculative config of method "mtp", the
+  // checkpoint path reads the `mtp.*` tensors off the same shards and attaches
+  // them so the runner can build the draft. A caller holding weights in memory
+  // had no way to supply that head, so a synthetic spec engine could only ever
+  // run with a NULL drafter, which is exactly the state a depth gate must not
+  // mistake for working speculation. Defaulted to nullopt, so every existing
+  // construction is unchanged.
   LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
-               tok::Tokenizer tokenizer, const EngineParams& params);
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               std::optional<Qwen3_5MTPWeights> mtp_weights = std::nullopt);
 
   // DENSE-arch overload (27B). Identical stack; the runner runs the dense
   // Qwen3_5DenseModel::Forward over the dense weights instead of the MoE forward.
   LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
-               tok::Tokenizer tokenizer, const EngineParams& params);
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               std::optional<Qwen3_5MTPWeights> mtp_weights = std::nullopt);
 
   LoadedEngine(const LoadedEngine&) = delete;
   LoadedEngine& operator=(const LoadedEngine&) = delete;
@@ -358,6 +425,24 @@ class LoadedEngine {
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
                                   bool is_pooling_model = false);
+  // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
+  // checkpoint. params.speculative_config carries the CLI method + optional user
+  // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
+  // mtp_num_hidden_layers (from config.raw text_config, default 1) so n_predict
+  // and the resolved k are correct. Returns nullopt when no speculation is
+  // configured (the byte-identical production path). Non-Qwen3.5 or non-mtp
+  // methods that reached here throw.
+  static std::optional<vllm::SpeculativeConfig> ResolveSpecConfig(
+      const EngineParams& params, const HfConfig& config);
+  // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): public beside the other Resolve*
+  // statics of this class, which are the pure config-resolution helpers the
+  // constructor calls and which tests already drive directly
+  // (tests/vllm/entrypoints/test_loaded_engine_dense.cpp:347 for
+  // ResolveMaxNumBatchedTokens). ResolveSpecConfig is the same kind of function
+  // and was private only by accident of where it was added. The DSpark block
+  // floor has to be reachable from a test that enters the loader's resolution
+  // path rather than calling SpeculativeConfig::ResolveDspark by hand, which is
+  // exactly the distinction .agents/reachability.md draws.
 
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight
@@ -380,15 +465,6 @@ class LoadedEngine {
       bool enable_caching,
       vllm::v1::StructuredOutputManager* structured_output_manager,
       std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt);
-  // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
-  // checkpoint. params.speculative_config carries the CLI method + optional user
-  // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
-  // mtp_num_hidden_layers (from config.raw text_config, default 1) so n_predict
-  // and the resolved k are correct. Returns nullopt when no speculation is
-  // configured (the byte-identical production path). Non-Qwen3.5 or non-mtp
-  // methods that reached here throw.
-  static std::optional<vllm::SpeculativeConfig> ResolveSpecConfig(
-      const EngineParams& params, const HfConfig& config);
   // SPEC-MTP I5d: build the KV-cache spec, widened for speculation when a spec
   // config is set (the extra GDN k+1 state slots + widened conv row + the
   // `fa_draft` full-attn group, MakeQwen3_5KVCacheSpec num_spec>0). With no spec
@@ -404,6 +480,13 @@ class LoadedEngine {
   // profile path (M3, not yet implemented) which falls back to 256. Throws
   // VLLM_ERR-shaped std::runtime_error when an absolute byte budget is smaller
   // than a single KV block.
+  //
+  // FIX-GPU-MEM-UTIL-INERT (#1165): the profile path also WARNS on stderr when
+  // it reaches knob 3 with an explicitly chosen gpu_memory_utilization, because
+  // that is the point at which the chosen fraction is discarded. Knobs 1 and 2
+  // return first, so a caller who sized the pool with --num-blocks or
+  // --kv-cache-memory is never warned -- and under knob 2 that also mirrors
+  // vLLM, which ignores the fraction there (cache.py:189).
   static int ResolveNumBlocks(const EngineParams& params,
                               const vllm::v1::KVCacheConfig& probe);
   // ROAD-V1-MEM M1: MakeKVCacheMaybeSpec with the block count resolved from the

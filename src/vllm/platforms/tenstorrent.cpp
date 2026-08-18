@@ -65,6 +65,15 @@ class TenstorrentPlatform final : public Platform {
     if (cfg.use_mla) return {};
     return {"FLASH_ATTN"};
   }
+
+  // HOST-FREE-FORWARD R1 measurement (local, gated on VT_TT_HOST_FREE_DECODE):
+  // enable the shared decode-graph framework so we can probe whether the
+  // RmsNorm+RoPE threshold flip gets capture past the to_vector fatal.
+  // NOT for shipping as-is: a real flip belongs to R4 and must be unconditional
+  // only once the forward is host-free end-to-end.
+  bool support_static_graph_mode() const override {
+    return std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  }
 };
 
 // Registers kTENSTORRENT during static init. Stays silent when no Blackhole

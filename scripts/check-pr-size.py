@@ -86,6 +86,11 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
+        # The intake surface moved out of roadmap_v1.md into its own append-only
+        # file (#840) and was never classified here. Classification is a hard
+        # error by design, so pr-size aborted on EVERY pull request that appends
+        # an index row, which under the same policy is nearly all of them (#856).
+        ".agents/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",
@@ -105,6 +110,14 @@ PROCEDURE_FILES = frozenset(
         "CLAUDE.md",
         ".agents/workflow.md",
         ".agents/verification.md",
+        # The "nothing lands dead" task guide (#888, `8f49ac3be`). Never
+        # classified, and classify_path FAILS CLOSED, so pr-size refused every
+        # PR that touched it and this file's own suite has been red on main ever
+        # since -- silently, because that suite runs in no CI job and only the
+        # next checker change loads it (#989). Third instance of the same class
+        # after #856 and #668; listed explicitly rather than letting .agents/
+        # become a blanket exemption.
+        ".agents/reachability.md",
         ".agents/porting.md",
         # The per-model coverage checklist that porting.md points at (#318). Same
         # procedure class as its sibling guides; listed explicitly rather than
@@ -112,6 +125,14 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
+        # The writing guides AGENTS.md delegates to, and the skill routes that
+        # point at them (#827). Same procedure class as their sibling guides.
+        # They were never classified, so classify_path FAILED CLOSED and this
+        # test has been red on main ever since that row landed (#856).
+        ".agents/style/commits.md",
+        ".agents/style/prose.md",
+        ".claude/skills/writing-commits-and-prs/SKILL.md",
+        ".claude/skills/writing-technical-english/SKILL.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",
@@ -296,6 +317,17 @@ CREATION_MUTATIONS = {
     # reduced one.
     "scripts/check-container-matrix.py": DISABLED_CREATION_CHECKER,
     "scripts/check-container-workflow.py": DISABLED_CREATION_CHECKER,
+    # GATE-SYMBOL-ANCHORS (#1143). Created here, so there is no BASE version to
+    # mutate. The empty stub exits 0 and prints nothing, which fails 20 of the
+    # 21 cases in tests/scripts/test_check_symbol_anchors.py -- including the
+    # clean-tree case, which asserts a checked count at or above the recorded
+    # floor and so cannot be satisfied by silence.
+    "scripts/check-symbol-anchors.py": DISABLED_CREATION_CHECKER,
+    # 2026-08-16: the CUDA arch-gate registration guard (#960). Created in the
+    # same PR, so there is no BASE version to mutate; its own suite loads the
+    # checker as a module and calls into it, so the disabled stub fails at import
+    # rather than quietly passing a reduced set of cases.
+    "scripts/check-cuda-op-arch-gate.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120

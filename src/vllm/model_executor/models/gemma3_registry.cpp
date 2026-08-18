@@ -67,7 +67,7 @@ void PrepareGemma3ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardGemma3ForCausalLM(LoadedModel& model,
                                        const ModelForwardInput& input) {
-  const auto& gemma = static_cast<Gemma3LoadedModel&>(model);
+  const auto& gemma = ModelAs<Gemma3LoadedModel>(model, "Gemma3ForCausalLM");
   const Gemma3Weights& weights = gemma.weights();
   if (input.gather_logits) {
     return Gemma3Model::ForwardDevice(input.token_ids, input.positions,

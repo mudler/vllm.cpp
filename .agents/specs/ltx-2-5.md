@@ -291,6 +291,11 @@ dgx.casa.
 new neighborhood-attention kernel); the temporal x2 upsampler; LoRA fusion; multishot;
 `int8-convrot` (ComfyUI-only quantization); multi-GPU / CFG parallelism.
 
+**Four upstream PIPELINES are out too, and this list did not say so until 2026-08-17:**
+`TI2VidTwoStagesPipeline`, `HDRICLoraPipeline`, `DubItPipeline` and
+`KeyframeInterpolationPipeline`. See `## Owed` for what each is blocked on and its issue.
+`TI2VidTwoStagesHQPipeline` (#921) and `DFRPipeline`'s rounds loop (#986) were already filed.
+
 ## 3. The oracle problem, and its resolution
 
 vLLM-Omni does **not** support LTX-2.5. Its recipe table keys on
@@ -934,20 +939,108 @@ rather than an error:
 - Speed axis: stays open until vllm-omni carries native 2.5 (tracked upstream at #6066) or
   another production-configuration denominator is ratified.
 
+## Owed
+
+Recorded 2026-08-17. Four upstream pipelines at Lightricks/LTX-2 `fd4ded7f` had no recipe
+row, no refusal, no `Ltx2UnportedPipelineFeature` marker and no issue. §2's "Out" list named
+none of them. Per AGENTS.md that is the worse half of the silent/refused split: a refusal
+naming a missing part is documented debt, and silence is not. Each now has its own issue,
+each saying what is absent, what a future row starts from, and what blocks it.
+
+- [#1093](https://github.com/mudler/vllm.cpp/issues/1093) — `TI2VidTwoStagesPipeline`
+  (`ti2vid_two_stages.py:61`). NOT our `distilled_two_stage`: stage 1 is CFG-guided on the
+  FULL model (`:247-259`), stage 2 carries the distilled LoRA alone (`:151`), and stage-1
+  sigmas are scheduler-derived (`:243-245`) where ours are the fixed `DistilledSigmas()`
+  table (`ltx2_pipeline.cpp:1163`). Also NOT `TI2VidTwoStagesHQPipeline`, which
+  [#921](https://github.com/mudler/vllm.cpp/issues/921) owns. Blocked on a guided VIDEO
+  denoise loop, and on two checkpoints absent from the NAS: the distilled LoRA and the full
+  `-dev-` transformer.
+  `.agents/specs/ltx25-resolution-envelope.md` already carried this under its own `## Owed`
+  and said "not separately filed, because #644 already owns 'close every refused arm'". That
+  record is real and is why this one was never silent; it is filed now because an umbrella
+  row cannot say what THIS arm is blocked on. That bullet now points here.
+- [#1094](https://github.com/mudler/vllm.cpp/issues/1094) — `HDRICLoraPipeline`
+  (`hdr_ic_lora.py:229`). Four comments and one `Fail(...)` string literal
+  (`ltx2_lora.cpp:246`) cite it; nothing implements it. Blocked on a LogC3 / ACEScct decode
+  tail (`ltx-core/hdr.py:37-172`, applied at `hdr_ic_lora.py:624`), which this tree has zero
+  of by deliberate exclusion (`ltx25-retire-dead-arms.md:167`, "no — colour science"), plus
+  an HDR IC-LoRA and a pre-computed text-embeddings file, neither on the NAS.
+- [#1095](https://github.com/mudler/vllm.cpp/issues/1095) — `DubItPipeline` (`dubit.py`).
+  `Ltx2ConditionAudioByReference` is ported, gated (`test_ltx2_vae.cpp:2926`) and undriven;
+  reference audio is already refused by name (`ltx2_video.cpp:1991-2004`). Blocked on the
+  negative RoPE shift (`dubit.py:351-353`), which our one ported shift structurally cannot
+  produce because it clamps at zero (`ltx2_conditioning.cpp:596-601`), and on the Dub-It
+  IC-LoRA.
+- ~~[#1096](https://github.com/mudler/vllm.cpp/issues/1096) —
+  `KeyframeInterpolationPipeline` (`keyframe_interpolation.py`).~~ LANDED as row
+  `LTX25-KEYFRAME-INTERP` ([`ltx25-keyframe-interp.md`](ltx25-keyframe-interp.md)),
+  and two of the three blockers recorded here were stale by the time it was picked
+  up. The per-sigma denoiser resolves ONE guider on this pipeline's default path —
+  `main()` passes plain `MultiModalGuiderParams`, so
+  `create_multimodal_guider_factory` takes `constant()` and builds a single
+  `(inf, params)` bin (`guiders.py:312-315`) — and both checkpoints are on the NAS
+  with #1148 closed at `40a796aa9`. The multi-keyframe surface is real, is NOT
+  what makes this pipeline different, and is now
+  [#1187](https://github.com/mudler/vllm.cpp/issues/1187). What WAS different, and
+  is named in none of the above, is the conditioning BUILDER: `:211` and `:260`
+  call `image_conditionings_by_adding_guiding_latent` (`helpers.py:343-367`), so
+  frame 0 is a keyframe that APPENDS rather than a latent that REPLACES.
+- [#1097](https://github.com/mudler/vllm.cpp/issues/1097) — `ltx2-gen` silently discards a
+  second `--lora`, and `kKnownLoadExtras`' own comment still says "nine of these ten" over a
+  twelve-entry array. Product code, so filed rather than fixed in this records change.
+- [#1098](https://github.com/mudler/vllm.cpp/issues/1098) — `README.md` has ZERO `LTX`
+  mentions (control: `minimax` = 7) and says "37 registered architectures" four times where
+  `docs/FEATURES.md` says 40. **Neither can be fixed today, and this change tried.** Two gates
+  refuse it independently: `MAX_README_CHARS = 30000` against a measured 29,989, so the
+  LTX-2.5 matrix row could only land by deleting another architecture's row; and
+  `check-doc-checkpoint.py:346-354`, which refuses any README change not accompanied by a
+  LANDING SOURCE edit, per commit (#573). A two-family paragraph was written and MEASURED to
+  fit with four characters to spare, then reverted unlanded when the second gate fired; it is
+  preserved verbatim in the issue thread. The first blocker is the shared-file lock AGENTS.md
+  § Records names; the second has no arm for a CORRECTION as against churn. Both want the
+  spec-plus-red-first path, not a drive-by, so neither is touched here.
+
+**One rejected audit finding, recorded because a rejection is a result.** These four were
+reported alongside a claim that `Ltx2AudioPatchify` is ported-but-undriven. It is not. It is
+called at `ltx2_video.cpp:2595`, unconditionally inside the phase loop of
+`Ltx2VideoEngine::Generate`, on every LTX-2.5 render. Its second call site, inside
+`Ltx2CreateAudioLatentState` (`ltx2_conditioning.cpp:484`), is the undriven one — which is
+how a true statement about one call site became a false statement about a symbol.
+
 ## Now
 
-L1-L6 merged and operator-gated on `row/MODEL-DIFFUSION-LTX25`. L7 (VideoEngine wiring +
-dgx e2e) and L8 (device-resident forward) are implemented and reviewed FAIL on five MEDIUM
-findings; the repair is in flight.
+Updated 2026-08-17. **The `## Now` this replaces was three days and roughly seventeen landed
+rows stale**, and it is worth saying what it claimed, because the shape recurs: it reported
+L1-L6 merged with "L7 and L8 ... reviewed FAIL on five MEDIUM findings; the repair is in
+flight". L7 and L8 landed at `cefacd2d0` on 2026-08-13, and `git log --grep LTX25` shows what
+followed.
 
-**The DiT forward runs on the GB10 GPU.** Independently verified by the runtime provider
-announcer, not by reading: all eight dispatched ops resolve `vt-native` on device 1 with
-`registered=1`, and ZERO reference-tier hits across eleven logs. The shipped 21.00B FP8 DiT
-(6124 tensors) staged and produced one finite forward, reproduced by the reviewer to the
-digit (absmax video 0.300781 / audio 2.14062).
+L1-L11 are on `main`. Landed since that paragraph was written, each on its own row and PR:
+prompt-side AdaLN (`65e79eee5`), the trained keyframe absolute-position bias (`98f8e046d`,
+#658), the temporal x2 upsampler (`2e9d95e74`, gated and undriven), tiled and streaming Conv
+VAE decode (`44b14cceb`), the dead-arm retirement (`0785cfc4d`), image conditioning and the
+VAE encoder load path (`c629b5d0f`), the device-seam sibling (`d415c931d`), the staged-view
+UAF repair (`4880c5715`, #904), audio-to-video (`c2019b0e3`), token-append (`c7cb59fbb`), the
+resolution envelope (`e5351776c`, #919), generated keyframe slots (`71b401b15`), IC-LoRA
+fusion (`885c96fe6`, #923), retake (`3ce1cf7c7`), the DFR base (`332aed738`, #986), the
+decode dtype (`d1b0ea3a8`, #1008), decode threading (`ec0e410b5`, #1009) and text-to-audio
+(`0b0b8900f`, #1005).
 
-**Two things that claim qualifies.** The FP8 DiT carries NO `__metadata__`, so it ran under
-DEFAULTS (`av_ca_timestep_scale_multiplier = 1`, `double_precision_rope = false`) against
-LTX-2.5's declared 1000 / float64 — the shipped weights on the right device in the wrong
-configuration. And the first-party NVFP4 DiT, which §4 names as the best GB10 arm, does NOT
-load (§4 correction). Next: the L7/L8 repair, then the squash landing.
+**The DiT forward runs on the GB10 GPU**, and that claim is unchanged. Independently verified
+by the runtime provider announcer, not by reading: all eight dispatched ops resolve
+`vt-native` on device 1 with `registered=1`, and ZERO reference-tier hits across eleven logs.
+The shipped 21.00B FP8 DiT (6124 tensors) staged and produced one finite forward, reproduced
+by the reviewer to the digit (absmax video 0.300781 / audio 2.14062).
+
+**What still qualifies it.** The FP8 DiT carries NO `__metadata__`, so a run without
+`--dit-config` takes DEFAULTS (`av_ca_timestep_scale_multiplier = 1`,
+`double_precision_rope = false`) against LTX-2.5's declared 1000 / float64. The first-party
+NVFP4 DiT no longer fails to load — §4.1's swizzled, high-nibble-first reading landed as L9a
+— so §4's superseded correction is history rather than current position.
+
+**A 704x448/25f render completed with a verified stereo track**, on the NVFP4 transformer on
+one GB10 at `0b0b8900f`: 25/25 distinct frame md5s, 0 near-uniform frames, 0/24 zero-motion
+pairs, 48 kHz stereo (`ltx25-resolution-envelope.md:383,401-407`). **It was NOT prompted** —
+it took the embeds path (`docs/USAGE.md`, the resolution section). A prompted render on real
+weights is still OWED, and so is the binding-oracle correctness axis (§3) and the speed axis
+(§0). None of the three is a failure and none is a pass.

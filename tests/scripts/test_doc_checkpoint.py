@@ -335,8 +335,10 @@ class SupportSurfaces(unittest.TestCase):
         finally:
             checker.blob = original
 
-    def test_a_new_model_owes_the_feature_surface(self):
-        errors = self.errors(["src/vllm/model_executor/models/newmodel.cpp"])
+    def test_a_matrix_record_still_owes_the_feature_surface(self):
+        # The four .agents/*-matrix.md records ARE claim surfaces, so they keep
+        # the path trigger. Pins what #595's fix must not widen away.
+        errors = self.errors([".agents/model-matrix.md"])
         self.assertTrue(errors)
         self.assertIn("docs/FEATURES.md", errors[0])
 
@@ -390,6 +392,67 @@ class SupportSurfaces(unittest.TestCase):
 
     def test_a_landing_source_permits_but_does_not_demand_readme(self):
         self.assertEqual(self.errors([".agents/mission.md"]), [])
+
+
+
+
+class FeatureSurfaceTrigger(unittest.TestCase):
+    """#595: a model file owes docs/FEATURES.md when its REGISTRATIONS change.
+
+    Editing the internals of an already-registered architecture is not a claim
+    about what the project supports. Keying on the path instead is what made a
+    one-line compile fix owe a public-doc edit, and #1054 answered that demand
+    with prose that crossed the check-public-doc-tables budgets and blocked
+    every push in the repository (#1055, #1058, #1062).
+    """
+
+    MODEL = "src/vllm/model_executor/models/somemodel.cpp"
+    REGISTERED = 'REGISTER_VLLM_MODEL("SomeForCausalLM", SomeModel);\nint f() { return 1; }\n'
+    EDITED = 'REGISTER_VLLM_MODEL("SomeForCausalLM", SomeModel);\nint f() { return 2; }\n'
+    ADDED = (
+        'REGISTER_VLLM_MODEL("SomeForCausalLM", SomeModel);\n'
+        'REGISTER_VLLM_MODEL("OtherForCausalLM", OtherModel);\n'
+    )
+
+    def errors(self, paths, before_text, after_text):
+        original = checker.blob
+
+        def fake(rev, path):
+            if path.startswith(".agents/specs/"):
+                return SPEC_WITH_NOW
+            return before_text if rev == "BEFORE" else after_text
+
+        checker.blob = fake
+        try:
+            return checker.errors_for(set(paths), "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    def test_editing_a_registered_model_owes_nothing(self):
+        # RED before the #595 trigger change: the path alone fired.
+        errors = self.errors([self.MODEL], self.REGISTERED, self.EDITED)
+        self.assertEqual(errors, [], f"a registration-preserving edit demanded: {errors}")
+
+    def test_a_new_model_registration_owes_the_feature_surface(self):
+        errors = self.errors([self.MODEL], self.REGISTERED, self.ADDED)
+        self.assertTrue(errors, "adding an architecture must still owe FEATURES.md")
+        self.assertIn("docs/FEATURES.md", errors[0])
+
+    def test_a_brand_new_model_file_owes_the_feature_surface(self):
+        errors = self.errors([self.MODEL], "", self.REGISTERED)
+        self.assertTrue(errors, "a new registered architecture must owe FEATURES.md")
+        self.assertIn("docs/FEATURES.md", errors[0])
+
+    def test_removing_a_registration_owes_the_feature_surface(self):
+        errors = self.errors([self.MODEL], self.ADDED, self.REGISTERED)
+        self.assertTrue(errors, "removing an architecture must still owe FEATURES.md")
+        self.assertIn("docs/FEATURES.md", errors[0])
+
+    def test_a_satisfied_registration_change_passes(self):
+        errors = self.errors(
+            [self.MODEL, "docs/FEATURES.md"], self.REGISTERED, self.ADDED
+        )
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

@@ -109,14 +109,26 @@
 //
 // UNPORTED. `Ltx2LoadDitFromSafetensors` REFUSES the load by naming these, and
 // only an explicit `allow_unported_modules` — which exists so the ported subset
-// stays gateable — proceeds, still reporting every one of them in `unported`:
+// stays gateable — proceeds, still reporting every one of them in `unported`.
+//
+// THAT GROUP IS NOW EMPTY for both shipped DiTs. It last held
+// `keyframes_abs_pos_embedding [1, 4096]`, which row LTX25-KEYFRAMES-ABS-POS
+// (.agents/specs/ltx25-keyframes-abs-pos.md, issue #658) ported on 2026-08-14 —
+// see the PORTED paragraph below.
+//
+// PORTED 2026-08-14 — no longer named in that refusal:
 //
 //   keyframes_abs_pos_embedding  [1, 4096]
-//       So `use_keyframes_abs_pos_embedding = TRUE`, contradicting ltx2.h:47-49.
-//       This is now the ONLY flag `Ltx2AdoptDeclaredDitParams` clears in its
-//       config copy, and it must stay that way: a flag cleared there is invisible
-//       to the contract-equality check, so clearing a PORTED one silently drops
-//       its tensors.
+//       Trained on the vonkaiser FP8 DiT: `F8_E4M3` with an `F32` scale, 4096 of
+//       4096 bytes NON-ZERO. Upstream adds it to every token the keyframes mask
+//       marks (model.py:217-219, transformer_args.py:23-43 called once at :269),
+//       and `_first_frame_keyframes_mask` marks the target's first latent frame
+//       UNCONDITIONALLY (tools.py:186-196), so it is live on every render.
+//       `Ltx2AdoptDeclaredDitParams` no longer force-clears the flag under
+//       `allow_unported_modules`; it resolves `supports_keyframes_abs_pos_embedding`
+//       (model.py:166-173) against what the file carries, which is what lets the
+//       first-party NVFP4 DiT — flag declared, tensor absent — load and apply
+//       nothing, exactly as upstream's meta-device load does.
 //
 // PORTED 2026-08-13 — no longer named in that refusal:
 //
@@ -165,6 +177,7 @@
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_lora.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -350,6 +363,23 @@ inline constexpr const char* kLtx2DitCheckpointPrefix = "model.diffusion_model."
 // Which quantization the DiT file actually uses, DETECTED from the tensors
 // rather than from a filename.
 enum class Ltx2DitQuant {
+  // NOT QUANTIZED — every weight is stored at the model dtype and the file
+  // carries no scale sidecar at all. This is upstream's ORDINARY case rather
+  // than a third scheme: `single_gpu_model_builder.py:51-57` (@ `fd4ded7f`)
+  // lists float32/float64/float16/bfloat16 as the dtypes `build(..., dtype=)`
+  // may cast and calls uint8-NVFP4 and float8 "quantized payloads" that must
+  // not be rewritten, so the two quantized arms are the exception and this is
+  // the baseline they are an exception to.
+  //
+  // It is what `Lightricks/LTX-2.5` ships as the FULL (dev) transformer, which
+  // `packages/ltx-pipelines/CLAUDE.md:17-30` names as the model for
+  // `TI2VidOneStagePipeline`, `T2AOneStagePipeline`, `TI2VidTwoStagesPipeline`,
+  // `TI2VidTwoStagesHQPipeline`, `A2VidPipelineTwoStage` and
+  // `KeyframeInterpolationPipeline` — most of the arms this port carries.
+  // Refusing it left every one of them runnable only against a DISTILLED
+  // checkpoint, which is a different sampling regime and renders plausibly
+  // (issue #1148, and #1137 for the missing class check).
+  kNone,
   kFp8,    // F8_E4M3 weight + F32 scalar `<name>_scale`   (vonkaiser 22b-distilled-fp8)
   kNvfp4,  // U8 packed + F8_E4M3 `<name>_scale` + F32 `<name>_scale_2`
 };
@@ -362,6 +392,19 @@ struct Ltx2DitLoadOptions {
   // Widen the bf16 materialization to f32 for `Ltx2DitForward`, whose gate is
   // f32 by declaration. Doubles the footprint; see the DTYPE note above.
   bool widen_to_f32 = false;
+  // IC-LoRA adapters to FUSE INTO the weights as they are materialized
+  // (ltx-core loader/fuse_loras.py:119-150; `DiffusionStage.from_checkpoint`
+  // takes them as a constructor argument, ic_lora.py:104-114, which is why they
+  // live on the LOAD options rather than on a generation request).
+  //
+  // Fusion happens immediately after `MaterializeDitTensor` and therefore serves
+  // the F32, BF16, FP8 and NVFP4 arms with one code path: both quantized
+  // branches dequantize to bf16 before returning. On the streaming arm it runs
+  // before the device copy, so the "one host buffer live at a time" invariant is
+  // unchanged. See `ltx2_lora.h` for the arithmetic and the dtype argument.
+  //
+  // Exactly one adapter is accepted; a second refuses by name.
+  std::vector<Ltx2LoraSpec> loras;
 };
 
 // A host buffer owned by a loaded checkpoint. Pointer-stable: the views index
@@ -383,6 +426,19 @@ struct Ltx2DitCheckpoint {
   // Module prefixes present in the file and outside the L2 contract, in header
   // order, deduplicated. Empty means the file and the contract agree.
   std::vector<std::string> unported;
+  // How many contract tensors an IC-LoRA delta was fused into. Zero when no
+  // adapter was given; never zero WITH one, because a LoRA that fused into
+  // nothing is refused at load.
+  int64_t lora_fused_tensors = 0;
+  // The reference scale factors the fused adapter declares in its own
+  // `__metadata__` (iclora_utils.py:30-49), resolved by
+  // `Ltx2ResolveLoraReferenceFactors`. Both 1 with no adapter, which is also
+  // upstream's default for an adapter that declares neither.
+  //
+  // These are what `Ltx2ConditionVideoByReference` takes and what the reference
+  // refusal used to name as unreadable. They are read here so that the refusal
+  // can name the cause that ACTUALLY remains.
+  Ltx2LoraReferenceFactors lora_reference;
   Ltx2DitWeights weights;
   std::map<std::string, vt::Tensor> views;
   // Host-resident buffers (`Ltx2LoadDitFromSafetensors`). Pointer-stable.
@@ -421,6 +477,93 @@ void Ltx2WidenDitToF32(Ltx2DitCheckpoint& checkpoint);
 // staging is not to move twice the bytes.
 Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile& file,
                                          const Ltx2DitLoadOptions& options = {});
+
+// Bring an ALREADY-LOADED checkpoint to the adapter state one PHASE wants.
+//
+// ─── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+//
+// `options.loras` is a property of the LOAD, and upstream's is a property of the
+// STAGE. Four pipelines build two `DiffusionStage`s from one checkpoint and hand
+// them different adapter sets, read at Lightricks/LTX-2 fd4ded7f:
+//
+//   a2vid_two_stage.py:107      `loras=tuple(loras)`
+//   a2vid_two_stage.py:114        vs `(*loras, *distilled_lora)`
+//   ti2vid_two_stages.py:140    `loras=tuple(loras)`
+//   ti2vid_two_stages.py:151      vs `(*tuple(loras), *distilled_lora)`
+//   ti2vid_two_stages_hq.py:154 `(*loras, distilled_lora_stage_1)`
+//   ti2vid_two_stages_hq.py:165   vs `(*loras, distilled_lora_stage_2)`
+//   ic_lora.py:108              `loras=tuple(loras)`
+//   ic_lora.py:119                vs `loras=()`   <- the mirror image
+//
+// Upstream pays for that with a SECOND `from_checkpoint` call against THE SAME
+// FILE — `model_paths.transformer()` at `a2vid_two_stage.py:104` and `:116`,
+// `ti2vid_two_stages.py:137` and `:148` — differing only in the adapter tuple.
+// It is a second MATERIALIZATION, not a second model, and that is exactly what
+// this function is. A second resident weight set would be a heavier
+// architecture than the reference: the DiT is 18.7 GB nvfp4, 21.0 GB fp8 and
+// ~39 GB bf16, against one GB10's 119 GB of unified memory with no swap.
+//
+// ─── WHAT IT DOES, AND WHY NOT THE TWO CHEAPER THINGS ────────────────────────
+//
+// For every contract tensor the adapters target it re-materializes the tensor
+// from `file` through the SAME `MaterializeDitTensor` the load uses, fuses the
+// adapters back in when `fuse` is true, and writes the result into the buffer
+// the view ALREADY points at. So:
+//
+//   * the view pointer never moves, and `checkpoint.weights` — a pure view
+//     struct — stays valid without being re-bound;
+//   * peak residency rises by ONE tensor plus the adapter's own A/B factors,
+//     never by a second weight set;
+//   * each phase gets `round_bf16(W + delta)` computed from the PRISTINE base,
+//     which is upstream's arithmetic rather than an approximation of it.
+//
+// NOT by SUBTRACTING the delta, which needs no file read and is wrong:
+// `round_bf16(round_bf16(W + d) - d)` is not `W`. The rounding is the whole
+// reason the accumulator dtype is pinned in `ltx2_lora.h`, and a subtract would
+// spend it twice. `test_ltx2_loader` compares byte-for-byte against a fresh
+// unfused load precisely so that implementation fails.
+//
+// NOT by applying the adapter UNFUSED at run time, which is `Wx + s*B(Ax)`
+// against upstream's `round_bf16(W + s*BA)x`. That is a rounding divergence AND
+// a different GEMM path, and it would change every arm's numerics to serve one
+// recipe.
+//
+// A tensor no adapter names is not touched at all, because for those the fused
+// and unfused images are equal by construction.
+//
+// `queue` is non-null exactly when the checkpoint was staged to a device, in
+// which case the write back is a `Copy` into the same device allocation. Passing
+// a queue for a host checkpoint, or none for a staged one, refuses by name
+// rather than writing to the wrong address space.
+//
+// Calling this with the state the checkpoint is already in is a no-op it detects
+// itself, so a single-phase recipe pays nothing.
+//
+// ─── AND THAT NO-OP IS THE TRAP THE NEXT ROW WALKS INTO ──────────────────────
+//
+// The state this detects is a BOOLEAN — `fuse` here, `lora_fused_tensors > 0` on
+// the checkpoint — so "already in that state" means "already FUSED" and never
+// "already fused AT THIS STRENGTH". Adding a per-phase strength on top of this
+// signature therefore does not work, and it fails SILENTLY rather than by name.
+//
+// `TI2VidTwoStagesHQPipeline` is the case: it builds the SAME adapter twice, at
+// `distilled_lora_strength_stage_1` and `distilled_lora_strength_stage_2`
+// (`ti2vid_two_stages_hq.py:92-101`), and hands one to each stage (`:154`,
+// `:165`). The CLI defaults them 0.25 and 0.5 (`utils/args.py:1174-1184`). BOTH
+// stages are fused, so `currently_fused == fuse` holds at the stage boundary and
+// this function returns having done nothing — stage 2 renders at stage 1's
+// strength, with no refusal, no shape change and no wrong-looking output.
+//
+// So growing this seam for https://github.com/mudler/vllm.cpp/issues/1144 needs
+// TWO changes beyond a new field on `Ltx2PhaseRecipe`: `fuse` must become a type
+// that can carry a STRENGTH, and `Ltx2DitCheckpoint` must record WHICH adapter
+// state is applied rather than merely whether one is. That is modest growth, not
+// a redesign — the re-materialize-and-write-back mechanism above is untouched by
+// it, because re-materializing from the pristine file already reaches any
+// strength in one pass.
+void Ltx2RebindDitLoras(vt::Queue* queue, const SafetensorsFile& file,
+                        const Ltx2DitLoadOptions& options, bool fuse,
+                        Ltx2DitCheckpoint& checkpoint);
 
 // ---------------------------------------------------------------------------
 // The text encoder
@@ -525,23 +668,29 @@ nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file);
 // engine (`Ltx2VideoEngine::Load`) and the device gate, which drives
 // `Ltx2StreamDitToDevice` directly and therefore owes the same adoption.
 //
-// `allow_unported_modules` clears `use_keyframes_abs_pos_embedding` IN A COPY of
-// the config before parsing: the flag is cleared for the CONTRACT, the module
-// stays unported, and the checkpoint's `unported` list still names it. Without
-// the opt-in `ParseLtx2DitParams` throws, which is the refusal.
+// THE ONE KEY IT RESOLVES RATHER THAN BELIEVES is
+// `use_keyframes_abs_pos_embedding`, and it is a MIRROR, not an escape hatch.
+// Upstream's `supports_keyframes_abs_pos_embedding` (model.py:166-173) is False
+// for "the config set the flag but the checkpoint carried no weight for it",
+// because models are built on the meta device and loaded with
+// `strict=False, assign=True`, so such a parameter stays on `meta` and the add is
+// never reached. So a declared flag over a file that omits the tensor is cleared
+// in a COPY of the config before parsing — no refusal, and no synthesised zero.
+// That case is the shipped first-party NVFP4 DiT exactly.
 //
-// IT CLEARS EXACTLY THAT ONE FLAG, and the scoping is the rule, not an accident.
-// It also used to clear `use_prompt_adaln_single`, whose module has been ported
-// since 2026-08-13 — so the opt-in a real render REQUIRES was silently turning a
+// This USED TO be conditioned on `allow_unported_modules`, which made a real
+// render's opt-in decide a correctness question; that parameter is gone. It also
+// used to clear `use_prompt_adaln_single`, whose module has been ported since
+// 2026-08-13 — so the opt-in a real render REQUIRES was silently turning a
 // correctness setting off, and the contract-equality check below could not see it
-// because both sides had been forced to the same cleared value. A ported module's
-// flag belongs in the contract; only a module nothing applies may be cleared here.
+// because both sides had been forced to the same cleared value. Nothing else is
+// cleared here: every other flag belongs in the contract, where that check can see
+// it.
 //
 // `source` names the config in every refusal, so a reader knows whether the
 // checkpoint declared it or a caller supplied it.
 Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
                                          const Ltx2DitParams& from_shapes,
-                                         bool allow_unported_modules,
                                          const std::string& source);
 
 // ---------------------------------------------------------------------------

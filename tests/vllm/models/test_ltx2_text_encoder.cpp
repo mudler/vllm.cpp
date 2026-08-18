@@ -37,6 +37,7 @@
 
 #include "doctest/doctest.h"
 #include "support/max_abs_diff.h"
+#include "support/process_id.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/gemma4.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
@@ -45,6 +46,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 
 #include "ltx2_text_goldens.inc"
 #include "ltx2_gemma_tower_goldens.inc"
@@ -1070,6 +1072,155 @@ TEST_CASE("ltx2 text: FeatureExtractorV2 — the two caption projections") {
   }
 }
 
+// LTX25-TEXT-LINEAR-SEAM (#1208). The caption projection IS the shared vt GEMM
+// seam, not a hand-rolled loop beside it, and this case is what says so
+// executably.
+//
+// It runs at flat = 8192 rather than at the goldens' 24, because the two
+// implementations this discriminates between — an f64 accumulator and the seam's
+// f32 one — agree to well under any bound at 24. The width is still 23x smaller
+// than the shipped 188160, so the fixture stays a few megabytes.
+//
+// TWO assertions, and the second is what stops the first from being vacuous:
+//
+//   1. the projection equals `vt::MatmulBT` + bias BYTE for byte. No tolerance:
+//      if the production path is the seam then there is nothing to round
+//      differently, and a bound here would accept an implementation that merely
+//      lands nearby.
+//   2. an f64-accumulating reference — the algorithm this row replaced — is
+//      measurably FURTHER away than that. Without it a test that passed under
+//      both implementations would be indistinguishable from one that
+//      discriminates, which is the failure AGENTS.md names for a gate that
+//      cannot say how.
+//
+// Correctness against upstream is NOT this case's job and it does not claim it:
+// this is a consistency gate between two of our own paths. The goldens above hold
+// the projection to the executed `ltx_core` module at 1e-5, and neither case
+// substitutes for the other.
+TEST_CASE("ltx2 text: the caption projection is the vt::MatmulBT seam") {
+  constexpr int64_t kSeamHidden = 128;
+  constexpr int64_t kSeamLayers = 64;                       // num_hidden_layers + 1
+  constexpr int64_t kSeamFlat = kSeamHidden * kSeamLayers;  // 8192
+  constexpr int64_t kSeamOut = 32;
+  constexpr int64_t kSeamBatch = 1;
+  constexpr int64_t kSeamSeq = 3;
+  constexpr int64_t kSeamRows = kSeamBatch * kSeamSeq;
+
+  // One deterministic stream, so the fixture is reproducible without a checked-in
+  // weight byte and without <random>'s implementation-defined engines.
+  uint64_t bits = 0x9e3779b97f4a7c15ull;
+  auto next = [&bits]() {
+    bits ^= bits << 13;
+    bits ^= bits >> 7;
+    bits ^= bits << 17;
+    return static_cast<float>(static_cast<double>(bits >> 40) / 16777216.0 - 0.5);
+  };
+
+  std::vector<std::vector<float>> layers(static_cast<size_t>(kSeamLayers));
+  std::vector<const float*> ptrs;
+  for (int64_t l = 0; l < kSeamLayers; ++l) {
+    std::vector<float>& buf = layers[static_cast<size_t>(l)];
+    buf.resize(static_cast<size_t>(kSeamRows * kSeamHidden));
+    for (float& v : buf) v = next();
+    ptrs.push_back(buf.data());
+  }
+  Ltx2TextHiddenStates states;
+  states.layers = ptrs;
+  states.batch = kSeamBatch;
+  states.seq = kSeamSeq;
+  states.hidden = kSeamHidden;
+
+  // Every position valid: a padded row projects to the bias alone, which no
+  // accumulator touches, and would only dilute the comparison.
+  const std::vector<int32_t> mask(static_cast<size_t>(kSeamRows), 1);
+
+  vllm::Ltx2TextEncoderWeights weights;
+  weights.video.in_features = kSeamFlat;
+  weights.video.out_features = kSeamOut;
+  weights.video.weight.resize(static_cast<size_t>(kSeamOut * kSeamFlat));
+  for (float& v : weights.video.weight) v = next() * 0.05f;
+  weights.video.bias.resize(static_cast<size_t>(kSeamOut));
+  for (float& v : weights.video.bias) v = next() * 0.02f;
+
+  Ltx2TextFeatureConfig cfg;
+  cfg.variant = Ltx2TextNormVariant::kPerTokenRmsV2;
+  cfg.embedding_dim = kSeamHidden;
+  cfg.num_layers = kSeamLayers;
+  cfg.video_out_features = kSeamOut;
+  cfg.audio_out_features = 0;  // the audio arm is not what this case is about
+  cfg.aggregate_bias = true;
+  cfg.is_av = false;
+
+  const vllm::Ltx2TextFeatures got =
+      vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), weights, cfg);
+  const size_t count = static_cast<size_t>(kSeamRows * kSeamOut);
+  REQUIRE(got.video.size() == count);
+
+  // The projection's INPUT, rebuilt from the same exported helpers the extractor
+  // itself calls, so nothing here re-implements a step: the stack, the V2 norm,
+  // and the per-projection rescale (feature_extractor.py:121-129).
+  const std::vector<float> stacked = vllm::Ltx2StackHiddenStates(states);
+  std::vector<float> scaled = vllm::Ltx2NormAndConcatPerTokenRms(
+      stacked.data(), mask.data(), kSeamBatch, kSeamSeq, kSeamHidden, kSeamLayers);
+  const float rescale =
+      static_cast<float>(vllm::Ltx2RescaleNorm(kSeamOut, kSeamHidden));
+  for (float& v : scaled) v *= rescale;
+
+  const vt::Device dev{vt::DeviceType::kCPU, 0};
+  vt::Queue q{dev, nullptr};
+  std::vector<float> seam(count, 0.0f);
+  vt::Tensor a = vt::Tensor::Contiguous(scaled.data(), vt::DType::kF32, dev,
+                                        {kSeamRows, kSeamFlat});
+  vt::Tensor b = vt::Tensor::Contiguous(weights.video.weight.data(), vt::DType::kF32,
+                                        dev, {kSeamOut, kSeamFlat});
+  vt::Tensor o =
+      vt::Tensor::Contiguous(seam.data(), vt::DType::kF32, dev, {kSeamRows, kSeamOut});
+  vt::MatmulBT(q, o, a, b);
+  for (int64_t r = 0; r < kSeamRows; ++r)
+    for (int64_t f = 0; f < kSeamOut; ++f)
+      seam[static_cast<size_t>(r * kSeamOut + f)] +=
+          weights.video.bias[static_cast<size_t>(f)];
+
+  // 1 — byte equality with the seam.
+  size_t mismatched = 0;
+  double worst_seam = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    if (got.video[i] != seam[i]) ++mismatched;
+    worst_seam = std::max(worst_seam, std::abs(static_cast<double>(got.video[i]) -
+                                               static_cast<double>(seam[i])));
+  }
+  MESSAGE("ltx2 text seam: elements differing from vt::MatmulBT = "
+          << mismatched << " / " << count << ", max|diff| = " << worst_seam);
+  CHECK(mismatched == 0);
+
+  // 2 — the discrimination proof. An f64 accumulator over the SAME input lands a
+  // measurable distance away at this width, so passing assertion 1 is a statement
+  // about the implementation rather than about the fixture.
+  double worst_f64 = 0.0;
+  for (int64_t r = 0; r < kSeamRows; ++r) {
+    const float* xr = scaled.data() + static_cast<size_t>(r * kSeamFlat);
+    for (int64_t f = 0; f < kSeamOut; ++f) {
+      const float* wr =
+          weights.video.weight.data() + static_cast<size_t>(f * kSeamFlat);
+      double acc = static_cast<double>(weights.video.bias[static_cast<size_t>(f)]);
+      for (int64_t i = 0; i < kSeamFlat; ++i)
+        acc += static_cast<double>(xr[i]) * static_cast<double>(wr[i]);
+      worst_f64 = std::max(
+          worst_f64,
+          std::abs(
+              static_cast<double>(got.video[static_cast<size_t>(r * kSeamOut + f)]) -
+              acc));
+    }
+  }
+  MESSAGE("ltx2 text seam: max|diff| vs an f64-accumulating reference = " << worst_f64);
+  // The floor sits between two MEASURED values on this deterministic fixture:
+  // 5.28e-08 when the projection accumulates in f64 (all that separates it from
+  // the reference is the store rounding), and 4.11e-06 when it is the seam. Both
+  // are constants of the fixture, so the band is a discrimination statement and
+  // not a tolerance.
+  CHECK(worst_f64 > 1e-6);
+}
+
 TEST_CASE("ltx2 text: FeatureExtractorV1 — one bias-free projection, is_av") {
   const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
   const Ltx2TextHiddenStates states = MakeStates(buffers);
@@ -1457,7 +1608,7 @@ TEST_CASE("ltx2 text: a non-f32 compute dtype is REFUSED, never silently widened
 
 TEST_CASE("ltx2 text: the tokenizer and HF sidecars come out of TENSORS, not files") {
   const fs::path dir =
-      fs::temp_directory_path() / ("ltx2_text_assets_" + std::to_string(::getpid()));
+      fs::temp_directory_path() / ("ltx2_text_assets_" + std::to_string(vllm_test::ProcessId()));
   fs::create_directories(dir);
 
   const std::string tokenizer = R"({"version":"1.0","model":{"type":"BPE"}})";

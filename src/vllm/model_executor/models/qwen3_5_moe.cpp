@@ -88,13 +88,13 @@ std::unique_ptr<LoadedModel> LoadQwen3_5MoeModel(
 
 void PrepareQwen3_5Moe(LoadedModel& model, const HfConfig& config,
                        vt::Queue& queue) {
-  auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
+  auto& qwen = ModelAs<Qwen3_5MoeLoadedModel>(model, "Qwen3_5MoeForConditionalGeneration");
   Qwen3_5Model::PrepareMarlinResident(qwen.weights(), config, queue);
 }
 
 ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
                                 const ModelForwardInput& input) {
-  auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
+  auto& qwen = ModelAs<Qwen3_5MoeLoadedModel>(model, "Qwen3_5MoeForConditionalGeneration");
   const Qwen3_5MoeWeights& weights = qwen.weights();
 
   // ENG-ASYNC-SCHED W4 (see qwen3_5_dense.cpp): scope the async runner's

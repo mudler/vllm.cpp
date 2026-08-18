@@ -17,7 +17,10 @@
 # Env overrides:
 #   BUILD_DIR      (default: build-triton-regen)
 #   TRITON_PYTHON  (default: ~/venvs/vllm-oracle/bin/python)
-#   VLLM_CPP_CUTLASS_DIR (default: ~/cutlass_probe, like dgx-bringup.sh)
+#   VLLM_CPP_CUTLASS_DIR (default: ~/cutlass_probe, which is one developer's
+#                        path. dgx-bringup.sh no longer carries that default,
+#                        and converting this one to ${CUTLASS_DIR} is owed by
+#                        ENV-AGNOSTIC-W1-TOOLING, issue #1190)
 #
 # The regen happens at CONFIGURE time (execute_process); no build is required
 # to refresh the vendored tree, but BUILD_DIR is left ready for `cmake --build`.

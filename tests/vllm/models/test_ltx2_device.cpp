@@ -611,6 +611,129 @@ TEST_CASE("ltx2 device: the prompt-side AdaLN arm matches upstream on CUDA") {
   CheckPromptAdalnCases(q, "cuda");
 }
 
+// The KEYFRAME MARKER, device-resident, against the same upstream goldens the
+// host arm is gated on (row LTX25-KEYFRAMES-ABS-POS, issue #658).
+//
+// This exists because the two forwards are separate implementations, and the
+// device one would otherwise DROP the term silently: it would still render, still
+// in the right shape, still finite. Both dtypes are run, because the marker is
+// applied through `vt::Add`'s row-broadcast form and the addend is staged at the
+// stream dtype — which is where a widened operand would show up.
+namespace {
+
+void CheckKeyframesCases(vt::Queue& q, const char* label) {
+  for (const vt::DType stream : {vt::DType::kF32, vt::DType::kBF16}) {
+    const bool wide = stream == vt::DType::kF32;
+    const double bound = wide ? kDeviceRoundOff : kBf16RoundOff;
+    {
+      INFO(label << " / keyframes marker, " << (wide ? "f32" : "bf16"));
+      Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+      p.use_keyframes_abs_pos_embedding = true;
+      WeightSet set = BuildWeights(p);
+      const Ltx2DitDeviceWeights staged = Ltx2StageDitWeightsToDevice(q, p, set.views, stream);
+      Modalities m;
+      BuildModalities(&m, false);
+      std::vector<float> mask(static_cast<size_t>(vllm_test::kLtx2Batch *
+                                                  vllm_test::kLtx2VideoTokens));
+      for (size_t i = 0; i < mask.size(); ++i) mask[i] = vllm_test::kLtx2KeyframesMask[i];
+      m.video.keyframes_mask = mask.data();
+      const vllm::Ltx2DitOutputs out =
+          Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, stream);
+      const size_t vcount =
+          static_cast<size_t>(m.video.batch * m.video.tokens * p.out_channels);
+      const size_t acount =
+          static_cast<size_t>(m.audio.batch * m.audio.tokens * p.audio_out_channels);
+      const double dv = MaxAbsDiff(out.video, vllm_test::kLtx2ForwardKeyframesVideo, vcount);
+      const double da = MaxAbsDiff(out.audio, vllm_test::kLtx2ForwardKeyframesAudio, acount);
+      MESSAGE("keyframes: max|diff| video=" << dv << " audio=" << da);
+      CHECK(dv < bound);
+      CHECK(da < bound);
+
+      // And the same staged model with NO marker must land on the OTHER golden,
+      // which is what separates "applied where the mask says" from "applied".
+      Modalities plain;
+      BuildModalities(&plain, false);
+      REQUIRE(plain.video.keyframes_mask == nullptr);
+      const vllm::Ltx2DitOutputs bare =
+          Ltx2DitForwardDevice(q, p, staged.weights, &plain.video, &plain.audio, stream);
+      CHECK(MaxAbsDiff(bare.video, vllm_test::kLtx2ForwardKeyframesNoMaskVideo, vcount) < bound);
+      CHECK(MaxAbsDiff(bare.audio, vllm_test::kLtx2ForwardKeyframesNoMaskAudio, acount) < bound);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 device: the keyframe marker arm matches upstream (CPU backend)") {
+  vt::Queue q{Cpu(), nullptr};
+  CheckKeyframesCases(q, "cpu-backend");
+}
+
+TEST_CASE("ltx2 device: the keyframe marker arm matches upstream on CUDA") {
+  vt::Backend* cuda = TryCuda();
+  if (cuda == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  CheckKeyframesCases(q, "cuda");
+}
+
+// THE MEMORY-FORMAT CHECK ON THE ARM WHERE WIDTH IS A REAL CHOICE.
+//
+// Upstream casts BOTH operands to `hidden_states.dtype` (transformer_args.py:42-43).
+// On the device arm `hidden_states` is at the STREAM dtype, so an f32 addend under
+// a bf16 stream is the "too WIDE" case AGENTS.md names: numerically correct, so
+// every golden and every token gate agrees with it, while it moves twice the
+// bytes and — on CUDA, where vt's elementwise kernels require matching dtypes —
+// throws from inside a kernel instead of by name.
+//
+// MEASURED: with the equality check removed, all five LTX-2.5 suites stayed
+// GREEN. Nothing else in the tree looks at this operand's width, which is why
+// this case exists rather than a comment claiming the check is load-bearing.
+TEST_CASE("ltx2 device: an f32 keyframes embedding under a bf16 stream is REFUSED") {
+  vt::Queue q{Cpu(), nullptr};
+  Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  p.use_keyframes_abs_pos_embedding = true;
+  WeightSet set = BuildWeights(p);
+  Ltx2DitDeviceWeights staged = Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
+  REQUIRE(staged.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+
+  Modalities m;
+  BuildModalities(&m, false);
+  std::vector<float> mask(
+      static_cast<size_t>(vllm_test::kLtx2Batch * vllm_test::kLtx2VideoTokens));
+  for (size_t i = 0; i < mask.size(); ++i) mask[i] = vllm_test::kLtx2KeyframesMask[i];
+  m.video.keyframes_mask = mask.data();
+
+  // Same values, same shape, f32 — which is exactly what a staging path that
+  // "kept the tables f32" would hand over. It is not a table.
+  const auto host = set.views.find("keyframes_abs_pos_embedding");
+  REQUIRE(host != set.views.end());
+  REQUIRE(host->second.dtype == vt::DType::kF32);
+  staged.weights.keyframes_abs_pos_embedding = host->second;
+  const std::string what = RefusalMessage([&] {
+    (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kBF16);
+  });
+  INFO("what: " << what);
+  CHECK(what.find("keyframes_abs_pos_embedding") != std::string::npos);
+  // Positive control for that substring search: the SAME helper over the SAME
+  // call with the bf16 view restored must return the empty string, so a refusal
+  // that names anything at all cannot be mistaken for this one.
+  //
+  // `restaged` has to be a named local. A `vt::Tensor` is a borrowed view, and
+  // the storage it points into is owned by the Ltx2DitDeviceWeights it came
+  // from. Reading the view out of a temporary leaves the pointer dangling the
+  // moment the full-expression ends (#904).
+  const Ltx2DitDeviceWeights restaged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
+  staged.weights.keyframes_abs_pos_embedding =
+      restaged.weights.keyframes_abs_pos_embedding;
+  CHECK(RefusalMessage([&] {
+          (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kBF16);
+        }).empty());
+}
+
 TEST_CASE("ltx2 device: the bf16 PRODUCTION stream matches upstream (CPU backend)") {
   vt::Queue q{Cpu(), nullptr};
   CheckBf16Stream(q, "cpu-backend bf16");
@@ -915,7 +1038,7 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
     }
     // Refuses by name if it describes a different weight contract, so a config
     // from the OTHER shipped DiT cannot be bound to these tensors unnoticed.
-    p = vllm::Ltx2AdoptDeclaredDitParams(config, ck.params, opt.allow_unported_modules, source);
+    p = vllm::Ltx2AdoptDeclaredDitParams(config, ck.params, source);
     MESSAGE("adopted config: double_precision_rope=" << p.double_precision_rope
             << " av_ca_timestep_scale_multiplier=" << p.av_ca_timestep_scale_multiplier
             << " timestep_scale_multiplier=" << p.timestep_scale_multiplier);

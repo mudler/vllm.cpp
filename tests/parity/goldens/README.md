@@ -32,6 +32,29 @@ exactly the set of manifests declaring a known op, and everything else is either
 loud-and-listed or loud-and-failing. A future oracle capture dropped into this
 tree cannot land unnoticed — it fails, by name, with the fix in the message.
 
+## A malformed golden never aborts the pass
+
+Closing the input set is not the same as closing the *exception* surface, and
+#776 is the difference. A manifest can be listed, named, and accept a runner and
+still make the walker throw: the file can be invalid JSON, or a field the runner
+reads can be absent or `null`. Either exception escaping `RunGoldenPass` aborts
+the whole test case, so **every golden the walker had not reached yet goes
+unchecked** — including the `no runner for op` check this directory depends on.
+That is a gate that has stopped gating while still looking like one red line.
+
+Both throw sites are now guarded. An exception from parsing a manifest, or from
+the runner reading it, becomes a `FAIL_CHECK` that names
+`goldens/<case>/manifest.json` and quotes the original exception, and the pass
+**continues to the next golden**. So a malformed golden costs you exactly its
+own case, and the report names the file instead of a line number in
+`test_op_parity.cpp`.
+
+The guard catches `std::exception` and nothing wider. doctest's
+`TestFailureException` is deliberately not derived from it, so a `REQUIRE` or
+`FAIL` inside a runner — the unregistered-op refusal above included — still
+aborts the pass exactly as before. The guard cannot mute an assertion; it only
+converts a thrown diagnostic that names no file into one that does.
+
 ## Adding an op-parity golden
 
 `manifest.json` carries at least:

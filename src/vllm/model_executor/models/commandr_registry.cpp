@@ -66,7 +66,7 @@ void PrepareCohereForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardCohereForCausalLM(LoadedModel& model,
                                        const ModelForwardInput& input) {
-  const auto& cm = static_cast<CommandrLoadedModel&>(model);
+  const auto& cm = ModelAs<CommandrLoadedModel>(model, "CohereForCausalLM");
   const CommandrWeights& weights = cm.weights();
   if (input.gather_logits) {
     return CommandrModel::ForwardDevice(input.token_ids, input.positions,

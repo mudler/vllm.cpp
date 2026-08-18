@@ -109,6 +109,18 @@ the issue, for example `Closes #123`.
 Do not use a screenshot as the only description. Images can become unavailable
 and cannot replace searchable text.
 
+**Never put a bare `---` line in a pull request body.** The repository sets
+`squash_merge_commit_message = PR_BODY`, so the body becomes the landed commit
+message, and `git interpret-trailers` treats a bare `---` as the end of that
+message. Everything below it — including the trailer block — becomes invisible
+to the parser, so `commit-protocol-tag` reports trailers the body plainly
+carries as missing. A markdown horizontal rule is the usual way this happens.
+Measured on pull request #950: two `---` rules, trailer block present and
+correct at the end, `git interpret-trailers --parse` returned nothing; deleting
+the two rules returned all three trailers. Use a heading to separate sections
+instead. A markdown table's `|---|---|` separator is not affected, because the
+line is not bare.
+
 ## Name branches
 
 For a claimed row, use the binding `row/<ROW-ID>` format. For other work, follow

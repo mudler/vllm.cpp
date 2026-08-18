@@ -152,6 +152,61 @@ def runnable_commands(section: str) -> list[str]:
     return good
 
 
+# A `Gates` section is a numbered list, and each item opens with a BOLD LEAD that
+# titles it. These three functions exist so a test can key on that structure
+# instead of on a sentence -- see .agents/specs/fix-gate-commands-prose-pin.md.
+#
+# They are DELIBERATELY not wired into `ratchet_errors`. A rule saying every gate
+# item without a runnable command must declare a disposition is red on arrival for
+# items this repo writes in prose rather than quoting (`Red first.`,
+# `CUDA compile.`), and this file's own header records that a gate which has to be
+# relaxed to pass is worse than no gate. That sweep is owed with its own survey.
+_GATE_ITEM = re.compile(r"(?m)^\d+\.\s")
+# The lead is a single-line title. A lead that does not close on its own line
+# returns None, which reads downstream as "declares no disposition" and takes a
+# gate RED rather than green. That is the safe direction for an unparsed record.
+_ITEM_LEAD = re.compile(r"^\d+\.\s+\*\*(.+?)\*\*")
+# A CLOSED, small vocabulary, matched in the LEAD ONLY. A status word in the lead
+# is a declaration ABOUT the gate. The same word in the body is ordinary prose
+# describing what the gate does, and crediting it would make this stop detecting
+# silence. Scope is MEASURED, not assumed: surveyed over every `Gates` section in
+# .agents/specs/ on 2026-08-18, 32 of 323 gate items GAIN a disposition when the
+# search widens from the lead to the whole item -- `**No regression:**` in
+# cpu-elementwise-gemm.md and `**Correctness gate:**` in dropin-kernel-abi.md both
+# pick up `pass` out of body prose. The row that motivated this file is NOT one of
+# the 32; that was the first hypothesis and the survey refuted it.
+_DISPOSITION = re.compile(
+    r"(?i)\b(owed|waived|blocked|deferred|superseded|not gated|ran|pass|passed|failed)\b"
+)
+
+
+def gate_items(section: str) -> list[str]:
+    """The numbered items of a `Gates` section, in order."""
+    starts = [m.start() for m in _GATE_ITEM.finditer(section)]
+    ends = starts[1:] + [len(section)]
+    return [section[a:b].rstrip() for a, b in zip(starts, ends)]
+
+
+def item_lead(item: str) -> str | None:
+    """The bold lead that titles one gate item, or None if it has no closed lead."""
+    match = _ITEM_LEAD.match(item)
+    return match.group(1) if match else None
+
+
+def gate_disposition(item: str) -> str | None:
+    """The status this gate item DECLARES in its lead, or None if it declares none.
+
+    `None` is the finding this exists to report: a gate item that names no
+    disposition and yields no runnable command is a leg the record is silent
+    about, and a reader of a credited row infers coverage nobody claimed.
+    """
+    lead = item_lead(item)
+    if lead is None:
+        return None
+    match = _DISPOSITION.search(lead)
+    return match.group(1) if match else None
+
+
 def classify_row(row) -> tuple[str, str]:
     specs = [p for p in record.local_spec_paths(row) if p.is_file()]
     if not specs:
@@ -300,7 +355,39 @@ def audit() -> list[dict]:
 # (`tests/scripts/test_agent_record.py`) is proven red against the BASE checker
 # by `scripts/check-pr-size.py`, which is itself one of the five. Growth from a
 # lifecycle move, so the set is re-pinned in the same change.
+# 2026-08-16: +SPEC-MTP-K-GT-1. A NEW row arriving at ACTIVE (issue #81), so it
+# enters GATED_STATES for the first time. Its spec's Gates section names
+# `scripts/agent-preflight.sh` plus the built CPU suite (493 passed / 0 failed /
+# 2 skipped of 495, the two skips checkpoint-gated and unrelated) and the three
+# focused doctest binaries, and records what is NOT implicated and why: the
+# change reaches a GPU forward only through paths the CPU tier already runs, so
+# no CUDA or SACRED gate is claimed here, and the DGX three-way at k=2..4 is
+# recorded as OWED rather than skipped. Growth, so the set is re-pinned in the
+# same change.
+# 2026-08-17: +ENG-RESIDENCY-CONFIG. A NEW row arriving at ACTIVE (issue #1110),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names the
+# documented CPU configure/build recipe, `ctest -j 6`, the three focused doctest
+# binaries by name, `scripts/agent-preflight.sh --staged`, and the reachability
+# mutation (delete the install call site in `LoadedEngine::FromModelDir`, require
+# the server-level suite red). It also records what is NOT implicated and why: the
+# row moves where a value comes from and changes no kernel, dtype, allocation or
+# token, so it claims no CUDA, SACRED or throughput gate, and the 370 GiB
+# reproduction through the JSON form is recorded as OWED rather than skipped
+# because dgx.casa was unreachable at the SSH layer. Growth, so the set is
+# re-pinned in the same change.
+# 2026-08-18: +ENG-CUDAGRAPH-DEDUP. A NEW row arriving at ACTIVE (issue #1162),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `ctest -R test_graph_dedup` and `scripts/agent-preflight.sh`, both of which
+# genuinely fail when the row regresses -- the focused suite detected 9 of 9
+# negative mutations of the registry it gates. It also records what is NOT
+# claimed and why: the device byte-identity A/B needs a leased CUDA box this
+# session did not have, so it is carried under the spec's `## Owed` rather than
+# reported as run, and the CUDA leg's compile rests on the `cuda-fat-build` CI
+# job. Growth, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-RESIDENCY-CONFIG",
+    "ENG-CUDAGRAPH-DEDUP",
+    "SPEC-MTP-K-GT-1",
     "ATTN-CHUNKED-LOCAL",
     "ENG-RECORD-ANCHOR-RATCHET",
     "SERVE-RECIPE-ARGS",

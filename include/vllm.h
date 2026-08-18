@@ -249,7 +249,28 @@ extern "C" {
  * caller that never touches a speech symbol is byte-identical. A directory no
  * speech family claims is refused NAMING every family that was tried, because
  * the wrong family does not fail, it renders noise. */
-#define VLLM_ABI_VERSION 20
+/* v21 — vllm_speech_model_params.device + vllm_speech_engine_device, THE SPEECH
+ * LANE'S DEVICE SELECTOR (issue #672). v20 could only run a speech family on the
+ * CPU: MiniMax-Music3's queue was a compile-time constant, so a 28.5 GB music
+ * model was a host-only model whatever hardware the box had.
+ *
+ * 0 = CPU, 1 = the accelerator this build resolves. That is the
+ * vllm_video_model_params.device spelling, NOT vllm_model_params.device's
+ * 0=auto/1=cpu/2=cuda: the text engine's `auto` selects an accelerator when one
+ * exists, whereas a speech family's CPU path is what its correctness gates were
+ * taken on, so a ZERO-VALUE CALLER MUST KEEP GETTING THE CPU ARM. Device 1 on a
+ * build with no accelerator backend, or on a PARTIAL backend that declines the
+ * family's architecture, is REFUSED BY NAME at load rather than substituted.
+ *
+ * vllm_speech_engine_device reports what was GRANTED, not what was asked for —
+ * two different facts, and a benchmark that conflates them measures the CPU arm
+ * twice.
+ *
+ * Appended at the END of vllm_speech_model_params, so a zero-initialized v20
+ * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
+ * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
+ * acoustic half are still host reference loops (see docs/FEATURES.md). */
+#define VLLM_ABI_VERSION 21
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -298,7 +319,9 @@ typedef struct vllm_model_params {
    * --tokenizer-config. Ignored for a .gguf model_path, whose template comes
    * from the GGUF `tokenizer.chat_template` metadata. */
   const char* tokenizer_config_path;
-  /* KV-cache block size (tokens per block). <= 0 => 32. */
+  /* KV-cache block size (tokens per block). <= 0 => 32.
+     MUST be a multiple of 16: the attention backends' get_kv_cache_shape
+     refuses any other value, so a non-multiple throws from vllm_engine_load. */
   int32_t block_size;
   /* KV-cache block count OVERRIDE (vLLM num_gpu_blocks_override). > 0 pins the
    * pool to exactly this many blocks. <= 0 => AUTO: the pool is sized by the
@@ -335,7 +358,11 @@ typedef struct vllm_model_params {
   const char* reasoning_parser;
   /* ── Speculative-decoding config (ABI v6) ──────────────────────────────────
    * The JSON object vLLM's --speculative-config takes, e.g.
-   * '{"method":"mtp"}' or '{"method":"mtp","num_speculative_tokens":1}'.
+   * '{"method":"mtp"}' or '{"method":"mtp","num_speculative_tokens":3}'.
+   * For "mtp", num_speculative_tokens is the draft DEPTH. It defaults to the
+   * checkpoint's mtp_num_hidden_layers, which is 1 on both gate checkpoints, and
+   * a deeper value loops the single head autoregressively. Depth cannot change
+   * the emitted tokens under greedy sampling, so it is a throughput knob.
    * NULL or "" => speculation DISABLED, the byte-identical default engine.
    * A malformed document or unsupported method fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT. Only MTP is supported today, on the Qwen3.5/3.6
@@ -401,12 +428,62 @@ typedef struct vllm_model_params {
    * when prefetch is enabled) fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT.
    *
-   * ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD` W0b wires the config
-   * surface end to end (CLI -> ABI -> EngineParams) and validates it; the
-   * offloader that would MOVE a weight is W2/W5. So a valid config parses,
-   * validates and is recorded, and no weight moves yet. It is spelled out here
-   * rather than left silent because a user who sets cpu_offload_gb and sees no
-   * memory change deserves to know it was accepted and is inert, not ignored.
+   * THE MIRRORED KEYS ARE ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD`
+   * W0b wires the `offload_backend`/`uva`/`prefetch` half end to end (CLI -> ABI
+   * -> EngineParams) and validates it; the offloader that would MOVE a weight to
+   * host RAM is W2/W5. So that half parses, validates and is recorded, and no
+   * weight moves yet. It is spelled out here rather than left silent because a
+   * user who sets cpu_offload_gb and sees no memory change deserves to know it
+   * was accepted and is inert, not ignored. This sentence covers ONLY those three
+   * keys.
+   *
+   * THE `vllm_cpp` KEY IS LIVE, and it moves weights (ABI v21, row
+   * `ENG-RESIDENCY-CONFIG`). The same string carries a vllm.cpp-ORIGINAL object
+   * for the tier BELOW upstream's: weights borrowed out of the GGUF file mapping
+   * rather than copied to host RAM, plus a bounded host slot cache for routed
+   * expert slices. Upstream has no disk tier, so there is nothing to mirror and
+   * the key names itself. Schema, every field optional and an absent field
+   * meaning unchanged:
+   *   {"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},
+   *                "expert_stream":{"enabled":bool,"slots":int,
+   *                                 "slot_bytes":int},
+   *                "device_fit":{"weight_budget_bytes":int}}}
+   * Precedence per field is environment variable > this document > built-in
+   * default, so an exported VT_GGUF_MMAP / VT_GGUF_PREFAULT / VT_MOE_EXPERT_STREAM
+   * / VT_MOE_EXPERT_STREAM_SLOTS / VT_MOE_EXPERT_STREAM_SLOT_BYTES /
+   * VT_DEVICE_WEIGHT_BUDGET_BYTES still wins; the engine prints one line on
+   * stderr naming what it installed, plus a second line
+   * naming the variables that override it when there are any. The engine acts on it
+   * during weight load, so it must be installed before then, which vllm_engine_load
+   * does. Loading a SECOND engine in one process is legal: an absent field means
+   * unchanged, so a partial document is merged over what is installed rather than
+   * replacing it, and only a document that would CHANGE a decision the process has
+   * already taken — the streaming answer, or the slot store's geometry — is refused.
+   *
+   * REFUSALS ADDED WITH THAT KEY, all VLLM_ERR_INVALID_ARGUMENT before any model
+   * I/O: an UNKNOWN key anywhere in the document — a misspelled top-level key
+   * (`{"vllm-cpp":...}` with a hyphen, `{"uvaa":...}`), a misspelled key inside
+   * `vllm_cpp` or inside any of its THREE objects
+   * (`{"vllm_cpp":{"mmapp":...}}`,
+   * `{"vllm_cpp":{"device_fit":{"weight_budget":0}}}`), and a misspelled key
+   * inside the mirrored `uva` or `prefetch` object
+   * (`{"uva":{"cpu_offload_GB":10}}`); a wrong-typed field; a non-positive
+   * `slots` or `slot_bytes`; and a NEGATIVE `weight_budget_bytes`. A typo is
+   * refused rather than defaulted because a silently disabled residency tier, or
+   * a budget the operator believes is set, is met as an out-of-memory kill rather
+   * than as an error. Upstream refuses one too: every vLLM config dataclass
+   * carries `extra="forbid"`. The four legal top-level keys are
+   * `offload_backend`, `uva`, `prefetch` and `vllm_cpp`.
+   *
+   * `weight_budget_bytes` is the ONE field of the six that ACCEPTS `0`, and the
+   * asymmetry is the reason the key exists. It is a BUDGET, not a size: `0` is
+   * the documented spelling of "suppress the load-time device-fit refusal and get
+   * the late failure back", because the fit check reads a zero budget as UNKNOWN
+   * and decides nothing — exactly what `VT_DEVICE_WEIGHT_BUDGET_BYTES=0` already
+   * means. `slots` and `slot_bytes` are sizes, and a slot count that silently
+   * became its default is a cache the operator does not have, so those two keep
+   * refusing `0`. Only a NEGATIVE budget is refused, and the message says "must
+   * not be negative" rather than "must be positive". See docs/USAGE.md.
    * Borrowed for the call only. */
   const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────
@@ -439,8 +516,9 @@ typedef struct vllm_model_params {
    *        silently replaced by another (mirror of vLLM assigning an explicit
    *        device verbatim, device.py:61-66).
    * 0 must stay auto so a zero-initialized struct preserves pre-v14 behaviour;
-   * the cpu-before-cuda value order follows the v12 precedent
-   * (vllm_video_model_params.device: 0 cpu, 1 cuda) shifted by the auto slot.
+   * the cpu-before-accelerator value order follows the v12 precedent
+   * (vllm_video_model_params.device: 0 cpu, 1 the resolved accelerator)
+   * shifted by the auto slot.
    * Any other value fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
   int32_t device;
   /* ── KV-pool sizing (ABI v16) ──────────────────────────────────────────────
@@ -456,7 +534,20 @@ typedef struct vllm_model_params {
    * the non-KV footprint; that profile run is not implemented yet
    * (ROAD-V1-MEM M3), so until it lands a struct with both other knobs unset
    * still falls back to the historical 256-block default — the zero-initialized
-   * struct's behaviour is unchanged from pre-v16. */
+   * struct's behaviour is unchanged from pre-v16.
+   *
+   * Since #1165 that fallback is no longer SILENT: a value > 0.0 here, with
+   * num_blocks and kv_cache_memory_bytes both unset, prints one warning per
+   * vllm_engine_load naming the block count that resolved instead and the two
+   * knobs that do bind today. Accepting a fraction and sizing nothing without
+   * saying so left callers believing they had sized the pool.
+   *
+   * Note that vllm_model_params_default() pre-fills this field with 0.92, so a
+   * caller who never touched it is indistinguishable from one who chose 0.92
+   * and does get the warning. That is deliberate: on this ABI there is no
+   * "flag not typed" state, and a struct carrying 0.92 into an engine that
+   * ignores it is exactly the case the warning is for. To opt out, spell the
+   * unset sentinel: set the field to 0.0. */
   double gpu_memory_utilization;
   /* kv_cache_memory_bytes: an ABSOLUTE KV-pool size in bytes. When > 0 it sizes
    * the block count directly (num_blocks = kv_cache_memory_bytes / bytes-per-
@@ -874,7 +965,13 @@ typedef struct vllm_video_model_params {
    * are byte-structurally identical, so it must be DECLARED; NULL/empty makes
    * every generate refuse with the guidance (the #77 guard). */
   const char* partition;
-  int32_t device;       /* 0 cpu, 1 cuda */
+  /* 0 is the CPU; 1 is THE ACCELERATOR THIS BUILD RESOLVES, through the
+   * platform seam (CurrentPlatform + TryGetBackend +
+   * supports_model_architecture), never the enum value 1. It is therefore CUDA
+   * on a CUDA build and refused BY NAME on a build with no accelerator backend,
+   * or one whose partial backend declines this architecture (#659, #660). The
+   * ABI value is unchanged; what it means was never "cuda". */
+  int32_t device;
   int32_t dequant_bf16; /* 0 keep-quant, 1 dequant/stream bf16 */
   int32_t fp4_resident; /* NVFP4+cuda: keep FP4 packed, Marlin W4A16 GEMM */
   /* ── v18 additions (the generalized seam) ─────────────────────────────────
@@ -1008,6 +1105,13 @@ typedef struct vllm_speech_model_params {
    * DETECTS it by inspecting the artifact. An unregistered name is refused
    * naming what IS registered; it is never treated as a hint. */
   const char* family;
+  /* v21 — WHERE the family runs. 0 = CPU (the zero value, and the arm every
+   * Music3 correctness gate was taken on), 1 = the accelerator this build
+   * resolves. Anything else is refused. Device 1 with no accelerator backend
+   * registered, or on a PARTIAL backend that declines this family's
+   * architecture, is refused BY NAME at load — never silently substituted.
+   * Appended, so a zero-initialized v20 struct is byte-identical. */
+  int32_t device;
 } vllm_speech_model_params;
 
 typedef struct vllm_speech_params {
@@ -1079,6 +1183,14 @@ VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine
  * synthesize from text alone, and 0 for a NULL handle. Ask BEFORE building a
  * request, so a missing clip is a caller-side refusal rather than a failed job. */
 VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine);
+/* v21 — the device this handle actually RESOLVED to, in the same encoding
+ * vllm_speech_model_params.device uses: 0 = CPU, 1 = an accelerator. 0 for a
+ * NULL handle.
+ *
+ * It reports what was GRANTED, which is not what was asked for. A caller that
+ * echoes back its own request cannot tell a device arm from a CPU arm with a
+ * flag set, and a speed comparison built on that measures one arm twice. */
+VLLM_API int32_t vllm_speech_engine_device(const vllm_speech_engine* engine);
 
 /* Run one BLOCKING synthesis, filling *out. Serialized per engine handle.
  * VLLM_ERR_INVALID_ARGUMENT for a NULL engine/params/out;

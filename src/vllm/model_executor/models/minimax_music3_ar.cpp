@@ -20,6 +20,8 @@
 #include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
 
+#include "vllm/model_executor/models/host_parallel.h"
+
 namespace vllm {
 namespace models {
 namespace music3 {
@@ -80,7 +82,7 @@ std::string CleanCaption(const std::string& caption) {
   static const std::regex kBulletA(R"(^\s*[*+-]\s+)");
   static const std::regex kBulletB(R"(^\s*\*\s+)");
   static const std::regex kBold(R"(\*\*([^*]+)\*\*)");
-  static const std::regex kItalic(R"((^|[^*])\*([^*\n]+)\*($|[^*]))");
+  static const std::regex kItalic(R"((^|[^*])\*([^*\n]+)\*(?!\*))");
   std::vector<std::string> lines;
   {
     std::string line;
@@ -107,9 +109,20 @@ std::string CleanCaption(const std::string& caption) {
       if (updated == line) break;
       line = updated;
     }
-    // The lookarounds of `(?<!\*)\*([^*\n]+)\*(?!\*)` are emulated by capturing
-    // the neighbours; std::regex has no lookbehind.
-    line = std::regex_replace(line, kItalic, "$1$2$3");
+    // encoders.py:72 — `re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)`.
+    // std::regex's ECMAScript grammar has NEGATIVE LOOKAHEAD but no lookbehind,
+    // so the two sides are spelled differently ON PURPOSE: the trailing `(?!\*)`
+    // is a true zero-width assertion, and only the leading `(?<!\*)` is emulated
+    // by capturing a character.
+    //
+    // The trailing side MUST NOT be a captured `($|[^*])` (#1083): consuming the
+    // neighbour advances the scan past it, so a span opening within one
+    // character of the previous close is skipped and the leftover asterisks
+    // re-pair ACROSS the intended spans — `*a* *b* *c*` came out `a *b c*`
+    // rather than `a b c`. Consuming on the LEADING side is safe by contrast,
+    // because that character sits before the span rather than between this span
+    // and the next one.
+    line = std::regex_replace(line, kItalic, "$1$2");
     const size_t keep = line.find_last_not_of(" \t\n\r\f\v");
     line = keep == std::string::npos ? std::string() : line.substr(0, keep + 1);
     if (i != 0) joined += '\n';
@@ -561,15 +574,24 @@ std::vector<float> LinearNoBias(const std::vector<float>& x, int64_t rows, int64
          " values, expected out_dim*in_dim = " + std::to_string(out_dim * in_dim));
   }
   std::vector<float> out(static_cast<size_t>(rows * out_dim));
-  for (int64_t r = 0; r < rows; ++r) {
-    for (int64_t o = 0; o < out_dim; ++o) {
+  // Parallel over OUTPUT elements, one flat index per (row, out_dim) pair.
+  // EACH output keeps its OWN sequential double accumulator over `in_dim` in
+  // ascending `i` — exactly the loop this replaced — so the reduction order
+  // W2/W3 gated against torch, and the `-ffp-contract=off` pinning that makes
+  // it reproducible, are untouched. Bit-identical to the serial loop by
+  // construction, not within a tolerance; `test_host_parallel` proves it
+  // against a verbatim copy of the serial code at five thread counts.
+  host_parallel::ForOutputRows(rows * out_dim, in_dim, [&](int64_t e0, int64_t e1) {
+    for (int64_t e = e0; e < e1; ++e) {
+      const int64_t r = e / out_dim;
+      const int64_t o = e - r * out_dim;
       double acc = 0.0;
       const float* xr = x.data() + r * in_dim;
       const float* wo = weight.data() + o * in_dim;
       for (int64_t i = 0; i < in_dim; ++i) acc += static_cast<double>(xr[i]) * wo[i];
-      out[static_cast<size_t>(r * out_dim + o)] = Store(acc, compute);
+      out[static_cast<size_t>(e)] = Store(acc, compute);
     }
-  }
+  });
   return out;
 }
 

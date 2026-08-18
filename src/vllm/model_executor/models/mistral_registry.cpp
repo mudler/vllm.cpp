@@ -88,7 +88,7 @@ ForwardLogits ForwardMistralForCausalLM(LoadedModel& model,
   // non-async-CUDA path, RAII-scoped, byte-identical when the mirror is off.
   const detail::DeviceTokenIdsScope device_ids_scope(
       input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
-  auto& mistral = static_cast<MistralLoadedModel&>(model);
+  auto& mistral = ModelAs<MistralLoadedModel>(model, "MistralForCausalLM");
   const MistralWeights& weights = mistral.weights();
   // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_
   // GRAPH); std::nullopt falls through to the byte-identical eager path below.

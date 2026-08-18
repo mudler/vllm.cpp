@@ -99,15 +99,57 @@ class Vocoder1dSingleHomeTests(unittest.TestCase):
             re.M,
         )
         counts: dict[str, int] = {name: 0 for name in pattern.pattern and SYMBOLS}
+        examined = 0
         for path in tracked_sources():
             if path.suffix != ".cpp":
                 continue
+            # The `vt` KERNEL SEAM is not a candidate home for this core, and
+            # since #672 it holds `vt::Conv1d` / `vt::ConvTranspose1d` -- the ops
+            # `vocoder1d` DELEGATES to. Those are the opposite of the fork this
+            # file exists to catch: they are what removed the second copy of the
+            # arithmetic. This pattern is a line-anchored TEXT match and cannot
+            # see a namespace, so it read `vt::Conv1d`'s definition in
+            # src/vt/ops.cpp as a duplicate of `vocoder1d::Conv1d`.
+            #
+            # The exclusion is scoped to the seam and PAID FOR by the new test
+            # below, which is added coverage rather than a subtraction: excluding
+            # a tree would otherwise let the core quietly re-grow its own loops
+            # while the op sat unused, so this file now pins the delegation it is
+            # trading for.
+            if path.is_relative_to(ROOT / "src" / "vt"):
+                continue
+            examined += 1
             for match in pattern.finditer(path.read_text(encoding="utf-8", errors="replace")):
                 counts[match.group(1)] += 1
+        # Say HOW MANY files were read. A walk that examined only vocoder1d.cpp
+        # would report every count as 1 and pass while seeing none of the tree --
+        # a green that means nothing, and one no count-of-1 assertion can detect.
+        self.assertGreater(examined, 100, f"only {examined} .cpp files scanned; the walk is broken")
         for name, count in counts.items():
             if name == "AliasFreeActivation1d":
                 continue
             self.assertEqual(count, 1, f"{name} has {count} definitions; exactly one is allowed")
+
+    def test_the_core_delegates_its_convolutions_to_the_shared_vt_ops(self) -> None:
+        """The price of excluding `src/vt/` from the count above.
+
+        Since #672 the convolution ARITHMETIC lives once, in the `vt::Conv1d` /
+        `vt::ConvTranspose1d` providers, and `vocoder1d` is their caller. If the
+        core ever re-grows its own loop, the count above would still read 1 --
+        one definition, in the right file, quietly doing the work itself again --
+        and all six consumers would silently leave the shared seam while every
+        numeric gate stayed green, because a re-grown loop computes the same
+        thing. That is the same class of failure as the fork this file was
+        written for, so it is asserted here, beside the exclusion it pays for.
+        """
+        text = SOURCE.read_text(encoding="utf-8")
+        for op in ("vt::Conv1d(", "vt::ConvTranspose1d("):
+            # assertTrue, not assertIn: assertIn prints the whole HAYSTACK on
+            # failure, and the haystack here is the entire source file.
+            self.assertTrue(
+                op in text,
+                f"{SOURCE.name} no longer calls {op} -- the core has left the shared vt seam",
+            )
 
 
 if __name__ == "__main__":

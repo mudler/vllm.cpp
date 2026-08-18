@@ -66,8 +66,9 @@ STATES = (
 STATE_CELL = re.compile(r"`(" + "|".join(re.escape(s) for s in STATES) + r")`")
 ROW_ID = re.compile(r"^\|\s*`([A-Z0-9][A-Za-z0-9_.-]*)`")
 
-# Support-surface triggers. These are about WHAT IS SUPPORTED, so they are still
-# path-derived -- adding a model file genuinely changes the feature surface.
+# Support-surface triggers. These four records ARE the claim, so editing one is
+# path-derived. Model SOURCE is not: see registration_changes() (#595), which
+# asks whether the registry set moved rather than whether a file was touched.
 FEATURE_SURFACE_FILES = frozenset(
     {
         ".agents/backend-matrix.md",
@@ -77,6 +78,10 @@ FEATURE_SURFACE_FILES = frozenset(
     }
 )
 FEATURE_SURFACE_PREFIXES = ("src/vllm/model_executor/models/",)
+
+# The registry's own entry point. `feature_surface` keys off a change to the SET
+# of these in a model TU, not off the path -- see registration_changes() (#595).
+REGISTRATION = re.compile(r"REGISTER_VLLM_MODEL\(\s*([A-Za-z0-9_:\"]+)")
 
 # Exact user-facing configuration/build/install entrypoints. Deliberately NOT
 # all of cmake/: toolchain internals do not change installation instructions.
@@ -269,6 +274,36 @@ def measurement_changes(paths: set[str], before: str, after: str) -> list[str]:
     )
 
 
+def registrations(text: str) -> set[str]:
+    """The architectures a model TU registers, by registry name."""
+    return set(REGISTRATION.findall(text))
+
+
+def registration_changes(paths: set[str], before: str, after: str) -> list[str]:
+    """Model files whose set of REGISTER_VLLM_MODEL entries changed (#595).
+
+    Keying `feature_surface` off the PATH made every edit under
+    `src/vllm/model_executor/models/` owe docs/FEATURES.md, which is the same
+    "classify by directory" defect this file's header says the rewrite removed
+    for src/, include/ and tests/. A one-line compile fix there owed a public
+    doc edit with nothing true to say; #1054 answered that demand with prose,
+    the prose crossed the check-public-doc-tables budgets, and because that
+    checker also runs pre-push it blocked EVERY branch in the repo (#1055).
+
+    What the project supports is what the registry registers, which is the same
+    set scripts/check-supported-models.py already gates FEATURES.md against. So
+    adding, removing or renaming an architecture is a claim and still owes the
+    surface; editing the internals of one already registered is not.
+    """
+
+    return sorted(
+        path
+        for path in paths
+        if path.startswith(FEATURE_SURFACE_PREFIXES)
+        and registrations(blob(before, path)) != registrations(blob(after, path))
+    )
+
+
 def classify(paths: set[str], before: str, after: str) -> tuple[set[str], list[str]]:
     """Return (change classes, human-readable reasons)."""
     classes: set[str] = set()
@@ -284,10 +319,15 @@ def classify(paths: set[str], before: str, after: str) -> tuple[set[str], list[s
         classes.add("lifecycle")
         reasons.extend(f"{path}: measurement recorded" for path in measured)
 
+    registered = registration_changes(paths, before, after)
+    if registered:
+        classes.add("feature_surface")
+        reasons.extend(f"{path}: model registration changed" for path in registered)
+
     for path in sorted(paths):
         if path in PUBLIC_SURFACES:
             continue
-        if path in FEATURE_SURFACE_FILES or path.startswith(FEATURE_SURFACE_PREFIXES):
+        if path in FEATURE_SURFACE_FILES:
             classes.add("feature_surface")
         if path in USER_USAGE_FILES or path.startswith(USER_USAGE_PREFIXES):
             classes.add("user_usage")

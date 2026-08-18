@@ -1,3 +1,7 @@
+#if defined(__unix__)
+#include <sys/mman.h>
+#include <unistd.h>  // ::sysconf(_SC_PAGESIZE) in the readahead hint below
+#endif
 // vllm.cpp original; see qwen3_5.h. Forward math mirrored 1:1 from the pinned
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,
 // qwen_gdn_linear_attn.py, qwen3_next.py::Qwen3NextAttention /
@@ -5,9 +9,14 @@
 // .agents/specs/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
 // .agents/specs/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
 // .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
+#include "vllm/config/weight_residency.h"
+#include "vllm/model_executor/host_expert_slot_store.h"
+#include "vllm/model_executor/expert_streamer.h"
+#include "vllm/model_executor/expert_slot_cache.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -35,6 +44,7 @@
 #include <optional>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_fp8_gemm.h"   // dense_fp8:: FP8 W8A8 seam (#940)
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // dense_nvfp4::MarlinDenseEnabled
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
@@ -66,9 +76,30 @@ void ResetQwen3_5MixedSpecInvocations() {
   g_mixed_spec_invocations.store(0, std::memory_order_relaxed);
 }
 
+// GDN-MOE-BF16-OUT (#1168) Edit 2 dropped the `e.dense_model` term. It entered at
+// f344decf4 ("dispatch exact packed decode") as one of that change's "real-model
+// safety gates", was never revisited, and neither reference has an equivalent:
+// VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE defaults True with no shape term
+// (vllm/envs.py:124 @ 5559679) and SGLang keys supports_packed_decode on the
+// platform alone (gdn_triton.py:43 @ f63458b5be). It became REDUNDANT once
+// GdnOutDType stopped branching on model shape: `core_out` is `outdt`, and
+// GdnPackedDecodeDTypesCompatible below already pins it to BF16, so an f32
+// recurrence output is what deselects packed decode on either arm. Removing it
+// BEFORE the dtype change would have removed a term that the dtype rule did not
+// yet subsume, which is why the two edits are one change and in this order.
+//
+// Do not read that as "and now the removal is observable in production", because
+// it is not, in either order (fresh-review finding). `has_packed_ba` needs
+// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
+// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// false before the shape term is ever read. Removing it therefore reaches packed
+// decode on NO checkpoint; it removes a contradiction with both references and a
+// second answer to a question the dtype rule already answers. Reaching packed
+// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
+// which is #1169, and it is owed.
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
-  return e.runtime_enabled && e.cuda && e.dense_model && e.has_packed_ba &&
+  return e.runtime_enabled && e.cuda && e.has_packed_ba &&
          e.merged_ba_enabled && e.dtype_compatible && e.has_state_indices &&
          e.num_prefills == 0 && e.num_prefill_tokens == 0 &&
          e.num_spec_decodes == 0 && e.num_spec_decode_tokens == 0 &&
@@ -93,7 +124,12 @@ vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
 // in the ONE place both the producer and the predictor read. See the header for
 // why each term is required; the short version is that the toggle is the opt-in,
 // `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
-// confines the narrowing to the dense 27B.
+// keeps the chain dtype-uniform. `outdt` used to be described as what "confines
+// the narrowing to the dense 27B"; GDN-MOE-BF16-OUT (#1168) removed the
+// model-shape argument from `GdnOutDType`, so `outdt` is BF16 on BOTH arms at
+// the default and confines nothing. The DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle
+// (`GdnFp8InBf16Enabled`, which requires a leading '1') is now the only term
+// keeping this inert on the 35B.
 vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
                                            vt::DType in_dtype,
                                            vt::DType out_dtype) {
@@ -117,6 +153,28 @@ bool detail::GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& d) {
 // Default OFF: ON only for a '1'-leading value (vt::cuda::GdnPackedRegTileFlagIsOn).
 bool detail::PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] == '1';
+}
+
+// GDN-MOE-BF16-OUT (#1168) — VT_GDN_OUT_BF16, default ON, parsed here so the CPU
+// tier can pin the truth table that GdnOutDType() caches. There is no model-shape
+// term: the environment is the whole decision, on the dense and the MoE arms
+// alike, exactly as upstream resolves one model dtype for every layer.
+bool detail::GdnOutBf16FlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
+// ...and the RESOLVER that consumes it, here rather than in the anonymous
+// namespace below so the CPU tier can call the thing the model calls. Pinning
+// the parser alone does not pin that anything reads it: a `GdnOutDType()`
+// hardwired to BF16 keeps every default-environment gate green, and the
+// documented `VT_GDN_OUT_BF16=0` rollback then silently stops rolling back. See
+// the header for why that matters more here than coverage — the variable is the
+// denominator of this row's same-binary A/B. The full derivation of WHAT this
+// dtype is stays at the `using` declaration below, next to the call sites.
+vt::DType detail::GdnOutDType() {
+  static const bool bf16 =
+      detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
+  return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -174,6 +232,40 @@ void detail::DisableGdnFp8InProjDebugStats() {
   g_gdn_fp8_inproj_debug_enabled.store(false, std::memory_order_release);
 }
 
+namespace {
+// GDN-MOE-BF16-OUT (#1168). What the last NON-MIXED-SPEC paged GDN layer actually
+// allocated and projected, recorded off the tensors themselves rather than off
+// the predicate. `GdnBlockPagedMixedSpec` is a paged GDN layer too and records
+// nothing, the stores are unconditional (the fp8 sibling above is default-off),
+// and they happen at graph CAPTURE and not at replay. The header states all
+// three; none of them is what the shape of this code suggests.
+std::atomic<bool> g_gdn_out_dtypes_observed{false};
+std::atomic<int> g_gdn_out_core_dtype{static_cast<int>(vt::DType::kF32)};
+std::atomic<int> g_gdn_out_z_dtype{static_cast<int>(vt::DType::kF32)};
+
+void RecordGdnOutActivationDTypes(vt::DType core_out, vt::DType z_gate) {
+  g_gdn_out_core_dtype.store(static_cast<int>(core_out), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(z_gate), std::memory_order_relaxed);
+  g_gdn_out_dtypes_observed.store(true, std::memory_order_release);
+}
+}  // namespace
+
+void detail::ResetGdnOutActivationDTypes() {
+  g_gdn_out_dtypes_observed.store(false, std::memory_order_release);
+  g_gdn_out_core_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+}
+
+detail::GdnOutActivationDTypes detail::LastGdnOutActivationDTypes() {
+  GdnOutActivationDTypes out;
+  out.observed = g_gdn_out_dtypes_observed.load(std::memory_order_acquire);
+  out.core_out =
+      static_cast<vt::DType>(g_gdn_out_core_dtype.load(std::memory_order_relaxed));
+  out.z_gate =
+      static_cast<vt::DType>(g_gdn_out_z_dtype.load(std::memory_order_relaxed));
+  return out;
+}
+
 bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
   const bool runtime_enabled =
@@ -183,8 +275,8 @@ bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
       !(env.merged_proj != nullptr && env.merged_proj[0] == '0') &&
       (env.merged_ba == nullptr || env.merged_ba[0] != '0');
   // Mirror the dtype_compatible expression on the real 27B dense gate:
-  // GdnInDType (default BF16), GdnOutDType dense default (BF16; override
-  // '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
+  // GdnInDType (default BF16), GdnOutDType (default BF16 on every arm since
+  // #1168; override '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
   // override '0' -> F32). The SSM cache dtype term is always a float dtype.
   const bool in_bf16 = env.in_bf16 == nullptr || env.in_bf16[0] != '0';
   const bool out_bf16 = env.out_bf16 == nullptr || env.out_bf16[0] != '0';
@@ -1452,79 +1544,27 @@ const OwnedTensor& DenseLmHead(const Qwen3_5DenseWeights& weights) {
   return weights.tied_lm_head ? weights.embed_tokens : weights.lm_head;
 }
 
-// Device-resident view over an Fp8Weight's raw fp8 [N,K] bytes, uploaded ONCE
-// (lazily) and reused across every forward step (mirror ResidentNvfp4). The
-// shared_ptr in the (const) weight owns the device buffer for the model lifetime.
-Tensor ResidentFp8(Dev d, const Fp8Weight& w) {
-  if (!w.d_packed) {
-    const size_t pb = w.packed.bytes.size();
-    void* p = d.b.Alloc(pb);
-    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
-    Backend* bk = &d.b;
-    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
-  }
-  return MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k});
-}
+// --- FP8 W8A8 dense seam (issue #940) ---------------------------------------
+// `ResidentFp8`, `DenseCublasLtFp8Enabled`, `MatmulFp8CutlassD` and
+// `MatmulFp8CutlassPreQuantD` USED to be defined right here, in this anonymous
+// namespace, which meant a second model could not reach them at all — the exact
+// "hand-roll a parallel path" trap AGENTS.md §"Shared seams" forbids. Their ONE
+// definition now lives in dense_fp8_gemm.h (the FP8 sibling of
+// dense_nvfp4_gemm.h) and the three names below are pure type adapters: this
+// file keeps its own anonymous-namespace `Dev`/`DBuf` (the KNOWN DUPLICATION
+// dense_nvfp4_gemm.h records), so it instantiates the shared template with THOSE
+// types and the generated code is what it was. No logic lives here; a change to
+// the seam changes this model's arithmetic, which is what makes the extraction
+// provable rather than decorative.
+using dense_fp8::DenseCublasLtFp8Enabled;
 
-// cuBLASLt FP8 dense GEMM toggle (VT_DENSE_CUBLASLT_FP8, DEFAULT ON when the fp8
-// weights are resident). Routes the fp8 dense projections through vt::
-// MatmulFp8CublasLt (cuBLASLt e4m3 — the native equivalent of vLLM's measured-
-// FASTER nvjet_sm121_qqtst fp8 kernels) instead of vt::MatmulFp8Cutlass (our
-// cutlass sm120 fp8 GEMM, measured NEUTRAL vs bf16 at M=64/sm_121a). The
-// activation quant + fp8-resident weight are IDENTICAL for both — only the GEMM
-// backend differs, so both are the same fp8 W8A8 math (vLLM's scheme).
-// VT_DENSE_CUBLASLT_FP8=0 restores the cutlass fp8 GEMM (the previous, validated
-// path) for the parent's authoritative A/B.
-bool DenseCublasLtFp8Enabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_DENSE_CUBLASLT_FP8");
-    return !(e != nullptr && e[0] == '0');
-  }();
-  return on;
-}
-
-// y[M,N] = x[M,K] (bf16/f32 device) @ dequant(w).T via a per-tensor W8A8 fp8
-// GEMM: static per-tensor activation quant (vt::QuantFp8Static with the
-// checkpoint input_scale) then an fp8 GEMM with the folded alpha
-// (= input_scale·weight_scale). By DEFAULT the GEMM is cuBLASLt fp8 (vt::
-// MatmulFp8CublasLt — mirrors vLLM's nvjet_qqtst fp8 dense); VT_DENSE_CUBLASLT_
-// FP8=0 selects the cutlass sm120 fp8 GEMM (vt::MatmulFp8Cutlass). out dtype f32
-// (q/k/v, in_proj_qkv/z sinks) or bf16 (o/out_proj residual sinks). CUDA-only
-// (the 35B W8A8 path is CUDA-resident — fp8 fields are populated by DEFAULT on
-// the CUDA+cutlass load, VT_DENSE_NATIVE).
 DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dtype) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  VT_CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type),
-           "MatmulFp8CutlassD: the fp8 W8A8 path is CUDA-only");
-  DBuf a_fp8(d, DType::kI8, {M, K});
-  vt::QuantFp8Static(d.q, a_fp8.t(), x, w.input_scale);
-  Tensor wdev = ResidentFp8(d, w);
-  DBuf dout(d, out_dtype, {M, N});
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
-  else
-    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
-  return dout;
+  return dense_fp8::MatmulFp8CutlassD<DBuf>(d, x, w, out_dtype);
 }
 
-// Pre-quantized fp8 analog of MatmulFp8CutlassD: the activation is ALREADY the
-// static-quant fp8 [M,K] (produced ONCE — either by RmsNormQuantFp8 or a shared
-// quant — and fed to every projection reading it), so this SKIPS the internal
-// QuantFp8Static and runs only the fp8 GEMM. The fp8 counterpart of
-// MatmulNvfp4Fp4DirectD; each GEMM still applies its own folded alpha (= shared
-// input_scale · this projection's weight_scale), so the result is identical to
-// MatmulFp8CutlassD(x) when a_fp8 == QuantFp8Static(x, w.input_scale).
-DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, DType out_dtype) {
-  const int64_t M = a_fp8.shape[0], N = w.n;
-  VT_CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type),
-           "MatmulFp8CutlassPreQuantD: the fp8 W8A8 path is CUDA-only");
-  Tensor wdev = ResidentFp8(d, w);
-  DBuf dout(d, out_dtype, {M, N});
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8, wdev, w.alpha);
-  else
-    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8, wdev, w.alpha);
-  return dout;
+DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w,
+                               DType out_dtype) {
+  return dense_fp8::MatmulFp8CutlassPreQuantD<DBuf>(d, a_fp8, w, out_dtype);
 }
 
 // --- Merged FP8 QKVParallelLinear (VT_FP8_MERGED_QKV, opt-in). The FP8 (W8A8)
@@ -2318,6 +2358,13 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
 #endif
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
+  // the same dtype every other arm of this o_proj returns.
+  if (!w.o_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated.t(),
+                                                        w.o_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
          : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
                : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
@@ -2425,7 +2472,18 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
       (Bf16GemmOutEnabled() && out.fp4) ? DType::kBF16 : DType::kF32;
   const auto project = [&](const Nvfp4Weight& fp4_weight,
                            const Fp8Weight& fp8_weight,
+                           const Fp8BlockWeight& block_weight,
                            const OwnedTensor& plain_weight) -> DBuf {
+    // MODEL-FP8-BLOCK-LINEAR (#1189 M4). FIRST, and exclusive: M3's loader
+    // fills the block field and leaves the bf16, per-tensor fp8 and fp4 ones
+    // EMPTY (qwen3_5_dense_weights.cpp), so a non-empty block weight IS the
+    // scheme. `out_dtype` is bf16 because that is upstream's `out_dtype` here
+    // -- the MODEL dtype (fp8.py:284) -- not the f32 the per-tensor arm below
+    // happens to use; a token gate cannot see a dtype that is too wide.
+    if (!block_weight.Empty()) {
+      return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, h, block_weight,
+                                                          DType::kBF16);
+    }
     if (fuse_qkv) {
       return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
                                     fp4_weight, q_out_dt, qkv_sf_sw_p);
@@ -2448,11 +2506,11 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                            : MatmulF32D(d, h, plain_weight);
   };
   out.q_owner.emplace(
-      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));
+      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj_fp8_block, w.q_proj));
   out.k_owner.emplace(
-      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj));
+      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj_fp8_block, w.k_proj));
   out.v_owner.emplace(
-      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj));
+      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj_fp8_block, w.v_proj));
   out.qgate = out.q_owner->t();
   out.key = out.k_owner->t();
   out.value = out.v_owner->t();
@@ -3213,8 +3271,8 @@ bool GdnFp8InBf16Enabled() {
   return on;
 }
 
-// GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
-// f32 default; VT_GDN_OUT_BF16=0/1 overrides both for diagnostics).
+// GDN recurrence-OUTPUT + z-gate in bf16, on EVERY arm (default ON;
+// VT_GDN_OUT_BF16=0 is the same-binary f32 rollback).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
 // upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
@@ -3229,18 +3287,26 @@ bool GdnFp8InBf16Enabled() {
 // this lever is the f32 `dcore` recurrence output that attempt left untouched.
 // This is correctness-significant for the 27B: with the repaired full NVFP4
 // tactic stack, f32 core/z takes the alternate whitespace near-tie branch while
-// bf16 reproduces native vLLM 16/16. Keep every unmeasured 35B arm, including
-// GGUF, on its prior f32 default; the explicit env override remains available
-// for its later independently gated campaign.
-DType GdnOutDType(bool dense_model) {
-  static const int override = [] {
-    const char* e = std::getenv("VT_GDN_OUT_BF16");
-    if (e == nullptr) return -1;
-    return e[0] == '0' ? 0 : 1;
-  }();
-  const bool bf16 = override >= 0 ? override != 0 : dense_model;
-  return bf16 ? DType::kBF16 : DType::kF32;
-}
+// bf16 reproduces native vLLM 16/16.
+//
+// GDN-MOE-BF16-OUT (#1168) removed the `bool dense_model` parameter this used to
+// default to. It resolved bf16 for a dense checkpoint and f32 for a MoE one, and
+// all three call sites passed `cfg.num_experts == 0`, so every MoE checkpoint
+// carried `dcore`, `z` and the gated-norm weight at double width. Upstream does
+// not branch on model shape anywhere on this path — `Qwen3_5ForCausalLMBase`
+// (vllm/model_executor/models/qwen3_5.py:280-297 @ 5559679) is the shared base of
+// the dense and MoE causal-LM arms — and the deferral quoted above ("keep every
+// unmeasured 35B arm on its prior f32 default") named its own successor campaign,
+// which this is. The parameter is gone rather than defaulted because a signature
+// that accepts a model shape makes the default unreadable at the definition and
+// lets a new call site reintroduce the split silently. VT_GDN_OUT_BF16=0 is now
+// the f32 rollback for BOTH arms rather than for the dense one alone.
+//
+// Fresh-review repair: the definition moved up beside `GdnOutBf16FlagIsOn` and
+// into `detail::`, so that a gate can observe the RESOLVER and not only its
+// parser. Nothing about the resolution changed. The call sites below are
+// unqualified and keep reading it through this declaration.
+using detail::GdnOutDType;
 
 // bf16 residual stream (default ON). vLLM runs the 35B in bf16
 // (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
@@ -3574,8 +3640,11 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
 // resident owner is shared by both arms: the fallback slices its output ROWS
 // (dim-0 raw-NK slices stay contiguous) and issues the two legacy GEMMs at
 // their independent dtypes, never retaining duplicate split weights. The
-// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType; the
-// 27B default is BF16/BF16, matching vLLM's model-dtype projection).
+// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType, and
+// since GDN-MOE-BF16-OUT (#1168) that is BF16/BF16 on every arm, matching vLLM's
+// model-dtype projection). The uniformity term therefore no longer excludes a
+// MoE checkpoint; `has_packed_qkvz` still does, because no MoE or GGUF loader
+// builds the merged `in_proj_qkvz` owner either — the same gap as #1169's.
 // VT_GDN_MERGED_QKVZ=0 (or master VT_GDN_MERGED_PROJ=0) restores the split
 // GEMMs from the same binary and the same resident owner.
 bool MergedGdnQkvzEnabled(Dev d) {
@@ -3640,11 +3709,17 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   //      narrowing is not value-neutral),
   //   2. indt == BF16, i.e. VT_GDN_IN_BF16 is on (its default) — this IS the
   //      lever being unblocked, so honouring its rollback is mandatory,
-  //   3. outdt == BF16. This is what confines the change to the 27B: the 35B is
-  //      MoE, so GdnOutDType(dense_model=false) is f32 by default and this stays
-  //      inert there. It also keeps the whole chain dtype-uniform, which the
-  //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
+  //   3. outdt == BF16, which keeps the whole chain dtype-uniform — the
+  //      downstream contracts need that: vt::RmsNormGatedQuantFp8 requires
   //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
+  //      This term USED to read "confines the change to the 27B, because the
+  //      35B is MoE and GdnOutDType(dense_model=false) is f32 there". #521
+  //      asked for that correction and GDN-MOE-BF16-OUT (#1168) is what makes
+  //      it wrong: outdt is BF16 on every arm now. What still keeps this leaf
+  //      inert on the 35B is condition 1, the DEFAULT-OFF VT_GDN_FP8_IN_BF16
+  //      toggle — a toggle term, not a model-shape one. Nothing moves by
+  //      default in either merge order, but whoever turns that toggle on owns
+  //      measuring the 35B too (#417).
   // PERF-GDN-PACKED-BRIDGE (#365): PERF-FP8-ALPHA-FOLD's three-term decision,
   // moved into the shared `GdnFp8MergedInProjDType` so the PRODUCER (this line,
   // which reaches MergedFp8QkvzD and allocates the buffer) and the PREDICTOR
@@ -3721,6 +3796,19 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                                      GdnFp8MergedInProjDType(indt, outdt)}),
              "qwen3_5 split FP8 GDN qkv: the allocated mixed_qkv dtype and the "
              "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first on both projections.
+  // `indt`/`outdt` rather than a literal bf16 here, because the packed-decode
+  // predictor above derives the SAME dtype for this arm and a disagreement
+  // makes vt::GdnPackedDecode throw.
+  if (!w.in_proj_qkv_fp8_block.Empty()) {
+    out.mixed_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_qkv_fp8_block, indt));
+    out.z_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_z_fp8_block, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -3791,7 +3879,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // and on the merged fp8 branch too under VT_GDN_FP8_IN_BF16 (default OFF, see
   // GdnFp8InBf16Enabled). See GdnInDType().
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   GdnQkvzOutput qkvz =
       ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
   Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
@@ -3915,6 +4003,13 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4197,7 +4292,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const DType convdt = mixed.dtype;
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   const DType actdt = GdnActDType();
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   g_mixed_spec_invocations.fetch_add(1, std::memory_order_relaxed);
@@ -4383,6 +4478,13 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4428,7 +4530,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const bool mixed_spec = spec && np > 0;
 
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   // PERF-27B-GDN-PACKED-REACHABLE (#365). `dtype_compatible` is decided by the
   // ACTIVATION dtypes vt::GdnPackedDecode requires, not by how the GDN weights
   // are stored. `mixed_qkv` has to be PREDICTED because this decision runs
@@ -4451,7 +4553,6 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
           vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
-          cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
           detail::GdnPackedDecodeDTypesCompatible(
@@ -4630,6 +4731,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // intermediates are allocated. This mirrors vLLM v0.25.0
   // _forward_core_decode_non_spec:1644-1695.
   DBuf dcore(d, outdt, {T, Hv, Dv});
+  // GDN-MOE-BF16-OUT (#1168): read off the tensors, not off GdnOutDType, so a
+  // gate entering through ModelRegistry::Forward observes what this layer RAN.
+  // This is the ONLY recording site. The mixed spec+non-spec batch returns into
+  // GdnBlockPagedMixedSpec above and never reaches it, so a mixed step leaves
+  // the record untouched rather than stale-free — see the header's limits.
+  RecordGdnOutActivationDTypes(dcore.t().dtype, z.dtype);
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   if (packed_decode) {
     Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
@@ -4831,6 +4938,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -5126,6 +5240,34 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   pa_args.max_seq_len = meta.max_seq_len;
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
+  // VT_DUMP_ATTN (issue #41, 0.8B ROCm divergence spike W1/W2): dump the
+  // full-attn block's internals per full-attn-layer call index (0-based), as
+  // raw little-endian dumps under $VT_DUMP_ATTN/fa<k>_{qkv,q,attn,gate}.bin.
+  // Inert when unset; the Downloads sync, so never set on a graph path.
+  static thread_local int64_t dump_fa_idx = -1;
+  dump_fa_idx++;
+  if (std::getenv("VT_DUMP_ATTN") != nullptr) {
+    auto DumpT = [&](const char* stage, const Tensor& t) {
+      int64_t n = 1;
+      for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
+      const size_t es = vt::SizeOf(t.dtype);
+      // contiguous check: innermost stride 1 and packed
+      std::vector<uint8_t> raw(static_cast<size_t>(n) * es);
+      DBuf tmp(d, t.dtype, {n});
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ATTN")) +
+                               "/fa" + std::to_string(dump_fa_idx) + "_" +
+                               stage + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    };
+    DumpT("qkv", qgate);
+    DumpT("q", qn3);
+    DumpT("attn", dattn.t());
+    DumpT("gate", gatef.t());
+  }
+
   // Sigmoid output gate, folded into the o_proj activation quant on the true-W4A4
   // path (§5) — see SigmoidGateOProjD.
   return SigmoidGateOProjD(d, Reshape(dattn.t(), {T, Hq * Dh}),
@@ -5169,12 +5311,521 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
   return wt;
 }
 
+// ENG-EXPERT-STREAM W4: serve an expert slice from a BOUNDED slot cache instead
+// of reading it straight out of the mmap'd tower.
+//
+// Default OFF (`VT_MOE_EXPERT_STREAM=1` turns it on, `VT_MOE_EXPERT_STREAM_SLOTS`
+// sets the budget), so every existing path keeps its bytes and its numbers.
+//
+// Why this exists, measured rather than assumed. On `Qwen3.8-2.4T-A95B UD-Q1_0`
+// the borrowed tower already makes a 370 GiB model FIT in 119 GiB, because the
+// weights are never copied. What it does not do is make it fast: each token
+// needs ~6.7 GB of expert bytes and the kernel serves them as 4 KiB faults in
+// ROUTER order, measured near 100 MB/s against an NVMe that sustains ~5 GB/s.
+// A slot is filled by ONE contiguous copy of a whole slice, so the read is
+// sequential, and a slice already resident costs nothing at all.
+//
+// The cache is keyed by (tower, expert). A tower's identity is `TowerUid()`, a
+// process-unique counter, NOT the buffer's address: the store outlives any one
+// model, and the allocator hands a freed tower's address to the next one (#1066,
+// and the note on TowerId below).
+
+// Whether the operator ASKED for streaming, independent of whether a store has
+// been built yet. The grouped-MoE gate needs this before any expert is touched.
+inline bool Qwen35ExpertStreamRequested() {
+  // ENG-RESIDENCY-CONFIG (#1110): the answer now comes from
+  // `ResolveExpertStreamRequested()`, which holds `VT_MOE_EXPERT_STREAM` >
+  // `--offload-config`'s `vllm_cpp.expert_stream.enabled` > OFF, and which keeps
+  // this knob's ODD environment rule verbatim: only the FIRST CHARACTER is
+  // examined, so `VT_MOE_EXPERT_STREAM=false` is ON. That is what
+  // docs/ENVIRONMENT.md documents, so it is transcribed rather than normalised
+  // onto the tree's whole-value polarity.
+  //
+  // The answer is still cached on first call, and that is deliberate — it decides
+  // whether an ~18 GiB slot store is built and whether the default-on grouped-MoE
+  // path is disabled, and those two must not be able to disagree later in the same
+  // process. The function-local static lives in `ResolveExpertStreamRequested`, not
+  // here; this is a pure delegation.
+  //
+  // That cached answer is why `SetWeightResidencyConfig` refuses a config that would
+  // CHANGE it — not one that arrives late. A document that omits `expert_stream`, or
+  // asks for exactly what was decided, or that the environment overrides anyway, is
+  // accepted; only one that would make this function's answer differ from the value
+  // already returned is refused, because recording that would publish a
+  // configuration the engine is not running. The loader installs in `FromModelDir`'s
+  // first block, ahead of all weight I/O, so the ordering holds by construction.
+  return ResolveExpertStreamRequested();
+}
+
+class Qwen35ExpertStream {
+ public:
+  // The store, or nullptr when nothing has built one. NEVER constructs, which
+  // is the whole reason it is separate from Get: the once-per-step hook and the
+  // stats reader must be able to ask "is this lane live?" without allocating an
+  // 18 GiB slot array behind a model that is not streaming at all.
+  static Qwen35ExpertStream* Existing() { return Slot().get(); }
+
+  // The largest slice a caller is about to take, declared BEFORE it takes any.
+  //
+  // gate/up and down are not the same size whenever a dynamic (UD) quant keeps
+  // `down_proj` at a higher precision than the gate/up pair, which is exactly
+  // what the checkpoints this row targets do. Sizing the store from whichever
+  // slice happened to arrive first then makes the FIRST down slice exceed the
+  // slot and trip the check below in the middle of decode. Declaring the
+  // maximum up front sizes the store once, correctly, before anything is
+  // stored, so the only remaining way to trip that check is a genuinely
+  // unforeseen slice.
+  static void Reserve(size_t slot_bytes) {
+    if (!Qwen35ExpertStreamRequested()) return;
+    std::lock_guard<std::mutex> lk(Mutex());
+    if (slot_bytes > Reserved()) Reserved() = slot_bytes;
+  }
+
+  static Qwen35ExpertStream* Get(size_t slot_bytes) {
+    if (!Qwen35ExpertStreamRequested()) return nullptr;
+    Qwen35ExpertStream* inst = nullptr;
+    {
+      // Construction only. The lock does NOT cover Slice: a decode step runs on
+      // one host thread, and holding a process-wide mutex across every expert
+      // slice would serialise the lane it exists to speed up.
+      //
+      // It does have to cover construction. The previous `static T* inst =
+      // nullptr; if (inst == nullptr) inst = new T(...)` is not the magic-static
+      // idiom used a few lines above and carries none of its guarantees: two
+      // concurrent first calls both see null, both construct, and one ~18 GiB
+      // store is leaked while the two halves of the model disagree about which
+      // cache they are using.
+      std::lock_guard<std::mutex> lk(Mutex());
+      std::unique_ptr<Qwen35ExpertStream>& slot = Slot();
+      if (slot == nullptr) {
+        slot.reset(new Qwen35ExpertStream(std::max(slot_bytes, Reserved())));
+      }
+      inst = slot.get();
+    }
+    // A tower larger than the slot cannot be served by THIS store. Refuse by
+    // name rather than silently falling back, which would make a streaming
+    // benchmark quietly measure the mmap path instead. Both sizes are named,
+    // because "too big" without the budget it exceeded is not actionable.
+    VT_CHECK(slot_bytes <= inst->store_->slot_bytes(),
+             "expert stream: a slice of " + std::to_string(slot_bytes) +
+                 " bytes exceeds the slot budget of " +
+                 std::to_string(inst->store_->slot_bytes()) +
+                 "; raise VT_MOE_EXPERT_STREAM_SLOT_BYTES");
+    return inst;
+  }
+
+  // The decode step boundary. Calling it is what clears per-step eviction
+  // protection and advances the hotness clock; see the note on the RAII guard
+  // below for what happens when nobody does.
+  static void EndStepIfActive() {
+    if (Qwen35ExpertStream* s = Existing()) s->EndStep();
+  }
+
+  // Force the cache-exhaustion branch, which makes every Slice return nullptr
+  // and every caller fall back to the resident tower view. This is a REAL
+  // production state (a budget smaller than one step's working set reaches it),
+  // and having a switch for it is what lets a gate prove the streamed and
+  // unstreamed arms produce the same bytes inside one process.
+  static void SetForceFallback(bool on) { ForceFallback() = on; }
+
+  // Returns the slot's bytes for `expert` of the tower based at `base`, or
+  // nullptr when the cache is exhausted for this step (the caller then reads
+  // the tower directly, which is correct but slow, and is counted).
+  // `fd`/`file_offset` describe where the slice lives on DISK. When they are
+  // valid the slot is filled by pread, which is the form the design specified
+  // and the only one that changes the I/O: a memcpy from the mapping still
+  // traps every 4 KiB page of its source, which is why W4 measured no decode
+  // gain. The mapping copy stays as the fallback for a weight with no
+  // descriptor (an expanded or repacked tensor owns its bytes outright).
+  uint8_t* Slice(const uint8_t* base, uint64_t tower_uid, int64_t expert,
+                 size_t offset, size_t bytes, int fd, size_t file_offset) {
+    if (ForceFallback()) {
+      // COUNTED SEPARATELY FROM `exhausted_`, on purpose (#1091 finding 6).
+      // `exhausted` is the operator-facing number and both docs define it as
+      // "the budget is smaller than one step's working set; raise
+      // VT_MOE_EXPERT_STREAM_SLOTS". This switch has no production caller at
+      // all, so charging it to that counter told an operator to raise a budget
+      // that was never the reason. It stays out of the stderr line for the same
+      // reason: in a production process it is always zero.
+      ++forced_;
+      return nullptr;
+    }
+    const int32_t tower = TowerId(tower_uid);
+    const ExpertKey key{tower, static_cast<int32_t>(expert)};
+    if (fd >= 0) {
+      const ExpertStreamer::Result r =
+          streamer_->EnsureFile(key, fd, file_offset + offset, bytes);
+      if (r.slot < 0) {
+        ++exhausted_;
+        return nullptr;
+      }
+      return store_->Slot(r.slot);
+    }
+    // Ask the kernel for the WHOLE slice up front, before the copy touches it.
+    //
+    // This is the difference between one readahead and 608 demand faults. The
+    // W4 measurement showed that filling a slot by memcpy from the mapping
+    // inherits the fault path streaming exists to bypass: the copy is
+    // sequential, but each 4 KiB page still traps. MADV_WILLNEED hands the
+    // range to the kernel's readahead in one call, which is the same lever
+    // `PrefaultBorrowedSpan` already uses at load, applied per slice at decode.
+    //
+    // Advisory and read-only, so it cannot change a byte. Skipped on a hit,
+    // where nothing will be read at all.
+    //
+    // THE ADDRESS MUST BE PAGE-ALIGNED. madvise(2) returns EINVAL when it is
+    // not, and a GGUF tensor is aligned to `general.alignment`, which defaults
+    // to 32 (gguf_reader.cpp:401) — so the slice address is essentially never a
+    // page boundary and the unaligned form was a no-op that reported nothing,
+    // because the return value was discarded too. Round the start DOWN and the
+    // end UP: the extra bytes belong to a neighbouring expert that this step is
+    // very likely to want as well, and MADV_WILLNEED cannot harm them either
+    // way. `advised_` counts the calls that were actually accepted, so a run
+    // can tell a working hint from a silently rejected one.
+    //
+    // ROUNDING THE END UP CAN LEAVE THE ALLOCATION, and that is the one way
+    // this call still fails: madvise(2) returns ENOMEM when any page in the
+    // range is unmapped, so a tower whose last byte sits near the end of its
+    // final mapped page would not be counted. In production the tower is a
+    // borrowed view into a file mapping many pages larger than one slice, so
+    // the trailing page is mapped. On the heap-backed towers the gates build it
+    // holds because the allocator's arena page is mapped, not because the
+    // allocation reaches it — which is why `advised == fills` is asserted
+    // against a measured run rather than assumed from the arithmetic.
+    //
+    // NO SPEEDUP IS CLAIMED HERE. This makes the call well-formed; whether
+    // readahead moves decode is a measurement the spec records as owed.
+#if defined(__unix__)
+    if (!cache_->IsResident(key)) {
+      const long ps_l = ::sysconf(_SC_PAGESIZE);
+      const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+      const auto begin = reinterpret_cast<uintptr_t>(base + offset);
+      const uintptr_t page_begin = begin & ~(ps - 1);
+      const uintptr_t page_end = (begin + bytes + ps - 1) & ~(ps - 1);
+      if (::madvise(reinterpret_cast<void*>(page_begin),
+                    static_cast<size_t>(page_end - page_begin),
+                    MADV_WILLNEED) == 0) {
+        ++advised_;
+      }
+    }
+#endif
+    const ExpertStreamer::Result r =
+        streamer_->EnsureSpan(key, base + offset, bytes);
+    if (r.slot < 0) {
+      ++exhausted_;
+      return nullptr;
+    }
+    return store_->Slot(r.slot);
+  }
+
+  void EndStep() {
+    streamer_->EndStep();
+    ReportStats(/*final=*/false);
+  }
+  const ExpertStreamer& streamer() const { return *streamer_; }
+  const ExpertSlotCache& cache() const { return *cache_; }
+  int64_t exhausted() const { return exhausted_; }
+  int64_t forced() const { return forced_; }
+  int64_t advised() const { return advised_; }
+
+  // ONE line a benchmark can read to prove the lane stayed live.
+  //
+  // This exists because of how the row's published decode number went wrong.
+  // The run printed `[expert-stream] ON ...` once at startup and then nothing,
+  // so a cache that switched itself off partway through token 3 looked exactly
+  // like one that worked for the whole run, and "streaming ON: no decode gain"
+  // was measured against a dead lane. The two numbers that would have caught it
+  // immediately are `steps` and `exhausted`: steps==0 means the step clock never
+  // advanced, and exhausted>0 means slices were refused and silently served from
+  // the mapping instead. Both are on this line, and either is wrong at a glance.
+  //
+  // `final` IS THE WHOLE POINT AND IT USED TO HAVE NO CALLER (#1091 finding 1).
+  // The periodic report is skipped on `steps == 0` — so the one run that most
+  // needs the line, the one where the step boundary is never reached, printed
+  // nothing at all, and both docs told an operator to read a zero off a line
+  // that could not exist. It is skipped again whenever `stats_every_` does not
+  // divide the step count, and the default is 16, so a healthy five-token run
+  // printed nothing either and a benchmark reading absence as failure reported
+  // VOID on a working lane. The final report crosses both early returns.
+  void ReportStats(bool final) const {
+    const int64_t steps = cache_->steps();
+    if (!final) {
+      if (stats_every_ <= 0) return;
+      if (steps == 0 || steps % stats_every_ != 0) return;
+    }
+    PrintStatsLine(steps, cache_->hits(), cache_->misses(), cache_->evictions(),
+                   streamer_->fills(), streamer_->bytes_filled(), exhausted_,
+                   advised_);
+  }
+
+  // The final line, printed exactly ONCE per process.
+  //
+  // NOTHING IN PRODUCTION CALLS THIS, and read the destructor below before you
+  // conclude otherwise. Teardown produces the LINE but does not route through
+  // here: the store is a function-local static, so `~Qwen35ExpertStream` runs on
+  // the normal exit path and calls `ReportStats` itself, for the reason stated
+  // there. The two share the once-flag, not a call, so exactly one of them
+  // prints. This entry exists so a GATE can observe the same guarantee from
+  // inside a running process, because a static destructor fires after main
+  // returns and nothing in the process can assert on it.
+  //
+  // A once-flag rather than two independent prints, so "one line" is a property
+  // of the process and not of which caller happened to win. The flag is a plain
+  // bool with constant initialisation and no destructor of its own, so it cannot
+  // itself be lost to static-destruction ordering.
+  //
+  // No store means no line, and that is not a gap: a store that exists always
+  // announced itself with `[expert-stream] ON ...` first, so banner-without-line
+  // is a process that died, and no-banner is a lane nothing ever reached.
+  static void FlushFinalStats() {
+    if (FinalReported()) return;
+    Qwen35ExpertStream* s = Existing();
+    if (s == nullptr) return;
+    FinalReported() = true;
+    s->ReportStats(/*final=*/true);
+  }
+
+  ~Qwen35ExpertStream() {
+    // The store holds the numbers, so it prints them before it goes away. Not
+    // routed through FlushFinalStats: that reads `Existing()`, and the unique_ptr
+    // this object lives in does not clear itself before running this destructor.
+    if (!FinalReported()) {
+      FinalReported() = true;
+      ReportStats(/*final=*/true);
+    }
+  }
+
+ private:
+  // The single instance, and the lock that makes creating it safe. Both are
+  // function-local statics so their own initialisation is the thread-safe magic
+  // static this class failed to use for the instance itself.
+  static std::unique_ptr<Qwen35ExpertStream>& Slot() {
+    static std::unique_ptr<Qwen35ExpertStream> inst;
+    return inst;
+  }
+  static std::mutex& Mutex() {
+    static std::mutex m;
+    return m;
+  }
+  static size_t& Reserved() {
+    static size_t bytes = 0;
+    return bytes;
+  }
+  static bool& ForceFallback() {
+    static bool on = false;
+    return on;
+  }
+  // Constant-initialised and destructor-free, so the "has the final line been
+  // printed" answer survives every other static's destruction.
+  static bool& FinalReported() {
+    static bool done = false;
+    return done;
+  }
+
+  // The one place the statistics line's format lives, so the final report and
+  // the periodic report cannot drift apart into two shapes a parser has to
+  // know about.
+  static void PrintStatsLine(int64_t steps, int64_t hits, int64_t misses,
+                             int64_t evictions, int64_t fills, int64_t bytes,
+                             int64_t exhausted, int64_t advised) {
+    std::fprintf(stderr,
+                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
+                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
+                 "advised=%lld\n",
+                 static_cast<long long>(steps), static_cast<long long>(hits),
+                 static_cast<long long>(misses),
+                 static_cast<long long>(evictions),
+                 static_cast<long long>(fills), static_cast<long long>(bytes),
+                 static_cast<long long>(exhausted),
+                 static_cast<long long>(advised));
+  }
+
+  explicit Qwen35ExpertStream(size_t slot_bytes) {
+    // ENG-RESIDENCY-CONFIG (#1110): both sizes resolve through the shared
+    // resolvers, which hold env var > `--offload-config`'s
+    // `vllm_cpp.expert_stream.{slots,slot_bytes}` > the default, and which keep
+    // the tolerant integer parsing this constructor already had (atoll, then
+    // ignore anything non-positive) so an environment-only run is unchanged. The
+    // CONFIG side is stricter: a zero or negative value is refused at startup,
+    // where the operator can still read the message, rather than silently becoming
+    // the default.
+    //
+    // `slot_bytes`' default is the caller's computed maximum, not a constant, so it
+    // is passed in rather than duplicated here.
+    slot_bytes = static_cast<size_t>(
+        ResolveExpertStreamSlotBytes(static_cast<int64_t>(slot_bytes)));
+    const int32_t slots = static_cast<int32_t>(ResolveExpertStreamSlots());
+    // STATS_EVERY stays environment-only, and that is a decision rather than an
+    // oversight: it changes only how often the line below is printed, so it is the
+    // instrument and not the configuration. `--offload-config` refuses it as an
+    // unknown key rather than accepting and dropping it.
+    const char* se = std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY");
+    if (se != nullptr && *se != '\0') {
+      const long v = std::atol(se);
+      if (v >= 0) stats_every_ = static_cast<int64_t>(v);
+    }
+    // Record the geometry this store was actually built with. It is the only way
+    // a test can tell that the two resolvers above were consulted: the values are
+    // otherwise visible only on a stderr line, and a site that hardcoded the
+    // default would leave every existing suite green.
+    NoteExpertStreamGeometry(static_cast<int64_t>(slots),
+                             static_cast<int64_t>(slot_bytes));
+    store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
+    cache_ = std::make_unique<ExpertSlotCache>(slots);
+    streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
+    std::fprintf(stderr,
+                 "[expert-stream] ON slots=%d slot_bytes=%zu resident=%.2f GiB\n",
+                 slots, slot_bytes, store_->resident_bytes() / 1073741824.0);
+  }
+
+  // A tower's cache identity, compacted into the int32 the key carries.
+  //
+  // The argument is the tensor's PROCESS-UNIQUE uid, not its base pointer. A
+  // pointer was wrong here in a way no single-model test could see. This store
+  // is a process-lifetime singleton, so it outlives any one model, and the
+  // allocator hands out an address again as soon as the first model is freed.
+  // The second model's tower then hit the FIRST model's entries and was served
+  // another checkpoint's weights, as a HIT, which by contract moves no bytes and
+  // so leaves nothing downstream to notice. Measured on two synthetic models in
+  // one process: 24 towers occupied 21 distinct addresses, and 20 of 222 slices
+  // came back wrong. The comment this replaces asserted the opposite, and its
+  // premise ("stable for the model's life") was true; the CACHE is simply not
+  // scoped to one model's life.
+  int32_t TowerId(uint64_t uid) {
+    auto it = tower_ids_.find(uid);
+    if (it != tower_ids_.end()) return it->second;
+    const int32_t id = next_tower_id_++;
+    tower_ids_.emplace(uid, id);
+    return id;
+  }
+
+  std::unique_ptr<HostExpertSlotStore> store_;
+  std::unique_ptr<ExpertSlotCache> cache_;
+  std::unique_ptr<ExpertStreamer> streamer_;
+  std::unordered_map<uint64_t, int32_t> tower_ids_;
+  int32_t next_tower_id_ = 0;
+  int64_t exhausted_ = 0;
+  // Slices the FORCED-fallback switch refused. Separate from `exhausted_`
+  // because that one is an operator-facing budget diagnosis and this one is a
+  // gate asking for the unstreamed arm; see the note at the ForceFallback
+  // branch in Slice.
+  int64_t forced_ = 0;
+  int64_t advised_ = 0;
+  int64_t stats_every_ = 16;
+};
+
+// The decode step boundary, as a scope guard.
+//
+// WHY THIS EXISTS AT ALL. `ExpertSlotCache::Acquire` marks every entry it
+// serves `protected_this_step`, because evicting a slot the current step is
+// about to read would hand the kernel bytes that are being overwritten. ONLY
+// EndStep clears that mark. Without a caller, the protection is permanent: once
+// the cache fills, `ColdestEvictable` finds every entry protected and returns
+// -1, `Acquire` returns slot -1, `Slice` returns nullptr, and every later slice
+// falls back to the mmap path. The lane switches itself off and says nothing,
+// the step clock never advances, and so the hotness decay, the LFU score, the
+// LRU tiebreak and eviction never run in production at all. On the live
+// configuration (8000 slots, ~2790 slices per token) that happens partway
+// through the third token.
+//
+// A guard rather than a call at the end of the body: ForwardLayers has two
+// returns and can throw, and a step that ended by throwing still ended.
+//
+// ONE FORWARD IS ONE STEP, AND THE GUARD REFUSES TO NEST (#1091 finding 3).
+// Five forwards in this file take expert slices — `ForwardLayers`,
+// `Qwen3_5Model::ForwardDense`, both MTP forwards and `Qwen3_5ReplayLayer` —
+// and each is a complete forward that no other one contains. A nested guard
+// would end the step twice, which advances the hotness clock for a step that
+// never happened and decays every resident entry an extra tick; that is a
+// quieter defect than the missing boundary and it is the one adding guards
+// invites. So the precondition is stated rather than handled, the same way
+// `MatmulF32Slice` states `expert >= 0`: the flag is per-thread because a
+// decode step runs on one host thread, which is the assumption the store's own
+// locking already makes.
+//
+// THE REFUSAL IS NOT GATED ON `Qwen35ExpertStreamRequested()`, deliberately.
+// "One forward is one step" is a property of the CALL GRAPH, not of the
+// streaming lane: a nest is a defect whether or not a store exists, and the
+// streamed run is the rare configuration. Arming it only there would let the
+// default-on path establish a nest that nobody sees until someone turns
+// streaming on, which is the shape this row keeps finding. The cost is that a
+// nest reds every Qwen3.5 forward rather than only the streamed ones, and that
+// is the intended polarity: loud on the default path is what makes it a gate.
+//
+// `Begin`/`End` are named rather than living only in the constructor and
+// destructor bodies so that `detail::ExpertStreamStepScope` can hold THE SAME
+// boundary. A gate that re-implemented the refusal would prove its own copy;
+// this way deleting the `VT_CHECK` below is one edit that both changes
+// production and takes the gate red.
+struct Qwen35ExpertStreamStep {
+  Qwen35ExpertStreamStep() { Begin(); }
+  ~Qwen35ExpertStreamStep() { End(); }
+  Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
+  Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
+
+  // Open the step. Throws when one is already open on this thread; the flag is
+  // then left as it was, so the outer guard's `End` still closes exactly one.
+  static void Begin() {
+    VT_CHECK(!Open(), "qwen3_5: a decode step is already open; the expert-stream "
+                      "step guard marks ONE forward and must not nest");
+    Open() = true;
+  }
+  static void End() {
+    Open() = false;
+    Qwen35ExpertStream::EndStepIfActive();
+  }
+
+ private:
+  static bool& Open() {
+    static thread_local bool open = false;
+    return open;
+  }
+};
+
+// The expert-slice seam. Identical to KqResidentSlice except that, when
+// streaming is on, the returned tensor points at a SLOT holding a contiguous
+// copy of the slice rather than into the tower itself.
+Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
+                     int64_t row_off, int64_t expert) {
+  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
+  const size_t bytes = static_cast<size_t>(N) * row_bytes;
+  // Streaming only serves a CPU-resident borrowed tower: a staged device weight
+  // is already resident on the device, and copying it through host slots would
+  // move MORE bytes, not fewer.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+    if (Qwen35ExpertStream* st = Qwen35ExpertStream::Get(bytes)) {
+      const uint8_t* base = w.bytes.data();
+      if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
+                                    static_cast<size_t>(row_off) * row_bytes,
+                                    bytes, w.mmap_fd, w.mmap_file_offset)) {
+        Tensor wt = ResidentWeight(d, w);  // inherit dtype/device/repack markers
+        wt.data = static_cast<void*>(slot);
+        wt.rank = 2;
+        wt.shape[0] = N;
+        wt.shape[1] = K;
+        wt.stride[0] = K;
+        wt.stride[1] = 1;
+        return wt;
+      }
+    }
+  }
+  return KqResidentSlice(d, w, N, K, row_off);
+}
+
 std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
                                   int64_t N, int64_t K, const OwnedTensor& w,
-                                  int64_t row_off) {
+                                  int64_t row_off, int64_t expert) {
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kF32, {M, N});
-  Tensor dw = KqResidentSlice(d, w, N, K, row_off);
+  // `expert` is a routed-expert index and is never negative: every call comes
+  // from ExpertMlpKq's `for (e = 0; e < E; ++e)`. An earlier revision branched
+  // to KqResidentSlice on `expert < 0`, which no caller could reach; the check
+  // now states the precondition instead of pretending to handle its negation,
+  // because an unreachable fallback is a place for a defect to hide rather than
+  // a safety net. KqExpertSlice itself falls back to the tower view whenever
+  // streaming is off or the cache cannot serve the slice.
+  VT_CHECK(expert >= 0, "qwen3_5: MatmulF32Slice needs a routed expert index");
+  Tensor dw = KqExpertSlice(d, w, N, K, row_off, expert);
   vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
   std::vector<float> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
@@ -5183,10 +5834,12 @@ std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t
 
 std::vector<uint16_t> MatmulBf16Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
                                       int64_t N, int64_t K, const OwnedTensor& w,
-                                      int64_t row_off) {
+                                      int64_t row_off, int64_t expert) {
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kBF16, {M, N});
-  Tensor dw = KqResidentSlice(d, w, N, K, row_off);
+  // See MatmulF32Slice: `expert` is always a real routed index here.
+  VT_CHECK(expert >= 0, "qwen3_5: MatmulBf16Slice needs a routed expert index");
+  Tensor dw = KqExpertSlice(d, w, N, K, row_off, expert);
   vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
   std::vector<uint16_t> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
@@ -5203,12 +5856,21 @@ std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
                                   const OwnedTensor& up_kq, const OwnedTensor& down_kq,
                                   const std::vector<uint16_t>& x, int64_t e, int64_t n,
                                   int64_t H, int64_t I) {
-  std::vector<float> hg = MatmulF32Slice(d, x, n, I, H, gate_kq, e * I);  // [n,I]
-  std::vector<float> hu = MatmulF32Slice(d, x, n, I, H, up_kq, e * I);    // [n,I]
+  // Declare the LARGEST of the three slices before taking any of them, so the
+  // slot store is sized once and correctly. gate/up and down differ in size
+  // whenever a UD (dynamic) quant keeps down_proj at a higher precision, and
+  // sizing from whichever slice arrived first would then refuse the first down
+  // slice mid-decode. Inert unless streaming was asked for.
+  Qwen35ExpertStream::Reserve(
+      std::max({static_cast<size_t>(I) * vt::RowSizeBytes(gate_kq.dtype, H),
+                static_cast<size_t>(I) * vt::RowSizeBytes(up_kq.dtype, H),
+                static_cast<size_t>(H) * vt::RowSizeBytes(down_kq.dtype, I)}));
+  std::vector<float> hg = MatmulF32Slice(d, x, n, I, H, gate_kq, e * I, e);  // [n,I]
+  std::vector<float> hu = MatmulF32Slice(d, x, n, I, H, up_kq, e * I, e);    // [n,I]
   std::vector<uint16_t> act(static_cast<size_t>(n) * I);
   for (size_t i = 0; i < act.size(); ++i)
     act[i] = vt::F32ToBF16(Silu(hg[i]) * hu[i]);
-  return MatmulBf16Slice(d, act, n, H, I, down_kq, e * H);  // [n,H]
+  return MatmulBf16Slice(d, act, n, H, I, down_kq, e * H, e);  // [n,H]
 }
 
 // W3b: keep-quant grouped MoE — default-ON, VT_QWEN35_GROUPED_MOE=0 restores the
@@ -5216,7 +5878,20 @@ std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
 inline bool Qwen35GroupedMoeEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_QWEN35_GROUPED_MOE");
-    return e == nullptr || std::string(e) != "0";
+    const bool grouped = (e == nullptr || std::string(e) != "0");
+    // The grouped path stages the WHOLE tower through ResidentWeight, so it
+    // bypasses the expert slot cache entirely. Leaving both on would silently
+    // do no streaming at all while the operator believes it is streaming, which
+    // is the invisible-fallback shape this tree refuses elsewhere. Streaming is
+    // explicit and opt-in, so it wins, and it says so once.
+    if (grouped && Qwen35ExpertStreamRequested()) {
+      std::fprintf(stderr,
+                   "[expert-stream] VT_MOE_EXPERT_STREAM=1 disables the grouped "
+                   "MoE path (it stages the whole tower and cannot stream); set "
+                   "VT_MOE_EXPERT_STREAM=0 to keep grouping\n");
+      return false;
+    }
+    return grouped;
   }();
   return on;
 }
@@ -6412,6 +7087,21 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
   const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4). The dense SwiGLU MLP's three
+  // projections, exclusive and first. bf16 out on all three -- upstream's
+  // `out_dtype` is the model dtype (fp8.py:284) and `vt::MoeSiluMul` is
+  // templated on its input dtype, so gate/up feed it unchanged; down_proj's
+  // bf16 is what every other arm of this return already produces.
+  if (!w.gate_proj_fp8_block.Empty()) {
+    DBuf bg = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, dh, w.gate_proj_fp8_block, DType::kBF16);
+    DBuf bu = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, dh, w.up_proj_fp8_block, DType::kBF16);
+    DBuf bact(d, DType::kBF16, {T, I});
+    vt::MoeSiluMul(d.q, bact.t(), bg.t(), bu.t());
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, bact.t(), w.down_proj_fp8_block, DType::kBF16);
+  }
   DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out,
                                               gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
@@ -6544,9 +7234,27 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
+  // VT_DUMP_ACT layer index: the paged loop's per-layer counter (0-based), used
+  // by the sub-stage dump below. Declared per-process; only the dump reads it.
+  static thread_local int64_t dump_layer_idx = -1;
+  dump_layer_idx++;
+  const bool dump_sub = std::getenv("VT_DUMP_ACT_SUB") != nullptr;
+  auto DumpStage = [&](const char* stage, DBuf& buf) {
+    if (!dump_sub) return;
+    std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                             vt::SizeOf(buf.t().dtype));
+    buf.Download(d, raw.data());
+    const std::string path = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                             "/layer_" + std::to_string(dump_layer_idx) + "_" +
+                             stage + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+  };
+
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_input_norm", dhn);
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -6559,12 +7267,15 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
                               *attn_kv, T);
   }();
+  DumpStage("block_out", attn);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_attn_norm", dh2);
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DumpStage("mlp_out", hidden);
 }
 
 // ── Qwen3.5/3.6 MTP head shared preamble (SPEC-MTP I5c). ────────────────────
@@ -6880,6 +7591,44 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+// ENG-EXPERT-STREAM (#912): the streamed-expert lane seen from outside this TU.
+// See qwen3_5_internal.h for why a benchmark and a gate both need to reach it.
+detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
+  ExpertStreamStats s;
+  const Qwen35ExpertStream* st = Qwen35ExpertStream::Existing();
+  if (st == nullptr) return s;  // never requested, or requested and never used
+  s.active = true;
+  s.steps = st->cache().steps();
+  s.hits = st->cache().hits();
+  s.misses = st->cache().misses();
+  s.evictions = st->cache().evictions();
+  s.fills = st->streamer().fills();
+  s.bytes_filled = st->streamer().bytes_filled();
+  s.exhausted = st->exhausted();
+  s.forced = st->forced();
+  s.advised = st->advised();
+  return s;
+}
+
+void detail::ExpertStreamSetForceFallback(bool on) {
+  Qwen35ExpertStream::SetForceFallback(on);
+}
+
+void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+
+void detail::ExpertStreamFlushStats() { Qwen35ExpertStream::FlushFinalStats(); }
+
+// The step guard as a scope a gate can hold. These forward to the SAME
+// `Begin`/`End` the production guard's constructor and destructor call, so the
+// nesting refusal a gate observes here is the one every forward in this file is
+// protected by, not a re-statement of it.
+detail::ExpertStreamStepScope::ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::Begin();
+}
+detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::End();
+}
+
 // ENG-ASYNC-SCHED W4: overwrite the REAL prefix of a freshly uploaded input-id
 // buffer with the device-resident ids the async runner's combine produced.
 //
@@ -7003,9 +7752,42 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const Qwen3_5MoeWeights& weights, const HfConfig& config,
                           const std::vector<int32_t>& logits_indices = {},
                           const Tensor* hidden_tap = nullptr,
+                          const std::vector<float>* mrope_cos_sin = nullptr,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
                           const Tensor* aux_out = nullptr,
                           StepDevInputs* persistent_sdi = nullptr) {
+  // ONE decode step, for the PAGED forwards: ForwardBody, the VL path and the
+  // graph driver's eager fallback all funnel through here exactly once per
+  // forward. This is the step boundary the expert slot cache is defined against,
+  // and it is neither once per layer nor once per expert.
+  //
+  // IT IS NOT THE ONLY ENTRY POINT, and the comment this replaces said it was
+  // (#1091 finding 3). Four more forwards reach `ExpertMlpKq -> KqExpertSlice`
+  // without passing through here — `Qwen3_5Model::ForwardDense`,
+  // `Qwen3_5MTPModel::Forward`, `Qwen3_5MTPModel::ForwardPaged` and
+  // `Qwen3_5ReplayLayer` — and each now carries its own guard.
+  //
+  // ONE OF THOSE FOUR HAS A PRODUCTION CALLER, not all of them, and an earlier
+  // revision of this comment said "the MTP pair" (#1106 finding 2, #1108). It is
+  // `Qwen3_5MTPModel::ForwardPaged`, the spec-decode DRAFT forward, reached from
+  // `runner.cpp:2183` through `spec_decode/mtp/speculator.cpp:107,262` — so the
+  // shape that was actually running is draft forwards that pin every slot they
+  // touch across the following target forward. That caller is itself
+  // "UNREACHABLE unless a speculator is configured" (`runner.cpp:2120`), so a
+  // DEFAULT-configuration run reaches none of these four guards; one of them has
+  // a production caller, which is not the same claim. `Qwen3_5MTPModel::Forward`,
+  // `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity entry
+  // points whose every caller is under `tests/`, and per `.agents/reachability.md`
+  // a call site inside a test is not reach: their guards land UNREACHED, which
+  // the spec's `## Owed` records as a staged slice rather than claiming.
+  //
+  // `RunMoeBlock` is the deliberate exception: it is one block, not a forward,
+  // and qwen3_moe.cpp owns the boundary for the model that composes it
+  // (qwen3_moe.cpp:150).
+  //
+  // Inert unless a store exists, which needs both VT_MOE_EXPERT_STREAM and a
+  // slice taken.
+  const Qwen35ExpertStreamStep expert_stream_step;
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -7042,10 +7824,23 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   StepDevInputs& sdi = persistent_sdi != nullptr ? *persistent_sdi : *local_sdi;
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
+  //
+  // MOE VL path (issue #891): a prebuilt MRoPE cos|sin cache [T, rotary_dim]
+  // (host f32, interleaved 3-section selection already baked in) is injected
+  // verbatim into the fused full-attn preamble, replacing the 1-D RoPE cache
+  // MaybeBuildAttnCosSin would build — the SAME injection point the dense arm's
+  // VL forward uses (DenseForwardLayers below). mrope_cos_sin == nullptr (every
+  // text caller, and every graph-captured caller) ⇒ byte-identical to before.
   if (persistent_sdi != nullptr) {
     // Persistent buffer already allocated (pre-capture); re-fill only, captured so
     // every replay re-derives rope from the freshly-staged positions.
     if (sdi.has_attn_cos_sin) FillAttnCosSin(d, sdi, config);
+  } else if (mrope_cos_sin != nullptr) {
+    const int rot = static_cast<int>(config.rotary_dim);
+    VT_CHECK(rot > 0 && static_cast<int64_t>(mrope_cos_sin->size()) == T * rot,
+             "qwen3_5 moe VL: MRoPE cos|sin cache must be [T, rotary_dim]");
+    sdi.attn_cos_sin = DBuf(d, DType::kF32, {T, rot}, mrope_cos_sin->data());
+    sdi.has_attn_cos_sin = true;
   } else {
     MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
   }
@@ -7128,7 +7923,7 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices, hidden_tap,
-                       aux_layer_ids, aux_out);
+                       /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
 }
 
 // Shared shape/count validation for the paged forward entry points.
@@ -7498,6 +8293,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
            "qwen3_5 forward: positions length must equal token count");
   VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
            "qwen3_5 forward: weights.layers size must equal num_hidden_layers");
+  // ONE decode step. This forward does NOT go through ForwardLayers — it runs
+  // its own unpaged layer loop — so it needs its own boundary, and every MoE
+  // layer it runs takes expert slices (#1091 finding 3).
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = static_cast<float>(config.rms_norm_eps);
 
@@ -7627,6 +8426,21 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
            "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
 
   (void)vocab_size;
+  // ONE decode step. A DRAFT forward is a complete forward with its own working
+  // set: its slices are finished with when it returns, and leaving them pinned
+  // across the target's forward would shrink the evictable set for the whole run
+  // — F1 at draft scale (#1091 finding 3). A spec-decode iteration therefore
+  // advances the clock once per draft plus once for the target, which is what
+  // "one step is one forward" means for a draft+target pair.
+  //
+  // THAT PAIR IS RUN BY `ForwardPaged`, NOT BY THIS OVERLOAD. This one is
+  // reached only through `ForwardLogitsHost`, a standalone parity convenience
+  // (qwen3_5_mtp.h:135) whose every caller is under `tests/`, so the guard here
+  // lands unreached and is recorded as a staged slice (#1108). It is kept
+  // because the reasoning above is what makes it correct the moment this
+  // overload gains a caller, and adding the guard later with the caller is how
+  // this row lost its step boundary the first time.
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 
   // Qwen3_5MultiTokenPredictor.forward head: shared embedding + independent Gemma
@@ -7679,6 +8493,8 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                draft_kv.head_size == config_->head_dim,
            "qwen3_5 MTP paged forward: draft KV cache dims mismatch config");
 
+  // ONE decode step, for the same reason as the unpaged draft forward above.
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 
   // Same head math as Forward; the difference is the DECODER LAYER, which runs
@@ -7708,6 +8524,45 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                   /*gdn_state=*/nullptr, tokens);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
+}
+
+// SPEC-MTP-K-GT-1 (#81): the device row gather the multi-step draft needs
+// between its prefill and its first decode step — the mirror of
+// `self.hidden_states[:num_reqs] = hidden_states[last_token_indices]`
+// (autoregressive/speculator.py:367-371). Row-by-row device-to-device copies,
+// the same idiom MtpHeadHidden uses for torch.cat, so the whole hidden carry
+// stays on the queue's device and never round-trips the host.
+Qwen3_5MTPHiddenStates Qwen3_5MTPModel::GatherHiddenRows(
+    const vt::Tensor& hidden_states, const std::vector<int64_t>& rows,
+    vt::Queue& queue) const {
+  const int64_t hidden_size = config_->hidden_size;
+  const int64_t num_rows = static_cast<int64_t>(rows.size());
+  VT_CHECK(num_rows > 0, "qwen3_5 MTP gather: empty row list");
+  VT_CHECK(hidden_states.rank == 2 && hidden_states.shape[1] == hidden_size &&
+               hidden_states.dtype == DType::kBF16 &&
+               hidden_states.IsContiguous() &&
+               hidden_states.device == queue.device,
+           "qwen3_5 MTP gather: hidden states must be contiguous bf16 [T,H] on "
+           "the queue device");
+  const int64_t tokens = hidden_states.shape[0];
+
+  Dev device{vt::GetBackend(queue.device.type), queue};
+  DBuf out(device, DType::kBF16, {num_rows, hidden_size});
+  const size_t row_bytes =
+      static_cast<size_t>(hidden_size) * vt::SizeOf(DType::kBF16);
+  auto* dst = static_cast<uint8_t*>(out.ptr());
+  const auto* src = static_cast<const uint8_t*>(hidden_states.data);
+  for (int64_t i = 0; i < num_rows; ++i) {
+    const int64_t row = rows[static_cast<size_t>(i)];
+    VT_CHECK(row >= 0 && row < tokens,
+             "qwen3_5 MTP gather: row index out of range");
+    device.b.Copy(device.q, dst + static_cast<size_t>(i) * row_bytes,
+                  src + static_cast<size_t>(row) * row_bytes, row_bytes);
+  }
+  Qwen3_5MTPHiddenStates gathered;
+  gathered.tensor = out.t();
+  gathered.storage = out.ReleaseShared();
+  return gathered;
 }
 
 ForwardLogits Qwen3_5MTPModel::ComputeLogits(
@@ -7892,6 +8747,24 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
+    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1): dump
+    // the residual stream after each layer as raw little-endian bf16 to
+    // $VT_DUMP_ACT/layer_<l>.bin (inert when unset; a debug hook, never the
+    // hot path — the Download forces a sync, so capture-graph paths must not
+    // set the env).
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(hidden.t().dtype));
+      hidden.Download(d, raw.data());  // Copy + Synchronize
+      const char* dir = std::getenv("VT_DUMP_ACT");
+      const std::string path =
+          std::string(dir) + "/layer_" + std::to_string(l) + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) {
+        std::fwrite(raw.data(), 1, raw.size(), f);
+        std::fclose(f);
+      }
+    }
   }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
@@ -8052,12 +8925,74 @@ int32_t VLArgMaxDevice(Dev d, DBuf& dlogits) {
 // Qwen3VLGetRopeIndex vs video_token mask + Qwen3VLGetRopeIndexVideo); the
 // forward, KV/GDN state, MRoPE application, and decode continuation here are
 // IDENTICAL, so the image path is byte-identical across the M3d refactor.
+//
+// MOE ARM (issue #891, .agents/specs/moe-vision-tower.md): the core is templated
+// on the weights arm rather than copied. Upstream composes the SAME
+// `Qwen3_VisionTransformer` on `Qwen3_5MoeForConditionalGeneration` and
+// `Qwen3_5ForConditionalGeneration` (pinned `qwen3_5.py`) over two text
+// backbones, so the tower, the processor, the MRoPE index math and this driver
+// are shared and the ONLY difference is which backbone consumes the merger
+// output. Two implementations of one tower would drift; the dense one is gated
+// at image 32/32 + video 32/32. The dense instantiation calls exactly the
+// functions it called before, in the same order.
+//
+// `graph_decode_supported` mirrors what the arm's PRODUCTION forward routes to a
+// captured decode graph: the dense arm always (qwen3_5_dense.h), the MoE arm
+// only on the fp4 CUDA path (`ForwardQwen3_5Moe`, qwen3_5_moe.cpp) — a bf16 MoE
+// checkpoint decodes eagerly in production and so decodes eagerly here.
+template <class W>
+struct VLDecodeGraphFor;
+template <>
+struct VLDecodeGraphFor<Qwen3_5DenseWeights> {
+  using type = Qwen3_5DenseDecodeGraph;
+};
+template <>
+struct VLDecodeGraphFor<Qwen3_5MoeWeights> {
+  using type = Qwen3_5DecodeGraph;
+};
+
+static void VLEmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& ids,
+                        const Qwen3_5DenseWeights& w, const HfConfig& c) {
+  DenseEmbedInto(d, hidden, ids, w, c);
+}
+static void VLEmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& ids,
+                        const Qwen3_5MoeWeights& w, const HfConfig& c) {
+  EmbedInto(d, hidden, ids, w, c);
+}
+static DBuf VLForwardLayersFor(Dev d, const Tensor& hidden_in,
+                               const std::vector<int32_t>& positions,
+                               const CommonAttentionMetadata& am,
+                               const GDNAttentionMetadata& gm,
+                               const std::vector<PagedKvCache>& attn_kv,
+                               const std::vector<GdnStateCache>& gdn_state,
+                               const Qwen3_5DenseWeights& w, const HfConfig& c,
+                               const std::vector<int32_t>& logits_indices,
+                               const std::vector<float>* mrope_cos_sin) {
+  return DenseForwardLayers(d, hidden_in, positions, am, gm, attn_kv, gdn_state,
+                            w, c, logits_indices, /*hidden_tap=*/nullptr,
+                            mrope_cos_sin);
+}
+static DBuf VLForwardLayersFor(Dev d, const Tensor& hidden_in,
+                               const std::vector<int32_t>& positions,
+                               const CommonAttentionMetadata& am,
+                               const GDNAttentionMetadata& gm,
+                               const std::vector<PagedKvCache>& attn_kv,
+                               const std::vector<GdnStateCache>& gdn_state,
+                               const Qwen3_5MoeWeights& w, const HfConfig& c,
+                               const std::vector<int32_t>& logits_indices,
+                               const std::vector<float>* mrope_cos_sin) {
+  return ForwardLayers(d, hidden_in, positions, am, gm, attn_kv, gdn_state, w, c,
+                       logits_indices, /*hidden_tap=*/nullptr, mrope_cos_sin);
+}
+
+template <class W>
 static std::vector<int32_t> VLGenerateCoreGdn(
     Dev d, const std::vector<int32_t>& prompt_ids,
     const std::vector<float>& mm_main, const std::vector<bool>& mask,
     const std::vector<int32_t>& pos3_prefill, int64_t delta,
-    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
-    const HfConfig& config, int max_new_tokens) {
+    int32_t eos_token_id, const W& weights,
+    const HfConfig& config, int max_new_tokens,
+    bool graph_decode_supported = true) {
   Backend& backend = d.b;
   const int64_t H = config.hidden_size;
   const int64_t Hkv = config.num_key_value_heads;
@@ -8167,7 +9102,7 @@ static std::vector<int32_t> VLGenerateCoreGdn(
   std::vector<uint16_t> emb_bits(static_cast<size_t>(T0 * H));
   {
     DBuf hemb(d, DType::kBF16, {T0, H});
-    DenseEmbedInto(d, hemb, prompt_ids, weights, config);
+    VLEmbedInto(d, hemb, prompt_ids, weights, config);
     hemb.Download(d, emb_bits.data());
   }
   {
@@ -8196,10 +9131,9 @@ static std::vector<int32_t> VLGenerateCoreGdn(
     const CommonAttentionMetadata am = attn_meta(T0, 0);
     const GDNAttentionMetadata gm = gdn_prefill_meta(T0);
     const std::vector<int32_t> last_idx = {static_cast<int32_t>(T0 - 1)};
-    DBuf dlogits = DenseForwardLayers(d, merged.t(), pos1d_prefill, am, gm,
-                                      attn_kv, gdn_state, weights, config,
-                                      last_idx, /*hidden_tap=*/nullptr,
-                                      &mrope_prefill);
+    DBuf dlogits =
+        VLForwardLayersFor(d, merged.t(), pos1d_prefill, am, gm, attn_kv,
+                           gdn_state, weights, config, last_idx, &mrope_prefill);
     generated.push_back(VLArgMaxDevice(d, dlogits));
   }
 
@@ -8226,10 +9160,11 @@ static std::vector<int32_t> VLGenerateCoreGdn(
   const bool decode_eager =
       (std::getenv("VT_MM_DECODE_EAGER") != nullptr &&
        std::string(std::getenv("VT_MM_DECODE_EAGER")) == "1");
-  std::unique_ptr<Qwen3_5DenseDecodeGraph> dgraph;
-  if (!decode_eager)
-    dgraph = std::make_unique<Qwen3_5DenseDecodeGraph>(weights, config, d.q,
-                                                       /*max_num_reqs=*/1);
+  using DecodeGraph = typename VLDecodeGraphFor<W>::type;
+  std::unique_ptr<DecodeGraph> dgraph;
+  if (!decode_eager && graph_decode_supported)
+    dgraph = std::make_unique<DecodeGraph>(weights, config, d.q,
+                                           /*max_num_reqs=*/1);
   for (int step = 1; step < max_new_tokens; ++step) {
     if (generated.back() == eos_token_id) break;
     const int64_t abs_idx = T0 + (step - 1);  // sequence index of the fed token
@@ -8256,15 +9191,81 @@ static std::vector<int32_t> VLGenerateCoreGdn(
       const std::vector<int32_t> pos1d_dec = {static_cast<int32_t>(abs_idx)};
       const std::vector<float> mrope_dec = BuildMropeCosSinHost(pos3_dec, 1, config);
       DBuf tok(d, DType::kBF16, {1, H});
-      DenseEmbedInto(d, tok, one_id, weights, config);
-      DBuf dlogits = DenseForwardLayers(d, tok.t(), pos1d_dec, am, gm, attn_kv,
-                                        gdn_state, weights, config, {},
-                                        /*hidden_tap=*/nullptr, &mrope_dec);
+      VLEmbedInto(d, tok, one_id, weights, config);
+      DBuf dlogits = VLForwardLayersFor(d, tok.t(), pos1d_dec, am, gm, attn_kv,
+                                        gdn_state, weights, config, {}, &mrope_dec);
       generated.push_back(VLArgMaxDevice(d, dlogits));
     }
   }
   return generated;
 }
+
+// ── Shared image / video PREFILL PLAN (both arms). ──────────────────────────
+// The merge mask, the mm_main row-count check and the MRoPE 3-D prefill
+// positions + decode continuation delta. NONE of this depends on the text
+// backbone — the tower, the processor and the rope-index math are shared between
+// `Qwen3_5ForConditionalGeneration` (dense 27B) and
+// `Qwen3_5MoeForConditionalGeneration` (MoE 35B) upstream — so it is computed
+// once here rather than copied per arm (issue #891).
+namespace {
+struct VLPrefillPlan {
+  std::vector<bool> mask;
+  std::vector<int32_t> pos3_prefill;
+  int64_t delta = 0;
+};
+
+// spatial_merge_size is 2 for the whole Qwen3-VL lineage (not a text-config
+// field; matches the 4B, the 27B and the 35B `vision_config`).
+constexpr int64_t kVLSpatialMergeSize = 2;
+
+VLPrefillPlan VLPlanImage(const std::vector<int32_t>& prompt_ids,
+                          const std::vector<float>& mm_main, int64_t H,
+                          const std::array<int64_t, 3>& grid_thw,
+                          int32_t image_token_id) {
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  VLPrefillPlan plan;
+  plan.mask.assign(static_cast<size_t>(T0), false);
+  int64_t offset = -1, n_img = 0;
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
+      if (offset < 0) offset = t;
+      plan.mask[static_cast<size_t>(t)] = true;
+      ++n_img;
+    }
+  }
+  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
+  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
+  plan.pos3_prefill = multimodal::Qwen3VLGetRopeIndex(
+      prompt_ids, spans, kVLSpatialMergeSize, &plan.delta);
+  return plan;
+}
+
+VLPrefillPlan VLPlanVideo(const std::vector<int32_t>& prompt_ids,
+                          const std::vector<float>& mm_main, int64_t H,
+                          const std::array<int64_t, 3>& grid_thw,
+                          int32_t video_token_id, int32_t vision_start_token_id,
+                          int32_t vision_end_token_id) {
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  VLPrefillPlan plan;
+  plan.mask.assign(static_cast<size_t>(T0), false);
+  int64_t n_vid = 0;
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == video_token_id) {
+      plan.mask[static_cast<size_t>(t)] = true;
+      ++n_vid;
+    }
+  }
+  VT_CHECK(n_vid > 0, "qwen3_5 VL: no video token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_vid, "qwen3_5 VL: mm_main rows != video-token count");
+  plan.pos3_prefill = multimodal::Qwen3VLGetRopeIndexVideo(
+      prompt_ids, grid_thw, kVLSpatialMergeSize, vision_start_token_id,
+      video_token_id, vision_end_token_id, &plan.delta);
+  return plan;
+}
+}  // namespace
 
 std::vector<int32_t> Qwen3_5VLGenerateGreedy(
     const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
@@ -8273,33 +9274,11 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedy(
     const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
   Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
-  const int64_t H = config.hidden_size;
-  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
-
-  // Image span offset + visual mask + N.
-  int64_t offset = -1, n_img = 0;
-  std::vector<bool> mask(static_cast<size_t>(T0), false);
-  for (int64_t t = 0; t < T0; ++t) {
-    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
-      if (offset < 0) offset = t;
-      mask[static_cast<size_t>(t)] = true;
-      ++n_img;
-    }
-  }
-  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
-  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
-  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
-
-  // MRoPE 3-D positions [3,T0] + decode continuation delta. spatial_merge_size is
-  // 2 for the whole Qwen3-VL lineage (not a text-config field; matches the 4B).
-  const int64_t sms = 2;
-  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
-  int64_t delta = 0;
-  const std::vector<int32_t> pos3_prefill =
-      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, sms, &delta);
-
-  return VLGenerateCoreGdn(d, prompt_ids, mm_main, mask, pos3_prefill, delta,
-                           eos_token_id, weights, config, max_new_tokens);
+  const VLPrefillPlan plan = VLPlanImage(prompt_ids, mm_main, config.hidden_size,
+                                         grid_thw, image_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens);
 }
 
 // ── M3d: the Qwen3.6-27B GDN-hybrid VL video->text greedy driver. ───────────
@@ -8319,31 +9298,71 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedyVideo(
     const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
   Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
-  const int64_t H = config.hidden_size;
-  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  const VLPrefillPlan plan =
+      VLPlanVideo(prompt_ids, mm_main, config.hidden_size, grid_thw,
+                  video_token_id, vision_start_token_id, vision_end_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens);
+}
 
-  // Video merge mask (all video_token_id positions across all frames).
-  int64_t n_vid = 0;
-  std::vector<bool> mask(static_cast<size_t>(T0), false);
-  for (int64_t t = 0; t < T0; ++t) {
-    if (prompt_ids[static_cast<size_t>(t)] == video_token_id) {
-      mask[static_cast<size_t>(t)] = true;
-      ++n_vid;
-    }
-  }
-  VT_CHECK(n_vid > 0, "qwen3_5 VL: no video token in prompt");
-  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
-  VT_CHECK(N == n_vid, "qwen3_5 VL: mm_main rows != video-token count");
+// ── issue #891: the Qwen3.6-35B-A3B MoE GDN-hybrid VL image / video drivers. ──
+//
+// The MoE arm of the SAME model family. Upstream's
+// `Qwen3_5MoeForConditionalGeneration` composes the SAME `Qwen3_VisionTransformer`
+// as `Qwen3_5ForConditionalGeneration` over the MoE text backbone (pinned vLLM
+// `qwen3_5.py`), and `deepstack_visual_indexes: []` compiles the deepstack path
+// out for the whole family (`qwen3_vl.py:1709-1716`). So these are the dense
+// drivers above with `Qwen3_5MoeWeights` substituted: the SAME shared tower
+// (`LoadQwen3_5MoeVision` -> `LoadQwen3VLVisionWeights` ->
+// `Qwen3VLVisionForward`), the SAME processor, the SAME MRoPE index math
+// (`VLPlanImage` / `VLPlanVideo`) and the SAME greedy core
+// (`VLGenerateCoreGdn<Qwen3_5MoeWeights>`).
+//
+// GATED ON MM INPUT: these are separate entry points, reached only when a request
+// carries an image or a video. A text-only request never enters here — it goes
+// through the registered `ForwardQwen3_5Moe`, which is untouched, so the text
+// path executes the identical instruction sequence it did before.
+//
+// DECODE GRAPH: `graph_decode_supported` mirrors `ForwardQwen3_5Moe`'s own
+// routing — the MoE decode graph is taken only on the fp4 CUDA path, so a bf16
+// checkpoint (`Qwen/Qwen3.6-35B-A3B`) decodes eagerly here exactly as it does in
+// production text decode.
+namespace {
+bool MoeDecodeGraphSupported(const Qwen3_5MoeWeights& weights) {
+  return !weights.layers.empty() &&
+         !weights.layers.front().moe.expert_gate_fp4.empty();
+}
+}  // namespace
 
-  // MRoPE 3-D positions [3,T0] + decode delta via the per-frame video scan.
-  const int64_t sms = 2;
-  int64_t delta = 0;
-  const std::vector<int32_t> pos3_prefill = multimodal::Qwen3VLGetRopeIndexVideo(
-      prompt_ids, grid_thw, sms, vision_start_token_id, video_token_id,
-      vision_end_token_id, &delta);
+std::vector<int32_t> Qwen3_5MoeVLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const VLPrefillPlan plan = VLPlanImage(prompt_ids, mm_main, config.hidden_size,
+                                         grid_thw, image_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens, MoeDecodeGraphSupported(weights));
+}
 
-  return VLGenerateCoreGdn(d, prompt_ids, mm_main, mask, pos3_prefill, delta,
-                           eos_token_id, weights, config, max_new_tokens);
+std::vector<int32_t> Qwen3_5MoeVLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const VLPrefillPlan plan =
+      VLPlanVideo(prompt_ids, mm_main, config.hidden_size, grid_thw,
+                  video_token_id, vision_start_token_id, vision_end_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens, MoeDecodeGraphSupported(weights));
 }
 
 ForwardLogits Qwen3_5DenseModel::ForwardDevice(
@@ -8419,6 +9438,10 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   const int64_t H = config.hidden_size;
   VT_CHECK(static_cast<int64_t>(hidden_in.size()) == T * H,
            "qwen3_5 replay: hidden_in must be [T*H]");
+  // ONE decode step. This replays a single layer as a self-contained unit of
+  // work, so the slices it takes are finished with when it returns; without a
+  // boundary they stay pinned for the life of the process (#1091 finding 3).
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev d{vt::GetBackend(queue.device.type), queue};
 
   // Seed the fused stream with the combined residual input: res = hidden_in,
@@ -8875,11 +9898,16 @@ struct Qwen3_5DecodeGraph::Impl {
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
       gdn_meta.num_spec_decodes = gm.num_spec_decodes;
       gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
-      // Spec-decode segmentation (SPEC-MTP I5a). All empty on the pure-decode
-      // graph path (spec never captures — ValidateGdnDecodeGraphState rejects a
-      // spec batch), so these copies are inert here; carried for completeness so
-      // a future spec-capable graph slot refreshes the full metadata. CopyInPlace
-      // on an empty optional is a no-op, keeping the default path byte-identical.
+      // Spec-decode segmentation (SPEC-MTP I5a). This comment used to say "spec
+      // never captures -- ValidateGdnDecodeGraphState rejects a spec batch", and
+      // that stopped being true when SPEC-DSPARK W8 (#442) RE-EXPRESSED that
+      // assertion to admit a uniform pure spec batch (`:469-497`). These copies
+      // are therefore INERT ONLY on the pure-decode path, where the optionals are
+      // empty and CopyInPlace is a no-op. On a captured SPEC step they carry the
+      // step's real segmentation and are load-bearing. Corrected while auditing
+      // the graph layer for MTP depth (#81), and the residual ambiguity that
+      // audit found is [#1020]: the slot ring is keyed on S alone, and two
+      // different uniform query lengths can now reach one key.
       CopyInPlace(gdn_meta.spec_state_indices_tensor, gm.spec_state_indices_tensor);
       CopyInPlace(gdn_meta.spec_query_start_loc, gm.spec_query_start_loc);
       CopyInPlace(gdn_meta.spec_sequence_masks, gm.spec_sequence_masks);
@@ -9148,7 +10176,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       try {
         return ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                              s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                             impl_->config, {}, nullptr, aux_ids_arg, aux_out_arg,
+                             impl_->config, {}, nullptr, /*mrope_cos_sin=*/nullptr,
+                             aux_ids_arg, aux_out_arg,
                              dbuf ? s.dev.get() : nullptr);
       } catch (...) {
         void* g = nullptr;
@@ -9177,7 +10206,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, s.gdn_meta,
                           attn_kv, gdn_state, impl_->weights, impl_->config, {},
-                          nullptr, aux_ids_arg, aux_out_arg);
+                          nullptr, /*mrope_cos_sin=*/nullptr, aux_ids_arg,
+                          aux_out_arg);
   s.warm = true;
   s.captured = false;
   publish_aux();
@@ -9297,11 +10327,16 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
       gdn_meta.num_spec_decodes = gm.num_spec_decodes;
       gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
-      // Spec-decode segmentation (SPEC-MTP I5a). All empty on the pure-decode
-      // graph path (spec never captures — ValidateGdnDecodeGraphState rejects a
-      // spec batch), so these copies are inert here; carried for completeness so
-      // a future spec-capable graph slot refreshes the full metadata. CopyInPlace
-      // on an empty optional is a no-op, keeping the default path byte-identical.
+      // Spec-decode segmentation (SPEC-MTP I5a). This comment used to say "spec
+      // never captures -- ValidateGdnDecodeGraphState rejects a spec batch", and
+      // that stopped being true when SPEC-DSPARK W8 (#442) RE-EXPRESSED that
+      // assertion to admit a uniform pure spec batch (`:469-497`). These copies
+      // are therefore INERT ONLY on the pure-decode path, where the optionals are
+      // empty and CopyInPlace is a no-op. On a captured SPEC step they carry the
+      // step's real segmentation and are load-bearing. Corrected while auditing
+      // the graph layer for MTP depth (#81), and the residual ambiguity that
+      // audit found is [#1020]: the slot ring is keyed on S alone, and two
+      // different uniform query lengths can now reach one key.
       CopyInPlace(gdn_meta.spec_state_indices_tensor, gm.spec_state_indices_tensor);
       CopyInPlace(gdn_meta.spec_query_start_loc, gm.spec_query_start_loc);
       CopyInPlace(gdn_meta.spec_sequence_masks, gm.spec_sequence_masks);
@@ -9558,8 +10593,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // Drain the capture if the forward throws — see the 35B driver above for why
     // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
     // is the 27B DENSE driver, and it is the one that matters most here: the
-    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is confined to the
-    // 27B by construction, since the 35B is MoE and its GdnOutDType is f32.
+    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is off by DEFAULT
+    // (GdnFp8InBf16Enabled), which is the only thing keeping it inert on the
+    // 35B. It used to read "confined to the 27B by construction, since the 35B
+    // is MoE and its GdnOutDType is f32"; GDN-MOE-BF16-OUT (#1168) made outdt
+    // BF16 on both arms, so the bound is a toggle now, not a model shape.
     DBuf lg = [&] {
       try {
         return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,

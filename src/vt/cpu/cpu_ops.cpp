@@ -532,6 +532,209 @@ uint8_t F32ToFp8(float f) {
                               static_cast<uint8_t>(mant));
 }
 
+// --- Static per-tensor FP8 W8A8 (VT-FP8-W8A8-CPU-ARM, #468). The CPU arm of the
+// path vLLM's ModelOptFp8LinearMethod runs: a static per-tensor activation quant
+// followed by a per-tensor fp8 GEMM. It exists so the fp8 seam is reachable, and
+// therefore testable, without a GPU.
+
+// QuantFp8Static CPU kernel — mirror of vLLM's static_scaled_fp8_quant
+// (csrc/quantization/w8a8/fp8/common.cuh:58-77 `scaled_fp8_conversion`):
+//   x = val * scale;  r = fmaxf(-448, fminf(x, 448));  hardware RNE convert
+// with the RECIPROCAL formed ONCE outside the loop, exactly as upstream forms it
+// (csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31 `1.0f / scale[...]`)
+// and exactly as our CUDA kernel does (cuda_matmul_fp8_cutlass.cu: `const float
+// inv = 1.0f / input_scale;` then `LoadIn(x, i) * inv`). It is a MULTIPLY BY THE
+// RECIPROCAL, not a divide: the two differ by up to one f32 ulp before the fp8
+// round, and near an e4m3 tie that ulp changes the emitted byte.
+//
+// F32ToFp8 supplies both remaining halves: it saturates (|a| >= 448 -> 0x7E,
+// which IS the encoding of 448, so clamp-then-convert and saturating-convert
+// coincide because 448 is the largest finite e4m3fn value) and it rounds to
+// nearest-even. The scale is per-TENSOR — upstream collapses the per-shard
+// input_scale to one scalar with `.max()` (modelopt.py:528) and then treats
+// `scale.numel() == 1` as a single group spanning the whole tensor
+// (common.cu:204-210). LoadF32 widens a bf16 x to f32 BEFORE the multiply, as
+// the CUDA kernel's LoadIn overload does, so both backends round at one point.
+void QuantFp8StaticKernel(Queue&, Tensor& out_fp8, const Tensor& x, float input_scale) {
+  const int64_t n = x.shape[0] * x.shape[1];
+  const float inv_scale = 1.0F / input_scale;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) op[i] = F32ToFp8(LoadF32(x, i) * inv_scale);
+  });
+}
+
+// --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 M1). QuantFp8Group CPU kernel:
+// the DYNAMIC per-token, per-group activation quant.
+//
+// MIRROR OF THE KERNEL THAT ACTUALLY EXECUTES, which is the C++ custom op and
+// not the Triton kernel. `per_token_group_quant_fp8` calls
+// `torch.ops._C.per_token_group_fp8_quant` and RETURNS whenever the platform is
+// CUDA-alike and the input is contiguous
+// (vllm/model_executor/layers/quantization/utils/fp8_utils.py:635-650), so the
+// Triton kernel below it never runs there. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps                  eps SEEDS the reduction
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit       a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)   a DIVIDE
+//   :86  DST_DTYPE(q)                              hardware e4m3 RNE
+//
+// TWO DIVIDES, DELIBERATELY, and this is the opposite of QuantFp8StaticKernel
+// forty lines above. That kernel multiplies by a hoisted reciprocal because
+// upstream ships the reciprocal there (common.cuh:62, with `1.0f / scale`
+// formed by the caller at common.cu:31). Here upstream ships a divide, and the
+// scale changes per group, so there is no loop-invariant reciprocal to hoist in
+// the first place. The Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) differs by up to one f32 ulp and carries an upstream
+// comment saying so. Near an e4m3 tie that ulp changes the emitted byte.
+// tests/vt/test_ops_quant_fp8_group_cpu.cpp G1 compares BYTES for this reason;
+// upstream's own test compares values at rtol=0.15 and cannot see it.
+//
+// eps is the reduction's INITIAL value rather than a clamp afterwards. The two
+// are numerically identical, and writing it upstream's way makes it visible
+// that an all-zero group yields y_s = 1e-10/448 instead of dividing by zero.
+//
+// LoadF32 widens a bf16 x to f32 before the absolute value and before the
+// divide, matching `fabsf(static_cast<float>(src))` at :53 and
+// `static_cast<float>(src) / y_s` at :85, so a bf16 input rounds at one point.
+// Parallel over ROWS: each row's groups are independent, and the reduction
+// order inside a group is fixed and sequential, so the result does not depend
+// on the thread count.
+void QuantFp8GroupKernel(Queue&, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                         int group_size) {
+  const int64_t m = x.shape[0], k = x.shape[1];
+  const int64_t groups = k / group_size;
+  constexpr float kEps = 1e-10F;      // fp8_utils.py:570, the only value any
+                                      // upstream call site passes
+  constexpr float kFp8MaxV = 448.0F;  // quant_utils.py:27-35 finfo(e4m3fn).max
+  constexpr float kFp8MinV = -448.0F;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  float* sp = out_scale.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      for (int64_t g = 0; g < groups; ++g) {
+        const int64_t base = r * k + g * group_size;
+        float amax = kEps;
+        for (int64_t i = 0; i < group_size; ++i)
+          amax = std::fmax(amax, std::fabs(LoadF32(x, base + i)));
+        const float y_s = amax / kFp8MaxV;
+        sp[r * groups + g] = y_s;
+        for (int64_t i = 0; i < group_size; ++i)
+          op[base + i] =
+              F32ToFp8(std::fmin(std::fmax(LoadF32(x, base + i) / y_s, kFp8MinV), kFp8MaxV));
+      }
+    }
+  });
+}
+
+// --- Block-wise FP8 (VT-MATMUL-FP8-BLOCK-REF, #1189 M2). MatmulFp8BlockScaled
+// CPU kernel: the 128x128 block-scaled fp8 GEMM, mirroring
+// native_w8a8_block_matmul (tests/kernels/quant_utils.py:91-154).
+//
+// THE SCALES APPLY IN THE MAINLOOP, ONCE PER K-BLOCK. `part` is a SEPARATE f32
+// accumulator that is scaled and only then folded into `acc`. That separation is
+// the whole point of the op: MatmulFp8CutlassKernel fifty lines below folds one
+// scalar alpha AFTER the whole K reduction, which has exactly one degree of
+// freedom per output element while this scheme has cdiv(K, block_k) of them. An
+// epilogue-only application cannot express a per-K-block scale AT ALL. Collapsing
+// `part` into `acc` here IS that epilogue form, and
+// tests/vt/test_ops_matmul_fp8_block_cpu.cpp G4 is constructed so it cannot pass.
+//
+// The scale PRODUCT is formed first, `part * (a_s * b_s)`, mirroring
+// `s = As_tiles[i] * Bs[j][i]` then `c += matmul(a, b.t()) * s`
+// (quant_utils.py:150-151). The kernel that executes upstream is CUTLASS, not
+// Triton (vllm/model_executor/kernels/linear/__init__.py:355-377,
+// vllm/utils/deep_gemm.py:27-46), and it associates left to right --
+// `accum(i) += tmp_accum(i) * tCrScaleAViewAsC(i) * tCrScaleBViewAsC(i)`, cutlass
+// 4.5.0 sm120_mma_tma_blockwise_scaling.hpp:714-717. The two differ by at most one
+// f32 ULP per K-block, and upstream's own gate is what admits it: it compares the
+// CUTLASS arm against THIS reference at rel_diff < 0.001
+// (test_block_fp8.py:194-200). We mirror the reference, because this op is the
+// reference port.
+//
+// `col / block_n` indexes the b_scale ROW by OUTPUT COLUMN, mirroring
+// `offs_bsn = offs_bn // group_n` (fp8_utils.py:823) and the reference's tiling
+// (quant_utils.py:131-143). For a round N that agrees with a tile counter; for a
+// ragged N it does not, which is why N=576 is in the ported grid.
+//
+// CEIL tiling and a short final K-tile: `k1 = min(k0 + block_k, k)`
+// (quant_utils.py:131-141). Upstream's wrapper asserts the ceil shapes
+// (fp8_utils.py:935-936), so a ragged block is legal rather than tolerated.
+//
+// A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH, in the same sense as
+// MatmulFp8CutlassKernel below: a naive nest that makes the block-fp8 seam
+// resolvable on a CPU queue so #1189 milestones M3 and M4 can be gated without a
+// GPU. It makes no speed claim. M5 owns the CUDA arm and will be measured
+// against this one. Parallel over ROWS; each output row is independent and the
+// reduction order inside a row is fixed, so the result does not depend on the
+// thread count.
+void MatmulFp8BlockScaledKernel(Queue&, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
+                                const Tensor& b_fp8, const Tensor& b_scale, int block_n,
+                                int block_k) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  const int64_t k_tiles = (k + block_k - 1) / block_k;
+  const auto* ap = a_fp8.Ptr<uint8_t>();
+  const auto* bp = b_fp8.Ptr<uint8_t>();
+  const auto* asp = a_scale.Ptr<float>();
+  const auto* bsp = b_scale.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    std::vector<float> arow(static_cast<size_t>(k));
+    for (int64_t i = r0; i < r1; ++i) {
+      // Decode the A row once and reuse it across N, as MatmulNvfp4Fp4Kernel does.
+      for (int64_t kk = 0; kk < k; ++kk)
+        arow[static_cast<size_t>(kk)] = Fp8ToF32(ap[i * k + kk]);
+      for (int64_t col = 0; col < n; ++col) {
+        const int64_t nb = col / block_n;   // fp8_utils.py:823
+        float acc = 0.0F;
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+          const int64_t k0 = kt * block_k;
+          const int64_t k1 = std::min(k0 + static_cast<int64_t>(block_k), k);
+          float part = 0.0F;                // the MAINLOOP register, kept separate
+          for (int64_t kk = k0; kk < k1; ++kk)
+            part += arow[static_cast<size_t>(kk)] * Fp8ToF32(bp[col * k + kk]);
+          acc += part * (asp[i * k_tiles + kt] * bsp[nb * k_tiles + kt]);
+        }
+        StoreF32(out, i * n + col, acc);
+      }
+    }
+  });
+}
+
+// MatmulFp8Cutlass CPU kernel: out[m,n] = alpha * Sum_k f8val(a[m,k])*f8val(b[n,k]),
+// f32 accumulate, ONE folded alpha (= input_scale*weight_scale — our recorded
+// deviation from upstream's two epilogue scalars, see include/vt/ops.h).
+//
+// A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH. It is a naive triple loop; it
+// makes no speed claim and nothing routes a production model through it. Its
+// purpose is that the fp8 GEMM seam resolves on a CPU queue so the surrounding
+// wiring can be gated without a GPU (#468).
+//
+// It is deliberately NOT a bit-mirror of the CUDA GEMM and does not claim to be:
+// the CUDA arm reduces K in tensor-core order and rounds its epilogue through
+// bf16, so the two agree to fp8/bf16 tolerance. Only the QUANT half above carries
+// a bit-exactness claim. Shaped like MatmulNvfp4Fp4Kernel: the A row is decoded
+// once per M and reused across N.
+void MatmulFp8CutlassKernel(Queue&, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                            float alpha) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  const auto* ap = a_fp8.Ptr<uint8_t>();
+  const auto* bp = b_fp8.Ptr<uint8_t>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    std::vector<float> arow(static_cast<size_t>(k));
+    for (int64_t i = r0; i < r1; ++i) {
+      for (int64_t kk = 0; kk < k; ++kk)
+        arow[static_cast<size_t>(kk)] = Fp8ToF32(ap[i * k + kk]);
+      for (int64_t col = 0; col < n; ++col) {
+        float acc = 0.0F;
+        for (int64_t kk = 0; kk < k; ++kk)
+          acc += arow[static_cast<size_t>(kk)] * Fp8ToF32(bp[col * k + kk]);
+        StoreF32(out, i * n + col, alpha * acc);
+      }
+    }
+  });
+}
+
 // Fused fp8 RMSNorm -> static per-tensor quant (mirror vLLM Inductor
 // fused_add_rms_norm_static_fp8_quant, rms_quant_fusion.py:124). Same reduction
 // order as RmsNormKernel; the fp8 is taken from the SAME bf16-rounded normed value
@@ -3120,6 +3323,15 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
+    RegisterOp(OpId::kQuantFp8Static, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernel)));
+    RegisterOp(OpId::kQuantFp8Group, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QuantFp8GroupFn>(&QuantFp8GroupKernel)));
+    RegisterOp(OpId::kMatmulFp8Cutlass, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFp8CutlassFn>(&MatmulFp8CutlassKernel)));
+    RegisterOp(OpId::kMatmulFp8BlockScaled, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulFp8BlockScaledFn>(&MatmulFp8BlockScaledKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
     RegisterOp(OpId::kGeluAndMul, DeviceType::kCPU,

@@ -260,6 +260,11 @@ struct SyntheticDit {
   // Must stay 0: a NaN weight is not something a real checkpoint stores, and it
   // makes a gate compare nan against nan.
   int64_t fp8_nonfinite_elements = 0;
+  // The rank-2 WEIGHTS the kNone arm stores unquantized, and how many of them a
+  // whole-model comparison therefore covers. Zero on the two quantized arms,
+  // where the same tensors take a dequantizing branch instead.
+  int64_t unquantized_weight_tensors = 0;
+  int64_t unquantized_weight_elements = 0;
 };
 
 SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
@@ -270,7 +275,17 @@ SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
     int64_t numel = 1;
     for (int64_t d : spec.shape) numel *= d;
     const bool table = IsTable(spec.name);
-    const bool quantized = spec.shape.size() == 2 && !table;
+    // On the kNone arm NOTHING is quantized. Every weight is stored at the model
+    // dtype and no scale sidecar is written anywhere, which is exactly what
+    // `ltx-2.5-22b-dev-transformer-bf16.safetensors` carries: 4059 BF16 tensors,
+    // 290 F32 (the six scale_shift_table families, which this fixture also keeps
+    // F32), and ZERO names ending in `_scale`, `_scale_2` or `torchao_nvfp4`.
+    const bool quantized =
+        quant != Ltx2DitQuant::kNone && spec.shape.size() == 2 && !table;
+    if (!quantized && !table && spec.shape.size() == 2) {
+      ++out.unquantized_weight_tensors;
+      out.unquantized_weight_elements += numel;
+    }
 
     if (table) {
       std::vector<float> v(static_cast<size_t>(numel));
@@ -894,13 +909,37 @@ TEST_CASE("ltx2 loader: the L2 contract's every name is present in the shipped D
   // (.agents/specs/ltx-2-5.md §1.2) and the module is PORTED
   // (.agents/specs/ltx25-prompt-adaln.md, issue #644).
   CHECK(p.use_prompt_adaln_single);
+  // MEASURED the same way: the SHIPPED vonkaiser FP8 checkpoint carries
+  // `keyframes_abs_pos_embedding`, so `supports_keyframes_abs_pos_embedding`
+  // (model.py:166-173) holds for it and the marker is live on every forward.
+  // This is the file's OWN evidence that ltx2.h's old "LTX-2.5's checkpoint does
+  // not carry the parameter" was false (row LTX25-KEYFRAMES-ABS-POS, issue #658).
+  CHECK(p.use_keyframes_abs_pos_embedding);
+  {
+    // The tensor the flag was resolved from, named and shaped, with a positive
+    // control in the same loop so "found it" is not an artefact of the search.
+    int64_t found = 0;
+    int64_t control = 0;
+    for (const Ltx2TensorSpec& spec : manifest) {
+      if (spec.name == "keyframes_abs_pos_embedding") {
+        ++found;
+        CHECK(spec.shape == std::vector<int64_t>{1, 4096});
+      }
+      if (spec.name == "patchify_proj.weight") ++control;
+    }
+    CHECK(found == 1);
+    CHECK(control == 1);
+  }
 
   // Enumerate the contract AS THE FILE DESCRIBES IT — no flag is forced here any
   // more — and require every one of its names in the file. This line used to read
   // `contract.use_prompt_adaln_single = false`, which is the shape of the defect:
   // the gate agreed with the port about a module they were both dropping.
   const std::vector<Ltx2TensorSpec> want = vllm::EnumerateLtx2DitTensors(p);
-  CHECK(want.size() == 4078 + 12);
+  //   4078 = the original L2 contract
+  //     12 = prompt_adaln_single + audio_prompt_adaln_single (issue #644)
+  //      1 = keyframes_abs_pos_embedding (issue #658)
+  CHECK(want.size() == 4078 + 12 + 1);
   int64_t missing = 0;
   std::string first_missing;
   for (const Ltx2TensorSpec& spec : want) {
@@ -916,16 +955,19 @@ TEST_CASE("ltx2 loader: the L2 contract's every name is present in the shipped D
   // ... and account for every name the file has that the contract does not, so
   // "the rest is fine" is a counted claim rather than a hope.
   //   258 = 2 connectors x (8 blocks x 16 + 1 learnable_registers)
-  //     1 = keyframes_abs_pos_embedding
-  // The 12 prompt-AdaLN tensors are no longer here: they moved INTO `want` when
-  // the module was ported, which is the whole delta this row landed.
+  // NOTHING ELSE. `keyframes_abs_pos_embedding` used to be the `+ 1` on this
+  // line; it moved INTO `want` when row LTX25-KEYFRAMES-ABS-POS ported it, which
+  // is the whole delta this row lands — exactly as the 12 prompt-AdaLN tensors
+  // did before it. The unported group is now EMPTY for this checkpoint, and the
+  // only names outside the DiT contract are the two connectors, which
+  // `Ltx2LoadConnectorWeights` owns.
   std::set<std::string> want_set;
   for (const Ltx2TensorSpec& spec : want) want_set.insert(spec.name);
   int64_t extra = 0;
   for (const std::string& name : present) {
     if (want_set.count(name) == 0) ++extra;
   }
-  CHECK(extra == 258 + 1);
+  CHECK(extra == 258);
 }
 
 // ===========================================================================
@@ -1510,6 +1552,217 @@ TEST_CASE("ltx2 loader: the NVFP4 DiT arm materializes onto the same contract") 
   std::remove(path.c_str());
 }
 
+TEST_CASE("ltx2 loader: the UNQUANTIZED bf16 DiT materializes onto the same contract") {
+  // Issue #1148. `PlanDit` used to refuse any file carrying neither U8 nor
+  // F8_E4M3, so `ltx-2.5-22b-dev-transformer-bf16.safetensors` — the FULL model
+  // upstream's pipeline table names for `one_stage`, `t2a_one_stage`,
+  // `res2s_two_stage` and `a2vid_two_stage` — could not be read at all.
+  //
+  // THIS CASE IS A VALUE GATE, NOT A LOAD GATE. A load that succeeds and then
+  // materializes garbage passes any "did it throw" assertion, so every element
+  // of every contract weight is compared bit-for-bit against the bf16 this
+  // fixture wrote, and the fixture's own expectation is checked for the two
+  // shapes a stub could hit by accident: all-zero and all-one-value.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kNone, {});
+  const std::string path = TmpPath("bf16");
+  WriteSafetensors(syn.entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  // The fixture must actually EXERCISE the unquantized weight path. On the two
+  // quantized arms these same tensors take a dequantizing branch, so a zero here
+  // would mean this case only re-checks the biases the other arms already cover.
+  INFO("unquantized weight tensors = " << syn.unquantized_weight_tensors
+                                       << " elements = " << syn.unquantized_weight_elements);
+  CHECK(syn.unquantized_weight_tensors > 0);
+  CHECK(syn.unquantized_weight_elements > 0);
+  // ...and nothing about the file is quantized: no sidecar, no marker.
+  int64_t sidecars = 0;
+  for (const StEntry& e : syn.entries) {
+    if (e.name.size() >= 6 && e.name.compare(e.name.size() - 6, 6, "_scale") == 0) ++sidecars;
+    if (e.dtype == "U8" || e.dtype == "F8_E4M3") ++sidecars;
+  }
+  CHECK(sidecars == 0);
+
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.quant == Ltx2DitQuant::kNone);
+  CHECK(ck.unported.empty());
+  CHECK(ck.params.num_layers == p.num_layers);
+  CHECK(ck.params.inner_dim() == p.inner_dim());
+  CHECK(ck.params.audio_inner_dim() == p.audio_inner_dim());
+  CHECK_FALSE(ck.params.ff_bias);
+  CHECK(ck.params.audio_ff_bias);
+
+  // THE EXPECTATION IS NOT REACHABLE BY ACCIDENT. Counted before it is used:
+  // a zero-filled materialization scores 0 non-zero, and any constant fill
+  // scores 1 distinct value. Both are the shapes this campaign has shipped a
+  // green test against twice.
+  int64_t want_total = 0, want_nonzero = 0;
+  std::set<uint16_t> want_distinct;
+  for (const auto& kv : syn.expected) {
+    for (const uint16_t v : kv.second) {
+      ++want_total;
+      if (v != 0) ++want_nonzero;
+      want_distinct.insert(v);
+    }
+  }
+  INFO("expected total = " << want_total << " nonzero = " << want_nonzero
+                           << " distinct = " << static_cast<int64_t>(want_distinct.size()));
+  CHECK(want_total > 0);
+  CHECK(want_nonzero == want_total);
+  CHECK(static_cast<int64_t>(want_distinct.size()) > 1000);
+
+  int64_t checked = 0, bad = 0, rank2 = 0;
+  std::string first_bad;
+  for (const auto& kv : syn.expected) {
+    auto it = ck.views.find(kv.first);
+    REQUIRE(it != ck.views.end());
+    const vt::Tensor& t = it->second;
+    // bf16 stays bf16. Widening here would still pass a value comparison, and
+    // no gate this project owns can see a dtype that is too WIDE.
+    REQUIRE(t.dtype == vt::DType::kBF16);
+    if (t.rank == 2) ++rank2;
+    const uint16_t* got = t.Ptr<uint16_t>();
+    for (size_t i = 0; i < kv.second.size(); ++i) {
+      ++checked;
+      if (got[i] != kv.second[i]) {
+        ++bad;
+        if (first_bad.empty()) first_bad = kv.first;
+      }
+    }
+  }
+  const std::string count_msg = "checked=" + std::to_string(checked) + " bad=" +
+                                std::to_string(bad) + " rank2=" + std::to_string(rank2) +
+                                " first=" + first_bad;
+  INFO(count_msg);
+  CHECK(checked == want_total);
+  CHECK(bad == 0);
+  CHECK(rank2 == syn.unquantized_weight_tensors);
+
+  // The tables stay F32 because the CHECKPOINT stores them F32 — the shipped dev
+  // transformer's 290 F32 tensors are exactly these six families.
+  auto tbl = ck.views.find("scale_shift_table");
+  REQUIRE(tbl != ck.views.end());
+  CHECK(tbl->second.dtype == vt::DType::kF32);
+  const size_t table_n = static_cast<size_t>(2 * p.inner_dim());
+  std::vector<float> table_got(tbl->second.Ptr<float>(), tbl->second.Ptr<float>() + table_n);
+  std::vector<float> table_want(table_n, 0.0F);
+  for (size_t i = 0; i < table_n; ++i) table_want[i] = TrueValue("scale_shift_table", i);
+  const double table_max_abs = vllm_test::MaxAbsDiff(table_got, table_want);
+  INFO("table max abs = " << table_max_abs);
+  CHECK(table_max_abs == 0.0);
+
+  std::remove(path.c_str());
+}
+
+TEST_CASE("ltx2 loader: a DiT mixing the two quantized encodings is still refused") {
+  // The sibling branch of the refusal #1148 removed. Splitting one `if` into a
+  // decision with three outcomes is exactly where a mixed file could start
+  // resolving to kNone and load half one way, so the branch that must SURVIVE is
+  // gated beside the one that must go.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit fp8 = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const SyntheticDit nvfp4 = BuildSyntheticDit(p, Ltx2DitQuant::kNvfp4, {});
+  // Take the FP8 file and replace ONE module's weight with the NVFP4 arm's
+  // U8 + two sidecars, which is what a half-requantized checkpoint looks like.
+  const std::string swap =
+      std::string(vllm::kLtx2DitCheckpointPrefix) + "transformer_blocks.0.attn1.to_q.weight";
+  std::vector<StEntry> mixed;
+  bool removed = false, added = false;
+  for (const StEntry& e : fp8.entries) {
+    if (e.name == swap || e.name == swap + "_scale") {
+      removed = true;
+      continue;
+    }
+    mixed.push_back(e);
+  }
+  for (const StEntry& e : nvfp4.entries) {
+    if (e.name == swap || e.name == swap + "_scale" || e.name == swap + "_scale_2") {
+      mixed.push_back(e);
+      added = true;
+    }
+  }
+  REQUIRE(removed);
+  REQUIRE(added);
+  const std::string path = TmpPath("mixed");
+  WriteSafetensors(mixed, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  bool named = false;
+  std::string what;
+  try {
+    vllm::Ltx2LoadDitFromSafetensors(file);
+  } catch (const std::exception& e) {
+    what = e.what();
+    named = what.find("BOTH") != std::string::npos;
+  }
+  const std::string mixed_msg = "what: " + what;
+  INFO(mixed_msg);
+  CHECK(named);
+  std::remove(path.c_str());
+}
+
+TEST_CASE("ltx2 loader: a DiT in a dtype this loader cannot read refuses by NAME, not in a circle") {
+  // What replaced "A bf16 DiT is not what phase L6 loads; use the L2 path." That
+  // advice was unreachable — `Ltx2LoadDitFromSafetensors` IS the L2 path and
+  // calls `PlanDit` on its first line — so the refusal that survives has to name
+  // the dtypes the file actually carries and the ones this loader reads.
+  //
+  // F16 is the case upstream would accept and this port does not:
+  // `_DTYPE_CASTABLE` (single_gpu_model_builder.py:51-57 @ `fd4ded7f`) lists
+  // torch.float16 beside bfloat16, so such a file is legal upstream.
+  //
+  // EVERY tensor is retyped, tables included, and that is load-bearing. This case
+  // first retyped only the BF16 ones, which left the F32 `scale_shift_table`
+  // families in place — so `PlanDit` still saw a dtype it reads, resolved kNone,
+  // and the refusal came from `MaterializeDitTensor` instead. Both messages
+  // happen to satisfy both assertions below, so the case passed while the branch
+  // it exists for was never reached: mutation M5 put "use the L2 path" back into
+  // the surviving `PlanDit` refusal and this suite stayed GREEN. Caught by that
+  // mutation, not by reading.
+  const Ltx2DitParams p = TinyParams();
+  SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kNone, {});
+  int64_t retyped = 0, halved = 0;
+  for (StEntry& e : syn.entries) {
+    if (e.dtype == "F32") {
+      // The reader cross-checks `numel * dtype_size == nbytes` for every dtype it
+      // knows (safetensors_reader.cpp:165-173), and F16 is half of F32. The
+      // CONTENT is irrelevant: `PlanDit` reads dtypes and shapes and refuses
+      // before a payload is touched.
+      e.bytes.resize(e.bytes.size() / 2);
+      ++halved;
+    }
+    e.dtype = "F16";
+    ++retyped;
+  }
+  REQUIRE(retyped > 0);
+  REQUIRE(halved > 0);
+  const std::string path = TmpPath("f16");
+  WriteSafetensors(syn.entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  std::string what;
+  try {
+    vllm::Ltx2LoadDitFromSafetensors(file);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  const std::string f16_msg = "what: " + what;
+  INFO(f16_msg);
+  // It is `PlanDit`'s refusal and not a later one, which is what makes the two
+  // assertions below statements about the branch this row wrote.
+  CHECK(what.find("no weight this loader can read") != std::string::npos);
+  // It names what the file carries...
+  CHECK(what.find("F16") != std::string::npos);
+  // ...and the four encodings it does read, so the reader learns what to convert
+  // to rather than only that they were wrong.
+  CHECK(what.find("F8_E4M3") != std::string::npos);
+  CHECK(what.find("BF16") != std::string::npos);
+  // ...and it does NOT send the reader back to the path that just refused.
+  CHECK(what.find("L2 path") == std::string::npos);
+  std::remove(path.c_str());
+}
+
 TEST_CASE("ltx2 loader: a missing tensor throws BY NAME and never reads as zeros") {
   const Ltx2DitParams p = TinyParams();
   SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
@@ -1544,9 +1797,14 @@ TEST_CASE("ltx2 loader: a missing tensor throws BY NAME and never reads as zeros
 
 TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed") {
   const Ltx2DitParams p = TinyParams();
+  // `caption_projection` is the 19B form the DiT would carry under
+  // `caption_proj_before_connector=false` (text_projection.py:31-38), which phase
+  // L3 owes. It replaced `keyframes_abs_pos_embedding` here when row
+  // LTX25-KEYFRAMES-ABS-POS ported that one (issue #658) — the mechanism is what
+  // this case gates, and it needs SOME family that is genuinely unported.
   const SyntheticDit syn = BuildSyntheticDit(
       p, Ltx2DitQuant::kFp8,
-      {"keyframes_abs_pos_embedding", "video_embeddings_connector.learnable_registers",
+      {"caption_projection.linear_1.weight", "video_embeddings_connector.learnable_registers",
        "audio_embeddings_connector.learnable_registers"});
   const std::string path = TmpPath("unported");
   WriteSafetensors(syn.entries, path);
@@ -1561,8 +1819,9 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const std::string what_msg = "what: " + what;
   INFO(what_msg);
   // ONE family in the LIST now, not five. `prompt_adaln_single` /
-  // `audio_prompt_adaln_single` left it when they were PORTED (issue #644); the
-  // case below proves a checkpoint carrying them needs no opt-in at all.
+  // `audio_prompt_adaln_single` left it when they were PORTED (issue #644), and
+  // `keyframes_abs_pos_embedding` left it for the same reason (issue #658); the
+  // cases below prove a checkpoint carrying either needs no opt-in at all.
   //
   // The list is asserted as a whole rather than by substring, because the message
   // deliberately goes on to NAME the families that are not in it — a
@@ -1571,7 +1830,10 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const size_t at = what.find(head);
   REQUIRE(at != std::string::npos);
   const std::string list = what.substr(at + head.size(), what.find('.', at) - at - head.size());
-  CHECK(list == "keyframes_abs_pos_embedding");
+  CHECK(list == "caption_projection");
+  // ASSERTED AS AN ABSENCE, with the positive control right above it: the retired
+  // family must not reappear in the refusal list.
+  CHECK(list.find("keyframes_abs_pos_embedding") == std::string::npos);
 
   // THE TWO CONNECTOR FAMILIES ARE NOT UNPORTED AS OF PHASE L9c. They are
   // outside the DiT's contract by design — upstream loads them into the text
@@ -1609,6 +1871,59 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const vllm::Ltx2DitCheckpoint conn_ck = vllm::Ltx2LoadDitFromSafetensors(conn_file);
   CHECK(conn_ck.unported.empty());
   std::remove(conn_path.c_str());
+}
+
+// REPLACES the half of the case above that used `keyframes_abs_pos_embedding` as
+// its unported example. The module is ported now (row LTX25-KEYFRAMES-ABS-POS,
+// issue #658), so what is gated here is the OPPOSITE claim: a checkpoint carrying
+// it loads with NO opt-in, resolves the flag, and BINDS the tensor rather than
+// stepping over it. That is what neither shipped LTX-2.5 DiT could do before.
+TEST_CASE("ltx2 loader: a keyframes-carrying checkpoint loads with NO opt-in") {
+  Ltx2DitParams p = TinyParams();
+  p.use_keyframes_abs_pos_embedding = true;
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string path = TmpPath("keyframes");
+  WriteSafetensors(syn.entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  // No `allow_unported_modules`. Before this row this threw by name.
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.unported.empty());
+  // Resolved from the file's own shapes, which is the only evidence a manifest
+  // carries — `supports_keyframes_abs_pos_embedding` (model.py:166-173).
+  CHECK(ck.params.use_keyframes_abs_pos_embedding);
+
+  // BOUND, not merely enumerated. A contract entry nothing binds is the exact
+  // failure mode the prompt-AdaLN row found (issue #644 row 0).
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.data != nullptr);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.rank == 2);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[0] == 1);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[1] == p.inner_dim());
+
+  // THE FP8 CONVENTION, stated rather than assumed. The synthetic file stores
+  // this tensor exactly as the shipped vonkaiser DiT does — `F8_E4M3` plus a
+  // scalar `F32` `<name>_scale` — and `MaterializeDitTensor`'s F8_E4M3 arm is the
+  // ONE convention that reads it: `ReadScalarF32` then `DequantFp8ToBf16`, giving
+  // a BF16 view. No second convention was invented for a rank-2 [1, D] tensor.
+  CHECK(ck.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+  {
+    const auto want = syn.expected.find("keyframes_abs_pos_embedding");
+    REQUIRE(want != syn.expected.end());
+    const uint16_t* got = ck.weights.keyframes_abs_pos_embedding.Ptr<uint16_t>();
+    REQUIRE(want->second.size() == static_cast<size_t>(p.inner_dim()));
+    for (size_t i = 0; i < want->second.size(); ++i) {
+      CAPTURE(i);
+      CHECK(got[i] == want->second[i]);
+    }
+  }
+
+  // ... and the f32 widening the L2 forward requires reaches it too, so the
+  // dtype assertion in `PrepareStream` is satisfiable rather than a dead end.
+  Ltx2DitLoadOptions widen;
+  widen.widen_to_f32 = true;
+  const vllm::Ltx2DitCheckpoint wide = vllm::Ltx2LoadDitFromSafetensors(file, widen);
+  CHECK(wide.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kF32);
+  std::remove(path.c_str());
 }
 
 // THE REGRESSION GATE FOR ISSUE #644 ROW 0.
@@ -1666,15 +1981,11 @@ TEST_CASE("ltx2 loader: a DiT carrying prompt_adaln_single loads with NO opt-in"
   std::remove(path2.c_str());
 }
 
-// The DECLARED config path. `Ltx2AdoptDeclaredDitParams` no longer forces both
-// sides of its comparison to a cleared flag, so a config that disagrees with the
-// file's shapes about `use_prompt_adaln_single` now produces two DIFFERENT
-// contracts and is refused — which is an INPUT-driven gate, not a mutation-only
-// one. Both directions are checked, because the equality is the point.
-TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is REFUSED") {
-  Ltx2DitParams shapes = TinyParams();
-  shapes.use_prompt_adaln_single = true;
-
+// The `transformer` object `ParseLtx2DitParams` needs in order to say YES: every
+// geometry key the shapes carry, plus every `check_config_value` the configurator
+// asserts verbatim (model_configurator.py:26-44). Shared by the two adoption
+// cases below so neither drifts from the other's idea of a valid config.
+nlohmann::json MinimalTransformerConfig(const Ltx2DitParams& shapes) {
   nlohmann::json t;
   t["num_attention_heads"] = shapes.num_attention_heads;
   t["attention_head_dim"] = shapes.attention_head_dim;
@@ -1712,28 +2023,111 @@ TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is
   t["av_cross_ada_norm"] = true;
   t["use_middle_indices_grid"] = true;
   t["caption_proj_before_connector"] = true;
+  return t;
+}
+
+// The DECLARED config path. `Ltx2AdoptDeclaredDitParams` no longer forces both
+// sides of its comparison to a cleared flag, so a config that disagrees with the
+// file's shapes about `use_prompt_adaln_single` now produces two DIFFERENT
+// contracts and is refused — which is an INPUT-driven gate, not a mutation-only
+// one. Both directions are checked, because the equality is the point.
+TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is REFUSED") {
+  Ltx2DitParams shapes = TinyParams();
+  shapes.use_prompt_adaln_single = true;
+  const nlohmann::json t = MinimalTransformerConfig(shapes);
 
   nlohmann::json agreeing;
   agreeing["transformer"] = t;
   agreeing["transformer"]["use_prompt_adaln_single"] = true;
   // Agreement is adopted, and carries the flag through.
   const Ltx2DitParams adopted =
-      vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes, false, "the test config");
+      vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes, "the test config");
   CHECK(adopted.use_prompt_adaln_single);
 
   nlohmann::json disagreeing;
   disagreeing["transformer"] = t;
   disagreeing["transformer"]["use_prompt_adaln_single"] = false;
-  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, false, "the test config"));
-  // The opt-in must not rescue it: clearing a PORTED flag in the config copy is
-  // exactly what made this comparison blind before.
-  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, true, "the test config"));
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, "the test config"));
 
   // And the other direction: shapes WITHOUT the module against a config that
   // declares it.
   Ltx2DitParams shapes_off = shapes;
   shapes_off.use_prompt_adaln_single = false;
-  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes_off, false, "the test config"));
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes_off, "the test config"));
+}
+
+// REPLACES the test that asserted `use_keyframes_abs_pos_embedding` was cleared
+// only under `allow_unported_modules`. That refusal is retired (row
+// LTX25-KEYFRAMES-ABS-POS, issue #658); what took its place is upstream's
+// `supports_keyframes_abs_pos_embedding` (model.py:166-173), resolved against
+// what the FILE carries — and this asserts all three of its outcomes, plus the
+// one thing that must NOT happen.
+TEST_CASE("ltx2 loader: a declared keyframes flag is RESOLVED against the file, not refused") {
+  Ltx2DitParams shapes = TinyParams();
+  shapes.use_prompt_adaln_single = false;
+
+  nlohmann::json t = MinimalTransformerConfig(shapes);
+  t["use_prompt_adaln_single"] = false;
+
+  SUBCASE("declared TRUE, tensor ABSENT: adopted as FALSE, and NOT refused") {
+    // The shipped first-party NVFP4 DiT exactly: `__metadata__` declares the
+    // flag, `declared - state_dict` is precisely this one key, and upstream's
+    // meta-device load leaves the parameter unmaterialized so the add is never
+    // reached. Before this row, `ltx2.cpp` threw here unless the caller passed
+    // `allow_unported_modules` — stricter than upstream.
+    nlohmann::json cfg;
+    cfg["transformer"] = t;
+    cfg["transformer"]["use_keyframes_abs_pos_embedding"] = true;
+    REQUIRE_FALSE(shapes.use_keyframes_abs_pos_embedding);
+    const Ltx2DitParams adopted =
+        vllm::Ltx2AdoptDeclaredDitParams(cfg, shapes, "the test config");
+    CHECK_FALSE(adopted.use_keyframes_abs_pos_embedding);
+    // NOT a synthesised zero: the contract must not name the tensor at all, or a
+    // loader would go looking for a weight the file does not have.
+    const std::vector<vllm::Ltx2TensorSpec> contract = vllm::EnumerateLtx2DitTensors(adopted);
+    int64_t named = 0;
+    for (const vllm::Ltx2TensorSpec& spec : contract) {
+      if (spec.name == "keyframes_abs_pos_embedding") ++named;
+    }
+    CHECK(named == 0);
+    // Positive control for that count, so a renamed contract entry cannot make
+    // the assertion above pass by finding nothing at all.
+    int64_t control = 0;
+    for (const vllm::Ltx2TensorSpec& spec : contract) {
+      if (spec.name == "patchify_proj.weight") ++control;
+    }
+    CHECK(control == 1);
+  }
+
+  SUBCASE("declared TRUE, tensor PRESENT: adopted TRUE and the contract names it") {
+    // The vonkaiser FP8 DiT plus the first-party config it needs (that file
+    // carries no `__metadata__` at all, so its config always arrives separately).
+    Ltx2DitParams with = shapes;
+    with.use_keyframes_abs_pos_embedding = true;
+    nlohmann::json cfg;
+    cfg["transformer"] = t;
+    cfg["transformer"]["use_keyframes_abs_pos_embedding"] = true;
+    const Ltx2DitParams adopted = vllm::Ltx2AdoptDeclaredDitParams(cfg, with, "the test config");
+    CHECK(adopted.use_keyframes_abs_pos_embedding);
+    const std::vector<vllm::Ltx2TensorSpec> contract = vllm::EnumerateLtx2DitTensors(adopted);
+    REQUIRE_FALSE(contract.empty());
+    // Registration order, which no shape encodes: model.py:217 is BEFORE :230.
+    CHECK(contract[0].name == "keyframes_abs_pos_embedding");
+    CHECK(contract[0].shape == std::vector<int64_t>{1, adopted.inner_dim()});
+  }
+
+  SUBCASE("NOT declared while the file CARRIES it is a real disagreement, refused") {
+    // Upstream would build no parameter and `strict=False` would drop the key.
+    // We refuse instead, because the tensor is already BOUND by the time the
+    // config is adopted and the two would describe different contracts — the
+    // same equality every other key is held to. Named rather than silent.
+    Ltx2DitParams with = shapes;
+    with.use_keyframes_abs_pos_embedding = true;
+    nlohmann::json cfg;
+    cfg["transformer"] = t;
+    cfg["transformer"]["use_keyframes_abs_pos_embedding"] = false;
+    CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(cfg, with, "the test config"));
+  }
 }
 
 TEST_CASE("ltx2 loader: the f32 widening is OPT-IN and bit-exact over bf16") {
@@ -1987,4 +2381,403 @@ TEST_CASE("ltx2 loader: BindLtx2DitWeights names the tensor it is missing") {
   INFO(bind_msg);
   CHECK(what.find(dropped) != std::string::npos);
   std::remove(path.c_str());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IC-LoRA fusion on the QUANTIZED arms (row LTX25-IC-LORA, issue #923)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHY THESE TWO CASES EXIST AND ARE NOT REDUNDANT WITH test_ltx2_lora. That
+// suite gates the fusion arithmetic against a bf16 buffer it hands over itself.
+// It cannot show that an FP8 or NVFP4 CHECKPOINT reaches the same code, and the
+// design claim this row makes is precisely that one hook serves every arm
+// because `MaterializeDitTensor`'s `F8_E4M3` and `U8` branches both
+// `return vt::DType::kBF16` before anything else sees a byte.
+//
+// If that claim were wrong — if either quantized branch returned its packed
+// dtype — the fuser's final `Fail` would fire and these cases would throw. So
+// they are the gate on the "one hook serves four arms" design, not a second
+// copy of the arithmetic gate.
+namespace {
+
+// Write a one-target IC-LoRA whose delta is a known constant, against the same
+// contract `BuildSyntheticDit` writes.
+std::string WriteLoraFor(const Ltx2DitParams& p, const std::string& target, float scale,
+                         const std::string& path) {
+  std::vector<int64_t> shape;
+  for (const Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(p)) {
+    if (spec.name == target) shape = spec.shape;
+  }
+  REQUIRE_MESSAGE(shape.size() == 2, "LoRA target '", target, "' is not rank 2");
+  const int64_t rank = 2;
+  const std::string module = target.substr(0, target.size() - std::string(".weight").size());
+
+  std::vector<StEntry> entries;
+  {
+    StEntry a;
+    a.name = "diffusion_model." + module + ".lora_A.weight";
+    a.dtype = "BF16";
+    a.shape = {rank, shape[1]};
+    for (int64_t i = 0; i < rank * shape[1]; ++i) {
+      const uint16_t v = vt::F32ToBF16(1.0F);
+      a.bytes.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    entries.push_back(std::move(a));
+
+    StEntry b;
+    b.name = "diffusion_model." + module + ".lora_B.weight";
+    b.dtype = "BF16";
+    b.shape = {shape[0], rank};
+    for (int64_t i = 0; i < shape[0] * rank; ++i) {
+      const uint16_t v = vt::F32ToBF16(scale);
+      b.bytes.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    entries.push_back(std::move(b));
+  }
+  WriteSafetensors(entries, path);
+  return path;
+}
+
+// The delta every case above produces: rank terms of `1.0 * scale`, so a
+// uniform `rank * scale` on every element of the target.
+constexpr float kLoraScale = 0.5F;
+constexpr float kExpectedDelta = 2 * kLoraScale;
+
+void CheckArmFuses(Ltx2DitQuant quant, const char* tag) {
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, quant, {});
+  const std::string dit_path = TmpPath((std::string("lora_") + tag).c_str());
+  WriteSafetensors(syn.entries, dit_path);
+
+  // A target that is quantized on BOTH arms: a rank-2 non-table weight.
+  const std::string target = "transformer_blocks.0.attn1.to_q.weight";
+  const std::string lora_path =
+      WriteLoraFor(p, target, kLoraScale, TmpPath((std::string("lora_a_") + tag).c_str()));
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+
+  // The control: the same checkpoint with no adapter, so the delta is measured
+  // against what this loader actually produces rather than against an
+  // independently computed dequantization.
+  const vllm::Ltx2DitCheckpoint plain = vllm::Ltx2LoadDitFromSafetensors(file);
+  REQUIRE(plain.lora_fused_tensors == 0);
+
+  vllm::Ltx2DitLoadOptions options;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  spec.strength = 1.0;
+  options.loras.push_back(spec);
+  const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+
+  INFO("arm = ", std::string(tag));
+  // Exactly one contract tensor was touched.
+  CHECK(fused.lora_fused_tensors == 1);
+  // No adapter metadata, so both factors are upstream's default of 1.
+  CHECK(fused.lora_reference.downscale == 1);
+  CHECK(fused.lora_reference.temporal == 1);
+
+  const vt::Tensor& before = plain.views.at(target);
+  const vt::Tensor& after = fused.views.at(target);
+  REQUIRE(before.dtype == vt::DType::kBF16);
+  REQUIRE(after.dtype == vt::DType::kBF16);
+  REQUIRE(before.Numel() == after.Numel());
+
+  // THE VALUE CLAIM: every element moved by exactly the delta. Checked
+  // element-wise rather than as a norm, because a norm cannot see a delta
+  // applied to the wrong half of the tensor.
+  const uint16_t* b0 = before.Ptr<uint16_t>();
+  const uint16_t* a0 = after.Ptr<uint16_t>();
+  int64_t moved = 0;
+  for (int64_t i = 0; i < before.Numel(); ++i) {
+    // Rounded to bf16, because the STORE is bf16: comparing against an f32 sum
+    // fails on the last mantissa bit for every element whose sum is not exactly
+    // representable, which is most of them.
+    const float want = vt::BF16ToF32(vt::F32ToBF16(vt::BF16ToF32(b0[i]) + kExpectedDelta));
+    CHECK(vt::BF16ToF32(a0[i]) == doctest::Approx(want));
+    if (a0[i] != b0[i]) ++moved;
+  }
+  // And it is not vacuous: the delta is non-zero, so the bytes must actually
+  // differ. A fuser that returned early would pass the Approx loop above only
+  // if `kExpectedDelta` were 0.
+  CHECK(moved == before.Numel());
+
+  // A tensor NO adapter targets is byte-identical, which is what shows the hook
+  // is keyed on the name rather than applied to everything materialized.
+  const std::string untouched = "transformer_blocks.0.attn1.to_k.weight";
+  const vt::Tensor& u0 = plain.views.at(untouched);
+  const vt::Tensor& u1 = fused.views.at(untouched);
+  REQUIRE(u0.Numel() == u1.Numel());
+  int64_t untouched_moved = 0;
+  for (int64_t i = 0; i < u0.Numel(); ++i) {
+    if (u0.Ptr<uint16_t>()[i] != u1.Ptr<uint16_t>()[i]) ++untouched_moved;
+  }
+  CHECK(untouched_moved == 0);
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 loader: an IC-LoRA fuses into the FP8 arm") {
+  // The arm most users run. `MaterializeDitTensor`'s F8_E4M3 branch calls
+  // DequantFp8ToBf16 and returns kBF16, so the delta lands on a dequantized
+  // weight and no FP8 quantizer is needed — which is the whole reason this port
+  // can serve every arm with one hook (ltx2_lora.h, the WHERE IT IS APPLIED
+  // note).
+  CheckArmFuses(Ltx2DitQuant::kFp8, "fp8");
+}
+
+TEST_CASE("ltx2 loader: an IC-LoRA fuses into the NVFP4 arm") {
+  // Same claim, the other quantized branch: U8-packed NVFP4 with its two scale
+  // sidecars, dequantized by Ltx2DequantNvfp4ToBf16 which also returns kBF16.
+  //
+  // Upstream RE-QUANTIZES here (quantization/nvfp4/fuse.py:40-47) because it
+  // keeps the packed weight resident for its NVFP4 kernels. This tree keeps
+  // bf16 (ltx2_loader.h's DTYPE note), so there is nothing to re-quantize into
+  // and no NVFP4 quantizer in the tree to do it with. The divergence is
+  // deliberate and recorded in the row's spec §3.1: our fused weight SKIPS
+  // upstream's lossy round trip, at no extra bytes.
+  CheckArmFuses(Ltx2DitQuant::kNvfp4, "nvfp4");
+}
+
+TEST_CASE("ltx2 loader: an IC-LoRA fuses into the UNQUANTIZED arm") {
+  // The third arm through the one hook, and the one upstream fuses on: both
+  // `DiffusionStage.from_checkpoint` calls in `a2vid_two_stage.py` (:104, :116 @
+  // `fd4ded7f`) name the FULL transformer, and it is bf16. `MaterializeDitTensor`
+  // returns kBF16 from its BF16 branch exactly as the two dequantizing branches
+  // do, so the fusion arithmetic is identical — proved here rather than assumed.
+  CheckArmFuses(Ltx2DitQuant::kNone, "bf16");
+}
+
+TEST_CASE("ltx2 loader: an adapter that fuses into NOTHING refuses rather than loading green") {
+  // Reachable because the contract carries rank-1 and rank-3 tensors a LoRA
+  // pair can legitimately name but never fuse into. A load that reported
+  // success here would render byte-identically to no adapter at all.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string dit_path = TmpPath("lora_none");
+  WriteSafetensors(syn.entries, dit_path);
+
+  // A non-rank-2 contract tensor: the scale-shift table is [rows, inner] rank 2,
+  // so pick a genuinely rank-1 one.
+  std::string rank1;
+  for (const Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(p)) {
+    const bool is_weight = spec.name.size() > 7 &&
+                           spec.name.compare(spec.name.size() - 7, 7, ".weight") == 0;
+    if (spec.shape.size() == 1 && is_weight) {
+      rank1 = spec.name;
+      break;
+    }
+  }
+  REQUIRE_MESSAGE(!rank1.empty(), "the contract has no rank-1 tensor to build this case on");
+
+  const std::string module = rank1.substr(0, rank1.size() - std::string(".weight").size());
+  std::vector<StEntry> entries;
+  for (const char* side : {".lora_A.weight", ".lora_B.weight"}) {
+    StEntry e;
+    e.name = "diffusion_model." + module + side;
+    e.dtype = "BF16";
+    e.shape = {1, 1};
+    const uint16_t v = vt::F32ToBF16(1.0F);
+    e.bytes.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    entries.push_back(std::move(e));
+  }
+  const std::string lora_path = TmpPath("lora_none_a");
+  WriteSafetensors(entries, lora_path);
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+  vllm::Ltx2DitLoadOptions options;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  options.loras.push_back(spec);
+
+  std::string what;
+  try {
+    (void)vllm::Ltx2LoadDitFromSafetensors(file, options);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  INFO("what: ", what);
+  CHECK(what.find("fused into ZERO tensors") != std::string::npos);
+  CHECK(what.find(lora_path) != std::string::npos);
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}
+
+// ─── LTX25-PHASE-LORA (#1118) ────────────────────────────────────────────────
+
+namespace {
+
+// Every bound view of `a` against `b`, byte for byte. Returns the number of
+// views that DIFFER, so a caller can assert both directions and neither
+// assertion is vacuous.
+//
+// Byte-for-byte and not a tolerance: the claim `Ltx2RebindDitLoras` makes is
+// that a rebound checkpoint is INDISTINGUISHABLE from one the loader produced,
+// and a tolerance would pass an implementation that reconstructs the base by
+// subtracting the delta — which is the wrong implementation this case exists to
+// catch.
+int64_t ViewsDiffering(const vllm::Ltx2DitCheckpoint& a, const vllm::Ltx2DitCheckpoint& b) {
+  REQUIRE(a.views.size() == b.views.size());
+  int64_t differing = 0;
+  for (const auto& kv : a.views) {
+    const auto it = b.views.find(kv.first);
+    REQUIRE(it != b.views.end());
+    const vt::Tensor& x = kv.second;
+    const vt::Tensor& y = it->second;
+    REQUIRE(x.dtype == y.dtype);
+    REQUIRE(x.Numel() == y.Numel());
+    const size_t bytes = static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype);
+    if (std::memcmp(x.data, y.data, bytes) != 0) ++differing;
+  }
+  return differing;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 loader: a phase rebind reproduces the load BYTE-FOR-BYTE in both directions") {
+  // THE EXACTNESS CLAIM of row LTX25-PHASE-LORA (#1118), made executable.
+  //
+  // Upstream gives each `DiffusionStage` its own adapter set by building a
+  // SECOND stage from the same checkpoint (ic_lora.py:104 and :115). This port
+  // holds one DiT and moves it between the two states, so the thing that has to
+  // be proved is that "moved back" and "loaded that way" are the same bytes —
+  // otherwise the seam buys per-phase adapters at the cost of a silent numeric
+  // drift, which is the trade this row rejected when it rejected unfused runtime
+  // LoRA.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string dit_path = TmpPath("rebind_dit");
+  WriteSafetensors(syn.entries, dit_path);
+
+  const std::string target = "transformer_blocks.0.attn1.to_q.weight";
+  const std::string lora_path = WriteLoraFor(p, target, kLoraScale, TmpPath("rebind_lora"));
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+
+  vllm::Ltx2DitLoadOptions options;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  spec.strength = 1.0;
+  options.loras.push_back(spec);
+
+  // The two REFERENCE images, each produced by the loader itself.
+  const vllm::Ltx2DitCheckpoint plain = vllm::Ltx2LoadDitFromSafetensors(file);
+  const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  REQUIRE(plain.lora_fused_tensors == 0);
+  REQUIRE(fused.lora_fused_tensors == 1);
+  // The instrument is armed: the two references genuinely differ, in exactly the
+  // one tensor the adapter targets. Without this line every equality below could
+  // pass on a checkpoint where the adapter did nothing.
+  REQUIRE(ViewsDiffering(plain, fused) == 1);
+
+  // The one under test, loaded FUSED exactly as `Ltx2VideoEngine::Load` loads it.
+  vllm::Ltx2DitCheckpoint live = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  REQUIRE(live.lora_fused_tensors == 1);
+  // The pointer the bound weights read through. `Ltx2DitWeights` is a pure view
+  // struct, so a rebind that reallocated would leave `live.weights` dangling and
+  // every forward would read freed memory. Captured before, checked after.
+  const void* const target_before = live.views.at(target).data;
+
+  SUBCASE("rebound OFF, it is the checkpoint the loader builds with no adapter") {
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/false, live);
+    CHECK(live.lora_fused_tensors == 0);
+    CHECK(live.views.at(target).data == target_before);
+    // The whole claim, in one number: nothing distinguishes it from `plain`.
+    CHECK(ViewsDiffering(live, plain) == 0);
+    // And it really moved — this is what fails if the rebind quietly did nothing.
+    CHECK(ViewsDiffering(live, fused) == 1);
+  }
+
+  SUBCASE("rebound OFF then ON, it is the checkpoint the loader builds WITH the adapter") {
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/false, live);
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/true, live);
+    CHECK(live.lora_fused_tensors == 1);
+    CHECK(live.views.at(target).data == target_before);
+    // THE ROUND TRIP. An implementation that reconstructed the base by
+    // SUBTRACTING the delta would land here at
+    // `round_bf16(round_bf16(W + d) - d) + d`, which is not `round_bf16(W + d)`
+    // for every element, and this line is what tells the two apart.
+    CHECK(ViewsDiffering(live, fused) == 0);
+    CHECK(ViewsDiffering(live, plain) == 1);
+  }
+
+  SUBCASE("a rebind to the state it is already in changes nothing") {
+    // The no-op a one-stage recipe and every recipe predating the phase field
+    // relies on: they never ask for a different set, and they must not pay a
+    // re-materialization to be told so.
+    vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/true, live);
+    CHECK(live.lora_fused_tensors == 1);
+    CHECK(ViewsDiffering(live, fused) == 0);
+  }
+
+  SUBCASE("a queue for a HOST checkpoint refuses by name") {
+    // The two address spaces. Guessing which one a view points at is how a
+    // rebind would corrupt weights silently instead of refusing.
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    std::string what;
+    try {
+      vllm::Ltx2RebindDitLoras(&queue, file, options, /*fuse=*/false, live);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    INFO("what: ", what);
+    CHECK(what.find("a queue for a HOST-resident checkpoint") != std::string::npos);
+    // It refused BEFORE touching anything.
+    CHECK(live.lora_fused_tensors == 1);
+    CHECK(ViewsDiffering(live, fused) == 0);
+  }
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}
+
+TEST_CASE("ltx2 loader: a rebind of a WIDENED checkpoint fuses in bf16 and stores f32") {
+  // The host arm the CPU parity forward actually runs: `widen_to_f32` is set
+  // whenever the engine is off-device (`ltx2_video.cpp`), so the bound view is
+  // an f32 copy while `MaterializeDitTensor` still returns bf16. If the rebind
+  // widened BEFORE fusing it would accumulate the delta in f32 and quietly undo
+  // the accumulator dtype `ltx2_lora.h` pins — which no token gate and no
+  // golden could see, because the numbers would still be finite and close.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string dit_path = TmpPath("rebind_wide_dit");
+  WriteSafetensors(syn.entries, dit_path);
+
+  const std::string target = "transformer_blocks.0.attn1.to_q.weight";
+  const std::string lora_path = WriteLoraFor(p, target, kLoraScale, TmpPath("rebind_wide_lora"));
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+
+  vllm::Ltx2DitLoadOptions options;
+  options.widen_to_f32 = true;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  spec.strength = 1.0;
+  options.loras.push_back(spec);
+
+  vllm::Ltx2DitLoadOptions plain_options;
+  plain_options.widen_to_f32 = true;
+
+  const vllm::Ltx2DitCheckpoint plain = vllm::Ltx2LoadDitFromSafetensors(file, plain_options);
+  const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  REQUIRE(plain.views.at(target).dtype == vt::DType::kF32);
+  REQUIRE(ViewsDiffering(plain, fused) == 1);
+
+  vllm::Ltx2DitCheckpoint live = vllm::Ltx2LoadDitFromSafetensors(file, options);
+  const void* const target_before = live.views.at(target).data;
+
+  vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/false, live);
+  CHECK(live.views.at(target).data == target_before);
+  CHECK(live.views.at(target).dtype == vt::DType::kF32);
+  CHECK(ViewsDiffering(live, plain) == 0);
+
+  vllm::Ltx2RebindDitLoras(/*queue=*/nullptr, file, options, /*fuse=*/true, live);
+  CHECK(ViewsDiffering(live, fused) == 0);
+  CHECK(ViewsDiffering(live, plain) == 1);
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
 }

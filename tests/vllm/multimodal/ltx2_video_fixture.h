@@ -256,6 +256,22 @@ inline vllm::Ltx2DitParams ReducedDitParams() {
   // than a configuration nothing ships, and the whole video engine renders
   // through the prompt-side AdaLN path (.agents/specs/ltx25-prompt-adaln.md).
   p.use_prompt_adaln_single = true;
+  // TRUE, exactly as the shipped vonkaiser FP8 DiT resolves it: that file carries
+  // `keyframes_abs_pos_embedding` `F8_E4M3 [1, 4096]` with 4096 of 4096 bytes
+  // NON-ZERO, so `supports_keyframes_abs_pos_embedding` (model.py:166-173) holds
+  // for it and the marker is live on every forward.
+  //
+  // THE FIXTURE CARRIES IT SO THE ENGINE PATH IS EXERCISED AT ALL. With the flag
+  // off, `Ltx2VideoEngine` never hands the DiT a marker, and a defect that made
+  // the marker CONDITIONAL — the one this module invites — was measured to leave
+  // all five LTX-2.5 suites green. With it on, every e2e render in this file goes
+  // through `apply_keyframes_absolute_embedding`
+  // (.agents/specs/ltx25-keyframes-abs-pos.md, issue #658).
+  //
+  // The first-party NVFP4 DiT is the OTHER case and is covered by its own
+  // env-gated test: it declares the flag and carries no tensor, which upstream's
+  // meta-device load turns into "apply nothing".
+  p.use_keyframes_abs_pos_embedding = true;
   p.ff_bias = false;                // LTX-2.5 (gemma4) sets ff_bias=false
   p.audio_ff_bias = true;
   return p;
@@ -402,6 +418,11 @@ inline nlohmann::json ReducedDitTransformerConfig(
   transformer["audio_cross_attention_dim"] = params.audio_cross_attention_dim;
   transformer["apply_gated_attention"] = params.apply_gated_attention;
   transformer["cross_attention_adaln"] = params.cross_attention_adaln;
+  // Written EXPLICITLY, because `Ltx2AdoptDeclaredDitParams` resolves this key
+  // against the file's shapes: a config that omitted it while the fixture writes
+  // the tensor would describe a different weight contract and be refused. The
+  // shipped first-party NVFP4 config declares it TRUE the same way.
+  transformer["use_keyframes_abs_pos_embedding"] = params.use_keyframes_abs_pos_embedding;
   transformer["ff_bias"] = params.ff_bias;
   transformer["rope_type"] = "split";
   transformer["use_middle_indices_grid"] = params.use_middle_indices_grid;
@@ -438,6 +459,12 @@ struct ReducedDitOptions {
   std::string model_version = "2.5.0";
   bool declare_config = true;
   bool declare_model_version = true;
+  // Write the file with NO quantized weight and NO scale sidecar anywhere: every
+  // tensor the FP8 shape would store F8_E4M3 is stored BF16 instead. That is the
+  // shape `Lightricks/LTX-2.5` ships the FULL (dev) transformer in — 4059 BF16
+  // and 290 F32, zero `_scale` names, measured from its own header on
+  // 2026-08-17 — and it is the arm issue #1148 refused at load.
+  bool unquantized = false;
   nlohmann::json transformer_overrides = nlohmann::json::object();
   ReducedConnectorOptions connector;
 };
@@ -455,7 +482,7 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
     for (const int64_t d : spec.shape) numel *= d;
     const std::string full = prefix + spec.name;
     const bool table = spec.name.find("scale_shift_table") != std::string::npos;
-    const bool quantizable = spec.shape.size() == 2 && !table &&
+    const bool quantizable = !options.unquantized && spec.shape.size() == 2 && !table &&
                              spec.name.size() > 7 &&
                              spec.name.compare(spec.name.size() - 7, 7, ".weight") == 0;
     std::vector<float> values = Param("ltx2.dit." + spec.name, numel, 0.08);
@@ -492,8 +519,11 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
         // tensor of this family is F8_E4M3 with an F32 sidecar, `learnable_registers`
         // INCLUDED (`...learnable_registers` + `...learnable_registers_scale`).
         // That is not the DiT's rule — there the scale-shift tables stay F32 —
-        // so it is stated from the file rather than inherited.
-        const bool quantizable = spec.shape.size() == 2;
+        // so it is stated from the file rather than inherited. On the
+        // `unquantized` arm this family follows the DiT's own dtype the same way
+        // the shipped dev transformer does: its 258 connector tensors are BF16
+        // with no sidecar, exactly like every other weight in that file.
+        const bool quantizable = !options.unquantized && spec.shape.size() == 2;
         if (quantizable) {
           constexpr float kScale = 0.5F;
           for (float& v : values) v /= kScale;
@@ -769,9 +799,14 @@ inline vllm::Ltx2VocoderBweConfig ReducedVocoderBweConfig() {
   return cfg;
 }
 
+// `with_encoder = false` writes the audio VAE the way EVERY LTX-2.5 checkpoint
+// looked before row LTX25-A2V-AUDIO-INPUT (#922): decoder and vocoder only, no
+// `audio_vae.encoder.` tensors. It exists so the "this checkpoint cannot do
+// audio-to-video" refusal has something to refuse, and so that refusal is
+// distinguishable from "the encoder is unported" — which it is not.
 inline void WriteReducedAudioVae(const vllm::Ltx2AudioDecoderConfig& cfg,
                                  const vllm::Ltx2VocoderBweConfig& voc,
-                                 const std::string& path) {
+                                 const std::string& path, bool with_encoder = true) {
   std::vector<Entry> entries;
   auto put = [&](const std::string& name, const std::vector<int64_t>& shape, double scale,
                  double offset = 0.0) {
@@ -886,9 +921,72 @@ inline void WriteReducedAudioVae(const vllm::Ltx2AudioDecoderConfig& cfg,
   // Non-negative, like a real mel filterbank.
   put("vocoder.mel_stft.mel_basis", {voc.n_mel_channels, n_freqs}, 0.02, 0.03);
 
+  // --- the ENCODER, for audio-to-video (row LTX25-A2V-AUDIO-INPUT, #922) ---
+  //
+  // Written into the SAME file under `audio_vae.encoder.`, because that is where
+  // AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER looks (model_configurator.py:194-200)
+  // and where the shipped checkpoints carry it. It reuses the decoder's
+  // `per_channel_statistics` entries above rather than writing its own: one set
+  // of statistics serves both directions, which is why BOTH key filters carry
+  // that prefix.
+  //
+  // The widths mirror the decoder's so the round trip closes: `ch_mult` of three
+  // levels means two strided downsamples, taking the 64-bin mel to the 16 latent
+  // mel bins the DiT's audio stream expects, and `double_z` puts conv_out at
+  // 2 * z_channels so the mean chunk is 8 channels wide. 8 x 16 == 128, the
+  // width `patched` already uses.
+  if (with_encoder) {
+    const std::string ep = "audio_vae.encoder.";
+    const int64_t levels_e = static_cast<int64_t>(cfg.ch_mult.size());
+    put(ep + "conv_in.conv.weight", {cfg.ch, 2, 3, 3}, 0.1);
+    put(ep + "conv_in.conv.bias", {cfg.ch}, 0.05);
+
+    auto put_resnet_e = [&](const std::string& prefix, int64_t in_ch, int64_t out_ch) {
+      put(prefix + ".conv1.conv.weight", {out_ch, in_ch, 3, 3}, 0.1);
+      put(prefix + ".conv1.conv.bias", {out_ch}, 0.05);
+      put(prefix + ".conv2.conv.weight", {out_ch, out_ch, 3, 3}, 0.1);
+      put(prefix + ".conv2.conv.bias", {out_ch}, 0.05);
+      if (in_ch != out_ch) {
+        put(prefix + ".nin_shortcut.conv.weight", {out_ch, in_ch, 1, 1}, 0.1);
+        put(prefix + ".nin_shortcut.conv.bias", {out_ch}, 0.05);
+      }
+    };
+
+    // `in_ch_mult = (1, *ch_mult)` (downsample.py:78-85): level i READS
+    // ch * ch_mult[i-1] and WRITES ch * ch_mult[i].
+    int64_t enc_in = cfg.ch;
+    for (int64_t level = 0; level < levels_e; ++level) {
+      const std::string sp = ep + "down." + std::to_string(level);
+      const int64_t block_out = cfg.ch * cfg.ch_mult[static_cast<size_t>(level)];
+      for (int64_t i = 0; i < cfg.num_res_blocks; ++i) {
+        put_resnet_e(sp + ".block." + std::to_string(i), enc_in, block_out);
+        enc_in = block_out;
+      }
+      // `attn_resolutions` is empty in this fixture, as in the shipped config,
+      // so no level carries attention.
+      if (level != levels_e - 1) {
+        // Downsample's conv is a BARE nn.Conv2d, so the key is `.downsample.conv`
+        // and NOT the `.conv.conv` a CausalConv2d produces.
+        put(sp + ".downsample.conv.weight", {enc_in, enc_in, 3, 3}, 0.1);
+        put(sp + ".downsample.conv.bias", {enc_in}, 0.05);
+      }
+    }
+    put_resnet_e(ep + "mid.block_1", enc_in, enc_in);
+    put_resnet_e(ep + "mid.block_2", enc_in, enc_in);
+    // `double_z` (audio_vae.py:237): conv_out is twice as wide and only the
+    // first half is ever read.
+    const int64_t enc_out = 2 * cfg.z_channels;
+    put(ep + "conv_out.conv.weight", {enc_out, enc_in, 3, 3}, 0.1);
+    put(ep + "conv_out.conv.bias", {enc_out}, 0.05);
+  }
+
   nlohmann::json dd;
   dd["ch"] = cfg.ch;
   dd["out_ch"] = cfg.out_ch;
+  // The encoder reads `in_channels` and `double_z` off the SAME ddconfig
+  // (model_configurator.py:172, 168); the decoder ignores both.
+  dd["in_channels"] = 2;
+  dd["double_z"] = true;
   dd["ch_mult"] = cfg.ch_mult;
   dd["num_res_blocks"] = cfg.num_res_blocks;
   dd["attn_resolutions"] = nlohmann::json::array();
@@ -900,10 +998,50 @@ inline void WriteReducedAudioVae(const vllm::Ltx2AudioDecoderConfig& cfg,
   dd["mel_bins"] = cfg.mel_bins;
   nlohmann::json audio_vae;
   audio_vae["model"]["params"]["ddconfig"] = dd;
-  audio_vae["model"]["params"]["sampling_rate"] = 16000;
+
+  // ── THE MEL FRONT-END, WRITTEN TO BE OBSERVABLE ───────────────────────────
+  //
+  // `Ltx2ParseAudioEncoderConfig` states in its own comment that these three
+  // values come from three different objects and that the obvious-looking
+  // neighbours are wrong. Written the shipped way — `sampling_rate = 16000`,
+  // no `filter_length` at all, `mel.n_mel_channels` equal to `ddconfig.mel_bins`
+  // — that claim is unobservable, because EVERY wrong reading lands on the same
+  // number as the right one: 16000 is also the parser's default, an absent
+  // `filter_length` and an absent `n_fft` both fall to the default 1024, and the
+  // two mel-bin sources agree so the `or` chain's ORDER cannot be seen. Three
+  // mutations of the parser then pass a full-suite gate.
+  //
+  // So this fixture DELIBERATELY differs from the shipped checkpoint on exactly
+  // those three axes, and says so rather than looking like a transcription
+  // error:
+  //
+  //   * `sampling_rate = 24000`, not the shipped 16000 and not the parser's
+  //     default. A decoy 16000 sits on `preprocessing.mel` — the neighbour a
+  //     reader reaches for — so "read it from the mel block" and "read nothing
+  //     and take the default" are the SAME wrong answer and both are caught.
+  //     24000 rather than something below 16000 because the audio latent grid is
+  //     fixed at 16000/160/4 = 25 frames/s by upstream's own constants
+  //     (types.py:174), so a lower rate would make every take too short and turn
+  //     the conditioning cases into refusals.
+  //   * `stft.filter_length = 512`, with a decoy `stft.n_fft = 1024` beside it.
+  //     `n_fft` is the name torchaudio uses and the one a reader writes from
+  //     memory; upstream's key is `filter_length`, and 1024 is also the default,
+  //     so the decoy carries both wrong answers at once.
+  //   * `mel.n_mel_channels = 32`, a decoy that DISAGREES with
+  //     `ddconfig.mel_bins`. The `or` chain reads ddconfig first
+  //     (model_configurator.py:160); with the two equal, a chain reordered to
+  //     read the mel block first is invisible.
+  //
+  // None of the three reaches the DECODER or the vocoder: the decoder's own
+  // `or` chain takes `ddconfig.mel_bins` first (ltx2_loader.cpp:1435-1440), and
+  // the vocoder rates live under `vocoder.bwe` (:1480-1498).
+  audio_vae["model"]["params"]["sampling_rate"] = 24000;
   audio_vae["preprocessing"]["stft"]["hop_length"] = 160;
   audio_vae["preprocessing"]["stft"]["causal"] = true;
-  audio_vae["preprocessing"]["mel"]["n_mel_channels"] = cfg.mel_bins;
+  audio_vae["preprocessing"]["stft"]["filter_length"] = 512;
+  audio_vae["preprocessing"]["stft"]["n_fft"] = 1024;             // DECOY
+  audio_vae["preprocessing"]["mel"]["sampling_rate"] = 16000;     // DECOY
+  audio_vae["preprocessing"]["mel"]["n_mel_channels"] = 32;       // DECOY
 
   auto vocoder_json = [](const vllm::Ltx2VocoderConfig& v) {
     nlohmann::json j;
@@ -1296,6 +1434,12 @@ inline void WritePromptEmbeds(const std::string& path, const std::string& tag, i
 // The whole set, as an engine would be pointed at it.
 struct Paths {
   std::string dit, video_vae, audio_vae, upsampler, video_embeds, audio_embeds;
+  // The NEGATIVE half of the embeds fallback (row LTX25-GUIDED-VIDEO, #1092).
+  // Written from DIFFERENT tags than the positive pair, deliberately: a negative
+  // conditioning equal to the positive one makes `cond - uncond` identically
+  // zero, so the classifier-free term would vanish and every assertion about it
+  // would pass for the wrong reason.
+  std::string negative_video_embeds, negative_audio_embeds;
   // Phase L13: the text tower, and the Gemma config the shipped encoder does not
   // carry. Written by every fixture; POINTING the engine at them is opt-in,
   // because a load that materializes a tower is not what most cases here gate.
@@ -1317,6 +1461,8 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   p.upsampler = dir + "/upsampler.safetensors";
   p.video_embeds = dir + "/video_prompt_embeds.f32";
   p.audio_embeds = dir + "/audio_prompt_embeds.f32";
+  p.negative_video_embeds = dir + "/negative_video_prompt_embeds.f32";
+  p.negative_audio_embeds = dir + "/negative_audio_prompt_embeds.f32";
   p.encoder = dir + "/text_encoder.safetensors";
   p.encoder_config = dir + "/gemma_config.json";
   WriteReducedTextEncoder(dit, p.encoder);
@@ -1327,6 +1473,12 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   WriteReducedUpsampler(ReducedUpsamplerConfig(dit.in_channels), p.upsampler);
   WritePromptEmbeds(p.video_embeds, "ltx2.embeds.video", prompt_tokens, dit.cross_attention_dim);
   WritePromptEmbeds(p.audio_embeds, "ltx2.embeds.audio", prompt_tokens,
+                    dit.audio_cross_attention_dim);
+  // `.negative` tags, so the two halves differ. `Param` seeds from the NAME, so
+  // these are as deterministic as the positive pair and independent of it.
+  WritePromptEmbeds(p.negative_video_embeds, "ltx2.embeds.video.negative", prompt_tokens,
+                    dit.cross_attention_dim);
+  WritePromptEmbeds(p.negative_audio_embeds, "ltx2.embeds.audio.negative", prompt_tokens,
                     dit.audio_cross_attention_dim);
   return p;
 }

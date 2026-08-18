@@ -54,6 +54,7 @@ from tools.bench.serve_low_common import (
     VLLM_COMMIT,
     coefficient_of_variation,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     sha256_file,
     write_json_atomic,
@@ -106,6 +107,11 @@ def _aggregate(values: Sequence[float]) -> dict[str, float]:
 
 
 def _run_metrics(record: Mapping[str, Any]) -> dict[str, float]:
+    # #931: the guard belongs where the rate is derived, not only in whichever
+    # validator happens to run first. `summarize_evidence` calls
+    # `validate_raw_result` immediately above this today; the next caller of
+    # `_run_metrics` will not.
+    require_complete_request_set(record, source="online-gate run record")
     duration = require_number(record.get("duration"), "duration")
     metrics = {
         axis: require_number(record.get(axis), axis)

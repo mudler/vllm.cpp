@@ -178,6 +178,42 @@ class Qwen3DenseModel {
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
+
+  // The `inputs_embeds` ENTRY (MODEL-MUSIC-MUSIC3 W2, #672) — additive, and the
+  // door the Qwen3 family already has everywhere except here.
+  //
+  // `Qwen3VLForConditionalGeneration` takes `inputs_embeds_bf16` after scattering
+  // the vision tower's rows into it (qwen3_vl.h:145,159; qwen3_vl_text.h:62-65);
+  // Gemma-4 and Muse-Glimmer do the same (gemma4.h:210-218,
+  // muse_glimmer.h:369-380). All of them exist because upstream's own
+  // `Qwen3Model.forward` accepts EITHER `input_ids` OR `inputs_embeds`, and the
+  // DENSE registration only ever wired the first. MiniMax-Music3's autoregressive
+  // loop is the caller that needs the second on the plain text model: its frame
+  // feedback is `_embed_audio_frame` (encoders.py:106-115), a SUM of one language-
+  // model row and seven depth-decoder rows scaled by num_codebooks^-0.5, which
+  // corresponds to no vocabulary entry and so cannot be spelled as a token id.
+  //
+  // `inputs_embeds_bf16` is the ALREADY-BUILT [num_tokens * hidden_size] host bf16
+  // hidden stream; `token_ids` has no counterpart here and is not taken. The layer
+  // stack, the final RMSNorm, the `logits_indices` gather and the (tied/untied)
+  // lm_head are the SAME ones Forward runs, so this is one branch at the embed
+  // step and nothing else — every token-id caller is byte-identical, which
+  // tests/vllm/models/test_qwen3_forward.cpp asserts by feeding the embedding of
+  // the same ids through both entries.
+  //
+  // `out_hidden`, when non-null, additionally receives the [n_out, hidden_size]
+  // f32 post-final-norm rows — the SAME rows ForwardHidden returns — from the one
+  // forward that produced the logits. Music3 reads `last_hidden_state[:, -1]` and
+  // applies `lm_head` to that same row (encoders.py:311-318), so a second 8.6B
+  // pass to fetch the other half would be pure waste. Null ⇒ not computed.
+  static std::vector<float> ForwardEmbeds(
+      const std::vector<uint16_t>& inputs_embeds_bf16,
+      const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {},
+      std::vector<float>* out_hidden = nullptr);
 };
 
 // SHARED pure-dense decode CUDA-graph driver — the sibling of Qwen3MoeDecodeGraph

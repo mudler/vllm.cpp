@@ -1,7 +1,9 @@
-// LTX-2.5 LATENT SPATIAL UPSAMPLER — stage 2 of the distilled two-stage recipe.
+// LTX-2.5 LATENT UPSAMPLER — the SPATIAL x2 arm (stage 2 of the distilled
+// two-stage recipe) and the TEMPORAL x2 arm.
 //
-// Row: MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model. Spec:
-// .agents/specs/ltx-2-5.md (phase L5). Issue #435.
+// Row: MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model. Specs:
+// .agents/specs/ltx-2-5.md (phase L5, the spatial arm, issue #435) and
+// .agents/specs/ltx25-temporal-upsampler.md (the temporal arm, issue #644 row E).
 //
 // ─── WHAT THIS IS A PORT OF (file:line on BOTH sides) ────────────────────────
 // Upstream root: Lightricks/LTX-2, packages/ltx-core/src/ltx_core/model/upsampler/
@@ -10,10 +12,26 @@
 //   Ltx2UpsamplerConfig         <-  model.py:25-80 + model_configurator.py:11-31
 //   (ResBlock)                  <-  res_block.py:29-37
 //   (SpatialRationalResampler)  <-  spatial_rational_resampler.py:40-47
-//   (PixelShuffleND)            <-  pixel_shuffle.py:31-54
+//   (PixelShuffleND, dims 2)    <-  pixel_shuffle.py:40-46
+//   (PixelShuffleND, dims 1)    <-  pixel_shuffle.py:47-52
+//   (the first-frame drop)      <-  model.py:111-113
 //   (BlurDownsample)            <-  blur_downsample.py:29-53
 //   Ltx2RationalForScale        <-  spatial_rational_resampler.py:10-14
 //   Ltx2UpsampleVideoLatent     <-  model.py:129-143 (upsample_video)
+//
+// ─── WHAT THE TEMPORAL ARM IS REACHABLE FROM ─────────────────────────────────
+// NOTHING, today, and that is stated here rather than only in the spec because a
+// header is what the next reader opens. It is ported and gated against executed
+// upstream at reduced dimensions, and `Ltx2ParseUpsamplerConfig`
+// (ltx2_loader.cpp:1431-1444) reads `temporal_upsample` off a checkpoint. But the
+// engine's ONE upsampler call site is the `kSpatialUpsample` phase input
+// transform (multimodal/ltx2_video.cpp:1408-1466), which shape-checks the result
+// against a SPATIALLY doubled latent and fails otherwise; and upstream's only
+// consumer is `DFRPipeline`'s rounds loop (ltx-pipelines/dfr_pipeline.py:235-245,
+// 402-407), which is not ported. The shipped temporal checkpoint
+// (`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`,
+// ltx-pipelines/docs/pipelines.md:176) is not on the NAS either, so no
+// real-weight result exists.
 //
 // ─── WHAT SEPARATES THIS FROM THE VAE'S CONVOLUTIONS ─────────────────────────
 // These are plain `torch.nn.Conv3d`/`Conv2d` with `padding=1` — ZERO padding on
@@ -31,11 +49,16 @@
 //    (res_block.py:36). `activation(x) + residual` is the same shape and a
 //    different function.
 //  * PixelShuffleND unpacks `(c p1 p2)` with p1 taking HEIGHT and p2 taking WIDTH
-//    (pixel_shuffle.py:41-47). Swapping them transposes every 2x2 block.
+//    (pixel_shuffle.py:41-47). Swapping them transposes every 2x2 block. The
+//    dims=1 arm has the same trap on one axis: `(c p1)` -> `(f p1)` puts p1
+//    FASTEST in both groupings (pixel_shuffle.py:47-52).
+//  * The temporal arm DROPS THE FIRST FRAME after the shuffle (model.py:109-113),
+//    so `f` frames in produce `2f - 1` out and not `2f`.
 //
 // ─── NOT PORTED, refused by name ─────────────────────────────────────────────
-//  * `temporal_upsample` (model.py:55-72, 109-113) — spec section 2 puts the
-//    temporal x2 upsampler out of scope; asking for it throws.
+//  * `spatial_upsample AND temporal_upsample` (model.py:55-59) — a DIFFERENT
+//    operator from the temporal-only arm: `Conv3d(mid, 8*mid)` + PixelShuffleND(3).
+//    Asking for it throws.
 //  * `dims == 2` (model.py:85-100) — a checkpoint that sets it wants Conv2d
 //    everywhere, i.e. no temporal convolution at all. LTX-2.5's upsampler is
 //    dims=3; the 2-D arm is refused rather than approximated by the 3-D one.
@@ -68,6 +91,14 @@ inline constexpr int64_t kLtx2UpsamplerNormGroups = 32;
 // below still earns its place, because a golden regenerated with a moved eps
 // moves with it and only the pin compares against torch's own default.
 inline constexpr double kLtx2UpsamplerNormEps = 1e-5;
+
+// `PixelShuffleND.__init__`'s `upscale_factors` default (pixel_shuffle.py:25),
+// element 0 — the only element the `dims == 1` arm reads (:47-52). No
+// construction site in `ltx_core` passes one, so this default IS the shipped
+// temporal upscale factor and it decides how many frames come out. Gated against
+// upstream's own signature by test_ltx2_pipeline.cpp, case "ltx2 the latent
+// temporal upsampler reproduces upstream".
+inline constexpr int64_t kLtx2UpsamplerTemporalFactor = 2;
 
 // LatentUpsampler.__init__ defaults (model.py:25-35), which are also
 // LatentUpsamplerConfigurator.from_metadata's `config.get` fallbacks
@@ -131,9 +162,10 @@ struct Ltx2LatentVolume {
   int64_t elems() const { return batch * channels * frames * height * width; }
 };
 
-// LatentUpsampler.forward (model.py:82-126), the dims == 3 spatial arm. Throws by
-// name for `dims == 2`, for `temporal_upsample`, and when neither upsample flag
-// is set (upstream's own ValueError at :74).
+// LatentUpsampler.forward (model.py:82-126), the dims == 3 arms: spatial-only
+// (`[b, c, f, h, w] -> [b, c, f, 2h, 2w]` at scale 2.0) and temporal-only
+// (`-> [b, c, 2f-1, h, w]`). Throws by name for `dims == 2`, for both flags set
+// at once, and when neither is set (upstream's own ValueError at :74).
 Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
                                     const Ltx2VaeWeights& weights,
                                     const Ltx2LatentVolume& latent);

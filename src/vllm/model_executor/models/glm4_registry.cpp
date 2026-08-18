@@ -67,7 +67,7 @@ void PrepareGlm4ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardGlm4ForCausalLM(LoadedModel& model,
                                      const ModelForwardInput& input) {
-  const auto& glm = static_cast<Glm4LoadedModel&>(model);
+  const auto& glm = ModelAs<Glm4LoadedModel>(model, "Glm4ForCausalLM");
   const Glm4Weights& weights = glm.weights();
   if (input.gather_logits) {
     return Glm4Model::ForwardDevice(input.token_ids, input.positions,

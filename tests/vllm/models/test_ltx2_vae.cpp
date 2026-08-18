@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 #include <string>
@@ -23,9 +24,16 @@
 
 #include "doctest/doctest.h"
 #include "support/max_abs_diff.h"
+// LTX25-DECODE-THREADS (issue #1009): Threadpool::SwapForTesting and the pool's
+// work-stealing cursor, reached via -I src the way every other threading A/B in
+// this tree does (tests/vt/test_ops_conv2d.cpp:25).
+#include "vt/cpu/cpu_threadpool.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
+// The accumulator-width case enters the decode through the PRODUCTION streaming
+// entry point rather than through Ltx2ConvVideoDecode (issue #1008).
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 // vocoder1d::kSnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
@@ -1057,6 +1065,344 @@ TEST_CASE("ltx2 vae: the NON-causal Conv video decoder matches upstream ltx_core
       causal_cfg, causal_bag.weights, latent, lc, lt, lh, lw, &causal_noise);
   REQUIRE(causal_frames.data.size() == frames.data.size());
   CHECK(causal_frames.data != frames.data);
+}
+
+TEST_CASE("ltx2 vae: the decode's convolution accumulates in f32, the width torch uses") {
+  // THE ONE DEFECT THE GOLDENS STRUCTURALLY CANNOT REPORT, so it gets its own
+  // instrument (issue #1008, .agents/specs/ltx25-decode-dtype.md).
+  //
+  // Every golden in this file is vacuous on accumulator WIDTH by construction:
+  // scripts/gen-ltx2-vae-goldens.py:223 casts every upstream parameter with
+  // `values.astype(np.float32)`, so the oracle ran f32 end to end and a dtype
+  // comparison against it compares nothing. A decode that accumulated in f64 —
+  // as this one did until #1008 — stays numerically plausible, keeps every
+  // golden green, and moves twice the bytes. AGENTS.md says a token gate cannot
+  // detect a dtype that is too wide; this case is what detects it here.
+  //
+  // THE REDUCTION IS ENGINEERED SO THE TWO WIDTHS ARE SEPARABLE, and the
+  // expected value is UPSTREAM'S, not a recording of what this port emits.
+  // MEASURED with torch 2.11.0 on exactly the taps below:
+  //   F.conv3d, f32 tensors  -> 0.0
+  //   F.conv3d, bf16 tensors -> 0.0   (upstream's own dtype, distilled.py:109)
+  //   F.conv3d, f64 tensors  -> 2.500000014901161
+  // Why 0.0 holds for ANY f32 summation order: half an ulp of 1e8 is 4.0, and
+  // the 25 small taps sum to 2.5, so every partial sum rounds back to exactly
+  // 1e8 and the closing -1e8 cancels it exactly. An f64 accumulator keeps the
+  // 2.5. There is no order in which an f32 accumulator does.
+  constexpr float kBig = 1e8f;
+  constexpr float kSmall = 0.1f;
+
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  cfg.prefix = "ltx2.videodec.accwidth.";
+  cfg.in_channels = 1;
+  cfg.out_channels = 1;
+  cfg.patch_size = 1;
+  cfg.base_channels = 2;
+  cfg.causal = false;
+  cfg.timestep_conditioning = false;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  // REPLICATE, not the fixtures' reflect: with a uniform input every conv tap
+  // then reads exactly 1.0 at every output voxel INCLUDING the borders, so one
+  // reduction is repeated everywhere and no voxel is a special case. `kZeros`
+  // would zero the border taps and break the derivation below.
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReplicate;
+  // No blocks at all. The decode is then conv_in -> PixelNorm -> SiLU ->
+  // conv_out, which is short enough to carry an ANALYTIC expectation end to end
+  // rather than a checked-in vector that only records today's behaviour.
+  cfg.decoder_blocks = {};
+
+  const std::string p = cfg.prefix;
+  vllm::Ltx2VaeWeights weights;
+  weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+
+  // conv_in is [out=2, in=1, 3, 3, 3]. Output channel 0 carries the separable
+  // reduction in the exact order CausalConv3d walks it (ic, then a, b, d, so
+  // flat 0..26); output channel 1 is all-zero with a bias of 1, purely to give
+  // PixelNorm a second channel with a known norm.
+  std::vector<float> conv_in(2 * 1 * 27, 0.0f);
+  conv_in[0] = kBig;
+  for (size_t i = 1; i < 26; ++i) conv_in[i] = kSmall;
+  conv_in[26] = -kBig;
+  weights.tensors[p + "conv_in.conv.weight"] = conv_in;
+  weights.tensors[p + "conv_in.conv.bias"] = {0.0f, 1.0f};
+
+  // conv_out is [out=1, in=2, 3, 3, 3]; it selects channel 0's centre tap and
+  // nothing else, so it forwards the value under test without adding a second
+  // reduction that could mask it.
+  //
+  // THE BIAS IS 7, AND THAT IS NOT COSMETIC. With a bias of 0 the f32 answer is
+  // zero, and a decode that never ran — a deleted call site handing back a
+  // zero-filled buffer — produces zero as well, so the case would pass while
+  // measuring nothing. This was not hypothetical: the reachability mutation was
+  // run, the stub returned zeros, and an earlier draft of this case PASSED.
+  // Offsetting the expectation off zero is what separates "accumulated in f32"
+  // from "nothing reached this at all".
+  constexpr float kOutBias = 7.0f;
+  std::vector<float> conv_out(1 * 2 * 27, 0.0f);
+  conv_out[13] = 1.0f;  // ic=0, a=b=d=1
+  weights.tensors[p + "conv_out.conv.weight"] = conv_out;
+  weights.tensors[p + "conv_out.conv.bias"] = {kOutBias};
+
+  const int64_t lt = 1, lh = 2, lw = 2;
+  const std::vector<float> latent(static_cast<size_t>(lt * lh * lw), 1.0f);
+
+  vllm::Ltx2TileSizeConfig tiling;
+  tiling.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.height = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.width = vllm::Ltx2DimensionSizeConfig{10000, 0};
+
+  // ENTERS THROUGH THE PRODUCTION ENTRY POINT. `Ltx2VideoDecodeStreaming` is
+  // what the render path calls (src/vllm/multimodal/ltx2_video.cpp:3258), and it
+  // reaches Ltx2ConvVideoDecode through ltx2_video_vae_tiled.cpp:113. Deleting
+  // that call site turns this case RED, which is the reachability proof; a case
+  // that called Ltx2ConvVideoDecode directly would prove only that the function
+  // works. A null noise stream is deliberate: this configuration must not draw,
+  // and the decode's own VT_CHECK fails loudly if that ever changes.
+  int64_t chunks = 0;
+  vllm::Ltx2VideoFrames got;
+  vllm::Ltx2VideoDecodeStreaming(
+      vllm::Ltx2VideoDecoderKind::kConv, cfg, weights, latent, cfg.in_channels, lt, lh, lw,
+      /*noise=*/nullptr, tiling, [&](const vllm::Ltx2VideoChunk& chunk) {
+        ++chunks;
+        got = chunk.frames;
+      });
+  REQUIRE(chunks == 1);
+  REQUIRE(got.data.size() == 4u);
+
+  // THE DERIVATION, so a reader can check the number rather than trust it.
+  //   conv_in ch0 = 0 (f32) or 2.5 (f64);  conv_in ch1 = bias = 1
+  //   PixelNorm over 2 channels: f32 mean_sq = 0.5, and 0 * anything = 0
+  //   SiLU(0) = 0;  conv_out forwards ch0 and adds its bias
+  // so an f32 accumulator makes EVERY output element exactly the bias. An f64
+  // one gives 2.5 -> 2.5/sqrt(3.625) = 1.31306 -> SiLU -> ~1.03473 on top of it,
+  // a gap of 1.03, which is 200000x the golden tolerance. Nothing between the
+  // two arms is a matter of tolerance.
+  const std::vector<float> want(4, kOutBias);
+  const double err = MaxAbsDiff(got.data, want.data(), got.data.size());
+  INFO("conv accumulator width probe max|out - bias| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // The f64 answer stated as a value, so this case fails LOUDLY rather than
+  // drifting if the accumulator is ever widened again. 1.03473 is what this
+  // decode returned before #1008 narrowed it.
+  CHECK(err < 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// LTX25-DECODE-THREADS (issue #1009): the decode had 20 cores and used one.
+// .agents/specs/ltx25-decode-threads.md
+// ---------------------------------------------------------------------------
+
+// The fixture both threading cases decode. Deliberately shared, so the case that
+// proves the dispatch happens and the case that proves the result does not
+// depend on it are looking at the SAME work.
+//
+// It is the accumulator-width fixture's derivation at a size where the
+// convolution has many output lines: `decoder_blocks` empty, patch_size 1,
+// replicate padding and an all-ones latent, so every conv tap reads exactly 1.0
+// at every output voxel including the borders and one reduction is repeated
+// everywhere. conv_in channel 0 carries the f32/f64 separable reduction, channel
+// 1 is all-zero weights with bias 1, conv_out selects channel 0's centre tap and
+// adds a bias of 7.
+struct Ltx2ThreadFixture {
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  vllm::Ltx2VaeWeights weights;
+  std::vector<float> latent;
+  int64_t lt = 0, lh = 0, lw = 0;
+};
+
+Ltx2ThreadFixture MakeLtx2ThreadFixture() {
+  Ltx2ThreadFixture f;
+  f.cfg.prefix = "ltx2.videodec.threads.";
+  f.cfg.in_channels = 1;
+  f.cfg.out_channels = 1;
+  f.cfg.patch_size = 1;
+  // 24 output channels, so conv_in's parallel row count is 24 * out.t * out.h and
+  // no thread count under test degenerates to one chunk.
+  f.cfg.base_channels = 24;
+  f.cfg.causal = false;
+  f.cfg.timestep_conditioning = false;
+  f.cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  f.cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReplicate;
+  f.cfg.decoder_blocks = {};
+
+  const std::string p = f.cfg.prefix;
+  f.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  f.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+
+  // conv_in is [out=24, in=1, 3, 3, 3]. Channel 0 carries the separable
+  // reduction in the exact order CausalConv3d walks it; channels 1..23 are
+  // all-zero weights with bias 1, which gives PixelNorm 23 unit channels to
+  // divide by and keeps channel 0 at zero on an f32 accumulator.
+  constexpr float kBig = 1e8f;
+  constexpr float kSmall = 0.1f;
+  std::vector<float> conv_in(static_cast<size_t>(24 * 1 * 27), 0.0f);
+  conv_in[0] = kBig;
+  for (size_t i = 1; i < 26; ++i) conv_in[i] = kSmall;
+  conv_in[26] = -kBig;
+  f.weights.tensors[p + "conv_in.conv.weight"] = conv_in;
+  std::vector<float> conv_in_bias(24, 1.0f);
+  conv_in_bias[0] = 0.0f;
+  f.weights.tensors[p + "conv_in.conv.bias"] = conv_in_bias;
+
+  // conv_out is [out=1, in=24, 3, 3, 3]; it selects channel 0's centre tap and
+  // nothing else. THE BIAS IS 7 for the reason #1008 recorded: with a bias of 0
+  // the expected value is zero, and a decode that never ran hands back a
+  // zero-filled buffer, so the case would pass while measuring nothing.
+  std::vector<float> conv_out(static_cast<size_t>(1 * 24 * 27), 0.0f);
+  conv_out[13] = 1.0f;  // ic = 0, a = b = d = 1
+  f.weights.tensors[p + "conv_out.conv.weight"] = conv_out;
+  f.weights.tensors[p + "conv_out.conv.bias"] = {7.0f};
+
+  f.lt = 3;
+  f.lh = 5;
+  f.lw = 4;
+  f.latent.assign(static_cast<size_t>(f.lt * f.lh * f.lw), 1.0f);
+  return f;
+}
+
+// Untiled, so the ONE decode call the streaming entry point makes is the whole
+// measurement.
+vllm::Ltx2TileSizeConfig Ltx2ThreadUntiled() {
+  vllm::Ltx2TileSizeConfig tiling;
+  tiling.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.height = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.width = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  return tiling;
+}
+
+vllm::Ltx2VideoFrames Ltx2ThreadDecode(const Ltx2ThreadFixture& f, int64_t* chunks) {
+  // ENTERS THROUGH THE PRODUCTION ENTRY POINT. `Ltx2VideoDecodeStreaming` is what
+  // the render path calls (src/vllm/multimodal/ltx2_video.cpp:3258) and it reaches
+  // Ltx2ConvVideoDecode at ltx2_video_vae_tiled.cpp:113. A case that called
+  // Ltx2ConvVideoDecode directly would prove the function works, never that the
+  // shipping path reaches the threaded one.
+  vllm::Ltx2VideoFrames got;
+  *chunks = 0;
+  vllm::Ltx2VideoDecodeStreaming(
+      vllm::Ltx2VideoDecoderKind::kConv, f.cfg, f.weights, f.latent, f.cfg.in_channels, f.lt, f.lh,
+      f.lw, /*noise=*/nullptr, Ltx2ThreadUntiled(), [&](const vllm::Ltx2VideoChunk& chunk) {
+        ++*chunks;
+        got = chunk.frames;
+      });
+  return got;
+}
+
+TEST_CASE("ltx2 vae: the decode DISPATCHES its convolutions to the CPU threadpool") {
+  // THE CASE THAT IS RED BEFORE #1009, and the reason the determinism case below
+  // is not enough on its own: two runs of a SERIAL decode are also bit-identical,
+  // so a thread-count A/B is green on an implementation that never threads
+  // anything. This case observes the dispatch itself.
+  //
+  // THE INSTRUMENT. `ParallelForRows` (src/vt/cpu/cpu_threadpool.cpp:413-458)
+  // partitions its rows through the pool's shared work-stealing cursor: worker 0
+  // seeds it with `ChunkSet(nth)` and every steal advances it with `ChunkAdd(1)`.
+  // `ChunkAdd(0)` is a public non-mutating read of that cursor — `fetch_add(0)`
+  // returns the current value. A fresh pool reads 0; a pool that has run at least
+  // one multi-chunk partitioned dispatch reads at least `nth`. So the read is a
+  // direct observation of "partitioned work ran on THIS pool", and the assertion
+  // before the decode is its own positive control: the instrument demonstrably
+  // reads zero when nothing has dispatched, which is exactly the state this row
+  // removes.
+  const Ltx2ThreadFixture f = MakeLtx2ThreadFixture();
+
+  vt::cpu::Threadpool tp(4);
+  REQUIRE(tp.NThreads() == 4);
+  // Positive control: the cursor reads zero on a pool nothing has dispatched to.
+  REQUIRE(tp.ChunkAdd(0) == 0);
+
+  vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+  int64_t chunks = 0;
+  vllm::Ltx2VideoFrames got;
+  try {
+    got = Ltx2ThreadDecode(f, &chunks);
+  } catch (...) {
+    vt::cpu::Threadpool::SwapForTesting(prev);
+    throw;
+  }
+  const int cursor = tp.ChunkAdd(0);
+  vt::cpu::Threadpool::SwapForTesting(prev);
+
+  REQUIRE(chunks == 1);
+  REQUIRE(got.data.size() == static_cast<size_t>(f.lt * f.lh * f.lw));
+
+  // The decode ran, and it ran through the pool.
+  CHECK(cursor > 0);
+
+  // AND IT PRODUCED THE RIGHT PIXELS. The derivation, so a reader can check the
+  // number rather than trust it: conv_in channel 0 accumulates to 0 in f32,
+  // channels 1..23 to their bias of 1; PixelNorm leaves channel 0 at 0; SiLU(0)
+  // is 0; conv_out forwards channel 0 and adds its bias. Every output element is
+  // therefore exactly 7. A stubbed or deleted decode returns zeros and fails
+  // here; an f64 accumulator keeps channel 0's 2.5 and fails here too.
+  const std::vector<float> want(got.data.size(), 7.0f);
+  const double err = MaxAbsDiff(got.data, want.data(), got.data.size());
+  INFO("threaded decode max|out - 7| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the decode is BIT-IDENTICAL across thread counts") {
+  // The determinism half of #1009. `ParallelForRows` steals work through an
+  // atomic cursor, so which worker takes which output line is genuinely
+  // non-deterministic run to run; the partition is over OUTPUT lines only and the
+  // whole `ci * kernel^3` reduction stays inside one output element's body, so
+  // every element is produced by the same instruction sequence on the same values
+  // whatever the worker count is. That is the contract cpu_threadpool.h:39-43
+  // states for the whole CPU backend, and this case holds the decode to it.
+  //
+  // A decode that returns different pixels at 1 thread and at 8 is a defect even
+  // with every golden green, and no golden here would see it: the goldens run at
+  // one thread count, the global pool's.
+  //
+  // Worker count 1 short-circuits ParallelForRows to `body(0, nr)` on the caller
+  // (cpu_threadpool.cpp:423-426), so the 1-thread arm IS the pre-#1009 serial code
+  // path byte for byte, and every other arm is compared against it.
+  //
+  // WHY 3 AND 5, STATED CORRECTLY. It is NOT that they fail to divide the row
+  // counts — they divide both of this fixture's conv row counts exactly. conv_in
+  // partitions 24*3*5 = 360 output lines and conv_out 1*3*5 = 15, and 3 and 5
+  // divide each of those. The mechanism is that a chunk boundary is a function of
+  // `nth * 4`, not of `nth`: ParallelForRows takes four chunks per thread
+  // (cpu_threadpool.cpp:428-431), so `dr = ceil(nr / nchunk)` (:443) with
+  // `nchunk = ceil(nr / ceil(nr / (nth*4)))`. At nr = 360 that is a stride of 45
+  // at 2 workers, 30 at 3, 18 at 5 and 12 at 8 — four DIFFERENT partitions of the
+  // same output, which is what the memcmp needs. Do NOT "fix" the fixture's row
+  // counts to make them indivisible by 3 and 5: that would change the shape for a
+  // reason that was never true, and 4 distinct strides is the property that
+  // matters.
+  const Ltx2ThreadFixture f = MakeLtx2ThreadFixture();
+
+  std::vector<float> base;
+  for (int nth : {1, 2, 3, 5, 8}) {
+    vt::cpu::Threadpool tp(nth);
+    vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+    int64_t chunks = 0;
+    vllm::Ltx2VideoFrames got;
+    try {
+      got = Ltx2ThreadDecode(f, &chunks);
+    } catch (...) {
+      vt::cpu::Threadpool::SwapForTesting(prev);
+      throw;
+    }
+    vt::cpu::Threadpool::SwapForTesting(prev);
+
+    REQUIRE(chunks == 1);
+    REQUIRE(got.data.size() == static_cast<size_t>(f.lt * f.lh * f.lw));
+    if (base.empty()) {
+      // NOT DEGENERATE, so a stubbed decode cannot satisfy the comparison below.
+      // An all-zero buffer is bit-identical to another all-zero buffer, so
+      // "every arm agrees" is a vacuous statement about a decode that never ran.
+      // This fixture's answer is 7 everywhere, which no absent computation
+      // produces.
+      const std::vector<float> want(got.data.size(), 7.0f);
+      REQUIRE(MaxAbsDiff(got.data, want.data(), got.data.size()) <= kLtx2GoldenTol);
+      base = got.data;
+    } else {
+      INFO("worker count " << nth);
+      CHECK(std::memcmp(base.data(), got.data.data(), base.size() * sizeof(float)) == 0);
+    }
+  }
 }
 
 TEST_CASE("ltx2 vae: the video decoder's norm_eps is gated where it BINDS") {
@@ -2371,6 +2717,77 @@ TEST_CASE("ltx2 conditioning: a KEYFRAME appends tokens at its own pixel frame")
   CHECK(no_fix.positions == state.positions);
 }
 
+TEST_CASE("ltx2 conditioning: the keyframe causal fix is gated on frame_idx == 0, and shows") {
+  // THE GATE `keyframe_cond.py:49` MIRRORS — `latent_tools.causal_fix if
+  // self.frame_idx == 0 else False` — and the reason it needs its own case is
+  // that the sibling case above cannot see it. That one passes
+  // `num_pixel_frames = 1`, and at that value the fix is INERT AT EVERY
+  // `frame_idx`: `get_pixel_coords` rewrites the temporal axis to
+  // `max(value + 1 - time, 0)` (patchifiers.py:166-169), which leaves a
+  // one-latent-frame keyframe's START at 0 either way, and then the
+  // `num_pixel_frames == 1` narrow at `keyframe_cond.py:56-57` overwrites the END
+  // the fix had moved. So `no_fix.positions == state.positions` there holds
+  // whether the gate is wired forwards, backwards, or not at all.
+  //
+  // MEASURED, on a probe of `Ltx2ConditionVideoByKeyframe` at these shapes:
+  // `num_pixel_frames = 1` gives 0 of 48 differing position values at
+  // `frame_idx` 0 and at `frame_idx` 8 alike; `num_pixel_frames != 1` gives 4 of
+  // 48 at `frame_idx` 0 and 0 of 48 at `frame_idx` 8. This case is that probe.
+  // The production first-frame arm (`ltx2_video.cpp`) passes
+  // `num_pixel_frames = 1`, so its `causal_fix = true` is unobservable BY
+  // CONSTRUCTION and no call-site check can gate it — this is where the gate
+  // lives instead.
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
+
+  // `num_pixel_frames` anything but 1, so the temporal END survives to be read.
+  constexpr int64_t kWideFrames = 2;
+
+  auto positions_at = [&](int64_t frame_idx, bool causal_fix) {
+    vllm::Ltx2LatentState state =
+        vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+    vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps, frame_idx,
+                                       /*strength=*/0.6, kWideFrames, causal_fix);
+    return state.positions;
+  };
+
+  // ── frame 0: the gate is OPEN, so the argument reaches `get_pixel_coords` ──
+  const std::vector<float> at0_fix = positions_at(0, true);
+  const std::vector<float> at0_no = positions_at(0, false);
+  REQUIRE(at0_fix.size() == at0_no.size());
+  CHECK_MESSAGE(at0_fix != at0_no,
+                "at frame_idx 0 `causal_fix` is passed through unchanged "
+                "(keyframe_cond.py:49), so flipping it must move the temporal positions. Equal "
+                "here means the argument never reaches `get_pixel_coords` and the production "
+                "call sites are choosing a value nothing consumes");
+
+  // ...and the DIRECTION is upstream's, not merely different. The fix shortens
+  // the first latent frame's pixel span from `[0, time)` to `[0, 1)`, because
+  // the VAE's stride for the very first frame is 1 (patchifiers.py:166-169), so
+  // the fixed temporal END is the SMALLER of the two. A flag wired backwards
+  // moves the positions and fails only this half.
+  const size_t tokens_before = static_cast<size_t>(
+      vllm::Ltx2VideoTokenCount(target, kCondPatch));
+  const size_t first_end = tokens_before * 2 + 1;  // dimension 0, first appended token, [1]
+  REQUIRE(at0_fix.size() > first_end);
+  CHECK_MESSAGE(at0_fix[first_end] < at0_no[first_end],
+                "the causal fix SHORTENS the first frame's temporal span "
+                "(patchifiers.py:166-169); fixed end "
+                    << at0_fix[first_end] << " against unfixed " << at0_no[first_end]);
+
+  // ── any other frame: the gate is CLOSED and the argument is discarded ──────
+  const std::vector<float> at5_fix =
+      positions_at(vllm_test::kLtx2CondKeyframeFrameIdx, true);
+  const std::vector<float> at5_no =
+      positions_at(vllm_test::kLtx2CondKeyframeFrameIdx, false);
+  CHECK_MESSAGE(at5_fix == at5_no,
+                "a keyframe that is not at pixel frame 0 has no first frame to correct, so "
+                "`keyframe_cond.py:49` forces False and the argument must change nothing. This "
+                "is the half the sibling case states, and at `num_pixel_frames = 1` it holds "
+                "vacuously");
+}
+
 TEST_CASE("ltx2 conditioning: a REFERENCE VIDEO is translated into the target's frame") {
   const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
   const vllm::Ltx2ScaleFactors factors;
@@ -2404,6 +2821,177 @@ TEST_CASE("ltx2 conditioning: a REFERENCE VIDEO is translated into the target's 
   INFO("unscaled reference positions max|diff| = " << err);
   CHECK(err <= kLtx2GoldenTol);
   CHECK(plain.positions != state.positions);
+}
+
+// ─── the token-APPEND seam (row LTX25-TOKEN-APPEND, issue #930) ─────────────
+//
+// UPSTREAM SHIPS NO TESTS. `find /home/mudler/_git/LTX-2 -name 'test_*.py'`
+// returns 0 across the whole repository at pin `fd4ded7f`, so there is no suite
+// to port and each case below is written against an upstream ANCHOR instead:
+// every assertion names the `file:line` that justifies the behaviour it checks.
+//
+// These are the two halves of an append the conditioning items could not do for
+// themselves. The items concatenate; nothing extended the per-token marker
+// alongside them, and nothing trimmed the sequence back.
+
+TEST_CASE("ltx2 conditioning: an APPEND extends the per-token keyframes marker") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+
+  // `create_initial_state` returns the marker ON the state (tools.py:184), not
+  // beside it. A port that only filled the out-parameter would leave an
+  // appending item with nothing to extend.
+  REQUIRE(static_cast<int64_t>(state.keyframes_mask.size()) == state.tokens);
+  const std::vector<float> before = state.keyframes_mask;
+
+  const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps,
+                                     vllm_test::kLtx2CondKeyframeFrameIdx, /*strength=*/0.6,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+
+  // ONE VALUE PER TOKEN, still. This is the invariant `extend_keyframes_mask`
+  // exists for, in upstream's own words: "otherwise the per-token marker goes
+  // out of sync with the token sequence" (mask_utils.py:83-85). Out of sync is
+  // invisible to every shape check downstream — the render stays the right size
+  // and applies a trained term to the wrong tokens.
+  CHECK(static_cast<int64_t>(state.keyframes_mask.size()) == state.tokens);
+  REQUIRE(state.tokens == vllm_test::kLtx2CondKeyframeTokens);
+
+  // The ORIGINAL values are untouched...
+  for (size_t i = 0; i < before.size(); ++i) {
+    INFO("target token " << i);
+    CHECK(state.keyframes_mask[i] == before[i]);
+  }
+  // ...and every appended token is UNMARKED. `marked=False` for given keyframe
+  // content (keyframe_cond.py:85-86, whose comment says given keyframe content
+  // carries no keyframe marker). Marking them would add a trained bias to
+  // tokens upstream leaves alone, and the render would still be finite and the
+  // right shape.
+  for (size_t i = before.size(); i < state.keyframes_mask.size(); ++i) {
+    INFO("appended token " << i);
+    CHECK(state.keyframes_mask[i] == 0.0F);
+  }
+}
+
+TEST_CASE("ltx2 conditioning: extend_keyframes_mask mirrors BOTH of upstream's None branches") {
+  // The branches are not symmetric and a port that treats them as one gets the
+  // generated-slot arm silently wrong (mask_utils.py:96-101).
+  SUBCASE("no existing mask and UNMARKED stays None") {
+    // `if existing is None and not marked: return None`
+    // (conditioning/mask_utils.py:98-99). An audio state carries no marker:
+    // `AudioLatentTools.create_initial_state` (tools.py:246-280) returns
+    // `self.patchify(LatentState(...))` with no `keyframes_mask` argument at
+    // all, where the video tools' own `create_initial_state` sets one on the
+    // line that builds the state (tools.py:184). Appending reference audio must
+    // therefore not materialise a zero mask, because a zero mask IS a mask and
+    // the DiT would read it as one.
+    const vllm::Ltx2AudioLatentShape target = CondAudioTarget();
+    const vllm::Ltx2AudioPatchifierParams params;
+    vllm::Ltx2LatentState state = vllm::Ltx2CreateAudioLatentState(target, params);
+    REQUIRE(state.keyframes_mask.empty());
+
+    vllm::Ltx2ExtendKeyframesMask(&state, /*num_new_tokens=*/3, /*marked=*/false);
+    CHECK(state.keyframes_mask.empty());
+  }
+  SUBCASE("no existing mask and MARKED zero-fills first, then marks the new tokens") {
+    // `existing = torch.zeros_like(latent_state.denoise_mask)`
+    // (mask_utils.py:100-101 — named in full because the nearest file above is
+    // `tools.py`, whose :100-101 is a real but unrelated statement) sized
+    // by the state BEFORE the append, then ones for the new tokens. The one
+    // upstream caller that passes true is `VideoGeneratedKeyframeSlots`
+    // (keyframe_slots.py:121).
+    const vllm::Ltx2AudioLatentShape target = CondAudioTarget();
+    const vllm::Ltx2AudioPatchifierParams params;
+    vllm::Ltx2LatentState state = vllm::Ltx2CreateAudioLatentState(target, params);
+    const int64_t before = state.tokens;
+    REQUIRE(before > 0);
+
+    vllm::Ltx2ExtendKeyframesMask(&state, /*num_new_tokens=*/3, /*marked=*/true);
+    REQUIRE(static_cast<int64_t>(state.keyframes_mask.size()) == before + 3);
+    for (int64_t i = 0; i < before; ++i) {
+      INFO("pre-existing token " << i);
+      CHECK(state.keyframes_mask[static_cast<size_t>(i)] == 0.0F);
+    }
+    for (int64_t i = before; i < before + 3; ++i) {
+      INFO("new token " << i);
+      CHECK(state.keyframes_mask[static_cast<size_t>(i)] == 1.0F);
+    }
+  }
+}
+
+TEST_CASE("ltx2 conditioning: clear_conditioning TRIMS an append back to the target grid") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+
+  const int64_t target_tokens = state.tokens;
+  REQUIRE(target_tokens == vllm_test::kLtx2CondVideoBaseTokens);
+  const std::vector<float> target_positions = state.positions;
+
+  // A CONDITIONED MASK VALUE INSIDE THE TARGET RANGE, and without it the
+  // all-ones assertion below gates NOTHING. `Ltx2CreateVideoLatentState` already
+  // fills every target token's mask with 1.0, and the keyframe append writes its
+  // `1 - strength` only at the TAIL, which a slice to `target_tokens` drops
+  // anyway — so "restore all ones" and "slice" produce identical bytes over the
+  // range the loop walks, and a slicing build passes. MEASURED: mutation M6
+  // sliced instead of restoring and this case stayed GREEN.
+  //
+  // `Ltx2ConditionVideoByLatentIndex` is the fix because it writes `1 - strength`
+  // at `start .. start + count` INSIDE the target (latent_cond.py:41; ours at
+  // ltx2_conditioning.cpp, the `state->mask[i] = 1.0 - strength` loop). At
+  // `latent_idx = 0` that is `start = 0`, `count = 1*2*2 = 4` of the 12 target
+  // tokens, so a slice leaves 0.4 at token 0 and the loop below REDs.
+  const vllm::Ltx2LatentVolume first = CondVolume("ltx2.cond.first", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByLatentIndex(&state, target, kCondPatch, first, /*strength=*/0.6,
+                                        /*latent_idx=*/0);
+  // THE INSTRUMENT IS ARMED, asserted rather than assumed. If this ever came
+  // back 1.0 the all-ones loop below would silently return to gating nothing,
+  // which is the exact state this case was repaired out of.
+  REQUIRE(state.mask.front() == doctest::Approx(0.4F));
+
+  const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps,
+                                     vllm_test::kLtx2CondKeyframeFrameIdx, /*strength=*/0.6,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+  REQUIRE(state.tokens > target_tokens);
+  // The APPENDED tokens carry `1 - strength` = 0.4 too. This one is a check on
+  // the append, NOT on the clear: `.back()` sits past `target_tokens`, so the
+  // trim drops it under either implementation and it can say nothing about
+  // all-ones-versus-slice. The value that separates those is `mask.front()`
+  // above.
+  REQUIRE(state.mask.back() == doctest::Approx(0.4F));
+
+  vllm::Ltx2ClearConditioning(&state, target_tokens);
+
+  // `latent`, `clean_latent` and `positions` truncated to
+  // `patchifier.get_token_count(target_shape)` (tools.py:101-105).
+  CHECK(state.tokens == target_tokens);
+  CHECK(static_cast<int64_t>(state.latent.size()) == target_tokens * state.width);
+  CHECK(static_cast<int64_t>(state.clean.size()) == target_tokens * state.width);
+
+  // THE MASK COMES BACK ALL ONES, not the conditioned mask sliced
+  // (tools.py:104 — `torch.ones_like(latent_state.denoise_mask)[:, :num_tokens]`).
+  // Slicing instead would leave 0.4 on nothing here, but on the two-stage recipe
+  // it would carry a conditioned mask into the next phase's initial latent.
+  REQUIRE(static_cast<int64_t>(state.mask.size()) == target_tokens);
+  for (int64_t i = 0; i < target_tokens; ++i) {
+    INFO("mask token " << i);
+    CHECK(state.mask[static_cast<size_t>(i)] == 1.0F);
+  }
+
+  // POSITIONS ARE TRIMMED PER DIMENSION. They are [pos_dims, tokens, 2], so a
+  // plain resize keeps the first dimension's APPENDED tokens and drops the last
+  // dimension's real ones — and the result still has the right length. Held to
+  // the target's own positions byte for byte, which is the only statement that
+  // can see the difference.
+  REQUIRE(state.positions.size() == target_positions.size());
+  CHECK(state.positions == target_positions);
+
+  // `keyframes_mask=None` (tools.py:113).
+  CHECK(state.keyframes_mask.empty());
 }
 
 TEST_CASE("ltx2 conditioning: the audio state and its REFERENCE AUDIO append") {

@@ -130,6 +130,28 @@ PROMPT_CASES = [
         "[Verse] dropped words\n[Chorus][Bridge]\nkeep this line\n"
         "tail [outro] ^ after caret",
     ),
+    # Two emphasis spans separated by ONE character. `markdown_and_tags` above
+    # carries a single italic span per line, so it cannot see the class in #1083:
+    # a trailing neighbour that is CONSUMED rather than looked ahead at advances
+    # the scan past the next span's opening `*`, and the survivors re-pair ACROSS
+    # the intended spans. Line 1 is the re-association; lines 2-3 are the plain
+    # adjacency at a line boundary and at the start of a line.
+    (
+        "adjacent_emphasis",
+        "Warm *lo-fi* *jazzy* keys with a *soft* *brushed* snare\n"
+        "*a* *b* *c*\n"
+        "*dreamy* *ambient* pads",
+        "[verse]\nlate light on the ridge",
+    ),
+    # The other side of the same rule: `(?<!\*)` / `(?!\*)` REFUSE a span whose
+    # neighbour is an asterisk, so an unbalanced run survives untouched. This is
+    # what keeps the leading guard from being dropped once the trailing one is a
+    # true lookahead.
+    (
+        "unbalanced_emphasis",
+        "a **b* c\na *b** c\n***x*** y\n*only* tail",
+        "[chorus]\nhold the line",
+    ),
 ]
 
 

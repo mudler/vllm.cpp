@@ -7,7 +7,8 @@
 // speculative decoding turned ON via EngineParams::speculative_config
 // ('{"method":"mtp","num_speculative_tokens":1}'). The 35B draft head is the MoE
 // MTP layer (Qwen3_5MTPKind::kMoe: 256 routed experts top-8 + shared expert),
-// selected automatically by model_loader.cpp:582 for the MoE target; the GDN
+// selected automatically for the MoE target by
+// `src/vllm/entrypoints/model_loader.cpp::is_dense_model`; the GDN
 // verify/rollback path is shared bit-exactly with the 27B (I4/I5a). Asserts:
 //
 //   (a) == (b) THREE-WAY IDENTITY. Greedy spec-decode is exactness-preserving, so

@@ -23,6 +23,15 @@ class ReadOnlyFileMapping final {
   const uint8_t* data() const noexcept { return data_; }
   size_t size() const noexcept { return size_; }
 
+#if !defined(_WIN32)
+  // The descriptor the mapping was made from, for a caller that wants to READ
+  // the file rather than fault it in through the mapping. Streaming an expert
+  // slice is such a caller: a pread lands the bytes in one syscall, where a
+  // memcpy from the mapping traps every 4 KiB page on the way. Negative when
+  // the mapping is not backed by a descriptor.
+  int fd() const noexcept { return fd_; }
+#endif
+
  private:
   ReadOnlyFileMapping() = default;
 

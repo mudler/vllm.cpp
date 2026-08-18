@@ -170,6 +170,42 @@ Structural deviations, and why each is forced:
   TODO admitting it is under-specified. We mirror the *behavior* (UVA requires
   pinned memory) and record the divergence if our platform layer answers
   differently.
+- **Offload is decided in the LOADERS, not over a constructed model
+  (user-directed 2026-08-15).** Upstream walks `module.named_parameters()` on a
+  built model, which is safe there because PyTorch builds modules on the meta
+  device and materialises them during load, so `wrap_modules` runs BEFORE the
+  real allocation. Our loaders materialise directly, so by the time a
+  `LoadedModel` exists the device copy is already allocated. Offloading there
+  would allocate and then move back, paying the exact peak the feature exists to
+  avoid, and on a memory-constrained device it can fail before it helps.
+  `LoadedModel` also exposes no parameter enumeration, deliberately. So the
+  decision is asked during loading, beside the residency policy that already
+  lives there (`GgufKeepQuantPolicy::Route` returns a `GgufResidency` per
+  tensor). RECORDED COST: upstream matches DOTTED parameter names, and
+  loader-side names differ by format (GGUF `blk.0.ffn_gate_exps`, safetensors
+  `model.layers.0.mlp.experts...`), so a caller must pass a canonical name or
+  the targeting semantics do not transfer. Second cost: residency is decided in
+  several loaders, and one that forgets to consult the policy silently does not
+  offload, so the application leaves owe a totality argument like the
+  `-Werror=switch` one `gguf_keep_quant.cpp` already uses.
+- **The seam was refactored once that was understood (2026-08-15).** The ABC
+  now carries `ConsiderWeight(canonical_name, bytes)`, which a loader asks per
+  weight, and ONE post-load hook, `OnModelPrepared`, which is upstream's
+  `post_init`. Two defects were removed. `PrepareModel` was a port of
+  `wrap_modules` that nothing could implement once the decision moved into the
+  loaders, and it duplicated `PostInit`. And `WeightOffloadPolicy` had become a
+  SECOND public surface answering "is this weight offloaded" beside the
+  offloader itself, which is the parallel path this protocol forbids; it is now
+  the concrete backend's internal state, reached only through `ConsiderWeight`.
+  `NoopWeightOffloader::ConsiderWeight` refuses every weight, so the existing
+  engine path is unchanged BY CONSTRUCTION rather than by a flag a caller must
+  remember to check.
+- **The earlier `PrepareModel(LoadedModel&)` hook was NOT where the UVA arm
+  acts.** The rest of W1 stands: the process-global, the factory, the
+  config-to-backend resolution, the no-op default and the graph hooks are all
+  still correct and needed. The hook itself was built against the assumption
+  above before that assumption was checked, and it is recorded here rather than
+  quietly left to confuse the next reader.
 - **We have no `make_layers`, so the wrap site is `ModelRegistry::Prepare`.**
   W1's row assumed a seam this tree does not have. Upstream installs the
   offloader in ONE place, `make_layers` (`models/utils.py:816,824`), which every
@@ -292,6 +328,35 @@ hardware we do not have, which is the opposite balance from
 
 ## Now
 
+**HARDWARE VERIFIED 2026-08-15 on dgx.casa (GB10, sm_121a).** Everything from
+W0a to the totality guard had been proven on CPU only. A full CUDA build
+(cmake 3.28.3, nvcc 13.0.88, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_FETCH=ON`) passed the degraded-build
+guards, so it carries CUTLASS NVFP4 and FP8, marlin-nvfp4, Triton AOT sm_121a
+and FlashAttention-2 rather than the silent fallbacks that have voided work on
+this box before.
+
+The row's own tests pass: `test_weight_offloader` 78 of 78,
+`test_weight_offload_policy` 47 of 47, `test_offload_config` 126 of 126. Those
+assertion counts are IDENTICAL to the CPU run, which is the check that the same
+cases ran rather than a subset being filtered out.
+
+Inertness: 444 of 451 test binaries pass. Two of the seven that do not exit 77
+with zero assertions, because the tree was transferred with `git archive` and
+carries no checkpoints. The other five were proven PRE-EXISTING by a control
+build at `10b8bbdaa`, the commit before this row's first code change, verified
+to contain zero weight-offload files. The control reproduces all five with the
+same exit codes, the same assertion counts and the same crash site, including
+`test_capi`'s SIGSEGV in an ABI v8 custom-logits-processor case. Recorded as
+issue #907.
+
+The verification took five attempts and four failed for environmental reasons
+rather than code: a link with no `libcuda.so.1` because the build container had
+no `--gpus`, a test stage made VOID by a suppressed apt failure that hid a
+missing `ctest`, an OOM kill at `-j16` under another session's 67 GiB GPU job,
+and an apt abort because the container had no network. Each would have read as a
+verdict about this row if its exit status had been taken at face value.
+
 `ACTIVE` since 2026-08-14 (`CLAIM-WEIGHT-OFFLOAD-W0A`). **W0a landed**: the
 config surface — the backend enum, both sub-configs with upstream's bounds and
 defaults, `Validate()` carrying the two hard errors and the three collected
@@ -301,6 +366,64 @@ auto-selection order, the layer grouping, and JSON parsing on the
 cases, 51/122 assertions red, build rc=0) then green 11/11, 126/126, and
 mutation-proven 6/6 with each mutation's compile status reported so a
 non-building mutation could not read as a pass.
+
+**W2a landed** (2026-08-15): the offload DECISION and its byte budget,
+`WeightOffloadPolicy`, mirroring `uva.py:74-107`. It answers offload, not
+targeted, or budget exhausted for one weight and keeps the running total. It
+moves nothing and knows nothing about a device, so both the loader-side
+application chosen above and any future model-side application can use it.
+
+The two properties a reimplementation gets wrong are pinned by name: upstream
+BREAKS on an exhausted budget and CONTINUES on an untargeted parameter, and the
+total advances only for a weight that was really offloaded. Five mutants, all
+caught, none failing to compile: targeting that breaks instead of continuing,
+an untargeted weight that consumes budget, targeting checked before the budget,
+a budget compared against the weight size, and a negative size advancing the
+total.
+
+**W2b landed** (2026-08-15): `UvaWeightOffloader`, the concrete arm that owns a
+`WeightOffloadPolicy` and answers `ConsiderWeight` through it. The factory now
+builds it for the `uva` backend, so `uva` is no longer reported as a backend
+this build lacks; `prefetch` still is, and W5 owns that.
+
+The engine now distinguishes two cases that both offload nothing, because a bug
+report needs to name the right one: a backend this build cannot construct at
+all, and a backend that IS constructed but that no loader consults yet.
+
+W1's "the factory NAMES a requested backend it cannot honour yet" case was
+UPDATED rather than deleted. It encoded W1's state, where neither backend
+existed. The expectation moved and the assertion stayed, because that assertion
+is what the two engine messages rest on.
+
+**The totality guard landed** (2026-08-15), which is what makes the remaining
+W2c work mechanical and safe. The cost recorded earlier was real: residency is
+decided in several loaders, there is no single upload helper, and
+`load_stats::AddDeviceUpload` reaches only 9 call sites in 6 files, so neither
+is a chokepoint that could enforce the obligation structurally. A model whose
+loader was never wired would have accepted a budget and kept every weight on the
+device with no error anywhere.
+
+`ModelFactory::supports_weight_offload` now declares the capability and DEFAULTS
+TO FALSE, which is the mechanism rather than a convenience. The engine refuses a
+configured offload against a model that does not claim support, before any
+weight I/O, naming the architecture. A new model inherits false and is refused
+until someone wires it. That is the same polarity as the `-Werror=switch`
+totality proof in `gguf_keep_quant.cpp`, expressed at run time because there is
+no enum to switch over.
+
+A second guard catches the lie the first cannot see: a model that DECLARES
+support and then never calls `ConsiderWeight`. Zero consulted weights is the
+only count that proves a defect, and it is reported as a defect in that loader
+rather than as a configuration error.
+
+A test pins that NO model declares support yet. When the first loader is wired
+that test fails, and whoever wired it must come back and say which model
+changed.
+
+Still owed for W2 (W2c): the first loader that asks `ConsiderWeight` and honours
+the answer, plus the pinned-host-copy and device-view halves of upstream's arm
+(uva.py:97-105), which belong to whoever owns the buffer. Neither has been
+verified on a device: dgx.casa was unreachable throughout this work.
 
 **W1 landed** (2026-08-14): the offloader seam. `WeightOffloader` interface,
 `NoopWeightOffloader` default, the process-global `Get`/`SetWeightOffloader`,

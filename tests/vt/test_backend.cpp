@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <cstring>
+#include <string>
 
 #include "vt/backend.h"
 
@@ -64,6 +65,48 @@ TEST_CASE("graph capture unsupported on CPU throws loud") {
 TEST_CASE("Device equality") {
   CHECK(Device{DeviceType::kCPU, 0} == Device{DeviceType::kCPU, 0});
   CHECK_FALSE(Device{DeviceType::kCPU, 0} == Device{DeviceType::kCUDA, 0});
+}
+
+// `DeviceTypeFromName` is the inverse of `DeviceTypeName` (#672). It exists so
+// the device-agnostic `vllm` layer can honour a device NAME an operator typed
+// without spelling a device enumerator or casting an integer into one — both of
+// which `scripts/check-device-leakage.py` counts as leakage, the second because
+// a cast hardcodes a device by ENUM VALUE and silently re-points if the enum is
+// ever reordered.
+//
+// The gate is a ROUND TRIP over every DeviceType rather than a spot check of two
+// spellings, because the failure this function can have is a MISSING or
+// TRANSPOSED entry, and a spot check of the entries that are present cannot see
+// one. The header's static_assert catches a list of the wrong LENGTH; only the
+// round trip catches a list of the right length with a name repeated.
+TEST_CASE("DeviceTypeFromName round-trips every DeviceType") {
+  size_t resolved = 0;
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    const DeviceType type = static_cast<DeviceType>(i);
+    const char* name = vt::DeviceTypeName(type);
+    CAPTURE(std::string(name));
+    REQUIRE(std::string(name) != "unknown");
+    // Seeded with something OTHER than kCPU: kCPU is what a failed resolve
+    // leaves behind in the caller, so seeding it here would let a function that
+    // never writes `out` pass the first iteration.
+    DeviceType back = DeviceType::kTENSTORRENT;
+    REQUIRE(vt::DeviceTypeFromName(name, &back));
+    CHECK(back == type);
+    ++resolved;
+  }
+  // Say HOW MANY were examined. A loop that silently ran zero times reports the
+  // same green as one that checked every platform.
+  CHECK(resolved == vt::kNumDeviceTypes);
+
+  DeviceType out = DeviceType::kCPU;
+  CHECK_FALSE(vt::DeviceTypeFromName("gpu", &out));
+  CHECK_FALSE(vt::DeviceTypeFromName("", &out));
+  CHECK_FALSE(vt::DeviceTypeFromName(nullptr, &out));
+  // Neither a prefix nor an extension may match: the comparison walks to BOTH
+  // NULs, so a truncating `strncmp` spelling of it would accept these.
+  CHECK_FALSE(vt::DeviceTypeFromName("cud", &out));
+  CHECK_FALSE(vt::DeviceTypeFromName("cudax", &out));
+  CHECK_FALSE(vt::DeviceTypeFromName("CUDA", &out));  // the names are lowercase
 }
 
 // ─── ENG-ASYNC-SCHED W3: async-output primitives (async_utils.py:12-70) ───────

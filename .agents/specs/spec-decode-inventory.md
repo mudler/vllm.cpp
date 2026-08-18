@@ -39,10 +39,10 @@ vLLM, it is not an addition vLLM lacks.
 | `eagle` | `vllm/v1/spec_decode/eagle.py:10` (`use_eagle()` `speculative.py:1324-1328`); models `llama_eagle.py`, `cohere_eagle.py`, `mistral_eagle.py`, ... | separate draft + target aux hidden-state tap | V1 default + MRV2 | **ABSENT** `SPEC-EAGLE` (EAGLE1 distinct from eagle3) |
 | `eagle3` | same `EagleProposer`; models `llama_eagle3.py`, `qwen3_eagle3.py`, `deepseek_eagle3.py` | separate draft + multi-layer aux taps | V1 default + MRV2 | **BLOCKED** `SPEC-EAGLE3` (no ungated gate-model checkpoint at pin) |
 | `extract_hidden_states` | `vllm/v1/spec_decode/extract_hidden_states.py:29` | none (offline hidden-state capture utility) | V1 default runner | **ABSENT** `SPEC-EXTRACT-HIDDEN` |
-| `mtp` (canonical) | `EagleProposer` via `use_eagle()`; special `Gemma4Proposer`/`Step3p5MTPProposer` (`gpu_model_runner.py:627-630`); MRV2 `MTPSpeculator` | head-on-base per family (nextn layer on target) | V1 default + MRV2 | **DONE** `SPEC-MTP` (Qwen3.5/3.6 k=1); family breadth `SPEC-MTP-FAMILY` |
+| `mtp` (canonical) | `EagleProposer` via `use_eagle()`; special `Gemma4Proposer`/`Step3p5MTPProposer` (`gpu_model_runner.py:627-630`); MRV2 `MTPSpeculator` | head-on-base per family (nextn layer on target) | V1 default + MRV2 | **DONE** `SPEC-MTP` (Qwen3.5/3.6; GPU-gated at k=1, and k>1 BUILT + CPU-gated by `SPEC-MTP-K-GT-1` 2026-08-16 with no speed number yet, see the fixed-depth axis below); family breadth `SPEC-MTP-FAMILY` |
 | `deepseek_mtp` ... `inkling_mtp` (20 family strings) | `MTPModelTypes` `speculative.py:37-59` -> deprecate-remap to `mtp` (`:686-690`); models `deepseek_mtp.py`, `glm4_moe_mtp.py`, `ernie_mtp.py`, `nemotron_h_mtp.py`, ... | head-on-base per family | V1 default (dispatched by `draft_model_config.hf_config.model_type`) | **ACTIVE** DeepSeek-V4 (`MODEL-SPEC-deepseek-v4-deep-seek-v4-mtp`, W1, weight-blocked); rest **INVENTORIED** (`SPEC-MTP-FAMILY`, model-matrix `MODEL-SPEC-*-mtp`) |
 | `dflash` | `vllm/v1/spec_decode/dflash.py` (DFlashProposer); models `laguna_dflash.py`, `qwen3_dflash.py`; speculators algo `algos.py:93` | separate block-diffusion draft + aux | V1 default + MRV2 | **DONE** `SPEC-DFLASH` (ported from vLLM; +GGUF `SPEC-DFLASH-GGUF`) |
-| `dspark` | MRV2 `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:37`; models `gemma4_dspark.py`, `qwen3_dspark.py`; speculators algo `algos.py:133` | separate SAR block draft + aux | V1 default (via `use_eagle()`) + MRV2 | **INVENTORIED** `SPEC-DSPARK` |
+| `dspark` | MRV2 `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:37`; models `gemma4_dspark.py`, `qwen3_dspark.py`; speculators algo `algos.py:133` | separate SAR block draft + aux | V1 default (via `use_eagle()`) + MRV2 | ~~**INVENTORIED**~~ **`ACTIVE`** `SPEC-DSPARK` (W1–W8 implemented + GPU-gated; 35B-A3B MoE 0.975x code / 1.012x prose vs the pinned graphed oracle, #442; superseded here 2026-08-12, #536) |
 
 ## User-visible config axes (apply on top of a method)
 
@@ -50,26 +50,36 @@ vLLM, it is not an addition vLLM lacks.
 |---|---|---|---|
 | Acceptance / rejection sampler | `speculative.py:77,216` (`rejection_sample_method`) | `standard` \| `synthetic` \| `block` | `standard` **ACTIVE** `SPEC-REJECTION`; `synthetic`/`block` **ABSENT** `SPEC-ACCEPT-VARIANTS` |
 | Draft sampling | `speculative.py:78,283` (`draft_sample_method`) | `greedy` \| `probabilistic` | `greedy` only; `probabilistic` **ABSENT** `SPEC-ACCEPT-VARIANTS` |
+| Fixed draft depth k | `speculative.py` (`num_speculative_tokens`); the MRV2 propose loop `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py:242-274` | any k >= 1 | **BUILT + CPU-gated** `SPEC-MTP-K-GT-1` (2026-08-16, #81) for the `mtp` method: k=1..4 through the production loader, greedy tokens unmoved at every depth. The GPU half is OWED, so there is NO speed number above k=1 and the default stays k=1. The other methods are unmeasured at k>1 |
 | Dynamic k (per batch size) | `speculative.py:1336-1337`; `vllm/v1/spec_decode/dynamic/utils.py` (`num_speculative_tokens_per_batch_size`) | schedule list | **ABSENT** `SPEC-DYNAMIC` |
-| Heterogeneous draft/target vocab | `vllm/v1/spec_decode/vocab_mapping.py` | shared-token / ID translation | **INVENTORIED** `SPEC-TLI` |
+| Heterogeneous draft/target vocab (TLI) | `vllm/config/speculative.py:150` (`use_heterogeneous_vocab`); `vllm/v1/spec_decode/vocab_mapping.py:68` (`VocabMapping`); consumed ONLY by `llm_base_proposer.py:432-495,688-691,831-837` (`SpecDecodeBaseProposer`) and `draft_model.py:19,34-58` | cross-tokenizer-family string intersection, target↔draft ID translation, constrained draft logits | **INVENTORIED** `SPEC-TLI` — untouched, and it hangs off the V1 `SpecDecodeBaseProposer`, NOT the V2-runner DFlash/DSpark speculators we ported, so its host row is `SPEC-DRAFT-MODEL` and it is prerequisite-blocked behind that row's W3 (2026-08-12, #536). DSpark's `d2t` does NOT cover it: `d2t` offsets ids inside ONE vocabulary |
 | GDN spec metadata + slot-snapshot rollback | `vllm/v1/attention/backends/gdn_attn.py` | — | **ACTIVE** `SPEC-GDN-SEGMENTS` |
 
 ## HF `speculators` checkpoint-format integration
 
 `vllm/transformers_utils/configs/speculators/algos.py` registers
 `SUPPORTED_SPECULATORS_TYPES = {eagle3, peagle, dflash, dspark}` (`:15,55,93,133`)
-and rewrites a HF `speculators`-format config into a vLLM draft arch. Our side
+and rewrites a HF `speculators`-format config into a vLLM draft arch. ~~Our side
 loads native draft configs directly (no `speculators`-format adapter); tracked
 under the EAGLE/DFlash/DSpark rows as a loader-format residual, not a separate
-method.
+method.~~ **SUPERSEDED 2026-08-12 (#536): `SPEC-DSPARK` W3 landed the DSpark
+adapter** — `speculators_model_type == "dspark"` detection, the
+`speculators_config` proposal-method unwrap, and the `algos.py:133-165` field
+translation (`aux_hidden_state_layer_ids` → `target_layer_ids = [i-1]`,
+`sample_from_anchor`, `draft_vocab_size`, `mask_token_id`, `markov_rank`,
+`block_size`), in `src/vllm/model_executor/models/qwen3_dspark.cpp:227-300`.
+It is the path the `RedHatAI/*speculator.dspark` gate-model drafts load through.
+The residual is now the EAGLE3/PEAGLE/DFlash algos, not the whole subsystem.
 
 ## Our lifecycle summary (engine matrix §Speculative decoding)
 
 - **DONE**: `SPEC-MTP`, `SPEC-MTP-GGUF`, `SPEC-DFLASH`, `SPEC-DFLASH-GGUF`.
 - **ACTIVE**: `SPEC-REJECTION`, `SPEC-GDN-SEGMENTS`, `SPEC-NGRAM`,
-  `SPEC-DRAFT-MODEL`.
+  `SPEC-DRAFT-MODEL`, **`SPEC-DSPARK`** (moved out of INVENTORIED here
+  2026-08-12, #536: it has been `ACTIVE` in the engine matrix since the
+  2026-08-09 spike, with W1–W8 implemented and GPU-gated).
 - **SPIKE**: `SPEC-MEDUSA`. **BLOCKED**: `SPEC-EAGLE3`.
-- **INVENTORIED**: `SPEC-DSPARK`, `SPEC-TLI`, and the nine enumerated here:
+- **INVENTORIED**: ~~`SPEC-DSPARK`,~~ `SPEC-TLI`, and the nine enumerated here:
   `SPEC-NGRAM-GPU`, `SPEC-SUFFIX`, `SPEC-EAGLE`, `SPEC-MTP-FAMILY`,
   `SPEC-ACCEPT-VARIANTS`, `SPEC-DYNAMIC`, `SPEC-CUSTOM-CLASS`,
   `SPEC-EXTRACT-HIDDEN`, `SPEC-MLP-SPECULATOR`.

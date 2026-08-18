@@ -57,6 +57,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>  // ::getpid below; guarded because MSVC has no such header
 #include <thread>
 #endif
 
@@ -181,7 +182,13 @@ struct Args {
   // engine (needs the M3 profile run; inert until then). --kv-cache-memory: an
   // absolute KV-pool size in bytes that sizes the block count directly (0 =>
   // unset).
-  double gpu_memory_utilization = 0.92;
+  //
+  // TRI-STATE (FIX-GPU-MEM-UTIL-INERT, #1165), like enable_prefix_caching
+  // below: nullopt means the flag was NOT passed. It carries a value only when
+  // the user typed one, which is what lets the engine warn that a chosen
+  // fraction sized nothing without warning on a default nobody chose. A plain
+  // double pre-filled with 0.92 could not express the difference.
+  std::optional<double> gpu_memory_utilization = std::nullopt;
   long long kv_cache_memory_bytes = 0;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.
@@ -217,6 +224,10 @@ struct Args {
   // never treated as a hint, because the wrong family would not fail — it would
   // render noise.
   std::string speech_family;
+  // WHERE the speech family runs. 0 = CPU, the default and the arm every Music3
+  // correctness gate was taken on; 1 = the accelerator this build resolves.
+  // A value the seam cannot serve is refused BY NAME at load, not substituted.
+  int32_t speech_device = 0;
   // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
   // family is useless if that family's required load knobs are unreachable:
   // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
@@ -399,7 +410,12 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--limit-mm-per-prompt '<json>']\n"
          "               [--speech-model <checkpoint-dir>] "
          "[--speech-family <name>]\n"
+         "               [--speech-device 0|1]\n"
          "               [--version]\n"
+         "  --speech-model WITHOUT --model serves /v1/audio/speech ALONE (no "
+         "text model is loaded)\n"
+         "  --speech-device 0 (default) runs the speech family on the CPU, 1 on "
+         "the accelerator this build resolves\n"
          "  accepted for published-recipe compatibility, NO effect: "
          "--enable-auto-tool-choice, --trust-remote-code\n";
   std::exit(code);
@@ -426,6 +442,14 @@ Args ParseArgs(int argc, char** argv) {
       a.served_model_name = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--block-size") {
       a.block_size = std::stoi(NextArg(argc, argv, i, argv[0]));
+      // The attention backends (FLASH_ATTN / ROCM_ATTN get_kv_cache_shape)
+      // enforce block_size % 16 == 0 and the runner validates at init — fail
+      // here with a clear message rather than at engine init.
+      if (a.block_size <= 0 || a.block_size % 16 != 0) {
+        std::cerr << argv[0] << ": --block-size must be a positive multiple of 16"
+                  << " (got " << a.block_size << ")\n";
+        Usage(argv[0], 2);
+      }
     } else if (flag == "--num-blocks") {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--gpu-memory-utilization") {
@@ -487,6 +511,8 @@ Args ParseArgs(int argc, char** argv) {
       a.speech_model = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speech-family") {
       a.speech_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-device") {
+      a.speech_device = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--video-extra") {
       const std::string kv = NextArg(argc, argv, i, argv[0]);
       const std::string::size_type eq = kv.find('=');
@@ -640,8 +666,22 @@ Args ParseArgs(int argc, char** argv) {
       Usage(argv[0], 2);
     }
   }
-  if (a.model_dir.empty()) {
-    std::cerr << "server: --model <dir> is required\n";
+  // --model is required EXCEPT for a speech-only server (#672). Upstream's own
+  // spelling for MiniMax-Music3 is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3`
+  // and nothing else — there is no text model in that command, because a music
+  // model is not an accessory to one. Requiring --model here made the documented
+  // recipe unrunnable on any box whose smallest text checkpoint is tens of GB:
+  // serving a 28.5 GB music model also staged a model no request would touch.
+  //
+  // This is a NEW ACCEPTED COMBINATION, not a change of behaviour: `--model` with
+  // or without `--speech-model` resolves exactly as before, and the case that
+  // changes verdict — NEITHER flag — was and remains an error. It mirrors the
+  // task-conditional dispatch already in this file for pooling and
+  // transcription-only models (vLLM api_server.py:255-265): the routes a server
+  // registers follow from what it loaded.
+  if (a.model_dir.empty() && a.speech_model.empty()) {
+    std::cerr << "server: --model <dir> is required (or --speech-model <dir> for "
+                 "a speech/music-only server)\n";
     Usage(argv[0], 2);
   }
   if (a.max_num_seqs <= 0 || a.max_num_batched_tokens < 0 ||
@@ -701,6 +741,13 @@ Args ParseArgs(int argc, char** argv) {
   if (!a.speech_family.empty() && a.speech_model.empty()) {
     std::cerr << "server: --speech-family names a family but --speech-model names no "
                  "checkpoint; there is nothing to load it from\n";
+    Usage(argv[0], 2);
+  }
+  if (a.speech_device != 0 && a.speech_model.empty()) {
+    // Same shape as the --speech-family check above, and for the same reason: a
+    // knob that silently applies to nothing reads as "it was honoured".
+    std::cerr << "server: --speech-device selects where the speech family runs but "
+                 "--speech-model names no checkpoint; there is nothing to place\n";
     Usage(argv[0], 2);
   }
   // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
@@ -796,6 +843,71 @@ int VllmServerMain(int argc, char** argv) {
       std::cerr << "\n";
     }
 
+    // ── SPEECH TASK DISPATCH (#672): --speech-model with NO --model serves
+    // /v1/audio/speech and nothing else. It is the same task-conditional shape
+    // the pooling and transcription-only branches below take, and the same one
+    // vLLM's api_server.py:255-265 uses: a server registers the routes its
+    // loaded task can answer, rather than every route it knows how to spell.
+    //
+    // It exists because upstream's own recipe is `sgl-omni serve --model
+    // MiniMaxAI/MiniMax-Music3` — one model, no text tower — and because pairing
+    // a 28.5 GB music checkpoint with an unrelated text checkpoint nobody
+    // queries is not a smaller cost than the music model itself. NOTHING here
+    // touches the combined path: --model + --speech-model still loads both and
+    // registers both, byte for byte as before.
+    if (args.model_dir.empty()) {
+      vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+      vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+      vllm::multimodal::SpeechModelParams smp;
+      smp.path = args.speech_model;
+      smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      smp.device = args.speech_device;   // 0 => CPU, the byte-identical default
+      std::string why;
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech = registry.Load(smp, &why);
+      if (loaded_speech == nullptr) {
+        throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
+      }
+      std::shared_ptr<vllm::multimodal::SpeechEngine> speech_only(std::move(loaded_speech));
+      // The served name defaults to the FAMILY rather than to the directory
+      // basename, because a speech-only server has no config.json to name and
+      // the family is what a client puts in `"model"`. An explicit
+      // --served-model-name still wins.
+      const std::string speech_served_name =
+          args.served_model_name.empty() ? speech_only->family() : args.served_model_name;
+      vllm::openai::SpeechCapabilities caps;
+      caps.family = speech_only->family();
+      caps.sample_rate = speech_only->sample_rate();
+      caps.requires_reference_audio = speech_only->requires_reference_audio();
+      std::cerr << "server: speech/music-only model (family=" << caps.family << ", "
+                << caps.sample_rate << " Hz, "
+                << (caps.requires_reference_audio ? "reference clip REQUIRED"
+                                                  : "text-only synthesis")
+                << ", family "
+                << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                // GRANTED, not requested. A log that echoed --speech-device back
+                // would say "cuda" on a build that resolved CPU.
+                << ", device " << vt::DeviceTypeName(speech_only->device().type)
+                << "); serving /v1/audio/speech\n";
+      namespace oai = vllm::entrypoints::openai;
+      oai::OpenAIServingModels speech_models(speech_served_name);
+      oai::ApiServer speech_server(speech_models, vllm::Version());
+      speech_server.set_synthesizer(
+          [speech_only](const vllm::openai::SpeechRequest& req)
+              -> vllm::openai::SpeechResponse {
+            return vllm::openai::SynthesizeSpeechRequest(*speech_only, req);
+          },
+          caps);
+      std::cerr << "server: listening on http://" << args.host << ":" << args.port
+                << " (model '" << speech_served_name << "')\n";
+      vllm::platform::ConsoleShutdown shutdown_on_signal(
+          [&]() { speech_server.stop(); });
+      if (!speech_server.listen(args.host, args.port)) {
+        std::cerr << "server: failed to bind " << args.host << ":" << args.port << "\n";
+        return 1;
+      }
+      return 0;
+    }
+
     const fs::path dir = NativeUtf8Path(args.model_dir);
     const std::string config_path = PathUtf8(dir / "config.json");
     const std::string tokenizer_path = PathUtf8(dir / "tokenizer.json");
@@ -808,6 +920,55 @@ int VllmServerMain(int argc, char** argv) {
             ? PathUtf8(dir.has_filename() ? dir.filename()
                                           : dir.parent_path().filename())
             : args.served_model_name;
+
+    // ── --offload-config, PARSED ONCE, AHEAD OF THE TASK BRANCH (#1135) ───────
+    //
+    // It used to be parsed after the branch below, in the text path only, so the
+    // pooling and transcription-only paths built their engine parameters without
+    // it. An embedding server started with `--offload-config` placed its weights
+    // as though the flag were absent and said nothing. That dropped BOTH halves
+    // of the document — vLLM's mirrored `uva`/`prefetch` weight offload and the
+    // vllm.cpp `vllm_cpp` residency extension — and had done so since before the
+    // extension existed.
+    //
+    // ONE PARSE, and every branch below now answers for the document: the text
+    // path and the pooling path take both halves, and the transcription-only
+    // path refuses a non-empty flag rather than dropping it.
+    //
+    // Both halves come out of the SAME string:
+    // `parse_offload_config_json` reads vLLM's three keys and
+    // `parse_weight_residency_extension_json` reads the extension and closes the
+    // document against a typo at every level. Two parsers over one string is what
+    // keeps `include/vllm/config/offload.h` a byte-faithful transcription of
+    // `vllm/config/offload.py` (which has no disk tier) while the operator still
+    // types one flag for one concept.
+    //
+    // Parsing HERE also refuses a malformed document, an unknown key or a
+    // validator violation BEFORE the architecture is peeked and before the
+    // `server: loading model from` line, rather than after both. Upstream's three
+    // backend/field mismatches are WARNINGS in vLLM and stay warnings here.
+    std::optional<vllm::OffloadConfig> parsed_offload_config;
+    std::optional<vllm::WeightResidencyConfig> parsed_weight_residency;
+    if (!args.offload_config.empty()) {
+      vllm::OffloadConfig off_cfg =
+          vllm::parse_offload_config_json(args.offload_config);
+      off_cfg.Validate();
+      for (const std::string& w : off_cfg.warnings) {
+        std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
+      }
+      parsed_offload_config = std::move(off_cfg);
+      // ENG-RESIDENCY-CONFIG (#1110): the SAME document also carries the
+      // vllm.cpp-original `vllm_cpp` key, which governs the tier BELOW vLLM's —
+      // weights borrowed out of the file mapping rather than moved to host RAM.
+      //
+      // Its parser REFUSES a key it does not know, which the mirrored parser does
+      // not do, and that refusal is load-bearing: a silently ignored
+      // `{"vllm_cpp":{"mmapp":...}}` starts a server running this tier at its
+      // defaults and is met as an out-of-memory kill instead of an error.
+      vllm::WeightResidencyConfig res_cfg =
+          vllm::parse_weight_residency_extension_json(args.offload_config);
+      if (!res_cfg.empty()) parsed_weight_residency = std::move(res_cfg);
+    }
 
     // ── TASK DISPATCH (ARCH-ONE-SURFACE ROW 1): a model dir whose
     // architectures resolve to a SupportsTranscription-ONLY registration
@@ -858,6 +1019,18 @@ int VllmServerMain(int argc, char** argv) {
         embed_params.max_num_seqs = args.max_num_seqs;
         embed_params.max_num_batched_tokens = args.max_num_batched_tokens;
         embed_params.enable_prefix_caching = args.enable_prefix_caching;
+        // #1135: BOTH halves of `--offload-config`, on the same terms as the text
+        // path. This branch reaches `LoadedEngine::FromModelDir`, which installs
+        // the residency document and the weight offloader ahead of every path and
+        // weight operation it performs — so an embedding model is loaded by the
+        // same loader and nothing about pooling makes either half inapplicable.
+        // Before this, both were dropped here in silence.
+        //
+        // The other engine flags this block still drops, `--device` among them,
+        // are #1196. They are the same shape over a wider set and belong to the
+        // row that owns this dispatch.
+        embed_params.offload_config = parsed_offload_config;
+        embed_params.weight_residency = parsed_weight_residency;
         auto loaded_embed = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
             vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                           embed_params));
@@ -905,6 +1078,33 @@ int VllmServerMain(int argc, char** argv) {
       }
 
       if (transcription_only) {
+        // #1135, and this arm is a REFUSAL rather than a wiring. The
+        // transcription stack has no seam either half of `--offload-config`
+        // could reach: `ParakeetTranscriber::FromDir` builds no `EngineParams`
+        // and calls no `LoadedEngine::FromModelDir`, so this path runs no
+        // `SetWeightResidencyConfig`, no `CreateWeightOffloader`, no GGUF
+        // mapping and no expert slot store. There is no field of either half
+        // that any code here could read.
+        //
+        // AGENTS.md: refuse an unimplemented arm with a message that names the
+        // missing part, and record the arm as owed. Accepting the flag and
+        // warning would leave a server running while it holds a placement
+        // instruction it does not follow, which is the failure #1135 was filed
+        // about. The document is still PARSED above, so a typo in it is refused
+        // here on the same terms as everywhere else.
+        if (!args.offload_config.empty()) {
+          throw std::invalid_argument(
+              "--offload-config is not supported on a transcription-only model "
+              "(" + archs[0] +
+              "). THE MISSING PART: this path serves /v1/audio/transcriptions "
+              "through ParakeetTranscriber, which loads its own weights and "
+              "never builds an engine, so neither vLLM's uva/prefetch weight "
+              "offload nor vllm.cpp's vllm_cpp weight-residency tier has a call "
+              "site on it. Both halves of the document would be accepted and "
+              "then ignored, which is issue #1135. Remove the flag, or serve a "
+              "text-generation or embedding model, which honour it. Tracked as "
+              "issue #1195");
+        }
         std::cerr << "server: transcription-only model (" << archs[0]
                   << "); serving /v1/audio/transcriptions\n";
         auto transcriber =
@@ -996,20 +1196,14 @@ int VllmServerMain(int argc, char** argv) {
       }
       engine_params.kv_transfer_config = std::move(kv_cfg);
     }
-    // --offload-config: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b). Empty (default)
-    // leaves the optional unset — the byte-identical no-offload path. Parsed and
-    // VALIDATED here so a malformed document or a validator violation is refused
-    // at startup rather than surfacing later. Upstream's three backend/field
-    // mismatches are WARNINGS in vLLM and stay warnings here.
-    if (!args.offload_config.empty()) {
-      vllm::OffloadConfig off_cfg =
-          vllm::parse_offload_config_json(args.offload_config);
-      off_cfg.Validate();
-      for (const std::string& w : off_cfg.warnings) {
-        std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
-      }
-      engine_params.offload_config = std::move(off_cfg);
-    }
+    // --offload-config: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b) and the
+    // vllm.cpp `vllm_cpp` residency tier (ENG-RESIDENCY-CONFIG). Both halves were
+    // parsed and validated above, ahead of the task branch, so that the pooling
+    // path gets them too and a malformed document is refused before the
+    // architecture peek (#1135). Empty (default) leaves both optionals unset —
+    // the byte-identical no-offload path.
+    engine_params.offload_config = parsed_offload_config;
+    engine_params.weight_residency = parsed_weight_residency;
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The
     // parse validates method/k here; n_predict + the resolved k are finalized in
@@ -1311,14 +1505,20 @@ int VllmServerMain(int argc, char** argv) {
       vllm::multimodal::SpeechModelParams smp;
       smp.path = args.speech_model;
       smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      smp.device = args.speech_device;   // 0 => CPU, the byte-identical default
       std::string why;
-      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded = registry.Load(smp, &why);
-      if (loaded == nullptr) {
+      // NOT `loaded`: that name is already taken by the TEXT engine in the
+      // enclosing scope, and MSVC's C4456 is a warning-as-error there, so the
+      // shadow red every pull request's `windows-msvc-*` pair with a failure
+      // about a line the author had not touched (#965).
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech_engine =
+          registry.Load(smp, &why);
+      if (loaded_speech_engine == nullptr) {
         // `why` names every family that was tried and the path, so a startup
         // failure is evidence rather than a verdict.
         throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
       }
-      speech_engine = std::move(loaded);
+      speech_engine = std::move(loaded_speech_engine);
       vllm::openai::SpeechCapabilities caps;
       caps.family = speech_engine->family();
       caps.sample_rate = speech_engine->sample_rate();
@@ -1329,37 +1529,16 @@ int VllmServerMain(int argc, char** argv) {
                                                   : "text-only synthesis")
                 << ", speech family "
                 << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                << ", device " << vt::DeviceTypeName(speech_engine->device().type)
                 << ")\n";
+      // The request mapping is `vllm::openai::SynthesizeSpeechRequest` (library,
+      // speech_api.h) rather than a lambda body here: a mapping that only a
+      // running server can reach is a mapping no gate can call, and this route
+      // is the one an end-to-end claim is made about.
       server.set_synthesizer(
           [speech_engine](const vllm::openai::SpeechRequest& req)
               -> vllm::openai::SpeechResponse {
-            // The library-owned request mapping: the route validated the
-            // ENVELOPE, the family validates its own fields and refuses by name.
-            vllm::multimodal::SpeechGenParams gen;
-            gen.text = req.text;
-            gen.language = req.language;
-            gen.lyrics = req.lyrics;
-            gen.description = req.description;
-            gen.reference_audio = req.reference_audio;
-            gen.reference_sample_rate = req.reference_sample_rate;
-            gen.audio_duration_s = req.audio_duration_s;
-            gen.num_inference_steps = req.num_inference_steps;
-            // NEGATIVE means "the family decides": 0 is a legal guidance scale.
-            gen.guidance_scale = req.has_guidance_scale ? req.guidance_scale : -1.0;
-            gen.seed = req.seed;
-            const vllm::multimodal::SpeechResult result = speech_engine->Synthesize(gen);
-            vllm::openai::SpeechResponse out;
-            out.sample_rate = result.sample_rate;
-            out.channels = result.channels;
-            out.samples_per_channel =
-                result.channels > 0
-                    ? static_cast<int64_t>(result.samples.size()) / result.channels
-                    : 0;
-            // The SHARED RIFF writer the H3 and LTX-2.5 audio paths already
-            // use, so HTTP and the ABI cannot emit different bytes.
-            out.wav = vllm::MiniMaxH3WriteWav(result.samples, out.channels,
-                                              out.samples_per_channel, out.sample_rate);
-            return out;
+            return vllm::openai::SynthesizeSpeechRequest(*speech_engine, req);
           },
           caps);
     }

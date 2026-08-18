@@ -484,6 +484,22 @@ namespace {
 // Keep helpers that return or take C++ types on THIS side of the boundary.
 std::string OrEmpty(const char* s) { return s == nullptr ? std::string() : std::string(s); }
 
+// The process-global speech registry, populated ONCE. A half-populated
+// registry would make detection depend on which entry point ran first, which
+// is the never-guess guarantee defeated by construction. (Issue #805: this
+// helper was added inside the `extern "C"` block below; a C-linkage function
+// returning a C++ reference is an error under clang's
+// -Wreturn-type-c-linkage, which this project's -Werror build promotes. It
+// lives beside OrEmpty, on the C++ side of the boundary, per the note above.)
+vllm::multimodal::SpeechRegistry& SpeechRegistry() {
+  static vllm::multimodal::SpeechRegistry& registry = [] () -> vllm::multimodal::SpeechRegistry& {
+    vllm::multimodal::SpeechRegistry& global = vllm::multimodal::GlobalSpeechRegistry();
+    vllm::models::music3::RegisterBuiltinSpeechFamilies(global);
+    return global;
+  }();
+  return registry;
+}
+
 }  // namespace
 
 extern "C" {
@@ -627,6 +643,16 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
           std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
         }
         ep.offload_config = std::move(off_cfg);
+        // ENG-RESIDENCY-CONFIG (#1110): the same string also carries the
+        // vllm.cpp-original `vllm_cpp` key (the host-RAM -> DISK residency tier).
+        // No new ABI field: one document holds both halves, exactly as the server
+        // flag does, so a library client gains the surface without an ABI bump.
+        // Refused HERE for the same reason the mirrored half is — a mistyped key
+        // is a CALLER error and must be INVALID_ARGUMENT before any model I/O, not
+        // a server quietly running this tier at its defaults.
+        vllm::WeightResidencyConfig res_cfg =
+            vllm::parse_weight_residency_extension_json(params->offload_config);
+        if (!res_cfg.empty()) ep.weight_residency = std::move(res_cfg);
       }
       // ABI v19: the multimodal input limits (#607 L2). Parsed HERE so a
       // malformed document is a CALLER error reported before any model I/O,
@@ -1677,26 +1703,14 @@ struct vllm_speech_engine {
   std::string family;
   int64_t sample_rate = 0;
   bool requires_reference_audio = false;
+  // What the load RESOLVED to, in the ABI's own 0=cpu/1=accelerator encoding —
+  // recorded at load rather than re-derived per query, so the handle answers
+  // with what was granted even if the platform state later changes.
+  int32_t device = 0;
   // Staged weights are shared state, and the ABI promises one blocking call per
   // handle: serialize here rather than trusting every family to.
   std::mutex mutex;
 };
-
-namespace {
-
-// The process-global registry, populated ONCE. A half-populated registry would
-// make detection depend on which entry point ran first, which is the
-// never-guess guarantee defeated by construction.
-vllm::multimodal::SpeechRegistry& SpeechRegistry() {
-  static vllm::multimodal::SpeechRegistry& registry = [] () -> vllm::multimodal::SpeechRegistry& {
-    vllm::multimodal::SpeechRegistry& global = vllm::multimodal::GlobalSpeechRegistry();
-    vllm::models::music3::RegisterBuiltinSpeechFamilies(global);
-    return global;
-  }();
-  return registry;
-}
-
-}  // namespace
 
 VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void) {
   vllm_speech_model_params p;
@@ -1725,6 +1739,11 @@ VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* par
   vllm::multimodal::SpeechModelParams mp;
   mp.path = OrEmpty(params->path);
   mp.family = OrEmpty(params->family);
+  // 0 = CPU (the zero value: byte-identical to every pre-v21 caller), 1 = the
+  // accelerator this build resolves. The seam refuses anything else, and
+  // refuses device 1 this build cannot serve, BY NAME — here, before 28.5 GB
+  // of weights are read.
+  mp.device = params->device;
   try {
     std::string why;
     std::unique_ptr<vllm::multimodal::SpeechEngine> engine =
@@ -1740,6 +1759,10 @@ VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* par
     handle->family = engine->family();
     handle->sample_rate = engine->sample_rate();
     handle->requires_reference_audio = engine->requires_reference_audio();
+    // GRANTED, not requested: a family with no device arm reports CPU here
+    // whatever `params->device` said, which is exactly the distinction a
+    // two-arm speed comparison depends on.
+    handle->device = engine->device().type == vt::DeviceType::kCPU ? 0 : 1;
     handle->engine = std::move(engine);
     *out = handle.release();
     ClearError();
@@ -1765,6 +1788,10 @@ VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine
 
 VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine) {
   return (engine != nullptr && engine->requires_reference_audio) ? 1 : 0;
+}
+
+VLLM_API int32_t vllm_speech_engine_device(const vllm_speech_engine* engine) {
+  return engine == nullptr ? 0 : engine->device;
 }
 
 VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,

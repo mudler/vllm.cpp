@@ -13,6 +13,8 @@
 
 #include "vt/backend.h"
 #include "vt/cuda/cuda_device_caps.h"
+#include "vt/graph_dedup.h"
+#include "vt/graph_dedup_runtime.h"
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
@@ -225,6 +227,18 @@ class CudaBackend final : public Backend {
   void* EndCaptureGraph(Queue& q) override {
     cudaGraph_t graph = nullptr;
     Check(cudaStreamEndCapture(AsStream(q), &graph), "cudaStreamEndCapture");
+    // ENG-CUDAGRAPH-DEDUP (#1162): with VT_CUDA_GRAPH_DEDUP set, hand the RAW graph to
+    // the dedup registry, which keys it by topology and folds it onto an existing
+    // executable when the driver accepts the update. The raw graph is retained for the
+    // handle's lifetime because both the key and cudaGraphExecUpdate need it — SGLang
+    // buys the same retention with torch.cuda.CUDAGraph(keep_graph=True). Default OFF,
+    // in which case this stays the pre-dedup path byte for byte.
+    if (vt::GraphDedupEnabled()) {
+      if (dedup_ == nullptr) {
+        dedup_ = std::make_unique<vt::GraphDedupRegistry>(vt::graph_dedup_rt::Ops());
+      }
+      return dedup_->Register(reinterpret_cast<void*>(graph));
+    }
     cudaGraphExec_t exec = nullptr;
     Check(cudaGraphInstantiate(&exec, graph, 0), "cudaGraphInstantiate");
     cudaGraphDestroy(graph);
@@ -264,8 +278,14 @@ class CudaBackend final : public Backend {
       }
     }
 #endif
-    Check(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph), AsStream(q)),
-          "cudaGraphLaunch");
+    if (dedup_ != nullptr && dedup_->Owns(graph)) {
+      // Owns() rather than a mode flag: a handle minted before the registry existed is
+      // still a plain executable, and the seam must never guess at a pointer's origin.
+      dedup_->Replay(graph, reinterpret_cast<void*>(AsStream(q)));
+    } else {
+      Check(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph), AsStream(q)),
+            "cudaGraphLaunch");
+    }
 #ifdef VT_BENCH_PROFILE_CONTROL
     if (g_cuda_profile_active) {
       if (g_cuda_profile_remaining_replays == 0) {
@@ -286,7 +306,12 @@ class CudaBackend final : public Backend {
 #endif
   }
   void DestroyGraph(void* graph) override {
-    if (graph != nullptr) cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph));
+    if (graph == nullptr) return;
+    if (dedup_ != nullptr && dedup_->Owns(graph)) {
+      dedup_->Destroy(graph);
+      return;
+    }
+    cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph));
   }
 
  private:
@@ -295,6 +320,9 @@ class CudaBackend final : public Backend {
   int sm_major_ = 0;
   int sm_minor_ = 0;
   cudaGraphExec_t exec_ = nullptr;  // last instantiated captured graph
+  // ENG-CUDAGRAPH-DEDUP (#1162): built on the first capture, and only when
+  // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
+  std::unique_ptr<vt::GraphDedupRegistry> dedup_;
 };
 
 // Registers kCUDA during static init (registration must complete before

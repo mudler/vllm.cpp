@@ -66,7 +66,7 @@ void PrepareStableLmForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardStableLmForCausalLM(LoadedModel& model,
                                          const ModelForwardInput& input) {
-  const auto& sm = static_cast<StablelmLoadedModel&>(model);
+  const auto& sm = ModelAs<StablelmLoadedModel>(model, "StableLmForCausalLM");
   const StablelmWeights& weights = sm.weights();
   if (input.gather_logits) {
     return StablelmModel::ForwardDevice(input.token_ids, input.positions,

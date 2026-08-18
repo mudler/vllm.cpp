@@ -5,10 +5,46 @@
 #include <string>
 #include <utility>
 
+#include "vllm/platforms/interface.h"
+#include "vt/backend.h"
+
 namespace vllm {
 namespace multimodal {
 
 SpeechEngine::~SpeechEngine() = default;
+
+// The CPU default. A family with no device arm answers honestly here rather
+// than being edited to say so, which is what keeps this seam additive.
+vt::Device SpeechEngine::device() const { return vt::Device{vt::DeviceType::kCPU, 0}; }
+
+vt::DeviceType SpeechEngineDeviceType(int32_t device, const std::string& family) {
+  if (device != 0 && device != 1) {
+    throw std::runtime_error(
+        "speech: device must be 0 (cpu) or 1 (the accelerator this build resolves), got " +
+        std::to_string(device));
+  }
+  if (device == 0) return vt::DeviceType::kCPU;
+
+  const vllm::platforms::Platform& platform = vllm::platforms::CurrentPlatform();
+  const vt::DeviceType accelerator = platform.device_type();
+  if (accelerator == vt::DeviceType::kCPU || vt::TryGetBackend(accelerator) == nullptr) {
+    throw std::runtime_error(
+        "speech: device 1 asks for an accelerator, but no accelerator backend is "
+        "registered in this build (the platform seam resolves to '" +
+        std::string(vt::DeviceTypeName(accelerator)) +
+        "'). Refusing rather than naming a device this build cannot run on.");
+  }
+  if (!platform.supports_model_architecture(family)) {
+    throw std::runtime_error(
+        "speech: device 1 resolves to platform '" +
+        std::string(vt::DeviceTypeName(accelerator)) + "', and that platform DECLINES the "
+        "architecture '" + family +
+        "' (Platform::supports_model_architecture): it is a PARTIAL backend that has not "
+        "registered the kernels this family needs. The build is partial, not broken. "
+        "Refusing by name rather than binding a queue that would die inside a kernel bind.");
+  }
+  return accelerator;
+}
 
 void SpeechRegistry::Register(SpeechFamilyRegistration registration) {
   if (registration.name.empty()) {

@@ -14,7 +14,7 @@ pins which tensors the component owes.
 
 Usage:
     scripts/gen-minimax-music3-manifest.py \
-        --checkpoint /mnt/nas_share/checkpoints/minimax-music3 \
+        --checkpoint "$CHECKPOINT_ROOT/minimax-music3" \
         --output tests/vllm/models/minimax_music3_manifest.inc
 """
 

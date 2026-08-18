@@ -93,7 +93,7 @@ void PrepareOPT(LoadedModel& model, const HfConfig& config, vt::Queue& queue) {
 }
 
 ForwardLogits ForwardOPT(LoadedModel& model, const ModelForwardInput& input) {
-  const auto& opt = static_cast<OPTLoadedModel&>(model);
+  const auto& opt = ModelAs<OPTLoadedModel>(model, "OPTForCausalLM");
   const OPTWeights& weights = opt.weights();
   // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits
   // on the opt-out. OPT is pure full-attention (input.gdn_* unused).

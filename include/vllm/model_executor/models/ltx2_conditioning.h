@@ -53,11 +53,44 @@
 namespace vllm {
 
 // LatentState (types.py:251-287) at batch 1, carrying only the fields a
-// conditioning item touches. `attention_mask` is deliberately absent: every item
-// ported here passes `attention_mask=None` and there is no pre-existing mask, so
-// `update_attention_mask` returns None (conditioning/mask_utils.py:110-140). An
-// item that DID need one would have to grow this struct rather than silently
-// dropping it, which is why the omission is stated here.
+// conditioning item touches.
+//
+// `attention_mask` is deliberately absent, and the reason is a fact about the
+// ported items rather than a simplification. Both appending VIDEO items pass a
+// literal `attention_mask=None` (keyframe_cond.py:68-76,
+// reference_video_cond.py:88-96), and `update_attention_mask` returns None when
+// its argument is None and the state carries no mask
+// (conditioning/mask_utils.py:110-143). The ONLY upstream route to a non-None
+// mask is `ConditioningItemAttentionStrengthWrapper`, whose sole application
+// site is the IC-LoRA path (ltx-pipelines/iclora_utils.py:169);
+// `combined_image_conditionings` (ltx-pipelines/utils/helpers.py:272-308), which
+// is the route this engine mirrors, never wraps. So a field here would be one no
+// ported item can populate — the unpassed-parameter shape .agents/reachability.md
+// enumerates. An item that DID need one would have to grow this struct rather
+// than silently dropping it, which is why the omission is stated here.
+// `GeneratedKeyframeLayout` (types.py:220-247): where a state's generated
+// keyframe slot tokens live, and what they represent.
+//
+// Recorded by `Ltx2ConditionVideoByGeneratedKeyframeSlots` when it appends the
+// slots, so they can later be located and extracted EXACTLY rather than by
+// assuming they are the trailing tokens. That distinction is the whole reason
+// this struct exists rather than a token count: conditioning items are applied
+// in list order and each appends to the end, so a state built with slots PLUS a
+// supplied keyframe has no fixed trailing layout. DFR's stage 2 builds exactly
+// that combination when a first-frame image is supplied.
+//
+// `first_token` is the state's token count BEFORE the append, which is the only
+// moment at which it is knowable without searching.
+struct Ltx2GeneratedKeyframeLayout {
+  std::vector<int64_t> pixel_frame_indices;  // target pixel frame of each slot, in token order
+  int64_t tokens_per_keyframe = 0;           // one latent frame's worth
+  int64_t first_token = -1;                  // -1 is upstream's `None`: no slots were applied
+
+  bool applied() const { return first_token >= 0; }
+  int64_t num_keyframes() const { return static_cast<int64_t>(pixel_frame_indices.size()); }
+  int64_t num_tokens() const { return num_keyframes() * tokens_per_keyframe; }
+};
+
 struct Ltx2LatentState {
   int64_t tokens = 0;
   int64_t width = 0;     // channels per token
@@ -66,6 +99,23 @@ struct Ltx2LatentState {
   std::vector<float> clean;      // [tokens, width]
   std::vector<float> mask;       // [tokens] — the denoise mask, 1 = fully denoised
   std::vector<float> positions;  // [pos_dims, tokens, 2] — [start, end)
+  // `LatentState.keyframes_mask` (types.py:251-287), [tokens] in {0, 1}. EMPTY
+  // is upstream's `None`, which is what an audio state carries and what a video
+  // state carries before `create_initial_state` marks the first latent frame.
+  //
+  // It lives HERE rather than beside the state because every appending item has
+  // to extend it — upstream's own docstring says "Every conditioning item that
+  // appends tokens must call this, otherwise the per-token marker goes out of
+  // sync with the token sequence" (mask_utils.py:83-85). A marker held next to a
+  // state that grows is a marker that silently stops describing it, and nothing
+  // about the render's SHAPE can see the difference.
+  std::vector<float> keyframes_mask;
+
+  // `LatentState.generated_keyframe_layout` (types.py:246). Default-constructed
+  // is upstream's `None`, and `Ltx2ConditionVideoByGeneratedKeyframeSlots`
+  // refuses a second application on a state that already carries one
+  // (keyframe_slots.py:133-134).
+  Ltx2GeneratedKeyframeLayout generated_keyframe_layout;
 };
 
 // VideoLatentTools.create_initial_state (tools.py:139-186) at batch 1.
@@ -77,6 +127,25 @@ Ltx2LatentState Ltx2CreateVideoLatentState(const Ltx2VideoLatentShape& shape, in
                                            const Ltx2ScaleFactors& factors, double fps,
                                            bool causal_fix, const float* initial_latent = nullptr,
                                            std::vector<float>* out_keyframes_mask = nullptr);
+
+// `_first_frame_keyframes_mask` (tools.py:186-196) on its own, [tokens] in {0, 1}.
+//
+// THE RULE IS UNCONDITIONAL. Upstream marks the target's first latent frame on
+// every generation, whether or not a keyframe was supplied — its own comment says
+// "the reference implementation marks it unconditionally -- independently of
+// whether any keyframe slots exist" (:190-191). The reason is a fact about the
+// latent, not about the request: the video encoder is CAUSAL, so the first
+// temporal latent frame covers one pixel frame while every later one covers
+// `temporal_scale_factor`, which puts it in the same token class as a generated
+// keyframe slot.
+//
+// Exposed because two callers need it — `Ltx2CreateVideoLatentState` and the video
+// engine, which builds its per-phase stream state by hand — and re-deriving
+// `tokens_per_latent_frame` at a call site is how "only when keyframes exist"
+// gets written by accident. That defect is invisible to every output check: it
+// renders a finite, correctly shaped clip that is simply missing a trained term.
+std::vector<float> Ltx2FirstFrameKeyframesMask(const Ltx2VideoLatentShape& shape,
+                                               int64_t patch_size);
 
 // AudioLatentTools.create_initial_state (tools.py:246-279) at batch 1. The audio
 // positions are the patch grid bounds THEMSELVES, in seconds — there is no
@@ -115,6 +184,122 @@ void Ltx2ConditionVideoByReference(Ltx2LatentState* state, const Ltx2LatentVolum
                                    int64_t patch_size, const Ltx2ScaleFactors& factors, double fps,
                                    int64_t downscale_factor, int64_t temporal_scale_factor,
                                    double strength, bool causal_fix);
+
+// `extend_keyframes_mask` (conditioning/mask_utils.py:74-105). Extends the state's
+// per-token marker to cover `num_new_tokens` tokens the caller is about to
+// append. Call it with the state as it stands BEFORE the append, which is the
+// state upstream hands it.
+//
+// The two None branches are upstream's and are mirrored exactly. No existing
+// mask and `marked` false leaves the mask empty (`return None`, :98-99) — an
+// audio state and any unmarked append onto an unmarked state. No existing mask
+// and `marked` TRUE zero-fills a fresh one first (:100-101), so the appended
+// tokens are the only marked ones.
+//
+// `marked` is TRUE for exactly one upstream construct, `VideoGeneratedKeyframeSlots`
+// (conditioning/types/keyframe_slots.py:121); every other appending item passes
+// false, because given keyframe content and reference latents are ordinary
+// guidance rather than a generated single-pixel-frame slot
+// (keyframe_cond.py:85-86, reference_video_cond.py:103-105).
+void Ltx2ExtendKeyframesMask(Ltx2LatentState* state, int64_t num_new_tokens, bool marked);
+
+// `VideoGeneratedKeyframeSlots.apply_to` (keyframe_slots.py:71-150). APPEND
+// fully-denoised single-pixel-frame slots at `pixel_frame_indices`, which the
+// model then GENERATES content into. Row LTX25-DFR-PIPELINE, issue #986.
+//
+// This is the second upstream feature called "keyframe" and it is not the one
+// `Ltx2ConditionVideoByKeyframe` ports. That one places content the CALLER
+// supplied; this one places empty slots the MODEL fills. Upstream keeps them as
+// separate classes for the same reason.
+//
+// ─── FOUR THINGS HERE INVERT OR DISABLE SOMETHING THE OTHER ITEMS DO ─────────
+//  * THE CONTENT GOES IN `latent`, NOT `clean`. Every other appending item
+//    writes zeros into the noisy tensor and its content into `clean_latent`.
+//    A slot does the OPPOSITE (keyframe_slots.py:136-139): `clean_latent` gets
+//    `zeros_like(slot_tokens)` and `latent` gets the seed. That is why this does
+//    not go through the shared `AppendTokens` helper, and why it must not be
+//    "simplified" into it later.
+//  * THE DENOISE MASK IS 1, NOT `1 - strength`. `denoise_mask = ones`
+//    (:118-119), because a slot is OUTPUT rather than guidance: at mask 1 the
+//    noiser lerps from the slot `latent` toward noise and IGNORES `clean_latent`
+//    entirely. There is no strength parameter, and adding one would be inventing
+//    a knob upstream does not have.
+//  * `marked = TRUE`. The single upstream call site that marks anything
+//    (:121). This is what puts the trained `keyframes_abs_pos_embedding` on the
+//    slot tokens; without it the slots are denoised as ordinary tokens, cost a
+//    full latent frame each, and buy nothing.
+//  * THE SPAN IS SET BY HAND, AND IT IS ONE PIXEL FRAME. `[t, t+1)` written
+//    explicitly (:167-168), against `factors.time` for a regular latent frame.
+//    That single-pixel-frame extent is what distinguishes a slot from an
+//    ordinary latent frame in RoPE space, and widening it renders a finite,
+//    correctly shaped clip whose slots sit in the wrong place in time.
+//
+// AND ONE THING THAT LOOKS LOAD-BEARING AND IS NOT, recorded because upstream's
+// own comment invites the opposite reading. `_slot_positions` passes
+// `causal_fix=False` and explains it as "the span is set explicitly below, so it
+// must not also be applied" (:161-163). Measured against EXECUTED upstream at
+// the pin, on a one-latent-frame shape: computing the positions with
+// `causal_fix=True` and then applying the explicit span gives a tensor
+// BYTE-IDENTICAL to the `False` one. The causal fix only touches the temporal
+// axis, and the explicit span overwrites that axis in full, so the flag cannot
+// survive it. The mutation that flips it here stays GREEN for that reason — not
+// because a test is missing — and `false` is kept anyway to mirror upstream's
+// text rather than its algebra.
+//
+// `initial_keyframes` may be null, which is upstream's zero fill. When present
+// it is `(B, C, K, H, W)` with `K == positions.size()` and spatial dims equal to
+// the target's; DFR passes the spatially upsampled stage-1 slots here
+// (dfr_pipeline.py:364).
+void Ltx2ConditionVideoByGeneratedKeyframeSlots(Ltx2LatentState* state,
+                                                const Ltx2VideoLatentShape& target,
+                                                int64_t patch_size,
+                                                const Ltx2ScaleFactors& factors, double fps,
+                                                const std::vector<int64_t>& pixel_frame_indices,
+                                                const Ltx2LatentVolume* initial_keyframes);
+
+// `LatentTools.extract_generated_keyframes` (tools.py:203-230): the denoised
+// slot content as a `(B, C, K, H, W)` latent, one latent frame per keyframe.
+//
+// Returns an empty volume when the state carries no layout, which is upstream's
+// `None` (:205-206). Validates the layout against the LIVE token count and
+// against the target's own tokens-per-latent-frame (:208-220), because a layout
+// recorded at one resolution and read at another would unpatchify the right
+// number of values into the wrong grid.
+Ltx2LatentVolume Ltx2ExtractGeneratedKeyframes(const Ltx2LatentState& state,
+                                               const Ltx2VideoLatentShape& target,
+                                               int64_t patch_size);
+
+// `LatentTools.clear_conditioning` (tools.py:88-117), called immediately before
+// unpatchify (ltx-pipelines/utils/blocks.py:576, :579). Truncates `latent`,
+// `clean` and `positions` back to `target_tokens`, which is
+// `patchifier.get_token_count(target_shape)` — so an appending item MUST add its
+// tokens at the END, which is what upstream's docstring requires in terms.
+//
+// TWO THINGS HERE ARE NOT A TRUNCATION and a port that only slices gets both
+// wrong. The denoise mask comes back as `torch.ones_like(...)[:, :num_tokens]`
+// (tools.py:104) — ALL ONES, not the conditioned mask sliced — because the
+// returned state describes a finished latent in which every target token is
+// denoised. And `keyframes_mask` is dropped to None (tools.py:113), because the
+// marker described a sequence that no longer exists.
+//
+// Both anchors are spelled with their FILE rather than left as bare `:NN`
+// continuations. The nearest file named above them is `blocks.py`, and
+// `blocks.py:104` and `blocks.py:113` are both real import statements, so a bare
+// form would send a reader who checks to a plausible wrong place rather than to
+// nothing — which is the failure mode worth spending eight characters on.
+//
+// GENERATED KEYFRAME SLOTS ARE EXTRACTED BEFORE THE TRIM, AND ORDER IS THE WHOLE
+// POINT (tools.py:97 against :115). The slots live OUTSIDE the target grid, so
+// the trim is exactly what would destroy them; upstream's own docstring says
+// they "are *not* conditioning: they are generated output that happens to live
+// outside the target grid". `out_generated_keyframes` receives them and may be
+// null when the caller does not want them. A port that trimmed first would
+// return a correct video latent and silently drop every slot, which is the
+// defect the #920 refusal was written about.
+void Ltx2ClearConditioning(Ltx2LatentState* state, int64_t target_tokens,
+                           const Ltx2VideoLatentShape* target = nullptr,
+                           int64_t patch_size = 1,
+                           Ltx2LatentVolume* out_generated_keyframes = nullptr);
 
 // AudioConditionByReferenceLatent (reference_audio_cond.py:33-65): APPEND already
 // patchified reference-audio tokens with their own timings. Takes the patchified

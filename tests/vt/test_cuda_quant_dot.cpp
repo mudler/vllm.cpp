@@ -27,6 +27,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -38,6 +41,13 @@
 #include "vt/ops.h"
 #include "vt/quant.h"      // vt::cpu::BlockToFloat
 #include "vt/tensor.h"
+
+#ifdef VLLM_CPP_CUDA
+// The device-codebook seal: the CPU tables it is measured against, and the copy
+// out of device memory (only the CUDA TU that defines them can address them).
+#include "vt/cpu/cpu_quant_iq_tables.h"
+#include "vt/cuda/cuda_iq_table_seal.h"
+#endif
 
 using vt::Backend;
 using vt::Device;
@@ -88,6 +98,12 @@ struct WeightCase {
   int d_off;
   int dmin_off;
   const char* name;
+  // Ceiling for the f64-DEQUANT case only (0 means use kMaxNmseErr). That
+  // comparison holds a Q8_K-quantized activation against an f32 reference, so
+  // it measures ACTIVATION error, whose reach depends on the weight
+  // distribution. It does NOT bound the kernel. The CUDA-vs-CPU bound below is
+  // what gates this port, it is shared by every case, and it is not relaxed.
+  double nmse_ref_max = 0.0;
 };
 
 // Same table as test_ops_quant_dot.cpp: the Q8_K-family encodings the CUDA kernel
@@ -98,6 +114,20 @@ const WeightCase kCases[] = {
     {DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},   // DeepSeek-V4 gate/up
     {DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},   // DeepSeek-V4 down
     {DType::kIQ2_S, 256, 82, 0, -1, "iq2_s"},       // DeepSeek-V4 UD-IQ2_M gate/up
+    // The two sub-2-bit codebooks the Qwen3.8-2.4T checkpoints store their
+    // routed experts in (96.92 % of each model). Without a CUDA arm these fall
+    // to the CPU path and still emit CORRECT tokens, just at CPU speed, which
+    // no token gate can see -- so device parity is gated HERE.
+    // Measured, not guessed. Both are ternary lanes times a per-32 scale, so a
+    // super-block spans a wider dynamic range than a 4-6 bit codebook while
+    // Q8_K gives the activation ONE scale per 256 elements. iq1_s lands at
+    // 5.2399e-4 on the thinnest shape (m=4, n=1 is FOUR dot products), against
+    // a 5e-4 default -- the CPU test measures 5.2398e-4 at the SAME shape, and
+    // that near-identity is what shows this is the activation term and not the
+    // device kernel. 2e-3 is ~4x the residual and an order of magnitude below
+    // the weakest decode defect (2.7e-2, measured by mutation on the CPU arm).
+    {DType::kIQ1_S, 256, 50, 0, -1, "iq1_s", 2e-3},       // Qwen3.8 UD-IQ1_S experts
+    {DType::kIQ1_XXXS, 256, 38, 0, -1, "iq1_xxxs", 2e-3},  // Qwen3.8 UD-Q1_0 experts
     {DType::kQ2_K, 256, 84, 80, 82, "q2_K"},        // DeepSeek-V4 UD-Q2_K_XL
     {DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
@@ -128,6 +158,33 @@ std::vector<uint8_t> RandomBlocks(const WeightCase& c, int64_t nblocks,
     const float jitter = 1.0F + 0.05F * static_cast<float>(i % 7);
     if (c.d_off >= 0) put_f16(c.d_off, 0.0125F * jitter);
     if (c.dmin_off >= 0) put_f16(c.dmin_off, 0.0075F * jitter);
+    // IQ1_S and IQ1_XXXS carry their per-32 sub-block scale INSIDE the weight
+    // (qh bits 12-14, and the sc nibble's bits 0-2). Uniformly random bits
+    // spread neighbouring 32-groups over a 15x scale range, which no encoder
+    // emits, and Q8_K gives the ACTIVATION one scale per 256 elements -- so the
+    // f64-dequant bound below would measure that synthetic dynamic range rather
+    // than the kernel. The scale still VARIES per sub-block, so a kernel that
+    // dropped or hoisted it is still caught; the delta sign bit stays random.
+    // Mirrors the identical narrowing in tests/vt/test_ops_quant_dot.cpp.
+    if (c.dtype == DType::kIQ1_S) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint16_t qh = 0;
+        std::memcpy(&qh, blk + 34 + 2 * ib, sizeof(qh));
+        const uint16_t ls = static_cast<uint16_t>(2 + ((i + ib) % 3));
+        qh = static_cast<uint16_t>((qh & 0x8FFFU) | (ls << 12));
+        std::memcpy(blk + 34 + 2 * ib, &qh, sizeof(qh));
+      }
+    }
+    if (c.dtype == DType::kIQ1_XXXS) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint8_t& byte = blk[34 + ib / 2];
+        const int shift = 4 * (ib & 1);
+        const uint8_t ls = static_cast<uint8_t>(2 + ((i + ib) % 3));
+        const uint8_t keep_sign = static_cast<uint8_t>((byte >> shift) & 0x8);
+        byte = static_cast<uint8_t>((byte & ~(0xFU << shift)) |
+                                    ((keep_sign | ls) << shift));
+      }
+    }
   }
   return bytes;
 }
@@ -228,7 +285,10 @@ TEST_CASE("CUDA keep-quant GEMM == CPU reference and f64 dequant (Q8_K family + 
         const double nmse_cpu = den_cpu > 0 ? num_cpu / den_cpu : num_cpu;
         CAPTURE(nmse_ref);
         CAPTURE(nmse_cpu);
-        CHECK(nmse_ref <= kMaxNmseErr);   // quantization error vs f64 dequant
+        const double ref_ceiling =
+            c.nmse_ref_max > 0 ? c.nmse_ref_max : kMaxNmseErr;
+        CAPTURE(ref_ceiling);
+        CHECK(nmse_ref <= ref_ceiling);   // quantization error vs f64 dequant
         CHECK(nmse_cpu <= kMaxNmseVsCpu);  // matches the CPU oracle (int core exact)
       }
     }
@@ -549,6 +609,322 @@ TEST_CASE("Brick 14: CUDA Q8_0 register-prefetch GEMV == plain (byte-identical)"
   gpu.DestroyQueue(gq);
 }
 
+// ─── the GROUPED seams (kMatmulBTQuantGrouped, kMoeGateUpSwiGLUGrouped) ──────
+//
+// Three dispatch switches consume IsCudaKeepQuantSupported. #967 taught the
+// predicate to say yes for IQ1_S and IQ1_XXXS and extended ONE of them. The
+// grouped GEMM uses that same predicate to SKIP its CPU fallback and then ran a
+// `switch (w)` with no case for either dtype and no default: it quantized the
+// activation, launched NOTHING, and returned. `cudaGetLastError()` reported
+// success, because a launch that never happened cannot fail, so the output
+// tensor kept whatever it already held. That is the DEFAULT routed-expert path
+// of Qwen3.8-2.4T (qwen3_5_gguf_weights.cpp -> qwen3_5.cpp KqGrouped ->
+// vt::MatmulBTQuantGrouped), and the two dtypes are 96.92 % of that checkpoint.
+// The fused gate+up+SwiGLU seam had the same hole, where it turned a NAMED
+// "gate/up must be the SAME CUDA keep-quant dtype" refusal into a silent no-op.
+//
+// Each gate below asserts TWO things, and it needs both:
+//   1. the output is not the POISON written into the device buffer before the
+//      call. This is the only assertion that can see "no kernel ran"; every
+//      value-comparison gate in this file would have read a zeroed allocation as
+//      a merely inaccurate result.
+//   2. it matches the CPU grouped golden (src/vt/cpu/cpu_quant_gemm.cpp, itself
+//      gated by test_ops_quant_dot.cpp) to kMaxNmseVsCpu. That is what catches a
+//      kernel that DID run, on the wrong expert row, scale, or codebook.
+// The f64 dequant band is deliberately not repeated here: the grouped kernel is
+// the dense kernel with one different weight-row index (same DotSuperblock, same
+// FinalFactor, same warp reduce), so the dense case above already measures the
+// quantization error per dtype and repeating it would only re-measure Q8_K.
+namespace {
+
+// Distinctive, never a plausible dot product, and the value the independent
+// review used on GB10 when it measured this defect.
+constexpr float kPoison = -12345.0F;
+
+// P routed rows over E experts into N columns. P=1 is decode with one expert;
+// N=7 puts an odd column count against the 32-lane warp tiling; the `bcast` arm
+// (activation rows == 1 while P > 1) is the shape the routed MoE actually takes,
+// where every selected expert reads ONE quantized hidden.
+struct GroupedShape {
+  int64_t P;
+  int64_t n;
+  int64_t E;
+  bool bcast;
+};
+const GroupedShape kGroupedShapes[] = {
+    {1, 1, 2, false}, {1, 16, 3, false}, {4, 7, 3, false}, {4, 7, 3, true}, {8, 16, 4, true},
+};
+
+std::vector<int32_t> ExpertIds(int64_t P, int64_t E) {
+  std::vector<int32_t> ids(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p)
+    ids[static_cast<size_t>(p)] = static_cast<int32_t>((p * 3 + 1) % E);
+  return ids;
+}
+
+// num/den of the CUDA-vs-CPU NMSE, plus how many outputs still carry the poison.
+struct GroupedVerdict {
+  double nmse = 0.0;
+  int64_t poisoned = 0;
+  int64_t nonfinite = 0;
+};
+
+GroupedVerdict Compare(const std::vector<float>& got, const std::vector<float>& ref) {
+  GroupedVerdict v;
+  double num = 0, den = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double g = got[i], r = ref[i];
+    if (got[i] == kPoison) ++v.poisoned;
+    if (!std::isfinite(g)) ++v.nonfinite;
+    num += (g - r) * (g - r);
+    den += r * r;
+  }
+  v.nmse = den > 0 ? num / den : num;
+  return v;
+}
+
+}  // namespace
+
+// The CPU twin of the probe below, and the reason to trust it. Both CUDA gates
+// that follow return early on a host without a device, so on a CPU-only runner
+// they assert NOTHING and doctest still prints SUCCESS. This case runs
+// everywhere: it drives the SAME poisoned-buffer instrument through the CPU
+// grouped golden, which must overwrite every element and reproduce the dense
+// per-expert result byte for byte. If the instrument itself were broken -- a
+// poison that is never written, a comparison that reads the wrong buffer -- it
+// would be broken here too, where it can be seen without a GPU.
+TEST_CASE("grouped keep-quant golden writes over a poisoned buffer (CPU arm)") {
+  Queue cq{Cpu(), nullptr};
+  int64_t combos = 0;
+  for (const WeightCase& c : kCases) {
+    const int64_t k = 8 * c.block_elems;
+    for (const GroupedShape& g : kGroupedShapes) {
+      const std::string case_name(c.name);
+      CAPTURE(case_name);
+      CAPTURE(g.P);
+      CAPTURE(g.n);
+      CAPTURE(g.bcast);
+      ++combos;
+
+      const int64_t arows = g.bcast ? 1 : g.P;
+      const int64_t wrows = g.E * g.n;
+      std::vector<uint8_t> wq = RandomBlocks(c, wrows * (k / c.block_elems), 0x5EEDU);
+      std::vector<float> a(static_cast<size_t>(arows * k));
+      GenerateData(1.0F, a.size(), a.data());
+      std::vector<int32_t> ids = ExpertIds(g.P, g.E);
+      const size_t outn = static_cast<size_t>(g.P * g.n);
+      const size_t row_bytes = static_cast<size_t>(k / c.block_elems) * c.block_bytes;
+
+      std::vector<float> got(outn, kPoison);
+      {
+        Tensor at = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {arows, k});
+        Tensor wt = Tensor::Contiguous(wq.data(), DType::kF32, Cpu(), {wrows, k});
+        wt.dtype = c.dtype;
+        Tensor et = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {g.P});
+        Tensor ot = Tensor::Contiguous(got.data(), DType::kF32, Cpu(), {g.P, g.n});
+        vt::MatmulBTQuantGrouped(cq, ot, at, wt, et);
+      }
+
+      // Independent reconstruction: the dense keep-quant GEMM over the row block
+      // expert_ids[p] selects, one row of output at a time.
+      std::vector<float> ref(outn, kPoison);
+      for (int64_t p = 0; p < g.P; ++p) {
+        const int64_t e = ids[static_cast<size_t>(p)];
+        Tensor at = Tensor::Contiguous(a.data() + static_cast<size_t>(g.bcast ? 0 : p * k),
+                                       DType::kF32, Cpu(), {1, k});
+        Tensor wt = Tensor::Contiguous(wq.data() + static_cast<size_t>(e * g.n) * row_bytes,
+                                       DType::kF32, Cpu(), {g.n, k});
+        wt.dtype = c.dtype;
+        Tensor ot = Tensor::Contiguous(ref.data() + static_cast<size_t>(p * g.n), DType::kF32,
+                                       Cpu(), {1, g.n});
+        vt::MatmulBTQuant(cq, ot, at, wt);
+      }
+
+      int64_t poisoned = 0;
+      for (float v : got)
+        if (v == kPoison) ++poisoned;
+      CAPTURE(poisoned);
+      CHECK(poisoned == 0);
+      CHECK(std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0);
+    }
+  }
+  CAPTURE(combos);
+  CHECK(combos == static_cast<int64_t>(std::size(kCases) * std::size(kGroupedShapes)));
+  CHECK(combos > 0);
+}
+
+TEST_CASE("CUDA grouped keep-quant GEMM == CPU grouped golden and it WRITES the output") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; CUDA grouped keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+
+  int64_t combos = 0;
+  for (const WeightCase& c : kCases) {
+    const int64_t k = 8 * c.block_elems;
+    for (const GroupedShape& g : kGroupedShapes) {
+      const std::string case_name(c.name);
+      CAPTURE(case_name);
+      CAPTURE(g.P);
+      CAPTURE(g.n);
+      CAPTURE(g.E);
+      CAPTURE(g.bcast);
+      CAPTURE(k);
+      ++combos;
+
+      const int64_t arows = g.bcast ? 1 : g.P;
+      std::vector<uint8_t> wq = RandomBlocks(c, g.E * g.n * (k / c.block_elems), 0x5EEDU);
+      std::vector<float> a(static_cast<size_t>(arows * k));
+      GenerateData(1.0F, a.size(), a.data());
+      std::vector<int32_t> ids = ExpertIds(g.P, g.E);
+      const size_t outn = static_cast<size_t>(g.P * g.n);
+
+      // --- CPU golden (the landed grouped keep-quant kernel over host tensors)
+      std::vector<float> cpu_out(outn, kPoison);
+      {
+        Tensor at = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {arows, k});
+        Tensor wt = Tensor::Contiguous(wq.data(), DType::kF32, Cpu(), {g.E * g.n, k});
+        wt.dtype = c.dtype;
+        Tensor et = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {g.P});
+        Tensor ot = Tensor::Contiguous(cpu_out.data(), DType::kF32, Cpu(), {g.P, g.n});
+        vt::MatmulBTQuantGrouped(cq, ot, at, wt, et);
+      }
+
+      // --- CUDA path, over a POISONED output buffer --------------------------
+      void* d_a = gpu.Alloc(a.size() * sizeof(float));
+      void* d_w = gpu.Alloc(wq.size());
+      void* d_e = gpu.Alloc(ids.size() * sizeof(int32_t));
+      void* d_o = gpu.Alloc(outn * sizeof(float));
+      std::vector<float> poison(outn, kPoison);
+      gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+      gpu.Copy(gq, d_w, wq.data(), wq.size());
+      gpu.Copy(gq, d_e, ids.data(), ids.size() * sizeof(int32_t));
+      gpu.Copy(gq, d_o, poison.data(), poison.size() * sizeof(float));
+      gpu.Synchronize(gq);
+      Tensor at = DevTensor(d_a, DType::kF32, {arows, k});
+      Tensor wt = DevTensor(d_w, c.dtype, {g.E * g.n, k});
+      Tensor et = DevTensor(d_e, DType::kI32, {g.P});
+      Tensor ot = DevTensor(d_o, DType::kF32, {g.P, g.n});
+      vt::MatmulBTQuantGrouped(gq, ot, at, wt, et);
+      std::vector<float> cuda_out(outn, 0.0F);
+      gpu.Copy(gq, cuda_out.data(), d_o, cuda_out.size() * sizeof(float));
+      gpu.Synchronize(gq);
+      gpu.Free(d_a);
+      gpu.Free(d_w);
+      gpu.Free(d_e);
+      gpu.Free(d_o);
+
+      const GroupedVerdict v = Compare(cuda_out, cpu_out);
+      CAPTURE(v.nmse);
+      CAPTURE(v.poisoned);
+      CHECK(v.poisoned == 0);   // a dispatch that launches nothing lands HERE
+      CHECK(v.nonfinite == 0);
+      CHECK(v.nmse <= kMaxNmseVsCpu);
+    }
+  }
+  // doctest prints "SUCCESS!" for a loop that never ran. Say how many it ran.
+  CAPTURE(combos);
+  CHECK(combos == static_cast<int64_t>(std::size(kCases) * std::size(kGroupedShapes)));
+  CHECK(combos > 0);
+  gpu.DestroyQueue(gq);
+}
+
+TEST_CASE("CUDA fused MoE gate+up+SwiGLU == CPU golden and it WRITES the output") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; CUDA fused-SwiGLU gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+
+  int64_t combos = 0;
+  for (const WeightCase& c : kCases) {
+    // The fused kernel is Q8_K-activation only; Q8_0 has no fused arm and the
+    // op REFUSES it by name (there is no CPU fallback behind this seam).
+    if (c.dtype == DType::kQ8_0) continue;
+    const int64_t k = 8 * c.block_elems;
+    for (const GroupedShape& g : kGroupedShapes) {
+      // limit=+inf is the plain silu(g)*u MLP; a finite limit exercises both
+      // clamp arms of the epilogue.
+      for (float limit : {std::numeric_limits<float>::infinity(), 3.0F}) {
+        const std::string case_name(c.name);
+        CAPTURE(case_name);
+        CAPTURE(g.P);
+        CAPTURE(g.n);
+        CAPTURE(g.bcast);
+        CAPTURE(limit);
+        ++combos;
+
+        const int64_t arows = g.bcast ? 1 : g.P;
+        const int64_t wrows = g.E * g.n;
+        std::vector<uint8_t> gw = RandomBlocks(c, wrows * (k / c.block_elems), 0x5EEDU);
+        std::vector<uint8_t> uw = RandomBlocks(c, wrows * (k / c.block_elems), 0xC0FFEEU);
+        std::vector<float> a(static_cast<size_t>(arows * k));
+        GenerateData(1.0F, a.size(), a.data());
+        std::vector<int32_t> ids = ExpertIds(g.P, g.E);
+        const size_t outn = static_cast<size_t>(g.P * g.n);
+
+        std::vector<float> cpu_out(outn, kPoison);
+        {
+          Tensor at = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {arows, k});
+          Tensor gt = Tensor::Contiguous(gw.data(), DType::kF32, Cpu(), {wrows, k});
+          Tensor ut = Tensor::Contiguous(uw.data(), DType::kF32, Cpu(), {wrows, k});
+          gt.dtype = c.dtype;
+          ut.dtype = c.dtype;
+          Tensor et = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {g.P});
+          Tensor ot = Tensor::Contiguous(cpu_out.data(), DType::kF32, Cpu(), {g.P, g.n});
+          vt::MoeGateUpSwiGLUGrouped(cq, ot, at, gt, ut, et, limit);
+        }
+
+        void* d_a = gpu.Alloc(a.size() * sizeof(float));
+        void* d_g = gpu.Alloc(gw.size());
+        void* d_u = gpu.Alloc(uw.size());
+        void* d_e = gpu.Alloc(ids.size() * sizeof(int32_t));
+        void* d_o = gpu.Alloc(outn * sizeof(float));
+        std::vector<float> poison(outn, kPoison);
+        gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+        gpu.Copy(gq, d_g, gw.data(), gw.size());
+        gpu.Copy(gq, d_u, uw.data(), uw.size());
+        gpu.Copy(gq, d_e, ids.data(), ids.size() * sizeof(int32_t));
+        gpu.Copy(gq, d_o, poison.data(), poison.size() * sizeof(float));
+        gpu.Synchronize(gq);
+        Tensor at = DevTensor(d_a, DType::kF32, {arows, k});
+        Tensor gt = DevTensor(d_g, c.dtype, {wrows, k});
+        Tensor ut = DevTensor(d_u, c.dtype, {wrows, k});
+        Tensor et = DevTensor(d_e, DType::kI32, {g.P});
+        Tensor ot = DevTensor(d_o, DType::kF32, {g.P, g.n});
+        vt::MoeGateUpSwiGLUGrouped(gq, ot, at, gt, ut, et, limit);
+        std::vector<float> cuda_out(outn, 0.0F);
+        gpu.Copy(gq, cuda_out.data(), d_o, cuda_out.size() * sizeof(float));
+        gpu.Synchronize(gq);
+        gpu.Free(d_a);
+        gpu.Free(d_g);
+        gpu.Free(d_u);
+        gpu.Free(d_e);
+        gpu.Free(d_o);
+
+        const GroupedVerdict v = Compare(cuda_out, cpu_out);
+        CAPTURE(v.nmse);
+        CAPTURE(v.poisoned);
+        CHECK(v.poisoned == 0);
+        CHECK(v.nonfinite == 0);
+        // The SwiGLU epilogue can drive a clamped output to exactly zero, which
+        // makes the denominator small on a thin shape; the band is the same
+        // CUDA-vs-CPU one because the integer core is the same.
+        CHECK(v.nmse <= kMaxNmseVsCpu);
+      }
+    }
+  }
+  CAPTURE(combos);
+  CHECK(combos == static_cast<int64_t>((std::size(kCases) - 1) * std::size(kGroupedShapes) * 2));
+  CHECK(combos > 0);
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   // The registration is what flips the GGUF loader's keep-quant default ON on a
   // CUDA device (GgufQuantComputeAvailable -> OpRegistered(kMatmulBTQuant,kCUDA))
@@ -685,5 +1061,56 @@ TEST_CASE("Brick 12: CUDA Q8_0 block-diagonal o-LoRA == per-group loop (bit-iden
     CHECK(std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0);
   }
   gpu.DestroyQueue(gq);
+}
+
+// The device-codebook drift seal cuda_quant_iq_tables.cuh has claimed since it
+// landed. `src/vt/cuda/cuda_quant_iq_tables.cuh` is a hand transcription of
+// `src/vt/cpu/cpu_quant_iq_tables.h`, and nothing compared the two: the CPU
+// tests digest the HOST symbols, and no gate reads `vt::cuda::d_iq1s_grid` at
+// all. The value gates in this file only see a drifted entry if a weight sample
+// happens to address it, which is chance, not coverage: replaying the
+// std::mt19937(0x5EED) stream those gates use, 266 of the 2048 d_iq1s_grid
+// entries (13.0 %) are never addressed, so drifting entry 0 is caught while
+// drifting entry 3 is green at 150032/150032 assertions.
+//
+// Byte equality is the right assertion because it is the actual contract: the
+// device tables are DERIVED from the CPU ones, deliberately in the same u64
+// layout, so any difference at all is a transcription defect.
+TEST_CASE("CUDA device codebooks == the CPU host tables (byte-exact)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; device-codebook seal skipped");
+    return;
+  }
+  vt::GetBackend(DeviceType::kCUDA);  // ensure a live CUDA context for the copy
+  auto snap = std::make_unique<vt::cuda::IqTableSnapshot>();
+  vt::cuda::SnapshotIqTablesFromDevice(snap.get());
+
+  int sealed = 0;
+  // `name` is a const& parameter, so the caller's temporary outlives the CAPTURE;
+  // a `CAPTURE(std::string(...))` would dangle, because doctest reads the
+  // captured expression at FAILURE time, not at capture time.
+  auto seal = [&](const std::string& name, const void* dev, const void* host, size_t bytes) {
+    CAPTURE(name);
+    CHECK(std::memcmp(dev, host, bytes) == 0);
+    ++sealed;
+  };
+  seal("d_kmask_iq2xs", snap->kmask_iq2xs, vt::cpu::kKmaskIq2xs, sizeof(snap->kmask_iq2xs));
+  seal("d_ksigns_iq2xs", snap->ksigns_iq2xs, vt::cpu::kKsignsIq2xs, sizeof(snap->ksigns_iq2xs));
+  seal("d_iq1s_grid", snap->iq1s_grid, vt::cpu::kIq1sGrid, sizeof(snap->iq1s_grid));
+  seal("d_iq1xxxs_grid", snap->iq1xxxs_grid, vt::cpu::kIq1xxxsGrid, sizeof(snap->iq1xxxs_grid));
+  seal("d_iq2xxs_grid", snap->iq2xxs_grid, vt::cpu::kIq2xxsGrid, sizeof(snap->iq2xxs_grid));
+  seal("d_iq3xxs_grid", snap->iq3xxs_grid, vt::cpu::kIq3xxsGrid, sizeof(snap->iq3xxs_grid));
+  seal("d_iq2s_grid", snap->iq2s_grid, vt::cpu::kIq2sGrid, sizeof(snap->iq2s_grid));
+  seal("d_kvalues_mxfp4", snap->kvalues_mxfp4, vt::cpu::kValuesMxfp4,
+       sizeof(snap->kvalues_mxfp4));
+  // Say how many tables were examined: a seal that compared nothing would
+  // otherwise print the same "SUCCESS!" as one that compared all eight.
+  CAPTURE(sealed);
+  CHECK(sealed == 8);
+  // And the extents themselves, so a snapshot that silently shrank is a failure
+  // rather than a shorter memcmp that trivially passes.
+  CHECK(sizeof(snap->iq1s_grid) == sizeof(vt::cpu::kIq1sGrid));
+  CHECK(sizeof(snap->iq1xxxs_grid) == sizeof(vt::cpu::kIq1xxxsGrid));
+  CHECK(sizeof(snap->iq2s_grid) == sizeof(vt::cpu::kIq2sGrid));
 }
 #endif  // VLLM_CPP_CUDA

@@ -85,6 +85,15 @@ EXPECTED_JOBS = (
     "device-leakage",
     "sanitize-cpu",
     "vulkan-spirv-freshness",
+    # Joined on 2026-08-17 (#503). These two were `if: github.event_name ==
+    # 'pull_request'` and so were never DEFINED for the baseline lane's events:
+    # not skipped, not missing, not covered -- absent from the payload entirely,
+    # which is the one shape the `missing` arm above exists to catch and the one
+    # it could not see, because the expectation did not name them. The verdict
+    # therefore printed GREEN while `main` did not compile under MSVC (#503,
+    # #1068). The workflow now runs them on `schedule`/`workflow_dispatch`.
+    "windows-msvc-cpu",
+    "windows-msvc-vulkan",
 )
 
 

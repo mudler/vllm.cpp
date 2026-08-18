@@ -86,7 +86,7 @@ void PrepareMuseGlimmer(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardMuseGlimmer(LoadedModel& model,
                                  const ModelForwardInput& input) {
-  auto& mg = static_cast<MuseGlimmerLoadedModel&>(model);
+  auto& mg = ModelAs<MuseGlimmerLoadedModel>(model, "MuseGlimmerForCausalLM");
   const MuseGlimmerWeights& weights = mg.weights();
   // W4 WIRING: the MULTIMODAL branch. When ModelForwardInput.mm is set (the
   // MuseGlimmerGenerateGreedyViaRegistry driver / the runner mm-path) the hidden

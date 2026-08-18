@@ -33,3 +33,4 @@ a.out
 # Logs and local capture artifacts (demo recordings, screencasts)
 *.log
 *.mp4
+generated/

@@ -703,7 +703,12 @@ add_library(vllm STATIC
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
+  src/vllm/config/weight_residency.cpp
   src/vllm/model_executor/weight_offloader.cpp
+  src/vllm/model_executor/weight_offload_policy.cpp
+  src/vllm/model_executor/expert_slot_cache.cpp
+  src/vllm/model_executor/model_loader/gguf_expert_span.cpp
+  src/vllm/model_executor/expert_streamer.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -713,6 +718,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
   src/vllm/model_executor/model_loader/gguf_keep_quant.cpp
+  src/vllm/model_executor/model_loader/gguf_device_fit.cpp
   src/vllm/model_executor/model_loader/nvfp4_dequant.cpp
   src/vllm/model_executor/model_loader/awq_gptq_dequant.cpp
   src/vllm/model_executor/model_loader/mxfp4_dequant.cpp
@@ -774,6 +780,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_quant.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_device.cpp
+  src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
@@ -828,6 +836,12 @@ add_library(vllm STATIC
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_audio_vae.cpp
   src/vllm/model_executor/models/ltx2_video_vae.cpp
+  # LTX-2.5 (ROW LTX25-TILED-DECODE, issue #644): the tiling algebra and the
+  # STREAMING tiled decode. Own translation units so the untiled decode above
+  # stays the gated reference and the tiled path cannot drift from it by sharing
+  # an internal helper only one of them exercises.
+  src/vllm/model_executor/models/ltx2_tiling.cpp
+  src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L3): the Gemma-4 multi-layer feature
   # aggregation, the two caption projections and the embedded asset pack. An
   # additive file mirroring ltx_core's own structure.
@@ -836,7 +850,21 @@ add_library(vllm STATIC
   # the latent spatial upsampler, the duration head and the embeddings
   # connector. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_pipeline.cpp
+  # LTX-2.5 (ROW LTX25-RES2S-LOOP, issue #921): the res_2s second-order sampler.
+  # Its own TU because upstream partitions it that way — a STEPPER advances one
+  # substep and lives in ltx-core/components/diffusion_steps.py, which
+  # ltx2_pipeline.cpp mirrors, while a SAMPLER decides how many substeps there
+  # are and what is evaluated between them and lives in
+  # ltx-pipelines/utils/samplers.py. Two upstream packages, two files here.
+  src/vllm/model_executor/models/ltx2_samplers.cpp
   src/vllm/model_executor/models/ltx2_upsampler.cpp
+  # LTX-2.5 (ROW LTX25-DFR-PIPELINE, issue #986): the DFR canvas layout — the
+  # keyframe segment grid, the temporal tile ranges and the latent stitch. Its
+  # own TU because it holds no weights and runs no kernel: it is pure index
+  # arithmetic whose every failure mode returns a correctly shaped, finite,
+  # plausible latent, so it is gated by exact index vectors rather than by a
+  # numeric band, which is a different kind of test from the rest of L5.
+  src/vllm/model_executor/models/ltx2_dfr.cpp
   src/vllm/model_executor/models/ltx2_duration_head.cpp
   src/vllm/model_executor/models/ltx2_connector.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L11): the conditioning items that
@@ -848,13 +876,36 @@ add_library(vllm STATIC
   # than additions to ltx2_loader.cpp, which two concurrent rows of the same
   # campaign need to edit.
   src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_audio_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_audio_input.cpp
   src/vllm/model_executor/models/ltx2_image_preprocess.cpp
+  # LTX-2.5 RETAKE (row LTX25-RETAKE, #924): the temporal region mask, the
+  # truncate-or-pad conform, and the frame-directory source. Its own TU for the
+  # same reason the two above are: ltx2_video.cpp is a concurrent-edit lock.
+  src/vllm/model_executor/models/ltx2_retake.cpp
+  # LTX-2.5 (ROW LTX25-T2A-ONE-STAGE, issue #1005): text-to-audio — the
+  # audio-only pipeline and its guided denoiser. Its own TU for the same reason
+  # the two above are, plus one this row adds: it is the only LTX pipeline that
+  # runs the DiT with `video = nullptr`, and keeping that call in one file is
+  # what makes "does anything else pass a video stream" a readable question.
+  src/vllm/model_executor/models/ltx2_t2a.cpp
+  # LTX-2.5 (ROW LTX25-GUIDED-VIDEO, issue #1092): `_guided_denoise` — the pass
+  # assembly four unported pipelines are each blocked on, and the piece the
+  # VIDEO denoise loop never had. Its own TU because upstream has its own file
+  # (ltx-pipelines utils/denoisers.py) and because ltx2_pipeline.cpp, where the
+  # guiders live, is a concurrent-edit lock.
+  src/vllm/model_executor/models/ltx2_denoisers.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
   src/vllm/model_executor/models/ltx2_loader.cpp
+  # LTX-2.5 (ROW LTX25-IC-LORA, issue #923): reading an IC-LoRA adapter and its
+  # `__metadata__`, and the bf16 delta the loader fuses into every arm. Its own
+  # TU for the same reason as the two above.
+  src/vllm/model_executor/models/ltx2_lora.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/entrypoints/openai/speech_api.cpp
+  src/vllm/entrypoints/openai/speech_api_synthesize.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
@@ -865,6 +916,10 @@ add_library(vllm STATIC
   # config descent, the on-disk name map, the registry entry and the het-KV
   # topology. No forward: nemotron_h.cpp is W4.
   src/vllm/model_executor/models/nemotron_h.cpp
+  # A2-R (#810): the DEVICE arm — the residual stream, the 52 norms, the
+  # embedding lookup and the 6 GQA attention blocks. Mamba/MoE/lm_head stay
+  # host; see the file header for why the line falls where it does.
+  src/vllm/model_executor/models/nemotron_h_device.cpp
   src/vllm/model_executor/models/nemotron_h_registry.cpp
   src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
@@ -920,6 +975,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/phi_weights.cpp
   src/vllm/model_executor/models/phi.cpp
   src/vllm/model_executor/models/model_registry.cpp
+  src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp
   src/vllm/plugins/plugins.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
@@ -986,6 +1042,7 @@ add_library(vllm STATIC
   src/vllm/v1/spec_decode/ngram_proposer.cpp
   src/vllm/v1/spec_decode/draft_model_proposer.cpp
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
+  src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_decode_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
@@ -1158,6 +1215,7 @@ add_library(vllm STATIC
   src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
+  src/vt/breakable_graph.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/op_provider.cpp
@@ -1188,6 +1246,9 @@ add_library(vllm STATIC
   # translation units, reached through vllm's INTERFACE --whole-archive option.
   src/vt/cpu/cpu_conv2d.cpp
   src/vt/cpu/cpu_conv1d_depthwise.cpp
+  # BigVGAN / DAC vocoder 1-D convolutions (#672). Self-registering, reached the
+  # same --whole-archive way as the conformer kernels above.
+  src/vt/cpu/cpu_conv1d_general.cpp
   src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
@@ -1562,6 +1623,12 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_quant_dot.cu
+    # UNCONDITIONAL ON PURPOSE (issue #960). The static per-tensor fp8 activation
+    # quant has no cutlass dependency; it lived in the cutlass-fp8 TU below and so
+    # went unregistered for kCUDA on every arch outside VT_CUTLASS_FP8_ARCHS,
+    # where the resolver then ran the portable CPU tier over device pointers and
+    # segfaulted. scripts/check-cuda-op-arch-gate.py fails if it leaves this list.
+    src/vt/cuda/cuda_quant_fp8.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu
@@ -1578,6 +1645,9 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu
+    # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
+    # convolution in the tree on any device.
+    src/vt/cuda/cuda_conv1d_general.cu
     src/vt/cuda/cuda_attention_cross.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
@@ -2249,6 +2319,7 @@ add_library(vllm_shared SHARED "${_vllm_shared_stub}")
 add_library(vllm::shared ALIAS vllm_shared)
 set_target_properties(vllm_shared PROPERTIES
   OUTPUT_NAME vllm
+  ARCHIVE_OUTPUT_NAME vllm_shared
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
   CXX_VISIBILITY_PRESET hidden
@@ -2261,7 +2332,11 @@ target_include_directories(vllm_shared PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 # Force-link the whole `vllm` archive (the C ABI + engine + the CPU-backend
 # static registrar) and inherit its PUBLIC deps (CUDA::cudart, Threads, ...).
-target_link_libraries(vllm_shared PRIVATE vllm)
+# On Windows the packaged shared target also needs the vendored BLAKE3 archive
+# explicitly on its own link line; relying on the static archive's usage
+# requirements is not sufficient once the C ABI DLL is assembled via
+# /WHOLEARCHIVE.
+target_link_libraries(vllm_shared PRIVATE vllm blake3_vendored)
 # Export only the C ABI: `vllm_*` stays global, everything else is localized.
 # UNLIKE the force-link guard above, `UNIX AND NOT APPLE` is CORRECT here: a
 # linker version script is a GNU-ld/ELF feature with no ld64 spelling (ld64 uses
@@ -2307,4 +2382,18 @@ endif()
 
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
 endif()

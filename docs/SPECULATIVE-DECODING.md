@@ -17,12 +17,45 @@ the list of accepted ones (`src/vllm/config/speculative.cpp`).
 |---|---|---|---|
 | `mtp` | the target's own `mtp.*` head | 1 | Gated, and the default recommendation. Token-exact against vLLM at concurrency 1, ~1.04x its speculative-on decode |
 | `dflash` | a separate z-lab block-diffusion checkpoint | block size, e.g. 16 | Gated. 2.9x over speculative-off at concurrency 1, at or above vLLM's own DFlash-on |
-| `dspark` | a separate DSpark checkpoint | block size, at least the draft's own | Runs end to end, **not gated**. Token-identical to speculative-off on the 35B, but currently about 2% slower than plain decode; no speed win is claimed |
+| `dspark` | a separate DSpark checkpoint | block size, at least the draft's own | Runs end to end, **not gated**. Token-identical to speculative-off on the 35B. Speculation works (drafts proposed and accepted), but the cross-engine ratio is UNSETTLED: the last matched-and-warm paired measurement is 0.834x of the pinned oracle. No speed win is claimed |
 | `ngram` | none, drafts come from the prompt's own suffix | required, no default | Accepted and wired; no published measurement |
 | `draft_model` | a separate full model | from the draft | **Config only.** The JSON parses, but the engine has no branch for it and refuses the load |
 
 MTP and DFlash are the two with binding numbers behind them; the per-method
 detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
+
+## Which keys the JSON accepts
+
+The object is checked key by key and **nothing is dropped**. A name this engine
+cannot honour is refused at startup, by name, before a byte of weights is read.
+Until [#1160](https://github.com/mudler/vllm.cpp/issues/1160) an unrecognised key
+was silently discarded, so `"draft_sample_method":"probabilistic"` started a
+server that drafted greedily and reported nothing, and a typo such as
+`"num_speculatve_tokens"` quietly took the resolved default instead of the value
+that was typed.
+
+| Key | Accepted |
+|---|---|
+| `method` | `mtp`, `dflash`, `dspark`, `ngram`, `draft_model` |
+| `num_speculative_tokens` | a positive integer, or absent for the method's own default |
+| `model` | the draft checkpoint path or HF repo id |
+| `prompt_lookup_min`, `prompt_lookup_max` | an integer of at least 1, `ngram` only |
+| `draft_sample_method` | `greedy` only, which is upstream's default and what this engine does |
+| `rejection_sample_method` | `standard` only, which is upstream's default and what this engine does |
+
+There are two kinds of refusal, worded differently on purpose. A name vLLM's own
+`SpeculativeConfig` declares, such as `quantization` or `max_model_len`, is
+reported as a real vLLM field this engine does not implement. Any other name is
+reported as unknown, together with the list above, because that one is usually a
+typo. `draft_sample_method: probabilistic` and the `synthetic` and `block`
+acceptance variants name row `SPEC-ACCEPT-VARIANTS`, which owes them.
+
+The distinction matters beyond ergonomics. Draft sampling and verify are greedy
+here, so a dropped `probabilistic` produced a **deterministic** run when a sampled
+draft was asked for, and a deterministic run is adjudicable by the token-exact
+greedy gate while the configuration the user actually requested is not. A
+silently downgraded flag therefore lets a parity or benchmark number be taken
+under a configuration nobody chose.
 
 ## MTP
 
@@ -30,9 +63,32 @@ detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
   in their safetensors (Qwen3.6-27B and Qwen3.6-35B-A3B). Both are GDN hybrids,
   and the speculative path is wired through the linear-attention (GDN) recurrence
   and short causal convolution as well as the attention layers.
-- **k = 1 only.** `num_speculative_tokens` greater than 1 is not accepted for
-  this method. Depth (k>1, dynamic, adaptive) is unbuilt and tracked in
-  [#81](https://github.com/mudler/vllm.cpp/issues/81).
+- **Depth is configurable.** `num_speculative_tokens` sets how many tokens the
+  MTP head drafts per step, by looping the single head autoregressively. It
+  defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate
+  checkpoints, so the default is unchanged. A value above `n_predict` must be a
+  multiple of it, mirroring vLLM. Depth is a pure throughput lever: greedy
+  decoding plus accept-if-equal rejection makes the emitted tokens identical at
+  every k, which is proven on CPU for k=1..4 against speculative-off. That
+  identity is exactly why a token gate cannot see a clamped depth, so each CPU arm
+  asserts TWO positive witnesses instead, because neither one alone is enough. The
+  DRAFT DECODE FORWARDS the propose ran, `k-1` per propose call, catch a propose
+  that never entered the loop. They do NOT catch padding: a propose that runs
+  every forward and then overwrites all k columns with its step-0 draft reports
+  `k-1` truthfully. The second witness counts the propose calls whose DELIVERED
+  draft row was not a pure function of its own first column, which is what a
+  padded row is, and it is measured non-zero at every k >= 2. Neither witness
+  proves PER-COLUMN PROVENANCE, that column j came from forward j. What the
+  CPU tier does NOT show is acceptance at depth: no draft is accepted at any depth
+  on the synthetic gate model, so the accept path at k>1 is unexercised there. A
+  non-zero acceptance COUNT at depth would not close provenance either, because a
+  padded row is accepted at column 1 whenever the target's own greedy continuation
+  repeats a token, which real text does routinely. Closing it needs an acceptance
+  RATE measured against a PADDED CONTROL on the same workload. The cross-engine
+  speed comparison at k>1 and the DGX three-way at k=2..4, which must run that
+  control, are still owed
+  ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), as are
+  batch-size-keyed dynamic depth and acceptance-driven adaptive depth.
 - **Correctness:** at concurrency 1 the speculative-on greedy output is
   token-for-token identical to both the speculative-off output and vLLM's own MTP
   speculative greedy output on the same prompt.
@@ -91,11 +147,19 @@ all 48 tokens and reproducible** (both arms run on the synchronous path; the
 speculative path forces async scheduling off, so a fair comparison has to force
 it off on the other side too).
 
-**It is still not gated.** Speculation is currently about 2% SLOWER than plain
-decode at concurrency 1 — the sequential stage is a host-side loop with a device
-round-trip per step — and the cross-engine comparison against vLLM's own DSpark,
-the acceptance-rate band, and the other target families are all still owed. No
-speed win is claimed. A GGUF target, and a target architecture with no aux
+**It is still not gated**, and the cross-engine number is UNSETTLED rather than
+merely owed. The host-side sequential stage described above was since moved on
+device, the T=1+k verify was captured, and the draft chain made sync-free; all
+three are byte-identical and landed. What is not settled is the ratio against
+vLLM's own DSpark. Ratios recorded through 2026-08-13 (0.957x-0.989x) were taken
+with a SINGLE COLD oracle invocation per paired run, so the denominator paid
+compile-JIT the numerator did not; with the oracle warm and generation length
+matched, the paired measurement is **0.834x**. Those two cannot be differenced
+directly, because the gate host was reimaged in between and is no longer the same
+machine. The deciding experiment — a single cold oracle invocation on the CURRENT
+box — is specified in the benchmark record and has not yet run. Until it does, no
+speed claim in either direction is supportable. The acceptance-rate band and the
+other target families remain owed. A GGUF target, and a target architecture with no aux
 multi-tap, are both refused by name.
 
 ```bash
@@ -107,6 +171,33 @@ main --model /models/Qwen3-4B \
 carries no `n_predict`), and it must be at least the checkpoint's block size —
 a smaller value produces incorrect output rather than merely lower acceptance,
 so it is rejected.
+
+### Which DSpark draft the loader will take
+
+The lane is decided by the DRAFT's own `config.json`, not by the method string
+you typed. Three architecture spellings route to the Qwen3 DSpark lane:
+
+| The draft declares | Routes to |
+|---|---|
+| `architectures: ["Qwen3DSparkModel"]` | the Qwen3 DSpark lane |
+| `architectures: ["Gemma4DSparkModel"]` | the Qwen3 DSpark lane (same loader) |
+| `architectures: ["DSparkDraftModel"]` with `model_type: "qwen3"` | the Qwen3 DSpark lane |
+
+The third row is vLLM PR
+[52197](https://github.com/vllm-project/vllm/pull/52197), merged 2026-08-17,
+which is AHEAD of the pinned oracle; it is mirrored here because the pinned
+behavior is wrong for a checkpoint that is already published
+(`RadixArk/Qwen3.8-27B-DSpark` declares exactly that pair).
+
+A draft config that carries no `architectures` key at all is not classified. It
+loads exactly as it did before, because an absent key is not evidence of a lane.
+
+Anything else that names an architecture is the DeepSeek-V4 DSpark draft, whose weights ship inside the
+DeepSeek-V4 target rather than in a separate checkpoint. vLLM rewrites such a
+config onto `model_type: "deepseek_v4"` and loads it; **this engine refuses it by
+name** instead, because it carries only a stub for that model and the lane needs
+two DGX Sparks. A refusal that names the missing arm is what you get, rather than
+a load that fails later on a missing key.
 
 ## The flag
 
@@ -137,8 +228,8 @@ vllm_engine_load(&mp, &engine);   /* NULL/"" speculative_config => no speculatio
 
 The JSON is parsed into the same `vllm::SpeculativeConfig` the C++ API takes
 programmatically (`EngineParams::speculative_config`). The examples above use
-`mtp`, where `num_speculative_tokens` must be 1; see [Methods](#methods) for the
-other spellings and what each one requires. A malformed document, an unsupported
+`mtp`, where `num_speculative_tokens` defaults to the checkpoint's head depth.
+See [Methods](#methods) for the other spellings and what each one requires. A malformed document, an unsupported
 method, a missing `num_speculative_tokens` where the method needs one, or a
 checkpoint with no `mtp.*` head fails the load loudly at startup rather than
 running silently without speculation.
@@ -177,10 +268,15 @@ and 8 on the 27B (about 1.5x our own speculative-off throughput).
 
 Each of these names the method it applies to.
 
-- **MTP is k=1 only.** `num_speculative_tokens` greater than 1 is not accepted
-  for `mtp`. The block drafters take their k from the draft's block size
-  instead, and `ngram` requires one. Depth for MTP (k>1, dynamic, adaptive) is
-  unbuilt, [#81](https://github.com/mudler/vllm.cpp/issues/81).
+- **MTP depth above 1 has no speed number yet.** The multi-step propose is
+  built and token-exactness at k=1..4 is proven on CPU, but the DGX three-way at
+  k=2..4 on the 27B and 35B and the cross-engine throughput A/B at matched k are
+  both owed ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), so no
+  speed claim is made for k>1. Batch-size-keyed dynamic depth and
+  acceptance-driven adaptive depth are unbuilt. A step whose actual draft count
+  differs from the configured k (the scheduler clamps drafts to the step's token
+  budget) falls out of the captured verify graph silently,
+  [#1020](https://github.com/mudler/vllm.cpp/issues/1020).
 - **EAGLE, EAGLE3, Medusa and the rest are not wired.** Of vLLM's thirteen
   `SpeculativeMethod` strings the engine accepts five, and `draft_model` among
   those is config-only. The remainder are inventoried, not implemented.

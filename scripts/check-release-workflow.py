@@ -136,7 +136,24 @@ def workflow_steps(block: str) -> list[str]:
 
 
 def validate_pr_ci(text: str) -> list[str]:
-    """Require native Windows proof on PRs without release authority."""
+    """Require native Windows proof, without release authority, on every lane
+    that can certify a tree.
+
+    The `if:` below is part of the pinned schema, so it is the reason this
+    function had to change for #503 at all. Until 2026-08-17 it read
+    `github.event_name == 'pull_request'`, which is what kept `windows-msvc-cpu`
+    and `windows-msvc-vulkan` off the schedule/dispatch lane that
+    `scripts/main-baseline.py` grades -- and a baseline that never runs a
+    compiling gate publishes GREEN for the wrong reason.
+
+    WHAT THIS STILL REFUSES, and it is the whole point of pinning a literal
+    rather than a substring: `always()`, `github.event_name != 'push'`, a bare
+    `true`, or any other broadening still fails the equality, because the
+    expected value is one exact string and not a predicate over strings. What
+    changed is which three events that string names, not the strength of the
+    binding. `push` is absent deliberately (55 pushes/day, two windows-2022
+    runners each, on a lane whose jobs cancel one another by design).
+    """
 
     try:
         workflow = load_workflow_yaml(text)
@@ -175,7 +192,12 @@ def validate_pr_ci(text: str) -> list[str]:
             f"  -BuildDir $env:GITHUB_WORKSPACE/{build_dir}\n"
         )
         expected = {
-            "if": "github.event_name == 'pull_request'",
+            # PR proof plus the two baseline-lane events (#503). `push` excluded.
+            "if": (
+                "github.event_name == 'pull_request' "
+                "|| github.event_name == 'schedule' "
+                "|| github.event_name == 'workflow_dispatch'"
+            ),
             "permissions": {"contents": "read"},
             "runs-on": "windows-2022",
             "timeout-minutes": 180,

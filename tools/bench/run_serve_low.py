@@ -32,6 +32,7 @@ from tools.bench.serve_low_common import (
     VLLM_COMMIT,
     canonical_json,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     write_json_atomic,
 )
@@ -384,10 +385,12 @@ def validate_raw_result(
     output_len: int = 128,
     max_concurrency: int | None = None,
 ) -> None:
-    if record.get("completed") != expected_requests:
-        raise HarnessError(
-            f"completed={record.get('completed')!r}; expected {expected_requests}"
-        )
+    # SGLang's schema carries `completed` and `errors` but no `failed`; the
+    # shared precondition checks whichever counters the record actually has, so
+    # a record that does carry `failed` cannot slip past unexamined (#931).
+    require_complete_request_set(
+        record, expected_requests=expected_requests, source="serve-low raw result"
+    )
     input_lens = record.get("input_lens")
     output_lens = record.get("output_lens")
     errors = record.get("errors")

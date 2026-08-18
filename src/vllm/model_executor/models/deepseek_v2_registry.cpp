@@ -84,7 +84,7 @@ void PrepareDeepseekV2ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardDeepseekV2ForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
-  auto& ds = static_cast<DeepseekV2LoadedModel&>(model);
+  auto& ds = ModelAs<DeepseekV2LoadedModel>(model, "DeepseekV2ForCausalLM");
   const DeepseekV2Weights& weights = ds.weights();
 
   // DECODE CUDA-GRAPH path (W9): route a PURE-DECODE CUDA step through the

@@ -110,6 +110,19 @@ class PathClassification(unittest.TestCase):
             "docker/Dockerfile.arm64": "configuration",
             "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
+            # Same failure as the Dockerfile entries above, one row later.
+            # #840 moved the intake table out of roadmap_v1.md into its own
+            # append-only file and never classified it, and classify_path FAILS
+            # CLOSED -- so pr-size aborted on every pull request that appends an
+            # index row, which under that same policy is nearly all of them
+            # (#856). It is a project record for the same reason roadmap_v1.md
+            # is: it IS the table roadmap_v1.md used to hold.
+            ".agents/roadmap_v1.md": "project_record",
+            ".agents/issue-index.md": "project_record",
+            ".agents/style/commits.md": "procedure",
+            ".agents/style/prose.md": "procedure",
+            ".claude/skills/writing-commits-and-prs/SKILL.md": "procedure",
+            ".claude/skills/writing-technical-english/SKILL.md": "procedure",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
@@ -477,6 +490,15 @@ class BudgetEnforcement(unittest.TestCase):
             # every case rather than quietly passing a reduced one.
             "scripts/check-container-matrix.py",
             "scripts/check-container-workflow.py",
+            # 2026-08-16: the CUDA arch-gate registration guard (#960). Its suite
+            # reaches into the checker's parser, so the disabled stub cannot load.
+            "scripts/check-cuda-op-arch-gate.py",
+            # 2026-08-18: the symbol-anchor freshness gate (#1143, #1139). Created
+            # in the same range, so it has no BASE version to mutate. The disabled
+            # stub exits 0 and prints nothing, which fails 20 of its 21 cases --
+            # including the clean-tree case, which asserts a checked count at or
+            # above the recorded floor and so cannot be satisfied by silence.
+            "scripts/check-symbol-anchors.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

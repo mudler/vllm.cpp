@@ -30,6 +30,17 @@ add_executable(kimi-linear-gen kimi_linear_gen/main.cpp)
 target_link_libraries(kimi-linear-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(kimi-linear-gen)
 
+# nemotron-h-gen: the Nemotron-3.5-Lightning-30B (NemotronHForCausalLM) A3
+# end-to-end token battery against the PINNED vLLM ORACLE golden, and a THIN
+# CLIENT of the public C ABI in exactly the kimi-linear-gen shape above:
+# vllm_engine_load + the v13 vllm_complete_tokens over the golden's
+# pre-tokenized prompts, linking the packaged shared library so it reaches no
+# internal header and needs no example-abi-allowlist row. #810,
+# .agents/specs/nemotron-h-abi-e2e.md §6.1.
+add_executable(nemotron-h-gen nemotron_h_gen/main.cpp)
+target_link_libraries(nemotron-h-gen PRIVATE vllm::shared)
+vllm_cpp_set_warnings(nemotron-h-gen)
+
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
 # measurement tool. Links the full C++ engine (vllm::vllm) so it can build both a
 # synthetic CPU engine (no --model) and a real loaded engine (--model on dgx).
@@ -230,6 +241,82 @@ if(VLLM_CPP_SERVER)
               --video-extra dit_config_path)
     set_tests_properties(test_server_video_extra_needs_a_value PROPERTIES
       PASS_REGULAR_EXPRESSION "--video-extra takes KEY=VALUE, got 'dit_config_path'")
+
+    # A SPEECH-ONLY server (#672): --speech-model with NO --model. Upstream's own
+    # recipe is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3` and nothing
+    # else, and requiring --model here meant serving a 28.5 GB music model also
+    # staged an unrelated text model no request would touch. Black-box for the
+    # same reason the --video-family cases above are: the flag table lives in an
+    # anonymous namespace and the binary IS the surface.
+    #
+    # 1. NEITHER flag is still an error, and the message now names the second
+    #    way to satisfy it. The pre-change spelling had no --speech-model
+    #    clause, so this expression is the RED.
+    add_test(NAME test_server_neither_model_flag
+      COMMAND $<TARGET_FILE:server>)
+    set_tests_properties(test_server_neither_model_flag PROPERTIES
+      PASS_REGULAR_EXPRESSION "--model <dir> is required \\(or --speech-model <dir> for a speech/music-only server\\)")
+
+    # 2. --speech-model ALONE gets PAST the argument check and into the speech
+    #    LOAD, which is the whole claim: before the change it exited at
+    #    "--model <dir> is required" without ever reaching a checkpoint. Proven
+    #    by the load refusal for a directory nothing claims, which is evidence
+    #    that the speech branch ran, and by asserting the --model demand is
+    #    ABSENT from the output.
+    add_test(NAME test_server_speech_only_reaches_the_speech_load
+      COMMAND $<TARGET_FILE:server> --speech-model /nonexistent-speech-dir)
+    set_tests_properties(test_server_speech_only_reaches_the_speech_load PROPERTIES
+      PASS_REGULAR_EXPRESSION "--speech-model /nonexistent-speech-dir"
+      FAIL_REGULAR_EXPRESSION "--model <dir> is required")
+
+    # 3. --speech-family STILL requires --speech-model. The new accepted
+    #    combination must not have widened this one into "a family with no
+    #    checkpoint is fine now".
+    add_test(NAME test_server_speech_family_still_needs_a_checkpoint
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speech-family minimax-music3)
+    set_tests_properties(test_server_speech_family_still_needs_a_checkpoint PROPERTIES
+      PASS_REGULAR_EXPRESSION "--speech-family names a family but --speech-model names no checkpoint")
+
+    # --speculative-config key ADMISSION, from the production entry point (#1160).
+    # `tests/vllm/config/test_speculative_unknown_keys.cpp` calls the parser
+    # directly, so it localizes a failure and proves NOTHING about reach: it stays
+    # green with the server's call site deleted. These three enter through the
+    # server binary on its default configuration, which is where a user meets this
+    # flag, and go RED when `server_main.cpp` stops calling
+    # `ParseSpeculativeConfigJson`. All three exit before a byte of weights is
+    # read, because the parse runs before `LoadedEngine::FromModelDir`.
+    #
+    # 1. The issue's reproduction. Before the fix this key was DROPPED, so the
+    #    server started and drafted greedy, and the run reached the model-load
+    #    error below instead of this refusal.
+    add_test(NAME test_server_speculative_rejects_probabilistic_draft
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speculative-config
+              "{\"method\":\"dspark\",\"model\":\"d\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}")
+    set_tests_properties(test_server_speculative_rejects_probabilistic_draft PROPERTIES
+      PASS_REGULAR_EXPRESSION "speculative-config: draft_sample_method \"probabilistic\" is not implemented.*SPEC-ACCEPT-VARIANTS"
+      FAIL_REGULAR_EXPRESSION "model path is not a directory")
+
+    # 2. A MISSPELLED key. `num_speculatve_tokens` used to fall through to the
+    #    resolved default, so the user silently got a k they did not ask for.
+    add_test(NAME test_server_speculative_rejects_a_misspelled_key
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speculative-config "{\"method\":\"mtp\",\"num_speculatve_tokens\":7}")
+    set_tests_properties(test_server_speculative_rejects_a_misspelled_key PROPERTIES
+      PASS_REGULAR_EXPRESSION "speculative-config: unknown key \"num_speculatve_tokens\""
+      FAIL_REGULAR_EXPRESSION "model path is not a directory")
+
+    # 3. The CONTROL, and the case that makes the two above mean something. A
+    #    valid config gets PAST the admission check and on to the model load, so
+    #    an admission check that refused everything would go red here rather than
+    #    passing the two refusal cases for the wrong reason.
+    add_test(NAME test_server_speculative_accepts_a_valid_config
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":1}")
+    set_tests_properties(test_server_speculative_accepts_a_valid_config PROPERTIES
+      PASS_REGULAR_EXPRESSION "model path is not a directory: /nonexistent-model-dir"
+      FAIL_REGULAR_EXPRESSION "speculative-config")
   endif()
 endif()
 
@@ -261,6 +348,18 @@ vllm_cpp_set_warnings(minimax-h3-gen)
 add_executable(ltx2-gen ltx2_gen/main.cpp)
 target_link_libraries(ltx2-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(ltx2-gen)
+
+# vocoder-conv-ab: the CPU-vs-device A/B for the BigVGAN / DAC vocoder
+# convolution chain (#672), SAME BINARY with `VLLM_CPP_VOCODER_DEVICE` as the
+# only variable. A benchmarks/ source rather than an examples/ one, and so out of
+# the ABI-client rule's scope by the same reading `vulkan_gemm_ab.cpp` lands on
+# (surface-coverage-2026-08-07.md, "Out of the gated examples/ tree"): it links
+# `vllm::vllm` and calls the vocoder core directly, because the thing being timed
+# is the seam and not a model. NOT gated on CUDA — the CPU arm is half the A/B.
+add_executable(vocoder-conv-ab ${CMAKE_SOURCE_DIR}/benchmarks/vocoder_conv_ab.cpp)
+target_link_libraries(vocoder-conv-ab PRIVATE vllm::vllm)
+target_include_directories(vocoder-conv-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_set_warnings(vocoder-conv-ab)
 
 # vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar
 # GEMM, SAME BINARY with VT_VULKAN_COOPMAT as the only variable. Built only in a
@@ -302,3 +401,12 @@ endif()
 add_executable(parakeet-transcribe parakeet_transcribe/main.cpp)
 target_link_libraries(parakeet-transcribe PRIVATE vllm::shared)
 vllm_cpp_set_warnings(parakeet-transcribe)
+
+# minimax-music3-gen: MiniMax-Music3 text-to-music end to end — a THIN client of
+# the public C ABI (include/vllm.h + vllm::shared ONLY, like vllm-cli and
+# parakeet-transcribe). It exists because the music family was the one
+# generative family in this tree with NO example: hearing the model needed a
+# running server plus a curl, or a C ABI caller nobody had written (#672).
+add_executable(minimax-music3-gen minimax_music3_gen/main.cpp)
+target_link_libraries(minimax-music3-gen PRIVATE vllm::shared)
+vllm_cpp_set_warnings(minimax-music3-gen)

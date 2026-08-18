@@ -384,3 +384,42 @@ TEST_CASE("residency_policy carries per-platform values the model consumes") {
   CHECK_FALSE(ShouldReleaseHostWeights(cpu, /*marlin=*/true, /*env=*/true));
   CHECK_FALSE(ShouldInterleaveLoadStream(cpu, /*marlin=*/true));
 }
+
+// The CUDA platform's POLICY ASSEMBLY, on every host.
+//
+// `CudaPlatform::residency_policy()` lives in `src/vllm/platforms/cuda.cpp`, which
+// compiles only in a CUDA build, so while the four assignments lived there nothing
+// on a CPU-only host could reach them: #1123 recorded "delete the
+// `device_memory_total_bytes` assignment" as an OWED mutation for exactly that
+// reason. The assembly is now a free function in the platform header, `cuda.cpp`
+// calls it with its probe, and this case pins every field it sets (#1136).
+//
+// What is still NOT pinned here, and is not claimed to be: the `cudaMemGetInfo`
+// call and the constructor threading in `cuda.cpp`. Those need a CUDA build.
+TEST_CASE("CudaResidencyPolicy assembles the CUDA policy, budget included") {
+  using vllm::platforms::CudaResidencyPolicy;
+
+  // GB10 as measured: cudaMemGetInfo total = 128452956160 (119.631 GiB).
+  const size_t kGb10Total = 128452956160U;
+  const ResidencyPolicy probed = CudaResidencyPolicy(kGb10Total);
+  // The three fields that predate #1123, unchanged: the CUDA path frees the host
+  // mirror after the Marlin build, pools device scratch, and leaves it uncapped.
+  CHECK(probed.release_host_weights_after_upload);
+  CHECK(probed.uses_device_memory_pool);
+  CHECK(probed.device_pool_cap_bytes == 0);
+  // The field #1123 added. This assertion is the one the owed mutation wanted:
+  // deleting the assignment leaves 0, which the fit refusal reads as UNKNOWN, so
+  // a checkpoint that cannot fit would load and die on the first forward again.
+  CHECK(probed.device_memory_total_bytes == kGb10Total);
+  // And it must be the ARGUMENT, not a constant: a second value moves it.
+  CHECK(CudaResidencyPolicy(4096).device_memory_total_bytes == 4096);
+
+  // A failed probe is 0 = UNKNOWN, and 0 must survive as 0 rather than being
+  // substituted. The derived decisions are unaffected by the budget either way,
+  // which is what makes this field additive.
+  const ResidencyPolicy unknown = CudaResidencyPolicy(0);
+  CHECK(unknown.device_memory_total_bytes == 0);
+  CHECK(unknown.release_host_weights_after_upload);
+  CHECK(ShouldReleaseHostWeights(unknown, /*marlin=*/true, /*env=*/true));
+  CHECK(ShouldInterleaveLoadStream(unknown, /*marlin=*/true));
+}

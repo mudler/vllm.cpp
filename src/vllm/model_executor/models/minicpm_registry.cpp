@@ -64,7 +64,7 @@ void PrepareMiniCPMForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardMiniCPMForCausalLM(LoadedModel& model,
                                         const ModelForwardInput& input) {
-  const auto& minicpm = static_cast<MiniCPMLoadedModel&>(model);
+  const auto& minicpm = ModelAs<MiniCPMLoadedModel>(model, "MiniCPMForCausalLM");
   const MiniCPMWeights& weights = minicpm.weights();
   if (input.gather_logits) {
     return MiniCPMModel::ForwardDevice(input.token_ids, input.positions,

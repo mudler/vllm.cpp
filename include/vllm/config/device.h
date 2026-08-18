@@ -15,8 +15,9 @@
 //   - The integer values are the C-ABI wire contract
 //     (vllm_model_params.device, ABI v14): 0 MUST be auto so a zero-initialized
 //     struct preserves the pre-v14 accelerator-first behaviour byte for byte;
-//     cpu-before-cuda then follows the shipped v12 precedent
-//     (vllm_video_model_params.device: 0 cpu, 1 cuda) shifted by the auto slot.
+//     cpu-before-accelerator then follows the shipped v12 precedent
+//     (vllm_video_model_params.device: 0 cpu, 1 the accelerator that build
+//     resolves) shifted by the auto slot.
 #ifndef VLLM_CONFIG_DEVICE_H_
 #define VLLM_CONFIG_DEVICE_H_
 

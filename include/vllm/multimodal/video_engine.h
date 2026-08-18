@@ -59,7 +59,10 @@ struct VideoModelParams {
   // value that is not registered is refused (it is never treated as a hint).
   std::string family;
 
-  int32_t device = 0;        // 0 cpu, 1 cuda
+  // 0 is the CPU; 1 is the accelerator this build RESOLVES through the platform
+  // seam, not the enum value 1 (#659, #660). Refused by name when this build has
+  // no accelerator backend, or its partial backend declines the family.
+  int32_t device = 0;
   int32_t dequant_bf16 = 0;  // 0 keep-quant, 1 dequant/stream bf16
   int32_t fp4_resident = 0;  // keep packed FP4 resident + quantized GEMM
   int64_t encoder_max_layers = 0;  // 0 => all layers

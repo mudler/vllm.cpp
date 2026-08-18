@@ -21,10 +21,17 @@
 // generic loop, asserts each runs CORRECT on the CPU 'second backend' via the Tier-0
 // composite — BYTE-EXACT vs the standalone-op-sequence golden, over the CPU-expressible
 // scope. For recipes whose quant terminal is CPU-expressible (fp4 + the attn macro +
-// plain add-rmsnorm) that is end-to-end; for the CUDA-only static-fp8 quant terminal
-// (`vt::QuantFp8Static`, unregistered on CPU per §3b/§6), the composite runs the
-// CPU-expressible PREFIX byte-exact, and the test ALSO asserts the full composite THROWS
-// on CPU — documenting the backend-negotiated tail rather than silently skipping it.
+// plain add-rmsnorm) that is end-to-end; for the three recipes ending in the
+// static-fp8 quant terminal (`vt::QuantFp8Static`) the composite ALSO runs end-to-end
+// byte-exact, since VT-FP8-W8A8-CPU-ARM (#468) gave that opcode a CPU kernel. Those three
+// recipes keep their PREFIX check as well — the prefix is what a backend inherits before
+// the terminal exists, and it is what would localise a future regression to the tail.
+//
+// HISTORY, because the change is a checker's CLAIM and not just a number: until #468 the
+// three fp8-terminal rows carried `cpu_full = false` and asserted the full composite
+// THROWS on CPU, documenting a backend-negotiated tail (spec §3b/§6). The throw was not
+// deleted to go green — it became impossible, and was replaced by the strictly stronger
+// byte-exact assertion the registration made available.
 //
 // ADDITIVITY EVIDENCE this test pins (catalog grows ⇒ backend does NOT):
 //   * The catalog (`include/vt/recipes.h`) grew 1→6→7 recipes across W0→W1→W3, while
@@ -98,10 +105,12 @@ std::vector<uint8_t> PackBf16(const std::vector<float>& f) {
   return out;
 }
 
-// The recipe with its trailing step (the CUDA-only static-fp8 quant terminal) and its
-// trailing operand (the fp8 output slot) dropped — the CPU-expressible PREFIX. Purely
-// structural on the POD (no per-recipe knowledge): every fp8-terminal recipe in the
-// catalog has the fp8 quant as its last step and the fp8 output as its last operand.
+// The recipe with its trailing step (the static-fp8 quant terminal) and its trailing
+// operand (the fp8 output slot) dropped — the PREFIX a backend inherits before that
+// terminal has a kernel. Purely structural on the POD (no per-recipe knowledge): every
+// fp8-terminal recipe in the catalog has the fp8 quant as its last step and the fp8
+// output as its last operand. Still checked alongside the full composite since #468, so
+// a future tail regression is localised rather than merely detected.
 FusedRecipe CpuExpressiblePrefix(const FusedRecipe& r) {
   FusedRecipe pr = r;
   pr.n = r.n - 1;
@@ -379,9 +388,9 @@ void CheckAttnQkNormRopeGate() {
   CHECK(gc == gg);
 }
 
-// --- fp8-terminal recipes: CPU-expressible PREFIX byte-exact + negotiated-tail throw --
+// --- fp8-terminal recipes: PREFIX byte-exact + the fp8 terminal, end-to-end on CPU ----
 
-// kRmsNormQuantFp8 — prefix: (add residual) + gemma-RMSNorm → bf16; fp8 tail CUDA-only.
+// kRmsNormQuantFp8 — prefix: (add residual) + gemma-RMSNorm → bf16; then the fp8 tail.
 void CheckRmsNormQuantFp8() {
   const int64_t t = 3, h = 256;
   const float eps = 1e-6f, scale = 0.125f;
@@ -416,17 +425,34 @@ void CheckRmsNormQuantFp8() {
   CHECK(tmp_c == tmp_g);
   CHECK(res_c == res_g);
 
-  // Backend-negotiated tail (§3b/§6): the full composite reaches the CUDA-only
-  // vt::QuantFp8Static terminal, which is unregistered on the CPU 'second backend' →
-  // it THROWS. The CPU backend inherits the portable prefix, negotiates the fp8 tail.
-  std::vector<uint8_t> fp8(static_cast<size_t>(t * h));
-  Tensor tfp8 = MakeTensor(fp8.data(), DType::kI8, {t, h});
-  b.op[4] = &tfp8;
+  // The fp8 TERMINAL, now end-to-end on CPU (VT-FP8-W8A8-CPU-ARM, #468). This
+  // assertion USED to be `CHECK_THROWS`: vt::QuantFp8Static was unregistered on the
+  // CPU 'second backend', so the full composite refused and the test could only
+  // document a backend-negotiated tail. The CPU registration retires that
+  // negotiation, and the throw is replaced by the strictly STRONGER claim it made
+  // impossible — the full composite equals the standalone-op-sequence golden BYTE
+  // for BYTE, fp8 output included.
+  std::vector<float> res_f = rf;  // fresh residual: the prefix run above consumed one
+  std::vector<uint8_t> tmp_f(tmp_g.size());
+  std::vector<uint8_t> fp8_f(static_cast<size_t>(t * h));
+  Tensor ttmp_f = MakeTensor(tmp_f.data(), DType::kBF16, {t, h});
+  Tensor trf = MakeTensor(res_f.data(), DType::kF32, {t, h});
+  Tensor tfp8_f = MakeTensor(fp8_f.data(), DType::kI8, {t, h});
+  b.op[2] = &trf;
+  b.op[3] = &ttmp_f;
+  b.op[4] = &tfp8_f;
   b.n = 5;
-  CHECK_THROWS(vt::FusedChainComposite(q, vt::kRmsNormQuantFp8, b, p));
+  vt::FusedChainComposite(q, vt::kRmsNormQuantFp8, b, p);
+
+  std::vector<uint8_t> fp8_g(fp8_f.size());
+  Tensor tfp8_g = MakeTensor(fp8_g.data(), DType::kI8, {t, h});
+  vt::QuantFp8Static(q, tfp8_g, ttmp_g, scale);
+  CHECK(tmp_f == tmp_g);
+  CHECK(res_f == res_g);
+  CHECK(fp8_f == fp8_g);
 }
 
-// kRmsNormGatedQuantFp8 — prefix: gated-RMSNorm → bf16; fp8 tail CUDA-only.
+// kRmsNormGatedQuantFp8 — prefix: gated-RMSNorm → bf16; then the fp8 tail.
 void CheckRmsNormGatedQuantFp8() {
   const int64_t rows = 3, d = 256;
   const float eps = 1e-6f, scale = 0.1875f;
@@ -457,15 +483,26 @@ void CheckRmsNormGatedQuantFp8() {
   vt::FusedChainComposite(q, CpuExpressiblePrefix(vt::kRmsNormGatedQuantFp8), b, p);
   CHECK(tmp_c == tmp_g);
 
-  std::vector<uint8_t> fp8(static_cast<size_t>(rows * d));
-  Tensor tfp8 = MakeTensor(fp8.data(), DType::kI8, {rows, d});
-  b.op[4] = &tfp8;
+  // fp8 terminal end-to-end on CPU (#468) — was CHECK_THROWS, see the note in
+  // CheckRmsNormQuantFp8 above.
+  std::vector<uint8_t> tmp_f(tmp_g.size());
+  std::vector<uint8_t> fp8_f(static_cast<size_t>(rows * d));
+  Tensor ttmp_f = MakeTensor(tmp_f.data(), DType::kBF16, {rows, d});
+  Tensor tfp8_f = MakeTensor(fp8_f.data(), DType::kI8, {rows, d});
+  b.op[3] = &ttmp_f;
+  b.op[4] = &tfp8_f;
   b.n = 5;
-  CHECK_THROWS(vt::FusedChainComposite(q, vt::kRmsNormGatedQuantFp8, b, p));
+  vt::FusedChainComposite(q, vt::kRmsNormGatedQuantFp8, b, p);
+
+  std::vector<uint8_t> fp8_g(fp8_f.size());
+  Tensor tfp8_g = MakeTensor(fp8_g.data(), DType::kI8, {rows, d});
+  vt::QuantFp8Static(q, tfp8_g, ttmp_g, scale);
+  CHECK(tmp_f == tmp_g);
+  CHECK(fp8_f == fp8_g);
 }
 
-// kSiluMulQuantFp8 — the W3 mechanical-sync recipe. Prefix: silu(gate)·up → bf16; fp8
-// tail CUDA-only. This is the executable proof that the CPU 'second backend' inherited
+// kSiluMulQuantFp8 — the W3 mechanical-sync recipe. Prefix: silu(gate)·up → bf16; then
+// the fp8 tail. This is the executable proof that the CPU 'second backend' inherited
 // a WHOLE NEW fusion pass (ported in W3) with ZERO backend edits — same generic path.
 void CheckSiluMulQuantFp8() {
   const int64_t m = 3, i = 256;
@@ -493,17 +530,33 @@ void CheckSiluMulQuantFp8() {
   vt::FusedChainComposite(q, CpuExpressiblePrefix(vt::kSiluMulQuantFp8), b, p);
   CHECK(tmp_c == tmp_g);
 
-  std::vector<uint8_t> fp8(static_cast<size_t>(m * i));
-  Tensor tfp8 = MakeTensor(fp8.data(), DType::kI8, {m, i});
-  b.op[3] = &tfp8;
+  // fp8 terminal end-to-end on CPU (#468) — was CHECK_THROWS. For THIS recipe the
+  // change is the additivity claim at its sharpest: a whole vLLM fusion pass that
+  // landed touching 2 shared files and zero backend files is now realized
+  // END-TO-END by the CPU 'second backend', because one opcode gained a host
+  // kernel and every recipe using it inherited the reach for free.
+  std::vector<uint8_t> tmp_f(tmp_g.size());
+  std::vector<uint8_t> fp8_f(static_cast<size_t>(m * i));
+  Tensor ttmp_f = MakeTensor(tmp_f.data(), DType::kBF16, {m, i});
+  Tensor tfp8_f = MakeTensor(fp8_f.data(), DType::kI8, {m, i});
+  b.op[2] = &ttmp_f;
+  b.op[3] = &tfp8_f;
   b.n = 4;
-  CHECK_THROWS(vt::FusedChainComposite(q, vt::kSiluMulQuantFp8, b, p));
+  vt::FusedChainComposite(q, vt::kSiluMulQuantFp8, b, p);
+
+  std::vector<uint8_t> fp8_g(fp8_f.size());
+  Tensor tfp8_g = MakeTensor(fp8_g.data(), DType::kI8, {m, i});
+  vt::QuantFp8Static(q, tfp8_g, ttmp_g, scale);
+  CHECK(tmp_f == tmp_g);
+  CHECK(fp8_f == fp8_g);
 }
 
 // The catalog: the SINGLE enumeration of every recipe the framework declares. Each row
 // pairs a recipe with the CPU-scope driver above. `cpu_full` records whether the CPU
 // 'second backend' realizes the recipe end-to-end (true) or up to the CPU-expressible
-// prefix with the fp8 quant terminal backend-negotiated (false). Adding a recipe adds
+// prefix only (false). Every row is `true` since #468 gave the fp8 quant terminal a CPU
+// kernel; the column stays because it is the mechanism, and a future opcode with no host
+// kernel would set it false again. Adding a recipe adds
 // ONE row here (a catalog/test concern) — the BACKEND path (composite walker + the one
 // kFusedChain registration) is untouched. This IS the additivity mechanism, executable.
 struct CatalogEntry {
@@ -520,9 +573,9 @@ const CatalogEntry kCatalog[] = {
     {&vt::kSiluMulFp4Quant, "kSiluMulFp4Quant", true, &CheckSiluMulFp4Quant},
     {&vt::kSigmoidGateFp4Quant, "kSigmoidGateFp4Quant", true, &CheckSigmoidGateFp4Quant},
     {&vt::kAttnQkNormRopeGate, "kAttnQkNormRopeGate", true, &CheckAttnQkNormRopeGate},
-    {&vt::kRmsNormQuantFp8, "kRmsNormQuantFp8", false, &CheckRmsNormQuantFp8},
-    {&vt::kRmsNormGatedQuantFp8, "kRmsNormGatedQuantFp8", false, &CheckRmsNormGatedQuantFp8},
-    {&vt::kSiluMulQuantFp8, "kSiluMulQuantFp8", false, &CheckSiluMulQuantFp8},
+    {&vt::kRmsNormQuantFp8, "kRmsNormQuantFp8", true, &CheckRmsNormQuantFp8},
+    {&vt::kRmsNormGatedQuantFp8, "kRmsNormGatedQuantFp8", true, &CheckRmsNormGatedQuantFp8},
+    {&vt::kSiluMulQuantFp8, "kSiluMulQuantFp8", true, &CheckSiluMulQuantFp8},
 };
 
 }  // namespace

@@ -41,9 +41,9 @@ decode-opt kernel on elements-per-lane and add an `EPL=4` instantiation.
 So the ROCm change is a **mirror of merged work**, not new design. It adopts
 the merged arm's flag, default, and stated reason verbatim
 (`cuda_paged_attn.cu`, `DecodeD128Enabled`). Where the two backends' facts
-differ — and they do, sharply in §5's measurement and materially in §7's dtype
-coverage, where this arm is **narrower** than the CUDA one — the difference is
-recorded rather than averaged away.
+differ — and they do, sharply in §5's measurement and materially in the
+`## Owed` section's dtype coverage, where this arm is **narrower** than the
+CUDA one — the difference is recorded rather than averaged away.
 
 ## 2. Why `PagedAttnOnline` was what ran
 
@@ -99,7 +99,9 @@ synchronization. This is the same observation #382 made about the CUDA file.
    `decode_opt`/`decode_gqa` flags — the same env var, default and rationale as
    the merged CUDA arm.
 3. `bf16_decode_opt` gate: `d == 256 || d == 512` → `(d == 128 && (decode_d128
-   || decode_wmma)) || d == 256 || d == 512`. The `decode_wmma` disjunct is
+   || decode_wmma)) || d == 256 || d == 512`. **As landed the gate omits the
+   `decode_wmma` disjunct**, because that flag does not exist — see the forward
+   reference below. The `decode_wmma` disjunct is
    deliberate: the rocWMMA arm (separate spec) is a second, independently
    opt-in kernel for the same head size, and without it a bare
    `VT_ATTN_DECODE_WMMA=1` would be a silent no-op. **Forward reference:**
@@ -114,8 +116,8 @@ synchronization. This is the same observation #382 made about the CUDA file.
    `d == 128` case.
 
 No change to any prefill path — those stay gated to `d==256||512` and are out
-of scope (§7); a `d=128` prefill call already falls through their internal
-`else { goto flash_fallback; }` guards to the decode-shaped launch.
+of scope (`## Owed`); a `d=128` prefill call already falls through their
+internal `else { goto flash_fallback; }` guards to the decode-shaped launch.
 
 ### Why default OFF
 
@@ -125,7 +127,7 @@ replaces. Warp-strided online softmax reduces the KV sequence in a different
 **order** than `PagedAttnOnline`'s per-tile loop, so a greedy anchor can move
 at an exact bf16 tie. Shipping OFF keeps every existing golden byte-identical.
 The flip owes the near-tie razor, a distributional gate, and regen under the
-ratified-tie rule — on **both** backends, and is named as owed in §7.
+ratified-tie rule — on **both** backends, and is named in `## Owed`.
 
 ### Test coverage
 
@@ -142,10 +144,19 @@ bf16 correctness coverage in this suite.
 
 `tests/CMakeLists.txt`: because the arm ships OFF **and** its flag is read into
 a `static const bool` — once per process — the default registration only ever
-gates the `PagedAttnOnline` fallback. Two extra ctest registrations re-run the
-same binary filtered to this case with `VT_ATTN_DECODE_D128=1` and
-`VT_ATTN_DECODE_WMMA=1`, so the arms that actually run the new kernels are
-gated. Same shape as the existing `test_dense_gateup_fused_marlin_off_*` pair.
+gates the `PagedAttnOnline` fallback. **As landed there is ONE extra ctest
+registration**, `VT_ATTN_DECODE_D128=1`; the planned second,
+`VT_ATTN_DECODE_WMMA=1`, does not exist because that flag does not. Same shape
+as the existing `test_dense_gateup_fused_marlin_off_*` pair.
+
+That registration does NOT by itself prove the new kernel ran. It re-runs the
+same case with the env set, and the case's only backend assertion is
+`declines == 0`, which `OpProviderStats` reports at PROVIDER granularity —
+identical with the flag set and unset. On any non-ROCm machine the case runs
+1 test case and **0 assertions** and exits 0, so the registration is green on
+nothing everywhere this project has hardware. Closing §9's stop condition 2
+needs a kernel-selection counter in `rocm_paged_attn.hip` asserted to DIFFER
+between the two registrations.
 Verified non-vacuous (the trap `SKIP_RETURN_CODE 77` exists for, issue #463):
 the filter resolves to `test cases: 1 | 1 passed`, `assertions: 6 | 6 passed`,
 not zero.
@@ -191,29 +202,105 @@ Any future flip to default-ON must be argued per backend with per-backend
 measurement; the fact that the ROCm arm is a large win is not evidence for the
 CUDA arm, and #382's sm_110 regression is not evidence against this one.
 
-**Correctness**, gfx1200, real hardware: `ctest -R 'rocm|cross_device'` **6/6
-pass**, including both new flag-on registrations. Full `ctest` 393 tests,
+**Correctness**, gfx1200, real hardware: `ctest -R 'rocm|cross_device'` **5/5
+pass** as landed, including the one new flag-on registration. (An earlier draft
+of this section said 6/6 "including both new flag-on registrations", from the
+two-registration plan above that did not land.) Full `ctest` 393 tests,
 385 passed / 8 failed; all 8 reproduce identically (same tests, same root cause
 `vt: no kernel for op 63 on device type 5`, an unrelated pre-existing ROCm
 op-registration gap) on an isolated build of this branch **without** this
 change — confirmed not caused by it.
 
+### Against the pinned oracle, both sides in the same container (2026-08-14)
+
+Recorded here from the [#767 comment of
+2026-08-14](https://github.com/mudler/vllm.cpp/pull/767#issuecomment-5295395139),
+because a number that lives only in a pull-request thread is lost the moment the
+thread is squashed. Full entry in
+[`.agents/benchmark-record.md`](../benchmark-record.md).
+
+Running our binary against the container's ROCm rather than the host's is a
+substitution, so it was proved inert first. In-container matches native,
+Qwen3-0.6B, 1024 in / 128 out, concurrency 1:
+
+| TPOT | native | in container |
+|---|---|---|
+| flag unset | 42.53 ms | 42.79 ms |
+| `VT_ATTN_DECODE_D128=1` | 11.78 ms | 12.03 ms |
+
+Both sides then in that same container, matched workload (Qwen3-0.6B,
+1024 in / 128 out, concurrency 1, **8 prompts**, warmup discarded, **3 reps**),
+oracle = vLLM `555967922` in its production configuration via `vllm bench serve`:
+
+| | TPOT reps | mean | vs oracle |
+|---|---|---|---|
+| ours, flag unset | 42.54 / 42.46 / 42.19 | 42.40 ms | 6.35x slower |
+| ours, `VT_ATTN_DECODE_D128=1` | 11.97 / 11.38 / 11.66 | **11.67 ms** | **1.75x slower** |
+| vLLM `555967922` | 6.57 / 6.90 / 6.58 | 6.68 ms | — |
+
+**This arm closes the decode gap from 6.35x to 1.75x on this shape.** It is the
+first oracle-relative ROCm decode number this row has.
+
+**What it is not, carried forward from the author's own caveats.** It is
+**latency, measured with each side's own harness**, not the same-tool per-call
+trace AGENTS.md requires before a throughput claim — the oracle runs over HTTP
+via `vllm bench serve` while ours is in-process, so TPOT is the only comparable
+axis and TTFT, E2EL and end-to-end throughput carry the oracle's HTTP and
+tokenizer overhead and are directional only. It does **not close #488**, which
+asks for a per-call kernel comparison (§6). One board, one model shape. The
+ROCm throughput axis stays **OPEN**.
+
+**The prompt count is load-bearing.** At `--num-prompts 2` the oracle returned
+TPOT 6.96 ms and 13.45 ms on consecutive reps — a ~2x spread whose average is
+plausible-looking and entirely fictional. The table above uses 8 prompts with a
+discarded warmup, where both sides hold to ~±0.3 ms.
+
 ## 6. What this does not claim
 
-- **It does not close #488.** #488 reports a per-call gap against vLLM and
-  asserts no cause. This removes one cause. No same-tool per-call re-measure
-  against the oracle was run after the change (blocked on the container/glibc
-  issue recorded in the WMMA spec), so the residual gap is unquantified.
+- **It does not close #488.** #488 reports a per-**call** gap against vLLM and
+  asserts no cause. This removes one cause, and §5's oracle A/B measures the
+  residual as a per-**token** latency, which is a different axis. The same-tool
+  per-call trace #488 asks for was **not run — and it is NOT blocked**; see the
+  [#767 comment of 2026-08-14](https://github.com/mudler/vllm.cpp/pull/767#issuecomment-5295395139).
+  An earlier draft of this section attributed the gap to a container/glibc ABI
+  mismatch. **That diagnosis was retracted by its own author**: our binary runs
+  inside the pinned oracle container, and the failures behind it were
+  self-inflicted (`LD_LIBRARY_PATH` exported container-wide, which breaks the
+  container's own tools, plus a bind mount that silently yielded nothing and
+  presented as a missing ELF interpreter). What the trace still needs is
+  decode-phase windowing on the oracle side — bucket dispatches over time and
+  take the final burst — or it compares our decode against vLLM's model load
+  and graph capture. `rocprofv3` is present in the container and our binary
+  traces under it. The work is reachable and owed, not blocked.
 - **No ceiling.** The next traceable hypothesis is the `qg=4`/`qg=8` fusion gap
-  (§7) and, above it, the skinny-GEMM lever in #487, which #488 itself notes is
+  (`## Owed`) and, above it, the skinny-GEMM lever in #487, which #488 itself notes is
   the larger share of ROCm decode time.
 
 ## 7. Scope
 
 **In scope.** The `rocm_paged_attn.hip` edits in §4, the new bf16 `d=128`
-cross-device test and its two flag-on ctest registrations, and this spec.
+cross-device test and its **one** flag-on ctest registration, and this spec.
+(The planned second registration, `VT_ATTN_DECODE_WMMA=1`, does not land,
+because that flag does not exist — §4 item 3 and the Test-coverage section
+record the same correction.)
 
-**Out of scope, named and owed.**
+## Owed
+
+Out of scope for this change, named here rather than left to be discovered.
+
+- **Proof that the flag-ON arm REACHES the new kernel** —
+  [#1134](https://github.com/mudler/vllm.cpp/issues/1134). `RegisteredDevices()`
+  (`tests/vt/test_backend_cross_device.cpp:84-96`) enumerates
+  `{kCUDA, kMETAL, kVULKAN, kXPU, kROCM}` and excludes `kCPU`, so on a CPU-only
+  runner the new case reports 1 test case, **0 assertions**, exit 0 — for both
+  registrations. And on ROCm, `OpProviderStats::declines` counts at PROVIDER
+  granularity, so it is identical with the flag set and unset. §9's stop
+  condition 2 is therefore OPEN, and closing it needs a kernel-selection
+  counter in `rocm_paged_attn.hip` asserted to DIFFER between the two
+  registrations. Disclosed in §4 and in the result banner; #1134 is the record
+  outside this file.
+- **The same-tool per-call kernel trace against the oracle** (§6). Reachable,
+  not blocked; owed before #488 can be judged.
 - **The flip to default-ON, on both backends.** Owes the near-tie razor, a
   distributional gate, and golden regen under the ratified-tie rule. Per §5 it
   must be argued per backend, not once. This is what keeps #382 open.
@@ -255,11 +342,11 @@ cross-device test and its two flag-on ctest registrations, and this spec.
 | Risk | Assessment |
 |---|---|
 | The reduction-order change moves a greedy anchor at a bf16 tie | This is why the arm ships **default OFF**, adopting the merged CUDA arm's flag, default and stated reason verbatim rather than inventing new ones. A default-ON flip is a separate, per-backend argument and is explicitly out of scope here. |
-| The 3.53x is a single-board, single-run figure | Measured on one gfx1200 that may also drive a display. It is indicative, not the idle-box reproduced standard AGENTS.md requires for a binding number, and §5 says so. It justifies building the arm; it does not license a BENCHMARKS entry or a default flip. |
+| The 3.53x is a single-board, single-run figure | Measured on one gfx1200 that may also drive a display. It is indicative, not the idle-box reproduced standard AGENTS.md requires for a binding number, and §5 says so. It justifies building the arm; it does not license a default flip. The BENCHMARKS row this change adds is the later 3-rep oracle A/B, entered as DIRECTIONAL against an explicitly still-PENDING ROCm axis, not as a binding ratio. |
 | The same arm measured 1.6x SLOWER on sm_110 (#382) | Recorded, deliberately not reconciled. It is the reason the default stays OFF and the reason the flip must be argued per backend rather than once. Treating the ROCm number as settling the question for all boards is the error this row is guarding against. |
 | The spec lands before its code | Intended, and required — AGENTS.md puts the spec before implementation. The consequence is that §4 and the result section describe an unmerged branch, which the banner above the result section states outright so no reader mistakes it for landed work. |
 | `VT_ATTN_DECODE_WMMA` is cited but does not exist | A forward reference to a sibling arm whose spec and issue are not yet filed (§4). An implementer must land the flag alongside the rocWMMA arm; taking §4 literally today produces a reference to an undefined symbol. |
-| The residual #488 gap is unquantified | No post-change per-call oracle re-measure was run, so how much of #488 this closes is unknown. Named here rather than left implicit; it is owed before #488 can be judged. |
+| The residual #488 gap is unquantified | Partly answered, on a different axis. §5's 2026-08-14 oracle A/B measures the residual as PER-TOKEN latency — 6.35x to 1.75x slower than vLLM `555967922` — with both sides in the same container. #488 asks for a PER-CALL kernel comparison, and that is still owed, so #488 is not judged by this. The earlier "blocked on container/glibc" reason for not running it was retracted by its author and is corrected in §6. |
 
 ## 9. Stop conditions
 
@@ -301,12 +388,24 @@ flock "$HOME/gpu.lock" -c '
 
 ## Result on the implementation branch (2026-08-12)
 
-> **Not landed.** This section records what was built and measured on the
-> unmerged implementation branch. No `VT_ATTN_DECODE_D128` exists in
-> `src/vt/rocm/` on `main` — `git log -S'VT_ATTN_DECODE_D128' -- src/vt/rocm/`
-> is empty, and `rocm_paged_attn.hip` still gates on `d == 256 || d == 512`.
-> This spec is committed BEFORE its implementation, per AGENTS.md; the section
-> becomes `## Outcome` when the code merges and the row reaches `DONE`.
+> **Landed by PR #767**, which carries this correction. The banner this
+> paragraph replaced said "Not landed" and offered
+> `git log -S'VT_ATTN_DECODE_D128' -- src/vt/rocm/` as proof — a command that
+> returns the opposite once the code is in, which is how a record starts
+> disagreeing with the tree.
+>
+> The section stays `## Result` rather than becoming `## Outcome`: `BACKEND-ROCM`
+> remains `ACTIVE`, and `## Outcome` is scoped to a row reaching `DONE`. The
+> arm ships **default OFF**, so nothing here is a shipped-behaviour claim.
+>
+> **Still owed, and NOT discharged by this landing:** the flag-ON arm has no
+> proof it REACHES the new kernel. `OpProviderStats` counts at provider
+> granularity, so `declines == 0` is identical with the flag set and unset, and
+> the ctest registration runs 0 assertions on every non-ROCm machine. §9's stop
+> condition 2 — "stop if the flag-ON arm cannot be shown to reach the new
+> kernel; confirm selection counts, not just tokens" — is therefore still open,
+> and [#1134](https://github.com/mudler/vllm.cpp/issues/1134) tracks it outside
+> this file.
 
 **Built the ROCm `d=128` decode arm, default OFF, mirroring the merged CUDA
 arm of the same issue.** Root cause for the ROCm decode-attention gap #488
@@ -319,9 +418,11 @@ tie) rather than inventing new ones.
 
 Measured on gfx1200 with the gate exercised both directions on one binary:
 **3.53x** TPOT at 1024-token context, and +42.7% / +25.0% / +17.8% decode
-throughput on Qwen3-0.6B / 1.7B / 4B. New bf16 `d=128` GQA correctness coverage
-where none existed, plus two flag-on ctest registrations so the opt-in arms are
-actually gated rather than silently skipped.
+throughput on Qwen3-0.6B / 1.7B / 4B, and — measured later, against the pinned
+oracle with both sides in one container — **6.35x to 1.75x slower than vLLM
+`555967922`** on per-token decode latency (§5). New bf16 `d=128` GQA correctness
+coverage where none existed, plus **one** flag-on ctest registration; the
+planned second could not land because `VT_ATTN_DECODE_WMMA` does not exist.
 
 **The finding worth carrying forward is the reversal:** #382 measured this same
 arm 1.6x *slower* on sm_110, where we measure it 3.5x *faster*. That is

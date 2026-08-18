@@ -98,9 +98,13 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--model-version 2.5] [--pipeline-kind distilled_two_stage]\n"
       "                [--upsampler <latent-spatial-x2.safetensors>]  phase 2 needs it\n"
       "                [--max-phase N] [--allow-unported]\n"
+      "                [--lora <ic-lora.safetensors> [STRENGTH]]  fused at load; 1.0\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
-      "                [--first-frame <image.ppm>] [--image-crf 0]\n"
+      "                [--first-frame <image.ppm>] [--last-frame <image.ppm>]\n"
+      "                [--image-crf 0]\n"
+      "                [--audio-path <in.wav>] [--audio-start-time S]\n"
+      "                [--audio-max-duration S]\n"
       "                [--device cpu|cuda]\n\n"
       "Renders LTX-2.5 (family \"ltx-2.5\") through vllm_video_engine_load +\n"
       "vllm_video_generate.\n\n"
@@ -132,7 +136,110 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "round trip needs libx264 and none is vendored here, so leaving --image-crf out\n"
       "resolves 18 and REFUSES by name. --image-crf 0 is upstream-legal and OUT OF\n"
       "DISTRIBUTION: the model sees pixels it was not trained on. That is a quality\n"
-      "cost, and this tool states it rather than turning it on quietly.\n");
+      "cost, and this tool states it rather than turning it on quietly.\n"
+      "--last-frame takes a second PPM and pins the CLOSING frame. It is a KEYFRAME\n"
+      "rather than a replacement: its tokens are APPENDED to the sequence, carrying\n"
+      "the temporal position of pixel frame N-1, and are trimmed off again before the\n"
+      "clip is decoded. Both slots share one --image-crf and one strength, and a\n"
+      "keyframe at an INTERIOR frame is not requestable (#1187).\n\n"
+      "AUDIO-TO-VIDEO. --audio-path takes a 16-bit PCM WAV and CONDITIONS the render\n"
+      "on it: the take is decoded, encoded through the audio VAE\'s encoder, truncated\n"
+      "to the clip\'s duration, and then held FROZEN through every denoise phase, so\n"
+      "the video is generated around a soundtrack you supplied rather than one the\n"
+      "model invented. The CONDITIONING MECHANISM is upstream\'s A2VidPipelineTwoStage:\n"
+      "decode, encode, truncate to the clip, freeze through both stages. The SCHEDULE\n"
+      "is NOT. Upstream\'s stage 1 is a caller-configured GUIDED one whose\n"
+      "--a2v-guidance-scale is the guider\'s modality_scale; a take here rides whichever\n"
+      "recipe the checkpoint resolves, in practice distilled_two_stage, whose sigmas are\n"
+      "fixed. So no claim is made that this reproduces upstream\'s A2Vid output.\n\n"
+      "The WAV must already match the checkpoint: its sample rate must equal the audio\n"
+      "VAE\'s mel front-end rate and its channel count the encoder\'s in_channels.\n"
+      "Neither is converted, because upstream resamples with a polyphase kaiser\n"
+      "resampler that is not ported here and feeds the file\'s own channel count into a\n"
+      "fixed-width convolution; both mismatches are refused with both numbers, since a\n"
+      "resampled-wrong or upmixed take renders a finished clip conditioned on audio you\n"
+      "never supplied. The take must also be at least as long as the clip: upstream\n"
+      "truncates a long one and asserts on a short one, so a short one is refused.\n\n"
+      "--audio-start-time seeks into the file (default 0) and --audio-max-duration caps\n"
+      "how much is read (default: the clip\'s own duration). Either without\n"
+      "--audio-path is refused rather than ignored. The rendered audio.wav is your own\n"
+      "input, not a VAE round trip, which is upstream\'s deliberate choice.\n\n"
+      "RETAKE regenerates a time window of an existing clip and keeps the rest.\n"
+      "--ref-video names a DIRECTORY of frame_%%06d.ppm (the layout minimax-h3-gen\n"
+      "writes), not a container file: upstream opens one with PyAV and no demuxer is\n"
+      "vendored here, so a .mp4 is refused. --retake-start-time and --retake-end-time\n"
+      "are seconds, the end exclusive, and --retake-frame-rate is required because a\n"
+      "frame folder carries no container frame rate. Needs --pipeline-kind retake: a\n"
+      "retake is ONE stage at the clip\'s own resolution, and the distilled two-stage\n"
+      "recipe renders its first stage at half. The geometry comes from the clip, so\n"
+      "--width, --height and --frames are refused alongside it. --regenerate-video 0\n"
+      "freezes the clip instead; --regenerate-audio has no effect while the source is\n"
+      "a frame folder, because a folder carries no audio and both of upstream\'s audio\n"
+      "predicates test for one.\n\n"
+      "TEXT-TO-AUDIO renders a soundtrack and NO PICTURE. --pipeline-kind\n"
+      "t2a_one_stage selects it; the result carries an audio.wav, zero frames and no\n"
+      "ffmpeg argv, because there is nothing to mux. --video-vae is not needed and\n"
+      "--width/--height are refused: upstream passes a 512x512 placeholder whose\n"
+      "height and width it documents as unused, and only --frames and the recipe\'s\n"
+      "frame rate are read, to derive the DURATION. Unlike the distilled video\n"
+      "recipes this one is GUIDED: it runs three DiT forwards per step by default\n"
+      "(conditional, unconditional, and one with the audio self-attention perturbed),\n"
+      "so it needs a text tower for the negative prompt. --negative-prompt,\n"
+      "--audio-cfg-guidance-scale, --audio-stg-guidance-scale, --audio-rescale-scale,\n"
+      "--audio-skip-step and --audio-stg-blocks are upstream\'s own flags; absent, each\n"
+      "takes the checkpoint generation\'s own value. --audio-stg-blocks is comma\n"
+      "separated and a block index outside the DiT\'s layer count is refused rather\n"
+      "than clamped. The accelerator is REFUSED by name on this pipeline.\n\n"
+      "GUIDANCE ON A VIDEO RENDER. --pipeline-kind one_stage runs upstream's guided\n"
+      "denoiser: FOUR DiT forwards per step (conditional, unconditional, perturbed,\n"
+      "and one with the audio<->video cross attention off), combined per modality in\n"
+      "x0 space. --video-cfg-guidance-scale, --video-stg-guidance-scale,\n"
+      "--video-rescale-scale, --video-skip-step, --video-stg-blocks,\n"
+      "--a2v-guidance-scale and --v2a-guidance-scale are upstream's own flags and\n"
+      "take the checkpoint generation's value when absent. The unconditional forward\n"
+      "needs a NEGATIVE conditioning: either a text tower plus --negative-prompt, or\n"
+      "--negative-prompt-embeds with --negative-audio-prompt-embeds. Absent both, a\n"
+      "cfg scale other than 1.0 is refused by name. --pipeline-kind\n"
+      "distilled_two_stage and retake distil their guidance INTO the weights and\n"
+      "refuse every one of these flags rather than applying it.\n\n"
+      "AUDIO-TO-VIDEO renders a clip AROUND a soundtrack you supply.\n"
+      "--pipeline-kind a2vid_two_stage selects it: stage 1 denoises video at half\n"
+      "resolution, guided by the checkpoint generation's own scales on a schedule\n"
+      "derived from the step count, and stage 2 upsamples 2x and refines with the\n"
+      "distilled three-sigma schedule. The take is encoded once and frozen at both\n"
+      "stages, and the audio.wav you get back is your own file. --audio-path is\n"
+      "REQUIRED on every request and --lora is REQUIRED at load, because upstream\n"
+      "makes both required and stage 2 is a refinement the base weights were never\n"
+      "distilled for; --upsampler is needed for stage 2 as on any two-stage recipe.\n"
+      "The guidance flags above reach stage 1 and are IGNORED by stage 2, which runs\n"
+      "no guider at all -- unlike distilled_two_stage, which refuses them. The\n"
+      "distilled adapter rides stage 2 ALONE, as upstream does: stage 1 runs the base\n"
+      "weights and the engine rebinds the DiT at the phase boundary.\n\n"
+      "TWO-STAGE TEXT/IMAGE-TO-VIDEO is the plain two-stage arm.\n"
+      "--pipeline-kind ti2vid_two_stage selects it: stage 1 generates at HALF the\n"
+      "requested resolution under full CFG on the UNADAPTED model, on a schedule\n"
+      "derived from the step count, and stage 2 upsamples 2x and refines with the\n"
+      "distilled three-sigma schedule and no guider. --lora is REQUIRED at load, as\n"
+      "upstream's --distilled-lora is, and --upsampler is needed for stage 2. There\n"
+      "is NO --audio-path here: the soundtrack is generated, and the audio.wav you get\n"
+      "back is STAGE 1's, because upstream refines the picture only and discards\n"
+      "stage 2's audio. --width and --height describe the FINAL output and must\n"
+      "divide 64, since stage 1 halves them. Upstream runs this on the FULL\n"
+      "(non-distilled) transformer; pointing it at a distilled checkpoint renders a\n"
+      "plausible clip on a trajectory those weights were never trained for, and\n"
+      "nothing in the output says so.\n\n"
+      "KEYFRAME INTERPOLATION generates the motion BETWEEN keyframes you pin.\n"
+      "--pipeline-kind keyframe_interpolation selects it. Its two stages are the\n"
+      "ti2vid_two_stage ones -- guided half-res stage 1 on the UNADAPTED model, then a\n"
+      "distilled three-sigma refinement -- and it needs the same --lora and\n"
+      "--upsampler for the same reasons. TWO fields differ and both of them render\n"
+      "either way. First, --first-frame is a KEYFRAME here rather than a frame that\n"
+      "overwrites the opening latent: upstream drops the frame-0 special case, so the\n"
+      "image is appended as guidance the model interpolates FROM instead of replacing\n"
+      "what it would otherwise generate. Second, the audio.wav you get back is STAGE\n"
+      "2\'s, not stage 1\'s as on ti2vid_two_stage. Use --first-frame and --last-frame\n"
+      "together to pin both ends of the clip; a keyframe at an INTERIOR frame is not\n"
+      "requestable yet.\n");
   std::exit(code);
 }
 
@@ -144,7 +251,22 @@ int main(int argc, char** argv) {
   std::string workdir = "/tmp/ltx2_gen", out_path, ffmpeg = "ffmpeg", device = "cuda";
   // BORROWED by `vllm_video_generate`, like the extras below, so it is owned
   // here and pointed at only after parsing.
-  std::string prompt, first_frame, image_crf;
+  std::string prompt, first_frame, last_frame, image_crf;
+  std::string audio_path, audio_start_time, audio_max_duration;
+  // RETAKE (row LTX25-RETAKE, #924): a source clip DIRECTORY and the window to
+  // regenerate. `--ref-video` is a directory of frame_%06d.ppm, not a container.
+  std::string ref_video, retake_start, retake_end, retake_fps, regen_video, regen_audio;
+  // TEXT-TO-AUDIO (row LTX25-T2A-ONE-STAGE, #1005): one flag per argument of
+  // upstream's `default_1_stage_t2a_arg_parser` (utils/args.py:1070-1120).
+  std::string negative_prompt, audio_cfg_scale, audio_stg_scale, audio_rescale;
+  std::string audio_skip_step, audio_stg_blocks;
+
+  // THE VIDEO GUIDER (row LTX25-GUIDED-VIDEO, #1092): the other half of the same
+  // parser, `default_1_stage_arg_parser` (utils/args.py:947-1066). `--negative-
+  // prompt` above is shared by both, which is why it is not repeated here.
+  std::string video_cfg_scale, video_stg_scale, video_rescale, video_skip_step;
+  std::string video_stg_blocks, a2v_scale, v2a_scale;
+  std::string negative_embeds, negative_audio_embeds;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -179,12 +301,35 @@ int main(int argc, char** argv) {
     else if (f == "--model-version") SetExtra("model_version", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--pipeline-kind") SetExtra("pipeline_kind", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--upsampler") SetExtra("upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    else if (f == "--negative-prompt-embeds") {
+      negative_embeds = Need(argc, argv, ++i, f.c_str());
+      SetExtra("negative_prompt_embeds_path", negative_embeds);
+    } else if (f == "--negative-audio-prompt-embeds") {
+      negative_audio_embeds = Need(argc, argv, ++i, f.c_str());
+      SetExtra("negative_audio_prompt_embeds_path", negative_audio_embeds);
+    }
+    // Kept although the library REFUSES this extra by name (#611): the duration
+    // head is unported, and forwarding the flag gets the caller that named
+    // refusal instead of "unknown option", which says nothing about why.
     else if (f == "--duration-head")
       SetExtra("duration_head_path", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--max-phase") SetExtra("max_phase", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--prompt-valid-rows")
       SetExtra("prompt_embeds_valid_rows", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--allow-unported") SetExtra("allow_unported_modules", "1");
+    // IC-LoRA (row LTX25-IC-LORA, issue #923), mirroring upstream's
+    // `--lora PATH [STRENGTH]` (ltx-pipelines utils/args.py:600-611): the
+    // strength is optional and defaults to upstream's DEFAULT_LORA_STRENGTH.
+    // LOAD extras, because upstream fuses the adapter into the weights at
+    // construction (ic_lora.py:104-114) and it cannot vary per request.
+    else if (f == "--lora") {
+      SetExtra("lora_path", Need(argc, argv, ++i, f.c_str()));
+      // The optional second word. Consumed only when it does not look like the
+      // next flag, which is how upstream's `nargs="+"` LoraAction disambiguates.
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        SetExtra("lora_strength", argv[++i]);
+      }
+    }
     // Image conditioning (row LTX25-IMAGE-COND, issue #644). `--first-frame` is
     // a binary PPM; `--image-crf` is the PER-GENERATION extra, so it rides
     // vp.extra_* rather than mp.extra_*. Only 0 is served, and it is NOT
@@ -192,7 +337,65 @@ int main(int argc, char** argv) {
     // own 18 and refuse, which is the point: this CLI must not be the thing that
     // quietly turns an out-of-distribution render on.
     else if (f == "--first-frame") first_frame = Need(argc, argv, ++i, "--first-frame");
+    // `--last-frame` pins the CLOSING keyframe, at pixel frame `frames - 1`. The
+    // ABI has carried `last_frame` and the engine has served it since row
+    // LTX25-TOKEN-APPEND (#930); this CLI simply never read the field, which
+    // #1191 records. It matters from `keyframe_interpolation` on, because a
+    // pipeline whose whole job is the motion BETWEEN two pinned frames could
+    // otherwise only be asked for one of them. Same `--image-crf` and the same
+    // strength as the first frame, because the request surface carries one of
+    // each (#1187).
+    else if (f == "--last-frame") last_frame = Need(argc, argv, ++i, "--last-frame");
     else if (f == "--image-crf") image_crf = Need(argc, argv, ++i, "--image-crf");
+    // AUDIO-TO-VIDEO (#922). Upstream's `--audio-path` is REQUIRED because that
+    // CLI drives the A2V pipeline and nothing else (a2vid_two_stage.py:312-317);
+    // here one binary serves every LTX-2.5 path, so supplying it is what selects
+    // the audio-conditioned one. Per-generation, so it rides vp.extra_* too.
+    else if (f == "--audio-path") audio_path = Need(argc, argv, ++i, "--audio-path");
+    else if (f == "--ref-video") ref_video = Need(argc, argv, ++i, "--ref-video");
+    else if (f == "--retake-start-time")
+      retake_start = Need(argc, argv, ++i, "--retake-start-time");
+    else if (f == "--retake-end-time")
+      retake_end = Need(argc, argv, ++i, "--retake-end-time");
+    else if (f == "--retake-frame-rate")
+      retake_fps = Need(argc, argv, ++i, "--retake-frame-rate");
+    // TEXT-TO-AUDIO (#1005). Selected by `--pipeline-kind t2a_one_stage`, which
+    // is a LOAD extra; these six are per-generation and are refused by name on
+    // any other pipeline rather than accepted and ignored.
+    else if (f == "--negative-prompt")
+      negative_prompt = Need(argc, argv, ++i, "--negative-prompt");
+    else if (f == "--audio-cfg-guidance-scale")
+      audio_cfg_scale = Need(argc, argv, ++i, "--audio-cfg-guidance-scale");
+    else if (f == "--audio-stg-guidance-scale")
+      audio_stg_scale = Need(argc, argv, ++i, "--audio-stg-guidance-scale");
+    else if (f == "--audio-rescale-scale")
+      audio_rescale = Need(argc, argv, ++i, "--audio-rescale-scale");
+    else if (f == "--audio-skip-step")
+      audio_skip_step = Need(argc, argv, ++i, "--audio-skip-step");
+    else if (f == "--audio-stg-blocks")
+      audio_stg_blocks = Need(argc, argv, ++i, "--audio-stg-blocks");
+    else if (f == "--video-cfg-guidance-scale")
+      video_cfg_scale = Need(argc, argv, ++i, "--video-cfg-guidance-scale");
+    else if (f == "--video-stg-guidance-scale")
+      video_stg_scale = Need(argc, argv, ++i, "--video-stg-guidance-scale");
+    else if (f == "--video-rescale-scale")
+      video_rescale = Need(argc, argv, ++i, "--video-rescale-scale");
+    else if (f == "--video-skip-step")
+      video_skip_step = Need(argc, argv, ++i, "--video-skip-step");
+    else if (f == "--video-stg-blocks")
+      video_stg_blocks = Need(argc, argv, ++i, "--video-stg-blocks");
+    else if (f == "--a2v-guidance-scale")
+      a2v_scale = Need(argc, argv, ++i, "--a2v-guidance-scale");
+    else if (f == "--v2a-guidance-scale")
+      v2a_scale = Need(argc, argv, ++i, "--v2a-guidance-scale");
+    else if (f == "--regenerate-video")
+      regen_video = Need(argc, argv, ++i, "--regenerate-video");
+    else if (f == "--regenerate-audio")
+      regen_audio = Need(argc, argv, ++i, "--regenerate-audio");
+    else if (f == "--audio-start-time")
+      audio_start_time = Need(argc, argv, ++i, "--audio-start-time");
+    else if (f == "--audio-max-duration")
+      audio_max_duration = Need(argc, argv, ++i, "--audio-max-duration");
     else if (f == "--device") device = Need(argc, argv, ++i, "--device");
     else if (f == "--frames") vp.num_frames = std::atoi(Need(argc, argv, ++i, "--frames"));
     else if (f == "--width") vp.width = std::atoi(Need(argc, argv, ++i, "--width"));
@@ -223,6 +426,8 @@ int main(int argc, char** argv) {
   vp.output_dir = workdir.c_str();
   if (!prompt.empty()) vp.prompt = prompt.c_str();
   if (!first_frame.empty()) vp.first_frame = first_frame.c_str();
+  if (!last_frame.empty()) vp.last_frame = last_frame.c_str();
+  if (!ref_video.empty()) vp.ref_video = ref_video.c_str();
 
   // The PER-GENERATION extras are a SEPARATE array from the load-time ones, and
   // conflating them is the whole failure this keeps apart: `image_crf` handed to
@@ -232,6 +437,64 @@ int main(int argc, char** argv) {
   if (!image_crf.empty()) {
     gen_keys.emplace_back("image_crf");
     gen_values.push_back(image_crf);
+  }
+  if (!audio_path.empty()) {
+    gen_keys.emplace_back("audio_path");
+    gen_values.push_back(audio_path);
+  }
+  if (!audio_start_time.empty()) {
+    gen_keys.emplace_back("audio_start_time");
+    gen_values.push_back(audio_start_time);
+  }
+  if (!audio_max_duration.empty()) {
+    gen_keys.emplace_back("audio_max_duration");
+    gen_values.push_back(audio_max_duration);
+  }
+  // Each retake knob rides the SAME per-generation array. Supplying one without
+  // the window is refused by the engine rather than ignored, so a half-typed
+  // retake reports what is missing instead of rendering the ordinary path.
+  // The knobs are a NAMED array rather than a braced-init-list iterated in
+  // place. Both are correct -- a braced-init-list bound to the range variable
+  // has its backing array lifetime-extended for the whole loop -- but the
+  // in-place form draws -Wdangling-reference from gcc 16, which
+  // `build-newest-gcc` found on its first run. The warning is a false positive
+  // and it is not silenced: the range now has automatic storage and a name, so
+  // no reference binds to a temporary and the question does not arise. Making
+  // the loop variable a copy does NOT help; the diagnostic is about the range
+  // reference, not the element.
+  const std::pair<const char*, std::string*> retake_knobs[] = {
+      std::make_pair("retake_start_time", &retake_start),
+                         std::make_pair("retake_end_time", &retake_end),
+                         std::make_pair("retake_frame_rate", &retake_fps),
+                         std::make_pair("regenerate_video", &regen_video),
+                         std::make_pair("regenerate_audio", &regen_audio),
+                         // TEXT-TO-AUDIO (#1005). One flag per upstream CLI
+                         // argument (`default_1_stage_t2a_arg_parser`,
+                         // ltx-pipelines utils/args.py:1070-1120). They are
+                         // per-generation, so they ride this array rather than
+                         // the load one; `--pipeline-kind t2a_one_stage` is the
+                         // LOAD knob that selects the pipeline, and supplying
+                         // these without it is refused by name.
+                         std::make_pair("negative_prompt", &negative_prompt),
+                         std::make_pair("audio_cfg_guidance_scale", &audio_cfg_scale),
+                         std::make_pair("audio_stg_guidance_scale", &audio_stg_scale),
+                         std::make_pair("audio_rescale_scale", &audio_rescale),
+                         std::make_pair("audio_skip_step", &audio_skip_step),
+                         std::make_pair("audio_stg_blocks", &audio_stg_blocks),
+                         // THE VIDEO GUIDER (#1092). Per-generation for the same
+                         // reason the audio row is, and refused whole on a recipe
+                         // whose guidance is distilled into the weights.
+                         std::make_pair("video_cfg_guidance_scale", &video_cfg_scale),
+                         std::make_pair("video_stg_guidance_scale", &video_stg_scale),
+                         std::make_pair("video_rescale_scale", &video_rescale),
+                         std::make_pair("video_skip_step", &video_skip_step),
+                         std::make_pair("video_stg_blocks", &video_stg_blocks),
+                         std::make_pair("a2v_guidance_scale", &a2v_scale),
+                         std::make_pair("v2a_guidance_scale", &v2a_scale)};
+  for (const auto& kv : retake_knobs) {
+    if (kv.second->empty()) continue;
+    gen_keys.emplace_back(kv.first);
+    gen_values.push_back(*kv.second);
   }
   std::vector<const char*> gkeys, gvalues;
   for (size_t i = 0; i < gen_keys.size(); ++i) {

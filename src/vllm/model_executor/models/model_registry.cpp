@@ -12,6 +12,7 @@
 // rather than a fixed in-file array.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/weight_offloader.h"
 
 #include <algorithm>
@@ -161,6 +162,29 @@ const ModelRegistration& RegistrationFor(std::string_view architecture) {
 
 LoadedModel::~LoadedModel() = default;
 
+// #775: the refusal behind `ModelAs`. Out-of-line so the header template stays
+// a `dynamic_cast` and a branch, and so the message is authored in ONE place
+// rather than once per registered architecture.
+//
+// It names the entry point that refused and the architecture the passed model's
+// own registration claims. Those two are usually the SAME string, and that is
+// the informative case rather than a redundant one: the realistic defect is a
+// caller that resolved a registration and then handed `factory->forward` a
+// model some other path produced, so the registration is right and the object
+// is not.
+void RaiseModelTypeMismatch(std::string_view architecture,
+                            const LoadedModel& model) {
+  throw std::runtime_error(
+      std::string(architecture) +
+      ": the LoadedModel handed to this registry entry point was not produced "
+      "by " +
+      std::string(architecture) +
+      "'s own load_weights (the model's registration names architecture '" +
+      std::string(model.registration().architecture) +
+      "'). Refusing by name rather than downcasting a foreign model, which is "
+      "undefined behaviour on every member call that follows (issue #775).");
+}
+
 // SPEC-MTP I5d-pre base defaults: a non-MTP architecture cannot retain draft
 // weights and builds no draft. The concrete Qwen3.5 dense/MoE models override
 // both (qwen3_5_dense.cpp / qwen3_5_moe.cpp).
@@ -299,6 +323,32 @@ ModelRegistry::OutOfTreeSupportedModels() {
 std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
                                                  const ModelSource& source) {
   const ModelRegistration& registration = Resolve(config);
+  // MODEL-FP8-BLOCK-WEIGHT (#1189 M3), narrowing FIX-FP8-BLOCKWISE-REFUSAL
+  // (#1166): the block-wise (fine-grained) FP8 config is READ and VALIDATED
+  // here, before any weight loader runs, and only what this build cannot
+  // execute is refused BY NAME -- a `quant_method` that is not fp8, a
+  // `weight_block_size` that is not exactly two dimensions, an
+  // `activation_scheme` other than `dynamic`, and a block shape other than
+  // 128x128. A supported `[128, 128]` `dynamic` checkpoint now passes and its
+  // projections load through the `weight_scale_inv` rung in
+  // `qwen3_5_dense_weights.cpp`. Nothing READS the resulting weight yet, and
+  // that gap is refused by name one step later, at `ModelRegistry::Prepare`.
+  //
+  // AFTER `Resolve`, so an unsupported architecture still reports the
+  // architecture rather than its quantization. BEFORE `load_weights`, because
+  // that is what makes the message about the unsupported SHAPE instead of about
+  // the first tensor whose name does not resolve: the dense loader branches on
+  // the weight dtype alone and a block-wise weight really is `F8_E4M3`, so it
+  // used to enter the per-tensor arm, ask for a `weight_scale` the checkpoint
+  // spells `weight_scale_inv`, and die on `tensor not found`.
+  //
+  // Sited on the registry rather than per model loader on purpose.
+  // `weight_block_size` is a property of the checkpoint's quantization config
+  // and not of one architecture, so a per-loader refusal would have to be
+  // written again for every architecture and would be missing from whichever
+  // one is added next. This also covers the GGUF arm, which reaches this
+  // function too and where the key is simply absent.
+  RefuseUnsupportedFp8BlockQuant(config);
   const ModelFactory& factory = *registration.factory;
   factory.parse_config(config);
   std::unique_ptr<LoadedModel> model =
@@ -312,13 +362,14 @@ std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
 void ModelRegistry::Prepare(LoadedModel& model, const HfConfig& config,
                             vt::Queue& queue) {
   model.registration().factory->prepare(model, config, queue);
-  // ENG-WEIGHT-OFFLOAD W1: the wrap-site analogue. Upstream calls
-  // `get_offloader().wrap_modules(...)` inside `make_layers`
-  // (model_executor/models/utils.py:824); we have no `make_layers`, and this is
-  // the one seam every production model passes through as it materialises its
-  // resident weights. The default instance is the no-op, so this line is inert
-  // until an engine installs a backend.
-  GetWeightOffloader().PrepareModel(model);
+  // ENG-WEIGHT-OFFLOAD: the post-load hook, upstream's `post_init`
+  // (offloader/base.py:68-76). This is NOT where a weight is offloaded. The
+  // offload decision is asked during LOADING, through
+  // `WeightOffloader::ConsiderWeight`, because a weight that reached here has
+  // already paid the device allocation the feature exists to avoid. The default
+  // instance is the no-op, so this line is inert until an engine installs a
+  // backend.
+  GetWeightOffloader().OnModelPrepared(model);
 }
 
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,

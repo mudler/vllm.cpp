@@ -26,6 +26,7 @@ from tools.bench.serve_low_common import (
     coefficient_of_variation,
     percentile,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     write_json_atomic,
     write_text_atomic,
@@ -85,6 +86,15 @@ def summarize_run(
     prompt_len: int = 1024,
     output_len: int = 128,
 ) -> dict[str, Any]:
+    # HARD, ahead of the soft validation below (#931). Every other defect this
+    # function tolerates voids ONE axis and leaves the rest readable; an
+    # incomplete request set makes every axis wrong at once, because each is a
+    # rate over a wall duration that still contains the dead request. A number
+    # emitted next to `binding_eligible: False` is still a number that gets
+    # quoted -- which is exactly what happened to the Qwen3.8-27B c1 leg.
+    completed = require_complete_request_set(
+        record, expected_requests=expected_requests, source="serve-low run record"
+    )
     reasons: list[str] = []
     try:
         validate_raw_result(
@@ -111,7 +121,7 @@ def summarize_run(
     total_output = sum(value for value in output_lens if isinstance(value, int))
 
     metrics: dict[str, float | None] = {
-        "request_throughput": expected_requests / duration,
+        "request_throughput": completed / duration,
         "input_throughput": total_input / duration,
         "output_throughput": total_output / duration,
         "total_throughput": (total_input + total_output) / duration,

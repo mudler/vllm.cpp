@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include "vt/device.h"
+
 namespace vllm {
 namespace multimodal {
 
@@ -32,7 +34,41 @@ namespace multimodal {
 struct SpeechModelParams {
   std::string path;
   std::string family;  // empty => detect
+
+  // WHERE the family runs (the device arm of #672). 0 = CPU, 1 = the
+  // accelerator this build resolves; `SpeechEngineDeviceType` below is the
+  // mapping and it REFUSES anything else BY NAME.
+  //
+  // Load-time rather than per-request, because weights are staged once: a
+  // family that re-uploaded its 28.5 GB per `Synthesize` would be a device arm
+  // on paper and a transfer benchmark in practice.
+  //
+  // ZERO IS CPU, deliberately, and this is NOT the `vllm_model_params.device`
+  // spelling (0=auto / 1=cpu / 2=cuda, mirroring vLLM's DeviceConfig). The text
+  // engine's `auto` picks an accelerator when one exists; a speech family's CPU
+  // path is what every correctness gate for it was taken on, so a zero-value
+  // caller must keep getting exactly the arm it has always had. This mirrors
+  // `VideoModelParams::device` (video_engine.h) — the sibling generative-engine
+  // seam, which fixed the same polarity for the same reason.
+  int32_t device = 0;
 };
+
+// Resolve the ABI's device selector for a speech family, asking the three
+// questions this seam asks everywhere else (minimax_h3_video.cpp:255, the
+// original): is there an accelerator at all, is a backend registered for it,
+// and does that platform accept THIS architecture — a PARTIAL backend (Metal
+// 15/75 ops, Tenstorrent) must be able to decline by name rather than be handed
+// a queue and die inside a kernel bind.
+//
+// `family` is the architecture key because that is this lane's stable registry
+// name (`SpeechModelParams::family`); a speech engine is not reached through
+// ModelRegistry's HF `architectures` entry. It lives HERE rather than beside one
+// family because the tree already carried two copies of this mapping
+// (minimax_h3_video.cpp, ltx2_video.cpp) and a third is where copies start to
+// disagree.
+//
+// THROWS on anything but 0 or 1, and on a device 1 this build cannot serve.
+vt::DeviceType SpeechEngineDeviceType(int32_t device, const std::string& family);
 
 // One synthesis request.
 struct SpeechGenParams {
@@ -108,6 +144,15 @@ class SpeechEngine {
   // True when the family cannot synthesize without a reference clip. Exposed
   // rather than implied, so a server can reject a request before staging.
   virtual bool requires_reference_audio() const = 0;
+
+  // WHERE this engine actually resolved to run — the mirror of
+  // `VideoEngine::device()`. Reported rather than inferred from the request,
+  // because "I asked for device 1" and "device 1 was granted" are different
+  // facts and a benchmark that confuses them measures the wrong arm.
+  //
+  // NON-pure with a CPU default: every family that has no device arm answers
+  // honestly without being edited, so IndexTTS-2.5 is untouched by this seam.
+  virtual vt::Device device() const;
 
   // Run one blocking synthesis. Implementations serialize internally (staged
   // weights are shared state); throws std::runtime_error to fail the request.

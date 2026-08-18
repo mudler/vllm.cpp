@@ -58,8 +58,24 @@ inline constexpr Music3PromptGolden kMusic3PromptGoldens[] = {
         "[start]\n[verse]\n[chorus][bridge]\nkeep this line\ntail\n[outro]\n^ after caret",
         "<|im_start|><|caption_start|>Genre\ndream pop\nhazy\nmood is dark and warmsolo\nbulletx\nendstop<|caption_end|><|lyrics_start|>[start]\n[verse]\n[chorus][bridge]\nkeep this line\ntail\n[outro]\n^ after caret<|lyrics_end|><|im_end|><|audio_start|>",
     },
+    {
+        "adjacent_emphasis",
+        "Warm *lo-fi* *jazzy* keys with a *soft* *brushed* snare\n*a* *b* *c*\n*dreamy* *ambient* pads",
+        "[verse]\nlate light on the ridge",
+        "Warm lo-fi jazzy keys with a soft brushed snare\na b c\ndreamy ambient pads",
+        "[start]\n[verse]\nlate light on the ridge",
+        "<|im_start|><|caption_start|>Warm lo-fi jazzy keys with a soft brushed snare\na b c\ndreamy ambient pads<|caption_end|><|lyrics_start|>[start]\n[verse]\nlate light on the ridge<|lyrics_end|><|im_end|><|audio_start|>",
+    },
+    {
+        "unbalanced_emphasis",
+        "a **b* c\na *b** c\n***x*** y\n*only* tail",
+        "[chorus]\nhold the line",
+        "a **b* c\na *b** c\nx y\nonly tail",
+        "[start]\n[chorus]\nhold the line",
+        "<|im_start|><|caption_start|>a **b* c\na *b** c\nx y\nonly tail<|caption_end|><|lyrics_start|>[start]\n[chorus]\nhold the line<|lyrics_end|><|im_end|><|audio_start|>",
+    },
 };
-inline constexpr int64_t kMusic3PromptGoldenCount = 2;
+inline constexpr int64_t kMusic3PromptGoldenCount = 4;
 
 // encoders.py:216-217 - every token but the first and the two
 // trailing structure tokens becomes the audio-CFG token.

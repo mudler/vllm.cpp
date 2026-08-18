@@ -4,7 +4,7 @@
   "model": "Qwen3.6-27B BF16 (50.89 GiB), greedy, 32-in / 32-out, concurrency 1",
   "hardware": "NVIDIA GB10 / DGX Spark",
   "workload": "7 clean legs with the host page cache dropped before each and the GPU serialized under one lock, one leg discarded for a NAMED cause (an overlapping compile job, not the unexplained 1-in-16 collapse); llama.cpp built -DGGML_VULKAN=ON at 237ad9b96 with a from-source shaderc so all five of its Vulkan fast paths report supported (banner: matrix cores NV_coopmat2), llama-bench tg1024, same weights",
-  "headline": "4.36 vs 4.35 tok/s, MET",
+  "headline": "4.36 vs 4.35 tok/s, MET (denominator SUPERSEDED)",
   "subline": "our GPU-side work was already ahead of llama.cpp's wall clock; pipelined submission closed the host-side remainder",
   "ours": {
     "label": "vllm.cpp (Vulkan)",
@@ -27,6 +27,7 @@
     "The campaign arc on this model: decode 2.40 -> 4.36 tok/s. The levers, in order of size: RMSNorm was dispatching ONE workgroup per row at batch 1 (7.85 -> 1.59 ms/token), GDN state I/O moved in place, the fused attention preamble went native (16 host round trips per token removed), the command batch stopped draining on every host memcpy, lm_head got column blocking, and submission was pipelined.",
     "The GEMV lever is CLOSED with its binding constraint identified: DRAM bandwidth on a ~50 GB working set streamed once per token, at 248.0 GB/s. llama.cpp's own rows-per-workgroup trick measured 0.966x here and ships off.",
     "Prefill is 21.5x its pre-campaign value on the same model. opt-125m greedy stays STRICT token-exact against the vLLM 0.25.0 oracle with 0 declines.",
-    "llama.cpp's own CUDA arm on this box is 4.67 tok/s, so its Vulkan backend runs at 93% of its CUDA."
+    "llama.cpp's own CUDA arm on this box is 4.67 tok/s, so its Vulkan backend runs at 93% of its CUDA.",
+    "DENOMINATOR SUPERSEDED (2026-08-16). 237ad9b96 is our own local-only fork of llama.cpp, 65 of this project's performance commits past upstream tag b9827, and it exists on no remote: the GitHub API answers 'No commit found for SHA' for both mudler/llama.cpp and ggml-org/llama.cpp. The tree it was built from also carried 27 uncommitted entries, so the binary is unidentified. None of the 65 commits touch ggml/src/ggml-vulkan/, so the compared Vulkan sources match b9827, but the build is still not reproducible. The oracle is now stock b10451 (10bf611e5). This is the FIRST verdict a re-take can flip: the 0.23% margin sits inside the 0.69% spread recorded in the first footnote. Re-take owed under #1003, and the pin is gateable=no until #857 builds it."
   ]
 }

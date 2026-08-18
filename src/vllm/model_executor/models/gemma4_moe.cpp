@@ -437,7 +437,15 @@ struct DevExpertLru {
 
   bool Enabled() { return BudgetBytes() > 0; }
 
-  // Free VRAM via Backend::DeviceMemoryInfo (ROCm/CUDA). No HIP in this TU.
+  // Free VRAM via Backend::DeviceMemoryInfo. No HIP in this TU.
+  //
+  // ROCm ONLY: `CudaBackend` does not override that seam, so this returns false on
+  // every CUDA device and `MakeRoom` below then refuses the device upload, which
+  // makes this whole cache dead on CUDA today. That is issue #1126, not an
+  // accident of this call site — the refuse-on-unknown polarity here is correct,
+  // because an Alloc without headroom has hung hipMalloc. This comment said
+  // "(ROCm/CUDA)" until #1123 measured it (the same false claim as the one on
+  // `vt::Backend::DeviceMemoryInfo` itself).
   static bool FreeBytes(Dev d, size_t* free_out) {
     *free_out = 0;
     size_t free_b = 0, tot_b = 0;
@@ -539,6 +547,28 @@ DevExpertLru& ExpertLru() {
 
 bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I,
                                    int64_t H) {
+  // Refuse BEFORE the upload on a device whose down-projection GEMM does not
+  // exist. Returning true here is a PROMISE that the caller may run the
+  // device-resident arm, and every caller that takes that promise ends in
+  // `vt::MatmulBTAlphaBeta` — `ExpertGeGLUDeviceAccum` (:76-93) and
+  // `ExpertGeGLUTopKFusedGelu` (:181-234) both do. That call has exactly one
+  // implementation in the tree, `rocm::MatmulBTAlphaBetaRocm`, so off ROCm it
+  // throws (issue #1205). The upload's own `try`/`catch (...)` below does NOT
+  // cover the compute, so without this line the exception leaves the decode step
+  // instead of degrading: the `else` arms at the call sites already fall back to
+  // `EnsureGemma4Fp8ExpertCached` + `ExpertGeGLUHost`, which is slower and
+  // rounds twice more, but answers.
+  //
+  // It is latent rather than live today only because `MakeRoom` needs
+  // `Backend::DeviceMemoryInfo`, which only ROCm overrides. #1126 step 1 is
+  // exactly the change that adds the CUDA override, which is why the refusal has
+  // to be here before it lands and not after.
+  //
+  // Keyed on whether the arm EXISTS, not on a device name or a build macro:
+  // `vt::HasMatmulBTAlphaBeta` is the same predicate the dispatch itself uses, so
+  // writing the CUDA kernel wakes this path with no edit here, and on ROCm the
+  // answer is true and nothing about this function changes.
+  if (!vt::HasMatmulBTAlphaBeta(d.q)) return false;
   // When device LRU disabled, do NOT host-cache-dequant here — that path was
   // unbounded (every expert forever) and OOM'd the 30G host (~27G RSS) under pollution.
   if (!ExpertLru().Enabled()) return false;

@@ -793,6 +793,7 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
                                    const Ltx2AdaLayerNormSingleWeights& cross_scale_shift_adaln,
                                    const Ltx2AdaLayerNormSingleWeights& cross_gate_adaln,
                                    const Ltx2AdaLayerNormSingleWeights* prompt_adaln,
+                                   const Tensor* keyframes_embedding,
                                    const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                                    int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
                                    int64_t heads, const Ltx2ModalityInput* cross,
@@ -804,6 +805,53 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
   DBuf latent = UploadStream(c.d, c.s, m.latent, {rows, in_channels});
   out.x.emplace(c.d, c.s, std::vector<int64_t>{rows, width});
   LinearDev(c, latent.t(), rows, in_channels, patchify, out.x->t());
+
+  // transformer_args.py:269 — `apply_keyframes_absolute_embedding`, in the same
+  // place and with the same polarity the host forward uses. Not a second rule:
+  // the two paths differ only in where the bytes live.
+  VT_CHECK(m.keyframes_mask == nullptr || keyframes_embedding != nullptr,
+           "ltx2: a keyframes_mask was supplied for a stream that carries no "
+           "keyframes_abs_pos_embedding (model.py:333 builds the AUDIO preprocessor with no "
+           "keyframes_embedding_provider; :314 gives the video one). Refusing rather than "
+           "rendering without a trained term.");
+  if (keyframes_embedding != nullptr && m.keyframes_mask != nullptr) {
+    // Same pairing the host arm asserts: a declared flag and an unbound view
+    // cannot disagree, because together they ARE
+    // `supports_keyframes_abs_pos_embedding` (model.py:166-173). `CheckResident`
+    // deliberately no-ops on an unbound view, so it does not cover this.
+    VT_CHECK(keyframes_embedding->data != nullptr,
+             "ltx2: use_keyframes_abs_pos_embedding is set but the staged weight view is unbound");
+    VT_CHECK(keyframes_embedding->rank == 2 && keyframes_embedding->shape[0] == 1 &&
+                 keyframes_embedding->shape[1] == width,
+             "ltx2: keyframes_abs_pos_embedding must be [1, stream width] (model.py:217-219)");
+    // `mask * embedding` cast to `hidden_states.dtype` (transformer_args.py:42-43)
+    // — so the ADDEND is at the stream dtype, not wider. The staged tensor already
+    // is, because `Ltx2StreamDitToDevice` stages the whole contract at one dtype;
+    // asserted rather than assumed because vt's CUDA elementwise kernels require
+    // matching dtypes and would throw from inside a kernel instead of by name.
+    VT_CHECK(keyframes_embedding->dtype == out.x->t().dtype,
+             "ltx2: keyframes_abs_pos_embedding is staged at a different dtype from the video "
+             "stream; upstream casts the embedding to hidden_states.dtype and never widens it");
+    // vt::Add's ROW-BROADCAST shape is rank-1 [D] (ops.h:1887-1889), which is
+    // exactly `mask * embedding` over a run of MARKED rows. Walking contiguous
+    // runs keeps the general mask exact while the first-frame rule — a prefix
+    // (tools.py:194-195) — costs a single call.
+    const Tensor bias =
+        MakeTensor(keyframes_embedding->data, keyframes_embedding->dtype,
+                   keyframes_embedding->device, {width});
+    int64_t r = 0;
+    while (r < rows) {
+      if (!(m.keyframes_mask[r] > 0.0F)) {
+        ++r;
+        continue;
+      }
+      int64_t end = r;
+      while (end < rows && m.keyframes_mask[end] > 0.0F) ++end;
+      Tensor run = RowsFrom(out.x->t(), r, width, {end - r, width});
+      vt::Add(c.d.q, run, run, bias);
+      r = end;
+    }
+  }
 
   AdalnOutDev ada =
       PrepareTimestepDev(c, adaln, m.timesteps, rows, width, c.p->timestep_scale_multiplier);
@@ -951,6 +999,9 @@ void CheckWeightsResident(const Ltx2DitWeights& w, vt::Device dev) {
   CheckAdalnResident(w.av_ca_v2a_gate, dev, "av_ca_v2a_gate");
   CheckResident(w.scale_shift_table, dev, "scale_shift_table");
   CheckResident(w.audio_scale_shift_table, dev, "audio_scale_shift_table");
+  // Bound only when use_keyframes_abs_pos_embedding resolves on; `CheckResident`
+  // no-ops on an unbound view, so this needs no flag either.
+  CheckResident(w.keyframes_abs_pos_embedding, dev, "keyframes_abs_pos_embedding");
   for (size_t i = 0; i < w.blocks.size(); ++i) {
     const Ltx2BlockWeights& b = w.blocks[i];
     const std::string tag = "blocks." + std::to_string(i);
@@ -1101,13 +1152,19 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
   const bool prompt_adaln = params.cross_attention_adaln && params.use_prompt_adaln_single;
   PreparedStreamDev vs = PrepareStreamDev(
       c, weights.patchify_proj, weights.adaln_single, weights.av_ca_video_scale_shift,
-      weights.av_ca_a2v_gate, prompt_adaln ? &weights.prompt_adaln_single : nullptr, *video, dim,
+      weights.av_ca_a2v_gate, prompt_adaln ? &weights.prompt_adaln_single : nullptr,
+      // model.py:314 — only the VIDEO preprocessor gets the provider.
+      params.use_keyframes_abs_pos_embedding ? &weights.keyframes_abs_pos_embedding : nullptr,
+      *video, dim,
       params.in_channels, 3,
       params.positional_embedding_max_pos, params.num_attention_heads, audio,
       params.cross_attention_dim);
   PreparedStreamDev as = PrepareStreamDev(
       c, weights.audio_patchify_proj, weights.audio_adaln_single, weights.av_ca_audio_scale_shift,
-      weights.av_ca_v2a_gate, prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr, *audio,
+      weights.av_ca_v2a_gate, prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr,
+      // model.py:333 — the audio preprocessor is built with NO provider.
+      /*keyframes_embedding=*/nullptr,
+      *audio,
       adim, params.audio_in_channels, 1,
       params.audio_positional_embedding_max_pos, params.audio_num_attention_heads, video,
       params.audio_cross_attention_dim);

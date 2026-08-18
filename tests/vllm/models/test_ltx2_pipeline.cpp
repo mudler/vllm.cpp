@@ -27,18 +27,28 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "ltx2_pipeline_goldens.inc"
+// Row LTX25-RES2S-LOOP (#921). Its own file rather than rows appended to
+// `ltx2_pipeline_goldens.inc`: that file is written by
+// scripts/gen-ltx2-pipeline-goldens.py and edited by several concurrent rows of
+// this campaign, and a per-row file is the shape `AGENTS.md ## Records` asks for.
+#include "ltx2_res2s_goldens.inc"
 
 #include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_samplers.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_duration_head.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
@@ -1137,13 +1147,59 @@ TEST_CASE("ltx2 the recipe table mirrors vLLM-Omni's, and refuses everything els
   CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5"));
   CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5"));
 
+  // The `retake` rows (row LTX25-RETAKE, #924), also Lightricks' and with no
+  // vLLM-Omni counterpart at all. Every value is read off `retake.py` rather than
+  // adapted from a neighbour, so each is asserted rather than assumed.
+  CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("retake", "2"));
+  {
+    const vllm::Ltx2PipelineRecipe retake = vllm::ResolveLtx2PipelineRecipe("retake", "2.5");
+    // ONE `DiffusionStage` call (retake.py:313-324), at the source clip's own
+    // resolution because `__call__` passes `output_shape.width` / `.height`
+    // straight through (:317-318). A second phase, or a downscale, would put the
+    // encoded source latent into a grid it does not fit.
+    REQUIRE(retake.phases.size() == 1);
+    CHECK(retake.phases[0].spatial_downscale == 1);
+    CHECK(retake.max_spatial_downscale() == 1);
+    CHECK(retake.phases[0].input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+    // `sigmas = DISTILLED_SIGMAS` (:287): `distilled` defaults True (:85) and the
+    // CLI hard-codes it (:359).
+    CHECK(retake.phases[0].sigmas == vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5")
+                                         .phases[0]
+                                         .sigmas);
+    // NOT the ancestral sampler. `DiffusionStage.__call__` defaults `stepper` to
+    // `EulerDiffusionStep()` (utils/blocks.py:526-527) and retake overrides
+    // neither `stepper` nor `loop`, so the sampler `distilled.py` selects for 2.5
+    // reaches retake through nothing. Asserted against the sibling recipe, which
+    // DOES select it at 2.5, so this cannot pass by both being the same value.
+    CHECK(retake.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+    CHECK(vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").phases[0].stepper ==
+          vllm::Ltx2StepperKind::kEulerAncestral);
+    // `SimpleDenoiser` (:290-294) takes no negative context, and
+    // `prompts_to_encode` is `[prompt]` alone in the distilled arm (:259).
+    CHECK(retake.negative_prompt.empty());
+    CHECK_FALSE(retake.phases[0].allow_guidance_override);
+    CHECK(retake.video_output_phase == 0);
+    CHECK(retake.audio_output_phase == 0);
+  }
+
   // ...and the refusal, which is the point. A plausible-but-wrong recipe RENDERS.
   for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
            {"one_stage", "3"},
            {"one_stage", "2.6"},
            {"distilled_two_stage", "2.3"},
            {"dmd2", "2.5"},
-           {"res2s_two_stage", "2.5"},
+           {"retake", "2.3"},
+           // WAS `{"res2s_two_stage", "2.5"}`, and it is repointed here rather
+           // than deleted. That pair was this list's stand-in for "a kind the
+           // table has never heard of", and row LTX25-RES2S-LOOP (#921) made it
+           // a SERVED row — so leaving it would have asserted a refusal for a
+           // capability that ships, which is the failure mode #923 retired an
+           // enumerator over. `res2s_two_stage` at 2.3 keeps the pair's job:
+           // 2.5 is the only version `LTX_2_3_HQ_PARAMS` resolves onto, because
+           // it is a plain constant with no `detect_params` lineage
+           // (constants.py:91-94).
+           {"res2s_two_stage", "2.3"},
+           {"hq_two_stage", "2.5"},
            {"", ""},
        }) {
     const std::string message = RefusalMessage(
@@ -1231,26 +1287,599 @@ TEST_CASE("ltx2 the two references disagree on the default negative prompt, and 
 // Out-of-scope refusals
 // ===========================================================================
 
-TEST_CASE("ltx2 every L5 out-of-scope feature is refused BY NAME") {
-  // Spec section 2 "Out", plus the L7 boundary. A silent downgrade of any of
-  // these produces a video, which is exactly why none of them may fall back.
-  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> owed = {
-      {vllm::Ltx2UnportedPipelineFeature::kTemporalUpsampler, "temporal"},
-      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
-      {vllm::Ltx2UnportedPipelineFeature::kMultishot, "multishot"},
-      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
-      {vllm::Ltx2UnportedPipelineFeature::kCfgParallelism, "parallelism"},
-      {vllm::Ltx2UnportedPipelineFeature::kVideoEngineWiring, "VideoEngine"},
-      {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
+// THE LIST SHRANK FROM SEVEN TO FIVE on 2026-08-13, and the shrink is the point.
+// Two enumerators were retired by row LTX25-RETIRE-DEAD-ARMS (#644):
+// `kMultishot`, which refused a feature that exists in NEITHER reference, and
+// `kVideoEngineWiring`, whose subject shipped in `cefacd2d0`. See
+// .agents/specs/ltx25-retire-dead-arms.md §1.1 and §1.5. A CHANGED CASE COUNT
+// here is that retirement, not a lost assertion.
+TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
+  // Spec section 2 "Out". A silent downgrade of any of these produces a video,
+  // which is exactly why none of them may fall back.
+  //
+  // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
+  // trip this. ONE of the five is, not two. The engine reaches
+  // `ltx2_upsampler.cpp:465` through `Ltx2UpsampleVideoLatent`, which
+  // `ltx2_video.cpp` calls when a phase asks for the spatial-upsample transform.
+  //
+  // `kBetaScheduler` USED TO BE LISTED HERE and is not reachable. Its call site
+  // `ltx2_pipeline.cpp:199` sits inside `Ltx2Schedule`, and `Ltx2Schedule` has no
+  // product caller at all — the engine calls `Ltx2SigmaSchedule` directly
+  // in `ltx2_video.cpp`'s phase driver — and no ABI field, load extra or CLI flag
+  // carries a scheduler kind. A refusal is only reachable if something CALLS the function
+  // holding it; an enumerator with a `case` label is not a caller. The case
+  // "ltx2 the reachable/marker split matches the source" below derives that
+  // reachability from the tree rather than restating it here.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> reachable = {
+      {vllm::Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler, "SPATIOTEMPORAL"},
   };
-  for (const auto& item : owed) {
+  // DECLARED-OUT-OF-SCOPE MARKERS: nothing a caller can send reaches these, so
+  // the message must not claim otherwise. Recording them as refusals overstated
+  // what this port has, which is the defect this row closes.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> markers = {
+      {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
+      // `kLoraFusion` WAS here and is RETIRED (row LTX25-IC-LORA, #923). It is
+      // not moved to `reachable`: it is gone. The `lora_path` load extra now
+      // fuses an adapter, so there is no unported LoRA-fusion feature left to
+      // name, and #691's prediction — that this list gates message TEXT and
+      // would not notice the property going false — is why the enumerator was
+      // deleted rather than reclassified. The compiler is what caught it, which
+      // is a weaker guarantee than #691 asks for and does not close #691.
+      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
+      {vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism, "multi-GPU"},
+  };
+
+  std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> all = reachable;
+  all.insert(all.end(), markers.begin(), markers.end());
+  for (const auto& item : all) {
     const std::string message =
         RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
     INFO("feature = ", item.second, " refusal = ", message);
     CHECK(Mentions(message, item.second));
     // Naming WHERE the work is owed is what keeps it from being rediscovered.
     CHECK(Mentions(message, "ltx-2-5.md"));
+    // The RETIRED arm must not come back: a refusal that cites a feature neither
+    // reference has sends the next reader looking upstream for it.
+    CHECK_FALSE(Mentions(message, "multishot"));
   }
+  for (const auto& item : reachable) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("reachable = ", item.second, " refusal = ", message);
+    CHECK_FALSE(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+  for (const auto& item : markers) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("marker = ", item.second, " refusal = ", message);
+    CHECK(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+
+  // THE ABSENCE THIS MESSAGE STATES IS ITSELF EVIDENCE, so it is gated. The first
+  // version of this marker ended "int8 appears upstream only in the trainer" — a
+  // false-absence claim of exactly the kind row LTX25-RETIRE-DEAD-ARMS exists to
+  // retire (#604), shipped inside a user-visible refusal. LTX-2 @ fd4ded7f carries
+  // a per-row int8 quantize kernel with fp32 scales in `ltx-kernels`, which is an
+  // INFERENCE package, not the trainer: `blockwise/triton_ops.py:35,43`, aliased
+  // `rowwise_int_quantize_triton` at `:436`. It is dead — that alias is its only
+  // reference and `blockwise/functional.py:12-18` does not re-export it — so the
+  // disposition is unchanged and only the sentence was wrong. See
+  // .agents/specs/ltx25-retire-dead-arms.md §1.2.
+  {
+    const std::string message = RefusalMessage([] {
+      vllm::Ltx2RefuseUnportedPipelineFeature(vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot);
+    });
+    INFO("int8 marker = ", message);
+    CHECK_FALSE(Mentions(message, "only in the trainer"));
+    // The true statement names where the one inference-side int8 lives, so a
+    // reader who greps upstream and finds it is not left thinking we missed it.
+    CHECK(Mentions(message, "ltx-kernels"));
+  }
+
+  // THE MULTI-GPU MARKER'S OWN EVIDENCE, for the same reason and after the same
+  // defect. This message shipped "Upstream has three forms and none of them is
+  // CFG batching", and the header above the enum shipped "zero `cfg` hits in
+  // either multigpu tree". Both are false at LTX-2 @ fd4ded7f, and both are #604
+  // again: the spec's grep was correct but PATH-FILTERED to the two SOURCE trees,
+  // excluding `ltx-pipelines/docs/multigpu/` where the answer lives. Re-derived
+  // without the filter, with the file list as its own positive control:
+  //
+  //   git ls-files -- '*multigpu*'          -> 33 files (the control)
+  //   git grep -n -i cfg -- '*multigpu*'    -> 5 lines, NOT zero
+  //
+  // Two of the five are substantive, at `docs/multigpu/gemma.md:103-104`. And
+  // there is a FOURTH `BuilderProtocol` in the very directory the message cites:
+  // `multigpu/bp_gemma_builder.py:42` `BatchParallelGemmaBuilder`, wrapping
+  // `ltx-core multigpu/gemma/batch_parallel_wrapper.py`, which partitions a PROMPT
+  // LIST across ranks.
+  //
+  // The disposition is unchanged and in fact stronger: `gemma.md:104` says the
+  // distilled pipeline runs "without CFG", so the one form that would batch a
+  // CFG pair is the one upstream tells you not to use for the recipe this port
+  // runs. Only the sentences were wrong. See
+  // .agents/specs/ltx25-retire-dead-arms.md §1.3.
+  {
+    const std::string message = RefusalMessage([] {
+      vllm::Ltx2RefuseUnportedPipelineFeature(
+          vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism);
+    });
+    INFO("multi-GPU marker = ", message);
+    // The retired count. "three forms" was an undercount produced by a path
+    // filter, so the count itself is the assertion.
+    CHECK_FALSE(Mentions(message, "three forms"));
+    CHECK(Mentions(message, "four forms"));
+    // The form the undercount missed, by name, so a reader who greps the cited
+    // directory and finds a fourth builder is not left thinking we missed it.
+    CHECK(Mentions(message, "BatchParallelGemmaBuilder"));
+    // And the REASON CFG batching is inapplicable, cited to the upstream line
+    // that says it, rather than asserted as an absence of the string `cfg`.
+    CHECK(Mentions(message, "gemma.md"));
+  }
+}
+
+// THE REACHABLE/MARKER SPLIT, DERIVED FROM THE TREE INSTEAD OF ASSERTED.
+//
+// The ledger above and `docs/USAGE.md` both make a claim about the PRODUCT CODE:
+// that a render asking for a reachable arm gets a refusal, and that nothing a
+// caller can send reaches a marker. Until this case existed, that claim was two
+// hand-maintained vectors and a paragraph, and it was wrong about
+// `kBetaScheduler` for the whole of this row: the header defined reachable as "a
+// caller CAN trip it", `docs/USAGE.md` published "Both are reachable", and the
+// refusal was inside `Ltx2Schedule`, which nothing calls.
+//
+// THE RULE THIS ENCODES. A refusal is reachable only if something CALLS the
+// function that holds it. A `case` label in a switch is not a caller, and an
+// enumerator that appears in `src/` proves only that the compiler can see it.
+// So the check is on the ENTRY FUNCTION of each arm's chain:
+//
+//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:465)
+//                             <- `Ltx2UpsampleVideoLatent` (:566)
+//                             <- `ltx2_video.cpp`, the phase that upsamples
+//   kBetaScheduler            `Ltx2Schedule` (ltx2_pipeline.cpp:199)
+//                             <- NOTHING
+//
+// TWO POSITIVE CONTROLS, because this case is an ABSENCE claim about our own tree
+// and #604 is the row's whole subject. A scan that reports zero because it opened
+// no files, or because it cannot match a symbol of this shape, reports the same
+// zero as a genuine absence. So the same walk, with the same predicate and the
+// same exclusions, must find `Ltx2UpsampleVideoLatent` called from product code
+// (the reachable arm, proving the walk sees callers at all) and `Ltx2SigmaSchedule`
+// called from product code (proving a SCHEDULER entry point in this same header
+// is findable, so the zero for `Ltx2Schedule` is not an artifact of the name).
+namespace {
+
+// Every product translation unit: `src/`, `include/` and `examples/`. Tests are
+// deliberately excluded — a unit test constructing an enumerator by hand is
+// exactly what a marker is, so counting it as a caller would erase the split.
+std::vector<std::filesystem::path> ProductSources() {
+  std::vector<std::filesystem::path> out;
+  for (const char* dir : {"src", "include", "examples"}) {
+    const std::filesystem::path root = std::filesystem::path(VLLM_CPP_SOURCE_ROOT) / dir;
+    if (!std::filesystem::is_directory(root)) continue;
+    for (const std::filesystem::directory_entry& e :
+         std::filesystem::recursive_directory_iterator(root)) {
+      if (!e.is_regular_file()) continue;
+      const std::string ext = e.path().extension().string();
+      if (ext == ".cpp" || ext == ".cc" || ext == ".h" || ext == ".hpp" || ext == ".cu") {
+        out.push_back(e.path());
+      }
+    }
+  }
+  return out;
+}
+
+// Product files mentioning `symbol(`, excluding the files that DECLARE and DEFINE
+// it. Reported as `path:line` strings so a failure names the caller rather than a
+// count the reader then has to go and find.
+std::vector<std::string> ProductCallSites(const std::vector<std::filesystem::path>& files,
+                                          const std::string& symbol,
+                                          const std::vector<std::string>& owning_files) {
+  std::vector<std::string> hits;
+  for (const std::filesystem::path& path : files) {
+    const std::string name = path.filename().string();
+    if (std::find(owning_files.begin(), owning_files.end(), name) != owning_files.end()) continue;
+    std::ifstream in(path);
+    if (!in.good()) continue;
+    std::string line;
+    size_t line_no = 0;
+    while (std::getline(in, line)) {
+      ++line_no;
+      if (line.find(symbol + "(") != std::string::npos) {
+        hits.push_back(path.filename().string() + ":" + std::to_string(line_no));
+      }
+    }
+  }
+  return hits;
+}
+
+std::string Join(const std::vector<std::string>& v) {
+  std::string s;
+  for (const std::string& x : v) s += (s.empty() ? "" : ", ") + x;
+  return s.empty() ? "<none>" : s;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 the reachable/marker split matches the source") {
+  const std::vector<std::filesystem::path> files = ProductSources();
+  // ANTI-VACUOUS, control zero: a walk that opened nothing reports every symbol
+  // as unreachable and passes the half of this case that matters least.
+  REQUIRE_MESSAGE(files.size() > 100,
+                  "the product-source walk found only " << files.size()
+                                                        << " files; VLLM_CPP_SOURCE_ROOT is wrong");
+
+  // ── CONTROL ONE: the reachable arm's entry function IS called ──────────────
+  const std::vector<std::string> upsample_callers =
+      ProductCallSites(files, "Ltx2UpsampleVideoLatent",
+                       {"ltx2_upsampler.cpp", "ltx2_upsampler.h", "ltx2_video_vae_encoder.h"});
+  INFO("Ltx2UpsampleVideoLatent callers = " << Join(upsample_callers));
+  CHECK_MESSAGE(!upsample_callers.empty(),
+                "the SPATIOTEMPORAL refusal is published as REACHABLE, but nothing in src/, "
+                "include/ or examples/ calls Ltx2UpsampleVideoLatent. Either the engine stopped "
+                "upsampling, or this walk is broken — resolve which before trusting the zero "
+                "below");
+
+  // ── CONTROL TWO: a scheduler entry point in the SAME header is findable ────
+  const std::vector<std::string> sigma_callers =
+      ProductCallSites(files, "Ltx2SigmaSchedule", {"ltx2_pipeline.cpp", "ltx2_pipeline.h"});
+  INFO("Ltx2SigmaSchedule callers = " << Join(sigma_callers));
+  CHECK_MESSAGE(!sigma_callers.empty(),
+                "no product caller of Ltx2SigmaSchedule either, so the walk cannot see scheduler "
+                "call sites and the Ltx2Schedule zero below proves nothing");
+
+  // ── THE CLAIM: the Beta refusal is reached by no product path ──────────────
+  const std::vector<std::string> schedule_callers =
+      ProductCallSites(files, "Ltx2Schedule", {"ltx2_pipeline.cpp", "ltx2_pipeline.h"});
+  INFO("Ltx2Schedule callers = " << Join(schedule_callers));
+
+  const std::string beta = RefusalMessage([] {
+    vllm::Ltx2RefuseUnportedPipelineFeature(vllm::Ltx2UnportedPipelineFeature::kBetaScheduler);
+  });
+  INFO("BetaScheduler refusal = " << beta);
+
+  // The two must AGREE, in both directions, which is what makes this a gate on
+  // the classification rather than a restatement of it. No caller means marker;
+  // a caller appearing later means the marker wording has to go.
+  if (schedule_callers.empty()) {
+    CHECK_MESSAGE(Mentions(beta, "DECLARED, NOT REQUESTABLE"),
+                  "nothing in src/, include/ or examples/ calls Ltx2Schedule, so no request can "
+                  "reach the BetaScheduler refusal, yet its message does not say DECLARED, NOT "
+                  "REQUESTABLE. Either route the engine through Ltx2Schedule or classify it as a "
+                  "marker, per .agents/specs/ltx25-retire-dead-arms.md §1.6");
+  } else {
+    CHECK_MESSAGE(!Mentions(beta, "DECLARED, NOT REQUESTABLE"),
+                  "Ltx2Schedule now HAS a product caller ("
+                      << Join(schedule_callers)
+                      << "), so the BetaScheduler refusal is reachable and must stop calling "
+                         "itself unrequestable. Move it back to the reachable group in the ledger "
+                         "case, docs/FEATURES.md and docs/USAGE.md");
+  }
+}
+
+// THE PUBLIC SURFACE MUST NOT RE-MERGE WHAT THE LEDGER SPLIT. `docs/FEATURES.md`
+// is where the reachable/marker distinction reaches a user, and it carried ONE
+// "Declared, not requestable" row listing all five arms — including the two a
+// caller CAN trip. That is the same conflation the ledger above stopped making,
+// reintroduced one surface out. Gated here rather than left to review because a
+// doc row and an enum drift silently.
+//
+// Deliberately narrow: it asserts only that no row calling something
+// unrequestable names a REACHABLE arm. It does not police the wording of the doc.
+TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable") {
+  std::ifstream in(VLLM_CPP_FEATURES_DOC_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << VLLM_CPP_FEATURES_DOC_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string doc = buf.str();
+  REQUIRE(doc.size() > 1000);
+
+  // The ONE arm with a product call site: `ltx2_upsampler.cpp:465` constructs the
+  // SPATIOTEMPORAL upsampler condition, and `ltx2_video.cpp` reaches it through
+  // `Ltx2UpsampleVideoLatent`. Named by the word the doc uses for it, since that
+  // is what a reader sees.
+  //
+  // `betascheduler` WAS IN THIS LIST and had to come out. It is a marker, not a
+  // reachable refusal — `Ltx2Schedule`, the only function holding its call site,
+  // has no product caller — so the doc's markers row now names it, and a check
+  // that no "not requestable" row may name it would fire on the correct sentence.
+  // Kept as a comment rather than deleted because the wrong classification is what
+  // this repair fixes; see the ledger case above and §1.6 of the row spec.
+  //
+  // `spatiotemporal upsampler`, NOT a bare `upsampler`, and that is the whole
+  // repair. `2e9d95e74` ported the TEMPORAL-ONLY x2 upsampler on this same issue
+  // and renamed the enumerator, so there are now two upsampler arms in this
+  // model: one refused, one shipped-but-undriven. A bare `upsampler` matches both
+  // and therefore cannot tell a refusal from a shipped feature — it fires on a
+  // correct sentence about the ported arm and stays silent on the distinction it
+  // exists to police. Matched case-insensitively because the doc capitalizes the
+  // word for emphasis in one row and not the other.
+  const std::vector<std::string> reachable_words = {"spatiotemporal upsampler"};
+
+  auto lowered = [](const std::string& text) {
+    std::string out = text;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+  };
+
+  size_t rows_examined = 0;
+  size_t reachable_rows = 0;
+  size_t line_no = 0;
+  size_t at = 0;
+  while (at <= doc.size()) {
+    const size_t end = doc.find('\n', at);
+    const std::string line = doc.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    ++line_no;
+    const std::string lower = lowered(line);
+    // A table row that makes the not-requestable claim, in either casing the doc
+    // uses for it.
+    const bool is_row = !line.empty() && line[0] == '|';
+    const bool claims_unrequestable = lower.find("not requestable") != std::string::npos;
+    const bool is_ltx = line.find("LTX-2.5") != std::string::npos;
+    if (is_row && claims_unrequestable && is_ltx) {
+      ++rows_examined;
+      for (const std::string& word : reachable_words) {
+        INFO("FEATURES.md:" << line_no << " = " << line);
+        CHECK_MESSAGE(lower.find(word) == std::string::npos,
+                      "a row claiming 'not requestable' names the REACHABLE arm '"
+                          << word
+                          << "'; split the reachable refusals out, per "
+                             ".agents/specs/ltx25-retire-dead-arms.md §1.6");
+      }
+    }
+    // AND THE REACHABLE ROW ITSELF, because the defect this repair closes was
+    // produced by a MERGE rather than by an author: `2e9d95e74` landed the
+    // temporal-only arm while this row's doc edit still called that arm refused,
+    // and both files auto-merged clean, so nothing said a word. Publishing a
+    // refusal for a shipped feature is #604 in the most user-facing surface there
+    // is, which is why the doc must name the arm that is ACTUALLY refused.
+    if (is_row && is_ltx && lower.find("refused by name at the call site") != std::string::npos) {
+      ++reachable_rows;
+      INFO("FEATURES.md:" << line_no << " = " << line);
+      CHECK_MESSAGE(lower.find("spatiotemporal") != std::string::npos,
+                    "the LTX-2.5 reachable-refusal row must name the SPATIOTEMPORAL upsampler. "
+                    "The temporal-only x2 arm is PORTED (2e9d95e74); a row that calls it "
+                    "refused publishes a refusal for a shipped feature");
+    }
+    if (end == std::string::npos) break;
+    at = end + 1;
+  }
+  // ANTI-VACUOUS. Without these the case passes when a row is renamed away and
+  // proves nothing — the failure mode this whole row is about.
+  CHECK_MESSAGE(rows_examined == 1,
+                "expected exactly ONE LTX-2.5 'not requestable' row in docs/FEATURES.md, found "
+                    << rows_examined);
+  CHECK_MESSAGE(reachable_rows == 1,
+                "expected exactly ONE LTX-2.5 'refused by name at the call site' row in "
+                "docs/FEATURES.md, found "
+                    << reachable_rows);
+}
+
+// THE RETIREMENT NOTE'S OWN EVIDENCE, held to what upstream actually says.
+//
+// Retiring `kMultishot` rests on an ABSENCE claim about upstream, and the header
+// above the enum is where a porter reads it. That sentence shipped wrong: it said
+// the only `scene` hit upstream was PySceneDetect in the TRAINER. At
+// Lightricks/LTX-2 @ fd4ded7f `scene` has THREE senses, and the third —
+// prompt-writing guidance — lives in `ltx-core`, which ships at INFERENCE. So a
+// porter greps `scene`, finds "scene cuts" in a shipped prompt-enhancer prompt,
+// and concludes we missed a multi-shot path that our own header told them did not
+// exist. Third instance of #604 inside the row whose subject is retiring #604.
+//
+// The disposition did not move — it got STRONGER. Those prompts instruct the
+// enhancer NOT to describe scene cuts and to keep a "Single continuous take"
+// (gemma3_i2v:18, gemma3_t2v:24, gemma4_i2v:3), which is affirmative evidence
+// that no multi-shot generation mode exists.
+//
+// WHAT THIS CASE CAN AND CANNOT PROVE. It reads the shipped header and holds its
+// text, so the false sentence cannot come back and the true evidence cannot be
+// dropped. It CANNOT verify the upstream claim — no upstream checkout exists in
+// this tree — so the derivation, with the positive control in the same command,
+// lives in .agents/specs/ltx25-retire-dead-arms.md §1.1.
+TEST_CASE("ltx2 the kMultishot retirement note states the scene evidence correctly") {
+  std::ifstream in(LTX2_PIPELINE_HEADER_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << LTX2_PIPELINE_HEADER_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string header = buf.str();
+  REQUIRE(header.size() > 1000);
+
+  // The note is prose wrapped across comment lines, so every claim below is
+  // matched against a flattened copy: comment markers dropped, runs of whitespace
+  // collapsed to one space. Without this a reflow of the paragraph would silently
+  // turn every assertion vacuous.
+  std::string flat;
+  flat.reserve(header.size());
+  bool pending_space = false;
+  for (size_t i = 0; i < header.size(); ++i) {
+    const char c = header[i];
+    if (c == '/' && i + 1 < header.size() && header[i + 1] == '/') {
+      i += 1;
+      pending_space = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      pending_space = true;
+      continue;
+    }
+    if (pending_space && !flat.empty()) flat += ' ';
+    pending_space = false;
+    flat += c;
+  }
+
+  // ANTI-VACUOUS. Every assertion below is about ONE paragraph; if that paragraph
+  // is renamed or removed they all pass while proving nothing.
+  size_t notes = 0;
+  for (size_t at = flat.find("`kMultishot` — FABRICATED"); at != std::string::npos;
+       at = flat.find("`kMultishot` — FABRICATED", at + 1)) {
+    ++notes;
+  }
+  REQUIRE_MESSAGE(notes == 1,
+                  "expected exactly ONE `kMultishot` — FABRICATED retirement note in "
+                      << LTX2_PIPELINE_HEADER_PATH << ", found " << notes);
+
+  // The sentence that was false. It asserted an upstream absence from our own
+  // vocabulary, with no positive control, in a SHIPPED header.
+  CHECK_MESSAGE(flat.find("the only `scene` hit is PySceneDetect") == std::string::npos,
+                "the retired false claim is back: `scene` is not trainer-only upstream — "
+                "ltx-core's shipped gemma prompt files carry it, see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(flat.find("only `scene` hit") == std::string::npos);
+
+  // SCOPE THE POSITIVE CHECKS TO THE NOTE. Searching the whole flattened header
+  // for a positive phrase is what made the `ltx-core` assertion below structurally
+  // unable to fail: `ltx-core` occurs SIX times in this header — the upstream map
+  // at :8 and :28, `parse_model_version` at :452, `kLoraFusion` at :629, and twice
+  // inside the note — so a file-wide `find` survived deleting the clause it exists
+  // to hold. Proved by mutation: rewriting the note to say the guidance ships
+  // "inside the TRAINER ONLY" left the case GREEN at 8/8. It also never went red
+  // in this row's own red-first run (4 of 8 failed; this was not one of them).
+  //
+  // The paragraph runs from the retirement marker to the NEXT enumerator heading,
+  // derived rather than pinned to a line number, because a recorded anchor in this
+  // header went stale inside this very pull request.
+  const size_t note_at = flat.find("`kMultishot` — FABRICATED");
+  REQUIRE(note_at != std::string::npos);
+  const std::string heading_tail = "` — ";
+  size_t note_end = std::string::npos;
+  for (size_t at = flat.find("`k", note_at + 1); at != std::string::npos;
+       at = flat.find("`k", at + 1)) {
+    const size_t close = flat.find('`', at + 1);
+    if (close == std::string::npos) break;
+    if (flat.compare(close, heading_tail.size(), heading_tail) == 0) {
+      note_end = at;
+      break;
+    }
+  }
+  if (note_end == std::string::npos) note_end = flat.size();
+  const std::string note = flat.substr(note_at, note_end - note_at);
+  // ANTI-VACUOUS, again: an empty or truncated slice would pass a negative check
+  // and fail a positive one for the wrong reason. The note is a long paragraph.
+  REQUIRE_MESSAGE(note.size() > 400,
+                  "the `kMultishot` retirement note sliced to " << note.size()
+                                                                << " chars; the slice is wrong");
+
+  // And the evidence that replaced it, by the three things a porter needs: that
+  // the narrative sense is PROMPT GUIDANCE, that it ships in `ltx-core` rather
+  // than only the trainer, and that the guidance FORBIDS scene cuts.
+  //
+  // The middle one is asserted as the CLAIM, not as the package name. The axis it
+  // holds — the guidance ships at inference, it is not trainer-only — is exactly
+  // the axis that shipped false for two review rounds, and a bare `ltx-core` does
+  // not hold it: neither sibling below covers it either, since both survive the
+  // trainer-only mutation.
+  CHECK_MESSAGE(note.find("scene cuts") != std::string::npos,
+                "the retirement note must name the prompt guidance it now rests on");
+  CHECK_MESSAGE(note.find("ships at INFERENCE inside `ltx-core`") != std::string::npos,
+                "the note must state WHERE the third `scene` sense ships. Trainer-only is what "
+                "it wrongly said for two rounds, and `ltx-core` shipping at inference is the "
+                "whole reason the retirement holds — see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(note.find("system_prompt") != std::string::npos);
+}
+
+// THE MULTI-GPU MARKER'S NOTE, held to what upstream actually contains.
+//
+// Same shape as the case above and the same defect, found in the same review. The
+// header shipped "NOT CFG batching: zero `cfg` hits in either multigpu tree". At
+// LTX-2 @ fd4ded7f that is FIVE hits, not zero, and two of them are substantive
+// prose about CFG. The spec's grep was right and its PATH FILTER was wrong: it
+// covered `ltx-pipelines/src/.../multigpu/` and `ltx-core/src/.../multigpu/` and
+// therefore excluded `ltx-pipelines/docs/multigpu/`, where the answer is written
+// out. That is this row's own transferable lesson — a path filter is an absence
+// claim too — committed by the row a fourth time.
+//
+// The header is where a porter reads the claim, so the header is what this holds.
+// The derivation, with `git ls-files -- '*multigpu*'` as its positive control,
+// is .agents/specs/ltx25-retire-dead-arms.md §1.3.
+//
+// WHAT THIS CAN AND CANNOT PROVE, stated for the same reason as above: it gates
+// the TEXT, so the false sentence cannot return and the correction cannot be
+// dropped. It cannot verify the upstream fact — there is no upstream checkout in
+// this tree — and pretending otherwise is worse than saying so.
+namespace {
+
+// Comment markers dropped, whitespace runs collapsed. A reflow of the paragraph
+// must not turn an assertion vacuous, which is why nothing below matches raw
+// header text.
+std::string FlattenHeaderComments(const std::string& header) {
+  std::string flat;
+  flat.reserve(header.size());
+  bool pending_space = false;
+  for (size_t i = 0; i < header.size(); ++i) {
+    const char c = header[i];
+    if (c == '/' && i + 1 < header.size() && header[i + 1] == '/') {
+      i += 1;
+      pending_space = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      pending_space = true;
+      continue;
+    }
+    if (pending_space && !flat.empty()) flat += ' ';
+    pending_space = false;
+    flat += c;
+  }
+  return flat;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 the multi-GPU marker note states the CFG evidence correctly") {
+  std::ifstream in(LTX2_PIPELINE_HEADER_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << LTX2_PIPELINE_HEADER_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string header = buf.str();
+  REQUIRE(header.size() > 1000);
+  const std::string flat = FlattenHeaderComments(header);
+
+  // ANTI-VACUOUS: every assertion below is about the ONE enumerator comment. If
+  // it is renamed or deleted they all pass while proving nothing.
+  size_t notes = 0;
+  for (size_t at = flat.find("kMultiGpuParallelism,"); at != std::string::npos;
+       at = flat.find("kMultiGpuParallelism,", at + 1)) {
+    ++notes;
+  }
+  REQUIRE_MESSAGE(notes == 1, "expected exactly ONE `kMultiGpuParallelism` enumerator in "
+                                  << LTX2_PIPELINE_HEADER_PATH << ", found " << notes);
+
+  // The sentence that was false, in the two spellings it could come back as. An
+  // absence asserted from our own vocabulary, with no positive control, in a
+  // SHIPPED header — #604, in the row that exists to retire #604.
+  CHECK_MESSAGE(flat.find("zero `cfg` hits") == std::string::npos,
+                "the retired false claim is back: `cfg` is 5 hits across the multigpu trees at "
+                "LTX-2 @ fd4ded7f, two of them substantive prose in docs/multigpu/gemma.md. See "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.3");
+  CHECK(flat.find("zero cfg hits") == std::string::npos);
+
+  // SCOPE THE POSITIVE CHECKS TO THE NOTE. A file-wide `find` for a word like
+  // `four` is structurally unable to fail here: `kInt8ConvRot`'s own comment
+  // already says "the four inference kinds upstream defines". The note runs from
+  // its enumerator to the end of the enum, derived rather than pinned to a line
+  // number, because a recorded anchor in this header went stale mid-review.
+  const size_t note_at = flat.find("kMultiGpuParallelism,");
+  REQUIRE(note_at != std::string::npos);
+  size_t note_end = flat.find("};", note_at);
+  if (note_end == std::string::npos) note_end = flat.size();
+  const std::string note = flat.substr(note_at, note_end - note_at);
+  // ANTI-VACUOUS, again: a truncated slice passes every negative check and fails
+  // every positive one for the wrong reason.
+  REQUIRE_MESSAGE(note.size() > 200, "the kMultiGpuParallelism note sliced to "
+                                         << note.size() << " chars; the slice is wrong");
+
+  // And the evidence that replaced it: the corrected count, the form the path
+  // filter hid, and the upstream line that gives the REASON rather than an
+  // absence of a string.
+  CHECK_MESSAGE(note.find("four") != std::string::npos,
+                "the marker must state the corrected COUNT; three was an undercount produced by "
+                "a path filter, and the count is the part that was wrong");
+  CHECK_MESSAGE(note.find("BatchParallelGemmaBuilder") != std::string::npos,
+                "the marker must name the FOURTH multigpu form, which sits in the very directory "
+                "the message cites (multigpu/bp_gemma_builder.py:42)");
+  CHECK_MESSAGE(note.find("gemma.md") != std::string::npos,
+                "the marker must cite the upstream line stating the distilled pipeline runs "
+                "without CFG, which is why CFG batching is inapplicable here");
 }
 
 // ===========================================================================
@@ -1291,6 +1920,33 @@ vllm::Ltx2LatentVolume ReducedUpsamplerLatent() {
   latent.height = vllm_test::kLtx2UpsHeight;
   latent.width = vllm_test::kLtx2UpsWidth;
   latent.data = Make("ltx2.ups.latent", latent.elems(), 1.0);
+  return latent;
+}
+
+// `spatial_upsample=False, temporal_upsample=True` (model.py:68-71) — the arm
+// with `Conv3d(mid, 2*mid)` + `PixelShuffleND(1)` and the dropped first frame.
+vllm::Ltx2UpsamplerConfig TemporalUpsamplerConfig(const std::string& prefix) {
+  vllm::Ltx2UpsamplerConfig config;
+  config.in_channels = vllm_test::kLtx2UpsInChannels;
+  config.mid_channels = vllm_test::kLtx2UpsMidChannels;
+  config.num_blocks_per_stage = vllm_test::kLtx2UpsBlocksPerStage;
+  config.dims = 3;
+  config.spatial_upsample = false;
+  config.temporal_upsample = true;
+  config.prefix = prefix;
+  return config;
+}
+
+// A separate fixture from ReducedUpsamplerLatent: 3 frames, so the frame axis
+// differs from H (4) and W (6) and `2F - 1 = 5` differs from `2F = 6`.
+vllm::Ltx2LatentVolume TemporalUpsamplerLatent() {
+  vllm::Ltx2LatentVolume latent;
+  latent.batch = 1;
+  latent.channels = vllm_test::kLtx2UpsInChannels;
+  latent.frames = vllm_test::kLtx2UpsTemporalFrames;
+  latent.height = vllm_test::kLtx2UpsHeight;
+  latent.width = vllm_test::kLtx2UpsWidth;
+  latent.data = Make("ltx2.ups.temporal.latent", latent.elems(), 1.0);
   return latent;
 }
 
@@ -1411,6 +2067,45 @@ TEST_CASE("ltx2 the latent spatial upsampler reproduces upstream") {
   CHECK(vllm::kLtx2UpsamplerNormEps == 1e-5);
 }
 
+TEST_CASE("ltx2 the latent temporal upsampler reproduces upstream") {
+  // model.py:68-71 builds `Conv3d(mid, 2*mid, k=3, p=1)` + `PixelShuffleND(1)`,
+  // and :113 drops the first frame after it (:109-113 is the whole branch).
+  // Everything else in the class is
+  // the same module set the three spatial arms above already gate, so this case
+  // is aimed at exactly two things: the temporal shuffle and the slice.
+  const vllm::Ltx2UpsamplerConfig config = TemporalUpsamplerConfig("ltx2.ups.Temporal.");
+  const ParamBag bag = BuildUpsamplerParams(config);
+  // The parameter CONTRACT first. `upsampler.0.weight` here is a Conv3d kernel
+  // [2*mid, mid, 3, 3, 3]; the non-rational SPATIAL arm's identically-named
+  // tensor is a 4-D Conv2d kernel (model.py:64-66). A port that reused the
+  // spatial enumeration builds the wrong element count and dies here.
+  CheckManifest(bag, vllm_test::kLtx2UpsTemporalParamNames,
+                vllm_test::kLtx2UpsTemporalParamCounts,
+                std::size(vllm_test::kLtx2UpsTemporalParamNames));
+
+  const vllm::Ltx2LatentVolume latent = TemporalUpsamplerLatent();
+  const vllm::Ltx2LatentVolume got = vllm::Ltx2LatentUpsample(config, bag.weights, latent);
+  CHECK(got.batch == vllm_test::kLtx2UpsTemporalOutShape[0]);
+  CHECK(got.channels == vllm_test::kLtx2UpsTemporalOutShape[1]);
+  // 2F - 1, not 2F: the drop is observable in the SHAPE, so a port that kept the
+  // first frame fails here before any value is compared.
+  CHECK(got.frames == vllm_test::kLtx2UpsTemporalOutShape[2]);
+  CHECK(got.frames == vllm_test::kLtx2UpsTemporalFactor * latent.frames - 1);
+  CHECK(got.height == vllm_test::kLtx2UpsTemporalOutShape[3]);
+  CHECK(got.width == vllm_test::kLtx2UpsTemporalOutShape[4]);
+
+  const double worst = MaxAbsDiff(got.data, vllm_test::kLtx2UpsTemporalGolden,
+                                  std::size(vllm_test::kLtx2UpsTemporalGolden));
+  INFO("LatentUpsampler arm = Temporal max|diff| = ", worst);
+  CHECK(worst <= kRoundOff);
+
+  // `PixelShuffleND.__init__`'s `upscale_factors` default (pixel_shuffle.py:25),
+  // which no construction site overrides. The goldens above move WITH it if it
+  // is regenerated, so this line is the only one that compares against upstream's
+  // own signature rather than against a tensor we produced.
+  CHECK(vllm::kLtx2UpsamplerTemporalFactor == vllm_test::kLtx2UpsTemporalFactor);
+}
+
 TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   const vllm::Ltx2LatentVolume latent = ReducedUpsamplerLatent();
   const ParamBag bag = BuildUpsamplerParams(ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.x."));
@@ -1423,13 +2118,29 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
     return message;
   };
 
-  vllm::Ltx2UpsamplerConfig temporal = ReducedUpsamplerConfig(false, 2.0, "");
-  temporal.temporal_upsample = true;
-  CHECK(Mentions(refuse("temporal", temporal), "temporal"));
+  // BOTH flags — `Conv3d(mid, 8*mid)` + `PixelShuffleND(3)` (model.py:55-59), a
+  // different operator from the temporal-only arm above and still unported. The
+  // upsampler weight upstream would build for it is 8*mid, emitted by the
+  // generator off the real module so this is not gated against a remembered
+  // shape.
+  CHECK(vllm_test::kLtx2UpsSpatiotemporalUpsamplerShape[0] ==
+        8 * vllm_test::kLtx2UpsMidChannels);
+  vllm::Ltx2UpsamplerConfig spatiotemporal = ReducedUpsamplerConfig(false, 2.0, "");
+  spatiotemporal.temporal_upsample = true;
+  const std::string spatiotemporal_message = refuse("spatial+temporal", spatiotemporal);
+  CHECK(Mentions(spatiotemporal_message, "temporal"));
+  CHECK(Mentions(spatiotemporal_message, "PixelShuffleND(3)"));
 
   vllm::Ltx2UpsamplerConfig two_d = ReducedUpsamplerConfig(false, 2.0, "");
   two_d.dims = 2;
   CHECK(Mentions(refuse("dims=2", two_d), "dims"));
+
+  // dims=2 is refused for the TEMPORAL arm too, and it has to be checked
+  // separately: the two arms take different branches, so a `dims` guard placed
+  // inside the spatial branch would let a 2-D temporal config through.
+  vllm::Ltx2UpsamplerConfig temporal_two_d = TemporalUpsamplerConfig("");
+  temporal_two_d.dims = 2;
+  CHECK(Mentions(refuse("temporal dims=2", temporal_two_d), "dims"));
 
   // Upstream's own ValueError when neither flag is set (model.py:73-74).
   vllm::Ltx2UpsamplerConfig neither = ReducedUpsamplerConfig(false, 2.0, "");
@@ -1946,4 +2657,1378 @@ TEST_CASE("ltx2 the processor's binary mask mirrors a comparison that looks back
       MaxAbsDiff(all_valid.video, got.video.data(), got.video.size());
   INFO("padded rows = ", pad, " max|diff| vs an all-valid mask = ", masked_vs_unmasked);
   CHECK(masked_vs_unmasked > 0.0);
+}
+
+// ===========================================================================
+// The res_2s sampler — row LTX25-RES2S-LOOP, issue #921
+//
+// Every golden below came out of UPSTREAM'S OWN CODE at Lightricks/LTX-2
+// fd4ded7f: `phi`, `get_res2s_coefficients`, `Res2sDiffusionStep`,
+// `post_process_latent` and `res2s_audio_video_denoising_loop` were imported
+// from the checkout and run. Three things were substituted and each is one this
+// port reproduces exactly — the denoiser (a fixed quadratic), the noise DRAW
+// (`torch.randn`, whose stream this port does not have) and two media-IO modules
+// the import chain pulls in and nothing numeric touches. The generator is
+// recorded in .agents/specs/ltx25-res2s-loop.md section 5.
+// ===========================================================================
+
+namespace {
+
+double MaxAbsDiffD(const std::vector<double>& got, const double* want, size_t count) {
+  REQUIRE(got.size() == count);
+  double worst = 0.0;
+  for (size_t i = 0; i < count; ++i) worst = std::max(worst, std::fabs(got[i] - want[i]));
+  return worst;
+}
+
+// The reduced fixture every loop case below runs on: 6 elements, a denoise mask
+// that is NOT all ones, and a clean latent that differs from the state, so
+// `post_process_latent` is not the identity and a build that dropped the blend
+// fails at the masked positions rather than passing.
+struct Res2sFixture {
+  std::vector<float> video_mask, video_clean, audio_mask, audio_clean;
+  int64_t evaluations = 0;
+  std::vector<double> eval_sigmas;
+  // The `step_index` each call was handed, recorded by the DENOISER rather than
+  // read back off `Ltx2Res2sLoopStats`. Two independent records of the same
+  // fact: the stats vector says what the loop believes it passed and this one
+  // says what arrived, so a build that recorded one value and passed another is
+  // visible. It matters because `should_skip_step` reads it
+  // (guiders.py:287-291) and nothing in the returned latents does.
+  std::vector<int64_t> eval_step_indices;
+  // One counter per upstream generator (samplers.py:267-268).
+  int64_t step_draws = 0, substep_draws = 0;
+
+  Res2sFixture() {
+    const size_t n = static_cast<size_t>(vllm_test::kLtx2Res2sLatentCount);
+    video_mask.assign(vllm_test::kLtx2Res2sMask, vllm_test::kLtx2Res2sMask + n);
+    video_clean.assign(vllm_test::kLtx2Res2sClean, vllm_test::kLtx2Res2sClean + n);
+    // The generator reverses both on the audio side, so a build that fed one
+    // modality's mask to the other is visible rather than symmetric.
+    audio_mask.assign(video_mask.rbegin(), video_mask.rend());
+    audio_clean.assign(video_clean.rbegin(), video_clean.rend());
+  }
+
+  vllm::Ltx2Res2sHooks Hooks() {
+    vllm::Ltx2Res2sHooks hooks;
+    // The substituted denoiser: `0.5x + 0.25 - 0.125x^2` on video and
+    // `-0.25x + 0.1 + 0.0625x^2` on audio, in the model dtype and in the same
+    // operation order the generator used. QUADRATIC and not affine on purpose,
+    // so a build that evaluated once and reused the result cannot land on the
+    // same trajectory by luck.
+    hooks.denoise = [this](const std::vector<float>& v, const std::vector<float>& a, double sigma,
+                           int64_t step_index, std::vector<float>& dv, std::vector<float>& da) {
+      evaluations += 1;
+      eval_sigmas.push_back(sigma);
+      eval_step_indices.push_back(step_index);
+      dv.resize(v.size());
+      for (size_t i = 0; i < v.size(); ++i) {
+        dv[i] = 0.5f * v[i] + 0.25f - 0.125f * (v[i] * v[i]);
+      }
+      da.resize(a.size());
+      for (size_t i = 0; i < a.size(); ++i) {
+        da[i] = -0.25f * a[i] + 0.1f - 0.0625f * (a[i] * a[i]);
+      }
+    };
+    hooks.post_process = [this](std::vector<double> x, bool is_video) {
+      const std::vector<float>& mask = is_video ? video_mask : audio_mask;
+      const std::vector<float>& clean = is_video ? video_clean : audio_clean;
+      for (size_t i = 0; i < x.size(); ++i) {
+        const double m = static_cast<double>(mask[i]);
+        x[i] = x[i] * m + static_cast<double>(clean[i]) * (1.0 - m);
+      }
+      return x;
+    };
+    // The generator's stand-in for `torch.randn`: a fixed pattern, offset by
+    // which of upstream's two generators would have drawn it
+    // (samplers.py:267-268) and by HOW MANY draws that generator has already
+    // made.
+    //
+    // STATEFUL ON PURPOSE, because upstream's generator is. `_get_new_noise`
+    // draws from a seeded `torch.Generator` that advances, so within one step
+    // the video draw and the audio draw are different tensors and the ORDER of
+    // the two calls decides which modality receives which. MEASURED: with this
+    // hook stateless — the same values for every call — swapping the video and
+    // audio injections left this whole suite green, because both modalities were
+    // being handed identical noise. The engine's own hook draws from one
+    // `SplitMixGaussian` per stream, where that swap is a real defect.
+    hooks.new_noise = [this](int64_t count, bool /*is_video*/, bool substep) {
+      int64_t& draw = substep ? substep_draws : step_draws;
+      std::vector<double> out(static_cast<size_t>(count));
+      for (int64_t i = 0; i < count; ++i) {
+        out[static_cast<size_t>(i)] =
+            static_cast<double>((i * 7 + 3 + (substep ? 1 : 0) + 13 * draw) % 11) / 5.0 - 1.0;
+      }
+      draw += 1;
+      return out;
+    };
+    return hooks;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("ltx2 res2s phi mirrors upstream AT THE SMALL-Z CLIFF") {
+  // THE POINT OF THIS CASE IS THAT A BETTER IMPLEMENTATION FAILS IT.
+  //
+  // `phi` (res2s.py:4-22) guards only `abs(z) < 1e-10` and otherwise evaluates
+  // `(exp(z) - remainder) / z^j` directly, which cancels catastrophically just
+  // outside the guard. Upstream's own phi2(-1e-10) is 0.0 and its phi2(-1e-8) is
+  // 1.1102230246251563. A port that used a Taylor series near zero — the
+  // numerically correct thing to do — returns 0.5 at both and DIVERGES FROM THE
+  // MODEL'S OWN RUNTIME. Asserted EXACTLY, not within a tolerance, because a
+  // tolerance wide enough to cover the cancellation would accept the series.
+  REQUIRE(vllm_test::kLtx2PhiCount == 14);
+  for (int64_t i = 0; i < vllm_test::kLtx2PhiCount; ++i) {
+    const double z = vllm_test::kLtx2PhiZ[i];
+    const double got1 = vllm::Ltx2Phi(1, z);
+    const double got2 = vllm::Ltx2Phi(2, z);
+    INFO("z = ", z, " phi1 got = ", got1, " want = ", vllm_test::kLtx2Phi1[i],
+         " phi2 got = ", got2, " want = ", vllm_test::kLtx2Phi2[i]);
+    CHECK(got1 == vllm_test::kLtx2Phi1[i]);
+    CHECK(got2 == vllm_test::kLtx2Phi2[i]);
+  }
+
+  // The threshold is EXACTLY 1e-10 and STRICT, so these two neighbouring inputs
+  // land on opposite branches. Stated apart from the sweep because it is the one
+  // constant the whole function turns on, and a sweep that happened to omit one
+  // side would not say so.
+  CHECK(vllm::Ltx2Phi(2, -1e-11) == 0.5);
+  CHECK(vllm::Ltx2Phi(2, -1e-10) == 0.0);
+  // phi_j(0) = 1/j! past the two values the coefficients use, so the factorial
+  // is gated rather than being correct only where it is inlined.
+  CHECK(vllm::Ltx2Phi(3, 0.0) == 1.0 / 6.0);
+  CHECK(vllm::Ltx2Phi(4, 0.0) == 1.0 / 24.0);
+  // j < 1 is not a value upstream's callers produce (res2s.py:49, :55, :59 pass
+  // 1 and 2), so it is refused rather than returning a plausible number.
+  CHECK_FALSE(RefusalMessage([] { (void)vllm::Ltx2Phi(0, -0.5); }).empty());
+}
+
+TEST_CASE("ltx2 res2s coefficients mirror upstream, cliff included") {
+  REQUIRE(vllm_test::kLtx2Res2sCoeffCount == 11);
+  for (int64_t i = 0; i < vllm_test::kLtx2Res2sCoeffCount; ++i) {
+    const double h = vllm_test::kLtx2Res2sCoeffH[i];
+    vllm::Ltx2PhiCache cache;
+    const vllm::Ltx2Res2sCoefficients got = vllm::Ltx2GetRes2sCoefficients(h, cache, 0.5);
+    INFO("h = ", h, " a21 = ", got.a21, " b1 = ", got.b1, " b2 = ", got.b2);
+    CHECK(got.a21 == vllm_test::kLtx2Res2sCoeffA21[i]);
+    CHECK(got.b1 == vllm_test::kLtx2Res2sCoeffB1[i]);
+    CHECK(got.b2 == vllm_test::kLtx2Res2sCoeffB2[i]);
+    // res2s.py:39 — three entries per distinct h: (1, -h*c2), (2, -h), (1, -h).
+    // Asserted because the cache is a mirrored STRUCTURE that changes no value,
+    // so nothing else here would notice it disappearing.
+    CHECK(cache.size() == 3u);
+    CHECK(cache.count(std::pair<int64_t, double>{1, -h * 0.5}) == 1u);
+    CHECK(cache.count(std::pair<int64_t, double>{1, -h}) == 1u);
+    CHECK(cache.count(std::pair<int64_t, double>{2, -h}) == 1u);
+  }
+
+  // The cliff carried INTO the coefficients, which is where it bites: at
+  // h = 1e-10 upstream's b2 collapses to 0 and b1 becomes phi1's own
+  // cancellation residue. A "fixed" phi gives b2 = 1.0 and b1 = 0.0 here.
+  vllm::Ltx2PhiCache cache;
+  const vllm::Ltx2Res2sCoefficients cliff = vllm::Ltx2GetRes2sCoefficients(1e-10, cache, 0.5);
+  CHECK(cliff.b2 == 0.0);
+  CHECK(cliff.b1 == 1.000000082740371);
+
+  // A cache SHARED across calls returns what a fresh one does. Upstream relies
+  // on this by threading one cache through the whole loop (samplers.py:287), and
+  // a keying defect — dropping `j`, say — shows here and nowhere else.
+  vllm::Ltx2PhiCache shared;
+  for (int64_t i = 0; i < vllm_test::kLtx2Res2sCoeffCount; ++i) {
+    const vllm::Ltx2Res2sCoefficients got =
+        vllm::Ltx2GetRes2sCoefficients(vllm_test::kLtx2Res2sCoeffH[i], shared, 0.5);
+    CHECK(got.a21 == vllm_test::kLtx2Res2sCoeffA21[i]);
+    CHECK(got.b1 == vllm_test::kLtx2Res2sCoeffB1[i]);
+    CHECK(got.b2 == vllm_test::kLtx2Res2sCoeffB2[i]);
+  }
+  // THIRTY, not thirty-three, and the shortfall is the cache doing its job.
+  // Three of these h values are twice another, and `a21` asks for phi at
+  // `-h * 0.5` while `b1` asks for it at `-h`: h = 0.25 reuses the entry
+  // h = 0.125 made, h = 0.5 reuses h = 0.25's, and h = 1.0 reuses h = 0.5's.
+  // So 11 * 3 - 3 = 30. Asserted as the exact number rather than as an
+  // inequality, because "fewer than 33" is also what a cache keyed on `neg_h`
+  // ALONE would report — and that cache would return phi_1 where phi_2 was
+  // asked for. The `count()` assertions in the sweep above pin the key's shape;
+  // this pins how many survived sharing.
+  CHECK(shared.size() == 30u);
+}
+
+TEST_CASE("ltx2 res2s the loop NORMALIZES its noise, unlike the ancestral loop") {
+  // `_get_new_noise` (samplers.py:164-170) against `_get_plain_noise`
+  // (:155-157). The res_2s loop defaults to the first and the ancestral loop to
+  // the second, ten lines apart in one file, so reading one off the other drops
+  // this step and nothing about the rendered clip says so.
+  const size_t n = static_cast<size_t>(vllm_test::kLtx2Res2sLatentCount);
+  const std::vector<double> raw(vllm_test::kLtx2Res2sNoiseRaw,
+                                vllm_test::kLtx2Res2sNoiseRaw + n);
+  const std::vector<double> got = vllm::Ltx2Res2sNormalizeNoise(raw);
+  const double worst = MaxAbsDiffD(got, vllm_test::kLtx2Res2sNoiseNormalized, n);
+  INFO("max|diff| against upstream's own _channelwise_normalize = ", worst);
+  CHECK(worst < 1e-12);
+
+  // THE EXPECTED VALUE IS NOT REACHABLE BY ACCIDENT, three ways. A pass-through
+  // returns `raw`, which is far from the golden; the golden's mean is 0 and its
+  // unbiased standard deviation is 1, and neither is true of the input.
+  CHECK(MaxAbsDiffD(raw, vllm_test::kLtx2Res2sNoiseNormalized, n) > 0.5);
+  double sum = 0.0, sq = 0.0;
+  for (const double v : got) sum += v;
+  for (const double v : got) sq += (v - sum / static_cast<double>(n)) * (v - sum / static_cast<double>(n));
+  CHECK(std::fabs(sum) < 1e-12);
+  CHECK(std::fabs(std::sqrt(sq / static_cast<double>(n - 1)) - 1.0) < 1e-12);
+  // A zero-filled buffer has no standard deviation to divide by, so it must NOT
+  // reproduce the golden — the shape a sibling row's width test passed on.
+  //
+  // ASSERTED ON `isnan` AND NOT THROUGH `MaxAbsDiffD`, because the distance
+  // instrument cannot see this. `std::max(worst, NaN)` returns `worst`, so a
+  // buffer of NaNs measures as max|diff| = 0 and the control reads as "the zeros
+  // reproduced the golden exactly" — which is how this assertion first passed
+  // for the opposite of its stated reason. This file's own header records the
+  // same NaN drop in `MaxAbsDiff`; the lesson had to be re-learned here.
+  const std::vector<double> zeros(n, 0.0);
+  const std::vector<double> from_zeros = vllm::Ltx2Res2sNormalizeNoise(zeros);
+  CHECK(std::isnan(from_zeros[0]));
+  CHECK_FALSE(std::isnan(got[0]));
+  // Fewer than two elements has no unbiased standard deviation, so it is refused
+  // rather than dividing by zero and handing the sampler a NaN latent.
+  CHECK_FALSE(
+      RefusalMessage([] { (void)vllm::Ltx2Res2sNormalizeNoise(std::vector<double>{1.0}); })
+          .empty());
+}
+
+TEST_CASE("ltx2 res2s the SDE coefficients run at TWO widths, as upstream hands them") {
+  // `Res2sDiffusionStep.get_sde_coeff` has no dtype of its own, and the res_2s
+  // loop reaches it at two: the SUBSTEP injection is handed
+  // `torch.stack([sigma, sub_sigma])`, both `hp` (samplers.py:342), and the STEP
+  // injection is handed the loop's own schedule, which `DiffusionStage` created
+  // as float32 (ti2vid_two_stages_hq.py:268, samplers.py:415).
+  //
+  // THE TWO ARMS MUST DISAGREE, or the split is a comment rather than a
+  // behaviour. They disagree by about one part in 1e7, which is exactly why the
+  // loop golden above needed a one-ulp bound to see it and why this case exists
+  // beside it: a golden that cannot separate two implementations is not gating
+  // the choice between them.
+  const double sigma_next = 0.62;
+  const double sigma_up = sigma_next * 0.5;
+  const vllm::Ltx2SdeCoeff f32 = vllm::Ltx2Res2sSdeCoeff(sigma_next, sigma_up);
+  const vllm::Ltx2SdeCoeff f64 = vllm::Ltx2Res2sSdeCoeffHp(sigma_next, sigma_up);
+  INFO("f32 alpha_ratio = ", f32.alpha_ratio, " f64 alpha_ratio = ", f64.alpha_ratio,
+       " f32 sigma_down = ", f32.sigma_down, " f64 sigma_down = ", f64.sigma_down);
+  CHECK(f32.alpha_ratio != f64.alpha_ratio);
+  CHECK(f32.sigma_down != f64.sigma_down);
+  // ...and they agree to float32 precision, so "they differ" is not a defect in
+  // one of them.
+  CHECK(std::fabs(f32.alpha_ratio - f64.alpha_ratio) < 1e-6);
+  CHECK(std::fabs(f32.sigma_down - f64.sigma_down) < 1e-6);
+  // `sigma_up` is clamped IN before anything else (diffusion_steps.py:138), on
+  // both arms.
+  const vllm::Ltx2SdeCoeff clamped = vllm::Ltx2Res2sSdeCoeffHp(0.5, 2.0);
+  CHECK(clamped.sigma_up <= 0.5 * vllm::kLtx2Res2sSigmaUpClamp);
+  // The float64 arm computes the residual in float64, so at the clamp boundary
+  // it is NOT the float32 arm's value — the residual scales as
+  // sqrt(1 - clamp^2), which is where the two widths part most visibly.
+  CHECK(vllm::Ltx2Res2sSdeCoeff(0.5, 2.0).sigma_down != clamped.sigma_down);
+}
+
+TEST_CASE("ltx2 res2s the loop evaluates the transformer TWICE per step") {
+  // THE DISCRIMINATOR THIS WHOLE ROW RESTS ON.
+  //
+  // The res_2s sampler calls the denoiser at `sigmas[i]` (samplers.py:301) and
+  // again at `sqrt(sigma * sigma_next)` (:315, :380-386), plus once more at the
+  // injected terminal sigma (:437). The already-shipped Euler arm calls it ONCE
+  // per step. The two return a clip of the same shape, the same frame count and
+  // the same sample rate, so this count is the only thing that separates them.
+  //
+  // The expected numbers are 6 and 9, chosen so that no stub reaches them: a
+  // build that evaluates nothing reports 0, a build that evaluates once per step
+  // reports 3 and 4, and `2 * steps` alone reports 8 on the terminal fixture.
+  struct Case {
+    const char* tag;
+    const float* sigmas;
+    int64_t sigma_count;
+    int64_t evaluations;
+    const double* eval_sigmas;
+    const int64_t* eval_step_indices;
+    int64_t full_steps;
+  };
+  const Case cases[] = {
+      {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount,
+       vllm_test::kLtx2Res2sBongOnEvaluations, vllm_test::kLtx2Res2sBongOnEvalSigmas,
+       vllm_test::kLtx2Res2sBongOnEvalStepIndices, 3},
+      {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
+       vllm_test::kLtx2Res2sBongOffByHSigmaCount, vllm_test::kLtx2Res2sBongOffByHEvaluations,
+       vllm_test::kLtx2Res2sBongOffByHEvalSigmas,
+       vllm_test::kLtx2Res2sBongOffByHEvalStepIndices, 3},
+      {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvaluations,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvalSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvalStepIndices, 3},
+      {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroSigmaCount,
+       vllm_test::kLtx2Res2sTerminalZeroEvaluations,
+       vllm_test::kLtx2Res2sTerminalZeroEvalSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroEvalStepIndices, 4},
+  };
+
+  for (const Case& c : cases) {
+    Res2sFixture fixture;
+    const std::vector<float> sigmas(c.sigmas, c.sigmas + c.sigma_count);
+    vllm::Ltx2Res2sModality video{
+        std::vector<float>(vllm_test::kLtx2Res2sVideo0,
+                           vllm_test::kLtx2Res2sVideo0 + vllm_test::kLtx2Res2sLatentCount),
+        true};
+    vllm::Ltx2Res2sModality audio{
+        std::vector<float>(vllm_test::kLtx2Res2sAudio0,
+                           vllm_test::kLtx2Res2sAudio0 + vllm_test::kLtx2Res2sLatentCount),
+        true};
+    const vllm::Ltx2Res2sLoopStats stats =
+        vllm::Ltx2Res2sDenoisingLoop(sigmas, video, audio, fixture.Hooks());
+
+    INFO("fixture = ", c.tag, " evaluations = ", stats.evaluations, " want ", c.evaluations);
+    // Upstream's count, measured by running upstream's loop with a counting
+    // denoiser. The loop's own tally and the hook's own tally must AGREE, so a
+    // build that reported the number without running the forwards fails.
+    CHECK(stats.evaluations == c.evaluations);
+    CHECK(fixture.evaluations == c.evaluations);
+    CHECK(stats.full_steps == c.full_steps);
+    // ...and it is not the first-order count. Asserted as an inequality against
+    // the step count so the case cannot pass by both numbers happening to match.
+    CHECK(stats.evaluations > 2 * stats.full_steps - 1);
+    CHECK(stats.evaluations != stats.full_steps);
+
+    // THE SIGMAS THEMSELVES, so a build that ran two forwards at the SAME sigma
+    // — which would keep the count right and the sampler wrong — fails here.
+    REQUIRE(stats.eval_sigmas.size() == static_cast<size_t>(c.evaluations));
+    REQUIRE(fixture.eval_sigmas.size() == static_cast<size_t>(c.evaluations));
+    for (int64_t i = 0; i < c.evaluations; ++i) {
+      INFO("fixture = ", c.tag, " evaluation ", i, " at sigma ", stats.eval_sigmas[i],
+           " want ", c.eval_sigmas[i]);
+      CHECK(std::fabs(stats.eval_sigmas[i] - c.eval_sigmas[i]) < 1e-12);
+      CHECK(stats.eval_sigmas[i] == fixture.eval_sigmas[i]);
+    }
+    // Every ODD entry is the geometric mean of its neighbours — `sqrt(sigma *
+    // sigma_next)`, upstream's "hardcode for c2 = 0.5" (samplers.py:314-315).
+    // Derived here rather than only read from the golden, so the golden and the
+    // rule check each other.
+    for (int64_t i = 0; i + 1 < c.full_steps * 2; i += 2) {
+      const double sigma = static_cast<double>(sigmas[static_cast<size_t>(i / 2)]);
+      const double next = (i / 2 + 1 < c.sigma_count - 1 || sigmas[c.sigma_count - 1] != 0.0f)
+                              ? static_cast<double>(sigmas[static_cast<size_t>(i / 2 + 1)])
+                              : static_cast<double>(vllm::kLtx2Res2sTerminalSigma);
+      CHECK(std::fabs(stats.eval_sigmas[i + 1] - std::sqrt(sigma * next)) < 1e-9);
+    }
+
+    // THE `step_index` EACH EVALUATION WAS HANDED, which is a SECOND argument
+    // upstream's `Denoiser` takes and which nothing about the returned latents,
+    // the evaluation count or a rendered frame records. Upstream passes three
+    // different things for it — `step_idx` at the first evaluation
+    // (samplers.py:301), a LITERAL 0 at the substep (samplers.py:385, beside a
+    // one-element schedule) and `n_full_steps` at the terminal one
+    // (samplers.py:437) — and the goldens carry the sequence upstream's own loop
+    // produced.
+    //
+    // IT IS NOT COSMETIC. The denoiser reads it through `should_skip_step`,
+    // which is `step % (skip_step + 1) != 0` (guiders.py:287-291). At the HQ
+    // preset's `skip_step = 0` every value behaves alike, so this whole
+    // distinction is INERT on the shipped arm — and it is live the moment a
+    // request sets `video_skip_step`, where passing the loop counter at the
+    // substep would skip half of a res_2s step's evaluations and render the
+    // first-order trajectory under the second-order sampler's schedule.
+    //
+    // Asserted against BOTH records: `stats` says what the loop believes it
+    // passed and `fixture` says what arrived, so a build that recorded one value
+    // and passed another fails rather than agreeing with itself.
+    REQUIRE(stats.eval_step_indices.size() == static_cast<size_t>(c.evaluations));
+    REQUIRE(fixture.eval_step_indices.size() == static_cast<size_t>(c.evaluations));
+    for (int64_t i = 0; i < c.evaluations; ++i) {
+      INFO("fixture = ", c.tag, " evaluation ", i, " step_index ", stats.eval_step_indices[i],
+           " want ", c.eval_step_indices[i]);
+      CHECK(stats.eval_step_indices[i] == c.eval_step_indices[i]);
+      CHECK(fixture.eval_step_indices[i] == c.eval_step_indices[i]);
+    }
+    // And the RULE the goldens encode, derived here rather than only read, so
+    // the two check each other: every substep evaluation is at index 0, every
+    // full-step evaluation is at its own step, and the terminal one is at
+    // `n_full_steps`.
+    for (int64_t step = 0; step < c.full_steps; ++step) {
+      CHECK(stats.eval_step_indices[2 * step] == step);
+      CHECK(stats.eval_step_indices[2 * step + 1] == 0);
+    }
+    if (c.evaluations == 2 * c.full_steps + 1) {
+      CHECK(stats.eval_step_indices[c.evaluations - 1] == c.full_steps);
+    }
+  }
+}
+
+TEST_CASE("ltx2 res2s the bong refinement runs in its own branch and nowhere else") {
+  // `bongmath and h < 0.5 and sigma > 0.03` (samplers.py:357), with both
+  // comparisons STRICT. Each branch is forced by a fixture that CANNOT be
+  // satisfying the other condition:
+  //
+  //   BongOn         h = 0.118, 0.134, 0.121   sigma = 0.9 .. 0.62   -> runs
+  //   BongOffByH     h = 0.588, 0.693, 0.734   sigma = 0.9 .. 0.12   -> h blocks it
+  //   BongOffBySigma h = 0.069, 0.074, 0.039   sigma = 0.03 .. 0.025 -> sigma blocks it
+  //
+  // The `h` fixture keeps every sigma above 0.03 and the sigma fixture keeps
+  // every h below 0.5, so neither is off for the other's reason.
+  //
+  // WHAT THIS CASE DOES *NOT* GATE, stated because it was claimed here and was
+  // false. The sigma fixture starts at the literal 0.03, and that was written as
+  // "pinning the inequality as strict". It does not. The schedule is float32, so
+  // `0.03f` widens to 0.029999999329447746, which is BELOW the double 0.03 the
+  // guard compares against — the boundary is a value no float32 schedule can
+  // hold, so `>` and `>=` are indistinguishable through this loop's interface.
+  // MEASURED: relaxing the guard to `>=` leaves this case green (mutation M5 in
+  // .agents/specs/ltx25-res2s-loop.md section 8). Upstream compares the same
+  // widened float32 against the same Python float (samplers.py:357), so the
+  // strictness is unobservable THERE too and no fixture can be built for it.
+  // Recorded as ungated rather than left reading as covered.
+  struct Case {
+    const char* tag;
+    const float* sigmas;
+    int64_t sigma_count;
+    int64_t bong_steps;
+    bool bong_moved;
+    const float* no_bong_video;
+  };
+  const Case cases[] = {
+      {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount, 3,
+       vllm_test::kLtx2Res2sBongOnBongMoved, vllm_test::kLtx2Res2sBongOnNoBongVideo},
+      {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
+       vllm_test::kLtx2Res2sBongOffByHSigmaCount, 0,
+       vllm_test::kLtx2Res2sBongOffByHBongMoved, vllm_test::kLtx2Res2sBongOffByHNoBongVideo},
+      {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount, 0,
+       vllm_test::kLtx2Res2sBongOffBySigmaBongMoved,
+       vllm_test::kLtx2Res2sBongOffBySigmaNoBongVideo},
+      {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroSigmaCount, 2,
+       vllm_test::kLtx2Res2sTerminalZeroBongMoved,
+       vllm_test::kLtx2Res2sTerminalZeroNoBongVideo},
+  };
+
+  for (const Case& c : cases) {
+    const std::vector<float> sigmas(c.sigmas, c.sigmas + c.sigma_count);
+    const auto run = [&](bool bongmath) {
+      Res2sFixture fixture;
+      vllm::Ltx2Res2sModality video{
+          std::vector<float>(vllm_test::kLtx2Res2sVideo0,
+                             vllm_test::kLtx2Res2sVideo0 + vllm_test::kLtx2Res2sLatentCount),
+          true};
+      vllm::Ltx2Res2sModality audio{
+          std::vector<float>(vllm_test::kLtx2Res2sAudio0,
+                             vllm_test::kLtx2Res2sAudio0 + vllm_test::kLtx2Res2sLatentCount),
+          true};
+      vllm::Ltx2Res2sLoopParams params;
+      params.bongmath = bongmath;
+      const vllm::Ltx2Res2sLoopStats stats =
+          vllm::Ltx2Res2sDenoisingLoop(sigmas, video, audio, fixture.Hooks(), params);
+      return std::pair<std::vector<float>, vllm::Ltx2Res2sLoopStats>{video.latent, stats};
+    };
+
+    const auto on = run(true);
+    const auto off = run(false);
+    INFO("fixture = ", c.tag, " bong steps = ", on.second.bong_steps, " want ", c.bong_steps);
+    // WHICH STEPS refined, counted. A build whose guard used `<=` on either
+    // comparison, or `or` for `and`, reports a different number here even where
+    // the latents happen to agree.
+    CHECK(on.second.bong_steps == c.bong_steps);
+    CHECK(off.second.bong_steps == 0);
+    // Turning the refinement off never changes how many forwards ran, which is
+    // why the evaluation count above cannot see this branch at all.
+    CHECK(on.second.evaluations == off.second.evaluations);
+
+    // The refinement's EFFECT, against upstream's own bongmath=False run rather
+    // than against a value this port computed. `bong_moved` came out of the
+    // generator, so "it changed the result" is upstream's observation.
+    const double moved = MaxAbsDiff(on.first, off.first.data(), off.first.size());
+    INFO("fixture = ", c.tag, " max|on - off| = ", moved, " upstream says moved = ",
+         c.bong_moved);
+    CHECK((moved > 0.0) == c.bong_moved);
+    // ...and the bongmath=False arm matches upstream's bongmath=False output, so
+    // "identical" is not being satisfied by both arms being broken the same way.
+    const double against_upstream =
+        MaxAbsDiff(off.first, c.no_bong_video, off.first.size());
+    INFO("fixture = ", c.tag, " max|diff| vs upstream (bongmath off) = ", against_upstream);
+    CHECK(against_upstream < kRoundOff);
+  }
+}
+
+TEST_CASE("ltx2 res2s the loop reproduces upstream") {
+  // THE BOUND IS ONE f32 ulp, NOT THIS FILE'S `kRoundOff`.
+  //
+  // Measured against upstream's own loop output, three of the five fixtures come
+  // back BIT-EXACT and the other two move by 2.98e-08, which is one ulp at 0.5.
+  // The bound is set there on purpose. At `kRoundOff` (5e-6) this case cannot
+  // see the float32/float64 split the step-level SDE coefficients run at
+  // (samplers.py:415 against :342), which shifts the result by about 1e-7
+  // relative — MEASURED: with the split collapsed onto float64 this case stayed
+  // GREEN at 5e-6 and REDS at 1e-7. A tolerance is a claim about how much
+  // disagreement is round-off, and 5e-6 was a claim this port could not defend.
+  constexpr double kOneUlp = 1e-7;
+  struct Case {
+    const char* tag;
+    const float* sigmas;
+    int64_t sigma_count;
+    double eta;
+    const float* video;
+    const float* audio;
+  };
+  const Case cases[] = {
+      {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount,
+       vllm_test::kLtx2Res2sBongOnEta, vllm_test::kLtx2Res2sBongOnVideo,
+       vllm_test::kLtx2Res2sBongOnAudio},
+      {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
+       vllm_test::kLtx2Res2sBongOffByHSigmaCount, vllm_test::kLtx2Res2sBongOffByHEta,
+       vllm_test::kLtx2Res2sBongOffByHVideo, vllm_test::kLtx2Res2sBongOffByHAudio},
+      {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount, vllm_test::kLtx2Res2sBongOffBySigmaEta,
+       vllm_test::kLtx2Res2sBongOffBySigmaVideo, vllm_test::kLtx2Res2sBongOffBySigmaAudio},
+      {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroSigmaCount, vllm_test::kLtx2Res2sTerminalZeroEta,
+       vllm_test::kLtx2Res2sTerminalZeroVideo, vllm_test::kLtx2Res2sTerminalZeroAudio},
+      // THE ONLY FIXTURE THAT SEPARATES THE TWO ETAS. The substep injection is
+      // pinned at 0.5 whatever the loop's own eta is (samplers.py:273-274), and
+      // with the loop at its own default of 0.5 the two are the same number, so
+      // a build that read `eta` at the substep is INVISIBLE on every fixture
+      // above. MEASURED: that build stayed green on all four before this row
+      // was added.
+      {"Eta1", vllm_test::kLtx2Res2sEta1Sigmas, vllm_test::kLtx2Res2sEta1SigmaCount,
+       vllm_test::kLtx2Res2sEta1Eta, vllm_test::kLtx2Res2sEta1Video,
+       vllm_test::kLtx2Res2sEta1Audio},
+  };
+
+  const size_t n = static_cast<size_t>(vllm_test::kLtx2Res2sLatentCount);
+  for (const Case& c : cases) {
+    Res2sFixture fixture;
+    const std::vector<float> sigmas(c.sigmas, c.sigmas + c.sigma_count);
+    vllm::Ltx2Res2sModality video{
+        std::vector<float>(vllm_test::kLtx2Res2sVideo0, vllm_test::kLtx2Res2sVideo0 + n), true};
+    vllm::Ltx2Res2sModality audio{
+        std::vector<float>(vllm_test::kLtx2Res2sAudio0, vllm_test::kLtx2Res2sAudio0 + n), true};
+    vllm::Ltx2Res2sLoopParams params;
+    params.eta = c.eta;
+    (void)vllm::Ltx2Res2sDenoisingLoop(sigmas, video, audio, fixture.Hooks(), params);
+
+    const double vworst = MaxAbsDiff(video.latent, c.video, n);
+    const double aworst = MaxAbsDiff(audio.latent, c.audio, n);
+    INFO("fixture = ", c.tag, " eta = ", c.eta, " video max|diff| = ", vworst,
+         " audio max|diff| = ", aworst);
+    CHECK(vworst < kOneUlp);
+    CHECK(aworst < kOneUlp);
+
+    // `post_process_latent` IS APPLIED, and the fixture's mask is what makes
+    // that checkable: at the two positions the video mask zeroes, the result
+    // must be the CLEAN latent exactly, whatever the sampler did. A build that
+    // dropped the blend returns a denoised value there and fails.
+    for (size_t i = 0; i < n; ++i) {
+      if (vllm_test::kLtx2Res2sMask[i] != 0.0f) continue;
+      INFO("fixture = ", c.tag, " masked video position ", i);
+      CHECK(video.latent[i] == vllm_test::kLtx2Res2sClean[i]);
+    }
+    // The two modalities did not receive each other's mask: the audio mask is
+    // the video one reversed, so the positions that must hold `clean` differ.
+    for (size_t i = 0; i < n; ++i) {
+      if (vllm_test::kLtx2Res2sMask[n - 1 - i] != 0.0f) continue;
+      INFO("fixture = ", c.tag, " masked audio position ", i);
+      CHECK(audio.latent[i] == vllm_test::kLtx2Res2sClean[n - 1 - i]);
+    }
+  }
+
+  // A loop with no modality at all is refused (samplers.py:258-259), rather than
+  // returning two empty latents that a caller would decode into a blank clip.
+  Res2sFixture fixture;
+  vllm::Ltx2Res2sModality absent_v{{}, false}, absent_a{{}, false};
+  const std::vector<float> sigmas{1.0f, 0.5f, 0.0f};
+  const std::string refusal = RefusalMessage(
+      [&] { (void)vllm::Ltx2Res2sDenoisingLoop(sigmas, absent_v, absent_a, fixture.Hooks()); });
+  INFO("refusal = ", refusal);
+  CHECK_FALSE(refusal.empty());
+  CHECK(Mentions(refusal, "samplers.py:258-259"));
+}
+
+TEST_CASE("ltx2 the res2s_two_stage recipe is upstream's HQ preset") {
+  const vllm::Ltx2PipelineRecipe hq = vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", "2.5");
+  REQUIRE(hq.phases.size() == 2u);
+
+  // THE THING THAT MAKES IT HQ. `stepper=Res2sDiffusionStep()` and
+  // `loop=res2s_audio_video_denoising_loop` on BOTH stages
+  // (ti2vid_two_stages_hq.py:258, :285/:292, :319/:335). Asserted against the
+  // distilled two-stage recipe in the same case, which selects a DIFFERENT
+  // sampler on each of its phases, so this cannot pass by every recipe having
+  // the same value.
+  CHECK(hq.phases[0].stepper == vllm::Ltx2StepperKind::kRes2s);
+  CHECK(hq.phases[1].stepper == vllm::Ltx2StepperKind::kRes2s);
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(distilled.phases[1].stepper == vllm::Ltx2StepperKind::kEuler);
+
+  // LTX_2_3_HQ_PARAMS (constants.py:95-115): 15 steps, STG OFF on both
+  // modalities, video rescale 0.45 and audio rescale 1.0. Fifteen against the
+  // 2.4 lineage's thirty is the whole economics of the preset — half the steps,
+  // twice the evaluations each.
+  CHECK(hq.num_inference_steps == 15);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").num_inference_steps == 30);
+  CHECK(hq.phases[0].video_guidance.stg_scale == 0.0);
+  CHECK(hq.phases[0].audio_guidance.stg_scale == 0.0);
+  CHECK(hq.phases[0].video_guidance.stg_blocks.empty());
+  CHECK(hq.phases[0].audio_guidance.stg_blocks.empty());
+  CHECK(hq.phases[0].video_guidance.cfg_scale == 3.0);
+  CHECK(hq.phases[0].audio_guidance.cfg_scale == 7.0);
+  CHECK(hq.phases[0].video_guidance.rescale_scale == 0.45);
+  CHECK(hq.phases[0].audio_guidance.rescale_scale == 1.0);
+
+  // Stage 1 halves (:238-243) and DERIVES its schedule from
+  // `num_inference_steps` (:260-267) — the one place this recipe differs in KIND
+  // from the distilled two-stage one, whose stage 1 carries frozen sigmas.
+  CHECK(hq.phases[0].spatial_downscale == 2);
+  CHECK(hq.phases[0].sigmas.empty());
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());
+  CHECK(hq.allow_request_sigmas);
+  CHECK_FALSE(hq.fixed_num_inference_steps);
+
+  // Stage 2 upsamples (:297), takes STAGE_2_DISTILLED_SIGMAS by DEFAULT ARGUMENT
+  // (:193), re-noises to its own first sigma (:327, :332) and runs a
+  // `SimpleDenoiser` (:316) that no request may re-arm.
+  CHECK(hq.phases[1].spatial_downscale == 1);
+  CHECK(hq.phases[1].input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  CHECK(hq.phases[1].sigmas == distilled.phases[1].sigmas);
+  CHECK(hq.phases[1].noise_scale == hq.phases[1].sigmas.front());
+  CHECK_FALSE(hq.phases[1].allow_guidance_override);
+
+  // :313-315, :339 — "Stage 2 refines video only; discard its audio". The audio
+  // that leaves is STAGE 1's, and taking stage 2's would decode a soundtrack the
+  // pipeline throws away: finite, the right length, the wrong take.
+  CHECK(hq.video_output_phase == 1);
+  CHECK(hq.audio_output_phase == 0);
+
+  // :210 — the prompt encoder is handed `[prompt, negative_prompt]` and stage 1
+  // builds a `GuidedDenoiser` with the negative encoding, so unlike the
+  // distilled arm this pipeline HAS a negative prompt.
+  CHECK(hq.allow_negative_prompt);
+  CHECK_FALSE(hq.negative_prompt.empty());
+  CHECK(distilled.negative_prompt.empty());
+
+  // The geometry is the FINAL output's; stage 1 runs at half of it.
+  // `assert_resolution(is_two_stage=True)` (:199) is what the engine then
+  // enforces against a request.
+  CHECK(hq.max_spatial_downscale() == 2);
+
+  // 2.5 ONLY. `LTX_2_3_HQ_PARAMS` is a plain constant with no `detect_params`
+  // lineage (constants.py:91-94), so there is no second version to resolve it
+  // onto and every other pair still refuses BY NAME.
+  for (const std::string& version : {std::string("2"), std::string("2.3"), std::string("2.4"),
+                                     std::string("2.6")}) {
+    const std::string message = RefusalMessage(
+        [&] { (void)vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", version); });
+    INFO("version = ", version, " refusal = ", message);
+    CHECK_FALSE(message.empty());
+    CHECK(Mentions(message, "Unsupported LTX pipeline kind/version"));
+    CHECK(Mentions(message, version));
+  }
+}
+
+// ─── LTX25-A2VID-RECIPE (#1117) ──────────────────────────────────────────────
+
+TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled one") {
+  // EVERY FIELD HERE RENDERS WHETHER IT IS RIGHT OR WRONG. A wrong sigma set, a
+  // wrong downscale, a wrong stepper and a wrong guider all produce a finished
+  // clip of the right size, frame count and sample rate, so each is asserted
+  // against its own upstream anchor rather than against a neighbouring recipe.
+  const vllm::Ltx2PipelineRecipe a2v =
+      vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe one = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(a2v.phases.size() == 2u);
+
+  // ── stage 1 (a2vid_two_stage.py:225-258) ──────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s1 = a2v.phases[0];
+  CHECK(s1.name == "stage_1");
+  // `width // 2, height // 2` (:206-212), which is also what makes
+  // `assert_resolution(is_two_stage=True)` (:168) the 64-divisor arm.
+  CHECK(s1.spatial_downscale == 2);
+  CHECK(a2v.max_spatial_downscale() == 2);
+  CHECK(s1.input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+  // `self._scheduler.execute(steps=num_inference_steps)` (:225-227): DERIVED at
+  // run time. The distilled recipe's stage 1 carries a frozen 9-sigma list, and
+  // handing that to a full model that was never distilled is the difference
+  // between 30 steps and 8 on the 2.5 row resolved above — LTX_2_3_PARAMS sets
+  // num_inference_steps=30 (utils/constants.py:85) and 2.4, which 2.5 resolves
+  // onto, inherits it (:124). 40 is 2.0's own default (:47), not this row's.
+  CHECK(s1.sigmas.empty());
+  CHECK(s1.use_official_sigma_schedule);
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control for that claim
+  // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :247-250
+  // sets none. #1013: at 0.0 the state stays as `create_initial_state` wrote it,
+  // which with no initial latent is all zeros, and a zero-initialised denoise
+  // still returns a finite clip.
+  CHECK(s1.noise_scale == 1.0);
+  // `:229-258` passes no `stepper`, so `EulerDiffusionStep()` applies
+  // (utils/blocks.py:526-527). The neighbouring distilled recipe selects the
+  // ANCESTRAL stepper on this very generation (distilled.py:76-84), which
+  // reaches a2vid through nothing, so the two are asserted side by side.
+  CHECK(s1.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(s1.stepper_eta == 0.0);
+  CHECK(s1.noise_seed_offset == 0);
+  // `MultiModalGuider(params=video_guider_params, ...)` (:233-236), whose six
+  // fields are the params table's video row through the CLI defaults
+  // (utils/args.py:947-1006). Asserted against `one_stage`'s phase, which is
+  // built from the same row, so a change to the table moves both.
+  CHECK(s1.video_guidance.cfg_scale == one.phases[0].video_guidance.cfg_scale);
+  CHECK(s1.video_guidance.stg_scale == one.phases[0].video_guidance.stg_scale);
+  CHECK(s1.video_guidance.rescale_scale == one.phases[0].video_guidance.rescale_scale);
+  CHECK(s1.video_guidance.modality_scale == one.phases[0].video_guidance.modality_scale);
+  CHECK(s1.video_guidance.stg_blocks == one.phases[0].video_guidance.stg_blocks);
+  // ...and the values themselves, so this case still says which arm it is on if
+  // both recipes were changed together. `rescale_scale = 0.7` is what makes the
+  // x0-space question live (guiders.py:268-271).
+  CHECK(s1.video_guidance.cfg_scale == 3.0);
+  CHECK(s1.video_guidance.stg_scale == 1.0);
+  CHECK(s1.video_guidance.rescale_scale == 0.7);
+  CHECK(s1.video_guidance.modality_scale == 3.0);
+
+  // THE AUDIO GUIDER IS THE DEFAULT ONE (:237-239) AND NOT THE TABLE'S ROW, and
+  // this is the field a reader is most likely to "fix" by symmetry with
+  // `OneStagePhase`, which takes the table's row and is right to
+  // (ti2vid_one_stage.py:215-218). A2Vid's audio stream is FROZEN, so the
+  // table's cfg 7.0 would buy an unconditional forward and a negative text
+  // encode for a delta multiplied into a latent the sampler cannot move.
+  CHECK(s1.audio_guidance.cfg_scale == 1.0);
+  CHECK(s1.audio_guidance.stg_scale == 0.0);
+  CHECK(s1.audio_guidance.rescale_scale == 0.0);
+  CHECK(s1.audio_guidance.modality_scale == 1.0);
+  CHECK(s1.audio_guidance.stg_blocks.empty());
+  CHECK_FALSE(s1.audio_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s1.audio_guidance.DoPerturbedGeneration());
+  CHECK_FALSE(s1.audio_guidance.DoIsolatedModalityGeneration());
+  // The control: `one_stage` DOES take the table's audio row, so the assertions
+  // above are not passing because every recipe carries defaults.
+  CHECK(one.phases[0].audio_guidance.cfg_scale == 7.0);
+  // The CLI passes six video guider fields per request (:353-360).
+  CHECK(s1.allow_guidance_override);
+
+  // ── stage 2 (a2vid_two_stage.py:277-297) ──────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s2 = a2v.phases[1];
+  CHECK(s2.name == "stage_2");
+  CHECK(s2.spatial_downscale == 1);
+  // `self.upsampler(video_state.latent[:1])` (:261).
+  CHECK(s2.input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (:164) — byte for
+  // byte the distilled recipe's stage 2, which is the ONE thing the two share.
+  CHECK(s2.sigmas == distilled.phases[1].sigmas);
+  CHECK_FALSE(s2.use_official_sigma_schedule);
+  // `noise_scale=stage_2_sigmas[0].item()` (:288).
+  REQUIRE_FALSE(s2.sigmas.empty());
+  CHECK(s2.noise_scale == s2.sigmas.front());
+  CHECK(s2.stepper == vllm::Ltx2StepperKind::kEuler);
+  // `SimpleDenoiser(v_context_p, a_context_p)` (:278) takes no params at all, so
+  // both guider fields stay at the positive-only defaults.
+  CHECK(s2.denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  CHECK(s1.denoiser == vllm::Ltx2PhaseDenoiser::kGuided);
+  // AND the override is ALLOWED here, which is the pair a boolean alone cannot
+  // express. The guider flags DO exist on this pipeline's parser (`:311` selects
+  // `default_2_stage_arg_parser`), so a request carrying one is legal — it just
+  // reaches stage 1 and nothing else (`:233-236`). Refusing would reject a
+  // request upstream accepts; applying would switch on guidance upstream's
+  // stage 2 does not run, and `kSimple` above is what stops that.
+  CHECK(s2.allow_guidance_override);
+  // The control on the OTHER polarity: `distilled.py` selects
+  // `default_2_stage_distilled_arg_parser` (utils/args.py:1188), which never adds
+  // the flags at all, so both of its phases REFUSE — and they are `kSimple` too,
+  // which is exactly why the refusal has to be tested before the skip.
+  CHECK_FALSE(distilled.phases[1].allow_guidance_override);
+  CHECK(distilled.phases[1].denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  CHECK_FALSE(s2.video_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s2.video_guidance.DoPerturbedGeneration());
+  CHECK_FALSE(s2.video_guidance.DoIsolatedModalityGeneration());
+
+  // ── the recipe (a2vid_two_stage.py:143-166, utils/args.py:1123-1128) ───────
+  CHECK(a2v.height == distilled.height);
+  CHECK(a2v.width == distilled.width);
+  CHECK(a2v.num_frames == distilled.num_frames);
+  CHECK(a2v.frame_rate == distilled.frame_rate);
+  CHECK(a2v.video_output_phase == 1);
+  CHECK(a2v.audio_output_phase == 1);
+  CHECK_FALSE(a2v.audio_only);
+  // Stage 1's schedule IS the step count (:226), so `--num-inference-steps` is
+  // honoured. The distilled recipe fixes both stages and refuses the override.
+  CHECK(a2v.allow_request_sigmas);
+  CHECK_FALSE(a2v.fixed_num_inference_steps);
+  CHECK(a2v.num_inference_steps == one.num_inference_steps);
+  CHECK_FALSE(distilled.allow_request_sigmas);  // the control
+  // `:146` takes a negative prompt and `:183` reads `ctx_n` into the video
+  // guider's `negative_context`; the distilled recipe has no negative half at
+  // all, so both polarities are exercised here.
+  CHECK(a2v.allow_negative_prompt);
+  CHECK(a2v.negative_prompt == one.negative_prompt);
+  CHECK_FALSE(a2v.negative_prompt.empty());
+  CHECK_FALSE(distilled.allow_negative_prompt);
+  CHECK_FALSE(a2v.allow_request_latents);
+  // `--audio-path` (:312-317) and `--distilled-lora` (utils/args.py:1140-1155)
+  // are BOTH `required=True`, and neither has a value this port can invent.
+  CHECK(a2v.requires_audio_input);
+  CHECK(a2v.requires_distilled_lora);
+  // The controls: no other recipe demands either, so a build that set the flags
+  // unconditionally is caught.
+  CHECK_FALSE(distilled.requires_audio_input);
+  CHECK_FALSE(distilled.requires_distilled_lora);
+  CHECK_FALSE(one.requires_audio_input);
+  CHECK_FALSE(one.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 a2vid: all four generations resolve and nothing else does") {
+  // FOUR ROWS, mirroring the `t2a_one_stage` rows one for one and for the same
+  // reason: `A2VidPipelineTwoStage` takes whatever `resolve_cli_params()` read
+  // off the checkpoint (a2vid_two_stage.py:311), exactly as
+  // `T2AOneStagePipeline` does at t2a_one_stage.py:178-179. There is no "which
+  // generations support audio-to-video" question upstream, so restricting these
+  // rows would be a local invention.
+  for (const char* version : {"2", "2.3", "2.4", "2.5"}) {
+    INFO("version = ", std::string(version));
+    CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", version));
+    const vllm::Ltx2PipelineRecipe r =
+        vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", version);
+    REQUIRE(r.phases.size() == 2u);
+    CHECK(r.requires_audio_input);
+    CHECK(r.requires_distilled_lora);
+    CHECK(r.phases[0].spatial_downscale == 2);
+    CHECK(r.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+  }
+  // The 2.4 and 2.5 rows take Lightricks' negative prompt and the older two take
+  // vLLM-Omni's, which is the split every other Lightricks-sourced row makes:
+  // the negative prompt travels with the GENERATION, not the pipeline.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5").negative_prompt !=
+        vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2").negative_prompt);
+
+  // A version the table does not carry is REFUSED by name, never defaulted onto
+  // a neighbouring generation's guidance scales.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.9"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", ""));
+  // ...and so is the near-miss spelling, which is what a reader who knows the
+  // upstream FILE name rather than the pipeline kind would type.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2v_two_stage", "2.5"));
+}
+
+TEST_CASE("ltx2 ti2vid: the recipe is the PLAIN two-stage pipeline, not the HQ one") {
+  // `TI2VidTwoStagesPipeline` (ti2vid_two_stages.py:61 @ fd4ded7f). Row
+  // LTX25-TI2VID-RECIPE, issue #1093.
+  //
+  // THIS PIPELINE SITS BETWEEN TWO ARMS THAT ALREADY SHIP, and every field that
+  // separates it from either renders whether it is right or wrong: a wrong
+  // stepper, a wrong sigma set, a wrong adapter placement and a wrong audio
+  // phase all produce a finished clip of the right size, frame count and sample
+  // rate. So each assertion below carries a CONTROL drawn from the recipe it
+  // would otherwise be confused with, and no assertion can pass by two values
+  // happening to coincide.
+  const vllm::Ltx2PipelineRecipe ti2v =
+      vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe res2s =
+      vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe a2v =
+      vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe one = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(ti2v.phases.size() == 2u);
+
+  // ── stage 1 (ti2vid_two_stages.py:223-269) ────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s1 = ti2v.phases[0];
+  CHECK(s1.name == "stage_1");
+  // `width // 2, height // 2` (:223-229), which is also what makes
+  // `assert_resolution(is_two_stage=True)` (:184) the 64-divisor arm here.
+  CHECK(s1.spatial_downscale == 2);
+  CHECK(ti2v.max_spatial_downscale() == 2);
+  CHECK(s1.input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+  // `self._scheduler.execute(steps=num_inference_steps)` (:243-245): DERIVED at
+  // run time, against `distilled_two_stage`'s frozen 9-sigma stage 1.
+  CHECK(s1.sigmas.empty());
+  CHECK(s1.use_official_sigma_schedule);
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control
+
+  // THE SCHEDULE ANCHOR, and the one field this arm could not be written with
+  // before this row. That same `execute` call passes NO latent, so
+  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
+  // recipe below — is the ONE upstream site that passes `latent=empty_latent`,
+  // and it is the control here precisely because it is the exception. Six other
+  // call sites side with this row; that the engine still derives from the
+  // target grid on three shipped arms is #1150.
+  CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // The default is today's behaviour, so nothing that predates this row moved.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+
+  // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :266-267
+  // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
+  // as `create_initial_state` wrote it, which with no initial latent is all
+  // zeros, and a zero-initialised denoise still returns a finite clip.
+  CHECK(s1.noise_scale == 1.0);
+  // NEITHER `self.stage_1(...)` (:247-269) NOR `self.stage_2(...)` (:289-308)
+  // passes `stepper` or `loop`, so `DiffusionStage.__call__`'s own defaults
+  // apply — `euler_denoising_loop` and `EulerDiffusionStep()`
+  // (utils/blocks.py:524-527). Two steppers reach this arm through nothing and
+  // both are asserted beside it: `distilled.py:76-84` selects the ANCESTRAL one
+  // on this very generation, and the HQ pipeline hands BOTH its stages
+  // `Res2sDiffusionStep()` (ti2vid_two_stages_hq.py:258).
+  CHECK(s1.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(res2s.phases[0].stepper == vllm::Ltx2StepperKind::kRes2s);
+  CHECK(s1.stepper_eta == 0.0);
+  CHECK(s1.noise_seed_offset == 0);
+  // `loras=tuple(loras)` (:140) against stage 2's `(*tuple(loras),
+  // *distilled_lora)` (:151) — stage 1 runs the UNADAPTED model, which is this
+  // pipeline's identity and the reason #1118 blocked it. The control is stage 2
+  // below; the mirror-image control is `res2s_two_stage`, which upstream fuses
+  // on BOTH stages (ti2vid_two_stages_hq.py:154, :165).
+  CHECK(s1.loras == vllm::Ltx2PhaseLoraScope::kNoAdapters);
+  CHECK(res2s.phases[0].loras == vllm::Ltx2PhaseLoraScope::kAllAdapters);
+  // `FactoryGuidedDenoiser` (:248) with a negative context on both streams
+  // (:251-258). On the default path it is a no-op against the HQ arm's
+  // `GuidedDenoiser`: `main()` passes plain `MultiModalGuiderParams`
+  // (:343-358), never a factory, so both reduce to `_guided_denoise`
+  // (utils/denoisers.py:61-211).
+  CHECK(s1.denoiser == vllm::Ltx2PhaseDenoiser::kGuided);
+  // `:319` selects `default_2_stage_arg_parser`, which carries the six video
+  // guider flags (utils/args.py:947-1006), so an override is legal.
+  CHECK(s1.allow_guidance_override);
+  // The video guider is the params table's row, shared with `one_stage` so a
+  // change to the table moves both...
+  CHECK(s1.video_guidance.cfg_scale == one.phases[0].video_guidance.cfg_scale);
+  CHECK(s1.video_guidance.stg_scale == one.phases[0].video_guidance.stg_scale);
+  CHECK(s1.video_guidance.rescale_scale == one.phases[0].video_guidance.rescale_scale);
+  CHECK(s1.video_guidance.modality_scale == one.phases[0].video_guidance.modality_scale);
+  CHECK(s1.video_guidance.stg_blocks == one.phases[0].video_guidance.stg_blocks);
+  // ...and the values themselves, so this case still says which arm it is on if
+  // both were changed together. `rescale_scale = 0.7` is what makes the x0-space
+  // question live on the DEFAULT path (guiders.py:268-271, #1039/#1092).
+  CHECK(s1.video_guidance.cfg_scale == 3.0);
+  CHECK(s1.video_guidance.stg_scale == 1.0);
+  CHECK(s1.video_guidance.rescale_scale == 0.7);
+  CHECK(s1.video_guidance.modality_scale == 3.0);
+
+  // THE AUDIO GUIDER IS THE TABLE'S ROW HERE, AND ON `a2vid_two_stage` IT IS
+  // NOT. That is not an inconsistency between two rows of this table; it is the
+  // difference between two pipelines. A2Vid's audio stream is the caller's
+  // FROZEN take, so it builds a default `MultiModalGuiderParams()`
+  // (a2vid_two_stage.py:237-239). This pipeline GENERATES its soundtrack, and
+  // :255-258 hands the audio guider factory the real params, which `main()`
+  // fills from six `--audio-*` / `--v2a-guidance-scale` flags at :351-358.
+  // Copying a2vid's line here would silently drop audio CFG 7.0 on a stream
+  // that is being sampled, so both polarities are asserted.
+  CHECK(s1.audio_guidance.cfg_scale == one.phases[0].audio_guidance.cfg_scale);
+  CHECK(s1.audio_guidance.cfg_scale == 7.0);
+  CHECK(s1.audio_guidance.DoUnconditionalGeneration());
+  CHECK(a2v.phases[0].audio_guidance.cfg_scale == 1.0);  // the control
+  CHECK_FALSE(a2v.phases[0].audio_guidance.DoUnconditionalGeneration());
+
+  // ── stage 2 (ti2vid_two_stages.py:271-308) ────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s2 = ti2v.phases[1];
+  CHECK(s2.name == "stage_2");
+  CHECK(s2.spatial_downscale == 1);
+  // `self.upsampler(video_state.latent[:1])` (:272).
+  CHECK(s2.input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (:178) — a DEFAULT
+  // ARGUMENT, so the schedule is frozen for this phase even though stage 1's is
+  // not. Byte for byte the distilled recipe's stage 2 (utils/constants.py:19-23).
+  CHECK(s2.sigmas == distilled.phases[1].sigmas);
+  CHECK_FALSE(s2.use_official_sigma_schedule);
+  REQUIRE(s2.sigmas.size() == 4u);
+  // `noise_scale=stage_2_sigmas[0].item()` on BOTH modality specs (:300, :305) —
+  // the upsampled latent is only valid at the noise level this stage starts from.
+  CHECK(s2.noise_scale == s2.sigmas.front());
+  CHECK(s2.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(res2s.phases[1].stepper == vllm::Ltx2StepperKind::kRes2s);  // the control
+  // `SimpleDenoiser(v_context_p, a_context_p)` (:290) takes no params at all.
+  CHECK(s2.denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  // ...AND the override is still ALLOWED, which is the pair `allow_guidance_
+  // override` alone cannot express: the flags DO exist on this pipeline's
+  // parser, so a request carrying one is legal — it reaches stage 1's guider
+  // and nothing else. `kSimple` above is what makes it inert here. The control
+  // on the other polarity is `distilled_two_stage`, whose parser never adds the
+  // flags (utils/args.py:1188) so both of its phases REFUSE.
+  CHECK(s2.allow_guidance_override);
+  CHECK_FALSE(distilled.phases[1].allow_guidance_override);
+  // Left at the default: `(*tuple(loras), *distilled_lora)` (:151) is every
+  // adapter this engine holds.
+  CHECK(s2.loras == vllm::Ltx2PhaseLoraScope::kAllAdapters);
+  CHECK_FALSE(s2.video_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s2.video_guidance.DoPerturbedGeneration());
+
+  // ── the recipe (ti2vid_two_stages.py:159-181, :310-312) ───────────────────
+  // `default_2_stage_arg_parser` sets the request geometry to the FINAL output
+  // (utils/args.py:1128); stage 1 runs at half through `spatial_downscale`.
+  CHECK(ti2v.height == a2v.height);
+  CHECK(ti2v.width == a2v.width);
+  CHECK(ti2v.num_frames == a2v.num_frames);
+  CHECK(ti2v.frame_rate == a2v.frame_rate);
+  CHECK(ti2v.num_inference_steps == one.num_inference_steps);
+  CHECK(ti2v.default_image_crf == one.default_image_crf);
+  CHECK(ti2v.video_output_phase == 1);
+
+  // THE FIELD MOST LIKELY TO BE "FIXED" TO 1, and :287-288 is upstream's own
+  // comment saying why not: "Stage 2 refines video only; discard its audio."
+  // `video_state, _ = self.stage_2(...)` at :289 IS the discard, and :311's
+  // `self.audio_decoder(audio_state.latent)` reads the name :247 bound. Writing
+  // 1 here would decode a soundtrack that is finite, the right length, at the
+  // right sample rate, and the wrong take. `res2s_two_stage` carries 0 for the
+  // identical reason; `a2vid_two_stage` carries 1 and is the control that stops
+  // this passing because every two-stage recipe happens to say 0.
+  CHECK(ti2v.audio_output_phase == 0);
+  CHECK(res2s.audio_output_phase == 0);
+  CHECK(a2v.audio_output_phase == 1);
+  CHECK_FALSE(ti2v.audio_only);
+
+  // Stage 1's schedule IS the step count (:244), so `--num-inference-steps` is
+  // honoured; stage 2 carries its own explicit sigmas and is unaffected either
+  // way, exactly as upstream's two parameters are.
+  CHECK(ti2v.allow_request_sigmas);
+  CHECK_FALSE(ti2v.fixed_num_inference_steps);
+  CHECK_FALSE(distilled.allow_request_sigmas);  // the control
+  // `:162` takes a negative prompt and :194-202 encodes `[prompt,
+  // negative_prompt]` into the two guider factories' `negative_context`.
+  CHECK(ti2v.allow_negative_prompt);
+  CHECK(ti2v.negative_prompt == one.negative_prompt);
+  CHECK_FALSE(ti2v.negative_prompt.empty());
+  CHECK_FALSE(distilled.allow_negative_prompt);  // the control
+  // No `__call__` parameter carries an initial latent (:159-181): stage 1's
+  // video spec has none and stage 2's is the upsampler's output.
+  CHECK_FALSE(ti2v.allow_request_latents);
+  // `--distilled-lora` is `required=True` on the parser :319 selects
+  // (utils/args.py:1140-1155), and stage 2's three-sigma refinement is what that
+  // adapter was trained for.
+  CHECK(ti2v.requires_distilled_lora);
+  // ...but there is NO `--audio-path` on this pipeline: the soundtrack is
+  // generated, not supplied. This is the field that separates the recipe from
+  // `a2vid_two_stage`, which sets both flags, so asserting only the first would
+  // pass on a copy of that recipe.
+  CHECK_FALSE(ti2v.requires_audio_input);
+  CHECK(a2v.requires_audio_input);  // the control
+  CHECK(a2v.requires_distilled_lora);
+  CHECK_FALSE(one.requires_distilled_lora);
+  CHECK_FALSE(distilled.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 ti2vid: all four generations resolve and nothing else does") {
+  // FOUR ROWS, mirroring `a2vid_two_stage` and `t2a_one_stage` line for line and
+  // for the same reason: `main()` calls `resolve_cli_params()` (:318) and hands
+  // the result to `default_2_stage_arg_parser(params=params, ...)` (:319) — the
+  // same two calls a2vid_two_stage.py:310-311 makes — so the generation comes
+  // off the checkpoint. There is no "which generations support this pipeline"
+  // question upstream, so restricting these rows would be a local invention.
+  for (const char* version : {"2", "2.3", "2.4", "2.5"}) {
+    INFO("version = ", std::string(version));
+    CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", version));
+    const vllm::Ltx2PipelineRecipe r =
+        vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", version);
+    REQUIRE(r.phases.size() == 2u);
+    CHECK(r.requires_distilled_lora);
+    CHECK_FALSE(r.requires_audio_input);
+    CHECK(r.phases[0].spatial_downscale == 2);
+    CHECK(r.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+    CHECK(r.phases[0].loras == vllm::Ltx2PhaseLoraScope::kNoAdapters);
+    CHECK(r.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+    CHECK(r.audio_output_phase == 0);
+  }
+  // The 2.4 and 2.5 rows take Lightricks' negative prompt and the older two take
+  // vLLM-Omni's, which is the split every four-key row makes: the negative
+  // prompt travels with the GENERATION, not with the pipeline.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5").negative_prompt !=
+        vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2").negative_prompt);
+
+  // A version the table does not carry is REFUSED by name, never defaulted onto
+  // a neighbouring generation's guidance scales.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.6"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", ""));
+  // ...and so are the near-miss spellings. `ti2vid_two_stages` is upstream's
+  // FILE name, which is PLURAL, and is exactly what a reader who knows
+  // ti2vid_two_stages.py rather than this table would type; the tree's kinds are
+  // singular (`a2vid_two_stage`, `res2s_two_stage`, `distilled_two_stage`).
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stages", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage_hq", "2.5"));
+}
+
+// ─── LTX25-KEYFRAME-INTERP (#1096) ───────────────────────────────────────────
+
+TEST_CASE("ltx2 keyframe: the recipe is the INTERPOLATION pipeline, not the plain two-stage one") {
+  // `KeyframeInterpolationPipeline` (keyframe_interpolation.py:55 @ fd4ded7f).
+  // Row LTX25-KEYFRAME-INTERP, issue #1096.
+  //
+  // THIS PIPELINE AND `ti2vid_two_stage` SHARE A PARSER, A STAGE LAYOUT, A
+  // STEPPER AND A SIGMA SET, and they disagree in exactly two fields. Both
+  // disagreements render either way: an interpolation that overwrites its first
+  // keyframe, and a soundtrack that is finite, the right length, at the right
+  // sample rate and the wrong take. So the controls below are drawn from THAT
+  // recipe above all, and no assertion can pass by two values coinciding.
+  const vllm::Ltx2PipelineRecipe kf =
+      vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", "2.5");
+  const vllm::Ltx2PipelineRecipe ti2v =
+      vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe res2s =
+      vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe a2v =
+      vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe one = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(kf.phases.size() == 2u);
+
+  // ── THE FIELD THAT IS THIS PIPELINE'S NAME ────────────────────────────────
+  //
+  // `:211` and `:260` call `image_conditionings_by_adding_guiding_latent`
+  // (helpers.py:343-367), which has NO branch: every image, `frame_idx == 0`
+  // included, becomes a `VideoConditionByKeyframeIndex` that APPENDS. Every
+  // other pipeline calls `combined_image_conditionings` (:272-308), whose
+  // `frame_idx == 0` arm is a `VideoConditionByLatentIndex` that REPLACES.
+  //
+  // FIVE CONTROLS, because the default is `kCombined` and an assertion that only
+  // read this recipe would pass on a build where the field exists and nothing
+  // sets it — and a single control would pass on a build where the default had
+  // been flipped the other way instead.
+  CHECK(kf.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kAddGuidingLatent);
+  CHECK(ti2v.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kCombined);
+  CHECK(res2s.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kCombined);
+  CHECK(a2v.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kCombined);
+  CHECK(distilled.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kCombined);
+  CHECK(one.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kCombined);
+
+  // ── stage 1 (keyframe_interpolation.py:198-252) ───────────────────────────
+  const vllm::Ltx2PhaseRecipe& s1 = kf.phases[0];
+  CHECK(s1.name == "stage_1");
+  // `width // 2, height // 2` (:203-209), which is also what makes
+  // `assert_resolution(is_two_stage=True)` (:170) the 64-divisor arm here.
+  CHECK(s1.spatial_downscale == 2);
+  CHECK(kf.max_spatial_downscale() == 2);
+  CHECK(s1.input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+  // `self._scheduler.execute(steps=num_inference_steps)` (:199-200): DERIVED at
+  // run time, against `distilled_two_stage`'s frozen 9-sigma stage 1.
+  CHECK(s1.sigmas.empty());
+  CHECK(s1.use_official_sigma_schedule);
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control
+
+  // THE SCHEDULE ANCHOR. That same `execute` call passes NO latent, so
+  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
+  // recipe — is the ONE upstream site that passes `latent=empty_latent`, and it
+  // is the control here precisely because it is the exception. That three other
+  // shipped arms still derive from the target grid is #1150, not this row.
+  CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(ti2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // Nothing that predates this row moved.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+
+  // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :244-247
+  // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
+  // as `create_initial_state` wrote it, which with no initial latent is all
+  // zeros, and a zero-initialised denoise still returns a finite clip.
+  CHECK(s1.noise_scale == 1.0);
+  // NEITHER `self.stage_1(...)` (:231-252) NOR `self.stage_2(...)` (:271-290)
+  // passes `stepper` or `loop`, so `DiffusionStage.__call__`'s own defaults
+  // apply — `euler_denoising_loop` and `EulerDiffusionStep()`
+  // (utils/blocks.py:524-527). Two steppers reach this arm through nothing and
+  // both are asserted beside it: `distilled.py:76-84` selects the ANCESTRAL one
+  // on this very generation, and the HQ pipeline hands BOTH its stages
+  // `Res2sDiffusionStep()` (ti2vid_two_stages_hq.py:258).
+  CHECK(s1.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(res2s.phases[0].stepper == vllm::Ltx2StepperKind::kRes2s);
+  CHECK(s1.stepper_eta == 0.0);
+  CHECK(s1.noise_seed_offset == 0);
+  // `loras=tuple(loras)` (:104) against stage 2's `stage_2_loras` (:111, passed
+  // at :116) — stage 1 runs the UNADAPTED model, which upstream's own pipeline
+  // table calls `Full + distilled LoRA` (packages/ltx-pipelines/CLAUDE.md:24)
+  // and which is the reason #1118 blocked this row. The mirror-image control is
+  // `res2s_two_stage`, which upstream fuses on BOTH stages.
+  CHECK(s1.loras == vllm::Ltx2PhaseLoraScope::kNoAdapters);
+  CHECK(res2s.phases[0].loras == vllm::Ltx2PhaseLoraScope::kAllAdapters);
+  // `FactoryGuidedDenoiser(...)` (:232-237). On this pipeline's DEFAULT path it
+  // resolves ONE guider for the whole schedule: `main()` passes plain
+  // `MultiModalGuiderParams` (:325-340), so `create_multimodal_guider_factory`
+  // takes `MultiModalGuiderFactory.constant` (guiders.py:360), which builds a
+  // single `(inf, params)` bin (:312-315). #1096 named a per-sigma denoiser as a
+  // blocker without deriving that; #1187 owns the sigma-BINNED arm.
+  CHECK(s1.denoiser == vllm::Ltx2PhaseDenoiser::kGuided);
+  // `:301` selects `default_2_stage_arg_parser`, which carries the six video
+  // guider flags (utils/args.py:947-1006), so an override is legal.
+  CHECK(s1.allow_guidance_override);
+  // The video guider is the params table's row, shared with `one_stage` so a
+  // change to the table moves both...
+  CHECK(s1.video_guidance.cfg_scale == one.phases[0].video_guidance.cfg_scale);
+  CHECK(s1.video_guidance.stg_scale == one.phases[0].video_guidance.stg_scale);
+  CHECK(s1.video_guidance.rescale_scale == one.phases[0].video_guidance.rescale_scale);
+  CHECK(s1.video_guidance.modality_scale == one.phases[0].video_guidance.modality_scale);
+  CHECK(s1.video_guidance.stg_blocks == one.phases[0].video_guidance.stg_blocks);
+  // ...and the values themselves, so this case still says which arm it is on if
+  // both were changed together. `rescale_scale = 0.7` is what makes the x0-space
+  // question live on the DEFAULT path (guiders.py:268-271, #1039/#1092).
+  CHECK(s1.video_guidance.cfg_scale == 3.0);
+  CHECK(s1.video_guidance.stg_scale == 1.0);
+  CHECK(s1.video_guidance.rescale_scale == 0.7);
+  CHECK(s1.video_guidance.modality_scale == 3.0);
+
+  // THE AUDIO GUIDER IS THE TABLE'S ROW, as on `ti2vid_two_stage` and NOT as on
+  // `a2vid_two_stage`. This pipeline GENERATES its soundtrack and :226-229 hands
+  // the audio guider factory the real params, filled from six `--audio-*` /
+  // `--v2a-guidance-scale` flags at :333-340. A2Vid's audio stream is the
+  // caller's FROZEN take, so it builds a default `MultiModalGuiderParams()`
+  // (a2vid_two_stage.py:237-239) and its cfg 7.0 would buy an unconditional
+  // forward for a delta multiplied into a latent the sampler cannot move.
+  CHECK(s1.audio_guidance.cfg_scale == one.phases[0].audio_guidance.cfg_scale);
+  CHECK(s1.audio_guidance.cfg_scale == 7.0);
+  CHECK(s1.audio_guidance.DoUnconditionalGeneration());
+  CHECK(a2v.phases[0].audio_guidance.cfg_scale == 1.0);  // the control
+  CHECK_FALSE(a2v.phases[0].audio_guidance.DoUnconditionalGeneration());
+
+  // ── stage 2 (keyframe_interpolation.py:254-290) ───────────────────────────
+  const vllm::Ltx2PhaseRecipe& s2 = kf.phases[1];
+  CHECK(s2.name == "stage_2");
+  CHECK(s2.spatial_downscale == 1);
+  // `self.upsampler(video_state.latent[:1])` (:255).
+  CHECK(s2.input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (:166) — a DEFAULT
+  // ARGUMENT, so the schedule is frozen for this phase even though stage 1's is
+  // not. Byte for byte the distilled recipe's stage 2 (utils/constants.py:19-23).
+  CHECK(s2.sigmas == distilled.phases[1].sigmas);
+  CHECK_FALSE(s2.use_official_sigma_schedule);
+  REQUIRE(s2.sigmas.size() == 4u);
+  // `noise_scale=stage_2_sigmas[0].item()` on BOTH modality specs (:282, :287) —
+  // the upsampled latent is only valid at the noise level this stage starts from.
+  CHECK(s2.noise_scale == s2.sigmas.front());
+  CHECK(s2.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(res2s.phases[1].stepper == vllm::Ltx2StepperKind::kRes2s);  // the control
+  // `SimpleDenoiser(v_context_p, a_context_p)` (:272) takes no params at all.
+  CHECK(s2.denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  // ...AND the override is still ALLOWED, which is the pair `allow_guidance_
+  // override` alone cannot express: the flags DO exist on this pipeline's
+  // parser, so a request carrying one is legal — it reaches stage 1's guider and
+  // nothing else. `kSimple` above is what makes it inert here. The control on
+  // the other polarity is `distilled_two_stage`, whose parser never adds the
+  // flags (utils/args.py:1188) so both of its phases REFUSE.
+  CHECK(s2.allow_guidance_override);
+  CHECK_FALSE(distilled.phases[1].allow_guidance_override);
+  // Left at the default: `stage_2_loras` (:111) is every adapter this engine
+  // holds, and :116 is where stage 2 takes it.
+  CHECK(s2.loras == vllm::Ltx2PhaseLoraScope::kAllAdapters);
+  CHECK_FALSE(s2.video_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s2.video_guidance.DoPerturbedGeneration());
+
+  // ── the recipe (keyframe_interpolation.py:147-168, :297-358) ──────────────
+  // `default_2_stage_arg_parser` sets the request geometry to the FINAL output
+  // (utils/args.py:1128); stage 1 runs at half through `spatial_downscale`.
+  CHECK(kf.height == ti2v.height);
+  CHECK(kf.width == ti2v.width);
+  CHECK(kf.num_frames == ti2v.num_frames);
+  CHECK(kf.frame_rate == ti2v.frame_rate);
+  CHECK(kf.num_inference_steps == one.num_inference_steps);
+  CHECK(kf.default_image_crf == one.default_image_crf);
+  CHECK(kf.video_output_phase == 1);
+
+  // THE SECOND FIELD THAT SEPARATES THIS FROM `ti2vid_two_stage`, and it is the
+  // one most likely to be copied from it. `:271` binds `video_state,
+  // audio_state = self.stage_2(...)` and `:293` decodes that name, so stage 2's
+  // soundtrack is what LEAVES. `ti2vid_two_stages.py:289` binds `video_state, _`
+  // under its own comment at `:287-288` — "Stage 2 refines video only; discard
+  // its audio" — and decodes the name `:247` bound instead. There is no comment
+  // either way in this file; the BINDING is the statement.
+  //
+  // Writing 0 here would decode stage 1's take: finite, the right length, at the
+  // right sample rate, and the wrong one. The controls are two-against-two, so
+  // this cannot pass because every two-stage recipe happens to agree.
+  CHECK(kf.audio_output_phase == 1);
+  CHECK(a2v.audio_output_phase == 1);
+  CHECK(ti2v.audio_output_phase == 0);
+  CHECK(res2s.audio_output_phase == 0);
+  CHECK_FALSE(kf.audio_only);
+
+  // Stage 1's schedule IS the step count (:200), so `--num-inference-steps` is
+  // honoured; stage 2 carries its own explicit sigmas and is unaffected either
+  // way, exactly as upstream's two parameters are.
+  CHECK(kf.allow_request_sigmas);
+  CHECK_FALSE(kf.fixed_num_inference_steps);
+  CHECK_FALSE(distilled.allow_request_sigmas);  // the control
+  // `:150` takes a negative prompt and :178-186 encodes `[prompt,
+  // negative_prompt]` into the two guider factories' `negative_context`.
+  CHECK(kf.allow_negative_prompt);
+  CHECK(kf.negative_prompt == one.negative_prompt);
+  CHECK_FALSE(kf.negative_prompt.empty());
+  CHECK_FALSE(distilled.allow_negative_prompt);  // the control
+  // No `__call__` parameter carries an initial latent (:147-168): stage 1's
+  // video spec has none and stage 2's is the upsampler's output.
+  CHECK_FALSE(kf.allow_request_latents);
+  // `distilled_lora` is POSITIONAL and non-defaulted (:68), and
+  // `--distilled-lora` is `required=True` on the parser :301 selects
+  // (utils/args.py:1140-1155).
+  CHECK(kf.requires_distilled_lora);
+  // ...but there is NO `--audio-path` on this pipeline: the soundtrack is
+  // generated, not supplied. This is the field that separates the recipe from
+  // `a2vid_two_stage`, which sets both flags, so asserting only the first would
+  // pass on a copy of that recipe.
+  CHECK_FALSE(kf.requires_audio_input);
+  CHECK(a2v.requires_audio_input);  // the control
+  CHECK(a2v.requires_distilled_lora);
+  CHECK(ti2v.requires_distilled_lora);
+  CHECK_FALSE(one.requires_distilled_lora);
+  CHECK_FALSE(distilled.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 keyframe: all four generations resolve and nothing else does") {
+  // FOUR ROWS, mirroring `ti2vid_two_stage` and `a2vid_two_stage` line for line
+  // and for the same reason: `main()` calls `resolve_cli_params()` (:300) and
+  // hands the result to `default_2_stage_arg_parser(params=params)` (:301), so
+  // the generation comes off the checkpoint. There is no "which generations
+  // support this pipeline" question upstream, so restricting these rows would be
+  // a local invention.
+  for (const char* version : {"2", "2.3", "2.4", "2.5"}) {
+    INFO("version = ", std::string(version));
+    CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", version));
+    const vllm::Ltx2PipelineRecipe r =
+        vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", version);
+    REQUIRE(r.phases.size() == 2u);
+    CHECK(r.image_conditioning == vllm::Ltx2ImageConditioningBuilder::kAddGuidingLatent);
+    CHECK(r.requires_distilled_lora);
+    CHECK_FALSE(r.requires_audio_input);
+    CHECK(r.phases[0].spatial_downscale == 2);
+    CHECK(r.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+    CHECK(r.phases[0].loras == vllm::Ltx2PhaseLoraScope::kNoAdapters);
+    CHECK(r.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+    CHECK(r.audio_output_phase == 1);
+  }
+  // The 2.4 and 2.5 rows take Lightricks' negative prompt and the older two take
+  // vLLM-Omni's, which is the split every four-key row makes: the negative
+  // prompt travels with the GENERATION, not with the pipeline.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", "2.5").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", "2").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", "2.5").negative_prompt !=
+        vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", "2").negative_prompt);
+
+  // A version the table does not carry is REFUSED by name, never defaulted onto
+  // a neighbouring generation's guidance scales.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", "2.6"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation", ""));
+  // ...and so are the near-miss spellings. This kind is upstream's FILE and
+  // CLASS name, unlike every `*_two_stage` kind in the table, so the plausible
+  // wrong spellings are the ones that assume the table's convention rather than
+  // upstream's.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe_interpolation_two_stage", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe_two_stage", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe_interp", "2.5"));
 }

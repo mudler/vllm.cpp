@@ -378,6 +378,20 @@ inline std::string Qwen27DFlashDraftSnapshot() {
   return HfSnapshot("models--z-lab--Qwen3.6-27B-DFlash",
                     kQwen27DFlashDraftRevision, "VT_DFLASH_DRAFT_SNAPSHOT");}
 
+// The Qwen3.5-0.8B GDN gate model (issue #41, the ROCm M4 lane). This revision
+// is what the committed `goldens/qwen35_greedy_0_8b` were captured against on
+// gfx1100 2026-08-12 (verified via the checkpoint's huggingface_hub download
+// metadata; `manifest.json` in the golden dir records the oracle identity).
+inline constexpr const char* kQwen35_08BRevision =
+    "2fc06364715b967f1860aea9cf38778875588b17";
+
+// The 0.8B GDN gate model, pinned to the goldens' revision. Absent cache => ""
+// and the caller emits its loud SKIP (the intended behavior off the gate host).
+inline std::string Qwen35_08BSnapshot() {
+  return HfSnapshot("models--Qwen--Qwen3.5-0.8B", kQwen35_08BRevision,
+                    "VT_QWEN35_08B_SNAPSHOT");
+}
+
 }  // namespace parity
 
 #endif  // VLLM_TESTS_PARITY_HF_SNAPSHOT_H_

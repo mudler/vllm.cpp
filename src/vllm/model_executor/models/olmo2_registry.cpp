@@ -71,7 +71,7 @@ void PrepareOlmo2ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardOlmo2ForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
-  const auto& olmo = static_cast<Olmo2LoadedModel&>(model);
+  const auto& olmo = ModelAs<Olmo2LoadedModel>(model, "Olmo2ForCausalLM");
   const Olmo2Weights& weights = olmo.weights();
   if (input.gather_logits) {
     return Olmo2Model::ForwardDevice(input.token_ids, input.positions,

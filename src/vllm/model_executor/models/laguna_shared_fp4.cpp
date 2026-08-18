@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"  // SafetensorsFile, StTensor
+#include "vllm/model_executor/models/dense_weight_loaders.h"  // ReadF32Scalar (#1181)
 #include "vllm/model_executor/models/dense_weight_loaders.h"      // dense_loaders::MakeOwned
 #include "vllm/model_executor/models/qwen3_5_weights.h"           // Nvfp4Weight, OwnedTensor
 #include "vt/dtype.h"                                             // VT_CHECK, vt::DType
@@ -69,13 +70,10 @@ bool LagunaHasFp4SharedExpert(const LagunaWeights& w) {
 
 namespace {
 
-// F32 scalar read (mirror laguna_weights.cpp LnReadF32Scalar).
-float ShReadF32Scalar(const StTensor& t) {
-  VT_CHECK(t.dtype == "F32" && t.nbytes >= 4, "laguna shared-fp4: F32 scalar expected");
-  float v;
-  std::memcpy(&v, t.data, 4);
-  return v;
-}
+// F32 scalar read, from the shared seam. This was a hand-copied mirror of
+// laguna_weights.cpp's own copy, and both bounded the size with `nbytes >= 4`,
+// a FLOOR, so a scale ARRAY was read as element 0 (#1181).
+using dense_loaders::ReadF32Scalar;
 
 // W4A16 fp4-raw read of one shared-expert projection. Byte-identical to
 // laguna_weights.cpp LnLoadCtNvfp4Raw for the weight fields (n/k/scale2/packed/
@@ -92,7 +90,7 @@ Nvfp4Weight ShLoadSharedNvfp4W4A16(
   VT_CHECK(in_dim % 16 == 0, "laguna shared-fp4: in_dim must be %16 for " + proj);
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3", "laguna shared-fp4: F8_E4M3 weight_scale for " + proj);
-  const float wgs = ShReadF32Scalar(get(proj + ".weight_global_scale"));
+  const float wgs = ReadF32Scalar(get, proj + ".weight_global_scale");
   VT_CHECK(wgs != 0.0F, "laguna shared-fp4: zero weight_global_scale for " + proj);
   Nvfp4Weight r;
   r.n = out_dim;

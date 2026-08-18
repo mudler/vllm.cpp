@@ -32,6 +32,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -218,11 +219,66 @@ void FillNoise(std::vector<float>& out, uint64_t seed) {
 
 // ── the engine ───────────────────────────────────────────────────────────────
 
+// ── where this engine runs (#659, #660) ──────────────────────────────────────
+//
+// `device` is the public video ABI's selector: 0 is the CPU, 1 is "the
+// accelerator". WHICH accelerator is the PLATFORM's question, not this model
+// file's — the same question `ltx2_video.cpp:609-657` (the comment through the
+// end of the capability refusal) and the auto arm of
+// `src/vllm/entrypoints/model_loader.cpp::SelectQueueForModel` ask.
+//
+// This used to be `static_cast<vt::DeviceType>(device)`, which is not a mapping
+// at all. It reads the ABI selector AS AN ENUM VALUE and is correct only for as
+// long as `kCUDA` stays 1 in include/vt/device.h — reorder that enum and every
+// H3 device-1 load silently re-points at a different backend. It also named CUDA
+// without writing `kCUDA`, so the DSR ratchet's token grep scored it ZERO while
+// the test asserting the very same mapping spelled the token honestly and WAS
+// counted: the gate read the confession and missed the act (#660). The
+// `dev_cast` bucket in scripts/check-device-leakage.py now sees it.
+//
+// Three questions, the same three the seam answers everywhere else:
+//   1. is there an accelerator at all (`CurrentPlatform().device_type()`),
+//   2. is a backend registered for it (`vt::TryGetBackend`),
+//   3. can that backend actually run THIS model
+//      (`Platform::supports_model_architecture`, interface.h:263) — a PARTIAL
+//      backend (Metal 15/75 ops, Tenstorrent) must be able to decline by name
+//      rather than be handed a queue and die inside a kernel bind (#659).
+//
+// The architecture key is the family string, because that is this lane's stable
+// registry name (`VideoModelParams::family`); the diffusion engines are not
+// reached through ModelRegistry's HF `architectures` entry.
+//
+// On a CUDA box all three pass and this resolves EXACTLY the device the cast
+// did. On a CPU-only build device 1 is now REFUSED here instead of returning
+// kCUDA and failing one step later in `vt::GetBackend(kCUDA)`, and the refusal
+// says which piece is missing.
 vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device) {
   if (device != 0 && device != 1) {
-    throw std::runtime_error("minimax_h3 video: device must be 0 (cpu) or 1 (cuda)");
+    throw std::runtime_error(
+        "minimax_h3 video: device must be 0 (cpu) or 1 (the accelerator this build "
+        "resolves)");
   }
-  return static_cast<vt::DeviceType>(device);
+  if (device == 0) return vt::DeviceType::kCPU;
+
+  const vllm::platforms::Platform& platform = vllm::platforms::CurrentPlatform();
+  const vt::DeviceType accelerator = platform.device_type();
+  if (accelerator == vt::DeviceType::kCPU || vt::TryGetBackend(accelerator) == nullptr) {
+    throw std::runtime_error(
+        "minimax_h3 video: device 1 asks for an accelerator, but no accelerator backend "
+        "is registered in this build (the platform seam resolves to '" +
+        std::string(vt::DeviceTypeName(accelerator)) +
+        "'). Refusing rather than naming a device this build cannot run on.");
+  }
+  if (!platform.supports_model_architecture(kMiniMaxH3VideoFamily)) {
+    throw std::runtime_error(
+        "minimax_h3 video: device 1 resolves to platform '" +
+        std::string(vt::DeviceTypeName(accelerator)) + "', and that platform DECLINES the "
+        "architecture '" + std::string(kMiniMaxH3VideoFamily) +
+        "' (Platform::supports_model_architecture): it is a PARTIAL backend that has not "
+        "registered the kernels this model needs. The build is partial, not broken. "
+        "Refusing by name rather than binding a queue that would die inside a kernel bind.");
+  }
+  return accelerator;
 }
 
 struct MiniMaxH3VideoEngine::Impl {

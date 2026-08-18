@@ -102,12 +102,16 @@ void PrepareQwen3VLForConditionalGeneration(LoadedModel& model,
                                             const HfConfig& config,
                                             vt::Queue& queue) {
   // Warm the persistent cos|sin cache so the first forward step does not build it.
-  static_cast<Qwen3VLLoadedModel&>(model).CosSinCache(queue, config);
+  // The call stays INLINE on the checked reference rather than gaining a local:
+  // `ModelAs` establishes the dynamic type before the member call either way, so
+  // a binding would change this site's shape without changing what it does.
+  ModelAs<Qwen3VLLoadedModel>(model, "Qwen3VLForConditionalGeneration")
+      .CosSinCache(queue, config);
 }
 
 ForwardLogits ForwardQwen3VLForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  auto& vl = static_cast<Qwen3VLLoadedModel&>(model);
+  auto& vl = ModelAs<Qwen3VLLoadedModel>(model, "Qwen3VLForConditionalGeneration");
   VT_CHECK(input.mm.has_value(),
            "Qwen3VLForConditionalGeneration registered forward requires "
            "multimodal inputs (ModelForwardInput.mm). Text-only Qwen3-VL through "

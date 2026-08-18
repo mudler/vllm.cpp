@@ -111,7 +111,7 @@ ForwardLogits ForwardLlamaModelEmbedding(LoadedModel& model,
   // (pooling_runner.py:36).
   // (The runner passes empty logits_indices when the gather toggle is off; the
   // pooling branch then host-gathers, mirroring the text host path.)
-  auto& emb = static_cast<LlamaEmbeddingLoadedModel&>(model);
+  auto& emb = ModelAs<LlamaEmbeddingLoadedModel>(model, "LlamaModel");
   return LlamaModel::ForwardHidden(input.token_ids, input.positions,
                                    input.attn_meta, input.attn_kv,
                                    emb.weights(), input.config, input.queue,

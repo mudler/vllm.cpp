@@ -7,6 +7,320 @@ credentials, or assuming its paths exist. The untracked
 workspace and supplies local path/lock overrides. If no profile is selected,
 use only the current local host and mark unavailable hardware gates `PENDING`.
 
+## Reaching a GPU: claim a lease, never `ssh`
+
+The shared GPUs are managed by
+[resource-controller](https://github.com/mudler/resource-controller), whose
+client is `rc`. **Claim a device with `rc run` or `rc hold` before any GPU work,
+and never `ssh` to a GPU box to run work directly.** A bypass makes the fleet
+report the box free while somebody is on it, which is the exact failure the
+lease exists to remove. The procedure is in the `leasing-a-gpu` skill, which
+this repository deliberately does not copy, because a copy goes stale without
+saying so.
+
+`AGENTS.md` §`Work on a GPU happens inside a lease` holds the rule, and its
+condition is the DEVICE rather than the shell you are typing in. `dgx:gpu0`,
+`thor:gpu0` and `orin:gpu0` are the fleet devices, so a lease is the required
+path to each of them and it replaces the file mutex as the default. The three
+names are listed in both files so that membership stays checkable when the
+client is not at hand, and they are a lower bound rather than an upper one: a
+device that `rc devices` reports is a fleet device even when this list has not
+caught up. On a GPU that is not one of them, take
+`${GPU_LOCK:-$HOME/gpu.lock}` as before.
+
+`rc devices` lists the fleet when your shell has the client AND the controller
+answers, so it reports your access and not the device's membership. It fails in
+at least three ways that a reader must not collapse into one: `command not
+found` means this shell lacks the client, and a timeout or a refused
+authentication means the controller is not answering. `thor:gpu0` read `unknown
+(no contact 1m0s)` on 2026-08-17, so lost contact is a live state. On a fleet
+device every one of those answers means get the client or report the controller
+down. None of them means take the file mutex over `ssh`, because that is the
+collision below, in which two mutexes could not see each other.
+
+**This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
+in this file still describe.** Read a historical recipe as evidence of what ran
+at the time, not as an instruction for what to run now. The file mutex is still
+real and still required, and it now lives INSIDE a lease rather than instead of
+one.
+
+**The bypass has already voided a measurement, so this is a measured cost and
+not a rule for its own sake.** `.agents/specs/minimax-music3.md` §13.10 records
+a whole speed axis retained as VOID on 2026-08-17: those runs went in by `ssh`
+plus `docker run` serialised by the old mutex, while a concurrent session held
+the SAME box through `rc`. The two sessions took different mutexes and neither
+excluded the other, which is verbatim the #777 failure, and it is the likely
+cause of a 3x swing in the samples. `.agents/benchmark-record.md` records the
+other half of that row taking a real `rc hold` on `thor:gpu0` and reports the
+window in which the fleet showed `thor:gpu0` FREE while it was in use.
+
+The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
+
+| Device | Labels | `/workspace` on it |
+|---|---|---|
+| `dgx:gpu0` | `gpu_model=GB10`, `class=train`, `k8s=true`, driver 580.173.02, `cpus=20`, 128 GB | the house NAS |
+| `thor:gpu0` | `gpu_model=NVIDIA-Thor`, `class=train`, `k8s=true`, driver 595.78, `cpus=14`, 132 GB | the house NAS, the SAME folder as `dgx` |
+| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, and NO detected GPU labels because Jetson carries no `nvidia-smi` | LOCAL disk, invisible from `dgx` and `thor` |
+
+**Select on `class` or `gpu_model`, never on `vram`.** `rc describe` reports
+`vram=[N/A]M` and `vram_free=[N/A]M` on this fleet. That is a probe reporting
+"unknown", not a value, so a selector such as `vram>=40G` matches nothing and
+the job is rejected with `no_matching_device`. A device that carries no label
+never matches, INCLUDING for `!=`, and `orin:gpu0` carries no detected GPU
+labels at all. `class=train` and `gpu_model=GB10` do match. `rc run` has no
+`--image` flag. Its flags are `--as`, `--cwd`, `-d`, `--explain`,
+`--idle-timeout`, `--max-runtime`, `--no-wait`, `--priority`, `--select` and
+`--timeout`.
+
+### What the `dgx:gpu0` leased worker can and cannot do, measured 2026-08-17
+
+Probed with one `rc run -d dgx:gpu0 --max-runtime 2m` job
+(`ff28ada1-0cd3-4867-bf9b-f67050d0608b`). Verify this again before you plan work
+around it, because the worker image can change under you. **It did change.** The
+`thor:gpu0` worker measured later the same day carries `python3` and `gcc`, which
+this list calls absent, so read this section as one box on one day. The `thor`
+reading is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
+**The `dgx:gpu0` worker then changed as well**, so read the whole section as
+history and take the toolchain from
+[#1213](https://github.com/mudler/vllm.cpp/issues/1213).
+
+- The command runs as user `rc` in a **k3s pod**, hostname `rc-worker-<id>`.
+  `/.dockerenv` is absent and 8 `KUBERNETES_*` variables are set, so it is a pod
+  rather than a docker container. The toolchain question is therefore a
+  worker-image question, not a per-job one.
+- Present: `bash`, `sh`, `ls`, **`nvidia-smi`** (which reports the GB10 by UUID),
+  `flock`, and **`/workspace`**.
+- **Absent on 2026-08-17: `gcc`, `cc`, `clang`, `nvcc`, `ninja`, `cmake`,
+  `make`, `python3`, `python`, `pip`, `docker`, `sudo`, `git`, `ssh`, `curl`,
+  `/usr/include/stdio.h`, and any `/usr/local/cuda*` toolkit.** That probe read
+  the worker as unable to compile, to start Python, or to install anything.
+  **That reading is SUPERSEDED.** `rc describe dgx:gpu0` now states that the job
+  runs as root in an Ubuntu 24.04 container carrying `git`, `curl`, `wget`,
+  `ssh`, `gcc`, `g++`, `make`, `cmake`, `ninja`, `pkg-config`, `python3`, `pip`
+  and `venv`, and it instructs the reader to install anything missing. The one
+  limit the sheet names is the CUDA toolkit, which a job apt-installs per run
+  ([#1213](https://github.com/mudler/vllm.cpp/issues/1213)).
+  **Do not carry a one-box reading to another device either.** On `thor:gpu0`
+  the same day the worker ran as `uid=0(root)` with `/usr/bin/gcc`,
+  `/usr/bin/python3` and a working `apt-get`
+  ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
+- **The host filesystem is not visible.** `/home/mudler` does not exist inside
+  the worker.
+- `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,
+  4.0T available, 46% used`, writable from the job, mounted on the dgx host at
+  `/usr/local/nas_share/rc` (SMB, NodePort 31516, subfolder `rc/`). It is the
+  SAME folder from `dgx` and from `thor`, and it is the one surface both ends
+  can see. It is NOT shared with `orin`.
+
+**The consequence, and it is now narrower than a blocker.** The pinned oracle
+venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST, and a leased
+worker cannot see it. The dgx host has carried no toolchain since the 2026-08-14
+reimage, so host-side oracle work needs `sudo -n docker run` against
+`vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached over
+`ssh`, which is the bypass. **The sentence this paragraph used to carry, "no
+vLLM leg of any row can currently run on `dgx.casa` by a lease-compliant path",
+is FALSIFIED for the BUILD step and still holds for a MODEL RUN.** On 2026-08-18
+two `rc run` jobs built the pin from source inside a lease, installed the wheel,
+imported it, and reported `cuda True NVIDIA GB10`
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185), and "The pinned oracle
+builds inside a lease on `dgx:gpu0`" further down). Nobody has run a model that
+way, so no oracle-side MEASUREMENT is unblocked yet. Read the old reason
+carefully before you quote it, because it was never the worker's missing
+toolchain. "The lease carries bytes, and the exec bit is a mount option" below
+measures staged content starting under the dynamic loader and after a copy to
+`/tmp`. That is why recent GPU work reached for `ssh`, and the bypass is a
+symptom of this gap rather than a discipline problem. Do not design the
+migration here. `ENV-LEASE-RUNTIME-STAGING` owns the runtime staging, and
+[`lease-runtime-staging.md`](specs/lease-runtime-staging.md) holds its working
+recipe for `torch` and `triton`. `ENV-ORACLE-WHEEL-IN-LEASE` owns the oracle
+build, in [`oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md).
+
+**This confirms and extends a finding that already landed, rather than making a
+new one.** `.agents/specs/minimax-music3.md` §13.10 probed `thor`'s worker on
+2026-08-17 and found the same absence (`no gcc / g++ / cmake / ninja / nvcc /
+make`), reported that the `$HOME` build tree is not mounted inside the worker,
+and named what a valid re-measurement needs: either a worker image carrying the
+CUDA devel toolchain, or the build placed on `/workspace` by something that
+already has one. This row measured `dgx`'s worker and adds the part that turns
+an open gap into a blocker for the parity gates, which is that the ORACLE VENV
+is also unreachable from a lease.
+
+### The lease carries bytes, and the exec bit is a mount option, measured 2026-08-17
+
+Probed with two `rc run -d dgx:gpu0 --max-runtime 3m` jobs,
+`1cb56f84-62bf-4c90-b138-9bd4c3b0617a` and
+`c692d5a0-ec3d-4498-86e4-e86a2864e91a`. Verify this again before you plan work
+around it, because the worker image and the mount options can change under you.
+
+`/workspace` in the worker and `/mnt/nas_share/rc/` on a local host are the same
+folder. A file written from the worker appeared locally under that path, and a
+file staged locally was read by the worker. The worker's `df` reported
+`//192.168.68.102/Data`, 7.3T total, 4.0T available, 46% used.
+
+**Direct execution off `/workspace` is refused, and the mount causes it rather
+than a `noexec` flag.** The worker mounts the share with `file_mode=0664`,
+`dir_mode=0775`, `nounix`, `forceuid` and `forcegid`, and the option list holds
+no `noexec`. The same bytes read `-rwxr-xr-x` on the local host, which mounts
+the share with `file_mode=0755`, and `-rw-rw-r--` in the worker, so the exec bit
+is a presentation of each mount and not stored state. In the worker, `chmod +x`
+failed with `Operation not permitted`, and a staged shell script and a copied
+ELF binary each failed to start with `Permission denied` and exit code 126.
+
+**Three routes ran staged content anyway, and each measured green.** Record the
+distinction, because a missing exec bit reads like a wall and is not one.
+
+| Route | Measured |
+|---|---|
+| `sh /workspace/staged.sh` | printed the script's output, exit 0 |
+| `/lib/ld-linux-aarch64.so.1 /workspace/echo_copy` | ran the ELF, exit 0 |
+| `cp` to `/tmp`, then `chmod +x`, then run | ran the script and the ELF, exit 0 |
+
+`/tmp`, `/var/tmp` and `$HOME`, which is `/home/rc`, are writable, take a real
+exec bit, and sit on a 3.6T overlay with 2.5T available. `/dev/shm` is 64M. The
+job's working directory `/` is not writable.
+
+**So the lease carries bytes, and bytes are enough to run.** A runtime staged on
+`/workspace` can start under the dynamic loader, or after a copy to `/tmp`.
+**This paragraph used to add that the `dgx:gpu0` worker cannot produce or fetch
+that runtime, because it had no `curl`, `wget`, `git`, `gcc`, `nvcc`, `cmake` or
+`python3`. That clause is SUPERSEDED.** The worker runs as root and carries every
+one of those names except the CUDA toolkit, and a job apt-installs `nvcc` from
+`developer.download.nvidia.com` per run
+([#1213](https://github.com/mudler/vllm.cpp/issues/1213)). Present and useful
+for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **The
+`thor:gpu0` worker produces one as well**, because it is root and carries
+`apt-get` and `gcc`. That is the section below.
+
+**This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
+not close it.** The HOST venv at `~/venvs/vllm-oracle-pin-555967922` stays
+unreachable from a lease, and only a host-side actor reached over `ssh` can
+place a copy of it on the NAS. That route is no longer the only one, because a
+lease BUILT the pin on 2026-08-18 rather than copying it
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)). **Whether a relocated CUDA runtime then starts is no longer
+UNMEASURED. It starts, on `thor:gpu0`.** The section below has the reading. A
+CUDA virtual environment still holds absolute paths in its shebangs and its
+`RECORD` files, so a `pip install --target` tree is the shape that was measured
+and a copied venv is not.
+
+**Three fleet-side changes would each remove the staging problem, and none of
+them is ours to make.** Whoever owns the fleet picks one. **A fourth route was
+then measured, and it needs nobody's permission:** the `thor:gpu0` worker runs
+as root with a working `apt-get`, so a job provisions its own container.
+
+1. The worker image gains a toolchain and a Python interpreter.
+2. `rc run` gains an `--image` flag, so a job selects an image that has them.
+3. `/workspace` is mounted so that a file there can carry an exec bit. This one
+   removes the copy step only, because the two routes above already execute.
+
+### A relocated CUDA runtime starts on `thor:gpu0`, measured 2026-08-17
+
+Probed with six `rc run` jobs on `thor:gpu0`: `6f4bdb03`, `9c0ebeac`, `8beba132`,
+`f60d945f`, `63c60a90` and `fd5654c0`. A `torch`, `triton` and `numpy` tree
+staged on `/workspace` imports, initializes CUDA, runs a bf16 matmul, and
+compiles and executes a Triton kernel. The job IDs in full, the staged-script
+sha256 values, the four walls and the working recipe are in
+[`lease-runtime-staging.md`](specs/lease-runtime-staging.md)
+([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
+
+```
+torch.__version__= 2.13.0+cu130      cuda available = True
+device 0         = NVIDIA Thor       capability     = (11, 0)
+triton.__version__ = 3.7.1           TRITON_JIT_OK  = 4096.0 PASS
+```
+
+The recipe, once per worker container:
+
+```sh
+apt-get update -qq && apt-get install -y -qq python3-dev
+mkdir -p /tmp/tp && cp -a /workspace/oracle-probe/site/triton /tmp/tp/
+chmod -R +x /tmp/tp/triton/backends/nvidia/bin/
+
+export PYTHONPATH=/tmp/tp:/workspace/oracle-probe/site
+export CPATH=/workspace/oracle-probe/pyhdr/python3.12:${CPATH:-}
+```
+
+**Read the scope before you quote it.** This is `thor:gpu0` at capability (11,0)
+and nothing else. The GB10 is `sm_121a`, and this tree was never staged there,
+so nothing here licenses a claim about the Spark. Only `torch`, `triton` and
+`numpy` are in this tree, so the pinned vLLM oracle is not shown to run by it.
+The clause this paragraph used to carry, that the oracle "needs `nvcc`, which
+the worker lacks", is FALSIFIED: a `dgx:gpu0` lease built the pin against a
+staged CUDA toolkit on 2026-08-18, in the section after the next one. The torch
+wheel is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`, and
+that skew is recorded as observed rather than adjudicated.
+
+**A prebuilt wheel does not remove the `nvcc` requirement, and that is measured.**
+An aarch64 vLLM wheel exists in general: `pip download --no-deps vllm` on the
+worker fetched `vllm-0.27.1-cp38-abi3-manylinux_2_28_aarch64.whl`, 307,180,998
+bytes. Our pin is not reachable that way, because
+`https://wheels.vllm.ai/nightly/vllm/` lists wheels for exactly ONE commit and is
+a moving pointer rather than an archive, and because the pin is a development
+version that is not on PyPI. Four 404s under a per-commit URL scheme were also
+seen, and they prove nothing, because that scheme was never confirmed against a
+known-good case. So reproducing the pinned oracle needs a source build or a
+deliberate pin advance. Nobody established that vLLM never retains per-commit
+wheels. That source build was then run inside a lease and produced our own
+wheel, so the route this paragraph names is open.
+
+### The pinned oracle builds inside a lease on `dgx:gpu0`, measured 2026-08-18
+
+Two `rc run` jobs on `dgx:gpu0`. The pinned vLLM oracle builds from source,
+installs, imports, and sees the GPU inside a lease. No raw `ssh` was used, so
+the fleet reported the box as held for the whole window. The job details, the
+staged-script hashes, the four staging walls and the non-claims are in
+[`oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md)
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)).
+
+```
+HEAD             = 5559679229bc961848b121ccdeaa8fa5d79bec98   PIN CONFIRMED
+nvcc             = release 13.3, V13.3.73    NVCC_RC=0
+wheel            = vllm-0.1.dev1+g555967922.cu133-cp312-cp312-linux_aarch64.whl
+vllm.__version__ = 0.1.dev1+g555967922       IDENTITY_RC=0
+cuda True NVIDIA GB10                        CUDA_RC=0
+```
+
+The `nvcc` came from the CUDA toolkit that row `MODEL-NEMOTRON-H-ABI-A3-E2E`
+staged on the NAS. The build script asserts `HEAD` against the pin before it
+compiles anything, and it aborts when the two differ.
+
+**Read the scope before you quote it, because three things are UNMEASURED.**
+Running a model is untested: only the build, the install, the import and
+`torch.cuda.is_available()` were measured, and the recorded failure mode of the
+step after `torch.compile` on this host is a reboot of the box
+(`.agents/specs/mtp-k-gt-1.md`). The wheel reports `0.1.dev1+g555967922` while
+`.agents/upstream-sync.md` records
+`vllm_runtime_version = 0.23.1rc1.dev1511+g555967922`, an OPEN discrepancy whose
+cause is the shallow fetch that stops `setuptools_scm` counting the commits
+since the last tag. The virtual environment is NOT staged, because that job was
+killed at its 90-minute ceiling and its partial tree was removed, so only the
+WHEEL is durable.
+
+**Two staging traps are worth carrying forward.** A `cp -a` from the NAS
+preserves `file_mode=0664`, so `nvcc` exits 126, and CIFS `nounix` stores no
+symlink, so a copied CUDA toolkit loses `include`, `lib64` and 32 library links
+and CMake then reports
+`Could NOT find CUDA (missing: CUDA_INCLUDE_DIRS CUDA_CUDART_LIBRARY) (found version "13.3")`,
+which names the version and denies the toolkit in one line. **The `rc` worker
+container is REUSED between jobs**, so a repair inside a staging branch is
+skipped on the next run and reports `nvcc already in place`. Write an
+environment repair unconditionally, and assert its postcondition.
+
+### The `flock` orphan hazard that motivated the replacement
+
+The harness family in this repository puts the `flock` handle on a **subshell**,
+not on the `timeout` or wrapper process a reader would check. Kill the wrapper
+and an ORPHAN survives holding the mutex, with its output pipe severed, and it
+looks perfectly idle to every instrument a reader reaches for.
+
+Measured 2026-08-17 (`.agents/specs/mtp-k-gt-1.md`, "What held the mutex"):
+`nvidia-smi --query-compute-apps` was EMPTY and loadavg stayed near 1.1, which
+reads as a finished holder. The holder was PID 333128, `bash -s 8000`, `PPid: 1`,
+holding `fd 3` on the lock file, with `fd 1` and `fd 2` still pointing at the
+pipe its dead `tee` had been reading. It was not idle. It held a live container
+and was inside a readiness poll, and it blocked its own owner's restart for about
+50 minutes as well as the queued gate. Read the whole process chain and
+`/proc/<pid>/fd` before you call a lock stale, and never kill an unowned PID.
+
 ## Registering your own environment
 
 The profiles below are per-developer facts, not requirements: nothing here is
@@ -57,7 +371,9 @@ environment:
   vendored target `sm_120`, CUTLASS and FlashAttention-2 enabled.
 - **CPU development path:** CPU reference backend + engine logic + CI
   development.
-- **Ettore DGX release-gate profile**: `ssh dgx.casa` — DGX Spark, GB10 (Blackwell, **sm_121**),
+- **Ettore DGX release-gate profile**: device `dgx:gpu0`, host `dgx.casa` (claim
+  it with `rc`, and read "Reaching a GPU" earlier in this file before you use the
+  `ssh` recipes recorded here). DGX Spark, GB10 (Blackwell, **sm_121**),
   ~119 GB unified memory, 20 cores, CUDA toolkit 13.0.88 (nvcc); compute
   capability 12.1 → sm_121. Unified memory: both gate models fit
   in bf16; the machine is memory-bandwidth-bound (~273 GB/s class) — decode
@@ -66,6 +382,23 @@ environment:
   never share a build tree between agents.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
+  - **The NAS mounts at `/usr/local/nas_share`, and `/mnt/nas_share` is GONE
+    (re-verified 2026-08-16).** `.env` sets
+    `CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints`, where 18 checkpoint
+    directories resolve, `nemotron-3.5-lightning-30b-nvfp4` and
+    `nemotron-3.5-lightning-30b-gguf` among them. **Do not restore the old path
+    as a convenience symlink.** `/mnt` is on the EPHEMERAL root overlay of this
+    immutable Kairos OS, so anything created there is gone after the next
+    reboot; `/usr/local` is `COS_PERSISTENT` and survives. That is the same
+    property that made an earlier `/oem` `rootfs`-stage change cost a boot (see
+    [[kairos-oem-rw-paths-change-cost-a-boot]]). Measured 2026-08-16, after the
+    box returned from an 8 h 19 min outage: the mount itself came back because
+    the `/oem` boot-stage unit worked and `findmnt /usr/local/nas_share` was
+    clean, and `/mnt/nas_share` did not come back. Every path built on `/mnt`
+    broke while `.env` still declared it, which blocks a checkpoint-loading gate
+    silently — a gate that reads a path `.env` does not declare is not the gate
+    its spec names. Check `findmnt /usr/local/nas_share` before you conclude
+    that a checkpoint is missing (#1073).
   - **MANDATORY gate-build flags on this box (re-proven 2026-07-29).** A model
     gate configured WITHOUT `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` and
     `-DVLLM_CPP_TRITON=ON` is NOT the production stack: cutlass-off silently
@@ -130,7 +463,9 @@ environment:
     parallel-flake advice in the Apple/Metal profile below does not transfer
     here. Serialising also means every other probe queues behind the suite, so
     run attribution arms BEFORE a full suite, never during one.
-  - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds the
+  - **GPU mutex:** this runs INSIDE an `rc` lease, never instead of one. The
+    lease decides who gets the box. The mutex serialises the work of whoever
+    holds it. Every CUDA test/model/serve/benchmark/profile holds the
     `${GPU_LOCK}` file mutex — **`$HOME/gpu.lock`**, which is what `.env.example`
     ships and what every script here falls back to via
     `${GPU_LOCK:-$HOME/gpu.lock}` — for the whole job or multi-arm series WHEN
@@ -151,7 +486,8 @@ environment:
     gate checkpoints, APEX GGUF evidence and sources were preserved; the volume
     had 359 GB free afterward. Maintain at least 200 GB headroom before adding
     competitor images.
-- **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: `ssh 192.168.68.23`
+- **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: device `thor:gpu0`,
+  host `192.168.68.23` (claim it with `rc` first)
   — NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, 14 CPU cores, ~122 GB
   UNIFIED memory. `nvidia-smi --query-gpu=compute_cap` returns **11.0**. Host of
   the first non-GB10 runtime proof (`CLAIM-CUDA-SM110-RUNTIME`, 2026-07-27).
@@ -219,6 +555,69 @@ environment:
     `EngineCore failed to start`. Export **`CC=/usr/bin/gcc`** alongside the documented
     `ninja` PATH fix and it runs. The `vllm-oracle` symlink still points at the 0.25.0
     rollback rather than the pin (issue #375, open).
+  - **★ `CC=/usr/bin/gcc` is STALE for the reimaged host, and the correction is to
+    run the oracle IN A CONTAINER (2026-08-17, `SPEC-MTP-K-GT-1`).** The bullet above
+    is right about the failure and wrong about the cure on this host. Measured on
+    `kairos-17dd`: there is no `gcc`, no `cc`, no `clang`, no `ninja` and no `nvcc`
+    anywhere on the host, and `/usr/include` carries neither `stdio.h` nor
+    `python3.12/Python.h`, so there are no glibc headers and no crt objects either.
+    Exporting `CC=/usr/bin/gcc` therefore names a file that does not exist. Triton
+    3.7.1 in the pinned venv ships only `ptxas`/`cuobjdump`/`nvdisasm`, no C
+    compiler, so nothing in the venv supplies one.
+    **What this looks like if you do not know it:** the weights load, the engine
+    then dies `RuntimeError: Failed to find C compiler`, and vLLM reports
+    `Engine core initialization failed. See root cause above. Failed core proc(s): {}`.
+    That is an INSTRUMENT failure wearing the shape of a verdict about the model.
+    Do NOT reach for `enforce_eager` to get past it: it is forbidden as a
+    denominator, and it would silently change the thing being measured.
+    **The cure**, and the shape `~/rs35b/run_oracle.sh` already used: run the host
+    venv inside `nvidia/cuda:13.0.1-devel-ubuntu24.04` with
+    `python3 python3-dev ninja-build build-essential libnuma1` installed, `-v
+    $HOME:$HOME`, `CC=/usr/bin/gcc` and `/usr/local/cuda/bin` on `PATH`. The image
+    ships python **3.12.3**, which matches the venv's `pyvenv.cfg` exactly, so the
+    HOST venv resolves inside the container. Bake the toolchain into an image
+    (`~/mtpgate/Dockerfile.oracle`, `mtpgate-oracle:1`) rather than `apt-get`ing it
+    per leg: a leg that must reach the network to start can fail for a reason that
+    has nothing to do with the measurement. Assert `gcc` and `ninja` INSIDE the
+    container before the model loads, so a broken image aborts by name instead of
+    four minutes later as an engine error. Container egress WAS available on
+    2026-08-17; the box has been recorded without it before, which is the argument
+    for baking rather than installing.
+    **★ AND THE PINNED ORACLE CANNOT CURRENTLY LOAD A 27B HERE AT ALL: it eats the
+    WHOLE MACHINE in the step after `torch.compile`, and `gpu_memory_utilization`
+    does NOT control it.** Measured the same day, once the toolchain fix let an
+    oracle get that far for the first time. At `gpu_memory_utilization=0.75` the
+    engine held about **110 GiB of HOST RAM** while `nvidia-smi` reported only
+    26 GiB on the device, hung 45 minutes at loadavg **260** with **0 GiB
+    available**, and `sshd` stopped completing a banner exchange while the box
+    still answered ICMP. Killing the container took it from 118 of 119 GiB used to
+    4 of 119 in under ten seconds.
+    **The obvious attribution to that 0.75 was tested and REFUTED.** A second run
+    at **0.30**, with a 5-second host-memory sampler running, collapsed the same
+    way: `avail_mb` 87683 at 09:00:47 and **0** at 09:02:25, loadavg 1.19 to 39.90.
+    Weight loading finished with 66 GiB free and `torch.compile` finished with
+    88 GiB free, so the collapse is neither of those. It is the step immediately
+    AFTER compilation and it is insensitive to the KV-pool fraction, which points
+    at the profiling forward and the graph capture (`max_num_batched_tokens=8192`,
+    `cudagraph_capture_sizes: [1, 2, 4, 8]`, every allocation host-backed here).
+    **That last part is a hypothesis with a located step, not a result.** Vary
+    those one at a time with the sampler running and believe nothing without an
+    A/B. **The 0.75 run THRASHED for 42 minutes and survived (`boot_id` and
+    `uptime` unchanged); the 0.30 run REBOOTED THE BOX** — `boot_id` moved
+    `5bbdc432…` to `bd5c6e7a…` and `journalctl --list-boots` shows boot `-1`
+    ending 09:10:15Z against boot `0` beginning 09:13:55Z. So a lower fraction is
+    NOT a safety margin: assume the box is at risk on every attempt. Always run a
+    `MemAvailable` sampler beside any load here; `nvidia-smi` is blind to all of
+    it, and the sampler is what turned a 45-minute mystery into a timestamped
+    100-second collapse. While sshd was answering intermittently one connection
+    returned `Permission denied (publickey)`; that is a memory-pressure artefact,
+    not a credential problem, and the same key worked seconds after the reboot.
+    **A cleanup trap is not a stop button.** Both DGX drivers used
+    `trap cleanup EXIT INT TERM` where `cleanup` resets the clocks and RETURNS, so
+    `SIGTERM` reset the clocks and the script then started its NEXT leg on a box
+    with no memory left. Put an `exit` on the signal path, and `docker kill` the
+    current named container inside the handler: `timeout` signals `docker run`, and
+    the container outlives it.
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import
@@ -431,8 +830,21 @@ inner 4096, state 128; context 262144.
   only `GL_KHR_cooperative_matrix`, and the build still configures and runs. A
   source-built shaderc `v2026.4-dev` lives at `/tmp/shaderc/b/glslc/glslc`; pass
   `-DVulkan_GLSLC_EXECUTABLE=` to it. **Verify the runtime banner says
-  `matrix cores: NV_coopmat2` before trusting any number.** llama.cpp at pin
-  `237ad9b96` is unpacked at `~/lcpp-vk` with `build-vk/bin/llama-bench` built.
+  `matrix cores: NV_coopmat2` before trusting any number.** llama.cpp is
+  unpacked at `~/lcpp-vk` with `build-vk/bin/llama-bench` built, **and that tree
+  is the SUPERSEDED fork `237ad9b96`, not the pin.** Do not reuse it. The
+  llama.cpp oracle is stock `b10451` since 2026-08-16
+  ([`oracles/llama-cpp.md`](oracles/llama-cpp.md)). `237ad9b96` is a local-only
+  commit on the developer's `localai-paged` branch, 65 of our own performance
+  commits past upstream `b9827`, built from a working tree with 27 uncommitted
+  entries. `~/lcpp-vk` therefore reproduces neither the pin nor any identifiable
+  object. The `BENCH-VK-LLAMA` decode `4.36 vs 4.35 MET` measured with it is the
+  **most fragile verdict** in the enumeration, a 0.23% margin inside a 0.69%
+  spread, and re-taking it is owed under
+  [#1003](https://github.com/mudler/vllm.cpp/issues/1003). Unpack the pinned SHA
+  fresh and assert `git status --porcelain` empty before recording any number.
+  Enumeration and the clean-tree rule:
+  [`specs/oracle-llamacpp-repin-stock.md`](specs/oracle-llamacpp-repin-stock.md).
 
 - **No Intel GPU exists on any box here**, so `BACKEND-XPU` end-to-end work is
   HW-BLOCKED; only policy-port, compile coverage and oneAPI CPU-device unit

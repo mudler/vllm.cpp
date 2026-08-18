@@ -101,7 +101,7 @@ void PrepareGemma4ForConditionalGeneration(LoadedModel& model,
   (void)queue;
   const char* env = std::getenv("VT_GEMMA4_RESIDENT_EXPERTS");
   if (env == nullptr || env[0] != '1') return;
-  auto& gemma = static_cast<Gemma4LoadedModel&>(model);
+  auto& gemma = ModelAs<Gemma4LoadedModel>(model, "Gemma4ForConditionalGeneration");
   Gemma4Weights& w = const_cast<Gemma4Weights&>(gemma.weights());
   int ngpu = 2;  // Upload clamps to hipGetDeviceCount
   if (const char* g = std::getenv("VT_GEMMA4_RESIDENT_GPUS"))
@@ -135,7 +135,7 @@ void PrepareGemma4ForConditionalGeneration(LoadedModel& model,
 
 ForwardLogits ForwardGemma4ForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  const auto& gemma = static_cast<Gemma4LoadedModel&>(model);
+  const auto& gemma = ModelAs<Gemma4LoadedModel>(model, "Gemma4ForConditionalGeneration");
   const Gemma4Weights& weights = gemma.weights();
   // CLAIM-GEMMA4-MM-E2E: the multimodal branch. When ModelForwardInput.mm is set
   // (the Gemma4GenerateGreedyViaRegistry driver / the runner mm-path) the hidden

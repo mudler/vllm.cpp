@@ -22,9 +22,11 @@ Commit the spike spec with source and dependency anchors. Then implement.
 ## The port cycle
 
 Implement the smallest coherent *vertical* slice — something that runs
-end-to-end, not a layer that nothing calls yet. Keep local names and structure
-mechanically traceable to upstream so the next person can diff them by eye.
-Record every C++ adaptation you had to make and why.
+end-to-end, not a layer that nothing calls yet. That is a rule, not a
+preference: see [`reachability.md`](reachability.md) for what counts as reached,
+and for how to land a staged slice that is not reached yet. Keep local names and
+structure mechanically traceable to upstream so the next person can diff them by
+eye. Record every C++ adaptation you had to make and why.
 
 Port the upstream test before the behavior. Capture the red. Implement. Get
 focused green. Run the full gate. Then hand to a fresh reviewer.
@@ -42,6 +44,27 @@ lever is unreachable.
 Anything genuinely written from scratch is recorded as such in
 [`porting-inventory.md`](porting-inventory.md) §9. "I couldn't find it upstream"
 is a search result, not a conclusion — say which paths you searched.
+
+### Name the symbol, not only the line
+
+A line number is a coordinate into a moving file, so it decays. Write
+`` `path/to/file.cpp::SymbolName` `` whenever a citation crosses a file
+boundary. Keep the line number beside it only while you are reading; a citation
+that has to survive somebody else's edit carries the symbol.
+
+`src/vllm/entrypoints/model_loader.cpp` is the measured case
+([#1143](https://github.com/mudler/vllm.cpp/issues/1143)): cited by line from
+109 sites in 45 files, and one 45-line insertion near its top moved 203 of those
+references at once, in files that change never opened. The same defect at
+upstream scale is [#1139](https://github.com/mudler/vllm.cpp/issues/1139), where
+a pin advance left three `vllm/v1/worker/**` line anchors pointing at unrelated
+code and two of them had already been copied elsewhere.
+
+`scripts/check-symbol-anchors.py` gates the in-repo half of the convention: the
+symbol a citation names must still be in the file it names. `--upstream-root
+<vllm-checkout>` runs the same question against the pinned oracle, which CI
+cannot do because it has no checkout. Design, limits, and what the two runs
+measured: [`specs/citation-anchor-freshness.md`](specs/citation-anchor-freshness.md).
 
 ## Mirror the memory format, not just the math
 
@@ -86,7 +109,9 @@ Route through the shared path or record one exact tracked exception:
 
 A capability reachable only through an example's internals is not shipped. Grow
 the ABI first, then rewrite the example as a thin client, then delete the
-parallel implementation.
+parallel implementation. The same holds for the shapes no checker sees: a
+parameter no caller passes, a branch no released config selects, a flag with no
+default path through it.
 
 New hardware and new models are additive files mirroring vLLM's structure — not
 edits that special-case an existing path.

@@ -247,7 +247,10 @@ std::string TinyConfigJson() {
   return j.dump();
 }
 
-constexpr int kBlockSize = 8;
+// The engine-level attention backends (FLASH_ATTN + ROCM_ATTN) enforce
+// block_size % 16 == 0 in get_kv_cache_shape; the runner now validates at
+// init, so the fixture uses a real block size (vLLM gate models use 16).
+constexpr int kBlockSize = 16;
 constexpr int kNumBlocks = 8;
 constexpr int kMaxModelLen = 32;
 

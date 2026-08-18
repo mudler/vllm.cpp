@@ -111,6 +111,8 @@ ALL_GREEN_JOBS = [
         "cuda-fat-build",
         "device-leakage",
         "vulkan-spirv-freshness",
+        "windows-msvc-cpu",
+        "windows-msvc-vulkan",
         "sanitize-cpu (address,undefined)",
         "sanitize-cpu (thread)",
     )
@@ -211,7 +213,12 @@ class VerdictTests(unittest.TestCase):
             tuple(sorted(baseline.EXPECTED_JOBS)),
             baseline.expected_jobs_from_workflow(),
         )
-        self.assertEqual(len(baseline.EXPECTED_JOBS), 9)
+        # 9 until 2026-08-17, then 11: `windows-msvc-cpu` and
+        # `windows-msvc-vulkan` joined the lane (#503). The literal is here so
+        # that DROPPING a job cannot be spelled as an edit to one list -- the
+        # equality above is satisfied by narrowing both sides together, and this
+        # is not.
+        self.assertEqual(len(baseline.EXPECTED_JOBS), 11)
 
     def test_an_unfinished_job_is_pending_not_failed(self) -> None:
         """Fail-closed is right; calling it a FAILURE is a wrong label."""
@@ -644,14 +651,25 @@ class WorkflowLaneTests(unittest.TestCase):
                         f"{name} cancel-in-progress is wrong for {event}",
                     )
 
-    def test_the_workflow_level_group_cancels_prs_and_nothing_else(self) -> None:
+    def test_the_workflow_level_group_cancels_prs_and_pushes_only(self) -> None:
+        """#822 ratified latest-only for BOTH the pull request and main push
+        lanes. It was previously pull-request-only, because a cancelled push
+        left its diff-scoped range permanently unwalked. That is now safe: the
+        gates base on the last SUCCESSFULLY gated commit, so a cancelled run's
+        commits are covered by the next one (#863).
+
+        `schedule` and `workflow_dispatch` stay non-cancellable. The baseline
+        lane exists to answer "is main green", and a cancelled baseline answers
+        nothing (#274).
+        """
         header = self.text.split("\njobs:\n", 1)[0]
         cancel = re.search(r"(?m)^  cancel-in-progress: (.+)$", header)
         self.assertIsNotNone(cancel)
         for event in EVENTS:
             with self.subTest(event=event):
                 self.assertEqual(
-                    resolve_boolean(cancel.group(1), event), event == "pull_request"
+                    resolve_boolean(cancel.group(1), event),
+                    event in ("pull_request", "push"),
                 )
 
     def test_diff_scoped_jobs_still_carry_no_concurrency_group(self) -> None:
@@ -699,6 +717,85 @@ class WorkflowLaneTests(unittest.TestCase):
             block,
             "continue-on-error makes needs.<job>.result report success; use the API",
         )
+
+    def test_the_windows_proofs_run_on_the_baseline_lane_and_not_on_push(self) -> None:
+        """#503: `main` could establish neither green nor red under MSVC.
+
+        Both jobs were `if: github.event_name == 'pull_request'`, so the
+        schedule/dispatch lane never DEFINED them -- and a job that is not
+        defined for an event is not `skipped`, it is absent, so it appeared in
+        no list `main-baseline.py` prints. The verdict read GREEN because it
+        graded a set that excluded them. Measured on the deliberate baseline run
+        32044993401 (`conclusion=success`): both jobs `skipped`. #1068 then
+        stopped `main` compiling under MSVC and surfaced on an unrelated
+        contributor's pull request rather than on `main`.
+
+        RESOLVED per event, not grepped, for the reason `resolve_boolean`
+        exists: `always()` and `github.event_name != 'push'` both admit the
+        baseline lane and both are wrong, and only the `push` half separates
+        them from the intended condition. The `push` assertion is not a style
+        preference -- that lane's jobs cancel one another by construction (26 of
+        40 runs in the window this suite measures) and 55 pushes/day times two
+        `windows-2022` runners buys nothing a baseline does not already have.
+        """
+        for name in ("windows-msvc-cpu", "windows-msvc-vulkan"):
+            block = job_block(self.text, name)
+            conditions = re.findall(r"(?m)^    if: (.+)$", block)
+            self.assertEqual(len(conditions), 1, f"{name} must have exactly one if:")
+            for event in EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertEqual(
+                        resolve_boolean(conditions[0], event),
+                        event != "push",
+                        f"{name} must run on {event}" if event != "push"
+                        else f"{name} must not run on push",
+                    )
+
+    def test_the_windows_proofs_are_covered_by_the_published_verdict(self) -> None:
+        """Running is half of it; the verdict has to GRADE them.
+
+        `baseline-summary` waits on its `needs:` list and `EXPECTED_JOBS` is
+        read from it, so a job that runs on the lane but is absent from both
+        would fail without moving the verdict -- the `continue-on-error` shape
+        of #274 reached by omission instead of by a masked conclusion.
+        """
+        needs = job_block(self.text, baseline.SUMMARY_JOB)
+        for name in ("windows-msvc-cpu", "windows-msvc-vulkan"):
+            with self.subTest(job=name):
+                self.assertIn(f"      - {name}\n", needs)
+                self.assertIn(name, baseline.EXPECTED_JOBS)
+
+    def test_a_red_windows_proof_makes_the_baseline_red(self) -> None:
+        """The consequence, executed rather than asserted about the workflow.
+
+        This is the state on the day it lands: #584 fast-fails
+        `test_openai_api_server.exe` with 0xC0000409 on every run of both lanes,
+        so the first baseline that can see them is RED. That is the correct
+        first verdict -- it was GREEN before only because it never ran them.
+        """
+        jobs = [
+            entry for entry in ALL_GREEN_JOBS if entry["name"] != "windows-msvc-cpu"
+        ] + [job("windows-msvc-cpu", "failure")]
+        item = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(item.green)
+        self.assertIn("windows-msvc-cpu", item.failing)
+        self.assertEqual(item.missing, [], "it ran; it is failing, not absent")
+
+    def test_a_windows_proof_skipped_back_off_the_lane_is_red_not_green(self) -> None:
+        """The exact regression #503 is about, as an executable statement.
+
+        Reverting the `if:` makes the API report the job `skipped`, which
+        `NOT_RUN_CONCLUSIONS` deliberately reads as absent rather than as a
+        pass. Before this row that absence discharged no expectation because
+        there was no expectation, and the verdict printed GREEN.
+        """
+        jobs = [
+            entry for entry in ALL_GREEN_JOBS if entry["name"] != "windows-msvc-vulkan"
+        ] + [job("windows-msvc-vulkan", "skipped")]
+        item = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(item.green)
+        self.assertIn("windows-msvc-vulkan", item.missing)
+        self.assertNotIn("windows-msvc-vulkan", item.failing)
 
     def test_sanitize_cpu_stays_continue_on_error_for_the_push_and_pr_lanes(self) -> None:
         """Out of scope for this row: it is the closing step of the hardening
@@ -766,15 +863,32 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
     guarding them fails the second half.
     """
 
-    RANGE_SCOPED = ("check-commit-trailers.py", "check-role-discipline.py")
+    # The strict trailer walk moved to `commit-protocol-tag` (#863), which opts
+    # out of the baseline lane at the job level and so has no in-step guard to
+    # test here. `ConcurrencySemanticsTests` pins its placement and its base.
+    RANGE_SCOPED = ("check-role-discipline.py",)
     FAKE_BASE = "1" * 40
     FAKE_HEAD = "2" * 40
 
+    # ONLY agent-record. There are two valid ways to keep a diff-scoped checker
+    # off the baseline lane, and this class tests one of them. `agent-record`
+    # RUNS on that lane because most of it is tree-scoped, so its diff-scoped
+    # calls must be guarded IN THE STEP. `documentation-checkpoint` and
+    # `commit-protocol-tag` are diff-scoped end to end and opt out at the JOB
+    # level instead, so they carry no in-step guard and replaying their bodies
+    # here would fail for the wrong reason.
+    #
+    # The strict trailer walk moved OUT of this job to `commit-protocol-tag`
+    # (#863), which is why the counts below dropped by one.
+    DIFF_SCOPED_JOBS = ("agent-record",)
+
     def setUp(self) -> None:
-        self.job = job_block(workflow_text(), "agent-record")
+        text = workflow_text()
+        self.job = "\n".join(job_block(text, name) for name in self.DIFF_SCOPED_JOBS)
         self.steps = [
             step
-            for step in steps_of(self.job)
+            for name in self.DIFF_SCOPED_JOBS
+            for step in steps_of(job_block(text, name))
             if step_env(step).get("PUSH_BASE") == "${{ github.event.before }}"
         ]
 
@@ -785,7 +899,8 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
         while explaining why it is empty on this lane, and a comment consumes
         nothing.
         """
-        self.assertEqual(len(self.steps), 2)
+        # Role discipline is the only diff-scoped call left in this job.
+        self.assertEqual(len(self.steps), 1)
         job_code = "\n".join(code_lines(self.job))
         accounted = "\n".join(
             "\n".join(code_lines("\n".join(step))) for step in self.steps
@@ -793,9 +908,9 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
         self.assertEqual(
             job_code.count("github.event.before"),
             accounted.count("github.event.before"),
-            "an unaccounted github.event.before consumer in agent-record",
+            "an unaccounted github.event.before consumer in a diff-scoped job",
         )
-        self.assertEqual(accounted.count("github.event.before"), 2)
+        self.assertEqual(accounted.count("github.event.before"), 1)
 
     def test_the_baseline_lane_invokes_no_range_scoped_checker_and_exits_zero(self) -> None:
         for event in BASELINE_EVENTS:
@@ -852,15 +967,25 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
                 for argv in invocations:
                     joined = " ".join(argv)
                     for checker in self.RANGE_SCOPED:
-                        if checker in joined:
-                            invoked.add(checker)
-                            self.assertIn(
-                                f"{self.FAKE_BASE}..{self.FAKE_HEAD}"
-                                if checker == "check-commit-trailers.py"
-                                else self.FAKE_BASE,
-                                joined,
-                                f"{checker} got the wrong range on {event}",
-                            )
+                        if checker not in joined:
+                            continue
+                        # `check-commit-trailers.py --message-file` validates the
+                        # pull request BODY, which under `PR_BODY` becomes the
+                        # landed commit message (#848). That invocation is not
+                        # diff-scoped and has no range to carry. It does not
+                        # count as the range-scoped run this case demands, so
+                        # `invoked` stays untouched and the assertion below still
+                        # requires the real range walk to have happened.
+                        if "--message-file" in joined:
+                            continue
+                        invoked.add(checker)
+                        self.assertIn(
+                            f"{self.FAKE_BASE}..{self.FAKE_HEAD}"
+                            if checker == "check-commit-trailers.py"
+                            else self.FAKE_BASE,
+                            joined,
+                            f"{checker} got the wrong range on {event}",
+                        )
             with self.subTest(event=event):
                 self.assertEqual(invoked, set(self.RANGE_SCOPED))
 
@@ -890,9 +1015,292 @@ class SuiteRegistrationTests(unittest.TestCase):
         self.assertIn(f"python3 tests/scripts/{self.NAME}.py", job)
 
     def test_the_agent_record_job_is_unconditional(self) -> None:
-        """A CI registration behind an `if:` is not a registration."""
+        """A CI registration behind an `if:` is not a registration.
+
+        #865 replaced this assertion with one permitting a condition, and three
+        pre-existing checkers went RED on `main` (#873): `check-release-binary-
+        contract.py` and `check-test-registration.py` credit a checker to CI
+        only through `_unconditional_ci_run_blocks`, which drops every job
+        carrying an `if:` at all. So this is not a style pin -- ANY condition
+        here, including the closed-pull-request one, un-registers every checker
+        this job owns.
+
+        #822's closed-PR skip is still enforced, by `needs:`. `last-gated-
+        commit` excludes the closed action, and a skipped dependency skips this
+        job with it, which `ConcurrencySemanticsTests.test_a_closed_pull_
+        request_executes_no_gate` asserts. `always()` would defeat that, so its
+        absence is asserted here too.
+        """
         job = job_block(workflow_text(), "agent-record")
         self.assertNotRegex(job, r"(?m)^    if:")
+        self.assertRegex(job, r"(?m)^    needs: \[last-gated-commit\]$")
+
+
+class ConcurrencySemanticsTests(unittest.TestCase):
+    """#822 lets a superseded run be cancelled. #863 is why that was unsafe.
+
+    A diff-scoped gate walks `base..head` once. If its run is cancelled, no
+    later run re-covers that range, because the next run's `before` is this
+    run's `sha`. The strict trailer walk sat in `agent-record`, which carries a
+    cancellable group keyed on `github.ref` -- constant for every push to main.
+    Measured on run 31851003245: `agent-record` cancelled, the commit fails the
+    strict walk, CI reported nothing.
+
+    Cancellation is safe only while BOTH hold: the diff-scoped gates carry no
+    group, and their base is the last SUCCESSFULLY gated commit rather than the
+    previous push. Each is asserted here, because reverting either one alone
+    silently reopens the hole.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import yaml
+        cls.ci = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        cls.ci_text = WORKFLOW.read_text(encoding="utf-8")
+        containers = ROOT / ".github/workflows/containers.yml"
+        cls.containers = yaml.safe_load(containers.read_text(encoding="utf-8"))
+
+    def owning_job(self, needle: str) -> str:
+        for name, job in self.ci["jobs"].items():
+            for step in job.get("steps", []) or []:
+                if needle in str(step.get("run", "")):
+                    return name
+        raise AssertionError(f"no job runs {needle!r}")
+
+    def test_the_strict_trailer_walk_lives_in_a_group_free_job(self) -> None:
+        owner = self.owning_job("check-commit-trailers.py --range")
+        self.assertIsNone(
+            self.ci["jobs"][owner].get("concurrency"),
+            f"{owner} walks a diff range and carries a concurrency group; a "
+            "cancelled run would skip that range forever (#863)",
+        )
+
+    def test_every_diff_scoped_step_bases_on_the_last_gated_commit(self) -> None:
+        """THE invariant, and it is not group-freeness.
+
+        A workflow-level `cancel-in-progress` cancels every job in the run,
+        including jobs that carry no group of their own. So moving a gate to a
+        group-free job protects nothing once the push lane is latest-only. What
+        protects it is the base: `github.event.before` is the previous push
+        whether or not it was gated, and the last GREEN commit is not. Any step
+        that consumes `before` without that fallback loses its range the first
+        time a push supersedes it.
+        """
+        for name, job in self.ci["jobs"].items():
+            for step in job.get("steps") or []:
+                env = {k: str(v) for k, v in (step.get("env") or {}).items()}
+                if "github.event.before" not in " ".join(env.values()):
+                    continue
+                with self.subTest(job=name, step=step.get("name")):
+                    self.assertIn(
+                        "LAST_GREEN", " ".join(env),
+                        "a diff-scoped step that does not consume the last "
+                        "gated commit; a cancelled push skips its range forever",
+                    )
+                    self.assertIn('LAST_GREEN:-', str(step.get("run", "")))
+
+    def test_agent_record_no_longer_walks_a_diff_range(self) -> None:
+        """It keeps its cancellable group, so it must hold nothing diff-scoped."""
+        body = " ".join(
+            str(s.get("run", "")) for s in self.ci["jobs"]["agent-record"]["steps"]
+        )
+        self.assertNotIn("--range", body)
+        self.assertIsNotNone(self.ci["jobs"]["agent-record"].get("concurrency"))
+
+    def test_the_diff_scoped_base_is_the_last_gated_commit(self) -> None:
+        """The enabling half. Without it, cancelling a push loses the range."""
+        self.assertIn("last-gated-commit", self.ci["jobs"])
+        owner = self.owning_job("check-commit-trailers.py --range")
+        self.assertIn("last-gated-commit", str(self.ci["jobs"][owner].get("needs")))
+        walk = next(
+            s for s in self.ci["jobs"][owner]["steps"]
+            if "check-commit-trailers.py --range" in str(s.get("run", ""))
+        )
+        self.assertIn("LAST_GREEN", str(walk.get("env")))
+
+    def test_the_base_falls_back_when_no_successful_run_is_found(self) -> None:
+        """A failed or rate-limited query must degrade to today's behaviour,
+        never to an empty range that passes vacuously."""
+        owner = self.owning_job("check-commit-trailers.py --range")
+        walk = next(
+            s for s in self.ci["jobs"][owner]["steps"]
+            if "check-commit-trailers.py --range" in str(s.get("run", ""))
+        )
+        self.assertIn('base="$PUSH_BASE"', str(walk["run"]))
+
+    def test_the_push_lane_is_latest_only(self) -> None:
+        group = self.ci["concurrency"]["group"]
+        cancel = str(self.ci["concurrency"]["cancel-in-progress"])
+        self.assertIn("github.ref", group)
+        self.assertNotIn("github.sha", group)
+        self.assertIn("github.event_name == 'push'", cancel)
+
+    def test_the_baseline_lane_stays_non_cancellable(self) -> None:
+        """#274's schedule lane exists to answer 'is main green'. A cancelled
+        baseline answers nothing."""
+        cancel = str(self.ci["concurrency"]["cancel-in-progress"])
+        self.assertNotIn("schedule", cancel)
+        self.assertIn("github.event_name", self.ci["concurrency"]["group"])
+
+    # The exception, pinned so a third job cannot join it silently. The ENTIRE
+    # job mapping of these two is compared for equality against a literal by
+    # `scripts/check-release-workflow.py::validate_pr_ci` -- the read-only
+    # native Windows PR proof schema, which is how the PR lane proves it holds
+    # no release, upload, write-token or OIDC authority (#117). The schema
+    # admits no extra key, so `needs:` is rejected, and it fixes the `if:`
+    # string, so a closed-action clause is rejected. #865 added one anyway and
+    # left that checker and `test_release_pipeline.py` RED on `main` (#873).
+    # The pinned authority schema outranks a cost optimisation; the residual --
+    # two Windows runners started per closed pull request -- is #874.
+    UNGUARDABLE_JOBS = ("windows-msvc-cpu", "windows-msvc-vulkan")
+
+    def test_every_unguardable_job_is_one_the_pinned_schema_owns(self) -> None:
+        """The list above is an ALLOWLIST, and prose is not a ratchet.
+
+        The exemption is justified by one mechanical fact: `validate_pr_ci`
+        compares these jobs' WHOLE mapping against a literal, so neither
+        `needs:` nor a closed clause can be added to them. Assert that fact
+        rather than the two names, and a job can only be exempted by actually
+        being in that schema. Without this, appending a name to the tuple
+        exempts any job at all and every gate stays green -- measured.
+
+        `contracts` is a local inside the checker, so this PARSES the checker
+        instead of importing it. Exposing it would mean editing `scripts/`,
+        and the whole subject of this row is that a test may not reshape the
+        thing it pins in order to pin it.
+        """
+        import ast
+
+        checker = ROOT / "scripts/check-release-workflow.py"
+        pinned = {
+            entry.elts[0].value
+            for function in ast.walk(ast.parse(checker.read_text(encoding="utf-8")))
+            if isinstance(function, ast.FunctionDef)
+            and function.name == "validate_pr_ci"
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "contracts" for t in node.targets)
+            for entry in node.value.elts
+        }
+        self.assertTrue(
+            pinned,
+            f"no `contracts` tuple found in {checker.name}::validate_pr_ci; the "
+            "exemption below cannot be justified against a schema this cannot read",
+        )
+        self.assertLessEqual(
+            set(self.UNGUARDABLE_JOBS), pinned,
+            "UNGUARDABLE_JOBS may only name jobs whose whole mapping is pinned "
+            f"byte-for-byte by validate_pr_ci (it pins {sorted(pinned)}); every "
+            "other job can carry the closed guard and must (#874)",
+        )
+
+    # GitHub skips a job whose `needs:` dependency was skipped -- UNLESS the
+    # job's own `if:` calls a status check function. `always()` is not the only
+    # one: `!cancelled()`, `failure()` and `success() || failure()` resurrect a
+    # dependent exactly the same way, and a `documentation-checkpoint` written
+    # as `${{ !cancelled() && (...) }}` with no closed clause at all passed
+    # every gate before this landed.
+    #
+    # So this permits a SHAPE instead of forbidding four names: a job leaning on
+    # the transitive form may carry no expression call at all. Everything that
+    # defeats skip propagation is a call, which makes this a superset of
+    # `success` / `failure` / `cancelled` / `always` and keeps it correct if
+    # GitHub ever adds a fifth. It fails CLOSED -- a harmless `contains(...)` is
+    # refused too -- and the answer to that is to carry the closed clause
+    # directly, which every job but the two pinned Windows proofs can do.
+    _CALLS_AN_EXPRESSION_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*\(")
+
+    def _skipped_on_a_closed_pull_request(self, name: str, seen: frozenset) -> bool:
+        """A job executes no gate on a closed PR if it says so itself, or if it
+        `needs:` a job that does -- a skipped dependency skips its dependents.
+
+        The transitive form is only load-bearing while the dependent's own `if:`
+        cannot override the skip. A status check function is exactly what
+        overrides it, so a job leaning on `needs:` must call no function at all,
+        and this returns False when it does.
+        """
+        if name in seen:
+            return False
+        job = self.ci["jobs"][name]
+        condition = str(job.get("if", ""))
+        if "closed" in condition:
+            return True
+        if self._CALLS_AN_EXPRESSION_FUNCTION.search(condition):
+            return False
+        needs = job.get("needs") or []
+        if isinstance(needs, str):
+            needs = [needs]
+        return any(
+            self._skipped_on_a_closed_pull_request(dependency, seen | {name})
+            for dependency in needs
+        )
+
+    def test_a_closed_pull_request_executes_no_gate(self) -> None:
+        on = self.ci[True] if True in self.ci else self.ci["on"]
+        pr = on.get("pull_request") or {}
+        self.assertIn(
+            "closed", (pr.get("types") or []),
+            "the pull_request trigger must list `closed`, or a closed PR never "
+            "enters the concurrency group and its run is never superseded",
+        )
+        for name in self.ci["jobs"]:
+            with self.subTest(job=name):
+                if name in self.UNGUARDABLE_JOBS:
+                    self.assertNotIn(
+                        "closed", str(self.ci["jobs"][name].get("if", "")),
+                        f"{name} carries the guard, so it is no longer the "
+                        "byte-exact Windows PR proof schema (#874)",
+                    )
+                    continue
+                self.assertTrue(
+                    self._skipped_on_a_closed_pull_request(name, frozenset()),
+                    f"{name} runs on a closed pull request: neither its own "
+                    "`if:` nor any job it needs excludes that action",
+                )
+
+    def test_no_workflow_has_a_duplicate_mapping_key(self) -> None:
+        """PyYAML keeps the LAST duplicate key and says nothing. GitHub rejects
+        the whole file.
+
+        This is not hypothetical: an edit to this row added `LAST_GREEN` twice
+        to one env block. Every yaml.safe_load in this suite passed, and GitHub
+        refused to parse ci.yml at all -- the run carried the workflow's PATH
+        instead of its name, ran zero jobs, and reported failure. No PyYAML
+        based test can see that, so the check has to be structural.
+        """
+        import yaml
+
+        class Strict(yaml.SafeLoader):
+            pass
+
+        def no_duplicates(loader, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise AssertionError(
+                        f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
+                    )
+                seen.add(key)
+            return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+        Strict.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_duplicates
+        )
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                yaml.load(path.read_text(encoding="utf-8"), Loader=Strict)
+
+    def test_containers_has_a_concurrency_policy(self) -> None:
+        """#822 names it the largest source of queued duplicates, and it had
+        none at all."""
+        self.assertIsNotNone(self.containers.get("concurrency"))
+
+    def test_a_container_tag_run_is_never_cancelled(self) -> None:
+        """publish/manifest/attest/promote push by digest. A cancelled publish
+        can leave a manifest half-joined."""
+        cancel = str(self.containers["concurrency"]["cancel-in-progress"])
+        self.assertIn("refs/tags/", cancel)
 
 
 if __name__ == "__main__":

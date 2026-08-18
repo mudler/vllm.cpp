@@ -13,6 +13,7 @@
   "buckets": {
     "kcuda": 0,
     "is_cuda": 0,
+    "dev_cast": 0,
     "cuda_inc": 0,
     "vt_ifdef": 32
   }

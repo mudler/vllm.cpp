@@ -27,6 +27,7 @@
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_getblas_dualslot.h"
 
 namespace vt::rocm {
 namespace {
@@ -67,37 +68,53 @@ struct BlasCtx {
   hipblasHandle_t handle = nullptr;
 };
 
-// Per-thread handle: hipBLAS is not free-threaded; decode is single-threaded per
-// engine worker. Avoid global mutex + SetStream on every GEMM (100s×/token).
-BlasCtx GetBlas(int device, hipStream_t stream) {
-  struct Tls {
-    int dev = -1;
-    hipStream_t stream = nullptr;
-    hipblasHandle_t handle = nullptr;
-  };
-  static thread_local Tls tls;
-  // Bind current device outside capture so create/setStream see the right GPU
-  // after peer-MoE left current on the expert device.
-  if (!StreamIsCapturing(stream)) {
+// Per-thread handles: hipBLAS is not free-threaded; decode is single-threaded
+// per engine worker. Avoid global mutex + SetStream on every GEMM (100s×/token).
+// Dual-slot (#837): hop 0→1 must not hipblasDestroy GPU0 while GPU0 GEMMs may
+// still be queued. Device 1 → slot 1; every other id shares slot 0.
+struct HipBlasHooks {
+  using handle_t = hipblasHandle_t;
+  using stream_t = hipStream_t;
+  static handle_t NullHandle() { return nullptr; }
+  static stream_t NullStream() { return nullptr; }
+  static bool IsNull(handle_t h) { return h == nullptr; }
+  static bool StreamIsCapturing(stream_t s) { return vt::rocm::StreamIsCapturing(s); }
+  static int GetDevice() {
     int cur = -1;
-    if (hipGetDevice(&cur) != hipSuccess || cur != device) (void)hipSetDevice(device);
+    if (hipGetDevice(&cur) != hipSuccess) return -1;
+    return cur;
   }
-  if (tls.handle == nullptr || tls.dev != device) {
-    if (tls.handle) {
-      (void)hipblasDestroy(tls.handle);
-      tls.handle = nullptr;
-    }
-    if (!StreamIsCapturing(stream)) (void)hipSetDevice(device);
-    CheckBlas(hipblasCreate(&tls.handle), "hipblasCreate");
-    tls.dev = device;
-    tls.stream = nullptr;
+  static void SetDevice(int d) { CheckHip(hipSetDevice(d), "hipSetDevice"); }
+  static handle_t Create() {
+    handle_t h = nullptr;
+    CheckBlas(hipblasCreate(&h), "hipblasCreate");
+    return h;
   }
-  if (tls.stream != stream) {
-    CheckBlas(hipblasSetStream(tls.handle, stream), "hipblasSetStream");
-    tls.stream = stream;
+  static void Destroy(handle_t h) { (void)hipblasDestroy(h); }
+  static void SetStream(handle_t h, stream_t s) {
+    CheckBlas(hipblasSetStream(h, s), "hipblasSetStream");
   }
-  return BlasCtx{tls.handle};
+};
+
+BlasCtx GetBlas(int device, hipStream_t stream) {
+  static thread_local GetBlasDualSlotEngine<HipBlasHooks> tls_slots;
+  HipBlasHooks hooks;
+  return BlasCtx{RocmProductGetBlasOn(tls_slots, device, stream, hooks)};
 }
+
+}  // namespace
+
+hipblasHandle_t ProductGetBlasHandle(int device, hipStream_t stream) {
+  // Same-TU call into file-local GetBlas (HipBlasHooks + tls_slots).
+  return GetBlas(device, stream).handle;
+}
+
+bool ProductGetBlasStreamIsCapturing(hipStream_t stream) {
+  // Exact production hook. Always-false mutation must turn the HIP probe RED.
+  return HipBlasHooks::StreamIsCapturing(stream);
+}
+
+namespace {
 
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
   return std::string("(") + Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(out.dtype);

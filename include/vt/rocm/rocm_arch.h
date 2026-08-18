@@ -70,4 +70,22 @@ constexpr std::optional<std::pair<int, int>> CapabilityFromGcnArch(std::string_v
   return std::pair<int, int>{major, minor};
 }
 
+// Host launch gate for Prefill SharedK WMMA (#785). True only when `gcn_arch`
+// is the literal HIP gcnArchName prefix `gfx1200` or `gfx1201`.
+//
+// Prefix, not substring: `foogfx1201` is false. After the six-char stem the
+// next character must be end-of-string or a non-digit so `gfx1201:xnack-`
+// matches and `gfx12010` does not. CapabilityFromGcnArch(12,0) is too wide
+// (gfx1202..gfx1209).
+constexpr bool GcnArchNameIsGfx12PrefillWmma(std::string_view gcn_arch) {
+  auto prefix_ok = [](std::string_view s, std::string_view stem) {
+    if (s.size() < stem.size()) return false;
+    if (s.substr(0, stem.size()) != stem) return false;
+    if (s.size() == stem.size()) return true;
+    const char c = s[stem.size()];
+    return c < '0' || c > '9';
+  };
+  return prefix_ok(gcn_arch, "gfx1200") || prefix_ok(gcn_arch, "gfx1201");
+}
+
 }  // namespace vt::rocm

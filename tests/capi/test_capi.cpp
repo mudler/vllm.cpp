@@ -24,15 +24,15 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include <nlohmann/json.hpp>
 
 #include "capi/engine_handle.h"
+#include "support/test_env.h"
 #include "vllm/config/device.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/platforms/interface.h"
+#include "vllm/support/platform_compat.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/bpe.h"
@@ -414,7 +414,7 @@ TEST_CASE("capi: vllm_complete_tokens matches the string-prompt completion (ABI 
   // reports six zero-initialized buffer entries must not satisfy ABI v12.
   const int32_t expected_ids[6] = {22, 12, 14, 9, 13, 2};
   for (int i = 0; i < 6; ++i) {
-    INFO("generated token index ", i);
+    CAPTURE(i);
     CHECK(out_tokens[i] == expected_ids[i]);
   }
   REQUIRE(via_tok.text != nullptr);
@@ -1222,7 +1222,7 @@ TEST_CASE("capi: enable_jump_forward defaults to 0 and validates (ABI v10)") {
 TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (ABI v10)") {
   // Resolution reads VT_ENABLE_JUMP_FORWARD as an override; clear it so this
   // test asserts the FIELD's effect, not an ambient env override.
-  ::unsetenv("VT_ENABLE_JUMP_FORWARD");
+  vllm_test::UnsetEnv("VT_ENABLE_JUMP_FORWARD");
   const HfConfig c = MakeConfig();
 
   // Default (nullopt): jump-forward resolves OFF — byte-identical to before v10.
@@ -1697,8 +1697,12 @@ struct VideoFoldWorkspace {
   std::string root, fixture;
   VideoFoldWorkspace() {
     static int counter = 0;
-    root = "/tmp/vllm_capi_video_" + std::to_string(::getpid()) + "_" +
-           std::to_string(counter++);
+    root =
+        (std::filesystem::temp_directory_path() /
+         ("vllm_capi_video_" +
+          std::to_string(vllm::support::CurrentProcessId()) + "_" +
+          std::to_string(counter++)))
+            .string();
     std::filesystem::create_directories(root);
     fixture = root + "/fixture";
     minimax_h3_fold::WriteFoldFixture(fixture);
@@ -1812,7 +1816,7 @@ TEST_CASE("capi v12: vllm_video_generate reproduces the pre-fold goldens") {
   for (int f = 0; f < 8; ++f) {
     char name[64];
     std::snprintf(name, sizeof(name), "/frame_%06d.ppm", f);
-    INFO("frame ", f);
+    CAPTURE(f);
     CHECK(ReadAllBytes(out_dir + name) == ReadAllBytes(golden_dir + name));
   }
   CHECK(ReadAllBytes(out_dir + "/audio.wav") ==
@@ -2460,6 +2464,12 @@ TEST_CASE("capi: v20 speech params zero-fill to the FAMILY's defaults") {
   const vllm_speech_model_params mp = vllm_speech_model_params_default();
   CHECK(mp.path == nullptr);
   CHECK(mp.family == nullptr);  // NULL => detect by inspecting the artifact
+  // v21. ZERO IS CPU, and that is the whole point of choosing this encoding
+  // over vllm_model_params.device's 0=auto: every pre-v21 caller zero-fills
+  // this struct, and every Music3 correctness gate was taken on the CPU arm, so
+  // an `auto` here would silently move those callers onto an ungated path the
+  // day the box grows a GPU.
+  CHECK(mp.device == 0);
 
   const vllm_speech_params p = vllm_speech_params_default();
   CHECK(p.text == nullptr);
@@ -2488,6 +2498,7 @@ TEST_CASE("capi: v20 speech handles refuse null arguments without touching *out"
   CHECK(vllm_speech_engine_family(nullptr) == nullptr);
   CHECK(vllm_speech_engine_sample_rate(nullptr) == 0);
   CHECK(vllm_speech_engine_requires_reference_audio(nullptr) == 0);
+  CHECK(vllm_speech_engine_device(nullptr) == 0);
   vllm_speech_engine_free(nullptr);
 
   vllm_speech_result out;
@@ -2545,6 +2556,9 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   // 0 — Music3 conditions on text alone. This is the value that DIFFERS from a
   // voice-cloning family's, so a pass proves the override was reached.
   CHECK(vllm_speech_engine_requires_reference_audio(eng) == 0);
+  // v21: the DEFAULT request (device 0) is GRANTED the CPU arm. `mp.device` was
+  // never set, which is exactly the pre-v21 caller.
+  CHECK(vllm_speech_engine_device(eng) == 0);
 
   // A DECLARED family loads the same checkpoint identically.
   vllm_speech_engine* declared = nullptr;
@@ -2553,8 +2567,18 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(std::string(vllm_speech_engine_family(declared)) == "minimax-music3");
   vllm_speech_engine_free(declared);
 
-  // And the owed stage is a RUNTIME refusal naming the missing piece, not a
-  // silent zero-length waveform.
+  // W6 refused HERE by name, because the 8.6B `Qwen3ForCausalLM` forward it
+  // needed had no `inputs_embeds` entry on the landed dense path. That entry
+  // exists now (`Qwen3DenseModel::ForwardEmbeds`) and the loop that drives it is
+  // `Music3GenerateFrameHiddens`, so this assertion is INVERTED: a valid request
+  // must no longer stop at a missing stage.
+  //
+  // This checkpoint is SYNTHETIC — valid configs, empty weight files — so the
+  // request runs the whole contract and then fails ON THE ARTIFACT, naming the
+  // file it could not read. Pinning that boundary is the point: the message must
+  // be about these bytes and must NOT be about an unimplemented forward. Whether
+  // the pipeline produces a song is a question only the real 28.5 GB checkpoint
+  // answers, and tests/parity/test_minimax_music3_e2e_real.cpp asks it.
   vllm_speech_params params = vllm_speech_params_default();
   params.lyrics = "[Verse]\nMorning light\n";
   params.description = "Genre: acoustic pop. BPM: 96.";
@@ -2566,7 +2590,18 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(vllm_synthesize(eng, &params, &out) == VLLM_ERR_RUNTIME);
   CHECK(out.samples == nullptr);
   CHECK(out.wav == nullptr);
-  CHECK(std::string(vllm_last_error()).find("Qwen3ForCausalLM") != std::string::npos);
+  {
+    const std::string message = vllm_last_error();
+    MESSAGE("a valid request against a synthetic checkpoint stops at: " << message);
+    // It reached the LANGUAGE MODEL's own weight file — the first thing the AR
+    // head touches, and the thing this checkpoint does not really have.
+    CHECK(message.find("language_model") != std::string::npos);
+    // And it is NOT the by-name refusal W6 shipped. Both spellings are asserted
+    // absent because either surviving would mean the stage is still owed; the
+    // message is printed above so a reader can check rather than trust.
+    CHECK(message.find("inputs_embeds") == std::string::npos);
+    CHECK(message.find("not implemented") == std::string::npos);
+  }
 
   // A field the family cannot honour is refused BY NAME rather than dropped.
   vllm_speech_params with_text = params;
@@ -2582,6 +2617,62 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(vllm_synthesize(eng, &bad_ref, &out) == VLLM_ERR_INVALID_ARGUMENT);
 
   vllm_speech_engine_free(eng);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+}
+
+// ─── ABI v21: the speech lane's device selector (#672) ────────────────────────
+
+TEST_CASE("capi: v21 an unrepresentable speech device is refused BY NAME at load") {
+  // The mapping is a MAPPING, not a cast. `static_cast<vt::DeviceType>(device)`
+  // is the defect the shared helper exists to prevent: it reads the ABI selector
+  // as an enum value, so device 2 would bind whichever backend happens to sit at
+  // index 2 of vt::DeviceType and the load would succeed against the wrong
+  // hardware. The refusal must arrive as MODEL_LOAD with the value in it.
+  const std::filesystem::path root = WriteSyntheticMusic3("device-refusal");
+  const std::string path = root.string();
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  mp.path = path.c_str();
+  mp.device = 2;
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string why = vllm_last_error();
+  CHECK(why.find("device must be 0 (cpu) or 1") != std::string::npos);
+  CHECK(why.find("2") != std::string::npos);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("capi: v21 speech device 1 is GRANTED or REFUSED, and the handle says which") {
+  // The one assertion that holds on every build: whatever happens, the handle
+  // NEVER reports a device the load did not grant. On a CPU-only build device 1
+  // must fail rather than fall back — a silent fallback is how a "GPU" benchmark
+  // measures the CPU arm — and on an accelerator build the handle must report 1,
+  // or the arm this row added is unobservable from the ABI.
+  //
+  // The case REPORTS which arm it examined instead of assuming one, because a
+  // gate that cannot say what it looked at has not reported.
+  const std::filesystem::path root = WriteSyntheticMusic3("device-one");
+  const std::string path = root.string();
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  mp.path = path.c_str();
+  mp.device = 1;
+  vllm_speech_engine* eng = nullptr;
+  const vllm_status status = vllm_speech_engine_load(&mp, &eng);
+  if (status == VLLM_OK) {
+    REQUIRE(eng != nullptr);
+    MESSAGE("capi speech device 1 was GRANTED on this build");
+    CHECK(vllm_speech_engine_device(eng) == 1);
+    vllm_speech_engine_free(eng);
+  } else {
+    MESSAGE("capi speech device 1 was REFUSED on this build: " << vllm_last_error());
+    CHECK(status == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+    // Named, so the caller learns which piece is missing rather than that
+    // something went wrong.
+    CHECK(std::string(vllm_last_error()).find("accelerator") != std::string::npos);
+  }
   std::error_code ec;
   std::filesystem::remove_all(root, ec);
 }

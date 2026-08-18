@@ -184,6 +184,46 @@ class LoadedModel {
   const TensorParallel* tensor_parallel_ = nullptr;
 };
 
+// ── The type-erasure seam's OTHER half (#775) ───────────────────────────────
+// Every registered `prepare`/`forward` is handed a type-erased `LoadedModel&`
+// and has to open it as its own concrete model. Doing that with a bare
+// `static_cast` down the hierarchy is a PROMISE, not a check: on an object
+// whose dynamic type is not that model, every member call through the resulting
+// reference is undefined behaviour, and the compiler is entitled to act on the
+// promise. UBSan reports it as "member call on address ... which does not point
+// to an object of type 'X'". It is invisible without a sanitizer whenever the
+// entry point was going to refuse anyway, which is precisely the state a model
+// still missing its weight loader is in.
+//
+// `ModelAs` is the checked form: it establishes the dynamic type first and
+// refuses BY NAME when the caller paired one architecture's registration with
+// another architecture's model. The cost is one `dynamic_cast` per forward
+// step (the seam is entered once per `ModelRegistry::Forward`, not per layer),
+// against a step that is milliseconds of GEMMs.
+//
+// `architecture` is the caller's OWN architecture name, so the refusal says
+// which entry point refused rather than only that something did.
+[[noreturn]] void RaiseModelTypeMismatch(std::string_view architecture,
+                                         const LoadedModel& model);
+
+template <typename Model>
+Model& ModelAs(LoadedModel& model, std::string_view architecture) {
+  Model* typed = dynamic_cast<Model*>(&model);
+  if (typed == nullptr) {
+    RaiseModelTypeMismatch(architecture, model);
+  }
+  return *typed;
+}
+
+template <typename Model>
+const Model& ModelAs(const LoadedModel& model, std::string_view architecture) {
+  const Model* typed = dynamic_cast<const Model*>(&model);
+  if (typed == nullptr) {
+    RaiseModelTypeMismatch(architecture, model);
+  }
+  return *typed;
+}
+
 // MM-ENGINE-FORWARD: one multimodal (vision/audio-language) forward step's
 // vision-conditioned inputs, carried as an OPTIONAL sub-field of ModelForwardInput
 // (below). Set (non-nullopt) ONLY by the runner mm-path when the request carries
@@ -312,6 +352,23 @@ struct ModelFactory {
   // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
   // Default false: every existing arch's engine load path is byte-identical.
   bool stage_on_load = false;
+  // ENG-WEIGHT-OFFLOAD: whether THIS model's loader asks
+  // `WeightOffloader::ConsiderWeight` for each weight and honours the answer.
+  //
+  // THE DEFAULT IS FALSE, AND THAT IS THE MECHANISM. There is no single upload
+  // helper in this tree: each model allocates its own device buffers, and
+  // `load_stats::AddDeviceUpload` reaches only 9 call sites in 6 files, so
+  // neither is a chokepoint that could enforce this. A model whose loader was
+  // never wired would therefore accept a `cpu_offload_gb` and silently keep
+  // every weight on the device, which is a memory bug with no error anywhere.
+  //
+  // Declaring the capability makes that case LOUD instead: the engine refuses a
+  // configured offload against a model that does not claim support, naming the
+  // architecture. A new model inherits false and is refused until someone wires
+  // it, which is the same polarity as the `-Werror=switch` totality proof in
+  // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
+  // switch over.
+  bool supports_weight_offload = false;
 };
 
 struct ModelRegistration {

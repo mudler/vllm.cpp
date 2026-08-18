@@ -12,6 +12,12 @@
 #include <utility>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
@@ -593,3 +599,86 @@ TEST_CASE("ggml traits: unknown type id throws") {
   // rather than return garbage size math.
   CHECK_THROWS_AS(vllm::GgmlTraits(7), std::runtime_error);
 }
+
+#if !defined(_WIN32)
+TEST_CASE("gguf: SourceOfSpan names the OWNING shard's fd and that shard's own offset") {
+  // ENG-EXPERT-STREAM F4 (#912). `SourceOfSpan` had ZERO coverage, and two
+  // mutations of it survived the whole gate: deleting the sibling walk, so every
+  // span resolves to shard 0's descriptor, and forcing `out.offset = 0`.
+  //
+  // Both are the "wrong shard at a plausible offset" failure. Nothing downstream
+  // can tell: a descriptor is a descriptor and an offset is in range, so the
+  // pread succeeds, returns the requested number of bytes, and the model
+  // multiplies whatever happened to live there. This is the one place in the
+  // streaming chain that decides WHICH FILE a weight is read out of.
+  //
+  // A split GGUF is the whole reason the function is not `ptr - base`: each
+  // shard is its own mapping with its own zero, and a merged file hands out
+  // spans from any of them.
+  SplitFiles f("spansrc");
+  f.Write(SplitShard("t_shard0", 10.0f, 0, 2, /*full_kv=*/true),
+          SplitShard("t_shard1", 20.0f, 1, 2, /*full_kv=*/false));
+
+  vllm::GgufFile g = vllm::GgufFile::Open(f.shard1());
+  REQUIRE(g.Tensors().size() == 2);
+  const vllm::GgufTensorInfo& t0 = g.Get("t_shard0");
+  const vllm::GgufTensorInfo& t1 = g.Get("t_shard1");
+
+  const vllm::GgufFile::SpanSource s0 = g.SourceOfSpan(t0.data, t0.nbytes);
+  const vllm::GgufFile::SpanSource s1 = g.SourceOfSpan(t1.data, t1.nbytes);
+  REQUIRE(s0.fd >= 0);
+  REQUIRE(s1.fd >= 0);
+
+  // THE SHARD-DISCRIMINATING ASSERTION. Deleting the sibling walk makes every
+  // span resolve through the primary mapping, and these two descriptors become
+  // the same one.
+  CHECK(s0.fd != s1.fd);
+
+  // The offset is relative to the OWNING shard's own zero, so shard 1's tensor
+  // sits at a small offset in a small file rather than at an address computed
+  // against shard 0.
+  const auto shard_size = [](int fd) {
+    struct ::stat st {};
+    REQUIRE(::fstat(fd, &st) == 0);
+    return static_cast<size_t>(st.st_size);
+  };
+  CHECK(s1.offset + t1.nbytes <= shard_size(s1.fd));
+  CHECK(s0.offset + t0.nbytes <= shard_size(s0.fd));
+  // Neither is zero here, so a mutation that forces `offset = 0` is not
+  // accidentally right.
+  CHECK(s0.offset > 0);
+  CHECK(s1.offset > 0);
+
+  // AND THE END-TO-END PROPERTY, which is the one that actually matters:
+  // pread(fd, offset) must reproduce the MAPPED bytes byte for byte. This is the
+  // substitution the expert streamer makes, so if it does not hold the streamer
+  // silently feeds the GEMM another tensor.
+  const auto pread_span = [](int fd, size_t off, size_t n) {
+    std::vector<uint8_t> buf(n);
+    size_t done = 0;
+    while (done < n) {
+      const ssize_t r = ::pread(fd, buf.data() + done, n - done,
+                                static_cast<off_t>(off + done));
+      REQUIRE(r > 0);
+      done += static_cast<size_t>(r);
+    }
+    return buf;
+  };
+  const std::vector<uint8_t> got1 = pread_span(s1.fd, s1.offset, t1.nbytes);
+  CHECK(std::memcmp(got1.data(), t1.data, t1.nbytes) == 0);
+  const std::vector<uint8_t> got0 = pread_span(s0.fd, s0.offset, t0.nbytes);
+  CHECK(std::memcmp(got0.data(), t0.data, t0.nbytes) == 0);
+
+  // The two shards hold DIFFERENT bytes, so the memcmp above can actually fail:
+  // a test whose two candidates are identical proves nothing about which one was
+  // chosen.
+  REQUIRE(t0.nbytes == t1.nbytes);
+  CHECK(std::memcmp(t0.data, t1.data, t0.nbytes) != 0);
+
+  // A span this file does not own is reported as "no descriptor", which the
+  // caller must read as "go through the mapping" rather than as an error.
+  const std::vector<uint8_t> foreign(64, 0x7E);
+  const vllm::GgufFile::SpanSource none = g.SourceOfSpan(foreign.data(), foreign.size());
+  CHECK(none.fd == -1);
+}
+#endif  // !_WIN32

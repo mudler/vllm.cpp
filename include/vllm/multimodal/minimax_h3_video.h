@@ -58,8 +58,14 @@ namespace vllm::multimodal {
 inline constexpr char kMiniMaxH3VideoFamily[] = "minimax-h3";
 
 // Map the stable public video ABI device selector onto the runtime's generic
-// backend key. The ABI remains 0=CPU / 1=CUDA; callers below this seam dispatch
-// only through the returned DeviceType.
+// backend key. The ABI is unchanged — 0 is the CPU, 1 is the accelerator, and
+// anything else throws — but 1 is RESOLVED through the platform seam
+// (`CurrentPlatform().device_type()` + `TryGetBackend` +
+// `supports_model_architecture`), never cast from the integer. It therefore
+// THROWS on a build with no accelerator backend, or one whose partial backend
+// declines this architecture, instead of naming a device that build cannot run
+// (#659, #660). Callers below this seam dispatch only through the returned
+// DeviceType.
 vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device);
 
 // ── Load-time parameters (the checkpoint set; the C ABI mirror is
@@ -79,7 +85,9 @@ struct MiniMaxH3VideoModelParams {
   // declared-but-unknown and the #77 guard refuses every full render
   // (MiniMaxH3PartitionFromFlag / MiniMaxH3CheckTaskPartition).
   std::string partition;
-  int32_t device = 0;        // 0 cpu, 1 cuda
+  // 0 cpu, 1 the accelerator this build resolves — see MiniMaxH3VideoDeviceType
+  // above; never `static_cast<vt::DeviceType>(device)` (#660).
+  int32_t device = 0;
   int32_t dequant_bf16 = 0;  // 0 keep-quant, 1 dequant/stream bf16
   // NVFP4 + cuda only: keep the packed FP4 resident and route the quantized
   // projections through the Marlin W4A16 GEMM (the pre-fold --fp4-resident).

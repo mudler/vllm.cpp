@@ -84,7 +84,7 @@ void PrepareQwen3ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3ForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
-  auto& qwen = static_cast<Qwen3DenseLoadedModel&>(model);
+  auto& qwen = ModelAs<Qwen3DenseLoadedModel>(model, "Qwen3ForCausalLM");
   const Qwen3DenseWeights& weights = qwen.weights();
   // ROW-SERVE-ASYNC-DENSE-MIRROR: publish the async runner's device-resident input
   // ids for the duration of THIS forward, so the shared EmbedInto (eager

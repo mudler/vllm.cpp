@@ -29,20 +29,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — the seam device 1 resolves through
+#include "vllm/support/platform_compat.h"
 #include "minimax_h3_video_fold_fixture.h"
 #include "vt/backend.h"
 
 namespace {
+
+namespace fs = std::filesystem;
 
 std::string ReadAll(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -57,18 +59,20 @@ struct FoldWorkspace {
   std::string root;
   FoldWorkspace() {
     static int counter = 0;
-    root = "/tmp/vllm_h3_video_fold_" + std::to_string(::getpid()) + "_" +
-           std::to_string(counter++);
-    ::mkdir(root.c_str(), 0755);
+    root = (fs::temp_directory_path() /
+            ("vllm_h3_video_fold_" +
+             std::to_string(vllm::support::CurrentProcessId()) + "_" +
+             std::to_string(counter++)))
+               .string();
+    fs::create_directories(root);
     fixture = root + "/fixture";
     minimax_h3_fold::WriteFoldFixture(fixture);
   }
   ~FoldWorkspace() {
-    // Best-effort cleanup; a leftover /tmp dir on abort is diagnosable, not
+    // Best-effort cleanup; a leftover temp dir on abort is diagnosable, not
     // harmful.
-    const std::string cmd = "rm -rf '" + root + "'";
-    const int rc = std::system(cmd.c_str());
-    (void)rc;
+    std::error_code ec;
+    fs::remove_all(root, ec);
   }
   std::string fixture;
 };
@@ -116,14 +120,42 @@ class CountingCudaBackend final : public vt::Backend {
   int create_queue_calls = 0;
 };
 
+// The PLATFORM half of the same fake. #660: device 1 used to be
+// `static_cast<vt::DeviceType>(1)`, so registering a backend alone was enough to
+// fake an accelerator — the engine never asked whether this build HAS one. It
+// asks now, through `CurrentPlatform()`, so a test that wants the accelerator
+// path has to supply a platform as well as a backend. That is not a harness
+// concession; it is the defect being visible: a build with a CUDA backend
+// registered and no CUDA platform is not a build that runs on CUDA.
+class FakeCudaPlatform final : public vllm::platforms::Platform {
+ public:
+  explicit FakeCudaPlatform(vt::Backend& backend) : backend_(backend) {}
+  vt::DeviceType device_type() const override { return vt::DeviceType::kCUDA; }
+  vt::Backend& backend() const override { return backend_; }
+  vllm::platforms::DeviceCapability get_device_capability() const override { return {}; }
+  std::vector<vt::DType> supported_dtypes() const override { return {vt::DType::kBF16}; }
+  vllm::platforms::ResidencyPolicy residency_policy() const override { return {}; }
+
+ private:
+  vt::Backend& backend_;
+};
+
 class ScopedCudaBackendRegistration {
  public:
   explicit ScopedCudaBackendRegistration(vt::Backend* replacement)
-      : previous_(vt::TryGetBackend(vt::DeviceType::kCUDA)) {
+      : previous_(vt::TryGetBackend(vt::DeviceType::kCUDA)),
+        previous_platform_(vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)
+                               ? &vllm::platforms::GetPlatform(vt::DeviceType::kCUDA)
+                               : nullptr),
+        platform_(*replacement) {
     vt::RegisterBackend(vt::DeviceType::kCUDA, replacement);
+    vllm::platforms::RegisterPlatform(vt::DeviceType::kCUDA, &platform_);
   }
   ~ScopedCudaBackendRegistration() {
     if (previous_ != nullptr) vt::RegisterBackend(vt::DeviceType::kCUDA, previous_);
+    if (previous_platform_ != nullptr) {
+      vllm::platforms::RegisterPlatform(vt::DeviceType::kCUDA, previous_platform_);
+    }
   }
 
   ScopedCudaBackendRegistration(const ScopedCudaBackendRegistration&) = delete;
@@ -131,6 +163,8 @@ class ScopedCudaBackendRegistration {
 
  private:
   vt::Backend* previous_;
+  vllm::platforms::Platform* previous_platform_;
+  FakeCudaPlatform platform_;
 };
 
 void CheckAgainstGoldens(const std::string& out_dir) {
@@ -159,9 +193,52 @@ void CheckAgainstGoldens(const std::string& out_dir) {
 
 TEST_CASE("minimax_h3 video fold: ABI device selectors map through DeviceType") {
   CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(0) == vt::DeviceType::kCPU);
-  CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(1) == vt::DeviceType::kCUDA);
   CHECK_THROWS(vllm::multimodal::MiniMaxH3VideoDeviceType(-1));
   CHECK_THROWS(vllm::multimodal::MiniMaxH3VideoDeviceType(2));
+
+  // Selector 1 is RESOLVED through the platform seam, not cast from the integer
+  // (#660: `static_cast<vt::DeviceType>(1)` was kCUDA only because kCUDA happens
+  // to be enum value 1). So the answer depends on what this build registered,
+  // and this case asserts BOTH arms rather than skipping either — a skip here
+  // would leave the CPU-only build, which is the one the defect hid on,
+  // unmeasured.
+  const vllm::platforms::Platform& platform = vllm::platforms::CurrentPlatform();
+  const vt::DeviceType accelerator = platform.device_type();
+  const bool have_backend =
+      accelerator != vt::DeviceType::kCPU && vt::TryGetBackend(accelerator) != nullptr;
+  // The THIRD question, asked here because the SOURCE asks it. A predicate that
+  // asks only the first two describes a different function than the one under
+  // test: on a PARTIAL backend (Metal, Tenstorrent) both of the first two are
+  // true, the source correctly refuses BY NAME, and a two-question predicate
+  // routes that correct refusal into the `== accelerator` arm — where it
+  // surfaces as an uncaught exception. That is a false RED on precisely the
+  // build class #659 exists to serve, and it is invisible on the CPU and CUDA
+  // boxes that run the gates, which is this row's own thesis about #659.
+  const bool accepts_architecture =
+      have_backend &&
+      platform.supports_model_architecture(vllm::multimodal::kMiniMaxH3VideoFamily);
+
+  if (accepts_architecture) {
+    // On the CUDA box this is byte-for-byte the old answer.
+    CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(1) == accelerator);
+  } else {
+    // The assertion the cast could never make: device 1 is REFUSED by name
+    // instead of returning kCUDA and failing one step later inside
+    // `vt::GetBackend(kCUDA)`. WHICH refusal is itself asserted — a partial
+    // backend must be told it is partial, not told its backend is missing, and
+    // a right refusal for a wrong reason is a wrong diagnosis that reads as a
+    // right one.
+    const std::string want =
+        have_backend ? "DECLINES" : "no accelerator backend is registered";
+    try {
+      (void)vllm::multimodal::MiniMaxH3VideoDeviceType(1);
+      FAIL("device 1 must be refused when this build cannot honour it");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find(want) != std::string::npos);
+    }
+  }
 }
 
 TEST_CASE("minimax_h3 video fold: CUDA load creates exactly one queue") {

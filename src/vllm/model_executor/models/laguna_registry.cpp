@@ -81,7 +81,7 @@ void PrepareLagunaForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardLagunaForCausalLM(LoadedModel& model,
                                        const ModelForwardInput& input) {
-  auto& laguna = static_cast<LagunaLoadedModel&>(model);
+  auto& laguna = ModelAs<LagunaLoadedModel>(model, "LagunaForCausalLM");
   const LagunaWeights& weights = laguna.weights();
   if (input.gather_logits) {
     return LagunaModel::ForwardDevice(input.token_ids, input.positions,

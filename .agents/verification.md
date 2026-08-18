@@ -72,6 +72,11 @@ a *scratch copy* and prove the focused test fails. Mutate, don't just read — a
 test that passes with the guard deleted was testing nothing. Restore the tree
 byte-for-byte after every mutation, and never mutate the reviewed worktree.
 
+**Reachability mutation:** delete the production call site too, not only the
+guards, and rerun the focused gate. A gate that stays green without it is
+measuring a class rather than a capability, and that is a finding.
+[`reachability.md`](reachability.md) has the method and the exceptions.
+
 Report `PASS` only after both passes on the same head. Every finding carries
 severity, the violated requirement, a reproduction, and the expected behavior.
 

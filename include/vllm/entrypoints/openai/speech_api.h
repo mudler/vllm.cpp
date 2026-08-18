@@ -32,6 +32,8 @@
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/speech_engine.h"
+
 namespace vllm::openai {
 
 // One parsed `/v1/audio/speech` body. Every generation control is inert at its
@@ -87,6 +89,20 @@ struct SpeechResponse {
   int64_t channels = 1;
   int64_t samples_per_channel = 0;
 };
+
+// Run one request against a loaded family and encode the result the way the
+// route serves it: map the parsed fields onto `multimodal::SpeechGenParams`,
+// call `SpeechEngine::Synthesize`, and write the RIFF bytes with the SHARED
+// writer the H3 and LTX-2.5 audio paths already use.
+//
+// It lives in the library rather than inside `server_main.cpp`'s lambda because
+// there the mapping was unreachable to anything but a running server — so the
+// one step an end-to-end gate needs to exercise was the one step no gate could
+// call. `set_synthesizer` is handed this function now, and a gate calls
+// `ApiServer::handle_audio_speech` over the same one, which is what makes a
+// claim about an HTTP request a claim about the code HTTP runs.
+SpeechResponse SynthesizeSpeechRequest(::vllm::multimodal::SpeechEngine& engine,
+                                       const SpeechRequest& request);
 
 }  // namespace vllm::openai
 

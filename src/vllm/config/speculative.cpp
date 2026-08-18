@@ -4,12 +4,114 @@
 // loader (see SpeculativeConfig::ResolveMtp).
 #include "vllm/config/speculative.h"
 
+#include <array>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
 namespace vllm {
+namespace {
+
+// #1160 — key ADMISSION for `--speculative-config`.
+//
+// Upstream deserializes this JSON into the `SpeculativeConfig` dataclass, which
+// carries `extra="forbid"` through its `@config` decorator
+// (vllm/config/speculative.py:81-83 @ the pinned oracle `555967922`), so vLLM
+// refuses a name it does not declare. This hand-written parser read five keys
+// and dropped everything else, which turned `"draft_sample_method":
+// "probabilistic"` into a silent GREEDY run and a misspelled
+// `"num_speculatve_tokens"` into the resolved default. A dropped key does not
+// merely do nothing: it changes what configuration a measurement was taken
+// under, which is the one thing a gate cannot recover afterwards.
+//
+// The three classes below restore that refusal. The split matters because a key
+// vLLM genuinely declares deserves a different message from a typo: telling a
+// user that `quantization` is "unknown" sends them hunting for a spelling
+// mistake that is not there.
+
+// Class 1: parsed and used below.
+constexpr std::array<std::string_view, 5> kHonouredKeys = {
+    "method", "num_speculative_tokens", "model", "prompt_lookup_min",
+    "prompt_lookup_max",
+};
+
+// Class 3: declared by `SpeculativeConfig` at the pin
+// (vllm/config/speculative.py:85-283 @ `555967922`) and NOT implemented here.
+// Mirrored field-for-field so a pin bump that adds a field is reconciled here
+// rather than silently widening what this parser drops. The internal
+// `SkipValidation` fields (`target_model_config`, `draft_model_config`,
+// `target_parallel_config`, `draft_parallel_config`, `draft_load_config`) are
+// listed too: upstream builds them rather than reading them from this JSON, so a
+// user who names one is asking for something no spelling of this flag delivers.
+constexpr std::array<std::string_view, 26> kUpstreamUnimplementedKeys = {
+    "enforce_eager",                          // :85
+    "draft_tensor_parallel_size",             // :102
+    "tensor_parallel_size",                   // :105
+    "quantization",                           // :110
+    "moe_backend",                            // :114
+    "attention_backend",                      // :119
+    "kv_cache_dtype",                         // :123
+    "max_model_len",                          // :126
+    "revision",                               // :129
+    "code_revision",                          // :133
+    "disable_padded_drafter_batch",           // :139
+    "use_local_argmax_reduction",             // :144
+    "use_heterogeneous_vocab",                // :150
+    "parallel_drafting",                      // :165
+    "target_model_config",                    // :172
+    "target_parallel_config",                 // :174
+    "num_speculative_tokens_per_batch_size",  // :178
+    "draft_model_config",                     // :186
+    "draft_parallel_config",                  // :188
+    "suffix_decoding_max_tree_depth",         // :192
+    "suffix_decoding_max_cached_requests",    // :196
+    "suffix_decoding_max_spec_factor",        // :202
+    "suffix_decoding_min_token_prob",         // :207
+    "draft_load_config",                      // :212
+    "synthetic_acceptance_rates",             // :224
+    "synthetic_acceptance_length",            // :232
+};
+
+// The tail every refusal carries, so the message closes the user's search
+// instead of only ending it. Class 2 is spelled with its one accepted value
+// because "supported" would otherwise overstate what those keys accept.
+constexpr std::string_view kSupportedKeys =
+    "supported keys: method, num_speculative_tokens, model, prompt_lookup_min, "
+    "prompt_lookup_max, draft_sample_method (only \"greedy\"), "
+    "rejection_sample_method (only \"standard\")";
+
+bool Contains(const std::array<std::string_view, 5>& set, const std::string& key) {
+  for (std::string_view k : set) {
+    if (k == key) return true;
+  }
+  return false;
+}
+
+bool Contains(const std::array<std::string_view, 26>& set, const std::string& key) {
+  for (std::string_view k : set) {
+    if (k == key) return true;
+  }
+  return false;
+}
+
+// Class 2: an upstream key whose value space we implement exactly one point of.
+// The accepted value is upstream's own DEFAULT in both cases, so a vLLM config
+// that spells the default explicitly keeps running, and only a request for
+// behavior we do not have is refused. `owed_by` names the missing part, which is
+// what AGENTS.md requires of a refused arm.
+void CheckValueGatedKey(const nlohmann::json& doc, const char* key,
+                        const char* accepted, const std::string& reason) {
+  if (!doc.contains(key)) return;
+  const nlohmann::json& v = doc.at(key);
+  if (v.is_string() && v.get<std::string>() == accepted) return;
+  const std::string got = v.is_string() ? ("\"" + v.get<std::string>() + "\"") : v.dump();
+  throw std::invalid_argument(std::string("speculative-config: ") + key + " " + got +
+                              " is not implemented. " + reason);
+}
+
+}  // namespace
 
 SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   nlohmann::json doc;
@@ -52,6 +154,53 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
         "\"ngram\" and \"draft_model\" are supported at this pin (got \"" +
         cfg.method + "\")");
   }
+
+  // #1160: key admission, AFTER the method check so an unsupported method is
+  // still the error a user sees first (it is the field that selects everything
+  // else), and BEFORE every other read so no key can be dropped on the way past.
+  // Presence is what is judged for classes 1 and 3, including an explicit
+  // `null`: a null on a key we do not implement still names a capability we do
+  // not have, and answering it with silence is the defect this restores.
+  for (auto it = doc.begin(); it != doc.end(); ++it) {
+    const std::string& key = it.key();
+    if (Contains(kHonouredKeys, key)) continue;
+    if (key == "draft_sample_method" || key == "rejection_sample_method") continue;
+    if (Contains(kUpstreamUnimplementedKeys, key)) {
+      throw std::invalid_argument(
+          "speculative-config: \"" + key +
+          "\" is a vLLM SpeculativeConfig field (vllm/config/speculative.py:85-283 "
+          "@ 555967922) that this engine does not implement at this pin, so it is "
+          "refused rather than dropped (" + std::string(kSupportedKeys) + ")");
+    }
+    throw std::invalid_argument(
+        "speculative-config: unknown key \"" + key +
+        "\" (vLLM's SpeculativeConfig declares no such field at the pinned oracle "
+        "555967922; " + std::string(kSupportedKeys) + ")");
+  }
+  // draft_sample_method (speculative.py:77,283). The draft is GREEDY by
+  // construction here — `speculator.h` takes the argmax and the verify accepts
+  // iff equal — so "probabilistic" would change the acceptance rule, and with it
+  // whether the run is adjudicable by the token-exact greedy gate at all.
+  CheckValueGatedKey(
+      doc, "draft_sample_method", "greedy",
+      "This engine drafts greedy only (include/vllm/v1/worker/gpu/spec_decode/"
+      "dspark/speculator.h) and verifies accept-iff-equal (include/vllm/v1/"
+      "spec_decode/rejection_sampler.h), so \"greedy\", which is upstream's own "
+      "default, is the only accepted value at this pin. Probabilistic draft "
+      "sampling is owed by row SPEC-ACCEPT-VARIANTS (.agents/engine-matrix.md), "
+      "vllm/config/speculative.py:77,283 @ 555967922.");
+  // rejection_sample_method (speculative.py:78,216). "standard" is upstream's
+  // default and the semantics the landed verify implements. "synthetic" and
+  // "block" are the two branches at
+  // vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:82-91, both listed as
+  // deferred in rejection_sampler.h.
+  CheckValueGatedKey(
+      doc, "rejection_sample_method", "standard",
+      "This engine implements upstream's default \"standard\" acceptance only, "
+      "as accept-iff-equal under greedy decode (include/vllm/v1/spec_decode/"
+      "rejection_sampler.h). The other two are owed by row SPEC-ACCEPT-VARIANTS "
+      "(.agents/engine-matrix.md), vllm/config/speculative.py:78,216 and "
+      "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:82-91 @ 555967922.");
 
   // num_speculative_tokens (k). Optional; the loader defaults it to n_predict
   // (mtp_num_hidden_layers) via ResolveMtp when absent (speculative.py:865-875).

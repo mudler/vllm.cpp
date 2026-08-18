@@ -98,7 +98,7 @@ void PrepareDeepseekV4ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
-  auto& ds = static_cast<DeepseekV4LoadedModel&>(model);
+  auto& ds = ModelAs<DeepseekV4LoadedModel>(model, "DeepseekV4ForCausalLM");
   const DeepseekV4Weights& weights = ds.weights();
   if (input.gather_logits) {
     return DeepseekV4Model::ForwardDevice(input.token_ids, input.positions,

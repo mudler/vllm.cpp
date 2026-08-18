@@ -156,7 +156,7 @@ Python lazy-import/subprocess caching remain explicitly deferred.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|
-| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForConditionalGeneration` (27B dense-hybrid, **VL multimodal** wrapper — vision_config present), `Qwen3_5MoeForConditionalGeneration` / `qwen35moe` (35B-A3B), plus the TEXT-ONLY arms `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM` (`qwen3_5_text` / `qwen3_5_moe_text`; motivating checkpoint `Qwen/Qwen3.8-2.4T-A95B`) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert (35B) / **dense SwiGLU MLP** (27B), GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load M0.10). **27B (co-equal gate):** CPU-first scaffolding started — arch/quant surveyed (`.agents/specs/qwen27b-w4a4-notes.md`: dense hybrid, W4A4, **and a VL wrapper — text path first, ViT deferred**), CPU W4A4 emulation reference + skipping greedy-parity gate landed; dense loader + single-seq `ForwardDense` + batched PAGED `Qwen3_5DenseModel::Forward` (paged==dense CPU-anchored) + `GPUModelRunner` dense route all landed CPU-green; W4A4 GPU GEMM + oracle golden pending (GPU-gated). **Ordinary plain-BF16 leaf (`LOAD-SAFETENSORS-DIRECT-DENSE`):** raw-NK stacked/tied 4B loading plus layer-bounded discrete-CUDA staging is implemented; real-weight CPU load passes 1656/1656 and local AOT-CUDA retained-host/direct-device tokens match at 1664/1664. The corrected AOT series completes 18/18 legs: ON/OFF/vLLM total **6155.10/6064.06/6730.46 tok/s**, ON=OFF 128/128, peak PSS **2.405/8.571/7.569 GiB**; current ON is 0.9316x the previous AOT result. Current-v0.25 oracle/sanitizer, strict VRAM and external 27B/35B regressions remain open, so this is not a support claim. **TEXT-ONLY arms (`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm`, `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`, issue #490, both `PARTIAL`):** additive registration against the existing dense/MoE factories plus a once-per-checkpoint backbone-namespace resolution (`model.language_model.` or flat `model.`, mixed REFUSED); AHEAD OF THE PIN at `ad5d29db7` / vllm#50210 and the **run gate is OWED** — no Qwen3.8 checkpoint fits GB10, so nothing about generated tokens, memory or speed is claimed. **The bf16 / 3-D-stacked MoE routed-expert arm is NOT implemented and is OWED** (the published MoE repos ship exactly that layout; only an NVFP4 requant loads), so the MoE gate does not close on a fitting checkpoint alone; such a checkpoint is refused by name (§9 deviation 17(e); [spec](specs/qwen38-text-only.md)). serving M1–M3 | **T0 (the gate)** |
+| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForConditionalGeneration` (27B dense-hybrid, **VL multimodal** wrapper — vision_config present), `Qwen3_5MoeForConditionalGeneration` / `qwen35moe` (35B-A3B), plus the TEXT-ONLY arms `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM` (`qwen3_5_text` / `qwen3_5_moe_text`; motivating checkpoint `Qwen/Qwen3.8-2.4T-A95B`) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert (35B) / **dense SwiGLU MLP** (27B), GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load M0.10). **27B (co-equal gate):** CPU-first scaffolding started — arch/quant surveyed (`.agents/specs/qwen27b-w4a4-notes.md`: dense hybrid, W4A4, **and a VL wrapper — text path first, ViT deferred**), CPU W4A4 emulation reference + skipping greedy-parity gate landed; dense loader + single-seq `ForwardDense` + batched PAGED `Qwen3_5DenseModel::Forward` (paged==dense CPU-anchored) + `GPUModelRunner` dense route all landed CPU-green; W4A4 GPU GEMM + oracle golden pending (GPU-gated). **Ordinary plain-BF16 leaf (`LOAD-SAFETENSORS-DIRECT-DENSE`):** raw-NK stacked/tied 4B loading plus layer-bounded discrete-CUDA staging is implemented; real-weight CPU load passes 1656/1656 and local AOT-CUDA retained-host/direct-device tokens match at 1664/1664. The corrected AOT series completes 18/18 legs: ON/OFF/vLLM total **6155.10/6064.06/6730.46 tok/s**, ON=OFF 128/128, peak PSS **2.405/8.571/7.569 GiB**; current ON is 0.9316x the previous AOT result. Current-v0.25 oracle/sanitizer, strict VRAM and external 27B/35B regressions remain open, so this is not a support claim. **TEXT-ONLY arms (`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm`, `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`, issue #490, both `PARTIAL`):** additive registration against the existing dense/MoE factories plus a once-per-checkpoint backbone-namespace resolution (`model.language_model.` or flat `model.`, mixed REFUSED); AHEAD OF THE PIN at `ad5d29db7` / vllm#50210 and the **run gate is OWED** — no Qwen3.8 checkpoint fits GB10, so nothing about generated tokens, memory or speed is claimed. The bf16 / 3-D-stacked MoE routed-expert arm was NOT implemented at that date and such a checkpoint was refused by name; **it is now implemented and ORACLE-GATED (2026-08-15, #740 + #864, §9 deviation 17(e)): 6/7 prompts STRICT 16/16 on the published `Qwen/Qwen3.6-35B-A3B` bf16 repo @`995ad96e`, the seventh an exact logit tie (#910), SACRED 3/3 byte-identical, NO speed number.** The run gate for `Qwen3_5MoeForCausalLM` itself is still OWED on size alone ([spec](specs/qwen38-text-only.md)). serving M1–M3 | **T0 (the gate)** |
 | Dense decoders | Llama 3.x, Qwen2/3, Mistral, Gemma 2/3, Phi | GQA + RoPE + SwiGLU + RMSNorm (subset of T0 layer set) | T1 |
 | MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE 🚧 `65788b3` (correctness-grade eager; grouped-GEMM perf M2.2) | T1 |
 | Qwen3-Next | `Qwen3NextForCausalLM` | same stack, interleaved-GQA weight layout | T1 |
@@ -1631,14 +1631,27 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     cycle reconciles it deliberately, and until then a Qwen3.5 change must check
     both anchors; (b) **no token or speed axis is claimable for
     `Qwen/Qwen3.8-2.4T-A95B`** — 2.4T bf16 is ~4.8 TB and the released FP8
-    variant ~2.4 TB against GB10's 128 GB unified, with no smaller Qwen3.8
-    sibling, so the run gate is OWED (both rows are `PARTIAL`, never `DONE`, and
+    variant ~2.4 TB against GB10's 128 GB unified, so the run gate for that
+    checkpoint is OWED (both rows are `PARTIAL`, never `DONE`, and
     the gap is recorded in [BENCHMARKS](../docs/BENCHMARKS.md) §Open gaps). The
+    A smaller sibling DOES exist and this row previously claimed otherwise:
+    `Qwen/Qwen3.8-27B` (55.6 GB bf16, 18 shards, revision
+    `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`) fits GB10 and **loads on current
+    `main` with no code change** — evidenced by reaching the engine
+    constructor's terminal log statement (`entrypoints/model_loader.cpp:1153`),
+    which is emitted only after every weight binds and the hybrid KV geometry
+    resolves. It does NOT close either text-only gate below: it declares
+    `Qwen3_5ForConditionalGeneration`, not `Qwen3_5[Moe]ForCausalLM`. It is the
+    already-gated Qwen3.6-27B shape retrained — `config.json` differs in exactly
+    one key (`transformers_version`) and the safetensors tensor-name set is
+    identical (1199 names, zero difference either direction). Its own
+    token-exact gate is OWED and unrun.
     DENSE gate closes when a `Qwen3_5ForCausalLM` checkpoint that fits GB10
-    appears; **the MoE one does not** — per (e) below, a fitting PUBLISHED MoE
-    checkpoint would still be refused at load, so the MoE gate needs a fitting
-    checkpoint whose routed experts are per-expert NVFP4, or (e) implemented
-    first; (c) **one behavior deliberately diverges from upstream, in the
+    appears; the MoE one, as recorded on 2026-08-12, did not — per (e) below, a
+    fitting PUBLISHED MoE checkpoint would still have been refused at load.
+    **SUPERSEDED 2026-08-15: (e) is implemented and oracle-gated, so a published
+    MoE checkpoint no longer refuses and the MoE gate now needs only a fitting
+    `Qwen3_5MoeForCausalLM` checkpoint, exactly like the DENSE one**; (c) **one behavior deliberately diverges from upstream, in the
     strict direction.** Upstream normalizes the two weight namespaces with
     `WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})`, so a
     checkpoint carrying backbone tensors under BOTH spellings LOADS upstream, its
@@ -1689,6 +1702,29 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     anchors become ordinary mirrored behavior and only (c), (d) and (e) survive
     as tracked items. Scope and gates:
     [qwen3.8 text-only spec](specs/qwen38-text-only.md).
+
+    **(e) IS CLOSED as of 2026-08-15, and closed with a token.**
+    [#740](https://github.com/mudler/vllm.cpp/issues/740)
+    ([spec](specs/moe-bf16-stacked-experts.md)) landed the 3-D stacked bf16
+    routed-expert reader and [#864](https://github.com/mudler/vllm.cpp/issues/864)
+    ([spec](specs/moe-bf16-tower-arms.md)) the bf16 GDN tower, attention tower,
+    shared expert and `lm_head`, each dispatched by tensor presence the way
+    `LoadQwen3_5Dense` already was. Both published indices now satisfy the load
+    plan completely, so the sentence above — "this loader has never read a
+    published Qwen bf16 MoE repo" — no longer holds. The binding token-exact
+    greedy gate RAN on `Qwen/Qwen3.6-35B-A3B` bf16
+    @`995ad96eacd98c81ed38be0c5b274b04031597b0` against the pinned oracle:
+    **6/7 prompts STRICT 16/16**, the seventh one exact logit tie
+    (`top2_gap_mnats = 0.0`) our on-device argmax breaks toward the higher id
+    where `torch.argmax` takes the lower
+    ([#910](https://github.com/mudler/vllm.cpp/issues/910)) — PASS under the
+    ratified near-tie doctrine. Only the FIRST divergence per prompt is validly
+    adjudicable, so the raw 108/112 position count is not a quality score.
+    SACRED inertness 3 of 3 with real counts and byte-identical goldens (27B
+    235/235, 35B 315/315, Coder 138/138, 688 assertions). NO throughput, latency
+    or memory number exists for that checkpoint. What is still owed is unchanged
+    by this: `Qwen/Qwen3.8-2.4T-A95B` remains unrunnable here on size, so (b)
+    stands for both classes, and the MTP and GGUF arms for 3.8 stay owed.
 
 ## 10. E2E test suites (T0 deliverable)
 

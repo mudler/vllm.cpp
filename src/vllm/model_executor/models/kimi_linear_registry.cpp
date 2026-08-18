@@ -87,7 +87,7 @@ void PrepareKimiLinearForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardKimiLinearForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
-  auto& kl = static_cast<KimiLinearLoadedModel&>(model);
+  auto& kl = ModelAs<KimiLinearLoadedModel>(model, "KimiLinearForCausalLM");
   const KimiLinearWeights& weights = kl.weights();
   // ROW 7 (§20.3): the RUNNER path — real paged caches supplied (the runner
   // always hands its allocated attn_kv + gdn_state groups) with bf16-resident

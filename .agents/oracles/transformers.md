@@ -20,6 +20,18 @@ placeholder expansion directly from it
 ([`../specs/audio-track.md`](../specs/audio-track.md) §A0), and the C++ STFT is
 gated against those goldens.
 
+**It cannot adjudicate a near-tie, and one attempt is recorded here so the next
+agent does not repeat it.** A CPU `transformers` probe of the three Qwen3.8-27B
+divergences ([`../specs/qwen38-27b-bf16-gate.md`](../specs/qwen38-27b-bf16-gate.md),
+[#915](https://github.com/mudler/vllm.cpp/issues/915)) reported all three as
+exact ties — and every runner-up gap it printed was an exact multiple of
+**0.125**, one bf16 ULP in that exponent range. An instrument quantized to one
+ULP cannot resolve a gap below one ULP, so "tied in bf16" does not imply "tied
+in the model" and agreement with it is not confirmation. vLLM computes logprobs
+from **fp32** and separates pairs bf16 collapses, so a logit-margin verdict
+comes from the pinned vLLM oracle; this one stands only as a secondary
+cross-check, with that limitation part of the result.
+
 ```oracle-pin
 id = transformers
 role = secondary

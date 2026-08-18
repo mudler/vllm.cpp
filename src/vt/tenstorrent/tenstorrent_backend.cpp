@@ -50,10 +50,15 @@ class TenstorrentBackend final : public Backend {
     std::free(p);
   }
   void Memset(Queue&, void* p, int value, size_t bytes) override {
+    // HOST-FREE-FORWARD R3: on-device zero-fill when capturing.
+    if (MemsetDeviceIfCapture(p, value)) return;
     std::memset(p, value, bytes);
     MarkHostWritten(p);
   }
   void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
+    // HOST-FREE-FORWARD R2: when capturing, prefer a device->device copy so the
+    // captured region has no host readback (which ttnn trace prohibits).
+    if (CopyDeviceDeviceIfCapture(dst, src)) return;
     // Device-resident results leave host stale until read; materialize first.
     EnsureHostBytes(const_cast<void*>(src));
     std::memcpy(dst, src, bytes);

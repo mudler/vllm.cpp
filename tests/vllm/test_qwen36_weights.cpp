@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -652,4 +653,112 @@ TEST_CASE(
     }
   }
 #endif  // VT_MARLIN_NVFP4
+}
+
+TEST_CASE("ReleaseHost drops the FILE DESCRIPTOR with the bytes it described") {
+  // F10 of the ENG-EXPERT-STREAM wiring review (#912).
+  //
+  // `mmap_fd`/`mmap_file_offset` say where a BORROWED tensor's host bytes
+  // physically live. `ReleaseHost` on a borrowed buffer drops the keep-alive and
+  // clears `mmap_src`, and it used to leave the descriptor set. That leaves a
+  // record that outlives its own subject: `bytes.data()` is now null, so an
+  // expert-stream slice would pread the recorded offset -- which belongs to a
+  // tensor nothing is reading any more -- and every released tower would key on
+  // the same `TowerId(nullptr)`.
+  std::vector<uint8_t> backing(256, 0x5A);
+  auto owner = std::make_shared<std::vector<uint8_t>>(backing);
+
+  vllm::OwnedTensor t;
+  t.dtype = vt::DType::kI8;
+  t.rank = 2;
+  t.shape[0] = 8;
+  t.shape[1] = 32;
+  t.bytes = vllm::OwnedBytes::Borrow(owner->data(), owner->size(), owner);
+  t.mmap_src = owner->data();
+  t.mmap_src_bytes = owner->size();
+  t.mmap_fd = 7;            // any plausible live descriptor
+  t.mmap_file_offset = 4096;
+  REQUIRE(t.bytes.borrowed());
+
+  t.ReleaseHost();
+
+  CHECK(t.bytes.data() == nullptr);
+  CHECK(t.mmap_src == nullptr);
+  CHECK(t.mmap_src_bytes == 0u);
+  // THE ASSERTIONS THAT WERE MISSING. A descriptor without bytes is not a
+  // source, and reading it as one is the "right offset, wrong tensor" failure.
+  CHECK(t.mmap_fd == -1);
+  CHECK(t.mmap_file_offset == 0u);
+}
+
+TEST_CASE("a tower's identity survives an address the allocator hands out again") {
+  // #1066. `TowerUid` exists because the expert slot cache is a process-lifetime
+  // singleton and an ADDRESS is not an identity across model lifetimes.
+  vllm::OwnedTensor a;
+  a.dtype = vt::DType::kI8;
+  a.rank = 1;
+  a.shape[0] = 64;
+  a.bytes.resize(64, 0x11);
+  const uint64_t uid_a = a.TowerUid();
+  CHECK(uid_a != 0u);
+  CHECK(a.TowerUid() == uid_a);  // stable while the bytes stay put
+
+  vllm::OwnedTensor b;
+  b.dtype = vt::DType::kI8;
+  b.rank = 1;
+  b.shape[0] = 64;
+  b.bytes.resize(64, 0x22);
+  // Two live tensors are always distinct, whatever addresses they happen to hold.
+  CHECK(b.TowerUid() != uid_a);
+
+  // A COPY carries the field but not the identity: its buffer is a different
+  // one, so inheriting the original's id would be exactly the collision this
+  // guards against.
+  vllm::OwnedTensor c = a;
+  CHECK(c.TowerUid() != uid_a);
+
+  // And re-stamping is keyed on the buffer, so replacing the bytes with a
+  // DIFFERENTLY ADDRESSED buffer yields a new identity rather than silently
+  // reusing the old one.
+  const uint64_t uid_c = c.TowerUid();
+  c.bytes = vllm::OwnedBytes(std::vector<uint8_t>(128, 0x33));
+  REQUIRE(c.bytes.data() != nullptr);
+  CHECK(c.TowerUid() != uid_c);
+}
+
+TEST_CASE("a tower's identity is keyed on its ADDRESS, and says so") {
+  // #1091 finding 5. The field comment used to promise an identity for "this
+  // tensor's CURRENT bytes"; the implementation keys on `bytes.data()` and
+  // re-stamps only when that address moves. The two are not the same claim, and
+  // the case above cannot tell them apart because a fresh `std::vector` lands
+  // somewhere else and so satisfies both readings.
+  //
+  // This one separates them, deterministically, by borrowing: a borrowed view
+  // names an address the test controls, so "same address, different contents"
+  // is constructible rather than a matter of allocator luck. #1066 was a comment
+  // on this exact field that promised more than the code delivered, so the limit
+  // is pinned here rather than left to be rediscovered.
+  auto one = std::make_shared<std::vector<uint8_t>>(64, 0x44);
+  auto two = std::make_shared<std::vector<uint8_t>>(64, 0x55);
+
+  vllm::OwnedTensor t;
+  t.dtype = vt::DType::kI8;
+  t.rank = 1;
+  t.shape[0] = 64;
+  t.bytes = vllm::OwnedBytes::Borrow(one->data(), one->size(), one);
+  const uint64_t uid = t.TowerUid();
+  CHECK(uid != 0u);
+
+  // Same address, wholly different contents. The uid does NOT move — which is
+  // the documented limit, not a defect, because nothing rewrites a tower in
+  // place. A future caller that did would need a different key.
+  std::fill(one->begin(), one->end(), 0x99);
+  CHECK(t.bytes.data() == one->data());
+  CHECK(t.TowerUid() == uid);
+
+  // A different address is a different tower, which is the half the cache
+  // depends on.
+  t.bytes = vllm::OwnedBytes::Borrow(two->data(), two->size(), two);
+  REQUIRE(t.bytes.data() != one->data());
+  CHECK(t.TowerUid() != uid);
 }

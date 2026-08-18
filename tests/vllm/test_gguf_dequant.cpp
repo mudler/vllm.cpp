@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
@@ -447,4 +448,58 @@ TEST_CASE("DequantGgufRowToF32 rejects unsupported i-quant type") {
   // decoder yet, so it must still fail loudly rather than silently mis-decode.
   std::vector<uint8_t> b2(136, 0);
   CHECK_THROWS_AS(DequantGgufRowToF32(23, b2.data(), 256), std::runtime_error);
+}
+
+// --- IQ1_S (19) / IQ1_XXXS (66): the two encodings the Qwen3.8-2.4T-A95B
+// checkpoints are 96.92 % made of. `vt::cpu::BlockToFloat` has decoded both
+// since #946, but this expand-to-bf16 path did not list them, so it threw
+// "unsupported ggml type". That is not a corner: `RouteGgufTensor` sends a
+// tensor here whenever the VT_CPU_REF oracle switch is on, keep-quant is off,
+// K is ragged, or the role is not a verbatim one, so the reference lane could
+// not load the target checkpoint at all.
+//
+// Gated on the ORACLE-produced goldens rather than on "does not throw": the
+// inputs are real checkpoint bytes and the expected values come from the pinned
+// upstream and fork ggml themselves. Provenance in
+// tests/vt/iq1_golden_vectors.h.
+#include "../vt/iq1_golden_vectors.h"
+
+namespace {
+
+void CheckGgufDequantAgainstOracle(uint32_t ggml_type, const uint8_t* blocks,
+                                   const uint32_t* golden_bits, size_t n) {
+  const std::vector<float> out =
+      DequantGgufRowToF32(ggml_type, blocks, static_cast<int64_t>(n));
+  REQUIRE(out.size() == n);
+  for (size_t i = 0; i < n; ++i) {
+    CAPTURE(i);
+    uint32_t bits = 0;
+    std::memcpy(&bits, &out[i], sizeof(bits));
+    CHECK(bits == golden_bits[i]);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("DequantGgufRowToF32 IQ1_S row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(19, vllm_test::kIq1sGoldenBlocks,
+                                vllm_test::kIq1sGoldenBits,
+                                std::size(vllm_test::kIq1sGoldenBits));
+}
+
+TEST_CASE("DequantGgufRowToF32 IQ1_XXXS row matches the pinned FORK oracle") {
+  CheckGgufDequantAgainstOracle(66, vllm_test::kIq1xxxsGoldenBlocks,
+                                vllm_test::kIq1xxxsGoldenBits,
+                                std::size(vllm_test::kIq1xxxsGoldenBits));
+}
+
+TEST_CASE("DequantGgufRowToF32 IQ3_XXS row matches the pinned oracle") {
+  // Same omission, found by the same review, in the same shared branch, so it
+  // is fixed in the same flow rather than filed and deferred (issue #1023).
+  // IQ3_XXS is the `ffn_down` encoding of the DeepSeek-V4 UD-IQ2_XXS vehicle,
+  // and `vt::cpu::BlockToFloat` has decoded it since that port; only this
+  // expansion path never listed it.
+  CheckGgufDequantAgainstOracle(18, vllm_test::kIq3xxsGoldenBlocks,
+                                vllm_test::kIq3xxsGoldenBits,
+                                std::size(vllm_test::kIq3xxsGoldenBits));
 }

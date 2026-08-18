@@ -270,7 +270,31 @@ def audio_self_mask_dense() -> torch.Tensor:
     )
 
 
-def build_modalities(masked: bool, audio_enabled: bool = True, dense_self_mask: bool = False):
+# `_first_frame_keyframes_mask` (ltx_core/tools.py:186-196) at THIS fixture's
+# geometry: the target's first latent frame, marked UNCONDITIONALLY, which is
+# `tokens_per_latent_frame = get_token_count(target._replace(frames=1))` — the
+# spatial token count of one latent frame, i.e. h*w of VIDEO_GRID.
+VIDEO_TOKENS_PER_LATENT_FRAME = VIDEO_GRID[1] * VIDEO_GRID[2]
+
+
+def video_keyframes_mask() -> torch.Tensor:
+    """The (B, T, 1) marker `Modality.keyframes_mask` carries (modality.py:63).
+
+    Built the way upstream builds it — `zeros_like(denoise_mask)` with
+    `[:, :tokens_per_latent_frame] = 1.0` (tools.py:194-195) — rather than as a
+    random fixture, because the RULE is half of what this arm gates.
+    """
+    mask = torch.zeros(BATCH, VIDEO_TOKENS, 1, dtype=torch.float32)
+    mask[:, :VIDEO_TOKENS_PER_LATENT_FRAME] = 1.0
+    return mask
+
+
+def build_modalities(
+    masked: bool,
+    audio_enabled: bool = True,
+    dense_self_mask: bool = False,
+    keyframes: bool = False,
+):
     from ltx_core.model.transformer.modality import Modality  # noqa: PLC0415
 
     video_ctx_mask = None
@@ -298,6 +322,10 @@ def build_modalities(masked: bool, audio_enabled: bool = True, dense_self_mask: 
         enabled=True,
         context_mask=video_ctx_mask,
         attention_mask=video_attn_mask,
+        # modality.py:63. Only the VIDEO modality ever carries it: the audio
+        # preprocessor is built with no `keyframes_embedding_provider` at all
+        # (model.py:314 supplies one, :333 does not).
+        keyframes_mask=video_keyframes_mask() if keyframes else None,
     )
     audio = Modality(
         latent=rand_input(
@@ -316,7 +344,12 @@ def build_modalities(masked: bool, audio_enabled: bool = True, dense_self_mask: 
     return video, audio
 
 
-def build_model(rope_type_name: str, double_rope: bool, prompt_adaln: bool | None = None):
+def build_model(
+    rope_type_name: str,
+    double_rope: bool,
+    prompt_adaln: bool | None = None,
+    keyframes: bool = False,
+):
     """`prompt_adaln` overrides ARCH's `use_prompt_adaln_single` for the flag-ON arm.
 
     Every OTHER parameter keeps its name, and the deterministic stream is keyed by
@@ -356,6 +389,11 @@ def build_model(rope_type_name: str, double_rope: bool, prompt_adaln: bool | Non
         use_prompt_adaln_single=prompt_adaln,
         ff_bias=ARCH["ff_bias"],
         audio_ff_bias=ARCH["audio_ff_bias"],
+        # model.py:80/:101/:217-219 — the flag is what BUILDS the (1, inner_dim)
+        # parameter. `fill_parameters` then TRAINS it: zero-initialized is the
+        # trap this arm exists to avoid, because a zero bias is an exact no-op
+        # (the term is ADDED) and would gate nothing.
+        use_keyframes_abs_pos_embedding=keyframes,
     )
     fill_parameters(model)
     model.eval()
@@ -626,16 +664,27 @@ def emit_bricks(out, model) -> None:
 def emit_forward(
     out, tag: str, rope_type_name: str, double_rope: bool, masked: bool,
     audio_enabled: bool = True, dense_self_mask: bool = False,
-    prompt_adaln: bool | None = None,
+    prompt_adaln: bool | None = None, keyframes: bool = False,
+    keyframes_mask: bool | None = None,
 ) -> None:
+    """`keyframes` builds the flag-ON model; `keyframes_mask` supplies the marker.
+
+    They are SEPARATE on purpose. A model with the parameter and a modality with
+    no mask is upstream's `keyframes_mask is None` early return
+    (transformer_args.py:37-38), and it is the arm that proves the bias is applied
+    where the MASK says and nowhere else.
+    """
+    if keyframes_mask is None:
+        keyframes_mask = keyframes
     out.write(
         f"// --- forward case {tag}: rope={rope_type_name} float64_freqs={double_rope} "
         f"masked={masked} audio_enabled={audio_enabled} dense_self_mask={dense_self_mask} "
-        f"prompt_adaln={ARCH['use_prompt_adaln_single'] if prompt_adaln is None else prompt_adaln}"
+        f"prompt_adaln={ARCH['use_prompt_adaln_single'] if prompt_adaln is None else prompt_adaln} "
+        f"keyframes={keyframes} keyframes_mask={keyframes_mask}"
         " ---\n"
     )
-    model = build_model(rope_type_name, double_rope, prompt_adaln)
-    video, audio = build_modalities(masked, audio_enabled, dense_self_mask)
+    model = build_model(rope_type_name, double_rope, prompt_adaln, keyframes)
+    video, audio = build_modalities(masked, audio_enabled, dense_self_mask, keyframes_mask)
     with torch.no_grad():
         vx, ax = model(video=video, audio=audio, perturbations=None)
     emit_f32(out, f"kLtx2Forward{tag}Video", tensor(vx))
@@ -694,6 +743,130 @@ def emit_prompt_adaln(out) -> None:
     emit_forward(out, "PromptAdalnMasked", "split", False, True, prompt_adaln=True)
 
 
+def emit_keyframes(out) -> None:
+    """Section 7 — the KEYFRAME absolute-position embedding arm.
+
+    Row LTX25-KEYFRAMES-ABS-POS, spec .agents/specs/ltx25-keyframes-abs-pos.md,
+    issue #658. Upstream is `apply_keyframes_absolute_embedding`
+    (transformer_args.py:23-43), called ONCE at :269 — immediately after
+    `patchify_proj` and before anything else touches `x`.
+
+    What is emitted, and why each piece is separately gateable:
+      * the flag-ON parameter list, so the ORDER our enumeration builds is
+        checked against upstream's own `named_parameters()`. The parameter is a
+        module-OWN one registered at model.py:217, i.e. BEFORE `scale_shift_table`
+        (:230), which no shape can tell you;
+      * the trained (1, inner_dim) embedding itself;
+      * the (B, T, 1) marker at this geometry;
+      * `apply_keyframes_absolute_embedding` run STANDALONE on the projected
+        tokens, so a failure localizes to the three lines of maths rather than to
+        a 2-block forward;
+      * three full forwards -- flag ON with the mask, flag ON with NO mask, and
+        the flag-OFF baseline -- which between them pin all three of upstream's
+        exits (apply, `keyframes_mask is None`, `embedding_provider is None`).
+    """
+    out.write("// --- section 7: the keyframe absolute-position embedding arm ---\n")
+    model = build_model("split", False, keyframes=True)
+
+    names, ranks, dims = [], [], []
+    for name, param in model.named_parameters():
+        names.append(name)
+        ranks.append(len(param.shape))
+        dims.extend(int(d) for d in param.shape)
+    out.write("inline constexpr const char* kLtx2KeyframesParamNames[] = {\n")
+    for name in names:
+        out.write(f'    "{name}",\n')
+    out.write("};\n\n")
+    emit_i64(out, "kLtx2KeyframesParamRanks", ranks)
+    emit_i64(out, "kLtx2KeyframesParamDims", dims)
+    emit_scalar(out, "kLtx2KeyframesParamCount", len(names))
+    emit_scalar(out, "kLtx2KeyframesTokensPerLatentFrame", VIDEO_TOKENS_PER_LATENT_FRAME)
+    out.write("\n")
+
+    mask = video_keyframes_mask()
+    emit_f32(out, "kLtx2KeyframesMask", tensor(mask))
+    emit_f32(out, "kLtx2KeyframesEmbedding", tensor(model.keyframes_abs_pos_embedding))
+
+    # The maths ALONE. `hidden_states` here is the real `patchify_proj(latent)`
+    # of the shared video fixture, so the test feeds the identical rows our
+    # `PrepareStream` produces at that point rather than a synthetic stand-in.
+    from ltx_core.model.transformer.transformer_args import (  # noqa: PLC0415
+        apply_keyframes_absolute_embedding,
+    )
+
+    video, _ = build_modalities(False, keyframes=True)
+    with torch.no_grad():
+        hidden = model.patchify_proj(video.latent)
+        applied = apply_keyframes_absolute_embedding(
+            hidden, video.keyframes_mask, model._keyframes_embedding
+        )
+        # The `keyframes_mask is None` exit (:37-38), same weights, same input.
+        unmarked = apply_keyframes_absolute_embedding(hidden, None, model._keyframes_embedding)
+    emit_f32(out, "kLtx2KeyframesHidden", tensor(hidden))
+    emit_f32(out, "kLtx2KeyframesApplied", tensor(applied))
+    emit_f32(out, "kLtx2KeyframesUnmarked", tensor(unmarked))
+
+    emit_forward(out, "Keyframes", "split", False, False, keyframes=True)
+    # Flag ON, marker ABSENT. Upstream returns `hidden_states` untouched, so this
+    # must equal the flag-OFF forward BIT-for-BIT over the shared weights -- and
+    # a port that applied the bias unconditionally rather than where the mask
+    # says would differ here and nowhere else.
+    emit_forward(
+        out, "KeyframesNoMask", "split", False, False, keyframes=True, keyframes_mask=False
+    )
+
+
+def measure_keyframes_magnitude() -> str:
+    """How far the render MOVES when the trained marker is applied.
+
+    The FP8 DiT ships this parameter with 4096 of 4096 bytes non-zero, so on that
+    checkpoint the term is live on every forward. This measures the floor at the
+    generator's synthetic scale: flag-ON-with-mask against flag-ON-without, which
+    isolates the term from every other difference because it is the SAME model.
+    """
+    lines = []
+    model = build_model("split", False, keyframes=True)
+    marked_v, marked_a = build_modalities(False, keyframes=True)
+    plain_v, plain_a = build_modalities(False, keyframes=False)
+    with torch.no_grad():
+        vx_on, ax_on = model(video=marked_v, audio=marked_a, perturbations=None)
+        vx_off, ax_off = model(video=plain_v, audio=plain_a, perturbations=None)
+
+    def rel(a, b):
+        a32 = a.to(torch.float32)
+        b32 = b.to(torch.float32)
+        delta = float((b32 - a32).abs().max())
+        denom = float(a32.abs().max())
+        return delta, (delta / denom if denom > 0 else float("nan"))
+
+    vabs, vrel = rel(vx_off, vx_on)
+    aabs, arel = rel(ax_off, ax_on)
+    lines.append(f"//   DiT video output: max|marked-unmarked| = {vabs:.6g}  ({vrel * 100:.2f}% of max|unmarked|)")
+    lines.append(f"//   DiT audio output: max|marked-unmarked| = {aabs:.6g}  ({arel * 100:.2f}% of max|unmarked|)")
+
+    emb = model.keyframes_abs_pos_embedding
+    with torch.no_grad():
+        hidden = model.patchify_proj(marked_v.latent)
+    lines.append(
+        f"//   the bias itself: max|embedding| = {float(emb.abs().max()):.6g} against "
+        f"max|patchify_proj(latent)| = {float(hidden.abs().max()):.6g}"
+    )
+    lines.append(
+        f"//   tokens it reaches: {VIDEO_TOKENS_PER_LATENT_FRAME} of {VIDEO_TOKENS} "
+        "(the target's FIRST latent frame, marked unconditionally by tools.py:194-195)"
+    )
+    lines.append(
+        "// The AUDIO row is non-zero only through the audio<->video cross attention:"
+    )
+    lines.append(
+        "// nothing adds this bias to the audio stream (model.py:333 builds that"
+    )
+    lines.append("// preprocessor with NO keyframes_embedding_provider).")
+    text = "\n".join(lines)
+    print("keyframes-embedding magnitude:\n" + text, file=sys.stderr)
+    return text
+
+
 def measure_prompt_adaln_magnitude() -> str:
     """How far the conditioning MOVES when the term is included, vs when it is not.
 
@@ -739,8 +912,13 @@ def measure_prompt_adaln_magnitude() -> str:
         kv_off = ctx * (1 + scale_off) + shift_off
         kv_on = ctx * (1 + scale_on) + shift_on
     kabs, krel = rel(kv_off, kv_on)
+    # NAME THE STREAM. Both rows below are computed from `vmod` and the VIDEO
+    # `prompt_scale_shift_table`, and neither said so, which is how the Outcome came
+    # to divide a shipped AUDIO ratio by this VIDEO denominator (issue #644). The
+    # audio stream's own value differs -- 40.6% against this row's 51.7% -- so an
+    # unlabelled ratio here is a denominator waiting to be misapplied.
     lines.append(
-        f"//   block 0 modulated prompt K/V: max|on-off| = {kabs:.6g}  "
+        f"//   block 0 modulated prompt K/V (VIDEO stream): max|on-off| = {kabs:.6g}  "
         f"({krel * 100:.2f}% of max|off|)"
     )
     # How much of the K/V modulation is timestep-conditioned at all: the MLP row
@@ -748,19 +926,34 @@ def measure_prompt_adaln_magnitude() -> str:
     static_max = float(table.abs().max())
     term_max = float(vmod.abs().max())
     lines.append(
-        f"//   timestep term vs static table: max|term| = {term_max:.6g} vs "
-        f"max|table| = {static_max:.6g}  ({term_max / static_max * 100:.1f}%)"
+        f"//   timestep term vs static table (VIDEO stream): max|term| = {term_max:.6g} "
+        f"vs max|table| = {static_max:.6g}  ({term_max / static_max * 100:.1f}%)"
     )
     lines.append(
-        "// The two output rows are bounded by this generator's SYNTHETIC weight scale"
+        "// ALL FOUR ROWS ARE GATE-FLOOR NUMBERS FROM SYNTHETIC WEIGHTS. The table and"
     )
     lines.append(
-        "// (0.05, param_spec above) and by a 2-block stack; they are the FLOOR the gate"
+        "// the prompt-AdaLN MLP are BOTH drawn at param_spec's scale=0.05 above, so every"
     )
     lines.append(
-        "// needs, not a claim about the trained checkpoint. The K/V row is where the"
+        "// ratio here is a property of THIS FIXTURE and moves with that scale; the output"
     )
-    lines.append("// term actually enters and is the number that answers 'does this matter'.")
+    lines.append(
+        "// rows are bounded by it AND by a 2-block stack. They are reported because a"
+    )
+    lines.append(
+        "// mutation has to be shown to move something -- NOT as a claim about the trained"
+    )
+    lines.append(
+        "// checkpoint. On the SHIPPED DiT the term DOMINATES the table it is added to:"
+    )
+    lines.append(
+        "// rms|term|/rms|table| = 1347% video, 1583% audio, measured through upstream's"
+    )
+    lines.append(
+        "// own AdaLayerNormSingle on the real weights. See"
+    )
+    lines.append("// .agents/specs/ltx25-prompt-adaln.md section Outcome.")
     text = "\n".join(lines)
     print("prompt-AdaLN magnitude:\n" + text, file=sys.stderr)
     return text
@@ -818,9 +1011,17 @@ def main() -> int:
         # Upstream's DEFAULT arm, and the one the shipped checkpoint runs.
         emit_prompt_adaln(out)
         out.write(
-            "// --- the MEASURED magnitude of the prompt-AdaLN term ---\n"
+            "// --- the prompt-AdaLN term's magnitude ON THIS SYNTHETIC FIXTURE ---\n"
             "// Same shared weights, same inputs, flag ON vs OFF:\n"
             + measure_prompt_adaln_magnitude()
+            + "\n"
+        )
+        # The keyframe marker (row LTX25-KEYFRAMES-ABS-POS, issue #658).
+        emit_keyframes(out)
+        out.write(
+            "// --- the MEASURED magnitude of the keyframe marker ---\n"
+            "// Same model, same weights, marker supplied vs not:\n"
+            + measure_keyframes_magnitude()
             + "\n"
         )
         out.write("}  // namespace vllm_test\n")

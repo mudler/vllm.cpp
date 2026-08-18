@@ -111,7 +111,7 @@ void PrepareGlm4MoeLiteForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardGlm4MoeLiteForCausalLM(LoadedModel& model,
                                             const ModelForwardInput& input) {
-  auto& glm = static_cast<Glm4MoeLiteLoadedModel&>(model);
+  auto& glm = ModelAs<Glm4MoeLiteLoadedModel>(model, "Glm4MoeLiteForCausalLM");
   const DeepseekV2Weights& weights = glm.weights();
 
   // Identical dispatch to deepseek_v2_registry.cpp: a PURE-DECODE CUDA step goes

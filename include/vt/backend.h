@@ -76,8 +76,21 @@ class Backend {
   virtual bool DeviceMemoryIsHostAddressable() const { return false; }
 
   // Optional device free/total VRAM probe (bytes). Default false = unknown.
-  // ROCm/CUDA override with hipMemGetInfo/cudaMemGetInfo so model code can
-  // size LRU caches without including vendor headers (device-leakage).
+  // ROCm overrides it with hipMemGetInfo (src/vt/rocm/rocm_backend.hip) so model
+  // code can size LRU caches without including vendor headers (device-leakage).
+  //
+  // CUDA does NOT override it. This comment claimed "ROCm/CUDA" until #1123
+  // measured what that costs: `Gemma4MoE`'s device-expert LRU is the seam's only
+  // consumer, its `FreeBytes` returns false on an absent probe and `MakeRoom`
+  // then refuses the device upload (both in gemma4_moe.cpp), so on EVERY CUDA
+  // device that cache admits nothing and falls back to host H2D, silently.
+  // Adding the override therefore WAKES a landed residency policy and needs its own
+  // measurement; that is issue #1126, and this line says what is true until then.
+  //
+  // The load-time GGUF fit refusal deliberately does not read this seam: it is a
+  // live free/total probe, and a load-time budget must not be a function of
+  // contention. It carries its own `total` on
+  // `vllm::platforms::ResidencyPolicy::device_memory_total_bytes` instead.
   virtual bool DeviceMemoryInfo(size_t* /*free_bytes*/, size_t* /*total_bytes*/) const {
     return false;
   }

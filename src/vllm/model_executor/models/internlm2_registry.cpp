@@ -91,7 +91,7 @@ ForwardLogits ForwardInternLM2ForCausalLM(LoadedModel& model,
   // non-async-CUDA path, RAII-scoped, byte-identical when the mirror is off.
   const detail::DeviceTokenIdsScope device_ids_scope(
       input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
-  auto& im2 = static_cast<InternLM2LoadedModel&>(model);
+  auto& im2 = ModelAs<InternLM2LoadedModel>(model, "InternLM2ForCausalLM");
   const InternLM2Weights& weights = im2.weights();
   // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_
   // GRAPH); std::nullopt falls through to the byte-identical eager path below.

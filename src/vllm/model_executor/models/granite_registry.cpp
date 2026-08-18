@@ -64,7 +64,7 @@ void PrepareGraniteForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardGraniteForCausalLM(LoadedModel& model,
                                         const ModelForwardInput& input) {
-  const auto& granite = static_cast<GraniteLoadedModel&>(model);
+  const auto& granite = ModelAs<GraniteLoadedModel>(model, "GraniteForCausalLM");
   const GraniteWeights& weights = granite.weights();
   if (input.gather_logits) {
     return GraniteModel::ForwardDevice(input.token_ids, input.positions,

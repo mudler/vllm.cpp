@@ -68,7 +68,7 @@ void PreparePhiForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardPhiForCausalLM(LoadedModel& model,
                                     const ModelForwardInput& input) {
-  const auto& pm = static_cast<PhiLoadedModel&>(model);
+  const auto& pm = ModelAs<PhiLoadedModel>(model, "PhiForCausalLM");
   const PhiWeights& weights = pm.weights();
   if (input.gather_logits) {
     return PhiModel::ForwardDevice(input.token_ids, input.positions, input.attn_meta,

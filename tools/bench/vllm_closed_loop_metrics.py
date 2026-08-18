@@ -113,6 +113,23 @@ def run_closed_loop(llm, prompts, sampling, concurrency: int, request_id_base: i
     return duration, [records[index] for index in range(len(prompts))]
 
 
+def require_every_request_returned(records, expected_requests: int) -> int:
+    """Refuse to divide by a wall duration that outlived some of its requests.
+
+    `duration` spans the whole closed loop, so a request that never came back
+    still contributes seconds to every rate below while contributing no tokens
+    (#931). The gather above indexes by request id and would raise KeyError on
+    a gap, but a KeyError names nothing; this names the count.
+    """
+
+    if len(records) != expected_requests:
+        raise RuntimeError(
+            f"closed-loop request set is partial: {len(records)} of "
+            f"{expected_requests} requests returned; no rate may be derived"
+        )
+    return len(records)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -166,6 +183,41 @@ def main() -> int:
     duration, records = run_closed_loop(
         llm, prompts, sampling, args.max_concurrency, args.request_id_base
     )
+    result, token_ids = derive_metrics(
+        records,
+        prompt_ids,
+        duration,
+        output_len=args.output_len,
+        max_concurrency=args.max_concurrency,
+        async_scheduling=args.async_scheduling,
+    )
+    args.metrics_output.write_text(
+        json.dumps(result, indent=2) + "\n", encoding="utf-8"
+    )
+    args.tokens_output.write_text(json.dumps(token_ids) + "\n", encoding="utf-8")
+    print(json.dumps({key: value for key, value in result.items() if key != "requests"}))
+    return 0
+
+
+def derive_metrics(
+    records,
+    prompt_ids,
+    duration: float,
+    *,
+    output_len: int,
+    max_concurrency: int,
+    async_scheduling: str,
+) -> tuple[dict, list[list[int]]]:
+    """Turn a closed-loop record set into rates, refusing a partial set first.
+
+    Split out of `main` so the guard below sits on a call path a test can
+    reach. It used to be one statement inside `main`, whose body starts by
+    importing `vllm` and constructing an `LLM` -- so no test could execute it,
+    and deleting the guard left all 328 tool tests green while the tool went
+    back to dividing by a duration that outlived some of its requests (#931).
+    """
+
+    require_every_request_returned(records, len(prompt_ids))
 
     request_rows = []
     all_itls_ms: list[float] = []
@@ -174,9 +226,9 @@ def main() -> int:
         if record["first_token_s"] is None or record["completion_s"] is None:
             raise RuntimeError(f"request {index} has incomplete timing")
         ids = list(record["output_token_ids"])
-        if len(ids) != args.output_len:
+        if len(ids) != output_len:
             raise RuntimeError(
-                f"request {index} emitted {len(ids)} tokens; expected {args.output_len}"
+                f"request {index} emitted {len(ids)} tokens; expected {output_len}"
             )
         token_ids.append(ids)
         ttft_ms = (record["first_token_s"] - record["arrival_s"]) * 1000.0
@@ -213,10 +265,10 @@ def main() -> int:
     output_tokens = sum(map(len, token_ids))
     result = {
         "admission": "closed_loop_delta_client_observed",
-        "async_scheduling_requested": args.async_scheduling,
+        "async_scheduling_requested": async_scheduling,
         "duration_s": duration,
         "successful_requests": len(records),
-        "maximum_request_concurrency": args.max_concurrency,
+        "maximum_request_concurrency": max_concurrency,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "request_throughput": len(records) / duration,
@@ -231,12 +283,7 @@ def main() -> int:
         "e2el_ms": summarize(e2el_ms),
         "requests": request_rows,
     }
-    args.metrics_output.write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
-    args.tokens_output.write_text(json.dumps(token_ids) + "\n", encoding="utf-8")
-    print(json.dumps({key: value for key, value in result.items() if key != "requests"}))
-    return 0
+    return result, token_ids
 
 
 if __name__ == "__main__":

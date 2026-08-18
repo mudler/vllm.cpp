@@ -275,6 +275,7 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     a.pe = args.video_pe;
     a.bias = args.video_self_bias;
     a.bias_rows = args.video_self_bias_rows;
+    a.all_perturbed = args.video_self_attn_perturbed;
     const std::vector<float> msa = Ltx2Attention(device, w.attn1, norm_vx.data(), nullptr, a);
     PostSelfAttention(video_x, msa.data(), gate, batch * tv, dim, eps, &vx_normed);
 
@@ -312,6 +313,7 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     a.pe = args.audio_pe;
     a.bias = args.audio_self_bias;
     a.bias_rows = args.audio_self_bias_rows;
+    a.all_perturbed = args.audio_self_attn_perturbed;
     const std::vector<float> msa = Ltx2Attention(device, w.audio_attn1, norm_ax.data(), nullptr, a);
     PostSelfAttention(audio_x, msa.data(), gate, batch * ta, adim, eps, &ax_normed);
 
@@ -347,7 +349,14 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
                       /*mod_index=*/0);
     };
 
-    if (run_a2v) {
+    // `if run_a2v and not video.cross_attn_skip_all` (transformer.py:335). The
+    // guard is INSIDE the `run_a2v || run_v2a` block, exactly as upstream's is,
+    // so a pass that skips one direction still took the `vx_pre` / `ax_pre`
+    // snapshot above and the surviving direction reads the pre-cross state.
+    // Hoisting it into the outer condition would be equivalent only while both
+    // directions are always skipped together, which is true of the one caller
+    // today and is not a property of the flag.
+    if (run_a2v && !args.video_cross_attn_skip_all) {
       std::vector<float> scale_v, shift_v, scale_a, shift_a;
       av_scale_shift(w.scale_shift_table_a2v_ca_video, args.video_cross_scale_shift, tv, dim, 0,
                      &scale_v, &shift_v);
@@ -375,7 +384,8 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
       AddGatedBroadcast(video_x, out, gate, batch, tv, dim);
     }
 
-    if (run_v2a) {
+    // `if run_v2a and not audio.cross_attn_skip_all` (transformer.py:367).
+    if (run_v2a && !args.audio_cross_attn_skip_all) {
       std::vector<float> scale_a, shift_a, scale_v, shift_v;
       av_scale_shift(w.scale_shift_table_a2v_ca_audio, args.audio_cross_scale_shift, ta, adim, 2,
                      &scale_a, &shift_a);
@@ -484,6 +494,7 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
                              const Ltx2AdaLayerNormSingleWeights& cross_scale_shift_adaln,
                              const Ltx2AdaLayerNormSingleWeights& cross_gate_adaln,
                              const Ltx2AdaLayerNormSingleWeights* prompt_adaln,
+                             const vt::Tensor* keyframes_embedding,
                              const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                              int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
                              int64_t heads, const Ltx2ModalityInput* cross) {
@@ -505,6 +516,61 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
     for (int64_t r = 0; r < rows; ++r) {
       float* dst = out.x.data() + r * width;
       for (int64_t c = 0; c < width; ++c) dst[c] += b[c];
+    }
+  }
+
+  // transformer_args.py:269 — `apply_keyframes_absolute_embedding` runs HERE,
+  // immediately after patchify_proj and before the timestep, so it is the input
+  // every later stage sees.
+  //
+  // A mask on a stream that has no provider is REFUSED rather than dropped:
+  // `_init_preprocessors` gives the video preprocessor one (model.py:314) and the
+  // audio one none (:333), so a caller that put the marker on the audio input has
+  // made a mistake that silently renders without it.
+  VT_CHECK(m.keyframes_mask == nullptr || keyframes_embedding != nullptr,
+           "ltx2: a keyframes_mask was supplied for a stream that carries no "
+           "keyframes_abs_pos_embedding. Upstream builds the AUDIO args preprocessor with no "
+           "keyframes_embedding_provider at all (model.py:333 against :314), and a model whose "
+           "checkpoint omitted the parameter leaves it on the meta device "
+           "(supports_keyframes_abs_pos_embedding, model.py:166-173). Either way the marker "
+           "cannot be applied, and dropping it silently would render without a trained term.");
+  if (keyframes_embedding != nullptr && m.keyframes_mask != nullptr) {
+    // transformer_args.py:42-43:
+    //   mask = (keyframes_mask > 0).to(dtype=hidden_states.dtype)
+    //   return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
+    // BOTH operands are cast to `hidden_states.dtype` — there is no wider
+    // accumulator upstream and there is none here. `hidden_states` is `out.x`,
+    // which this TU holds in f32 because the WHOLE L2 forward is f32 (the DTYPE
+    // note at the top of ltx2.h); the embedding is read at that same width, so
+    // the term is added in the stream dtype exactly as upstream adds it.
+    //
+    // The view's dtype is asserted rather than assumed: the FP8 arm materializes
+    // this tensor as BF16 (MaterializeDitTensor's F8_E4M3 arm) and only
+    // `Ltx2WidenDitToF32` brings it to f32, so reading `Ptr<float>()` off an
+    // unwidened view would consume two bf16 lanes per float — finite, plausible,
+    // and invisible to any output check.
+    // BOUND, not merely declared. `BindLtx2DitWeights` binds this whenever the
+    // flag resolves true and throws by name when the map lacks it, so an unbound
+    // view here means a caller assembled `Ltx2DitWeights` itself and forgot one —
+    // and a default-constructed `vt::Tensor` would read as a zero-length bias,
+    // i.e. no bias at all, on a model whose config says it has one.
+    VT_CHECK(keyframes_embedding->data != nullptr,
+             "ltx2: use_keyframes_abs_pos_embedding is set but the weight view is unbound; "
+             "upstream's `supports_keyframes_abs_pos_embedding` (model.py:166-173) is exactly "
+             "the pair of these two facts and they cannot disagree");
+    VT_CHECK(keyframes_embedding->dtype == vt::DType::kF32,
+             "ltx2: keyframes_abs_pos_embedding must be f32 on the L2 forward, which computes in "
+             "f32 throughout; a bf16 view read as f32 would silently halve its length");
+    VT_CHECK(keyframes_embedding->rank == 2 && keyframes_embedding->shape[0] == 1 &&
+                 keyframes_embedding->shape[1] == width,
+             "ltx2: keyframes_abs_pos_embedding must be [1, stream width] (model.py:217-219)");
+    const float* e = keyframes_embedding->Ptr<float>();
+    for (int64_t r = 0; r < rows; ++r) {
+      // `(keyframes_mask > 0)` — a STRICT comparison cast to the stream dtype,
+      // so the marker is a 0/1 selector and never a scale.
+      if (!(m.keyframes_mask[r] > 0.0f)) continue;
+      float* dst = out.x.data() + r * width;
+      for (int64_t c = 0; c < width; ++c) dst[c] += e[c];
     }
   }
 
@@ -696,19 +762,27 @@ Ltx2PromptIdentity Ltx2PromptIdentityOf(const Ltx2DitParams& params,
 Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
                               const Ltx2ModalityInput* audio, vt::DType compute_dtype,
-                              Ltx2PromptKvCache* cache) {
+                              Ltx2PromptKvCache* cache, const Ltx2DitPerturbation* perturbations) {
   VT_CHECK(compute_dtype == vt::DType::kF32,
            "ltx2: phase L2 ships only the f32 parity forward; the bf16 / FP8 / NVFP4 stream "
            "dtypes are phase L6 and are refused rather than silently computed in f32");
-  // LTX-2.5 is an LTXModelType.AudioVideo checkpoint (model_configurator.py:47),
-  // and that is the only weight contract EnumerateLtx2DitTensors describes. The
-  // VideoOnly / AudioOnly types (model.py:31-33) build a DIFFERENT parameter set —
-  // no audio stream, no av_ca AdaLN embedders — so they are refused by name rather
-  // than served by a path no golden covers. Use `enabled` to run one stream of an
-  // AV model, which is what the pipeline itself does.
-  VT_CHECK(video != nullptr && audio != nullptr,
-           "ltx2: phase L2 ships the AudioVideo model type only; LTXModelType.VideoOnly and "
-           "LTXModelType.AudioOnly carry a different weight contract and are not ported");
+  // transformer.py:259-260 — upstream's own refusal, in its own words: "At least
+  // one of video or audio must be provided".
+  //
+  // ONE stream may be null, which is what `T2AOneStagePipeline` runs
+  // (t2a_one_stage.py:167, `video=None`) and what model.py:505 expresses.
+  // This check used to demand BOTH and blamed the AudioOnly / VideoOnly WEIGHT
+  // CONTRACT for it. That reason was re-derived at this tree and does not
+  // describe the case: T2A loads the ordinary AudioVideo FILE and restricts which
+  // keys it reads (LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP,
+  // model_configurator.py:228-239), so the contract EnumerateLtx2DitTensors
+  // describes is the one it satisfies. Every line below was ALREADY written
+  // against `video != nullptr` / `have_both`, so lifting the guard reaches a path
+  // this file already had. The weight-contract statement survives where it is
+  // true — at the loader, about the file.
+  VT_CHECK(video != nullptr || audio != nullptr,
+           "ltx2: at least one of the video and audio streams must be present "
+           "(transformer.py:259-260)");
   const int64_t dim = params.inner_dim();
   const int64_t adim = params.audio_inner_dim();
   // transformer_args.py:197 views the projected context to the STREAM width, so
@@ -734,20 +808,46 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
              "ltx2: the video stream needs a context when context_tokens > 0");
     vs = PrepareStream(device, params, weights.patchify_proj, weights.adaln_single,
                        weights.av_ca_video_scale_shift, weights.av_ca_a2v_gate,
-                       prompt_adaln ? &weights.prompt_adaln_single : nullptr, *video, dim,
+                       prompt_adaln ? &weights.prompt_adaln_single : nullptr,
+                       // model.py:314 — only the VIDEO preprocessor gets the provider.
+                       params.use_keyframes_abs_pos_embedding
+                           ? &weights.keyframes_abs_pos_embedding
+                           : nullptr,
+                       *video, dim,
                        params.in_channels, 3, params.positional_embedding_max_pos,
                        params.num_attention_heads, have_both ? audio : nullptr);
   }
   if (audio != nullptr) {
     as = PrepareStream(device, params, weights.audio_patchify_proj, weights.audio_adaln_single,
                        weights.av_ca_audio_scale_shift, weights.av_ca_v2a_gate,
-                       prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr, *audio, adim,
+                       prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr,
+                       // model.py:333 — the audio preprocessor is built with NO
+                       // keyframes_embedding_provider. Not an omission: nothing
+                       // adds this bias to the audio stream upstream.
+                       /*keyframes_embedding=*/nullptr,
+                       *audio, adim,
                        params.audio_in_channels, 1, params.audio_positional_embedding_max_pos,
                        params.audio_num_attention_heads, have_both ? video : nullptr);
   }
 
+  // `perturbations` (model.py:493). A vector that is not exactly `num_layers`
+  // long is REFUSED rather than indexed defensively: a config built for another
+  // layer count would otherwise perturb a prefix of the blocks and leave the rest
+  // alone, which is a legal-looking STG pass over the wrong blocks and renders.
+  if (perturbations != nullptr) {
+    for (const std::vector<uint8_t>* v :
+         {&perturbations->video_self_attn, &perturbations->audio_self_attn}) {
+      VT_CHECK(v->empty() || static_cast<int64_t>(v->size()) == params.num_layers,
+               "ltx2: a perturbation vector is neither empty nor one entry per block");
+    }
+  }
+
   const bool use_cache = cache != nullptr;
   if (use_cache) {
+    VT_CHECK(video != nullptr && audio != nullptr,
+             "ltx2: the prompt K/V cache keys on BOTH streams' context tensors "
+             "(Ltx2PromptIdentityOf), so it is refused on a one-stream call rather than keyed on "
+             "half an identity — two different renders would otherwise share a cache entry");
     // The cached K/V are a function of the PROMPT (and of nothing else on this
     // path — that is what use_prompt_adaln_single=false buys). A filled cache is
     // therefore bound to one prompt, and a call carrying another one is refused
@@ -771,6 +871,17 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
     a.audio_context_tokens = audio != nullptr ? audio->context_tokens : 0;
     a.video_enabled = video != nullptr && video->enabled;
     a.audio_enabled = audio != nullptr && audio->enabled;
+    if (perturbations != nullptr) {
+      a.video_self_attn_perturbed = !perturbations->video_self_attn.empty() &&
+                                    perturbations->video_self_attn[static_cast<size_t>(i)] != 0;
+      a.audio_self_attn_perturbed = !perturbations->audio_self_attn.empty() &&
+                                    perturbations->audio_self_attn[static_cast<size_t>(i)] != 0;
+      // Not indexed by block: the only thing that builds these asks for ALL
+      // blocks (`blocks=None`, denoisers.py:132-135), and upstream's reader is a
+      // per-block scalar rather than a mask multiply (transformer.py:335,367).
+      a.video_cross_attn_skip_all = perturbations->video_cross_attn_skip_all;
+      a.audio_cross_attn_skip_all = perturbations->audio_cross_attn_skip_all;
+    }
     a.video_timestep_modulation = vs.modulation.empty() ? nullptr : vs.modulation.data();
     a.audio_timestep_modulation = as.modulation.empty() ? nullptr : as.modulation.data();
     a.video_prompt_modulation =

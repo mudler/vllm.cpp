@@ -58,6 +58,42 @@ constexpr const char* DeviceTypeName(DeviceType device) {
   return "unknown";
 }
 
+// The inverse of `DeviceTypeName`: resolves a lowercase spelling back to its
+// enum, returning false when nothing matches. It lives here, beside the forward
+// direction, for the same reason that one does — it names every platform
+// EQUALLY, so it is a data list rather than a device-specific branch, and adding
+// a platform still touches one enum and this one file.
+//
+// It exists because the shared `vllm` layer has to honour a device NAME an
+// operator typed (`VLLM_CPP_VOCODER_DEVICE`, #672) WITHOUT either spelling a
+// device enumerator or casting an integer into one. Both are exactly what
+// `scripts/check-device-leakage.py` counts, and it is right to: a cast hardcodes
+// a device by ENUM VALUE, never writes the token, and silently re-points if the
+// enum is ever reordered. Enumerating the list HERE keeps that hazard inside the
+// seam that owns the enum, and the static_assert makes adding a platform without
+// listing it a build error rather than a silent gap.
+inline bool DeviceTypeFromName(const char* name, DeviceType* out) {
+  if (name == nullptr || out == nullptr) return false;
+  constexpr DeviceType kAll[] = {DeviceType::kCPU,    DeviceType::kCUDA, DeviceType::kMETAL,
+                                 DeviceType::kVULKAN, DeviceType::kXPU,  DeviceType::kROCM,
+                                 DeviceType::kTENSTORRENT};
+  static_assert(sizeof(kAll) / sizeof(kAll[0]) == kNumDeviceTypes,
+                "DeviceTypeFromName must list every DeviceType");
+  for (const DeviceType device : kAll) {
+    const char* a = name;
+    const char* b = DeviceTypeName(device);
+    while (*a != '\0' && *a == *b) {
+      ++a;
+      ++b;
+    }
+    if (*a == '\0' && *b == '\0') {
+      *out = device;
+      return true;
+    }
+  }
+  return false;
+}
+
 struct Device {
   DeviceType type = DeviceType::kCPU;
   int32_t index = 0;

@@ -128,8 +128,23 @@ def ready_errors(payload: dict[str, Any], expected: dict[str, str]) -> list[str]
 
 
 def run_local_preflight() -> bool:
+    """Run preflight, and refuse a run that SKIPPED a gate as well as one that failed.
+
+    This reads preflight by exit status alone, which carries two of the three
+    states preflight reports. Without `--fail-on-skip` a run whose base does not
+    resolve, or whose branch is behind `origin/main`, exits 0 with up to five
+    gates never executed, and this function returned True for it. The line below
+    then printed the word "green" over a trailer check that had not run (#998).
+
+    The flag is opt-in precisely so a human running preflight on a branch behind
+    `main` still gets exit 0. This caller is not that human. It is the documented
+    gate before a remote handoff, so an unknown here has to read as "not ready"
+    rather than as success.
+    """
+
     return subprocess.run(
-        [str(ROOT / "scripts/agent-preflight.sh"), "--quiet"], cwd=ROOT
+        [str(ROOT / "scripts/agent-preflight.sh"), "--quiet", "--fail-on-skip"],
+        cwd=ROOT,
     ).returncode == 0
 
 
@@ -138,7 +153,12 @@ def main() -> int:
     parser.add_argument("--pr-json", type=Path)
     args = parser.parse_args()
     if not run_local_preflight():
-        print("READY FAILED: local preflight is red", file=sys.stderr)
+        print(
+            "READY FAILED: local preflight did not report every gate green. "
+            "A gate FAILED, or a gate was SKIPPED and reported nothing about "
+            "this tree. Its report above says which, and why.",
+            file=sys.stderr,
+        )
         return 1
     try:
         expected = local_expected()

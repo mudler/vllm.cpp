@@ -33,6 +33,17 @@ gate `PENDING`. Never convert a missing value into an assumption. Preferences
 control operations only. They cannot reduce a correctness, evidence,
 attribution, or testing obligation.
 
+**Create both files on first use.** Neither is tracked, so a fresh checkout has
+neither, and `scripts/agent-start.py` reports the absence and routes you to ask.
+Ask the developer for the one value the current gate needs. Record an
+environment value with `scripts/agent-onboard.py --env-set KEY=VALUE`, which
+refuses any key `.env.example` does not declare. Record a preference by copying
+`.agents/developer-preferences.example.md` and editing the one entry. Leave
+every key you did not ask about empty, because empty means unavailable and its
+gate stays `PENDING`. A host name, a share path, or a checkout path written in
+a repository document is another developer's resolved value. It is never a
+default, and reading one instead of asking is the failure this rule names.
+
 ## History is git
 
 The project has no state log. Git is the history, and the history must agree
@@ -241,6 +252,7 @@ only when it appears in this table and has a recorded pin:
 | SGLang | `sglang` | a model or serving path that SGLang implements and vLLM does not |
 | SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models served by SGLang's pipeline runtime, in a third repository that is not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
+| `unslothai/llama.cpp` fork | `llama-cpp-unsloth` | the sub-IQ1_S quant encodings (IQ1_XS, IQ1_XXS, IQ1_XXXS) that no upstream llama.cpp defines, and that a published Qwen3.8-2.4T checkpoint stores its experts in |
 | Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, for which vLLM has no backend |
 
 <!-- oracle-registry:end -->
@@ -318,6 +330,40 @@ unimplemented arm with a message that names the missing part. Record the arm as
 owed. Never leave the missing path to be discovered later. Use
 [`.agents/porting-a-model.md`](.agents/porting-a-model.md) as the checklist.
 
+**Say which weights, and from where.** Every ported model documents the
+checkpoints it was built and gated against in [`docs/USAGE.md`](docs/USAGE.md),
+in the same change that makes the capability reachable: file name, size, and the
+exact HuggingFace repo *and revision*, grouped by arm, with a sha256 for a
+quantized artifact and the refused arms named beside them. A repo id alone is not
+a pin, because checkpoints get re-quantized in place under an unchanged name.
+Weights are the one part of a port a reader cannot infer from the code, so code
+shipped without them is something nobody can feed.
+
+## Nothing lands dead
+
+A shared seam says where a capability routes. This section says whether anything
+reaches it. The two failures are different, and this tree has carried the second
+one green.
+
+What lands is reachable from a production entry point at its own merge commit:
+`include/vllm.h`, the loader, `ModelRegistry::Forward`, or a registered server
+or command-line path on its default configuration. An example's internals are
+not one, and a test is not one. The smallest failing test enters the new code
+through that entry point. A unit test that constructs the type by hand proves
+that the class works, never that anything reaches it.
+
+A staged slice may land unreached only when the commit body and the pull request
+body name what is unreached, the row ID that owns the wiring, and the issue that
+tracks it, and the row's spec lists it under `## Owed`. There is no registry, and
+silence is not an exception.
+
+The fresh reviewer mutates for this. Delete the production call site in a scratch
+copy and rerun the focused gate. A gate that stays green without the call site
+measures a class, not a capability.
+
+Method, the shapes dead code takes, and why no checker enforces this:
+[`.agents/reachability.md`](.agents/reachability.md).
+
 ## Records
 
 Every inventory item has a stable ID. It records the upstream source, local
@@ -372,6 +418,59 @@ lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
 `.agents/NOW.md` is authored only at operator cadence and is never a per-row
 lifecycle write.
 
+## Work on a GPU happens inside a lease
+
+The shared GPUs are managed by
+[resource-controller](https://github.com/mudler/resource-controller), whose
+client is `rc`. **`dgx:gpu0`, `thor:gpu0` and `orin:gpu0` are the fleet devices.
+Claim a fleet device with `rc run` or `rc hold` before any GPU work, and never
+`ssh` to one to run work directly.** The lease is the required path to those
+boxes, and it replaces the `flock` file mutex as the default. The three names
+are written here so that membership stays checkable when the client is not at
+hand.
+
+**The condition is the device, not the shell you are typing in.** A missing
+local `rc`, a controller that does not answer, and a refused authentication are
+each a reason to get the client or to report the controller down. None of them
+turns a fleet device into a box you may reach by `ssh` plus `flock`, because the
+fleet cannot see that mutex. `thor:gpu0` read `unknown (no contact 1m0s)` on
+2026-08-17, so a controller that loses contact is a live state and not a
+hypothetical. The list of three is a lower bound and never an upper one. A
+device that `rc devices` reports is a fleet device even when this file has not
+caught up with the fleet.
+
+**On a GPU that is not a fleet device, take the file mutex
+`${GPU_LOCK:-$HOME/gpu.lock}`.** The rule is conditional because the hosts are
+not identical, and a reader on a personal machine still needs an instruction.
+Where both apply, the mutex runs inside the lease and never instead of one. The
+lease decides who gets the box. The mutex serialises the work of whoever holds
+it.
+
+**Two mutexes that do not exclude each other are worse than one, and this
+already cost a measurement.** On 2026-08-17 one session took the file mutex over
+`ssh` while another session held the same box through `rc`. Neither mutex
+excluded the other, and `.agents/specs/minimax-music3.md` §13.10 retains a whole
+speed axis as VOID because of it. That is the #777 failure again, in which this
+repository carried two GPU mutexes and neither serialised the other. A bypass
+also makes the fleet report the box free while somebody is on it.
+
+**A lease runs as root, and the worker provisions itself.** The leased worker
+reads and writes the shared `/workspace`, and on `dgx:gpu0` it is an Ubuntu 24.04
+container carrying `git`, `curl`, `wget`, `gcc`, `cmake`, `ninja`, `python3` and
+`pip`. It installs what it lacks and it compiles in place. On 2026-08-18 one job
+apt-installed `cuda-nvcc-13-0` and built this tree for `sm_121a`
+([#1213](https://github.com/mudler/vllm.cpp/issues/1213)).
+
+**Four limits are still real, and they shape staging.** No CUDA toolkit is
+preinstalled, so a job that compiles CUDA installs one first. A global install
+leaks into the next job, so put project dependencies in a virtual environment
+under `/workspace`. `/workspace` is CIFS and holds no symlink, so build in `/tmp`
+and copy out with `cp -rL`. Unconstrained parallelism has OOM-rebooted this box,
+so use `-j 4`. The HOST `dgx.casa` has no egress to `github.com` while the
+container does, so name the side you mean.
+[`.agents/environment.md`](.agents/environment.md) carries the fleet, the
+measurement, and the procedure.
+
 ## Work happens in a worktree
 
 **Do every unit of work in its own linked worktree and task branch.** A unit of
@@ -414,6 +513,20 @@ it does not authorize cleanup.
 Merge each verified pull request in the current session. Close an obsolete pull
 request and record the reason. Never end a session with a verified, unmerged
 pull request.
+
+**The pull request body is the landed commit message.** The repository sets
+`squash_merge_commit_message = PR_BODY`, so write the body to the same standard
+as a commit message and end it with the trailer block below. This setting is
+part of the contract, not a convenience. Under the previous `COMMIT_MESSAGES`
+value GitHub wrote a `---------` separator between the concatenated commit
+messages, and on a multi-commit squash the last one fell between the trailer
+block and the `Co-authored-by:` line GitHub appends. That orphaned the block,
+and the gate reported trailers the commit plainly carried as missing.
+
+No gate can hold that setting, because reading it needs a network call and no
+checker here may make one. If the landed commits start failing the trailer gate
+again, read the setting first. `tests/scripts/test_check_commit_trailers.py`
+pins both squash shapes, so the difference between them is executable.
 
 Every commit contains a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and these
 trailers:
@@ -471,6 +584,7 @@ Read the guide for the current job.
 | Porting a MODEL (the coverage checklist) | [`.agents/porting-a-model.md`](.agents/porting-a-model.md) |
 | Porting a model, kernel, or feature from vLLM | [`.agents/porting.md`](.agents/porting.md) |
 | Running gates, proving correctness, reviewing | [`.agents/verification.md`](.agents/verification.md) |
+| Proving a change is reached | [`.agents/reachability.md`](.agents/reachability.md) |
 | Measuring performance | [`.agents/benchmarking.md`](.agents/benchmarking.md) |
 | Fixing a bug | [`.agents/bugfixing.md`](.agents/bugfixing.md) |
 | Working on a specific host or GPU | [`.agents/environment.md`](.agents/environment.md) |
@@ -487,6 +601,7 @@ scripts/agent-preflight.sh                      # before edits
 scripts/agent-preflight.sh --staged             # before commit
 python3 scripts/agent-ready.py                  # before remote handoff
 python3 scripts/agent-integration.py --base origin/main
+rc devices                                      # the GPU fleet, and who holds it
 ```
 
 Never push, merge, manage services, use external compute, or download large

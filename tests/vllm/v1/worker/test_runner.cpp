@@ -36,6 +36,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/kv_cache_dtype.h"
+#include "vllm/v1/attention/registry.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -188,7 +189,7 @@ Qwen3_5MoeWeights MakeWeights(const HfConfig& c) {
   return w;
 }
 
-constexpr int kBlockSize = 8;
+constexpr int kBlockSize = 16;
 constexpr int kMaxModelLen = 32;
 constexpr int kNumBlocks = 8;
 
@@ -450,6 +451,14 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(runner.num_blocks() == kNumBlocks);
   CHECK_FALSE(runner.kv_cache_backend_resident());
 
+  // M3: the runner resolves the ENGINE-level attention backend at init, per
+  // attention group. On CPU the dense priority walk (cpu.cpp) is
+  // [CPU_ATTN (unregistered), FLASH_ATTN] so it lands on FLASH_ATTN —
+  // behavior-preserving, and the proof that selection is now part of the
+  // runtime path, not just the registry test. One name per attention layer.
+  REQUIRE(runner.attn_backend_names().size() == 1);
+  CHECK(runner.attn_backend_names()[0] == "FLASH_ATTN");
+
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);
   const PagedKvCache& kv = runner.attn_kv()[0];
@@ -585,7 +594,8 @@ TEST_CASE("runner: MambaSpec is the allocation source of truth") {
 // ─── #810: THE BYTE-NEUTRALITY ARM ───────────────────────────────────────────
 //
 // `initialize_kv_cache` serves EVERY architecture — the engine builds exactly
-// one `GPUModelRunner` (model_loader.cpp:1007-1023) — so a refactor of it owes
+// one `GPUModelRunner` (`src/vllm/entrypoints/model_loader.cpp::runner_`, built
+// in the `LoadedEngine` member-init list) — so a refactor of it owes
 // a proof that it changes nothing for the models that already work. This
 // mirrors the BYTE-NEUTRALITY CONTRACT stated for the `per_layer_attn_specs`
 // seam at include/vllm/v1/kv_cache_interface.h:354-374: byte-identical
@@ -597,7 +607,7 @@ TEST_CASE("runner: MambaSpec is the allocation source of truth") {
 // inputs of the code under test reproduces exactly the self-consistency defect
 // the case above exists to remove. Only the KV element SIZE follows
 // `ResolveKvCacheDType()`, because the VT_KV_CACHE_F32 A/B lane legitimately
-// changes it and the geometry — K+V, block 8, 2 kv heads, head_dim 8 — is the
+// changes it and the geometry — K+V, block 16, 2 kv heads, head_dim 8 — is the
 // part being pinned.
 //
 // It reports its own N ([[the-state-was-not-the-one-you-believed]]): every
@@ -633,11 +643,11 @@ TEST_CASE("runner: the Qwen3.5 allocation is BYTE-IDENTICAL after #810") {
   // 4. Every attention view, per layer.
   const int64_t kv_es =
       static_cast<int64_t>(vt::SizeOf(vllm::v1::ResolveKvCacheDType()));
-  const int64_t kFaPageBytes = 2 * 8 * 2 * 8 * kv_es;  // K+V, block, Hkv, Dh
+  const int64_t kFaPageBytes = 2 * 16 * 2 * 8 * kv_es;  // K+V, block, Hkv, Dh
   CHECK(runner.fa_page_size_bytes() == kFaPageBytes);
   for (const PagedKvCache& kv : runner.attn_kv()) {
     CHECK(kv.num_blocks == 8);
-    CHECK(kv.block_size == 8);
+    CHECK(kv.block_size == 16);
     CHECK(kv.num_kv_heads == 2);
     CHECK(kv.head_size == 8);
     CHECK(kv.dtype == vllm::v1::ResolveKvCacheDType());

@@ -723,9 +723,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   //
   // WHICH accelerator is the PLATFORM's question, not this model file's. This
   // asked `TryGetBackend(kCUDA)` — the same defect work row M3a repaired in
-  // `SelectQueueForModel` (src/vllm/entrypoints/model_loader.cpp:75-104 — the
-  // full path matters, there is also a src/vllm/model_executor/model_loader/
-  // DIRECTORY and the bare file name sends a reader there), where a hardcoded
+  // `src/vllm/entrypoints/model_loader.cpp::SelectQueueForModel` (the full path
+  // matters, there is also a src/vllm/model_executor/model_loader/ DIRECTORY and
+  // the bare file name sends a reader there), where a hardcoded
   // `GetBackend(kCUDA)` was the one line standing between a complete non-NVIDIA
   // backend and running a model. `CurrentPlatform()` walks the probe order
   // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU}

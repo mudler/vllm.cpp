@@ -28,8 +28,10 @@ that stopped answering ([#1040](https://github.com/mudler/vllm.cpp/issues/1040))
 and two of the levers it ranked have since landed without re-measurement, so the
 profile the ranking describes is not the profile in this tree. W1 either
 reproduces the order or replaces it, and **this section is amended with the
-re-derived order before W2 starts**. A lever whose rank does not survive W1 is
-re-placed or dropped here, in writing, rather than carried.
+re-derived order before W2 starts, unless W1 reports `BLOCKED`, in which case W2
+and W3 proceed on their byte-compare and RSS gates and W4/W5 do not start**. A
+lever whose rank does not survive W1 is re-placed or dropped here, in writing,
+rather than carried.
 
 ## Scope
 
@@ -128,11 +130,14 @@ It is not: `src/vllm/multimodal/ltx2_video.cpp:847` selects
 `Ltx2StreamDitToDevice` on `im.on_device`, and `:3864-3866` selects
 `Ltx2DitForwardDevice` over `Ltx2DitForward` on the same flag.
 `Ltx2DitForwardDevice` (`src/vllm/model_executor/models/ltx2_device.cpp:1111`)
-runs a real device forward — it takes `vt::Backend&`, calls
-`CheckWeightsResident(weights, queue.device)` at `:1145`, and drives 48 blocks of
-device ops. The spike's own §5 records that the sampled window **had written no
-frame**, which excludes the VAE decode as well. So the 1.00-core, GPU-zero window
-is *neither* the routed denoise *nor* the decode, and the remaining candidates
+runs a real device forward — it takes `vt::Queue&`
+(declared `include/vllm/model_executor/models/ltx2_device.h:136`) and obtains the
+backend inside it via `vt::GetBackend(queue.device.type)` at
+`ltx2_device.cpp:1146`, calls `CheckWeightsResident(weights, queue.device)` at
+`:1144`, and drives 48 blocks of device ops. The spike's own §5 records that the
+sampled window **had written no frame**, which excludes the VAE decode as well.
+So the 1.00-core, GPU-zero window is *neither* the routed denoise *nor* the
+decode, and the remaining candidates
 are the conditioning stage (finding 2), the LoRA fuse
 ([#1202](https://github.com/mudler/vllm.cpp/issues/1202),
 [#1210](https://github.com/mudler/vllm.cpp/issues/1210)) and the load path
@@ -150,8 +155,10 @@ not move the projection. The comment at `:443-445` states the reason and it is
 the real blocker: the tower's weights are `Gemma4Weights`
 (`include/vllm/model_executor/models/ltx2_text_encoder.h:542-548`) of
 `OwnedTensor` (`include/vllm/model_executor/models/gemma4.h:114-125`) over
-`OwnedBytes` (`include/vllm/model_executor/models/qwen3_5_weights.h:47-56`),
-which has no device field. `grep -c 'Device\|kCUDA\|Queue'
+`OwnedBytes` (held at `include/vllm/model_executor/models/qwen3_5_weights.h:47-56`,
+defined at `include/vllm/model_executor/models/owned_bytes.h:42`), which has no
+device field — `grep -icE 'device|cuda|vt::Queue' owned_bytes.h` returns **0**.
+`grep -c 'Device\|kCUDA\|Queue'
 src/vllm/model_executor/models/gemma4_weights.cpp` returns **0** against a
 positive control of **16** for the identical pattern in `ltx2_device.cpp` and
 **4** in `ltx2_text_encoder.cpp` itself, so the zero is a finding and not a
@@ -168,14 +175,16 @@ has headroom"*. The device path **refuses the widen by name**:
 `src/vllm/model_executor/models/ltx2_loader.cpp:759-765` fails
 `Ltx2StreamDitToDevice` on `widen_to_f32`, and `:780-800` keeps exactly one host
 buffer live per tensor. So #1015's double-hold — `Ltx2WidenDitToF32` at
-`:739-754` pushes the f32 copy onto `checkpoint.storage` at `:753` while the bf16
-buffer pushed at `:728` is never dropped — is a **host-arm** defect. It is still
+`:739-754` pushes the f32 copy onto `checkpoint.storage` at `:752` while the bf16
+buffer pushed at `:729` is never dropped — is a **host-arm** defect. It is still
 in W2 and still early, because the host f32 arm is the *reference* every W4 and
 W5 correctness gate compares against, and an arm that cannot load is not a
 reference. #1016 is the one that gates device headroom: on GB10's unified memory
 the device copy and the dead file cache come out of the same 119 GiB, and the
-LTX loaders call `MaybeReleaseSourcePages` nowhere while 15 other files under
-`src/vllm` do (`safetensors_reader.cpp:339` is the definition;
+LTX loaders call `MaybeReleaseSourcePages` nowhere while 14 other files under
+`src/vllm` do — `grep -rl` returns 15 files, one of which is the defining
+`safetensors_reader.cpp` and one of the remaining 14 a header
+(`safetensors_reader.cpp:339` is the definition;
 `qwen3_5_dense_weights.cpp:87` and `gemma4_weights.cpp:149-150` are two of the
 callers). Note the fix is armed by default —
 `LoadWindowedReleaseEnabled()` (`safetensors_reader.cpp:303-312`) reads
@@ -230,19 +239,34 @@ edits, because several already drifted between the spike's base and this one
 `ltx2_loader.cpp:694-710` is now `:739-754`; the seam row's `ltx2_video.cpp:4479`
 is now `:4638`).
 
+**That re-derivation is the ONLY check these anchors get, and the gap is
+specific.** No checker in this tree reads a bare `path.cpp:123` written in prose.
+`check_links` (`scripts/check-agent-record.py:862-886`) parses markdown link
+targets only, and validates a `#L<n>` fragment against the target's line count —
+so a dangling link and an out-of-range `#L999999` are both caught, and a bare
+`ltx2_video.cpp:99999` in a sentence is not read at all. `check_spec`
+(`scripts/check-agent-record.py:1169`) takes a `ClaimRow`, so its
+structured-section requirement reaches only a spec linked from a matrix row, and
+this row has none (§*Decisions taken here*, "No matrix row, and no claim file").
+Every `file:line` below and in §*Our baseline* is therefore checked by a person
+reading it and by nothing else — four of them were off by one or two lines, in
+both directions, when this spec was first reviewed. Each stage re-derives with
+`grep -n` against its own base and pastes the output into its report, rather
+than counting by eye.
+
 | Stage | Our anchor at this base | What changes | Production entry point it must be reached from |
 |---|---|---|---|
 | W0 | `src/vllm/multimodal/ltx2_video.cpp` render driver; `include/vllm.h` | phase-boundary timestamps + peak host/device bytes emitted per phase | `examples/ltx2_gen` through the `vllm.h` video ABI, on the shipped default |
 | W1 | none — measurement only | none | the same binary W0 shipped |
 | W2a #1016 | `src/vllm/model_executor/models/ltx2_loader.cpp:722-735`, `:780-800` | `MaybeReleaseSourcePages` after each materialization, both arms | `Ltx2LoadDitFromSafetensors` / `Ltx2StreamDitToDevice` via `ltx2_video.cpp:847` |
 | W2b #1015 | `src/vllm/model_executor/models/ltx2_loader.cpp:739-754` | drop the bf16 source buffer as each view is repointed | the host f32 arm at `ltx2_video.cpp:847` |
-| W2c #1210 | `src/vllm/model_executor/models/ltx2_loader.cpp:806-830` (`Ltx2RebindDitLoras`) | delete the load-time fuse that phase 0 provably undoes | `Ltx2RebindDitLoras` on a LoRA render |
+| W2c #1210 | `src/vllm/model_executor/models/ltx2_loader.cpp:808-912` (`Ltx2RebindDitLoras`) | delete the load-time fuse that phase 0 provably undoes | `Ltx2RebindDitLoras` on a LoRA render |
 | W3 #1021 | `src/vllm/model_executor/models/ltx2_loader.cpp:780-800`; `src/vt/cuda/cuda_backend.cu:77-95` | batch/overlap the per-tensor `Alloc`+`Copy`+`Synchronize` | `Ltx2StreamDitToDevice` |
 | W4 #1269 | `src/vllm/multimodal/ltx2_video.cpp:2085`, `:2799`, `:4638`; `src/vllm/model_executor/models/ltx2_text_encoder.cpp:446`; `include/vllm/model_executor/models/gemma4.h:114-125` | a device weight arm for the tower + queue threading | `Ltx2EncodePromptToConditioning` from the render driver |
 | W5 #1007 | `src/vllm/model_executor/models/ltx2_video_vae.cpp:161-290`; `include/vllm/model_executor/models/ltx2_video_vae.h:230-244`; `include/vllm/model_executor/models/ltx2_tiling.h:308` | a `vt::` conv3d op with CUDA and CPU arms; a device `Ltx2VaeWeights` | `Ltx2VideoDecodeStreaming` from the render driver |
 | W5 rider #1011 | same, plus the NDHWC half owed to [`ltx25-decode-dtype.md`](ltx25-decode-dtype.md) `## Owed` | workspace reuse, in-place norm/SiLU, free-before-conv, temporal chunking, memory format | same |
 | W6 #1014 | W0's peak-memory emission; `--query-compute-apps=used_memory` | attribution, then a release if one is found | the render |
-| W7 | `src/vt/cuda/cuda_backend.cu:203-232` (the capture primitive) | nothing unless the measurement says capture | — |
+| W7 | `src/vt/cuda/cuda_backend.cu:206-222` (`BeginCapture`, `EndCapture`, `Replay` — the capture primitive) | nothing unless the measurement says capture | — |
 | O1 #1012 | [`.agents/oracles/diffusers.md`](../oracles/diffusers.md) | record that `diffusers` implements LTX-2.5 and measure its gateability | — |
 
 **Nothing lands dead.** Each stage's smallest failing test enters through the
@@ -263,7 +287,7 @@ local red-first cases, and each names the guarantee it pins:
 |---|---|
 | W0 | a render at a small fixed geometry through the video ABI emits a phase table whose entries carry a monotone timestamp and a byte count; red before, because the path emits one line per render ([#1010](https://github.com/mudler/vllm.cpp/issues/1010)) |
 | W2a | peak `Rss_File` across a load, asserted below the pre-change value by a stated margin; red before, because no release call exists |
-| W2b | peak RSS across a **host** load, asserted below the pre-change value; red before, because both buffers are retained (`ltx2_loader.cpp:728` and `:753`) |
+| W2b | peak RSS across a **host** load, asserted below the pre-change value; red before, because both buffers are retained (`ltx2_loader.cpp:729` and `:752`) |
 | W2c | a LoRA load followed by a phase-0 rebind performs the fuse **once**; red before, because it fuses, un-fuses and re-fuses |
 | W3 | staged bytes byte-compare equal to the serial path AND the round-trip count falls; the byte-compare is the correctness half and must be written first |
 | W4 | conditioning tensors from the device arm against the host arm within a stated tolerance, entering through `Ltx2EncodePromptToConditioning`; red before, because there is no device arm to select |
@@ -543,12 +567,12 @@ its phase table lands, and W5 owes one when its wall is accepted.
 ### Risks to the plan itself
 
 * **W1 needs a lease on a box that has been unreachable.** If `dgx.casa` does not
-  answer, W1 reports `BLOCKED` with `REMOTE_UNVERIFIED` and the campaign stops at
-  W2 — the two load-path defects and the staging path are provable on any box with
-  the checkpoint, because their gates are RSS and byte-compares, not wall clock.
-  W4 and W5 do **not** start on an unreproduced ranking. That is the stop
-  condition, and it is deliberate: proceeding would repeat the exact failure
-  #1040 records.
+  answer, W1 reports `BLOCKED` with `REMOTE_UNVERIFIED` and the campaign runs W2
+  **and W3** and then stops — the two load-path defects and the staging path are
+  provable on any box with the checkpoint, because their gates are RSS and
+  byte-compares, not wall clock. W4 and W5 do **not** start on an unreproduced
+  ranking. That is the stop condition, and it is deliberate: proceeding would
+  repeat the exact failure #1040 records.
 * **W5 may be large enough to need its own campaign.** If its port map comes back
   with more than one new `vt::` op family, the stage splits and this section is
   amended rather than the stage being pushed through as one review.

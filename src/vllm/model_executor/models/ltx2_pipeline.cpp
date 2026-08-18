@@ -1797,7 +1797,7 @@ Ltx2PipelineRecipe Ti2VidTwoStageRecipe(const Ltx2PipelineParams& params,
 //
 // ─── DIFFERENCE 1: THE IMAGE-CONDITIONING BUILDER ────────────────────────────
 // `:211` and `:260` call `image_conditionings_by_adding_guiding_latent`
-// (helpers.py:343-367). `ti2vid_two_stages.py:211` calls
+// (helpers.py:343-367). `ti2vid_two_stages.py:231` and `:276` call
 // `combined_image_conditionings` (:272-308). The two functions differ by ONE
 // branch: the second sends `frame_idx == 0` to `VideoConditionByLatentIndex`,
 // which REPLACES latent frame 0's clean tokens; the first has no branch at all

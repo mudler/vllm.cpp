@@ -540,8 +540,11 @@ RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline
   refusal lifts (`ltx2_lora.h:167-172`).
 - ~~**`keyframe_interpolation`** (#1096), the fourth pipeline on this parser.~~
   Landed as row `LTX25-KEYFRAME-INTERP`, which took this row as its template and
-  set `schedule_tokens = kSchedulerDefault` on its own stage 1 — so the
-  six-to-one table above is now five-to-one against #1150 rather than six.
+  set `schedule_tokens = kSchedulerDefault` on its own stage 1. That moved the
+  keyframe line of the table above from `n/a` to `yes` and left the count owed to
+  #1150 at **three**, where it already stood: the six-to-one split is the
+  `latent` column, which no port can change, and the keyframe arm was never one
+  of the divergent three because it was unported rather than wrong.
 - **`allow_request_latents` has no reader in `src/`**, on any recipe, owned by
   [#1152](https://github.com/mudler/vllm.cpp/issues/1152). Four assignments on
   `origin/main` and five with this row's, zero readers in either count, against

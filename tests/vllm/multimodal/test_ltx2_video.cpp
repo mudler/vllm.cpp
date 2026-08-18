@@ -1838,6 +1838,73 @@ TEST_CASE("ltx2 video: GENERATED keyframe slots are SERVED, and the marker reach
     CHECK(trace.slot_tokens_extracted == 0);
   }
 
+  SUBCASE("slots applied AFTER a supplied keyframe still describe their own tokens") {
+    // THE ORDERING HALF, and it had no case until
+    // [#1219](https://github.com/mudler/vllm.cpp/issues/1219). Upstream applies
+    // conditioning items in list order and DFR appends the slot item LAST
+    // (dfr_pipeline.py:320-330, :353-365), so a supplied keyframe stands in front
+    // of the slots whenever the caller pins one. Every slot assertion the engine
+    // makes has to locate the slot tokens, and this is the arrangement in which
+    // "the tokens after the target grid" and "the tokens this item appended" are
+    // DIFFERENT windows.
+    //
+    // A closing keyframe is the reachable way to get an append in front of the
+    // slots on this kind: `wants_last_frame` takes `VideoConditionByKeyframeIndex`
+    // and appends (keyframe_cond.py:79-82) on every pipeline, where the first
+    // frame only appends on the `image_conditionings_by_adding_guiding_latent`
+    // recipes. The two features are unrelated and compose, which is the point.
+    const std::string closing = ws.root + "/gk_closing.ppm";
+    WriteBytes(closing, ConditioningPpm(20, 28, 51));
+
+    auto request = [&](const char* dir, bool slots, bool keyframe) {
+      vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+      if (slots) gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "2";
+      if (keyframe) {
+        gen.last_frame_path = closing;
+        gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+      }
+      const vllm::multimodal::VideoResult result = engine->Generate(gen);
+      CHECK(result.frame_count == 9);
+      return ltx2->last_conditioning();
+    };
+
+    // Four renders, so the count below is a RELATION between measured lengths
+    // rather than a literal: each item's own cost is measured on its own, and
+    // the claim is that together they cost the sum. `image_tokens` cannot serve
+    // here — the engine fills it on the FIRST-frame arm only, and this closing
+    // keyframe leaves it 0.
+    const vllm::multimodal::Ltx2ConditioningTrace bare = request("gk_bare2", false, false);
+    const vllm::multimodal::Ltx2ConditioningTrace slots_only = request("gk_alone", true, false);
+    const vllm::multimodal::Ltx2ConditioningTrace kf_only = request("gk_kf_only", false, true);
+    const vllm::multimodal::Ltx2ConditioningTrace both = request("gk_after_kf", true, true);
+
+    REQUIRE(slots_only.slot_positions.size() == 2);
+    REQUIRE(slots_only.slot_marked_tokens > 0);
+    REQUIRE(slots_only.video_tokens > bare.video_tokens);
+    REQUIRE(kf_only.video_tokens > bare.video_tokens);
+
+    MESSAGE("video_tokens  bare " << bare.video_tokens << "  slots " << slots_only.video_tokens
+                                  << "  keyframe " << kf_only.video_tokens << "  both "
+                                  << both.video_tokens);
+
+    // The slots are placed and MARKED exactly as they are alone: a keyframe in
+    // front changes WHERE they sit in the sequence and nothing about what they
+    // are. This is the assertion the engine's own slot checks stand behind, and
+    // the arrangement that makes "past the target grid" and "what this item
+    // appended" two different windows.
+    CHECK(both.slot_positions == slots_only.slot_positions);
+    CHECK_MESSAGE(both.slot_marked_tokens == slots_only.slot_marked_tokens,
+                  "a supplied keyframe in front of the slots changed how many slot tokens "
+                  "carry the trained marker — expected " << slots_only.slot_marked_tokens
+                                                         << ", got " << both.slot_marked_tokens);
+    CHECK_MESSAGE(both.video_tokens == slots_only.video_tokens +
+                                           (kf_only.video_tokens - bare.video_tokens),
+                  "the two appending items must cost what each costs alone: "
+                      << slots_only.video_tokens << " + "
+                      << kf_only.video_tokens - bare.video_tokens << " against "
+                      << both.video_tokens);
+  }
+
   SUBCASE("a negative count gets upstream's OWN reason") {
     // `evenly_spaced_keyframe_positions` raises "num_keyframes must be
     // non-negative" (utils/helpers.py:372-373) before anything looks at the
@@ -8170,6 +8237,112 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
                 "the appended keyframe left the rendered clip unchanged, so it was placed into "
                 "a state the decode never read");
   CHECK_FALSE(kf.bytes.empty());
+}
+
+TEST_CASE("ltx2 keyframe: BOTH ends pin at once - two appends, and each is located at its own") {
+  // THE PIPELINE'S HEADLINE REQUEST, and it aborted the render
+  // ([#1219](https://github.com/mudler/vllm.cpp/issues/1219)).
+  // `KeyframeInterpolationPipeline` exists to generate the motion BETWEEN
+  // pinned keyframes; `docs/USAGE.md`'s worked example for this kind passes
+  // `--first-frame open.ppm --last-frame close.ppm`, and `ltx2-gen --help` says
+  // to use the two together. So this is not an edge case, it is the case.
+  //
+  // WHAT BROKE, and it is a shape worth keeping in view: the last-frame arm
+  // located its own appended tokens at `positions[target_tokens * 2]`, which is
+  // the first token PAST THE TARGET GRID — correct only while that arm owned the
+  // first append. Row LTX25-KEYFRAME-INTERP put a second appending item in front
+  // of it on the `image_conditionings_by_adding_guiding_latent` recipes, so the
+  // index then named the FIRST frame's keyframe at temporal 0, and the arm's own
+  // positional assertion threw. A derived index that was right by ORDER rather
+  // than by construction, and the item that changed the order was two hundred
+  // lines above it.
+  //
+  // THE CONTROL IS THE OTHER BUILDER, and it is what makes this case say
+  // "ordering" rather than "keyframes". `ti2vid_two_stage` takes the same two
+  // images through `combined_image_conditionings`, whose frame-0 item REPLACES
+  // (helpers.py:295-300), so it has exactly ONE append and never reached the
+  // defect. It stayed green throughout and must stay green here.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/both.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const std::string closing = ws.root + "/closing.ppm";
+  WriteBytes(closing, ConditioningPpm(20, 28, 41));
+
+  struct Pinned {
+    int64_t video_tokens;
+    int64_t image_tokens;
+  };
+
+  // `ends` selects which of the two slots are filled, so one lambda produces the
+  // bare grid, each single end, and both — and the counts below are then
+  // relations between renders of one geometry rather than literals.
+  auto render = [&](const char* kind, bool first, bool last, const std::string& tag) -> Pinned {
+    vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = KeyframeGen(ws.root + "/" + tag);
+    if (first) gen.first_frame_ppm = ConditioningPpm(20, 28, 40);
+    if (last) gen.last_frame_path = closing;
+    // One CRF for both slots, which is the surface: upstream resolves the CRF
+    // once for the whole `images` list (blocks.py:966-983), and the H.264 round
+    // trip an LTX-2.5 checkpoint would otherwise resolve is refused by name here.
+    if (first || last) gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // The artifact, not only the trace: the render has to come back at the
+    // requested length, because the appended tokens are trimmed back off before
+    // the unpatchify and a clip of the wrong length is the visible half of a
+    // trim that read the wrong count.
+    CHECK(result.frame_count == 9);
+    return Pinned{t.video_tokens, t.image_tokens};
+  };
+
+  // ── THE CONTROL, FIRST, so a red below is attributable ─────────────────────
+  //
+  // Replace + one append. This is the arm that was already green, and running it
+  // first means a failure here says "both arms are broken" rather than letting
+  // the new arm's red stand for the pair.
+  const Pinned ti_both = render("ti2vid_two_stage", true, true, "ti_both");
+  const Pinned ti_bare = render("ti2vid_two_stage", false, false, "ti_bare");
+  REQUIRE(ti_both.image_tokens > 0);
+  CHECK_MESSAGE(ti_both.video_tokens == ti_bare.video_tokens + ti_both.image_tokens,
+                "`combined_image_conditionings` REPLACES at frame 0 and APPENDS at the closing "
+                "frame, so pinning both ends grows the sequence by exactly ONE image — expected "
+                    << ti_bare.video_tokens + ti_both.image_tokens << ", got "
+                    << ti_both.video_tokens);
+
+  // ── AND THE ARM THIS ROW ADDS: two appends, both located ───────────────────
+  const Pinned kf_both = render("keyframe_interpolation", true, true, "kf_both");
+  const Pinned kf_bare = render("keyframe_interpolation", false, false, "kf_bare");
+  const Pinned kf_first = render("keyframe_interpolation", true, false, "kf_first");
+  const Pinned kf_last = render("keyframe_interpolation", false, true, "kf_last");
+
+  MESSAGE("video_tokens  bare " << kf_bare.video_tokens << "  first " << kf_first.video_tokens
+                                << "  last " << kf_last.video_tokens << "  both "
+                                << kf_both.video_tokens << "  image_tokens "
+                                << kf_both.image_tokens);
+
+  REQUIRE(kf_both.image_tokens > 0);
+  CHECK(kf_bare.video_tokens == ti_bare.video_tokens);
+  // Each end alone appends one image's worth...
+  CHECK(kf_first.video_tokens == kf_bare.video_tokens + kf_both.image_tokens);
+  CHECK(kf_last.video_tokens == kf_bare.video_tokens + kf_both.image_tokens);
+  // ...and the two together append BOTH, which is the count the defect could
+  // never produce because the render never finished.
+  CHECK_MESSAGE(kf_both.video_tokens == kf_bare.video_tokens + 2 * kf_both.image_tokens,
+                "`image_conditionings_by_adding_guiding_latent` has no frame-0 branch "
+                "(helpers.py:343-367), so BOTH pinned ends take `VideoConditionByKeyframeIndex` "
+                "and append (keyframe_cond.py:79-82) — expected "
+                    << kf_bare.video_tokens + 2 * kf_both.image_tokens << ", got "
+                    << kf_both.video_tokens);
+  // ...and it is strictly more than the builder that replaces at frame 0, which
+  // is what the two arms differ by.
+  CHECK(kf_both.video_tokens > ti_both.video_tokens);
 }
 
 TEST_CASE("ltx2 keyframe: the pipeline renders through vllm.h, guided on the UNADAPTED stage 1") {

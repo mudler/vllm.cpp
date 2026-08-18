@@ -84,15 +84,17 @@ a pure-BF16 DiT (#1148) closed at `40a796aa9`. What is owed is the RUN.
 
 ### (d) THE DIFFERENCE THE AUDIT DOES NOT NAME: the conditioning builder
 
-`ti2vid_two_stages.py:211` calls `combined_image_conditionings`; this pipeline's
-`:211` and `:260` call `image_conditionings_by_adding_guiding_latent`. They are
+`ti2vid_two_stages.py:231` and `:276` call `combined_image_conditionings`; this
+pipeline's `:211` and `:260` call `image_conditionings_by_adding_guiding_latent`.
+(Both files carry a `:211`, and this line named the wrong one until the review
+repair: `ti2vid_two_stages.py:211` is blank.) They are
 different functions and the difference is one branch:
 
 | | `combined_image_conditionings` (`helpers.py:272-308`) | `image_conditionings_by_adding_guiding_latent` (`helpers.py:343-367`) |
 |---|---|---|
 | `frame_idx == 0` | `VideoConditionByLatentIndex` (`:295-300`) | `VideoConditionByKeyframeIndex` |
 | any other `frame_idx` | `VideoConditionByKeyframeIndex` (`:301-305`) | `VideoConditionByKeyframeIndex` |
-| what frame 0 does to the state | REPLACES latent frame 0's clean tokens; the token count NEVER changes (`latent_cond.py:38-39`) | APPENDS a latent frame of tokens at the end (`keyframe_cond.py:79-82`) |
+| what frame 0 does to the state | REPLACES latent frame 0's clean tokens; the token count NEVER changes (`latent_cond.py:40-41`) | APPENDS a latent frame of tokens at the end (`keyframe_cond.py:79-82`) |
 
 The second function has no branch at all: it is one loop and one item type. That
 is the whole content of the diff between the two files' conditioning, and it is
@@ -124,7 +126,7 @@ another file is named.
 |---|---|---|
 | `spatial_downscale` | 2 | `:203-209`, `width // 2` / `height // 2` |
 | `sigmas` | empty (derived) | `:199-200`, `self._scheduler.execute(steps=num_inference_steps)` |
-| `schedule_tokens` | `kSchedulerDefault` | the same call passes NO latent; `schedulers.py:31` reads that as `default_number_of_tokens` = `MAX_SHIFT_ANCHOR` = 4096 (`:11`, `:29`) |
+| `schedule_tokens` | `kSchedulerDefault` | the same call passes NO latent; `schedulers.py:32` reads that as `default_number_of_tokens` = `MAX_SHIFT_ANCHOR` = 4096 (`:11`, `:29`) |
 | `noise_scale` | 1.0 | `:244-247` sets none; `ModalitySpec.noise_scale` defaults 1.0 (`utils/types.py:110`) |
 | `video_guidance` | `params.video_guider` | `:222-225`, from `MultiModalGuiderParams` the CLI fills (`:325-332`) |
 | `audio_guidance` | `params.audio_guider` | `:226-229`, filled from six `--audio-*` / `--v2a-guidance-scale` flags (`:333-340`) |
@@ -546,6 +548,34 @@ reader knows which half is measured.
 `ResolveLtx2PipelineRecipe` and nothing recomputes it, so the next four-key kind
 has to move it again.
 
+### The review repair, and the one defect it found
+
+The fresh review returned eight findings. Six are repaired on this branch, one is
+inherited and tree-wide, and one is filed above under `## Owed`.
+
+**The blocking one is [#1219](https://github.com/mudler/vllm.cpp/issues/1219),
+and it is worth stating as a shape rather than as a line number.** This row's own
+`## Tests` §2 gated that frame 0 APPENDS on this builder, and every case it
+describes pins ONE end. Pinning both — which is the pipeline's name, the
+`docs/USAGE.md` worked example and the `ltx2-gen --help` instruction — aborted the
+render, because the LANDED last-frame arm located its own appended tokens at
+`positions[target_tokens * 2]`. That index is the first token past the target
+grid: correct while that arm owned the first append, and false the moment this row
+put a second appending item in front of it. The generated-keyframe-slot arm
+carried the same derivation.
+
+**Nothing in the diff touched either arm.** The row added an append two hundred
+lines above them and changed what "the first appended token" meant. A derived
+index that is right by ORDER survives every review of the code that contains it,
+because the code that contains it is not the code that breaks it. What the case
+this repair adds gates is the ORDER, on both builders, with `ti2vid_two_stage` —
+replace plus one append — as the control that never reached the defect.
+
+**A second measurement the repair owes the next reader**: `causal_fix = true` at
+the first-frame call site is INERT, not merely ungated. The reason and the probe
+numbers are under `## Owed`, and the gate that could exist lives on the seam in
+`test_ltx2_vae` rather than at the call site.
+
 ## Dependencies
 
 - #1118 (`LTX25-PHASE-LORA`), landed at `4ae0f54ab`. Supplies
@@ -593,6 +623,59 @@ has to move it again.
 - **The other three divergent arms on the schedule anchor**, owned by
   [#1150](https://github.com/mudler/vllm.cpp/issues/1150). This row sets its own
   phase and touches none of them.
+- **A trace-derived step count in the two schedule-anchor cases**,
+  [#1220](https://github.com/mudler/vllm.cpp/issues/1220). Both cases — the
+  `ti2vid` one and the copy this row made of it — return `gen.steps` from their
+  render lambda under a comment that says the count is read back out of the
+  render, so the four `REQUIRE(x.steps == rendered_steps)` lines compare four
+  copies of one request field. The guard is weakened rather than vacuous: it
+  still reds when the pinned `gen.steps = 3` is lowered, which is the mutation it
+  was built for. `Ltx2ConditioningTrace::dit_evaluations` already carries the
+  observation. Not repaired in this row's review-repair flow because it changes
+  what a LANDED case measures on both pipelines and the res_2s control, so it
+  owes its own red-first evidence rather than a quiet re-derivation of a passing
+  assertion.
+- **The `causal_fix` argument at the first-frame call site is INERT**, and the
+  gate for it lives on the seam rather than at the call site. MEASURED on a probe
+  of `Ltx2ConditionVideoByKeyframe`: at `num_pixel_frames = 1`, which both
+  production arms pass, flipping `causal_fix` moves 0 of 48 position values at
+  `frame_idx` 0 and at `frame_idx` 8 alike, because `get_pixel_coords` leaves a
+  one-latent-frame keyframe's temporal START at 0 either way
+  (`max(0 + 1 - time, 0)`, patchifiers.py:166-169) and the `num_pixel_frames == 1`
+  narrow at `keyframe_cond.py:56-57` then overwrites the END the fix had moved.
+  So no call-site check can detect a flip, and one that appeared to would be a
+  false gate. The `frame_idx == 0` gate the argument passes through
+  (`keyframe_cond.py:49`) is what carries the risk, and it is gated in
+  `test_ltx2_vae` at `num_pixel_frames != 1`, where the fix shows: 4 of 48
+  differing at `frame_idx` 0 and 0 of 48 at `frame_idx` 8. The pre-existing
+  negative-half assertion beside it (`no_fix.positions == state.positions` at
+  `frame_idx` 5, `num_pixel_frames = 1`) holds VACUOUSLY and is not this row's to
+  rewrite.
+
+- **The tree-wide correction of two off-by-N upstream anchors**,
+  [#1230](https://github.com/mudler/vllm.cpp/issues/1230). Re-derived at the
+  LTX-2 pin `fd4ded7f` by reading the pinned files rather than inheriting the
+  citation: `latent_cond.py:38` is `latent_state = latent_state.clone()` and
+  `:39` is blank, so the two writes are `:40-41`; `schedulers.py:31` is the
+  return annotation `) -> torch.FloatTensor:`, so the
+  `tokens = math.prod(latent.shape[2:])` read is `:32`. Twenty-two citations
+  carry the stale form and eight already carry the corrected one, inside the
+  same files: `ltx2_video.cpp` cites `schedulers.py:31` at `:3618` and `:32` at
+  `:3017` and `:3600`. This row's review repair corrected the seven its own new
+  lines restated and those corrections were then REVERTED, because a PARTIAL
+  correction is strictly worse than none. It left `ltx2_video.cpp` reading
+  `latent_cond.py:38-39` at `:2208` and `:3174` and `:40-41` a hundred lines
+  later with nothing recording which a reader should believe, and a uniform
+  wrong anchor is correctable by one grep while a mixed one is not. One of the
+  seven also lived in `include/vllm/`, a `USER_USAGE_PREFIXES` path in
+  `scripts/check-doc-checkpoint.py:99` -- a pure path match with no content
+  analysis -- so a comment-only anchor edit in a public header demanded a
+  `docs/USAGE.md` edit this change did not owe, and manufacturing one to turn a
+  gate green is what AGENTS.md forbids. Both effects are properties of doing it
+  piecemeal. The records this row writes state the anchors CORRECTLY -- the
+  table at `:97` and `:129` above, and #1219's index row -- so the record says
+  what is true while the source stays uniformly stale until #1230 sweeps it in
+  one commit with its own reviewer.
 
 ## Stop conditions
 

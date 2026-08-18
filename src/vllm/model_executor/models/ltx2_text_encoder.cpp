@@ -78,19 +78,29 @@ std::vector<float> Linear(vt::Queue& q, const std::vector<float>& x, int64_t row
     Fail("linear: bias size does not match out_features");
 
   std::vector<float> out(static_cast<size_t>(rows * w.out_features));
-  // A zero extent is not a GEMM. vt::MatmulBT would have to be handed a
-  // zero-shaped tensor, and the loop this replaced simply produced nothing.
-  if (rows == 0 || w.out_features == 0 || w.in_features == 0) return out;
+  // `out` is empty in both of these cases, so there is nothing to write and no
+  // zero-shaped tensor to hand vt::MatmulBT.
+  if (rows == 0 || w.out_features == 0) return out;
 
-  const vt::Device dev{vt::DeviceType::kCPU, 0};
-  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
-                                        dev, {rows, w.in_features});
-  vt::Tensor b = vt::Tensor::Contiguous(const_cast<float*>(w.weight.data()),
-                                        vt::DType::kF32, dev,
-                                        {w.out_features, w.in_features});
-  vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, dev,
-                                        {rows, w.out_features});
-  vt::MatmulBT(q, o, a, b);
+  // A zero-width reduction is not a GEMM either, but it is NOT the same as
+  // writing nothing: the loop this replaced seeded its accumulator with the bias
+  // and skipped the inner loop, so every output was the bias alone. Skipping only
+  // the GEMM and still running the bias add below reproduces that exactly. None
+  // of this is reachable through the extractor — RequireDeclaredProjection pins
+  // `in_features` to `embedding_dim * num_layers` and both are refused at zero —
+  // and it is written this way so the replacement is behaviour-preserving rather
+  // than merely equivalent where the tests happen to look.
+  if (w.in_features > 0) {
+    const vt::Device dev{vt::DeviceType::kCPU, 0};
+    vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
+                                          dev, {rows, w.in_features});
+    vt::Tensor b = vt::Tensor::Contiguous(const_cast<float*>(w.weight.data()),
+                                          vt::DType::kF32, dev,
+                                          {w.out_features, w.in_features});
+    vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, dev,
+                                          {rows, w.out_features});
+    vt::MatmulBT(q, o, a, b);
+  }
 
   if (has_bias) {
     for (int64_t r = 0; r < rows; ++r) {

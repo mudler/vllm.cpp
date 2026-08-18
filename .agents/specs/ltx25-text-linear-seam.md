@@ -206,7 +206,7 @@ substitutes for the other.
 |---|---|
 | f32 accumulation is materially worse at `K = 188160` | measured (§4.2) rather than argued, and reported against the bf16 ulp of the value it produces |
 | the goldens move | they are at `flat = 24`; measured before and after |
-| `vt::MatmulBT` refuses a degenerate shape | `rows == 0` and `out_features == 0` return early, as the loop did |
+| `vt::MatmulBT` refuses a degenerate shape | `rows == 0` and `out_features == 0` return the empty `out` early. A zero `in_features` skips only the GEMM and still runs the bias add, which is what the old loop produced (accumulator seeded with the bias, inner loop skipped) — behaviour-preserving rather than merely equivalent where the tests look. Unreachable through the extractor either way |
 | the CPU backend is not registered in some consumer | it is unconditionally registered; the text tower is host-only by construction (`Ltx2TextEncoderWeights` holds `std::vector<float>`) |
 
 ## 7. Gates

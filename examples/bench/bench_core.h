@@ -555,8 +555,13 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
           std::max(max_prompt, static_cast<int>(tok.Encode(prompt).size()));
     }
     const int seq_budget = max_prompt + cfg.output_len + 4;
+    // The engine-level attention backends (FLASH_ATTN / ROCM_ATTN
+    // get_kv_cache_shape) enforce block_size % 16 == 0 and the runner
+    // validates at init, so round the unified block up to a multiple of 16 —
+    // one block must still fit a full sequence (block >= seq_budget).
+    const int block = (seq_budget + 15) / 16 * 16;
     vllm::entrypoints::EngineParams params;
-    params.block_size = seq_budget;   // unified block (hybrid-KV constraint).
+    params.block_size = block;   // unified block (hybrid-KV constraint), %16.
     params.max_model_len = seq_budget;
     params.max_num_seqs = std::max(cfg.concurrency, 1);
     params.num_blocks = std::max(cfg.concurrency * 4, 16);

@@ -3,7 +3,7 @@
 //
 // The production hazard is accelerator-only: today every capture instantiates its own
 // graph executable (src/vt/cuda/cuda_backend.cu EndCaptureGraph, and the same shape on
-// hipGraph), so a model holds one executable per padded decode bucket and eight drivers
+// hipGraph), so a model holds one executable per padded decode bucket and nine drivers
 // each hold their own set. The registry folds captures whose topology matches onto ONE
 // executable and re-points it with cudaGraphExecUpdate / hipGraphExecUpdate.
 //
@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,15 @@ struct FakeDevice {
   int graph_destroyed = 0;
   int updates = 0;
   std::set<int> reject_update_for;  // graph ids the driver refuses to update onto
+  // Graph ids the driver refuses to INSTANTIATE. cudaGraphInstantiate fails for reasons
+  // that have nothing to do with the topology -- out of memory is the common one on the
+  // unified-memory box this row exists for -- so it is a distinct outcome from a refused
+  // update and it has to have its own case.
+  std::set<int> fail_instantiate_for;
+  // Times the registry handed the driver a NULL executable. cudaGraphExecUpdate has no
+  // defined behaviour for one; counting it here rather than dereferencing it keeps the
+  // red observable instead of a crash.
+  int null_exec_updates = 0;
   std::vector<int> launch_log;      // the id of the graph each launch actually ran
   // With `recycle` set, a destroyed graph's STORAGE is handed back to the test instead
   // of being freed, so a later capture can be made to land on the same address on
@@ -76,8 +86,12 @@ std::string FakeSignature(void* graph) {
 }
 
 void* FakeInstantiate(void* graph) {
-  ++g_dev->instantiated;
   auto* source = static_cast<FakeGraph*>(graph);
+  // Mirrors the driver: on failure nothing is allocated and the out-parameter is left
+  // null, which is what src/vt/graph_dedup_runtime.h Instantiate() turns into a null
+  // return. Counting only the successes keeps live_execs() meaningful.
+  if (g_dev->fail_instantiate_for.count(source->id) != 0) return nullptr;
+  ++g_dev->instantiated;
   return new FakeExec{source->sig, source->id};
 }
 
@@ -87,6 +101,11 @@ void* FakeInstantiate(void* graph) {
 // what reject_update_for models.
 bool FakeUpdate(void* exec_handle, void* graph_handle, std::string* detail) {
   ++g_dev->updates;
+  if (exec_handle == nullptr) {
+    ++g_dev->null_exec_updates;
+    if (detail != nullptr) *detail = "fake driver got a null executable";
+    return false;
+  }
   auto* exec = static_cast<FakeExec*>(exec_handle);
   auto* graph = static_cast<FakeGraph*>(graph_handle);
   if (g_dev->reject_update_for.count(graph->id) != 0 || exec->sig != graph->sig) {
@@ -317,6 +336,62 @@ TEST_CASE("a capture reusing a freed graph address does not inherit its replay s
   registry.Close();
 }
 
+TEST_CASE("a capture the driver cannot instantiate fails at the capture site") {
+  DeviceScope scope;
+  scope.dev.fail_instantiate_for.insert(1);
+  auto registry = MakeRegistry();
+
+  // The pre-dedup path called Check(cudaGraphInstantiate(...), "cudaGraphInstantiate")
+  // inside EndCaptureGraph, so an instantiate failure threw where the capture happened.
+  // Accepting a null executable instead would mint a valid-looking handle over nothing,
+  // count it live, and defer the failure to the first replay -- a different site, a
+  // different message, and the driver's reason already thrown away.
+  CHECK_THROWS_AS(registry.Register(MakeGraph("decode", 1)), std::runtime_error);
+
+  // And it must not be counted. A registry that reported a capture it can never replay
+  // would make the exec-count ratio this row is measured by a fiction.
+  CHECK(registry.CapturedCount() == 0);
+  CHECK(registry.ExecCount() == 0);
+  CHECK(scope.dev.live_execs() == 0);
+  // The capture's ownership had already transferred, so unwinding has to release it.
+  CHECK(scope.dev.graph_destroyed == 1);
+
+  // The registry is still usable for a capture the driver will accept.
+  void* ok = registry.Register(MakeGraph("decode", 2));
+  registry.Replay(ok, nullptr);
+  registry.Replay(ok, nullptr);
+  CHECK(registry.ExecCount() == 1);
+  CHECK(scope.dev.launch_log == std::vector<int>{2, 2});
+
+  registry.Close();
+}
+
+TEST_CASE("a probe the driver cannot instantiate degrades instead of driving a null exec") {
+  DeviceScope scope;
+  auto registry = MakeRegistry();
+
+  void* first = registry.Register(MakeGraph("decode", 1));
+  // The probe re-instantiates an EXISTING group member, so its instantiate can fail
+  // independently of the capture being registered -- most plausibly under the memory
+  // pressure that made this row worth doing at all.
+  scope.dev.fail_instantiate_for.insert(1);
+  void* second = registry.Register(MakeGraph("decode", 2));
+
+  // cudaGraphExecUpdate has no defined behaviour for a null executable, so a failed
+  // probe must answer "cannot fold" rather than ask the driver about nothing.
+  CHECK(scope.dev.null_exec_updates == 0);
+  CHECK(registry.CapturedCount() == 2);
+  CHECK(registry.ExecCount() == 2);
+
+  for (int round = 0; round < 2; ++round) {
+    registry.Replay(first, nullptr);
+    registry.Replay(second, nullptr);
+  }
+  CHECK(scope.dev.launch_log == std::vector<int>{1, 2, 1, 2});
+
+  registry.Close();
+}
+
 TEST_CASE("the registry does not claim a handle it did not mint") {
   DeviceScope scope;
   auto registry = MakeRegistry();
@@ -371,4 +446,18 @@ TEST_CASE("dedup is off unless the environment asks for it") {
   CHECK_FALSE(vt::GraphDedupEnabledFor(""));
   CHECK_FALSE(vt::GraphDedupEnabledFor("0"));
   CHECK(vt::GraphDedupEnabledFor("1"));
+
+  // Exactly "1", not "starts with 1". Without the terminator check these all enable
+  // dedup, and every case above still passes, because none of them ever asks about a
+  // value whose FIRST character is the one the polarity accepts. "10" is the one that
+  // matters in practice: it is what a hand-edited "1" plus a stray keystroke looks
+  // like, and turning a default-off correctness-sensitive path on by accident is the
+  // failure this polarity exists to prevent.
+  CHECK_FALSE(vt::GraphDedupEnabledFor("10"));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("11"));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("1 "));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("1x"));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("01"));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("true"));
+  CHECK_FALSE(vt::GraphDedupEnabledFor("on"));
 }

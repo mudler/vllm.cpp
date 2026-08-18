@@ -26,8 +26,9 @@ In scope:
    after instantiate. Both the signature and the update need it.
 3. The CUDA ops table and the CUDA backend wiring, off by default behind
    `VT_CUDA_GRAPH_DEDUP`.
-4. An observable capture-count / exec-count log line and a programmatic `Stats()`
-   accessor, so the ratio is a measurement rather than a claim.
+4. An observable capture-count / exec-count log line and the programmatic
+   `CapturedCount()` / `ExecCount()` accessors behind it, so the ratio is a measurement
+   rather than a claim.
 
 Out of scope, each owned elsewhere:
 
@@ -35,7 +36,7 @@ Out of scope, each owned elsewhere:
   [#1163](https://github.com/mudler/vllm.cpp/issues/1163).
 - The diffusion / denoise-loop capture: `ENG-CUDAGRAPH-DIFFUSION`,
   [#1164](https://github.com/mudler/vllm.cpp/issues/1164), blocked.
-- Retiring the eight hand-rolled decode drivers. This row does not touch their
+- Retiring the nine hand-rolled decode drivers. This row does not touch their
   internals; it changes only what the seam they already call hands back.
 - Any change to bucket selection, padding, or the `pure_decode` predicate.
 
@@ -57,7 +58,7 @@ Paths below are relative to `python/sglang/srt/`.
 | Register: signature hit re-points, signature miss instantiates a new group | `:219-242` | `GraphDedupRegistry::Register` |
 | Replay: update only when the group's current raw graph differs, then launch | `:258-275` | `GraphDedupRegistry::Replay` |
 | Compatibility probe on a separate executable so a failed probe cannot leave the live one in an undefined state | `:236-238` (`compat_exec`), destroyed by `seal()` at `:244-251` | `GraphDedupRegistry::Register`, **transient** probe — see the divergence below |
-| `"captured %d CUDA graphs, deduped to %d execs"` | `:353-358` | `GraphDedupRegistry::Stats()` plus the log line |
+| `"captured %d CUDA graphs, deduped to %d execs"` | `:353-358` | `GraphDedupRegistry::CapturedCount()` / `ExecCount()` plus the log line |
 | Retained raw graph (`torch.cuda.CUDAGraph(keep_graph=True)`) | `:326` | `EndCaptureGraph` stops calling `cudaGraphDestroy` when dedup is on |
 
 Three deliberate divergences from the upstream construction, each forced by a
@@ -66,7 +67,7 @@ difference in our seam rather than chosen:
 - **The probe executable is transient, not persistent.** SGLang holds a second
   `compat_exec` per group for the whole capture phase and frees it in `seal()`,
   which its backend calls at `end_cuda_graph_capture()` (`:352-358`). **Our seam has
-  no capture-phase end.** The eight drivers capture lazily, the first time a padded
+  no capture-phase end.** The nine drivers capture lazily, the first time a padded
   bucket is seen, interleaved with replays of buckets already captured
   (`src/vllm/model_executor/models/qwen3_5.cpp:9918`,
   `src/vllm/model_executor/models/qwen3.cpp:888`). A persistent probe would therefore
@@ -106,12 +107,16 @@ the raw graph away:
   scope.
 
 The executables multiply along two axes. `include/vllm/model_executor/models/decode_graph_sizes.h:32-41`
-yields 7 padded decode buckets at `max_num_seqs=32` and 11 at 64, and eight drivers
+yields 7 padded decode buckets at `max_num_seqs=32` and 11 at 64, and nine drivers
 each build their own set: `Qwen3_5DecodeGraph`, `Qwen3_5DenseDecodeGraph`,
 `Qwen3MoeDecodeGraph`, `Qwen3DenseDecodeGraph`, `DeepseekV2DecodeGraph`,
 `VoxtralDecodeGraph`, plus the graph code in
 `src/vllm/model_executor/models/deepseek_v4.cpp:1900` and
-`src/vllm/model_executor/models/laguna.cpp:2691`.
+`src/vllm/model_executor/models/laguna.cpp:2691`, and the DFlash draft graph in
+`src/vllm/model_executor/models/qwen3_dflash.cpp:771,870,1038,1091,1095,1106`. This
+spec said **eight** until 2026-08-18; the ninth was found and the count corrected by
+[#1179](https://github.com/mudler/vllm.cpp/issues/1179) on `ENG-CUDAGRAPH-BREAK`, and
+carried here so the two rows describe the same tree.
 
 Why it matters here specifically, restated from the issue so this spec stands alone:
 on GB10 unified memory an out-of-memory event reboots the box, capture time is startup
@@ -132,7 +137,7 @@ instantiate were never a source of baked pointers.
 
 | New / changed | What |
 |---|---|
-| `src/vt/graph_dedup.h` (new) | `GraphDedupOps` (six function pointers: signature, instantiate, update, destroy exec, destroy graph, launch) and `GraphDedupRegistry`. Header-only, no device dependency, CPU-unit-testable — the same shape `src/vt/cuda/graph_safe_scratch.h` used for the graph-safe scratch bookkeeping. Also `GraphDedupEnabled()`, the `VT_CUDA_GRAPH_DEDUP` read. |
+| `src/vt/graph_dedup.h` (new) | `GraphDedupOps` (six function pointers: signature, instantiate, update, destroy exec, destroy graph, launch) and `GraphDedupRegistry`. Header-only, no device dependency, CPU-unit-testable — the same shape `src/vt/cuda/graph_safe_scratch.h` used for the graph-safe scratch bookkeeping. Also `GraphDedupEnabled()`, the `VT_CUDA_GRAPH_DEDUP` read, and the `CapturedCount()` / `ExecCount()` accessors. There is no single `Stats()` method: two accessors read at the call site beat one struct nobody stores. |
 | `src/vt/graph_dedup_runtime.h` (new) | The CUDA / HIP ops table, written **once** and bound to either runtime by a macro alias block. `GraphSignature()` lives here. This is the file that must not become two hand-written copies. |
 | `src/vt/cuda/cuda_backend.cu` | `EndCaptureGraph` routes through the registry when enabled and retains the raw graph; `ReplayGraph` and `DestroyGraph` dispatch on `registry->Owns(handle)`. |
 | `src/vt/rocm/rocm_backend.hip` | The same three edits against the same shared header. |
@@ -157,14 +162,16 @@ an assertion about intent.
 
 | Case | Guarantee | Upstream |
 |---|---|---|
-| `folds compatible captures onto one executable` | K same-signature captures leave exactly 1 live exec; `Stats()` is `(K, 1)` | `:219-242`, `:253-256` |
+| `folds compatible captures onto one executable` | K same-signature captures leave exactly 1 live exec; `(CapturedCount(), ExecCount())` is `(K, 1)` | `:219-242`, `:253-256` |
 | `keeps incompatible captures apart` | different signatures never share | `:225-241` |
 | `replays the graph the caller asked for` | over an interleaved multi-replay sequence, the deduped launch log equals the non-deduped control log, element for element | `:258-275` |
 | `does not re-update for a repeated shape` | a second consecutive replay of one handle issues no update | `:267` |
 | `falls back to a private executable when the driver rejects the update` | a probe failure yields its own exec, the existing group's live exec is untouched, and replay stays correct | diverges from `:229`, stated above |
 | `frees the shared executable only with its last graph` | destroying one sibling keeps the exec; destroying the last frees the exec and every retained raw graph, with all counters balanced | `:277-292` |
 | `does not claim a handle it did not mint` | `Owns()` is false for a foreign pointer | ours; the seam has no upstream twin |
-| `is off unless the environment asks for it` | `GraphDedupEnabled()` polarity | `:321` |
+| `is off unless the environment asks for it` | `GraphDedupEnabledFor()` polarity, including the values that only the terminator check rejects (`"10"`, `"11"`, `"1 "`, `"1x"`) | `:321` |
+| `a capture the driver cannot instantiate fails at the capture site` | a null `instantiate` throws inside `Register`, mints no handle, counts nothing, and releases the capture it took ownership of | ours; added by the fresh review of #1178 |
+| `a probe the driver cannot instantiate degrades instead of driving a null exec` | a failed probe answers "cannot fold" rather than passing a null executable to `cudaGraphExecUpdate` | ours; added by the fresh review of #1178 |
 
 ## Gates
 
@@ -230,6 +237,46 @@ an assertion about intent.
   hit is probed with the real driver call before it is honoured. This is deliberate:
   a signature that had to be exhaustive would be a correctness surface, and it is
   instead a lookup key.
+- **The fold that is probed is not always the fold that is replayed, and the gap is an
+  unasserted transitivity assumption.** `Register` probes the pair
+  `(group.raws.front(), raw_graph)`; `Replay` issues `(group.current_raw, entry.raw)`.
+  For a group of one or two members those coincide. From the third member onwards they
+  do not, so honouring the probe treats `cudaGraphExecUpdate` compatibility as
+  **transitive** across a group's members — if the driver re-points A onto B and A onto
+  C, then it re-points B onto C. Neither the CUDA nor the HIP documentation states this,
+  and nothing here asserts it. The fresh review of [#1178](https://github.com/mudler/vllm.cpp/pull/1178)
+  demonstrated it with a driver refusal keyed on the `(current, target)` pair: every
+  `Register` probe succeeded and the **second** `Replay` threw. The failure polarity is
+  what makes it survivable — a refusal lands on the `VT_CHECK` in `Replay`, loudly, and
+  never on a silent launch of the executable's previous contents. The stronger fix is to
+  probe `group.current_raw` instead of `raws.front()`, which removes the assumption
+  entirely; it is **not** taken here because it changes probe behaviour while the device
+  A/B (below) is measuring this exact commit. It is owed.
+- **One registry serves every model on a device, and it is unsynchronised.**
+  `CudaBackend::dedup_` is a member of a process-singleton per-device backend
+  (`src/vt/cuda/cuda_backend.cu:355-365`), so the registry — and its two plain
+  `unordered_map`s — is shared by every model loaded onto that device. The constraint is
+  therefore wider than the "one runner thread" note above implies: a second model
+  capturing or destroying a graph concurrently with the first races the containers
+  themselves, before any question about a shared executable arises. Correct today
+  because the engine drives one device from one thread. A lock belongs at the registry
+  the moment that stops being true, and `ENG-CUDAGRAPH-BREAK` must not widen who
+  captures without adding one.
+- **The signature builder has no executable coverage; it is compile-gated only.** The
+  12 cases in `tests/vt/test_graph_dedup.cpp` drive `GraphDedupRegistry` through a fake
+  ops table, so they gate the registry's launch-sequence identity and nothing else.
+  `src/vt/graph_dedup_runtime.h` — the Kahn ordering, the topological re-index, the
+  sorted edge emission, the five node-payload cases, the depth-4 child-graph bound and
+  the five degradation escapes — is reached by no test on any tier; `cuda-fat-build`
+  proves only that it compiles. "12/12 negative mutations detected" is a statement about
+  `graph_dedup.h`, and must not be read as coverage of that file. The probe caps the
+  blast radius, so an unstable signature can never produce a wrong replay — but it has
+  exactly one silent mode: a signature that is unstable for some topology folds nothing,
+  every CPU test stays green, and the only observable is the device-side
+  `"captured N graphs, deduped to N execs"` log line. What would cover it: a CUDA-tier
+  test that captures the same trivial graph twice and asserts the two signatures are
+  byte-equal, and a second that captures two deliberately different topologies and
+  asserts they differ. Both need a device, so both are owed with the A/B.
 - **Two runtime-API calls changed shape across CUDA major versions, and only one was
   foreseen.** `cudaGraphExecUpdate` took the 3-argument `cudaGraphExecUpdateResultInfo`
   form at CUDA 12, so both it and the legacy 4-argument form are bound; HIP has only
@@ -248,6 +295,8 @@ an assertion about intent.
 |---|---|---|
 | The device byte-identity A/B and the executable-count measurement (W4) | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | needs a leased CUDA box; the CPU tier proves the registry's launch-sequence identity, not the device's |
 | Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | gated on W4. A default is a measurement, not a preference |
+| Probing `group.current_raw` rather than `raws.front()`, retiring the transitivity assumption above | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it changes probe behaviour, and the device A/B is measuring the current one. Land it with the A/B rerun, not before |
+| Executable coverage for `src/vt/graph_dedup_runtime.h`'s signature builder (stability and discrimination, both device-tier) | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it needs a real `cudaGraph_t`, so it rides with the leased box the A/B already needs |
 | The ROCm leg's compile and run verification | [#41](https://github.com/mudler/vllm.cpp/issues/41) | no ROCm hardware or `hipcc` is reachable from this session and CI has no ROCm job, so the HIP wiring is written against the same shared header but is compile-unverified |
 
 ## Stop conditions

@@ -5,8 +5,8 @@
 // WHAT THIS REPLACES. Backend::EndCaptureGraph instantiates one graph executable per
 // capture and destroys the raw graph immediately (src/vt/cuda/cuda_backend.cu, and the
 // same shape on hipGraph). A model therefore holds one executable per padded decode
-// bucket — 7 of them at max_num_seqs=32 and 11 at 64 — and eight hand-rolled drivers
-// each hold their own set. The decode graphs of two padded batch sizes are usually the
+// bucket — 7 of them at max_num_seqs=32 and 11 at 64 — and nine hand-rolled drivers
+// each hold their own set (count corrected 2026-08-18, issue #1179). The decode graphs of two padded batch sizes are usually the
 // same node topology with different parameters, which is exactly the case
 // cudaGraphExecUpdate exists for: re-point ONE executable instead of instantiating a
 // second.
@@ -20,7 +20,9 @@
 // signature, but never trusts it: every candidate match is PROBED with the real driver
 // update before it is honoured, on a throwaway executable, and a probe the driver
 // refuses gives that capture its own executable. So a signature that is too coarse
-// costs a wasted probe and nothing else, and a signature can never make a replay wrong.
+// costs a wasted probe, or at worst the loud Replay-time VT_CHECK described there when
+// update compatibility turns out not to be transitive across a group -- never a wrong
+// replay. A signature can only cost a fold, it can never make a replay wrong.
 // The alternative — a signature exhaustive enough to be trusted — would make this file
 // a correctness surface that has to track every node-parameter class the driver knows.
 //
@@ -39,6 +41,15 @@
 // replay's update would re-point the executable out from under the first. Today's
 // drivers replay decode graphs from one runner thread on one queue, so the constraint
 // holds; it is stated here because it is a constraint the seam did not previously carry.
+//
+// The constraint is wider than "one runner thread", though, and the reason is where the
+// registry LIVES: `CudaBackend::dedup_` belongs to a process-singleton per-device
+// backend (src/vt/cuda/cuda_backend.cu:355-365), so ONE registry serves every model on
+// a device. Its two `unordered_map`s carry no synchronisation, so a second model
+// capturing or destroying a graph concurrently with the first is a data race on the
+// containers themselves, before any question about a shared executable arises. Correct
+// today because the engine drives one device from one thread; a lock belongs here the
+// moment that stops being true.
 #ifndef VT_GRAPH_DEDUP_H_
 #define VT_GRAPH_DEDUP_H_
 
@@ -125,6 +136,20 @@ class GraphDedupRegistry {
     if (group == nullptr) {
       auto created = std::make_unique<Group>();
       created->exec = ops_.instantiate(raw_graph);
+      // FAIL HERE, at the capture site, exactly where the pre-dedup path did:
+      // EndCaptureGraph wrapped cudaGraphInstantiate in Check(), so an instantiate
+      // failure threw with the driver's error code while the caller was still inside
+      // the capture it belongs to. Accepting a null executable instead would mint a
+      // valid-looking handle over nothing, count it live in ExecCount(), and defer the
+      // failure to the first Replay as "graph launch failed" -- the wrong site, the
+      // wrong message, and the driver's reason already discarded. The capture's
+      // ownership transferred to us at the top of Register, so release it before
+      // unwinding rather than leaking it on the way out.
+      const bool instantiated = created->exec != nullptr;
+      if (!instantiated) ops_.destroy_graph(raw_graph);
+      VT_CHECK(instantiated,
+               "graph dedup: instantiate failed for the graph being registered at this "
+               "capture site; the capture cannot be replayed");
       created->current_raw = raw_graph;
       group = created.get();
       candidates.push_back(std::move(created));
@@ -156,9 +181,19 @@ class GraphDedupRegistry {
     if (group.current_raw != entry.raw) {
       std::string detail;
       const bool ok = ops_.update(group.exec, entry.raw, &detail);
-      // Register already probed this exact fold, so a refusal here is an invariant
-      // violation rather than an unsupported capture, and silently launching the
-      // executable's PREVIOUS contents would be the worst possible response.
+      // THIS IS NOT THE FOLD Register PROBED. Register probes (group.raws.front(),
+      // raw_graph); this update is (group.current_raw, entry.raw), and from the third
+      // member of a group onwards those pairs differ. Accepting the fold on the probe's
+      // word therefore treats cudaGraphExecUpdate compatibility as TRANSITIVE across a
+      // group's members -- if the driver can re-point A onto B and A onto C, then it can
+      // re-point B onto C. Neither the CUDA nor the HIP documentation says so, and this
+      // file does not assert it; it is an assumption, recorded as such under
+      // `## Risks/decisions` in .agents/specs/eng-cudagraph-dedup.md and owed there.
+      // The reason it is safe to hold it here anyway is the polarity of the failure: a
+      // refusal is either an invariant violation or that transitivity not holding, and
+      // both land on this VT_CHECK. What must never happen is the alternative --
+      // launching the executable's PREVIOUS contents under this handle, which is a wrong
+      // answer rather than a loud one.
       VT_CHECK(ok, std::string("graph dedup: replay update refused (") + detail + ")");
       group.current_raw = entry.raw;
     }
@@ -237,6 +272,12 @@ class GraphDedupRegistry {
   bool ProbeAccepts(const Group& candidate, void* raw_graph) const {
     if (candidate.raws.empty()) return false;
     void* probe = ops_.instantiate(candidate.raws.front());
+    // The probe instantiates a SECOND executable, so it can fail on its own -- most
+    // plausibly under the memory pressure this row exists to relieve. cudaGraphExecUpdate
+    // has no defined behaviour for a null executable, so answer "cannot fold" instead of
+    // asking the driver about nothing. Unlike the instantiate above this is not fatal:
+    // declining to fold degrades to exactly today's one-executable-per-capture path.
+    if (probe == nullptr) return false;
     std::string detail;
     const bool ok = ops_.update(probe, raw_graph, &detail);
     ops_.destroy_exec(probe);

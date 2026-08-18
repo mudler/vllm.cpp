@@ -37,7 +37,7 @@ are our reading of their documented behavior, not measurements.
 | Chunked prefill | ✅ | ✅ | ✅ | ☐ |
 | Automatic prefix caching | ✅ | ✅ | ✅ (radix) | ◐ |
 | Preemption and recompute | ✅ | ✅ | ✅ | ☐ |
-| Priority scheduling | ◐ gating | ✅ | ✅ | ☐ |
+| Priority scheduling | ◐ gating (`--scheduling-policy priority` reaches the server; scheduler-unit tests only, no engine-level priority-vs-FCFS gate exists yet, #534) | ✅ | ✅ | ☐ |
 | LPM cache-aware admission | ✅ | ☐ | ✅ | ☐ |
 | In-batch prefix de-prioritization | ✅ | ☐ | ✅ | ☐ |
 | Async / overlap scheduling | ✅ default on (UAF-safe drain; device token-ids mirror on gate + classic-dense; the decode graph declines while the mirror is live (#323 fix, eager fallback); opt-in `VT_ASYNC_EXECUTOR` out-of-capture H2D staging) | ✅ | ✅ | ☐ |
@@ -79,7 +79,7 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
-| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ LOADS, cannot run (#1189 M3): weight + `cdiv` scale rung + config/tensor cross-check; BF16 scale widened to f32. Linear method is M4, so `Prepare` refuses by name ([spec](../.agents/specs/model-fp8-block-weight.md)) | ✅ | ✅ | ☐ |
+| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ RUNS on CPU, refuses on CUDA (#1189 M4/M6): 10 projections as 7 GEMMs, `gate_up` + QKV merged, mainloop scales. No CUDA kernel (M5), no token gate ([spec](../.agents/specs/model-fp8-block-merged.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
 | FP8 W8A8 works on a CUDA arch without `cutlass-fp8` | ✅ `vt::QuantFp8Static` registers from an unconditional TU (#960); sm_110 measured ([spec](../.agents/specs/vt-fp8-quant-arch-gate.md)) | ✅ | ✅ | ☐ |
 | fp8-tower GDN `in_proj` emits bf16, unlocking packed GDN decode | ◐ `VT_GDN_FP8_IN_BF16` + `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert alone), both default **OFF**, ungated (#339) ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |

@@ -5,6 +5,7 @@
 #include "vt/merged_gemm.h"
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include "vt/dtype.h"
@@ -52,6 +53,67 @@ void MergedGemm(Queue& q, const MergedGemmGroup& desc, Tensor& out, const Tensor
     const float up = std::fmin(std::fmax(u[i], -limit), limit);
     o[i] = gate * (1.0F / (1.0F + std::exp(-gate))) * up;
   }
+}
+
+
+// The block-wise FP8 merged group (merged_gemm.h kFp8BlockGateUpSwiGLU /
+// kFp8BlockQkv, #1189 M6). Same tiering as MergedGemm above: the descriptor's
+// fused kernel where a device has registered one, else the composite — ONE
+// mainloop-scaled block GEMM over the N-concatenated operand, then the group's
+// elementwise tail.
+void MergedGemmFp8Block(Queue& q, const MergedGemmGroup& desc, Tensor& merged,
+                        Tensor* out, const Tensor& a_fp8, const Tensor& a_scale,
+                        const Tensor& w_fp8, const Tensor& w_scale, int block_n,
+                        int block_k, float epilogue_scalar) {
+  VT_CHECK(desc.arity >= 2,
+           "MergedGemmFp8Block: a merged group needs at least two shards");
+  VT_CHECK(desc.epilogue == MergedEpilogue::kNone ||
+               desc.epilogue == MergedEpilogue::kSiluMulClamp,
+           "MergedGemmFp8Block: only the kNone and clamped-SwiGLU epilogues are "
+           "realized on the block-wise FP8 arm");
+  VT_CHECK(merged.rank == 2 && w_fp8.rank == 2 && w_scale.rank == 2,
+           "MergedGemmFp8Block: merged output and weight operands are rank-2");
+  VT_CHECK(merged.shape[1] == w_fp8.shape[0],
+           "MergedGemmFp8Block: the merged output's N does not match the "
+           "N-concatenated weight's rows");
+
+  // The fast path a future single-launch kernel takes. kNoMergedFastOp today on
+  // both block groups, so this is unreachable until #1189 M5 registers one; it
+  // is written here rather than at the model site so the model site never
+  // learns the tiering rule.
+  if (desc.fast_op != kNoMergedFastOp &&
+      OpRegistered(static_cast<OpId>(desc.fast_op), q.device.type)) {
+    VT_CHECK(false,
+             "MergedGemmFp8Block: the group names a fused fast op that this "
+             "build registers but cannot dispatch yet");
+  }
+
+  MatmulFp8BlockScaled(q, merged, a_fp8, a_scale, w_fp8, w_scale, block_n,
+                       block_k);
+
+  if (desc.epilogue == MergedEpilogue::kNone) {
+    VT_CHECK(out == nullptr,
+             "MergedGemmFp8Block: a kNone group has no epilogue output");
+    return;
+  }
+  VT_CHECK(out != nullptr,
+           "MergedGemmFp8Block: the clamped-SwiGLU epilogue needs an output");
+  VT_CHECK(desc.arity == 2,
+           "MergedGemmFp8Block: the clamped-SwiGLU epilogue is arity-2");
+  VT_CHECK(merged.shape[1] == 2 * out->shape[1] &&
+               merged.shape[0] == out->shape[0],
+           "MergedGemmFp8Block: the SwiGLU output must be half the merged "
+           "output's width and the same height");
+  // limit == +inf reduces kSiluMulClamp to the plain silu(gate)*up SwiGLU, as
+  // merged_gemm.h's enumerator records, and vt::SiluAndMul IS that reduction
+  // over the contiguous [M,2I] buffer. A finite limit would need a clamped
+  // kernel, which no backend binds for this arm, so it is refused rather than
+  // dropped.
+  VT_CHECK(std::isinf(epilogue_scalar) && epilogue_scalar > 0.0F,
+           "MergedGemmFp8Block: the block-wise FP8 SwiGLU tail is the "
+           "limit=+inf reduction of kSiluMulClamp; no clamped kernel is bound "
+           "on this arm");
+  SiluAndMul(q, *out, merged);
 }
 
 }  // namespace vt

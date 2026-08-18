@@ -121,6 +121,11 @@ void BreakableGraph::Reset() {
   // behind makes the next capture report replays it never ran, and G3's whole
   // job is to be the number nobody has to trust twice.
   replays_ = 0;
+  // Same argument for the recorded failure: it describes ONE capture attempt.
+  // A driver that rethrows it clears it by resetting, and a stale one would
+  // make the NEXT step propagate an error its own capture never hit.
+  capture_failed_ = false;
+  capture_error_ = nullptr;
 }
 
 void BreakableGraph::Replay(Queue& q) {
@@ -145,8 +150,13 @@ void BreakableGraph::Replay(Queue& q) {
 
 GraphCaptureScope* GraphCaptureScope::Current() { return t_current_scope; }
 
-GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out)
-    : b_(&b), q_(&q), g_(&out), uncaught_on_entry_(std::uncaught_exceptions()) {
+GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out,
+                                     GraphCaptureMode mode)
+    : b_(&b),
+      q_(&q),
+      g_(&out),
+      mode_(mode),
+      uncaught_on_entry_(std::uncaught_exceptions()) {
   // Refused before ANY backend call, and refused in both lanes so the switch
   // cannot change which programs are legal.
   //
@@ -162,6 +172,11 @@ GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out)
            "GraphCaptureScope: this BreakableGraph already holds a capture; Reset() it first");
   active_ = GraphCaptureEnabled() && b.SupportsGraphCapture();
   if (!active_) return;  // inert: the forward runs eager, exactly as today
+  // A fresh capture attempt starts with no failure recorded. Clearing here and
+  // not only in `Reset()` is what stops a caller that swallowed one attempt's
+  // error from seeing it again after the next attempt SUCCEEDED.
+  g_->capture_failed_ = false;
+  g_->capture_error_ = nullptr;
   g_->backend_ = b_;
   t_current_scope = this;
   BeginSegment();
@@ -183,15 +198,33 @@ GraphCaptureScope::~GraphCaptureScope() {
   // `captured() == true` and replays as half a step. Comparing the uncaught
   // depth against the one recorded at entry is what tells the two apart, and the
   // partial container is destroyed rather than handed back.
+  //
+  // AND THE DRAIN RECORDS THAT IT DRAINED. Swallowing is mandatory here; being
+  // SILENT about it is not. `Reset()` leaves the container reporting
+  // `captured() == false`, which is also what an INERT scope reports — and the
+  // caller's correct response to those two states is opposite (see
+  // `BreakableGraph::capture_failed()`). The flag and the exception are stashed
+  // AFTER the reset, because `Reset()` clears them.
   const bool unwinding = std::uncaught_exceptions() > uncaught_on_entry_;
   try {
     EndSegment();
   } catch (...) {
     g_->Reset();
+    g_->capture_failed_ = true;
+    // Inside a handler, so this IS the close's own exception. This is the arm a
+    // caller can observe, because nothing else is propagating.
+    g_->capture_error_ = std::current_exception();
     t_current_scope = nullptr;
     return;
   }
-  if (unwinding) g_->Reset();
+  if (unwinding) {
+    g_->Reset();
+    g_->capture_failed_ = true;
+    // No `capture_error_` here, and not by omission: no handler has been entered
+    // for the exception that is unwinding through this scope, so
+    // `std::current_exception()` returns null. The real exception reaches the
+    // caller on its own; see `BreakableGraph::capture_error()`.
+  }
   t_current_scope = nullptr;
 }
 
@@ -211,6 +244,16 @@ void GraphCaptureScope::EndSegment() {
 
 void GraphCaptureScope::AppendBreak(std::function<void()> fn, const void* destination) {
   if (!active_) return;
+  // A `kFull` scope has ONE segment by definition, so a registered break would
+  // leave `break_count() == segment_count()` and `Replay` would drop it. Every
+  // `GraphBreak` form already takes the pass-through arm here (`splits()` is
+  // false), and this refusal is what stops a form added later from opting out of
+  // that — the same reason the aliasing check lives at this one registration
+  // point rather than in each form.
+  VT_CHECK(mode_ == GraphCaptureMode::kPiecewise,
+           "GraphBreak: this capture scope is kFull (vLLM CUDAGraphMode.FULL), which "
+           "captures the forward as ONE segment; a break point cannot be registered "
+           "in it. Open the scope in kPiecewise to split");
   // The ALIASING half of lifetime rule 1, refused rather than documented. Two
   // break points writing through one CELL bind both replay closures to the same
   // address: the earlier writeback is overwritten on every replay, and any
@@ -234,7 +277,7 @@ void GraphCaptureScope::AppendBreak(std::function<void()> fn, const void* destin
 // The bare marker (`:370-374`).
 void GraphBreak() {
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     detail::CountBreakPoint();
     return;
   }

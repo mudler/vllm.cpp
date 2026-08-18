@@ -118,11 +118,11 @@ token-for-token correctness against the pinned oracle.
 |---|---|---|
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **flat 0.937-0.956 c1-c32** (#349; 0.838 void) |
 | Qwen3.8-2.4T-A95B (`UD-Q1_0`, 370 GiB) | **Loads and generates on ONE 119 GiB GB10**; speed is the gap | Resident 62 GiB; 66.7 s/tok, streaming OFF. Streaming lands but its decode figure is VOID: the step clock had no caller, so the cache died in token 3 ([#912](https://github.com/mudler/vllm.cpp/issues/912)) |
-| Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32) | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration |
+| Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32), STALE as of 2026-08-12 (+136 src commits then, incl. a +2.05% c8 lever); regrid owed | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration. Router warp kernel (#378) device-gated 315/315 both arms, kernel 1.363x, step-level not separable |
 | Qwen3.6-35B-A3B (published BF16, GDN MoE) — TEXT | Correctness-gated 2026-08-15 (#740, #864, both `DONE`); **no throughput, latency or memory number exists for this checkpoint, and none is claimed** | Greedy vs the pinned oracle @`995ad96e`: **6/7 prompts STRICT 16/16**; the 7th is one exact logit tie (`0.0 mnats`) our argmax breaks toward the higher id (#910). SACRED 3/3, goldens byte-identical |
 | Qwen3.6-35B-A3B (BF16) — IMAGE / VIDEO | Implemented, **NOT gated** (#891); row stays `PARTIAL` | The 333 `model.visual.*` tensors load and the tower computes (`[1,28,28]`→`[196,2048]`, finite, absmax 2.08) on sm_110 FALLBACK attention. The token-exact mm gate vs the oracle is OWED |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending. Async-serving P0 FIXED (#323: the decode graph replayed stale HOST ids, now declines while the mirror is live; async 7/7 incl. Llama/Mistral/InternLM2) | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **Async device-mirror (`ROW-SERVE-ASYNC-DENSE-MIRROR`, `f9c969ae`): the #31 fix ported to the classic dense family, dgx-VERIFIED.** The shared dense `EmbedInto` (qwen3.cpp) raced the async combine's device input-ids write against a stale host upload → token-0 degeneration on the depth-2 AsyncLLM serving path (quant-independent). `EmbedInto` now consumes the device override published by `ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` (27B-dense template); gate `test_qwen3_dense_async_serving` RED on `VT_ASYNC_DEVICE_MIRROR=0`, GREEN default, byte-identical mirror-off. dgx GB10: async gate RED→GREEN 0.6B+4B, SACRED 0.6B+4B 184/184 unchanged (byte-neutral sync path), memcheck 0 errors; Yi30/Qwen3-8B-MXFP4 default-config e2e coherent + 3/4 token-exact (p2 = oracle-ratified near-tie, gap 0.0000), closing the QUANT-CT-MXFP4 async-default residual. RESIDUAL: sibling InternLM2/Mistral/Llama scope one-liner; W4 bench RAN; FA2 GQA-swap default-ON, c2-c8 <1.0x. `FLASH-PTXAS` #82: codegen at PARITY (no ptxas lever); gap=engine context. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
-| Qwen3.5-4B BF16 direct-load on discrete CUDA | Correct; throughput/host PSS ahead, acceptance `PENDING`; latency/VRAM open | Atomic pretoken exact. Ratios: tput 1.0283x; TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower; VRAM +118.7 MiB. GDN local stack retained ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| Qwen3.5-4B BF16 direct-load on discrete CUDA | Correct; throughput/host PSS ahead, acceptance `PENDING`; latency/VRAM open; sampled-token lever CLOSED, next is the TTFT intake/prefill split ([#527](https://github.com/mudler/vllm.cpp/issues/527)) | Atomic pretoken exact. Ratios: tput 1.0283x; TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower; VRAM +118.7 MiB. GDN local stack retained ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -198,6 +198,21 @@ The boundary is vLLM's — its v1 default splits at `splitting_ops`, defaulted t
 the attention family — and only the registration form is SGLang's, because vLLM
 gets its split from Dynamo and FX and we have no compiler. W1 registers ONE
 break point, at the dense attention entry of `Qwen3ForCausalLM`.
+
+W2 (2026-08-18, #1261) migrates the first driver: the shared dense decode graph
+now captures and replays through the seam instead of its own `BeginCapture` pair
+and raw handle. It captures in FULL mode, mirroring vLLM's decode arm, so a
+decode step keeps the single graph it already had; the PIECEWISE arm has no
+production driver yet, because the break closure W1 registered reads a returned
+frame on replay. Bit-exactness against a REPLAYED capture on a real GPU is owed,
+not met.
+
+A capture that FAILS is now distinguishable from a scope that was INERT. The
+capture scope has to swallow a throwing `EndCaptureGraph` — a destructor that
+propagates terminates — and both states left the container reporting
+"not captured", so a driver reading only that bit could return uncomputed device
+memory as a decode step's logits. The container records the failure and the
+exception, and the driver propagates it.
 
 The stage's exit criterion was measured rather than assumed: ending a capture
 and BEGINNING A NEW ONE on the same stream mid-forward, with eager work between,

@@ -755,8 +755,83 @@ destination-carrying form because `AttnBlock` returns a fresh pooled buffer on
 every call. G2's mutation applies from this stage on and was performed; see
 `## Outcome`.
 
-**W2, migrate `Qwen3DenseDecodeGraph` first.** It goes first for three reasons,
-in order. It is the SMALLEST batched driver by machinery, holding no
+**W2, migrate `Qwen3DenseDecodeGraph` first. DONE 2026-08-18,
+[#1261](https://github.com/mudler/vllm.cpp/issues/1261).** The driver's capture
+is now the seam's: `Qwen3DenseDecodeGraph::Step` opens a `vt::GraphCaptureScope`
+over a per-slot `vt::BreakableGraph` and replays through
+`BreakableGraph::Replay`, so the hand-rolled `BeginCapture`/`EndCaptureGraph`
+pair, the raw `void*` handle, the `bool captured` half of the state machine, the
+`DestroyGraph` loop and the driver's own `VLLM_CPP_CUDAGRAPH` read are gone —
+items 1, 2, 5, 6 and part of 4 of `## Our baseline`, absorbed. **This is the
+first stage at which the seam is ENTERED from a production step**, which retires
+W1's staged slice.
+
+**The migration added one thing the seam did not have, and mirroring is the
+reason.** `vt::GraphCaptureMode` ports vLLM's `CUDAGraphMode`
+(`vllm/config/compilation.py:59-63`), whose v1 default `FULL_AND_PIECEWISE`
+(`:63`) is documented at `:630-632` as "Capture full cudagraph for DECODE
+batches and piecewise cudagraph for prefill and mixed prefill-decode batches";
+`decode_mode()` (`:65-66`) returns the FULL half and the runtime reads it per
+batch at `vllm/v1/worker/gpu/cudagraph_utils.py:185-186`. W1 built the piecewise
+mode alone. **A decode driver opened in `kPiecewise` would convert a fully
+graphed decode step into one EAGER attention call per layer between two graph
+replays** — twenty-eight of them on Qwen3-4B — which is not what vLLM does for a
+decode batch, which the secondary oracle does not do either (SGLang reaches BCG
+through `--cuda-graph-backend-prefill=breakable`,
+`test_breakable_cuda_graph.py:279-281`), and which nothing in this record
+supports. `GraphBreak` inside a `kFull` scope therefore takes the same
+pass-through arm it takes outside a scope, so the break's work is captured
+INSIDE the single segment, and `GraphCaptureScope::AppendBreak` REFUSES a
+registration in that mode rather than leaving a container with
+`break_count() == segment_count()`. **This is a correctness and mirroring
+argument, not a performance one.** No throughput is claimed and none was
+measured; `kFull` is what keeps the migrated step's shape the one it already
+had.
+
+**That degradation is a CONDITIONAL, and the order matters.** It is what a
+piecewise decode capture costs once the capture WORKS. Today it does not: the
+same one-token change faults on the first replay for the lifetime reason in the
+next paragraph, measured as mutation D in `## Outcome`. Both are true and only
+the second is currently observable; W2's first head stated the first as though
+the second did not exist.
+
+**The piecewise arm does not reach this driver at W2, and the reason is a
+lifetime, not a preference.** The registered break point's closure captures
+`RunLayer`'s frame by reference — `dhn`, `si`, `meta`, `T` — every one of which
+is a per-step local. On replay N those references name a frame that returned,
+which is lifetime rule 2 at the `GraphBreak` declaration. Making the closure
+replay-safe means holding the layer's inputs in persistent storage the driver
+owns, which is the same capability `StepDevInputs` is and which W4 owns. W1's
+own G2 gate never saw this because it counts segments and never calls `Replay`.
+Recorded under `## Owed` with W4 as the owner.
+
+**The async decline at `qwen3.cpp` STANDS, and W2 says so rather than leaving
+it.** Migrating the CAPTURE machinery does not move the INPUTS: `Step` still
+refreshes the persistent HOST vectors the captured copies read, so the depth-2
+race the decline avoids is untouched by this stage and removing the decline
+would restore the measured failure. The fix is `StepDevInputs`
+(`qwen3_5.cpp:3894`) as a SEAM capability, which is W4 by this section's own
+words and which is the only version of the fix that also reaches
+`qwen3_moe.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`. Hand-copying it into this
+driver would be the tenth copy of the capability this row exists to stop
+copying. Both arms are now GATED
+(`tests/vllm/models/test_qwen3_decode_graph_seam.cpp`) so neither can change
+silently, and the mutation that deletes the decline reds that case.
+
+**Gates run.** G2, the reachability mutation, is
+`tests/vllm/models/test_qwen3_decode_graph_seam.cpp`: it drives
+`Qwen3DenseDecodeGraph::Step` through four decode steps (cold, capture, replay,
+replay) and asserts the seam's OWN counters, because a driver calling
+`Backend::ReplayGraph` directly leaves a backend log identical to the seam's.
+Replacing the scope and `Replay` with the pre-W2 raw pair (18 changed lines,
+compiled clean, exit 0) left `test_breakable_graph` 27/27, W1's
+`test_qwen3_break_point` 2/2 and `test_qwen3_forward` 10/10 GREEN and turned
+this file RED on four assertions — W1's contrast reproduced one stage later.
+G4 holds in the same file: the capture step's logits are bit-identical to
+`Qwen3DenseModel::Forward`, 100 values, 0 differing. **G1 is NOT met and is
+owed**, because a CPU harness cannot replay a captured segment; see `## Owed`.
+
+It went first for three reasons, in order. It is the SMALLEST batched driver by machinery, holding no
 `StepDevInputs` and no auxiliary tap buffer. It carries the DECLINE mitigation at
 `qwen3.cpp:961-986`, so the migration has a documented, measured failure mode to
 gate against rather than a hypothetical one. Its gate models, Qwen3-0.6B and
@@ -938,9 +1013,15 @@ point registered inside an unjoined fork window without this rule fails at
 
 ## Now
 
-`ACTIVE`. W0 (spike) and W1 (the seam, its ported unit gate, and one registered
-break point) have landed; W2 through W6 remain, and `## Work breakdown` states
-each. Owner: `.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W1.md`.
+`ACTIVE`. W0 (spike), W1 (the seam, its ported unit gate, and one registered
+break point) and W2 (`Qwen3DenseDecodeGraph` migrated onto the seam) have
+landed; W3 through W6 remain, and `## Work breakdown` states each. Owner:
+`.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W2.md`.
+
+The seam is now ENTERED from a production step: one driver opens a capture
+scope, so W1's staged slice is retired. The mode that step opens is `kFull`,
+mirroring vLLM's decode arm; the PIECEWISE arm still has no production driver
+and `## Owed` names what has to be true before one exists.
 
 W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
 `cudaStreamBeginCapture` mid-forward on our stream configuration — is
@@ -950,16 +1031,13 @@ CONFIRMED on a leased GPU and is no longer an open question for any later stage.
 
 Each item names the stage that owns it. Nothing here is claimed by W1.
 
-- **The seam is not yet ENTERED from a production step.** `GraphCaptureScope` and
-  `BreakableGraph` are constructed by the gates, not by a driver, because no
-  driver opens a scope until **W2** migrates `Qwen3DenseDecodeGraph`. The break
-  point itself IS on the production path — every `Qwen3ForCausalLM` forward
-  executes it and takes the pass-through arm — and
-  `tests/vllm/models/test_qwen3_break_point.cpp` is what holds that. This is the
-  staged slice AGENTS.md allows, named here rather than left silent. Owner: W2,
-  [#1163](https://github.com/mudler/vllm.cpp/issues/1163) tracks the handoff —
-  the parent, because #1192 CLOSES with W1 and a tracker that dies at merge
-  tracks nothing.
+- ~~**The seam is not yet ENTERED from a production step.**~~ RETIRED by **W2**
+  ([#1261](https://github.com/mudler/vllm.cpp/issues/1261)).
+  `Qwen3DenseDecodeGraph::Step` opens a `vt::GraphCaptureScope` over a per-slot
+  `vt::BreakableGraph` and replays through `BreakableGraph::Replay`, and
+  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp` holds it through the
+  seam's own counters. This was the staged slice AGENTS.md allows; it is closed
+  rather than carried.
 - **The auxiliary-stream auto-join before every segment close** (D10, the port of
   `breakable_cuda_graph.py:353-361`). W1 registers its break point on a model
   that forks no auxiliary queue, so the rule is not exercised and untested
@@ -978,11 +1056,43 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   false; ROCm (`rocm_backend.hip:248`) and Tenstorrent
   (`tenstorrent_backend.cpp:75-81`) are not exercised, and D6 records that
   segmenting a ttnn mesh trace is UNVERIFIED on that runtime. Owner: **W3**.
-- **G1, bit-exactness against eager on a real GPU over MORE than one replay.**
-  W1's bit-exactness is against the model's own eager forward on CPU, with the
-  scope open, 500 logits and 0 differing — which proves the seam changed no
-  numerics, and does NOT prove a replayed segmented capture matches. Owner:
-  **W2**, on the leased GPU its gate models already need.
+- **G1, bit-exactness against eager on a real GPU over MORE than one replay.
+  STILL OWED after W2, and W2 states why rather than implying it ran.** W1's
+  bit-exactness was against the model's own eager forward on CPU with the scope
+  open (500 logits, 0 differing); W2 adds the driver's CAPTURE step against
+  `Qwen3DenseModel::Forward` (100 logits, 0 differing). Neither is G1. A CPU
+  kernel is a direct function call and not a backend submission, so nothing a
+  CPU harness calls a "replay" recomputes anything, and the defect class this
+  gate exists for only appears on a LATER replay. The gate needs Qwen3-0.6B and
+  Qwen3-4B on a real device through an `rc` lease. W2 obtained no lease:
+  `dgx:gpu0` was held by another session's benchmark for the whole window and
+  `orin:gpu0`'s Jetson driver cannot run a CUDA 13 runtime. Owner: **W3**, which
+  migrates three more drivers of the same shape and can run one lease for all
+  four.
+- **The PIECEWISE arm has no production driver, and the break closure is why.**
+  W2's driver opens its scope in `kFull`, so the registered break point takes
+  the pass-through arm and the capture is one segment. Opening it `kPiecewise`
+  today would register a replay closure that captured `RunLayer`'s frame by
+  reference (`dhn`, `si`, `meta`, `T` — every one a per-step local), which is
+  lifetime rule 2 at the `GraphBreak` declaration and reads a returned frame on
+  replay N. The fix is persistent, driver-owned storage for the layer's inputs,
+  which is the capability `StepDevInputs` already is. Owner: **W4**, and **W6**
+  cannot move the eligibility predicate before it exists.
+- **The async device-token DECLINE at `qwen3.cpp` still stands**, and W2
+  deliberately did not remove it. `Step` replays against the persistent HOST
+  vectors, so the depth-2 race is untouched by moving the CAPTURE onto the seam,
+  and the measured battery (`depth-1 graph ON PASS 78/78`, `depth-2 graph OFF
+  PASS 82/82`, `depth-2 graph ON FAIL, slots 1-3 degenerate`) is what removing
+  it would restore. Both arms are gated at
+  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp`. Owner: **W4**, as the
+  seam-level persistent device input path — the only version of the fix that
+  also reaches `qwen3_moe.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`.
+  [#1179](https://github.com/mudler/vllm.cpp/issues/1179) tracks it.
+- **The async battery itself was NOT re-run by W2.**
+  `tests/parity/test_qwen3_dense_async_serving.cpp` needs a GPU and a
+  checkpoint, and W2 obtained no lease. What W2 can say is what it measured: the
+  decline's code path is unchanged and both of its arms are now executable on
+  CPU. Re-running the battery belongs with G1 on the same lease. Owner: **W3**.
 - **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
   drain cannot see.** The `uncaught_exceptions()` comparison in
   `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A
@@ -993,12 +1103,27 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   header and this spec state the guarantee only for the propagating case, so
   this is a RESIDUAL rather than a false claim — but a driver that wraps a break
   in a `try` gets silently wrong numerics on replay, and W2 is the first stage
-  that opens a scope from a driver. Owner: **W2**.
+  that opens a scope from a driver. **W2 did not close it and did not need to:**
+  its scope is `kFull`, so it has ONE segment and no `try` anywhere inside it,
+  and a `kFull` capture has no between-segments window for a caught exception to
+  truncate. The residual becomes live for the first driver that captures
+  PIECEWISE. Owner: **W4**, with the piecewise arm it unblocks.
+  What W2 DID close is the adjacent hole the fresh review found, and it is
+  recorded here because the two are easy to confuse: the drain leaves a FAILED
+  capture reporting exactly what an INERT scope reports, and the first W2 head
+  read that one bit and returned the uncomputed layer output as the step's
+  logits. `vt::BreakableGraph::capture_failed()` / `capture_error()` separate the
+  two states, the driver rethrows, and
+  `tests/vt/test_breakable_graph.cpp` test 13d plus
+  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp` gate both.
 - **The reuse hazard the seam must close** (D1): making the intermediates a
   segment reads unavailable to the `DevicePool` free list for the life of the
   `BreakableGraph`. W1 states the lifetime rules at the `GraphBreak` declaration
   and enforces the OUTPUT half through the writeback contract; the INPUT half is
-  a pool change with its own argument. Owner: **W2**.
+  a pool change with its own argument. **W2 did not close it and did not need
+  to:** the hazard is the window BETWEEN two segments, which a `kFull` capture
+  does not have, so it becomes live for the first driver that captures
+  piecewise. Owner: **W4**, with the piecewise arm it unblocks.
 
 ## Outcome
 
@@ -1055,6 +1180,40 @@ and `## Owed` and `## Outcome` are new. The framing is unchanged and is not
 negotiable — coverage and correctness, never speed. No throughput gate is
 declared and none was measured.
 
+Revised 2026-08-18 a fifth time, after a fresh review of the W2 head returned
+`FAIL` (one HIGH, one MEDIUM, two LOW). What changed. **The HIGH:** the driver
+read `captured() == false` as "the scope was inert" and returned the layer
+output as the step's logits, which on CUDA is uncomputed device memory, because
+`~GraphCaptureScope` must swallow a throwing `EndCaptureGraph` and the container
+had no way to say WHICH of the two states it was in. `BreakableGraph` now
+records `capture_failed()` and `capture_error()`, the driver rethrows the
+runtime's own exception, and both the seam-level and driver-level arms are gated
+(`tests/vt/test_breakable_graph.cpp` test 13d;
+`tests/vllm/models/test_qwen3_decode_graph_seam.cpp`). **The MEDIUM:** the
+counterfactual carrying the W2 record was stated as fact, never run, and is
+false; `## Outcome` now carries the measured mutation D and separates the two
+claims it had merged. **The LOWs:** the caught-inside-scope residual is
+reassigned from W2 to W4 with W2's disposition recorded, and a test justification
+in the G2 file that could not apply to a `kFull` container is corrected.
+
+**Disclosure, because a reader would look for it here.** The three
+`vt::GraphCaptureMode` unit cases in `tests/vt/test_breakable_graph.cpp` were
+written AFTER the implementation they cover, not red-first. The fresh review
+mutated both load-bearing halves (the `splits()` gate and the `AppendBreak`
+refusal) and each was detected, so no test-quality finding follows — but the
+order is recorded rather than left to be inferred from a green suite. The
+capture-failure gate added in the repair WAS red-first: it failed with
+`CHECK_THROWS_AS(...) did NOT throw at all!` before the driver change.
+
+Revised 2026-08-18 a fourth time, when W2 landed (#1261): `## Work breakdown`
+W2 records what shipped, `## Now` moves the owner to the W2 claim, `## Owed`
+retires the staged slice W1 left and files four new items (the piecewise arm's
+lifetime blocker, the standing async decline, the un-re-run async battery, and
+G1 still owed on a real GPU), and `## Outcome` records the mode finding. The
+framing is unchanged and is not negotiable — coverage and correctness, never
+speed. No throughput gate is declared and none was measured; `vt::GraphCaptureMode`
+exists to mirror vLLM's decode arm, not to make anything faster.
+
 Revised 2026-08-18 a third time, after a fresh review of the W1 head returned
 `FAIL`. What changed: the destination-carrying break point takes a
 `vt::BreakSlot` the seam owns instead of a caller reference it cannot outlive
@@ -1077,6 +1236,54 @@ the exact recipe. **What was NOT retained is the leased run's own driver script
 and its raw stdout**, so the verdict recorded above is reproducible only by
 re-running the committed source under the recorded recipe on a leased GPU — which
 is what a later claimant has to do rather than cite this paragraph.
+
+**W2's finding, and it is the one a later stage most needs.** The seam W1 built
+is the PIECEWISE mode, and W1's records read as though migrating a driver onto
+the seam and splitting its capture were one act. They are two, and the primary
+oracle keeps them apart: `splitting_ops` says WHERE a graph may be split,
+`cudagraph_mode` says WHETHER this batch's graph is split at all, and for a
+decode batch vLLM's own default answers "not at all".
+
+**What a naive piecewise migration actually does, CORRECTED and MEASURED.** W2's
+first head asserted that opening the scope `kPiecewise` and changing nothing else
+"would have been bit-exact and would have passed every gate in this tree". That
+was reasoned, never run, and it is FALSE — the fresh review ran it and so did the
+repair. Mutation D, one token (`kFull` -> `kPiecewise`) at
+`src/vllm/model_executor/models/qwen3.cpp`, compiles clean and dies on the FIRST
+replay, which the capture step itself performs:
+
+```
+vt: matmul_bt: rank-2 tensors required   (src/vt/ops.cpp:158)
+  vllm::dense_attn::AttnBlock(...)
+  vt::GraphBreak<RunLayer::{lambda#1}, std::optional<DBuf>>::{lambda#1}::operator()()
+  vt::BreakableGraph::Replay(vt::Queue&)
+  vllm::Qwen3DenseDecodeGraph::Step(...)
+```
+
+`test_qwen3_decode_graph_seam` goes 4/4 -> 1/4 with three cases THROWN, G2 having
+passed only its four cold-step assertions before the capture step's own replay
+faulted. So the naive migration is a USE-AFTER-SCOPE, loud, on the first step
+that captures — not a quiet degradation. The cause is the very next item below,
+which the same section already identified: W1's break closure captures
+`RunLayer`'s frame by reference. The two statements contradicted each other two
+paragraphs apart, and the false one UNDERSTATED the hazard.
+
+**The part that was true, and is worth keeping separately.** HAD the closure been
+replay-safe, the piecewise split would have converted a shipped, default-ON,
+fully graphed decode step into twenty-eight eager attention calls per step, and
+no gate here could have seen it, because a token gate cannot see a segment count.
+Nothing in this row's framing — coverage and correctness, never speed — licenses
+that. That is why `kFull` is a MIRRORING requirement and not a preference. But it
+is a conditional, not the observed behaviour: today the same change faults first.
+D7 therefore stands as a risk with one measured half, not as a lived case.
+
+**And the break point W1 registered is not replay-safe, which is what mutation D
+exposes.** Its closure captures `RunLayer`'s frame by reference. W1's G2 gate
+opens a scope, runs the forward and counts segments; it never calls `Replay`, so
+a closure that reads a returned frame on replay N was invisible to it. W2 found
+this by READING the closure's captures at the site rather than by trusting the
+gate that was green; mutation D is the run that confirms it, and it is recorded
+here so a later stage does not have to re-derive either half.
 
 **The finding worth keeping at the top level.** The seam's most-documented rule —
 that the destination must outlive the graph — was broken by the ONLY site that

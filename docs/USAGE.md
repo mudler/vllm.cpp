@@ -618,6 +618,22 @@ then run a block-scaled GEMM whose scales apply in the mainloop, once per
 K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
 model dtype and what vLLM emits at the same sites.
 
+Those ten projections are seven GEMMs, because `gate_proj` and `up_proj` run as
+one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linears
+vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
+concatenate exactly and the merged GEMM is byte-identical to the separate ones.
+
+That merge needs each projection in a group except the last to be a multiple of
+128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
+that breaks the rule is refused by name, and the message says which projection
+and how wide it is, rather than quietly running a different arithmetic:
+
+```text
+block-wise FP8 merged 'qkv_proj': shard 'k_proj' has out_features 64, which is
+not a multiple of the quantization block's n 128. Only the LAST shard of a
+merged block-quant linear may be ragged
+```
+
 On a device with no block-scaled GEMM the model refuses while it is being
 prepared, before the first forward and before any CUDA graph is captured:
 

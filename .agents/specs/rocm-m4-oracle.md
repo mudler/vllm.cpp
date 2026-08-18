@@ -92,3 +92,68 @@ Review findings, all accepted and fixed in the current shape:
 4. **Anchor message honesty**: anchor drift now reads "REGRESSION SUSPECTED:
    bisect the engine change first" — re-deriving goldens is the last step of a
    justified re-capture, never the response to a failure.
+
+## Issue #1222: missing-artifact fail-safe repair
+
+### Scope
+
+The Qwen3.5-0.8B paged-engine gate promises that an unavailable prerequisite is
+not a correctness pass. Repair the three required committed-artifact paths in
+`tests/parity/test_qwen35_paged_engine.cpp`: `greedy_ids.npy`, `our_ids.npy`,
+and `neartie_gap_mnats.npy`. Issue #1222 is an in-flow `BACKEND-ROCM` bug for PR
+#559. Snapshot absence, non-ROCm execution, malformed present arrays, and the
+numerical acceptance policy keep their existing behavior.
+
+### Design
+
+Put the three existence checks behind one prerequisite helper used by the real
+gate and by a test-only golden-directory probe in the same executable. Missing
+required files route through the existing `SkipGate` process exit 77. A
+deterministic CMake subprocess test creates temporary golden directories,
+removes each required file in turn, invokes the actual gate executable through
+the probe, and rejects any child result other than 77.
+
+`VT_DUMP_IDS` remains the explicit bootstrap path when the greedy capture exists
+but the anchor/gap pair is incomplete. It can run the model and write
+`our_ids.i32`; after that bootstrap work it exits 77 because no correctness gate
+ran. Present files continue into `LoadNpy` and the existing dtype/shape checks,
+so malformed arrays remain hard failures rather than becoming skips.
+
+### Risks
+
+- A probe that reimplements the condition could pass while the real gate stays
+  unsafe. The probe therefore calls the same prerequisite helper in the same
+  process as the production test case.
+- Treating any parse failure as unavailable would hide corrupt evidence. Only
+  filesystem absence is eligible for exit 77.
+- Returning normally after bootstrap would preserve a second false-success
+  path; bootstrap completion must terminate through `SkipGate`.
+- Artifact checks must happen before model construction only in probe mode;
+  the ordinary snapshot and device gates retain their ordering and behavior.
+
+### Tests
+
+1. Add the subprocess regression and capture semantic RED before the repair:
+   children missing greedy, anchor, and gap return 0 instead of 77.
+2. Rebuild every affected target and require all three children to return 77.
+3. Under `flock /home/vikash/gpu.lock` with
+   `LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib`, run the real pinned
+   Qwen3.5 gate and require 16/16 prompts and 137 assertions, not exit 77.
+4. In scratch, restore one repaired missing-artifact branch to a normal return,
+   freshly rebuild, and require the deterministic subprocess test to fail for
+   the corresponding child. Restore byte-for-byte, rebuild, and require green.
+5. Run `PATH=/usr/bin:$PATH GIT_CONFIG_GLOBAL=/dev/null
+   scripts/agent-preflight.sh` and require literal `All gates green.`
+
+### Evidence
+
+The implementation commit records command lines, exact exits, mutation source
+and binary hashes, the real model-gate result, and the final preflight result.
+
+### Stop conditions
+
+Stop rather than weaken the gate if the deterministic test cannot exercise the
+actual executable, if absent artifacts cannot be distinguished from malformed
+present arrays, if the pinned local snapshot or ROCm gate cannot run under the
+required mutex, or if any change outside this test, its registration, this
+specification, and the issue-index append is required.

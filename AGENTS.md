@@ -454,9 +454,20 @@ speed axis as VOID because of it. That is the #777 failure again, in which this
 repository carried two GPU mutexes and neither serialised the other. A bypass
 also makes the fleet report the box free while somebody is on it.
 
-**A lease carries bytes, not executables.** The leased worker reads and writes
-the shared `/workspace`, and it has no compiler, no downloader and no Python, so
-it cannot produce a runtime in place. Plan staging around that limit.
+**A lease runs as root, and the worker provisions itself.** The leased worker
+reads and writes the shared `/workspace`, and on `dgx:gpu0` it is an Ubuntu 24.04
+container carrying `git`, `curl`, `wget`, `gcc`, `cmake`, `ninja`, `python3` and
+`pip`. It installs what it lacks and it compiles in place. On 2026-08-18 one job
+apt-installed `cuda-nvcc-13-0` and built this tree for `sm_121a`
+([#1213](https://github.com/mudler/vllm.cpp/issues/1213)).
+
+**Four limits are still real, and they shape staging.** No CUDA toolkit is
+preinstalled, so a job that compiles CUDA installs one first. A global install
+leaks into the next job, so put project dependencies in a virtual environment
+under `/workspace`. `/workspace` is CIFS and holds no symlink, so build in `/tmp`
+and copy out with `cp -rL`. Unconstrained parallelism has OOM-rebooted this box,
+so use `-j 4`. The HOST `dgx.casa` has no egress to `github.com` while the
+container does, so name the side you mean.
 [`.agents/environment.md`](.agents/environment.md) carries the fleet, the
 measurement, and the procedure.
 

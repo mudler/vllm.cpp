@@ -1705,6 +1705,8 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
 
+`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The shared `vt` registry hashes a captured graph's structure and re-points a single executable with `cudaGraphExecUpdate` on a hit, falling back to a private executable when the driver rejects the update. A memory and capture-time change, NOT a throughput change. Default OFF until a leased-GPU same-binary A/B proves a deduped replay token-identical; that A/B and the ROCm compile are owed ([#1162](https://github.com/mudler/vllm.cpp/issues/1162)).
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`

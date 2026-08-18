@@ -43,6 +43,9 @@
 #include <vector>
 
 #include "vt/backend.h"
+#define VT_GRAPH_DEDUP_HIP 1
+#include "vt/graph_dedup.h"
+#include "vt/graph_dedup_runtime.h"
 #include "vt/rocm/rocm_arch.h"
 
 namespace vt::rocm {
@@ -271,6 +274,16 @@ class RocmBackend final : public Backend {
   void* EndCaptureGraph(Queue& q) override {
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    // ENG-CUDAGRAPH-DEDUP (#1162), the same wiring as the CUDA leg against the same
+    // shared registry and the same shared ops table: with VT_CUDA_GRAPH_DEDUP set, the
+    // RAW graph is retained and keyed by topology so compatible captures share one
+    // executable. Default OFF, in which case this is the pre-dedup path byte for byte.
+    if (vt::GraphDedupEnabled()) {
+      if (dedup_ == nullptr) {
+        dedup_ = std::make_unique<vt::GraphDedupRegistry>(vt::graph_dedup_rt::Ops());
+      }
+      return dedup_->Register(reinterpret_cast<void*>(graph));
+    }
     hipGraphExec_t exec = nullptr;
     Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
           "hipGraphInstantiate");
@@ -281,6 +294,10 @@ class RocmBackend final : public Backend {
   // cudaProfilerStart/Stop around a chosen replay. A rocprofiler equivalent is
   // later work and deliberately out of W1's scope (spec §2).
   void ReplayGraph(Queue& q, void* graph) override {
+    if (dedup_ != nullptr && dedup_->Owns(graph)) {
+      dedup_->Replay(graph, reinterpret_cast<void*>(AsStream(q)));
+      return;
+    }
     Check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), AsStream(q)),
           "hipGraphLaunch");
   }
@@ -299,10 +316,13 @@ class RocmBackend final : public Backend {
   // leak this backend would rather report than swallow, independent of what
   // the build flags happen to enforce.
   void DestroyGraph(void* graph) override {
-    if (graph != nullptr) {
-      Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
-            "hipGraphExecDestroy");
+    if (graph == nullptr) return;
+    if (dedup_ != nullptr && dedup_->Owns(graph)) {
+      dedup_->Destroy(graph);
+      return;
     }
+    Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
+          "hipGraphExecDestroy");
   }
 
   // THE LOAD-BEARING BOOL. This is what decides whether the portable CPU
@@ -353,6 +373,9 @@ class RocmBackend final : public Backend {
   // Single-graph slot for the EndCapture/Replay pair. The handle API
   // (EndCaptureGraph) stores nothing here — its caller owns the exec.
   hipGraphExec_t exec_ = nullptr;
+  // ENG-CUDAGRAPH-DEDUP (#1162): built on the first capture, and only when
+  // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
+  std::unique_ptr<vt::GraphDedupRegistry> dedup_;
 };
 
 // Registers every visible AMD GPU at its own Device{kROCM, i} slot, mirroring

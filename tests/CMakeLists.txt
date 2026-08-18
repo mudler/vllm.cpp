@@ -1690,6 +1690,14 @@ target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src
 vllm_cpp_add_test(test_breakable_graph vt/test_breakable_graph.cpp)
 vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
 target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_graph_dedup vt/test_graph_dedup.cpp)
+target_include_directories(test_graph_dedup PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-CUDAGRAPH-DEDUP / #1184: the two device-free halves of the CUDA/HIP binding --
+# the error-latch guard every entry point installs, and the structural-signature walk.
+# Both lived inside a header that includes <cuda_runtime.h> and were therefore reached
+# by NO test on any tier; the latch defect hid in exactly that gap.
+vllm_cpp_add_test(test_graph_dedup_runtime vt/test_graph_dedup_runtime.cpp)
+target_include_directories(test_graph_dedup_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).

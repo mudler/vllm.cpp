@@ -646,7 +646,12 @@ differently. Second, a SINGLE-arm sweep on this branch alone, one run at a time:
 | 1-minute load average | rc | what fired |
 |---|---|---|
 | 172.06 before, 194.47 after | 1 | the harness's own quiet gate: `waiting for quiet: 15s busy=920% builders=0 load=194.47`, then `NO_QUIET_WINDOW after 15s`. 2 of its 10 unittest cases failed and the run took 114.7 s |
-| 53.41 before, 49.45 after | 0 | nothing: `Ran 10 tests in 3.338s` / `OK` — the same three files, the same tree, 34x faster |
+| 92.56 before, 107.42 after | 1 | the same gate, later in the session: `NO_QUIET_WINDOW after 30s (busy=104% builders=0 load=103.79 ...)`. 1 of 10 failed, 86.0 s |
+| 53.41 before, 49.45 after | **0** | nothing: `Ran 10 tests in 3.338s` / `OK` — the same three files, the same tree, 34x faster |
+
+Three single-arm runs on ONE tree, and the verdict tracks the box's load rather
+than anything about the branch. `scripts/agent-preflight.sh` is rc 1 exactly when
+this harness is rc 1, and rc 0 when it is rc 0.
 
 The assertion that fires is the harness's own quiet gate, not a figure it computed,
 which is the signature `.agents/environment.md` already records for this box.

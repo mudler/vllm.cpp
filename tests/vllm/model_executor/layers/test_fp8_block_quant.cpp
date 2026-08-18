@@ -12,19 +12,19 @@
 // from the checkpoint. The reader was sent after a tensor upstream never writes
 // in this mode instead of being told the fine-grained arm is absent.
 //
-// EVERY case here enters through `ModelRegistry::Load`, the production loader
-// `src/vllm/entrypoints/model_loader.cpp:1613` calls, and NOT through the
-// predicate. That is deliberate and it is the reachability proof AGENTS.md
-// `## Nothing lands dead` asks for: a unit test that called the predicate
+// EVERY case here enters through `ModelRegistry::Load`, which the production
+// loader `src/vllm/entrypoints/model_loader.cpp::FromModelDir` calls, and NOT
+// through the predicate. That is deliberate and it is the reachability proof
+// AGENTS.md `## Nothing lands dead` asks for: a unit test that called the predicate
 // directly would prove the function works and never that a load reaches it.
 // Deleting the call site in `ModelRegistry::Load` must red this file.
 //
 // No checkpoint, no GPU, and no model directory: the refusal fires before
 // `factory.load_weights`, so an EMPTY shard vector is all a load needs to reach
 // it. That is why the guard sits in `ModelRegistry::Load` rather than at the
-// other pre-load refusal site, `RefuseUnsupportedWeightOffload`
-// (`src/vllm/entrypoints/model_loader.cpp:1536`), which needs a directory on
-// disk.
+// other pre-load refusal site,
+// `src/vllm/entrypoints/model_loader.cpp::RefuseUnsupportedWeightOffload`,
+// which needs a directory on disk.
 #include <doctest/doctest.h>
 
 #include <string>

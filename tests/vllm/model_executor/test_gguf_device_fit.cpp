@@ -56,7 +56,8 @@ std::string BuildTwoTensorGguf() {
 // The same file plus one tensor of the MTP / `nextn` block, which a DEFAULT load
 // never stages: the head is attached only under
 // `params.speculative_config.has_value() && method == "mtp"`
-// (`src/vllm/entrypoints/model_loader.cpp:1452-1453`), and the main model reads
+// (the GGUF branch of `src/vllm/entrypoints/model_loader.cpp::FromModelDir`),
+// and the main model reads
 // `block_count - nextn_predict_layers` blocks
 // (`qwen3_5_gguf_weights.cpp:877-878`), so the head's blocks are outside its
 // range. The footprint counts it anyway, because it takes the whole tensor

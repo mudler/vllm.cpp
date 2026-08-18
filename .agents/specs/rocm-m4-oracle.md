@@ -175,6 +175,43 @@ so malformed arrays remain hard failures rather than becoming skips.
 - Full gate: `PATH=/usr/bin:$PATH GIT_CONFIG_GLOBAL=/dev/null
   scripts/agent-preflight.sh` exited 0 and printed literal `All gates green.`
 
+#### Reviewer repair loop for the complete probe
+
+- Complete-control RED: after the CMake regression created all three
+  placeholder artifacts, `flock /home/vikash/gpu.lock env
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib ctest --test-dir
+  build-hip --output-on-failure -R
+  '^test_qwen35_paged_engine_prerequisites$'` exited 8. The three
+  missing-artifact children stayed at exit 77. The complete child exited 0,
+  and doctest reported one passed case with zero assertions.
+- Focused GREEN: a fresh `cmake --build build-hip --target
+  test_qwen35_paged_engine --parallel 4` under the same mutex and library path
+  exited 0. The same CTest command exited 0. Direct CMake-script execution
+  exited 0 and reported child exits 77, 77, 77, and 86.
+- Real model gate: `flock /home/vikash/gpu.lock env
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib
+  ./build-hip/tests/test_qwen35_paged_engine` exited 0. The gate loaded snapshot
+  `2fc06364715b967f1860aea9cf38778875588b17`, ran on ROCm device type 5,
+  passed 16 of 16 prompts and 137 of 137 assertions, and reported zero
+  declines.
+- Mutation: the complete-probe branch changed back to a normal return while
+  retaining a reference to the sentinel so the mutation compiled. The source
+  hash changed from
+  `7a2c3782b1546a8a90ba1599610e13068addeb631f7286e66dac7ce4ec1215f7`
+  to `b3de308eb7805d575248258eda60e2acbca8e2db9b8e25b8a16cfbacd88bb465`.
+  The fresh rebuild exited 0 and changed the binary hash from
+  `acf873bebec14804e9763bdee8c9c2e51dddd0b5949fb8cbff7091b8935bb931`
+  to `febc7bcc6e4cf81668651aff0c21bf3dc7be75c8593c7235dfc1f7da68e56947`.
+  CTest exited 8 because the complete child returned 0. The three
+  missing-artifact children still returned 77. Restoration recovered both
+  original hashes, and the fresh rebuild and CTest each exited 0. A prior
+  one-line mutation was rejected as evidence because `-Werror` stopped the
+  build on the unused sentinel before the regression ran.
+- Full gate: `env PATH=/usr/bin:$PATH GIT_CONFIG_GLOBAL=/dev/null
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib
+  scripts/agent-preflight.sh` exited 0 and printed literal
+  `All gates green.`
+
 ### Stop conditions
 
 Stop rather than weaken the gate if the deterministic test cannot exercise the
@@ -200,3 +237,17 @@ The test uses an environment probe in the real executable instead of a second
 artifact predicate. A separate validator was rejected because it could drift
 from the gate. Exit 77 remains the existing CTest unavailable-gate contract.
 No numerical threshold, snapshot pin, model setting, or device default changed.
+
+The reviewer found that the probe's complete-artifact path still returned
+normally. That return bypassed snapshot resolution, model construction, and the
+device check, so a test-only path could report production success. The
+subprocess regression now includes one complete-artifact control. That control
+requires the named test-only sentinel exit 86. Exit 86 is distinct from process
+success 0 and the unavailable-gate skip 77, and it fits the portable process
+exit range.
+
+After the shared prerequisite helper returns in probe mode, the executable now
+prints that the test probe completed and that the production gate did not run.
+It then exits 86. The missing greedy, anchor, and gap probes still exit 77.
+Normal execution without the probe is unchanged and continues through snapshot
+resolution, array validation, model construction, and the ROCm device gate.

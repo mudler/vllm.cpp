@@ -74,6 +74,8 @@ namespace {
 // Near-tie acceptance threshold in milli-nats — same bar as the Qwen3-dense
 // gate (0.5 nats); see that file for the derivation.
 constexpr int32_t kNearTieMnats = 500;
+// Stable test-only sentinel: distinct from process success and CTest skip 77.
+constexpr int kPrerequisiteProbeCompleteExit = 86;
 
 // The standard prompt battery — MUST match scripts/qwen3-oracle-capture.py (and
 // qwen3-neartie-gap.py) exactly; those scripts are model-agnostic and take
@@ -164,7 +166,15 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   const bool dump = !probe && std::getenv("VT_DUMP_IDS") != nullptr;
   const GateArtifactState artifacts =
       RequireGateArtifacts(gdir, label, dump);
-  if (probe) return;
+  if (probe) {
+    std::fprintf(
+        stderr,
+        "\n*** TEST PROBE COMPLETE (exit %d), production gate NOT RUN ***\n"
+        "*** %s: all three required artifact paths are present ***\n\n",
+        kPrerequisiteProbeCompleteExit, label);
+    std::fflush(stderr);
+    std::exit(kPrerequisiteProbeCompleteExit);
+  }
   // BOOTSTRAP: with VT_DUMP_IDS set and no gap golden yet, generate + dump OUR
   // token ids (our_ids.i32) so qwen3-neartie-gap.py can build the gap golden.
   if (artifacts == GateArtifactState::kBootstrap) {

@@ -1,0 +1,5 @@
+# CLAIM-ROCM-GEMMA4-PREFILL-PEER-HELPER
+
+| Claim | Row IDs | Agent | Worktree | Branch | Owned scope | State | Last update |
+|---|---|---|---|---|---|---|---|
+| `CLAIM-ROCM-GEMMA4-PREFILL-PEER-HELPER` | `BACKEND-ROCM` (slug `ROCM-GEMMA4-PREFILL-PEER-HELPER`, issue #839) | hermes-vllm (lab), helper | `/home/don/llms/vllm.cpp-prefill-peer` | `row/ROCM-GEMMA4-PREFILL-PEER-HELPER` | Owns ONLY: `RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice` → Launch/Finish + PeerPipeTls + DequantCache pin that persists in PeerSlot until host-observed retirement (ev_e or expert-stream sync on pre-record errors); Ensure rejects reconfiguration while pins live. **EXCLUDED:** kPeerPipe default ON, FP8 Lt, GU_INTERLEAVE, donor unpin-before-ev_e, donor Ensure→FreeAll on live pins, #838, #697. Requires #837 before or with impl as a separate head. Independent history from abandoned `row/ROCM-GEMMA4-XDEV-MOE`. | `IMPLEMENTING` | 2026-08-15 — ea9c: product RestoreComputeOrThrow no-op mutation RED via HIP compile-and-run |

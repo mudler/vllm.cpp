@@ -1756,7 +1756,9 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
 
-`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The GB10 same-binary A/B ran on 2026-08-18 and split: replays are byte-identical 10/10 and [#1184](https://github.com/mudler/vllm.cpp/issues/1184) is gone, but the fold NEVER engages — the signature carries the padded batch dimension, so two decode buckets never group and ON allocates as many executables as OFF. Default stays OFF; the flip is unjustified on this evidence, and a coarser key is the open hypothesis ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)).
+`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The GB10 A/B of 2026-08-18 split: byte-identical 10/10, [#1184](https://github.com/mudler/vllm.cpp/issues/1184) gone, and the fold never engaged because the shipped key carries the padded batch dimension.
+
+`ENG-CUDAGRAPH-DEDUP` coarse key: the [#1226](https://github.com/mudler/vllm.cpp/issues/1226) hypothesis is CONFIRMED on GB10. Drop the launch dimensions and every bucket folds — 3 graphs to 2 execs, 2 to 1, 2 to 1 — with `cudaGraphExecUpdate` probed once per fold and `refused=0`. It is opt-in, default OFF, and PR #1232 has NOT landed, so nothing on `main` folds today. No memory or speed number: clocks were unpinned and nobody measured bytes saved.
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

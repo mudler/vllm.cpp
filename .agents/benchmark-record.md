@@ -23684,3 +23684,195 @@ a large-L3 x86 box would give. The prediction matching is not a measurement, and
 the ~46 GB/s figure it reasons from was itself inferred from Thor, so this is the
 same argument returning rather than independent support. Settling it needs a
 measured bandwidth on both boxes.
+
+## ENG-CUDAGRAPH-DEDUP W5 — the coarse-key experiment: the fold HAPPENS, the driver refuses NOTHING, and the OFF/OFF control VOIDED one workload (2026-08-18, `row/ENG-CUDAGRAPH-DEDUP-KEY-RESULT`, experiment branch `row/ENG-CUDAGRAPH-DEDUP-KEY` at `b48b51df1`, PR #1232 DRAFT, GB10 sm_121a, #1226 / #1162 / #1283)
+
+**This does not supersede `ENG-CUDAGRAPH-DEDUP W4`. It answers the one hypothesis
+W4 left open.** W4 measured the SHIPPED exact key and found `N == M` in every ON
+cell. That result stands, unchanged, for that key. W5 measures a DIFFERENT key,
+behind its own opt-in, on a branch that has not landed.
+
+### What was being tested
+
+W4's negative was attributed, from source, to `AppendKernelPayload`
+(`src/vt/graph_dedup_runtime.h:119-129`) hashing `(func, gridDim.{x,y,z},
+blockDim.{x,y,z}, sharedMemBytes)` while decode buckets differ precisely in launch
+dimensions, so no candidate group ever forms. The hypothesis filed as
+[#1226](https://github.com/mudler/vllm.cpp/issues/1226): `cudaGraphExecUpdate`
+requires *topology* to match and is designed to permit *parameter* changes, and a
+kernel's launch configuration is a parameter. Because the registry probes BEFORE it
+folds, a coarser key that groups two graphs the driver then refuses costs one wasted
+probe and a private executable, never a wrong replay. That makes it a cost question.
+
+### Recipe
+
+`dgx:gpu0` through an `rc` lease, pod `rc-worker-4b8lj`, boot_id
+`3fd9745a-d25a-426c-ba3c-97c958a85515` — **the same value at both ends of the log**,
+so the box did not reboot mid-series. GB10, driver `580.173.02`. `### AB_KEY START
+2026-08-18T20:49:31Z` to `### DONE_AB_KEY 2026-08-18T20:58:46Z`.
+
+Source: `git archive` of `b48b51df1`, tar sha256
+`7aa50f3bc165bb471f4e9b45512127716a2e603450dbe76a149ac2d382c772ad`, **asserted by
+the harness before extraction** (`got=7aa50f3b…`). The coarse-key assertion strings,
+which exist only at that commit, were verified before configure. Binary sha256
+`ca114abb6055223c24127beb414ee033c562c17deee0223de91c641242240b63`, copied out of the
+build tree before anything ran it. Model Qwen3-0.6B bf16 (`Qwen3ForCausalLM`, 28
+layers, hidden 1024), `model.safetensors` sha256
+`11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641`.
+
+All four mandatory production-stack configure assertions GREEN, quoted from
+`ab.log`:
+
+```text
+-- CUTLASS found at /tmp/dedupkey/cutlass; enabling sm120a NVFP4 cutlass GEMM
+-- FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)
+-- Triton AOT: gdn_deltah_h48 <- sm_121a as vt_aot_sm_121a_gdn_deltah_h48_default
+VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a
+```
+
+`### BUILD END 2026-08-18T20:56:08Z rc=0`, `compile_errors=0`. Both CPU dedup suites
+green before any cell ran: `test_graph_dedup` 13/13 cases / 65 assertions,
+`test_graph_dedup_runtime` 22/22 cases / 88 assertions, `Status: SUCCESS!` on both.
+Loader path `/tmp/dedupkey/cu13lt:/usr/local/cuda/targets/sbsa-linux/lib:/tmp/dedupkey/run`
+(oracle cuBLASLt + toolkit cudart), qualified by a preflight that had to exit 0,
+capture a decode graph AND write its token artifact: `smoke c1 rc=0
+captured_graphs=1 cublas_errors=0 loader_errors=0 ids=present`.
+
+Every cell: `vllm-bench --model <qwen3-0.6b> --input-len 64 --temperature 0
+--output-token-ids <ids>` with `VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1`
+throughout. **Greedy, fixed seed.** The only variables are `VT_CUDA_GRAPH_DEDUP` and
+`VT_CUDA_GRAPH_DEDUP_COARSE_KEY`.
+
+| Workload | `--concurrency` | `--num-prompts` | `--output-len` | `--seed` | `--max-num-batched-tokens` | captured padded sizes |
+|---|---:|---:|---:|---:|---|---|
+| A | 24 | 24 | 40 | 4242 | 128 | 24, 16, 8 |
+| B | 16 | 21 | 32 | 777 | not passed | 16, 8 |
+| C | 32 | 49 | 24 | 31337 | not passed | 32, 24 |
+
+### Result 1 — THE HYPOTHESIS IS CONFIRMED
+
+The `### FOLD SUMMARY` block, verbatim from `logs-ab/ab.log`:
+
+```text
+a_exact:    captured 3 graphs, deduped to 3 execs  (probes=0 refused=0)
+a_coarse_a: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+a_coarse_b: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+b_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+b_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+c_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+c_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+```
+
+Each COARSE cell announced itself: `vt graph dedup: key mode = COARSE (launch
+dimensions and extents dropped)`; each EXACT cell announced `key mode = EXACT`. The
+harness VOIDs a cell that fails to announce the arm it claims, and no cell did.
+
+**`probes=0` on every exact-key cell is the direct proof of W4's diagnosis, not a
+restatement of it.** W4 concluded from reading `graph_dedup_runtime.h` that no
+candidate group forms and `cudaGraphExecUpdate` is never asked. The probe counter says
+exactly that, from the running process, which is a different and stronger kind of
+evidence. Drop the launch dimensions and the driver is asked once per fold and
+**accepts every time**. So on this hardware `cudaGraphExecUpdate` does tolerate a
+grid-dimension change, and the benefit W4 recorded as unreachable **is reachable via
+the key**.
+
+**`refused=0` is one driver on one hardware and toolkit pair.** AGENTS.md forbids
+declaring a ceiling; it equally forbids declaring a floor from one box. Nothing here
+says the driver accepts a grid change elsewhere, and a refusal elsewhere would be a
+cost, not a correctness failure.
+
+### Result 2 — byte-identity holds on A and C
+
+`--output-token-ids`, real generated identifiers, `empty_rows=0` everywhere.
+
+| Workload | cells | `ids_sha256` | bytes | requests x tokens |
+|---|---|---|---:|---|
+| A | `off_a`, `off_b`, `exact`, `coarse_a`, `coarse_b` — all five | `59ebff4a22362086b9fcf426feba847b15b0dc7bf31b37892b1bfc7221b435dc` | 3655 | 24 x 40 = 960 |
+| C | `off_a`, `off_b`, `exact`, `coarse_a` — all four | `ff205260c1fa41a8cc10ad1b8fd0c29f40bd6a2324aa8a64f5192f62cedbd76b` | 4608 | 49 x 24 = 1176 |
+
+A and C hash to two different values, so the identity is not vacuous. On both, the
+OFF/OFF control passed FIRST (`IDENTICAL a_off_a == a_off_b`, `IDENTICAL c_off_a ==
+c_off_b`) and only then were the ON arms compared.
+
+### Result 3 — WORKLOAD B IS VOID, and the cause is a NEW DEFECT
+
+```text
+*** DIFFERS *** b_off_a vs b_off_b
+b_off_a  = 5973c5a10a6210085417fb25a29edbd0dc15fe61d7d4f774dd8ff3883dae1d64  bytes=2638
+b_off_b  = 4cf7923080db6aa29759537f2192f3d9500db11c0e8d72bbb2b4ac6e4614af7c  bytes=2650
+ids_b_off_a.json ids_b_off_b.json differ: char 2166, line 1
+```
+
+Both cells had `VT_CUDA_GRAPH_DEDUP` **unset** — this is the OFF/OFF control. One
+binary, one workload, greedy `--temperature 0 --seed 777`, 23 seconds apart
+(`20:57:42Z` and `20:58:05Z`), same captured sizes `16 8`, same 59 replays across 3
+slots. Different token ids.
+
+What the divergence is, read out of the artifacts rather than inferred: both runs emit
+`ids_requests=21 ids_total_tokens=672 empty_rows=0`, so **the token counts are
+identical** and the 2638-vs-2650 delta is JSON decimal width, not a truncation and not
+an early stop. Exactly two of the 21 rows differ, and both diverge mid-decode rather
+than at the first token — row 17 at token index 11, row 18 at token index 5. Rows 17
+and 18 sit in the ragged tail that `--num-prompts 21` at `--concurrency 16` leaves.
+
+**Consequence: B's `b_off_a == b_exact` and `b_off_a == b_coarse_a` lines are
+worthless**, because they compare against a baseline that does not reproduce itself.
+**B is VOID, not a pass.** Only the OFF/OFF control makes that visible; without it, B
+would have read as three more byte-identity confirmations. This is the second time on
+this row that a control, not a result, carried the finding.
+
+This is **not** a dedup defect — the feature is off in both cells that disagree — and
+it is not diagnosed here beyond what the evidence shows. Filed as
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283) with the hashes, the exact cell
+configuration, and an isolation plan: establish the rate over N repetitions; re-run with
+`VLLM_CPP_CUDAGRAPH=0` to separate the scheduler from the graph path; test the
+ragged-tail hypothesis with `--num-prompts` an exact multiple of `--concurrency`;
+compare per-step batch composition for the two diverging requests; and check the top-2
+logit margin at the divergence step, because a near-tie a reduction order can flip is a
+different defect from a wrong value.
+
+### Caveats — every one of these bounds the result above
+
+- **The toolkit is NOT the one the completed baseline ran on.** W5 built under nvcc
+  **`13.3.73`** (`### NVCC_RELEASE=13.3`); the completed baseline gate recorded in
+  `fe24a3029` ran under **`13.0.88`**, which is the version the recorded dgx gate stack
+  names. The pod's toolkit is a property of the shared pod, not of the job — the
+  16:43Z attempt on this same boot saw 13.0.88 and the 20:49Z run saw 13.3.73. The
+  OFF-vs-ON and EXACT-vs-COARSE comparisons **within this one binary** are valid.
+  **This run and that baseline are not directly comparable to each other.**
+- **Clocks were NOT pinned:** 2405 MHz current, 3003 MHz max, 2418 MHz applications,
+  53 °C, throttling `Disabled`. **No throughput number is claimed or implied.** The
+  `Benchmark duration` figures (2.52-2.72 s) and `replay branch avg` figures
+  (0.038-0.124 ms/step) in the logs are diagnostics, not measurements.
+- **No memory number either, and this one is not about the clocks.** Nothing in this
+  run measured bytes. The fold counts EXECUTABLES. What one `cudaGraphExec_t` costs on
+  this model, and therefore what 3→2 returns, is unmeasured on both keys.
+- **Load was not controlled**, only recorded: `loadavg_series_start=10.63 9.15 6.73`,
+  `loadavg_series_end=2.11 4.82 5.80`, falling monotonically across the series. Cell
+  order is fixed in the harness, so a load-correlated effect is not separable from a
+  cell-order effect here.
+- **Only the Qwen3 dense decode driver was exercised**, as in W4. Whether any other
+  capture site, or two models sharing the process-singleton registry, folds under
+  either key is untested.
+- **PR [#1232](https://github.com/mudler/vllm.cpp/pull/1232) is a DRAFT.** The coarse
+  key is behind `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`, default OFF, inside
+  `VT_CUDA_GRAPH_DEDUP`, itself default OFF. **Nothing on `main` folds today**, and
+  this entry must not be read as though it does.
+
+### Evidence
+
+`/mnt/nas_share/rc/dedup-key/` — `README.md` (the harness, its guards, and the
+2026-08-18T15:47Z VOID it was repaired after), `run.sh`, `build.sh`,
+`src-b48b51df1.tar`, `logs/` (configure, build, unit suites, binary and model sha256,
+nvcc version), `logs-ab/ab.log` and `logs-ab/run_<tag>.log` for all 13 cells, and
+`out-ab/ids_<tag>.json` for the token artifacts.
+
+### Next traceable hypotheses
+
+No ceiling and no floor is declared. **Owed:** the byte measurement that would price
+the fold, on pinned clocks; the probe cost at the bucket churn a real serving grid
+produces (7 or 11 buckets across nine capture drivers, not the 2-3 measured here); a
+second driver and a second CUDA release for the `refused=0` rate; landing #1232 before
+any of that, because the key it would default to is still a draft; and
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283), without which no future A/B on
+this row can use a ragged-tail workload shape.

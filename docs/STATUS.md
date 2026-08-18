@@ -516,8 +516,13 @@ no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with do
 pure mirror floor, and #149's dense half. Its memory and speed gates need a
 discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
 nothing, so those gates are blocked rather than pending
-[spec](../.agents/specs/weight-offload-uva.md)), and the full tool-calling
-template surface. **Muse Glimmer's
+[spec](../.agents/specs/weight-offload-uva.md)), the disk-residency tier as a
+config surface (`ENG-RESIDENCY-CONFIG` ACTIVE, #1110: mmap residency, prefault
+and the expert-stream lane are reachable from `--offload-config`'s `vllm_cpp`
+key, not only from `VT_*`, which keep working as overrides; env var beats config
+beats default; the 370 GiB reproduction through the JSON form is owed and needs
+GB10 [spec](../.agents/specs/weight-residency-config.md)), and the full
+tool-calling template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
 only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
 kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler

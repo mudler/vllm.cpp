@@ -523,8 +523,18 @@ ENGINE_PREFIXES = (
 # humans caught by reading during the 2026-08-13/14 campaign, all of them IN RANGE.
 # Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
 # parser, no baseline and no test exists yet.
+# 157 since 2026-08-17: +`ENG-RESIDENCY-CONFIG` (the host-RAM->DISK weight-residency
+# tier as a CONFIG surface -- a `vllm_cpp` extension key inside the existing
+# `--offload-config` document, reaching the loader through
+# `EngineParams::weight_residency`). Genuinely new, and not expressible by either
+# offload row it sits beside: `ENG-WEIGHT-OFFLOAD` owns the MIRRORED device->host
+# tier and may not grow a disk arm without breaking a 1:1 transcription of
+# `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming MECHANISM
+# rather than its configuration -- this row changes where a value comes from and
+# nothing about what it does. `ACTIVE`, spec `specs/weight-residency-config.md`,
+# issue #1110 (also fixes #1109 in flow).
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 160
+ENGINE_ROWS = 161
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

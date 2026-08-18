@@ -12,6 +12,8 @@
 //
 // Helpers (all in `vllm::dense_loaders`):
 //   MakeOwned            — allocate a zero-filled OwnedTensor of dtype+shape.
+//   ReadF32Scalar        — one per-tensor F32 scale, count and dtype CHECKED
+//                          (#1181): the six local copies of this disagreed.
 //   TransposeBf16        — bf16 [rows,cols] -> bf16 [cols,rows].
 //   LoadBf16Direct       — copy a BF16 tensor verbatim (optionally reshaped).
 //   LoadBf16Transposed   — BF16 [out,in] -> owned bf16 [in,out] (Matmul-B).
@@ -50,6 +52,69 @@ inline OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
   }
   o.bytes.resize(static_cast<size_t>(n) * vt::SizeOf(dt));
   return o;
+}
+
+// `[96, 40]`, `[8]`, `[]` -- the shape as a reader can compare it against a
+// checkpoint's own header.
+inline std::string ShapeString(const std::vector<int64_t>& shape) {
+  std::string s = "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i != 0) s += ", ";
+    s += std::to_string(shape[i]);
+  }
+  return s + "]";
+}
+
+// THE per-tensor f32 scale read. One implementation, because six hand-written
+// copies of it disagreed about what a scale is (issue #1181).
+//
+// UPSTREAM, at pin `555967922`. A per-tensor scale is not a raw tensor read
+// there, it is a parameter TYPE: `PerTensorScaleParameter`
+// (`vllm/model_executor/parameter.py:260-272`) asserts
+// `loaded_weight.shape[0] == 1` for any non-rank-0 scale before it copies
+// (`:304-309`), with the sibling shape assert in `_assert_and_load` at
+// `:93-96`. The slot is allocated `torch.float32`
+// (`layers/quantization/utils/fp8_utils.py:1276`), so `copy_` VALUE-converts a
+// narrower on-disk dtype and never reinterprets its bytes. And the declared
+// strategy -- TENSOR, CHANNEL or BLOCK -- picks the parameter type before a
+// byte is read (`compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py:63,128`),
+// so upstream never infers a scale's shape from its byte count. Both checks
+// below are that type's whole job on this side.
+//
+// WHY AN EXACT COUNT AND AN EXACT DTYPE, NOT A FLOOR. The previous bound was
+// `t.nbytes >= sizeof(float)`, and a floor admits every wrong answer that is
+// large enough. A block-wise grid `[ceil(N/128), ceil(K/128)]` passed and was
+// read as block (0, 0), which then stood in for the whole matrix. A
+// per-output-channel `[out] BF16` scale passed at two bytes an element and was
+// read as one float built from the first two entries. Neither raised anything,
+// because both produce a finite, plausible number, and a plausible wrong scale
+// yields fluent wrong tokens rather than a failure. That is the one defect
+// class a token gate cannot see.
+//
+// A NARROW DTYPE IS REFUSED RATHER THAN CONVERTED, deliberately. Upstream
+// converts, so conversion would be defensible, but no caller here can be shown
+// to need it: a one-element BF16 scale has never been read correctly on this
+// path, since the four-byte copy took two bytes of the scale and two bytes of
+// whatever followed it. The BF16 scale layout that IS published is
+// per-output-channel, which the count check refuses first whatever the dtype
+// rule says. Converting would be untested code on a path no checkpoint reaches.
+inline float ReadF32Scalar(const TensorResolver& get, const std::string& name) {
+  const StTensor& t = get(name);
+  int64_t numel = 1;
+  for (const int64_t d : t.shape) numel *= d;
+  VT_CHECK(numel == 1,
+           "dense loader: '" + name + "' ships shape " + ShapeString(t.shape) +
+               " (" + std::to_string(numel) +
+               " elements), not the ONE element a per-tensor scale is");
+  VT_CHECK(t.dtype == "F32",
+           "dense loader: '" + name + "' ships dtype " + t.dtype +
+               ", not the F32 a per-tensor scale is");
+  VT_CHECK(t.data != nullptr && t.nbytes == sizeof(float),
+           "dense loader: '" + name +
+               "' is a one-element F32 scale but does not carry 4 readable bytes");
+  float v = 0.0F;
+  std::memcpy(&v, t.data, sizeof(float));
+  return v;
 }
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].
@@ -372,15 +437,6 @@ inline OwnedTensor LoadMergedBf16Vector(const TensorResolver& get,
 // `alpha` is deliberately left 0 so `Nvfp4Weight::IsTrueW4A4()` is false and the
 // weight routes to the W4A16 (Marlin, bf16-activation) dispatcher.
 
-// Read a per-tensor f32 scalar (the CT global scales are 1-element F32 tensors).
-inline float ReadCtF32Scalar(const StTensor& t, const std::string& name) {
-  VT_CHECK(t.data != nullptr && t.nbytes >= sizeof(float),
-           "dense loader: scalar tensor too small for f32: " + name);
-  float v = 0.0F;
-  std::memcpy(&v, t.data, sizeof(float));
-  return v;
-}
-
 // True when `proj` is stored as a compressed-tensors NVFP4 linear. This is the
 // per-layer scheme probe: presence of `.weight_packed` means the config group
 // matched this Linear (vLLM resolves the same thing through `find_matched_target`
@@ -418,7 +474,7 @@ inline Nvfp4Weight LoadCtNvfp4W4A16(
                " carries input_global_scale (W4A4); the dense NVFP4 loader "
                "implements the WEIGHT-ONLY W4A16 scheme only");
   const float wgs_disk =
-      ReadCtF32Scalar(get(proj + ".weight_global_scale"), proj);
+      ReadF32Scalar(get, proj + ".weight_global_scale");
   VT_CHECK(wgs_disk != 0.0F,
            "dense loader: zero weight_global_scale (divisor) for " + proj);
 

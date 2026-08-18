@@ -102,25 +102,28 @@ reading is in "A relocated CUDA runtime starts on `thor:gpu0`" further down.
   SAME folder from `dgx` and from `thor`, and it is the one surface both ends
   can see. It is NOT shared with `orin`.
 
-**The consequence, and it is a blocker rather than an inconvenience.** The
-pinned oracle venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST,
-and a leased worker cannot see it. The dgx host has carried no toolchain since
-the 2026-08-14 reimage, so host-side oracle work needs `sudo -n docker run`
-against `vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached
-over `ssh`, which is the bypass. **No vLLM leg of any row can currently run on
-`dgx.casa` by a lease-compliant path, because nothing has staged a runtime on
-the NAS** ([#1129](https://github.com/mudler/vllm.cpp/issues/1129)). Read that
-reason carefully, because it is no longer the worker's missing toolchain. "The
-lease carries bytes, and the exec bit is a mount option" below measures staged
-content starting under the dynamic loader and after a copy to `/tmp`, so what
-blocks the oracle is that nothing has put a runtime where a lease can see it.
-That is why recent GPU work reached for `ssh`, and the bypass is a symptom of
-this gap rather than a discipline problem. Do not design the migration here.
-`ENV-LEASE-RUNTIME-STAGING` owns the design, and
-[`lease-runtime-staging.md`](specs/lease-runtime-staging.md) holds the working
-recipe. That recipe stages `torch` and `triton`, not the pinned oracle, and it
-ran on `thor:gpu0` and not here, so the sentence above still stands for
-`dgx.casa` today.
+**The consequence, and it is now narrower than a blocker.** The pinned oracle
+venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST, and a leased
+worker cannot see it. The dgx host has carried no toolchain since the 2026-08-14
+reimage, so host-side oracle work needs `sudo -n docker run` against
+`vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached over
+`ssh`, which is the bypass. **The sentence this paragraph used to carry, "no
+vLLM leg of any row can currently run on `dgx.casa` by a lease-compliant path",
+is FALSIFIED for the BUILD step and still holds for a MODEL RUN.** On 2026-08-18
+two `rc run` jobs built the pin from source inside a lease, installed the wheel,
+imported it, and reported `cuda True NVIDIA GB10`
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185), and "The pinned oracle
+builds inside a lease on `dgx:gpu0`" further down). Nobody has run a model that
+way, so no oracle-side MEASUREMENT is unblocked yet. Read the old reason
+carefully before you quote it, because it was never the worker's missing
+toolchain. "The lease carries bytes, and the exec bit is a mount option" below
+measures staged content starting under the dynamic loader and after a copy to
+`/tmp`. That is why recent GPU work reached for `ssh`, and the bypass is a
+symptom of this gap rather than a discipline problem. Do not design the
+migration here. `ENV-LEASE-RUNTIME-STAGING` owns the runtime staging, and
+[`lease-runtime-staging.md`](specs/lease-runtime-staging.md) holds its working
+recipe for `torch` and `triton`. `ENV-ORACLE-WHEEL-IN-LEASE` owns the oracle
+build, in [`oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md).
 
 **This confirms and extends a finding that already landed, rather than making a
 new one.** `.agents/specs/minimax-music3.md` §13.10 probed `thor`'s worker on
@@ -175,10 +178,11 @@ for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **Th
 and `gcc`. That is the section below.
 
 **This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
-not close it.** The pinned oracle stays unreachable because its virtual
-environment lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx host, which
-no lease can see, and only a host-side actor reached over `ssh` can place a copy
-on the NAS. **Whether a relocated CUDA runtime then starts is no longer
+not close it.** The HOST venv at `~/venvs/vllm-oracle-pin-555967922` stays
+unreachable from a lease, and only a host-side actor reached over `ssh` can
+place a copy of it on the NAS. That route is no longer the only one, because a
+lease BUILT the pin on 2026-08-18 rather than copying it
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)). **Whether a relocated CUDA runtime then starts is no longer
 UNMEASURED. It starts, on `thor:gpu0`.** The section below has the reading. A
 CUDA virtual environment still holds absolute paths in its shebangs and its
 `RECORD` files, so a `pip install --target` tree is the shape that was measured
@@ -222,12 +226,14 @@ export CPATH=/workspace/oracle-probe/pyhdr/python3.12:${CPATH:-}
 ```
 
 **Read the scope before you quote it.** This is `thor:gpu0` at capability (11,0)
-and nothing else. The GB10 is `sm_121a` and is UNMEASURED, so nothing here
-licenses a claim about the Spark. Only `torch`, `triton` and `numpy` are staged,
-so the pinned vLLM oracle is still not shown to run: it is a source build with
-compiled extensions and it needs `nvcc`, which the worker lacks. The torch wheel
-is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`, and that
-skew is recorded as observed rather than adjudicated.
+and nothing else. The GB10 is `sm_121a`, and this tree was never staged there,
+so nothing here licenses a claim about the Spark. Only `torch`, `triton` and
+`numpy` are in this tree, so the pinned vLLM oracle is not shown to run by it.
+The clause this paragraph used to carry, that the oracle "needs `nvcc`, which
+the worker lacks", is FALSIFIED: a `dgx:gpu0` lease built the pin against a
+staged CUDA toolkit on 2026-08-18, in the section after the next one. The torch
+wheel is `+cu130` while the staged `ptxas` reports `release 12.8, V12.8.93`, and
+that skew is recorded as observed rather than adjudicated.
 
 **A prebuilt wheel does not remove the `nvcc` requirement, and that is measured.**
 An aarch64 vLLM wheel exists in general: `pip download --no-deps vllm` on the
@@ -239,7 +245,51 @@ version that is not on PyPI. Four 404s under a per-commit URL scheme were also
 seen, and they prove nothing, because that scheme was never confirmed against a
 known-good case. So reproducing the pinned oracle needs a source build or a
 deliberate pin advance. Nobody established that vLLM never retains per-commit
-wheels.
+wheels. That source build was then run inside a lease and produced our own
+wheel, so the route this paragraph names is open.
+
+### The pinned oracle builds inside a lease on `dgx:gpu0`, measured 2026-08-18
+
+Two `rc run` jobs on `dgx:gpu0`. The pinned vLLM oracle builds from source,
+installs, imports, and sees the GPU inside a lease. No raw `ssh` was used, so
+the fleet reported the box as held for the whole window. The job details, the
+staged-script hashes, the four staging walls and the non-claims are in
+[`oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md)
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)).
+
+```
+HEAD             = 5559679229bc961848b121ccdeaa8fa5d79bec98   PIN CONFIRMED
+nvcc             = release 13.3, V13.3.73    NVCC_RC=0
+wheel            = vllm-0.1.dev1+g555967922.cu133-cp312-cp312-linux_aarch64.whl
+vllm.__version__ = 0.1.dev1+g555967922       IDENTITY_RC=0
+cuda True NVIDIA GB10                        CUDA_RC=0
+```
+
+The `nvcc` came from the CUDA toolkit that row `MODEL-NEMOTRON-H-ABI-A3-E2E`
+staged on the NAS. The build script asserts `HEAD` against the pin before it
+compiles anything, and it aborts when the two differ.
+
+**Read the scope before you quote it, because three things are UNMEASURED.**
+Running a model is untested: only the build, the install, the import and
+`torch.cuda.is_available()` were measured, and the recorded failure mode of the
+step after `torch.compile` on this host is a reboot of the box
+(`.agents/specs/mtp-k-gt-1.md`). The wheel reports `0.1.dev1+g555967922` while
+`.agents/upstream-sync.md` records
+`vllm_runtime_version = 0.23.1rc1.dev1511+g555967922`, an OPEN discrepancy whose
+cause is the shallow fetch that stops `setuptools_scm` counting the commits
+since the last tag. The virtual environment is NOT staged, because that job was
+killed at its 90-minute ceiling and its partial tree was removed, so only the
+WHEEL is durable.
+
+**Two staging traps are worth carrying forward.** A `cp -a` from the NAS
+preserves `file_mode=0664`, so `nvcc` exits 126, and CIFS `nounix` stores no
+symlink, so a copied CUDA toolkit loses `include`, `lib64` and 32 library links
+and CMake then reports
+`Could NOT find CUDA (missing: CUDA_INCLUDE_DIRS CUDA_CUDART_LIBRARY) (found version "13.3")`,
+which names the version and denies the toolkit in one line. **The `rc` worker
+container is REUSED between jobs**, so a repair inside a staging branch is
+skipped on the next run and reports `nvcc already in place`. Write an
+environment repair unconditionally, and assert its postcondition.
 
 ### The `flock` orphan hazard that motivated the replacement
 

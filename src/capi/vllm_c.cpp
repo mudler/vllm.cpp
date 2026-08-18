@@ -643,6 +643,16 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
           std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
         }
         ep.offload_config = std::move(off_cfg);
+        // ENG-RESIDENCY-CONFIG (#1110): the same string also carries the
+        // vllm.cpp-original `vllm_cpp` key (the host-RAM -> DISK residency tier).
+        // No new ABI field: one document holds both halves, exactly as the server
+        // flag does, so a library client gains the surface without an ABI bump.
+        // Refused HERE for the same reason the mirrored half is — a mistyped key
+        // is a CALLER error and must be INVALID_ARGUMENT before any model I/O, not
+        // a server quietly running this tier at its defaults.
+        vllm::WeightResidencyConfig res_cfg =
+            vllm::parse_weight_residency_extension_json(params->offload_config);
+        if (!res_cfg.empty()) ep.weight_residency = std::move(res_cfg);
       }
       // ABI v19: the multimodal input limits (#607 L2). Parsed HERE so a
       // malformed document is a CALLER error reported before any model I/O,

@@ -1112,6 +1112,23 @@ int VllmServerMain(int argc, char** argv) {
         std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
       }
       engine_params.offload_config = std::move(off_cfg);
+      // ENG-RESIDENCY-CONFIG (#1110): the SAME document also carries the
+      // vllm.cpp-original `vllm_cpp` key, which governs the tier BELOW vLLM's —
+      // weights borrowed out of the file mapping rather than moved to host RAM.
+      // Two parsers over one string, each reading only its own half, is what keeps
+      // `include/vllm/config/offload.h` a byte-faithful transcription of
+      // `vllm/config/offload.py` (which has no disk tier) while still giving the
+      // operator one flag for one concept.
+      //
+      // Parsed HERE, beside the mirrored half, for the same reason: a mistyped key
+      // costs a second rather than a full load. The extension REFUSES a key it
+      // does not know, which the mirrored parser does not do — and that refusal is
+      // load-bearing, because a silently ignored `{"vllm_cpp":{"mmapp":...}}`
+      // starts a server running this tier at its defaults and is discovered as an
+      // out-of-memory kill instead of an error.
+      vllm::WeightResidencyConfig res_cfg =
+          vllm::parse_weight_residency_extension_json(args.offload_config);
+      if (!res_cfg.empty()) engine_params.weight_residency = std::move(res_cfg);
     }
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The

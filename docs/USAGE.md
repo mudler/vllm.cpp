@@ -55,6 +55,15 @@ or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
 ### ROCm op coverage is incremental (and throws are by design)
 
+ROCm now also carries an **engine-level attention backend name**. Until #1056 the
+kernels were registered (`kPagedAttention`, `kReshapeAndCache`) but
+`RocmPlatform::get_attn_backend_priority` returned an empty list, so
+`SelectAttentionBackendName` had nothing to resolve for `kROCM` — ROCm was the
+only platform in that state. It now returns upstream's dense order verbatim, and
+`ROCM_ATTN` is registered against the NHD layout this tree uses. Nothing routes
+to that name until the runner asks for it (#1065), and no user-facing flag
+changes: this is what the engine picks, not something you select.
+
 The ROCm backend registers native ops family by family
 ([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
 the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal
@@ -550,6 +559,31 @@ The refusal is deliberate. Nothing is wrong with that checkpoint, and the
 missing arm is in this project. To run the same model here, use a per-tensor
 FP8, BF16, NVFP4, or GGUF checkpoint of it. Issue
 [#1166](https://github.com/mudler/vllm.cpp/issues/1166) tracks the port.
+
+### A per-tensor scale has to be one F32 number
+
+Every scale this build reads as a single number is required to be exactly one
+element and exactly `F32`. That covers `weight_scale`, `input_scale`,
+`weight_scale_2`, `weight_global_scale`, `input_global_scale`, `k_scale` and
+`v_scale`. A checkpoint that stores one of them as an array, or in a narrower
+dtype, is refused at load with a message naming the tensor, the shape it
+shipped, and the dtype it shipped:
+
+```text
+dense loader: 'model.layers.0.self_attn.q_proj.weight_scale' ships shape
+[12288, 1] (12288 elements), not the ONE element a per-tensor scale is
+```
+
+The two layouts this refuses in practice are per-output-channel FP8, which
+stores one scale per output row, and block-wise FP8, which stores a grid. Both
+used to load. The reader took the first four bytes and used them as the scale
+of the whole matrix, which is a finite plausible number and therefore fluent
+plausible wrong output rather than a failure. Issue
+[#1181](https://github.com/mudler/vllm.cpp/issues/1181) has the detail, and the
+per-output-channel arm itself is not implemented yet.
+
+`lm_head` is not affected. It has always read a per-output-channel scale
+correctly, as the table above records.
 
 ### Architectures that resolve but refuse to run
 
@@ -2198,7 +2232,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend, an unknown TOP-LEVEL key (the four legal ones are `offload_backend`, `uva`, `prefetch` and `vllm_cpp`) or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md). The same document also carries the **`vllm_cpp` key**, which governs the tier BELOW this one — weights borrowed out of the file mapping rather than moved to host RAM — and which is live rather than refused: see [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode). A `vllm_cpp`-only document does not enable vLLM's offload backends and is not subject to the refusal above |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
@@ -3801,6 +3835,104 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
   ./build/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
+
+### The same thing as config, and which one wins
+
+The residency knobs are also config keys, under the `vllm_cpp` key of
+`--offload-config` — the flag that already carries vLLM's weight-offload
+document. One flag covers both tiers: vLLM's own `uva`/`prefetch` keys move
+weights from the device to host RAM, and the `vllm_cpp` key governs the tier
+below that, where weights stay borrowed out of the file mapping.
+
+```sh
+./build/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+  --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
+                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+```
+
+| Key | Environment equivalent | Default |
+|---|---|---|
+| `vllm_cpp.mmap.enabled` | `VT_GGUF_MMAP` | on when weights stay quantized |
+| `vllm_cpp.mmap.prefault` | `VT_GGUF_PREFAULT` | on with mmap residency — **set it `false` for a model larger than memory** |
+| `vllm_cpp.expert_stream.enabled` | `VT_MOE_EXPERT_STREAM` | off |
+| `vllm_cpp.expert_stream.slots` | `VT_MOE_EXPERT_STREAM_SLOTS` | `64`; a real model wants thousands |
+| `vllm_cpp.expert_stream.slot_bytes` | `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | the largest gate/up/down slice of the first MoE layer reached |
+
+Every field is optional, and an absent field means unchanged, so an
+`--offload-config` without a `vllm_cpp` key behaves exactly as it did before this
+surface existed — with one difference, described below: a misspelled key is now an
+error rather than being ignored. The same C ABI field carries it:
+`vllm_model_params.offload_config` is one string holding both halves, so a library
+client needs no new field.
+
+**A second engine in one process is legal.** "Absent means unchanged" applies to the
+install as well as to the parse: a later document is merged field by field over the
+installed one, so `{"vllm_cpp":{"mmap":{"enabled":true}}}` on a second engine changes
+`mmap` and leaves the first engine's `expert_stream` and slot count alone. Only two
+things cannot be changed once a model has used them — whether expert streaming is on,
+which is cached the first time it is asked, and the slot store's `slots x slot_bytes`
+reservation, which is fixed when the store is built. A document that would change
+either is refused at startup, naming the field and the value in force; a document that
+omits it, or asks for exactly what is in force, is accepted.
+
+**Precedence is `environment variable > config > built-in default`**, and it is
+deliberate: the `VT_*` variables exist so a benchmark arm is switchable without
+restarting the server with a new document, so `VT_MOE_EXPERT_STREAM=0` beats a
+config `"enabled": true`. The engine prints one line at startup naming the fields
+of the document it installed, and a second naming every variable that would win
+over one of them, because a configuration silently overridden by something
+exported weeks ago is the one way this precedence hurts. The first line reports
+what was ASKED FOR, not what the engine resolves: the streaming answer is cached the
+first time it is asked, so resolving it at startup would move that decision ahead of
+the weight load. That constraint binds `expert_stream` alone — `prefault` and `slots`
+could be resolved at startup, and `mmap` and `slot_bytes` need a built-in default only
+their caller knows — and the line reports the document for all five so it reports one
+kind of thing rather than a mixture. Read the two lines together: `expert_stream=on`
+beside `VT_MOE_EXPERT_STREAM (expert_stream) OVERRIDES` means the document said on and
+the variable decides.
+
+**Where the config form reaches, and where it does not.** It reaches the
+generate/chat server path (`vllm-server`) and the C ABI's
+`vllm_model_params.offload_config`, which is the whole of the library surface. It
+does NOT reach `vllm-cli`, nor the server's pooling/embedding and
+transcription-only paths, which build their engine parameters without the offload
+document at all — the mirrored `uva`/`prefetch` half is dropped there too, and has
+been since before this key existed. On those three, use the environment form
+above. Recorded under `## Owed` in
+[`.agents/specs/weight-residency-config.md`](../.agents/specs/weight-residency-config.md)
+with [#1135](https://github.com/mudler/vllm.cpp/issues/1135).
+
+**A misspelled key is refused at startup, not ignored — at every level of the
+document.** vLLM's own parser ignores a key it does not recognise, which is what
+lets this extension share the flag, and it is also what would make
+`{"vllm_cpp":{"mmapp":…}}` or `{"vllm-cpp":{…}}` start a server that quietly does
+not borrow its weights, discovered later as an out-of-memory kill. The hyphenated
+spelling is the likeliest typo of all, because every flag around it is hyphenated.
+So the whole document is enumerated and the offender is named:
+
+```text
+offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream)
+offload config: unknown key "vllm-cpp" (expected one of: offload_backend uva prefetch vllm_cpp)
+offload config: unknown key "uva.cpu_offload_GB" (expected one of: cpu_offload_gb cpu_offload_params)
+```
+
+Every level means every level, the mirrored sub-objects included. The enumeration once
+stopped at the top level and inside `vllm_cpp`, which left the same hole one step down:
+`{"uva":{"cpu_offload_GB":10}}` started a server with a 0 GiB offload budget the
+operator believed was set.
+
+The four legal top-level keys are `offload_backend`, `uva`, `prefetch` and
+`vllm_cpp` — vLLM's three plus this extension — so a typo in the mirrored half
+(`uvaa`, or `cpu_offload_gbb` inside it) is refused on the same terms. Refusing is what upstream does with its own
+JSON config flags: vLLM builds its config dataclasses with a decorator that sets
+`ConfigDict(extra="forbid")` (`vllm/config/utils.py:68-69`), which is why
+`--kv-transfer-config` refuses an unknown key — and upstream has no
+`--offload-config` at all, so no upstream-legal document is refused by this.
+
+`VT_MOE_EXPERT_STREAM_STATS_EVERY` is **not** a config key, by decision: it
+changes only how often the statistics line below is printed, so it is the
+instrument rather than the configuration, and the config surface refuses it as an
+unknown key rather than accepting and dropping it.
 
 It applies to CPU keep-quant expert towers. On a device platform the expert
 slice is already device-resident and is served unchanged, and turning streaming

@@ -312,6 +312,35 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].path.name, "engine-matrix.md")
 
+    def test_residency_config_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #1110 row and its 157 -> 158 bump are one semantic change.
+
+        Same shape as the #117, #606, #633 and #632 assertions above, and owed for
+        the same reason: the bump is the whole of what
+        `scripts/check-agent-record.py` changed for this row, so without an
+        assertion naming the row the constant is the only artifact and 158 is
+        plausible rather than checkable. That is exactly the state the
+        `governance_checker` evidence contract in `scripts/check-pr-size.py`
+        refuses, and it refused this row's first commit by name.
+
+        The pin is also the only mechanical statement available about WHERE this
+        row belongs. It sits between two offload rows that could each plausibly
+        have absorbed it -- `ENG-WEIGHT-OFFLOAD` owns the mirrored device-to-host
+        tier and cannot grow a disk arm without breaking a 1:1 transcription of
+        `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming
+        mechanism rather than its configuration -- so "a genuinely new row" is a
+        claim, and naming it here is what makes the claim fail if the row is ever
+        folded into a neighbour without the count following.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        found = [row for row in rows if row.item_id == "ENG-RESIDENCY-CONFIG"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].path.name, "engine-matrix.md")
+
     def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
         """373 needs BOTH rows named, because the merge that produced it collided.
 

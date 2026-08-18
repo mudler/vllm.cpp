@@ -39,6 +39,7 @@
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/config/offload.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/runner.h"
@@ -168,6 +169,21 @@ struct EngineParams {
   // offloading == the byte-identical engine. Validated at construction; the
   // offloader that consumes it is W2/W5, so today this is recorded and inert.
   std::optional<vllm::OffloadConfig> offload_config = std::nullopt;
+
+  // ENG-RESIDENCY-CONFIG (#1110): the host-RAM -> DISK residency tier, parsed out
+  // of the `vllm_cpp` key of the SAME `--offload-config` document `offload_config`
+  // above comes from. Absent (default) == every knob resolves from the environment
+  // and its built-in default, i.e. the byte-identical engine.
+  //
+  // It is a SEPARATE field rather than an arm of `OffloadConfig` because that
+  // struct is a 1:1 transcription of `vllm/config/offload.py` and upstream has no
+  // disk tier — see include/vllm/config/weight_residency.h for the whole argument,
+  // the schema, and the env-beats-config precedence.
+  //
+  // FromModelDir installs it in its FIRST statement block, ahead of every path,
+  // config and weight operation, because each knob it feeds is read through a
+  // static that latches on first use.
+  std::optional<vllm::WeightResidencyConfig> weight_residency = std::nullopt;
 
   // SPEC-MTP I5d-pre: opt-in speculative-decoding configuration. Empty/absent
   // (default) == NO speculation == byte-identical production engine (mirrors

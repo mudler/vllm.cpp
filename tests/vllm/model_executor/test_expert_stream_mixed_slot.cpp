@@ -26,6 +26,7 @@
 #include <cstring>
 #include <vector>
 
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -50,7 +51,13 @@ namespace {
 struct EnableExpertStreaming {
   EnableExpertStreaming() {
     ::setenv("VT_MOE_EXPERT_STREAM", "1", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "64", 1);
+    // 96, NOT the default 64, and that matters: with 64 the value is
+    // indistinguishable from the site ignoring the variable entirely. MEASURED
+    // (ENG-RESIDENCY-CONFIG, #1110) — with the slot-count site mutated to a
+    // hardcoded 64, so that `VT_MOE_EXPERT_STREAM_SLOTS=8000` would silently stop
+    // working, this suite and test_gguf_expert_span both stayed green. A knob no
+    // test can distinguish from its default is not covered.
+    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "96", 1);
     // DELIBERATELY NOT SET: VT_MOE_EXPERT_STREAM_SLOT_BYTES. The whole point is
     // to let the store size itself, which is where the defect lives.
     ::unsetenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
@@ -356,4 +363,12 @@ TEST_CASE("a UD-shaped model streams: the slot fits the LARGEST slice, not the f
   CHECK(s.fills > 0);
   CHECK(s.steps == 1);
   CHECK(s.exhausted == 0);
+
+  // ...with the geometry the RESOLVERS produced. `slots` is the non-default 96 set
+  // above, which is what makes this an assertion about the knob rather than about
+  // the default, and `slot_bytes` is the LARGEST slice — the thing this case exists
+  // for — rather than the gate slice that arrives first.
+  const vllm::ExpertStreamGeometry geom = vllm::BuiltExpertStreamGeometry();
+  CHECK(geom.slots == 96);
+  CHECK(geom.slot_bytes >= static_cast<int64_t>(down_slice));
 }

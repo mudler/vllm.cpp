@@ -8,6 +8,7 @@
 // .agents/specs/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
 // .agents/specs/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
 // .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
@@ -5146,11 +5147,28 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
 // Whether the operator ASKED for streaming, independent of whether a store has
 // been built yet. The grouped-MoE gate needs this before any expert is touched.
 inline bool Qwen35ExpertStreamRequested() {
-  static const bool on = [] {
-    const char* v = std::getenv("VT_MOE_EXPERT_STREAM");
-    return v != nullptr && v[0] != '0' && v[0] != '\0';
-  }();
-  return on;
+  // ENG-RESIDENCY-CONFIG (#1110): the answer now comes from
+  // `ResolveExpertStreamRequested()`, which holds `VT_MOE_EXPERT_STREAM` >
+  // `--offload-config`'s `vllm_cpp.expert_stream.enabled` > OFF, and which keeps
+  // this knob's ODD environment rule verbatim: only the FIRST CHARACTER is
+  // examined, so `VT_MOE_EXPERT_STREAM=false` is ON. That is what
+  // docs/ENVIRONMENT.md documents, so it is transcribed rather than normalised
+  // onto the tree's whole-value polarity.
+  //
+  // The answer is still cached on first call, and that is deliberate — it decides
+  // whether an ~18 GiB slot store is built and whether the default-on grouped-MoE
+  // path is disabled, and those two must not be able to disagree later in the same
+  // process. The function-local static lives in `ResolveExpertStreamRequested`, not
+  // here; this is a pure delegation.
+  //
+  // That cached answer is why `SetWeightResidencyConfig` refuses a config that would
+  // CHANGE it — not one that arrives late. A document that omits `expert_stream`, or
+  // asks for exactly what was decided, or that the environment overrides anyway, is
+  // accepted; only one that would make this function's answer differ from the value
+  // already returned is refused, because recording that would publish a
+  // configuration the engine is not running. The loader installs in `FromModelDir`'s
+  // first block, ahead of all weight I/O, so the ordering holds by construction.
+  return ResolveExpertStreamRequested();
 }
 
 class Qwen35ExpertStream {
@@ -5437,22 +5455,35 @@ class Qwen35ExpertStream {
   }
 
   explicit Qwen35ExpertStream(size_t slot_bytes) {
-    const char* sb = std::getenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
-    if (sb != nullptr && *sb != '\0') {
-      const long long v = std::atoll(sb);
-      if (v > 0) slot_bytes = static_cast<size_t>(v);
-    }
-    int32_t slots = 64;
-    const char* sv = std::getenv("VT_MOE_EXPERT_STREAM_SLOTS");
-    if (sv != nullptr && *sv != '\0') {
-      const long v = std::atol(sv);
-      if (v > 0) slots = static_cast<int32_t>(v);
-    }
+    // ENG-RESIDENCY-CONFIG (#1110): both sizes resolve through the shared
+    // resolvers, which hold env var > `--offload-config`'s
+    // `vllm_cpp.expert_stream.{slots,slot_bytes}` > the default, and which keep
+    // the tolerant integer parsing this constructor already had (atoll, then
+    // ignore anything non-positive) so an environment-only run is unchanged. The
+    // CONFIG side is stricter: a zero or negative value is refused at startup,
+    // where the operator can still read the message, rather than silently becoming
+    // the default.
+    //
+    // `slot_bytes`' default is the caller's computed maximum, not a constant, so it
+    // is passed in rather than duplicated here.
+    slot_bytes = static_cast<size_t>(
+        ResolveExpertStreamSlotBytes(static_cast<int64_t>(slot_bytes)));
+    const int32_t slots = static_cast<int32_t>(ResolveExpertStreamSlots());
+    // STATS_EVERY stays environment-only, and that is a decision rather than an
+    // oversight: it changes only how often the line below is printed, so it is the
+    // instrument and not the configuration. `--offload-config` refuses it as an
+    // unknown key rather than accepting and dropping it.
     const char* se = std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY");
     if (se != nullptr && *se != '\0') {
       const long v = std::atol(se);
       if (v >= 0) stats_every_ = static_cast<int64_t>(v);
     }
+    // Record the geometry this store was actually built with. It is the only way
+    // a test can tell that the two resolvers above were consulted: the values are
+    // otherwise visible only on a stderr line, and a site that hardcoded the
+    // default would leave every existing suite green.
+    NoteExpertStreamGeometry(static_cast<int64_t>(slots),
+                             static_cast<int64_t>(slot_bytes));
     store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
     cache_ = std::make_unique<ExpertSlotCache>(slots);
     streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);

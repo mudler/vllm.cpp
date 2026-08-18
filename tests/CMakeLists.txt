@@ -1717,6 +1717,11 @@ vllm_cpp_add_test(test_ops_fp8_cpu vt/test_ops_fp8_cpu.cpp)
 # quant. CPU-gateable by construction; its CPU-vs-CUDA byte-identity arm (G6) is
 # CUDA-gated and reports PENDING rather than skipping where no device exists.
 vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.cpp)
+# VT-MATMUL-FP8-BLOCK-REF (#1189 M2): the 128x128 block-scaled fp8 GEMM, CPU
+# reference arm — the numerical oracle every later block-fp8 kernel is measured
+# against. Its G4 holds the constraint the row exists for: the scales apply in
+# the MAINLOOP, once per K-block, which an epilogue-folded alpha cannot express.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu.cpp)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the

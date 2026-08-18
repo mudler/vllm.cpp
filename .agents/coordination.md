@@ -2219,6 +2219,18 @@ list of what the project supports.
   request-compaction-safe device token map, not retune FA2 blindly or delete
   the synchronization without preserving row identity.
   Evidence: [2026-07-25 4B repair](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
+  **That next-owner directive is SUPERSEDED, 2026-08-12
+  ([#527](https://github.com/mudler/vllm.cpp/issues/527)) — the checkpoint text
+  above is left as written, but do not act on it.** The
+  request-compaction-safe device token map landed two days later in `deed7c2a1`
+  (2026-07-27, runner-owned device buffers + `LaunchApplyLastSampledOps` replaying
+  condense's row edits on-device) and is DEFAULT ON since `1718bf155`
+  (2026-08-05); the wait it was meant to repair does not exist on the benchmarked
+  path, because `vllm-bench` drives the synchronous `LLMEngine::step()` and never
+  enters `sample_tokens_async` — `deed7c2a1` records that refutation of the
+  497-`cudaStreamSynchronize` attribution itself. The exact series was rerun
+  through 2026-08-09 (**1.0283x PASS** on throughput). The row's live plan is
+  [the sm_120 Pareto campaign](specs/sm120-qwen35-pareto-2026-08-09.md).
 
 **DFlash D14 note (2026-07-27, `CLAIM-DFLASH-D14`, GPU-GATED on dgx, SPEED GATE MET → `SPEC-DFLASH` DONE, NOT pushed — FULL SHA reported to caller).** Closes `SPEC-DFLASH` (engine-matrix row `SPEC-DFLASH` + kernel-matrix `KERNEL-ATTN-DFLASH-PAGED-BLOCK` + model-matrix `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm`) → `DONE`. Base `origin/main` `4657f6f3`, isolated worktree `/home/mudler/_git/wt-dflash-d14` (branch `dflash-d14`); dgx reused tree `~/work/dflash-d12/tree/build-cuda`, one `flock $HOME/gpu.lock`. An nsys of the graphed spec-on step attributed the D13 ~2% residual to the from-scratch draft-attention kernel; ported it to a WARP-scoped online-softmax variant (`DFlashPagedBlockAttentionWarpKernel`, 3.1× faster) → our-ON graphed 29.32 ≥ vLLM-ON graphed 29.240 (non-overlapping 3-rep bands, 1.003×). Correctness UNCHANGED (27/27 graph==eager, acceptance 19/39/29/25, 1629 accepted identical warp-vs-block, CUDA==CPU 795648/795648 + sanitizer 0); inertness SACRED 235/235 + MTP 9/9. **Owned files ONLY:** `src/vt/cuda/cuda_ops.cu` (additive: `DFlashPagedBlockAttentionWarpKernel` + `UseDflashAttnBlockKernel` + a launcher branch; the D12 block kernel retained under `VT_DFLASH_ATTN_BLOCK=1`) + the record surfaces (spec §0 D14 RESULT, engine-matrix, kernel-matrix, model-matrix + checklist rollup, roadmap, ledger, state, this note, README, `docs/BENCHMARKS.md`). **EXPLICIT NON-COLLISION:** does NOT touch the causal `kAttention`/`kPagedAttention`, any non-DFlash op, the runner, or the models — the warp kernel is reached ONLY via `DFlashPagedBlockAttention` (DFlash draft path). Roadmap's FINAL open speed item; SPEC-DFLASH is now correctness-complete AND at/above vLLM throughput.
 

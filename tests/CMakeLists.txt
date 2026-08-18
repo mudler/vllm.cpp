@@ -1722,6 +1722,16 @@ target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_
 # in cuda_gdn.cu and is covered by same-process byte-exact CUDA comparisons.
 vllm_cpp_add_test(test_gdn_decode_fused vt/test_gdn_decode_fused.cpp)
 target_include_directories(test_gdn_decode_fused PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier REDUCTION-ORDER contract for the single-warp MoE router top-k
+# (VT_MOE_ROUTER_WARP, default ON; spec moe-router-topk-single-warp.md, #378).
+# The claim is that the lane map `expert = lane + 32*slot` plus a per-lane
+# halving tree performs the bit-identical float additions as the incumbent
+# 256-thread block reduction in src/vt/cuda/cuda_moe.cu -- pure IEEE-754, so it
+# is provable with no GPU and no nvcc. Reaches the CUDA-free map/tree/selector
+# header under src/; the executing kernel is covered on-device by the
+# parallel-vs-serial byte-exactness case in test_ops_moe_grouped.
+vllm_cpp_add_test(test_moe_router_warp_map vt/test_moe_router_warp_map.cpp)
+target_include_directories(test_moe_router_warp_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load
 # fast-path flags (VT_FP4_QUANT_FAST + VT_SILU_FP4_FAST, both default OFF /
 # '1'-opt-in). Reaches the internal header under src/ (not public API); the
@@ -1842,6 +1852,13 @@ add_test(NAME test_ops_fp8_alpha_vec_epilogue_on
 set_tests_properties(test_ops_fp8_alpha_vec_epilogue_on PROPERTIES
   ENVIRONMENT "VT_FP8_ALPHA_VEC_EPILOGUE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
+# Reaches the CUDA-free VT_MOE_ROUTER_WARP selector header under src/, through
+# the shared test-only pin tests/vt/moe_router_warp_env.h: the parallel-vs-serial
+# router case PINS that toggle both ways and ASSERTS the pinned state, so it can
+# no longer degenerate to block-vs-serial when the ambient environment says 0
+# (spec moe-router-topk-single-warp.md §9, #378). Same include pattern as
+# test_moe_router_warp_map above, which executes that pin without a GPU.
+target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)

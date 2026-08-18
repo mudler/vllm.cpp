@@ -5240,6 +5240,34 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   pa_args.max_seq_len = meta.max_seq_len;
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
+  // VT_DUMP_ATTN (issue #41, 0.8B ROCm divergence spike W1/W2): dump the
+  // full-attn block's internals per full-attn-layer call index (0-based), as
+  // raw little-endian dumps under $VT_DUMP_ATTN/fa<k>_{qkv,q,attn,gate}.bin.
+  // Inert when unset; the Downloads sync, so never set on a graph path.
+  static thread_local int64_t dump_fa_idx = -1;
+  dump_fa_idx++;
+  if (std::getenv("VT_DUMP_ATTN") != nullptr) {
+    auto DumpT = [&](const char* stage, const Tensor& t) {
+      int64_t n = 1;
+      for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
+      const size_t es = vt::SizeOf(t.dtype);
+      // contiguous check: innermost stride 1 and packed
+      std::vector<uint8_t> raw(static_cast<size_t>(n) * es);
+      DBuf tmp(d, t.dtype, {n});
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ATTN")) +
+                               "/fa" + std::to_string(dump_fa_idx) + "_" +
+                               stage + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    };
+    DumpT("qkv", qgate);
+    DumpT("q", qn3);
+    DumpT("attn", dattn.t());
+    DumpT("gate", gatef.t());
+  }
+
   // Sigmoid output gate, folded into the o_proj activation quant on the true-W4A4
   // path (§5) — see SigmoidGateOProjD.
   return SigmoidGateOProjD(d, Reshape(dattn.t(), {T, Hq * Dh}),
@@ -7206,9 +7234,27 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
+  // VT_DUMP_ACT layer index: the paged loop's per-layer counter (0-based), used
+  // by the sub-stage dump below. Declared per-process; only the dump reads it.
+  static thread_local int64_t dump_layer_idx = -1;
+  dump_layer_idx++;
+  const bool dump_sub = std::getenv("VT_DUMP_ACT_SUB") != nullptr;
+  auto DumpStage = [&](const char* stage, DBuf& buf) {
+    if (!dump_sub) return;
+    std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                             vt::SizeOf(buf.t().dtype));
+    buf.Download(d, raw.data());
+    const std::string path = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                             "/layer_" + std::to_string(dump_layer_idx) + "_" +
+                             stage + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+  };
+
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_input_norm", dhn);
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -7221,12 +7267,15 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
                               *attn_kv, T);
   }();
+  DumpStage("block_out", attn);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_attn_norm", dh2);
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DumpStage("mlp_out", hidden);
 }
 
 // ── Qwen3.5/3.6 MTP head shared preamble (SPEC-MTP I5c). ────────────────────
@@ -8698,6 +8747,24 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
+    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1): dump
+    // the residual stream after each layer as raw little-endian bf16 to
+    // $VT_DUMP_ACT/layer_<l>.bin (inert when unset; a debug hook, never the
+    // hot path — the Download forces a sync, so capture-graph paths must not
+    // set the env).
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(hidden.t().dtype));
+      hidden.Download(d, raw.data());  // Copy + Synchronize
+      const char* dir = std::getenv("VT_DUMP_ACT");
+      const std::string path =
+          std::string(dir) + "/layer_" + std::to_string(l) + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) {
+        std::fwrite(raw.data(), 1, raw.size(), f);
+        std::fclose(f);
+      }
+    }
   }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.

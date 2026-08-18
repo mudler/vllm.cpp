@@ -227,8 +227,9 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
   // not against CUDA's — identical anchor+band logic, device-appropriate goldens.
   const vt::DeviceType run_dev = loaded->runner().device().type;
   const bool metal = run_dev == vt::DeviceType::kMETAL;
+  const bool rocm = run_dev == vt::DeviceType::kROCM;
   const bool tenstorrent = run_dev == vt::DeviceType::kTENSTORRENT;
-  const bool device_golden = metal || tenstorrent;
+  const bool device_golden = metal || tenstorrent || rocm;
   // The forward + greedy ops Qwen3-dense dispatches on the DEFAULT
   // (VT_QWEN3_ROPE_CACHE) path. kRopeCosSinCache + kRopeFromCache are the M3b
   // additions (build the per-step cos|sin cache, then apply it); the rest are
@@ -252,7 +253,7 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     }
     vt::EnableOpProviderCallStats(true);
     MESSAGE(label << ": running on device type " << static_cast<int>(run_dev)
-            << " (2=METAL, 6=TENSTORRENT) — gated against this device's OWN "
+            << " (2=METAL, 5=ROCM, 6=TENSTORRENT) — gated against this device's OWN "
                "oracle-backed golden");
   }
 
@@ -261,9 +262,13 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
   const int32_t* anchor_ids = od;   // hard anchor for THIS device
   const int32_t* gap_ids = gapd;    // vLLM teacher-forced gaps for THIS device
   parity::NpyArray o_dev, gap_dev;  // keep device arrays alive for the loop
-  const char* ids_name = metal ? "our_ids_metal.npy" : "our_ids_tenstorrent.npy";
+  const char* ids_name =
+      metal ? "our_ids_metal.npy"
+            : (rocm ? "our_ids_rocm.npy" : "our_ids_tenstorrent.npy");
   const char* gap_name =
-      metal ? "neartie_gap_mnats_metal.npy" : "neartie_gap_mnats_tenstorrent.npy";
+      metal ? "neartie_gap_mnats_metal.npy"
+            : (rocm ? "neartie_gap_mnats_rocm.npy"
+                    : "neartie_gap_mnats_tenstorrent.npy");
   bool bootstrap_only = false;
   if (device_golden) {
     const bool have_dev = fs::exists(gdir / ids_name) && fs::exists(gdir / gap_name);
@@ -272,7 +277,7 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       // qwen3-neartie-gap.py then teacher-forces vLLM on that sequence.
       bootstrap_only = true;
       MESSAGE(label << ": BOOTSTRAP dump (device golden absent) for "
-              << (metal ? "Metal" : "Tenstorrent") << "...");
+              << (metal ? "Metal" : (rocm ? "ROCm" : "Tenstorrent")) << "...");
     } else {
       REQUIRE_MESSAGE(have_dev,
                       label << ": device oracle golden absent (" << ids_name << " / "
@@ -402,7 +407,8 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
   if (dump) {
     const std::string dump_name =
         tenstorrent ? "our_ids_tenstorrent.i32"
-                    : (metal ? "our_ids_metal.i32" : "our_ids.i32");
+                    : (metal ? "our_ids_metal.i32"
+                             : (rocm ? "our_ids_rocm.i32" : "our_ids.i32"));
     const std::string path = (gdir / dump_name).string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f != nullptr) {

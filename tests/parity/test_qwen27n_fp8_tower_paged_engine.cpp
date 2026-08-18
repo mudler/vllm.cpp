@@ -92,7 +92,10 @@ namespace {
 // Qwen3.6-27B has 48 GDN (`linear_attention`) layers. One merged FP8 qkvz GEMM
 // per layer on the default arm; two split GEMMs per layer on the
 // VT_GDN_MERGED_QKVZ_FP8=0 rollback.
-constexpr uint64_t kGdnLayers = 48;
+// [[maybe_unused]]: the uses below live behind the CUDA-only fp8-tower arms;
+// on a HIP-only build they compile out and the constant would be an
+// -Wunused-const-variable error under clang/hipcc.
+[[maybe_unused]] constexpr uint64_t kGdnLayers = 48;
 
 // Snapshot dir of the FP8-tower 27B, or "" to refuse. Pinned to the revision
 // its goldens were captured against; a cache holding some other revision of the

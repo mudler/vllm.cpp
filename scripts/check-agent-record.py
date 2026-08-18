@@ -567,8 +567,18 @@ ENGINE_PREFIXES = (
 # in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
 # whose only caller is a test, and that refusal becomes reachable production code the
 # moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
+# 165: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
+# container image and no release archive can obtain a checkpoint: the runtime
+# stage carries no Python and no `curl`, while `docker/Dockerfile:188-192`
+# already sets `HF_HOME=/cache` and declares the `/cache` volume for a fetch
+# that does not exist. The row is not a duplicate of `LOAD-SAFETENSORS` or
+# `LOAD-GGUF`, which both start from bytes already on disk, and it is not
+# `LOAD-CONFIG-SURFACE`, which parses a flag it never resolves. The one adjacent
+# implementation, `model_loader.cpp:279-303`, reads an existing cache for the
+# DFlash draft alone and never downloads. `READY`, spec
+# `specs/hf-model-download.md`, issue #1280.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 164
+ENGINE_ROWS = 165
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

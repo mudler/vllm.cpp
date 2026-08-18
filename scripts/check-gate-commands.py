@@ -375,7 +375,20 @@ def audit() -> list[dict]:
 # session did not have, so it is carried under the spec's `## Owed` rather than
 # reported as run, and the CUDA leg's compile rests on the `cuda-fat-build` CI
 # job. Growth, so the set is re-pinned in the same change.
+# 2026-08-18: +ENG-HF-MODEL-DOWNLOAD. A NEW row arriving at READY (issue #1280),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `scripts/validate-container-image.py`, which boots the image and asserts the
+# failure for an unknown repository is an HTTP 404 from the hub rather than the
+# message that names the build options. That distinction is the point: a symbol
+# check passes on a build where `VLLM_CPP_HF_DOWNLOAD` resolved OFF, so the
+# container gate is the only instrument that separates a working TLS build from
+# a silently disabled one. The section also records what the runnable gates do
+# NOT cover: the hermetic suite speaks plain hypertext transfer protocol, so it
+# proves nothing about transport layer security, and the second instrument is an
+# opt-in online test that does not run in the default lane. Growth, so the set
+# is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-HF-MODEL-DOWNLOAD",
     "ENG-RESIDENCY-CONFIG",
     "ENG-CUDAGRAPH-DEDUP",
     "SPEC-MTP-K-GT-1",

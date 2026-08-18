@@ -2228,6 +2228,9 @@ TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
         dev.DestroyQueue(q);
       }
     }
+  }
+}
+
 TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
   // The "paged attention" case above hand-builds a contiguous KV cache; the
   // real model path writes it with ReshapeAndCache and reads it back. This

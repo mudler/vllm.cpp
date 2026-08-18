@@ -1035,6 +1035,12 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
            "NemotronH device mamba: this device has no static per-tensor fp8 "
            "activation quant, so the FP8 W8A8 arm cannot run (issue #960)");
 
+  // `ResidentIn` locks only the slot's creation, and the build below runs
+  // outside that lock -- the same shape `NemotronHMoeBlockDevice` has for its
+  // arena. Two threads entering one layer for the first time would both build.
+  // Nothing in this tree drives one model's forward from two threads, and
+  // diverging from the arena's idiom here would be an unrelated change; stated
+  // rather than silently inherited.
   NemotronHMambaDeviceResident& mr =
       ResidentIn<NemotronHMambaDeviceResident>(w.device_fp8);
   BuildNemotronHMambaDeviceResident(d, w, params, adt, mr);

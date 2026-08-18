@@ -99,6 +99,28 @@ inline bool GraphDedupEnabled() {
   return enabled;
 }
 
+// VT_CUDA_GRAPH_DEDUP_COARSE_KEY — the second knob, and the one under measurement by
+// issue #1226. Default OFF, so the shipped key is exactly the one the 2026-08-18 device
+// gate ran and the two are a same-binary A/B rather than two builds. Which fields the
+// coarse key drops, and why `sharedMemBytes` and the memcpy kind are kept rather than
+// swept in, is argued at length in `vt/graph_dedup_signature.h` beside the functions that
+// implement it. Same polarity function as above: anything that is not exactly "1" is off,
+// stated once so the two knobs cannot drift apart.
+//
+// THE LINE THIS PRINTS IS EVIDENCE, not decoration. A coarse-key run that folds nothing
+// is indistinguishable from a run where the flag never reached the process, and that
+// ambiguity is exactly what makes an A/B void. The mode is announced once, on the first
+// signature computed, which is also the proof that a signature was computed at all.
+inline bool GraphDedupCoarseKeyEnabled() {
+  static const bool enabled = [] {
+    const bool on = GraphDedupEnabledFor(std::getenv("VT_CUDA_GRAPH_DEDUP_COARSE_KEY"));
+    std::fprintf(stderr, "vt graph dedup: key mode = %s\n",
+                 on ? "COARSE (launch dimensions and extents dropped)" : "EXACT");
+    return on;
+  }();
+  return enabled;
+}
+
 // Owns every captured raw graph handed to it and every executable it instantiates.
 // Register returns the opaque handle the vt seam's void* contract already promises; the
 // backend routes ReplayGraph / DestroyGraph back here for the handles Owns() claims, and
@@ -167,8 +189,17 @@ class GraphDedupRegistry {
       // Mirrors SGLang's "captured %d CUDA graphs, deduped to %d execs"
       // (cuda_graph_dedup_mixin.py:358). Emitted per registration rather than once at
       // the end because there is no end: see the capture-phase note at the top.
-      std::fprintf(log_, "vt graph dedup: captured %zu graphs, deduped to %zu execs\n",
-                   CapturedCount(), ExecCount());
+      //
+      // THE PROBE COUNTS ARE NOT COSMETIC (#1226). Without them `N == M` has two
+      // indistinguishable causes: no candidate group ever formed, so the driver was
+      // never asked; or a group formed and the driver REFUSED. Those are opposite
+      // findings — the first indicts the key, the second indicts the operation — and the
+      // 2026-08-18 gate could only tell them apart by reading the signature's source.
+      // A run that cannot separate them measures nothing.
+      std::fprintf(log_,
+                   "vt graph dedup: captured %zu graphs, deduped to %zu execs "
+                   "(probes=%zu refused=%zu)\n",
+                   CapturedCount(), ExecCount(), probes_, probe_refusals_);
     }
     return key;
   }
@@ -233,6 +264,12 @@ class GraphDedupRegistry {
   // Live captures, and the executables they share between them. The pre-dedup path
   // would report these equal.
   std::size_t CapturedCount() const { return handles_.size(); }
+  // How often a candidate group was found and the driver was actually asked, and how
+  // often it said no. `probes_ == 0` with more than one capture means the KEY never
+  // grouped anything; `probe_refusals_ == probes_` means it grouped and the driver
+  // declined. See the log-line note in Register.
+  std::size_t ProbeCount() const { return probes_; }
+  std::size_t ProbeRefusalCount() const { return probe_refusals_; }
   std::size_t ExecCount() const {
     std::size_t count = 0;
     for (const auto& bucket : groups_) count += bucket.second.size();
@@ -269,7 +306,7 @@ class GraphDedupRegistry {
   // Can `candidate`'s executable be re-pointed onto `raw_graph`? Answered on a
   // throwaway executable so a refusal cannot leave the live one in a state the driver
   // documentation does not define.
-  bool ProbeAccepts(const Group& candidate, void* raw_graph) const {
+  bool ProbeAccepts(const Group& candidate, void* raw_graph) {
     if (candidate.raws.empty()) return false;
     void* probe = ops_.instantiate(candidate.raws.front());
     // The probe instantiates a SECOND executable, so it can fail on its own -- most
@@ -279,8 +316,20 @@ class GraphDedupRegistry {
     // declining to fold degrades to exactly today's one-executable-per-capture path.
     if (probe == nullptr) return false;
     std::string detail;
+    ++probes_;
     const bool ok = ops_.update(probe, raw_graph, &detail);
     ops_.destroy_exec(probe);
+    if (!ok) {
+      ++probe_refusals_;
+      // The driver's own reason, verbatim, once per refusal. `detail` carries the
+      // cudaError_t and the cudaGraphExecUpdateResult that
+      // src/vt/graph_dedup_runtime.h's Update() formats, and that pair is the ONLY
+      // evidence that distinguishes "this driver will not re-point across these
+      // parameters" from "the key grouped two graphs that are genuinely different".
+      if (log_ != nullptr) {
+        std::fprintf(log_, "vt graph dedup: probe refused a fold (%s)\n", detail.c_str());
+      }
+    }
     return ok;
   }
 
@@ -292,6 +341,8 @@ class GraphDedupRegistry {
 
   GraphDedupOps ops_;
   std::FILE* log_ = nullptr;
+  std::size_t probes_ = 0;
+  std::size_t probe_refusals_ = 0;
   std::unordered_map<std::string, std::vector<std::unique_ptr<Group>>> groups_;
   std::unordered_map<void*, std::unique_ptr<Handle>> handles_;
 };

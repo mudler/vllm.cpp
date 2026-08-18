@@ -28,6 +28,7 @@
 
 #include "support/test_env.h"
 #include "vllm/config/device.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/gguf_builder.h"
 #include "vllm/platforms/interface.h"
@@ -315,4 +316,133 @@ TEST_CASE("device fit: an explicit CPU load is never refused, at any budget") {
   CAPTURE(message);
   CHECK(message.find("cannot serve this GGUF") == std::string::npos);
   CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+// --- The budget as a CONFIG KEY (#1127), through the same loader --------------
+//
+// The cases above move the budget with `VT_DEVICE_WEIGHT_BUDGET_BYTES`. The three
+// below move it with `--offload-config`'s `vllm_cpp.device_fit.weight_budget_bytes`,
+// arriving as `EngineParams::weight_residency`. The first two set NO variable at
+// all; the third sets one DELIBERATELY, because its subject is the precedence
+// between the two inputs rather than the config tier on its own.
+//
+// This is the reachability half of #1127 and not a second unit test of the
+// resolver: `test_weight_residency_config` already builds the config by hand and
+// calls `ResolveDeviceWeightBudgetBytes`, which proves the rule and says nothing
+// about whether a document reaches it. The chain these cases traverse is
+// `parse_weight_residency_extension_json` -> `EngineParams::weight_residency` ->
+// `SetWeightResidencyConfig` (the install block at the top of `FromModelDir`) ->
+// `DeviceWeightBudgetBytes` (the fit check, later in the SAME call). Measured:
+// deleting the install call site in `LoadedEngine::FromModelDir`, and separately
+// deleting the delegation inside `DeviceWeightBudgetBytes`, each turn this suite
+// RED.
+//
+// The install and the fit check being in one function is what makes this
+// observable without a checkpoint: the install runs before any path or weight
+// operation, and the check runs before the tokenizer.
+
+TEST_CASE("device fit: the budget arrives as a CONFIG KEY, with no variable set") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  // Parsed from the SAME string the `--offload-config` flag carries, rather than
+  // assembled field by field: a case that set the struct member directly would
+  // still pass if the parser never learned the key.
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":8191}}})");
+  REQUIRE(params.weight_residency->device_weight_budget_bytes.has_value());
+
+  std::string message;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  // One byte under the footprint, exactly as the environment case is, so a
+  // comparison against the wrong quantity cannot pass by accident.
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound)) != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound - 1)) != std::string::npos);
+  // The refusal names the config form as a way out, not only the variable, so an
+  // operator who set the budget with a document is told how to raise it with one.
+  CHECK(message.find("weight_budget_bytes") != std::string::npos);
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+TEST_CASE("device fit: a config budget of ZERO suppresses the refusal") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  // The platform's own probe is 0 in this fixture, so a budget of 0 is NOT what
+  // distinguishes this case from the default one. What it proves is that a
+  // configured zero reaches the check AS a zero rather than being dropped as a
+  // falsy value on the way, which is the one direction the merge and the resolver
+  // could each have got wrong. The positive control is the case above: the same
+  // file and platform refuse when the configured budget is 8191.
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})");
+
+  std::string message;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  // Read what the loader installed BEFORE clearing it: this is the assertion that
+  // the document reached the process-global rather than being carried past it.
+  const vllm::WeightResidencyConfig installed =
+      vllm::ActiveWeightResidencyConfig();
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  REQUIRE(installed.device_weight_budget_bytes.has_value());
+  CHECK(*installed.device_weight_budget_bytes == 0);
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  // The LATER error, asserted positively: without it, "no refusal" would also be
+  // true of a load that died earlier for an unrelated reason.
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+TEST_CASE("device fit: the VARIABLE beats the config key, through the loader") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  // The document suppresses the refusal; the variable puts a refusing budget
+  // back. The precedence exists so a benchmark arm is switchable without a
+  // restart, and this is that direction: the variable can turn a configured
+  // suppression back ON.
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})");
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kStagedLowerBound - 1));
+  std::string message;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound - 1)) != std::string::npos);
 }

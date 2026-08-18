@@ -320,6 +320,7 @@ build/examples/vllm-cli \
 | `--seed S` | (unset) | RNG seed (enables seeded sampling) |
 | `--stream` | off | Stream token deltas to stdout |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. Every key is checked and none is dropped: an unknown or misspelled name is refused at startup by name, and a real vLLM key this engine does not implement is refused as such ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--offload-config '<json>'` | (unset) | Weight placement, the same JSON document `vllm-server` takes and the same C ABI field. Both halves: vLLM's mirrored `uva`/`prefetch` device-to-host weight offload, and vllm.cpp's `vllm_cpp` key for the host-to-disk residency tier that makes a checkpoint larger than host RAM loadable. An unknown key at any level of the document is refused at startup by name. Added by [#1135](https://github.com/mudler/vllm.cpp/issues/1135); see [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode) |
 | `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
@@ -2228,6 +2229,13 @@ Read it as follows.
 * the `calls` column on `denoise.dit_device` counts *steps*, not forwards: one
   bracket covers both classifier-free-guidance branches, so the forward count is
   twice it.
+* the `load.ar.*` and `load.ac.*` rows break the two weight loads down further.
+  They are spans *inside* the `load.ar_weights` / `load.acoustic_weights` leaves,
+  so they are printed and never summed. They exist because the safetensors
+  reader is an **mmap** whose tensors are copied out, which interleaves
+  page-fault I/O with the copy inside a single call — so the load total on its
+  own cannot say whether a slow load is storage or CPU, and `load.ac.dit_build`
+  in particular touches no file at all.
 
 It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
 other value, including a near miss like `y`, leaves it off — an operator who
@@ -2341,8 +2349,8 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend, an unknown TOP-LEVEL key (the four legal ones are `offload_backend`, `uva`, `prefetch` and `vllm_cpp`) or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md). The same document also carries the **`vllm_cpp` key**, which governs the tier BELOW this one — weights borrowed out of the file mapping rather than moved to host RAM — and which is live rather than refused: see [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode). A `vllm_cpp`-only document does not enable vLLM's offload backends and is not subject to the refusal above |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. For `dspark`, `num_speculative_tokens` may no longer sit BELOW the draft checkpoint's block: DSpark drafts a block, our block is sized from this value alone, and a shorter one drafted a structurally wrong block in silence. It is refused now, before any weight is loaded, naming the block, the config key the block was read from, and the value given ([#1225](https://github.com/mudler/vllm.cpp/issues/1225)). The block is read from the draft config's `dspark_block_size`, or from `block_size` when that key is absent, which is the case on every published Qwen3 draft (`deepseek-ai/dspark_qwen3_4b_block7` and `RadixArk/Qwen3.8-27B-DSpark` both carry `block_size: 7`, so k must be at least 7). vLLM reads only the first key and accepts the shorter value. vLLM also builds its model config BEFORE its speculative config, so a command that names both a target directory it cannot open and a short `k` hears about the target there and about the `k` here. Those are the two recorded divergences, both argued in `.agents/specs/dspark-block-size-guard.md`. A k at or above the block behaves exactly as before. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend, an unknown TOP-LEVEL key (the four legal ones are `offload_backend`, `uva`, `prefetch` and `vllm_cpp`) or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md). The same document also carries the **`vllm_cpp` key**, which governs the tier BELOW this one — weights borrowed out of the file mapping rather than moved to host RAM — and which is live rather than refused: see [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode). A `vllm_cpp`-only document does not enable vLLM's offload backends and is not subject to the refusal above. The flag is accepted by `vllm-server` (the generate/chat and the pooling/embedding paths), by `vllm-cli`, and by the C ABI; the server's transcription-only path REFUSES it by name, because that path builds no engine and could only accept the document and ignore it ([#1195](https://github.com/mudler/vllm.cpp/issues/1195)) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). The DRAFT is classified from its own `config.json` rather than from the method string: `Qwen3DSparkModel`, `Gemma4DSparkModel`, and — BEYOND-PIN, mirroring [vllm#52197](https://github.com/vllm-project/vllm/pull/52197) merged 2026-08-17 — `DSparkDraftModel` together with `model_type` `qwen3` all route to the Qwen3 DSpark lane, and every other DSpark draft that DECLARES an architecture is the DeepSeek-V4 variant, which is refused by name because this engine carries only a stub for it (`SPEC-DSPARK-QWEN3-ROUTING`, [#1193](https://github.com/mudler/vllm.cpp/issues/1193)). A draft config carrying no `architectures` key at all is not classified and loads as before, because an absent key is not evidence of a lane. Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. For `dspark`, `num_speculative_tokens` may no longer sit BELOW the draft checkpoint's block: DSpark drafts a block, our block is sized from this value alone, and a shorter one drafted a structurally wrong block in silence. It is refused now, before any weight is loaded, naming the block, the config key the block was read from, and the value given ([#1225](https://github.com/mudler/vllm.cpp/issues/1225)). The block is read from the draft config's `dspark_block_size`, or from `block_size` when that key is absent, which is the case on every published Qwen3 draft (`deepseek-ai/dspark_qwen3_4b_block7` and `RadixArk/Qwen3.8-27B-DSpark` both carry `block_size: 7`, so k must be at least 7). vLLM reads only the first key and accepts the shorter value. vLLM also builds its model config BEFORE its speculative config, so a command that names both a target directory it cannot open and a short `k` hears about the target there and about the `k` here. Those are the two recorded divergences, both argued in `.agents/specs/dspark-block-size-guard.md`. A k at or above the block behaves exactly as before. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -2452,6 +2460,51 @@ For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.
 
+## DSpark drafts: the exact checkpoints
+
+A DSpark draft is a SEPARATE checkpoint named by the `model` key of
+`--speculative-config`. A repo id alone is not a pin, because a checkpoint can be
+re-quantized in place under an unchanged name, so the revision is part of the
+identity.
+
+| Draft | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| Qwen3.8-27B, 5 layers against a 64-layer target | `RadixArk/Qwen3.8-27B-DSpark` @ `85ef153be924f17ce4bf62726954eeaa4a73e854` | `model.safetensors` | 2 718 576 122 | `9d26d5e637551c244d543c67c790bd0947f360e005c569e5851a185ffe692786` |
+
+That draft declares `architectures: ["DSparkDraftModel"]` with `model_type:
+"qwen3"` and `block_size: 7`, which is the pair
+[vllm#52197](https://github.com/vllm-project/vllm/pull/52197) routes to the Qwen3
+DSpark lane and which this engine mirrors ahead of its pinned oracle
+(`SPEC-DSPARK-QWEN3-ROUTING`,
+[#1193](https://github.com/mudler/vllm.cpp/issues/1193)). **It has not been run
+here yet**: the token-exact gate against the pinned oracle needs the 2.53 GiB
+download and GPU time, and both are pending developer authority, so the routing
+is gated on CPU and the decode is not.
+
+The two layouts that already run are the native
+`deepseek-ai/dspark_qwen3_*_block7` drafts and the Speculators-format
+`RedHatAI/*.dspark` drafts; the DeepSeek-V4 DSpark draft, whose weights ship
+inside the DeepSeek-V4 target, is refused by name.
+
+**Which refusal you actually get today.** Point the server or the C API at a
+DeepSeek-V4 DSpark draft and the message is the named DeepSeek-V4 refusal, the
+one the classification produces. `LoadedEngine::FromModelDir` resolves a
+`dspark` speculative config ONCE, at the top of the function
+([#1225](https://github.com/mudler/vllm.cpp/issues/1225)), before it opens the
+target directory and long before it loads the draft, so the classification is now
+the FIRST thing a DSpark run meets. An earlier writing of this paragraph said the
+draft loader's "the draft config must carry target_layer_ids and mask_token_id"
+won instead; that was true while the draft load ran ahead of the resolution, and
+it stopped being true when the resolution was hoisted.
+
+Two messages still come out in front of it, and both are the resolution's own.
+A `dspark` run that names no `num_speculative_tokens` against a draft whose
+config carries no `n_predict` is refused for the missing `k` first, because that
+check sits ahead of the classification in the same branch. And a `.gguf` target
+takes the GGUF branch above the hoist, which carries its own named refusal for a
+GGUF DSpark target (`SPEC-DSPARK`). Either way the draft is refused and nothing
+loads it as a Qwen3 draft.
+
 ## Muse Glimmer 30B from a GGUF k-quant
 
 The text tower loads from a `muse-glimmer`-architecture GGUF, so the 30B model
@@ -2460,7 +2513,7 @@ straight at the file; the config comes from the GGUF's own metadata, so no
 `config.json` is needed:
 
 ```sh
-./build/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
+./build/examples/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
 ```
 
 Both published k-quants load (`muse-glimmer-30B-kquant-17gb.gguf` and the mixed
@@ -3485,7 +3538,7 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Twenty-four**
+schedule or guidance scale renders a video instead of failing. **Twenty-eight**
 pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 
 | `pipeline_kind` | resolving `model_version` | what it also needs |
@@ -3499,6 +3552,7 @@ pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 | `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
 | `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
 | `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
+| `keyframe_interpolation` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3705,6 +3759,82 @@ All three knobs this arm needs are LOAD extras, so a server supplies them with
 of `/v1/videos`. That is a statement about the request surface: the gated path
 is `vllm_video_engine_load` plus `vllm_video_generate`, which is what `ltx2-gen`
 drives, and no test here exercises the HTTP route end to end.
+
+### `keyframe_interpolation`: generating the motion between pinned frames
+
+`KeyframeInterpolationPipeline` — you supply the keyframes, the model generates
+what happens between them. Its two stages are `ti2vid_two_stage`'s: a guided
+half-resolution stage 1 on the **unadapted** model, then a 2x latent upsample and
+a distilled three-sigma refinement. It needs the same `--lora-path` and
+`--upsampler-path`, for the same reasons.
+
+```sh
+ltx2-gen \
+  --pipeline-kind keyframe_interpolation \
+  --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
+  --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
+  --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
+  --prompt 'the balloon drifts from the left ridge to the right one' \
+  --first-frame open.ppm --last-frame close.ppm --image-crf 0 \
+  --height 704 --width 1216 --num-frames 121 --steps 30 \
+  --output-dir out/
+```
+
+**Two fields separate it from `ti2vid_two_stage`, and both render either way.**
+
+**The first frame is a KEYFRAME, not a replacement.** Every other pipeline maps a
+conditioning image at frame 0 onto a latent-index item, which overwrites the
+tokens of latent frame 0 in place. This one drops that special case: the image is
+appended as keyframe guidance the model interpolates *from*, and the sequence the
+transformer runs over grows by one latent frame. Nothing about a rendered clip
+shows which mapping was used — both return the right size, the right frame count
+and the right sample rate with the image visibly present — so the difference is
+gated on the token count the transformer actually ran over.
+
+**The soundtrack that leaves is stage 2's**, where `ti2vid_two_stage` keeps stage
+1's and discards its refinement stage's audio. Upstream says so by what it binds
+rather than in a comment, and the two pipelines bind opposite ways.
+
+Everything else is shared. `--lora-path` is **required** and the load is refused
+without it: upstream makes the distilled adapter a positional, non-defaulted
+constructor argument as well as a required flag, and the adapter rides **stage 2
+alone** while stage 1 runs the base weights. There is no `--audio-path`; the
+soundtrack is generated. Height and width describe the FINAL output and must
+divide 64, because stage 1 halves them. Its stage-1 sigma shift is fitted on the
+scheduler's fixed 4096-token anchor rather than on the target latent grid, which
+is what upstream's `execute(steps=...)` with no latent resolves to.
+
+**`--last-frame` is new with this kind** and works on every pipeline that takes
+images: the ABI and the engine have served a closing keyframe since
+[#930](https://github.com/mudler/vllm.cpp/issues/930), and `ltx2-gen` had never
+read the field ([#1191](https://github.com/mudler/vllm.cpp/issues/1191)). Both
+image slots share one `--image-crf` and one strength, and a keyframe at an
+**interior** frame is not requestable — upstream's `--image PATH FRAME_IDX
+STRENGTH [CRF]` is repeatable and this request surface carries two fixed slots
+([#1187](https://github.com/mudler/vllm.cpp/issues/1187)).
+
+**Which weights this was gated against: reduced CPU fixtures, and nothing else.**
+Upstream runs this pipeline on the FULL model
+(`ltx-2.5-22b-dev-transformer-bf16.safetensors`, 42,018,190,584 bytes, 4349
+tensors, 21.004 B parameters, pure BF16, `model_version` `2.5.0`), which is on
+the NAS and header-verified, and which `LTX25-BF16-DIT`
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)) made loadable. **What
+is owed is the run**: a comparison against upstream's own render on the same
+checkpoint, prompt and seed. Do **not** substitute a distilled transformer to try
+the arm out — the distilled scales are trained into those weights, so a
+CFG-guided stage 1 on top samples a trajectory they were never trained for and
+renders a plausible clip with nothing in its size, frame count, sample rate or
+errors to show it ([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
+
+All three knobs this arm needs are LOAD extras, so a server supplies them with
+`--video-extra pipeline_kind=keyframe_interpolation` and the same for
+`lora_path` and `upsampler_path`. Like `ti2vid_two_stage` and unlike
+`a2vid_two_stage` it needs no per-generation extra, so
+[#928](https://github.com/mudler/vllm.cpp/issues/928) does not stand in the way
+of `/v1/videos` — though `/v1/videos` forwards no image either, so a server
+render is unconditioned. That is a statement about the request surface: the gated
+path is `vllm_video_engine_load` plus `vllm_video_generate`, which is what
+`ltx2-gen` drives, and no test here exercises the HTTP route end to end.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3941,7 +4071,7 @@ save.
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
 VT_MOE_EXPERT_STREAM_SLOTS=8000 \
-  ./build/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+  ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
 
@@ -3949,12 +4079,13 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
 
 The residency knobs are also config keys, under the `vllm_cpp` key of
 `--offload-config` — the flag that already carries vLLM's weight-offload
-document. One flag covers both tiers: vLLM's own `uva`/`prefetch` keys move
+document. `vllm-cli` takes the same flag, so the two recipes here differ only in
+which binary they start, not in what each one can express. One flag covers both tiers: vLLM's own `uva`/`prefetch` keys move
 weights from the device to host RAM, and the `vllm_cpp` key governs the tier
 below that, where weights stay borrowed out of the file mapping.
 
 ```sh
-./build/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
                                  "expert_stream":{"enabled":true,"slots":8000}}}'
 ```
@@ -3966,6 +4097,7 @@ below that, where weights stay borrowed out of the file mapping.
 | `vllm_cpp.expert_stream.enabled` | `VT_MOE_EXPERT_STREAM` | off |
 | `vllm_cpp.expert_stream.slots` | `VT_MOE_EXPERT_STREAM_SLOTS` | `64`; a real model wants thousands |
 | `vllm_cpp.expert_stream.slot_bytes` | `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | the largest gate/up/down slice of the first MoE layer reached |
+| `vllm_cpp.device_fit.weight_budget_bytes` | `VT_DEVICE_WEIGHT_BUDGET_BYTES` | the device's own probe (`cudaMemGetInfo` total on CUDA; no check elsewhere). `0` suppresses the load-time device-fit refusal; it is the only key here that accepts `0`, and a negative value is refused |
 
 Every field is optional, and an absent field means unchanged, so an
 `--offload-config` without a `vllm_cpp` key behaves exactly as it did before this
@@ -4000,16 +4132,30 @@ kind of thing rather than a mixture. Read the two lines together: `expert_stream
 beside `VT_MOE_EXPERT_STREAM (expert_stream) OVERRIDES` means the document said on and
 the variable decides.
 
-**Where the config form reaches, and where it does not.** It reaches the
-generate/chat server path (`vllm-server`) and the C ABI's
-`vllm_model_params.offload_config`, which is the whole of the library surface. It
-does NOT reach `vllm-cli`, nor the server's pooling/embedding and
-transcription-only paths, which build their engine parameters without the offload
-document at all — the mirrored `uva`/`prefetch` half is dropped there too, and has
-been since before this key existed. On those three, use the environment form
-above. Recorded under `## Owed` in
+**Where the config form reaches, and where it does not.** It reaches
+`vllm-server`'s generate/chat path, `vllm-server`'s pooling/embedding path,
+`vllm-cli`, and the C ABI's `vllm_model_params.offload_config`, which is the whole
+of the library surface. All four take BOTH halves of the document, and the server
+parses it once, before it reads the model's architecture, so a typo is refused at
+startup whichever path the model then takes.
+
+It does NOT reach the server's **transcription-only** path, and that path
+**refuses the flag** rather than accepting it and doing nothing:
+
+```text
+server: fatal: --offload-config is not supported on a transcription-only model
+(ParakeetForCTC). THE MISSING PART: this path serves /v1/audio/transcriptions
+through ParakeetTranscriber, which loads its own weights and never builds an
+engine, so neither vLLM's uva/prefetch weight offload nor vllm.cpp's vllm_cpp
+weight-residency tier has a call site on it. ...
+```
+
+Use the environment form above on that path, or serve a text-generation or
+embedding model. Recorded under `## Owed` in
 [`.agents/specs/weight-residency-config.md`](../.agents/specs/weight-residency-config.md)
-with [#1135](https://github.com/mudler/vllm.cpp/issues/1135).
+with [#1195](https://github.com/mudler/vllm.cpp/issues/1195).
+[#1135](https://github.com/mudler/vllm.cpp/issues/1135) is the issue this section
+answered for the other three.
 
 **A misspelled key is refused at startup, not ignored — at every level of the
 document.** vLLM's own parser ignores a key it does not recognise, which is what
@@ -4020,7 +4166,7 @@ spelling is the likeliest typo of all, because every flag around it is hyphenate
 So the whole document is enumerated and the offender is named:
 
 ```text
-offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream)
+offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream device_fit)
 offload config: unknown key "vllm-cpp" (expected one of: offload_backend uva prefetch vllm_cpp)
 offload config: unknown key "uva.cpu_offload_GB" (expected one of: cpu_offload_gb cpu_offload_params)
 ```
@@ -4148,12 +4294,27 @@ things it deliberately does not do:
   load will not stage — the MTP / `nextn` block on a load with no speculator, 8.33
   GiB of the measured 369.96 GiB checkpoint — is still in the sum, so a budget in
   that narrow window refuses a weight set that would have fitted. Raise
-  `VT_DEVICE_WEIGHT_BUDGET_BYTES` if you land in it
+  the budget if you land in it
   ([#1136](https://github.com/mudler/vllm.cpp/issues/1136)).
 
-`VT_DEVICE_WEIGHT_BUDGET_BYTES` moves the budget: lower it when something else
-lives in the pool, or raise it (or set `0`) to suppress the refusal and get the
-late failure back. It does not make the model fit.
+**Moving the budget.** Lower it when something else lives in the pool, or raise
+it (or set `0`) to suppress the refusal and get the late failure back. It does
+not make the model fit. Two ways to say it, and the first beats the second:
+
+```sh
+VT_DEVICE_WEIGHT_BUDGET_BYTES=68719476736 ./build/examples/vllm-server --model ...
+./build/examples/vllm-server --model ... \
+  --offload-config '{"vllm_cpp":{"device_fit":{"weight_budget_bytes":68719476736}}}'
+```
+
+The config key is the same `--offload-config` document the residency knobs use,
+so one flag still covers weight placement
+([#1127](https://github.com/mudler/vllm.cpp/issues/1127)). `0` from either input
+suppresses the refusal. The environment variable takes decimal digits only: a
+value with a sign, a space or trailing garbage is ignored and falls through to
+the config, then to the probe, because reading a typo as `0` would silently
+disable the guard. A malformed config value cannot get that far, because the
+parser refuses it at startup.
 
 **The instrument matters here.** `nvidia-smi
 --query-gpu=memory.total,memory.free,memory.used` answers `[N/A], [N/A], [N/A]`

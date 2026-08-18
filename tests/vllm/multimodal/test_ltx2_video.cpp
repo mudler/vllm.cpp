@@ -1838,6 +1838,73 @@ TEST_CASE("ltx2 video: GENERATED keyframe slots are SERVED, and the marker reach
     CHECK(trace.slot_tokens_extracted == 0);
   }
 
+  SUBCASE("slots applied AFTER a supplied keyframe still describe their own tokens") {
+    // THE ORDERING HALF, and it had no case until
+    // [#1219](https://github.com/mudler/vllm.cpp/issues/1219). Upstream applies
+    // conditioning items in list order and DFR appends the slot item LAST
+    // (dfr_pipeline.py:320-330, :353-365), so a supplied keyframe stands in front
+    // of the slots whenever the caller pins one. Every slot assertion the engine
+    // makes has to locate the slot tokens, and this is the arrangement in which
+    // "the tokens after the target grid" and "the tokens this item appended" are
+    // DIFFERENT windows.
+    //
+    // A closing keyframe is the reachable way to get an append in front of the
+    // slots on this kind: `wants_last_frame` takes `VideoConditionByKeyframeIndex`
+    // and appends (keyframe_cond.py:79-82) on every pipeline, where the first
+    // frame only appends on the `image_conditionings_by_adding_guiding_latent`
+    // recipes. The two features are unrelated and compose, which is the point.
+    const std::string closing = ws.root + "/gk_closing.ppm";
+    WriteBytes(closing, ConditioningPpm(20, 28, 51));
+
+    auto request = [&](const char* dir, bool slots, bool keyframe) {
+      vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+      if (slots) gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "2";
+      if (keyframe) {
+        gen.last_frame_path = closing;
+        gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+      }
+      const vllm::multimodal::VideoResult result = engine->Generate(gen);
+      CHECK(result.frame_count == 9);
+      return ltx2->last_conditioning();
+    };
+
+    // Four renders, so the count below is a RELATION between measured lengths
+    // rather than a literal: each item's own cost is measured on its own, and
+    // the claim is that together they cost the sum. `image_tokens` cannot serve
+    // here — the engine fills it on the FIRST-frame arm only, and this closing
+    // keyframe leaves it 0.
+    const vllm::multimodal::Ltx2ConditioningTrace bare = request("gk_bare2", false, false);
+    const vllm::multimodal::Ltx2ConditioningTrace slots_only = request("gk_alone", true, false);
+    const vllm::multimodal::Ltx2ConditioningTrace kf_only = request("gk_kf_only", false, true);
+    const vllm::multimodal::Ltx2ConditioningTrace both = request("gk_after_kf", true, true);
+
+    REQUIRE(slots_only.slot_positions.size() == 2);
+    REQUIRE(slots_only.slot_marked_tokens > 0);
+    REQUIRE(slots_only.video_tokens > bare.video_tokens);
+    REQUIRE(kf_only.video_tokens > bare.video_tokens);
+
+    MESSAGE("video_tokens  bare " << bare.video_tokens << "  slots " << slots_only.video_tokens
+                                  << "  keyframe " << kf_only.video_tokens << "  both "
+                                  << both.video_tokens);
+
+    // The slots are placed and MARKED exactly as they are alone: a keyframe in
+    // front changes WHERE they sit in the sequence and nothing about what they
+    // are. This is the assertion the engine's own slot checks stand behind, and
+    // the arrangement that makes "past the target grid" and "what this item
+    // appended" two different windows.
+    CHECK(both.slot_positions == slots_only.slot_positions);
+    CHECK_MESSAGE(both.slot_marked_tokens == slots_only.slot_marked_tokens,
+                  "a supplied keyframe in front of the slots changed how many slot tokens "
+                  "carry the trained marker — expected " << slots_only.slot_marked_tokens
+                                                         << ", got " << both.slot_marked_tokens);
+    CHECK_MESSAGE(both.video_tokens == slots_only.video_tokens +
+                                           (kf_only.video_tokens - bare.video_tokens),
+                  "the two appending items must cost what each costs alone: "
+                      << slots_only.video_tokens << " + "
+                      << kf_only.video_tokens - bare.video_tokens << " against "
+                      << both.video_tokens);
+  }
+
   SUBCASE("a negative count gets upstream's OWN reason") {
     // `evenly_spaced_keyframe_positions` raises "num_keyframes must be
     // non-negative" (utils/helpers.py:372-373) before anything looks at the
@@ -8024,4 +8091,582 @@ TEST_CASE("ltx2 ti2vid: the distilled-LoRA requirement refuses BY WHAT IS MISSIN
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(Ti2VidParams(ws.paths, lora));
   CHECK_NOTHROW((void)engine->Generate(Ti2VidGen(ws.root + "/no_take")));
+}
+
+// ─── LTX25-KEYFRAME-INTERP (#1096) ───────────────────────────────────────────
+
+namespace {
+
+// A `keyframe_interpolation` engine on the shipped fixture. The same two
+// load-side requirements `ti2vid_two_stage` has: the spatial upsampler stage 2
+// needs, which `ConditioningParams` supplies, and the distilled adapter, which
+// upstream makes a POSITIONAL non-defaulted parameter
+// (keyframe_interpolation.py:68) as well as `--distilled-lora required=True`
+// (utils/args.py:1140-1155).
+//
+// NO `audio_path`: this pipeline generates its soundtrack, and unlike
+// `ti2vid_two_stage` the take that leaves is STAGE 2's (`:271`, `:293`).
+vllm::multimodal::VideoModelParams KeyframeParams(const ltx2_fixture::Paths& paths,
+                                                  const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "keyframe_interpolation";
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+// `steps = 2`, because stage 1's schedule is DERIVED from the step count
+// (keyframe_interpolation.py:199-200) and two sigma intervals exercise the loop.
+// The case that gates the schedule ANCHOR raises this to 3 and says why. The STG
+// block list is the fixture's, not this row's: the reduced DiT has TWO blocks
+// and the params row this recipe resolves names block 28.
+vllm::multimodal::VideoGenParams KeyframeGen(const std::string& out_dir, int64_t size = 64) {
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.steps = 2;
+  gen.height = size;
+  gen.width = size;
+  OneStageFixtureGuidance(&gen);
+  return gen;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a latent that replaces") {
+  // THE ROW'S IDENTITY, and the one thing that separates
+  // `image_conditionings_by_adding_guiding_latent` (helpers.py:343-367) from
+  // `combined_image_conditionings` (:272-308): the second sends `frame_idx == 0`
+  // to `VideoConditionByLatentIndex`, which REPLACES latent frame 0's clean
+  // tokens and never changes the token count (latent_cond.py:38-39); the first
+  // has NO branch and sends it to `VideoConditionByKeyframeIndex`, which APPENDS
+  // a latent frame of tokens (keyframe_cond.py:79-82).
+  //
+  // GATED THROUGH `LoadVideoEngine` + `Generate`, not on the recipe struct: the
+  // recipe case in test_ltx2_pipeline proves the field is SET, and this one
+  // proves it is CONSUMED (#1013).
+  //
+  // AND NO PIXEL COMPARISON CAN SEE IT. Both arms condition on the same image,
+  // both return a clip of the right size, the right frame count and the right
+  // sample rate. The only observable is the sequence LENGTH the DiT ran over,
+  // which is `Ltx2ConditioningTrace::video_tokens`, recorded before the trim.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  struct Conditioned {
+    int64_t video_tokens;
+    int64_t image_tokens;
+    std::string bytes;
+  };
+
+  // ONE image, ONE geometry, ONE seed. The only thing that differs between the
+  // two loads is `pipeline_kind`, so nothing but the builder can move the
+  // numbers below.
+  auto render = [&](const char* kind, bool with_image, const std::string& tag) -> Conditioned {
+    vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = KeyframeGen(ws.root + "/" + tag);
+    if (with_image) {
+      gen.first_frame_ppm = ConditioningPpm(20, 28, 1);
+      // CRF 0 EXPLICITLY, because an LTX-2.5 checkpoint RESOLVES 18 when the
+      // caller leaves it unset (`ImageConditioner.resolve_crf`, blocks.py:977-983)
+      // and the H.264 round trip that 18 needs is refused by name in this tree.
+      // Every image-conditioning case here asks for 0 for the same reason; it is
+      // orthogonal to which builder places the image.
+      gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    }
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    std::string all;
+    for (int64_t f = 0; f < result.frame_count; ++f) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+      all += ReadAll(gen.output_dir + name);
+    }
+    return Conditioned{t.video_tokens, t.image_tokens, all};
+  };
+
+  const Conditioned kf = render("keyframe_interpolation", /*with_image=*/true, "kf");
+  const Conditioned ti = render("ti2vid_two_stage", /*with_image=*/true, "ti");
+  // THE THIRD RENDER, and without it the equality below passes on a tree where
+  // BOTH arms append: it pins what the bare target grid is on this geometry, so
+  // "the plain arm placed its image without growing the sequence" is a claim
+  // about the grid rather than a comparison of two unknowns.
+  const Conditioned bare = render("ti2vid_two_stage", /*with_image=*/false, "bare");
+  const Conditioned kf_bare = render("keyframe_interpolation", /*with_image=*/false, "kf_bare");
+
+  MESSAGE("video_tokens  keyframe " << kf.video_tokens << "  ti2vid " << ti.video_tokens
+                                    << "  bare " << bare.video_tokens);
+
+  // NEITHER ARM PLACED NOTHING. A build that encoded the image and never
+  // conditioned on it would satisfy every count comparison below by making them
+  // all equal, so this is a REQUIRE.
+  REQUIRE(kf.image_tokens > 0);
+  REQUIRE(ti.image_tokens > 0);
+  // The same image at the same geometry encodes to the same number of tokens
+  // under both builders — only WHERE they go differs.
+  CHECK(kf.image_tokens == ti.image_tokens);
+
+  // ── the plain arm REPLACED: its sequence is the bare target grid ───────────
+  CHECK_MESSAGE(ti.video_tokens == bare.video_tokens,
+                "`combined_image_conditionings` sends frame 0 to "
+                "`VideoConditionByLatentIndex`, which replaces tokens that already exist "
+                "(latent_cond.py:38-39), so the count must not move — it went from "
+                    << bare.video_tokens << " to " << ti.video_tokens);
+  CHECK(kf_bare.video_tokens == bare.video_tokens);
+
+  // ── and this arm APPENDED, by exactly one image's worth of tokens ──────────
+  CHECK_MESSAGE(kf.video_tokens == bare.video_tokens + kf.image_tokens,
+                "`image_conditionings_by_adding_guiding_latent` has no frame-0 branch "
+                "(helpers.py:343-367), so frame 0 takes `VideoConditionByKeyframeIndex` and "
+                "APPENDS (keyframe_cond.py:79-82). Expected "
+                    << bare.video_tokens + kf.image_tokens << " tokens, got " << kf.video_tokens);
+  CHECK(kf.video_tokens > ti.video_tokens);
+
+  // ── and the render CHANGED, which is what a token count alone cannot say ───
+  //
+  // Against the SAME kind with no image, deliberately, and not against the plain
+  // arm: the two arms place the same content, so a pixel difference between THEM
+  // says only that they placed it differently, which the counts above already
+  // say with a reason. What this adds is that the conditioning reached the
+  // pixels at all on this arm.
+  CHECK_MESSAGE(kf.bytes != kf_bare.bytes,
+                "the appended keyframe left the rendered clip unchanged, so it was placed into "
+                "a state the decode never read");
+  CHECK_FALSE(kf.bytes.empty());
+}
+
+TEST_CASE("ltx2 keyframe: BOTH ends pin at once - two appends, and each is located at its own") {
+  // THE PIPELINE'S HEADLINE REQUEST, and it aborted the render
+  // ([#1219](https://github.com/mudler/vllm.cpp/issues/1219)).
+  // `KeyframeInterpolationPipeline` exists to generate the motion BETWEEN
+  // pinned keyframes; `docs/USAGE.md`'s worked example for this kind passes
+  // `--first-frame open.ppm --last-frame close.ppm`, and `ltx2-gen --help` says
+  // to use the two together. So this is not an edge case, it is the case.
+  //
+  // WHAT BROKE, and it is a shape worth keeping in view: the last-frame arm
+  // located its own appended tokens at `positions[target_tokens * 2]`, which is
+  // the first token PAST THE TARGET GRID — correct only while that arm owned the
+  // first append. Row LTX25-KEYFRAME-INTERP put a second appending item in front
+  // of it on the `image_conditionings_by_adding_guiding_latent` recipes, so the
+  // index then named the FIRST frame's keyframe at temporal 0, and the arm's own
+  // positional assertion threw. A derived index that was right by ORDER rather
+  // than by construction, and the item that changed the order was two hundred
+  // lines above it.
+  //
+  // THE CONTROL IS THE OTHER BUILDER, and it is what makes this case say
+  // "ordering" rather than "keyframes". `ti2vid_two_stage` takes the same two
+  // images through `combined_image_conditionings`, whose frame-0 item REPLACES
+  // (helpers.py:295-300), so it has exactly ONE append and never reached the
+  // defect. It stayed green throughout and must stay green here.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/both.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const std::string closing = ws.root + "/closing.ppm";
+  WriteBytes(closing, ConditioningPpm(20, 28, 41));
+
+  struct Pinned {
+    int64_t video_tokens;
+    int64_t image_tokens;
+  };
+
+  // `ends` selects which of the two slots are filled, so one lambda produces the
+  // bare grid, each single end, and both — and the counts below are then
+  // relations between renders of one geometry rather than literals.
+  auto render = [&](const char* kind, bool first, bool last, const std::string& tag) -> Pinned {
+    vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = KeyframeGen(ws.root + "/" + tag);
+    if (first) gen.first_frame_ppm = ConditioningPpm(20, 28, 40);
+    if (last) gen.last_frame_path = closing;
+    // One CRF for both slots, which is the surface: upstream resolves the CRF
+    // once for the whole `images` list (blocks.py:966-983), and the H.264 round
+    // trip an LTX-2.5 checkpoint would otherwise resolve is refused by name here.
+    if (first || last) gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // The artifact, not only the trace: the render has to come back at the
+    // requested length, because the appended tokens are trimmed back off before
+    // the unpatchify and a clip of the wrong length is the visible half of a
+    // trim that read the wrong count.
+    CHECK(result.frame_count == 9);
+    return Pinned{t.video_tokens, t.image_tokens};
+  };
+
+  // ── THE CONTROL, FIRST, so a red below is attributable ─────────────────────
+  //
+  // Replace + one append. This is the arm that was already green, and running it
+  // first means a failure here says "both arms are broken" rather than letting
+  // the new arm's red stand for the pair.
+  const Pinned ti_both = render("ti2vid_two_stage", true, true, "ti_both");
+  const Pinned ti_bare = render("ti2vid_two_stage", false, false, "ti_bare");
+  REQUIRE(ti_both.image_tokens > 0);
+  CHECK_MESSAGE(ti_both.video_tokens == ti_bare.video_tokens + ti_both.image_tokens,
+                "`combined_image_conditionings` REPLACES at frame 0 and APPENDS at the closing "
+                "frame, so pinning both ends grows the sequence by exactly ONE image — expected "
+                    << ti_bare.video_tokens + ti_both.image_tokens << ", got "
+                    << ti_both.video_tokens);
+
+  // ── AND THE ARM THIS ROW ADDS: two appends, both located ───────────────────
+  const Pinned kf_both = render("keyframe_interpolation", true, true, "kf_both");
+  const Pinned kf_bare = render("keyframe_interpolation", false, false, "kf_bare");
+  const Pinned kf_first = render("keyframe_interpolation", true, false, "kf_first");
+  const Pinned kf_last = render("keyframe_interpolation", false, true, "kf_last");
+
+  MESSAGE("video_tokens  bare " << kf_bare.video_tokens << "  first " << kf_first.video_tokens
+                                << "  last " << kf_last.video_tokens << "  both "
+                                << kf_both.video_tokens << "  image_tokens "
+                                << kf_both.image_tokens);
+
+  REQUIRE(kf_both.image_tokens > 0);
+  CHECK(kf_bare.video_tokens == ti_bare.video_tokens);
+  // Each end alone appends one image's worth...
+  CHECK(kf_first.video_tokens == kf_bare.video_tokens + kf_both.image_tokens);
+  CHECK(kf_last.video_tokens == kf_bare.video_tokens + kf_both.image_tokens);
+  // ...and the two together append BOTH, which is the count the defect could
+  // never produce because the render never finished.
+  CHECK_MESSAGE(kf_both.video_tokens == kf_bare.video_tokens + 2 * kf_both.image_tokens,
+                "`image_conditionings_by_adding_guiding_latent` has no frame-0 branch "
+                "(helpers.py:343-367), so BOTH pinned ends take `VideoConditionByKeyframeIndex` "
+                "and append (keyframe_cond.py:79-82) — expected "
+                    << kf_bare.video_tokens + 2 * kf_both.image_tokens << ", got "
+                    << kf_both.video_tokens);
+  // ...and it is strictly more than the builder that replaces at frame 0, which
+  // is what the two arms differ by.
+  CHECK(kf_both.video_tokens > ti_both.video_tokens);
+}
+
+TEST_CASE("ltx2 keyframe: the pipeline renders through vllm.h, guided on the UNADAPTED stage 1") {
+  // THE REACHABILITY CLAIM, and it is the point of this case rather than a note
+  // beside it. Entry point: `LoadVideoEngine` with a documented value of the
+  // documented `pipeline_kind` LOAD extra plus `lora_path`, then `Generate`.
+  // Nothing here constructs a recipe, a guider, a phase or a modality by hand.
+  // Deleting the `keyframe_interpolation` dispatch row in
+  // `ResolveLtx2PipelineRecipe` REDs this case at the LOAD, which is what
+  // separates measuring a capability from measuring a class
+  // (.agents/reachability.md).
+  //
+  // `ltx2-gen --pipeline-kind keyframe_interpolation --lora-path ...
+  // --upsampler-path ...` is the same two calls through the ABI, as a thin
+  // client that includes no internal header.
+  //
+  // AND #928 DOES NOT EXCLUDE THE HTTP ROUTE HERE, unlike on `a2vid_two_stage`.
+  // That recipe needs `audio_path`, a PER-GENERATION extra, and
+  // `VideoGenParamsFromRequest` writes none. All three knobs THIS recipe needs —
+  // `pipeline_kind`, `lora_path`, `upsampler_path` — are LOAD extras, which a
+  // server supplies through `--video-extra KEY=VALUE`, and `requires_audio_input`
+  // is false, which the recipe case gates. That is a statement about the REQUEST
+  // SURFACE and not a second reach claim: no case here drives the HTTP route end
+  // to end, so it is not measured and is not asserted.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(KeyframeParams(ws.paths, lora));
+  REQUIRE(engine != nullptr);
+  auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  CHECK(ltx->pipeline_kind() == "keyframe_interpolation");
+
+  const vllm::multimodal::VideoResult result = engine->Generate(KeyframeGen(ws.root + "/kf"));
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+  CHECK(result.frame_count == 9);
+  // The soundtrack is GENERATED and decoded through the vocoder, so it comes
+  // back at the BWE arm's rate rather than at the audio VAE's.
+  CHECK(result.sample_rate > 0);
+
+  // ── stage 1 ran upstream's GUIDED denoiser, on all four arms ───────────────
+  //
+  // AN EVALUATION COUNT CANNOT SEE THIS. A denoiser call is ONE evaluation
+  // whether guidance ran or not, so only the FORWARD counters — actual
+  // `Ltx2DitForward` calls — distinguish a guided stage 1 from a
+  // `SimpleDenoiser` one. The trace's guided fields are recorded at step 0 of
+  // phase 0, which is this recipe's stage 1, and its guider is the params
+  // table's video row (cfg 3.0, stg 1.0, rescale 0.7, modality 3.0), so all four
+  // passes run and the rescale branch — the one term that is NOT invariant
+  // between x0 and velocity space — is live on the DEFAULT path.
+  REQUIRE_MESSAGE(t.video_guided, "stage 1 did not go through the guided seam at all");
+  CHECK(t.video_cond_forwards == 1);
+  CHECK(t.video_uncond_forwards == 1);
+  CHECK(t.video_perturbed_forwards == 1);
+  CHECK(t.video_modality_forwards == 1);
+  CHECK(t.video_guidance_cfg_scale == 3.0);
+  CHECK(t.video_guidance_stg_scale == 1.0);
+  CHECK(t.video_guidance_rescale_scale == 0.7);
+  CHECK(t.video_guidance_modality_scale == 3.0);
+  CHECK(t.dit_forwards > t.dit_evaluations);
+
+  // ── the four arms are combined in X0 SPACE, not velocity space ────────────
+  //
+  // `_guided_denoise` converts each pass to x0 BEFORE it combines them
+  // (ltx-core utils.py:39-52, `sample - velocity * sigma`). Every LINEAR term is
+  // invariant under that change of variable, so cfg, stg and modality cannot see
+  // the difference; the RESCALE branch is not invariant, and `rescale_scale`
+  // defaults to 0.7 here, so a space error lands on the default path
+  // (#1039, #1092).
+  //
+  // A MAGNITUDE ASSERTION CANNOT GATE IT. On a reduced fixture
+  // `std(cond)/std(pred)` is 1.0 to 1e-5 in BOTH spaces. `x0 == latent -
+  // sigma*velocity` is an equation between three RECORDED tensors instead: exact
+  // in x0 space, and in velocity space `x0` IS the velocity, so the residual
+  // becomes the whole sample and `|x0 - velocity|` collapses to exactly 0 —
+  // which is what the RED prints.
+  const size_t n = t.video_first_latent.size();
+  REQUIRE(n > 0);
+  const size_t tokens = t.video_first_timesteps.size();
+  REQUIRE(tokens > 0);
+  const size_t width = n / tokens;
+  REQUIRE(width * tokens == n);
+  // THE FIXTURE CAN DECIDE THIS AT ALL: the two candidate tensors coincide when
+  // the sample is zero. A REQUIRE, because nothing below discriminates once it
+  // fails.
+  double latent_span = 0.0;
+  for (const float x : t.video_first_latent) {
+    latent_span = std::max(latent_span, std::abs(static_cast<double>(x)));
+  }
+  REQUIRE_MESSAGE(latent_span > 1e-3, "the step-0 sample is zero, so the two candidate tensors "
+                                      "coincide and nothing below discriminates");
+
+  struct KeyframeArm {
+    const char* name;
+    const std::vector<float>& velocity;
+    const std::vector<float>& x0;
+  };
+  const KeyframeArm arms[] = {
+      {"cond", t.video_first_cond_velocity, t.video_first_cond},
+      {"uncond", t.video_first_uncond_velocity, t.video_first_uncond},
+      {"perturbed", t.video_first_perturbed_velocity, t.video_first_perturbed},
+      {"modality", t.video_first_modality_velocity, t.video_first_modality},
+  };
+  for (const KeyframeArm& arm : arms) {
+    INFO("arm = " << std::string(arm.name));
+    REQUIRE(arm.velocity.size() == n);
+    REQUIRE(arm.x0.size() == n);
+    // PER ARM, because a zeroed velocity makes `to_denoised` the identity on
+    // THIS arm alone and would satisfy the equation while proving nothing.
+    double velocity_span = 0.0;
+    for (const float x : arm.velocity) {
+      velocity_span = std::max(velocity_span, std::abs(static_cast<double>(x)));
+    }
+    REQUIRE_MESSAGE(velocity_span > 1e-6, "this arm's velocity is zero, so the equation below "
+                                          "holds for a reason that is not the one it tests");
+    // `x0 = latent - sigma_token * velocity` (model.py:590-604), with the
+    // PER-TOKEN timestep and not the schedule scalar.
+    double residual = 0.0;
+    double against_velocity = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double sigma = static_cast<double>(t.video_first_timesteps[i / width]);
+      const double expected = static_cast<double>(t.video_first_latent[i]) -
+                              sigma * static_cast<double>(arm.velocity[i]);
+      residual = std::max(residual, std::abs(static_cast<double>(arm.x0[i]) - expected));
+      against_velocity = std::max(
+          against_velocity,
+          std::abs(static_cast<double>(arm.x0[i]) - static_cast<double>(arm.velocity[i])));
+    }
+    INFO("max|x0 - (latent - sigma*v)| = " << residual);
+    INFO("max|x0 - velocity| = " << against_velocity);
+    CHECK(residual < 1e-4);
+    CHECK(against_velocity > 1e-6);
+  }
+}
+
+TEST_CASE("ltx2 keyframe: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `tokens = math.prod(latent.shape[2:]) if latent is not None else
+  // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
+  // = 4096 (`:11`, `:29`). `keyframe_interpolation.py:199-200` passes NO latent;
+  // `ti2vid_two_stages_hq.py:267` — our `res2s_two_stage` — passes
+  // `latent=empty_latent` and is the ONE upstream site that does.
+  //
+  // A 2x2 OVER (recipe, geometry), because neither half alone is load-bearing.
+  // The equalities alone pass on a build that hard-codes 4096 for everything;
+  // the inequalities alone pass on a `target_tokens`-everywhere tree. Only the
+  // pair says that the anchor is per-phase AND selected correctly.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  // Two geometries whose stage-1 target grids differ. Both divide 64, which is
+  // `Ltx2AssertResolution`'s divisor on a `spatial_downscale = 2` recipe.
+  const int64_t kSmall = 64;
+  const int64_t kLarge = 128;
+
+  // TWO NUMBERS OUT OF EACH RENDER, AND THE SECOND ONE IS WHAT KEEPS THE
+  // TRAJECTORY HALF OF THIS CASE HONEST. The recomputations at the end run at
+  // the step count the RENDER used. Restating that count as a literal down there
+  // decouples it from `gen.steps`: lowering the render to 2 steps would then
+  // leave every assertion in this case green while making the trajectory claim
+  // vacuous. That is not hypothetical — `ltx25-ti2vid-recipe.md` shipped this
+  // case with a literal and a fresh review found the mutation undetected.
+  struct Rendered {
+    int64_t schedule_tokens;
+    int64_t steps;
+  };
+
+  auto rendered_for = [&](const char* kind, int64_t size, const std::string& tag) -> Rendered {
+    vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = KeyframeGen(ws.root + "/" + tag, size);
+    // THREE STEPS, NOT THE FIXTURE'S TWO, and the reason is asserted below: the
+    // scheduler's `stretch` pins sigma[0] at 1.0 and the LAST non-zero sigma at
+    // `terminal` = 0.1 (schedulers.py:48-55), so a 2-step schedule is
+    // {1, 0.1, 0} for EVERY token count and the anchor cannot reach the
+    // trajectory at all. Three steps is the shortest schedule with an interior
+    // sigma for the shift to move. Lowering this number is REFUSED rather than
+    // deprecated: it comes back out of this lambda and the trajectory assertions
+    // recompute at it, so 2 here reds them by name.
+    gen.steps = 3;
+    // `keyframe_interpolation` resolves `stg_blocks = [28]` (constants.py:86-87)
+    // and this fixture's DiT has TWO blocks, so its perturbed pass is refused by
+    // name unless the request names a block that exists. The HQ preset ships
+    // `stg_blocks = []` beside `stg_scale = 0.0` (constants.py:105, :113), asks
+    // for no perturbed pass at all, and FIXES its stage-2 guidance — so giving
+    // it the same override is refused outright. `KeyframeGen` carries the
+    // override, so the control has to take it back off.
+    if (std::string(kind) != "keyframe_interpolation") {
+      gen.extras.erase(vllm::multimodal::kLtx2VideoStgBlocksExtra);
+      gen.extras.erase(vllm::multimodal::kLtx2AudioStgBlocksExtra);
+    }
+    (void)engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // Written only on the branch that CALLS `Ltx2SigmaSchedule`, so a phase
+    // carrying frozen sigmas leaves it 0. Stage 2 of both recipes does, which is
+    // why what lands here is stage 1's.
+    REQUIRE(t.schedule_tokens > 0);
+    return Rendered{t.schedule_tokens, gen.steps};
+  };
+
+  const Rendered kf_small_r = rendered_for("keyframe_interpolation", kSmall, "kf_small");
+  const Rendered kf_large_r = rendered_for("keyframe_interpolation", kLarge, "kf_large");
+  const Rendered hq_small_r = rendered_for("res2s_two_stage", kSmall, "hq_small");
+  const Rendered hq_large_r = rendered_for("res2s_two_stage", kLarge, "hq_large");
+
+  const int64_t kf_small = kf_small_r.schedule_tokens;
+  const int64_t kf_large = kf_large_r.schedule_tokens;
+  const int64_t hq_small = hq_small_r.schedule_tokens;
+  const int64_t hq_large = hq_large_r.schedule_tokens;
+
+  // The step count the four renders ACTUALLY ran at, read back out of them
+  // rather than restated below. All four have to agree, or "the step count" is
+  // not one number and nothing below can be recomputed at it.
+  const int64_t rendered_steps = kf_small_r.steps;
+  REQUIRE(kf_large_r.steps == rendered_steps);
+  REQUIRE(hq_small_r.steps == rendered_steps);
+  REQUIRE(hq_large_r.steps == rendered_steps);
+
+  MESSAGE("keyframe: " << kf_small << " / " << kf_large << "   res2s: " << hq_small << " / "
+                       << hq_large);
+
+  // ── this arm's schedule is RESOLUTION-INDEPENDENT, at upstream's constant ──
+  const int64_t anchor = vllm::Ltx2SchedulerParams{}.default_number_of_tokens;
+  CHECK(anchor == 4096);  // schedulers.py:11 — pinned, not read back from the build
+  CHECK_MESSAGE(kf_small == anchor,
+                "stage 1's sigma shift was fitted on " << kf_small << " tokens, but upstream "
+                    "passes no latent (keyframe_interpolation.py:199-200) and gets " << anchor);
+  CHECK(kf_large == anchor);
+
+  // ── and the HQ arm's is NOT, which is what stops the above being a constant ─
+  CHECK_MESSAGE(hq_small != hq_large,
+                "the res_2s arm reported the same anchor at two resolutions, so this fixture "
+                "cannot tell the two branches apart and the equalities above prove nothing");
+  CHECK(hq_small != anchor);
+  CHECK(hq_large != anchor);
+
+  // ── and the two anchors really do produce DIFFERENT sigmas ────────────────
+  //
+  // The strongest half: a claim about the trajectory rather than about the
+  // counter that reports it. `sigma_shift = tokens*mm + b` (schedulers.py:35-39),
+  // so two token counts give two schedules — unless the shift arithmetic has
+  // been flattened, in which case selecting the anchor would be inert and every
+  // assertion above would still pass.
+  // AT `rendered_steps`, NOT AT A LITERAL.
+  const std::vector<float> at_anchor = vllm::Ltx2SigmaSchedule(rendered_steps, anchor);
+  const std::vector<float> at_target = vllm::Ltx2SigmaSchedule(rendered_steps, hq_small);
+  REQUIRE(at_anchor.size() == at_target.size());
+  CHECK_MESSAGE(at_anchor != at_target,
+                "the 4096 anchor and the target grid produce the SAME schedule on this fixture, "
+                "so nothing above measures which one was taken");
+
+  // AND THE RENDER'S STEP COUNT IS LOAD-BEARING, WHICH IS WORTH AN ASSERTION
+  // RATHER THAN A COMMENT. TWO assertions, because they fail for different
+  // reasons. The first names the render's own step count, so lowering
+  // `gen.steps` to make this case faster fails HERE, by name, rather than
+  // silently turning the comparison above into a value against itself. The
+  // second pins the degeneracy itself, so it fails if a scheduler change ever
+  // makes a 2-step schedule token-dependent.
+  CHECK_MESSAGE(rendered_steps > 2,
+                "the renders above ran at " << rendered_steps << " steps, and a schedule that "
+                "short is {1, 0.1, 0} for EVERY token count (schedulers.py:48-55), so the "
+                "trajectory comparison above compares a value with itself");
+  CHECK_MESSAGE(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor) ==
+                    vllm::Ltx2SigmaSchedule(/*steps=*/2, hq_small),
+                "a 2-step schedule now DOES depend on the token count, so the stretch no longer "
+                "pins both of its non-zero sigmas and the comment above is wrong");
+  CHECK(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor).size() == 3u);
+}
+
+TEST_CASE("ltx2 keyframe: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
+  // `distilled_lora` is a POSITIONAL, non-defaulted parameter
+  // (keyframe_interpolation.py:68) and `--distilled-lora` is `required=True`
+  // (utils/args.py:1140-1155) on the parser `:301` selects. Stage 2's three-sigma
+  // refinement (`:166`) is what that adapter was trained for. Without it the
+  // render FINISHES: a clip of the right size, frame count and sample rate, with
+  // a distilled schedule run on undistilled weights.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
+  mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    FAIL_CHECK("a keyframe_interpolation load with no distilled LoRA must be refused");
+  } catch (const std::exception& e) {
+    const std::string message = e.what();
+    INFO("message = " << message);
+    // It names the PIPELINE that was asked for, which is what makes the refusal
+    // actionable rather than generic. This recipe is the THIRD user of
+    // `requires_distilled_lora`, and #1151 is the record of what the message
+    // said when it had only one: the previous pipeline's own line numbers.
+    CHECK(message.find("keyframe_interpolation") != std::string::npos);
+    CHECK(message.find("distilled LoRA") != std::string::npos);
+    CHECK(message.find("lora_path") != std::string::npos);
+    CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py") == std::string::npos);
+    CHECK(message.find("ti2vid_two_stages.py") == std::string::npos);
+  }
+
+  // THE CONTROL: the same load WITH the adapter renders, so the case is about
+  // the requirement and not about any load failure.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(KeyframeParams(ws.paths, lora)));
+  // THE SECOND CONTROL: the DEFAULT kind is fine without an adapter, so this is
+  // this recipe's requirement and not a new global one.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths)));
+
+  // ── and NO audio take is demanded, which `a2vid_two_stage` does ────────────
+  //
+  // The two recipes come off the same parser and share `requires_distilled_lora`,
+  // so a recipe written by copying that one would inherit `requires_audio_input`
+  // and refuse every render. There is no `--audio-path` on this pipeline:
+  // keyframe_interpolation.py:147-168 takes `images`, not a waveform.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(KeyframeParams(ws.paths, lora));
+  CHECK_NOTHROW((void)engine->Generate(KeyframeGen(ws.root + "/no_take")));
 }

@@ -16,8 +16,11 @@
 
 #include "vt/ops.h"
 #include "vt/backend.h"
+#include "vt/rocm/rocm_arch.h"
 
+#include <array>
 #include <cstdlib>
+#include <mutex>
 #include <vector>
 
 namespace vt::rocm {
@@ -30,6 +33,29 @@ inline void Check(hipError_t err, const char* what) {
     throw std::runtime_error(std::string("vt rocm: ") + what + ": " +
                              hipGetErrorString(err));
   }
+}
+
+// Per-device, once: launch SharedK WMMA only when this device's gcnArchName is
+// gfx1200/gfx1201 (prefix). Not per-build, not getenv. Device kernel body
+// still uses VT_ROCWMMA_OK (#785).
+bool PrefillSharedKWmmaHostOk() {
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0) return false;
+  struct Slot {
+    std::once_flag once;
+    bool ok = false;
+  };
+  static std::array<Slot, 64> slots;
+  if (static_cast<unsigned>(dev) >= slots.size()) return false;
+  std::call_once(slots[static_cast<unsigned>(dev)].once, [dev] {
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+      slots[static_cast<unsigned>(dev)].ok = false;
+      return;
+    }
+    slots[static_cast<unsigned>(dev)].ok = GcnArchNameIsGfx12PrefillWmma(prop.gcnArchName);
+  });
+  return slots[static_cast<unsigned>(dev)].ok;
 }
 
 // Optional correctness path: run the CPU paged-attn oracle on host copies.
@@ -1736,7 +1762,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         return e[0] != '0';
       }();
       static const bool sharedk_wmma = [] {
-        // Default ON: d=256 Q-smem WMMA; d=512 global-Q WMMA (K+V only LDS).
+        // Default ON: d=256 Q-smem WMMA only. d=512 stays scalar SharedK
+        // until a separately gated kernel repair (shipping f58b spills).
         // =0 forces scalar SharedK for A/B.
         const char* e = std::getenv("VT_ATTN_PREFILL_SHAREDK_WMMA");
         if (!e) return true;
@@ -1754,10 +1781,10 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                   static_cast<size_t>(2 * bn) * static_cast<size_t>(d));
         };
         const unsigned z_groups = (qg == 8 && d == 512) ? 4u : 1u;
-        // Host must not launch WMMA stubs on non-gfx1200/1201 fatbin slices
-        // (kernel body is #else empty there → silent garbage out).
-#if defined(VT_ROCWMMA_OK)
-        if (sharedk_wmma) {
+        // Host must not launch WMMA stubs on non-gfx1200/1201 devices
+        // (kernel body is empty there → silent garbage out). Runtime prefix
+        // match on hipDeviceProp_t.gcnArchName; VT_ROCWMMA_OK is device-only.
+        if (sharedk_wmma && PrefillSharedKWmmaHostOk()) {
           if (d == 256) {
             // Q16K+K16K+V16K=48KB dyn + s_sc~4KB
             constexpr int BM = 16, BN = 32;
@@ -1774,25 +1801,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                     args.logits_soft_cap, args.causal, window_left, window_right);
             Check(hipGetLastError(), "paged_attention prefill_sharedk_wmma d256 launch");
             return;
-          } else if (d == 512) {
-            // Global Q; dyn K+V only BN16 → 32KB. Partial last tile scalar QK.
-            constexpr int BM = 16, BN = 16;
-            const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
-            dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
-            dim3 block(static_cast<unsigned>(BM * 32));
-            PagedAttnPrefillSharedKWmma<2, 16, BM, BN, true>
-                <<<grid, block, smem_kv(BN), st>>>(
-                    out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(),
-                    k_cache.Ptr<__hip_bfloat16>(), v_cache.Ptr<__hip_bfloat16>(),
-                    block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-                    query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-                    bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-                    args.logits_soft_cap, args.causal, window_left, window_right);
-            Check(hipGetLastError(), "paged_attention prefill_sharedk_wmma d512 launch");
-            return;
           }
         }
-#endif  // VT_ROCWMMA_OK
         if (d == 256) {
           constexpr int BM = 32, BN = 32;  // K+V 32KB; BM32 ~+2% vs BM16 @11k
           const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);

@@ -137,13 +137,25 @@ Music3ArWeights Music3LoadArWeights(const MiniMaxMusic3Paths& paths,
          std::to_string(out.lm_config.num_hidden_layers) + " vs " +
          std::to_string(config.language_model.num_hidden_layers) + ")");
   }
+  // BREAKDOWN ROWS. These are SPANS, not leaves: they sit INSIDE the
+  // `load.ar_weights` leaf that `minimax_music3_speech.cpp` brackets, so summing
+  // them would double-count the load. They exist to answer one question that no
+  // wall clock can — `SafetensorsFile` is an mmap and every tensor is COPIED out
+  // of it, so page-fault I/O and the copy are interleaved inside one call and
+  // "is the load I/O or CPU?" cannot be inferred from the total.
   std::vector<SafetensorsFile> shards;
-  shards.reserve(paths.language_model_shards.size());
-  for (const std::string& shard : paths.language_model_shards) {
-    shards.push_back(SafetensorsFile::Open(shard));
+  {
+    profile::Timer open_timer("load.ar.open_shards", /*span=*/true);
+    shards.reserve(paths.language_model_shards.size());
+    for (const std::string& shard : paths.language_model_shards) {
+      shards.push_back(SafetensorsFile::Open(shard));
+    }
   }
   if (shards.empty()) Fail("MiniMax-Music3: language_model has no safetensors shards");
-  out.lm = LoadQwen3ForCausalLMWeights(shards, out.lm_config);
+  {
+    profile::Timer lm_timer("load.ar.lm_weights", /*span=*/true);
+    out.lm = LoadQwen3ForCausalLMWeights(shards, out.lm_config);
+  }
   if (out.lm.embed_tokens.bytes.size() !=
       static_cast<size_t>(out.lm_config.vocab_size) *
           static_cast<size_t>(out.lm_config.hidden_size) * sizeof(uint16_t)) {
@@ -171,6 +183,7 @@ Music3ArWeights Music3LoadArWeights(const MiniMaxMusic3Paths& paths,
 
   const SafetensorsFile depth_file = SafetensorsFile::Open(
       (fs::path(paths.rvq_depth_decoder_dir) / "diffusion_pytorch_model.safetensors").string());
+  const auto depth_t0 = profile::Now();
   const auto depth_get = [&depth_file](const std::string& name) {
     return AtRuntimeDtype(depth_file.Get(name), name);
   };
@@ -197,9 +210,13 @@ Music3ArWeights Music3LoadArWeights(const MiniMaxMusic3Paths& paths,
         depth_get("audio_heads." + std::to_string(head) + ".weight"));
   }
 
+  profile::AddSince("load.ar.depth_weights", depth_t0, /*span=*/true);
+
   // ── the tokenizer ────────────────────────────────────────────────────────
+  const auto tok_t0 = profile::Now();
   out.tokenizer =
       tok::Tokenizer::FromHfJson((fs::path(paths.tokenizer_dir) / "tokenizer.json").string());
+  profile::AddSince("load.ar.tokenizer", tok_t0, /*span=*/true);
   return out;
 }
 

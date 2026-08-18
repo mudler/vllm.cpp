@@ -278,6 +278,8 @@ a spike while its user-facing serving surface is finalized.
 
 **DSpark block floor** (`SPEC-DSPARK-BLOCK-SIZE-GUARD`, ACTIVE, [#1225](https://github.com/mudler/vllm.cpp/issues/1225)). A speculative length below the draft's block was accepted silently: both `ResolveDspark` call sites passed `std::nullopt`, so the `k >= block` floor reached no user path, and our draft block is sized by `k` alone. It is refused now, with `block_size` supplying the floor when upstream's `dspark_block_size` is absent — one recorded divergence, because neither published Qwen3 draft sets that key. The GPU run gate that exhibits the garbling is owed.
 
+**DSpark draft routing** (`SPEC-DSPARK-QWEN3-ROUTING`, ACTIVE) makes the loader classify a DSpark draft from the draft's own `config.json` before it resolves anything else. `Qwen3DSparkModel`, `Gemma4DSparkModel` and — ahead of the pin, mirroring vllm#52197 — `DSparkDraftModel` with `model_type` `qwen3` take the landed Qwen3 lane; a draft that resolves to the DeepSeek-V4 DSpark lane is refused BY NAME instead of being rewritten into a stub. CPU-gated only: the token-exact run gate against the pinned oracle waits on a draft download and GPU time that are not authorized, so it stays owed (#1193).
+
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
 Unlike V3's fused `eh_proj`, the V4 nextn layer keeps separate `e_proj`/`h_proj`,

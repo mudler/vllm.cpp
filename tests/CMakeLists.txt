@@ -1139,6 +1139,11 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# SPEC-DSPARK-QWEN3-ROUTING (#1193): REACHABILITY of that classification — the
+# loader's own ResolveSpecConfig reads the draft's config.json and refuses the
+# DeepSeek-V4 DSpark lane by name, instead of trusting the CLI method string.
+vllm_cpp_add_test(test_dspark_draft_routing
+  vllm/entrypoints/test_dspark_draft_routing.cpp)
 # #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
 # refused by name, and an upstream key this engine does not implement is refused
 # with the missing part named, instead of being silently dropped.
@@ -1168,6 +1173,22 @@ vllm_cpp_add_test(test_expert_stream_latch
 vllm_cpp_add_test(test_weight_residency_reach
   vllm/entrypoints/test_weight_residency_reach.cpp)
 target_include_directories(test_weight_residency_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
+# only thing that proves the FLAG arrives: `test_weight_residency_reach` already
+# drives `vllm_engine_load` with the same JSON string, so a test that called the
+# ABI here would re-prove the ABI. `$<TARGET_FILE:vllm-cli>` resolves at generate
+# time, after every directory is processed; the build ORDER dependency is declared
+# in the top-level CMakeLists, where the `vllm-cli` target already exists.
+# Registered UNCONDITIONALLY, and with examples off it leaves `VLLM_CLI_BINARY`
+# undefined: the suite then exits 77 and CTest reports it Skipped, which is what
+# `SKIP_RETURN_CODE` above is for. Registering it only under the option would hide
+# the gate's absence instead of reporting it.
+vllm_cpp_add_test(test_cli_offload_config
+  vllm/entrypoints/test_cli_offload_config.cpp)
+if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_cli_offload_config
+    PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
 vllm_cpp_add_test(test_expert_slot_cache vllm/model_executor/test_expert_slot_cache.cpp)
@@ -1530,6 +1551,9 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
+vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
+  vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
 vllm_cpp_add_test(test_triton_aot_arch_dispatch
   vt/test_triton_aot_arch_dispatch.cpp)
 target_include_directories(test_triton_aot_arch_dispatch PRIVATE
@@ -1539,9 +1563,23 @@ target_include_directories(test_cpu_isa_x86 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cpu_isa_arm vt/test_cpu_isa_arm.cpp)
 target_include_directories(test_cpu_isa_arm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
-  # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
-  # case no-ops when the build has HIP but the box has no AMD GPU.
-  vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+# Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
+# case no-ops when the build has HIP but the box has no AMD GPU.
+vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+# #785 P1 GPU product-seam witness. Executable only — NOT add_test.
+# Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
+add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
+  vt/test_ops_paged_attn_sharedk_wmma_p1_gpu.cpp)
+target_include_directories(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR})
+if(TARGET vllm::sanitize_test_shared)
+  target_link_libraries(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
+    vllm::sanitize_test_shared vllm_test_main)
+else()
+  target_link_libraries(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
+    vllm::vllm vllm_test_main)
+endif()
+vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)

@@ -152,6 +152,11 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
                                                 const MiniMaxMusic3Config& config) {
   Music3AcousticWeights out;
 
+  // BREAKDOWN ROWS, all SPANS: they sit inside the `load.acoustic_weights` leaf
+  // and summing them would double-count it. `SafetensorsFile` is an mmap whose
+  // tensors are COPIED out, so the read and the copy are interleaved and the
+  // total cannot say which one it is.
+  const auto cond_t0 = profile::Now();
   const SafetensorsFile condition_file = SafetensorsFile::Open(
       (fs::path(paths.condition_encoder_dir) / "diffusion_pytorch_model.safetensors").string());
   const auto condition_get = [&condition_file](const std::string& name) {
@@ -161,21 +166,36 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
   out.condition.layer_scale = condition_get("layer_scale");
   out.condition.proj_weight = condition_get("proj.weight");
   out.condition.proj_bias = condition_get("proj.bias");
+  profile::AddSince("load.ac.condition", cond_t0, /*span=*/true);
 
+  const auto voc_t0 = profile::Now();
   const SafetensorsFile vocoder_file = SafetensorsFile::Open(
       (fs::path(paths.vocoder_dir) / "diffusion_pytorch_model.safetensors").string());
   out.vocoder = VocoderWeightsFromLoader(
       config.vocoder, MiniMaxMusic3LoadVocoderWeights(config.vocoder, vocoder_file));
+  profile::AddSince("load.ac.vocoder", voc_t0, /*span=*/true);
 
   if (paths.transformer_shards.empty()) {
     Fail("MiniMax-Music3: the transformer has no safetensors shards");
   }
+  // The two halves of the fp32 DiT's 9.7 GB: reading each tensor out of the
+  // mmap into a `std::map` of `std::vector<float>`, and then rebuilding the
+  // weight struct from that map. They are separated because they are different
+  // costs — the first touches every source page, the second is a pure host copy
+  // that touches no file at all — and only the second can be blamed on the
+  // loader rather than on the storage.
   std::map<std::string, std::vector<float>> dit;
-  for (const std::string& shard : paths.transformer_shards) {
-    const SafetensorsFile file = SafetensorsFile::Open(shard);
-    for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+  {
+    profile::Timer read_timer("load.ac.dit_read", /*span=*/true);
+    for (const std::string& shard : paths.transformer_shards) {
+      const SafetensorsFile file = SafetensorsFile::Open(shard);
+      for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+    }
   }
-  out.dit = DitWeightsFromTensors(config.transformer, dit);
+  {
+    profile::Timer build_timer("load.ac.dit_build", /*span=*/true);
+    out.dit = DitWeightsFromTensors(config.transformer, dit);
+  }
   return out;
 }
 

@@ -956,7 +956,38 @@ int LoadedEngine::ResolveNumBlocks(const EngineParams& params,
   //    fraction can be turned into a block count. Until that lands, fall back to
   //    the historical default so the default path is byte-identical.
   // TODO(ROAD-V1-MEM M3): profile run -> available_kv = free*util - non_kv.
-  return 256;
+  constexpr int kFallbackNumBlocks = 256;
+  // FIX-GPU-MEM-UTIL-INERT (#1165): this line is where an explicitly chosen
+  // fraction gets discarded, so this is where the engine has to say so. The
+  // flag is NOT refused: roadmap_v1.md:71 records the intent that it keeps
+  // vLLM's exact name and fraction semantics so a published vLLM launch line
+  // ports unchanged. What was wrong was accepting the value in silence, which
+  // left a user believing they had sized the KV pool when they had sized
+  // nothing.
+  //
+  // Only an EXPLICIT value warns. A default nobody set has nothing to report,
+  // and a line on every start is noise rather than a warning.
+  if (params.gpu_memory_utilization.has_value()) {
+    std::cerr
+        << "vllm.cpp: WARNING --gpu-memory-utilization "
+        << *params.gpu_memory_utilization
+        << " was accepted but did NOT size the KV cache.\n"
+           "vllm.cpp:   The profile run that turns a free-memory fraction into "
+           "a block count is not\n"
+           "vllm.cpp:   implemented yet (ROAD-V1-MEM M3, "
+           "https://github.com/mudler/vllm.cpp/issues/83).\n"
+           "vllm.cpp:   The pool fell back to "
+        << kFallbackNumBlocks
+        << " blocks. To size it today, pass\n"
+           "vllm.cpp:   --kv-cache-memory <bytes> for an absolute KV budget, or "
+           "--num-blocks <n> for an\n"
+           "vllm.cpp:   exact block count.\n";
+    // Unbuffered by the time the loader's next line lands, so the notice cannot
+    // be separated from the load it belongs to (same reason as the auto-fit
+    // INFO line in ResolveMaxModelLen).
+    std::cerr.flush();
+  }
+  return kFallbackNumBlocks;
 }
 
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(

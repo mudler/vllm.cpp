@@ -16,6 +16,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -2357,6 +2358,13 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
 #endif
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
+  // the same dtype every other arm of this o_proj returns.
+  if (!w.o_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated.t(),
+                                                        w.o_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
          : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
                : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
@@ -2464,7 +2472,18 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
       (Bf16GemmOutEnabled() && out.fp4) ? DType::kBF16 : DType::kF32;
   const auto project = [&](const Nvfp4Weight& fp4_weight,
                            const Fp8Weight& fp8_weight,
+                           const Fp8BlockWeight& block_weight,
                            const OwnedTensor& plain_weight) -> DBuf {
+    // MODEL-FP8-BLOCK-LINEAR (#1189 M4). FIRST, and exclusive: M3's loader
+    // fills the block field and leaves the bf16, per-tensor fp8 and fp4 ones
+    // EMPTY (qwen3_5_dense_weights.cpp), so a non-empty block weight IS the
+    // scheme. `out_dtype` is bf16 because that is upstream's `out_dtype` here
+    // -- the MODEL dtype (fp8.py:284) -- not the f32 the per-tensor arm below
+    // happens to use; a token gate cannot see a dtype that is too wide.
+    if (!block_weight.Empty()) {
+      return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, h, block_weight,
+                                                          DType::kBF16);
+    }
     if (fuse_qkv) {
       return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
                                     fp4_weight, q_out_dt, qkv_sf_sw_p);
@@ -2487,11 +2506,11 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                            : MatmulF32D(d, h, plain_weight);
   };
   out.q_owner.emplace(
-      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));
+      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj_fp8_block, w.q_proj));
   out.k_owner.emplace(
-      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj));
+      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj_fp8_block, w.k_proj));
   out.v_owner.emplace(
-      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj));
+      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj_fp8_block, w.v_proj));
   out.qgate = out.q_owner->t();
   out.key = out.k_owner->t();
   out.value = out.v_owner->t();
@@ -3777,6 +3796,19 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                                      GdnFp8MergedInProjDType(indt, outdt)}),
              "qwen3_5 split FP8 GDN qkv: the allocated mixed_qkv dtype and the "
              "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first on both projections.
+  // `indt`/`outdt` rather than a literal bf16 here, because the packed-decode
+  // predictor above derives the SAME dtype for this arm and a disagreement
+  // makes vt::GdnPackedDecode throw.
+  if (!w.in_proj_qkv_fp8_block.Empty()) {
+    out.mixed_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_qkv_fp8_block, indt));
+    out.z_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_z_fp8_block, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -3971,6 +4003,13 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4439,6 +4478,13 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4892,6 +4938,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -7006,6 +7059,21 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
   const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4). The dense SwiGLU MLP's three
+  // projections, exclusive and first. bf16 out on all three -- upstream's
+  // `out_dtype` is the model dtype (fp8.py:284) and `vt::MoeSiluMul` is
+  // templated on its input dtype, so gate/up feed it unchanged; down_proj's
+  // bf16 is what every other arm of this return already produces.
+  if (!w.gate_proj_fp8_block.Empty()) {
+    DBuf bg = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, dh, w.gate_proj_fp8_block, DType::kBF16);
+    DBuf bu = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, dh, w.up_proj_fp8_block, DType::kBF16);
+    DBuf bact(d, DType::kBF16, {T, I});
+    vt::MoeSiluMul(d.q, bact.t(), bg.t(), bu.t());
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, bact.t(), w.down_proj_fp8_block, DType::kBF16);
+  }
   DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out,
                                               gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)

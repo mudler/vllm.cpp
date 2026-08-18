@@ -242,12 +242,15 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // Host-lifetime helpers for ordinary dense CUDA models. The release function
 // drops only tensors whose authoritative raw/F32 device representation exists;
 // unused fallbacks stay host-resident. The caller synchronizes first.
-// MODEL-FP8-BLOCK-WEIGHT (#1189 M3), the M3/M4 seam. Throws by name when the
-// load produced a block-wise FP8 weight, because nothing in this build can read
-// one yet. Called from `PrepareQwen3_5Dense`, i.e. `ModelRegistry::Prepare`, so
-// a block-wise checkpoint LOADS and declines to run rather than falling through
-// to an empty bf16 tensor. Milestone M4 deletes it along with the gap.
-void RefuseUnconsumedQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights);
+// MODEL-FP8-BLOCK-LINEAR (#1189 M4), the M4/M5 seam. Throws by name when the
+// load produced a block-wise FP8 weight AND `device` has no block-scaled GEMM
+// to run it with. Inert on a device that has one, which is what M4 changed:
+// the forward reads these weights now, so the remaining gap is the kernel and
+// not the wiring. Called from `PrepareQwen3_5Dense`, i.e.
+// `ModelRegistry::Prepare`, so the refusal lands before the first forward and
+// before any graph capture. Milestone M5 deletes it along with the gap.
+void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
+                                          vt::DeviceType device);
 
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights);
 size_t ReleaseResidentQwen3_5DenseHostWeights(Qwen3_5DenseWeights& weights);

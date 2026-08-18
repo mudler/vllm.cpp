@@ -662,13 +662,19 @@ TEST_CASE("fp8 block weight: the per-tensor and bf16 arms are unchanged") {
 }
 
 // G7 -----------------------------------------------------------------------
-TEST_CASE("fp8 block weight: nothing consumes it yet and Prepare says so by name") {
-  // The M3/M4 seam. `ModelRegistry::Load` succeeds so the loader rung is
-  // reachable from a production entry point at this merge commit; nothing reads
-  // an `Fp8BlockWeight` yet, so `ModelRegistry::Prepare` — which every runner
-  // calls before the first forward (`src/vllm/v1/worker/gpu/runner.cpp:414`) —
-  // refuses rather than letting the dense `project` lambda fall through to an
-  // empty bf16 tensor.
+TEST_CASE("fp8 block weight: Prepare ACCEPTS a block checkpoint on a device that can run it") {
+  // The M3/M4 seam MOVED here, and this case is what proves it moved rather
+  // than merely being deleted. M3 refused every LOADED block weight at
+  // `ModelRegistry::Prepare`, because nothing could read one. M4 wires the
+  // dense forward, so on a CPU queue — where `vt::MatmulFp8BlockScaled` and
+  // `vt::QuantFp8Group` are both registered — Prepare must now SUCCEED.
+  //
+  // The refusal did not go away, it narrowed to a device with no block-scaled
+  // GEMM; that arm is asserted by name in
+  // `tests/vllm/model_executor/models/test_fp8_block_linear.cpp` G6, and the
+  // forward that makes this acceptance legitimate is asserted through
+  // `ModelRegistry::Forward` by G3 there. Asserting acceptance WITHOUT that
+  // pair would be a gate that passes because a guard was deleted.
   const TempCheckpoint ckpt(DenseFixture(ProjArm::kBlockBf16Scale));
   const HfConfig config = DenseConfig(BlockQuantJson());
   std::vector<SafetensorsFile> shards;
@@ -685,8 +691,18 @@ TEST_CASE("fp8 block weight: nothing consumes it yet and Prepare says so by name
   } catch (const std::exception& e) {
     message = e.what();
   }
-  REQUIRE_FALSE(message.empty());
-  CHECK(Names(message, "block-wise"));
-  CHECK(Names(message, "q_proj"));
-  CHECK(Names(message, "1189"));
+  // Empty, and the message is reported when it is not, because "Prepare threw
+  // something" and "Prepare threw the block-wise refusal" are different
+  // failures and only one of them is about this row.
+  INFO("Prepare threw: " << message);
+  CHECK(message.empty());
+
+  // ... and the fixture Prepare accepted really does carry a block-wise weight,
+  // so this is acceptance of the arm under test rather than of a fixture that
+  // quietly loaded bf16 and would have been accepted by M3 too.
+  const vllm::Qwen3_5DenseWeights w = LoadDense(ckpt, config);
+  const vllm::Fp8BlockWeight& q = w.layers[0].attn.q_proj_fp8_block;
+  REQUIRE_FALSE(q.Empty());
+  CHECK(q.block_n == 128);
+  CHECK(q.block_k == 128);
 }

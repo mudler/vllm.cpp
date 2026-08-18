@@ -15,6 +15,7 @@
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
@@ -675,7 +676,24 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
   // Public focused-loader seam historically describes the 27B checkpoint, which
   // is NVFP4 and declares no `weight_block_size`, so the default-constructed
   // block config here is the truthful one and the routing is unchanged.
-  const TensorExists has = [](const std::string&) { return true; };
+  //
+  // `has` ASKS THE RESOLVER (#1256). It used to answer `true` for every name,
+  // which was harmless while the only caller of `has` was a dtype probe that
+  // went on to `get` the tensor anyway and would throw on a name that was not
+  // there. M3's config/tensor cross-check made it harmful: it asks
+  // `has(proj + ".weight_scale_inv")` WITHOUT then fetching it, so a stub that
+  // says yes to everything reports a block-wise scale on a checkpoint that has
+  // none, and `IsFp8BlockProjection` refuses the disagreement it just invented.
+  // `TensorResolver` throws on a missing tensor, so probing it is the honest
+  // answer and the only one available at this seam.
+  const TensorExists has = [&get](const std::string& name) {
+    try {
+      (void)get(name);
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  };
   return LoadGdnDense(get, has, layer_base, Fp8BlockQuantConfig{});
 }
 
@@ -841,24 +859,28 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   return w;
 }
 
-// MODEL-FP8-BLOCK-WEIGHT (#1189 M3), the M3/M4 seam. The loader now BUILDS
-// `Fp8BlockWeight`s and no forward path reads one: `layers::MakeLinearMethod`
-// has no block arm and the dense `project` lambda
-// (`src/vllm/model_executor/models/qwen3_5.cpp`) knows only fp4, per-tensor fp8
-// and bf16, so an unwired block-wise checkpoint would fall through to an EMPTY
-// bf16 tensor and produce fluent wrong output. This runs from
-// `PrepareQwen3_5Dense`, i.e. `ModelRegistry::Prepare`, which every runner calls
-// unconditionally before the first forward and before any graph capture
-// (`src/vllm/v1/worker/gpu/runner.cpp:414,455`). The checkpoint therefore loads
-// and DECLINES to run; it never runs wrong. Deleted by #1189 milestone M4, which
-// makes the weight readable.
-void RefuseUnconsumedQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights) {
+// MODEL-FP8-BLOCK-LINEAR (#1189 M4), the M4/M5 seam, narrowing the M3/M4 one.
+//
+// M3 refused every LOADED block weight, because the dense forward knew only
+// fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
+// through to an EMPTY bf16 tensor. The forward reads them now
+// (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
+// what is left to refuse is a DEVICE with no kernel: `vt::MatmulFp8BlockScaled`
+// is a CPU correctness reference and the mainloop-scaled CUTLASS kernel is
+// milestone M5. This runs from `PrepareQwen3_5Dense`, i.e.
+// `ModelRegistry::Prepare`, which every runner calls unconditionally before the
+// first forward and before any graph capture
+// (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a
+// capture rather than inside the first GEMM. Deleted by M5.
+void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
+                                          vt::DeviceType device) {
+  if (dense_fp8_block::BlockFp8Runnable(device)) return;
   for (size_t l = 0; l < weights.layers.size(); ++l) {
     const Qwen3_5DenseLayerWeights& layer = weights.layers[l];
     const std::string base = "model.layers." + std::to_string(l) + ".";
-    const auto check = [&base](const Fp8BlockWeight& w,
-                               const std::string& suffix) {
-      if (!w.Empty()) RefuseUnconsumedFp8BlockWeight(base + suffix);
+    const auto check = [&base, device](const Fp8BlockWeight& w,
+                                       const std::string& suffix) {
+      if (!w.Empty()) RefuseUnrunnableFp8BlockWeight(base + suffix, device);
     };
     if (layer.is_linear_attention) {
       check(layer.gdn.in_proj_qkv_fp8_block, "linear_attn.in_proj_qkv");

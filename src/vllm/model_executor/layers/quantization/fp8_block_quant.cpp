@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/device.h"  // DeviceTypeName
 
 namespace vllm {
 namespace {
@@ -171,20 +172,23 @@ void RefuseUnsupportedFp8BlockQuant(const HfConfig& config) {
   (void)block;
 }
 
-void RefuseUnconsumedFp8BlockWeight(const std::string& proj) {
-  // Named, not merely refused: the projection so the reader knows this is a
-  // real loaded weight rather than a config guess, what is missing, what DOES
-  // work today, and the issue that owes the rest.
+void RefuseUnrunnableFp8BlockWeight(const std::string& proj,
+                                    vt::DeviceType device) {
+  // Named, not merely refused: the projection, so the reader knows this is a
+  // real loaded weight rather than a config guess; the DEVICE, because that is
+  // the thing that is wrong and the thing the reader can change; what does work
+  // today; and the issue that owes the rest.
   throw std::runtime_error(
       "block-wise (fine-grained) 128x128 FP8 weights LOADED for " + proj +
-      " and nothing in this build can execute them: there is no block-wise "
-      "FP8 linear method, so the checkpoint would run through an empty weight "
-      "and produce fluent wrong output. The loader, the weight and the CPU "
-      "reference GEMM are implemented; the linear method and the forward "
-      "wiring are milestone M4 of " +
+      " and there is no block-wise FP8 GEMM on device '" +
+      std::string(vt::DeviceTypeName(device)) +
+      "'. The linear method and the dense forward wiring are implemented and "
+      "the CPU reference GEMM executes them, so this checkpoint runs on CPU "
+      "today; the mainloop-scaled CUTLASS kernel that would run it here is "
+      "milestone M5 of " +
       std::string(kIssue) +
-      ". Per-tensor FP8 and NVFP4 checkpoints of the same architecture run "
-      "today.");
+      ". Per-tensor FP8 and NVFP4 checkpoints of the same architecture run on "
+      "this device today.");
 }
 
 }  // namespace vllm

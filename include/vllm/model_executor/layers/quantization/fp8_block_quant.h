@@ -38,6 +38,8 @@
 // block weight by name rather than letting the forward produce a number.
 #pragma once
 
+#include "vt/device.h"  // vt::DeviceType
+
 #include <string>
 #include <vector>
 
@@ -98,10 +100,14 @@ Fp8BlockQuantConfig ReadFp8BlockQuantConfig(const HfConfig& config);
 // not of one architecture.
 void RefuseUnsupportedFp8BlockQuant(const HfConfig& config);
 
-// The M3/M4 seam. A block-wise weight LOADS and nothing reads it yet, so the
-// model refuses to be prepared rather than letting a forward fall through to an
-// empty bf16 tensor and produce a fluent wrong answer. `proj` is the projection
-// that carries the weight, so the message names one instead of the class.
-[[noreturn]] void RefuseUnconsumedFp8BlockWeight(const std::string& proj);
+// The M4/M5 seam, narrowing M3's. The forward READS a block-wise weight now
+// (`layers::Fp8BlockLinearMethod`, quantization/fp8_block.h), so what is left
+// to refuse is a DEVICE with no block-scaled GEMM: `vt::MatmulFp8BlockScaled`
+// is a CPU correctness reference and the mainloop-scaled CUTLASS kernel is
+// milestone M5. `proj` is the projection that carries the weight, so the
+// message names one instead of the class, and `device` is the one that cannot
+// run it, so the reader is told what to change rather than what is missing.
+[[noreturn]] void RefuseUnrunnableFp8BlockWeight(const std::string& proj,
+                                                 vt::DeviceType device);
 
 }  // namespace vllm

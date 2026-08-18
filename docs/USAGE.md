@@ -596,7 +596,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 loads and does not run yet
+### Block-wise FP8 runs on CPU and refuses on CUDA
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -610,27 +610,45 @@ checkpoint declares `quantization_config.weight_block_size` in its
 `self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
 `self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
 
-That checkpoint now LOADS. The weights are read into a block-wise FP8 weight,
-the `BF16` scale is widened to `F32` by value the way vLLM widens it, and the
-config is cross-checked against the tensors so a disagreement is named rather
-than guessed at. Nothing can execute the weight yet, so the model refuses to
-finish preparing:
+That checkpoint now RUNS on a CPU queue. Ten projections of the Qwen3.5 dense
+model — `q_proj`, `k_proj`, `v_proj`, `o_proj`, the Gated-DeltaNet
+`in_proj_qkv`, `in_proj_z` and `out_proj`, and the MLP's `gate_proj`, `up_proj`
+and `down_proj` — quantize their activation per token per 128-wide group and
+then run a block-scaled GEMM whose scales apply in the mainloop, once per
+K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
+model dtype and what vLLM emits at the same sites.
+
+On a device with no block-scaled GEMM the model refuses while it is being
+prepared, before the first forward and before any CUDA graph is captured:
 
 ```text
 block-wise (fine-grained) 128x128 FP8 weights LOADED for
-model.layers.0.self_attn.q_proj and nothing in this build can execute them
+model.layers.0.self_attn.q_proj and there is no block-wise FP8 GEMM on device
+'cuda'. The linear method and the dense forward wiring are implemented and the
+CPU reference GEMM executes them, so this checkpoint runs on CPU today
 ```
+
+What exists on CPU is a correctness reference. It makes no speed claim, and no
+token-exact comparison against vLLM on this checkpoint has been recorded,
+because the GPU arm that would run one does not exist yet. Milestone M5 of
+[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
+mainloop-scaled CUTLASS kernel; [#1166](https://github.com/mudler/vllm.cpp/issues/1166)
+is the original report.
+
+One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
+paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
+both to share one dtype, so it refuses. That affects every BF16 arm rather than
+this one; it is tracked as
+[#1249](https://github.com/mudler/vllm.cpp/issues/1249). Leave the lever unset,
+which is the default.
 
 Two block-wise configurations are refused earlier, at load, because no build
 here implements them: an `activation_scheme` other than `dynamic`, and a
 `weight_block_size` other than `[128, 128]`. Both messages name the key and the
 value your `config.json` declares.
 
-Nothing is wrong with those checkpoints; the missing arm is in this project. To
-run the same model today, use a per-tensor FP8, BF16, NVFP4, or GGUF checkpoint
-of it. Issue [#1189](https://github.com/mudler/vllm.cpp/issues/1189) tracks the
-remaining milestones, and
-[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
+To run this model on a GPU today, use a per-tensor FP8, BF16, NVFP4, or GGUF
+checkpoint of it.
 
 ### A per-tensor scale has to be one F32 number
 

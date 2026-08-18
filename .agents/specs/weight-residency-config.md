@@ -82,10 +82,10 @@ Three findings shape the change:
 | Field | Content |
 |---|---|
 | Row ID | `ENG-RESIDENCY-CONFIG` (engine-matrix, KV cache and memory). Issue [#1110](https://github.com/mudler/vllm.cpp/issues/1110); fixes [#1109](https://github.com/mudler/vllm.cpp/issues/1109) in flow |
-| In | A vllm.cpp-original `WeightResidencyConfig` under the `vllm_cpp` key of the existing `--offload-config` document; its parser, which refuses an unknown key at every level of the document (the four legal top-level keys included) and a wrong-typed or non-positive field; a process-global install/resolve seam with a defined config-vs-env precedence and a late-install refusal; the three call sites that resolve these knobs today (`GgufLoadPolicy::FromEnv` for `mmap`, `PrefaultBorrowedSpan` for `prefault`, `Qwen35ExpertStreamRequested` + the `Qwen35ExpertStream` constructor for the streaming lane); the flag→`EngineParams`→install chain through both production entry points (`server_main.cpp` and the C ABI's `offload_config`); `docs/USAGE.md` and `docs/ENVIRONMENT.md` |
-| Out | Any change to `OffloadConfig`, `UVAOffloadConfig`, `PrefetchOffloadConfig` or their validator — the mirror stays byte-faithful. Any change to what the knobs *do*: this row moves where their value comes from and nothing else. A new flag. `VT_MOE_EXPERT_STREAM_STATS_EVERY` (see below). `VT_GGUF_KEEP_QUANT`, `VT_CPU_REF`, `VT_GGUF_KEEP_F16` and the rest of the load-transform family — they are a different tier and a different row |
-| Supported modes | `{"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},"expert_stream":{"enabled":bool,"slots":int,"slot_bytes":int}}}`. Every field is optional and every absent field means "unchanged", so an absent `vllm_cpp` key is byte-identical to today |
-| Dispatch behavior | Resolved from **env var if set, else config if set, else the built-in default**, at each read. `mmap` and `prefault` are read per load and per span; `expert_stream` is cached on first read and the two sizes are fixed when the slot store is built. Nothing is resolved when neither input is set, so the default engine path is byte-identical |
+| In | W2 adds the sixth knob and the three unreached entry points; W1 is everything below it. A vllm.cpp-original `WeightResidencyConfig` under the `vllm_cpp` key of the existing `--offload-config` document; its parser, which refuses an unknown key at every level of the document (the four legal top-level keys included) and a wrong-typed or non-positive field; a process-global install/resolve seam with a defined config-vs-env precedence and a late-install refusal; the three call sites that resolve these knobs today (`GgufLoadPolicy::FromEnv` for `mmap`, `PrefaultBorrowedSpan` for `prefault`, `Qwen35ExpertStreamRequested` + the `Qwen35ExpertStream` constructor for the streaming lane); the flag→`EngineParams`→install chain through both production entry points (`server_main.cpp` and the C ABI's `offload_config`); `docs/USAGE.md` and `docs/ENVIRONMENT.md`. **W2** ([#1127](https://github.com/mudler/vllm.cpp/issues/1127), [#1135](https://github.com/mudler/vllm.cpp/issues/1135)): a sixth key, `vllm_cpp.device_fit.weight_budget_bytes`, which takes over `VT_DEVICE_WEIGHT_BUDGET_BYTES`'s middle tier at `DeviceWeightBudgetBytes`; and the `--offload-config` document reaching `vllm-cli` and the server's pooling path, with the transcription-only path refusing the flag by name instead of dropping it |
+| Out | Any change to `OffloadConfig`, `UVAOffloadConfig`, `PrefetchOffloadConfig` or their validator — the mirror stays byte-faithful. Any change to what the knobs *do*: this row moves where their value comes from and nothing else. A new flag NAME: W2 gives `vllm-cli` the `--offload-config` spelling the server already uses, and adds no second flag for either tier. `VT_MOE_EXPERT_STREAM_STATS_EVERY` (see below). Honouring a weight-residency document on the transcription-only server path, which has no loader to honour it with (see `## Owed`). The nine other engine flags the pooling path also drops (see `## Owed`). `VT_GGUF_KEEP_QUANT`, `VT_CPU_REF`, `VT_GGUF_KEEP_F16` and the rest of the load-transform family — they are a different tier and a different row |
+| Supported modes | `{"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},"expert_stream":{"enabled":bool,"slots":int,"slot_bytes":int},"device_fit":{"weight_budget_bytes":int}}}`. Every field is optional and every absent field means "unchanged", so an absent `vllm_cpp` key is byte-identical to today. `slots` and `slot_bytes` must be positive; `weight_budget_bytes` must be non-negative, because `0` is the documented spelling of "suppress the device-fit refusal" |
+| Dispatch behavior | Resolved from **env var if set, else config if set, else the built-in default**, at each read. `mmap` and `prefault` are read per load and per span; `expert_stream` is cached on first read and the two sizes are fixed when the slot store is built; `weight_budget_bytes` is read once per GGUF load, at the fit check, and caches nothing. Nothing is resolved when neither input is set, so the default engine path is byte-identical |
 | Regimes served | A checkpoint larger than host RAM on a single box: the mmap-borrowed weight tower plus the bounded expert slot cache. CPU keep-quant expert towers today; a device platform serves the slice device-resident and is unaffected |
 
 ## Upstream chain
@@ -157,6 +157,10 @@ resolve sites have no input but `getenv`.
 | `expert_stream`, `slots`, `slot_bytes` resolve | `src/vllm/model_executor/models/qwen3_5.cpp`, `Qwen35ExpertStreamRequested` and the `Qwen35ExpertStream` constructor |
 | Docs | `docs/USAGE.md` (the streaming section gains the config form), `docs/ENVIRONMENT.md` (precedence note + the #1109 default correction) |
 | Named resolvers | `ResolveGgufMmap`, `ResolveGgufPrefault`, `ResolveExpertStreamRequested` (+ its pure `ExpertStreamRequestedFrom`), `ResolveExpertStreamSlots`, `ResolveExpertStreamSlotBytes` — one per knob, each the sole reader of its variable |
+| W2: the budget key | `device_weight_budget_bytes` in `WeightResidencyConfig`, parsed from `vllm_cpp.device_fit.weight_budget_bytes`, resolved by `ResolveDeviceWeightBudgetBytes` in the same pair |
+| W2: the budget call site | `DeviceWeightBudgetBytes` in `src/vllm/model_executor/model_loader/gguf_device_fit.cpp`, which keeps its name and its digits-only environment grammar and delegates the precedence to the resolver |
+| W2: the server flag, once | `src/vllm/entrypoints/openai/server_main.cpp` — the parse moves ahead of the architecture branch; the pooling path takes both halves; the transcription-only path refuses a non-empty document |
+| W2: `vllm-cli` | `examples/cli/main.cpp` — a `--offload-config` flag assigned to `vllm_model_params.offload_config`, which `src/capi/vllm_c.cpp` already parses for both halves |
 
 **Five knobs, five named resolvers, and the polarities are not the same.** Each
 knob gets one function in the new header that owns its environment NAME and its
@@ -264,6 +268,35 @@ New tests, each red before its implementation:
   stderr for a `--offload-config` document carrying only a `vllm_cpp` key. This
   is the test the reachability mutation deletes the call site under.
 
+W2 adds these, each red before its implementation:
+
+- `tests/vllm/config/test_weight_residency_config.cpp` gains the budget key: the
+  parse of `vllm_cpp.device_fit.weight_budget_bytes`, `0` ACCEPTED (it is the
+  documented spelling of "suppress the refusal", so the sibling rule that refuses
+  a non-positive value would be wrong here), a negative value refused, a
+  misspelled `device_fit` and a misspelled `weight_budget_bytes` each refused by
+  name, the three precedence cases, "absent means unchanged" across two partial
+  documents, and the absence of a latch — a late install of the budget after a
+  load is accepted.
+- `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp` gains the budget key's
+  REACHABILITY: the same synthetic GGUF and fake staging platform the environment
+  cases use, with NO variable set and the budget arriving through
+  `EngineParams::weight_residency`, asserting the refusal message and its byte
+  count. It is the case the reachability mutation deletes the install call site
+  under, and it also carries the environment-beats-config direction through the
+  loader.
+- `tests/vllm/entrypoints/openai/test_serve_residency_config.cpp` gains the two
+  server entry points: a model directory whose `config.json` names `LlamaModel`
+  takes the pooling branch AND prints the install line, and one that names
+  `ParakeetForCTC` takes the transcription branch and ABORTS when
+  `--offload-config` is non-empty while starting normally when it is absent.
+- `tests/vllm/entrypoints/test_cli_offload_config.cpp` — `vllm-cli`'s own
+  reachability, by running the built `vllm-cli` binary on a nonexistent model
+  with `--offload-config` and reading the install line off its stderr. A test
+  that called the C ABI directly would prove the ABI, which
+  `test_weight_residency_reach.cpp` already does; only running the binary proves
+  the FLAG arrives.
+
 **Two existing suites gain the observable their knob never had.** Both were found
 by the mutation pass, not by reading, and both are gaps that predate this row —
 the old inline `getenv` calls were equally unwatched:
@@ -307,6 +340,15 @@ claims none.
    ./build/tests/test_gguf_keep_quant
    ./build/tests/test_expert_stream_mixed_slot
    ```
+
+   W2 adds four more to that list:
+
+   ```sh
+   ./build/tests/test_gguf_device_fit
+   ./build/tests/test_gguf_device_fit_reach
+   ./build/tests/test_cli_offload_config
+   ./build/tests/test_offload_config
+   ```
 3. Every guarantee mutation-proven: for each added test, delete or invert the
    behavior it names, rebuild, require its suite red with a non-zero case count,
    restore by byte copy and verify by sha256. A mutation that fails to compile is
@@ -338,8 +380,8 @@ claims none.
 
 ## Work breakdown
 
-One wave. The change is one field wide at every hop, and splitting it would land
-a parser nothing reaches.
+W1 was one wave. The change is one field wide at every hop, and splitting it
+would have landed a parser nothing reaches.
 
 | Step | Content |
 |---|---|
@@ -348,7 +390,59 @@ a parser nothing reaches.
 | W1c | `EngineParams`, `server_main.cpp`, the C ABI, the install site, and both reachability suites |
 | W1d | `docs/USAGE.md`, `docs/ENVIRONMENT.md` (including the #1109 correction), the records |
 
+W2 closes two of W1's own `## Owed` entries in one change, because they edit the
+same two files. Splitting them would put two branches on `server_main.cpp`'s
+argument block and `weight_residency.cpp`'s parser at the same time.
+
+| Step | Content |
+|---|---|
+| W2a | `device_fit.weight_budget_bytes` ([#1127](https://github.com/mudler/vllm.cpp/issues/1127)): the parser key, the merge, the announce line, `ResolveDeviceWeightBudgetBytes`, and `DeviceWeightBudgetBytes` delegating to it |
+| W2b | The three entry points ([#1135](https://github.com/mudler/vllm.cpp/issues/1135)): the server's offload parse hoisted ahead of the architecture branch, the pooling path taking both halves, the transcription-only path refusing the flag, and `vllm-cli` gaining `--offload-config` |
+| W2c | `docs/USAGE.md`, `docs/ENVIRONMENT.md`, and this spec |
+
 ## Risks and decisions
+
+**W2 decisions.**
+
+- **The budget key is `vllm_cpp.device_fit.weight_budget_bytes`, not a scalar
+  beside `mmap` and `expert_stream`.** Two reasons. `vllm_cpp` maps a name to an
+  OBJECT today, and the parser's `ExtObject` walk depends on that; a bare scalar
+  sibling makes the level heterogeneous for one field. And the budget is a third
+  KNOB FAMILY — the load-time device-fit check — rather than a member of either
+  existing one, so it gets its own object exactly as they do. The field name drops
+  the family prefix, which is the transformation `VT_GGUF_MMAP` -> `mmap.enabled`
+  and `VT_MOE_EXPERT_STREAM_SLOTS` -> `expert_stream.slots` already use.
+- **`0` is legal for this key and illegal for its two integer siblings.** `slots`
+  and `slot_bytes` are sizes, and a zero size that silently became 64 is a cache
+  the operator does not have, so `ExtPositiveInt` refuses it. `0` on the budget is
+  the DOCUMENTED spelling of "suppress the device-fit refusal", identical to
+  `VT_DEVICE_WEIGHT_BUDGET_BYTES=0`, and `CheckDeviceWeightFit` reads a zero budget
+  as UNKNOWN and decides nothing. Refusing it would remove the escape hatch this
+  key exists to give. So the budget parses through `ExtNonNegativeInt` and a
+  negative value is still refused.
+- **The environment grammar does not change, and the config sits UNDER it.**
+  `DeviceWeightBudgetBytes` accepts decimal digits only: a sign, a space or
+  trailing garbage is ignored and the next tier stands. That tier used to be the
+  probe and is now the config, so a run with no config resolves byte-for-byte as
+  before. The rule is transcribed once, in `ResolveDeviceWeightBudgetBytes`, and
+  `DescribeEnvOverrides` asks the SAME predicate rather than reporting presence —
+  the #1122 L7 shape, where `SLOTS=banana` was announced as an override the
+  resolver ignored.
+- **The budget latches nothing.** It is read once per GGUF load, at the fit check,
+  through no static. A late install that sets it is therefore accepted, and
+  `ResidencyLatch` gains no enumerator. That is pinned rather than asserted: a case
+  installs a budget after a completed load and requires no throw.
+- **The transcription-only path refuses the flag rather than accepting it.**
+  AGENTS.md: refuse an unimplemented arm with a message that names the missing
+  part, and record the arm as owed. A warning would leave a server running while
+  it holds a placement instruction it does not follow, which is the shape #1135
+  was filed about. The cost is a launcher script that passes one flag to every
+  model and now has to stop passing it to an ASR model. See `## Owed` and #1195.
+- **The server parses `--offload-config` ONCE, ahead of the architecture branch.**
+  Three consumers over one parse, rather than three parses. It also moves the
+  typo refusal earlier than the `server: loading model from` line, so a mistyped
+  document now aborts before that line prints instead of after it.
+
 
 - **A namespaced key inside a mirrored flag can read as "vLLM takes this".** It
   does not. The key is literally `vllm_cpp`, which is the cheapest possible
@@ -702,23 +796,31 @@ count from the last `test cases:` match.
   `mincore()` over a host mirror, and the same instrument would apply here. Owned
   by `ENG-RESIDENCY-CONFIG`, issue
   [#1110](https://github.com/mudler/vllm.cpp/issues/1110).
-- **The config form does not reach three entry points, and two of them are
-  server-side.** `--offload-config` is parsed once, after the architecture
-  resolution, so the server's POOLING/embedding path
-  (`server_main.cpp`, the `if (pooling_model)` block) and its transcription-only
-  path build their `EngineParams` without it — the MIRRORED `uva`/`prefetch` half is
-  dropped there too, and has been since before this key existed, so this is a
-  pre-existing gap that the new key inherits rather than a regression. `vllm-cli`
-  has no such flag at all, which is a deliberate scope line (this row adds no new
-  flag) but is unrecorded. Both are documented in `docs/USAGE.md` beside the config
-  form so a reader is not left to discover it. Fixing the server half means moving
-  the offload parse ahead of the architecture branch, which is
-  `ENG-WEIGHT-OFFLOAD`'s surface as much as this one's. Owned by
-  `ENG-RESIDENCY-CONFIG`, issue
-  [#1135](https://github.com/mudler/vllm.cpp/issues/1135) — filed for this gap
-  specifically, because it was previously listed against
-  [#1122](https://github.com/mudler/vllm.cpp/issues/1122), the review issue this pull
-  request closes, so on landing the gap would have had no open issue (#1133 L8).
+- **The transcription-only server path cannot honour a weight-residency
+  document, so W2 refuses the flag there instead of wiring it.**
+  `ParakeetTranscriber::FromDir` (`src/vllm/multimodal/parakeet_transcription.cpp:49`)
+  builds no `EngineParams` and calls no `LoadedEngine`. It reads its weights
+  through `LoadParakeetForCTC` and `LoadParakeetTransducer`, so that path has no
+  `SetWeightResidencyConfig` call, no `CreateWeightOffloader` call, no GGUF
+  mapping and no expert slot store. There is no field of either half of the
+  document that any code on it could read. Wiring it means giving the
+  transcription stack a loader seam, which is a bigger change than #1135 and
+  belongs to whoever adds one. What W2 lands instead: the parse still runs, so a
+  typo is refused at startup exactly as on every other path, and a non-empty
+  `--offload-config` on that path aborts with a message naming the missing seam
+  rather than being dropped in silence. Owned by
+  `ARCH-ONE-SURFACE`, issue
+  [#1195](https://github.com/mudler/vllm.cpp/issues/1195).
+- **The pooling path builds `EngineParams` from 8 of the server's engine
+  flags.** W2 adds `offload_config` and `weight_residency` to it, because those
+  two are #1135's subject. The same block still drops `--device`,
+  `--scheduling-policy`, `--kv-transfer-config`, `--speculative-config`,
+  `--enable-jump-forward` and the multimodal limits, so `vllm-server --device
+  cuda` on an embedding model runs the accelerator-first probe instead of the
+  named device. That is the same shape as #1135 over a wider set of flags, it
+  predates this row, and the pooling dispatch block is `ARCH-ONE-SURFACE ROW 6`'s
+  surface rather than this row's. Owned by `SERVE-POOLING-ENDPOINTS`, issue
+  [#1196](https://github.com/mudler/vllm.cpp/issues/1196).
 
 ## Now
 
@@ -745,7 +847,23 @@ enumeration reaches the mirrored `uva`/`prefetch` sub-objects, which makes the A
 "anywhere in the document" true. `#1135` now owns the unreached-entry-point gap that
 was listed against the closing review issue.
 
+W2 closes #1127 and #1135. The document carries a sixth knob,
+`vllm_cpp.device_fit.weight_budget_bytes`, so the escape hatch for the load-time
+device-fit refusal is a config key on the same terms as its five siblings:
+`VT_DEVICE_WEIGHT_BUDGET_BYTES` still wins over it, `0` still suppresses the
+refusal, and a misspelling anywhere in the new level is refused by name. It is
+the only key here whose legal range includes zero, and the parser has a separate
+helper for that.
+
+The document also reaches two more entry points. `vllm-cli` takes
+`--offload-config` and passes it to the C ABI field that already parses both
+halves. The server parses the flag ONCE, ahead of the architecture branch, and
+the pooling path now takes both halves. The transcription-only path takes
+neither, because it has no loader seam that could read either — it REFUSES a
+non-empty document at startup and names what is missing, which is #1195.
+
 What keeps it `ACTIVE` rather than `DONE` is what is above under `## Owed`: nobody
 has yet driven the 370 GiB checkpoint through the JSON form on the box that can
-hold it, and the config form still does not reach the pooling, transcription or
-`vllm-cli` entry points.
+hold it, the transcription-only path refuses the document rather than honouring
+it (#1195), and the pooling path still drops the server's other engine flags
+(#1196).

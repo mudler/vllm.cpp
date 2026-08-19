@@ -1407,8 +1407,24 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   The lease W3 obtained was `thor:gpu0`, which is CUDA; the fleet
   (`rc devices`) carries no ROCm device and no Tenstorrent device, so this is
   BLOCKED on hardware rather than unattempted. What W3 can say is what it
-  measured: the seam's CUDA arm now runs on TWO architectures rather than one,
-  sm_110 here and sm_121a on GB10 for the W1 exit criterion.
+  measured: the seam's CUDA arm now runs on TWO architectures rather than one.
+
+  **THAT SENTENCE NAMED THE WRONG DEVICE AND THE WRONG ARCHITECTURE, and W5
+  corrected it ([#1361](https://github.com/mudler/vllm.cpp/issues/1361)).** It
+  read "sm_110 here and sm_121a on GB10 for the W1 exit criterion", while this
+  same file records at `## Work breakdown` W1 that the exit criterion was
+  measured on `orin:gpu0`, driver `12060` — a Jetson AGX Orin, which is neither
+  a GB10 nor `sm_121a`. The two architectures are real and the claim survives;
+  the attribution did not. What was measured, and where: the W1 exit criterion
+  (`cudaStreamEndCapture` then `cudaStreamBeginCapture` mid-forward with eager
+  work between) on `orin:gpu0`, and G1 plus the unit suite on `thor:gpu0` at
+  sm_110 for W3, W4 and W5. The exit criterion has NOT been re-measured on
+  `thor`, and the reason is structural rather than an omission: every migrated
+  driver opens `kFull`, so nothing in the tree re-begins a capture mid-forward,
+  and G1 exercises capture and replay rather than the re-begin. **`sm_121a` on
+  GB10 is OWED, not done** — W5 could not take it because `dgx:gpu0` was held by
+  another session for that stage's whole window. This is the shape where a
+  number quoted often starts being treated as measured.
   **W5 did NOT discharge it either, and the fleet answer is unchanged**:
   `rc devices` lists `dgx:gpu0`, `orin:gpu0` and `thor:gpu0`, all NVIDIA. This is
   the second stage to inherit the item and find the same wall, which is the
@@ -1455,6 +1471,19 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   seam (G2) and that a REPLAYED segment reproduces the eager forward (G1), and
   both need each model's own device kernels — V4's four `kCUDA`-registered
   families, Laguna's NVFP4 Marlin arm — rather than only a compiler.
+
+- **The W1 exit criterion on a THIRD architecture, `sm_121a` on GB10.** Filed as
+  its own item because #1361 found the record already claiming it. What has
+  actually been measured: the criterion on `orin:gpu0`, and G1 plus the unit
+  suite on `thor:gpu0` at sm_110. `dgx:gpu0` is the only `sm_121a` device on the
+  fleet and it was held by another session for the whole of W5's window
+  (`rc devices`: `busy`, past one hour). **It cannot be discharged by re-running
+  G1 there**, and that is the part worth writing down: every migrated driver
+  opens `kFull`, so nothing in this tree re-begins a capture mid-forward, and G1
+  therefore exercises capture and replay rather than the re-begin the criterion
+  is about. Discharging it needs the W1 probe itself run on GB10, or the first
+  PIECEWISE production driver — which is W6. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**.
 
   What settles all three: a CUDA build on a marlin-nvfp4 architecture — the same
   `thor:gpu0` (sm_110) shape W3 and W4 used — which compiles the Laguna and V4

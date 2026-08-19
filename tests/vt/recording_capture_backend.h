@@ -97,6 +97,19 @@ class RecordingCaptureBackend final : public vt::Backend {
   vt::Queue CreateQueue() override { return vt::Queue{}; }
   bool UnifiedMemory() const override { return true; }
 
+  // THE AUX-STREAM VOCABULARY, LOGGED. ENG-CUDAGRAPH-BREAK W5 (#1335) needs the
+  // D10 auto-join to be visible IN THE SAME SEQUENCE as the segment close, for
+  // the reason W1 had to put break markers into this log rather than into a
+  // private vector: two independently asserted sequences are satisfied by an
+  // implementation that interleaves nothing. The rule under test is an ORDER —
+  // "join before `EndCaptureGraph`" — so it is only assertable if both ends are
+  // in one trace. `SupportsAuxStream()` is true here because the CUDA backend
+  // reports true (`src/vt/cuda/cuda_backend.cu:200`) and D10 exists only for
+  // backends that do.
+  bool SupportsAuxStream() const override { return true; }
+  void RecordEvent(vt::Event&, vt::Queue&) override { log_.push_back("RecordEvent"); }
+  void QueueWaitEvent(vt::Queue&, vt::Event&) override { log_.push_back("QueueWaitEvent"); }
+
   bool SupportsGraphCapture() const override { return supports_capture_; }
   void BeginCapture(vt::Queue&) override {
     log_.push_back("Begin");

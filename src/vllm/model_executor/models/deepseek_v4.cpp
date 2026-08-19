@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -67,6 +68,7 @@
 #include "vt/ops.h"      // vt::MatmulBT (auto-dispatches kMatmulBTQuant on block weights)
 #include "vt/tensor.h"   // vt::Tensor::Contiguous
 #include "vt/backend.h"  // vt::GetBackend / Backend::Synchronize (device GEMM drain)
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W5: the shared capture seam
 
 namespace vllm {
 namespace {
@@ -1715,7 +1717,15 @@ struct V4Graph {
   float* res_cur = nullptr;
   float* res_nxt = nullptr;
   int64_t kv_base = 0;
-  void* graph = nullptr;
+  // ENG-CUDAGRAPH-BREAK W5 (#1335): the instantiated graph, its handle ownership
+  // and its release live in the SHARED SEAM instead of in a raw `void*` this
+  // class destroyed by hand. `vt::BreakableGraph` releases every segment it
+  // holds through `Backend::DestroyGraph`, which is the routing that lets
+  // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without editing
+  // this file. `gstate` STAYS: it is this driver's cold/warm/captured ladder,
+  // not a duplicate of `captured()` — the seam has no notion of the eager
+  // warm-run that grows the pool before a capture may allocate nothing.
+  vt::BreakableGraph graph;
   int gstate = 0;  // 0 cold (eager warm-run), 1 warm (capture+replay), 2 captured (replay)
   vt::Queue* qu = nullptr;
 
@@ -1766,9 +1776,8 @@ struct V4Graph {
       std::copy(pref.begin(), pref.end(), cache[static_cast<size_t>(l)].begin());
     }
   }
-  ~V4Graph() {
-    if (graph != nullptr && qu != nullptr) vt::GetBackend(qu->device).DestroyGraph(graph);
-  }
+  // No destructor: `graph` releases its own segments through
+  // `Backend::DestroyGraph`, so the hand-rolled one this replaced is gone.
 
   // The per-layer resident chain over the PERSISTENT buffers (the capture region).
   void RunChain(const V4Backend& be) {
@@ -1895,13 +1904,55 @@ struct V4Graph {
       RunChain(be);
       gstate = 1;
     } else if (gstate == 1) {   // warm: capture the region once, then replay it
-      b.BeginCapture(*be.q);
-      RunChain(be);
-      graph = b.EndCaptureGraph(*be.q);
-      b.ReplayGraph(*be.q, graph);
-      gstate = 2;
+      // ENG-CUDAGRAPH-BREAK W5 (#1335): the capture is the SHARED SEAM's, not
+      // this driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The
+      // scope owns the segment, the handle, its release, the drain a mid-capture
+      // throw needs, and the G3 counters.
+      //
+      // kFULL, INHERITED FROM W2 AND NOT RE-ARGUED. vLLM's v1 default
+      // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63` @ pin
+      // `5559679229`) is documented at `:630-632` as a FULL graph for DECODE
+      // batches and a piecewise one for prefill and mixed batches, and
+      // `decode_mode()` (`:65-66`) returns the full half. This is the T=1
+      // resident decode step, so its capture is ONE segment with the attention
+      // calls INSIDE it — byte-identical in shape to the region this replaces.
+      {
+        vt::GraphCaptureScope scope(b, *be.q, graph, vt::GraphCaptureMode::kFull);
+        RunChain(be);
+      }  // ~GraphCaptureScope closes the segment and files it on `graph`
+      // NOT CAPTURED covers TWO states and they mean opposite things.
+      //
+      //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph`
+      //     threw. Under stream capture NOTHING between `BeginCapture` and the
+      //     throw executed — every kernel was RECORDED — so `logits` holds
+      //     whatever the pool last left there, and returning it would hand this
+      //     step uncomputed device memory as its logits: no fault, and a token
+      //     gate cannot see it. It PROPAGATES, carrying the runtime's own
+      //     exception, which is what the pre-W5 driver's unguarded
+      //     `EndCaptureGraph` did.
+      //   * INERT (`capture_failed() == false`): capture is unsupported here, or
+      //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, `RunChain`
+      //     ran EAGERLY, and `logits` is a real result — so this step returns
+      //     normally and the driver stays in `gstate == 1`, running eager every
+      //     step rather than pretending to hold a graph.
+      if (!graph.captured()) {
+        if (graph.capture_failed()) {
+          const std::exception_ptr err = graph.capture_error();
+          graph.Reset();  // clear the failure with the graph it described
+          if (err) std::rethrow_exception(err);
+          VT_CHECK(false,
+                   "deepseek-v4 decode graph: the capture was ABANDONED and its logits "
+                   "were never computed; refusing to return uncaptured device memory");
+        }
+      } else {
+        graph.Replay(*be.q);
+        gstate = 2;
+      }
     } else {                    // captured: one cudaGraphLaunch
-      b.ReplayGraph(*be.q, graph);
+      // Through the seam's container, never `Backend::ReplayGraph` directly: it
+      // replays its segments in order (one, here, because this capture is kFull)
+      // and owns the G3 replay counter.
+      graph.Replay(*be.q);
     }
     // append this token's deck_new → cache[kv_base] (on the stream, AFTER the step's
     // graph produced deck_new, BEFORE the next replay reads it) — the growing KV.

@@ -1188,3 +1188,178 @@ TEST_CASE("Test 13d: a DRAINED capture records that it drained; an INERT scope d
     CHECK(g.capture_error() == nullptr);
   }
 }
+
+// ---------------------------------------------------------------------------
+// TEST 15 of `## Tests to port` — THE AUXILIARY-STREAM AUTO-JOIN (D10).
+// Port of `_end_current_segment` (`:353-361`) and of the `wait_stream` hook
+// (`:101-153`) that populates the set it walks. ENG-CUDAGRAPH-BREAK W5 (#1335).
+// ---------------------------------------------------------------------------
+//
+// WHY THIS COULD NOT BE WRITTEN BEFORE W5, and why the record says so rather
+// than implying the rule was always covered. W1 registered its break point on a
+// model that forks no auxiliary queue. W2, W3 and W4 all migrated drivers that
+// open `kFull`, which has exactly ONE segment and therefore no segment CLOSE
+// between two pieces of a forward for an outstanding fork to straddle. W5 is the
+// first stage that owns a driver whose fork is inside the captured region by
+// construction (`laguna.cpp:2572-2576` fork, `:2612` join).
+//
+// WHAT IT ASSERTS AND WHY IT IS AN ORDER. Closing a capture with an unjoined
+// fork FAILS at `cudaStreamEndCapture`, so "the join happened" is not the claim
+// — "the join happened BEFORE the close" is. Both ends are therefore asserted
+// out of ONE backend trace, for the same reason W1 had to move break markers
+// into the backend's own log: two independently asserted sequences are satisfied
+// by an implementation that interleaves nothing.
+TEST_CASE("BreakableGraph: an outstanding fork is joined BEFORE the segment closes") {
+  using vt::BreakableGraph;
+  using vt::GraphCaptureMode;
+  using vt::GraphCaptureScope;
+
+  // ARM 1, THE RULE. A fork registered inside a piecewise capture and never
+  // joined by the model is joined by the SCOPE, at the break point that closes
+  // the segment and again at the scope's own close.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    vt::Queue aux = b.CreateQueue();
+    vt::Event done = b.CreateEvent();
+    vt::ResetGraphBreakStats();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g, GraphCaptureMode::kPiecewise);
+      REQUIRE(scope.active());
+      // The model forks and tells the scope, exactly as `laguna.cpp` does.
+      vt::GraphNoteFork(aux, done);
+      CHECK(scope.outstanding_forks() == 1);
+      // ... and then hits a break point WITHOUT joining. Upstream's hazard.
+      vt::GraphBreak();
+      // The scope joined it, so nothing is outstanding for the next segment.
+      CHECK(scope.outstanding_forks() == 0);
+    }
+    REQUIRE(g.captured());
+    CHECK(g.segment_count() == 2);
+    CHECK(g.break_count() == 1);
+    // THE ORDER, out of one trace. `QueueWaitEvent` sits between the fork's
+    // `RecordEvent` and the `EndCaptureGraph` it protects, on the FIRST segment.
+    CHECK(b.Trace() ==
+          "Begin RecordEvent QueueWaitEvent EndCaptureGraph Begin EndCaptureGraph");
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    CHECK(s.forks_tracked == 1);
+    CHECK(s.forks_auto_joined == 1);
+  }
+
+  // ARM 2, THE CONTROL that makes arm 1 a distinction rather than a flag that is
+  // always set. The model joins its OWN fork before the break, which is what
+  // every shipped fork site actually does. The scope must then do NOTHING: no
+  // second wait, no extra event record, and `forks_auto_joined` stays 0. Without
+  // this arm an implementation that joined unconditionally on every segment
+  // close would pass arm 1 while issuing a redundant wait on every real step.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    vt::Queue aux = b.CreateQueue();
+    vt::Event done = b.CreateEvent();
+    vt::ResetGraphBreakStats();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g, GraphCaptureMode::kPiecewise);
+      REQUIRE(scope.active());
+      vt::GraphNoteFork(aux, done);
+      CHECK(scope.outstanding_forks() == 1);
+      b.RecordEvent(done, aux);      // the model's own join, first half
+      b.QueueWaitEvent(q, done);     // ... and its second half
+      vt::GraphNoteJoin(aux);        // the registration is retired
+      CHECK(scope.outstanding_forks() == 0);
+      vt::GraphBreak();
+      CHECK(scope.outstanding_forks() == 0);
+    }
+    REQUIRE(g.captured());
+    // ONE RecordEvent and ONE QueueWaitEvent in the whole trace — the model's.
+    CHECK(b.Count("RecordEvent") == 1);
+    CHECK(b.Count("QueueWaitEvent") == 1);
+    CHECK(b.Trace() ==
+          "Begin RecordEvent QueueWaitEvent EndCaptureGraph Begin EndCaptureGraph");
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    CHECK(s.forks_tracked == 1);
+    CHECK(s.forks_auto_joined == 0);
+  }
+
+  // ARM 3, `kFull`. The mode every migrated driver opens. A fork registered here
+  // is still tracked and is still joined before the ONE segment closes — which
+  // is the arm `laguna.cpp` actually takes, because its fork and join both sit
+  // inside `RunChain`. It is asserted rather than assumed, because "the set is
+  // empty so the rule is vacuous" is a claim about the MODEL, not about the seam,
+  // and a driver that returns early between its fork and its join would make it
+  // false without changing a line of this file.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    vt::Queue aux = b.CreateQueue();
+    vt::Event done = b.CreateEvent();
+    vt::ResetGraphBreakStats();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g, GraphCaptureMode::kFull);
+      REQUIRE(scope.active());
+      vt::GraphNoteFork(aux, done);
+      CHECK(scope.outstanding_forks() == 1);
+    }
+    REQUIRE(g.captured());
+    CHECK(g.segment_count() == 1);
+    CHECK(b.Trace() == "Begin RecordEvent QueueWaitEvent EndCaptureGraph");
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    CHECK(s.forks_auto_joined == 1);
+  }
+
+  // ARM 4, THE INERT SCOPE. Outside a capture, and inside a scope the backend
+  // cannot honour, both calls make ZERO backend calls and move no counter — the
+  // same pass-through guarantee `GraphBreak` gives, applied to the fork hooks.
+  // A model calls them unconditionally, so a version that tracked in the inert
+  // lane would issue joins on a forward that never captured.
+  {
+    RecordingCaptureBackend b(/*supports_capture=*/false);
+    vt::Queue q = b.CreateQueue();
+    vt::Queue aux = b.CreateQueue();
+    vt::Event done = b.CreateEvent();
+    vt::ResetGraphBreakStats();
+    vt::GraphNoteFork(aux, done);  // no scope at all
+    vt::GraphNoteJoin(aux);
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE_FALSE(scope.active());
+      vt::GraphNoteFork(aux, done);
+      CHECK(scope.outstanding_forks() == 0);
+    }
+    CHECK(b.Trace().empty());
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    CHECK(s.forks_tracked == 0);
+    CHECK(s.forks_auto_joined == 0);
+  }
+
+  // ARM 5, RE-REGISTERING ONE QUEUE. A model that forks the same auxiliary queue
+  // in two layers of one capture must leave ONE entry, not two: two entries make
+  // the auto-join issue two waits for one fork, and — the half that actually
+  // corrupts state — a single `GraphNoteJoin` would then retire only one of them
+  // and leave a joined queue looking outstanding forever.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    vt::Queue aux = b.CreateQueue();
+    vt::Event done = b.CreateEvent();
+    vt::ResetGraphBreakStats();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g, GraphCaptureMode::kFull);
+      REQUIRE(scope.active());
+      vt::GraphNoteFork(aux, done);
+      vt::GraphNoteFork(aux, done);
+      CHECK(scope.outstanding_forks() == 1);
+      vt::GraphNoteJoin(aux);
+      CHECK(scope.outstanding_forks() == 0);
+    }
+    CHECK(b.Count("QueueWaitEvent") == 0);
+    const vt::GraphBreakStats s = vt::GetGraphBreakStats();
+    CHECK(s.forks_tracked == 1);
+    CHECK(s.forks_auto_joined == 0);
+  }
+}

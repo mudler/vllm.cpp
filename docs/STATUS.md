@@ -152,7 +152,7 @@ token-for-token correctness against the pinned oracle.
 | Laguna-S-2.1 MoE (`LagunaForCausalLM`, 118B/8B) | **BINDING 2026-08-04: was 87% of vLLM (37.55 vs 43.10, same-tool nsys)**; root cause was bf16 projections on UNIFIED/ATS host memory, and device-resident staging (byte-exact) gives 44.6, parity+ vs 43.1, default-ON | 48 layers (12 global + 36 SWA-512), 256 routed top-10 + 1 shared expert, per-head softplus attn out-gate, sigmoid `noaux_tc` router, dual per-layer RoPE, GQA 8 KV / 128 head-dim, 1M ctx. History: benchmark-record |
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
-| LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs load inside the contract; one runs device-resident on GB10. Caption projection on `vt::MatmulBT` (#1208); IC-LoRA fusion on `vt::Matmul` (#1202), 143x, residual now the add-back (#1254). Render OWED |
+| LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs load inside the contract; one device-resident on GB10. Caption proj on `vt::MatmulBT` (#1208); LoRA fusion on `vt::Matmul` (#1202), add-back (#1254). #1286 REFUTED (#1317), alloc gated. Render OWED |
 | MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM + 2.4B fp32 DiT (§14). Depth 4.45x, wall 2.74x, WAV byte-identical (§16). No reference number |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
@@ -238,6 +238,38 @@ the capability held a pinned token-id block that was filled every step and never
 uploaded. So the classic-dense decline that costs a shipped model its decode
 graph under asynchronous serving is not one refactor away from removable. It
 stands, and the work it needs is now named rather than assigned.
+
+W5 (2026-08-19, #1335) migrates the last three, so ALL NINE drivers are on the
+seam and the migration is complete. These are the single-shape drivers: the
+DFlash draft graph, the DeepSeek V4 decode graph, and the Laguna decode graph,
+whose own source note asked for this seam by name. No hand-rolled capture call
+survives anywhere under `src/vllm/`.
+
+W5 also gives the seam the auxiliary-stream rule. Closing a graph segment while
+a side stream forked inside it is still recording is illegal, so the capture
+scope now tracks the forks opened since the segment began and joins any that are
+still outstanding before it closes. Every earlier stage captured in FULL mode,
+which has one segment and therefore no window for the rule to govern, so this is
+the first stage that could exercise it; the Laguna decode graph, whose fork sits
+inside the captured region by construction, is what reaches it.
+
+Bit-exactness against a replayed capture is still owed for four of the nine
+drivers, and for two of them so is the routing gate. The reasons are per driver
+and are recorded: DeepSeek V4 refuses a CPU queue before it reaches its capture,
+and Laguna's capture class only exists in a CUDA build with the Marlin NVFP4
+kernels. The DFlash driver's own gate landed red first.
+
+One half of that is closed. Laguna's capture class is behind a build flag, so a
+green CUDA build is equally consistent with the migrated code having been
+compiled OUT. Injecting an error into each migrated region and requiring the
+build to fail settles it: both regions are really compiled. What the two still
+owe is behavioural, and needs each model's own device kernels rather than only a
+compiler.
+
+Bit-exactness for the five drivers that HAVE it was re-measured at this stage's
+head on a leased GPU, because the shared capture-close path changed underneath
+them: five drivers, 2066 assertions, nothing differing over three consecutive
+replays each.
 
 W3 also closed a gate that could not fail. The mode a driver captures in was
 unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole

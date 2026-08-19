@@ -4652,15 +4652,41 @@ Nothing about this is new configuration to learn: there is no new flag, no new
 config key and no new command. The seam is a library surface
 (`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
 attention entry of `Qwen3ForCausalLM`. **Production steps now open a capture
-scope**, six of them as of W4: `Qwen3DenseDecodeGraph` (W2, #1261),
-`Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph` and `DeepseekV2DecodeGraph` (W3,
-#1291), and `Qwen3_5DecodeGraph` with `Qwen3_5DenseDecodeGraph` (W4, #1307).
-Every one of them opens the scope in FULL mode, mirroring the decode half of
-vLLM's v1 default `CUDAGraphMode.FULL_AND_PIECEWISE`, and a `vt::GraphBreak`
-inside a FULL scope takes its pass-through arm — so the switch still changes
-nothing about the break point beyond what it already changed about the decode
-graphs. This paragraph asserted the opposite until W4: it was written at W1,
-when it was true, and W2 falsified it without rewriting it here.
+scope, and as of W5 (#1335) ALL NINE decode and draft graphs do**:
+`Qwen3DenseDecodeGraph` (W2, #1261), `Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph`
+and `DeepseekV2DecodeGraph` (W3, #1291), `Qwen3_5DecodeGraph` with
+`Qwen3_5DenseDecodeGraph` (W4, #1307), and the DFlash draft graph, the DeepSeek
+V4 decode graph and the Laguna decode graph (W5, #1335). Every one of them opens
+the scope in FULL mode, mirroring the decode half of vLLM's v1 default
+`CUDAGraphMode.FULL_AND_PIECEWISE`, and a `vt::GraphBreak` inside a FULL scope
+takes its pass-through arm — so the switch still changes nothing about the break
+point beyond what it already changed about the decode graphs. This paragraph
+asserted the opposite until W4: it was written at W1, when it was true, and W2
+falsified it without rewriting it here.
+
+**W5 WIDENS WHAT THE SWITCH REACHES, and that is a user-visible change rather
+than an internal one.** The three single-shape drivers never read
+`VLLM_CPP_CUDAGRAPH` at all: each invented its own name — `VT_V4_DECODE_GRAPH`,
+`VT_DFLASH_GRAPH` and `VT_LAGUNA_DECODE_GRAPH` — so before W5 there was no single
+setting that turned capture off everywhere. There is now, and the three
+per-driver names STAY, because each is a same-binary A/B lever for exactly one
+driver rather than a copy of the shared one. Either turns its driver's capture
+off; `VLLM_CPP_CUDAGRAPH=0` turns all nine off at once.
+
+Turning capture off on those three does NOT return uncomputed memory, and the
+distinction is worth stating because it is invisible to a token gate. An INERT
+scope runs the forward eagerly, so the driver's buffers hold real values. A
+capture that FAILS is the opposite: under stream capture nothing between the
+begin and the failure executed, so those same buffers hold whatever the
+allocator last left there. The seam reports the two states apart and every
+migrated driver propagates the failure instead of returning the buffer.
+
+**The seam also owns the auxiliary-stream rule as of W5.** A model that forks a
+side stream inside a capture — the Laguna decode graph runs its FP4 shared
+expert that way — registers the fork with the capture scope, and the scope joins
+any fork still outstanding before it closes a segment, because ending a capture
+with an unjoined fork fails. There is nothing to configure: registration is part
+of the model's fork, and outside a capture both hooks do nothing at all.
 
 Building it needs no option. `src/vt/breakable_graph.cpp` and, since W4,
 `src/vt/persistent_step_input.cpp` — the capture-stable per-step device input

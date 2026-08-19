@@ -97,8 +97,8 @@ Both forms were already parsed; a failing anchor was dropped and covered by
 `any()`, and no symbol test ran. 32 of the 38 offenders are in range.
 `check-agent-record.py` now classifies each citation OK, STALE or BROKEN and
 gates the rot against `scripts/record-anchor-baseline.json` in both directions.
-Backlog **38** (32 stale, 6 broken) over 844 correct; `ACTIVE` and `READY` rows
-join the count. No product behavior changed.
+Backlog **38** (32 stale, 6 broken); `ACTIVE` and `READY` rows join the count.
+No product behavior changed.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by

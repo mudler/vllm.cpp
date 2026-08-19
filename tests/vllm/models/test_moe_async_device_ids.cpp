@@ -18,10 +18,30 @@
 // `tests/vllm/models/test_kimi_linear_paged.cpp` does for the same contract:
 // hand the RIGHT identifiers ONLY through `device_token_ids`, make the host
 // vector deliberately wrong, and require the logits to equal a run that had the
-// right host identifiers and no mirror. On CPU a host pointer is
-// device-addressable, so the contract is directly testable here.
+// right host identifiers and no mirror.
 //
-// THREE RUNS, because two of them cannot separate the cases:
+// WHAT CPU CANNOT SHOW, stated the right way round. `vt::Backend::Alloc` returns
+// HOST-addressable memory on this backend, so the mirror's buffer and the host
+// vector are the same kind of pointer and both refresh arms reduce to the same
+// `memcpy` from the same address. That is precisely why the DEVICE half of the
+// contract is NOT directly testable here: replacing
+// `PersistentStepInput::RefreshFromDevice` with `RefreshFromHost` leaves every
+// logit bit-identical and reds only the `device_refreshes`/`host_refreshes`
+// counters. Those counters are a legitimate stand-in for WHICH ARM RAN, and they
+// are what this file asserts; they gate the instrument, not the behaviour. The
+// two behavioural guarantees — that the copy reads DEVICE memory, and that it is
+// ordered on the main queue AFTER the runner's combine — are untested on any
+// device, and the spec's `## Owed` records that rather than implying otherwise.
+//
+// BOTH LANES, because the defect had two halves and only one of them could ever
+// have been declined. A case that constructs `StaticGraphCpu` gets the decode
+// GRAPH driver, because that harness is what makes the CPU platform answer
+// `support_static_graph_mode()` true. A case that does NOT construct it gets the
+// registry's EAGER arm (`ForwardDevice`), which is the lane every non-CUDA and
+// every non-pure-decode step takes and the lane no refusal could have mitigated.
+// Each registration owes the guarantee on both, so each is run twice.
+//
+// THREE RUNS per lane, because two of them cannot separate the cases:
 //
 //   A  right host ids, no mirror          -> the reference
 //   B  WRONG host ids, no mirror          -> must DIFFER from A
@@ -258,10 +278,16 @@ struct CachePool {
 constexpr int64_t kDsQkNope = 16, kDsQkRope = 8, kDsVHead = 16, kDsKvLora = 24;
 constexpr int64_t kDsHeads = 4, kDsE = 4, kDsMoeI = 16;
 
-std::string DsConfigJson() {
+// The SAME geometry serves BOTH registrations that reach `DeepseekV2DecodeGraph`.
+// `glm4_moe_lite_registry.cpp` loads `DeepseekV2Weights` through the identical
+// loader and dispatches to the identical driver; the only thing that differs is
+// which registry forward publishes the scope, which is exactly the call site
+// #1305 changed and the one nothing gated before this file.
+std::string DsConfigJson(const char* architecture = "DeepseekV2ForCausalLM",
+                         const char* model_type = "deepseek_v2") {
   nlohmann::json j;
-  j["architectures"] = std::vector<std::string>{"DeepseekV2ForCausalLM"};
-  j["model_type"] = "deepseek_v2";
+  j["architectures"] = std::vector<std::string>{architecture};
+  j["model_type"] = model_type;
   j["hidden_size"] = kH;
   j["num_hidden_layers"] = kL;
   j["num_attention_heads"] = kDsHeads;
@@ -447,11 +473,84 @@ size_t Differing(const std::vector<float>& a, const std::vector<float>& b) {
   return n;
 }
 
+// THE A/B/C TRIPLE, over whichever lane the CALLER has already put the registry
+// in. Constructing `StaticGraphCpu` before calling this routes the step into the
+// decode-GRAPH driver; not constructing it leaves the CPU platform answering
+// `support_static_graph_mode()` false, which is the registry's EAGER arm.
+//
+// `through_seam` IS AN ASSERTION AND NOT DECORATION, and it is what makes the
+// two lanes distinguishable from inside one helper. The graph driver refreshes a
+// `vllm::StepTokenIds`, so it moves `vt::PersistentStepInput`'s process-wide
+// counters once per step; the eager arms copy the override straight over their
+// own per-step `DBuf` and must never touch that seam at all. Checking the
+// counters BOTH ways means a change that quietly moved a case onto the other
+// lane could not keep it green.
+template <class Pool>
+void AbcTriple(const Fixture& fx, bool through_seam, int steps = 4) {
+  const int64_t want = through_seam ? steps : 0;
+
+  // RUN A — the reference: the identifiers arrive on the host, no mirror.
+  vt::ResetStepInputStats();
+  const std::vector<std::vector<float>> ref =
+      Run<Pool>(fx, /*stale_host=*/false, /*mirror=*/false, steps);
+  {
+    const vt::StepInputStats s = vt::GetStepInputStats();
+    // On the graph lane the slot binds once and refreshes from the HOST every
+    // step; with no mirror the device arm must never be taken. On the eager lane
+    // NOTHING binds, which is how this case proves it is on the other lane.
+    CHECK(s.host_refreshes == want);
+    CHECK(s.device_refreshes == 0);
+    if (through_seam) {
+      CHECK(s.binds >= 1);
+    } else {
+      CHECK(s.binds == 0);
+    }
+  }
+
+  // RUN B — THE CONTROL. Stale host identifiers and no mirror: the logits must
+  // MOVE. Without this arm a model that ignored its identifiers entirely would
+  // satisfy run C.
+  vt::ResetStepInputStats();
+  const std::vector<std::vector<float>> stale =
+      Run<Pool>(fx, /*stale_host=*/true, /*mirror=*/false, steps);
+  CHECK(vt::GetStepInputStats().device_refreshes == 0);
+  // EVERY step is compared, and what each one MEANS depends on the lane. On the
+  // eager lane every step recomputes, so every comparison is a live one. On the
+  // graph lane a CPU "replay" recomputes nothing — it returns the slot's
+  // persistent logits unchanged — so steps 2 and 3 hold what step 1 produced and
+  // the comparison is true for that reason there. On a DEVICE a replay
+  // recomputes, and those steps become the assertion the reported defect is
+  // actually about: that a REPLAY does not generate from stale identifiers.
+  for (int t = 0; t < steps; ++t) CHECK(Differing(ref[t], stale[t]) > 0);
+
+  // RUN C — THE GATE. The same stale host vector, with the true identifiers
+  // reaching the model ONLY through `device_token_ids`.
+  vt::ResetStepInputStats();
+  const std::vector<std::vector<float>> via_device =
+      Run<Pool>(fx, /*stale_host=*/true, /*mirror=*/true, steps);
+  {
+    const vt::StepInputStats s = vt::GetStepInputStats();
+    // THE SEAM, ASSERTED on the lane that owes it. `device_refreshes` moves only
+    // inside `vt::PersistentStepInput::RefreshFromDevice`; a hand-rolled copy in
+    // the graph driver would produce identical logits and leave this at zero.
+    CHECK(s.device_refreshes == want);
+    CHECK(s.host_refreshes == want);
+  }
+  size_t differing = 0;
+  for (int t = 0; t < steps; ++t) differing += Differing(ref[t], via_device[t]);
+  CHECK(differing == 0);
+  MESSAGE("registry forward, mirror vs host reference, bit for bit: "
+          << steps << " steps x " << ref[0].size() << " values, " << differing
+          << " differing");
+}
+
 }  // namespace
 
+// ─── Qwen3-MoE: `qwen3_moe_registry.cpp`, both lanes ─────────────────────────
+
 TEST_CASE(
-    "Qwen3MoeForCausalLM embeds the async mirror's DEVICE ids, not the stale host "
-    "vector") {
+    "Qwen3MoeForCausalLM GRAPH arm embeds the async mirror's DEVICE ids, not the "
+    "stale host vector") {
   Fixture fx(ConfigJson(), BuildTensors());
   REQUIRE(fx.cfg.num_experts == kE);
   REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
@@ -461,98 +560,68 @@ TEST_CASE(
   // registries so the driver's OWN predicate is what routes, exactly as the
   // seam gates do.
   StaticGraphCpu harness;
-
-  constexpr int kSteps = 4;
-
-  // RUN A — the reference: the identifiers arrive on the host, no mirror.
-  vt::ResetStepInputStats();
-  const std::vector<std::vector<float>> ref = Run<CachePool>(fx, /*stale_host=*/false,
-                                                  /*mirror=*/false, kSteps);
-  {
-    const vt::StepInputStats s = vt::GetStepInputStats();
-    // The slot binds once and refreshes from the HOST every step; with no mirror
-    // the device arm must never be taken.
-    CHECK(s.host_refreshes == kSteps);
-    CHECK(s.device_refreshes == 0);
-    CHECK(s.binds >= 1);
-  }
-
-  // RUN B — THE CONTROL. Stale host identifiers and no mirror: the logits must
-  // MOVE. Without this arm a model that ignored its identifiers entirely would
-  // satisfy run C.
-  vt::ResetStepInputStats();
-  const std::vector<std::vector<float>> stale = Run<CachePool>(fx, /*stale_host=*/true,
-                                                    /*mirror=*/false, kSteps);
-  CHECK(vt::GetStepInputStats().device_refreshes == 0);
-  // EVERY step is compared, and what each one MEANS depends on the harness. On
-  // CPU only the cold and capture steps recompute — a CPU "replay" returns the
-  // slot's persistent logits unchanged — so steps 2 and 3 hold what step 1
-  // produced and the comparison is true for that reason there. On a DEVICE a
-  // replay recomputes, and those steps become the assertion the reported defect
-  // is actually about: that a REPLAY does not generate from stale identifiers.
-  // Asserting them costs nothing here and makes this file the device gate the
-  // moment it runs on one.
-  for (int t = 0; t < kSteps; ++t) CHECK(Differing(ref[t], stale[t]) > 0);
-
-  // RUN C — THE GATE. The same stale host vector, with the true identifiers
-  // reaching the model ONLY through `device_token_ids`.
-  vt::ResetStepInputStats();
-  const std::vector<std::vector<float>> via_device = Run<CachePool>(fx, /*stale_host=*/true,
-                                                         /*mirror=*/true, kSteps);
-  {
-    const vt::StepInputStats s = vt::GetStepInputStats();
-    // THE SEAM, ASSERTED. `device_refreshes` moves only inside
-    // `vt::PersistentStepInput::RefreshFromDevice`; a hand-rolled copy in the
-    // driver would produce identical logits and leave this at zero.
-    CHECK(s.device_refreshes == kSteps);
-    CHECK(s.host_refreshes == kSteps);
-  }
-  size_t differing = 0;
-  for (int t = 0; t < kSteps; ++t) differing += Differing(ref[t], via_device[t]);
-  CHECK(differing == 0);
-  MESSAGE("registry forward, mirror vs host reference, bit for bit: "
-          << kSteps << " steps x " << ref[0].size() << " values, " << differing
-          << " differing");
+  AbcTriple<CachePool>(fx, /*through_seam=*/true);
 }
 
+// THE EAGER HALF, which is the half no decline could ever have mitigated and the
+// half nothing in this tree gated. `ForwardQwen3MoeForCausalLM` falls through to
+// `Qwen3MoeModel::ForwardDevice` on every step that is not pure-decode-on-a
+// -static-graph platform, and `ForwardBody` embeds there from the HOST vector.
+// Before #1305 that arm never looked at `device_token_ids` either, so on the
+// asynchronous serving path it generated from the previous step's identifiers
+// exactly like the graph arm did. NO harness here: a plain CPU platform answers
+// `support_static_graph_mode()` false, so the registry's own predicate routes.
 TEST_CASE(
-    "DeepseekV2ForCausalLM embeds the async mirror's DEVICE ids, not the stale host "
-    "vector") {
+    "Qwen3MoeForCausalLM EAGER arm embeds the async mirror's DEVICE ids, not the "
+    "stale host vector") {
+  Fixture fx(ConfigJson(), BuildTensors());
+  REQUIRE(fx.cfg.num_experts == kE);
+  AbcTriple<CachePool>(fx, /*through_seam=*/false);
+}
+
+// ─── DeepSeek-V2: `deepseek_v2_registry.cpp`, both lanes ─────────────────────
+
+TEST_CASE(
+    "DeepseekV2ForCausalLM GRAPH arm embeds the async mirror's DEVICE ids, not "
+    "the stale host vector") {
   Fixture fx(DsConfigJson(), DsBuildTensors());
   REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
                   "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
   StaticGraphCpu harness;
+  AbcTriple<DsCachePool>(fx, /*through_seam=*/true);
+}
 
-  constexpr int kSteps = 4;
+TEST_CASE(
+    "DeepseekV2ForCausalLM EAGER arm embeds the async mirror's DEVICE ids, not "
+    "the stale host vector") {
+  Fixture fx(DsConfigJson(), DsBuildTensors());
+  AbcTriple<DsCachePool>(fx, /*through_seam=*/false);
+}
 
-  vt::ResetStepInputStats();
-  const std::vector<std::vector<float>> ref =
-      Run<DsCachePool>(fx, /*stale_host=*/false, /*mirror=*/false, kSteps);
-  {
-    const vt::StepInputStats s = vt::GetStepInputStats();
-    CHECK(s.host_refreshes == kSteps);
-    CHECK(s.device_refreshes == 0);
-    CHECK(s.binds >= 1);
-  }
+// ─── GLM-4-MoE-Lite: `glm4_moe_lite_registry.cpp`, THE THIRD REGISTRATION ────
+//
+// #1305 changed THREE registry forwards and the PR that landed it mutated TWO.
+// This one shares `DeepseekV2DecodeGraph` and `DeepseekV2Model` with
+// `deepseek_v2_registry.cpp` down to the weights struct, so the only thing it
+// owns — and the only thing a gate on the other two can prove nothing about — is
+// its OWN `detail::DeviceTokenIdsScope`. Deleting that one scope leaves both
+// DeepSeek cases green, which is why this case exists as a separate one rather
+// than as a comment claiming coverage.
+TEST_CASE(
+    "Glm4MoeLiteForCausalLM GRAPH arm embeds the async mirror's DEVICE ids, not "
+    "the stale host vector") {
+  Fixture fx(DsConfigJson("Glm4MoeLiteForCausalLM", "glm4_moe_lite"),
+             DsBuildTensors());
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
+  StaticGraphCpu harness;
+  AbcTriple<DsCachePool>(fx, /*through_seam=*/true);
+}
 
-  vt::ResetStepInputStats();
-  const std::vector<std::vector<float>> stale =
-      Run<DsCachePool>(fx, /*stale_host=*/true, /*mirror=*/false, kSteps);
-  CHECK(vt::GetStepInputStats().device_refreshes == 0);
-  for (int t = 0; t < kSteps; ++t) CHECK(Differing(ref[t], stale[t]) > 0);
-
-  vt::ResetStepInputStats();
-  const std::vector<std::vector<float>> via_device =
-      Run<DsCachePool>(fx, /*stale_host=*/true, /*mirror=*/true, kSteps);
-  {
-    const vt::StepInputStats s = vt::GetStepInputStats();
-    CHECK(s.device_refreshes == kSteps);
-    CHECK(s.host_refreshes == kSteps);
-  }
-  size_t differing = 0;
-  for (int t = 0; t < kSteps; ++t) differing += Differing(ref[t], via_device[t]);
-  CHECK(differing == 0);
-  MESSAGE("registry forward, mirror vs host reference, bit for bit: "
-          << kSteps << " steps x " << ref[0].size() << " values, " << differing
-          << " differing");
+TEST_CASE(
+    "Glm4MoeLiteForCausalLM EAGER arm embeds the async mirror's DEVICE ids, not "
+    "the stale host vector") {
+  Fixture fx(DsConfigJson("Glm4MoeLiteForCausalLM", "glm4_moe_lite"),
+             DsBuildTensors());
+  AbcTriple<DsCachePool>(fx, /*through_seam=*/false);
 }

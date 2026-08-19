@@ -57,7 +57,7 @@ The first series free of both, at the pin, graphed, and at a pinned clock is in
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 ROLLBACK, SUPERSEDED | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x, VOID as ratios (#520, #414). At the pin, clocks pinned: **0.995x c1 / 0.946x c4 TPOT**. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 ROLLBACK, SUPERSEDED | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | OPEN: TTFT/TPOT/E2E 1.085/1.017/1.029x, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
-| Qwen3.8-27B | bf16 (@`1d4bf0f2`) | 0.26.0.dev0 at the pin, graphed, clocks 2184 MHz | **1 of 3 concurrency cells** | Token gate PASSES. Only c4 is like-for-like: tput **0.963x**, ITL **1.008x**. c1/c8 tput NOT ESTABLISHED: we failed 1/6 and ~11/48 requests, vLLM none ([#931](https://github.com/mudler/vllm.cpp/issues/931)) |
+| Qwen3.8-27B | bf16 (@`1d4bf0f2`) | 0.26.0.dev0 at the pin, graphed; c4 at a pinned 2184 MHz, the 2026-08-19 re-measure SAMPLED only | **1 of 3 concurrency cells** | Token gate PASSES. c4 like-for-like: tput **0.963x**, ITL **1.008x**. c1 re-measured COMPLETE, pairing DISCARDED on clock spread; c8 vLLM denominator NOT MEASURABLE ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 
 ### GDN prefill kernels by GPU
 
@@ -197,9 +197,9 @@ record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fi
 | Axis | c1 | c4 | c8 |
 |---|---:|---:|---:|
 | Requests completed, ours / vLLM | 5,5,5 / 6,6,6 of 6 | 24,24,24 / 24,24,24 of 24 | 36,37,36 / 48,48,48 of 48 |
-| Output token throughput | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | **0.963x** | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) |
+| Output token throughput | NOT ESTABLISHED as a ratio; both arms' absolutes are re-measured below | **0.963x** | NOT ESTABLISHED as a ratio; ours is re-measured below and vLLM has no leg |
 | Total token throughput | NOT ESTABLISHED | **0.918x** | NOT ESTABLISHED |
-| Status of the two withheld cells | cause LANDED: the drop was our own SSE keepalive frame, and `VT_SERVER_SSE_PING_S` now defaults to 0 ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | (cell stands) | still withheld, now awaiting the paired 3-rep re-run owed by [#915](https://github.com/mudler/vllm.cpp/issues/915), not a diagnosis |
+| Status of the two withheld cells | SUPERSEDED 2026-08-19 by the re-measure rows below: the cause was our SSE keepalive frame and our arm now completes every request ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | (cell stands) | SUPERSEDED: our arm is complete, and the missing half is now vLLM's, for a different reason ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 | Median ITL, over completed only | 1.013x | **1.008x** | 1.021x |
 | Median TPOT, over completed only | 1.014x | 0.980x | 0.925x |
 | Median TTFT, over completed only | 0.733x | 0.881x | 1.268x |
@@ -210,6 +210,22 @@ record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fi
 | Why that ratio is not like-for-like | ours answers `/health` on process liveness only (`api_server.cpp:286-294`); no dummy run, no kernel warmup, decode CUDA graph captures lazily on first use | vLLM warms up and captures before it serves (`gpu_worker.py:697-708`, `api_server.py:780-785`) | 53 s is "weights loaded", 780 s is "warmed and graph-captured" |
 | What our readiness signal defers | first request TTFT **91.613 s**, the same with the SSE keepalive on and off, so it is genuine first-inference cost, not the [#931](https://github.com/mudler/vllm.cpp/issues/931) defect | cell stands as measured; a like-for-like comparison has not been taken | forensics in `.agents/benchmark-record.md` |
 | Host memory after warmup | **42.5 vs 110.1 GiB = 2.59x**, but vLLM's is set by `--gpu-memory-utilization 0.85` pre-reserving KV, so it is what the configured engine holds, not what the model needs | | |
+| **RE-MEASURED 2026-08-19, absolutes only** ([#915](https://github.com/mudler/vllm.cpp/issues/915), [#979](https://github.com/mudler/vllm.cpp/issues/979)) | ours **4.4040 tok/s** (CV 0.039%), vLLM **4.2835 tok/s** (CV 0.033%) | (cell stands) | ours **22.6402 tok/s** (CV 0.205%); vLLM **NOT MEASURABLE**, below |
+| Requests completed on the re-measure | ours 6,6,6 of 6; vLLM 6,6,6 of 6; `failed=0` every leg | (cell stands) | ours 48,48,48 of 48, `failed=0`; 162/162 over the whole series |
+| Median TPOT / ITL on the re-measure | ours 218.11 / 216.56 ms; vLLM 228.36 / 226.86 ms | (cell stands) | ours 250.57 / 232.83 ms |
+| **Why no c1 ratio is quoted** | `gpu_clock_state compare` returned `PAIRING_VERDICT=DISCARD` on all three pairings. The ratio is OWED, not withheld for being unflattering | (cell stands) | no vLLM leg exists to pair |
+| What the clock gate actually refused | cross-arm rule PASSED: same boot, both arms 2489 MHz, median offset **0.0%**. The within-run rule FAILED on both arms | (cell stands) | ours 12.92-14.99% spread, same breach |
+| Within-run SM-clock spread, 5% ceiling | ours 13.58 / 26.36 / 14.34%, vLLM 10.16 / 17.48 / 18.52%; `SwThermal` in every window, `HwSlowdown+HwThermal` in one | (cell stands) | **all six of our legs and all three vLLM legs breached it** |
+| Clocks were SAMPLED, never pinned | `nvidia-smi -lgc` returns `LGC_RC=4`, permission denied, as root inside an `rc` lease. Every prior pinned figure used the retired `ssh`+`flock` path | (cell stands) | same lease, same refusal |
+| **vLLM c8 denominator** | (c1 landed) | (cell stands) | **NOT MEASURABLE on this box at the recorded config**, which is the answer and not a gap. Not a claim that vLLM is defective |
+| Evidence for that verdict | (c1 landed: vLLM's own c1 cold start was 426 s and all three legs ran) | (cell stands) | `/health` at 373 s, then the worker was lost during warmup; the KV reservation took **48,715 MB in one 4 s window** (58,453 -> 9,738); last value 6,261 MB; death inside one 2 s sample |
+| Why no watchdog can guard it | (c1 landed) | (cell stands) | ~6-7 GB headroom at `--gpu-memory-utilization 0.85 --max-num-batched-tokens 8192`; 12,000 MB kills a healthy server and 5,000 MB is never reached in time. Every other fix is an engine knob |
+| Undetermined, recorded as owed | (c1 landed) | (cell stands) | whether the HOST rebooted or only the k3s pod was lost; these artifacts cannot tell. Settle it by reading `/proc/sys/kernel/random/boot_id` against `3fd9745a-...85515` in a later job |
+| #915's own-arm debt, DISCHARGED | prior 2.37 -> 4.4040 tok/s while median TPOT moved 220.6 -> 218.11 | (cell stands) | prior 15.96 -> 22.6402 while TPOT moved 261.1 -> 250.57. Different boots, so read the SHAPE, not the percentage |
+| What that shape proves | throughput moved a lot, per-token barely at all; qualitative, the boots differ: the throughput axis was dividing live tokens by a wall still holding dead requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | (cell stands) | withholding 0.677x rather than publishing it was correct, and this is the evidence for that |
+| A divergence found in the raw files | our `usage.prompt_tokens` reports 5,942 where vLLM reports 6,144 on identical prompts; 19 of 48 short at c8 | (cell stands) | `output_lens` is `[128]xN` on both arms, so TPOT and ITL stand. Total-token throughput is CORRUPTED, and output throughput is BIASED UP, next row |
+| Size of that bias, which EXCEEDS our own stated precision | if the prompts were truly truncated the wall is short by ~0.22 s of 174.39 s, about **0.13%**, beside a published CV of 0.039% | (cell stands) | ~1.1-1.6 s of 271.0 s, about **0.4-0.6%**, beside a published CV of 0.205%. A lower bound: shorter context also cheapens decode |
+| Are the two TTFT medians still comparable? | YES, by evidence and not by luck: our two short prompts are the two LOWEST TTFTs in all three reps, so both arms' medians fall on 1024-token requests | (cell stands) | no vLLM leg exists to compare against |
 | Why only c4 counts | `output_throughput` divides tokens by a wall duration that still contains the dead request, so a cell where one arm dropped requests is withheld, not quoted | 3 paired reps, clocks 2184 MHz | token gate: 4/7 strict, 3 exact fp32 ties ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 
 ### Qwen3.8-27B quantized arms, both gates PENDING and no number quoted

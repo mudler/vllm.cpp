@@ -3022,6 +3022,50 @@ vllm::openai::SpeechResponse StereoWav(int64_t frames) {
   return out;
 }
 
+// A 44-byte-header 16-bit PCM MONO WAV as a base64 `data:` URL, which is the
+// only reference-clip encoding `ParseSpeechRequest` accepts. Built here, like
+// its twin in test_speech_api.cpp, so the sample values stay visible to the
+// assertions rather than sitting in a committed blob.
+std::string MonoWavDataUri(const std::vector<int16_t>& samples, uint32_t rate) {
+  std::string wav;
+  const uint32_t payload = static_cast<uint32_t>(samples.size() * 2);
+  const auto put32 = [&wav](uint32_t v) {
+    for (int i = 0; i < 4; ++i) wav += static_cast<char>((v >> (8 * i)) & 0xFF);
+  };
+  const auto put16 = [&wav](uint16_t v) {
+    for (int i = 0; i < 2; ++i) wav += static_cast<char>((v >> (8 * i)) & 0xFF);
+  };
+  wav += "RIFF";
+  put32(36u + payload);
+  wav += "WAVE";
+  wav += "fmt ";
+  put32(16u);
+  put16(1u);  // PCM
+  put16(1u);  // mono
+  put32(rate);
+  put32(rate * 2);
+  put16(2u);
+  put16(16u);
+  wav += "data";
+  put32(payload);
+  for (const int16_t sample : samples) put16(static_cast<uint16_t>(sample));
+
+  static const char* kAlphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string b64;
+  for (size_t i = 0; i < wav.size(); i += 3) {
+    const uint32_t a = static_cast<unsigned char>(wav[i]);
+    const uint32_t b = i + 1 < wav.size() ? static_cast<unsigned char>(wav[i + 1]) : 0u;
+    const uint32_t d = i + 2 < wav.size() ? static_cast<unsigned char>(wav[i + 2]) : 0u;
+    const uint32_t triple = (a << 16) | (b << 8) | d;
+    b64 += kAlphabet[(triple >> 18) & 0x3F];
+    b64 += kAlphabet[(triple >> 12) & 0x3F];
+    b64 += i + 1 < wav.size() ? kAlphabet[(triple >> 6) & 0x3F] : '=';
+    b64 += i + 2 < wav.size() ? kAlphabet[triple & 0x3F] : '=';
+  }
+  return "data:audio/wav;base64," + b64;
+}
+
 uint32_t WavU32(const std::string& wav, size_t offset) {
   return static_cast<uint32_t>(static_cast<unsigned char>(wav[offset])) |
          (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 1])) << 8) |
@@ -3240,6 +3284,259 @@ TEST_CASE("api_server: /v1/audio/speech route registration is ADDITIVE over a re
       CHECK(videos->status == 404);  // still unregistered, no video runner attached
     });
   }
+}
+
+// The REQUEST-KEY contract, entered through the production route rather than
+// through `ParseSpeechRequest`. `tests/vllm/entrypoints/openai/test_speech_api.cpp`
+// localizes each refusal; this case proves the registered endpoint reaches them,
+// which is the half a parser test cannot see — the parse call at
+// `api_server.cpp:504` is one line, and deleting it leaves every parser test
+// green while `POST /v1/audio/speech` honours nothing.
+TEST_CASE("api_server: /v1/audio/speech refuses the dropped keys AT THE ROUTE") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::openai::SpeechRequest seen;
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest& req) {
+        seen = req;
+        ++calls;
+        return StereoWav(8);
+      },
+      caps);
+
+  // THE COST CASE OF #925, as the route sees it: `audio_duration` where OpenAI
+  // puts it, beside an `extra_params` object. The duration used to be dropped
+  // here and the family answered with 60 s of music behind a 200.
+  ApiServer::DispatchResult split = h.server.handle_audio_speech(
+      R"({"lyrics":"[Verse]\nx\n","extra_params":{"seed":7},"audio_duration":0.1})");
+  CHECK(split.status == 200);
+  CHECK(calls == 1);
+  CHECK(seen.audio_duration_s == doctest::Approx(0.1));
+  CHECK(seen.seed == 7);
+
+  // Each newly refused key is a 400 whose body NAMES the key and what to send
+  // instead, and NOTHING is synthesized.
+  calls = 0;
+  struct Case {
+    const char* body;
+    const char* names;
+  };
+  const Case cases[] = {
+      {R"({"input":"hi","speaker":"alloy"})", "`speaker` is SGLang-Omni's alias for `voice`"},
+      {R"({"lyrics":"x","instructions":"Genre: lo-fi"})",
+       "`instructions` is SGLang-Omni's spelling"},
+      {R"({"input":"hi","ref_audio":"/tmp/v.wav"})", "`ref_audio` is SGLang-Omni's spelling"},
+      {R"({"input":"hi","ref_text":"hello"})",
+       "`ref_text` (the transcript of a reference clip) is not supported"},
+      {R"({"lyrics":"x","token_count":250})", "`token_count` is SGLang-Omni's LENGTH"},
+      {R"({"lyrics":"x","duration_tokens":250})", "`duration_tokens` is SGLang-Omni's LENGTH"},
+      {R"({"input":"hi","task_type":"CustomVoice"})",
+       "`task_type` (`Base`/`CustomVoice`/`VoiceDesign`) is not supported"},
+      {R"({"input":"hi","x_vector_only_mode":true})", "`x_vector_only_mode` is not supported"},
+      {R"({"input":"hi","initial_codec_chunk_frames":4})",
+       "`initial_codec_chunk_frames` is not supported"},
+      // The guards that already existed, now seen through an `extra_params`
+      // body, which is where they had stopped firing.
+      {R"({"lyrics":"x","extra_params":{"seed":7},"audio_duration_s":0.1})",
+       "`audio_duration_s` is not a request key"},
+      {R"({"lyrics":"x","extra_params":{"seed":7},"temperature":0.7})",
+       "`temperature` is not supported"},
+      {R"({"lyrics":"x","extra_params":{"voice":"alloy"}})", "`voice` is not supported"},
+  };
+  for (const Case& one : cases) {
+    CAPTURE(one.body);
+    ApiServer::DispatchResult r = h.server.handle_audio_speech(one.body);
+    CHECK(r.status == 400);
+    CHECK(r.content_type == "application/json");
+    CHECK(r.body.find(one.names) != std::string::npos);
+    CHECK(r.body.find("RIFF") == std::string::npos);
+  }
+  // NOT ONE of the twelve reached the family.
+  CHECK(calls == 0);
+}
+
+TEST_CASE("api_server: /v1/audio/speech honours the request keys OVER A REAL SOCKET") {
+  // The route table plus the handler plus the parser, entered the way a user
+  // enters them. #925 was a 42-minute job that a caller could not tell from the
+  // one it asked for, so the claim worth pinning here is a claim about an HTTP
+  // request and not about a function.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::openai::SpeechRequest seen;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest& req) {
+        seen = req;
+        return StereoWav(8);
+      },
+      caps);
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  ScopedServerThread server_thread(h.server);
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+  httplib::Client client("127.0.0.1", port);
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(15, 0);
+
+  {
+    auto res = client.Post(
+        "/v1/audio/speech",
+        R"({"lyrics":"[Verse]\nx\n","extra_params":{"seed":7},"audio_duration":0.1})",
+        "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // THE ASSERTION THE 42-MINUTE JOB NEEDED: the duration on the wire is the
+    // duration the family was asked for, not the family's default.
+    CHECK(seen.audio_duration_s == doctest::Approx(0.1));
+    CHECK(seen.seed == 7);
+  }
+  {
+    auto res = client.Post("/v1/audio/speech", R"({"lyrics":"x","instructions":"Genre: lo-fi"})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("`instructions` is SGLang-Omni's spelling") != std::string::npos);
+    CHECK(res->body.find("`description`") != std::string::npos);
+  }
+  server_thread.join();  // stops the server, then joins
+}
+
+// The CONTENT keys, at the ROUTE (#1336). The parser cases in
+// `tests/vllm/entrypoints/openai/test_speech_api.cpp` localize each one; this
+// case is the half they cannot see, because what a nested content key costs is
+// paid downstream of the parser: the family never receives it, and the family
+// is where two of the three refusals live.
+TEST_CASE("api_server: /v1/audio/speech reads the CONTENT keys from both placements") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::openai::SpeechRequest seen;
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest& req) {
+        seen = req;
+        ++calls;
+        return StereoWav(8);
+      },
+      caps);
+
+  // A nested `text` REACHES the family. That matters because Music3 refuses
+  // `text` by name (`minimax_music3_speech.cpp:440-446`) and its refusal ends
+  // with the words "rather than having it silently dropped": before this
+  // repair, nesting the key produced precisely that drop, with a 200 over it.
+  // The harness synthesizer stands in for the family, so what is asserted here
+  // is that the string ARRIVES, which is what the real refusal needs.
+  ApiServer::DispatchResult r =
+      h.server.handle_audio_speech(R"({"lyrics":"x","extra_params":{"text":"hello"}})");
+  CHECK(r.status == 200);
+  CHECK(calls == 1);
+  CHECK(seen.text == "hello");
+
+  // A nested `language` reaches the family too, where
+  // `minimax_music3_speech.cpp:456-460` refuses it by name.
+  r = h.server.handle_audio_speech(R"({"lyrics":"x","extra_params":{"language":"en"}})");
+  CHECK(r.status == 200);
+  CHECK(seen.language == "en");
+
+  // The rest of the content set, over the route.
+  r = h.server.handle_audio_speech(
+      R"({"extra_params":{"lyrics":"[Verse]\nx\n","description":"pop","model":"minimax-music3"}})");
+  CHECK(r.status == 200);
+  CHECK(seen.lyrics == "[Verse]\nx\n");
+  CHECK(seen.description == "pop");
+  CHECK(seen.model == "minimax-music3");
+
+  // PRECEDENCE is the one behaviour a caller can OBSERVE, and until now it was
+  // pinned by the parser suite alone. `extra_params` wins at the route as well.
+  r = h.server.handle_audio_speech(
+      R"({"lyrics":"top","audio_duration":9.0,"extra_params":{"lyrics":"nested","audio_duration":0.5}})");
+  CHECK(r.status == 200);
+  CHECK(seen.lyrics == "nested");
+  CHECK(seen.audio_duration_s == doctest::Approx(0.5));
+
+  // The #925 boundary at the route: an unknown key in either placement is a
+  // 200, not a 400. A strict whitelist would red these two.
+  calls = 0;
+  CHECK(h.server.handle_audio_speech(R"({"lyrics":"x","some_future_knob":1})").status == 200);
+  CHECK(h.server.handle_audio_speech(R"({"lyrics":"x","extra_params":{"some_future_knob":1}})")
+            .status == 200);
+  CHECK(calls == 2);
+}
+
+// The SECOND-ORDER cost of the nested `reference_audio` drop, which is the one
+// a caller could not have diagnosed. For a family whose
+// `requires_reference_audio()` is true, `api_server.cpp:511-516` refuses BEFORE
+// staging with "`reference_audio` ... is required". A nested clip was dropped
+// by the parser, so the server answered that 400 to a caller who had supplied
+// the clip, naming the field they had just sent.
+TEST_CASE("api_server: a nested `reference_audio` satisfies a family that REQUIRES one") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::openai::SpeechRequest seen;
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "indextts2";
+  caps.sample_rate = 22050;
+  caps.channels = 1;
+  caps.requires_reference_audio = true;  // IndexTTS-2.5 has no text-only synthesis
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest& req) {
+        seen = req;
+        ++calls;
+        return StereoWav(8);
+      },
+      caps);
+
+  const std::string uri = MonoWavDataUri({16384, -16384}, 22050);
+
+  // The control: with no clip at all the route still refuses, so this case
+  // cannot pass by the guard having been removed.
+  ApiServer::DispatchResult none = h.server.handle_audio_speech(R"({"input":"hi"})");
+  CHECK(none.status == 400);
+  CHECK(none.body.find("is required") != std::string::npos);
+  CHECK(calls == 0);
+
+  // TOP LEVEL: accepted before this repair and after it.
+  ApiServer::DispatchResult flat = h.server.handle_audio_speech(
+      R"({"input":"hi","reference_audio":")" + uri + R"("})");
+  CHECK(flat.status == 200);
+  CHECK(seen.reference_audio.size() == 2);
+
+  // NESTED: a 400 naming the very field the caller sent, until now.
+  ApiServer::DispatchResult nested = h.server.handle_audio_speech(
+      R"({"input":"hi","extra_params":{"reference_audio":")" + uri + R"("}})");
+  CHECK(nested.status == 200);
+  CHECK(nested.body.find("is required") == std::string::npos);
+  REQUIRE(seen.reference_audio.size() == 2);
+  CHECK(seen.reference_sample_rate == 22050);
+  CHECK(seen.reference_audio[0] == doctest::Approx(0.5));
+  CHECK(seen.reference_audio[1] == doctest::Approx(-0.5));
+  CHECK(calls == 2);
 }
 
 // ─── The SPEECH-ONLY server (#672) ──────────────────────────────────────────

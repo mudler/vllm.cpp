@@ -694,6 +694,20 @@ include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
+# THE COMPILED-ARCH MANIFEST (issue #1357, umbrella #1332 M2) starts EMPTY, and
+# empty means "FlashAttention-2 was not compiled". It is filled in exactly one
+# place: beside the vt_cuda_set_source_gencode call that emits FA2's -gencode
+# options, so the manifest cannot claim an architecture nvcc was not asked to
+# emit SASS for. Nothing fills it in a non-CUDA build, in a build with
+# -DVLLM_CPP_FLASH_ATTN=OFF, in a build without CUTLASS headers, or in a build
+# whose requested architectures do not intersect the feature table's fa2 row --
+# and "not compiled" is the correct answer in every one of those cases.
+#
+# The header is rendered at the END of this file, after that assignment has had
+# its chance to run. Derived, never hand-written: a parallel architecture list is
+# CUDA_SUPPORTED_ARCHS, and a list that goes stale is precisely the defect.
+set(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "")
+
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
@@ -781,6 +795,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
   src/vllm/model_executor/models/minimax_music3_device.cpp
+  src/vllm/model_executor/models/minimax_music3_depth_device.cpp
   src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
@@ -1090,6 +1105,7 @@ add_library(vllm STATIC
   src/vllm/platform/process.cpp
   src/vllm/platform/console_shutdown.cpp
   src/vllm/platforms/platform.cpp
+  src/vllm/platforms/cuda_arch_manifest.cpp
   src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/registry.cpp
@@ -2277,6 +2293,11 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     vt_cuda_set_source_gencode("${VT_FA2_ARCHS}" ${_VT_FA2_SOURCES})
+    # THE MANIFEST, taken from the SAME argument that just became nvcc's
+    # -gencode options for these exact sources (issue #1357). Reaching this line
+    # is what "FA2 is compiled" means, and the architectures are the ones the
+    # compiler was handed -- not a second list that has to be kept honest.
+    string(REPLACE ";" "," VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "${VT_FA2_ARCHS}")
     list(APPEND _VT_CUDA_FEATURE_SOURCES ${_VT_FA2_SOURCES})
   endif()
 
@@ -2433,3 +2454,11 @@ endif()
 if(TARGET test_cli_offload_config AND TARGET vllm-cli)
   add_dependencies(test_cli_offload_config vllm-cli)
 endif()
+
+# Render the compiled-arch manifest (issue #1357). Last, so it observes whatever
+# the FA2 gencode site above did or did not set. Generated per build into the
+# build tree, so it is not a shared file any pull request has to edit.
+configure_file(include/vllm/platforms/cuda_compiled_archs.h.in
+  include/vllm/platforms/cuda_compiled_archs.h @ONLY)
+message(STATUS
+  "CUDA FA2 compiled-arch manifest: [${VLLM_CPP_CUDA_FA2_COMPILED_ARCHS}]")

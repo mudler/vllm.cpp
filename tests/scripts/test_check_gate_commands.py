@@ -480,6 +480,40 @@ class RatchetTests(unittest.TestCase):
         )
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dropping_the_anchor_ratchet_from_the_pin_breaks_it(self):
+        # MUTATION for the 2026-08-14 re-pin (#632). ENG-RECORD-ANCHOR-RATCHET
+        # entered the runnable population when the row left SPIKE for ACTIVE, so
+        # the entry added for it must be what keeps the exact pin agreeing with
+        # the audit. Remove it and the equality assertion has to go red, which is
+        # what proves the row was pinned because it entered the population and
+        # not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-RECORD-ANCHOR-RATCHET"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-RECORD-ANCHOR-RATCHET"})
+
+    def test_the_anchor_ratchet_credit_is_its_own_gate(self):
+        # The credit has to be EARNED, not inherited: unlike the weak credits the
+        # RUNNABLE_BASELINE header admits to, this row's gate IS the checker its
+        # spec names, so the credited command is the thing under test. Pin both
+        # halves -- the row audits runnable, and the invocation its Gates section
+        # carries is the one that reds on either direction of the ratchet. A spec
+        # rewritten into prose gates goes red here rather than keeping a credit
+        # it no longer deserves.
+        row = "ENG-RECORD-ANCHOR-RATCHET"
+        self.assertIn(row, gates.RUNNABLE_BASELINE)
+        record = next(r for r in gates.audit() if r["id"] == row)
+        self.assertEqual(record["verdict"], "runnable", record)
+
+        section = gates.gates_section(
+            (ROOT / ".agents/specs/record-anchor-ratchet.md").read_text(encoding="utf-8")
+        )
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        self.assertIn("python3 scripts/check-agent-record.py --report", commands)
+        self.assertIn("python3 tests/scripts/test_agent_record.py", commands)
+
     def test_eng_docs_site_is_credited_for_real_commands(self):
         # ENG-DOCS-SITE joined the runnable population on arrival rather than
         # being parked as gates-no-command, so the credit has to be earned by

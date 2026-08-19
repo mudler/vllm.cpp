@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Record-anchor baseline for scripts/check-agent-record.py",
+    "(ENG-RECORD-ANCHOR-RATCHET, .agents/specs/record-anchor-ratchet.md).",
+    "STALE = the cited line exists but does not contain the symbol named",
+    "beside it. BROKEN = the line is out of range, or the file is gone.",
+    "THESE NUMBERS MAY ONLY EVER GO DOWN. Lower them in the SAME commit as",
+    "the repair that earned it, by running:",
+    "  python3 scripts/check-agent-record.py --write-baseline",
+    "It is a rot budget, never to be raised to make a failing check pass.",
+    "Only the rot is stored. The OK count is printed by --report but kept out",
+    "of this file on purpose: pinning it would make every change that adds or",
+    "removes a citation rewrite this file, which is a lock, not a ratchet."
+  ],
+  "total": 38,
+  "buckets": {
+    "stale": 32,
+    "broken": 6
+  }
+}

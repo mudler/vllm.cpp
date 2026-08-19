@@ -578,20 +578,46 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
       // `queue_` and the ONLY thing the device selector changes.
       //
       // WHAT MOVES: the 8.6B `Qwen3ForCausalLM` half, through the shared
-      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride. WHAT
-      // DOES NOT: the 0.65B RVQ depth decoder and the whole acoustic half,
-      // which are host reference loops — see minimax_music3_ar.h and
-      // vocoder1d.h for exactly which pieces are owed and why.
+      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride, AND —
+      // since #1309 — the 0.65B RVQ depth decoder, which was 48.4 % of a run
+      // (spec §19.1). WHAT DOES NOT: the depth decoder's projection, audio
+      // heads and feedback embedding, ~1.6 % of that stage and owed by §19.7;
+      // and the whole acoustic half's host reference loops — see
+      // minimax_music3_ar.h and vocoder1d.h for which pieces are owed and why.
+      //
+      // NON-const, because the depth arm below STAGES OUT OF IT.
       const auto load_t0 = profile::Now();
-      const Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
+      Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
       profile::AddSince("load.ar_weights", load_t0);
       profile::Mark("ar.weights_loaded");
       const std::vector<int32_t> prompt_ids = ar.Encode(request.prompt);
+
+      // THE PRODUCTION SELECTION for the depth decoder, on the SAME switch the
+      // DiT arm rides: `--speech-device 1` resolves `queue_` to the platform's
+      // device, and a non-CPU queue takes the device arm. There is no separate
+      // flag and no environment variable, because a capability behind an option
+      // nothing turns on is the shape `.agents/reachability.md` calls dead.
+      //
+      // The rule itself lives in `Music3SelectDepthArm` rather than in an `if`
+      // here, and that placement is the #1131 repair: the condition `queue_` has
+      // to satisfy is false on every runner CI owns, so a branch written at this
+      // line is unreachable from any gate, while the function is driven by
+      // `test_minimax_music3_ar` on both sides of it. The DiT block below still
+      // carries the untestable shape and #1131 still owns it.
+      //
+      // `release_host` is TRUE: the staged tensors are the ONLY thing the host
+      // append loop reads, and it is not called when the arm is engaged. The
+      // projection, the audio embeddings and the audio heads — which this stage
+      // still reads on the host — are not staged and are not released.
+      Music3DepthDeviceWeights staged_depth;
+      const Music3DepthDeviceArm depth_arm = Music3SelectDepthArm(
+          queue_, ar.depth_config, ar.depth, /*release_host=*/true, &staged_depth);
       Music3ArResult generated;
       {
         profile::Timer ar_timer("ar.TOTAL_loop", /*span=*/true);
-        generated = Music3GenerateFrameHiddens(
-            prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue_);
+        generated = Music3GenerateFrameHiddens(prompt_ids, request.max_frames, ar,
+                                               Music3SeededSampler(request.seed), queue_,
+                                               depth_arm);
       }
       profile::Mark("ar.loop_done");
       frame_hiddens = std::move(generated.frame_hiddens);

@@ -10177,8 +10177,13 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
     s.warm = false;
-    s.dev.reset();
+    // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
+    // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
+    // pool blocks. `Unbind()` does not dereference the destination today, so
+    // the old order was correct by the implementation's silence rather than by
+    // anything stated — which is one edit away from a use-after-free.
     s.pin.Free();
+    s.dev.reset();
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
@@ -10656,8 +10661,13 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
     s.warm = false;
-    s.dev.reset();
+    // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
+    // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
+    // pool blocks. `Unbind()` does not dereference the destination today, so
+    // the old order was correct by the implementation's silence rather than by
+    // anything stated — which is one edit away from a use-after-free.
     s.pin.Free();
+    s.dev.reset();
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the

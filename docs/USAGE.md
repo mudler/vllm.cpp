@@ -4719,6 +4719,32 @@ any fork still outstanding before it closes a segment, because ending a capture
 with an unjoined fork fails. There is nothing to configure: registration is part
 of the model's fork, and outside a capture both hooks do nothing at all.
 
+**W6 CHANGES WHICH STEPS REACH A DECODE GRAPH AT ALL** (#1374, #1020), and that
+is the only user-visible behaviour change in this stage. Until W6 the engine
+admitted a step to a decode graph only when its uniform query length equalled
+`1 + num_speculative_tokens`, the width CONFIGURED for the engine's lifetime. The
+scheduler clamps a request's drafts to the step's token budget, so at
+`num_speculative_tokens` above 1 a step every request entered with the same
+SHORTER draft prefix -- uniform, and exactly the shape a graph can serve -- got
+no graph and ran its verify eagerly, with no log and no counter. The engine now
+reads the length the step actually has. Nothing about the emitted tokens changes;
+what changes is that fewer steps fall out to the eager path.
+
+`VT_SPEC_GRAPH_MAX_QLENS` bounds that, and its default of `2` is deliberate.
+Every captured shape retains an `[S, vocab]` f32 logits block plus an `[S, H]`
+hidden, times two ring slots, so admitting every clamped depth would multiply the
+resident capture set by `1 + num_speculative_tokens`. The default admits two
+distinct speculative query lengths per driver -- the steady-state `1 + k` plus
+one clamped one. `0` removes the bound; a larger value widens it. A step past the
+bound runs eager, which is what every clamped step did before W6.
+
+Two things W6 does NOT change. A prefill or a mixed batch is still never
+captured, on any model: every decode graph in this engine is built for a decode
+shape and there is no prefill capture driver, so "graphed except at the break
+points" remains a property of the seam rather than of any shipped path. And the
+seven drivers that are not the two Qwen3.5 ones still admit only query length 1,
+so they are byte-identical across this change.
+
 Building it needs no option. `src/vt/breakable_graph.cpp` and, since W4,
 `src/vt/persistent_step_input.cpp` — the capture-stable per-step device input
 the migrated drivers stage through, so that a replayed graph reads this step's

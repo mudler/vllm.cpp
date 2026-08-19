@@ -978,19 +978,37 @@ TEST_CASE("G1 CUDA W6: a colliding spec shape does not replay the other graph") 
   }
   REQUIRE(arm_b.captured());  // the q == 2 graph exists, which is the premise
 
+  // THE ARMS RUN TO COMPLETION ONE AT A TIME, not interleaved step by step like
+  // every other case here, and the reason is the DevicePool rather than style.
+  // A capture pre-grows the pool for its own retained `[S, vocab]` logits with
+  // one alloc-and-free immediately before `BeginCapture`, so the capture's own
+  // allocation is a pool HIT; a `cudaMalloc` inside a capturing stream is fatal.
+  // That pre-grow assumes the pool does not move between it and the capture.
+  // Interleaving two driver instances breaks the assumption -- the other arm's
+  // step consumes the block that was just freed -- and the first head of this
+  // case measured exactly that: `cudaMalloc: operation not permitted when stream
+  // is capturing`, 496 assertions in and reproducible with the case run alone.
+  // Production steps ONE driver at a time, so the sequential shape is also the
+  // faithful one.
+  const auto run_arm = [&](vllm::Qwen3_5DenseDecodeGraph& arm,
+                           CudaGdnCachePool& cache) {
+    std::vector<std::vector<float>> out;
+    for (int step = 0; step < 5; ++step) {
+      out.push_back(Read(
+          b, q,
+          arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                   SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
+          c.vocab_size * 6));
+    }
+    return out;
+  };
+  const std::vector<std::vector<float>> a_logits = run_arm(arm_a, cache_a);
+  const std::vector<std::vector<float>> b_logits = run_arm(arm_b, cache_b);
+
   size_t total = 0;
   for (int step = 0; step < 5; ++step) {
-    const std::vector<int32_t> tok = SpecIota(6, 10);
-    const std::vector<int32_t> pos = SpecIota(6, 0);
-    const CommonAttentionMetadata am = SpecAttnMeta(2, 3, 0);
-    const vllm::v1::GDNAttentionMetadata gm = SpecGdnMeta(2, 3);
-    const std::vector<float> a =
-        Read(b, q, arm_a.Step(tok, pos, am, gm, cache_a.attn_kv, cache_a.gdn_state),
-             c.vocab_size * 6);
-    const std::vector<float> bb =
-        Read(b, q, arm_b.Step(tok, pos, am, gm, cache_b.attn_kv, cache_b.gdn_state),
-             c.vocab_size * 6);
-    total += CompareStep(step, a, bb);
+    total += CompareStep(step, a_logits[static_cast<size_t>(step)],
+                         b_logits[static_cast<size_t>(step)]);
   }
   CHECK(arm_a.captured());
   CHECK(arm_b.captured());

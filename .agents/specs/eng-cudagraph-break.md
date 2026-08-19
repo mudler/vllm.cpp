@@ -2012,3 +2012,70 @@ at a declaration and re-derived by every caller is not a mechanism. Where a
 contract can be encoded in a type, encode it: W2 through W5 add nine more callers
 and none of them should have to read that paragraph to be correct.
 
+
+### W6, the eligibility predicate ([#1374](https://github.com/mudler/vllm.cpp/issues/1374))
+
+**The stage's most important result is what it found ALREADY BROKEN, not what it
+widened.** #1020 called the `(S, q)` ring key an ENABLER: "today that cannot
+collide, precisely BECAUSE the predicate admits only one query length per
+engine". That is wrong at the base commit and W6 measured it wrong.
+`S = spec_step ? B : PadToCaptureSize(B)`, so a SPEC step of 4 requests at 1+1
+tokens and a NON-SPEC padded step of 8 requests both land on `S == 8` with the
+predicate exactly as it was. The two carry different metadata --
+`num_spec_decodes`, `spec_query_start_loc`, `num_accepted_tokens`, a different
+row count -- and the second finds `captured()` true and replays the first's
+graph. `SizeSlot::Refresh` copies IN PLACE only while the sizes match and
+REASSIGNS the vector when they do not, so a shape swap also moves the host source
+addresses a capture baked, which is D2. Silently wrong logits with no fault. The
+condition is one speculating engine with eight concurrent requests at k=1.
+
+`Refresh`'s own comment named the residual and called it future
+(#1020: "the slot ring is keyed on S alone, and two different uniform query
+lengths can NOW reach one key"). The word that was wrong is "now".
+
+**Mutation D was not detected, and the repair is the stage's second result.**
+Deleting the runner's per-request draft conjunct left all three gate levels green
+at 104/104, 53/53 and 138/138. The reason is structural: both models that read
+`uniform_query_len` are GDN hybrids, so a prefill carries
+`gdn_meta.num_prefill_tokens > 0` and the FIRST conjunct refuses it before the
+per-request one runs. Rewriting the case against a full-attention-only Qwen3.5
+config did not reach it either -- the KV cache spec still builds a GDN group and
+the step is refused by the state validator. So the conjunct moved into
+`v1::GraphEligibleQueryLen`, beside the arithmetic it composes with, where
+`test_cudagraph_dispatch` gates it directly and a mutation reds 4 assertions.
+**The general shape, and it is the third time this row has hit it:** a guard
+placed where nothing can move it reads as correct forever. W1's aliasing refusal,
+W3's mode counters and this conjunct are the same lesson at three different
+layers.
+
+**What was REJECTED, and why.** An unbounded widening. Reading the step's actual
+query length multiplies the ceiling on captured spec shapes by `1 + k`, and every
+shape retains an `[S, vocab]` f32 logits block plus an `[S, H]` hidden, times two
+ring slots -- at a 151k vocabulary that is roughly 0.6 MB per token of S for the
+logits alone. #1020 said this had to be measured on a GPU before it landed, and
+that measurement needs a real checkpoint on a `dgx` window this stage did not
+have. So the widening is BOUNDED instead: `VT_SPEC_GRAPH_MAX_QLENS`, default 2,
+which doubles the ceiling rather than multiplying it by `1 + k`. The default is
+the smallest value that admits anything new -- the steady-state `1 + k` plus one
+clamped length -- and a step past it runs eager, which is what every clamped
+shape did before W6. `## Owed` carries the reading that is still owed.
+
+**Why `q > 1` and not `q >= 1` in the model-side test.** At `q == 1` the
+population is exactly `pure_decode`, which is the field the other seven drivers
+read and which is byte-identical across this change. Keeping `input.pure_decode`
+on the left of the disjunction means the seven untouched drivers are provably
+narrower than the new field, which is the polarity `## Work breakdown` W6
+requires. A value above 1 also PROVES speculation is configured, because the
+runner bounds the length by `1 + num_spec()`.
+
+**And the row's own headline did not close.** W6 was scoped as "the predicate
+moves from `pure_decode` to eligible-except-at-the-break-points". Half of that is
+a category error and it took the stage to see it: **there is no driver to be
+eligible INTO for a prefill or a mixed batch.** All nine are decode drivers. The
+predicate can widen only onto shapes an existing driver serves, which is what W6
+did, and everything past that needs a prefill capture driver nobody has written.
+Its benefit is refuted by this spec's own dated numbers (D5), so `## Owed` states
+what would have to be true first rather than scheduling it. **That is a
+publishable negative in the same shape `ENG-CUDAGRAPH-DEDUP` published: the
+machinery composes and the coverage it would buy has no measured demand on this
+hardware.**

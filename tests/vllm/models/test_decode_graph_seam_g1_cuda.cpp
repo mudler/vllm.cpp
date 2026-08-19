@@ -940,6 +940,9 @@ CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
   return am;
 }
 
+// Token ids for a spec step. `base + n` must stay inside the vocabulary -- the
+// first head used base 50 against a 40-entry embedding table and the CUDA embed
+// refused it on device, which is the one failure mode this helper can have.
 std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
   std::vector<int32_t> v(static_cast<size_t>(n));
   for (int32_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = base + i;
@@ -957,6 +960,7 @@ TEST_CASE("G1 CUDA W6: a colliding spec shape does not replay the other graph") 
   vt::Queue q = b.CreateQueue();
   const HfConfig c = Qwen35DenseConfig();
   const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
+  REQUIRE(c.vocab_size >= 26);  // the two id ranges below, asserted not assumed
 
   CudaGdnCachePool cache_a(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
                            /*spec_mql=*/3);
@@ -969,7 +973,7 @@ TEST_CASE("G1 CUDA W6: a colliding spec shape does not replay the other graph") 
   // compares. Three steps, because a spec step always takes the two-slot parity
   // ring and slot 0 is warm only on the third.
   for (int step = 0; step < 3; ++step) {
-    arm_b.Step(SpecIota(6, 50), SpecIota(6, 0), SpecAttnMeta(3, 2, 0),
+    arm_b.Step(SpecIota(6, 20), SpecIota(6, 0), SpecAttnMeta(3, 2, 0),
                SpecGdnMeta(3, 2), cache_prime.attn_kv, cache_prime.gdn_state);
   }
   REQUIRE(arm_b.captured());  // the q == 2 graph exists, which is the premise

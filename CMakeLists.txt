@@ -727,6 +727,10 @@ add_library(vllm STATIC
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the HuggingFace cache layout. Pure file
+  # system, no transport, so it builds in every lane. The DFlash draft path
+  # in model_loader.cpp reaches it and is not behind VLLM_CPP_SERVER.
+  src/vllm/transformers_utils/hf_cache.cpp
   src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
@@ -2322,6 +2326,10 @@ if(VLLM_CPP_SERVER)
   # construction) lives in the library so examples/server can be a thin client of
   # the C ABI's vllm_server_main (v17). It shares api_server.cpp's httplib gate.
   target_sources(vllm PRIVATE src/vllm/entrypoints/openai/server_main.cpp)
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the hub protocol speaks HTTP through the same
+  # vendored cpp-httplib header api_server.cpp uses, so it shares that gate. The
+  # cache half above stays unconditional because it opens no socket.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/hf_hub.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party

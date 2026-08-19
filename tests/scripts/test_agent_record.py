@@ -1655,5 +1655,80 @@ class IssueIndexTableShape(unittest.TestCase):
         require(errors, rf"issue-index\.md:{len(rows)}: table has 4 pipes; expected 5")
 
 
+class HfModelDownloadRowIsCounted(unittest.TestCase):
+    """The ENGINE ratchet bump 164 -> 165 is backed by a real row (#1280).
+
+    Same shape and the same reason as `MtpDepthRowIsCounted`, applied to the pin
+    this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump with
+    nothing behind it looks exactly like a bump for a row that landed.
+    `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS by moving it,
+    which holds for any value and cannot say whether 165 is the right one. This
+    class says that, by tying the pin to the row the matrix carries.
+    """
+
+    ROW = "ENG-HF-MODEL-DOWNLOAD"
+
+    def test_the_row_exists_in_the_engine_matrix(self) -> None:
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        """A row whose issue lives only in the PR body is untraceable."""
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("hf-model-download.md", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/1280)", index)
+
+    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the ENGINE matrix at a mutated copy on disk, for the
+        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
+        globally would feed engine content to every matrix, and this case would
+        then pass on errors that have nothing to do with the removal.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "engine rows" in e], [])
+
+        path = agent_record.ENGINE_MATRIX
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "engine-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("engine rows" in e for e in errors),
+            f"removing {self.ROW} must break the engine count; got {errors}",
+        )
+
+    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
+        """MUTATION TARGET: `ENGINE_ROWS` back at 164 must be an error.
+
+        The pin and the matrix are two hand-maintained records of one number.
+        This asserts they agree at the value this change lands, so lowering the
+        constant to the previous 164 while the row is present reds here.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([e for e in errors if "engine rows" in e], [])
+        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
+        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
+        self.assertIn(self.ROW, {r.item_id for r in engine})
+
+
 if __name__ == "__main__":
     unittest.main()

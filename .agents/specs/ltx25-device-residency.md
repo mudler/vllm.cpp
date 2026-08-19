@@ -662,32 +662,40 @@ Landed on `row/LTX25-RESIDENCY-W0`, issue
 ### The gate, and the number
 
 **PASS.** One completed render through the `vllm.h` video ABI emits a phase
-table whose named leaves sum to **98.33% of wall** — 0.154896 s of leaves
-against 0.157525 s of wall, residue **2.63 ms**. The tolerance was fixed at
-**>= 95%** in the test's own comment and in the red-first commit message
-*before* the instrumented run, and the sum is checked in the same case that
-checks the named boundaries, because one leaf called `render` would sum to wall
-exactly and measure nothing.
+table whose named leaves sum to **99.84% of wall** — 12.010601 s of leaves
+against 12.030305 s of wall, residue **19.7 ms** over 21 entries and 169
+samples. The tolerance was fixed at **>= 95%** in the test's own comment and in
+the red-first commit message *before* the instrumented run, and the sum is
+checked in the same case that checks the named boundaries, because one leaf
+called `render` would sum to wall exactly and measure nothing.
+
+The same case has produced **98.33% at a 0.158 s wall, 99.96% at 6.138 s and
+99.84% at 12.030 s** on three runs of the identical binary at the identical
+geometry. The RATIO is what the gate reads and it never came near the 95% floor;
+the WALL moved by a factor of 76 across those runs because the box was building
+other sessions' trees, which is why no wall figure in this section is a
+benchmark and why W1 is written as a lease on an idle box.
 
 The evidence file is
 [`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json),
-sha256 `e7e68ed4124250dbe1bd1e201cc3eba966d769aef4ffa26a12bfbe64fa45e01f`,
+sha256 `3444151a613a1f1f53ae5ca5bdf221bf9ad688f244eb0c1db1e4280e805ae6a9`,
 written verbatim by the render that produced it. Provenance, because the file
 carries none of this itself:
 
 | | |
 |---|---|
 | producer | `examples/ltx2_gen` (`build/examples/ltx2-gen`), through `vllm_video_engine_load` + `vllm_video_generate` |
-| tree | `040a4ee66860ef952ff54b172366818477d1902a` on `row/LTX25-RESIDENCY-W0` |
+| tree | binary built from `4fe6b47deaf06141c248a5e95c2c32880e5dd7ed` on `row/LTX25-RESIDENCY-W0`, which is a merge of `origin/main` `96ed8346f` |
 | build | `cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF`, gcc 13.3.0 |
 | host | `mudler-ubuntu-box`, Linux 6.8.0-136-generic x86_64, **20 cores and CONTENDED** — other sessions were compiling throughout |
 | checkpoint | the reduced-dimension fixture `tests/vllm/multimodal/ltx2_video_fixture.h` writes, in the shipped file format |
 | geometry | `--frames 9 --width 64 --height 64 --seed 7 --max-phase 0 --device cpu` |
-| completion | 9 frames written, **9 distinct per-frame md5s**, plus a 48 kHz WAV |
+| completion | 9 frames written, **9 distinct per-frame md5s**, plus a 48 kHz WAV. The exit code is not the completion gate here ([#1149](https://github.com/mudler/vllm.cpp/issues/1149)); the distinct md5s are |
+| device column | **every row reads `-1`.** See `## Owed` — this is the CPU arm, and `CudaBackend` would read `-1` as well |
 
 **The wall figures are NOT a benchmark and nothing may quote them as one.** The
 host was contended, the checkpoint is a reduced fixture, and the same case
-measured 0.26 s and 6.14 s of wall on two consecutive runs of the identical
+measured 0.26 s, 6.14 s and 12.03 s of wall on three runs of the identical
 binary. What the artifact supports is the SHAPE of the table and the fact that
 its parts add up. `docs/BENCHMARKS.md` is therefore untouched, which is what
 this spec's `### Decisions taken here` already said W0 owes: W1 owes the
@@ -695,8 +703,21 @@ benchmark edit, on a leased idle box, at two geometries.
 
 ### What the table says about this render, which is not what anybody expected
 
-On the fixture, `decode.audio` is **56% of wall** (0.0889 s) and `denoise` is
-34% (0.0539 s). That ordering belongs to a two-block reduced DiT and says
+Two leaves are the whole render on this fixture, and **which of them is larger
+changed between two runs of the identical binary**. On the artifact's run
+`denoise` is 8.127 s (67.6% of a 12.030 s wall) and `decode.audio` is 3.062 s
+(25.5%). On an earlier run of the same case at the same geometry the order was
+reversed: `decode.audio` 0.0889 s against `denoise` 0.0539 s of a 0.158 s wall.
+
+That reversal is worth more than either number. The host was building other
+sessions' trees throughout, and the two phases do not have the same threading —
+so a contended box does not merely add noise to a phase table, it can change the
+RANKING the table reports. This campaign exists because a stale ranking was
+taken as a profile, and W1's own gate is an idle leased box for exactly this
+reason. Nothing here says anything about the 21.00B checkpoint, whose DiT load
+alone is minutes; what it says is that the table is now capable of showing an
+ordering, and that reading one off a contended run is how the last ranking went
+wrong. That ordering belongs to a two-block reduced DiT and says
 nothing about the 21.00B checkpoint — it is recorded because it is the first
 time any LTX-2.5 render in this tree has said where its time went at all, and
 because it is exactly the kind of term the spike's lever table could not have

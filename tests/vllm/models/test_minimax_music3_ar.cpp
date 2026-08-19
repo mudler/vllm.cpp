@@ -23,6 +23,7 @@
 // attention 4 / 65, and a frame row that keeps depth position 0 reds 1 / 24.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1171,6 +1172,672 @@ TEST_CASE("music3 ar: the COMPOSED depth stage is BIT-IDENTICAL to the schedule 
                                    << config.residual_codebooks() << " codebook steps x 2 CFG rows, "
                                    << nonzero << " of " << want.size()
                                    << " reference values non-zero, " << calls_new << " draws");
+}
+
+// ---------------------------------------------------------------------------
+// The DEVICE arm (#1309, spec §19)
+// ---------------------------------------------------------------------------
+//
+// These run on a `vt::Queue` whose device is kCPU. That is not a compromise, it
+// is the point: every op the device forward composes — kMatmulBT, kRmsNorm,
+// kAttentionCross, kSiluAndMul, kAdd — carries a CPU provider AND a CUDA one, so
+// the composition, the merged weight layouts, the cache indexing and the
+// PRODUCTION SELECTION are all gated here with no GPU and no checkpoint.
+//
+// #1131 is why the selection is gated rather than only the forward. The DiT
+// device arm's kernels are gated and its switch is not, so `on_device = false`
+// leaves every suite green — the two arms agree numerically BY DESIGN, and no
+// gate there ever asked WHICH ONE RAN. `Music3DepthDeviceForwardCount()` is what
+// asks it here.
+//
+// What these cases do NOT reach is the CUDA kernels themselves, and that is said
+// rather than implied: the CUDA `AttentionCross` uses an online-softmax
+// recurrence where the CPU one uses three passes, and cuBLASLt splits K by an
+// algorithm no CPU provider has. Spec §19.6 owes that leg to `thor:gpu0`.
+
+// The spacing of bf16 at `value`'s magnitude. bf16 keeps 8 significand bits
+// (1 implicit + 7 stored), so a value in [2^k, 2^(k+1)) has ULP 2^(k-7).
+double Bf16Ulp(double value) {
+  if (value == 0.0 || !std::isfinite(value)) return std::ldexp(1.0, -133);
+  int exponent = 0;
+  std::frexp(std::abs(value), &exponent);  // |v| = m * 2^e, m in [0.5, 1)
+  return std::ldexp(1.0, exponent - 8);
+}
+
+// A CPU queue. `vt::Queue`'s CPU form carries a null handle by construction —
+// the speech engine builds exactly this when `--speech-device 0`.
+vt::Queue CpuQueue() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
+
+// A deterministic reduced geometry, WIDER than the goldens on both axes that a
+// merged weight layout could get wrong: 8 heads of 8 (so `heads * head_dim` is
+// not `head_dim`), and an intermediate size that is not a multiple of the hidden
+// size (so a gate/up half swap cannot be masked by a symmetric shape).
+m3::DepthDecoderConfig DeviceArmConfig() {
+  m3::DepthDecoderConfig config;
+  config.hidden_size = 64;
+  config.num_layers = 3;
+  config.num_attention_heads = 8;
+  config.intermediate_size = 96;
+  config.audio_vocab_size = 32;
+  config.num_codebooks = 8;
+  config.max_position_embeddings = 8;
+  return config;
+}
+
+// Weights whose values are ALREADY bf16-exact, because that is what the loader
+// hands the arms: `AtRuntimeDtype` rounds every AR-half tensor through bf16 into
+// its f32 carrier. Drawing f32 noise here instead would make the device arm's
+// staging lossy for a reason the shipped path does not have, and would price a
+// rounding this row does not perform.
+std::vector<float> DeviceArmFill(size_t n, uint32_t* state, float scale) {
+  std::vector<float> v(n);
+  for (size_t i = 0; i < n; ++i) {
+    *state = *state * 1664525u + 1013904223u;
+    const float raw =
+        static_cast<float>(static_cast<double>(*state >> 8) / 8388608.0 - 1.0) * scale;
+    v[i] = vt::BF16ToF32(vt::F32ToBF16(raw));
+  }
+  return v;
+}
+
+m3::DepthDecoderWeights DeviceArmWeights(const m3::DepthDecoderConfig& config, uint32_t* state) {
+  const size_t hidden = static_cast<size_t>(config.hidden_size);
+  const size_t inter = static_cast<size_t>(config.intermediate_size);
+  m3::DepthDecoderWeights weights;
+  weights.audio_embeddings = DeviceArmFill(
+      static_cast<size_t>(config.audio_vocab_size * config.residual_codebooks()) * hidden, state,
+      0.5f);
+  weights.projection = DeviceArmFill(hidden * hidden, state, 0.25f);
+  weights.pos_embedding =
+      DeviceArmFill(static_cast<size_t>(config.max_position_embeddings) * hidden, state, 0.5f);
+  weights.norm = DeviceArmFill(hidden, state, 0.5f);
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    m3::DepthDecoderLayerWeights layer;
+    layer.input_layernorm = DeviceArmFill(hidden, state, 0.5f);
+    layer.post_attention_layernorm = DeviceArmFill(hidden, state, 0.5f);
+    layer.to_q = DeviceArmFill(hidden * hidden, state, 0.25f);
+    layer.to_k = DeviceArmFill(hidden * hidden, state, 0.25f);
+    layer.to_v = DeviceArmFill(hidden * hidden, state, 0.25f);
+    layer.to_out = DeviceArmFill(hidden * hidden, state, 0.25f);
+    layer.gate_proj = DeviceArmFill(inter * hidden, state, 0.25f);
+    layer.up_proj = DeviceArmFill(inter * hidden, state, 0.25f);
+    layer.down_proj = DeviceArmFill(hidden * inter, state, 0.25f);
+    weights.layers.push_back(std::move(layer));
+  }
+  for (int64_t h = 0; h < config.residual_codebooks(); ++h) {
+    weights.audio_heads.push_back(
+        DeviceArmFill(static_cast<size_t>(config.audio_vocab_size) * hidden, state, 0.25f));
+  }
+  return weights;
+}
+
+// The seeds this gate measures over, and WHY there is more than one. The bound
+// below was originally fitted to the first of them, and a review falsified it by
+// changing NOTHING BUT THE SEED: same distribution, same geometry, no defect, and
+// the shipped `mean <= 4.0` red on three of six equally valid draws. A tolerance
+// that a redraw of the reference weights can fail is measuring the draw, not the
+// arm. §19.4b carries the per-seed table and the arithmetic behind the bounds.
+constexpr uint32_t kDeviceArmSeeds[] = {0x9E3779B9u, 0x2468ACE0u, 0x00000001u,
+                                        0x13579BDFu, 0xDEADBEEFu, 0x51ED2701u};
+constexpr size_t kNumDeviceArmSeeds = sizeof(kDeviceArmSeeds) / sizeof(kDeviceArmSeeds[0]);
+
+// One draw's worth of device-vs-host deviation.
+//
+// TWO BUCKETS, AND THEY SUM. A reference value of EXACTLY zero has no ULP —
+// bf16's spacing at zero is the denormal floor, so `|got| / Bf16Ulp(0)` reads
+// ~1e35 for an absolute difference of 1e-5 and the statistic stops meaning
+// anything about the arm. Seed `0x51ED2701` draws one such value in 1024 and the
+// CORRECT arm reads mean 8.8e32 on it. So a zero reference is measured
+// ABSOLUTELY instead, and the two counts are asserted to sum to the compared
+// total: a defect that produced zeros would have to grow that bucket to hide in
+// it, and growing it is a failure.
+struct DeviceArmBand {
+  double worst = 0.0;       // bf16 ULP, over the non-zero references only
+  double mean = 0.0;        // bf16 ULP, over the non-zero references only
+  double median = 0.0;      // bf16 ULP, over the non-zero references only
+  double worst_at_zero = 0.0;  // absolute, over the zero references only
+  size_t compared = 0;
+  size_t nonzero = 0;
+  size_t at_zero = 0;
+  uint64_t forwards = 0;
+};
+
+// Run BOTH arms over the whole position schedule at one seed and measure the gap.
+DeviceArmBand MeasureDeviceArmBand(const m3::DepthDecoderConfig& config, uint32_t seed) {
+  uint32_t state = seed;
+  m3::DepthDecoderWeights host_weights = DeviceArmWeights(config, &state);
+  m3::DepthDecoderWeights stage_source = host_weights;
+
+  vt::Queue queue = CpuQueue();
+  // `release_host=false`: this gate compares the two arms, so the host copy must
+  // survive. A serving path passes true.
+  const m3::Music3DepthDeviceWeights staged =
+      m3::StageMusic3DepthWeights(queue, config, stage_source, /*release_host=*/false);
+  REQUIRE(staged.staged());
+
+  const int64_t batch = 2;
+  const int64_t H = config.hidden_size;
+  m3::DepthDecoderCache host_cache;
+  m3::Music3DepthDeviceCache device_cache;
+  DeviceArmBand band;
+  std::vector<double> ulps;
+  ulps.reserve(static_cast<size_t>(config.max_position_embeddings * batch * H));
+  const uint64_t before = m3::Music3DepthDeviceForwardCount();
+
+  for (int64_t position = 0; position < config.max_position_embeddings; ++position) {
+    // The two CFG rows differ, which is what makes a schedule that served one to
+    // both detectable at all.
+    const std::vector<float> embeds = DeviceArmFill(static_cast<size_t>(batch * H), &state, 1.0f);
+    const std::vector<float> want = m3::DepthDecoderAppend(
+        embeds, batch, config, host_weights, m3::ArCompute::kBFloat16, &host_cache);
+    const std::vector<float> got =
+        m3::DepthDecoderAppendDevice(queue, config, staged, embeds, batch, &device_cache);
+    REQUIRE(got.size() == want.size());
+    for (size_t i = 0; i < want.size(); ++i) {
+      const double absolute = std::abs(static_cast<double>(got[i]) - want[i]);
+      ++band.compared;
+      if (want[i] == 0.0f) {
+        band.worst_at_zero = std::max(band.worst_at_zero, absolute);
+        ++band.at_zero;
+        continue;
+      }
+      const double ulp = absolute / Bf16Ulp(want[i]);
+      band.worst = std::max(band.worst, ulp);
+      band.mean += ulp;
+      ulps.push_back(ulp);
+      ++band.nonzero;
+    }
+  }
+  band.forwards = m3::Music3DepthDeviceForwardCount() - before;
+  band.mean /= static_cast<double>(band.nonzero == 0 ? 1 : band.nonzero);
+  if (!ulps.empty()) {
+    const size_t mid = ulps.size() / 2;
+    std::nth_element(ulps.begin(), ulps.begin() + static_cast<long>(mid), ulps.end());
+    band.median = ulps[mid];
+  }
+  return band;
+}
+
+// THE BOUNDS, placed from a MULTI-SEED measurement against a mutation battery
+// rather than from the deviation one draw happened to produce. §19.4b carries
+// the whole table; the two things that decide the numbers are these.
+//
+// THE CORRECT ARM, over six seeds:
+//
+//   seed         worst    mean  median  note
+//   0x9E3779B9     110   2.095       1  the seed the old bound was fitted to
+//   0x2468ACE0     435   3.804       1
+//   0x00000001    1110   5.755       1  RED under the old `mean <= 4.0`
+//   0x13579BDF    3663   7.154       1  RED under the old `mean <= 4.0`
+//   0xDEADBEEF    7340   9.904       1  RED under the old `mean <= 4.0`
+//   0x51ED2701     939   3.103       1  one reference is exactly zero
+//
+// FIVE STRUCTURAL MUTATIONS, each over the same six seeds, worst case first:
+//
+//   mutation                       mean range   median range
+//   wrong attention scale          19.6 -  71.3      4 -   4
+//   gate/up half swap              52.5 - 158.8     12 -  15
+//   K/V cache row collision       166.4 - 376.1      3 -   4
+//   dropped position embedding    357.8 - 1487       76 -  90
+//   q|k|v merge order swapped     400.0 - 1731      104 - 131
+//
+// WHY THE MEDIAN IS THE PRIMARY GATE. It is EXACTLY 1 bf16 ULP at all six seeds
+// for the correct arm — a constant, not a distribution — because the deviation
+// this arm actually carries is one rounding-polarity tick per element, and the
+// seed only changes the tail. Every defect is at least 3. So the median's window
+// is (1, 3] and it cannot be moved by a redraw, which is precisely the property
+// the old single-seed bound lacked.
+//
+// WHY THE MEAN IS STILL GATED, and what it costs. The mean is tail-sensitive, so
+// it catches a SPARSE defect that leaves the middle of the distribution alone and
+// the median would not see. Its window is narrow and asymmetric: the correct
+// arm's worst draw is 9.904 and the tightest defect is 19.6 — the wrong attention
+// scale at `0xDEADBEEF`, which is the same seed that produces the correct arm's
+// own worst mean. 15 sits inside that window, 1.51x above every correct draw
+// measured and 1.31x below every defect draw measured. That is a real margin and
+// it is not a large one, and a seventh seed drawing a correct mean above 15 is
+// possible in a way that one drawing a median above 2 is not.
+//
+// WHY `worst` IS NOT GATED AT ALL. It cannot discriminate. A CORRECT arm reads
+// worst 7340 at `0xDEADBEEF` while the gate/up half swap reads 6641 and the wrong
+// attention scale 6865 at the seed each is worst-separated on, so any `worst`
+// bound loose enough to admit a correct implementation admits two structural
+// defects. It is reported, and it carries only a canary far above any draw here,
+// because a value that has gone non-finite must not read as rounding.
+constexpr double kDeviceArmMedianUlpBound = 2.0;
+constexpr double kDeviceArmMeanUlpBound = 15.0;
+constexpr double kDeviceArmWorstUlpCanary = 1.0e6;
+// The zero-reference bucket, measured ABSOLUTELY because it has no ULP. See
+// `DeviceArmBand`.
+constexpr double kDeviceArmZeroAbsBound = 1.0e-2;
+
+TEST_CASE("music3 ar: the DEVICE depth decode tracks the host arm inside a bf16 band") {
+  // NOT bitwise, and the spec says so BEFORE this code rather than after a
+  // surprise (§19.4). Three reasons, each sufficient alone: the host keeps a
+  // sequential `double` per output element where `vt::MatmulBT` accumulates in
+  // f32; the reduction re-associates; and `vt::RmsNorm` keeps full f32 precision
+  // across the weight multiply where our `RmsNorm` mirrors upstream's TWO
+  // roundings. The first of those makes the device arm the CLOSER mirror of
+  // torch, which accumulates bf16 matmuls in f32.
+  //
+  // So the bound is in bf16 ULPs OF THE REFERENCE VALUE, not in absolute units:
+  // four layers of activations span orders of magnitude and an absolute bound
+  // would be vacuous at the top and impossible at the bottom.
+  //
+  // And it is asserted over SIX DRAWS, because the single-draw version of this
+  // case passed while a correct arm failed on three other seeds (§19.4b).
+  const m3::DepthDecoderConfig config = DeviceArmConfig();
+  double worst_over_seeds = 0.0;
+  double worst_mean = 0.0;
+  double worst_median = 0.0;
+  size_t total_compared = 0;
+  size_t total_nonzero = 0;
+  size_t total_at_zero = 0;
+  double worst_at_zero = 0.0;
+  uint64_t total_forwards = 0;
+
+  for (size_t s = 0; s < kNumDeviceArmSeeds; ++s) {
+    const uint32_t seed = kDeviceArmSeeds[s];
+    CAPTURE(seed);
+    const DeviceArmBand band = MeasureDeviceArmBand(config, seed);
+    worst_over_seeds = std::max(worst_over_seeds, band.worst);
+    worst_mean = std::max(worst_mean, band.mean);
+    worst_median = std::max(worst_median, band.median);
+    total_compared += band.compared;
+    total_nonzero += band.nonzero;
+    total_at_zero += band.at_zero;
+    worst_at_zero = std::max(worst_at_zero, band.worst_at_zero);
+    total_forwards += band.forwards;
+
+    CHECK_MESSAGE(band.median <= kDeviceArmMedianUlpBound,
+                  "seed " << seed << ": device/host MEDIAN deviation " << band.median
+                          << " bf16 ULP exceeds " << kDeviceArmMedianUlpBound
+                          << "; the correct arm is exactly 1 at every seed measured, so this "
+                             "is a STRUCTURAL defect and not a redraw");
+    CHECK_MESSAGE(band.mean <= kDeviceArmMeanUlpBound,
+                  "seed " << seed << ": device/host MEAN deviation " << band.mean
+                          << " bf16 ULP exceeds " << kDeviceArmMeanUlpBound
+                          << ", which is a STRUCTURAL defect, not rounding");
+    CHECK_MESSAGE(band.worst <= kDeviceArmWorstUlpCanary,
+                  "seed " << seed << ": device/host WORST deviation " << band.worst
+                          << " bf16 ULP is past the non-finite canary");
+    CHECK_MESSAGE(band.worst_at_zero <= kDeviceArmZeroAbsBound,
+                  "seed " << seed << ": where the reference is EXACTLY zero the device arm is "
+                          << band.worst_at_zero << " away, past " << kDeviceArmZeroAbsBound);
+    // Per draw, not only in aggregate, and the buckets SUM. An all-zero
+    // reference satisfies any tolerance; so does a forward that never ran; and
+    // so does a defect that quietly moved every element into the un-gated
+    // zero-reference bucket.
+    CHECK_MESSAGE(band.nonzero > 0, "seed " << seed << ": the reference block is all zeros");
+    const size_t bucketed = band.nonzero + band.at_zero;
+    CHECK_MESSAGE(bucketed == band.compared,
+                  "seed " << seed << ": " << band.nonzero << " + " << band.at_zero
+                          << " buckets do not sum to " << band.compared << " compared values");
+    CHECK_MESSAGE(band.compared ==
+                      static_cast<size_t>(config.max_position_embeddings * 2 * config.hidden_size),
+                  "seed " << seed << ": the position sweep did not compare every position");
+    CHECK_MESSAGE(band.forwards == static_cast<uint64_t>(config.max_position_embeddings),
+                  "seed " << seed << ": the DEVICE forward ran " << band.forwards
+                          << " times, expected " << config.max_position_embeddings);
+    MESSAGE("seed " << seed << ": worst " << band.worst << " bf16 ULP, mean " << band.mean
+                    << ", median " << band.median << ", " << band.nonzero << "/" << band.compared
+                    << " references non-zero, " << band.at_zero << " at zero (worst absolute "
+                    << band.worst_at_zero << ")");
+  }
+
+  // THE SWEEP ITSELF HAS TEETH. A loop that silently measured one seed six times,
+  // or zero seeds, would satisfy every bound above.
+  CHECK_MESSAGE(kNumDeviceArmSeeds >= 6,
+                "a multi-seed bound needs more than one seed, got " << kNumDeviceArmSeeds);
+  const uint64_t want_forwards =
+      static_cast<uint64_t>(config.max_position_embeddings) * kNumDeviceArmSeeds;
+  CHECK(total_forwards == want_forwards);
+  const size_t total_bucketed = total_nonzero + total_at_zero;
+  CHECK(total_bucketed == total_compared);
+  // The un-gated bucket must stay NEGLIGIBLE. It is the one place a defect could
+  // sit without being measured in ULPs, so its size is a gate of its own.
+  CHECK_MESSAGE(total_at_zero * 100 < total_compared,
+                total_at_zero << " of " << total_compared
+                              << " references are exactly zero, so the ULP statistic is being "
+                                 "computed over a shrinking minority");
+  MESSAGE("device depth decode over " << kNumDeviceArmSeeds << " seeds: " << total_compared
+                                      << " values (" << total_at_zero << " at zero, worst "
+                                      << worst_at_zero << " absolute), worst "
+                                      << worst_over_seeds
+                                      << " bf16 ULP (reported, not gated), worst mean "
+                                      << worst_mean << " against " << kDeviceArmMeanUlpBound
+                                      << ", worst median " << worst_median << " against "
+                                      << kDeviceArmMedianUlpBound);
+}
+
+TEST_CASE("music3 ar: the device depth arm is bf16 RESIDENT, on the weights AND the activations") {
+  // #1131 offers two instruments — "invocation count OR resident dtype" — and
+  // this row took only the first until a review took the second one's absence
+  // and proved it mattered: widening a single activation buffer to `kF32` left
+  // the ULP band, the drawn codes and every case in this file GREEN while the
+  // path moved twice the bytes. That is AGENTS.md's "a token gate cannot detect
+  // a dtype that is too WIDE" landing on the very row whose thesis is a dtype,
+  // and it is §19.2a's finding about the HOST arm arriving inside the arm that
+  // exists to fix it.
+  const m3::DepthDecoderConfig config = DeviceArmConfig();
+  uint32_t state = 0x5EEDD7EEu;
+  m3::DepthDecoderWeights source = DeviceArmWeights(config, &state);
+  vt::Queue queue = CpuQueue();
+  const m3::Music3DepthDeviceWeights staged =
+      m3::StageMusic3DepthWeights(queue, config, source, /*release_host=*/false);
+  REQUIRE(staged.staged());
+
+  // THE STAGED WEIGHTS, read off the tensors rather than inferred from the
+  // numbers. f32 weights would be MORE precise and would sail through every
+  // tolerance in this file.
+  CHECK(staged.pos_embedding.dtype == vt::DType::kBF16);
+  CHECK(staged.norm.dtype == vt::DType::kBF16);
+  REQUIRE(static_cast<int64_t>(staged.layers.size()) == config.num_layers);
+  for (const m3::Music3DepthDeviceLayer& layer : staged.layers) {
+    CHECK(layer.input_layernorm.dtype == vt::DType::kBF16);
+    CHECK(layer.post_attention_layernorm.dtype == vt::DType::kBF16);
+    CHECK(layer.qkv.dtype == vt::DType::kBF16);
+    CHECK(layer.to_out.dtype == vt::DType::kBF16);
+    CHECK(layer.gate_up.dtype == vt::DType::kBF16);
+    CHECK(layer.down_proj.dtype == vt::DType::kBF16);
+  }
+
+  // THE ACTIVATIONS AND THE K/V CACHE, which no caller can see from outside, so
+  // the forward reports what it allocated. One call is enough to populate the
+  // mask; the mask is monotone over the process, so a widened buffer anywhere in
+  // this binary lands here.
+  const int64_t H = config.hidden_size;
+  const std::vector<float> embeds = DeviceArmFill(static_cast<size_t>(2 * H), &state, 1.0f);
+  m3::Music3DepthDeviceCache cache;
+  const std::vector<float> out =
+      m3::DepthDecoderAppendDevice(queue, config, staged, embeds, 2, &cache);
+  CHECK(out.size() == static_cast<size_t>(2 * H));
+
+  const uint64_t resident = m3::Music3DepthDeviceResidentDtypes();
+  const uint64_t bf16_only = uint64_t{1} << static_cast<unsigned>(vt::DType::kBF16);
+  CHECK_MESSAGE(resident != 0,
+                "the resident-dtype instrument reported NOTHING, so it measured nothing");
+  CHECK_MESSAGE(resident == bf16_only,
+                "the device depth forward made buffers resident in dtypes other than bf16: "
+                "mask 0x"
+                    << std::hex << resident << std::dec << ", expected 0x" << std::hex
+                    << bf16_only << std::dec
+                    << " — a WIDER buffer is invisible to every tolerance in this file");
+}
+
+TEST_CASE("music3 ar: the depth arm SELECTION stages on a device queue and never on a CPU one") {
+  // THE #1131 REPAIR. The engine used to decide this with an `if` on
+  // `queue_.device.type`, and that condition is false on every runner CI owns —
+  // so the branch was the one line no gate could enter, which is #1131's shape
+  // reproduced by the change that cites #1131 as its reason for existing. The
+  // rule now lives in `Music3SelectDepthArm`, which runs on BOTH sides of that
+  // condition and is therefore drivable here.
+  const m3::DepthDecoderConfig config = DeviceArmConfig();
+  uint32_t state = 0x0BADC0DEu;
+  const m3::DepthDecoderWeights depth = DeviceArmWeights(config, &state);
+
+  SUBCASE("a CPU queue stages NOTHING and keeps the host reference arm") {
+    vt::Queue queue = CpuQueue();
+    m3::DepthDecoderWeights source = depth;
+    m3::Music3DepthDeviceWeights staged;
+    const uint64_t before = m3::Music3DepthDeviceForwardCount();
+    const m3::Music3DepthDeviceArm arm =
+        m3::Music3SelectDepthArm(queue, config, source, /*release_host=*/true, &staged);
+    CHECK_FALSE(arm.engaged());
+    CHECK_FALSE(arm.half_set());
+    CHECK_FALSE(staged.staged());
+    CHECK(m3::Music3DepthDeviceForwardCount() == before);
+    // `release_host` was TRUE and NOTHING may have been released, because the
+    // host loop is what this queue selected and the host loop reads these.
+    REQUIRE(source.layers.size() == depth.layers.size());
+    CHECK(source.pos_embedding.size() == depth.pos_embedding.size());
+    CHECK(source.layers[0].to_q.size() == depth.layers[0].to_q.size());
+    CHECK(source.layers[0].gate_proj.size() == depth.layers[0].gate_proj.size());
+  }
+
+  SUBCASE("EVERY non-CPU device stages or refuses, and never silently falls back") {
+    // THE THIRD OUTCOME IS THE DEFECT. A device queue must come back with an
+    // ENGAGED arm, or the staging must REFUSE by name because this build has no
+    // provider for that device. What must not happen is a quiet return of a
+    // disengaged arm, because that is a caller that asked for the device, was
+    // given the host loop, and was told nothing — #1131 exactly.
+    //
+    // `kCUDA` is deliberately NOT in this list. On a CUDA build without a device
+    // the staging would fail INSIDE the CUDA runtime, and a CUDA call designed
+    // to fail latches a sticky error that the next unrelated kernel reports as
+    // its own. Every entry below takes the identical branch, so the rule is
+    // covered and the latch is not armed.
+    constexpr vt::DeviceType kNonCpuDevices[] = {
+        vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN, vt::DeviceType::kXPU,
+        vt::DeviceType::kROCM, vt::DeviceType::kTENSTORRENT};
+    int engaged_count = 0;
+    int refused_count = 0;
+    for (vt::DeviceType type : kNonCpuDevices) {
+      CAPTURE(vt::DeviceTypeName(type));
+      vt::Queue queue{vt::Device{type, 0}, nullptr};
+      m3::DepthDecoderWeights source = depth;
+      m3::Music3DepthDeviceWeights staged;
+      bool engaged = false;
+      bool refused = false;
+      try {
+        const m3::Music3DepthDeviceArm arm =
+            m3::Music3SelectDepthArm(queue, config, source, /*release_host=*/false, &staged);
+        engaged = arm.engaged();
+      } catch (const std::runtime_error&) {
+        refused = true;
+      }
+      engaged_count += engaged ? 1 : 0;
+      refused_count += refused ? 1 : 0;
+      // Named, because doctest cannot decompose a `||` inside a CHECK.
+      const bool selection_fired = engaged || refused;
+      CHECK_MESSAGE(selection_fired, "device '"
+                                            << vt::DeviceTypeName(type)
+                                            << "' quietly took the HOST arm: the selection did "
+                                               "not fire and nothing said so");
+    }
+    // The loop must have RUN. A list that emptied, or a body that threw before
+    // the first CHECK, would leave every assertion above unexecuted.
+    const int outcomes = engaged_count + refused_count;
+    CHECK(outcomes == static_cast<int>(sizeof(kNonCpuDevices) / sizeof(kNonCpuDevices[0])));
+    MESSAGE("non-CPU selection: " << engaged_count << " staged, " << refused_count
+                                  << " refused by name");
+  }
+
+  SUBCASE("a null staging slot is refused rather than dereferenced") {
+    vt::Queue queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+    m3::DepthDecoderWeights source = depth;
+    CHECK_THROWS_AS(
+        m3::Music3SelectDepthArm(queue, config, source, /*release_host=*/false, nullptr),
+        std::runtime_error);
+  }
+}
+
+TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws the same codes") {
+  // The reachability gate. It drives the PRODUCTION `Music3DepthStage` — the one
+  // `Music3GenerateFrameHiddens` calls, which is how the registered speech family
+  // reaches this row — with the device arm ENGAGED, and it asks the question
+  // #1131 says nobody asked of the DiT arm: which arm ran?
+  //
+  // A numeric comparison alone cannot answer that, because the two arms agree by
+  // design. So the counter is checked, and it is checked for an EXACT value
+  // rather than for movement: `num_codebooks` calls a frame, which is §16.2's 8.
+  const m3::DepthDecoderConfig config = DeviceArmConfig();
+  uint32_t state = 0x51ED2701u;
+  m3::DepthDecoderWeights depth = DeviceArmWeights(config, &state);
+  const int64_t H = config.hidden_size;
+  const size_t hidden = static_cast<size_t>(H);
+
+  m3::Music3ArWeights weights;
+  weights.depth_config = config;
+  weights.depth = depth;
+  weights.lm_config.hidden_size = H;
+  const int64_t vocab = m3::kAudioCodeOffset + 64;
+  weights.lm_config.vocab_size = vocab;
+  {
+    std::vector<uint8_t> bytes(static_cast<size_t>(vocab) * hidden * sizeof(uint16_t), 0);
+    uint16_t* const rows = reinterpret_cast<uint16_t*>(bytes.data());
+    const std::vector<float> table =
+        DeviceArmFill(static_cast<size_t>(vocab - m3::kAudioCodeOffset) * hidden, &state, 0.5f);
+    for (int64_t t = m3::kAudioCodeOffset; t < vocab; ++t) {
+      for (int64_t j = 0; j < H; ++j) {
+        rows[t * H + j] =
+            vt::F32ToBF16(table[static_cast<size_t>((t - m3::kAudioCodeOffset) * H + j)]);
+      }
+    }
+    weights.lm.embed_tokens.bytes = vllm::OwnedBytes(std::move(bytes));
+    weights.lm.embed_tokens.dtype = vt::DType::kBF16;
+    weights.lm.embed_tokens.rank = 2;
+    weights.lm.embed_tokens.shape[0] = vocab;
+    weights.lm.embed_tokens.shape[1] = H;
+  }
+
+  const int32_t semantic_code = 11;
+  const int64_t frame_index = 2;
+  const std::vector<float> last_conditional = DeviceArmFill(hidden, &state, 1.0f);
+  const std::vector<float> last_unconditional = DeviceArmFill(hidden, &state, 1.0f);
+
+  int64_t host_draws = 0;
+  int64_t device_draws = 0;
+  const auto make_sampler = [](int64_t* counter) {
+    return m3::Music3CodeSampler(
+        [counter](const std::vector<float>& probs, const m3::Music3Draw&) -> int64_t {
+          ++*counter;
+          size_t best = 0;
+          for (size_t i = 1; i < probs.size(); ++i) {
+            if (probs[i] > probs[best]) best = i;
+          }
+          return static_cast<int64_t>(best);
+        });
+  };
+
+  // The HOST arm, through the same production entry point, with a
+  // default-constructed arm — which is what every existing caller passes.
+  std::vector<int32_t> host_codes{semantic_code};
+  const std::vector<float> host = m3::Music3DepthStage(
+      last_conditional, last_unconditional, frame_index, weights, make_sampler(&host_draws),
+      &host_codes);
+
+  vt::Queue queue = CpuQueue();
+  m3::DepthDecoderWeights stage_source = depth;
+  const m3::Music3DepthDeviceWeights staged =
+      m3::StageMusic3DepthWeights(queue, config, stage_source, /*release_host=*/false);
+  m3::Music3DepthDeviceArm arm;
+  arm.queue = &queue;
+  arm.depth = &staged;
+  REQUIRE(arm.engaged());
+  REQUIRE_FALSE(arm.half_set());
+
+  const uint64_t before = m3::Music3DepthDeviceForwardCount();
+  std::vector<int32_t> device_codes{semantic_code};
+  const std::vector<float> device =
+      m3::Music3DepthStage(last_conditional, last_unconditional, frame_index, weights,
+                           make_sampler(&device_draws), &device_codes, arm);
+  const uint64_t after = m3::Music3DepthDeviceForwardCount();
+
+  // THE ASSERTION #1131 SAYS IS MISSING. `num_codebooks` appends a frame: one
+  // for the batch-2 prefix at position 0, then one per residual codebook step.
+  CHECK_MESSAGE(after - before == static_cast<uint64_t>(config.num_codebooks),
+                "the composed stage ran the DEVICE forward " << (after - before)
+                                                             << " times, expected "
+                                                             << config.num_codebooks);
+  REQUIRE(device.size() == host.size());
+  double worst_ulp = 0.0;
+  size_t nonzero = 0;
+  for (size_t i = 0; i < host.size(); ++i) {
+    worst_ulp = std::max(worst_ulp,
+                         std::abs(static_cast<double>(device[i]) - host[i]) / Bf16Ulp(host[i]));
+    if (host[i] != 0.0f) ++nonzero;
+  }
+  CHECK_MESSAGE(worst_ulp <= 512.0, "composed device/host worst deviation "
+                                        << worst_ulp << " bf16 ULP exceeds 512, which is a "
+                                                        "STRUCTURAL defect, not rounding");
+  // A tolerance CANNOT see a dropped stage — the prefix append, the fed-back
+  // projection row — because a schedule missing one still produces finite,
+  // plausible numbers. The drawn codes can.
+  CHECK_MESSAGE(device_codes == host_codes, "the two arms drew different residual codes");
+  CHECK(device_draws == host_draws);
+  CHECK(device_draws == config.residual_codebooks());
+  CHECK(static_cast<int64_t>(device_codes.size()) == config.num_codebooks);
+  CHECK_MESSAGE(nonzero > 0, "the reference block is all zeros, so nothing is comparable");
+  CHECK_MESSAGE(device_draws > 0, "no code was drawn, so the draw order is untested");
+  MESSAGE("composed device stage: " << host.size() << " values, worst " << worst_ulp
+                                    << " bf16 ULP, " << (after - before) << " device forwards, "
+                                    << device_draws << " draws, " << nonzero << " of "
+                                    << host.size() << " reference values non-zero");
+}
+
+TEST_CASE("music3 ar: the device depth arm refuses what it cannot serve, by name") {
+  const m3::DepthDecoderConfig config = DeviceArmConfig();
+  uint32_t state = 0x1234567u;
+  m3::DepthDecoderWeights depth = DeviceArmWeights(config, &state);
+  vt::Queue queue = CpuQueue();
+  m3::DepthDecoderWeights stage_source = depth;
+  const m3::Music3DepthDeviceWeights staged =
+      m3::StageMusic3DepthWeights(queue, config, stage_source, /*release_host=*/false);
+  const int64_t H = config.hidden_size;
+  const std::vector<float> row = DeviceArmFill(static_cast<size_t>(2 * H), &state, 1.0f);
+
+  SUBCASE("a null cache, a non-positive batch and a mis-sized input") {
+    m3::Music3DepthDeviceCache cache;
+    CHECK_THROWS_AS(m3::DepthDecoderAppendDevice(queue, config, staged, row, 2, nullptr),
+                    std::runtime_error);
+    CHECK_THROWS_AS(m3::DepthDecoderAppendDevice(queue, config, staged, row, 0, &cache),
+                    std::runtime_error);
+    CHECK_THROWS_AS(m3::DepthDecoderAppendDevice(queue, config, staged, row, 3, &cache),
+                    std::runtime_error);
+  }
+  SUBCASE("unstaged weights are refused rather than dereferenced") {
+    m3::Music3DepthDeviceCache cache;
+    const m3::Music3DepthDeviceWeights empty;
+    CHECK_FALSE(empty.staged());
+    CHECK_THROWS_AS(m3::DepthDecoderAppendDevice(queue, config, empty, row, 2, &cache),
+                    std::runtime_error);
+  }
+  SUBCASE("the batch cannot change mid-cache, and the position ceiling binds") {
+    m3::Music3DepthDeviceCache cache;
+    m3::DepthDecoderAppendDevice(queue, config, staged, row, 2, &cache);
+    const std::vector<float> one = DeviceArmFill(static_cast<size_t>(H), &state, 1.0f);
+    CHECK_THROWS_AS(m3::DepthDecoderAppendDevice(queue, config, staged, one, 1, &cache),
+                    std::runtime_error);
+    for (int64_t p = 1; p < config.max_position_embeddings; ++p) {
+      m3::DepthDecoderAppendDevice(queue, config, staged, row, 2, &cache);
+    }
+    CHECK(cache.positions == config.max_position_embeddings);
+    CHECK_THROWS_AS(m3::DepthDecoderAppendDevice(queue, config, staged, row, 2, &cache),
+                    std::runtime_error);
+  }
+  SUBCASE("a mis-sized weight is refused AT STAGE TIME, naming the tensor") {
+    m3::DepthDecoderWeights broken = depth;
+    broken.layers[0].gate_proj.pop_back();
+    CHECK_THROWS_AS(
+        m3::StageMusic3DepthWeights(queue, config, broken, /*release_host=*/false),
+        std::runtime_error);
+  }
+  SUBCASE("HALF an arm is refused at the composed stage rather than silently ignored") {
+    // A caller that set one field thinks it asked for the device and did not.
+    // Falling back to the host loop would be a 4.4x slowdown wearing a correct
+    // answer, so it is a refusal.
+    m3::Music3ArWeights weights;
+    weights.depth_config = config;
+    weights.depth = depth;
+    weights.lm_config.hidden_size = H;
+    weights.lm_config.vocab_size = m3::kAudioCodeOffset + 8;
+    m3::Music3DepthDeviceArm queue_only;
+    queue_only.queue = &queue;
+    CHECK(queue_only.half_set());
+    std::vector<int32_t> codes{1};
+    const std::vector<float> last(static_cast<size_t>(H), 0.5f);
+    const m3::Music3CodeSampler sampler =
+        [](const std::vector<float>&, const m3::Music3Draw&) -> int64_t { return 0; };
+    CHECK_THROWS_AS(m3::Music3DepthStage(last, last, 0, weights, sampler, &codes, queue_only),
+                    std::runtime_error);
+    m3::Music3DepthDeviceArm weights_only;
+    weights_only.depth = &staged;
+    CHECK(weights_only.half_set());
+    std::vector<int32_t> codes2{1};
+    CHECK_THROWS_AS(m3::Music3DepthStage(last, last, 0, weights, sampler, &codes2, weights_only),
+                    std::runtime_error);
+  }
 }
 
 TEST_CASE("music3 ar: the audio heads match upstream, one per residual codebook") {

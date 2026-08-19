@@ -779,6 +779,18 @@ reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
 come from the geometry the engine has just resolved for your checkpoint, so a
 refusal is about that checkpoint on this build.
 
+**A device is only ever offered the backends built for it.** On CPU the engine
+resolves `CPU_ATTN`, which is what the reference engine resolves on a CPU too. It
+is worth saying out loud because it was briefly untrue: `CPU_ATTN` was named as
+the CPU's preference while being registered nowhere, so CPU runs quietly fell
+through to `FLASH_ATTN` — harmless until `FLASH_ATTN` was taught FlashAttention-2's
+rule that a head size must be a multiple of 8. A CPU model with a head size of 6
+then had no backend at all and was refused at initialization, on hardware that
+runs it perfectly well ([#1371](https://github.com/mudler/vllm.cpp/issues/1371)).
+If you see the refusal above naming `FLASH_ATTN` alone on a device that is not an
+NVIDIA GPU, that is the shape to report: the rule quoted at you is about a kernel
+your device never runs.
+
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend
 whose declared floor is compute capability 8.0 is accepted on any newer GPU, even

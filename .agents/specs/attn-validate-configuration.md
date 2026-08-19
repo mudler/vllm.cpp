@@ -91,6 +91,27 @@ own it already exist.** No new roadmap row is opened.
 4. **The non-MLA sm_100 priority arm gained a `use_non_causal` guard upstream**
    between the two pins; see "Anchor reconciliation" below. Fixed in flow, tracked
    by its own issue, because the anchor being corrected points straight at it.
+5. **This change left three devices declaring a kernel they do not run.**
+   Recorded after the fact, because it was a live regression before it was debt.
+   `FlashAttentionBackend` is registered under `FLASH_ATTN` for `kCPU`, `kMETAL`,
+   `kVULKAN` and `kTENSTORRENT` as well as `kCUDA`
+   (`src/vllm/v1/attention/backend.cpp:381-417`), on the documented precondition
+   that those kernels share its NHD KV layout — a statement about the LAYOUT, not
+   about the kernel. M1 then attached FA2's capability surface to that shared
+   class, including `supports_head_size` = `head_size % 8 == 0 && head_size <= 256`
+   (`flash_attn.py:170-178`). Every one of those four devices thereby inherited a
+   rule about a CUDA kernel it does not run, and since each of the four lists no
+   other dense backend, a head size their own kernels handle correctly matched
+   NOTHING and `SelectAttentionBackendName` threw out of
+   `GPUModelRunner::initialize_kv_cache`. The compute-capability predicate got its
+   precondition in this same change; the head-size one did not, and the difference
+   is only that `CpuPlatform` reports no capability while it does report a head
+   size. CPU is closed by [#1371](https://github.com/mudler/vllm.cpp/issues/1371),
+   which registers `CPU_ATTN` — upstream's own CPU answer at `cpu.py:75-87` — so
+   the CPU stops borrowing another device's declaration. The other three have no
+   upstream backend to mirror and must have their capabilities AUTHORED.
+   **Owner: [#1389](https://github.com/mudler/vllm.cpp/issues/1389), row
+   `BACKEND-ATTN-REGISTRY`.**
 
 ## Anchor reconciliation
 

@@ -207,6 +207,15 @@ production driver yet, because the break closure W1 registered reads a returned
 frame on replay. Bit-exactness against a REPLAYED capture on a real GPU is owed,
 not met.
 
+W3 (2026-08-19, #1291) migrates the three remaining plain batched drivers:
+Qwen3-Coder MoE, Voxtral text and DeepSeek-V2 MLA. Each captures and replays
+through the seam in FULL mode, and each landed with its own gate. Six drivers
+read the framework capture switch for themselves before this row; two remain.
+
+W3 also closed a gate that could not fail. The mode a driver captures in was
+unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole
+driver gate green. The seam now counts the mode, and that flip reds each gate.
+
 A capture that FAILS is now distinguishable from a scope that was INERT. The
 capture scope has to swallow a throwing `EndCaptureGraph` — a destructor that
 propagates terminates — and both states left the container reporting

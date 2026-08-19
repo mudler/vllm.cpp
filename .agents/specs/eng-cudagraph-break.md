@@ -575,7 +575,22 @@ and an `rc` lease.
 **Correctness first. No performance result is accepted before the token-exact gate
 for that model is established.**
 
-**G1, bit-exactness against eager, per migrated model, over MORE than one replay.**
+**G1, bit-exactness against eager, per migrated model, over MORE than one replay.
+DELIVERED for four of the four migrated drivers, 2026-08-19 (W3, #1291), on
+`thor:gpu0` through an `rc` lease** — NVIDIA Thor, sm_110, driver 595.78, nvcc
+13.0.88, source at `c905bb536`, CUDA-ON build (`-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110`), 32 `.cu.o` objects, the binary resolving
+`libcudart.so.13` and `libcublasLt.so.13`.
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` ran **3 cases, 1600
+assertions, exit 0**, with per-driver readings `5 steps x 100 logits, 0
+differing, 4 replays` for `Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph` and
+`DeepseekV2DecodeGraph`. The assertion count is the load-bearing half of that
+statement: on a box with no CUDA backend the same file reports `Status:
+SUCCESS!` over `assertions: 0`, which is a skip wearing a pass, so a G1 claim
+from it is admissible only with a non-zero count and the device named. W2's
+driver is covered by construction — its gate ran on the identical seam — but it
+is not one of the three cases and is NOT claimed here.
+
 For each migrated model, run the same inputs through the segmented capture path and
 through the eager forward with capture disabled, and require the logits to be
 bit-identical. The comparison must cover at least three consecutive replays of the
@@ -840,9 +855,81 @@ MoE driver: `Qwen3_5DecodeGraph` is the richest and the most load-bearing, and
 migrating it first would put the hardest correctness surface behind the least
 seam experience.
 
-**W3, migrate the three remaining plain batched drivers.** `Qwen3MoeDecodeGraph`,
-`DeepseekV2DecodeGraph` and `VoxtralDecodeGraph`. They share W2's shape, so each
-is a repeat with its own G1 and G2. Landable one at a time.
+**W3, migrate the three remaining plain batched drivers. DONE 2026-08-19,
+[#1291](https://github.com/mudler/vllm.cpp/issues/1291).** `Qwen3MoeDecodeGraph`,
+`DeepseekV2DecodeGraph` and `VoxtralDecodeGraph` each open a
+`vt::GraphCaptureScope` over a per-slot `vt::BreakableGraph` in `kFull` and
+replay through `BreakableGraph::Replay`. Each landed as its own commit with its
+own red-first G2 gate, because they share W2's shape and nothing about one
+depends on another. What is gone from all three: the hand-rolled
+`BeginCapture`/`EndCaptureGraph` pair, the raw `void*` handle, the `bool
+captured` flag, the `DestroyGraph` loop and the driver's own
+`VLLM_CPP_CUDAGRAPH` read. **The six batched-driver reads `## Our baseline` item
+1 counted are down to two**, both in `qwen3_5.cpp`, which W4 owns. The two
+per-model rollback switches STAY (`VT_QWEN3MOE_CUDAGRAPH`,
+`VT_DEEPSEEK_CUDAGRAPH`): each is an A/B lever for exactly one driver, not a copy
+of the shared one.
+
+**Each driver owes its own gate, and the reason is that nothing else can see the
+difference.** A driver that kept its raw pair produces identical logits, an
+identical backend log and an identical `replay_count()`. `segments_captured` and
+`replays` are the only observables that separate "captured a graph" from
+"captured a graph THROUGH THE SEAM". Each gate drives `Step` through cold,
+capture, replay and a second replay and asserts those. Red-first, each on four
+assertions before its migration: `test_qwen3_moe_decode_graph_seam` 222/226 exit
+1, `test_voxtral_decode_graph_seam` 224/228 exit 1,
+`test_deepseek_v2_decode_graph_seam` 224/228 exit 1. Green after: 3/3 each.
+
+**The harness is now SHARED**, which this row should have done at W2 and did not.
+W2's gate carried its own capture-capable CPU backend and static-graph CPU
+platform; three more copies would have reproduced inside `tests/` the exact
+duplication being removed from `src/`, and two copies of a harness diverge
+invisibly because both files stay green while measuring different things.
+`tests/vllm/models/decode_graph_seam_harness.h` holds them once and W2's file
+includes it, unchanged in behaviour at 4/4 and 231 assertions.
+
+**W3 FOUND A GATE THAT COULD NOT FAIL, and closing it is part of this stage.**
+The three gates assert `breaks_registered == 0` to hold the capture to vLLM's
+decode arm. That assertion is a TAUTOLOGY for these models: it moves only when a
+`vt::GraphBreak` registers into a splitting scope, and the one production break
+point in the tree is W1's, in `qwen3.cpp`. W2's driver runs through it, so for W2
+the assertion was load-bearing; none of W3's three models registers one.
+Measured, not reasoned: flipping `kFull` to `kPiecewise` in `qwen3_moe.cpp` — one
+token — compiled clean and left that driver's whole gate GREEN at 226/226. The
+mode was UNOBSERVABLE from outside a driver: the scope is a `Step` local, the
+container is private to the driver's `Impl`, and a token gate cannot see a
+segment count. `vt::GraphBreakStats` gains `full_scopes` and `piecewise_scopes`,
+counted in `GraphCaptureScope`'s constructor on the ACTIVE path only (an inert
+scope makes no backend call in either mode, so counting it would report a mode
+that never reached a backend). Gated with its controls in
+`tests/vt/test_breakable_graph.cpp`; the same flip now reds each of the three
+driver gates on exactly those two assertions.
+
+**NO BREAK POINT IS REGISTERED IN THESE THREE MODELS, and that is a decision.**
+Under `kFull` a break point takes the same pass-through arm it takes outside a
+scope, so registering one here would land machinery no gate can exercise.
+Establishing each model's break-point set is what the PIECEWISE arm needs; that
+arm is blocked on replay-safe closure inputs, which W4 owns, and W6 is where the
+eligibility predicate moves.
+
+**G1 IS DELIVERED HERE**, which is the item W1 and W2 both carried as owed. See
+`## Gates` G1 and the `## Owed` entry it retires.
+
+**The async device-token decline, per driver.** `VoxtralDecodeGraph` needs none:
+its only construction site is `VoxtralGenerateGreedy`, the single-sequence
+multimodal greedy loop, which is not reached from `runner.cpp` and has no
+asynchronous device mirror. `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph` are
+a different case and a NEW FINDING rather than an inherited one: their
+registrations (`qwen3_moe_registry.cpp:107`, `deepseek_v2_registry.cpp:106`, and
+`glm4_moe_lite_registry.cpp:125` which constructs the DeepSeek driver) route a
+pure-decode step into a host-vector replay with NO `device_token_ids` check at
+all, while `qwen3.cpp:1106` declines for exactly that condition on a measured
+battery. W3 did not add a decline: it would trade a shipped, default-ON
+capability away on a measurement this stage cannot make, and the fix
+`qwen3.cpp`'s own comment names is `StepDevInputs` as a seam capability, which is
+W4 and is the only version that reaches these registrations at all. Filed as
+[#1305](https://github.com/mudler/vllm.cpp/issues/1305), owner W4, and recorded
+under `## Owed`.
 
 **W4, migrate the two Qwen3.5 drivers.** `Qwen3_5DecodeGraph` and
 `Qwen3_5DenseDecodeGraph`. These carry `StepDevInputs`, the auxiliary taps and the
@@ -1014,14 +1101,20 @@ point registered inside an unjoined fork window without this rule fails at
 ## Now
 
 `ACTIVE`. W0 (spike), W1 (the seam, its ported unit gate, and one registered
-break point) and W2 (`Qwen3DenseDecodeGraph` migrated onto the seam) have
-landed; W3 through W6 remain, and `## Work breakdown` states each. Owner:
-`.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W2.md`.
+break point), W2 (`Qwen3DenseDecodeGraph`) and W3 (`Qwen3MoeDecodeGraph`,
+`VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`) have landed. **Four of the nine
+drivers are on the seam.** W4 through W6 remain, and `## Work breakdown` states
+each. Owner: `.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W3.md`.
 
-The seam is now ENTERED from a production step: one driver opens a capture
-scope, so W1's staged slice is retired. The mode that step opens is `kFull`,
-mirroring vLLM's decode arm; the PIECEWISE arm still has no production driver
-and `## Owed` names what has to be true before one exists.
+Every migrated step opens its scope in `kFull`, mirroring vLLM's decode arm. The
+PIECEWISE arm still has no production driver and `## Owed` names what has to be
+true before one exists.
+
+**G1 is MET for every migrated driver and is no longer owed.** Bit-exactness
+against the eager arm over the capture step plus THREE consecutive replays, on
+`thor:gpu0` through an `rc` lease: 3 cases, 1600 assertions, 0 differing. That
+was the item W1 and W2 both carried forward, and it is the only gate in this row
+a CPU harness could never have answered.
 
 W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
 `cudaStreamBeginCapture` mid-forward on our stream configuration — is
@@ -1055,20 +1148,33 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   gated here through a recording backend reporting `SupportsGraphCapture()`
   false; ROCm (`rocm_backend.hip:248`) and Tenstorrent
   (`tenstorrent_backend.cpp:75-81`) are not exercised, and D6 records that
-  segmenting a ttnn mesh trace is UNVERIFIED on that runtime. Owner: **W3**.
-- **G1, bit-exactness against eager on a real GPU over MORE than one replay.
-  STILL OWED after W2, and W2 states why rather than implying it ran.** W1's
-  bit-exactness was against the model's own eager forward on CPU with the scope
-  open (500 logits, 0 differing); W2 adds the driver's CAPTURE step against
-  `Qwen3DenseModel::Forward` (100 logits, 0 differing). Neither is G1. A CPU
-  kernel is a direct function call and not a backend submission, so nothing a
-  CPU harness calls a "replay" recomputes anything, and the defect class this
-  gate exists for only appears on a LATER replay. The gate needs Qwen3-0.6B and
-  Qwen3-4B on a real device through an `rc` lease. W2 obtained no lease:
-  `dgx:gpu0` was held by another session's benchmark for the whole window and
-  `orin:gpu0`'s Jetson driver cannot run a CUDA 13 runtime. Owner: **W3**, which
-  migrates three more drivers of the same shape and can run one lease for all
-  four.
+  segmenting a ttnn mesh trace is UNVERIFIED on that runtime. **W3 did NOT
+  discharge this and says so rather than letting the owner field imply it did.**
+  The lease W3 obtained was `thor:gpu0`, which is CUDA; the fleet
+  (`rc devices`) carries no ROCm device and no Tenstorrent device, so this is
+  BLOCKED on hardware rather than unattempted. What W3 can say is what it
+  measured: the seam's CUDA arm now runs on TWO architectures rather than one,
+  sm_110 here and sm_121a on GB10 for the W1 exit criterion. Owner: **W5**,
+  which migrates the driver family whose Tenstorrent recapture path
+  (`qwen3.cpp`'s `VT_TT_RECAPTURE_EVERY` branch) is the only place a ttnn mesh
+  trace meets this seam today.
+- ~~**G1, bit-exactness against eager on a real GPU over MORE than one
+  replay.**~~ RETIRED by **W3**
+  ([#1291](https://github.com/mudler/vllm.cpp/issues/1291)).
+  `tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` runs each migrated
+  driver COLD, CAPTURE and THREE consecutive replays against the driver's own
+  eager arm, selected by `max_num_reqs == 0` so both arms are the same binary on
+  the same device rather than two builds. Measured on `thor:gpu0` through an
+  `rc` lease: 3 cases, 1600 assertions, exit 0, `5 steps x 100 logits, 0
+  differing, 4 replays` for each of the three W3 drivers. See `## Gates` G1 for
+  the build and device provenance, and for why the ASSERTION COUNT and not the
+  status line is what carries the claim. **Two limits, named rather than
+  claimed away.** The models are the synthetic tiny ones the CPU forward gates
+  already use, not Qwen3-0.6B or Qwen3-4B: they exercise the real CUDA kernels
+  and the real capture and replay, and they do not exercise a checkpoint's
+  weights or a long context. And W2's `Qwen3DenseDecodeGraph` is not one of the
+  three cases; it shares the seam and the shape, which is an argument and not a
+  measurement.
 - **The PIECEWISE arm has no production driver, and the break closure is why.**
   W2's driver opens its scope in `kFull`, so the registered break point takes
   the pass-through arm and the capture is one segment. Opening it `kPiecewise`
@@ -1088,11 +1194,28 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   seam-level persistent device input path — the only version of the fix that
   also reaches `qwen3_moe.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`.
   [#1179](https://github.com/mudler/vllm.cpp/issues/1179) tracks it.
-- **The async battery itself was NOT re-run by W2.**
-  `tests/parity/test_qwen3_dense_async_serving.cpp` needs a GPU and a
-  checkpoint, and W2 obtained no lease. What W2 can say is what it measured: the
-  decline's code path is unchanged and both of its arms are now executable on
-  CPU. Re-running the battery belongs with G1 on the same lease. Owner: **W3**.
+- **The async battery itself was NOT re-run, by W2 or by W3.**
+  `tests/parity/test_qwen3_dense_async_serving.cpp` needs a GPU **and a
+  checkpoint**, and that second half is what W3's lease did not carry: the G1
+  run built from a clean clone on the leased box's local disk and used synthetic
+  weights, so no checkpoint was staged and the battery could not run beside it.
+  What both stages can say is what they measured: the decline's code path is
+  unchanged and both of its arms are executable on CPU. Owner: **W4**, which
+  owns the fix the battery exists to validate.
+- **Three decode-graph registrations route an ASYNCHRONOUS step into a
+  host-vector replay with NO `device_token_ids` decline**
+  ([#1305](https://github.com/mudler/vllm.cpp/issues/1305), found by W3, not
+  caused by it — the shape is present at W3's base commit `5d9fe332c`).
+  `qwen3_moe_registry.cpp:107`, `deepseek_v2_registry.cpp:106` and
+  `glm4_moe_lite_registry.cpp:125` admit a pure-decode step to a driver that
+  replays against persistent HOST vectors, while `qwen3.cpp:1106` declines for
+  exactly that condition on a measured battery whose own comment calls the
+  hazard "latent for EVERY classic-dense model, since the graph is default-ON".
+  W3 did not add a decline: it would trade a shipped, default-ON capability away
+  on a measurement this stage cannot make, and the fix `qwen3.cpp` names is
+  `StepDevInputs` as a seam capability. `VoxtralDecodeGraph` is unaffected — its
+  only construction site is `VoxtralGenerateGreedy`, which the runner does not
+  reach. Owner: **W4**.
 - **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
   drain cannot see.** The `uncaught_exceptions()` comparison in
   `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A

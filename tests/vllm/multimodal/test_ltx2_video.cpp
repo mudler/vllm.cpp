@@ -2821,6 +2821,225 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   vllm_video_engine_free(engine);
 }
 
+
+// ─── W0-live: the lane that runs WHILE the render is alive (issue #1413) ─────
+//
+// WHAT THIS GATES, and why the table above does not already gate it. That case
+// reads `phase-log.json`, which `Ltx2VideoEngine::Generate` writes after
+// `im.trace.completed = true` — the SUCCESS PATH ONLY. A render that is killed,
+// aborted by a lease governor, or still running writes no table at all, and that
+// is the population this campaign actually has: #1375 is `ABORT[92] PROJECTED
+// OVERRUN` / `child exit=-15` / 0 frames, and `ltx25-decode-speed.md`'s two
+// rungs are `EXIT=137` / 0 frames and `EXIT=1` / 0 frames. An instrument that
+// reports on completion reported on none of them.
+//
+// So the deliverable here is different in kind: a line emitted AS EACH PHASE
+// STARTS, so that the last line printed names the phase that is currently
+// running. That is the whole difference between a working render and a hung one,
+// which were byte-identical from outside for 2.5 hours at a time, and it is the
+// difference a close-only emitter would still not make — the 3002 s conditioning
+// stretch never closed.
+//
+// AND IT CAPTURES REAL STDERR, with `dup`/`dup2`, rather than installing a
+// test-only sink. A sink would be a seam that could be armed here and absent in
+// production, which is the exact defect class `.agents/reachability.md` is
+// about; what is asserted below is what a user sees on the shipped default with
+// nothing set.
+//
+// THE NON-VACUOUS HALF is the strictly-increasing forward index. An emitter that
+// printed a constant `dit forward 1` would satisfy "the marker appears" and would
+// report nothing — which is what the spike's external sampler did, and why
+// #1375's `dit_runs=0` is not evidence of absence. The count has to MOVE.
+//
+// Nothing between the redirect and its restore may assert: a doctest `REQUIRE`
+// that aborted the case in there would leave the process with stderr pointed at
+// a temporary file for every case that follows.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 video: a render through the ABI PRINTS its progress while it runs") {
+  Workspace ws;
+  const std::string audio_embeds = ws.paths.audio_embeds;
+  const std::string max_phase = "0";
+  const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
+                        vllm::multimodal::kLtx2MaxPhaseExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = ws.paths.dit.c_str();
+  mp.video_vae_path = ws.paths.video_vae.c_str();
+  mp.audio_vae_path = ws.paths.audio_vae.c_str();
+  mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
+  mp.extra_keys = keys;
+  mp.extra_values = values;
+  mp.n_extras = 2;
+  mp.device = 0;
+
+  const std::string out_dir = ws.root + "/progress_out";
+  vllm_video_params gen = vllm_video_params_default();
+  gen.width = 64;
+  gen.height = 64;
+  gen.num_frames = 9;
+  gen.seed = 7;
+  gen.has_seed = 1;
+  gen.output_dir = out_dir.c_str();
+
+  vllm_video_engine* engine = nullptr;
+  vllm_video_result result;
+  std::memset(&result, 0, sizeof(result));
+  vllm_status loaded = VLLM_OK;
+  vllm_status generated = VLLM_OK;
+  std::string engine_error;
+  std::string captured;
+
+  // The LOAD is inside the capture as well as the generation: the timeline
+  // starts at the load because the DiT staging is minutes at 22B, and a lane
+  // that only spoke after the load would be silent for the phase #1021 is about.
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    loaded = vllm_video_engine_load(&mp, &engine);
+    if (loaded == VLLM_OK && engine != nullptr) {
+      generated = vllm_video_generate(engine, &gen, &result);
+    }
+    if (vllm_last_error() != nullptr) engine_error = vllm_last_error();
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+
+  INFO(engine_error);
+  REQUIRE(loaded == VLLM_OK);
+  REQUIRE(engine != nullptr);
+  REQUIRE(generated == VLLM_OK);
+
+  // ── the lines ────────────────────────────────────────────────────────────
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  MESSAGE("captured " << lines.size() << " [render] lines of " << captured.size()
+                      << " bytes of stderr");
+  REQUIRE_MESSAGE(!lines.empty(),
+                  "the render printed NOTHING while it ran; a working render and a hung one "
+                  "are still the same observation (#1413)");
+
+  // Every line carries the elapsed clock, and it never goes backwards. A `t=`
+  // that reset would mean two timelines interleaved in one capture.
+  double previous_t = -1.0;
+  for (const std::string& line : lines) {
+    INFO(line);
+    const size_t at = line.find(" t=");
+    REQUIRE_MESSAGE(at != std::string::npos, "a progress line carries no elapsed clock");
+    const double t = std::atof(line.c_str() + at + 3);
+    CHECK(t >= previous_t);
+    previous_t = t;
+  }
+
+  // ── the boundaries, opened AND closed ────────────────────────────────────
+  //
+  // The OPEN marker is the one that matters and it is asserted by name: a close
+  // marker alone names only phases that finished, and every render this row
+  // exists for stopped inside a phase that never did.
+  auto index_of = [&lines](const std::string& needle) -> long {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+    }
+    return -1;
+  };
+  for (const std::string name : {"load.dit", "denoise", "decode.video", "artifacts.frames"}) {
+    // `std::string`, never `const char*`: doctest stringifies a streamed `char*`
+    // as a BOOL, so a failure here would have printed "no '1' line".
+    CHECK_MESSAGE(index_of("+ " + name) >= 0, "no OPEN line for phase '" << name << "'");
+    CHECK_MESSAGE(index_of("- " + name) >= 0, "no CLOSE line for phase '" << name << "'");
+    CHECK_MESSAGE(index_of("- " + name) > index_of("+ " + name),
+                  "phase '" << name << "' closed before it opened");
+  }
+
+  // A close line reports what the phase cost, which is the number a reader takes
+  // off a killed run's log without waiting for a table that will never be
+  // written.
+  const long dit_close = index_of("- load.dit");
+  REQUIRE(dit_close >= 0);
+  CHECK_MESSAGE(lines[static_cast<size_t>(dit_close)].find(" dur=") != std::string::npos,
+                "a phase closed without saying what it cost: "
+                    << lines[static_cast<size_t>(dit_close)]);
+
+  // ── the per-forward counter, and the proof that it MOVES ─────────────────
+  std::vector<long> forward_indices;
+  std::vector<size_t> forward_lines;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const size_t at = lines[i].find("dit forward ");
+    if (at == std::string::npos) continue;
+    forward_indices.push_back(std::atol(lines[i].c_str() + at + 12));
+    forward_lines.push_back(i);
+  }
+  REQUIRE_MESSAGE(forward_indices.size() >= 2,
+                  "the denoise loop printed " << forward_indices.size()
+                                              << " forward lines; #1375 measures ~162 s per "
+                                                 "forward and 60 of them is structural, so a "
+                                                 "loop that prints once is a loop that hangs");
+  for (size_t i = 1; i < forward_indices.size(); ++i) {
+    INFO(lines[forward_lines[i]]);
+    CHECK_MESSAGE(forward_indices[i] > forward_indices[i - 1],
+                  "the forward counter did not move: " << forward_indices[i - 1] << " then "
+                                                       << forward_indices[i]);
+    // `last=` is the per-forward cost #1375 could only get as a wall-clock
+    // interval between GPU busy/idle edges. Absent on the first tick by
+    // construction, required on every one after it.
+    CHECK_MESSAGE(lines[forward_lines[i]].find(" last=") != std::string::npos,
+                  "a forward tick carries no per-forward cost: " << lines[forward_lines[i]]);
+  }
+  // The sampler step, as a FRACTION. Without the denominator a reader knows the
+  // render moved and not whether it is a tenth or nine tenths of the way.
+  //
+  // Two statements rather than one `&&`: doctest's expression decomposer
+  // static-asserts "Expression Too Complex Please Rewrite As Binary Comparison"
+  // on a conjunction, so the compound form does not build — and a mutation that
+  // fails to build reads exactly like a passing test.
+  const std::string first_tick = lines[forward_lines[0]];
+  CHECK_MESSAGE(first_tick.find(" step ") != std::string::npos,
+                "a forward tick names no sampler step: " << first_tick);
+  CHECK_MESSAGE(first_tick.find("/") != std::string::npos,
+                "the sampler step carries no /N denominator, so a reader knows the render "
+                "moved and not whether it is a tenth or nine tenths of the way: "
+                    << first_tick);
+
+  // ── the ticks are INSIDE the phase they claim ────────────────────────────
+  const long denoise_open = index_of("+ denoise");
+  const long denoise_close = index_of("- denoise");
+  REQUIRE(denoise_open >= 0);
+  REQUIRE(denoise_close >= 0);
+  for (size_t i = 0; i < forward_lines.size(); ++i) {
+    const long at = static_cast<long>(forward_lines[i]);
+    // Two comparisons, never one `&&`: doctest static-asserts on a conjunction.
+    CHECK_MESSAGE(at > denoise_open,
+                  "a DiT forward tick was printed BEFORE the denoise phase opened: "
+                      << lines[forward_lines[i]]);
+    CHECK_MESSAGE(at < denoise_close,
+                  "a DiT forward tick was printed AFTER the denoise phase closed: "
+                      << lines[forward_lines[i]]);
+  }
+
+  vllm_video_result_free(&result);
+  vllm_video_engine_free(engine);
+}
+#endif  // !_WIN32
+
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────
 //
 // Everything above runs over a reduced fixture, which proves the composition and

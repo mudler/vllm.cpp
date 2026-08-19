@@ -203,11 +203,16 @@ question needs the box, and needs no GPU beyond a server that is already up:
    into the non-owning `ApiServer::tokenizer_` (`api_server.h:340`); and
    `model_loader.cpp:1528` constructs `input_processor_(tokenizer_, …)`, whose
    member is a REFERENCE (`input_processor.h:152`) to the same object.
-   `model_loader.cpp:1529` and `:1508` take the same object's address a fourth
-   and fifth time, for `output_processor_(&tokenizer_)` and for
-   `MakeNativeBackendFactory(tokenizer_, …)`. What the
-   two endpoints do NOT share is the HANDLER around it: body parse, string
-   extraction, and `Encode` against `EncodeWithSpecialTokens`.
+   `model_loader.cpp:1529` and `:1508` borrow it a fourth and fifth time, by
+   ADDRESS for `output_processor_(&tokenizer_)` and by REFERENCE for
+   `MakeNativeBackendFactory(tokenizer_, …)`, whose parameter is declared
+   `const tok::Tokenizer&` and which the header requires the object to outlive
+   (`backend_native.h:155-158`). The one owning instance is
+   move-constructed at `model_loader.cpp:1429`, and the count is of THIS path:
+   the C ABI takes a sixth borrow at `vllm_c.cpp:1395`, off the HTTP path this
+   probe drives. What the two endpoints do NOT share is the HANDLER around it:
+   body parse, string extraction, and `Encode` against
+   `EncodeWithSpecialTokens`.
 
    Read the three outcomes as follows:
 

@@ -65,14 +65,60 @@ void ForOutputRows(int64_t rows, int64_t work_per_row,
   ParallelForRows(CurrentThreadpool(), rows, body);
 }
 
+// How many OUTPUT POSITIONS share one sweep of the (ic, k) weights. It is not a
+// blocking heuristic and it is not tunable at run time: it is the number of
+// INDEPENDENT f64 accumulator chains the kernel offers the machine, and the
+// whole of #1334 is that the shipped loop offered exactly one. 32 doubles is
+// four AVX-512 registers or sixteen NEON ones, and it measured best of {8, 16,
+// 32, 64} at the vocoder's shapes on both -O2 and -O3.
+constexpr int64_t kConv1dPosTile = 32;
+
+// The fixed width the in-range part of a tile is chunked into when the tile is
+// not whole. GCC's -O2 vector cost model is `very-cheap` and takes only a loop
+// whose trip count is a known multiple of the vector width, so a runtime bound
+// is the difference between 1.1x and 5.2x on the SAME source. Release is -O3
+// and CI builds it, but scripts/dgx-bringup.sh builds RelWithDebInfo, and a
+// kernel that is fast only under the flag the next measurement happens to pick
+// is a kernel nobody can compare.
+constexpr int64_t kConv1dChunk = 8;
+
 // out[n, oc, t] = bias[oc] + Sum_{ic,k} x[n, g*Cin/g + ic, t*stride - padding +
 // k*dilation] * w[oc, ic, k], taps outside [0, Lin) SKIPPED (zero padding).
 //
-// The accumulator is seeded with the bias and walked in (ic ascending, k
-// ascending) order — vocoder1d.cpp:90-100 @ 8fa405bb7, verbatim. Every existing
-// caller passes padding == 0 (the vocoder pads explicitly through
-// `vocoder1d::Pad1d`, which can also replicate); the skip below is therefore
-// unreachable on those shapes and exists for torch parity.
+// THE ARITHMETIC IS THE ONE vocoder1d.cpp:90-100 @ 8fa405bb7 PERFORMED, AND
+// THE ORDER IS TOO. What changed (#1334) is only which cells are in flight at
+// once. The shipped form seeded one accumulator with the bias and swept
+// (ic ascending, k ascending) into it, which for a MiniMax-Music3 residual unit
+// is in_per_group * kernel = 384 * 7 = 2688 STRICTLY DEPENDENT f64 additions per
+// output element: no instruction-level parallelism, no vectorisation at any
+// width, and a measured ~2.8-3.0 cycles per multiply-accumulate, which is what
+// an `fadd` latency of 3 predicts and nothing else does.
+//
+// This form holds kConv1dPosTile accumulators, one per output position, and
+// hoists the (ic, k) sweep outside them. Fix ANY single output cell and read
+// what it receives, in order: the bias, then (ic=0,k=0), (ic=0,k=1), ... — the
+// identical sequence of IEEE-754 double additions of the identical double
+// products, in the identical order. The additions are INTERLEAVED across
+// independent cells rather than serialised into one. That is a scheduling
+// change and not an arithmetic one, so `memcmp` equality with the pre-change
+// loop, with the CUDA provider, and with all four consumers' goldens survives BY
+// CONSTRUCTION rather than within a tolerance.
+//
+// The zero-padding skip moves from a per-position test to a CLAMP on the tile,
+// which is the same set: for a fixed k the positions with 0 <= t*stride - pad +
+// k*dilation < Lin form one contiguous run of t, so the (t, ic, k) triples this
+// skips are exactly the triples the shipped loop skipped. Every existing caller
+// passes padding == 0, so the clamp's edges are reached only by the op's torch
+// arm — which is why tests/vt/test_ops_conv1d_general.cpp gates them and why
+// this row added the tile-geometry cases that do.
+//
+// stride > 1 keeps the shipped gather (`acc[i] += x[base + i*stride] * w`),
+// because a strided load does not vectorise and a gather instruction is slower
+// than the scalar it replaces here. The MiniMax-Music3 vocoder's Conv1d calls
+// are all stride 1; the strided caller is the alias-free DOWNSAMPLE in
+// vocoder1d::AliasFreeActivation1d::Apply, which is depthwise (in_per_group ==
+// 1) and therefore has a chain one tap deep — it is not the shape this is
+// about. .agents/specs/minimax-music3.md §18.4.
 void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias,
                   const Conv1dArgs& args) {
   const int64_t batch = x.shape[0], in_channels = x.shape[1], in_len = x.shape[2];
@@ -88,28 +134,62 @@ void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const T
 
   const int64_t rows = batch * out_channels;
   ForOutputRows(rows, length * in_per_group * kernel, [&](int64_t r0, int64_t r1) {
+    alignas(64) double acc[kConv1dPosTile];
     for (int64_t r = r0; r < r1; ++r) {
       const int64_t n = r / out_channels;
       const int64_t oc = r - n * out_channels;
       const int64_t g = oc / out_per_group;
       const float* xn = xp + n * in_channels * in_len;
       float* on = op + (n * out_channels + oc) * length;
-      for (int64_t t = 0; t < length; ++t) {
-        double acc = bp != nullptr ? bp[oc] : 0.0;
+      const double seed = bp != nullptr ? bp[oc] : 0.0;
+      for (int64_t t0 = 0; t0 < length; t0 += kConv1dPosTile) {
+        const int64_t tile = std::min<int64_t>(kConv1dPosTile, length - t0);
+        for (int64_t i = 0; i < tile; ++i) acc[i] = seed;
         for (int64_t ic = 0; ic < in_per_group; ++ic) {
-          const int64_t src_c = g * in_per_group + ic;
+          const float* xc = xn + (g * in_per_group + ic) * in_len;
+          const float* wc = wp + (oc * in_per_group + ic) * kernel;
           for (int64_t k = 0; k < kernel; ++k) {
-            const int64_t pos = t * stride - pad + k * dilation;
-            if (pos < 0 || pos >= in_len) continue;
-            acc += static_cast<double>(xn[src_c * in_len + pos]) *
-                   static_cast<double>(wp[(oc * in_per_group + ic) * kernel + k]);
+            const double wv = static_cast<double>(wc[k]);
+            // Position of tile slot i is `base + i * stride`; it contributes iff
+            // that lies in [0, in_len), which bounds i to [lo, hi).
+            const int64_t base = t0 * stride - pad + k * dilation;
+            int64_t lo = base < 0 ? (-base + stride - 1) / stride : 0;
+            const int64_t room = in_len - base;
+            int64_t hi = room <= 0 ? 0 : std::min<int64_t>(tile, (room + stride - 1) / stride);
+            if (lo >= hi) continue;
+            // Formed only after the clamp, so it never points before `xc`.
+            const float* xs = xc + base + lo * stride;
+            double* ap = acc + lo;
+            const int64_t span = hi - lo;
+            if (stride != 1) {
+              for (int64_t i = 0; i < span; ++i)
+                ap[i] += static_cast<double>(xs[i * stride]) * wv;
+            } else if (span == kConv1dPosTile) {
+              // The whole-tile case, and the only loop here with a compile-time
+              // trip count. It is what the vocoder's own shapes take.
+              for (int64_t i = 0; i < kConv1dPosTile; ++i)
+                ap[i] += static_cast<double>(xs[i]) * wv;
+            } else {
+              int64_t i = 0;
+              for (; i + kConv1dChunk <= span; i += kConv1dChunk) {
+                double* a8 = ap + i;
+                const float* x8 = xs + i;
+                for (int64_t j = 0; j < kConv1dChunk; ++j)
+                  a8[j] += static_cast<double>(x8[j]) * wv;
+              }
+              for (; i < span; ++i) ap[i] += static_cast<double>(xs[i]) * wv;
+            }
           }
         }
-        on[t] = static_cast<float>(acc);
+        for (int64_t i = 0; i < tile; ++i) on[t0 + i] = static_cast<float>(acc[i]);
       }
     }
   });
 }
+
+// Fixed tap width for the contiguous (dilation == 1) scatter; 4 divides every
+// kernel the four consumers run (4, 8, 12, 16) with no tail.
+constexpr int64_t kConvTranspose1dTapChunk = 4;
 
 // torch.nn.functional.conv_transpose1d. Weight is [Cin, Cout/groups, K].
 //
@@ -151,7 +231,26 @@ void ConvTranspose1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
           const double value = xn[ic * in_len + t];
           if (value == 0.0) continue;
           double* dst = acc.data() + t * stride;
-          for (int64_t k = 0; k < kernel; ++k) dst[k * dilation] += value * static_cast<double>(wc[k]);
+          // The taps of ONE input value land in `kernel` DISTINCT cells, so this
+        // scatter already has instruction-level parallelism and chunking it
+        // reorders nothing: no cell receives two of these adds. What the chunk
+        // buys is the compile-time trip count -O2's `very-cheap` vector model
+        // needs (2.7-2.9x there on the three kernels of 8 taps or more; -O3
+        // already finds it, which is why this op is ~6 % of the chain's wall and
+        // Conv1d is ~94 %). §18.5.
+        if (dilation == 1) {
+          int64_t k = 0;
+          for (; k + kConvTranspose1dTapChunk <= kernel; k += kConvTranspose1dTapChunk) {
+            double* dk = dst + k;
+            const float* wk = wc + k;
+            for (int64_t j = 0; j < kConvTranspose1dTapChunk; ++j)
+              dk[j] += value * static_cast<double>(wk[j]);
+          }
+          for (; k < kernel; ++k) dst[k] += value * static_cast<double>(wc[k]);
+        } else {
+          for (int64_t k = 0; k < kernel; ++k)
+            dst[k * dilation] += value * static_cast<double>(wc[k]);
+        }
         }
       }
       float* on = op + (n * out_channels + dst_c) * length;

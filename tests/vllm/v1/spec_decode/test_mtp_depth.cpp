@@ -98,6 +98,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/config/speculative.h"
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) dispatch counters
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
@@ -631,4 +632,152 @@ TEST_CASE("mtp depth: the ngram proposer is unaffected by the MTP depth work") {
   REQUIRE(out.finished);
   REQUIRE(out.outputs.size() == 1);
   CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 4);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, reached from
+// the production engine. Closes the predicate half of
+// [#1020](https://github.com/mudler/vllm.cpp/issues/1020), which this row owned
+// under `## Owed` until W6 took it.
+//
+// WHY IT LIVES HERE AND NOT IN ITS OWN FILE. The predicate runs in
+// `GPUModelRunner::execute_model`, so seeing it work needs a real engine driving
+// real speculative steps -- LoadedEngine, EngineCore, Scheduler, runner -- which
+// is exactly the stack this file already builds. A second copy of that fixture
+// would be the "two copies of a harness diverge invisibly" shape the sibling
+// decode-graph gates were consolidated to avoid, and a test that called
+// `ActualUniformDecodeQueryLen` directly would prove the arithmetic and never
+// that a step reaches it.
+//
+// WHAT #1020 IS, IN ONE SENTENCE. The predicate compared the batch's uniform
+// query length against `1 + num_speculative_tokens`, the CONFIGURED width, so a
+// step the scheduler had clamped to a shorter -- but still perfectly uniform --
+// draft prefix missed it and ran its verify eager, with no log and no counter.
+//
+// WHY `clamped_spec_steps` AND NOT `uniform_spec_steps`. The total moves on an
+// unclamped engine too, so it cannot witness the widening: it is above zero
+// before and after. Only the strictly-between-1-and-`1 + k` bucket is the
+// population the old predicate refused, and it is zero unless something actually
+// clamped. MEASURED on this fixture at `max_model_len == 32`: the context tail
+// clamps the last verify steps, and the bucket reads 0 at k=1, 0 at k=2, 1 at
+// k=3, 2 at k=4 and 4 at k=6. The k<=2 zeros are not a gap, they are the
+// control: at k=1 there is no length strictly between 1 and 2 for a clamp to
+// land on, so a counter that fired there would be counting something else.
+TEST_CASE("W6: a CLAMPED spec verify is graph-eligible at its actual depth") {
+  const HfConfig c = MakeDenseConfig();
+
+  // k=1 and k=2: the control. Nothing can be clamped into the open interval.
+  for (const int k : {1, 2}) {
+    CAPTURE(k);
+    vllm::v1::ResetGraphDispatchStats();
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(k),
+                     MakeMtpHead(c));
+    const RequestOutput out = eng.engine().generate("hello", Greedy(29), "req");
+    REQUIRE(out.finished);
+    const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+    CAPTURE(st.uniform_steps);
+    CAPTURE(st.uniform_spec_steps);
+    CAPTURE(st.clamped_spec_steps);
+    // The engine ran and the predicate saw it. A zero here would make every
+    // assertion below hold vacuously, which is the shape a broken instrument
+    // reports as a pass.
+    REQUIRE(st.uniform_steps > 0);
+    CHECK(st.uniform_spec_steps > 0);
+    CHECK(st.clamped_spec_steps == 0);
+  }
+
+  // k >= 3: the context tail clamps, and those steps are now eligible. This is
+  // the assertion the mutation moves.
+  for (const int k : {3, 4, 6}) {
+    CAPTURE(k);
+    vllm::v1::ResetGraphDispatchStats();
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(k),
+                     MakeMtpHead(c));
+    const RequestOutput out = eng.engine().generate("hello", Greedy(29), "req");
+    REQUIRE(out.finished);
+    REQUIRE(out.outputs.size() == 1);
+    CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 29);
+    const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+    CAPTURE(st.uniform_steps);
+    CAPTURE(st.uniform_spec_steps);
+    CAPTURE(st.clamped_spec_steps);
+    REQUIRE(st.uniform_steps > 0);
+    CHECK(st.clamped_spec_steps > 0);
+    // A clamped step is a subset of the speculative ones, or one of the two
+    // counters is counting the wrong population.
+    CHECK(st.clamped_spec_steps < st.uniform_spec_steps);
+    CHECK(st.uniform_spec_steps <= st.uniform_steps);
+  }
+}
+
+// The conjunct that keeps a PREFILL out of the widened arm, and it is not
+// hypothetical: without it this fixture reported 27 "uniform spec" steps out of
+// 28 on a 29-token run, because a single request prefilling n tokens is uniform
+// at query length n by every arithmetic test vLLM applies. The runner
+// additionally requires that every request in the step is verifying at exactly
+// `q - 1` drafts, read off the scheduler's own per-request counts.
+//
+// A spec-OFF engine is the cleanest statement of it: `num_spec()` is 0, so
+// `1 + k` is 1 and nothing above 1 can be admitted at all.
+TEST_CASE("W6: a spec-OFF engine admits query length 1 and nothing else") {
+  const HfConfig c = MakeDenseConfig();
+  vllm::v1::ResetGraphDispatchStats();
+  LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), EngineParams{});
+  const RequestOutput out = eng.engine().generate("hello", Greedy(8), "req");
+  REQUIRE(out.finished);
+  const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+  CAPTURE(st.uniform_steps);
+  CAPTURE(st.uniform_spec_steps);
+  CAPTURE(st.ragged_steps);
+  REQUIRE(st.uniform_steps > 0);
+  CHECK(st.uniform_spec_steps == 0);
+  CHECK(st.clamped_spec_steps == 0);
+  // No driver on this CPU platform captures, so nothing opened a ring. Asserted
+  // rather than left unsaid: a non-zero here would mean a CPU step reached a
+  // capture path, which `support_static_graph_mode()` is supposed to refuse.
+  CHECK(st.capture_shapes == 0);
+}
+
+// A MULTI-TOKEN PREFILL ON A SPECULATING ENGINE. "hello world" is two tokens in
+// this fixture's BPE, so at k=3 the prefill step is uniform at query length 2 by
+// arithmetic, inside the `1 + k` bound, and strictly below the configured 4 --
+// the shape a bare uniformity test would put in the CLAMPED bucket and hand to a
+// decode capture.
+//
+// WHICH CONJUNCT ACTUALLY REFUSES IT HERE, because the two are easy to confuse
+// and only measurement separates them. On this GDN hybrid it is the FIRST one:
+// the model has linear-attention layers, so `gdn_group_id_ >= 0` and a prefill
+// step carries `gdn_meta.num_prefill_tokens > 0`. The per-request draft conjunct
+// inside `GraphEligibleQueryLen` is therefore REDUNDANT on every model that
+// reads `uniform_query_len` today, and a mutation deleting it left this suite
+// GREEN at 104/104 -- which is why that conjunct is gated in
+// `test_cudagraph_dispatch.cpp` on the function itself, and why the spec records
+// it as defence in depth for the next model rather than as something measured
+// here. Recorded rather than claimed away.
+//
+// One request generating ONE token is one step, and that step is the prefill.
+// So every speculative bucket must be empty and the step must be reported as
+// serving no captured shape at all.
+TEST_CASE("W6: a multi-token PREFILL is not a verify shape") {
+  const HfConfig c = MakeDenseConfig();
+  vllm::v1::ResetGraphDispatchStats();
+  LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3),
+                   MakeMtpHead(c));
+  const RequestOutput out = eng.engine().generate("hello world", Greedy(1), "req");
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 1);
+  const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+  CAPTURE(st.uniform_steps);
+  CAPTURE(st.uniform_spec_steps);
+  CAPTURE(st.clamped_spec_steps);
+  CAPTURE(st.ragged_steps);
+  // A step ran, so nothing below is vacuous.
+  REQUIRE(st.uniform_steps + st.ragged_steps > 0);
+  CHECK(st.uniform_spec_steps == 0);
+  CHECK(st.clamped_spec_steps == 0);
+  // And it was reported as serving no captured shape, which is the positive
+  // half: "not admitted" has to be OBSERVABLE or the two counters above are
+  // satisfied by a step that was never counted at all.
+  CHECK(st.ragged_steps >= 1);
 }

@@ -44,6 +44,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) dispatch counters
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"
 #include "vt/dtype.h"
@@ -200,9 +201,15 @@ struct CachePool {
   std::vector<std::vector<float>> gdn_conv_buf;
   std::vector<PagedKvCache> attn_kv;
   std::vector<GdnStateCache> gdn_state;
+  int64_t spec_max_query_len = 1;
 
-  CachePool(const HfConfig& cfg, int64_t nb, int64_t bs)
-      : c(cfg), num_blocks(nb), block_size(bs) {
+  // `spec_mql` is the longest speculative query length this pool must serve.
+  // `causal_conv1d_spec_update` derives it from the conv state WIDTH --
+  // `state_len = (K - 1) + (mql - 1)` (`src/vt/ops.cpp:1903`) -- so a pool built
+  // at the plain decode width refuses every q above 1. Default 1 keeps every
+  // existing case byte-identical.
+  CachePool(const HfConfig& cfg, int64_t nb, int64_t bs, int64_t spec_mql = 1)
+      : c(cfg), num_blocks(nb), block_size(bs), spec_max_query_len(spec_mql) {
     const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
     const int64_t Hv = c.linear_num_value_heads, Dv = c.linear_value_head_dim,
                   Dk = c.linear_key_head_dim, Kw = c.linear_conv_kernel_dim;
@@ -211,7 +218,9 @@ struct CachePool {
     for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
       if (c.layer_types[static_cast<size_t>(l)] == "linear_attention") {
         gdn_ssm_buf.emplace_back(static_cast<size_t>(nb * Hv * Dv * Dk), 0.0f);
-        gdn_conv_buf.emplace_back(static_cast<size_t>(nb * conv_dim * (Kw - 1)), 0.0f);
+        gdn_conv_buf.emplace_back(
+            static_cast<size_t>(nb * conv_dim * (Kw - 1 + spec_max_query_len - 1)),
+            0.0f);
       } else {
         full_attn_buf.emplace_back(static_cast<size_t>(nb * 2 * bs * Hkv * Dh), 0.0f);
       }
@@ -231,8 +240,9 @@ struct CachePool {
       GdnStateCache gs;
       gs.ssm_state = vt::Tensor::Contiguous(gdn_ssm_buf[g].data(), DType::kF32, dev,
                                             {nb, Hv, Dv, Dk});
-      gs.conv_state = vt::Tensor::Contiguous(gdn_conv_buf[g].data(), DType::kF32, dev,
-                                             {nb, conv_dim, Kw - 1});
+      gs.conv_state = vt::Tensor::Contiguous(
+          gdn_conv_buf[g].data(), DType::kF32, dev,
+          {nb, conv_dim, Kw - 1 + spec_max_query_len - 1});
       gdn_state.push_back(gs);
     }
   }
@@ -699,4 +709,161 @@ TEST_CASE("Qwen3_5DecodeGraph::Step REACHES vt::PersistentStepInput") {
   // capability is landed and reached; adopting its device arm is what the
   // `qwen3.cpp` decline needs, and the spec's `## Owed` names it.
   CHECK(after_replay.device_refreshes == 0);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ENG-CUDAGRAPH-BREAK W6 (#1374): THE SLOT KEY, closing the half of
+// [#1020](https://github.com/mudler/vllm.cpp/issues/1020) that is not the
+// predicate.
+//
+// WHY THIS IS NOT A UNIT TEST OF A COMPARATOR. `DecodeGraphSlotKey`'s ordering
+// is four lines and a test that constructed one by hand would prove the
+// comparator sorts. The claim here is different: that two SPEC steps whose
+// padded token counts are EQUAL and whose uniform query lengths DIFFER get two
+// graphs rather than one. Only `Qwen3_5DecodeGraph::Step` can answer that, and
+// only through the driver's own capture counters -- a token gate cannot see
+// which graph a replay came from, which is precisely how the collision stayed
+// invisible.
+//
+// THE COLLISION IS REACHABLE TODAY AND NOT ONLY AFTER THE WIDENING.
+// `S = spec_step ? B : PadToCaptureSize(B)`, so 2 requests x 2 tokens and
+// 1 request x 4 tokens are both S == 4. Before W6 both indexed `slots[4]`, and
+// the second replayed a graph captured against the first's metadata --
+// different `spec_query_start_loc`, different `num_accepted_tokens`, different
+// row count. `SizeSlot::Refresh` copies IN PLACE only while the sizes match and
+// REASSIGNS the vector when they do not, which also moves the host addresses a
+// capture baked (spec `## Risks/decisions` D2). Silently wrong logits.
+namespace {
+
+// One PURE-SPEC batch: `reqs` requests, each verifying `q` tokens.
+// Mirrors the gdn_attn.cpp spec contract the driver's
+// `ValidateGdnDecodeGraphState` enforces (`qwen3_5.cpp:367-421`): no non-spec
+// rows, so `num_decodes == num_prefills == 0` and the non-spec segmentation is
+// nullopt by construction.
+GDNAttentionMetadata SpecGdnMeta(int32_t reqs, int32_t q) {
+  GDNAttentionMetadata gm;
+  gm.num_prefills = 0;
+  gm.num_prefill_tokens = 0;
+  gm.num_decodes = 0;
+  gm.num_decode_tokens = 0;
+  gm.num_spec_decodes = reqs;
+  gm.num_spec_decode_tokens = reqs * q;
+  gm.num_actual_tokens = reqs * q;
+  gm.spec_state_indices_num_cols = q;
+  std::vector<int32_t> ssi(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (int32_t r = 0; r < reqs; ++r)
+    for (int32_t j = 0; j < q; ++j)
+      ssi[static_cast<size_t>(r * q + j)] = r;
+  gm.spec_state_indices_tensor = std::move(ssi);
+  std::vector<int32_t> sqsl(static_cast<size_t>(reqs) + 1);
+  for (int32_t r = 0; r <= reqs; ++r) sqsl[static_cast<size_t>(r)] = r * q;
+  gm.spec_query_start_loc = std::move(sqsl);
+  gm.spec_sequence_masks = std::vector<uint8_t>(static_cast<size_t>(reqs), 1);
+  std::vector<int32_t> stx(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (size_t i = 0; i < stx.size(); ++i) stx[i] = static_cast<int32_t>(i);
+  gm.spec_token_indx = std::move(stx);
+  // Accept ONE token per request, the shape a verify step arrives in before the
+  // rejection sampler has run. Column `acc - 1 == 0` is the live initial slot.
+  gm.num_accepted_tokens = std::vector<int32_t>(static_cast<size_t>(reqs), 1);
+  return gm;
+}
+
+CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
+  CommonAttentionMetadata am;
+  am.num_reqs = reqs;
+  am.num_actual_tokens = reqs * q;
+  am.query_start_loc.resize(static_cast<size_t>(reqs) + 1);
+  for (int32_t r = 0; r <= reqs; ++r)
+    am.query_start_loc[static_cast<size_t>(r)] = r * q;
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens.assign(static_cast<size_t>(reqs), pos + q);
+  am.seq_lens_cpu = am.seq_lens;
+  am.max_query_len = q;
+  am.max_seq_len = pos + q;
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(static_cast<size_t>(reqs), 0);
+  am.slot_mapping.resize(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (size_t i = 0; i < am.slot_mapping.size(); ++i)
+    am.slot_mapping[i] = pos + static_cast<int32_t>(i);
+  am.causal = true;
+  return am;
+}
+
+std::vector<int32_t> Iota(int32_t n, int32_t base) {
+  std::vector<int32_t> v(static_cast<size_t>(n));
+  for (int32_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = base + i;
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("W6: two spec shapes of EQUAL S and different q get two graphs") {
+  // The conv window bounds the verify length this model can run:
+  // `causal_conv1d_spec_update` refuses a query length above
+  // `linear_conv_kernel_dim - 1` (`src/vt/ops.cpp:1913`). The shared
+  // `TinyConfig` uses 4, which caps q at 3 and leaves no room for the third
+  // distinct length the capture bound needs. Widen the window in a LOCAL copy
+  // and build this case's weights and caches from that same copy, so nothing
+  // else in the file observes it.
+  HfConfig c = TinyConfig();
+  c.linear_conv_kernel_dim = 6;
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  REQUIRE_MESSAGE(vt::GraphCaptureEnabled(),
+                  "this gate needs the CAPTURING lane; VLLM_CPP_CUDAGRAPH=0 is set");
+
+  StaticGraphCpu harness;
+  vt::Queue q = Q();
+  CachePool pool(c, /*num_blocks=*/4, /*block_size=*/16, /*spec_mql=*/4);
+
+  vt::ResetGraphBreakStats();
+  vllm::v1::ResetGraphDispatchStats();
+  vllm::Qwen3_5DecodeGraph graph(w, c, q, /*max_num_reqs=*/4);
+
+  // SHAPE A: 3 requests x 2 tokens == 6 tokens. THREE steps, because a spec step
+  // always takes the two-slot parity ring (`dbuf = impl_->dbuf || spec_step`):
+  // slot 0 runs cold, slot 1 runs cold, and slot 0 is warm and captures on the
+  // THIRD. Two steps would leave nothing captured and the collision below
+  // unexercised, which is the "assertions: 0 wearing a pass" shape.
+  for (int step = 0; step < 3; ++step) {
+    graph.Step(Iota(6, 10), Iota(6, 0), SpecAttnMeta(3, 2, 0), SpecGdnMeta(3, 2),
+               pool.attn_kv, pool.gdn_state);
+  }
+  CHECK(vllm::v1::GetGraphDispatchStats().capture_shapes == 1);
+  CHECK(vt::GetGraphBreakStats().segments_captured == 1);
+
+  // SHAPE B: 2 requests x 3 tokens == 6 tokens. The SAME S, a DIFFERENT q.
+  // Before W6 this indexed the ring shape A already captured, found
+  // `graph.captured()` true on the FIRST step, and replayed shape A's graph
+  // against shape B's metadata. The key separates them, so this opens a ring of
+  // its own and takes the cold path again.
+  for (int step = 0; step < 3; ++step) {
+    graph.Step(Iota(6, 20), Iota(6, 0), SpecAttnMeta(2, 3, 8), SpecGdnMeta(2, 3),
+               pool.attn_kv, pool.gdn_state);
+  }
+  const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+  CAPTURE(st.capture_shapes);
+  CAPTURE(st.qlen_cap_declines);
+  // THE ASSERTION THE MUTATION MOVES. Two rings, not one.
+  CHECK(st.capture_shapes == 2);
+  // And two captures, which is what says the second ring was actually USED
+  // rather than merely created. `segments_captured` moves only when a
+  // `vt::GraphCaptureScope` closes a segment.
+  CHECK(vt::GetGraphBreakStats().segments_captured == 2);
+  CHECK(st.qlen_cap_declines == 0);
+
+  // SHAPE C: 1 request x 4 tokens, a THIRD distinct speculative query length.
+  // `VT_SPEC_GRAPH_MAX_QLENS` defaults to 2, so this one is refused and runs
+  // eager -- which is what every clamped shape did before W6. The difference is
+  // that it now moves a counter instead of nothing, which is the half of #1020
+  // its title is about.
+  for (int step = 0; step < 3; ++step) {
+    graph.Step(Iota(4, 30), Iota(4, 0), SpecAttnMeta(1, 4, 20), SpecGdnMeta(1, 4),
+               pool.attn_kv, pool.gdn_state);
+  }
+  const vllm::v1::GraphDispatchStats st2 = vllm::v1::GetGraphDispatchStats();
+  CAPTURE(st2.capture_shapes);
+  CAPTURE(st2.qlen_cap_declines);
+  CHECK(st2.qlen_cap_declines == 3);
+  CHECK(st2.capture_shapes == 2);  // no third ring was opened
+  CHECK(vt::GetGraphBreakStats().segments_captured == 2);
 }

@@ -11,28 +11,39 @@ is why the load-bearing gate below is byte-identity rather than a speed ratio.
 ## Now
 
 `ACTIVE`, and the state is argued rather than inherited. The shared registry, its CPU
-contract suite, the CUDA wiring and the
-[#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair all landed. The owed
-device A/B ran on 2026-08-18 (W4) and split in two: the correctness half PASSED, and the
-benefit half was REFUTED for exactly the case this row was filed for. `N == M` in every
-`VT_CUDA_GRAPH_DEDUP=1` cell, because the signature carries the padded batch dimension,
-so no two decode buckets ever group.
+contract suite, the CUDA wiring, the
+[#1184](https://github.com/mudler/vllm.cpp/issues/1184) repair and the coarse key of
+[#1226](https://github.com/mudler/vllm.cpp/issues/1226) have all landed — the last of
+them as `2c8f53d93`, so the "PR #1232 is a draft" caveat every earlier record carried is
+retired and the fold is reachable on `main` today, behind two default-OFF flags.
 
-**W5, the same day, tested the hypothesis that negative produced and CONFIRMED it.**
-A COARSE key that drops the launch dimensions and the memcpy extents folds every bucket
-the exact key left alone — 3 graphs to 2 execs, 2 to 1, 2 to 1 — with
-`cudaGraphExecUpdate` probed once per fold and **accepted every time**, `refused=0`. The
-benefit W4 recorded as unreachable is reachable via the key
-([#1226](https://github.com/mudler/vllm.cpp/issues/1226) DELIVERED).
+**The row's benefit question is now CLOSED, and the answer is NEGATIVE.** W6 ran the
+device-byte measurement W4 and W5 both named as owed, on the SHIPPED bucket sets rather
+than the 2-3 buckets earlier runs reached. The fold is real there: 7 captures fold to 3
+executables at `max_num_seqs=32` and 11 fold to 5 at 64. The saving is not: 13.83 MiB
+nominal at 7 buckets, which is 0.42% of a 3.25 GiB process and SMALLER than the
+disagreement of its own null control, and nothing at all at 11 buckets. The driver
+refuses 43% of probes at 7 buckets and 73% at 11, every one of them
+`cudaGraphExecUpdateErrorTopologyChanged`, because the decode graphs are two topologies
+of 376 and 404 nodes rather than one. **That inverts the premise the coarse key was
+built on**: a key that cannot see a topology difference produces more false candidates,
+not more folds. Both flags therefore stay OFF, on measurement rather than on silence.
+Full result: [`## Outcome`](#outcome), W6.
 
-The row stays `ACTIVE`, and the argument moved rather than stayed still. It is still not
-`DONE`: the coarse key is behind its own opt-in in **PR #1232, which has not landed**,
-so nothing on `main` folds today, and the row's stated saving is a MEMORY saving that
-**nobody has measured in bytes on either key**. It is still not `PARTIAL`, because
-nothing upstream is omitted; the coarse key is our own extension past SGLang, which keys
-the same fields we started from. It is not `BLOCKED`, because nothing external stops the
-next step. What is owed is now a DECISION about the default, and that decision needs a
-measurement that does not exist. Full result: [`## Outcome`](#outcome).
+**Why the row is still `ACTIVE` and not `DONE`.** The measurement obligations are
+discharged and the decision is delivered, which is the DONE case and it is a real one.
+Three things stop the flip here, and none of them is a checker technicality. The
+feature is unreachable on the DEFAULT serving path, because the async runner captures no
+decode graph — that reach is owned by `ENG-CUDAGRAPH-BREAK`
+([#1179](https://github.com/mudler/vllm.cpp/issues/1179)) and is the "nothing lands
+dead" half of this row. Two items still sit under this row's own issue: the device-tier
+signature stability and discrimination tests, and probing `group.current_raw` instead of
+`raws.front()` to retire the transitivity assumption in `Replay`. And the `DONE` record
+surface itself owes a `.agents/parity-ledger.md` entry, a closing-commit owner in place
+of `CLAIM-ENG-CUDAGRAPH-DEDUP`, an exact test anchor, and the release of that claim —
+files this record-only branch does not own. It is not `PARTIAL`, because nothing
+upstream is omitted; the coarse key is our own extension past SGLang. It is not
+`BLOCKED`, because nothing external stops the next step.
 
 ## Scope
 
@@ -720,6 +731,140 @@ measured bytes saved — the fold count is a count of executables, not of memory
 **Only the Qwen3 dense decode driver was exercised**, as in W4. Whether any other capture
 site folds under either key is untested.
 
+### W6, 2026-08-19: the DEVICE-BYTE measurement, and the topology finding that inverts the premise
+
+This is the measurement W4 and W5 both recorded as owed. Every number before it counted
+executables; the row's stated saving is a MEMORY saving. It also removes W5's largest
+caveat: **PR #1232 landed as `2c8f53d93`**, so this run measures a configuration that
+ships rather than a draft.
+
+Ran on `dgx:gpu0` through an `rc` lease, job `93f783de-228f-47d5-806d-c5b56aa72c3a`, pod
+`rc-worker-4b8lj`, boot_id `3fd9745a-d25a-426c-ba3c-97c958a85515` at BOTH ends, GB10,
+driver `580.173.02`, nvcc **13.0.88**, `### DONE_BYTES 2026-08-19T04:57:19Z`. Twelve
+cells of one binary (sha256 `be697268…0ce657a7`) built from `origin/main` `2c8f53d93`
+(tar sha256 asserted before extraction), `VT_ASYNC_RUNNER=0` and
+`VT_DECODE_GRAPH_STATS=1` throughout, the only variables `VT_CUDA_GRAPH_DEDUP` and
+`VT_CUDA_GRAPH_DEDUP_COARSE_KEY`. All 12 cells exit 0 with zero VOID markers. Recipe,
+instruments, cell tables and every caveat:
+[`.agents/benchmark-record.md`](../benchmark-record.md), entry `ENG-CUDAGRAPH-DEDUP W6`.
+
+**The bucket churn is the shipped one.** `vllm-bench` sets
+`max_num_seqs = concurrency`, so W32 captured `[1 2 4 8 16 24 32]`, **7 of 7**, and W64
+captured `[1 2 4 8 16 24 32 40 48 56 64]`, **11 of 11** — exactly
+`include/vllm/model_executor/models/decode_graph_sizes.h:32-41`. W5 reached 2-3 buckets
+and every earlier conclusion about probe behaviour came from a process that presented
+the driver with one pair.
+
+**The fold engages.**
+
+```text
+w32_coarse_a/b  captured 7 graphs,  deduped to 3 execs   (probes=7  refused=3)
+w32_exact_a     captured 7 graphs,  deduped to 7 execs   (probes=0  refused=0)
+w64_coarse_a/b  captured 11 graphs, deduped to 5 execs   (probes=22 refused=16)
+w64_exact_a     captured 11 graphs, deduped to 11 execs  (probes=0  refused=0)
+```
+
+Token ids are byte-identical across every cell of a workload, including both OFF/OFF
+controls (W32 `ff0db6c6…be9d`, 11720 B; W64 `e1cbf5fc…e5d0`, 57620 B). Neither workload
+has [#1283](https://github.com/mudler/vllm.cpp/issues/1283)'s ragged-tail shape, and
+neither hit it.
+
+**The saving does not survive its own null control.** Two instruments, and they agree.
+`nvidia-smi --query-compute-apps` per-process tail median shows W64 identical to the
+megabyte in all five cells (9737 MiB) and W32's coarse arm reading 10-23 MiB *higher*
+than OFF (3252/3262 OFF against 3262/3275 COARSE). A `cudaMemGetInfo` shim summed over
+every `cudaGraphInstantiate` gives a nominal **13.83 MiB** at 7 buckets — **0.42%** of
+the 3.25 GiB process — and **−0.75 MiB**, i.e. nothing, at 11.
+
+That nominal effect is **NOT ESTABLISHED**, on four grounds that are independent of each
+other. `EXACT` is a true null control — it retains exactly as many executables as OFF (7
+and 11) at `probes=0` — and it disagrees with OFF by 10.6-13.1 MiB, against a candidate
+effect of 13.83 MiB. The W64 OFF/OFF pair disagrees with ITSELF by 18.2 MiB. One
+instantiate recorded a NEGATIVE delta (`-5,165,056` B in `w32_exact_a`), which is only
+possible if something else released memory inside the same window. And
+`cudaGraphExecDestroy` returned `reclaimed_bytes=0` in every cell. Per-instantiate
+deltas for byte-identical 404-node graphs range from 0 to 10,514,432 B, and 17 of 27
+instantiates in `w64_coarse_a` read exactly zero: these are POOL-GRANULAR readings, and
+the coarse arm's throwaway probe executables grow that pool exactly like retained ones
+do. What can be priced is one ~390-node executable at **2.08-4.35 MiB**, or 10.0-10.6 KB
+per node.
+
+**THE MECHANISM, and why it inverts this row's own hypothesis.** The driver refuses
+**43% of probes at 7 buckets and 73% at 11**, and every single refusal is
+`vt graph dedup: probe refused a fold (err=910 result=2)` —
+`cudaErrorGraphExecUpdateFailure` with `cudaGraphExecUpdateErrorTopologyChanged`. The
+shim's `cudaGraphGetNodes` reading says why false candidates form at all: the decode
+graphs are **two topologies, 376 and 404 nodes**, mixed across the bucket set
+(`w32_off_a` captured `404 404 376 376 404 404 404`).
+
+Every refusal is about TOPOLOGY, never about a parameter. **So a coarser key produces
+more false hits, not more folds** — the opposite of what W5's 2-bucket A/B suggested.
+W5's "the driver accepts every time, `refused=0`" was an artefact of workloads whose
+buckets only ever shrank, so exactly one pair was ever presented. This is the correction
+W5's own `refused=0` caveat asked for, and it arrived from the same box.
+
+**The probe cost, exact and clock-independent.** W32: OFF 7 instantiates / 0 updates
+against COARSE **10** (3 retained + 7 probes) / 11 updates. W64: OFF 11 / 0 against
+COARSE **27** (5 retained + 22 probes) / 28 updates — **2.45x the instantiate calls** to
+retain 6 fewer executables. **Peak transient did NOT double**: in every ON cell the
+live-bytes peak equals its end value, because `Register` destroys the probe executable
+before it returns. The feared "double the peak to save the steady state" trade did not
+occur.
+
+**A replay-time re-point occurred, as ARITHMETIC over two printed totals.** `probes=7`
+against 11 update calls and `probes=22` against 28 leaves 4 and 6 updates that are not
+probes, over 88 and 244 replays — the reverse re-point W5 recorded as untested on a
+device. Those cells exit 0 with byte-identical ids, so `Replay`'s transitivity
+assumption neither aborted nor changed a token here. It is stated as arithmetic and NOT
+as a measurement, because the registry counts probe refusals only and a replay-time
+refusal would abort on `VT_CHECK` rather than increment anything.
+
+**Times: NONE is attributable.** The clock pin was REFUSED inside the lease — `The
+current user does not have permission to change clocks for GPU 0000000F:01:00.0`, and
+the log records `clocks_pinned=0`. The instantiate-wall and update-wall figures in
+`bytes.log` are diagnostics and are deliberately quoted nowhere as a result.
+
+### W6: why the defaults keep their values
+
+1. **`VT_CUDA_GRAPH_DEDUP` stays OFF — supported by numbers, not merely ungated.** Best
+   nominal saving 13.83 MiB (0.42% of process) at the 7-bucket set, smaller than its own
+   null control's disagreement; nothing at 11 buckets; cost is 16 extra
+   instantiate/destroy pairs and 28 update calls on the capture path.
+2. **`VT_CUDA_GRAPH_DEDUP_COARSE_KEY` alone is a NO-OP, not merely unsupported.**
+   `GraphDedupCoarseKeyEnabled()` (`src/vt/graph_dedup.h:114`) is read only by the
+   signature builder (`src/vt/graph_dedup_runtime.h:177`), which runs only from
+   `Register`, which `src/vt/cuda/cuda_backend.cu:237` calls only under
+   `GraphDedupEnabled()`. With dedup off, its sole observable is one stderr line.
+3. **Both on — not supported.** The same numbers plus a 73% probe-refusal rate.
+
+### W6: what this run does NOT establish
+
+- **No time-based figure is attributable**, because the clock pin was refused.
+- **nvcc was 13.0.88 here and 13.3.73 for the W5 fold run.** Comparisons WITHIN this one
+  binary are valid; this run and W5 are NOT directly comparable to each other.
+- **`result=2` is one driver (`580.173.02`), one GB10, one toolkit.**
+- **Only the Qwen3 dense decode driver was exercised**, as in W4 and W5.
+- **`VT_ASYNC_RUNNER=0` throughout**, so the feature remains unreachable on the DEFAULT
+  serving path ([#1179](https://github.com/mudler/vllm.cpp/issues/1179)).
+- **`cudaMemGetInfo` cannot separate an executable's own cost from the pool chunk that
+  satisfied it.** Every byte figure inherits that limit.
+- `run.sh`'s per-cell `shim_inst … sum_bytes` reducer sums only POSITIVE deltas and
+  reads higher in the two cells holding a negative one. The tables use the SIGNED sum,
+  which matches the shim's in-process `SUMMARY` counter in every cell.
+
+### W6: no ceiling — what would change the answer
+
+- **Where the 376/404 node split comes from.** The FA-2 split-KV grid is the first
+  suspect. A capture that fixes the node set across buckets removes every refusal in this
+  run and turns the fold ratio into the whole bucket set. Until then, coarsening the key
+  is the wrong direction.
+- **An instrument that resolves a single 2-4 MiB executable** against driver pool
+  granularity — `cuMemGetAllocationGranularity`, a pool-statistics query, or a build with
+  pool instrumentation.
+- **A 60-80 layer checkpoint.** Bytes scale with node count and this graph is 376-404
+  nodes on a 28-layer 0.6B model. 10.0-10.6 KB per node is the figure to re-run against
+  before the flip is refused permanently for large models.
+
 ## Owed
 
 **DELIVERED by W4, 2026-08-18 — see [`## Outcome`](#outcome).** The device
@@ -730,6 +875,36 @@ executable-count ratio: **DELIVERED AND NEGATIVE**, `N == M` in every ON cell ov
 and three distinct padded buckets, so the row's headline saving is measured NOT to
 occur with the current signature. What remains owed is below.
 
+**DELIVERED by W6, 2026-08-19 — THE DECISION, and it is NEGATIVE.** The default flip
+this row has owed since W4 is no longer owed: it is DECIDED, against, on measurement.
+`VT_CUDA_GRAPH_DEDUP` stays OFF, `VT_CUDA_GRAPH_DEDUP_COARSE_KEY` stays OFF and is a
+no-op on its own, and both together are unsupported. The two numbers W5 named as
+missing were both taken. **Bytes:** 13.83 MiB nominal at the shipped 7-bucket set, 0.42%
+of a 3.25 GiB process, smaller than the disagreement of its own null control, and
+nothing at 11 buckets. **The probe cost at real bucket churn:** 43% of probes refused at
+7 buckets and 73% at 11, 2.45x the instantiate calls, every refusal
+`cudaGraphExecUpdateErrorTopologyChanged`. Two W5 items are closed as a side effect: PR
+#1232 LANDED as `2c8f53d93`, and the replay-time re-point did occur (4 and 6 of them,
+arithmetic over the update and probe totals) without an abort or a token change. W6 also
+INVERTED this row's premise — the decode graphs are two topologies of 376 and 404 nodes,
+so a coarser key produces more false candidates rather than more folds. See
+[`## Outcome`](#outcome), W6. **What remains owed is below, and it is now three
+measurements plus the residual engineering — never another attempt at the same flip.**
+
+**[#1226](https://github.com/mudler/vllm.cpp/issues/1226) is CLOSED.** It owned the
+coarse-key hypothesis, and W5 confirmed it while W6 priced it and inverted it. The rows
+in the older tables below that still name it are history and are kept as such; the live
+residue moved on 2026-08-19 to
+[#1303](https://github.com/mudler/vllm.cpp/issues/1303), which owns the 376/404 topology
+split, and to [#1162](https://github.com/mudler/vllm.cpp/issues/1162), which owns this
+row and everything else still open on it.
+
+| Item | Issue | Why not here |
+|---|---|---|
+| **Where the 376/404 node split comes from.** Every refusal in W6 was `cudaGraphExecUpdateErrorTopologyChanged`, and the node counts say the decode buckets genuinely differ in STRUCTURE, not only in parameters. The FA-2 split-KV grid is the first suspect. A capture that fixes the node set across buckets would remove every refusal and turn the fold ratio into the whole bucket set; until then, coarsening the key is measured to be the wrong direction | [#1303](https://github.com/mudler/vllm.cpp/issues/1303) | it is a NEW hypothesis about the capture path rather than about the key, needs its own spec and its own red-first evidence, and W6's job was to price the key that shipped |
+| **An instrument that resolves a single 2-4 MiB executable against driver pool granularity.** Neither W6 instrument can: `cudaMemGetInfo` measures pool growth, 17 of 27 instantiates in one cell read exactly zero, one read NEGATIVE, and `cudaGraphExecDestroy` reclaimed nothing anywhere. `cuMemGetAllocationGranularity`, a driver-pool statistics query, or a build with pool instrumentation would price the fold directly instead of through a total whose noise exceeds the effect | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it is an instrument-building task, and W6 deliberately reported the noisy total WITH its null control rather than presenting a 13.83 MiB number the control cannot support |
+| **A 60-80 layer checkpoint.** Bytes scale with node count and W6's graph is 376-404 nodes on a 28-layer 0.6B model, measured at 10.0-10.6 KB per node. The flip is refused for THIS model class on THIS evidence; it is not refused permanently for large models until the same measurement runs on a deep one | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it needs another lease and a large checkpoint, and refusing the flip for the measured case does not depend on it |
+
 **DELIVERED by W5, 2026-08-18 — the [#1226](https://github.com/mudler/vllm.cpp/issues/1226)
 hypothesis: CONFIRMED.** A coarse key folds every decode bucket the exact key left alone
 (3→2, 2→1, 2→1) and the driver accepted every probe, `refused=0`. That closes the
@@ -739,10 +914,10 @@ nobody has taken.** Every number so far counts executables. Nothing has measured
 
 | Item | Issue | Why not here |
 |---|---|---|
-| Flipping `VT_CUDA_GRAPH_DEDUP` on by default | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | **STILL NOT JUSTIFIED, and the reason CHANGED.** W4's reason was that the ON arm allocated as many executables as OFF. W5 removed that reason: with the coarse key the ON arm allocates FEWER. The reason now is that nobody has priced the saving. A default is a measurement, and "2 execs instead of 3" is a count, not bytes. See the row below |
-| **THE DECISION, and the measurement it needs: does the COARSE key become the default?** Two numbers are missing and neither is optional. (1) **Bytes.** What does one `cudaGraphExec_t` cost on this model at this bucket set, and what does the fold actually return — device allocation at steady state, ON versus OFF, on a pinned-clock idle box. Every W4 and W5 figure counts executables. (2) **The probe cost at real bucket churn.** W5 probed once per fold on a 2-3 bucket process. A serving grid with 7 or 11 buckets across nine capture drivers churns differently, and the probe runs on the capture path. Only then is the flip a measurement rather than a preference | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it needs a leased GPU, pinned clocks, and PR #1232 landed first — the key it would default to is still a draft. Deliberately NOT decided by this record, exactly as W5's own hypothesis was not decided by W4's |
-| Landing PR [#1232](https://github.com/mudler/vllm.cpp/pull/1232), the coarse-key mode itself. It is a DRAFT, so nothing on `main` folds today and this row's saving is unreachable on every configuration that ships | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | the experiment measured whether the key works before asking whether it should land, which is the correct order. It needs its own fresh review, and its red-first discrimination test — that the coarse key still SEPARATES two genuinely different topologies — is the load-bearing one |
-| **An ALTERNATING workload, and a counter for replay-time re-points.** W5's three workloads captured their padded buckets in strictly descending order, so no group was ever replayed back to an earlier member and the only pair any coarse group issued was the one the probe tested. The reverse re-point — the pair that is untested from group size two onwards — is therefore unmeasured on a device, and `refused=0` does not cover it. The registry counts PROBE refusals only, so the ask is not even observable today: a replay-time refusal aborts on `Replay`'s `VT_CHECK` instead of incrementing anything | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it needs a workload whose decode batch returns to a bucket it already captured, which the fixed-pool bench harness does not produce, plus a replay-side counter. Both ride with the lease the memory measurement above already needs |
+| ~~Flipping `VT_CUDA_GRAPH_DEDUP` on by default~~ **DECIDED AGAINST by W6, 2026-08-19.** It is no longer owed, and no longer merely unjustified: 13.83 MiB nominal (0.42% of process) at 7 buckets, nothing at 11, smaller than its own null control's disagreement, against 16 extra instantiate/destroy pairs and 28 update calls. History below | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | **STILL NOT JUSTIFIED, and the reason CHANGED.** W4's reason was that the ON arm allocated as many executables as OFF. W5 removed that reason: with the coarse key the ON arm allocates FEWER. The reason now is that nobody has priced the saving. A default is a measurement, and "2 execs instead of 3" is a count, not bytes. See the row below |
+| ~~**THE DECISION, and the measurement it needs: does the COARSE key become the default?**~~ **DELIVERED AND NEGATIVE by W6, 2026-08-19.** Both numbers were taken at the SHIPPED bucket sets: bytes (0.42% at 7 buckets, none at 11, inside the null control's own noise) and the probe cost at real churn (43% and 73% refused, 2.45x the instantiate calls). The original wording follows.** Two numbers are missing and neither is optional. (1) **Bytes.** What does one `cudaGraphExec_t` cost on this model at this bucket set, and what does the fold actually return — device allocation at steady state, ON versus OFF, on a pinned-clock idle box. Every W4 and W5 figure counts executables. (2) **The probe cost at real bucket churn.** W5 probed once per fold on a 2-3 bucket process. A serving grid with 7 or 11 buckets across nine capture drivers churns differently, and the probe runs on the capture path. Only then is the flip a measurement rather than a preference | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it needs a leased GPU, pinned clocks, and PR #1232 landed first — the key it would default to is still a draft. Deliberately NOT decided by this record, exactly as W5's own hypothesis was not decided by W4's |
+| ~~Landing PR [#1232](https://github.com/mudler/vllm.cpp/pull/1232)~~ **LANDED as `2c8f53d93`, and W6 measured that exact commit.** The original wording follows. It is a DRAFT, so nothing on `main` folds today and this row's saving is unreachable on every configuration that ships | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | the experiment measured whether the key works before asking whether it should land, which is the correct order. It needs its own fresh review, and its red-first discrimination test — that the coarse key still SEPARATES two genuinely different topologies — is the load-bearing one |
+| **PARTLY ANSWERED by W6, 2026-08-19:** 4 and 6 replay-time re-points occurred over 88 and 244 replays — arithmetic over the update and probe totals, not a counter — with every cell exiting 0 and byte-identical, so `Replay`'s transitivity assumption neither aborted nor changed a token. The counter is STILL owed, and so is a workload that alternates by design rather than by accident. Original wording: **An ALTERNATING workload, and a counter for replay-time re-points.** W5's three workloads captured their padded buckets in strictly descending order, so no group was ever replayed back to an earlier member and the only pair any coarse group issued was the one the probe tested. The reverse re-point — the pair that is untested from group size two onwards — is therefore unmeasured on a device, and `refused=0` does not cover it. The registry counts PROBE refusals only, so the ask is not even observable today: a replay-time refusal aborts on `Replay`'s `VT_CHECK` instead of incrementing anything | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | it needs a workload whose decode batch returns to a bucket it already captured, which the fixed-pool bench harness does not produce, plus a replay-side counter. Both ride with the lease the memory measurement above already needs |
 | A second driver, a second architecture, a second CUDA release. `refused=0` is one driver (`580.173.02`) on one GB10 under nvcc `13.3.73`. A refusal elsewhere costs a wasted probe rather than a wrong replay, but the rate is unknown and the default decision depends on it | [#1226](https://github.com/mudler/vllm.cpp/issues/1226) | no second CUDA box with a different driver is reachable from this session, and `orin:gpu0` stays BLOCKED on the CUDA 13 runtime |
 | **[#1283](https://github.com/mudler/vllm.cpp/issues/1283): greedy decode is not reproducible at concurrency 16.** W5's OFF/OFF control caught it and it VOIDED workload B. NOT this row's defect — `VT_CUDA_GRAPH_DEDUP` is unset in both cells that disagree — but this row's future A/Bs cannot use that workload shape until it is understood | [#1283](https://github.com/mudler/vllm.cpp/issues/1283) | it is a decode-path defect with its own issue and its own isolation plan. Folding it into this row would hide it behind a graph feature it has nothing to do with |
 | Probing `group.current_raw` rather than `raws.front()`, retiring the transitivity assumption above | [#1162](https://github.com/mudler/vllm.cpp/issues/1162) | it changes probe behaviour, and the device A/B is measuring the current one. Land it with the A/B rerun, not before |

@@ -1259,6 +1259,8 @@ vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_common_attn_metadata vllm/v1/attention/test_common_attn_metadata.cpp)
 vllm_cpp_add_test(test_attn_backend_registry vllm/v1/attention/test_attn_backend_registry.cpp)
+vllm_cpp_add_test(test_attn_validate_configuration
+  vllm/v1/attention/test_attn_validate_configuration.cpp)
 vllm_cpp_add_test(test_attention_window vllm/model_executor/layers/attention/test_attention.cpp)
 vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)

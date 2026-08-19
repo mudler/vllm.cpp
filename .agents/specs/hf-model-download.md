@@ -471,6 +471,12 @@ and `tests/vllm/entrypoints/test_dflash_draft_hf_cache.cpp`, which enters the
 production loader with a repository identifier so that deleting the call site
 turns it red.
 
+A second fresh review returned FAIL on the tree-listing size rule, and the two
+holes it found are repaired at this head under issue
+[#1339](https://github.com/mudler/vllm.cpp/issues/1339): the rule could be
+disarmed by an entry that reported no size, and it exempted one path listed
+twice. `test_hf_hub.cpp` now carries 35 cases and 141 assertions.
+
 The row stays `READY` rather than moving to `ACTIVE`, because an `ACTIVE` row
 needs a `CLAIM-*` owner recorded in a claim source and that is the operator's
 record to write, not an implementer's. W3 through W7 have not been done: there

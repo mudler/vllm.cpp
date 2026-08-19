@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""HF-tokenizers side of the GGUF tokenizer e2e check (dgx-only, not CI).
+"""HF-tokenizers side of the GGUF tokenizer e2e check (gate host only, not CI).
 
 Prints one line per corpus entry: space-separated token ids, or "EMPTY" for
 an entry that encodes to zero ids — the exact output format of
-examples/tokenize/main.cpp. Diff the two on dgx.casa:
+examples/tokenize/main.cpp. Diff the two on the gate host:
 
-    cd ~/work/vllm.cpp
+    cd "${GATE_CHECKOUT}"
     build/examples/tokenize \
-        ~/work/apex/qwen36_35b/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \
+        "${CHECKPOINT_ROOT}"/qwen36_35b/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \
         tests/parity/goldens/tokenizer_qwen36/corpus.txt > /tmp/gguf_cpp.txt
-    ~/venvs/vllm-oracle/bin/python tools/parity/verify_tokenizer_gguf.py \
+    "${VLLM_ORACLE}"/bin/python tools/parity/verify_tokenizer_gguf.py \
         tests/parity/goldens/tokenizer_qwen36/tokenizer.json \
         tests/parity/goldens/tokenizer_qwen36/corpus.txt > /tmp/hf_py.txt
     diff /tmp/hf_py.txt /tmp/gguf_cpp.txt   # expect no output

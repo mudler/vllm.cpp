@@ -337,10 +337,17 @@ row's own dated measurements — 3.8% prefill host idle at above 96% GPU-busy on
 GB10, and the 27B prefill gap at 92.5% non-GEMM glue. The spec's `## Owed`
 states what would have to be true first.
 
-Still owed: the ROCm and Tenstorrent arms, blocked on fleet hardware; G1 and G2
-for the three single-shape drivers; and #1380, a `cudaMalloc` inside a
-capturing stream on the second parity-ring slot of a speculative shape, which
-W6 found, located and did not cause.
+**#1380 is FIXED and the speculative shape now replays**, measured on BOTH
+`thor:gpu0` (sm_110) and `dgx:gpu0` (GB10, sm_121a) with identical readings on
+each arm. The second parity-ring slot's capture did a `cudaMalloc` inside the
+captured region and threw. The site was the GDN causal-conv output, whose block
+lands in the same `DevicePool` SIZE CLASS as the retained `[S, vocab]` logits at
+that shape, so the driver's one-block pre-grow met a demand of two. The pre-grow
+now asks the pool for the whole step's per-class transient demand instead of
+naming one tensor.
+
+Still owed: the ROCm and Tenstorrent arms, blocked on fleet hardware; and G1 and
+G2 for the three single-shape drivers.
 
 ## Speculative decoding
 

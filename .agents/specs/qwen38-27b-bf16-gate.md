@@ -150,7 +150,10 @@ vLLM's breached that ceiling**, c8's included (12.92-14.99%).
 **At c8 the vLLM denominator is NOT MEASURABLE on this box at the recorded
 configuration.** That is the c8 answer, not a gap in it, and it is a statement
 about headroom and guard granularity here rather than a claim that vLLM is
-defective. Detail, trajectory and arithmetic in
+defective. The worker loss behind that verdict is now known to have been a
+HOST REBOOT rather than a lost k3s pod — `boot_id` changed — which is why no
+sampling watchdog could have caught it. `## Outcome` separates that observed
+fact from the derived timing, and neither creates a denominator. Detail, trajectory and arithmetic in
 [`../benchmark-record.md`](../benchmark-record.md).
 
 **What advances this row next** is a c1 pairing taken in a window the clock gate
@@ -255,6 +258,75 @@ log live during a failing leg and it is 27 lines, all startup, no error, no
 request line, no rejection. So the cause is not named yet, and a controlled
 reproduction recording HTTP status and exception class is the next step.
 
+**SETTLED, and the two halves of it are not equally strong.** This spec carried
+one question as owed: whether the HOST rebooted or only the k3s pod was lost
+when the c8 vLLM worker died. An `rc run` job on `dgx:gpu0`, job id
+`97cf3e63-e4a4-4506-bde7-f19f19be3bbf`, read the answer back:
+
+```text
+BOOT_ID_NOW=64c495a3-8c9c-4b20-8496-a97efda0e332
+BOOT_ID_AT_BENCH=3fd9745a-d25a-426c-ba3c-97c958a85515
+VERDICT=REBOOTED
+UPTIME_S=38868
+MemAvailable_MB=117436
+```
+
+**THE HOST REBOOTED. That half is OBSERVED and it is certain.**
+`/proc/sys/kernel/random/boot_id` is generated once per kernel boot and is
+kernel-wide, so a changed value is a reboot and cannot be anything else. A pod
+restart, a container teardown and a `k3s` restart all leave it alone. The
+disjunction is retired: it was not merely a lost pod.
+
+**WHEN it rebooted is DERIVED, and it rests on an assumption this measurement
+does not test.** `UPTIME_S=38868` is `/proc/uptime` as read from INSIDE the `rc`
+worker, so it is the HOST's uptime only if that worker does not virtualize
+`/proc`. `lxcfs` and its equivalents do virtualize `/proc/uptime`; none of them
+can touch `boot_id`, which is why the observed half does not inherit this
+caveat. The worker is a k3s pod, where an unvirtualized `/proc` is the default,
+but nothing in these artifacts asserts that `lxcfs` is absent. Establishing it
+costs one line in a later job and no lease was taken for it here.
+
+Under that assumption the running kernel booted 38,868 s before the probe was
+read, and the read instant itself is known only to about half a minute — the
+probe log's last write is 2026-08-19T21:29:35Z and the run was reported at
+21:30:02Z. So the derived boot lands between **10:41:47Z and 10:42:14Z**, and no
+tighter figure is honest. That interval is INSIDE the c8 window:
+
+| Time (UTC) | Event |
+|---|---|
+| 10:18:51 | c1 legs complete, `TEARDOWN_VERDICT=CLEAN`, `MemAvailable` 116,869 MB |
+| 10:18:54 | c8 vLLM server launched, `SERVER_PID=123868` |
+| 10:25:07 | c8 server answers `GET /health 200 OK` |
+| 10:25:26 | last `MemAvailable` sample, 6,261 MB; nothing after it |
+| **~10:42** | **derived boot time of the kernel now running** |
+| 11:26:00 | the job's last write |
+
+The box therefore came back up about 17 minutes after the c8 server was healthy
+and about 16 minutes after the last memory sample, during the untimed warmup.
+
+**NOT established: that the reboot killed the worker.** Three things are
+consistent with it — the timing above, the descent `NOTES.txt` FINDING 4 records
+(9,738 -> 6,261 MB over ~40 s, then the worker lost between two 2-second
+samples), and this box's documented habit of rebooting instead of OOM-killing
+(`.agents/environment.md`). Consistency is not a trace. Nothing here ties the
+reboot to the worker's death, so it stays a hypothesis with a located window,
+exactly as this repository requires, and no record may read it as a cause.
+
+**No number moves.** This settles a provenance question and creates no
+denominator. The c8 vLLM denominator is still NOT MEASURABLE at the recorded
+configuration, the c1 pairing is still `PAIRING_VERDICT=DISCARD`, and neither
+cell becomes a ratio because of this finding. What the finding does is explain
+the shape of the absence.
+
+**It HARDENS the watchdog conclusion rather than softening it.** The campaign
+concluded that a sampling watchdog is not a viable guard for the c8 denominator
+here at any floor that still lets the configuration run. A watchdog is a
+userspace process on the box, and a kernel reboot ends it with everything else.
+So the guard is not merely too coarse at a 2-second cadence: on the failure mode
+this box demonstrably has, there is no floor and no cadence at which a sampler
+lives long enough to report the event. `boot_id`, read after the fact, is the
+only instrument that saw it.
+
 **What was NOT established.** Nothing about the vision path on this checkpoint,
 nothing about its NVFP4 or Q4_K_M arms (#821), no claim that #910 is fixed (this
 is the second checkpoint to be costed by it), and no throughput number at c1 or
@@ -267,10 +339,12 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   clock gate and the c8 denominator does not exist, so the row's own question —
   what our speed is against vLLM's production configuration at c1 and c8 — is
   still unanswered.
-- Whether the HOST rebooted or only the k3s pod was lost when the c8 vLLM worker
-  died on 2026-08-19. The artifacts cannot distinguish them. Settle it by
-  reading `/proc/sys/kernel/random/boot_id` inside any later `dgx:gpu0` job and
-  comparing it against `3fd9745a-d25a-426c-ba3c-97c958a85515`.
+- Whether the `dgx:gpu0` `rc` worker virtualizes `/proc/uptime`. The 2026-08-19
+  HOST reboot is OBSERVED from `boot_id` and does not depend on this; only the
+  DERIVED ~10:42Z boot time does, and `## Outcome` states the assumption beside
+  the number. One line in any later leased job settles it — print `/proc/uptime`
+  beside `date -u` and reconcile against a host boot that is known
+  independently. No lease was taken for it here.
 - [#1355](https://github.com/mudler/vllm.cpp/issues/1355), the prompt-token
   divergence found in this campaign's raw result files: our server reported
   5,942 prompt tokens where vLLM reported 6,144 for the identical

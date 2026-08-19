@@ -24277,7 +24277,12 @@ can resolve. **A sampling watchdog is therefore not a viable guard for the c8
 denominator here at ANY floor that still lets the configuration run**: 12,000 MB
 kills a healthy server (below), and 5,000 MB was never reached before the worker
 was lost — `watchdog.log` is empty, zero bytes, because the last value the
-sampler saw was above it.
+sampler saw was above it. **And the settled reboot below makes that conclusion
+stronger rather than merely faster-than-sampled**: a watchdog is a userspace
+process on the box, so a kernel reboot ends it with everything it was guarding.
+There is no floor and no cadence at which a sampler survives the event it is
+supposed to report, which is a different and harder statement than "2 seconds is
+too coarse".
 
 Every way to create that headroom is an ENGINE KNOB. Lowering
 `gpu_memory_utilization` or `max_num_batched_tokens` produces a
@@ -24288,12 +24293,60 @@ NOT MEASURABLE rather than a number taken at a configuration nobody recorded.
 For scale on the same box and the same workload, ours held a `MemAvailable`
 floor of 21,100 MB across both of its legs.
 
-**UNDETERMINED, and recorded as owed rather than guessed.** Whether the HOST
-rebooted or only the k3s pod was lost when the worker died is not decidable from
-these artifacts. One command settles it: read
-`/proc/sys/kernel/random/boot_id` inside any later `dgx:gpu0` job and compare
-against `3fd9745a-d25a-426c-ba3c-97c958a85515`. A different value means the host
-rebooted.
+**SETTLED THE SAME DAY — THE HOST REBOOTED, AND THE TWO HALVES OF THAT ARE NOT
+EQUALLY STRONG.** This entry carried the pod-versus-host question as owed. An
+`rc run` job on `dgx:gpu0`, job id `97cf3e63-e4a4-4506-bde7-f19f19be3bbf`,
+answered it:
+
+```text
+BOOT_ID_NOW=64c495a3-8c9c-4b20-8496-a97efda0e332
+BOOT_ID_AT_BENCH=3fd9745a-d25a-426c-ba3c-97c958a85515
+VERDICT=REBOOTED
+UPTIME_S=38868
+MemAvailable_MB=117436
+```
+
+**OBSERVED: the machine rebooted.** `/proc/sys/kernel/random/boot_id` is
+kernel-wide and regenerated once per boot, so a changed value is a reboot and
+nothing else. A pod restart, a container teardown and a `k3s` restart all leave
+it unchanged. The disjunction is retired.
+
+**DERIVED, and conditional: the reboot lands inside the c8 window.**
+`UPTIME_S=38868` is `/proc/uptime` read from INSIDE the `rc` worker, so it is
+the HOST's uptime only if that worker does not virtualize `/proc`. `lxcfs` and
+its equivalents do virtualize `/proc/uptime` and none of them can touch
+`boot_id`, which is exactly why the observed half above does not inherit this
+caveat. The worker is a k3s pod, where an unvirtualized `/proc` is the default,
+and no artifact here asserts that `lxcfs` is absent. Under that assumption the
+running kernel booted 38,868 s before the probe was read, and the read instant
+is itself known only to about half a minute — the probe log's last write is
+2026-08-19T21:29:35Z and the run was reported at 21:30:02Z — so the derived boot
+falls between **10:41:47Z and 10:42:14Z**. No tighter figure is supportable.
+
+| Time (UTC) | Event |
+|---|---|
+| 10:18:51 | c1 legs complete, `TEARDOWN_VERDICT=CLEAN`, `MemAvailable` 116,869 MB |
+| 10:18:54 | c8 vLLM server launched, `SERVER_PID=123868` |
+| 10:25:07 | c8 server answers `GET /health 200 OK` |
+| 10:25:26 | last `MemAvailable` sample, 6,261 MB; nothing after it |
+| **~10:42** | **derived boot time of the kernel now running** |
+| 11:26:00 | the job's last write |
+
+So the box came back about 17 minutes after the c8 server was healthy and about
+16 minutes after the last memory sample, during the untimed warmup.
+
+**NOT ESTABLISHED: that the reboot killed the worker.** Three facts are
+consistent with it — the interval above, the descent this entry already records
+(9,738 -> 6,261 MB, then a loss inside one 2-second sample), and this box's
+documented habit of rebooting instead of OOM-killing. Consistency is not a
+trace, nothing here ties the reboot to the worker's death, and an apparent
+explanation is a hypothesis until it is traced. Recorded as an observed reboot
+with a consistent window, never as a cause.
+
+**NO NUMBER MOVES.** This settles provenance and creates nothing. The c8 vLLM
+denominator is still NOT MEASURABLE at the recorded configuration, the c1
+pairing is still `PAIRING_VERDICT=DISCARD`, and no ratio is derived or restored
+from either. What the finding does is explain the shape of the absence.
 
 ### FINDING THAT OUTLIVES THIS CAMPAIGN 1 — CLOCK PINNING IS UNAVAILABLE INSIDE AN `rc` LEASE
 

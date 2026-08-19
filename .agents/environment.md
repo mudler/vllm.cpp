@@ -525,6 +525,37 @@ environment:
     parallel-flake advice in the Apple/Metal profile below does not transfer
     here. Serialising also means every other probe queues behind the suite, so
     run attribution arms BEFORE a full suite, never during one.
+  - **★ IT REBOOTS UNDER A SERVING LOAD TOO, NOT ONLY UNDER A BUILD OR A
+    LOAD, AND FROM INSIDE A LEASE `boot_id` IS THE ONLY INSTRUMENT THAT SEES IT
+    (measured 2026-08-19, [#915](https://github.com/mudler/vllm.cpp/issues/915)).**
+    The pinned oracle's c8 denominator leg for `Qwen/Qwen3.8-27B` bf16 — vLLM's
+    production graphed shape at `--gpu-memory-utilization 0.85
+    --max-num-batched-tokens 8192` — answered `GET /health 200 OK` at 10:25:07Z
+    with about 9,950 MB of `MemAvailable`, read 6,261 MB at 10:25:26Z, and the
+    worker was then lost inside one 2-second sample, during the untimed warmup.
+    That configuration leaves roughly **6-7 GB of headroom** on this box. The
+    earlier reboots this file records for this machine are a `ctest -j 4` and an
+    oracle LOAD; this one happened after the server was already healthy and
+    serving-ready, so "survived startup" is not a safe state.
+    **Read `boot_id` in every leased job that loads anything large.** A lease
+    gives you a pod, not the box's history: `uptime` resetting and
+    `journalctl --list-boots` are host instruments a pod does not have, and a
+    lost worker looks identical whether the pod died or the machine did. That
+    ambiguity stood unresolved in the campaign record for a day.
+    `/proc/sys/kernel/random/boot_id` is kernel-wide and regenerated per boot,
+    so a changed value is a reboot and nothing else can forge it: a later job
+    (`97cf3e63-e4a4-4506-bde7-f19f19be3bbf`) read
+    `64c495a3-8c9c-4b20-8496-a97efda0e332` against the benchmark's
+    `3fd9745a-d25a-426c-ba3c-97c958a85515`. **Do not promote a boot TIME derived
+    from `/proc/uptime` to the same strength.** Read inside a pod, `/proc/uptime`
+    is the host's only if the worker does not virtualize `/proc` — `lxcfs` does,
+    and it cannot touch `boot_id` — so the identity change is observed and any
+    derived timestamp carries that assumption. State it beside the number.
+    **And a sampling watchdog cannot guard this class of failure at all.** A
+    userspace sampler dies with the kernel, so there is no floor and no cadence
+    at which it reports the event; here the 2-second sampler never even saw a
+    value below its own 5,000 MB floor. Detail in
+    [`specs/qwen38-27b-bf16-gate.md`](specs/qwen38-27b-bf16-gate.md).
   - **GPU mutex:** this runs INSIDE an `rc` lease, never instead of one. The
     lease decides who gets the box. The mutex serialises the work of whoever
     holds it. Every CUDA test/model/serve/benchmark/profile holds the

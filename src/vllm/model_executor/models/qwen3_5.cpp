@@ -48,6 +48,8 @@
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // dense_nvfp4::MarlinDenseEnabled
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W4: the shared capture seam
+#include "vt/persistent_step_input.h"  // ENG-CUDAGRAPH-BREAK W4: the persistent step inputs
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
@@ -9689,15 +9691,32 @@ static bool DecodeGraphDoubleBufferEnabled() {
 // unreproducible). Sized once at capture for the padded size S / block-table cols /
 // gdn index count. Non-owning of the SizeSlot's std::vectors — StageStepInputs copies
 // them in each step, then enqueues the async device copy.
+//
+// ENG-CUDAGRAPH-BREAK W4 (#1307): each field is now a `vt::PersistentStepInput`
+// — the capture-stable device destination BOUND together with its pinned host
+// staging block — instead of a bare pinned pointer this struct allocated and a
+// `Backend::Copy` the stager issued by hand beside it. The two halves were
+// separated by ninety lines, so nothing checked that the staged byte count and
+// the destination's size agreed; the seam refuses a refresh longer than the
+// bound capacity, which is the address-stability rule the captured graph depends
+// on.
+//
+// THE PINNED `token_ids` BLOCK IS GONE, and its absence is a finding rather than
+// a tidy-up. It was allocated here, filled by `StageStepInputs` and zeroed by
+// the poison hook, and it was NEVER uploaded and never read: `StepDevInputs`
+// has no token-id member, because the embed runs OUTSIDE the captured region
+// from the HOST vector (`EmbedInto`), so the decode graph carries no token ids
+// to the device at all. That is also why making `StepDevInputs` a seam
+// capability does not by itself close the `qwen3.cpp` async decline — the fix
+// that decline names needs a DEVICE token-id destination no driver has. See the
+// spec's `## Owed`.
 struct PinnedStepInputs {
-  Backend* b = nullptr;
-  int32_t* positions = nullptr;
-  int64_t* slot_mapping = nullptr;
-  int32_t* block_table = nullptr;
-  int32_t* seq_lens = nullptr;
-  int32_t* qsl = nullptr;
-  int32_t* gdn_state_idx = nullptr;
-  int32_t* token_ids = nullptr;
+  vt::PersistentStepInput positions;
+  vt::PersistentStepInput slot_mapping;
+  vt::PersistentStepInput block_table;
+  vt::PersistentStepInput seq_lens;
+  vt::PersistentStepInput qsl;
+  vt::PersistentStepInput gdn_state_idx;
   int64_t S = 0, R = 0, cols = 0, idx = 0;  // S = tokens, R = requests
   bool has_idx = false;
   bool ready = false;
@@ -9705,17 +9724,16 @@ struct PinnedStepInputs {
   PinnedStepInputs() = default;
   PinnedStepInputs(const PinnedStepInputs&) = delete;
   PinnedStepInputs& operator=(const PinnedStepInputs&) = delete;
-  ~PinnedStepInputs() { Free(); }
   void Free() {
-    if (b == nullptr) return;
-    for (void* p : {static_cast<void*>(positions), static_cast<void*>(slot_mapping),
-                    static_cast<void*>(block_table), static_cast<void*>(seq_lens),
-                    static_cast<void*>(qsl), static_cast<void*>(gdn_state_idx),
-                    static_cast<void*>(token_ids)})
-      if (p != nullptr) b->FreePinned(p);
-    positions = nullptr; slot_mapping = nullptr; block_table = nullptr;
-    seq_lens = nullptr; qsl = nullptr; gdn_state_idx = nullptr; token_ids = nullptr;
-    b = nullptr; ready = false;
+    positions.Unbind();
+    slot_mapping.Unbind();
+    block_table.Unbind();
+    seq_lens.Unbind();
+    qsl.Unbind();
+    gdn_state_idx.Unbind();
+    S = 0; R = 0; cols = 0; idx = 0;
+    has_idx = false;
+    ready = false;
   }
   // SPEC-DSPARK W8 (#442): `S` is TOKENS and `R` is REQUESTS. They are equal for
   // pure decode, which is why one count sufficed until a speculative verify
@@ -9723,18 +9741,21 @@ struct PinnedStepInputs {
   // the host block table and the device buffer (`cudaMemcpyAsync: invalid
   // argument`). Upstream keeps both for the same reason: its graph key is
   // BatchDescriptor(num_tokens, num_reqs, uniform).
-  void Alloc(Backend& bk, int64_t S_, int64_t R_, int64_t cols_, int64_t idx_,
-             bool has_idx_) {
+  // BINDS the destinations `dev` already owns; it does not allocate them. The
+  // device side is drawn from a DEDICATED pool so a retained input never pops a
+  // block the captured forward's own scratch then needs, and the seam
+  // deliberately does not take that decision over (see
+  // `include/vt/persistent_step_input.h`).
+  void Alloc(Backend& bk, StepDevInputs& dev, int64_t S_, int64_t R_, int64_t cols_,
+             int64_t idx_, bool has_idx_) {
     Free();
-    b = &bk; S = S_; R = R_ > 0 ? R_ : S_; cols = cols_; idx = idx_; has_idx = has_idx_;
-    positions = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
-    slot_mapping = static_cast<int64_t*>(bk.AllocPinned(sizeof(int64_t) * S));
-    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R * cols));
-    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R));
-    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (R + 1)));
-    token_ids = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
-    if (has_idx) gdn_state_idx =
-        static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * idx));
+    S = S_; R = R_ > 0 ? R_ : S_; cols = cols_; idx = idx_; has_idx = has_idx_;
+    positions.Bind(bk, dev.positions.ptr(), sizeof(int32_t) * S);
+    slot_mapping.Bind(bk, dev.slot_mapping.ptr(), sizeof(int64_t) * S);
+    block_table.Bind(bk, dev.block_table.ptr(), sizeof(int32_t) * R * cols);
+    seq_lens.Bind(bk, dev.seq_lens.ptr(), sizeof(int32_t) * R);
+    qsl.Bind(bk, dev.query_start_loc.ptr(), sizeof(int32_t) * (R + 1));
+    if (has_idx) gdn_state_idx.Bind(bk, dev.gdn_state_idx.ptr(), sizeof(int32_t) * idx);
     ready = true;
   }
 };
@@ -9814,26 +9835,26 @@ static void StageStepInputs(Dev d, Slot& s) {
   PinnedStepInputs& pin = s.pin;
   StepDevInputs& dev = *s.dev;
   const int64_t S = pin.S, R = pin.R, cols = pin.cols;  // tokens, requests
-  std::memcpy(pin.positions, s.positions.data(), sizeof(int32_t) * S);
-  std::memcpy(pin.slot_mapping, s.attn_meta.slot_mapping.data(), sizeof(int64_t) * S);
-  std::memcpy(pin.block_table, s.attn_meta.block_table_tensor.data(),
-              sizeof(int32_t) * R * cols);
-  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * R);
-  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (R + 1));
-  std::memcpy(pin.token_ids, s.token_ids.data(), sizeof(int32_t) * S);
+  // ENG-CUDAGRAPH-BREAK W4 (#1307): each line is the memcpy-into-pinned PLUS the
+  // asynchronous H2D into the SAME device address, which the seam holds together
+  // so the pair cannot drift apart. The destination address is unchanged by a
+  // refresh BY CONSTRUCTION, which is what the captured graph baked.
+  pin.positions.RefreshFromHost(d.q, s.positions.data(), sizeof(int32_t) * S);
+  pin.slot_mapping.RefreshFromHost(d.q, s.attn_meta.slot_mapping.data(),
+                                   sizeof(int64_t) * S);
+  pin.block_table.RefreshFromHost(d.q, s.attn_meta.block_table_tensor.data(),
+                                  sizeof(int32_t) * R * cols);
+  pin.seq_lens.RefreshFromHost(d.q, s.attn_meta.seq_lens.data(), sizeof(int32_t) * R);
+  pin.qsl.RefreshFromHost(d.q, s.attn_meta.query_start_loc.data(),
+                          sizeof(int32_t) * (R + 1));
+  // Skipping the refresh and re-uploading the previous step's staged bytes are
+  // the same device state, because the staging block still holds them; the skip
+  // is the one that does not move bytes to say so.
   if (pin.has_idx && dev.has_gdn_idx &&
       s.gdn_meta.non_spec_state_indices_tensor.has_value())
-    std::memcpy(pin.gdn_state_idx,
-                s.gdn_meta.non_spec_state_indices_tensor->data(),
-                sizeof(int32_t) * pin.idx);
-  d.b.Copy(d.q, dev.positions.ptr(), pin.positions, sizeof(int32_t) * S);
-  d.b.Copy(d.q, dev.slot_mapping.ptr(), pin.slot_mapping, sizeof(int64_t) * S);
-  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * R * cols);
-  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * R);
-  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (R + 1));
-  if (pin.has_idx && dev.has_gdn_idx)
-    d.b.Copy(d.q, dev.gdn_state_idx.ptr(), pin.gdn_state_idx,
-             sizeof(int32_t) * pin.idx);
+    pin.gdn_state_idx.RefreshFromHost(
+        d.q, s.gdn_meta.non_spec_state_indices_tensor->data(),
+        sizeof(int32_t) * pin.idx);
 }
 
 // Test-only (VT_ASYNC_EXECUTOR_POISON): immediately AFTER StageStepInputs enqueued the
@@ -9848,20 +9869,37 @@ template <class Slot>
 static void MaybePoisonStagedInputs(bool poison, Slot& s) {
   if (!poison || !s.pin.ready) return;
   PinnedStepInputs& pin = s.pin;
-  std::fill(pin.positions, pin.positions + pin.S, 0);
-  std::fill(pin.slot_mapping, pin.slot_mapping + pin.S, 0);
-  std::fill(pin.seq_lens, pin.seq_lens + pin.S, 0);
-  std::fill(pin.token_ids, pin.token_ids + pin.S, 0);
+  // The STAGING block is what a true asynchronous DMA is still reading, so
+  // corrupting it is what races the copy. `token_ids` is not in this list any
+  // more because its pinned block is gone: it was never uploaded, so zeroing it
+  // could never have poisoned anything (see PinnedStepInputs).
+  //
+  // EACH CELL IS ZEROED OVER ITS OWN CAPACITY, and that closes #1319. This hook
+  // used to fill all four blocks over `pin.S` — TOKENS — while `seq_lens` is
+  // allocated with `pin.R`, REQUESTS. The two are equal on a pure-decode step
+  // and NOT on a speculative one, where `S = R * (1 + k)`, so the fill ran
+  // `(S - R)` int32s past the end of a `cudaHostAlloc`'d block, corrupting
+  // pinned memory inside the very arm that exists to fail loudly. Asking each
+  // cell for its own capacity makes the count and the allocation the same
+  // fact.
+  const auto zero = [](vt::PersistentStepInput& c) {
+    if (c.staging() != nullptr) std::memset(c.staging(), 0, c.capacity());
+  };
+  zero(pin.positions);
+  zero(pin.slot_mapping);
+  zero(pin.seq_lens);
 }
 
 struct Qwen3_5DecodeGraph::Impl {
   Impl(const Qwen3_5MoeWeights& w, const HfConfig& c, vt::Queue q,
        int64_t max_reqs)
       : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
-    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
-    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    // ENG-CUDAGRAPH-BREAK W4 (#1307): the FRAMEWORK-WIDE switch is the SEAM's,
+    // not this driver's. `vt::GraphCaptureEnabled()` reads `VLLM_CPP_CUDAGRAPH`
+    // once per process into a function-local static. These were the LAST TWO of
+    // the six batched-driver reads the spec's `## Our baseline` item 1 counted.
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on &&
+    enabled = vt::GraphCaptureEnabled() &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
     dbuf = enabled && DecodeGraphDoubleBufferEnabled();
@@ -9871,7 +9909,11 @@ struct Qwen3_5DecodeGraph::Impl {
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots)
       for (auto& s : kv.second.slot) {
-        if (s.graph != nullptr) b.DestroyGraph(s.graph);
+        // No DestroyGraph: every segment handle belongs to the slot's
+        // `vt::BreakableGraph`, whose destructor releases it through
+        // `Backend::DestroyGraph`. That routing is what lets
+        // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
+        // editing this driver (spec `## Risks/decisions` D4).
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -9896,9 +9938,12 @@ struct Qwen3_5DecodeGraph::Impl {
     // allocates a fresh buffer per call, which a captured graph cannot do.
     std::unique_ptr<DBuf> aux;        // [S, H*taps] bf16, null when no aux tap
     int64_t aux_taps = 0;             // tap count this buffer + graph were built for
-    void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
+    // ENG-CUDAGRAPH-BREAK W4 (#1307): the instantiated graph, its handle
+    // ownership, its release and its `captured()` state now live in the shared
+    // seam instead of a raw `void*` plus a `bool` this driver maintained by
+    // hand. `vt::BreakableGraph` is non-copyable and is constructed in place.
+    vt::BreakableGraph graph;
     int fa_cols = -1;                 // captured block-table column count
-    bool captured = false;
     bool warm = false;
     int64_t replays = 0;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
@@ -10084,11 +10129,11 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   const int64_t aux_taps =
       aux_out != nullptr ? static_cast<int64_t>(aux_out->layer_ids.size()) : 0;
   if (s.aux_taps != aux_taps) {
-    if (s.graph != nullptr) {
-      b.DestroyGraph(s.graph);
-      s.graph = nullptr;
-    }
-    s.captured = false;
+    // Reset() releases every segment through Backend::DestroyGraph and returns
+    // the container to its as-constructed state, which is also what lets the
+    // next capture open a scope on it (the scope refuses a container that
+    // already holds one).
+    s.graph.Reset();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -10138,19 +10183,22 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam, pgm);
   s.fa_cols = cols;
-  if (cols_changed && s.graph != nullptr) {
-    b.DestroyGraph(s.graph);
-    s.graph = nullptr;
-    s.captured = false;
+  if (cols_changed && s.graph.captured()) {
+    s.graph.Reset();
     s.warm = false;
-    s.dev.reset();
+    // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
+    // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
+    // pool blocks. `Unbind()` does not dereference the destination today, so
+    // the old order was correct by the implementation's silence rather than by
+    // anything stated — which is one edit away from a use-after-free.
     s.pin.Free();
+    s.dev.reset();
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, stage this step's inputs into the persistent device
   // buffers (Option A: H2D out of the captured region), then relaunch the graph.
-  if (s.captured) {
+  if (s.graph.captured()) {
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
@@ -10158,7 +10206,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       record_staged();
       MaybePoisonStagedInputs(impl_->poison, s);
     }
-    b.ReplayGraph(impl_->queue, s.graph);
+    // Through the seam's container, never `Backend::ReplayGraph` directly: the
+    // container replays its segments in order (one, here, because a decode
+    // capture is kFull) and owns the G3 replay counter the gate reads.
+    s.graph.Replay(impl_->queue);
     ++s.replays;
     ++impl_->replays;
     publish_aux();
@@ -10196,6 +10247,17 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
         return false;
       }();
+      // UNBIND BEFORE THE DESTINATION DIES, the same rule the shape-change path
+      // above states, applied to the other site that replaces `s.dev`. The
+      // assignment below destroys the PREVIOUS `StepDevInputs`, returning its
+      // pool blocks to the free list while `s.pin`'s cells still name them, and
+      // the rebind is four statements later at `s.pin.Alloc`. Reachable: the
+      // `aux_taps` branch resets the graph and clears `warm` WITHOUT calling
+      // `s.pin.Free()`, so the next warm step arrives here with the cells bound.
+      // Harmless today only because `Unbind()` does not dereference — which is
+      // exactly the argument the shape-change site refused to rely on. Free costs
+      // nothing extra: `Alloc` calls `Free()` first regardless.
+      s.pin.Free();
       {
         ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
         s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
@@ -10208,39 +10270,84 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
+      s.pin.Alloc(b, *s.dev, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-    b.BeginCapture(impl_->queue);
-    // A THROW OUT OF A CAPTURE REGION MUST STILL END THE CAPTURE (#339, review
-    // finding F-B). Capture mode is cudaStreamCaptureModeThreadLocal
-    // (cuda_backend.cu), so if an exception skipped EndCaptureGraph the stream
-    // would stay in capture mode FOREVER and every later CUDA call on it would
-    // fail — a failure mode that looks nothing like its cause, arrives long
-    // after it, and cannot be repaired by the first catch (the engine thread in
-    // v1/engine/core_client.cpp, which only marks the engine dead). Any refusal
-    // raised inside ForwardLayers reaches here: the fp8 splitK premise check is
-    // one such, and it is not the only thing under here that can throw. Drain,
-    // then rethrow the ORIGINAL error — mirrors qwen3_dflash.cpp's capture guard.
-    DBuf lg = [&] {
-      try {
-        return ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                             s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                             impl_->config, {}, nullptr, /*mrope_cos_sin=*/nullptr,
-                             aux_ids_arg, aux_out_arg,
-                             dbuf ? s.dev.get() : nullptr);
-      } catch (...) {
-        void* g = nullptr;
-        try { g = b.EndCaptureGraph(impl_->queue); } catch (...) {}  // unstick the stream
-        if (g != nullptr) b.DestroyGraph(g);
-        throw;
+    // ENG-CUDAGRAPH-BREAK W4 (#1307): the capture is the SHARED SEAM's, not this
+    // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
+    // the segment, the handle, its release and the drain a mid-capture throw
+    // needs — the drain three drivers each hand-rolled as the same
+    // `try { EndCaptureGraph(); } catch (...) {}`, and which the scope now
+    // performs by comparing `std::uncaught_exceptions()` against the depth it
+    // recorded at entry. A refusal raised inside the forward (the fp8 splitK
+    // premise check is one such, and not the only one) still reaches the caller
+    // with the ORIGINAL error, because nothing here swallows it.
+    //
+    // kFULL, and the mode is the whole argument. vLLM's v1 default
+    // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63`) is documented at
+    // `:630-632` as a FULL graph for DECODE batches and a piecewise one for
+    // prefill and mixed batches, and `decode_mode()` (`:65-66`) returns the full
+    // half. This is a decode driver, so its capture is ONE segment with the
+    // attention calls INSIDE it — byte-identical in shape to the region this
+    // replaces. Opening it kPiecewise would turn every layer's attention into an
+    // eager call between two graph replays, which is not vLLM's decode behaviour
+    // and which nothing in this row's record supports.
+    std::optional<DBuf> lg;
+    {
+      vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                         s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                         impl_->config, {}, nullptr, /*mrope_cos_sin=*/nullptr,
+                         aux_ids_arg, aux_out_arg,
+                         dbuf ? s.dev.get() : nullptr);
+    }  // ~GraphCaptureScope closes the segment and files it on s.graph
+    // NOT CAPTURED covers TWO states, and returning the buffer is correct for
+    // exactly one of them. `~GraphCaptureScope` must swallow a throwing
+    // `EndCaptureGraph` — a destructor that propagates terminates — so a FAILED
+    // capture leaves the container reporting what an INERT scope reports.
+    //
+    //   * INERT (`capture_failed() == false`): the backend cannot capture, or
+    //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, the layer
+    //     region above ran EAGERLY, and the buffer is a real result. Return it
+    //     and go back to cold so the next same-size step re-warms.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph` threw.
+    //     Under stream capture NOTHING between `BeginCapture` and the throw
+    //     executed: every kernel was RECORDED, so the buffer is pool-recycled
+    //     memory. Returning it would hand this step uncomputed device memory as
+    //     its logits — silently wrong tokens, no fault, and a token gate cannot
+    //     see it.
+    //
+    // So the failure PROPAGATES, carrying the runtime's own exception. This is
+    // exactly what the pre-W4 driver did (`s.graph = b.EndCaptureGraph(...)` was
+    // unguarded), and it is not a recovery this stage can justify inventing: a
+    // stream whose capture was INVALIDATED has not told us it is usable.
+    if (!s.graph.captured()) {
+      s.warm = false;  // either way this slot goes back to cold
+      if (s.graph.capture_failed()) {
+        const std::exception_ptr err = s.graph.capture_error();
+        s.graph.Reset();  // clear the failure with the graph it described
+        // The runtime's OWN diagnosis where the seam holds it. It is empty only
+        // on the arm where an exception was already propagating THROUGH the
+        // scope, which cannot reach this line; the refusal below makes that
+        // unreachability an assertion rather than a claim.
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "Qwen3.5 decode graph: the capture was ABANDONED and its logits were "
+                 "never computed; refusing to return uncaptured device memory");
       }
-    }();
-    s.graph = b.EndCaptureGraph(impl_->queue);
-    s.logits = std::make_unique<DBuf>(std::move(lg));
-    s.captured = true;
+      publish_aux();
+      record_staged();
+      ForwardLogits drained = WrapDeviceLogits(d, std::move(*lg), vocab);
+      if (drained.rows != B) {
+        drained.rows = B;
+        drained.device_tensor = MakeTensor(drained.device_storage.get(), DType::kF32,
+                                           d.q.device, {B, vocab});
+      }
+      return drained;
+    }
+    s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
-    b.ReplayGraph(impl_->queue, s.graph);
+    s.graph.Replay(impl_->queue);
     record_staged();
     s.replays = 1;
     ++impl_->replays;
@@ -10259,7 +10366,6 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
                           nullptr, /*mrope_cos_sin=*/nullptr, aux_ids_arg,
                           aux_out_arg);
   s.warm = true;
-  s.captured = false;
   publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
@@ -10287,10 +10393,12 @@ struct Qwen3_5DenseDecodeGraph::Impl {
   Impl(const Qwen3_5DenseWeights& w, const HfConfig& c, vt::Queue q,
        int64_t max_reqs)
       : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
-    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
-    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    // ENG-CUDAGRAPH-BREAK W4 (#1307): the FRAMEWORK-WIDE switch is the SEAM's,
+    // not this driver's. `vt::GraphCaptureEnabled()` reads `VLLM_CPP_CUDAGRAPH`
+    // once per process into a function-local static. These were the LAST TWO of
+    // the six batched-driver reads the spec's `## Our baseline` item 1 counted.
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on &&
+    enabled = vt::GraphCaptureEnabled() &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
     dbuf = enabled && DecodeGraphDoubleBufferEnabled();
@@ -10304,7 +10412,11 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots)
       for (auto& s : kv.second.slot) {
-        if (s.graph != nullptr) b.DestroyGraph(s.graph);
+        // No DestroyGraph: every segment handle belongs to the slot's
+        // `vt::BreakableGraph`, whose destructor releases it through
+        // `Backend::DestroyGraph`. That routing is what lets
+        // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
+        // editing this driver (spec `## Risks/decisions` D4).
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -10325,9 +10437,12 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     // allocates a fresh buffer per call, which a captured graph cannot do.
     std::unique_ptr<DBuf> aux;        // [S, H*taps] bf16, null when no aux tap
     int64_t aux_taps = 0;             // tap count this buffer + graph were built for
-    void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
+    // ENG-CUDAGRAPH-BREAK W4 (#1307): the instantiated graph, its handle
+    // ownership, its release and its `captured()` state now live in the shared
+    // seam instead of a raw `void*` plus a `bool` this driver maintained by
+    // hand. `vt::BreakableGraph` is non-copyable and is constructed in place.
+    vt::BreakableGraph graph;
     int fa_cols = -1;                 // captured block-table column count
-    bool captured = false;
     bool warm = false;
     int64_t replays = 0;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
@@ -10510,11 +10625,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   const int64_t aux_taps =
       aux_out != nullptr ? static_cast<int64_t>(aux_out->layer_ids.size()) : 0;
   if (s.aux_taps != aux_taps) {
-    if (s.graph != nullptr) {
-      b.DestroyGraph(s.graph);
-      s.graph = nullptr;
-    }
-    s.captured = false;
+    // Reset() releases every segment through Backend::DestroyGraph and returns
+    // the container to its as-constructed state, which is also what lets the
+    // next capture open a scope on it (the scope refuses a container that
+    // already holds one).
+    s.graph.Reset();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -10563,19 +10678,22 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam, pgm);
   s.fa_cols = cols;
-  if (cols_changed && s.graph != nullptr) {
-    b.DestroyGraph(s.graph);
-    s.graph = nullptr;
-    s.captured = false;
+  if (cols_changed && s.graph.captured()) {
+    s.graph.Reset();
     s.warm = false;
-    s.dev.reset();
+    // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
+    // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
+    // pool blocks. `Unbind()` does not dereference the destination today, so
+    // the old order was correct by the implementation's silence rather than by
+    // anything stated — which is one edit away from a use-after-free.
     s.pin.Free();
+    s.dev.reset();
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, stage this step's inputs into the persistent device
   // buffers (Option A: H2D out of the captured region), then relaunch the graph.
-  if (s.captured) {
+  if (s.graph.captured()) {
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
@@ -10585,10 +10703,13 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     }
 #ifdef VT_BENCH_PROFILE_CONTROL
     vt::cuda::MarkCudaGraphReplayProfilerEligible(
-        s.graph, static_cast<uint32_t>(B), static_cast<uint32_t>(S),
+        s.graph.segment(0), static_cast<uint32_t>(B), static_cast<uint32_t>(S),
         static_cast<uint64_t>(s.replays));
 #endif
-    b.ReplayGraph(impl_->queue, s.graph);
+    // Through the seam's container, never `Backend::ReplayGraph` directly: the
+    // container replays its segments in order (one, here, because a decode
+    // capture is kFull) and owns the G3 replay counter the gate reads.
+    s.graph.Replay(impl_->queue);
     ++s.replays;
     ++impl_->replays;
     publish_aux();
@@ -10624,6 +10745,17 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
         return false;
       }();
+      // UNBIND BEFORE THE DESTINATION DIES, the same rule the shape-change path
+      // above states, applied to the other site that replaces `s.dev`. The
+      // assignment below destroys the PREVIOUS `StepDevInputs`, returning its
+      // pool blocks to the free list while `s.pin`'s cells still name them, and
+      // the rebind is four statements later at `s.pin.Alloc`. Reachable: the
+      // `aux_taps` branch resets the graph and clears `warm` WITHOUT calling
+      // `s.pin.Free()`, so the next warm step arrives here with the cells bound.
+      // Harmless today only because `Unbind()` does not dereference — which is
+      // exactly the argument the shape-change site refused to rely on. Free costs
+      // nothing extra: `Alloc` calls `Free()` first regardless.
+      s.pin.Free();
       {
         ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
         s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
@@ -10636,40 +10768,92 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
+      s.pin.Alloc(b, *s.dev, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-    b.BeginCapture(impl_->queue);
-    // Drain the capture if the forward throws — see the 35B driver above for why
-    // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
-    // is the 27B DENSE driver, and it is the one that matters most here: the
-    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is off by DEFAULT
-    // (GdnFp8InBf16Enabled), which is the only thing keeping it inert on the
-    // 35B. It used to read "confined to the 27B by construction, since the 35B
-    // is MoE and its GdnOutDType is f32"; GDN-MOE-BF16-OUT (#1168) made outdt
-    // BF16 on both arms, so the bound is a toggle now, not a model shape.
-    DBuf lg = [&] {
-      try {
-        return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                                  s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                                  impl_->config, {}, nullptr, nullptr, aux_ids_arg,
-                                  aux_out_arg, dbuf ? s.dev.get() : nullptr);
-      } catch (...) {
-        void* g = nullptr;
-        try { g = b.EndCaptureGraph(impl_->queue); } catch (...) {}  // unstick the stream
-        if (g != nullptr) b.DestroyGraph(g);
-        throw;
+    // ENG-CUDAGRAPH-BREAK W4 (#1307): the capture is the SHARED SEAM's, not this
+    // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
+    // the segment, the handle, its release and the drain a mid-capture throw
+    // needs — the drain three drivers each hand-rolled as the same
+    // `try { EndCaptureGraph(); } catch (...) {}`, and which the scope now
+    // performs by comparing `std::uncaught_exceptions()` against the depth it
+    // recorded at entry. A refusal raised inside the forward (the fp8 splitK
+    // premise check is one such, and not the only one) still reaches the caller
+    // with the ORIGINAL error, because nothing here swallows it.
+    //
+    // kFULL, and the mode is the whole argument. vLLM's v1 default
+    // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63`) is documented at
+    // `:630-632` as a FULL graph for DECODE batches and a piecewise one for
+    // prefill and mixed batches, and `decode_mode()` (`:65-66`) returns the full
+    // half. This is a decode driver, so its capture is ONE segment with the
+    // attention calls INSIDE it — byte-identical in shape to the region this
+    // replaces. Opening it kPiecewise would turn every layer's attention into an
+    // eager call between two graph replays, which is not vLLM's decode behaviour
+    // and which nothing in this row's record supports.
+    //
+    // This is the 27B DENSE driver, and the bf16-D fp8 lever this region guards
+    // (VT_GDN_FP8_IN_BF16) is off by DEFAULT (GdnFp8InBf16Enabled), which is the
+    // only thing keeping it inert on the 35B — GDN-MOE-BF16-OUT (#1168) made
+    // outdt BF16 on both arms, so the bound is a toggle now, not a model shape.
+    std::optional<DBuf> lg;
+    {
+      vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                              s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                              impl_->config, {}, nullptr, nullptr, aux_ids_arg,
+                              aux_out_arg, dbuf ? s.dev.get() : nullptr);
+    }  // ~GraphCaptureScope closes the segment and files it on s.graph
+    // NOT CAPTURED covers TWO states, and returning the buffer is correct for
+    // exactly one of them. `~GraphCaptureScope` must swallow a throwing
+    // `EndCaptureGraph` — a destructor that propagates terminates — so a FAILED
+    // capture leaves the container reporting what an INERT scope reports.
+    //
+    //   * INERT (`capture_failed() == false`): the backend cannot capture, or
+    //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, the layer
+    //     region above ran EAGERLY, and the buffer is a real result. Return it
+    //     and go back to cold so the next same-size step re-warms.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph` threw.
+    //     Under stream capture NOTHING between `BeginCapture` and the throw
+    //     executed: every kernel was RECORDED, so the buffer is pool-recycled
+    //     memory. Returning it would hand this step uncomputed device memory as
+    //     its logits — silently wrong tokens, no fault, and a token gate cannot
+    //     see it.
+    //
+    // So the failure PROPAGATES, carrying the runtime's own exception. This is
+    // exactly what the pre-W4 driver did (`s.graph = b.EndCaptureGraph(...)` was
+    // unguarded), and it is not a recovery this stage can justify inventing: a
+    // stream whose capture was INVALIDATED has not told us it is usable.
+    if (!s.graph.captured()) {
+      s.warm = false;  // either way this slot goes back to cold
+      if (s.graph.capture_failed()) {
+        const std::exception_ptr err = s.graph.capture_error();
+        s.graph.Reset();  // clear the failure with the graph it described
+        // The runtime's OWN diagnosis where the seam holds it. It is empty only
+        // on the arm where an exception was already propagating THROUGH the
+        // scope, which cannot reach this line; the refusal below makes that
+        // unreachability an assertion rather than a claim.
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "Qwen3.5 decode graph: the capture was ABANDONED and its logits were "
+                 "never computed; refusing to return uncaptured device memory");
       }
-    }();
-    s.graph = b.EndCaptureGraph(impl_->queue);
-    s.logits = std::make_unique<DBuf>(std::move(lg));
-    s.captured = true;
+      publish_aux();
+      record_staged();
+      ForwardLogits drained = WrapDeviceLogits(d, std::move(*lg), vocab);
+      if (drained.rows != B) {
+        drained.rows = B;
+        drained.device_tensor = MakeTensor(drained.device_storage.get(), DType::kF32,
+                                           d.q.device, {B, vocab});
+      }
+      return drained;
+    }
+    s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
       std::fprintf(stderr, "[DenseDecodeGraph] captured Qwen3.5 dense decode graph "
                            "for padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
-    b.ReplayGraph(impl_->queue, s.graph);
+    s.graph.Replay(impl_->queue);
     record_staged();
     s.replays = 1;
     ++impl_->replays;
@@ -10688,7 +10872,6 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                                impl_->config, {}, nullptr, nullptr, aux_ids_arg,
                                aux_out_arg);
   s.warm = true;
-  s.captured = false;
   publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.

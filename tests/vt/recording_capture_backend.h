@@ -74,9 +74,25 @@ class RecordingCaptureBackend final : public vt::Backend {
   void Memset(vt::Queue&, void* p, int v, size_t bytes) override {
     std::memset(p, v, bytes);
   }
+  // A COPY ISSUED INSIDE A CAPTURE IS RECORDED, NOT EXECUTED — the same rule
+  // `Record` states for a kernel, applied to the one operation a persistent
+  // step input is made of. Before ENG-CUDAGRAPH-BREAK W4 (#1307) this ran the
+  // memcpy immediately even mid-capture, which made a capture look like it had
+  // already moved bytes that a real `cudaMemcpyAsync` would only move on replay.
+  //
+  // The closure captures the two ADDRESSES and not the bytes, deliberately: a
+  // real capture bakes the source and destination pointers, so replay N re-reads
+  // whatever the source holds AT REPLAY TIME. That is the entire mechanism
+  // behind `vt::PersistentStepInput::RefreshFromDevice`, and a harness that
+  // snapshotted the bytes here would make the fresh and stale arms
+  // indistinguishable.
   void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
-    std::memcpy(dst, src, bytes);
     ++copies_;
+    if (capturing_) {
+      open_work_.push_back([dst, src, bytes] { std::memcpy(dst, src, bytes); });
+      return;
+    }
+    std::memcpy(dst, src, bytes);
   }
   vt::Queue CreateQueue() override { return vt::Queue{}; }
   bool UnifiedMemory() const override { return true; }

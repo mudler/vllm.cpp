@@ -24128,3 +24128,396 @@ registry still counts probe refusals only and a replay-time refusal would abort 
 `mem/mem_<tag>.csv` (the per-call `cudaMemGetInfo` trace with node counts),
 `mem/smp_<tag>.csv` (the `nvidia-smi` and RSS sampler) and `out-bytes/ids_<tag>.json`
 (the token artifacts).
+
+## BENCH-QWEN38-27B-BF16 c1/c8 RE-MEASURE — our arm lands complete, the c1 pairing is DISCARDED on clock spread, and the c8 vLLM denominator is NOT MEASURABLE on this box (2026-08-19, `row/BENCH-QWEN38-27B-BF16-RESULT`, `dgx:gpu0` GB10 sm_121a via `rc` leases, #915 / #979, cause #931)
+
+Subject `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, bf16,
+`config.json` `architectures = ['Qwen3_5ForConditionalGeneration']`,
+`model_type = qwen3_5`, 18 shards. Ours built at `1dac4f9a70195b282d16c536f319e8b171c925f8`
+(`origin/main` at run time), source tarball sha256
+`c74c45d1dc910087c313f5f29b81b4cbc6f8d649886618f2399d7988b0bd2fc0`, binary sha256
+`7d0c3cafb224f66ef6789f40df3caeb2b22987605922911fffcaa3e188344b0a` asserted
+`WANT == GOT` at launch. Oracle `0.1.dev1+g555967922`, the pin, used as the
+CLIENT for both arms and as the server for the vLLM arm. Client identity read
+from `vllm.__file__` in the lease and printed per series.
+
+Workload, identical string on both arms: `vllm bench serve --backend openai
+--endpoint /v1/completions --dataset-name random --random-input-len 1024
+--random-output-len 128 --random-range-ratio 0 --num-prompts <6 x C>
+--max-concurrency C --request-rate inf --ignore-eos --temperature 0 --seed 0`.
+Fresh server per concurrency, one untimed discarded warmup, then 3 reps.
+Ours: `--device cuda --max-model-len 2048 --max-num-seqs 32
+--max-num-batched-tokens 8192 --no-enable-prefix-caching --language-model-only`,
+with `VT_SERVER_SSE_PING_S=0` exported. vLLM: the recorded #915 configuration
+UNMODIFIED — `--gpu-memory-utilization 0.85 --max-num-seqs 32
+--max-num-batched-tokens 8192 --max-model-len 2048 --no-enable-prefix-caching
+--language-model-only --mamba-ssm-cache-dtype float32 --seed 0`.
+
+Box state asserted rather than assumed. Both series printed
+`COTENANTS_AT_SERIES_START=0` and `IDLE_BOX=YES` from a
+`nvidia-smi --query-compute-apps` count, and exit 38 instead of measuring when
+that count is non-zero. Both teardowns printed `COMPUTE_APPS_AFTER_TEARDOWN=0`
+and `TEARDOWN_VERDICT=CLEAN`.
+
+### OUR ARM — three clean legs at each concurrency, every request completed
+
+`out/bench-20260819T035148Z/`. Medians over 3 reps; CV is the population
+coefficient of variation over the same three values.
+
+| Axis | c1 | c8 |
+|---|---:|---:|
+| completed / num_prompts, per rep | 6, 6, 6 of 6 | 48, 48, 48 of 48 |
+| `failed`, per rep | 0, 0, 0 | 0, 0, 0 |
+| non-empty `errors` entries | 0 | 0 |
+| output token throughput, median | **4.4040 tok/s** | **22.6402 tok/s** |
+| output token throughput, CV over 3 reps | 0.039% | 0.205% |
+| total token throughput, median — **CORRUPTED, [#1355](https://github.com/mudler/vllm.cpp/issues/1355); NOT comparable to vLLM's** | 38.4776 tok/s, over 5,942 input tokens where the workload intends 6,144 | 196.0967 tok/s, over 47,072 where it intends 49,152 |
+| median TPOT | 218.11 ms | 250.57 ms |
+| median ITL | 216.56 ms | 232.83 ms |
+| median TTFT | 883.78 ms | 3623.5 ms |
+| median E2EL | 28,586.6 ms | 35,098.0 ms |
+| cold start to first `/health` | 30 s | 54 s |
+| SM clock median over the timed window | 2489 MHz, all three legs | 2515 MHz, all three legs |
+| within-run SM-clock spread | 13.58% / 26.36% / 14.34% | 14.99% / 13.44% / 12.92% |
+
+162 of 162 requests completed across the whole series, zero failures. The floor
+of `MemAvailable` over 1,077 samples spanning both legs was 21,100 MB.
+
+### vLLM ARM c1 — three clean legs, on the production graphed configuration
+
+`out/vllm-20260819T095758Z/`. The configuration is read back from the engine's
+own startup line rather than from the command line: `enforce_eager=False`,
+`cudagraph_mode: FULL_AND_PIECEWISE`, `cudagraph_capture_sizes [1, 2, 4, 8, 16,
+24, 32, 40, 48, 56, 64]`, `FLASH_ATTN` (FlashAttention version 2),
+`dtype=torch.bfloat16`, `enable_chunked_prefill=True`. That is vLLM's production
+shape and not `--enforce-eager`.
+
+| Axis | c1 |
+|---|---:|
+| completed / num_prompts, per rep | 6, 6, 6 of 6 |
+| `failed`, per rep | 0, 0, 0 |
+| output token throughput, median | **4.2835 tok/s** |
+| output token throughput, CV over 3 reps | 0.033% |
+| total token throughput, median — **do not set this beside ours**; ours is deflated by 202 missing prompt tokens ([#1355](https://github.com/mudler/vllm.cpp/issues/1355)), so the axis is not comparable | 38.5516 tok/s, over the full 6,144 input tokens |
+| median TPOT | 228.36 ms |
+| median ITL | 226.86 ms |
+| median TTFT | 876.4 ms |
+| cold start to first `/health` | 426 s |
+| SM clock median over the timed window | 2489 MHz, all three legs |
+| within-run SM-clock spread | 10.16% / 17.48% / 18.52% |
+
+### NO RATIO IS DERIVED AT c1, AND THE REASON IS THE WITHIN-RUN RULE
+
+`tools/bench/gpu_clock_state.py compare` returned rc=1 with a non-empty
+`reasons` list on all three c1 pairings. `PAIRING_VERDICT=DISCARD`. The shape of
+the refusal is unusual and is recorded precisely, because reading it as "the two
+arms disagree" inverts it:
+
+- **The cross-arm rule passed perfectly.** Same boot id
+  `3fd9745a-d25a-426c-ba3c-97c958a85515` on both arms. Median SM clock 2489 MHz
+  on BOTH arms in all three reps, a median offset of **0.0%** against a 1%
+  ceiling. Same GPU (`NVIDIA GB10`), same driver `580.173.02`, same
+  `clocks.max.sm` 3003 MHz, same `clocks.applications.graphics` 2418 MHz, same
+  persistence mode `Enabled`.
+- **The within-run rule failed on BOTH arms.** Ours 13.58% / 26.36% / 14.34%,
+  vLLM 10.16% / 17.48% / 18.52%, against the 5% ceiling
+  `.agents/benchmarking.md` sets. `SwThermalSlowdown` (`0x20`) is active in
+  EVERY one of the nine windows across both arms and both concurrencies; our c1
+  rep 2 additionally carries `HwSlowdown + SwThermal + HwThermal` (`0x68`).
+
+So both c1 absolutes are recorded above as facts with their own clock blocks,
+and **no ours-over-vLLM ratio is derived from them, here or anywhere else**.
+The ratio is OWED, not withheld because it is unflattering: the two absolutes
+happen to sit within a few percent of each other, and the reason there is no
+number is that the instrument that decides whether a pair may be divided
+refused the pair. A number the clock gate discarded is not a number.
+
+The window itself was observed rather than nominal: 155-163 retained busy
+samples per c1 window and 244-246 per c8 window, against the 30-sample floor,
+with 15-26 idle samples excluded per window.
+
+An observation that is an ARGUMENT and not a licence: three c1 legs with
+spreads of 13.58%, 26.36% and 14.34%, one of them hardware-throttled, produced
+output throughput within 0.039% and median TPOT within 0.007% of each other.
+That is evidence this batch-1 path is not clock-limited. It says nothing about
+c8, nothing about a different kernel mix, and nothing about any other boot, and
+it does not convert a DISCARD into a pairing.
+
+### THE c8 vLLM DENOMINATOR IS NOT MEASURABLE ON THIS BOX AT THE RECORDED CONFIGURATION
+
+This is the ANSWER to the c8 denominator question, not a gap in it, and it is a
+statement about headroom and guard granularity on this box. **It is not a claim
+that vLLM is defective**, and no reader may take it as one.
+
+The c8 vLLM server loaded, reached `/health` after 373 s (launched 10:18:54 UTC,
+first `GET /health 200 OK` logged at 10:25:07 UTC), and the worker was then lost
+during the untimed warmup, before any timed leg ran. The memory trajectory is
+the finding, from the series' own 2-second `MemAvailable` sampler
+(`out/vllm-20260819T095758Z/mem.samples`, epoch seconds and MB). One row is NOT
+from the sampler: the `before launch` value is `MemAvailable_MB_before_server`
+from `job.log:214`, read once at launch, and `116869` appears nowhere in
+`mem.samples`.
+
+| Sample time (UTC) | MemAvailable | What it is |
+|---|---:|---|
+| 10:18:54 | 116,869 MB | before launch |
+| 10:24:41 | 58,453 MB | weights loaded, compile and capture done |
+| 10:24:43 | 38,708 MB | the KV reservation, first step |
+| 10:24:45 | 9,738 MB | the KV reservation, second step |
+| 10:25:07 | ~9,950 MB | first `GET /health 200 OK` |
+| 10:25:26 | 6,261 MB | last observed value; no sample after it |
+
+**48,715 MB left in a single 4-second window.** The last observed value was
+6,261 MB and the worker died inside one 2-second sampling interval.
+
+CONSEQUENCE, stated narrowly. At `--gpu-memory-utilization 0.85
+--max-num-batched-tokens 8192`, graphed, this box leaves roughly **6-7 GB of
+headroom**, and the fall from healthy to dead is faster than a 2-second sampler
+can resolve. **A sampling watchdog is therefore not a viable guard for the c8
+denominator here at ANY floor that still lets the configuration run**: 12,000 MB
+kills a healthy server (below), and 5,000 MB was never reached before the worker
+was lost — `watchdog.log` is empty, zero bytes, because the last value the
+sampler saw was above it.
+
+Every way to create that headroom is an ENGINE KNOB. Lowering
+`gpu_memory_utilization` or `max_num_batched_tokens` produces a
+surviving-but-different engine whose number is not the denominator #915 and #979
+ask for. That is why none was attempted, and why the honest result is
+NOT MEASURABLE rather than a number taken at a configuration nobody recorded.
+
+For scale on the same box and the same workload, ours held a `MemAvailable`
+floor of 21,100 MB across both of its legs.
+
+**UNDETERMINED, and recorded as owed rather than guessed.** Whether the HOST
+rebooted or only the k3s pod was lost when the worker died is not decidable from
+these artifacts. One command settles it: read
+`/proc/sys/kernel/random/boot_id` inside any later `dgx:gpu0` job and compare
+against `3fd9745a-d25a-426c-ba3c-97c958a85515`. A different value means the host
+rebooted.
+
+### FINDING THAT OUTLIVES THIS CAMPAIGN 1 — CLOCK PINNING IS UNAVAILABLE INSIDE AN `rc` LEASE
+
+Measured 2026-08-19 on `dgx:gpu0`, in a job running as root in the `rc` worker
+pod:
+
+```text
+$ nvidia-smi -lgc 2190
+The current user does not have permission to change clocks for GPU 0000000F:01:00.0.
+LGC_RC=4
+```
+
+Reproduced in both attempts of the vLLM arm and in our arm, three jobs.
+
+`.agents/benchmarking.md` instructs "Pin the clocks before measuring, under the
+lock", and **every clock-pinned figure in this repository's records was taken
+over the retired host + `ssh` + `flock` path**. The migration to `rc` leases
+silently removed clock pinning and no record said so. Same class as
+[#1265](https://github.com/mudler/vllm.cpp/issues/1265): a capability the
+records assume, which the current access path does not provide. Inside a lease
+the SM clock can only be SAMPLED. `tools/bench/gpu_clock_state.py` remains
+usable and is the only attribution these numbers carry — and it is what turned
+this campaign's c1 pairing into a DISCARD.
+
+Not the first sighting: this record already carries the refusal once, as a
+per-run note under `ENG-CUDAGRAPH-DEDUP W6`. What is new is that the refusal is
+a property of the ACCESS PATH rather than of one run, and that a task guide
+still tells the next reader to do the impossible thing. Recorded in
+`.agents/environment.md` beside the other measured lease capabilities, and
+`.agents/benchmarking.md` now names the exception where it instructs the pin.
+
+### FINDING THAT OUTLIVES THIS CAMPAIGN 2 — A GUARD SET INSIDE A CONFIGURATION'S OWN OPERATING POINT MANUFACTURES THE FINDING IT WAS MEANT TO DETECT
+
+`out/vllm-20260819T073125Z/`, the FIRST vLLM attempt. Its `MemAvailable`
+watchdog fired 18 s after the server reached `/health` and killed it:
+
+```text
+WATCHDOG: MemAvailable 11917MB < 12000MB -- KILLING vllm pgid=110154 to save the box
+```
+
+The obvious reading — "the recorded denominator configuration collapses inside a
+lease" — was WRONG, and wrong in the most dangerous way, because it matched the
+hypothesis already held and would have been believed. The arithmetic refutes it:
+
+| Quantity | Value |
+|---|---:|
+| `MemTotal` | 122,502 MB |
+| `0.85 x MemTotal`, reserved BY DESIGN | 104,127 MB |
+| `MemAvailable_MB_before_server`, from the job log | 116,350 MB |
+| predicted free after the reservation | 12,223 MB |
+| OBSERVED floor at which the guard fired | 11,917 MB |
+| difference | **306 MB** |
+
+The 46 GB "collapse" is the KV reservation doing exactly what
+`gpu_memory_utilization` configures, which on GB10's unified pool comes out of
+host RAM. The watchdog floor of 12,000 MB sat ABOVE the configuration's own
+steady-state free memory, so it fired on a healthy server. Attempt 2 confirmed
+it directly: with the floor moved to 5,000 MB, the c1 legs ran to completion at
+a steady state around 7,500 MB — BELOW the floor of attempt 1.
+
+**THE REUSABLE RULE.** A tripped guard is evidence about the GUARD until its
+threshold is shown to sit outside the guarded thing's operating point. Predict
+the number from the configuration and compare; a 306 MB match settled in one
+line what no amount of log-reading would have. And distinguish an ENGINE KNOB
+from an INSTRUMENT THRESHOLD: `gpu_memory_utilization` and
+`max_num_batched_tokens` define the denominator and may never be tuned to make a
+run survive, while the watchdog floor appears nowhere in the engine
+configuration and changes nothing about what is measured. Between attempt 1 and
+attempt 2 the floor moved 12,000 -> 5,000 MB and **no engine knob moved**.
+
+Two further defects in the same harness, both repaired between the attempts: the
+watchdog `break`s after firing, which would have left every later leg
+unprotected; and the reps kept driving a dead server, recording
+`completed=0 / failed=6 / duration 0.013 s` three times.
+
+### WHAT #915's TWO WITHHELD CELLS LOOK LIKE NOW
+
+Against the previously recorded cells (2026-08-15, a DIFFERENT boot
+`03717c9d-63c8-4652-a8fe-a63d012c5718`, clocks PINNED flat at 2184 MHz):
+
+| Axis | prior | this series | completion, prior -> now |
+|---|---:|---:|---|
+| c1 output tok/s, ours | 2.37 | 4.4040 | 5, 5, 5 of 6 -> 6, 6, 6 of 6 |
+| c1 median TPOT ms, ours | 220.6 | 218.11 | as above |
+| c8 output tok/s, ours | 15.96 | 22.6402 | 36, 37, 36 of 48 -> 48, 48, 48 of 48 |
+| c8 median TPOT ms, ours | 261.1 | 250.57 | as above |
+
+**The SHAPE of that difference is the diagnosis, and the MAGNITUDE is not
+established by these two rows.** The throughput axis moves a great deal while
+the per-token axis barely moves at all — and that comparison is qualitative on
+purpose, because the two rows straddle the 2184 MHz-pinned / 2489 MHz-sampled
+boundary this paragraph goes on to declare non-dividable, so quoting a percentage
+here (220.6 -> 218.11 and 261.1 -> 250.57) would break the rule stated three
+sentences later. That is exactly what
+[#931](https://github.com/mudler/vllm.cpp/issues/931) predicts: the per-token
+axis was always measuring the engine, because it is computed over completed
+requests, while `output_throughput` was dividing live tokens by a wall duration
+that still contained the dead requests. Withholding rather than publishing
+0.677x was correct, and this is the evidence for that judgement.
+
+The magnitude is NOT established because the two rows come from different boots
+with different clock attribution — 2184 MHz pinned then, 2489/2515 MHz sampled
+and thermally throttled now, which is 14-15% apart on the median alone. Per
+`.agents/benchmarking.md`, a ratio is valid only between two arms measured in
+the same window, and these are not. Read the direction and the shape; do not
+read the percentage.
+
+**One caveat on the #931 fix.** The measured arm exported
+`VT_SERVER_SSE_PING_S=0` explicitly. So this series demonstrates that the
+keepalive frame was the cause and that disabling it removes the drops. It does
+NOT independently demonstrate that the shipped DEFAULT is `0`, because the
+harness never depended on the default.
+
+### A DIVERGENCE THE CAMPAIGN DID NOT SET OUT TO FIND — THE TWO ARMS REPORTED DIFFERENT PROMPT-TOKEN COUNTS
+
+Read out of the raw result files rather than out of any summary. On the
+IDENTICAL client invocation, seed and dataset, `input_lens` (which
+`vllm/benchmarks/lib/endpoint_request_func.py:247` overwrites from the SERVER's
+`usage.prompt_tokens`) differs between the arms:
+
+| Leg | ours | vLLM |
+|---|---|---|
+| c1, per request | `[915, 931, 1024, 1024, 1024, 1024]`, sum **5,942** | `[1024] x 6`, sum **6,144** |
+| c8, distribution | 29 of 48 at 1024, 19 short (877-941), sum **47,072** | not measured |
+
+Deterministic: byte-identical `input_lens` across all three c1 reps and all
+three c8 reps. `vllm bench serve` re-aligns prompts against the server's own
+`/tokenize` when the first prompt disagrees
+(`vllm/benchmarks/serve.py:2041-2044`), and it printed no `tokenizer mismatch`
+warning on either arm, so our `/tokenize` agreed on 1024 while our
+`usage.prompt_tokens` reported 915 for the same request.
+
+**What this does and does not touch, BOUNDED rather than asserted.**
+`total_token_throughput` has input tokens in its numerator and is corrupted
+outright: our c1 figure of 38.4776 tok/s is computed over 5,942 input tokens and
+our c8 figure of 196.10 tok/s over 47,072, where the intended workload is 6,144
+and 49,152. `output_lens` is `[128] x N` on BOTH arms in every leg, so TPOT and
+ITL — both computed per completed request — stand.
+
+**`output_throughput` does NOT stand unconditionally, and the earlier wording
+"affects total-token throughput only" was too strong.** It is
+`total_output_tokens / duration`, and under GENUINE truncation the missing
+prompt tokens mean less prefill and therefore a shorter wall, which biases it
+UP. The size is derivable from these files. At c1 the wall equals the sum of the
+per-request E2ELs to within 1 ms (174.4387 s against a 174.4397 s `duration`),
+so the whole effect is in TTFT: over the 15 non-outlier c1 points the marginal
+prefill cost is 1.10 ms/token, so the missing 202 tokens are 0.22 s, and the two
+short prompts' TTFTs sit 0.20, 0.23 and 0.20 s below the 1024-token mean of
+884.6 ms across the three reps — **~0.22 s of 174.39 s, about 0.13%, against a
+published CV of 0.039%**. At c8 the first wave prefills at 1,300-1,800
+tok/s (six of eight first tokens by 4.579 s in rep 3), so 2,080 missing tokens
+are **~1.1-1.6 s of 271.0 s, about 0.4-0.6%, against a published CV of 0.205%**.
+Both are LOWER bounds, because a shorter context also cheapens every decode step.
+So the systematic bias on our headline throughput figures is larger than the
+precision printed beside them, and a reader must see that.
+
+**The two median TTFTs ARE comparable, and by evidence rather than by luck.**
+883.78 ms ours against 876.4 ms vLLM: every vLLM prompt is 1024 tokens, and on
+our side the two short prompts (915 and 931) produce the two LOWEST TTFTs in all
+three reps — sorted rep 1 `0.7381, 0.8264, 0.8436, 0.8484, 0.9047, 3.9243`, rep 2
+`0.7295, 0.8078, 0.8523, 0.9152, 0.9248, 4.0061`, rep 3 `0.7294, 0.8363, 0.8899,
+0.8900, 0.8921, 3.9548`. The median of six averages the third and fourth, both of
+which are 1024-token requests in every rep, so both arms' medians fall on the same
+prompt length. Had a short prompt landed at rank three or four, this comparison
+would have been wrong and nothing in the record would have said so.
+
+**Two causes remain open and the artifacts cannot separate them**: our server
+under-reports `usage.prompt_tokens`, or our server actually processed a
+truncated prompt. Filed, not fixed in flow — this row writes no product code
+and holds no GPU.
+
+### A SECOND THING THE CAMPAIGN DID NOT SET OUT TO FIND — A REPRODUCIBLE TTFT OUTLIER AT A FIXED REQUEST INDEX
+
+[#1365](https://github.com/mudler/vllm.cpp/issues/1365). At c1 the six requests
+are strictly serialized, and OUR arm puts a ~4 s TTFT on request 3 of every leg:
+
+| leg | `ttfts`, seconds |
+|---|---|
+| `warmup-c1.json` | 77.005, 0.727, **3.981**, 0.850, 0.845, 0.839 |
+| `c1-r1.json` | 0.738, 0.826, **3.924**, 0.844, 0.905, 0.848 |
+| `c1-r2.json` | 0.729, 0.808, **4.006**, 0.915, 0.925, 0.852 |
+| `c1-r3.json` | 0.729, 0.836, **3.955**, 0.890, 0.892, 0.890 |
+
+Four legs of four, always index 2, and request 3 carries a 1024-token prompt
+exactly as requests 4, 5 and 6 do, so prompt length does not separate it. The
+77.005 s first value is the separate, already-recorded first-inference cost
+behind a liveness-only `/health`. The oracle has no such point: 18 requests
+across its three c1 legs, every TTFT between 0.834 and 1.015 s.
+
+**Nothing recorded above is wrong, and that is exactly why this is filed.** The
+figure this repository quotes is the MEDIAN, labelled as such, and the median of
+six averages ranks three and four, which the outlier never occupies. What it does
+move is the MEAN — ours 1347.6 / 1372.6 / 1365.4 ms against the oracle's 873.3 /
+883.4 / 900.2 ms, while the medians read 883.78 ms and 876.4 ms — and the wall:
+request 4 starts 31.63 s after request 3 where every other gap is ~28.4 s, so
+roughly 3.1 s of the 174.39 s c1 wall. A reproducible outlier at a FIXED request
+index is a behaviour rather than noise. The cause is deliberately NOT chased
+here; this row writes no product code and holds no GPU.
+
+### EVIDENCE
+
+`/mnt/nas_share/rc/q38bf16/` — `NOTES.txt` (the campaign's own 253-line
+provenance and reasoning file, the primary source for this entry), `build.sh`,
+`bench.sh`, `job.sh`, `vllm-arm.sh`, `reap-orphans.sh`, `STAGED-SHA256.txt`
+(hashes of all five), `src-1dac4f9a7.tar.gz` with `src.sha256`, and under `out/`:
+`RESULT.txt`, `build.log`, `cfg.log`, `bench-20260819T035148Z/` (our arm: six
+result JSONs, six `clock-*.json` windows with their raw samples, `CLOCKS.txt`,
+`SUMMARY.txt`, `mem.samples`, `job.log`, `ckpt-sha256.txt`,
+`ckpt-resolved.txt`, `client-identity.txt`, per-leg server logs),
+`vllm-20260819T073125Z/` (attempt 1, including the non-empty `watchdog.log`),
+and `vllm-20260819T095758Z/` (attempt 2: three c1 JSONs and clock windows, both
+server logs, `mem.samples`, the empty `watchdog.log`).
+
+**Three inconsistencies inside the evidence directory, resolved in favour of the
+executing artifact.** `NOTES.txt` states a binary sha256 of `ab0b9a1e...`; the
+job log asserted and printed `7d0c3caf...` as both `WANT` and `GOT` at launch,
+and `out/RESULT.txt` agrees, so `7d0c3caf...` is the binary that ran and
+`NOTES.txt` carries a stale value. `NOTES.txt` gives the checkpoint as
+55,586,040,114 bytes where `.agents/specs/qwen38-27b-bf16-gate.md` records
+55,586,114,863, a difference of 74,749 bytes; the run DID re-derive it and it
+agrees with `NOTES.txt` — `out/bench-20260819T035148Z/job.log:47,49` print
+`CKPT_SRC_BYTES=55586040114` and `CKPT_DST_BYTES=55586040114` over the staged tree
+that served every leg — so what is unadjudicated is why the spec's figure differs,
+not whether anybody measured. And `NOTES.txt:208` gives the c8 cold start as 374 s
+where this entry derives 373 s from the log's own timestamps (10:18:54 launch,
+10:25:07 first `GET /health 200 OK`); the derived value is the better one and the
+disagreement is recorded here rather than left silent, since the other two were.

@@ -719,6 +719,36 @@ without a rewrite this branch is forbidden to perform. Under
 on a squash in any case, so the pull request body is the correction of record for
 those, and sections 2.2 and 3 here are the correction of record for the substance.
 
+**FIRST MEASURED CELL, 2026-08-19, and one pair that cannot exist.** The
+`ours vs vLLM` bf16 pair of section 2.4's matrix has now been attempted on
+`Qwen/Qwen3.8-27B` @`1d4bf0f2`, both arms in an `rc` lease on `dgx:gpu0`, and
+the two concurrencies resolve differently:
+
+- **c1 produced both absolutes and no ratio.** Ours 4.4040 tok/s, vLLM 4.2835
+  tok/s, three reps each, every request completed on both arms.
+  `gpu_clock_state compare` returned `PAIRING_VERDICT=DISCARD` on all three
+  pairings because the within-run SM-clock spread breached the 5% ceiling on
+  both arms, so the ratio is OWED rather than derived.
+- **c8's vLLM denominator is NOT MEASURABLE on this box at the recorded
+  configuration**, and that is the cell's answer rather than a gap in it. The
+  server reached `/health`, then the KV reservation took 48,715 MB in one
+  4-second window and the worker died with 6,261 MB left. Every way to create
+  the missing headroom is an engine knob that would change the denominator.
+  This is a statement about this box, not about vLLM.
+
+The measurement, the clock blocks, the memory trajectory and the two findings
+that outlive the campaign are in
+[`../benchmark-record.md`](../benchmark-record.md).
+
+**A campaign premise is falsified in passing.** `.agents/environment.md`
+recorded that the pinned oracle builds inside a lease but that "nobody has run a
+model that way, so no oracle-side MEASUREMENT is unblocked yet"
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)). It ran. Three clean
+c1 legs of `vllm serve` on a 52 GiB checkpoint, from a lease, with no `ssh` and
+no container image. What is still blocked is `sglang`, which needs the image
+path [#1265](https://github.com/mudler/vllm.cpp/issues/1265) forbids, and the
+c8 point on this hardware.
+
 ## Owed
 
 - [#979](https://github.com/mudler/vllm.cpp/issues/979) owns this campaign and is
@@ -742,3 +772,14 @@ those, and sections 2.2 and 3 here are the correction of record for the substanc
   assertions named in section 2.5: no e4m3 scale byte with its sign bit set, and
   the GDN head permutation at `conversion/qwen.py:378-386` shown to be a
   permutation of the same codes.
+- [#1354](https://github.com/mudler/vllm.cpp/issues/1354): **clock pinning is
+  unavailable inside an `rc` lease**, so every remaining pair in section 2.4 has
+  the same exposure this one hit — a within-run spread the clock gate refuses,
+  with no lever to reduce it. Recorded in
+  [`../environment.md`](../environment.md).
+- Whether the HOST rebooted or only the k3s pod was lost when the c8 vLLM worker
+  died. Read `/proc/sys/kernel/random/boot_id` inside a later `dgx:gpu0` job and
+  compare against `3fd9745a-d25a-426c-ba3c-97c958a85515`.
+- A c8 vLLM denominator for this checkpoint from a box with more than 6-7 GB of
+  headroom at `--gpu-memory-utilization 0.85 --max-num-batched-tokens 8192`.
+  Unowned, and deliberately not obtained by tuning either knob.

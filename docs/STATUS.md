@@ -976,10 +976,62 @@ those throughput cells are **withheld, not quoted**
 tokens by a duration that still contains the dead request, which is why c1 reads
 0.677x while median TPOT in the same file reads 1.014x in our favour.
 
-**That cause has landed, and the two cells are now waiting on a re-run rather
-than on a diagnosis.** The dropped requests were our own SSE keepalive comment
-frame, and `VT_SERVER_SSE_PING_S` now defaults to `0`. Both cells stay withheld
-until [#915](https://github.com/mudler/vllm.cpp/issues/915) re-runs them paired.
+**That cause has landed, and the re-run happened on 2026-08-19.** The dropped
+requests were our own SSE keepalive comment frame, and `VT_SERVER_SSE_PING_S`
+now defaults to `0`. With it off, our arm completed **162 of 162** requests,
+three reps at each concurrency, `failed=0` on every leg: c1 output throughput
+**4.4040 tok/s** (CV 0.039%), c8 **22.6402 tok/s** (CV 0.205%).
+
+**Read both of those absolutes with one caveat.** Our server reported 5,942
+prompt tokens at c1 where vLLM reported 6,144 on the identical prompts, and 19 of
+48 were short at c8 ([#1355](https://github.com/mudler/vllm.cpp/issues/1355)).
+`output_lens` is `[128]xN` on both arms, so TPOT and ITL stand and total-token
+throughput does not. Output throughput is biased UP if the prompts were truly
+truncated, by roughly 0.13% at c1 and 0.4-0.6% at c8 — larger than the 0.039% and
+0.205% CVs published beside them, so the bias is not inside the stated precision.
+
+**Our half of the debt is discharged. Neither cell is a ratio, and each is
+blocked for its own reason.** At c1 vLLM also completed every request
+(**4.2835 tok/s**, CV 0.033%) and both absolutes stand, but
+`gpu_clock_state compare` returned `PAIRING_VERDICT=DISCARD` on all three
+pairings. **The c1 ratio is OWED, not withheld for being unflattering.**
+
+The refusal is about clock spread, not about the arms disagreeing. The
+cross-arm rule passed perfectly — same boot, both arms at a 2489 MHz median,
+offset **0.0%** — while the within-run rule failed on both, at
+13.58/26.36/14.34% for us and 10.16/17.48/18.52% for vLLM against a 5% ceiling,
+with `SwThermalSlowdown` active in every window and one of ours also carrying
+`HwSlowdown+HwThermal`. All six of our legs and all three of vLLM's breached
+that ceiling, and stable medians do not launder it.
+
+**At c8 the vLLM denominator is NOT MEASURABLE on this box at the recorded
+configuration, and that is the answer rather than a gap in it.** The server
+reached `/health` at 373 s and the worker was then lost during warmup. The KV
+reservation took **48,715 MB in a single 4-second window** (58,453 -> 9,738 MB),
+the last observed value was 6,261 MB, and the death fell inside one 2-second
+sampling interval.
+
+So `--gpu-memory-utilization 0.85 --max-num-batched-tokens 8192` leaves roughly
+6-7 GB of headroom here, and a sampling watchdog cannot guard it at any floor
+that still lets the configuration run: 12,000 MB kills a healthy server and
+5,000 MB is never reached in time. Every way to create that headroom is an
+engine knob that would change the denominator, so none was attempted. **This is
+a statement about headroom and guard granularity on this box, not a claim that
+vLLM is defective.**
+
+**Clocks were SAMPLED, never pinned, and that is new.** `nvidia-smi -lgc`
+returns `LGC_RC=4`, "The current user does not have permission to change
+clocks", running as root inside an `rc` lease. Every clock-pinned figure in
+these records was taken over the retired host + `ssh` + `flock` path, so the
+migration to leases removed clock pinning and no record said so until now. Same
+class as [#1265](https://github.com/mudler/vllm.cpp/issues/1265), and the root
+cause of the discarded pairing.
+
+**Undetermined, and recorded as owed rather than guessed.** Whether the host
+rebooted or only the k3s pod was lost when the worker died cannot be decided
+from these artifacts. One command settles it: compare
+`/proc/sys/kernel/random/boot_id` against `3fd9745a-d25a-426c-ba3c-97c958a85515`
+inside any later `dgx:gpu0` job.
 
 Resource axes on the same series: cold start to first `/health` **53 s vs
 780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —

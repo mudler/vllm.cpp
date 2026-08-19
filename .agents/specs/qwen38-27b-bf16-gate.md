@@ -101,10 +101,63 @@ is the claim. What it adds is evidence, listed under Evidence required.
 
 ## Now
 
-`PARTIAL`. The token axis is closed and passing. The speed axis is closed only
-at **c4** (0.963x throughput, 1.008x ITL); c1 and c8 throughput are withheld until
-[#931](https://github.com/mudler/vllm.cpp/issues/931) closes, because our server
-drops requests there and vLLM does not. Nothing else advances this row.
+`PARTIAL`, and it stays `PARTIAL` after the 2026-08-19 re-measure. The token
+axis is closed and passing. The speed axis is closed only at **c4** (0.963x
+throughput, 1.008x ITL).
+
+**Our half of the c1/c8 debt is DISCHARGED.**
+[#931](https://github.com/mudler/vllm.cpp/issues/931) is closed and the fix
+holds on hardware: with `VT_SERVER_SSE_PING_S=0`, three reps at each
+concurrency on an idle leased box completed **162 of 162** requests with
+`failed=0` and zero non-empty `errors` entries on every leg. c1 output
+throughput **4.4040 tok/s** (CV 0.039%), median TPOT 218.11 ms, median ITL
+216.56 ms, median TTFT 883.78 ms. c8 output throughput **22.6402 tok/s**
+(CV 0.205%), total token throughput **196.10 tok/s, CORRUPTED — do not quote it**
+([#1355](https://github.com/mudler/vllm.cpp/issues/1355), `## Owed`), median TPOT
+250.57 ms, median ITL 232.83 ms, median TTFT 3623.5 ms. Both teardowns
+`TEARDOWN_VERDICT=CLEAN`.
+
+**And read the two output-throughput figures with the same caveat, bounded rather
+than dismissed.** `output_lens` is `[128]xN` on both arms, so TPOT and ITL stand.
+`output_throughput` divides output tokens by a WALL, and a genuinely truncated
+prompt shortens that wall, so it is biased UP: at the c1 marginal prefill cost the
+missing 202 tokens are ~0.22 s of a 174.39 s wall (~0.13%), and the missing 2,080
+at c8 are ~1.1-1.6 s of 271.0 s (~0.4-0.6%). Both exceed the 0.039% and 0.205% CVs
+published beside them, so "unaffected" is wrong and the bias sits outside our own
+stated precision. Shorter context also cheapens decode, so these are lower bounds.
+The median TTFTs (883.78 ms ours, 876.4 ms vLLM) ARE comparable: our two short
+prompts are the two LOWEST TTFTs in every rep, so on both arms the median falls on
+a 1024-token request.
+
+**Neither cell became a ratio, and the two halves are blocked differently.** At
+c1 the pinned oracle `0.1.dev1+g555967922` also completed every request on its
+production graphed configuration (`enforce_eager=False`,
+`cudagraph_mode: FULL_AND_PIECEWISE`, capture sizes `[1..64]`, `FLASH_ATTN`,
+read back from its own startup line): **4.2835 tok/s** (CV 0.033%), median TPOT
+228.36 ms, median ITL 226.86 ms, median TTFT 876.4 ms, cold start 426 s. Both
+absolutes stand as facts with their own clock blocks, and
+`gpu_clock_state compare` returned `PAIRING_VERDICT=DISCARD` on all three
+pairings, so **no ratio is derived — the c1 ratio is OWED, not withheld for
+being unflattering**.
+
+The refusal is about spread, not disagreement. Cross-arm: same boot
+`3fd9745a-d25a-426c-ba3c-97c958a85515`, both arms at a 2489 MHz median, offset
+**0.0%**. Within-run: ours 13.58/26.36/14.34%, vLLM 10.16/17.48/18.52%, against
+the 5% ceiling, with `SwThermalSlowdown` in every window and
+`HwSlowdown+HwThermal` in one of ours. **All six of our legs and all three of
+vLLM's breached that ceiling**, c8's included (12.92-14.99%).
+
+**At c8 the vLLM denominator is NOT MEASURABLE on this box at the recorded
+configuration.** That is the c8 answer, not a gap in it, and it is a statement
+about headroom and guard granularity here rather than a claim that vLLM is
+defective. Detail, trajectory and arithmetic in
+[`../benchmark-record.md`](../benchmark-record.md).
+
+**What advances this row next** is a c1 pairing taken in a window the clock gate
+will accept, which needs either clock pinning (unavailable in a lease, below) or
+a thermally quiet window, and a c8 denominator taken somewhere with more than
+6-7 GB of headroom at the recorded configuration. Neither is reachable from
+`dgx:gpu0` today.
 
 ## Outcome
 
@@ -206,3 +259,42 @@ reproduction recording HTTP status and exception class is the next step.
 nothing about its NVFP4 or Q4_K_M arms (#821), no claim that #910 is fixed (this
 is the second checkpoint to be costed by it), and no throughput number at c1 or
 c8 until #931 closes. Concurrencies above 8 were not run.
+
+## Owed
+
+- [#915](https://github.com/mudler/vllm.cpp/issues/915) stays OPEN. Our arm's
+  c1/c8 debt is discharged; the vLLM half is not. The c1 ratio is refused by the
+  clock gate and the c8 denominator does not exist, so the row's own question —
+  what our speed is against vLLM's production configuration at c1 and c8 — is
+  still unanswered.
+- Whether the HOST rebooted or only the k3s pod was lost when the c8 vLLM worker
+  died on 2026-08-19. The artifacts cannot distinguish them. Settle it by
+  reading `/proc/sys/kernel/random/boot_id` inside any later `dgx:gpu0` job and
+  comparing it against `3fd9745a-d25a-426c-ba3c-97c958a85515`.
+- [#1355](https://github.com/mudler/vllm.cpp/issues/1355), the prompt-token
+  divergence found in this campaign's raw result files: our server reported
+  5,942 prompt tokens where vLLM reported 6,144 for the identical
+  client-generated prompts, 19 of 48 short at c8. Whether we under-report
+  `usage.prompt_tokens` or actually truncate the prompt is not decidable from
+  these artifacts. **It corrupts `total_token_throughput` on both legs** — c1
+  38.4776 tok/s and c8 196.10 tok/s are computed over 5,942 and 47,072 input
+  tokens where the workload intends 6,144 and 49,152 — and it biases
+  `output_throughput` up by more than that figure's own CV; `## Now` carries the
+  bound. Quoting either total-token figure, or setting our 38.4776 beside vLLM's
+  38.5516, compares two different workloads.
+- [#1365](https://github.com/mudler/vllm.cpp/issues/1365), a reproducible ~4 s
+  TTFT outlier on request 3 of every c1 leg of ours, which the oracle does not
+  have: index 2 reads 3.981 / 3.924 / 4.006 / 3.955 s across the warmup leg and
+  all three reps against 0.73-0.93 s for every other request, four legs of four,
+  on a 1024-token prompt like requests 4, 5 and 6. Nothing published is wrong,
+  because the median of six averages ranks three and four and the outlier never
+  occupies either; it moves the MEAN (ours 1347.6-1372.6 ms against the oracle's
+  873.3-900.2 ms) and costs ~3.1 s of the 174.39 s c1 wall. The cause is not
+  chased here.
+- The checkpoint size disagrees between records: this spec's `## Outcome` says
+  55,586,114,863 bytes and the campaign's `NOTES.txt` says 55,586,040,114, a
+  difference of 74,749 bytes. The 2026-08-19 run DID re-derive it, and it agrees
+  with `NOTES.txt`: `out/bench-20260819T035148Z/job.log:47,49` print
+  `CKPT_SRC_BYTES=55586040114` and `CKPT_DST_BYTES=55586040114` over the staged
+  tree that then served every leg. What is unresolved is WHY the `## Outcome`
+  figure differs, which the artifacts cannot settle.

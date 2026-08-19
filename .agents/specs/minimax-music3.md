@@ -3437,3 +3437,355 @@ reader to rediscover from a profile.
 reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an
 internal two-arm number on named hardware.
 
+
+---
+
+## 17. The depth decoder reaches the device (#672, [#1309](https://github.com/mudler/vllm.cpp/issues/1309)) — §11.4's LAST owed device row, and the dtype it was blocked on
+
+§11.4 named three device rows. The vocoder closed in §13, the DiT in §14, and
+§14.5 left this one blocked on a dtype rather than on the work. §16 then removed
+the arithmetic nobody read, which made this row **worth 4.4x less than when it
+was written** and did not make it unnecessary: on `thor:gpu0` the depth forward
+is still **48.4 % of a run**.
+
+This section settles the dtype and describes the arm. The row is
+`MUSIC3-DEPTH-DEVICE`.
+
+### 17.1 The gap, measured, on the head this row starts from
+
+`main` at `678fc672c`, `thor:gpu0` sm_110, `--device 1 --duration 4 --steps 4`,
+100 frames, checkpoint staged to local disk (so §15.6's cold-CIFS load is not
+inside these figures):
+
+| bucket | seconds | share of wall |
+|---|---|---|
+| `ar.depth_forward` | 78.1 | **48.4 %** |
+| `vocoder.decode_window` | 53.6 | 33.2 % |
+| `ar.lm_decode_step` | 12.3 | 7.6 % |
+| `denoise.dit_device` | 5.1 | 3.1 % |
+
+A **0.646 B** decoder costs **6.3x** the **8.6 B** language model beside it. The
+sizes are not the reason; which processor each runs on is. §16.4 measured the
+host kernel at ~4 bytes of f32 weight traffic per multiply-accumulate — 2.28 GB
+per `DepthDecoderAppend` call, 8 calls a frame — and §16.6b measured 96.93 ms
+per call, i.e. **~23.5 GB/s achieved** across Thor's 14 cores.
+
+### 17.2 THE DTYPE — settled, and the oracle settles it by declaring nothing
+
+§14.5 blocked this row because routing an `ArCompute::kBFloat16` decoder through
+an **f32** `vt::MatmulBT` would silently drop the rounding every gated number was
+taken with. That reasoning is correct and its conclusion has expired, because
+the row does not need an f32 `vt::MatmulBT`. It needs a **bf16** one, and
+`vt::MatmulBT` has been one all along:
+
+> `a/b bf16 (or f32), out f32 or bf16, contiguous, same device` — same f32
+> accumulation and dtype contract as `Matmul`
+> ([`include/vt/ops.h:1281-1283`](../../include/vt/ops.h))
+
+The CUDA provider states the same contract as a refusal by name
+(`src/vt/cuda/cuda_matmul.cu:296-300`): `supported: (bf16,bf16)->f32|bf16,
+(f32,f32)->f32|bf16`. **Mixed f32-activation × bf16-weight is rejected**, so the
+arm is bf16 on both operands or it is not bf16 at all.
+
+**What the oracle says.** `MiniMaxMusic3RVQDepthDecoder` declares **no dtype**.
+Its `@register_to_config __init__` takes no `dtype` parameter and constructs every
+submodule at torch's ambient default
+(`diffusers` @ `c6da9936`,
+`models/transformers/minimax_music3_rvq_depth_decoder.py:101-125`). There is **no
+`torch.float32` literal and no `.float()` call anywhere in the file**. The single
+cast in the module is a **down**-cast that re-aligns the attention output to the
+query dtype:
+
+```python
+51        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+```
+
+So the dtype is imposed from outside, by `load_components(dtype=...)`, and
+[`tools/oracle/music3_oracle.py:91-95,103-108`](../../tools/oracle/music3_oracle.py)
+resolves `rvq_depth_decoder: torch.bfloat16` under **both** its policies —
+`ON_DISK_DTYPES` and `REFERENCE_DTYPES` differ only in `condition_encoder`. That
+is the invariant §2.1 already records at :176 and :179-182:
+`dtype(language_model) == dtype(rvq_depth_decoder) == dtype(condition_encoder)`,
+bf16 AR half over fp32 acoustic half.
+
+**Where fp32 legitimately appears, and why it is not this row's.** The depth loop
+promotes to fp32 exactly twice, both **after** the decoder and both on logits:
+the CFG mix at `encoders.py:134` (`logits[:1].float()`) and the sampler at
+`encoders.py:95` (`torch.nan_to_num(logits.float(), ...)`). Both already run on
+the host in `Music3DepthStage`, and this row does not move them.
+
+**The decision.** Weights bf16, activations bf16, every op boundary storing bf16,
+accumulation f32. That is `vt::MatmulBT`'s contract unmodified, and it is what a
+bf16 torch module on a GPU does.
+
+#### 17.2a The finding this makes visible, which no gate in this tree can see
+
+The host arm holds the depth decoder's weights in `std::vector<float>`. The
+checkpoint is bf16 and the loader widens it, so every stored value is
+bf16-exact: the numbers are right, and the goldens, the token gates and §16.6b's
+WAV hash all pass **while the path moves twice the bytes the oracle moves**.
+
+That is `AGENTS.md`'s "a token gate cannot detect a dtype that is too wide", in
+this tree, on the stage that is half the run. §16.7 records the same fact from
+the other side as lever 1. It is written here as a **finding**, not as a defect
+introduced by this row: the host arm's f32 containers are what W2/W3's
+reduction-order gates were taken against, and this row does not narrow them. The
+device arm is the narrow one.
+
+Per [`.agents/porting.md`](../porting.md) "Mirror the memory format, not just the
+math", the four questions and their answers for this path:
+
+| ask | answer, and where upstream answers it |
+|---|---|
+| what dtype does the linear OUTPUT? | bf16 — `nn.Linear` at module dtype, no cast (`minimax_music3_rvq_depth_decoder.py:63-66,114,124`) |
+| what dtype do the intermediate activation buffers carry? | bf16 — read the consumer: `:51` casts the attention output back **to** `query.dtype` |
+| is a projection one physical GEMM or several? | several upstream (`to_q`/`to_k`/`to_v`, `gate_proj`/`up_proj`); **merged here**, see §17.3 |
+| what `kv_cache_dtype` is resolved? | not applicable — the depth cache is this decoder's own 16-position table, not a paged KV cache; it is bf16 with its activations |
+
+### 17.3 The design — no new kernel, and two merges the seam asks for
+
+Every op already exists with a **CPU and a CUDA provider**, so this row composes
+a forward rather than adding a kernel. That is §14.2's shape and it is deliberate.
+
+| host reference (`minimax_music3_ar.cpp`) | shared op |
+|---|---|
+| `RmsNorm` | `vt::RmsNorm` |
+| `LinearNoBias` | `vt::MatmulBT` |
+| `CausalAttentionStep` | `vt::AttentionCross`, `bias = nullptr` |
+| `silu(gate) * up` | `vt::SiluAndMul` |
+| residual adds | `vt::Add` |
+
+**The attention is causal upstream and `vt::AttentionCross` is the right op
+anyway, for a reason that is an identity rather than a shortcut.**
+`DepthDecoderAppend` presents **one** query row against a cache of `seq`
+positions that are all at or before it. A causal mask over a single query at the
+last position masks nothing. So the non-causal op computes upstream's causal
+result exactly, and `vt::Attention` — which would apply a mask keyed on a query
+index this call does not have — is the wrong one. Upstream's own
+`dispatch_attention_fn(..., is_causal=True)` (`:43-50`) runs whole sequences;
+ours runs one row, and that is §16.3's identity, already gated bitwise.
+
+**Two merges, because AGENTS.md routes mergeable projections through the merged
+seam and because they cost nothing numerically.** Each output element remains its
+own dot product, so merging changes no reduction:
+
+* `to_q | to_k | to_v` stage as one `[3H, H]` weight; one `vt::MatmulBT` produces
+  `[batch, 3H]`, split by re-view (`vt::QkvSplit` is available but a free
+  `MakeTensor` at an offset is what the DiT arm uses and needs no copy).
+* `gate_proj | up_proj` stage as one `[2I, H]` weight. This is the merge that
+  `vt::SiluAndMul` **requires**: it computes `silu(x[:, :D]) * x[:, D:]` over one
+  `[T, 2D]` buffer, and upstream's `silu(gate_proj(x)) * up_proj(x)` puts gate
+  first. **No half swap** — unlike §14.3's DiT, where the assignment was the
+  opposite way round and needed a stage-time exchange.
+
+The weight sweeps per frame fall from 8 (decoder) + 7 (projection) of f32 to the
+same counts at **half the bytes**, and the sweep itself moves from 14 host cores
+to the device.
+
+**What does NOT move.** The audio heads, the CFG mix, the top-k draw, the
+feedback embedding and the projection of the fed-back row stay on the host in
+this row, exactly as `Music3DepthStage` has them. The heads are seven
+`[1024, 4096]` GEMVs a frame against the decoder's 8 sweeps of 570 M
+multiply-accumulates; §15's profile puts `ar.depth_projection` at 1.307 s and
+the forward at 78.316 s. Moving them is owed, not skipped silently: §17.7.
+
+### 17.4 Correctness — bitwise is NOT achievable, said before the code, with the tolerance and its reason
+
+**This arm cannot be bit-identical to the host arm, and no gate here will claim
+it.** §16 could claim it because a causal identity is exact. This row changes the
+machine. Three independent reasons, each sufficient on its own:
+
+1. **The accumulator narrows.** The host keeps a sequential `double` per output
+   element (`minimax_music3_ar.cpp::LinearNoBias`); `vt::MatmulBT` accumulates in
+   **f32** (`CUBLAS_COMPUTE_32F`). Over `in_dim` 4096 and 6144 that is a real
+   difference, not a formality.
+2. **The reduction re-associates.** cuBLASLt splits K by an algorithm this row
+   does not choose, and `vt::AttentionCross`'s CUDA kernel uses an **online
+   softmax recurrence** where the host and the CPU provider use a three-pass
+   max/sum/weighted-sum. The two are not bit-identical to each other either.
+3. **`vt::RmsNorm` deliberately drops a rounding our host arm deliberately
+   keeps.** `include/vt/ops.h:1940-1942` records it: "unlike upstream
+   `forward_native`, the standard path keeps full f32 precision (no
+   `x.to(weight.dtype)` rounding before the weight multiply); parity tests vs
+   upstream bf16 need bf16-eps tolerance". Our `RmsNorm` mirrors
+   `normalization.py:600-606`'s **two** roundings on purpose. So the shared op is
+   *wider* here than the reference at exactly one point, and that is a recorded
+   divergence rather than a bug in either.
+
+**The gate is therefore a tolerance, and the tolerance is derived rather than
+chosen.** The proposal, to be replaced by the measured value before the row is
+`DONE`:
+
+* the reference is the **host arm at `ArCompute::kBFloat16`**, not an f32 forward,
+  because the host arm is what every committed number was taken with;
+* the bound is stated in **bf16 ULPs of the reference value**, not in absolute
+  units, because the activations span orders of magnitude across four layers;
+* the proposed acceptance is **max 2 bf16 ULP** with a **mean below 0.5 ULP**
+  over every compared value, which is the band §5's own matched control already
+  established for this decoder (the header records ~1.3 bf16 ULP average between
+  an f32 and a bf16 forward of the same weights);
+* the gate asserts its own **teeth**: that the compared reference values are
+  non-zero and that a deliberately wrong arm exceeds the bound. A tolerance
+  nothing can fail is not a gate.
+
+**A tolerance gate cannot see a dropped stage, so it is not the only gate.** The
+composition is held by the same instrument §16.5 had to add: the production
+`Music3DepthStage` is driven end to end and its **drawn codes and draw count**
+are compared, which a numeric tolerance would not notice.
+
+### 17.4a The tolerance was MEASURED, and it refuted §17.4's own ordering
+
+§17.4 named three sources and led with the accumulator. **The measurement puts
+that last and it is corrected here rather than quietly left standing.**
+
+`test_minimax_music3_ar`, 8 heads of 8, three layers, the full 8-position
+schedule, bf16-exact pseudo-random weights, on a **CPU `vt::Queue`**:
+
+| arm | worst | mean | composed stage, worst |
+|---|---|---|---|
+| as shipped | **110 bf16 ULP** | **2.095** | **255 bf16 ULP** |
+| host's two intermediate roundings COLLAPSED to the seam's shape | 8 ULP | 0.0596 | **0 — bit-identical** |
+
+The second row is an attribution mutation, applied to the **host** reference and
+restored `sha256`-verified. It removes exactly two roundings:
+
+1. `RmsNorm`'s cast back to the weight dtype **before** the affine multiply —
+   `Store(Store(normed) * w)` becomes `Store(normed * w)`. That is
+   `normalization.py:605-606`, which our host arm mirrors on purpose and
+   `vt::RmsNorm` deliberately does not (`include/vt/ops.h`: the standard path
+   "keeps full f32 precision (no `x.to(weight.dtype)` rounding before the weight
+   multiply)").
+2. SiLU's own store before the `* up` multiply — `Store(Store(silu) * up)`
+   becomes `Store(silu * up)`. torch computes `F.silu(gate)` into a **bf16
+   tensor** and then multiplies, so upstream rounds there too; `vt::SiluAndMul`
+   computes the whole expression in f32 and rounds once.
+
+**So ~97 % of the mean deviation is rounding POLARITY inside two shared ops, not
+the accumulator, not the reduction order and not the dtype.** The accumulator and
+reduction-order terms §17.4 led with are the 0.0596 ULP remainder, which is the
+order of magnitude first principles predict for f32-vs-f64 accumulation over 64
+terms. §17.4's reason (3) was right and was ranked third; reasons (1) and (2) are
+real and are nearly invisible beside it.
+
+**The counterfactual is the strongest statement this row has: with the roundings
+aligned, the composed device stage is BIT-IDENTICAL to the host arm over 448
+values.** The port's algebra — the merged `[3H, H]` and `[2I, H]` layouts, the
+cache indexing, the batch-2 sequencing, the attention identity — is therefore
+exactly right, and the entire remaining difference lives inside two `vt` kernels.
+
+#### What this changes about the row, said plainly
+
+**The blocker was never the dtype, and it is not the dtype now.** §14.5 named the
+dtype; §17.2 settled it and the settlement stands. What the measurement exposes
+is a different obstacle: **the shared seam cannot express the reference's
+rounding polarity**, and it cannot be worked around at the call site, because
+`vt` has no elementwise or row-broadcast multiply — `MulScalar` takes a scalar
+and `MulColVecF32` is an f32 in-place column scale. Expressing
+`Store(normed) * w` or `Store(silu) * up` therefore needs a seam extension
+(a `vt::Mul` with the two operand shapes `vt::Add` already accepts, or
+rounding-faithful variants of `vt::RmsNorm` and `vt::SiluAndMul`), with CPU and
+CUDA providers and its own gates. That is its own row and it is NOT taken here.
+
+**What is consequently NOT claimed.** No parity claim, and no speed number. The
+row's numeric gate bounds an attributed divergence; it does not prove agreement
+with the reference. The decisive gate is `test_minimax_music3_ar_real` — the
+full-scale bf16 companion against the committed oracle goldens — run with the
+device arm, and it needs the 28.5 GB checkpoint. It has NOT been run, and until
+it has, `AGENTS.md`'s "establish the declared token-exact gate before you accept
+a performance result" forbids quoting a Thor A/B for this arm. The A/B is
+therefore **blocked on correctness, not on the box**, and that is why this row
+lands without one.
+
+The stake is measurable rather than speculative: the header of
+`minimax_music3_ar.h` records that an **fp32** depth forward left 448 450 of
+716 800 committed golden values beyond one bf16 ULP, at mean absolute error
+2.65e-03. A seam that keeps f32 through two roundings per layer is a step in that
+direction, and whether it lands inside the full-scale gate's tolerance is exactly
+what has not been measured.
+
+#### One instrument defect, found inside this row, and it printed a clean green
+
+The mutation runner restored the tree with `tar x`, which sets mtimes **from the
+archive** — i.e. from before the mutation. The restored source was therefore
+OLDER than the object ninja had built from the mutated one, **ninja skipped the
+rebuild, and the next run reported 35/35 cases and 508/508 assertions SUCCESS
+while executing the MUTATED binary**. `git diff --name-only` could not see it
+either, because after restoration the file matches `HEAD` byte for byte and a
+`sha256sum` of the source says — correctly, and uselessly — that the source is
+pristine.
+
+That is `.agents/verification.md`'s "a copied build directory rebuilds the
+original sources" arriving from the other side, and it is the same shape as
+§16.6a: **whenever an artifact is required to have changed, assert that it
+changed rather than that its inputs did.** The runner now restores with `tar xm`,
+touches every source, and rebuilds before declaring the mutation over. The
+numbers in the table above were re-taken on a forced rebuild.
+
+### 17.5 Reachability — the #1131 trap, named before it is fallen into
+
+[#1131](https://github.com/mudler/vllm.cpp/issues/1131) is this exact failure for
+the DiT arm: its kernels and staging are gated, its **production switch** is not,
+and setting `on_device = false` leaves every suite green. The reason it happened
+is structural rather than careless — the CUDA arm needs a GPU that CI does not
+have, so the natural gate is a unit test of the forward, and a unit test of the
+forward is exactly what cannot see the switch.
+
+**The way out is that every op this arm uses has a CPU provider.** So the device
+forward runs on a `vt::Queue` whose device is `kCPU`, with no GPU and no
+checkpoint, and CI can drive it **through the production call site**:
+
+1. `Music3DepthStage` takes a `Music3DepthDeviceArm` (queue + staged weights).
+   Non-null selects `DepthDecoderAppendDevice`; null keeps the host loop.
+2. `MiniMaxMusic3SpeechEngine` stages the arm when `queue_.device.type !=
+   kCPU`, which is the **default** on `--speech-device 1` — the same switch
+   `StageMusic3DitWeights` already rides
+   (`minimax_music3_speech.cpp:634-640`).
+3. The CI gate constructs the arm on a **CPU queue** and drives
+   `Music3DepthStage`, asserting (a) agreement with the host arm inside §17.4's
+   band, (b) identical drawn codes, and (c) that the device path was **taken** —
+   a counter, not an inference from the numbers, because the two arms agree
+   numerically by design. That last assertion is the one #1131 says is missing,
+   quoted in its own words: the gate "must assert the device path was TAKEN
+   (invocation count or resident dtype), not merely that outputs agree".
+4. The reachability mutation deletes the production selection in a scratch copy
+   and the focused gate must go **RED**.
+
+### 17.6 Gates and evidence this row owes
+
+| leg | where | what it proves |
+|---|---|---|
+| numeric agreement, CPU queue | `tests/vllm/models/test_minimax_music3_ar.cpp` | the composition, at reduced geometry, in CI, no GPU |
+| composition + drawn codes | same | a dropped stage a tolerance cannot see |
+| device path TAKEN | same | the #1131 hole |
+| numeric agreement, CUDA | `thor:gpu0` under `rc` | the kernels the CPU provider does not exercise |
+| stage A/B + wall | `thor:gpu0` under `rc` | the reason the row exists |
+| WAV identity | `thor:gpu0` under `rc` | that it is inaudible in the product — **within** §17.4's band, so a HASH pair is not available here and an RMS/peak/max-abs comparison replaces it |
+
+**The A/B's own preconditions, which §16.6a paid for.** Two source trees, two
+build dirs, both binaries' `sha256` printed and a hard failure when they are
+**equal**; the checkpoint staged to local disk with `SRC_BYTES == DST_BYTES`
+asserted; `uptime` on both sides; alternating pairs; the loudest pair kept. The
+**call count is the control**: an arm that cannot move the counter cannot contain
+the change.
+
+### 17.7 Owed, named here rather than discovered later
+
+* The **audio heads, the CFG mix, the top-k draw and the fed-back projection**
+  stay on the host. They are ~1.6 % of the stage today; they become the stage's
+  remainder once the forward moves, and that is the next thing to measure rather
+  than to assume.
+* The **host arm's f32 weight containers** are unchanged (§17.2a). §16.7's lever 1
+  — bf16 host storage, bit-identical on the safetensors lineage and **not** on
+  the GGUF Q4_K one — is still open and is still not this row.
+* The **condition mix** is still host-side (§14.5). It runs once per window, not
+  once per step.
+* **Why Thor's stage ratios exceed x86's** is still a hypothesis (§16.6b) and
+  this row does not settle it.
+
+### 17.8 Stop conditions
+
+Stop and report rather than widening scope if: the CUDA arm's disagreement with
+the host arm exceeds §17.4's band and the cause is not one of that section's
+three; `vt::AttentionCross` refuses this geometry; the staged bf16 weights do not
+fit beside the 8.6 B language model on the measurement box; or the A/B's
+`ARMS_DIFFER` guard fires.

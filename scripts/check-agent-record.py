@@ -623,6 +623,9 @@ ENGINE_PREFIXES = (
 # MEASURED: 64 KB of ordinary English prose costs 25.3 s through the committed
 # Mistral golden against HF `tokenizers` 0.22.2's 10.1 ms on the same file for
 # byte-identical identifiers, and the fit over 1 KB to 64 KB has exponent 2.01.
+# Those are contended minima on a 20-core box at load 4-90, not idle-host
+# constants; the spec's `## Gates` owes the idle-host re-measure. The exponent,
+# not the constant, is what makes this a row.
 # `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
 # Bumped for a real new row, never to make a failing state transition pass.
 ENGINE_ROWS = 168

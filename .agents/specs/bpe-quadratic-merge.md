@@ -86,7 +86,7 @@ Out of scope, each with a stated reason:
 ## Our baseline
 
 Every figure below was measured on an AMD Ryzen 9 9950X3D (20 cores) at `-O2`,
-against a driver built from this tree's own tokenizer sources. **Two harnesses
+against a driver built from this tree's own tokenizer sources. **Three harnesses
 produced them and the tables say which.**
 
 - **Harness A**, the one that found the defect: `BpeSplit` alone, against the
@@ -99,10 +99,19 @@ produced them and the tables say which.**
   idle: another session was compiling throughout, which is why the minimum of a
   repetition set is reported rather than a mean. The minimum is the least
   contended estimate available, not a claim of an idle host.
+- **Harness C**, the confirmation: the same Harness B binaries re-run on
+  2026-08-19 at load average 23 to 57, which is BUSIER than either earlier run.
+  It exists to answer one question, whether the recorded constants reproduce.
+  They do not, and the direction is the one contention predicts: `a` x 65,535
+  read 37,564.80 ms against Harness B's 24,358.86 ms, a 54% inflation at roughly
+  double the load. The growth ratios it re-derived are in `## Tests to port`
+  item 3 and they replace the figures a previous revision recorded there.
 
-The **shape** is what both harnesses agree on, and it is the result. A
-same-binary idle-host re-measure still belongs to the implementing row, and
-`## Gates` requires it before any speed claim is accepted.
+The **shape** is what all three harnesses agree on, and it is the result. Every
+absolute figure below is a contended minimum, and Harness C is the evidence that
+none of them is quotable as a constant: the same input on the same binary moved
+54% on load alone. A same-binary idle-host re-measure still belongs to the
+implementing row, and `## Gates` requires it before any speed claim is accepted.
 
 ### The benchmark prompts that found it
 
@@ -600,31 +609,53 @@ prove after.
    Encode at n and at 4n and assert the ratio sits below a bound that quadratic
    growth cannot satisfy and the implemented algorithm can. **Use a step of at
    least 4x, and take the minimum of k repetitions rather than one shot.** Both
-   requirements were measured, because a first revision of this spec specified a
-   2x single-shot ratio and called it "the assertion that survives a slow
-   runner", which is backwards:
+   requirements are measured below, and so is the limit of what they buy:
 
-   - **A 2x single shot has about 1.6x of usable band.** Eight independent
-     single-shot pairs of the prototype at 131,072 and 262,144 bytes, load
-     average 20 to 30, gave ratios 1.862, 2.291, 2.303, 2.219, 2.508, 2.331,
-     2.395
-     and 2.336, a 35% spread over the minimum. Linearithmic predicts ~2.1 and
-     quadratic 4.0, so the band a bound may sit in is (2.51, 4.0). The two
-     halves are separate, independently preemptible measurement windows. They do
-     **not** move together, and one deschedule in the 2n half crosses 4.0.
-   - **A 4x step with min-of-8 has about 2.7x, and is four times more stable.**
-     Four independent min-of-8 sweeps at 65,536 and 262,144 bytes on the same
-     box gave 5.51, 5.74, 6.01 and 6.03, a 9% spread. Quadratic predicts 16,
-     so the band is (6.03, 16).
+   - **A 2x step cannot separate the two algorithms at all under load.** Eight
+     independent min-of-8 sweeps of the prototype at 131,072 and 262,144 bytes,
+     load average 50 to 57 on the 20-core box, 2026-08-19, gave 3.328, 2.525,
+     1.573, 4.414, 1.485, 3.193, 1.916 and 1.372. Quadratic growth predicts
+     4.0, and **the observed maximum 4.414 is already above it**. A 2x
+     assertion therefore fires on the correct algorithm before it ever fires on
+     the defect, which is why the step has to be at least 4x.
+   - **A 4x step still separates, with about 1.8x of margin.** Eight
+     independent min-of-8 sweeps at 65,536 and 262,144 bytes, same binary, same
+     session, same load, gave 7.202, 8.920, 4.182, 2.800, 6.626, 4.198, 4.507
+     and 8.586. Quadratic predicts 16 and the observed maximum is 8.920, so a
+     bound sits in (8.92, 16).
 
-   The red side is measured on the current code at the same shape: 8,000 to
-   32,000 bytes costs 16.74x, against the 16x `n^2` predicts. The prototype's
-   5.5 to 6.0 is above the ~4.6 that `n log n` predicts because the prototype
-   still builds a string key and a merged string per candidate. The interned
-   implementation removes both, so **the implementing row re-derives the bound
-   from min-of-k sweeps on its own code** and records the sweep, the `k`, and
-   the host load beside it. A bound copied from the prototype is not a bound for
-   the implementation.
+   **Min-of-k is necessary and it is not sufficient, and this spec no longer
+   claims otherwise.** A first revision specified a 2x single-shot ratio and
+   called it "the assertion that survives a slow runner"; a second replaced that
+   with a 4x min-of-8 sweep and certified a 9% spread and a (6.03, 16) band from
+   four sweeps. Neither figure reproduced. The eight-sweep re-derivation above,
+   taken at load 50 to 57 rather than the earlier revision's lighter and
+   unrecorded load, spreads 3.2x at both step sizes. The two halves of a ratio
+   are separate, independently preemptible measurement windows, and taking a
+   minimum inside each half does not make them move together. **The stability of
+   this assertion on a contended runner is therefore UNESTABLISHED**, and the
+   claim that a 4x step is "four times more stable" is withdrawn rather than
+   restated with a new number.
+
+   The red side, re-derived on the current code at the same shape and load,
+   min-of-3, four sweeps: 8,000 to 32,000 bytes costs 12.680, 14.740, 16.468 and
+   15.276, against the 16x `n^2` predicts. Placing that beside the prototype's
+   worst gives the real picture: **the window between the prototype's slowest
+   ratio, 8.920, and the current code's fastest, 12.680, is 1.42x.** That is the
+   whole budget this assertion has on a loaded host, and it is the reason item 2
+   and not this item is the robust gate.
+
+   Two obligations follow for the implementing row. It **re-derives the bound
+   from min-of-k sweeps on its own code**, because the interned implementation
+   removes the string key and the merged string the prototype still builds and
+   should sit nearer the ~4.6 that `n log n` predicts than the prototype's 2.8
+   to 8.9. And it records the sweep, the `k`, the load average, and the host
+   beside the bound, so that the next reader can tell a real regression from a
+   busy box. A bound copied from the prototype is not a bound for the
+   implementation, and a bound derived on a loaded host is not a bound at all.
+   If the assertion cannot be made to hold with margin on the CI runner, it
+   lands `SKIP`-ped with this paragraph as the reason rather than tuned until it
+   passes.
 4. **The leftmost tie.** Extend the existing `test_bpe.cpp` case into one that
    distinguishes the two orders on a longer symbol list.
 5. **A stale-entry case.** A merge sequence where a queued candidate is

@@ -614,8 +614,14 @@ nvcc 13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110`, 32 `.cu.o`
 objects — at source `79dc6b5bd`:
 `tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` ran **5 cases, 2066
 assertions, 0 failed, exit 0**, every driver again reading `0 differing, 4
-replays`, and `tests/vt/test_breakable_graph.cpp` ran 265 assertions on the same
-device.
+replays`. On the same device and in the same job: the full CUDA library built
+clean (`lib_rc=0`, 742 targets), `tests/vt/test_breakable_graph.cpp` ran 30 cases
+and 265 assertions, and `tests/vllm/models/test_qwen3_dflash_decode_graph_seam.cpp`
+ran **4 cases, 23 assertions, exit 0** — so W5's own driver gate, including the
+#1352 child-process arm, is green on a CUDA build and not only on this box's CPU
+one. That last line is a build-and-routing result rather than a replay one: the
+DFlash case still runs against the CPU harness inside that binary, which is why
+G1 for that driver stays owed below.
 
 **THE ONE THING A GREEN BUILD COULD NOT HAVE TOLD US was measured separately.**
 Laguna's capture class is inside `#ifdef VT_MARLIN_NVFP4`, so "the CUDA build

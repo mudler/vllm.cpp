@@ -484,9 +484,22 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
 
 ## Owed
 
-- **The device-resident `ptb` and `mod` passes.** `Ltx2DitForwardDevice` takes
-  no `perturbations`. Owned by this row's follow-up issue; refused by name until
-  then.
+- ~~**The device-resident `ptb` and `mod` passes.**~~ CLOSED by §12 on
+  2026-08-19. `Ltx2DitForwardDevice` takes `perturbations` and honours all four
+  fields, and the two refusals that stood in for it are gone.
+- **Link B of §12.8 — the device branch of the x0 model's ternary is entered by
+  no test on a box without an accelerator.** `Ltx2VideoEngine::Load` refuses
+  `device != 0` where no accelerator backend is registered, and no CI job here
+  has a GPU runner, so mutation D10 (drop `p` from that one branch) is GREEN on
+  this host. Owned by this row under
+  [#1092](https://github.com/mudler/vllm.cpp/issues/1092) until a leased run
+  renders `one_stage` on `device = 1` at the model's own guider defaults and
+  records `dit_forwards == 4 * dit_evaluations`. The same shape
+  [#1131](https://github.com/mudler/vllm.cpp/issues/1131) records for
+  MiniMax-Music3.
+- **The 2.0x forward-count cost of §12.5, unmeasured on hardware.** 120 forwards
+  where #1375 measured 60, at ~162 s/forward on GB10 at 1024x576. Arithmetic,
+  not a measurement: nothing here ran it.
 - **The other four pipelines** — `a2vid_two_stage`, `ti2vid_two_stages`
   ([#1093](https://github.com/mudler/vllm.cpp/issues/1093)),
   `ti2vid_two_stages_hq` (#921),
@@ -657,8 +670,275 @@ so the edits were applied by a script that asserts the expected hit count per
 replacement and refuses the whole run on a mismatch — two of the 43 planned edits
 were caught that way and re-derived.
 
+## 12. The device-resident perturbed forward — the owed half of #1092
+
+Added 2026-08-19, base `origin/main` @ `96ed8346f`. Upstream pin unchanged:
+Lightricks/LTX-2 `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`, verified with
+`git rev-parse HEAD` in `/home/mudler/_git/LTX-2` on 2026-08-19.
+
+§11 landed the guided denoiser. It landed with one arm missing, recorded under
+`## Owed` and refused by name: `Ltx2DitForwardDevice` took no `perturbations`
+argument, so on `device != 0` the `ptb` and `mod` passes could not run and the
+render was refused rather than served an unperturbed forward. This section is
+that arm.
+
+### 12.1 What the refusal cost, measured
+
+The first full-model render reached a DiT forward on 2026-08-19 (run
+`20260819T150230Z`, `dgx:gpu0`, GB10, [#1375](https://github.com/mudler/vllm.cpp/issues/1375)).
+Its configuration line reads `one_stage --device cuda`, 1024x576/25f, **"STG off
+and modality 1.0 (the device arm refuses a perturbed forward, #1092)"**. So the
+only arm that can hold the 21.004 B model ran with two of upstream's four
+guidance terms pinned to their identity values:
+
+| field | model default (`ltx2_pipeline.cpp:947-963`) | what the render had to use |
+|---|---|---|
+| `video_guider.stg_scale` | 1.0 | 0.0 |
+| `audio_guider.stg_scale` | 1.0 | 0.0 |
+| `video_guider.modality_scale` | 3.0 | 1.0 |
+| `audio_guider.modality_scale` | 3.0 | 1.0 |
+
+That is the same defect this row exists for, one residency down: a finite clip of
+the right size and frame count, denoised along a different trajectory than
+upstream's.
+
+### 12.2 Scope
+
+**In.** `Ltx2DitForwardDevice` grows the `const Ltx2DitPerturbation*` parameter
+the host forward already has, and honours all four of its fields on the device
+arm. The two refusals that stood in for it are removed. The refusals the HOST arm
+carries for the same states are mirrored rather than dropped.
+
+**Out.** Nothing new. The device arm inherits exactly the port boundary the host
+arm already has: no `BatchedPerturbationConfig` partial blend, no batch > 1
+(both degenerate at `Ltx2ModalityInput::batch == 1`), and the prompt-K/V cache
+stays refused on this arm for the reason `ltx2_device.h` already gives.
+
+### 12.3 Upstream chain, re-derived at the pin
+
+Read at `fd4ded7f` in `/home/mudler/_git/LTX-2`, from the sentence making each
+claim rather than out of a cited span:
+
+| Upstream | Line | What it says |
+|---|---|---|
+| `ltx-core .../transformer/attention.py` | `:556` | `context = x if context is None else context` |
+| | `:557` | `use_attention = not all_perturbed` |
+| | `:559` | `v = self.to_v(context)` — computed on BOTH paths |
+| | `:561-562` | `if not use_attention: out = v` |
+| | `:564-565` | `q = self.to_q(x)`, `k = self.to_k(context)` — the skipped half |
+| | `:573` | `out = out * perturbation_mask + v * (1 - perturbation_mask)` — the partial blend, unported, degenerate at batch 1 |
+| | `:576` | the per-head gate, applied on BOTH paths |
+| | `:579` | `return self.to_out(out)` — on BOTH paths |
+| `ltx-core .../transformer/transformer.py` | `:268-269` | `run_a2v` / `run_v2a`, which test PRESENCE and not `enabled` |
+| | `:335` | `if run_a2v and not video.cross_attn_skip_all` |
+| | `:367` | `if run_v2a and not audio.cross_attn_skip_all` |
+| `ltx-core .../transformer/transformer_args.py` | `:99-102, :112-118` | `BlockPerturbationsProcessor` — `cross_attn_skip_all` is `all_in_batch(cross_type, block)`, so at batch 1 it is the flag itself |
+| `ltx-core .../transformer/model.py` | `:442-458` | which perturbation type reaches which stream: `SKIP_A2V_CROSS_ATTN` rides the VIDEO args, `SKIP_V2A_CROSS_ATTN` the AUDIO args |
+| | `:493`, `:509-511` | the `perturbations` argument, and `None` meaning "perturb nothing" |
+| `ltx-pipelines utils/denoisers.py` | `:100-137` | the four passes, in that order |
+| | `:182-187` | the `BatchedPerturbationConfig` built over the pass list |
+
+**Upstream does not share work between the legs.** `_guided_denoise`'s own
+docstring says it "batches all guidance passes into one transformer call": it
+`torch.cat`s the per-pass contexts, `_repeat_state`s the latent `n` times and
+issues ONE forward at batch `n * B` (`denoisers.py:145-190`), then `chunk(n)`s
+the result. The FLOPs are `n` times the conditional pass either way, and
+`BatchSplitAdapter` is upstream's own documented option to "split this batch into
+sequential chunks internally" (`denoisers.py:66-70`). This port runs the passes
+sequentially at batch 1, which is that shape. Nothing is shared and nothing is
+lost.
+
+### 12.4 Design
+
+**One parameter, mirroring the host signature.**
+
+```
+Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue&, const Ltx2DitParams&,
+                                    const Ltx2DitWeights&, const Ltx2ModalityInput* video,
+                                    const Ltx2ModalityInput* audio, vt::DType compute_dtype,
+                                    Ltx2PromptKvCache* cache = nullptr,
+                                    const Ltx2DitPerturbation* perturbations = nullptr);
+```
+
+Three mechanical changes behind it, each the device twin of a host site that
+already exists and is gated:
+
+1. `AttnArgsDev::all_perturbed`, read in `AttentionDev` as `attention.py:557`.
+   The value projection is computed first (`:559`), and when the flag is set the
+   function returns through a shared epilogue carrying `v` — so `to_q`, `to_k`,
+   the q/k RMSNorms, RoPE and the scores never run, and the gate and `to_out`
+   still do. The epilogue is FACTORED, not duplicated, for the reason
+   `ltx2.cpp:825-829` already gives on the host arm: a perturbed pass that
+   skipped `to_out` returns a tensor of the right shape in the wrong width-space
+   and the block would add it to the residual and render.
+2. `BlockArgsDev` grows the same four fields `Ltx2BlockArgs` has, and
+   `BlockForwardDev`'s `if (run_a2v)` / `if (run_v2a)` become
+   `if (run_a2v && !args.video_cross_attn_skip_all)` /
+   `if (run_v2a && !args.audio_cross_attn_skip_all)`. The `vx_pre` / `ax_pre`
+   snapshot stays OUTSIDE both guards, as `transformer.py:333`'s `vx_pre_av = vx`
+   does, so a pass that skips one direction still lets the other read the
+   pre-cross state.
+3. `Ltx2DitForwardDevice` validates the vectors exactly as `ltx2_dit.cpp:837-842`
+   does — neither empty nor `num_layers` long is refused — and fills the block
+   args per layer.
+
+**Two refusals go away and one arrives.**
+
+- `ltx2_video.cpp`'s pre-loop `if (im.on_device && wants_perturbation) Fail(...)`
+  is deleted, because the sentence it makes is no longer true.
+- The `VT_CHECK(!im.on_device || p == nullptr, ...)` inside the x0 model is
+  deleted for the same reason, and the argument it guarded is passed.
+- `AttentionDev` gains the host arm's own refusal: `all_perturbed` on a CROSS
+  call. `Ltx2DitPerturbation` has no cross-attention self-perturbation type, and
+  a cross call carrying the flag would be served the self-attention rule.
+
+Nothing is weakened into silence. Every state the host arm refuses, the device
+arm refuses with the same text.
+
+### 12.5 Cost, stated before it is discovered
+
+**Forward count.** `#1375` measured 60 forwards as structural for a 30-step
+`one_stage` render: 30 steps x 2, cond + uncond, because the refusal pinned the
+other two guiders to identity. With the model's own defaults every step assembles
+all four passes (`denoisers.py:100-137`), so the same render becomes **30 x 4 =
+120 forwards**. At the ~162 s/forward that run measured on GB10 at 1024x576 that
+is ~5.4 h of denoise where it was ~2.7 h — **2.0x**, not the 1.5x a third leg
+alone would cost.
+
+This is upstream's own default and correctness comes first, so it is not traded
+away. The two extras that were the workaround remain the way to buy the time
+back: `video_stg_guidance_scale=0` / `audio_stg_guidance_scale=0` drops the `ptb`
+pass and `a2v_guidance_scale=1` / `v2a_guidance_scale=1` drops `mod`, taking the
+render back to 60 forwards at the trajectory it has today. What changes is which
+of the two is the DEFAULT.
+
+**Device memory: no increase, and the direction is down.** A perturbed
+self-attention allocates strictly FEWER device buffers than an unperturbed one —
+no `qb`, `qn`, `kb`, `kn` and no `attn`; the value projection is reused — and a
+skipped cross direction allocates none of its six. The passes run one at a time,
+so the forward's peak concurrent scratch is unchanged for `cond`/`uncond` and
+lower for `ptb`/`mod`. `#1375` recorded `OWN_DEMAND=74.907 GiB` and
+`min_avail=39.97 GiB` for the two-pass configuration; the four-pass one asks the
+device for no more than that. Not measured on hardware here — see §12.8.
+
+**Host memory: two more pass slots.** `Ltx2GuidedDenoiseResult` already carries
+four slots and the device arm fills two of them; it will fill four. The delta is
+`2 x (video_tokens x out_channels + audio_tokens x audio_out_channels) x 4 bytes`
+for the x0 tensors and the same again for the velocities. At the shipped latent
+geometry that is single-digit MiB against a 21 B model, and it is the same
+quantity the host arm has carried since `daeff67f2`.
+
+### 12.6 Tests
+
+The gate is the one `test_ltx2_device.cpp:486` already argues for: "Registering
+on kCPU is what lets the whole device-forward CODE PATH be covered without a GPU,
+so a GPU gates the KERNELS and not the port."
+
+**T1 — the device arm tracks the HOST arm on every perturbation shape.**
+`Ltx2DitForward` (f32, host) against `Ltx2DitForwardDevice` (f32, CPU backend) on
+identical inputs, for five configurations: unperturbed, video self-attn on block
+0, audio self-attn on block 0, `SKIP_A2V_CROSS_ATTN`, `SKIP_V2A_CROSS_ATTN`, and
+the `mod` pass's own both-directions form. Each row asserts TWO things, because
+either alone is passable by a defect:
+
+- **agreement** — `max|device - host| < kDeviceRoundOff`, the same 2e-5 the
+  existing host-tracking case uses;
+- **non-vacuity** — `max|perturbed - unperturbed| > kDeviceRoundOff` on the
+  stream the perturbation writes, so a device arm that accepted the argument and
+  ignored it cannot pass by agreeing with a host arm it never diverged from.
+
+The second half is the one that is RED before the change.
+
+**T2 — each CROSS perturbation gates ITS OWN direction and no other.** The
+device twin of §7.5, and it exists for the same measured reason: against the
+host arm, mutations M12, M13 and M15 (apply one flag, or swap which flag gates
+which direction) were all GREEN until a direct per-direction case existed.
+Separation comes from upstream's own predicates (`transformer.py:268-269`): with
+`audio->enabled = false` and the audio stream still PRESENT, A2V runs and V2A
+does not, and the reverse. Each row asserts that the flag for that direction
+MOVES the written stream and that the flag for the other direction leaves it
+**bit-identical**, which is what makes the swap detectable and not only the
+omission.
+
+**T3 — the refusals.** A wrong-length perturbation vector is refused by name. A
+CROSS call carrying `all_perturbed` is refused by name. Both mirror the host
+arm's text.
+
+**T4 — reachability, and its limit.** See §12.8. The end-to-end device case is
+conditional on an accelerator backend and this host has none.
+
+### 12.7 The mutations this gate must survive
+
+| # | Mutation | Must go RED at |
+|---|---|---|
+| D1 | `Ltx2DitForwardDevice` accepts `perturbations` and ignores it | T1 non-vacuity, every row |
+| D2 | the device self-attention ignores `all_perturbed` | T1 video / audio self-attn rows |
+| D3 | the device arm ignores `video_cross_attn_skip_all` | T2 A2V row |
+| D4 | the device arm ignores `audio_cross_attn_skip_all` | T2 V2A row |
+| D5 | the device arm SWAPS which flag gates which direction | T2 both rows |
+| D6 | the perturbed path returns `v` WITHOUT `to_out` | T1 agreement, every perturbed row |
+| D7 | the perturbed path skips the per-head gate | T1 agreement, every perturbed row |
+| D8 | the wrong-length vector check deleted | T3 |
+| D9 | the `vx_pre` / `ax_pre` snapshot moved INSIDE the direction guards | T2 both rows |
+| D10 | the production call site drops `p` on the device arm | see §12.8 — GREEN on a box with no accelerator, and that is reported rather than hidden |
+
+Each mutation reports four facts: `BUILT=YES/NO`, the compiler error count,
+`git diff --stat` proving it applied, and the failing assertion by name. A
+mutation that fails to build reads exactly like a passing test.
+
+### 12.8 Reachability, and what this host cannot prove
+
+**The production chain, by hand.** `vllm_video_engine_load` ->
+`vllm::multimodal::LoadVideoEngine` -> `Ltx2VideoEngine::Load`, which sets
+`im.on_device = params.device != 0` (`ltx2_video.cpp:745`) and stages the DiT
+with `Ltx2StreamDitToDevice` (`:847`) -> `Generate` -> the phase loop ->
+`Ltx2GuidedDenoise(x0_model, denoise_in)` -> the `x0_model` lambda ->
+`Ltx2DitForwardDevice(..., p)`. Every hop is on the DEFAULT configuration of
+`pipeline_kind = one_stage`, whose guiders are `stg_scale = 1.0` and
+`modality_scale = 3.0`, so `p` is non-null on the `ptb` and `mod` passes without
+any request extra.
+
+**What a test can enter through, here.** Nothing. `Ltx2VideoEngine::Load` refuses
+`device != 0` unless the platform seam resolves a REGISTERED accelerator backend
+(`ltx2_video.cpp:749-758`), and it refuses a partial backend beside that
+(`:779-788`). This build registers neither, no CI job in `.github/workflows/ci.yml`
+has a GPU runner, and this row is explicitly barred from taking a lease. So the
+last link of the chain — the ternary that selects `Ltx2DitForwardDevice` over
+`Ltx2DitForward` — is not executable on this host or in CI.
+
+**Stated as a result, not as an omission.** Mutation D10 — delete `p` from the
+device branch of the x0 model's ternary — is **GREEN** here, and it is green for
+lack of hardware rather than for lack of a test. The three links, separately:
+
+| Link | What it is | Gated by |
+|---|---|---|
+| A | entry point -> the x0 model, carrying `p` | the existing end-to-end `one_stage` guidance case, on the host arm. Deleting `p` from the lambda's argument list reds it. |
+| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **nothing on this host.** The residual. |
+| C | `Ltx2DitForwardDevice` honours `p` | T1, T2, T3 — new, and RED before this change |
+
+Link C is what did not exist at all before this section, and it is the whole of
+what a box without a GPU can hold. Link B is one argument in one ternary whose
+other branch IS gated, and it is listed under `## Owed` with the issue that owns
+measuring it on hardware. This is the shape
+[#1131](https://github.com/mudler/vllm.cpp/issues/1131) already records for
+MiniMax-Music3 — "the DiT device arm's production SWITCH is unreachable from any
+test" — and naming it is the difference between a staged link and dead code.
+
+### 12.9 Stop conditions
+
+- Stop and report `NEEDS_DECISION` if honouring the model defaults on the device
+  arm is judged too expensive to be the default. The row does not make that
+  trade itself: correctness first is the rule, and the two extras that buy the
+  time back already exist and are documented.
+- Stop if any perturbation shape cannot be served on the device arm. Refuse it by
+  name and record it; never run an unperturbed forward where the recipe asked for
+  a perturbed one.
+
 ## Now
 
-The fresh review returned CHANGES REQUESTED; the blocking finding and the nine
-non-blocking ones this repair owns are answered on the branch (§11.1), the branch
-is merged up to `origin/main`, and the row awaits a second fresh review.
+§1-§11 landed at `daeff67f2`. [#1092](https://github.com/mudler/vllm.cpp/issues/1092)
+stayed OPEN for the arm §1 recorded as owed: the device-resident `ptb` and `mod`
+passes. §12 is that arm, and it is what this change carries. The row stays
+`ACTIVE` rather than moving to `DONE`, because §12.8 link B and the §12.5 cost
+are both open and both listed under `## Owed`; neither can be closed without a
+GPU lease, which this change did not take.

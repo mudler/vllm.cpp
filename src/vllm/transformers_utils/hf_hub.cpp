@@ -366,9 +366,17 @@ std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
   // began failing the moment a token was set.
   const bool trust_oids = !opts.token.empty();
 
+  // The first entry of an identifier whose size the listing REPORTED. An entry
+  // that reports no size is never an owner, because it can neither agree nor
+  // disagree with a later entry, and keeping it would silence the size rule for
+  // that identifier for the rest of the listing.
+  //
+  // ONE owner is enough, rather than a list of every known-size entry, because
+  // size equality is transitive: every later known size is compared against the
+  // first one, so two entries that disagree with each other cannot both agree
+  // with it. The list would cost memory and buy no refusal.
   struct OidOwner {
     std::string path;
-    bool size_known = false;
     uint64_t size = 0;
   };
 
@@ -390,15 +398,14 @@ std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
     // top level is therefore read first and `lfs.size` is the fallback for a
     // listing that omits it. `lfs.pointerSize` is the size of the pointer file
     // and is never the content size, so it is not read.
-    bool size_known = false;
+    // `HfFile::size` stays empty when the listing reports no size, so that an
+    // unreported size and a zero-byte file stay different facts.
     if (item.contains("size") && item["size"].is_number_unsigned()) {
       file.size = item["size"].get<uint64_t>();
-      size_known = true;
     } else if (item.contains("lfs") && item["lfs"].is_object() &&
                item["lfs"].contains("size") &&
                item["lfs"]["size"].is_number_unsigned()) {
       file.size = item["lfs"]["size"].get<uint64_t>();
-      size_known = true;
     }
 
     // Read the identifier whatever the token says, because the checks below
@@ -429,20 +436,26 @@ std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
             "answering the truth about this repository. The listing is not "
             "usable.");
       }
-      const auto [it, inserted] =
-          oid_owner.emplace(oid, OidOwner{file.path, size_known, file.size});
       // RULE 1, the size disagreement. Two files sharing an identifier is
       // LEGITIMATE: `lfs.oid` is the sha256 of the contents and the plain
       // `oid` is the git blob sha1, so two byte-identical files in one
       // repository share one identifier by construction. What no content hash
       // can do is name two different sizes.
-      if (!inserted && it->second.path != file.path && it->second.size_known &&
-          size_known && it->second.size != file.size) {
+      //
+      // The rule asks nothing about the PATH. One path listed twice at two
+      // different sizes is self contradictory whichever entry is believed, and
+      // exempting it would exempt the exact shape this rule exists to catch.
+      const auto it = oid_owner.find(oid);
+      if (it == oid_owner.end()) {
+        if (file.size.has_value()) {
+          oid_owner.emplace(oid, OidOwner{file.path, *file.size});
+        }
+      } else if (file.size.has_value() && it->second.size != *file.size) {
         throw std::runtime_error(
             "vllm.cpp: the tree listing for repository '" + repo_id +
             "' gives object identifier " + oid + " to '" + it->second.path +
             "' at " + std::to_string(it->second.size) + " bytes and to '" +
-            file.path + "' at " + std::to_string(file.size) +
+            file.path + "' at " + std::to_string(*file.size) +
             " bytes. One content hash cannot name two different sizes. The "
             "listing is not usable.");
       }

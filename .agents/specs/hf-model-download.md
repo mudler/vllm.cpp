@@ -2,6 +2,9 @@
 
 Row `ENG-HF-MODEL-DOWNLOAD` in [`engine-matrix.md`](../engine-matrix.md).
 Issue [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+The two holes the second review found in this row's tree-listing size rule are
+issue [#1339](https://github.com/mudler/vllm.cpp/issues/1339), repaired in the
+same flow.
 The quickstart page that consumes this row is issue
 [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
 
@@ -157,9 +160,11 @@ Integrity, and the one place this row does not port llama.cpp:
 
 - Treat `lfs.oid` as absent unless the request carried a token. This governs
   whether the identifier is USED as a blob name, and nothing else.
-- Refuse a listing in which two distinct files carry one object identifier and
-  disagree on size. Accept them when the sizes agree, because that is duplicate
-  content.
+- Refuse a listing whose entries share one object identifier and disagree on a
+  size the listing REPORTED, whether or not their paths differ. Accept them when
+  the reported sizes agree, because that is duplicate content. An entry that
+  reports no size is compared against nothing and can never satisfy the rule on
+  another entry's behalf.
 - Refuse an object identifier whose characters are all the same, for example one
   character repeated 64 times.
 - Neither refusal depends on the token.
@@ -216,6 +221,9 @@ protocol, reached through `HF_ENDPOINT`.
 | Gated repository | HTTP 401 names the repository and `HF_TOKEN` |
 | Token sent | The fake hub observes the `Authorization` header |
 | Fabricated object identifier | A tree where every file carries `"a"` 64 times is refused |
+| Size rule not disarmable | An unsized entry first, then two disagreeing sizes, is refused |
+| One path, two sizes | One path listed twice at 4096 and 2048 bytes is refused |
+| Unreported size | A zero-byte file and an entry with no size read differently |
 | Truncated body | A body shorter than `Content-Length` is refused |
 | Bad safetensors header | A file failing the data-end check is refused |
 | No symbolic link | The snapshot entry is a real file and the model loads |
@@ -256,6 +264,8 @@ byte for byte:
 | Delete the resolver call in `server_main.cpp` | The end-to-end case |
 | Range mismatch warns instead of failing | The range-ignored case |
 | Accept an all-identical object identifier listing | The fabricated-identifier case |
+| Own an identifier with an entry that reports no size | The not-disarmable case |
+| Restore the distinct-path guard on the size rule | The one-path-two-sizes case |
 | Remove index-driven selection | The decoy-file case |
 | Remove the offline short circuit | The offline cases |
 
@@ -372,6 +382,35 @@ that shape is always a broken instrument and never duplicate content. An
 identifier that is one character repeated is refused, because no content hash
 produces one, and it is exactly what was measured. Neither rule depends on the
 token. A shared identifier with an agreed size is accepted.
+
+**The size rule then shipped with two holes, and the second review caught
+both.** Issue [#1339](https://github.com/mudler/vllm.cpp/issues/1339) tracks
+them, and both are repaired in the same flow.
+
+The first shape was a DISARM. The rule kept the first entry carrying an
+identifier as that identifier's owner whatever its size state, and then compared
+only against an owner whose size was known, so a first entry that reported no
+size silenced the rule for that identifier for the rest of the listing. Every
+later entry under it was accepted at any size. `HF_ENDPOINT` is user
+configurable, so one omitted `size` field on a mirror bought an unconditional
+pass. The owner is now the first entry whose size the listing REPORTED, and an
+entry that reports none is never an owner. One owner is enough rather than a
+list of them, because size equality is transitive: two entries that disagree
+with each other cannot both agree with the first.
+
+The second shape was a distinct-path GUARD, `it->second.path != file.path`,
+which exempted one path listed twice. It was pinned by nothing, because the case
+named for it gave both entries one size and never reached the rule, and it
+contradicted the rule's own sentence. One path that is 4096 bytes and 2048 bytes
+in the same listing is self contradictory whichever entry is believed, and it is
+the exact shape the rule exists to catch. The guard is removed. A repeated path
+at an agreed size stays accepted, and the two cases now measure the boundary
+from both sides.
+
+`HfFile::size` is a `std::optional<uint64_t>` for the same reason. A plain
+`uint64_t` spells a zero-byte file and an unreported size both `0`, and W3 sizes
+a byte range and a resume offset from this field, so the ambiguity would have
+been inherited by the downloader rather than staying inside the listing.
 
 The size the size rule compares is the CONTENT size: the entry's top-level
 `size`, falling back to `lfs.size`. `lfs.pointerSize` is the size of the pointer

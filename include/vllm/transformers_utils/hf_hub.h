@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -52,7 +53,14 @@ struct HfFile {
   // The CONTENT size, read from the entry's top-level `size` and, when the
   // listing omits that, from `lfs.size`. Never `lfs.pointerSize`, which is the
   // size of the pointer file and is nearly equal for every shard.
-  uint64_t size = 0;
+  //
+  // EMPTY when the listing reported no size at all. It is an optional rather
+  // than a zero, because a zero-byte file and an unreported size are different
+  // facts and `0` spells both. A caller that sizes a byte range, a resume
+  // offset, or a completeness check from this field has to be able to tell
+  // them apart, and the size rule on `HubListRepoFiles` compares only the
+  // sizes the listing actually reported.
+  std::optional<uint64_t> size;
   // The large-file-storage object identifier, or empty.
   //
   // EMPTY UNLESS THE LISTING REQUEST CARRIED A TOKEN. On 17 August 2026 the

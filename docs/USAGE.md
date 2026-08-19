@@ -1826,14 +1826,23 @@ for each cache directory it happens in. The fetcher that calls it is W3 of the
 row, so nothing prints that line at this commit.
 
 A repository listing is refused, rather than partly used, when it fails either
-of two integrity checks. An object identifier given to two different files that
-disagree in size is refused, because no content hash names two sizes. An
-identifier whose characters are all the same, such as one character repeated 64
-times, is refused, because no content hash produces one and that is the value
-the hub was measured serving for a gated repository on 17 August 2026. Neither
-check depends on `HF_TOKEN`. Two files that share an identifier and agree on
-size are accepted, because that is duplicate content and a repository is
+of two integrity checks. An object identifier given to two entries that disagree
+on the size the listing reported for them is refused, because no content hash
+names two sizes. That holds whether or not the two entries name different paths:
+one path listed twice at two sizes is self contradictory whichever entry is
+believed. An identifier whose characters are all the same, such as one character
+repeated 64 times, is refused, because no content hash produces one and that is
+the value the hub was measured serving for a gated repository on 17 August 2026.
+Neither check depends on `HF_TOKEN`. Entries that share an identifier and agree
+on size are accepted, because that is duplicate content and a repository is
 allowed to hold it.
+
+The size check compares only the sizes a listing actually reported. It reads the
+entry's top-level `size` and falls back to `lfs.size`, never to `lfs.pointerSize`
+which is the size of the pointer file. An entry that reports no size is compared
+against nothing, and it cannot stand in as the reference for the entries that
+follow it, so a mirror named by `HF_ENDPOINT` cannot switch the check off by
+omitting one field.
 
 Two limits are worth stating plainly. No command-line surface reaches any of
 this yet, so setting `HF_TOKEN` today changes nothing a server does. And the

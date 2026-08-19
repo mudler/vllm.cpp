@@ -930,10 +930,13 @@ TEST_CASE("a malformed object identifier is dropped and the file is kept") {
   CHECK(files.at(2).oid == Sha256Like("c4"));
 }
 
-TEST_CASE("one identifier repeated on ONE path is not a duplicate") {
-  // The size rule is about two DIFFERENT files. The same file listed twice
-  // carries the same identifier and the same size by definition, and refusing
-  // that would turn a redundant listing into an unusable repository.
+TEST_CASE("ONE path listed twice at an agreed size is accepted") {
+  // The size rule refuses a DISAGREEMENT, not a repetition. A redundant
+  // listing that repeats one entry unchanged says nothing contradictory, so it
+  // stays usable. Its pair, "ONE path listed twice with disagreeing sizes is
+  // refused", serves this same repeated path at two sizes, so the two cases
+  // measure the rule's boundary rather than asserting that a repeated path is
+  // exempt from it.
   FakeHub hub;
   TempDir tmp;
   HfHubOptions opts = OptionsFor(hub, tmp.path());
@@ -951,4 +954,100 @@ TEST_CASE("one identifier repeated on ONE path is not a duplicate") {
   CHECK(files.at(1).path == "model.safetensors");
   CHECK(files.at(0).oid == oid);
   CHECK(files.at(1).oid == oid);
+}
+
+TEST_CASE("an entry that reports no size cannot disarm the size rule") {
+  // The rule keeps ONE owner per identifier, and an owner whose size the
+  // listing never reported can neither agree nor disagree with a later entry.
+  // Keeping such an entry as the owner would silence the rule for that
+  // identifier for the rest of the listing. `HF_ENDPOINT` is user
+  // configurable, so a mirror that omits `size` on ONE entry would otherwise
+  // buy every later entry under that identifier an unconditional pass.
+  //
+  // The first entry here carries `lfs.pointerSize` and no size, which is the
+  // shape that reads as a size only to a caller that reads the wrong field.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string oid = Sha256Like("e6");
+  hub.set_tree(
+      std::string(R"([{"type":"file","path":"a.bin",)") +
+      R"("lfs":{"oid":")" + oid + R"(","pointerSize":135}},)" +
+      R"({"type":"file","path":"b.bin","size":4096,)" +
+      R"("lfs":{"oid":")" + oid + R"("}},)" +
+      R"({"type":"file","path":"c.bin","size":2048,)" +
+      R"("lfs":{"oid":")" + oid + R"("}}])");
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("an entry with no size must not disarm the size rule");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find(oid) != std::string::npos);
+  CHECK(message.find("b.bin") != std::string::npos);
+  CHECK(message.find("c.bin") != std::string::npos);
+  CHECK(message.find("4096") != std::string::npos);
+  CHECK(message.find("2048") != std::string::npos);
+  CHECK(message.find("two different sizes") != std::string::npos);
+}
+
+TEST_CASE("ONE path listed twice with disagreeing sizes is refused") {
+  // The rule reads "a shared identifier whose entries disagree on a known size
+  // is refused", and it carries no exemption for a repeated path. One path
+  // that is 4096 bytes and 2048 bytes in the same listing is self
+  // contradictory whichever field is believed, and it is exactly the shape a
+  // hub answering something other than the truth produces.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string oid = Sha256Like("f7");
+  hub.set_tree(
+      std::string(R"([{"type":"file","path":"model.safetensors","size":4096,)") +
+      R"("lfs":{"oid":")" + oid + R"("}},)" +
+      R"({"type":"file","path":"model.safetensors","size":2048,)" +
+      R"("lfs":{"oid":")" + oid + R"("}}])");
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("one path listed twice at two sizes must be refused");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find(oid) != std::string::npos);
+  CHECK(message.find("model.safetensors") != std::string::npos);
+  CHECK(message.find("4096") != std::string::npos);
+  CHECK(message.find("2048") != std::string::npos);
+  CHECK(message.find("two different sizes") != std::string::npos);
+}
+
+TEST_CASE("a listing that reports no size is not a zero-byte file") {
+  // `HfFile::size` has to be able to say UNKNOWN. A zero-byte file and an
+  // entry whose size the listing never reported are different facts, and a
+  // plain `uint64_t` spells both of them `0`. W3 sizes a byte range and a
+  // resume offset from this field, so the ambiguity would be inherited by the
+  // downloader rather than staying inside the listing.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  hub.set_tree(
+      std::string(R"([{"type":"file","path":"empty.txt","size":0},)") +
+      R"({"type":"file","path":"unsized.bin",)" +
+      R"("lfs":{"oid":")" + Sha256Like("a9") + R"(","pointerSize":135}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).path == "empty.txt");
+  REQUIRE(files.at(0).size.has_value());
+  CHECK(files.at(0).size.value() == 0);
+  CHECK(files.at(1).path == "unsized.bin");
+  // `lfs.pointerSize` is not a content size, so this entry has none.
+  CHECK_FALSE(files.at(1).size.has_value());
 }

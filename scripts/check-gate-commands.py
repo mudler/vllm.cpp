@@ -396,7 +396,22 @@ def audit() -> list[dict]:
 # proves nothing about transport layer security, and the second instrument is an
 # opt-in online test that does not run in the default lane. Growth, so the set
 # is re-pinned in the same change.
+# 2026-08-19: +ENG-CUDAGRAPH-BREAK, and this entry is a REPAIR rather than a
+# landing. W5 of that row (#1361, commit 601b576c6) filled its spec's Gates
+# section with runnable evidence, including a named test binary with its case
+# and assertion counts and an exit status, which is what moves a row into the
+# runnable population. The re-pin this ratchet's own error text demands was not
+# made in that change, so `main` itself has been red on
+# tests/scripts/test_check_gate_commands.py since it landed: 8 failures of 44,
+# every one a comparison between the computed runnable set and this pin,
+# measured in a detached worktree of origin/main. The continuous integration
+# lane that would have caught it independently has not executed for this
+# repository since roughly 07:43Z that day, so the change landed with no remote
+# verdict. Found while merging origin/main into row/ENG-HF-MODEL-DOWNLOAD and
+# fixed in that flow under #1376, because the fix is small and clear and a red
+# main blocks every other row's gate. Growth, so the set is re-pinned.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-CUDAGRAPH-BREAK",
     "ENG-HF-MODEL-DOWNLOAD",
     "ENG-RESIDENCY-CONFIG",
     "ENG-CUDAGRAPH-DEDUP",

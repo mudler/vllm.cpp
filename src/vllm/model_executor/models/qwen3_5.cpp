@@ -9873,6 +9873,15 @@ static void MaybePoisonStagedInputs(bool poison, Slot& s) {
   // corrupting it is what races the copy. `token_ids` is not in this list any
   // more because its pinned block is gone: it was never uploaded, so zeroing it
   // could never have poisoned anything (see PinnedStepInputs).
+  //
+  // EACH CELL IS ZEROED OVER ITS OWN CAPACITY, and that closes #1319. This hook
+  // used to fill all four blocks over `pin.S` — TOKENS — while `seq_lens` is
+  // allocated with `pin.R`, REQUESTS. The two are equal on a pure-decode step
+  // and NOT on a speculative one, where `S = R * (1 + k)`, so the fill ran
+  // `(S - R)` int32s past the end of a `cudaHostAlloc`'d block, corrupting
+  // pinned memory inside the very arm that exists to fail loudly. Asking each
+  // cell for its own capacity makes the count and the allocation the same
+  // fact.
   const auto zero = [](vt::PersistentStepInput& c) {
     if (c.staging() != nullptr) std::memset(c.staging(), 0, c.capacity());
   };

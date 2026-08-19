@@ -1020,6 +1020,44 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
 Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 `--audio-prompt-embeds` to condition from files instead.
 
+### Where the render spent its wall: `phase-log.json`
+
+Every completed LTX-2.5 render writes **`<workdir>/phase-log.json`** beside the
+frames, on the shipped default and behind no flag, and `ltx2-gen` prints its
+path on the line after `wrote N frames`. An embedder gets the same path from
+`vllm_video_last_phase_log(engine)` (ABI v22) rather than by guessing a filename.
+
+It is a flat, non-overlapping timeline of named phases — the DiT load, the two
+VAE loads, the text tower and the connector, the denoise, the video and audio
+decodes, the frame and WAV writers — each carrying a start and end measured from
+the load, a duration, a **peak host byte** count and a **peak device byte**
+count. Two fields at the top say how complete it is:
+
+| Field | What it means |
+|---|---|
+| `wall_seconds` | from the engine load to the end of this generation |
+| `sum_leaf_seconds` | the named phases, which do not overlap |
+| `unaccounted_seconds` | the difference — time inside no named phase |
+
+`unaccounted_seconds` is emitted rather than distributed over the phases,
+because a table whose parts do not add up has a phase nobody named, and a
+plausible-looking table is worse than an obviously incomplete one. On a
+completed 64x64/9-frame render it is under 2% of wall.
+
+`peak_device_bytes` is the **driver's** in-use figure through the backend's
+`DeviceMemoryInfo`, and it is `-1` where no probe answers — on the CPU arm, and
+on any device whose backend does not implement it. It is not zero there, because
+a byte count of zero and a byte count nobody took are different facts.
+
+Two environment variables, both measurement lanes rather than configuration:
+`VLLM_RENDER_PHASE_LOG_STDERR=1` also prints the table as a fixed-width block,
+and `VLLM_RENDER_PHASE_SAMPLER=0` stops the 100 ms sampler thread, which narrows
+the per-phase peaks to what the phase boundaries saw and removes nothing else.
+
+The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
+staging is minutes paid at the front of every render. A process that loads a
+second engine starts a new timeline, so the table describes the last load.
+
 Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
 binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
 required and is not the default, because omitting it resolves the checkpoint's
@@ -3343,6 +3381,10 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v16 | Absolute KV-cache memory sizing |
 | v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 | v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
+| v19 | Per-modality multimodal input limits |
+| v20 | Speech and music generation through `vllm_speech_*` / `vllm_synthesize` |
+| v21 | Device selection on the speech lane (`vllm_speech_model_params.device`, `vllm_speech_engine_device`) |
+| v22 | The render phase table: `vllm_video_last_phase_log` names the `phase-log.json` a completed `vllm_video_generate` wrote |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.

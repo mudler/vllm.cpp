@@ -16,13 +16,32 @@ with a `file:line` at this base.
 
 ## Now
 
-`READY`. The spec is committed, no stage has started, and the row is
-**deliberately unclaimed** — each stage below is dispatched to its own fresh
-implementer and its own fresh reviewer, so a claim file naming this session would
-be false the moment this pull request merges.
+`ACTIVE`. **W0 has landed and W1 is next**, which is a lease on a box with the
+checkpoints — `dgx.casa`, per `H3`. Every other stage is unstarted, and each is
+dispatched to its own fresh implementer and its own fresh reviewer.
 
-The stage order is **W0 → W1 → W2 → W3 → W4 → W5 → W6 → W7**, with the oracle
-lane **O1** running beside it and blocking only ratios. **W1 is a gate on the
+**What W0 answered, and what it did not.** A completed render now writes
+`<output_dir>/phase-log.json` on the shipped default: a flat, non-overlapping
+timeline of named phases, each carrying a monotone timestamp, a duration, a peak
+host byte count and a peak device byte count, with `unaccounted_seconds` emitted
+beside the sum rather than smeared over the phases. On a completed 64x64/9-frame
+render through the `vllm.h` video ABI the named leaves account for **98.33% of
+wall** (0.1549 s of 0.1575 s, residue 2.63 ms), so **the phases sum and W1 may
+start**. The artifact is
+[`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json)
+and its provenance is in `## Outcome — W0` below.
+
+**What W0 did NOT measure is the device column.** That render is the CPU arm, so
+every `peak_device_bytes` reads the `-1` "no probe on this arm" sentinel. The
+probe itself is installed beside the device queue
+(`src/vllm/multimodal/ltx2_video.cpp`, `Ltx2VideoEngine::Load`, at the
+`vt::CreateQueue(im.device)` site) and reads
+`vt::Backend::DeviceMemoryInfo`; **nothing has run it on an accelerator**, and
+W1's lease owes that. It is recorded in `## Owed` rather than left to be read
+off a table full of `-1`.
+
+The stage order is **W0 (landed) → W1 → W2 → W3 → W4 → W5 → W6 → W7**, with the
+oracle lane **O1** running beside it and blocking only ratios. **W1 is a gate on the
 order itself.** The ranking every later stage inherits was measured on a host
 that stopped answering ([#1040](https://github.com/mudler/vllm.cpp/issues/1040)),
 and two of the levers it ranked have since landed without re-measurement, so the
@@ -590,8 +609,9 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | Issue | Stage | State |
 |---|---|---|
 | [#1264](https://github.com/mudler/vllm.cpp/issues/1264) | this row: the staged campaign spec | closed by this row landing |
-| [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | owed |
-| [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | W0 (contract) + W1 (closes) | owed |
+| [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | **closed.** The render writes a phase table on the shipped default; the ABI names it through `vllm_video_last_phase_log` (v22) |
+| the phase table's DEVICE column | W1 | **owed.** Every `peak_device_bytes` in W0's artifact is the `-1` no-probe sentinel, because the only render W0 could take was the CPU arm: `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. The probe is wired at the `vt::CreateQueue(im.device)` site in `Ltx2VideoEngine::Load` and has never executed. W1's lease runs it, and until it does **no device-byte number from this instrument exists** |
+| [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | W0 (contract) + W1 (closes) | contract half **met** — the table is a file beside the frames rather than a console line, and it is retrievable from this repo at `benchmarks/demo/`. The closing half is W1's |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | W1 | owed; its `utilization.gpu` positive control is still unrecorded in this tree |
 | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | W2a | owed |
 | [#1015](https://github.com/mudler/vllm.cpp/issues/1015) | W2b | owed; host arm only, see `## Our baseline` finding 3 |
@@ -621,3 +641,113 @@ Also owed, and not attached to a stage:
 * **The third single-core stretch** of the #1208 trace (2589 s+, RSS flat at
   31 GiB), unattributed. W1's phase table should name it; if it does not, that is
   a W0 gap and W0 iterates.
+
+## Outcome — W0, the instrument
+
+Landed on `row/LTX25-RESIDENCY-W0`, issue
+[#1010](https://github.com/mudler/vllm.cpp/issues/1010), base `5f68e60df`.
+
+### The gate, and the number
+
+**PASS.** One completed render through the `vllm.h` video ABI emits a phase
+table whose named leaves sum to **98.33% of wall** — 0.154896 s of leaves
+against 0.157525 s of wall, residue **2.63 ms**. The tolerance was fixed at
+**>= 95%** in the test's own comment and in the red-first commit message
+*before* the instrumented run, and the sum is checked in the same case that
+checks the named boundaries, because one leaf called `render` would sum to wall
+exactly and measure nothing.
+
+The evidence file is
+[`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json),
+sha256 `e7e68ed4124250dbe1bd1e201cc3eba966d769aef4ffa26a12bfbe64fa45e01f`,
+written verbatim by the render that produced it. Provenance, because the file
+carries none of this itself:
+
+| | |
+|---|---|
+| producer | `examples/ltx2_gen` (`build/examples/ltx2-gen`), through `vllm_video_engine_load` + `vllm_video_generate` |
+| tree | `040a4ee66860ef952ff54b172366818477d1902a` on `row/LTX25-RESIDENCY-W0` |
+| build | `cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF`, gcc 13.3.0 |
+| host | `mudler-ubuntu-box`, Linux 6.8.0-136-generic x86_64, **20 cores and CONTENDED** — other sessions were compiling throughout |
+| checkpoint | the reduced-dimension fixture `tests/vllm/multimodal/ltx2_video_fixture.h` writes, in the shipped file format |
+| geometry | `--frames 9 --width 64 --height 64 --seed 7 --max-phase 0 --device cpu` |
+| completion | 9 frames written, **9 distinct per-frame md5s**, plus a 48 kHz WAV |
+
+**The wall figures are NOT a benchmark and nothing may quote them as one.** The
+host was contended, the checkpoint is a reduced fixture, and the same case
+measured 0.26 s and 6.14 s of wall on two consecutive runs of the identical
+binary. What the artifact supports is the SHAPE of the table and the fact that
+its parts add up. `docs/BENCHMARKS.md` is therefore untouched, which is what
+this spec's `### Decisions taken here` already said W0 owes: W1 owes the
+benchmark edit, on a leased idle box, at two geometries.
+
+### What the table says about this render, which is not what anybody expected
+
+On the fixture, `decode.audio` is **56% of wall** (0.0889 s) and `denoise` is
+34% (0.0539 s). That ordering belongs to a two-block reduced DiT and says
+nothing about the 21.00B checkpoint — it is recorded because it is the first
+time any LTX-2.5 render in this tree has said where its time went at all, and
+because it is exactly the kind of term the spike's lever table could not have
+ranked.
+
+### What was rejected, and why
+
+**A shared phase table with the process as its scope was rejected**, after it
+shipped and failed. `Begin` was first written idempotent, so a process that
+loaded several engines accumulated one timeline and reported the time between
+unrelated renders as this render's residue: the 90-case suite read 8.33 s of
+residue against a 5.20 s budget on a render that had accounted for 99.96% of its
+own wall. A load now discards the earlier timeline. The origin still sits at the
+LOAD and not at the generation, because the spike measures ~7.5 minutes of DiT
+staging paid at the front of every render.
+
+**Chaining the phases into a partition was rejected.** A `Mark(name)` that
+closed the open phase and opened the next would make the sum hold by
+construction, and the missing time would be silently charged to whichever phase
+happened to be open. The scopes therefore leave real gaps, and the residue is a
+real quantity — which is what makes the gate refutable at all, and what mutation
+M2 below demonstrates.
+
+**Appending a field to `vllm_video_result` was rejected** in favour of the
+`vllm_video_last_phase_log(engine)` query. Growing an OUTPUT struct is the one
+append a caller cannot absorb by zero-initializing, because the library writes
+the new field using its own `sizeof`.
+
+**Instrumenting `vt`'s allocator for the device column was rejected** as a
+different row's change: it is a hot path taken thousands of times per step. The
+column is the driver's own in-use figure through `vt::Backend::DeviceMemoryInfo`,
+which is the one device-byte instrument the gate host answers —
+`--query-gpu=memory.used` returns `[N/A]` on GB10 (spike §4.3).
+
+### Mutations, each with its diff, its compile status and its exit code
+
+| # | Mutation | `git diff --stat` | compile | focused gate |
+|---|---|---|---|---|
+| M1 | delete the `WritePhaseLog` call in `Generate` — the **reachability** mutation | 1 file, +2/-2 | rc 0, 0 errors | **RED**, exit 1, 4 assertions, 1 failed |
+| M2 | mark the `denoise` scope a span so its time is named by nobody | 1 file, +1/-1 | rc 0, 0 errors | **RED**, exit 1, 273 assertions, 1 failed, on `leaves >= 0.95 * wall` (0.078 s of 0.117 s) |
+| M3 | make `HostResidentBytes` return `-1` | 1 file, +4/-1 | rc 0, 0 errors | **RED**, exit 1, 273 assertions, **21** failed, one per phase entry |
+
+M1 is the mutation `.agents/reachability.md` asks for: the production call site
+is deleted in a scratch copy and the focused gate goes red, so the gate measures
+a capability rather than a class.
+
+### No claim file, and the checker says why
+
+A `CLAIM-LTX25-RESIDENCY-W0.md` was written and then removed.
+`scripts/check-agent-record.py:1712-1714` refuses an active claim whose `Row IDs`
+cell holds no ID its `ID_RE` recognises, and that pattern is built from the same
+fixed prefix list (`:327-338`) that keeps this campaign out of every matrix —
+`LTX25-` is not in it. So a claim file for this stage is a record no checker can
+validate, sitting beside a row no matrix carries. The stage's ownership,
+evidence and exclusions are recorded here and in the pull-request body instead,
+which is where this spec's `### Decisions taken here` already said they would be.
+
+### Owed out of W0
+
+* **The device column has never executed.** See `## Owed`.
+* **A render on the SHIPPED 21.00B checkpoint has not been instrumented**, which
+  is W1's whole job. Nothing here says what the table looks like when the DiT
+  load is minutes rather than milliseconds.
+* **`GenerateAudioOnly` writes the table but has no gate on it.** The t2a arm
+  flushes through the same helper and the case that would check it was not
+  written; the video arm is gated at two levels.

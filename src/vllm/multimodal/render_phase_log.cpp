@@ -12,7 +12,13 @@
 
 #include <nlohmann/json.hpp>
 
-#if defined(__linux__)
+// `sysconf(_SC_PAGESIZE)` rather than a hardcoded 4096: `statm` counts PAGES,
+// and the boxes this instrument exists for are aarch64 — GB10 and Thor — where a
+// 64 KiB page would make every byte count in the table 16x too small. The guard
+// names `_WIN32` as well as `__linux__` because `check-windows-portability.py`
+// reads only the `_WIN32` form, and a guard a checker cannot see is one nobody
+// can rely on.
+#if defined(__linux__) && !defined(_WIN32)
 #include <unistd.h>
 #endif
 
@@ -25,7 +31,7 @@ namespace phase {
 // reason is `music3_profile.h`'s: `status` is ~50 formatted lines and this runs
 // ten times a second beside a multi-gigabyte load.
 int64_t HostResidentBytes() {
-#if defined(__linux__)
+#if defined(__linux__) && !defined(_WIN32)
   std::FILE* f = std::fopen("/proc/self/statm", "r");
   if (f == nullptr) return -1;
   long long total_pages = 0;

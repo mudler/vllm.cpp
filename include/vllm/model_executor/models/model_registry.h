@@ -388,6 +388,33 @@ struct ModelFactory {
   // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
   // switch over.
   bool supports_weight_offload = false;
+  // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124): whether THIS model's forward
+  // reads its routed-expert weights through the expert-stream slot seam
+  // (`KqExpertSlice`), so the stacked `*_exps.weight` towers are served a slice
+  // at a time out of the host slot store instead of being staged.
+  //
+  // THE DEFAULT IS FALSE FOR THE SAME REASON `supports_weight_offload`'s is, and
+  // this one is load-bearing in the UNSAFE direction. The load-time fit bound
+  // (`gguf_device_fit.h`) can drop a tensor set from what it charges the device,
+  // and the loader identifies that set by NAME — `_exps.weight`, which is what a
+  // llama.cpp MoE export writes for every MoE family it converts, not only the
+  // ones this tree streams. `deepseek_v4_weights.cpp` and `laguna_weights.cpp`
+  // both write that exact suffix, and neither model composes `RunMoeBlock`
+  // (`deepseek_v2.cpp` says so at its head), so neither ever reaches
+  // `KqExpertSlice`. Dropping their towers from the bound would remove a REFUSAL
+  // THAT WAS CORRECT and put back the failure #1123 exists to prevent: a
+  // 26-minute load and then `cudaMalloc: out of memory` on the first forward.
+  //
+  // WHY THE CAPABILITY AND NOT AN ARCHITECTURE LIST. The fact is a property of
+  // the model's forward, and it lives beside the forward: `qwen3_5_moe.cpp` and
+  // `qwen3_moe_registry.cpp` are the two translation units that route into
+  // `RunMoeBlock`, and they are the two that set this. A list in the loader would
+  // be a second description of the same fact, in a file that cannot see when the
+  // first one changes — and a model whose forward stopped streaming would leave
+  // the list saying it still does. Inheriting false is the safe answer: a new
+  // architecture gets the whole bound and the #1123 refusal until somebody wires
+  // the seam and says so here.
+  bool streams_routed_experts = false;
 };
 
 struct ModelRegistration {

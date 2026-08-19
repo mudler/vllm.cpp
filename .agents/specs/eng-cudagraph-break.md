@@ -931,11 +931,70 @@ W4 and is the only version that reaches these registrations at all. Filed as
 [#1305](https://github.com/mudler/vllm.cpp/issues/1305), owner W4, and recorded
 under `## Owed`.
 
-**W4, migrate the two Qwen3.5 drivers.** `Qwen3_5DecodeGraph` and
-`Qwen3_5DenseDecodeGraph`. These carry `StepDevInputs`, the auxiliary taps and the
-speculative-decode predicate. W4 is where the persistent device input path becomes
-a seam capability rather than one driver's private code, which is what makes it
-available to the four drivers that lack it.
+**W4, the persistent device input path as a seam capability, and the two Qwen3.5
+drivers. DONE 2026-08-19, [#1307](https://github.com/mudler/vllm.cpp/issues/1307).**
+
+`vt::PersistentStepInput` (`include/vt/persistent_step_input.h`,
+`src/vt/persistent_step_input.cpp`) is one capture-stable per-step device input.
+It BINDS a destination the driver owns and refreshes it IN PLACE from either a
+pinned host staging block or a DEVICE source. What it owns is the part every
+driver re-derived: the address-stability rule as a REFUSAL rather than a comment,
+the pinned staging block that makes the upload a true asynchronous DMA, and the
+refreshing ARM as an observable (`last_source()`, `vt::StepInputStats`) rather
+than an inference from which line the driver happened to call. What it
+deliberately does NOT own is the device allocation — `Qwen3_5DecodeGraph` draws
+its retained inputs from a DEDICATED `DevicePool` so they never pop a block the
+captured forward's own scratch then needs, and a seam that took that over would
+silently move nine drivers onto one pool (D3).
+
+`Qwen3_5DecodeGraph` and `Qwen3_5DenseDecodeGraph` open a `vt::GraphCaptureScope`
+over a per-slot `vt::BreakableGraph` in `kFull` and replay through
+`BreakableGraph::Replay`, and their `PinnedStepInputs`/`StageStepInputs` staging
+now runs through the capability. **Six of the nine drivers are on the seam**, and
+`grep -rn 'std::getenv("VLLM_CPP_CUDAGRAPH")' src/` returns exactly ONE line,
+`src/vt/breakable_graph.cpp:61` — there is finally a single switch that turns
+capture off. The three single-shape drivers keep their invented switches
+(`VT_V4_DECODE_GRAPH`, `VT_DFLASH_GRAPH`, `VT_LAGUNA_DECODE_GRAPH`); they are W5's.
+
+**W4 FOUND THAT ITS OWN PREMISE WAS INCOMPLETE, and this is the stage's most
+important result.** The spec said the fix `qwen3.cpp`'s decline names — read the
+identifiers at REPLAY time from a stable device buffer — "already exists, in the
+sibling driver, as `StepDevInputs`". **It does not.** `StepDevInputs` has no
+token-id member. Its pinned sibling did: `PinnedStepInputs::token_ids` was
+allocated at capture, filled by `StageStepInputs` every step, zeroed by the
+poison hook, and **never uploaded and never read**. The embed runs OUTSIDE the
+captured region from the HOST vector (`EmbedInto`), in every batched driver, so
+**the decode graph carries no token ids to the device in ANY driver** — including
+the one this row cited as having the capability.
+
+So making the persistent device input path a seam capability was never, by
+itself, going to close the decline: the one input an asynchronous mirror patches
+is precisely the one the path does not carry. What W4 lands is the capability
+that makes writing that destination a per-driver two-liner instead of a tenth
+hand-rolled copy, and `RefreshFromDevice` is the arm it needs. The dead block is
+removed and the finding is recorded rather than quietly tidied.
+
+**Gates.** Red-first throughout. The capability's gate ran against a stub with
+the declared API and none of its guarantees: 9 cases, 0 passed, 59 assertions, 32
+failed, exit 1; GREEN after at 9/9, 59/59. The driver gate
+(`tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`) ran RED on the MoE
+driver's five seam assertions before the migration (3 cases, 1 failed, 62
+assertions, 5 failed, exit 1) and GREEN after with both drivers at 7/7 and 129
+assertions, G4 reading `40 values, 0 differing` on each.
+
+**Reachability, which the capability could easily have failed.** A unit test that
+constructs the type by hand proves the class works and never that anything
+reaches it. A case enters through `Qwen3_5DecodeGraph::Step` and asserts
+`vt::GetStepInputStats()`: `binds=6` after the capture step, `host_refreshes >= 5`
+after the replay step. Deleting the `StageStepInputs(d, s)` call site reds that
+case ALONE and leaves `test_persistent_step_input` 59/59 green, which is the
+distinction itself. Two limits: the case sets `VT_ASYNC_EXECUTOR=1`, because the
+persistent device input path sits behind that lever (default OFF) plus the
+speculative-decode arm, and that lever also turns on the 2-slot parity ring, so
+slot 0 captures on step THREE.
+
+**The async decline STANDS, and the reason is sharper than "the fix is not built
+yet".** See `## Owed`.
 
 **W5, migrate the three single-shape drivers.** DeepSeek V4, Laguna and DFlash.
 `laguna.cpp:2116-2119` already carries the note that its capture class is waiting
@@ -1101,10 +1160,19 @@ point registered inside an unjoined fork window without this rule fails at
 ## Now
 
 `ACTIVE`. W0 (spike), W1 (the seam, its ported unit gate, and one registered
-break point), W2 (`Qwen3DenseDecodeGraph`) and W3 (`Qwen3MoeDecodeGraph`,
-`VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`) have landed. **Four of the nine
-drivers are on the seam.** W4 through W6 remain, and `## Work breakdown` states
-each. Owner: `.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W3.md`.
+break point), W2 (`Qwen3DenseDecodeGraph`), W3 (`Qwen3MoeDecodeGraph`,
+`VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`) and W4 (the persistent device
+input path as `vt::PersistentStepInput`, plus `Qwen3_5DecodeGraph` and
+`Qwen3_5DenseDecodeGraph`) have landed. **Six of the nine drivers are on the
+seam**, and one `std::getenv("VLLM_CPP_CUDAGRAPH")` remains in `src/`, the
+seam's own. W5 and W6 remain, and `## Work breakdown` states each. Owner:
+`.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W4.md`.
+
+**W4 corrected a premise this spec had asserted three times.** The decode graph
+carries NO token ids to the device in any driver, `StepDevInputs` included, so
+the `qwen3.cpp` async decline was never one refactor away from removable. It
+STANDS, and `## Owed` now names what is actually missing instead of naming a
+stage.
 
 Every migrated step opens its scope in `kFull`, mirroring vLLM's decode arm. The
 PIECEWISE arm still has no production driver and `## Owed` names what has to be
@@ -1184,24 +1252,53 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   replay N. The fix is persistent, driver-owned storage for the layer's inputs,
   which is the capability `StepDevInputs` already is. Owner: **W4**, and **W6**
   cannot move the eligibility predicate before it exists.
-- **The async device-token DECLINE at `qwen3.cpp` still stands**, and W2
-  deliberately did not remove it. `Step` replays against the persistent HOST
-  vectors, so the depth-2 race is untouched by moving the CAPTURE onto the seam,
-  and the measured battery (`depth-1 graph ON PASS 78/78`, `depth-2 graph OFF
-  PASS 82/82`, `depth-2 graph ON FAIL, slots 1-3 degenerate`) is what removing
-  it would restore. Both arms are gated at
-  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp`. Owner: **W4**, as the
-  seam-level persistent device input path — the only version of the fix that
-  also reaches `qwen3_moe.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`.
-  [#1179](https://github.com/mudler/vllm.cpp/issues/1179) tracks it.
-- **The async battery itself was NOT re-run, by W2 or by W3.**
-  `tests/parity/test_qwen3_dense_async_serving.cpp` needs a GPU **and a
-  checkpoint**, and that second half is what W3's lease did not carry: the G1
-  run built from a clean clone on the leased box's local disk and used synthetic
-  weights, so no checkpoint was staged and the battery could not run beside it.
-  What both stages can say is what they measured: the decline's code path is
-  unchanged and both of its arms are executable on CPU. Owner: **W4**, which
-  owns the fix the battery exists to validate.
+- **The async device-token DECLINE at `qwen3.cpp:1106` STANDS after W4, and the
+  reason changed.** W4 owned the decision and did not remove it. What W4
+  established, by reading the tree rather than by inheriting the record:
+
+  1. **No driver has a device token-id destination, `StepDevInputs` included.**
+     `StepDevInputs` has no token-id member; its pinned sibling
+     `PinnedStepInputs::token_ids` was allocated, filled every step and NEVER
+     uploaded or read. The embed runs OUTSIDE the captured region from the HOST
+     vector (`EmbedInto`) in every batched driver. So the fix the decline's own
+     comment names — read the identifiers at REPLAY time from a stable device
+     buffer — did not exist anywhere in the tree, and this spec asserted three
+     times that it did. `vt::PersistentStepInput::RefreshFromDevice` is the arm
+     that fix needs; the destination itself is still owed.
+  2. **The decline's recorded CAUSE does not survive contact with the tree.**
+     `338cbbfd1` (#323) records "the registry-level `DeviceTokenIdsScope`
+     (`60e71a0e`) did not close it: this path returns BEFORE the eager forward
+     ever runs". At that commit's own parent the scope was constructed at
+     `qwen3_dense.cpp:96`, BEFORE `DenseDecodeGraphForward` at `:103`, and
+     `EmbedInto` consumed it through `ApplyDeviceTokenIdsOverride` on all three
+     of the driver's arms (`qwen3.cpp:610,621,644` @ `338cbbfd1^`). The override
+     was therefore live on the graph path. The measured failure is real; the
+     mechanism recorded beside it is not the one that produced it, and nobody
+     has since identified what did.
+  3. **Therefore the decline could not be removed on this row's evidence.** A
+     mitigation whose failure mode is unexplained is not retired by a refactor
+     that plausibly addresses the explanation nobody has confirmed. Removing it
+     needs the battery, red first with the decline deleted.
+
+  **The battery was NOT run, and this is the plain statement rather than an
+  implication.** `tests/parity/test_qwen3_dense_async_serving.cpp` needs a GPU
+  **and** the real Qwen3-0.6B/4B snapshots under `~/.cache/huggingface/hub`, and
+  its own header restricts it to `dgx.casa`. `dgx:gpu0` was held by another
+  session's job for the whole of W4's window (`rc devices`: `busy`, 1h31m and
+  climbing); W4's lease was `thor:gpu0`, which has no such checkpoint. Both arms
+  of the decline stay gated on CPU at
+  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp`. Owner: the stage that
+  gets a `dgx` window WITH the checkpoints, and it owes two runs, not one — the
+  battery as it stands, and the battery with the decline deleted, because only
+  the second can fail. [#1179](https://github.com/mudler/vllm.cpp/issues/1179)
+  and [#323](https://github.com/mudler/vllm.cpp/issues/323) track it.
+- **The async battery has still NOT been re-run, by W2, W3 or W4.** The
+  obstacle is the same one and it is a resource rather than an oversight: the
+  battery needs a GPU **and** a real checkpoint, W4's lease was `thor:gpu0`
+  (clean clone, synthetic weights, no HuggingFace cache), and `dgx:gpu0` — the
+  only box its header admits — was held by another session for W4's whole
+  window. The decline entry above records what the battery now owes, which is
+  two runs and not one.
 - **Three decode-graph registrations route an ASYNCHRONOUS step into a
   host-vector replay with NO `device_token_ids` decline**
   ([#1305](https://github.com/mudler/vllm.cpp/issues/1305), found by W3, not
@@ -1215,7 +1312,20 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   on a measurement this stage cannot make, and the fix `qwen3.cpp` names is
   `StepDevInputs` as a seam capability. `VoxtralDecodeGraph` is unaffected — its
   only construction site is `VoxtralGenerateGreedy`, which the runner does not
-  reach. Owner: **W4**.
+  reach.
+
+  **W4's disposition: #1305 STAYS OPEN and W4 did not add a decline either, for
+  a reason that is now stronger than W3's.** W3 declined to trade a shipped
+  default-ON capability for an unmeasured hazard. W4 adds the finding that makes
+  the trade worse: the hazard #1305 describes is the SAME one `qwen3.cpp`
+  mitigates, and W4 established that the mitigation's own recorded cause is
+  falsified and its real cause unidentified (see the decline entry above).
+  Copying a mitigation whose mechanism nobody can name into three more
+  registrations would spread an unexplained behaviour, not close a defect. What
+  #1305 needs is the same `dgx` window with checkpoints that the decline needs:
+  run the battery shape against `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph`
+  and find out whether they degenerate at depth 2 at all. Owner: the stage that
+  gets that window.
 - **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
   drain cannot see.** The `uncaught_exceptions()` comparison in
   `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A

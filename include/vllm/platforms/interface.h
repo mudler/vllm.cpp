@@ -271,6 +271,46 @@ class Platform {
   // false. Surface parity for the ROCm/memory-reporting port; unwired today.
   virtual bool is_integrated_gpu() const { return false; }
 
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). May a KERNEL on this platform
+  // DEREFERENCE ordinary host storage — a `std::vector<uint8_t>`, an mmap'd
+  // file page — with no staging copy, no registration and no map/unmap call?
+  //
+  // This is a PROBED PHYSICAL PROPERTY, never a device name, an architecture
+  // string or a compute capability. CUDA answers from
+  // `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated`, probed once at
+  // registration; ROCm from the `pageable_memory_access` + `integrated` pair it
+  // already probes. The conjunction is the point: a DISCRETE card with HMM
+  // reports pageable access alone and would then serve every expert slice over
+  // PCIe with page migration, which is the opposite of what the caller wants.
+  //
+  // WHY NOT AN EXISTING PREDICATE. `is_cpu()` is what this lifts. Every one of
+  // the other four answers a different question:
+  //
+  //   needs_weight_staging()  is TRUE on CUDA everywhere, GB10 included, and is
+  //                           a PROGRAMMING-MODEL policy — the model's forward
+  //                           binds distinct device pointers. It would gate
+  //                           nothing here, and the two deliberately DISAGREE on
+  //                           GB10 (stages: yes; can read host memory: yes).
+  //   is_unified_memory()     answers the OPPOSITE question: CUDA on GB10
+  //                           reports unified because host and device address one
+  //                           physical pool, while a `cudaMalloc` pointer is
+  //                           still not host-dereferenceable — see
+  //                           `include/vt/backend.h::DeviceMemoryIsHostAddressable`.
+  //   is_integrated_gpu()     alone is insufficient:
+  //                           `src/vllm/platforms/rocm.cpp::is_integrated_gpu`
+  //                           records integrated-WITHOUT-pageable-access as a
+  //                           real device class, and on it a host pointer faults.
+  //   Backend::DeviceMemoryIsHostAddressable()
+  //                           is the MIRROR of this one and not a substitute. It
+  //                           asks whether a pointer from `Alloc()` may be
+  //                           dereferenced by the HOST; this asks whether a host
+  //                           pointer may be dereferenced by the DEVICE. GB10
+  //                           answers false to that one and true to this one.
+  //
+  // Base false, because being wrong here hands a host pointer to a device kernel.
+  // A platform must OPT IN from a probe, exactly like the backend seam above.
+  virtual bool host_memory_is_device_addressable() const { return false; }
+
   // interface.py:1058 + cuda.py:662 support_static_graph_mode — does this platform
   // support static (CUDA-graph) capture mode? CUDA: true; else false. Distinct
   // from supports_graph_capture() (the backend-level capability); this is the
@@ -416,5 +456,34 @@ Platform& CurrentPlatform();
 // so the next backend cannot reintroduce that silence. Returns a pointer to a
 // static array of `count` entries.
 const DeviceType* CurrentPlatformPriority(size_t& count);
+
+// ENG-EXPERT-STREAM-DEVICE W0b, issue #1378. The DECISION behind
+// `CudaPlatform::host_memory_is_device_addressable()`, as a pure function of the
+// two probed attribute values, so it can be checked without the hardware.
+//
+// It exists because the conjunction was gated by nothing. The rule is declared
+// load-bearing in three places -- the base predicate's own comment above,
+// `src/vllm/platforms/cuda.cpp`'s probe, and this row's spec -- and the only CUDA
+// box this project can reach reports BOTH attributes as 1, so `test_platform`
+// could assert the implication (`!hmda || integrated`) and the board value and
+// still pass with either term deleted. Both mutations were run in the fresh
+// review of #1377 and both came back GREEN. A rule that no reachable input can
+// falsify is a comment, not a guard.
+//
+// The device class the conjunction is FOR is the one nobody here owns: a discrete
+// card with HMM answers `pageable = 1, integrated = 0`, and on it the lane would
+// serve ~6.95 GB of expert slices per token over PCIe with page migration. Taking
+// the arguments as the raw `int`s `cudaDeviceGetAttribute` writes, rather than as
+// `bool`s, keeps this callable with exactly the values the probe produced --
+// including the 0 a FAILED probe leaves behind, which is the conservative answer
+// and is part of what the cases pin.
+//
+// The ROCm leg answers the identical conjunction inside
+// `vt::rocm::HostMemoryIsDeviceAddressable` (`src/vt/rocm/rocm_backend.hip`). It
+// does NOT call this function and cannot: `vt` does not depend on `vllm`, and
+// inverting that layering to share four bytes of boolean algebra would be the
+// worse trade. The duplication is recorded here rather than left to be found.
+bool HostMemoryIsDeviceAddressableFromAttrs(int pageable_memory_access,
+                                            int integrated);
 
 }  // namespace vllm::platforms

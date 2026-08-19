@@ -1387,11 +1387,16 @@ trajectory the weights were never trained for. Their guiders are upstream's
 positive-only one, so they still issue one forward per step and their output is
 unchanged by this row.
 
-**The accelerator is refused for the perturbed and isolated-modality passes.**
-`Ltx2DitForwardDevice` takes no perturbation argument, so those two passes on
-`device = 1` would run an unperturbed forward and leave both terms at zero.
-Classifier-free guidance alone is a different context and no perturbation, and
-runs on both arms.
+**All four passes run on the accelerator too, and that doubles the render.**
+`Ltx2DitForwardDevice` took no perturbation argument until 2026-08-19, so
+`device = 1` refused the perturbed and isolated-modality passes rather than run
+them unperturbed with both terms at zero. It takes one now, and the refusal is
+gone. What replaces it is a cost: at the model's own guider defaults a step
+assembles four forwards on `device = 1` where it assembled two, so a 30-step
+render is 120 forwards rather than 60 — about **2.0x** the denoise time.
+`--video-stg-guidance-scale 0 --audio-stg-guidance-scale 0 --a2v-guidance-scale 1
+--v2a-guidance-scale 1` buys that back and is the trajectory the accelerator arm
+had before, at the cost upstream's defaults are there to avoid.
 
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and

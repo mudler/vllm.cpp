@@ -2709,7 +2709,6 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   };
   std::vector<PhaseGuidance> phase_guidance(recipe.phases.size());
   bool wants_negative = false;
-  bool wants_perturbation = false;
   for (size_t p = 0; p < recipe.phases.size(); ++p) {
     phase_guidance[p].video = recipe.phases[p].video_guidance;
     phase_guidance[p].audio = recipe.phases[p].audio_guidance;
@@ -2719,35 +2718,27 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         phase_guidance[p].audio.DoUnconditionalGeneration()) {
       wants_negative = true;
     }
-    if (phase_guidance[p].video.DoPerturbedGeneration() ||
-        phase_guidance[p].audio.DoPerturbedGeneration() ||
-        phase_guidance[p].video.DoIsolatedModalityGeneration() ||
-        phase_guidance[p].audio.DoIsolatedModalityGeneration()) {
-      wants_perturbation = true;
-    }
   }
 
-  // REFUSED BY NAME, not degraded. `Ltx2DitForwardDevice` (ltx2_device.h:136)
-  // takes no `perturbations` argument, so the perturbed and isolated-modality
-  // passes on the device arm would run an UNPERTURBED forward — a finite clip
-  // whose `stg_scale * (cond - perturbed)` and `(modality_scale - 1) * (cond -
-  // mod)` terms are identically zero, and which is indistinguishable from a
-  // working render at every output this engine has. Classifier-free guidance
-  // alone is a different CONTEXT and no perturbation, so it is served on both
-  // arms.
-  if (im.on_device && wants_perturbation) {
-    Fail("this render's guidance needs a PERTURBED forward (STG, or the isolated-modality pass "
-         "that `modality_scale != 1.0` selects) and `Ltx2DitForwardDevice` takes no "
-         "`perturbations` argument, so the device-resident arm cannot run one. Refusing rather "
-         "than running an unperturbed forward, which would leave the STG and modality terms "
-         "exactly zero and render. Set '" +
-         std::string(kLtx2VideoStgScaleExtra) + "' and '" +
-         std::string(kLtx2AudioStgScaleExtra) + "' to 0.0 and '" +
-         std::string(kLtx2A2vGuidanceScaleExtra) + "' and '" +
-         std::string(kLtx2V2aGuidanceScaleExtra) +
-         "' to 1.0 to run classifier-free guidance alone on this arm, or load with device 0. "
-         "Owed by row LTX25-GUIDED-VIDEO (#1092).");
-  }
+  // THE PERTURBED PASSES RUN ON BOTH RESIDENCIES SINCE 2026-08-19, and until then
+  // this is where the device arm was refused by name. `Ltx2DitForwardDevice` took
+  // no `perturbations` argument, so the `ptb` and `mod` passes there would have
+  // run an UNPERTURBED forward — a finite clip whose
+  // `stg_scale * (cond - perturbed)` and `(modality_scale - 1) * (cond - mod)`
+  // terms are identically zero, indistinguishable from a working render at every
+  // output this engine has. The refusal was the right answer to a real gap; the
+  // gap is closed (ltx2_device.h, .agents/specs/ltx25-guided-video.md §12) and
+  // the refusal is gone with it rather than kept as a safety blanket over a
+  // capability that exists.
+  //
+  // WHAT THAT COSTS, so nobody discovers it as a regression: a render whose
+  // guiders carry the model's own defaults (stg 1.0, modality 3.0 —
+  // ltx2_pipeline.cpp:947-963) now assembles FOUR passes per step where the
+  // device arm previously ran two, which is 2.0x the DiT time. #1375 measured
+  // ~162 s per forward on GB10 at 1024x576 with 60 forwards structural; the same
+  // render is 120 forwards. Setting the two STG scales to 0.0 and the two
+  // modality scales to 1.0 buys that back at the trajectory the device arm had
+  // before, and those four extras are documented in docs/USAGE.md.
 
   // The second half of upstream's ONE `PromptEncoder` call over
   // `[prompt, negative_prompt]` (ti2vid_one_stage.py:166-174). Encoded ONLY when
@@ -3842,27 +3833,25 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // One graph, two residencies. On the CPU this is the L2 parity forward in
       // its declared f32; on an accelerator it is the phase-L8 device-resident
       // forward over the bf16 the DiT was STAGED at, and the two agree on
-      // everything but where the bytes live and how wide they are. The device
-      // forward takes no `perturbations`, which is why a guider that asks for the
-      // perturbed or isolated-modality pass on that arm is refused before the
-      // loop rather than served an unperturbed forward.
+      // everything but where the bytes live and how wide they are — INCLUDING
+      // `perturbations`, for which the device forward took no argument until
+      // #1092's second half and which is why the whole perturbed arm was refused
+      // there.
+      //
+      // `p` IS PASSED ON BOTH BRANCHES, and that symmetry is the point: an
+      // argument list that carries the perturbation on one residency and drops it
+      // on the other renders, with the STG and modality terms at exactly zero and
+      // nothing in the frames, the shapes or the counts to show for it. No test on
+      // a box without an accelerator enters the first branch, because
+      // `Ltx2VideoEngine::Load` refuses `device != 0` where no accelerator backend
+      // is registered — so that half is link B of
+      // .agents/specs/ltx25-guided-video.md §12.8, listed under its `## Owed` and
+      // owed a leased run rather than left implied.
       const Ltx2X0Model x0_model = [&](const Ltx2ModalityInput* v, const Ltx2ModalityInput* a,
                                        const Ltx2DitPerturbation* p) {
-        // The refusal above is a statement about the RECIPE; this is a statement
-        // about the CALL, and the two are not the same check. A pass that reached
-        // here with a perturbation on the device arm would have it silently
-        // dropped by the argument list below, which is the shape of defect this
-        // file keeps finding: correct output for the wrong reason, with the STG
-        // and modality terms at exactly zero and nothing in the frames, the
-        // shapes or the counts to show for it.
-        VT_CHECK(!im.on_device || p == nullptr,
-                 "ltx2 video: a perturbed forward reached the device-resident arm, where "
-                 "`Ltx2DitForwardDevice` has no `perturbations` argument to take it. The guidance "
-                 "resolution refuses this before the loop, so reaching it is a defect rather than "
-                 "a bad request. Owed by row LTX25-GUIDED-VIDEO (#1092).");
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
-                                                im.compute_dtype)
+                                                im.compute_dtype, /*cache=*/nullptr, p)
                          : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, v, a,
                                           im.compute_dtype, /*cache=*/nullptr, p);
         // EVERY ACTUAL DiT FORWARD IS COUNTED HERE, and that is a different

@@ -286,6 +286,25 @@ struct ModelForwardInput {
   // graph-captured and ours was not. DEFAULT 0 => the predicate reduces exactly
   // to today's pure-decode shape, so every non-spec caller is byte-identical.
   int64_t num_speculative_tokens = 0;
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, moved off
+  // `pure_decode` and onto the step's ACTUAL uniform query length.
+  //
+  // The runner computes it once per step through
+  // `v1::ActualUniformDecodeQueryLen` (`v1/worker/gpu/cudagraph_dispatch.h`) and
+  // every model reads the answer. 0 means "no captured decode graph in this tree
+  // can serve this step" -- prefill, mixed, ragged, or uniform at a length above
+  // the configured `1 + num_speculative_tokens`. 1 is exactly `pure_decode`.
+  // A value ABOVE 1 is a speculative VERIFY step at its actual draft depth,
+  // which is the population [#1020] named and which the two Qwen3.5 drivers
+  // serve.
+  //
+  // WHY `pure_decode` SURVIVES BESIDE IT. Seven of the nine decode drivers
+  // capture a query_len == 1 shape and nothing else, and widening them here
+  // would admit steps no driver can serve -- the exact failure the spec's
+  // `## Work breakdown` W6 says to avoid by ordering this stage last. They keep
+  // reading `pure_decode`, which is provably NARROWER than this field, so the
+  // widening is opt-in per driver rather than imposed on all nine at once.
+  int64_t uniform_query_len = 0;
   bool gather_logits = true;
   // SPEC-MTP I5d-pre hidden-state tap. When non-null (only the spec verify
   // forward sets it, I5d), the Qwen3.5 dense/MoE forward routes to

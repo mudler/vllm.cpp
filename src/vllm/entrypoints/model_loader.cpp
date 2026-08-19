@@ -28,6 +28,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
+#include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
@@ -785,23 +786,79 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
   return KVConnectorFactory::Create(ctx);
 }
 
-// Top-level GGUF architecture dispatch: `general.architecture` selects the
-// family's HfConfig builder. The qwen35/qwen35moe/qwen3next keys go to
-// HfConfigFromGguf; a `deepseek4` file goes to DeepseekV4HfConfigFromGguf (which
-// maps it onto the registered DeepseekV4ForCausalLM). Additive by construction —
-// a new GGUF-loadable arch adds ONE arm here and owns its config builder in its
-// own TU. Everything downstream (Resolve -> tokenizer -> Load) is arch-agnostic.
-HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
-  const vllm::GgufValue* arch = gguf.FindKv("general.architecture");
-  if (arch != nullptr && arch->TypeId() == vllm::kGgufString &&
-      std::get<std::string>(arch->v) == "deepseek4") {
-    return vllm::DeepseekV4HfConfigFromGguf(gguf);
+// The GGUF architectures this build dispatches, keyed by llama.cpp's
+// `general.architecture`, in the order they are tried. ONE table rather than a
+// ladder plus a hand-written list: the refusal below names the supported set by
+// READING this, so an added arm cannot drift from what a user is told it can
+// load. Additive by construction — a new GGUF-loadable arch adds ONE row here
+// and owns its config builder in its own TU. Everything downstream
+// (Resolve -> tokenizer -> Load) is arch-agnostic.
+//
+//  * `deepseek4` -> DeepseekV4HfConfigFromGguf, which maps it onto the
+//    registered DeepseekV4ForCausalLM.
+//  * `muse-glimmer` -> the k-quant arm whose config builder recovers the query
+//    pre-scale from the folded attn_q_norm and the iRoPE mask from
+//    sliding_window_pattern (muse_glimmer_gguf_weights.h).
+//  * the three qwen3_5 keys -> HfConfigFromGguf, which owns all three itself
+//    (qwen3_5_gguf_weights.cpp).
+struct GgufArchArm {
+  const char* arch;
+  HfConfig (*build)(const vllm::GgufFile&);
+};
+
+constexpr GgufArchArm kGgufArchArms[] = {
+    {"deepseek4", &vllm::DeepseekV4HfConfigFromGguf},
+    {vllm::kMuseGlimmerGgufArch, &vllm::MuseGlimmerHfConfigFromGguf},
+    {"qwen35", &vllm::HfConfigFromGguf},
+    {"qwen35moe", &vllm::HfConfigFromGguf},
+    {"qwen3next", &vllm::HfConfigFromGguf},
+};
+
+std::string SupportedGgufArchitectures() {
+  std::string list;
+  for (const GgufArchArm& arm : kGgufArchArms) {
+    if (!list.empty()) list += ", ";
+    list += arm.arch;
   }
-  // The Muse Glimmer k-quant arm; its config builder recovers the query
-  // pre-scale from the folded attn_q_norm and the iRoPE mask from
-  // sliding_window_pattern (muse_glimmer_gguf_weights.h).
-  if (vllm::IsMuseGlimmerGguf(gguf)) return vllm::MuseGlimmerHfConfigFromGguf(gguf);
-  return vllm::HfConfigFromGguf(gguf);
+  return list;
+}
+
+// Top-level GGUF architecture dispatch: `general.architecture` selects the
+// family's HfConfig builder.
+//
+// The default is EXPLICIT and refuses by name. It used to fall through to
+// `vllm::HfConfigFromGguf`, which is qwen3_5's builder and hard-asserts its own
+// three keys — so every unsupported architecture, `nemotron_h_moe` included,
+// died with "qwen3_5 gguf: unexpected architecture", naming a model that has
+// nothing to do with the file the user passed and sending the reader into an
+// unrelated translation unit (#809). A refusal that names the wrong model is
+// worse than none.
+HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
+  const vllm::GgufValue* arch_kv = gguf.FindKv("general.architecture");
+  if (arch_kv == nullptr || arch_kv->TypeId() != vllm::kGgufString) {
+    throw std::runtime_error(
+        "GGUF: this file carries no string `general.architecture` key, so no "
+        "architecture can be selected. GGUF architectures supported by this "
+        "build: " +
+        SupportedGgufArchitectures());
+  }
+  const std::string arch = std::get<std::string>(arch_kv->v);
+  for (const GgufArchArm& arm : kGgufArchArms) {
+    if (arch == arm.arch) return arm.build(gguf);
+  }
+  // KNOWN architectures whose GGUF arm is OWED, not absent. Each refuses with
+  // the message its OWN model writes, so the reader lands in the translation
+  // unit that owes the work and on the spec section that tracks it. Without
+  // this the arm below would refuse them as merely unrecognized, which
+  // understates them: the file IS one this project knows.
+  if (vllm::IsNemotronHGguf(gguf)) {
+    throw std::runtime_error(vllm::NemotronHGgufRefusal());
+  }
+  throw std::runtime_error(
+      "GGUF architecture '" + arch +
+      "' is not supported by this build. GGUF architectures supported by this "
+      "build: " +
+      SupportedGgufArchitectures());
 }
 
 }  // namespace

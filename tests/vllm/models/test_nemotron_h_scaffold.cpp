@@ -25,6 +25,10 @@
 // (env `VT_NEMOTRON35_SNAPSHOT`) and SKIPS loudly when it is absent.
 #include "vllm/model_executor/models/nemotron_h.h"
 #include "vllm/model_executor/models/nemotron_h_forward.h"
+// The W7 refusal is asserted through the REAL entrypoint dispatch (#809), so
+// this gate needs the engine entry point and the shared synthetic-GGUF writer.
+#include "vllm/entrypoints/model_loader.h"
+#include "vllm/gguf_builder.h"
 
 #include <doctest/doctest.h>
 
@@ -670,6 +674,42 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
 
   SUBCASE("GGUF k-quants are owed (W7), never silently dequantized") {
+    // Driven through the REAL path a `.gguf` argument takes — a synthetic file
+    // carrying the `general.architecture` llama.cpp writes for this family,
+    // handed to `LoadedEngine::FromModelDir`.
+    //
+    // This subcase used to construct a `Kind::kGguf` `ModelSource` by hand and
+    // call the factory directly, which is a state no user is ever in: it was
+    // the ONLY caller that ever reached the guard. A real file went to the
+    // entrypoint's GGUF architecture dispatch, which had no default and fell
+    // through to qwen3_5's config builder, so it died with "qwen3_5 gguf:
+    // unexpected architecture" — naming an unrelated model — while this
+    // assertion stayed green throughout (#809). The instrument was reporting on
+    // a state no user is in.
+    //
+    // The direct-source assertion is KEPT below: it is the registry factory
+    // guard's own gate, and it still covers a direct caller. What is added is
+    // the door a real file arrives at.
+    for (const char* arch : {vllm::kNemotronHGgufArch, vllm::kNemotronHMoeGgufArch}) {
+      gguf_test::GgufModelBuilder builder;
+      builder.AddKv(gguf_test::StrKv("general.architecture", arch));
+      // No tensors and no vocab: the refusal must fire at the dispatch, before
+      // any tokenizer or weight I/O, or it is not the guarantee being claimed.
+      const gguf_test::TempFile file(builder.Build());
+      // As a std::string: doctest stringifies a bare `const char*` from a
+      // braced init-list as the pointer, which names nothing in a failure.
+      const std::string arch_name(arch);
+      CAPTURE(arch_name);
+      CHECK_THROWS_WITH_AS(
+          vllm::entrypoints::LoadedEngine::FromModelDir(
+              file.path(), vllm::entrypoints::EngineParams{}),
+          doctest::Contains("NemotronHForCausalLM"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(
+          vllm::entrypoints::LoadedEngine::FromModelDir(
+              file.path(), vllm::entrypoints::EngineParams{}),
+          doctest::Contains("§5b W7"), std::runtime_error);
+    }
+
     vllm::ModelSource source;
     source.kind = vllm::ModelSource::Kind::kGguf;
     CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, source),

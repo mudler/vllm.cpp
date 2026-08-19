@@ -290,6 +290,7 @@ jobs:
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
+          python3 tests/scripts/test_agent_pr_body.py
       - name: A citation that names a symbol still finds it (#1143, #1139)
         # The tree already carried 539 `path::Symbol` citations and had never
         # checked one. Line anchors are what rot: one 45-line insertion near the

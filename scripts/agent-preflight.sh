@@ -149,6 +149,7 @@ SUITES=(
   test_gpu_lock_one_truth
   test_main_baseline
   test_agent_preflight_skip_report
+  test_agent_pr_body
   test_check_symbol_anchors
 )
 

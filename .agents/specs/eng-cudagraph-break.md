@@ -713,21 +713,46 @@ DIRECTLY, so it bypasses the predicate entirely, and the `(S, q, spec)` key only
 changes which map entry a step uses. The five migrated drivers read 0 differing
 on the same binary.
 
-`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore pins steps 0
-through 2 -- the two cold slots and the FIRST capture -- and prints all five
-outcomes, so the reading above is re-derivable with one command on a leased
-device. It asserts what it measured rather than what W6 wanted, and the
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore pinned steps 0
+through 2 -- the two cold slots and the FIRST capture -- and printed all five
+outcomes, so the reading above stayed re-derivable with one command on a leased
+device. It asserted what it measured rather than what W6 wanted, and the
 difference between "the spec path is broken" and "the second ring slot's capture
-is refused" is the whole value of the case.
+is refused" is what made the cause findable.
 
-There is also no eager arm to compare a spec step against, and that is worth
-recording for whoever picks it up: every other case in this file selects one with
-`max_num_reqs == 0`, because `PadToCaptureSize` then returns -1, and a spec step
-takes `S = B` and never consults `max_num_reqs`. The A/B has to be between two
-GRAPHED drivers that differ only in HISTORY. They must also run SEQUENTIALLY
-rather than step-interleaved: the capture pre-grows the pool for its retained
-`[S, vocab]` logits immediately before `BeginCapture`, and a second driver's step
-in between takes the block that was just freed.
+**#1380 IS FIXED, and the cause is not the one the pre-grow comment assumed
+(2026-08-19, `thor:gpu0`, sm_110).** A backtrace taken AT the failing
+`cudaMalloc` -- not inferred from the message, which names the API and no call
+site -- resolves to `DBuf` construction inside `GdnBlockPaged`
+(`src/vllm/model_executor/models/qwen3_5.cpp`, the `dconv` causal-conv output),
+reached through `RunDenseLayerPaged` and `DenseForwardLayers` from the
+`GraphCaptureScope` in `Qwen3_5DenseDecodeGraph::Step`. The request was 960
+bytes, which at the gate's synthetic shape is BOTH `[T=6, conv_dim=80]` bf16 and
+`[S=6, vocab=40]` f32.
+
+That coincidence IS the defect. `DevicePool` hands out blocks by SIZE CLASS and
+knows nothing about tensors, so a pre-grow that allocates and frees one
+`[S, vocab]` block supplies one block of a class the captured forward may need
+several of. A `VT_POOL_TRACE_CLASS` trace on the device measured the forward
+holding TWO blocks of that class live at once, against a pre-grow of one, with
+the other ring slot's retained logits holding the third. `DevicePool` now
+measures the per-class PEAK a step holds live above its own baseline, and
+`PreGrowForCapture` makes the free list able to serve that profile before
+`BeginCapture`. Both Qwen3.5 drivers record the profile at the end of their COLD
+step, per SLOT, because two shapes interleave through one pool.
+
+**The eager arm question is answered, and the answer is the opposite of what this
+paragraph used to say.** It read that the A/B "has to be between two GRAPHED
+drivers that differ only in HISTORY", because `max_num_reqs == 0` does not select
+eager on a spec shape (`S = B` never consults it). Two graphed drivers is wrong:
+measured, they both capture and compete for one pool, and the refusal moves from
+the second ring slot to the first. The eager arm is
+`Qwen3_5DenseModel::ForwardDevice`, which is the body the driver's own disabled
+path runs. And the SEQUENCING rule the paragraph got right has the opposite
+reason: the two arms must not interleave because an eager forward between the
+graph arm's steps DEEPENS the shared free list on the graph arm's behalf and
+hides the defect outright -- the interleaved shape of this case passed 1240
+assertions at the un-fixed head while the driver stepped alone threw.
 
 For each migrated model, run the same inputs through the segmented capture path and
 through the eager forward with capture disabled, and require the logits to be
@@ -1545,6 +1570,137 @@ CONFIRMED on a leased GPU and is no longer an open question for any later stage.
 
 Each item names the stage that owns it. Nothing here is claimed by W1.
 
+- ~~**A speculative capture does a `cudaMalloc` INSIDE the captured region and
+  throws** ([#1380](https://github.com/mudler/vllm.cpp/issues/1380), found by
+  W6).~~ RETIRED 2026-08-19 on `thor:gpu0` (sm_110). The call site was named with
+  a backtrace taken AT the failing allocation rather than inferred from the
+  message: `dconv`, the GDN causal-conv output in `GdnBlockPaged`, reached from
+  the `GraphCaptureScope` in `Qwen3_5DenseDecodeGraph::Step`. `DevicePool` is
+  keyed by SIZE CLASS, that block shares a class with the retained
+  `[S, vocab]` logits at the gate's shape, and the driver's pre-grow supplied ONE
+  block against a measured demand of two. `DevicePool::PreGrowForCapture` now
+  serves the whole step's per-class transient demand; `## Gates` G1 carries the
+  measurement and the two detecting mutations.
+
+  **THE ARCHITECTURE QUESTION #1380 ASKED FIRST IS ANSWERED BY MEASUREMENT, on
+  `dgx:gpu0`.** The issue said the first thing a fix had to establish was whether
+  this reproduces at `sm_121a`, because SPEC-DSPARK W8 recorded a WORKING spec
+  capture on GB10. IT REPRODUCES. NVIDIA GB10, compute capability 12.1, driver
+  580.173.02, nvcc 13.0.88, `-DVLLM_CPP_CUDA=ON
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=OFF`, the binary resolving
+  `libcudart.so.13` and `libcublasLt.so.13`, job
+  `d092c4b6-809b-4742-81a5-5484276d000f`:
+
+  * at the RED sha `eae8cc3f0`, `cudaMalloc: operation not permitted when stream
+    is capturing`, then the queue poisoned on the following step -- the SAME
+    message and the same per-step shape as `thor:gpu0` at that sha, 507
+    assertions / 8 failed / exit 1;
+  * at the fixed sha `15906f0a4`, **6 cases, 3306 assertions, 0 failed, exit 0**,
+    the spec case reading `5 steps x 240 logits, 0 differing, 3 replays` and the
+    five pre-W6 drivers `0 differing, 4 replays` each.
+
+  **Two architectures, both arms, identical readings.** That supersedes the
+  argument this entry used to rest on -- that the defect is host-side
+  `DevicePool` arithmetic and therefore architecture-independent -- by measuring
+  it instead. The argument still holds and is still worth keeping, because
+  `tests/vllm/models/test_device_pool.cpp` reproduces the same deficit with fake
+  host backends, no GPU and no CUDA at all.
+
+  **And it explains W8 without contradicting it.** Whether the collision occurs
+  is arithmetic over the MODEL's dimensions, not the device's: at the real 35B a
+  `[S, vocab]` f32 block with `vocab = 151936` shares a size class with nothing
+  the GDN block allocates, so W8's capture had no competitor for its class. The
+  fix removes the dependence on that coincidence rather than relying on it.
+
+  **The fix also uncovered a SILENT out-of-bounds read, fixed in the same flow**
+  ([#1394](https://github.com/mudler/vllm.cpp/issues/1394)). Moving which pooled
+  block holds a tensor moves what follows it, and `vt::cpu::PagedAttentionKernel`
+  read `btab[r * bt_row + (j / block_size) * bt_col]` for every
+  `j < seq_lens[r]` without checking the table had that many columns.
+  `test_qwen3_5_decode_graph_seam.cpp`'s `SpecAttnMeta` supplied one column
+  against shape C's `seq_lens = 24` at `block_size = 16`.
+
+  **THE SEVERITY WAS RECORDED TOO LOW FIRST, AND THE CORRECTION RAISES IT.** This
+  entry, the commit body and [#1394](https://github.com/mudler/vllm.cpp/issues/1394)
+  all first read that the case "passes at `origin/main`", on the strength of one
+  reading: `test_qwen3_5_decode_graph_seam` at `5f68e60df` on `thor:gpu0`, 8 cases
+  / 138 assertions / exit 0, in a CUDA-ON build. **The operator then measured the
+  same file at the same SHA and got a deterministic SIGSEGV, exit 139, three runs
+  of three.** Both readings are real. What they say together is that the
+  out-of-bounds read is present at `main` unconditionally and that WHETHER IT
+  FAULTS depends on what the allocator put after the table -- so it crashes
+  deterministically in natural case order on at least one build, and is silent
+  wrong-page attention on another. "Passes at main" was a statement about one
+  build presented as a statement about the tree, and it is withdrawn.
+
+  **What settles the presence of the defect independently of any heap layout**:
+  `origin/main` built with ONLY the kernel refusal added and WITHOUT the
+  test-data fix -- the refusal FIRED (`## Gates` G1). A predicate over
+  `seq_lens[r]`, `block_size` and `block_table.shape[1]` cannot depend on what
+  follows an allocation.
+
+  **And the assertion counts never disagreed.** 135 is a run of the same 8 cases
+  that CRASHED inside the last one, so doctest never counts the three assertions
+  after the crash point; 138 is the complete run. `git diff` shows this pull
+  request adds no assertion to that file, and the file is byte-identical between
+  `5f68e60df` and `96ed8346f`.
+
+  The kernel now refuses, one compare per visited request outside the token loop,
+  and the helper sizes its table for the sequence length it declares. **The
+  `.agents/issue-index.md` row for #1394 still carries the withdrawn wording:
+  that file is append-only and one row per issue, so the correction lives here
+  rather than as an edit or a second row.**
+
+  **ONE ASSUMPTION IS CARRIED BY AN ARGUMENT AND BY NO GATE, and this entry
+  exists so nobody reads the green as covering it.** The profile a driver
+  pre-grows from is the one its COLD step recorded at that shape and slot, so the
+  fix rests on: *the captured forward demands no more blocks of any size class
+  than the eager forward at the same shape did*.
+
+  **What supports it is a reading of the code, not a measurement -- and the
+  reading this entry first gave was WRONG, though the conclusion survives it.**
+  The withdrawn wording was "both arms run the same `DenseForwardLayers`". They
+  call the same function and take DIFFERENT branches of it. The cold arm passes
+  13 arguments and lets `persistent_sdi` default to `nullptr`
+  (`src/vllm/model_executor/models/qwen3_5.cpp:11153-11156`); the capture arm
+  passes `dbuf ? s.dev.get() : nullptr` as a 14th (`:11084-11087`). The MoE
+  driver carries the same asymmetry (`:10595-10598` cold, `:10529-10533`
+  capture). Sameness was never the argument, and asserting it invited a reader to
+  check the wrong thing.
+
+  **The containment holds for the reason the branch itself gives, which is
+  stronger than sameness.** At `:8858-8890`, the `persistent_sdi == nullptr` arm
+  calls `BuildStepDevInputs` into the ACTIVE (main) pool and then
+  `MaybeBuildAttnCosSin`; the non-null arm allocates NOTHING there and calls only
+  `FillAttnCosSin` into buffers `s.dev` already owns, built pre-capture under
+  `ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b))`
+  (`:11043`, `:10493`) -- a DIFFERENT pool from the one `PreGrowForCapture` grows.
+  So at the one point where the arms diverge, the capture arm's main-pool demand
+  is a strict SUBSET of the cold arm's, and the asymmetry runs in the safe
+  direction. The `warm = false` reset paths (`:10902`, `:10952`; `:10355`,
+  `:10406`) reset the graph and force a fresh cold step, so no slot ever
+  pre-grows from a profile recorded at a shape it no longer runs.
+
+  **None of that is a measurement, and the residual risk is unchanged**: the
+  argument covers the divergence the code has TODAY, and a future capture-only
+  allocation would break it silently. **No test asserts it.** The device gate would go red if the
+  assumption broke *at the gate's shape*, which is one shape on one synthetic
+  model, and the CPU gate asserts the pool primitive rather than the drivers'
+  use of it. So a capture-only allocation with no eager counterpart -- a new
+  buffer allocated inside `GraphCaptureScope` that the eager path never builds --
+  reopens #1380 exactly, and nothing here would say so until a capture threw on a
+  device.
+
+  **What would settle it**, in increasing cost: (1) assert the containment
+  directly -- have `PreGrowForCapture` record the profile it was given, have the
+  pool record the peak the CAPTURED region actually reached, and refuse (or
+  count) when the second exceeds the first, which turns the argument into a
+  runtime invariant a gate can mutate; (2) failing that, a second G1 shape whose
+  class arithmetic differs from the first, so the gate is not one coincidence
+  wide. Option (1) is the one worth building, because it holds for every driver
+  and every shape rather than for the shapes somebody remembered to gate.
+  Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+
 - ~~**The seam is not yet ENTERED from a production step.**~~ RETIRED by **W2**
   ([#1261](https://github.com/mudler/vllm.cpp/issues/1261)).
   `Qwen3DenseDecodeGraph::Step` opens a `vt::GraphCaptureScope` over a per-slot
@@ -1891,6 +2047,95 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   set against a one-length one, on a real checkpoint, which needs the same `dgx`
   window with weights that the async battery below needs. Owner: row
   **`ENG-CUDAGRAPH-BREAK`**.
+
+- **The block-table bound this row lands is CPU-ONLY, and the identical
+  unbounded read stays live on five other backends**
+  ([#1406](https://github.com/mudler/vllm.cpp/issues/1406), found while fixing
+  [#1390](https://github.com/mudler/vllm.cpp/issues/1390)).
+  [#1394](https://github.com/mudler/vllm.cpp/issues/1394) is scoped to
+  `vt::cpu::PagedAttentionKernel` and to the seam case that fed it a short table,
+  and both halves land here -- so this row CLOSES it. **It does not close the
+  read.** Six backends register `OpId::kPagedAttention` and the other five carry
+  the byte-identical index with `j` bounded only by `seq_lens[r]`:
+
+  | Backend | Sites | Where |
+  |---|---|---|
+  | CUDA | 12 | `src/vt/cuda/cuda_paged_attn.cu:230,385,521,676,837,1067,1310,1387,1583,1663,1830,1912` |
+  | ROCm | 7 | `src/vt/rocm/rocm_paged_attn.hip:226,424,557,765,1064,1277,1530` |
+  | Metal | 5 | `src/vt/metal/metal_msl.h:1054,1142,1293,1341,1591` |
+  | Tenstorrent | 2 | `src/vt/tenstorrent/tenstorrent_ops.cpp:3070,3100`, the HOST fallback |
+  | Vulkan | 1 | `src/vt/vulkan/shaders/vt_paged_attn.comp:110` |
+
+  **27 sites, counted with `grep -c` on this tree rather than read off a
+  truncated listing** -- which is the failure that made #1406's first revision
+  say nine. Two sites are NOT in that list because they are already bounded, and
+  saying which matters as much as the count: Tenstorrent's device-staging path
+  (`tenstorrent_ops.cpp:2258-2267`) walks `c < max_blocks` from
+  `block_table.shape[1]`, so it cannot leave the table.
+
+  **The seam cannot hold the bound as written**, which is why this is an issue
+  and not a follow-up commit. `vt::PagedAttention` (`src/vt/ops.cpp:3575-3577`)
+  validates the block table's ROW half only, and it performs zero content
+  dereferences today -- on a device path `seq_lens` is device memory the host
+  must not read. The one host-readable quantity, `PagedAttentionArgs::max_seq_len`,
+  is documented at `include/vt/ops.h:806-812` as a value for which "an upper
+  bound is safe", so a refusal keyed on it rejects calls the contract permits.
+  Vulkan and Metal make this concrete from the other side: both pass only
+  `block_table.stride[0]` and `stride[1]` to the shader
+  (`src/vt/vulkan/vulkan_ops.cpp:994-995`, `src/vt/metal/metal_ops.mm:940-941`),
+  never the column count, so those shaders could not bound the read even if they
+  wanted to. #1406 carries the three candidate resolutions and the argument for
+  each. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+
+- **The kernel refusal this row lands is REACHED but UNGATED, and PR
+  [#1407](https://github.com/mudler/vllm.cpp/pull/1407) is the gate**
+  ([#1390](https://github.com/mudler/vllm.cpp/issues/1390)). This is a staged
+  slice under AGENTS.md's "Nothing lands dead", named here rather than left to be
+  discovered.
+
+  **What is unreached is the TEST, not the code.** The refusal at
+  `src/vt/cpu/cpu_paged_attn.cpp:145-155` sits on the production paged-attention
+  path and every existing case runs through it; what no case does is FEED it a
+  short table. That is this pull request's own doing and is not an oversight to
+  regret: its second half sizes `SpecAttnMeta`'s block table correctly, so after
+  it, no test in the tree supplies the input the refusal exists to reject.
+  `grep -rn "block table is shorter" tests/` returns nothing, and deleting the
+  guard leaves `test_qwen3_5_decode_graph_seam` at 8/8 and `test_ops_paged_attn`
+  at 14/14, both exit 0.
+
+  **The detecting case is written and reviewed in #1407**, which adds the
+  `CHECK_THROWS_AS` over-long `seq_lens` case and two negative controls to
+  `tests/vt/test_ops_paged_attn.cpp`, and which merges IMMEDIATELY after this one
+  in the sequence #1393 then #1407 then #1391. Duplicating it here would leave
+  two gates for one refusal and no owner for either, so it is deliberately not
+  duplicated. Until #1407 lands, the refusal's predicate is supported by the
+  measurement in `## Gates` G1 -- `origin/main` built with ONLY the kernel refusal
+  and WITHOUT the test-data fix, where the refusal FIRED (exit 1, 8 cases / 7
+  passed / 1 failed) -- and by no test in this tree. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**.
+
+- **`PreGrowForCapture` ignores the pool's own soft cap, and would grow into the
+  abort it exists to prevent under a non-zero one** (INERT today; recorded so it
+  is not rediscovered as a fresh defect). `include/vllm/model_executor/models/device_pool.h:165-183`
+  frees blocks back to the driver when `retained_ + key > cap`, while
+  `PreGrowForCapture` adds to `retained_` without consulting `cap` at all. A
+  `cudaFree` inside a captured region aborts the capture exactly as a `cudaMalloc`
+  does, so a pre-grow that tripped the cap DURING capture would reopen #1380 by
+  the other API. Nothing can reach it now: every platform resolves
+  `device_pool_cap_bytes` to 0, which disables the cap entirely, and the pre-grow
+  itself runs OUTSIDE the captured region. A comment naming the coupling landed
+  with this row; the refusal or the cap-aware pre-grow is owed by whichever row
+  first sets a non-zero cap. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+
+- **`MarkStepBoundary()` is called on `Pool(b)` only, so the persistent decode
+  input pool's demand profile is never read** (INFO, harmless). Both Qwen3.5
+  drivers call `Pool(b).MarkStepBoundary()`; `PersistentDecodeInputPool(d.b)` is
+  a separate `DevicePool` whose `base` therefore stays 0 and whose `peak`
+  ratchets monotonically for the process lifetime. Nothing consumes either value
+  for that pool -- `PreGrowForCapture` is only ever called on `Pool(b)` -- so the
+  effect is two unread counters and not a leak or a wrong pre-grow. It is
+  recorded because a later reader who wires a second pre-grow would inherit a
+  profile that has never been reset. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
 
 ## Outcome
 

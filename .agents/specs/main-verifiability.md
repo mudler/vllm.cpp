@@ -464,7 +464,69 @@ Stop and report rather than pressing on if:
 
 ## Outcome
 
-**Not yet written.** Owed once the four post-merge observations in *Gates* are
-made. It must record: the first scheduled run's id and verdict, whether it
-survived concurrent pushes, whether the cadence needed changing and why, and
-what `scripts/main-baseline.py` printed against real data.
+Written 2026-08-19 from 39 completed scheduled runs, `2026-08-12T17:10Z` to
+`2026-08-19T04:49Z`. The follow-on repair is
+[`baseline-lane-eviction.md`](baseline-lane-eviction.md).
+
+**The lane works, and the 200-run window hides it.** `gh run list --workflow
+ci.yml --limit 200` reads 175 cancelled, 17 failure, 0 success, and that window
+spans 18 hours 14 minutes because the push and pull request lanes fill it. Read
+per event, the lane published a verdict for **37 of 39 triggers**: 20 `success`,
+17 `failure`, 2 `cancelled`. Median wall 118 minutes for a green run.
+
+The six owed observations, each now made:
+
+1. **A scheduled run fires on the cron.** 39 runs in 7 days at `17 */4 * * *`.
+2. **It survives concurrent pushes.** No scheduled run was cancelled by a push
+   in the window. The event discriminator holds.
+3. **`baseline-summary` reads the Actions API for its own run** with the default
+   `GITHUB_TOKEN` and `actions: read`. It published on every run that started.
+4. **`scripts/main-baseline.py` finds and parses real baseline runs.** It
+   renders SHA, verdict, failing jobs and the last fully green SHA.
+5. **Every job in `needs:` reaches green on a `schedule` payload.** Run
+   `32067210005` at `76f2a6d84e41` is all-green across the nine jobs of the
+   original coverage. No job was RED for a lane reason rather than a tree one.
+6. **The `missing` bucket stays empty against a real payload**, for every run
+   that executed jobs. It fills only for a run that executed none, which is
+   finding 8 below.
+
+**Risk 2 was NOT handled, and that is this spec's error.** It named "the
+baseline lane itself gets cancelled" and recorded the handling as "own group
+plus `cancel-in-progress: false`". That covers one half of GitHub's concurrency
+contract. The other half is the queue, which holds one pending run and cancels
+it when a third arrives. Runs `32140419182` and `32206456661` were discarded
+that way, with `startedAt: null` for every job, at the seconds their successors
+were created. `cancel-in-progress` cancelled nothing. The stop condition "the
+first post-merge scheduled run is cancelled anyway" fired, later than expected
+and by a mechanism this spec did not consider.
+
+**The cadence argument's premise expired.** "Successive runs still cannot
+overlap a 99-minute suite" was true when measured. Run `32118587477` took 9 h 28
+min with no predecessor to wait for, on 345 job-minutes of work, because a
+3.8-minute `ubuntu-latest` job waited 3 h 59 min for a runner. 8 of 39 runs ran
+over four hours. The cron is unchanged at `17 */4 * * *` and the reason is in
+`baseline-lane-eviction.md`: the per-run key removes the harm, and re-tuning a
+cadence on one day of contention is premature.
+
+**What the lane reports, and why it is not a defect of the lane.** No fully green
+baseline exists since [#503](https://github.com/mudler/vllm.cpp/issues/503) put
+`windows-msvc-cpu` and `windows-msvc-vulkan` on the lane on 2026-08-17. Both
+fail in 5 of 5 scheduled runs with
+`test_openai_api_server.exe exited with status -1073740791` (`0xC0000409`,
+`STATUS_STACK_BUFFER_OVERRUN`), which is
+[#584](https://github.com/mudler/vllm.cpp/issues/584), open and pre-existing.
+This is the same statement this spec made on the day it landed, one issue later.
+
+**Rejected, and why.** Making `push` non-cancellable stays rejected on the same
+arithmetic, restated with the current suite cost: 55 pushes/day at 345
+job-minutes is about 316 hours of job time per day, on a pool that already makes
+a 3.8-minute job wait 3 h 59 min.
+
+## Owed
+
+* Finding 8: `scripts/main-baseline.py` renders a run that executed zero jobs as
+  `RED` with all 11 jobs `missing`, so `NEWEST BASELINE: RED at <sha>` names a
+  tree the run never checked out. Filed as
+  [#1316](https://github.com/mudler/vllm.cpp/issues/1316) and owned by
+  [`baseline-lane-eviction.md`](baseline-lane-eviction.md), which removes its
+  only observed producer.

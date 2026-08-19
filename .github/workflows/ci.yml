@@ -78,8 +78,49 @@ on:
 # `schedule` and `workflow_dispatch` keep their own partition through the
 # event_name token and stay non-cancellable, so the baseline lane (#274) is
 # untouched.
+#
+# 2026-08-19 (#274): THE BASELINE EVENTS ADMIT `github.run_id` INTO THE KEY, and
+# every job-level group below takes the same conditional.
+#
+# `cancel-in-progress: false` is only half of GitHub's concurrency contract. The
+# other half is the queue, and it holds exactly ONE pending run: a third run
+# joining a group that has one run in progress and one pending CANCELS the
+# pending one. Non-cancellable therefore never meant "cannot be cancelled".
+#
+# It cost two of the last 39 scheduled baselines, and neither executed a single
+# job. Runs 32140419182 and 32206456661 return `startedAt: null` for EVERY job
+# and died at 16:46:51 and 04:49:54 -- the seconds their successors 32162114781
+# and 32217173498 were created, 2 out of 2. `cancel-in-progress` resolves false
+# for `schedule`, so it cancelled nothing; the shared key
+# `ci-schedule-refs/heads/main-<repo>` did.
+#
+# Queue depth two is reachable because the suite outgrew the cron. Run
+# 32118587477 took 9 h 28 min with NO predecessor to wait for, on 345
+# job-minutes of work: `agent-record` is a 3.8-minute ubuntu job and waited 3 h
+# 59 min for a runner, `baseline-summary` is a 0.2-minute job and waited 4 h 33
+# min. The four-hour cron laps that, and 8 of 39 runs ran over four hours.
+#
+# A queue that discards its own contents costs a verdict and reclaims nothing,
+# because a discarded run never ran anything to reclaim. So a group that never
+# cancels must never queue: `github.run_id` enters for `schedule` and
+# `workflow_dispatch` ONLY. For `push` the conditional resolves to `github.ref`
+# and for `pull_request` to the pull request number, so both keys are what they
+# were and #822's latest-only push lane is untouched.
+#
+# Widening the cron was REJECTED as the fix and left as a separate decision: it
+# is probabilistic (the wall is set by pool contention this file does not
+# control), it spends the ~9-commit red range the 4h cadence was chosen for, and
+# the contention it answers is one day old. See
+# .agents/specs/baseline-lane-eviction.md.
+#
+# `tests/scripts/test_main_baseline.py::GroupEvictionTests` holds the invariant
+# over every concurrency block in this file, derived from `cancel-in-progress`
+# rather than from a list, so a job that joins later is covered by the pull
+# request that adds it: never-cancels implies varies-per-run, and cancels
+# implies shared. Both directions, because a key that varies per run cancels
+# nothing.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.repository }}
+  group: ci-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.event.pull_request.number || github.ref }}-${{ github.repository }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
@@ -87,7 +128,7 @@ jobs:
     # Tree-scoped: validates the record as it stands at HEAD, so only the newest
     # push to a ref is meaningful. Cancellable.
     concurrency:
-      group: ci-agent-record-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-agent-record-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # NO job-level `if:`, deliberately, and no `always()`.
     #
@@ -677,7 +718,7 @@ jobs:
     #
     # Tree-scoped (drives cmake at HEAD): cancellable.
     concurrency:
-      group: ci-cuda-arch-features-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-cuda-arch-features-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -706,7 +747,7 @@ jobs:
     permissions:
       contents: read
     concurrency:
-      group: ci-cuda-fat-build-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-cuda-fat-build-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -781,7 +822,7 @@ jobs:
     #
     # Tree-scoped (checks HEAD's artifact): cancellable.
     concurrency:
-      group: ci-vulkan-spirv-freshness-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-vulkan-spirv-freshness-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -818,7 +859,7 @@ jobs:
     #
     # Tree-scoped: cancellable.
     concurrency:
-      group: ci-build-test-vulkan-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-build-test-vulkan-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -863,7 +904,7 @@ jobs:
     # Tree-scoped: the ratchet compares HEAD against the committed baseline, so
     # only the newest push matters. Cancellable.
     concurrency:
-      group: ci-device-leakage-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-device-leakage-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -943,7 +984,7 @@ jobs:
   build-test-cpu:
     # Tree-scoped and the most expensive lane in the workflow. Cancellable.
     concurrency:
-      group: ci-build-test-cpu-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-build-test-cpu-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -1004,7 +1045,7 @@ jobs:
     # portability, and build-test-cpu already owns execution. Keeping it to a
     # build is roughly one extra compile per PR.
     concurrency:
-      group: ci-build-newest-gcc-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-build-newest-gcc-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
@@ -1037,7 +1078,7 @@ jobs:
     # every available rich tier; qemu's Cortex-A53 model supplies the required
     # feature-poor execution and illegal-tier refusal gate.
     concurrency:
-      group: ci-build-test-cpu-arm64-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-build-test-cpu-arm64-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).
@@ -1124,7 +1165,7 @@ jobs:
     # the two mutually-exclusive sanitizer legs of the SAME run would land in one
     # group and cancel each other, leaving only whichever started second.
     concurrency:
-      group: ci-sanitize-cpu-${{ matrix.lane }}-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-sanitize-cpu-${{ matrix.lane }}-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     # Skip when the pull request was CLOSED: the run exists only to enter
     # the concurrency group and supersede the in-flight one (#822).

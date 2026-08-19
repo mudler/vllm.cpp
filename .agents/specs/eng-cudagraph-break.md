@@ -576,8 +576,33 @@ and an `rc` lease.
 for that model is established.**
 
 **G1, bit-exactness against eager, per migrated model, over MORE than one replay.
-DELIVERED for four of the four migrated drivers, 2026-08-19 (W3, #1291), on
-`thor:gpu0` through an `rc` lease** — NVIDIA Thor, sm_110, driver 595.78, nvcc
+RE-RUN AND EXTENDED for W4, 2026-08-19 ([#1307](https://github.com/mudler/vllm.cpp/issues/1307)),
+on `thor:gpu0` through an `rc` lease** — NVIDIA Thor, sm_110, driver 595.78,
+nvcc 13.0.88, source `4ea38eccbf82bbe6b8a227753fe64463fb840b78`, CUDA-ON build
+(`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110`), 32 `.cu.o` objects, the
+46.3 MB binary resolving `libcudart.so.13` and `libcublasLt.so.13` out of
+`/usr/local/cuda-13.0/targets/sbsa-linux/lib`.
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` ran **5 cases, 2066
+assertions, 0 failed, exit 0**:
+
+```
+G1 Qwen3MoeDecodeGraph    on CUDA: 5 steps x 100 logits, 0 differing, 4 replays
+G1 VoxtralDecodeGraph     on CUDA: 5 steps x 100 logits, 0 differing, 4 replays
+G1 DeepseekV2DecodeGraph  on CUDA: 5 steps x 100 logits, 0 differing, 4 replays
+G1 Qwen3_5DecodeGraph     on CUDA: 5 steps x  40 logits, 0 differing, 4 replays
+G1 Qwen3_5DenseDecodeGraph on CUDA: 5 steps x 40 logits, 0 differing, 4 replays
+```
+
+The two Qwen3.5 cases needed a cache pool the other three did not:
+`CudaGdnCachePool` allocates the RECURRENT ssm and conv state on device beside
+the paged KV, and each arm gets its own — the GDN recurrence advances its state
+every step, so two arms sharing one state would step each other's recurrence and
+the agreement would measure nothing. **Five of the six migrated drivers are now
+covered by measurement**; W2's `Qwen3DenseDecodeGraph` still is not, and still
+shares the seam by argument rather than by measurement.
+
+**The W3 run this extends, kept because it is the earlier evidence** (W3, #1291,
+2026-08-19, the same `thor:gpu0`) — NVIDIA Thor, sm_110, driver 595.78, nvcc
 13.0.88, source at `c905bb536`, CUDA-ON build (`-DVLLM_CPP_CUDA=ON
 -DVLLM_CPP_CUDA_ARCHITECTURES=110`), 32 `.cu.o` objects, the binary resolving
 `libcudart.so.13` and `libcublasLt.so.13`.
@@ -1178,11 +1203,13 @@ Every migrated step opens its scope in `kFull`, mirroring vLLM's decode arm. The
 PIECEWISE arm still has no production driver and `## Owed` names what has to be
 true before one exists.
 
-**G1 is MET for every migrated driver and is no longer owed.** Bit-exactness
-against the eager arm over the capture step plus THREE consecutive replays, on
-`thor:gpu0` through an `rc` lease: 3 cases, 1600 assertions, 0 differing. That
-was the item W1 and W2 both carried forward, and it is the only gate in this row
-a CPU harness could never have answered.
+**G1 is MET for five of the six migrated drivers and is no longer owed.**
+Bit-exactness against the eager arm over the capture step plus THREE consecutive
+replays, on `thor:gpu0` through an `rc` lease: **5 cases, 2066 assertions, 0
+differing**, the two Qwen3.5 drivers added by W4. W2's `Qwen3DenseDecodeGraph`
+is still covered by argument rather than by measurement, which `## Gates` G1
+says out loud. This is the only gate in this row a CPU harness could never have
+answered.
 
 W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
 `cudaStreamBeginCapture` mid-forward on our stream configuration — is

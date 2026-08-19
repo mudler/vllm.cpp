@@ -282,7 +282,7 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   `output_throughput` up by more than that figure's own CV; `## Now` carries the
   bound. Quoting either total-token figure, or setting our 38.4776 beside vLLM's
   38.5516, compares two different workloads.
-- [#1365](https://github.com/mudler/vllm.cpp/issues/1365), a reproducible ~4 s
+- [#1381](https://github.com/mudler/vllm.cpp/issues/1381), a reproducible ~4 s
   TTFT outlier on request 3 of every c1 leg of ours, which the oracle does not
   have: index 2 reads 3.981 / 3.924 / 4.006 / 3.955 s across the warmup leg and
   all three reps against 0.73-0.93 s for every other request, four legs of four,
@@ -290,7 +290,13 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   because the median of six averages ranks three and four and the outlier never
   occupies either; it moves the MEAN (ours 1347.6-1372.6 ms against the oracle's
   873.3-900.2 ms) and costs ~3.1 s of the 174.39 s c1 wall. The cause is not
-  chased here.
+  chased here. **This finding was first appended to `.agents/issue-index.md`
+  under the link `#1365`** in `9e1a5e573` (#1369), which is the O(n^2) BPE merge
+  loop and unrelated; no issue existed for the finding at all until #1381. That
+  landed row is NOT edited, because the append-only rule permits in-place
+  correction only before a row lands (the #979 precedent), so the index carries
+  an appended `#1381` row as the correction and a reader who arrives at the
+  `#1365` row should follow it there.
 - The checkpoint size disagrees between records: this spec's `## Outcome` says
   55,586,114,863 bytes and the campaign's `NOTES.txt` says 55,586,040,114, a
   difference of 74,749 bytes. The 2026-08-19 run DID re-derive it, and it agrees

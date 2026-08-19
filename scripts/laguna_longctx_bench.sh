@@ -5,19 +5,37 @@
 #   Lever B = VT_LAGUNA_SWA_WINDOW (byte-exact window-bounded SWA reads, default ON)
 #   Lever A = VT_LAGUNA_KV_BF16    (near-tie bf16 paged KV, default OFF / opt-in)
 #
-# RUN ON GB10 (dgx.casa), from the extracted build tree (git-archive transfer — NOT rsync),
-# with the checkpoint at ~/laguna-xs-nvfp4. Serializes on GPU_LOCK, default $HOME/gpu.lock
+# RUN ON the GB10 gate host `${GATE_HOST}` names, from the extracted build tree
+# (git-archive transfer — NOT rsync). Serializes on GPU_LOCK, default $HOME/gpu.lock
 # (never force).
 # Park local-ai-worker before, restore after (see AGENTS box-safety). Median-of-3, drop-caches.
 #
 #   scripts/laguna_longctx_bench.sh <nvfp4-dir> <laguna-gen-binary>
 #
+# BOTH operands are required. They used to default into one operator's `$HOME`
+# layout, so a second developer's run measured whatever happened to sit there,
+# or nothing, after taking the GPU lock and dropping the page cache. This
+# harness refuses first instead (#1190).
+#
 # The graph/eager KV is fixed-capacity (pos + VT_LAGUNA_KV_HEADROOM rows); the 2048 arm needs
 # headroom >= ~2048 or it trips the capacity VT_CHECK — this harness sets it per length.
 set -euo pipefail
 
-MODEL="${1:-$HOME/laguna-xs-nvfp4}"
-BIN="${2:-$HOME/laguna-n4-build/build-cuda/examples/laguna-gen}"
+refuse_operand() {  # $1=position $2=what $3=where it should come from
+  echo "REFUSED: $(basename "$0") needs its $1 operand, $2." >&2
+  echo "  usage: $(basename "$0") <nvfp4-dir> <laguna-gen-binary>" >&2
+  echo "  $3" >&2
+  echo "Ask the developer for the value. Never substitute another" >&2
+  echo "developer's host or path, and never guess a default." >&2
+  exit 3
+}
+
+MODEL="${1:-}"
+BIN="${2:-}"
+[ -n "${MODEL}" ] || refuse_operand first "the NVFP4 checkpoint directory" \
+  "Keep it under \${CHECKPOINT_ROOT} from .env and pass the full path."
+[ -n "${BIN}" ] || refuse_operand second "the built laguna-gen binary" \
+  "It is <your build dir>/examples/laguna-gen; .env declares no build path."
 IDS="2,785,9626,377,15360,395"          # prompt ids (same stream as prior Laguna gates)
 BASE_ENV="VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1"
 LOCK="${GPU_LOCK:-$HOME/gpu.lock}"   # THE box mutex, one truth (#777)

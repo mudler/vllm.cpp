@@ -46,8 +46,10 @@ row wrote the debt into the file rather than into a count. 20 files.
 ## The classification, per hit
 
 The rule is applied per hit and never per file, because the campaign measured
-that density does not predict the defect. Of the 22 query hits, 12 are
-configuration and 10 are provenance.
+that density does not predict the defect. Of the 22 query hits, 13 are
+configuration and 9 are provenance. After the conversion the same query returns
+9 hits over the same paths, and every one of them is in the provenance column
+below.
 
 | File:line | Class | Why |
 |---|---|---|
@@ -152,9 +154,9 @@ wrong source and records the wrong provenance in the manifest. That is the
   executable half. A relative default such as `${BUILD_DIR:-build-triton-regen}`
   is nobody's path and stays, and `${GPU_LOCK:-$HOME/gpu.lock}` is exempt for the
   reason `.env.example` records.
-- The provenance hits stay literal. Six files and nine sentences are pinned by
-  content, so a later blind sweep that rewrites a recorded measurement's host
-  goes red.
+- The provenance hits stay literal. Nine files and twelve sentence fragments are
+  pinned by content, so a later blind sweep that rewrites a recorded
+  measurement's host goes red.
 
 The last case is the one that protects the second class. Every other assertion
 here would pass a `sed` that converted the whole tree.
@@ -193,6 +195,58 @@ The campaign's stop conditions apply unchanged. Report `NEEDS_DECISION` rather
 than guessing when one paragraph holds both classes, and never rename a file
 whose name carries a host.
 
+## Evidence
+
+Red before green, at base `5c8671c50`, with the suite written and no file
+converted:
+
+```text
+$ python3 tests/scripts/test_env_agnostic_tooling.py
+Ran 11 tests in 1.439s
+FAILED (failures=58)
+```
+
+Ten of the eleven cases failed. The one that passed is
+`ProvenanceTests::test_every_recorded_measurement_keeps_its_host`, which is
+correct: that guard has to be green on both sides of this change, because what
+it protects is what must NOT move.
+
+Green after, same command, 11 tests `OK`.
+
+The campaign's query over the wave's paths returns 9 hits after the conversion,
+down from 22, and each of the 9 is in the provenance column of
+`## The classification, per hit`:
+
+```sh
+git grep -hoIE 'dgx\.casa|nas_share|192\.168\.|thor:gpu0' \
+  -- scripts tools third_party/README.md ':!scripts/dgx-bringup.sh' | wc -l
+```
+
+Four mutations, each applied to the committed tree, each restored and confirmed
+byte-for-byte identical by `git write-tree` returning `e2d6c00e5` again with
+`git status --porcelain` empty. Every mutation compiled, so none of them is a
+build failure reading as a passing test:
+
+| Mutation | compile_rc | Failing cases |
+|---|---:|---:|
+| `sed 's/dgx\.casa/${GATE_HOST}/g'` over the six provenance files | 0 | 6, all `ProvenanceTests` |
+| reintroduce `${CUTLASS_DIR:-${HOME}/cutlass_probe}` in `regen-triton-aot.sh` | 0 | 3 |
+| restore `--pin` default `/home/mudler/_git/vllm` in `dump_gdn.py` | 0 | 3 |
+| delete the `resolve_pinned_source` call site in `dump_moe.py` | 0 | 4 |
+
+The first is the one this row exists to make expensive. A blind sweep of the
+tree is the cheapest way to close #1190 and the only way to falsify the records
+while doing it, and until now nothing anywhere would have gone red.
+
+The last is the reachability mutation. Removing the call site and resolving the
+literal inline keeps `parity_env.py` compiling and its unit behaviour intact,
+and the suite still goes red, so the gate measures the entry point rather than
+the helper.
+
+`scripts/agent-preflight.sh --staged --fail-on-skip` reported 84 gates `ok`,
+zero `FAIL`, and two `SKIP`, both because `origin/main` had moved and the branch
+was behind it. The post-merge run is recorded in the pull request.
+
 ## Owed
 
 **The derivation query cannot see the defect it was written to find.**
@@ -221,6 +275,6 @@ filed and not fixed in the same flow.
 
 ## Now
 
-`ENV-AGNOSTIC-W1-TOOLING` converts 12 configuration hits across `scripts/`,
-`tools/` and `third_party/README.md`, leaves 10 provenance hits literal, removes
-the five hard-coded defaults those files carried, and gates each refusal.
+`ENV-AGNOSTIC-W1-TOOLING` converts 13 configuration hits across `scripts/`,
+`tools/` and `third_party/README.md`, leaves 9 provenance hits literal, removes
+the hard-coded defaults five entry points carried, and gates each refusal.

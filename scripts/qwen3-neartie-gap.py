@@ -19,8 +19,8 @@
 #                                       OUR token (0 = our token IS vLLM's argmax;
 #                                       99_999_000 = our token outside vLLM's top-K
 #                                       => real divergence, gate fails).
-# Run on dgx with the oracle venv (PATH incl. ~/venvs/vllm-oracle/bin):
-#   PATH=$HOME/venvs/vllm-oracle/bin:$PATH ~/venvs/vllm-oracle/bin/python \
+# Run on the gate host with the oracle venv (PATH incl. ${VLLM_ORACLE}/bin):
+#   PATH="${VLLM_ORACLE}/bin:$PATH" "${VLLM_ORACLE}/bin/python" \
 #     scripts/qwen3-neartie-gap.py --model Qwen/Qwen3-4B \
 #       --golden-dir tests/parity/goldens/qwen3_greedy_4b
 import argparse, os, sys

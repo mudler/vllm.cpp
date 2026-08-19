@@ -1702,16 +1702,46 @@ target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # domain. Reaches src/ for the tier header and the threadpool test hook.
 vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
 target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# LTX25-TEXT-LINEAR-MEM (#1286): the seam's PEAK RESIDENT bound. Every other
-# GEMM gate here asserts values or byte equality, so a kernel that allocated a
-# whole intermediate per worker would pass all of them. Registered only on
-# Linux, because the measurement is /proc/self/{status,clear_refs}; compiling it
+# LTX25-TEXT-LINEAR-MEM (#1286): the seam's ALLOCATION bound, on both
+# `MatmulOneChunk` instantiations. Every other GEMM gate here asserts values or
+# byte equality, so a kernel that allocated a whole intermediate per worker
+# would pass all of them. It counts bytes REQUESTED through replaced global
+# `operator new` overloads, not peak RSS -- the peak-RSS draft read zero at
+# every geometry while passing every bound, because glibc retains the arena
+# (spec `## Outcome` W4).
+#
+# Registered only on Linux, and NOT because of /proc or the threadpool: the
+# counter reads nothing under /proc and the pool is portable. It is that the
+# replaced allocation functions serve the WHOLE PROGRAM, so the gate depends on
+# every `delete` in the binary reaching the matching replaced `delete`, and on
+# its fixed slack term being calibrated against the library doing the
+# allocating. Both hold for glibc/libstdc++ and are unestablished elsewhere; a
+# standard library linked as its own runtime keeps its own `operator new`, and
+# the mismatch is a heap corruption rather than a red assertion. Compiling it
 # elsewhere with a skip would print `Status: SUCCESS!` over `assertions: 0`,
-# which reads as a pass. Reaches src/ for the threadpool test hook, which is what
-# lets one process sweep the worker count.
+# which reads as a pass. Extending the lanes is owed, not a one-line change.
+# Reaches src/ for the threadpool test hook, which is what lets one process
+# sweep the worker count.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   vllm_cpp_add_test(test_ops_matmul_mem vt/test_ops_matmul_mem.cpp)
   target_include_directories(test_ops_matmul_mem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # The C allocator is counted through the LINKER, not through a symbol
+  # definition. `--wrap` redirects the calls made by the objects in this link --
+  # which includes libvllm.a, and so cpu_ops.cpp -- while leaving `malloc` itself
+  # defined by whoever normally defines it. Defining `malloc` in the test would
+  # instead be a second strong definition beside AddressSanitizer's own
+  # interceptor, which is what would break the sanitize-cpu lane. Scoped to this
+  # one target, so nothing else in the suite is affected.
+  #
+  # These flags are LOAD-BEARING, not an optimization: the test references
+  # `__real_malloc` directly, so dropping one fails the LINK rather than quietly
+  # costing the gate its malloc coverage. Verified by mutation (M-W).
+  target_link_options(test_ops_matmul_mem PRIVATE
+    -Wl,--wrap=malloc
+    -Wl,--wrap=calloc
+    -Wl,--wrap=realloc
+    -Wl,--wrap=aligned_alloc
+    -Wl,--wrap=posix_memalign)
 endif()
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt

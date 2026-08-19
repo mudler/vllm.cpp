@@ -56,14 +56,14 @@ to bound.
 Read out of the tree at `origin/main` `678fc672c`:
 
 1. **The seam allocates exactly one thing per call, and it is thread-local.**
-   `src/vt/cpu/cpu_ops.cpp:125` — `static thread_local std::vector<float> af;`,
+   `src/vt/cpu/cpu_ops.cpp:130` — `static thread_local std::vector<float> af;`,
    resized to `nrows * k` where `nrows = min(16, chunk rows)` and 16 is ggml's
    `blck_1`. Nothing else in `MatmulChunked`, `MatmulOneChunk`,
    `MatmulOneChunkRef` or `vt::MatmulBT` allocates. At the shipped
    `k = 188160` that is `16 x 188160 x 4 = 12.04 MB` per worker, and at
    `hardware_concurrency() = 20` it is **241 MB in total**, not 26 GiB.
 2. **`static thread_local` means it is allocated once per worker for the process
-   lifetime and never shrinks** — the comment at `cpu_ops.cpp:122-124` says so.
+   lifetime and never shrinks** — the comment at `cpu_ops.cpp:127-129` says so.
    That is a retention property worth recording; it is not a per-call cost.
 3. **The call site's `scaled` copy is pre-existing and unchanged by #1252.**
    `ltx2_text_encoder.cpp:460-465` builds one `std::vector<float>` the size of
@@ -89,6 +89,13 @@ the fix is chosen from #1286's own list and this table is rewritten before any
 code is written.
 
 ## Tests to port
+
+> **This section is the PLAN, and its instrument was refuted.** `VmHWM` read
+> `growth_bytes = 0` at every geometry while passing every bound. The shipped
+> gate counts bytes requested through replaced global `operator new` overloads
+> instead. Read `## Outcome` W4 before reading the paragraph below as a
+> description of what landed. The same warning applies to the peak-RSS paragraph
+> under `## Risks/decisions`.
 
 None to port: there is no upstream test for a C++ threadpool's peak resident
 footprint. The new test is original and its contract is stated where it lives.
@@ -171,7 +178,10 @@ than deciding it in code. No tolerance is widened to make a red green.
 is written to bound a *difference* at a geometry where the signal (12 MB per
 worker) is far above malloc noise, rather than to pin an absolute number. If a
 robust bound cannot be written, that is reported as a finding instead of being
-weakened until it passes.
+weakened until it passes. **This risk was realised in the worst available
+form** — not a flaky red but a permanent green over a measurement of zero. See
+`## Outcome` W4: the peak-RSS instrument was refuted and replaced, and this
+paragraph describes the plan rather than what shipped.
 
 ## Owed
 
@@ -183,13 +193,61 @@ weakened until it passes.
 - **No GB10 number.** Every measurement below is from a 20-core Zen 5 under KVM.
   Allocation sizes are architecture-independent, so the attribution carries; a
   throughput ratio does not, and none is claimed for GB10.
-- **The seam's tile is retained for the process lifetime.** `af` is a
-  `static thread_local` that grows to the largest `K` any GEMM on that worker
-  ever saw and never shrinks. At `K = 188160` and 20 workers that is 232 MiB
-  held until exit, on a box that may later be tight. It is bounded, deliberate
-  and now measured; it is not repaired here, because the buffer exists precisely
-  so a worker allocates once, and trading that away is a performance decision
-  with its own spec.
+- **The seam's tile is retained for the process lifetime, PER INSTANTIATION.**
+  `af` is a `static thread_local` that grows to the largest `K` any GEMM on that
+  worker ever saw and never shrinks. At `K = 188160` and 20 workers that is
+  232 MiB held until exit, on a box that may later be tight. `MatmulOneChunk`
+  has **two** such buffers, one in each of `<true>` and `<false>`, so a process
+  that runs both orientations at that `K` retains up to **464 MiB** — measured,
+  not inferred, in `## Outcome` W5. It is bounded and deliberate; it is not
+  repaired here, because the buffer exists precisely so a worker allocates once,
+  and trading that away is a performance decision with its own spec.
+- **The counter does not see `mmap`/`sbrk`, nor an allocator reached inside a
+  shared library's own internal calls.** `--wrap` binds at THIS link, so a
+  `malloc` that `libstdc++.so` calls internally is outside it; every global
+  `operator new` is covered regardless, which is what a `std::vector` and a
+  `std::function` use. A kernel that took pages straight from `mmap` would be
+  invisible to this gate. Nothing in the seam does, and no mutation here
+  attempts it, so this is a stated boundary rather than a measured gap.
+- **`path:line` citations are an entirely uncovered class of anchor.**
+  `scripts/check-symbol-anchors.py`'s `CITATION_RE`
+  (`check-symbol-anchors.py:87-90`) requires a literal `::` between the path and
+  a C++ identifier, so it cannot match `path:line` at all. Counted over every
+  `.md` in this tree with the checker's own pattern against the line-anchor
+  form: **613 `path::Symbol` citations and 14,448 `path:line` citations**, of
+  which the second number is checked by nothing. That is how the wrong
+  `cpu_ops.cpp:125` in this row's own records survived the implementation
+  commit, the merge, and the gate. Extending the checker needs its own spec and
+  its own red-first mutation and is not attempted here — the 24:1 ratio is the
+  reason it deserves one rather than a follow-up line.
+- **The `cpu_ops.cpp:125` anchor cannot be corrected in `.agents/issue-index.md`.**
+  Row `#1286` at `issue-index.md:423` cites `cpu_ops.cpp:125` twice for
+  `static thread_local std::vector<float> af`, which is at **line 130**; `:125`
+  is `const int64_t blck_1 = 16;`. The index is append-only and keyed, and its
+  checker reads commits rather than the working tree, so the row cannot be
+  edited and a corrective row would be a duplicate key. **The correction lives
+  here and in the pull request body**, which is where a reader following the row
+  arrives. The same wrong anchor is frozen in the two commit bodies of
+  `0377cde70` and `8d46223fd` for the same reason.
+- **Linux-only registration is a calibration and toolchain scope, not a `/proc`
+  dependency.** The counter reads nothing under `/proc` and the threadpool is
+  portable. Three things bind it instead. The gate needs every `delete` in the
+  binary to reach the matching replaced `delete`; its fixed slack term is
+  calibrated against the library doing the allocating; and `-Wl,--wrap` is a GNU
+  `ld`/`lld` feature with no MSVC equivalent, so the C-allocator half of the
+  counter has no portable form at all. The first two are established for
+  glibc/libstdc++ and nothing else. Extending the gate to the macOS and Windows
+  lanes is owed work, and on Windows it needs a different mechanism rather than
+  a different flag.
+- **`runguard.py`'s line citations are unstable and are not chased.** The file
+  lives outside this repository on a mutable NAS path and was rewritten after
+  this row's implementation commit, so `runguard.py:236-237,260` no longer
+  resolves reproducibly. The claim it supports does not rest on the citation:
+  in the retained `memguard.tsv` the first sample of the #1252 run reads
+  `avail = 88.078`, `used = 31.553` — summing to 119.631 GiB, the box's whole
+  `MemTotal` — beside `rss = 0.001` for a child that had just started. A column
+  that reads 31.553 GiB before the process has allocated anything is
+  system-wide by construction, whatever line of `runguard.py` computes it.
 
 ## Now
 
@@ -232,10 +290,19 @@ floor, and consistent with the "never below ~40 GiB" the pre-#1252 runs showed.
 Two further readings from the same evidence, recorded because each one on its
 own would have been read as supporting #1286:
 
-- During its single-core projection the pre-#1252 run sits **dead flat** at
-  `anon = 34.35`, `rss = 33.56`, `used = 74.50` from t=124 s to t=1801 s. The
-  #1252 run's threaded stretch sits at `anon = 34.30`, `rss = 30.35`,
-  `used = 97.40`. **The same `anon` to 0.15%** — with `used` 23 GiB apart.
+- During its single-core projection (`cpu ~ 100%`, t=124-1801 s, 1676 samples)
+  the pre-#1252 run is **dead flat**: `anon` 34.283-34.441, `rss` 33.484-33.570,
+  `used` 74.405-74.573. The #1252 run's threaded stretch (`cpu > 500%`,
+  t=137.1-385.5 s, 236 samples) is a **ramp** rather than a plateau: `anon`
+  climbs 34.280 -> 42.593, `rss` 30.322 -> 42.120, `used` 97.350 -> 105.853.
+  The two coincide on `anon` at the ramp's FIRST SAMPLE — 34.280 against
+  34.283 — and nowhere after it. That near-identity is where the ramp starts,
+  not a matching steady state, and quoting it as "the threaded stretch sits at"
+  would present one sample as a stretch. `used` is 23 GiB apart at that sample
+  and 26.6 GiB apart at the peak, which is the starting occupancy again. What
+  the reading supports is unchanged: the argument in this section is
+  peak-minus-own-`t=0` (38.012 against 38.217), which does not depend on any
+  single sample.
 - The pre-#1252 run reached t=3017.3 s and was stopped from outside
   (`# TERMINAL signal=15 (supervisor asked to stop)`), still inside
   conditioning with `dit_runs=0`. Neither run ever loaded the DiT, so neither
@@ -246,12 +313,15 @@ Filed as [#1317](https://github.com/mudler/vllm.cpp/issues/1317).
 ### W2 — the local A/B: the seam costs 0.24 GiB and keeps the 8.4x
 
 Same probe source and flags on both arms, only the `Linear` body differing, at
-the shipped `K = 188160` and `out_features = 4096`; peak RSS is `VmHWM` read
-before and after the call with every operand already allocated and touched.
-20-core Zen 5 under KVM, Release, `-ffp-contract=off`, box **not idle**
-(loadavg 5.4-13.3), three replicates, median:
+the shipped `K = 188160` and `out_features = 4096` and at **`rows = 64`,
+REDUCED from the shipped 1024** to keep the single-threaded arm inside a
+sensible wall; the tile term this sweep isolates is independent of `rows` by
+construction, and the full `rows = 1024` geometry is measured separately below.
+Peak RSS is `VmHWM` read before and after the call with every operand already
+allocated and touched. 20-core Zen 5 under KVM, Release, `-ffp-contract=off`,
+box **not idle** (loadavg 5.4-13.3), three replicates, median:
 
-| arm | wall | rate | peak-RSS growth |
+| arm (`rows = 64`, reduced) | wall | rate | peak-RSS growth |
 |---|---:|---:|---:|
 | before, scalar `double` loop | **28.488 s** | 1.732 GMAC/s | **1.0 MiB** |
 | after, `vt::MatmulBT` | **3.378 s** | 14.60 GMAC/s | **232 MiB** |
@@ -260,10 +330,10 @@ before and after the call with every operand already allocated and touched.
 is **0.85% of the 26.6 GiB #1286 attributes to it**, i.e. 117x too small to be
 the reported defect.
 
-Swept over threadpool width at the same geometry, the growth is exactly the
-per-worker tile and nothing else:
+Swept over threadpool width at the same reduced `rows = 64` geometry, the growth
+is exactly the per-worker tile and nothing else:
 
-| workers | 1 | 2 | 4 | 8 | 16 | 20 |
+| workers (`rows = 64`, reduced) | 1 | 2 | 4 | 8 | 16 | 20 |
 |---|---:|---:|---:|---:|---:|---:|
 | peak-RSS growth (MiB) | 12.9 | 24.7 | 47.8 | 93.8 | 186.1 | **232.1** |
 | per worker (MiB) | 12.9 | 12.3 | 12.0 | 11.7 | 11.6 | 11.6 |
@@ -361,6 +431,180 @@ M1 mutates **`src/vt/cpu/cpu_ops.cpp`**, product code reached from
 the red evidence that the gate measures shipped behaviour rather than a
 test-local copy. This row adds no product code, so there is no production call
 site to delete — `reachability.md` answers that case directly.
+
+### W5 — the review of W4, and the three defects the bound above still had
+
+The fresh review of `39b34c0c8` returned nine findings and no `PASS`. **The
+refutation in W1-W3 was confirmed and is unchanged.** What failed review was the
+gate itself, which is the irony worth recording: a bound written to catch a
+memory regression did not catch three obvious shapes of one. The repairs and
+their evidence:
+
+**The bound admitted a 2x per-worker regression while its comment said it could
+not.** `Bound(n)` was `8 MiB + n * 2 * kTileBytes`. The per-thread term was
+literally two tiles, and the fixed term was two more at the gate's `K`. The
+reviewer's M-B — a second tile-sized `thread_local` per worker — doubled the
+growth at every worker count and passed **13 of 13 assertions**. At the shipped
+geometry that is 232 -> 464 MiB landing silently. The bound is now
+`1 MiB + n * kTileBytes`: exactly the property the file claims, over a fixed
+term measured at **64 bytes**. The comment now states which worker counts detect
+a doubling (4 and up) instead of claiming it detects all of them.
+
+**The counter was bypassed by an over-aligned `operator new`.** Only the
+non-aligned overloads were replaced, so the C++17 `std::align_val_t` family fell
+through to the library. The reviewer's M-D delivered the whole-activation defect
+through a 64-byte-aligned `operator new` and read **byte-identical growth,
+13/13 green**. That is the natural shape for a SIMD scratch buffer in this
+kernel, not a corner case. All eight aligned `new`/`delete` overloads are now
+replaced.
+
+**`std::malloc` is now seen too, through the linker rather than through a
+symbol definition.** The reviewer's M-E delivered the same defect through
+`std::malloc`, and the first pass of this repair left it green and narrowed the
+claim instead. That was the wrong call, and re-examining it produced a mechanism
+with none of the objections: `-Wl,--wrap=malloc` (and `calloc`, `realloc`,
+`aligned_alloc`, `posix_memalign`), scoped to this one target. It redirects the
+CALLS made by the objects in this link — `libvllm.a`, and so `cpu_ops.cpp` —
+without defining `malloc`, so AddressSanitizer's interceptor keeps its symbol
+and there is no second strong definition to collide with. **M-E now reds at
+1,086,324,800 bytes.** `free` is deliberately not wrapped: releasing a block
+gives no size without a header, and a header would mean applying an offset to
+pointers libc allocated before this file was reached, which is heap corruption
+rather than a failed assertion. So the C-allocator figure is bytes REQUESTED,
+cumulatively, which errs toward red and never toward a silent green — and it
+reads exactly **zero** on a clean run, so it adds no noise to any bound.
+
+A **coverage case** makes the whole claim executable rather than prose: it
+allocates through each counted route — plain `new`, array `new`, over-aligned
+`new` at two alignments, and `std::malloc` — and requires the counter to move by
+the amount asked for. Two failure modes are covered by two different mechanisms.
+Dropping a `--wrap` flag fails the LINK, because the file references
+`__real_malloc` directly (mutation **M-W**: `BUILT=NO`, `undefined reference to
+'__real_malloc'`), so the coverage cannot silently vanish from the build. The
+subtler mode — the route present but folded away — is what the assertion
+catches.
+
+**One thing the probe taught, which is why that case calls through a `volatile`
+function pointer.** A direct `std::malloc(n)` written in THIS translation unit is
+never wrapped: the compiler treats it as a builtin and folds it before the
+linker sees a symbol reference. Measured in a standalone probe — same-TU calls
+gave `malloc=0 calloc=0 posix_memalign=1`, while the identical calls made from a
+SEPARATE translation unit gave `malloc=1 calloc=1 posix_memalign=1` and the full
+3 MiB. Product code is always the separate-TU case, which is why M-E reds; but a
+coverage probe written the obvious way would have asserted nothing.
+
+**`MatmulOneChunk<false>` had no assertion behind it.** `<false>` and `<true>`
+are separate instantiations with separate `thread_local` buffers, and the gate
+called only `vt::MatmulBT` on a non-repacked weight. `MatmulKernel`
+(`cpu_ops.cpp:292-294`) routes `vt::Matmul` to `<false>`, and `MatmulBTKernel`'s
+`elem_kn_repacked` lever (`cpu_ops.cpp:306-314`) routes there too; `vt::Matmul`
+is #1259's `Ltx2FuseLoraIntoTensor` path — merged and unexercised on the full
+model. Both arms are now measured. The two `af` symbols are **separately
+confirmed with `nm -C`** on the gate's own binary, at distinct addresses, and
+the measurement shows the same thing: in the liveness case `MatmulBT` on 8 fresh workers reads
+33,554,496 bytes and the `vt::Matmul` call immediately after reads
+33,554,496 again. Eight tiles both times, not eight then seven — the calling
+thread paid for a second buffer, which one shared buffer could not produce. So
+the "232 MiB held until exit" figure under `## Owed` is **per instantiation**.
+
+**The chunk-row-span defect was invisible at every geometry the gate ran.** The
+reviewer's M-A (`nrows = ir1_end - iir1`) produced byte-identical growth and
+13/13 green. Replaying `MatmulChunked`'s grid arithmetic
+(`cpu_ops.cpp:230-264`) over all twelve shapes the sweeps use gives `dr1` = 16
+at eleven of them and 8 at the twelfth. Never above 16, which is the entire
+reason M-A could not be seen — and a coincidence of the chosen shapes, not a
+property of the kernel. The collapse to one chunk per thread
+(`nchunk0 * nchunk1 < nth * 4`) is LIVE and is the shipped default, since
+`VT_CPU_MATMUL_STEAL` is off, and after it `dr1` is `ceil(rows/nth)` when the
+activation is the longer axis and `rows` outright when the weight is. This was
+cheap to close rather than to file, so a case now runs at `rows = 128, n = 16,
+nth = 4` — a live non-NUMA shape where the collapse gives `dr1 = 32` and a
+chunk-sized buffer costs two tiles per worker instead of one.
+
+**One correction to the finding as it was written.** The review described this
+as "a real ~3x regression the gate cannot see on a NUMA host", citing
+`dr1 = ceil(rows/nth) = 52` at `rows = 1024, nth = 20`. Two things are off.
+`IsNuma()` is `constexpr false` in this tree (`cpu_threadpool.h:74`; NUMA is
+recorded as unported at `cpu_threadpool.h:25`), so that branch is dead today and
+the gap is reachable through the LIVE collapse instead. And at the shipped
+LTX-2.5 caption projection the weight is the longer axis
+(`n = 4096 > rows = 1024`), so the collapse takes `nchunk1 = 1` and
+`dr1 = 1024`, not 52 — a chunk-sized `af` there would be 770 MB per worker and
+15.4 GB across 20, which is #1286's hypothesised shape almost exactly. The
+finding was right that the gate was blind; the magnitude is larger than it
+said, and the trigger is nearer.
+
+**The mutation table**, on `Release`, 20-core Zen 5 under KVM, this branch's
+head. Every row rebuilt and re-run; `sha256(cpu_ops.cpp)` was
+`dc39eccdece48879e82be7209e95d182c6ed624eb04389de689fa4b58fe4f1f3` before and
+after every one of them.
+
+| mutation | defect | `BUILT` / `compile_err` | `git diff --stat` on `src/` | before this repair | after |
+|---|---|---|---|---|---|
+| **M-A** | `nrows` = chunk row span | `YES` / 0 | `cpu_ops.cpp \| 2 +-` | green (13/13) | **exit 1**, 2 failed of 38, `33,554,496 <= 17,825,792` on both arms of the collapsed case |
+| **M-A2** | `nrows` = whole activation | `YES` / 0 | `cpu_ops.cpp \| 2 +-` | red | **exit 1**, 14 failed of 38, `67,108,928 <= 9,437,184` |
+| **M-B** | second tile-sized buffer per worker | `YES` / 0 | `cpu_ops.cpp \| 3 +` | green (13/13) | **exit 1**, 10 failed of 38, `25,165,888 <= 17,825,792` at 4 workers and `58,720,320 <= 34,603,008` at 8 |
+| **M-D** | whole activation via 64-byte-aligned `operator new` | `YES` / 0 | `cpu_ops.cpp \| 12 +` | green (13/13) | **exit 1**, 14 failed of 38, `1,019,215,936` bytes at `rows=1024`, 4 workers |
+| **M-E** | whole activation via `std::malloc` | `YES` / 0 | `cpu_ops.cpp \| 12 +` | green (13/13) | **exit 1**, 14 failed of 38, `71,303,232 <= 9,437,184` at 2 workers and `1,086,324,800` bytes at `rows=1024`, 4 workers |
+| **M-W** | the `--wrap=malloc` link flag removed | **`NO`** / 1 | `CMakeLists.txt \| 1 -` | n/a | **link fails**, `undefined reference to '__real_malloc'` — the coverage cannot be dropped silently |
+
+**The reviewer's green was reproduced rather than taken on report.** The gate
+file from `39b34c0c8` was restored over the repaired one, M-B applied to
+`cpu_ops.cpp`, and the result was `exit 0`, **2 cases, 13 assertions, 0 failed,
+`Status: SUCCESS!`** — the reviewed bound passing over a doubled per-worker
+allocation, in this session's own build. The aligned half needs no re-run to
+confirm: `align_val_t` appears **0 times** in the reviewed file and 13 times in
+the repaired one, so the C++17 family was simply not replaced. The tree was
+restored to the same `sha256(cpu_ops.cpp)` afterwards and rebuilt green.
+
+Green after the repair: **5 cases, 38 assertions, 0 failed, exit 0**,
+`Status: SUCCESS!`, against 2 cases and 13 assertions before it.
+
+**The `sanitize-cpu (address,undefined)` risk the reviewer named was exercised,
+and the record is in two parts because the second attempt was blocked.**
+
+The FIRST widening — the aligned `operator new` family, before `--wrap` was
+added — ran in the full lane's own configuration
+(`-DVLLM_CPP_SANITIZE='address,undefined'`, `-DVLLM_CPP_CUDA=OFF`,
+`UBSAN_OPTIONS=print_stacktrace=1`): **5 cases, 36 assertions, 0 failed, exit
+0**, no ASan or UBSan diagnostic. The `thread` lane was green too, once ASLR was
+disabled to work around this box's `FATAL: ThreadSanitizer: unexpected memory
+mapping` — a local kernel/TSan incompatibility, not a finding.
+
+**Rebuilding that lane after adding `--wrap` hit `No space left on device`** —
+other sessions filled the shared disk to 100%, and the build's first output was
+five `fatal error: error writing to /tmp/...: No space left on device` lines,
+which is an infrastructure failure wearing the costume of a code verdict. So the
+full lane was NOT re-run with `--wrap` in place, and that is stated rather than
+implied.
+
+What ran in its place is a standalone probe reproducing the gate's entire
+allocator mechanism in miniature — replaced plain and aligned
+`operator new`/`delete`, the five `--wrap` redirections, and a separate
+translation unit standing in for `cpu_ops.cpp` — compiled and linked with
+`-fsanitize=address,undefined`. It **builds clean and runs clean**: all three C
+allocator routes intercepted (3 MiB accounted), 64-byte alignment preserved
+through the replaced aligned `new`, replaced `operator new` accounting correct,
+no ASan or UBSan diagnostic, exit 0. That establishes the MECHANISM against
+ASan, which is precisely the collision the reviewer named. It does not stand in
+for a full-lane run and is not offered as one.
+
+**Full gate on the merged tree.** `ctest -j 6` at `origin/main` `edbc47ce0`:
+**100% passed, 0 failed out of 554**, 3 skipped by design, 1593.98 s. The box
+was heavily contended throughout — two other sessions were building and testing
+this tree, loadavg 109-149 on 20 cores — so `test_ltx2_video` took 1541 s where
+this branch's earlier run took a fraction of that. **Nothing red, and no
+wall-time figure here is a measurement of anything.** `check-agent-record.py`:
+`agent record OK: ENGINE=165 MODEL=377 QUANT=84 KERNEL=52 BACKEND=85
+ANCHOR-ROT=38`. `check-issue-index-append-only.py`: `OK`, 413 rows, zero
+duplicate keys, #1286 and #1317 each present once. `check-commit-trailers.py`
+and `check-commit-style.py` over `origin/main..HEAD`: both `OK`.
+
+**The bound is deliberately tight now, and that is the point.** At 8 workers the
+honest worst case is 8 tiles (every worker fresh, which the liveness case
+reaches) = 33,554,496 bytes against a bound of 34,603,008. The 1 MiB of headroom
+is 16,000x the measured incidental. Widening it again would buy nothing except
+the 2x hole M-B just walked through.
 
 ### What is not claimed
 

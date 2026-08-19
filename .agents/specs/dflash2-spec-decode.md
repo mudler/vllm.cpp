@@ -116,8 +116,9 @@ Present, and reused rather than rebuilt:
   block kernel that closed the `SPEC-DFLASH` speed gate.
 - The loader ALREADY shares `embed_tokens` and `lm_head` from the target, which
   is exactly what a DFlash2 checkpoint requires
-  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:56-60,155-157`). The
-  class comment at `include/vllm/model_executor/models/qwen3_dflash.h:75-77`
+  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:56-60,215-219`; the
+  second range was `:155-157` before W1 widened the resolver's comment). The
+  class comment at `include/vllm/model_executor/models/qwen3_dflash.h:79-82`
   claims the draft owns both; it is STALE and this row corrects it.
 - `src/vt/cuda/cuda_sample.cu:297-506` is a sort-free block-cooperative
   pivot-bracket threshold search, one block per row, ported from the same
@@ -127,17 +128,24 @@ Present, and reused rather than rebuilt:
 
 Absent, and owed by this row:
 
-- No route for `DFlash2DraftModel`. `SpeculativeConfig` classifies a DSpark draft
-  from its own `config.json` (`include/vllm/config/speculative.h:134-158`) and has
-  no DFlash equivalent for a second architecture. The identical gap for
+- No route for `DFlash2DraftModel`. `SpeculativeConfig` classified a DSpark draft
+  from its own `config.json` (`include/vllm/config/speculative.h:159-182` after
+  W1's insertion above it) and had no DFlash equivalent for a second architecture.
+  CLOSED by W1: `SpeculativeConfig::IsDflash2Draft`
+  (`include/vllm/config/speculative.h:115-138`) with its loader refusal
+  (`src/vllm/entrypoints/model_loader.cpp:430-517`, the classification helper
+  `ReadDflashDraftArchitectures` at `:430-456` and `RefuseDflash2Draft` at
+  `:458-517`). The identical gap for
   `DSparkDraftModel` is open as [#1193](https://github.com/mudler/vllm.cpp/issues/1193);
   this row does not fix that one, and must not collide with it.
 - No grouped dynamic convolution anywhere in `vt`.
 - No candidate selector, no lattice, no path walk.
 - No top-k that EMITS the surviving (id, value) pairs. The threshold search
   above masks below the k-th largest and returns no indices.
-- `is_causal` is not read. `include/vllm/model_executor/models/qwen3_dflash.h:22-24`
-  resolves causality by the legacy rule alone.
+- `is_causal` was not read: causality resolved by the legacy rule alone. CLOSED by
+  W1 in `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:96-171`
+  (`ResolveQwen3DFlashAttnModes`) and `:173-200`
+  (`MakeQwen3DFlashDraftConfig`).
 
 ## Port map
 
@@ -149,7 +157,7 @@ Absent, and owed by this row:
 | `dflash2/speculator.py` walk kernel | `src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp` + a CUDA walk kernel | D3: device from day one |
 | `dflash2/speculator.py` draft-logit cache | same file | the realized q the rejection sampler reads at T>0 |
 | `registry.py` + `spec_decode/__init__.py` | `include/vllm/config/speculative.h`, `src/vllm/entrypoints/model_loader.cpp` | classify from the draft's own config, as `IsDsparkDraft` does |
-| `_dflash_layer_causal` | `include/vllm/model_executor/models/qwen3_dflash.h:22-24` | D4; the ONE shared-behaviour edit |
+| `_dflash_layer_causal` | `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:96-171` | D4; the ONE shared-behaviour edit. LANDED in W1 |
 | `use_v2_model_runner` | no analogue | we have one runner; record the reason rather than porting a switch |
 | — | `src/vllm/model_executor/models/qwen3_dflash2_gguf.cpp` | the GGUF drafter arm, W5 |
 
@@ -287,9 +295,107 @@ reviewer who mutates the guarantee rather than reading it.
   throughput reads below vLLM's on the same workload, that is an unresolved
   implementation difference with a named next hypothesis, per AGENTS.md.
 
+## Owed
+
+Everything here is landed-but-not-yet-reachable, or found and not fixed. Each
+entry names what is missing, why it is not fixed where it was found, and the
+wave that discharges it. AGENTS.md `## Nothing lands dead` permits a staged
+slice to land unreached only when this list, the commit body and the pull
+request body all name it, so this section is the record that permission depends
+on and not a summary.
+
+- **O1 — the `is_causal` half of W1 is INERT at its own merge commit, on both
+  container arms.** Owner: this row, discharged by W2. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+  `ResolveQwen3DFlashAttnModes`' top-level arm, `MakeQwen3DFlashDraftConfig`'s
+  carry of the key, and `MakeDflashGgufConfig`'s read of
+  `dflash.attention.causal` are all live code with unit gates, and no checkpoint
+  this commit ADMITS can take any of them. The reason is the other half of the
+  same wave: every artifact that declares the key also declares the DFlash2
+  markers W1 refuses — `z-lab/Qwen3.8-27B-DFlash2` declares `is_causal false`
+  beside `architectures: ["DFlash2DraftModel"]`, and
+  `z-lab/Qwen3.8-27B-DFlash2-GGUF` declares `dflash.attention.causal` beside
+  `dflash.selector_rank` — and `RefuseDflash2Draft` throws on both before any
+  config is built. Every published DFlash1 artifact declares neither key, so it
+  takes the legacy arm exactly as before, which is the inertness the wave's
+  gates assert on purpose. This is `.agents/reachability.md`'s "unselected
+  branch" shape: the branch is reached by construction in a test and by no input
+  the production entry point accepts. It becomes live in W2, which is the wave
+  that lifts the refusal for the parts it implements. W1 lands it anyway because
+  splitting a refusal from the rule that makes the refused checkpoint correct
+  would land the refusal alone and leave the rule to be rediscovered.
+- **O2 — the loader's production call sites are not gated for the causality
+  carry.** Owner: this row, discharged by W2. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Mutation-proven by
+  W1's fresh reviewer: appending `draft->config.raw.erase("is_causal");` after
+  the `MakeQwen3DFlashDraftConfig` call in `LoadDflashDraft`
+  (`src/vllm/entrypoints/model_loader.cpp`, safetensors arm) and after the
+  `MakeDflashGgufConfig` call (GGUF arm) each COMPILES CLEAN and leaves both
+  focused suites GREEN. What holds the carry is the direct unit call on the two
+  builders, so the gate measures the builders and not the loader that uses them.
+  It is not repaired where it was found because an entry-point gate on this path
+  has to load a draft, and a draft load needs real draft weights: `LoadDflashDraft`
+  reads the config and the shards in one function and shares `embed_tokens` and
+  `lm_head` off a live target. W2 brings the DFlash2 fixture weights that make
+  such a gate constructible; before then the only reachable form is another unit
+  call, which is the thing that already fails to hold.
+- **O3 — `MakeQwen3DFlashDraftConfig` cannot parse the published DFlash2
+  `config.json` at all.** Owner: this row, discharged by W2. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Found by W1's fresh
+  reviewer and confirmed against the file on 2026-08-19: the builder does
+  `c.at("rope_theta")` and `c.at("block_size")`, and `z-lab/Qwen3.8-27B-DFlash2`
+  nests them as `rope_parameters.rope_theta` and `dflash_config.block_size`, with
+  neither key present at the top level. Both `at` calls throw, so the builder
+  cannot construct a config for the checkpoint this row exists to run. It is
+  invisible today because W1 REFUSES that checkpoint earlier, at
+  `RefuseDflash2Draft`, which runs before any config is built. It is a W2
+  blocker rather than a W1 defect: the builder is only ever asked to parse a
+  DFlash2 config once W2 lifts the refusal, and repairing it in W1 would land a
+  parse arm for a shape nothing feeds. `transformers` moved RoPE settings under
+  `rope_parameters`, so the fix is a fallback and not a replacement — DFlash1
+  checkpoints still carry the flat spelling.
+
 ## Now
 
-`SPEC-DFLASH2` is `READY`. The spec is committed and base-reachable, which is
-what a helper dispatch needs; no production code has landed. Next action: W1,
-dispatched to a fresh implementer against this spec, red-first on the causality
-gate.
+`SPEC-DFLASH2` is `ACTIVE`. W1 landed on 2026-08-19: the `DFlash2DraftModel`
+route and D4's `is_causal` precedence, both red-first and both mutation-proven on
+CPU. No DFlash2 mechanism landed with it, and none is claimed.
+
+What W1 ships is a REFUSAL. A draft whose `config.json` declares
+`DFlash2DraftModel` is refused at startup, before any weight is read, with both
+missing mechanisms named — from the dflash branch of
+`LoadedEngine::ResolveSpecConfig` and again at the top of
+`LoadedEngine::FromModelDir`, which is the site that matters, because the dflash
+draft load runs there BEFORE the constructor's resolution. Refusing rather than
+loading is the whole point: a DFlash2 checkpoint carries DFlash1's entire tensor
+set, so the DFlash1 lane would load it with nothing missing and draft worse
+tokens with no visible symptom.
+
+D4 landed with it, in both halves, and is NOT YET REACHED. `ResolveQwen3DFlashAttnModes`
+resolves a top-level `is_causal` ahead of `dflash_config.causal` and ahead of the
+legacy `layer_types` rule, and `MakeQwen3DFlashDraftConfig` — moved out of the
+loader's anonymous namespace so the key it carries is gateable at all — copies the
+key off the draft's own `config.json`. A resolution that reads a key the config
+builder drops is half a port, and only the two together make the rule reachable.
+Reachable in principle: no checkpoint W1 ADMITS declares the key, because every
+artifact that declares it also declares the DFlash2 markers the same commit
+refuses. `## Owed` O1 records that precisely, O2 records that the loader's own
+call sites are not gated for the carry, and W2 discharges both. What W1 asserts
+about D4 is therefore a unit guarantee plus the inertness of the DFlash1 lane,
+and no more than that.
+
+W1 also covers the GGUF drafter, which the spec's own W1 text did not name and
+which the `config.json`-keyed classification cannot see. `z-lab/Qwen3.8-27B-DFlash2-GGUF`
+@ `57ab3265056d4024870b0621cfc2c127537020ed` writes `general.architecture = "dflash"`,
+byte-identical to a DFlash1 drafter, and a GGUF carries no `architectures` array
+at all — so `qwen3_dflash_gguf.cpp` would have loaded it as DFlash1 with no
+error. The discriminator is therefore the DFlash2-only metadata
+(`dflash.selector_rank`, `dflash.selector_top_k`, `dflash.conv_kernel_size`), and
+`dflash.attention.causal` is the GGUF spelling of `is_causal` and resolves in the
+same precedence. Both were read off the published file on 2026-08-19; the shipped
+DFlash1 drafter `muse-glimmer-30b-gguf/dflash-kquant.gguf` carries none of those
+keys and is unchanged. This is a REFUSAL on the GGUF axis, not the GGUF drafter
+ARM, which stays W5.
+
+Next action: W2, the grouped dynamic convolution, CPU reference first, against
+the checkpoint's real shapes (taps 2, group 16, block 8).

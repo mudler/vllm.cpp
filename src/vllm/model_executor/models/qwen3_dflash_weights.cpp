@@ -94,8 +94,32 @@ OwnedTensor ConcatRawNK(const TensorResolver& get, const std::vector<std::string
 }  // namespace
 
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config) {
-  // Mirror _resolve_layer_attention (qwen3_dflash.py:86-146) + _dflash_layer_causal
-  // (:58-64). dflash_config overrides live in config.raw["dflash_config"].
+  // Mirror _resolve_layer_attention (qwen3_dflash.py:86-146) + _dflash_layer_causal.
+  // dflash_config overrides live in config.raw["dflash_config"].
+  //
+  // SPEC-DFLASH2 W1 (#1314), BEYOND-PIN. `_dflash_layer_causal` resolves an
+  // EXPLICIT top-level `is_causal` before it falls back to anything else
+  // (qwen3_dflash.py:58-67 @ vllm-project/vllm#52816 head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f`; the pinned 555967922 form at
+  // :58-64 has only the two legacy arms). So the order is exactly:
+  //
+  //   1. top-level `is_causal`, if present     -> every layer takes its value
+  //   2. `dflash_config.causal`, if present    -> every layer takes its value
+  //   3. the legacy rule                       -> causal iff the layer is SWA
+  //
+  // The order is the whole change. `z-lab/Qwen3.8-27B-DFlash2` declares all five
+  // layers `sliding_attention` AND `is_causal false`; under the legacy rule alone
+  // every layer runs CAUSAL, the draft still emits plausible tokens, a token gate
+  // against our own output sees nothing, and only ACCEPTANCE falls -- which the
+  // lossless verify hides (.agents/specs/dflash2-spec-decode.md D4).
+  //
+  // No published DFlash1 checkpoint declares `is_causal`, so arm 1 never fires
+  // for one and their resolution is unchanged, which is what upstream does in the
+  // same commit.
+  //
+  // The WINDOW is a separate answer and none of this touches it: upstream returns
+  // `(sliding_window, causal)` as two independent resolutions, and a
+  // non-causal SWA layer still attends within its window.
   static const std::string kSliding = "sliding_attention";
   const nlohmann::json empty = nlohmann::json::object();
   const nlohmann::json& dflash =
@@ -104,8 +128,13 @@ std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig
           ? config.raw.at("dflash_config")
           : empty;
   const bool use_swa = dflash.value("use_swa", false);
+  const bool has_is_causal = config.raw.is_object() && config.raw.contains("is_causal") &&
+                             config.raw.at("is_causal").is_boolean();
   const bool has_causal_override = dflash.contains("causal") && dflash.at("causal").is_boolean();
-  const bool causal_override = has_causal_override ? dflash.at("causal").get<bool>() : false;
+  const bool explicit_causal = has_is_causal ? config.raw.at("is_causal").get<bool>()
+                               : has_causal_override ? dflash.at("causal").get<bool>()
+                                                     : false;
+  const bool has_explicit_causal = has_is_causal || has_causal_override;
 
   const std::vector<std::string>& lt = config.layer_types;
   int64_t num_sliding = 0;
@@ -122,7 +151,7 @@ std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig
       is_sliding = lt[static_cast<size_t>(i)] == kSliding;
     }
     Qwen3DFlashLayerAttnMode m;
-    m.causal = has_causal_override ? causal_override : is_sliding;
+    m.causal = has_explicit_causal ? explicit_causal : is_sliding;
     if (is_sliding) {
       int64_t win = 0;
       if (dflash.contains("swa_window_size") && dflash.at("swa_window_size").is_number())
@@ -139,6 +168,35 @@ std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig
     modes.push_back(m);
   }
   return modes;
+}
+
+HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c) {
+  HfConfig cfg;
+  cfg.hidden_size = c.at("hidden_size").get<int64_t>();
+  cfg.num_attention_heads = c.at("num_attention_heads").get<int64_t>();
+  cfg.num_key_value_heads = c.at("num_key_value_heads").get<int64_t>();
+  cfg.head_dim = c.at("head_dim").get<int64_t>();
+  cfg.rotary_dim = cfg.head_dim;
+  cfg.rope_theta = c.at("rope_theta").get<double>();
+  cfg.intermediate_size = c.at("intermediate_size").get<int64_t>();
+  cfg.vocab_size = c.at("vocab_size").get<int64_t>();
+  cfg.num_hidden_layers = c.at("num_hidden_layers").get<int64_t>();
+  cfg.rms_norm_eps = c.at("rms_norm_eps").get<double>();
+  cfg.sliding_window = c.at("sliding_window").get<int64_t>();
+  cfg.layer_types = c.at("layer_types").get<std::vector<std::string>>();
+  cfg.raw = nlohmann::json::object();
+  cfg.raw["dflash_config"] = c.at("dflash_config");
+  cfg.raw["block_size"] = c.at("block_size");
+  // SPEC-DFLASH2 W1 (#1314): the top-level attention semantics, which
+  // ResolveQwen3DFlashAttnModes resolves ahead of every legacy arm. Upstream gets
+  // this key for free by reading it off a HuggingFace config object
+  // (`getattr(config, "is_causal", None)`, qwen3_dflash.py:60 @ the PR head);
+  // this builder copies named keys, so a key it drops is a key the resolution can
+  // never see. Optional, and absent from every DFlash1 checkpoint.
+  if (c.contains("is_causal") && c.at("is_causal").is_boolean()) {
+    cfg.raw["is_causal"] = c.at("is_causal");
+  }
+  return cfg;
 }
 
 Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& config,

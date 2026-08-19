@@ -130,13 +130,22 @@ struct PhaseLog::Impl {
     });
   }
 
+  // The thread object is HANDED OUT under `mu` and joined outside it. Reading
+  // `sampler.joinable()` with the lock released would race a concurrent
+  // `StartSamplerLocked`, which writes that same object; joining while holding
+  // `mu` would deadlock, because the worker needs `mu` to finish its wait. A
+  // second mutex for the thread's lifetime would invert the lock order against
+  // `Open`, which already holds `mu` when it starts the sampler. Moving the
+  // handle out is the one shape that has neither problem.
   void StopSampler() {
+    std::thread victim;
     {
       std::lock_guard<std::mutex> lock(mu);
       stop = true;
+      victim = std::move(sampler);
     }
     stop_cv.notify_all();
-    if (sampler.joinable()) sampler.join();
+    if (victim.joinable()) victim.join();
   }
 };
 

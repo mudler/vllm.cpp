@@ -125,7 +125,17 @@ bool DeclaredCausal(const nlohmann::json& obj, const char* key, bool* out) {
 }  // namespace
 
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config) {
-  // Mirror _resolve_layer_attention (qwen3_dflash.py:86-146) + _dflash_layer_causal.
+  // Mirror _resolve_layer_attention + _dflash_layer_causal. WHICH REVISION each
+  // half is read at, because the two differ and an unqualified anchor hides that:
+  // `_resolve_layer_attention` is `qwen3_dflash.py:86-146` at the parity pin
+  // `555967922` and `:109-169` at vllm-project/vllm#52816 head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f`, and its body is the SAME at both
+  // -- the PR moves the function down the file and does not edit it.
+  // `_dflash_layer_causal` is `:58-64` at the pin and `:58-67` at the PR head, and
+  // that one IS edited: the head adds the top-level `is_causal` arm this function
+  // resolves first. So the sliding-window half below mirrors the pin, the
+  // causality half mirrors the PR head, and both anchors are BEYOND-PIN-qualified
+  // rather than pointing at one revision that carries only half the rule.
   // dflash_config overrides live in config.raw["dflash_config"].
   //
   // SPEC-DFLASH2 W1 (#1314), BEYOND-PIN. `_dflash_layer_causal` resolves an

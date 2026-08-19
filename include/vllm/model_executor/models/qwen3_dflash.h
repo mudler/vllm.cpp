@@ -119,8 +119,11 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
 
 // Resolve the per-layer attention modes from config.layer_types, the optional
 // dflash_config overrides, and the optional top-level `is_causal`. Exposed for
-// the loader + tests. Mirrors _resolve_layer_attention (qwen3_dflash.py:86-146)
-// and _dflash_layer_causal, whose precedence the definition documents in full.
+// the loader + tests. Mirrors _resolve_layer_attention (qwen3_dflash.py:86-146 @
+// the parity pin 555967922, :109-169 @ vllm-project/vllm#52816 head
+// 19c9351904df4c63042671bc67a866ca48dc7d6f, identical body at both) and
+// _dflash_layer_causal (:58-64 @ the pin, :58-67 @ that head, where the top-level
+// `is_causal` arm is added), whose precedence the definition documents in full.
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config);
 
 // Build a DFlash draft HfConfig from the draft checkpoint's own config.json (the

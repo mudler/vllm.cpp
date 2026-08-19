@@ -119,8 +119,10 @@ Present, and reused rather than rebuilt:
   (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:56-60,268-272`; the
   second range was `:155-157` before W1 widened the resolver's comment and
   `:215-219` before the #1366 repair widened it again). The
-  class comment at `include/vllm/model_executor/models/qwen3_dflash.h:79-82`
-  claims the draft owns both; it is STALE and this row corrects it.
+  class comment on `include/vllm/model_executor/models/qwen3_dflash.h`'s
+  `Qwen3DFlashWeights` claims the draft owns both; it is STALE and this row
+  corrects it. (Cited by symbol: the line range first written here, `:79-82`,
+  named four fields of `Qwen3DFlashLayerWeights` instead.)
 - `src/vt/cuda/cuda_sample.cu:297-506` is a sort-free block-cooperative
   pivot-bracket threshold search, one block per row, ported from the same
   FlashInfer `TopK/TopPRenormProb` approach the selector's top-k uses.
@@ -134,9 +136,12 @@ Absent, and owed by this row:
   W1's insertion above it) and had no DFlash equivalent for a second architecture.
   CLOSED by W1: `SpeculativeConfig::IsDflash2Draft`
   (`include/vllm/config/speculative.h:115-138`) with its loader refusal
-  (`src/vllm/entrypoints/model_loader.cpp:430-517`, the classification helper
-  `ReadDflashDraftArchitectures` at `:430-456` and `RefuseDflash2Draft` at
-  `:458-517`). The identical gap for
+  (the classification helper
+  `src/vllm/entrypoints/model_loader.cpp::ReadDflashDraftArchitectures` and
+  `src/vllm/entrypoints/model_loader.cpp::RefuseDflash2Draft`, cited by SYMBOL
+  because the line range this spec first carried was stale two merges later and
+  `scripts/check-symbol-anchors.py` states it cannot verify a line citation).
+  The identical gap for
   `DSparkDraftModel` is open as [#1193](https://github.com/mudler/vllm.cpp/issues/1193);
   this row does not fix that one, and must not collide with it.
 - No grouped dynamic convolution anywhere in `vt`.
@@ -292,6 +297,27 @@ reviewer who mutates the guarantee rather than reading it.
   Developer scope answer, 2026-08-19. `SPEC-DFLASH` split its GGUF arm into
   `SPEC-DFLASH-GGUF`, which reached `DONE` separately; this row carries the arm
   itself rather than repeating the split.
+- **D8 — DIVERGENCE: an uncoercible `is_causal` is REFUSED by name, where
+  upstream coerces it.** Upstream resolves the key as `bool(is_causal)`
+  (`qwen3_dflash.py:58-67` @ vllm-project/vllm#52816 head
+  `19c9351904df4c63042671bc67a866ca48dc7d6f`), and Python's `bool` accepts every
+  object: `bool("false")` is `True`, `bool([])` is `False`. `DeclaredCausal`
+  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp::DeclaredCausal`)
+  instead honours a boolean or a number and refuses any other JSON type with a
+  message naming the key. This is one exact tracked exception under AGENTS.md
+  `## vLLM is the reference`, and the reason is the OTHER container rather than
+  Python. The GGUF spelling `dflash.attention.causal` is read through `KvI64`,
+  which takes every integer width and bool and names its own error on anything
+  else, so a `"false"` string has no GGUF counterpart to agree with: coercing it
+  in the HF arm would make the two containers answer differently for the same
+  logical checkpoint, which is the exact failure `## Now` records for the numeric
+  spelling one step earlier. The blast radius is empty on every published
+  artifact -- all four DFlash draft `config.json` files read on 2026-08-19
+  (`z-lab/Qwen3.6-27B-DFlash`, `z-lab/Qwen3.5-9B-DFlash`,
+  `z-lab/gemma-4-31B-it-DFlash`, `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`) declare
+  no `is_causal` at all, and `z-lab/Qwen3.8-27B-DFlash2` declares it as a JSON
+  boolean. Reconcile onto upstream's coercion if a checkpoint ever spells it as a
+  string, and change the GGUF arm in the same edit or not at all.
 - **D7 — no ceiling is declared anywhere in this spec.** If our acceptance or
   throughput reads below vLLM's on the same workload, that is an unresolved
   implementation difference with a named next hypothesis, per AGENTS.md.
@@ -355,6 +381,38 @@ on and not a summary.
   parse arm for a shape nothing feeds. `transformers` moved RoPE settings under
   `rope_parameters`, so the fix is a fallback and not a replacement — DFlash1
   checkpoints still carry the flat spelling.
+- **O4 — the `use_swa` causality repair (#1366) is UNREACHED, and the config
+  builder cannot parse a draft that declares no `layer_types`.** Owner: this row,
+  discharged by W2. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Found by W1's second
+  fresh review and repaired here as a RECORD correction rather than as code,
+  because making it reachable is not a small and clear change. Three facts, each
+  checked on 2026-08-19:
+  (a) `MakeQwen3DFlashDraftConfig` does `c.at("layer_types")`, and upstream reads
+  `getattr(config, "layer_types", None)` (`qwen3_dflash.py:134`, and `:66` in
+  `_dflash_layer_causal`, @
+  vllm-project/vllm#52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`), so an
+  absent key is upstream's `None` and is this builder's raw
+  `[json.exception.out_of_range.403]`. Mirroring that one `getattr` is a
+  three-line change, and `layer_types` is the ONLY key of MiMo's real
+  `dflash/config.json` this builder is missing -- every other name it reads is
+  present at the top level there, which is what separates this entry from O3.
+  (b) It would still buy no reachability. `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`
+  is the only published draft with `use_swa` and no `layer_types`, and its target
+  `MiMoV2ForCausalLM` is `INVENTORIED`, unassigned and unimplemented in
+  `.agents/model-matrix.md`, so no production entry point can serve the model
+  that draft heads. A drafter is not reachable without its target.
+  (c) It would make a WRONG path selectable where a loud parse failure
+  stands today.
+  Upstream reads `dflash_config.attention_sink_bias` and passes a per-head sink
+  bias into its `Attention` (`qwen3_dflash.py:309-313` and `:240-257` @ that
+  head); MiMo's config sets it true and this lane has no attention sink at all,
+  so a MiMo draft that parsed would load with the sinks silently absent --
+  acceptance-only and token-invisible, the exact class this row exists to remove.
+  Landing (a) alone converts a loud parse error into a quiet wrong answer.
+  W2 discharges this with O3, and it must land the `layer_types` fallback, a
+  named refusal for `dflash_config.attention_sink_bias`, and the loader-entry
+  gate O2 owes, as one change rather than three.
 
 ## Now
 
@@ -415,10 +473,28 @@ table and silent about the arm. The same issue's second half is the coercion:
 `is_causal` was honoured only as a JSON boolean, while upstream tests presence
 and coerces, and the GGUF arm's `KvI64` already took every integer width -- so
 `"is_causal": 0` fell through in silence and the two containers disagreed with
-each other. Both halves are repaired red-first and mutation-proven, and unlike
-D4 the `use_swa` half is REACHED today, because the checkpoints it governs are
-DFlash1 ones this engine already admits.
+each other. Both halves are repaired red-first and mutation-proven, and
+NEITHER IS REACHED. An earlier revision of this section, and `4941dfbfe`'s commit
+body, claimed the `use_swa` half was -- "REACHED today, because the checkpoints it
+governs are DFlash1 ones this engine already admits". That was wrong on two
+independent counts, both established by W1's second fresh review on 2026-08-19 and
+confirmed against the published files and against this tree.
+`XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash` is the only published draft of the governed
+shape, and it declares NO `layer_types`, while `MakeQwen3DFlashDraftConfig` does
+`c.at("layer_types")` and throws `[json.exception.out_of_range.403] key
+'layer_types' not found` before any causality is resolved. Its target
+architecture `MiMoV2ForCausalLM` is `INVENTORIED` and unassigned in
+`.agents/model-matrix.md`, so this engine cannot serve the model that draft
+heads, whatever the builder does. The GGUF arm cannot reach the rule either:
+`MakeDflashGgufConfig` never writes `use_swa` and always fills `layer_types` from
+the sliding-window pattern. The three other published DFlash1 drafts
+(`z-lab/Qwen3.6-27B-DFlash`, `z-lab/Qwen3.5-9B-DFlash`,
+`z-lab/gemma-4-31B-it-DFlash`) all declare `layer_types` and no `use_swa`, so the
+repair leaves their resolution byte-for-byte unchanged -- the inertness half,
+which is the only thing W1 asserts about either half. `## Owed` O4 records the
+gap, names W2 as its owner, and states why the reachability repair was not
+attempted in this flow.
 
 Next action: W2, the grouped dynamic convolution, CPU reference first, against
 the checkpoint's real shapes (taps 2, group 16, block 8). W2 must also discharge
-`## Owed` O1, O2 and O3, and O3 is a blocker rather than a cleanup.
+`## Owed` O1, O2, O3 and O4, and O3 and O4 are blockers rather than cleanups.

@@ -102,6 +102,69 @@ rule, asserted as a decision rather than assumed.
 site is proven by the matcher's tests plus a mutation, and that limit is stated
 rather than papered over.
 
+## Evidence
+
+CPU Debug build, `-DVLLM_CPP_CUDA=OFF`. Every run is a direct binary invocation,
+never through a pipe.
+
+**RED before.** The matcher was first implemented as the status quo — literally
+`return true`, which is what `supports_fa2_attention()` did — so the first run
+measured the DEFECT rather than a missing symbol:
+
+```
+[doctest] test cases:  6 |  0 passed |  6 failed | 0 skipped
+[doctest] assertions: 25 | 14 passed | 11 failed |
+[doctest] Status: FAILURE!            (compile_rc=0, run exit 1)
+```
+
+**GREEN after.**
+
+| Binary | cases | assertions | status |
+|---|---:|---:|---|
+| `test_cuda_arch_manifest` | 6 | 40 | SUCCESS |
+| `test_platform` | 12 | 95 | SUCCESS |
+| `test_cuda_fa2_arch_manifest.py` | 6 | — | OK |
+
+**The gate hardware keeps its FA2 path, proved rather than asserted.**
+`tests/scripts/test_cuda_fa2_arch_manifest.py` drives the REAL
+`cmake/CudaArchFeatures.cmake` through `cmake -P`, so it needs no CUDA toolkit
+and no GPU: requesting `121a` resolves the manifest to exactly `121a`, and a
+device reporting 12,1 matches it including the suffix. The same probe shows the
+ten-SM release request narrowing to `{80, 86, 87, 89, 120a, 121a}` — `90a`,
+`100a`, `103a` and `110` dropped, because the `fa2` feature row names no kernel
+body for them — and shows a Hopper-only build resolving EMPTY.
+
+**Mutations.** Restored from a `tar` snapshot, never `git checkout`. `compile_rc`
+and `git diff --stat` printed for each.
+
+| # | Mutation | `compile_rc` | Result |
+|---|---|---:|---|
+| MM1 | hard-code the unconditional `return true` again | 0 | RED 1/6 cases pass |
+| MM2 | ignore the arch-specific suffix | 0 | RED 5/6 |
+| MM3 | drop SASS minor-version compatibility | 0 | RED 4/6 |
+| MM4 | **reachability**: sever the production call site from the manifest | 0 | **GREEN — a NULL RESULT, see below** |
+
+**MM4 measured nothing, and is reported as nothing.**
+`src/vllm/platforms/cuda.cpp` is compiled only inside the CUDA block
+(`CMakeLists.txt:1635`), so on a CPU host the mutated translation unit is not in
+the build at all: `ninja -t targets all | grep -c 'platforms/cuda.cpp'` returns
+`0` and no `cuda.cpp.o` exists. Its green is the "mutation that never entered the
+build reads as a pass" shape, not evidence that the call site is unreached. The
+wiring is therefore proven here by inspection only; the CI `cuda-fat-build` job
+compiles that translation unit and is what actually exercises it. Stated rather
+than papered over, and carried in `## Owed`.
+
+**One mutation stranded a change and was caught.** A 10-minute shell timeout
+killed the MM3 runner between its build and its restore, leaving the mutation in
+the tree. It was found by grepping for the `MUTATION` marker rather than by
+trusting the script, restored from the snapshot, and the runner was then hardened
+with an `EXIT`/`INT`/`TERM` trap. A second defect surfaced with it: this host's
+`find` is `bfs`, which rejects the `-newermt '-1 day'` form the restore used, so
+the post-restore `touch` had been failing silently — and a `tar` restore rewinds
+mtimes, which is exactly how ninja is made to skip a rebuild and hand back a
+binary built from mutated source. The restore now touches the files explicitly,
+and a full rebuild plus re-run confirmed green before the pass continued.
+
 ## Owed
 
 - `SelectAttentionBackendName` still routes nothing, and

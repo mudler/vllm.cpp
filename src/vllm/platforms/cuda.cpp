@@ -8,7 +8,9 @@
 #include <cstddef>
 #include <vector>
 
+#include "vllm/platforms/cuda_arch_manifest.h"
 #include "vllm/platforms/cuda_attn_priority.h"
+#include "vllm/platforms/cuda_compiled_archs.h"
 #include "vllm/platforms/interface.h"
 
 #include "vt/backend.h"
@@ -70,11 +72,28 @@ class CudaPlatform final : public Platform {
   // direct-view reference path. Exactly what `device==kCUDA` returned.
   bool needs_weight_staging() const override { return true; }
 
-  // S7 attention fast-path POLICY -> True: this device carries the vendored
+  // S7 attention fast-path POLICY: does THIS device carry the vendored
   // flash-attention-2 native-bf16 split-KV kernel the FA2 dispatch selects
-  // (cuda_paged_attn.cu). Base false answers the f32 graph-captured fallback.
-  // Exactly what `device==kCUDA` returned at the FA2 dispatch gate.
-  bool supports_fa2_attention() const override { return true; }
+  // (cuda_paged_attn.cu)? False answers the f32 graph-captured fallback.
+  // Consumed at qwen3_5.cpp's FA2 dispatch gate, where it decides `attn_dt`.
+  //
+  // THIS RETURNED `true` UNCONDITIONALLY UNTIL ISSUE #1357, for every CUDA
+  // device the registrar probes, while CMakeLists.txt defaults
+  // VLLM_CPP_CUDA_ARCHITECTURES to `121a` alone and the feature table narrows
+  // FA2 further. A default build run on an sm_86 card therefore took the FA2
+  // path with no SASS for the device. That is the same class of claim that made
+  // the reference engine select an unrunnable FlashAttention on a GB10
+  // (#1332): a predicate answering from the DEVICE when the question that
+  // decides the launch is about the BINARY.
+  //
+  // It now asks the build. The manifest is GENERATED from VT_FA2_ARCHS beside
+  // the vt_cuda_set_source_gencode call that turns that same variable into
+  // nvcc's -gencode options, so it cannot name an architecture the compiler was
+  // not handed, and it is empty whenever FA2 was not compiled at all.
+  bool supports_fa2_attention() const override {
+    return ArchIsCompiled(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS, cap_.major,
+                          cap_.minor);
+  }
 
   // interface.py:181-187 supported_dtypes order (bf16 default fallback).
   std::vector<DType> supported_dtypes() const override {

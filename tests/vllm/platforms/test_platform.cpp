@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/platforms/cuda_arch_manifest.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/device.h"
@@ -299,9 +300,20 @@ TEST_CASE("CUDA leg capability values (GPU build only)") {
   // NON-staging), so a staging gate keyed on is_unified_memory() would flip CPU.
   CHECK(cu.needs_weight_staging());
 
-  // S7 supports_fa2_attention: unconditional true on CUDA — the vendored FA2
-  // split-KV kernel exists here. Backs the converted FA2 dtype-selection gates.
+  // S7 supports_fa2_attention. NO LONGER unconditional (issue #1357): it asks
+  // the generated compiled-arch manifest whether THIS device has FA2 SASS in
+  // THIS build. It must still be true here, and that is the whole
+  // no-change-on-the-gate-hardware claim made executable — a GB10 build requests
+  // `121a`, the feature table's fa2 row contains `12.1a`, so the manifest
+  // contains `121a` and this device reports capability 12,1: an exact match
+  // including the arch-specific suffix. A red here on a GB10 CUDA build means
+  // the manifest lost the arch, and the model would silently drop to the f32
+  // graph-captured fallback.
   CHECK(cu.supports_fa2_attention());
+  // And the manifest is genuinely consulted rather than ignored: the same
+  // device is NOT served by a build that compiled some other architecture.
+  CHECK_FALSE(vllm::platforms::ArchIsCompiled("80", cu.get_device_capability().major,
+                                              cu.get_device_capability().minor));
 
   // Family membership: GB10 is 12.x.
   CHECK(cu.is_device_capability_family(120));

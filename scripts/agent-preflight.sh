@@ -149,6 +149,7 @@ SUITES=(
   test_gpu_lock_one_truth
   test_main_baseline
   test_agent_preflight_skip_report
+  test_agent_pr_body
   test_check_symbol_anchors
 )
 
@@ -318,6 +319,14 @@ for checker in "${CHECKERS[@]}"; do
     # is the flag. Wiring either without --check installs a gate that cannot
     # fail, which for check-gate-commands is the very defect it classifies.
     claim-view|check-gate-commands) run "$checker" python3 "scripts/$checker.py" --check ;;
+    # check-agent-record also carries the record-anchor ratchet
+    # (ENG-RECORD-ANCHOR-RATCHET, #632): a citation that names a line no longer
+    # holding the symbol beside it fails HERE, on the plain call, and the error
+    # names the bucket that moved. Deliberately NOT wired as --report: `run`
+    # shows only the first 12 lines of a failure, and the report's offender list
+    # would push the error message out of that window. The full list is one
+    # command away (`scripts/check-agent-record.py --report`) and CI prints it
+    # unconditionally.
     *) run "$checker" python3 "scripts/$checker.py" ;;
   esac
 done

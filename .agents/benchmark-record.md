@@ -23876,3 +23876,255 @@ second driver and a second CUDA release for the `refused=0` rate; landing #1232 
 any of that, because the key it would default to is still a draft; and
 [#1283](https://github.com/mudler/vllm.cpp/issues/1283), without which no future A/B on
 this row can use a ragged-tail workload shape.
+
+## ENG-CUDAGRAPH-DEDUP W6 — the DEVICE-BYTE measurement: the fold ENGAGES at the shipped bucket set, the saving DOES NOT SURVIVE its own null control, and the driver refuses 73% of probes on TOPOLOGY (2026-08-19, `row/ENG-CUDAGRAPH-DEDUP-BYTES-RESULT`, tested `origin/main` `2c8f53d93`, GB10 sm_121a, #1162 / #1226)
+
+**This supersedes nothing. It delivers the one measurement W4 and W5 both named as
+owed** — the row's saving is a MEMORY saving, every earlier number counted
+executables, and nobody had measured bytes. It also removes W5's largest caveat:
+[PR #1232](https://github.com/mudler/vllm.cpp/pull/1232) LANDED as `2c8f53d93`, so the
+coarse key is on `main` (default OFF inside a default-OFF flag) and this entry measures
+a configuration that ships rather than a draft.
+
+**The decision this run was taken to make is DELIVERED and NEGATIVE: leave
+`VT_CUDA_GRAPH_DEDUP` default OFF.**
+
+### Recipe
+
+`dgx:gpu0` through an `rc` lease, job `93f783de-228f-47d5-806d-c5b56aa72c3a`, pod
+`rc-worker-4b8lj`, `### BYTES START 2026-08-19T04:30:07Z` to
+`### DONE_BYTES 2026-08-19T04:57:19Z`. GB10, driver `580.173.02`, persistence Enabled,
+boot_id `3fd9745a-d25a-426c-ba3c-97c958a85515` — **the same value at both ends**, so the
+box did not reboot mid-series. `loadavg` start `2.16 2.18 2.33`, end `3.17 3.93 3.80`.
+
+Source: `git archive` of `origin/main` `2c8f53d93`, tar sha256
+`8fc4109b10b5070ae6b531f8ba1c2f3ec227e2d78dad5a7d1d9e41c5b89d0cc9`, asserted by the
+harness before extraction. Binary `vllm-bench` sha256
+`be6972682fa7ba2dacbd5d03166314c45e46960875d0b0b61690715a0ce657a7`, copied out of the
+build tree before anything ran it. Release build, `VLLM_CPP_CUDA_ARCHITECTURES=121a`,
+CUTLASS 4.5.0 sm120a NVFP4 ENABLED, FlashAttention-2 ENABLED, vendored sm_121a Triton
+AOT. `nvcc` **13.0.88**. Model Qwen3-0.6B bf16, 28 layers, from
+`/workspace/dedup-gate/model`.
+
+`VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1` throughout; the only variables are
+`VT_CUDA_GRAPH_DEDUP` and `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`. Twelve cells (two
+calibration, ten A/B), all exit 0, zero VOID markers.
+
+| Workload | `--concurrency` | `--num-prompts` | `--input-len` | `--output-len` | `--max-num-batched-tokens` | captured padded sizes |
+|---|---:|---:|---:|---:|---|---|
+| W32 | 32 | 32 | 128 | 96 | 64 | 1, 2, 4, 8, 16, 24, 32 — **7 of 7** |
+| W64 | 64 | 64 | 256 | 256 | 128 | 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64 — **11 of 11** |
+
+`vllm-bench` sets `max_num_seqs = concurrency`, so these are exactly the shipped bucket
+sets of `include/vllm/model_executor/models/decode_graph_sizes.h:32-41`. **This is the
+churn W5 could not produce**: W5's three workloads reached 2-3 buckets, and every W4 and
+W5 conclusion about probe behaviour was drawn from a process that presented the driver
+with one pair.
+
+### Instruments, and the assertion each one had to pass first
+
+**A — `nvidia-smi --query-compute-apps=used_memory`**, sampled against the benchmark pid
+every 0.3 s. `--query-gpu=memory.used` returns `[N/A]` on this box and was NOT used.
+
+**B — an `LD_PRELOAD` shim** reading `cudaMemGetInfo` immediately before and after every
+`cudaGraphInstantiate`, `cudaGraphExecUpdate` and `cudaGraphExecDestroy`, plus
+`cudaGraphGetNodes` for a node count per instantiate. Interposition was asserted at
+build time (`vllm-bench: undefined cudaGraphInstantiate refs = 1`) and again by a
+preflight cell that had to exit 0, capture a graph AND write its token artifact.
+
+### Result 1 — THE FOLD ENGAGES, at the bucket set that ships
+
+```text
+w32_coarse_a  vt graph dedup: captured 7 graphs, deduped to 3 execs (probes=7 refused=3)
+w32_coarse_b  vt graph dedup: captured 7 graphs, deduped to 3 execs (probes=7 refused=3)
+w32_exact_a   vt graph dedup: captured 7 graphs, deduped to 7 execs (probes=0 refused=0)
+w64_coarse_a  vt graph dedup: captured 11 graphs, deduped to 5 execs (probes=22 refused=16)
+w64_coarse_b  vt graph dedup: captured 11 graphs, deduped to 5 execs (probes=22 refused=16)
+w64_exact_a   vt graph dedup: captured 11 graphs, deduped to 11 execs (probes=0 refused=0)
+```
+
+Both OFF cells of each workload emit no dedup line at all and instantiate 7 and 11
+executables respectively. Token ids are byte-identical across every cell of a workload,
+**including both OFF/OFF controls**: W32 all
+`ff0db6c6f4cf0eaa9cba7278880b2c24ec5f6602df6e47d16f9f0cea0b15be9d` (11720 B), W64 all
+`e1cbf5fcd3843a07787b39fd167fa713084e84a7b6e5a80836e044912298e5d0` (57620 B). Neither
+workload reproduces [#1283](https://github.com/mudler/vllm.cpp/issues/1283)'s
+ragged-tail shape, and neither hit it.
+
+### Result 2 — THE DRIVER REFUSES, and it says TOPOLOGY
+
+| buckets | probes | refused | rate | reason, verbatim |
+|---:|---:|---:|---:|---|
+| 7 | 7 | 3 | 43% | `vt graph dedup: probe refused a fold (err=910 result=2)` x3 |
+| 11 | 22 | 16 | **73%** | `vt graph dedup: probe refused a fold (err=910 result=2)` x16 |
+
+`err=910` is `cudaErrorGraphExecUpdateFailure`; `result=2` is
+`cudaGraphExecUpdateErrorTopologyChanged`. **Every refusal in this run gave that one
+reason.** W5's `refused=0` was an artefact of a workload whose buckets only ever shrank,
+so only one pair was ever presented.
+
+The shim's `cudaGraphGetNodes` reading says why false candidates form at all: the decode
+graphs are **not one topology**. They come in two node counts, **376 and 404**, mixed
+across the bucket set — `w32_off_a` instantiated, in capture order,
+`404 404 376 376 404 404 404`, and `w64_coarse_a` saw
+`376 376 376 376 376 376 404 404 376 …`.
+
+**This inverts the hypothesis the coarse key was built on.** Every refusal is about
+topology, never about a parameter. A key that cannot see a topology difference therefore
+produces MORE false candidates, not more folds, and coarsening it further makes the
+refusal rate worse rather than better. A refusal is a cost and never a wrong replay —
+the probe is the authority and a refused capture gets its own executable — but it is the
+cost that decides the flip.
+
+### Result 3 — THE BYTES, and why the saving is NOT ESTABLISHED
+
+**Instrument A, per-process device footprint, tail median (MiB):**
+
+| workload | OFF a | OFF b | COARSE a | COARSE b | EXACT a |
+|---|---:|---:|---:|---:|---:|
+| W32 (7 buckets) | 3252 | 3262 | 3262 | 3275 | 3262 |
+| W64 (11 buckets) | 9737 | 9737 | 9737 | 9737 | 9737 |
+
+**No saving is visible at MiB resolution.** W64 is identical to the megabyte in all five
+cells. W32's coarse arm reads 10-23 MiB *higher* than its OFF arm.
+
+**Instrument B, signed sum of `cudaMemGetInfo` free-byte deltas over every
+`cudaGraphInstantiate` in the cell:**
+
+| cell | retained execs | instantiate calls | bytes | MiB |
+|---|---:|---:|---:|---:|
+| w32_off_a | 7 | 7 | 29,356,032 | 28.00 |
+| w32_off_b | 7 | 7 | 31,952,896 | 30.47 |
+| **w32_exact_a** (null control) | **7** | **7** | **18,206,720** | **17.36** |
+| w32_coarse_a | 3 | 10 | 16,654,336 | 15.88 |
+| w32_coarse_b | 3 | 10 | 15,654,912 | 14.93 |
+| w64_off_a | 11 | 11 | 43,134,976 | 41.14 |
+| w64_off_b | 11 | 11 | 24,014,848 | 22.90 |
+| **w64_exact_a** (null control) | **11** | **11** | **43,855,872** | **41.82** |
+| w64_coarse_a | 5 | 27 | 35,045,376 | 33.42 |
+| w64_coarse_b | 5 | 27 | 33,673,216 | 32.11 |
+
+**The nominal effect.** W32: OFF mean 29.24 MiB against COARSE mean 15.40 MiB, a nominal
+**13.83 MiB**, which is **0.42%** of the 3262 MiB process footprint instrument A
+measured. W64: OFF mean 32.02 MiB against COARSE mean 32.77 MiB, i.e. **−0.75 MiB,
+nothing, in the wrong direction**, on a 9737 MiB process.
+
+**And the nominal effect is not established, on four independent grounds:**
+
+1. **The null control disagrees by as much as the candidate effect.** `EXACT` retains
+   exactly as many executables as `OFF` (7 and 11) at `probes=0`, so it allocates the
+   same executables and its true difference from OFF is ZERO. It measured 17.36 MiB
+   where OFF measured 28.00 and 30.47 — a **10.6-13.1 MiB** disagreement, against a
+   candidate effect of 13.83 MiB.
+2. **An OFF/OFF pair disagrees with itself by more.** W64 OFF a/b are 41.14 and 22.90
+   MiB: **18.2 MiB** apart on two runs of one binary on one workload.
+3. **One instantiate recorded a NEGATIVE delta.** `w32_exact_a` recorded, in order,
+   `10,055,680 / -5,165,056 / 2,326,528 / 2,727,936 / 4,153,344 / 2,273,280 /
+   1,835,008` bytes: one instantiate left MORE device memory free than it found, which
+   is only possible if something else in the process released memory inside the same
+   window.
+4. **`cudaGraphExecDestroy` reclaimed nothing, in every cell.** `reclaimed_bytes=0`
+   everywhere. A destroy that returns no measurable memory says the reading is pool
+   growth, not per-object cost.
+
+The mechanism is the same one in all four. Per-instantiate deltas for byte-identical
+404-node graphs range from **0 to 10,514,432 bytes**, and 17 of 27 instantiates in
+`w64_coarse_a` read exactly `delta_bytes=0`. The driver serves these allocations from a
+pool that grows in chunks and does not shrink, so a per-cell total measures POOL GROWTH,
+and the coarse arm's throwaway probe executables grow that pool exactly like retained
+ones do. That is how an 11→5 fold arrives at no measurable saving.
+
+**What CAN be priced.** Over the four OFF cells, bytes ÷ retained execs gives **2.08 to
+4.35 MiB for one ~390-node decode-graph executable** (4.00, 4.35, 3.74, 2.08). The
+harness also printed bytes per node for a reader sizing the same fold on a deeper
+checkpoint: `w32_off_a mean_nodes=396.0 mean_bytes_per_node=10590.2`,
+`w64_off_a mean_nodes=391.3 mean_bytes_per_node=10022.1`.
+
+### Result 4 — THE PROBE COST, exact and clock-independent
+
+| workload | arm | instantiate calls | exec destroys | `cudaGraphExecUpdate` calls |
+|---|---|---:|---:|---:|
+| W32 | OFF | 7 | 7 | 0 |
+| W32 | COARSE | **10** (3 retained + 7 probes) | 10 | 11 |
+| W64 | OFF | 11 | 11 | 0 |
+| W64 | COARSE | **27** (5 retained + 22 probes) | 27 | 28 |
+
+At 11 buckets the coarse key runs **2.45x the instantiate calls** and adds 28 update
+calls on the capture path, to retain 6 fewer executables.
+
+**Peak transient memory did NOT double.** In every ON cell the shim's live-bytes trace
+peaks at its end value (W32 COARSE `live_bytes_peak=16654336 live_bytes_end=16654336`;
+W64 COARSE `35045376 = 35045376`), because `Register` destroys the probe executable
+before it returns. The feared "double the peak to save the steady state" trade did not
+occur.
+
+**A replay-time re-point DID occur, and it is arithmetic, not a counter.** `probes=7`
+against 11 update calls, and `probes=22` against 28, leaves 4 and 6 updates that are not
+probes — the reverse re-point W5 recorded as untested on a device. Those cells exit 0
+with byte-identical ids, so the transitivity assumption in `Replay` did not abort and did
+not change a token here. It is stated as ARITHMETIC over two printed totals, because the
+registry still counts probe refusals only and a replay-time refusal would abort on
+`Replay`'s `VT_CHECK` rather than increment anything.
+
+### What this run does NOT establish
+
+- **NO time-based figure is attributable.** The clock pin was REFUSED inside the lease:
+  `The current user does not have permission to change clocks for GPU 0000000F:01:00.0`,
+  and the log records `clocks_pinned=0`. The instantiate-wall and update-wall figures in
+  `bytes.log` are diagnostics and are deliberately not quoted as results anywhere in
+  this record.
+- **nvcc was 13.0.88 here and 13.3.73 for the W5 fold run.** The OFF-vs-ON and
+  EXACT-vs-COARSE comparisons WITHIN this one binary are valid; this run and W5 are
+  **not directly comparable to each other**. 13.0.88 is the toolkit the completed W4
+  baseline gate ran.
+- **`result=2` is one driver (`580.173.02`), one GB10, one toolkit.** A different
+  refusal rate elsewhere is a different cost, not a different correctness.
+- **Only the Qwen3 dense decode driver was exercised**, as in W4 and W5. The other eight
+  capture drivers, and two models sharing the process-singleton registry, are untested.
+- **`VT_ASYNC_RUNNER=0` throughout.** Dedup engages only there, because the async path
+  captures no decode graph, so the feature remains unreachable on the DEFAULT serving
+  path ([#1179](https://github.com/mudler/vllm.cpp/issues/1179)).
+- **`cudaMemGetInfo` cannot separate an executable's own cost from the pool chunk that
+  satisfied it.** Every byte figure above inherits that limit.
+- **Two summaries of the same rows differ, and neither is wrong.** `run.sh`'s per-cell
+  `shim_inst … sum_bytes` reducer sums only POSITIVE deltas and therefore reads higher in
+  the two cells containing a negative one (`w32_exact_a` 23,371,776 against the signed
+  18,206,720). The tables above use the SIGNED sum, which agrees with the shim's own
+  in-process `SUMMARY` counter in every cell.
+
+### Verdict
+
+1. **`VT_CUDA_GRAPH_DEDUP` stays default OFF — supported by these numbers, not merely
+   ungated.** Best nominal saving 13.83 MiB (0.42% of process) at 7 buckets, smaller
+   than its own null control's disagreement; nothing at 11 buckets; cost is 16 extra
+   instantiate/destroy pairs and 28 update calls on the capture path.
+2. **`VT_CUDA_GRAPH_DEDUP_COARSE_KEY` alone is a NO-OP, not merely unsupported.**
+   `GraphDedupCoarseKeyEnabled()` (`src/vt/graph_dedup.h:114`) is read only by the
+   signature builder (`src/vt/graph_dedup_runtime.h:177`), which runs only from
+   `Register`, which `src/vt/cuda/cuda_backend.cu:237` calls only under
+   `GraphDedupEnabled()`. With dedup off its sole observable is one stderr line.
+3. **Both on — not supported.** Same numbers plus a 73% probe-refusal rate.
+
+### Next traceable hypotheses — NO CEILING is declared
+
+- **Find where the 376/404 node split comes from.** The FA-2 split-KV grid is the first
+  suspect. If a capture exists that fixes the node set across buckets, every refusal in
+  this run disappears and the fold ratio is the whole bucket set rather than 3/7 and
+  5/11. Until then a coarser key is the wrong direction.
+- **An instrument that resolves a single 2-4 MiB executable against driver pool
+  granularity.** `cuMemGetAllocationGranularity`, a driver-pool statistics query, or a
+  build with pool instrumentation would price the fold directly instead of through a
+  total whose noise exceeds the effect.
+- **A 60-80 layer checkpoint.** Bytes scale with node count and this graph is 376-404
+  nodes on a 28-layer 0.6B model. The measured 10.0-10.6 KB per node is the number to
+  re-run against before the flip is refused permanently for large models.
+
+### Evidence
+
+`/mnt/nas_share/rc/dedup-bytes/` — `RESULT.md` and `STATUS.md` (the pre-registered
+"what must be true before any number here is quoted" list and the result against it),
+`run.sh`, `build.sh`, `memshim.c`, `src-2c8f53d93.tar`, `logs-bytes/bytes.log`,
+`logs-bytes/clockpin.log` (the refusal), `logs-bytes/run_<tag>.log` for all 12 cells,
+`mem/mem_<tag>.csv` (the per-call `cudaMemGetInfo` trace with node counts),
+`mem/smp_<tag>.csv` (the `nvidia-smi` and RSS sampler) and `out-bytes/ids_<tag>.json`
+(the token artifacts).

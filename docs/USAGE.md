@@ -596,7 +596,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 runs on CPU and refuses on CUDA
+### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -645,11 +645,31 @@ CPU reference GEMM executes them, so this checkpoint runs on CPU today
 ```
 
 What exists on CPU is a correctness reference. It makes no speed claim, and no
-token-exact comparison against vLLM on this checkpoint has been recorded,
-because the GPU arm that would run one does not exist yet. Milestone M5 of
-[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
-mainloop-scaled CUTLASS kernel; [#1166](https://github.com/mudler/vllm.cpp/issues/1166)
-is the original report.
+token-exact comparison against vLLM on this checkpoint has been recorded.
+
+A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
+**build-verified only**. It is the block-scaled CUTLASS GEMM vLLM itself
+dispatches on those devices, ported whole, with the scales applied in the
+mainloop; it is compiled by continuous integration for both architectures and
+registered, so a build for one of them no longer refuses the checkpoint at
+prepare time. **It has never been executed.** No comparison against the CPU
+reference, no token-exact comparison against vLLM, and no throughput number has
+been recorded for it, on any device. The value comparison that would settle it
+is written and registered as `test_ops_matmul_fp8_block_cuda`, and on a machine
+with no device it reports that it did not run. Treat this arm as untested until
+that test has been run on hardware and its result recorded. Milestone M5 of
+[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the kernel and the
+run it still owes; [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is
+the original report.
+
+Two shapes the CPU arm accepts are refused on CUDA, by name and with the
+dimension and its remainder in the message. The CUTLASS collective needs both
+`K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
+and reroutes those shapes to a Triton kernel this build does not have. A
+*ragged* 128-block is not affected and runs: `N = 576` is `4*128 + 64` and is the
+shape vLLM's own CUTLASS test uses. A build for any other CUDA architecture has
+no such kernel compiled and keeps refusing at prepare time, which is the honest
+answer rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
@@ -663,8 +683,8 @@ here implements them: an `activation_scheme` other than `dynamic`, and a
 `weight_block_size` other than `[128, 128]`. Both messages name the key and the
 value your `config.json` declares.
 
-To run this model on a GPU today, use a per-tensor FP8, BF16, NVFP4, or GGUF
-checkpoint of it.
+To run this model on a GPU with a recorded correctness result today, use a
+per-tensor FP8, BF16, NVFP4, or GGUF checkpoint of it.
 
 ### A per-tensor scale has to be one F32 number
 

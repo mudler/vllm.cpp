@@ -1003,6 +1003,71 @@ TEST_CASE("Mode: registering a break into a kFull scope is REFUSED") {
   CHECK(g2.segment_count() == 2);
 }
 
+// THE MODE COUNTERS, added by W3 (#1291) because the mode was UNOBSERVABLE from
+// outside a driver and a mute guard was measured hiding that.
+//
+// WHAT WENT WRONG WITHOUT THEM. W2's driver gate could pin its scope's mode only
+// because `qwen3.cpp` registers a production `vt::GraphBreak`, so
+// `breaks_registered` moved in one mode and not the other. The three drivers W3
+// migrated register none, so `breaks_registered == 0` holds in BOTH modes there.
+// Measured, not reasoned: flipping `kFull` to `kPiecewise` in `qwen3_moe.cpp`
+// compiled clean and left that driver's whole gate green at 226/226. The mode is
+// the difference between one graph and one eager attention call per layer, and a
+// token gate cannot see a segment count, so it needed an observable of its own.
+//
+// THE INERT ARM IS THE CONTROL that stops the counters from being "scopes
+// constructed". A scope that cannot capture makes no backend call in either
+// mode, so counting it would report a mode that never reached a backend.
+TEST_CASE("Mode: the scope counters report which mode an ACTIVE capture opened in") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+
+  const vt::GraphBreakStats before = vt::GetGraphBreakStats();
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kFull);
+    REQUIRE(scope.active());
+  }
+  const vt::GraphBreakStats after_full = vt::GetGraphBreakStats();
+  CHECK(after_full.full_scopes - before.full_scopes == 1);
+  CHECK(after_full.piecewise_scopes - before.piecewise_scopes == 0);
+
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kPiecewise);
+    REQUIRE(scope.active());
+  }
+  const vt::GraphBreakStats after_piece = vt::GetGraphBreakStats();
+  CHECK(after_piece.full_scopes - after_full.full_scopes == 0);
+  CHECK(after_piece.piecewise_scopes - after_full.piecewise_scopes == 1);
+
+  // THE CONTROL: an INERT scope counts as neither. This backend answers
+  // `SupportsGraphCapture()` false, which is Vulkan and Metal.
+  RecordingCaptureBackend nb(/*supports_capture=*/false);
+  vt::Queue nq = nb.CreateQueue();
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(nb, nq, g, vt::GraphCaptureMode::kFull);
+    REQUIRE_FALSE(scope.active());
+  }
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(nb, nq, g, vt::GraphCaptureMode::kPiecewise);
+    REQUIRE_FALSE(scope.active());
+  }
+  const vt::GraphBreakStats after_inert = vt::GetGraphBreakStats();
+  CHECK(after_inert.full_scopes - after_piece.full_scopes == 0);
+  CHECK(after_inert.piecewise_scopes - after_piece.piecewise_scopes == 0);
+
+  // And ResetGraphBreakStats() clears them, like every other G3 counter: a
+  // number that survives its own reset describes a run nobody can bound.
+  vt::ResetGraphBreakStats();
+  const vt::GraphBreakStats cleared = vt::GetGraphBreakStats();
+  CHECK(cleared.full_scopes == 0);
+  CHECK(cleared.piecewise_scopes == 0);
+}
+
 // ---------------------------------------------------------------------------
 // Test 13d, the DISTINCTION the drain owed a driver. W2's fresh review found the
 // HIGH this closes.

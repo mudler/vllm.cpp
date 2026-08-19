@@ -91,6 +91,15 @@ Lifecycle changes still update STATUS and BENCHMARKS, while the moved row spec's
 `## Now` replaces the per-row write to `.agents/NOW.md`. Runtime and performance
 are `VOID`; no product behavior changed.
 
+Record-anchor ratchet (2026-08-18, `ENG-RECORD-ANCHOR-RATCHET` `ACTIVE`, #632):
+the record's own `file.cpp:123` citations were range-checked and never reported.
+Both forms were already parsed; a failing anchor was dropped and covered by
+`any()`, and no symbol test ran. 32 of the 38 offenders are in range.
+`check-agent-record.py` now classifies each citation OK, STALE or BROKEN and
+gates the rot against `scripts/record-anchor-baseline.json` in both directions.
+Backlog **38** (32 stale, 6 broken) over 844 correct; `ACTIVE` and `READY` rows
+join the count. No product behavior changed.
+
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
 `scripts/check-supported-models.py` (+ mutation test), so the 37
@@ -206,6 +215,15 @@ decode step keeps the single graph it already had; the PIECEWISE arm has no
 production driver yet, because the break closure W1 registered reads a returned
 frame on replay. Bit-exactness against a REPLAYED capture on a real GPU is owed,
 not met.
+
+W3 (2026-08-19, #1291) migrates the three remaining plain batched drivers:
+Qwen3-Coder MoE, Voxtral text and DeepSeek-V2 MLA. Each captures and replays
+through the seam in FULL mode, and each landed with its own gate. Six drivers
+read the framework capture switch for themselves before this row; two remain.
+
+W3 also closed a gate that could not fail. The mode a driver captures in was
+unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole
+driver gate green. The seam now counts the mode, and that flip reds each gate.
 
 A capture that FAILS is now distinguishable from a scope that was INERT. The
 capture scope has to swallow a throwing `EndCaptureGraph` — a destructor that
@@ -1756,9 +1774,11 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
 
-`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The GB10 A/B of 2026-08-18 split: byte-identical 10/10, [#1184](https://github.com/mudler/vllm.cpp/issues/1184) gone, and the fold never engaged because the shipped key carries the padded batch dimension.
+`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. Byte-identical on GB10 over 10/10 comparisons, [#1184](https://github.com/mudler/vllm.cpp/issues/1184) gone. The exact key folds nothing, because it carries the padded batch dimension; the coarse key folds and is measured below. Default OFF, and the flag stays OFF on measurement rather than on silence.
 
-`ENG-CUDAGRAPH-DEDUP` coarse key: the [#1226](https://github.com/mudler/vllm.cpp/issues/1226) hypothesis is CONFIRMED on GB10. Drop the launch dimensions and every bucket folds — 3 graphs to 2 execs, 2 to 1, 2 to 1 — with `cudaGraphExecUpdate` probed once per fold and `refused=0`. It is opt-in, default OFF, and PR #1232 has NOT landed, so nothing on `main` folds today. No memory or speed number: clocks were unpinned and nobody measured bytes saved.
+`ENG-CUDAGRAPH-DEDUP` coarse key ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)): landed and MEASURED, and the benefit is NEGATIVE. At the shipped bucket sets it folds 7 captures to 3 execs and 11 to 5, so the fold is real. The device-byte saving is not: 13.83 MiB nominal at 7 buckets (0.42% of a 3.25 GiB process), nothing at 11, and smaller than the disagreement of its own null control. The driver refuses 43% of probes at 7 buckets and 73% at 11, always on TOPOLOGY — the decode graphs are 376 and 404 nodes, so a coarser key makes false candidates, not folds.
+
+`ENG-CUDAGRAPH-DEDUP` defaults: both flags stay OFF. `VT_CUDA_GRAPH_DEDUP_COARSE_KEY` alone is a no-op, because the coarse key is read only inside the dedup path. **No time figure is attributable** — the clock pin was refused inside the lease. The feature is also still unreachable on the DEFAULT serving path, which captures no decode graph ([#1179](https://github.com/mudler/vllm.cpp/issues/1179)).
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

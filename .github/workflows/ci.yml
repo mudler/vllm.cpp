@@ -117,8 +117,13 @@ jobs:
         with:
           fetch-depth: 0
       - name: Canonical roadmap tables and links are consistent
+        # --report, wired the way check-device-leakage's is below: the record
+        # anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) gates on a baseline,
+        # and printing every STALE/BROKEN offender on every run is what keeps
+        # the backlog legible instead of a number nobody can act on. It is the
+        # same gate -- --report adds output, never leniency.
         run: |
-          python3 scripts/check-agent-record.py
+          python3 scripts/check-agent-record.py --report
           python3 tests/scripts/test_agent_record.py
           python3 tests/scripts/test_check_issue_index_append_only.py
           python3 tests/scripts/test_doc_checkpoint.py
@@ -290,6 +295,7 @@ jobs:
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
+          python3 tests/scripts/test_agent_pr_body.py
       - name: A citation that names a symbol still finds it (#1143, #1139)
         # The tree already carried 539 `path::Symbol` citations and had never
         # checked one. Line anchors are what rot: one 45-line insertion near the

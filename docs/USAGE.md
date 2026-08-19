@@ -4408,7 +4408,7 @@ save.
 
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
-VT_MOE_EXPERT_STREAM_SLOTS=8000 \
+VT_MOE_EXPERT_STREAM_SLOTS=4000 \
   ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
@@ -4467,13 +4467,23 @@ Four limits, stated plainly rather than left to be discovered.
   file, against the residency this process resolved, and a file that mixes a kept
   tower with a staged one keeps the whole bound as well (issue
   [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
-* **No speed claim is attached.** The decode measurement on the one machine that
-  answers capable has not run at the time of writing; `docs/BENCHMARKS.md`
-  carries it as `PENDING` and records what HAS been measured there, which is the
-  device probe itself. Device access to host-resident weights on that part has a
-  recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
-  way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
-  the benchmarks file before assuming the GPU is the faster arm here.
+* **The load now succeeds and the generation does not, so there is still no
+  speed claim.** The measurement ran on the one machine that answers true
+  (GB10, 2026-08-18) and it split: `--device cuda` loads this checkpoint in
+  255-272 s, which it could not do before, and then exhausts the machine inside
+  its first forward without emitting a token
+  ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)). The slot arena is
+  measurably not the cause — a 64-slot 0.15 GiB arena fails exactly where an
+  8000-slot 18.55 GiB one does — so raising or lowering
+  `VT_MOE_EXPERT_STREAM_SLOTS` will not get you a token. **Use `--device cpu`
+  for this checkpoint today.** That arm serves it at a steady **11.05 s/token
+  at 4000 slots**, which is the count both recipes in this section set and the
+  only count that figure holds for. The same binary at 8000 slots measured a
+  39.98-45.40 s/token median over two runs, and the second of them consumed all
+  30,625 MiB of the box's swap, so **more slots is not a free knob here**: the
+  extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
+  mapping is served out of. Read `docs/BENCHMARKS.md` before assuming the GPU is
+  the faster arm here.
 
 ### The same thing as config, and which one wins
 
@@ -4487,7 +4497,7 @@ below that, where weights stay borrowed out of the file mapping.
 ```sh
 ./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
-                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+                                 "expert_stream":{"enabled":true,"slots":4000}}}'
 ```
 
 | Key | Environment equivalent | Default |

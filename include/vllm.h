@@ -270,7 +270,29 @@ extern "C" {
  * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
  * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
  * acoustic half are still host reference loops (see docs/FEATURES.md). */
-#define VLLM_ABI_VERSION 21
+/* v22 — vllm_video_last_phase_log, WHERE A RENDER SPENT ITS WALL (issue #1010,
+ * row LTX25-DEVICE-RESIDENCY stage W0).
+ *
+ * Before this the LTX-2.5 render path emitted one line per render, so a render
+ * that took two hours could not say which of its phases took them. Every
+ * attempt to act on that profile has since failed on a measurement defect: the
+ * evidence existed only on a host that stopped answering (#1040), the 1731 s
+ * phase #1087 measures is unnamed, and #1024's GPU-zero window is known to be
+ * neither the denoise nor the decode.
+ *
+ * A completed generation now WRITES a phase table — `phase-log.json`, beside
+ * the frames, on the shipped default and behind no flag — carrying, per phase,
+ * a monotone timestamp, a duration, a peak host byte count and a peak device
+ * byte count, plus the wall and the `unaccounted_seconds` the named phases did
+ * NOT cover. That residue is emitted rather than smeared over the phases,
+ * because a table whose parts do not add up has a phase nobody named.
+ *
+ * PURELY ADDITIVE: no struct changed and no existing signature moved, which is
+ * why the path is a QUERY on the handle rather than a new member on
+ * vllm_video_result. Growing an OUTPUT struct is the one append a caller cannot
+ * absorb by zero-initializing, since the library writes the field with its own
+ * sizeof. A family that emits no table returns NULL. */
+#define VLLM_ABI_VERSION 22
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -1063,6 +1085,20 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
 /* Free the owned members of a result and zero the struct. The struct itself
  * is caller storage. NULL is a no-op. */
 VLLM_API void vllm_video_result_free(vllm_video_result* out);
+
+/* v22: the phase table the LAST completed vllm_video_generate on this handle
+ * wrote — an absolute path to a JSON file holding, per phase, a monotone
+ * timestamp, a duration, and peak host and device byte counts, plus the wall
+ * and the time the named phases did not cover.
+ *
+ * Points at storage the library owns for the lifetime of the handle (the
+ * vllm_video_engine_family precedent); the caller must NOT free it, and the
+ * next generate replaces it. NULL when this handle has completed no
+ * generation, when the family emits no table, or when the engine is NULL.
+ *
+ * The FILE is the deliverable, not this string: a number that lives only in a
+ * process nobody attached to is the evidence class issue #1040 is made of. */
+VLLM_API const char* vllm_video_last_phase_log(const vllm_video_engine* engine);
 
 /* ── Standalone MP4 mux-argv composer ─────────────────────────────────────────
  * The encoding contract (h264/yuv420p + AAC, -shortest, +faststart) is the

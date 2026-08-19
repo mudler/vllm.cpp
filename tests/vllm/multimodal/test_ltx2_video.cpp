@@ -2769,7 +2769,12 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
     const double end = entry["end_seconds"].get<double>();
     INFO("phase = " << name);
     CHECK(!name.empty());
-    CHECK(start >= previous_start);
+    CHECK_MESSAGE(start >= previous_start,
+                  "the table is emitted as a TIMELINE, sorted by start; the records are "
+                  "APPENDED in completion order, and an emitter that forgot to sort would "
+                  "hand a reader a table whose rows interleave two renders");
+    CHECK(start <= wall);
+    CHECK(end <= wall + 1e-6);
     CHECK(end >= start);
     previous_start = start;
     // A byte count, not a placeholder: this process is resident and every phase
@@ -2784,8 +2789,12 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 
   // (3) THE NAMED BOUNDARIES. Without these the sum below is satisfied by one
   // leaf called `render`, which is an instrument that measures a stopwatch.
-  for (const char* required : {"load.dit", "denoise", "decode.video", "artifacts.frames"}) {
-    CHECK_MESSAGE(std::find(names.begin(), names.end(), std::string(required)) != names.end(),
+  for (const std::string required : {"load.dit", "denoise", "decode.video", "decode.audio",
+                                    "artifacts.frames", "artifacts.audio"}) {
+    // `std::string`, not `const char*`: doctest stringifies a `char*` streamed
+    // into a message as a BOOL, so a failing case here would have printed
+    // "names no '1' phase" and said nothing about which name was missing.
+    CHECK_MESSAGE(std::find(names.begin(), names.end(), required) != names.end(),
                   "the phase table names no '" << required << "' phase");
   }
 
@@ -2801,6 +2810,13 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
                 "the phase table does not sum: " << leaves << "s of named leaves against " << wall
                                                  << "s of wall. The missing time is a phase "
                                                     "nobody named, and W0 iterates until it is");
+
+  // (5) THE ABI CARRIES IT. `examples/ltx2_gen` is a client of `vllm.h` and
+  // nothing else, so a client that never guesses a filename beside the frames
+  // can still name the table it was handed.
+  REQUIRE(vllm_video_last_phase_log(engine) != nullptr);
+  CHECK(std::string(vllm_video_last_phase_log(engine)) == log_path);
+
   vllm_video_result_free(&result);
   vllm_video_engine_free(engine);
 }
@@ -8814,4 +8830,37 @@ TEST_CASE("ltx2 keyframe: the distilled-LoRA requirement refuses BY WHAT IS MISS
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(KeyframeParams(ws.paths, lora));
   CHECK_NOTHROW((void)engine->Generate(KeyframeGen(ws.root + "/no_take")));
+}
+
+
+// The conditioning half of the same instrument, which the case above cannot
+// reach: that engine conditions from a prompt-embeds FILE, so the tower and the
+// connector never run and a table naming them would be lying. This one types a
+// prompt, which is the arm #1269 and stage W4 are about — the spike bounds the
+// caption projection at 39-100% of a ~1731 s phase and cannot say which,
+// because nothing separated the tower from the connector.
+TEST_CASE("ltx2 video: a PROMPTED render names the tower and the connector separately") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(EncoderParams(ws.paths));
+  const std::string out_dir = ws.root + "/prompted_phases";
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(PromptedGen(out_dir, "a b c"));
+
+  REQUIRE_MESSAGE(!result.phase_log_path.empty(),
+                  "the seam-level render returned no phase table path");
+  CHECK(result.phase_log_path == out_dir + "/phase-log.json");
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
+  std::vector<std::string> names;
+  for (const nlohmann::json& entry : table["phases"]) {
+    names.push_back(entry["name"].get<std::string>());
+  }
+  for (const std::string required : {"conditioning.tower", "conditioning.connector"}) {
+    CHECK_MESSAGE(std::find(names.begin(), names.end(), required) != names.end(),
+                  "the phase table names no '" << required << "' phase");
+  }
+  // The two are SEPARATE leaves, not one bracket counted twice: the sum still
+  // holds, which is what says the split did not double count the tower.
+  CHECK(table["unaccounted_seconds"].get<double>() <=
+        0.05 * table["wall_seconds"].get<double>());
 }

@@ -1,0 +1,382 @@
+#include "vllm/multimodal/render_phase_log.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <thread>
+
+#include <nlohmann/json.hpp>
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
+namespace vllm {
+namespace multimodal {
+namespace phase {
+
+// `/proc/self/statm` field 2 is the resident page count, which is what `ps`
+// reports as RSS. Reading `statm` rather than `status` is deliberate and the
+// reason is `music3_profile.h`'s: `status` is ~50 formatted lines and this runs
+// ten times a second beside a multi-gigabyte load.
+int64_t HostResidentBytes() {
+#if defined(__linux__)
+  std::FILE* f = std::fopen("/proc/self/statm", "r");
+  if (f == nullptr) return -1;
+  long long total_pages = 0;
+  long long resident_pages = 0;
+  const int read = std::fscanf(f, "%lld %lld", &total_pages, &resident_pages);
+  std::fclose(f);
+  if (read != 2) return -1;
+  const long page = ::sysconf(_SC_PAGESIZE);
+  if (page <= 0) return -1;
+  return static_cast<int64_t>(resident_pages) * static_cast<int64_t>(page);
+#else
+  return -1;
+#endif
+}
+
+namespace {
+
+// The sampler is a MEASUREMENT LANE, in the same shape `VT_POOL_BYPASS` and
+// `VLLM_LTX2_POOL_DRAIN` already take: it exists so an A/B over what the sampler
+// itself costs runs on ONE binary. It is never a configuration — the boundary
+// samples are taken either way, so turning it off narrows the peaks rather than
+// removing the table.
+bool SamplerEnabled() {
+  const char* off = std::getenv("VLLM_RENDER_PHASE_SAMPLER");
+  return off == nullptr || off[0] != '0';
+}
+
+bool StderrEnabled() {
+  const char* on = std::getenv("VLLM_RENDER_PHASE_LOG_STDERR");
+  return on != nullptr && on[0] != '0';
+}
+
+}  // namespace
+
+struct PhaseLog::Impl {
+  mutable std::mutex mu;
+
+  // An OPEN scope. `depth` at open time is what decides `nested`: a leaf that
+  // finds another leaf already open did not measure a disjoint interval, and
+  // adding it to the sum would make the residue negative rather than visible.
+  struct Open {
+    size_t handle = 0;
+    std::string name;
+    int64_t render = 0;
+    double start = 0.0;
+    int64_t peak_host = -1;
+    int64_t peak_device = -1;
+    bool span = false;
+    bool nested = false;
+    bool live = false;
+  };
+
+  std::chrono::steady_clock::time_point origin{};
+  bool running = false;
+  int64_t render = 0;
+  size_t next_handle = 1;
+  int64_t samples = 0;
+  std::vector<Open> open;
+  std::vector<Record> records;
+  DeviceByteProbe device_probe;
+
+  std::thread sampler;
+  std::condition_variable stop_cv;
+  bool stop = false;
+
+  double Now() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count();
+  }
+
+  // Caller holds `mu`. Reads both counters once and folds them into every open
+  // scope, so a nested span sees the peak its children reached.
+  void SampleLocked() {
+    const int64_t host = HostResidentBytes();
+    int64_t device = -1;
+    if (device_probe) {
+      device = device_probe();
+    }
+    ++samples;
+    for (Open& o : open) {
+      if (!o.live) continue;
+      if (host > o.peak_host) o.peak_host = host;
+      if (device > o.peak_device) o.peak_device = device;
+    }
+  }
+
+  void StartSamplerLocked() {
+    if (sampler.joinable() || !SamplerEnabled()) return;
+    stop = false;
+    sampler = std::thread([this]() {
+      std::unique_lock<std::mutex> lock(mu);
+      while (!stop) {
+        stop_cv.wait_for(lock, std::chrono::milliseconds(100));
+        if (stop) break;
+        SampleLocked();
+      }
+    });
+  }
+
+  void StopSampler() {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      stop = true;
+    }
+    stop_cv.notify_all();
+    if (sampler.joinable()) sampler.join();
+  }
+};
+
+PhaseLog::PhaseLog() : impl_(new Impl()) {}
+
+PhaseLog::~PhaseLog() {
+  impl_->StopSampler();
+  delete impl_;
+}
+
+PhaseLog& PhaseLog::Instance() {
+  static PhaseLog log;
+  return log;
+}
+
+void PhaseLog::Begin() {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  if (impl_->running) return;  // a second load joins the timeline it found
+  impl_->origin = std::chrono::steady_clock::now();
+  impl_->running = true;
+  impl_->render = 0;
+  impl_->samples = 0;
+}
+
+void PhaseLog::SetDeviceProbe(DeviceByteProbe probe) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->device_probe = std::move(probe);
+}
+
+void PhaseLog::SetRender(int64_t render) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->render = render;
+}
+
+double PhaseLog::Elapsed() const {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  if (!impl_->running) return 0.0;
+  return impl_->Now();
+}
+
+size_t PhaseLog::Open(const std::string& name, bool span) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  if (!impl_->running) {
+    impl_->origin = std::chrono::steady_clock::now();
+    impl_->running = true;
+  }
+  impl_->StartSamplerLocked();
+  Impl::Open o;
+  o.handle = impl_->next_handle++;
+  o.name = name;
+  o.render = impl_->render;
+  o.start = impl_->Now();
+  o.span = span;
+  o.live = true;
+  bool leaf_already_open = false;
+  for (const Impl::Open& other : impl_->open) {
+    if (other.live && !other.span) leaf_already_open = true;
+  }
+  o.nested = leaf_already_open && !span;
+  impl_->open.push_back(std::move(o));
+  impl_->SampleLocked();
+  return impl_->open.back().handle;
+}
+
+void PhaseLog::Close(size_t handle) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->SampleLocked();
+  for (size_t i = 0; i < impl_->open.size(); ++i) {
+    Impl::Open& o = impl_->open[i];
+    if (o.handle != handle || !o.live) continue;
+    Record r;
+    r.name = o.name;
+    r.render = o.render;
+    r.start = o.start;
+    r.end = impl_->Now();
+    r.peak_host_bytes = o.peak_host;
+    r.peak_device_bytes = o.peak_device;
+    r.span = o.span;
+    r.nested = o.nested;
+    impl_->records.push_back(std::move(r));
+    impl_->open.erase(impl_->open.begin() + static_cast<std::ptrdiff_t>(i));
+    return;
+  }
+}
+
+void PhaseLog::Sample() {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->SampleLocked();
+}
+
+std::vector<Record> PhaseLog::Records() const {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  return impl_->records;
+}
+
+int64_t PhaseLog::Samples() const {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  return impl_->samples;
+}
+
+void PhaseLog::Reset() {
+  impl_->StopSampler();
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->records.clear();
+  impl_->open.clear();
+  impl_->running = false;
+  impl_->render = 0;
+  impl_->samples = 0;
+  impl_->device_probe = DeviceByteProbe();
+}
+
+namespace {
+
+// The arithmetic every consumer of this table needs, in ONE place: the wall, the
+// sum of the leaves that partition it, and the difference between them. Leaves
+// only — a span encloses leaves and a nested leaf overlaps one, and adding
+// either would make `unaccounted` the residue of double counting instead of a
+// real quantity.
+struct Totals {
+  double wall = 0.0;
+  double leaves = 0.0;
+  double unaccounted = 0.0;
+};
+
+// The records are APPENDED in completion order, because that is when a scope
+// knows its own end. A reader wants a TIMELINE, so the emitted order is by
+// start — stably, so two scopes that opened in the same tick keep the order they
+// were opened in. Sorting here rather than at insertion keeps the append cheap
+// and keeps the appended order recoverable from `end_seconds`.
+std::vector<Record> ByStart(std::vector<Record> records) {
+  std::stable_sort(records.begin(), records.end(),
+                   [](const Record& a, const Record& b) { return a.start < b.start; });
+  return records;
+}
+
+Totals Sum(const std::vector<Record>& records, double wall) {
+  Totals t;
+  t.wall = wall;
+  for (const Record& r : records) {
+    if (r.span || r.nested) continue;
+    t.leaves += r.end - r.start;
+  }
+  t.unaccounted = wall - t.leaves;
+  return t;
+}
+
+}  // namespace
+
+bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
+                         const std::string& device, std::string* why) const {
+  const std::vector<Record> records = ByStart(Records());
+  const Totals totals = Sum(records, Elapsed());
+
+  nlohmann::json out;
+  out["schema"] = "vllm.cpp render phase log v1";
+  out["family"] = family;
+  out["device"] = device;
+  out["wall_seconds"] = totals.wall;
+  out["sum_leaf_seconds"] = totals.leaves;
+  out["unaccounted_seconds"] = totals.unaccounted;
+  out["host_bytes_source"] =
+#if defined(__linux__)
+      "/proc/self/statm";
+#else
+      "none";
+#endif
+  out["device_bytes_source"] = device == "cpu" ? "none" : "vt::Backend::DeviceMemoryInfo";
+  out["samples"] = Samples();
+  nlohmann::json phases = nlohmann::json::array();
+  for (const Record& r : records) {
+    nlohmann::json e;
+    e["name"] = r.name;
+    e["render"] = r.render;
+    e["start_seconds"] = r.start;
+    e["end_seconds"] = r.end;
+    e["duration_seconds"] = r.end - r.start;
+    e["peak_host_bytes"] = r.peak_host_bytes;
+    e["peak_device_bytes"] = r.peak_device_bytes;
+    e["span"] = r.span;
+    e["nested"] = r.nested;
+    phases.push_back(std::move(e));
+  }
+  out["phases"] = std::move(phases);
+
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if (!f.good()) {
+    if (why != nullptr) *why = "cannot open " + path;
+    return false;
+  }
+  const std::string text = out.dump(2);
+  f.write(text.data(), static_cast<std::streamsize>(text.size()));
+  f.put('\n');
+  if (!f.good()) {
+    if (why != nullptr) *why = "cannot write " + path;
+    return false;
+  }
+  if (StderrEnabled()) {
+    const std::string block = RenderText(family, device);
+    std::fwrite(block.data(), 1, block.size(), stderr);
+    std::fflush(stderr);
+  }
+  return true;
+}
+
+std::string PhaseLog::RenderText(const std::string& family, const std::string& device) const {
+  const std::vector<Record> records = ByStart(Records());
+  const Totals totals = Sum(records, Elapsed());
+  const double kGiB = 1024.0 * 1024.0 * 1024.0;
+  std::string out = "\nRENDER PHASE LOG family=" + family + " device=" + device + "\n";
+  char line[256];
+  std::snprintf(line, sizeof(line), "  %-4s %-30s %10s %10s %10s %10s\n", "r", "phase", "start_s",
+                "dur_s", "host_GiB", "dev_GiB");
+  out += line;
+  for (const Record& r : records) {
+    const char* kind = r.span ? "span" : (r.nested ? "nest" : "leaf");
+    std::snprintf(line, sizeof(line), "  %-4lld %-30s %10.3f %10.3f %10.3f %10.3f %s\n",
+                  static_cast<long long>(r.render), r.name.c_str(), r.start, r.end - r.start,
+                  r.peak_host_bytes < 0 ? -1.0 : static_cast<double>(r.peak_host_bytes) / kGiB,
+                  r.peak_device_bytes < 0 ? -1.0 : static_cast<double>(r.peak_device_bytes) / kGiB,
+                  kind);
+    out += line;
+  }
+  std::snprintf(line, sizeof(line), "  %-4s %-30s %10s %10.3f\n", "", "sum(leaf)", "",
+                totals.leaves);
+  out += line;
+  std::snprintf(line, sizeof(line), "  %-4s %-30s %10s %10.3f\n", "", "unaccounted", "",
+                totals.unaccounted);
+  out += line;
+  std::snprintf(line, sizeof(line), "  %-4s %-30s %10s %10.3f\n", "", "WALL", "", totals.wall);
+  out += line;
+  return out;
+}
+
+Scope::Scope(const std::string& name, bool span)
+    : handle_(PhaseLog::Instance().Open(name, span)) {}
+
+Scope::~Scope() { Close(); }
+
+void Scope::Close() {
+  if (closed_) return;
+  closed_ = true;
+  PhaseLog::Instance().Close(handle_);
+}
+
+void SampleNow() { PhaseLog::Instance().Sample(); }
+
+}  // namespace phase
+}  // namespace multimodal
+}  // namespace vllm

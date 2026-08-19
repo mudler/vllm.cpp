@@ -4,7 +4,14 @@
 // Row: MODEL-DIFFUSION-LTX25, .agents/specs/ltx-2-5.md phase L7. Issue #435.
 #include "vllm/multimodal/ltx2_video.h"
 
+// W0 of LTX25-DEVICE-RESIDENCY (#1010): the phase instrument. Every scope
+// below is a production call site — the table is written on the shipped
+// default, not behind a flag, because the runs whose profile the campaign
+// needs are the long ones nobody knew to instrument in advance.
+#include "vllm/multimodal/render_phase_log.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -299,9 +306,31 @@ std::vector<float> ToDenoised(const std::vector<float>& sample, const std::vecto
   return out;
 }
 
+// W0 of LTX25-DEVICE-RESIDENCY (#1010): the phase table lands BESIDE the frames
+// it explains, on the shipped default.
+//
+// A file rather than a console line, because #1040 is made of exactly the
+// evidence that existed only on a host that stopped answering, and a render that
+// took two hours is not one somebody was watching. An IO failure here is
+// reported and swallowed: a render must not fail because its instrument could
+// not write, and a silent success would be worse than either.
+void WritePhaseLog(const std::string& output_dir, const std::string& family,
+                   const std::string& device, std::string* out_path);
+
 std::string JoinPath(const std::string& dir, const std::string& leaf) {
   if (dir.empty()) return leaf;
   return dir.back() == '/' ? dir + leaf : dir + "/" + leaf;
+}
+
+void WritePhaseLog(const std::string& output_dir, const std::string& family,
+                   const std::string& device, std::string* out_path) {
+  const std::string path = JoinPath(output_dir, "phase-log.json");
+  std::string why;
+  if (phase::PhaseLog::Instance().WriteJson(path, family, device, &why)) {
+    *out_path = path;
+    return;
+  }
+  std::fprintf(stderr, "[ltx2] the phase table was not written: %s\n", why.c_str());
 }
 
 int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::string& key,
@@ -713,6 +742,16 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   Impl& im = *engine->impl_;
   im.params = params;
 
+  // ── W0: the timeline starts HERE, not at the first generation (#1010) ─────
+  //
+  // The load is render 0 because it is a phase of the render in every sense the
+  // campaign cares about: the spike measures ~7.5 minutes of DiT staging paid at
+  // the front of every render and every gate run, and a table that started at
+  // `Generate` would report that time as somebody else's.
+  phase::PhaseLog::Instance().Begin();
+  phase::PhaseLog::Instance().SetRender(0);
+  const phase::Scope load_span("load", /*span=*/true);
+
   // ── where this engine runs (phase L8) ─────────────────────────────────────
   //
   // `device` is 0 for the CPU and 1 + <accelerator index> for an accelerator,
@@ -805,6 +844,23 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "on device 0 and labelling it with an index nothing runs on.");
     }
     im.queue = vt::CreateQueue(im.device);
+    // W0: what the phase table's device column MEANS on this arm. The driver's
+    // own in-use figure, not ours — `--query-gpu=memory.used` returns `[N/A]` on
+    // GB10 (the spike §4.3), so this probe is the one device-byte instrument the
+    // gate host answers. It is installed with the queue rather than at the first
+    // phase, so every phase after the device is resolved carries the column.
+    {
+      const vt::DeviceType probe_type = im.device.type;
+      phase::PhaseLog::Instance().SetDeviceProbe([probe_type]() -> int64_t {
+        vt::Backend* backend = vt::TryGetBackend(probe_type);
+        if (backend == nullptr) return -1;
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        if (!backend->DeviceMemoryInfo(&free_bytes, &total_bytes)) return -1;
+        if (total_bytes < free_bytes) return -1;
+        return static_cast<int64_t>(total_bytes - free_bytes);
+      });
+    }
     // bf16: upstream resolves ONE model dtype and every layer inherits it, and it
     // is what `Ltx2StreamDitToDevice` stages. f32 on an accelerator would move
     // twice the bytes to reach a gate dtype, which is the polarity this project
@@ -844,8 +900,14 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     if (!lora_strength.empty()) spec.strength = ParseLoraStrength(lora_strength);
     dit_options.loras.push_back(std::move(spec));
   }
-  im.dit = im.on_device ? Ltx2StreamDitToDevice(*im.queue, dit_file, dit_options)
-                        : Ltx2LoadDitFromSafetensors(dit_file, dit_options);
+  {
+    // W0: the phase the campaign's W2 and W3 both act on. It covers the
+    // materialization AND the per-tensor device staging, because from the
+    // outside they are one wait.
+    const phase::Scope dit_phase("load.dit");
+    im.dit = im.on_device ? Ltx2StreamDitToDevice(*im.queue, dit_file, dit_options)
+                          : Ltx2LoadDitFromSafetensors(dit_file, dit_options);
+  }
 
   // ── the config the SHAPES cannot see ──────────────────────────────────────
   //
@@ -1077,6 +1139,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // object across pipelines.
   if (params.video_vae_path.empty() && !im.recipe.audio_only) Fail("video_vae_path is required");
   if (!params.video_vae_path.empty()) {
+    const phase::Scope video_vae_phase("load.video_vae");
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
     const nlohmann::json vae_config = Ltx2ReadCheckpointConfig(f);
     im.video_cfg = Ltx2ParseConvVideoDecoderConfig(vae_config, &im.video_kind);
@@ -1127,6 +1190,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // ── the audio VAE + its vocoder ───────────────────────────────────────────
   if (params.audio_vae_path.empty()) Fail("audio_vae_path is required");
   {
+    const phase::Scope audio_vae_phase("load.audio_vae");
     const SafetensorsFile f = SafetensorsFile::Open(params.audio_vae_path);
     const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
     im.audio_cfg = Ltx2ParseAudioDecoderConfig(config);
@@ -1146,6 +1210,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // ── the optional latent spatial upsampler (the two-stage recipe's phase 2) ─
   const std::string upsampler_path = VideoExtra(params.extras, "upsampler_path");
   if (!upsampler_path.empty()) {
+    const phase::Scope upsampler_phase("load.upsampler");
     const SafetensorsFile f = SafetensorsFile::Open(upsampler_path);
     const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
     im.upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
@@ -1178,6 +1243,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
          "dropped looks exactly like the feature not working.");
   }
   if (!params.encoder_path.empty()) {
+    // W0: ~24 GB of host bf16 at the shipped 12B, and the tower every W4
+    // hypothesis is about.
+    const phase::Scope text_encoder_phase("load.text_encoder");
     const SafetensorsFile encoder_file = SafetensorsFile::Open(params.encoder_path);
 
     // 1. THE ASSET PACK. `require_config=false` unconditionally, because the
@@ -1286,6 +1354,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
         "unconditioned, which renders.");
   }
   if (!params.prompt_embeds_path.empty()) {
+    const phase::Scope embeds_phase("load.prompt_embeds");
     im.video_prompt_embeds = ReadF32File("prompt_embeds_path", params.prompt_embeds_path);
     im.audio_prompt_embeds = ReadF32File(kLtx2AudioPromptEmbedsExtra, audio_embeds_path);
     const int64_t vw = im.dit.params.cross_attention_dim;
@@ -1732,7 +1801,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   Impl& im = *impl_;
   std::lock_guard<std::mutex> guard(im.mutex);
 
+  // ── W0: this render's slice of the timeline (#1010) ───────────────────────
+  //
+  // The counter is a process static rather than a member: the table is a PROCESS
+  // timeline (the load is render 0 and belongs to whichever render first flushes
+  // it), and two engines in one process interleaving their renders is a
+  // measurement shape nobody takes, not a case to encode.
+  static std::atomic<int64_t> render_counter{0};
+  phase::PhaseLog::Instance().SetRender(render_counter.fetch_add(1) + 1);
+  phase::Scope generate_span("generate", /*span=*/true);
+  const std::string phase_device =
+      im.on_device ? std::string(vt::DeviceTypeName(im.device.type)) : std::string("cpu");
+
   if (gen.output_dir.empty()) Fail("output_dir is required");
+  phase::Scope setup_phase("generate.setup");
   for (const auto& kv : gen.extras) {
     // The per-generation extras this family DEFINES, and the list is the one
     // below rather than this sentence: `image_crf` (row LTX25-IMAGE-COND), the
@@ -2075,6 +2157,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   //     12B forward over the prompt's own valid tokens once per request, against
   //     a denoise loop of many 21B forwards; it is recorded as owed rather than
   //     hidden, and it is the reason `im.queue` is not passed here.
+  setup_phase.Close();
+
   std::vector<float> prompt_video, prompt_audio;
   const float* video_context = im.video_prompt_embeds.data();
   const float* audio_context = im.audio_prompt_embeds.data();
@@ -2082,10 +2166,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   im.trace = Ltx2ConditioningTrace{};
 
   if (!gen.prompt.empty()) {
+    // W0: the phase #1269 and W4 are about. Split into the TOWER and the
+    // CONNECTOR because they are different work on different weights, and the
+    // spike's 39-100% bound could not tell them apart.
+    const phase::Scope conditioning_span("generate.conditioning", /*span=*/true);
     vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    phase::Scope tower_phase("conditioning.tower");
     const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
         *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
         gen.prompt, text_queue);
+    tower_phase.Close();
     prompt_video = encoded.conditioning.video;
     prompt_audio = encoded.conditioning.audio;
     context_tokens = encoded.seq;
@@ -2107,9 +2197,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
             "only on an already right-padded input. Refusing rather than sorting a "
             "caption stream against a mask it no longer matches.");
       }
+      phase::Scope connector_phase("conditioning.connector");
       const Ltx2ConnectorEmbeddings through = RunConnector(
           SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
           im.audio_connector_cfg, prompt_video, prompt_audio, mask, context_tokens);
+      connector_phase.Close();
       prompt_video = through.video;
       prompt_audio = through.audio;
     }
@@ -2152,9 +2244,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // about a video stream this pipeline does not have, and a `t2a` request that
   // fell through would be refused by a message about latent grids.
   if (im.recipe.audio_only) {
-    return GenerateAudioOnly(im, gen, audio_context, context_tokens);
+    VideoResult audio_only = GenerateAudioOnly(im, gen, audio_context, context_tokens);
+    generate_span.Close();
+    WritePhaseLog(gen.output_dir, kLtx2VideoFamily, phase_device, &audio_only.phase_log_path);
+    return audio_only;
   }
 
+  // W0: the five leaves below CHAIN — each one closes where the next opens —
+  // so the driver's linear prologue is named rather than left as residue.
+  phase::Scope prep_image("generate.image_cond");
   // ── conditioning on pixels (row LTX25-IMAGE-COND, issue #644) ─────────────
   //
   // Upstream this is `ImageConditioner` (ltx-pipelines/utils/blocks.py:936-993,
@@ -2388,6 +2486,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.image_strength = image_strength;
   }
 
+  prep_image.Close();
+  phase::Scope prep_geometry("generate.geometry");
   // ── geometry ──────────────────────────────────────────────────────────────
   const Ltx2PipelineRecipe& recipe = im.recipe;
   // A retake's geometry is the SOURCE clip's, not the recipe's and not the
@@ -2544,6 +2644,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   std::vector<float> audio_latent_volume;  // [C, F, M], unpatchified
   int64_t audio_lc = 0, audio_lf = 0, audio_lm = 0;
 
+  prep_geometry.Close();
+  phase::Scope prep_audio("generate.audio_input");
   // ── AUDIO-TO-VIDEO: the driving waveform (#922) ────────────────────────────
   //
   // `A2VidPipelineTwoStage.__call__` lines 196-202: decode the file, encode it
@@ -2648,6 +2750,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     a2v_audio_volume = encoded.data;
   }
 
+  prep_audio.Close();
+  phase::Scope prep_retake("generate.retake");
   // ── RETAKE: the source clip becomes the initial video latent (#924) ───────
   //
   // `RetakePipeline.__call__` lines 238-247: read the clip and encode it through
@@ -2686,6 +2790,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.retake_latent_absmax = AbsMax(retake_video_volume);
   }
 
+  prep_retake.Close();
+  phase::Scope prep_guiders("generate.guiders");
   // ── THE GUIDERS, and the negative conditioning they ask for (#1092) ───────
   //
   // `create_multimodal_guider_factory(params=..., negative_context=...)` once per
@@ -2825,8 +2931,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
   }
 
+  prep_guiders.Close();
   for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
     const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
+    // W0: one set of leaves PER RECIPE PHASE. The two-stage recipe renders its
+    // stages at different resolutions, so a table that summed them would hide
+    // exactly the term the campaign is looking for.
+    ::vllm::multimodal::phase::Scope phase_prepare("phase.prepare");
 
     // THE PER-PHASE ADAPTER SET (row LTX25-PHASE-LORA, issue #1118). Upstream
     // hands each `DiffusionStage` its own `loras=` argument
@@ -3912,6 +4023,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // model above is the other half: this one counts CALLS, that one counts
       // FORWARDS, and only the second moves when guidance is dropped.
       im.trace.dit_evaluations += 1;
+      // W0: one host/device sample per DiT forward. The scope boundaries alone
+      // would report the peak a MINUTES-long denoise reached only at its ends,
+      // and W6's attribution of the ~59 GiB needs the interior.
+      ::vllm::multimodal::phase::SampleNow();
 
       // `last_denoised_*` keeps what the GUIDER returned, before the
       // post-process, because that is what `_last_denoised_video` holds
@@ -3962,6 +4077,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
     const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
 
+    phase_prepare.Close();
+    // W0: THE phase #1024 was read as, and the one this instrument exists to
+    // separate from the rest. It covers both sampler arms, because from the
+    // outside they are the same wait.
+    ::vllm::multimodal::phase::Scope denoise_phase("denoise");
     if (phase.stepper == Ltx2StepperKind::kRes2s) {
       // ── the res_2s second-order sampler (samplers.py:208-447) ─────────────
       //
@@ -4104,6 +4224,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         if (phase_index == 0 && step == 0) im.trace.video_first_next_latent = video.latent;
       }
     }
+    denoise_phase.Close();
+    // W0: what a recipe phase does AFTER its sampler — the trim, the slot
+    // extraction and the pool drain. Small on this fixture and not obviously
+    // small at 22B, which is the reason it is named rather than folded in.
+    ::vllm::multimodal::phase::Scope phase_finish("phase.finish");
 
     // `clear_conditioning` + `unpatchify` (blocks.py:575-580, in that order).
     //
@@ -4215,6 +4340,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
   }
 
+  phase::Scope trim_phase("generate.trim");
   // ── DFR: trim the padded canvas back to the caller's contract (#986) ──────
   //
   // `dfr_pipeline.py:531-540`. The canvas padded its tail up to a whole number
@@ -4372,13 +4498,22 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     ec.clear();
   }
 
+  trim_phase.Close();
+
   int64_t rendered_frames = 0;
   int64_t rendered_channels = 0;
+  // W0: the decode and the PPM writer INTERLEAVE — the decoder streams chunks
+  // into the writer's callback — so the two leaves ALTERNATE rather than nest.
+  // Folding the writes into `decode.video` would charge W5's lever with the cost
+  // of a `write(2)`; nesting them would take the writer out of the sum entirely.
+  size_t decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
   Ltx2VideoDecodeStreaming(
       im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
       video_lh, video_lw, &decode_noise,
       Ltx2AutoTileSizeConfig(rendered_h, rendered_w, video_factors),
       [&](const Ltx2VideoChunk& chunk) {
+        phase::PhaseLog::Instance().Close(decode_handle);
+        phase::Scope write_phase("artifacts.frames");
         MiniMaxH3VideoFrameShape shape;
         shape.channels = chunk.frames.channels;
         shape.t = chunk.frames.frames;
@@ -4399,7 +4534,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
         rendered_frames += chunk.frames.frames;
         rendered_channels = chunk.frames.channels;
+        write_phase.Close();
+        decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
       });
+  phase::PhaseLog::Instance().Close(decode_handle);
 
   // ── the soundtrack ────────────────────────────────────────────────────────
   //
@@ -4420,6 +4558,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     audio_samples = a2v_source.samples_per_channel;
     audio_rate = a2v_source.sample_rate;
   } else {
+    const phase::Scope audio_decode_phase("decode.audio");
     const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
         im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
     waveform = Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data,
@@ -4479,8 +4618,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
          std::to_string(expect_frames) + " x " + std::to_string(im.video_cfg.out_channels));
   }
   result.audio_path = JoinPath(gen.output_dir, "audio.wav");
-  WriteFileBytes(result.audio_path,
-                 MiniMaxH3WriteWav(waveform, audio_channels, audio_samples, audio_rate));
+  {
+    const phase::Scope wav_phase("artifacts.audio");
+    WriteFileBytes(result.audio_path,
+                   MiniMaxH3WriteWav(waveform, audio_channels, audio_samples, audio_rate));
+  }
   result.frame_count = rendered_frames;
   result.width = rendered_w;
   result.height = rendered_h;
@@ -4500,6 +4642,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // separates "this conditioning produced that clip" from "this conditioning was
   // built for a render that then failed".
   im.trace.completed = true;
+  // W0 (#1010): the table, beside the frames it explains. The enclosing span is
+  // closed BEFORE the write so this render's own span appears in its own file.
+  generate_span.Close();
+  WritePhaseLog(gen.output_dir, kLtx2VideoFamily, phase_device, &result.phase_log_path);
   return result;
 }
 

@@ -460,8 +460,14 @@ struct CudaGdnCachePool {
   std::vector<void*> owned;
   std::vector<PagedKvCache> attn_kv;
   std::vector<vllm::GdnStateCache> gdn_state;
+  // `spec_mql` is the longest speculative query length this pool must serve.
+  // `causal_conv1d_spec_update` derives it from the conv state WIDTH --
+  // `state_len = (K - 1) + (mql - 1)` (`src/vt/ops.cpp:1903`) -- so a pool built
+  // at the plain decode width refuses every q above 1. Default 1 keeps every
+  // pre-W6 case byte-identical.
   CudaGdnCachePool(vt::Backend& backend, vt::Queue& q, const HfConfig& c,
-                   int64_t num_blocks, int64_t block_size)
+                   int64_t num_blocks, int64_t block_size,
+                   int64_t spec_mql = 1)
       : b(backend) {
     const vt::Device dev{vt::DeviceType::kCUDA, 0};
     const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
@@ -482,8 +488,10 @@ struct CudaGdnCachePool {
             alloc(static_cast<size_t>(num_blocks * Hv * Dv * Dk) * sizeof(float)),
             DType::kF32, dev, {num_blocks, Hv, Dv, Dk});
         gs.conv_state = vt::Tensor::Contiguous(
-            alloc(static_cast<size_t>(num_blocks * conv_dim * (Kw - 1)) * sizeof(float)),
-            DType::kF32, dev, {num_blocks, conv_dim, Kw - 1});
+            alloc(static_cast<size_t>(num_blocks * conv_dim *
+                                      (Kw - 1 + spec_mql - 1)) *
+                  sizeof(float)),
+            DType::kF32, dev, {num_blocks, conv_dim, Kw - 1 + spec_mql - 1});
         gdn_state.push_back(gs);
       } else {
         PagedKvCache kv;
@@ -856,4 +864,135 @@ TEST_CASE("G1 CUDA: Qwen3_5DenseDecodeGraph replays bit-exactly against eager, 3
   MESSAGE("G1 Qwen3_5DenseDecodeGraph on CUDA: 5 steps x "
           << c.vocab_size << " logits, " << total << " differing, "
           << graphed.replay_count() << " replays");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// G1 FOR ENG-CUDAGRAPH-BREAK W6 (#1374): the ring key on a REAL DEVICE.
+// [#1020](https://github.com/mudler/vllm.cpp/issues/1020).
+//
+// WHAT THE CPU GATE CANNOT SAY. `test_qwen3_5_decode_graph_seam.cpp` proves the
+// key opens TWO rings for two spec shapes of equal S, by counting them. It
+// cannot prove the second ring replays the right graph, because a CPU "replay"
+// recomputes nothing -- the whole reason this file exists.
+//
+// THE ARMS, AND WHY NEITHER IS "EAGER". Every other case here selects its eager
+// arm with `max_num_reqs == 0`, because `PadToCaptureSize` then returns -1. That
+// lever does not exist on a SPEC step: `S = spec_step ? B : PadToCaptureSize(B)`
+// takes the exact shape and never consults `max_num_reqs`. So the A/B here is
+// between two GRAPHED drivers that differ only in their HISTORY. Arm A has only
+// ever seen the q == 3 shape. Arm B saw the q == 2 shape first, on a throwaway
+// cache, and both shapes are S == 6.
+//
+// Under the pre-W6 key both shapes indexed `slots[6]`, so arm B's first q == 3
+// step would find `captured()` already true and REPLAY the q == 2 graph -- a
+// graph whose captured metadata has three requests where this step has two.
+// Same binary, same device, same inputs, same starting cache state: any
+// difference between the arms is the key.
+//
+// FIVE STEPS AND THREE REPLAYS, the same shape the rest of this file uses,
+// because a single replay cannot tell a correct boundary from one that happens
+// to read a buffer nothing has overwritten yet.
+namespace {
+
+vllm::v1::GDNAttentionMetadata SpecGdnMeta(int32_t reqs, int32_t q) {
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 0;
+  gm.num_prefill_tokens = 0;
+  gm.num_decodes = 0;
+  gm.num_decode_tokens = 0;
+  gm.num_spec_decodes = reqs;
+  gm.num_spec_decode_tokens = reqs * q;
+  gm.num_actual_tokens = reqs * q;
+  gm.spec_state_indices_num_cols = q;
+  std::vector<int32_t> ssi(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (int32_t r = 0; r < reqs; ++r)
+    for (int32_t j = 0; j < q; ++j) ssi[static_cast<size_t>(r * q + j)] = r;
+  gm.spec_state_indices_tensor = std::move(ssi);
+  std::vector<int32_t> sqsl(static_cast<size_t>(reqs) + 1);
+  for (int32_t r = 0; r <= reqs; ++r) sqsl[static_cast<size_t>(r)] = r * q;
+  gm.spec_query_start_loc = std::move(sqsl);
+  gm.spec_sequence_masks = std::vector<uint8_t>(static_cast<size_t>(reqs), 1);
+  std::vector<int32_t> stx(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (size_t i = 0; i < stx.size(); ++i) stx[i] = static_cast<int32_t>(i);
+  gm.spec_token_indx = std::move(stx);
+  gm.num_accepted_tokens = std::vector<int32_t>(static_cast<size_t>(reqs), 1);
+  return gm;
+}
+
+CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
+  CommonAttentionMetadata am;
+  am.num_reqs = reqs;
+  am.num_actual_tokens = reqs * q;
+  am.query_start_loc.resize(static_cast<size_t>(reqs) + 1);
+  for (int32_t r = 0; r <= reqs; ++r)
+    am.query_start_loc[static_cast<size_t>(r)] = r * q;
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens.assign(static_cast<size_t>(reqs), pos + q);
+  am.seq_lens_cpu = am.seq_lens;
+  am.max_query_len = q;
+  am.max_seq_len = pos + q;
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(static_cast<size_t>(reqs), 0);
+  am.slot_mapping.resize(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (size_t i = 0; i < am.slot_mapping.size(); ++i)
+    am.slot_mapping[i] = pos + static_cast<int32_t>(i);
+  am.causal = true;
+  return am;
+}
+
+std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
+  std::vector<int32_t> v(static_cast<size_t>(n));
+  for (int32_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = base + i;
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("G1 CUDA W6: a colliding spec shape does not replay the other graph") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
+    return;
+  }
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  const HfConfig c = Qwen35DenseConfig();
+  const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
+
+  CudaGdnCachePool cache_a(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
+                           /*spec_mql=*/3);
+  CudaGdnCachePool cache_b(b, q, c, 4, 16, 3);
+  CudaGdnCachePool cache_prime(b, q, c, 4, 16, 3);
+  vllm::Qwen3_5DenseDecodeGraph arm_a(w, c, q, /*max_num_reqs=*/4);
+  vllm::Qwen3_5DenseDecodeGraph arm_b(w, c, q, /*max_num_reqs=*/4);
+
+  // Arm B's history: the OTHER shape of the same S, on a cache neither arm
+  // compares. Three steps, because a spec step always takes the two-slot parity
+  // ring and slot 0 is warm only on the third.
+  for (int step = 0; step < 3; ++step) {
+    arm_b.Step(SpecIota(6, 50), SpecIota(6, 0), SpecAttnMeta(3, 2, 0),
+               SpecGdnMeta(3, 2), cache_prime.attn_kv, cache_prime.gdn_state);
+  }
+  REQUIRE(arm_b.captured());  // the q == 2 graph exists, which is the premise
+
+  size_t total = 0;
+  for (int step = 0; step < 5; ++step) {
+    const std::vector<int32_t> tok = SpecIota(6, 10);
+    const std::vector<int32_t> pos = SpecIota(6, 0);
+    const CommonAttentionMetadata am = SpecAttnMeta(2, 3, 0);
+    const vllm::v1::GDNAttentionMetadata gm = SpecGdnMeta(2, 3);
+    const std::vector<float> a =
+        Read(b, q, arm_a.Step(tok, pos, am, gm, cache_a.attn_kv, cache_a.gdn_state),
+             c.vocab_size * 6);
+    const std::vector<float> bb =
+        Read(b, q, arm_b.Step(tok, pos, am, gm, cache_b.attn_kv, cache_b.gdn_state),
+             c.vocab_size * 6);
+    total += CompareStep(step, a, bb);
+  }
+  CHECK(arm_a.captured());
+  CHECK(arm_b.captured());
+  CHECK(arm_a.replay_count() >= 3);
+  CHECK(arm_b.replay_count() >= 3);
+  MESSAGE("G1 W6 colliding spec shapes on CUDA: 5 steps x " << (c.vocab_size * 6)
+          << " logits, " << total << " differing, arm A " << arm_a.replay_count()
+          << " replays, arm B " << arm_b.replay_count() << " replays");
 }

@@ -3229,11 +3229,62 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     if (wants_first_frame) {
       const Ltx2LatentVolume encoded = encode_conditioning_image("first_frame", image_bytes);
 
-      // `frame_idx == 0` -> `VideoConditionByLatentIndex` (helpers.py:295-300).
-      // It REPLACES tokens that already exist and the token count never changes.
+      // WHICH ITEM FRAME 0 TAKES IS THE RECIPE'S TO SAY, and it is the ONE line
+      // on which upstream's two image-conditioning builders differ (row
+      // LTX25-KEYFRAME-INTERP, #1096):
+      //
+      //   combined_image_conditionings (helpers.py:295-300)
+      //       frame_idx == 0 -> VideoConditionByLatentIndex. REPLACES tokens
+      //       that already exist; the token count never changes.
+      //   image_conditionings_by_adding_guiding_latent (helpers.py:343-367)
+      //       NO branch. Frame 0 takes VideoConditionByKeyframeIndex like every
+      //       other frame, and APPENDS a latent frame of tokens.
+      //
+      // A `pipeline_kind` string test here would be one more place for the next
+      // recipe on the second builder to be missed, so the flag rides the recipe
+      // — see `Ltx2ImageConditioningBuilder`.
+      //
+      // NOTHING ABOUT THE RENDER'S SHAPE CAN SEE THIS. Both arms condition on
+      // the same image and both return a clip of the right size, the right frame
+      // count and the right sample rate; the only observable is the sequence
+      // LENGTH the DiT ran over, which is `im.trace.video_tokens`.
+      const bool frame0_appends =
+          recipe.image_conditioning == Ltx2ImageConditioningBuilder::kAddGuidingLatent;
+      // The sequence length BEFORE this item, so the digest below can be taken
+      // from the tokens the append actually grew. On the replace arm it is also
+      // the length after, which the assertion under `frame0_appends` states.
+      const int64_t before_first_frame = video.tokens;
+
       Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
-      Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
-                                      /*latent_idx=*/0);
+      if (frame0_appends) {
+        // `frame_idx = 0` is not a formality: `VideoConditionByKeyframeIndex`
+        // offsets its positions by `frame_idx` (keyframe_cond.py:52), so this
+        // argument alone decides WHERE IN TIME the opening keyframe lands. It is
+        // gated below, on a temporal window recomputed from `fps`, because
+        // nothing else can see it — the sibling arm found the same hole with
+        // mutation M10 and carries the same shape of check.
+        //
+        // `causal_fix = true` is upstream's value for this item and it is INERT
+        // at this call site. MEASURED, so the next reader does not go looking
+        // for the gate that cannot exist: `Ltx2ConditionVideoByKeyframe` gates
+        // the fix on `frame_idx == 0` (keyframe_cond.py:49,
+        // `latent_tools.causal_fix if self.frame_idx == 0 else False`), so the
+        // gate is OPEN here and the fix is applied — and then the
+        // `num_pixel_frames == 1` narrow at `:56-57` overwrites the temporal END
+        // the fix moved, while the temporal START clamps to 0 either way for a
+        // keyframe whose latent depth is 1 (`max(0 + 1 - time, 0)`, and
+        // `encoded.frames != 1` is refused above). Flipping this argument moves
+        // 0 of 48 position values on a probe of the same shapes; the fix becomes
+        // observable only at `num_pixel_frames != 1`, which no arm here passes.
+        // The `frame_idx == 0` gate itself is what carries the risk, and it is
+        // gated on the seam in `test_ltx2_vae` at a shape where it shows.
+        Ltx2ConditionVideoByKeyframe(&state, encoded, /*patch_size=*/1, factors, fps,
+                                     /*frame_idx=*/0, image_strength,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+      } else {
+        Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
+                                        /*latent_idx=*/0);
+      }
       FromLatentState(state, &video);
 
       // The witness, taken from the TOKENS THAT WERE WRITTEN rather than from
@@ -3254,12 +3305,92 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const int64_t placed = Ltx2VideoTokenCount({1, vshape.channels, 1, vshape.height,
                                                   vshape.width},
                                                  1);
+      // AND WHERE THEY LANDED DEPENDS ON THE ARM. The replace arm writes latent
+      // frame 0, which is the FRONT of the clean tensor; the append arm writes
+      // the tokens it just added, which are the TAIL. Reading the front on the
+      // append arm would digest unconditioned tokens and report a healthy
+      // conditioning for a state the keyframe never reached — exactly the
+      // failure the paragraph above says this field exists to prevent.
+      const ptrdiff_t first = frame0_appends
+                                  ? static_cast<ptrdiff_t>(before_first_frame * video.width)
+                                  : 0;
       const std::vector<float> written(
-          video.clean.begin(),
-          video.clean.begin() + static_cast<ptrdiff_t>(placed * video.width));
+          video.clean.begin() + first,
+          video.clean.begin() + first + static_cast<ptrdiff_t>(placed * video.width));
+      // AND THE SLICE IS THE ONE THE IMAGE LANDED IN. `first` is the only thing
+      // that decides which tokens the three fields below describe, and it was
+      // ungated: forcing it to 0 on the append arm made the digest describe the
+      // untouched FRONT of the sequence, and both binaries stayed green — which
+      // is the exact failure the paragraph above says these fields exist to
+      // prevent, arriving through the slice rather than through the conditioning.
+      //
+      // Recomputed from `encoded`, not from `first`, so the two are independent
+      // expressions. Both conditioning items write the SAME bytes — the
+      // patchified conditioning volume — the replace arm at latent frame 0
+      // (latent_cond.py:38-39) and the append arm at the tail
+      // (keyframe_cond.py:82) — so one expectation serves both, and a slice that
+      // names any other window reds by value rather than by shape.
+      Ltx2VideoLatentShape placed_shape = vshape;
+      placed_shape.frames = encoded.frames;
+      const std::vector<float> expected =
+          Ltx2VideoPatchify(encoded.data.data(), placed_shape, /*patch_size=*/1);
+      VT_CHECK(written == expected,
+               "ltx2 video: `image_digest` and `image_absmax` must describe the tokens the "
+               "conditioning item WROTE. The slice this arm read back does not hold the "
+               "patchified conditioning volume, so the trace reports a healthy conditioning for "
+               "a window the image never reached");
       im.trace.image_tokens = placed;
       im.trace.image_digest = DigestF32(written);
       im.trace.image_absmax = AbsMax(written);
+
+      // THE ARM DID WHAT ITS NAME SAYS. Asserted rather than assumed for the
+      // reason the last-frame arm below asserts the same thing: a build whose
+      // append did not grow the sequence leaves buffers longer than the count
+      // that describes them, and the DiT then reads a prefix, renders a
+      // plausible clip and never mentions the keyframe. The replace polarity is
+      // asserted too, because the two arms share one digest slice above and that
+      // slice is only correct while each arm moves the count the way this says.
+      if (frame0_appends) {
+        VT_CHECK(video.tokens == before_first_frame + placed,
+                 "ltx2 video: this recipe takes `image_conditionings_by_adding_guiding_latent` "
+                 "(ltx-pipelines/utils/helpers.py:343-367), whose frame-0 item APPENDS "
+                 "(keyframe_cond.py:79-82), and the sequence did not grow by one latent frame "
+                 "of tokens");
+
+        // ...AND IT LANDED ON PIXEL FRAME 0, which is the whole content of
+        // `frame_idx` and which nothing above can see. MEASURED, on this arm,
+        // exactly as the sibling last-frame arm measured it: changing
+        // `frame_idx` from 0 to 3 left both binaries GREEN, because an opening
+        // keyframe pinned to the wrong pixel frame appends the same number of
+        // tokens carrying the same content and only sits somewhere else in time.
+        //
+        // The window is recomputed from `fps` alone and never read back from the
+        // argument, so the two are independent expressions. Upstream offsets in
+        // integer PIXEL space and then divides the temporal axis by fps
+        // (keyframe_cond.py:52-59), and `num_pixel_frames = 1` narrows the end to
+        // `start + 1` BEFORE that division (`:56-57`) — so the first appended
+        // token spans exactly `[0, 1/fps)`. Asserting the END as well as the
+        // START is what keeps this check reading the composition rather than the
+        // offset alone: it is the one place `num_pixel_frames` is observable.
+        const double want_t0 = 0.0;
+        const double want_t1 = static_cast<double>(static_cast<float>(1.0 / fps));
+        const double got_t0 = video.positions[static_cast<size_t>(before_first_frame * 2)];
+        const double got_t1 = video.positions[static_cast<size_t>(before_first_frame * 2 + 1)];
+        VT_CHECK(std::abs(got_t0 - want_t0) <= 1e-5 &&
+                     std::abs(got_t1 - want_t1) <= 1e-5 * std::max(1.0, std::abs(want_t1)),
+                 "ltx2 video: the first-frame keyframe's appended tokens must span pixel frame 0, "
+                 "i.e. [" +
+                     std::to_string(want_t0) + ", " + std::to_string(want_t1) +
+                     "), and the first appended token spans [" + std::to_string(got_t0) + ", " +
+                     std::to_string(got_t1) +
+                     "). A keyframe that appends the right number of tokens at the wrong TIME "
+                     "renders a clip of the right length that pins the image to the wrong end");
+      } else {
+        VT_CHECK(video.tokens == before_first_frame,
+                 "ltx2 video: `combined_image_conditionings` sends frame 0 to "
+                 "`VideoConditionByLatentIndex` (helpers.py:295-300), which REPLACES tokens that "
+                 "already exist (latent_cond.py:38-39), so the sequence length must not move");
+      }
     }
 
     // ── the LAST-frame keyframe (row LTX25-TOKEN-APPEND, issue #930) ────────
@@ -3282,6 +3413,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     if (wants_last_frame) {
       const Ltx2LatentVolume encoded = encode_conditioning_image("last_frame", last_frame_bytes);
 
+      // THE SEQUENCE LENGTH BEFORE THIS ITEM, and it is not `target_tokens`.
+      // Every assertion below locates this item's tokens, and the only thing
+      // that knows where they start is the count at the moment of the append —
+      // NOT the target grid, which is what stands before the FIRST append and
+      // nothing after it. Reading the target here was correct only while this
+      // arm was the first append, and row LTX25-KEYFRAME-INTERP put the
+      // first-frame arm's own append in front of it on the
+      // `image_conditionings_by_adding_guiding_latent` recipes: with both ends
+      // pinned, `positions[target_tokens * 2]` named the FIRST frame's keyframe
+      // at temporal 0 and the check below aborted the render (#1219).
+      const int64_t before_last_frame = video.tokens;
+
       Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
       Ltx2ConditionVideoByKeyframe(&state, encoded, /*patch_size=*/1, factors, fps,
                                    /*frame_idx=*/frames - 1, image_strength,
@@ -3293,7 +3436,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // that dropped the grown count would leave a state whose buffers are
       // longer than the count that describes them — and the DiT would then read
       // a prefix, render a plausible clip, and never mention the keyframe.
-      VT_CHECK(video.tokens > target_tokens,
+      VT_CHECK(video.tokens > before_last_frame,
                "ltx2 video: a keyframe conditioning must APPEND tokens "
                "(keyframe_cond.py:79-82) and this one left the sequence length unchanged");
       VT_CHECK(static_cast<int64_t>(video.latent.size()) == video.tokens * video.width &&
@@ -3320,13 +3463,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // expressions and a mutation of the argument alone moves one and not the
       // other. `Ltx2ConditionVideoByKeyframe` offsets the item's temporal
       // coordinates by `frame_idx` in integer PIXEL space and then divides the
-      // temporal axis by fps (keyframe_cond.py:52-58), so the first appended
+      // temporal axis by fps (keyframe_cond.py:52-59), so the first appended
       // token's temporal START is `frame_idx / fps`. Positions are
       // [pos_dims, tokens, 2] concatenated PER DIMENSION, so the temporal axis
-      // is dimension 0 and the first appended token sits at `target_tokens * 2`.
+      // is dimension 0 and this item's first token sits at
+      // `before_last_frame * 2` — the count at the moment of ITS append, which
+      // is the target grid only when nothing appended before it.
       const double want_t0 = static_cast<double>(static_cast<float>(
           static_cast<double>(frames - 1) / fps));
-      const double got_t0 = video.positions[static_cast<size_t>(target_tokens * 2)];
+      const double got_t0 = video.positions[static_cast<size_t>(before_last_frame * 2)];
       VT_CHECK(std::abs(got_t0 - want_t0) <= 1e-5 * std::max(1.0, std::abs(want_t0)),
                "ltx2 video: the last-frame keyframe's appended tokens must carry the temporal "
                "position of pixel frame `frames - 1` (" +
@@ -3356,6 +3501,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // stage's composition, which renders a clip whose keyframes simply disagree
     // with the video around them.
     if (!slot_positions.empty()) {
+      // AGAIN THE COUNT AT THE APPEND, not the target grid, and for the reason
+      // the last-frame arm states: two supplied keyframes can already stand in
+      // front of this item, so `target_tokens` is the length before the FIRST
+      // append and describes nothing here (#1219).
+      const int64_t before_slots = video.tokens;
       Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
       Ltx2ConditionVideoByGeneratedKeyframeSlots(
           &state, vshape, /*patch_size=*/1, factors, fps, slot_positions,
@@ -3364,11 +3514,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       FromLatentState(state, &video);
 
       VT_CHECK(video.tokens ==
-                   target_tokens + static_cast<int64_t>(slot_positions.size()) *
-                                       slot_layout.tokens_per_keyframe,
+                   before_slots + static_cast<int64_t>(slot_positions.size()) *
+                                      slot_layout.tokens_per_keyframe,
                "ltx2 video: the generated keyframe slots must APPEND one latent frame of tokens "
                "per slot (keyframe_slots.py:83-84, :136-140), and the sequence did not grow by "
                "that many");
+      // ...AND THE RECORDED LAYOUT DESCRIBES THOSE TOKENS. `first_token` is the
+      // state's own pre-append count (keyframe_slots.py:143-147), and the marked
+      // walk below starts there; a layout that named some other token would
+      // count the wrong window and still report a healthy total.
+      VT_CHECK(slot_layout.first_token == before_slots,
+               "ltx2 video: the generated keyframe layout must start at the token the slots were "
+               "appended at (keyframe_slots.py:143-147), and it names " +
+                   std::to_string(slot_layout.first_token) + " against " +
+                   std::to_string(before_slots));
       // THE MARKER REACHED THE NEW TOKENS. This is the one thing the slot arm
       // buys over an ordinary append, it is what `marked=true` exists for
       // (keyframe_slots.py:121), and nothing about the render's shape, its token

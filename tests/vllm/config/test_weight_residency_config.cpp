@@ -882,3 +882,311 @@ TEST_CASE("residency config: reading mmap or prefault latches NOTHING, so a seco
   CHECK(vllm::ResolveGgufMmap(/*builtin_default=*/true) == false);
   CHECK(vllm::ResolveGgufPrefault() == false);
 }
+
+// ─── W2: `vllm_cpp.device_fit.weight_budget_bytes` (issue #1127) ──────────────
+//
+// The sixth knob, and the only one whose legal range includes ZERO. `slots` and
+// `slot_bytes` are sizes, so a zero there is refused: a slot count that silently
+// became 64 is a cache the operator does not have. `0` on the budget is the
+// DOCUMENTED spelling of "suppress the device-fit refusal", identical to
+// `VT_DEVICE_WEIGHT_BUDGET_BYTES=0`, because `CheckDeviceWeightFit` reads a zero
+// budget as UNKNOWN and decides nothing. Refusing it would remove the escape hatch
+// the key exists to give, so it parses through its own non-negative helper.
+
+TEST_CASE("residency config: the device-fit budget parses, and ZERO is legal") {
+  const vllm::WeightResidencyConfig c =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":137438953472}}})");
+  REQUIRE(c.device_weight_budget_bytes.has_value());
+  CHECK(*c.device_weight_budget_bytes == 137438953472LL);
+  CHECK_FALSE(c.empty());
+  // It reaches the install line under its own name, so an operator reading the
+  // line can tell a budget was set from a budget that fell through to the probe.
+  CHECK(Mentions(c.Describe(), "device_weight_budget_bytes=137438953472"));
+
+  // ZERO. This is the suppression spelling and it must survive the parse as an
+  // ENGAGED optional: `nullopt` would fall through to the probe, which is the
+  // opposite of what the operator asked for.
+  const vllm::WeightResidencyConfig zero =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})");
+  REQUIRE(zero.device_weight_budget_bytes.has_value());
+  CHECK(*zero.device_weight_budget_bytes == 0);
+  CHECK_FALSE(zero.empty());
+
+  // An absent `device_fit` object leaves it unset, and an empty one does too.
+  CHECK_FALSE(vllm::parse_weight_residency_extension_json(
+                  R"({"vllm_cpp":{"mmap":{"enabled":true}}})")
+                  .device_weight_budget_bytes.has_value());
+  const vllm::WeightResidencyConfig empty_obj =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"device_fit":{}}})");
+  CHECK_FALSE(empty_obj.device_weight_budget_bytes.has_value());
+  CHECK(empty_obj.empty());
+}
+
+TEST_CASE("residency config: a misspelled device_fit key is REFUSED, never ignored") {
+  // The whole reason this parser enumerates: the mirrored parser ignores what it
+  // does not know, so a typo in a new level would start a server whose device-fit
+  // budget is the probe while the operator believes it is the number typed. On a
+  // box where the probe is smaller than the checkpoint, that typo is the refusal
+  // the operator was trying to suppress.
+  const std::string level =
+      RefusalMessage(R"({"vllm_cpp":{"device_fitt":{"weight_budget_bytes":1}}})");
+  CHECK(Mentions(level, "unknown key \"vllm_cpp.device_fitt\""));
+  CHECK(Mentions(level, "expected one of: mmap expert_stream device_fit"));
+
+  // The hyphenated spelling of the new level, for the same reason the hyphenated
+  // `vllm-cpp` is pinned: every flag around it is hyphenated.
+  CHECK(Mentions(
+      RefusalMessage(R"({"vllm_cpp":{"device-fit":{"weight_budget_bytes":1}}})"),
+      "unknown key \"vllm_cpp.device-fit\""));
+
+  // And the field inside it. `weight_budget_byte` is the likeliest of these,
+  // because the singular reads correctly in English and the plural is the name.
+  const std::string field =
+      RefusalMessage(R"({"vllm_cpp":{"device_fit":{"weight_budget_byte":1}}})");
+  CHECK(Mentions(field, "unknown key \"vllm_cpp.device_fit.weight_budget_byte\""));
+  CHECK(Mentions(field, "expected one of: weight_budget_bytes"));
+
+  // The name a reader might carry over from the environment variable.
+  CHECK(Mentions(RefusalMessage(
+                     R"({"vllm_cpp":{"device_fit":{"device_weight_budget_bytes":1}}})"),
+                 "unknown key \"vllm_cpp.device_fit.device_weight_budget_bytes\""));
+}
+
+TEST_CASE("residency config: a wrong-typed or NEGATIVE budget is REFUSED") {
+  CHECK(Mentions(
+      RefusalMessage(R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":"10"}}})"),
+      "\"vllm_cpp.device_fit.weight_budget_bytes\" must be an integer"));
+  CHECK(Mentions(
+      RefusalMessage(R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":1.5}}})"),
+      "\"vllm_cpp.device_fit.weight_budget_bytes\" must be an integer"));
+  CHECK(Mentions(
+      RefusalMessage(R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":true}}})"),
+      "\"vllm_cpp.device_fit.weight_budget_bytes\" must be an integer"));
+
+  // NEGATIVE is refused and ZERO is not, which is the whole distinction between
+  // this field's helper and the one `slots` uses. A message that said "positive"
+  // here would be lying about a value the parser accepts.
+  const std::string neg = RefusalMessage(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":-1}}})");
+  CHECK(Mentions(neg, "\"vllm_cpp.device_fit.weight_budget_bytes\""));
+  CHECK(Mentions(neg, "must not be negative"));
+  CHECK(Mentions(neg, "-1"));
+
+  // `device_fit` itself must be an object, and the message names the DOCUMENT
+  // path rather than a hardcoded prefix.
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"device_fit":5}})"),
+                 "\"vllm_cpp.device_fit\" must be a JSON object"));
+}
+
+TEST_CASE("residency config: the budget resolves env > config > probed total") {
+  ResidencyFixture fx;
+  constexpr size_t kProbed = 128ULL * 1024 * 1024 * 1024;
+
+  // Neither input: the probe stands, byte-for-byte as before this key existed.
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == kProbed);
+
+  // Config only.
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":4096}}})"));
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == 4096U);
+
+  // A config ZERO reaches the resolver as zero, which `CheckDeviceWeightFit`
+  // reads as UNKNOWN and therefore as "do not refuse". The suppression spelling
+  // has to survive the resolver as well as the parser.
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})"));
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == 0U);
+
+  // Environment beats config, in BOTH directions. A benchmark arm switched by an
+  // exported variable is why this precedence exists, and an override that could
+  // not raise the budget back would not be one.
+  ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", "8192", 1);
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == 8192U);
+  ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", "0", 1);
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == 0U);
+
+  // THE ENVIRONMENT GRAMMAR IS UNCHANGED: decimal digits only. A signed, spaced
+  // or garbage value is IGNORED, and what it now falls through to is the CONFIG
+  // rather than the probe. Reading "-1" as a budget would wrap to ULLONG_MAX and
+  // silently disable the guard, which is why the grammar is explicit.
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":4096}}})"));
+  for (const char* bad : {"-1", " 64", "64x", "", "banana", "+64"}) {
+    ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", bad, 1);
+    CAPTURE(bad);
+    CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == 4096U);
+  }
+  // ...and with no config either, the same bad values leave the probe standing.
+  vllm::ResetWeightResidencyConfigForTesting();
+  for (const char* bad : {"-1", " 64", "64x", "", "banana"}) {
+    ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", bad, 1);
+    CAPTURE(bad);
+    CHECK(vllm::ResolveDeviceWeightBudgetBytes(kProbed) == kProbed);
+  }
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+}
+
+TEST_CASE("residency config: the budget's override note asks whether the variable WINS") {
+  ResidencyFixture fx;
+  const vllm::WeightResidencyConfig c =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":4096}}})");
+
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  CHECK(c.DescribeEnvOverrides().empty());
+
+  ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", "8192", 1);
+  const std::string note = c.DescribeEnvOverrides();
+  CHECK(Mentions(note, "VT_DEVICE_WEIGHT_BUDGET_BYTES"));
+  CHECK(Mentions(note, "device_weight_budget_bytes"));
+
+  // `0` IS an override — it is the suppression value, not an absent one — so it
+  // must be announced. A predicate that tested for a positive number would drop
+  // exactly the value an operator is most surprised to have inherited.
+  ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", "0", 1);
+  CHECK(Mentions(c.DescribeEnvOverrides(), "VT_DEVICE_WEIGHT_BUDGET_BYTES"));
+
+  // A value the resolver IGNORES is not an override, and announcing it would send
+  // the operator after a line that decides nothing (the #1122 L7 shape).
+  for (const char* bad : {"-1", " 64", "64x", "banana"}) {
+    ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", bad, 1);
+    CAPTURE(bad);
+    CHECK(c.DescribeEnvOverrides().empty());
+  }
+
+  // And a document that does not SET the budget is never reported for it,
+  // whatever the variable says.
+  ::setenv("VT_DEVICE_WEIGHT_BUDGET_BYTES", "8192", 1);
+  CHECK_FALSE(Mentions(vllm::parse_weight_residency_extension_json(
+                           R"({"vllm_cpp":{"mmap":{"enabled":true}}})")
+                           .DescribeEnvOverrides(),
+                       "VT_DEVICE_WEIGHT_BUDGET_BYTES"));
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+}
+
+TEST_CASE("residency config: ABSENT MEANS UNCHANGED for the budget, at both ends") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  // Two DIFFERENT partial documents, which is the shape that caught #1133 H2: a
+  // second document that restates the first's field cannot show a dropped field.
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":4096},)"
+      R"("expert_stream":{"slots":8000}}})"));
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"mmap":{"enabled":true}}})"));
+
+  const vllm::WeightResidencyConfig installed =
+      vllm::ActiveWeightResidencyConfig();
+  REQUIRE(installed.device_weight_budget_bytes.has_value());
+  CHECK(*installed.device_weight_budget_bytes == 4096);
+  REQUIRE(installed.expert_stream_slots.has_value());
+  CHECK(*installed.expert_stream_slots == 8000);
+  REQUIRE(installed.mmap.has_value());
+  CHECK(*installed.mmap == true);
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(999) == 4096U);
+
+  // And a later document that DOES set it overwrites it, because that is what
+  // "set" means. `0` is a set value, so it must overwrite too rather than read as
+  // "unchanged" — the one place where the suppression spelling and the absent
+  // spelling would be confusable.
+  vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})"));
+  REQUIRE(vllm::ActiveWeightResidencyConfig()
+              .device_weight_budget_bytes.has_value());
+  CHECK(*vllm::ActiveWeightResidencyConfig().device_weight_budget_bytes == 0);
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(999) == 0U);
+}
+
+TEST_CASE("residency config: the budget LATCHES NOTHING, so a late install is accepted") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  // Read it, which is what a completed GGUF load does at its fit check. Nothing
+  // caches the answer, so nothing freezes.
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 4096U);
+  CHECK_FALSE(vllm::WeightResidencyLatched());
+
+  // A second engine may therefore still set it, and the refusal must not fire.
+  // `expert_stream` and the slot geometry are the only two decisions that freeze,
+  // and this key is in neither.
+  CHECK_NOTHROW(
+      vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":8192}}})")));
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 8192U);
+
+  // Even once the streaming decision HAS been taken, a budget-only document is
+  // not a change to it and is accepted.
+  (void)vllm::ResolveExpertStreamRequested();
+  REQUIRE(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+  CHECK_NOTHROW(
+      vllm::SetWeightResidencyConfig(vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":16384}}})")));
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 16384U);
+}
+
+TEST_CASE("residency config: the SETTER refuses what the PARSER refuses") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  // THE OTHER DOOR. Every production caller reaches the process-global through
+  // `parse_weight_residency_extension_json`, which refuses a negative budget and a
+  // non-positive slot size. But `SetWeightResidencyConfig` is declared in a public
+  // header and takes the STRUCT, so a hand-built config is a legal way in that
+  // skips those rules entirely, and the resolver's own comment used to justify its
+  // cast by trusting a parser that had not necessarily run.
+  //
+  // The budget is the dangerous one rather than merely the wrong one:
+  // `ResolveDeviceWeightBudgetBytes` casts to `size_t`, so an installed `-1`
+  // resolves to SIZE_MAX — an effectively infinite budget that switches the
+  // load-time device-fit refusal OFF without a word. That is the exact
+  // "a budget the operator believes is set" failure the parser's own refusal text
+  // names.
+  vllm::WeightResidencyConfig negative_budget;
+  negative_budget.device_weight_budget_bytes = -1;
+  std::string message;
+  try {
+    vllm::SetWeightResidencyConfig(negative_budget);
+    message = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    message = e.what();
+  } catch (const std::exception& e) {
+    message = std::string("WRONG EXCEPTION TYPE: ") + e.what();
+  }
+  CAPTURE(message);
+  CHECK(Mentions(message, "device_weight_budget_bytes"));
+  CHECK(Mentions(message, "must not be negative"));
+  CHECK(Mentions(message, "-1"));
+
+  // ...and nothing was installed, so the check the refusal protects still reads
+  // the probe. Without this the case would pass on an implementation that threw
+  // AFTER writing the value.
+  CHECK_FALSE(
+      vllm::ActiveWeightResidencyConfig().device_weight_budget_bytes.has_value());
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 4096U);
+
+  // The two sizes get the parser's rule at this door too, so the two doors into
+  // one struct state one rule.
+  vllm::WeightResidencyConfig zero_slots;
+  zero_slots.expert_stream_slots = 0;
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(zero_slots),
+                  std::invalid_argument);
+  vllm::WeightResidencyConfig negative_slot_bytes;
+  negative_slot_bytes.expert_stream_slot_bytes = -8;
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(negative_slot_bytes),
+                  std::invalid_argument);
+
+  // Everything the PARSER accepts, the setter still accepts — `0` for the budget
+  // above all, because it is this field's suppression spelling and a guard that
+  // refused it would delete the escape hatch the key exists to give.
+  vllm::WeightResidencyConfig zero_budget;
+  zero_budget.device_weight_budget_bytes = 0;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(zero_budget));
+  CHECK(vllm::ResolveDeviceWeightBudgetBytes(4096) == 0U);
+}

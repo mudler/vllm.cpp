@@ -192,7 +192,7 @@ if [ "${status}" != 0 ]; then
 
 Vendored Triton AOT artifacts are STALE relative to the build contract or
 triton_kernels/*.py.
-Regenerate (maintainer task, needs Python+Triton+GPU, e.g. dgx.casa):
+Regenerate (maintainer task, needs Python+Triton+GPU, on ${GATE_HOST}):
     scripts/regen-triton-aot.sh
 then review + commit the vendored-tree diff. See .agents/porting-inventory.md
 and cmake/TritonAOT.cmake for the full contract.

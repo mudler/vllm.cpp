@@ -63,8 +63,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -78,6 +80,7 @@
 #include "vllm/model_executor/models/mla_attention.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W3: the shared capture seam
 #include "vt/ops.h"
 
 namespace vllm {
@@ -882,21 +885,25 @@ ForwardLogits DeepseekV2Model::ForwardDevice(
 struct DeepseekV2DecodeGraph::Impl {
   Impl(const DeepseekV2Weights& w, vt::Queue q, int64_t max_reqs)
       : weights(w), queue(q), max_num_reqs(max_reqs) {
-    // The framework-wide graph switch, plus a DeepSeek-local rollback so W9 can
-    // run a same-binary A/B of exactly this lever.
-    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
-    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the FRAMEWORK-WIDE switch is the SEAM's,
+    // not this driver's. `vt::GraphCaptureEnabled()` reads `VLLM_CPP_CUDAGRAPH`
+    // once per process into a function-local static; six drivers each read that
+    // variable for themselves before this row, so there was no one switch that
+    // turned capture off. The DeepSeek-LOCAL rollback stays here, because it is a
+    // per-model A/B lever for exactly this driver (W9) and not a copy of the
+    // shared one.
     const char* local = std::getenv("VT_DEEPSEEK_CUDAGRAPH");
     const bool local_on = (local == nullptr) || local[0] != '0';
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on && local_on &&
+    enabled = vt::GraphCaptureEnabled() && local_on &&
               platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {
-    Backend& b = vt::GetBackend(queue.device.type);
-    for (auto& kv : slots)
-      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+    // No DestroyGraph loop: every segment handle belongs to the slot's
+    // `vt::BreakableGraph`, whose destructor releases it through
+    // `Backend::DestroyGraph`. That routing is what lets ENG-CUDAGRAPH-DEDUP
+    // (#1162) interpose at the backend later without editing this driver.
   }
 
   struct SizeSlot {
@@ -905,9 +912,13 @@ struct DeepseekV2DecodeGraph::Impl {
     CommonAttentionMetadata attn_meta;
     std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
-    void* graph = nullptr;         // instantiated cudaGraphExec (opaque)
-    int bt_cols = -1;              // captured block-table column count
-    bool captured = false;
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the instantiated graph, its handle
+    // ownership, its release and its `captured()` state now live in the shared
+    // seam instead of in a raw `void*` plus a `bool` this driver maintained by
+    // hand. `vt::BreakableGraph` is non-copyable and is constructed in place by
+    // `slots[S]`, so the map still owns one per padded size.
+    vt::BreakableGraph graph;
+    int bt_cols = -1;  // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
 
@@ -976,10 +987,12 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   const bool cols_changed = (s.bt_cols != -1 && s.bt_cols != cols);
   s.Refresh(ptok, ppos, pam);
   s.bt_cols = cols;
-  if (cols_changed && s.graph != nullptr) {
-    b.DestroyGraph(s.graph);
-    s.graph = nullptr;
-    s.captured = false;
+  if (cols_changed && s.graph.captured()) {
+    // Reset() releases every segment through Backend::DestroyGraph and returns
+    // the container to its as-constructed state, which is also what lets the
+    // next capture open a scope on it (the scope refuses a container that
+    // already holds one).
+    s.graph.Reset();
     s.warm = false;
   }
 
@@ -988,10 +1001,14 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   // the SAME padded metadata the captured region was built from — the diagnostic
   // stays exactly as informative as it is on the eager path, which is what the
   // paged-engine gate asserts on.
-  if (s.captured) {
+  if (s.graph.captured()) {
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
     RecordMlaBatchSplit(BuildMlaBatchSplit(s.attn_meta), s.attn_meta.num_reqs);
-    b.ReplayGraph(impl_->queue, s.graph);
+    // Through the seam's container, never `Backend::ReplayGraph` directly: the
+    // container replays its segments in order (one, here, because a decode
+    // capture is kFull) and owns the G3 replay counter the reachability gate
+    // reads.
+    s.graph.Replay(impl_->queue);
     ++s.replays;
     ++impl_->replays;
     // DIAGNOSTIC (VT_DEEPSEEK_GRAPH_VERIFY=1, off by default, dev-only): run the
@@ -1025,19 +1042,72 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   // this size by the previous (eager) step. CAPTURE the layer region once.
   if (s.warm) {
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
-    b.BeginCapture(impl_->queue);
-    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
-                            impl_->weights, kNoGather);
-    s.graph = b.EndCaptureGraph(impl_->queue);
-    s.logits = std::make_unique<DBuf>(std::move(lg));
-    s.captured = true;
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the capture is the SHARED SEAM's, not this
+    // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
+    // the segment, the handle, its release, the drain a mid-capture throw needs
+    // and the G3 counters.
+    //
+    // kFULL, and the mode is the whole argument. vLLM's v1 default
+    // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63`) is documented at
+    // `:630-632` as a FULL graph for DECODE batches and a piecewise one for
+    // prefill and mixed batches, and `decode_mode()` (`:65-66`) returns the full
+    // half. This is a decode driver, so its capture is ONE segment with the MLA
+    // decode attention INSIDE it — byte-identical in shape to the region this
+    // replaces. Opening it kPiecewise would turn every layer's attention into an
+    // eager call between two graph replays, which is not vLLM's decode behaviour
+    // and which nothing in this row's record supports.
+    std::optional<DBuf> lg;
+    {
+      vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                         impl_->weights, kNoGather);
+    }  // ~GraphCaptureScope closes the segment and files it on s.graph
+    // NOT CAPTURED covers TWO states, and returning `*lg` is correct for exactly
+    // one of them. `~GraphCaptureScope` must swallow a throwing `EndCaptureGraph`
+    // — a destructor that propagates terminates — so a FAILED capture leaves the
+    // container reporting what an INERT scope reports.
+    //
+    //   * INERT (`capture_failed() == false`): the backend cannot capture, or
+    //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, the layer
+    //     region above ran EAGERLY, and `*lg` is a real result.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph` threw
+    //     (`src/vt/cuda/cuda_backend.cu:229`, `Check()` at `:50`). Under stream
+    //     capture NOTHING between `BeginCapture` and the throw executed: every
+    //     kernel was RECORDED, so `*lg` is pool-recycled memory, and returning it
+    //     would hand this step uncomputed device memory as its logits — silently
+    //     wrong tokens, no fault, and a token gate cannot see it.
+    //
+    // So the failure PROPAGATES, carrying the runtime's own exception, which is
+    // exactly what the pre-W3 driver did (its `s.graph = b.EndCaptureGraph(...)`
+    // was unguarded). Gated at
+    // `tests/vllm/models/test_deepseek_v2_decode_graph_seam.cpp`.
+    if (!s.graph.captured()) {
+      s.warm = false;  // either way this slot goes back to cold
+      if (s.graph.capture_failed()) {
+        const std::exception_ptr err = s.graph.capture_error();
+        s.graph.Reset();  // clear the failure with the graph it described
+        // The runtime's OWN diagnosis where the seam holds it. It is empty only
+        // on the arm where an exception was already propagating THROUGH the
+        // scope, which cannot reach this line; the refusal below is what makes
+        // that unreachability an assertion rather than a claim.
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "DeepseekV2DecodeGraph: the decode capture was ABANDONED and its logits "
+                 "were never computed; refusing to return uncaptured device memory");
+      }
+      ForwardLogits drained = WrapDeviceLogits(std::move(*lg), B, vocab);
+      drained.device_tensor =
+          MakeTensor(drained.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+      return drained;
+    }
+    s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
       std::fprintf(stderr,
                    "[DeepseekV2DecodeGraph] captured MLA decode graph for padded "
                    "size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
-    b.ReplayGraph(impl_->queue, s.graph);
+    s.graph.Replay(impl_->queue);
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -1052,7 +1122,6 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
                           impl_->weights, kNoGather);
   s.warm = true;
-  s.captured = false;
   ForwardLogits fl = WrapDeviceLogits(std::move(lg), B, vocab);
   fl.device_tensor =
       MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, vocab});

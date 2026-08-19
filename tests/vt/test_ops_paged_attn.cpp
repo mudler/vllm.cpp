@@ -1196,8 +1196,18 @@ TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at 
   // kBlockN=128 for d128: covers up to ceil(140/128)*128 = 256 keys = 16 pages;
   // size the block table to that so no column is read past its row (memcheck).
   const int64_t max_blocks = 16, num_blocks = 64;
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     const int64_t Hq = ratio.first, Hk = ratio.second, page = Hk * D;
     CAPTURE(Hq);
     auto qf = RandF32(static_cast<size_t>(num_tokens * Hq * D),
@@ -1569,8 +1579,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode matches composed referen
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 decode parity (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {1, 2, 4, 8}) {
       for (const int base_len : {5, 21, 1024}) {  // short => num_splits==1; long => split
         CAPTURE(ratio.first);
@@ -1615,8 +1635,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode GQA group-swap matches c
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 group-swap parity (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {1, 2, 4, 8}) {
       for (const int base_len : {5, 21, 1024}) {  // short => num_splits==1; long => split
         CAPTURE(ratio.first);
@@ -1645,8 +1675,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode swap near-ties the plain
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 swap-vs-plain near-tie (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {2, 8}) {
       for (const int base_len : {21, 1024}) {
         CAPTURE(ratio.first);
@@ -1691,8 +1731,18 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode num_splits cap engages a
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 num_splits-cap check (dgx-pending)");
     return;
   }
+  // ★ {32, 2} IS NEMOTRON-3.5-LIGHTNING, AND IT WAS NOT HERE (#1157).
+  // Every case in this file measured ngroups 2 (16/8) and 4 (32/8), the two
+  // Qwen3-dense gate configs the varlen d128 decode path was written for. The
+  // path is DEFAULT ON for ANY bf16 causal pure-decode at head_dim 128, so the
+  // first model to arrive with a different ratio reaches an untested grid — and
+  // NemotronH-3.5-Lightning-30B is 32 query heads over 2 KV heads, ngroups 16,
+  // four times the widest group count ever measured here. Its A3 token gate
+  // failed 6/96 on the device while the same binary decodes the same checkpoint
+  // token-exact on CPU, which is what sent the search here.
   for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
-                            std::pair<int64_t, int64_t>{32, 8}}) {
+                            std::pair<int64_t, int64_t>{32, 8},
+                            std::pair<int64_t, int64_t>{32, 2}}) {
     for (const int batch : {1, 2, 4}) {
       CAPTURE(ratio.first);
       CAPTURE(batch);

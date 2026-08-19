@@ -574,22 +574,32 @@ std::vector<float> LinearNoBias(const std::vector<float>& x, int64_t rows, int64
          " values, expected out_dim*in_dim = " + std::to_string(out_dim * in_dim));
   }
   std::vector<float> out(static_cast<size_t>(rows * out_dim));
-  // Parallel over OUTPUT elements, one flat index per (row, out_dim) pair.
+  // Parallel over OUTPUT COLUMNS, with the input rows walked INSIDE one column.
   // EACH output keeps its OWN sequential double accumulator over `in_dim` in
   // ascending `i` — exactly the loop this replaced — so the reduction order
   // W2/W3 gated against torch, and the `-ffp-contract=off` pinning that makes
   // it reproducible, are untouched. Bit-identical to the serial loop by
   // construction, not within a tolerance; `test_host_parallel` proves it
-  // against a verbatim copy of the serial code at five thread counts.
-  host_parallel::ForOutputRows(rows * out_dim, in_dim, [&](int64_t e0, int64_t e1) {
-    for (int64_t e = e0; e < e1; ++e) {
-      const int64_t r = e / out_dim;
-      const int64_t o = e - r * out_dim;
-      double acc = 0.0;
-      const float* xr = x.data() + r * in_dim;
+  // against a verbatim copy of the serial code at five thread counts, at
+  // rows 16, 8 and 1.
+  //
+  // WHY THE ROW LOOP MOVED INSIDE (#672). The previous flat `(row, out)` index
+  // swept the WHOLE weight matrix once per input row: at the depth decoder's
+  // 4096x4096 and 6144x4096 projections that is 2.28 GB of f32 weights read per
+  // row, and this kernel is weight-streaming bound, not FLOP bound. Holding one
+  // weight row `wo` across every input row reads it ONCE for the whole call, so
+  // a two-row call (the depth decoder's two CFG branches) moves half the bytes.
+  // The visit order INSIDE a dot product is untouched, which is the only order
+  // any gate pinned.
+  host_parallel::ForOutputRows(out_dim, rows * in_dim, [&](int64_t o0, int64_t o1) {
+    for (int64_t o = o0; o < o1; ++o) {
       const float* wo = weight.data() + o * in_dim;
-      for (int64_t i = 0; i < in_dim; ++i) acc += static_cast<double>(xr[i]) * wo[i];
-      out[static_cast<size_t>(e)] = Store(acc, compute);
+      for (int64_t r = 0; r < rows; ++r) {
+        double acc = 0.0;
+        const float* xr = x.data() + r * in_dim;
+        for (int64_t i = 0; i < in_dim; ++i) acc += static_cast<double>(xr[i]) * wo[i];
+        out[static_cast<size_t>(r * out_dim + o)] = Store(acc, compute);
+      }
     }
   });
   return out;
@@ -634,6 +644,50 @@ std::vector<float> CausalAttention(const std::vector<float>& q, const std::vecto
     }
   }
   return out;
+}
+
+
+// ONE causal attention step, for the LAST position of a sequence whose K and V
+// for positions 0..seq-1 are already in the caller's cache. Transcribed from
+// `CausalAttention` above at `i == seq - 1`, statement for statement: the same
+// `inv_sqrt`, the same ascending-`j` score sweep with the running maximum, the
+// same ascending-`j` exponential and sum, and the same ascending-`j`
+// accumulation into one sequential double per output component before the one
+// `Store`. Nothing is reassociated, which is what makes the incremental
+// schedule bit-identical to the whole-sequence forward rather than close to it.
+//
+// `q` is ONE row [heads*head_dim]; `k`/`v` are [seq, heads*head_dim] caches with
+// this step's own row already appended as position seq-1.
+void CausalAttentionStep(const float* q, const float* k, const float* v, int64_t seq,
+                         int64_t heads, int64_t head_dim, ArCompute compute, float* out) {
+  const double inv_sqrt = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  const int64_t width = heads * head_dim;
+  std::vector<double> scores(static_cast<size_t>(seq));
+  for (int64_t h = 0; h < heads; ++h) {
+    double max_score = -std::numeric_limits<double>::infinity();
+    for (int64_t j = 0; j < seq; ++j) {
+      double acc = 0.0;
+      for (int64_t d = 0; d < head_dim; ++d) {
+        acc += static_cast<double>(q[h * head_dim + d]) *
+               static_cast<double>(k[j * width + h * head_dim + d]);
+      }
+      scores[static_cast<size_t>(j)] = acc * inv_sqrt;
+      max_score = std::max(max_score, scores[static_cast<size_t>(j)]);
+    }
+    double sum = 0.0;
+    for (int64_t j = 0; j < seq; ++j) {
+      scores[static_cast<size_t>(j)] = std::exp(scores[static_cast<size_t>(j)] - max_score);
+      sum += scores[static_cast<size_t>(j)];
+    }
+    for (int64_t d = 0; d < head_dim; ++d) {
+      double acc = 0.0;
+      for (int64_t j = 0; j < seq; ++j) {
+        acc += scores[static_cast<size_t>(j)] *
+               static_cast<double>(v[j * width + h * head_dim + d]);
+      }
+      out[h * head_dim + d] = Store(acc / sum, compute);
+    }
+  }
 }
 
 }  // namespace
@@ -721,6 +775,118 @@ std::vector<float> DepthDecoderForward(const std::vector<float>& inputs_embeds, 
 
   // :142
   return RmsNorm(hidden_states, seq_len, hidden, weights.norm, 1e-6, compute);
+}
+
+std::vector<float> DepthDecoderAppend(const std::vector<float>& inputs_embeds, int64_t batch,
+                                      const DepthDecoderConfig& config,
+                                      const DepthDecoderWeights& weights, ArCompute compute,
+                                      DepthDecoderCache* cache) {
+  const int64_t hidden = config.hidden_size;
+  if (cache == nullptr) Fail("MiniMax-Music3: the incremental depth decode needs a cache");
+  if (batch <= 0) Fail("MiniMax-Music3: the incremental depth decode needs a positive batch");
+  if (static_cast<int64_t>(inputs_embeds.size()) != batch * hidden) {
+    Fail("MiniMax-Music3: the incremental depth decode got " +
+         std::to_string(inputs_embeds.size()) + " input values, expected batch*hidden = " +
+         std::to_string(batch * hidden));
+  }
+  if (static_cast<int64_t>(weights.layers.size()) != config.num_layers) {
+    Fail("MiniMax-Music3: the depth decoder has " + std::to_string(weights.layers.size()) +
+         " layer weight sets, expected " + std::to_string(config.num_layers));
+  }
+  if (static_cast<int64_t>(weights.pos_embedding.size()) !=
+      config.max_position_embeddings * hidden) {
+    Fail("MiniMax-Music3: pos_embedding is " + std::to_string(weights.pos_embedding.size()) +
+         " values, expected " + std::to_string(config.max_position_embeddings * hidden));
+  }
+  const int64_t heads = config.num_attention_heads;
+  const int64_t head_dim = config.head_dim();
+  if (heads * head_dim != hidden) {
+    Fail("MiniMax-Music3: hidden_size " + std::to_string(hidden) +
+         " is not divisible by num_attention_heads " + std::to_string(heads));
+  }
+  if (cache->positions == 0 && cache->keys.empty()) {
+    cache->batch = batch;
+    cache->hidden = hidden;
+    cache->layers = config.num_layers;
+    cache->keys.assign(static_cast<size_t>(config.num_layers * batch), std::vector<float>());
+    cache->values.assign(static_cast<size_t>(config.num_layers * batch), std::vector<float>());
+  }
+  if (cache->batch != batch || cache->hidden != hidden || cache->layers != config.num_layers) {
+    Fail("MiniMax-Music3: the depth cache holds batch " + std::to_string(cache->batch) +
+         " / hidden " + std::to_string(cache->hidden) + " / layers " +
+         std::to_string(cache->layers) + ", asked for " + std::to_string(batch) + " / " +
+         std::to_string(hidden) + " / " + std::to_string(config.num_layers));
+  }
+  const int64_t position = cache->positions;
+  if (position >= config.max_position_embeddings) {
+    Fail("MiniMax-Music3: the depth decoder was given position " + std::to_string(position) +
+         " but max_position_embeddings is " +
+         std::to_string(config.max_position_embeddings) +
+         "; pos_embedding has no row for the rest");
+  }
+  const int64_t seq = position + 1;
+
+  // :138-139 — the SAME learned row `DepthDecoderForward` adds at this position.
+  std::vector<float> hidden_states(inputs_embeds.size());
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t c = 0; c < hidden; ++c) {
+      hidden_states[static_cast<size_t>(b * hidden + c)] =
+          Store(static_cast<double>(inputs_embeds[static_cast<size_t>(b * hidden + c)]) +
+                    weights.pos_embedding[static_cast<size_t>(position * hidden + c)],
+                compute);
+    }
+  }
+
+  std::vector<float> attended(static_cast<size_t>(batch * hidden));
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    const DepthDecoderLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
+    const std::vector<float> normed =
+        RmsNorm(hidden_states, batch, hidden, layer.input_layernorm, 1e-6, compute);
+    const std::vector<float> q = LinearNoBias(normed, batch, hidden, layer.to_q, hidden, compute);
+    const std::vector<float> k = LinearNoBias(normed, batch, hidden, layer.to_k, hidden, compute);
+    const std::vector<float> v = LinearNoBias(normed, batch, hidden, layer.to_v, hidden, compute);
+    for (int64_t b = 0; b < batch; ++b) {
+      std::vector<float>& kc = cache->keys[static_cast<size_t>(l * batch + b)];
+      std::vector<float>& vc = cache->values[static_cast<size_t>(l * batch + b)];
+      if (static_cast<int64_t>(kc.size()) != position * hidden ||
+          static_cast<int64_t>(vc.size()) != position * hidden) {
+        Fail("MiniMax-Music3: the depth cache for layer " + std::to_string(l) + " row " +
+             std::to_string(b) + " holds " + std::to_string(kc.size()) +
+             " key values, expected position*hidden = " + std::to_string(position * hidden));
+      }
+      kc.insert(kc.end(), k.begin() + b * hidden, k.begin() + (b + 1) * hidden);
+      vc.insert(vc.end(), v.begin() + b * hidden, v.begin() + (b + 1) * hidden);
+      CausalAttentionStep(q.data() + b * hidden, kc.data(), vc.data(), seq, heads, head_dim,
+                          compute, attended.data() + b * hidden);
+    }
+    const std::vector<float> projected =
+        LinearNoBias(attended, batch, hidden, layer.to_out, hidden, compute);
+    for (size_t i = 0; i < hidden_states.size(); ++i) {
+      hidden_states[i] = Store(static_cast<double>(hidden_states[i]) + projected[i], compute);
+    }
+
+    const std::vector<float> post =
+        RmsNorm(hidden_states, batch, hidden, layer.post_attention_layernorm, 1e-6, compute);
+    const std::vector<float> gate =
+        LinearNoBias(post, batch, hidden, layer.gate_proj, config.intermediate_size, compute);
+    const std::vector<float> up =
+        LinearNoBias(post, batch, hidden, layer.up_proj, config.intermediate_size, compute);
+    std::vector<float> activated(gate.size());
+    for (size_t i = 0; i < gate.size(); ++i) {
+      const double g = gate[i];
+      const double silu = Store(g / (1.0 + std::exp(-g)), compute);
+      activated[i] = Store(silu * static_cast<double>(up[i]), compute);
+    }
+    const std::vector<float> down = LinearNoBias(activated, batch, config.intermediate_size,
+                                                 layer.down_proj, hidden, compute);
+    for (size_t i = 0; i < hidden_states.size(); ++i) {
+      hidden_states[i] = Store(static_cast<double>(hidden_states[i]) + down[i], compute);
+    }
+  }
+
+  cache->positions = seq;
+  // :142
+  return RmsNorm(hidden_states, batch, hidden, weights.norm, 1e-6, compute);
 }
 
 std::vector<float> DepthSequenceEmbeds(const std::vector<float>& last_hidden,

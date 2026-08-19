@@ -79,7 +79,6 @@ VT_GDN_MERGED_PROJ
 VT_GDN_MERGED_QKVZ
 VT_GDN_MERGED_QKVZ_FP8
 VT_GDN_OCC_BLOCK
-VT_GDN_OUT_BF16
 VT_GDN_OUT_FP8_FUSE
 VT_GDN_PACKED_DECODE_FP8_TOWER
 VT_GDN_PACKED_DECODE_TRITON
@@ -227,3 +226,5 @@ VT_W4A4_TRUE
 # selects a kernel or a batching strategy for the expert GEMMs and each
 # treats a name here as a known kernel-internal knob. A NEW production env
 # var must be documented in docs/ENVIRONMENT.md OR added here.
+VT_DUMP_ACT_SUB
+VT_DUMP_ATTN

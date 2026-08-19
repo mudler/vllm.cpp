@@ -42,6 +42,7 @@ REQUIRED_SOURCES = (
     "src/vt/cuda/cuda_nvfp4_sm12x.cu",
     "src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu",
     "src/vt/cuda/cuda_matmul_fp8_cutlass.cu",
+    "src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu",
     "src/vt/cuda/cuda_matmul_nvfp4_sm100.cu",
     "src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu",
     "src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu",
@@ -93,6 +94,7 @@ def expected_sms(source: str) -> tuple[str, ...]:
         or name == "cuda_matmul_nvfp4_cutlass.cu"
         or name.startswith("cuda_nvfp4_tactics_")
         or name == "cuda_matmul_fp8_cutlass.cu"
+        or name == "cuda_matmul_fp8_block_cutlass.cu"
     ):
         return SM12X
     return ALL_SMS

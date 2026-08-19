@@ -19,10 +19,14 @@
 //   LoadBf16Transposed   — BF16 [out,in] -> owned bf16 [in,out] (Matmul-B).
 //   LoadMergedBf16RawNK  — concat BF16 torch-Linear shards [N_i,K] along output
 //                          rows, kept RAW [N,K] with nk=true for vt::MatmulBT.
+//   ProbeThroughResolver — a tensor-presence probe built from a resolver.
+//   CheckProbeCanAnswerNo — refuse a presence probe that cannot answer
+//                          `false`.
 #pragma once
 
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <string>
@@ -63,6 +67,65 @@ inline std::string ShapeString(const std::vector<int64_t>& shape) {
     s += std::to_string(shape[i]);
   }
   return s + "]";
+}
+
+// --- Tensor-presence probes (FIX-PROBE-CANNOT-SAY-NO, issue #1258) -----------
+//
+// A name no checkpoint carries. Its ONLY use is asking a presence probe whether
+// it is capable of its negative answer.
+inline constexpr const char* kAbsentProbeSentinel =
+    "__vllm_cpp__a_tensor_no_checkpoint_carries__";
+
+// "Does this checkpoint carry `name`?", built from the ONE thing a resolver-only
+// loader seam is given.
+//
+// `TensorResolver` returns a REFERENCE, so absence has exactly one
+// representation in its contract: it throws. `SafetensorsFile::Get` documents
+// that (`safetensors_reader.h`), and every fixture resolver in the tree mirrors
+// it. Probing the resolver is therefore the honest answer AND the only one
+// available where no name index is in scope.
+//
+// ONE implementation on purpose. Issue #1256 was two copies of an always-true
+// stub; the repair for the first (#1257) was a hand-written `try`/`catch`, and a
+// second hand-written copy of that is the same mistake pointed the other way.
+//
+// The resolver is captured BY VALUE. A returned lambda holding a reference to a
+// caller's `std::function` is the next subtle lifetime bug in a helper that
+// exists because a subtle bug got shipped twice; a `std::function` copy costs
+// one allocation, once per seam call, against a load that reads gigabytes.
+inline std::function<bool(const std::string&)> ProbeThroughResolver(
+    const TensorResolver& get) {
+  return [get](const std::string& name) {
+    try {
+      (void)get(name);
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  };
+}
+
+// A presence predicate that cannot answer `false` is a DEFECT, not a
+// conservative default: it reports every optional tensor as present, and the
+// first guard to ask about one refuses a checkpoint over a tensor that does not
+// exist. That is issue #1256, twice, in one file.
+//
+// This is deliberately independent of HOW the probe was built, which is what a
+// stronger type could not be: it also catches a name index populated from the
+// wrong shard list and a probe a refactor detached from its data.
+//
+// `VT_CHECK` and not `assert`: Release defines `NDEBUG`, and a guard that
+// evaporates in the configuration everything ships in is not a guard.
+inline void CheckProbeCanAnswerNo(
+    const std::function<bool(const std::string&)>& has, const char* seam) {
+  VT_CHECK(!has(kAbsentProbeSentinel),
+           std::string("dense loader: ") + seam +
+               " was given a tensor-presence probe that answered YES for '" +
+               kAbsentProbeSentinel +
+               "', a name no checkpoint carries. A probe that cannot answer NO "
+               "reports every optional tensor as present, so the next guard to "
+               "ask about one refuses the checkpoint over a tensor that is not "
+               "there (issues 1256, 1258)");
 }
 
 // THE per-tensor f32 scale read. One implementation, because six hand-written
@@ -115,6 +178,105 @@ inline float ReadF32Scalar(const TensorResolver& get, const std::string& name) {
   float v = 0.0F;
   std::memcpy(&v, t.data, sizeof(float));
   return v;
+}
+
+// Block-wise (fine-grained) FP8 projection: `<proj>.weight` F8_E4M3 [N, K]
+// beside `<proj>.weight_scale_inv` [cdiv(N, block_n), cdiv(K, block_k)] ->
+// `Fp8BlockWeight`. MODEL-FP8-BLOCK-WEIGHT, #1189 M3, spec
+// `.agents/specs/model-fp8-block-weight.md`.
+//
+// The fp8 bytes are kept RAW in the on-disk [N=out, K=in] orientation, as
+// `LoadFp8Raw` does for the per-tensor arm: no dequant and no transpose, so the
+// projection costs one byte per element and every scale decision stays inside
+// the GEMM where upstream applies it (per K-block, in the mainloop -- see
+// `.agents/specs/vt-matmul-fp8-block-ref.md`).
+//
+// THE SCALE IS WIDENED TO F32, NOT REINTERPRETED. Upstream allocates the
+// parameter `torch.float32` (`utils/fp8_utils.py:1276,1283-1296`) and loads the
+// checkpoint tensor into it with `self.data.copy_()`
+// (`vllm/model_executor/parameter.py:97`), which CONVERTS. `Qwen/Qwen3.8-27B-FP8`
+// ships the tensor `BF16`, so the resident f32 is the mirror rather than a
+// widening: it is the dtype upstream carries, `vt::MatmulFp8BlockScaled` refuses
+// anything else, and bf16 -> f32 is exact. The switch below has NO default
+// branch that memcpy's bytes, because #1181 landed a guard for exactly that.
+// `vt::LoadUnaligned` because a safetensors tensor's offset is the running byte
+// total of everything ahead of it and can be odd (#627).
+//
+// The shape check is upstream's own: the allocation at `fp8_utils.py:1283-1296`
+// uses `cdiv` on BOTH axes and `parameter.py:95-98` then asserts the loaded
+// tensor matches it exactly. A short final block is legal and must work.
+inline Fp8BlockWeight LoadFp8BlockRaw(const TensorResolver& get,
+                                      const std::string& proj, int64_t block_n,
+                                      int64_t block_k) {
+  VT_CHECK(block_n > 0 && block_k > 0,
+           "dense loader: '" + proj +
+               "' block-wise FP8 needs positive block dimensions, got [" +
+               std::to_string(block_n) + ", " + std::to_string(block_k) + "]");
+  const StTensor& w = get(proj + ".weight");
+  VT_CHECK(w.dtype == "F8_E4M3",
+           "dense loader: '" + proj + ".weight' ships dtype " + w.dtype +
+               ", not the F8_E4M3 a block-wise FP8 weight is");
+  VT_CHECK(w.shape.size() == 2,
+           "dense loader: '" + proj + ".weight' ships shape " +
+               ShapeString(w.shape) +
+               ", not the 2-D [out_features, in_features] a block-wise FP8 "
+               "weight is");
+  Fp8BlockWeight r;
+  r.n = w.shape[0];
+  r.k = w.shape[1];
+  r.block_n = block_n;
+  r.block_k = block_k;
+
+  const std::string scale_name = proj + ".weight_scale_inv";
+  const StTensor& s = get(scale_name);
+  const int64_t rows = (r.n + block_n - 1) / block_n;
+  const int64_t cols = (r.k + block_k - 1) / block_k;
+  VT_CHECK(
+      s.shape.size() == 2 && s.shape[0] == rows && s.shape[1] == cols,
+      "dense loader: '" + scale_name + "' ships shape " +
+          ShapeString(s.shape) + ", not the " +
+          ShapeString(std::vector<int64_t>{rows, cols}) +
+          " a [" + std::to_string(r.n) + ", " + std::to_string(r.k) +
+          "] weight quantized in [" + std::to_string(block_n) + ", " +
+          std::to_string(block_k) +
+          "] blocks needs. Both dimensions round UP (ceil), so a short final "
+          "block still owns a scale");
+  const int64_t count = rows * cols;
+  r.scale = MakeOwned(vt::DType::kF32, {rows, cols});
+  auto* dst = reinterpret_cast<float*>(r.scale.bytes.data());
+  if (s.dtype == "BF16") {
+    VT_CHECK(s.data != nullptr &&
+                 s.nbytes == static_cast<size_t>(count) * sizeof(uint16_t),
+             "dense loader: '" + scale_name +
+                 "' is a BF16 block scale but does not carry " +
+                 std::to_string(count * 2) + " readable bytes");
+    for (int64_t i = 0; i < count; ++i)
+      dst[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(s.data + i * 2));
+  } else if (s.dtype == "F32") {
+    VT_CHECK(s.data != nullptr &&
+                 s.nbytes == static_cast<size_t>(count) * sizeof(float),
+             "dense loader: '" + scale_name +
+                 "' is an F32 block scale but does not carry " +
+                 std::to_string(count * 4) + " readable bytes");
+    for (int64_t i = 0; i < count; ++i)
+      dst[i] = vt::LoadUnaligned<float>(s.data + i * 4);
+  } else {
+    VT_CHECK(false,
+             "dense loader: '" + scale_name + "' ships dtype " + s.dtype +
+                 ", and a block-wise FP8 scale is read as BF16 or F32 only. "
+                 "Upstream loads it into an F32 parameter with a CONVERTING "
+                 "copy, so a narrower dtype is widened by VALUE; reading its "
+                 "bytes as another dtype is the defect issue #1181 fixed");
+  }
+  MaybeReleaseSourcePages(s.data, s.nbytes);
+
+  r.packed = MakeOwned(vt::DType::kI8, {r.n, r.k});
+  VT_CHECK(w.nbytes == r.packed.bytes.size(),
+           "dense loader: '" + proj +
+               ".weight' block-wise FP8 byte-size mismatch");
+  std::memcpy(r.packed.bytes.data(), w.data, w.nbytes);
+  MaybeReleaseSourcePages(w.data, w.nbytes);
+  return r;
 }
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].

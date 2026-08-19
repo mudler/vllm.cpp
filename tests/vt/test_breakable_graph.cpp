@@ -883,3 +883,308 @@ TEST_CASE("G3: the seam reports segments captured, breaks registered and replays
   CHECK(s.breaks_registered == 1);
   CHECK(s.replays == 2);
 }
+
+// ---------------------------------------------------------------------------
+// vt::GraphCaptureMode — the second half of vLLM's capture contract, added by
+// W2 (#1261). Upstream has no counterpart: SGLang's BCG IS the piecewise mode
+// and has no full-graph arm to select. The primary oracle does, and it is the
+// one a decode driver reaches for.
+// ---------------------------------------------------------------------------
+
+// The DEFAULT is piecewise, stated as a case rather than left to the twenty-odd
+// cases above that construct the three-argument scope. A default that silently
+// changed would turn every one of them into a one-segment capture whose break
+// assertions then fail for a reason none of them names.
+TEST_CASE("Mode: the default scope is kPiecewise and it splits") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g);
+    CHECK(scope.mode() == vt::GraphCaptureMode::kPiecewise);
+    CHECK(scope.active());
+    CHECK(scope.splits());
+    vt::GraphBreak();
+  }
+  CHECK(g.segment_count() == 2);
+  CHECK(g.break_count() == 1);
+}
+
+// kFULL <- vLLM `CUDAGraphMode.FULL` (`vllm/config/compilation.py:61`), the half
+// of `FULL_AND_PIECEWISE` (`:63`) that `decode_mode()` (`:65-66`) selects for a
+// uniform decode batch, documented at `:630-632`. A break point inside such a
+// scope runs its function INSIDE the single segment and splits nothing, which is
+// exactly what a captured decode step has always done.
+//
+// The break function issues its work through `Record`, so the assertion is not
+// "the break was skipped" but the stronger "the break's work landed in the ONE
+// segment and runs on every replay" — the difference between a full capture and
+// a step that quietly lost an operation.
+TEST_CASE("Mode: a kFull scope captures ONE segment and the break's work is INSIDE it") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+
+  IntBuf x = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf mid = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf y = MakeBuf(b, {0, 0, 0, 0});
+  IntBuf broken_dst = MakeBuf(b, {0, 0, 0, 0});
+  BreakSlot<vt::Tensor> broken;
+
+  const vt::GraphBreakStats before = vt::GetGraphBreakStats();
+  {
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kFull);
+    REQUIRE(scope.active());
+    CHECK(scope.mode() == vt::GraphCaptureMode::kFull);
+    CHECK_FALSE(scope.splits());
+    b.Record([&] { AddInto(mid, x.t, 1); });  // mid = x + 1
+    GraphBreak(
+        [&] {
+          // Work a real break function would issue on the queue. In kFull the
+          // stream is still capturing, so it belongs to the one segment.
+          b.Record([&] { AddInto(broken_dst, mid.t, 0); });
+          return broken_dst.t;
+        },
+        broken);
+    b.Record([&] { AddInto(y, *broken, 3); });  // y = broken + 3
+  }
+  const vt::GraphBreakStats after = vt::GetGraphBreakStats();
+
+  // ONE segment, NO break function, and ONE Begin/EndCaptureGraph pair: the
+  // capture never re-began.
+  CHECK(g.segment_count() == 1);
+  CHECK(g.break_count() == 0);
+  CHECK(b.Trace() == "Begin EndCaptureGraph");
+  CHECK(after.segments_captured - before.segments_captured == 1);
+  CHECK(after.breaks_registered - before.breaks_registered == 0);
+  // The site was still REACHED, which is the counter that separates a kFull
+  // capture from one whose break-point registration was deleted.
+  CHECK(after.break_points_reached - before.break_points_reached == 1);
+  // The slot took the pass-through path, so the seam owns no cell for it.
+  CHECK_FALSE(broken.pinned());
+
+  Fill(x, 10);
+  b.ClearLog();
+  g.Replay(q);
+  CHECK(b.Trace() == "ReplayGraph");
+  // x=10 -> +1=11 -> break copies 11 -> +3=14. The break's operation ran at
+  // replay, from inside the segment.
+  CHECK(Read(mid) == std::vector<int32_t>{11, 11, 11, 11});
+  CHECK(Read(broken_dst) == std::vector<int32_t>{11, 11, 11, 11});
+  CHECK(Read(y) == std::vector<int32_t>{14, 14, 14, 14});
+}
+
+// The refusal at the ONE registration point. Every `GraphBreak` form already
+// takes the pass-through arm in kFull, so this is what stops a form added later
+// from registering a break into a capture that has a single segment — where
+// `break_count() == segment_count()` and `Replay` drops the last break.
+TEST_CASE("Mode: registering a break into a kFull scope is REFUSED") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  BreakableGraph g;
+  {
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kFull);
+    REQUIRE(scope.active());
+    CHECK_THROWS(scope.AppendBreak([] {}, nullptr));
+    // The CONTROL: the identical call on a piecewise scope is accepted, so the
+    // refusal is about the mode and not about the arguments.
+  }
+  BreakableGraph g2;
+  {
+    GraphCaptureScope scope(b, q, g2, vt::GraphCaptureMode::kPiecewise);
+    CHECK_NOTHROW(scope.AppendBreak([] {}, nullptr));
+    scope.EndSegment();
+    scope.BeginSegment();
+  }
+  CHECK(g2.break_count() == 1);
+  CHECK(g2.segment_count() == 2);
+}
+
+// THE MODE COUNTERS, added by W3 (#1291) because the mode was UNOBSERVABLE from
+// outside a driver and a mute guard was measured hiding that.
+//
+// WHAT WENT WRONG WITHOUT THEM. W2's driver gate could pin its scope's mode only
+// because `qwen3.cpp` registers a production `vt::GraphBreak`, so
+// `breaks_registered` moved in one mode and not the other. The three drivers W3
+// migrated register none, so `breaks_registered == 0` holds in BOTH modes there.
+// Measured, not reasoned: flipping `kFull` to `kPiecewise` in `qwen3_moe.cpp`
+// compiled clean and left that driver's whole gate green at 226/226. The mode is
+// the difference between one graph and one eager attention call per layer, and a
+// token gate cannot see a segment count, so it needed an observable of its own.
+//
+// THE INERT ARM IS THE CONTROL that stops the counters from being "scopes
+// constructed". A scope that cannot capture makes no backend call in either
+// mode, so counting it would report a mode that never reached a backend.
+TEST_CASE("Mode: the scope counters report which mode an ACTIVE capture opened in") {
+  RequireCaptureLane();
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+
+  const vt::GraphBreakStats before = vt::GetGraphBreakStats();
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kFull);
+    REQUIRE(scope.active());
+  }
+  const vt::GraphBreakStats after_full = vt::GetGraphBreakStats();
+  CHECK(after_full.full_scopes - before.full_scopes == 1);
+  CHECK(after_full.piecewise_scopes - before.piecewise_scopes == 0);
+
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(b, q, g, vt::GraphCaptureMode::kPiecewise);
+    REQUIRE(scope.active());
+  }
+  const vt::GraphBreakStats after_piece = vt::GetGraphBreakStats();
+  CHECK(after_piece.full_scopes - after_full.full_scopes == 0);
+  CHECK(after_piece.piecewise_scopes - after_full.piecewise_scopes == 1);
+
+  // THE CONTROL: an INERT scope counts as neither. This backend answers
+  // `SupportsGraphCapture()` false, which is Vulkan and Metal.
+  RecordingCaptureBackend nb(/*supports_capture=*/false);
+  vt::Queue nq = nb.CreateQueue();
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(nb, nq, g, vt::GraphCaptureMode::kFull);
+    REQUIRE_FALSE(scope.active());
+  }
+  {
+    BreakableGraph g;
+    GraphCaptureScope scope(nb, nq, g, vt::GraphCaptureMode::kPiecewise);
+    REQUIRE_FALSE(scope.active());
+  }
+  const vt::GraphBreakStats after_inert = vt::GetGraphBreakStats();
+  CHECK(after_inert.full_scopes - after_piece.full_scopes == 0);
+  CHECK(after_inert.piecewise_scopes - after_piece.piecewise_scopes == 0);
+
+  // And ResetGraphBreakStats() clears them, like every other G3 counter: a
+  // number that survives its own reset describes a run nobody can bound.
+  vt::ResetGraphBreakStats();
+  const vt::GraphBreakStats cleared = vt::GetGraphBreakStats();
+  CHECK(cleared.full_scopes == 0);
+  CHECK(cleared.piecewise_scopes == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 13d, the DISTINCTION the drain owed a driver. W2's fresh review found the
+// HIGH this closes.
+// ---------------------------------------------------------------------------
+//
+// The drain (13a/13b/13c) is correct and stays: a destructor that propagated
+// would terminate. But it leaves the container in the SAME observable state as a
+// scope that was never active — `captured() == false` — and those two states have
+// OPPOSITE meanings for the caller. An INERT scope ran the forward EAGERLY, so
+// the values the caller holds are real. A FAILED capture ran NOTHING: under
+// stream capture every operation between `BeginCapture` and the failure was
+// RECORDED, not executed, so the caller's buffers hold whatever the pool last
+// left there. A driver that cannot tell the two apart returns uncomputed memory
+// as its step's result, silently, and no token gate can see it
+// (`src/vllm/model_executor/models/qwen3.cpp`, the HIGH this case gates).
+//
+// `capture_failed()` is that distinction, and `capture_error()` carries the
+// ORIGINAL exception where the seam holds it, so a driver can propagate the
+// runtime's own diagnosis instead of inventing one.
+TEST_CASE("Test 13d: a DRAINED capture records that it drained; an INERT scope does not") {
+  RequireCaptureLane();
+
+  // ARM 1, the FAILED capture: the close refuses, the destructor swallows (it
+  // must), and the container says so.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE(scope.active());
+      b.FailNextEndCapture();
+    }
+    CHECK_FALSE(g.captured());
+    CHECK(g.capture_failed());
+    REQUIRE(g.capture_error() != nullptr);
+    // The ORIGINAL error, not a substitute: a driver rethrows this so the
+    // runtime's own message reaches the operator.
+    CHECK_THROWS_AS(std::rethrow_exception(g.capture_error()), std::runtime_error);
+  }
+
+  // ARM 2, an exception PROPAGATING through the scope. The drain fires on the
+  // uncaught-depth comparison rather than on a throwing close, and the container
+  // records the FAILURE but not a cause — pinned here because it is the one
+  // place the two accessors disagree, and the disagreement is a language rule,
+  // not a bug. No handler has been entered for an exception that is still
+  // unwinding, so `std::current_exception()` in `~GraphCaptureScope` is null.
+  // Nothing is lost: on this arm the real exception reaches the caller under its
+  // own power, which is what `CHECK_THROWS_AS` below observes.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    CHECK_THROWS_AS(
+        [&] {
+          GraphCaptureScope scope(b, q, g);
+          throw std::runtime_error("model code blew up");
+        }(),
+        std::runtime_error);
+    CHECK_FALSE(g.captured());
+    CHECK(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+  }
+
+  // ARM 3, the INERT scope — the CONTROL, and the arm that makes this a
+  // distinction rather than a flag that is always set. The backend cannot
+  // capture, the forward ran eager, and there is no error to report. Without
+  // this arm a driver that treated `!captured()` as failure would look gated.
+  {
+    RecordingCaptureBackend b(/*supports_capture=*/false);
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      CHECK_FALSE(scope.active());
+    }
+    CHECK_FALSE(g.captured());
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+  }
+
+  // ARM 4, a CLEAN capture. Nothing failed, so nothing is recorded — and
+  // `Reset()` returns the container to its as-constructed state, error included,
+  // so a stale failure cannot outlive the capture that produced it.
+  {
+    RecordingCaptureBackend b;
+    vt::Queue q = b.CreateQueue();
+    BreakableGraph g;
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE(scope.active());
+    }
+    REQUIRE(g.captured());
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+
+    g.Reset();
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+
+    // Now FAIL a capture on the same container, and then SUCCEED on it without
+    // an intervening `Reset()` — which is legal, because the drain already reset
+    // it. The clear at scope ENTRY is what this pins: without it the container
+    // would report a graph it holds AND a failure it recovered from, and a
+    // driver reading the failure first would refuse a step that captured fine.
+    {
+      GraphCaptureScope scope(b, q, g);
+      b.FailNextEndCapture();
+    }
+    REQUIRE(g.capture_failed());
+    REQUIRE(g.capture_error() != nullptr);
+    {
+      GraphCaptureScope scope(b, q, g);
+      REQUIRE(scope.active());
+    }
+    REQUIRE(g.captured());
+    CHECK_FALSE(g.capture_failed());
+    CHECK(g.capture_error() == nullptr);
+  }
+}

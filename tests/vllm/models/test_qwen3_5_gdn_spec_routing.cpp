@@ -363,7 +363,12 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
     INFO("dims := ", std::string(g.name));
     CAPTURE(bad);
     CAPTURE(first);
-    if (bad != 0) { CAPTURE(mixed_out[first]); CAPTURE(ref[first]); }
+    if (bad != 0) {
+      // One CAPTURE per line: same-line pairs collide on DOCTEST_CAPTURE_<line>
+      // (clang/hipcc reject the redefinition; GCC happened not to).
+      CAPTURE(mixed_out[first]);
+      CAPTURE(ref[first]);
+    }
     CHECK(bad == 0);
   } else {
     float maxabs = 0.0f;

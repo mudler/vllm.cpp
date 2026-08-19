@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
+import json
 import re
 import subprocess
 import sys
@@ -138,7 +141,19 @@ MATRICES = {
     # ADVANCED to `ACTIVE` (keep-quant compute landed) by `CLAIM-DEEPSEEK-V4-W8` —
     # the `UD-IQ2_XXS` down-projection routed experts (`ffn_down_exps`) are IQ3_XXS;
     # no row count change (an in-place advance, not a new row).
-    "QUANT": (AGENTS / "quantization-matrix.md", 82),
+    # 84 since 2026-08-18: +`QUANT-QWEN38-27B-GGUF-ARM` and
+    # +`QUANT-QWEN38-27B-NVFP4-ARM`, the two quantized arms of Qwen3.8-27B whose bf16
+    # arm is already gated (#915) and which #821 has owned with no row of its own.
+    # Two rows and not one: they share nothing but a model name -- different file
+    # format, different loader translation unit, different oracle (llama.cpp for the
+    # GGUF arm, because vLLM has no in-tree GGUF at the pin and SGLang's alias table
+    # does not reach `qwen3_5`; pinned vLLM for NVFP4, which it runs), different
+    # external blockers (#857 vs #1185), and even different tokenizers on disk.
+    # Merging them would let one external blocker hold the other's work. Neither is
+    # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
+    # encoding rather than on a checkpoint. Both `READY`, spec
+    # `specs/qwen38-27b-quant-arms.md`, issue #821.
+    "QUANT": (AGENTS / "quantization-matrix.md", 84),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
@@ -516,13 +531,20 @@ ENGINE_PREFIXES = (
 # is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
 # `READY`, spec `specs/hybrid-placement.md`, issue #149.
 # 156 since 2026-08-14: +`ENG-RECORD-ANCHOR-RATCHET` (the record's own `path:line`
-# citations are 82% unchecked -- `LINK_RE` in THIS file matches only markdown
-# links, so 2137 bare `file.cpp:123` citations across the five matrices are never
-# parsed, against 480 that are; and the 18% seen is only range-checked, never
-# checked to contain the symbol named beside it). Found by three stale anchors that
-# humans caught by reading during the 2026-08-13/14 campaign, all of them IN RANGE.
-# Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
-# parser, no baseline and no test exists yet.
+# citations were checked for RANGE but never for CONTENT, and a failing check was
+# silently DROPPED. `local_line_anchors` in THIS file parses both citation forms
+# -- markdown links, and (since ee511ca8a) bare `file.cpp:123` under the
+# `RAW_LOCAL_ANCHOR_RE` prefixes -- but on a missing file or an out-of-range line
+# it `continue`s, so the bad anchor is omitted from the list and swallowed by
+# `is_code_anchor`'s `any()`. There was no symbol test and no report. 32 of the
+# 38 offenders this row banks are IN RANGE, so range-checking alone could never
+# have found them. Found by three stale anchors that humans caught by reading
+# during the 2026-08-13/14 campaign, all of them IN RANGE. Issue #632.
+# It lands `ACTIVE`, not `SPIKE`: the same change carries the parser, the
+# STALE/BROKEN classifier, `scripts/record-anchor-baseline.json` and the
+# `RecordAnchorRatchet` suite, so a comment framed at the spec-only commit would
+# be false about the file it sits in. The COUNT is unchanged by that -- the row
+# already existed at 156 and this is not a bump.
 # 157 since 2026-08-17: +`ENG-RESIDENCY-CONFIG` (the host-RAM->DISK weight-residency
 # tier as a CONFIG surface -- a `vllm_cpp` extension key inside the existing
 # `--offload-config` document, reaching the loader through
@@ -543,6 +565,29 @@ ENGINE_PREFIXES = (
 # 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
 # ported here, so this row records a divergence that already exists rather than
 # introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
+# 164 since 2026-08-18: +`LOAD-GGUF-MMPROJ` (a SECOND, `clip`-architecture GGUF
+# projector file beside the language file, and the Qwen3-VL vision tower loaded out
+# of it). Genuinely new and not expressible by `LOAD-GGUF` beside it: that row owns
+# the reader, the dequantization and the Qwen name transforms for ONE file, and the
+# single-file assumption it was built on is structural rather than incidental --
+# `ModelSource` carries a vector of safetensors shards and exactly one `GgufFile*`
+# (`model_registry.h:98`), and `EngineParams` has no projector field, so an mmproj
+# has nowhere to arrive. Sharding is already handled and is not this: `DetectSplit`
+# merges shards of ONE split, never a second, differently-architected file. Nothing
+# in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
+# whose only caller is a test, and that refusal becomes reachable production code the
+# moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
+# 165 since 2026-08-19: +`SPEC-DFLASH2` (the `DFlash2DraftModel` architecture: a
+# grouped dynamic depthwise convolution inside each draft block, and a candidate
+# selector that replaces the per-slot argmax with a scored path walk over the target
+# head's top-K). Genuinely new and not expressible by `SPEC-DFLASH` beside it: that
+# row owns the DFlash mechanism and reached `DONE`, and upstream itself carries
+# DFlash2 as a SECOND architecture rather than as a change to the first -- DFlash1
+# gains two subclass seams and keeps every behaviour, so a `DFlashDraftModel`
+# checkpoint resolves exactly as it does today. BEYOND-PIN on vLLM PR 52816 (OPEN at
+# head `19c93519`, base `9842d701`); the parity pin `555967922` does not carry the
+# architecture at all, so this row does not advance the pin. `READY`, spec
+# `specs/dflash2-spec-decode.md`, issue #1314.
 # 163 since 2026-08-18: +`ENG-EXPERT-STREAM-DEVICE` (the DESTINATION half of expert
 # streaming -- where a streamed slice lives and which platform may read it). Genuinely
 # new and not expressible by `ENG-EXPERT-STREAM` beside it: that row owns the streaming
@@ -556,7 +601,7 @@ ENGINE_PREFIXES = (
 # `offloader/prefetch.py:557-560`) and no secondary oracle implements it either.
 # `READY`, spec `specs/expert-stream-device-slots.md`, issue #1124.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 163
+ENGINE_ROWS = 166
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
@@ -1074,6 +1119,370 @@ def ledger_line_anchors(value: str, source: Path) -> list[str]:
     ]
 
 
+# --- record-anchor ratchet (ENG-RECORD-ANCHOR-RATCHET, #632) ------------------
+#
+# Records cite code as `server_main.cpp:505`. Code moves; the citation does not.
+# The checker above LOOKS like it catches that and does not:
+#
+#   1. NO REPORT, not "no parser". `local_line_anchors` reads BOTH citation
+#      forms: the markdown link through `LINK_RE`, and the bare
+#      `file.cpp:123` form through `RAW_LOCAL_ANCHOR_RE` since ee511ca8a. It
+#      range-checks each one. What it does not do is REPORT: on a missing file
+#      and on an out-of-range line the loop runs `continue`, so the bad anchor
+#      never enters the returned list, and `is_code_anchor`'s `any()` swallows
+#      what is left. There was no symbol test either, which is the gap that
+#      matters: 32 of the 38 offenders recorded here are IN RANGE, so a range
+#      check could not have found them.
+#   2. `any`, NOT `all`. `is_code_anchor` returns true if ONE anchor in a cell
+#      qualifies, so a single good link covers arbitrarily many rotted citations
+#      beside it. That is not a bug in the STATE gate -- a row IS evidenced by
+#      one good anchor, and the `any` stays -- but it is why nothing counted the
+#      others.
+#   3. STATE. `EVIDENCED_STATES` omits `ACTIVE` and `READY`, so 92 live rows got
+#      no anchor check at all.
+#
+# TWO POPULATIONS, TWO RATIOS, and quoting one without its denominator is what
+# produced the false "the bare form was never parsed" claim this comment
+# replaces. Measured at `8daa67b39`, the head before this branch merged `main` a
+# second time, counting a citation only where it is the WHOLE of a backtick
+# span, which is what the parser requires:
+#
+#   * ALL citation forms in the five matrices, ours and upstream: 492 links and
+#     1708 bare, 2200 in total. 525 of the bare forms sit under a
+#     `RAW_LOCAL_ANCHOR_RE` prefix, so 1017 of 2200 (46.2%) were already parsed.
+#     Most of the remainder are upstream paths that reach no local checker.
+#   * The citations this ratchet CLASSIFIES, which is the population that
+#     matters: 867. Of those 832 (96.0%) were already parsed AND range-checked
+#     before this row, and 35 (4.0%) are genuinely new to parsing, under
+#     `.agents/`, `docs/` and `website/`. Every offender recorded then sat in
+#     the 96%. The value this row adds is the symbol test and the report, not the
+#     parser.
+#
+# A range check is not the fix: every stale anchor found
+# by hand during the 2026-08-13/14 campaign was IN RANGE --
+# `docs/USAGE.md:902` (the count line had moved to :1126), `multimodal.py:17-43`
+# (the block ends at :45) and `server_main.cpp:308` (a different table entry
+# after a 4-line comment landed above). Only "does this line contain the symbol
+# named beside it" separates those from a live citation.
+#
+# THE RATCHET. Enforcing correctness over the whole backlog in one landing would
+# surface an unknown amount of unrelated rot, so this mirrors the DSR ratchet in
+# scripts/check-device-leakage.py, which this repo already trusts:
+# scripts/record-anchor-baseline.json holds the accepted STALE + BROKEN counts,
+# a bucket ABOVE its baseline fails, and a bucket BELOW it fails too, with the
+# instruction to lower the baseline in the SAME commit as the repair. The number
+# only ever moves down, and only deliberately. `--report` names every offender
+# so the backlog is legible rather than a number.
+#
+# WHERE THE CONSERVATIVE LINE IS DRAWN, and why each side of it is where it is.
+# A checker that cries wolf gets disabled, and this one has to survive a
+# four-figure backlog, so every rule below prefers a missed rot to a false one:
+#
+#   * ONLY the `code` and `tests` cells of rows in RECORD_ANCHOR_STATES. The
+#     `upstream` column is never read. That is what keeps the upstream
+#     references (`vllm/model_executor/...py:123`, `csrc/...cu:44`) out of the
+#     count structurally, rather than by a path heuristic.
+#   * A bare citation must be the WHOLE of a backtick span, so running prose can
+#     never be parsed as a path.
+#   * It must resolve to a file in the tree, or be a near miss: at least two path
+#     separators AND an existing parent directory, i.e. "a directory we own with
+#     a filename we do not" -- a rename or a deletion. `vllm/utils/hashing.py`
+#     and `tests/v1/core/test_scheduler.py` have no such parent here and are
+#     silently skipped, which is correct: they are upstream, and we cannot
+#     validate an anchor into a tree we do not have.
+#   * A symbol is inferred ONLY from an immediately adjacent backtick span --
+#     whitespace between them, or whitespace and one `(` for the trailing
+#     `path:line (`Symbol`)` form. Nothing else, and never from prose.
+#   * That span must LOOK like a symbol: an identifier, at least 4 characters,
+#     carrying `_`, `::`, `()` or an uppercase letter. `bf16` and `nvfp4` sit
+#     next to citations constantly and are not symbols; `MoeAuxStream`,
+#     `evict_blocks` and `Scheduler::shutdown()` are.
+#   * With no inferable symbol the citation is OK by construction. 801 of the
+#     867 in-scope citations land there, which is 92.4%, or about 13 in 14.
+#     That is the intended polarity: this gate exists to be believed when it
+#     does fire.
+#   * The symbol test asks whether the cited LINES CONTAIN the name. A comment
+#     that mentions the symbol therefore reads OK. That is a measured limit and
+#     not a defect: `KERNEL-ATTN-MLA-SPARSE` cites
+#     `include/vllm/v1/attention/backend.h:271` for `get_kv_cache_shape`, whose
+#     real declaration is at :341, and drift on `main` moved a ROCm comment
+#     naming the symbol onto :271. Tightening this would need a parser per
+#     language, which is the cry-wolf trade this whole block refuses.
+RECORD_ANCHOR_BASELINE = ROOT / "scripts/record-anchor-baseline.json"
+RECORD_ANCHOR_VERDICTS = ("ok", "stale", "broken")
+# The BUDGET is the rot only. `ok` is counted and printed but deliberately NOT
+# stored: a baseline that pinned it would make every PR that adds or removes any
+# citation rewrite this file, which is exactly the shared-file lock AGENTS.md
+# forbids. Per-bucket rather than one total, so a repaired BROKEN cannot pay for
+# a new STALE.
+RECORD_ANCHOR_BUCKETS = ("stale", "broken")
+# Gap 3. `EVIDENCED_STATES` itself is deliberately NOT widened. Making ACTIVE and
+# READY *require* an anchor raises 85 errors across 53 rows that carry prose
+# evidence today, which is the bulk cleanup this row exists to avoid. (The unit
+# is errors, not rows: the contract check emits one per missing anchor field, so
+# a row can raise more than one -- 32 rows raise two here and 21 raise one.)
+# They join the COUNT instead, and the ratchet absorbs what that surfaces.
+RECORD_ANCHOR_STATES = EVIDENCED_STATES | {"ACTIVE", "READY"}
+RECORD_ANCHOR_FIELDS = ("code", "tests")
+BARE_CITATION_RE = re.compile(
+    r"([A-Za-z0-9_./+-]*[A-Za-z0-9_+-]\.[A-Za-z0-9_+-]+):(\d+)(?:-(\d+))?"
+)
+BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?")
+
+
+@dataclass(frozen=True)
+class Citation:
+    # No matrix field: row IDs are unique across the matrices (check_matrices
+    # enforces it), so the item id already locates the offender.
+    item_id: str
+    path: str
+    start: int
+    end: int
+    symbol: str | None
+    verdict: str
+
+    def describe(self) -> str:
+        span = f"{self.start}" if self.end == self.start else f"{self.start}-{self.end}"
+        want = f" expected `{self.symbol}`" if self.symbol else ""
+        return f"{self.verdict:<6} {self.item_id} -> {self.path}:{span}{want}"
+
+
+@dataclass
+class RecordAnchorResult:
+    counts: dict[str, int] = dataclasses.field(
+        default_factory=lambda: dict.fromkeys(RECORD_ANCHOR_VERDICTS, 0)
+    )
+    citations: list[Citation] = dataclasses.field(default_factory=list)
+
+    @property
+    def offenders(self) -> list[Citation]:
+        return [c for c in self.citations if c.verdict in {"STALE", "BROKEN"}]
+
+    @property
+    def total(self) -> int:
+        """STALE + BROKEN. `ok` is reported but is not part of the budget."""
+        return sum(self.counts[bucket] for bucket in RECORD_ANCHOR_BUCKETS)
+
+
+def looks_like_symbol(text: str) -> bool:
+    text = text.strip()
+    if len(text) < 4 or SYMBOL_RE.fullmatch(text) is None:
+        return False
+    # A LEADING underscore in a record is nearly always an abbreviated suffix --
+    # "the text-only `_ModelInfo`" naming the `ModelInfo` beside it, not a
+    # symbol spelled `_ModelInfo`. Searching for it literally produced the one
+    # false STALE this rule was measured against, on an anchor that was right.
+    if text.startswith("_"):
+        return False
+    return "_" in text or "::" in text or text.endswith("()") or any(c.isupper() for c in text)
+
+
+def cell_citations(cell: str, source: Path, root: Path) -> list[tuple[Path, int, int, str | None]]:
+    """Every citation of THIS tree in one record cell, with its expected symbol.
+
+    Returns `(resolved_path, start, end, symbol_or_None)`. Both citation forms
+    are recognised -- the markdown link `[label](path#L12)` the old parser saw,
+    and the bare `` `path:12` `` / `` `path:12-20` `` span that is six times
+    more common here and was never parsed as a citation at all.
+    """
+    tokens: list[tuple[int, int, str, object]] = []
+    links: list[tuple[int, int]] = []
+    for match in LINK_RE.finditer(cell):
+        target = match.group(1).strip().strip("<>")
+        links.append((match.start(), match.end()))
+        if not target or target.startswith(("http://", "https://", "mailto:")):
+            continue
+        target_path, _, fragment = target.partition("#")
+        line_match = LINE_FRAGMENT_RE.fullmatch(fragment)
+        if line_match is None:
+            continue
+        start = int(line_match.group(1))
+        end = int(line_match.group(2) or start)
+        resolved = (source.parent / target_path).resolve()
+        tokens.append((match.start(), match.end(), "citation", (resolved, start, end)))
+    for match in BACKTICK_SPAN_RE.finditer(cell):
+        # A backtick span inside a link is that link's LABEL, not a token beside
+        # it: `[`foo.cpp`](../src/foo.cpp#L4)` must not be read as a neighbour.
+        if any(lo <= match.start() < hi for lo, hi in links):
+            continue
+        inner = match.group(1).strip()
+        bare = BARE_CITATION_RE.fullmatch(inner)
+        if bare is not None:
+            start = int(bare.group(2))
+            end = int(bare.group(3) or start)
+            resolved = (root / bare.group(1)).resolve()
+            tokens.append((match.start(), match.end(), "citation", (resolved, start, end)))
+        elif looks_like_symbol(inner):
+            tokens.append((match.start(), match.end(), "symbol", inner))
+        else:
+            tokens.append((match.start(), match.end(), "other", inner))
+    tokens.sort(key=lambda t: t[0])
+
+    found: list[tuple[Path, int, int, str | None]] = []
+    for index, (lo, hi, kind, payload) in enumerate(tokens):
+        if kind != "citation":
+            continue
+        resolved, start, end = payload  # type: ignore[misc]
+        symbol: str | None = None
+        if index > 0 and tokens[index - 1][2] == "symbol":
+            if not cell[tokens[index - 1][1]:lo].strip():
+                symbol = str(tokens[index - 1][3]).strip()
+        if symbol is None and index + 1 < len(tokens) and tokens[index + 1][2] == "symbol":
+            if cell[hi:tokens[index + 1][0]].strip() in {"", "("}:
+                symbol = str(tokens[index + 1][3]).strip()
+        found.append((resolved, start, end, symbol))
+    return found
+
+
+def classify_citation(
+    resolved: Path, start: int, end: int, symbol: str | None, root: Path
+) -> str | None:
+    """OK / STALE / BROKEN, or None when the citation is not about this tree."""
+    if not resolved.is_file():
+        # "A directory we own with a filename we do not" -- a rename or a
+        # deletion, and the one missing-file case worth calling BROKEN. Require
+        # THREE path components so a one-segment upstream name whose top-level
+        # directory happens to match ours (llama.cpp's `src/llama-model.cpp`,
+        # vLLM's `cmake/utils.cmake`) is skipped rather than blamed on us.
+        try:
+            depth = len(resolved.relative_to(root).parts)
+        except ValueError:
+            return None
+        if depth >= 3 and resolved.parent.is_dir():
+            return "BROKEN"
+        return None
+    lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    if start < 1 or end < start or end > len(lines):
+        return "BROKEN"
+    if symbol is None:
+        return "OK"
+    base = symbol.removesuffix("()").split("::")[-1]
+    body = "\n".join(lines[start - 1:end])
+    return "OK" if re.search(r"\b" + re.escape(base) + r"\b", body) else "STALE"
+
+
+def scan_record_anchors(
+    rows: list[ClaimRow] | None = None, root: Path | None = None
+) -> RecordAnchorResult:
+    root = ROOT if root is None else root
+    if rows is None:
+        rows, _ = check_matrices([])
+    result = RecordAnchorResult()
+    for row in rows:
+        if row.state not in RECORD_ANCHOR_STATES:
+            continue
+        # BY INDEX, not by name: several matrices carry one `Local evidence`
+        # column that field_index resolves for BOTH `code` and `tests`, and
+        # reading it twice would count every citation in it twice.
+        indices = {field_index(row.header, name) for name in RECORD_ANCHOR_FIELDS}
+        for index in sorted(i for i in indices if i is not None):
+            cell = row.cells[index] if index < len(row.cells) else ""
+            if is_placeholder(cell):
+                continue
+            for resolved, start, end, symbol in cell_citations(cell, row.path, root):
+                verdict = classify_citation(resolved, start, end, symbol, root)
+                if verdict is None:
+                    continue
+                try:
+                    shown = resolved.relative_to(root).as_posix()
+                except ValueError:
+                    shown = resolved.as_posix()
+                result.counts[verdict.lower()] += 1
+                result.citations.append(
+                    Citation(
+                        item_id=row.item_id,
+                        path=shown,
+                        start=start,
+                        end=end,
+                        symbol=symbol,
+                        verdict=verdict,
+                    )
+                )
+    return result
+
+
+def load_record_anchor_baseline() -> dict[str, int]:
+    if not RECORD_ANCHOR_BASELINE.is_file():
+        return {}
+    data = json.loads(RECORD_ANCHOR_BASELINE.read_text(encoding="utf-8"))
+    return {bucket: int(data["buckets"][bucket]) for bucket in RECORD_ANCHOR_BUCKETS}
+
+
+def write_record_anchor_baseline(result: RecordAnchorResult) -> int:
+    previous = load_record_anchor_baseline()
+    if previous and result.total > sum(previous.values()):
+        print(
+            "REFUSING to write a HIGHER record-anchor baseline "
+            f"({sum(previous.values())} -> {result.total}). The ratchet only turns one "
+            "way: repair the anchors instead of banking the rot.",
+            file=sys.stderr,
+        )
+        return 1
+    payload = {
+        "_comment": [
+            "Record-anchor baseline for scripts/check-agent-record.py",
+            "(ENG-RECORD-ANCHOR-RATCHET, .agents/specs/record-anchor-ratchet.md).",
+            "STALE = the cited line exists but does not contain the symbol named",
+            "beside it. BROKEN = the line is out of range, or the file is gone.",
+            "THESE NUMBERS MAY ONLY EVER GO DOWN. Lower them in the SAME commit as",
+            "the repair that earned it, by running:",
+            "  python3 scripts/check-agent-record.py --write-baseline",
+            "It is a rot budget, never to be raised to make a failing check pass.",
+            "Only the rot is stored. The OK count is printed by --report but kept out",
+            "of this file on purpose: pinning it would make every change that adds or",
+            "removes a citation rewrite this file, which is a lock, not a ratchet.",
+        ],
+        "total": result.total,
+        "buckets": {bucket: result.counts[bucket] for bucket in RECORD_ANCHOR_BUCKETS},
+    }
+    RECORD_ANCHOR_BASELINE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(f"baseline written: {RECORD_ANCHOR_BASELINE.name} -> {result.total}")
+    return 0
+
+
+def record_anchor_report(result: RecordAnchorResult) -> str:
+    lines = [
+        "Record anchors in the `code` / `tests` cells of "
+        f"{'/'.join(sorted(RECORD_ANCHOR_STATES))} rows:",
+        "",
+    ]
+    lines.extend(f"  {c.describe()}" for c in result.offenders)
+    if result.offenders:
+        lines.append("")
+    lines.append(
+        "record anchors: "
+        + ", ".join(f"{b}={result.counts[b]}" for b in RECORD_ANCHOR_VERDICTS)
+        + f"  -> rot {result.total}"
+    )
+    return "\n".join(lines)
+
+
+def check_record_anchors(result: RecordAnchorResult, errors: list[str]) -> None:
+    baseline = load_record_anchor_baseline()
+    if not baseline:
+        errors.append(
+            f"no record-anchor baseline at {RECORD_ANCHOR_BASELINE.relative_to(ROOT)}; "
+            "run --write-baseline to establish one"
+        )
+        return
+    for bucket in RECORD_ANCHOR_BUCKETS:
+        got, want = result.counts[bucket], baseline[bucket]
+        if got > want:
+            errors.append(
+                f"RECORD ANCHOR REGRESSION in bucket '{bucket}': {got} > baseline {want}. "
+                "A citation names a line that no longer holds what the prose says it "
+                "does. Run `python3 scripts/check-agent-record.py --report` for the "
+                "offenders and repair the anchor. NEVER raise the baseline to pass."
+            )
+        elif got < want:
+            errors.append(
+                f"record-anchor baseline STALE in bucket '{bucket}': {got} < baseline "
+                f"{want}. A repair must lower the baseline in the SAME commit: run "
+                "`python3 scripts/check-agent-record.py --write-baseline` and commit it."
+            )
+
+
 def commit_exists(commit: str) -> bool:
     result = subprocess.run(
         ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
@@ -1554,7 +1963,20 @@ def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
                 errors.append(f"{source.relative_to(ROOT)}: references unknown stable row {item_id}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="print every STALE/BROKEN record anchor with the symbol expected",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="rewrite scripts/record-anchor-baseline.json (only ever DOWNWARD)",
+    )
+    args = parser.parse_args(argv)
+
     errors: list[str] = []
     for path in REQUIRED:
         if not path.is_file():
@@ -1590,10 +2012,32 @@ def main() -> int:
         check_spec_location(errors)
         check_roadmap(by_id, errors)
 
+        anchors = scan_record_anchors(rows)
+        if args.report:
+            print(record_anchor_report(anchors))
+        if not args.write_baseline:
+            # Writing is a MODE, not a step: it must not also report the gate it
+            # is about to move, or a run that lowered the baseline would print a
+            # regression against the value it just replaced.
+            check_record_anchors(anchors, errors)
+    elif args.write_baseline:
+        print(
+            "REFUSING to write a baseline from a tree whose record does not parse.",
+            file=sys.stderr,
+        )
+
     if errors:
         for error in dict.fromkeys(errors):
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
+
+    if args.write_baseline:
+        # AFTER the error gate, deliberately. The mode used to return the moment
+        # it had a number, so a tree that failed some OTHER record check could
+        # still bank its rot, and the banked figure would carry the authority of
+        # a run that never passed. A baseline is a measurement of the record, so
+        # it is only taken from a record that checks out.
+        return write_record_anchor_baseline(anchors)
 
     counts = [
         "ENGINE="
@@ -1610,6 +2054,7 @@ def main() -> int:
             f"{prefix}="
             + str(sum(row.item_id.startswith(prefix + "-") for row in rows if row.path == path))
         )
+    counts.append(f"ANCHOR-ROT={anchors.total}")
     print("agent record OK: " + " ".join(counts))
     return 0
 

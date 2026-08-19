@@ -36,15 +36,21 @@ REQUIRED_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # belongs in docs/STATUS.md and docs/BENCHMARKS.md, not in a README table cell.
 MAX_CELL_CHARS = 220
 
-# The README is a landing page, not the status ledger. These budgets are what
-# stop it drifting back into a log one checkpoint at a time: per AGENTS.md the
-# per-capability lifecycle obligation lands in docs/STATUS.md, and anything that
-# would push the README past these limits is exactly that kind of content.
-# Measured in characters, not lines, so the budget does not move with how the
-# prose happens to be wrapped. The landing page was 61,909 chars when it was
-# still the status ledger and is ~23,000 as a landing page; 30,000 leaves real
-# headroom while making a slide back to a log fail CI.
-MAX_README_CHARS = 30000
+# The README is a landing page, not the status ledger, and what keeps it one is
+# a budget on each ENTRY: one prose paragraph, one table cell. Measured in
+# characters, not lines, so the budget does not move with how the prose happens
+# to be wrapped.
+#
+# There is deliberately NO whole-file budget. `MAX_README_CHARS = 30000` was
+# removed under #498, when README.md stood 7 characters below it. Per AGENTS.md
+# Records a budget on a shared file makes every addition evict someone else's
+# content, and merging two such edits cleanly is worse than conflicting because
+# it applies both evictions. It was the fourth budget of that shape to be
+# retired, after the per-class line limits, `check-now-current.py`'s MAX_CHARS
+# and STATUS_RATCHET (#364), and PageRules `max_chars` (#460). Do not
+# reintroduce it under a larger value:
+# `test_checker_declares_no_whole_file_budget` fails if the constant returns at
+# all. See .agents/specs/readme-budget-retire.md.
 MAX_PARAGRAPH_CHARS = 900
 
 # The README must point at the status ledger, and the ledger must actually carry
@@ -131,13 +137,6 @@ def readme_errors(text: str) -> list[str]:
         errors.append(
             f"README contains {count} em-dash(es); house style forbids them "
             "(use commas, periods, parentheses, or hyphens)"
-        )
-
-    if len(text) > MAX_README_CHARS:
-        errors.append(
-            f"README is {len(text)} chars, over the {MAX_README_CHARS}-char "
-            "landing-page budget; per-capability status belongs in "
-            "docs/STATUS.md, not here"
         )
 
     if STATUS_LINK not in text:

@@ -24755,3 +24755,86 @@ CUDA/ROCm/Vulkan is not covered. The counter sees every global `operator new`
 and nothing below it, so a raw `std::malloc` in the kernel is outside it (M-E
 above). No full-model render has been rerun, so nothing here says what such a
 run would now do — only that #1252 is not what stopped the last one.
+
+## MODEL-DIFFUSION-LTX25 FULL MODEL, the first render on the 21.004 B DiT, and the geometry ceiling beside it (2026-08-19, `row/MODEL-DIFFUSION-LTX25-FULLMODEL-RENDER`, binary `0a43a750` built from `7b9e207b1`, GB10, #1375 / #1252 / #1092)
+
+Every previous LTX-2.5 artifact was rendered on the DISTILLED arm. This is the
+first on the full `ltx-2.5-22b-dev-transformer-bf16.safetensors`: 42,018,190,584
+bytes, 4349 tensors, 21,004,025,600 elements, BF16 4059 / F32 290, zero
+quantisation scales. The checkpoint was verified semantically before use (header
+parses, tensor count matches, last tensor's `data_end` lands exactly on the file
+size), because a byte-count match alone does not prove a copy is whole.
+
+### The accepted measurement
+
+| | |
+|---|---|
+| Geometry | 768x448, 25 frames, 24 fps (1344 latent tokens) |
+| Wall | 2990 s (49.8 min), 2987 samples at 1 Hz |
+| Output | 25 frames + `audio.wav`, 1.01 s, 48 kHz stereo, plus `video.mp4` |
+| Own demand | 74.247 GiB above a 5.397 GiB baseline; peak system 79.644 GiB |
+| Min MemAvailable | 39.99 GiB against a 12.0 GiB hard floor |
+| GPU busy | 1010 of 2987 samples above 50% |
+
+Verifier verdict `PASS` on both arms, with the numbers rather than the verdict:
+25 distinct frame hashes of 25, zero near-uniform and zero near-black frames,
+adjacent-frame MAD 2.01 against far-frame (lag 12) MAD 9.34, a ratio of 0.215
+where uncorrelated noise gives ~1.0. Audio RMS -15.63 dBFS, envelope CV 0.112,
+spectral crest 52.0, active window fraction 1.0.
+
+### The rung that was refused, on the same lease
+
+1024x576/25f (2304 tokens) ran 3251 s and was refused by the governor rather than
+run to the wall: `first_dit = 481.5 s`, `per_forward ~ 162.0 s` from 7 resolved
+forward starts, so the recipe's fixed 60 forwards plus a 600 s tail project
+10803 s against that rung's 7153 s budget. The forward count is not tunable:
+`one_stage` at model version 2.5 resolves to 30 inference steps
+(`ltx2_pipeline.cpp:968` via `Ltx2Params24`), and `cfg_scale` 3.0 != 1.0 forces
+an unconditional forward per step (`ltx2_pipeline.cpp:521-523`), giving exactly
+2 forwards per step. So the ceiling here is geometry against lease length.
+
+### What this render is NOT
+
+It is not a full-fidelity reference render. `Ltx2DitForwardDevice` takes no
+`perturbations` argument, so the device-resident arm refuses the perturbed and
+isolated-modality passes by name (`ltx2_video.cpp:2738-2749`, #1092), while
+LTX-2.5's own params carry `stg_scale` 1.0 and `modality_scale` 3.0. The run used
+the engine's own sanctioned escape, `--video-stg-guidance-scale 0
+--audio-stg-guidance-scale 0 --a2v-guidance-scale 1.0 --v2a-guidance-scale 1.0`,
+which keeps real classifier-free guidance (video 3.0, audio 7.0) and gives up the
+STG term and the isolated-modality term. No oracle ran against it, so no parity
+claim is made and the speed axis stays `PENDING`.
+
+### Two instrument facts, recorded because both have already caused a wrong reading
+
+`gpu_edges = 0` means SATURATED, not idle. The counter looks for a GPU busy to
+idle transition, and the 1024x576 rung sat above 50% utilisation in 2704 of 3191
+samples, so there was no idle gap to sample. Reading that counter as "no work
+ran" is the available reading and the wrong one.
+
+`eu-stack` attaches inside the rc worker container and resolves ZERO frames, so
+every phase label came back `OTHER`. Phase attribution in this record is derived
+from the cpu%/rss signature instead: a single-threaded phase pins ~100% of one
+core of twenty with rss flat, weight loading ramps rss, and device staging shows
+above 800%. Do not budget on stack sampling in that container.
+
+### Why this was reachable at all
+
+Before #1252 the caption projection was a scalar triple loop with a `double`
+accumulator (`ltx2_text_encoder.cpp:61-70`) that could not reach an f32 FMA.
+Runs on the pre-fix binary measured single-core stretches of 1740 s and 1738 s,
+0.11% apart, reproducing the ~1731 s figure in #1087 twice in one render. After
+#1252 routed it through `vt::MatmulBT`, the same phase appears as `first_dit`
+481 s. That is the difference between a render that cannot fit a 4 h lease at any
+useful geometry and one that fits at 768x448.
+
+### Reproduce
+
+    rc run -d dgx:gpu0 --max-runtime 4h -- \
+      bash -lc 'BUDGET_S=14400 bash /workspace/ltx25-fullmodel/job/build_and_render.sh'
+
+The job builds `ltx2-gen` from `7b9e207b1` in-lease, refusing to proceed unless
+`vt::MatmulBT` is present in the unpacked source, then renders. Weights,
+`bin/` and `job/` are staged under `/workspace/ltx25-fullmodel` on the house NAS.
+Run evidence is `out/20260819T150230Z/` with `PROVENANCE`, `memguard.tsv`,
+`phases.tsv`, `verify.txt` and `render.log` per rung.

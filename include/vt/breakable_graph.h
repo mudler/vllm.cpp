@@ -161,6 +161,25 @@ struct GraphBreakStats {
   int64_t segments_captured = 0;
   int64_t breaks_registered = 0;
   int64_t replays = 0;  // BreakableGraph::Replay calls
+  // ACTIVE scopes opened in each mode. ENG-CUDAGRAPH-BREAK W3 (#1291) added
+  // these because the mode was UNOBSERVABLE from outside a driver, and the mode
+  // is the difference between one graph and one eager attention call per layer.
+  //
+  // W2 could gate its driver's mode only because `qwen3.cpp` registers a
+  // `vt::GraphBreak`, so `breaks_registered` moved in one mode and not the
+  // other. The three drivers W3 migrated register none — the one production
+  // break point in the tree is W1's — so for them `breaks_registered` is 0 in
+  // BOTH modes and a `== 0` assertion cannot tell them apart. Measured: flipping
+  // `kFull` to `kPiecewise` in `qwen3_moe.cpp` compiled clean and left that
+  // driver's whole gate GREEN, 226/226. A guard that holds under the mutation it
+  // names is a mute switch, so the mode is now a counter rather than an
+  // inference from a side effect.
+  //
+  // They count ACTIVE scopes only. An inert scope (no capture support, or
+  // `VLLM_CPP_CUDAGRAPH=0`) captures nothing in either mode, so counting it
+  // would make the number report a mode that never reached a backend.
+  int64_t full_scopes = 0;
+  int64_t piecewise_scopes = 0;
 };
 GraphBreakStats GetGraphBreakStats();
 void ResetGraphBreakStats();

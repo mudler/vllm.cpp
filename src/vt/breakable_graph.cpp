@@ -25,6 +25,8 @@ std::atomic<int64_t> g_break_points{0};
 std::atomic<int64_t> g_segments{0};
 std::atomic<int64_t> g_breaks{0};
 std::atomic<int64_t> g_replays{0};
+std::atomic<int64_t> g_full_scopes{0};
+std::atomic<int64_t> g_piecewise_scopes{0};
 
 }  // namespace
 
@@ -38,6 +40,8 @@ GraphBreakStats GetGraphBreakStats() {
   s.segments_captured = g_segments.load(std::memory_order_relaxed);
   s.breaks_registered = g_breaks.load(std::memory_order_relaxed);
   s.replays = g_replays.load(std::memory_order_relaxed);
+  s.full_scopes = g_full_scopes.load(std::memory_order_relaxed);
+  s.piecewise_scopes = g_piecewise_scopes.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -46,6 +50,8 @@ void ResetGraphBreakStats() {
   g_segments.store(0, std::memory_order_relaxed);
   g_breaks.store(0, std::memory_order_relaxed);
   g_replays.store(0, std::memory_order_relaxed);
+  g_full_scopes.store(0, std::memory_order_relaxed);
+  g_piecewise_scopes.store(0, std::memory_order_relaxed);
 }
 
 // Read ONCE into a function-local static, so a process is in exactly one lane
@@ -178,6 +184,16 @@ GraphCaptureScope::GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out,
   g_->capture_failed_ = false;
   g_->capture_error_ = nullptr;
   g_->backend_ = b_;
+  // The MODE this capture opened in, counted where it is decided. Nothing
+  // outside a driver could read it before, and a decode driver that opened
+  // `kPiecewise` would split a shipped one-graph step into one eager attention
+  // call per layer with no gate in this tree able to see it; a token gate cannot
+  // see a segment count either. Counted only on the ACTIVE path, because an
+  // inert scope captures nothing in either mode.
+  if (mode_ == GraphCaptureMode::kPiecewise)
+    g_piecewise_scopes.fetch_add(1, std::memory_order_relaxed);
+  else
+    g_full_scopes.fetch_add(1, std::memory_order_relaxed);
   t_current_scope = this;
   BeginSegment();
 }

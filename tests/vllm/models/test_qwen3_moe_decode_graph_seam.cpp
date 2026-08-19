@@ -211,7 +211,15 @@ TEST_CASE("G2: Qwen3MoeDecodeGraph captures and replays THROUGH the vt seam") {
     const vt::GraphBreakStats s = vt::GetGraphBreakStats();
     CHECK(s.segments_captured == 1);
     CHECK(graph.captured());
-    // kFULL: a decode capture is ONE segment and registers NO break.
+    // kFULL, ASSERTED ON THE MODE ITSELF and not inferred from a side effect.
+    // `breaks_registered == 0` is TRUE IN BOTH MODES for this model, because
+    // nothing in its forward registers a `vt::GraphBreak` — the one production
+    // break point in the tree is W1's, in `qwen3.cpp`. Measured, not reasoned:
+    // flipping this driver's `kFull` to `kPiecewise` compiled clean and left
+    // this whole file green. `full_scopes` / `piecewise_scopes` (W3, #1291) are
+    // the observable that actually moves, so that flip now reds this case.
+    CHECK(s.full_scopes == 1);
+    CHECK(s.piecewise_scopes == 0);
     CHECK(s.breaks_registered == 0);
   }
 

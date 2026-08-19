@@ -91,6 +91,37 @@ OwnedTensor ConcatRawNK(const TensorResolver& get, const std::vector<std::string
   return out;
 }
 
+// DeclaredCausal: upstream's `is not None` test followed by its `bool(...)`
+// coercion, for either spelling of the explicit causality (#1366).
+//
+// Upstream reads the key off a HuggingFace config object and writes
+// `if is_causal is not None: return bool(is_causal)`, with the same shape one
+// arm down for `dflash_config.causal` (qwen3_dflash.py:58-67 @
+// vllm-project/vllm#52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`). So a
+// config that spells the value `0` or `1` is honoured there, and a port that
+// demanded a JSON boolean dropped it in SILENCE -- back onto the legacy rule,
+// with nothing raised and only acceptance moving.
+//
+// The bound on the coercion is the OTHER container, not Python. `MakeDflashGgufConfig`
+// reads the GGUF spelling `dflash.attention.causal` through `KvI64`, which takes
+// every integer width and bool and names its own error on anything else
+// (qwen3_dflash_gguf.cpp). This is that rule, so the two containers now answer
+// identically: an absent key and a JSON null fall through, a boolean or a number
+// is honoured, and a type neither container can coerce is refused BY NAME rather
+// than dropped. Returns whether the key was declared; writes the resolved value
+// only when it was.
+bool DeclaredCausal(const nlohmann::json& obj, const char* key, bool* out) {
+  if (!obj.is_object() || !obj.contains(key)) return false;
+  const nlohmann::json& v = obj.at(key);
+  if (v.is_null()) return false;
+  VT_CHECK(v.is_boolean() || v.is_number(),
+           std::string("qwen3_dflash: config key \"") + key +
+               "\" must be a boolean or a number (upstream coerces it with "
+               "bool(), and the GGUF arm reads the same value as an integer)");
+  *out = v.is_boolean() ? v.get<bool>() : (v.get<double>() != 0.0);
+  return true;
+}
+
 }  // namespace
 
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config) {
@@ -103,9 +134,14 @@ std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig
   // `19c9351904df4c63042671bc67a866ca48dc7d6f`; the pinned 555967922 form at
   // :58-64 has only the two legacy arms). So the order is exactly:
   //
-  //   1. top-level `is_causal`, if present     -> every layer takes its value
-  //   2. `dflash_config.causal`, if present    -> every layer takes its value
-  //   3. the legacy rule                       -> causal iff the layer is SWA
+  //   1. top-level `is_causal`, if DECLARED    -> every layer takes bool(it)
+  //   2. `dflash_config.causal`, if DECLARED   -> every layer takes bool(it)
+  //   3. the legacy rule  -> causal iff `layer_types[i]` IS `sliding_attention`
+  //
+  // Arm 3 reads the DECLARED `layer_types` and not the resolved layer type, so
+  // `dflash_config.use_swa` does not reach it; see the comment on the loop body
+  // and #1366. Arms 1 and 2 test PRESENCE and then coerce, as upstream's
+  // `bool(...)` does; see `DeclaredCausal` above.
   //
   // The order is the whole change. `z-lab/Qwen3.8-27B-DFlash2` declares all five
   // layers `sliding_attention` AND `is_causal false`; under the legacy rule alone
@@ -128,13 +164,11 @@ std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig
           ? config.raw.at("dflash_config")
           : empty;
   const bool use_swa = dflash.value("use_swa", false);
-  const bool has_is_causal = config.raw.is_object() && config.raw.contains("is_causal") &&
-                             config.raw.at("is_causal").is_boolean();
-  const bool has_causal_override = dflash.contains("causal") && dflash.at("causal").is_boolean();
-  const bool explicit_causal = has_is_causal ? config.raw.at("is_causal").get<bool>()
-                               : has_causal_override ? dflash.at("causal").get<bool>()
-                                                     : false;
-  const bool has_explicit_causal = has_is_causal || has_causal_override;
+  // `||` is the precedence, and it short-circuits exactly where upstream returns:
+  // a declared `is_causal` answers and `dflash_config.causal` is never consulted.
+  bool explicit_causal = false;
+  const bool has_explicit_causal = DeclaredCausal(config.raw, "is_causal", &explicit_causal) ||
+                                   DeclaredCausal(dflash, "causal", &explicit_causal);
 
   const std::vector<std::string>& lt = config.layer_types;
   int64_t num_sliding = 0;
@@ -150,8 +184,23 @@ std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig
     } else {
       is_sliding = lt[static_cast<size_t>(i)] == kSliding;
     }
+    // The legacy fallback reads the RAW `layer_types`, and NOT the `is_sliding`
+    // resolved just above (#1366). The two differ whenever `dflash_config.use_swa`
+    // is set, because `use_swa` forces SWA onto every layer -- an absent
+    // `layer_types` and an all-full one alike -- while upstream's fallback is
+    // `bool(layer_types) and layer_types[i] == _SLIDING_ATTENTION`
+    // (qwen3_dflash.py:66-67 @ the PR head), which such a config fails. Upstream's
+    // own `_resolve_layer_attention` docstring table states it as a row --
+    // `layer_types=None` + `use_swa=True` -> causal False -- and names
+    // `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash` as the published checkpoint of that
+    // shape. `use_swa` moves the WINDOW, never the causality. Reading `is_sliding`
+    // here ran every layer of such a DFlash1 draft CAUSAL against upstream's
+    // non-causal, which is acceptance-only and invisible to a token gate because
+    // the verify is lossless.
+    const bool legacy_causal =
+        static_cast<size_t>(i) < lt.size() && lt[static_cast<size_t>(i)] == kSliding;
     Qwen3DFlashLayerAttnMode m;
-    m.causal = has_explicit_causal ? explicit_causal : is_sliding;
+    m.causal = has_explicit_causal ? explicit_causal : legacy_causal;
     if (is_sliding) {
       int64_t win = 0;
       if (dflash.contains("swa_window_size") && dflash.at("swa_window_size").is_number())
@@ -193,7 +242,11 @@ HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c) {
   // (`getattr(config, "is_causal", None)`, qwen3_dflash.py:60 @ the PR head);
   // this builder copies named keys, so a key it drops is a key the resolution can
   // never see. Optional, and absent from every DFlash1 checkpoint.
-  if (c.contains("is_causal") && c.at("is_causal").is_boolean()) {
+  // Carried whenever it is DECLARED, in whatever scalar the checkpoint spells it
+  // (#1366). The builder plumbs and the resolution decides: gating the carry on a
+  // type would put a second, narrower predicate in front of `DeclaredCausal` and
+  // reintroduce exactly the silent drop that key exists to prevent.
+  if (c.contains("is_causal") && !c.at("is_causal").is_null()) {
     cfg.raw["is_causal"] = c.at("is_causal");
   }
   return cfg;

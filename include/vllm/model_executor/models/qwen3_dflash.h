@@ -20,12 +20,18 @@
 // layers are causal within their window. This routes through the new
 // vt::DFlashBlockAttention primitive (ops.h) rather than the causal
 // vt::PagedAttention every other model uses. Per-layer causality is resolved from
-// config exactly as vLLM _resolve_layer_attention (:86-146) + _dflash_layer_causal:
-// an explicit top-level `is_causal` wins, else `dflash_config.causal`, else a layer
-// is causal iff it is a sliding_attention layer. The top-level arm is BEYOND-PIN
-// (SPEC-DFLASH2 W1, #1314), from vllm-project/vllm#52816 head
-// `19c9351904df4c63042671bc67a866ca48dc7d6f`; no DFlash1 checkpoint declares the
-// key, so their resolution is unchanged. See ResolveQwen3DFlashAttnModes.
+// config exactly as vLLM _resolve_layer_attention (:109-169) + _dflash_layer_causal
+// (:58-67), both @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`: a DECLARED top-level `is_causal`
+// wins, else a declared `dflash_config.causal`, else a layer is causal iff its
+// DECLARED `layer_types[i]` is `sliding_attention`. That last arm reads the
+// declared value and not the resolved layer type, so `dflash_config.use_swa` --
+// which forces SWA onto every layer -- moves the WINDOW and never the causality
+// (#1366). Both explicit arms test presence and then coerce, as upstream's
+// `bool(...)` does, so a checkpoint spelling the value `0` is honoured. The
+// top-level arm is BEYOND-PIN (SPEC-DFLASH2 W1, #1314); no DFlash1 checkpoint
+// declares the key, so their resolution is unchanged by it. See
+// ResolveQwen3DFlashAttnModes.
 //
 // Context-KV precompute (qwen3_dflash.py:548-619 precompute_and_store_context_kv)
 // and prepare_dflash_inputs are D3 (DF-DRAFT-KV-PREP); this header/cpp owns the

@@ -79,6 +79,15 @@ json CausalOverride(bool causal) {
   return d;
 }
 
+// `dflash_config.use_swa`, which forces SWA onto every layer -- including an
+// all-full `layer_types` and an absent one -- and which upstream's causality
+// fallback deliberately does NOT read (#1366).
+json UseSwa() {
+  json d = json::object();
+  d["use_swa"] = true;
+  return d;
+}
+
 // Upstream `dflash_has_any_non_causal` (qwen3_dflash.py:68-74), which is the
 // value its parametrized table asserts: whether the draft needs a
 // non-causal-capable backend at all.
@@ -119,6 +128,30 @@ std::string DflashGgufBytes(const std::optional<bool>& causal) {
   if (causal.has_value()) {
     b.AddKv(gguf_test::BoolKv("dflash.attention.causal", *causal));
   }
+  return b.Build();
+}
+
+// The same drafter with `dflash.attention.causal` written as a U32 rather than
+// a bool, which is what a converter with no boolean KV type emits. `KvI64`
+// already takes it; this fixture is what proves the HF arm agrees (#1366).
+std::string DflashGgufBytesNumericCausal(uint32_t causal) {
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "dflash"));
+  b.AddKv(gguf_test::U32Kv("dflash.block_count", 5));
+  b.AddKv(gguf_test::U32Kv("dflash.embedding_length", 5120));
+  b.AddKv(gguf_test::U32Kv("dflash.feed_forward_length", 17408));
+  b.AddKv(gguf_test::U32Kv("dflash.attention.head_count", 32));
+  b.AddKv(gguf_test::U32Kv("dflash.attention.head_count_kv", 8));
+  b.AddKv(gguf_test::U32Kv("dflash.attention.key_length", 128));
+  b.AddKv(gguf_test::F32Kv("dflash.rope.freq_base", 1e7f));
+  b.AddKv(gguf_test::F32Kv("dflash.attention.layer_norm_rms_epsilon", 1e-6f));
+  b.AddKv(gguf_test::U32Kv("dflash.attention.sliding_window", 2048));
+  b.AddKv(gguf_test::BoolArrayKv("dflash.attention.sliding_window_pattern",
+                                 {true, true, true, true, true}));
+  b.AddKv(gguf_test::U32Kv("dflash.block_size", 8));
+  b.AddKv(gguf_test::I32ArrayKv("dflash.target_layers", {6, 20, 34, 48, 62}));
+  b.AddKv(gguf_test::U32Kv("tokenizer.ggml.mask_token_id", 248070));
+  b.AddKv(gguf_test::U32Kv("dflash.attention.causal", causal));
   return b.Build();
 }
 
@@ -220,6 +253,157 @@ TEST_CASE("dflash causality: a DFlash1 checkpoint resolves EXACTLY as before") {
   }
   CHECK_FALSE(modes[4].causal);
   CHECK(modes[4].sliding_window == 0);
+}
+
+TEST_CASE("dflash causality: use_swa makes a layer SLIDING and never CAUSAL (#1366)") {
+  // The two rows of upstream's own `_resolve_layer_attention` docstring table
+  // that its parametrize list never exercises (qwen3_dflash.py:109-133 @ the PR
+  // head). The fallback resolves causality from the RAW `layer_types` and not
+  // from the resolved layer type:
+  //
+  //     layer_types = getattr(config, "layer_types", None)
+  //     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
+  //
+  // `use_swa` therefore moves the WINDOW and never the causality. The table
+  // states it directly -- `layer_types=None` + `use_swa=True` -> causal False --
+  // and names `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash` as that shape ("sets
+  // use_swa, assumes non-causal".)
+  //
+  // This is a DFlash1 divergence, found by the fresh reviewer of SPEC-DFLASH2 W1
+  // and fixed in flow (#1366). It is the same acceptance-only, token-invisible
+  // failure class this row exists to remove, one arm over: such a draft ran
+  // every layer CAUSAL here and NON-causal upstream, the verify stayed lossless,
+  // and only acceptance moved. Both rows assert the WINDOW too, because the
+  // resolved layer type is genuinely sliding in both and a fix that reached the
+  // window instead of the causality would be wrong in a way no causality
+  // assertion could see.
+  SUBCASE("layer_types absent + use_swa -> sliding, and NON-causal") {
+    const std::vector<Qwen3DFlashLayerAttnMode> modes =
+        ResolveQwen3DFlashAttnModes(Config(2, {}, UseSwa()));
+    REQUIRE(modes.size() == 2);
+    CHECK_FALSE(modes[0].causal);
+    CHECK_FALSE(modes[1].causal);
+    CHECK(modes[0].sliding_window == 2048);
+    CHECK(modes[1].sliding_window == 2048);
+  }
+
+  SUBCASE("all-full layer_types + use_swa -> sliding, and NON-causal") {
+    // The same divergence by the other branch of the `is_sliding` rule:
+    // `use_swa` forces SWA over an all-full `layer_types`, and `layer_types[i]`
+    // is still `full_attention`, so upstream answers non-causal.
+    const std::vector<Qwen3DFlashLayerAttnMode> modes = ResolveQwen3DFlashAttnModes(
+        Config(2, {"full_attention", "full_attention"}, UseSwa()));
+    REQUIRE(modes.size() == 2);
+    CHECK_FALSE(modes[0].causal);
+    CHECK_FALSE(modes[1].causal);
+    CHECK(modes[0].sliding_window == 2048);
+    CHECK(modes[1].sliding_window == 2048);
+  }
+
+  SUBCASE("use_swa is still OVERRIDDEN by an explicit value") {
+    // The fallback is the LAST arm, so neither explicit spelling loses its
+    // precedence to this repair.
+    CHECK_FALSE(AnyNonCausal(Config(2, {}, UseSwa(), json(true))));
+    json d = UseSwa();
+    d["causal"] = true;
+    CHECK_FALSE(AnyNonCausal(Config(2, {}, d)));
+  }
+}
+
+TEST_CASE("dflash causality: a NUMERIC is_causal is honoured, as upstream's bool() is (#1366)") {
+  // Upstream tests PRESENCE and then coerces -- `if is_causal is not None:
+  // return bool(is_causal)` (qwen3_dflash.py:59-61 @ the PR head) -- so a
+  // config that writes the key as 0 or 1 is honoured there. Requiring a JSON
+  // boolean made `"is_causal": 0` fall through to the legacy rule in SILENCE,
+  // which is the same invisible-acceptance shape one more time.
+  //
+  // It also made the two containers disagree with each other. The GGUF arm
+  // reads `dflash.attention.causal` through `KvI64`, which takes every integer
+  // width AND bool and names its own error on anything else, so a numeric
+  // spelling already worked there. The HF arm now matches it on both halves:
+  // numbers are honoured, and a type neither container can coerce is REFUSED by
+  // name rather than dropped.
+  SUBCASE("is_causal 0 -> non-causal, over an all-sliding layer_types") {
+    CHECK(AnyNonCausal(Config(2, {"sliding_attention", "sliding_attention"},
+                              json::object(), json(0))));
+  }
+  SUBCASE("is_causal 1 -> causal, over an all-full layer_types") {
+    CHECK_FALSE(AnyNonCausal(
+        Config(2, {"full_attention", "full_attention"}, json::object(), json(1))));
+  }
+  SUBCASE("dflash_config.causal 0 -> the same coercion, one arm down") {
+    json d = json::object();
+    d["causal"] = 0;
+    CHECK(AnyNonCausal(Config(2, {"sliding_attention", "sliding_attention"}, d)));
+  }
+  SUBCASE("a type NEITHER container can coerce is refused BY NAME") {
+    // BY NAME, and asserted as such: a bare CHECK_THROWS passes on the
+    // nlohmann `type_error` a coercion attempt raises on its own, so it would
+    // hold whether or not this engine refuses anything deliberately. The
+    // message has to carry the KEY, which is the whole difference between a
+    // refusal and an accident. The GGUF arm's `KvI64` names its key the same
+    // way.
+    std::string message;
+    try {
+      ResolveQwen3DFlashAttnModes(
+          Config(2, {"full_attention", "full_attention"}, json::object(),
+                 json("false")));
+      FAIL("an uncoercible is_causal was ACCEPTED");
+    } catch (const std::exception& e) {
+      message = e.what();
+    }
+    CHECK(message.find("is_causal") != std::string::npos);
+    CHECK(message.find("boolean or a number") != std::string::npos);
+  }
+  SUBCASE("the two containers agree on a numeric spelling") {
+    // HF `is_causal: 0` and GGUF `dflash.attention.causal = 0` (a u32, which is
+    // what a converter that has no bool type writes) must reach the same answer.
+    const gguf_test::TempFile file(DflashGgufBytesNumericCausal(0));
+    const vllm::GgufFile g = vllm::GgufFile::Open(file.path());
+    const HfConfig gc = MakeDflashGgufConfig(g);
+    REQUIRE(gc.raw.contains("is_causal"));
+    const std::vector<Qwen3DFlashLayerAttnMode> gmodes = ResolveQwen3DFlashAttnModes(gc);
+    REQUIRE(gmodes.size() == 5);
+
+    const HfConfig hc = Config(5,
+                               {"sliding_attention", "sliding_attention",
+                                "sliding_attention", "sliding_attention",
+                                "sliding_attention"},
+                               json::object(), json(0));
+    const std::vector<Qwen3DFlashLayerAttnMode> hmodes = ResolveQwen3DFlashAttnModes(hc);
+    REQUIRE(hmodes.size() == 5);
+    for (size_t i = 0; i < 5; ++i) {
+      CAPTURE(i);
+      CHECK_FALSE(gmodes[i].causal);
+      CHECK(gmodes[i].causal == hmodes[i].causal);
+    }
+  }
+}
+
+TEST_CASE("dflash draft config: a NUMERIC is_causal is CARRIED too (#1366)") {
+  // The builder gates the key on the same predicate the resolution does, so a
+  // spelling one accepts and the other drops cannot exist.
+  json doc = json::object();
+  doc["hidden_size"] = 5120;
+  doc["num_attention_heads"] = 32;
+  doc["num_key_value_heads"] = 8;
+  doc["head_dim"] = 128;
+  doc["rope_theta"] = 1e7;
+  doc["intermediate_size"] = 25600;
+  doc["vocab_size"] = 248320;
+  doc["num_hidden_layers"] = 2;
+  doc["rms_norm_eps"] = 1e-6;
+  doc["sliding_window"] = 2048;
+  doc["layer_types"] = json::array({"sliding_attention", "sliding_attention"});
+  doc["block_size"] = 8;
+  doc["dflash_config"] = json::object();
+  doc["dflash_config"]["mask_token_id"] = 248070;
+  doc["dflash_config"]["target_layer_ids"] = json::array({5, 19});
+  doc["is_causal"] = 0;
+
+  const HfConfig c = MakeQwen3DFlashDraftConfig(doc);
+  REQUIRE(c.raw.contains("is_causal"));
+  CHECK(AnyNonCausal(c));
 }
 
 TEST_CASE("dflash draft config: is_causal is CARRIED off the draft's config.json") {

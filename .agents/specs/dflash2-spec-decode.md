@@ -116,8 +116,9 @@ Present, and reused rather than rebuilt:
   block kernel that closed the `SPEC-DFLASH` speed gate.
 - The loader ALREADY shares `embed_tokens` and `lm_head` from the target, which
   is exactly what a DFlash2 checkpoint requires
-  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:56-60,215-219`; the
-  second range was `:155-157` before W1 widened the resolver's comment). The
+  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:56-60,268-272`; the
+  second range was `:155-157` before W1 widened the resolver's comment and
+  `:215-219` before the #1366 repair widened it again). The
   class comment at `include/vllm/model_executor/models/qwen3_dflash.h:79-82`
   claims the draft owns both; it is STALE and this row corrects it.
 - `src/vt/cuda/cuda_sample.cu:297-506` is a sort-free block-cooperative
@@ -143,9 +144,9 @@ Absent, and owed by this row:
 - No top-k that EMITS the surviving (id, value) pairs. The threshold search
   above masks below the k-th largest and returns no indices.
 - `is_causal` was not read: causality resolved by the legacy rule alone. CLOSED by
-  W1 in `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:96-171`
-  (`ResolveQwen3DFlashAttnModes`) and `:173-200`
-  (`MakeQwen3DFlashDraftConfig`).
+  W1 in `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:127-220`
+  (`ResolveQwen3DFlashAttnModes`, with its `DeclaredCausal` coercion at
+  `:113-123`) and `:222-253` (`MakeQwen3DFlashDraftConfig`).
 
 ## Port map
 
@@ -157,7 +158,7 @@ Absent, and owed by this row:
 | `dflash2/speculator.py` walk kernel | `src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp` + a CUDA walk kernel | D3: device from day one |
 | `dflash2/speculator.py` draft-logit cache | same file | the realized q the rejection sampler reads at T>0 |
 | `registry.py` + `spec_decode/__init__.py` | `include/vllm/config/speculative.h`, `src/vllm/entrypoints/model_loader.cpp` | classify from the draft's own config, as `IsDsparkDraft` does |
-| `_dflash_layer_causal` | `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:96-171` | D4; the ONE shared-behaviour edit. LANDED in W1 |
+| `_dflash_layer_causal` | `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:113-123,127-220` | D4; the ONE shared-behaviour edit. LANDED in W1 |
 | `use_v2_model_runner` | no analogue | we have one runner; record the reason rather than porting a switch |
 | — | `src/vllm/model_executor/models/qwen3_dflash2_gguf.cpp` | the GGUF drafter arm, W5 |
 
@@ -397,5 +398,27 @@ DFlash1 drafter `muse-glimmer-30b-gguf/dflash-kquant.gguf` carries none of those
 keys and is unchanged. This is a REFUSAL on the GGUF axis, not the GGUF drafter
 ARM, which stays W5.
 
+W1's fresh review also raised [#1366](https://github.com/mudler/vllm.cpp/issues/1366)
+against the same function, and it is FIXED IN FLOW rather than deferred, per
+AGENTS.md. It is pre-existing and it is D4's failure class one arm over. The
+legacy fallback read the RESOLVED `is_sliding`, which `dflash_config.use_swa`
+forces true on every layer; upstream reads the DECLARED `layer_types`
+(`bool(layer_types) and layer_types[i] == "sliding_attention"`,
+`qwen3_dflash.py:66-67` @ the PR head), and states the consequence as a row of
+its own `_resolve_layer_attention` docstring table -- `layer_types=None` +
+`use_swa=True` -> causal False -- naming `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`
+as the published checkpoint of that shape. Such a DFlash1 draft therefore ran
+every layer CAUSAL here and non-causal upstream, with the verify lossless and
+only acceptance moving. It went uncaught because upstream's parametrize table
+has no `use_swa` row either, so the ported cases were faithful to the ported
+table and silent about the arm. The same issue's second half is the coercion:
+`is_causal` was honoured only as a JSON boolean, while upstream tests presence
+and coerces, and the GGUF arm's `KvI64` already took every integer width -- so
+`"is_causal": 0` fell through in silence and the two containers disagreed with
+each other. Both halves are repaired red-first and mutation-proven, and unlike
+D4 the `use_swa` half is REACHED today, because the checkpoints it governs are
+DFlash1 ones this engine already admits.
+
 Next action: W2, the grouped dynamic convolution, CPU reference first, against
-the checkpoint's real shapes (taps 2, group 16, block 8).
+the checkpoint's real shapes (taps 2, group 16, block 8). W2 must also discharge
+`## Owed` O1, O2 and O3, and O3 is a blocker rather than a cleanup.

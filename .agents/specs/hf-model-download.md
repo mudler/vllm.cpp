@@ -266,6 +266,7 @@ byte for byte:
 | Accept an all-identical object identifier listing | The fabricated-identifier case |
 | Own an identifier with an entry that reports no size | The not-disarmable case |
 | Restore the distinct-path guard on the size rule | The one-path-two-sizes case |
+| Remove the case fold on the object identifier | The mixed-case-two-sizes case and the blob-name case |
 | Remove index-driven selection | The decoy-file case |
 | Remove the offline short circuit | The offline cases |
 
@@ -407,6 +408,41 @@ the exact shape the rule exists to catch. The guard is removed. A repeated path
 at an agreed size stays accepted, and the two cases now measure the boundary
 from both sides.
 
+The third shape was LETTER CASE, issue
+[#1370](https://github.com/mudler/vllm.cpp/issues/1370), found by the fourth
+fresh review. `IsHexString` accepts `A` through `F` as well as `a` through `f`,
+which mirrors llama.cpp's `is_valid_oid`, and `oid_owner` was keyed on the raw
+identifier with nothing folding case anywhere in the file. Two spellings of one
+identifier therefore landed two keys and the rule compared nothing. Measured at
+`db0af37b1`: `a.bin` at 4096 bytes under `ab234567...` beside `b.bin` at 2048
+bytes under `AB234567...` was ACCEPTED, where the same pair in one case is
+refused. That is the first shape's lesson again. `HF_ENDPOINT` is user
+configurable, so the listing is input the hub does not have to answer
+truthfully, and where one omitted field bought an unconditional pass there, one
+changed letter case bought it here.
+
+The identifier is now folded to lower case once, after the hexadecimal form is
+validated and before either rule or `HfFile::oid` reads it. FOLDED rather than
+REFUSED, because hexadecimal is case-insensitive by definition and both git and
+the hub emit lower case, so an upper-case spelling is another spelling of one
+value rather than a claim about a second object. Refusing it would reject a
+mirror over a difference that means nothing, which is the false positive the
+any-duplicate rule was replaced for.
+
+The fold is applied to the identifier ITSELF and not only to the map key,
+because the raw-identifier assumption reaches past the map. `HfFile::oid` left
+the function in the listing's case, and `HfBlobPath` makes that value a cache
+FILE NAME, so one listing would populate a different cache on a case-sensitive
+file system than on a case-insensitive one such as this project's CIFS
+checkpoint mounts. That half is latent rather than shipped, because `HfBlobPath`
+has no production caller until W3, and it is repaired ahead of that caller
+rather than left for it. `IsDegenerateOid` needed no repair, because folding a
+repeated character leaves it repeated, and an upper-case degenerate identifier
+is now pinned so the fold cannot move that verdict silently. The COMMIT is
+deliberately not folded: no integrity rule keys on it, so a second spelling
+costs at worst a second snapshot directory rather than a rule that stops firing,
+and neither reference implementation folds it either.
+
 `HfFile::size` is a `std::optional<uint64_t>` for the same reason. A plain
 `uint64_t` spells a zero-byte file and an unreported size both `0`, and W3 sizes
 a byte range and a resume offset from this field, so the ambiguity would have
@@ -472,10 +508,21 @@ production loader with a repository identifier so that deleting the call site
 turns it red.
 
 A second fresh review returned FAIL on the tree-listing size rule, and the two
-holes it found are repaired at this head under issue
+holes it found are repaired under issue
 [#1339](https://github.com/mudler/vllm.cpp/issues/1339): the rule could be
 disarmed by an entry that reported no size, and it exempted one path listed
-twice. `test_hf_hub.cpp` now carries 35 cases and 141 assertions.
+twice.
+
+A fourth fresh review returned FAIL on a third hole in the same rule and on the
+header that describes it. Both are repaired at this head. The size rule was
+evadable by LETTER CASE, issue
+[#1370](https://github.com/mudler/vllm.cpp/issues/1370), and the identifier is
+now folded to lower case before either rule or `HfFile::oid` reads it. The
+header still stated the superseded distinct-path form of rule 1, and still
+carried an orphan fragment left by the edit that removed the any-duplicate rule.
+Rule 1 now says what the code does, the fragment is gone, and the fold is
+documented on the function and on `HfFile::oid`. `test_hf_hub.cpp` now carries
+39 cases and 154 assertions.
 
 The row stays `READY` rather than moving to `ACTIVE`, because an `ACTIVE` row
 needs a `CLAIM-*` owner recorded in a claim source and that is the operator's

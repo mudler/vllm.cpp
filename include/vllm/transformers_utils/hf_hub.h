@@ -73,6 +73,10 @@ struct HfFile {
   //
   // That drop is a decision about USE, and it is the only thing the token
   // governs. The two integrity rules on `HubListRepoFiles` run whoever asked.
+  //
+  // LOWER CASE whatever the listing spelled, so a value that becomes a blob
+  // file name names one file on a case-sensitive file system and on a
+  // case-insensitive one alike.
   std::string oid;
   // `{endpoint}{repo}/resolve/{commit}/{path}`.
   std::string url;
@@ -103,14 +107,16 @@ std::string HubResolveRefToCommit(const std::string& repo_id,
 // answering something other than the truth about one file is not a source the
 // rest of the answer can be trusted from. Neither depends on the token.
 //
-//  1. Two DISTINCT files carry one object identifier and disagree on size. A
-//     content hash cannot name two sizes, so this is always a broken
-//     instrument.
+//  1. Two entries carry one object identifier and disagree on size. A content
+//     hash cannot name two sizes, so this is always a broken instrument. The
+//     rule asks nothing about the PATH: one path listed twice at two different
+//     sizes is self contradictory whichever entry is believed, and it is
+//     refused too.
 //  2. An identifier is one character repeated, for example 'a' 64 times. No
 //     content hash produces that, and it is the value measured on gated
 //     `Lightricks/LTX-2.5` on 17 August 2026.
 //
-// Two distinct files that share an identifier AND a size are ACCEPTED. That is
+// Two entries that share an identifier AND a size are ACCEPTED. That is
 // duplicate content, which is legitimate: `lfs.oid` is the sha256 of the
 // contents and the plain `oid` is the git blob sha1, so two byte-identical
 // files in one repository share one identifier by construction. Refusing that
@@ -118,9 +124,13 @@ std::string HubResolveRefToCommit(const std::string& repo_id,
 // replaced. See `.agents/specs/hf-model-download.md`.
 //
 // An identifier that is neither 40 nor 64 hexadecimal characters is dropped and
-// its file is kept, because the file is still addressable by path. A hub that hands out one identifier for every file is
-// answering something other than the truth about the repository, and a
-// per-entry filter would let the rest of that answer through.
+// its file is kept, because the file is still addressable by path.
+//
+// Every identifier is FOLDED to lower case before either rule reads it and
+// before it reaches `HfFile::oid`. Hexadecimal is case-insensitive and the hub
+// and git both emit lower case, so `AB23...` and `ab23...` are one value. A
+// listing that spelled them differently used to slip past rule 1, because the
+// two spellings were two keys.
 //
 // Throws std::runtime_error on a refusal.
 std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,

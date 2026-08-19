@@ -1878,6 +1878,13 @@ Neither check depends on `HF_TOKEN`. Entries that share an identifier and agree
 on size are accepted, because that is duplicate content and a repository is
 allowed to hold it.
 
+Identifiers are compared in one letter case. Hexadecimal is case-insensitive and
+the hub emits lower case, so a listing that spelled one identifier `ab23...` on
+one entry and `AB23...` on the next is naming one object and both checks see it
+that way. A mirror named by `HF_ENDPOINT` therefore cannot switch the size check
+off by changing a letter's case, and a cached blob gets the same name on a
+case-sensitive file system and on a case-insensitive one.
+
 The size check compares only the sizes a listing actually reported. It reads the
 entry's top-level `size` and falls back to `lfs.size`, never to `lfs.pointerSize`
 which is the size of the pointer file. An entry that reports no size is compared

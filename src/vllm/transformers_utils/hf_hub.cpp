@@ -27,6 +27,13 @@ const char* NonEmptyEnv(const char* name) {
   return (value != nullptr && value[0] != '\0') ? value : nullptr;
 }
 
+// Both cases are accepted, which mirrors llama.cpp's `is_valid_oid`
+// (`common/hf-cache.cpp:161 @ b10451`). An OBJECT IDENTIFIER is therefore
+// folded to one case by its caller before anything keys on it, because two
+// spellings of one identifier are one identifier. A COMMIT is deliberately not
+// folded: nothing keys an integrity rule on it, so a second spelling costs at
+// worst a second snapshot directory rather than a rule that stops firing, and
+// neither reference implementation folds it either.
 bool IsHexString(const std::string& s, size_t length) {
   if (s.size() != length) return false;
   for (const char c : s) {
@@ -421,6 +428,36 @@ std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
     // still addressable by path, and only content addressing is lost.
     if (!oid.empty() && !IsHexString(oid, 40) && !IsHexString(oid, 64)) {
       oid.clear();
+    }
+    // FOLD the identifier to one case. `IsHexString` accepts 'A' through 'F' as
+    // well as 'a' through 'f', so without this a listing that spells one
+    // identifier two ways lands TWO keys in the owner map below and the size
+    // rule compares nothing: `a.bin` at 4096 bytes under `ab23...` beside
+    // `b.bin` at 2048 bytes under `AB23...` was ACCEPTED, where the same pair
+    // in one case is refused. `HF_ENDPOINT` names the host, so the listing is
+    // input the hub does not have to answer truthfully, and a rule that one
+    // letter's case switches off is not a rule.
+    //
+    // FOLDED rather than REFUSED, because case carries no information here.
+    // Hexadecimal is case-insensitive by definition and both git and the hub
+    // emit lower case, so an upper-case spelling is another spelling of one
+    // value rather than a claim about a second object. Refusing it would reject
+    // a mirror over a difference that means nothing, which is the false
+    // positive the earlier any-duplicate rule was replaced for.
+    //
+    // The fold is applied to `oid` ITSELF and not only to the map key, because
+    // the identifier also leaves this function in `HfFile::oid` and becomes a
+    // cache file name through `HfBlobPath`. A name that kept the listing's case
+    // would split one blob across two files on a case-sensitive file system
+    // while a case-insensitive one, such as the CIFS mounts this project reads
+    // checkpoints from, collapsed them, so the same listing would populate a
+    // different cache on two hosts.
+    //
+    // `IsDegenerateOid` needs no separate repair: folding a repeated character
+    // leaves it repeated, so the fold cannot move that verdict, and it only
+    // makes the refusal quote the canonical spelling.
+    for (char& c : oid) {
+      if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
     }
 
     if (!oid.empty()) {

@@ -13,6 +13,7 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -690,6 +691,120 @@ TEST_CASE("one identifier on two files of different sizes is refused") {
   CHECK(message.find("4096") != std::string::npos);
   CHECK(message.find("2048") != std::string::npos);
   CHECK(message.find("two different sizes") != std::string::npos);
+}
+
+TEST_CASE("one identifier spelled in two cases on two sizes is still refused") {
+  // THE BYPASS. `IsHexString` accepts 'A' through 'F' as well as 'a' through
+  // 'f', so a hub that spells one identifier `ab234567...` on the first entry
+  // and `AB234567...` on the second used to land two keys in the owner map and
+  // the size rule compared nothing. The measured pair is `a.bin` at 4096 bytes
+  // and `b.bin` at 2048 bytes, which the same rule refuses the moment both
+  // spellings agree on case.
+  //
+  // `HF_ENDPOINT` names the host, so the listing is input the hub does not have
+  // to answer truthfully. A rule an attacker turns off by changing one letter's
+  // case is not a rule.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string lower =
+      "ab234567890abcdef0123456789abcdef0123456789abcdef0123456789abcde";
+  std::string upper = lower;
+  for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  REQUIRE(lower != upper);
+  hub.set_tree(std::string(R"([{"type":"file","path":"a.bin","size":4096,)") +
+               R"("lfs":{"oid":")" + lower + R"("}},)" +
+               R"({"type":"file","path":"b.bin","size":2048,)" +
+               R"("lfs":{"oid":")" + upper + R"("}}])");
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("one identifier spelled in two cases on two sizes must be refused");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find("a.bin") != std::string::npos);
+  CHECK(message.find("b.bin") != std::string::npos);
+  CHECK(message.find("4096") != std::string::npos);
+  CHECK(message.find("2048") != std::string::npos);
+  CHECK(message.find("two different sizes") != std::string::npos);
+  // The message quotes the identifier in the folded spelling, so a reader is
+  // not told two identifiers collided when one did.
+  CHECK(message.find(lower) != std::string::npos);
+}
+
+TEST_CASE("an identifier is folded to lower case before it becomes a blob name") {
+  // The same raw-string assumption reaches past the owner map. `HfFile::oid` is
+  // what `HfBlobPath` will name a cache file with, and a name that keeps the
+  // case the listing chose splits one blob across two files on a case-sensitive
+  // file system while a case-insensitive one, such as the CIFS mounts this
+  // project reads checkpoints from, collapses them. Hexadecimal is
+  // case-insensitive by definition and the hub and git both emit lower case, so
+  // the canonical spelling is the lower-case one.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string lower =
+      "ab234567890abcdef0123456789abcdef0123456789abcdef0123456789abcde";
+  std::string upper = lower;
+  for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  hub.set_tree(std::string(R"([{"type":"file","path":"a.bin","size":4096,)") +
+               R"("lfs":{"oid":")" + upper + R"("}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 1);
+  CHECK(files.at(0).oid == lower);
+}
+
+TEST_CASE("two cases of one identifier agreeing on size are still accepted") {
+  // The negative control for the fold. Folding must not convert the legitimate
+  // duplicate-content shape into a refusal, and it must not leave the two
+  // spellings looking like two different identifiers either: they are one, and
+  // both entries load.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string lower =
+      "ab234567890abcdef0123456789abcdef0123456789abcdef0123456789abcde";
+  std::string upper = lower;
+  for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  hub.set_tree(std::string(R"([{"type":"file","path":"a.bin","size":4096,)") +
+               R"("lfs":{"oid":")" + lower + R"("}},)" +
+               R"({"type":"file","path":"b.bin","size":4096,)" +
+               R"("lfs":{"oid":")" + upper + R"("}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).oid == lower);
+  CHECK(files.at(1).oid == lower);
+}
+
+TEST_CASE("an upper case degenerate identifier is refused by the degeneracy rule") {
+  // The degeneracy rule asks whether every character is the same one, which no
+  // change of case can defeat on its own, and the fold cannot break it either
+  // because folding a repeated character leaves it repeated. This case pins
+  // that, so the fold cannot silently move the rule.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  hub.set_tree(std::string(R"([{"type":"file","path":"a.bin","size":4096,)") +
+               R"("lfs":{"oid":")" + std::string(64, 'A') + R"("}}])");
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("an upper case degenerate identifier must be refused");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find("characters are all 'a'") != std::string::npos);
 }
 
 TEST_CASE("two files that share an identifier AND a size are accepted") {

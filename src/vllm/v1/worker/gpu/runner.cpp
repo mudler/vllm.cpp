@@ -1494,15 +1494,34 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // The GDN prefill conjunct is `pure_decode`'s and stays: a step with GDN
   // prefill tokens carries recurrent-prefill segmentation no decode capture was
   // built for, and the two model copies each tested it separately.
-  const std::optional<int64_t> uniform_qlen =
-      gdn_meta.num_prefill_tokens == 0
-          ? v1::ActualUniformDecodeQueryLen(
-                num_reqs, attn_meta.num_actual_tokens, attn_meta.max_query_len,
-                num_spec())
-          : std::nullopt;
+  //
+  // THE ARM ABOVE 1 IS A SPECULATIVE VERIFY AND NOTHING ELSE, and the shape
+  // alone does not say so. A single request prefilling three tokens is uniform
+  // at query length 3 by every arithmetic test upstream applies, and at k >= 2
+  // it would pass a bare `q <= 1 + k` bound straight into a DECODE capture --
+  // measured on this tree's own CPU spec fixture, where a 20-token run reported
+  // 19 "uniform spec" steps before this conjunct existed. So the widened arm
+  // additionally requires that EVERY request in the step is verifying at exactly
+  // `q - 1` drafts, read off the scheduler's own per-request draft counts. That
+  // is narrower than the shape test, never wider, and it is what makes
+  // `uniform_query_len > 1` mean what its comment says it means.
+  const std::optional<int64_t> uniform_qlen = [&]() -> std::optional<int64_t> {
+    if (gdn_meta.num_prefill_tokens != 0) return std::nullopt;
+    const std::optional<int64_t> q = v1::ActualUniformDecodeQueryLen(
+        num_reqs, attn_meta.num_actual_tokens, attn_meta.max_query_len,
+        num_spec());
+    if (!q.has_value() || *q == 1) return q;
+    const std::vector<int32_t>& per_req = step.num_draft_tokens_per_req;
+    if (static_cast<int>(per_req.size()) != num_reqs) return std::nullopt;
+    for (const int32_t drafts : per_req) {
+      if (static_cast<int64_t>(drafts) + 1 != *q) return std::nullopt;
+    }
+    return q;
+  }();
   // #1020 is titled on the word SILENTLY. A step that finds no captured shape
   // now moves a counter, on the shared path every registered model reaches.
-  v1::NoteGraphDispatch(uniform_qlen.value_or(0));
+  v1::NoteGraphDispatch(uniform_qlen.value_or(0),
+                        v1::UniformDecodeQueryLen(num_spec()));
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).

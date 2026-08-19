@@ -154,6 +154,14 @@ struct GraphDispatchStats {
   // every non-speculative engine, so a moved number is proof the widened arm
   // was reached rather than an inference from the total.
   int64_t uniform_spec_steps = 0;
+  // Uniform at a length STRICTLY BETWEEN 1 and the configured `1 + k`. This is
+  // the [#1020](https://github.com/mudler/vllm.cpp/issues/1020) population
+  // exactly: a verify step the scheduler clamped to a shorter draft prefix,
+  // still perfectly uniform, and refused by the old predicate for no reason
+  // other than that it compared against a constant. It is a SEPARATE counter
+  // from `uniform_spec_steps` because the total moves on an unclamped engine
+  // too, so only this one can witness the widening.
+  int64_t clamped_spec_steps = 0;
   // No uniform query length exists for this step: prefill, mixed, or ragged.
   // No decode graph in this tree can serve one, which is the coverage the
   // PIECEWISE arm would have to reach and does not (spec `## Owed`).
@@ -175,8 +183,10 @@ struct GraphDispatchStats {
 GraphDispatchStats GetGraphDispatchStats();
 void ResetGraphDispatchStats();
 // Records one step's dispatch decision. `query_len` is the value
-// `ActualUniformDecodeQueryLen` returned, or 0 for "no uniform length".
-void NoteGraphDispatch(int64_t query_len);
+// `ActualUniformDecodeQueryLen` returned, or 0 for "no uniform length";
+// `configured_query_len` is `UniformDecodeQueryLen(num_speculative_tokens)`,
+// which is what separates a clamped verify from a full-depth one.
+void NoteGraphDispatch(int64_t query_len, int64_t configured_query_len);
 // Records one newly opened decode-graph capture shape.
 void NoteDecodeGraphShape();
 // Records one step refused by the distinct-query-length bound.

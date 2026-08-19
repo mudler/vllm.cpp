@@ -29,14 +29,17 @@ GraphDispatchStats& Stats() {
 GraphDispatchStats GetGraphDispatchStats() { return Stats(); }
 void ResetGraphDispatchStats() { Stats() = GraphDispatchStats{}; }
 
-void NoteGraphDispatch(int64_t query_len) {
+void NoteGraphDispatch(int64_t query_len, int64_t configured_query_len) {
   GraphDispatchStats& s = Stats();
   if (query_len <= 0) {
     ++s.ragged_steps;
     return;
   }
   ++s.uniform_steps;
-  if (query_len > 1) ++s.uniform_spec_steps;
+  if (query_len > 1) {
+    ++s.uniform_spec_steps;
+    if (query_len < configured_query_len) ++s.clamped_spec_steps;
+  }
 }
 
 void NoteDecodeGraphShape() { ++Stats().capture_shapes; }

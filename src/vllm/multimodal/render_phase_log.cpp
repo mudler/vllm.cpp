@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -64,6 +65,26 @@ bool StderrEnabled() {
   return on != nullptr && on[0] != '0';
 }
 
+// THE LIVE LANE'S OWN SWITCH (#1413), and it is ON unless somebody turns it off.
+//
+// A measurement lane in the shape `VLLM_RENDER_PHASE_SAMPLER` and
+// `VLLM_LTX2_POOL_DRAIN` already take here: it exists so an A/B over what the
+// emitter itself costs runs on ONE binary. It is never a configuration, and
+// nothing in this tree sets it. The polarity is the point — `VT_H3_PROGRESS` is
+// the same instrument for MiniMax-H3 and it is opt-in, which is exactly why no
+// LTX-2.5 run has ever had one.
+//
+// READ ONCE. This is consulted at every phase boundary and every DiT forward, so
+// a `getenv` per call would put a process-environment lookup inside the
+// instrument whose cost this row claims is negligible.
+bool ProgressEnabled() {
+  static const bool on = []() {
+    const char* off = std::getenv("VLLM_RENDER_PROGRESS");
+    return off == nullptr || off[0] != '0';
+  }();
+  return on;
+}
+
 }  // namespace
 
 struct PhaseLog::Impl {
@@ -90,6 +111,9 @@ struct PhaseLog::Impl {
   size_t next_handle = 1;
   int64_t samples = 0;
   std::vector<Open> open;
+  // Per-unit tick clock for the live lane, so `last=` is the interval between
+  // two occurrences of the SAME unit rather than since any other line.
+  std::map<std::string, double> last_tick;
   std::vector<Record> records;
   DeviceByteProbe device_probe;
 
@@ -99,6 +123,15 @@ struct PhaseLog::Impl {
 
   double Now() const {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count();
+  }
+
+  // Caller holds `mu`. FLUSHED ON EVERY LINE, because the whole population this
+  // lane exists for is runs that are killed: a line still sitting in a stdio
+  // buffer when the process takes a SIGKILL is a line nobody gets, and it is the
+  // last one — the one naming the phase that was running.
+  void EmitLocked(const char* text) {
+    std::fputs(text, stderr);
+    std::fflush(stderr);
   }
 
   // Caller holds `mu`. Reads both counters once and folds them into every open
@@ -165,6 +198,7 @@ void PhaseLog::Begin() {
   std::lock_guard<std::mutex> lock(impl_->mu);
   impl_->records.clear();
   impl_->open.clear();
+  impl_->last_tick.clear();
   impl_->origin = std::chrono::steady_clock::now();
   impl_->running = true;
   impl_->render = 0;
@@ -207,8 +241,21 @@ size_t PhaseLog::Open(const std::string& name, bool span) {
     if (other.live && !other.span) leaf_already_open = true;
   }
   o.nested = leaf_already_open && !span;
+  const double opened_at = o.start;
+  const std::string opened_name = o.name;
   impl_->open.push_back(std::move(o));
   impl_->SampleLocked();
+  // W0-live (#1413): the OPEN line, which is the load-bearing half. It means the
+  // last line printed names the phase that is CURRENTLY RUNNING, and that is the
+  // whole difference between a working render and a hung one. A close-only
+  // emitter would have printed nothing at all for the 3002 s conditioning
+  // stretch, because that stretch never closed.
+  if (ProgressEnabled()) {
+    char text[256];
+    std::snprintf(text, sizeof(text), "[render] + %-24s t=%.3fs\n", opened_name.c_str(),
+                  opened_at);
+    impl_->EmitLocked(text);
+  }
   return impl_->open.back().handle;
 }
 
@@ -227,6 +274,25 @@ void PhaseLog::Close(size_t handle) {
     r.peak_device_bytes = o.peak_device;
     r.span = o.span;
     r.nested = o.nested;
+    // W0-live (#1413): what the phase COST, on the line, at the moment it ends.
+    // A reader of a killed run's log takes every completed phase's duration off
+    // this without waiting for a table that will never be written.
+    if (ProgressEnabled()) {
+      const double kGiB = 1024.0 * 1024.0 * 1024.0;
+      const double host = r.peak_host_bytes < 0 ? -1.0
+                                                : static_cast<double>(r.peak_host_bytes) / kGiB;
+      char text[320];
+      if (r.peak_device_bytes >= 0) {
+        std::snprintf(text, sizeof(text),
+                      "[render] - %-24s t=%.3fs dur=%.3fs host=%.2fGiB dev=%.2fGiB\n",
+                      r.name.c_str(), r.end, r.end - r.start, host,
+                      static_cast<double>(r.peak_device_bytes) / kGiB);
+      } else {
+        std::snprintf(text, sizeof(text), "[render] - %-24s t=%.3fs dur=%.3fs host=%.2fGiB\n",
+                      r.name.c_str(), r.end, r.end - r.start, host);
+      }
+      impl_->EmitLocked(text);
+    }
     impl_->records.push_back(std::move(r));
     impl_->open.erase(impl_->open.begin() + static_cast<std::ptrdiff_t>(i));
     return;
@@ -236,6 +302,36 @@ void PhaseLog::Close(size_t handle) {
 void PhaseLog::Sample() {
   std::lock_guard<std::mutex> lock(impl_->mu);
   impl_->SampleLocked();
+}
+
+void PhaseLog::Tick(const std::string& unit, int64_t index, const std::string& detail) {
+  if (!ProgressEnabled()) return;
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  // A tick before any scope opened starts the timeline, exactly as `Open` does.
+  // Returning silently instead would make the first unit of work of a render
+  // that took no scope disappear, which is the failure this lane exists to stop.
+  if (!impl_->running) {
+    impl_->origin = std::chrono::steady_clock::now();
+    impl_->running = true;
+  }
+  const double now = impl_->Now();
+  const std::map<std::string, double>::const_iterator previous = impl_->last_tick.find(unit);
+  char text[384];
+  if (previous == impl_->last_tick.end()) {
+    std::snprintf(text, sizeof(text), "[render]   %s %lld  %s  t=%.3fs\n", unit.c_str(),
+                  static_cast<long long>(index), detail.c_str(), now);
+  } else {
+    // `last=` IS THE DELIVERABLE. #1375 could only obtain the per-forward cost as
+    // a wall-clock interval between GPU busy/idle edges from outside the process,
+    // because `eu-stack` unwinds zero frames inside the `rc` worker container.
+    // This is the same quantity, measured by the thing doing the work, on every
+    // run including the ones that die.
+    std::snprintf(text, sizeof(text), "[render]   %s %lld  %s  t=%.3fs last=%.3fs\n",
+                  unit.c_str(), static_cast<long long>(index), detail.c_str(), now,
+                  now - previous->second);
+  }
+  impl_->last_tick[unit] = now;
+  impl_->EmitLocked(text);
 }
 
 std::vector<Record> PhaseLog::Records() const {
@@ -253,6 +349,7 @@ void PhaseLog::Reset() {
   std::lock_guard<std::mutex> lock(impl_->mu);
   impl_->records.clear();
   impl_->open.clear();
+  impl_->last_tick.clear();
   impl_->running = false;
   impl_->render = 0;
   impl_->samples = 0;
@@ -393,6 +490,10 @@ void Scope::Close() {
 }
 
 void SampleNow() { PhaseLog::Instance().Sample(); }
+
+void Tick(const std::string& unit, int64_t index, const std::string& detail) {
+  PhaseLog::Instance().Tick(unit, index, detail);
+}
 
 }  // namespace phase
 }  // namespace multimodal

@@ -1066,6 +1066,43 @@ The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
 staging is minutes paid at the front of every render. A process that loads a
 second engine starts a new timeline, so the table describes the last load.
 
+### While the render runs: the `[render]` lines
+
+The table above is written by a generation that **returns**. A render that is
+killed, aborted by a lease governor, or still going writes none, so LTX-2.5 also
+narrates itself on stderr as it goes, on the shipped default and behind no flag:
+
+```text
+[render] + load.dit                 t=0.514s
+[render] - load.dit                 t=451.203s dur=450.689s host=12.94GiB
+[render] + denoise                  t=612.240s
+[render]   dit forward 1  phase 0 step 1/30  t=612.244s
+[render]   dit forward 2  phase 0 step 1/30  t=774.256s last=162.012s
+[render]   dit forward 3  phase 0 step 2/30  t=936.301s last=162.045s
+...
+[render] - denoise                  t=10331.184s dur=9718.944s host=44.77GiB
+[render] + decode.video             t=10331.190s
+```
+
+Read it as three things:
+
+* **The last line names what is running.** A phase prints when it opens, not
+  only when it finishes, so a run that stops inside a phase still says which one.
+  Between the banner and `wrote N frames` there was previously nothing at all,
+  and a working render and a hung one were the same observation.
+* **`last=` is the per-forward cost.** Seconds since the previous DiT forward,
+  measured by the process doing the work rather than inferred from outside it.
+* **`step k/N` is exact; the forward counter has no denominator.** The sampler
+  decides how many denoiser calls a step takes and the guider decides how many
+  forwards each call is (one to four), so a total would be a guess. Two forwards
+  per step is what a guided render does with `cfg_scale != 1.0`.
+
+`VLLM_RENDER_PROGRESS=0` silences them. It is a measurement lane so an A/B over
+what the emitter costs runs on one binary, not a setting to turn off: the cost is
+one flushed `fprintf` per phase boundary and per forward — on the order of a
+hundred writes against hours of wall — and nothing is emitted per token or per
+VAE tile.
+
 Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
 binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
 required and is not the default, because omitting it resolves the checkpoint's

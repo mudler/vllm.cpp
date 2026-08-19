@@ -3981,6 +3981,30 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                  "`Ltx2DitForwardDevice` has no `perturbations` argument to take it. The guidance "
                  "resolution refuses this before the loop, so reaching it is a defect rather than "
                  "a bad request. Owed by row LTX25-GUIDED-VIDEO (#1092).");
+        // W0-live (#1413): THE tick, and it fires BEFORE the forward rather than
+        // after it. At #1375's measured ~162 s per forward on the 21.004 B model
+        // this line is the only output the process produces for minutes at a
+        // time, so it has to name the forward that is IN FLIGHT — otherwise a run
+        // killed inside forward 37 says 36 and a reader has to guess whether the
+        // missing one ran. The cost of that choice: the last forward of a
+        // completed render has no line of its own, and its duration is inside the
+        // `- denoise` boundary line.
+        //
+        // NO DENOMINATOR ON THE FORWARD COUNTER, deliberately. 60 = 30 x 2 is
+        // true of the config #1375 measured and is not structural here: the
+        // sampler decides how many denoiser calls happen and `Ltx2GuidedDenoise`
+        // decides how many forwards each call is (one to four — cond, uncond,
+        // ptb, mod, denoisers.py:100-137). The STEP fraction is exact, because
+        // `sigmas` is this recipe phase's own schedule; note that the res_2s
+        // substep passes a literal 0 and its terminal evaluation passes
+        // `n_full_steps`, so on that arm the step number is the DENOISER's index
+        // and not a monotone loop counter. The forward counter is the monotone
+        // one, which is why the progress claim rests on it.
+        ::vllm::multimodal::phase::Tick(
+            "dit forward", im.trace.dit_forwards + 1,
+            "phase " + std::to_string(phase_index) + " step " +
+                std::to_string(step_index + 1) + "/" +
+                std::to_string(static_cast<int64_t>(sigmas.size()) - 1));
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
                                                 im.compute_dtype)

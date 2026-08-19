@@ -413,7 +413,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 879 889 890 958 1054 1070 1118 1211 1237 1345 1387 1429 1431
+// 889 899 900 968 1064 1080 1128 1221 1247 1355 1397 1439 1441
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -845,10 +845,20 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     }
     im.queue = vt::CreateQueue(im.device);
     // W0: what the phase table's device column MEANS on this arm. The driver's
-    // own in-use figure, not ours — `--query-gpu=memory.used` returns `[N/A]` on
-    // GB10 (the spike §4.3), so this probe is the one device-byte instrument the
-    // gate host answers. It is installed with the queue rather than at the first
-    // phase, so every phase after the device is resolved carries the column.
+    // own in-use figure, read through the backend seam rather than by naming a
+    // vendor here — nothing below the device resolution above names one.
+    //
+    // ON CUDA IT ANSWERS -1 TODAY, and that is #1126, not a defect in this line.
+    // `CudaBackend` does not override `DeviceMemoryInfo`; ROCm is the only
+    // backend that does (`src/vt/rocm/rocm_backend.hip:358`). Wiring CUDA in
+    // would wake `Gemma4MoE`'s device-expert LRU, which is dead on CUDA for
+    // exactly that reason (`include/vllm/platforms/interface.h:68-72`), so it is
+    // a behaviour change with its own measurement and it is not an instrument's
+    // to make. The column reports -1 rather than 0, because a byte count of zero
+    // and a byte count nobody took are different facts.
+    //
+    // Installed with the queue rather than at the first phase, so every phase
+    // after the device is resolved carries the column.
     {
       const vt::DeviceType probe_type = im.device.type;
       phase::PhaseLog::Instance().SetDeviceProbe([probe_type]() -> int64_t {

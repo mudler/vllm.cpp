@@ -1045,9 +1045,17 @@ plausible-looking table is worse than an obviously incomplete one. On a
 completed 64x64/9-frame render it is under 2% of wall.
 
 `peak_device_bytes` is the **driver's** in-use figure through the backend's
-`DeviceMemoryInfo`, and it is `-1` where no probe answers — on the CPU arm, and
-on any device whose backend does not implement it. It is not zero there, because
-a byte count of zero and a byte count nobody took are different facts.
+`DeviceMemoryInfo`, and it is `-1` where no probe answers. It is not zero there,
+because a byte count of zero and a byte count nobody took are different facts.
+
+**Today it answers `-1` on CUDA as well as on the CPU**, and that is worth
+knowing before you read a table full of `-1` as a finding: `CudaBackend` does
+not implement `DeviceMemoryInfo`
+([#1126](https://github.com/mudler/vllm.cpp/issues/1126)); ROCm is the only
+backend that does. On a unified-memory board such as GB10 the `peak_host_bytes`
+column is not a poor substitute — host and device are one pool there, and
+`nvidia-smi --query-gpu=memory.used` reports `[N/A]` on that board while
+`--query-compute-apps=used_memory` answers.
 
 Two environment variables, both measurement lanes rather than configuration:
 `VLLM_RENDER_PHASE_LOG_STDERR=1` also prints the table as a fixed-width block,

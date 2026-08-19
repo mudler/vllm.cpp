@@ -20,8 +20,18 @@
 // layers are causal within their window. This routes through the new
 // vt::DFlashBlockAttention primitive (ops.h) rather than the causal
 // vt::PagedAttention every other model uses. Per-layer causality is resolved from
-// config exactly as vLLM _resolve_layer_attention (:86-146): a layer is causal iff
-// it is a sliding_attention layer (unless dflash_config.causal overrides).
+// config exactly as vLLM _resolve_layer_attention (:109-169) + _dflash_layer_causal
+// (:58-67), both @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`: a DECLARED top-level `is_causal`
+// wins, else a declared `dflash_config.causal`, else a layer is causal iff its
+// DECLARED `layer_types[i]` is `sliding_attention`. That last arm reads the
+// declared value and not the resolved layer type, so `dflash_config.use_swa` --
+// which forces SWA onto every layer -- moves the WINDOW and never the causality
+// (#1366). Both explicit arms test presence and then coerce, as upstream's
+// `bool(...)` does, so a checkpoint spelling the value `0` is honoured. The
+// top-level arm is BEYOND-PIN (SPEC-DFLASH2 W1, #1314); no DFlash1 checkpoint
+// declares the key, so their resolution is unchanged by it. See
+// ResolveQwen3DFlashAttnModes.
 //
 // Context-KV precompute (qwen3_dflash.py:548-619 precompute_and_store_context_kv)
 // and prepare_dflash_inputs are D3 (DF-DRAFT-KV-PREP); this header/cpp owns the
@@ -107,10 +117,30 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
                                    const HfConfig& config, int64_t num_taps,
                                    int32_t mask_token_id);
 
-// Resolve the per-layer attention modes from config.layer_types (and the optional
-// dflash_config overrides). Exposed for the loader + tests. Mirrors
-// _resolve_layer_attention (qwen3_dflash.py:86-146).
+// Resolve the per-layer attention modes from config.layer_types, the optional
+// dflash_config overrides, and the optional top-level `is_causal`. Exposed for
+// the loader + tests. Mirrors _resolve_layer_attention (qwen3_dflash.py:86-146 @
+// the parity pin 555967922, :109-169 @ vllm-project/vllm#52816 head
+// 19c9351904df4c63042671bc67a866ca48dc7d6f, identical body at both) and
+// _dflash_layer_causal (:58-64 @ the pin, :58-67 @ that head, where the top-level
+// `is_causal` arm is added), whose precedence the definition documents in full.
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config);
+
+// Build a DFlash draft HfConfig from the draft checkpoint's own config.json (the
+// real nested {block_size, dflash_config:{mask_token_id,target_layer_ids},
+// layer_types, ...}). Mirrors the D3 parity harness MakeConfig; kept manual
+// rather than routed through LoadHfConfig so the DFlashDraftModel architecture
+// and the nested dflash_config parse deterministically. It was `MakeDflashDraftConfig`
+// in the loader's anonymous namespace until SPEC-DFLASH2 W1 moved it here.
+//
+// It lives beside ResolveQwen3DFlashAttnModes because the two are one decision
+// split in half: this copies the named keys the draft resolution reads, and that
+// function reads them. A key this builder drops is a key that resolution can
+// never see, whatever the checkpoint declares -- which is why `is_causal` is
+// carried here and gated in tests/vllm/v1/spec_decode/test_dflash_causality.cpp.
+// The loader (src/vllm/entrypoints/model_loader.cpp, LoadDflashDraft) is the
+// production caller.
+HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c);
 
 // D11 (Part A) — DEVICE-RESIDENT append-only draft-KV store. Opaque handle (defined
 // in qwen3_dflash.cpp) holding, per request, the projected bf16 K/V for every draft

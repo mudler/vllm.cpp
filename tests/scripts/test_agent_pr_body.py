@@ -16,6 +16,7 @@ with no credentials and never depends on a live pull request.
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -38,7 +39,7 @@ PLACEHOLDER = "AGENT:MODEL [TOOL]"
 
 EXIT_OK = 0
 EXIT_CONTRACT = 1
-EXIT_REMOTE_UNVERIFIED = 3
+EXIT_UNVERIFIED = 3
 
 
 def body(assisted: str) -> str:
@@ -124,7 +125,7 @@ class OfflineContractTests(ToolHarness):
     def test_an_unreadable_body_file_is_unverified_not_a_verdict(self) -> None:
         """A message that could not be read says nothing about a message."""
         result = self.run_tool("--body-file", str(self.workspace / "absent.txt"))
-        self.assertEqual(result.returncode, EXIT_REMOTE_UNVERIFIED, result.stdout)
+        self.assertEqual(result.returncode, EXIT_UNVERIFIED, result.stdout)
         self.assertIn("UNVERIFIED", result.stderr)
 
     def test_exactly_one_of_pr_and_body_file(self) -> None:
@@ -171,7 +172,7 @@ class FetchTests(ToolHarness):
             code=1,
         )
         result = self.run_tool("--pr", "999999", gh=stub)
-        self.assertEqual(result.returncode, EXIT_REMOTE_UNVERIFIED, result.stdout)
+        self.assertEqual(result.returncode, EXIT_UNVERIFIED, result.stdout)
         self.assertIn("REMOTE_UNVERIFIED", result.stderr)
         self.assertIn("Could not resolve", result.stderr)
         self.assertNotIn("the message is empty", result.stdout + result.stderr)
@@ -179,7 +180,7 @@ class FetchTests(ToolHarness):
     def test_an_absent_gh_is_remote_unverified(self) -> None:
         stub = "#!/bin/sh\nexit 127\n"
         result = self.run_tool("--pr", "1", gh=stub)
-        self.assertEqual(result.returncode, EXIT_REMOTE_UNVERIFIED, result.stdout)
+        self.assertEqual(result.returncode, EXIT_UNVERIFIED, result.stdout)
         self.assertIn("REMOTE_UNVERIFIED", result.stderr)
 
     def test_malformed_forge_json_is_remote_unverified(self) -> None:
@@ -187,7 +188,7 @@ class FetchTests(ToolHarness):
             with self.subTest(payload=payload):
                 result = self.run_tool("--pr", "1", gh=self.gh_stub(stdout=payload))
                 self.assertEqual(
-                    result.returncode, EXIT_REMOTE_UNVERIFIED, result.stdout
+                    result.returncode, EXIT_UNVERIFIED, result.stdout
                 )
                 self.assertIn("REMOTE_UNVERIFIED", result.stderr)
 
@@ -248,6 +249,29 @@ class DelegationTests(unittest.TestCase):
         self.assertIn("scripts/agent-pr-body.py --pr", workflow)
         landing = agents.split("\n## Landing work", 1)[1].split("\n## ", 1)[0]
         self.assertIn("scripts/agent-pr-body.py", landing)
+
+    def test_the_spec_table_names_exactly_these_cases(self) -> None:
+        """The row's spec describes this suite, and a table goes stale silently.
+
+        A recorded name drifts inside the pull request that records it, and a
+        reader then reviews a table rather than a suite. The two sets are
+        compared, not sampled, and neither file is the other's source: the spec
+        is prose a human wrote and the names come from the loaded classes.
+        """
+        spec = (ROOT / ".agents/specs/gate-pr-body-trailers.md").read_text(
+            encoding="utf-8"
+        )
+        section = spec.split("\n## Tests", 1)[1].split("\n## ", 1)[0]
+        recorded = set(re.findall(r"`(test_[a-z0-9_]+)`", section))
+        module = sys.modules[__name__]
+        implemented = {
+            name
+            for value in vars(module).values()
+            if isinstance(value, type) and issubclass(value, unittest.TestCase)
+            for name in vars(value)
+            if name.startswith("test_")
+        }
+        self.assertEqual(recorded, implemented)
 
     def test_the_suite_is_registered_where_gates_run(self) -> None:
         """A suite nothing runs is not a gate."""

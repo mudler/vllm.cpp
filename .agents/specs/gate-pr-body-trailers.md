@@ -195,22 +195,30 @@ dead" failure in its purest form. Filed as
 
 All in `tests/scripts/test_agent_pr_body.py`, before the `__main__` guard,
 registered in `scripts/agent-preflight.sh` `SUITES` and in the CI step that
-already runs `tests/scripts/test_agent_gates.py`.
+already runs `tests/scripts/test_agent_gates.py`. Nineteen cases, none of which
+reaches a network.
 
 | Case | Proves |
 |---|---|
 | `test_the_exact_landed_malformed_value_is_refused` | The bytes that landed on `281b4bc76c0e` are refused offline. |
-| `test_a_filled_body_is_accepted` | A correct body passes, so the refusal above is not a constant. |
-| `test_the_template_placeholder_is_refused` | `--filled` is passed. |
-| `test_an_empty_body_read_successfully_is_a_contract_failure_not_remote_unverified` | Exit 1, not 3. |
-| `test_a_body_with_no_trailer_paragraph_is_refused` | The whole contract applies, not one trailer. |
-| `test_a_fetched_body_is_held_to_the_same_contract` | The fetching half feeds the validating half. Stubbed `gh`. |
-| `test_an_unreachable_forge_is_remote_unverified_and_never_a_verdict_about_the_body` | Exit 3, `REMOTE_UNVERIFIED`, and `gh`'s own message. Stubbed `gh`. |
-| `test_gh_is_not_invoked_by_the_offline_door` | `--body-file` makes no network call; a stub that would fail the run is never reached. |
-| `test_the_pr_number_is_rejected_unless_it_is_a_positive_integer` | No shell metacharacter reaches `gh`, proven by a stub that is never touched. |
+| `test_a_filled_body_is_accepted` | A correct body passes, so the refusal above is a verdict and not a constant. |
+| `test_the_template_placeholder_is_refused` | `--filled` is passed. That value is legal without the flag. |
+| `test_a_body_with_no_trailer_paragraph_is_refused` | The whole contract applies, not one trailer of it. |
+| `test_an_unreadable_body_file_is_unverified_not_a_verdict` | A message that could not be read says nothing about a message. Exit 3. |
 | `test_exactly_one_of_pr_and_body_file` | The argument contract. |
+| `test_the_pr_number_is_rejected_unless_it_is_a_positive_integer` | No shell metacharacter reaches `gh`, proven by a stub that stays untouched. |
+| `test_a_fetched_body_is_held_to_the_same_contract` | The fetching half feeds the validating half. Stubbed `gh`. |
+| `test_a_fetched_filled_body_passes` | The fetched arm has both verdicts, not only the refusal. |
+| `test_an_unreachable_forge_is_remote_unverified_and_never_a_verdict` | Exit 3, `REMOTE_UNVERIFIED`, `gh`'s own message, and never the checker's empty-message line. |
+| `test_an_absent_gh_is_remote_unverified` | A missing tool is unknown, not a bad body. |
+| `test_malformed_forge_json_is_remote_unverified` | Four shapes: not JSON, a list, no `body` key, a null `body`. |
+| `test_an_empty_body_read_successfully_is_a_contract_failure` | Exit 1, not 3. Read and empty is not the same state as never read. |
+| `test_gh_is_not_invoked_by_the_offline_door` | `--body-file` makes no network call, which is what makes it gateable. |
 | `test_the_rule_is_not_reimplemented` | One implementation, two callers. |
+| `test_the_checker_it_delegates_to_exists` | The delegate is a path, and a path can be moved. |
 | `test_the_landing_procedure_names_the_command` | `AGENTS.md` and `.agents/workflow.md` name it, so the entry point cannot be deleted silently. |
+| `test_the_suite_is_registered_where_gates_run` | A suite nothing runs is not a gate. |
+| `test_the_spec_table_names_exactly_these_cases` | This table is compared with the loaded suite, not sampled, so it cannot go stale inside the change that writes it. |
 
 ## Gates
 

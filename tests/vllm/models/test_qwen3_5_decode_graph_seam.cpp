@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "decode_graph_seam_harness.h"
@@ -607,4 +608,95 @@ TEST_CASE("A capture that FAILS reaches the caller; Qwen3_5DenseDecodeGraph neve
                              pool.attn_kv, pool.gdn_state),
                   std::exception);
   CHECK_FALSE(graph.captured());
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// THE CAPABILITY IS REACHED FROM A PRODUCTION STEP.
+// ───────────────────────────────────────────────────────────────────────────
+//
+// `.agents/reachability.md` and the AGENTS.md "Nothing lands dead" rule: a seam
+// capability that lands unreachable by the drivers that need it is the exact
+// failure they exist for, and a unit test that constructs the type by hand
+// proves the class works and never that anything reaches it. So this case enters
+// through `Qwen3_5DecodeGraph::Step` — the same entry the registered forward
+// calls — and asserts the PROCESS-WIDE counters, which move only inside
+// `vt::PersistentStepInput`.
+//
+// IT SETS `VT_ASYNC_EXECUTOR=1`, and that is a limit stated rather than hidden.
+// The persistent device input path is behind that lever (default OFF) plus the
+// speculative-decode arm, so on a default text-decode step the driver holds no
+// `StepDevInputs` at all and stages nothing. What this case therefore proves is
+// that the production `Step` REACHES the capability on the configuration that
+// has persistent device inputs — not that every step does. The lever is read
+// once into `Impl::dbuf` at construction, so it is set before the driver is
+// built and restored immediately after.
+namespace {
+struct ScopedEnv {
+  const char* name;
+  std::string prev;
+  bool had;
+  ScopedEnv(const char* n, const char* v) : name(n) {
+    const char* p = std::getenv(n);
+    had = p != nullptr;
+    if (had) prev = p;
+    ::setenv(n, v, 1);
+  }
+  ~ScopedEnv() {
+    if (had)
+      ::setenv(name, prev.c_str(), 1);
+    else
+      ::unsetenv(name);
+  }
+};
+}  // namespace
+
+TEST_CASE("Qwen3_5DecodeGraph::Step REACHES vt::PersistentStepInput") {
+  const HfConfig c = TinyConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+
+  StaticGraphCpu harness;
+  CachePool pool(c, /*num_blocks=*/4, /*block_size=*/16);
+  vt::ResetStepInputStats();
+  REQUIRE(vt::GetStepInputStats().binds == 0);
+
+  const ScopedEnv async_on("VT_ASYNC_EXECUTOR", "1");
+  vllm::Qwen3_5DecodeGraph graph(w, c, q, /*max_num_reqs=*/4);
+
+  // THE LEVER ALSO TURNS ON THE 2-SLOT PARITY RING, so each padded size holds
+  // two slots and consecutive steps alternate between them. Slot 0 is therefore
+  // cold on step 1 and WARM on step 3, which is where it captures — a three-step
+  // walk here rather than the two-step one the single-slot cases use. That ring
+  // is the reason the lever exists: at depth 2 the engine enqueues sample(i-1)
+  // AFTER forward(i), so a single persistent logits buffer would be overwritten
+  // before it is read.
+  graph.Step({11}, {0}, DecodeAttnMeta(0), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);  // slot 0, COLD
+  graph.Step({12}, {1}, DecodeAttnMeta(1), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);  // slot 1, COLD
+  graph.Step({13}, {2}, DecodeAttnMeta(2), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);  // slot 0, WARM: binds the persistent inputs, captures
+  REQUIRE(graph.captured());
+  const vt::StepInputStats after_capture = vt::GetStepInputStats();
+  MESSAGE("after capture: binds=" << after_capture.binds << " host_refreshes="
+                                  << after_capture.host_refreshes);
+  // Five inputs are bound unconditionally (positions, slot_mapping, block_table,
+  // seq_lens, query_start_loc) and the GDN state index only when the step
+  // carries one, so the floor is five rather than an exact count.
+  CHECK(after_capture.binds >= 5);
+
+  graph.Step({14}, {3}, DecodeAttnMeta(3), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);  // slot 1, WARM
+  graph.Step({15}, {4}, DecodeAttnMeta(4), DecodeGdnMeta(), pool.attn_kv,
+             pool.gdn_state);  // slot 0, REPLAY: stages through the seam
+  const vt::StepInputStats after_replay = vt::GetStepInputStats();
+  CHECK(after_replay.host_refreshes >= 5);
+
+  // The DEVICE arm is NOT exercised here, and saying so is the point of this
+  // line. No decode driver refreshes an input from a device source yet: the one
+  // input an asynchronous mirror patches is the token ids, and no driver has a
+  // device destination for them (see PinnedStepInputs in `qwen3_5.cpp`). The
+  // capability is landed and reached; adopting its device arm is what the
+  // `qwen3.cpp` decline needs, and the spec's `## Owed` names it.
+  CHECK(after_replay.device_refreshes == 0);
 }

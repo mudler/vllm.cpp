@@ -49,6 +49,7 @@
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W4: the shared capture seam
+#include "vt/persistent_step_input.h"  // ENG-CUDAGRAPH-BREAK W4: the persistent step inputs
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
@@ -9690,15 +9691,32 @@ static bool DecodeGraphDoubleBufferEnabled() {
 // unreproducible). Sized once at capture for the padded size S / block-table cols /
 // gdn index count. Non-owning of the SizeSlot's std::vectors — StageStepInputs copies
 // them in each step, then enqueues the async device copy.
+//
+// ENG-CUDAGRAPH-BREAK W4 (#1307): each field is now a `vt::PersistentStepInput`
+// — the capture-stable device destination BOUND together with its pinned host
+// staging block — instead of a bare pinned pointer this struct allocated and a
+// `Backend::Copy` the stager issued by hand beside it. The two halves were
+// separated by ninety lines, so nothing checked that the staged byte count and
+// the destination's size agreed; the seam refuses a refresh longer than the
+// bound capacity, which is the address-stability rule the captured graph depends
+// on.
+//
+// THE PINNED `token_ids` BLOCK IS GONE, and its absence is a finding rather than
+// a tidy-up. It was allocated here, filled by `StageStepInputs` and zeroed by
+// the poison hook, and it was NEVER uploaded and never read: `StepDevInputs`
+// has no token-id member, because the embed runs OUTSIDE the captured region
+// from the HOST vector (`EmbedInto`), so the decode graph carries no token ids
+// to the device at all. That is also why making `StepDevInputs` a seam
+// capability does not by itself close the `qwen3.cpp` async decline — the fix
+// that decline names needs a DEVICE token-id destination no driver has. See the
+// spec's `## Owed`.
 struct PinnedStepInputs {
-  Backend* b = nullptr;
-  int32_t* positions = nullptr;
-  int64_t* slot_mapping = nullptr;
-  int32_t* block_table = nullptr;
-  int32_t* seq_lens = nullptr;
-  int32_t* qsl = nullptr;
-  int32_t* gdn_state_idx = nullptr;
-  int32_t* token_ids = nullptr;
+  vt::PersistentStepInput positions;
+  vt::PersistentStepInput slot_mapping;
+  vt::PersistentStepInput block_table;
+  vt::PersistentStepInput seq_lens;
+  vt::PersistentStepInput qsl;
+  vt::PersistentStepInput gdn_state_idx;
   int64_t S = 0, R = 0, cols = 0, idx = 0;  // S = tokens, R = requests
   bool has_idx = false;
   bool ready = false;
@@ -9706,17 +9724,16 @@ struct PinnedStepInputs {
   PinnedStepInputs() = default;
   PinnedStepInputs(const PinnedStepInputs&) = delete;
   PinnedStepInputs& operator=(const PinnedStepInputs&) = delete;
-  ~PinnedStepInputs() { Free(); }
   void Free() {
-    if (b == nullptr) return;
-    for (void* p : {static_cast<void*>(positions), static_cast<void*>(slot_mapping),
-                    static_cast<void*>(block_table), static_cast<void*>(seq_lens),
-                    static_cast<void*>(qsl), static_cast<void*>(gdn_state_idx),
-                    static_cast<void*>(token_ids)})
-      if (p != nullptr) b->FreePinned(p);
-    positions = nullptr; slot_mapping = nullptr; block_table = nullptr;
-    seq_lens = nullptr; qsl = nullptr; gdn_state_idx = nullptr; token_ids = nullptr;
-    b = nullptr; ready = false;
+    positions.Unbind();
+    slot_mapping.Unbind();
+    block_table.Unbind();
+    seq_lens.Unbind();
+    qsl.Unbind();
+    gdn_state_idx.Unbind();
+    S = 0; R = 0; cols = 0; idx = 0;
+    has_idx = false;
+    ready = false;
   }
   // SPEC-DSPARK W8 (#442): `S` is TOKENS and `R` is REQUESTS. They are equal for
   // pure decode, which is why one count sufficed until a speculative verify
@@ -9724,18 +9741,21 @@ struct PinnedStepInputs {
   // the host block table and the device buffer (`cudaMemcpyAsync: invalid
   // argument`). Upstream keeps both for the same reason: its graph key is
   // BatchDescriptor(num_tokens, num_reqs, uniform).
-  void Alloc(Backend& bk, int64_t S_, int64_t R_, int64_t cols_, int64_t idx_,
-             bool has_idx_) {
+  // BINDS the destinations `dev` already owns; it does not allocate them. The
+  // device side is drawn from a DEDICATED pool so a retained input never pops a
+  // block the captured forward's own scratch then needs, and the seam
+  // deliberately does not take that decision over (see
+  // `include/vt/persistent_step_input.h`).
+  void Alloc(Backend& bk, StepDevInputs& dev, int64_t S_, int64_t R_, int64_t cols_,
+             int64_t idx_, bool has_idx_) {
     Free();
-    b = &bk; S = S_; R = R_ > 0 ? R_ : S_; cols = cols_; idx = idx_; has_idx = has_idx_;
-    positions = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
-    slot_mapping = static_cast<int64_t*>(bk.AllocPinned(sizeof(int64_t) * S));
-    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R * cols));
-    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R));
-    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (R + 1)));
-    token_ids = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
-    if (has_idx) gdn_state_idx =
-        static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * idx));
+    S = S_; R = R_ > 0 ? R_ : S_; cols = cols_; idx = idx_; has_idx = has_idx_;
+    positions.Bind(bk, dev.positions.ptr(), sizeof(int32_t) * S);
+    slot_mapping.Bind(bk, dev.slot_mapping.ptr(), sizeof(int64_t) * S);
+    block_table.Bind(bk, dev.block_table.ptr(), sizeof(int32_t) * R * cols);
+    seq_lens.Bind(bk, dev.seq_lens.ptr(), sizeof(int32_t) * R);
+    qsl.Bind(bk, dev.query_start_loc.ptr(), sizeof(int32_t) * (R + 1));
+    if (has_idx) gdn_state_idx.Bind(bk, dev.gdn_state_idx.ptr(), sizeof(int32_t) * idx);
     ready = true;
   }
 };
@@ -9815,26 +9835,26 @@ static void StageStepInputs(Dev d, Slot& s) {
   PinnedStepInputs& pin = s.pin;
   StepDevInputs& dev = *s.dev;
   const int64_t S = pin.S, R = pin.R, cols = pin.cols;  // tokens, requests
-  std::memcpy(pin.positions, s.positions.data(), sizeof(int32_t) * S);
-  std::memcpy(pin.slot_mapping, s.attn_meta.slot_mapping.data(), sizeof(int64_t) * S);
-  std::memcpy(pin.block_table, s.attn_meta.block_table_tensor.data(),
-              sizeof(int32_t) * R * cols);
-  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * R);
-  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (R + 1));
-  std::memcpy(pin.token_ids, s.token_ids.data(), sizeof(int32_t) * S);
+  // ENG-CUDAGRAPH-BREAK W4 (#1307): each line is the memcpy-into-pinned PLUS the
+  // asynchronous H2D into the SAME device address, which the seam holds together
+  // so the pair cannot drift apart. The destination address is unchanged by a
+  // refresh BY CONSTRUCTION, which is what the captured graph baked.
+  pin.positions.RefreshFromHost(d.q, s.positions.data(), sizeof(int32_t) * S);
+  pin.slot_mapping.RefreshFromHost(d.q, s.attn_meta.slot_mapping.data(),
+                                   sizeof(int64_t) * S);
+  pin.block_table.RefreshFromHost(d.q, s.attn_meta.block_table_tensor.data(),
+                                  sizeof(int32_t) * R * cols);
+  pin.seq_lens.RefreshFromHost(d.q, s.attn_meta.seq_lens.data(), sizeof(int32_t) * R);
+  pin.qsl.RefreshFromHost(d.q, s.attn_meta.query_start_loc.data(),
+                          sizeof(int32_t) * (R + 1));
+  // Skipping the refresh and re-uploading the previous step's staged bytes are
+  // the same device state, because the staging block still holds them; the skip
+  // is the one that does not move bytes to say so.
   if (pin.has_idx && dev.has_gdn_idx &&
       s.gdn_meta.non_spec_state_indices_tensor.has_value())
-    std::memcpy(pin.gdn_state_idx,
-                s.gdn_meta.non_spec_state_indices_tensor->data(),
-                sizeof(int32_t) * pin.idx);
-  d.b.Copy(d.q, dev.positions.ptr(), pin.positions, sizeof(int32_t) * S);
-  d.b.Copy(d.q, dev.slot_mapping.ptr(), pin.slot_mapping, sizeof(int64_t) * S);
-  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * R * cols);
-  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * R);
-  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (R + 1));
-  if (pin.has_idx && dev.has_gdn_idx)
-    d.b.Copy(d.q, dev.gdn_state_idx.ptr(), pin.gdn_state_idx,
-             sizeof(int32_t) * pin.idx);
+    pin.gdn_state_idx.RefreshFromHost(
+        d.q, s.gdn_meta.non_spec_state_indices_tensor->data(),
+        sizeof(int32_t) * pin.idx);
 }
 
 // Test-only (VT_ASYNC_EXECUTOR_POISON): immediately AFTER StageStepInputs enqueued the
@@ -9849,10 +9869,16 @@ template <class Slot>
 static void MaybePoisonStagedInputs(bool poison, Slot& s) {
   if (!poison || !s.pin.ready) return;
   PinnedStepInputs& pin = s.pin;
-  std::fill(pin.positions, pin.positions + pin.S, 0);
-  std::fill(pin.slot_mapping, pin.slot_mapping + pin.S, 0);
-  std::fill(pin.seq_lens, pin.seq_lens + pin.S, 0);
-  std::fill(pin.token_ids, pin.token_ids + pin.S, 0);
+  // The STAGING block is what a true asynchronous DMA is still reading, so
+  // corrupting it is what races the copy. `token_ids` is not in this list any
+  // more because its pinned block is gone: it was never uploaded, so zeroing it
+  // could never have poisoned anything (see PinnedStepInputs).
+  const auto zero = [](vt::PersistentStepInput& c) {
+    if (c.staging() != nullptr) std::memset(c.staging(), 0, c.capacity());
+  };
+  zero(pin.positions);
+  zero(pin.slot_mapping);
+  zero(pin.seq_lens);
 }
 
 struct Qwen3_5DecodeGraph::Impl {
@@ -10219,7 +10245,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
+      s.pin.Alloc(b, *s.dev, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     // ENG-CUDAGRAPH-BREAK W4 (#1307): the capture is the SHARED SEAM's, not this
@@ -10701,7 +10727,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
+      s.pin.Alloc(b, *s.dev, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     // ENG-CUDAGRAPH-BREAK W4 (#1307): the capture is the SHARED SEAM's, not this

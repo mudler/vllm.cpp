@@ -314,6 +314,13 @@ struct Args {
   // an empty map resolve to the 999-per-modality default, so a server started
   // without either flag refuses nothing it used to serve.
   vllm::MultiModalConfig multimodal;
+  // ── The `clip` multimodal projector (row `LOAD-GGUF-MMPROJ`, #821) ────────
+  // llama.cpp's `--mmproj`: the SECOND GGUF file, beside a `.gguf` --model.
+  // Empty (default) == no projector == every load that existed before the row.
+  // Deliberately explicit: a sibling `mmproj*.gguf` is NOT auto-discovered,
+  // because a directory holding two unrelated models must not silently fuse
+  // them.
+  std::string mmproj_path;
 };
 
 // ── Accepted-and-inert serve arguments (SERVE-RECIPE-ARGS, #606) ────────────
@@ -408,6 +415,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--speculative-config '<json>']\n"
          "               [--[no-]language-model-only]\n"
          "               [--limit-mm-per-prompt '<json>']\n"
+         "               [--mmproj <mmproj-*.gguf>]\n"
          "               [--speech-model <checkpoint-dir>] "
          "[--speech-family <name>]\n"
          "               [--speech-device 0|1]\n"
@@ -595,6 +603,15 @@ Args ParseArgs(int argc, char** argv) {
       a.offload_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--mmproj") {
+      // llama.cpp's own spelling for the second file (`b10451`
+      // `tools/mtmd/mtmd-cli.cpp`). NOT validated here: unlike the JSON flags
+      // above, whose value can be refused without touching the disk, this is a
+      // path whose contents decide the answer — and the loader already refuses
+      // it BY NAME before the tokenizer and before any language weight byte, so
+      // a second check here would be a second implementation of the same
+      // refusal rather than an earlier one.
+      a.mmproj_path = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--language-model-only" ||
                flag == "--no-language-model-only") {
       // arg_utils.py:1276 over a bool field, which _compute_kwargs gives
@@ -1204,6 +1221,9 @@ int VllmServerMain(int argc, char** argv) {
     // the byte-identical no-offload path.
     engine_params.offload_config = parsed_offload_config;
     engine_params.weight_residency = parsed_weight_residency;
+    // --mmproj: the second GGUF (LOAD-GGUF-MMPROJ, #821). Empty leaves the
+    // loader on its single-file path, byte-identically.
+    engine_params.mmproj_path = args.mmproj_path;
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The
     // parse validates method/k here; n_predict + the resolved k are finalized in

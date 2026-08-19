@@ -14,8 +14,9 @@ model-run-in-a-lease that this spec's NVFP4 gate depends on;
 [#809](https://github.com/mudler/vllm.cpp/issues/809) / PR
 [#876](https://github.com/mudler/vllm.cpp/pull/876) owns the GGUF architecture
 dispatch this spec builds on and which is still OPEN.
-**Lifecycle:** `READY` (all three rows). No `src/`, `include/` or `tests/` file
-changes here — this change is the spec and the records.
+**Lifecycle:** `LOAD-GGUF-MMPROJ` is `PARTIAL` (W1 landed; see
+[W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` and
+`QUANT-QWEN38-27B-NVFP4-ARM` are `READY`.
 **Owner:** unassigned
 
 ## Why this is not optional
@@ -730,6 +731,98 @@ in Git history with a diff, an author and a date, as
 `AGENTS.md` §"Changing the rules or a checker" requires of an exception. This is
 visible debt, not a precedent: the next unrelated rider gets its own branch.
 
+## W1 outcome
+
+`LOAD-GGUF-MMPROJ` is implemented and `PARTIAL`. What follows is what W1
+actually delivered, what it deliberately did NOT deliver, and the one place it
+departs from the [Port map](#load-gguf-mmproj) above.
+
+### What landed
+
+- **The flag, on all three surfaces.** `EngineParams::mmproj_path`
+  (`include/vllm/entrypoints/model_loader.h`), `vllm_model_params.mmproj_path`
+  (`include/vllm.h`, **C ABI v22**, appended so a zero-initialised v21 struct is
+  byte-identical), and `--mmproj` on the OpenAI server. The spelling is
+  llama.cpp's, which is the flag a holder of these artifacts already types.
+- **The reader.** `include/vllm/model_executor/models/clip_mmproj_gguf.h` +
+  `src/vllm/model_executor/models/clip_mmproj_gguf.cpp`. It reads the
+  projector's own `clip.*` metadata into the SAME
+  `multimodal::Qwen3VLVisionConfig` that
+  `minimax_h3_vision_gguf.cpp::MiniMaxH3EncoderVisionConfig` builds from
+  `visual.*`, and the `v.*` / `mm.*` tensors into the SAME
+  `multimodal::Qwen3VLVisionWeights`. No second tower, no second config type.
+- **The temporal-patch join, and its refusal.** llama.cpp stores the `conv3d`
+  patch embedding as two `conv2d` halves summed over the two frames
+  (`qwen2vl.cpp::clip_graph_qwen2vl::build_inp_with_temporal_merge` at
+  `b10451`), so the join INTERLEAVES them per channel into the
+  `[out, C * T * p * p]` operand the tower reads. A concatenation has the same
+  size and the same multiset of values, so the gate checks every position rather
+  than the length. A file carrying only `v.patch_embd.weight` is refused by
+  name, with both feature counts in the message.
+- **MuseGlimmer's refusal, reached.** `clip.projector_type == "muse-glimmer"`
+  routes to `MuseGlimmerRefuseMmproj()`, whose only caller before this row was
+  `tests/vllm/models/test_muse_glimmer_gguf.cpp`. **This is a change to
+  MuseGlimmer's behaviour**, made deliberately and stated here: a user who
+  passes `mmproj-kquant.gguf` now gets that recorded message from the loader
+  instead of getting no way to name the file at all.
+- **Placement.** The projector is opened, validated and READ after the
+  architecture resolve and the device-fit refusal and **before the tokenizer**,
+  so a projector this build cannot load costs a message rather than a 17 GB map
+  followed by one.
+
+### What did NOT land, and is owed
+
+- **Nothing runs the tower.** `LoadedEngine::vision_tower()` holds it; no
+  forward reads it. There is no multimodal request path on the C ABI (the ABI
+  v19 note in `include/vllm.h` already records this for the input limits) and no
+  GGUF image/video driver. Owed by `QUANT-QWEN38-27B-GGUF-ARM` (#821 W3), and
+  listed under `## Owed` below.
+- **No real projector has been read.** Every gate here is a synthetic GGUF. The
+  334-tensor accounting against `mmproj-BF16.gguf` belongs to
+  `QUANT-QWEN38-27B-GGUF-ARM`, which is where the committed manifest lives.
+- **Deepstack is carried, not gated on real weights.** The discovery is exercised
+  synthetically; Qwen3.8-27B's projector has no DeepStack, which agrees with its
+  `deepstack_visual_indexes: []`, so that leg stays not-applicable here.
+
+### The one departure from the Port map, and why
+
+The Port map says to add "a second, explicitly-named optional projector pointer"
+to `ModelSource`. **W1 does not add it.** The tower is loaded by the loader and
+held by `LoadedEngine`, not passed through `ModelSource` into an architecture's
+weight loader.
+
+The reason is `AGENTS.md` §"Nothing lands dead". No `Qwen3_5*Weights` has a
+vision member, and no architecture's registry loader reads one: on the
+safetensors side the tower is a SEPARATE reader (`LoadQwen3_5MoeVision`) over the
+same shards, and it too has no production caller today. A `ModelSource::mmproj`
+pointer in W1 would therefore be the "unpassed parameter" shape
+[`reachability.md`](../reachability.md) names — a field the loader fills and no
+loader reads — which is worse than not adding it. `LoadedEngine` is also where a
+multimodal request path will look for the tower, and it is where the file
+actually belongs: a projector is a separate FILE the engine was handed, not part
+of the model checkpoint.
+
+The seam is not lost. When W3 gives the tower a consumer, the consumer decides
+whether it wants the tower through `ModelSource` or off the engine, and it can
+add the field in the same change that reads it. **This is a design change from
+the committed spec and it wants an operator's ratification rather than silence.**
+
+### Evidence
+
+- Red first, captured by building the tree with the reader stubbed and the
+  loader hook absent: `test_clip_mmproj_gguf` 8/8 cases failed (0 passed),
+  `test_gguf_mmproj_reach` 4/5 failed. Green after: 8/8 and 5/5, 272 and 19
+  assertions, both `Status: SUCCESS!`.
+- Reachability mutation (the one `AGENTS.md` requires): deleting the
+  `LoadQwen3VLVisionFromClipMmproj` call site in `model_loader.cpp` reds
+  `test_gguf_mmproj_reach` (1 case, 3 assertions) and leaves
+  `test_clip_mmproj_gguf` **fully green at 8/8**. That contrast is the evidence,
+  not the red alone: the reader's own gate cannot tell the difference.
+- Guard mutations: deleting the `RefuseUnsupportedClipMmproj` call reds 2 cases;
+  deleting the non-`.gguf` `--mmproj` refusal reds 1; turning the patch-embedding
+  interleave into a concatenation reds 128 of the join's assertions. The tree was
+  restored byte-for-byte after each, verified by sha256.
+
 ## Dependencies and blockers
 
 Named here rather than under `## Owed`, because `## Owed` means this spec owns
@@ -753,8 +846,19 @@ the issue and each of these is owned by another row.
 Owned by this spec's three rows, and unpaid until an implementation change pays
 them:
 
-- [#821](https://github.com/mudler/vllm.cpp/issues/821) itself — every acceptance
-  bullet it lists is still open, and this change is its spec, not its closure.
+- [#821](https://github.com/mudler/vllm.cpp/issues/821) itself — its GGUF-arm
+  and NVFP4-arm acceptance bullets are still open. W1 closes only the
+  second-projector-file half of it.
+- **A consumer for the loaded vision tower.** W1 loads it and
+  `LoadedEngine::vision_tower()` holds it; no forward reads it and no C-ABI or
+  server request can feed it an image. Owned by `QUANT-QWEN38-27B-GGUF-ARM`
+  (W3 in the [Work breakdown](#work-breakdown)), tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821). Named here rather than
+  left to be discovered: a tower that loads and never runs is exactly the shape
+  [`reachability.md`](../reachability.md) exists to keep visible.
+- **The 334-tensor accounting against the REAL `mmproj-BF16.gguf`.** Every W1
+  gate is synthetic. The committed manifest and the live-file comparison belong
+  to `QUANT-QWEN38-27B-GGUF-ARM`.
 - The mirrored bytes and a **locally computed** sha256 for
   `Qwen3.8-27B-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `model.safetensors` and
   `model_mtp.safetensors`. Nothing in this spec records a hash it did not
@@ -778,15 +882,19 @@ them:
 
 ## Now
 
-All three rows are `READY`: the gap is verified against `origin/main`
-`836c13c35` and
-against the artifacts' own headers, and this spec is committed before any
-implementation. No `src/`, `include/` or `tests/` file changes in this change —
-`git diff origin/main..HEAD` over those three paths is empty, and that emptiness
-is the claim.
+`LOAD-GGUF-MMPROJ` is `PARTIAL`: W1 landed, and what it did and did not deliver
+is [W1 outcome](#w1-outcome). Its blocker cleared before it started — PR #876
+merged as `250db75a2`, so the GGUF architecture dispatch names an unsupported
+file by its own architecture instead of falling through to qwen3_5's assert.
+A user can now pass `--mmproj mmproj-BF16.gguf` beside a `.gguf` model, and the
+projector is read, refused by name, or accepted with its tower held on the
+engine. Nothing runs that tower yet, and that is `## Owed`.
 
-Next action is `LOAD-GGUF-MMPROJ`, because it needs no lease, no checkpoint
-download and no oracle, and it is the only one of the three whose blocker
-(PR #876) is already in flight. The Q4_K_M manifest and accounting gate is the
-next CPU-only unit after it. Both token gates wait on #857 and #1185
-respectively, and are not scheduled here.
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` stay `READY`, both
+verified against the artifacts' own headers.
+
+Next action is W2, the Q4_K_M manifest and accounting gate, because it needs no
+lease, no oracle and no GPU, and because the `block_count - nextn_predict_layers`
+correction it pins is the single most likely way to get a fluent, wrong model out
+of that file. Both token gates wait on #857 and #1185 respectively, and are not
+scheduled here.

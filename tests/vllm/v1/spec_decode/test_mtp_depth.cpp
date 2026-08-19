@@ -737,3 +737,40 @@ TEST_CASE("W6: a spec-OFF engine admits query length 1 and nothing else") {
   // capture path, which `support_static_graph_mode()` is supposed to refuse.
   CHECK(st.capture_shapes == 0);
 }
+
+// THE CONTROL FOR THE CONJUNCT ABOVE, and the case that makes it non-vacuous.
+//
+// The spec-OFF case cannot see a missing conjunct, because `num_spec()` is 0
+// there and the `q <= 1 + k` bound alone refuses everything above 1. The failure
+// it has to catch is a PREFILL on a SPECULATING engine: "hello world" is two
+// tokens in this fixture's BPE, so at k=3 the prefill step is uniform at query
+// length 2, is inside the bound, and is strictly below the configured 4 -- it
+// would land in the CLAMPED bucket and be handed to a decode capture, which
+// `BuildPaddedDecode` would then rewrite as two single-token requests.
+//
+// One request generating ONE token is one step, and that step is the prefill.
+// So every speculative bucket must be empty and the step must be reported as
+// serving no captured shape at all.
+TEST_CASE("W6: a multi-token PREFILL is not a verify shape") {
+  const HfConfig c = MakeDenseConfig();
+  vllm::v1::ResetGraphDispatchStats();
+  LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3),
+                   MakeMtpHead(c));
+  const RequestOutput out = eng.engine().generate("hello world", Greedy(1), "req");
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 1);
+  const vllm::v1::GraphDispatchStats st = vllm::v1::GetGraphDispatchStats();
+  CAPTURE(st.uniform_steps);
+  CAPTURE(st.uniform_spec_steps);
+  CAPTURE(st.clamped_spec_steps);
+  CAPTURE(st.ragged_steps);
+  // A step ran, so nothing below is vacuous.
+  REQUIRE(st.uniform_steps + st.ragged_steps > 0);
+  CHECK(st.uniform_spec_steps == 0);
+  CHECK(st.clamped_spec_steps == 0);
+  // And it was reported as serving no captured shape, which is the positive
+  // half: "not admitted" has to be OBSERVABLE or the two counters above are
+  // satisfied by a step that was never counted at all.
+  CHECK(st.ragged_steps >= 1);
+}

@@ -17,9 +17,9 @@ them.
 recorded for this row under `## Git integration` in
 `.agents/developer-preferences.md`. The only recorded answer there is
 `SPEC-DFLASH2`'s, and AGENTS.md makes one pull request the default when no
-answer is recorded. The shape is not cosmetic here: W1 lands the cost and growth
-assertions of `## Tests to port` items 2 and 3 RED against unchanged code, so a
-split would leave `main` red between W1 and W3. See `## Work breakdown`.
+answer is recorded. The shape is not cosmetic here: W1 lands the cost assertion
+of `## Tests to port` item 2 RED against unchanged code, so a split would leave
+`main` red between W1 and W3. See `## Work breakdown`.
 
 ## Now
 
@@ -104,8 +104,16 @@ produced them and the tables say which.**
   It exists to answer one question, whether the recorded constants reproduce.
   They do not, and the direction is the one contention predicts: `a` x 65,535
   read 37,564.80 ms against Harness B's 24,358.86 ms, a 54% inflation at roughly
-  double the load. The growth ratios it re-derived are in `## Tests to port`
-  item 3 and they replace the figures a previous revision recorded there.
+  double the load. The growth ratios it re-derived are gone with the assertion
+  they were derived for; `## Tests to port` item 3 records that ruling.
+
+**None of those three harnesses was committed, and that is the root cause of
+three rounds of irreproducible constants.** `tools/bench/bpe_encode_cost.cpp`
+is the committed one, added with this revision. It is not any of A, B or C: it
+is a fourth driver, it re-derived the English figures within the factor that
+load alone explains, and its build and run commands are in `## Gates`. Every
+figure below predates it and none can be re-derived from the tree at the
+revision that recorded it.
 
 The **shape** is what all three harnesses agree on, and it is the result. Every
 absolute figure below is a contended minimum, and Harness C is the evidence that
@@ -317,7 +325,7 @@ selects this version. The implementing row records the version it read.
 | `mod.rs:9`, `model.rs:19` identifier-keyed `MergeMap` | `MergeRanks = unordered_map<string, int32_t>` in `include/vllm/tokenizer/bpe.h` | an identifier-pair-keyed table built at load |
 | `src/vllm/tokenizer/bpe.cpp::MergeKey` | one `std::string` per probe | deleted; there is no key to build |
 | `model.rs:180-189` `MergeTokenOutOfVocabulary` | no rule; the failure appears per request in `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` | refused at load, naming the missing token, on `FromHfJson` AND `FromGguf` |
-| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: `src/vllm/tokenizer/tokenizer.cpp::MergeKey` concatenates `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
+| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: `src/vllm/tokenizer/bpe.cpp::MergeKey` concatenates `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
 | `model.rs:382-460` `merge_word` | `src/vllm/tokenizer/tokenizer.cpp::EncodePlainSp`'s symbol builder | unchanged in behaviour, emitting identifiers |
 | `model.rs:475-496` word cache | absent | still absent, and out of scope |
 
@@ -451,9 +459,9 @@ implementer does not inherit them by accident:
   heap entry, because it reuses the string-keyed `MergeRanks`. The
   implementation interns, so its constant is lower and its growth ratio is
   closer to `n log n` than the prototype's. **A bound derived from the
-  prototype's ratio is therefore not a bound for the implementation**, and
-  `## Tests to port` item 3 requires the implementing row to re-derive it on
-  its own code.
+  prototype's ratio is therefore not a bound for the implementation.** No such
+  bound is asserted anywhere in this row: `## Tests to port` item 3 records the
+  ruling that dropped it.
 
 ## Defence in depth
 
@@ -473,8 +481,10 @@ assumed.** Two facts, both read at this base:
   100 MB is what a request body may be.
 
 Extrapolate the measured `n^2.01` fit, taking `t = c n^2` with `c` from the
-25,345.61 ms at 65,536 bytes. A 100 MB body of a single character class is then
-on the order of `6e7` s, several hundred CPU-days of one core, for one request.
+25,345.61 ms at 65,536 bytes — one session's reading at load average 4 to 12,
+which is the term that has since been shown to move a figure like this one by
+54%. A 100 MB body of a single character class is then on the order of `6e7` s,
+several hundred CPU-days of one core, for one request.
 That extrapolation spans three decades beyond the largest measured point, so
 read it as an order of magnitude and not as a measurement. What is measured is
 that 64 KB already costs 25 s. Either way the conclusion does not depend on the
@@ -496,8 +506,7 @@ it if a later row adds one:
 After the fix, 64 KB encodes in tens of milliseconds. The prototype takes
 15.485 ms on the English case and 7.40 ms to 28.07 ms on the single-class cases.
 The guard therefore protects against a future regression rather than against
-today's cost. File it as its own
-issue when the row lands.
+today's cost. File it as its own issue when the row lands.
 
 ## Dependencies
 
@@ -536,9 +545,9 @@ before any algorithm changes.
 
 | W | Deliverable | Reviewable on its own because |
 |---|---|---|
-| **W1** | The equivalence corpus and harness of `## Tests to port` item 1, plus the cost and growth assertions of items 2 and 3, all against UNCHANGED code | items 1 and 6 pass, items 2 and 3 are red. That red is the defect, recorded before anything moves |
+| **W1** | The equivalence corpus and harness of `## Tests to port` item 1, plus the cost assertion of item 2, all against UNCHANGED code | items 1 and 6 pass, item 2 is red. That red is the defect, recorded before anything moves |
 | **W2** | The identifier-keyed merge table and the load-time refusal, with `BpeMerge` still doing the O(n^2) scan over identifiers | W1 stays exactly as green and as red as it was. Only the representation moved |
-| **W3** | The heap merge, the linked symbol list, the comparator, the staleness checks | W1's items 2 and 3 turn green and nothing else changes |
+| **W3** | The heap merge, the linked symbol list, the comparator, the staleness checks | W1's item 2 turns green and nothing else changes |
 | **W4** | The idle-host re-measure, the `## Outcome` section, `docs/STATUS.md` and `docs/BENCHMARKS.md` | the code is frozen; this is the record |
 
 W2 before W3 is deliberate. Interning and the heap are separable in the tree
@@ -548,17 +557,18 @@ also the order the `new_id` staleness test needs: that comparison cannot be
 written against a string-keyed table.
 
 **These four waves are four commits in ONE pull request, and the split is a
-review aid rather than a landing plan.** W1 lands items 2 and 3 red against
+review aid rather than a landing plan.** W1 lands item 2 red against
 unchanged code, so between W1 and W3 the gate is failing by construction. A
 separate W1 pull request would put that red on `main` and leave every other
 row's gate unable to tell its own failure from this one. AGENTS.md's default
 with no recorded preference is one pull request, none of its three split cases
 applies here, because no helper needs a base-reachable spec, the scope is one
 function, and W1 through W3 all write product code. The commit order still
-proves the spec came first. If the developer prefers a split, the reds must land
+proves the spec came first. If the developer prefers a split, the red must land
 `SKIP`-ped with the reason and the owning wave named, and W3 must remove the
-skip in the same change that turns them green. A permanently skipped assertion
-is not an acceptable resting state.
+skip in the same change that turns it green. A permanently skipped assertion
+is not an acceptable resting state, which is also why item 3 is dropped outright
+rather than deferred.
 
 ## Risks
 
@@ -596,66 +606,86 @@ prove after.
    identifiers so the capture is reproducible. Where an entry cannot be captured
    from HF, the test records that entry as self-referential in its own comment
    rather than letting the whole corpus inherit an oracle it does not have.
-2. **A cost bound that fails today, and it is the ROBUST of the two.** Encode
-   one pretoken of a stated size and assert an upper bound on wall time. State
-   the bound as an absolute figure with the margin argued, not as a ratio
-   against a same-run baseline. At 65,536 bytes of English through the Mistral
-   golden the two sides are 25,345.61 ms and, for the prototype, 15.485 ms, so a
-   bound placed anywhere in the middle of that has **three orders of magnitude**
-   of headroom. A runner would have to be a thousand times slower than this box
-   to cross it. That margin, not the fact that it is a single measurement, is
-   what makes this assertion survive a contended runner.
-3. **A growth-shape assertion, which is the TIGHTER of the two and needs care.**
-   Encode at n and at 4n and assert the ratio sits below a bound that quadratic
-   growth cannot satisfy and the implemented algorithm can. **Use a step of at
-   least 4x, and take the minimum of k repetitions rather than one shot.** Both
-   requirements are measured below, and so is the limit of what they buy:
+2. **A cost bound that fails today. It is the ONLY timing assertion this row
+   ships, and item 3 records why.** Encode one pretoken of a stated size and
+   assert an upper bound on wall time. State the bound as an absolute figure
+   with the margin argued, not as a ratio against a same-run baseline. At 65,536
+   bytes of English through the Mistral golden the two sides read 25,345.61 ms
+   and, for the prototype, 15.485 ms — one session's readings at load average 4
+   to 12, tabulated in `## The SentencePiece family pays it on ordinary
+   English`, not constants. What survives the load is the SEPARATION: a bound
+   placed between them has **three orders of magnitude** of headroom, so a
+   runner would have to be a thousand times slower than that box to cross it.
 
-   - **A 2x step cannot separate the two algorithms at all under load.** Eight
-     independent min-of-8 sweeps of the prototype at 131,072 and 262,144 bytes,
-     load average 50 to 57 on the 20-core box, 2026-08-19, gave 3.328, 2.525,
-     1.573, 4.414, 1.485, 3.193, 1.916 and 1.372. Quadratic growth predicts
-     4.0, and **the observed maximum 4.414 is already above it**. A 2x
-     assertion therefore fires on the correct algorithm before it ever fires on
-     the defect, which is why the step has to be at least 4x.
-   - **A 4x step still separates, with about 1.8x of margin.** Eight
-     independent min-of-8 sweeps at 65,536 and 262,144 bytes, same binary, same
-     session, same load, gave 7.202, 8.920, 4.182, 2.800, 6.626, 4.198, 4.507
-     and 8.586. Quadratic predicts 16 and the observed maximum is 8.920, so a
-     bound sits in (8.92, 16).
+   That margin is the whole argument, and it is cheap to check that load does
+   not eat it. Re-derived for this revision with the committed harness
+   `tools/bench/bpe_encode_cost.cpp` on the same box on 2026-08-19, min-of-3,
+   at load average 194/209/196 — an order of magnitude busier than the table
+   above — English through the Mistral golden read 12.802 ms at 1,000 bytes and
+   606.424 ms at 8,000 bytes, against that table's 5.61 ms and 358.83 ms. So
+   roughly 1.7x on load alone, and the identifier counts (267 and 2,134) came
+   back exactly. **The identifiers reproduce and the times do not**, which is
+   the whole shape of this row in two numbers, and 1.7x against a thousandfold
+   margin is why item 2 and not item 3 is the gate.
+3. **A growth-shape assertion. CONSIDERED AND REJECTED — do not implement it.**
+   The shape would have been: encode at n and at 4n, and assert the ratio sits
+   below a bound that quadratic growth cannot satisfy and the implemented
+   algorithm can. It is not in this row's scope, it is not deferred to the
+   implementing row, and it must not land `SKIP`-ped. **Operator ruling,
+   2026-08-19.** It is recorded here at length so that nobody proposes it again
+   from the same reasoning that produced it twice.
 
-   **Min-of-k is necessary and it is not sufficient, and this spec no longer
-   claims otherwise.** A first revision specified a 2x single-shot ratio and
-   called it "the assertion that survives a slow runner"; a second replaced that
-   with a 4x min-of-8 sweep and certified a 9% spread and a (6.03, 16) band from
-   four sweeps. Neither figure reproduced. The eight-sweep re-derivation above,
-   taken at load 50 to 57 rather than the earlier revision's lighter and
-   unrecorded load, spreads 3.2x at both step sizes. The two halves of a ratio
-   are separate, independently preemptible measurement windows, and taking a
-   minimum inside each half does not make them move together. **The stability of
-   this assertion on a contended runner is therefore UNESTABLISHED**, and the
-   claim that a 4x step is "four times more stable" is withdrawn rather than
-   restated with a new number.
+   The ruling rests on a re-derivation by an independent reviewer, on the
+   20-core box at load average 176 to 268:
 
-   The red side, re-derived on the current code at the same shape and load,
-   min-of-3, four sweeps: 8,000 to 32,000 bytes costs 12.680, 14.740, 16.468 and
-   15.276, against the 16x `n^2` predicts. Placing that beside the prototype's
-   worst gives the real picture: **the window between the prototype's slowest
-   ratio, 8.920, and the current code's fastest, 12.680, is 1.42x.** That is the
-   whole budget this assertion has on a loaded host, and it is the reason item 2
-   and not this item is the robust gate.
+   - **The red and green distributions OVERLAP at that load.** Ten sweeps of
+     8,000 to 32,000 bytes on the CURRENT, defective code gave 4.654, 9.213,
+     9.629, 11.989, 12.115, 13.206, 15.241, 16.017, 16.376 and 17.896. Five of
+     the ten fall below 12.680, which a previous revision of this document
+     certified as the defective code's MINIMUM, and one falls below 8.920,
+     which the same revision certified as the prototype's MAXIMUM. A bound
+     cannot be placed between two distributions that overlap.
+   - **The mechanism is this row's own diagnosis turned against its own gate.**
+     In the sweep that produced 4.654, the 8,000-byte leg read 4,383 ms against
+     the other nine sweeps' 650 to 1,878 ms. A preempted DENOMINATOR alone
+     dropped the defective code to a ratio the correct algorithm is supposed to
+     own. Min-of-k inside each half does not help: the two halves of a ratio are
+     separate, independently preemptible measurement windows, and a minimum
+     taken inside one of them says nothing about how the other one was
+     scheduled.
+   - **The margin argument for a 2x step was FALSIFIED.** A previous revision
+     argued that a 2x step is unusable because a correct algorithm was observed
+     at 4.414, above the 4.0 that quadratic predicts. That 4.414 was a
+     single-session artifact. Twenty-four min-of-8 sweeps of HF `tokenizers`
+     0.22.2 — the reference implementation this design mirrors, at the version
+     [`../oracles/transformers.md`](../oracles/transformers.md) pins — ranged
+     0.756 to 3.349 at load average 198 to 228, and never once exceeded 4.0.
+     The crossing does not reproduce, so it is recorded here as a negative
+     result and is not evidence for anything.
 
-   Two obligations follow for the implementing row. It **re-derives the bound
-   from min-of-k sweeps on its own code**, because the interned implementation
-   removes the string key and the merged string the prototype still builds and
-   should sit nearer the ~4.6 that `n log n` predicts than the prototype's 2.8
-   to 8.9. And it records the sweep, the `k`, the load average, and the host
-   beside the bound, so that the next reader can tell a real regression from a
-   busy box. A bound copied from the prototype is not a bound for the
-   implementation, and a bound derived on a loaded host is not a bound at all.
-   If the assertion cannot be made to hold with margin on the CI runner, it
-   lands `SKIP`-ped with this paragraph as the reason rather than tuned until it
-   passes.
+   **Item 2 carries the timing gate alone, and that is the right split rather
+   than a reduction.** Item 2's separation is about three orders of magnitude
+   and is immune to load in the only sense that matters: a 1.7x inflation, which
+   is what an order-of-magnitude load increase actually cost above, does not
+   approach it. The best separation this assertion was ever certified at was
+   1.42x, a figure that did not itself reproduce, and the separation actually
+   observed above is none at all. A gate whose margin is smaller than the noise of the
+   host it runs on does not measure the code; it measures the box, and on a red
+   day it reports the defect as fixed.
+
+   Three revisions of this document each certified a growth window, and no
+   reviewer reproduced any of them: a 2x single-shot ratio called "the assertion
+   that survives a slow runner"; a 4x min-of-8 sweep with a certified 9% spread
+   and a (6.03, 16) band; and an eight-sweep re-derivation with a 1.42x window.
+   The pattern is not carelessness in any one of them. It is that this quantity
+   is not stable on a shared host, and the correct response to a third
+   irreproducible certification is to stop certifying it.
+
+   What the implementing row owes instead is nothing here: it implements item 2,
+   and if it wants a growth reading for its `## Outcome`, it takes one with
+   `tools/bench/bpe_encode_cost.cpp`, records the sweep, the `k`, the load
+   average and the host beside it, and states it as a session reading. A reading
+   is not a gate, and this item is the record of why this one cannot become one.
 4. **The leftmost tie.** Extend the existing `test_bpe.cpp` case into one that
    distinguishes the two orders on a longer symbol list.
 5. **A stale-entry case.** A merge sequence where a queued candidate is
@@ -695,8 +725,10 @@ The CPU tier can prove, with no other host:
 - Token-identifier equivalence before and after, on both tokenizer families,
   over a corpus that contains the failing regime.
 - The tie-break order, the stale-entry handling, and the load-time refusal.
-- That the cost bound and the growth shape are red before the change and green
-  after.
+- That the cost bound of `## Tests to port` item 2 is red before the change
+  and green after. It is the row's only timing assertion; item 3 records the
+  growth-shape assertion that was considered and rejected, and no gate here
+  lands `SKIP`-ped.
 - Through `test_tokenizer_parity`, `test_tokenizer_parity_mistral`,
   `test_tokenizer_parity_deepseek` and `test_tokenizer_parity_gpt4o`, that all
   four already-gated families still produce their recorded identifiers.
@@ -715,15 +747,60 @@ That needs the bf16 27B server on `dgx:gpu0` under an `rc` lease, and it is the
 row's closing evidence rather than its correctness gate. Run it only after the
 CPU gates are green.
 
+**The harness is committed, and this is the recipe AGENTS.md §Gates requires.**
+`tools/bench/bpe_encode_cost.cpp` times `Tokenizer::Encode` on one synthetic
+input at stated sizes through a stated `tokenizer.json`, min-of-k, and prints
+the 1/5/15-minute load average beside every row it emits. Its own header carries
+the same two commands and states that its output is a session reading and never
+a bound. Build it, from the repository root:
+
+```sh
+g++ -O2 -std=c++20 -I include -I src -isystem third_party \
+    tools/bench/bpe_encode_cost.cpp \
+    src/vllm/tokenizer/bpe.cpp src/vllm/tokenizer/tokenizer.cpp \
+    src/vllm/tokenizer/pretokenizer.cpp src/vllm/tokenizer/unicode_data.cpp \
+    src/vllm/model_executor/model_loader/gguf_reader.cpp \
+    src/vllm/model_executor/model_loader/read_only_file_mapping.cpp \
+    -o /tmp/bpe_encode_cost
+```
+
+and run it against either committed golden:
+
+```sh
+/tmp/bpe_encode_cost tests/parity/goldens/tokenizer_mistral/tokenizer.json \
+    --case english --repeats 5 --sizes 1000,8000
+/tmp/bpe_encode_cost tests/parity/goldens/tokenizer_qwen36/tokenizer.json \
+    --case a --case newline --repeats 5 --sizes 1000,4096
+```
+
+It is registered as no test and CI runs it never. CI does COMPILE it, as the
+never-linked OBJECT library `vllm_bpe_encode_cost` in `CMakeLists.txt`, so it
+cannot rot behind a `Tokenizer::Encode` or `FromHfJson` signature change while
+still being the only artifact these figures can be reproduced from. **It is
+deliberately not a gate**: item 3 rules that a growth gate is not viable on a
+shared runner, and the cost bound of item 2 belongs in the test suite rather
+than in a bench driver. This harness exists so that a human or an agent can
+re-derive a figure deliberately, on a host whose load they have looked at.
+
 Required before any speed figure in this spec is accepted: an idle-host,
 same-binary A/B re-measure with the load average recorded. No figure above was
 taken on an idle host. Harness A ran at load average 130 to 190 and Harness B at
 4 to 90, on a 20-core box with another session compiling and testing throughout.
 Harness B reports the minimum of a repetition set, which is the least contended
 estimate the box could give, and that is not the same thing as an idle
-measurement. The two harnesses agree on the shape and on every absolute figure
-to within about 25%, which is what makes the shape safe to reason from and the
-constants not yet quotable.
+measurement.
+
+**The harnesses agree on the SHAPE and they do not agree on the constants.** An
+earlier revision of this section said the harnesses agreed "on every absolute
+figure to within about 25%". That sentence named Harness A and B and was never
+updated when Harness C was added, and Harness C contradicts it directly: the
+same binary on the same input read 37,564.80 ms against Harness B's 24,358.86 ms
+at roughly double the load, which is **54%**. A fourth reading taken for this
+revision with the committed harness moved the 8,000-byte English figure by about
+1.7x on load alone. So the agreement that makes this row's argument is the
+exponent, the ratio against HF on identical output, and the direction — every
+one of which is invariant across all four — and no absolute figure in this
+document is quotable as a constant.
 
 ## Owed
 

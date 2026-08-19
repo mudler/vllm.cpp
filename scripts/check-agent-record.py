@@ -620,12 +620,16 @@ ENGINE_PREFIXES = (
 # thing a token gate provably cannot see. It is also not a benchmark row: the encode
 # runs synchronously on the HTTP worker five lines before the only length check, so
 # `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
-# MEASURED: 64 KB of ordinary English prose costs 25.3 s through the committed
-# Mistral golden against HF `tokenizers` 0.22.2's 10.1 ms on the same file for
-# byte-identical identifiers, and the fit over 1 KB to 64 KB has exponent 2.01.
-# Those are contended minima on a 20-core box at load 4-90, not idle-host
-# constants; the spec's `## Gates` owes the idle-host re-measure. The exponent,
-# not the constant, is what makes this a row.
+# MEASURED, and stated as the two SESSION-INVARIANT quantities only: over 1 KB to
+# 64 KB of ordinary English prose the fit through the committed Mistral golden has
+# exponent 2.01, and at 64 KB our cost is 2,507x HF `tokenizers` 0.22.2's on the
+# same file for byte-identical identifiers. Both are ratios taken inside one
+# session, so contention cancels. The ABSOLUTE milliseconds are deliberately not
+# repeated here: they moved 54% between two runs of one binary on one input, so a
+# constant copied into this comment would be a fourth place for a number nobody
+# can reproduce to drift. They live in the spec's tables, each beside its own load
+# average, and `## Gates` owes the idle-host re-measure. The exponent, not the
+# constant, is what makes this a row.
 # `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
 # Bumped for a real new row, never to make a failing state transition pass.
 ENGINE_ROWS = 168

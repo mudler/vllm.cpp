@@ -129,6 +129,17 @@ HfConfig MakeDflashGgufConfig(const GgufFile& gguf) {
   c.raw = nlohmann::json::object();
   c.raw["block_size"] = ReqI64(gguf, p + "block_size");
 
+  // SPEC-DFLASH2 W1 (#1314): `dflash.attention.causal` is the GGUF spelling of
+  // the HF top-level `is_causal`, and it resolves in the same precedence --
+  // ahead of `dflash_config.causal` and ahead of the pattern-derived rule
+  // above. The published DFlash2 GGUF declares it FALSE beside an all-true
+  // sliding-window pattern, so the pattern alone answers CAUSAL for every layer
+  // and the drafter loses acceptance with nothing to see. Optional: a DFlash1
+  // GGUF declares no such key and keeps the pattern-derived answer.
+  if (const GgufValue* causal = gguf.FindKv(p + "attention.causal")) {
+    c.raw["is_causal"] = KvI64(*causal, p + "attention.causal") != 0;
+  }
+
   // target_layer_ids: llama.cpp's DFlashModel::set_gguf_parameters writes
   // `[i + 1 for i in target_layer_ids]`, so the stored list is OFFSET BY ONE
   // from the HF value the engine expects. Undo it here. Getting this wrong is
@@ -157,6 +168,22 @@ HfConfig MakeDflashGgufConfig(const GgufFile& gguf) {
   dcfg["mask_token_id"] = KvI64(*mask, "tokenizer.ggml.mask_token_id");
   c.raw["dflash_config"] = std::move(dcfg);
   return c;
+}
+
+bool IsDflash2Gguf(const GgufFile& gguf, std::string* matched_key) {
+  // Ordered so the message names the most specific key a reader can grep for.
+  static const char* kDflash2Keys[] = {
+      "dflash.selector_rank",
+      "dflash.selector_top_k",
+      "dflash.conv_kernel_size",
+  };
+  for (const char* key : kDflash2Keys) {
+    if (gguf.FindKv(key) != nullptr) {
+      if (matched_key != nullptr) *matched_key = key;
+      return true;
+    }
+  }
+  return false;
 }
 
 // Owns the dequantized bf16 buffers the resolver hands out views over. The

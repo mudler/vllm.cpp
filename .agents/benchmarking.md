@@ -81,6 +81,14 @@ sudo nvidia-smi -lgc 2100        # pin, before the first leg
 sudo nvidia-smi -rgc             # release, after the last one
 ```
 
+**This works on the host path only.** Inside an `rc` lease `nvidia-smi -lgc`
+returns `LGC_RC=4`, "The current user does not have permission to change
+clocks", even as root, measured 2026-08-19 on `dgx:gpu0` in three jobs. Fleet
+devices are reachable by lease only, so for them the SM clock can be SAMPLED and
+not pinned, and a pairing may be refused on within-run spread with no lever to
+fix it. Read
+[`environment.md`](environment.md) before you plan a paired series.
+
 Pinning is a **shared-host mutation**. Never run `-lgc` or `-rgc` while another
 session holds `$HOME/gpu.lock` — it silently reprices their in-flight
 measurement, which is the very defect this section exists for. Take the lock,

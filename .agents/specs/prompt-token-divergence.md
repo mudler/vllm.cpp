@@ -201,9 +201,9 @@ question needs the box, and needs no GPU beyond a server that is already up:
    (`model_loader.h:381`, returning `LoadedEngine::tokenizer_` at
    `model_loader.h:528`); `api_server.cpp:1229` passes that object's ADDRESS
    into the non-owning `ApiServer::tokenizer_` (`api_server.h:340`); and
-   `model_loader.cpp:1453` constructs `input_processor_(tokenizer_, …)`, whose
+   `model_loader.cpp:1528` constructs `input_processor_(tokenizer_, …)`, whose
    member is a REFERENCE (`input_processor.h:152`) to the same object.
-   `model_loader.cpp:1454` and `:1433` take the same object's address a fourth
+   `model_loader.cpp:1529` and `:1508` take the same object's address a fourth
    and fifth time, for `output_processor_(&tokenizer_)` and for
    `MakeNativeBackendFactory(tokenizer_, …)`. What the
    two endpoints do NOT share is the HANDLER around it: body parse, string

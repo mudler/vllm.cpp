@@ -107,16 +107,23 @@ void PersistentStepInput::Copy(Queue& q, const void* src, size_t bytes,
            "PersistentStepInput: refresh is longer than the bound capacity. The "
            "destination address is baked into a captured graph and cannot grow; "
            "rebind and recapture for the new shape");
-  if (bytes == 0) return;
-  if (from == StepInputSource::kHost && staging_ != nullptr) {
-    // Through the PINNED block, so the upload is a true asynchronous DMA rather
-    // than an effectively host-synchronous pageable copy — and so the source
-    // address a capture bakes belongs to this cell rather than to the caller's
-    // frame.
-    std::memcpy(staging_, src, bytes);
-    b_->Copy(q, device_, staging_, bytes);
-  } else {
-    b_->Copy(q, device_, src, bytes);
+  // A ZERO-BYTE REFRESH SKIPS THE COPY AND STILL COUNTS. The counters and
+  // `last_source_` below answer "which arm refreshed this cell", which is the
+  // observable this capability adds; returning early from here would leave a
+  // step that DID choose an arm reporting the previous one, or `kUnset` on the
+  // first step, and `host_refreshes` would under-count. The copy is what has
+  // nothing to do, not the decision.
+  if (bytes > 0) {
+    if (from == StepInputSource::kHost && staging_ != nullptr) {
+      // Through the PINNED block, so the upload is a true asynchronous DMA rather
+      // than an effectively host-synchronous pageable copy — and so the source
+      // address a capture bakes belongs to this cell rather than to the caller's
+      // frame.
+      std::memcpy(staging_, src, bytes);
+      b_->Copy(q, device_, staging_, bytes);
+    } else {
+      b_->Copy(q, device_, src, bytes);
+    }
   }
   if (from == StepInputSource::kHost) {
     ++host_refreshes_;

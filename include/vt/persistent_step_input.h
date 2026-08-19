@@ -76,6 +76,10 @@ enum class StepInputSource {
 // Segment counts tell a two-segment capture from an eager step; these tell a
 // step that re-read the device mirror from one that uploaded a stale host
 // vector, which no token gate and no segment count can distinguish.
+//
+// A ZERO-BYTE refresh counts, and sets `last_source()`. What it skips is the
+// COPY; the arm was still chosen, and a counter that missed it would under-count
+// exactly the thing it exists to make visible.
 struct StepInputStats {
   int64_t binds = 0;
   int64_t host_refreshes = 0;
@@ -109,6 +113,24 @@ void ResetStepInputStats();
 //     source. This is the arm the `qwen3.cpp` decline's own comment names as the
 //     real fix: read the identifiers from a stable device buffer instead of
 //     racing a host read against a device write.
+//
+//     **THIS ARM LANDS WITH NO PRODUCTION CALLER, named rather than implied.**
+//     `grep -rn RefreshFromDevice src/ include/` returns its definition and
+//     nothing else, and `last_source()`/`StepInputSource` have no production
+//     reader either. It is a staged slice under AGENTS.md's "Nothing lands
+//     dead": the capability the decline needs is the DESTINATION — a device
+//     token-id buffer the captured graph reads — and no driver has one (see the
+//     decline in `qwen3.cpp`'s `DenseDecodeGraphForward`). Writing this arm's
+//     caller before that destination exists would be the tenth hand-rolled copy
+//     this row removes. Owner: row `ENG-CUDAGRAPH-BREAK`, the stage that gets a
+//     `dgx` window WITH the Qwen3-0.6B/4B checkpoints the battery needs; listed
+//     under `## Owed` in `.agents/specs/eng-cudagraph-break.md` and tracked by
+//     #1179 and #323. The HOST arm IS reached, and its own reach is bounded
+//     rather than claimed whole: `qwen3_5.cpp`'s `StageStepInputs` routes both
+//     Qwen3.5 decode drivers through it whenever `dbuf` is set, which is
+//     `VT_ASYNC_EXECUTOR=1` (default OFF, `docs/ENVIRONMENT.md`) or a
+//     speculative verify step. `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`
+//     holds that call site with a mutation that reds only the reachability case.
 //
 // WHERE THE CALL SITE SITS decides what a REPLAY sees, and both placements are
 // legal:

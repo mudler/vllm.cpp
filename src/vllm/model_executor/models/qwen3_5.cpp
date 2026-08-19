@@ -10247,6 +10247,17 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
         return false;
       }();
+      // UNBIND BEFORE THE DESTINATION DIES, the same rule the shape-change path
+      // above states, applied to the other site that replaces `s.dev`. The
+      // assignment below destroys the PREVIOUS `StepDevInputs`, returning its
+      // pool blocks to the free list while `s.pin`'s cells still name them, and
+      // the rebind is four statements later at `s.pin.Alloc`. Reachable: the
+      // `aux_taps` branch resets the graph and clears `warm` WITHOUT calling
+      // `s.pin.Free()`, so the next warm step arrives here with the cells bound.
+      // Harmless today only because `Unbind()` does not dereference — which is
+      // exactly the argument the shape-change site refused to rely on. Free costs
+      // nothing extra: `Alloc` calls `Free()` first regardless.
+      s.pin.Free();
       {
         ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
         s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
@@ -10734,6 +10745,17 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
         return false;
       }();
+      // UNBIND BEFORE THE DESTINATION DIES, the same rule the shape-change path
+      // above states, applied to the other site that replaces `s.dev`. The
+      // assignment below destroys the PREVIOUS `StepDevInputs`, returning its
+      // pool blocks to the free list while `s.pin`'s cells still name them, and
+      // the rebind is four statements later at `s.pin.Alloc`. Reachable: the
+      // `aux_taps` branch resets the graph and clears `warm` WITHOUT calling
+      // `s.pin.Free()`, so the next warm step arrives here with the cells bound.
+      // Harmless today only because `Unbind()` does not dereference — which is
+      // exactly the argument the shape-change site refused to rely on. Free costs
+      // nothing extra: `Alloc` calls `Free()` first regardless.
+      s.pin.Free();
       {
         ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
         s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(

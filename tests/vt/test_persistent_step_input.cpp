@@ -157,6 +157,40 @@ TEST_CASE("A SHORTER refresh is legal and leaves the padding tail alone") {
   CHECK(in.host_refreshes() == 1);
 }
 
+// A ZERO-BYTE REFRESH IS STILL A REFRESH, and the counters are the reason this
+// matters. `host_refreshes`/`device_refreshes` and `last_source()` exist to
+// answer "which arm refreshed this cell", which no token gate and no segment
+// count can see. A zero-byte call that returned before touching them would leave
+// the cell reporting the PREVIOUS arm — `kUnset` on the first step — over a step
+// that did choose an arm, so the observable would under-count exactly the shape
+// it was added to make visible. No driver passes zero today (every byte count is
+// a positive product and `gdn_state_idx` is guarded by `has_idx`), which is why
+// this is a counter defect and not a numerics one: the copy has nothing to move
+// either way.
+TEST_CASE("A ZERO-BYTE refresh is counted and records its arm") {
+  RecordingCaptureBackend b;
+  vt::Queue q = b.CreateQueue();
+  int32_t* dst = DevVec(b, {7, 7, 7, 7});
+  const std::vector<int32_t> src = {1, 2, 3, 4};
+
+  PersistentStepInput in;
+  in.Bind(b, dst, kBytes);
+  vt::ResetStepInputStats();
+
+  in.RefreshFromHost(q, src.data(), 0);
+  CHECK(in.host_refreshes() == 1);
+  CHECK(in.last_source() == StepInputSource::kHost);
+  CHECK(vt::GetStepInputStats().host_refreshes == 1);
+
+  in.RefreshFromDevice(q, dst, 0);
+  CHECK(in.device_refreshes() == 1);
+  CHECK(in.last_source() == StepInputSource::kDevice);
+  CHECK(vt::GetStepInputStats().device_refreshes == 1);
+
+  // And it moved NOTHING, which is the half that must stay true.
+  CHECK(Read(dst, kN) == std::vector<int32_t>{7, 7, 7, 7});
+}
+
 TEST_CASE("An UNBOUND cell refuses a refresh rather than dropping it") {
   RecordingCaptureBackend b;
   vt::Queue q = b.CreateQueue();
@@ -192,7 +226,7 @@ TEST_CASE("RefreshFromDevice refuses a null source") {
 // A refresh issued INSIDE a capture is recorded, so it runs on every REPLAY,
 // re-reading whatever its source holds at that moment. That is the decline's own
 // wording for the fix — "read the identifiers at REPLAY time from a stable
-// device buffer" (`qwen3.cpp:1086`) — made executable.
+// device buffer" (`qwen3.cpp`'s `DenseDecodeGraphForward`) — made executable.
 //
 // Both arms are asserted in ONE case, because asserting only the device arm
 // would stay green if the two arms had collapsed into each other. The host arm

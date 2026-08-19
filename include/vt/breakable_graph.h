@@ -255,6 +255,14 @@ class BreakableGraph {
   void Replay(Queue& q);
 
   size_t segment_count() const { return segments_.size(); }
+  // THE OPAQUE HANDLE OF ONE SEGMENT, for a caller that must hand it to a
+  // profiler or a debugger. It is NOT an invitation to interpret it: spec
+  // `## Risks/decisions` D4 requires every acquisition and release to go through
+  // `Backend::EndCaptureGraph` and `Backend::DestroyGraph` so
+  // ENG-CUDAGRAPH-DEDUP (#1162) can interpose at the backend without editing
+  // this container. The one caller is the `VT_BENCH_PROFILE_CONTROL` replay
+  // marker in `qwen3_5.cpp`, which is a bench-only build.
+  void* segment(size_t i) const { return i < segments_.size() ? segments_[i] : nullptr; }
   size_t break_count() const { return break_fns_.size(); }
   bool captured() const { return !segments_.empty(); }
   int64_t replay_count() const { return replays_; }

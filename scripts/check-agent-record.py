@@ -577,7 +577,18 @@ ENGINE_PREFIXES = (
 # in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
 # whose only caller is a test, and that refusal becomes reachable production code the
 # moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
-# 165: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
+# 165 since 2026-08-19: +`SPEC-DFLASH2` (the `DFlash2DraftModel` architecture: a
+# grouped dynamic depthwise convolution inside each draft block, and a candidate
+# selector that replaces the per-slot argmax with a scored path walk over the target
+# head's top-K). Genuinely new and not expressible by `SPEC-DFLASH` beside it: that
+# row owns the DFlash mechanism and reached `DONE`, and upstream itself carries
+# DFlash2 as a SECOND architecture rather than as a change to the first -- DFlash1
+# gains two subclass seams and keeps every behaviour, so a `DFlashDraftModel`
+# checkpoint resolves exactly as it does today. BEYOND-PIN on vLLM PR 52816 (OPEN at
+# head `19c93519`, base `9842d701`); the parity pin `555967922` does not carry the
+# architecture at all, so this row does not advance the pin. `READY`, spec
+# `specs/dflash2-spec-decode.md`, issue #1314.
+# 166: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
 # container image and no release archive can obtain a checkpoint: the runtime
 # stage carries no Python and no `curl`, while `docker/Dockerfile:188-192`
 # already sets `HF_HOME=/cache` and declares the `/cache` volume for a fetch
@@ -588,7 +599,7 @@ ENGINE_PREFIXES = (
 # DFlash draft alone and never downloads. `READY`, spec
 # `specs/hf-model-download.md`, issue #1280.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 165
+ENGINE_ROWS = 166
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

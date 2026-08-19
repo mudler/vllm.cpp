@@ -129,9 +129,12 @@ void ResetStepInputStats();
 //     comparison AND on `device_refreshes`.
 //
 //     WHAT IS STILL UNREAD, named rather than implied. `last_source()` and
-//     `StepInputSource` have no production reader — every caller of either is a
-//     test. And the call site above sits OUTSIDE the captured region, so this arm
-//     is read once per step and never at REPLAY time. Replay-time reading is what
+//     `StepInputSource` have no production reader — every caller that reads a
+//     VALUE is a test. The one non-test caller is
+//     `include/vllm/model_executor/models/step_token_ids.h:122`, a forwarding
+//     wrapper that nothing itself calls, so it moves no value anywhere. And the
+//     call site above sits OUTSIDE the captured region, so this arm is read
+//     once per step and never at REPLAY time. Replay-time reading is what
 //     the `qwen3.cpp` decline actually needs, and neither that destination nor
 //     that placement exists in the dense driver the decline guards. Owner: row
 //     `ENG-CUDAGRAPH-BREAK`, the stage that gets a

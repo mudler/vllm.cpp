@@ -1800,8 +1800,17 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   give their padded size slot a `vllm::StepTokenIds`
   (`include/vllm/model_executor/models/step_token_ids.h`), whose destination is a
   device buffer with a stable address and whose refresh takes the DEVICE arm
-  whenever the runner's mirror is live; `last_source()` and `StepInputSource`
-  gain their reader with it. Reached from `ModelRegistry::Forward` through
+  whenever the runner's mirror is live. **`last_source()` and `StepInputSource`
+  do NOT gain a reader with it, and an earlier draft of this entry said they
+  did.** What gains a production caller is `RefreshFromDevice`; the ARM
+  OBSERVABLE stays unread. `grep -rn 'last_source()' src/` returns NOTHING; the
+  six `CHECK`s in `tests/vt/test_persistent_step_input.cpp` are the only readers
+  of a value; and `include/vllm/model_executor/models/step_token_ids.h:122`
+  forwards to `cell_.last_source()` but is itself never called. The two headers
+  (`include/vt/persistent_step_input.h`, `step_token_ids.h`) state the same
+  thing, and a record asserting a reader exists is exactly the drift the header
+  repairs in this change were made to end. Reached from `ModelRegistry::Forward`
+  through
   `qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp` and
   `glm4_moe_lite_registry.cpp`, and gated at
   `tests/vllm/models/test_moe_async_device_ids.cpp`, which enters at that entry
@@ -1969,12 +1978,22 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   every assertion passes**
   ([#1390](https://github.com/mudler/vllm.cpp/issues/1390), found while landing
   [#1305](https://github.com/mudler/vllm.cpp/issues/1305), not caused by it).
-  Measured at `5f68e60df`, which is `origin/main` exactly, CPU Release: `8 cases,
-  7 passed, 1 failed, 135 assertions, 135 passed, 0 failed`, exit 139, with
-  `W6: two spec shapes of EQUAL S and different q get two graphs` reporting
-  `CRASHED: SIGSEGV`. **The assertion counter cannot see it** — the number a
-  reader greps says 135/135 — so only the exit status and the `CRASHED` line
-  carry the verdict. It is ORDER-DEPENDENT: `-tc="W6*"` alone passes at 9/9,
+  Measured at `5f68e60df`, which is `origin/main` exactly, CPU Release: **exit
+  139**, with `W6: two spec shapes of EQUAL S and different q get two graphs`
+  reporting `CRASHED: SIGSEGV`. **No assertion count from that file carries a
+  verdict, and the first record of this entry treated one as though it did.**
+  That run printed `8 cases, 7 passed, 1 failed, 135 assertions, 135 passed, 0
+  failed`, which reads 135/135 to a grep. The counts are NOT REPRODUCIBLE: three
+  consecutive runs of ONE unchanged baseline binary gave 6 passed with 2 failed
+  and 141 assertions, then no summary at all, then no summary at all. **The
+  general rule, stated properly: on a crashing suite no assertion count means
+  anything, because the process dies before the harness totals it — only the exit
+  code carries a verdict.** The exit status and the `CRASHED` line are the stable
+  observations, and the crash case and site are reproducible where the counts are
+  not. `.agents/engine-matrix.md`'s row and the pull-request body carry this same
+  correction. `.agents/issue-index.md`'s row is APPEND-ONLY and cannot be edited,
+  so it still presents `8 cases, 7 passed, 1 failed, 135 of 135` as the
+  measurement; **this spec and the issue are the authority over that row.** It is ORDER-DEPENDENT: `-tc="W6*"` alone passes at 9/9,
   exit 0, so the crash needs state an earlier case in the same process left
   behind. `gdb` puts the fault inside `vt::cpu::PagedAttentionKernel` on a
   threadpool worker, which is what a block table or slot mapping that does not
@@ -2286,3 +2305,42 @@ what would have to be true first rather than scheduling it. **That is a
 publishable negative in the same shape `ENG-CUDAGRAPH-DEDUP` published: the
 machinery composes and the coverage it would buy has no measured demand on this
 hardware.**
+
+
+### #1305, the device-token mirror: two BOUNDED residuals the fresh review named
+
+Both are recorded rather than repaired, each with the reasoning that bounds it.
+Neither is a defect this change introduced into a shipped path.
+
+**R1 — the four shape refusals now name the WRONG FILE for three of their four
+callers.** Hoisting the duplicated shape check into one helper in
+`src/vllm/model_executor/models/qwen3_5.cpp` moves `__FILE__`/`__LINE__` for all
+four refusals to `qwen3_5.cpp:562`, so a refusal raised from any of the other
+three callers reports a location in a file that caller does not live in. **Not
+repaired, and the bound is what makes that acceptable:** no test asserts these
+strings — a grep for the message and for each of the four `what` values returns
+only comments — and the `what` prefix still carries CALLER IDENTITY, so the
+reader learns which driver disagreed even when the file token is wrong. The
+audience is also narrow: a shape refusal is a "the runner and the model disagree"
+message, read once, in anger, from a log, by somebody who greps the message text
+and not the file token. Repairing it means threading a caller location through the
+helper, which is more machinery than the defect it removes. Owner: row
+**`ENG-CUDAGRAPH-BREAK`**, if a later stage gives these refusals a gate.
+
+**R2 — the two rewritten call sites in files this change was not repairing are
+UNGATED, and were before it.** `src/vllm/model_executor/models/qwen3.cpp:213`
+and `src/vllm/model_executor/models/qwen3_5.cpp:7829` are covered only by
+checkpoint-gated skips — `test_qwen3_dense_async_serving` and
+`test_qwen36_async_serving`, both reporting `assertions: 0` on this box, which is
+a SKIP wearing a pass — and `tests/vllm/models/test_qwen3_decode_graph_seam.cpp:341-349`
+gates the graph DECLINE, never the consumption. What the hoist changed at those
+two sites is the ARGUMENT LIST alone; the shared BODY they now call is gated, so
+the residual ungated surface is two argument lists rather than two shape checks.
+**Net the hoist IMPROVES coverage:** before it, a defect in any one of the four
+private copies was invisible; after it, a defect in the shared body reds
+`tests/vllm/models/test_moe_async_device_ids.cpp`. The gap is PRE-EXISTING — those
+two files' async arms had no CPU-reachable gate at the base commit and have none
+now — and this change neither created nor widened it. Owner: row
+**`ENG-CUDAGRAPH-BREAK`**, the stage that gets a `dgx` window WITH the
+Qwen3-0.6B/4B checkpoints, which is the same window the decline and the depth-2
+battery already owe runs to.

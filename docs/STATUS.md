@@ -218,8 +218,26 @@ not met.
 
 W3 (2026-08-19, #1291) migrates the three remaining plain batched drivers:
 Qwen3-Coder MoE, Voxtral text and DeepSeek-V2 MLA. Each captures and replays
-through the seam in FULL mode, and each landed with its own gate. Six drivers
-read the framework capture switch for themselves before this row; two remain.
+through the seam in FULL mode, and each landed with its own gate.
+
+W4 (2026-08-19, #1307) migrates the two Qwen3.5 drivers, so six of the nine are
+on the seam. Six drivers read the framework capture switch for themselves before
+this row; none do now, and the one read left in `src/` is the seam's own.
+
+W4 also makes the persistent device input path a shared capability rather than
+one driver's private code. `vt::PersistentStepInput` binds a capture-stable
+device destination together with its pinned host staging block, and refreshes it
+in place from a host source or a device one. The device arm is what a decode
+graph needs to read this step's real identifiers while an asynchronous scheduler
+is patching them on the GPU.
+
+Its own premise turned out to be wrong, and that is the stage's main result. The
+decode graph carries NO token ids to the device in any driver: the embedding runs
+outside the captured region from a host vector, and the one driver credited with
+the capability held a pinned token-id block that was filled every step and never
+uploaded. So the classic-dense decline that costs a shipped model its decode
+graph under asynchronous serving is not one refactor away from removable. It
+stands, and the work it needs is now named rather than assigned.
 
 W3 also closed a gate that could not fail. The mode a driver captures in was
 unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole

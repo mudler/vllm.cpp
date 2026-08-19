@@ -2660,6 +2660,151 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
   vllm_video_engine_free(engine);
 }
 
+
+// ─── W0 of LTX25-DEVICE-RESIDENCY: the phase instrument (issue #1010) ────────
+//
+// WHAT THIS GATES, and why the campaign put it first. Before this case the whole
+// LTX-2.5 render path emitted ONE line per render — the example's `wrote N
+// frames` — so a run that spent 1731 s somewhere could not say WHERE
+// (#1087 measures that phase and says in its own text "Do not guess it from the
+// duration"), and #1024's GPU-zero window is known NOT to be the denoise
+// (`ltx2_video.cpp` selects `Ltx2StreamDitToDevice` / `Ltx2DitForwardDevice` on
+// `on_device`) and NOT to be the decode (no frame had been written). A campaign
+// staged on that profile would be spending months against a subject nobody had
+// named. `.agents/specs/ltx25-device-residency.md` §Gates, stage W0.
+//
+// WHAT MAKES IT NON-VACUOUS, which is the whole difficulty of a "the parts sum
+// to the whole" gate. A single leaf called `render` covering everything would
+// sum to wall exactly and measure nothing, so the sum is only half of what is
+// asserted here: the table must ALSO carry the named boundaries below (the DiT
+// load, the denoise, the video decode, the frame writer). One without the other
+// is satisfiable by an instrument that names nothing, or by an instrument that
+// names everything and misses the time between the names.
+//
+// THE TOLERANCE IS STATED BEFORE THE RUN, per the spec's §Gates: the named
+// leaves must account for at least 95% of the instrumented wall. The residue is
+// emitted as `unaccounted_seconds` rather than distributed over the leaves,
+// because a phase table whose parts do not add up is a table with a phase nobody
+// named, and the spec's stop condition for W0 is that a partial table is worse
+// than none.
+//
+// It runs over the REDUCED fixture on the CPU arm, so its `peak_device_bytes`
+// column is the "no device probe on this arm" sentinel (-1). What that column
+// carries on a device render is owed to W1's lease; what is gated here is that
+// every entry carries a monotone timestamp and a host byte count, which is what
+// #1010 asks for.
+TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to wall") {
+  Workspace ws;
+  const std::string audio_embeds = ws.paths.audio_embeds;
+  const std::string max_phase = "0";
+  const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
+                        vllm::multimodal::kLtx2MaxPhaseExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = ws.paths.dit.c_str();
+  mp.video_vae_path = ws.paths.video_vae.c_str();
+  mp.audio_vae_path = ws.paths.audio_vae.c_str();
+  mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
+  mp.extra_keys = keys;
+  mp.extra_values = values;
+  mp.n_extras = 2;
+  mp.device = 0;
+
+  vllm_video_engine* engine = nullptr;
+  const vllm_status loaded = vllm_video_engine_load(&mp, &engine);
+  const std::string load_error = vllm_last_error() == nullptr ? "" : vllm_last_error();
+  INFO(load_error);
+  REQUIRE(loaded == VLLM_OK);
+  REQUIRE(engine != nullptr);
+
+  const std::string out_dir = ws.root + "/phase_out";
+  vllm_video_params gen = vllm_video_params_default();
+  gen.width = 64;
+  gen.height = 64;
+  gen.num_frames = 9;
+  gen.seed = 7;
+  gen.has_seed = 1;
+  gen.output_dir = out_dir.c_str();
+
+  vllm_video_result result;
+  std::memset(&result, 0, sizeof(result));
+  const vllm_status generated = vllm_video_generate(engine, &gen, &result);
+  const std::string gen_error = vllm_last_error() == nullptr ? "" : vllm_last_error();
+  INFO(gen_error);
+  REQUIRE(generated == VLLM_OK);
+
+  // (1) THE FILE. The deliverable is retrievable evidence, not a line on a
+  // console somebody has to have been watching (#1040 is made of exactly the
+  // evidence that existed only on a host that stopped answering), so the shipped
+  // default WRITES it beside the frames it explains.
+  const std::string log_path = out_dir + "/phase-log.json";
+  std::ifstream probe(log_path, std::ios::binary);
+  REQUIRE_MESSAGE(probe.good(), "the render wrote no phase table at ", log_path);
+  probe.close();
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(log_path));
+
+  REQUIRE(table.contains("wall_seconds"));
+  REQUIRE(table.contains("phases"));
+  REQUIRE(table["phases"].is_array());
+  REQUIRE(!table["phases"].empty());
+  const double wall = table["wall_seconds"].get<double>();
+  CHECK(wall > 0.0);
+
+  // (2) EVERY ENTRY carries a monotone timestamp and a byte count. `start` is
+  // measured from the instrument's origin, so the sequence is non-decreasing by
+  // construction ONLY if the records are appended in completion order; a table
+  // that sorted or re-based them would break here.
+  double previous_start = -1.0;
+  double leaves = 0.0;
+  std::vector<std::string> names;
+  for (const nlohmann::json& entry : table["phases"]) {
+    REQUIRE(entry.contains("name"));
+    REQUIRE(entry.contains("start_seconds"));
+    REQUIRE(entry.contains("end_seconds"));
+    REQUIRE(entry.contains("peak_host_bytes"));
+    REQUIRE(entry.contains("peak_device_bytes"));
+    const std::string name = entry["name"].get<std::string>();
+    const double start = entry["start_seconds"].get<double>();
+    const double end = entry["end_seconds"].get<double>();
+    INFO("phase = " << name);
+    CHECK(!name.empty());
+    CHECK(start >= previous_start);
+    CHECK(end >= start);
+    previous_start = start;
+    // A byte count, not a placeholder: this process is resident and every phase
+    // of it holds the fixture's weights, so a zero here is an instrument that
+    // read nothing rather than a phase that allocated nothing.
+    CHECK(entry["peak_host_bytes"].get<int64_t>() > 0);
+    CHECK(entry["peak_device_bytes"].get<int64_t>() >= -1);
+    names.push_back(name);
+    if (entry.value("span", false)) continue;
+    leaves += end - start;
+  }
+
+  // (3) THE NAMED BOUNDARIES. Without these the sum below is satisfied by one
+  // leaf called `render`, which is an instrument that measures a stopwatch.
+  for (const char* required : {"load.dit", "denoise", "decode.video", "artifacts.frames"}) {
+    CHECK_MESSAGE(std::find(names.begin(), names.end(), std::string(required)) != names.end(),
+                  "the phase table names no '" << required << "' phase");
+  }
+
+  // (4) THE SUM. Stated as the tolerance the spec fixed before the run: the
+  // named leaves account for >= 95% of the instrumented wall, and whatever is
+  // left is reported as its own quantity rather than smeared over the leaves.
+  REQUIRE(table.contains("unaccounted_seconds"));
+  const double unaccounted = table["unaccounted_seconds"].get<double>();
+  MESSAGE("phase table: wall=" << wall << "s leaves=" << leaves << "s unaccounted="
+                               << unaccounted << "s over " << names.size() << " entries");
+  CHECK(std::fabs((wall - leaves) - unaccounted) < 1e-6);
+  CHECK_MESSAGE(leaves >= 0.95 * wall,
+                "the phase table does not sum: " << leaves << "s of named leaves against " << wall
+                                                 << "s of wall. The missing time is a phase "
+                                                    "nobody named, and W0 iterates until it is");
+  vllm_video_result_free(&result);
+  vllm_video_engine_free(engine);
+}
+
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────
 //
 // Everything above runs over a reduced fixture, which proves the composition and

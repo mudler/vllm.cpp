@@ -387,6 +387,8 @@ vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 vllm_cpp_add_test(test_speech_api vllm/entrypoints/openai/test_speech_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
+vllm_cpp_add_test(test_cuda_arch_manifest
+  vllm/platforms/test_cuda_arch_manifest.cpp)
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
 # ENG-EXPERT-STREAM #1123: the load-time GGUF device-fit refusal, in two targets

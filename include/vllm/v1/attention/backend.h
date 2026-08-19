@@ -1,4 +1,13 @@
-// Ported from: vllm/v1/attention/backend.py @ e24d1b24
+// Ported from: vllm/v1/attention/backend.py @ pin 5559679229 (re-anchored from
+// `e24d1b24`, the pin retired at W5; `validate_configuration` is `:320-393` and
+// the `supports_*` predicates `:154-317` there).
+//
+// ONE anchor is deliberately NOT advanced: FlashAttentionBackend::get_kv_cache_shape
+// below still mirrors flash_attn.py @ `e24d1b24`. At `5559679229` upstream returns
+// (num_blocks, num_kv_heads, block_size, 2 * head_size) instead. That is the KV
+// memory format the whole engine allocates and every paged-attention kernel
+// reads, so re-anchoring it is a kernel campaign rather than a comment edit.
+// Named here rather than left to be discovered; owner: BACKEND-ATTN-REGISTRY.
 //
 // Scope (M1.6 Task 1): the per-step attention metadata + the attention backend
 // interface the paged-attention path (Task 2/3) and the GDN metadata (Task 4)
@@ -23,13 +32,11 @@
 //   * The deprecated lazy _seq_lens_cpu accessor and the unpadded()/replace()
 //     spec-decode helpers. The host-equivalent num_computed_tokens_cpu array is
 //     ported because chunked-local virtual batching consumes and rewrites it.
-//   * AttentionBackend: the whole supports_*/validate_configuration capability
-//     surface, get_kv_cache_stride_order / get_kv_cache_block_dim, cudagraph
-//     capture/drafting hooks, MLA / sparse-MLA impls. AttentionCGSupport itself
-//     is ported for the chunked-local wrapper. Ported here: the T0 core
-//     (CommonAttentionMetadata, the AttentionBackend/AttentionImpl/
-//     AttentionMetadataBuilder ABCs, get_name + get_kv_cache_shape, the forward
-//     signature).
+//   * AttentionBackend: get_kv_cache_stride_order / get_kv_cache_block_dim,
+//     cudagraph capture/drafting hooks, MLA / sparse-MLA impls.
+//     AttentionCGSupport itself is ported for the chunked-local wrapper.
+//     The supports_*/validate_configuration capability surface is NO LONGER
+//     deferred — it is ported below (issue #1332 M1).
 #ifndef VLLM_V1_ATTENTION_BACKEND_H_
 #define VLLM_V1_ATTENTION_BACKEND_H_
 
@@ -39,6 +46,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/platforms/interface.h"
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
 #include "vt/ops.h"
 
@@ -52,6 +60,26 @@ enum class AttentionType {
   kEncoderOnly,    // "encoder_only"
   kEncoderDecoder  // "encoder_decoder"
 };
+
+// Upstream's AttentionType IS its string value (backend.py:38-46 is a class of
+// `str` constants), and `supports_attn_type` takes that string (`:292-298`).
+// `platforms::AttnSelectorConfig::attn_type` therefore carries the string, and
+// this is the conversion. Returns the exact upstream spelling.
+const char* AttentionTypeName(AttentionType type);
+
+// The `CacheDType` name (vllm/config/cache.py:19-36) for a KV-cache storage
+// dtype, which is what `supports_kv_cache_dtype` matches against.
+//
+// Upstream's "auto" means "the model dtype, unquantized" (`cache.py:77-78`), and
+// an f32/f16/bf16 KV cache is exactly that — so all three map to "auto" rather
+// than to their own `CacheDType` spellings, which upstream uses only when the
+// user pins the cache to a dtype the model does not have. `vt::DType` carries no
+// fp8 member yet, so the quantized names are unreachable from here; when it
+// does, this is the one place the mapping goes.
+const char* KvCacheDTypeName(vt::DType dtype);
+
+// vllm/utils/torch_utils.py:75-80 `is_quantized_kv_cache`, over the same name.
+bool IsQuantizedKvCacheName(const std::string& kv_cache_dtype);
 
 // Cudagraph support level advertised by an attention metadata builder.
 // Values preserve upstream ordering; chunked-local explicitly returns kNever.
@@ -233,6 +261,104 @@ class AttentionBackend {
   // W2 keeps its exact selection behavior.
   virtual bool is_mla() const { return false; }
   virtual bool is_sparse() const { return false; }
+
+  // ─── The declared-capability surface (backend.py:154-393) ─────────────────
+  //
+  // READ THIS BEFORE TRUSTING A GREEN RESULT FROM IT (issue #1332). Every
+  // predicate below describes what a backend CLAIMS. None of them can see what
+  // the shipped binary contains. Upstream's
+  // FlashAttentionBackend.supports_compute_capability is `>= (8,0)`; it returned
+  // true on a GB10 (capability 12,1) whose FA2 fatbin holds sm_80 SASS plus
+  // compute_80 PTX and nothing else, and every launch then failed a driver JIT
+  // with cudaErrorUnsupportedPtxVersion. `grep -rn get_arch_list vllm/` returns
+  // zero hits: vLLM never asks what its own fatbins contain, and neither does
+  // this. Measured on that board through the pinned oracle, same wheel and same
+  // prompt: asking for FLASHINFER generates text and exits 0, while the default
+  // — which resolves FLASH_ATTN, upstream's priority 0 for this device — dies at
+  // the FIRST attention call. The priority-0 choice is unrunnable and the
+  // priority-1 choice works, and every predicate below passes BOTH.
+  //
+  // The invariant #1332 states is that no backend may be declared valid on
+  // the strength of a property of the DEVICE alone, and satisfying it needs the
+  // build-derived compiled-arch manifest (M2) and the launch probe (M3). This
+  // layer is NECESSARY AND NOT SUFFICIENT, and a reader who takes it for a
+  // runnability check will reproduce exactly the failure that opened the issue.
+  //
+  // Structure mirrors upstream: static declarations returning bool, collected by
+  // validate_configuration into a list of reason strings; an EMPTY list means
+  // valid. Ours are virtual member functions because our backends are instances
+  // rather than classes (MakeAttentionBackend), which is the same adaptation
+  // get_impl_cls above already records.
+
+  // backend.py:155-156 / :59-64 — the declared value lists. A backend overrides
+  // the list, not the predicate, wherever upstream does.
+  virtual std::vector<vt::DType> supported_dtypes() const {
+    return {vt::DType::kF16, vt::DType::kBF16};  // backend.py:59
+  }
+  virtual std::vector<std::string> supported_kv_cache_dtypes() const {
+    return {"auto", "float16", "bfloat16"};  // backend.py:60-64
+  }
+  virtual std::vector<int> get_supported_head_sizes() const { return {}; }
+  // backend.py:69-71 — upstream returns [MultipleOf(1)]. Every entry here IS a
+  // MultipleOf: supports_block_size accepts any multiple of any entry, which is
+  // upstream's hybrid_blocks rule at :184-192, and MultipleOf(1) accepts all.
+  virtual std::vector<int> get_supported_kernel_block_sizes() const { return {1}; }
+
+  // backend.py:158-161.
+  virtual bool supports_head_size(int head_size) const;
+  // backend.py:163-165.
+  virtual bool supports_dtype(vt::DType dtype) const;
+  // backend.py:167-173 — an EMPTY name is upstream's `None`, accepted outright.
+  virtual bool supports_kv_cache_dtype(const std::string& kv_cache_dtype) const;
+  // backend.py:175-192 — 0 is upstream's `None`, accepted outright.
+  virtual bool supports_block_size(int block_size) const;
+
+  // backend.py:237-298 — the plain feature flags, upstream defaults.
+  virtual bool supports_sink() const { return false; }            // :241-243
+  virtual bool supports_mm_prefix() const { return false; }        // :249-251
+  virtual bool supports_per_head_quant_scales() const { return false; }  // :257-259
+  virtual bool supports_sliding_window() const { return false; }   // :261-263
+  virtual bool supports_non_causal() const { return false; }       // :265-274
+  virtual bool supports_batch_invariance() const { return false; } // :276-278
+  virtual bool supports_kv_connector() const { return true; }      // :280-282
+  virtual bool supports_pcp() const { return false; }              // :284-289
+  // :291-298 — the base supports DECODER only.
+  virtual bool supports_attn_type(const std::string& attn_type) const {
+    return attn_type == AttentionTypeName(AttentionType::kDecoder);
+  }
+  // :300-302.
+  virtual bool supports_compute_capability(
+      const platforms::DeviceCapability& capability) const {
+    (void)capability;
+    return true;
+  }
+
+  // :304-317 — the cross-field rule a per-field predicate cannot express.
+  // Returns the reason when the COMBINATION is invalid, nullopt when it is fine.
+  //
+  // ADAPTATION: upstream passes nine positional arguments, every one of them a
+  // field of the AttentionSelectorConfig the caller already holds
+  // (cuda.py:381-384 splats that config). We pass the config itself, so a new
+  // upstream field does not change nine signatures.
+  virtual std::optional<std::string> supports_combination(
+      const platforms::AttnSelectorConfig& cfg,
+      const platforms::DeviceCapability& capability) const {
+    (void)cfg;
+    (void)capability;
+    return std::nullopt;
+  }
+
+  // backend.py:319-393. Collects one reason per failed predicate and returns
+  // them ALL: upstream builds a list and prints the whole list (cuda.py:416-420,
+  // :432-446), because a message that stopped at the first failure would send a
+  // reader chasing one cause of four. An EMPTY result means the backend is valid
+  // for this request.
+  //
+  // The reason STRINGS are upstream's, byte for byte, so a refusal here and a
+  // refusal from the oracle read the same.
+  virtual std::vector<std::string> validate_configuration(
+      const platforms::AttnSelectorConfig& cfg,
+      const platforms::DeviceCapability& capability) const;
 };
 
 // The T0 concrete full-attention backend. Ports the FlashAttention V1 paged KV
@@ -253,6 +379,54 @@ class FlashAttentionBackend final : public AttentionBackend {
       int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
       int64_t head_size,
       const std::string& cache_dtype_str = "auto") const override;
+
+  // ─── Capability overrides, ported from flash_attn.py:72-239 ──────────────
+  // flash_attn.py:74-80.
+  std::vector<std::string> supported_kv_cache_dtypes() const override {
+    return {"auto", "float16", "bfloat16", "fp8", "fp8_e4m3"};
+  }
+  // flash_attn.py:82-84 — MultipleOf(16).
+  std::vector<int> get_supported_kernel_block_sizes() const override { return {16}; }
+  // flash_attn.py:170-178. Upstream raises the ceiling to 512 when FlashAttention
+  // v4 resolves (`is_fa_version_supported(4)`); this tree ships FA2 only
+  // (BACKEND-CUDA-COMP-FA records FA3/FA4 as unported), so the 512 arm is
+  // unreachable and is deliberately not written as an always-false branch.
+  bool supports_head_size(int head_size) const override {
+    if (head_size % 8 != 0) return false;
+    return head_size <= 256;
+  }
+  // flash_attn.py:200-202. SEE THE WARNING ON THE BASE CLASS: this is the exact
+  // predicate that returned true on a GB10 whose FA2 fatbin had no sm_121 code
+  // (issue #1332). It is upstream's, and it is not a runnability check.
+  bool supports_compute_capability(
+      const platforms::DeviceCapability& capability) const override {
+    return capability.major > 8 || (capability.major == 8 && capability.minor >= 0);
+  }
+  bool supports_sliding_window() const override { return true; }   // :98-100
+  bool supports_batch_invariance() const override { return true; }  // :102-104
+  bool supports_non_causal() const override { return true; }        // :106-108
+  // :110-118 — FlashAttention serves every attention type.
+  bool supports_attn_type(const std::string& attn_type) const override {
+    return attn_type == AttentionTypeName(AttentionType::kDecoder) ||
+           attn_type == AttentionTypeName(AttentionType::kEncoder) ||
+           attn_type == AttentionTypeName(AttentionType::kEncoderOnly) ||
+           attn_type == AttentionTypeName(AttentionType::kEncoderDecoder);
+  }
+  // :120-123 `get_flash_attn_version() >= 3`. This tree ships FA2, so the answer
+  // is upstream's own answer for FA2 rather than a divergence — and it is what
+  // makes the ported test_per_head_quant_scales case assert a refusal.
+  bool supports_per_head_quant_scales() const override { return false; }
+  // :204-239. Only the sink rule is expressible here: the fp8-KV and mm_prefix
+  // rules both key on a resolved FA version >= 3, which this tree never reaches,
+  // and supported_kv_cache_dtypes / supports_mm_prefix already refuse them.
+  std::optional<std::string> supports_combination(
+      const platforms::AttnSelectorConfig& cfg,
+      const platforms::DeviceCapability& capability) const override {
+    if (cfg.has_sink && capability.present() && capability.major < 9) {
+      return std::string("sink not supported on compute capability < 9.0");
+    }
+    return std::nullopt;
+  }
 };
 
 // The dense ROCm paged-attention backend (issue #41 M3). Upstream ROCM_ATTN
@@ -348,10 +522,14 @@ class TritonMLABackend final : public AttentionBackend {
   // makes FLASHINFER_MLA_SPARSE_SM120 lose and TRITON_MLA win on GB10).
   bool is_mla() const override { return true; }
 
-  // triton_mla.py:100-103 supports_block_size — block_size % 16 == 0. Exposed as
-  // a plain predicate (the full supports_* surface is still deferred, see the
-  // header note) because get_kv_cache_shape enforces it.
-  static bool supports_block_size(int64_t block_size) { return block_size % 16 == 0; }
+  // triton_mla.py:100-103 supports_block_size — block_size % 16 == 0. Declared as
+  // the SUPPORTED-SIZE LIST rather than as an overridden predicate, which is
+  // upstream's shape and which the base supports_block_size (backend.py:175-192)
+  // turns into the same `% 16 == 0` answer. Was a `static` member before #1332;
+  // a static of that name would have HIDDEN the base virtual, so a caller
+  // through an AttentionBackend& and a caller through a TritonMLABackend& would
+  // have got different answers.
+  std::vector<int> get_supported_kernel_block_sizes() const override { return {16}; }
 
   // W4: the MLA decode impl. Upstream `get_impl_cls` returns the CLASS
   // (triton_mla.py:126-128 -> TritonMLAImpl); here a factory returning an

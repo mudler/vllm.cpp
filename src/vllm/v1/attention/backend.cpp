@@ -1,5 +1,6 @@
-// Ported from: vllm/v1/attention/backend.py @ e24d1b24
-// (get_kv_cache_shape from vllm/v1/attention/backends/flash_attn.py @ e24d1b24)
+// Ported from: vllm/v1/attention/backend.py @ pin 5559679229
+// (get_kv_cache_shape from vllm/v1/attention/backends/flash_attn.py @ e24d1b24 —
+// deliberately NOT re-anchored; see the divergence note at the top of backend.h)
 #include "vllm/v1/attention/backend.h"
 
 #include <algorithm>
@@ -70,6 +71,159 @@ CommonAttentionMetadata MakeCommonAttentionMetadata(
   return cam;
 }
 
+const char* AttentionTypeName(AttentionType type) {
+  // backend.py:38-46 — the exact upstream string values.
+  switch (type) {
+    case AttentionType::kDecoder:
+      return "decoder";
+    case AttentionType::kEncoder:
+      return "encoder";
+    case AttentionType::kEncoderOnly:
+      return "encoder_only";
+    case AttentionType::kEncoderDecoder:
+      return "encoder_decoder";
+  }
+  return "decoder";
+}
+
+// vllm/config/cache.py:19-36 CacheDType. See the header for why f32/f16/bf16 all
+// map to "auto".
+const char* KvCacheDTypeName(vt::DType dtype) {
+  switch (dtype) {
+    case vt::DType::kF32:
+    case vt::DType::kF16:
+    case vt::DType::kBF16:
+      return "auto";
+    default:
+      // No other vt::DType is a KV-cache storage dtype in this tree. "auto" is
+      // the unquantized answer, which is what a caller with an unexpected dtype
+      // needs the selector to keep doing until the mapping above grows a row.
+      return "auto";
+  }
+}
+
+// vllm/utils/torch_utils.py:75-80.
+bool IsQuantizedKvCacheName(const std::string& kv_cache_dtype) {
+  const auto ends_with = [&](const std::string& suffix) {
+    return kv_cache_dtype.size() >= suffix.size() &&
+           kv_cache_dtype.compare(kv_cache_dtype.size() - suffix.size(),
+                                  suffix.size(), suffix) == 0;
+  };
+  return kv_cache_dtype.rfind("fp8", 0) == 0 || ends_with("per_token_head") ||
+         kv_cache_dtype == "nvfp4";
+}
+
+// backend.py:158-161 — an EMPTY supported list means "no constraint".
+bool AttentionBackend::supports_head_size(int head_size) const {
+  const std::vector<int> supported = get_supported_head_sizes();
+  if (supported.empty()) return true;
+  return std::find(supported.begin(), supported.end(), head_size) != supported.end();
+}
+
+// backend.py:163-165.
+bool AttentionBackend::supports_dtype(vt::DType dtype) const {
+  const std::vector<vt::DType> supported = supported_dtypes();
+  return std::find(supported.begin(), supported.end(), dtype) != supported.end();
+}
+
+// backend.py:167-173. An EMPTY name is upstream's `None`.
+bool AttentionBackend::supports_kv_cache_dtype(
+    const std::string& kv_cache_dtype) const {
+  if (kv_cache_dtype.empty()) return true;
+  const std::vector<std::string> supported = supported_kv_cache_dtypes();
+  if (supported.empty()) return true;
+  return std::find(supported.begin(), supported.end(), kv_cache_dtype) !=
+         supported.end();
+}
+
+// backend.py:175-192. Every entry of get_supported_kernel_block_sizes() is an
+// upstream MultipleOf, so a framework block size is supported when it is a
+// multiple of ANY declared size — upstream's hybrid_blocks rule at :187-191,
+// which is why 32 passes a backend declaring MultipleOf(16) and 8 does not.
+bool AttentionBackend::supports_block_size(int block_size) const {
+  if (block_size == 0) return true;  // upstream `None`
+  const std::vector<int> supported = get_supported_kernel_block_sizes();
+  if (supported.empty()) return true;
+  for (const int size : supported) {
+    if (size != 0 && block_size % size == 0) return true;
+  }
+  return false;
+}
+
+// backend.py:319-393, in upstream's order, with upstream's reason strings.
+std::vector<std::string> AttentionBackend::validate_configuration(
+    const platforms::AttnSelectorConfig& cfg,
+    const platforms::DeviceCapability& capability) const {
+  std::vector<std::string> invalid_reasons;
+  if (!supports_head_size(cfg.head_size)) {
+    invalid_reasons.emplace_back("head_size not supported");
+  }
+  if (!supports_dtype(cfg.dtype)) {
+    invalid_reasons.emplace_back("dtype not supported");
+  }
+  if (!supports_kv_cache_dtype(cfg.kv_cache_dtype)) {
+    invalid_reasons.emplace_back("kv_cache_dtype not supported");
+  }
+  if (!supports_block_size(cfg.block_size)) {
+    invalid_reasons.emplace_back("block_size not supported");
+  }
+  if (cfg.use_mm_prefix && !supports_mm_prefix()) {
+    invalid_reasons.emplace_back(
+        "partial multimodal token full attention not supported");
+  }
+  if (cfg.use_mla != is_mla()) {
+    invalid_reasons.emplace_back(cfg.use_mla ? "MLA not supported"
+                                             : "non-MLA not supported");
+  }
+  if (cfg.has_sink && !supports_sink()) {
+    invalid_reasons.emplace_back("attention sinks not supported");
+  }
+  if (cfg.use_sparse != is_sparse()) {
+    invalid_reasons.emplace_back(cfg.use_sparse ? "sparse not supported"
+                                                : "non-sparse not supported");
+  }
+  if (cfg.use_per_head_quant_scales && !supports_per_head_quant_scales()) {
+    invalid_reasons.emplace_back("per-head quant scales not supported");
+  }
+  // backend.py:366-367, with upstream's own PRECONDITION rather than a new rule:
+  // CudaPlatform.get_attn_backend_cls asserts `device_capability is not None`
+  // before it calls this (cuda.py:403-404), and CpuPlatform has a separate
+  // selector that never reaches it (cpu.py:75-87). Our selector is shared across
+  // every DeviceType, and DeviceCapability::present() is already false for every
+  // platform that cannot answer the question, so the predicate applies exactly
+  // where upstream applies it. Without this, FLASH_ATTN — which this tree also
+  // registers for kCPU/kMETAL/kVULKAN/kTENSTORRENT — would be refused on every
+  // one of them by a rule about NVIDIA compute capability.
+  if (capability.present() && !supports_compute_capability(capability)) {
+    invalid_reasons.emplace_back("compute capability not supported");
+  }
+  if (!supports_attn_type(cfg.attn_type)) {
+    invalid_reasons.emplace_back("attention type " + cfg.attn_type +
+                                 " not supported");
+  }
+  if (cfg.has_sliding_window && !supports_sliding_window()) {
+    invalid_reasons.emplace_back("sliding window not supported");
+  }
+  if (cfg.use_non_causal && !supports_non_causal()) {
+    invalid_reasons.emplace_back("non-causal attention not supported");
+  }
+  if (cfg.use_batch_invariant && !supports_batch_invariance()) {
+    invalid_reasons.emplace_back("batch invariance not supported");
+  }
+  if (cfg.use_kv_connector && !supports_kv_connector()) {
+    invalid_reasons.emplace_back("KV connector not supported");
+  }
+  if (cfg.use_pcp && !supports_pcp()) {
+    invalid_reasons.emplace_back("PCP not supported");
+  }
+  if (const std::optional<std::string> combination =
+          supports_combination(cfg, capability);
+      combination.has_value()) {
+    invalid_reasons.push_back(*combination);
+  }
+  return invalid_reasons;
+}
+
 std::vector<int64_t> FlashAttentionBackend::get_kv_cache_shape(
     int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
     int64_t head_size, const std::string& /*cache_dtype_str*/) const {
@@ -98,8 +252,9 @@ std::vector<int64_t> RocmAttentionBackend::get_kv_cache_shape(
 std::vector<int64_t> TritonMLABackend::get_kv_cache_shape(
     int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
     int64_t head_size, const std::string& /*cache_dtype_str*/) const {
-  // triton_mla.py:100-103 supports_block_size.
-  if (!supports_block_size(block_size)) {
+  // triton_mla.py:100-103 supports_block_size — now the base predicate reading
+  // this class's get_supported_kernel_block_sizes() == {16}.
+  if (!supports_block_size(static_cast<int>(block_size))) {
     throw std::invalid_argument("Block size must be a multiple of 16.");
   }
   // mla_attention.py:1219 — "num_kv_heads ... assumed to be 1 for MLA". Upstream

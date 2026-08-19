@@ -976,11 +976,31 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     // A future backend with a different layout fails LOUDLY here at init.
     const bool is_mla =
         mla_layer_mask[static_cast<size_t>(i)] != 0;
+    // #1332 M1: the selector now applies the full validate_configuration
+    // capability surface, so the request it is asked has to BE the request. The
+    // three fields this site can answer come straight from the geometry it just
+    // resolved. `dtype` (the model/query dtype) is NOT available here — the
+    // runner resolves only ResolveKvCacheDType() — so it keeps its bf16 default;
+    // that is owed to #1332 M4 and recorded under `## Owed` in
+    // .agents/specs/attn-validate-configuration.md.
+    //
+    // AND READ THIS BEFORE READING A GREEN SELECTION AS A WORKING BACKEND: the
+    // name resolved here still reaches only attn_backend_names_, the
+    // VT_ATTN_SELECT_LOG print below and CheckKvCacheShape. dense_attn::AttnBlock
+    // calls vt::PagedAttention unconditionally. Nothing DISPATCHES on this. #1332
+    // M4 owns that, and until it lands a valid name is a claim, not a route.
+    vllm::platforms::AttnSelectorConfig cfg;
+    cfg.head_size = static_cast<int>(fa_dims[i].head_size);
+    cfg.num_heads = static_cast<int>(fa_dims[i].num_kv_heads);
+    cfg.block_size = static_cast<int>(fa_block_size);
+    cfg.kv_cache_dtype = vllm::v1::KvCacheDTypeName(fa_dims[i].dtype);
+    cfg.quantized_kv_cache = vllm::v1::IsQuantizedKvCacheName(cfg.kv_cache_dtype);
+
     std::string name;
     if (is_mla) {
       if (!mla_backend_resolved) {
         mla_backend_resolved = true;
-        vllm::platforms::AttnSelectorConfig mla_cfg;
+        vllm::platforms::AttnSelectorConfig mla_cfg = cfg;
         mla_cfg.use_mla = true;
         try {
           mla_backend = vllm::v1::SelectAttentionBackendName(
@@ -995,7 +1015,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       if (!dense_backend_resolved) {
         dense_backend_resolved = true;
         dense_backend = vllm::v1::SelectAttentionBackendName(
-            vllm::platforms::GetPlatform(queue_.device.type));
+            vllm::platforms::GetPlatform(queue_.device.type), "", cfg);
       }
       name = dense_backend;
     }

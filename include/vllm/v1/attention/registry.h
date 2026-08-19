@@ -1,7 +1,9 @@
 // Ported from: vllm/v1/attention/backends/registry.py (AttentionBackendEnum +
 // @register_backend self-registration) and the platform-driven selection in
-// vllm/platforms/cuda.py:361-470 (get_valid_backends / get_attn_backend_cls) @
-// pin e24d1b24 — the attention-backend REGISTRY + platform-priority SELECTION
+// vllm/platforms/cuda.py:359-394 (get_valid_backends) and :397-492
+// (get_attn_backend_cls) @ pin 5559679229 — re-anchored from `:361-470 @
+// e24d1b24`, the pin retired at W5 — the attention-backend REGISTRY +
+// platform-priority SELECTION
 // seam (extensibility item 4). This is the ENGINE-level "which AttentionBackend"
 // seam; the concrete attention KERNEL stays selected at the vt:: op-table level
 // (vt::PagedAttention -> GetOp(kPagedAttention, device.type)), which is already

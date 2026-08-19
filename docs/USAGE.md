@@ -734,6 +734,47 @@ block-wise FP8 scale tensor the checkpoint had never contained
 ([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
 the wrong side costs more than the failure does.
 
+### A refusal that names the attention backend, and what it cannot tell you
+
+Starting an engine resolves an attention backend for each KV-cache group, and
+that backend is now asked whether it can serve the request before it is chosen.
+When none of the backends this build registers can, the engine refuses at
+initialization rather than later, and the message names every candidate with
+every reason it lost:
+
+```text
+No valid attention backend for device type 1 from
+{FLASH_ATTN: [head_size not supported, block_size not supported]}
+(use_mla=false, use_sparse=false)
+```
+
+The reason strings are vLLM's own, so a refusal here and a refusal from the
+reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
+come from the geometry the engine has just resolved for your checkpoint, so a
+refusal is about that checkpoint on this build.
+
+**What this check cannot tell you.** It reports what a backend *claims*, never
+what your binary contains and never whether the kernel will launch. A backend
+whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
+when the build carries no compiled code for that GPU.
+
+That is a real failure mode, not a hypothetical one, and it surfaces as a launch
+error rather than as the refusal above. It has been measured on a GB10 board
+(compute capability 12,1) against the reference engine, same wheel and same
+prompt: asking for its `FLASHINFER` backend generates text and exits cleanly,
+while the default — which resolves `FLASH_ATTN`, the reference engine's *first*
+preference for that device — dies at the first attention call with
+`cudaErrorUnsupportedPtxVersion`. The first preference could not run and the
+second could, and no capability check on either side could tell them apart.
+
+So if a run dies inside attention rather than being refused before it starts,
+the backend was accepted on a claim your build does not honour. Confirming which
+architectures a build actually targets is a separate question, answered under
+"Confirming which CUDA architecture a build targets" above. Tracked as
+[#1332](https://github.com/mudler/vllm.cpp/issues/1332).
+
+Selecting a backend by name is not exposed yet; the engine always resolves one.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are
@@ -1994,13 +2035,16 @@ environment variables are set. It is NOT yet measured against the vLLM-Omni
 oracle, which is unpinned (#633), so nothing here is a quality claim. Inferring the emotion from a clip instead of stating it needs a
 Conformer and a Perceiver that are not ported.
 
-There is **no `/v1/audio/speech`**. Text to speech is not servable: the
-IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
-stages named as missing by the checkpoint's own manifest, and no route is
-registered, the public ABI carries no synthesis entry point, and loading the
-family refuses with a message naming the missing pieces (#634). Asking a running server for speech
-today is a 404 at the route table, not a runtime error, and that is the accurate
-signal: the capability does not reach any surface yet.
+`/v1/audio/speech` is served, but **only** by a server started with
+`--speech-model`, and what it can render depends on the family that flag loads
+(#1112). MiniMax-Music3 renders: a composed request returns a real 44100 Hz
+stereo WAV (#852). **IndexTTS-2.5 does not**: its stages are ported and gated at
+reduced dimensions, further stages are named as missing by the checkpoint's own
+manifest, and loading the family refuses with a message naming the missing
+pieces (#634). Without `--speech-model` the route is a 404 at the route table
+rather than a runtime error, which is the accurate signal: the endpoint is opt
+in, not absent. See
+[Speech and music generation](#speech-and-music-generation).
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it — every prompt position is scored against the token
@@ -2130,7 +2174,7 @@ rather than ignored — see below the table for why that polarity matters here.
 |---|---|---|---|
 | `lyrics` | string | **required** for MiniMax-Music3 | the sung text, with `[Verse]` / `[Chorus]` section tags. An empty lyric normalizes to a bare `[start]` prompt, so it is a 400 rather than an instrumental |
 | `description` (alias `prompt`) | string | **required** for MiniMax-Music3 | genre, BPM, key, instrumentation, mood. NOT a voice or speaker description. Supplying both spellings with different values is a 400, never a silent winner |
-| `audio_duration` (alias `duration`) | number, seconds | `60` | resolved to `int(seconds x 25)` autoregressive frames, then **clamped** to the 9000-frame ceiling — the same silent clamp upstream applies (`encoders.py:287`). Shorter than one frame (0.04 s) is a 400 |
+| `audio_duration` (alias `duration`) | number, seconds | `60` | resolved to `int(seconds x 25)` autoregressive frames, then **clamped** to the 9000-frame ceiling — the same silent clamp upstream applies (`encoders.py:287`). Shorter than one frame (0.04 s) is a 400. **`0` means "take the family's default"**, the same as omitting it; only a NEGATIVE value is a 400 (#1338) |
 | `num_inference_steps` | integer | `30` | flow-matching Euler steps in the acoustic half. Must be > 0 |
 | `guidance_scale` | number | `1.7` | classifier-free guidance on the DiT. **0 is legal** and selects the unconditional branch, so omitting the field is how you ask for the default — not sending 0 |
 | `seed` | integer | `0` | seeds the autoregressive top-k draw *and* the initial denoise latents. A fixed seed, not a random one: 0 is as deterministic as any other value |
@@ -2162,6 +2206,31 @@ for that once (#925), which is why the list is long rather than convenient.
 | `response_format` other than `"wav"` | no mp3/opus/aac/flac encoder is vendored, and relabelling RIFF bytes is worse than refusing |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty` | this model's autoregressive stage has ONE sampler — a fixed top-50 draw (`encoders.py:48,94-103`). There is no temperature to set and no nucleus branch to widen, so the knob can be neither honoured nor honestly ignored. Upstream refuses all four (`request_builders.py:14-19,109-114`). Use `seed` to control the draw |
 | `max_new_tokens` | SGLang-Omni's spelling of the length, counted in 25 Hz **frames** rather than seconds (`request_builders.py:56-68`). This route takes `audio_duration` in seconds — divide by 25. Two spellings of one meaning on one route is exactly what #925 was |
+| `token_count`, `duration_tokens` | SGLang-Omni's length in **duration tokens** (`protocol.py:355-356`). Same meaning as `audio_duration`, different unit; upstream refuses both by name for this model (`request_builders.py:20-30,71-81`). A length key nobody reads is how a short request becomes a 60 s song (#1315) |
+| `instructions` | it names two things and this route honours neither. **OpenAI's** createSpeech uses it for voice **style** and emotion, and no registered family exposes a style control. **SGLang-Omni** uses it for the music **caption**, the string it assembles into `<\|caption_start\|>` and requires non-empty (`request_builders.py:104-106`); this route calls that `description`, so send `description` if the caption is what you meant. Refused rather than aliased because a secondary oracle never becomes the mirror source, and because a global alias would bake one family's meaning into a shared route (#1315) |
+| `speaker` | SGLang-Omni's declared **alias** for `voice` (`protocol.py:337-339`). Refusing `voice` and dropping `speaker` refused one spelling of one field and returned a 200 for the other (#1315) |
+| `ref_audio`, `ref_text` | upstream's reference-clip spellings, where `ref_audio` is a path or URL. This route takes `reference_audio` as a `data:` URL, because the server and the client need not share a filesystem; no family conditions on a reference **transcript** at all. Upstream refuses both by name (`request_builders.py:20-30,71-81`) |
+| `task_type`, `x_vector_only_mode`, `initial_codec_chunk_frames` | there is one synthesis mode per loaded family and no task selector, no speaker-embedding-only path, and the chunk schedule is the family's own (MiniMax-Music3 fixes it at 200 frames with a 100 hop). Upstream refuses all three by name (`request_builders.py:20-30,71-81`) |
+
+**Where you put a key does not change whether it is read.** EVERY key on this
+route is accepted at the **top level** and nested under **`extra_params`**,
+because vLLM-Omni nests them and OpenAI does not, and a client should not have to
+know which surface it is talking to. That covers the generation knobs
+(`audio_duration`, `duration`, `num_inference_steps`, `guidance_scale`, `seed`),
+the content fields (`model`, `input`, `text`, `language`, `lyrics`,
+`description`, `prompt`, `reference_audio`) and every refusal in the table above.
+`extra_params` wins where both carry the same key, the same precedence the video
+route uses.
+
+This used to be an either/or: an `extra_params` object as empty as `{}` stopped
+the top level being read at all, so a body that nested `seed` and put
+`audio_duration` where OpenAI puts it lost the duration and got the 60 s default,
+which is #925's cost behind a 200 with #925's own guard unable to fire (#1315).
+The **content fields** were the second half of the same hole and were fixed one
+change later (#1336): a nested `text`, `language` or `reference_audio` was
+dropped, which defeated the family refusals that catch those keys at the top
+level, and a nested reference clip made a family that requires one answer
+"`reference_audio` is required" to a caller who had just supplied it.
 
 A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 **before** anything stages: the route asks the loaded engine's
@@ -2223,7 +2292,7 @@ direction that matters.
 | 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
 | guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
 | **2.4B fp32 flow-matching DiT** (every denoise step, both CFG branches) | **device**, weights staged ONCE |
-| 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
+| **0.646B RVQ depth decoder** (8 appends per frame) | **device**, weights staged ONCE at **bf16** |
 | condition mix (once per window), scheduler, CFG mix, Euler step | **host** |
 | DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
 
@@ -2244,18 +2313,68 @@ this arm mirrors that rather than buying speed with a narrower dtype.
 The remaining stages do not move, for two different reasons, and both are owed
 rather than hidden:
 
-* the depth decoder and the condition mix are host `std::vector<float>`
-  reference loops under `-ffp-contract=off`, and they run at
-  `ArCompute::kBFloat16` — every op's *result* is rounded to bf16, which is what
-  upstream stores. Routing them through an f32 GEMM would silently drop that
-  rounding, so mirroring them needs bf16 storage, which is a dtype decision with
-  its own numeric evidence rather than a transcription;
+* the condition mix is a host `std::vector<float>` reference loop under
+  `-ffp-contract=off` running at `ArCompute::kBFloat16`. It also runs **once per
+  window** rather than once per step, so it is outside the per-step loop
+  entirely;
 * the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
   1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
   are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
   are registered for the **CPU only**. There is no CUDA kernel behind the op
   this stage would need, so it is named here rather than hand-rolled outside the
   seam.
+
+The **depth decoder** reaches the device the same way, and its dtype is the one
+thing about it worth knowing. Upstream's `MiniMaxMusic3RVQDepthDecoder` declares
+**no dtype at all** — no `dtype` parameter, no `torch.float32` literal, no
+`.float()` call — so it inherits whatever `load_components(dtype=...)` resolves,
+and that is **bf16** for this checkpoint. The arm therefore stages its weights at
+bf16 and keeps every activation at bf16 with f32 accumulation, which is
+`vt::MatmulBT`'s own contract. The narrowing is **lossless**: the loader already
+rounds every AR-half tensor through bf16 into an f32 carrier, so the device copy
+holds exactly the values the host arm holds, in half the bytes.
+
+It runs on five shared ops with **no new kernel** (`MatmulBT`, `RmsNorm`,
+`AttentionCross`, `SiluAndMul`, `Add`), with the MLP's gate/up pair routed
+through the shared merged-GEMM seam. What does **not** move with it, and is owed
+rather than hidden: the audio heads, the CFG mix, the top-k draw and the fed-back
+projection row, which together are ~1.6 % of the stage.
+
+**Its numbers are not identical to the host arm's, and the difference is
+measured rather than assumed.** Against the host reference, over **six seeds** of
+the gate's reduced geometry, the device arm reads a median of exactly **1 bf16
+ULP** at every seed, means of 2.095 to 9.904 and worst-case values of 110 to
+7340. The gate bounds the median at 2 and the mean at 15; it does **not** bound
+the worst case, because the worst case cannot tell a correct arm from a broken
+one — a correct arm reads 7340 on the seed where a swapped gate/up half reads
+6641. An earlier revision of this document quoted one seed's 110 and 2.095 as
+though they were the arm's deviation; they are one draw of it.
+
+Almost all of that deviation — the composed stage goes to **zero,
+bit-identical**, once the two are aligned — is one rounding per element, from two
+places, and the two are **not** the same kind of thing:
+
+- `vt::SiluAndMul` computes the whole gated expression in f32 where a bf16 torch
+  module narrows `silu(gate)` before multiplying by `up`. That one is a genuine
+  gap in the shared seam and is tracked as its own issue.
+- `vt::RmsNorm` keeps f32 across the weight multiply, and **that is correct**.
+  vLLM's own RMSNorm does exactly the same on both its CPU and its CUDA path, and
+  upstream reverted the change that would have made it multiply in the weight's
+  dtype. The Music3 *host* arm rounds twice because it mirrors the `diffusers`
+  module this model is; the device arm rounds once because it mirrors vLLM. Two
+  references disagree here and neither side is defective, so this term will not
+  go away. An earlier revision of this document called it a shortcoming of the
+  shared op.
+
+Until the difference is settled against the oracle, **no throughput number is
+quoted for this arm** and the full-scale gate against the committed oracle
+goldens has not been run with it.
+
+If the build has no provider for the device you asked for, the depth arm
+**refuses by name at staging time**, naming the op and the device, rather than
+falling back to the host loop — a silent fallback would be a large slowdown
+wearing a correct answer. `--speech-device 0` keeps the host reference arm and
+stages nothing.
 
 Because the host stages are unchanged — and because `--speech-device 0` takes
 the same `DitForward` it always did, source byte for source byte — the CPU arm
@@ -4884,8 +5003,9 @@ quantized arm (0.0324), so upper bounds alone cannot tell them apart.
 
 ### IndexTTS-2.5 goldens and checkpoint manifests
 
-The speech lane is not servable yet (see `/v1/audio/speech` above); these
-regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
+IndexTTS-2.5 is not servable yet — `/v1/audio/speech` exists and serves
+MiniMax-Music3, but this family still refuses naming its missing pieces (#634,
+#1112). These regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
 names and shapes from its pickle header over HTTP range requests, so it inspects
 a multi-GB checkpoint without downloading the weights:
 

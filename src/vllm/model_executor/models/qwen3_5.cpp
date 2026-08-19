@@ -545,6 +545,27 @@ detail::DeviceTokenIds& detail::DeviceTokenIdsOverride() {
   return ids;
 }
 
+// #1305 — THE CONSUMER SIDE, once, beside the publisher it reads. See
+// `qwen3_5_internal.h` for what each argument means and why the copy goes on the
+// queue. Four models call these: this one, `qwen3.cpp`, `qwen3_moe.cpp` and
+// `deepseek_v2.cpp`, each of which used to carry its own copy of both bodies.
+detail::DeviceTokenIds detail::TakeDeviceTokenIds() {
+  const DeviceTokenIds ov = DeviceTokenIdsOverride();
+  if (ov.ids != nullptr) DeviceTokenIdsOverride() = DeviceTokenIds{};
+  return ov;
+}
+
+bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
+                                 void* dst, int64_t dst_count, const char* what) {
+  const DeviceTokenIds ov = TakeDeviceTokenIds();
+  if (ov.ids == nullptr) return false;
+  VT_CHECK(ov.count <= dst_count,
+           std::string(what) + ": device input ids longer than the embed input");
+  backend.Copy(queue, dst, ov.ids,
+               static_cast<size_t>(ov.count) * sizeof(int32_t));
+  return true;
+}
+
 vt::DType detail::ResolveMambaSsmCacheDType(const HfConfig& config,
                                             vt::DType conv_dtype) {
   const std::string& dtype = config.mamba_ssm_dtype;
@@ -7801,17 +7822,11 @@ detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
 // (the multimodal helper embeds a prompt and then single tokens); consuming on
 // first use means those cannot be handed ids that were never meant for them.
 // The first embed in a registry forward is always the step's own.
+// #1305: the take-and-clear and the bounds-checked copy this used to spell out
+// are `detail::ApplyDeviceTokenIds` (defined above, declared in
+// `qwen3_5_internal.h`), one body for the four models that consume the scope.
 static void ApplyDeviceTokenIdsOverride(Dev d, DBuf& dids, int64_t T) {
-  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
-  if (ov.ids == nullptr) return;
-  detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
-  // A device buffer LONGER than the embed's input would run past the end. That
-  // can only mean the runner and the model disagree about this step's shape, so
-  // fail loudly rather than corrupt the embedding.
-  VT_CHECK(ov.count <= T,
-           "qwen3_5 embed: device input ids longer than the embed input");
-  d.b.Copy(d.q, dids.ptr(), ov.ids,
-           static_cast<size_t>(ov.count) * sizeof(int32_t));
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3_5 embed");
 }
 
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).

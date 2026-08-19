@@ -21,7 +21,7 @@
 // upstream answers, and FLASH_ATTN stays registered for kCPU as the second
 // entry of the same priority list.
 //
-// ─── TWO RECORDED DEVIATIONS FROM cpu_attn.py ──────────────────────────────
+// ─── THREE RECORDED DEVIATIONS FROM cpu_attn.py ────────────────────────────
 //
 // 1. `get_kv_cache_shape` returns the NHD 5-dim shape
 //    (num_blocks, 2, block_size, num_kv_heads, head_size), NOT upstream's HND
@@ -45,6 +45,31 @@
 //    outside upstream's list. Declaring upstream's list would refuse work this
 //    binary performs correctly — which is the same class of untrue capability
 //    claim #1332 was opened for, pointed the other way.
+//
+//    Say the direction out loud, because it is the unusual one: an EMPTY list is
+//    WIDER than upstream's, not narrower. This backend accepts any head size,
+//    including sizes upstream's CPU kernel refuses, and including 0 — which the
+//    base predicate treats as unconstrained rather than as a value
+//    (`backend.cpp::AttentionBackend::supports_head_size`, backend.py:158-161).
+//    That is the base class's own default for a backend with no fixed-width
+//    dispatch, and it is a true statement about our scalar kernel; it is still a
+//    wider claim than the file this one is ported from makes, and a future CPU
+//    kernel that gains head-size specialization owes this list its real entries.
+//
+// 3. `supported_kv_cache_dtypes` omits "fp8_e5m2", where cpu_attn.py:47-52 lists
+//    FOUR entries ["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]. Our CPU KV-fp8 arm has
+//    one encoding: `KvKind::kFp8` resolves to `LoadKvFp8E4M3` and nothing else
+//    (`src/vt/cpu/cpu_paged_attn.cpp::KvElem`), and both vt entry points
+//    VT_CHECK-refuse an e5m2 KV cache (`src/vt/ops.cpp`, "fp8_e5m2 CPU compute /
+//    read is a named later brick"). Claiming e5m2 would select this backend for a
+//    cache it cannot read, so the entry is dropped rather than claimed.
+//
+//    This is NOT the same omission FlashAttentionBackend makes, and an earlier
+//    draft of this comment said it was. FLASH_ATTN's list here is
+//    ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3"], which is
+//    flash_attn.py:71-78 VERBATIM — upstream's FA backend never claimed e5m2, so
+//    nothing was trimmed from it and it is no precedent for anything. This
+//    deviation stands on our own kernel's single encoding, and on that alone.
 #ifndef VLLM_V1_ATTENTION_BACKENDS_CPU_ATTN_H_
 #define VLLM_V1_ATTENTION_BACKENDS_CPU_ATTN_H_
 
@@ -76,17 +101,18 @@ class CpuAttentionBackend final : public AttentionBackend {
   std::vector<vt::DType> supported_dtypes() const override {
     return {vt::DType::kF16, vt::DType::kBF16, vt::DType::kF32};
   }
-  // cpu_attn.py:47-52, minus "fp8_e5m2". The KV-FP8 arm of our CPU kernel is
-  // e4m3 only (`KvKind::kFp8` -> LoadKvFp8E4M3, cpu_paged_attn.cpp), so e5m2 is
-  // omitted rather than claimed. FlashAttentionBackend's list is trimmed for
-  // exactly the same reason.
+  // DEVIATION 3 in the file header — cpu_attn.py:47-52 minus "fp8_e5m2". The
+  // KV-FP8 arm of our CPU kernel is e4m3 only (`KvKind::kFp8` -> LoadKvFp8E4M3,
+  // cpu_paged_attn.cpp), so e5m2 is omitted rather than claimed. FLASH_ATTN's
+  // shorter list is NOT a precedent: it is flash_attn.py's own list verbatim.
   std::vector<std::string> supported_kv_cache_dtypes() const override {
     return {"auto", "fp8", "fp8_e4m3"};
   }
   // cpu_attn.py:54-56 — MultipleOf(16).
   std::vector<int> get_supported_kernel_block_sizes() const override { return {16}; }
   // DEVIATION 2 in the file header. An empty list is "no constraint"
-  // (backend.py:158-161), which is what our scalar CPU kernel actually offers.
+  // (backend.py:158-161), which is what our scalar CPU kernel actually offers —
+  // a WIDER claim than upstream's eleven sizes, 0 included. See the header.
   std::vector<int> get_supported_head_sizes() const override { return {}; }
   // cpu_attn.py:66-68.
   bool supports_non_causal() const override { return true; }

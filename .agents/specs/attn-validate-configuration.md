@@ -215,7 +215,8 @@ its capability by constructor argument.
 | Upstream case | Ported as |
 |---|---|
 | `test_backend_selection` (cuda/cpu arms) | selection under a fully populated config still resolves `FLASH_ATTN` on sm_121 and sm_100 |
-| `test_fp32_fallback` | an `f32` request finds no valid backend and the refusal names `dtype not supported`; upstream lands on `FLEX_ATTENTION`, which this tree does not register |
+| `test_fp32_fallback` (cuda arm) | an `f32` request finds no valid backend and the refusal names `dtype not supported`; upstream lands on `FLEX_ATTENTION`, which this tree does not register |
+| `test_fp32_fallback` (cpu arm, `test_attention_selector.py:230-241`) | ported at the #1371 repair, in `tests/vllm/v1/attention/test_attn_backend_registry.cpp`: on a CPU platform an `f32` request resolves `CPU_ATTN`, which is upstream's assertion verbatim. It could not be ported when this row landed, because `CPU_ATTN` had no registrar and the CPU's only backend declared `{f16, bf16}`. The hip arm stays unported and says why in the case: it asserts a refusal that upstream derives from ROCm's minimum head size of 32, and `RocmAttentionBackend` declares no head-size list, so the throw would arrive for the wrong reason |
 | `test_flash_attn` (upstream `pytest.skip`s it) | its five assertions ported as direct predicate cases: capability `(7,5)`, dtype `fp8`, `kv_cache_dtype="fp8"`, `block_size=8`, `head_size=17` |
 | `test_per_head_quant_scales_backend_selection` | `FLASH_ATTN` + `use_per_head_quant_scales` is refused and the reason names it |
 | `test_non_causal_backend_selection`, `test_non_causal_autoselect_backend` | `FLASH_ATTN` advertises `supports_non_causal()` and a non-causal request selects it |

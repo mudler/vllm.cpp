@@ -1,6 +1,6 @@
 // Ported from: vllm/v1/attention/backends/cpu_attn.py @ pin 5559679229
-// (CPUAttentionBackend). See the header for the two recorded deviations and for
-// why registering this name is the fix for issue #1371.
+// (CPUAttentionBackend). See the header for the three recorded deviations and
+// for why registering this name is the fix for issue #1371.
 #include "vllm/v1/attention/backends/cpu_attn.h"
 
 #include <memory>

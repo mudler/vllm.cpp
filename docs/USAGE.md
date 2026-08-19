@@ -791,6 +791,14 @@ If you see the refusal above naming `FLASH_ATTN` alone on a device that is not a
 NVIDIA GPU, that is the shape to report: the rule quoted at you is about a kernel
 your device never runs.
 
+One consequence is worth stating on its own, because it widens what a CPU run
+accepts. `CPU_ATTN` serves **`f32` as well as `f16` and `bf16`**, which is what
+the reference engine's CPU backend serves. `FLASH_ATTN` declares the two half
+dtypes only, so while the CPU was borrowing it an `f32` model was refused at
+initialization with `dtype not supported`. It now runs. The KV-cache dtypes the
+CPU accepts are `auto`, `fp8` and `fp8_e4m3`; `fp8_e5m2` is refused by name,
+because the CPU kernel's fp8 arm reads e4m3 alone.
+
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend
 whose declared floor is compute capability 8.0 is accepted on any newer GPU, even

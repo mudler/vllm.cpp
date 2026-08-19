@@ -10,6 +10,28 @@
 
 namespace vllm::v1 {
 
+void RefuseDflash2CandidateSelector(const Qwen3DFlashWeights& weights) {
+  if (!weights.IsDflash2()) return;
+  VT_CHECK(false,
+           "dflash2: this draft is a DFlash2 draft (its dflash_config declares "
+           "conv_kernel_size/conv_group_size and its layers carry the "
+           "attention_conv/mlp_conv tensors). Its grouped dynamic depthwise "
+           "convolution IS implemented and just ran; its CANDIDATE SELECTOR is not. "
+           "Upstream replaces the per-slot argmax with a scored path walk over the "
+           "target head's top-K -- CandidateSelector "
+           "(vllm/model_executor/models/qwen3_dflash2.py) plus the walk kernel and "
+           "the realized-q draft-logit cache "
+           "(vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py) @ "
+           "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f. "
+           "Sampling this block with the DFlash1 per-slot argmax instead would "
+           "succeed and propose worse tokens with NO visible symptom: the verify is "
+           "lossless, so the emitted tokens are still the target's and only "
+           "acceptance falls. Owed by row SPEC-DFLASH2 wave W3 "
+           "(.agents/specs/dflash2-spec-decode.md), issue #1314 "
+           "(https://github.com/mudler/vllm.cpp/issues/1314). Use a DFlashDraftModel "
+           "checkpoint until that wave lands.");
+}
+
 std::vector<std::vector<int32_t>> SampleDflashBlockDrafts(
     const std::vector<float>& block_logits, int num_reqs, int k,
     int64_t draft_vocab) {
@@ -73,6 +95,9 @@ DflashProposeResult DflashProposeBlock(
       Qwen3DFlashModel::ForwardBlockLogitsWithContext(
           context_states, context_positions, ctx_cu, block_input_ids,
           block_positions, block_cu, weights, config, queue);
+
+  // SPEC-DFLASH2 W2 (#1314): the conv has run; the selector has not been ported.
+  RefuseDflash2CandidateSelector(weights);
 
   DflashProposeResult out;
   out.draft_token_ids = SampleDflashBlockDrafts(block_logits, num_reqs, k,

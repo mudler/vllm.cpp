@@ -158,7 +158,23 @@ Re-derived at this head after merging 161 commits of `main`, not carried from
 any earlier number. The population tables are in `## The defect` above and are
 not repeated here.
 
-**Rot: 38 — 32 `STALE`, 6 `BROKEN`, against 844 `OK`.**
+**Rot: 38 — 32 `STALE`, 6 `BROKEN`.**
+
+**The `OK` total is not written down, here or anywhere else.** `--report`
+derives it at read time, and it moves on every merge that adds or removes a
+citation, so a document that states it becomes false at the next landing.
+`record-anchor-baseline.json` refuses to store it for that reason, in its own
+`_comment`. Four prose surfaces stated it anyway: this spec, the
+`ENG-RECORD-ANCHOR-RATCHET` row in `engine-matrix.md`, `docs/BENCHMARKS.md` and
+`docs/STATUS.md`. All four said `844` where the tree at `678fc672c` reads `847`,
+because three good citations landed on `main` between the last measurement and
+the merge. AGENTS.md §Records names this shape directly: *never store a
+measurement of one file inside another file*. The count is therefore dropped
+rather than re-derived. What remains stated is the rot, which is gated against
+the baseline in both directions and cannot drift in silence, and the
+SHA-anchored population figures at `8daa67b39`, which give the same sense of
+scale without a live number. [#1324](https://github.com/mudler/vllm.cpp/issues/1324)
+tracks the gate that would have caught the drift.
 
 The set is the 40 the fresh review verified by hand, minus one.
 `KERNEL-ATTN-MLA-SPARSE` cites `include/vllm/v1/attention/backend.h:271` for
@@ -288,6 +304,23 @@ exact invocations, each of which genuinely fails when the row regresses:
   instructions.
 - **Out of scope**: rewriting existing citations. The ratchet lets them be fixed
   by whoever next touches the row.
+
+## Owed
+
+Both were found by this row's own review and neither is fixed here, because each
+is a semantic checker change and owes its own spec, red-before mutation and
+fresh reviewer.
+
+- [#1324](https://github.com/mudler/vllm.cpp/issues/1324) — this row's figures
+  in `docs/BENCHMARKS.md` and `docs/STATUS.md` are read by no gate. Restoring
+  wrong values into the page leaves `check-public-doc-tables.py` and
+  `check-agent-record.py` both green, measured at `af87251c5`. The drift that
+  landed with the row is repaired; the gap that let it land is not.
+- [#1325](https://github.com/mudler/vllm.cpp/issues/1325) — the `"total"` key in
+  `scripts/record-anchor-baseline.json` is written and never read.
+  `load_record_anchor_baseline` returns the two buckets only, and
+  `write_record_anchor_baseline` refuses a raise against their `sum()`, so
+  corrupting `total` to disagree with them is inert.
 
 ## Now
 

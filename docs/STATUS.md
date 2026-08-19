@@ -1105,8 +1105,13 @@ projector, read its tower into the same Qwen3-VL weights the safetensors path
 builds, join the two-tensor temporal patch embedding, and refuse four wrong-file
 cases by name before the tokenizer.
 
-**Nothing runs that tower yet**, and no real `mmproj-BF16.gguf` has been read, so
-the 334-tensor accounting is owed by `QUANT-QWEN38-27B-GGUF-ARM`.
+The mapping is confirmed on the shipped bytes, not only on a fixture: the same
+reader runs over the real `mmproj-BF16.gguf` (931 146 432 B, GGUF v3, 334
+tensors, 35 keys) behind `VLLM_CPP_QWEN38_27B_MMPROJ`, and its 334 consumed
+names, its `clip.*` geometry and its two-half patch-embedding join all agree.
+CI keeps the synthetic fixture and reads no NAS file. **Nothing runs that tower
+yet**, and the committed 334-name manifest with its CI accounting is owed by
+`QUANT-QWEN38-27B-GGUF-ARM`.
 
 The other two arms are not implemented. The artifact published as
 `unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision` checkpoint

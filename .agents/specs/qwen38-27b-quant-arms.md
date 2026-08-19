@@ -777,12 +777,19 @@ departs from the [Port map](#load-gguf-mmproj) above.
   v19 note in `include/vllm.h` already records this for the input limits) and no
   GGUF image/video driver. Owed by `QUANT-QWEN38-27B-GGUF-ARM` (#821 W3), and
   listed under `## Owed` below.
-- **No real projector has been read.** Every gate here is a synthetic GGUF. The
-  334-tensor accounting against `mmproj-BF16.gguf` belongs to
-  `QUANT-QWEN38-27B-GGUF-ARM`, which is where the committed manifest lives.
-- **Deepstack is carried, not gated on real weights.** The discovery is exercised
-  synthetically; Qwen3.8-27B's projector has no DeepStack, which agrees with its
-  `deepstack_visual_indexes: []`, so that leg stays not-applicable here.
+- **No COMMITTED manifest, and no CI accounting against one.** The reader is now
+  confirmed against the real `mmproj-BF16.gguf` (see
+  [The live confirmation](#the-live-confirmation) below), but that confirmation
+  is env-gated and reads a file on the NAS. The committed 334-name manifest and
+  the accounting test that runs in CI without the bytes belong to
+  `QUANT-QWEN38-27B-GGUF-ARM`, which is where the manifest lives.
+- **Deepstack is carried, and no real weights EXERCISE it.** The discovery is
+  exercised synthetically. Qwen3.8-27B's projector taps nothing — its
+  `clip.vision.is_deepstack_layers` is 27 `false` values and it ships no
+  `v.deepstack.*` tensor, agreeing with the safetensors side's
+  `deepstack_visual_indexes: []` — so the live case can only confirm the EMPTY
+  answer. A projector that actually taps is owed to the first row that holds
+  one.
 
 ### The one departure from the Port map, and why
 
@@ -807,12 +814,72 @@ whether it wants the tower through `ModelSource` or off the engine, and it can
 add the field in the same change that reads it. **This is a design change from
 the committed spec and it wants an operator's ratification rather than silence.**
 
+### The live confirmation
+
+W1's CI gate is synthetic and stays synthetic: CI must not depend on a 931 MB
+file on a NAS share. Beside it, the same reader now runs over the artifact a
+user actually holds, behind `VLLM_CPP_QWEN38_27B_MMPROJ`. Unset, the case skips
+loudly; set, it adds 43 assertions to `test_clip_mmproj_gguf`.
+
+The file is `unsloth/Qwen3.8-27B-GGUF` @
+`fe1e2a23d973adb629709749dc4f6756df66ef10`, `mmproj-BF16.gguf`, 931 146 432 B,
+sha256 `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53`, GGUF
+v3, 334 tensors (110 BF16 + 224 F32), 35 metadata keys. Its companion language
+file is `Qwen3.8-27B-Q4_K_M.gguf`, 17 106 775 008 B, sha256
+`7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`, same repo
+and revision. Both sha256 values were computed locally on the mirrored copy.
+Both are third-party Unsloth quantizations, not first-party releases.
+
+**What the real bytes CONFIRMED**, none of it contradicted:
+
+- Every one of the eleven `clip.*` keys the reader requires is present under the
+  spelling it reads, and the geometry is hidden 1152, 16 heads, 27 blocks,
+  feed-forward 4304, projection 5120, patch 16, spatial merge 2, layer-norm
+  epsilon 1e-6.
+- `in_channels = 3` and `num_position_embeddings = 2304` come off the tensor
+  shapes, which is the only place the file states them, and the shapes are the
+  ones the reader's checks demand: `v.patch_embd.weight` is torch
+  `[1152, 3, 16, 16]` and `v.position_embd.weight` is torch `[2304, 1152]`.
+- **Both patch-embedding halves ship.** `v.patch_embd.weight.1` is present with
+  the identical shape, so the real artifact takes the ACCEPTING arm and the
+  refusal is for a file that is not this one. Both halves are F32 on this
+  artifact, so the live case reads them straight out of the mmap and checks the
+  join at all 1 769 472 positions without going through the same dequant helper
+  the reader uses.
+- The name map closes in both directions and nothing is left over. The 334
+  names the reader consumes are exactly the 334 the file ships: 27 blocks x 12,
+  plus `mm.0`/`mm.2` weight and bias, `v.post_ln` weight and bias,
+  `v.patch_embd` weight, `.weight.1` and bias, and `v.position_embd.weight`.
+- `v.post_ln` is 1152 wide — the PRE-shuffle hidden size, not the merged 4608 —
+  which is the FILE confirming `use_postshuffle_norm = false` rather than the
+  reader assuming it.
+- DeepStack discovery agrees with the file's own declaration: the reader finds
+  no tap from the tensor names, and `clip.vision.is_deepstack_layers` is 27
+  `false` values.
+
+**What it did NOT confirm.** The tower is loaded, never run, so nothing here
+says the weights produce correct activations. `general.file_type = 32` and the
+BF16 tensor half are dequantized through `DequantGgufRowToF32`, which this row
+does not gate. And the discovery still reads the TENSORS rather than
+`clip.vision.is_deepstack_layers`; the two agree on this file and only on this
+file, which is why the live case asserts both.
+
 ### Evidence
 
 - Red first, captured by building the tree with the reader stubbed and the
   loader hook absent: `test_clip_mmproj_gguf` 8/8 cases failed (0 passed),
   `test_gguf_mmproj_reach` 4/5 failed. Green after: 8/8 and 5/5, 272 and 19
   assertions, both `Status: SUCCESS!`.
+- The live case re-established its own red the same way, and its second
+  mutation is the one that says what the live case BUYS. Turning the join into
+  a concatenation reds it at `wrong == 0` (2 of 9 cases, 185 assertions).
+  Renaming `ffn_up` to `ffn_gate` in the reader AND in the synthetic fixture
+  together — a name-map defect the fixture agrees with — leaves the hermetic
+  gate **fully green at 9/9, 272 assertions, `Status: SUCCESS!`**, and reds only
+  the live case, by name: `missing tensor v.blk.0.ffn_gate.weight`. A fixture
+  cannot catch a name its own author got wrong; the shipped bytes can.
+  Green after both restores, verified by sha256: 9/9 at 272 assertions hermetic
+  and 9/9 at 315 assertions live, `test_gguf_mmproj_reach` 5/5 at 19.
 - Reachability mutation (the one `AGENTS.md` requires): deleting the
   `LoadQwen3VLVisionFromClipMmproj` call site in `model_loader.cpp` reds
   `test_gguf_mmproj_reach` (1 case, 3 assertions) and leaves
@@ -856,19 +923,27 @@ them:
   [#821](https://github.com/mudler/vllm.cpp/issues/821). Named here rather than
   left to be discovered: a tower that loads and never runs is exactly the shape
   [`reachability.md`](../reachability.md) exists to keep visible.
-- **The 334-tensor accounting against the REAL `mmproj-BF16.gguf`.** Every W1
-  gate is synthetic. The committed manifest and the live-file comparison belong
-  to `QUANT-QWEN38-27B-GGUF-ARM`.
-- The mirrored bytes and a **locally computed** sha256 for
-  `Qwen3.8-27B-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `model.safetensors` and
-  `model_mtp.safetensors`. Nothing in this spec records a hash it did not
+- **The COMMITTED 334-name manifest for `mmproj-BF16.gguf`, and the CI
+  accounting against it.** W1's CI gate is synthetic and its live comparison is
+  env-gated on a NAS file, so nothing in CI accounts for that artifact's tensor
+  set. The manifest, generated the way
+  `scripts/gen-muse-glimmer-gguf-manifest.py` generates one, belongs to
+  `QUANT-QWEN38-27B-GGUF-ARM`.
+- The mirrored bytes and a **locally computed** sha256 for `model.safetensors`
+  and `model_mtp.safetensors`. Nothing in this spec records a hash it did not
   compute, and no remote-reported hash may become one.
+  `Qwen3.8-27B-Q4_K_M.gguf` and `mmproj-BF16.gguf` are PAID: both are mirrored
+  and both hashes are recorded in
+  [The live confirmation](#the-live-confirmation) and in `docs/USAGE.md`.
 - `model_mtp.safetensors`'s own header parse. Its 15 tensor names came from
   `model.safetensors.index.json`, not from its header, and this spec says so
   rather than implying otherwise.
-- The `docs/USAGE.md` rows for all four artifacts, per
+- The `docs/USAGE.md` rows for the two SAFETENSORS artifacts, per
   [`porting-a-model.md`](../porting-a-model.md) §2.1. Owed by whichever row first
-  makes an arm reachable, not by this spec.
+  makes an arm reachable, not by this spec. The two GGUF rows are PAID: W1 made
+  `--mmproj` reachable, so it published the projector and its companion language
+  file under `docs/USAGE.md` §"The exact files this was gated against", named as
+  the third-party Unsloth quantizations they are.
 - A re-anchor pass over the `file:line` citations on **all three** surfaces this
   change publishes them on — this spec, the two `quantization-matrix.md` rows
   (which publish clickable `#L` permalinks), and the justifying comment in
@@ -888,7 +963,9 @@ merged as `250db75a2`, so the GGUF architecture dispatch names an unsupported
 file by its own architecture instead of falling through to qwen3_5's assert.
 A user can now pass `--mmproj mmproj-BF16.gguf` beside a `.gguf` model, and the
 projector is read, refused by name, or accepted with its tower held on the
-engine. Nothing runs that tower yet, and that is `## Owed`.
+engine. That is confirmed on the shipped 334-tensor artifact and not only on a
+fixture ([The live confirmation](#the-live-confirmation)); CI still reads the
+fixture alone. Nothing runs that tower yet, and that is `## Owed`.
 
 `QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` stay `READY`, both
 verified against the artifacts' own headers.

@@ -11,6 +11,9 @@
 // `b10451` = `10bf611e533d81f739128304991c5e133c6aebd8`.
 #include <doctest/doctest.h>
 
+#include <cstdlib>
+#include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -244,4 +247,203 @@ TEST_CASE("clip mmproj: a muse-glimmer projector gets MuseGlimmer's OWN recorded
   CHECK(message.find("MuseGlimmer GGUF") != std::string::npos);
   CHECK(message.find("1176") != std::string::npos);
   CHECK(message.find("safetensors checkpoint") != std::string::npos);
+}
+
+// ── The LIVE artifact ───────────────────────────────────────────────────────
+//
+// Everything above is synthetic, and stays that way: the synthetic fixture is
+// the CI gate, because CI must not depend on a 931 MB file on a NAS share.
+// This case is the CONFIRMATION — the same reader, over the bytes a user
+// actually holds — and it SKIPS LOUDLY when the file is not named:
+//
+//   VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf
+//     ./build/tests/test_clip_mmproj_gguf
+//
+// The artifact is `unsloth/Qwen3.8-27B-GGUF` @
+// `fe1e2a23d973adb629709749dc4f6756df66ef10`, file `mmproj-BF16.gguf`,
+// 931,146,432 bytes, sha256
+// 83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53. Its numbers
+// below were read OFF THAT FILE's header, not copied from this reader, so they
+// are an independent statement of what the container holds.
+//
+// What this case does NOT do: it is not the committed 334-name manifest. That,
+// and the accounting against it in CI, is owed by `QUANT-QWEN38-27B-GGUF-ARM`
+// (#821 W2) where the manifest lives.
+namespace {
+
+// The tensor names THIS reader consumes, restated from the real file's header
+// rather than from the reader's source, so a name the reader gets wrong is a
+// disagreement between two sources rather than a tautology.
+std::vector<std::string> LiveExpectedTensorNames(int64_t depth) {
+  std::vector<std::string> names = {
+      "v.patch_embd.weight", "v.patch_embd.weight.1", "v.patch_embd.bias",
+      "v.position_embd.weight", "v.post_ln.weight", "v.post_ln.bias",
+      "mm.0.weight", "mm.0.bias", "mm.2.weight", "mm.2.bias"};
+  for (int64_t l = 0; l < depth; ++l) {
+    const std::string p = "v.blk." + std::to_string(l) + ".";
+    for (const char* leaf :
+         {"ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+          "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight",
+          "attn_out.bias", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight",
+          "ffn_down.bias"}) {
+      names.push_back(p + leaf);
+    }
+  }
+  return names;
+}
+
+}  // namespace
+
+TEST_CASE("clip mmproj: the REAL Qwen3.8-27B projector maps name for name") {
+  const char* env = std::getenv("VLLM_CPP_QWEN38_27B_MMPROJ");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: set VLLM_CPP_QWEN38_27B_MMPROJ to the real "
+            "mmproj-BF16.gguf to confirm this mapping on the shipped bytes");
+    return;
+  }
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(std::string(env));
+
+  // It is the file this case is about. A wrong file must say so here rather
+  // than fail an arithmetic assert forty lines down.
+  REQUIRE(vllm::IsClipMmprojGguf(gguf));
+  REQUIRE(vllm::ClipProjectorType(gguf) == "qwen3vl_merger");
+  REQUIRE(gguf.Tensors().size() == 334);
+  REQUIRE_NOTHROW(vllm::RefuseUnsupportedClipMmproj(gguf, std::string(env)));
+
+  // ── The `clip.*` -> Qwen3VLVisionConfig mapping, on the real metadata ────
+  const vllm::multimodal::Qwen3VLVisionConfig cfg =
+      vllm::ClipMmprojVisionConfig(gguf);
+  CHECK(cfg.hidden_size == 1152);            // clip.vision.embedding_length
+  CHECK(cfg.num_heads == 16);                // clip.vision.attention.head_count
+  CHECK(cfg.depth == 27);                    // clip.vision.block_count
+  CHECK(cfg.intermediate_size == 4304);      // clip.vision.feed_forward_length
+  CHECK(cfg.out_hidden_size == 5120);        // clip.vision.projection_dim
+  CHECK(cfg.patch_size == 16);               // clip.vision.patch_size
+  CHECK(cfg.spatial_merge_size == 2);        // clip.vision.spatial_merge_size
+  CHECK(cfg.temporal_patch_size == 2);       // by construction; no kv states it
+  CHECK(cfg.in_channels == 3);               // off v.patch_embd.weight's shape
+  CHECK(cfg.num_position_embeddings == 2304);  // off v.position_embd.weight
+  CHECK(cfg.norm_eps == doctest::Approx(1e-6F).epsilon(1e-3));
+
+  // DeepStack, from two independent statements that must agree. We discover a
+  // tap from the TENSOR that names it; the file separately declares
+  // `clip.vision.is_deepstack_layers`, one bool per block. Qwen3.8-27B taps
+  // nothing, so both must be empty — and if a later projector taps something,
+  // this is the assert that catches a discovery reading the wrong one.
+  CHECK(cfg.deepstack_visual_indexes.empty());
+  const vllm::GgufValue* ds = gguf.FindKv("clip.vision.is_deepstack_layers");
+  REQUIRE(ds != nullptr);
+  REQUIRE(ds->TypeId() == vllm::kGgufArray);
+  const vllm::GgufArray& ds_arr = std::get<vllm::GgufArray>(ds->v);
+  CHECK(ds_arr.elems.size() == 27);
+  int declared_taps = 0;
+  for (const vllm::GgufValue& e : ds_arr.elems) {
+    if (e.TypeId() == vllm::kGgufBool && std::get<bool>(e.v)) ++declared_taps;
+  }
+  CHECK(declared_taps == 0);
+
+  // ── The `v.*` / `mm.*` name map: nothing missing, nothing unread ─────────
+  //
+  // Two directions, checked by two different things. FILE -> READER is the
+  // load below: every name the reader asks for must be in the file, and a
+  // missing one throws naming itself. READER -> FILE is this set difference,
+  // against the restatement above rather than against the reader's own
+  // strings, because comparing the reader with itself would pass by
+  // construction. The restatement is therefore load-bearing and is read off
+  // the artifact's header, not off the reader.
+  std::set<std::string> present;
+  for (const vllm::GgufTensorInfo& t : gguf.Tensors()) present.insert(t.name);
+  std::set<std::string> consumed;
+  for (const std::string& n : LiveExpectedTensorNames(cfg.depth)) {
+    consumed.insert(n);
+  }
+  CHECK(consumed.size() == 334);
+  std::vector<std::string> missing;   // named, not read
+  std::vector<std::string> unread;    // shipped, not consumed
+  for (const std::string& n : consumed) {
+    if (present.count(n) == 0) missing.push_back(n);
+  }
+  for (const std::string& n : present) {
+    if (consumed.count(n) == 0) unread.push_back(n);
+  }
+  CAPTURE(missing.empty() ? std::string("-") : missing.front());
+  CAPTURE(unread.empty() ? std::string("-") : unread.front());
+  CHECK(missing.empty());
+  CHECK(unread.empty());
+
+  // ── The two-half temporal patch embedding, on the shipped bytes ──────────
+  //
+  // The half this reader refuses a file for lacking is PRESENT here, so the
+  // real artifact takes the accepting arm; the refusal is for a file that is
+  // not this one.
+  REQUIRE(present.count("v.patch_embd.weight.1") == 1);
+  const vllm::GgufTensorInfo& h0 = gguf.Get("v.patch_embd.weight");
+  const vllm::GgufTensorInfo& h1 = gguf.Get("v.patch_embd.weight.1");
+  // Torch order [out, C, p, p], the shape the join's own check demands.
+  CHECK(h0.shape == std::vector<int64_t>{1152, 3, 16, 16});
+  CHECK(h1.shape == h0.shape);
+  // Both halves ship F32 on this artifact, so the values below are read
+  // STRAIGHT out of the mmap. That deliberately avoids gating the join through
+  // the same dequant helper the reader uses, which would prove consistency and
+  // not correctness.
+  REQUIRE(h0.ggml_type == 0);
+  REQUIRE(h1.ggml_type == 0);
+  const int64_t half_elems = 1152 * 3 * 16 * 16;
+  REQUIRE(h0.nbytes == static_cast<size_t>(half_elems) * sizeof(float));
+  std::vector<float> w0(static_cast<size_t>(half_elems));
+  std::vector<float> w1(static_cast<size_t>(half_elems));
+  std::memcpy(w0.data(), h0.data, h0.nbytes);
+  std::memcpy(w1.data(), h1.data, h1.nbytes);
+  // The halves must actually DIFFER, or an interleave and a concatenation
+  // would be indistinguishable and everything below would prove nothing.
+  bool halves_differ = false;
+  for (int64_t i = 0; i < half_elems && !halves_differ; ++i) {
+    halves_differ = w0[static_cast<size_t>(i)] != w1[static_cast<size_t>(i)];
+  }
+  REQUIRE(halves_differ);
+
+  const vllm::multimodal::Qwen3VLVisionWeights w =
+      vllm::LoadQwen3VLVisionFromClipMmproj(gguf, cfg);
+  REQUIRE(static_cast<int64_t>(w.patch_proj_w.size()) == 2 * half_elems);
+  // Every position, counted rather than asserted one CHECK at a time: 1.77 M
+  // doctest assertions would be the report, not the result.
+  const int64_t plane = 16 * 16;
+  int64_t compared = 0;
+  int64_t wrong = 0;
+  for (int64_t o = 0; o < 1152; ++o) {
+    for (int64_t c = 0; c < 3; ++c) {
+      const int64_t src = (o * 3 + c) * plane;
+      const int64_t dst = (o * 3 + c) * 2 * plane;
+      for (int64_t i = 0; i < plane; ++i) {
+        if (w.patch_proj_w[static_cast<size_t>(dst + i)] !=
+            w0[static_cast<size_t>(src + i)]) {
+          ++wrong;
+        }
+        if (w.patch_proj_w[static_cast<size_t>(dst + plane + i)] !=
+            w1[static_cast<size_t>(src + i)]) {
+          ++wrong;
+        }
+        compared += 2;
+      }
+    }
+  }
+  CHECK(wrong == 0);
+  // The loop ran over the whole operand. A bound that collapsed would leave
+  // `wrong == 0` true and prove nothing.
+  CHECK(compared == 2 * half_elems);
+
+  // ── The rest of the tower, at the widths the real metadata implies ───────
+  REQUIRE(w.blocks.size() == 27);
+  CHECK(static_cast<int64_t>(w.blocks[0].qkv_w.size()) == 3 * 1152 * 1152);
+  CHECK(static_cast<int64_t>(w.blocks[0].fc1_w.size()) == 4304 * 1152);
+  CHECK(static_cast<int64_t>(w.blocks[26].fc2_w.size()) == 1152 * 4304);
+  CHECK(static_cast<int64_t>(w.pos_embed_w.size()) == 2304 * 1152);
+  // `v.post_ln` is 1152 wide — the PRE-shuffle hidden size, not the merged
+  // 4608 — which is the file confirming `use_postshuffle_norm = false` rather
+  // than this reader assuming it.
+  CHECK(static_cast<int64_t>(w.merger.norm_w.size()) == 1152);
+  CHECK(w.merger.use_postshuffle_norm == false);
+  CHECK(static_cast<int64_t>(w.merger.fc1_w.size()) == 4608 * 4608);
+  CHECK(static_cast<int64_t>(w.merger.fc2_w.size()) == 5120 * 4608);
+  CHECK(w.deepstack_mergers.empty());
 }

@@ -3638,6 +3638,44 @@ any language-model weight byte is read:
   loading would mean inventing the other, and the result would be a fluent,
   wrong model rather than an error.
 
+#### The exact files this was gated against
+
+`--mmproj` was built and gated against the two files below. Both are
+**third-party quantizations by Unsloth**, not first-party releases from the model
+authors, and a repo id alone is not a pin, because a checkpoint gets re-quantized
+in place under an unchanged name.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| `clip` projector (`--mmproj`) | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `mmproj-BF16.gguf` | 931 146 432 | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` |
+| Q4_K_M language file (`--model`) | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `Qwen3.8-27B-Q4_K_M.gguf` | 17 106 775 008 | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` |
+
+Both sha256 values were computed locally on this project's mirrored copy, not
+read back from the hub.
+
+The projector is GGUF v3 with 334 tensors (110 BF16 + 224 F32) and 35 metadata
+keys, `general.architecture = clip`, `general.type = mmproj`,
+`clip.projector_type = qwen3vl_merger`. Its tower is 27 blocks of hidden 1152,
+16 heads, feed-forward 4304, patch 16, spatial merge 2, projected to 5120, with
+2304 position embeddings and no DeepStack tap — its
+`clip.vision.is_deepstack_layers` is 27 `false` values, and it ships no
+`v.deepstack.*` tensor.
+
+To re-run the mapping against those bytes rather than against the synthetic
+fixture CI uses, name the file and run the reader's own gate:
+
+```console
+VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf \
+  ./build/tests/test_clip_mmproj_gguf
+```
+
+Unset, the case skips loudly and the gate stays hermetic; CI never reads the
+file. **What is still owed on these artifacts** is the committed 334-name
+manifest and the CI accounting against it, the Q4_K_M arm's own tensor
+accounting and token gate, and any image or video answer at all —
+`QUANT-QWEN38-27B-GGUF-ARM`,
+[#821](https://github.com/mudler/vllm.cpp/issues/821).
+
 ### Per-prompt input limits
 
 vLLM caps how many items of each modality one prompt may carry

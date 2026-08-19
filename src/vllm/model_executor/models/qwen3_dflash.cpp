@@ -1012,11 +1012,24 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     VT_CHECK(ctx_cu.back() == static_cast<int32_t>(st.num_ctx),
              "ForwardBlockLogitsWithDeviceKV(paged): ctx_cu.back() must equal store num_ctx");
 
+    // `vt::GraphCaptureEnabled()` is the THIRD conjunct and it is not decoration
+    // (#1352, found and fixed while landing #1335). Before W5 this driver's
+    // capture was its own `BeginCapture` pair, so `VLLM_CPP_CUDAGRAPH` could not
+    // reach it and the two conjuncts below were the whole predicate. The capture
+    // is now the seam's, and the seam reads that switch itself — so without this
+    // conjunct `VLLM_CPP_CUDAGRAPH=0` would still route into the CAPTURE lane,
+    // run the eager warm pass, open an INERT scope, and run the whole
+    // `ForwardPagedBody` a SECOND time inside it. Two full draft forwards per
+    // propose, forever, because the driver would never reach `g_state == 2`.
+    // Not wrong, just wasteful, which is exactly the kind of defect that
+    // survives a token gate. Asking here makes the switch select this driver's
+    // existing single-forward eager path, which is what it means everywhere else.
     const bool graph_ok =
-        UseDflashGraph() && d.b.SupportsGraphCapture() &&
+        UseDflashGraph() && vt::GraphCaptureEnabled() && d.b.SupportsGraphCapture() &&
         platforms::GetPlatform(queue.device.type).support_static_graph_mode();
 
-    // --- Eager paged path (VT_DFLASH_GRAPH=0, or capture unsupported) ---------
+    // --- Eager paged path (VT_DFLASH_GRAPH=0, VLLM_CPP_CUDAGRAPH=0, or capture
+    //     unsupported) --------------------------------------------------------
     if (!graph_ok) {
       DBuf hidden(d, DType::kBF16, {Tq, H});
       {
@@ -1143,7 +1156,13 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
                  "DFlash draft graph: the capture was ABANDONED and its logits were "
                  "never computed; refusing to return uncaptured device memory");
       }
-      st.g_state = 0;  // inert: stay eager, and re-warm rather than re-capture
+      // INERT is now UNREACHABLE from here: `graph_ok` above required both
+      // `vt::GraphCaptureEnabled()` and `SupportsGraphCapture()`, which are the
+      // only two things that make a scope inert. Kept as a total branch rather
+      // than an assertion, because a future inert cause added to the seam must
+      // degrade to a correct eager step rather than to undefined behaviour —
+      // the region DID run eagerly, so `*lg` holds real values.
+      st.g_state = 0;  // stay eager, and re-warm rather than re-capture
       lg->Download(d, out.data());
       return out;
     }

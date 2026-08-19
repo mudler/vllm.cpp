@@ -49,14 +49,34 @@ namespace vllm_test {
 // vocabulary by logging.
 class CaptureCapableCpuBackend final : public vt::Backend {
  public:
-  explicit CaptureCapableCpuBackend(vt::Backend& inner) : inner_(inner) {}
+  // `supports_capture` is the CONTROL LANE switch. Passing false makes this the
+  // same delegating backend that answers `SupportsGraphCapture()` FALSE, so a
+  // driver's own predicate sends it down its eager path — which is the lane a
+  // gate has to compare against to tell "the switch chose eager" apart from
+  // "the switch made the capture inert and the forward ran twice" (#1352).
+  explicit CaptureCapableCpuBackend(vt::Backend& inner, bool supports_capture = true)
+      : inner_(inner), supports_capture_(supports_capture) {}
 
-  void* Alloc(size_t bytes) override { return inner_.Alloc(bytes); }
+  // ALLOCATIONS ARE COUNTED, and the reason is LANE IDENTITY rather than memory.
+  // ENG-CUDAGRAPH-BREAK W5 (#1352) needed to tell apart two versions of a driver
+  // that produce IDENTICAL logits and BOTH report `segments_captured == 0` — the
+  // one that takes its eager path under `VLLM_CPP_CUDAGRAPH=0`, and the one that
+  // takes the CAPTURE path and runs the forward twice inside an inert scope.
+  // Neither a token gate nor the seam's counters can see that difference. What
+  // can is the comparison against a backend that CANNOT capture: with the switch
+  // off the two must allocate exactly the same, because they must be running the
+  // same code. The count is an EQUALITY against a control, never a magic number,
+  // so it does not go stale when the driver's allocation pattern changes.
+  void* Alloc(size_t bytes) override {
+    ++allocs_;
+    return inner_.Alloc(bytes);
+  }
   void Free(void* p) override { inner_.Free(p); }
   void Memset(vt::Queue& q, void* p, int v, size_t bytes) override {
     inner_.Memset(q, p, v, bytes);
   }
   void Copy(vt::Queue& q, void* dst, const void* src, size_t bytes) override {
+    ++copies_;
     inner_.Copy(q, dst, src, bytes);
   }
   vt::Queue CreateQueue() override { return inner_.CreateQueue(); }
@@ -78,7 +98,7 @@ class CaptureCapableCpuBackend final : public vt::Backend {
   }
   bool SupportsAuxStream() const override { return inner_.SupportsAuxStream(); }
 
-  bool SupportsGraphCapture() const override { return true; }
+  bool SupportsGraphCapture() const override { return supports_capture_; }
   void BeginCapture(vt::Queue&) override { log_.push_back("Begin"); }
   void* EndCaptureGraph(vt::Queue&) override {
     // Arm-once refusal, the shape of a real `cudaStreamEndCapture` returning
@@ -106,6 +126,20 @@ class CaptureCapableCpuBackend final : public vt::Backend {
 
   void FailNextEndCapture() { fail_next_end_ = true; }
 
+  // COPIES, not allocations, and the difference is the DevicePool. A pooled
+  // allocator serves the second of two identical forwards out of its free list
+  // without calling `Alloc` at all, so an allocation count reads 11 for the
+  // first lane measured and 0 for the second REGARDLESS of which lanes they
+  // were — an instrument that reports the ORDER of the runs rather than their
+  // shape. Copies are per-operation work the pool cannot absorb, so they count
+  // the forward rather than the allocator's history (#1352).
+  int64_t copies() const { return copies_; }
+  int64_t allocs() const { return allocs_; }
+  void ResetCounters() {
+    copies_ = 0;
+    allocs_ = 0;
+  }
+
   size_t Count(std::string_view what) const {
     size_t n = 0;
     for (const auto& e : log_)
@@ -115,7 +149,10 @@ class CaptureCapableCpuBackend final : public vt::Backend {
 
  private:
   vt::Backend& inner_;
+  bool supports_capture_ = true;
   bool fail_next_end_ = false;
+  int64_t allocs_ = 0;
+  int64_t copies_ = 0;
   std::vector<std::string> log_;
   std::vector<void*> tags_;
 };
@@ -168,10 +205,10 @@ class StaticGraphCpuPlatform final : public vllm::platforms::Platform {
 // was there.
 class StaticGraphCpu {
  public:
-  StaticGraphCpu()
+  explicit StaticGraphCpu(bool supports_capture = true)
       : prev_backend_(&vt::GetBackend(vt::DeviceType::kCPU)),
         prev_platform_(&vllm::platforms::GetPlatform(vt::DeviceType::kCPU)),
-        backend_(*prev_backend_),
+        backend_(*prev_backend_, supports_capture),
         platform_(*prev_platform_, backend_) {
     vt::RegisterBackend(vt::DeviceType::kCPU, &backend_);
     vllm::platforms::RegisterPlatform(vt::DeviceType::kCPU, &platform_);

@@ -35,8 +35,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -295,4 +302,114 @@ TEST_CASE("dflash draft graph: an abandoned capture propagates instead of return
       stores, ctx_cu, ids, pos, block_cu, w, cfg, q);
   CHECK(after.size() == static_cast<size_t>(3) * dm.vocab);
   CHECK(vt::GetGraphBreakStats().segments_captured == 1);
+}
+
+
+// ---------------------------------------------------------------------------
+// #1352 — THE KILL SWITCH MUST SELECT THE EAGER LANE, not an inert capture lane.
+// ---------------------------------------------------------------------------
+//
+// WHY THIS NEEDS AN UNUSUAL INSTRUMENT, stated before the code so the shape is
+// not mistaken for cleverness. The defect it gates produces IDENTICAL logits and
+// leaves `segments_captured` at 0 in BOTH versions, so a token gate is blind to
+// it and so are the seam's own counters. What differs is which CODE PATH ran:
+// with the fix, `VLLM_CPP_CUDAGRAPH=0` sends the driver down its existing eager
+// paged path; without it, the driver takes the CAPTURE path, runs its eager warm
+// pass, opens an INERT scope and runs the whole forward a SECOND time inside it.
+//
+// So the assertion is LANE IDENTITY against a control that cannot be argued
+// with: a backend that CANNOT capture takes the eager path by construction, and
+// a capture-capable backend with the switch OFF must then allocate EXACTLY the
+// same amount, because it must be running exactly the same code. An equality
+// against a live control, never a magic number, so it does not go stale when the
+// driver's allocation pattern changes.
+//
+// IT RUNS IN A CHILD PROCESS for the reason `test_breakable_graph`'s T4 does:
+// `vt::GraphCaptureEnabled()` is read once per process into a function-local
+// static, so no case inside a running process can toggle it.
+TEST_CASE("dflash draft graph: VLLM_CPP_CUDAGRAPH=0 takes the EAGER lane, not an inert capture") {
+  const char* sentinel_path = std::getenv("VLLM_CPP_DFLASH_KILLSWITCH_SENTINEL");
+  if (sentinel_path != nullptr) {
+    // ---- CHILD ARM: this process was started with VLLM_CPP_CUDAGRAPH=0. ----
+    REQUIRE_FALSE(vt::GraphCaptureEnabled());
+
+    Dims dm;
+    HfConfig cfg = MakeConfig(dm);
+    Qwen3DFlashWeights w = MakeWeights(dm);
+    vt::Queue q = Cpu();
+    const std::vector<float> ctx = Ctx(3, dm.H);
+    const std::vector<int32_t> ids = {2, 7, 7};
+    const std::vector<int32_t> pos = {3, 4, 5};
+    const std::vector<int32_t> block_cu = {0, 3};
+    const std::vector<int32_t> ctx_cu = {0, 3};
+
+    // Measures one propose on a given lane: the allocation count and the logits.
+    const auto run = [&](bool supports_capture, int64_t* copies) {
+      vllm_test::StaticGraphCpu harness(supports_capture);
+      auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+      Qwen3DFlashModel::AppendContextKVDevice(*store, ctx, {0, 1, 2}, w, cfg, q);
+      std::vector<DflashDeviceKVStore*> stores = {store.get()};
+      harness.backend().ResetCounters();
+      std::vector<float> out = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+          stores, ctx_cu, ids, pos, block_cu, w, cfg, q);
+      *copies = harness.backend().copies();
+      return out;
+    };
+
+    vt::ResetGraphBreakStats();
+    int64_t cannot_capture_copies = 0, switch_off_copies = 0;
+    const std::vector<float> control = run(/*supports_capture=*/false, &cannot_capture_copies);
+    const std::vector<float> switched_off = run(/*supports_capture=*/true, &switch_off_copies);
+
+    // Nothing captured in either lane, which is the part BOTH versions satisfy
+    // and which is therefore NOT the discriminator. It is asserted anyway,
+    // because a version that captured here would be a different defect.
+    REQUIRE(vt::GetGraphBreakStats().segments_captured == 0);
+    REQUIRE(cannot_capture_copies > 0);  // the control actually did work
+
+    // THE DISCRIMINATOR. Same lane => same allocations, exactly.
+    const bool same_lane = (switch_off_copies == cannot_capture_copies);
+    // ... and the same numbers, which holds in both versions and is here so a
+    // failure of the line above cannot be dismissed as the two lanes computing
+    // different things.
+    bool identical = control.size() == switched_off.size();
+    for (size_t i = 0; identical && i < control.size(); ++i)
+      if (control[i] != switched_off[i]) identical = false;
+
+    std::ofstream out(sentinel_path);
+    out << (same_lane ? "SAME-LANE" : "DIFFERENT-LANE") << " " << cannot_capture_copies << " "
+        << switch_off_copies << " " << (identical ? "IDENTICAL" : "DIVERGED");
+    return;
+  }
+
+  // ---- PARENT ARM. ----
+#ifdef __linux__
+  char exe[4096] = {0};
+  const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  REQUIRE_MESSAGE(n > 0, "cannot resolve this test binary; the child arm cannot be run");
+  const std::filesystem::path sentinel =
+      std::filesystem::temp_directory_path() /
+      ("vllm_cpp_dflash_killswitch_" + std::to_string(::getpid()) + ".txt");
+  std::filesystem::remove(sentinel);
+  // The filter must match THIS case only, and doctest splits `-tc` on COMMAS,
+  // so the pattern carries none.
+  const std::string cmd = "VLLM_CPP_CUDAGRAPH=0 VLLM_CPP_DFLASH_KILLSWITCH_SENTINEL='" +
+                          sentinel.string() + "' '" + std::string(exe) +
+                          "' -tc='*EAGER lane*' >/dev/null 2>&1";
+  const int rc = std::system(cmd.c_str());
+  CHECK(rc == 0);
+  // The sentinel is what defeats "0 cases ran, SUCCESS!": a filter that matched
+  // nothing exits 0 and writes no file.
+  REQUIRE(std::filesystem::exists(sentinel));
+  std::ifstream in(sentinel);
+  std::string lane, control_copies, off_copies, values;
+  in >> lane >> control_copies >> off_copies >> values;
+  INFO("control(no-capture-support) copies=" << control_copies
+                                             << " switch-off copies=" << off_copies);
+  CHECK(lane == "SAME-LANE");
+  CHECK(values == "IDENTICAL");
+  std::filesystem::remove(sentinel);
+#else
+  MESSAGE("kill-switch child arm needs /proc/self/exe; not run on this platform");
+#endif
 }

@@ -588,7 +588,19 @@ ENGINE_PREFIXES = (
 # head `19c93519`, base `9842d701`); the parity pin `555967922` does not carry the
 # architecture at all, so this row does not advance the pin. `READY`, spec
 # `specs/dflash2-spec-decode.md`, issue #1314.
-# 166: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
+# 163 since 2026-08-18: +`ENG-EXPERT-STREAM-DEVICE` (the DESTINATION half of expert
+# streaming -- where a streamed slice lives and which platform may read it). Genuinely
+# new and not expressible by `ENG-EXPERT-STREAM` beside it: that row owns the streaming
+# MECHANISM -- the slot cache, the streamer, the `pread` filler and the host store --
+# and all of it landed and runs on `--device cpu`, while this row changes only the
+# destination those bytes are written to and the predicate that decides who may read
+# them. The two have different hardware requirements and different lifecycle states:
+# the parent is `READY` with a live CPU lane, and this one cannot reach its own
+# discrete-GPU gate on any box the project owns. Surpass-track, no oracle: inference-time
+# disk expert paging is absent in pinned vLLM (`offloader/uva.py:21`,
+# `offloader/prefetch.py:557-560`) and no secondary oracle implements it either.
+# `READY`, spec `specs/expert-stream-device-slots.md`, issue #1124.
+# 167: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
 # container image and no release archive can obtain a checkpoint: the runtime
 # stage carries no Python and no `curl`, while `docker/Dockerfile:188-192`
 # already sets `HF_HOME=/cache` and declares the `/cache` volume for a fetch
@@ -599,7 +611,7 @@ ENGINE_PREFIXES = (
 # DFlash draft alone and never downloads. `READY`, spec
 # `specs/hf-model-download.md`, issue #1280.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 166
+ENGINE_ROWS = 167
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

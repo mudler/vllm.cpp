@@ -1810,8 +1810,7 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   (`include/vt/persistent_step_input.h`, `step_token_ids.h`) state the same
   thing, and a record asserting a reader exists is exactly the drift the header
   repairs in this change were made to end. Reached from `ModelRegistry::Forward`
-  through
-  `qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp` and
+  through `qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp` and
   `glm4_moe_lite_registry.cpp`, and gated at
   `tests/vllm/models/test_moe_async_device_ids.cpp`, which enters at that entry
   point over a synthetic safetensors checkpoint and reds when the registry's
@@ -1993,10 +1992,12 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   not. `.agents/engine-matrix.md`'s row and the pull-request body carry this same
   correction. `.agents/issue-index.md`'s row is APPEND-ONLY and cannot be edited,
   so it still presents `8 cases, 7 passed, 1 failed, 135 of 135` as the
-  measurement; **this spec and the issue are the authority over that row.** It is ORDER-DEPENDENT: `-tc="W6*"` alone passes at 9/9,
-  exit 0, so the crash needs state an earlier case in the same process left
-  behind. `gdb` puts the fault inside `vt::cpu::PagedAttentionKernel` on a
-  threadpool worker, which is what a block table or slot mapping that does not
+  measurement; **this spec and the issue are the authority over that row.**
+
+  It is ORDER-DEPENDENT: `-tc="W6*"` alone passes at 9/9, exit 0, so the crash
+  needs state an earlier case in the same process left behind. `gdb` puts the
+  fault inside `vt::cpu::PagedAttentionKernel` on a threadpool worker, which is
+  what a block table or slot mapping that does not
   describe the handed KV cache looks like. Reverse-applying #1305's whole source
   change and rebuilding leaves the same exit 139, and that change executes none
   of this binary's crashing path. NOT fixed in flow: a segmentation fault in

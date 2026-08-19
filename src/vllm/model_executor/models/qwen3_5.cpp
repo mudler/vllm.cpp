@@ -545,6 +545,27 @@ detail::DeviceTokenIds& detail::DeviceTokenIdsOverride() {
   return ids;
 }
 
+// #1305 — THE CONSUMER SIDE, once, beside the publisher it reads. See
+// `qwen3_5_internal.h` for what each argument means and why the copy goes on the
+// queue. Four models call these: this one, `qwen3.cpp`, `qwen3_moe.cpp` and
+// `deepseek_v2.cpp`, each of which used to carry its own copy of both bodies.
+detail::DeviceTokenIds detail::TakeDeviceTokenIds() {
+  const DeviceTokenIds ov = DeviceTokenIdsOverride();
+  if (ov.ids != nullptr) DeviceTokenIdsOverride() = DeviceTokenIds{};
+  return ov;
+}
+
+bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
+                                 void* dst, int64_t dst_count, const char* what) {
+  const DeviceTokenIds ov = TakeDeviceTokenIds();
+  if (ov.ids == nullptr) return false;
+  VT_CHECK(ov.count <= dst_count,
+           std::string(what) + ": device input ids longer than the embed input");
+  backend.Copy(queue, dst, ov.ids,
+               static_cast<size_t>(ov.count) * sizeof(int32_t));
+  return true;
+}
+
 vt::DType detail::ResolveMambaSsmCacheDType(const HfConfig& config,
                                             vt::DType conv_dtype) {
   const std::string& dtype = config.mamba_ssm_dtype;
@@ -7801,17 +7822,11 @@ detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
 // (the multimodal helper embeds a prompt and then single tokens); consuming on
 // first use means those cannot be handed ids that were never meant for them.
 // The first embed in a registry forward is always the step's own.
+// #1305: the take-and-clear and the bounds-checked copy this used to spell out
+// are `detail::ApplyDeviceTokenIds` (defined above, declared in
+// `qwen3_5_internal.h`), one body for the four models that consume the scope.
 static void ApplyDeviceTokenIdsOverride(Dev d, DBuf& dids, int64_t T) {
-  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
-  if (ov.ids == nullptr) return;
-  detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
-  // A device buffer LONGER than the embed's input would run past the end. That
-  // can only mean the runner and the model disagree about this step's shape, so
-  // fail loudly rather than corrupt the embedding.
-  VT_CHECK(ov.count <= T,
-           "qwen3_5 embed: device input ids longer than the embed input");
-  d.b.Copy(d.q, dids.ptr(), ov.ids,
-           static_cast<size_t>(ov.count) * sizeof(int32_t));
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3_5 embed");
 }
 
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
@@ -10132,6 +10147,13 @@ struct Qwen3_5DecodeGraph::Impl {
     int fa_cols = -1;                 // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
+    // #1380: what the EAGER step at THIS shape demanded of the scratch pool, per
+    // size class. Taken at the end of the cold step and handed back to
+    // `DevicePool::PreGrowForCapture` immediately before this slot's capture, so
+    // every allocation the captured forward makes is a pool HIT. Per SLOT rather
+    // than per pool because two shapes interleave through one pool and the pool's
+    // own last-step state would answer for whichever step ran most recently.
+    DevicePool::StepDemand demand;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10243,6 +10265,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
+  // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
+  // reads the profile the COLD step at this shape recorded, and a profile is a
+  // property of one step, so the boundary is here and not inside a branch.
+  Pool(b).MarkStepBoundary();
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
 
@@ -10432,14 +10458,27 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // Pre-grow the pool for THIS slot's RETAINED [S,vocab] logits block while the
-      // OTHER ring slot's logits is held, so the captured logits alloc is a pool HIT
-      // (a cudaMalloc mid-capture aborts it). Working scratch is freed at
-      // ForwardLayers return and SAFELY shared between the two graphs — they replay
-      // sequentially on one stream, so only the retained logits needs two live
-      // copies. Alloc+free forces the (out-of-capture) growth; the block returns to
-      // the free list for the capture's own allocation to hit.
-      { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+      // block, on the reasoning that the capture RETAINS its logits while the
+      // other ring slot still holds its own, so the free list is one short. The
+      // retention half is right and the "one block of that shape" half is not:
+      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+      // ring slot's capture died in `dconv`, the GDN causal-conv output
+      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+      // inside a captured region aborts the capture. An alloc-and-free grows the
+      // pool only when that class's free list is EMPTY, so with one block free
+      // and TWO needed live at once it grew nothing at all.
+      //
+      // So the driver stops naming a tensor and asks the pool for the demand the
+      // EAGER step at this shape actually made (`s.demand`, taken at the end of
+      // the cold step). Working scratch is still freed at ForwardLayers return and
+      // still SAFELY shared between the two graphs -- they replay sequentially on
+      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+      // legal, and it is a no-op once the free list is deep enough.
+      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture. BuildStepDevInputs fills s.dev from the refreshed host vectors so
       // the capture step reads correct inputs; the persistent cos|sin (fused-preamble
@@ -10573,6 +10612,12 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
                           nullptr, /*mrope_cos_sin=*/nullptr, aux_ids_arg,
                           aux_out_arg);
   s.warm = true;
+  // #1380: the cold step is the ONE eager run of this exact forward at this exact
+  // shape, so it is where the capture's allocation demand is measurable. Recorded
+  // per SLOT and consumed by `PreGrowForCapture` at this slot's capture. Taken
+  // AFTER the forward and BEFORE the logits leave: the profile is a per-class
+  // PEAK, so it already holds every block this step had live at once.
+  s.demand = Pool(b).StepDemandProfile();
   publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
@@ -10652,6 +10697,13 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     int fa_cols = -1;                 // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
+    // #1380: what the EAGER step at THIS shape demanded of the scratch pool, per
+    // size class. Taken at the end of the cold step and handed back to
+    // `DevicePool::PreGrowForCapture` immediately before this slot's capture, so
+    // every allocation the captured forward makes is a pool HIT. Per SLOT rather
+    // than per pool because two shapes interleave through one pool and the pool's
+    // own last-step state would answer for whichever step ran most recently.
+    DevicePool::StepDemand demand;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10764,6 +10816,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
+  // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
+  // reads the profile the COLD step at this shape recorded, and a profile is a
+  // property of one step, so the boundary is here and not inside a branch.
+  Pool(b).MarkStepBoundary();
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
 
@@ -10953,13 +11009,27 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // Pre-grow the pool for THIS slot's RETAINED [S,vocab] logits block while the
-      // OTHER ring slot's logits is held, so the captured logits alloc is a pool HIT
-      // (a cudaMalloc mid-capture aborts it). Working scratch is freed at
-      // DenseForwardLayers return and SAFELY shared between the two graphs — they
-      // replay sequentially on one stream, so only the retained logits needs two
-      // live copies.
-      { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+      // block, on the reasoning that the capture RETAINS its logits while the
+      // other ring slot still holds its own, so the free list is one short. The
+      // retention half is right and the "one block of that shape" half is not:
+      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+      // ring slot's capture died in `dconv`, the GDN causal-conv output
+      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+      // inside a captured region aborts the capture. An alloc-and-free grows the
+      // pool only when that class's free list is EMPTY, so with one block free
+      // and TWO needed live at once it grew nothing at all.
+      //
+      // So the driver stops naming a tensor and asks the pool for the demand the
+      // EAGER step at this shape actually made (`s.demand`, taken at the end of
+      // the cold step). Working scratch is still freed at DenseForwardLayers return and
+      // still SAFELY shared between the two graphs -- they replay sequentially on
+      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+      // legal, and it is a no-op once the free list is deep enough.
+      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture (see the 35B driver). The dense fused-preamble arch (27B W4A4)
       // allocates + fills the persistent cos|sin here (pre-capture); the captured
@@ -11100,6 +11170,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                                impl_->config, {}, nullptr, nullptr, aux_ids_arg,
                                aux_out_arg);
   s.warm = true;
+  // #1380: the cold step is the ONE eager run of this exact forward at this exact
+  // shape, so it is where the capture's allocation demand is measurable. Recorded
+  // per SLOT and consumed by `PreGrowForCapture` at this slot's capture. Taken
+  // AFTER the forward and BEFORE the logits leave: the profile is a per-class
+  // PEAK, so it already holds every block this step had live at once.
+  s.demand = Pool(b).StepDemandProfile();
   publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.

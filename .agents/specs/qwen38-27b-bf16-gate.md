@@ -150,7 +150,13 @@ vLLM's breached that ceiling**, c8's included (12.92-14.99%).
 **At c8 the vLLM denominator is NOT MEASURABLE on this box at the recorded
 configuration.** That is the c8 answer, not a gap in it, and it is a statement
 about headroom and guard granularity here rather than a claim that vLLM is
-defective. Detail, trajectory and arithmetic in
+defective. A HOST REBOOT is now OBSERVED on this box on the benchmark day —
+`boot_id` changed, so it was not merely a lost k3s pod — but nothing ties that
+reboot to the worker loss behind this verdict, and `## Outcome` does not claim
+it does. What the reboot establishes on its own is narrower: against the reboot
+class of failure a sampling watchdog is not a guard at any cadence, because a
+userspace sampler dies with the kernel. Neither half creates a denominator.
+Detail, trajectory and arithmetic in
 [`../benchmark-record.md`](../benchmark-record.md).
 
 **What advances this row next** is a c1 pairing taken in a window the clock gate
@@ -255,6 +261,137 @@ log live during a failing leg and it is 27 lines, all startup, no error, no
 request line, no rejection. So the cause is not named yet, and a controlled
 reproduction recording HTTP status and exception class is the next step.
 
+**SETTLED, and the two halves of it are not equally strong.** This spec carried
+one question as owed: whether the HOST rebooted or only the k3s pod was lost
+when the c8 vLLM worker died. An `rc run` job on `dgx:gpu0`, job id
+`97cf3e63-e4a4-4506-bde7-f19f19be3bbf`, read the answer back. This is the probe
+log in full and verbatim, 312 bytes, sha256
+`25b88023d85dbd7c751389be6427547ceb75f58992be18ba6d7f421a0418fd94`:
+
+```text
+rc: queued at position 1 for dgx:gpu0
+rc: job 97cf3e63-e4a4-4506-bde7-f19f19be3bbf on dgx:gpu0
+BOOT_ID_NOW=64c495a3-8c9c-4b20-8496-a97efda0e332
+BOOT_ID_AT_BENCH=3fd9745a-d25a-426c-ba3c-97c958a85515
+VERDICT=REBOOTED -- the host boot_id changed since the 2026-08-19 benchmark
+UPTIME_S=38868
+MemAvailable_MB=117436
+```
+
+**THE HOST REBOOTED. That half is OBSERVED and it is certain.**
+`/proc/sys/kernel/random/boot_id` is generated once per kernel boot and is
+kernel-wide, so a changed value is a reboot and cannot be anything else. A pod
+restart, a container teardown and a `k3s` restart all leave it alone. The
+disjunction is retired: it was not merely a lost pod.
+
+**WHEN it rebooted is DERIVED, and it rests on an assumption this measurement
+does not test.** `UPTIME_S=38868` is `/proc/uptime` as read from INSIDE the `rc`
+worker, so it is the HOST's uptime only if that worker does not virtualize
+`/proc`. `lxcfs` and its equivalents do virtualize `/proc/uptime`; none of them
+can touch `boot_id`, which is why the observed half does not inherit this
+caveat. The worker is a k3s pod, where an unvirtualized `/proc` is the default,
+but nothing in these artifacts asserts that `lxcfs` is absent. The VALUE argues
+against virtualization by itself — a container-scoped `/proc/uptime` reports the
+POD's age, and 38,868 s is 10.8 h, which is not a plausible age for a job
+submitted minutes before the read — but an argument is not the assertion, so the
+caveat stands. Establishing it costs one line in a later job and no lease was
+taken for it here.
+
+**The bound is ONE-SIDED, and the interval an earlier draft of this section
+recorded was not.** That draft also said no tighter figure was honest, which was
+wrong in both directions: a tighter UPPER bound exists and the LOWER bound is
+not established at all. 38,868 s is 10:47:48. The probe
+log's last write is 21:29:35.606816Z, and that mtime is when the FINAL line
+(`MemAvailable_MB`) landed, so `UPTIME_S` was read strictly BEFORE it. The mtime
+is an UPPER bound on the read instant, not a midpoint, and 21:30:02Z — the run's
+reported completion — is later still. Both of the endpoints recorded earlier sit
+at or after the true read instant, so the interval they formed excluded the
+whole region the value occupies. The arithmetic:
+
+```text
+21:29:35.606816Z  -  10:47:48  =  10:41:47.606816Z
+```
+
+So the derived boot is **at or before 2026-08-19T10:41:47.6Z**, half a second
+later still if `UPTIME_S` rounds `/proc/uptime` rather than truncating it; the
+probe script was not retained, so which one is unknown. No LOWER bound is
+stated. One would have to come from when the probe STARTED rather than from
+anything in the log's content, and it would cross the same unpinned clock
+boundary as the upper one.
+
+**The two clocks are not pinned to each other and this measurement does not
+quantify the skew.** 21:29:35.606816Z is the mtime of a file on the LOCAL host,
+written there by the `rc` client. `UPTIME_S` was read on `dgx`, and the table
+below is `dgx`-side content plus mtimes on the shared CIFS mount. Neither is the
+local host's clock, so the derived instant is being compared across an offset
+nothing here measures.
+
+| Time (UTC) | Strength | Event |
+|---|---|---|
+| 10:18:51 | observed | c1 legs complete, `TEARDOWN_VERDICT=CLEAN`, `MemAvailable` 116,869 MB |
+| 10:18:54 | observed | c8 vLLM server launched, `SERVER_PID=123868`; also `job.log`'s last CONTENT line |
+| 10:25:07 | observed | c8 server answers `GET /health 200 OK`; `vllm-server-c8.log`'s last CONTENT line |
+| 10:25:26 | observed | last `MemAvailable` sample, 6,261 MB; nothing after it. `mem.samples` mtime is 10:25:28.570640 |
+| **at or before 10:41:47.6** | **derived** | **upper bound on the boot of the kernel now running** |
+| 11:26:32.079 | mtime only | `job.log` and `vllm-server-c8.log` both re-stamped. NOT a content write and NOT established as liveness |
+
+**The 11:26 row is a file mtime, and an earlier draft recorded it as `11:26:00`,
+"the job's last write".** It is neither. The actual mtimes are 11:26:32.079517600
+(`job.log`) and 11:26:32.079047100 (`vllm-server-c8.log`), **0.47 ms apart**,
+which is one bulk event touching both files rather than a job writing to either.
+No CONTENT anywhere in `out/vllm-20260819T095758Z/` is later than 10:25:07
+(`vllm-server-c8.log`) or 10:25:26 (`mem.samples`), and `job.log`'s last content
+line is the 10:18:54 launch banner.
+
+**Two readings of that row are possible, they are incompatible, and NEITHER is
+established.** If a process flushed at 11:26:32 then the box was alive at
+11:26:32, which contradicts a boot at or before 10:41:47.6Z that ended it. If it
+was a reaper or a CIFS flush, the last evidence of anything alive is
+`mem.samples` at 10:25:28.570640 and the derived boot is about 16 minutes AFTER
+it. The row is recorded at mtime strength and the tension is left open, not
+resolved by preferring whichever reading fits.
+
+**A second open discrepancy, from this box's own prior reboot.**
+[`../environment.md`](../environment.md) records that one with an exact
+`journalctl --list-boots` pair: boot `-1` ending 09:10:15Z against boot `0`
+beginning 09:13:55Z, about **3m40s** of downtime. Apply that shape here and a
+boot at 10:41:47 puts the box GOING DOWN around 10:38, thirteen minutes after
+every writer in the evidence directory had already stopped, which does not fit a
+simple crash at 10:25:28. Recorded as an open discrepancy and left unresolved:
+the 3m40s is one sample from one reboot, the bound above is one-sided so the
+true boot may be much earlier, and the two clocks are unpinned.
+
+**The WARMUP clause belongs to the worker LOSS, not to the boot.** The loss was
+during the untimed warmup before any timed leg ran; that is observed. At the
+derived boot instant nothing had written for about 16 minutes, so that instant is
+not "during the warmup". Measured against the observed marks, the bound sits at
+most 16m41s after the `/health` 200 and at most 16m22s after the last memory
+sample.
+
+**NOT established: that the reboot killed the worker.** Three things are
+consistent with it — the bound above, the descent `NOTES.txt` FINDING 4 records
+(9,738 -> 6,261 MB over ~40 s, then the worker lost between two 2-second
+samples), and this box's documented habit of rebooting instead of OOM-killing
+(`.agents/environment.md`). Consistency is not a trace. Nothing here ties the
+reboot to the worker's death, so it stays a hypothesis with a one-sided derived
+bound, exactly as this repository requires, and no record may read it as a cause.
+
+**No number moves.** This settles a provenance question and creates no
+denominator. The c8 vLLM denominator is still NOT MEASURABLE at the recorded
+configuration, the c1 pairing is still `PAIRING_VERDICT=DISCARD`, and neither
+cell becomes a ratio because of this finding. What the finding does is explain
+the shape of the absence.
+
+**What the reboot DOES establish about watchdogs, stated at its own scope.** A
+watchdog is a userspace process on the box, and a kernel reboot ends it with
+everything else, so against the REBOOT CLASS of failure there is no floor and no
+cadence at which a sampler lives long enough to report the event. That is a
+general property of samplers and kernels and it needs no causal link. It does
+NOT strengthen the campaign's separate conclusion about the c8 denominator,
+which would require the reboot to be what killed this worker — the thing the
+paragraph above declines to claim. `boot_id`, read after the fact, is the only
+instrument that saw the reboot at all.
+
 **What was NOT established.** Nothing about the vision path on this checkpoint,
 nothing about its NVFP4 or Q4_K_M arms (#821), no claim that #910 is fixed (this
 is the second checkpoint to be costed by it), and no throughput number at c1 or
@@ -267,10 +404,34 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   clock gate and the c8 denominator does not exist, so the row's own question —
   what our speed is against vLLM's production configuration at c1 and c8 — is
   still unanswered.
-- Whether the HOST rebooted or only the k3s pod was lost when the c8 vLLM worker
-  died on 2026-08-19. The artifacts cannot distinguish them. Settle it by
-  reading `/proc/sys/kernel/random/boot_id` inside any later `dgx:gpu0` job and
-  comparing it against `3fd9745a-d25a-426c-ba3c-97c958a85515`.
+- **The boot TIME, which is derived and one-sided.** The 2026-08-19 HOST reboot
+  is OBSERVED from `boot_id` and owes nothing to this item. Only the derived
+  bound — at or before 10:41:47.6Z — depends on the `dgx:gpu0` `rc` worker not
+  virtualizing `/proc/uptime`, and on a local-to-`dgx` clock offset that nothing
+  measures. `journalctl --list-boots` retires both at once, because it prints the
+  boot's own down and up timestamps in the host's clock and needs neither
+  `/proc/uptime` nor an independently known boot. **Whether a LEASED job can reach
+  it is itself unestablished, and this item must not assume that it can.** The
+  `boot_id` bullet in [`../environment.md`](../environment.md) states that the
+  boot list is a HOST instrument a pod does not have, which is exactly why
+  `boot_id` was the instrument here; a leased worker runs as root and may or may
+  not have the host journal mounted, and no artifact settles that. So the job is:
+  run `journalctl --list-boots` from inside a lease and record whether it answers
+  at all, and print `/proc/uptime` beside `date -u` in the same job so the
+  virtualization question falls out of the comparison either way. If the lease
+  cannot read the boot list, this item needs host access and stays owed. The
+  `thor:gpu0` build reboot that `../environment.md` records under
+  [#1380](https://github.com/mudler/vllm.cpp/issues/1380) reaches the same
+  instrument from the other side and leaves the same access question open, so one
+  job that answers it discharges part of both. No lease was taken here.
+- **Two open discrepancies around that bound, recorded rather than resolved.**
+  The `11:26:32` mtimes on `job.log` and `vllm-server-c8.log` are 0.47 ms apart
+  and admit two incompatible readings, one of which puts the box alive after the
+  derived boot. And the only `journalctl` downtime this repository has measured
+  on this box is ~3m40s, which applied here would put it going down around 10:38,
+  thirteen minutes after every writer had stopped. `## Outcome` states both. The
+  job above settles the second and bounds the first, if it can read the boot
+  list at all.
 - [#1355](https://github.com/mudler/vllm.cpp/issues/1355), the prompt-token
   divergence found in this campaign's raw result files: our server reported
   5,942 prompt tokens where vLLM reported 6,144 for the identical

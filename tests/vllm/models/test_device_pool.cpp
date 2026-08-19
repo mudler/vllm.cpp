@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/model_executor/models/device_pool.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/device.h"
@@ -459,4 +460,98 @@ TEST_CASE("device pool: a backend whose PLATFORM is unregistered is REFUSED, not
   q.device = Device{DeviceType::kXPU, 0};
   q.handle = nullptr;
   CHECK_THROWS_AS(DBuf(Dev{a, q}, DType::kF32, {64}), std::runtime_error);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1380: THE CAPTURE PRE-GROW SERVES THE STEP'S DEMAND, NOT ONE BLOCK.
+//
+// A `cudaMalloc` inside a captured region aborts the capture, so a decode-graph
+// driver has to make every allocation the captured forward performs a pool HIT.
+// Running the forward eagerly once first is necessary and not sufficient: the
+// capture RETAINS its `[S, vocab]` logits, so one block never returns to the
+// free list and the NEXT capture at that shape is one block short.
+//
+// `Qwen3_5DenseDecodeGraph` used to answer that by allocating and freeing ONE
+// `[S, vocab]` block before `BeginCapture`. That reasons about a TENSOR while
+// the pool reasons about a SIZE CLASS, and it is one block where the forward may
+// hold several of that class live at once. Measured on `thor:gpu0` (sm_110): the
+// second ring slot's capture of a speculative shape threw
+// `cudaMalloc: operation not permitted when stream is capturing` inside `dconv`,
+// the GDN causal-conv output, whose `[T, conv_dim]` bf16 lands in the same class
+// as the retained `[S, vocab]` f32 logits at that shape, and the measured peak
+// for the class was TWO.
+//
+// This case is that arithmetic with no GPU: one eager step holding two blocks of
+// one class at once, one block retained the way a captured graph retains its
+// logits, and then the pair of allocations the captured region would make.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST_CASE("device pool: a capture pre-grow serves the STEP's demand, not one block") {
+  if (PoolBypass()) {
+    // The bypass lane has no free list at all — every Get is a driver Alloc —
+    // so "the free list is deep enough" is not a question it can be asked. The
+    // lane stays usable as a discriminator instead of reddening here.
+    MESSAGE("SKIP: VT_POOL_BYPASS=1 removes the free list this case measures");
+    return;
+  }
+  TagBackend& a = NewBackend();
+  Queue qa = QueueOn(0);
+  vllm::DevicePool& pool = vllm::Pool(a);
+  const std::vector<int64_t> shape{2048};  // 8192 bytes @ f32 — this case's class
+  const size_t key = vllm::DevicePool::SizeClassForTest(8192);
+
+  // ONE eager step at this shape. It holds TWO blocks of the class live at the
+  // same time and returns both, which is exactly what a forward does when its
+  // working scratch and its output land in one class.
+  pool.MarkStepBoundary();
+  {
+    DBuf scratch(Dev{a, qa}, DType::kF32, shape);
+    DBuf out(Dev{a, qa}, DType::kF32, shape);
+    CHECK(scratch.ptr() != out.ptr());
+  }
+  const vllm::DevicePool::StepDemand demand = pool.StepDemandProfile();
+  int64_t peak = 0;
+  for (const auto& e : demand)
+    if (e.first == key) peak = e.second;
+  CHECK(peak == 2);  // the PROFILE, and it is the number the pre-grow needs
+
+  // The previous capture retained its logits: one block leaves circulation for
+  // good, exactly as `SizeSlot::logits` does. The free list is now ONE deep
+  // against a demand of two, which is the whole defect.
+  auto retained = std::make_unique<DBuf>(Dev{a, qa}, DType::kF32, shape);
+
+  const int allocs_before = a.allocs();
+  pool.PreGrowForCapture(a, demand);
+  const int allocs_after_pregrow = a.allocs();
+  CHECK(allocs_after_pregrow == allocs_before + 1);  // it really was one short
+
+  // THE GATE. This is the captured region: two blocks of the class, live at once,
+  // and NOT ONE of them may reach the driver.
+  {
+    DBuf x(Dev{a, qa}, DType::kF32, shape);
+    DBuf y(Dev{a, qa}, DType::kF32, shape);
+    CHECK(x.ptr() != y.ptr());
+    CHECK(a.allocs() == allocs_after_pregrow);
+  }
+
+  // Idempotent: a free list that is already deep enough costs nothing, which is
+  // the steady state on a warm server.
+  const int allocs_before_second = a.allocs();
+  pool.PreGrowForCapture(a, demand);
+  CHECK(a.allocs() == allocs_before_second);
+
+  // A profile is a property of the FORWARD, not of what is resident when it
+  // runs. Re-measure with the retained block still live and the peak must read
+  // two again, because the baseline moved with it. Without that subtraction the
+  // profile would read three here and the pre-grow would over-allocate on every
+  // capture for the rest of the process.
+  pool.MarkStepBoundary();
+  {
+    DBuf scratch(Dev{a, qa}, DType::kF32, shape);
+    DBuf out(Dev{a, qa}, DType::kF32, shape);
+  }
+  int64_t peak_with_retention = 0;
+  for (const auto& e : pool.StepDemandProfile())
+    if (e.first == key) peak_with_retention = e.second;
+  CHECK(peak_with_retention == 2);
+  retained.reset();
 }

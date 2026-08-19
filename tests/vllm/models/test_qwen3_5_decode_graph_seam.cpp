@@ -780,8 +780,23 @@ CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
   am.seq_lens_cpu = am.seq_lens;
   am.max_query_len = q;
   am.max_seq_len = pos + q;
-  am.block_table_num_cols = 1;
-  am.block_table_tensor.assign(static_cast<size_t>(reqs), 0);
+  // THE BLOCK TABLE HAS TO REACH THE LAST POSITION IT DECLARES, and a fixed one
+  // column does not. `CachePool` uses `block_size = 16`, and the CPU paged
+  // attention reads `btab[r * bt_row + (j / block_size) * bt_col]` for every
+  // j <= p (`src/vt/cpu/cpu_paged_attn.cpp`). Shape C below sits at pos 20, so
+  // j reaches 23, so the kernel reads column 1 of a ONE-column table -- an
+  // out-of-bounds read of the pooled block that holds it. It was silent until a
+  // pool change moved what follows that block, and then it was a SIGSEGV
+  // (#1394). Size the table for the sequence length this metadata declares, and
+  // map logical block i to physical block i so it agrees with
+  // `slot_mapping = pos + i`.
+  const int32_t kBlockSize = 16;  // CachePool's, and the only one these cases use
+  const int32_t cols = (pos + q + kBlockSize - 1) / kBlockSize;
+  am.block_table_num_cols = cols;
+  am.block_table_tensor.resize(static_cast<size_t>(reqs) * static_cast<size_t>(cols));
+  for (int32_t r = 0; r < reqs; ++r)
+    for (int32_t i = 0; i < cols; ++i)
+      am.block_table_tensor[static_cast<size_t>(r * cols + i)] = i;
   am.slot_mapping.resize(static_cast<size_t>(reqs) * static_cast<size_t>(q));
   for (size_t i = 0; i < am.slot_mapping.size(); ++i)
     am.slot_mapping[i] = pos + static_cast<int32_t>(i);

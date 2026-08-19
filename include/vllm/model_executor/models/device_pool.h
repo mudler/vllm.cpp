@@ -102,17 +102,29 @@ class DevicePool {
     const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      auto it = free_.find(key);
-      if (it != free_.end() && !it->second.empty()) {
-        void* p = it->second.back();
-        it->second.pop_back();
+      ClassState& cs = classes_[key];
+      ++cs.live;
+      if (cs.live - cs.base > cs.peak) cs.peak = cs.live - cs.base;
+      if (!cs.free.empty()) {
+        void* p = cs.free.back();
+        cs.free.pop_back();
         retained_ -= key;
         ++hits_;
         return p;
       }
       ++misses_;
     }
-    return b.Alloc(key);
+    try {
+      return b.Alloc(key);
+    } catch (...) {
+      // The block was never handed out, so it must not count as live: a Get that
+      // threw has no matching Put, and a leaked `live` would make every later
+      // demand profile read one block too high for this class forever.
+      std::lock_guard<std::mutex> lk(mu_);
+      ClassState& cs = classes_[key];
+      if (cs.live > 0) --cs.live;
+      throw;
+    }
   }
   // Uncapped retention (deliberately-retained cross-step buffers: the device
   // logits / MTP hidden handed off via a shared_ptr deleter). Bytes are always
@@ -139,8 +151,10 @@ class DevicePool {
     }
     const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
+    ClassState& cs = classes_[key];
+    if (cs.live > 0) --cs.live;
     retained_ += key;
-    free_[key].push_back(p);
+    cs.free.push_back(p);
   }
   // Cap-aware retention for the high-frequency forward scratch (DBuf). The soft
   // cap comes from the platform's residency_policy().device_pool_cap_bytes
@@ -155,13 +169,17 @@ class DevicePool {
       return;
     }
     const size_t key = ClassOf(bytes);
-    std::lock_guard<std::mutex> lk(mu_);
-    if (cap != 0 && retained_ + key > cap) {
-      b.Free(p);
-      return;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ClassState& cs = classes_[key];
+      if (cs.live > 0) --cs.live;
+      if (cap == 0 || retained_ + key <= cap) {
+        retained_ += key;
+        cs.free.push_back(p);
+        return;
+      }
     }
-    retained_ += key;
-    free_[key].push_back(p);
+    b.Free(p);  // over the soft cap: to the driver, outside the lock
   }
 
   // Release every RETAINED block back to the driver, and report the bytes freed.
@@ -175,7 +193,7 @@ class DevicePool {
   // block, once, and is what keeps a big-canvas MiniMax-H3 VAE decode from
   // meeting the driver's OOM on top of 50 steps of denoise scratch.
   //
-  // SAFETY: `free_` only ever holds blocks a DBuf already returned, so nothing
+  // SAFETY: a class's free list only ever holds blocks a DBuf already returned, so nothing
   // live is touched. Under VT_POOL_BYPASS the free list is always empty (Put
   // frees straight through) and this is a no-op. And because a pool now holds
   // ONE device's blocks, `b.Free` is guaranteed to be the allocator that made
@@ -184,15 +202,102 @@ class DevicePool {
     RequireOwnDevice(b, "Drain");
     std::lock_guard<std::mutex> lk(mu_);
     size_t freed = 0;
-    for (auto& entry : free_) {
-      for (void* p : entry.second) {
+    for (auto& entry : classes_) {
+      for (void* p : entry.second.free) {
         b.Free(p);
         freed += entry.first;
       }
+      entry.second.free.clear();
     }
-    free_.clear();
     retained_ = 0;
     return freed;
+  }
+
+  // ── CAPTURE PRE-GROW (#1380) ───────────────────────────────────────────────
+  // A `cudaMalloc` inside a captured region ABORTS the capture, so every
+  // allocation the captured forward makes has to be a pool HIT. Warming the pool
+  // by running the same forward eagerly first is necessary and NOT sufficient,
+  // and the missing half is what #1380 measured: the capture RETAINS its
+  // `[S, vocab]` logits, so one block never comes back to the free list, and the
+  // NEXT capture at that shape is one block short. Since the pool is keyed by
+  // SIZE CLASS rather than by tensor, the block the next capture then misses on
+  // need not be the logits at all -- on `thor:gpu0` it was `dconv`, the GDN
+  // causal-conv output (`qwen3_5.cpp:4665`), which at the gate's shape lands in
+  // the SAME class as the retained logits.
+  //
+  // So the driver cannot pre-grow by naming one tensor. It asks the pool what
+  // the step it just ran actually demanded, and asks for that to be servable.
+  // `StepDemand` is the per-class PEAK number of blocks live at one time above
+  // the baseline the last `MarkStepBoundary` recorded -- the transient demand,
+  // not the retention -- so the profile is a property of the FORWARD and not of
+  // whatever happened to be resident when it ran.
+  using StepDemand = std::vector<std::pair<size_t, int64_t>>;
+
+  // Close the current step for demand accounting. The next step's peak is
+  // measured from the blocks that are live right now.
+  void MarkStepBoundary() {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& e : classes_) {
+      e.second.peak = 0;
+      e.second.base = e.second.live;
+    }
+  }
+
+  // The per-class transient demand measured since the last `MarkStepBoundary`.
+  // A driver takes this at the end of the EAGER step it runs at a shape and
+  // hands it back at that shape's capture, which is why it is a value rather
+  // than pool state: two shapes interleave through one pool, and last-step state
+  // would answer for whichever step ran most recently instead of for this one.
+  StepDemand StepDemandProfile() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    StepDemand out;
+    out.reserve(classes_.size());
+    for (const auto& e : classes_)
+      if (e.second.peak > 0) out.emplace_back(e.first, e.second.peak);
+    return out;
+  }
+
+  // Make the free list able to serve `demand` without touching the driver, and
+  // report how many blocks that cost. Call it OUTSIDE the captured region; a
+  // block created here is a `cudaMalloc` and would abort a capture in progress.
+  // Idempotent, and a no-op once the free list is deep enough — which is the
+  // steady state, so a warm server pays nothing for it.
+  //
+  // IT IGNORES THE SOFT CAP, AND UNDER A NON-ZERO ONE THAT REOPENS #1380 BY THE
+  // OTHER API. This function adds to `retained_` without consulting `cap`,
+  // while `Put` above frees a returned block STRAIGHT TO THE DRIVER once
+  // `retained_ + key > cap`. A `cudaFree` inside a captured region aborts the
+  // capture exactly as a `cudaMalloc` does — and `Put` is called from INSIDE the
+  // captured forward, every time a scratch `DBuf` there goes out of scope. So a
+  // pre-grow that pushed `retained_` over the cap would arm the abort it exists
+  // to prevent, at the first block the capture returned.
+  //
+  // Nothing can reach that today and this is a hazard note, not a live defect:
+  // every platform resolves `residency_policy().device_pool_cap_bytes` to 0,
+  // and `cap == 0` is the uncapped fast path in `Put`. WHOEVER FIRST SETS A
+  // NON-ZERO CAP OWES THE FIX HERE — either pass `cap` in and refuse to grow
+  // past it, or make the captured region's `Put` cap-exempt. Recorded under
+  // `## Owed` in `.agents/specs/eng-cudagraph-break.md`; owner row
+  // `ENG-CUDAGRAPH-BREAK`.
+  size_t PreGrowForCapture(vt::Backend& b, const StepDemand& demand) {
+    RequireOwnDevice(b, "PreGrowForCapture");
+    if (Bypass()) return 0;  // no free list to grow; every Get is a driver call
+    std::vector<size_t> missing;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (const auto& want : demand) {
+        ClassState& cs = classes_[want.first];
+        for (int64_t have = static_cast<int64_t>(cs.free.size()); have < want.second; ++have)
+          missing.push_back(want.first);
+      }
+    }
+    for (size_t key : missing) {
+      void* p = b.Alloc(key);
+      std::lock_guard<std::mutex> lk(mu_);
+      classes_[key].free.push_back(p);
+      retained_ += key;
+    }
+    return missing.size();
   }
 
   ~DevicePool() {
@@ -207,7 +312,7 @@ class DevicePool {
                    "distinct-classes=%zu\n",
                    static_cast<const void*>(backend_),
                    static_cast<unsigned long long>(h), static_cast<unsigned long long>(m),
-                   rate, free_.size());
+                   rate, classes_.size());
     }
   }
 
@@ -263,13 +368,25 @@ class DevicePool {
     return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
   }
 
-  std::mutex mu_;
+  // One size class: its free blocks, and the demand accounting `StepDemand`
+  // reads. `live` counts blocks handed out and not yet returned; `base` is what
+  // `live` was at the last step boundary; `peak` is the largest `live - base`
+  // since then, which is the number of blocks of this class a repeat of that
+  // step needs on the free list.
+  struct ClassState {
+    std::vector<void*> free;
+    int64_t live = 0;
+    int64_t base = 0;
+    int64_t peak = 0;
+  };
+
+  mutable std::mutex mu_;
   // THE DEVICE, and the reason this class exists in this shape. Every block in
-  // `free_` was allocated by this backend and will be freed by it; nothing else
-  // may draw from or return to this pool.
+  // a class's free list was allocated by this backend and will be freed by it;
+  // nothing else may draw from or return to this pool.
   vt::Backend* backend_;
-  std::unordered_map<size_t, std::vector<void*>> free_;
-  size_t retained_ = 0;  // bytes (class-rounded) held in free_, for the soft cap
+  std::unordered_map<size_t, ClassState> classes_;
+  size_t retained_ = 0;  // bytes (class-rounded) held free, for the soft cap
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
 };

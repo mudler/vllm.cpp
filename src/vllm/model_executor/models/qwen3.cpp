@@ -205,17 +205,12 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
 // The override is published by the registry forward's detail::DeviceTokenIdsScope
 // and CONSUMED here on first use; null on every path except the CUDA async runner,
 // so with no override this is byte-identical to the pre-fix host upload.
+// #1305: the take-and-clear and the bounds-checked copy this used to spell out
+// are `detail::ApplyDeviceTokenIds` (`qwen3_5_internal.h`), one body for the four
+// models that consume the scope. Behaviour, ordering and the refusal message are
+// unchanged; only the copy count is.
 static void ApplyDeviceTokenIdsOverride(Dev d, DBuf& dids, int64_t T) {
-  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
-  if (ov.ids == nullptr) return;
-  detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
-  // A device buffer LONGER than the embed's input would run past the end. That can
-  // only mean the runner and the model disagree about this step's shape, so fail
-  // loudly rather than corrupt the embedding.
-  VT_CHECK(ov.count <= T,
-           "qwen3 dense embed: device input ids longer than the embed input");
-  d.b.Copy(d.q, dids.ptr(), ov.ids,
-           static_cast<size_t>(ov.count) * sizeof(int32_t));
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3 dense embed");
 }
 
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table). KEPT
@@ -1099,18 +1094,27 @@ std::optional<ForwardLogits> DenseDecodeGraphForward(
   // (`tests/parity/test_qwen3_dense_async_serving.cpp`) run twice — as it stands,
   // and with the decline deleted, because only the second can fail.
   //
-  // THE FIX THIS COMMENT NAMES DOES NOT EXIST IN ANY DRIVER, and W4 measured that
-  // too. No decode graph carries token ids to the device: `StepDevInputs`
-  // (`qwen3_5.cpp`) has no token-id member, its pinned sibling's `token_ids` block
-  // was allocated and filled every step and NEVER uploaded and never read (W4
-  // removed it), and every batched driver embeds OUTSIDE the captured region from
-  // the HOST vector. `vt::PersistentStepInput::RefreshFromDevice`
-  // (`include/vt/persistent_step_input.h`) is the arm that fix needs — reading the
-  // identifiers at REPLAY time from a stable device buffer, which is this
-  // comment's own wording — but the DESTINATION it would refresh is still owed.
-  // W2 (#1261) migrating this driver's capture onto the shared seam did not move
-  // the inputs, and W4 landing the storage primitive did not create the
-  // destination.
+  // THE FIX THIS COMMENT NAMES IS NOW HALF-BUILT, AND NOT IN THIS DRIVER. When W4
+  // measured it, no decode graph carried token ids to the device at all:
+  // `StepDevInputs` (`qwen3_5.cpp`) has no token-id member, its pinned sibling's
+  // `token_ids` block was allocated and filled every step and NEVER uploaded and
+  // never read (W4 removed it), and every batched driver embedded OUTSIDE the
+  // captured region from the HOST vector. #1305 changed the DESTINATION half for
+  // two of the nine drivers: `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph`
+  // now hold their step identifiers in a `vllm::StepTokenIds`
+  // (`include/vllm/model_executor/models/step_token_ids.h`) whose device address
+  // is stable for the life of the slot, and refresh it through
+  // `vt::PersistentStepInput::RefreshFromDevice` from the runner's mirror.
+  //
+  // THAT BUYS THIS DRIVER NOTHING, and it does not weaken the decline. This
+  // driver has no such destination: W2 (#1261) migrating its capture onto the
+  // shared seam did not move the inputs, and #1305 did not touch it. And even in
+  // the two drivers that now have one, the refresh runs OUTSIDE the capture, once
+  // per step, because `vt::Embedding` allocates a device bounds-check flag and
+  // synchronizes the stream and therefore cannot be captured. Reading the
+  // identifiers at REPLAY time — this comment's own wording for the fix — still
+  // exists in no driver, which is why #1305 records the graph half of the defect
+  // as unsettled rather than closing it.
   //
   // Declining the graph while the mirror is live falls back to the proven-correct
   // eager path. This is a MITIGATION, not the end state, and a correct stream

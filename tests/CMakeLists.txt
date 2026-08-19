@@ -1778,6 +1778,7 @@ target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src
 # graph stays valid — the fix for the 35B c2+ online-serving illegal-memory-access.
 # The device proof is the DGX serving harness; this pins the never-free guarantee.
 vllm_cpp_add_test(test_breakable_graph vt/test_breakable_graph.cpp)
+vllm_cpp_add_test(test_persistent_step_input vt/test_persistent_step_input.cpp)
 vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
 target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_graph_dedup vt/test_graph_dedup.cpp)

@@ -2292,7 +2292,7 @@ direction that matters.
 | 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
 | guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
 | **2.4B fp32 flow-matching DiT** (every denoise step, both CFG branches) | **device**, weights staged ONCE |
-| 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
+| **0.646B RVQ depth decoder** (8 appends per frame) | **device**, weights staged ONCE at **bf16** |
 | condition mix (once per window), scheduler, CFG mix, Euler step | **host** |
 | DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
 
@@ -2313,18 +2313,68 @@ this arm mirrors that rather than buying speed with a narrower dtype.
 The remaining stages do not move, for two different reasons, and both are owed
 rather than hidden:
 
-* the depth decoder and the condition mix are host `std::vector<float>`
-  reference loops under `-ffp-contract=off`, and they run at
-  `ArCompute::kBFloat16` — every op's *result* is rounded to bf16, which is what
-  upstream stores. Routing them through an f32 GEMM would silently drop that
-  rounding, so mirroring them needs bf16 storage, which is a dtype decision with
-  its own numeric evidence rather than a transcription;
+* the condition mix is a host `std::vector<float>` reference loop under
+  `-ffp-contract=off` running at `ArCompute::kBFloat16`. It also runs **once per
+  window** rather than once per step, so it is outside the per-step loop
+  entirely;
 * the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
   1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
   are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
   are registered for the **CPU only**. There is no CUDA kernel behind the op
   this stage would need, so it is named here rather than hand-rolled outside the
   seam.
+
+The **depth decoder** reaches the device the same way, and its dtype is the one
+thing about it worth knowing. Upstream's `MiniMaxMusic3RVQDepthDecoder` declares
+**no dtype at all** — no `dtype` parameter, no `torch.float32` literal, no
+`.float()` call — so it inherits whatever `load_components(dtype=...)` resolves,
+and that is **bf16** for this checkpoint. The arm therefore stages its weights at
+bf16 and keeps every activation at bf16 with f32 accumulation, which is
+`vt::MatmulBT`'s own contract. The narrowing is **lossless**: the loader already
+rounds every AR-half tensor through bf16 into an f32 carrier, so the device copy
+holds exactly the values the host arm holds, in half the bytes.
+
+It runs on five shared ops with **no new kernel** (`MatmulBT`, `RmsNorm`,
+`AttentionCross`, `SiluAndMul`, `Add`), with the MLP's gate/up pair routed
+through the shared merged-GEMM seam. What does **not** move with it, and is owed
+rather than hidden: the audio heads, the CFG mix, the top-k draw and the fed-back
+projection row, which together are ~1.6 % of the stage.
+
+**Its numbers are not identical to the host arm's, and the difference is
+measured rather than assumed.** Against the host reference, over **six seeds** of
+the gate's reduced geometry, the device arm reads a median of exactly **1 bf16
+ULP** at every seed, means of 2.095 to 9.904 and worst-case values of 110 to
+7340. The gate bounds the median at 2 and the mean at 15; it does **not** bound
+the worst case, because the worst case cannot tell a correct arm from a broken
+one — a correct arm reads 7340 on the seed where a swapped gate/up half reads
+6641. An earlier revision of this document quoted one seed's 110 and 2.095 as
+though they were the arm's deviation; they are one draw of it.
+
+Almost all of that deviation — the composed stage goes to **zero,
+bit-identical**, once the two are aligned — is one rounding per element, from two
+places, and the two are **not** the same kind of thing:
+
+- `vt::SiluAndMul` computes the whole gated expression in f32 where a bf16 torch
+  module narrows `silu(gate)` before multiplying by `up`. That one is a genuine
+  gap in the shared seam and is tracked as its own issue.
+- `vt::RmsNorm` keeps f32 across the weight multiply, and **that is correct**.
+  vLLM's own RMSNorm does exactly the same on both its CPU and its CUDA path, and
+  upstream reverted the change that would have made it multiply in the weight's
+  dtype. The Music3 *host* arm rounds twice because it mirrors the `diffusers`
+  module this model is; the device arm rounds once because it mirrors vLLM. Two
+  references disagree here and neither side is defective, so this term will not
+  go away. An earlier revision of this document called it a shortcoming of the
+  shared op.
+
+Until the difference is settled against the oracle, **no throughput number is
+quoted for this arm** and the full-scale gate against the committed oracle
+goldens has not been run with it.
+
+If the build has no provider for the device you asked for, the depth arm
+**refuses by name at staging time**, naming the op and the device, rather than
+falling back to the host loop — a silent fallback would be a large slowdown
+wearing a correct answer. `--speech-device 0` keeps the host reference arm and
+stages nothing.
 
 Because the host stages are unchanged — and because `--speech-device 0` takes
 the same `DitForward` it always did, source byte for source byte — the CPU arm

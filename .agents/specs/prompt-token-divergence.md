@@ -133,16 +133,32 @@ what item 2 and item 4 establish is that these sources produce the reference ids
 on x86-64 at four optimisation settings and under ASan and UBSan. The server
 binary that reported the anomaly is aarch64, and the probe below exists to catch
 a code-generation difference in exactly that class. What remains is that the
-server binary (`bin/vllm-server`, sha256 `ab0b9a1e6144…`, aarch64, built from
+server binary (`bin/vllm-server`, sha256 `7d0c3cafb224…`, aarch64, built from
 `1dac4f9a7`) reported a count that the identical source, the identical
 `tokenizer.json` and the identical prompt bytes do not produce on x86-64.
+
+**That sha256 is the run's, and the conflicting value beside the artifacts is
+already adjudicated.** `NOTES.txt` in the evidence directory records
+`ab0b9a1e6144…`, which is the binary of the PREVIOUS day's run
+(`out/bench-20260818T213222Z/job.log:17,22`). Three artifacts of the run this
+spec diagnoses give `7d0c3cafb224…` instead: `sha256sum` over
+`/mnt/nas_share/rc/q38bf16/bin/vllm-server`, `out/RESULT.txt:5`, and
+`out/bench-20260819T035148Z/job.log:17,18`, which asserted `WANT_BIN_SHA256`
+equal to `GOT_BIN_SHA256` at launch.
+`.agents/benchmark-record.md:24510-24514` settled this exact conflict in favour
+of the executing artifact, so it is not re-opened here. The hash is not
+load-bearing for the diagnosis — both builds carry
+`WANT_SHA=1dac4f9a7…` and the identical `SRC_SHA256=c74c45d1…`, two
+non-reproducible builds of one tree, and the argument rests on the source and on
+aarch64 — but it is load-bearing for reproducing the run.
 
 **The conclusion rests on the data path, not on an enumeration.** No list of
 things that can go wrong inside a tokenizer is needed, and none is offered,
 because a missed entry would not weaken this:
 
-- `usage.prompt_tokens` is `res.prompt_token_ids.size()`
-  (`serving_completion.cpp:78`);
+- `usage.prompt_tokens` is `response.prompt_token_ids.size()`
+  (`serving_completion.cpp:78`, the streaming path `vllm bench serve` drives;
+  `res.prompt_token_ids.size()` at `:283` is its non-streaming sibling);
 - that vector is `RequestOutput::prompt_token_ids`
   (`output_processor.cpp:284`), copied from the request state the engine
   recorded at admission (`output_processor.cpp:174`);
@@ -178,7 +194,7 @@ question needs the box, and needs no GPU beyond a server that is already up:
    checkpoint, POST prompt 0 of the regenerated corpus to `/tokenize`
    (`add_special_tokens: false`) and to `/v1/completions`.
 
-   **There is ONE tokenizer instance and three borrows of it**, so this probe
+   **There is ONE tokenizer instance and five borrows of it**, so this probe
    does not compare two tokenizer states and must not be read as doing so.
    `server_main.cpp:1229` takes
    `const vllm::tok::Tokenizer& tokenizer = loaded->tokenizer()`
@@ -186,7 +202,10 @@ question needs the box, and needs no GPU beyond a server that is already up:
    `model_loader.h:528`); `api_server.cpp:1229` passes that object's ADDRESS
    into the non-owning `ApiServer::tokenizer_` (`api_server.h:340`); and
    `model_loader.cpp:1453` constructs `input_processor_(tokenizer_, …)`, whose
-   member is a REFERENCE (`input_processor.h:152`) to the same object. What the
+   member is a REFERENCE (`input_processor.h:152`) to the same object.
+   `model_loader.cpp:1454` and `:1433` take the same object's address a fourth
+   and fifth time, for `output_processor_(&tokenizer_)` and for
+   `MakeNativeBackendFactory(tokenizer_, …)`. What the
    two endpoints do NOT share is the HANDLER around it: body parse, string
    extraction, and `Encode` against `EncodeWithSpecialTokens`.
 
@@ -241,7 +260,7 @@ This spec corrects OUR numerator and stops there. Both columns are our arm:
 numbers.** `tools/bench/gpu_clock_state.py compare` returned
 `PAIRING_VERDICT=DISCARD` on all three c1 pairings; `docs/BENCHMARKS.md:216`
 records the c1 ratio as OWED for that reason; and
-`.agents/benchmark-record.md:24230` states that no ours-over-vLLM ratio is
+`.agents/benchmark-record.md:24229` states that no ours-over-vLLM ratio is
 derived from those absolutes, here or anywhere else. A number the clock gate
 discarded is not a number, and a corrected numerator does not turn one into a
 number. Nor would such a ratio be independent evidence if the gate ever allowed

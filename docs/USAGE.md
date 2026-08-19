@@ -4413,6 +4413,68 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
                    --prompt "The capital of France is" --max-tokens 16
 ```
 
+### Which device can serve it
+
+`--device cpu` serves this today, and that is the arm every published number for
+this checkpoint was measured on.
+
+`--device cuda` refuses at load, by design, when the weights cannot be staged
+into device memory (issue
+[#1123](https://github.com/mudler/vllm.cpp/issues/1123)). The message names the
+byte counts on both sides. That refusal is now **conditional on the lane**
+(`ENG-EXPERT-STREAM-DEVICE` W0d, issue
+[#1124](https://github.com/mudler/vllm.cpp/issues/1124)): with expert streaming
+on, on a device whose kernels can dereference host memory, **and on a model
+family that actually streams its experts**, the routed-expert towers are not
+staged at all — their slices are read from the host slot store in place — so
+what has to fit is the NON-expert remainder plus the slot arena rather than the
+whole file.
+
+Four limits, stated plainly rather than left to be discovered.
+
+* **The device has to be probed capable, and most are not.** The condition is
+  `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
+  unified part. A DISCRETE card answers false, keeps staging every tower and
+  keeps the refusal. That is deliberate: a slot store the card cannot read is
+  not a lane, and giving it one is later work on the same row.
+* **The model has to be one of the families whose forward reads experts through
+  the slot seam.** Today that is the Qwen3.5 MoE family:
+  `Qwen3_5MoeForConditionalGeneration` and `Qwen3_5MoeForCausalLM`, which share
+  one factory and one MoE block, and which a `qwen35moe` GGUF resolves to.
+  `Qwen3MoeForCausalLM` (Qwen3-Coder) declares the same capability truthfully
+  and NO GGUF load can reach it, because no `general.architecture` maps onto it
+  — that gap is listed under `## Owed` in the row's spec. Every other
+  architecture keeps the whole bound and keeps the refusal even with
+  `VT_MOE_EXPERT_STREAM=1` set. `DeepseekV4ForCausalLM` is the case to have in
+  mind: a `deepseek4` GGUF loads, its export carries the same `_exps.weight`
+  tensor names, and its forward stages every one of those towers, so charging
+  the device for a slot arena instead would under-count what the load really
+  needs and turn a correct refusal into an out-of-memory first forward.
+  `LagunaForCausalLM` is NOT that case and is not evidence for anything here: no
+  `laguna` GGUF architecture arm exists, so a Laguna GGUF is refused as an
+  unsupported architecture well before this check runs.
+* **The checkpoint's expert towers have to KEEP the form the file stores them
+  in, which means keep-quant OR keep-f16.** Those are the two residencies that
+  read experts a slice at a time, and they are one arm rather than two: the
+  loader sends both into the same stacked tower (`LoadExpertsStackedKq`), and the
+  slice seam sizes a row with `vt::RowSizeBytes` and so never looks at the dtype.
+  An F16 expert tower therefore gets the lane, and an operator holding one should
+  not read this section and predict a refusal. The fp4-resident and the
+  expand-to-bf16 arms of the same loader stage every tower like any other weight.
+  So `VT_GGUF_KEEP_QUANT=0` — which turns keep-f16 off with it, because keep-f16
+  rides the same condition — and an NVFP4 GGUF both keep the whole bound and keep
+  the refusal on a device and a model that otherwise qualify. This is checked per
+  file, against the residency this process resolved, and a file that mixes a kept
+  tower with a staged one keeps the whole bound as well (issue
+  [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
+* **No speed claim is attached.** The decode measurement on the one machine that
+  answers capable has not run at the time of writing; `docs/BENCHMARKS.md`
+  carries it as `PENDING` and records what HAS been measured there, which is the
+  device probe itself. Device access to host-resident weights on that part has a
+  recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
+  way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
+  the benchmarks file before assuming the GPU is the faster arm here.
+
 ### The same thing as config, and which one wins
 
 The residency knobs are also config keys, under the `vllm_cpp` key of

@@ -21,9 +21,11 @@ namespace {
 class CudaPlatform final : public Platform {
  public:
   CudaPlatform(int cc_major, int cc_minor, bool integrated,
+               bool host_memory_device_addressable,
                size_t device_memory_total_bytes)
       : cap_{cc_major, cc_minor},
         integrated_{integrated},
+        host_memory_device_addressable_{host_memory_device_addressable},
         device_memory_total_bytes_{device_memory_total_bytes} {}
 
   DeviceType device_type() const override { return DeviceType::kCUDA; }
@@ -60,6 +62,16 @@ class CudaPlatform final : public Platform {
   // cudaDevAttrIntegrated, probed once at registration. GB10 (Grace-Blackwell UMA)
   // reports integrated. Surface parity for the ROCm/memory-reporting port.
   bool is_integrated_gpu() const override { return integrated_; }
+
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). Probed once at registration
+  // from `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — the same
+  // conjunction `src/vt/cuda/cuda_arch_tactics.cu::ProbeDeviceCaps` already
+  // gathers for the kernel layer, kept in one shape so the two layers cannot
+  // answer differently. See the base declaration for why neither attribute alone is
+  // the predicate, and why this is NOT `needs_weight_staging()` inverted.
+  bool host_memory_is_device_addressable() const override {
+    return host_memory_device_addressable_;
+  }
 
   // cuda.py:662 support_static_graph_mode -> True (CUDA graph capture mode).
   bool support_static_graph_mode() const override { return true; }
@@ -155,6 +167,7 @@ class CudaPlatform final : public Platform {
  private:
   DeviceCapability cap_;
   bool integrated_ = false;
+  bool host_memory_device_addressable_ = false;
   // cudaMemGetInfo's `total`, probed once at registration; 0 == UNKNOWN.
   size_t device_memory_total_bytes_ = 0;
 };
@@ -183,6 +196,17 @@ struct Registrar {
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) != cudaSuccess) {
       integrated = 0;
     }
+    // host_memory_is_device_addressable (ENG-EXPERT-STREAM-DEVICE W0b, issue
+    // #1124) — probed here, beside the attribute above, because it is the SAME
+    // question asked of the other direction of the bus. A query failure defaults
+    // to 0, which answers false: handing a host pointer to a device kernel on a
+    // device that cannot follow it is a fault, so the conservative answer is the
+    // one that keeps staging.
+    int pageable = 0;
+    if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) !=
+        cudaSuccess) {
+      pageable = 0;
+    }
     // ResidencyPolicy::device_memory_total_bytes (issue #1123) — probe once here,
     // beside the other device probes. `nvidia-smi` is the WRONG instrument for
     // this on a GB10: `--query-gpu=memory.total,memory.free,memory.used` answers
@@ -206,8 +230,16 @@ struct Registrar {
     // static outlives the registrar as RegisterPlatform requires.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
-    static CudaPlatform platform(major, minor, integrated != 0,
-                                 total_bytes);  // device 0 only
+    static CudaPlatform platform(
+        major, minor, integrated != 0,
+        // #1378: the conjunction is a named, CPU-testable decision now
+        // (`HostMemoryIsDeviceAddressableFromAttrs`, declared in
+        // `platforms/interface.h`), not two `!= 0` tests written here where no
+        // reachable box can falsify either of them. The probe still owns the two
+        // VALUES, including the 0 a failed query leaves; the rule that combines
+        // them is gated on the CPU tier.
+        HostMemoryIsDeviceAddressableFromAttrs(pageable, integrated),
+        total_bytes);  // device 0 only
 #pragma GCC diagnostic pop
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }

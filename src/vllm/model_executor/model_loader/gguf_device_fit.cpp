@@ -20,30 +20,107 @@ std::string Gib(size_t bytes) {
   return s + " GiB";
 }
 
+// W0d. Does `name` end in `suffix`? An empty suffix matches NOTHING, which is
+// what makes `StreamedExpertLane{}` inert: the natural reading of "ends with the
+// empty string" is "always", and that would exclude every tensor in the file the
+// moment a caller forgot to set the field.
+bool NameHasSuffix(const std::string& name, std::string_view suffix) {
+  if (suffix.empty() || suffix.size() > name.size()) return false;
+  return name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// The staged size of one tensor: `min(gguf_bytes, elems * model_dtype_bytes)`.
+// See the header for why the minimum is the defensible term.
+size_t StagedBytes(const GgufTensorInfo& t, size_t model_dtype_bytes) {
+  size_t elems = 1;
+  for (const int64_t d : t.shape) {
+    if (d <= 0) {  // A malformed dim cannot be reasoned about; contribute the
+      elems = 0;   // on-disk size alone rather than a bogus expanded size.
+      break;
+    }
+    elems *= static_cast<size_t>(d);
+  }
+  // The expanded size, when it is knowable. `elems == 0` means the shape was
+  // unusable, and then the on-disk size is the only defensible term.
+  const size_t expanded = elems == 0 ? t.nbytes : elems * model_dtype_bytes;
+  return expanded < t.nbytes ? expanded : t.nbytes;
+}
+
 }  // namespace
 
+size_t GgufLargestExpertSliceBytes(const GgufFile& gguf,
+                                   std::string_view tensor_name_suffix) {
+  size_t largest = 0;
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (!NameHasSuffix(t.name, tensor_name_suffix)) continue;
+    // `shape[0]`, NOT `shape.back()`, and the difference is measured rather than
+    // assumed: `gguf_reader.cpp:443` pushes `ggml_dims[d-1]`, so this vector is
+    // the REVERSE of the file's `ne` order. A tower the file writes as
+    // `[n_embd, n_ff_exp, n_expert]` therefore arrives as
+    // `[n_expert, n_ff_exp, n_embd]`, and the expert count is the first entry.
+    // Reading the last one gives `n_embd` — 8192 on the target checkpoint
+    // instead of 512, a slot 16x too small.
+    //
+    // A tensor of another rank is not a stacked tower; charging its whole size
+    // over-states the slot rather than under-stating it.
+    const size_t experts = t.shape.size() == 3 && t.shape[0] > 0
+                               ? static_cast<size_t>(t.shape[0])
+                               : 1;
+    const size_t slice = t.nbytes / experts;
+    if (slice > largest) largest = slice;
+  }
+  return largest;
+}
+
+bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
+                                   std::string_view tensor_name_suffix,
+                                   const GgufLoadPolicy& policy) {
+  bool matched = false;
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (!NameHasSuffix(t.name, tensor_name_suffix)) continue;
+    matched = true;
+    // The SAME call the model's own loader makes, on the SAME tensor, with the
+    // SAME role, through the SAME function: `LoadExpertsOrNvfp4` peeks
+    // `kStackedExpertWeight` and dispatches on the answer. Asking it the same way
+    // is what stops the bound and the forward from disagreeing about a file.
+    const GgufResidency r =
+        PeekRoute(policy, t, GgufTensorRole::kStackedExpertWeight);
+    if (r != GgufResidency::kKeepQuant && r != GgufResidency::kKeepF16) {
+      return false;
+    }
+  }
+  return matched;
+}
+
 GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
-                                              size_t model_dtype_bytes) {
+                                              size_t model_dtype_bytes,
+                                              const StreamedExpertLane& lane) {
   GgufStagedFootprint out;
   for (const GgufTensorInfo& t : gguf.Tensors()) {
-    size_t elems = 1;
-    for (const int64_t d : t.shape) {
-      if (d <= 0) {  // A malformed dim cannot be reasoned about; contribute the
-        elems = 0;   // on-disk size alone rather than a bogus expanded size.
-        break;
-      }
-      elems *= static_cast<size_t>(d);
+    // W0d: a tensor the slot lane serves is never staged, so it contributes
+    // nothing to the bound and cannot be the largest single allocation either.
+    // It is still COUNTED, in its own two fields, so the caller can say what was
+    // left out and how much of it there was.
+    if (NameHasSuffix(t.name, lane.tensor_name_suffix)) {
+      ++out.streamed_tensor_count;
+      out.streamed_bytes += StagedBytes(t, model_dtype_bytes);
+      continue;
     }
-    // The expanded size, when it is knowable. `elems == 0` means the shape was
-    // unusable, and then the on-disk size is the only defensible term.
-    const size_t expanded = elems == 0 ? t.nbytes : elems * model_dtype_bytes;
-    const size_t staged = expanded < t.nbytes ? expanded : t.nbytes;
+    const size_t staged = StagedBytes(t, model_dtype_bytes);
     out.lower_bound_bytes += staged;
     ++out.tensor_count;
     if (staged > out.largest_tensor_bytes) {
       out.largest_tensor_bytes = staged;
       out.largest_tensor_name = t.name;
     }
+  }
+  // The arena is charged only when the lane actually has towers to serve. A file
+  // with no expert towers builds no slot store at all (`Qwen35ExpertStream::Get`
+  // is reached only from the expert-slice seam), so charging one would invent
+  // bytes nothing allocates.
+  if (out.streamed_tensor_count > 0) {
+    out.arena_bytes = lane.arena_bytes;
+    out.lower_bound_bytes += lane.arena_bytes;
   }
   return out;
 }
@@ -69,7 +146,8 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      std::string_view device_name,
                                      bool needs_weight_staging,
                                      size_t budget_bytes,
-                                     size_t model_dtype_bytes) {
+                                     size_t model_dtype_bytes,
+                                     const StreamedExpertLane& lane) {
   DeviceWeightFit fit;
   fit.budget_bytes = budget_bytes;
   // A platform that does not stage weights reads them where they already are, so
@@ -82,7 +160,7 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
   if (budget_bytes == 0) return fit;
 
   const GgufStagedFootprint fp =
-      GgufStagedWeightFootprint(gguf, model_dtype_bytes);
+      GgufStagedWeightFootprint(gguf, model_dtype_bytes, lane);
   fit.needed_bytes = fp.lower_bound_bytes;
   if (fp.lower_bound_bytes <= budget_bytes) return fit;
 
@@ -110,6 +188,25 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
       "--offload-config '{\"vllm_cpp\":{\"device_fit\":"
       "{\"weight_budget_bytes\":0}}}', suppresses this refusal "
       "and restores that late failure; it does not make the model fit.";
+  // W0d. With the lane ON the message above is misleading in its most important
+  // sentence — the device streaming lane is exactly what IS running — so the
+  // correction is appended rather than left to be read as a stale claim. The
+  // lane-OFF message is untouched, byte for byte, because every CPU and discrete
+  // user reads that one and it is still true for them.
+  if (fp.streamed_tensor_count > 0) {
+    fit.message +=
+        " NOTE: the expert-stream lane IS active for this load, so the "
+        "sentence above about there being no device streaming lane does not "
+        "apply. " + std::to_string(fp.streamed_tensor_count) +
+        " expert towers (" + std::to_string(fp.streamed_bytes) + " bytes, " +
+        Gib(fp.streamed_bytes) + ") were EXCLUDED from the figure above "
+        "because the lane serves their slices from host slot storage, and the "
+        "slot arena's " + std::to_string(fp.arena_bytes) + " bytes (" +
+        Gib(fp.arena_bytes) + ") were counted instead. What does not fit is "
+        "therefore the NON-expert remainder plus that arena; lowering "
+        "VT_MOE_EXPERT_STREAM_SLOTS shrinks the arena, and nothing shrinks the "
+        "remainder.";
+  }
   return fit;
 }
 

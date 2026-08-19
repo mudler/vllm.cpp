@@ -313,11 +313,33 @@ names it and assigns it to W2 — an exception CAUGHT INSIDE the scope leaves th
 rest of the forward uncaptured while `captured()` stays true, because nothing is
 unwinding at scope exit for the drain to see.
 
-**Not yet entered from a production step.** No driver opens a capture scope
-until W2 migrates `Qwen3DenseDecodeGraph`; the break point itself runs on every
-forward and takes the pass-through arm. The spec's `## Owed` names that with its
-owner, along with the auxiliary-stream auto-join, the ROCm and Tenstorrent arms,
-and GPU bit-exactness over more than one replay.
+**NINE OF THE NINE DRIVERS ARE ON THE SEAM** as of W6 (2026-08-19, #1374,
+#1020). A call-shaped grep for `BeginCapture`, `EndCaptureGraph`, `ReplayGraph`
+and `DestroyGraph` over `src/vllm/` returns nothing, and one
+`VLLM_CPP_CUDAGRAPH` read survives in the tree, the seam's own. G1 on
+`thor:gpu0`: 2066 assertions, 0 differing, five drivers, capture plus three
+replays each.
+
+**W6 moved the eligibility predicate off `pure_decode`.** The runner names the
+step's ACTUAL uniform query length once and every model reads the answer,
+instead of two model files re-deriving that test in twenty duplicated lines
+each. A speculative verify the scheduler clamped to a shorter draft prefix is
+now captured at its own depth rather than running eager, which closes #1020
+together with a `(S, q, spec)` ring key. `VT_SPEC_GRAPH_MAX_QLENS` bounds how
+many distinct speculative query lengths one driver captures.
+
+**What did NOT move is "except at the break points", and that is a result
+rather than a shortfall.** No driver in this tree serves a prefill or a mixed
+batch under any predicate: all nine are decode drivers. A piecewise arm needs a
+prefill capture driver nobody has written, and its benefit is refuted by this
+row's own dated measurements — 3.8% prefill host idle at above 96% GPU-busy on
+GB10, and the 27B prefill gap at 92.5% non-GEMM glue. The spec's `## Owed`
+states what would have to be true first.
+
+Still owed: the ROCm and Tenstorrent arms, blocked on fleet hardware; G1 and G2
+for the three single-shape drivers; and #1380, a `cudaMalloc` inside a
+capturing stream on the second parity-ring slot of a speculative shape, which
+W6 found, located and did not cause.
 
 ## Speculative decoding
 

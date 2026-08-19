@@ -681,24 +681,44 @@ and `DeepseekV2DecodeGraph`, and `5 steps x 40 logits, 0 differing, 4 replays`
 for both Qwen3.5 drivers. **W6 does not move a single logit on any migrated
 driver.**
 
-**The ring-key case is BLOCKED and the blocker is not this row's.** The CPU seam
-gate proves the key opens TWO rings by counting them; it cannot prove the second
-ring replays the RIGHT graph, because a CPU replay recomputes nothing. The device
-case needs two spec shapes to capture, and **not one can**: one driver, one cache
-pool, one shape -- two requests verifying three tokens each -- throws
-`cudaMalloc: operation not permitted when stream is capturing` on the first step
-that opens a capture scope, reproduced with the case run alone in a fresh
-process. Not the ring key, not pool pressure from the five cases above, not two
-interleaved drivers. Filed as
-[#1380](https://github.com/mudler/vllm.cpp/issues/1380), which is pre-existing:
-W6 changes which shapes reach a driver and not the capture's allocation
-discipline.
+**The ring-key case is BLOCKED, and locating the blocker is the more useful
+result.** The CPU seam gate proves the key opens TWO rings by counting them; it
+cannot prove the second ring replays the RIGHT graph, because a CPU replay
+recomputes nothing. The device case needs two spec shapes each to reach a REPLAY,
+and **a speculative shape cannot reach one at all on this device**. Measured per
+step rather than aggregated, and identical run alone in a fresh process:
 
-`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore PINS the
-refusal, asserts that it reaches the caller (W2's rethrow, so a failed capture
-never returns pool memory it did not write), and carries the assertion W6 wanted
-in a comment. **It is written to FAIL when #1380 is fixed**, so whoever fixes the
-capture inherits a red pointing at the owed gate rather than a silent skip.
+```
+spec step 0: captured=0 threw=''
+spec step 1: captured=0 threw=''
+spec step 2: captured=1 threw=''
+spec step 3: captured=1 threw='vt cuda: cudaMalloc: operation not permitted when stream is capturing'
+spec step 4: captured=1 threw='vt cuda: embedding: operation failed due to a previous error during capture'
+```
+
+A spec step always takes the two-slot parity ring (`dbuf = impl_->dbuf ||
+spec_step`), so the sequence is slot 0 cold, slot 1 cold, slot 0 CAPTURES, slot 1
+CAPTURES, slot 0 REPLAYS. **The first capture succeeds and the SECOND slot's
+capture is refused**, which is precisely the case the driver's own pre-grow
+comment names -- "pre-grow the pool for THIS slot's RETAINED `[S,vocab]` logits
+block while the OTHER ring slot's logits is held". The pre-grow covers the
+logits; something else in the spec arm allocates inside the captured region and
+is not covered. Step 4 shows the queue is then POISONED, on a step that opens no
+scope. So a replay is unreachable on a speculative shape here, and the feature is
+default-ON.
+
+Filed as [#1380](https://github.com/mudler/vllm.cpp/issues/1380). **It is
+pre-existing and W6 neither caused nor regressed it**: the case drives the driver
+DIRECTLY, so it bypasses the predicate entirely, and the `(S, q, spec)` key only
+changes which map entry a step uses. The five migrated drivers read 0 differing
+on the same binary.
+
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore pins steps 0
+through 2 -- the two cold slots and the FIRST capture -- and prints all five
+outcomes, so the reading above is re-derivable with one command on a leased
+device. It asserts what it measured rather than what W6 wanted, and the
+difference between "the spec path is broken" and "the second ring slot's capture
+is refused" is the whole value of the case.
 
 There is also no eager arm to compare a spec step against, and that is worth
 recording for whoever picks it up: every other case in this file selects one with

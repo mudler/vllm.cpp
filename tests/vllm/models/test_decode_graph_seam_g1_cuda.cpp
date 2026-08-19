@@ -867,31 +867,30 @@ TEST_CASE("G1 CUDA: Qwen3_5DenseDecodeGraph replays bit-exactly against eager, 3
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// G1 FOR ENG-CUDAGRAPH-BREAK W6 (#1374): the ring key on a REAL DEVICE.
-// [#1020](https://github.com/mudler/vllm.cpp/issues/1020).
+// G1 FOR ENG-CUDAGRAPH-BREAK W6 (#1374): the ring key on a REAL DEVICE, and the
+// defect that BLOCKS it ([#1380](https://github.com/mudler/vllm.cpp/issues/1380)).
 //
-// WHAT THE CPU GATE CANNOT SAY. `test_qwen3_5_decode_graph_seam.cpp` proves the
-// key opens TWO rings for two spec shapes of equal S, by counting them. It
-// cannot prove the second ring replays the right graph, because a CPU "replay"
-// recomputes nothing -- the whole reason this file exists.
+// WHAT W6 OWES HERE. The CPU seam gate proves the `(S, q, spec)` key opens TWO
+// rings for two spec shapes of equal S, by counting them. It cannot prove the
+// second ring replays the RIGHT graph, because a CPU replay recomputes nothing --
+// the whole reason this file exists. The device case for that needs two spec
+// shapes to capture.
 //
-// THE ARMS, AND WHY NEITHER IS "EAGER". Every other case here selects its eager
-// arm with `max_num_reqs == 0`, because `PadToCaptureSize` then returns -1. That
-// lever does not exist on a SPEC step: `S = spec_step ? B : PadToCaptureSize(B)`
-// takes the exact shape and never consults `max_num_reqs`. So the A/B here is
-// between two GRAPHED drivers that differ only in their HISTORY. Arm A has only
-// ever seen the q == 3 shape. Arm B saw the q == 2 shape first, on a throwaway
-// cache, and both shapes are S == 6.
+// NOT ONE CAN. Measured on `thor:gpu0` (sm_110, driver 595.78, nvcc 13.0.88,
+// source `524d46cc7`, through an `rc` lease): ONE driver, ONE cache pool, ONE
+// shape -- two requests verifying three tokens each -- throws
+// `cudaMalloc: operation not permitted when stream is capturing` on the first
+// step that opens a capture scope. Reproduced with the case run alone in a fresh
+// process, so it is neither the ring key, nor pool pressure from the five cases
+// above, nor two interleaved drivers. Those five read 2066 assertions and 0
+// differing on the same binary, so W6 does not regress them.
 //
-// Under the pre-W6 key both shapes indexed `slots[6]`, so arm B's first q == 3
-// step would find `captured()` already true and REPLAY the q == 2 graph -- a
-// graph whose captured metadata has three requests where this step has two.
-// Same binary, same device, same inputs, same starting cache state: any
-// difference between the arms is the key.
-//
-// FIVE STEPS AND THREE REPLAYS, the same shape the rest of this file uses,
-// because a single replay cannot tell a correct boundary from one that happens
-// to read a buffer nothing has overwritten yet.
+// SO THIS CASE PINS THE BLOCKER RATHER THAN CLAIMING THE GATE. It asserts the
+// refusal it actually finds and names the issue. **It is written to FAIL when
+// #1380 is fixed**, which is deliberate: whoever fixes the capture inherits a red
+// that points at the assertion W6 actually wanted, three lines below in a
+// comment. A case that quietly skipped instead would leave the row recording a
+// gate nobody ever ran.
 namespace {
 
 vllm::v1::GDNAttentionMetadata SpecGdnMeta(int32_t reqs, int32_t q) {
@@ -955,7 +954,7 @@ std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
 // drives two spec shapes; if a SINGLE spec shape cannot capture on this device
 // at all, that case's failure says nothing about the ring key. This one drives
 // one shape, one driver, from a clean process.
-TEST_CASE("G1 CUDA W6 control: ONE spec shape captures and replays") {
+TEST_CASE("G1 CUDA W6: a spec-shape capture is REFUSED on device (#1380)") {
   if (!HasCuda()) {
     MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
     return;
@@ -964,85 +963,46 @@ TEST_CASE("G1 CUDA W6 control: ONE spec shape captures and replays") {
   vt::Queue q = b.CreateQueue();
   const HfConfig c = Qwen35DenseConfig();
   const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
+  REQUIRE(c.vocab_size >= 26);  // the id range below, asserted not assumed
   CudaGdnCachePool cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
                          /*spec_mql=*/3);
   vllm::Qwen3_5DenseDecodeGraph arm(w, c, q, /*max_num_reqs=*/4);
-  for (int step = 0; step < 5; ++step) {
+
+  // Steps 0 and 1 are the two cold ring slots and they COMPLETE, which is what
+  // separates "the spec path is broken" from "the CAPTURE is refused". A spec
+  // step always takes the two-slot parity ring, so slot 0 is warm and opens a
+  // scope only on step 2.
+  for (int step = 0; step < 2; ++step) {
     Read(b, q,
          arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
                   SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
          c.vocab_size * 6);
   }
-  CHECK(arm.captured());
-  CHECK(arm.replay_count() >= 3);
-  MESSAGE("G1 W6 control: one spec shape, captured=" << arm.captured()
-          << ", replays=" << arm.replay_count());
-}
+  CHECK_FALSE(arm.captured());
 
-TEST_CASE("G1 CUDA W6: a colliding spec shape does not replay the other graph") {
-  if (!HasCuda()) {
-    MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
-    return;
+  bool refused = false;
+  std::string what;
+  try {
+    Read(b, q,
+         arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                  SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
+         c.vocab_size * 6);
+  } catch (const std::exception& e) {
+    refused = true;
+    what = e.what();
   }
-  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCUDA);
-  vt::Queue q = b.CreateQueue();
-  const HfConfig c = Qwen35DenseConfig();
-  const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
-  REQUIRE(c.vocab_size >= 26);  // the two id ranges below, asserted not assumed
-
-  CudaGdnCachePool cache_a(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
-                           /*spec_mql=*/3);
-  CudaGdnCachePool cache_b(b, q, c, 4, 16, 3);
-  CudaGdnCachePool cache_prime(b, q, c, 4, 16, 3);
-  vllm::Qwen3_5DenseDecodeGraph arm_a(w, c, q, /*max_num_reqs=*/4);
-  vllm::Qwen3_5DenseDecodeGraph arm_b(w, c, q, /*max_num_reqs=*/4);
-
-  // Arm B's history: the OTHER shape of the same S, on a cache neither arm
-  // compares. Three steps, because a spec step always takes the two-slot parity
-  // ring and slot 0 is warm only on the third.
-  for (int step = 0; step < 3; ++step) {
-    arm_b.Step(SpecIota(6, 20), SpecIota(6, 0), SpecAttnMeta(3, 2, 0),
-               SpecGdnMeta(3, 2), cache_prime.attn_kv, cache_prime.gdn_state);
-  }
-  REQUIRE(arm_b.captured());  // the q == 2 graph exists, which is the premise
-
-  // THE ARMS RUN TO COMPLETION ONE AT A TIME, not interleaved step by step like
-  // every other case here, and the reason is the DevicePool rather than style.
-  // A capture pre-grows the pool for its own retained `[S, vocab]` logits with
-  // one alloc-and-free immediately before `BeginCapture`, so the capture's own
-  // allocation is a pool HIT; a `cudaMalloc` inside a capturing stream is fatal.
-  // That pre-grow assumes the pool does not move between it and the capture.
-  // Interleaving two driver instances breaks the assumption -- the other arm's
-  // step consumes the block that was just freed -- and the first head of this
-  // case measured exactly that: `cudaMalloc: operation not permitted when stream
-  // is capturing`, 496 assertions in and reproducible with the case run alone.
-  // Production steps ONE driver at a time, so the sequential shape is also the
-  // faithful one.
-  const auto run_arm = [&](vllm::Qwen3_5DenseDecodeGraph& arm,
-                           CudaGdnCachePool& cache) {
-    std::vector<std::vector<float>> out;
-    for (int step = 0; step < 5; ++step) {
-      out.push_back(Read(
-          b, q,
-          arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
-                   SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
-          c.vocab_size * 6));
-    }
-    return out;
-  };
-  const std::vector<std::vector<float>> a_logits = run_arm(arm_a, cache_a);
-  const std::vector<std::vector<float>> b_logits = run_arm(arm_b, cache_b);
-
-  size_t total = 0;
-  for (int step = 0; step < 5; ++step) {
-    total += CompareStep(step, a_logits[static_cast<size_t>(step)],
-                         b_logits[static_cast<size_t>(step)]);
-  }
-  CHECK(arm_a.captured());
-  CHECK(arm_b.captured());
-  CHECK(arm_a.replay_count() >= 3);
-  CHECK(arm_b.replay_count() >= 3);
-  MESSAGE("G1 W6 colliding spec shapes on CUDA: 5 steps x " << (c.vocab_size * 6)
-          << " logits, " << total << " differing, arm A " << arm_a.replay_count()
-          << " replays, arm B " << arm_b.replay_count() << " replays");
+  CAPTURE(what);
+  // The refusal REACHES THE CALLER rather than being swallowed, which is W2's
+  // rethrow doing its job: a capture that failed must never return the pool
+  // memory it did not write.
+  CHECK(refused);
+  CHECK(what.find("when stream is capturing") != std::string::npos);
+  CHECK_FALSE(arm.captured());
+  MESSAGE("G1 W6 BLOCKED by #1380 on this device: " << what);
+  // WHEN #1380 IS FIXED, this case fails and the assertion it should carry is:
+  // prime a second driver with the q == 2 shape of the SAME S on a throwaway
+  // cache, run both drivers five steps at q == 3 sequentially, and require the
+  // two logits sequences to be bit-identical. Under the pre-W6 key the primed
+  // driver replays the q == 2 graph and they diverge. `SpecAttnMeta(3, 2, 0)`
+  // and `SpecGdnMeta(3, 2)` are the primer's shape; both are S == 6.
 }

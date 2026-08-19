@@ -667,6 +667,68 @@ from it is admissible only with a non-zero count and the device named. W2's
 driver is covered by construction — its gate ran on the identical seam — but it
 is not one of the three cases and is NOT claimed here.
 
+**G1 FOR W6: RE-RUN AND PASSING for the five migrated drivers, and BLOCKED for
+the ring key ([#1374](https://github.com/mudler/vllm.cpp/issues/1374),
+[#1380](https://github.com/mudler/vllm.cpp/issues/1380)).** Measured on
+`thor:gpu0` through an `rc` lease -- NVIDIA Thor sm_110, driver 595.78, nvcc
+13.0.88, CUDA-ON build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF`), the binary resolving `libcudart.so.13` and
+`libcublasLt.so.13`.
+
+The five pre-W6 cases read **2066 assertions, 0 failed**, with `5 steps x 100
+logits, 0 differing, 4 replays` for `Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph`
+and `DeepseekV2DecodeGraph`, and `5 steps x 40 logits, 0 differing, 4 replays`
+for both Qwen3.5 drivers. **W6 does not move a single logit on any migrated
+driver.**
+
+**The ring-key case is BLOCKED, and locating the blocker is the more useful
+result.** The CPU seam gate proves the key opens TWO rings by counting them; it
+cannot prove the second ring replays the RIGHT graph, because a CPU replay
+recomputes nothing. The device case needs two spec shapes each to reach a REPLAY,
+and **a speculative shape cannot reach one at all on this device**. Measured per
+step rather than aggregated, and identical run alone in a fresh process:
+
+```
+spec step 0: captured=0 threw=''
+spec step 1: captured=0 threw=''
+spec step 2: captured=1 threw=''
+spec step 3: captured=1 threw='vt cuda: cudaMalloc: operation not permitted when stream is capturing'
+spec step 4: captured=1 threw='vt cuda: embedding: operation failed due to a previous error during capture'
+```
+
+A spec step always takes the two-slot parity ring (`dbuf = impl_->dbuf ||
+spec_step`), so the sequence is slot 0 cold, slot 1 cold, slot 0 CAPTURES, slot 1
+CAPTURES, slot 0 REPLAYS. **The first capture succeeds and the SECOND slot's
+capture is refused**, which is precisely the case the driver's own pre-grow
+comment names -- "pre-grow the pool for THIS slot's RETAINED `[S,vocab]` logits
+block while the OTHER ring slot's logits is held". The pre-grow covers the
+logits; something else in the spec arm allocates inside the captured region and
+is not covered. Step 4 shows the queue is then POISONED, on a step that opens no
+scope. So a replay is unreachable on a speculative shape here, and the feature is
+default-ON.
+
+Filed as [#1380](https://github.com/mudler/vllm.cpp/issues/1380). **It is
+pre-existing and W6 neither caused nor regressed it**: the case drives the driver
+DIRECTLY, so it bypasses the predicate entirely, and the `(S, q, spec)` key only
+changes which map entry a step uses. The five migrated drivers read 0 differing
+on the same binary.
+
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore pins steps 0
+through 2 -- the two cold slots and the FIRST capture -- and prints all five
+outcomes, so the reading above is re-derivable with one command on a leased
+device. It asserts what it measured rather than what W6 wanted, and the
+difference between "the spec path is broken" and "the second ring slot's capture
+is refused" is the whole value of the case.
+
+There is also no eager arm to compare a spec step against, and that is worth
+recording for whoever picks it up: every other case in this file selects one with
+`max_num_reqs == 0`, because `PadToCaptureSize` then returns -1, and a spec step
+takes `S = B` and never consults `max_num_reqs`. The A/B has to be between two
+GRAPHED drivers that differ only in HISTORY. They must also run SEQUENTIALLY
+rather than step-interleaved: the capture pre-grows the pool for its retained
+`[S, vocab]` logits immediately before `BeginCapture`, and a second driver's step
+in between takes the block that was just freed.
+
 For each migrated model, run the same inputs through the segmented capture path and
 through the eager forward with capture disabled, and require the logits to be
 bit-identical. The comparison must cover at least three consecutive replays of the
@@ -686,6 +748,33 @@ a class and not a capability. The reviewer restores the tree byte for byte
 afterwards. Report the diff stat and the compiler status alongside the mutation
 result, because a mutation that never applied and a mutation that failed to build
 both read as a passing test.
+
+**G2 FOR W6, at three levels, because the predicate change has three parts and
+no one gate covers them ([#1374](https://github.com/mudler/vllm.cpp/issues/1374)).**
+
+| Level | File | What only it can see | Detecting mutation |
+|---|---|---|---|
+| The engine | `tests/vllm/v1/spec_decode/test_mtp_depth.cpp` | that a CLAMPED verify step reaches the predicate at all, driven by LoadedEngine / EngineCore / Scheduler / GPUModelRunner | A: revert the predicate to the configured-width comparison. 3 failures, other two levels GREEN |
+| The driver | `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp` | that two spec shapes of equal S and different q get two rings and two captures | B: key on S alone. 3 failures. C: the bound never fires. 3 failures. E, the over-fire control: the bound always fires. 8 failures |
+| The arithmetic | `tests/vllm/v1/worker/gpu/test_cudagraph_dispatch.cpp` | the verify conjunct, which no engine here can reach | D2: drop the conjunct. 4 failures, other two levels GREEN |
+
+**The engine gate asserts `clamped_spec_steps` and not the total**, because the
+total moves on an unclamped engine too and so cannot witness the widening.
+MEASURED at `max_model_len == 32` over a 29-token run: 0 at k=1, 0 at k=2, 1 at
+k=3, 2 at k=4, 4 at k=6. The context tail is what clamps. The k<=2 zeros are the
+control rather than a gap: no length exists strictly between 1 and 2.
+
+**One mutation was NOT detected and the repair is part of W6.** Deleting the
+per-request draft conjunct from the runner left all three levels green -- 104/104,
+53/53, 138/138 -- because both models that read `uniform_query_len` are GDN
+hybrids whose prefill carries `gdn_meta.num_prefill_tokens > 0`, so the runner's
+FIRST conjunct refuses a prefill before the per-request one is consulted.
+Rewriting the case against a full-attention-only Qwen3.5 config did not reach it
+either: the KV cache spec still builds a GDN group and the step is refused by the
+state validator. The conjunct moved into `v1::GraphEligibleQueryLen` beside the
+arithmetic it composes with, where a mutation CAN move it, and `## Owed` records
+that it is defence in depth for the next model rather than something measured on
+one.
 
 **G3, segment-count observability.** A log line or counter that reports segments
 captured, break functions registered, and replays run, so the ratio is observable
@@ -1168,12 +1257,71 @@ predicate and build-flag reasons above. G5's ROCm and Tenstorrent arms stay
 BLOCKED on hardware the fleet does not carry. `## Owed` carries each with its
 resource.
 
-**W6, close the coverage gap the row exists for.** Only after W1 through W5 does
-the predicate at `runner.cpp:1341` move from `pure_decode` to "eligible except at
-the break points". This is LAST, not first: replacing the predicate before every
-driver can survive a segmented capture would admit steps that no driver can serve.
-[#1020](https://github.com/mudler/vllm.cpp/issues/1020) closes here or is
-explicitly re-scoped here.
+**W6, close the coverage gap the row exists for. DONE 2026-08-19,
+[#1374](https://github.com/mudler/vllm.cpp/issues/1374).** Only after W1 through
+W5 does the predicate at `runner.cpp` move from `pure_decode`. This is LAST, not
+first: replacing the predicate before every driver can survive a segmented
+capture would admit steps that no driver can serve.
+
+**What moved.** The runner shipped ONE boolean that means "query length is 1",
+and a model wanting anything wider had to re-derive the whole test for itself.
+Two of them did, in twenty byte-identical lines each
+(`qwen3_5_moe.cpp`, `qwen3_5_dense.cpp`, landed by #442). W6 makes the runner
+name the step's ACTUAL uniform query length once, through
+`v1::GraphEligibleQueryLen` (`src/vllm/v1/worker/gpu/cudagraph_dispatch.h`), and
+ship it on `ModelForwardInput::uniform_query_len`. **That header had been INERT
+since #442 with no caller; W6 is its production caller.**
+
+**[#1020](https://github.com/mudler/vllm.cpp/issues/1020) CLOSES HERE**, and its
+own "what a fix has to do" is the shape of the change. Both halves landed
+together because either alone is a defect:
+
+1. The predicate reads the step's ACTUAL length instead of comparing against the
+   configured `1 + num_spec()`, a constant for the engine's lifetime. The
+   scheduler clamps drafts to the step's token budget
+   (`v1/core/sched/scheduler.cpp:616-622`), so at k > 1 a step every request
+   entered with the same SHORTER prefix is uniform, is exactly the shape a graph
+   can serve, and got none.
+2. Both Qwen3.5 drivers key their slot ring on `(S, q, spec)` rather than on the
+   padded token count alone. **That was not only the enabler #1020 called it, it
+   was a LIVE collision.** `S = spec_step ? B : PadToCaptureSize(B)`, so a spec
+   step of 4 requests at 1+1 tokens and a non-spec padded step of 8 requests both
+   land on `S == 8` at the base commit, carry different metadata, and the second
+   replays a graph captured against the first. `SizeSlot::Refresh` copies IN
+   PLACE only while the sizes match and REASSIGNS the vector when they do not,
+   which also moves the host addresses a capture baked (D2). Silently wrong
+   logits, invisible to a token gate.
+
+**The widening is BOUNDED, and the bound is the memory question #1020 said had to
+be answered before it landed.** Reading the actual length multiplies the spec
+shape ceiling by `1 + k`, and each shape retains an `[S, vocab]` f32 logits block
+plus an `[S, H]` hidden, times two ring slots.
+`VT_SPEC_GRAPH_MAX_QLENS` bounds the DISTINCT speculative query lengths one
+driver captures; the default of 2 is the smallest value that admits anything new
+(the steady-state `1 + k` plus one clamped length), `0` removes it. A step past
+the bound runs EAGER, which is exactly what every clamped shape did before W6.
+
+**One TIGHTENING arrived with the widening, and it is the polarity this stage
+owes.** A `q > 1` batch carrying no spec segmentation is refused by the driver
+rather than captured: `BuildPaddedDecode` rewrites a non-spec step's metadata as
+a pure decode of S single-token requests, which is not what a
+multi-token-per-request batch is. The predicate never sent one there; it was the
+predicate saying so and nothing in the driver.
+
+**WHAT W6 DID NOT DO, and it is the row's own headline.** The predicate did NOT
+move to "eligible except at the break points". Nothing in this tree captures a
+PREFILL or a MIXED batch under any predicate, because no driver serves one:
+every one of the nine is a decode driver. The piecewise arm the row was scoped
+on needs a driver that does not exist, and building one lands machinery against
+a benefit D5 already refutes on this hardware. `## Owed` names it as a row-level
+item with what would have to be true, rather than as a stage that ran out of
+time.
+
+**Gates.** G2 at three levels, because the claim has three parts and no one gate
+covers them, each with a detecting mutation; see `## Gates` G2 and `## Outcome`.
+Seven of the nine drivers still read `pure_decode` and are byte-identical across
+this change, which is the "provably narrower-or-equal to what the drivers
+support" the stage's ordering requires.
 
 ## Risks/decisions
 
@@ -1326,17 +1474,40 @@ point registered inside an unjoined fork window without this rule fails at
 
 ## Now
 
-`ACTIVE`. W0 (spike), W1 (the seam, its ported unit gate, and one registered
-break point), W2 (`Qwen3DenseDecodeGraph`), W3 (`Qwen3MoeDecodeGraph`,
-`VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`), W4 (the persistent device input
-path as `vt::PersistentStepInput`, plus `Qwen3_5DecodeGraph` and
-`Qwen3_5DenseDecodeGraph`) and W5 (the three single-shape drivers, plus D10) have
-landed. **NINE OF THE NINE DRIVERS ARE ON THE SEAM**, the migration is complete,
-and one `std::getenv("VLLM_CPP_CUDAGRAPH")` remains in `src/` — the seam's own.
+`ACTIVE`, with ONE item left and it is not a stage. W0 (spike), W1 (the seam, its
+ported unit gate, and one registered break point), W2 (`Qwen3DenseDecodeGraph`),
+W3 (`Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`), W4
+(the persistent device input path as `vt::PersistentStepInput`, plus
+`Qwen3_5DecodeGraph` and `Qwen3_5DenseDecodeGraph`), W5 (the three single-shape
+drivers, plus D10) and W6 (the eligibility predicate, and #1020) have landed.
+**NINE OF THE NINE DRIVERS ARE ON THE SEAM**, the migration is complete, and one
+`std::getenv("VLLM_CPP_CUDAGRAPH")` remains in `src/` -- the seam's own.
 `grep -rnE '\.(BeginCapture|EndCaptureGraph|ReplayGraph|DestroyGraph)\s*\('`
-over `src/vllm/`, with comment lines excluded, returns NOTHING. **Only W6
-remains**, and `## Work breakdown` states it. Owner:
-`.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W5.md`.
+over `src/vllm/`, with comment lines excluded, returns NOTHING.
+
+**W6 MOVED THE PREDICATE AND DID NOT CLOSE THE COVERAGE GAP THE ROW WAS NAMED
+FOR, and that is the honest reading rather than a shortfall to be worked
+around.** What moved is real and is measured: the runner names the step's ACTUAL
+uniform query length once instead of shipping a boolean that means "query length
+is 1", the two Qwen3.5 registrations stop re-deriving that test in twenty
+duplicated lines each, and a speculative verify the scheduler clamped to a
+shorter draft prefix is now captured at its own depth instead of running eager.
+[#1020](https://github.com/mudler/vllm.cpp/issues/1020) closes on that, together
+with the `(S, q, spec)` ring key, which was a LIVE collision and not only the
+enabler #1020 called it.
+
+**What did NOT move is "except at the break points".** No driver in this tree
+serves a PREFILL or a MIXED batch under any predicate: all nine are decode
+drivers, and widening the predicate to admit a prefill would admit a step nothing
+can serve, which is the failure `## Work breakdown` W6 orders this stage last to
+avoid. The piecewise arm therefore needs a driver that does not exist. **Building
+one lands machinery against a benefit this spec already refuted on this
+hardware** -- D5's 3.8% prefill host-idle at above 96% GPU-busy on GB10, and the
+27B prefill gap at 92.5% non-GEMM glue -- so `## Owed` names it as a row-level
+item with what would have to be true first, and it is not claimed as a stage that
+ran out of window. **That is a publishable negative, in the same shape the
+sibling row `ENG-CUDAGRAPH-DEDUP` published: the machinery composes, the coverage
+it would buy has no measured demand on the hardware we have.**
 
 **D10, the auxiliary-stream auto-join, is discharged and is REACHED.** Every
 prior stage opened `kFull`, which has one segment and so no between-segments
@@ -1363,10 +1534,11 @@ differing**, the two Qwen3.5 drivers added by W4. W2's `Qwen3DenseDecodeGraph`
 is still covered by argument rather than by measurement, which `## Gates` G1
 says out loud, and W5's three single-shape drivers join it there for reasons
 `## Owed` names per driver. This is the only gate in this row a CPU harness could
-never have answered.
+never have answered. W6 adds a SIXTH case to the same file for its ring key; see
+`## Outcome`.
 
-W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
-`cudaStreamBeginCapture` mid-forward on our stream configuration — is
+W1's exit criterion -- that CUDA permits `cudaStreamEndCapture` followed by
+`cudaStreamBeginCapture` mid-forward on our stream configuration -- is
 CONFIRMED on a leased GPU and is no longer an open question for any later stage.
 
 ## Owed
@@ -1525,8 +1697,32 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   PRIMITIVE and not the arm.** `vt::PersistentStepInput` is persistent,
   driver-owned, capture-stable storage, so what is missing is no longer a
   primitive: it is a driver that holds its layer's inputs there and a break
-  closure that reads them instead of `RunLayer`'s frame. Owner: **W6**, which
-  cannot move the eligibility predicate before that exists.
+  closure that reads them instead of `RunLayer`'s frame.
+
+  **W6 DID NOT BUILD THAT DRIVER, and the reason is not the closure.** W6 moved
+  the eligibility predicate anyway, because the two turned out to be independent:
+  the predicate widened onto shapes the EXISTING `kFull` drivers already serve
+  (a speculative verify at its actual draft depth), and that needed no piecewise
+  arm at all. What a piecewise arm would serve is a PREFILL or a MIXED batch, and
+  **no driver in this tree serves one under any predicate** -- all nine are decode
+  drivers. So the missing piece is not a closure and not a primitive, it is a
+  PREFILL CAPTURE DRIVER, which is a row-sized amount of work.
+
+  **And its benefit is already refuted on the hardware we have.** D5's own dated
+  measurements are the argument against building it: prefill idle between
+  launches at 3.8% with GPU-busy above 96% on GB10, and the 27B prefill gap at
+  92.5% non-GEMM glue GPU work. A piecewise prefill capture removes host launch
+  gaps, and there are no host launch gaps to remove. Negative results are
+  regime-dependent (D5 says so), so this is dated and hardware-specific rather
+  than permanent.
+
+  **What would have to be true before anyone builds it**, stated so the next
+  agent does not re-derive it: a named path that is BOTH currently eager AND
+  currently host-bound, with the host-bound part measured, which is exactly the
+  bar `## Gates` sets for any speed claim from this row. Absent that, the three
+  items this entry, the caught-exception residual and the D1 reuse hazard have
+  been carrying between them stay open TOGETHER and are all downstream of the
+  same missing driver. Owner: row **`ENG-CUDAGRAPH-BREAK`**, not a stage.
 - **The async device-token DECLINE at `qwen3.cpp`'s `DenseDecodeGraphForward` STANDS after W4, and the
   reason changed.** W4 owned the decision and did not remove it. What W4
   established, by reading the tree rather than by inheriting the record:
@@ -1643,8 +1839,11 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   and a `kFull` capture has no between-segments window for a caught exception to
   truncate. The residual becomes live for the first driver that captures
   PIECEWISE. **W4 did not close it either, and for the identical reason:** both
-  drivers it migrated open `kFull`. Owner: **W6**, with the piecewise arm it
-  unblocks.
+  drivers it migrated open `kFull`. **W6 did not either, and W6 is where the
+  ownership stops being a stage:** every driver it touched still opens `kFull`,
+  because the shapes W6's predicate widened onto are decode shapes and vLLM
+  captures decode FULL. This residual is downstream of the missing prefill
+  capture driver, above. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
   What W2 DID close is the adjacent hole the fresh review found, and it is
   recorded here because the two are easy to confuse: the drain leaves a FAILED
   capture reporting exactly what an INERT scope reports, and the first W2 head
@@ -1661,8 +1860,37 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   to:** the hazard is the window BETWEEN two segments, which a `kFull` capture
   does not have, so it becomes live for the first driver that captures
   piecewise. **W4 did not close it either, and for the identical reason:** both
-  drivers it migrated open `kFull`. Owner: **W6**, with the piecewise arm it
-  unblocks.
+  drivers it migrated open `kFull`. **W6 did not either**, and for the third time
+  the identical reason: it widened onto DECODE shapes, which vLLM captures FULL.
+  Downstream of the missing prefill capture driver, above. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**.
+- **The verify conjunct in `v1::GraphEligibleQueryLen` is DEFENCE IN DEPTH and is
+  unreached** ([#1374](https://github.com/mudler/vllm.cpp/issues/1374)). It
+  refuses a batch that is uniform by arithmetic but is not a speculative verify --
+  a single request prefilling n tokens is uniform at query length n, and at
+  k >= 2 that sits inside the `1 + k` bound. On every model that reads
+  `uniform_query_len` today the runner's FIRST conjunct already refuses it: both
+  are GDN hybrids, so a prefill carries `gdn_meta.num_prefill_tokens > 0`.
+  MEASURED, not assumed: deleting the conjunct left all three W6 gate levels
+  GREEN, and rewriting the case against a full-attention-only Qwen3.5 config did
+  not reach it either because the KV cache spec still builds a GDN group. It is
+  therefore gated on the FUNCTION (`test_cudagraph_dispatch.cpp`, where a
+  mutation reds 4 assertions) rather than through an engine, and it is named here
+  because a guard nothing reaches is exactly what "nothing lands dead" is about.
+  It becomes reached the moment a full-attention-only model reads
+  `uniform_query_len`. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+- **The enlarged capture set has NOT been measured for memory**
+  ([#1374](https://github.com/mudler/vllm.cpp/issues/1374)).
+  [#1020](https://github.com/mudler/vllm.cpp/issues/1020) said the widening had
+  to be measured on a GPU before it landed, because reading the step's actual
+  query length multiplies the spec shape ceiling by `1 + k` and each shape retains
+  an `[S, vocab]` f32 logits block. W6 answered that with a BOUND rather than a
+  measurement -- `VT_SPEC_GRAPH_MAX_QLENS`, default 2, so the ceiling doubles
+  rather than multiplying by `1 + k` -- and the bound is gated, not the number of
+  bytes. What is owed is the reading: the resident bytes of a two-length capture
+  set against a one-length one, on a real checkpoint, which needs the same `dgx`
+  window with weights that the async battery below needs. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**.
 
 ## Outcome
 
@@ -1831,3 +2059,70 @@ at a declaration and re-derived by every caller is not a mechanism. Where a
 contract can be encoded in a type, encode it: W2 through W5 add nine more callers
 and none of them should have to read that paragraph to be correct.
 
+
+### W6, the eligibility predicate ([#1374](https://github.com/mudler/vllm.cpp/issues/1374))
+
+**The stage's most important result is what it found ALREADY BROKEN, not what it
+widened.** #1020 called the `(S, q)` ring key an ENABLER: "today that cannot
+collide, precisely BECAUSE the predicate admits only one query length per
+engine". That is wrong at the base commit and W6 measured it wrong.
+`S = spec_step ? B : PadToCaptureSize(B)`, so a SPEC step of 4 requests at 1+1
+tokens and a NON-SPEC padded step of 8 requests both land on `S == 8` with the
+predicate exactly as it was. The two carry different metadata --
+`num_spec_decodes`, `spec_query_start_loc`, `num_accepted_tokens`, a different
+row count -- and the second finds `captured()` true and replays the first's
+graph. `SizeSlot::Refresh` copies IN PLACE only while the sizes match and
+REASSIGNS the vector when they do not, so a shape swap also moves the host source
+addresses a capture baked, which is D2. Silently wrong logits with no fault. The
+condition is one speculating engine with eight concurrent requests at k=1.
+
+`Refresh`'s own comment named the residual and called it future
+(#1020: "the slot ring is keyed on S alone, and two different uniform query
+lengths can NOW reach one key"). The word that was wrong is "now".
+
+**Mutation D was not detected, and the repair is the stage's second result.**
+Deleting the runner's per-request draft conjunct left all three gate levels green
+at 104/104, 53/53 and 138/138. The reason is structural: both models that read
+`uniform_query_len` are GDN hybrids, so a prefill carries
+`gdn_meta.num_prefill_tokens > 0` and the FIRST conjunct refuses it before the
+per-request one runs. Rewriting the case against a full-attention-only Qwen3.5
+config did not reach it either -- the KV cache spec still builds a GDN group and
+the step is refused by the state validator. So the conjunct moved into
+`v1::GraphEligibleQueryLen`, beside the arithmetic it composes with, where
+`test_cudagraph_dispatch` gates it directly and a mutation reds 4 assertions.
+**The general shape, and it is the third time this row has hit it:** a guard
+placed where nothing can move it reads as correct forever. W1's aliasing refusal,
+W3's mode counters and this conjunct are the same lesson at three different
+layers.
+
+**What was REJECTED, and why.** An unbounded widening. Reading the step's actual
+query length multiplies the ceiling on captured spec shapes by `1 + k`, and every
+shape retains an `[S, vocab]` f32 logits block plus an `[S, H]` hidden, times two
+ring slots -- at a 151k vocabulary that is roughly 0.6 MB per token of S for the
+logits alone. #1020 said this had to be measured on a GPU before it landed, and
+that measurement needs a real checkpoint on a `dgx` window this stage did not
+have. So the widening is BOUNDED instead: `VT_SPEC_GRAPH_MAX_QLENS`, default 2,
+which doubles the ceiling rather than multiplying it by `1 + k`. The default is
+the smallest value that admits anything new -- the steady-state `1 + k` plus one
+clamped length -- and a step past it runs eager, which is what every clamped
+shape did before W6. `## Owed` carries the reading that is still owed.
+
+**Why `q > 1` and not `q >= 1` in the model-side test.** At `q == 1` the
+population is exactly `pure_decode`, which is the field the other seven drivers
+read and which is byte-identical across this change. Keeping `input.pure_decode`
+on the left of the disjunction means the seven untouched drivers are provably
+narrower than the new field, which is the polarity `## Work breakdown` W6
+requires. A value above 1 also PROVES speculation is configured, because the
+runner bounds the length by `1 + num_spec()`.
+
+**And the row's own headline did not close.** W6 was scoped as "the predicate
+moves from `pure_decode` to eligible-except-at-the-break-points". Half of that is
+a category error and it took the stage to see it: **there is no driver to be
+eligible INTO for a prefill or a mixed batch.** All nine are decode drivers. The
+predicate can widen only onto shapes an existing driver serves, which is what W6
+did, and everything past that needs a prefill capture driver nobody has written.
+Its benefit is refuted by this spec's own dated numbers (D5), so `## Owed` states
+what would have to be true first rather than scheduling it. **That is a
+publishable negative in the same shape `ENG-CUDAGRAPH-DEDUP` published: the
+machinery composes and the coverage it would buy has no measured demand on this
+hardware.**

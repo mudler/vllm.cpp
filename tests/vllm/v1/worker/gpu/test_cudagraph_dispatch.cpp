@@ -84,3 +84,124 @@ TEST_CASE("request count for a padded capture, and the shapes upstream refuses")
   CHECK_FALSE(UniformDecodeNumReqs(0, 8, 8).has_value());
   CHECK_FALSE(UniformDecodeNumReqs(9, 8, 0).has_value());
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// ENG-CUDAGRAPH-BREAK W6 (#1374): the predicate reads the step's ACTUAL uniform
+// query length. [#1020](https://github.com/mudler/vllm.cpp/issues/1020).
+//
+// These are the arithmetic cases. They say what the function computes and never
+// that a step reaches it; the reachability gate is
+// `tests/vllm/v1/spec_decode/test_mtp_depth.cpp` ("W6: a CLAMPED spec verify is
+// graph-eligible at its actual depth"), which drives a real engine.
+TEST_CASE("W6: a CLAMPED verify keeps its actual query length") {
+  // THE #1020 CASE. k=3, so the configured shape is 4. A step every request
+  // entered with TWO drafts is uniform at 3, which `IsUniformDecodeBatch`
+  // rejects against the configured width and this function reports.
+  CHECK_FALSE(IsUniformDecodeBatch(/*num_reqs=*/2, /*num_tokens=*/6,
+                                   /*max_query_len=*/3, /*num_spec=*/3));
+  CHECK(ActualUniformDecodeQueryLen(2, 6, 3, 3) == 3);
+
+  // Full depth is unchanged: both agree, which is what makes the widening
+  // additive rather than a replacement.
+  CHECK(IsUniformDecodeBatch(2, 8, 4, 3));
+  CHECK(ActualUniformDecodeQueryLen(2, 8, 4, 3) == 4);
+
+  // Every clamped depth between the two, and the degenerate one at the bottom:
+  // a step with no drafts left is an ordinary decode and reports 1.
+  CHECK(ActualUniformDecodeQueryLen(4, 8, 2, 3) == 2);
+  CHECK(ActualUniformDecodeQueryLen(4, 4, 1, 3) == 1);
+
+  // THE UPPER BOUND IS KEPT, and it is not the same test as the equality it
+  // replaces. A batch uniform ABOVE `1 + k` is not a verify step -- it is a
+  // prefill or a chunked batch wearing a uniform shape -- and no decode driver
+  // in this tree captures one. Mirrors vLLM, whose FULL branch dispatches only
+  // at the configured decode length (cudagraph_dispatcher.py:143).
+  CHECK_FALSE(ActualUniformDecodeQueryLen(1, 9, 9, /*num_spec=*/3).has_value());
+  CHECK_FALSE(ActualUniformDecodeQueryLen(1, 2, 2, /*num_spec=*/0).has_value());
+
+  // Speculation OFF collapses it to exactly today's pure-decode shape, which is
+  // what makes every non-speculative engine byte-identical across this change.
+  CHECK(ActualUniformDecodeQueryLen(4, 4, 1, /*num_spec=*/0) == 1);
+
+  // A ragged batch has no uniform length at any configured width, so no graph
+  // can serve it and the function says so rather than picking one.
+  CHECK_FALSE(ActualUniformDecodeQueryLen(2, 5, 3, 3).has_value());
+  CHECK_FALSE(ActualUniformDecodeQueryLen(3, 8, 2, 3).has_value());
+  CHECK_FALSE(ActualUniformDecodeQueryLen(0, 4, 1, 3).has_value());
+}
+
+TEST_CASE("W6: the dispatch counters separate the clamped population") {
+  // #1020 is titled on the word SILENTLY, so the counters are part of the fix
+  // rather than decoration. This case pins which bucket each step lands in.
+  ResetGraphDispatchStats();
+  const int64_t configured = UniformDecodeQueryLen(3);  // == 4
+  CHECK(configured == 4);
+
+  NoteGraphDispatch(/*query_len=*/1, configured);  // ordinary decode
+  NoteGraphDispatch(4, configured);                // full-depth verify
+  NoteGraphDispatch(3, configured);                // CLAMPED verify, the #1020 one
+  NoteGraphDispatch(2, configured);                // clamped harder
+  NoteGraphDispatch(0, configured);                // prefill / mixed / ragged
+
+  const GraphDispatchStats s = GetGraphDispatchStats();
+  CHECK(s.uniform_steps == 4);
+  CHECK(s.uniform_spec_steps == 3);
+  CHECK(s.clamped_spec_steps == 2);
+  CHECK(s.ragged_steps == 1);
+  // The buckets SUM to the steps recorded, or one of them is double-counting.
+  CHECK(s.uniform_steps + s.ragged_steps == 5);
+  // And the spec buckets nest, which is what says `clamped` is a SUBSET rather
+  // than a parallel count.
+  CHECK(s.clamped_spec_steps <= s.uniform_spec_steps);
+  CHECK(s.uniform_spec_steps <= s.uniform_steps);
+
+  ResetGraphDispatchStats();
+  const GraphDispatchStats z = GetGraphDispatchStats();
+  CHECK(z.uniform_steps == 0);
+  CHECK(z.uniform_spec_steps == 0);
+  CHECK(z.clamped_spec_steps == 0);
+  CHECK(z.ragged_steps == 0);
+  CHECK(z.capture_shapes == 0);
+  CHECK(z.qlen_cap_declines == 0);
+}
+
+// THE VERIFY CONJUNCT, gated on the function because no engine in this tree can
+// reach it. Both models that read `uniform_query_len` are GDN hybrids, so their
+// prefill steps carry `gdn_meta.num_prefill_tokens > 0` and the runner's FIRST
+// conjunct refuses them before this one is consulted. Measured, not assumed:
+// deleting the per-request test left `test_mtp_depth` GREEN at 104/104. It is
+// defence in depth for the next model that reads the field, and the spec's
+// `## Owed` says so -- so it is gated HERE, where a mutation can move it.
+TEST_CASE("W6: a batch uniform by arithmetic is not automatically a verify") {
+  const std::vector<int32_t> kNoDrafts;
+
+  // THE PREFILL. One request, three tokens, k=3. Uniform at 3 and inside the
+  // bound, so the shape half admits it; no request is verifying, so the step
+  // half does not.
+  CHECK(ActualUniformDecodeQueryLen(1, 3, 3, /*num_spec=*/3) == 3);
+  CHECK_FALSE(
+      GraphEligibleQueryLen(1, 3, 3, /*num_spec=*/3, kNoDrafts).has_value());
+
+  // A REAL VERIFY at the same shape: one request carrying two drafts.
+  CHECK(GraphEligibleQueryLen(1, 3, 3, /*num_spec=*/3, {2}) == 3);
+  // ... and at full depth.
+  CHECK(GraphEligibleQueryLen(2, 8, 4, /*num_spec=*/3, {3, 3}) == 4);
+
+  // A MIXED step whose arithmetic happens to be uniform: both requests carry
+  // three tokens, but only one of them is verifying at two drafts. Admitting it
+  // would capture a shape half the batch does not have.
+  CHECK_FALSE(GraphEligibleQueryLen(2, 6, 3, /*num_spec=*/3, {2, 0}).has_value());
+  CHECK_FALSE(GraphEligibleQueryLen(2, 6, 3, /*num_spec=*/3, {1, 2}).has_value());
+  // A count array that does not cover the batch says nothing about it.
+  CHECK_FALSE(GraphEligibleQueryLen(2, 6, 3, /*num_spec=*/3, {2}).has_value());
+
+  // QUERY LENGTH 1 NEVER CONSULTS THE DRAFT COUNTS, because that arm is
+  // `pure_decode` and every driver already serves it. A step with no recorded
+  // drafts still reports 1.
+  CHECK(GraphEligibleQueryLen(4, 4, 1, /*num_spec=*/3, kNoDrafts) == 1);
+  CHECK(GraphEligibleQueryLen(4, 4, 1, /*num_spec=*/0, kNoDrafts) == 1);
+
+  // And the refusals the shape half already owns survive composition.
+  CHECK_FALSE(GraphEligibleQueryLen(2, 5, 3, 3, {2, 2}).has_value());  // ragged
+  CHECK_FALSE(GraphEligibleQueryLen(1, 9, 9, 3, {8}).has_value());     // over 1+k
+}

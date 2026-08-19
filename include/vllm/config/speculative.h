@@ -112,6 +112,31 @@ struct SpeculativeConfig {
     return cfg;
   }
 
+  // IsDflash2Draft: whether a DFlash draft is a DFlash2 one, by the architecture
+  // upstream itself selects on.
+  //
+  // BEYOND-PIN (SPEC-DFLASH2 W1, #1314). vllm-project/vllm#52816 is OPEN at head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f`; the parity pin `555967922` does
+  // not carry the architecture at all, and this row does NOT advance the pin.
+  // Upstream registers `"DFlash2DraftModel" -> ("qwen3_dflash2",
+  // "DFlash2Qwen3ForCausalLM")` (`model_executor/models/registry.py:628`) and
+  // asks exactly this question in two places: the speculator selection
+  // (`v1/worker/gpu/spec_decode/__init__.py:12`) and `_is_dflash2_draft`
+  // (`config/vllm.py:668-676`), both spelled as membership of the string in the
+  // draft config's `architectures`. The precedent for mirroring an open pull
+  // request ahead of the pin is `SPEC-DSPARK-QWEN3-ROUTING` toward vllm#52197,
+  // argued at .agents/specs/dflash2-spec-decode.md D1.
+  //
+  // It answers a QUESTION and refuses nothing. The refusal — with the missing
+  // parts named — belongs to the loader, which is where a user arrives
+  // (src/vllm/entrypoints/model_loader.cpp::ResolveSpecConfig).
+  static bool IsDflash2Draft(const std::vector<std::string>& architectures) {
+    for (const std::string& arch : architectures) {
+      if (arch == "DFlash2DraftModel") return true;
+    }
+    return false;
+  }
+
   // IsDsparkDraft: the DSpark half of upstream's method auto-detection
   // (speculative.py:881-887) — a draft whose model id contains "dspark"
   // (case-insensitively, e.g. deepseek-ai/dspark_qwen3_8b_block7 or

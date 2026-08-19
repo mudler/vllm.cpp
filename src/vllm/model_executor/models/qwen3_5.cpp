@@ -13,6 +13,7 @@
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) slot-key + dispatch counters
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
@@ -9569,6 +9570,88 @@ void CopyInPlace(std::optional<std::vector<T>>& dst,
   CopyInPlace(*dst, *src);
 }
 
+// ENG-CUDAGRAPH-BREAK W6 (#1374): THE DECODE-GRAPH SLOT KEY, closing the half of
+// [#1020](https://github.com/mudler/vllm.cpp/issues/1020) that is not the
+// predicate.
+//
+// The ring used to be keyed on the padded token count S ALONE, and `Refresh`'s
+// own comment already recorded the residual: "the slot ring is keyed on S alone,
+// and two different uniform query lengths can now reach one key". That was
+// harmless only while the predicate admitted exactly one query length per
+// engine, which is the guarantee W6 removes.
+//
+// IT WAS NOT ONLY A FUTURE HAZARD. `S = spec_step ? B : PadToCaptureSize(B)`, so
+// a SPEC step of 4 requests at 1+1 tokens and a NON-SPEC padded step of 8
+// requests both land on S == 8 TODAY. The two carry different metadata --
+// `num_spec_decodes`, `spec_query_start_loc`, `num_accepted_tokens` -- and the
+// second would replay a graph captured against the first. `Refresh` copies IN
+// PLACE only while the sizes match; a size change reassigns the vector, so the
+// step that follows a shape swap also moves the host addresses a capture baked
+// (spec `## Risks/decisions` D2). Silently wrong logits, invisible to a token
+// gate.
+//
+// `spec` is in the key and `query_len` alone is not enough for the same reason:
+// a spec step whose requests each carry ONE token is uniform at q == 1 and still
+// carries spec segmentation, so it must not share a ring with a padded pure
+// decode of the same width.
+struct DecodeGraphSlotKey {
+  int64_t size = 0;       // S, the captured token count
+  int64_t query_len = 1;  // the uniform query length the graph was captured for
+  bool spec = false;      // the step carried spec-decode segmentation
+};
+inline bool operator<(const DecodeGraphSlotKey& a, const DecodeGraphSlotKey& b) {
+  if (a.size != b.size) return a.size < b.size;
+  if (a.query_len != b.query_len) return a.query_len < b.query_len;
+  return static_cast<int>(a.spec) < static_cast<int>(b.spec);
+}
+
+// The bound on how many DISTINCT speculative query lengths one driver captures.
+//
+// WHY A BOUND EXISTS AT ALL. Before W6 the predicate admitted one query length
+// per engine, so the spec shape count was bounded by `max_num_seqs`. Reading the
+// step's ACTUAL length multiplies that ceiling by `1 + k`, and every shape
+// retains an [S, vocab] f32 logits block plus an [S, H] hidden -- at a 151k
+// vocabulary the logits alone are ~0.6 MB per token of S, times two ring slots.
+// An unbounded widening is a memory regression nobody measured, so the widening
+// is bounded, tunable and COUNTED rather than open.
+//
+// The default of 2 is the smallest value that admits anything new: one steady-
+// state length (the configured `1 + k`, which every unclamped verify takes) plus
+// one clamped length. `VT_SPEC_GRAPH_MAX_QLENS=0` removes the bound; a larger
+// value widens it. A step past the bound falls to the eager arm, which is
+// exactly what it did before W6, and `qlen_cap_declines` reports it.
+inline int64_t SpecQueryLenCap() {
+  static const int64_t cap = [] {
+    const char* v = std::getenv("VT_SPEC_GRAPH_MAX_QLENS");
+    if (v == nullptr || v[0] == '\0') return static_cast<int64_t>(2);
+    return static_cast<int64_t>(std::strtoll(v, nullptr, 10));
+  }();
+  return cap;
+}
+
+// True when capturing `key` would push this driver past `SpecQueryLenCap()`
+// distinct speculative query lengths. A key already in the map is never capped:
+// declining a shape the driver already holds a graph for would strand it.
+template <class MapT>
+bool DecodeGraphQueryLenCapped(const MapT& slots, const DecodeGraphSlotKey& key) {
+  if (!key.spec || key.query_len <= 1) return false;
+  const int64_t cap = SpecQueryLenCap();
+  if (cap <= 0) return false;
+  if (slots.find(key) != slots.end()) return false;
+  // The map is ordered by (size, query_len, spec), so equal query lengths are
+  // NOT adjacent and a run-length count would over-report. Collect them; the
+  // set is bounded by the cap plus one and this runs once per step.
+  std::vector<int64_t> seen;
+  for (const auto& kv : slots) {
+    if (!kv.first.spec || kv.first.query_len <= 1) continue;
+    if (kv.first.query_len == key.query_len) return false;
+    if (std::find(seen.begin(), seen.end(), kv.first.query_len) == seen.end()) {
+      seen.push_back(kv.first.query_len);
+    }
+  }
+  return static_cast<int64_t>(seen.size()) >= cap;
+}
+
 // The decode-graph capture set + pad-to-capture selector live in
 // vllm/model_executor/models/decode_graph_sizes.h (DecodeGraphSizes /
 // PadToCaptureSize), derived from max_num_seqs to mirror vLLM's
@@ -10030,7 +10113,7 @@ struct Qwen3_5DecodeGraph::Impl {
     SizeSlot slot[2];
     int next = 0;
   };
-  std::map<int64_t, SlotRing> slots;  // padded size S -> parity ring
+  std::map<DecodeGraphSlotKey, SlotRing> slots;  // (S, q, spec) -> parity ring
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
 };
@@ -10076,7 +10159,23 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // because num_reqs is.
   const bool spec_step = gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
-  if (!impl_->enabled || S < 0 ||
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
+  // ring key built from it. `Q == 0` means the batch does not divide evenly into
+  // its requests, which no captured decode shape describes.
+  const int64_t Q = (attn_meta.num_reqs > 0 && B % attn_meta.num_reqs == 0)
+                        ? B / attn_meta.num_reqs
+                        : 0;
+  const DecodeGraphSlotKey key{S, Q, spec_step};
+  // A q > 1 batch that carries NO spec segmentation is refused rather than
+  // captured, and this is a TIGHTENING that arrived with the widening. `S` for a
+  // non-spec step is `PadToCaptureSize(B)` and `BuildPaddedDecode` rewrites the
+  // metadata as a pure decode of S single-token requests, which is not what a
+  // multi-token-per-request batch is. The predicate never sent one here, but it
+  // was the predicate saying so and nothing in the driver.
+  const bool servable_shape = Q >= 1 && (Q == 1 || spec_step);
+  const bool qlen_capped = DecodeGraphQueryLenCapped(impl_->slots, key);
+  if (qlen_capped) v1::NoteDecodeGraphQueryLenDecline();
+  if (!impl_->enabled || S < 0 || !servable_shape || qlen_capped ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
     if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
@@ -10098,7 +10197,12 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // this step's slot from the size's parity ring (alternating), and host-wait its
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
-  Impl::SlotRing& ring = impl_->slots[S];
+  const bool new_shape = impl_->slots.find(key) == impl_->slots.end();
+  Impl::SlotRing& ring = impl_->slots[key];
+  // W6: a distinct captured shape is the observable the widening is measured by.
+  // Without it a two-shape driver and a one-shape driver are indistinguishable
+  // from outside, which is how #1020 stayed silent.
+  if (new_shape) v1::NoteDecodeGraphShape();
   // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
   // inputs. The per-call StepDevInputs is a pool block freed when the call
   // returns, so a graph captured against it replays over recycled memory.
@@ -10529,7 +10633,7 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     SizeSlot slot[2];
     int next = 0;
   };
-  std::map<int64_t, SlotRing> slots;  // padded size S -> parity ring
+  std::map<DecodeGraphSlotKey, SlotRing> slots;  // (S, q, spec) -> parity ring
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
 };
@@ -10574,7 +10678,23 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // because num_reqs is.
   const bool spec_step = gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
-  if (!impl_->enabled || S < 0 ||
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
+  // ring key built from it. `Q == 0` means the batch does not divide evenly into
+  // its requests, which no captured decode shape describes.
+  const int64_t Q = (attn_meta.num_reqs > 0 && B % attn_meta.num_reqs == 0)
+                        ? B / attn_meta.num_reqs
+                        : 0;
+  const DecodeGraphSlotKey key{S, Q, spec_step};
+  // A q > 1 batch that carries NO spec segmentation is refused rather than
+  // captured, and this is a TIGHTENING that arrived with the widening. `S` for a
+  // non-spec step is `PadToCaptureSize(B)` and `BuildPaddedDecode` rewrites the
+  // metadata as a pure decode of S single-token requests, which is not what a
+  // multi-token-per-request batch is. The predicate never sent one here, but it
+  // was the predicate saying so and nothing in the driver.
+  const bool servable_shape = Q >= 1 && (Q == 1 || spec_step);
+  const bool qlen_capped = DecodeGraphQueryLenCapped(impl_->slots, key);
+  if (qlen_capped) v1::NoteDecodeGraphQueryLenDecline();
+  if (!impl_->enabled || S < 0 || !servable_shape || qlen_capped ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
     if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
@@ -10595,7 +10715,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // this step's slot from the size's parity ring (alternating), and host-wait its
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
-  Impl::SlotRing& ring = impl_->slots[S];
+  const bool new_shape = impl_->slots.find(key) == impl_->slots.end();
+  Impl::SlotRing& ring = impl_->slots[key];
+  // W6: a distinct captured shape is the observable the widening is measured by.
+  // Without it a two-shape driver and a one-shape driver are indistinguishable
+  // from outside, which is how #1020 stayed silent.
+  if (new_shape) v1::NoteDecodeGraphShape();
   // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
   // inputs. The per-call StepDevInputs is a pool block freed when the call
   // returns, so a graph captured against it replays over recycled memory.

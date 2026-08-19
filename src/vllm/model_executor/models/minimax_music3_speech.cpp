@@ -598,19 +598,20 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
       // flag and no environment variable, because a capability behind an option
       // nothing turns on is the shape `.agents/reachability.md` calls dead.
       //
+      // The rule itself lives in `Music3SelectDepthArm` rather than in an `if`
+      // here, and that placement is the #1131 repair: the condition `queue_` has
+      // to satisfy is false on every runner CI owns, so a branch written at this
+      // line is unreachable from any gate, while the function is driven by
+      // `test_minimax_music3_ar` on both sides of it. The DiT block below still
+      // carries the untestable shape and #1131 still owns it.
+      //
       // `release_host` is TRUE: the staged tensors are the ONLY thing the host
       // append loop reads, and it is not called when the arm is engaged. The
       // projection, the audio embeddings and the audio heads — which this stage
       // still reads on the host — are not staged and are not released.
       Music3DepthDeviceWeights staged_depth;
-      Music3DepthDeviceArm depth_arm;
-      if (queue_.device.type != vt::DeviceType::kCPU) {
-        profile::Timer stage_timer("ar.depth_staging");
-        staged_depth = StageMusic3DepthWeights(queue_, ar.depth_config, ar.depth,
-                                               /*release_host=*/true);
-        depth_arm.queue = &queue_;
-        depth_arm.depth = &staged_depth;
-      }
+      const Music3DepthDeviceArm depth_arm = Music3SelectDepthArm(
+          queue_, ar.depth_config, ar.depth, /*release_host=*/true, &staged_depth);
       Music3ArResult generated;
       {
         profile::Timer ar_timer("ar.TOTAL_loop", /*span=*/true);

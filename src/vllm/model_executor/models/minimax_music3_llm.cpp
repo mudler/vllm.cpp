@@ -563,6 +563,30 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
 }
 
 // ---------------------------------------------------------------------------
+// The depth decoder's device arm, selected
+// ---------------------------------------------------------------------------
+
+Music3DepthDeviceArm Music3SelectDepthArm(vt::Queue& queue, const DepthDecoderConfig& config,
+                                          DepthDecoderWeights& weights, bool release_host,
+                                          Music3DepthDeviceWeights* staged) {
+  // See minimax_music3_llm.h for why this is a function and not an `if` in the
+  // engine: the engine's condition is false on every runner CI owns, and #1131
+  // is what an ungateable selection costs.
+  if (staged == nullptr) {
+    Fail("MiniMax-Music3: the depth arm selection needs somewhere to stage into");
+  }
+  Music3DepthDeviceArm arm;
+  if (queue.device.type == vt::DeviceType::kCPU) return arm;
+  // Timed HERE rather than at the call site so the span exists only when
+  // something is actually staged; a CPU queue returns above and records nothing.
+  profile::Timer stage_timer("ar.depth_staging");
+  *staged = StageMusic3DepthWeights(queue, config, weights, release_host);
+  arm.queue = &queue;
+  arm.depth = staged;
+  return arm;
+}
+
+// ---------------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------------
 

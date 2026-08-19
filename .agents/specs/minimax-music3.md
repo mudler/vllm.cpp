@@ -3603,14 +3603,32 @@ machine. Three independent reasons, each sufficient on its own:
    does not choose, and `vt::AttentionCross`'s CUDA kernel uses an **online
    softmax recurrence** where the host and the CPU provider use a three-pass
    max/sum/weighted-sum. The two are not bit-identical to each other either.
-3. **`vt::RmsNorm` deliberately drops a rounding our host arm deliberately
-   keeps.** `include/vt/ops.h:1940-1942` records it: "unlike upstream
-   `forward_native`, the standard path keeps full f32 precision (no
-   `x.to(weight.dtype)` rounding before the weight multiply); parity tests vs
-   upstream bf16 need bf16-eps tolerance". Our `RmsNorm` mirrors
-   `normalization.py:600-606`'s **two** roundings on purpose. So the shared op is
-   *wider* here than the reference at exactly one point, and that is a recorded
-   divergence rather than a bug in either.
+3. **The two arms normalize against different references, and both are right.**
+   The Music3 **host** arm's own RmsNorm (`minimax_music3_ar.cpp`) mirrors the
+   diffusers module this model *is*: `normalization.py::RMSNorm.forward` casts
+   back to the weight dtype at `:560` and then multiplies at `:561`, so it rounds
+   **twice**, and the decoder constructs exactly that class — `class RMSNorm` at
+   `:510`, built at `minimax_music3_rvq_depth_decoder.py:78,80,122`. (`:600-606`
+   is `GlobalResponseNorm` and `:590-597` is `MochiRMSNorm`; neither is on this
+   path. The earlier `:600-606` citation in this spec was wrong by ~46 lines.)
+   The **device** arm routes through the shared `vt::RmsNorm`, which mirrors
+   vLLM, and vLLM keeps f32 across the weight multiply and rounds **once**.
+
+   **`vt::RmsNorm` does not diverge from its reference, and an earlier revision of
+   this section said it did.** Verified directly at the parity pin `555967922`:
+   `csrc/cpu/layernorm.cpp` computes `fp32_out = fp32_x * fp32_s_variance *
+   fp32_w` and narrows once at `scalar_vec_t out(fp32_out)`;
+   `csrc/libtorch_stable/layernorm_kernels.cu:93` computes
+   `static_cast<scalar_t>(x * s_variance * w)`. Upstream landed the
+   weight-dtype multiply as vllm#42379 and **reverted** it as vllm#46070, which is
+   an ancestor of the pin. `AGENTS.md` makes vLLM the only reference wherever it
+   implements the behaviour and it implements RMSNorm, so diffusers was never the
+   mirror source for the shared op — only for the model.
+
+   What follows is that this term of the band will **not** go away, because
+   neither side is defective. Which rounding is right *for this model* is a
+   question the diffusers oracle settles through `test_minimax_music3_ar_real`,
+   and §17.6 records that as owed.
 
 **The gate is therefore a tolerance, and the tolerance is derived rather than
 chosen.** The proposal, to be replaced by the measured value before the row is
@@ -3649,12 +3667,14 @@ schedule, bf16-exact pseudo-random weights, on a **CPU `vt::Queue`**:
 The second row is an attribution mutation, applied to the **host** reference and
 restored `sha256`-verified. It removes exactly two roundings:
 
-1. `RmsNorm`'s cast back to the weight dtype **before** the affine multiply —
-   `Store(Store(normed) * w)` becomes `Store(normed * w)`. That is
-   `normalization.py:605-606`, which our host arm mirrors on purpose and
-   `vt::RmsNorm` deliberately does not (`include/vt/ops.h`: the standard path
-   "keeps full f32 precision (no `x.to(weight.dtype)` rounding before the weight
-   multiply)").
+1. The **host** arm's cast back to the weight dtype **before** the affine
+   multiply — `Store(Store(normed) * w)` becomes `Store(normed * w)`. That is
+   `normalization.py::RMSNorm.forward:559-561` — the `.to(self.weight.dtype)` at
+   `:560` and the `* self.weight` at `:561` — which the host arm mirrors on
+   purpose because it mirrors the diffusers module, and which `vt::RmsNorm` does
+   not do because it mirrors vLLM, where the multiply is f32 and the narrowing is
+   single (§17.4 reason 3, verified at the pin). **Neither side is defective**,
+   so this term does not close.
 2. SiLU's own store before the `* up` multiply — `Store(Store(silu) * up)`
    becomes `Store(silu * up)`. torch computes `F.silu(gate)` into a **bf16
    tensor** and then multiplies, so upstream rounds there too; `vt::SiluAndMul`
@@ -3671,20 +3691,33 @@ real and are nearly invisible beside it.
 aligned, the composed device stage is BIT-IDENTICAL to the host arm over 448
 values.** The port's algebra — the merged `[3H, H]` and `[2I, H]` layouts, the
 cache indexing, the batch-2 sequencing, the attention identity — is therefore
-exactly right, and the entire remaining difference lives inside two `vt` kernels.
+exactly right, and the entire remaining difference is rounding polarity in two
+shared ops — one of which (`vt::SiluAndMul`) is a genuine seam gap and one of
+which (`vt::RmsNorm`) is two references legitimately disagreeing. See §17.4
+reason 3, which corrects an earlier claim in this spec that both were seam gaps.
 
 #### What this changes about the row, said plainly
 
 **The blocker was never the dtype, and it is not the dtype now.** §14.5 named the
 dtype; §17.2 settled it and the settlement stands. What the measurement exposes
-is a different obstacle: **the shared seam cannot express the reference's
-rounding polarity**, and it cannot be worked around at the call site, because
-`vt` has no elementwise or row-broadcast multiply — `MulScalar` takes a scalar
-and `MulColVecF32` is an f32 in-place column scale. Expressing
-`Store(normed) * w` or `Store(silu) * up` therefore needs a seam extension
-(a `vt::Mul` with the two operand shapes `vt::Add` already accepts, or
-rounding-faithful variants of `vt::RmsNorm` and `vt::SiluAndMul`), with CPU and
-CUDA providers and its own gates. That is its own row and it is NOT taken here.
+is a different obstacle, and **it is half the size this section first claimed**.
+
+**The `vt::RmsNorm` half is not a seam gap at all.** §17.4 reason 3 carries the
+verification: vLLM's own RMSNorm multiplies in f32 and narrows once, on both the
+CPU and the CUDA path at the parity pin, and upstream reverted the weight-dtype
+variant. `vt::RmsNorm` therefore mirrors its reference exactly. The two arms
+differ because the *host* arm mirrors the diffusers module and the *device* arm
+mirrors vLLM, and both are correct against the reference each answers to. That
+term stays in the band permanently, and no seam extension removes it.
+
+**The `vt::SiluAndMul` half is real.** `F.silu(gate)` produces a **bf16 tensor**
+that is then multiplied, where `vt::SiluAndMul` computes the whole expression in
+f32 and rounds once. It cannot be worked around at the call site, because `vt`
+has no elementwise or row-broadcast multiply — `MulScalar` takes a scalar and
+`MulColVecF32` is an f32 in-place column scale — so expressing
+`Store(silu) * up` needs a seam extension with CPU and CUDA providers and its own
+gates. That is [#1322](https://github.com/mudler/vllm.cpp/issues/1322)'s
+surviving half, it is its own row, and it is NOT taken here.
 
 **What is consequently NOT claimed.** No parity claim, and no speed number. The
 row's numeric gate bounds an attributed divergence; it does not prove agreement
@@ -3721,6 +3754,76 @@ changed rather than that its inputs did.** The runner now restores with `tar xm`
 touches every source, and rebuilds before declaring the mutation over. The
 numbers in the table above were re-taken on a forced rebuild.
 
+### 17.4b The tolerance was fitted to ONE seed, and a review falsified it
+
+§17.4a placed the bound from a single draw of the reference weights. A fresh
+review changed **nothing but the RNG seed** — same distribution, same geometry,
+no defect — and the shipped `mean <= 4.0` **reds on three of six equally valid
+draws**. A tolerance a redraw can fail is measuring the draw, not the arm.
+
+The correct arm, `test_minimax_music3_ar`, 8 heads of 8, three layers, the full
+8-position schedule, batch 2, on a CPU `vt::Queue`:
+
+| seed | worst | mean | median | under the old bound |
+|---|---:|---:|---:|---|
+| `0x9E3779B9` | 110 | 2.095 | 1 | pass (the seed it was fitted to) |
+| `0x2468ACE0` | 435 | 3.804 | 1 | pass |
+| `0x00000001` | 1110 | 5.755 | 1 | **FAIL** |
+| `0x13579BDF` | 3663 | 7.154 | 1 | **FAIL** |
+| `0xDEADBEEF` | 7340 | 9.904 | 1 | **FAIL** |
+| `0x51ED2701` | 939 | 3.103 | 1 | pass |
+
+**`worst` cannot discriminate and is no longer gated.** A *correct* arm reads
+worst 7340 at `0xDEADBEEF`; the gate/up half swap reads 6641 and the wrong
+attention scale 6865. Any `worst` bound loose enough to admit a correct
+implementation admits two structural defects, so a correct arm is *worse* on that
+axis than two defects. It is reported, with a canary at 1e6 for a non-finite
+value.
+
+**The metric itself had a defect, found by the sixth seed.** A reference value of
+exactly zero has no ULP — bf16's spacing at zero is the denormal floor — so
+`|got| / Bf16Ulp(0)` reads ~1e35 for an absolute difference of 1e-5.
+`0x51ED2701` draws one such value in 1024 and read mean **8.8e32 with the arm
+correct**. Zero references are now measured **absolutely** in their own bucket
+(worst observed 8.30e-05 against a 1e-2 bound), and the two counts are asserted
+to **sum**, so a defect cannot hide by growing the un-gated bucket.
+
+#### The battery, and why the median is the primary gate
+
+Five structural mutations, each run over all six seeds, on a clean tree, with the
+compiler exit status, `git diff --stat` and the **binary** `sha256` printed for
+every run and the source restored and verified after each:
+
+| mutation | mean range | median range | verdict |
+|---|---:|---:|---|
+| wrong attention scale (`1/sqrt(hidden)`) | 19.6 – 71.3 | 4 – 4 | RED 2 cases / 13 assertions |
+| gate/up half swap | 52.5 – 158.8 | 12 – 15 | RED 2 / 14 |
+| K/V cache row collision (`l*batch`) | 166.4 – 376.1 | 3 – 4 | RED 2 / 14 |
+| dropped position embedding | 357.8 – 1487 | 76 – 90 | RED 2 / 15 |
+| `q\|k\|v` merge order swapped | 400.0 – 1731 | 104 – 131 | RED 2 / 15 |
+
+**The median is exactly 1 bf16 ULP at every seed for the correct arm** — a
+constant, not a distribution — because the deviation this arm carries is one
+rounding-polarity tick per element and the seed only changes the tail. Every
+defect is at least 3. The bound is **2**, and it cannot be moved by a redraw,
+which is precisely the property the single-seed bound lacked.
+
+**The mean stays gated at 15, and its margin is honestly thin.** It is
+tail-sensitive, so it catches a *sparse* defect that leaves the middle of the
+distribution alone and the median would miss. Its window is
+(9.904, 19.6): the correct arm's worst draw against the tightest defect, which is
+the wrong attention scale at `0xDEADBEEF` — the same seed that produces the
+correct arm's own worst mean. 15 is 1.51x above every correct draw measured and
+1.31x below every defect draw measured. A seventh seed drawing a correct mean
+above 15 is possible in a way that one drawing a median above 2 is not, and if
+that happens the median is the gate that still holds.
+
+**This bound does not become obsolete.** §17.4 reason 3 records the verification:
+the `vt::RmsNorm` term is two references legitimately disagreeing, not a defect
+awaiting repair, so it does not close. #1322's surviving `vt::SiluAndMul` half
+may narrow the band later; it is not landed, this row does not wait for it, and
+nothing here is deferred against it.
+
 ### 17.5 Reachability — the #1131 trap, named before it is fallen into
 
 [#1131](https://github.com/mudler/vllm.cpp/issues/1131) is this exact failure for
@@ -3736,10 +3839,26 @@ checkpoint, and CI can drive it **through the production call site**:
 
 1. `Music3DepthStage` takes a `Music3DepthDeviceArm` (queue + staged weights).
    Non-null selects `DepthDecoderAppendDevice`; null keeps the host loop.
-2. `MiniMaxMusic3SpeechEngine` stages the arm when `queue_.device.type !=
-   kCPU`, which is the **default** on `--speech-device 1` — the same switch
-   `StageMusic3DitWeights` already rides
-   (`minimax_music3_speech.cpp:634-640`).
+2. `MiniMaxMusic3SpeechEngine` stages the arm through
+   `Music3SelectDepthArm`, on the **default** `--speech-device 1` — the same
+   switch `StageMusic3DitWeights` already rides.
+
+   **This was written as an `if` in the engine, and a review proved that was the
+   trap it claims to avoid.** Deleting the whole
+   `if (queue_.device.type != kCPU) { … }` block — the only thing
+   `--speech-device 1` reaches — left `test_minimax_music3_ar` 35/35 · 508/508
+   and `test_minimax_music3_speech` 9/9 · 223/223 SUCCESS. That is #1131's shape
+   reproduced by the change that names #1131 as its reason for existing, and it
+   is structural: on a CPU-only runner that condition can never be true, so no
+   branch written at that line is reachable by any gate CI owns.
+
+   The rule now lives in `Music3SelectDepthArm`, which executes on **both** sides
+   of the condition and is therefore drivable from a CPU gate. Three outcomes,
+   and the third is the defect: a CPU queue stages nothing and returns a
+   disengaged arm; any other device stages and returns an engaged one, or
+   `StageMusic3DepthWeights` refuses by name because this build has no provider
+   for it; a non-CPU queue **quietly** taking the host loop is what must never
+   happen. Gutting the selector reds 1 case / 6 assertions.
 3. The CI gate constructs the arm on a **CPU queue** and drives
    `Music3DepthStage`, asserting (a) agreement with the host arm inside §17.4's
    band, (b) identical drawn codes, and (c) that the device path was **taken** —
@@ -3748,7 +3867,20 @@ checkpoint, and CI can drive it **through the production call site**:
    quoted in its own words: the gate "must assert the device path was TAKEN
    (invocation count or resident dtype), not merely that outputs agree".
 4. The reachability mutation deletes the production selection in a scratch copy
-   and the focused gate must go **RED**.
+   and the focused gate must go **RED**. It does: gutting `Music3SelectDepthArm`
+   reds 1 case / 6 assertions.
+
+**What is still NOT gated, stated rather than implied.** Deleting the engine's
+two-line *call* to `Music3SelectDepthArm` leaves both suites green
+(`test_minimax_music3_ar` 37/37 · 640/640, `test_minimax_music3_speech`
+9/9 · 223/223), with the mutated `test_minimax_music3_speech` binary `sha256`
+`77334986…` against the baseline `6bd42129…` so the run is not a stale-binary
+artefact. Nothing here changes that, and nothing can on a CPU-only runner: the
+engine needs the 28.5 GB checkpoint and a real device. The rule it calls is now
+gated, its two components are gated, and the residual is the call itself. It is
+owned by `MUSIC3-DEPTH-DEVICE` and tracked by
+[#1131](https://github.com/mudler/vllm.cpp/issues/1131), listed under §17.7, and
+it is the same residual the DiT block one screen below still carries in full.
 
 ### 17.6 Gates and evidence this row owes
 
@@ -3770,6 +3902,46 @@ the change.
 
 ### 17.7 Owed, named here rather than discovered later
 
+Every item below is owned by row `MUSIC3-DEPTH-DEVICE` and names the issue that
+tracks it, per `.agents/reachability.md` and `AGENTS.md` `## Nothing lands dead`.
+
+* **The engine's call to `Music3SelectDepthArm` is reachable but not gated**
+  ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
+  `MUSIC3-DEPTH-DEVICE`). `--speech-device 1` reaches it and no CI gate can:
+  deleting the two-line call leaves `test_minimax_music3_ar` 37/37 · 640/640 and
+  `test_minimax_music3_speech` 9/9 · 223/223 green, because the engine needs the
+  28.5 GB checkpoint and a real device. §17.5 carries the mutation and the binary
+  hashes. The *rule* it calls is gated on both sides of its condition, so what is
+  owed is the call, not the logic. It closes with the `thor:gpu0` legs in §17.6.
+* **`scripts/check-fusion-consistency.py` is satisfied by a COMMENT**
+  ([#1351](https://github.com/mudler/vllm.cpp/issues/1351), row
+  `MUSIC3-DEPTH-DEVICE`). Replacing the `layers::UnquantizedMlpGateUpMethod` call
+  in `minimax_music3_depth_device.cpp` with an inline hand-rolled
+  `vt::MatmulBT` + `vt::SiluAndMul` path, while leaving the two comment mentions
+  in place — the `#include`'s trailing `// layers::UnquantizedMlpGateUpMethod`
+  and the `gate_up` field note — leaves the checker **green**, and the numbers
+  bit-identical so nothing else sees it either. Verified two ways: a fresh
+  reviewer ran the checker end to end at `rc=0`, and calling the checker's own
+  functions gives `uses_merged_gemm_seam = True` for the hand-rolled variant with
+  comments kept and `False` only once comments are stripped. `Check 2` runs
+  `_MERGED_GEMM_SEAM` over `path.read_text()`; the file's only comment-aware
+  helper, `allowlisted_names`, strips `#` comments from the **allowlist file**
+  rather than from the scanned source. So the checker can no longer detect a
+  regression to a hand-rolled path in this TU. **Reported rather than fixed
+  here:** a checker change needs its own spec, a red-before test and green-after
+  evidence per `AGENTS.md` `## Changing the rules or a checker`, and widening the
+  regex is exactly the move that section forbids. Renaming `MlpGateUp` to
+  `MlpGateUpXX` is *not* a detection gap — `MlpGateUp[A-Za-z]*Method` matches it
+  by design, to cover `UnquantizedMlpGateUpGeluMethod`.
+* **The depth K/V cache's pooling is unmeasured**
+  ([#1309](https://github.com/mudler/vllm.cpp/issues/1309), row
+  `MUSIC3-DEPTH-DEVICE`). It now draws from the device pool through `DBuf`
+  instead of `backend.Alloc`/`Free`, which at the shipped 4-layer batch-2
+  geometry removes 16 `cudaMalloc` and 16 synchronizing `cudaFree` per frame. The
+  change is correct by construction — `ReleaseShared` returns the block to the
+  pool it came from — but **no speed number is quoted for it**, because this box
+  has no GPU and the A/B is blocked on correctness. Measure it with the §17.6
+  `thor:gpu0` legs, not before.
 * The **audio heads, the CFG mix, the top-k draw and the fed-back projection**
   stay on the host. They are ~1.6 % of the stage today; they become the stage's
   remainder once the forward moves, and that is the next thing to measure rather

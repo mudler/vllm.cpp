@@ -281,6 +281,32 @@ struct Music3DepthDeviceArm {
   bool half_set() const { return (queue != nullptr) != (depth != nullptr); }
 };
 
+// THE PRODUCTION SELECTION of that arm, as a function rather than as an `if` in
+// the engine (#1309, [#1131](https://github.com/mudler/vllm.cpp/issues/1131),
+// spec §17.5).
+//
+// WHY IT IS A FUNCTION. The engine's condition is `queue_.device.type != kCPU`,
+// and that condition is FALSE on every runner CI owns, so an `if` written there
+// is the one line a CPU-only gate can never enter — which is #1131 exactly, and
+// #1131 is the reason this row exists. The same function runs on both sides of
+// the condition, so a gate CAN enter it: with a CPU queue, and with a fabricated
+// non-CPU one.
+//
+// THREE OUTCOMES, AND THE THIRD IS THE DEFECT. A CPU queue stages nothing and
+// returns an arm that is not engaged, so the caller keeps the host reference loop
+// every Music3 gate was taken on. Any other device stages the decoder into
+// `*staged` and returns an ENGAGED arm — or, on a build or a box that has no
+// provider for it, `StageMusic3DepthWeights` REFUSES by name and that refusal
+// propagates. What must never happen is a non-CPU queue quietly taking the host
+// arm, and that is what `test_minimax_music3_ar` asserts over every non-CPU
+// `vt::DeviceType`.
+//
+// `staged` outlives the returned arm's use or the arm dangles; the engine holds
+// both in the same scope. Throws if it is null.
+Music3DepthDeviceArm Music3SelectDepthArm(vt::Queue& queue, const DepthDecoderConfig& config,
+                                          DepthDecoderWeights& weights, bool release_host,
+                                          Music3DepthDeviceWeights* staged);
+
 // `MiniMaxMusic3SemanticGenerationStep.__call__` (encoders.py:299-353).
 //
 // `prompt_ids` is the CONDITIONAL row; the unconditional row is derived with

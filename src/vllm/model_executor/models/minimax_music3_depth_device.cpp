@@ -53,6 +53,20 @@ using vt::Tensor;
 // read after a synchronizing call, never a synchronization primitive itself.
 std::atomic<uint64_t> g_forward_count{0};
 
+// See `Music3DepthDeviceResidentDtypes`. Same ordering argument as the counter
+// above: an instrument, not a synchronization primitive.
+std::atomic<uint64_t> g_resident_dtypes{0};
+
+// Record the dtype of a buffer the forward made resident. `DType` is a `uint8_t`
+// enum of 20 values, so one bit each fits a `uint64_t` with room to spare, and
+// the static_assert makes adding the 65th dtype a build error rather than a
+// silently truncated instrument.
+constexpr uint64_t DtypeBit(DType dt) {
+  return uint64_t{1} << static_cast<unsigned>(dt);
+}
+static_assert(static_cast<unsigned>(DType::kMXFP4) < 64,
+              "the resident-dtype mask has one bit per DType and DType outgrew 64");
+
 void RequireStageSize(const std::vector<float>& values, int64_t expected, const char* what) {
   if (static_cast<int64_t>(values.size()) != expected) {
     Fail(std::string("MiniMax-Music3 depth stage: ") + what + " is " +
@@ -138,6 +152,10 @@ Tensor RowView(const Tensor& base, int64_t row, const std::vector<int64_t>& shap
 }  // namespace
 
 uint64_t Music3DepthDeviceForwardCount() { return g_forward_count.load(std::memory_order_relaxed); }
+
+uint64_t Music3DepthDeviceResidentDtypes() {
+  return g_resident_dtypes.load(std::memory_order_relaxed);
+}
 
 Music3DepthDeviceWeights StageMusic3DepthWeights(vt::Queue& queue,
                                                  const DepthDecoderConfig& config,
@@ -265,15 +283,23 @@ std::vector<float> DepthDecoderAppendDevice(vt::Queue& queue, const DepthDecoder
     cache->hidden = hidden;
     cache->layers = config.num_layers;
     cache->capacity = config.max_position_embeddings;
-    const size_t bytes = static_cast<size_t>(cache->capacity * hidden) * sizeof(uint16_t);
     const size_t slots = static_cast<size_t>(config.num_layers * batch);
     cache->keys.resize(slots);
     cache->values.resize(slots);
     for (size_t s = 0; s < 2 * slots; ++s) {
-      void* p = backend.Alloc(bytes);
-      std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
-      cache->storage.push_back(std::move(owner));
-      Tensor t = MakeTensor(p, DType::kBF16, queue.device, {cache->capacity, hidden});
+      // POOLED, through `DBuf`, and NOT `backend.Alloc` — because this cache is
+      // a local of `Music3DepthStage` and is therefore built and destroyed once
+      // per FRAME. At the shipped 4-layer batch-2 geometry a raw pair would be
+      // 16 `cudaMalloc` plus 16 `cudaFree` per frame, and `cudaFree`
+      // synchronizes the device; `DBuf`'s own comment says the pool exists for
+      // exactly that. `ReleaseShared` hands the block a carrier that returns it
+      // to the pool it came from, which the hand-written deleter this replaced
+      // could not name. The staged WEIGHTS stay on `backend.Alloc` on purpose:
+      // they are allocated once and held for the process, and a pool block held
+      // forever is a pool block withdrawn from the pool.
+      DBuf block(dev, DType::kBF16, {cache->capacity, hidden});
+      const Tensor t = block.t();
+      cache->storage.push_back(block.ReleaseShared());
       (s < slots ? cache->keys : cache->values)[s % slots] = t;
     }
   }
@@ -307,6 +333,17 @@ std::vector<float> DepthDecoderAppendDevice(vt::Queue& queue, const DepthDecoder
   DBuf attended(dev, DType::kBF16, {batch, hidden});
   DBuf projected(dev, DType::kBF16, {batch, hidden});
   DBuf down(dev, DType::kBF16, {batch, hidden});
+
+  // #1131's SECOND instrument. Every buffer this call makes resident reports its
+  // own dtype into one mask, read back by the gate — because the ULP band above
+  // cannot see a buffer that is too WIDE, and a review proved it by widening
+  // `normed` to `kF32` and watching all 35 cases stay green. Read the buffers
+  // rather than restating the constant, or the assertion tests this line instead
+  // of the allocation.
+  uint64_t resident = DtypeBit(hidden_states.t().dtype) | DtypeBit(normed.t().dtype) |
+                      DtypeBit(qkv.t().dtype) | DtypeBit(attended.t().dtype) |
+                      DtypeBit(projected.t().dtype) | DtypeBit(down.t().dtype) |
+                      DtypeBit(cache->keys[0].dtype) | DtypeBit(cache->values[0].dtype);
   const vt::RmsNormArgs norm_args{1e-6f, /*gemma=*/false};
   const vt::AttentionCrossArgs attn_args{
       static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)))};
@@ -352,6 +389,9 @@ std::vector<float> DepthDecoderAppendDevice(vt::Queue& queue, const DepthDecoder
     // `silu(gate) * up` with no permutation and no half swap.
     const layers::UnquantizedMlpGateUpMethod mlp(&layer.gate_up, inter);
     DBuf activated = mlp.Apply(dev, normed.t());
+    resident |= DtypeBit(activated.t().dtype) | DtypeBit(layer.qkv.dtype) |
+                DtypeBit(layer.gate_up.dtype) | DtypeBit(layer.down_proj.dtype) |
+                DtypeBit(layer.to_out.dtype);
     vt::MatmulBT(queue, down.t(), activated.t(), layer.down_proj);
     vt::Add(queue, hidden_states.t(), hidden_states.t(), down.t());
   }
@@ -359,10 +399,15 @@ std::vector<float> DepthDecoderAppendDevice(vt::Queue& queue, const DepthDecoder
   // :142
   DBuf normed_out(dev, DType::kBF16, {batch, hidden});
   vt::RmsNorm(queue, normed_out.t(), hidden_states.t(), weights.norm, norm_args);
+  resident |= DtypeBit(normed_out.t().dtype) | DtypeBit(weights.norm.dtype) |
+              DtypeBit(weights.pos_embedding.dtype);
   std::vector<uint16_t> host(static_cast<size_t>(batch * hidden));
   normed_out.Download(dev, host.data());
 
   cache->positions = seq;
+  // OR-ed ONCE, at the end, so a call that threw part way through never reports
+  // a partial residency as if it were the whole forward's.
+  g_resident_dtypes.fetch_or(resident, std::memory_order_relaxed);
   g_forward_count.fetch_add(1, std::memory_order_relaxed);
   std::vector<float> out(host.size());
   for (size_t i = 0; i < host.size(); ++i) out[i] = vt::BF16ToF32(host[i]);

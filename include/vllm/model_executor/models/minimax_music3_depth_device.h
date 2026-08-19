@@ -75,12 +75,28 @@
 //      softmax recurrence where the host and the CPU provider use an explicit
 //      three-pass max/exp/normalize. Those two are not bit-identical to each
 //      other either.
-//   3. `vt::RmsNorm` DROPS A ROUNDING OUR HOST ARM DELIBERATELY KEEPS. vt/ops.h
-//      records it: the standard path "keeps full f32 precision (no
-//      `x.to(weight.dtype)` rounding before the weight multiply)". Our
-//      `RmsNorm` mirrors normalization.py:600-606's TWO roundings on purpose. So
-//      the shared op is WIDER than the reference at exactly one point. That is a
-//      recorded divergence, not a defect in either.
+//   3. THE TWO ARMS NORMALIZE AGAINST DIFFERENT REFERENCES, AND BOTH ARE RIGHT.
+//      The Music3 HOST arm's own RmsNorm (minimax_music3_ar.cpp) mirrors the
+//      diffusers module this model IS: `normalization.py::RMSNorm.forward` casts
+//      back to the weight dtype at `:560` before the affine multiply at `:561`,
+//      so it rounds TWICE, and the decoder constructs exactly that class
+//      (minimax_music3_rvq_depth_decoder.py:78,80,122). The device arm routes
+//      through the SHARED `vt::RmsNorm`, which mirrors vLLM — and vLLM keeps f32
+//      across the weight multiply and rounds ONCE. Verified at the parity pin
+//      `555967922`: `csrc/cpu/layernorm.cpp` computes
+//      `fp32_out = fp32_x * fp32_s_variance * fp32_w`, and
+//      `csrc/libtorch_stable/layernorm_kernels.cu:93` computes
+//      `static_cast<scalar_t>(x * s_variance * w)`. Upstream tried the
+//      weight-dtype multiply (vllm#42379) and REVERTED it (vllm#46070, an
+//      ancestor of the pin).
+//
+//      So this is NOT the shared op diverging from its reference, and an earlier
+//      revision of this comment said it was. AGENTS.md makes vLLM the only
+//      reference wherever it implements the behaviour, and it implements
+//      RMSNorm, so `vt::RmsNorm` is correct against it. What differs is which
+//      reference each arm answers to. WHICH ONE IS RIGHT FOR THIS MODEL is a
+//      question the diffusers oracle settles through
+//      `test_minimax_music3_ar_real`, and §17.6 records that as owed.
 //
 // The gate is therefore a tolerance in bf16 ULPs of the reference value, and it
 // asserts its own teeth. A tolerance cannot see a DROPPED STAGE, so it is not
@@ -201,6 +217,25 @@ struct Music3DepthDeviceCache {
 // from the numbers. This counter is that assertion's instrument, and it is the
 // reason a reachability mutation on the production selection goes RED here.
 uint64_t Music3DepthDeviceForwardCount();
+
+// #1131's OTHER instrument, and this row took only the first until a review said
+// so. The words are #1131's own: a gate "must assert the device path was TAKEN
+// (invocation count OR RESIDENT DTYPE), not merely that outputs agree".
+//
+// A bit per `vt::DType`, OR-ed over every buffer `DepthDecoderAppendDevice`
+// makes resident — the activations, the merged QKV block, the MLP result, the
+// downloaded output and the K/V cache — accumulated across every call in this
+// process. It reads back what the forward ACTUALLY allocated rather than what
+// this header says it should, which is the whole point: AGENTS.md's "a token
+// gate cannot detect a dtype that is too WIDE" applies with full force to the
+// tolerance gate above, and a review proved it — widening one activation buffer
+// to `kF32` left the ULP band, the drawn codes and all 35 cases green while the
+// path moved twice the bytes. That is §17.2a's own finding about the HOST arm,
+// arriving inside the arm that exists to fix it.
+//
+// The mask is monotone and never reset, so a single widened buffer anywhere in
+// the process is visible for the rest of it.
+uint64_t Music3DepthDeviceResidentDtypes();
 
 // ONE depth position, appended to `cache`, for `batch` rows at once — the device
 // twin of `DepthDecoderAppend`, with the same inputs, the same outputs and the

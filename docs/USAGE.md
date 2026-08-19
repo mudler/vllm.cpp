@@ -2272,14 +2272,40 @@ rather than hidden: the audio heads, the CFG mix, the top-k draw and the fed-bac
 projection row, which together are ~1.6 % of the stage.
 
 **Its numbers are not identical to the host arm's, and the difference is
-measured rather than assumed.** Against the host reference the device arm reads
-worst 110 bf16 ULP and mean 2.095 at the gate's reduced geometry. Almost all of
-that — the composed stage goes to **zero, bit-identical**, once the two are
-aligned — is two roundings a bf16 torch module performs and the shared ops do
-not: `vt::RmsNorm` keeps f32 across the weight multiply, and `vt::SiluAndMul`
-computes the whole gated expression in f32. That is tracked as its own issue, and
-until it is settled **no throughput number is quoted for this arm** and the
-full-scale gate against the committed oracle goldens has not been run with it.
+measured rather than assumed.** Against the host reference, over **six seeds** of
+the gate's reduced geometry, the device arm reads a median of exactly **1 bf16
+ULP** at every seed, means of 2.095 to 9.904 and worst-case values of 110 to
+7340. The gate bounds the median at 2 and the mean at 15; it does **not** bound
+the worst case, because the worst case cannot tell a correct arm from a broken
+one — a correct arm reads 7340 on the seed where a swapped gate/up half reads
+6641. An earlier revision of this document quoted one seed's 110 and 2.095 as
+though they were the arm's deviation; they are one draw of it.
+
+Almost all of that deviation — the composed stage goes to **zero,
+bit-identical**, once the two are aligned — is one rounding per element, from two
+places, and the two are **not** the same kind of thing:
+
+- `vt::SiluAndMul` computes the whole gated expression in f32 where a bf16 torch
+  module narrows `silu(gate)` before multiplying by `up`. That one is a genuine
+  gap in the shared seam and is tracked as its own issue.
+- `vt::RmsNorm` keeps f32 across the weight multiply, and **that is correct**.
+  vLLM's own RMSNorm does exactly the same on both its CPU and its CUDA path, and
+  upstream reverted the change that would have made it multiply in the weight's
+  dtype. The Music3 *host* arm rounds twice because it mirrors the `diffusers`
+  module this model is; the device arm rounds once because it mirrors vLLM. Two
+  references disagree here and neither side is defective, so this term will not
+  go away. An earlier revision of this document called it a shortcoming of the
+  shared op.
+
+Until the difference is settled against the oracle, **no throughput number is
+quoted for this arm** and the full-scale gate against the committed oracle
+goldens has not been run with it.
+
+If the build has no provider for the device you asked for, the depth arm
+**refuses by name at staging time**, naming the op and the device, rather than
+falling back to the host loop — a silent fallback would be a large slowdown
+wearing a correct answer. `--speech-device 0` keeps the host reference arm and
+stages nothing.
 
 Because the host stages are unchanged — and because `--speech-device 0` takes
 the same `DitForward` it always did, source byte for source byte — the CPU arm

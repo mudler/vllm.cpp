@@ -408,19 +408,30 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   is OBSERVED from `boot_id` and owes nothing to this item. Only the derived
   bound — at or before 10:41:47.6Z — depends on the `dgx:gpu0` `rc` worker not
   virtualizing `/proc/uptime`, and on a local-to-`dgx` clock offset that nothing
-  measures. Both retire together and cheaply, in one `rc` job that runs
-  `journalctl --list-boots` on the host: it prints the boot's own down and up
-  timestamps in the host's clock, which needs neither `/proc/uptime` nor an
-  independently known boot. Print `/proc/uptime` beside `date -u` in the same job
-  and the virtualization question falls out of the comparison. No lease was taken
-  for either here.
+  measures. `journalctl --list-boots` retires both at once, because it prints the
+  boot's own down and up timestamps in the host's clock and needs neither
+  `/proc/uptime` nor an independently known boot. **Whether a LEASED job can reach
+  it is itself unestablished, and this item must not assume that it can.** The
+  `boot_id` bullet in [`../environment.md`](../environment.md) states that the
+  boot list is a HOST instrument a pod does not have, which is exactly why
+  `boot_id` was the instrument here; a leased worker runs as root and may or may
+  not have the host journal mounted, and no artifact settles that. So the job is:
+  run `journalctl --list-boots` from inside a lease and record whether it answers
+  at all, and print `/proc/uptime` beside `date -u` in the same job so the
+  virtualization question falls out of the comparison either way. If the lease
+  cannot read the boot list, this item needs host access and stays owed. The
+  `thor:gpu0` build reboot that `../environment.md` records under
+  [#1380](https://github.com/mudler/vllm.cpp/issues/1380) reaches the same
+  instrument from the other side and leaves the same access question open, so one
+  job that answers it discharges part of both. No lease was taken here.
 - **Two open discrepancies around that bound, recorded rather than resolved.**
   The `11:26:32` mtimes on `job.log` and `vllm-server-c8.log` are 0.47 ms apart
   and admit two incompatible readings, one of which puts the box alive after the
   derived boot. And the only `journalctl` downtime this repository has measured
   on this box is ~3m40s, which applied here would put it going down around 10:38,
   thirteen minutes after every writer had stopped. `## Outcome` states both. The
-  same `journalctl --list-boots` job settles the second and bounds the first.
+  job above settles the second and bounds the first, if it can read the boot
+  list at all.
 - [#1355](https://github.com/mudler/vllm.cpp/issues/1355), the prompt-token
   divergence found in this campaign's raw result files: our server reported
   5,942 prompt tokens where vLLM reported 6,144 for the identical

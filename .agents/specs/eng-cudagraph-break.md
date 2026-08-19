@@ -1231,8 +1231,13 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   that forks no auxiliary queue, so the rule is not exercised and untested
   machinery was not landed for it. A break point placed inside an unjoined fork
   window today fails LOUDLY at `EndCaptureGraph`, which is the one failure mode
-  in this spec that is not silent. Owners: **W4** (`qwen3_5.cpp:6254-6255,6384`)
-  and **W5** (`laguna.cpp:2572-2576,2612`).
+  in this spec that is not silent. **W4 migrated `qwen3_5.cpp` and did NOT
+  discharge this**, and the reason is the mode rather than the effort: its scope
+  is `kFull`, so there is exactly one segment and no segment CLOSE inside the
+  fork window at `:6254-6255,6384` for the rule to govern, and the machinery
+  would have landed unexercised. Owners: **W5** (`laguna.cpp:2572-2576,2612`,
+  whose fork is inside the captured region by construction) and the first stage
+  that captures PIECEWISE.
 - ~~**The capture-failure drain as a GATED case** (test 13).~~ DELIVERED in W1,
   and the record it replaces was wrong twice over. The destructor did NOT already
   behave: its `catch` guarded a throwing `EndCaptureGraph` alone, and an
@@ -1277,8 +1282,12 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   reference (`dhn`, `si`, `meta`, `T` — every one a per-step local), which is
   lifetime rule 2 at the `GraphBreak` declaration and reads a returned frame on
   replay N. The fix is persistent, driver-owned storage for the layer's inputs,
-  which is the capability `StepDevInputs` already is. Owner: **W4**, and **W6**
-  cannot move the eligibility predicate before it exists.
+  which is the capability `StepDevInputs` already is. **W4 landed the storage
+  PRIMITIVE and not the arm.** `vt::PersistentStepInput` is persistent,
+  driver-owned, capture-stable storage, so what is missing is no longer a
+  primitive: it is a driver that holds its layer's inputs there and a break
+  closure that reads them instead of `RunLayer`'s frame. Owner: **W6**, which
+  cannot move the eligibility predicate before that exists.
 - **The async device-token DECLINE at `qwen3.cpp:1106` STANDS after W4, and the
   reason changed.** W4 owned the decision and did not remove it. What W4
   established, by reading the tree rather than by inheriting the record:
@@ -1367,7 +1376,9 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   its scope is `kFull`, so it has ONE segment and no `try` anywhere inside it,
   and a `kFull` capture has no between-segments window for a caught exception to
   truncate. The residual becomes live for the first driver that captures
-  PIECEWISE. Owner: **W4**, with the piecewise arm it unblocks.
+  PIECEWISE. **W4 did not close it either, and for the identical reason:** both
+  drivers it migrated open `kFull`. Owner: **W6**, with the piecewise arm it
+  unblocks.
   What W2 DID close is the adjacent hole the fresh review found, and it is
   recorded here because the two are easy to confuse: the drain leaves a FAILED
   capture reporting exactly what an INERT scope reports, and the first W2 head
@@ -1383,7 +1394,9 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   a pool change with its own argument. **W2 did not close it and did not need
   to:** the hazard is the window BETWEEN two segments, which a `kFull` capture
   does not have, so it becomes live for the first driver that captures
-  piecewise. Owner: **W4**, with the piecewise arm it unblocks.
+  piecewise. **W4 did not close it either, and for the identical reason:** both
+  drivers it migrated open `kFull`. Owner: **W6**, with the piecewise arm it
+  unblocks.
 
 ## Outcome
 

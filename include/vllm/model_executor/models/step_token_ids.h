@@ -111,6 +111,14 @@ class StepTokenIds {
   // seam rather than writing a fifth private copy: a step that re-read the device
   // mirror and one that uploaded a stale host vector leave the same bytes-shaped
   // destination and the same token count, and no token gate can separate them.
+  //
+  // WHO READS THESE, stated rather than assumed. Nothing does, yet: `bound()`,
+  // `capacity()`, `last_source()`, `device_refreshes()` and `host_refreshes()`
+  // have no caller in `src/` or `tests/` — `t()` is the only accessor a caller
+  // uses. What `tests/vllm/models/test_moe_async_device_ids.cpp` asserts is the
+  // PROCESS-WIDE `vt::GetStepInputStats()`, which the same refreshes move. These
+  // five are the per-slot form of the same answer and are kept because a
+  // multi-slot driver needs the per-slot one, not because a reader exists.
   vt::StepInputSource last_source() const { return cell_.last_source(); }
   int64_t device_refreshes() const { return cell_.device_refreshes(); }
   int64_t host_refreshes() const { return cell_.host_refreshes(); }

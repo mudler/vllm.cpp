@@ -117,20 +117,18 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
 // and it consumes the HOST token_ids. The graph driver runs this per step into
 // its PERSISTENT hidden buffer, then captures/replays ForwardLayers over that
 // fixed hidden address.
-// #1305 — CONSUME the registry's scoped device-id override, once per forward.
+// #1305 — THE SCOPED DEVICE-ID OVERRIDE is consumed here, once per forward.
 // `ForwardQwen3MoeForCausalLM` publishes `ModelForwardInput::device_token_ids`
 // through `detail::DeviceTokenIdsScope`; it is null on every path except the
 // asynchronous CUDA runner, where the combine has already spliced each decode
 // row's sampled token into the DEVICE identifiers and left the host vector
-// deliberately stale. Taking it CLEARS it, so the first embed in a forward is
-// the one that gets it and a second, unrelated embed cannot be handed another
-// step's rows.
-detail::DeviceTokenIds TakeDeviceTokenIds() {
-  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
-  if (ov.ids != nullptr) detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
-  return ov;
-}
-
+// deliberately stale. Both readers below —
+// `detail::TakeDeviceTokenIds` on the graph path and
+// `detail::ApplyDeviceTokenIds` on the eager one — CLEAR it, so the first embed
+// in a forward is the one that gets it and a second, unrelated embed cannot be
+// handed another step's rows. Both live in `qwen3_5_internal.h` beside the scope
+// that publishes them, because four models consume it and each used to spell the
+// same two bodies out for itself.
 // EMBED FROM AN ALREADY-RESIDENT ID TENSOR. The decode-graph driver holds its
 // identifiers in a `vllm::StepTokenIds` whose device address is stable for the
 // life of the slot, so this arm takes the tensor instead of re-uploading a host
@@ -150,13 +148,7 @@ void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
   // they embedded the host vector and never looked at the device mirror. The
   // override's copy is enqueued on the main queue, so it is ordered AFTER the
   // combine that produced it rather than racing it.
-  const detail::DeviceTokenIds ov = TakeDeviceTokenIds();
-  if (ov.ids != nullptr) {
-    VT_CHECK(ov.count <= T,
-             "qwen3 moe embed: device input ids longer than the embed input");
-    d.b.Copy(d.q, dids.ptr(), ov.ids,
-             static_cast<size_t>(ov.count) * sizeof(int32_t));
-  }
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3 moe embed");
   EmbedInto(d, hidden, dids.t(), weights, config);
 }
 
@@ -547,7 +539,7 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   // enqueued on the main queue, so the second is ordered after the combine
   // instead of racing it, and all three arms below embed from the SAME stable
   // address.
-  const detail::DeviceTokenIds ov = TakeDeviceTokenIds();
+  const detail::DeviceTokenIds ov = detail::TakeDeviceTokenIds();
   s.ids.Ensure(d, S);
   s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
   if (cols_changed && s.graph.captured()) {

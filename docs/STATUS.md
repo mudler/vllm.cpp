@@ -152,7 +152,7 @@ token-for-token correctness against the pinned oracle.
 | Laguna-S-2.1 MoE (`LagunaForCausalLM`, 118B/8B) | **BINDING 2026-08-04: was 87% of vLLM (37.55 vs 43.10, same-tool nsys)**; root cause was bf16 projections on UNIFIED/ATS host memory, and device-resident staging (byte-exact) gives 44.6, parity+ vs 43.1, default-ON | 48 layers (12 global + 36 SWA-512), 256 routed top-10 + 1 shared expert, per-head softplus attn out-gate, sigmoid `noaux_tc` router, dual per-layer RoPE, GQA 8 KV / 128 head-dim, 1M ctx. History: benchmark-record |
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
-| LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs load inside the contract; one runs device-resident on GB10. Caption projection on `vt::MatmulBT` (#1208); IC-LoRA fusion on `vt::Matmul` (#1202), 143x, residual now the add-back (#1254). Render OWED |
+| LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs load inside the contract; one device-resident on GB10. Caption proj on `vt::MatmulBT` (#1208); LoRA fusion on `vt::Matmul` (#1202), add-back (#1254). #1286 REFUTED (#1317), alloc gated. Render OWED |
 | MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM + 2.4B fp32 DiT (§14). Depth 4.45x, wall 2.74x, WAV byte-identical (§16). No reference number |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
@@ -238,6 +238,38 @@ the capability held a pinned token-id block that was filled every step and never
 uploaded. So the classic-dense decline that costs a shipped model its decode
 graph under asynchronous serving is not one refactor away from removable. It
 stands, and the work it needs is now named rather than assigned.
+
+W5 (2026-08-19, #1335) migrates the last three, so ALL NINE drivers are on the
+seam and the migration is complete. These are the single-shape drivers: the
+DFlash draft graph, the DeepSeek V4 decode graph, and the Laguna decode graph,
+whose own source note asked for this seam by name. No hand-rolled capture call
+survives anywhere under `src/vllm/`.
+
+W5 also gives the seam the auxiliary-stream rule. Closing a graph segment while
+a side stream forked inside it is still recording is illegal, so the capture
+scope now tracks the forks opened since the segment began and joins any that are
+still outstanding before it closes. Every earlier stage captured in FULL mode,
+which has one segment and therefore no window for the rule to govern, so this is
+the first stage that could exercise it; the Laguna decode graph, whose fork sits
+inside the captured region by construction, is what reaches it.
+
+Bit-exactness against a replayed capture is still owed for four of the nine
+drivers, and for two of them so is the routing gate. The reasons are per driver
+and are recorded: DeepSeek V4 refuses a CPU queue before it reaches its capture,
+and Laguna's capture class only exists in a CUDA build with the Marlin NVFP4
+kernels. The DFlash driver's own gate landed red first.
+
+One half of that is closed. Laguna's capture class is behind a build flag, so a
+green CUDA build is equally consistent with the migrated code having been
+compiled OUT. Injecting an error into each migrated region and requiring the
+build to fail settles it: both regions are really compiled. What the two still
+owe is behavioural, and needs each model's own device kernels rather than only a
+compiler.
+
+Bit-exactness for the five drivers that HAVE it was re-measured at this stage's
+head on a leased GPU, because the shared capture-close path changed underneath
+them: five drivers, 2066 assertions, nothing differing over three consecutive
+replays each.
 
 W3 also closed a gate that could not fail. The mode a driver captures in was
 unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole
@@ -976,10 +1008,62 @@ those throughput cells are **withheld, not quoted**
 tokens by a duration that still contains the dead request, which is why c1 reads
 0.677x while median TPOT in the same file reads 1.014x in our favour.
 
-**That cause has landed, and the two cells are now waiting on a re-run rather
-than on a diagnosis.** The dropped requests were our own SSE keepalive comment
-frame, and `VT_SERVER_SSE_PING_S` now defaults to `0`. Both cells stay withheld
-until [#915](https://github.com/mudler/vllm.cpp/issues/915) re-runs them paired.
+**That cause has landed, and the re-run happened on 2026-08-19.** The dropped
+requests were our own SSE keepalive comment frame, and `VT_SERVER_SSE_PING_S`
+now defaults to `0`. With it off, our arm completed **162 of 162** requests,
+three reps at each concurrency, `failed=0` on every leg: c1 output throughput
+**4.4040 tok/s** (CV 0.039%), c8 **22.6402 tok/s** (CV 0.205%).
+
+**Read both of those absolutes with one caveat.** Our server reported 5,942
+prompt tokens at c1 where vLLM reported 6,144 on the identical prompts, and 19 of
+48 were short at c8 ([#1355](https://github.com/mudler/vllm.cpp/issues/1355)).
+`output_lens` is `[128]xN` on both arms, so TPOT and ITL stand and total-token
+throughput does not. Output throughput is biased UP if the prompts were truly
+truncated, by roughly 0.13% at c1 and 0.4-0.6% at c8 — larger than the 0.039% and
+0.205% CVs published beside them, so the bias is not inside the stated precision.
+
+**Our half of the debt is discharged. Neither cell is a ratio, and each is
+blocked for its own reason.** At c1 vLLM also completed every request
+(**4.2835 tok/s**, CV 0.033%) and both absolutes stand, but
+`gpu_clock_state compare` returned `PAIRING_VERDICT=DISCARD` on all three
+pairings. **The c1 ratio is OWED, not withheld for being unflattering.**
+
+The refusal is about clock spread, not about the arms disagreeing. The
+cross-arm rule passed perfectly — same boot, both arms at a 2489 MHz median,
+offset **0.0%** — while the within-run rule failed on both, at
+13.58/26.36/14.34% for us and 10.16/17.48/18.52% for vLLM against a 5% ceiling,
+with `SwThermalSlowdown` active in every window and one of ours also carrying
+`HwSlowdown+HwThermal`. All six of our legs and all three of vLLM's breached
+that ceiling, and stable medians do not launder it.
+
+**At c8 the vLLM denominator is NOT MEASURABLE on this box at the recorded
+configuration, and that is the answer rather than a gap in it.** The server
+reached `/health` at 373 s and the worker was then lost during warmup. The KV
+reservation took **48,715 MB in a single 4-second window** (58,453 -> 9,738 MB),
+the last observed value was 6,261 MB, and the death fell inside one 2-second
+sampling interval.
+
+So `--gpu-memory-utilization 0.85 --max-num-batched-tokens 8192` leaves roughly
+6-7 GB of headroom here, and a sampling watchdog cannot guard it at any floor
+that still lets the configuration run: 12,000 MB kills a healthy server and
+5,000 MB is never reached in time. Every way to create that headroom is an
+engine knob that would change the denominator, so none was attempted. **This is
+a statement about headroom and guard granularity on this box, not a claim that
+vLLM is defective.**
+
+**Clocks were SAMPLED, never pinned, and that is new.** `nvidia-smi -lgc`
+returns `LGC_RC=4`, "The current user does not have permission to change
+clocks", running as root inside an `rc` lease. Every clock-pinned figure in
+these records was taken over the retired host + `ssh` + `flock` path, so the
+migration to leases removed clock pinning and no record said so until now. Same
+class as [#1265](https://github.com/mudler/vllm.cpp/issues/1265), and the root
+cause of the discarded pairing.
+
+**Undetermined, and recorded as owed rather than guessed.** Whether the host
+rebooted or only the k3s pod was lost when the worker died cannot be decided
+from these artifacts. One command settles it: compare
+`/proc/sys/kernel/random/boot_id` against `3fd9745a-d25a-426c-ba3c-97c958a85515`
+inside any later `dgx:gpu0` job.
 
 Resource axes on the same series: cold start to first `/health` **53 s vs
 780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —

@@ -269,6 +269,16 @@ fill being PRESENT, only on its being CORRECT. That is the expected shape while
 the selected name still dispatches nothing (`## Owed` item 1), and it is the
 second reason this change must not be read as fixing selection.
 
+## Found in flow, filed, not fixed here
+
+[#1353](https://github.com/mudler/vllm.cpp/issues/1353): a full disk makes the
+preflight report ten record and policy suites red while the only fault is
+`No space left on device`, and the failures read as findings about records. Hit
+on this row's own gate run at 100% disk; all ten went green after reclaiming this
+row's build tree, with no tree change. Not fixed in this flow because it changes
+preflight semantics and adds a refusal path, which `AGENTS.md` routes to the
+normal row, spec and fresh-review path. Owner: `ENG-RECORD-ANCHOR-RATCHET`.
+
 ## Stop conditions
 
 - Stop and report `NEEDS_DECISION` if a ported predicate would refuse a

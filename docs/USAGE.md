@@ -756,11 +756,21 @@ refusal is about that checkpoint on this build.
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend
 whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
-when the build carries no compiled code for that GPU — which is a real failure
-mode, not a hypothetical one, and it surfaces as a launch error rather than as
-this refusal. Confirming which architectures a build actually targets is a
-separate question, answered under "Confirming which CUDA architecture a build
-targets" above. Tracked as
+when the build carries no compiled code for that GPU.
+
+That is a real failure mode, not a hypothetical one, and it surfaces as a launch
+error rather than as the refusal above. It has been measured on a GB10 board
+(compute capability 12,1) against the reference engine, same wheel and same
+prompt: asking for its `FLASHINFER` backend generates text and exits cleanly,
+while the default — which resolves `FLASH_ATTN`, the reference engine's *first*
+preference for that device — dies at the first attention call with
+`cudaErrorUnsupportedPtxVersion`. The first preference could not run and the
+second could, and no capability check on either side could tell them apart.
+
+So if a run dies inside attention rather than being refused before it starts,
+the backend was accepted on a claim your build does not honour. Confirming which
+architectures a build actually targets is a separate question, answered under
+"Confirming which CUDA architecture a build targets" above. Tracked as
 [#1332](https://github.com/mudler/vllm.cpp/issues/1332).
 
 Selecting a backend by name is not exposed yet; the engine always resolves one.

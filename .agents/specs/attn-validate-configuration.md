@@ -63,6 +63,25 @@ own it already exist.** No new roadmap row is opened.
    be the defect #1332 exists to correct. The compiled-arch manifest (M2) and the
    launch probe (M3) are what make the layer sound. **Owner: #1332 M2/M3, row
    `BACKEND-CUDA-COMP-FA`.**
+
+   **The measurement that settles this, and it is not a thought experiment.**
+   Run through the pinned oracle on a GB10 board in the fleet (compute capability
+   12,1), same wheel, same prompt, one variable:
+
+   | Requested backend | Result |
+   |---|---|
+   | `FLASHINFER` | `GENERATED: ' Paris. The capital of France is also the capital of the Republic of France.'`, `GEN_RC=0` |
+   | default (resolves `FLASH_ATTN`) | dies at the FIRST attention call, `cudaErrorUnsupportedPtxVersion` |
+
+   vLLM's own priority list puts `FLASH_ATTN` at position 0 and `FLASHINFER` at
+   position 1 for this device (`cuda.py:156-163`, the `else` arm our table row
+   mirrors). **The priority-0 choice is unrunnable on the board and the
+   priority-1 choice works, and every filter in this file passes both.** Both
+   declare a compute-capability floor at or below 12,1; neither is asked what its
+   own fatbin contains. That is the gap, stated as a pair of observations rather
+   than as an argument, and it is why this row's M1 must not be reported as
+   fixing selection. Motivation only — M2 and M3 close it and are NOT in this
+   change.
 3. **`AttnSelectorConfig::dtype` is not supplied by the runner.** The production
    call site fills `head_size`, `block_size` and `kv_cache_dtype` from the
    resolved per-layer KV geometry, but the model/query dtype is not available at

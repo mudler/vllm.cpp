@@ -272,7 +272,13 @@ class AttentionBackend {
   // compute_80 PTX and nothing else, and every launch then failed a driver JIT
   // with cudaErrorUnsupportedPtxVersion. `grep -rn get_arch_list vllm/` returns
   // zero hits: vLLM never asks what its own fatbins contain, and neither does
-  // this. The invariant #1332 states is that no backend may be declared valid on
+  // this. Measured on that board through the pinned oracle, same wheel and same
+  // prompt: asking for FLASHINFER generates text and exits 0, while the default
+  // — which resolves FLASH_ATTN, upstream's priority 0 for this device — dies at
+  // the FIRST attention call. The priority-0 choice is unrunnable and the
+  // priority-1 choice works, and every predicate below passes BOTH.
+  //
+  // The invariant #1332 states is that no backend may be declared valid on
   // the strength of a property of the DEVICE alone, and satisfying it needs the
   // build-derived compiled-arch manifest (M2) and the launch probe (M3). This
   // layer is NECESSARY AND NOT SUFFICIENT, and a reader who takes it for a

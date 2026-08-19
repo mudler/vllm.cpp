@@ -418,23 +418,238 @@ stated removal condition is the device/paged runner path, which is A2-P's.
 
 ## 10. Now
 
-**State at this commit:** spec only. No product code, no lifecycle change.
+**State at this commit:** the device arm is IMPLEMENTED and REACHED, and its
+binding measurement is PENDING a lease.
 
-A2-Q1 is **BLOCKED on #960** and is not claimable until it lands. When it does, a
-fresh implementer claims this file, captures a RED per §5.3 first, and lands the
-mamba device arm with G-SAFE untouched. A fresh reviewer — never the implementer
-— runs the §5.3 mutations.
+`NemotronHMamba2MixerDevice` (`nemotron_h_device.cpp`) runs the whole block on
+the device on the shared FP8 W8A8 seam, and BOTH forwards select it at runtime:
+`NemotronHDeviceForward` (non-paged, discarding the recurrence) and
+`NemotronHPagedForward` (production, advancing the gathered recurrent rows in
+place). The selection is a runtime op-table query plus a weight-form predicate,
+never a preprocessor guard, so a dense NemotronH or a device without the fp8 pair
+keeps the host bounce.
 
-**Three things to read before the first edit:** §3, so the Thor dependency is
-consumed rather than re-derived; §1.1, so the conv-state dtype is left to A2-P;
-and §5.2, so the bands are measured rather than chosen.
+**Three design points differ from §4 and the reasons are recorded here rather
+than left to be re-derived:**
+
+1. **The `Fp8Weight` pair is built ON FIRST DEVICE USE, not by the loader**
+   (§4.1/§4.2 put it in the loader). Building it in a `ResidentSlot` the weights
+   own is A2-Q2a's newer idiom and it is strictly better here: it does not double
+   the 890 MB fp8 tower in host memory at load, it does not upload anything on a
+   host-only run, and it leaves `rep.host_bytes` — the literal `18888922112` that
+   `test_nemotron_h_loader.cpp:310` pins — untouched, so §4.2's re-derivation
+   obligation does not arise at all. The e4m3 staging copy is released as soon as
+   `ResidentFp8` has uploaded it, so the peak cost of the conversion is one
+   projection.
+2. **The upload IS accounted** (§4.4 expected the report to say it was short).
+   `dense_fp8::ResidentFp8` still does not call `load_stats::AddDeviceUpload`
+   — that is [#974](https://github.com/mudler/vllm.cpp/issues/974), unchanged, and
+   the shared header is not touched — so A2-Q1 accounts what IT uploads at the
+   site that causes it, exactly as `ResidentWeight` and `ResidentNvfp4` do. The
+   counter is then also the instrument the residency case reads, because an arm
+   that re-uploaded the tower every step returns identical numbers to one that
+   uploads it once.
+3. **The paged selection carries an `ssm_dtype == f32` term.**
+   `vt::GdnStateGather` widens the page into an f32 working buffer by op
+   contract, and the HOST arm then narrows it back to `ssm_dtype` before the
+   mixer sees it. On a checkpoint whose `mamba_ssm_cache_dtype` is not f32 the
+   two arms would round differently and the per-block numeric gate would be
+   comparing two different computations. The released checkpoint resolves f32.
+
+**The comparison is NOT bit-comparable by construction, and §5.2's "measure the
+band" is therefore binding rather than cautionary.** The host reference is
+W8A16 — `DenseFor` dequantizes the fp8 weight to bf16 and leaves the activation
+alone, as `DenseBf16` says outright — while the device arm is W8A8 as vLLM is.
+The difference between them is the e4m3 activation quantization, and every band
+in `tests/vllm/models/test_nemotron_h_mamba_device.cpp` is measured in the run
+against a defect the fixture separates.
+
+### 10.1 Thor (sm_110) RAN the arm, and it answers §3's question
+
+Measured 2026-08-18 under an `rc` lease on `thor:gpu0`, product tree behaviourally
+identical to this row's head (the later commits touch tests, scripts and one
+comment only). `cmake --build -j 4` returned 0. The feature table read
+**`ENABLED for [110]: 1 ; DISABLED cells: 7`** — only `marlin-nvfp4`, with
+`cutlass-fp8` and both `scaledmm-c3x` cells DISABLED.
+
+**That configuration is the whole point.** §3.1 measured Thor as having half an
+fp8 arm: the GEMM present through `kMatmulFp8CublasLt`, the activation quant
+trapped in a CUTLASS-gated TU. #991 moved the registration out. The arm running
+here, on a build with no CUTLASS fp8 at all, is what closes that question.
+
+`test_nemotron_h_mamba_device` reported **49 assertions** where a GPU-less box
+reports 4, so the device path executed rather than skipping:
+
+| case | result |
+|---|---|
+| fresh block vs host reference, T=1 / 8 / 12 | agreed 0.164 / 0.282 / 0.309 against a measured band of 0.5; 128 / 1024 / 1536 elements examined; 3 widths covered |
+| the fp8 tower uploads ONCE | first call 61760 B == expected 61760 B, second call 0 B |
+| refuses a dense projection, refuses a missing `input_scale` | both threw |
+| the carry across two legs | **FAILED, and the instrument was the defect** — see below |
+
+Neighbouring suites, same run, all `Status: SUCCESS!`: `test_nemotron_h_forward`
+16/16 (5716 assertions), `test_nemotron_h_paged_forward` 12/12 (3256),
+`test_nemotron_h_loader` 2/2, `test_nemotron_h_moe_device` 2/2 (29),
+`test_ops_mamba2_ssd` 12/12 (2095), `test_ops_fp8_cpu` 5/5 (62).
+
+### 10.2 The carry gate banded a defect smaller than the noise it had to accept
+
+The case banded the SECOND LEG'S OUTPUT against the separation of a dropped
+carry. Thor measured the second leg agreeing to 0.705 while a dropped carry
+separated by only 0.205, so the derived band (0.102) sat BELOW the deviation a
+FRESH leg already shows (0.164 at T=1, from the case above).
+
+That is §5.2's lesson arriving from the other direction. The two arms are W8A8
+against W8A16, so a fresh leg already disagrees by the e4m3 activation
+quantization and a second leg compounds that with the same disagreement
+propagated through the carried state. **A defect whose separation is smaller than
+the noise the comparison must accept is not resolvable from that comparison**, and
+widening the band until it passes is what §8.1 says to stop for.
+
+The repair gates what the carry IS: the STATE. A dropped carry hands the next leg
+zeros, so the separation between the advanced state and a zeroed one is 1.0 by
+construction — about six times the noise floor. The conv window and the SSM state
+are banded separately, each against its own zeroed twin. The noise floor is
+measured in the run at the same width and printed beside the separation, and the
+second leg's output carries an assertion only when the separation exceeds twice
+that floor, with the condition printed either way.
+
+The failure also exposed two fixture defects. `mamba_ssm_cache_dtype` was unset
+and resolved bf16 — NOT the configuration the paged forward selects the device arm
+for (`ssm_dtype == f32`), so the cheap arm was gating a path production does not
+take. And the whole file was a skip on a GPU-less box, so a CPU-runnable case now
+pins the op contract the split depends on.
+
+### 10.2b The repaired carry gate, re-run on hardware, and what it measured
+
+Thor re-run at the branch head: `test_nemotron_h_mamba_device` **5 cases, 63
+assertions, 0 failed**, and every neighbouring suite green again. The repair of
+§10.2 therefore holds on the silicon that exposed the defect, and the numbers it
+prints now justify the repair rather than merely passing:
+
+| quantity | measured | separation | band | margin |
+|---|---|---|---|---|
+| W8A8-vs-W8A16 noise floor, T=1 | **0.2465** | — | — | the reference for everything below |
+| carried conv window | **0.1746** over 576 elements | 1.0 (zeroed) | 0.5 | 2.9x |
+| carried SSM state | **0.0614** over 2048 elements | 1.0 (zeroed) | 0.5 | 8.1x |
+| second leg's output | 0.7055 | 0.2045 | — | NO assertion, see below |
+
+**The data now proves the diagnosis that drove the repair.** A dropped carry
+separates the second leg's output by 0.2045, while the noise the comparison must
+accept is 0.2465 — the defect is genuinely SMALLER than the noise, so
+`separation > 2 * noise_floor` is false and the case makes no assertion there, by
+design. The state comparison carries the case instead, at 2.9x and 8.1x margins.
+Had the original band survived, it would have been asserting on a quantity it
+cannot resolve.
+
+**One diagnostic was defective and is fixed.** The line that reports whether the
+second leg is resolvable printed `1` rather than its prose, because doctest
+stringifies a `const char*` as a BOOL and the message streamed a `char*` ternary.
+That line's whole job is to make "no assertion was made here" a STATED result
+rather than a silent hole, so a version of it that cannot say what it means is
+the same class of defect as the band it reports on. It now builds a
+`std::string`; reproduced against doctest 2.5.2 both ways before the fix.
+
+### 10.2c The decode-window sampler works, and it quantifies the dilution
+
+Thor re-run, A3 gate with the arm ON, sampler starting only after
+`engine loaded in Ns`:
+
+```
+RC[a3 on]=0
+[nemotron-h] engine loaded in 500.9s
+[nemotron-h] TOKEN MATCH: 96/96 over 3 prompt(s) (full rows=3, short rows=0, mode=decode)
+[nemotron-h] STRICT PASS
+on: GPU busy in 240 of 564 DECODE samples = 42.55% busy
+on: decode window 75.418 s (the engine load is OUTSIDE it)
+on: per output token 0.785606 s
+reference-tier lines in on: 0
+```
+
+**42.55% over the decode alone against 15.33% over load+decode.** The load is
+500.9 s and the decode is 75.418 s, so the old window was 87% load — the
+dilution §10.3 diagnosed is now measured rather than argued.
+
+**The same cross-silicon defect was still live on the per-token line and is
+fixed.** That run printed `ratio 54.7x` against vLLM's 0.014369 s, which is a
+GB10 figure, for a decode measured on Thor. It is exactly the defect the
+busy-fraction reporter carried, and fixing one surface while leaving its twin is
+how a wrong comparison survives a correction. The ratio is now quoted only when
+`ARCH` is the arch it was measured on; elsewhere the rate still prints and the
+comparison is withheld by name. Both arms are pinned in
+`tests/scripts/test_nemotron_h_a2q1_per_token.py`, and quoting the ratio
+unconditionally reds the suite.
+
+### 10.3 The A/B, on the corrected instrument: the busy fraction ROSE
+
+Second Thor lease, fresh build and clone, sampler measuring the DECODE window
+alone. Same binary, same checkpoint, same golden, differing only by
+`VT_NEMOTRON_H_DEVICE_MAMBA`:
+
+| flag | mamba arm | A3 | exit | decode GPU busy | per output token | decode wall |
+|---|---|---|---|---|---|---|
+| `1` (default) | device FP8 W8A8 | `96/96 STRICT PASS` | 0 | **240/564 = 42.55%** | **0.785606 s** | 75.4 s |
+| `0` | host, dequant to bf16 | `93/96 DIVERGENCE` | 1 | **700/3808 = 18.38%** | **5.633442 s** | 540.8 s |
+
+**THE BUSY FRACTION ROSE, WHICH IS THIS UNIT'S ACCEPTANCE TEST: 18.38% to
+42.55%, +24.17 points, a 2.31x rise.** A decode token costs 7.17x less. Peak host
+44070 MiB. `reference-tier lines: 0` on both arms, so neither took the portable
+tier.
+
+**Read on the box it was taken on, and nowhere else.** These are sm_110 figures.
+The 6.31% baseline and the 0.014369 s per-token reference are BOTH GB10's, so
+neither supports a ratio against these numbers, and the instrument now withholds
+both comparisons by name on any other arch. What is established is the ON/OFF
+difference on one box, and that is exactly the comparison the hypothesis needed.
+
+**The `ratio 54.7x` and `ratio 392.1x` strings in that run's log are stale and
+must not be quoted.** That job cloned before the per-token arch gate landed, so it
+still printed the GB10 comparison unconditionally; the per-token VALUES are sound
+measurements of that box, the ratios beside them are not.
+
+### 10.4 The divergence reproduces, so it is not n=1 on Thor
+
+Two independent Thor leases, separate builds and separate clones, agree exactly
+on both arms:
+
+| run | arm ON | arm OFF |
+|---|---|---|
+| `20260818T222352Z` | 96/96 | 93/96 |
+| `20260818T232910Z` | 96/96 | 93/96 |
+
+So the `n=1` caveat is lifted FOR THOR: the host arm's 93/96 is reproducible
+there, and the device arm's 96/96 is too. GB10 remains n=1 in the other
+direction (the #1157 run, host arm, 96/96), and no GB10 run of the DEVICE arm
+exists yet. [#1290](https://github.com/mudler/vllm.cpp/issues/1290) carries this.
+
+**What is still owed.** The occupancy hypothesis is now SUPPORTED on sm_110 and
+UNMEASURED on sm_121a, and the two are not interchangeable. Specifically owed:
+
+- the GB10 run, which is the only one that can be read against the 6.31%
+  baseline and the 0.014369 s per-token reference, and the only place a DEVICE-arm
+  A3 result does not yet exist at all;
+- the §5.1 per-block numeric gate against `trace.mixer[l]` on the real checkpoint
+  — the A3 gate is token-level and cannot see a per-layer defect whose argmax is
+  unchanged;
+- the §5.3 mutations, which belong to the fresh reviewer;
+- the three moved tokens on the OFF arm, whose oracle top-2 margin decides
+  whether [#1290](https://github.com/mudler/vllm.cpp/issues/1290) is a near-tie
+  sensitivity or a wrong answer.
+
+`scripts/nemotron-h-a2q1-dgx-gate.sh` is the recipe, and it now measures the
+decode window, withholds both GB10 references off `121a`, and refuses a fraction
+outright when the load boundary never appears.
 
 ## 11. Owed
 
-- [#974](https://github.com/mudler/vllm.cpp/issues/974) — the fp8 resident
-  helpers upload without `AddDeviceUpload` / `AdoptDeviceBytesAsHost`. A2-Q1
-  consumes them and reports its accounting as short (§4.4); the fix is not this
-  unit's.
+- [#974](https://github.com/mudler/vllm.cpp/issues/974) — `dense_fp8::ResidentFp8`
+  uploads without `AddDeviceUpload` / `AdoptDeviceBytesAsHost`. A2-Q1 consumes it
+  and accounts its own upload at its own call site (§10.2); the fix INSIDE the
+  shared header is not this unit's, and every other caller of the seam is
+  byte-unchanged.
+- The §5.1 real-checkpoint per-block numeric gate, the §5.3 mutation pass and the
+  GPU-occupancy measurement are PENDING a GB10 lease. They are the unit's
+  acceptance test, not paperwork.
 - The device arm has **no production caller** until A2-P wires it through
   `ModelRegistry::Forward` (§7). Tracked on
   [#810](https://github.com/mudler/vllm.cpp/issues/810).

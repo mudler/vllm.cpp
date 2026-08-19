@@ -135,6 +135,7 @@ SUITES=(
   test_check_model_checklist
   test_check_supported_models
   test_check_env_doc
+  test_nemotron_h_a2q1_per_token
   test_checker_text
   test_check_fusion_consistency
   test_check_fp4_resident_consistency

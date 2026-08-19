@@ -240,6 +240,20 @@ struct NemotronHMambaWeights {
   NemotronHOwned dt_bias;  // [mamba_num_heads] f32
   // Mixer2RMSNormGated weight over the SSM intermediate width.
   NemotronHOwned norm_weight;  // [mamba_intermediate_size]
+
+  // A2-Q1 (#810): this layer's device-resident mamba state — the two FP8 W8A8
+  // towers uploaded through the shared `dense_fp8::ResidentFp8` seam plus the
+  // six small recurrence parameters, built ONCE on first device use and owned
+  // BY THE WEIGHTS. Opaque here for the same reason `moe_marlin` below is: the
+  // resident type is an implementation detail of nemotron_h_device.cpp.
+  //
+  // KEYED ON THE SLOT, NEVER ON AN ADDRESS (issue #237, qwen3_5_weights.h:183).
+  // Two engine builds in one process can hand the second engine's weights the
+  // address the first engine's had, and an address-keyed cache then returns the
+  // PREVIOUS engine's device pointers: plausible, wrong values rather than a
+  // crash. Holding the state in the weights it describes makes that
+  // unrepresentable.
+  ResidentSlot device_fp8;
 };
 
 // GQA attention weights. q/k/v ship SEPARATE on disk (upstream fuses them into
@@ -515,6 +529,29 @@ std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
                                                  const std::vector<float>& hidden_normed,
                                                  int64_t num_tokens, vt::DType act_dtype,
                                                  vt::Queue& dev_queue);
+
+// A2-Q1 (#810): ONE NemotronH Mamba2 block on the device, with host-side input
+// and output so a gate can drive a single block in isolation — the same
+// per-block equivalence seam `NemotronHMoeBlockDeviceHostIO` is, and for the
+// same reason.
+//
+// WHY THE GATE IS NUMERIC AND NOT TOKENS. A token comparison cannot see a
+// dropped `input_scale` (the activation quantized against 1.0), an `alpha`
+// folded as `weight_scale` alone, a transposed `in_proj` operand, a `zxbcdt`
+// split offset by one column, or a projection that quietly stayed on the host
+// and dequantized. Every one of those is finite, correctly shaped and
+// plausible, and this row has already been bitten by three of them.
+//
+// `state` is the OPTIONAL carried recurrence, exactly as `NemotronHMamba2Mixer`
+// takes it: null runs the fresh-state arm (zero conv window, no initial SSM
+// state), non-null carries in and is UPDATED IN PLACE, so the two arms are
+// comparable on the carrying path as well as the fresh one.
+std::vector<float> NemotronHMamba2MixerDeviceHostIO(const NemotronHMambaWeights& w,
+                                                    const NemotronHParams& params,
+                                                    const std::vector<float>& hidden_normed,
+                                                    int64_t num_tokens, vt::DType act_dtype,
+                                                    vt::Queue& dev_queue,
+                                                    NemotronHMambaState* state = nullptr);
 
 // The final output projection, on the HOST, over `num_rows` already-gathered
 // and already-final-normed rows `[num_rows, hidden_size]` (f32 in, f32 logits

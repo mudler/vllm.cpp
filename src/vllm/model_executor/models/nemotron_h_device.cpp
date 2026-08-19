@@ -104,6 +104,13 @@
 // header rather than dense_device_glue.h — `ResidentWeight`, the lazy
 // upload-once seam this row converts NemotronH's dense weights onto.
 #include "vllm/model_executor/models/dense_attn_block.h"
+// A2-Q1 (#810): the SHARED per-tensor FP8 W8A8 dense GEMM glue extracted by
+// #940 — `ResidentFp8` (the upload-once device view) and `MatmulFp8CutlassD`
+// (static per-tensor activation quant + fp8 GEMM with the folded alpha). This
+// header exists BECAUSE of this model (its own note says so), so the mamba
+// projections route through it rather than re-typing the entry points here —
+// the hand-rolled parallel path AGENTS.md forbids.
+#include "vllm/model_executor/models/dense_fp8_gemm.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"  // kFusedAddRmsNormStd
@@ -355,9 +362,6 @@ bool MoeIsNvfp4(const NemotronHMoeWeights& w) {
   return true;
 }
 
-// DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- the whole arena region names vt::cuda::Marlin* functions declared only in the guarded header above, so it cannot compile on a build without them. vt::OpRegistered answers availability, never declaration. Mirrors laguna.cpp:456, the same CUDA-leg arena.
-#ifdef VT_MARLIN_NVFP4
-
 // Fetch (building on first use) the resident state a weight owns. A VERBATIM
 // copy of qwen3_5.cpp:680, which is file-local `static` there and so cannot be
 // called from here. The duplication is deliberate and is the same call this file
@@ -373,6 +377,9 @@ R& ResidentIn(const ResidentSlot& slot) {
   if (!slot.state) slot.state = std::make_shared<R>();
   return *static_cast<R*>(slot.state.get());
 }
+
+// DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- the whole arena region names vt::cuda::Marlin* functions declared only in the guarded header above, so it cannot compile on a build without them. vt::OpRegistered answers availability, never declaration. Mirrors laguna.cpp:456, the same CUDA-leg arena.
+#ifdef VT_MARLIN_NVFP4
 
 // ─── A2-Q2a: one MoE layer's device-resident Marlin arena ───────────────────
 //
@@ -763,6 +770,409 @@ DBuf NemotronHMoeBlockDevice(Dev d, const NemotronHMoeWeights& w,
 
 #endif  // VT_MARLIN_NVFP4
 
+// ─── A2-Q1: the FP8 W8A8 Mamba2 block on the DEVICE ─────────────────────────
+//
+// The 23 Mamba2 layers were the last host bounce of the decode step, and they
+// were the EXPENSIVE one. The host arm reaches its two projections through
+// `Linear(..., const NemotronHOwned&)` (nemotron_h.cpp:291), whose `DenseFor`
+// (:245) calls `NemotronHOwned::DenseBf16()` — a FULL dequant of the fp8 tower
+// into a fresh bf16 buffer ON EVERY CALL. That is 23 x (10304x2688 + 2688x4096)
+// = 890e6 elements re-expanded per TOKEN, plus a download of the normed hidden
+// and an upload of the mixer output per layer. It is why a decode step spent
+// its time on the host.
+//
+// ★ THE BLOCK MOVES WHOLE, ON THE FP8 SEAM, OR NOT AT ALL. `mixer.in_proj`
+// produces the fused `zxbcdt` that the causal conv and the SSD scan both consume
+// (mamba_mixer2.py:550, split :692-696), so there is no intermediate landing in
+// which the conv is on the device and `in_proj` is not. That is the whole reason
+// the shared FP8 W8A8 linear seam (#940, `dense_fp8_gemm.h`) had to be extracted
+// first: without it this block has no device path to build.
+//
+// WHAT IS MIRRORED, statement for statement, from the host arm
+// (nemotron_h.cpp:451-625) — same vt:: ops, same order, same dtypes, different
+// backend, which is the property A2-R established and the numeric gate reads:
+//
+//   in_proj (FP8 W8A8) -> QkvSplit(z | xBC | dt) -> CausalConv1dFwd(silu)
+//     -> QkvSplit(x | B | C) -> Mamba2ChunkScan -> RmsNormGatedGroup(n_groups)
+//     -> out_proj (FP8 W8A8)
+//
+// The ONE substitution is the split: the host arm copies columns with
+// `SliceCols` (nemotron_h.cpp:333) because `vt::Mamba2ChunkScan` validates every
+// operand contiguous (ops.cpp CheckMamba2Operand). `vt::QkvSplit` is exactly
+// that copy on the device — a three-way column split with INDEPENDENT widths
+// into three contiguous outputs (ops.h:3512) — so the two arms produce the same
+// bytes and neither hands the scan a strided view.
+
+// Every projection of one Mamba2 block on the FP8 W8A8 seam, plus the six small
+// recurrence parameters, uploaded ONCE and held for the model lifetime. Built on
+// first device use and keyed on the weights' own `ResidentSlot`, never on an
+// address (nemotron_h_forward.h, `device_fp8`).
+struct NemotronHMambaDeviceResident {
+  Fp8Weight in_proj;   // [in_proj_out_features, hidden_size] e4m3
+  Fp8Weight out_proj;  // [hidden_size, mamba_intermediate_size] e4m3
+  // The device buffers this arm owns for the model lifetime. Raw `Backend::Alloc`
+  // with a freeing deleter rather than a pooled `DBuf`: a `DBuf` held forever
+  // would take its block out of the shared scratch pool for good, which is the
+  // opposite of what the pool is for.
+  std::shared_ptr<void> conv_w;   // act dtype [conv_dim, conv_kernel]
+  std::shared_ptr<void> conv_b;   // act dtype [conv_dim]  (use_conv_bias only)
+  std::shared_ptr<void> a_neg;    // f32 [num_heads]  = -exp(A_log)
+  std::shared_ptr<void> d_term;   // f32 [num_heads]
+  std::shared_ptr<void> dt_bias;  // f32 [num_heads]
+  std::shared_ptr<void> norm_w;   // act dtype [mamba_intermediate_size]
+  bool has_conv_bias = false;
+  bool ready = false;
+};
+
+// Refuse by name unless BOTH projections are the FP8 W8A8 static form this arm
+// is built from. `BuildTiny` and any future unquantized NemotronH ship them
+// `kDense`, and those layers keep the host bounce — stated here rather than
+// discovered later as a silent slow path.
+bool MambaIsFp8(const NemotronHMambaWeights& w) {
+  auto q = [](const NemotronHOwned& t) {
+    return t.form == NemotronHWeightForm::kFp8W8A8Static && !t.bytes.empty() &&
+           t.shape.size() == 2;
+  };
+  return q(w.in_proj) && q(w.out_proj);
+}
+
+// VT_NEMOTRON_H_DEVICE_MAMBA, default ON. The same-binary A/B switch every
+// measurement of this row needs: with it OFF the identical build takes the host
+// bounce, so a throughput or GPU-occupancy difference is attributable to THIS
+// arm and not to a rebuild. Mirrors `NemotronHDeviceMoeEnabled`, which A2-Q2a
+// introduced for its own A/B.
+bool NemotronHDeviceMambaEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NEMOTRON_H_DEVICE_MAMBA");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+// A lifetime-resident device copy of `nbytes` host bytes. Accounted through
+// `load_stats::AddDeviceUpload` AT THE SITE THAT CAUSES THE UPLOAD, which is
+// what `ResidentWeight` (dense_attn_block.h:197) and `ResidentNvfp4`
+// (dense_nvfp4_gemm.h:306) already do. `dense_fp8::ResidentFp8` does NOT account
+// its own upload — that is issue #974, and A2-Q1 does not fix it inside the
+// shared header; it accounts what IT uploads, here, so this row's device-upload
+// total is honest and every other caller of the seam is byte-unchanged.
+std::shared_ptr<void> ResidentBytes(Dev d, const void* src, size_t nbytes) {
+  VT_CHECK(nbytes > 0, "NemotronH device mamba: refusing a zero-byte residency");
+  void* p = d.b.Alloc(nbytes);
+  d.b.Copy(d.q, p, src, nbytes);
+  vllm::load_stats::AddDeviceUpload(nbytes);
+  Backend* bk = &d.b;
+  return std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+}
+
+// The same three properties `RequireWeight` checks on the host arm
+// (nemotron_h.cpp:180), so a defect that refuses there refuses here rather than
+// reaching a kernel with a null pointer or a transposed extent.
+std::shared_ptr<void> ResidentDense(Dev d, const NemotronHOwned& w, const char* what,
+                                    DType want, const std::vector<int64_t>& shape) {
+  VT_CHECK(!w.Empty(), std::string("NemotronH device mamba: weight '") + what +
+                           "' is not materialized");
+  VT_CHECK(w.IsDense(), std::string("NemotronH device mamba: weight '") + what +
+                            "' is not dense; only the two projections are quantized");
+  VT_CHECK(w.dtype == want, std::string("NemotronH device mamba: weight '") + what +
+                                "' has the wrong dtype for this arm");
+  VT_CHECK(w.shape == shape, std::string("NemotronH device mamba: weight '") + what +
+                                 "' has the wrong shape");
+  return ResidentBytes(d, w.bytes.data(), w.bytes.size());
+}
+
+// One `NemotronHOwned` FP8 W8A8 projection as the SHARED `Fp8Weight` the seam
+// consumes. `packed` is a staging copy of the e4m3 bytes and is RELEASED as soon
+// as `ResidentFp8` has uploaded them (see the build below), so the peak cost of
+// the conversion is one projection rather than the whole 890 MB tower.
+Fp8Weight MambaFp8Weight(const NemotronHOwned& t, const char* what) {
+  VT_CHECK(t.form == NemotronHWeightForm::kFp8W8A8Static,
+           std::string("NemotronH device mamba: '") + what +
+               "' is not the FP8 W8A8 static form this arm is built from");
+  VT_CHECK(t.shape.size() == 2, std::string("NemotronH device mamba: '") + what +
+                                    "' is not a rank-2 [out, in] projection");
+  Fp8Weight f;
+  f.n = t.shape[0];
+  f.k = t.shape[1];
+  VT_CHECK(t.bytes.size() == static_cast<size_t>(f.n) * static_cast<size_t>(f.k),
+           std::string("NemotronH device mamba: '") + what +
+               "' does not carry exactly one e4m3 byte per [out, in] element");
+  // ★ `Fp8Weight` HAS NO `has_input_scale` (qwen3_5_weights.h:318-325): a 0.0
+  // `input_scale` IS "no scale shipped" there, while `NemotronHOwned` carries the
+  // distinction explicitly (nemotron_h_forward.h:174). The A2-Q1 spec §4.1 says
+  // the distinction survives the conversion because the default is 0.0 — ASSERT
+  // that mapping rather than assume it. A shipped 1.0 is a real value and passes;
+  // an unshipped scale reaching the GEMM as 1.0 would quantize the activation
+  // against the wrong divisor and produce a finite, plausible, wrong answer.
+  VT_CHECK(t.has_input_scale,
+           std::string("NemotronH device mamba: '") + what +
+               "' ships no input_scale, so the static per-tensor activation quant "
+               "this arm performs has no divisor; refusing rather than defaulting to 1.0");
+  VT_CHECK(t.input_scale > 0.0F && t.global_scale > 0.0F,
+           std::string("NemotronH device mamba: '") + what +
+               "' has a non-positive input_scale or weight_scale");
+  f.weight_scale = t.global_scale;
+  f.input_scale = t.input_scale;
+  // The folded per-tensor GEMM scalar, mirroring vLLM's per-tensor
+  // `ScaledEpilogue` (dense_fp8_gemm.h:20-39 cites the apply chain).
+  f.alpha = t.input_scale * t.global_scale;
+  f.packed.dtype = DType::kI8;
+  f.packed.rank = 2;
+  f.packed.shape[0] = f.n;
+  f.packed.shape[1] = f.k;
+  f.packed.nk = true;
+  f.packed.bytes.assign(t.bytes.begin(), t.bytes.end());
+  return f;
+}
+
+void BuildNemotronHMambaDeviceResident(Dev d, const NemotronHMambaWeights& w,
+                                       const NemotronHParams& params, DType adt,
+                                       NemotronHMambaDeviceResident& mr) {
+  if (mr.ready) return;
+  const int64_t H = params.hidden_size;
+  const int64_t I = params.mamba_intermediate_size();
+  const int64_t Cd = params.conv_dim();
+  const int64_t Hh = params.mamba_num_heads;
+  const int64_t K = params.conv_kernel;
+  const int64_t proj = params.in_proj_out_features();
+
+  mr.in_proj = MambaFp8Weight(w.in_proj, "mixer.in_proj");
+  VT_CHECK(mr.in_proj.n == proj && mr.in_proj.k == H,
+           "NemotronH device mamba: 'mixer.in_proj' is not "
+           "[in_proj_out_features, hidden_size]");
+  mr.out_proj = MambaFp8Weight(w.out_proj, "mixer.out_proj");
+  VT_CHECK(mr.out_proj.n == H && mr.out_proj.k == I,
+           "NemotronH device mamba: 'mixer.out_proj' is not "
+           "[hidden_size, mamba_intermediate_size]");
+  // Upload through the SHARED seam, which caches the device copy on the weight
+  // (`Fp8Weight::d_packed`). Synchronize before releasing the staging bytes: the
+  // copy `ResidentFp8` issues is asynchronous, so freeing the source first is a
+  // use-after-free that pageable-memory semantics merely hide most of the time.
+  (void)dense_fp8::ResidentFp8(d, mr.in_proj);
+  (void)dense_fp8::ResidentFp8(d, mr.out_proj);
+  d.b.Synchronize(d.q);
+  vllm::load_stats::AddDeviceUpload(mr.in_proj.packed.bytes.size() +
+                                    mr.out_proj.packed.bytes.size());
+  // The device copy is now the only one. `ResidentFp8` never re-reads `packed`
+  // once `d_packed` is set, so dropping the host staging here is what keeps the
+  // conversion from doubling the 890 MB fp8 tower on a unified-memory box.
+  mr.in_proj.packed.bytes.Reset();
+  mr.out_proj.packed.bytes.Reset();
+
+  VT_CHECK(params.mamba_hidden_act == "silu",
+           "NemotronH device mamba: only mamba_hidden_act=silu is ported (the "
+           "checkpoint ships silu); an other activation is refused rather than "
+           "silently substituted");
+  mr.conv_w = ResidentDense(d, w.conv1d_weight, "mixer.conv1d.weight", adt, {Cd, K});
+  if (params.use_conv_bias) {
+    // The conv bias is a MODEL-DTYPE tensor (ColumnParallelLinear's bias), not
+    // one of the three f32 SSM parameters below — the host arm says the same
+    // (nemotron_h.cpp:516-519).
+    mr.conv_b = ResidentDense(d, w.conv1d_bias, "mixer.conv1d.bias", adt, {Cd});
+    mr.has_conv_bias = true;
+  }
+  // `A = -exp(A_log)` in f32. THE f32 IS UPSTREAM'S OWN POLARITY, not a local
+  // widening: `self.A = -torch.exp(self.A_log.float())` keeps A in f32 whatever
+  // the model dtype, and `vt::Mamba2ChunkScan` validates A/D/dt_bias as f32
+  // (ops.cpp:2162-2180). Evaluated ONCE here rather than per step, and in the
+  // same `std::exp` over the same f32 input the host arm uses
+  // (nemotron_h.cpp:539-543), so the two arms feed the scan bit-identical A.
+  VT_CHECK(!w.A_log.Empty() && w.A_log.dtype == DType::kF32 &&
+               w.A_log.shape == std::vector<int64_t>{Hh},
+           "NemotronH device mamba: 'mixer.A_log' is absent or is not f32 [num_heads]");
+  std::vector<float> a_neg(static_cast<size_t>(Hh));
+  {
+    const auto* src = reinterpret_cast<const float*>(w.A_log.bytes.data());
+    for (int64_t h = 0; h < Hh; ++h) a_neg[static_cast<size_t>(h)] = -std::exp(src[h]);
+  }
+  mr.a_neg = ResidentBytes(d, a_neg.data(), a_neg.size() * sizeof(float));
+  mr.d_term = ResidentDense(d, w.D, "mixer.D", DType::kF32, {Hh});
+  mr.dt_bias = ResidentDense(d, w.dt_bias, "mixer.dt_bias", DType::kF32, {Hh});
+  mr.norm_w = ResidentDense(d, w.norm_weight, "mixer.norm.weight", adt, {I});
+  d.b.Synchronize(d.q);  // every upload has landed -> the host stagings are dead
+  mr.ready = true;
+}
+
+// ONE NemotronH Mamba2 block on the device.
+//
+// `normed` is the already-normed hidden [T,H] in `adt` on the device; the return
+// is the `out_proj` output [T,H] in `adt` on the device.
+//
+// `conv_state` / `ssm_state` are the recurrence buffers for this one request,
+// device-resident and UPDATED IN PLACE — the paged forward hands them the rows
+// `vt::GdnStateGather` already gathered and zeroed, so nothing round-trips
+// through the host. Both null is the discard arm the non-paged forward takes,
+// the exact analogue of `state == nullptr` on the host arm.
+//
+// `has_initial` is CARRIED SEPARATELY rather than derived from the pointers,
+// because the host arm distinguishes the two (nemotron_h.cpp:500-506): a caller
+// that wants the ADVANCED state back but starts from zeros passes buffers with
+// `has_initial = false`, and the conv window then reads zeros and the scan gets
+// NO `initial_states` — precisely what the host arm does. Deriving the flag from
+// pointer-ness would make those two cases indistinguishable.
+DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
+                                const NemotronHParams& params, const Tensor& normed,
+                                int64_t T, DType adt, Tensor* conv_state,
+                                Tensor* ssm_state, bool has_initial) {
+  const int64_t H = params.hidden_size;
+  const int64_t I = params.mamba_intermediate_size();
+  const int64_t Cd = params.conv_dim();
+  const int64_t P = params.mamba_head_dim;
+  const int64_t Hh = params.mamba_num_heads;
+  const int64_t G = params.n_groups;
+  const int64_t N = params.ssm_state_size;
+  const int64_t Kw = params.conv_kernel;
+  const int64_t proj = params.in_proj_out_features();
+  VT_CHECK(T > 0, "NemotronH device mamba: empty token sequence");
+  VT_CHECK(normed.rank == 2 && normed.shape[0] == T && normed.shape[1] == H,
+           "NemotronH device mamba: the normed hidden is not [T, hidden_size]");
+  VT_CHECK(Hh * P == I, "NemotronH device mamba: num_heads*head_dim != intermediate");
+  VT_CHECK(I + 2 * G * N == Cd, "NemotronH device mamba: conv_dim mismatch");
+  VT_CHECK((conv_state == nullptr) == (ssm_state == nullptr),
+           "NemotronH device mamba: the conv and SSM carries are one unit — pass "
+           "both or neither");
+  VT_CHECK(vt::OpRegistered(vt::OpId::kQuantFp8Static, d.q.device.type),
+           "NemotronH device mamba: this device has no static per-tensor fp8 "
+           "activation quant, so the FP8 W8A8 arm cannot run (issue #960)");
+
+  // `ResidentIn` locks only the slot's creation, and the build below runs
+  // outside that lock -- the same shape `NemotronHMoeBlockDevice` has for its
+  // arena. Two threads entering one layer for the first time would both build.
+  // Nothing in this tree drives one model's forward from two threads, and
+  // diverging from the arena's idiom here would be an unrelated change; stated
+  // rather than silently inherited.
+  NemotronHMambaDeviceResident& mr =
+      ResidentIn<NemotronHMambaDeviceResident>(w.device_fp8);
+  BuildNemotronHMambaDeviceResident(d, w, params, adt, mr);
+
+  // 1. the fused zxbcdt projection (mamba_mixer2.py:550), on the shared FP8
+  //    W8A8 seam: static per-tensor activation quant against `input_scale`, then
+  //    the fp8 GEMM with the folded `alpha = input_scale * weight_scale`.
+  DBuf zxbcdt = dense_fp8::MatmulFp8CutlassD<DBuf>(d, normed, mr.in_proj, adt);
+
+  // 2. split: z | xBC | dt (mamba_mixer2.py:692-696 reads xBC/dt off the tail,
+  //    :583 reads the gate off the head). The device twin of the host arm's
+  //    three `SliceCols` copies.
+  DBuf z(d, adt, {T, I});
+  DBuf xbc(d, adt, {T, Cd});
+  DBuf dt(d, adt, {T, Hh});
+  VT_CHECK(I + Cd + Hh == proj,
+           "NemotronH device mamba: the zxbcdt widths do not sum to "
+           "in_proj_out_features");
+  vt::QkvSplit(d.q, z.t(), xbc.t(), dt.t(), zxbcdt.t());
+
+  // 3. the causal depthwise conv with the silu activation
+  //    (`activation=config.mamba_hidden_act` = "silu", mamba_mixer2.py:832-846).
+  //    The conv state is f32 BY OP CONTRACT and, when the caller carries none,
+  //    is a TRANSIENT per-call buffer exactly as the host reference's is
+  //    (nemotron_h.cpp:493-498) — A2-Q1 is non-paged in its own right and reads
+  //    no persistent page it did not receive.
+  const bool carry_in = conv_state != nullptr && has_initial;
+  DBuf conv_fresh(d, DType::kF32, {1, Cd, Kw - 1});
+  if (conv_state == nullptr) conv_fresh.Zero(d);
+  Tensor cst = conv_state != nullptr ? *conv_state : conv_fresh.t();
+  const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+  const int32_t hinit[1] = {carry_in ? 1 : 0};
+  DBuf dqsl(d, DType::kI32, {2}, qsl);
+  DBuf dhinit(d, DType::kI32, {1}, hinit);
+  DBuf xbc_out(d, adt, {T, Cd});
+  {
+    Tensor cw = MakeTensor(mr.conv_w.get(), adt, d.q.device, {Cd, Kw});
+    Tensor cb = MakeTensor(mr.conv_b.get(), adt, d.q.device, {Cd});
+    vt::CausalConv1dArgs cargs;
+    cargs.silu_activation = true;
+    vt::CausalConv1dFwd(d.q, xbc_out.t(), xbc.t(), cw, mr.has_conv_bias ? &cb : nullptr,
+                        cst, dqsl.t(), dhinit.t(), cargs);
+  }
+
+  // 4. split the conv output into x | B | C (mamba_mixer2.py:535-543).
+  DBuf ssm_x(d, adt, {T, Hh, P});
+  DBuf ssm_b(d, adt, {T, G, N});
+  DBuf ssm_c(d, adt, {T, G, N});
+  {
+    Tensor xf = Reshape(ssm_x.t(), {T, I});
+    Tensor bf = Reshape(ssm_b.t(), {T, G * N});
+    Tensor cf = Reshape(ssm_c.t(), {T, G * N});
+    vt::QkvSplit(d.q, xf, bf, cf, xbc_out.t());
+  }
+
+  // 5. the SSD scan. The SSM state dtype is resolved INDEPENDENTLY of every
+  //    activation dtype above — `mamba_ssm_cache_dtype` is "float32" on this
+  //    checkpoint while the tower is bf16, and deriving it from `adt` would
+  //    halve the recurrent state invisibly to a token gate (nemotron_h.h,
+  //    NemotronHSsmCacheDType records why).
+  const DType ssm_dtype = NemotronHSsmCacheDType(params, adt);
+  if (ssm_state != nullptr) {
+    VT_CHECK(ssm_state->dtype == ssm_dtype,
+             "NemotronH device mamba: the carried SSM state is not the cache "
+             "dtype this model resolves");
+  }
+  // One sequence, chunked on the GLOBAL token position — the single-sequence
+  // case of `compute_varlen_chunk_metadata` (v1/attention/backends/mamba2_attn.py
+  // :22-88), built exactly as the host arm builds it (nemotron_h.cpp:559-571).
+  const int64_t chunk = params.chunk_size;
+  const int32_t cu_seqlens[2] = {0, static_cast<int32_t>(T)};
+  std::vector<int32_t> cu_chunk = {0};
+  std::vector<int32_t> seq_idx;
+  for (int64_t pos = 0; pos < T; pos += chunk) {
+    cu_chunk.push_back(static_cast<int32_t>(std::min(pos + chunk, T)));
+    seq_idx.push_back(0);
+  }
+  const int32_t last_chunk[1] = {static_cast<int32_t>(seq_idx.size()) - 1};
+  // These five metadata uploads are NOT followed by a `Synchronize`, unlike
+  // `UploadAs` above, and the difference is deliberate. Every one is a few
+  // hundred bytes, and a pageable H2D copy that small is staged by the driver
+  // before `cudaMemcpyAsync` returns, so the host buffers below may die at the
+  // end of this scope. That is the same reliance qwen3_5.cpp:3936 already makes
+  // for the identical GDN conv metadata. A per-layer stream synchronize here
+  // would reintroduce exactly the host/GPU lockstep this unit exists to remove.
+  DBuf dcu(d, DType::kI32, {2}, cu_seqlens);
+  DBuf dcc(d, DType::kI32, {static_cast<int64_t>(cu_chunk.size())}, cu_chunk.data());
+  DBuf dlc(d, DType::kI32, {1}, last_chunk);
+  DBuf dsi(d, DType::kI32, {static_cast<int64_t>(seq_idx.size())}, seq_idx.data());
+  DBuf y(d, adt, {T, Hh, P});
+  DBuf final_states(d, ssm_dtype, {1, Hh, P, N});
+  {
+    Tensor At = MakeTensor(mr.a_neg.get(), DType::kF32, d.q.device, {Hh});
+    Tensor Dt = MakeTensor(mr.d_term.get(), DType::kF32, d.q.device, {Hh});
+    Tensor dbt = MakeTensor(mr.dt_bias.get(), DType::kF32, d.q.device, {Hh});
+    vt::Mamba2Args args;
+    args.chunk_size = chunk;
+    // mamba_mixer2.py:888-889: dt_softplus=True, dt_limit=(0.0, +inf). `z` is
+    // NOT passed to the scan — upstream gates in the norm below (:583-585), and
+    // passing it here would apply silu(z) twice.
+    args.dt_softplus = true;
+    args.dt_min = 0.0F;
+    args.dt_max = std::numeric_limits<float>::infinity();
+    vt::Mamba2ChunkScan(d.q, y.t(), final_states.t(), ssm_x.t(), dt.t(), At, ssm_b.t(),
+                        ssm_c.t(), &Dt, /*z=*/nullptr, &dbt, carry_in ? ssm_state : nullptr,
+                        dcu.t(), dcc.t(), dlc.t(), dsi.t(), args);
+  }
+  if (ssm_state != nullptr) {
+    // The scan READS `ssm_state` as its initial state, so the final state lands
+    // in its own buffer and is copied back afterwards rather than aliasing the
+    // operand the kernel is still reading.
+    const size_t nb = static_cast<size_t>(Hh * P * N) * vt::SizeOf(ssm_dtype);
+    d.b.Copy(d.q, ssm_state->data, final_states.t().data, nb);
+  }
+
+  // 6. the silu-gated GROUP RMS norm (Mixer2RMSNormGated, mamba_mixer2.py:478-480,
+  //    :583-585). n_groups is the mixer's, NOT 1.
+  DBuf normed_gated(d, adt, {T, I});
+  {
+    Tensor yt = Reshape(y.t(), {T, I});
+    Tensor gt = z.t();
+    Tensor nw = MakeTensor(mr.norm_w.get(), adt, d.q.device, {I});
+    vt::RmsNormGatedGroupArgs args;
+    args.eps = static_cast<float>(params.layer_norm_epsilon);
+    args.n_groups = G;
+    vt::RmsNormGatedGroup(d.q, normed_gated.t(), yt, gt, &nw, args);
+  }
+
+  // 7. out_proj (mamba_mixer2.py:586), the second FP8 W8A8 projection.
+  return dense_fp8::MatmulFp8CutlassD<DBuf>(d, normed_gated.t(), mr.out_proj, adt);
+}
+
 }  // namespace
 
 // ─── the per-block equivalence seam ─────────────────────────────────────────
@@ -831,6 +1241,78 @@ std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
            "(VT_MARLIN_NVFP4 is off), so the device MoE arm is not compiled in");
   return {};
 #endif
+}
+
+std::vector<float> NemotronHMamba2MixerDeviceHostIO(const NemotronHMambaWeights& w,
+                                                    const NemotronHParams& params,
+                                                    const std::vector<float>& hidden_normed,
+                                                    int64_t num_tokens, DType act_dtype,
+                                                    Queue& dev_queue,
+                                                    NemotronHMambaState* state) {
+  const int64_t T = num_tokens;
+  const int64_t H = params.hidden_size;
+  const int64_t Cd = params.conv_dim();
+  const int64_t Kw = params.conv_kernel;
+  const int64_t Hh = params.mamba_num_heads;
+  const int64_t P = params.mamba_head_dim;
+  const int64_t N = params.ssm_state_size;
+  VT_CHECK(T > 0, "NemotronH device mamba: empty token sequence");
+  VT_CHECK(static_cast<int64_t>(hidden_normed.size()) == T * H,
+           "NemotronH device mamba: hidden size mismatch");
+  VT_CHECK(act_dtype == DType::kBF16 || act_dtype == DType::kF32,
+           "NemotronH device mamba: the model dtype must be bf16 or f32");
+  VT_CHECK(dev_queue.device.type != vt::DeviceType::kCPU,
+           "NemotronH device mamba: this is the DEVICE arm and requires a "
+           "non-CPU queue; the host reference is NemotronHMamba2Mixer");
+  VT_CHECK(MambaIsFp8(w),
+           "NemotronH device mamba: this layer's projections are not FP8 W8A8 "
+           "static, which is the only form A2-Q1's device arm is built from");
+
+  Dev d{vt::GetBackend(dev_queue.device.type), dev_queue};
+  // Round the input through `act_dtype` on the way in, exactly as the host arm
+  // does with `PackF32` (nemotron_h.cpp:466). Feeding the device f32 values the
+  // host arm would have rounded first is the deviation that makes an
+  // equivalence gate quietly meaningless.
+  DBuf x = UploadAs(d, hidden_normed, act_dtype, {T, H});
+
+  const DType ssm_dtype = NemotronHSsmCacheDType(params, act_dtype);
+  const bool carry = state != nullptr && state->has_initial;
+  // Allocated whenever the caller wants the advanced state back, carrying or
+  // not — the three cases the host arm distinguishes (nemotron_h.cpp:500-506,
+  // :600-606) are `state == nullptr` (discard), `state` fresh (start from zeros,
+  // report the advance) and `state` carrying.
+  DBuf conv(d, DType::kF32, {1, Cd, Kw - 1});
+  DBuf ssm(d, ssm_dtype, {1, Hh, P, N});
+  if (carry) {
+    VT_CHECK(static_cast<int64_t>(state->conv.size()) == Cd * (Kw - 1),
+             "NemotronH device mamba: carried conv state has the wrong extent");
+    VT_CHECK(state->ssm.dtype == ssm_dtype && state->ssm.Numel() == Hh * P * N,
+             "NemotronH device mamba: carried SSM state has the wrong dtype or extent");
+    conv = UploadAs(d, state->conv, DType::kF32, {1, Cd, Kw - 1});
+    DBuf up(d, ssm_dtype, {1, Hh, P, N}, state->ssm.bytes.data());
+    d.b.Synchronize(d.q);
+    ssm = std::move(up);
+  } else if (state != nullptr) {
+    conv.Zero(d);
+    ssm.Zero(d);
+  }
+  Tensor ct = conv.t();
+  Tensor st = ssm.t();
+  const bool keep = state != nullptr;
+  DBuf out = NemotronHMamba2MixerDevice(d, w, params, x.t(), T, act_dtype,
+                                        keep ? &ct : nullptr, keep ? &st : nullptr, carry);
+  if (state != nullptr) {
+    // The advanced state, reported exactly as the host arm reports it
+    // (nemotron_h.cpp:600-606), so a multi-leg gate can compare the carry too.
+    state->conv = DownloadF32(d, conv, DType::kF32, Cd * (Kw - 1));
+    std::vector<uint8_t> sb(static_cast<size_t>(Hh * P * N) * vt::SizeOf(ssm_dtype));
+    ssm.Download(d, sb.data());
+    state->ssm.dtype = ssm_dtype;
+    state->ssm.shape = {Hh, P, N};
+    state->ssm.bytes = std::move(sb);
+    state->has_initial = true;
+  }
+  return DownloadF32(d, out, act_dtype, T * H);
 }
 
 // ─── the hybrid forward ─────────────────────────────────────────────────────
@@ -935,9 +1417,20 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
     const bool moe_on_device =
         lw.block == NemotronHBlock::kMoe && adt == DType::kBF16 && MoeIsNvfp4(lw.moe) &&
         vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
+    // A2-Q1: a Mamba2 layer whose two projections are FP8 W8A8 static runs on
+    // the DEVICE now, so it needs no host bounce. Same shape of selection as the
+    // MoE one above and for the same reason: every term is a runtime query
+    // (`MambaIsFp8` names only NemotronHWeightForm, `vt::OpRegistered` IS the
+    // op table's own answer), never a preprocessor guard, so a build or a device
+    // without the fp8 pair resolves false and keeps the host arm.
+    const bool mamba_on_device =
+        lw.block == NemotronHBlock::kMamba && MambaIsFp8(lw.mamba) &&
+        NemotronHDeviceMambaEnabled() &&
+        vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type) &&
+        vt::OpRegistered(vt::OpId::kQuantFp8Static, d.q.device.type);
     std::vector<float> nvec;
     const bool needs_host =
-        lw.block != NemotronHBlock::kAttention && !moe_on_device;
+        lw.block != NemotronHBlock::kAttention && !moe_on_device && !mamba_on_device;
     if (needs_host || (trace != nullptr && trace->capture)) {
       nvec = DownloadF32(d, normed, adt, T * H);
     }
@@ -951,6 +1444,16 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
     std::vector<float> mvec;
     if (lw.block == NemotronHBlock::kAttention) {
       carry = NemotronHAttnBlock(d, lw.attn, params, normed.t(), T, adt);
+      if (trace != nullptr && trace->capture) {
+        mvec = DownloadF32(d, carry, adt, T * H);
+      }
+    } else if (mamba_on_device) {
+      // NON-PAGED, exactly as this whole forward is: the recurrence is discarded
+      // on return, which is what the host reference does when it is handed no
+      // state (nemotron_h.cpp:500-506). A2-P's paged forward below is the arm
+      // that carries it.
+      carry = NemotronHMamba2MixerDevice(d, lw.mamba, params, normed.t(), T, adt,
+                                         nullptr, nullptr, false);
       if (trace != nullptr && trace->capture) {
         mvec = DownloadF32(d, carry, adt, T * H);
       }
@@ -1609,7 +2112,23 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
         lw.block == NemotronHBlock::kMoe && adt == DType::kBF16 && MoeIsNvfp4(lw.moe) &&
         NemotronHDeviceMoeEnabled() &&
         vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
-    const bool needs_host = lw.block != NemotronHBlock::kAttention && !moe_on_device;
+    // A2-Q1 (#810): the 23 Mamba2 layers on the FP8 W8A8 seam. THE `ssm_dtype ==
+    // f32` TERM IS NOT DECORATION. `vt::GdnStateGather` widens the page into an
+    // f32 working buffer by op contract, and the HOST arm below then NARROWS
+    // that f32 back to `ssm_dtype` before the mixer sees it
+    // (`NemotronHOwned::FromF32`, :below). On a checkpoint whose
+    // `mamba_ssm_cache_dtype` is not f32 the two arms would therefore round
+    // differently, and the per-block numeric gate would be comparing two
+    // different computations. The released checkpoint resolves f32, so the
+    // device arm runs; anything else keeps the host bounce rather than silently
+    // dropping a rounding step.
+    const bool mamba_on_device =
+        lw.block == NemotronHBlock::kMamba && MambaIsFp8(lw.mamba) &&
+        NemotronHDeviceMambaEnabled() && ssm_dtype == DType::kF32 &&
+        vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type) &&
+        vt::OpRegistered(vt::OpId::kQuantFp8Static, d.q.device.type);
+    const bool needs_host =
+        lw.block != NemotronHBlock::kAttention && !moe_on_device && !mamba_on_device;
     std::vector<float> nvec;
     if (needs_host || (trace != nullptr && trace->capture)) {
       nvec = DownloadF32(d, normed, adt, T * H);
@@ -1627,6 +2146,61 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
       carry = NemotronHMoeBlockDevice(d, lw.moe, params, normed.t(), T);
       if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
 #endif
+    } else if (mamba_on_device) {
+      // ── A2-Q1: the CARRY, without leaving the device. ──
+      //
+      // The gather/scatter pair and the `has_initial = true` reasoning are A2-P's
+      // and are UNCHANGED (see the block comment above `NemotronHRecurrentIo`).
+      // What changes is everything between them: the two D2H downloads, the host
+      // mixer with its per-call fp8 dequant, and the two H2D uploads are gone,
+      // and the gathered rows are handed straight to the device mixer, which
+      // advances them IN PLACE in the same buffers the scatter then writes back.
+      const GdnStateCache& cache = input.gdn_state[mamba_i];
+      NemotronHRecurrentIo io = GatherNemotronHState(d, cache, params, R, sdi);
+      const int64_t conv_row = params.conv_dim() * (params.conv_kernel - 1);
+      const int64_t ssm_row =
+          params.mamba_num_heads * params.mamba_head_dim * params.ssm_state_size;
+      DBuf mixed(d, adt, {T, H});
+      // Zeroed first, exactly as the host arm's `mvec.assign(T * H, 0.0F)`
+      // below does, so a token no request's query range covers reads as zero
+      // rather than as whatever the scratch pool last held there.
+      mixed.Zero(d);
+      const size_t esz = vt::SizeOf(adt);
+      for (int64_t r = 0; r < R; ++r) {
+        // The RECURRENT half's own query offsets, read exactly as the host arm
+        // below reads them, so a mixed batch stays correct when A2-B lifts the
+        // request count.
+        const std::vector<int32_t>& qsl = *input.gdn_meta.non_spec_query_start_loc;
+        const int64_t t0 = qsl[static_cast<size_t>(r)];
+        const int64_t t1 = qsl[static_cast<size_t>(r + 1)];
+        VT_CHECK(t1 > t0 && t1 <= T,
+                 "NemotronH paged forward: a request's query range is empty or "
+                 "runs past the step's tokens");
+        Tensor rows = MakeTensor(static_cast<char*>(normed.t().data) +
+                                     static_cast<size_t>(t0 * H) * esz,
+                                 adt, d.q.device, {t1 - t0, H});
+        Tensor cr = MakeTensor(static_cast<char*>(io.conv.t().data) +
+                                   static_cast<size_t>(r * conv_row) * sizeof(float),
+                               DType::kF32, d.q.device,
+                               {1, params.conv_dim(), params.conv_kernel - 1});
+        Tensor sr = MakeTensor(static_cast<char*>(io.ssm.t().data) +
+                                   static_cast<size_t>(r * ssm_row) * sizeof(float),
+                               DType::kF32, d.q.device,
+                               {1, params.mamba_num_heads, params.mamba_head_dim,
+                                params.ssm_state_size});
+        // `has_initial = true` in EVERY case, over a row the gather has already
+        // zeroed when the mask said fresh — A2-P's property, restated here
+        // because this arm is the one that now consumes it.
+        DBuf got = NemotronHMamba2MixerDevice(d, lw.mamba, params, rows, t1 - t0, adt,
+                                              &cr, &sr, /*has_initial=*/true);
+        d.b.Copy(d.q, static_cast<char*>(mixed.t().data) +
+                          static_cast<size_t>(t0 * H) * esz,
+                 got.t().data, static_cast<size_t>((t1 - t0) * H) * esz);
+      }
+      ScatterNemotronHState(d, cache, io, sdi);
+      ++mamba_i;
+      carry = std::move(mixed);
+      if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
     } else if (lw.block == NemotronHBlock::kMamba) {
       // ── the CARRY. This is the unit. ──
       const GdnStateCache& cache = input.gdn_state[mamba_i];

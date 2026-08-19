@@ -608,9 +608,10 @@ The two Qwen3.5 cases needed a cache pool the other three did not:
 `CudaGdnCachePool` allocates the RECURRENT ssm and conv state on device beside
 the paged KV, and each arm gets its own — the GDN recurrence advances its state
 every step, so two arms sharing one state would step each other's recurrence and
-the agreement would measure nothing. **Five of the six migrated drivers are now
-covered by measurement**; W2's `Qwen3DenseDecodeGraph` still is not, and still
-shares the seam by argument rather than by measurement.
+the agreement would measure nothing. **Five of the NINE migrated drivers are
+covered by measurement**; W2's `Qwen3DenseDecodeGraph` and W5's three
+single-shape drivers are not, and share the seam by argument rather than by
+measurement.
 
 **The W3 run this extends, kept because it is the earlier evidence** (W3, #1291,
 2026-08-19, the same `thor:gpu0`) — NVIDIA Thor, sm_110, driver 595.78, nvcc
@@ -1032,10 +1033,101 @@ slot 0 captures on step THREE.
 **The async decline STANDS, and the reason is sharper than "the fix is not built
 yet".** See `## Owed`.
 
-**W5, migrate the three single-shape drivers.** DeepSeek V4, Laguna and DFlash.
-`laguna.cpp:2116-2119` already carries the note that its capture class is waiting
-for exactly this seam, and it names DeepSeek V4's driver as the sibling that moves
-with it.
+**W5, migrate the three single-shape drivers. DONE 2026-08-19,
+[#1335](https://github.com/mudler/vllm.cpp/issues/1335).** DeepSeek V4, Laguna
+and DFlash. `laguna.cpp:2116-2119` carried the note that its capture class was
+waiting for exactly this seam and named DeepSeek V4's driver as the sibling that
+moves with it; both moved in this stage and the note now says what is actually
+left device-coupled, which is the captured CHAIN and not the capture.
+
+Each driver's `Step` opens a `vt::GraphCaptureScope` over its own
+`vt::BreakableGraph` in `kFull` and replays through `BreakableGraph::Replay`.
+What is gone from all three: the hand-rolled `BeginCapture`/`EndCaptureGraph`
+pair, the raw `void*` handle, two hand-written destructors that released it, and
+DFlash's private `try`/drain. **NINE OF NINE DRIVERS ARE ON THE SEAM**, and
+`grep -rnE '\.(BeginCapture|EndCaptureGraph|ReplayGraph|DestroyGraph)\s*\('`
+over `src/vllm/`, with comment lines excluded, returns NOTHING — every surviving
+textual hit is prose about what was removed.
+
+The three per-model rollback switches STAY (`VT_V4_DECODE_GRAPH`,
+`VT_DFLASH_GRAPH`, `VT_LAGUNA_DECODE_GRAPH`): each is a same-binary A/B lever for
+exactly one driver, not a copy of the shared one. What changes is that
+`VLLM_CPP_CUDAGRAPH` reaches all three for the first time, through
+`vt::GraphCaptureEnabled()` inside the scope. `gstate`/`g_state` stays too, and
+it is not a duplicate of `captured()`: it is each driver's cold/warm/captured
+ladder, and the seam has no notion of the eager warm-run that grows the pool so
+the capture that follows can allocate nothing.
+
+**D10 IS DISCHARGED HERE, and W5 is the first stage where it could be.**
+`GraphCaptureScope` owns the set of side queues forked since the current segment
+opened and joins every outstanding one before `Backend::EndCaptureGraph` — the
+port of `_end_current_segment` (`:353-361`) plus the `wait_stream` hook
+(`:101-153`) whose only purpose is to populate that set. W1 registered its break
+point on a model that forks no auxiliary queue; W2, W3 and W4 all opened `kFull`,
+which has ONE segment and therefore no segment CLOSE inside a fork window for the
+rule to govern, so the machinery would have landed unexercised. W5 owns the only
+driver in the tree whose fork is inside the captured region by construction
+(`laguna.cpp:2572-2576` fork, `:2612` join), and that driver is the rule's
+PRODUCTION CALLER through `vt::GraphNoteFork` and `vt::GraphNoteJoin`.
+
+We need no monkey-patch to populate the set, because our fork and join are
+explicit `Backend::RecordEvent` and `Backend::QueueWaitEvent` calls rather than
+an implicit torch API — the model TELLS the scope. The retirement call is not
+politeness: without it the scope would issue a REDUNDANT second join before every
+segment close, which is exactly what the gate's CONTROL arm pins. Both hooks are
+no-ops outside an active scope and make ZERO backend calls there, which is the
+same pass-through guarantee `GraphBreak` gives.
+
+**The rule is gated as a COUNTER and an ORDER, because W3 proved prose is not a
+gate.** W3 measured a mode guard that stayed green at 226/226 under the exact
+mutation it named. So `vt::GraphBreakStats` gains `forks_tracked` and
+`forks_auto_joined`, and the load-bearing one is the second: it is 0 for a model
+that joins its own fork inside the segment and non-zero exactly when the seam did
+the work. And the claim is an ORDER rather than an event, because closing a
+capture with an unjoined fork FAILS at `cudaStreamEndCapture` — so both ends are
+asserted out of ONE backend trace
+(`Begin RecordEvent QueueWaitEvent EndCaptureGraph Begin EndCaptureGraph`), for
+the same reason W1 had to move break markers into the backend's own log. Test 15
+of `## Tests to port` carries five arms: the rule, the CONTROL where the model
+joins first and the scope must do nothing, `kFull` (the arm every migrated driver
+actually takes), the inert scope, and re-registering one queue. Two mutations,
+both compiled clean: deleting `JoinOutstandingForks()` reds ONLY the new case on
+5 assertions at 29 of 30 still passing, and making `NoteJoin` fail to retire the
+entry reds it on 8 — so neither the rule nor its control is vacuous. Green after:
+30 cases, 265 assertions, exit 0.
+
+**ONE of the three drivers is gateable without a GPU, and the reason is each
+driver's own admission predicate rather than a choice.** The DFlash draft graph
+admits on `VT_DFLASH_GRAPH` plus `Backend::SupportsGraphCapture()` plus
+`Platform::support_static_graph_mode()` — it names neither a device type nor a
+kernel registry — so the shared harness's two swapped registries reach it.
+DeepSeek V4's `CanRunResidentDecode` (`deepseek_v4.cpp:1481-1487`) refuses a CPU
+queue outright and refuses again unless `V4DeviceKernelsAvailable()`, the four V4
+kernel families registered under `kCUDA` by `cuda_deepseek_v4.cu`. Laguna's whole
+capture class is behind `#ifdef VT_MARLIN_NVFP4`, which CMake sets only for a
+CUDA build on a marlin-nvfp4 architecture (`sm_12xa` and, since the Thor
+bring-up, `sm_110`), so on a box with no `nvcc` the migrated region is not in any
+reachable binary at all.
+
+`tests/vllm/models/test_qwen3_dflash_decode_graph_seam.cpp` is therefore the
+stage's driver gate. RED FIRST against the unmigrated driver: 3 cases, 0 passed,
+16 assertions, 7 failed, exit 1, on `segments_captured`, `full_scopes` and
+`replays`. GREEN after: 3 cases, 18 assertions, exit 0. G2's mutation — replacing
+the scope and `Replay` with the pre-W5 raw pair, compiled clean at 79 insertions
+and 29 deletions — reds ONLY that file (7 assertions) and leaves
+`test_breakable_graph` 265, `test_qwen3_decode_graph_seam` 231,
+`test_qwen3_moe_decode_graph_seam` 228, `test_voxtral_decode_graph_seam` 230,
+`test_deepseek_v2_decode_graph_seam` 230, `test_qwen3_5_decode_graph_seam` 129
+and the driver's OWN `test_dflash_propose` 31 all GREEN. That last one is the
+whole argument restated as a measurement: a driver's bit-exactness suite cannot
+see which capture machinery ran. G4 holds in the same file at 24 values, 0
+differing, against the driver's own eager paged arm.
+
+**What W5 does NOT deliver, named rather than implied.** G1 for all three
+drivers, and G2 for DeepSeek V4 and Laguna, are OWED on hardware for the
+predicate and build-flag reasons above. G5's ROCm and Tenstorrent arms stay
+BLOCKED on hardware the fleet does not carry. `## Owed` carries each with its
+resource.
 
 **W6, close the coverage gap the row exists for.** Only after W1 through W5 does
 the predicate at `runner.cpp:1341` move from `pure_decode` to "eligible except at
@@ -1197,12 +1289,23 @@ point registered inside an unjoined fork window without this rule fails at
 
 `ACTIVE`. W0 (spike), W1 (the seam, its ported unit gate, and one registered
 break point), W2 (`Qwen3DenseDecodeGraph`), W3 (`Qwen3MoeDecodeGraph`,
-`VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`) and W4 (the persistent device
-input path as `vt::PersistentStepInput`, plus `Qwen3_5DecodeGraph` and
-`Qwen3_5DenseDecodeGraph`) have landed. **Six of the nine drivers are on the
-seam**, and one `std::getenv("VLLM_CPP_CUDAGRAPH")` remains in `src/`, the
-seam's own. W5 and W6 remain, and `## Work breakdown` states each. Owner:
-`.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W4.md`.
+`VoxtralDecodeGraph`, `DeepseekV2DecodeGraph`), W4 (the persistent device input
+path as `vt::PersistentStepInput`, plus `Qwen3_5DecodeGraph` and
+`Qwen3_5DenseDecodeGraph`) and W5 (the three single-shape drivers, plus D10) have
+landed. **NINE OF THE NINE DRIVERS ARE ON THE SEAM**, the migration is complete,
+and one `std::getenv("VLLM_CPP_CUDAGRAPH")` remains in `src/` — the seam's own.
+`grep -rnE '\.(BeginCapture|EndCaptureGraph|ReplayGraph|DestroyGraph)\s*\('`
+over `src/vllm/`, with comment lines excluded, returns NOTHING. **Only W6
+remains**, and `## Work breakdown` states it. Owner:
+`.agents/claims/CLAIM-ENG-CUDAGRAPH-BREAK-W5.md`.
+
+**D10, the auxiliary-stream auto-join, is discharged and is REACHED.** Every
+prior stage opened `kFull`, which has one segment and so no between-segments
+window, so the rule could not be exercised and untested machinery was not landed
+for it. W5 owns `laguna.cpp`, the only driver whose fork is inside the captured
+region by construction, and that driver is the production caller. Gated as a
+counter and an ORDER out of one backend trace, with two mutations proving neither
+the rule nor its control arm is vacuous.
 
 **W4 corrected a premise this spec had asserted three times.** The decode graph
 carries NO token ids to the device in any driver, `StepDevInputs` included, so
@@ -1214,13 +1317,14 @@ Every migrated step opens its scope in `kFull`, mirroring vLLM's decode arm. The
 PIECEWISE arm still has no production driver and `## Owed` names what has to be
 true before one exists.
 
-**G1 is MET for five of the six migrated drivers and is no longer owed.**
+**G1 is MET for five of the NINE migrated drivers and is owed for four.**
 Bit-exactness against the eager arm over the capture step plus THREE consecutive
 replays, on `thor:gpu0` through an `rc` lease: **5 cases, 2066 assertions, 0
 differing**, the two Qwen3.5 drivers added by W4. W2's `Qwen3DenseDecodeGraph`
 is still covered by argument rather than by measurement, which `## Gates` G1
-says out loud. This is the only gate in this row a CPU harness could never have
-answered.
+says out loud, and W5's three single-shape drivers join it there for reasons
+`## Owed` names per driver. This is the only gate in this row a CPU harness could
+never have answered.
 
 W1's exit criterion — that CUDA permits `cudaStreamEndCapture` followed by
 `cudaStreamBeginCapture` mid-forward on our stream configuration — is
@@ -1237,18 +1341,24 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   `tests/vllm/models/test_qwen3_decode_graph_seam.cpp` holds it through the
   seam's own counters. This was the staged slice AGENTS.md allows; it is closed
   rather than carried.
-- **The auxiliary-stream auto-join before every segment close** (D10, the port of
-  `breakable_cuda_graph.py:353-361`). W1 registers its break point on a model
-  that forks no auxiliary queue, so the rule is not exercised and untested
-  machinery was not landed for it. A break point placed inside an unjoined fork
-  window today fails LOUDLY at `EndCaptureGraph`, which is the one failure mode
-  in this spec that is not silent. **W4 migrated `qwen3_5.cpp` and did NOT
-  discharge this**, and the reason is the mode rather than the effort: its scope
-  is `kFull`, so there is exactly one segment and no segment CLOSE inside the
-  fork window at `:6254-6255,6384` for the rule to govern, and the machinery
-  would have landed unexercised. Owners: **W5** (`laguna.cpp:2572-2576,2612`,
-  whose fork is inside the captured region by construction) and the first stage
-  that captures PIECEWISE.
+- ~~**The auxiliary-stream auto-join before every segment close** (D10, the port
+  of `breakable_cuda_graph.py:353-361`).~~ RETIRED by **W5**
+  ([#1335](https://github.com/mudler/vllm.cpp/issues/1335)).
+  `GraphCaptureScope` owns the outstanding-fork set and joins every entry before
+  `Backend::EndCaptureGraph`; `vt::GraphNoteFork` and `vt::GraphNoteJoin` are the
+  registration, and `laguna.cpp:2572-2576,2612` — the only fork inside a captured
+  region by construction — is the production caller. W1 through W4 could not
+  discharge it and the reason was the MODE rather than the effort: every stage
+  before this one opened `kFull`, which has one segment and therefore no segment
+  CLOSE inside a fork window for the rule to govern, so landing the machinery
+  would have landed it unexercised. Gated as test 15 of `## Tests to port` with
+  five arms and proven non-vacuous by two mutations. **One residual, and it is
+  named rather than folded in:** the seam joins a fork the model REGISTERED. A
+  model that forks without calling `GraphNoteFork` is exactly as exposed as
+  before, and no checker can see that, because the fork is an ordinary pair of
+  backend calls. Laguna is the only such site today; the next one is the
+  obligation of whoever adds it, and the `SupportsAuxStream()` capability is
+  where a reader lands.
 - ~~**The capture-failure drain as a GATED case** (test 13).~~ DELIVERED in W1,
   and the record it replaces was wrong twice over. The destructor did NOT already
   behave: its `catch` guarded a throwing `EndCaptureGraph` alone, and an
@@ -1265,10 +1375,51 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   (`rc devices`) carries no ROCm device and no Tenstorrent device, so this is
   BLOCKED on hardware rather than unattempted. What W3 can say is what it
   measured: the seam's CUDA arm now runs on TWO architectures rather than one,
-  sm_110 here and sm_121a on GB10 for the W1 exit criterion. Owner: **W5**,
-  which migrates the driver family whose Tenstorrent recapture path
-  (`qwen3.cpp`'s `VT_TT_RECAPTURE_EVERY` branch) is the only place a ttnn mesh
-  trace meets this seam today.
+  sm_110 here and sm_121a on GB10 for the W1 exit criterion.
+  **W5 did NOT discharge it either, and the fleet answer is unchanged**:
+  `rc devices` lists `dgx:gpu0`, `orin:gpu0` and `thor:gpu0`, all NVIDIA. This is
+  the second stage to inherit the item and find the same wall, which is the
+  signal that it is not a stage-sized problem: it needs a ROCm or Tenstorrent
+  device on the fleet, and no ordering of the remaining work produces one. Owner:
+  row **`ENG-CUDAGRAPH-BREAK`**, discharged by whichever stage first has the
+  hardware. The Tenstorrent half additionally has a named entry point when that
+  day comes — `qwen3.cpp`'s `VT_TT_RECAPTURE_EVERY` branch is the only place a
+  ttnn mesh trace meets this seam.
+
+- **G1 and G2 for the three SINGLE-SHAPE drivers** (W5,
+  [#1335](https://github.com/mudler/vllm.cpp/issues/1335)). Each has its own
+  reason and none of them is effort, so they are listed per driver rather than as
+  one line:
+
+  1. **DFlash** has G2 and G4 on CPU
+     (`tests/vllm/models/test_qwen3_dflash_decode_graph_seam.cpp`, red-first,
+     3 cases / 18 assertions) and owes only G1, which every CPU-gated driver in
+     this row owes for the same reason: a CPU "replay" recomputes nothing, so a
+     CPU harness cannot hold that a REPLAYED segment reproduces the eager
+     forward.
+  2. **DeepSeek V4** owes G1 AND G2. `CanRunResidentDecode`
+     (`deepseek_v4.cpp:1481-1487`) refuses `device.type == kCPU` outright and
+     refuses again unless `V4DeviceKernelsAvailable()` — the four V4 kernel
+     families registered under `kCUDA` by `cuda_deepseek_v4.cu`. The shared
+     harness swaps a backend and a platform; it cannot manufacture a device type,
+     a CUDA op registry and a whole vt kernel layer, and a stub that did would
+     measure the stub. The migration is covered by CONSTRUCTION — same seam, same
+     mode, same call shape as the seven gated drivers — which is an argument and
+     not a gate, and this entry exists so nobody reads it as one.
+  3. **Laguna** owes G1 and G2 for a build reason rather than a predicate one.
+     `LagunaGraph` is inside `#ifdef VT_MARLIN_NVFP4`, which CMake sets only for
+     a CUDA build on a marlin-nvfp4 architecture, so on a host with no `nvcc` the
+     migrated region is in no reachable binary. `laguna.cpp` compiling clean in
+     the CPU configuration verifies the FILE and not the region, and
+     `test_laguna_scaffold` (167 assertions) and `test_laguna_nvfp4_loader` (63)
+     staying green says nothing about the capture at all.
+
+  What settles all three: a CUDA build on a marlin-nvfp4 architecture — the same
+  `thor:gpu0` (sm_110) shape W3 and W4 used — which compiles the Laguna and V4
+  regions and can extend
+  `tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` with a DFlash case over
+  the synthetic draft model this stage's CPU gate already builds. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**, the stage that gets that window.
 - ~~**G1, bit-exactness against eager on a real GPU over MORE than one
   replay.**~~ RETIRED by **W3**
   ([#1291](https://github.com/mudler/vllm.cpp/issues/1291)).

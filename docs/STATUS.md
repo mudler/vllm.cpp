@@ -239,6 +239,26 @@ uploaded. So the classic-dense decline that costs a shipped model its decode
 graph under asynchronous serving is not one refactor away from removable. It
 stands, and the work it needs is now named rather than assigned.
 
+W5 (2026-08-19, #1335) migrates the last three, so ALL NINE drivers are on the
+seam and the migration is complete. These are the single-shape drivers: the
+DFlash draft graph, the DeepSeek V4 decode graph, and the Laguna decode graph,
+whose own source note asked for this seam by name. No hand-rolled capture call
+survives anywhere under `src/vllm/`.
+
+W5 also gives the seam the auxiliary-stream rule. Closing a graph segment while
+a side stream forked inside it is still recording is illegal, so the capture
+scope now tracks the forks opened since the segment began and joins any that are
+still outstanding before it closes. Every earlier stage captured in FULL mode,
+which has one segment and therefore no window for the rule to govern, so this is
+the first stage that could exercise it; the Laguna decode graph, whose fork sits
+inside the captured region by construction, is what reaches it.
+
+Bit-exactness against a replayed capture is still owed for four of the nine
+drivers, and for two of them so is the routing gate. The reasons are per driver
+and are recorded: DeepSeek V4 refuses a CPU queue before it reaches its capture,
+and Laguna's capture class only exists in a CUDA build with the Marlin NVFP4
+kernels. The DFlash driver's own gate landed red first.
+
 W3 also closed a gate that could not fail. The mode a driver captures in was
 unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole
 driver gate green. The seam now counts the mode, and that flip reds each gate.

@@ -57,6 +57,8 @@
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v2.h"
+#include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_moe.h"
 #include "vllm/model_executor/models/voxtral.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -440,6 +442,230 @@ DeepseekV2Weights DsWeights(const DeepseekV2Params& p) {
 
 const std::vector<int32_t> kTokens = {11, 12, 13, 14, 15};
 
+
+// ---- Qwen3.5 (W4): the GDN-hybrid drivers ---------------------------------
+//
+// These two carry the persistent device input path, the auxiliary taps and the
+// speculative-decode predicate, so they are the richest replay surface in the
+// row and the one where a stale segment input would be least visible from a
+// token count alone.
+
+// Device-resident KV plus RECURRENT state. The GDN kernels read and write the
+// ssm/conv state ON DEVICE across steps, so a host vector is not a cache here
+// and — more to the point for G1 — each arm must own its own, or one arm's
+// recurrence would advance on the other's writes and the agreement would mean
+// nothing.
+struct CudaGdnCachePool {
+  vt::Backend& b;
+  std::vector<void*> owned;
+  std::vector<PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  CudaGdnCachePool(vt::Backend& backend, vt::Queue& q, const HfConfig& c,
+                   int64_t num_blocks, int64_t block_size)
+      : b(backend) {
+    const vt::Device dev{vt::DeviceType::kCUDA, 0};
+    const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+    const int64_t Hv = c.linear_num_value_heads, Dv = c.linear_value_head_dim,
+                  Dk = c.linear_key_head_dim, Kw = c.linear_conv_kernel_dim;
+    const int64_t key_dim = c.linear_num_key_heads * Dk, value_dim = Hv * Dv;
+    const int64_t conv_dim = 2 * key_dim + value_dim;
+    const auto alloc = [&](size_t bytes) {
+      void* d = b.Alloc(bytes);
+      b.Memset(q, d, 0, bytes);
+      owned.push_back(d);
+      return d;
+    };
+    for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+      if (c.layer_types[static_cast<size_t>(l)] == "linear_attention") {
+        vllm::GdnStateCache gs;
+        gs.ssm_state = vt::Tensor::Contiguous(
+            alloc(static_cast<size_t>(num_blocks * Hv * Dv * Dk) * sizeof(float)),
+            DType::kF32, dev, {num_blocks, Hv, Dv, Dk});
+        gs.conv_state = vt::Tensor::Contiguous(
+            alloc(static_cast<size_t>(num_blocks * conv_dim * (Kw - 1)) * sizeof(float)),
+            DType::kF32, dev, {num_blocks, conv_dim, Kw - 1});
+        gdn_state.push_back(gs);
+      } else {
+        PagedKvCache kv;
+        kv.data = alloc(static_cast<size_t>(num_blocks * 2 * block_size * Hkv * Dh) *
+                        vt::SizeOf(DType::kBF16));
+        kv.dtype = DType::kBF16;
+        kv.num_blocks = num_blocks;
+        kv.block_size = block_size;
+        kv.num_kv_heads = Hkv;
+        kv.head_size = Dh;
+        attn_kv.push_back(kv);
+      }
+    }
+    b.Synchronize(q);
+  }
+  ~CudaGdnCachePool() {
+    for (void* p : owned) b.Free(p);
+  }
+};
+
+vllm::v1::GDNAttentionMetadata DecodeGdnMeta() {
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 0;
+  gm.num_prefill_tokens = 0;
+  gm.num_decodes = 1;
+  gm.num_decode_tokens = 1;
+  gm.num_actual_tokens = 1;
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1};
+  return gm;
+}
+
+OwnedTensor MakeF32(const std::vector<int64_t>& shape, uint32_t seed) {
+  OwnedTensor o;
+  o.dtype = DType::kF32;
+  o.rank = static_cast<int>(shape.size());
+  int64_t numel = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[static_cast<size_t>(i)];
+    numel *= shape[static_cast<size_t>(i)];
+  }
+  o.bytes.resize(static_cast<size_t>(numel) * sizeof(float));
+  auto* p = reinterpret_cast<float*>(o.bytes.data());
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-0.08f, 0.08f);
+  for (int64_t i = 0; i < numel; ++i) p[i] = dist(rng);
+  return o;
+}
+
+HfConfig Qwen35Base() {
+  HfConfig c;
+  c.hidden_size = 32;
+  c.num_hidden_layers = 4;  // [LA, LA, LA, FA]
+  c.vocab_size = 40;
+  c.head_dim = 8;
+  c.layer_types = {"linear_attention", "linear_attention", "linear_attention",
+                   "full_attention"};
+  c.linear_num_key_heads = 2;
+  c.linear_key_head_dim = 8;
+  c.linear_value_head_dim = 8;
+  c.linear_conv_kernel_dim = 4;
+  c.rope_theta = 10000.0;
+  c.rotary_dim = 4;
+  c.rms_norm_eps = 1e-6;
+  c.max_position_embeddings = 64;
+  return c;
+}
+
+HfConfig Qwen35MoeConfig() {
+  HfConfig c = Qwen35Base();
+  c.model_type = "qwen3_5_moe_text";
+  c.architectures = {"Qwen3_5MoeForConditionalGeneration"};
+  c.num_attention_heads = 4;
+  c.num_key_value_heads = 2;
+  c.num_experts = 4;
+  c.num_experts_per_tok = 2;
+  c.moe_intermediate_size = 16;
+  c.shared_expert_intermediate_size = 16;
+  c.linear_num_value_heads = 4;
+  return c;
+}
+
+vllm::MoeBlockWeights Qwen35Moe(const HfConfig& c, uint32_t s) {
+  vllm::MoeBlockWeights m;
+  const int64_t H = c.hidden_size, E = c.num_experts, I = c.moe_intermediate_size,
+                Is = c.shared_expert_intermediate_size;
+  m.router_gate = MakeBf16({H, E}, false, s + 1);
+  m.shared_gate = MakeBf16({H, 1}, false, s + 2);
+  for (int64_t e = 0; e < E; ++e) {
+    m.expert_gate.push_back(MakeBf16({H, I}, false, s + 100 + static_cast<uint32_t>(e)));
+    m.expert_up.push_back(MakeBf16({H, I}, false, s + 200 + static_cast<uint32_t>(e)));
+    m.expert_down.push_back(MakeBf16({I, H}, false, s + 300 + static_cast<uint32_t>(e)));
+  }
+  m.shared_gate_proj = MakeBf16({H, Is}, false, s + 3);
+  m.shared_up_proj = MakeBf16({H, Is}, false, s + 4);
+  m.shared_down_proj = MakeBf16({Is, H}, false, s + 5);
+  return m;
+}
+
+// `Gdn` and `Attn` are filled identically for the MoE and dense arms, so they
+// are one function each over the layer-weight type.
+template <class LayerW>
+void FillQwen35Layer(LayerW& lw, const HfConfig& c, bool linear, uint32_t s) {
+  const int64_t H = c.hidden_size;
+  const int64_t Hq = c.num_attention_heads, Hkv = c.num_key_value_heads,
+                Dh = c.head_dim;
+  const int64_t Hk = c.linear_num_key_heads, Hv = c.linear_num_value_heads,
+                Dk = c.linear_key_head_dim, Dv = c.linear_value_head_dim,
+                Kw = c.linear_conv_kernel_dim;
+  const int64_t key_dim = Hk * Dk, value_dim = Hv * Dv,
+                conv_dim = 2 * key_dim + value_dim;
+  lw.is_linear_attention = linear;
+  lw.input_layernorm = MakeBf16({H}, false, s + 1, 0.5f);
+  lw.post_attention_layernorm = MakeBf16({H}, false, s + 2, 0.5f);
+  if (linear) {
+    lw.gdn.in_proj_qkv = MakeBf16({H, conv_dim}, false, s + 10);
+    lw.gdn.in_proj_z = MakeBf16({H, value_dim}, false, s + 20);
+    lw.gdn.in_proj_b = MakeBf16({H, Hv}, false, s + 30);
+    lw.gdn.in_proj_a = MakeBf16({H, Hv}, false, s + 40);
+    lw.gdn.conv1d_weight = MakeBf16({conv_dim, Kw}, false, s + 50);
+    lw.gdn.a_log = MakeF32({Hv}, s + 60);
+    lw.gdn.dt_bias = MakeF32({Hv}, s + 70);
+    lw.gdn.norm_weight = MakeBf16({Dv}, false, s + 80, 0.5f);
+    lw.gdn.out_proj = MakeBf16({value_dim, H}, false, s + 90);
+  } else {
+    lw.attn.q_proj = MakeBf16({H, 2 * Hq * Dh}, false, s + 10);
+    lw.attn.k_proj = MakeBf16({H, Hkv * Dh}, false, s + 20);
+    lw.attn.v_proj = MakeBf16({H, Hkv * Dh}, false, s + 30);
+    lw.attn.o_proj = MakeBf16({Hq * Dh, H}, false, s + 40);
+    lw.attn.q_norm = MakeBf16({Dh}, false, s + 50, 0.5f);
+    lw.attn.k_norm = MakeBf16({Dh}, false, s + 60, 0.5f);
+  }
+}
+
+vllm::Qwen3_5MoeWeights Qwen35MoeWeights(const HfConfig& c) {
+  vllm::Qwen3_5MoeWeights w;
+  const int64_t H = c.hidden_size, V = c.vocab_size;
+  w.embed_tokens = MakeBf16({V, H}, false, 11);
+  w.final_norm = MakeBf16({H}, false, 12, 0.5f);
+  w.lm_head = MakeBf16({H, V}, false, 13);
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    const uint32_t s = 1000 + static_cast<uint32_t>(l) * 5000;
+    vllm::Qwen3_5MoeLayerWeights lw;
+    FillQwen35Layer(lw, c, c.layer_types[static_cast<size_t>(l)] == "linear_attention",
+                    s);
+    lw.moe = Qwen35Moe(c, s + 500);
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
+HfConfig Qwen35DenseConfig() {
+  HfConfig c = Qwen35Base();
+  c.model_type = "qwen3_5_text";
+  c.architectures = {"Qwen3_5ForConditionalGeneration"};
+  c.num_attention_heads = 6;
+  c.num_key_value_heads = 2;
+  c.intermediate_size = 16;
+  c.num_experts = 0;
+  c.linear_num_value_heads = 6;  // GQA ratio 3
+  return c;
+}
+
+vllm::Qwen3_5DenseWeights Qwen35DenseWeights(const HfConfig& c) {
+  vllm::Qwen3_5DenseWeights w;
+  const int64_t H = c.hidden_size, V = c.vocab_size, I = c.intermediate_size;
+  w.embed_tokens = MakeBf16({V, H}, false, 11);
+  w.final_norm = MakeBf16({H}, false, 12, 0.5f);
+  w.lm_head = MakeBf16({H, V}, false, 13);
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    const uint32_t s = 1000 + static_cast<uint32_t>(l) * 5000;
+    vllm::Qwen3_5DenseLayerWeights lw;
+    FillQwen35Layer(lw, c, c.layer_types[static_cast<size_t>(l)] == "linear_attention",
+                    s);
+    lw.mlp.gate_proj = MakeBf16({H, I}, false, s + 501);
+    lw.mlp.up_proj = MakeBf16({H, I}, false, s + 502);
+    lw.mlp.down_proj = MakeBf16({I, H}, false, s + 503);
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
 }  // namespace
 
 TEST_CASE("G1 CUDA: Qwen3MoeDecodeGraph replays bit-exactly against eager, 3 replays") {
@@ -551,4 +777,83 @@ TEST_CASE("G1 CUDA: DeepseekV2DecodeGraph replays bit-exactly against eager, 3 r
                                                          << total << " differing, "
                                                          << graphed.replay_count()
                                                          << " replays");
+}
+
+TEST_CASE("G1 CUDA: Qwen3_5DecodeGraph replays bit-exactly against eager, 3 replays") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
+    return;
+  }
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  const HfConfig c = Qwen35MoeConfig();
+  const vllm::Qwen3_5MoeWeights w = Qwen35MoeWeights(c);
+
+  CudaGdnCachePool eager_cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16);
+  CudaGdnCachePool graph_cache(b, q, c, 4, 16);
+  vllm::Qwen3_5DecodeGraph eager(w, c, q, /*max_num_reqs=*/0);   // EAGER arm
+  vllm::Qwen3_5DecodeGraph graphed(w, c, q, /*max_num_reqs=*/4);
+
+  size_t total = 0;
+  for (int step = 0; step < 5; ++step) {
+    const std::vector<int32_t> tok = {kTokens[static_cast<size_t>(step)]};
+    const std::vector<int32_t> pos = {step};
+    const CommonAttentionMetadata am = DecodeMeta(step);
+    const vllm::v1::GDNAttentionMetadata gm = DecodeGdnMeta();
+    const std::vector<float> e =
+        Read(b, q, eager.Step(tok, pos, am, gm, eager_cache.attn_kv,
+                              eager_cache.gdn_state),
+             c.vocab_size);
+    const std::vector<float> g =
+        Read(b, q, graphed.Step(tok, pos, am, gm, graph_cache.attn_kv,
+                                graph_cache.gdn_state),
+             c.vocab_size);
+    total += CompareStep(step, e, g);
+  }
+  CHECK_FALSE(eager.captured());
+  CHECK(graphed.captured());
+  CHECK(graphed.replay_count() >= 3);  // capture + 3 replays: MORE than one
+  MESSAGE("G1 Qwen3_5DecodeGraph on CUDA: 5 steps x " << c.vocab_size << " logits, "
+                                                      << total << " differing, "
+                                                      << graphed.replay_count()
+                                                      << " replays");
+}
+
+TEST_CASE("G1 CUDA: Qwen3_5DenseDecodeGraph replays bit-exactly against eager, 3 replays") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
+    return;
+  }
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  const HfConfig c = Qwen35DenseConfig();
+  const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
+
+  CudaGdnCachePool eager_cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16);
+  CudaGdnCachePool graph_cache(b, q, c, 4, 16);
+  vllm::Qwen3_5DenseDecodeGraph eager(w, c, q, /*max_num_reqs=*/0);   // EAGER arm
+  vllm::Qwen3_5DenseDecodeGraph graphed(w, c, q, /*max_num_reqs=*/4);
+
+  size_t total = 0;
+  for (int step = 0; step < 5; ++step) {
+    const std::vector<int32_t> tok = {kTokens[static_cast<size_t>(step)]};
+    const std::vector<int32_t> pos = {step};
+    const CommonAttentionMetadata am = DecodeMeta(step);
+    const vllm::v1::GDNAttentionMetadata gm = DecodeGdnMeta();
+    const std::vector<float> e =
+        Read(b, q, eager.Step(tok, pos, am, gm, eager_cache.attn_kv,
+                              eager_cache.gdn_state),
+             c.vocab_size);
+    const std::vector<float> g =
+        Read(b, q, graphed.Step(tok, pos, am, gm, graph_cache.attn_kv,
+                                graph_cache.gdn_state),
+             c.vocab_size);
+    total += CompareStep(step, e, g);
+  }
+  CHECK_FALSE(eager.captured());
+  CHECK(graphed.captured());
+  CHECK(graphed.replay_count() >= 3);
+  MESSAGE("G1 Qwen3_5DenseDecodeGraph on CUDA: 5 steps x "
+          << c.vocab_size << " logits, " << total << " differing, "
+          << graphed.replay_count() << " replays");
 }

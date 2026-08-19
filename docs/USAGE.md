@@ -4420,11 +4420,15 @@ honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 
 ## Turning CUDA graph capture off, including the break seam
 
-`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It always did for the six
-batched decode drivers that each read it, and as of `ENG-CUDAGRAPH-BREAK` W1
-(#1192) it is also the switch the shared break-point seam reads, once per
-process, into a function-local static — so a process is in exactly one lane for
-its whole life and nothing can toggle it mid-run.
+`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It reached the six batched
+decode drivers as six separate reads of the same name, one copied into each
+driver; as of `ENG-CUDAGRAPH-BREAK` W4 (#1307) `src/` holds exactly ONE, in the
+shared break-point seam (`src/vt/breakable_graph.cpp`), which reads it once per
+process into a function-local static — so a process is in exactly one lane for
+its whole life and nothing can toggle it mid-run. **The switch still means what
+it always meant.** What changed is that the drivers now agree by construction
+instead of by six copies of one parse, and that the lane is fixed at the first
+read rather than re-decided whenever a driver is constructed.
 
 With capture off, or on a backend that reports no capture support (Vulkan,
 Metal, and the CPU backend), a `vt::GraphCaptureScope` is INERT: it captures
@@ -4436,14 +4440,23 @@ migration stage reversible.
 Nothing about this is new configuration to learn: there is no new flag, no new
 config key and no new command. The seam is a library surface
 (`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
-attention entry of `Qwen3ForCausalLM`. No production step opens a capture scope
-yet — that arrives when the decode drivers migrate onto the seam — so today the
-switch changes nothing about the break point beyond what it already changed
-about the decode graphs.
+attention entry of `Qwen3ForCausalLM`. **Production steps now open a capture
+scope**, six of them as of W4: `Qwen3DenseDecodeGraph` (W2, #1261),
+`Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph` and `DeepseekV2DecodeGraph` (W3,
+#1291), and `Qwen3_5DecodeGraph` with `Qwen3_5DenseDecodeGraph` (W4, #1307).
+Every one of them opens the scope in FULL mode, mirroring the decode half of
+vLLM's v1 default `CUDAGraphMode.FULL_AND_PIECEWISE`, and a `vt::GraphBreak`
+inside a FULL scope takes its pass-through arm — so the switch still changes
+nothing about the break point beyond what it already changed about the decode
+graphs. This paragraph asserted the opposite until W4: it was written at W1,
+when it was true, and W2 falsified it without rewriting it here.
 
-Building it needs no option. `src/vt/breakable_graph.cpp` is part of the core
-`vllm` library on every platform, because the seam is backend-agnostic and asks
-nothing new of any backend.
+Building it needs no option. `src/vt/breakable_graph.cpp` and, since W4,
+`src/vt/persistent_step_input.cpp` — the capture-stable per-step device input
+the migrated drivers stage through, so that a replayed graph reads this step's
+values from the address it was captured against — are part of the core `vllm`
+library on every platform, because the seam is backend-agnostic and asks nothing
+new of any backend.
 
 The switch is GATED, and it is gated in a child process, because it is read once
 per process into a function-local static and no test in a running process can

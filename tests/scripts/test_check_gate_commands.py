@@ -781,6 +781,40 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-DEDUP"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dropping_cudagraph_break_from_the_pin_breaks_it(self):
+        # MUTATION for the #1376 repair. ENG-CUDAGRAPH-BREAK entered the runnable
+        # population when W5 (#1361) filled its spec's Gates section with runnable
+        # evidence, and the re-pin that change owed was not made, so main itself
+        # failed this suite 8 times of 44. Remove the entry and set equality has
+        # to go red, which is what proves the row was pinned because it entered
+        # the population rather than to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-CUDAGRAPH-BREAK"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_hf_model_download_earns_its_runnable_baseline_entry(self):
+        # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
+        # population for the first time and the baseline grows by one. Same
+        # shape and same reason as the row above.
+        #
+        # The row is classified runnable because its spec's `## Gates` section
+        # names `scripts/validate-container-image.py`, a command that can fail.
+        # The exact pin proves the SET agrees, which holds for any membership
+        # and cannot say this row belongs. This says it: remove the entry and
+        # set equality has to go red, which is what separates a row pinned
+        # because it entered the population from a row pinned to quiet a gate.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-HF-MODEL-DOWNLOAD"), "runnable")
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-HF-MODEL-DOWNLOAD"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
 
 if __name__ == "__main__":
     unittest.main()

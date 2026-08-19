@@ -600,8 +600,18 @@ ENGINE_PREFIXES = (
 # disk expert paging is absent in pinned vLLM (`offloader/uva.py:21`,
 # `offloader/prefetch.py:557-560`) and no secondary oracle implements it either.
 # `READY`, spec `specs/expert-stream-device-slots.md`, issue #1124.
+# 167: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
+# container image and no release archive can obtain a checkpoint: the runtime
+# stage carries no Python and no `curl`, while `docker/Dockerfile:188-192`
+# already sets `HF_HOME=/cache` and declares the `/cache` volume for a fetch
+# that does not exist. The row is not a duplicate of `LOAD-SAFETENSORS` or
+# `LOAD-GGUF`, which both start from bytes already on disk, and it is not
+# `LOAD-CONFIG-SURFACE`, which parses a flag it never resolves. The one adjacent
+# implementation, `model_loader.cpp:279-303`, reads an existing cache for the
+# DFlash draft alone and never downloads. `READY`, spec
+# `specs/hf-model-download.md`, issue #1280.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 166
+ENGINE_ROWS = 167
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

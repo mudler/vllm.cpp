@@ -727,6 +727,10 @@ add_library(vllm STATIC
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the HuggingFace cache layout. Pure file
+  # system, no transport, so it builds in every lane. The DFlash draft path
+  # in model_loader.cpp reaches it and is not behind VLLM_CPP_SERVER.
+  src/vllm/transformers_utils/hf_cache.cpp
   src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
@@ -2323,6 +2327,10 @@ if(VLLM_CPP_SERVER)
   # construction) lives in the library so examples/server can be a thin client of
   # the C ABI's vllm_server_main (v17). It shares api_server.cpp's httplib gate.
   target_sources(vllm PRIVATE src/vllm/entrypoints/openai/server_main.cpp)
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the hub protocol speaks HTTP through the same
+  # vendored cpp-httplib header api_server.cpp uses, so it shares that gate. The
+  # cache half above stays unconditional because it opens no socket.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/hf_hub.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party
@@ -2354,6 +2362,42 @@ foreach(_music3_ab_arm before after)
   vllm_cpp_set_warnings(vllm_music3_depth_stage_ab_${_music3_ab_arm})
 endforeach()
 target_compile_definitions(vllm_music3_depth_stage_ab_after PRIVATE MUSIC3_AFTER)
+
+# ── The MiniMax-Music3 vocoder decode-window A/B driver (#672, #1334) ─────────
+# `tools/bench/music3_vocoder_conv_ab.cpp` is the artifact behind spec §18's
+# numbers, and it is registered as no test, so nothing in `ctest` runs it.
+#
+# WHY THIS ONE IS AN EXECUTABLE WHERE ITS SIBLING 20 LINES ABOVE IS AN OBJECT
+# LIBRARY. That divergence was a review finding (2026-08-19) and it is argued
+# here rather than left to be noticed twice. The depth driver's two arms are
+# `#if defined(MUSIC3_AFTER)` branches of ONE file, so compiling it is the whole
+# rot guard and linking `main` would only add an entry point nobody calls; an
+# OBJECT library is strictly cheaper and it says so.
+#
+# This driver's arms are two SOURCE TREES, the shape spec §18.8 requires and that
+# §16.6a was voided for not having, and the recorded recipe is a SHIPPED SCRIPT:
+# `scripts/music3-vocoder-conv-ab.sh` configures two clones, runs
+# `ninja ... vllm_music3_vocoder_conv_ab` in each, `sha256sum`s the two results
+# and REFUSES to time anything when they hash the same, then executes them with
+# `--lengths=` / `--repeats=`. Every one of those steps needs a linked binary.
+# An OBJECT library would guard the compile and break the reproduction, which
+# inverts the point: the rot this target exists to prevent is a §18 nobody can
+# re-run.
+#
+# What it costs, stated rather than hoped: one ~21 MB executable in a build tree,
+# no test registration, and no `install(TARGETS ...)` entry — see the install
+# list below, which names `vllm` and `vllm_shared` only — so it does not ship and
+# no packaged artifact changes. `main` is linked and never runs in CI; the
+# allocation the depth driver's comment worries about happens on invocation, not
+# at load.
+add_executable(vllm_music3_vocoder_conv_ab tools/bench/music3_vocoder_conv_ab.cpp)
+target_link_libraries(vllm_music3_vocoder_conv_ab PRIVATE vllm)
+target_include_directories(vllm_music3_vocoder_conv_ab PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
 
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and

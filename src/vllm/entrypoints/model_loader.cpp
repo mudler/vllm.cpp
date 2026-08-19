@@ -33,6 +33,7 @@
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft load
+#include "vllm/transformers_utils/hf_cache.h"  // ENG-HF-MODEL-DOWNLOAD (#1280)
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
@@ -278,29 +279,21 @@ bool IsDflashGgufDraft(const std::string& path) {
 }
 
 std::string ResolveDflashDraftDir(const std::string& path) {
-  std::error_code ec;
-  if (IsDflashGgufDraft(path)) return path;
-  if (fs::exists(fs::path(path) / "config.json", ec)) return path;
-  // HF repo id -> local cache snapshot.
-  std::string slug = "models--";
-  for (char c : path) slug.push_back(c == '/' ? '-' : c);
-  // "z-lab/Qwen3.6-27B-DFlash" -> "models--z-lab--Qwen3.6-27B-DFlash" (each '/'
-  // becomes '--'): the single replace above turned '/' into one '-', so redo it
-  // as the HF two-dash convention.
-  slug.clear();
-  slug = "models--";
-  for (size_t i = 0; i < path.size(); ++i) {
-    if (path[i] == '/') slug += "--";
-    else slug.push_back(path[i]);
-  }
+  // ENG-HF-MODEL-DOWNLOAD W2 (#1280): this used to carry its own copy of the
+  // HuggingFace cache walk. The walk now lives in
+  // vllm::transformers_utils::ResolveCachedSnapshotDir, so the tree holds ONE
+  // implementation of it.
+  //
+  // The cache root stays $HOME/.cache/huggingface/hub, which is what this path
+  // has always read, rather than HfHubCacheDir(). This move is a relocation and
+  // must not change what a DFlash run resolves; a container that sets HF_HOME
+  // would otherwise start resolving a different directory as a side effect. The
+  // migration onto HfHubCacheDir() is listed under `## Owed` in
+  // .agents/specs/hf-model-download.md.
   const char* home = std::getenv("HOME");
-  if (home == nullptr) return path;
-  fs::path snaps = fs::path(home) / ".cache/huggingface/hub" / slug / "snapshots";
-  if (!fs::is_directory(snaps, ec)) return path;
-  std::string best;
-  for (const auto& e : fs::directory_iterator(snaps, ec))
-    if (fs::exists(e.path() / "config.json", ec)) best = e.path().string();
-  return best.empty() ? path : best;
+  const fs::path hub_dir =
+      home == nullptr ? fs::path() : fs::path(home) / ".cache/huggingface/hub";
+  return vllm::transformers_utils::ResolveCachedSnapshotDir(path, hub_dir);
 }
 
 // Read a named BF16 tensor from safetensors shards into a host OwnedTensor

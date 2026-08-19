@@ -114,15 +114,30 @@ void ResetStepInputStats();
 //     real fix: read the identifiers from a stable device buffer instead of
 //     racing a host read against a device write.
 //
-//     **THIS ARM LANDS WITH NO PRODUCTION CALLER, named rather than implied.**
-//     `grep -rn RefreshFromDevice src/ include/` returns its definition and
-//     nothing else, and `last_source()`/`StepInputSource` have no production
-//     reader either. It is a staged slice under AGENTS.md's "Nothing lands
-//     dead": the capability the decline needs is the DESTINATION — a device
-//     token-id buffer the captured graph reads — and no driver has one (see the
-//     decline in `qwen3.cpp`'s `DenseDecodeGraphForward`). Writing this arm's
-//     caller before that destination exists would be the tenth hand-rolled copy
-//     this row removes. Owner: row `ENG-CUDAGRAPH-BREAK`, the stage that gets a
+//     **THIS ARM HAS A PRODUCTION CALLER, and it did not when it landed.** The
+//     paragraph that used to stand here said `grep -rn RefreshFromDevice src/
+//     include/` returned its definition and nothing else. #1305 made that false
+//     and this records the new state rather than leaving the old one to be
+//     discovered. The grep now also returns
+//     `include/vllm/model_executor/models/step_token_ids.h`, whose
+//     `StepTokenIds::Refresh` is called once per decode step by
+//     `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph` — three shipped
+//     registrations (`qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp`,
+//     `glm4_moe_lite_registry.cpp`) reach it.
+//     `tests/vllm/models/test_moe_async_device_ids.cpp` holds that call site:
+//     deleting this arm's invocation reds its three GRAPH cases on the token
+//     comparison AND on `device_refreshes`.
+//
+//     WHAT IS STILL UNREAD, named rather than implied. `last_source()` and
+//     `StepInputSource` have no production reader — every caller that reads a
+//     VALUE is a test. The one non-test caller is
+//     `include/vllm/model_executor/models/step_token_ids.h:122`, a forwarding
+//     wrapper that nothing itself calls, so it moves no value anywhere. And the
+//     call site above sits OUTSIDE the captured region, so this arm is read
+//     once per step and never at REPLAY time. Replay-time reading is what
+//     the `qwen3.cpp` decline actually needs, and neither that destination nor
+//     that placement exists in the dense driver the decline guards. Owner: row
+//     `ENG-CUDAGRAPH-BREAK`, the stage that gets a
 //     `dgx` window WITH the Qwen3-0.6B/4B checkpoints the battery needs; listed
 //     under `## Owed` in `.agents/specs/eng-cudagraph-break.md` and tracked by
 //     #1179 and #323. The HOST arm IS reached, and its own reach is bounded

@@ -180,6 +180,17 @@ struct GraphBreakStats {
   // would make the number report a mode that never reached a backend.
   int64_t full_scopes = 0;
   int64_t piecewise_scopes = 0;
+  // D10, the auxiliary-stream fork set. ENG-CUDAGRAPH-BREAK W5 (#1335) added
+  // these for the same reason W3 added the mode counters: the rule is invisible
+  // from outside the scope, and a guard nothing can observe is a guard nothing
+  // can prove. `forks_tracked` counts `GraphNoteFork` registrations that reached
+  // an ACTIVE scope; `forks_auto_joined` counts the forks the scope itself had
+  // to join because they were still outstanding when a segment closed. The
+  // second is the one that matters: it is ZERO for a model that joins its own
+  // fork inside the segment, and non-zero exactly when the seam did the work
+  // upstream's `_end_current_segment` (`:353-361`) does.
+  int64_t forks_tracked = 0;
+  int64_t forks_auto_joined = 0;
 };
 GraphBreakStats GetGraphBreakStats();
 void ResetGraphBreakStats();
@@ -408,6 +419,37 @@ class GraphCaptureScope {
   // share an address — and the cell is what actually aliases.
   void AppendBreak(std::function<void()> fn, const void* destination);
 
+  // ---------------------------------------------------------------------
+  // D10 — THE OUTSTANDING-FORK SET. Port of upstream's `wait_stream` hook
+  // (`:101-153`, installed `:310`, removed `:332`) and of the auto-join inside
+  // `_end_current_segment` (`:353-361`).
+  // ---------------------------------------------------------------------
+  //
+  // WHY THIS EXISTS. Closing a segment while a side stream forked inside it is
+  // still participating in the capture is illegal: `cudaStreamEndCapture` fails
+  // on a capture graph with an unjoined fork. Upstream keeps the whole
+  // `torch.cuda.Stream.wait_stream` monkey-patch for no other purpose than to
+  // know WHICH streams are outstanding, then joins them itself before
+  // `capture_end()`.
+  //
+  // WHY OURS IS CHEAPER. Our fork and join are explicit `Backend::RecordEvent`
+  // and `Backend::QueueWaitEvent` calls on a seam we control, not an implicit
+  // torch API, so the model TELLS the scope instead of the scope patching the
+  // runtime. `NoteFork` registers; `NoteJoin` retires the registration when the
+  // model joined the queue itself, which is the common case and the one that
+  // must cost nothing.
+  //
+  // `join_event` is the event the scope RECORDS on `aux` and then WAITS on the
+  // capture queue if it still has to join. It must outlive this scope — the
+  // natural owner is the capture driver that created the queue, which is what
+  // `laguna.cpp`'s `LagunaGraph` does with `aux_done` (created in the
+  // constructor, destroyed in the destructor). Registering an event that dies
+  // first is lifetime rule 2 at the `GraphBreak` declaration, applied to an
+  // event instead of a buffer.
+  void NoteFork(Queue& aux, Event& join_event);
+  void NoteJoin(Queue& aux);
+  size_t outstanding_forks() const { return forks_.size(); }
+
  private:
   Backend* b_;
   Queue* q_;
@@ -420,7 +462,36 @@ class GraphCaptureScope {
   // this capture. A capture has as many breaks as the model has split points,
   // so a linear scan here is cheaper than the map that would replace it.
   std::vector<const void*> destinations_;
+  // The forks registered since this segment opened and not yet retired. One
+  // entry per outstanding side queue; a model forks as many queues as it has
+  // overlap paths, so a linear scan is cheaper than the map that would replace
+  // it — the same argument `destinations_` makes.
+  struct ForkedQueue {
+    Queue* q;
+    Event* e;
+  };
+  std::vector<ForkedQueue> forks_;
+  // Joins every outstanding fork onto the capture queue and clears the set.
+  // Called by `EndSegment` BEFORE `Backend::EndCaptureGraph`.
+  void JoinOutstandingForks();
 };
+
+// ---------------------------------------------------------------------------
+// vt::GraphNoteFork / vt::GraphNoteJoin — the D10 registration at the SITE.
+// ---------------------------------------------------------------------------
+//
+// Same shape as `GraphBreak`: OUTSIDE a capture scope both are no-ops making
+// ZERO backend calls, so a non-capturing forward is byte-identical to today.
+// Inside an ACTIVE scope `GraphNoteFork` adds the queue to the outstanding set
+// and `GraphNoteJoin` retires it.
+//
+// THE MODEL STILL ISSUES ITS OWN FORK AND JOIN. These do not replace
+// `Backend::RecordEvent` / `Backend::QueueWaitEvent`; they tell the scope that
+// a fork is open, so the scope can close the window if a segment ends before
+// the model's own join runs. A model that always joins inside its segment sees
+// `forks_auto_joined == 0` and pays two vector operations.
+void GraphNoteFork(Queue& aux, Event& join_event);
+void GraphNoteJoin(Queue& aux);
 
 // ---------------------------------------------------------------------------
 // vt::GraphBreak — the break point. Port of `eager_on_graph` (`:204-243`),

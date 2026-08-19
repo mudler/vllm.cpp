@@ -27,6 +27,8 @@ std::atomic<int64_t> g_breaks{0};
 std::atomic<int64_t> g_replays{0};
 std::atomic<int64_t> g_full_scopes{0};
 std::atomic<int64_t> g_piecewise_scopes{0};
+std::atomic<int64_t> g_forks_tracked{0};
+std::atomic<int64_t> g_forks_auto_joined{0};
 
 }  // namespace
 
@@ -42,6 +44,8 @@ GraphBreakStats GetGraphBreakStats() {
   s.replays = g_replays.load(std::memory_order_relaxed);
   s.full_scopes = g_full_scopes.load(std::memory_order_relaxed);
   s.piecewise_scopes = g_piecewise_scopes.load(std::memory_order_relaxed);
+  s.forks_tracked = g_forks_tracked.load(std::memory_order_relaxed);
+  s.forks_auto_joined = g_forks_auto_joined.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -52,6 +56,8 @@ void ResetGraphBreakStats() {
   g_replays.store(0, std::memory_order_relaxed);
   g_full_scopes.store(0, std::memory_order_relaxed);
   g_piecewise_scopes.store(0, std::memory_order_relaxed);
+  g_forks_tracked.store(0, std::memory_order_relaxed);
+  g_forks_auto_joined.store(0, std::memory_order_relaxed);
 }
 
 // Read ONCE into a function-local static, so a process is in exactly one lane
@@ -252,6 +258,11 @@ void GraphCaptureScope::BeginSegment() {
 
 void GraphCaptureScope::EndSegment() {
   if (!active_ || !segment_open_) return;
+  // D10, and it runs BEFORE the close rather than after it, because after is too
+  // late: `cudaStreamEndCapture` on a capture graph that still has an unjoined
+  // fork FAILS. Upstream does exactly this inside `_end_current_segment`
+  // (`:353-361`), immediately before `capture_end()`.
+  JoinOutstandingForks();
   segment_open_ = false;  // cleared FIRST: a throwing end must not be retried
   void* seg = b_->EndCaptureGraph(*q_);
   g_->segments_.push_back(seg);
@@ -288,6 +299,63 @@ void GraphCaptureScope::AppendBreak(std::function<void()> fn, const void* destin
   }
   g_->break_fns_.push_back(std::move(fn));
   g_breaks.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// D10 — the outstanding-fork set. Port of the `wait_stream` hook (`:101-153`)
+// and of the auto-join in `_end_current_segment` (`:353-361`).
+// ---------------------------------------------------------------------------
+
+void GraphCaptureScope::NoteFork(Queue& aux, Event& join_event) {
+  if (!active_) return;
+  // Registering the SAME queue twice would make the auto-join issue two waits
+  // for one fork, and — worse — would leave one entry behind after `NoteJoin`
+  // retired the other, so a joined queue would still look outstanding. The
+  // identity is the QUEUE, because that is what a join targets.
+  for (ForkedQueue& f : forks_) {
+    if (f.q == &aux) {
+      f.e = &join_event;  // a re-fork of the same queue: keep ONE entry, newest event
+      return;
+    }
+  }
+  forks_.push_back(ForkedQueue{&aux, &join_event});
+  g_forks_tracked.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GraphCaptureScope::NoteJoin(Queue& aux) {
+  if (!active_) return;
+  for (size_t i = 0; i < forks_.size(); ++i) {
+    if (forks_[i].q == &aux) {
+      forks_.erase(forks_.begin() + static_cast<long>(i));
+      return;
+    }
+  }
+}
+
+void GraphCaptureScope::JoinOutstandingForks() {
+  if (!active_ || forks_.empty()) return;
+  for (ForkedQueue& f : forks_) {
+    // The join upstream spells `self.stream.wait_stream(s)` (`:359`): make the
+    // CAPTURE queue wait for everything submitted to the side queue. Ours is the
+    // explicit two-call form — record on the side queue, wait on the capture
+    // queue — which is the same pair the model itself issues when it joins.
+    b_->RecordEvent(*f.e, *f.q);
+    b_->QueueWaitEvent(*q_, *f.e);
+    g_forks_auto_joined.fetch_add(1, std::memory_order_relaxed);
+  }
+  forks_.clear();
+}
+
+void GraphNoteFork(Queue& aux, Event& join_event) {
+  GraphCaptureScope* s = GraphCaptureScope::Current();
+  if (s == nullptr) return;
+  s->NoteFork(aux, join_event);
+}
+
+void GraphNoteJoin(Queue& aux) {
+  GraphCaptureScope* s = GraphCaptureScope::Current();
+  if (s == nullptr) return;
+  s->NoteJoin(aux);
 }
 
 // The bare marker (`:370-374`).

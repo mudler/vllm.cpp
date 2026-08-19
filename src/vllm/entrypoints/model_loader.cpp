@@ -1847,11 +1847,87 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     {
       const platforms::Platform& target = platforms::GetPlatform(
           ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The bound above sums the
+      // WHOLE tensor table, so on `Qwen3.8-2.4T-A95B UD-Q1_0` it counts all
+      // 335.62 GiB of `*_exps` and refuses before any forward exists to take the
+      // slot arm. That is right whenever those towers really are staged, and
+      // wrong when the streaming lane serves them: then they are not staged at
+      // all, and what the device pays instead is the slot arena.
+      //
+      // THE FOUR CONDITIONS, in this order because the last one LATCHES.
+      // `ResolveExpertStreamRequested()` fixes the process's answer for good, so
+      // it is asked only once the platform has already said it both stages and
+      // can read host slots, and only once the resolved MODEL has said its
+      // forward reads experts through the slot seam — which is false on every CPU
+      // load, on every discrete device and on every architecture that does not
+      // stream, i.e. everywhere the latch would be a side effect rather than the
+      // question. The offload config is installed at the top of this function,
+      // well before here, so the latched answer is the configured one.
+      //
+      // THE ARCHITECTURE TERM IS NOT COSMETIC. Without it this block is keyed on
+      // the tensor NAME alone, and `_exps.weight` is what a llama.cpp MoE export
+      // writes for families this tree does not stream:
+      // `deepseek_v4_weights.cpp` and `laguna_weights.cpp` both emit it, and
+      // neither model composes `RunMoeBlock`, so neither ever reaches
+      // `KqExpertSlice`. `CheckDeviceWeightFit` has ONE production call site —
+      // this one — and every GGUF architecture arrives at it, so a `deepseek4`
+      // load on a GB10 with `VT_MOE_EXPERT_STREAM=1` would have had its whole
+      // expert set dropped from the bound and an arena added that nothing
+      // allocates. That is the UNSAFE direction, unlike the two over-counts this
+      // bound documents (#1136): it deletes a correct refusal and puts back the
+      // 26-minute load and the `cudaMalloc: out of memory` first forward that
+      // #1123 exists to prevent. The capability is declared on the factory beside
+      // the forward that implements it, and a model that does not declare it gets
+      // the whole bound.
+      //
+      // THE RESIDENCY TERM IS THE SAME FINDING ONE LEVEL DEEPER (#1378). The four
+      // conditions above are all properties of the DEVICE and the ARCHITECTURE,
+      // and a `qwen35moe` GGUF satisfies every one of them while still staging
+      // every tower: `LoadExpertsOrNvfp4` routes the SAME `_exps.weight` tensors
+      // to `expert_*_fp4` or to `expert_*` whenever the residency is not a keep
+      // residency, and only the `expert_*_kq` arm reaches `KqExpertSlice`. With
+      // `VT_GGUF_KEEP_QUANT=0`, or on an NVFP4 GGUF, this block therefore dropped
+      // 335.62 GiB of towers from the bound on a load that stages all of them and
+      // deleted the #1123 refusal outright. `GgufExpertTowersReachSlotLane` asks
+      // the model loader's own routing function about this file under this
+      // process's policy, so the bound and the forward cannot disagree.
+      //
+      // It is asked LAST, after `ResolveExpertStreamRequested()`, only because
+      // that call LATCHES: moving a non-latching file scan in front of it would
+      // change which loads fix the process's streaming answer, and this repair
+      // has no business moving that.
+      static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
+      StreamedExpertLane lane;
+      if (target.needs_weight_staging() &&
+          target.host_memory_is_device_addressable() &&
+          gguf_arch.factory != nullptr &&
+          gguf_arch.factory->streams_routed_experts &&
+          ResolveExpertStreamRequested() &&
+          GgufExpertTowersReachSlotLane(gguf, kStreamedExpertSuffix,
+                                        GgufLoadPolicy::FromEnv())) {
+        // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
+        // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
+        // writes. The arena is the store's own arithmetic — `slots *
+        // slot_bytes` through the same two resolvers `Qwen35ExpertStream`'s
+        // constructor uses, with the largest per-expert slice in this file as
+        // the computed default, so the number here is the number that gets
+        // allocated and not an estimate of it.
+        lane.tensor_name_suffix = kStreamedExpertSuffix;
+        const size_t slice =
+            GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
+        if (slice > 0) {
+          lane.arena_bytes =
+              static_cast<size_t>(ResolveExpertStreamSlots()) *
+              static_cast<size_t>(
+                  ResolveExpertStreamSlotBytes(static_cast<int64_t>(slice)));
+        }
+      }
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.needs_weight_staging(),
           DeviceWeightBudgetBytes(
-              target.residency_policy().device_memory_total_bytes));
+              target.residency_policy().device_memory_total_bytes),
+          /*model_dtype_bytes=*/2, lane);
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);

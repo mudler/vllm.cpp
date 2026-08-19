@@ -31,6 +31,17 @@ std::string DeviceArchName(int index) noexcept;
 // discrete without a device header.
 bool IntegratedDevice(int index) noexcept;
 
+// ENG-EXPERT-STREAM-DEVICE W0b (issue #1124): may a kernel on device `index`
+// DEREFERENCE ordinary host storage? `hipDeviceAttributeIntegrated AND
+// hipDeviceAttributePageableMemoryAccess`, both of which ProbeDevice already
+// reads; false when the device is absent or either probe fails.
+//
+// NOT `RocmBackend::UnifiedMemory()`, which the registrar widens with the
+// managed-allocation branch: hipMallocManaged makes the BACKEND's own pointers
+// migratable and says nothing about a host `std::vector`'s. HIP-free so the
+// platform leg can answer without a device header.
+bool HostMemoryIsDeviceAddressable(int index) noexcept;
+
 // Which allocation path Backend::Alloc takes for device `index` — the
 // approach-(b) introspection seam (issue #41 F6, maintainer-ratified
 // 2026-08-08). True: every Backend::Alloc block is

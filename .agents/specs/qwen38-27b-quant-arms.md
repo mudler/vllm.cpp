@@ -350,7 +350,7 @@ unquantized.
    (`:147-163`) names this exact case: "A per-output-channel `[out] BF16` scale passed at two bytes an element
    and was read as one float built from the first two entries." So even after (1)
    is fixed, `weight_scale` BF16 `[10240,1]` fails the count check first. `Fp8Weight`
-   (`include/vllm/model_executor/models/qwen3_5_weights.h:318-330`) is three host
+   (`include/vllm/model_executor/models/qwen3_5_weights.h:342-355`) is three host
    floats with **no tensor-valued scale slot**, so this is a type change, not a
    read fix.
 

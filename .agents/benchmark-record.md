@@ -19,6 +19,51 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## ENG-EXPERT-STREAM-DEVICE W0a — a GB10 kernel CAN dereference the host slot arena (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0`, #1124)
+
+**W0a is the probe the whole W0 mechanism rests on, and it answered
+`W0A_VERDICT=PAGEABLE_OK`.** It is recorded here rather than only in the
+scoreboard because it is a MEASUREMENT, and because the row's spec and
+`docs/BENCHMARKS.md` had both carried it as "not run" after it had run.
+
+The question. `HostExpertSlotStore`'s arena is a plain `std::vector<uint8_t>`.
+W0c serves an expert slice by handing a CUDA GEMM a pointer INTO that vector.
+If a GB10 kernel cannot dereference ordinary host storage, the design is wrong
+at the root, `Platform::host_memory_is_device_addressable()` answers false on the
+one box that matters, the lane never engages, and the row returns
+`NEEDS_DECISION` in favour of a `cudaHostAlloc` arena, which is a different
+allocator and a different ownership story.
+
+The answer, on `dgx:gpu0` inside an `rc` lease:
+
+| Quantity | Value |
+|---|---|
+| `cudaDevAttrPageableMemoryAccess` | 1 |
+| `cudaDevAttrIntegrated` | 1 |
+| kernel read AND write of a 2,490,368 B slot in `std::vector` storage | correct |
+| bandwidth ratio over that access, range across reps | 2.06-2.28x |
+| verdict | `W0A_VERDICT=PAGEABLE_OK` |
+
+Two things this deliberately does not say. The attribute pair is exactly what
+`CudaPlatform` conjoins, so it is the predicate's own input and not a proxy for
+it; but an attribute is a CLAIM, which is why the probe also ran the access. The
+slot size is 2,490,368 B because that is one real IQ1_XXXS expert slice on
+`Qwen3.8-2.4T-A95B UD-Q1_0` (1,275,068,416 / 512), so the measured access is the
+access the lane will perform and not a synthetic stand-in.
+
+Two of the four attributes the spec's port map names,
+`cudaDevAttrPageableMemoryAccessUsesHostPageTables` and
+`cudaDevAttrConcurrentManagedAccess`, are NOT carried here. The verdict turns on
+the two that are, and writing down two numbers that were not handed over would be
+worse than the gap.
+
+**This is not a decode number and does not become one.** W0e — G0-CORRECT,
+G0-LIVE and G0-SPEED — is still queued on the box, no speed floor is set for it,
+and a CUDA arm slower than the CPU arm remains a real publishable outcome: the
+recorded GB10 ATS penalty applies to all ~6.95 GB of expert bytes this lane reads
+per token, and the 2.06-2.28x above is a microbenchmark of one access, not of a
+decode step.
+
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 
 **This supersedes the entry that recorded the A3 gate as a 6/96 device failure

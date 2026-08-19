@@ -418,18 +418,31 @@ struct NemotronHMoeMarlinResident {
   void* ss_down = nullptr;  // fp8 [1, Is/16, H]
   void* sg_down = nullptr;  // f32 [1]
   void* workspace = nullptr;  // i32 [sms*4] reduction locks
+  // The ROUTER PAIR, resident for the same reason everything above it is: the
+  // gate is [E,H] f32 and the correction bias is [E] f32, neither changes after
+  // load, and both used to be re-uploaded -- with a full stream drain each --
+  // on every forward (#1312). They carry their own null test rather than
+  // `ready`, because `ready` says the ARENA is built and these two are not part
+  // of it.
+  void* gate = nullptr;  // f32 [E, H]   `mixer.gate.weight`
+  void* bias = nullptr;  // f32 [E]      `mixer.gate.e_score_correction_bias`
   int sms = 0;
   bool ready = false;
 };
 
 
-// Upload one DENSE `NemotronHOwned` to the device, refusing by name on the same
-// three properties `RequireWeight` checks on the host arm (nemotron_h.cpp:180),
-// so an absent or mis-shaped router weight fails identically on both arms rather
-// than reaching a kernel with a null pointer. Uploaded per call, not resident:
-// the router gate is 1.4 MB and A2-Q2a makes no speed claim (:39).
-DBuf UploadOwned(Dev d, const NemotronHOwned& w, const char* what, DType want,
-                 const std::vector<int64_t>& shape) {
+// Refuse by name on the same three properties `RequireWeight` checks on the host
+// arm (nemotron_h.cpp:180), so an absent or mis-shaped router weight fails
+// identically on both arms rather than reaching a kernel with a null pointer.
+//
+// SEPARATED FROM THE UPLOAD ON PURPOSE. `ResidentOwned` below copies once and
+// reuses, and a refusal folded into that copy would fire on the FIRST forward
+// only -- so a weight that is wrong would be refused once and then silently
+// accepted for the rest of the process. This runs on every call, which is the
+// polarity `UploadOwned` had when it re-uploaded per call, and is what keeps the
+// device arm's refusal identical to the host arm's.
+void RequireOwned(const NemotronHOwned& w, const char* what, DType want,
+                  const std::vector<int64_t>& shape) {
   VT_CHECK(!w.Empty(),
            std::string("NemotronH device moe: weight '") + what + "' is not materialized");
   VT_CHECK(w.IsDense(),
@@ -439,9 +452,35 @@ DBuf UploadOwned(Dev d, const NemotronHOwned& w, const char* what, DType want,
                                 "' has the wrong dtype for this arm");
   VT_CHECK(w.shape == shape,
            std::string("NemotronH device moe: weight '") + what + "' has the wrong shape");
-  DBuf b(d, want, shape, w.bytes.data());
-  d.b.Synchronize(d.q);  // `w.bytes` outlives this, but the copy is async; see UploadAs
-  return b;
+}
+
+// A device-RESIDENT view over one DENSE `NemotronHOwned`, uploaded once into
+// `slot` and read in place by every later forward. The seam is
+// `dense_attn::ResidentWeight` (dense_attn_block.h:177) and the arena fetch this
+// same function already makes through `ResidentIn` -- upload once, cache on the
+// weights, test the cached handle rather than a step counter.
+//
+// THIS REPLACED A PER-CALL UPLOAD, AND THE COST WAS NOT THE BYTES (#1312).
+// `UploadOwned` ended in `d.b.Synchronize(d.q)`, which on CUDA is
+// `cudaStreamSynchronize` (cuda_backend.cu:110) -- the host thread blocks until
+// the whole stream drains. At 23 MoE layers the router alone cost 46 copies AND
+// 46 drains per decode token. vLLM has nothing to mirror here because it has no
+// such transfer: the router is an `nn.Parameter` that lives on the device.
+//
+// The first-use copy KEEPS its drain. It is not load-bearing for lifetime --
+// `w.bytes` is the model's own storage and outlives every forward -- but it is
+// one drain per layer per process rather than per token, and removing it is a
+// separate argument this change does not need to make.
+Tensor ResidentOwned(Dev d, const NemotronHOwned& w, const char* what, DType want,
+                     const std::vector<int64_t>& shape, void*& slot) {
+  RequireOwned(w, what, want, shape);
+  if (slot == nullptr) {
+    void* p = d.b.Alloc(w.bytes.size());
+    d.b.Copy(d.q, p, w.bytes.data(), w.bytes.size());
+    d.b.Synchronize(d.q);
+    slot = p;  // published only after the copy has landed
+  }
+  return MakeTensor(slot, want, d.q.device, shape);
 }
 
 // Repack ONE projection into `dst_w`/`dst_s`, streaming its packed codes and
@@ -593,10 +632,20 @@ DBuf DenseMarlinE1(Dev d, const Tensor& x, void* w, void* s, void* g, void* ws, 
                                     block, static_cast<int32_t*>(sorted.t().data),
                                     static_cast<int32_t*>(experts.t().data),
                                     static_cast<int32_t*>(npad.t().data));
-  // `mul_topk_weights` is false, so these are read by nothing; the op still
-  // requires an f32 tensor of the right extent.
-  const std::vector<float> ones(static_cast<size_t>(M), 1.0F);
-  DBuf tw(d, DType::kF32, {M}, ones.data());
+  // `mul_topk_weights` is false, so this is read by nothing; the op still
+  // requires an f32 tensor of the right extent, so it is ALLOCATED AND LEFT
+  // UNWRITTEN. The kernel dereferences `topk_weights_ptr` only under
+  // `if (mul_topk_weights)` -- marlin_template.h:518 is the only load, :1879 the
+  // only read, and :1797/:1880-1884 are the other branches on the same flag.
+  //
+  // It used to be `std::vector<float> ones(M, 1.0F)` handed to the `DBuf`
+  // constructor, whose copy is ASYNC (dense_device_glue.h:126) and which nothing
+  // here waited on, so the vector died at the end of this function with the copy
+  // possibly still in flight: the use-after-free shape UploadAs:183-189
+  // documents, uncovered. Removing the upload removes the hazard AND two
+  // host->device copies per MoE layer per token, which is strictly better than
+  // adding a drain to make a write nobody reads safe (#1312).
+  DBuf tw(d, DType::kF32, {M});
   DBuf out(d, DType::kBF16, {M, N});
   Tensor wq = MakeTensor(w, DType::kI32, d.q.device, {1, K / 16, N * 2});
   Tensor sc = MakeTensor(s, DType::kI8, d.q.device, {1, K / 16, N});
@@ -647,23 +696,32 @@ DBuf NemotronHMoeBlockDevice(Dev d, const NemotronHMoeWeights& w,
   // ── LAZY, AND EXPLICITLY TRANSITIONAL (A2-P owns moving it) ────────────────
   // The A2-Q2 spec's §4.2 puts this repack in `PrepareNemotronHForCausalLM`,
   // because a 16.5 GB allocation inside a forward would land inside a CUDA-graph
-  // capture. That reason is FORWARD-LOOKING and is false today: nothing captures
-  // `NemotronHDeviceForward`, which has no production caller at all
-  // (`ForwardNemotronHForCausalLM` still routes to the host reference,
-  // nemotron_h_registry.cpp:185-187). Putting it in `Prepare` NOW would instead
-  // make every production NemotronH engine load pay 16.5 GB of device memory for
-  // a path nothing reaches — `ModelRegistry::Prepare` is called unconditionally
-  // from both `GPUModelRunner` constructors (runner.cpp:414, :455) — on a
-  // unified-memory box that REBOOTS rather than OOM-kills.
+  // capture.
   //
-  // "Nothing lands dead" covers an unreached FORWARD, which costs nothing. It
-  // does not cover an unreached ALLOCATION inside a REACHED hook. So A2-Q2a
-  // builds on first use and `PrepareNemotronHForCausalLM` stays a no-op.
+  // ONE OF THIS COMMENT'S TWO CLAUSES HAS SINCE EXPIRED, and it is corrected
+  // here rather than re-quoted (#1346). It used to say that this block "has no
+  // production caller at all (`ForwardNemotronHForCausalLM` still routes to the
+  // host reference)". A2-P landed the paged fold, so it has one:
+  // `ForwardNemotronHForCausalLM` -> `NemotronHPagedForward`
+  // (nemotron_h_registry.cpp:200-202) -> this function, whenever the runner
+  // supplies paged KV and recurrent caches. The "unreached ALLOCATION inside a
+  // REACHED hook" argument that followed from it is therefore weaker than it
+  // reads: an engine load that goes on to decode now pays this cost either way,
+  // and moving it to `Prepare` would move it, not add it.
+  //
+  // WHAT STILL HOLDS, and it is the clause the conclusion actually rests on:
+  // nothing CAPTURES this forward, so §4.2's capture reason is still not live;
+  // and `ModelRegistry::Prepare` is called unconditionally from both
+  // `GPUModelRunner` constructors (runner.cpp:414, :455), so a `--load-only`
+  // run, or any run that never takes a step, would pay 16.5 GB of device memory
+  // for nothing on a unified-memory box that REBOOTS rather than OOM-kills.
+  // A2-Q2a therefore keeps building on first use and
+  // `PrepareNemotronHForCausalLM` stays a no-op.
   //
   // THIS IS NOT THE INTENDED END STATE. A2-P moves it to `Prepare` at exactly
-  // the moment §4.2's justification stops being false — when a production caller
-  // and a capture both exist. Do not read a lazy build here as a decision that
-  // the forward is the right home for it.
+  // the moment §4.2's justification stops being false — when a capture exists.
+  // Do not read a lazy build here as a decision that the forward is the right
+  // home for it.
   if (!mr.ready) BuildNemotronHMoeMarlinResident(d, w, params, mr);
 
   // --- router. f32 END TO END, exactly as the host arm does it
@@ -671,13 +729,13 @@ DBuf NemotronHMoeBlockDevice(Dev d, const NemotronHMoeWeights& w,
   // MODEL-DTYPE one widened, never a separately-computed f32 activation, so the
   // bf16 rounding the host arm applies first is applied here too by construction
   // (`dh` is already bf16).
-  DBuf gate = UploadOwned(d, w.gate, "mixer.gate.weight", DType::kF32, {E, H});
-  DBuf bias = UploadOwned(d, w.e_score_correction_bias,
-                          "mixer.gate.e_score_correction_bias", DType::kF32, {E});
+  Tensor gate = ResidentOwned(d, w.gate, "mixer.gate.weight", DType::kF32, {E, H}, mr.gate);
+  Tensor bias = ResidentOwned(d, w.e_score_correction_bias,
+                              "mixer.gate.e_score_correction_bias", DType::kF32, {E}, mr.bias);
   DBuf hf32(d, DType::kF32, {T, H});
   vt::CastF32(d.q, hf32.t(), dh);
   DBuf logits(d, DType::kF32, {T, E});
-  vt::MatmulBT(d.q, logits.t(), hf32.t(), gate.t());
+  vt::MatmulBT(d.q, logits.t(), hf32.t(), gate);
 
   DBuf topk_w(d, DType::kF32, {T, Kk});
   DBuf topk_id(d, DType::kI32, {T, Kk});
@@ -690,7 +748,7 @@ DBuf NemotronHMoeBlockDevice(Dev d, const NemotronHMoeWeights& w,
     args.topk_group = static_cast<int>(params.topk_group);
     // NOT params.routed_scaling_factor — see the block comment above.
     args.routed_scaling_factor = 1.0f;
-    Tensor bt = bias.t();
+    Tensor bt = bias;
     vt::MoeRouterTopK(d.q, topk_w.t(), topk_id.t(), logits.t(), args, &bt);
   }
 

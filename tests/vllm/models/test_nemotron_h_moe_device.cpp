@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -209,6 +210,120 @@ double MaxRel(const std::vector<float>& got, const std::vector<float>& want,
   return worst;
 }
 
+
+// ─── #1312: the instrument for "how many times per forward?" ────────────────
+//
+// A DELEGATING backend, not a fake one. This arm calls real Marlin kernels
+// through `d.q.handle`, so a backend that owned its own memory could not run the
+// block at all and the counts would be counts of a simulation. `CountingBackend`
+// forwards every one of `vt::Backend`'s entry points to the one already
+// registered and tallies two of them on the way through, so the arithmetic below
+// is over the same forward the equivalence case above measures.
+//
+// COPIES ARE COUNTED BY SOURCE HOST POINTER, NEVER BY BYTE COUNT. The router
+// gate is [E,H] f32 = 4096 bytes at this fixture's geometry, and a size-keyed
+// instrument would silently answer a different question the first time any other
+// transfer happened to be 4096 bytes wide. The source pointer is the weight's
+// own storage, so it cannot be confused with anything else.
+class CountingBackend final : public vt::Backend {
+ public:
+  explicit CountingBackend(vt::Backend* inner) : in_(inner) {}
+
+  // The two that are counted.
+  void Copy(Queue& q, void* dst, const void* src, size_t bytes) override {
+    ++copies_[src];
+    in_->Copy(q, dst, src, bytes);
+  }
+  void Synchronize(Queue& q) override {
+    ++syncs_;
+    in_->Synchronize(q);
+  }
+
+  int CopiesFrom(const void* src) const {
+    const auto it = copies_.find(src);
+    return it == copies_.end() ? 0 : it->second;
+  }
+  int Syncs() const { return syncs_; }
+  void Reset() {
+    copies_.clear();
+    syncs_ = 0;
+  }
+
+  // Pure delegation, in `include/vt/backend.h` declaration order. Every entry
+  // point is forwarded: a base implementation left inherited here would change
+  // behaviour (`CreateEvent` would hand back a null-handle event, `Alloc` would
+  // not compile), and a decorator that alters what it decorates is not one.
+  void* Alloc(size_t bytes) override { return in_->Alloc(bytes); }
+  void Free(void* p) override { in_->Free(p); }
+  void Memset(Queue& q, void* p, int value, size_t bytes) override {
+    in_->Memset(q, p, value, bytes);
+  }
+  Queue CreateQueue() override { return in_->CreateQueue(); }
+  void DestroyQueue(Queue& q) override { in_->DestroyQueue(q); }
+  void FlushPending() override { in_->FlushPending(); }
+  bool UnifiedMemory() const override { return in_->UnifiedMemory(); }
+  bool DeviceMemoryIsHostAddressable() const override {
+    return in_->DeviceMemoryIsHostAddressable();
+  }
+  bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes) const override {
+    return in_->DeviceMemoryInfo(free_bytes, total_bytes);
+  }
+  int DeviceCapabilityMajor() const override { return in_->DeviceCapabilityMajor(); }
+  int DeviceCapabilityMinor() const override { return in_->DeviceCapabilityMinor(); }
+  void* AllocPinned(size_t bytes) override { return in_->AllocPinned(bytes); }
+  void FreePinned(void* p) override { in_->FreePinned(p); }
+  vt::Event CreateEvent(bool blocking = false) override { return in_->CreateEvent(blocking); }
+  void DestroyEvent(vt::Event& e) override { in_->DestroyEvent(e); }
+  void RecordEvent(vt::Event& e, Queue& q) override { in_->RecordEvent(e, q); }
+  void SynchronizeEvent(vt::Event& e) override { in_->SynchronizeEvent(e); }
+  bool QueryEvent(vt::Event& e) override { return in_->QueryEvent(e); }
+  void QueueWaitEvent(Queue& q, vt::Event& e) override { in_->QueueWaitEvent(q, e); }
+  bool SupportsAuxStream() const override { return in_->SupportsAuxStream(); }
+  bool SupportsAsyncSampledTokenReadback() const override {
+    return in_->SupportsAsyncSampledTokenReadback();
+  }
+  bool SupportsCompressedConvState() const override {
+    return in_->SupportsCompressedConvState();
+  }
+  bool SupportsCompressedGdnState() const override {
+    return in_->SupportsCompressedGdnState();
+  }
+  bool SupportsGraphCapture() const override { return in_->SupportsGraphCapture(); }
+  void BeginCapture(Queue& q) override { in_->BeginCapture(q); }
+  void EndCapture(Queue& q) override { in_->EndCapture(q); }
+  void Replay(Queue& q) override { in_->Replay(q); }
+  void* EndCaptureGraph(Queue& q) override { return in_->EndCaptureGraph(q); }
+  void ReplayGraph(Queue& q, void* graph) override { in_->ReplayGraph(q, graph); }
+  void DestroyGraph(void* graph) override { in_->DestroyGraph(graph); }
+
+ private:
+  vt::Backend* in_;
+  std::map<const void*, int> copies_;
+  int syncs_ = 0;
+};
+
+// Install a backend for a scope and put the previous one back, including on the
+// way out through an exception. `RegisterBackend(DeviceType, ...)` writes the
+// SAME registry slot as `RegisterBackend(Device{type, 0}, ...)`
+// (`include/vt/backend.h:269-275`), so one call covers both lookups and one
+// restore undoes both.
+class BackendSwap {
+ public:
+  BackendSwap(DeviceType type, vt::Backend* installed)
+      : type_(type), prev_(vt::TryGetBackend(Device{type, 0})) {
+    vt::RegisterBackend(type_, installed);
+  }
+  ~BackendSwap() {
+    if (prev_ != nullptr) vt::RegisterBackend(type_, prev_);
+  }
+  BackendSwap(const BackendSwap&) = delete;
+  BackendSwap& operator=(const BackendSwap&) = delete;
+
+ private:
+  DeviceType type_;
+  vt::Backend* prev_;
+};
+
 }  // namespace
 
 // ─── the gate ───────────────────────────────────────────────────────────────
@@ -342,4 +457,114 @@ TEST_CASE("NemotronH A2-Q2a: the device MoE arm refuses a dense expert rather th
 
   const std::vector<float> x = SynthVec(static_cast<size_t>(T * H), 78, 0.5F);
   CHECK_THROWS(vllm::NemotronHMoeBlockDeviceHostIO(w, p, x, T, dt, dq));
+}
+
+// ─── #1312: the router pair is uploaded ONCE, not once per decode token ─────
+//
+// NO COMMA IN THIS NAME EITHER, for the reason the case above states.
+//
+// WHAT IS BEING ASSERTED, AND WHY A COUNT. `NemotronHMoeBlockDevice` used to
+// call `UploadOwned` for `mixer.gate.weight` and for
+// `mixer.gate.e_score_correction_bias` on every forward, and `UploadOwned` ends
+// in `d.b.Synchronize(d.q)` -- which the CUDA backend implements as
+// `cudaStreamSynchronize` (`src/vt/cuda/cuda_backend.cu:110`), a host-blocking
+// drain of the whole stream and NOT a no-op. The released checkpoint carries 23
+// MoE layers, so a decode token paid 46 host->device copies and 46 pipeline
+// drains for two tensors that do not change after load.
+//
+// A numeric gate cannot see any of that: the answer is identical either way,
+// which is exactly why the equivalence case above stayed green while this was
+// true. The observable is a COUNT, and it has to be taken over more than one
+// forward, because the first one is allowed to upload.
+//
+// T = 1 IS THE DECODE WIDTH and is not incidental. "46 per token" is a claim
+// about the step this model spends its whole generation in.
+TEST_CASE("NemotronH #1312: the device MoE router gate and bias upload once not once per forward") {
+  Queue dq{Device{DeviceType::kCPU, 0}, nullptr};
+  if (!TryCudaQueue(&dq)) {
+    NoteDeviceSkip("device MoE router residency");
+    return;
+  }
+  const NemotronHParams p = MoeParams();
+  const DType dt = DType::kBF16;
+  const int64_t T = 1;
+  const int64_t H = p.hidden_size;
+  const NemotronHMoeWeights w = MakeNvfp4Moe(p, dt);
+  const std::vector<float> x = SynthVec(static_cast<size_t>(T * H), 79, 0.5F);
+
+  vt::Backend* real = vt::TryGetBackend(Device{DeviceType::kCUDA, 0});
+  REQUIRE(real != nullptr);
+  // STATIC, deliberately. `DBuf` returns its pooled blocks to `ActivePool(*b_)`,
+  // which is keyed on the backend's ADDRESS, so a decorator that died at the end
+  // of this case would leave a pool keyed on a dead object for whatever landed at
+  // the same address next.
+  static CountingBackend counting(real);
+  counting.Reset();
+  const BackendSwap swap(DeviceType::kCUDA, &counting);
+
+  constexpr int kForwards = 3;
+  int gate_uploads[kForwards] = {0, 0, 0};
+  int bias_uploads[kForwards] = {0, 0, 0};
+  int syncs[kForwards] = {0, 0, 0};
+  std::vector<std::vector<float>> got;
+  int forwards_run = 0;
+  for (int i = 0; i < kForwards; ++i) {
+    counting.Reset();
+    got.push_back(vllm::NemotronHMoeBlockDeviceHostIO(w, p, x, T, dt, dq));
+    gate_uploads[i] = counting.CopiesFrom(w.gate.bytes.data());
+    bias_uploads[i] = counting.CopiesFrom(w.e_score_correction_bias.bytes.data());
+    syncs[i] = counting.Syncs();
+    ++forwards_run;
+    MESSAGE("forward " << (i + 1) << ": gate uploads " << gate_uploads[i]
+                       << ", bias uploads " << bias_uploads[i] << ", host syncs "
+                       << syncs[i]);
+  }
+  // The loop ran, or every count below is a count of nothing.
+  REQUIRE(forwards_run == kForwards);
+  REQUIRE(static_cast<int>(got.size()) == kForwards);
+
+  // EACH FORWARD COMPUTED A WHOLE ANSWER, asserted against the geometry rather
+  // than against its own length, and the three agree. Residency must not move a
+  // value: the same weights read from a device copy uploaded once are the same
+  // bytes as the same weights re-uploaded three times.
+  for (int i = 0; i < kForwards; ++i) {
+    INFO("forward " << (i + 1));
+    REQUIRE(got[static_cast<size_t>(i)].size() == static_cast<size_t>(T * H));
+  }
+  for (int i = 1; i < kForwards; ++i) {
+    int examined = 0;
+    int64_t n = 0;
+    const double drift = MaxRel(got[static_cast<size_t>(i)], got[0], &n);
+    examined = static_cast<int>(n);
+    MESSAGE("forward " << (i + 1) << " vs forward 1: worst relative deviation " << drift
+                       << " over " << examined << " elements");
+    REQUIRE(n == T * H);  // THE COUNT IS THE REPORT: a 0 over nothing is also 0
+    CHECK(drift == 0.0);
+  }
+
+  // ── the defect, stated as a count ─────────────────────────────────────────
+  // First use is allowed to upload the pair, and must: a residency slot that
+  // never filled would also report 0 on every later forward.
+  CHECK(gate_uploads[0] == 1);
+  CHECK(bias_uploads[0] == 1);
+  // No later forward uploads either one. Before #1312 was fixed both of these
+  // read 1 on every forward, which at 23 MoE layers is the 46 copies per decode
+  // token the issue names.
+  CHECK(gate_uploads[1] == 0);
+  CHECK(gate_uploads[2] == 0);
+  CHECK(bias_uploads[1] == 0);
+  CHECK(bias_uploads[2] == 0);
+
+  // ── and as a drain count ──────────────────────────────────────────────────
+  // The steady state is stable, so the number below is a state rather than a
+  // phase of the arena build.
+  REQUIRE(syncs[1] == syncs[2]);
+  // TWO, and each one is named: `UploadAs` of the activation
+  // (`nemotron_h_device.cpp:203`) and `DownloadF32` of the result (`:211`, via
+  // `DBuf::Download`). BOTH BELONG TO THIS HOST-IN/HOST-OUT TEST SEAM and have
+  // no counterpart in `NemotronHPagedForward`, which keeps the carry on the
+  // device. Before the fix this read 4; the extra two were the `UploadOwned`
+  // drain for the gate and the one for the bias, and those two are what a decode
+  // token paid 46 of.
+  CHECK(syncs[2] == 2);
 }

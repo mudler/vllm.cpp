@@ -610,8 +610,22 @@ ENGINE_PREFIXES = (
 # implementation, `model_loader.cpp:279-303`, reads an existing cache for the
 # DFlash draft alone and never downloads. `READY`, spec
 # `specs/hf-model-download.md`, issue #1280.
+# 168 since 2026-08-19: +`SPEC-BPE-QUADRATIC-MERGE` (the BPE merge loop is O(n^2)
+# in pretoken length, on the request path, before `ValidatePromptLen`). Genuinely
+# new and not expressible by the two tokenizer rows beside it: `LOAD-HF-BPE` and
+# `LOAD-SENTENCEPIECE` both own a FORMAT -- which `tokenizer.json` shapes parse and
+# which token identifiers come out -- and both are token-exact against HF goldens
+# today and stay that way. This row changes no identifier at all. It replaces the
+# algorithm underneath both of them, and its gate is a COST bound, which is the one
+# thing a token gate provably cannot see. It is also not a benchmark row: the encode
+# runs synchronously on the HTTP worker five lines before the only length check, so
+# `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
+# MEASURED at `31f93787c`: 65,535 bytes of one repeated character costs 28.1-48.1 s
+# of one core, and 64 KB of ordinary English prose costs 24.1 s through the committed
+# Mistral golden, growing n^2.0. `READY`, spec `specs/bpe-quadratic-merge.md`,
+# issue #1365.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 167
+ENGINE_ROWS = 168
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

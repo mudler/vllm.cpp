@@ -179,6 +179,14 @@ jobs:
       - name: The gate bring-up script resolves its values or refuses
         run: |
           python3 tests/scripts/test_gate_bringup.py
+      - name: scripts/ and tools/ resolve their values, refuse, and keep records
+        # Registered in TWO places, like the bring-up suite above: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`. Half of it guards
+        # the SECOND class of the #1190 rule -- the dated measurements that must
+        # STAY literal -- and that half is what a later blind sweep of the tree
+        # would trip, so it has to run on a lane nobody has to remember.
+        run: |
+          python3 tests/scripts/test_env_agnostic_tooling.py
       - name: The docs site's content invariants hold
         run: |
           python3 scripts/check-site.py

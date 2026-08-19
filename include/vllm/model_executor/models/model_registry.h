@@ -286,6 +286,25 @@ struct ModelForwardInput {
   // graph-captured and ours was not. DEFAULT 0 => the predicate reduces exactly
   // to today's pure-decode shape, so every non-spec caller is byte-identical.
   int64_t num_speculative_tokens = 0;
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, moved off
+  // `pure_decode` and onto the step's ACTUAL uniform query length.
+  //
+  // The runner computes it once per step through
+  // `v1::ActualUniformDecodeQueryLen` (`v1/worker/gpu/cudagraph_dispatch.h`) and
+  // every model reads the answer. 0 means "no captured decode graph in this tree
+  // can serve this step" -- prefill, mixed, ragged, or uniform at a length above
+  // the configured `1 + num_speculative_tokens`. 1 is exactly `pure_decode`.
+  // A value ABOVE 1 is a speculative VERIFY step at its actual draft depth,
+  // which is the population [#1020] named and which the two Qwen3.5 drivers
+  // serve.
+  //
+  // WHY `pure_decode` SURVIVES BESIDE IT. Seven of the nine decode drivers
+  // capture a query_len == 1 shape and nothing else, and widening them here
+  // would admit steps no driver can serve -- the exact failure the spec's
+  // `## Work breakdown` W6 says to avoid by ordering this stage last. They keep
+  // reading `pure_decode`, which is provably NARROWER than this field, so the
+  // widening is opt-in per driver rather than imposed on all nine at once.
+  int64_t uniform_query_len = 0;
   bool gather_logits = true;
   // SPEC-MTP I5d-pre hidden-state tap. When non-null (only the spec verify
   // forward sets it, I5d), the Qwen3.5 dense/MoE forward routes to
@@ -369,6 +388,33 @@ struct ModelFactory {
   // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
   // switch over.
   bool supports_weight_offload = false;
+  // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124): whether THIS model's forward
+  // reads its routed-expert weights through the expert-stream slot seam
+  // (`KqExpertSlice`), so the stacked `*_exps.weight` towers are served a slice
+  // at a time out of the host slot store instead of being staged.
+  //
+  // THE DEFAULT IS FALSE FOR THE SAME REASON `supports_weight_offload`'s is, and
+  // this one is load-bearing in the UNSAFE direction. The load-time fit bound
+  // (`gguf_device_fit.h`) can drop a tensor set from what it charges the device,
+  // and the loader identifies that set by NAME — `_exps.weight`, which is what a
+  // llama.cpp MoE export writes for every MoE family it converts, not only the
+  // ones this tree streams. `deepseek_v4_weights.cpp` and `laguna_weights.cpp`
+  // both write that exact suffix, and neither model composes `RunMoeBlock`
+  // (`deepseek_v2.cpp` says so at its head), so neither ever reaches
+  // `KqExpertSlice`. Dropping their towers from the bound would remove a REFUSAL
+  // THAT WAS CORRECT and put back the failure #1123 exists to prevent: a
+  // 26-minute load and then `cudaMalloc: out of memory` on the first forward.
+  //
+  // WHY THE CAPABILITY AND NOT AN ARCHITECTURE LIST. The fact is a property of
+  // the model's forward, and it lives beside the forward: `qwen3_5_moe.cpp` and
+  // `qwen3_moe_registry.cpp` are the two translation units that route into
+  // `RunMoeBlock`, and they are the two that set this. A list in the loader would
+  // be a second description of the same fact, in a file that cannot see when the
+  // first one changes — and a model whose forward stopped streaming would leave
+  // the list saying it still does. Inheriting false is the safe answer: a new
+  // architecture gets the whole bound and the #1123 refusal until somebody wires
+  // the seam and says so here.
+  bool streams_routed_experts = false;
 };
 
 struct ModelRegistration {

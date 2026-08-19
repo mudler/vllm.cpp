@@ -1102,6 +1102,7 @@ add_library(vllm STATIC
   src/vllm/v1/core/sched/async_scheduler.cpp
   src/vllm/v1/core/sched/utils.cpp
   src/vllm/v1/worker/gpu/block_table.cpp
+  src/vllm/v1/worker/gpu/cudagraph_dispatch.cpp
   src/vllm/v1/worker/gpu/input_batch.cpp
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
   src/vllm/v1/worker/gpu/async_output.cpp

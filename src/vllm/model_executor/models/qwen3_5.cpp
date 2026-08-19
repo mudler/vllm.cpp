@@ -13,6 +13,7 @@
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) slot-key + dispatch counters
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
@@ -1093,6 +1094,26 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   VT_CHECK(!w.elem_kn_repacked,
            "qwen3_5: an elem_kn_repacked ([K,N]) weight reached device staging; "
            "VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
+  // ENG-EXPERT-STREAM-DEVICE W0c (issues #1123, #1124). THE ALLOCATION THIS
+  // ROW EXISTS TO PREVENT, guarded at the one line that makes it.
+  //
+  // `nb` below is `w.bytes.size()` — the WHOLE stacked `[E*N,K]` tower, which on
+  // `Qwen3.8-2.4T-A95B UD-Q1_0` is 1,275,068,416 bytes, 512 experts at once. The
+  // streamed lane exists so that exactly one 2,490,368-byte slice of it is
+  // resident at a time. A tower that has been claimed by the lane and then
+  // reaches this branch has therefore defeated the lane completely, and it does
+  // so INVISIBLY: the first 48 towers fit, and the load dies partway through
+  // layer 16 of 93 with `cudaMalloc: out of memory` (issue #1123). Failing here,
+  // by name, turns that into one legible error at the first tower.
+  //
+  // It is a tripwire and not a reachable production path — see the field's
+  // comment in qwen3_5_weights.h for the two routes that would otherwise arrive
+  // here and why neither can today.
+  VT_CHECK(!w.expert_streamed,
+           "qwen3_5: a STREAMED expert tower reached device staging; the "
+           "expert-stream lane serves its slices from host slot storage and the "
+           "whole tower must never be uploaded (ENG-EXPERT-STREAM-DEVICE W0c, "
+           "issues #1123 and #1124)");
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
@@ -5330,10 +5351,22 @@ std::vector<uint16_t> ExpertMlp(Dev d, const OwnedTensor& gate,
 // expert tower `w` [E*out, in]. Byte-IDENTICAL to MatmulF32/MatmulBf16 on a standalone
 // per-expert OwnedTensor (same kMatmulBTQuant core, same slice bytes). CRITICAL: the
 // whole tower is made DEVICE-RESIDENT via ResidentWeight (CUDA `needs_weight_staging`
-// is TRUE — the kernel CANNOT read host bytes; a raw-host-ptr view produces garbage),
-// staged ONCE (cached on `w.d_dev`) and REUSED per expert; the slice offsets the
-// RESIDENT ptr. The tower is nk=true ([N,K]) so MatmulBT applies (row = whole blocks,
-// row_off*row_bytes never cuts a block).
+// is TRUE), staged ONCE (cached on `w.d_dev`) and REUSED per expert; the slice offsets
+// the RESIDENT ptr. The tower is nk=true ([N,K]) so MatmulBT applies (row = whole
+// blocks, row_off*row_bytes never cuts a block).
+//
+// THIS COMMENT USED TO SAY "the kernel CANNOT read host bytes; a raw-host-ptr view
+// produces garbage", FULL STOP, AND THAT IS NO LONGER TRUE OF EVERY STAGING PLATFORM
+// (ENG-EXPERT-STREAM-DEVICE W0c, issue #1124). It is still true of a DISCRETE one, and
+// that is why this function exists and why a discrete device keeps taking it. But
+// `KqHostSliceView` twenty lines below deliberately builds exactly the raw-host-ptr
+// view the old sentence forbade, on a platform whose probed
+// `host_memory_is_device_addressable()` says its kernels can follow a host pointer —
+// a GB10, where `PageableMemoryAccess` and `Integrated` are both 1 (W0a, measured).
+// The predicate is what separates the two cases; "CUDA stages, therefore host bytes
+// are unreadable" was a conflation of two different device properties, and it is the
+// same conflation `interface.h` warns about where it says `is_unified_memory()` and
+// `is_integrated_gpu()` are the WRONG predicate for staging.
 Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
                        int64_t row_off) {
   const Tensor whole = ResidentWeight(d, w);  // stage/view the WHOLE tower (cached)
@@ -5820,6 +5853,33 @@ struct Qwen35ExpertStreamStep {
   }
 };
 
+// A [N,K] weight tensor over HOST-resident slice bytes — a slot, or the tower's
+// own mapping — carrying exactly the markers `ResidentWeight`'s ALIASING branch
+// carries and nothing else.
+//
+// WHY THIS IS NOT `ResidentWeight` WITH THE POINTER OVERWRITTEN, which is what
+// the slot arm used to do (ENG-EXPERT-STREAM-DEVICE W0c, issue #1124). That call
+// existed solely to inherit dtype/device/repack markers, and on CPU it aliases
+// and costs nothing. On a WEIGHT-STAGING platform it takes the other branch and
+// runs `d.b.Alloc(w.bytes.size())` on the whole `[E*N,K]` tower — 1.1875 GiB —
+// and memoizes it on `w.d_dev`. So the very first streamed slice allocated the
+// thing streaming exists to avoid, and lifting the `is_cpu()` guard below
+// without this helper reproduces issue #1123 instead of fixing it.
+//
+// The marker set is inherited by TRANSCRIPTION rather than by call, so it is
+// worth saying what it is and what it deliberately omits. `repacked` and
+// `elem_kn_repacked` are copied, exactly as the aliasing branch copies them.
+// `q8_0_aligned` is NOT, also exactly as that branch does not: `MakeTensor`
+// drops it and `ResidentWeight` never restores it on either branch, so copying
+// it here would change the CPU lane's bytes rather than preserve them.
+Tensor KqHostSliceView(Dev d, const OwnedTensor& w, uint8_t* data, int64_t N,
+                       int64_t K) {
+  Tensor wt = MakeTensor(static_cast<void*>(data), w.dtype, d.q.device, {N, K});
+  wt.repacked = w.repacked;
+  wt.elem_kn_repacked = w.elem_kn_repacked;
+  return wt;
+}
+
 // The expert-slice seam. Identical to KqResidentSlice except that, when
 // streaming is on, the returned tensor points at a SLOT holding a contiguous
 // copy of the slice rather than into the tower itself.
@@ -5827,23 +5887,51 @@ Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
                      int64_t row_off, int64_t expert) {
   const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
   const size_t bytes = static_cast<size_t>(N) * row_bytes;
-  // Streaming only serves a CPU-resident borrowed tower: a staged device weight
-  // is already resident on the device, and copying it through host slots would
-  // move MORE bytes, not fewer.
-  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+  const vllm::platforms::Platform& p =
+      vllm::platforms::GetPlatform(d.q.device.type);
+  const bool cpu = p.is_cpu();
+  // ENG-EXPERT-STREAM-DEVICE W0b/W0c (issue #1124). The lane serves slices out
+  // of HOST storage — `HostExpertSlotStore`'s arena is a `std::vector<uint8_t>`
+  // — so the question is not "is this the CPU" but "can this platform's kernels
+  // READ host storage". `is_cpu()` is one answer to that;
+  // `host_memory_is_device_addressable()` is the probed answer for the rest, and
+  // it is what lets a GB10 serve a 369.96 GiB checkpoint out of a 119.631 GiB
+  // pool instead of refusing the load.
+  //
+  // A DISCRETE device answers false, keeps falling through to KqResidentSlice,
+  // and therefore keeps hitting the #1123 load-time refusal. That is correct
+  // for it: a slot store it cannot read is not a lane, and giving it one is
+  // W1/W2's job, not this branch's.
+  if (cpu || p.host_memory_is_device_addressable()) {
     if (Qwen35ExpertStream* st = Qwen35ExpertStream::Get(bytes)) {
+      // Claim the tower for the lane BEFORE taking a slice, so the refusal in
+      // ResidentWeight covers the whole tower rather than only the slices that
+      // happened to be served. A tower the lane touched at all must never be
+      // staged.
+      w.expert_streamed = true;
       const uint8_t* base = w.bytes.data();
       if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
                                     static_cast<size_t>(row_off) * row_bytes,
                                     bytes, w.mmap_fd, w.mmap_file_offset)) {
-        Tensor wt = ResidentWeight(d, w);  // inherit dtype/device/repack markers
-        wt.data = static_cast<void*>(slot);
-        wt.rank = 2;
-        wt.shape[0] = N;
-        wt.shape[1] = K;
-        wt.stride[0] = K;
-        wt.stride[1] = 1;
-        return wt;
+        return KqHostSliceView(d, w, slot, N, K);
+      }
+      // The cache could not serve this slice. On CPU that falls through to the
+      // unchanged KqResidentSlice below, which aliases the tower and is what
+      // every existing arm-comparison gate measures.
+      //
+      // On a host-addressable DEVICE it must NOT: KqResidentSlice would stage
+      // the whole 1.1875 GiB tower, and this branch is not rare. Prefill takes
+      // it thousands of times by construction — the peak protected set for a
+      // T-token prompt is `93 x 3 x min(512, 10*T)` slices, which saturates at
+      // 331 GiB for any T >= 52, so no slot budget makes prefill fit. Reading
+      // the tower's own host bytes in place is exactly what the CPU arm does,
+      // costs nothing, and is correct precisely because this platform said its
+      // kernels can follow a host pointer.
+      if (!cpu) {
+        return KqHostSliceView(
+            d, w,
+            const_cast<uint8_t*>(base) + static_cast<size_t>(row_off) * row_bytes,
+            N, K);
       }
     }
   }
@@ -7664,6 +7752,22 @@ detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
 
 void detail::ExpertStreamSetForceFallback(bool on) {
   Qwen35ExpertStream::SetForceFallback(on);
+}
+
+// ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). See the declarations in
+// qwen3_5_internal.h for what these reach and what they deliberately do not
+// claim to prove. Both are one-line delegations to the production helpers, so a
+// gate observes exactly the code the forward runs and not a copy of it.
+vt::Tensor detail::ExpertSliceForTest(vt::Queue& q, const OwnedTensor& w,
+                                      int64_t N, int64_t K, int64_t row_off,
+                                      int64_t expert) {
+  Dev d{vt::GetBackend(q.device.type), q};
+  return KqExpertSlice(d, w, N, K, row_off, expert);
+}
+
+void detail::StageWeightForTest(vt::Queue& q, const OwnedTensor& w) {
+  Dev d{vt::GetBackend(q.device.type), q};
+  (void)ResidentWeight(d, w);
 }
 
 void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
@@ -9569,6 +9673,88 @@ void CopyInPlace(std::optional<std::vector<T>>& dst,
   CopyInPlace(*dst, *src);
 }
 
+// ENG-CUDAGRAPH-BREAK W6 (#1374): THE DECODE-GRAPH SLOT KEY, closing the half of
+// [#1020](https://github.com/mudler/vllm.cpp/issues/1020) that is not the
+// predicate.
+//
+// The ring used to be keyed on the padded token count S ALONE, and `Refresh`'s
+// own comment already recorded the residual: "the slot ring is keyed on S alone,
+// and two different uniform query lengths can now reach one key". That was
+// harmless only while the predicate admitted exactly one query length per
+// engine, which is the guarantee W6 removes.
+//
+// IT WAS NOT ONLY A FUTURE HAZARD. `S = spec_step ? B : PadToCaptureSize(B)`, so
+// a SPEC step of 4 requests at 1+1 tokens and a NON-SPEC padded step of 8
+// requests both land on S == 8 TODAY. The two carry different metadata --
+// `num_spec_decodes`, `spec_query_start_loc`, `num_accepted_tokens` -- and the
+// second would replay a graph captured against the first. `Refresh` copies IN
+// PLACE only while the sizes match; a size change reassigns the vector, so the
+// step that follows a shape swap also moves the host addresses a capture baked
+// (spec `## Risks/decisions` D2). Silently wrong logits, invisible to a token
+// gate.
+//
+// `spec` is in the key and `query_len` alone is not enough for the same reason:
+// a spec step whose requests each carry ONE token is uniform at q == 1 and still
+// carries spec segmentation, so it must not share a ring with a padded pure
+// decode of the same width.
+struct DecodeGraphSlotKey {
+  int64_t size = 0;       // S, the captured token count
+  int64_t query_len = 1;  // the uniform query length the graph was captured for
+  bool spec = false;      // the step carried spec-decode segmentation
+};
+inline bool operator<(const DecodeGraphSlotKey& a, const DecodeGraphSlotKey& b) {
+  if (a.size != b.size) return a.size < b.size;
+  if (a.query_len != b.query_len) return a.query_len < b.query_len;
+  return static_cast<int>(a.spec) < static_cast<int>(b.spec);
+}
+
+// The bound on how many DISTINCT speculative query lengths one driver captures.
+//
+// WHY A BOUND EXISTS AT ALL. Before W6 the predicate admitted one query length
+// per engine, so the spec shape count was bounded by `max_num_seqs`. Reading the
+// step's ACTUAL length multiplies that ceiling by `1 + k`, and every shape
+// retains an [S, vocab] f32 logits block plus an [S, H] hidden -- at a 151k
+// vocabulary the logits alone are ~0.6 MB per token of S, times two ring slots.
+// An unbounded widening is a memory regression nobody measured, so the widening
+// is bounded, tunable and COUNTED rather than open.
+//
+// The default of 2 is the smallest value that admits anything new: one steady-
+// state length (the configured `1 + k`, which every unclamped verify takes) plus
+// one clamped length. `VT_SPEC_GRAPH_MAX_QLENS=0` removes the bound; a larger
+// value widens it. A step past the bound falls to the eager arm, which is
+// exactly what it did before W6, and `qlen_cap_declines` reports it.
+inline int64_t SpecQueryLenCap() {
+  static const int64_t cap = [] {
+    const char* v = std::getenv("VT_SPEC_GRAPH_MAX_QLENS");
+    if (v == nullptr || v[0] == '\0') return static_cast<int64_t>(2);
+    return static_cast<int64_t>(std::strtoll(v, nullptr, 10));
+  }();
+  return cap;
+}
+
+// True when capturing `key` would push this driver past `SpecQueryLenCap()`
+// distinct speculative query lengths. A key already in the map is never capped:
+// declining a shape the driver already holds a graph for would strand it.
+template <class MapT>
+bool DecodeGraphQueryLenCapped(const MapT& slots, const DecodeGraphSlotKey& key) {
+  if (!key.spec || key.query_len <= 1) return false;
+  const int64_t cap = SpecQueryLenCap();
+  if (cap <= 0) return false;
+  if (slots.find(key) != slots.end()) return false;
+  // The map is ordered by (size, query_len, spec), so equal query lengths are
+  // NOT adjacent and a run-length count would over-report. Collect them; the
+  // set is bounded by the cap plus one and this runs once per step.
+  std::vector<int64_t> seen;
+  for (const auto& kv : slots) {
+    if (!kv.first.spec || kv.first.query_len <= 1) continue;
+    if (kv.first.query_len == key.query_len) return false;
+    if (std::find(seen.begin(), seen.end(), kv.first.query_len) == seen.end()) {
+      seen.push_back(kv.first.query_len);
+    }
+  }
+  return static_cast<int64_t>(seen.size()) >= cap;
+}
+
 // The decode-graph capture set + pad-to-capture selector live in
 // vllm/model_executor/models/decode_graph_sizes.h (DecodeGraphSizes /
 // PadToCaptureSize), derived from max_num_seqs to mirror vLLM's
@@ -10030,7 +10216,7 @@ struct Qwen3_5DecodeGraph::Impl {
     SizeSlot slot[2];
     int next = 0;
   };
-  std::map<int64_t, SlotRing> slots;  // padded size S -> parity ring
+  std::map<DecodeGraphSlotKey, SlotRing> slots;  // (S, q, spec) -> parity ring
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
 };
@@ -10076,7 +10262,23 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // because num_reqs is.
   const bool spec_step = gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
-  if (!impl_->enabled || S < 0 ||
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
+  // ring key built from it. `Q == 0` means the batch does not divide evenly into
+  // its requests, which no captured decode shape describes.
+  const int64_t Q = (attn_meta.num_reqs > 0 && B % attn_meta.num_reqs == 0)
+                        ? B / attn_meta.num_reqs
+                        : 0;
+  const DecodeGraphSlotKey key{S, Q, spec_step};
+  // A q > 1 batch that carries NO spec segmentation is refused rather than
+  // captured, and this is a TIGHTENING that arrived with the widening. `S` for a
+  // non-spec step is `PadToCaptureSize(B)` and `BuildPaddedDecode` rewrites the
+  // metadata as a pure decode of S single-token requests, which is not what a
+  // multi-token-per-request batch is. The predicate never sent one here, but it
+  // was the predicate saying so and nothing in the driver.
+  const bool servable_shape = Q >= 1 && (Q == 1 || spec_step);
+  const bool qlen_capped = DecodeGraphQueryLenCapped(impl_->slots, key);
+  if (qlen_capped) v1::NoteDecodeGraphQueryLenDecline();
+  if (!impl_->enabled || S < 0 || !servable_shape || qlen_capped ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
     if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
@@ -10098,7 +10300,12 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // this step's slot from the size's parity ring (alternating), and host-wait its
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
-  Impl::SlotRing& ring = impl_->slots[S];
+  const bool new_shape = impl_->slots.find(key) == impl_->slots.end();
+  Impl::SlotRing& ring = impl_->slots[key];
+  // W6: a distinct captured shape is the observable the widening is measured by.
+  // Without it a two-shape driver and a one-shape driver are indistinguishable
+  // from outside, which is how #1020 stayed silent.
+  if (new_shape) v1::NoteDecodeGraphShape();
   // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
   // inputs. The per-call StepDevInputs is a pool block freed when the call
   // returns, so a graph captured against it replays over recycled memory.
@@ -10529,7 +10736,7 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     SizeSlot slot[2];
     int next = 0;
   };
-  std::map<int64_t, SlotRing> slots;  // padded size S -> parity ring
+  std::map<DecodeGraphSlotKey, SlotRing> slots;  // (S, q, spec) -> parity ring
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
 };
@@ -10574,7 +10781,23 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // because num_reqs is.
   const bool spec_step = gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
-  if (!impl_->enabled || S < 0 ||
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
+  // ring key built from it. `Q == 0` means the batch does not divide evenly into
+  // its requests, which no captured decode shape describes.
+  const int64_t Q = (attn_meta.num_reqs > 0 && B % attn_meta.num_reqs == 0)
+                        ? B / attn_meta.num_reqs
+                        : 0;
+  const DecodeGraphSlotKey key{S, Q, spec_step};
+  // A q > 1 batch that carries NO spec segmentation is refused rather than
+  // captured, and this is a TIGHTENING that arrived with the widening. `S` for a
+  // non-spec step is `PadToCaptureSize(B)` and `BuildPaddedDecode` rewrites the
+  // metadata as a pure decode of S single-token requests, which is not what a
+  // multi-token-per-request batch is. The predicate never sent one here, but it
+  // was the predicate saying so and nothing in the driver.
+  const bool servable_shape = Q >= 1 && (Q == 1 || spec_step);
+  const bool qlen_capped = DecodeGraphQueryLenCapped(impl_->slots, key);
+  if (qlen_capped) v1::NoteDecodeGraphQueryLenDecline();
+  if (!impl_->enabled || S < 0 || !servable_shape || qlen_capped ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
     if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
@@ -10595,7 +10818,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // this step's slot from the size's parity ring (alternating), and host-wait its
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
-  Impl::SlotRing& ring = impl_->slots[S];
+  const bool new_shape = impl_->slots.find(key) == impl_->slots.end();
+  Impl::SlotRing& ring = impl_->slots[key];
+  // W6: a distinct captured shape is the observable the widening is measured by.
+  // Without it a two-shape driver and a one-shape driver are indistinguishable
+  // from outside, which is how #1020 stayed silent.
+  if (new_shape) v1::NoteDecodeGraphShape();
   // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
   // inputs. The per-call StepDevInputs is a pool block freed when the call
   // returns, so a graph captured against it replays over recycled memory.

@@ -460,8 +460,14 @@ struct CudaGdnCachePool {
   std::vector<void*> owned;
   std::vector<PagedKvCache> attn_kv;
   std::vector<vllm::GdnStateCache> gdn_state;
+  // `spec_mql` is the longest speculative query length this pool must serve.
+  // `causal_conv1d_spec_update` derives it from the conv state WIDTH --
+  // `state_len = (K - 1) + (mql - 1)` (`src/vt/ops.cpp:1903`) -- so a pool built
+  // at the plain decode width refuses every q above 1. Default 1 keeps every
+  // pre-W6 case byte-identical.
   CudaGdnCachePool(vt::Backend& backend, vt::Queue& q, const HfConfig& c,
-                   int64_t num_blocks, int64_t block_size)
+                   int64_t num_blocks, int64_t block_size,
+                   int64_t spec_mql = 1)
       : b(backend) {
     const vt::Device dev{vt::DeviceType::kCUDA, 0};
     const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
@@ -482,8 +488,10 @@ struct CudaGdnCachePool {
             alloc(static_cast<size_t>(num_blocks * Hv * Dv * Dk) * sizeof(float)),
             DType::kF32, dev, {num_blocks, Hv, Dv, Dk});
         gs.conv_state = vt::Tensor::Contiguous(
-            alloc(static_cast<size_t>(num_blocks * conv_dim * (Kw - 1)) * sizeof(float)),
-            DType::kF32, dev, {num_blocks, conv_dim, Kw - 1});
+            alloc(static_cast<size_t>(num_blocks * conv_dim *
+                                      (Kw - 1 + spec_mql - 1)) *
+                  sizeof(float)),
+            DType::kF32, dev, {num_blocks, conv_dim, Kw - 1 + spec_mql - 1});
         gdn_state.push_back(gs);
       } else {
         PagedKvCache kv;
@@ -856,4 +864,139 @@ TEST_CASE("G1 CUDA: Qwen3_5DenseDecodeGraph replays bit-exactly against eager, 3
   MESSAGE("G1 Qwen3_5DenseDecodeGraph on CUDA: 5 steps x "
           << c.vocab_size << " logits, " << total << " differing, "
           << graphed.replay_count() << " replays");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// G1 FOR ENG-CUDAGRAPH-BREAK W6 (#1374): the ring key on a REAL DEVICE, and the
+// defect that BLOCKS it ([#1380](https://github.com/mudler/vllm.cpp/issues/1380)).
+//
+// WHAT W6 OWES HERE. The CPU seam gate proves the `(S, q, spec)` key opens TWO
+// rings for two spec shapes of equal S, by counting them. It cannot prove the
+// second ring replays the RIGHT graph, because a CPU replay recomputes nothing --
+// the whole reason this file exists. The device case for that needs two spec
+// shapes to capture.
+//
+// NOT ONE CAN. Measured on `thor:gpu0` (sm_110, driver 595.78, nvcc 13.0.88,
+// source `524d46cc7`, through an `rc` lease): ONE driver, ONE cache pool, ONE
+// shape -- two requests verifying three tokens each -- throws
+// `cudaMalloc: operation not permitted when stream is capturing` on the first
+// step that opens a capture scope. Reproduced with the case run alone in a fresh
+// process, so it is neither the ring key, nor pool pressure from the five cases
+// above, nor two interleaved drivers. Those five read 2066 assertions and 0
+// differing on the same binary, so W6 does not regress them.
+//
+// SO THIS CASE PINS THE BLOCKER RATHER THAN CLAIMING THE GATE. It asserts the
+// refusal it actually finds and names the issue. **It is written to FAIL when
+// #1380 is fixed**, which is deliberate: whoever fixes the capture inherits a red
+// that points at the assertion W6 actually wanted, three lines below in a
+// comment. A case that quietly skipped instead would leave the row recording a
+// gate nobody ever ran.
+namespace {
+
+vllm::v1::GDNAttentionMetadata SpecGdnMeta(int32_t reqs, int32_t q) {
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 0;
+  gm.num_prefill_tokens = 0;
+  gm.num_decodes = 0;
+  gm.num_decode_tokens = 0;
+  gm.num_spec_decodes = reqs;
+  gm.num_spec_decode_tokens = reqs * q;
+  gm.num_actual_tokens = reqs * q;
+  gm.spec_state_indices_num_cols = q;
+  std::vector<int32_t> ssi(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (int32_t r = 0; r < reqs; ++r)
+    for (int32_t j = 0; j < q; ++j) ssi[static_cast<size_t>(r * q + j)] = r;
+  gm.spec_state_indices_tensor = std::move(ssi);
+  std::vector<int32_t> sqsl(static_cast<size_t>(reqs) + 1);
+  for (int32_t r = 0; r <= reqs; ++r) sqsl[static_cast<size_t>(r)] = r * q;
+  gm.spec_query_start_loc = std::move(sqsl);
+  gm.spec_sequence_masks = std::vector<uint8_t>(static_cast<size_t>(reqs), 1);
+  std::vector<int32_t> stx(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (size_t i = 0; i < stx.size(); ++i) stx[i] = static_cast<int32_t>(i);
+  gm.spec_token_indx = std::move(stx);
+  gm.num_accepted_tokens = std::vector<int32_t>(static_cast<size_t>(reqs), 1);
+  return gm;
+}
+
+CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
+  CommonAttentionMetadata am;
+  am.num_reqs = reqs;
+  am.num_actual_tokens = reqs * q;
+  am.query_start_loc.resize(static_cast<size_t>(reqs) + 1);
+  for (int32_t r = 0; r <= reqs; ++r)
+    am.query_start_loc[static_cast<size_t>(r)] = r * q;
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens.assign(static_cast<size_t>(reqs), pos + q);
+  am.seq_lens_cpu = am.seq_lens;
+  am.max_query_len = q;
+  am.max_seq_len = pos + q;
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(static_cast<size_t>(reqs), 0);
+  am.slot_mapping.resize(static_cast<size_t>(reqs) * static_cast<size_t>(q));
+  for (size_t i = 0; i < am.slot_mapping.size(); ++i)
+    am.slot_mapping[i] = pos + static_cast<int32_t>(i);
+  am.causal = true;
+  return am;
+}
+
+// Token ids for a spec step. `base + n` must stay inside the vocabulary -- the
+// first head used base 50 against a 40-entry embedding table and the CUDA embed
+// refused it on device, which is the one failure mode this helper can have.
+std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
+  std::vector<int32_t> v(static_cast<size_t>(n));
+  for (int32_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = base + i;
+  return v;
+}
+
+}  // namespace
+
+// THE CONTROL FOR THE CASE BELOW, and it has to run FIRST. The collision case
+// drives two spec shapes; if a SINGLE spec shape cannot capture on this device
+// at all, that case's failure says nothing about the ring key. This one drives
+// one shape, one driver, from a clean process.
+TEST_CASE("G1 CUDA W6: which spec step is refused on device (#1380)") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
+    return;
+  }
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  const HfConfig c = Qwen35DenseConfig();
+  const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
+  REQUIRE(c.vocab_size >= 26);  // the id range below, asserted not assumed
+  CudaGdnCachePool cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
+                         /*spec_mql=*/3);
+  vllm::Qwen3_5DenseDecodeGraph arm(w, c, q, /*max_num_reqs=*/4);
+
+  // Five steps, each recorded rather than aggregated, because the whole question
+  // is WHICH step is refused. A spec step always takes the two-slot parity ring
+  // (`dbuf = impl_->dbuf || spec_step`), so the sequence is: slot 0 cold, slot 1
+  // cold, slot 0 CAPTURES, slot 1 CAPTURES, slot 0 REPLAYS. A replay is
+  // unreachable unless BOTH slots capture.
+  std::vector<std::string> failed(5);
+  std::vector<int> captured_after(5, -1);
+  for (int step = 0; step < 5; ++step) {
+    try {
+      Read(b, q,
+           arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                    SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
+           c.vocab_size * 6);
+    } catch (const std::exception& e) {
+      failed[static_cast<size_t>(step)] = e.what();
+    }
+    captured_after[static_cast<size_t>(step)] = arm.captured() ? 1 : 0;
+  }
+  for (int step = 0; step < 5; ++step) {
+    MESSAGE("spec step " << step << ": captured=" << captured_after[static_cast<size_t>(step)]
+            << " threw='" << failed[static_cast<size_t>(step)] << "'");
+  }
+  // The two cold steps and the FIRST capture complete. This is what separates
+  // "the spec path is broken" from "the SECOND ring slot's capture is refused",
+  // and the difference matters: the first is a dead feature, the second is a
+  // feature that can never reach a REPLAY.
+  CHECK(failed[0].empty());
+  CHECK(failed[1].empty());
+  CHECK(failed[2].empty());
+  CHECK(captured_after[2] == 1);
+  MESSAGE("G1 W6 on this device: replays=" << arm.replay_count());
 }

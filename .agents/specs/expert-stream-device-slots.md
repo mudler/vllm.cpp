@@ -10,11 +10,124 @@ platform may read it.
 
 ## Now
 
-`READY`, spec committed, no implementation. W0 is the critical path: today
-`--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` refuses at load by design
-(`76f2a6d84`, issue #1123), so **there is no GPU number for this checkpoint to
-take at all**, and nothing downstream of W0 produces one on the hardware this
-project owns. The developer's target is that GPU figure.
+`ACTIVE`. **W0a HAS RUN on `dgx:gpu0` and answered `PAGEABLE_OK`. W0b, W0c and
+W0d are implemented and unit-gated on the CPU tier. W0e is still QUEUED behind
+the lease, so no decode number exists yet and none is claimed.**
+
+What that means precisely, because "W0 landed" would overstate it:
+
+* **W0b — the predicate.** `Platform::host_memory_is_device_addressable()`,
+  base false, CUDA from `cudaDevAttrPageableMemoryAccess AND
+  cudaDevAttrIntegrated` probed at registration, ROCm from the pair its backend
+  already probes. Gated in `test_platform` (14 cases / 114 assertions), which
+  pins the DEFAULT and the INDEPENDENCE from all four neighbouring predicates.
+  **The CONJUNCTION itself was gated by nothing until #1378**, and that is a
+  measurement rather than a suspicion: both attributes read 1 on the only CUDA
+  box this project can reach, so `test_platform`'s implication assertion and its
+  board value both survive the deletion of either term, and the fresh review of
+  #1377 ran both deletions and got GREEN twice. The decision is now
+  `HostMemoryIsDeviceAddressableFromAttrs(pageable, integrated)`, a pure function
+  in the always-compiled `platforms/platform.cpp` that `cuda.cpp`'s registrar
+  calls, gated over all four attribute pairs on a tier with no CUDA device.
+  Both deletions were re-run against the extracted function and both are now
+  RED: 14 cases with 1 failed and 114 assertions with 2 failed, exit status 1,
+  compile status 0, no ENOSPC in the build log, `git diff --stat` showing the
+  edit applied, and `platform.cpp` restored byte-identical by sha256 afterwards.
+  What is STILL owed is the CUDA registrar's own probe assembly — the
+  `cudaDeviceGetAttribute` calls and the failure defaults around them — which
+  compiles only in a CUDA build; that row is under `## Owed`, and this bullet no
+  longer claims more than it has.
+* **W0c — the slot arm without the tower.** The seam takes the slot arm on
+  `is_cpu() || host_memory_is_device_addressable()`, builds the slice tensor
+  through a new `KqHostSliceView` instead of `ResidentWeight` (whose staging
+  branch is the 1.1875 GiB allocation #1123 died on), reads the tower in place
+  when the cache cannot serve a slice on a non-CPU platform, and refuses by
+  name if a claimed tower ever reaches device staging. Gated in the new
+  `test_expert_stream_device_slot` (5 cases / 38 assertions) over a fake
+  staging, host-addressable platform, because no CPU tier can register a real
+  one.
+* **W0d — the conditional refusal.** The fit bound gained a
+  `StreamedExpertLane` input; the loader fills it when the platform stages, can
+  read host slots, the resolved model's factory declares
+  `streams_routed_experts`, the config says streaming is on, and **this file's
+  expert towers actually take a keep residency**. Gated in
+  `test_gguf_device_fit` (17 cases / 130) for the arithmetic and the residency
+  predicate, and `test_gguf_device_fit_reach` (14 cases / 66) for the production
+  reach. **The lane-off bound is byte-identical**, asserted three ways against
+  literal values.
+  **The architecture term was a review finding, not a design choice made up
+  front.** The first draft keyed the lane on the tensor-name suffix alone, and
+  `_exps.weight` is what a llama.cpp MoE export writes for every MoE family it
+  converts — `deepseek_v4_weights.cpp` and `laguna_weights.cpp` write the
+  identical name and neither model composes `RunMoeBlock`. That dropped their
+  towers from the bound and charged an arena nothing allocates, which deletes a
+  CORRECT refusal, unlike the two over-counts above, which only over-refuse. The
+  term is a declared capability on `ModelFactory` rather than a name list in the
+  loader, so it lives beside the forward that implements it and a new
+  architecture inherits false.
+  **The RESIDENCY term is the same finding one level down, and it was found the
+  same way** ([#1378](https://github.com/mudler/vllm.cpp/issues/1378), fresh
+  review of #1377). All four terms above are properties of the DEVICE and the
+  ARCHITECTURE, and a `qwen35moe` GGUF satisfies every one of them while still
+  staging every tower: `LoadExpertsOrNvfp4` routes the same `_exps.weight`
+  tensors to `expert_*_fp4` (`kNvfp4Fp4`) or to `expert_*` (`kExpandBf16`)
+  whenever the residency is not a keep residency, and only the `expert_*_kq` arm
+  reaches `KqExpertSlice`. So `VT_GGUF_KEEP_QUANT=0` -- a documented, supported
+  opt-out -- and an NVFP4 GGUF each turned the lane on, dropped 335.62 GiB of
+  towers from the bound and DELETED the #1123 refusal, which is the unsafe
+  direction and puts back the 26-minute load and the `cudaMalloc: out of memory`
+  first forward. The W0c `expert_streamed` tripwire does not catch it either,
+  because a tower on those arms is never claimed. The fifth term is
+  `GgufExpertTowersReachSlotLane`, which asks the model loader's OWN routing
+  function (`PeekRoute`, promoted to `gguf_keep_quant.h` so one decision has one
+  description) about this file under this process's policy. It is all-or-nothing
+  in the safe direction: one tower that would be staged keeps the WHOLE bound, so
+  it can over-refuse -- which `VT_DEVICE_WEIGHT_BUDGET_BYTES` releases -- and can
+  never under-refuse.
+  **The accepted set has TWO routes, and the second one was gated by nothing
+  until the second review of #1377.** `GgufExpertTowersReachSlotLane` accepts
+  `kKeepQuant` OR `kKeepF16`, which is read off `LoadExpertsOrNvfp4`: everything
+  that is neither fp4 nor expand goes to `LoadExpertsStackedKq`, whose `VT_CHECK`
+  names both, and `KqExpertSlice` sizes a row with `vt::RowSizeBytes` and never
+  looks at the dtype. But every fixture in the tree stored its towers in Q8_0,
+  F32 or NVFP4, so narrowing the accept to `kKeepQuant` alone left
+  `test_gguf_device_fit` at 16/16 and `test_gguf_device_fit_reach` at 14/14 --
+  the same "a load-bearing term no reachable input falsifies" shape the residency
+  term itself was filed for. `BuildGgufWithF16ExpertTower` closes it with an F16
+  (ggml type 1) tower, which `KeepQuantDType` can never accept and which
+  `RouteGgufTensor` step 2 routes `kKeepF16`. Mutation M4 (narrow the accept to
+  `kKeepQuant`) was re-run on both sides of that fixture: compile status 0 both
+  times, no ENOSPC in either build log, `git diff --stat` showing 1 file / 1
+  insertion / 1 deletion, GREEN against the pre-fixture file at 16 cases / 117
+  assertions and exit status 0, RED against the current file at 17 cases with 1
+  failed and 130 assertions with 1 failed and exit status 1, and both files
+  restored byte-identical by sha256.
+* **W0a — the probe. RUN, and it answered the question W0b rests on.** On
+  `dgx:gpu0` inside an `rc` lease: `cudaDevAttrPageableMemoryAccess = 1` and
+  `cudaDevAttrIntegrated = 1`, which is exactly the pair `CudaPlatform`
+  conjoins, so the predicate answers TRUE on a GB10. The probe did not stop at
+  the attribute, because an attribute is a claim and this row needed the
+  behaviour: a kernel READ AND WROTE a 2,490,368-byte slot — one real expert
+  slice — living in plain `std::vector<uint8_t>` storage, correctly, which is
+  the exact access `Qwen35ExpertStream`'s arena will serve. Measured bandwidth
+  over that access was 2.06-2.28x, recorded as the range across the reps rather
+  than as a single figure. Verdict token `W0A_VERDICT=PAGEABLE_OK`.
+  **The stop condition therefore did not fire.** `PageableMemoryAccess == 0`
+  would have made W0b wrong as designed and returned the row `NEEDS_DECISION`
+  in favour of a `cudaHostAlloc` arena; W0b-W0d were written against that risk
+  knowingly, and the risk has now resolved in their favour. Two of the four
+  attributes the port map names — `...UsesHostPageTables` and
+  `ConcurrentManagedAccess` — are not carried here, because the verdict turns on
+  the two that are and inventing the other two would be worse than omitting
+  them.
+* **W0e — the measurement.** Not run. G0-CORRECT, G0-LIVE and G0-SPEED are all
+  `PENDING` on the lease.
+
+So `--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` is no longer refused by the
+predicate on this box: the probe has measured `PageableMemoryAccess == 1`, and
+the predicate was probed rather than assumed precisely so that this sentence
+could change on evidence. What has NOT run is the load itself. The developer's
+target remains that GPU figure, and W0e is what produces it.
 
 ## Scope
 
@@ -144,10 +257,26 @@ than discovered during implementation.
 
 The arithmetic that makes the conditional refusal EXACT rather than a fudge
 factor: with the lane on, the staged set is the non-expert remainder plus the
-slot arena, both known at load. Default load, 8000 slots:
-26.01 GiB + 8000 x 2,490,368 B (18.55 GiB) = **44.56 GiB against a 119.631 GiB
-pool**. No headroom fraction is invented, and the over-count direction the
-existing bound documents (issue #1136) is unchanged.
+slot arena, both known at load. No headroom fraction is invented, and the
+over-count direction the existing bound documents (issue #1136) is unchanged.
+
+**Two arena figures exist, they differ by 2.2105x, and the CHARGED one is the
+one that decides the load.** This was written as one number in the first draft
+and the fresh review caught it. At 8000 slots:
+
+| Quantity | Value |
+|---|---|
+| what `Qwen35ExpertStream::Reserve` ALLOCATES: 8000 x 2,490,368 B, the IQ1_XXXS slice a default load streams | 19,922,944,000 B = **18.55 GiB** |
+| what the fit bound CHARGES: 8000 x 5,505,024 B, the largest `*_exps` slice in the FILE, which is an MTP `nextn`-block Q2_K tower | 44,040,192,000 B = **41.02 GiB** |
+| charged total, against the 34.34 GiB the bound counts as the remainder | 80,910,933,504 B = **75.35 GiB** |
+| resident total, against the 26.01 GiB a default load actually stages | 47,853,196,800 B = **44.56 GiB** |
+
+Both totals fit the 119.631 GiB pool, so the verdict on this checkpoint is
+unchanged. The gap is the SAME over-count the bound already documents — it scans
+the file, a load streams a subset of it — applied twice, once to the remainder
+and once to the slot size, and it can only over-refuse. `GgufLargestExpertSliceBytes`'s
+own header records the 2.2105x factor; what was missing was saying that the
+published total carried it too.
 
 ### The CUDA kernel exists
 
@@ -256,7 +385,7 @@ gate that stays green without it measured a class, not a capability.
 | Dependency | Shape |
 |---|---|
 | **CPU decode re-measure on a live cache** | The DENOMINATOR for G0-SPEED, not a gate that blocks starting. `docs/BENCHMARKS.md:8` records streaming-ON decode as VOID (#912 F1) with a re-measure owed, and the operator is arranging it separately. G0-CORRECT and G0-LIVE need no denominator and can run first. **If the box frees up for only one run, take the CUDA arm** — it is the one that does not exist at all today, it produces the correctness verdict as well as a number, and the CPU denominator can follow. |
-| `dgx:gpu0` | The only GB10. Leased through `rc`, never bare ssh; the hold sits behind a trap that releases on every exit path. Currently held by another agent's Nemotron gate, with a second agent on thor, so W0's measurement QUEUES. W0a/W0b/W0c/W0d are all buildable and unit-gatable without it. |
+| `dgx:gpu0` | The only GB10. Leased through `rc`, never bare ssh; the hold sits behind a trap that releases on every exit path. W0a HAS taken its lease and returned `PAGEABLE_OK`; W0e's measurement still QUEUES behind other work on the box. W0b/W0c/W0d are all buildable and unit-gatable without it. |
 | The 370 GiB checkpoint | Already staged for the parent row; recipe in [expert-streaming.md](expert-streaming.md) "Loading a 370 GiB split GGUF". |
 | PRs #1200 and #1216 | Both edit `.agents/specs/expert-streaming.md`. This row does not, deliberately — see `## Risks/decisions`. |
 | #1126 (`Backend::DeviceMemoryInfo` has no CUDA override) | NOT a blocker. W0 and W1 read the budget from `residency_policy().device_memory_total_bytes`, which CUDA already probes at registration; they never touch the live free/total seam #1126 owns. |
@@ -280,6 +409,10 @@ where the wave ENDS, not where it degrades quietly into the next one.
   ANY CUDA device including discrete but changes the store's allocator and its
   ownership story. That is a different design and it comes back as
   `NEEDS_DECISION` rather than being substituted silently.
+  **RESULT (`dgx:gpu0`, `W0A_VERDICT=PAGEABLE_OK`):** `PageableMemoryAccess = 1`,
+  `Integrated = 1`, a kernel read and wrote a 2,490,368-byte slot of plain
+  `std::vector` storage correctly, bandwidth ratio 2.06-2.28x over the reps. The
+  stop condition did not fire and the `cudaHostAlloc` fallback is not taken.
 * **W0b — the predicate.** `host_memory_is_device_addressable()`, base false,
   CUDA from the W0a attribute, ROCm from its already-probed
   `pageable_memory_access`. **Why not an existing predicate:** `is_cpu()` is what
@@ -291,7 +424,12 @@ where the wave ENDS, not where it degrades quietly into the next one.
   a real device class. A discrete CUDA device answers false, keeps falling through
   to `KqResidentSlice`, and therefore keeps hitting the #1123 refusal — which is
   correct, and which is what W1/W2 exist to remove.
-  **Gate:** `tests/vllm/platforms/test_platform.cpp`, mutation-proven.
+  **Gate:** `tests/vllm/platforms/test_platform.cpp`, mutation-proven — and read
+  that literally only since #1378. The first shape of this gate asserted the
+  implication and the board value on hardware where both attributes read 1, so
+  deleting either term of the conjunction left it green. The rule now lives in
+  `HostMemoryIsDeviceAddressableFromAttrs` and is gated over all four attribute
+  pairs on the CPU tier, where both deletions are red.
   **Stop condition:** none; this wave is small and self-contained.
 * **W0c — the slot arm without the tower.** Lift the guard, build the slot
   tensor directly instead of through `ResidentWeight`, and add the named refusal
@@ -302,9 +440,14 @@ where the wave ENDS, not where it degrades quietly into the next one.
   set), stop — that is a different change and it is not this wave.
 * **W0d — the conditional refusal.** Teach the fit bound the streamed-tensor
   exclusion and the arena, and pass it from the loader.
-  **Gate:** `test_gguf_device_fit` for the arithmetic and
-  `test_gguf_device_fit_reach` for the production reach; the lane-off bound must
-  be byte-identical to today.
+  **Gate:** `test_gguf_device_fit` for the arithmetic and the residency-route
+  predicate, and `test_gguf_device_fit_reach` for the production reach; the
+  lane-off bound must be byte-identical to today. The reach suite pins
+  `VT_GGUF_KEEP_QUANT=1` for its lane-on cases, deliberately: the production
+  default for that policy is `GgufQuantComputeAvailable()`, which is true on a
+  real GB10 and false in a CPU-only build carrying a fake CUDA platform, so
+  inheriting it would make every lane-on case measure the absence of a CUDA
+  kernel instead of the lane.
   **Stop condition:** if the exclusion cannot be expressed without the bound
   taking a general per-tensor staging POLICY (the shape #1136 explicitly refuses
   to invent), stop and return `NEEDS_DECISION`. The lane's tensor set is
@@ -367,7 +510,7 @@ re-derived here.
 | **The GB10 ATS penalty could erase W0's win entirely.** Device access to host-resident weights on GB10 is recorded as carrying a real penalty, and this lane reads 6.95 GB per token that way. | Accepted as the thing being measured, not assumed away. G0-SPEED is what settles it, and the settling measurement is named: the CUDA arm's decode s/token against the CPU arm's, same box, same lease, three interleaved reps. A CUDA arm at or above the CPU arm's time is a genuine negative result — it closes the unified shortcut for this box, leaves W1/W2 standing for the discrete case, and is recorded in `docs/BENCHMARKS.md` as measured. It is a few hours, not a campaign, and that asymmetry is why W0 runs first. |
 | W0 is FOUR edits, not one guard. | Stated rather than discovered. The two forcing facts are in `## Our baseline` (a): the slot arm's own `ResidentWeight` call stages the tower, and (b): the load-time refusal fires before any forward. Neither is in #1124's four pieces. W0d touches the fit bound, which is the one place this wave reaches into another row's surface; it is additive and exact (an explicit tensor exclusion plus the arena), it does not touch the KV/activation term `KV-WARMUP-PROFILE` owns, and if it cannot stay that way the W0d stop condition returns `NEEDS_DECISION`. |
 | W1/W2 can be built here but only VALIDATED on hardware nobody here has. | Recorded as owed with its exact measurement rather than dressed as a gate. This host has no discrete NVIDIA GPU, and on `dgx:gpu0` device memory IS host memory, so a device store there proves the plumbing and not the capability. See `## Owed`. |
-| A device store is the wrong shape if the answer is "put the slots in pinned host memory". | Open, and W0a's result informs it. A `cudaHostAlloc` arena is device-readable on discrete GPUs too, over PCIe, which is almost certainly too slow to serve 6.95 GB/token — but it is the fallback if `PageableMemoryAccess == 0` on GB10, and it is written down here so it is not re-invented as a surprise mid-wave. |
+| A device store is the wrong shape if the answer is "put the slots in pinned host memory". | CLOSED for this box by W0a. The fallback was conditional on `PageableMemoryAccess == 0` on GB10, and the probe measured 1 with a kernel correctly reading and writing a 2,490,368-byte slot of plain `std::vector` storage, so the pageable arena W0c builds on is the measured answer and not a hope. The `cudaHostAlloc` arena stays written down here for the DISCRETE case, where it is still device-readable over PCIe and still almost certainly too slow to serve 6.95 GB/token — that case is W1/W2's, not W0's. |
 | This row does not edit `.agents/specs/expert-streaming.md`. | Deliberate. PRs #1200 and #1216 both edit that file today, and its `## Owed` entry for #1124 remains TRUE as written — it names the capability and the issue, and it does not name a row ID that this row's existence falsifies. Cross-linking is one-way, from here to there. Re-pointing that entry at this row is a one-line follow-up once both PRs land, and it is not worth a conflict now. |
 | `ENGINE_ROWS` in `scripts/check-agent-record.py` is a shared counter, exactly the "measurement of one file stored in another" coupling AGENTS.md warns about. | Bumped 162 -> 163 for a real new row, with its justification paragraph, per the constant's own comment history. Checked against every open PR: none bumps it (#851 carries a stale `156` as diff context, #361 does not touch it), so this addition takes the lock cleanly. |
 | Splitting the device capability out of `ENG-EXPERT-STREAM` rather than adding a W7-W9 to it. | The parent row's spec is 1600 lines and has two open PRs editing it. A separate row gives this capability an independent lifecycle state and a per-row spec surface, which is the shape AGENTS.md prefers (one file per row, read with a glob). The parent keeps the MECHANISM; this row owns the DESTINATION. |
@@ -377,6 +520,9 @@ re-derived here.
 
 | Owed | Why it is open |
 |---|---|
+| **`kQwen3MoeFactory.streams_routed_experts = true` is a CORRECT declaration that nothing READS today.** The flag's only reader is the loader's lane block, which is on the GGUF path, and `kGgufArchArms` (`model_loader.cpp`) maps no `general.architecture` onto `Qwen3MoeForCausalLM` (Qwen3-Coder), so no GGUF load can resolve to that factory. | It is set anyway because it is TRUE: `qwen3_moe.cpp` composes the same `RunMoeBlock` the Qwen3.5 MoE forward does, which is why it holds an `EndStepGuard` at all, so its experts do reach `KqExpertSlice`. Declaring it false to make every setting reachable would put a false statement in the registry, and the safe-direction default would then hide it. Named here per `## Nothing lands dead` rather than left for the next reader to find: `ENG-EXPERT-STREAM-DEVICE` owns the wiring under [#1124](https://github.com/mudler/vllm.cpp/issues/1124), and the flag becomes read the moment a `qwen3moe` GGUF arch arm exists. The `Qwen3_5Moe*` setting beside it IS read, and its gate is now EVIDENCED rather than asserted: mutation M-A3 (`kQwen3_5MoeFactory.streams_routed_experts = false`, `qwen3_5_moe.cpp`) was listed as NOT RUN in #1377's pull request body, was then run by that pull request's fresh review, and was re-run during the #1378 repair with the result recorded -- compile status 0, `git diff --stat` 1 file / 1 insertion / 1 deletion, `test_gguf_device_fit_reach` 14 cases with 2 failed and 66 assertions with 6 failed, exit status 1, tree restored byte-identical by sha256. **The laguna half of the same claim is VACUOUS and is not evidence for anything.** Mutation M-A3c (`kLagunaFactory.streams_routed_experts = true`) is GREEN, and correctly so: `laguna` has no entry in `kGgufArchArms` (`model_loader.cpp`), so a Laguna GGUF is refused as an unsupported architecture before the fit check runs and no setting on that factory can reach the lane. Nothing is owed to make it gateable -- manufacturing a gate for an unreachable flag would be worse than saying this -- and `DeepseekV4ForCausalLM`, which DOES have an arch arm, is the case that carries the architecture term's weight. |
+| **`scripts/check-doc-checkpoint.py` stays RED on this branch for commit `939755f99` and cannot be made green here** ([#1387](https://github.com/mudler/vllm.cpp/issues/1387)). That commit appended a measurement to `.agents/benchmark-record.md` without writing `docs/FEATURES.md`, whose streaming row then said "CPU keep-quant towers only" after W0c had made a host-readable staging device take the slot arm. | The PAGE is repaired here. The GATE is not, and cannot be: the checker walks a range one COMMIT at a time, and `main` may never be force-pushed, so no later commit can make a published one green. The squashed commit that lands carries both paths and passes. Changing the walk is checker semantics and needs its own row, spec and red-first evidence. |
+| **The CUDA registrar's own probe assembly is still unmutated.** `src/vllm/platforms/cuda.cpp`'s `Registrar` reads `cudaDevAttrPageableMemoryAccess` and `cudaDevAttrIntegrated`, defaults each to 0 on a query failure, and hands the pair to `HostMemoryIsDeviceAddressableFromAttrs`. That call and those defaults compile only in a CUDA build, so nothing on the CPU tier can mutate them. | The RULE they feed is no longer part of this debt: #1378 extracted it and gated it over all four attribute pairs in `test_platform`, and both term-deletion mutations are RED there. What remains is narrower and honest -- the probe calls, the failure defaults, and the registration itself -- and it needs the same `dgx:gpu0` lease as W0e. Named here rather than folded into the W0b bullet, which used to claim more than it had. |
 | **G-DISCRETE: validate W1/W2 on a discrete NVIDIA GPU.** The measurement: on a device with VRAM V and `host_memory_is_device_addressable() == false`, load a GGUF whose `*_exps` towers exceed V, with the lane on, and gate (i) token-exactness against the CPU arm on the same checkpoint, (ii) decode-phase `exhausted` delta 0, (iii) peak device allocation <= non-expert remainder + arena. | No discrete NVIDIA GPU is reachable from this project. `dgx:gpu0` is a GB10 where device memory IS host memory, so a device store there exercises the plumbing and not the thing W1 exists for. Recorded rather than implied, because a gate nobody can run is not a gate. |
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
 | **The CPU arm's streaming decode figure is still VOID.** `docs/BENCHMARKS.md:8` records it as VOID (#912 F1) with a re-measure owed. | Owned by `ENG-EXPERT-STREAM` and arranged separately by the operator. It is the DENOMINATOR for G0-SPEED, not a precondition for G0-CORRECT or G0-LIVE. |

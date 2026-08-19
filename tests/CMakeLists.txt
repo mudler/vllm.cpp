@@ -435,6 +435,8 @@ vllm_cpp_add_test(test_qwen3_moe_decode_graph_seam vllm/models/test_qwen3_moe_de
 vllm_cpp_add_test(test_voxtral_decode_graph_seam vllm/models/test_voxtral_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v2_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_qwen3_5_decode_graph_seam vllm/models/test_qwen3_5_decode_graph_seam.cpp)
+# W6 (#1374): the dispatch counters live under src/, beside the runner (:561).
+target_include_directories(test_qwen3_5_decode_graph_seam PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_decode_graph_seam vllm/models/test_qwen3_dflash_decode_graph_seam.cpp)
 # G1 for the row: bit-exactness against eager over THREE replays, on a real
 # device. Inert without a CUDA backend (every case skips), because a CPU
@@ -1170,6 +1172,12 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 # DeepSeek-V4 DSpark lane by name, instead of trusting the CLI method string.
 vllm_cpp_add_test(test_dspark_draft_routing
   vllm/entrypoints/test_dspark_draft_routing.cpp)
+# SPEC-DFLASH2 W1 (#1314): REACHABILITY of the DFlash2 refusal — the loader
+# reads the draft's own config.json and refuses `DFlash2DraftModel` by name,
+# instead of drafting it through the DFlash1 lane with the grouped convolution
+# and the candidate selector silently absent.
+vllm_cpp_add_test(test_dflash2_draft_routing
+  vllm/entrypoints/test_dflash2_draft_routing.cpp)
 # #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
 # refused by name, and an upstream key this engine does not implement is refused
 # with the missing part named, instead of being silently dropped.
@@ -1233,6 +1241,13 @@ target_include_directories(test_expert_stream_wiring PRIVATE ${CMAKE_SOURCE_DIR}
 # defect, and the store is built from the FIRST model a process runs.
 vllm_cpp_add_test(test_expert_stream_mixed_slot vllm/model_executor/test_expert_stream_mixed_slot.cpp)
 target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE W0c (#1124): the PLATFORM branch of the expert-slice
+# seam. Its own binary for two independent reasons -- it latches
+# VT_MOE_EXPERT_STREAM like its siblings, and it registers a fake backend and a
+# fake platform in the process-global kXPU slot, which must not leak into any
+# other suite.
+vllm_cpp_add_test(test_expert_stream_device_slot vllm/model_executor/test_expert_stream_device_slot.cpp)
+target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime
@@ -1281,6 +1296,10 @@ vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cp
 # SPEC-MTP-K-GT-1 (#81): MTP speculation DEPTH through the production loader —
 # the configured k reaches the propose path, or is refused by name.
 vllm_cpp_add_test(test_mtp_depth vllm/v1/spec_decode/test_mtp_depth.cpp)
+# ENG-CUDAGRAPH-BREAK W6 (#1374): the graph-eligibility predicate and its
+# counters live under src/, beside the runner that computes them, exactly as
+# test_cudagraph_dispatch reads them (:561).
+target_include_directories(test_mtp_depth PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
 vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp)
 # SPEC-MTP-K-GT-1 (#81): the draft-DECODE half of the autoregressive propose —
@@ -1288,6 +1307,10 @@ vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_p
 vllm_cpp_add_test(test_prepare_decode_inputs vllm/v1/spec_decode/test_prepare_decode_inputs.cpp)
 vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W1 (#1314): the DFlash causality rule — the port of vLLM's
+# tests/v1/spec_decode/test_dflash_causality.py as edited by vllm#52816, plus the
+# assertion that a DFlash1 checkpoint's resolution is unchanged.
+vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports

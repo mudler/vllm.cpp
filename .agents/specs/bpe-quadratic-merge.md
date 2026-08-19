@@ -8,7 +8,18 @@ every leg" to the cause measured below.
 surface. Every gate in this spec runs on a CPU host.
 **Row:** `SPEC-BPE-QUADRATIC-MERGE` in
 [`engine-matrix.md`](../engine-matrix.md), section "Loading, tokenizer, and config".
-**Base:** `31f93787c`. Every local line number in this document is read there.
+**Base:** `31f93787c`, merged with `origin/main` at `c9724b5ee`. Every local
+line number in this document is read at that merge. `git diff 31f93787c HEAD --
+src/vllm/tokenizer include/vllm/tokenizer src/vllm/v1/engine/input_processor.cpp
+src/vllm/entrypoints/openai/api_server.cpp` is empty, so the merge moves none of
+them.
+**Pull request shape:** ONE pull request carrying W1 through W4. No answer is
+recorded for this row under `## Git integration` in
+`.agents/developer-preferences.md`. The only recorded answer there is
+`SPEC-DFLASH2`'s, and AGENTS.md makes one pull request the default when no
+answer is recorded. The shape is not cosmetic here: W1 lands the cost and growth
+assertions of `## Tests to port` items 2 and 3 RED against unchanged code, so a
+split would leave `main` red between W1 and W3. See `## Work breakdown`.
 
 ## Now
 
@@ -24,11 +35,13 @@ void BpeMerge(std::vector<std::string>& symbols, const MergeRanks& ranks) {
   // (strict < keeps the first best). O(n^2) scan; pretokens are tiny.
 ```
 
-Nothing bounds a pretoken. Four of the seven pretokenizer rules return a run of
+Nothing bounds a pretoken. Five of the seven pretokenizer rules return a run of
 unbounded length, and on the SentencePiece family the pretoken is the entire
-prompt. Measured on this tree, 64 KB of the letter `a` costs 28.1 s of one core
-and 64 KB of ASCII spaces costs 48.1 s, both on a path that runs before any
-length check. The row is `READY`: this spec is committed before any product
+prompt. Measured on this tree, 64 KB of the letter `a` costs 24.4 s of one core
+and 64 KB of ASCII spaces costs 45.8 s, both on a path that runs before any
+length check. HF `tokenizers` 0.22.2, reading the same committed tokenizer file,
+returns the identical token identifiers for 64 KB of English in 10.1 ms against
+our 25.3 s. The row is `READY`: this spec is committed before any product
 code, because the fix replaces the merge algorithm on a token-exact path and the
 design has to be agreed before anyone edits the tokenizer.
 
@@ -38,12 +51,20 @@ In scope:
 
 - `src/vllm/tokenizer/bpe.cpp::BpeMerge`, replaced by a heap-driven merge that
   mirrors HF `tokenizers` `Word::merge_all`.
-- Whatever `src/vllm/tokenizer/bpe.h` has to expose so that
+- Whatever `include/vllm/tokenizer/bpe.h` has to expose so that
   `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` and
   `src/vllm/tokenizer/tokenizer.cpp::EncodePlainSp`, the only two callers, reach
   the new form.
 - The interning decision described under `## Design`, and the load-time refusal
-  it needs.
+  it needs, on **both** load surfaces. `merge_ranks_` is built from
+  `tokenizer.json` by `src/vllm/tokenizer/tokenizer.cpp::FromHfJson`
+  (`InsertMerge` at `src/vllm/tokenizer/tokenizer.cpp:680`) and from a GGUF's
+  `tokenizer.ggml.merges` by `src/vllm/tokenizer/tokenizer.cpp::FromGguf`
+  (`src/vllm/tokenizer/tokenizer.cpp:741`, the same `InsertMerge` at `:864`).
+  Both reach the same table and the same `BpeMerge`, so the refusal has to be
+  written once where the table is built and gated on both. `FromGguf` is already
+  gated: `tests/vllm/test_bpe.cpp` builds a zero-tensor GGUF and loads it
+  through `Tokenizer::FromGguf`.
 - Red-first equivalence and cost cases in `tests/vllm/test_bpe.cpp` and one new
   CPU-tier binary described under `## Tests`.
 - `docs/STATUS.md` and `docs/BENCHMARKS.md` when the row moves to `DONE`.
@@ -64,20 +85,29 @@ Out of scope, each with a stated reason:
 
 ## Our baseline
 
-Every figure below was reproduced in this row, on an AMD Ryzen 9 9950X3D at
-`-O2`, against a driver built from this tree's own `bpe.cpp`,
-`pretokenizer.cpp` and `unicode_data.cpp`. The box carried a load average
-between 130 and 190, so these are contended numbers. The **shape** is the
-result. A same-binary idle re-measure belongs to the implementing row, and
-`## Gates` requires it before any speed claim is accepted.
+Every figure below was measured on an AMD Ryzen 9 9950X3D (20 cores) at `-O2`,
+against a driver built from this tree's own tokenizer sources. **Two harnesses
+produced them and the tables say which.**
 
-Merge table: `merges.txt` of `qwen3.8-27b-hf`, 247,586 merges, sha256
-`a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d`.
+- **Harness A**, the one that found the defect: `BpeSplit` alone, against the
+  `merges.txt` of `qwen3.8-27b-hf`, 247,586 merges, sha256
+  `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d`, at a load
+  average between 130 and 190. Those are heavily contended single-shot numbers.
+- **Harness B**, the re-derivation: full `Tokenizer::Encode` through the two
+  committed goldens, min-of-k, at a load average between 4 and 90 on the same
+  box, 2026-08-19. Every figure carries its `k` and the load. The box was not
+  idle: another session was compiling throughout, which is why the minimum of a
+  repetition set is reported rather than a mean. The minimum is the least
+  contended estimate available, not a claim of an idle host.
+
+The **shape** is what both harnesses agree on, and it is the result. A
+same-binary idle-host re-measure still belongs to the implementing row, and
+`## Gates` requires it before any speed claim is accepted.
 
 ### The benchmark prompts that found it
 
-The six reconstructed `vllm bench serve` prompts of the #1365 legs, timing
-`BpeSplit` only:
+Harness A. The six reconstructed `vllm bench serve` prompts of the #1365 legs,
+timing `BpeSplit` only:
 
 | prompt | bytes | pretokens | longest pretoken | current | heap prototype |
 |---|---:|---:|---:|---:|---:|
@@ -92,7 +122,7 @@ Index 2 is the outlier request of #1365's four legs. It is one pretoken.
 
 ### The growth is quadratic
 
-Prompt 2 truncated and tripled, one pretoken throughout:
+Harness A. Prompt 2 truncated and tripled, one pretoken throughout:
 
 | bytes | BPE merge |
 |---:|---:|
@@ -104,35 +134,67 @@ Prompt 2 truncated and tripled, one pretoken throughout:
 
 Three times the bytes costs 7.65 times the time.
 
-### Four rules are unbounded, not one
+### Five rules are unbounded, not one
 
-`src/vllm/tokenizer/pretokenizer.cpp::MatchLetterRun` (rule 2),
-`src/vllm/tokenizer/pretokenizer.cpp::MatchPunctRun` (rule 4),
-`src/vllm/tokenizer/pretokenizer.cpp::MatchWsNotBeforeNonSpace` (rule 6) and
-`src/vllm/tokenizer/pretokenizer.cpp::MatchWs` (rule 7) each scan `while (p <
-t.size())` with no cap. Only
-`src/vllm/tokenizer/pretokenizer.cpp::MatchNumbers` is capped, at one codepoint
-for Qwen and three for Llama-3. Each input below is 8,192 bytes returned as one
-pretoken:
+The Qwen and Llama-3 alternation has exactly seven rules, dispatched at
+`src/vllm/tokenizer/pretokenizer.cpp:810-821`. **Five of them scan
+`while (p < t.size())` with no cap:**
 
-| input | rule | current | heap prototype |
-|---|---|---:|---:|
-| `a` x 8,192 | 2, letter run | 514.19 ms | 2.33 ms |
-| `中` x 2,731 | 2, letter run | 438.58 ms | 0.85 ms |
-| `ก` x 2,731 | 2, letter run | 505.81 ms | not run |
-| `~` x 8,192 | 4, punct run | 451.81 ms | 2.20 ms |
-| space x 8,192 | 7, whitespace | 813.02 ms | 3.16 ms |
+| rule | function | bound |
+|---:|---|---|
+| 1 | `MatchContraction` (`:82`) | **bounded**: a fixed alternation, at most three bytes |
+| 2 | `MatchLetterRun` (`:106`); `MatchTekkenLetterRun` (`:193`) on Tekken | unbounded |
+| 3 | `MatchNumbers` (`:219`) | **capped** at `max_digits`: one codepoint for Qwen, three for Llama-3 |
+| 4 | `MatchPunctRun` (`:241`) | unbounded |
+| 5 | `MatchWsNewlines` (`:269`) | unbounded |
+| 6 | `MatchWsNotBeforeNonSpace` (`:287`) | unbounded |
+| 7 | `MatchWs` (`:303`) | unbounded |
+
+Rule 5 was missed by the first revision of this spec and by #1365 as first
+re-scoped. It matches `\s*[\r\n]+`, so a block of newlines is one pretoken and
+pays the same cost. A pasted log and a pasted diff both have that shape. Two
+rules are bounded, and only one of those two is bounded by a *cap*: saying
+"only `MatchNumbers` is capped" is true of rule 3 and says nothing about rule 1,
+which is bounded by its own alternation rather than by a counter.
+
+Harness B, 8,192 bytes of one character, `Tokenizer::Encode` through the
+committed `tests/parity/goldens/tokenizer_qwen36/tokenizer.json`, min-of-5, load
+average 33 to 37:
+
+| input | rule | pretokens | current | heap prototype |
+|---|---|---:|---:|---:|
+| `a` x 8,192 | 2, letter run | 1 | 467.59 ms | 1.96 ms |
+| `中` x 2,730 (+2 B) | 2, letter run | 2, longest 8,190 | 433.12 ms | 0.81 ms |
+| `ก` x 2,730 (+2 B) | 2, letter run | 2, longest 8,190 | 532.33 ms | 1.14 ms |
+| `的` x 2,730 (+2 B) | 2, letter run | 2, longest 8,190 | 389.74 ms | 0.82 ms |
+| `~` x 8,192 | 4, punct run | 1 | 414.21 ms | 1.91 ms |
+| **newline x 8,192** | **5, `\s*[\r\n]+`** | **1** | **580.44 ms** | **2.60 ms** |
+| space x 8,192 | 7, whitespace | 1 | 618.56 ms | 2.84 ms |
+
+The pretoken counts are read from `vllm::tok::Pretokenize` itself, not inferred:
+the CJK and Thai inputs are 2,730 codepoints plus a 2-byte remainder, which is a
+second pretoken, so their longest run is 8,190 rather than 8,192.
 
 The trigger is a long run of one character class, not one script. ASCII reaches
-it.
+it, and so does an empty-looking block of newlines.
 
 ### At 65,535 bytes
 
-| input | current | heap prototype |
-|---|---:|---:|
-| `的` x 21,845 | 28,746.70 ms | 8.31 ms |
-| `a` x 65,535 | 28,130.35 ms | not run |
-| space x 65,535 | 48,098.11 ms | not run |
+Harness B, `Tokenizer::Encode` through the committed Qwen3.6 golden. Every input
+is one pretoken of 65,535 bytes, read from `vllm::tok::Pretokenize`. Current
+min-of-2, prototype min-of-5, load average 25 to 90. The current column is
+min-of-2 rather than min-of-5 because each repetition costs about 30 s of one
+core, which is itself the finding:
+
+| input | rule | current | heap prototype | ratio |
+|---|---|---:|---:|---:|
+| `a` x 65,535 | 2 | 24,358.86 ms | 20.71 ms | 1,176x |
+| `中` x 21,845 | 2 | 26,823.67 ms | 8.00 ms | 3,353x |
+| `ก` x 21,845 | 2 | 39,122.71 ms | 10.72 ms | 3,649x |
+| `的` x 21,845 | 2 | 30,309.46 ms | 7.40 ms | 4,096x |
+| `~` x 65,535 | 4 | 32,468.48 ms | 18.85 ms | 1,723x |
+| newline x 65,535 | 5 | 40,538.57 ms | 24.14 ms | 1,679x |
+| space x 65,535 | 7 | 45,780.21 ms | 28.07 ms | 1,631x |
 
 ### The SentencePiece family pays it on ordinary English
 
@@ -146,22 +208,38 @@ metaspace layout, and the committed Mistral golden
 `"split": false` in its own `pre_tokenizer`.
 
 Full `Tokenizer::Encode` through that committed golden, on "The quick brown fox
-jumps over the lazy dog. " repeated to length. The Qwen3.6 golden is the
-byte-level control on the identical text:
+jumps over the lazy dog. " repeated to length. Two controls run the identical
+text: the committed Qwen3.6 golden, which is the byte-level arm of our own
+tokenizer, and **HF `tokenizers` 0.22.2 reading the same Mistral
+`tokenizer.json` file**, which is the code the pinned `transformers` executes
+and therefore the oracle for both the identifiers and the cost. Harness B,
+min-of-3 for the two Mistral columns, min-of-5 for the Qwen3.6 control, load
+average 4 to 12:
 
-| prompt bytes | Mistral golden | Qwen3.6 golden |
-|---:|---:|---:|
-| 1,000 | 5.59 ms | 0.15 ms |
-| 2,000 | 21.73 ms | 0.11 ms |
-| 4,000 | 87.15 ms | 0.23 ms |
-| 8,000 | 357.01 ms | 0.47 ms |
-| 16,000 | 1,410.42 ms | 0.92 ms |
-| 32,000 | 5,804.42 ms | not run |
-| 65,536 | 24,144.72 ms | not run |
+| prompt bytes | ids | ours, Mistral golden | HF `tokenizers` 0.22.2, same file | ours / HF | ours, Qwen3.6 control |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 267 | 5.61 ms | 0.14 ms | 40x | 0.058 ms |
+| 8,000 | 2,134 | 358.83 ms | 1.09 ms | 329x | 0.457 ms |
+| 32,000 | 8,534 | 6,005.56 ms | 4.92 ms | 1,221x | 1.883 ms |
+| 65,536 | 17,476 | 25,345.61 ms | 10.11 ms | **2,507x** | 3.877 ms |
 
-Sixteen times the bytes costs 252 times the time. That exponent is 2.0. A
-Mistral or Gemma server spends 24 s of one core to tokenize a 64 KB English
-document, and a user who pastes a document sends exactly that.
+**The identifiers are the same on both sides**: the `ids` column is one number
+because ours and HF's agree at every size, and at 8,000 bytes the two id
+sequences were compared element by element and are byte-identical (2,134 of
+2,134). So the 2,507x is a pure cost difference on identical output, not a
+different answer computed faster.
+
+Fitting our Mistral column, 65.536x the bytes costs 4,518x the time, an exponent
+of **2.01**. Read at a single 4x step it is plainer still: 8,000 to 32,000 bytes
+costs 16.74x, against the 16x that `n^2` predicts and the ~4.6x that
+`n log n` does (`4 * log2(32000) / log2(8000)`, the word being the whole prompt
+on this arm, so `n` is the prompt length in codepoints). The Qwen3.6 control
+over the same 65.536x range costs 66.8x, which is linear. HF over the same range
+costs 72x, also linear.
+
+A Mistral or Gemma server spends 25 s of one core to tokenize a 64 KB English
+document that HF tokenizes in 10 ms, and a user who pastes a document sends
+exactly that.
 
 ### Why no gate saw it
 
@@ -207,7 +285,8 @@ that crate holds the merge loop. So the executing chain for a vLLM encode is:
 | `transformers` 5.14.1 | the `tokenizer.json` contract | the pin resolved inside the pinned vLLM environment, [`../oracles/transformers.md`](../oracles/transformers.md) |
 | `tokenizers` 0.22.2 | **the merge algorithm** | `tokenizers/src/models/bpe/word.rs:162-250` (`Word::merge_all`) |
 | `tokenizers` 0.22.2 | the merge-table representation | `tokenizers/src/models/bpe/mod.rs:9` (`type Pair = (u32, u32)`), `model.rs:19` (`MergeMap`), `model.rs:174-192` (built at load, refuses an out-of-vocabulary merge) |
-| `tokenizers` 0.22.2 | the tie-break order | `tokenizers/src/models/bpe/word.rs:28-35` (`Ord for Merge`) |
+| `tokenizers` 0.22.2 | the tie-break order | `tokenizers/src/models/bpe/word.rs:28-36` (`Ord for Merge`) |
+| `tokenizers` 0.22.2 | what a stale heap entry is | `tokenizers/src/models/bpe/word.rs:197-205`, which compares `new_id`, NOT the pair |
 | `tokenizers` 0.22.2 | the symbol list | `tokenizers/src/models/bpe/word.rs:37-53` (`Symbol`, `merge_with`) |
 | `tokenizers` 0.22.2 | word construction, byte fallback, unk fusing | `tokenizers/src/models/bpe/model.rs:382-460` (`merge_word`) |
 | `tokenizers` 0.22.2 | the word cache, out of scope here | `model.rs:475-496`, `tokenizers/src/utils/cache.rs:7,10` |
@@ -226,9 +305,10 @@ selects this version. The implementing row records the version it read.
 | `word.rs:162-250` `Word::merge_all` | `src/vllm/tokenizer/bpe.cpp::BpeMerge`, an O(n^2) rescan | the same signature, heap-driven |
 | `word.rs:37-43` `Symbol {c, prev, next, len}` | `std::vector<std::string>` with `erase` per merge | a linked symbol list with `len = 0` tombstones |
 | `word.rs:28-35` `Ord for Merge` | `strict <` inside the scan | an explicit comparator, with the tie pinned by a test |
-| `mod.rs:9`, `model.rs:19` identifier-keyed `MergeMap` | `MergeRanks = unordered_map<string, int32_t>` in `src/vllm/tokenizer/bpe.h` | an identifier-pair-keyed table built at load |
+| `mod.rs:9`, `model.rs:19` identifier-keyed `MergeMap` | `MergeRanks = unordered_map<string, int32_t>` in `include/vllm/tokenizer/bpe.h` | an identifier-pair-keyed table built at load |
 | `src/vllm/tokenizer/bpe.cpp::MergeKey` | one `std::string` per probe | deleted; there is no key to build |
-| `model.rs:180-189` `MergeTokenOutOfVocabulary` | no rule; the failure appears per request in `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` | refused at load, naming the missing token |
+| `model.rs:180-189` `MergeTokenOutOfVocabulary` | no rule; the failure appears per request in `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` | refused at load, naming the missing token, on `FromHfJson` AND `FromGguf` |
+| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: `src/vllm/tokenizer/tokenizer.cpp::MergeKey` concatenates `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
 | `model.rs:382-460` `merge_word` | `src/vllm/tokenizer/tokenizer.cpp::EncodePlainSp`'s symbol builder | unchanged in behaviour, emitting identifiers |
 | `model.rs:475-496` word cache | absent | still absent, and out of scope |
 
@@ -251,13 +331,20 @@ selects this version. The implementing row records the version it read.
    (`word.rs:217-244`).
 4. A popped candidate is validated before use rather than removed when it goes
    stale: skip it when its left symbol was removed (`word.rs:187`), when it has
-   no right neighbour (`word.rs:191`), or when the pair it names is no longer
-   the pair at that position (`word.rs:198-205`).
+   no right neighbour (`word.rs:191`), or when the merge table's `new_id` for
+   the pair now at that position differs from the entry's own `new_id`
+   (`word.rs:197-205`). **The third test compares `new_id`, not the pair.**
+   Upstream's line is
+   `merges.get(&target_new_pair).is_none_or(|(_, new_id)| *new_id != top.new_id)`
+   (`word.rs:200-203`), so a table with two distinct pairs mapping to one
+   `new_id` accepts the entry where a pair comparison would reject it. Port the
+   `new_id` comparison, and note that this is only expressible once the table is
+   identifier-keyed, which is the second reason W2 comes before W3.
 
 That is O(n log n) merges of O(1) work each, against our O(n) rescan per merge.
 
 **The order must stay identical, and upstream makes it explicit.** `Ord for
-Merge` (`word.rs:28-35`) inverts both comparisons, so the max-heap yields the
+Merge` (`word.rs:28-36`) inverts both comparisons, so the max-heap yields the
 lowest `rank` first and the lowest `pos` on a tie. That is the same leftmost
 rule our loop gets from `strict <`. Our implementation states this in a comment
 and a test pins it, because a heap silently reversing a tie is exactly the
@@ -298,28 +385,92 @@ emit, so it breaks the mirror on exactly the inputs it claims to protect.
 Truncation is worse, because it changes the output silently. Nobody should
 reach for this as a shortcut, which is why it is written here.
 
-**Rejected on measurement: removing the per-probe `std::string` on its own.**
-This was the low-risk option and it does not work. The same loop with one
-reused key buffer, measured in the same harness on the same inputs, scored
-31,076.04 ms on the 65,535-byte case against the current 28,746.70 ms, and
-639.39 ms against 813.02 ms on 8,192 spaces. It is within noise, and slower on
-the largest case. The allocation is not the cost. The rescan is. The separable
-question therefore has a measured answer of no, and the two changes are one
-change: interning removes the key because the algorithm no longer names one.
+**Removing the per-probe `std::string` on its own is not a separate option, and
+that is an argument about the design rather than a measurement.** Interning is
+forced by the algorithm: upstream's heap entry carries `new_id`
+(`word.rs:8-12`), its staleness test compares `new_id` (`word.rs:197-205`), and
+its table is keyed on an identifier pair (`mod.rs:9`, `model.rs:19`). A merge
+step that has to rebuild a `std::string` to name a pair cannot express that
+test. So the key disappears as a consequence of mirroring `merge_all`, not as a
+tuning step taken beside it. The rescan is the `O(n^2)` term and the key is a
+constant on top of it. Removing a constant from a quadratic leaves a quadratic,
+which is why nobody should reach for the key alone as the cheap half.
+
+**How much the key alone is worth has NOT been measured on an idle host, and
+this spec makes no claim about it.** A first revision of this spec asserted that
+a reused key buffer had been measured and was *slower*, and a same-binary A/B
+did not reproduce that direction: the sign reversed on the largest case. The
+original figures were taken at load average 130-190, which is where a reversed
+sign comes from. The claim is withdrawn rather than restated with a new sign,
+because neither reading has an idle-host A/B behind it and the design argument
+above does not need one. What IS measured, in `## Prototype evidence`, is the
+heap against the current loop, and that ratio is three orders of magnitude, not
+a margin any allocation constant could account for.
 
 ## Prototype evidence
 
-A prototype of the design, built against this tree's sources, produced symbol
-output **bit-identical** to `BpeMerge` on all ten inputs it was run against: the
-six benchmark prompts, 8,192 spaces, 8,192 `~`, 8,192 `a`, 2,731 `中`, and the
-65,535-byte `的` case. It is a prototype, not the implementation. It validates
-staleness by comparing the merged string, where the implementation must mirror
-upstream's identifier comparison (`word.rs:198-205`), and it uses
-`std::priority_queue` where upstream uses a 4-ary heap. Neither difference
-changes the order, and both are named so the implementer does not inherit them
-by accident.
+A prototype of the design, built against this tree's sources by substituting one
+`bpe.cpp` in the link line, produced output **bit-identical** to `BpeMerge`
+everywhere it has been run.
+
+**Harness A**, symbol output only, against the `qwen3.8-27b-hf` merge table:
+ten inputs: the six benchmark prompts, 8,192 spaces, 8,192 `~`, 8,192 `a`,
+2,731 `中`, and the 65,535-byte `的` case. **Every one of those is byte-level.**
+None of them exercises `EncodePlainSp`, which is the arm this row exists for,
+so on its own that set does not cover the SentencePiece path at all.
+
+**Harness B** closes exactly that gap, comparing token identifiers out of full
+`Tokenizer::Encode` through **both** committed goldens, the SentencePiece
+`tokenizer_mistral` and the byte-level `tokenizer_qwen36`, over ten inputs each:
+2,000 and 8,000 bytes of English prose, 4,096 bytes each of spaces, `a`, `~` and
+newlines, 2,001 bytes of `的`, 3,000 bytes each of Chinese and Thai prose, and
+4,000 bytes of mixed script with punctuation, digits and whitespace. All 20
+comparisons are identical, and **all 20 also match HF `tokenizers` 0.22.2
+reading the same two files**, which is what makes them an oracle result rather
+than a self-consistency check.
+
+It is a prototype, not the implementation. Three differences are named so the
+implementer does not inherit them by accident:
+
+- It validates staleness by comparing the merged **string**, where upstream
+  compares `new_id` (`word.rs:197-205`) and the implementation must too. On a
+  merge table with two distinct pairs sharing one `new_id`, the two tests are
+  not the same test.
+- It uses `std::priority_queue` where upstream uses a 4-ary heap. The order is
+  the same because the comparator is the same. The constant is not.
+- It still builds a `MergeKey` string per candidate and a merged string per
+  heap entry, because it reuses the string-keyed `MergeRanks`. The
+  implementation interns, so its constant is lower and its growth ratio is
+  closer to `n log n` than the prototype's. **A bound derived from the
+  prototype's ratio is therefore not a bound for the implementation**, and
+  `## Tests to port` item 3 requires the implementing row to re-derive it on
+  its own code.
 
 ## Defence in depth
+
+**Nothing else in the stack bounds this, and that is checked rather than
+assumed.** Two facts, both read at this base:
+
+- **There is no authentication anywhere in `src/vllm/entrypoints/`.** A
+  case-insensitive grep for `api_key`, `api-key`, `bearer`, `authorization` and
+  `authenticat` over all 143 files of `src/vllm/entrypoints/` and
+  `include/vllm/entrypoints/` returns nothing, exit status 1. So there is no
+  credential between an unauthenticated caller and `/tokenize`, which needs no
+  engine and no model.
+- **The only size bound in the stack is httplib's default**,
+  `CPPHTTPLIB_PAYLOAD_MAX_LENGTH` at `third_party/httplib/httplib.h:129-130`,
+  which is `100 * 1024 * 1024`. Nothing in `src/`, `include/`, `cmake/` or
+  `CMakeLists.txt` overrides it and nothing calls `set_payload_max_length`, so
+  100 MB is what a request body may be.
+
+Extrapolate the measured `n^2.01` fit, taking `t = c n^2` with `c` from the
+25,345.61 ms at 65,536 bytes. A 100 MB body of a single character class is then
+on the order of `6e7` s, several hundred CPU-days of one core, for one request.
+That extrapolation spans three decades beyond the largest measured point, so
+read it as an order of magnitude and not as a measurement. What is measured is
+that 64 KB already costs 25 s. Either way the conclusion does not depend on the
+constant: the cost is unbounded in the request body, unauthenticated, and paid
+on the HTTP worker before any check.
 
 A length guard at the API boundary is worth having **after** the algorithmic
 fix, not instead of it, and it is not in this row's scope. Two constraints bind
@@ -333,18 +484,41 @@ it if a later row adds one:
   wrong place, because it needs the token count that the expensive step
   produces.
 
-After the fix, 64 KB encodes in single-digit milliseconds, so the guard protects
-against a future regression rather than against today's cost. File it as its own
+After the fix, 64 KB encodes in tens of milliseconds. The prototype takes
+15.485 ms on the English case and 7.40 ms to 28.07 ms on the single-class cases.
+The guard therefore protects against a future regression rather than against
+today's cost. File it as its own
 issue when the row lands.
 
 ## Dependencies
 
-None. The row is self-contained host code on base `31f93787c`. It needs no
-oracle run, no lease, no checkpoint mount, and no other row. The two goldens its
-gates read are already committed. It does not block on
+**Code:** none. The row is self-contained host code. It needs no oracle run, no
+lease, no checkpoint mount, and no other row's code. The two goldens its gates
+read are already committed. It does not block on
 [#915](https://github.com/mudler/vllm.cpp/issues/915) and #915 does not block on
 it, although closing this row removes the outlier that
 [`qwen38-27b-bf16-gate.md`](qwen38-27b-bf16-gate.md) records.
+
+**Record:** none, and this row appends no
+[`issue-index.md`](../issue-index.md) row of its own.
+
+#1365 already has its row. `9e1a5e573`
+([PR #1369](https://github.com/mudler/vllm.cpp/pull/1369)) appended it at
+13:05:11Z on 19 August 2026, and it was correctly anchored when it landed. A second row for the same issue number is
+what `scripts/check-agent-record.py` reports as `issue #1365 listed twice`,
+because under `merge=union` a duplicate is exactly what two branches appending
+one issue look like. So no row is appended here, and that is the finished state
+rather than a deferral.
+
+**The landed row's text is stale, and it is not repaired by editing it.** #1365
+was renamed and re-scoped in place at 17:05:51Z on 19 August 2026, from the
+symptom, a reproducible ~4 s TTFT outlier on request 3 of every leg, onto the
+cause this spec addresses. The index row was written before that and still reads
+as the original symptom report. The issue now legitimately covers both, and its
+body keeps the original observation verbatim under
+`## Original report, kept verbatim`. The index is append-only, so the row stays
+as it landed and this paragraph is where the reader is told that the row
+describes the symptom while the issue describes the cause.
 
 ## Work breakdown
 
@@ -360,15 +534,31 @@ before any algorithm changes.
 
 W2 before W3 is deliberate. Interning and the heap are separable in the tree
 even though they are one design, and splitting them means a reviewer never has
-to hold a representation change and an algorithm change in mind at once.
+to hold a representation change and an algorithm change in mind at once. It is
+also the order the `new_id` staleness test needs: that comparison cannot be
+written against a string-keyed table.
+
+**These four waves are four commits in ONE pull request, and the split is a
+review aid rather than a landing plan.** W1 lands items 2 and 3 red against
+unchanged code, so between W1 and W3 the gate is failing by construction. A
+separate W1 pull request would put that red on `main` and leave every other
+row's gate unable to tell its own failure from this one. AGENTS.md's default
+with no recorded preference is one pull request, none of its three split cases
+applies here, because no helper needs a base-reachable spec, the scope is one
+function, and W1 through W3 all write product code. The commit order still
+proves the spec came first. If the developer prefers a split, the reds must land
+`SKIP`-ped with the reason and the owning wave named, and W3 must remove the
+skip in the same change that turns them green. A permanently skipped assertion
+is not an acceptable resting state.
 
 ## Risks
 
 | Risk | Why it is real | Control |
 |---|---|---|
 | A tie is resolved differently and one token identifier changes | The heap's comparator is where leftmost-wins lives, and a reversed tie is invisible on most text | Port `Ord for Merge` (`word.rs:28-35`) with its inversion; a direct tie case in `test_bpe.cpp`, which already pins `BpeSplit("ĠĠĠ", r2) == {"ĠĠ", "Ġ"}` |
-| A stale heap entry is applied | Positions and neighbours change under the heap | Mirror all three validations (`word.rs:187`, `:191`, `:198-205`); a red-first case that reaches a stale entry |
+| A stale heap entry is applied | Positions and neighbours change under the heap | Mirror all three validations (`word.rs:187`, `:191`, `:197-205`), the third of them comparing `new_id` rather than the pair; a red-first case that reaches a stale entry |
 | Interning refuses a checkpoint that loads today | The load-time vocabulary rule is new for us | Verify every committed golden still loads; record which ones in `## Outcome` |
+| A llama.cpp-converted GGUF is refused where `tokenizer.json` was not | `src/vllm/tokenizer/tokenizer.cpp::FromGguf` builds the same `merge_ranks_` at `:864`, and `tokenizer.ggml.merges` is a legacy `"left right"` string list produced by a CONVERTER rather than copied from the original checkpoint. A converter that drops or renames a vocabulary entry names a token the vocabulary does not carry, and after W2 that is a load-time refusal on a file that loads today. Neither we nor upstream have a GGUF case for this: HF `tokenizers` never reads GGUF, so upstream cannot be the oracle for the GGUF arm | The refusal message names the missing token, so the failure is actionable at load rather than per request. `tests/vllm/test_bpe.cpp` already loads a GGUF through `FromGguf`; the implementing row adds one case that a GGUF merge naming an absent token is refused at load with the name in the message, and one that the existing well-formed GGUF still loads. If a real converted checkpoint is refused, that is `NEEDS_DECISION` under `## Stop conditions`, not a quiet widening |
 | The `kUnk` sentinel collides with a real identifier | The SentencePiece path merges a value that is not a vocabulary entry | Reserve an identifier outside the vocabulary range and assert it |
 | The equivalence corpus is too small to be evidence | The existing 64-entry corpus missed this defect at 54 bytes | The corpus below is required to contain the long-pretoken regime |
 
@@ -382,17 +572,59 @@ prove after.
    identifiers. The corpus is the existing 64 entries, plus the six #1365
    prompts, plus real multilingual prose in Chinese, Japanese, Thai, Lao and
    Khmer, plus the single-class runs above at a size the suite can afford. This
-   test **passes on today's code** and must keep passing. It is the correctness
-   gate, and its value is that it cannot go green on a faster wrong answer.
-2. **A cost bound that fails today.** Encode one pretoken of a stated size and
-   assert an upper bound on wall time. This is red on `31f93787c` by three
-   orders of magnitude, which is the margin that makes a wall-clock assertion
-   honest on a contended runner. State the bound as an absolute figure with the
-   margin argued, not as a ratio against a same-run baseline.
-3. **A growth-shape assertion.** Encode at n and at 2n and assert the ratio sits
-   below a bound that quadratic growth cannot satisfy and linearithmic growth
-   can. This is the assertion that survives a slow runner, because both halves
-   move together. It is red today at a ratio near 4.
+   test **passes on today's code** and must keep passing.
+   **The recorded identifiers come from HF `tokenizers` 0.22.2, not from our own
+   output.** A baseline captured from the code under test is a change detector:
+   it can only prove that the answer did not move, never that the answer is
+   right, so recording our own output would make the sentence "it cannot go
+   green on a faster wrong answer" false. The capture is cheap and has already
+   been done for the 20 comparisons of `## Prototype evidence`: `Tokenizer.from_file`
+   on the same committed `tokenizer.json` file the C++ side reads, then
+   `encode(text, add_special_tokens=False)` against `Tokenizer::Encode` (the
+   `add_special_tokens=True` arm pairs with `EncodeWithSpecialTokens`), comparing
+   `Encoding.ids` element by element. The generator script, the `tokenizers`
+   version, and the golden file's sha256 are committed beside the recorded
+   identifiers so the capture is reproducible. Where an entry cannot be captured
+   from HF, the test records that entry as self-referential in its own comment
+   rather than letting the whole corpus inherit an oracle it does not have.
+2. **A cost bound that fails today, and it is the ROBUST of the two.** Encode
+   one pretoken of a stated size and assert an upper bound on wall time. State
+   the bound as an absolute figure with the margin argued, not as a ratio
+   against a same-run baseline. At 65,536 bytes of English through the Mistral
+   golden the two sides are 25,345.61 ms and, for the prototype, 15.485 ms, so a
+   bound placed anywhere in the middle of that has **three orders of magnitude**
+   of headroom. A runner would have to be a thousand times slower than this box
+   to cross it. That margin, not the fact that it is a single measurement, is
+   what makes this assertion survive a contended runner.
+3. **A growth-shape assertion, which is the TIGHTER of the two and needs care.**
+   Encode at n and at 4n and assert the ratio sits below a bound that quadratic
+   growth cannot satisfy and the implemented algorithm can. **Use a step of at
+   least 4x, and take the minimum of k repetitions rather than one shot.** Both
+   requirements were measured, because a first revision of this spec specified a
+   2x single-shot ratio and called it "the assertion that survives a slow
+   runner", which is backwards:
+
+   - **A 2x single shot has about 1.6x of usable band.** Eight independent
+     single-shot pairs of the prototype at 131,072 and 262,144 bytes, load
+     average 20 to 30, gave ratios 1.862, 2.291, 2.303, 2.219, 2.508, 2.331,
+     2.395
+     and 2.336, a 35% spread over the minimum. Linearithmic predicts ~2.1 and
+     quadratic 4.0, so the band a bound may sit in is (2.51, 4.0). The two
+     halves are separate, independently preemptible measurement windows. They do
+     **not** move together, and one deschedule in the 2n half crosses 4.0.
+   - **A 4x step with min-of-8 has about 2.7x, and is four times more stable.**
+     Four independent min-of-8 sweeps at 65,536 and 262,144 bytes on the same
+     box gave 5.51, 5.74, 6.01 and 6.03, a 9% spread. Quadratic predicts 16,
+     so the band is (6.03, 16).
+
+   The red side is measured on the current code at the same shape: 8,000 to
+   32,000 bytes costs 16.74x, against the 16x `n^2` predicts. The prototype's
+   5.5 to 6.0 is above the ~4.6 that `n log n` predicts because the prototype
+   still builds a string key and a merged string per candidate. The interned
+   implementation removes both, so **the implementing row re-derives the bound
+   from min-of-k sweeps on its own code** and records the sweep, the `k`, and
+   the host load beside it. A bound copied from the prototype is not a bound for
+   the implementation.
 4. **The leftmost tie.** Extend the existing `test_bpe.cpp` case into one that
    distinguishes the two orders on a longer symbol list.
 5. **A stale-entry case.** A merge sequence where a queued candidate is
@@ -402,8 +634,17 @@ prove after.
    `tests/parity/goldens/tokenizer_mistral/tokenizer.json`, whose `"split":
    false` makes the whole prompt one word. Ordinary English prose is the input,
    because that is what fails.
-7. **The load-time vocabulary refusal.** A merge table naming a token absent
-   from the vocabulary is refused at load, with the missing name in the message.
+7. **The load-time vocabulary refusal, on BOTH load surfaces.** A merge table
+   naming a token absent from the vocabulary is refused at load, with the
+   missing name in the message, once through
+   `src/vllm/tokenizer/tokenizer.cpp::FromHfJson` and once through
+   `src/vllm/tokenizer/tokenizer.cpp::FromGguf`, whose
+   `tokenizer.ggml.merges` reaches the same `InsertMerge` at
+   `src/vllm/tokenizer/tokenizer.cpp:864`. `tests/vllm/test_bpe.cpp` already
+   builds a zero-tensor GGUF and loads it through `FromGguf`, so the GGUF case
+   is one more kv block in an existing fixture, not new machinery. Also assert
+   that the existing well-formed GGUF still loads, because that is the
+   regression the refusal can cause.
 
 The reachability mutation for the fresh reviewer: delete the call to the new
 merge from `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` in a scratch copy and
@@ -428,6 +669,15 @@ The CPU tier can prove, with no other host:
 - Through `test_tokenizer_parity`, `test_tokenizer_parity_mistral`,
   `test_tokenizer_parity_deepseek` and `test_tokenizer_parity_gpt4o`, that all
   four already-gated families still produce their recorded identifiers.
+- Through `test_bpe`, `test_tokenizer_metaspace_split` and `test_detokenizer`,
+  that the units this change actually edits still hold. These three are the
+  suites nearest the diff and the first revision of this spec omitted all of
+  them. `test_bpe` owns `BpeSplit`, `BpeMerge`, `MergeKey` and the `FromGguf`
+  load path. `test_tokenizer_metaspace_split` owns the `metaspace_split_` flag
+  that decides whether the SentencePiece arm makes the whole prompt one word.
+  `test_detokenizer` is the round trip that a changed symbol boundary would
+  break. All three are declared in `tests/CMakeLists.txt` and run in the CPU
+  tier today.
 
 What the CPU tier cannot prove: the end-to-end TTFT of #1365's legs on GB10.
 That needs the bf16 27B server on `dgx:gpu0` under an `rc` lease, and it is the
@@ -435,12 +685,21 @@ row's closing evidence rather than its correctness gate. Run it only after the
 CPU gates are green.
 
 Required before any speed figure in this spec is accepted: an idle-host,
-same-binary A/B re-measure with the load average recorded, because every figure
-above was taken between load average 130 and 190.
+same-binary A/B re-measure with the load average recorded. No figure above was
+taken on an idle host. Harness A ran at load average 130 to 190 and Harness B at
+4 to 90, on a 20-core box with another session compiling and testing throughout.
+Harness B reports the minimum of a repetition set, which is the least contended
+estimate the box could give, and that is not the same thing as an idle
+measurement. The two harnesses agree on the shape and on every absolute figure
+to within about 25%, which is what makes the shape safe to reason from and the
+constants not yet quotable.
 
 ## Owed
 
-Nothing yet. This row files no issue it does not fix.
+Nothing. This row files no issue it does not fix, and it owes no
+[`issue-index.md`](../issue-index.md) row: #1365's row already exists and a
+second one for the same number is a checker failure, argued under
+`## Dependencies`.
 
 ## Stop conditions
 

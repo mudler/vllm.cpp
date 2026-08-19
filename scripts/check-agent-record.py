@@ -620,10 +620,10 @@ ENGINE_PREFIXES = (
 # thing a token gate provably cannot see. It is also not a benchmark row: the encode
 # runs synchronously on the HTTP worker five lines before the only length check, so
 # `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
-# MEASURED at `31f93787c`: 65,535 bytes of one repeated character costs 28.1-48.1 s
-# of one core, and 64 KB of ordinary English prose costs 24.1 s through the committed
-# Mistral golden, growing n^2.0. `READY`, spec `specs/bpe-quadratic-merge.md`,
-# issue #1365.
+# MEASURED: 64 KB of ordinary English prose costs 25.3 s through the committed
+# Mistral golden against HF `tokenizers` 0.22.2's 10.1 ms on the same file for
+# byte-identical identifiers, and the fit over 1 KB to 64 KB has exponent 2.01.
+# `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
 # Bumped for a real new row, never to make a failing state transition pass.
 ENGINE_ROWS = 168
 

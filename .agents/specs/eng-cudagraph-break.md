@@ -12,7 +12,7 @@ to be named and measured before any speed claim is admissible, and
 `## Risks/decisions` D5 records why no such path is named today.
 
 The correctness half is not a framing device, it is already shipped damage
-([#1179](https://github.com/mudler/vllm.cpp/issues/1179)). `src/vllm/model_executor/models/qwen3.cpp:961-986`
+([#1179](https://github.com/mudler/vllm.cpp/issues/1179)). `src/vllm/model_executor/models/qwen3.cpp`'s `DenseDecodeGraphForward`
 DECLINES its decode graph outright whenever the asynchronous device-token mirror is
 live, and its comment records the measurement that forced it: `depth-1, graph ON
 PASS 78/78`, `depth-2, graph OFF PASS 82/82`, `depth-2, graph ON FAIL, slots 1-3
@@ -22,6 +22,17 @@ as `StepDevInputs` (`qwen3_5.cpp:3894`). One driver has the capability and a shi
 model lost its decode graph because it does not. That is duplication producing a
 correctness regression, not a tidiness complaint, and it is the second reason this
 row exists.
+
+**THE SENTENCE ABOVE ABOUT `StepDevInputs` IS FALSE, and W4 measured it false
+([#1307](https://github.com/mudler/vllm.cpp/issues/1307)).** It is kept as
+written because it is what this row was scoped on and `## Owed` has to be read
+against it, not because it is true. `StepDevInputs` has no token-id member; its
+pinned sibling's `token_ids` block was filled every step and never uploaded and
+never read; every batched driver embeds OUTSIDE the captured region from the HOST
+vector. No driver has the capability, so the decline was never one refactor away
+from removable. The decline's own recorded CAUSE is falsified too. `## Owed` and
+`## Now` carry the corrected record, and the decline's comment in `qwen3.cpp`
+was repaired in the same pull request.
 
 ## Scope
 
@@ -948,7 +959,7 @@ a different case and a NEW FINDING rather than an inherited one: their
 registrations (`qwen3_moe_registry.cpp:107`, `deepseek_v2_registry.cpp:106`, and
 `glm4_moe_lite_registry.cpp:125` which constructs the DeepSeek driver) route a
 pure-decode step into a host-vector replay with NO `device_token_ids` check at
-all, while `qwen3.cpp:1106` declines for exactly that condition on a measured
+all, while `qwen3.cpp`'s `DenseDecodeGraphForward` declines for exactly that condition on a measured
 battery. W3 did not add a decline: it would trade a shipped, default-ON
 capability away on a measurement this stage cannot make, and the fix
 `qwen3.cpp`'s own comment names is `StepDevInputs` as a seam capability, which is
@@ -1288,7 +1299,7 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   primitive: it is a driver that holds its layer's inputs there and a break
   closure that reads them instead of `RunLayer`'s frame. Owner: **W6**, which
   cannot move the eligibility predicate before that exists.
-- **The async device-token DECLINE at `qwen3.cpp:1106` STANDS after W4, and the
+- **The async device-token DECLINE at `qwen3.cpp`'s `DenseDecodeGraphForward` STANDS after W4, and the
   reason changed.** W4 owned the decision and did not remove it. What W4
   established, by reading the tree rather than by inheriting the record:
 
@@ -1323,11 +1334,38 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   session's job for the whole of W4's window (`rc devices`: `busy`, 1h31m and
   climbing); W4's lease was `thor:gpu0`, which has no such checkpoint. Both arms
   of the decline stay gated on CPU at
-  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp`. Owner: the stage that
-  gets a `dgx` window WITH the checkpoints, and it owes two runs, not one — the
-  battery as it stands, and the battery with the decline deleted, because only
-  the second can fail. [#1179](https://github.com/mudler/vllm.cpp/issues/1179)
+  `tests/vllm/models/test_qwen3_decode_graph_seam.cpp`. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**, the stage that gets a `dgx` window WITH the
+  checkpoints; it owes two runs, not one — the battery as it stands, and the
+  battery with the decline deleted, because only the second can fail.
+  [#1179](https://github.com/mudler/vllm.cpp/issues/1179)
   and [#323](https://github.com/mudler/vllm.cpp/issues/323) track it.
+
+  **The DECLINE'S OWN COMMENT was left standing verbatim by the head this
+  entry landed on, and the fresh review caught it.** It still asserted the
+  falsified `DeviceTokenIdsScope` mechanism, still named `StepDevInputs` as the
+  fix at the stale anchor `qwen3_5.cpp:3894`, and still read `Owner: W4` — the
+  one place a reader lands when they open the decline, disagreeing with the
+  spec, `docs/STATUS.md`, the engine-matrix row, the new header and the pull
+  request. Repaired in the same pull request that made it stale, per AGENTS.md
+  "a record edit rides in the pull request whose change made the record stale".
+  The decline itself is UNCHANGED.
+
+  **`RefreshFromDevice` therefore lands with NO production caller, and that is
+  the staged slice AGENTS.md admits rather than an oversight.** `grep -rn
+  RefreshFromDevice src/ include/` returns the definition alone;
+  `last_source()` and `StepInputSource` have no production reader either. The
+  arm is unreachable until a driver holds a device token-id destination, which
+  is what this entry owes, so writing a caller now would be the tenth
+  hand-rolled copy this row exists to remove. Named in the commit body, in the
+  pull-request body, at the declaration in
+  `include/vt/persistent_step_input.h`, and here. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**, same stage and same two issues as above. The HOST
+  arm is reached, and its reach is bounded rather than claimed whole:
+  `StageStepInputs` (`qwen3_5.cpp`) routes both Qwen3.5 decode drivers through
+  it when `dbuf` is set — `VT_ASYNC_EXECUTOR=1`, default OFF, or a speculative
+  verify step — and `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`
+  holds that call site with a mutation that reds only the reachability case.
 - **The async battery has still NOT been re-run, by W2, W3 or W4.** The
   obstacle is the same one and it is a resource rather than an oversight: the
   battery needs a GPU **and** a real checkpoint, W4's lease was `thor:gpu0`
@@ -1341,7 +1379,7 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   caused by it — the shape is present at W3's base commit `5d9fe332c`).
   `qwen3_moe_registry.cpp:107`, `deepseek_v2_registry.cpp:106` and
   `glm4_moe_lite_registry.cpp:125` admit a pure-decode step to a driver that
-  replays against persistent HOST vectors, while `qwen3.cpp:1106` declines for
+  replays against persistent HOST vectors, while `qwen3.cpp`'s `DenseDecodeGraphForward` declines for
   exactly that condition on a measured battery whose own comment calls the
   hazard "latent for EVERY classic-dense model, since the graph is default-ON".
   W3 did not add a decline: it would trade a shipped, default-ON capability away
@@ -1360,8 +1398,8 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   registrations would spread an unexplained behaviour, not close a defect. What
   #1305 needs is the same `dgx` window with checkpoints that the decline needs:
   run the battery shape against `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph`
-  and find out whether they degenerate at depth 2 at all. Owner: the stage that
-  gets that window.
+  and find out whether they degenerate at depth 2 at all. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**, the stage that gets that window.
 - **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
   drain cannot see.** The `uncaught_exceptions()` comparison in
   `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A

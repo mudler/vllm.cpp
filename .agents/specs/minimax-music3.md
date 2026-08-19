@@ -3437,3 +3437,245 @@ reader to rediscover from a profile.
 reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an
 internal two-arm number on named hardware.
 
+
+## 17. The request-key contract, finished (#1315) — a guard that stopped looking
+
+[#925](https://github.com/mudler/vllm.cpp/issues/925) refused `audio_duration_s`
+and [#953](https://github.com/mudler/vllm.cpp/issues/953) refused the five keys
+SGLang-Omni names. Both landed and both are correct. This section is what they
+did not cover, and the first half of it is the same defect they fixed, still
+live at `678fc672c` and reachable by an ordinary body.
+
+### 17.1 Scope
+
+[#1315](https://github.com/mudler/vllm.cpp/issues/1315). One function,
+`ParseSpeechRequest`
+([`src/vllm/entrypoints/openai/speech_api.cpp`](../../src/vllm/entrypoints/openai/speech_api.cpp)),
+plus the tests that enter it through the registered route. No engine, no
+kernel, no model code, no lifecycle change: the row stays `ACTIVE`, so this
+change owes `docs/USAGE.md` (a request-key surface) and nothing in
+`docs/STATUS.md`, `docs/BENCHMARKS.md` or `## Now`.
+
+### 17.2 The oracle, and what it says
+
+vLLM registers no `/v1/audio/speech` and no MiniMax-Music3, so the primary is
+silent here and the secondary applies: SGLang-Omni, pinned at
+`748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`
+([`.agents/oracles/sglang-omni.md`](../oracles/sglang-omni.md)). The pin was
+asserted against the local checkout's `HEAD` before a line of it was read,
+because an oracle whose identity is assumed measures whatever happens to be
+checked out.
+
+`_build_tts_params` (`sglang_omni/serve/speech_service.py:737-779`) forwards a
+named set of wire keys into the model builder.
+`_UNSUPPORTED_TTS_PARAMS` (`sglang_omni/models/minimax_music3/request_builders.py:20-30`)
+lists what MiniMax-Music3 cannot honour, and `_validate_tts_contract` (`:71-81`)
+raises `"MiniMax Music 3 does not support speech parameters: <names>"` for each.
+Two further keys come from the schema itself: `voice` carries
+`AliasChoices("voice", "speaker")` (`sglang_omni/serve/protocol.py:337-339`),
+and `instructions` is the music CAPTION, which the builder requires non-empty
+(`request_builders.py:104-106`).
+
+The oracle is `gateable = no` — cloned and read, never executed here — so this
+is a SOURCE reading and it is recorded as one. Nothing in this section claims a
+measured comparison against a running SGLang-Omni.
+
+### 17.3 The defect, in two parts
+
+**Part 1 — `extra_params` was a REPLACEMENT, not a second place to look.** The
+`const nlohmann::json& extra` binding in `ParseSpeechRequest` selects one of the
+two objects. It is at `speech_api.cpp:159-161` in `f06b9e93d`, the merge base of
+the change that repairs it. An earlier draft of this section and the `#1315` row
+in [`issue-index.md`](../issue-index.md) both cite `:160-163`, which is off by
+one line and, at the repaired head, lands on the `voice` and `speed` refusals
+instead. This copy is corrected; the index row is append-only and keeps the
+slip, so the anchor to trust is this one and the symbol name is what survives
+either way.
+
+```cpp
+const nlohmann::json& extra =
+    (json.contains("extra_params") && json.at("extra_params").is_object())
+        ? json.at("extra_params") : json;
+```
+
+So a body carrying an `extra_params` object AT ALL — an empty `{}` suffices —
+stops the top level being read for every knob and every refusal that resolves
+through `extra`. `{"lyrics": …, "extra_params": {"seed": 7}, "audio_duration":
+0.1}` drops the duration, leaves `audio_duration_s` at its `0.0` sentinel, and
+§4.1's resolver substitutes the family's 60 s
+(`minimax_music3_speech.cpp:478-479`). That is #852's ~750x job, behind a 200,
+with #925's guard in the tree and unable to fire. The five #953 refusals go
+quiet on the same body. The mirror hole is the other side of it: `voice`,
+`speed`, `stream`, `stream_format` and `response_format` were read from the top
+level only, so nesting any of them dropped it.
+
+**Part 2 — nine keys the oracle names, dropped silently.** The seven of
+`_UNSUPPORTED_TTS_PARAMS` that this route can see (`task_type`, `ref_audio`,
+`ref_text`, `x_vector_only_mode`, `initial_codec_chunk_frames`, `token_count`,
+`duration_tokens`), plus `speaker` and `instructions`. `token_count` and
+`duration_tokens` are LENGTH keys, so they repeat #925's cost exactly.
+
+### 17.4 Design
+
+`extra_params` becomes a second place to look, with `extra_params` winning —
+the precedence the video route already documents
+(`src/vllm/entrypoints/openai/video_api.cpp:216-225`), so the two routes resolve
+a knob the same way instead of two ways. Every request key goes through one
+`Owner(key)` resolver.
+
+**That sentence was false when this section was first written, and §17.7 records
+what the false version cost.** The first implementation routed the KNOBS and the
+REFUSALS through `Owner` and left the eight CONTENT keys (`model`, `input`,
+`text`, `language`, `lyrics`, `description`, `prompt`, `reference_audio`)
+reading the bare `json` handle, while claiming in the code that "there is no
+longer a handle on one placement only". There was: `Owner` needs `json` as its
+fallback, so the handle cannot go away. What is guaranteed is a CONVENTION that
+the code states and the tests pin, not a structural impossibility, and it is
+written that way now because the impossibility claim is exactly what let eight
+direct reads sit underneath it through an implementation and a first review.
+
+The nine keys are REFUSED by name, each naming what to send instead. `speaker`
+points at `voice`'s refusal, `instructions` at `description`, `ref_audio` at
+`reference_audio`, and both length keys at `audio_duration` in seconds.
+
+**`instructions` is refused rather than aliased, and that is a decision.**
+Upstream HONOURS it as the caption, so an alias would be the closer mirror of
+behaviour. TWO reasons hold. AGENTS.md holds that a secondary oracle "never
+becomes the mirror source", and SGLang-Omni is the secondary here only because
+vLLM registers no `/v1/audio/speech` at all. And `instructions` means
+style-and-emotion for a TTS family (`protocol.py:348`) and the caption for this
+music one, so a global alias on a SHARED route would bake one family's meaning
+into it.
+
+A third reason that the first draft of this section gave, *"one meaning keeps
+one name on this route"*, does NOT hold, and the counter-example is four
+refusals up in the same function: `prompt` is ACCEPTED as a second spelling of
+`description`, with a comment stating the opposite policy. The rule the cases
+actually follow is narrower, and it is stated in the code beside the refusal:
+an ALIAS is accepted when both spellings carry the same value in the same UNITS
+and mean the same thing for every family this route can load.
+`prompt`/`description` qualify. `instructions` fails on MEANING. And the
+`max_new_tokens` precedent from #953 — which is real, and landed in `c90e3fc02`
+— fails on UNITS, 25 Hz frames against seconds, so aliasing it would need a
+silent conversion of the one quantity this route has already shipped a 750x
+error in.
+
+**The refusal has to name BOTH readings of the key, and now does.**
+`instructions` is OpenAI's OWN createSpeech field, for voice style and emotion,
+and this route describes itself as "OpenAI's createSpeech, extended with the two
+MUSIC inputs" (`api_server.cpp:496-497`). Framing the refusal purely as
+SGLang-Omni's caption spelling and redirecting to `description` is right for the
+caller who ported an SGLang recipe and wrong for the caller who read OpenAI's:
+it moves a VOICE-STYLE string into the music caption, which is the exact
+conflation this refusal exists to prevent. The message states the OpenAI reading
+first (no registered family exposes a style control, so there is nothing to
+send), then upstream's, then the `description` redirect for that second reading
+only.
+
+**`language` is deliberately absent from the refused set.** Upstream lists it,
+but it is already refused BY NAME one layer down
+(`minimax_music3_speech.cpp:456-460`), which is the layer this tree puts
+family-specific refusals at, and where a family that HAS a language can still
+take it. A family-specific refusal belongs at the family layer, and a future
+speech family that takes a language must not have to unpick a parser-level
+refusal to get one.
+
+**The first draft justified this with "Moving it up would break IndexTTS-2.5",
+and that is not true today.** No registered family reads
+`SpeechGenParams::language` at all: `grep -rn '\.language'
+src/vllm/model_executor/models/` returns exactly one hit, the MiniMax-Music3
+refusal above, and `grep language src/vllm/model_executor/models/indextts2.cpp`
+returns nothing. Moving the refusal up would therefore break nothing; it would
+convert a SILENT DROP into a refusal. That drop is this row's own defect class
+in the family this row did not touch, and it is filed as
+[#1337](https://github.com/mudler/vllm.cpp/issues/1337) against
+`MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation` rather than
+fixed here, because either fix is IndexTTS-2 model code with its own oracle
+reading. The argument above is the forward-looking form and is the one that
+stands.
+
+**The boundary from #925 is unchanged.** An unknown key is still accepted, so
+`extra_params` stays forward-compatible. Only keys the pinned oracle names are
+refused, and the negative control in the test file pins that boundary so a later
+sweep cannot quietly turn it into "refuse everything".
+
+### 17.5 Gate
+
+Red first, and the red is the point: the parser suite fails 24 assertions and
+the server suite 54 before the change, on assertions that name the dropped key.
+The content-key repair in §17.7 adds a second red on top of that one, measured
+against the merge base `f06b9e93d`.
+The failing tests enter through the production entry point —
+`ApiServer::handle_audio_speech`, which is what
+`server.Post("/v1/audio/speech", …)` calls (`api_server.cpp:1116-1120`) — and one
+of them over a real socket, because #925 was a claim about an HTTP request and a
+parser test cannot make one. The parser-level cases stay as well; they localize
+a failure, which is worth having, and they are not the proof.
+
+Reachability is proven by deleting the parse call site
+(`api_server.cpp:504`) in a scratch copy and confirming the focused gate reds.
+
+### 17.6 Risks
+
+A guard that fires on an ordinary request is worse than the drop it replaces, so
+every refusal carries a negative control: a body without the key parses, an
+unknown key parses, and the honoured knobs keep their values across both
+placements. The precedence choice is the one behaviour change a body could
+notice, and it only becomes observable when a caller sends the SAME key twice in
+two places, which today resolves to whichever object `extra` happened to bind.
+
+### 17.7 The invariant was false, and three refusals were defeatable by nesting
+
+A fresh review of the implementation returned FAIL, and it was right. The repair
+itself reproduced exactly: the 750x defect, the fact that `"extra_params":{}`
+alone was enough, and every number claimed. What failed was a STRUCTURAL claim
+the change rested its durability on, and the live defect that claim was hiding.
+
+**What was false.** `speech_api.cpp` said "Every read and every refusal below
+resolves through `Owner` ... a guard that looks at one placement only can no
+longer be written, because there is no longer a handle on one placement only".
+The handle `json` was still in scope and still used about thirteen times below
+that sentence, for `model`, `input`, `text`, `language`, `lyrics`,
+`description`, `prompt` and `reference_audio`. None of the eight resolved
+through `Owner`.
+
+**What that cost**, measured against the real downstream chain rather than
+argued. Three refusals stayed defeatable by moving the key one level down
+([#1336](https://github.com/mudler/vllm.cpp/issues/1336)):
+
+| body | before | after |
+|---|---|---|
+| `{…,"text":"hello"}` | REFUSED (`minimax_music3_speech.cpp:440-446`) | unchanged |
+| `{…,"extra_params":{"text":"hello"}}` | 200, `text` silently DROPPED | reaches the family, which refuses it |
+| `{…,"language":"en"}` | REFUSED (`:456-460`) | unchanged |
+| `{…,"extra_params":{"language":"en"}}` | 200, `language` silently DROPPED | reaches the family, which refuses it |
+| `{…,"reference_audio":"data:…"}` | decoded | unchanged |
+| `{…,"extra_params":{"reference_audio":"data:…"}}` | 200, clip silently DROPPED | decoded |
+
+The `text` case is the sharpest, because the refusal it bypassed ends with the
+words *"rather than having it silently dropped"* and nesting produced precisely
+that drop. The `reference_audio` case has a second-order cost a caller could not
+have diagnosed: for a family whose `requires_reference_audio()` is true, the
+nested clip was dropped and `api_server.cpp:511-516` then answered
+`400 "reference_audio … is required"` naming the field the caller had just sent.
+
+**None of this was a regression.** The pre-#1315 code read those keys from the
+top level only as well. It was in scope, untested and unfiled, and the false
+invariant is what let it survive an implementation and a first review: a claim
+that a defect *cannot be written* reads as a reason not to look for it.
+
+**The repair.** The eight content keys route through `Owner`, so the invariant is
+true in substance, and the comment now claims a convention the tests pin instead
+of an impossibility the code cannot provide. Two smaller findings ride with it:
+the `instructions` argument loses the leg `prompt` falsifies (§17.4), and the
+`audio_duration` refusal stops promising `> 0` while implementing `>= 0.0`
+([#1338](https://github.com/mudler/vllm.cpp/issues/1338)), which had made an
+explicit `"audio_duration": 0` resolve to the family's 60 s default with the
+message that would have explained it never printed. `docs/FEATURES.md` picks up
+the placement change its own trigger owed.
+
+**The lesson worth keeping**, because neither the code nor Git will say it: the
+review did not find the drops by reading the diff. It found them by testing the
+INVARIANT the diff asserted, and the invariant was the only part of the change
+that had no test. A claim about what can no longer be written is a claim, and it
+gets mutated like any other.

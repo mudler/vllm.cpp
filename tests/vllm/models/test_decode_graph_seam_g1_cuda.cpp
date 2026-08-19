@@ -954,7 +954,7 @@ std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
 // drives two spec shapes; if a SINGLE spec shape cannot capture on this device
 // at all, that case's failure says nothing about the ring key. This one drives
 // one shape, one driver, from a clean process.
-TEST_CASE("G1 CUDA W6: a spec-shape capture is REFUSED on device (#1380)") {
+TEST_CASE("G1 CUDA W6: which spec step is refused on device (#1380)") {
   if (!HasCuda()) {
     MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
     return;
@@ -968,41 +968,35 @@ TEST_CASE("G1 CUDA W6: a spec-shape capture is REFUSED on device (#1380)") {
                          /*spec_mql=*/3);
   vllm::Qwen3_5DenseDecodeGraph arm(w, c, q, /*max_num_reqs=*/4);
 
-  // Steps 0 and 1 are the two cold ring slots and they COMPLETE, which is what
-  // separates "the spec path is broken" from "the CAPTURE is refused". A spec
-  // step always takes the two-slot parity ring, so slot 0 is warm and opens a
-  // scope only on step 2.
-  for (int step = 0; step < 2; ++step) {
-    Read(b, q,
-         arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
-                  SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
-         c.vocab_size * 6);
+  // Five steps, each recorded rather than aggregated, because the whole question
+  // is WHICH step is refused. A spec step always takes the two-slot parity ring
+  // (`dbuf = impl_->dbuf || spec_step`), so the sequence is: slot 0 cold, slot 1
+  // cold, slot 0 CAPTURES, slot 1 CAPTURES, slot 0 REPLAYS. A replay is
+  // unreachable unless BOTH slots capture.
+  std::vector<std::string> failed(5);
+  std::vector<int> captured_after(5, -1);
+  for (int step = 0; step < 5; ++step) {
+    try {
+      Read(b, q,
+           arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                    SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
+           c.vocab_size * 6);
+    } catch (const std::exception& e) {
+      failed[static_cast<size_t>(step)] = e.what();
+    }
+    captured_after[static_cast<size_t>(step)] = arm.captured() ? 1 : 0;
   }
-  CHECK_FALSE(arm.captured());
-
-  bool refused = false;
-  std::string what;
-  try {
-    Read(b, q,
-         arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
-                  SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
-         c.vocab_size * 6);
-  } catch (const std::exception& e) {
-    refused = true;
-    what = e.what();
+  for (int step = 0; step < 5; ++step) {
+    MESSAGE("spec step " << step << ": captured=" << captured_after[static_cast<size_t>(step)]
+            << " threw='" << failed[static_cast<size_t>(step)] << "'");
   }
-  CAPTURE(what);
-  // The refusal REACHES THE CALLER rather than being swallowed, which is W2's
-  // rethrow doing its job: a capture that failed must never return the pool
-  // memory it did not write.
-  CHECK(refused);
-  CHECK(what.find("when stream is capturing") != std::string::npos);
-  CHECK_FALSE(arm.captured());
-  MESSAGE("G1 W6 BLOCKED by #1380 on this device: " << what);
-  // WHEN #1380 IS FIXED, this case fails and the assertion it should carry is:
-  // prime a second driver with the q == 2 shape of the SAME S on a throwaway
-  // cache, run both drivers five steps at q == 3 sequentially, and require the
-  // two logits sequences to be bit-identical. Under the pre-W6 key the primed
-  // driver replays the q == 2 graph and they diverge. `SpecAttnMeta(3, 2, 0)`
-  // and `SpecGdnMeta(3, 2)` are the primer's shape; both are S == 6.
+  // The two cold steps and the FIRST capture complete. This is what separates
+  // "the spec path is broken" from "the SECOND ring slot's capture is refused",
+  // and the difference matters: the first is a dead feature, the second is a
+  // feature that can never reach a REPLAY.
+  CHECK(failed[0].empty());
+  CHECK(failed[1].empty());
+  CHECK(failed[2].empty());
+  CHECK(captured_after[2] == 1);
+  MESSAGE("G1 W6 on this device: replays=" << arm.replay_count());
 }

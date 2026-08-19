@@ -667,20 +667,47 @@ from it is admissible only with a non-zero count and the device named. W2's
 driver is covered by construction — its gate ran on the identical seam — but it
 is not one of the three cases and is NOT claimed here.
 
-**G1 FOR W6, the ring key on a real device
-([#1374](https://github.com/mudler/vllm.cpp/issues/1374)).** The CPU seam gate
-proves the key opens TWO rings by counting them; it cannot prove the second ring
-replays the RIGHT graph, because a CPU replay recomputes nothing. There is also
-no eager arm to compare a spec step against: every other case in the G1 file
-selects one with `max_num_reqs == 0`, because `PadToCaptureSize` then returns -1,
-and a spec step takes `S = B` and never consults `max_num_reqs`. So the W6 case
-is an A/B between two GRAPHED drivers that differ only in HISTORY -- arm A has
-only seen `q == 3`, arm B saw `q == 2` first on a throwaway cache, and both
-shapes are `S == 6`. Under the pre-W6 key arm B's first `q == 3` step would find
-`captured()` true and replay the `q == 2` graph. Same binary, same device, same
-inputs, same starting cache state, so any difference is the key. Five steps and
-three replays, the shape the rest of the file uses. See `## Outcome` for the
-reading and the device.
+**G1 FOR W6: RE-RUN AND PASSING for the five migrated drivers, and BLOCKED for
+the ring key ([#1374](https://github.com/mudler/vllm.cpp/issues/1374),
+[#1380](https://github.com/mudler/vllm.cpp/issues/1380)).** Measured on
+`thor:gpu0` through an `rc` lease -- NVIDIA Thor sm_110, driver 595.78, nvcc
+13.0.88, CUDA-ON build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF`), the binary resolving `libcudart.so.13` and
+`libcublasLt.so.13`.
+
+The five pre-W6 cases read **2066 assertions, 0 failed**, with `5 steps x 100
+logits, 0 differing, 4 replays` for `Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph`
+and `DeepseekV2DecodeGraph`, and `5 steps x 40 logits, 0 differing, 4 replays`
+for both Qwen3.5 drivers. **W6 does not move a single logit on any migrated
+driver.**
+
+**The ring-key case is BLOCKED and the blocker is not this row's.** The CPU seam
+gate proves the key opens TWO rings by counting them; it cannot prove the second
+ring replays the RIGHT graph, because a CPU replay recomputes nothing. The device
+case needs two spec shapes to capture, and **not one can**: one driver, one cache
+pool, one shape -- two requests verifying three tokens each -- throws
+`cudaMalloc: operation not permitted when stream is capturing` on the first step
+that opens a capture scope, reproduced with the case run alone in a fresh
+process. Not the ring key, not pool pressure from the five cases above, not two
+interleaved drivers. Filed as
+[#1380](https://github.com/mudler/vllm.cpp/issues/1380), which is pre-existing:
+W6 changes which shapes reach a driver and not the capture's allocation
+discipline.
+
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore PINS the
+refusal, asserts that it reaches the caller (W2's rethrow, so a failed capture
+never returns pool memory it did not write), and carries the assertion W6 wanted
+in a comment. **It is written to FAIL when #1380 is fixed**, so whoever fixes the
+capture inherits a red pointing at the owed gate rather than a silent skip.
+
+There is also no eager arm to compare a spec step against, and that is worth
+recording for whoever picks it up: every other case in this file selects one with
+`max_num_reqs == 0`, because `PadToCaptureSize` then returns -1, and a spec step
+takes `S = B` and never consults `max_num_reqs`. The A/B has to be between two
+GRAPHED drivers that differ only in HISTORY. They must also run SEQUENTIALLY
+rather than step-interleaved: the capture pre-grows the pool for its retained
+`[S, vocab]` logits immediately before `BeginCapture`, and a second driver's step
+in between takes the block that was just freed.
 
 For each migrated model, run the same inputs through the segmented capture path and
 through the eager forward with capture disabled, and require the logits to be

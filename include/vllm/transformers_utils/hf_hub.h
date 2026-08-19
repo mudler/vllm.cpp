@@ -49,6 +49,9 @@ HfHubOptions HfHubOptionsFromEnv();
 struct HfFile {
   // Repository-relative path, always a real subpath of the snapshot directory.
   std::string path;
+  // The CONTENT size, read from the entry's top-level `size` and, when the
+  // listing omits that, from `lfs.size`. Never `lfs.pointerSize`, which is the
+  // size of the pointer file and is nearly equal for every shard.
   uint64_t size = 0;
   // The large-file-storage object identifier, or empty.
   //
@@ -58,7 +61,10 @@ struct HfFile {
   // identical for all 14 large-file-storage files. That value passes
   // llama.cpp's `is_valid_oid` at `common/hf-cache.cpp:161`, which accepts any
   // 40 or 64 character hexadecimal string. An unauthenticated identifier
-  // therefore proves nothing and is dropped rather than trusted.
+  // therefore proves nothing and is dropped rather than used as a blob name.
+  //
+  // That drop is a decision about USE, and it is the only thing the token
+  // governs. The two integrity rules on `HubListRepoFiles` run whoever asked.
   std::string oid;
   // `{endpoint}{repo}/resolve/{commit}/{path}`.
   std::string url;
@@ -85,10 +91,26 @@ std::string HubResolveRefToCommit(const std::string& repo_id,
 // the reference resolution names one; asking for a branch here would let a
 // moving `main` change what a second run loads.
 //
-// The listing is REFUSED, not filtered, when two DISTINCT files carry the same
-// object identifier. One file listed twice is not that case. An identifier that
-// is neither 40 nor 64 hexadecimal characters is dropped and its file is kept,
-// because the file is still addressable by path. A hub that hands out one identifier for every file is
+// Two integrity rules REFUSE the listing rather than filter it, because a hub
+// answering something other than the truth about one file is not a source the
+// rest of the answer can be trusted from. Neither depends on the token.
+//
+//  1. Two DISTINCT files carry one object identifier and disagree on size. A
+//     content hash cannot name two sizes, so this is always a broken
+//     instrument.
+//  2. An identifier is one character repeated, for example 'a' 64 times. No
+//     content hash produces that, and it is the value measured on gated
+//     `Lightricks/LTX-2.5` on 17 August 2026.
+//
+// Two distinct files that share an identifier AND a size are ACCEPTED. That is
+// duplicate content, which is legitimate: `lfs.oid` is the sha256 of the
+// contents and the plain `oid` is the git blob sha1, so two byte-identical
+// files in one repository share one identifier by construction. Refusing that
+// rejected a valid repository, which is why the earlier any-duplicate rule was
+// replaced. See `.agents/specs/hf-model-download.md`.
+//
+// An identifier that is neither 40 nor 64 hexadecimal characters is dropped and
+// its file is kept, because the file is still addressable by path. A hub that hands out one identifier for every file is
 // answering something other than the truth about the repository, and a
 // per-entry filter would let the rest of that answer through.
 //

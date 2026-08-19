@@ -37,6 +37,17 @@ bool IsHexString(const std::string& s, size_t length) {
   return true;
 }
 
+// True when every character of `oid` is the same one, for example 'a' repeated
+// 64 times. No content hash produces that value. This is the shape the
+// HuggingFace tree API actually served on 17 August 2026 for the gated
+// repository `Lightricks/LTX-2.5`, identically for all 14 large-file-storage
+// files, and llama.cpp's `is_valid_oid` at `common/hf-cache.cpp:161 @ b10451`
+// accepts it because it only asks whether the characters are hexadecimal.
+bool IsDegenerateOid(const std::string& oid) {
+  return !oid.empty() &&
+         oid.find_first_not_of(oid.front()) == std::string::npos;
+}
+
 bool IsAlphanumeric(char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
          (c >= '0' && c <= '9');
@@ -348,13 +359,21 @@ std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
                              repo_id + "' is not an array");
   }
 
-  // The identifier a listing entry carries is trusted only when the request
-  // carried a token. See HfFile::oid: an unauthenticated caller on a gated
-  // repository has been answered with a fabricated identifier.
+  // Whether the identifier is USED as a blob name still depends on the token.
+  // See HfFile::oid. The two integrity rules below do NOT: an identifier that
+  // is broken on its face is broken whoever asked for it, and gating them on
+  // the token was an inversion in which a repository that loaded anonymously
+  // began failing the moment a token was set.
   const bool trust_oids = !opts.token.empty();
 
+  struct OidOwner {
+    std::string path;
+    bool size_known = false;
+    uint64_t size = 0;
+  };
+
   std::vector<HfFile> files;
-  std::map<std::string, std::string> oid_owner;
+  std::map<std::string, OidOwner> oid_owner;
   for (const json& item : doc) {
     if (!item.is_object() || !item.contains("type") || !item["type"].is_string() ||
         item["type"].get<std::string>() != "file" || !item.contains("path") ||
@@ -366,38 +385,70 @@ std::vector<HfFile> HubListRepoFiles(const std::string& repo_id,
     file.path = item["path"].get<std::string>();
     if (!IsSafeEntryPath(file.path)) continue;
 
+    // The tree API reports the CONTENT size at the top level for every file,
+    // including a large-file-storage file, whose `lfs.size` repeats it. The
+    // top level is therefore read first and `lfs.size` is the fallback for a
+    // listing that omits it. `lfs.pointerSize` is the size of the pointer file
+    // and is never the content size, so it is not read.
+    bool size_known = false;
     if (item.contains("size") && item["size"].is_number_unsigned()) {
       file.size = item["size"].get<uint64_t>();
+      size_known = true;
+    } else if (item.contains("lfs") && item["lfs"].is_object() &&
+               item["lfs"].contains("size") &&
+               item["lfs"]["size"].is_number_unsigned()) {
+      file.size = item["lfs"]["size"].get<uint64_t>();
+      size_known = true;
     }
 
-    if (trust_oids) {
-      if (item.contains("lfs") && item["lfs"].is_object() &&
-          item["lfs"].contains("oid") && item["lfs"]["oid"].is_string()) {
-        file.oid = item["lfs"]["oid"].get<std::string>();
-      } else if (item.contains("oid") && item["oid"].is_string()) {
-        file.oid = item["oid"].get<std::string>();
+    // Read the identifier whatever the token says, because the checks below
+    // have to see it.
+    std::string oid;
+    if (item.contains("lfs") && item["lfs"].is_object() &&
+        item["lfs"].contains("oid") && item["lfs"]["oid"].is_string()) {
+      oid = item["lfs"]["oid"].get<std::string>();
+    } else if (item.contains("oid") && item["oid"].is_string()) {
+      oid = item["oid"].get<std::string>();
+    }
+    // A malformed identifier is dropped, not used, and the file is kept: it is
+    // still addressable by path, and only content addressing is lost.
+    if (!oid.empty() && !IsHexString(oid, 40) && !IsHexString(oid, 64)) {
+      oid.clear();
+    }
+
+    if (!oid.empty()) {
+      // RULE 2, the degenerate identifier. Refused, and never conditional on a
+      // token, because no content hash is one character repeated.
+      if (IsDegenerateOid(oid)) {
+        throw std::runtime_error(
+            "vllm.cpp: the tree listing for repository '" + repo_id +
+            "' gives '" + file.path + "' the object identifier " + oid +
+            ", whose " + std::to_string(oid.size()) +
+            " characters are all '" + std::string(1, oid.front()) +
+            "'. No content hash produces that value, so the hub is not "
+            "answering the truth about this repository. The listing is not "
+            "usable.");
       }
-      // A malformed identifier is dropped, not used, and the file is kept: it
-      // is still addressable by path, and only content addressing is lost.
-      if (!file.oid.empty() && !IsHexString(file.oid, 40) &&
-          !IsHexString(file.oid, 64)) {
-        file.oid.clear();
-      }
-      if (!file.oid.empty()) {
-        const auto [it, inserted] = oid_owner.emplace(file.oid, file.path);
-        if (!inserted && it->second != file.path) {
-          // REFUSED, not filtered. A hub that hands out one identifier for
-          // several files is answering something other than the truth about the
-          // repository, and letting the rest of that answer through would make
-          // two different files share one blob.
-          throw std::runtime_error(
-              "vllm.cpp: the tree listing for repository '" + repo_id +
-              "' gives object identifier " + file.oid +
-              " to two different files, '" + it->second + "' and '" + file.path +
-              "'. The listing is not usable.");
-        }
+      const auto [it, inserted] =
+          oid_owner.emplace(oid, OidOwner{file.path, size_known, file.size});
+      // RULE 1, the size disagreement. Two files sharing an identifier is
+      // LEGITIMATE: `lfs.oid` is the sha256 of the contents and the plain
+      // `oid` is the git blob sha1, so two byte-identical files in one
+      // repository share one identifier by construction. What no content hash
+      // can do is name two different sizes.
+      if (!inserted && it->second.path != file.path && it->second.size_known &&
+          size_known && it->second.size != file.size) {
+        throw std::runtime_error(
+            "vllm.cpp: the tree listing for repository '" + repo_id +
+            "' gives object identifier " + oid + " to '" + it->second.path +
+            "' at " + std::to_string(it->second.size) + " bytes and to '" +
+            file.path + "' at " + std::to_string(file.size) +
+            " bytes. One content hash cannot name two different sizes. The "
+            "listing is not usable.");
       }
     }
+
+    if (trust_oids) file.oid = oid;
 
     file.url = HubFileUrl(opts.endpoint, repo_id, commit, file.path);
     files.push_back(std::move(file));

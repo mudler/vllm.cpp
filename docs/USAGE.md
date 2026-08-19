@@ -1825,6 +1825,16 @@ a snapshot entry will become a real file, and the switch will be logged one time
 for each cache directory it happens in. The fetcher that calls it is W3 of the
 row, so nothing prints that line at this commit.
 
+A repository listing is refused, rather than partly used, when it fails either
+of two integrity checks. An object identifier given to two different files that
+disagree in size is refused, because no content hash names two sizes. An
+identifier whose characters are all the same, such as one character repeated 64
+times, is refused, because no content hash produces one and that is the value
+the hub was measured serving for a gated repository on 17 August 2026. Neither
+check depends on `HF_TOKEN`. Two files that share an identifier and agree on
+size are accepted, because that is duplicate content and a repository is
+allowed to hold it.
+
 Two limits are worth stating plainly. No command-line surface reaches any of
 this yet, so setting `HF_TOKEN` today changes nothing a server does. And the
 DFlash draft path, which is the one caller that already resolves a repository

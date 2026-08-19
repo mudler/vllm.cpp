@@ -49,6 +49,18 @@ namespace {
 constexpr const char* kCommit = "1111111111111111111111111111111111111111";
 constexpr const char* kToken = "hf_testtokentesttokentesttokentesttoken";
 
+// A well-formed 64 character identifier that is NOT one repeated character.
+// A fixture meaning "a real content hash" cannot be spelled `std::string(64,
+// '2')` any more, because that is the shape the degeneracy rule refuses, and a
+// fixture written that way would be refused for a reason the case is not about.
+std::string Sha256Like(const std::string& seed) {
+  std::string oid;
+  while (oid.size() < 64) oid += "0123456789abcdef";
+  oid.resize(64);
+  for (size_t i = 0; i < seed.size() && i < oid.size(); ++i) oid[i] = seed[i];
+  return oid;
+}
+
 class TempDir {
  public:
   TempDir() {
@@ -176,7 +188,7 @@ class FakeHub {
   std::string tree_anonymous_ =
       R"([{"type":"file","path":"config.json","size":12},)"
       R"({"type":"file","path":"model.safetensors","size":4096,)"
-      R"("lfs":{"oid":"2222222222222222222222222222222222222222222222222222222222222222"}}])";
+      R"("lfs":{"oid":"a1234567890abcdef0123456789abcdef0123456789abcdef0123456789abcde"}}])";
   std::string tree_authenticated_ = tree_anonymous_;
 };
 
@@ -249,12 +261,29 @@ HfHubOptions OptionsFor(const FakeHub& hub, const fs::path& hub_dir) {
 // API answered an unauthenticated caller on the gated repository
 // `Lightricks/LTX-2.5` with an `lfs.oid` of one character repeated 64 times,
 // identical for all 14 large-file-storage files.
+//
+// The two shards carry DIFFERENT sizes, which is also what a real sharded
+// repository looks like. Both integrity rules therefore have something to fire
+// on, and the cases below assert each rule on a fixture that isolates it, so
+// neither rule can hide the other's absence.
 std::string FabricatedOidTree() {
   const std::string oid(64, 'a');
   return std::string(R"([{"type":"file","path":"model-00001-of-00002.safetensors",)") +
          R"("size":4096,"lfs":{"oid":")" + oid + R"("}},)" +
          R"({"type":"file","path":"model-00002-of-00002.safetensors",)" +
-         R"("size":4096,"lfs":{"oid":")" + oid + R"("}}])";
+         R"("size":2048,"lfs":{"oid":")" + oid + R"("}}])";
+}
+
+// The same repeated-identifier shape with a WELL-FORMED identifier, so only the
+// size disagreement is left to catch it.
+std::string SharedOidTree(const std::string& oid, uint64_t first_size,
+                          uint64_t second_size) {
+  return std::string(R"([{"type":"file","path":"model-00001-of-00002.safetensors",)") +
+         R"("size":)" + std::to_string(first_size) + R"(,"lfs":{"oid":")" + oid +
+         R"("}},)" +
+         R"({"type":"file","path":"model-00002-of-00002.safetensors",)" +
+         R"("size":)" + std::to_string(second_size) + R"(,"lfs":{"oid":")" + oid +
+         R"("}}])";
 }
 
 }  // namespace
@@ -573,20 +602,25 @@ TEST_CASE("an authenticated listing keeps distinct object identifiers") {
   opts.token = kToken;
   hub.set_tree_authenticated(
       std::string(R"([{"type":"file","path":"a.safetensors","size":1,)") +
-      R"("lfs":{"oid":")" + std::string(64, '2') + R"("}},)" +
+      R"("lfs":{"oid":")" + Sha256Like("a2") + R"("}},)" +
       R"({"type":"file","path":"b.safetensors","size":2,)" +
-      R"("lfs":{"oid":")" + std::string(64, '3') + R"("}}])");
+      R"("lfs":{"oid":")" + Sha256Like("b3") + R"("}}])");
 
   const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
   REQUIRE(files.size() == 2);
-  CHECK(files.at(0).oid == std::string(64, '2'));
-  CHECK(files.at(1).oid == std::string(64, '3'));
+  CHECK(files.at(0).oid == Sha256Like("a2"));
+  CHECK(files.at(1).oid == Sha256Like("b3"));
 }
 
-TEST_CASE("a fabricated object identifier is refused, not filtered") {
+TEST_CASE("the measured degenerate identifier is refused by the degeneracy rule") {
   // The regression test for the 17 August 2026 event. llama.cpp's is_valid_oid
   // at common/hf-cache.cpp:161 accepts any 40 or 64 character hexadecimal
   // string, so a verbatim port of that function turns this case red.
+  //
+  // The refusal asserted here is the DEGENERACY rule, named in the message. The
+  // fixture also disagrees on size, so the other rule would catch it too, and
+  // asserting the rule by name is what stops one rule from masking the other's
+  // deletion.
   FakeHub hub;
   TempDir tmp;
   HfHubOptions opts = OptionsFor(hub, tmp.path());
@@ -596,25 +630,132 @@ TEST_CASE("a fabricated object identifier is refused, not filtered") {
   std::string message;
   try {
     HubListRepoFiles("org/repo", kCommit, opts);
-    FAIL("a listing whose files share one object identifier must be refused");
+    FAIL("a listing carrying a degenerate object identifier must be refused");
   } catch (const std::runtime_error& e) {
     message = e.what();
   }
+  INFO("message: ", message);
   CHECK(message.find(std::string(64, 'a')) != std::string::npos);
-  CHECK(message.find("model-00002-of-00002.safetensors") != std::string::npos);
+  CHECK(message.find("characters are all 'a'") != std::string::npos);
+  CHECK(message.find("model-00001-of-00002.safetensors") != std::string::npos);
+  // It is refused on the FIRST such file, before a duplicate can even be seen.
+  CHECK(message.find("bytes") == std::string::npos);
 }
 
-TEST_CASE("a fabricated object identifier is dropped when no token was sent") {
-  // The same tree, read without a token. The oid never becomes a blob name, so
-  // the fabricated value cannot address anything. This is the primary defense
-  // and the duplicate check is the second one.
+TEST_CASE("a degenerate identifier is refused whether or not a token was sent") {
+  // The rule that must never depend on the token. An identifier that is one
+  // character repeated is never real, so an anonymous caller has exactly as
+  // much reason to refuse it. The old rule sat behind the token and produced
+  // the inversion this repair removes: a repository that loaded anonymously
+  // started failing the moment a token was set.
   FakeHub hub;
   TempDir tmp;
   hub.set_tree(FabricatedOidTree());
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, OptionsFor(hub, tmp.path()));
+    FAIL("a degenerate identifier must be refused with no token too");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find("characters are all 'a'") != std::string::npos);
+}
+
+TEST_CASE("one identifier on two files of different sizes is refused") {
+  // The size rule, on a WELL-FORMED identifier, so the degeneracy rule has
+  // nothing to fire on and this case measures one rule alone. A content hash
+  // that named two different sizes would be a broken instrument, whatever the
+  // repository holds.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string oid =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  hub.set_tree(SharedOidTree(oid, 4096, 2048));
+
+  std::string message;
+  try {
+    HubListRepoFiles("org/repo", kCommit, opts);
+    FAIL("one identifier naming two sizes must be refused");
+  } catch (const std::runtime_error& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find(oid) != std::string::npos);
+  CHECK(message.find("model-00001-of-00002.safetensors") != std::string::npos);
+  CHECK(message.find("model-00002-of-00002.safetensors") != std::string::npos);
+  CHECK(message.find("4096") != std::string::npos);
+  CHECK(message.find("2048") != std::string::npos);
+  CHECK(message.find("two different sizes") != std::string::npos);
+}
+
+TEST_CASE("two files that share an identifier AND a size are accepted") {
+  // THE FALSE POSITIVE the old rule produced, and the reason it had to change.
+  // `lfs.oid` is the sha256 of the contents and the plain `oid` is the git blob
+  // sha1, so two byte-identical files in one repository share one identifier by
+  // construction. A repository that ships the same tokenizer file twice, or the
+  // same shard under two names, is legitimate and must load.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string oid =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  hub.set_tree(SharedOidTree(oid, 4096, 4096));
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).path == "model-00001-of-00002.safetensors");
+  CHECK(files.at(1).path == "model-00002-of-00002.safetensors");
+  CHECK(files.at(0).oid == oid);
+  CHECK(files.at(1).oid == oid);
+  CHECK(files.at(0).size == 4096);
+  CHECK(files.at(1).size == 4096);
+}
+
+TEST_CASE("the content size is read from lfs.size when the top level omits it") {
+  // The size the rule compares has to be the CONTENT size. The tree API reports
+  // it at the top level for every file and repeats it in `lfs.size`, so the top
+  // level is read first and `lfs.size` is the fallback. `lfs.pointerSize` is the
+  // size of the pointer file, is around 135 bytes for every shard, and would
+  // make two different shards look equal.
+  FakeHub hub;
+  TempDir tmp;
+  HfHubOptions opts = OptionsFor(hub, tmp.path());
+  opts.token = kToken;
+  const std::string oid = Sha256Like("a7");
+  hub.set_tree(
+      std::string(R"([{"type":"file","path":"a.safetensors",)") +
+      R"("lfs":{"oid":")" + oid + R"(","size":4096,"pointerSize":135}},)" +
+      R"({"type":"file","path":"b.safetensors",)" +
+      R"("lfs":{"oid":")" + Sha256Like("b8") +
+      R"(","size":2048,"pointerSize":135}}])");
+
+  const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
+  REQUIRE(files.size() == 2);
+  CHECK(files.at(0).size == 4096);
+  CHECK(files.at(1).size == 2048);
+}
+
+TEST_CASE("an untokenized identifier is dropped rather than used as a blob name") {
+  // A well-formed identifier read without a token. It never becomes a blob
+  // name, because an unauthenticated answer about a gated repository is not
+  // evidence. That drop is a decision about USE, and it is the one thing the
+  // token still governs: both integrity rules run whoever asked.
+  FakeHub hub;
+  TempDir tmp;
+  hub.set_tree(SharedOidTree(
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 4096,
+      4096));
   const std::vector<HfFile> files =
       HubListRepoFiles("org/repo", kCommit, OptionsFor(hub, tmp.path()));
   REQUIRE(files.size() == 2);
   for (const HfFile& file : files) CHECK(file.oid.empty());
+  // The size is read whether or not the identifier is kept.
+  CHECK(files.at(0).size == 4096);
 }
 
 TEST_CASE("the listing skips directories and refuses a path that escapes the snapshot") {
@@ -776,7 +917,7 @@ TEST_CASE("a malformed object identifier is dropped and the file is kept") {
       R"({"type":"file","path":"notes.txt","size":2,)" +
       R"("lfs":{"oid":")" + std::string(64, 'z') + R"("}},)" +
       R"({"type":"file","path":"good.safetensors","size":3,)" +
-      R"("lfs":{"oid":")" + std::string(64, '4') + R"("}}])");
+      R"("lfs":{"oid":")" + Sha256Like("c4") + R"("}}])");
 
   const std::vector<HfFile> files = HubListRepoFiles("org/repo", kCommit, opts);
   REQUIRE(files.size() == 3);
@@ -786,19 +927,18 @@ TEST_CASE("a malformed object identifier is dropped and the file is kept") {
   CHECK(files.at(1).oid.empty());
   // The well-formed one is untouched, so the case measures the drop and not a
   // listing that carries no identifiers at all.
-  CHECK(files.at(2).oid == std::string(64, '4'));
+  CHECK(files.at(2).oid == Sha256Like("c4"));
 }
 
 TEST_CASE("one identifier repeated on ONE path is not a duplicate") {
-  // The refusal is about two DIFFERENT files sharing an identifier, which would
-  // make them share a blob. The same file listed twice carries the same
-  // identifier by definition, and refusing that would turn a redundant listing
-  // into an unusable repository.
+  // The size rule is about two DIFFERENT files. The same file listed twice
+  // carries the same identifier and the same size by definition, and refusing
+  // that would turn a redundant listing into an unusable repository.
   FakeHub hub;
   TempDir tmp;
   HfHubOptions opts = OptionsFor(hub, tmp.path());
   opts.token = kToken;
-  const std::string oid(64, '5');
+  const std::string oid = Sha256Like("d5");
   hub.set_tree(
       std::string(R"([{"type":"file","path":"model.safetensors","size":4096,)") +
       R"("lfs":{"oid":")" + oid + R"("}},)" +

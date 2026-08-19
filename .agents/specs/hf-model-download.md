@@ -155,8 +155,14 @@ the shared function. The tree gets one implementation, not two.
 
 Integrity, and the one place this row does not port llama.cpp:
 
-- Treat `lfs.oid` as absent unless the request carried a token.
-- Refuse a listing in which two distinct files carry the same object identifier.
+- Treat `lfs.oid` as absent unless the request carried a token. This governs
+  whether the identifier is USED as a blob name, and nothing else.
+- Refuse a listing in which two distinct files carry one object identifier and
+  disagree on size. Accept them when the sizes agree, because that is duplicate
+  content.
+- Refuse an object identifier whose characters are all the same, for example one
+  character repeated 64 times.
+- Neither refusal depends on the token.
 - Prove a safetensors file complete with
   `8 + header_len + max(data_offsets[1]) == file_size`.
 - Prove a GGUF file complete with its magic value, version, tensor count, and
@@ -348,6 +354,34 @@ with the greater path breaking a tie. "Newest" is what the comment on the
 relocated function always claimed the function did. A repository with one
 snapshot, which is every case the DFlash draft path has been run against,
 resolves identically either way.
+
+**The any-duplicate refusal was wrong, and review caught it.** This spec first
+required refusing any listing in which two distinct files carry one object
+identifier, and W2 implemented that. The fresh reviewer refuted the
+requirement. `lfs.oid` is the sha256 of the contents and the non-large-file
+fallback is the git blob sha1, so two byte-identical files in one repository
+share one identifier by construction. A repository that ships one tokenizer
+file under two names, or one shard twice, is legitimate, and the rule rejected
+it. The rule also sat behind the token, so such a repository loaded anonymously
+and began failing the moment `HF_TOKEN` was set, which is the wrong polarity
+for an integrity check.
+
+The operator replaced it with two narrower rules. A shared identifier whose
+files disagree on SIZE is refused, because no content hash names two sizes, so
+that shape is always a broken instrument and never duplicate content. An
+identifier that is one character repeated is refused, because no content hash
+produces one, and it is exactly what was measured. Neither rule depends on the
+token. A shared identifier with an agreed size is accepted.
+
+The size the size rule compares is the CONTENT size: the entry's top-level
+`size`, falling back to `lfs.size`. `lfs.pointerSize` is the size of the pointer
+file, is about 135 bytes for every shard, and would make two different shards
+look equal.
+
+This is a corrected requirement rather than a quiet narrowing, which is why it
+is recorded here. The regression case for the measured event survives it: the
+`Lightricks/LTX-2.5` fixture is refused by the degeneracy rule, and its shards
+are given different sizes so that the size rule would catch it independently.
 
 **A null grep is not absence.** This spec states that no document pins a runtime
 dependency list, based on a grep of `docs/RELEASES.md`, `docs/BUILD.md`, and

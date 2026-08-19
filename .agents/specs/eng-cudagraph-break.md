@@ -1877,11 +1877,14 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   architectures: three runs each — right host ids and no mirror as the reference,
   stale host ids and no mirror as the CONTROL that must differ, stale host ids
   with the truth reaching the model only through `device_token_ids` as the gate.
-  RED before the fix at 2 cases / 59 assertions / 12 failed / exit 1, with 200 of
-  200 logit values differing per step on both architectures; GREEN after at
-  59/59. Two mutations: deleting the registry scope line reds it at 6 assertions,
-  and swapping the seam's DEVICE arm for its HOST arm leaves the logits BIT
-  IDENTICAL and reds only the counters, which is the arm no token gate can see.
+  RED before the fix at 2 cases / 65 assertions / 10 failed / exit 1, with 800 of
+  800 logit values differing over four steps on BOTH architectures; GREEN after at
+  65/65, exit 0. Two mutations, each compiled clean and each restored by sha256:
+  deleting the registry's scope line — the production call site — reds 4
+  assertions and puts all 800 values back, and swapping the seam's DEVICE arm for
+  its HOST arm leaves the logits BIT IDENTICAL at 0 of 800 differing and reds only
+  `device_refreshes` and `host_refreshes`, which is the arm no token gate can
+  see.
 
   **WHAT IS STILL OWED, narrowed rather than closed.** The depth-2
   four-concurrent battery against these two models on a real device has NOT been
@@ -1889,8 +1892,16 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   fix is proven to embed the mirror's identifiers and is NOT proven to close the
   degeneration `qwen3.cpp`'s decline was measured against — whose own cause W4
   established is unidentified. `qwen3.cpp`'s decline therefore STANDS, untouched.
-  Owner: row **`ENG-CUDAGRAPH-BREAK`**, the stage that gets a `dgx` window with
-  checkpoints; the same window the decline entry above already owes two runs to.
+  The reason this stage did not run it, stated as a fleet state rather than as an
+  intention: at 2026-08-19, `rc devices` read `dgx:gpu0 busy` — the only box whose
+  HuggingFace cache carries Qwen3-Coder-30B-A3B — while `thor:gpu0` and
+  `orin:gpu0` were ready and carry no such checkpoint, so the battery was not
+  obtainable in the window rather than skipped. The CPU gate compares all four
+  steps for exactly this reason: on a device the two replay steps become the
+  assertion the defect is about, and the file becomes the device gate the moment
+  it runs on one. Owner: row **`ENG-CUDAGRAPH-BREAK`**, the stage that gets a
+  `dgx` window with checkpoints; the same window the decline entry above already
+  owes two runs to.
 - **`test_qwen3_5_decode_graph_seam` SIGSEGVs on `main`, in W6's own case, and
   every assertion passes**
   ([#1390](https://github.com/mudler/vllm.cpp/issues/1390), found while landing

@@ -379,6 +379,13 @@ const std::vector<std::vector<int32_t>>& TrueIds() {
   return v;
 }
 
+struct DeviceFree {
+  vt::Backend* b = nullptr;
+  void operator()(void* p) const {
+    if (p != nullptr && b != nullptr) b->Free(p);
+  }
+};
+
 // Drive `steps` pure-decode steps through ModelRegistry::Forward and return the
 // downloaded [2, vocab] logits of each step. `mirror` selects run C: the host
 // vector is replaced by zeros and the true identifiers travel only through
@@ -409,9 +416,19 @@ std::vector<std::vector<float>> Run(const Fixture& fx, bool stale_host, bool mir
     in.pure_decode = true;
     in.gdn_state_slots = 8;
     in.uniform_query_len = 1;
-    // On CPU a host pointer IS device-addressable, which is what makes the
-    // mirror's contract directly testable without a GPU.
-    if (mirror) in.device_token_ids = truth.data();
+    // THE MIRROR'S BUFFER IS A REAL BACKEND ALLOCATION, not the host vector's
+    // address. On CPU the two are the same thing, so this buys nothing today;
+    // it is what makes the case correct by construction on a device, where
+    // `device_token_ids` is a pointer the runner's combine wrote and a host
+    // address would be the wrong kind of pointer.
+    std::unique_ptr<void, DeviceFree> mirror_ids;
+    if (mirror) {
+      const size_t bytes = truth.size() * sizeof(int32_t);
+      mirror_ids.reset(be.Alloc(bytes));
+      mirror_ids.get_deleter().b = &be;
+      be.Copy(q, mirror_ids.get(), truth.data(), bytes);
+      in.device_token_ids = static_cast<const int32_t*>(mirror_ids.get());
+    }
     const vllm::ForwardLogits fl = ModelRegistry::Forward(*model, in);
     REQUIRE(fl.on_device());
     std::vector<float> rows(static_cast<size_t>(2 * kV));
@@ -467,11 +484,15 @@ TEST_CASE(
   const std::vector<std::vector<float>> stale = Run<CachePool>(fx, /*stale_host=*/true,
                                                     /*mirror=*/false, kSteps);
   CHECK(vt::GetStepInputStats().device_refreshes == 0);
-  // Only the COLD and CAPTURE steps recompute on this harness; a CPU replay
-  // returns the slot's persistent logits unchanged, so steps 2 and 3 carry no
-  // information either way and are not asserted on.
-  CHECK(Differing(ref[0], stale[0]) > 0);
-  CHECK(Differing(ref[1], stale[1]) > 0);
+  // EVERY step is compared, and what each one MEANS depends on the harness. On
+  // CPU only the cold and capture steps recompute — a CPU "replay" returns the
+  // slot's persistent logits unchanged — so steps 2 and 3 hold what step 1
+  // produced and the comparison is true for that reason there. On a DEVICE a
+  // replay recomputes, and those steps become the assertion the reported defect
+  // is actually about: that a REPLAY does not generate from stale identifiers.
+  // Asserting them costs nothing here and makes this file the device gate the
+  // moment it runs on one.
+  for (int t = 0; t < kSteps; ++t) CHECK(Differing(ref[t], stale[t]) > 0);
 
   // RUN C — THE GATE. The same stale host vector, with the true identifiers
   // reaching the model ONLY through `device_token_ids`.
@@ -486,11 +507,12 @@ TEST_CASE(
     CHECK(s.device_refreshes == kSteps);
     CHECK(s.host_refreshes == kSteps);
   }
-  CHECK(Differing(ref[0], via_device[0]) == 0);
-  CHECK(Differing(ref[1], via_device[1]) == 0);
+  size_t differing = 0;
+  for (int t = 0; t < kSteps; ++t) differing += Differing(ref[t], via_device[t]);
+  CHECK(differing == 0);
   MESSAGE("registry forward, mirror vs host reference, bit for bit: "
-          << ref[0].size() << " values per step, " << Differing(ref[0], via_device[0])
-          << " and " << Differing(ref[1], via_device[1]) << " differing");
+          << kSteps << " steps x " << ref[0].size() << " values, " << differing
+          << " differing");
 }
 
 TEST_CASE(
@@ -517,8 +539,7 @@ TEST_CASE(
   const std::vector<std::vector<float>> stale =
       Run<DsCachePool>(fx, /*stale_host=*/true, /*mirror=*/false, kSteps);
   CHECK(vt::GetStepInputStats().device_refreshes == 0);
-  CHECK(Differing(ref[0], stale[0]) > 0);
-  CHECK(Differing(ref[1], stale[1]) > 0);
+  for (int t = 0; t < kSteps; ++t) CHECK(Differing(ref[t], stale[t]) > 0);
 
   vt::ResetStepInputStats();
   const std::vector<std::vector<float>> via_device =
@@ -528,9 +549,10 @@ TEST_CASE(
     CHECK(s.device_refreshes == kSteps);
     CHECK(s.host_refreshes == kSteps);
   }
-  CHECK(Differing(ref[0], via_device[0]) == 0);
-  CHECK(Differing(ref[1], via_device[1]) == 0);
+  size_t differing = 0;
+  for (int t = 0; t < kSteps; ++t) differing += Differing(ref[t], via_device[t]);
+  CHECK(differing == 0);
   MESSAGE("registry forward, mirror vs host reference, bit for bit: "
-          << ref[0].size() << " values per step, " << Differing(ref[0], via_device[0])
-          << " and " << Differing(ref[1], via_device[1]) << " differing");
+          << kSteps << " steps x " << ref[0].size() << " values, " << differing
+          << " differing");
 }

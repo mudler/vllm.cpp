@@ -702,15 +702,12 @@ std::vector<Nvfp4Weight> OwnGgufNvfp4Experts(const GgufFile& g,
   return out;
 }
 
-// The PURE routing decision, WITHOUT firing the audit hook. Call sites that must
-// look at a tensor's fate before choosing which loader to run use this, so the
-// tensor is still audited EXACTLY ONCE by whichever loader they then call. Same
-// pattern (and same reason) as the tied-head probe in LoadEmbedAndHead.
-GgufResidency PeekRoute(const GgufLoadPolicy& pol, const GgufTensorInfo& t,
-                        GgufTensorRole role) {
-  return RouteGgufTensor(pol.keep_quant, pol.keep_f16, pol.nvfp4_fp4,
-                         pol.cpu_ref, role, t.ggml_type, t.shape);
-}
+// `PeekRoute` — the pure routing decision without the audit hook — used to live
+// here, next to its first caller (the tied-head probe in LoadEmbedAndHead uses
+// the same pattern). It now lives in `gguf_keep_quant.h` beside the routing
+// function it delegates to, because the load-time device-fit lane asks the same
+// question of the same expert towers and one decision may have only one
+// description. These call sites bind to `vllm::PeekRoute` unchanged.
 
 // A policy copy with the fp4 residency DISABLED, for the call sites whose
 // consumer is an OwnedTensor and has no `Nvfp4Weight` field to fill: the

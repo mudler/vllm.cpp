@@ -84,6 +84,30 @@ struct OwnedTensor {
   // absent. Mutable because ReleaseHost is logically const, like lazy residency.
   mutable bool host_released = false;
 
+  // ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). The expert-stream lane has
+  // claimed this tower: its slices are served from HOST slot storage, and the
+  // tower itself must therefore NEVER be staged into device memory.
+  //
+  // Why a flag and not a name test. `ResidentWeight` is handed an OwnedTensor
+  // and has no idea what the loader called it, and the refusal has to fire in
+  // `ResidentWeight` because that is where the 1.1875 GiB `d.b.Alloc` is. A
+  // process-global set of streamed tower ids would answer the same question at
+  // the cost of a lookup in the decode path of every weight; one bool on the
+  // tensor answers it for free.
+  //
+  // Set by `KqExpertSlice` the first time the lane serves this tower, and read
+  // by `ResidentWeight`'s staging branch, which throws by name. That refusal is
+  // a TRIPWIRE, not a path with a production caller: with the lane on, the
+  // grouped-MoE route that would stage a tower is already disabled
+  // (`Qwen35GroupedMoeEnabled`), and W0c's own fallback reads the tower's host
+  // bytes in place. It exists because the failure it guards is issue #1123 —
+  // 48 towers staged, death partway through layer 16 of 93 — and that failure
+  // is silent until the allocator runs out.
+  //
+  // Mutable for the same reason `d_dev` is: claiming a tower for the lane is
+  // logically const, like lazy residency.
+  mutable bool expert_streamed = false;
+
   // ENG-LOAD-DIRECT-UPLOAD (issue #150). Non-null when `bytes` BORROWS a
   // read-only safetensors mmap taken verbatim from the checkpoint instead of
   // being copied into an owned buffer, and records the exact source range so

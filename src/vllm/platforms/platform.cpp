@@ -102,4 +102,13 @@ const DeviceType* CurrentPlatformPriority(size_t& count) {
   return kCurrentPriority;
 }
 
+bool HostMemoryIsDeviceAddressableFromAttrs(int pageable_memory_access,
+                                            int integrated) {
+  // BOTH, and the header says which device class each term excludes. It lives in
+  // this always-compiled translation unit rather than in `cuda.cpp` so that the
+  // CPU tier can run it: `cuda.cpp` compiles only in a CUDA build, which is the
+  // reason the conjunction went ungated in the first place.
+  return pageable_memory_access != 0 && integrated != 0;
+}
+
 }  // namespace vllm::platforms

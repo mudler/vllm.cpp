@@ -148,11 +148,13 @@ PhaseLog& PhaseLog::Instance() {
 
 void PhaseLog::Begin() {
   std::lock_guard<std::mutex> lock(impl_->mu);
-  if (impl_->running) return;  // a second load joins the timeline it found
+  impl_->records.clear();
+  impl_->open.clear();
   impl_->origin = std::chrono::steady_clock::now();
   impl_->running = true;
   impl_->render = 0;
   impl_->samples = 0;
+  impl_->device_probe = DeviceByteProbe();
 }
 
 void PhaseLog::SetDeviceProbe(DeviceByteProbe probe) {

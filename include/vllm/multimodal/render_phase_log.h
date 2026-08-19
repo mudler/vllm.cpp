@@ -79,9 +79,18 @@ class PhaseLog {
  public:
   static PhaseLog& Instance();
 
-  // Start (or restart) the timeline. Idempotent while a timeline is open — the
-  // second call does not move the origin, so a second engine load in one process
-  // joins the timeline it finds rather than truncating it.
+  // Start a timeline, DISCARDING any earlier one.
+  //
+  // A LOAD IS WHAT STARTS A SESSION, and that is the whole reason this resets.
+  // The load's own phases belong in the render's table — the spike measures ~7.5
+  // minutes of DiT staging paid at the front of every render — so the origin has
+  // to sit at the load and not at the generation. A process that loads a second
+  // engine is measuring the second one, and carrying the first one's timeline
+  // forward would report the time between two unrelated loads as this render's
+  // unaccounted residue. The measurement shape the campaign takes is one load
+  // and one render per process; a process that interleaves several gets a table
+  // about the last load, which is stated here rather than left to be discovered
+  // from a wall that does not match a stopwatch.
   void Begin();
 
   // What the device column means on this arm. Passing an empty probe restores

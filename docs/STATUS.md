@@ -1096,11 +1096,12 @@ cause of the discarded pairing.
 **Settled, and only one half of it is observed.** A later `dgx:gpu0` job read
 `/proc/sys/kernel/random/boot_id` as `64c495a3-...` against the benchmark's
 `3fd9745a-...`, so the HOST rebooted and it was not a lost k3s pod. The boot
-TIME is DERIVED from `/proc/uptime` inside the worker, lands at
-10:41:47-10:42:14Z inside the c8 window, and is conditional on that worker not
+TIME is DERIVED from `/proc/uptime` inside the worker, is ONE-SIDED — at or
+before 10:41:47.6Z, with no lower bound — and is conditional on that worker not
 virtualizing `/proc`. That the reboot KILLED the worker is consistent but
-untraced, so it is not claimed, and no number changes. No sampling watchdog
-could have caught it either: a userspace sampler dies with the kernel.
+untraced, so it is not claimed and no number changes. What the reboot does
+establish is narrower and stands on its own: no sampling watchdog can guard the
+REBOOT CLASS of failure, because a userspace sampler dies with the kernel.
 
 Resource axes on the same series: cold start to first `/health` **53 s vs
 780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —

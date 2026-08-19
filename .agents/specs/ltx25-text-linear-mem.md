@@ -175,12 +175,199 @@ weakened until it passes.
 
 ## Owed
 
-- [#1286](https://github.com/mudler/vllm.cpp/issues/1286) — this row.
+- [#1317](https://github.com/mudler/vllm.cpp/issues/1317) — the harness compares
+  absolute system-wide peaks across runs with different starting occupancy, and
+  something held 26.8 GiB on `dgx:gpu0` before the run began. Both halves are
+  outside this repository — `runguard.py` and the fleet's job hygiene — so
+  neither is fixed in flow. It is what actually aborted the render.
+- **No GB10 number.** Every measurement below is from a 20-core Zen 5 under KVM.
+  Allocation sizes are architecture-independent, so the attribution carries; a
+  throughput ratio does not, and none is claimed for GB10.
+- **The seam's tile is retained for the process lifetime.** `af` is a
+  `static thread_local` that grows to the largest `K` any GEMM on that worker
+  ever saw and never shrinks. At `K = 188160` and 20 workers that is 232 MiB
+  held until exit, on a box that may later be tight. It is bounded, deliberate
+  and now measured; it is not repaired here, because the buffer exists precisely
+  so a worker allocates once, and trading that away is a performance decision
+  with its own spec.
 
 ## Now
 
-`ACTIVE`. W1 and W2 measured; see `## Outcome`.
+`DONE`. The reported defect does not exist; the seam gained the bound whose
+absence let it be believed.
 
 ## Outcome
 
-Filled in when the row reaches `DONE`.
+### W1 — the attribution: the +26 GiB is the box, not the change
+
+Both runs are retained, and that is what makes this answerable.
+`runguard.py:236-237,260` fixes the compared column: `used_gib` is the
+**system-wide** `MemTotal - MemAvailable`, `anon_gib` is system-wide
+`AnonPages`, and only `rss_gib` is the child's own.
+
+| | pre-#1252 `1024x576-25f/` | #1252 `20260818T220620Z/1024x576-25f/` |
+|---|---:|---:|
+| `used_gib` at `t=0` | **4.741** | **31.553** |
+| `avail_gib` at `t=0` | 114.890 | 88.078 |
+| peak `used_gib` | 79.206 at t=1867.4 s, `cpu=1885.5%` | 105.853 at t=199.2 s, `cpu=1925.2%` |
+
+The box carried **26.812 GiB** before `ltx2-gen` started in the second run.
+#1286's regression is `105.853 - 79.206 = 26.647 GiB`. The two agree to
+**0.165 GiB**.
+
+Each run's own demand — peak minus its own `t=0` — is the same:
+
+| axis | pre-#1252 | #1252 | delta |
+|---|---:|---:|---:|
+| `used_gib` peak minus own `t=0` | **74.465** | **74.300** | **-0.165** |
+| `anon_gib` peak minus own `t=0` | 38.012 | 38.217 | +0.205 |
+| child `rss_gib` at the peak sample | 41.952 | 42.090 | +0.138 |
+
+Three columns, three instruments, all inside ±0.25 GiB, and both peaks sampled
+inside a ~1900% CPU stretch rather than in two different phases. On a box as
+clean as the first run's, the #1252 binary's own 74.300 GiB would have left
+**40.59 GiB** available — above the 12 GiB hard floor and the 8 GiB projection
+floor, and consistent with the "never below ~40 GiB" the pre-#1252 runs showed.
+
+Two further readings from the same evidence, recorded because each one on its
+own would have been read as supporting #1286:
+
+- During its single-core projection the pre-#1252 run sits **dead flat** at
+  `anon = 34.35`, `rss = 33.56`, `used = 74.50` from t=124 s to t=1801 s. The
+  #1252 run's threaded stretch sits at `anon = 34.30`, `rss = 30.35`,
+  `used = 97.40`. **The same `anon` to 0.15%** — with `used` 23 GiB apart.
+- The pre-#1252 run reached t=3017.3 s and was stopped from outside
+  (`# TERMINAL signal=15 (supervisor asked to stop)`), still inside
+  conditioning with `dit_runs=0`. Neither run ever loaded the DiT, so neither
+  peak is a whole-render peak, and neither is presented as one.
+
+Filed as [#1317](https://github.com/mudler/vllm.cpp/issues/1317).
+
+### W2 — the local A/B: the seam costs 0.24 GiB and keeps the 8.4x
+
+Same probe source and flags on both arms, only the `Linear` body differing, at
+the shipped `K = 188160` and `out_features = 4096`; peak RSS is `VmHWM` read
+before and after the call with every operand already allocated and touched.
+20-core Zen 5 under KVM, Release, `-ffp-contract=off`, box **not idle**
+(loadavg 5.4-13.3), three replicates, median:
+
+| arm | wall | rate | peak-RSS growth |
+|---|---:|---:|---:|
+| before, scalar `double` loop | **28.488 s** | 1.732 GMAC/s | **1.0 MiB** |
+| after, `vt::MatmulBT` | **3.378 s** | 14.60 GMAC/s | **232 MiB** |
+
+**8.43x, and +231 MiB.** The speedup reproduces #1252's 8.57x; the memory cost
+is **0.85% of the 26.6 GiB #1286 attributes to it**, i.e. 117x too small to be
+the reported defect.
+
+Swept over threadpool width at the same geometry, the growth is exactly the
+per-worker tile and nothing else:
+
+| workers | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| peak-RSS growth (MiB) | 12.9 | 24.7 | 47.8 | 93.8 | 186.1 | **232.1** |
+| per worker (MiB) | 12.9 | 12.3 | 12.0 | 11.7 | 11.6 | 11.6 |
+
+The model predicts `16 x 188160 x 4 = 11.48 MiB` per worker. The measurement
+lands on it, and the output checksum is **byte-identical across all six thread
+counts**, which is the dispatch determinism contract holding.
+
+At the **full shipped geometry**, `rows = 1024`, both projections, default 20
+workers (box heavily loaded, loadavg 15.9 then 28.5, so the wall times are not
+a speed claim):
+
+| projection | wall | rate | peak-RSS growth |
+|---|---:|---:|---:|
+| `1024 x 188160 x 4096` | 57.34 s | 13.76 GMAC/s | **247 MiB** |
+| `1024 x 188160 x 2048` | 28.95 s | 13.63 GMAC/s | **239 MiB** |
+
+`rows` moved 16x between the two sweeps and the growth moved by 15 MiB — which
+is the output buffer, `1024 x 4096 x 4 = 16.8 MB`, allocated inside the timed
+region. The tile does not scale with rows, as designed.
+
+**So the answer to "which of the three" is none of them.** Not the threaded
+kernel: 232 MiB at 20 workers. Not the call site: its `scaled` copy is 770 MB
+and is present on **both** arms, so it cannot be a regression. Not an
+interaction. The measurement was confounded by its baseline.
+
+### W3 — #1259 has the same profile and needs nothing
+
+`Ltx2FuseLoraIntoTensor` routes through `vt::Matmul`, the other member of the
+same seam, and `MatmulOneChunk` is one template shared by both orientations —
+so the per-worker buffer is `16 x K x 4` there too, with `K = rank`. At the
+shipped `4096 x 450 x 4096`, measured with the same allocation counter the new
+gate uses:
+
+| workers | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| bytes requested | 28,864 | 28,864 | 86,464 | 201,664 | 432,064 | **547,264** |
+
+**0.52 MiB at 20 workers**, exactly `19 x 28,800 + 64`. `bs` and `agg` are
+unchanged by #1259. It cannot reach the wall #1286 describes, so nothing is
+fixed and nothing is filed for it.
+
+### W4 — the bound, and what looking for it exposed
+
+`tests/vt/test_ops_matmul_mem.cpp`. The refutation does not repair the thing the
+attribution found: **no gate in this tree bounds the seam's memory.** Every GEMM
+gate asserts values or byte equality, so a kernel that allocated a whole
+intermediate per worker would have passed all of them on every model until a box
+ran out. That is why the bound lands here even though the reported defect is not
+real.
+
+**Peak RSS could not carry the gate, and finding that out was the useful part.**
+The first draft measured `VmHWM` around `/proc/self/clear_refs`. It read
+`growth_bytes = 0` for **every** thread count and **every** row count while
+passing every bound — because the operands are freed between measurements,
+glibc keeps the arena, and the next tile is served from resident pages. A mute
+switch that reports green over a kernel doing anything at all. The gate is
+therefore a replaced global `operator new` counting what the seam **asks for**,
+which no allocator policy can silence, with a liveness case beside it requiring
+the counter to see at least six of eight fresh workers take a tile.
+
+Green, at `K = 65536` so one tile is exactly 4 MiB:
+
+| workers | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| bytes requested | 64 | 4,194,368 | 12,582,976 | 29,360,192 |
+
+`(nthreads - 1)` tiles, because the caller thread's `thread_local` is already
+sized. Rows 64 vs 1024 at 4 workers: **12,582,976 both times**, difference 0.
+
+**Red first, by mutation, and the first attempt did not build.** M1 widens `af`
+from the 16-row tile to the whole activation — #1286's own hypothesis, written
+into the kernel.
+
+- **First attempt: `BUILT=NO`, `compile_err=2`**,
+  `cpu_ops.cpp:134:19: error: unused variable 'nrows' [-Werror=unused-variable]`.
+  Recorded because a mutation that fails to build reads exactly like a passing
+  test.
+- **Second attempt: `BUILT=YES`, `compile_err=0`**, `git diff --stat` =
+  `src/vt/cpu/cpu_ops.cpp | 2 +-, 1 file changed, 1 insertion(+), 1 deletion(-)`.
+  `test_ops_matmul_mem` **exit 1**, `Status: FAILURE!`,
+  `2 test cases | 1 passed | 1 failed`, `13 assertions | 7 passed | 6 failed`.
+  Failing by name: `CHECK(growth <= Bound(nthreads))` at three worker counts —
+  `67,108,928 <= 25,165,824`, `201,326,656 <= 41,943,040`,
+  `469,762,112 <= 75,497,472` — and all three of the row-scaling assertions,
+  with `rows=1024` reading **1,073,741,888 bytes**, a gibibyte of exactly the
+  shape #1286 supposed.
+- Restored byte-for-byte: `sha256(cpu_ops.cpp) =`
+  `dc39eccdece48879e82be7209e95d182c6ed624eb04389de689fa4b58fe4f1f3` before and
+  after. Rebuilt (binary mtime moved 07:15:48 -> 07:16:27, so the green is not a
+  stale binary) and green again: **2 cases, 13 assertions, 0 failed, exit 0**.
+
+M1 mutates **`src/vt/cpu/cpu_ops.cpp`**, product code reached from
+`ModelRegistry::Forward` and from the LTX-2.5 text tower, which is what makes
+the red evidence that the gate measures shipped behaviour rather than a
+test-local copy. This row adds no product code, so there is no production call
+site to delete — `reachability.md` answers that case directly.
+
+### What is not claimed
+
+- No GB10 measurement of any kind, so #1252's unmeasured per-core ratio `R` is
+  untouched and the LTX-2.5 speed axis stays where it was.
+- The bound is a **CPU** bound. `vt::MatmulBT` on CUDA/ROCm/Vulkan is not
+  covered, and their allocation behaviour is not measured here.
+- Nothing establishes what would happen on a full-model render now, because no
+  full-model render has been rerun. The claim is that #1252 is not what stopped
+  the last one.

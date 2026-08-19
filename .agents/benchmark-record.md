@@ -24128,3 +24128,152 @@ registry still counts probe refusals only and a replay-time refusal would abort 
 `mem/mem_<tag>.csv` (the per-call `cudaMemGetInfo` trace with node counts),
 `mem/smp_<tag>.csv` (the `nvidia-smi` and RSS sampler) and `out-bytes/ids_<tag>.json`
 (the token artifacts).
+
+## LTX25-TEXT-LINEAR-MEM — #1252 costs 0.24 GiB of peak host memory, not 26 GiB, and the 8.4x survives (2026-08-19, `row/LTX25-TEXT-LINEAR-MEM`, base `origin/main` `678fc672c`, 20-core Zen 5 under KVM, #1286 / #1252 / #1259 / #1317)
+
+**This entry refutes [#1286](https://github.com/mudler/vllm.cpp/issues/1286).**
+That issue reported that routing the LTX-2.5 caption projection through
+`vt::MatmulBT` ([#1252](https://github.com/mudler/vllm.cpp/issues/1252)) raised
+peak host memory from ~79 GiB to 105.85 GiB on a 119 GiB GB10 and aborted a
+full-model render, and named the seam's per-thread tiles as the first suspect.
+It is not the seam, it is not the call site, and it is not an interaction. **The
++26 GiB is the box's occupancy before the job started.**
+
+### The paired GB10 evidence
+
+`runguard.py:236-237,260` fixes what the compared column is: `used_gib` is the
+SYSTEM-WIDE `MemTotal - MemAvailable`, `anon_gib` is system-wide `AnonPages`,
+and only `rss_gib` is the child's own. Both runs are retained under
+`/mnt/nas_share/rc/ltx25-fullmodel/out/`.
+
+| | pre-#1252, `1024x576-25f/` | #1252, `20260818T220620Z/1024x576-25f/` |
+|---|---:|---:|
+| `used_gib` at `t=0` | **4.741** | **31.553** |
+| `avail_gib` at `t=0` | 114.890 | 88.078 |
+| peak `used_gib` | 79.206 at t=1867.4 s, `cpu=1885.5%` | 105.853 at t=199.2 s, `cpu=1925.2%` |
+| samples / terminal | 3018, `signal=15 (supervisor asked to stop)` | 391, `exit=90 guard:PROJECTION` |
+
+Starting difference **26.812 GiB**; claimed regression `105.853 - 79.206 =`
+**26.647 GiB**. They agree to **0.165 GiB**.
+
+Peak minus each run's own `t=0`, on three independent columns:
+
+| axis | pre-#1252 | #1252 | delta |
+|---|---:|---:|---:|
+| `used_gib` peak minus own `t=0` | **74.465** | **74.300** | **-0.165** |
+| `anon_gib` peak minus own `t=0` | 38.012 | 38.217 | +0.205 |
+| child `rss_gib` at the peak sample | 41.952 | 42.090 | +0.138 |
+
+Both peaks sit inside a ~1900% CPU stretch, so this is the same phase class and
+not two different ones. On a box as clean as the first run's, the #1252 binary's
+own 74.300 GiB would have left **40.59 GiB** available — above the 12 GiB hard
+floor and the 8 GiB projection floor, and consistent with the "never below
+~40 GiB" the pre-#1252 runs showed.
+
+Two readings that each look like support for #1286 in isolation and are not.
+First, during its single-core projection the pre-#1252 run is DEAD FLAT at
+`anon = 34.35`, `rss = 33.56`, `used = 74.50` from t=124 s to t=1801 s, while
+the #1252 run's threaded stretch sits at `anon = 34.30`, `rss = 30.35`,
+`used = 97.40` — **the same `anon` to 0.15%**, with `used` 23 GiB apart. Second,
+NEITHER run ever loaded the DiT (`dit_runs=0` in both; the first was stopped
+from outside at t=3017.3 s still inside conditioning), so neither peak is a
+whole-render peak and neither is presented as one. Filed as
+[#1317](https://github.com/mudler/vllm.cpp/issues/1317).
+
+### The local A/B, before vs after, at the shipped geometry
+
+Same probe source and flags on both arms, only the `Linear` body differing.
+Peak RSS is `VmHWM` read before and after the call with every operand already
+allocated and touched, so the figure is the call's own. 20-core Zen 5 under KVM,
+Release, `-ffp-contract=off`, `K = 188160`, `out_features = 4096`,
+`rows = 64` (REDUCED from the shipped 1024 to keep the single-threaded arm
+inside a sensible wall; the tile term the sweep isolates is independent of rows
+by construction). Box NOT idle, loadavg 5.4-13.3, three replicates, median:
+
+| arm | wall | rate | peak-RSS growth |
+|---|---:|---:|---:|
+| before, scalar `double` loop | **28.488 s** | 1.732 GMAC/s | **1.0 MiB** |
+| after, `vt::MatmulBT` | **3.378 s** | 14.60 GMAC/s | **232 MiB** |
+
+**8.43x, and +231 MiB** — reproducing #1252's 8.57x, and **0.85% of the
+26.6 GiB #1286 attributes to the change**, i.e. 117x too small to be it.
+
+Swept over threadpool width, same geometry:
+
+| workers | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| peak-RSS growth (MiB) | 12.9 | 24.7 | 47.8 | 93.8 | 186.1 | **232.1** |
+| per worker (MiB) | 12.9 | 12.3 | 12.0 | 11.7 | 11.6 | 11.6 |
+
+The model is `cpu_ops.cpp:125`'s `static thread_local std::vector<float> af`,
+sized by ggml's 16-row `blck_1` tile: `16 x 188160 x 4 = 11.48 MiB` per worker.
+The measurement lands on it, and the output checksum is **byte-identical across
+all six thread counts** — the dispatch determinism contract holding.
+
+Full shipped geometry, `rows = 1024`, both projections, default 20 workers. The
+box was heavily loaded (loadavg 15.9 then 28.5) so **the wall times below are
+not a speed claim**, only the memory column is:
+
+| projection | wall | rate | peak-RSS growth |
+|---|---:|---:|---:|
+| `1024 x 188160 x 4096` | 57.34 s | 13.76 GMAC/s | **247 MiB** |
+| `1024 x 188160 x 2048` | 28.95 s | 13.63 GMAC/s | **239 MiB** |
+
+16x the rows moved the growth by 15 MiB, which is the output buffer
+(`1024 x 4096 x 4 = 16.8 MB`) allocated inside the timed region. The tile does
+not scale with rows.
+
+### #1259, the sibling that has never run on the full model
+
+`Ltx2FuseLoraIntoTensor` takes `vt::Matmul`, the other member of the same seam;
+`MatmulOneChunk` is one template shared by both orientations, so the per-worker
+buffer is `16 x K x 4` there too with `K = rank`. Measured at the shipped
+`4096 x 450 x 4096` with a replaced global `operator new`:
+
+| workers | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| bytes requested | 28,864 | 28,864 | 86,464 | 201,664 | 432,064 | **547,264** |
+
+**0.52 MiB at 20 workers**, exactly `19 x 28,800 + 64`. `bs` and `agg` are
+unchanged by #1259. It cannot reach the wall #1286 describes; nothing fixed,
+nothing filed.
+
+### The refuted instrument, recorded because it read as a pass
+
+The bound this row lands (`tests/vt/test_ops_matmul_mem.cpp`) was FIRST written
+against peak RSS, measuring `VmHWM` across `/proc/self/clear_refs`. It read
+`growth_bytes = 0` for **every** thread count and **every** row count while
+passing every bound: the operands are freed between measurements, glibc keeps
+the arena, and the next tile is served from pages that are already resident. A
+mute switch reporting green over a kernel doing anything at all. The shipped
+gate counts what the seam ASKS FOR through a replaced global `operator new`,
+which no allocator policy can silence, with a liveness case requiring the
+counter to see at least six of eight fresh workers take a tile.
+
+### Mutation M1 — the hypothesis, written into the kernel
+
+`af` widened from the 16-row tile to the whole activation.
+
+- **First attempt: `BUILT=NO`, `compile_err=2`** —
+  `cpu_ops.cpp:134:19: error: unused variable 'nrows' [-Werror=unused-variable]`.
+  Recorded because a mutation that fails to build reads exactly like a passing
+  test.
+- **Second attempt: `BUILT=YES`, `compile_err=0`**, `git diff --stat` =
+  `src/vt/cpu/cpu_ops.cpp | 2 +-, 1 file changed, 1 insertion(+), 1 deletion(-)`.
+  `test_ops_matmul_mem` **exit 1**, `Status: FAILURE!`,
+  `2 test cases | 1 passed | 1 failed`, `13 assertions | 7 passed | 6 failed`.
+  By name: `CHECK(growth <= Bound(nthreads))` at three worker counts
+  (`67,108,928 <= 25,165,824`; `201,326,656 <= 41,943,040`;
+  `469,762,112 <= 75,497,472`) and all three row-scaling assertions, with
+  `rows=1024` reading **1,073,741,888 bytes**.
+- Restored byte-for-byte, `sha256(cpu_ops.cpp) =`
+  `dc39eccdece48879e82be7209e95d182c6ed624eb04389de689fa4b58fe4f1f3` before and
+  after; rebuilt (binary mtime 07:15:48 -> 07:16:27, so the green is not stale)
+  and green: **2 cases, 13 assertions, 0 failed, exit 0**.
+
+### Not claimed
+
+No GB10 number of any kind. The bound is a CPU bound; `vt::MatmulBT` on
+CUDA/ROCm/Vulkan is not covered. No full-model render has been rerun, so nothing
+here says what such a run would now do — only that #1252 is not what stopped the
+last one.

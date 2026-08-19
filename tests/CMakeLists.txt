@@ -1701,6 +1701,17 @@ target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # domain. Reaches src/ for the tier header and the threadpool test hook.
 vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
 target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# LTX25-TEXT-LINEAR-MEM (#1286): the seam's PEAK RESIDENT bound. Every other
+# GEMM gate here asserts values or byte equality, so a kernel that allocated a
+# whole intermediate per worker would pass all of them. Registered only on
+# Linux, because the measurement is /proc/self/{status,clear_refs}; compiling it
+# elsewhere with a skip would print `Status: SUCCESS!` over `assertions: 0`,
+# which reads as a pass. Reaches src/ for the threadpool test hook, which is what
+# lets one process sweep the worker count.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  vllm_cpp_add_test(test_ops_matmul_mem vt/test_ops_matmul_mem.cpp)
+  target_include_directories(test_ops_matmul_mem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.

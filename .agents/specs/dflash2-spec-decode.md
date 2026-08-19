@@ -116,9 +116,9 @@ Present, and reused rather than rebuilt:
   block kernel that closed the `SPEC-DFLASH` speed gate.
 - The loader ALREADY shares `embed_tokens` and `lm_head` from the target, which
   is exactly what a DFlash2 checkpoint requires
-  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:56-60,268-272`; the
-  second range was `:155-157` before W1 widened the resolver's comment and
-  `:215-219` before the #1366 repair widened it again). The
+  (the `TryLoadBf16` comment on `src/vllm/model_executor/models/qwen3_dflash_weights.cpp` and the two calls it
+  documents in `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::LoadQwen3DFlash`; cited by symbol because the range moved
+  three times inside this one branch as comments above it grew). The
   class comment on `include/vllm/model_executor/models/qwen3_dflash.h`'s
   `Qwen3DFlashWeights` claims the draft owns both; it is STALE and this row
   corrects it. (Cited by symbol: the line range first written here, `:79-82`,
@@ -149,9 +149,9 @@ Absent, and owed by this row:
 - No top-k that EMITS the surviving (id, value) pairs. The threshold search
   above masks below the k-th largest and returns no indices.
 - `is_causal` was not read: causality resolved by the legacy rule alone. CLOSED by
-  W1 in `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:127-220`
-  (`ResolveQwen3DFlashAttnModes`, with its `DeclaredCausal` coercion at
-  `:113-123`) and `:222-253` (`MakeQwen3DFlashDraftConfig`).
+  W1 in `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::ResolveQwen3DFlashAttnModes`,
+  with its coercion helper `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::DeclaredCausal`, and
+  `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::MakeQwen3DFlashDraftConfig`.
 
 ## Port map
 
@@ -163,7 +163,7 @@ Absent, and owed by this row:
 | `dflash2/speculator.py` walk kernel | `src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp` + a CUDA walk kernel | D3: device from day one |
 | `dflash2/speculator.py` draft-logit cache | same file | the realized q the rejection sampler reads at T>0 |
 | `registry.py` + `spec_decode/__init__.py` | `include/vllm/config/speculative.h`, `src/vllm/entrypoints/model_loader.cpp` | classify from the draft's own config, as `IsDsparkDraft` does |
-| `_dflash_layer_causal` | `src/vllm/model_executor/models/qwen3_dflash_weights.cpp:113-123,127-220` | D4; the ONE shared-behaviour edit. LANDED in W1 |
+| `_dflash_layer_causal` | `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::DeclaredCausal` + `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::ResolveQwen3DFlashAttnModes` | D4; the ONE shared-behaviour edit. LANDED in W1 |
 | `use_v2_model_runner` | no analogue | we have one runner; record the reason rather than porting a switch |
 | — | `src/vllm/model_executor/models/qwen3_dflash2_gguf.cpp` | the GGUF drafter arm, W5 |
 
@@ -297,6 +297,9 @@ reviewer who mutates the guarantee rather than reading it.
   Developer scope answer, 2026-08-19. `SPEC-DFLASH` split its GGUF arm into
   `SPEC-DFLASH-GGUF`, which reached `DONE` separately; this row carries the arm
   itself rather than repeating the split.
+- **D7 — no ceiling is declared anywhere in this spec.** If our acceptance or
+  throughput reads below vLLM's on the same workload, that is an unresolved
+  implementation difference with a named next hypothesis, per AGENTS.md.
 - **D8 — DIVERGENCE: an uncoercible `is_causal` is REFUSED by name, where
   upstream coerces it.** Upstream resolves the key as `bool(is_causal)`
   (`qwen3_dflash.py:58-67` @ vllm-project/vllm#52816 head
@@ -318,9 +321,6 @@ reviewer who mutates the guarantee rather than reading it.
   no `is_causal` at all, and `z-lab/Qwen3.8-27B-DFlash2` declares it as a JSON
   boolean. Reconcile onto upstream's coercion if a checkpoint ever spells it as a
   string, and change the GGUF arm in the same edit or not at all.
-- **D7 — no ceiling is declared anywhere in this spec.** If our acceptance or
-  throughput reads below vLLM's on the same workload, that is an unresolved
-  implementation difference with a named next hypothesis, per AGENTS.md.
 
 ## Owed
 
@@ -397,6 +397,17 @@ on and not a summary.
   three-line change, and `layer_types` is the ONLY key of MiMo's real
   `dflash/config.json` this builder is missing -- every other name it reads is
   present at the top level there, which is what separates this entry from O3.
+  Both halves of that are MEASURED rather than argued, on the published file
+  (sha256 `2ed5a998f5f57e00a9fe14d2b3e767f06e49462a97eb09d80c927e112a585c9e`)
+  driven through the production builder by a scratch program on 2026-08-19. As
+  shipped it prints `THREW: [json.exception.out_of_range.403] key 'layer_types'
+  not found`. With the three-line fallback applied in a scratch copy, restored
+  byte-for-byte afterwards and verified by sha256, the same file builds and
+  `ResolveQwen3DFlashAttnModes` answers five layers, every one `causal=0` with
+  `sliding_window=1024` -- exactly upstream's `layer_types=None` + `use_swa=True`
+  docstring row, and the opposite of what this engine answered before #1366. So
+  the rule and the fallback are both right; what is missing is anything that can
+  feed them.
   (b) It would still buy no reachability. `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`
   is the only published draft with `use_swa` and no `layer_types`, and its target
   `MiMoV2ForCausalLM` is `INVENTORIED`, unassigned and unimplemented in

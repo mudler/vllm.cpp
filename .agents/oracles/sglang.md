@@ -83,8 +83,53 @@ machine-readable value reading `yes` for a reader of
 budgets an arm nobody can produce. The 2026-07-28 numbers do not need the flag
 to survive: they live in this file, in `../sglang-matrix.md` and in
 `docs/BENCHMARKS.md`, and `gateable` is not a history field. The candidate
-route, its two qualifiers and the untested aarch64 kernel-wheel coverage are in
-[#1265](https://github.com/mudler/vllm.cpp/issues/1265).
+route and its qualifiers are in
+[#1265](https://github.com/mudler/vllm.cpp/issues/1265), and the section below
+carries what has since been measured about them.
+
+**One pin, two delivery artifacts, and the second one has not run.** The route
+out is a PyPI wheel installed inside an `rc` lease, and it is specified by row
+`SGLANG-ORACLE-LEASE-WHEEL` in
+[`../specs/sglang-wheel-in-lease.md`](../specs/sglang-wheel-in-lease.md). The
+wheels are `sglang-0.5.15-cp312-cp312-manylinux_2_34_aarch64.whl`, 12,716,006
+bytes, sha256
+`1c2d2602b4ba04c6a71d2f3bf2e3654da53987536f0d65dbe4f57cdc65c9812e`, and
+`sglang_kernel-0.4.4-cp310-abi3-manylinux2014_aarch64.whl`, 34,243,333 bytes,
+sha256 `727e4bc53abeade20260186f99199200320b9fa51f8de7af90c01524cff73e5d`. They
+sit under THIS pin rather than under a second oracle id, because an oracle id
+names an upstream and not a delivery, and because the wheel's `sglang/` tree is
+byte-identical to `f63458b5` for every file that exists in both. `pin` does not
+move.
+
+**The aarch64 kernel-wheel coverage is no longer untested. It was tested and it
+passed**, by static analysis on 2026-08-19.
+`sgl_kernel/sm100/common_ops.abi3.so` holds 56 fatbin containers of 6 cubins
+each, every container declaring architectures 90, 100, 103, 110, 120 and 121,
+and **zero containers lack 121**. Each payload was decompressed and its ELF
+`e_flags` matched against the declared architecture: 336 of 336 agree. NVIDIA's
+`cuobjdump -lelf`, release 13.0, V13.0.85, names the six targets, and the 121
+cubins are **`sm_121a`**, the architecture-accelerated variant, 56 of them, one
+per container; the plain ones are the 90 cubins.
+`sgl-kernel/CMakeLists.txt:221` builds `-gencode=arch=compute_121a,code=sm_121a`
+on aarch64 at CUDA 13.0 and `:127` builds plain `sm_90`, six gencode targets for
+six cubins per container. GB10's coverage is therefore accelerated and not
+merely present. This record said the inverse until 2026-08-19, read off the low
+byte of `e_flags`, which carries no base-versus-`a` distinction at
+`EI_ABIVERSION = 8`; the spec's `sm_121a` section records why that read was
+wrong in both directions. `load_utils.py` selects `sm90/` only
+at compute capability 90, so GB10 takes `sm100/`. The 5.6% size gap against the
+x86_64 wheel is one absent library, `flash_ops.abi3.so`, and capability refuses
+FlashAttention-3 on this device in any case. The wheel carries no runtime commit
+assertion, because `sglang/_version.py` sets `__commit_id__` to `None`, so
+identity is asserted against the committed per-file manifest
+[`../specs/sglang-wheel-in-lease.json`](../specs/sglang-wheel-in-lease.json).
+
+**None of that is a run**, so `gateable` stays `no`. The five conditions that
+would move it are in the spec, and every one of them needs a job that serves a
+model. `scripts/dgx-sglang-low-concurrency.sh` stays unrunnable and owes a NEW
+driver rather than a patch. It has no execution half at all: `:55-57` refuses
+every mode except `--dry-run`, and `:5-7` records that the image pull and the
+`docker run` are what its P2 would have added, which is the forbidden path.
 
 **This is not a reversal of the 2026-08-16 correction.** This record said
 `gateable = no` until 2026-08-16, for two and a half weeks after the run, on a

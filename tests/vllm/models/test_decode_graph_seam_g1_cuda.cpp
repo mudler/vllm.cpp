@@ -951,6 +951,34 @@ std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
 
 }  // namespace
 
+// THE CONTROL FOR THE CASE BELOW, and it has to run FIRST. The collision case
+// drives two spec shapes; if a SINGLE spec shape cannot capture on this device
+// at all, that case's failure says nothing about the ring key. This one drives
+// one shape, one driver, from a clean process.
+TEST_CASE("G1 CUDA W6 control: ONE spec shape captures and replays") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
+    return;
+  }
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = b.CreateQueue();
+  const HfConfig c = Qwen35DenseConfig();
+  const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
+  CudaGdnCachePool cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
+                         /*spec_mql=*/3);
+  vllm::Qwen3_5DenseDecodeGraph arm(w, c, q, /*max_num_reqs=*/4);
+  for (int step = 0; step < 5; ++step) {
+    Read(b, q,
+         arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                  SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
+         c.vocab_size * 6);
+  }
+  CHECK(arm.captured());
+  CHECK(arm.replay_count() >= 3);
+  MESSAGE("G1 W6 control: one spec shape, captured=" << arm.captured()
+          << ", replays=" << arm.replay_count());
+}
+
 TEST_CASE("G1 CUDA W6: a colliding spec shape does not replay the other graph") {
   if (!HasCuda()) {
     MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");

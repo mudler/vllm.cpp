@@ -10,10 +10,15 @@
 // that is reallocated each step therefore cannot be read by a replay at all, and
 // one that is refreshed from a host vector is only ever as fresh as that vector.
 //
-// WHY IT IS HERE AND NOT IN A MODEL. The capability exists in the tree already,
-// as `StepDevInputs` in `src/vllm/model_executor/models/qwen3_5.cpp` — 41 lines
-// there, and ZERO lines of `qwen3_moe.cpp`, `qwen3.cpp`, `deepseek_v2.cpp`,
-// `voxtral.cpp` and `qwen3_dflash.cpp`. That asymmetry is not tidiness: the four
+// WHY IT IS HERE AND NOT IN A MODEL. The capability existed in the tree already,
+// as `StepDevInputs` in `src/vllm/model_executor/models/qwen3_5.cpp`, and in
+// exactly one driver. Measured with `grep -c StepDevInputs <file>` at this
+// commit: 44 in `qwen3_5.cpp` (41 before this row added its own comments), 0 in
+// `qwen3_moe.cpp`, `deepseek_v2.cpp`, `voxtral.cpp` and `qwen3_dflash.cpp`, and
+// 1 in `qwen3.cpp` — which is a COMMENT naming the fix it does not have, not a
+// use. That last number is the instrument's limit rather than a correction:
+// `grep -c` counts matching LINES, prose included, so it can only ever bound
+// the answer from above. That asymmetry is not tidiness: the four
 // drivers without it replay against HOST vectors, and one of them,
 // `qwen3.cpp`'s `DenseDecodeGraphForward`, DECLINES its decode graph outright
 // whenever the asynchronous device-token mirror is live, on a measured battery

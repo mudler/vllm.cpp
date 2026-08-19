@@ -259,6 +259,18 @@ and are recorded: DeepSeek V4 refuses a CPU queue before it reaches its capture,
 and Laguna's capture class only exists in a CUDA build with the Marlin NVFP4
 kernels. The DFlash driver's own gate landed red first.
 
+One half of that is closed. Laguna's capture class is behind a build flag, so a
+green CUDA build is equally consistent with the migrated code having been
+compiled OUT. Injecting an error into each migrated region and requiring the
+build to fail settles it: both regions are really compiled. What the two still
+owe is behavioural, and needs each model's own device kernels rather than only a
+compiler.
+
+Bit-exactness for the five drivers that HAVE it was re-measured at this stage's
+head on a leased GPU, because the shared capture-close path changed underneath
+them: five drivers, 2066 assertions, nothing differing over three consecutive
+replays each.
+
 W3 also closed a gate that could not fail. The mode a driver captures in was
 unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole
 driver gate green. The seam now counts the mode, and that flip reds each gate.

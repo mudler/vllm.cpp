@@ -604,6 +604,39 @@ G1 Qwen3_5DecodeGraph     on CUDA: 5 steps x  40 logits, 0 differing, 4 replays
 G1 Qwen3_5DenseDecodeGraph on CUDA: 5 steps x 40 logits, 0 differing, 4 replays
 ```
 
+**G1 WAS RE-RUN AT W5's HEAD on `thor:gpu0` through an `rc` lease, and it is a
+re-run rather than a new case.** The seam changed UNDER the five measured
+drivers: D10 put a `JoinOutstandingForks()` call on the path of EVERY segment
+close, so each migrated driver's capture now executes seam code W4's run did not,
+and a change to the shared close path is exactly what a CPU harness cannot clear.
+Same box and same provenance as W3 and W4 — NVIDIA Thor, sm_110, driver 595.78,
+nvcc 13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110`, 32 `.cu.o`
+objects — at source `79dc6b5bd`:
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` ran **5 cases, 2066
+assertions, 0 failed, exit 0**, every driver again reading `0 differing, 4
+replays`, and `tests/vt/test_breakable_graph.cpp` ran 265 assertions on the same
+device.
+
+**THE ONE THING A GREEN BUILD COULD NOT HAVE TOLD US was measured separately.**
+Laguna's capture class is inside `#ifdef VT_MARLIN_NVFP4`, so "the CUDA build
+compiled `laguna.cpp`" is satisfied just as well by a build that compiled the
+migrated region OUT — success and failure are the SAME OBSERVATION. Two facts
+settle it. `-DVT_MARLIN_NVFP4=1` is on `laguna.cpp`'s own compile command in
+`compile_commands.json`, and CMake reported `CUDA feature marlin-nvfp4: ENABLED
+for [110]`. And the region itself was MUTATED: an undeclared identifier inserted
+immediately after `vt::GraphCaptureScope scope(b, q, graph, kFull)` FAILED the
+object build under `-Werror` (`laguna.cpp:2735`,
+`'VT_W5_MUTATION_THIS_MUST_NOT_COMPILE' was not declared in this scope`) against
+a baseline object build of rc 0, and the tree restored byte for byte to an empty
+`git diff`. The identical mutation on DeepSeek V4 failed at
+`deepseek_v4.cpp:1921`. **Both migrated regions are compiled.** That is the half
+of their coverage answerable without the models' own kernels and checkpoints; G1
+and G2 for those two remain owed, and `## Owed` states what each needs.
+
+**W5 ADDED NO G1 CASE OF ITS OWN, and says so rather than leaving it to be
+inferred from a count.** Its three drivers are single-shape and each refuses the
+harness for its own reason.
+
 The two Qwen3.5 cases needed a cache pool the other three did not:
 `CudaGdnCachePool` allocates the RECURRENT ssm and conv state on device beside
 the paged KV, and each arm gets its own — the GDN recurrence advances its state
@@ -1413,6 +1446,15 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
      the CPU configuration verifies the FILE and not the region, and
      `test_laguna_scaffold` (167 assertions) and `test_laguna_nvfp4_loader` (63)
      staying green says nothing about the capture at all.
+
+  **ONE HALF OF 2 AND 3 IS NOW CLOSED and the rest is not, so the split is worth
+  stating.** W5 measured on `thor:gpu0` that both migrated regions are actually
+  COMPILED, by mutating each one and requiring the object build to fail — see
+  `## Gates` G1. So "the code might not even be built" is no longer part of what
+  these two owe. What they still owe is behavioural: that the routing reaches the
+  seam (G2) and that a REPLAYED segment reproduces the eager forward (G1), and
+  both need each model's own device kernels — V4's four `kCUDA`-registered
+  families, Laguna's NVFP4 Marlin arm — rather than only a compiler.
 
   What settles all three: a CUDA build on a marlin-nvfp4 architecture — the same
   `thor:gpu0` (sm_110) shape W3 and W4 used — which compiles the Laguna and V4

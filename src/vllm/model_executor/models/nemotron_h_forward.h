@@ -240,6 +240,20 @@ struct NemotronHMambaWeights {
   NemotronHOwned dt_bias;  // [mamba_num_heads] f32
   // Mixer2RMSNormGated weight over the SSM intermediate width.
   NemotronHOwned norm_weight;  // [mamba_intermediate_size]
+
+  // A2-Q1 (#810): this layer's device-resident mamba state — the two FP8 W8A8
+  // towers uploaded through the shared `dense_fp8::ResidentFp8` seam plus the
+  // six small recurrence parameters, built ONCE on first device use and owned
+  // BY THE WEIGHTS. Opaque here for the same reason `moe_marlin` below is: the
+  // resident type is an implementation detail of nemotron_h_device.cpp.
+  //
+  // KEYED ON THE SLOT, NEVER ON AN ADDRESS (issue #237, qwen3_5_weights.h:183).
+  // Two engine builds in one process can hand the second engine's weights the
+  // address the first engine's had, and an address-keyed cache then returns the
+  // PREVIOUS engine's device pointers: plausible, wrong values rather than a
+  // crash. Holding the state in the weights it describes makes that
+  // unrepresentable.
+  ResidentSlot device_fp8;
 };
 
 // GQA attention weights. q/k/v ship SEPARATE on disk (upstream fuses them into
@@ -515,6 +529,67 @@ std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
                                                  const std::vector<float>& hidden_normed,
                                                  int64_t num_tokens, vt::DType act_dtype,
                                                  vt::Queue& dev_queue);
+
+// A2-Q1 (#810): ONE NemotronH Mamba2 block on the device, with host-side input
+// and output so a gate can drive a single block in isolation — the same
+// per-block equivalence seam `NemotronHMoeBlockDeviceHostIO` is, and for the
+// same reason.
+//
+// WHY THE GATE IS NUMERIC AND NOT TOKENS. A token comparison cannot see a
+// dropped `input_scale` (the activation quantized against 1.0), an `alpha`
+// folded as `weight_scale` alone, a transposed `in_proj` operand, a `zxbcdt`
+// split offset by one column, or a projection that quietly stayed on the host
+// and dequantized. Every one of those is finite, correctly shaped and
+// plausible, and this row has already been bitten by three of them.
+//
+// `state` is the OPTIONAL carried recurrence, exactly as `NemotronHMamba2Mixer`
+// takes it: null runs the fresh-state arm (zero conv window, no initial SSM
+// state), non-null carries in and is UPDATED IN PLACE, so the two arms are
+// comparable on the carrying path as well as the fresh one.
+std::vector<float> NemotronHMamba2MixerDeviceHostIO(const NemotronHMambaWeights& w,
+                                                    const NemotronHParams& params,
+                                                    const std::vector<float>& hidden_normed,
+                                                    int64_t num_tokens, vt::DType act_dtype,
+                                                    vt::Queue& dev_queue,
+                                                    NemotronHMambaState* state = nullptr);
+
+// ─── A2-D1 (#1311): WHICH RECURRENT ARM THE FORWARD RAN ─────────────────────
+//
+// vLLM branches its Mamba2 mixer on `has_decode` and runs the two SINGLE-STEP
+// kernels on the decode rows (`causal_conv1d_update` at
+// `mamba_mixer2.py:1012`, `selective_state_update` at `:1087`), keeping the
+// chunked prefill pair for the prefill rows. Both single-step kernels take
+// `state_indices` and update the cache IN PLACE at the slot, so upstream's
+// decode half performs no gather and no scatter.
+//
+// ★ WHY A COUNTER EXISTS AT ALL. The two arms compute the SAME recurrence, so
+// they produce the same tokens, and a token gate therefore cannot tell them
+// apart — the identical blindness `[[token-gates-cannot-see-dequant-fallbacks]]`
+// records for a dequant fallback. Without a record of what RAN, "the decode
+// step stopped launching the chunk scan" is a claim about the source, not an
+// observation about the binary, and a test asserting it would be reading its
+// own expectation back out of the file. These counters are incremented AT THE
+// `vt::` CALL SITES, so a gate entering through `ModelRegistry::Forward`
+// observes the launches the step actually made. They are the same recording
+// seam `RecordGdnOutActivationDTypes` (qwen3_5.cpp) is, and exist for the same
+// reason.
+//
+// The counters are process-global and NOT thread-safe, exactly like the seam
+// they mirror. Nothing in this tree drives one model's forward from two
+// threads; stated here rather than silently inherited.
+struct NemotronHMambaArmCounts {
+  int64_t state_update_rows = 0;  // rows through vt::Mamba2StateUpdate
+  int64_t chunk_scan_calls = 0;   // calls to vt::Mamba2ChunkScan
+  int64_t conv_update_rows = 0;   // rows through vt::CausalConv1dUpdate
+  int64_t conv_fwd_calls = 0;     // calls to vt::CausalConv1dFwd
+  int64_t state_gathers = 0;      // vt::GdnStateGather launches
+  int64_t state_scatters = 0;     // vt::GdnStateScatter launches
+};
+
+// Read the counters and ZERO them, so a caller measures ONE step rather than a
+// running total it has to subtract. Reading and resetting in one call is what
+// keeps a test from reporting a number that a previous case contributed to.
+NemotronHMambaArmCounts NemotronHTakeMambaArmCounts();
 
 // The final output projection, on the HOST, over `num_rows` already-gathered
 // and already-final-normed rows `[num_rows, hidden_size]` (f32 in, f32 logits

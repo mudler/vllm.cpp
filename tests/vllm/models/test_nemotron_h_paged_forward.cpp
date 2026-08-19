@@ -682,6 +682,113 @@ TEST_CASE("NemotronH paged: the bf16 page arm decodes the same tokens as the ref
 // 3. THE CARRY IS REAL — direct assertions on the recurrent pages.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ─── A2-D1 (#1311): the ARM RECORDER, armed through the production entry point ──
+//
+// WHY THIS CASE EXISTS, and it is not the swap's gate. A2-D1 replaces the
+// chunked SSD kernels with the single-step ones on the DECODE rows of the
+// device mamba arm. That arm is CUDA-only by construction — it enters through
+// an FP8 W8A8 `in_proj` and `kMatmulFp8CublasLt` is registered ONLY by
+// `cuda_matmul.cu:920` — so no case in this CPU suite can execute the swapped
+// code, and saying so is better than a case that pretends otherwise. The swap
+// itself is gated on the real checkpoint (`scripts/nemotron-h-a2q1-dgx-gate.sh`
+// steps 7 and 8, the same-binary `VT_NEMOTRON_H_MAMBA_DECODE_STEP` A/B) and at
+// the op level by the two driver-group equivalence cases in
+// `tests/vt/test_ops_mamba2_state_update.cpp`.
+//
+// ★ WHAT THIS CASE DOES GATE IS THE INSTRUMENT THOSE RUNS ARE READ WITH.
+// The dgx evidence is a set of COUNTERS: "the decode step launched 0 chunk
+// scans and 23 state-update rows". A counter that is never incremented reports
+// exactly the same thing as a kernel that is never launched
+// ([[absent-hook-looks-like-armed-instrument]]), so a broken recorder would
+// present as a triumphant GREEN. This case drives the counters through
+// `ModelRegistry::Forward` on the arm that IS reachable here — the host mamba
+// branch, whose gather/scatter A2-D1 leaves alone — and asserts NON-ZERO counts
+// against the fixture's own geometry. If the recorder stops recording, this
+// goes red on a CPU box in seconds, before anyone spends a GPU window reading a
+// zero as a result.
+TEST_CASE("NemotronH paged: the recurrent arm recorder counts what the step launched") {
+  unsetenv("VT_KV_CACHE_F32");
+  Fixture fx("bfloat16");
+  const vllm::ModelRegistration& reg = fx.model->registration();
+  KVCacheConfig kv = reg.factory->make_kv_cache(fx.cfg, kBlockSize, kNumBlocks);
+  GPUModelRunner runner(fx.cfg, *fx.model, kv, Q(), /*max_num_reqs=*/2, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  // The fixture schedule is `M E * M E`, so TWO mamba layers. Every recurrent
+  // layer of a step gathers twice (conv + ssm) and scatters twice, which is the
+  // per-step cost A2-D1 removes from the decode half of the DEVICE arm.
+  constexpr int64_t kMambaLayers = 2;
+  constexpr int64_t kPerLayerGathers = 2;
+
+  const std::vector<int32_t> prompt{1, 7, 3, 9, 2, 14, 5, 11};
+
+  // Read-and-reset first, so nothing an earlier case in this binary contributed
+  // is counted here.
+  (void)vllm::NemotronHTakeMambaArmCounts();
+
+  std::vector<NewRequestData> reqs;
+  reqs.push_back(MakeNewReq("REC0", prompt, {0, 1}, /*state_slot=*/0));
+  std::map<std::string, int> sched;
+  sched["REC0"] = static_cast<int>(prompt.size());
+  SchedulerOutput s1 = NewStep(std::move(reqs), std::move(sched));
+  CHECK_FALSE(runner.execute_model(s1).has_value());
+  vllm::v1::ModelRunnerOutput m1 = runner.sample_tokens(std::nullopt);
+  REQUIRE(m1.sampled_token_ids.size() == 1);
+  const vllm::NemotronHMambaArmCounts pf = vllm::NemotronHTakeMambaArmCounts();
+
+  // ONE decode step, measured on its own.
+  std::vector<std::string> ids{"REC0"};
+  std::vector<int> computed{static_cast<int>(prompt.size())};
+  std::vector<int> outputs{1};
+  SchedulerOutput sd = DecodeStep(ids, computed, outputs);
+  CHECK_FALSE(runner.execute_model(sd).has_value());
+  vllm::v1::ModelRunnerOutput md = runner.sample_tokens(std::nullopt);
+  REQUIRE(md.sampled_token_ids.size() == 1);
+  const vllm::NemotronHMambaArmCounts dec = vllm::NemotronHTakeMambaArmCounts();
+
+  MESSAGE("prefill step: gathers=" << pf.state_gathers << " scatters=" << pf.state_scatters
+                                   << " chunk_scan_calls=" << pf.chunk_scan_calls
+                                   << " state_update_rows=" << pf.state_update_rows
+                                   << " conv_fwd_calls=" << pf.conv_fwd_calls
+                                   << " conv_update_rows=" << pf.conv_update_rows);
+  MESSAGE("decode step : gathers=" << dec.state_gathers << " scatters=" << dec.state_scatters
+                                   << " chunk_scan_calls=" << dec.chunk_scan_calls
+                                   << " state_update_rows=" << dec.state_update_rows
+                                   << " conv_fwd_calls=" << dec.conv_fwd_calls
+                                   << " conv_update_rows=" << dec.conv_update_rows);
+
+  // ★ THE COUNTS ARE ASSERTED AGAINST THE FIXTURE'S GEOMETRY, not against
+  // "> 0". A recorder that incremented once per FORWARD instead of once per
+  // LAYER would satisfy a `> 0` assertion and misreport every dgx number by a
+  // factor of the layer count.
+  CHECK(pf.state_gathers == kMambaLayers * kPerLayerGathers);
+  CHECK(pf.state_scatters == kMambaLayers * kPerLayerGathers);
+  CHECK(dec.state_gathers == kMambaLayers * kPerLayerGathers);
+  CHECK(dec.state_scatters == kMambaLayers * kPerLayerGathers);
+
+  // THIS TEST'S QUEUE has no FP8 GEMM -- and that is a statement about the
+  // queue, not about the box: `Q()` is a CPU queue, `kMatmulFp8CublasLt` is
+  // registered only by `cuda_matmul.cu:920`, and the paged forward selects the
+  // device mamba arm by asking the OP TABLE for the queue's device. So this
+  // case reads the same on a GPU box as on a CPU one, which is why it is a
+  // stable floor rather than a property of wherever it happens to run.
+  // Asserting the zero here is what makes the non-zero on a leased GPU mean
+  // something: the two counters are wired to the `vt::` call sites and not to
+  // the branch condition.
+  CHECK(dec.state_update_rows == 0);
+  CHECK(dec.conv_update_rows == 0);
+  CHECK(dec.chunk_scan_calls == 0);  // the HOST mixer's scan is not this counter's
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, Q().device.type));
+
+  // And the reader really does RESET: a second read with no forward between
+  // must be all zeros, or every dgx figure would be a running total.
+  const vllm::NemotronHMambaArmCounts again = vllm::NemotronHTakeMambaArmCounts();
+  CHECK(again.state_gathers == 0);
+  CHECK(again.state_scatters == 0);
+  CHECK(again.chunk_scan_calls == 0);
+  CHECK(again.state_update_rows == 0);
+}
+
 TEST_CASE("NemotronH paged: the recurrent pages carry state across steps and are indexed") {
   setenv("VT_KV_CACHE_F32", "1", 1);
   Fixture fx("float32");

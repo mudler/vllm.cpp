@@ -25056,3 +25056,273 @@ narrower f64 vector explains without anything further.
 
 SGLang-Omni is still `gateable = no`. Every reference axis in `docs/BENCHMARKS.md`
 stays `PENDING`. Everything above is an internal two-arm number on one named box.
+
+## A2-D1 — NemotronH decodes on the single-step recurrent kernels (#1311)
+
+**Verdict: this change is TOKEN-NEUTRAL on both gated hosts, and its SPEED
+hypothesis is REFUTED on both. The GB10 `95/96` is A2-Q1's device mamba arm and
+NOT this row and NOT the architecture** — resolved by a three-leg run, see the
+sm_121a section. That same run measured **A2-Q1's arm at 6.64x per output
+token** (718.1x -> 108.2x vs vLLM), which is the larger finding on this page.** Measured as a same-binary A/B on `thor:gpu0`
+(sm_110) and `dgx:gpu0` (GB10, sm_121a); recipe
+`scripts/nemotron-h-a2d1-gpu-gate.sh`.
+
+| host | ON (single-step) | OFF (chunk scan) | per-token move | verdict |
+|---|---|---|---|---|
+| sm_110 | `96/96 STRICT PASS` | `96/96 STRICT PASS` | +0.388% (slower) | speed REFUTED |
+| sm_121a | `95/96 DIVERGENCE` | `95/96 DIVERGENCE` | -1.991% (faster) | speed REFUTED |
+
+**Each host returns the SAME token verdict on both arms**, which is what makes
+this change token-neutral: the arm that predates it diverges identically to the
+arm that replaces it. The sm_121a divergence is therefore NOT this row's and is
+filed as #1388 -- it is the "sm_121a re-run pending" `STATUS` has carried, and
+it fails on both arms.
+
+Both moves are under #1311's own 3% refutation bar, so the speed hypothesis is
+refuted on both hosts -- and note they point in OPPOSITE directions, which is
+itself evidence that neither is signal.
+
+This entry was first written before any GPU lease was obtained and said no
+number was claimed. It is superseded by the sections below rather than deleted,
+because the order in which the evidence arrived is part of the record.
+
+### What IS established, and on what
+
+The decode-vs-prefill equivalence the swap rests on, at NemotronH's own group
+count. The only pre-existing case ran `H=4 G=2`, i.e. `heads_per_group = 2`;
+this model runs 8. CPU, `test_ops_mamba2_state_update`, 7 cases / 2527
+assertions / `SUCCESS`, of which the new case contributes 58 assertions:
+
+| shape | out elements | out scale | worst \|diff\| | state elements | state scale | worst \|diff\| |
+|---|---|---|---|---|---|---|
+| multi-chunk `T=24 chunk=8` | 98,304 | 26.0174 | 1.90735e-05 | 524,288 | 4.58483 | 9.53674e-07 |
+| production `T=1 chunk=128` | 4,096 | 32.2456 | 7.62939e-06 | 524,288 | 5.54134 | 4.76837e-07 |
+
+The scale is printed beside every comparison and asserted `> 0.1`, because the
+inherited 5e-3 atol would accept everything if the tensors compared were ~1e-7
+([[count-based-tolerances-bound-nothing]]).
+
+Mutation **A2D1-M1** — clamp the state-update group index to `min(h/hpg, 1)`:
+
+```
+existing case (H=4 G=2 hpg=2)   RC=0   1 passed | 0 failed    8 |  8 passed | 0 failed
+new driver case (H=64 G=8 hpg=8) RC=1  0 passed | 1 failed   58 | 54 passed | 4 failed
+```
+
+Invisible to the case that existed, caught by the case this row adds, on BOTH
+shapes. Tree restored byte-for-byte (`src/vt/cpu/cpu_ops.cpp` md5
+`753ba5c3d0869396c20f2205eb2617d7` before and after).
+
+### The launch and allocation counts — ARITHMETIC, NOT A PROFILE
+
+Counted from `cuda_mamba2_ssd.cuh:596-641` at the driver geometry
+(`H=64 P=64 N=128 G=8 cs=128 S=1 nchunks=1 T=1`), per TOKEN over 23 mamba
+layers:
+
+| | chunk scan (before) | state update (after) |
+|---|---|---|
+| SSD kernel launches | 115 | 23 |
+| SSD `Alloc`/`Free` | 230 | 0 |
+| SSD `cudaMemsetAsync` | 46, zeroing 57.5 MiB | 0 |
+| SSD scratch | 104.9 MiB | 0 |
+| gather/scatter launches | 92 | 0 |
+| small metadata H2D | 138 | 0 |
+| `M2ChunkScanKernel` grid | 524,288 elements for 4,096 | n/a |
+
+Per-call scratch is `dtv` 32 KiB + `dac` 32 KiB + `states` 2.00 MiB + `cb`
+512 KiB + `passed` 2.00 MiB = **4.5625 MiB**, of which 2.50 MiB is memset.
+
+**Disagreement with #1311, recorded rather than reconciled.** The issue put the
+gather/scatter state churn at "roughly +414 MiB/token". Counting the three SSM
+movements (gather, scatter, `final_states` copy-back) at 4.00 MiB each gives
+12.0 MiB per layer per token = ~276 MiB/token for the SSM plus ~7 MiB for the
+conv, about **283 MiB/token**. Neither figure is measured and the direction of
+the change does not depend on which is right, so the smaller one is carried and
+the difference is stated.
+
+### The A3 e2e token gate — MEASURED, and it is the acceptance condition
+
+`thor:gpu0` (sm_110) inside an `rc` lease, `ARCH=110`, tree `68a0ff378`, real
+`NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` at `/workspace/a3/ckpt-stage`,
+device mamba arm ON, `VT_NEMOTRON_H_MAMBA_DECODE_STEP=1` (the default):
+
+```
+RC[a3 on]=0
+[nemotron-h] engine loaded in 654.7s
+[nemotron-h] TOKEN MATCH: 96/96 over 3 prompt(s) (full rows=3, short rows=0, mode=decode)
+[nemotron-h] STRICT PASS
+on: tokens compared 96 ; matched 96
+reference-tier lines in on: 0
+```
+
+The `reference-tier` count matters: the portable reference tier is numerically
+CORRECT, so a pass obtained on it is invisible in the tokens and only that line
+separates them.
+
+### Which kernels the decode steps LAUNCHED — the reachability evidence
+
+Every decode step of that run, read off the `vt::` call sites via
+`VT_NEMOTRON_H_ARM_TRACE`:
+
+```
+[NH-DIAG] ARM step T=1 nd=1 np=0  state_update_rows=23 chunk_scan_calls=0
+                                  conv_update_rows=23 conv_fwd_calls=0
+                                  gathers=0 scatters=0
+ARM lines total: 96
+ARM lines with a DECODE row: 93
+ARM lines with a PREFILL row: 3
+```
+
+23 is the mamba layer count and `nd=1` is one decode row, so that is ONE
+state-update row per mamba layer, ZERO chunk scans, ZERO gathers and ZERO
+scatters on a decode step. 96 forwards = 3 prefills + 93 decodes over 3 prompts
+x 32 tokens. `vt::Mamba2StateUpdate` went from zero callers under `src/vllm/` to
+23 launches per decoded token through a production entry point.
+
+### The decode window — SAMPLED ON THE DECODE ONLY
+
+```
+on: decode window 74.511 s (the engine load is OUTSIDE it)
+on: engine load 654.7 s, excluded
+on: GPU busy in 244 of 555 DECODE samples = 43.96%
+on: per output token 0.776159 s
+```
+
+**NO vLLM ratio is quoted for arch 110.** The 0.014369 s reference is GB10's,
+and a ratio against it would compare two pieces of silicon. The only admissible
+comparison is the ON/OFF A/B of this same binary on this same box.
+
+### The same-binary A/B — the SPEED HYPOTHESIS IS REFUTED ON THIS BOX
+
+One binary, one box, device mamba arm ON in both legs, only
+`VT_NEMOTRON_H_MAMBA_DECODE_STEP` differing. Both legs pass the token gate, so
+this is a speed comparison between two CORRECT arms:
+
+| | ON (single-step, default) | OFF (chunk scan at decode) |
+|---|---|---|
+| A3 verdict | `96/96 mode=decode STRICT PASS` | `96/96 mode=decode STRICT PASS` |
+| `state_update_rows` per decode step | 23 | 0 |
+| `chunk_scan_calls` per decode step | 0 | 23 |
+| `conv_update_rows` / `conv_fwd_calls` | 23 / 0 | 0 / 23 |
+| `gathers` / `scatters` per decode step | 0 / 0 | 46 / 46 |
+| decode window | 74.511 s | 74.223 s |
+| per output token | 0.776159 s | 0.773156 s |
+| GPU busy (decode samples) | 244 of 555 = 43.96% | 230 of 562 = 40.93% |
+| engine load, EXCLUDED | 654.7 s | 778.2 s |
+| `reference-tier` lines | 0 | 0 |
+
+**Per output token moved +0.388%, and in the SLOWER direction.** Issue #1311's
+own stop condition is "Refuted if per-token time moves less than 3%". At 0.388%
+the speed hypothesis is **REFUTED on `thor:gpu0` (sm_110) at concurrency 1**,
+and this record says so rather than reporting the two counter columns as though
+they were a result.
+
+**What is NOT refuted, and the distinction matters.** The counters are not a
+prediction; they are what the run launched. The single-step arm demonstrably
+removed 92 of 115 SSD kernel launches, all 230 driver alloc/frees, all 46
+memsets, 104.9 MiB of per-token scratch and all 92 gather/scatter launches per
+token — and per-token time did not move. **So at c1 on this box the decode step
+is not bound by any of them.** That is a finding, not a null.
+
+**Limits of this measurement, stated rather than discovered later:**
+
+- **n = 1 per leg.** No repetitions, so 0.388% is not separable from run-to-run
+  noise; it is reported as "did not move", not as a regression.
+- **The two legs did not see the same box.** Engine load was 654.7 s and 778.2 s
+  — an 18.8% spread on a phase that is excluded from the window but is evidence
+  that the host was not in the same state for both.
+- **Thor is not GB10.** The 6.31% busy-fraction and 0.014369 s/token references
+  are GB10's, so NO ratio against them is quoted here. The sm_121a leg is owed
+  and is the only thing that can answer the GB10 question
+  ([[negative-results-are-regime-dependent]]).
+- **c1 only.** The gather/scatter tax the `qwen3_5.cpp:4730-4746` comment
+  describes is stated to scale with CONCURRENCY, and G-SAFE pins `num_reqs <= 1`
+  here, so the regime where it would show has not been measured at all.
+
+**The next traceable hypothesis, because no ceiling is declared:** an `nsys`
+trace of the DECODE WINDOW ONLY on both legs, attributing the 0.776 s/token.
+The counters say what the step stopped launching; the trace would say what the
+0.776 s is actually spent on. Peak host during the run was 44402 MiB.
+
+### sm_121a (GB10) — RESOLVED by a three-leg run: the cause is A2-Q1's arm
+
+`dgx:gpu0`, `rc` lease, `ARCH=121a`, logs `/workspace/a2d1-discriminate/20260819T200231Z`.
+THREE legs of ONE binary. Legs 1 and 2 vary the mamba KERNEL; leg 3 removes
+A2-Q1's device mamba arm entirely (`VT_NEMOTRON_H_DEVICE_MAMBA=0`):
+
+| leg | device mamba | tokens | s/token | vs vLLM | decode busy |
+|---|---|---|---|---|---|
+| `on` (single-step) | 1 | `95/96 DIVERGENCE` | 1.584694 | 110.3x | 108/1052 = 10.27% |
+| `off` (chunk scan) | 1 | `95/96 DIVERGENCE` | 1.554233 | 108.2x | 108/1061 = 10.18% |
+| **`hostmamba`** | **0** | **`96/96 STRICT PASS`** | 10.318897 | 718.1x | 559/7115 = 7.86% |
+
+**★ THE CAUSE IS A2-Q1's DEVICE MAMBA ARM, NOT THE ARCHITECTURE.** Removing it
+on the same binary and box restores `96/96`. The earlier "arch-specific" reading
+was retracted before this ran, and this is the experiment that actually tested
+it.
+
+**★ WHY THIS IS A DISCRIMINATION AND NOT A CORRELATION: leg 3's own counters.**
+It reports `state_update_rows=0 chunk_scan_calls=0 conv_update_rows=0
+conv_fwd_calls=0` with `gathers=46 scatters=46` — all four kernel counters at
+zero while the host branch's gather/scatter stay non-zero, which is the
+signature of the host path and of nothing else. 96 ARM lines, 93 decode rows, 3
+prefill rows, `reference-tier lines: 0`. A leg that could not prove which path
+it took would have made this a correlation between a flag and an outcome; the
+counters are what make it an attribution.
+
+**The divergence is ONE token, and both device legs lose the SAME one.** The
+repaired verdict grep — added after the first GB10 run discarded it — captured
+it:
+
+```
+got: ...,1044,12837,2505,1261,9943,1307,11286
+exp: ...,1044,12837,2505,1261,9943,1307,3468
+```
+
+Prompt 2 (13 prompt tokens, the longest), position 32 of 32, the LAST generated
+token; positions 1-31 byte-identical, and identical between the two device legs.
+Prompts 0 and 1 are 32/32. **Whether this is a defect or a bf16 near-tie is NOT
+settled here** — a fresh implementer is root-causing it from the oracle's top-2
+margin at that position, and a near-tie would mean there is no defect at all.
+
+### The second result, and it is the larger one
+
+**A2-Q1's device mamba arm is worth 6.64x per output token on GB10**: 10.318897
+s with the arm off against 1.554233 s with it on, closing the vLLM ratio
+**718.1x -> 108.2x**, with decode busy rising 7.86% -> 10.18%. It agrees in
+direction and rough magnitude with #1289's independent Thor decode-window A/B
+(7.17x less time per output token), which is two boxes and two harnesses
+agreeing.
+
+**Bound honestly. This is ONE run per leg on a contended box**, engine load
+excluded from every window (376.3 s on leg 3). It is not a mean, it has no
+spread, and the box was carrying foreign jobs all day. The 6.64x is a large
+enough effect to survive that; the ~2% on/off deltas are not, and §A2-D1's own
+data now proves it — see below.
+
+**108.2x is an OPEN GAP, not a win.** It is the distance still to vLLM after the
+single biggest movement measured on this model. Nothing here claims parity, and
+no ceiling is declared.
+
+### The +-2% on/off delta is NOISE, and this run proves it
+
+Two runs of the SAME on/off comparison on the SAME box:
+
+| run | on | off | on-vs-off |
+|---|---|---|---|
+| first GB10 | 1.513958 | 1.544706 | **-1.991%** (on faster) |
+| this GB10 | 1.584694 | 1.554233 | **+1.960%** (on slower) |
+
+**The sign flipped.** A quantity that reverses direction between two runs of one
+comparison on one box is not a measurement of that comparison. This retires any
+reading of the ~2% figures as signal and strengthens #1311's refutation, which
+was already argued from the 3% bar: the single-step-vs-chunk-scan speed question
+is settled negative on both hosts, and the token question is settled neutral
+(95/96 vs 95/96 here, 96/96 vs 96/96 on Thor).
+
+### Evidence
+
+`tests/vt/test_ops_mamba2_state_update.cpp` (the two driver-group cases),
+`tests/vllm/models/test_nemotron_h_paged_forward.cpp` (the arm recorder, driven
+through `ModelRegistry::Forward`), `scripts/nemotron-h-a2d1-gpu-gate.sh` (the
+recipe), and the Thor run logs under `/workspace/a2d1-thor/20260819T125936Z`.

@@ -522,6 +522,185 @@ TEST_CASE("mamba2 state update reproduces the chunked prefill token by token") {
                5e-3, 5e-3);
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (3b) DECODE == PREFILL **AT THE NEMOTRON-H DRIVER GROUP COUNT** (A2-D1, #1311).
+//
+// WHY (3) DOES NOT COVER THIS. Case (3) runs `G = 2` with `H = 4`, so
+// `heads_per_group = 2`. NemotronH runs `n_groups = 8` over `num_heads = 64`,
+// so `heads_per_group = 8` — and the group index is the ONE thing the two arms
+// derive independently: the state update computes `hpg = H / G` and
+// `gg = h / hpg` in its own kernel (cuda_mamba2_ssd.cuh:657,:496), the chunk
+// scan derives its own. A head-to-group map that is right at hpg = 2 and wrong
+// at hpg = 8 passes (3) and produces finite, plausible, WRONG numbers on the
+// released checkpoint.
+//
+// This was the ungated assumption #1311 named: the issue's own text says
+// "NOT VERIFIED: whether the state-update arm is numerically equivalent to the
+// chunk scan at T=1 for n_groups=8". `.agents/specs/mamba2-ssd.md` §8.3 declares
+// an equivalence CONTRACT, but §8.3 is device-vs-host — no case gated
+// decode-vs-prefill at this group count on either arm. A2-D1 swaps production
+// decode onto the state update, so it gates the property first.
+//
+// THE SECOND SHAPE IS THE PRODUCTION ONE. `T = 1` with `chunk_size = 128` is
+// exactly what a NemotronH decode step handed the chunk scan before this change
+// (nchunks = 1, a 128x-oversized grid) and exactly what it now hands the state
+// update. Gating the multi-chunk shape alone would leave the one shape that
+// actually ships ungated.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+// The driver geometry, from the released `NVIDIA-Nemotron-3.5-Lightning-30B-A3B`
+// config and mirrored in mamba2-ssd.md §1.4.
+constexpr int64_t kDrvH = 64;   // mamba_num_heads
+constexpr int64_t kDrvP = 64;   // mamba_head_dim
+constexpr int64_t kDrvG = 8;    // n_groups
+constexpr int64_t kDrvN = 128;  // ssm_state_size
+
+struct EquivShape {
+  int64_t T;
+  int64_t chunk;
+  const char* tag;
+};
+
+// ★ A TOLERANCE IS ONLY A BOUND IF THE VALUES IT BOUNDS ARE NON-TRIVIAL. These
+// cases inherit case (3)'s upstream-ported 5e-3 / 5e-3 (test_mamba_ssm_ssd.py
+// :210-213), and an atol of 5e-3 accepts EVERYTHING if the tensor being compared
+// happens to be ~1e-7 everywhere. So the scale and the worst absolute difference
+// are printed unconditionally beside every comparison, and the scale is
+// ASSERTED to be O(1): a run whose outputs collapsed to noise would then fail
+// here rather than pass vacuously
+// ([[count-based-tolerances-bound-nothing]]).
+struct Spread {
+  double scale;      // max |want|
+  double worst_abs;  // max |got - want|
+  size_t n;
+};
+
+Spread Measure(const std::vector<float>& got, const std::vector<float>& want) {
+  Spread s{0.0, 0.0, 0};
+  for (size_t i = 0; i < got.size() && i < want.size(); ++i) {
+    s.scale = std::max(s.scale, std::abs(static_cast<double>(want[i])));
+    s.worst_abs = std::max(s.worst_abs, std::abs(static_cast<double>(got[i]) -
+                                                 static_cast<double>(want[i])));
+    ++s.n;
+  }
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("mamba2 state update reproduces the chunked prefill at the driver group count") {
+  const int64_t H = kDrvH, P = kDrvP, G = kDrvG, N = kDrvN;
+  REQUIRE(H % G == 0);
+  REQUIRE(H / G == 8);  // heads_per_group -- the value case (3) never exercises
+  const EquivShape shapes[] = {{24, 8, "multi-chunk T=24 chunk=8"},
+                               {1, 128, "production decode T=1 chunk=128"}};
+  size_t shapes_run = 0;
+  for (const EquivShape& sh : shapes) {
+    const int64_t T = sh.T, chunk = sh.chunk;
+    INFO("shape " << std::string(sh.tag));
+    std::mt19937 rng(0x51D1u + static_cast<uint32_t>(T));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+
+    std::vector<float> A(static_cast<size_t>(H));
+    for (auto& v : A) v = -ud(rng) - 1.0f;
+    std::vector<float> D(static_cast<size_t>(H));
+    for (auto& v : D) v = nd(rng);
+    std::vector<float> dt_bias(static_cast<size_t>(H));
+    for (auto& v : dt_bias) v = ud(rng) - 4.0f;
+    std::vector<float> x(static_cast<size_t>(T * H * P));
+    for (auto& v : x) v = nd(rng);
+    std::vector<float> dt(static_cast<size_t>(T * H));
+    for (auto& v : dt) v = nd(rng);
+    std::vector<float> B(static_cast<size_t>(T * G * N));
+    for (auto& v : B) v = nd(rng);
+    std::vector<float> C(static_cast<size_t>(T * G * N));
+    for (auto& v : C) v = nd(rng);
+
+    // ── prefill arm: the chunked scan, exactly as the paged forward builds it ──
+    std::vector<float> y_prefill(static_cast<size_t>(T * H * P), 0.0f);
+    std::vector<float> fs(static_cast<size_t>(H * P * N), 0.0f);
+    {
+      Queue q = CpuQ();
+      std::vector<int32_t> cu{0, static_cast<int32_t>(T)};
+      std::vector<int32_t> ccs{0};
+      std::vector<int32_t> sidx;
+      for (int64_t pos = 0; pos < T; pos += chunk) {
+        ccs.push_back(static_cast<int32_t>(std::min(pos + chunk, T)));
+        sidx.push_back(0);
+      }
+      std::vector<int32_t> lci{static_cast<int32_t>(sidx.size()) - 1};
+      Tensor xt = MakeT(x.data(), DType::kF32, {T, H, P});
+      Tensor dtt = MakeT(dt.data(), DType::kF32, {T, H});
+      Tensor At = MakeT(A.data(), DType::kF32, {H});
+      Tensor Bt = MakeT(B.data(), DType::kF32, {T, G, N});
+      Tensor Ct = MakeT(C.data(), DType::kF32, {T, G, N});
+      Tensor Dt = MakeT(D.data(), DType::kF32, {H});
+      Tensor dbt = MakeT(dt_bias.data(), DType::kF32, {H});
+      Tensor outt = MakeT(y_prefill.data(), DType::kF32, {T, H, P});
+      Tensor fst = MakeT(fs.data(), DType::kF32, {1, H, P, N});
+      Tensor cust = MakeT(cu.data(), DType::kI32, {2});
+      Tensor ccst = MakeT(ccs.data(), DType::kI32, {static_cast<int64_t>(ccs.size())});
+      Tensor lcit = MakeT(lci.data(), DType::kI32, {1});
+      Tensor sit = MakeT(sidx.data(), DType::kI32, {static_cast<int64_t>(sidx.size())});
+      Mamba2Args args;
+      args.chunk_size = chunk;
+      args.dt_softplus = true;
+      vt::Mamba2ChunkScan(q, outt, fst, xt, dtt, At, Bt, Ct, &Dt, nullptr, &dbt, nullptr, cust,
+                          ccst, lcit, sit, args);
+    }
+
+    // ── decode arm: T single-token updates on one cache slot ──
+    std::vector<uint8_t> raw(static_cast<size_t>(H * P * N) * 4, 0);
+    std::vector<float> y_decode(static_cast<size_t>(T * H * P), 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+      StepInputs step;
+      step.A = A;
+      step.D = D;
+      step.dt_bias = dt_bias;
+      step.x.assign(x.begin() + static_cast<size_t>(t * H * P),
+                    x.begin() + static_cast<size_t>((t + 1) * H * P));
+      step.dt.assign(dt.begin() + static_cast<size_t>(t * H),
+                     dt.begin() + static_cast<size_t>((t + 1) * H));
+      step.B.assign(B.begin() + static_cast<size_t>(t * G * N),
+                    B.begin() + static_cast<size_t>((t + 1) * G * N));
+      step.C.assign(C.begin() + static_cast<size_t>(t * G * N),
+                    C.begin() + static_cast<size_t>((t + 1) * G * N));
+      step.z.assign(static_cast<size_t>(H * P), 0.0f);
+      StepCfg cfg;
+      const std::vector<float> o = RunStateUpdate(raw, 1, step, nullptr, 1, H, P, G, N, cfg);
+      REQUIRE(o.size() == static_cast<size_t>(H * P));
+      std::copy(o.begin(), o.end(), y_decode.begin() + static_cast<size_t>(t * H * P));
+    }
+
+    // ★ THE GEOMETRY IS ASSERTED, NOT ASSUMED. A comparison over zero elements
+    // reports a maximum deviation of 0.0, which is also what a bit-exact match
+    // reports; the counts below are what separate the two.
+    REQUIRE(y_decode.size() == static_cast<size_t>(T * H * P));
+    REQUIRE(y_prefill.size() == static_cast<size_t>(T * H * P));
+    REQUIRE(fs.size() == static_cast<size_t>(H * P * N));
+    const std::vector<float> st_decode = Unpack(raw, static_cast<size_t>(H * P * N), DType::kF32);
+    const Spread so = Measure(y_decode, y_prefill);
+    const Spread ss = Measure(st_decode, fs);
+    MESSAGE("driver-group equivalence " << std::string(sh.tag) << " at hpg=" << (H / G)
+                                        << ": out n=" << so.n << " scale=" << so.scale
+                                        << " worst|diff|=" << so.worst_abs << "; state n="
+                                        << ss.n << " scale=" << ss.scale
+                                        << " worst|diff|=" << ss.worst_abs);
+    REQUIRE(so.n == static_cast<size_t>(T * H * P));
+    REQUIRE(ss.n == static_cast<size_t>(H * P * N));
+    CHECK(so.scale > 0.1);  // the outputs are O(1); D*x alone puts them there
+    CHECK(ss.scale > 1e-4);
+    ExpectCloseF("driver-group decode vs chunked prefill", y_decode, y_prefill, 5e-3, 5e-3);
+    ExpectCloseF("driver-group final state", st_decode, fs, 5e-3, 5e-3);
+    ++shapes_run;
+  }
+  // A loop that ran zero times passes every assertion inside it.
+  REQUIRE(shapes_run == 2);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // (4) The SSM cache dtype is its own knob (`mamba2_state_dtype`,
 // mamba_utils.py:73-81) — a bf16 cache with f32 activations must run and must
@@ -1171,6 +1350,155 @@ TEST_CASE("mamba2 state update CUDA arm reproduces the CUDA chunked prefill") {
   ExpectCloseF("device decode vs device chunked prefill", y_decode, y_prefill, 5e-3, 5e-3);
   ExpectCloseF("device final state", Unpack(raw, static_cast<size_t>(H * P * N), DType::kF32), fs,
                5e-3, 5e-3);
+}
+
+
+// DECODE == PREFILL **AT THE NEMOTRON-H DRIVER GROUP COUNT** on the DEVICE
+// (A2-D1, #1311). The CUDA twin of case (3b): see that case for why the group
+// count is the property under test and why the second shape is the production
+// one. Both arms run on device, through entirely separate kernels
+// (`M2StateUpdateKernel` vs the five-stage chunked pipeline), so the agreement
+// is evidence and not a shared-helper tautology.
+//
+// THIS IS THE ARM THAT SHIPS. NemotronH's device mamba block is CUDA-only —
+// its FP8 W8A8 projections need `kMatmulFp8CublasLt`, which only
+// `cuda_matmul.cu:920` registers — so the CPU case above gates the algebra and
+// this one gates the kernel production actually launches.
+TEST_CASE("mamba2 state update CUDA arm reproduces the CUDA chunked prefill at the driver group count") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  const int64_t H = kDrvH, P = kDrvP, G = kDrvG, N = kDrvN;
+  REQUIRE(H % G == 0);
+  REQUIRE(H / G == 8);
+  const EquivShape shapes[] = {{24, 8, "multi-chunk T=24 chunk=8"},
+                               {1, 128, "production decode T=1 chunk=128"}};
+  size_t shapes_run = 0;
+  for (const EquivShape& sh : shapes) {
+    const int64_t T = sh.T, chunk = sh.chunk;
+    INFO("shape " << std::string(sh.tag));
+    std::mt19937 rng(0x51D1u + static_cast<uint32_t>(T));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+
+    std::vector<float> A(static_cast<size_t>(H));
+    for (auto& v : A) v = -ud(rng) - 1.0f;
+    std::vector<float> D(static_cast<size_t>(H));
+    for (auto& v : D) v = nd(rng);
+    std::vector<float> dt_bias(static_cast<size_t>(H));
+    for (auto& v : dt_bias) v = ud(rng) - 4.0f;
+    std::vector<float> x(static_cast<size_t>(T * H * P));
+    for (auto& v : x) v = nd(rng);
+    std::vector<float> dt(static_cast<size_t>(T * H));
+    for (auto& v : dt) v = nd(rng);
+    std::vector<float> B(static_cast<size_t>(T * G * N));
+    for (auto& v : B) v = nd(rng);
+    std::vector<float> C(static_cast<size_t>(T * G * N));
+    for (auto& v : C) v = nd(rng);
+
+    // ── prefill arm on device ──
+    std::vector<float> y_prefill(static_cast<size_t>(T * H * P), 0.0f);
+    std::vector<float> fs(static_cast<size_t>(H * P * N), 0.0f);
+    {
+      Queue q = gpu->CreateQueue();
+      const Device dev{DeviceType::kCUDA, 0};
+      std::vector<int32_t> cu{0, static_cast<int32_t>(T)};
+      std::vector<int32_t> ccs{0};
+      std::vector<int32_t> sidx;
+      for (int64_t pos = 0; pos < T; pos += chunk) {
+        ccs.push_back(static_cast<int32_t>(std::min(pos + chunk, T)));
+        sidx.push_back(0);
+      }
+      std::vector<int32_t> lci{static_cast<int32_t>(sidx.size()) - 1};
+
+      DBuf dx(*gpu, q, x.data(), x.size() * sizeof(float));
+      DBuf ddt(*gpu, q, dt.data(), dt.size() * sizeof(float));
+      DBuf dA(*gpu, q, A.data(), A.size() * sizeof(float));
+      DBuf dB(*gpu, q, B.data(), B.size() * sizeof(float));
+      DBuf dC(*gpu, q, C.data(), C.size() * sizeof(float));
+      DBuf dD(*gpu, q, D.data(), D.size() * sizeof(float));
+      DBuf ddb(*gpu, q, dt_bias.data(), dt_bias.size() * sizeof(float));
+      DBuf dout(*gpu, q, nullptr, y_prefill.size() * sizeof(float));
+      DBuf dfs(*gpu, q, nullptr, fs.size() * sizeof(float));
+      DBuf dcu(*gpu, q, cu.data(), cu.size() * sizeof(int32_t));
+      DBuf dccs(*gpu, q, ccs.data(), ccs.size() * sizeof(int32_t));
+      DBuf dlci(*gpu, q, lci.data(), lci.size() * sizeof(int32_t));
+      DBuf dsi(*gpu, q, sidx.data(), sidx.size() * sizeof(int32_t));
+
+      Tensor xt = MakeTDev(dx.get(), DType::kF32, dev, {T, H, P});
+      Tensor dtt = MakeTDev(ddt.get(), DType::kF32, dev, {T, H});
+      Tensor At = MakeTDev(dA.get(), DType::kF32, dev, {H});
+      Tensor Bt = MakeTDev(dB.get(), DType::kF32, dev, {T, G, N});
+      Tensor Ct = MakeTDev(dC.get(), DType::kF32, dev, {T, G, N});
+      Tensor Dt = MakeTDev(dD.get(), DType::kF32, dev, {H});
+      Tensor dbt = MakeTDev(ddb.get(), DType::kF32, dev, {H});
+      Tensor outt = MakeTDev(dout.get(), DType::kF32, dev, {T, H, P});
+      Tensor fst = MakeTDev(dfs.get(), DType::kF32, dev, {1, H, P, N});
+      Tensor cust = MakeTDev(dcu.get(), DType::kI32, dev, {2});
+      Tensor ccst = MakeTDev(dccs.get(), DType::kI32, dev,
+                             {static_cast<int64_t>(ccs.size())});
+      Tensor lcit = MakeTDev(dlci.get(), DType::kI32, dev, {1});
+      Tensor sit = MakeTDev(dsi.get(), DType::kI32, dev,
+                            {static_cast<int64_t>(sidx.size())});
+      Mamba2Args args;
+      args.chunk_size = chunk;
+      args.dt_softplus = true;
+      vt::Mamba2ChunkScan(q, outt, fst, xt, dtt, At, Bt, Ct, &Dt, nullptr, &dbt, nullptr, cust,
+                          ccst, lcit, sit, args);
+      dout.Download(q, y_prefill.data());
+      dfs.Download(q, fs.data());
+      gpu->Synchronize(q);
+      gpu->DestroyQueue(q);
+    }
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "driver-group: prefill arm");
+
+    // ── decode arm: T single-token device steps on one cache slot ──
+    std::vector<uint8_t> raw(static_cast<size_t>(H * P * N) * 4, 0);
+    std::vector<float> y_decode(static_cast<size_t>(T * H * P), 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+      StepInputs step;
+      step.A = A;
+      step.D = D;
+      step.dt_bias = dt_bias;
+      step.x.assign(x.begin() + static_cast<size_t>(t * H * P),
+                    x.begin() + static_cast<size_t>((t + 1) * H * P));
+      step.dt.assign(dt.begin() + static_cast<size_t>(t * H),
+                     dt.begin() + static_cast<size_t>((t + 1) * H));
+      step.B.assign(B.begin() + static_cast<size_t>(t * G * N),
+                    B.begin() + static_cast<size_t>((t + 1) * G * N));
+      step.C.assign(C.begin() + static_cast<size_t>(t * G * N),
+                    C.begin() + static_cast<size_t>((t + 1) * G * N));
+      step.z.assign(static_cast<size_t>(H * P), 0.0f);
+      StepCfg cfg;
+      const std::vector<float> o =
+          RunStateUpdateCuda(*gpu, raw, 1, step, nullptr, 1, H, P, G, N, cfg);
+      REQUIRE(o.size() == static_cast<size_t>(H * P));
+      std::copy(o.begin(), o.end(), y_decode.begin() + static_cast<size_t>(t * H * P));
+    }
+    RequireNativeCudaProvider(vt::OpId::kMamba2StateUpdate, "driver-group: decode arm");
+
+    REQUIRE(y_decode.size() == static_cast<size_t>(T * H * P));
+    REQUIRE(y_prefill.size() == static_cast<size_t>(T * H * P));
+    REQUIRE(fs.size() == static_cast<size_t>(H * P * N));
+    const std::vector<float> st_decode = Unpack(raw, static_cast<size_t>(H * P * N), DType::kF32);
+    const Spread so = Measure(y_decode, y_prefill);
+    const Spread ss = Measure(st_decode, fs);
+    MESSAGE("CUDA driver-group equivalence " << std::string(sh.tag) << " at hpg=" << (H / G)
+                                             << ": out n=" << so.n << " scale=" << so.scale
+                                             << " worst|diff|=" << so.worst_abs << "; state n="
+                                             << ss.n << " scale=" << ss.scale
+                                             << " worst|diff|=" << ss.worst_abs);
+    REQUIRE(so.n == static_cast<size_t>(T * H * P));
+    REQUIRE(ss.n == static_cast<size_t>(H * P * N));
+    CHECK(so.scale > 0.1);
+    CHECK(ss.scale > 1e-4);
+    ExpectCloseF("CUDA driver-group decode vs chunked prefill", y_decode, y_prefill, 5e-3, 5e-3);
+    ExpectCloseF("CUDA driver-group final state", st_decode, fs, 5e-3, 5e-3);
+    ++shapes_run;
+  }
+  REQUIRE(shapes_run == 2);
 }
 
 // The SSM cache dtype is its own knob (mamba_utils.py:73-81), and `out` does not

@@ -416,7 +416,8 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
                                     const std::vector<float>& last_hidden_unconditional,
                                     int64_t frame_index, const Music3ArWeights& weights,
                                     const Music3CodeSampler& sampler,
-                                    std::vector<int32_t>* out_frame_codes) {
+                                    std::vector<int32_t>* out_frame_codes,
+                                    const Music3DepthDeviceArm& device_arm) {
   // `_generate_depth_codes` (encoders.py:117-142). The two prompt rows share
   // every sequence entry EXCEPT position 0, which is each row's own
   // `projection(last_hidden)` — that is the whole of what the unconditional
@@ -430,6 +431,15 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   }
   if (out_frame_codes->size() != 1) {
     Fail("MiniMax-Music3: the depth stage starts from the frame's semantic code alone");
+  }
+  // Half an arm is a caller that thinks it asked for the device and did not.
+  // Refused by name rather than silently falling back to the host loop, which
+  // would be a 4.4x slowdown wearing a correct answer.
+  if (device_arm.half_set()) {
+    Fail("MiniMax-Music3: the depth stage's device arm needs BOTH a queue and staged weights; "
+         "got " +
+         std::string(device_arm.queue != nullptr ? "a queue and no weights"
+                                                 : "weights and no queue"));
   }
   profile::Timer depth_timer("ar.depth_stage", /*span=*/true);
   const int32_t semantic = (*out_frame_codes)[0];
@@ -452,6 +462,18 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   // The two CFG rows go through as ONE batch-2 call — which is upstream's own
   // shape, `(2, 2..8, 4096)` — so every weight sweep serves both branches.
   DepthDecoderCache cache;
+  Music3DepthDeviceCache device_cache;
+  // THE PRODUCTION SELECTION (#1309, spec §17.5). Deleting this lambda's device
+  // branch is the reachability mutation, and the composed-stage gate goes RED on
+  // it — which is the leg #1131 records as missing for the DiT arm.
+  const auto append = [&](const std::vector<float>& embeds) {
+    if (device_arm.engaged()) {
+      return DepthDecoderAppendDevice(*device_arm.queue, config, *device_arm.depth, embeds,
+                                      /*batch=*/2, &device_cache);
+    }
+    return DepthDecoderAppend(embeds, /*batch=*/2, config, weights.depth, ArCompute::kBFloat16,
+                              &cache);
+  };
 
   // The depth sequence's first two rows: each branch's own
   // `projection(last_hidden)` at position 0, and the SHARED
@@ -476,8 +498,7 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   // row of a length-2 sequence first, so position 0's own output is never used.
   {
     profile::Timer forward_timer("ar.depth_forward");
-    DepthDecoderAppend(std::vector<float>(prefix.begin(), prefix.begin() + 2 * H), /*batch=*/2,
-                       config, weights.depth, ArCompute::kBFloat16, &cache);
+    append(std::vector<float>(prefix.begin(), prefix.begin() + 2 * H));
   }
 
   std::vector<float> next(static_cast<size_t>(2 * H));
@@ -488,8 +509,7 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
     std::vector<float> states;
     {
       profile::Timer forward_timer("ar.depth_forward");
-      states = DepthDecoderAppend(next, /*batch=*/2, config, weights.depth,
-                                  ArCompute::kBFloat16, &cache);
+      states = append(next);
     }
     std::vector<float> hidden_rows[2];
     hidden_rows[0].assign(states.begin(), states.begin() + H);
@@ -550,7 +570,8 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
                                           int64_t max_frames,
                                           const Music3ArWeights& weights,
                                           const Music3CodeSampler& sampler,
-                                          vt::Queue& queue) {
+                                          vt::Queue& queue,
+                                          const Music3DepthDeviceArm& device_arm) {
   if (!sampler) Fail("MiniMax-Music3: the autoregressive loop needs a code sampler");
   if (max_frames <= 0) {
     Fail("MiniMax-Music3: the autoregressive loop needs a positive frame budget, got " +
@@ -634,7 +655,7 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
     const std::vector<float> depth_hidden = Music3DepthStage(
         std::vector<float>(hidden.begin(), hidden.begin() + static_cast<ptrdiff_t>(H)),
         std::vector<float>(hidden.begin() + static_cast<ptrdiff_t>(H), hidden.end()),
-        frame_index, weights, sampler, &frame_codes);
+        frame_index, weights, sampler, &frame_codes, device_arm);
     result.codes.insert(result.codes.end(), frame_codes.begin(), frame_codes.end());
     ++result.calls;
 

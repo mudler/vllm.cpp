@@ -781,6 +781,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
   src/vllm/model_executor/models/minimax_music3_device.cpp
+  src/vllm/model_executor/models/minimax_music3_depth_device.cpp
   src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp

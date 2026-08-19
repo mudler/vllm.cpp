@@ -76,6 +76,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/minimax_music3_ar.h"
+#include "vllm/model_executor/models/minimax_music3_depth_device.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
 #include "vllm/model_executor/models/qwen3.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -265,6 +266,21 @@ struct Music3ArResult {
   bool stopped_on_end_token = false;
 };
 
+// The depth decoder's DEVICE arm, selected per call (#1309, spec §17).
+//
+// Both fields or neither. One alone is a caller that thinks it asked for the
+// device arm and did not, so it is REFUSED rather than silently ignored — the
+// same shape, and the same reason, as `Music3DenoiseDeviceArm`.
+//
+// A default-constructed arm keeps the host loop, so every existing caller and
+// every existing gate is unchanged by construction.
+struct Music3DepthDeviceArm {
+  vt::Queue* queue = nullptr;
+  const Music3DepthDeviceWeights* depth = nullptr;
+  bool engaged() const { return queue != nullptr && depth != nullptr; }
+  bool half_set() const { return (queue != nullptr) != (depth != nullptr); }
+};
+
 // `MiniMaxMusic3SemanticGenerationStep.__call__` (encoders.py:299-353).
 //
 // `prompt_ids` is the CONDITIONAL row; the unconditional row is derived with
@@ -278,7 +294,8 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
                                           int64_t max_frames,
                                           const Music3ArWeights& weights,
                                           const Music3CodeSampler& sampler,
-                                          vt::Queue& queue);
+                                          vt::Queue& queue,
+                                          const Music3DepthDeviceArm& device_arm = {});
 
 // One frame's DEPTH stage, with the language model's own hidden states SUPPLIED
 // rather than produced. `Music3GenerateFrameHiddens` calls it once per frame,
@@ -300,7 +317,8 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
                                     const std::vector<float>& last_hidden_unconditional,
                                     int64_t frame_index, const Music3ArWeights& weights,
                                     const Music3CodeSampler& sampler,
-                                    std::vector<int32_t>* out_frame_codes);
+                                    std::vector<int32_t>* out_frame_codes,
+                                    const Music3DepthDeviceArm& device_arm = {});
 
 }  // namespace music3
 }  // namespace models

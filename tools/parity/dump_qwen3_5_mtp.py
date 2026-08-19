@@ -6,16 +6,20 @@ first non-dummy Qwen3_5MTP forward, and stores its exact draft inputs and
 outputs.  The corresponding C++ gate is the focused ``qwen3.5 MTP standalone
 head parity`` case in ``test_op_parity``.
 
-Run on dgx.casa after acquiring the project GPU lock::
+Run on the gate host after acquiring the project GPU lock::
 
     flock "${GPU_LOCK:-$HOME/gpu.lock}" bash -lc '
-      cd ~/work/vllm.cpp
+      cd "${GATE_CHECKOUT}"
       VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-        ~/venvs/vllm-oracle/bin/python \
+        "${VLLM_ORACLE}"/bin/python \
         tools/parity/dump_qwen3_5_mtp.py \
         --model <snapshot> --tag 27b \
-        --pinned-vllm /home/mudler/work/vllm-pin \
+        --pinned-vllm "${VLLM_SOURCE}" \
         --out tests/parity/goldens'
+
+`${VLLM_SOURCE}` is required, and `--pinned-vllm` overrides it for one run. The
+flag carried one operator's checkout as its default until #1190; the AST check
+below then compared the executable tree against whatever sat at that path.
 
 The installed wheel is used for the executable engine.  The script refuses to
 run unless the executable MTP class AST (init/forward/compute_logits) matches
@@ -49,6 +53,7 @@ from typing import Any
 import torch
 
 from dump_common import save_case
+from parity_env import resolve_pinned_source
 
 
 CAPTURE: dict[str, torch.Tensor] = {}
@@ -230,8 +235,8 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--pinned-vllm",
-        default="/home/mudler/_git/vllm",
-        help="checkout at the parity pin e24d1b24",
+        default=None,
+        help="checkout at the parity pin e24d1b24; defaults to ${VLLM_SOURCE}",
     )
     parser.add_argument(
         "--prompt",
@@ -244,6 +249,10 @@ def main() -> None:
     parser.add_argument("--gpu-mem", type=float, default=0.8)
     args = parser.parse_args()
 
+    # First, because it is the only precondition that costs nothing to check and
+    # because an unresolved checkout must not reach the engine (#1190).
+    pinned = resolve_pinned_source(args.pinned_vllm, "--pinned-vllm")
+
     if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") != "0":
         raise RuntimeError(
             "set VLLM_ENABLE_V1_MULTIPROCESSING=0 so the capture patch and "
@@ -255,7 +264,7 @@ def main() -> None:
     from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
 
     installed_source = pathlib.Path(inspect.getsourcefile(Qwen3_5MTP) or "")
-    verify_mtp_source(installed_source, pathlib.Path(args.pinned_vllm))
+    verify_mtp_source(installed_source, pinned)
     install_capture_patch(Qwen3_5MTP)
 
     print("vllm from:", vllm.__file__, "version", vllm.__version__)

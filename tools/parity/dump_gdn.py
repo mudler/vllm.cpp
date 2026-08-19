@@ -1,12 +1,16 @@
 # vllm.cpp parity harness; oracle = PINNED upstream vLLM checkout (e24d1b24).
 """Dump GDN-layer op goldens from the pinned vLLM checkout (M0.7 Task 1).
 
-Runs on the dgx GPU inside the oracle venv, executing the PINNED sources
-verbatim (never pip vLLM, never re-implemented math):
+Runs on the gate host's GPU inside the oracle venv, executing the PINNED
+sources verbatim (never pip vLLM, never re-implemented math):
 
-    ssh dgx.casa 'cd ~/work/vllm.cpp && ~/venvs/vllm-oracle/bin/python \
-        tools/parity/dump_gdn.py --pin ~/work/vllm-pin \
+    ssh "${GATE_HOST}" 'cd "${GATE_CHECKOUT}" && "${VLLM_ORACLE}"/bin/python \
+        tools/parity/dump_gdn.py --pin "${VLLM_SOURCE}" \
         --out tests/parity/goldens'
+
+`${VLLM_SOURCE}` is required. Pass `--pin` to override it for one run. There is
+no default, because a default resolves to SOME tree and the oracle math would
+then execute from a checkout nobody named (#1190).
 
 Loading technique (oracle_detokenizer.py's exec-stub, extended to packages):
 we register package skeletons for `vllm`, `vllm.model_executor...` etc. whose
@@ -59,6 +63,8 @@ import types
 
 import numpy as np
 import torch
+
+from parity_env import resolve_pinned_source
 
 UPSTREAM_PIN = "e24d1b24"
 STUBBED = [
@@ -565,11 +571,12 @@ DUMPERS = {
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--pin", default="/home/mudler/_git/vllm")
+    ap.add_argument("--pin", default=None,
+                    help="pinned vLLM checkout; defaults to ${VLLM_SOURCE}")
     ap.add_argument("--only", nargs="*", default=None)
     args = ap.parse_args()
     assert torch.cuda.is_available(), "pinned Triton oracles need the GPU"
-    ops = load_pinned(pathlib.Path(args.pin).expanduser())
+    ops = load_pinned(resolve_pinned_source(args.pin, "--pin"))
     dev = "cuda"
     root = pathlib.Path(args.out)
     grand = 0

@@ -23,6 +23,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"           // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"    // HostLogits (W3)
 #include "vllm/model_executor/models/qwen3_moe.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type).is_cuda()
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
@@ -86,6 +87,18 @@ ForwardLogits ForwardQwen3MoeForCausalLM(LoadedModel& model,
                                          const ModelForwardInput& input) {
   auto& qwen = ModelAs<Qwen3MoeLoadedModel>(model, "Qwen3MoeForCausalLM");
   const Qwen3MoeWeights& weights = qwen.weights();
+  // #1305 — PUBLISH the async runner's device-resident input ids for the duration
+  // of THIS forward. On the asynchronous serving path the runner's combine
+  // splices each decode row's sampled token into the DEVICE identifiers on the
+  // main queue and leaves the host `token_ids` deliberately stale
+  // (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm). Before this line, every
+  // arm below — the decode graph AND both eager arms — embedded that stale host
+  // vector and never looked at `input.device_token_ids` at all, so every row past
+  // the first generated from the previous step's identifiers. RAII-scoped so it
+  // cannot outlive the call, and null on every non-async-CUDA path, which makes
+  // this byte-identical when the mirror is off.
+  const detail::DeviceTokenIdsScope device_ids_scope(
+      input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
 
   // DECODE CUDA-GRAPH path (W7): route a PURE-DECODE CUDA step through the
   // model's graph driver, which pads the batch up to the nearest captured size

@@ -1,8 +1,14 @@
 // The CUDA attention-backend priority TABLE — a faithful, complete port of
-// vllm/platforms/cuda.py:84-176 `_get_backend_priorities` @ pin e24d1b24 (BOTH
-// the MLA branch `:93-142` and the non-MLA branch `:143-166`), plus
-// vllm/v1/attention/backends/mla/prefill/selector.py:47-76
+// vllm/platforms/cuda.py:83-163 `_get_backend_priorities` @ pin 5559679229 (BOTH
+// the MLA branch `:93-143` and the non-MLA branch `:144-163`), plus
+// vllm/v1/attention/backends/mla/prefill/selector.py:48-77
 // `_get_mla_prefill_backend_priorities`.
+//
+// Re-anchored from `cuda.py:84-176 @ e24d1b24`, the pin retired at W5. The MLA
+// rows, the sm_12x two-entry row and the MLA-prefill lists are unchanged in
+// CONTENT at the new pin and were re-read line by line to confirm it. The
+// non-MLA sm_100 row was NOT: it gained a `use_non_causal` guard, which is
+// issue #1333 and is ported below.
 //
 // It lives in a HEADER, not inside the CUDA-only cuda.cpp TU, for two reasons:
 //   * it is pure DATA + a lookup — no CUDA, no device — so the CPU test tier can
@@ -41,6 +47,11 @@ struct AttnPriorityRow {
   int major;  // exact compute-capability major, or kAnyMajor for upstream `else`
   std::vector<const char*> backends;
   SparseTailOrder sparse_tail;
+  // cuda.py:148 `and not use_non_causal` — issue #1333. When true, this row
+  // matches only a CAUSAL request and a non-causal one falls through to the
+  // `else` row. Exactly one upstream arm carries the guard, so it is a per-row
+  // field rather than a second key.
+  bool causal_only = false;
 };
 
 // Upstream names are the AttentionBackendEnum MEMBER names
@@ -70,12 +81,17 @@ inline const std::vector<AttnPriorityRow>& AttnPriorityTable() {
        {"FLASH_ATTN_MLA", "FLASHMLA", "FLASHINFER_MLA", "TRITON_MLA",
         "FLASH_ATTN_MLA_SPARSE", "FLASHMLA_SPARSE"},
        SparseTailOrder::kFixed},
-      // ── non-MLA (unchanged behavior; previously an inline if-chain) ────────
-      // cuda.py:144-152 — sm_100.
+      // ── non-MLA ───────────────────────────────────────────────────────────
+      // cuda.py:145-155 — sm_100, CAUSAL only. The guard is upstream's, and its
+      // reason is upstream's comment at `:145-147`: SM100f defaults to FlashInfer
+      // for TRTLLM causal attention, but its non-causal cutlass path — the one
+      // DFlash attention uses — is known to have problems, so FlashAttention is
+      // preferred when non-causal on SM100f. Issue #1333.
       {false, 10,
        {"FLASHINFER", "FLASH_ATTN", "TRITON_ATTN", "FLEX_ATTENTION", "TURBOQUANT"},
-       SparseTailOrder::kFixed},
-      // cuda.py:153-166 — everything else, INCLUDING GB10 sm_121 (major 12).
+       SparseTailOrder::kFixed, /*causal_only=*/true},
+      // cuda.py:156-163 — everything else, INCLUDING GB10 sm_121 (major 12), and
+      // INCLUDING sm_100 for a non-causal request.
       {false, kAnyMajor,
        {"FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "FLEX_ATTENTION", "TURBOQUANT"},
        SparseTailOrder::kFixed},
@@ -89,6 +105,9 @@ inline std::vector<std::string> LookupAttnPriority(int major,
   const AttnPriorityRow* fallback = nullptr;
   for (const AttnPriorityRow& row : AttnPriorityTable()) {
     if (row.use_mla != cfg.use_mla) continue;
+    // cuda.py:148 — a causal-only row does not match a non-causal request, so
+    // the walk continues to the `else` row (#1333).
+    if (row.causal_only && cfg.use_non_causal) continue;
     if (row.major == major) {
       match = &row;
       break;

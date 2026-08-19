@@ -1,7 +1,9 @@
 // Ported from: vllm/v1/attention/backends/registry.py + vllm/platforms/cuda.py
-// :361-470 (get_valid_backends / get_attn_backend_cls) @ pin e24d1b24 — the
-// attention-backend registry storage + platform-priority selection. See
-// registry.h for the design; this file is the registry table and the selector.
+// :359-394 (get_valid_backends) and :397-492 (get_attn_backend_cls) @ pin
+// 5559679229 — the attention-backend registry storage + platform-priority
+// selection. (Re-anchored from `:361-470 @ e24d1b24`, the pin retired at W5.)
+// See registry.h for the design; this file is the registry table and the
+// selector.
 #include "vllm/v1/attention/registry.h"
 
 #include <array>
@@ -55,15 +57,32 @@ std::unique_ptr<AttentionBackend> MakeAttentionBackend(vt::DeviceType device,
 
 namespace {
 
-// The capability half of vllm/v1/attention/backend.py:307-360
-// validate_configuration: a candidate must agree with the request on is_mla()
-// and is_sparse(). Backends are stateless descriptors, so constructing one to
-// ask is cheap and mirrors upstream querying the CLASS. This is the ONLY place
-// sparse/DSA needs to be understood — see registry.h "the DSA seam".
-bool CandidateMatchesConfig(vt::DeviceType device, const std::string& name,
-                            const platforms::AttnSelectorConfig& cfg) {
+// vllm/v1/attention/backend.py:319-393 `validate_configuration`, asked of one
+// candidate. Backends are stateless descriptors, so constructing one to ask is
+// cheap and mirrors upstream querying the CLASS. Returns upstream's list of
+// reasons; EMPTY means the candidate is valid for this request.
+//
+// Before #1332 M1 this asked two questions inline (is_mla / is_sparse). Those
+// two are still asked, by validate_configuration, in upstream's order and with
+// upstream's reason strings — the sparse/DSA seam registry.h describes is
+// unchanged, it just no longer has its own private copy of the rule.
+std::vector<std::string> CandidateInvalidReasons(
+    vt::DeviceType device, const std::string& name,
+    const platforms::Platform& platform,
+    const platforms::AttnSelectorConfig& cfg) {
   const std::unique_ptr<AttentionBackend> backend = MakeAttentionBackend(device, name);
-  return backend->is_mla() == cfg.use_mla && backend->is_sparse() == cfg.use_sparse;
+  return backend->validate_configuration(cfg, platform.get_device_capability());
+}
+
+// `[reason, reason, ...]`, upstream's own rendering (cuda.py:433-438).
+std::string JoinReasons(const std::vector<std::string>& reasons) {
+  std::string out = "[";
+  for (size_t i = 0; i < reasons.size(); ++i) {
+    if (i != 0) out += ", ";
+    out += reasons[i];
+  }
+  out += "]";
+  return out;
 }
 
 }  // namespace
@@ -84,12 +103,13 @@ std::string SelectAttentionBackendName(const platforms::Platform& platform,
           "' is not registered for device type " +
           std::to_string(static_cast<int>(device)));
     }
-    if (!CandidateMatchesConfig(device, selected, cfg)) {
+    const std::vector<std::string> reasons =
+        CandidateInvalidReasons(device, selected, platform, cfg);
+    if (!reasons.empty()) {
+      // cuda.py:416-420 — the error names every reason, not the first.
       throw std::invalid_argument(
-          std::string("selected attention backend '") + selected +
-          "' does not satisfy the request (use_mla=" +
-          (cfg.use_mla ? "true" : "false") +
-          ", use_sparse=" + (cfg.use_sparse ? "true" : "false") + ")");
+          std::string("Selected backend ") + selected +
+          " is not valid for this configuration. Reason: " + JoinReasons(reasons));
     }
     return selected;
   }
@@ -99,17 +119,24 @@ std::string SelectAttentionBackendName(const platforms::Platform& platform,
   // backend). An unregistered name is skipped exactly as an ImportError-ing
   // backend is in get_valid_backends; a registered-but-mismatched one is skipped
   // exactly as validate_configuration's "invalid reasons" reject it.
+  std::string all_invalid_reasons;
   for (const std::string& name : platform.get_attn_backend_priority(cfg)) {
     if (!HasAttentionBackend(device, name)) continue;
-    if (!CandidateMatchesConfig(device, name, cfg)) continue;
-    return name;
+    const std::vector<std::string> reasons =
+        CandidateInvalidReasons(device, name, platform, cfg);
+    if (reasons.empty()) return name;
+    // cuda.py:387-388 — a rejected candidate is REMEMBERED with its reasons, so
+    // the exhaustion message can say why each one lost rather than only that
+    // none won.
+    if (!all_invalid_reasons.empty()) all_invalid_reasons += ", ";
+    all_invalid_reasons += name + ": " + JoinReasons(reasons);
   }
 
+  // cuda.py:440-446.
   throw std::runtime_error(
-      std::string("no valid attention backend registered for device type ") +
-      std::to_string(static_cast<int>(device)) +
-      " (priority list yielded no registered backend; use_mla=" +
-      (cfg.use_mla ? "true" : "false") +
+      std::string("No valid attention backend for device type ") +
+      std::to_string(static_cast<int>(device)) + " from {" + all_invalid_reasons +
+      "} (use_mla=" + (cfg.use_mla ? "true" : "false") +
       ", use_sparse=" + (cfg.use_sparse ? "true" : "false") + ")");
 }
 

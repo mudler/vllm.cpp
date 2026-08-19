@@ -734,6 +734,37 @@ block-wise FP8 scale tensor the checkpoint had never contained
 ([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
 the wrong side costs more than the failure does.
 
+### A refusal that names the attention backend, and what it cannot tell you
+
+Starting an engine resolves an attention backend for each KV-cache group, and
+that backend is now asked whether it can serve the request before it is chosen.
+When none of the backends this build registers can, the engine refuses at
+initialization rather than later, and the message names every candidate with
+every reason it lost:
+
+```text
+No valid attention backend for device type 1 from
+{FLASH_ATTN: [head_size not supported, block_size not supported]}
+(use_mla=false, use_sparse=false)
+```
+
+The reason strings are vLLM's own, so a refusal here and a refusal from the
+reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
+come from the geometry the engine has just resolved for your checkpoint, so a
+refusal is about that checkpoint on this build.
+
+**What this check cannot tell you.** It reports what a backend *claims*, never
+what your binary contains and never whether the kernel will launch. A backend
+whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
+when the build carries no compiled code for that GPU — which is a real failure
+mode, not a hypothetical one, and it surfaces as a launch error rather than as
+this refusal. Confirming which architectures a build actually targets is a
+separate question, answered under "Confirming which CUDA architecture a build
+targets" above. Tracked as
+[#1332](https://github.com/mudler/vllm.cpp/issues/1332).
+
+Selecting a backend by name is not exposed yet; the engine always resolves one.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are

@@ -41,7 +41,7 @@ own it already exist.** No new roadmap row is opened.
 
 1. **The selector still routes nothing.** `SelectAttentionBackendName`'s result
    reaches exactly three places in
-   `src/vllm/v1/worker/gpu/runner.cpp::GpuModelRunner::InitializeKvCache`:
+   `src/vllm/v1/worker/gpu/runner.cpp::GPUModelRunner::initialize_kv_cache`:
    `attn_backend_names_` (`:1002`), the `VT_ATTN_SELECT_LOG` debug print
    (`:1003-1024`), and `vllm::v1::CheckKvCacheShape` (`:1025-1029`).
    `dense_attn::AttnBlock` calls `vt::PagedAttention` unconditionally
@@ -66,7 +66,7 @@ own it already exist.** No new roadmap row is opened.
 3. **`AttnSelectorConfig::dtype` is not supplied by the runner.** The production
    call site fills `head_size`, `block_size` and `kv_cache_dtype` from the
    resolved per-layer KV geometry, but the model/query dtype is not available at
-   `InitializeKvCache` (the runner resolves only `ResolveKvCacheDType()` there),
+   `initialize_kv_cache` (the runner resolves only `ResolveKvCacheDType()` there),
    so `dtype` keeps its `kBF16` default in production and the `supports_dtype`
    predicate is exercised by tests alone. **Owner: #1332 M4.**
 4. **The non-MLA sm_100 priority arm gained a `use_non_causal` guard upstream**
@@ -194,6 +194,61 @@ behavior-preserving control for the existing production call sites.
 `scripts/agent-preflight.sh --fail-on-skip`, plus the focused
 `test_attn_validate_configuration` and `test_attn_backend_registry` cases. No GPU:
 every predicate is host code and the capability is injected.
+
+## Evidence
+
+CPU Debug build, `-DVLLM_CPP_CUDA=OFF`. Every run below is a direct binary
+invocation, never through a pipe, so the reported status is the binary's.
+
+**RED before.** `tests/vllm/v1/attention/test_attn_validate_configuration.cpp`
+written first against the config fields alone, with no predicate implemented:
+
+```
+[doctest] test cases: 12 |  2 passed | 10 failed | 0 skipped
+[doctest] assertions: 22 | 10 passed | 12 failed |
+[doctest] Status: FAILURE!            (exit 1)
+```
+
+The two that passed are the behavior control (`FLASH_ATTN` still selected) and
+the case asserting the sm_100 CAUSAL ordering, which was already correct — the
+non-causal half of that same case is one of the ten reds.
+
+**GREEN after**, with the predicate-level cases added:
+
+| Binary | cases | assertions | status |
+|---|---:|---:|---|
+| `test_attn_validate_configuration` | 21 | 76 | SUCCESS |
+| `test_attn_backend_registry` | 17 | 62 | SUCCESS |
+| `test_runner` | 19 | 543 | SUCCESS |
+
+**Mutations.** Each applied to the worktree, built, run, then restored from a
+`tar` snapshot taken before the pass — not `git checkout`, which reads the index
+and would have destroyed the untracked new test file. `git diff --stat` was
+printed before and after each one and the line counts returned to their
+pre-mutation values, and `compile_rc` was printed for each, because a mutation
+that fails to build and a mutation that never applied both read as a pass.
+
+| # | Mutation | `compile_rc` | Result |
+|---|---|---:|---|
+| M1 | `CandidateInvalidReasons` returns `{}` — the selector stops asking | 0 | RED: `validate_configuration` 12/21, `registry` 15/17 |
+| M2 | drop the `capability.present()` precondition | 0 | RED: both files, 1 case each |
+| M3 | `supports_block_size` compares equality instead of a multiple | 0 | RED: 4 cases |
+| M4 | remove the #1333 causal-only guard | 0 | RED: 1 case |
+| M5 | **reachability**: the production geometry stops flowing into the config (`cfg.head_size = 17`) | 0 | RED: `test_runner` **19/19 cases fail** |
+| M6 | **reachability**: delete the production config fill entirely | 0 | GREEN: `test_runner` 543/543 |
+
+**M5 is the reachability proof.** Corrupting one field of the config that
+`GPUModelRunner::initialize_kv_cache` builds fails every one of the 19
+`test_runner` cases, because the refusal propagates out of the runner's own
+initialization. The capability layer is therefore reached from a production
+entry point with production data, not only from its own unit test.
+
+**M6 is the honest negative, and it is recorded rather than explained away.**
+Deleting the fill leaves `test_runner` green, because the defaults still
+validate. The layer is reached and executed; no test's failure depends on the
+fill being PRESENT, only on its being CORRECT. That is the expected shape while
+the selected name still dispatches nothing (`## Owed` item 1), and it is the
+second reason this change must not be read as fixing selection.
 
 ## Stop conditions
 

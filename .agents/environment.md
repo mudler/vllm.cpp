@@ -190,8 +190,12 @@ rather than discovering it after the GPU time is spent.
 `ssh` and no container image, and it served three clean benchmark legs. That
 retires the "nobody has run a model that way" reading of
 [#1185](https://github.com/mudler/vllm.cpp/issues/1185) recorded above. What is
-still unreachable is the image-based path SGLang needs
-([#1265](https://github.com/mudler/vllm.cpp/issues/1265)).
+still unreachable is the image-based path SGLang used
+([#1265](https://github.com/mudler/vllm.cpp/issues/1265)). A wheel route around
+it is specified by row `SGLANG-ORACLE-LEASE-WHEEL` in
+[`sglang-wheel-in-lease.md`](specs/sglang-wheel-in-lease.md), which needs no
+source build and no image. That route is specified and NOT run, so the SGLang
+oracle stays `gateable = no`.
 
 **And one instrument rule, paid for in the same series.** A guard whose
 threshold sits inside the guarded configuration's own operating point

@@ -1517,15 +1517,24 @@ region by construction, and that driver is the production caller. Gated as a
 counter and an ORDER out of one backend trace, with two mutations proving neither
 the rule nor its control arm is vacuous.
 
-**#1305 IS FIXED, and reading the tree made it a bigger defect than the issue
-described.** The three registrations it names never published
+**#1305's EAGER HALF IS FIXED AND GATED; its GRAPH half is not settled, and the
+issue stays OPEN.** Reading the tree made it a bigger defect than the issue
+described: the three registrations it names never published
 `detail::DeviceTokenIdsScope` and neither model's `EmbedInto` ever consulted one,
 so `device_token_ids` reached nothing in either translation unit — the eager arms
 as well as the decode graph. Both now consume it, and each decode-graph slot
 holds a `vllm::StepTokenIds` on `vt::PersistentStepInput`, which is
-`RefreshFromDevice`'s first production caller. What is NOT closed is the depth-2
-battery on a device; `## Owed` carries it, and `qwen3.cpp`'s decline is
-untouched.
+`RefreshFromDevice`'s first production caller. Gated at six cases and 191
+assertions across both lanes of all three registrations, after a fresh review
+proved by mutation that the first gate saw neither the eager arms nor the third
+registry.
+
+The graph half does not close on that. The mechanism these drivers now have is
+functionally what `qwen3.cpp` already had at `338cbbfd1^`, and W4 measured the
+depth-2 graph-ON battery FAILING with it in place; a stable device address buys
+nothing while the embed stays outside the capture. #1305's settlement condition
+is that battery, it did not run, `## Owed` carries it together with the untested
+device half of the refresh contract, and `qwen3.cpp`'s decline is untouched.
 
 **W4 corrected a premise this spec had asserted three times.** The decode graph
 carries NO token ids to the device in any driver, `StepDevInputs` included, so
@@ -1850,8 +1859,8 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   and find out whether they degenerate at depth 2 at all. Owner: row
   **`ENG-CUDAGRAPH-BREAK`**, the stage that gets that window.
 
-  **RESOLVED, AND NOT THE WAY EITHER W3 OR W4 EXPECTED, because reading the tree
-  found a LARGER defect than the one #1305 describes and a fix that needs no
+  **HALF RESOLVED, AND NOT THE WAY EITHER W3 OR W4 EXPECTED, because reading the
+  tree found a LARGER defect than the one #1305 describes and a fix that needs no
   decline at all.** #1305 reads as a graph-arm hazard. It is not: those three
   registrations never constructed a `detail::DeviceTokenIdsScope` and neither
   `qwen3_moe.cpp`'s nor `deepseek_v2.cpp`'s `EmbedInto` ever consulted one, so
@@ -1873,25 +1882,79 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   of a fifth private copy.
 
   Gated at `tests/vllm/models/test_moe_async_device_ids.cpp`, entered at
-  `ModelRegistry::Forward` over a synthetic safetensors checkpoint for both
-  architectures: three runs each — right host ids and no mirror as the reference,
-  stale host ids and no mirror as the CONTROL that must differ, stale host ids
-  with the truth reaching the model only through `device_token_ids` as the gate.
-  RED before the fix at 2 cases / 65 assertions / 10 failed / exit 1, with 800 of
-  800 logit values differing over four steps on BOTH architectures; GREEN after at
-  65/65, exit 0. Two mutations, each compiled clean and each restored by sha256:
-  deleting the registry's scope line — the production call site — reds 4
-  assertions and puts all 800 values back, and swapping the seam's DEVICE arm for
-  its HOST arm leaves the logits BIT IDENTICAL at 0 of 800 differing and reds only
-  `device_refreshes` and `host_refreshes`, which is the arm no token gate can
-  see.
+  `ModelRegistry::Forward` over a synthetic safetensors checkpoint: three runs per
+  case — right host ids and no mirror as the reference, stale host ids and no
+  mirror as the CONTROL that must differ, stale host ids with the truth reaching
+  the model only through `device_token_ids` as the gate. RED before the fix at 2
+  cases / 65 assertions / 10 failed / exit 1, with 800 of 800 logit values
+  differing over four steps on BOTH architectures; GREEN after at 65/65, exit 0.
 
-  **WHAT IS STILL OWED, narrowed rather than closed.** The depth-2
-  four-concurrent battery against these two models on a real device has NOT been
-  run: it needs a GPU and a real checkpoint, and this stage had neither. So the
-  fix is proven to embed the mirror's identifiers and is NOT proven to close the
-  degeneration `qwen3.cpp`'s decline was measured against — whose own cause W4
-  established is unidentified. `qwen3.cpp`'s decline therefore STANDS, untouched.
+  **THE GATE THAT LANDED COVERED HALF OF WHAT THE CHANGE CLAIMS, and a fresh
+  review proved it by mutation rather than by reading.** Two gaps, each shown with
+  a mutation that compiled and ran. Deleting the `TakeDeviceTokenIds` +
+  `d.b.Copy` block from BOTH `EmbedInto(const std::vector<int32_t>&)` overloads —
+  restoring the pre-fix EAGER behaviour, which is the half this entry calls its
+  most important finding — left the gate green at 2/2 cases and 65/65 assertions.
+  Deleting the two-line `DeviceTokenIdsScope` from
+  `glm4_moe_lite_registry.cpp`, the THIRD of the three registrations this entry
+  says publish a scope, did too; the landing change's own reachability mutation
+  had covered only two.
+
+  Repaired to SIX cases / 191 assertions / exit 0, both lanes for all three
+  registrations, routed through one A/B/C helper. The lane is chosen by the
+  registry's OWN predicate rather than by the test: a case that constructs
+  `StaticGraphCpu` gets the decode graph, a case that does not gets
+  `ForwardDevice`, and `through_seam` asserts the `vt::PersistentStepInput`
+  counters BOTH ways — moving on the graph lane, at zero on the eager one — so a
+  case cannot drift onto the other lane and stay green. GLM-4-MoE-Lite gets its
+  own fixture rather than a claim of coverage: it shares the driver, the model and
+  the weights struct with DeepSeek-V2, so the only thing it owns is its scope.
+
+  Three detecting mutations, each compiled clean (`compile_rc=0`) and each
+  restored:
+
+  | mutation | exit | cases | what reds |
+  |---|---|---|---|
+  | delete both `EmbedInto` override consumers | 1 | 3 of 6 pass | the 3 EAGER cases, on `differing == 0` |
+  | delete `glm4_moe_lite_registry.cpp`'s scope | 1 | 4 of 6 pass | the 2 GLM cases only |
+  | delete `StepTokenIds::Refresh`'s `RefreshFromDevice` | 1 | 3 of 6 pass | the 3 GRAPH cases, on `device_refreshes` AND `differing == 0` |
+
+  A FOURTH mutation deleted the shared copy outright and FAILED TO BUILD under
+  `-Wunused-parameter`; its verdict was discarded rather than read as a pass,
+  which is the failure mode a mutation harness has to print `compile_rc` to avoid.
+
+  **WHAT IS STILL OWED, narrowed rather than closed, and why #1305 does NOT close
+  here.** The issue SPLITS. The EAGER half is fixed and gated on all three
+  registrations and deserves to close. The GRAPH half does not, and the reason is
+  sharper than "the battery did not run": the mechanism these two drivers now have
+  is functionally what `qwen3.cpp` ALREADY HAD at `338cbbfd1^` — a registry scope,
+  consumed by `EmbedInto`, copying the mirror's identifiers over the embed source
+  OUTSIDE the capture — and W4 recorded at `qwen3.cpp:1083-1095` that the depth-2
+  graph-ON battery STILL FAILED with exactly that in place. A stable device
+  address buys nothing while the embed stays outside the capture, which the change
+  itself concedes. So landing it is not evidence that the graph-arm degeneration
+  is gone.
+
+  The depth-2 four-concurrent battery against Qwen3-Coder and DeepSeek-V2-Lite on
+  a real device — #1305's own settlement condition — has NOT been run: it needs a
+  GPU and a real checkpoint, and this stage had neither. The fix is proven to
+  embed the mirror's identifiers and is NOT proven to close the degeneration
+  `qwen3.cpp`'s decline was measured against, whose own cause W4 established is
+  unidentified. **#1305 therefore stays OPEN**, the pull request references it
+  without a closing keyword, and `qwen3.cpp`'s decline STANDS, untouched.
+
+  **AND THE DEVICE HALF OF THE CONTRACT IS UNTESTED ON ANY DEVICE.** On the CPU
+  backend `vt::Backend::Alloc` returns HOST-addressable memory, so the mirror's
+  buffer and the host vector are the same kind of pointer and both refresh arms
+  reduce to the same memcpy from the same address. Swapping
+  `PersistentStepInput::RefreshFromDevice` for `RefreshFromHost` leaves every
+  logit bit-identical — 0 of 800 differing — and reds only the
+  `device_refreshes`/`host_refreshes` counters. Those counters are a legitimate
+  stand-in for WHICH ARM RAN and they are what the file asserts, but they gate the
+  INSTRUMENT, not the behaviour. The two behavioural guarantees — that the copy
+  reads DEVICE memory, and that it is main-queue-ordered AFTER the runner's
+  combine — have no gate on any device. Owed with the battery, same window, same
+  owner.
   The reason this stage did not run it, stated as a fleet state rather than as an
   intention: at 2026-08-19, `rc devices` read `dgx:gpu0 busy` — the only box whose
   HuggingFace cache carries Qwen3-Coder-30B-A3B — while `thor:gpu0` and

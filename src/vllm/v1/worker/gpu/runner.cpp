@@ -1505,19 +1505,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // `q - 1` drafts, read off the scheduler's own per-request draft counts. That
   // is narrower than the shape test, never wider, and it is what makes
   // `uniform_query_len > 1` mean what its comment says it means.
-  const std::optional<int64_t> uniform_qlen = [&]() -> std::optional<int64_t> {
-    if (gdn_meta.num_prefill_tokens != 0) return std::nullopt;
-    const std::optional<int64_t> q = v1::ActualUniformDecodeQueryLen(
-        num_reqs, attn_meta.num_actual_tokens, attn_meta.max_query_len,
-        num_spec());
-    if (!q.has_value() || *q == 1) return q;
-    const std::vector<int32_t>& per_req = step.num_draft_tokens_per_req;
-    if (static_cast<int>(per_req.size()) != num_reqs) return std::nullopt;
-    for (const int32_t drafts : per_req) {
-      if (static_cast<int64_t>(drafts) + 1 != *q) return std::nullopt;
-    }
-    return q;
-  }();
+  const std::optional<int64_t> uniform_qlen =
+      gdn_meta.num_prefill_tokens == 0
+          ? v1::GraphEligibleQueryLen(num_reqs, attn_meta.num_actual_tokens,
+                                      attn_meta.max_query_len, num_spec(),
+                                      step.num_draft_tokens_per_req)
+          : std::nullopt;
   // #1020 is titled on the word SILENTLY. A step that finds no captured shape
   // now moves a counter, on the shared path every registered model reaches.
   v1::NoteGraphDispatch(uniform_qlen.value_or(0),

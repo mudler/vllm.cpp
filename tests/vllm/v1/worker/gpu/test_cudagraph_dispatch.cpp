@@ -164,3 +164,44 @@ TEST_CASE("W6: the dispatch counters separate the clamped population") {
   CHECK(z.capture_shapes == 0);
   CHECK(z.qlen_cap_declines == 0);
 }
+
+// THE VERIFY CONJUNCT, gated on the function because no engine in this tree can
+// reach it. Both models that read `uniform_query_len` are GDN hybrids, so their
+// prefill steps carry `gdn_meta.num_prefill_tokens > 0` and the runner's FIRST
+// conjunct refuses them before this one is consulted. Measured, not assumed:
+// deleting the per-request test left `test_mtp_depth` GREEN at 104/104. It is
+// defence in depth for the next model that reads the field, and the spec's
+// `## Owed` says so -- so it is gated HERE, where a mutation can move it.
+TEST_CASE("W6: a batch uniform by arithmetic is not automatically a verify") {
+  const std::vector<int32_t> kNoDrafts;
+
+  // THE PREFILL. One request, three tokens, k=3. Uniform at 3 and inside the
+  // bound, so the shape half admits it; no request is verifying, so the step
+  // half does not.
+  CHECK(ActualUniformDecodeQueryLen(1, 3, 3, /*num_spec=*/3) == 3);
+  CHECK_FALSE(
+      GraphEligibleQueryLen(1, 3, 3, /*num_spec=*/3, kNoDrafts).has_value());
+
+  // A REAL VERIFY at the same shape: one request carrying two drafts.
+  CHECK(GraphEligibleQueryLen(1, 3, 3, /*num_spec=*/3, {2}) == 3);
+  // ... and at full depth.
+  CHECK(GraphEligibleQueryLen(2, 8, 4, /*num_spec=*/3, {3, 3}) == 4);
+
+  // A MIXED step whose arithmetic happens to be uniform: both requests carry
+  // three tokens, but only one of them is verifying at two drafts. Admitting it
+  // would capture a shape half the batch does not have.
+  CHECK_FALSE(GraphEligibleQueryLen(2, 6, 3, /*num_spec=*/3, {2, 0}).has_value());
+  CHECK_FALSE(GraphEligibleQueryLen(2, 6, 3, /*num_spec=*/3, {1, 2}).has_value());
+  // A count array that does not cover the batch says nothing about it.
+  CHECK_FALSE(GraphEligibleQueryLen(2, 6, 3, /*num_spec=*/3, {2}).has_value());
+
+  // QUERY LENGTH 1 NEVER CONSULTS THE DRAFT COUNTS, because that arm is
+  // `pure_decode` and every driver already serves it. A step with no recorded
+  // drafts still reports 1.
+  CHECK(GraphEligibleQueryLen(4, 4, 1, /*num_spec=*/3, kNoDrafts) == 1);
+  CHECK(GraphEligibleQueryLen(4, 4, 1, /*num_spec=*/0, kNoDrafts) == 1);
+
+  // And the refusals the shape half already owns survive composition.
+  CHECK_FALSE(GraphEligibleQueryLen(2, 5, 3, 3, {2, 2}).has_value());  // ragged
+  CHECK_FALSE(GraphEligibleQueryLen(1, 9, 9, 3, {8}).has_value());     // over 1+k
+}

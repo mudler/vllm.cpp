@@ -738,15 +738,22 @@ TEST_CASE("W6: a spec-OFF engine admits query length 1 and nothing else") {
   CHECK(st.capture_shapes == 0);
 }
 
-// THE CONTROL FOR THE CONJUNCT ABOVE, and the case that makes it non-vacuous.
+// A MULTI-TOKEN PREFILL ON A SPECULATING ENGINE. "hello world" is two tokens in
+// this fixture's BPE, so at k=3 the prefill step is uniform at query length 2 by
+// arithmetic, inside the `1 + k` bound, and strictly below the configured 4 --
+// the shape a bare uniformity test would put in the CLAMPED bucket and hand to a
+// decode capture.
 //
-// The spec-OFF case cannot see a missing conjunct, because `num_spec()` is 0
-// there and the `q <= 1 + k` bound alone refuses everything above 1. The failure
-// it has to catch is a PREFILL on a SPECULATING engine: "hello world" is two
-// tokens in this fixture's BPE, so at k=3 the prefill step is uniform at query
-// length 2, is inside the bound, and is strictly below the configured 4 -- it
-// would land in the CLAMPED bucket and be handed to a decode capture, which
-// `BuildPaddedDecode` would then rewrite as two single-token requests.
+// WHICH CONJUNCT ACTUALLY REFUSES IT HERE, because the two are easy to confuse
+// and only measurement separates them. On this GDN hybrid it is the FIRST one:
+// the model has linear-attention layers, so `gdn_group_id_ >= 0` and a prefill
+// step carries `gdn_meta.num_prefill_tokens > 0`. The per-request draft conjunct
+// inside `GraphEligibleQueryLen` is therefore REDUNDANT on every model that
+// reads `uniform_query_len` today, and a mutation deleting it left this suite
+// GREEN at 104/104 -- which is why that conjunct is gated in
+// `test_cudagraph_dispatch.cpp` on the function itself, and why the spec records
+// it as defence in depth for the next model rather than as something measured
+// here. Recorded rather than claimed away.
 //
 // One request generating ONE token is one step, and that step is the prefill.
 // So every speculative bucket must be empty and the step must be reported as

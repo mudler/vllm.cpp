@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace vllm {
 namespace v1 {
@@ -133,6 +134,44 @@ inline std::optional<int64_t> ActualUniformDecodeQueryLen(
   if (!uniform.has_value()) return std::nullopt;
   if (*uniform > UniformDecodeQueryLen(num_speculative_tokens)) return std::nullopt;
   return uniform;
+}
+
+// THE STEP'S GRAPH-ELIGIBLE QUERY LENGTH: the shape test above, plus the
+// conjunct that keeps a batch which is uniform by ARITHMETIC but is not a
+// speculative VERIFY out of a decode capture. This is the function the runner
+// calls; `ActualUniformDecodeQueryLen` is its shape half.
+//
+// WHY THE SHAPE IS NOT ENOUGH, MEASURED RATHER THAN REASONED. A single request
+// prefilling three tokens is uniform at query length 3 by every arithmetic test
+// vLLM applies, and at k >= 2 it sits inside the `1 + k` bound. Admitting it
+// hands a prefill to a driver whose `BuildPaddedDecode` rewrites the metadata as
+// S single-token requests, which is not what a multi-token-per-request batch is.
+// On this tree's CPU spec fixture the bare shape test reported 27 "uniform spec"
+// steps out of 28 on a 29-token run before this conjunct existed.
+//
+// So a length above 1 is admitted only when EVERY request in the step is
+// verifying at exactly `q - 1` drafts, read off the scheduler's own per-request
+// draft counts (`ExecuteModelStep::num_draft_tokens_per_req`). That is strictly
+// narrower than the shape test and never wider, which is the polarity
+// `## Work breakdown` W6 requires: a predicate must not admit a step no driver
+// can serve.
+//
+// `drafts_per_req` is EMPTY on every step the scheduler recorded no drafts for,
+// and then nothing above 1 is admitted at all.
+inline std::optional<int64_t> GraphEligibleQueryLen(
+    int64_t num_reqs, int64_t num_tokens, int64_t max_query_len,
+    int64_t num_speculative_tokens,
+    const std::vector<int32_t>& drafts_per_req) {
+  const std::optional<int64_t> q = ActualUniformDecodeQueryLen(
+      num_reqs, num_tokens, max_query_len, num_speculative_tokens);
+  if (!q.has_value() || *q == 1) return q;
+  if (static_cast<int64_t>(drafts_per_req.size()) != num_reqs) {
+    return std::nullopt;
+  }
+  for (const int32_t drafts : drafts_per_req) {
+    if (static_cast<int64_t>(drafts) + 1 != *q) return std::nullopt;
+  }
+  return q;
 }
 
 // Dispatch observability. The sibling of `vt::GraphBreakStats`, and it exists

@@ -133,6 +133,12 @@ const ModelFactory kQwen3MoeFactory{
     .forward = &ForwardQwen3MoeForCausalLM,
     .make_kv_cache = &MakeQwen3MoeKVCache,
     .is_dense_model = false,
+    // ENG-EXPERT-STREAM-DEVICE W0d (#1124). This model composes the SAME
+    // `RunMoeBlock` the Qwen3.5 MoE forward does — `qwen3_moe.cpp` says so where
+    // it marks the step boundary, and that is why it holds an `EndStepGuard` at
+    // all — so its experts reach `KqExpertSlice` and the slot lane serves its
+    // `*_exps.weight` towers.
+    .streams_routed_experts = true,
 };
 
 }  // namespace

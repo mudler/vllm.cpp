@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/tensor.h"
 
 namespace vt {
 struct Queue;
@@ -19,6 +20,7 @@ namespace vllm {
 struct GdnStateCache;
 struct HfConfig;
 struct GdnLayerWeights;
+struct OwnedTensor;
 
 namespace v1 {
 struct GDNAttentionMetadata;
@@ -501,6 +503,30 @@ ExpertStreamStats ExpertStreamSnapshot();
 // reaches it), exposed so one process can compare the streamed and unstreamed
 // arms and prove they produce identical bytes.
 void ExpertStreamSetForceFallback(bool on);
+
+// ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). The expert-slice seam and the
+// weight-staging helper, callable from a gate.
+//
+// WHY THEY ARE EXPOSED, given that a unit test which constructs a type by hand
+// proves nothing about reachability. Reachability of `KqExpertSlice` itself is
+// NOT what these are for and is not what they claim: it is already gated through
+// the production forward by `test_expert_stream_wiring`, which asserts the lane
+// filled slots during `Qwen3_5Model::Forward`. What these two reach is the
+// PLATFORM BRANCH inside that seam, which only a weight-staging,
+// host-addressable device takes — a device this project owns exactly one of, and
+// which no CPU test tier can register a real one of. Without them the branch
+// that decides whether a 369.96 GiB checkpoint loads at all would be provable
+// only on `dgx:gpu0`, which is the untestable-device shape this row has been
+// bitten by before.
+//
+// `StageWeightForTest` is the same shape as `ExpertStreamSetForceFallback`
+// above: no production path calls it, and it exists so a gate can observe a
+// guarantee from inside a running process. Here the guarantee is the refusal
+// that fires when a streamed tower reaches device staging — a tripwire whose
+// whole value is that it never fires in production.
+vt::Tensor ExpertSliceForTest(vt::Queue& q, const OwnedTensor& w, int64_t N,
+                              int64_t K, int64_t row_off, int64_t expert);
+void StageWeightForTest(vt::Queue& q, const OwnedTensor& w);
 
 // End one decode step for the streamed-expert cache. The Qwen3.5 MoE forward
 // runs this from its own layer driver; a SECOND full-attention MoE model

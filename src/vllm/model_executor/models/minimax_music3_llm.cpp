@@ -463,7 +463,7 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   // shape, `(2, 2..8, 4096)` — so every weight sweep serves both branches.
   DepthDecoderCache cache;
   Music3DepthDeviceCache device_cache;
-  // THE PRODUCTION SELECTION (#1309, spec §17.5). Deleting this lambda's device
+  // THE PRODUCTION SELECTION (#1309, spec §19.5). Deleting this lambda's device
   // branch is the reachability mutation, and the composed-stage gate goes RED on
   // it — which is the leg #1131 records as missing for the DiT arm.
   const auto append = [&](const std::vector<float>& embeds) {

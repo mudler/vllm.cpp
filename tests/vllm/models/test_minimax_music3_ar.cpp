@@ -1175,7 +1175,7 @@ TEST_CASE("music3 ar: the COMPOSED depth stage is BIT-IDENTICAL to the schedule 
 }
 
 // ---------------------------------------------------------------------------
-// The DEVICE arm (#1309, spec §17)
+// The DEVICE arm (#1309, spec §19)
 // ---------------------------------------------------------------------------
 //
 // These run on a `vt::Queue` whose device is kCPU. That is not a compromise, it
@@ -1193,7 +1193,7 @@ TEST_CASE("music3 ar: the COMPOSED depth stage is BIT-IDENTICAL to the schedule 
 // What these cases do NOT reach is the CUDA kernels themselves, and that is said
 // rather than implied: the CUDA `AttentionCross` uses an online-softmax
 // recurrence where the CPU one uses three passes, and cuBLASLt splits K by an
-// algorithm no CPU provider has. Spec §17.6 owes that leg to `thor:gpu0`.
+// algorithm no CPU provider has. Spec §19.6 owes that leg to `thor:gpu0`.
 
 // The spacing of bf16 at `value`'s magnitude. bf16 keeps 8 significand bits
 // (1 implicit + 7 stored), so a value in [2^k, 2^(k+1)) has ULP 2^(k-7).
@@ -1276,7 +1276,7 @@ m3::DepthDecoderWeights DeviceArmWeights(const m3::DepthDecoderConfig& config, u
 // changing NOTHING BUT THE SEED: same distribution, same geometry, no defect, and
 // the shipped `mean <= 4.0` red on three of six equally valid draws. A tolerance
 // that a redraw of the reference weights can fail is measuring the draw, not the
-// arm. §17.4b carries the per-seed table and the arithmetic behind the bounds.
+// arm. §19.4b carries the per-seed table and the arithmetic behind the bounds.
 constexpr uint32_t kDeviceArmSeeds[] = {0x9E3779B9u, 0x2468ACE0u, 0x00000001u,
                                         0x13579BDFu, 0xDEADBEEFu, 0x51ED2701u};
 constexpr size_t kNumDeviceArmSeeds = sizeof(kDeviceArmSeeds) / sizeof(kDeviceArmSeeds[0]);
@@ -1359,7 +1359,7 @@ DeviceArmBand MeasureDeviceArmBand(const m3::DepthDecoderConfig& config, uint32_
 }
 
 // THE BOUNDS, placed from a MULTI-SEED measurement against a mutation battery
-// rather than from the deviation one draw happened to produce. §17.4b carries
+// rather than from the deviation one draw happened to produce. §19.4b carries
 // the whole table; the two things that decide the numbers are these.
 //
 // THE CORRECT ARM, over six seeds:
@@ -1413,7 +1413,7 @@ constexpr double kDeviceArmZeroAbsBound = 1.0e-2;
 
 TEST_CASE("music3 ar: the DEVICE depth decode tracks the host arm inside a bf16 band") {
   // NOT bitwise, and the spec says so BEFORE this code rather than after a
-  // surprise (§17.4). Three reasons, each sufficient alone: the host keeps a
+  // surprise (§19.4). Three reasons, each sufficient alone: the host keeps a
   // sequential `double` per output element where `vt::MatmulBT` accumulates in
   // f32; the reduction re-associates; and `vt::RmsNorm` keeps full f32 precision
   // across the weight multiply where our `RmsNorm` mirrors upstream's TWO
@@ -1425,7 +1425,7 @@ TEST_CASE("music3 ar: the DEVICE depth decode tracks the host arm inside a bf16 
   // would be vacuous at the top and impossible at the bottom.
   //
   // And it is asserted over SIX DRAWS, because the single-draw version of this
-  // case passed while a correct arm failed on three other seeds (§17.4b).
+  // case passed while a correct arm failed on three other seeds (§19.4b).
   const m3::DepthDecoderConfig config = DeviceArmConfig();
   double worst_over_seeds = 0.0;
   double worst_mean = 0.0;
@@ -1517,7 +1517,7 @@ TEST_CASE("music3 ar: the device depth arm is bf16 RESIDENT, on the weights AND 
   // the ULP band, the drawn codes and every case in this file GREEN while the
   // path moved twice the bytes. That is AGENTS.md's "a token gate cannot detect
   // a dtype that is too WIDE" landing on the very row whose thesis is a dtype,
-  // and it is §17.2a's finding about the HOST arm arriving inside the arm that
+  // and it is §19.2a's finding about the HOST arm arriving inside the arm that
   // exists to fix it.
   const m3::DepthDecoderConfig config = DeviceArmConfig();
   uint32_t state = 0x5EEDD7EEu;

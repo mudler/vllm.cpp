@@ -266,7 +266,7 @@ struct Music3ArResult {
   bool stopped_on_end_token = false;
 };
 
-// The depth decoder's DEVICE arm, selected per call (#1309, spec §17).
+// The depth decoder's DEVICE arm, selected per call (#1309, spec §19).
 //
 // Both fields or neither. One alone is a caller that thinks it asked for the
 // device arm and did not, so it is REFUSED rather than silently ignored — the
@@ -283,7 +283,7 @@ struct Music3DepthDeviceArm {
 
 // THE PRODUCTION SELECTION of that arm, as a function rather than as an `if` in
 // the engine (#1309, [#1131](https://github.com/mudler/vllm.cpp/issues/1131),
-// spec §17.5).
+// spec §19.5).
 //
 // WHY IT IS A FUNCTION. The engine's condition is `queue_.device.type != kCPU`,
 // and that condition is FALSE on every runner CI owns, so an `if` written there

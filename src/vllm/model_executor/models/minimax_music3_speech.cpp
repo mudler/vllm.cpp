@@ -580,8 +580,8 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
       // WHAT MOVES: the 8.6B `Qwen3ForCausalLM` half, through the shared
       // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride, AND —
       // since #1309 — the 0.65B RVQ depth decoder, which was 48.4 % of a run
-      // (spec §17.1). WHAT DOES NOT: the depth decoder's projection, audio
-      // heads and feedback embedding, ~1.6 % of that stage and owed by §17.7;
+      // (spec §19.1). WHAT DOES NOT: the depth decoder's projection, audio
+      // heads and feedback embedding, ~1.6 % of that stage and owed by §19.7;
       // and the whole acoustic half's host reference loops — see
       // minimax_music3_ar.h and vocoder1d.h for which pieces are owed and why.
       //

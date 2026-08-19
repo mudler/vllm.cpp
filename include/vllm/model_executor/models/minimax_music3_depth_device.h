@@ -1,4 +1,4 @@
-// MiniMax-Music3 — the DEVICE-RESIDENT RVQ depth decoder (#672, #1309, spec §17).
+// MiniMax-Music3 — the DEVICE-RESIDENT RVQ depth decoder (#672, #1309, spec §19).
 //
 // `DepthDecoderAppend` (minimax_music3_ar.cpp) is the portable reference: host
 // `std::vector<float>` throughout, one sequential `double` accumulator per
@@ -7,7 +7,7 @@
 //
 // ─── WHY THIS EXISTS ─────────────────────────────────────────────────────────
 //
-// Spec §17.1, measured on `thor:gpu0` at `678fc672c`: `ar.depth_forward` is
+// Spec §19.1, measured on `thor:gpu0` at `678fc672c`: `ar.depth_forward` is
 // 78.1 s of a 161 s run — 48.4 %, the largest single term. A 0.646B decoder
 // therefore costs 6.3x the 8.6B language model beside it, and the reason is
 // which processor each runs on. §16.4 measured the host kernel at ~4 bytes of
@@ -34,7 +34,7 @@
 //
 // ─── bf16 STORAGE, f32 ACCUMULATION — THE DECISION §14.5 LEFT OWED ───────────
 //
-// Spec §17.2. The oracle settles this by declaring NOTHING:
+// Spec §19.2. The oracle settles this by declaring NOTHING:
 // `MiniMaxMusic3RVQDepthDecoder` takes no `dtype` parameter and contains no
 // `torch.float32` literal and no `.float()` call
 // (minimax_music3_rvq_depth_decoder.py:101-125); its single cast is the
@@ -57,11 +57,11 @@
 // does the same to every activation the host arm hands across this boundary. So
 // every value staged or uploaded here is ALREADY exactly bf16-representable and
 // `vt::F32ToBF16` on it is exact. The host arm's f32 CONTAINERS are what move
-// twice the oracle's bytes (spec §17.2a); this arm's do not.
+// twice the oracle's bytes (spec §19.2a); this arm's do not.
 //
 // ─── NUMERICS: NOT BIT-IDENTICAL, AND SAID BEFORE THE CODE ───────────────────
 //
-// Spec §17.4. §16 could claim bitwise identity because a causal identity is
+// Spec §19.4. §16 could claim bitwise identity because a causal identity is
 // exact; this row changes the machine, and it does NOT claim it. Three
 // independent reasons, each sufficient alone:
 //
@@ -96,7 +96,7 @@
 //      RMSNorm, so `vt::RmsNorm` is correct against it. What differs is which
 //      reference each arm answers to. WHICH ONE IS RIGHT FOR THIS MODEL is a
 //      question the diffusers oracle settles through
-//      `test_minimax_music3_ar_real`, and §17.6 records that as owed.
+//      `test_minimax_music3_ar_real`, and §19.6 records that as owed.
 //
 // The gate is therefore a tolerance in bf16 ULPs of the reference value, and it
 // asserts its own teeth. A tolerance cannot see a DROPPED STAGE, so it is not
@@ -159,7 +159,7 @@ struct Music3DepthDeviceLayer {
 // `projection`, `audio_embeddings` and `audio_heads` are NOT here. They stay on
 // the host in this row, deliberately: §15's profile puts `ar.depth_projection`
 // at 1.307 s against the forward's 78.316 s, so they are ~1.6 % of the stage.
-// Spec §17.7 carries them as owed rather than leaving them to be discovered.
+// Spec §19.7 carries them as owed rather than leaving them to be discovered.
 struct Music3DepthDeviceWeights {
   vt::Tensor pos_embedding;  // [max_position_embeddings, H]
   vt::Tensor norm;           // [H]
@@ -230,7 +230,7 @@ uint64_t Music3DepthDeviceForwardCount();
 // gate cannot detect a dtype that is too WIDE" applies with full force to the
 // tolerance gate above, and a review proved it — widening one activation buffer
 // to `kF32` left the ULP band, the drawn codes and all 35 cases green while the
-// path moved twice the bytes. That is §17.2a's own finding about the HOST arm,
+// path moved twice the bytes. That is §19.2a's own finding about the HOST arm,
 // arriving inside the arm that exists to fix it.
 //
 // The mask is monotone and never reset, so a single widened buffer anywhere in

@@ -78,6 +78,8 @@
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight glue
 #include "vllm/model_executor/models/device_pool.h"
 #include "vllm/model_executor/models/mla_attention.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIds
+#include "vllm/model_executor/models/step_token_ids.h"   // #1305: the slot's device ids
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W3: the shared capture seam
@@ -530,14 +532,47 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
 // The EMBED step, hoisted out of the layer region so it can stay OUTSIDE a CUDA
 // graph capture (the embedding path takes a device flag through a cudaMalloc +
 // stream sync — the same reason qwen3_moe.cpp:200 keeps `EmbedInto` outside).
-void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
+// #1305 — CONSUME the registry's scoped device-id override, once per forward.
+// Both registrations that reach this TU (`DeepseekV2ForCausalLM` and
+// `Glm4MoeLiteForCausalLM`) publish `ModelForwardInput::device_token_ids` through
+// `detail::DeviceTokenIdsScope`; it is null on every path except the asynchronous
+// CUDA runner, where the combine has already spliced each decode row's sampled
+// token into the DEVICE identifiers and left the host vector deliberately stale.
+// Taking it CLEARS it, so the first embed in a forward is the one that gets it.
+detail::DeviceTokenIds TakeDeviceTokenIds() {
+  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
+  if (ov.ids != nullptr) detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
+  return ov;
+}
+
+// EMBED FROM AN ALREADY-RESIDENT ID TENSOR. The decode-graph driver holds its
+// identifiers in a `vllm::StepTokenIds` whose device address is stable for the
+// life of the slot, so this arm takes the tensor instead of re-uploading a host
+// vector into a fresh per-step allocation.
+void EmbedInto(Dev d, DBuf& hidden, const Tensor& ids,
                const DeepseekV2Weights& weights) {
   const DeepseekV2Params& p = weights.params;
-  const int64_t T = static_cast<int64_t>(token_ids.size());
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {p.vocab_size, p.hidden_size});
-  DBuf dids(d, DType::kI32, {T}, token_ids.data());
   Tensor h = hidden.t();
-  vt::Embedding(d.q, h, dtab, dids.t());
+  vt::Embedding(d.q, h, dtab, ids);
+}
+
+void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
+               const DeepseekV2Weights& weights) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  // #1305: the eager arms of these two registrations had the SAME defect as the
+  // graph arm — they embedded the host vector and never looked at the device
+  // mirror. The override's copy is enqueued on the main queue, so it is ordered
+  // AFTER the combine that produced it rather than racing it.
+  const detail::DeviceTokenIds ov = TakeDeviceTokenIds();
+  if (ov.ids != nullptr) {
+    VT_CHECK(ov.count <= T,
+             "deepseek v2 embed: device input ids longer than the embed input");
+    d.b.Copy(d.q, dids.ptr(), ov.ids,
+             static_cast<size_t>(ov.count) * sizeof(int32_t));
+  }
+  EmbedInto(d, hidden, dids.t(), weights);
 }
 
 // The CAPTURABLE region: everything after the embedding — the MLA step metadata
@@ -912,6 +947,12 @@ struct DeepseekV2DecodeGraph::Impl {
     CommonAttentionMetadata attn_meta;
     std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
+    // #1305: this slot's per-step input IDENTIFIERS, in a device buffer whose
+    // address does not move, refreshed through `vt::PersistentStepInput` from the
+    // padded host vector and then from the runner's device mirror when it is
+    // live. Before it, every arm below re-uploaded the HOST vector into a fresh
+    // allocation and the mirror was never read at all.
+    StepTokenIds ids;
     // ENG-CUDAGRAPH-BREAK W3 (#1291): the instantiated graph, its handle
     // ownership, its release and its `captured()` state now live in the shared
     // seam instead of in a raw `void*` plus a `bool` this driver maintained by
@@ -987,6 +1028,17 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   const bool cols_changed = (s.bt_cols != -1 && s.bt_cols != cols);
   s.Refresh(ptok, ppos, pam);
   s.bt_cols = cols;
+  // #1305 — THE IDENTIFIERS, ON THE SEAM. Bind this padded size's device
+  // destination once, then refresh it for this step: the padded host vector
+  // first (authoritative for the inert padding rows and for every row when no
+  // mirror is live), and then the runner's DEVICE identifiers over the real
+  // prefix when the asynchronous combine has patched them there. Both copies are
+  // enqueued on the main queue, so the second is ordered after the combine
+  // instead of racing it, and all three arms below embed from the SAME stable
+  // address.
+  const detail::DeviceTokenIds ov = TakeDeviceTokenIds();
+  s.ids.Ensure(d, S);
+  s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
   if (cols_changed && s.graph.captured()) {
     // Reset() releases every segment through Backend::DestroyGraph and returns
     // the container to its as-constructed state, which is also what lets the
@@ -1002,7 +1054,7 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   // stays exactly as informative as it is on the eager path, which is what the
   // paged-engine gate asserts on.
   if (s.graph.captured()) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
     RecordMlaBatchSplit(BuildMlaBatchSplit(s.attn_meta), s.attn_meta.num_reqs);
     // Through the seam's container, never `Backend::ReplayGraph` directly: the
     // container replays its segments in order (one, here, because a decode
@@ -1041,7 +1093,7 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   // Warm: the pool, weight residency and per-shape kernel scratch were warmed for
   // this size by the previous (eager) step. CAPTURE the layer region once.
   if (s.warm) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
     // ENG-CUDAGRAPH-BREAK W3 (#1291): the capture is the SHARED SEAM's, not this
     // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
     // the segment, the handle, its release, the drain a mid-capture throw needs
@@ -1118,7 +1170,7 @@ ForwardLogits DeepseekV2DecodeGraph::Step(
   // split workspace for this size) and defer capture to the next same-size step.
   // This is a real decode step — nothing is wasted.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
-  EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
+  EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
                           impl_->weights, kNoGather);
   s.warm = true;

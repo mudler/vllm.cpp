@@ -1079,30 +1079,47 @@ std::optional<ForwardLogits> DenseDecodeGraphForward(
   //   depth-1, graph ON   PASS 78/78      (no async pipelining)
   //   depth-2, graph OFF  PASS 82/82      (eager path honours the scope)
   //   depth-2, graph ON   FAIL, slots 1-3 degenerate
-  // Both conditions are required, which is why the registry-level
-  // DeviceTokenIdsScope (60e71a0e) did not close it: this path returns BEFORE
-  // the eager forward ever runs.
+  // Both conditions are required. THE MECHANISM THIS COMMENT USED TO RECORD FOR
+  // THAT — "the registry-level DeviceTokenIdsScope (60e71a0e) did not close it:
+  // this path returns BEFORE the eager forward ever runs" — IS FALSE, and
+  // ENG-CUDAGRAPH-BREAK W4 (#1307) established it by reading the tree at the
+  // commit that wrote the sentence. At `338cbbfd1^` the scope is constructed at
+  // `qwen3_dense.cpp:96-97`, BEFORE `DenseDecodeGraphForward` at `:102`, and all
+  // three of this driver's arms (`:610,621,644`) call `EmbedInto`, which applies
+  // the override through `ApplyDeviceTokenIdsOverride`. The override was LIVE on
+  // the graph path. `60e71a0e`'s three registry sites (`mistral_registry.cpp:89`,
+  // `internlm2_registry.cpp:92`, `llama_registry.cpp:101`) all have the same
+  // order, and two of them are the models the battery reproduced on.
   //
-  // Declining the graph while the mirror is live falls back to that
-  // proven-correct eager path. This is a MITIGATION, not the end state — the
-  // real fix is for Step() to read the ids at REPLAY time (a stable device
-  // buffer), which restores graphed decode for async serving. Until then a
-  // correct stream outranks the graph's throughput.
+  // So the measured failure is real and its recorded CAUSE is not the one that
+  // produced it, and nobody has identified what did. That is why the decline
+  // STANDS rather than why it should go: a mitigation whose failure mode is
+  // unexplained is not retired by a refactor that plausibly addresses an
+  // explanation no one has confirmed. Removing it needs the battery
+  // (`tests/parity/test_qwen3_dense_async_serving.cpp`) run twice — as it stands,
+  // and with the decline deleted, because only the second can fail.
   //
-  // ENG-CUDAGRAPH-BREAK W2 (#1261) MIGRATED THIS DRIVER ONTO THE SHARED SEAM AND
-  // DELIBERATELY LEFT THE DECLINE STANDING. Migrating the CAPTURE machinery does
-  // not move the inputs: `Step` still refreshes the persistent HOST vectors the
-  // captured copies read, so the race this decline avoids is untouched by W2 and
-  // removing it here would restore the measured depth-2 failure. The fix this
-  // comment names is `StepDevInputs` (`qwen3_5.cpp:3894`), and the row's spec
-  // (`.agents/specs/eng-cudagraph-break.md` `## Work breakdown`) puts it in W4,
-  // where the persistent device input path becomes a SEAM capability rather than
-  // one driver's private code — which is the only version of the fix that also
-  // reaches `qwen3_moe.cpp`, `deepseek_v2.cpp` and `voxtral.cpp`. Hand-copying
-  // it into this driver at W2 would be the tenth copy of the capability this row
-  // exists to stop copying. Owner: W4; recorded under `## Owed`, and gated in
-  // `tests/vllm/models/test_qwen3_decode_graph_seam.cpp` so neither arm can
-  // change silently.
+  // THE FIX THIS COMMENT NAMES DOES NOT EXIST IN ANY DRIVER, and W4 measured that
+  // too. No decode graph carries token ids to the device: `StepDevInputs`
+  // (`qwen3_5.cpp`) has no token-id member, its pinned sibling's `token_ids` block
+  // was allocated and filled every step and NEVER uploaded and never read (W4
+  // removed it), and every batched driver embeds OUTSIDE the captured region from
+  // the HOST vector. `vt::PersistentStepInput::RefreshFromDevice`
+  // (`include/vt/persistent_step_input.h`) is the arm that fix needs — reading the
+  // identifiers at REPLAY time from a stable device buffer, which is this
+  // comment's own wording — but the DESTINATION it would refresh is still owed.
+  // W2 (#1261) migrating this driver's capture onto the shared seam did not move
+  // the inputs, and W4 landing the storage primitive did not create the
+  // destination.
+  //
+  // Declining the graph while the mirror is live falls back to the proven-correct
+  // eager path. This is a MITIGATION, not the end state, and a correct stream
+  // outranks the graph's throughput until the two battery runs above say
+  // otherwise. Owner: row `ENG-CUDAGRAPH-BREAK`, the stage that gets a `dgx`
+  // window WITH the Qwen3-0.6B/4B checkpoints the battery needs; recorded under
+  // `## Owed` in `.agents/specs/eng-cudagraph-break.md`, tracked by #1179 and
+  // #323, and gated in `tests/vllm/models/test_qwen3_decode_graph_seam.cpp` so
+  // neither arm can change silently.
   if (input.device_token_ids != nullptr) {
     return std::nullopt;
   }

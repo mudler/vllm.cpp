@@ -280,11 +280,19 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
                                           const Music3CodeSampler& sampler,
                                           vt::Queue& queue);
 
-// The same loop with the language model's own hidden states SUPPLIED rather than
-// produced — the teacher-forcing entry the LLM parity gate drives, and nothing
-// else. Kept beside the real loop instead of duplicated inside a test so the two
-// cannot drift: `Music3GenerateFrameHiddens` is this function with a session
-// attached.
+// One frame's DEPTH stage, with the language model's own hidden states SUPPLIED
+// rather than produced. `Music3GenerateFrameHiddens` calls it once per frame,
+// which is how the registered speech family reaches it; it is kept out of line
+// rather than inlined there so a gate can drive the schedule without a
+// checkpoint.
+//
+// WHAT DRIVES IT. An earlier revision of this comment said "the teacher-forcing
+// entry the LLM parity gate drives, and nothing else". That was wrong:
+// `test_minimax_music3_llm_real` never called this function, and until #1246
+// nothing but the loop did, so the schedule it composes — the 3-row prefix
+// projection, the batch-2 sequencing, the fed-back projection row — had no gate
+// of its own. `test_minimax_music3_ar`'s composed-stage case now drives it
+// directly against a transcription of the whole-sequence schedule it replaced.
 //
 // Not exposed on any request path: a caller with the hidden states already has
 // what the loop exists to compute.

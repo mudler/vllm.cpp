@@ -49,6 +49,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -58,6 +59,7 @@
 #include "vt/backend.h"
 #include "vt/device.h"  // DeviceTypeName
 #include "vt/dtype.h"   // VT_CHECK
+#include "vt/merged_gemm.h"  // MergedGemmGroup, kFp8Block*
 #include "vt/ops.h"
 
 namespace vllm {
@@ -207,6 +209,270 @@ inline DBufT MatmulFp8BlockScaledD(DevT d, const Tensor& x,
                            static_cast<int>(w.block_k));
   BlockGemmCounter().fetch_add(1, std::memory_order_relaxed);
   return dout;
+}
+
+
+// ---------------------------------------------------------------------------
+// MERGED groups — MODEL-FP8-BLOCK-MERGED (#1189 milestone M6, spec
+// `.agents/specs/model-fp8-block-merged.md`)
+// ---------------------------------------------------------------------------
+//
+// vLLM runs `gate_proj`/`up_proj` as ONE MergedColumnParallelLinear and
+// `q`/`k`/`v` as ONE QKVParallelLinear -- the model declares both in its
+// `packed_modules_mapping` (`models/qwen3_5.py:288-298` @ `5559679229`), and
+// the two loaders are `layers/linear.py:660` and `:1021`. The block arm can do the same by simply concatenating the
+// shards along N, which the per-tensor fp8 arm cannot: a per-tensor shard folds
+// its own scalar alpha and two scalars do not concatenate, so that arm runs at
+// alpha=1 and applies a per-output-column alpha vector afterwards. A block
+// scale is indexed by `n / block_n`, so merged row `offset_j + l` of shard `j`
+// lands in block `offset_j / block_n + l / block_n` exactly when `offset_j` is
+// a multiple of `block_n`, and the merged grid is then the row-concatenation of
+// the shard grids.
+
+// One shard of a merged group. The NAME travels with the pointer because every
+// refusal below has to say WHICH projection is wrong, and a caller that passes
+// three anonymous pointers cannot be told that.
+struct Fp8BlockShard {
+  const Fp8BlockWeight* w;
+  const char* name;
+};
+
+inline int64_t Fp8BlockCDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+// May this group be N-concatenated at all?
+//
+// THE GUARD THIS FILE EXISTS FOR. Upstream's `validate_fp8_block_shape`
+// (`utils/fp8_utils.py:1229-1244`) requires every partition of a merged
+// block-quant linear EXCEPT THE LAST to be a multiple of `block_n`, and
+// `adjust_block_scale_shard` (`layers/linear.py:86-95`) ceil-divides the shard
+// offset and the shard size INDEPENDENTLY, which is consistent only under that
+// rule. Upstream also carries an escape hatch that disables the validation when
+// any partition is ragged (`linear.py:532-557`, read at `fp8_utils.py:1207`),
+// but the hatch only MOVES the failure: run upstream's own function over a
+// QKVParallelLinear with q=256, k=64, v=64 at block_n=128 and the `v` shard
+// slices rows [3,4) of a scale parameter that has 3 rows.
+//
+// So there is no correct merged GEMM for a ragged NON-final shard, and this
+// refuses one by name rather than splitting silently or slicing silently. A
+// ragged FINAL shard is fine, and upstream allows exactly that case.
+inline void CheckFp8BlockMergeable(const vt::MergedGemmGroup& desc,
+                                   const char* group,
+                                   const Fp8BlockShard* shards, int count) {
+  VT_CHECK(shards != nullptr && count >= 2,
+           std::string("block-wise FP8 merged '") + group +
+               "': a merged group needs at least two shards");
+  VT_CHECK(count == desc.arity,
+           std::string("block-wise FP8 merged '") + group + "': " +
+               std::to_string(count) + " shards against descriptor '" +
+               desc.name + "' arity " + std::to_string(desc.arity));
+  const Fp8BlockWeight& first = *shards[0].w;
+  for (int i = 0; i < count; ++i) {
+    const Fp8BlockShard& sh = shards[i];
+    const Fp8BlockWeight& w = *sh.w;
+    const std::string where =
+        std::string("block-wise FP8 merged '") + group + "': shard '" +
+        sh.name + "' ";
+    VT_CHECK(!w.Empty() && w.block_n > 0 && w.block_k > 0,
+             where + "is empty or carries no block geometry");
+    VT_CHECK(w.k == first.k,
+             where + "has in_features " + std::to_string(w.k) +
+                 " where shard '" + shards[0].name + "' has " +
+                 std::to_string(first.k) +
+                 "; a merged linear has ONE input");
+    VT_CHECK(w.block_n == first.block_n && w.block_k == first.block_k,
+             where + "has block geometry " + std::to_string(w.block_n) + "x" +
+                 std::to_string(w.block_k) + " where shard '" +
+                 shards[0].name + "' has " + std::to_string(first.block_n) +
+                 "x" + std::to_string(first.block_k));
+    VT_CHECK(w.scale.rank == 2 && w.scale.dtype == DType::kF32,
+             where + "does not carry a 2-D f32 scale grid");
+    VT_CHECK(w.scale.shape[0] == Fp8BlockCDiv(w.n, w.block_n) &&
+                 w.scale.shape[1] == Fp8BlockCDiv(w.k, w.block_k),
+             where + "carries a scale grid that is not cdiv(N,block_n) by "
+                     "cdiv(K,block_k)");
+    // An elementwise gated epilogue reads the merged output as two EQUAL
+    // halves (vt::SiluAndMul splits [M,2D] at D), so an unequal pair would
+    // silently mis-split. Upstream's own gate_up is `output_sizes = [I, I]`.
+    VT_CHECK(desc.epilogue != vt::MergedEpilogue::kSiluMulClamp ||
+                 w.n == first.n,
+             where + "has out_features " + std::to_string(w.n) +
+                 " where shard '" + shards[0].name + "' has " +
+                 std::to_string(first.n) +
+                 "; a gated merged linear splits its output into two EQUAL "
+                 "halves");
+    // Every shard but the LAST has to start the next one on a block boundary.
+    if (i + 1 < count) {
+      VT_CHECK(
+          w.n % first.block_n == 0,
+          where + "has out_features " + std::to_string(w.n) +
+              ", which is not a multiple of the quantization block's n " +
+              std::to_string(first.block_n) +
+              ". Only the LAST shard of a merged block-quant linear may be "
+              "ragged (vllm utils/fp8_utils.py:1229-1244); an earlier ragged "
+              "shard makes the concatenated scale grid disagree with the "
+              "merged operand's block rows, so the merge is refused rather "
+              "than mis-sliced");
+    }
+  }
+}
+
+// The N-concatenated operand, as tensor views over one device buffer pair.
+struct Fp8BlockMergedView {
+  Tensor packed;  // i8  [sum N_i, K]
+  Tensor scale;   // f32 [sum cdiv(N_i, block_n), cdiv(K, block_k)]
+  int64_t n_total = 0;
+  int64_t k = 0;
+  int64_t block_n = 0;
+  int64_t block_k = 0;
+};
+
+// Build (lazily, ONCE) the merged operand and keep it resident. Mirrors
+// `ResidentFp8Qkv` and `ResidentNvfp4Qkv`: the shards' bytes are copied
+// back-to-back and the per-shard residents are then never built, so the merged
+// arm costs no duplicate device bytes.
+template <class DevT>
+inline Fp8BlockMergedView ResidentFp8BlockMerged(
+    DevT d, const vt::MergedGemmGroup& desc, const char* group,
+    const Fp8BlockShard* shards, int count, const Fp8BlockMergedResident& r) {
+  CheckFp8BlockMergeable(desc, group, shards, count);
+  const Fp8BlockWeight& first = *shards[0].w;
+  int64_t n_total = 0;
+  int64_t scale_rows = 0;
+  size_t packed_bytes = 0;
+  size_t scale_bytes = 0;
+  for (int i = 0; i < count; ++i) {
+    const Fp8BlockWeight& w = *shards[i].w;
+    VT_CHECK(w.packed.bytes.size() == static_cast<size_t>(w.n * w.k),
+             std::string("block-wise FP8 merged '") + group + "': shard '" +
+                 shards[i].name +
+                 "' does not carry exactly one fp8 byte per element");
+    n_total += w.n;
+    scale_rows += w.scale.shape[0];
+    packed_bytes += w.packed.bytes.size();
+    scale_bytes += w.scale.bytes.size();
+  }
+  // The property the whole merge rests on, asserted rather than assumed: the
+  // concatenated grid is the grid the merged operand's own N would allocate.
+  VT_CHECK(scale_rows == Fp8BlockCDiv(n_total, first.block_n),
+           std::string("block-wise FP8 merged '") + group +
+               "': the concatenated scale grid has " +
+               std::to_string(scale_rows) + " rows where the merged N " +
+               std::to_string(n_total) + " needs " +
+               std::to_string(Fp8BlockCDiv(n_total, first.block_n)));
+
+  if (!r.d_packed || !r.d_scale) {
+    VT_CHECK(!r.d_packed && !r.d_scale,
+             std::string("block-wise FP8 merged '") + group +
+                 "': partial resident state");
+    Backend* bk = &d.b;
+    void* pp = d.b.Alloc(packed_bytes);
+    std::shared_ptr<void> packed_owner(pp,
+                                       [bk](void* q) { bk->Free(q); });
+    auto* pdst = static_cast<uint8_t*>(pp);
+    for (int i = 0; i < count; ++i) {
+      const auto& src = shards[i].w->packed.bytes;
+      d.b.Copy(d.q, pdst, src.data(), src.size());
+      pdst += src.size();
+    }
+    void* sp = d.b.Alloc(scale_bytes);
+    std::shared_ptr<void> scale_owner(sp, [bk](void* q) { bk->Free(q); });
+    auto* sdst = static_cast<uint8_t*>(sp);
+    for (int i = 0; i < count; ++i) {
+      const auto& src = shards[i].w->scale.bytes;
+      d.b.Copy(d.q, sdst, src.data(), src.size());
+      sdst += src.size();
+    }
+    r.d_packed = std::move(packed_owner);
+    r.d_scale = std::move(scale_owner);
+  }
+
+  Fp8BlockMergedView v;
+  v.packed = dense_attn::MakeTensor(r.d_packed.get(), DType::kI8, d.q.device,
+                                    {n_total, first.k});
+  v.scale = dense_attn::MakeTensor(r.d_scale.get(), DType::kF32, d.q.device,
+                                   {scale_rows, first.scale.shape[1]});
+  v.n_total = n_total;
+  v.k = first.k;
+  v.block_n = first.block_n;
+  v.block_k = first.block_k;
+  return v;
+}
+
+// The preconditions every merged group shares, refused HERE rather than one
+// frame deeper inside `vt::QuantFp8Group` so the message names the projection
+// group a reader can act on. Upstream asserts the same divisibility on the
+// ACTIVATION (`utils/fp8_utils.py:596-599`) while tiling the WEIGHT with cdiv
+// (`fp8_utils.py:930-936`); that asymmetry is upstream's, not ours.
+template <class DevT>
+inline void CheckFp8BlockMergedActivation(DevT d, const char* group,
+                                          const Tensor& x,
+                                          const Fp8BlockMergedView& v) {
+  const std::string where = std::string("block-wise FP8 merged '") + group + "': ";
+  const int64_t K = x.shape[1];
+  VT_CHECK(K == v.k, where + "activation K " + std::to_string(K) +
+                         " does not match the merged weight's in_features " +
+                         std::to_string(v.k));
+  VT_CHECK(K % v.block_k == 0,
+           where + "the activation's in_features " + std::to_string(K) +
+               " is not a multiple of the quantization block's k " +
+               std::to_string(v.block_k) +
+               ", which the dynamic per-token per-group activation quant "
+               "requires (vllm utils/fp8_utils.py:596-599)");
+  VT_CHECK(BlockFp8Runnable(d.q.device.type),
+           where + "no block-wise (fine-grained) FP8 kernel on device '" +
+               vt::DeviceTypeName(d.q.device.type) +
+               "'. The CPU reference arm is what exists today; the "
+               "mainloop-scaled CUTLASS kernel is milestone M5 of "
+               "https://github.com/mudler/vllm.cpp/issues/1189");
+}
+
+// y[M, sum N_i] = x[M,K] @ dequant(concat(w_i)).T — ONE block-scaled GEMM over
+// the merged operand, the caller slicing the output into its logical shards.
+// This is the QKV shape (`vt::kFp8BlockQkv`, epilogue kNone).
+template <class DBufT, class DevT>
+inline DBufT MatmulFp8BlockMergedD(DevT d, const Tensor& x,
+                                   const Fp8BlockMergedView& v, DType out_dtype,
+                                   const vt::MergedGemmGroup& desc) {
+  const int64_t M = x.shape[0], K = x.shape[1];
+  CheckFp8BlockMergedActivation(d, desc.name, x, v);
+  DBufT a_fp8(d, DType::kI8, {M, K});
+  DBufT a_scale(d, DType::kF32, {M, K / v.block_k});
+  vt::QuantFp8Group(d.q, a_fp8.t(), a_scale.t(), x,
+                    static_cast<int>(v.block_k));
+  DBufT out(d, out_dtype, {M, v.n_total});
+  vt::MergedGemmFp8Block(d.q, desc, out.t(), /*out=*/nullptr, a_fp8.t(),
+                         a_scale.t(), v.packed, v.scale,
+                         static_cast<int>(v.block_n),
+                         static_cast<int>(v.block_k),
+                         /*epilogue_scalar=*/0.0F);
+  BlockGemmCounter().fetch_add(1, std::memory_order_relaxed);
+  return out;
+}
+
+// silu(gate) * up as [M, sum N_i / 2] — ONE merged gate_up GEMM plus the SwiGLU
+// tail (`vt::kFp8BlockGateUpSwiGLU`). This is what
+// `layers::Fp8BlockMlpGateUpMethod` and the dense MLP both run.
+template <class DBufT, class DevT>
+inline DBufT Fp8BlockGateUpSwiGLUD(DevT d, const Tensor& x,
+                                   const Fp8BlockMergedView& v,
+                                   DType out_dtype) {
+  const int64_t M = x.shape[0], K = x.shape[1];
+  VT_CHECK(v.n_total % 2 == 0,
+           "block-wise FP8 merged 'gate_up_proj': the merged N must be even");
+  CheckFp8BlockMergedActivation(d, "gate_up_proj", x, v);
+  DBufT a_fp8(d, DType::kI8, {M, K});
+  DBufT a_scale(d, DType::kF32, {M, K / v.block_k});
+  vt::QuantFp8Group(d.q, a_fp8.t(), a_scale.t(), x,
+                    static_cast<int>(v.block_k));
+  DBufT gate_up(d, out_dtype, {M, v.n_total});
+  DBufT act(d, out_dtype, {M, v.n_total / 2});
+  vt::MergedGemmFp8Block(d.q, vt::kFp8BlockGateUpSwiGLU, gate_up.t(), &act.t(),
+                         a_fp8.t(), a_scale.t(), v.packed, v.scale,
+                         static_cast<int>(v.block_n),
+                         static_cast<int>(v.block_k),
+                         std::numeric_limits<float>::infinity());
+  BlockGemmCounter().fetch_add(1, std::memory_order_relaxed);
+  return act;
 }
 
 }  // namespace dense_fp8_block

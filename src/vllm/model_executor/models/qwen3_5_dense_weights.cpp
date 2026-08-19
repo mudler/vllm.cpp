@@ -686,14 +686,12 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
   // none, and `IsFp8BlockProjection` refuses the disagreement it just invented.
   // `TensorResolver` throws on a missing tensor, so probing it is the honest
   // answer and the only one available at this seam.
-  const TensorExists has = [&get](const std::string& name) {
-    try {
-      (void)get(name);
-      return true;
-    } catch (const std::exception&) {
-      return false;
-    }
-  };
+  //
+  // FIX-PROBE-CANNOT-SAY-NO (#1258): the `try`/`catch` this used to spell out
+  // now lives ONCE in `dense_loaders`, because the sibling seam below needs the
+  // identical probe and two copies of a subtle thing is the next defect.
+  const TensorExists has = dense_loaders::ProbeThroughResolver(get);
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5DenseGdn");
   return LoadGdnDense(get, has, layer_base, Fp8BlockQuantConfig{});
 }
 
@@ -758,6 +756,10 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const TensorExists& has,
     const std::string& layer_type, int64_t layer_idx,
     const std::string& backbone_prefix, const Fp8BlockQuantConfig& block) {
+  // FIX-PROBE-CANNOT-SAY-NO (#1258): every dense-layer path funnels through this
+  // overload, so one check here covers the production loader, both resolver-only
+  // seams, and whatever probe a caller supplies next.
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5DenseLayer");
   const std::string base =
       backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5DenseLayerWeights layer;
@@ -789,9 +791,18 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
     const std::string& backbone_prefix) {
-  // The public resolver-only seam is used by the compressed-tensors parity
-  // fixture, where every routed projection is NVFP4.
-  const TensorExists has = [](const std::string&) { return true; };
+  // FIX-PROBE-CANNOT-SAY-NO (#1258). This was the SECOND always-true stub named
+  // by #1256; #1257 fixed only the sibling above. It was not latent: the
+  // `qwen36_gdn_layer_27b` isolated-layer golden replays through THIS overload
+  // (`tests/parity/test_op_parity.cpp`) with `layer_type == "linear_attention"`,
+  // which routes to `LoadGdnDense`, whose first act is the
+  // `IsFp8BlockProjection` cross-check a constant `true` lies to. That leg is
+  // SKIPped without the pinned 27B snapshot, which is why no CPU lane saw it.
+  //
+  // The compressed-tensors parity fixture this seam was written for really does
+  // carry `weight_packed` on every routed projection, so a truthful probe leaves
+  // its routing where it was and merely stops inventing the tensors it lacks.
+  const TensorExists has = dense_loaders::ProbeThroughResolver(get);
   return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx,
                                backbone_prefix);
 }
@@ -820,6 +831,11 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   const TensorExists has = [&where](const std::string& name) {
     return where.find(name) != where.end();
   };
+  // FIX-PROBE-CANNOT-SAY-NO (#1258). Truthful by construction today; checked
+  // anyway, because the guard's value is that it does not depend on how the
+  // probe was built — a name index filled from the wrong shard list fails here
+  // too.
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5Dense");
 
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==

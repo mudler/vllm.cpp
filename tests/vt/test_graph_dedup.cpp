@@ -74,6 +74,12 @@ struct FakeDevice {
   // defined behaviour for one; counting it here rather than dereferencing it keeps the
   // red observable instead of a crash.
   int null_exec_updates = 0;
+  // Every (currently-reflected graph id, target graph id) pair the driver was ASKED
+  // about, probe and replay alike, in call order. The counter above says how many times
+  // the driver was asked; this says WHICH re-points were asked for, and the difference
+  // between the set Register probes and the set Replay issues is the whole of the
+  // unprobed-pair disclosure in src/vt/graph_dedup.h.
+  std::vector<std::pair<int, int>> update_log;
   std::vector<int> launch_log;      // the id of the graph each launch actually ran
   // With `recycle` set, a destroyed graph's STORAGE is handed back to the test instead
   // of being freed, so a later capture can be made to land on the same address on
@@ -114,6 +120,7 @@ bool FakeUpdate(void* exec_handle, void* graph_handle, std::string* detail) {
   }
   auto* exec = static_cast<FakeExec*>(exec_handle);
   auto* graph = static_cast<FakeGraph*>(graph_handle);
+  g_dev->update_log.emplace_back(exec->id, graph->id);
   if (g_dev->reject_update_for.count(graph->id) != 0 ||
       g_dev->reject_update_pair.count({exec->id, graph->id}) != 0 ||
       exec->sig != graph->sig) {
@@ -400,14 +407,68 @@ TEST_CASE("a probe the driver cannot instantiate degrades instead of driving a n
   registry.Close();
 }
 
+TEST_CASE("a two-member group replays a pair the probe never tested") {
+  // THE BOUNDARY OF THE PROBE, and it is reached at group size TWO rather than three.
+  // Register probes exactly (group.raws.front(), candidate), because the group's
+  // executable is instantiated from the FIRST capture -- so (1 -> 2) is the only pair
+  // the driver was ever asked about. Replay issues (group.current_raw, entry.raw), and
+  // the moment an alternating decode goes back to the first bucket that is (2 -> 1): the
+  // reverse direction, which nothing probed. src/vt/graph_dedup.h disclosed this as
+  // beginning "from the third member of a group onwards"; that is one member too late
+  // and it misses the ordinary alternating-decode case, so the pair sequence is pinned
+  // here rather than described.
+  DeviceScope scope;
+  auto registry = MakeRegistry();
+
+  using Pairs = std::vector<std::pair<int, int>>;
+  void* g1 = registry.Register(MakeGraph("decode", 1));
+  void* g2 = registry.Register(MakeGraph("decode", 2));
+  REQUIRE(registry.ExecCount() == 1);
+  // One probe, and it is (1 -> 2). The live executable still reflects graph 1.
+  CHECK(scope.dev.update_log == Pairs{{1, 2}});
+
+  registry.Replay(g1, nullptr);  // already reflected: no update is issued at all
+  CHECK(scope.dev.update_log == Pairs{{1, 2}});
+
+  registry.Replay(g2, nullptr);  // (1 -> 2): the pair the probe tested
+  registry.Replay(g1, nullptr);  // (2 -> 1): the reverse, which nothing tested
+  CHECK(scope.dev.update_log == Pairs{{1, 2}, {1, 2}, {2, 1}});
+  CHECK(scope.dev.launch_log == std::vector<int>{1, 2, 1});
+
+  registry.Close();
+}
+
+TEST_CASE("the unprobed reverse pair of a two-member group fails loudly") {
+  // The same two-member shape with the driver refusing exactly the direction no probe
+  // asked about. The probe still succeeds, the two captures still fold onto one
+  // executable, and the refusal surfaces on the ALTERNATION rather than at capture time.
+  // Loud, not wrong: leaving the executable pointing at graph 2 and launching it under
+  // g1's handle is the failure this VT_CHECK exists to prevent. A coarser key reaches
+  // this shape sooner than the exact one, which is why it is gated at size two.
+  DeviceScope scope;
+  scope.dev.reject_update_pair.insert({2, 1});
+  auto registry = MakeRegistry();
+
+  void* g1 = registry.Register(MakeGraph("decode", 1));
+  void* g2 = registry.Register(MakeGraph("decode", 2));
+  REQUIRE(registry.ExecCount() == 1);  // (1 -> 2) was probed and accepted
+
+  registry.Replay(g2, nullptr);
+  CHECK_THROWS_AS(registry.Replay(g1, nullptr), std::runtime_error);
+  CHECK(scope.dev.launch_log == std::vector<int>{2});
+
+  registry.Close();
+}
+
 TEST_CASE("a replay update the driver refuses fails loudly rather than launching stale nodes") {
   DeviceScope scope;
   // Register probes (group.raws.front(), candidate) but Replay issues
-  // (group.current_raw, target), and from the third group member onwards those pairs
-  // differ -- so honouring the probe assumes update compatibility is TRANSITIVE across a
-  // group. Nothing asserts that. Refusing exactly the pair Register never asks about
-  // reproduces the case: every probe succeeds, the group folds to one executable, and
-  // the SECOND replay is where the assumption is tested for real.
+  // (group.current_raw, target), and every replay whose pair is not one of the probed
+  // ones assumes update compatibility is TRANSITIVE across a group. Nothing asserts
+  // that. This case takes the third-member shape of it -- (2 -> 3), which no probe ever
+  // asked about because every probe is (1 -> candidate); the two-member shape, the
+  // reverse direction, is the case above. Every probe succeeds, the group folds to one
+  // executable, and the SECOND replay is where the assumption is tested for real.
   scope.dev.reject_update_pair.insert({2, 3});
   auto registry = MakeRegistry();
 

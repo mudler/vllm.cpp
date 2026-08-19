@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -173,6 +174,40 @@ bool GraphCaptureEnabled();
 class GraphCaptureScope;
 
 // ---------------------------------------------------------------------------
+// vt::GraphCaptureMode — WHICH of vLLM's two capture modes this scope is.
+// Port of `CUDAGraphMode` (`vllm/config/compilation.py:59-63` @ pin
+// `5559679229`); the runtime selection is `decode_mode()`/`mixed_mode()`
+// (`:65-69`), read per batch at `vllm/v1/worker/gpu/cudagraph_utils.py:185-186`.
+// ---------------------------------------------------------------------------
+//
+// THE BOUNDARY AND THE MODE ARE TWO DIFFERENT QUESTIONS, and W1 shipped only
+// one of them. `splitting_ops` says WHERE a graph may be split; `cudagraph_mode`
+// says WHETHER this batch's graph is split at all. vLLM's v1 default is
+// `FULL_AND_PIECEWISE = (FULL, PIECEWISE)` (`:63`), documented at `:630-632` as
+// "Capture full cudagraph for DECODE batches and piecewise cudagraph for prefill
+// and mixed prefill-decode batches", and `decode_mode()` returns `value[0]`, so
+// a uniform decode batch upstream gets ONE graph with attention INSIDE it. The
+// secondary oracle agrees: SGLang reaches its breakable graph through
+// `--cuda-graph-backend-prefill=breakable`
+// (`test_breakable_cuda_graph.py:279-281` @ `f63458b5be`) — prefill, not decode.
+//
+// So a capture scope has to carry the mode, and a DECODE driver has to open it
+// in `kFull`. Without this a migrated decode driver would convert a fully
+// graphed decode step into one eager attention call per layer, which is not
+// vLLM's decode behaviour and which nothing in this row's record supports. This
+// is a MIRRORING requirement, not a performance argument: the row claims no
+// throughput and measures none, and `kFull` is what keeps a migrated decode
+// step's shape the one it already had.
+//
+// `kPiecewise` is the default because it is the mode the seam was built for and
+// the one every unit case exercises; a scope that means `kFull` says so.
+enum class GraphCaptureMode {
+  kPiecewise,  // CUDAGraphMode.PIECEWISE (`:60`): every GraphBreak splits.
+  kFull,       // CUDAGraphMode.FULL (`:61`): GraphBreak runs its function INSIDE
+               // the single segment and splits nothing.
+};
+
+// ---------------------------------------------------------------------------
 // vt::BreakableGraph — the segment container. Port of `BreakableCUDAGraph`
 // (`:246-274`); fields `:251-252`, interleaved replay `:255-264`.
 // ---------------------------------------------------------------------------
@@ -205,6 +240,40 @@ class BreakableGraph {
   bool captured() const { return !segments_.empty(); }
   int64_t replay_count() const { return replays_; }
 
+  // WHY A DRAINED CAPTURE HAS TO SAY SO, and why a bool would not do.
+  //
+  // `~GraphCaptureScope` must swallow (a destructor that propagates
+  // terminates), so after a FAILED capture the container reports exactly what an
+  // INERT scope reports: `captured() == false`. Those two states mean OPPOSITE
+  // things to the caller. An inert scope ran the forward EAGERLY, so the values
+  // the caller holds are real. A failed capture ran NOTHING: under stream
+  // capture every operation between `BeginCapture` and the failure was RECORDED,
+  // not executed, so the caller's buffers hold whatever the allocator last left
+  // there. A driver that reads only `captured()` returns uncomputed device
+  // memory as its step's result — silently wrong numbers, no fault, and a token
+  // gate cannot see it. That is the defect this accessor exists to make
+  // impossible to write, and it was a live HIGH in the first driver migration.
+  //
+  // TWO ACCESSORS AND NOT ONE, because the drain has two arms and only one of
+  // them can name the cause. `capture_failed()` is the state a caller branches
+  // on. `capture_error()` is the ORIGINAL exception when the seam holds it, so
+  // the caller rethrows the runtime's own diagnosis instead of inventing one.
+  //
+  // It is EMPTY on the other arm, and the reason is a language rule rather than
+  // an omission: when the scope is abandoned because an exception is propagating
+  // THROUGH it, no handler has been entered yet, so `std::current_exception()`
+  // in the destructor returns null ([propagation]/7 — it names the currently
+  // HANDLED exception). Fabricating a stand-in there would be a message that
+  // describes nothing. It costs nothing either, because on that arm the real
+  // exception is already propagating to the caller under its own power; the
+  // arm a caller can actually observe and must branch on is the throwing close.
+  //
+  // Both are cleared by `Reset()` and at the start of every fresh capture,
+  // because a failure that outlives the graph it describes is a verdict nobody
+  // can trust twice.
+  bool capture_failed() const { return capture_failed_; }
+  const std::exception_ptr& capture_error() const { return capture_error_; }
+
   // Releases every segment through Backend::DestroyGraph, clears the breaks, and
   // returns the container to its as-constructed state — replay count included,
   // because a stale count on a reset container is a number that describes a
@@ -217,6 +286,8 @@ class BreakableGraph {
   std::vector<void*> segments_;
   std::vector<std::function<void()>> break_fns_;
   int64_t replays_ = 0;
+  bool capture_failed_ = false;
+  std::exception_ptr capture_error_;
 };
 
 // ---------------------------------------------------------------------------
@@ -258,6 +329,13 @@ class BreakableGraph {
 // capture must never be reported as `captured()`, because a partial capture is
 // replayable, and replaying half a forward is silently wrong numerics.
 //
+// A DRAIN IS NOT A RECOVERY, and the container says which one happened. The
+// failure is recorded on the container as `capture_failed()`, with the swallowed
+// exception as `capture_error()` where the seam holds it, so the caller can tell
+// a capture that FAILED from a scope that was INERT — two states the drain
+// otherwise leaves identical and whose meanings are opposite. See those
+// accessors for what reading only `captured()` costs.
+//
 // THE DRAIN'S LIMIT, stated because it is not obvious. It compares
 // `std::uncaught_exceptions()` against the depth at entry, so it sees an
 // exception that is PROPAGATING at scope exit. An exception CAUGHT INSIDE the
@@ -267,12 +345,19 @@ class BreakableGraph {
 // inside a capture scope. Owed to W2 in the spec's `## Owed`.
 class GraphCaptureScope {
  public:
-  GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out);
+  explicit GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out,
+                             GraphCaptureMode mode = GraphCaptureMode::kPiecewise);
   ~GraphCaptureScope();
   GraphCaptureScope(const GraphCaptureScope&) = delete;
   GraphCaptureScope& operator=(const GraphCaptureScope&) = delete;
 
   bool active() const { return active_; }
+  GraphCaptureMode mode() const { return mode_; }
+  // Whether a `GraphBreak` inside this scope splits the capture. FALSE for an
+  // inert scope AND for a `kFull` one, and those are different states: an inert
+  // scope captures nothing, while a `kFull` scope captures the break's work
+  // INSIDE its single segment. `GraphBreak` needs only the one question.
+  bool splits() const { return active_ && mode_ == GraphCaptureMode::kPiecewise; }
   static GraphCaptureScope* Current();
 
   Backend& backend() const { return *b_; }
@@ -300,6 +385,7 @@ class GraphCaptureScope {
   Backend* b_;
   Queue* q_;
   BreakableGraph* g_;
+  GraphCaptureMode mode_ = GraphCaptureMode::kPiecewise;
   bool active_ = false;
   bool segment_open_ = false;
   int uncaught_on_entry_ = 0;
@@ -367,7 +453,7 @@ void GraphBreak();
 template <class Fn, class = std::enable_if_t<std::is_void_v<decltype(std::declval<Fn&>()())>>>
 void GraphBreak(Fn&& fn) {
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     fn();  // pass-through: byte-identical to today, zero backend calls
     detail::CountBreakPoint();
     return;
@@ -399,7 +485,7 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
                 "the following segment baked, or use the in-place form GraphBreak(fn), or "
                 "ask for the non-copyable fallback explicitly with vt::NoWriteback{}.");
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     *out = fn();  // pass-through: a move, never a copy, and the cell stays unpinned
     detail::CountBreakPoint();
     return;
@@ -432,7 +518,7 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
 template <class Fn, class Out>
 void GraphBreak(Fn&& fn, BreakSlot<Out>& out, NoWriteback) {
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     *out = fn();
     detail::CountBreakPoint();
     return;

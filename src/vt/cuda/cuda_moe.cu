@@ -9,9 +9,11 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
+#include "vt/cuda/moe_router_warp.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -197,6 +199,133 @@ __global__ void MoeRouterTopKKernel(float* weights, int32_t* indices, const Tin*
       if (!(denom > 0.0f)) denom = 1.0f;  // denom<=0 -> 1 guard (.cu:245-253)
       for (int j = 0; j < k; ++j) weights[row * k + j] /= denom;
     }
+  }
+}
+
+// ─── Single-warp router top-k (KERNEL-MOE-ROUTER-WARP, issue #378) ─────────
+// One WARP per token with the whole logit row in registers: no shared memory,
+// no __syncthreads(), and ONE global read of the row instead of two. At E=256
+// the block kernel above spends 37 barriers and 3 KiB of dynamic shared memory
+// on a few hundred comparisons; this spends none.
+//
+// BYTE-IDENTICAL to MoeRouterTopKKernel<Tin,false>, and the reason is
+// structural, not an appeal to associativity. In that kernel's block reduction
+// the levels s = 128, 64, 32 are all multiples of the warp width, so `t` and
+// `t + s` always share a lane id: those three levels never cross a lane, and
+// they combine exactly red[L + 32q] by the standard halving recursion on q.
+// Levels s = 16..1 live inside warp 0 and are what __shfl_down_sync
+// reproduces. So `MoeRouterWarpExpert(lane, q) == lane + 32q` plus
+// `MoeRouterWarpTree{Sum,Max}`'s halving tree performs the IDENTICAL float
+// operations on the IDENTICAL operands in the IDENTICAL association. The full
+// derivation, one VPT at a time, is in
+// .agents/specs/moe-router-topk-single-warp.md §5; the reduction-order claim is
+// EXECUTED (with no GPU needed) by tests/vt/test_moe_router_warp_map.cpp.
+//
+// This is where 6a8c5cf9's "vLLM's topkGating reorders the softmax reduction so
+// it is off-limits" (see :156-163) is too strong. It is true of vLLM's OWN lane
+// map -- at topkGating<8,256,4,16,32,...> lane L owns the CONTIGUOUS experts
+// [8L, 8L+8) (topk_softmax_kernels.cu:344-346), which genuinely reassociates --
+// and false of this one.
+//
+// SHAPE port only. Every arithmetic decision below is the block kernel's, NOT
+// vLLM's: the divide (not a reciprocal multiply), the sum>0 guard, the isfinite
+// clamp after normalize, the -INFINITY mask, the -INFINITY max seed that erases
+// NaN, the denom<=0 -> 1 guard, the trailing divide, and the best<0 sentinel.
+// vLLM does five of those differently and porting any of them changes tokens;
+// the spec §4 tabulates each against its upstream file:line.
+template <typename Tin, int VPT>
+__launch_bounds__(kMoeRouterWarpsPerCta* kMoeRouterWarpWidth) __global__
+    void MoeRouterTopKWarpKernel(float* weights, int32_t* indices, const Tin* logits, int64_t t,
+                                 int k, bool renormalize) {
+  constexpr int kE = kMoeRouterWarpWidth * VPT;
+  const int lane = static_cast<int>(threadIdx.x);
+  // One token per warp; the exit is warp-UNIFORM, so a warp that survives it
+  // has all 32 lanes active and the 0xffffffffu shuffle masks are valid.
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * kMoeRouterWarpsPerCta +
+                      static_cast<int64_t>(threadIdx.y);
+  if (row >= t) return;
+  const Tin* lrow = logits + row * kE;
+
+  // The ONLY read of the logit row. Slot q covers the 32 consecutive experts
+  // [32q, 32q+32), so every load is fully coalesced.
+  float p[VPT];
+#pragma unroll
+  for (int q = 0; q < VPT; ++q) p[q] = Load(lrow, MoeRouterWarpExpert(lane, q));
+
+  // Max: per-lane halving tree (with the -INFINITY seed that erases NaN),
+  // then the five in-warp levels. Congruent to :70-79.
+  float m = MoeRouterWarpTreeMax<VPT>(p);
+#pragma unroll
+  for (int off = kMoeRouterWarpWidth / 2; off > 0; off >>= 1) {
+    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+  }
+  const float mx = __shfl_sync(0xffffffffu, m, 0);  // the block read red[0] here
+
+  // exp(logit - max) stays in registers -- no second global read, no sp[].
+  // Congruent to :82-94.
+#pragma unroll
+  for (int q = 0; q < VPT; ++q) p[q] = expf(p[q] - mx);
+  float s = MoeRouterWarpTreeSum<VPT>(p);
+#pragma unroll
+  for (int off = kMoeRouterWarpWidth / 2; off > 0; off >>= 1) {
+    s += __shfl_down_sync(0xffffffffu, s, off);
+  }
+  const float sum = __shfl_sync(0xffffffffu, s, 0);
+
+  // Normalize: the DIVIDE, the sum>0 guard, the clamp after (:97-103).
+#pragma unroll
+  for (int q = 0; q < VPT; ++q) {
+    float pj = sum > 0.0f ? p[q] / sum : 0.0f;
+    if (!isfinite(pj)) pj = 0.0f;
+    p[q] = pj;
+  }
+
+  // Greedy top-k. The argmax is a reduction over the total order "higher value,
+  // then lower expert index", which IS associative and commutative, so this
+  // grouping matches the block's per-thread/warp/leader grouping exactly --
+  // the argument already recorded at :156-163 and unchanged here.
+  float denom = 0.0f;  // meaningful on lane 0 only, accumulated in k order
+  for (int j = 0; j < k; ++j) {
+    float lv = -INFINITY;
+    int li = -1;
+#pragma unroll
+    for (int q = 0; q < VPT; ++q) {  // ascending expert index within the lane
+      if (p[q] > lv) {               // strict `>` -> lowest index at the max
+        lv = p[q];
+        li = MoeRouterWarpExpert(lane, q);
+      }
+    }
+#pragma unroll
+    for (int off = kMoeRouterWarpWidth / 2; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xffffffffu, lv, off);
+      const int oi = __shfl_down_sync(0xffffffffu, li, off);
+      if (ov > lv || (ov == lv && oi >= 0 && (li < 0 || oi < li))) {
+        lv = ov;
+        li = oi;
+      }
+    }
+    const float best_v = __shfl_sync(0xffffffffu, lv, 0);
+    const int best = __shfl_sync(0xffffffffu, li, 0);
+    // Exclude the winner from later rounds, in the owning lane's own register.
+    // The slot compare is UNROLLED on purpose: a runtime index into a per-thread
+    // array forces it to local memory, which would spill the whole row and cost
+    // exactly the register residency this kernel exists for.
+    if (best >= 0 && lane == (best & (kMoeRouterWarpWidth - 1))) {
+      const int slot = best / kMoeRouterWarpWidth;
+#pragma unroll
+      for (int q = 0; q < VPT; ++q) {
+        if (q == slot) p[q] = -INFINITY;
+      }
+    }
+    if (lane == 0) {
+      weights[row * k + j] = best_v;                     // -INFINITY when best < 0
+      indices[row * k + j] = static_cast<int32_t>(best);  // -1 when best < 0
+      denom += best_v;
+    }
+  }
+  if (lane == 0 && renormalize) {
+    if (!(denom > 0.0f)) denom = 1.0f;  // denom<=0 -> 1 guard, as :197
+    for (int j = 0; j < k; ++j) weights[row * k + j] /= denom;
   }
 }
 
@@ -417,9 +546,60 @@ void LaunchGroupedRouter(cudaStream_t s, Tensor& weights, Tensor& indices,
   Check(cudaGetLastError(), "moe_router_grouped_topk launch");
 }
 
+// VT_MOE_ROUTER_WARP (default ON, "0" restores the block kernel for a
+// same-binary A/B). Read fresh per launch -- a getenv on a host path that runs
+// once per MoE layer per step -- so an in-process test can flip it, matching
+// Fa2PrefillEnabled() (cuda_paged_attn.cu:2504-2507). Under CUDA-graph capture
+// it is read at capture time and the graph bakes the chosen kernel, which is
+// how every other lever in this backend behaves.
+bool MoeRouterWarpEnabled() {
+  return MoeRouterWarpFlagIsOn(std::getenv("VT_MOE_ROUTER_WARP"));
+}
+
+// Returns false when this (E) is not one of the widths whose byte-exactness is
+// derived, so the caller falls through to the UNCHANGED block kernel.
+template <typename Tin>
+bool LaunchRouterWarp(cudaStream_t s, Tensor& weights, Tensor& indices, const Tensor& logits,
+                      int64_t t, int64_t e, int k, bool renorm) {
+  const int vpt = MoeRouterWarpValuesPerThread(e);
+  if (vpt == 0) return false;  // decide BEFORE touching the tensors
+  const dim3 block(kMoeRouterWarpWidth, kMoeRouterWarpsPerCta);
+  const unsigned grid =
+      static_cast<unsigned>((t + kMoeRouterWarpsPerCta - 1) / kMoeRouterWarpsPerCta);
+  float* w = weights.Ptr<float>();
+  int32_t* idx = indices.Ptr<int32_t>();
+  const Tin* lg = logits.Ptr<Tin>();
+  switch (vpt) {
+    case 1:
+      MoeRouterTopKWarpKernel<Tin, 1><<<grid, block, 0, s>>>(w, idx, lg, t, k, renorm);
+      break;
+    case 2:
+      MoeRouterTopKWarpKernel<Tin, 2><<<grid, block, 0, s>>>(w, idx, lg, t, k, renorm);
+      break;
+    case 4:
+      MoeRouterTopKWarpKernel<Tin, 4><<<grid, block, 0, s>>>(w, idx, lg, t, k, renorm);
+      break;
+    case 8:
+      MoeRouterTopKWarpKernel<Tin, 8><<<grid, block, 0, s>>>(w, idx, lg, t, k, renorm);
+      break;
+    default:
+      return false;
+  }
+  Check(cudaGetLastError(), "moe_router_topk_warp launch");
+  return true;
+}
+
 template <typename Tin>
 void LaunchRouter(cudaStream_t s, Tensor& weights, Tensor& indices, const Tensor& logits,
                   int64_t t, int64_t e, int k, bool renorm, bool serial) {
+  // The single-warp kernel is byte-identical (see MoeRouterTopKWarpKernel) but
+  // NEVER replaces `serial`: that path is the byte-exact ORACLE the parity test
+  // compares against, so changing it would invalidate the oracle instead of
+  // testing the candidate.
+  if (!serial && MoeRouterWarpEnabled() &&
+      LaunchRouterWarp<Tin>(s, weights, indices, logits, t, e, k, renorm)) {
+    return;
+  }
   const size_t shmem = static_cast<size_t>(e) * sizeof(float);
   if (serial) {
     MoeRouterTopKKernel<Tin, true><<<static_cast<unsigned>(t), kBlock, shmem, s>>>(

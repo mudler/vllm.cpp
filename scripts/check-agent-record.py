@@ -138,7 +138,19 @@ MATRICES = {
     # ADVANCED to `ACTIVE` (keep-quant compute landed) by `CLAIM-DEEPSEEK-V4-W8` —
     # the `UD-IQ2_XXS` down-projection routed experts (`ffn_down_exps`) are IQ3_XXS;
     # no row count change (an in-place advance, not a new row).
-    "QUANT": (AGENTS / "quantization-matrix.md", 82),
+    # 84 since 2026-08-18: +`QUANT-QWEN38-27B-GGUF-ARM` and
+    # +`QUANT-QWEN38-27B-NVFP4-ARM`, the two quantized arms of Qwen3.8-27B whose bf16
+    # arm is already gated (#915) and which #821 has owned with no row of its own.
+    # Two rows and not one: they share nothing but a model name -- different file
+    # format, different loader translation unit, different oracle (llama.cpp for the
+    # GGUF arm, because vLLM has no in-tree GGUF at the pin and SGLang's alias table
+    # does not reach `qwen3_5`; pinned vLLM for NVFP4, which it runs), different
+    # external blockers (#857 vs #1185), and even different tokenizers on disk.
+    # Merging them would let one external blocker hold the other's work. Neither is
+    # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
+    # encoding rather than on a checkpoint. Both `READY`, spec
+    # `specs/qwen38-27b-quant-arms.md`, issue #821.
+    "QUANT": (AGENTS / "quantization-matrix.md", 84),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
@@ -543,8 +555,20 @@ ENGINE_PREFIXES = (
 # 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
 # ported here, so this row records a divergence that already exists rather than
 # introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
+# 164 since 2026-08-18: +`LOAD-GGUF-MMPROJ` (a SECOND, `clip`-architecture GGUF
+# projector file beside the language file, and the Qwen3-VL vision tower loaded out
+# of it). Genuinely new and not expressible by `LOAD-GGUF` beside it: that row owns
+# the reader, the dequantization and the Qwen name transforms for ONE file, and the
+# single-file assumption it was built on is structural rather than incidental --
+# `ModelSource` carries a vector of safetensors shards and exactly one `GgufFile*`
+# (`model_registry.h:98`), and `EngineParams` has no projector field, so an mmproj
+# has nowhere to arrive. Sharding is already handled and is not this: `DetectSplit`
+# merges shards of ONE split, never a second, differently-architected file. Nothing
+# in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
+# whose only caller is a test, and that refusal becomes reachable production code the
+# moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 163
+ENGINE_ROWS = 164
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

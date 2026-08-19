@@ -416,9 +416,16 @@ vllm_cpp_add_test(test_fp8_block_weight_load
 # dense forward that reaches it.
 vllm_cpp_add_test(test_fp8_block_linear
   vllm/model_executor/models/test_fp8_block_linear.cpp)
+
+# MODEL-FP8-BLOCK-MERGED (#1189 M6): the merged gate_up and QKV projections of
+# the block-wise FP8 arm. Enters at `ModelRegistry::Forward`, so deleting either
+# production merge call site reds this target.
+vllm_cpp_add_test(test_fp8_block_merged
+  vllm/model_executor/models/test_fp8_block_merged.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
+vllm_cpp_add_test(test_qwen3_decode_graph_seam vllm/models/test_qwen3_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
 # GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
@@ -1715,6 +1722,16 @@ target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_
 # in cuda_gdn.cu and is covered by same-process byte-exact CUDA comparisons.
 vllm_cpp_add_test(test_gdn_decode_fused vt/test_gdn_decode_fused.cpp)
 target_include_directories(test_gdn_decode_fused PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier REDUCTION-ORDER contract for the single-warp MoE router top-k
+# (VT_MOE_ROUTER_WARP, default ON; spec moe-router-topk-single-warp.md, #378).
+# The claim is that the lane map `expert = lane + 32*slot` plus a per-lane
+# halving tree performs the bit-identical float additions as the incumbent
+# 256-thread block reduction in src/vt/cuda/cuda_moe.cu -- pure IEEE-754, so it
+# is provable with no GPU and no nvcc. Reaches the CUDA-free map/tree/selector
+# header under src/; the executing kernel is covered on-device by the
+# parallel-vs-serial byte-exactness case in test_ops_moe_grouped.
+vllm_cpp_add_test(test_moe_router_warp_map vt/test_moe_router_warp_map.cpp)
+target_include_directories(test_moe_router_warp_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load
 # fast-path flags (VT_FP4_QUANT_FAST + VT_SILU_FP4_FAST, both default OFF /
 # '1'-opt-in). Reaches the internal header under src/ (not public API); the
@@ -1764,6 +1781,43 @@ target_include_directories(test_graph_dedup PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # by NO test on any tier; the latch defect hid in exactly that gap.
 vllm_cpp_add_test(test_graph_dedup_runtime vt/test_graph_dedup_runtime.cpp)
 target_include_directories(test_graph_dedup_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-CUDAGRAPH-DEDUP / #1226: the coarse-key knob itself. vt::GraphDedupCoarseKeyEnabled
+# caches its answer in a function-local static -- deliberately, because the drivers
+# capture lazily and a knob that moved between two captures would give one model a mixed
+# set of handles -- so ONE PROCESS CAN OBSERVE ONE VALUE. Proving that "1" enables the
+# coarse key and "10" does not therefore takes one process per value, which is what these
+# entries are. Without them the accessor's only coverage was a single unset-variable
+# CHECK_FALSE, which two mutations survived: accepting any non-null value, and reading a
+# completely different variable name.
+vllm_cpp_add_test(test_graph_dedup_coarse_env vt/test_graph_dedup_coarse_env.cpp)
+target_include_directories(test_graph_dedup_coarse_env PRIVATE ${CMAKE_SOURCE_DIR}/src)
+function(vllm_cpp_add_coarse_key_case suffix value expect)
+  add_test(NAME test_graph_dedup_coarse_env_${suffix}
+    COMMAND test_graph_dedup_coarse_env)
+  set_tests_properties(test_graph_dedup_coarse_env_${suffix} PROPERTIES
+    ENVIRONMENT "VT_CUDA_GRAPH_DEDUP_COARSE_KEY=${value};VT_COARSE_KEY_EXPECT=${expect}"
+    SKIP_RETURN_CODE 77)
+endfunction()
+# The one value that turns it on. This entry is what proves the accessor reads THIS
+# variable: a mutation that reads any other name leaves it unset and fails here.
+vllm_cpp_add_coarse_key_case(on "1" 1)
+# ...and the near misses, each of which enables the key under a `value != nullptr` test.
+# "10" is a hand-edited "1" plus a stray keystroke, and it turning a default-off
+# correctness-sensitive path on by accident is the failure the polarity exists to stop.
+vllm_cpp_add_coarse_key_case(off_zero "0" 0)
+vllm_cpp_add_coarse_key_case(off_ten "10" 0)
+vllm_cpp_add_coarse_key_case(off_oh_one "01" 0)
+vllm_cpp_add_coarse_key_case(off_one_x "1x" 0)
+vllm_cpp_add_coarse_key_case(off_true "true" 0)
+vllm_cpp_add_coarse_key_case(off_empty "" 0)
+# The knob is DEFINED but the OTHER knob is the one set. The two are separate variables
+# and the coarse key must not piggyback on VT_CUDA_GRAPH_DEDUP: a run that asked only for
+# dedup must get the exact key the 2026-08-18 device gate ran, or the A/B is not one.
+add_test(NAME test_graph_dedup_coarse_env_off_sibling_knob
+  COMMAND test_graph_dedup_coarse_env)
+set_tests_properties(test_graph_dedup_coarse_env_off_sibling_knob PROPERTIES
+  ENVIRONMENT "VT_CUDA_GRAPH_DEDUP=1;VT_COARSE_KEY_EXPECT=0"
+  SKIP_RETURN_CODE 77)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).
@@ -1852,6 +1906,13 @@ add_test(NAME test_ops_fp8_alpha_vec_epilogue_on
 set_tests_properties(test_ops_fp8_alpha_vec_epilogue_on PROPERTIES
   ENVIRONMENT "VT_FP8_ALPHA_VEC_EPILOGUE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
+# Reaches the CUDA-free VT_MOE_ROUTER_WARP selector header under src/, through
+# the shared test-only pin tests/vt/moe_router_warp_env.h: the parallel-vs-serial
+# router case PINS that toggle both ways and ASSERTS the pinned state, so it can
+# no longer degenerate to block-vs-serial when the ambient environment says 0
+# (spec moe-router-topk-single-warp.md §9, #378). Same include pattern as
+# test_moe_router_warp_map above, which executes that pin without a GPU.
+target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)

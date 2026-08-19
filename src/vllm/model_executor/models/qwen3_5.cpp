@@ -2387,10 +2387,46 @@ struct FullAttnQkvOutput {
 FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                                      const Tensor& h, int64_t t,
                                      const Tensor* h_fp8,
-                                     [[maybe_unused]] bool packed_consumers) {
+                                     bool packed_consumers) {
   FullAttnQkvOutput out;
   out.fp4 = !w.q_proj_fp4.Empty();
   const bool fp8 = !w.q_proj_fp8.Empty();
+
+  // MODEL-FP8-BLOCK-MERGED (#1189 M6): vLLM's QKVParallelLinear, as ONE
+  // block-scaled GEMM over the N-concatenated q|k|v operand
+  // (`linear.py:1247-1260` @ `5559679229`). FIRST, before the fp4 and
+  // per-tensor fp8 branches, mirroring the loader's own rung order: a
+  // block-wise weight is `F8_E4M3` on disk and the per-tensor probe would
+  // otherwise claim it (#1166 seen from the forward's end).
+  //
+  // `packed_consumers` is the site's own precondition and predates this row:
+  // the merged output exposes ROW-STRIDED q/k/v views, which only the fused
+  // attn preamble reads correctly, so the fp4 and per-tensor fp8 merged arms
+  // carry the same gate. It is a property of the consumer, not of the scales.
+  if (!w.q_proj_fp8_block.Empty() && packed_consumers) {
+    const dense_fp8_block::Fp8BlockShard qkv_shards[3] = {
+        {&w.q_proj_fp8_block, "q_proj"},
+        {&w.k_proj_fp8_block, "k_proj"},
+        {&w.v_proj_fp8_block, "v_proj"}};
+    const dense_fp8_block::Fp8BlockMergedView qkv =
+        dense_fp8_block::ResidentFp8BlockMerged(
+            d, vt::kFp8BlockQkv, "qkv_proj", qkv_shards, 3,
+            w.qkv_fp8_block_merged);
+    // bf16, which is upstream's `out_dtype` at this site and what the split
+    // block arm below already emits, so the merge moves no dtype.
+    out.packed_owner.emplace(dense_fp8_block::MatmulFp8BlockMergedD<DBuf>(
+        d, h, qkv, DType::kBF16, vt::kFp8BlockQkv));
+    Tensor all = out.packed_owner->t();
+    const int64_t qn = w.q_proj_fp8_block.n;
+    const int64_t kn = w.k_proj_fp8_block.n;
+    const int64_t vn = w.v_proj_fp8_block.n;
+    VT_CHECK(all.shape[1] == qn + kn + vn,
+             "qwen3_5 packed block-wise FP8 QKV: output shape mismatch");
+    out.qgate = all.Slice(1, 0, qn);
+    out.key = all.Slice(1, qn, qn + kn);
+    out.value = all.Slice(1, qn + kn, qn + kn + vn);
+    return out;
+  }
 #ifdef VT_CUTLASS_NVFP4
   if (out.fp4 && MergedQkvEligible(w, d, packed_consumers)) {
     out.packed_owner.emplace(MergedQkvCutlassD(d, h, w));
@@ -7093,12 +7129,26 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // templated on its input dtype, so gate/up feed it unchanged; down_proj's
   // bf16 is what every other arm of this return already produces.
   if (!w.gate_proj_fp8_block.Empty()) {
-    DBuf bg = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
-        d, dh, w.gate_proj_fp8_block, DType::kBF16);
-    DBuf bu = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
-        d, dh, w.up_proj_fp8_block, DType::kBF16);
-    DBuf bact(d, DType::kBF16, {T, I});
-    vt::MoeSiluMul(d.q, bact.t(), bg.t(), bu.t());
+    // MODEL-FP8-BLOCK-MERGED (#1189 M6). ONE gate_up GEMM, which is vLLM's own
+    // topology (`MergedColumnParallelLinear`, named for this model at
+    // `models/qwen3_5.py:288-298`, loaded at `layers/linear.py:660`). Unlike the
+    // per-tensor fp8 merge two screens up, this needs no alpha vector and no
+    // shared-scale guard: block scales concatenate losslessly along N. The
+    // merged GEMM is byte-identical to the two split ones, so the ONLY
+    // instrument that can see the merge is the dispatch counter, which
+    // `tests/vllm/model_executor/models/test_fp8_block_merged.cpp` reads.
+    const dense_fp8_block::Fp8BlockShard gate_up_shards[2] = {
+        {&w.gate_proj_fp8_block, "gate_proj"},
+        {&w.up_proj_fp8_block, "up_proj"}};
+    const dense_fp8_block::Fp8BlockMergedView gate_up =
+        dense_fp8_block::ResidentFp8BlockMerged(
+            d, vt::kFp8BlockGateUpSwiGLU, "gate_up_proj", gate_up_shards, 2,
+            w.gate_up_fp8_block_merged);
+    VT_CHECK(gate_up.n_total == 2 * I,
+             "qwen3_5 dense MLP: the merged block-wise FP8 gate_up operand's N "
+             "does not match twice the intermediate size");
+    DBuf bact = dense_fp8_block::Fp8BlockGateUpSwiGLUD<DBuf>(d, dh, gate_up,
+                                                            DType::kBF16);
     return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
         d, bact.t(), w.down_proj_fp8_block, DType::kBF16);
   }

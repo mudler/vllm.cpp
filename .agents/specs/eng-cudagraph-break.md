@@ -1517,6 +1517,16 @@ region by construction, and that driver is the production caller. Gated as a
 counter and an ORDER out of one backend trace, with two mutations proving neither
 the rule nor its control arm is vacuous.
 
+**#1305 IS FIXED, and reading the tree made it a bigger defect than the issue
+described.** The three registrations it names never published
+`detail::DeviceTokenIdsScope` and neither model's `EmbedInto` ever consulted one,
+so `device_token_ids` reached nothing in either translation unit — the eager arms
+as well as the decode graph. Both now consume it, and each decode-graph slot
+holds a `vllm::StepTokenIds` on `vt::PersistentStepInput`, which is
+`RefreshFromDevice`'s first production caller. What is NOT closed is the depth-2
+battery on a device; `## Owed` carries it, and `qwen3.cpp`'s decline is
+untouched.
+
 **W4 corrected a premise this spec had asserted three times.** The decode graph
 carries NO token ids to the device in any driver, `StepDevInputs` included, so
 the `qwen3.cpp` async decline was never one refactor away from removable. It
@@ -1775,7 +1785,22 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   "a record edit rides in the pull request whose change made the record stale".
   The decline itself is UNCHANGED.
 
-  **`RefreshFromDevice` therefore lands with NO production caller, and that is
+  **`RefreshFromDevice` HAS A PRODUCTION CALLER as of
+  [#1305](https://github.com/mudler/vllm.cpp/issues/1305), which retires the
+  staged slice below.** `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph` each
+  give their padded size slot a `vllm::StepTokenIds`
+  (`include/vllm/model_executor/models/step_token_ids.h`), whose destination is a
+  device buffer with a stable address and whose refresh takes the DEVICE arm
+  whenever the runner's mirror is live; `last_source()` and `StepInputSource`
+  gain their reader with it. Reached from `ModelRegistry::Forward` through
+  `qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp` and
+  `glm4_moe_lite_registry.cpp`, and gated at
+  `tests/vllm/models/test_moe_async_device_ids.cpp`, which enters at that entry
+  point over a synthetic safetensors checkpoint and reds when the registry's
+  scope line is deleted. The paragraph below is the record as W4 wrote it and is
+  kept for provenance.
+
+  **`RefreshFromDevice` landed with NO production caller, and that was
   the staged slice AGENTS.md admits rather than an oversight.** `grep -rn
   RefreshFromDevice src/ include/` returns the definition alone;
   `last_source()` and `StepInputSource` have no production reader either. The
@@ -1824,6 +1849,67 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   run the battery shape against `Qwen3MoeDecodeGraph` and `DeepseekV2DecodeGraph`
   and find out whether they degenerate at depth 2 at all. Owner: row
   **`ENG-CUDAGRAPH-BREAK`**, the stage that gets that window.
+
+  **RESOLVED, AND NOT THE WAY EITHER W3 OR W4 EXPECTED, because reading the tree
+  found a LARGER defect than the one #1305 describes and a fix that needs no
+  decline at all.** #1305 reads as a graph-arm hazard. It is not: those three
+  registrations never constructed a `detail::DeviceTokenIdsScope` and neither
+  `qwen3_moe.cpp`'s nor `deepseek_v2.cpp`'s `EmbedInto` ever consulted one, so
+  `ModelForwardInput::device_token_ids` reached NOTHING in either translation
+  unit. The decode graph, `ForwardDevice` and `Forward` all embedded the host
+  vector the runner's mirror arm deliberately leaves stale for decode rows. That
+  is a defect on the EAGER path too, which no decline could have mitigated, and
+  it is why the fix is the consumption rather than the refusal.
+
+  What landed: the three registries publish the scope, the same mechanism
+  `qwen3.cpp`, `qwen3_5.cpp`, `mistral_registry.cpp`, `internlm2_registry.cpp`
+  and `llama_registry.cpp` already use, so every embed in both translation units
+  consumes it; and each decode-graph size slot holds a `vllm::StepTokenIds`
+  whose destination is a device buffer with a stable address, refreshed through
+  `vt::PersistentStepInput` — host arm for the padded vector, DEVICE arm over the
+  real prefix, both on the main queue so the second is ordered after the combine
+  rather than racing it. That is the version of the fix this row was scoped to
+  produce, and it gives `RefreshFromDevice` its first production caller instead
+  of a fifth private copy.
+
+  Gated at `tests/vllm/models/test_moe_async_device_ids.cpp`, entered at
+  `ModelRegistry::Forward` over a synthetic safetensors checkpoint for both
+  architectures: three runs each — right host ids and no mirror as the reference,
+  stale host ids and no mirror as the CONTROL that must differ, stale host ids
+  with the truth reaching the model only through `device_token_ids` as the gate.
+  RED before the fix at 2 cases / 59 assertions / 12 failed / exit 1, with 200 of
+  200 logit values differing per step on both architectures; GREEN after at
+  59/59. Two mutations: deleting the registry scope line reds it at 6 assertions,
+  and swapping the seam's DEVICE arm for its HOST arm leaves the logits BIT
+  IDENTICAL and reds only the counters, which is the arm no token gate can see.
+
+  **WHAT IS STILL OWED, narrowed rather than closed.** The depth-2
+  four-concurrent battery against these two models on a real device has NOT been
+  run: it needs a GPU and a real checkpoint, and this stage had neither. So the
+  fix is proven to embed the mirror's identifiers and is NOT proven to close the
+  degeneration `qwen3.cpp`'s decline was measured against — whose own cause W4
+  established is unidentified. `qwen3.cpp`'s decline therefore STANDS, untouched.
+  Owner: row **`ENG-CUDAGRAPH-BREAK`**, the stage that gets a `dgx` window with
+  checkpoints; the same window the decline entry above already owes two runs to.
+- **`test_qwen3_5_decode_graph_seam` SIGSEGVs on `main`, in W6's own case, and
+  every assertion passes**
+  ([#1390](https://github.com/mudler/vllm.cpp/issues/1390), found while landing
+  [#1305](https://github.com/mudler/vllm.cpp/issues/1305), not caused by it).
+  Measured at `5f68e60df`, which is `origin/main` exactly, CPU Release: `8 cases,
+  7 passed, 1 failed, 135 assertions, 135 passed, 0 failed`, exit 139, with
+  `W6: two spec shapes of EQUAL S and different q get two graphs` reporting
+  `CRASHED: SIGSEGV`. **The assertion counter cannot see it** — the number a
+  reader greps says 135/135 — so only the exit status and the `CRASHED` line
+  carry the verdict. It is ORDER-DEPENDENT: `-tc="W6*"` alone passes at 9/9,
+  exit 0, so the crash needs state an earlier case in the same process left
+  behind. `gdb` puts the fault inside `vt::cpu::PagedAttentionKernel` on a
+  threadpool worker, which is what a block table or slot mapping that does not
+  describe the handed KV cache looks like. Reverse-applying #1305's whole source
+  change and rebuilding leaves the same exit 139, and that change executes none
+  of this binary's crashing path. NOT fixed in flow: a segmentation fault in
+  another stage's newly landed code, mechanism unlocated, in a file under
+  concurrent edit for [#1380](https://github.com/mudler/vllm.cpp/issues/1380).
+  Owner: row **`ENG-CUDAGRAPH-BREAK`**, the stage that owns W6.
 - **An exception CAUGHT INSIDE the capture scope leaves a partial capture the
   drain cannot see.** The `uncaught_exceptions()` comparison in
   `~GraphCaptureScope` detects an exception that is PROPAGATING at scope exit. A

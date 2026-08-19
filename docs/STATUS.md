@@ -1045,6 +1045,17 @@ throughput does not. Output throughput is biased UP if the prompts were truly
 truncated, by roughly 0.13% at c1 and 0.4-0.6% at c8 — larger than the 0.039% and
 0.205% CVs published beside them, so the bias is not inside the stated precision.
 
+**That caveat now carries a row.** `SPEC-PROMPT-TOKEN-DIVERGENCE` is READY
+([#1355](https://github.com/mudler/vllm.cpp/issues/1355),
+[spec](../.agents/specs/prompt-token-divergence.md)): diagnosis committed, defect
+not located, no product code changed. Off the box our tokenizer sources return
+HuggingFace's IDS, not merely its counts, for all 48 regenerated prompts on
+x86-64 at four optimisation settings, under ASan and UBSan, and over a real
+socket. The count is not a reporting artifact: `usage.prompt_tokens` is the id
+vector the engine consumed, so a short one means the model saw a different
+prompt. What is left needs the ARM box, because the server binary was aarch64 and
+that CI lane builds four kernel targets and runs no tokenizer gate at all.
+
 **Our half of the debt is discharged. Neither cell is a ratio, and each is
 blocked for its own reason.** At c1 vLLM also completed every request
 (**4.2835 tok/s**, CV 0.033%) and both absolutes stand, but

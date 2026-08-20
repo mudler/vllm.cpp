@@ -232,7 +232,14 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(
 // DOES reuse is the tied-embedding rule (`output.weight` absent => the head IS
 // `token_embd.weight`) and the sidecar-aware dequant, so an NVFP4 head cannot
 // silently lose the `<stem>.scale` factor its blocks do not carry.
+//
+// `head_was_quantized` (optional) reports whether the head tensor this
+// dequantized was BLOCK-QUANTIZED on disk rather than stored as dense floats.
+// `SPEC-DFLASH2` W3 (#1314) needs it: the DFlash2 candidate selector consumes
+// the target head's EXACT top-K, which a dequantized head does not produce, and
+// upstream refuses that case by name. The DFlash1 lane does not read it.
 void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& gguf, OwnedTensor* embed,
-                                    OwnedTensor* head);
+                                    OwnedTensor* head,
+                                    bool* head_was_quantized = nullptr);
 
 }  // namespace vllm

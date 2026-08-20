@@ -92,6 +92,59 @@ struct Qwen3DFlashConvWeights {
   bool Empty() const { return base_kernel.bytes.empty(); }
 };
 
+// SPEC-DFLASH2 W3 (#1314): the CANDIDATE SELECTOR of a DFlash2 draft. EMPTY on a
+// DFlash1 draft, which is what `Qwen3DFlashWeights::IsDflash2` reads.
+//
+// BEYOND-PIN, from `CandidateSelector` and `DFlash2Qwen3ForCausalLM`
+// (vllm/model_executor/models/qwen3_dflash2.py:231-356 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`). The
+// PR head MOVED from `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19
+// (#1404). `_score_edges`, `CandidateSelector` and every line of
+// `compute_candidates` except the LM-head guard are BYTE-IDENTICAL at the two
+// heads; the two things that changed are ported or recorded on
+// `Dflash2SelectorWeights::kNonPortSetModelTag` below.
+//
+// The three tensors are named exactly as the published checkpoint stores them
+// (`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+// safetensors header read 2026-08-19):
+//   candidate_selector.hidden_projection.weight  bf16 (256, 5120)
+//   candidate_selector.predecessor_codebook      bf16 (248320, 256)   127 MB
+//   candidate_selector.successor_codebook        bf16 (248320, 256)   127 MB
+//
+// The two codebooks are ~254 MB resident that the DFlash1 lane never allocates
+// (`## Risks/decisions` D5). Upstream stores them bf16 and so do we; whether a
+// narrower dtype would serve is NOT decided by this row.
+struct Dflash2SelectorWeights {
+  OwnedTensor hidden_projection;     // bf16 raw-NK [rank, H], nk
+  OwnedTensor predecessor_codebook;  // bf16 [vocab, rank]
+  OwnedTensor successor_codebook;    // bf16 [vocab, rank]
+  int64_t rank = 0;    // dflash_config.selector_rank (256 on both drafts)
+  int64_t top_k = 0;   // dflash_config.selector_top_k (16 on both drafts)
+  // The two OUTPUT SCALARS, applied to the candidate VALUES in
+  // `compute_candidates` BEFORE the selector scores them
+  // (`DFlash2Qwen3ForCausalLM.compute_candidates` @ that head). A wrong value
+  // reorders the top-K and moves acceptance without raising anything, which is
+  // this row's signature invisible defect, so `## Risks/decisions` D9 requires
+  // them gated against a checkpoint that SETS them:
+  // `z-lab/Muse-Glimmer-30B-DFlash2` ships 0.19611613513818404 and 20.0, while
+  // `z-lab/Qwen3.8-27B-DFlash2` ships neither and takes both defaults (#1327).
+  float output_multiplier = 1.0f;
+  // `float(dflash_config.get("final_logit_softcapping") or 0.0)`, then DISABLED
+  // when not > 0 — upstream's own `softcap if softcap > 0 else None`. So 0 here
+  // means "no softcap" and never "cap at zero".
+  float final_logit_softcapping = 0.0f;
+  bool Empty() const { return predecessor_codebook.bytes.empty(); }
+  // A DELIBERATE NON-PORT, recorded rather than skipped in silence. Upstream
+  // wraps the selector's construction in `set_model_tag("dflash2_candidate_selector")`
+  // because `CandidateSelector` carries its own `@support_torch_compile` and is
+  // built while the draft's model tag is still active, so without a tag of its
+  // own the two share a torch.compile cache namespace and the selector loads the
+  // draft's graph. It is the only behavioural change #52816 made to this file
+  // between the two heads. This engine has no torch.compile and no compile
+  // cache, so there is nothing for a tag to disambiguate.
+  static constexpr const char* kNonPortSetModelTag = "dflash2_candidate_selector";
+};
+
 // One DFlash draft decoder layer: input/post standard RMSNorm + plain Qwen3
 // attention (merged qkv, per-head q/k norm, NeoX RoPE) + SwiGLU MLP. Weights are
 // kept in the on-disk torch-Linear [N=out,K=in] orientation (nk=true) for
@@ -145,6 +198,21 @@ struct Qwen3DFlashWeights {
   // with `1 + k` once the resolved speculative config is known, because a CLI `k`
   // that differs from the checkpoint's default must move the conv's block with it.
   int64_t conv_block_size = 0;
+  // SPEC-DFLASH2 W3 (#1314): TRUE when the SHARED lm_head above was produced by
+  // DEQUANTIZING a quantized target tensor rather than read as dense floats.
+  // Only the GGUF target arm can set it (`LoadGgufSharedEmbedAndHeadBf16`
+  // dequantizes a q6_K/NVFP4 `output.weight` to bf16); the safetensors arm
+  // refuses a non-BF16 head one layer up in `LoadNamedBf16`. It exists because
+  // the DFlash2 selector's whole input is the target head's EXACT top-K, which a
+  // dequantized head does not produce -- the case upstream's LM-head guard
+  // refuses by name. See `RefuseQuantizedDflash2LmHead`
+  // (qwen3_dflash2.h). Read only by that guard; the DFlash1 lane is unaffected,
+  // which is why the flag is recorded rather than refused at load.
+  bool lm_head_dequantized = false;
+  // SPEC-DFLASH2 W3 (#1314): the candidate selector. EMPTY on a DFlash1 draft.
+  // It is loaded whenever `IsDflash2()`, because a DFlash2 checkpoint that
+  // carried the conv and no selector is not a shape this port knows how to run.
+  Dflash2SelectorWeights candidate_selector;
   bool IsDflash2() const { return conv_taps > 0; }
 };
 

@@ -348,9 +348,11 @@ class SharedHeadSource {
   // Fill the draft's two shared tensors. Both arms produce the SAME thing: bf16
   // `[vocab, H]` with nk=false for the gather table and the same `[vocab, H]`
   // with nk=true for the MatmulBT head. Throws naming the source on absence.
-  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head) const {
+  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
+                bool* head_was_quantized = nullptr) const {
+    if (head_was_quantized != nullptr) *head_was_quantized = false;
     if (gguf_ != nullptr) {
-      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head);
+      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
       *embed = LoadNamedBf16(
           *shards_, "model.language_model.embed_tokens.weight", false);
@@ -469,10 +471,11 @@ std::vector<std::string> ReadDflashDraftArchitectures(const std::string& path) {
 //  * SAFETENSORS is ADMITTED. Its grouped dynamic depthwise convolution is
 //    implemented (`vt::DFlashGroupedConv`), loaded (`LoadQwen3DFlash` reads the
 //    per-layer `attention_conv`/`mlp_conv` tensors) and RUN (every layer body of
-//    `Qwen3DFlashModel`). What is still missing is the candidate selector, and
-//    that is refused BY NAME one step later, after the conv has executed, at
-//    `RefuseDflash2CandidateSelector`. Refusing here instead would leave every
-//    line of W2 unreachable from any production entry point -- AGENTS.md
+//    `Qwen3DFlashModel`), and as of W3 so is its CANDIDATE SELECTOR
+//    (`vllm::v1::Dflash2SelectCandidates`). What is still missing is the PATH
+//    WALK, and that is refused BY NAME one step later, after both have executed,
+//    at `RefuseDflash2PathWalk`. Refusing here instead would leave every
+//    line of W2 and W3 unreachable from any production entry point -- AGENTS.md
 //    `## Nothing lands dead`. The notice below is what a user gets at STARTUP so
 //    the later refusal is not a surprise; it is a notice and not a warning about
 //    a degraded result, because there is no degraded result: the engine refuses.
@@ -510,12 +513,13 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
     std::cerr
         << "vllm.cpp: the draft checkpoint at \"" << draft_model_path
         << "\" declares architecture \"DFlash2DraftModel\". Its grouped dynamic "
-           "depthwise convolution is implemented and will run; its CANDIDATE "
-           "SELECTOR is not implemented, and this draft will be refused by name at "
-           "its first propose rather than sampled with the DFlash1 per-slot argmax "
-           "(which would propose worse tokens with no visible symptom, because the "
-           "verify is lossless). Owed by row SPEC-DFLASH2 wave W3 "
-           "(.agents/specs/dflash2-spec-decode.md), issue #1314.\n";
+           "depthwise convolution and its CANDIDATE SELECTOR are implemented and "
+           "will run; its PATH WALK is not implemented, and this draft will be "
+           "refused by name at its first propose rather than sampled with the "
+           "DFlash1 per-slot argmax (which would propose worse tokens with no "
+           "visible symptom, because the verify is lossless). Owed by row "
+           "SPEC-DFLASH2 wave W4 (.agents/specs/dflash2-spec-decode.md), issue "
+           "#1314.\n";
     return;
   }
   throw std::invalid_argument(
@@ -526,11 +530,12 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
       "`MakeDflashGgufConfig` reads none of the DFlash2 metadata beyond the keys "
       "that identify the file, and `LoadQwen3DFlashFromGguf` has no name for the "
       "conv or selector tensors. The SAFETENSORS DFlash2 draft is admitted as of "
-      "SPEC-DFLASH2 W2: its grouped dynamic depthwise convolution is implemented "
-      "and runs, and it is refused at the candidate selector instead "
+      "SPEC-DFLASH2 W2: its grouped dynamic depthwise convolution and (as of W3) "
+      "its candidate selector are implemented and run, and it is refused at the "
+      "path walk instead "
       "(vllm/model_executor/models/qwen3_dflash2.py and "
       "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py @ "
-      "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f). "
+      "vllm-project/vllm#52816 head 66e5414c6d75a8529473d977f7458c140bbab8a0). "
       "Loading this file through the DFlash1 GGUF lane instead would succeed, "
       "because a DFlash2 GGUF carries DFlash1's whole tensor set and declares the "
       "same `general.architecture`, and it would draft worse tokens with no "
@@ -801,7 +806,8 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // exactly as vLLM's skip_substrs(embed_tokens)/tie handling. Common to BOTH
   // draft sources and BOTH target containers since B1 - the source abstraction
   // is what lets the four combinations share one code path.
-  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head);
+  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head,
+                  &draft->weights.lm_head_dequantized);
   draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
   // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
   // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
@@ -1461,6 +1467,15 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
                    AttachMtp(MakeQwen3_5DenseLoadedModel(std::move(weights)),
                              std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
+
+// SPEC-DFLASH2 W3 (#1314): the DFlash counterpart of the overload above. See the
+// header for why it exists and what it makes reachable.
+LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::unique_ptr<DflashDraft> dflash_draft)
+    : LoadedEngine(std::move(config), MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                   std::move(tokenizer), params, /*preselected_queue=*/nullptr,
+                   std::move(dflash_draft)) {}
 
 LoadedEngine::LoadedEngine(HfConfig config,
                            std::unique_ptr<LoadedModel> model,

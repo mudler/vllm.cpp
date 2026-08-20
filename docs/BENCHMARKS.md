@@ -426,7 +426,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: **0.835x** paired on kairos-17dd (matched 89 tokens, warm oracle cache). Prior 0.957-0.989 came from a different machine with a cold oracle (#442) | `ACTIVE` |
 | DSpark block floor | Qwen3.8-27B + `RadixArk/Qwen3.8-27B-DSpark` @ `85ef153b` | a `k` below the draft's block is refused instead of drafted; the run gate that exhibits the garbling is **owed** and needs a GPU lease (#1225) | `ACTIVE` |
 | DSpark draft routing | Qwen3.8-27B + `RadixArk/Qwen3.8-27B-DSpark` @ `85ef153b` | **PENDING**, no number. The token-exact run gate needs the 2.53 GiB draft and GPU time, and neither authority is recorded; only the CPU classification gate has run (`.agents/specs/dspark-qwen3-routing.md` §6) | `ACTIVE` |
-| DFlash2 route and causality | `Qwen/Qwen3.8-27B` + `z-lab/Qwen3.8-27B-DFlash2` | **PENDING, no number admissible.** W2 landed the grouped convolution; the draft is still refused at the candidate selector, so no step exists to time. Acceptance (G3, SAME-TRAJECTORY) reads first | `ACTIVE` |
+| DFlash2 route and causality | `Qwen/Qwen3.8-27B` + `z-lab/Qwen3.8-27B-DFlash2` | **PENDING, no number admissible.** W2 landed the convolution and W3 the candidate selector; the draft is refused at the PATH WALK, so no complete draft step exists to time. Acceptance (G3, SAME-TRAJECTORY) reads first | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

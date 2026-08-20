@@ -4,33 +4,14 @@
 // DF-ENGINE-INTEGRATION.
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"
 
+#include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"
+
 #include <cstddef>
 
 #include "vt/backend.h"
 
 namespace vllm::v1 {
 
-void RefuseDflash2CandidateSelector(const Qwen3DFlashWeights& weights) {
-  if (!weights.IsDflash2()) return;
-  VT_CHECK(false,
-           "dflash2: this draft is a DFlash2 draft (its dflash_config declares "
-           "conv_kernel_size/conv_group_size and its layers carry the "
-           "attention_conv/mlp_conv tensors). Its grouped dynamic depthwise "
-           "convolution IS implemented and just ran; its CANDIDATE SELECTOR is not. "
-           "Upstream replaces the per-slot argmax with a scored path walk over the "
-           "target head's top-K -- CandidateSelector "
-           "(vllm/model_executor/models/qwen3_dflash2.py) plus the walk kernel and "
-           "the realized-q draft-logit cache "
-           "(vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py) @ "
-           "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f. "
-           "Sampling this block with the DFlash1 per-slot argmax instead would "
-           "succeed and propose worse tokens with NO visible symptom: the verify is "
-           "lossless, so the emitted tokens are still the target's and only "
-           "acceptance falls. Owed by row SPEC-DFLASH2 wave W3 "
-           "(.agents/specs/dflash2-spec-decode.md), issue #1314 "
-           "(https://github.com/mudler/vllm.cpp/issues/1314). Use a DFlashDraftModel "
-           "checkpoint until that wave lands.");
-}
 
 std::vector<std::vector<int32_t>> SampleDflashBlockDrafts(
     const std::vector<float>& block_logits, int num_reqs, int k,
@@ -91,13 +72,31 @@ DflashProposeResult DflashProposeBlock(
   // The context-aware (1+k) block forward (D3): PrecomputeContextKV the accumulated
   // combined features + attend the block over [context; block] per request. Returns
   // [num_reqs*(1+k), draft_vocab] f32 draft logits (lm_head applied).
+  //
+  // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out`, the
+  // post-final-norm hidden the candidate selector's `hidden_projection` reads.
+  // Upstream's `_generate_draft` gets both from one forward for the same reason
+  // -- the selector must project the SAME hidden states the logits came from,
+  // and a second forward would be a second model state.
+  const bool dflash2 = weights.IsDflash2();
+  std::vector<float> block_hidden;
   const std::vector<float> block_logits =
       Qwen3DFlashModel::ForwardBlockLogitsWithContext(
           context_states, context_positions, ctx_cu, block_input_ids,
-          block_positions, block_cu, weights, config, queue);
+          block_positions, block_cu, weights, config, queue, nullptr,
+          dflash2 ? &block_hidden : nullptr);
 
-  // SPEC-DFLASH2 W2 (#1314): the conv has run; the selector has not been ported.
-  RefuseDflash2CandidateSelector(weights);
+  // SPEC-DFLASH2 W3 (#1314): the conv and the CANDIDATE SELECTOR have both run
+  // by the end of this block; the PATH WALK has not, and is refused by name.
+  if (dflash2) {
+    std::vector<int32_t> anchors(static_cast<size_t>(num_reqs));
+    for (int r = 0; r < num_reqs; ++r)
+      anchors[static_cast<size_t>(r)] =
+          block_input_ids[static_cast<size_t>(static_cast<int64_t>(r) * block)];
+    const Dflash2ProposeState selected = Dflash2SelectCandidates(
+        block_logits, block_hidden, anchors, num_reqs, k, weights, config, queue);
+    RefuseDflash2PathWalk(weights, selected);
+  }
 
   DflashProposeResult out;
   out.draft_token_ids = SampleDflashBlockDrafts(block_logits, num_reqs, k,

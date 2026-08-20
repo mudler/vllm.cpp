@@ -316,6 +316,27 @@ class LoadedEngine {
                tok::Tokenizer tokenizer, const EngineParams& params,
                std::optional<Qwen3_5MTPWeights> mtp_weights = std::nullopt);
 
+  // SPEC-DFLASH2 W3 (#1314): the DFLASH counterpart of the `mtp_weights`
+  // overload above, and it exists for the identical reason that one gives. A
+  // caller holding weights in memory had no way to supply a DFlash/DFlash2
+  // draft, so `dflash_draft_` was null on every synthetic engine, the runner's
+  // `set_dflash_draft` was never called, and `propose_drafts_block` -- the
+  // PRODUCTION site where the grouped convolution, the candidate selector and
+  // the refusal all live -- was unreachable from any test in this repository.
+  // That is what spec `## Owed` O5 and O7 record for W1 and W2: their production
+  // call sites were mutation-proven UNGATED, and the stated reason was that a
+  // gate would need an on-disk target plus draft driven through the loader. It
+  // does not: it needs this overload, which is the same seam FromModelDir uses
+  // (it builds a DflashDraft and hands it to the private constructor below).
+  //
+  // The draft is loaded by the CALLER, exactly as `mtp_weights` is, and
+  // everything downstream -- ResolveSpecConfig, the aux-multi-tap refusal, the
+  // set_dflash_draft wiring, the whole propose loop -- is the production code
+  // path unchanged.
+  LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               std::unique_ptr<DflashDraft> dflash_draft);
+
   LoadedEngine(const LoadedEngine&) = delete;
   LoadedEngine& operator=(const LoadedEngine&) = delete;
   LoadedEngine(LoadedEngine&&) = delete;

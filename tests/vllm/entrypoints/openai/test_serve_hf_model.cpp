@@ -23,6 +23,9 @@
 // inherit no listening thread and there would be nothing to fetch from.
 #include <doctest/doctest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -50,6 +53,15 @@ using nlohmann::json;
 namespace {
 
 constexpr const char* kCommit = "1111111111111111111111111111111111111111";
+// The DEFAULT branch's commit, and the hub serves NOTHING under it. The
+// checkpoint lives on `kRevision` instead, which is what makes `--revision`
+// load bearing: a run that does not carry the flag resolves `main`, gets this
+// commit, lists an empty tree and never finds a config.json, so the server does
+// not bind. Without that the flag would be reached but unpinned, because the
+// fake hub answered `main` and `--revision main` identically.
+constexpr const char* kDefaultCommit =
+    "2222222222222222222222222222222222222222";
+constexpr const char* kRevision = "serving";
 constexpr const char* kRepoId = "tiny/llama";
 
 std::string ReadAll(const fs::path& path) {
@@ -127,12 +139,21 @@ class FakeHub {
                   res.set_content(
                       std::string(
                           R"({"branches":[{"name":"main","targetCommit":")") +
-                          kCommit + R"("}],"tags":[]})",
+                          kDefaultCommit + R"("},{"name":")" + kRevision +
+                          R"(","targetCommit":")" + kCommit +
+                          R"("}],"tags":[]})",
                       "application/json");
                 });
     server_.Get("/api/models/(.*)/tree/(.*)",
                 [this](const httplib::Request& req, httplib::Response& res) {
                   Record(req);
+                  // Only `kCommit` holds the checkpoint. The default branch's
+                  // commit lists nothing, so a run that lost `--revision`
+                  // fetches nothing and the server never binds.
+                  if (req.path.find(kCommit) == std::string::npos) {
+                    res.set_content("[]", "application/json");
+                    return;
+                  }
                   res.set_content(Tree(), "application/json");
                 });
     server_.Get("/(.*)/resolve/(.*)",
@@ -214,12 +235,41 @@ class FakeHub {
   std::map<std::string, std::string> files_;
 };
 
-// A port nothing is listening on. Bound and released, which is the same race
-// every server test in this tree runs and which has not been a problem here.
+// A port nothing is listening on, AND THE PROBE SOCKET IS CLOSED before the
+// number is returned.
+//
+// The first version of this function bound with an `httplib::Server` and called
+// `probe.stop()`. That released nothing. `Server::stop()`
+// (`third_party/httplib/httplib.h:11460`) is guarded by `if (is_running_)`, this
+// function never calls `listen_after_bind()`, so `is_running_` was false and the
+// socket was never shut down, and `Server::~Server()` is `= default` and does not
+// close it either. httplib sets `SO_REUSEPORT` (`httplib.h:9455`), so the forked
+// child bound the SAME port successfully and the kernel then load balanced
+// inbound connections between the orphan socket, which nobody ever accepted on,
+// and the real server.
+//
+// Measured on this box with `ss -ltnp` during an unmutated run at head
+// `e25d3d344`: two LISTEN rows on one port, one owned by the parent and one by
+// the child, the parent's carrying `Recv-Q 1`, which is the hung request sitting
+// in a backlog nobody drains. Three runs took 90.4 s, 240.4 s and 180.4 s, and
+// the 240.4 s one FAILED. Every stall was an exact multiple of a client read
+// timeout rather than an intermediate value, which is what a contended box would
+// have given.
+//
+// A plain POSIX socket is used rather than an httplib one because the close has
+// to be unconditional.
 int FreePort() {
-  httplib::Server probe;
-  const int port = probe.bind_to_any_port("127.0.0.1");
-  probe.stop();
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(fd >= 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+  socklen_t length = sizeof(addr);
+  REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &length) == 0);
+  const int port = static_cast<int>(::ntohs(addr.sin_port));
+  REQUIRE(::close(fd) == 0);
   return port;
 }
 
@@ -278,12 +328,30 @@ TEST_CASE("serve: --model org/repo FETCHES the checkpoint and completes a reques
   fs::remove_all(home);
   fs::create_directories(home);
 
+  // `--download-dir` IS the directory that holds the `models--org--repo`
+  // folders, which is how vLLM hands it to `snapshot_download(cache_dir=...)`
+  // (`config/model.py:183`). It is a sibling of `hub/`, never inside it, so the
+  // assertions at the end can tell the two apart.
+  const fs::path download_dir = home / "dl";
+  fs::create_directories(download_dir);
+
   const int port = FreePort();
   // `--max-num-seqs 4` is a HARNESS setting, not a product one: the HTTP worker
   // pool is sized from it plus four (`ApiServer::kControlWorkerHeadroom`), so
   // the default 32 starts a 36-thread pool to serve one four-token request.
-  // On a contended box that is scheduling pressure the case does not need.
+  // It is NOT why this case used to be slow. That was a leaked listening socket
+  // in `FreePort`, and the note there records the measurement.
+  //
+  // `--revision` and `--download-dir` are here because they are PRODUCTION
+  // FLAGS with a production effect, and until they were on this line the only
+  // thing that reached `ParseArgs` for either of them was nothing at all: both
+  // `ParseArgs` branches could be deleted with every suite still green, because
+  // the unit cases set `ModelResolveOptions` by hand. They are load bearing
+  // now: the checkpoint is published on a non-default branch, and the cache
+  // lands under `--download-dir` rather than under `HF_HOME`.
   const std::string serve_args = std::string("--model ") + kRepoId +
+                                 " --revision " + kRevision +
+                                 " --download-dir " + download_dir.string() +
                                  " --port " + std::to_string(port) +
                                  " --host 127.0.0.1 --max-model-len 64"
                                  " --block-size 16 --max-num-seqs 4"
@@ -332,34 +400,27 @@ TEST_CASE("serve: --model org/repo FETCHES the checkpoint and completes a reques
                           {"prompt", "abc"},
                           {"max_tokens", 4},
                           {"temperature", 0}};
-    // THREE ATTEMPTS, AND ONLY WHEN THERE WAS NO ANSWER. A transport error is
-    // not a verdict from the server: it says the exchange did not complete.
-    // An ANSWER, of any status, ends the loop and is what the assertions below
-    // read, so a wrong answer is never retried away.
+    // ONE ATTEMPT. There WAS a retry loop here, three attempts whenever the
+    // exchange did not complete, and it was absorbing the leaked probe socket
+    // that `FreePort` above now closes. With the leak gone the completion
+    // answers in 0.2 to 0.4 s and there is nothing left for a retry to absorb,
+    // so a second attempt could only hide the next defect the way this one hid
+    // that one. Sixty seconds of dead time read as a green run with no output.
     //
-    // Each attempt gets a FRESH client. The health poll leaves a keep-alive
-    // socket the server may close on its own timeout, and a reused dead socket
-    // reports as a transport error that reads exactly like a refusal.
-    //
-    // The retry exists because this suite has been measured timing out on a box
-    // at load 32 with two other builds running: the server bound, answered
-    // /health, and then took longer than the read timeout to answer one
-    // four-token completion. `test_openai_api_server` and
-    // `test_openai_conformance` carry RUN_SERIAL for the same starvation, which
-    // serialises this suite against other ctest tests and not against the rest
-    // of the machine.
-    for (int attempt = 0; attempt < 3 && completion_status == 0; ++attempt) {
-      httplib::Client caller("http://127.0.0.1:" + std::to_string(port));
-      caller.set_connection_timeout(5, 0);
-      caller.set_read_timeout(60, 0);
-      const httplib::Result answer =
-          caller.Post("/v1/completions", request.dump(), "application/json");
-      if (answer) {
-        completion_status = answer->status;
-        completion_body = answer->body;
-      } else {
-        completion_error = httplib::to_string(answer.error());
-      }
+    // A FRESH client rather than the health poll's. That poll leaves a
+    // keep-alive socket the server may close on its own timeout, and a reused
+    // dead socket reports as a transport error that reads exactly like a
+    // refusal.
+    httplib::Client caller("http://127.0.0.1:" + std::to_string(port));
+    caller.set_connection_timeout(5, 0);
+    caller.set_read_timeout(60, 0);
+    const httplib::Result answer =
+        caller.Post("/v1/completions", request.dump(), "application/json");
+    if (answer) {
+      completion_status = answer->status;
+      completion_body = answer->body;
+    } else {
+      completion_error = httplib::to_string(answer.error());
     }
   }
 
@@ -392,8 +453,19 @@ TEST_CASE("serve: --model org/repo FETCHES the checkpoint and completes a reques
   CHECK_FALSE(hub.asked_for("original"));
 
   // And the cache holds the HuggingFace layout, so a second run is offline.
-  CHECK(fs::is_regular_file(home / "hub" / "models--tiny--llama" / "snapshots" /
+  //
+  // IT LANDED UNDER `--download-dir`, NOT UNDER `HF_HOME`, which is the
+  // statement that `--download-dir` reached the resolver rather than being
+  // parsed and dropped. Deleting its `ParseArgs` branch puts the tree back
+  // under `HF_HOME/hub` and turns both of these red.
+  CHECK(fs::is_regular_file(download_dir / "models--tiny--llama" / "snapshots" /
                             kCommit / "config.json"));
+  CHECK_FALSE(fs::exists(home / "hub" / "models--tiny--llama"));
+  // And it is the `--revision` commit. `main` names `kDefaultCommit`, under
+  // which this hub lists nothing, so a run that lost the flag never gets this
+  // far: it fails at `REQUIRE(healthy)` above.
+  CHECK_FALSE(fs::exists(download_dir / "models--tiny--llama" / "snapshots" /
+                         kDefaultCommit));
 
   fs::remove_all(home);
 }

@@ -268,7 +268,10 @@ byte for byte:
 
 | Mutation | Must turn red |
 |---|---|
-| Delete the resolver call in `server_main.cpp` | The end-to-end case |
+| Neutralise the resolver call in `server_main.cpp` with `if (false)` | The end-to-end case |
+| Delete the `--revision` branch in `ParseArgs` | The end-to-end case |
+| Delete the `--download-dir` branch in `ParseArgs` | The end-to-end case |
+| Drop the object-identifier preference in `BlobNameFor` | The blob-name case |
 | Range mismatch warns instead of failing | The range-ignored case |
 | Accept an all-identical object identifier listing | The fabricated-identifier case |
 | Own an identifier with an entry that reports no size | The not-disarmable case |
@@ -276,6 +279,17 @@ byte for byte:
 | Remove the case fold on the object identifier | The mixed-case-two-sizes case and the blob-name case |
 | Remove index-driven selection | The decoy-file case |
 | Remove the offline short circuit | The offline cases |
+
+THE RESOLVER MUTATION IS A NEUTRALISATION, NOT A DELETION, and the row above
+says `if (false)` for a measured reason. DELETING the call does not compile:
+`ResolveModelArgument` is file local, so `server_main.cpp:840` fails with
+`error: 'ResolveModelArgument(Args&)' defined but not used
+[-Werror=unused-function]` and the exit status is 1. A reviewer who ran the
+deletion got a stale binary and a false green, which is exactly the trap this
+repository has already recorded. `if (false) ResolveModelArgument(args);` is one
+changed line, compiles at exit 0, and reddens the end-to-end case at
+`test_serve_hf_model.cpp` `REQUIRE(healthy)` with an empty hub-path list,
+because the loader then opens `tiny/llama` as a relative directory.
 
 Each mutation run prints the compiler exit status and `git diff --stat` beside
 the test result. A mutation that fails to build and a mutation that never
@@ -489,19 +503,62 @@ which is a second decision the same case pinned: with the check after the call,
 the suite measured a 12 byte partial file grown to 48 bytes under a refusal that
 still reported the right reason.
 
-**The end-to-end case retries a request that got NO ANSWER, three times.**
-Measured on 2026-08-20 at load 32, with two other builds running on the same
-twenty-core box: the server bound, answered `/health`, and then did not answer
-one four-token completion inside a 120 second read timeout, while all forty of
-its threads sat at 0% processor. The same binary passed the run before and the
-run after. That is the starvation `test_openai_api_server` and
-`test_openai_conformance` already carry `RUN_SERIAL` for, and `RUN_SERIAL`
-serialises a suite against other ctest tests rather than against the rest of
-the machine. The retry loop asks again only when the exchange did not complete.
-An ANSWER of any status ends the loop and is what every assertion reads, so a
-wrong answer is never retried away, and a server that never binds still fails at
-`REQUIRE(healthy)`. Whether a completion can genuinely hang under contention is
-NOT settled by this, and it is not this row's question.
+**The end-to-end case leaked a listening socket, and the retry loop that hid it
+is gone.** This paragraph previously blamed box contention at load 32 and
+scheduler starvation, and said that whether a completion can genuinely hang
+under contention was not settled by this work. That was WRONG, the cause was
+inside this row's own diff, and it is recorded here because a committed spec is
+the binding record and a false cause sends the next reader into the serving
+core, which this row does not touch.
+
+`FreePort` in `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` bound an
+ephemeral port with an `httplib::Server` and called `probe.stop()`. That
+released nothing. `Server::stop()` at `third_party/httplib/httplib.h:11460` is
+guarded by `if (is_running_)`, the function never called `listen_after_bind()`,
+so `is_running_` was false and the socket was never shut down, and
+`Server::~Server()` is `= default` and does not close it either. httplib sets
+`SO_REUSEPORT` at `httplib.h:9455`, so the forked child bound the SAME port
+successfully and the kernel load balanced inbound connections between the
+orphan, which nobody ever accepted on, and the real server.
+
+Measured with `ss -ltnp` during an unmutated run at `e25d3d344`: two LISTEN rows
+on one port, one owned by the parent and one by the child, the parent's carrying
+`Recv-Q 1`, which is the hung request sitting in a backlog nobody drains.
+
+| Variant | wall, one binary, one box | verdict |
+|---|---|---|
+| `e25d3d344`, three runs at load 12 to 15 | 90.4 s, 240.4 s, 180.4 s | one FAILED |
+| `FreePort` closing its socket, five runs at load 20 to 25 | 0.12 to 0.15 s | five passed |
+
+Every stall was an exact multiple of a client read timeout, 30 s health and
+60 s completion, never an intermediate value. A contended box gives a
+distribution, not quantised multiples of the client's own timeout, and the
+repaired case is FASTER at load 25 than the committed one was at load 13.
+
+`FreePort` now uses a POSIX `socket`, `bind`, `getsockname`, `close`, because
+the close has to be unconditional. The three-attempt retry loop is DELETED: with
+the leak gone there is nothing left for it to absorb, and sixty seconds of dead
+time read as a green run with no output at all. The serving core was cleared by
+inspection in the same pass, and every wait on the path is a predicate-guarded
+`condition_variable::wait`, at `httplib.h:10444`, in
+`include/vllm/v1/engine/core_proc.h`, and at
+`src/vllm/v1/engine/output_processor.cpp:48`.
+
+`--max-num-seqs 4` stays on the command line, and the reason recorded for it was
+also wrong. The worker-pool arithmetic is true, the default 32 does start a
+36-thread pool for one four-token request, but that is not why the case was
+slow, and the comment now says so.
+
+**`--revision` and `--download-dir` were parsed and never reached.** Both
+`ParseArgs` branches could be deleted with `test_downloader`, `test_model_resolver`
+and `test_serve_hf_model` all still green, because the two cases named for those
+flags set `ModelResolveOptions` fields by hand and never touch a flag. That is
+`.agents/reachability.md`'s own sentence: a unit test that constructs the type by
+hand proves the class works, never that anything reaches it. The end-to-end case
+now carries both flags and they are LOAD BEARING. The fake hub publishes the
+checkpoint on a non-default branch and lists nothing under the commit `main`
+names, so a run without `--revision` fetches nothing and never binds, and the
+cache is asserted to land under `--download-dir` and NOT under `HF_HOME`.
 
 **A blob is named by the object identifier, else by the COMMIT and the path.**
 The `## Port map` above says "by the entity tag from the resolve response or by
@@ -601,10 +658,27 @@ Three suites cover W3 and W4. `tests/vllm/transformers_utils/test_downloader.cpp
 and `tests/vllm/transformers_utils/test_model_resolver.cpp` run against
 in-process fake hubs, and `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp`
 is the REACHABILITY gate: it enters at `VllmServerMain(argc, argv)` with
-`--model tiny/llama`, and the server fetches the committed `llama_embed_e2e`
-checkpoint from the fake hub, boots, and completes a `/v1/completions` request.
-Deleting the resolver call site in `server_main.cpp` leaves the server unable to
-bind and turns that case red.
+`--model tiny/llama --revision serving --download-dir <dir>`, and the server
+fetches the committed `llama_embed_e2e` checkpoint from the fake hub, boots, and
+completes a `/v1/completions` request. Neutralising the resolver call site in
+`server_main.cpp` with `if (false)` leaves the server unable to bind and turns
+that case red. DELETING the call instead does not compile, and the mutation
+table above records why.
+
+A FIFTH FRESH REVIEW returned FAIL on six findings, and every one is repaired at
+this head. The end-to-end case leaked a listening socket and the retry loop hid
+it, both recorded under `## Risks and decisions` with the measurement.
+`--revision` and `--download-dir` were parsed and never reached, and the
+end-to-end case now carries both and reddens when either `ParseArgs` branch is
+deleted. The recorded resolver mutation did not compile, and the table now
+records the one that does. The two no-TLS cases were wrapped in
+`#ifndef CPPHTTPLIB_OPENSSL_SUPPORT` and would have become zero-assertion skips
+the moment W5 defines that macro, so the preprocessor now selects WHICH
+statement each case makes rather than whether it makes one. Preprocessing both
+files with the macro defined yields zero surviving assertions at `e25d3d344` and
+the TLS arm at this head. And the object-identifier preference in `BlobNameFor`
+was unpinned, so `test_model_resolver.cpp` now gives one listed file an
+identifier and asserts the two blob names apart.
 
 W5, W6 and W7 have not been done: there is no transport layer security option,
 no `docs/FEATURES.md` entry, and no fresh review.

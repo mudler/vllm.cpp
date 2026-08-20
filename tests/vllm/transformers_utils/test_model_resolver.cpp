@@ -165,6 +165,12 @@ class FakeHub {
   void add(const std::string& path, std::string bytes) {
     files_[path] = std::move(bytes);
   }
+  // Give one listed file an object identifier. The hub reports one for a
+  // large-file entry and reports none for a small one, and which of the two a
+  // file gets decides the name its cache blob takes.
+  void add_oid(const std::string& path, std::string oid) {
+    oids_[path] = std::move(oid);
+  }
   int request_count() const { return requests_.load(); }
   std::vector<std::string> paths() const {
     const std::lock_guard<std::mutex> lock(mu_);
@@ -185,6 +191,8 @@ class FakeHub {
       item["type"] = "file";
       item["path"] = entry.first;
       item["size"] = entry.second.size();
+      const auto oid = oids_.find(entry.first);
+      if (oid != oids_.end()) item["oid"] = oid->second;
       out.push_back(item);
     }
     return out.dump();
@@ -202,6 +210,7 @@ class FakeHub {
   mutable std::mutex mu_;
   std::vector<std::string> paths_;
   std::map<std::string, std::string> files_;
+  std::map<std::string, std::string> oids_;
 };
 
 // A scratch `HF_HOME` and `HF_ENDPOINT`, restored on the way out so one case
@@ -477,10 +486,15 @@ TEST_CASE("model resolver: --revision names a branch, and there is no @rev synta
   CHECK(message.find("no-such-branch") != std::string::npos);
 }
 
-TEST_CASE("model resolver: an https endpoint with no TLS names the build options") {
-#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+TEST_CASE("model resolver: what an https endpoint does, on this build's TLS state") {
+  // BOTH ARMS ASSERT, for the reason recorded on the matching case in
+  // `test_downloader.cpp`: an `#ifndef` around the whole body turns this case
+  // into `assertions: 0` the moment W5 defines the macro, and a zero-assertion
+  // case is a skip wearing a pass. The endpoint is LOOPBACK on a port nothing
+  // listens on so that a TLS build fails to connect instead of reaching the
+  // network.
   TempDir dir;
-  vllm_test::SetEnv("HF_ENDPOINT", "https://huggingface.co/");
+  vllm_test::SetEnv("HF_ENDPOINT", "https://127.0.0.1:1/");
   vllm_test::SetEnv("HF_HOME", (dir.path() / "home").string().c_str());
   vllm_test::SetEnv("HF_HUB_OFFLINE", "");
   ModelResolveOptions opts;
@@ -490,6 +504,12 @@ TEST_CASE("model resolver: an https endpoint with no TLS names the build options
   vllm_test::SetEnv("HF_HOME", "");
   INFO("refusal: " << message);
   REQUIRE_FALSE(message.empty());
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  // A build that speaks https reports the transport, not a rebuild instruction.
+  CHECK(message.find("cannot speak HTTPS") == std::string::npos);
+  CHECK(message.find("VLLM_CPP_OPENSSL") == std::string::npos);
+  CHECK(message.find("VLLM_CPP_BUILD_BORINGSSL") == std::string::npos);
+#else
   // Not a connection error that reads like a network fault.
   CHECK(message.find("VLLM_CPP_HF_DOWNLOAD") != std::string::npos);
   CHECK(message.find("VLLM_CPP_OPENSSL") != std::string::npos);
@@ -527,4 +547,44 @@ TEST_CASE("model resolver: SelectWeightFiles is index driven, then format ordere
   CHECK(IsRepoRootFile("config.json"));
   CHECK_FALSE(IsRepoRootFile("original/model.safetensors"));
   CHECK_FALSE(IsRepoRootFile(""));
+}
+
+// F6 of the fifth fresh review: the object-identifier PREFERENCE in
+// `BlobNameFor` was unpinned. Dropping it left every case green, because both
+// names are valid and nothing observable changed for a caller. What it does
+// change is the cache file name, which is the thing `docs/USAGE.md` promises
+// `--verbose` reports, so it is pinned here rather than recorded as owed.
+TEST_CASE("model resolver: a blob is named by the object identifier, else by the commit and the path") {
+  FakeHub hub;
+  TempDir dir;
+  const fs::path home = dir.path() / "home";
+  HubEnvironment env(hub, home);
+  // The identifier is only TRUSTED under a token, because an anonymous listing
+  // for a gated repository fabricates one. So the case that wants to see it
+  // used has to set one.
+  vllm_test::SetEnv("HF_TOKEN", "hf_a_test_token");
+
+  PopulateSafetensorsRepo(hub);
+  // Forty hexadecimal characters, not one repeated, so neither integrity rule
+  // fires on it.
+  const std::string kOid = "0123456789abcdef0123456789abcdef01234567";
+  hub.add_oid("model.safetensors", kOid);
+
+  const ModelResolveOptions opts;
+  const std::string resolved = ResolveModelPath("org/repo", opts);
+  vllm_test::SetEnv("HF_TOKEN", "");
+  REQUIRE_FALSE(resolved.empty());
+
+  const fs::path blobs = home / "hub" / "models--org--repo" / "blobs";
+  // The listing carried an identifier for the shard, so the identifier IS the
+  // blob name: it is a content hash, so two repositories holding one byte
+  // sequence share one blob.
+  CHECK(fs::is_regular_file(blobs / kOid));
+  // It carried none for `config.json`, so the fallback is the commit and the
+  // flattened path, which names exactly one byte sequence for the same reason a
+  // content hash would.
+  CHECK(fs::is_regular_file(blobs / (std::string(kCommit) + "--config.json")));
+  // And the identifier was not ALSO used as a second name for the same bytes.
+  CHECK_FALSE(fs::exists(blobs /
+                         (std::string(kCommit) + "--model.safetensors")));
 }

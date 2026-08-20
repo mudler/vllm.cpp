@@ -371,15 +371,32 @@ TEST_CASE("downloader: the shape a path declares by its extension") {
   CHECK(HfShapeForPath("tokenizer.model") == HfFileShape::kOpaque);
 }
 
-TEST_CASE("downloader: an https address on a build with no TLS names the build options") {
-#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+TEST_CASE("downloader: what an https address does, on this build's TLS state") {
+  // BOTH ARMS ASSERT. The first version of this case wrapped its whole body in
+  // `#ifndef CPPHTTPLIB_OPENSSL_SUPPORT`, so the moment W5 defines that macro
+  // the case would have compiled to nothing and reported `assertions: 0`, which
+  // this tree records as a skip wearing a pass. The preprocessor now selects
+  // WHICH statement is made, never whether one is made.
+  //
+  // The address is LOOPBACK on a port nothing listens on, not
+  // `huggingface.co`. Under a no-TLS build the scheme is refused before any
+  // socket opens, so the host never mattered; under a TLS build it would be a
+  // real network call, and a hermetic suite must not make one.
   TempDir dir;
   const std::string message = MessageOf([&] {
-    HubProbeFile("https://huggingface.co/org/repo/resolve/main/config.json",
+    HubProbeFile("https://127.0.0.1:1/org/repo/resolve/main/config.json",
                  OptionsFor());
   });
   INFO("refusal: " << message);
   REQUIRE_FALSE(message.empty());
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  // This build SPEAKS https, so the refusal is the connection failing and must
+  // NOT name the build options: a message telling a working build to rebuild
+  // itself sends the reader after the wrong thing.
+  CHECK(message.find("cannot speak HTTPS") == std::string::npos);
+  CHECK(message.find("VLLM_CPP_OPENSSL") == std::string::npos);
+  CHECK(message.find("VLLM_CPP_BUILD_BORINGSSL") == std::string::npos);
+#else
   CHECK(message.find("VLLM_CPP_HF_DOWNLOAD") != std::string::npos);
   CHECK(message.find("VLLM_CPP_OPENSSL") != std::string::npos);
   CHECK(message.find("VLLM_CPP_BUILD_BORINGSSL") != std::string::npos);

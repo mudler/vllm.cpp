@@ -50,9 +50,9 @@ extra files and launch flags when a model needs them.
 
 ## Use the C ABI
 
-Link `libvllm` and include [`include/vllm.h`](../include/vllm.h). The public
-header defines the complete C ABI. This example shows the blocking completion
-shape:
+For an installed library, use the stable public interface in
+[`include/vllm.h`](../include/vllm.h). Link `libvllm` and include `vllm.h`.
+This example shows the blocking completion shape:
 
 ```c
 #include "vllm.h"
@@ -77,11 +77,14 @@ if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLL
 vllm_engine_free(engine);
 ```
 
-## Use the C++ library
+## Use the internal C++ library in the source tree
 
-The C++ headers live under [`include/vllm/`](../include/vllm/). Load a model
-directory through `LoadedEngine`, which gives you the engine used by the
-server:
+The headers under [`include/vllm/`](../include/vllm/) are source-tree
+internals. They are not an installed or stable public ABI. Repository targets
+can include these headers and link the internal `vllm::vllm` CMake target.
+
+For example, a source-tree target can load a model directory through
+`LoadedEngine`:
 
 ```cpp
 vllm::entrypoints::EngineParams params;
@@ -90,10 +93,10 @@ params.policy = vllm::SchedulerPolicy::kLPM;
 auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, params);
 ```
 
-See [`entrypoints/model_loader.h`](../include/vllm/entrypoints/model_loader.h),
-[`v1/engine/llm_engine.h`](../include/vllm/v1/engine/llm_engine.h), and
-[`v1/engine/async_llm.h`](../include/vllm/v1/engine/async_llm.h) for the public
-types.
+See [`entrypoints/model_loader.h`](../include/vllm/entrypoints/model_loader.h)
+for `LoadedEngine`. The source-tree examples declare their link targets in
+[`examples/CMakeLists.txt`](../examples/CMakeLists.txt). External consumers
+must use the C ABI in `include/vllm.h`.
 
 ## First-line troubleshooting
 

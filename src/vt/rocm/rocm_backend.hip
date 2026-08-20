@@ -428,6 +428,15 @@ bool IntegratedDevice(int index) noexcept {
   return caps.valid && caps.integrated;
 }
 
+bool HostMemoryIsDeviceAddressable(int index) noexcept {
+  // The CONJUNCTION, not `pageable_memory_access` alone: see the declaration.
+  // It is deliberately NOT `unified_memory_`, which the registrar widens with
+  // `managed_alloc` — a hipMallocManaged device reports unified because ITS OWN
+  // allocations are migratable, which says nothing about a plain host pointer.
+  const DeviceCaps caps = ProbeDevice(index);
+  return caps.valid && caps.integrated && caps.pageable_memory_access;
+}
+
 bool ManagedAllocActive(int index) noexcept {
   // Answers from the SAME pure predicate over the SAME probe the registrar
   // used, so this cannot drift from what the registered backend decided at

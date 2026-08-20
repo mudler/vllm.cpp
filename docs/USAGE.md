@@ -1056,6 +1056,17 @@ frames, on the shipped default and behind no flag, and `ltx2-gen` prints its
 path on the line after `wrote N frames`. An embedder gets the same path from
 `vllm_video_last_phase_log(engine)` (ABI v22) rather than by guessing a filename.
 
+**"Completed" is the whole of it, and it is worth reading literally.** The table
+is written by the success path and by nothing else: the two write sites sit
+immediately before a successful return, and every guard above them throws past
+them. A render that is killed, that a lease governor aborts, that refuses on a
+guard, or that is still running leaves **no `phase-log.json` at all** — not a
+truncated one and not an empty one — and `vllm_video_last_phase_log` returns
+`NULL`. A 2.5-hour render stopped at 2.4 hours tells you nothing about where it
+was. Making a running or killed render legible is
+[#1413](https://github.com/mudler/vllm.cpp/issues/1413), and it is a separate
+lane from this file.
+
 It is a flat, non-overlapping timeline of named phases — the DiT load, the two
 VAE loads, the text tower and the connector, the denoise, the video and audio
 decodes, the frame and WAV writers — each carrying a start and end measured from
@@ -1114,9 +1125,11 @@ column is not a poor substitute — host and device are one pool there, and
 `--query-compute-apps=used_memory` answers.
 
 Two environment variables, both measurement lanes rather than configuration:
-`VLLM_RENDER_PHASE_LOG_STDERR=1` also prints the table as a fixed-width block,
-and `VLLM_RENDER_PHASE_SAMPLER=0` stops the 100 ms sampler thread, which narrows
-the per-phase peaks to what the phase boundaries saw and removes nothing else.
+`VLLM_RENDER_PHASE_LOG_STDERR=1` also prints the table as a fixed-width block —
+including when the file itself cannot be written, which is the case that lane
+exists for — and `VLLM_RENDER_PHASE_SAMPLER=0` stops the 100 ms sampler thread,
+which narrows the per-phase peaks to what the phase boundaries saw and removes
+nothing else.
 
 The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
 staging is minutes paid at the front of every render. A process that loads a
@@ -3387,11 +3400,14 @@ something else this port does not.
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 21`,
-`include/vllm.h:273`; **46** exported functions, the count of `^VLLM_API `
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 22`,
+`include/vllm.h:295`; **47** exported functions, the count of `^VLLM_API `
 declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
-This line read `19` and `36` until 2026-08-17; both numbers were last true
-several ABI additions ago, and neither is derived by any gate.
+This line read `19` and `36` until 2026-08-17 and `21`, `273` and `46` until the
+W0 phase log added `vllm_video_last_phase_log`; every one of those numbers was
+last true several ABI additions ago, and none of the three is derived by any
+gate — the version, the line and the count each drift independently, and the
+line number drifts on an edit that adds no ABI at all.
 
 On native Windows/MSVC, the shared-library packaging lane keeps the runtime DLL
 name at `vllm` and gives the import/static archive the distinct name

@@ -3200,6 +3200,81 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   }
 }
 
+// ─── the CONSOLE copy is not a passenger of the FILE write ──────────────
+//
+// `VLLM_RENDER_PHASE_LOG_STDERR=1` exists for exactly one situation: a render
+// whose table cannot reach a file. An unwritable `--output-dir`, a read-only
+// mount, a full disk. If the console block is emitted only after the file write
+// has already succeeded, the lane is silent in the one case it was added for,
+// and `docs/ENVIRONMENT.md`'s "also prints" describes something the code does
+// not do. This case pins the ORDER rather than the text: the block reaches the
+// real fd 2, and `WriteJson` still reports the IO failure by name instead of
+// letting the console copy launder an error into a success.
+//
+// Real fd 2 by `dup`/`dup2`, not a test-only sink, for the reason the live
+// progress lane gives: a sink is a seam that can be armed in the test and absent
+// in production.
+TEST_CASE("ltx2 phase log: the stderr copy is emitted when the FILE write FAILS") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+  { phase::Scope denoise("denoise"); }
+  { phase::Scope decode("decode.video"); }
+
+  // A directory nobody created, so the `ofstream` is not `good()` at open. The
+  // precondition is asserted rather than assumed — a path that happened to exist
+  // would turn this case into a test of the success path.
+  const char* kMissingDir = "/vllm-cpp-no-such-directory-1010";
+  struct stat missing {};
+  REQUIRE(::stat(kMissingDir, &missing) != 0);
+  const std::string path = std::string(kMissingDir) + "/phase-log.json";
+
+  const char* prev = std::getenv("VLLM_RENDER_PHASE_LOG_STDERR");
+  const std::string saved_env = prev == nullptr ? std::string() : std::string(prev);
+  ::setenv("VLLM_RENDER_PHASE_LOG_STDERR", "1", 1);
+
+  char tmpl[] = "/tmp/vllm_phase_stderr_XXXXXX";
+  const int sink = ::mkstemp(tmpl);
+  REQUIRE(sink >= 0);
+  std::fflush(stderr);
+  const int saved_fd = ::dup(2);
+  REQUIRE(saved_fd >= 0);
+  REQUIRE(::dup2(sink, 2) >= 0);
+
+  std::string why;
+  const bool ok = log.WriteJson(path, "ltx2-video", "cpu", &why);
+
+  std::fflush(stderr);
+  ::dup2(saved_fd, 2);
+  ::close(saved_fd);
+  ::close(sink);
+
+  if (prev == nullptr) {
+    ::unsetenv("VLLM_RENDER_PHASE_LOG_STDERR");
+  } else {
+    ::setenv("VLLM_RENDER_PHASE_LOG_STDERR", saved_env.c_str(), 1);
+  }
+
+  std::ifstream in(tmpl, std::ios::binary);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string captured = buf.str();
+  in.close();
+  ::unlink(tmpl);
+
+  // The console copy never converts an IO error into a success.
+  CHECK_FALSE(ok);
+  CHECK(why.find("cannot open") != std::string::npos);
+
+  MESSAGE("captured " << captured.size() << " bytes of stderr on a FAILED file write");
+  REQUIRE_MESSAGE(!captured.empty(),
+                  "VLLM_RENDER_PHASE_LOG_STDERR printed nothing when the file write failed, "
+                  "which is the one case the lane exists for");
+  CHECK(captured.find("denoise") != std::string::npos);
+  CHECK(captured.find("decode.video") != std::string::npos);
+  log.Reset();
+}
+
 // ─── F10: the sampler STOPS when the last scope closes ───────────────────────
 //
 // THE FIRST UNIT CASE THIS INSTRUMENT HAS. Every other gate in this file reaches

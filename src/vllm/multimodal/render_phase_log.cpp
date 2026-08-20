@@ -414,6 +414,20 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
   }
   out["phases"] = std::move(phases);
 
+  // THE CONSOLE COPY GOES FIRST, and the order is the whole point of it.
+  //
+  // `VLLM_RENDER_PHASE_LOG_STDERR` exists for the run whose table cannot reach a
+  // file: an unwritable `--output-dir`, a read-only mount, a full disk. Emitted
+  // after the two failure returns below it was silent in exactly that case, and
+  // `docs/ENVIRONMENT.md`'s "also prints" described something the code did not
+  // do. Hoisting it also means a process that dies during the write has still
+  // said what it measured.
+  if (StderrEnabled()) {
+    const std::string block = RenderText(family, device);
+    std::fwrite(block.data(), 1, block.size(), stderr);
+    std::fflush(stderr);
+  }
+
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f.good()) {
     if (why != nullptr) *why = "cannot open " + path;
@@ -425,11 +439,6 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
   if (!f.good()) {
     if (why != nullptr) *why = "cannot write " + path;
     return false;
-  }
-  if (StderrEnabled()) {
-    const std::string block = RenderText(family, device);
-    std::fwrite(block.data(), 1, block.size(), stderr);
-    std::fflush(stderr);
   }
   return true;
 }

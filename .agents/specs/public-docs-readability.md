@@ -208,6 +208,17 @@ the implementation sequence, mutation evidence, rejected approaches, and issue
 history. This pass covers campaign-created public pages. It does not claim to
 rewrite every legacy page under `docs/`.
 
+The R5 semantic repair restores the current operating contract that the first
+task-focused pass removed from the MiniMax-Music3 and LTX 2.5 recipes. The
+Music3 page now uses the DiT guidance default of `1.7`, the full checkpoint
+revision, the quantized refusal and real Q4 gates, the duration rules, exact
+request refusals, and the speech-device contract. The LTX page now uses only
+the pinned first-party DiT, states the `res2s_two_stage` LoRA boundary, and
+restores the HQ defaults, geometry, frame grid, pipeline refusals, guidance,
+prompt-embeds, config, progress, and CPU-thread contracts. These are current
+user constraints. The implementation history remains in each model's owning
+specification.
+
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
 #1463 uses the accepted spec-owned form in the append-only issue index.

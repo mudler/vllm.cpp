@@ -15,9 +15,13 @@ OpenAI-compatible video endpoint.
 | `a2vid_two_stage` | Video generation around supplied audio |
 | `dfr` | Dynamic frame-rate generation with generated keyframe slots |
 
-Two-stage pipelines require `--upsampler` and `--lora`. The upstream name for
-the adapter is `--distilled-lora`. Use `--max-phase 0` to stop after the first
-phase.
+The plain two-stage, keyframe-interpolation, and audio-to-video pipelines
+require `--upsampler` and `--lora`. Upstream calls the adapter
+`--distilled-lora`. The `res2s_two_stage` preset requires the upsampler, but it
+does not require the LoRA. If you supply one, the current loader applies one
+load-time strength to both phases. It cannot reproduce the upstream HQ strengths
+of `0.25` in stage 1 and `0.5` in stage 2. Use `--max-phase 0` to stop after the
+first phase.
 
 Retake requests use `--retake-start-time`, `--retake-end-time`, and
 `--retake-frame-rate`. Select the regenerated streams with
@@ -60,41 +64,58 @@ Set `VLLM_CPP_LTX2_TEXT_ENCODER` when the text encoder is outside
 ## Generate video
 
 ```sh
+LTX_ROOT="$CHECKPOINT_ROOT/ltx-2.5"
 ltx2-gen \
-  --dit ltx-2.5-22b-distilled-fp8.safetensors \
-  --dit-config ltx-2.5-transformer-config.json \
+  --dit "$LTX_ROOT/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors" \
   --model-version 2.5 \
-  --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
-  --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
-  --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
-  --encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
-  --encoder-config ltx-2.5-gemma4-text-config.json \
+  --video-vae "$LTX_ROOT/vae/ltx-2.5-video-vae-conv-bf16.safetensors" \
+  --audio-vae "$LTX_ROOT/vae/ltx-2.5-audio-vae-bf16.safetensors" \
+  --upsampler "$LTX_ROOT/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" \
+  --prompt-embeds "$LTX_VIDEO_EMBEDS" \
+  --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
+  --prompt-valid-rows "$LTX_PROMPT_ROWS" \
   --pipeline-kind res2s_two_stage \
-  --prompt "a red fox running through deep snow at sunrise" \
   --frames 25 --width 320 --height 192 --seed 20260812 \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```
 
-The high-quality preset uses these defaults:
+The high-quality preset sets `num_inference_steps` to 15. Stage 1 derives its
+schedule from that value; stage 2 uses its fixed refinement schedule. Both
+stages use the `res_2s` sampler. Video CFG is `3.0`, audio CFG is `7.0`, and
+modality guidance is `3.0`. STG is disabled and video guidance rescaling is
+`0.45`.
 
-- first phase: 20 steps, guidance 4.0, STG 1.0, and STG rescaling 0.7
-- second phase: three steps, guidance 1.0, and STG disabled
-- sampler: `res_2s`
+Use dimensions divisible by `64` for any two-stage pipeline. Use dimensions
+divisible by `32` for a one-stage pipeline. The engine refuses invalid width or
+height values instead of rounding them. Frame counts use the temporal VAE grid:
+pass `8k + 1` frames to get the requested count. Other positive counts floor to
+that grid. The default geometry is `1024x1536` at 121 frames.
 
 ## Generate audio without video
 
 ```sh
-ltx2-gen --dit ltx-2.5-dit.safetensors \
-  --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
-  --encoder gemma4-12b-with-proj.safetensors \
-  --encoder-config gemma4.json \
+LTX_ROOT="$CHECKPOINT_ROOT/ltx-2.5"
+ltx2-gen \
+  --dit "$LTX_ROOT/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors" \
+  --model-version 2.5 \
+  --audio-vae "$LTX_ROOT/vae/ltx-2.5-audio-vae-bf16.safetensors" \
+  --prompt-embeds "$LTX_VIDEO_EMBEDS" \
+  --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
+  --prompt-valid-rows "$LTX_PROMPT_ROWS" \
   --pipeline-kind t2a_one_stage --device cpu \
-  --frames 121 --prompt "rain on a tin roof, distant thunder" \
+  --audio-cfg-guidance-scale 1.0 --frames 121 \
   --workdir /tmp/t2a
 ```
 
-The duration follows the video-frame count at the pipeline frame rate. This
-pipeline returns a WAV file and no picture.
+The duration follows the frame count at the pipeline frame rate. This pipeline
+returns a WAV file and no picture. It runs only on the CPU and refuses
+`--device cuda`. Do not pass `--video-vae`, `--width`, or `--height`.
+
+The audio-only defaults are CFG `7.0`, STG `1.0`, rescale `0.7`, skip step `0`,
+and STG block `28`. The negative prompt supplies the sixth guidance input.
+Audio-only generation fixes modality guidance at `1.0` because it has no video
+stream. The prompt-embeds path needs a text tower for negative conditioning
+unless you set audio CFG to `1.0`.
 
 ## Conditioning and current limits
 
@@ -115,12 +136,31 @@ unsupported. These paths still need multi-frame pixel encoding, stage-specific
 adapter application, or the audio-VAE encoder filter. The engine also refuses
 sample-rate conversion and a VAE configured with `latent_log_var: none`.
 
-The DFR pipeline does not accept a frame-count input. It chooses the latent
-layout from the reference path and generated keyframe slots.
+The DFR pipeline refuses a frame-count input. It derives the frame count from
+the reference path. It also refuses `num_generated_keyframes`; DFR creates its
+own keyframe grid. Other supported pipelines accept generated keyframe slots,
+but reject a negative count or a target shorter than `N + 2` frames.
 
 The server does not forward a per-generation LoRA path. Load the adapter when
 you load the engine. `--negative-prompt-embeds` and
 `--negative-audio-prompt-embeds` apply to the embeds path only.
+
+The `one_stage` pipeline exposes video and audio CFG, STG, rescale, skip-step,
+and STG-block controls. It also exposes `--a2v-guidance-scale` and
+`--v2a-guidance-scale`. A CFG scale other than `1.0` requires negative
+conditioning from the text tower or both negative embeds files. Both embeds
+files must have the same row count as the positive pair. The engine refuses an
+STG block outside the DiT layer count. Distilled two-stage and retake pipelines
+refuse these one-stage guidance controls.
+
+Prompt embeds are little-endian F32 rows. Video rows have width 4,096 and audio
+rows have width 2,048. Supply both files with the same row count. On checkpoints
+with the embeddings connector, that count must be a multiple of 128. Set
+`--prompt-valid-rows` to the number of real caption rows. A command with
+`--prompt` but no `--encoder`, or with only one embeds file, is invalid.
+
+Pass `--dit-config` only when the selected DiT has no safetensors metadata. The
+loader refuses a config beside a checkpoint that already declares one.
 
 ## Inspect a render
 
@@ -135,6 +175,10 @@ benchmark.
 Set `VLLM_RENDER_PHASE_LOG_STDERR=1` to print the phase table. Set
 `VLLM_RENDER_PHASE_SAMPLER=0` to disable the 100 ms memory sampler. The normal
 `[render]` lines print phase boundaries and DiT-forward progress.
+
+Set `VLLM_RENDER_PROGRESS=0` to hide the normal progress lines. Set
+`VLLM_CPP_CPU_THREADS` to control the shared CPU worker pool used by host-side
+render stages.
 
 See [benchmarks](../BENCHMARKS.md) for accepted measurements.
 

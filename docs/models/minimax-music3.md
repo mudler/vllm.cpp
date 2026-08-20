@@ -9,7 +9,8 @@ Use `MiniMaxAI/MiniMax-Music3` at revision
 `fbdf52fbaaca799592917417eb05f1899f1255ec`.
 
 ```sh
-hf download MiniMaxAI/MiniMax-Music3 --revision fbdf52fb \
+hf download MiniMaxAI/MiniMax-Music3 \
+  --revision fbdf52fbaaca799592917417eb05f1899f1255ec \
   --local-dir "$CHECKPOINT_ROOT/minimax-music3" \
   --exclude 'qwen_7B/*' '*.pth'
 ```
@@ -53,6 +54,23 @@ Other Music3 GGUF, NVFP4, MXFP4, FP8, INT8, AWQ, GPTQ, bitsandbytes, and MLX
 arms are unsupported. ComfyUI GGUF files contain only the DiT and condition
 encoder, so they cannot generate audio by themselves.
 
+The loader refuses a quantized component that it cannot identify. It also
+refuses a quantized Diffusers tree that declares an unsupported sidecar or
+quantization method. The refusal gate does not need a checkpoint:
+
+```sh
+cmake --build build -j 8 --target test_minimax_music3_quant
+./build/tests/test_minimax_music3_quant
+```
+
+The Q4_K gate needs both the Diffusers checkpoint and the pinned GGUF:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT="$CHECKPOINT_ROOT/minimax-music3" \
+VLLM_CPP_MUSIC3_GGUF="$CHECKPOINT_ROOT/rvq_depth_decoder_q4_k.gguf" \
+  ./build/tests/test_minimax_music3_quant_real
+```
+
 ## Generate a sample
 
 Use a duration below eight seconds and a small step count for an initial test.
@@ -81,6 +99,12 @@ build/examples/vllm-server \
 You do not need `--model` for a speech-only server. The server detects the
 standard checkpoint layout, so `--speech-family` is optional.
 
+`--speech-device 0` runs the family on the CPU. `--speech-device 1` requests the
+configured accelerator for the language model, DiT, and RVQ depth decoder. The
+server refuses accelerator selection when the build or family cannot provide
+the required device path. It also refuses `--speech-device` without
+`--speech-model`.
+
 ## Request a song
 
 ```sh
@@ -98,14 +122,33 @@ The route accepts fields at the top level or inside `extra_params`. Values in
 
 - `audio_duration` or `duration` sets the length in seconds. The default is 60.
 - `num_inference_steps` sets the denoising step count. The default is 30.
-- `guidance_scale` controls guidance. The default is 1.5.
+- `guidance_scale` controls classifier-free guidance on the DiT. The default is
+  `1.7`; `0` is valid and selects the unconditional branch.
 - `seed` controls the autoregressive and denoising draws.
 - `lyrics` supplies the song text.
 - `description` supplies the music caption.
 
-The route refuses named voices, rate control, streaming, non-WAV formats,
-sampler controls, duration-token aliases, reference-clip aliases, and task or
-chunk selectors.
+The route clamps the autoregressive length to 9,000 frames. A positive duration
+below `0.04` seconds is invalid. A negative duration is invalid. A duration of
+`0` or an omitted duration selects the family default of 60 seconds.
+
+The route refuses these request fields by their exact names:
+
+| Fields | Reason |
+|---|---|
+| `voice`, `speaker`, `speed` | The family has no named voice or rate control. |
+| `stream`, `stream_format` | The engine produces the complete song before it returns samples. |
+| non-`wav` `response_format` | The server has no encoder for another format. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | The autoregressive stage uses its fixed top-50 sampler. |
+| `audio_duration_s`, `max_new_tokens`, `token_count`, `duration_tokens` | Use `audio_duration` or `duration` in seconds. |
+| `instructions` | Use `description` for the music caption. |
+| `ref_audio`, `ref_text` | This family does not condition on a reference clip or transcript. |
+| `task_type`, `x_vector_only_mode`, `initial_codec_chunk_frames` | The family has one synthesis mode and a fixed chunk schedule. |
+
+The route also refuses `lyrics` or `description` when either field is empty. It
+refuses conflicting values for `description` and its `prompt` alias. Top-level
+fields and fields under `extra_params` use the same rules; `extra_params` wins
+when both locations contain the same field.
 
 ## Inspect stage timing
 

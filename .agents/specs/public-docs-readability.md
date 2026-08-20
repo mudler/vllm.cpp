@@ -29,6 +29,21 @@ for `lilcheaty/MiniMax-H3-NVFP4`. Registry rows cover the Q4_K_M artifacts
 verified end to end and the pruned Q8_0 artifacts recorded as rendered. The
 model page records the other published variants and their current state.
 
+The R2 repair restores the complete W3 ownership boundary. IndexTTS keeps only
+its public refusal, while its golden and conversion commands remain in
+`.agents/specs/indextts-2-5.md`. The Qwen3.8 mixed FP8 and NVFP4 description now
+lives in its model page. MiniMax-H3 uses one ordered workflow and its registry
+includes the official video VAE, audio VAE, and tokenizer. The exact official
+sizes come from the pinned Hugging Face tree and raw Git LFS pointers at
+`42ed227ee7df40d41602854ae760620d6eb651fe` on 20 August 2026.
+
+The LTX registry and model page restore the base facts from
+`docs/USAGE.md:4380-4510` and `docs/USAGE.md:4782-4865` at
+`c8d926ea82bd6d8f5d6312693572c84234a6a7f3`. The Qwen description comes from
+`docs/USAGE.md:3983-4044` at the same base. Git history searches for the LTX
+LoRA, H3 VAE, and IndexTTS headings identify the commits that introduced those
+facts before the W3 extraction.
+
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
 #1463 uses the accepted spec-owned form in the append-only issue index.

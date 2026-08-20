@@ -2,6 +2,44 @@
 
 Use this page for Qwen3.8 27B checkpoints, commands, supported arms, and current limitations.
 
+## Unsloth mixed FP8 and NVFP4 checkpoint
+
+`unsloth/Qwen3.8-27B-NVFP4` is a third-party mixed-precision checkpoint. Its
+repository name says NVFP4, while `quantization_config.format` says
+`mixed-precision`. Use revision
+`7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`.
+
+The set contains a 22,568,192,096-byte `model.safetensors` backbone and an
+849,400,392-byte BF16 `model_mtp.safetensors` drafter. The complete set is
+23,417,592,488 bytes. The checkpoint registry records the locally computed
+SHA-256 for the quantized backbone.
+
+The backbone index contains 1,968 names:
+
+| Scheme | Modules | Tensors | Covers |
+|---|---:|---:|---|
+| `group_1`, NVFP4 W4A4 with group size 16 | 168 | 672 | MLP projections on layers 0 through 55 |
+| `group_0`, FP8 W8A8 | 233 | 466 | Attention, GDN, `lm_head`, and MLP projections on layers 56 through 63 |
+| Configuration ignore list | 317 | 475 | GDN low-rank projections, norms, vision blocks, merger, and MTP head |
+| No quantization target | 267 | 323 | Norms, `conv1d`, embeddings, and position data |
+| `kv_cache_scheme` scales | 16 | 32 | `k_scale` and `v_scale` on full-attention layers |
+
+The NVFP4 modules load. The engine refuses the FP8 group before it reads a
+weight. That group requires per-output-channel weight scales and dynamic
+per-token activation quantization. This build implements neither requirement.
+The engine also refuses `kv_cache_scheme` because it does not consume the
+checkpoint's K/V scales.
+
+Run the real-checkpoint manifest gate with:
+
+```console
+VLLM_CPP_QWEN38_27B_NVFP4_DIR=/path/to/qwen3.8-27b-nvfp4 \
+  ./build/tests/test_qwen38_27b_nvfp4_arm
+```
+
+The FP8 tower, quantized KV cache, resident-byte assertion, and token gates are
+still owed under [#821](https://github.com/mudler/vllm.cpp/issues/821).
+
 ## Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128

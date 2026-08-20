@@ -134,8 +134,17 @@ lists other published arms when they have not been used as a gated checkpoint.
 | MiniMax-H3 encoder | `qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` | 14,576,977,888 bytes | `realrebelai/MiniMax-H3_GGUFs` @ `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7` | `1bf75e038c5895b97b6ea16cc1e3d32076254b06ec3df10657650d86dc82279e` | Q4_K_M text and multimodal conditioning | No separate refused arm recorded |
 | MiniMax-H3 pruned FL2VA | `minimax_h3_fl2va_pruned-Q8_0.gguf` | 21,437,786,208 bytes | `unsloth/MiniMax-H3-GGUF` @ `d629413c2e5b51b38c453668b75ca3b06ca92703` | `1c77759fd30e4b41dd4fb341d684518177f544428c6186fd9f5fd96f8ebf55d4` | Pruned Q8_0 loads and renders | Other pruned quant levels load but have not been rendered |
 | MiniMax-H3 pruned REF2VA | `minimax_h3_ref2va_pruned-Q8_0.gguf` | 21,414,002,784 bytes | `unsloth/MiniMax-H3-GGUF` @ `d629413c2e5b51b38c453668b75ca3b06ca92703` | `60f8a47434ec9a925f0aea41d9e0db9cb78ebc46791b7488d621dbd6905e5d89` | Pruned Q8_0 loads and renders | Other pruned quant levels load but have not been rendered |
+| MiniMax-H3 video VAE | `FL2VA/video_vae/source/model.safetensors` | 10,415,548,320 bytes | `MiniMaxAI/MiniMax-H3` @ `42ed227ee7df40d41602854ae760620d6eb651fe` | n/a (non-quantized) | Official video decode for the five-file recipe | No quantized arm is recorded |
+| MiniMax-H3 audio VAE | `FL2VA/audio_vae/model.safetensors` | 605,429,308 bytes | `MiniMaxAI/MiniMax-H3` @ `42ed227ee7df40d41602854ae760620d6eb651fe` | n/a (non-quantized) | Official audio decode for the five-file recipe | No quantized arm is recorded |
+| MiniMax-H3 tokenizer | `FL2VA/tokenizer/tokenizer.json` | 7,032,403 bytes | `MiniMaxAI/MiniMax-H3` @ `42ed227ee7df40d41602854ae760620d6eb651fe` | n/a (non-quantized) | Official tokenizer for the five-file recipe | No separate arm is recorded |
 | MiniMax-Music3 | Diffusers checkpoint tree | about 28.5 GB resident | `MiniMaxAI/MiniMax-Music3` @ `fbdf52fbaaca799592917417eb05f1899f1255ec` | n/a (non-quantized) | bf16 language model, depth decoder, condition encoder; fp32 transformer and vocoder | Native `.pth` layout |
 | MiniMax-Music3 depth decoder | `rvq_depth_decoder_q4_k.gguf` | 405,752,480 bytes | `audio-cpp/MiniMax-Music3-GGUF` @ `c36aaeed683f33b05796788e4204f4eeba8fa547` | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` | GGUF Q4_K depth decoder | Other GGUF components and third-party lineages |
+| LTX-2.5 full DiT | `diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Full bf16 DiT | Checkpoint-class validation is owed |
+| LTX-2.5 distilled DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled bf16 DiT | Checkpoint-class validation is owed |
+| LTX-2.5 distilled NVFP4 DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | Content hash unavailable from the gated repository; #1048 | Distilled NVFP4 DiT | Authenticated content pin is owed |
+| LTX-2.5 distilled LoRA | `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled two-stage recipes; rank and alpha 450; version 2.5.0 | Distinct from the 327,322,640-byte IC-LoRA |
+| Qwen3.8-27B mixed FP8 and NVFP4 | `model.safetensors` | 22,568,192,096 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` | NVFP4 modules load | FP8 modules and quantized KV cache are refused |
+| Qwen3.8-27B MTP drafter | `model_mtp.safetensors` | 849,400,392 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | n/a (non-quantized) | BF16 MTP artifact is present | MTP execution is owed |
 | Qwen3.8-2.4T-A95B | `UD-Q1_0` ten-file GGUF split | about 370 GiB | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` (shard 1); `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` (shard 2) | CPU expert streaming from disk | CUDA refuses a checkpoint that exceeds device capacity |
 <!-- checkpoint-registry:end -->
 
@@ -2528,66 +2537,6 @@ the pinned llama.cpp, which is `PENDING` on
 [#857](https://github.com/mudler/vllm.cpp/issues/857) because that oracle is
 recorded `gateable = no`, and any image or video answer at all —
 `QUANT-QWEN38-27B-GGUF-ARM`,
-[#821](https://github.com/mudler/vllm.cpp/issues/821).
-
-### `unsloth/Qwen3.8-27B-NVFP4` — what it is, and which arm is refused
-
-This artifact's repo name says NVFP4 and its `quantization_config.format` says
-`mixed-precision`. **This engine cannot run it yet**, and it now says so at load
-instead of failing on a missing tensor. It is documented here because it is a
-checkpoint people reach for, and because the refusal is the shipped behaviour.
-
-Also a **third-party quantization by Unsloth**, not a first-party release. A repo
-id is not a pin: the revision [#821](https://github.com/mudler/vllm.cpp/issues/821)
-originally named, `a767244d27bd76589a3e3b2ab4e64032c4ebc7af`, no longer resolves,
-and this is the second in-place re-quantization this publisher has done in this
-model family.
-
-| Arm | Repo and revision | File | Bytes | sha256 |
-|---|---|---|---|---|
-| mixed FP8 + NVFP4 backbone | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `model.safetensors` | 22 568 192 096 | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` |
-| bf16 MTP drafter | same revision | `model_mtp.safetensors` | 849 400 392 | not mirrored here, so no locally computed hash — and no remote-reported one is recorded |
-
-Total resident size of the set is 23 417 592 488 B, which is
-`model.safetensors.index.json`'s own `metadata.total_size` and the sum of the two
-files. The sha256 above was computed locally on this project's mirrored copy, not
-read back from the hub.
-
-The 1968 names of that index split into two schemes plus the parts no group
-claims:
-
-| Scheme | Modules | Tensors | Covers |
-|---|---:|---:|---|
-| `group_1`, `nvfp4-pack-quantized` W4A4, `group_size` 16 | 168 | 672 | `mlp.(gate\|up\|down)_proj` on layers 0-55 |
-| `group_0`, `float-quantized` FP8 W8A8 | 233 | 466 | `self_attn.(q\|k\|v\|o)_proj`, `linear_attn.(in_proj_qkv\|in_proj_z\|out_proj)`, `lm_head`, and layers 56-63's MLP |
-| on the config's `ignore` list | 317 | 475 | the GDN low-rank projections and norms, the 27 vision blocks, the merger, the whole MTP head |
-| named by no target | 267 | 323 | norms, `conv1d`, the embedding table, the patch and position embeddings |
-| `kv_cache_scheme` scales | 16 | 32 | `k_scale` / `v_scale` on the 16 full-attention layers |
-
-**The NVFP4 arm loads. The FP8 arm is REFUSED**, by name, before any weight is
-read, because its `group_0` needs two things this build does not have: a
-per-output-channel weight scale (`weights.strategy: channel`, so `weight_scale`
-ships `[out, 1]` rather than the one element a per-tensor scale is) and dynamic
-per-token activation quantization (`input_activations.dynamic: true`, so the
-checkpoint correctly ships **no** `*.input_scale` at all and the scale is
-computed per forward). The declared `kv_cache_scheme` is refused for the same
-reason: nothing here reads `k_scale` / `v_scale`, and there is no quantized KV
-cache to apply them to. Since layers 0-55 and 56-63 use the SAME module names and
-differ only by a regex over the layer index, no per-tensor dtype probe can tell
-the two groups apart; the split is read from `config_groups`.
-
-To re-verify the committed manifests and config against the shipped bytes rather
-than against the fixture CI reads:
-
-```console
-VLLM_CPP_QWEN38_27B_NVFP4_DIR=/path/to/qwen3.8-27b-nvfp4 \
-  ./build/tests/test_qwen38_27b_nvfp4_arm
-```
-
-Unset, that case skips loudly and the gate stays hermetic; CI reads no NAS file.
-**What is still owed on this artifact** is the FP8 tower itself, a consumed
-`kv_cache_scheme`, a resident-bytes assertion, and every token gate —
-`QUANT-QWEN38-27B-NVFP4-ARM`,
 [#821](https://github.com/mudler/vllm.cpp/issues/821).
 
 ### Per-prompt input limits

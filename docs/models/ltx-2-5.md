@@ -1137,6 +1137,16 @@ API's tree listing.
 | `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
 | `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
 
+The distilled two-stage recipes also require
+`loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors`. The file is
+8,899,889,568 bytes and contains 3,320 BF16 tensors. They form 1,660
+`lora_A`/`lora_B` pairs. Its metadata sets `lora_rank` and `lora_alpha` to
+`450`, and sets `model_version` to `2.5.0`.
+
+This distilled LoRA is not the 327,322,640-byte
+`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`. The IC-LoRA
+serves a different pipeline arm.
+
 **The hub will not give you a content hash for this repo, and it does not say
 so.** `Lightricks/LTX-2.5` is gated — an unauthenticated `resolve` returns
 `Access to model Lightricks/LTX-2.5 is restricted` — and the tree API answers an

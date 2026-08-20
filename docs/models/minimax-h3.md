@@ -6,9 +6,9 @@ Set `VT_H3_DUMP_DIR=<dir>` to write the video and audio latents for a numerical
 comparison. The retired pre-fold driver flags `--denoise-only`, `--dump-params`,
 and `--save-embeds` are no longer accepted by the thin ABI client.
 
-## MiniMax-H3: video + audio generation
+## MiniMax-H3 video and audio workflow
 
-## The exact weights (so a render is reproducible)
+### Get the exact weights
 
 Five files. The DiT and encoder are community GGUF quantisations; the two VAEs and
 the tokenizer come from the official checkpoint.
@@ -17,9 +17,9 @@ the tokenizer come from the official checkpoint.
 |---|---|---|
 | `MiniMax-H3-FL2VA-Q4_K_M.gguf` | 19.9 GB | [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs) |
 | `qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` | 14.6 GB | [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs) |
-| `vae/diffusion_pytorch_model.safetensors` | 5.2 GB | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/video_vae/` |
-| `audio_vae/model.safetensors` | 0.6 GB | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/audio_vae/` |
-| `tokenizer.json` | 7 MB | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/tokenizer/` |
+| `video_vae/source/model.safetensors` | 10,415,548,320 bytes | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/video_vae/` |
+| `audio_vae/model.safetensors` | 605,429,308 bytes | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/audio_vae/` |
+| `tokenizer/tokenizer.json` | 7,032,403 bytes | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/` |
 
 Take each VAE's `config.json` from the same directory as its weights: they carry the
 per-channel `latents_mean` / `latents_std` and the temporal `clip_length` /
@@ -356,7 +356,7 @@ web root.
 The weights, and why each one is needed, are in the MiniMax-H3 section below.
 
 
-## MiniMax-H3: video + audio generation
+### Generate video and audio
 
 
 Renders an MP4 with a stereo track. Weights: a GGUF DiT (use **Q4_K_M**), the Qwen3-VL-32B

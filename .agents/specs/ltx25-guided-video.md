@@ -1172,6 +1172,11 @@ and unperturbed forward costs directly and closes the §12.5 owed line.
 §1-§11 landed at `daeff67f2`. [#1092](https://github.com/mudler/vllm.cpp/issues/1092)
 stayed OPEN for the arm §1 recorded as owed: the device-resident `ptb` and `mod`
 passes. §12 is that arm, and it is what this change carries. The row stays
-`ACTIVE` rather than moving to `DONE`, because §12.8 link B and the §12.5 cost
-are both open and both listed under `## Owed`; neither can be closed without a
-GPU lease, which this change did not take.
+`ACTIVE` rather than moving to `DONE`, because §12.8 link B and the §12.5 wall
+clock are both open and both listed under `## Owed`. Neither is closed by this
+change, and this change took no GPU lease. Be exact about what a lease is needed
+FOR: the §12.5 wall clock needs one, and so does the HARDWARE half of link B,
+but link B's SOFTWARE half — does anything at all enter the device branch of the
+ternary — is closable on this box by a dedicated test executable with a synthetic
+unified-memory accelerator. §12.8 says what that costs and which two steps of it
+nobody has verified.

@@ -107,14 +107,21 @@ real absence and not a truncated download.
 
 ### 2.1 `__metadata__` carries nothing
 
-FULL-BF16 and DIST-NVFP4 both carry exactly four metadata keys: `config`,
-`gemma_source_checkpoint`, `license`, `model_version`.
+FULL-BF16 and DIST-NVFP4 carry the same four metadata keys and **every one of
+the four values is byte-identical**. Compared as raw strings, with the sha256 of
+each string taken on both files:
 
-- `config` is **2199 bytes on both and byte-identical**: sha256 of the string
-  begins `13be9edf16635af9` on each, and the parsed JSON compares equal.
-- `model_version` is `2.5.0` on both.
-- `gemma_source_checkpoint` is `{"ltx_version": "2.5.0", "gemma_version": "gemma4-12b-ltx-v1"}` on both.
-- `license` is the same LTX-2.x Community License text on both.
+| key | bytes | sha256 (first 16) on each file | equal |
+|---|---:|---|---|
+| `config` | 2199 | `13be9edf16635af9` | yes |
+| `gemma_source_checkpoint` | 62 | `440f5e30dea8891e` | yes |
+| `license` | 34562 | `4912471e6a71cc46` | yes |
+| `model_version` | 5 | `f0ea2fc99f3b79d3` | yes |
+
+`model_version` is `2.5.0` and `gemma_source_checkpoint` is
+`{"ltx_version": "2.5.0", "gemma_version": "gemma4-12b-ltx-v1"}` on both. So the
+whole `__metadata__` map is one and the same map on a full checkpoint and on a
+distilled one, and it survives re-quantization unchanged.
 
 DIST-FP8 carries **no `__metadata__` at all**, which is why the FP8 recipes in
 `docs/USAGE.md` need `--dit-config`.
@@ -307,8 +314,8 @@ that consumes it cannot drift into two files.
   this fixture declares `2.5`.
 
 The reachability mutation for this row is the deletion of the
-`Ltx2CheckpointClassRefusal` call from `Ltx2VideoEngine::Load`. Section 7
-records it.
+`Ltx2CheckpointClassRefusal` call from `Ltx2VideoEngine::Load`. `## Outcome`
+records it beside the guard mutations.
 
 ---
 
@@ -336,10 +343,29 @@ Both are behaviour changes on shipped, gated arms and belong to their own rows.
 ## Owed
 
 - [#1137](https://github.com/mudler/vllm.cpp/issues/1137) — the row's own issue,
-  closed by this change for the refusal half. The **detector** half stays owed
-  and is not owed to a later revision of this design: section 2.4 names the one
-  measurement that could reopen it, a header diff of the two bf16 transformers,
-  which needs an authenticated fetch of a gated 42 GB file.
+  closed by this change for the refusal half. The **detector** half stays owed,
+  and it is worth naming the three signals that WOULD close it, so that a later
+  reader has somewhere to start rather than re-deriving section 2:
+
+  1. **An upstream flag.** The cheapest fix is not ours: one
+     `__metadata__` key, or one field in the embedded `config`, that says which
+     class the file is. Today the config is copied verbatim across builds
+     (section 2.1), so nothing distinguishes them. This is a request to
+     Lightricks, not a change here.
+  2. **A pinned content digest.** A sha256 per published artifact turns "which
+     class is this" into "which build is this", which is strictly stronger.
+     `Lightricks/LTX-2.5` is gated and its unauthenticated tree API returns 64
+     literal `*` characters for every `lfs.oid` and `xetHash`, so this needs an
+     authenticated fetch. Owned by
+     [#1048](https://github.com/mudler/vllm.cpp/issues/1048).
+  3. **A payload-level signature.** Unknown, and unknowable from here: it needs
+     the header-and-payload diff of the two bf16 transformers that section 2.4
+     could not make. If a stable, cheap discriminator exists it is in the
+     weights, not in the header.
+
+  Until one of those lands, the declaration is **load-bearing rather than
+  belt-and-braces**: a wrong declaration is the only remaining path to the
+  silent wrong-regime render, and nothing downstream can catch it.
 - `dmd2` has no stated checkpoint class in either reference, so it is the one
   kind this row does not gate (`kUnstated`).
 - `dfr` and `res2s_two_stage` do not set `requires_distilled_lora`, although
@@ -351,9 +377,129 @@ Both are behaviour changes on shipped, gated arms and belong to their own rows.
 
 ## Now
 
-`READY`. Spec committed before the implementation on branch
-`row/LTX25-CHECKPOINT-CLASS`.
+`ACTIVE`. The spec is committed before the implementation on branch
+`row/LTX25-CHECKPOINT-CLASS`, which is the commit order that proves spec-first.
+The row reaches `DONE` when a fresh reviewer returns `PASS` on the immutable
+head.
 
 ## Outcome
 
-Filled at `DONE`.
+Landed as designed: a refusal, not a detector. What follows is what was
+measured, what was rejected, and why each default has the value it has.
+
+### What the row shipped
+
+`Ltx2RequiredCheckpointClass` on the recipe, `Ltx2CheckpointClass` as the
+caller's declaration, the `checkpoint_class` load extra, one call to
+`Ltx2CheckpointClassRefusal` in `Ltx2VideoEngine::Load`, and
+`ltx2-gen --checkpoint-class`. Ten recipe factories set the requirement
+explicitly; none relies on the field's default.
+
+### Red first, and the red is the defect
+
+Captured at the pre-implementation tree (`include/`, `src/` and both test files
+at the spec commit), with the five shipped engine cases appended and ONE textual
+substitution: `vllm::multimodal::kLtx2CheckpointClassExtra`, which does not
+exist yet, for its literal spelling `"checkpoint_class"`, at 12 sites. No
+assertion was changed.
+
+- `BUILT=YES`, `compile_err=0`, `git diff --stat` against the spec commit
+  `1 file changed, 234 insertions(+)` — the test file alone.
+- `5 cases | 0 passed | 5 failed | 96 skipped`, `20 assertions | 6 passed |
+  14 failed`, `Status: FAILURE!`, exit 1. The case count moved off zero, so this
+  is a run and not a filter that matched nothing.
+- The defect itself is the FATAL in
+  `ltx2 checkpoint class: an UNDECLARED load refuses instead of rendering` at
+  `kind = one_stage`, `test_ltx2_video.cpp:9917`: `REQUIRE_FALSE( msg.empty() )`
+  with `msg` empty — the load SUCCEEDED. A `Full`-arm load that declared nothing
+  rendered.
+- This capture was taken TWICE: once on the first draft of the cases, and again
+  on the FINAL shipped text after the undeclared loop changed, so the recorded
+  red matches what lands byte-for-byte modulo the one substitution.
+- The mismatch case failed on the message rather than on the throw:
+  pre-change the engine refuses `checkpoint_class` as an *unknown load extra*,
+  so `msg.find("FULL")`, `msg.find("CLAUDE.md:17-30")` and
+  `msg.find("'distilled'")` all miss. Red for the intended reason and not for a
+  bare "something threw".
+
+### Green
+
+| Gate | Result |
+|---|---|
+| `test_ltx2_pipeline` (whole binary) | 59 cases, 3413 assertions, 0 failed, `SUCCESS!`, exit 0 |
+| `test_ltx2_pipeline -tc='ltx2 checkpoint class*'` | 3 cases, 97 assertions, 0 failed |
+| `test_ltx2_video -tc='ltx2 checkpoint class*'` | 5 cases, 90 assertions, 0 failed |
+| `test_ltx2_video` (whole binary) | 101 cases, 3599 assertions, **0 assertions failed**, 100/101 cases passed; the one case that did not is a transient `cannot write .../audio.wav` at 94% disk with three concurrent `test_ltx2_video` runs on the box, and it passes in isolation (1 case, 103 assertions, 0 failed, `SUCCESS!`, exit 0) |
+| `test_capi` (run serially; it contends with `test_ltx2_video` over `/tmp`) | 65 cases, 654 assertions, 0 failed, `SUCCESS!`, exit 0 — run strictly after `test_ltx2_video` exited |
+
+### Mutations
+
+Each one was applied to the working tree, built, run, then restored from a byte
+snapshot taken before the mutation and rebuilt. `git diff --stat` is against
+that snapshot rather than against `HEAD`, so it shows the mutation alone.
+
+| # | Mutation | Applied | Built | Result |
+|---|---|---|---|---|
+| M2 | `kFull` accepts any class | 1 ins / 1 del | YES, `compile_err=0` | RED: 1/3 cases, `REQUIRE_FALSE( msg.empty() )` at the mismatch case |
+| M3 | an absent declaration returns "" | 1 ins | YES, `compile_err=0` | RED: 1/3 cases, `REQUIRE_FALSE( msg.empty() )` at the absent-declaration case |
+| M4 | `retake` full-with-no-adapter condition disabled | 1 ins / 1 del | YES, `compile_err=0` | RED: 1/3 cases, `REQUIRE_FALSE( msg.empty() )` at the `kFullOrDistilled` case |
+| M5 | `dfr`'s row set to `kDistilled` | 1 ins / 1 del | YES, `compile_err=0` | RED: 2/3 cases, 4 assertions including `recipe.checkpoint_class == row.required` |
+| M7 | `dmd2`'s `kUnstated` exemption removed | 1 ins / 1 del | YES, `compile_err=0` | RED: 1/3 cases, the `dmd2` accept assertion |
+| M6 | **reachability**: the `Ltx2CheckpointClassRefusal` call deleted from `Ltx2VideoEngine::Load` | 1 ins / 1 del | YES, `compile_err=0` | RED on `test_ltx2_video`: 4 of 5 cases, `REQUIRE_FALSE( msg.empty() )` at four sites. GREEN on `test_ltx2_pipeline`: 3 cases, 97 assertions, `SUCCESS!` |
+
+M6 is the reachability evidence `AGENTS.md` "Nothing lands dead" asks for. Every
+engine case enters at `LoadVideoEngine` or `vllm_video_engine_load`; the
+pure-function cases in `test_ltx2_pipeline` stay green under M6, which is
+exactly the point — they measure the function, not the capability.
+
+### What was rejected, and why
+
+**A detector on `keyframes_abs_pos_embedding`.** It is the only structural
+difference between the full bf16 file and the distilled NVFP4 one, and it is
+falsified twice (section 2.2). Shipping it would refuse a correct load of the
+FP8 distilled build and admit a wrong one, with a green check beside it.
+
+**A size check.** The two bf16 transformers are the same byte count
+(section 2.3).
+
+**A filename check.** A local copy of the NVFP4 transformer on this project's
+NAS is 116,384 bytes smaller than the published artifact of the same name and is
+internally complete, so a different build already exists here under an unchanged
+name.
+
+**Making `checkpoint_class` optional, or a warning.** Silence is the defect. A
+warning is silence with a log line: the render still completes and the artifacts
+still pass every check this tree owns.
+
+**A `kFullOrDistilled` that accepts anything.** `retake` would then run
+`DISTILLED_SIGMAS` on undistilled weights, which is #1137 on one arm. The
+condition mirrors `retake.py:71-73`.
+
+**Changing `requires_distilled_lora` on `res2s_two_stage` and `dfr`.** Found
+while reading the table; it refuses loads that succeed today on two shipped
+arms, so it went to [#1445](https://github.com/mudler/vllm.cpp/issues/1445) and
+section 6's stop condition rather than into this diff.
+
+### Why each default has its value
+
+- `Ltx2PipelineRecipe::checkpoint_class` defaults to `kFull`, the most demanding
+  value any row takes, so a recipe added later that forgets the field refuses
+  rather than admits. The gate is the cross-product case, not the default.
+- `kUnstated` is set explicitly on `dmd2` and nowhere else, so the one ungated
+  kind is greppable rather than implied by an absent line.
+- `FixtureCheckpointClass` in the test resolves the class FROM the recipe table
+  instead of listing it per case, because a per-case list would be a second copy
+  of the table that could disagree without anything saying so.
+- The refusal sits AFTER the `requires_distilled_lora` one. A two-stage load
+  with no adapter fails both, and the adapter message names a missing file the
+  caller can fetch.
+
+### Limits
+
+- No GPU lease was taken and no render on real weights is claimed. The gate is
+  the reduced fixture plus four real safetensors headers.
+- The engine cannot check the declaration. A false declaration still renders in
+  the wrong regime.
+- The distilled bf16 transformer was not read (section 2.4). If it ever becomes
+  readable and its header does differ from the full one, this row's conclusion
+  narrows and a detector becomes possible; the refusal stays correct either way.

@@ -1044,6 +1044,7 @@ the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
 ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
          --dit-config ltx-2.5-transformer-config.json \
          --model-version 2.5 \
+         --checkpoint-class distilled \
          --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
@@ -1418,10 +1419,10 @@ generates a soundtrack and no video at all. The result carries an `audio.wav`,
 is nothing to mux.
 
 ```sh
-ltx2-gen --dit ltx-2.5-dit.safetensors \
+ltx2-gen --dit ltx-2.5-22b-dev-transformer-bf16.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --encoder gemma4-12b-with-proj.safetensors --encoder-config gemma4.json \
-         --pipeline-kind t2a_one_stage --device cpu \
+         --pipeline-kind t2a_one_stage --checkpoint-class full --device cpu \
          --frames 121 --prompt "rain on a tin roof, distant thunder" \
          --workdir /tmp/t2a
 ```
@@ -1442,10 +1443,19 @@ MiniMax-Music3 below each carry a full table and LTX-2.5 carries none. That is
 campaign-wide and pre-existing rather than particular to this recipe, and it is
 recorded rather than invented, because no LTX-2.5 arm here has been rendered on
 real weights yet. Tracked by
-[#1048](https://github.com/mudler/vllm.cpp/issues/1048); read `--dit` above as
-"the LTX-2.5 transformer", which the other recipes on this page spell as
-`ltx-2.5-22b-distilled-fp8.safetensors` together with the `--dit-config` its
-missing `__metadata__` requires.
+[#1048](https://github.com/mudler/vllm.cpp/issues/1048).
+
+**This recipe needs the FULL transformer, and it named the distilled one until
+2026-08-20.** `T2AOneStagePipeline`'s `Model` column reads `Full`
+(ltx-pipelines CLAUDE.md:20 at `fd4ded7f`) and `t2a_one_stage.py:50` says it
+again in prose: *"Assumes full non distilled model is provided in the
+checkpoint_path."* The text here used to read `--dit` as
+`ltx-2.5-22b-distilled-fp8.safetensors`, "which the other recipes on this page
+spell as", so the published recipe pointed at the wrong checkpoint class and
+nothing refused it
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)). `--checkpoint-class`
+is what refuses it now, and the file above is the full one. It carries its own
+`__metadata__`, so it needs no `--dit-config`.
 
 **No `--video-vae` is needed**, and none is loaded: upstream's pipeline never
 constructs a video VAE. `--width` and `--height` are **refused** rather than
@@ -3475,7 +3485,8 @@ vllm-server --model /path/to/text-model \
   --video-encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
   --video-extra encoder_config_path=ltx-2.5-gemma4-text-config.json \
   --video-extra dit_config_path=ltx-2.5-transformer-config.json \
-  --video-extra model_version=2.5
+  --video-extra model_version=2.5 \
+  --video-extra checkpoint_class=distilled
 ```
 
 `allow_unported_modules=1` is no longer needed for either shipped LTX-2.5 DiT —
@@ -3601,11 +3612,15 @@ declares none), `dit_config_path`, `encoder_config_path`,
 `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
 negative half of the same fallback, for the unconditional forward),
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
-`upsampler_path`, `duration_head_path`, `lora_path` and `lora_strength` — twelve
-keys, which is `kKnownLoadExtras` (`ltx2_video.cpp:377-383`) in order. The two
-LoRA keys landed with issue #923 and were missing from this list until
-2026-08-17; the array's own neighbouring comment still says "nine of these ten",
-which is [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
+`upsampler_path`, `duration_head_path`, `lora_path`, `lora_strength` and
+`checkpoint_class` (which class of transformer `dit_path` holds; see the
+`pipeline_kind` table above) — fifteen keys, which is `kKnownLoadExtras`
+(`ltx2_video.cpp`, the `kKnownLoadExtras` array) in order. The two LoRA keys
+landed with issue #923 and were missing from this list until 2026-08-17;
+`checkpoint_class` landed with
+[#1137](https://github.com/mudler/vllm.cpp/issues/1137). The array's own
+neighbouring comment still says "nine of these ten", which is
+[#1097](https://github.com/mudler/vllm.cpp/issues/1097).
 An extra a family does not define is
 refused, never ignored. One caveat inside that set: `duration_head_path` is
 defined but UNSERVED — the duration head is ported and gated as a brick, and
@@ -4181,18 +4196,18 @@ anything else by name rather than defaulting, because a plausible but wrong sigm
 schedule or guidance scale renders a video instead of failing. **Twenty-eight**
 pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 
-| `pipeline_kind` | resolving `model_version` | what it also needs |
-|---|---|---|
-| `one_stage` | 2, 2.3, 2.4, 2.5 | — |
-| `distilled_two_stage` | 2, 2.5 | `upsampler_path` for its second phase |
-| `res2s_two_stage` | **2.5 only** | `upsampler_path` for its second phase |
-| `dfr` | **2.5 only** | `upsampler_path` |
-| `dmd2` | 2, 2.3 | — |
-| `retake` | 2, 2.5 | a source clip as a `frame_%06d.ppm` directory |
-| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
-| `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
-| `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
-| `keyframe_interpolation` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
+| `pipeline_kind` | resolving `model_version` | `checkpoint_class` | what it also needs |
+|---|---|---|---|
+| `one_stage` | 2, 2.3, 2.4, 2.5 | `full` | — |
+| `distilled_two_stage` | 2, 2.5 | `distilled` | `upsampler_path` for its second phase |
+| `res2s_two_stage` | **2.5 only** | `full` | `upsampler_path` for its second phase |
+| `dfr` | **2.5 only** | `keyframe_slot_sft` | `upsampler_path` |
+| `dmd2` | 2, 2.3 | none stated | — |
+| `retake` | 2, 2.5 | `full` **with** `lora_path`, or `distilled` | a source clip as a `frame_%06d.ppm` directory |
+| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | `full` | a text tower; no video VAE is asked for |
+| `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `full` | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
+| `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `full` | `upsampler_path` and `lora_path` |
+| `keyframe_interpolation` | 2, 2.3, 2.4, 2.5 | `full` | `upsampler_path` and `lora_path` |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -4202,6 +4217,59 @@ that parameter — so resolving DFR onto it would build a recipe the engine must
 then refuse at load. Refusing at the recipe table names the version instead
 (the `dfr` arm of `ResolveLtx2PipelineRecipe`, named rather than given as a line
 range because this row's own insertions above it staled the range once already).
+
+### `checkpoint_class` is REQUIRED, and it is a declaration rather than a check
+
+The third column is upstream's own `Model` column
+(ltx-pipelines `CLAUDE.md:17-30` at `fd4ded7f`), reduced to the class of
+transformer the pipeline runs. Every kind except `dmd2` refuses a load that does
+not declare one: `ltx2-gen --checkpoint-class full|distilled|keyframe_slot_sft`,
+the `checkpoint_class` load extra on the C API, and
+`--video-extra checkpoint_class=...` on the server.
+
+**The engine asks because it cannot tell.** Measured on 2026-08-20 by parsing
+four LTX-2.5 safetensors headers and no payload byte:
+
+- `ltx-2.5-22b-dev-transformer-bf16.safetensors` (full) and
+  `ltx-2.5-22b-distilled-transformer-bf16.safetensors` (distilled) are **both
+  42,018,190,584 bytes**, so `ls -l` does not separate them.
+- The **whole `__metadata__` map** of the full file and of the distilled NVFP4
+  build is byte-identical, key by key: `config` (2199 bytes, sha256 opening
+  `13be9edf16635af9`), `gemma_source_checkpoint` (62), `license` (34562) and
+  `model_version` (`2.5.0`). It survives re-quantization unchanged, so there is
+  no metadata field left to key on.
+- The one structural difference between those two,
+  `keyframes_abs_pos_embedding`, is an architecture-support flag and not a
+  distillation marker. The distilled NVFP4 file's own copied config still
+  declares `"use_keyframes_abs_pos_embedding": true` with the tensor absent, and
+  `vonkaiser/LTX-2.5-FP8-NVFP4`'s `ltx-2.5-22b-distilled-fp8.safetensors`
+  **carries** the tensor, as `F8_E4M3 [1, 4096]` with an `F32` scale, over a base
+  tensor-name set that is exactly the dev file's 4349 names.
+
+So there is no field to detect, a wrong detector would be worse than none, and
+the load refuses rather than guessing. Pointing `--dit` at the distilled file on
+a `full` arm used to **render**: the requested size, the requested frame count
+and the requested sample rate, sampled in a regime the weights were never
+trained for, which no pixel, RMS, windowed-energy or spectral check can see
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
+
+**What the flag does not buy.** The engine never opens the file to verify the
+claim, because there is nothing in the header to verify it against. Declaring
+`full` for a distilled checkpoint still renders in the wrong regime. What
+changed is that it now takes a deliberate false statement instead of silence.
+
+`retake` is the one permissive row and it is a condition, not a hole. Upstream's
+`RetakePipeline` states it at `retake.py:71-73` — "using distilled model **or**
+passing distillation lora with full model" — and this port mirrors the
+`distilled=True` arm its command line hard-codes (`retake.py:336`, `:359`), which
+then takes `DISTILLED_SIGMAS` (`:287`). So `--checkpoint-class full` on a
+`retake` needs `--lora`, and `distilled` needs nothing.
+
+`dmd2` is the one kind nothing gates. Lightricks' table has no `dmd2` row and
+vLLM-Omni's `_PIPELINE_RECIPES` (`ltx2_recipes.py:160-167`) has no `Model`
+column, so no reference states a class for it. That is recorded rather than
+defaulted, and it is owed in
+[`.agents/specs/ltx25-checkpoint-class.md`](../.agents/specs/ltx25-checkpoint-class.md).
 
 ### `res2s_two_stage`: the high-quality preset, and why it is a sampler
 
@@ -4233,6 +4301,7 @@ property of the output says so. Ask for the pipeline, not for its step count.
 
 ```sh
 ltx2-gen --pipeline-kind res2s_two_stage \
+         --checkpoint-class full \
          --prompt "a cinematic shot of ..." \
          --height 1088 --width 1920 --frames 121
 ```
@@ -4265,7 +4334,8 @@ ltx2-gen --dit ltx-2.5-22b-distilled-fp8.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
          --lora ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
-         --pipeline-kind a2vid_two_stage --audio-path take.wav \
+         --pipeline-kind a2vid_two_stage --checkpoint-class full \
+         --audio-path take.wav \
          --prompt "a drummer in a small club" \
          --width 128 --height 128 --frames 25 --out out/a2v
 ```
@@ -4343,6 +4413,7 @@ it with the distilled adapter on a frozen three-sigma schedule and no guider.
 ```sh
 ltx2-gen \
   --pipeline-kind ti2vid_two_stage \
+  --checkpoint-class full \
   --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
   --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
   --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
@@ -4411,6 +4482,7 @@ a distilled three-sigma refinement. It needs the same `--lora-path` and
 ```sh
 ltx2-gen \
   --pipeline-kind keyframe_interpolation \
+  --checkpoint-class full \
   --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
   --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
   --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
@@ -4669,14 +4741,35 @@ the sha256 of the copy on this project's NAS, computed locally, and it has not
 been compared against the published artifact because there is nothing here to
 compare it to.
 
-**The two bf16 transformers are exactly the same SIZE**, and the file name is
-the only cheap thing that separates them. Both are 4349 tensors, both carry the
-same four `__metadata__` keys with `model_version` `2.5.0`. So a mislabelled or
-re-downloaded copy cannot be caught by `ls -l`, and nothing here validates the
-checkpoint *class* at load
-([#1137](https://github.com/mudler/vllm.cpp/issues/1137)): pointing
-`--pipeline-kind res2s_two_stage` at the distilled file renders in the wrong
-sampling regime with no diagnostic.
+**The two bf16 transformers are exactly the same SIZE**, 42,018,190,584 bytes
+each, re-read from the tree API on 2026-08-20. The file name is the only cheap
+thing that separates them, and a file name is not a pin.
+
+**What is measured about the distilled bf16 file, and what is not.** Its SIZE is
+the tree listing's. Nothing else here is: it is 42 GB in a gated repository, an
+unauthenticated range request for its first 8 bytes answers HTTP `401`, and no
+copy of it exists on this project's NAS. An earlier version of this paragraph
+asserted that it is "4349 tensors" carrying "the same four `__metadata__` keys",
+which no measurement supported; that sentence is withdrawn. What IS measured, on
+the files that are here, is the full bf16 file against the distilled NVFP4 one:
+byte-identical 2199-byte `__metadata__["config"]`, the same `model_version`
+`2.5.0`, and one structural difference that is an architecture flag rather than
+a class marker. The full derivation is in the `checkpoint_class` section above
+and in [`.agents/specs/ltx25-checkpoint-class.md`](../.agents/specs/ltx25-checkpoint-class.md)
+section 2.
+
+**The load now validates the checkpoint CLASS**
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)). Pointing
+`--pipeline-kind res2s_two_stage` at the distilled file used to render in the
+wrong sampling regime with no diagnostic; it is refused now, by the declaration
+the caller supplies rather than by a detector, for the reason above.
+
+**A local copy already disagrees with the published artifact.** The tree listing
+gives the NVFP4 transformer as 18,721,548,408 bytes. The copy under that name on
+this project's NAS is 18,721,432,024, a difference of 116,384 bytes, and it is
+internally complete — its `8 + header + data_end` equals its own size. So it is a
+different build under an unchanged name, which is exactly the hazard the class
+declaration exists for.
 
 Read from the FULL model's own header on 2026-08-17, by parsing its
 677,616-byte JSON prologue and no payload: 4349 tensors, every one

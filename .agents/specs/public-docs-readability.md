@@ -100,6 +100,17 @@ The obsolete revision `a767244d27bd76589a3e3b2ab4e64032c4ebc7af` remains in
 the issue index, quantization matrix, and Qwen3.8 quant-arm spec with its stale
 classification. None of these five literals needs another public copy.
 
+The R3 closure review found that the original global literal-count command no
+longer represented preservation after extraction. It exited 1 with 703 removed
+occurrences. These occurrences included expected duplicates and archived
+contributor commands. The replacement check validates all 275 manifest rows.
+Each row names its current public destination or internal evidence owner. The
+check passes on this tree. It exits 1 when a destination is changed to a
+nonexistent page. The campaign-base heading check still rejects missing or
+extra source sections. The empty heading at campaign-base `USAGE.md:582` is
+`stale` and cites the exact Git anchor. It does not claim a deduplicated body
+that never existed.
+
 The LTX registry and model page restore the base facts from
 `docs/USAGE.md:4380-4510` and `docs/USAGE.md:4782-4865` at
 `c8d926ea82bd6d8f5d6312693572c84234a6a7f3`. The Qwen description comes from
@@ -498,7 +509,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:474` ### Timing an encode on your own box | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:497` ### How much memory a Vulkan load needs | Build procedure, current feature state, measurement, cross-model workflow, and design or implementation history | `docs/reference/model-loading.md` for Vulkan unified-memory sizing and `VT_VULKAN_ALLOC_STATS`; `docs/BUILD.md` for the Vulkan measurement tools and Tenstorrent build requirements; `docs/STATUS.md` for current Tenstorrent backend state; `docs/BENCHMARKS.md` for the Voxtral/Whisper FlashAttention-2 and vocoder A/B measurements; `docs/guides/vocoder-device.md` for the cross-model vocoder A/B workflow; `.agents/specs/backend-fanout-metal-vulkan-xpu.md`, `.agents/specs/tenstorrent-backend.md`, `.agents/specs/multimodal-speed.md`, and `.agents/specs/minimax-music3.md` for implementation, gate, and raw-measurement history | `moved`; `deduplicated`; `archived` | `.agents/specs/backend-fanout-metal-vulkan-xpu.md`; `.agents/specs/tenstorrent-backend.md`; `.agents/specs/multimodal-speed.md`; `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:557` ### Running the vocoder convolutions on the GPU | Cross-model workflow and design or implementation history | `docs/guides/vocoder-device.md` for device selection, defaults, supported device names, refusals, and the A/B workflow; `.agents/specs/minimax-music3.md` for byte-identity gates, rollout decisions, and implementation history | `moved`; `archived` | `.agents/specs/minimax-music3.md` |
-| `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Stale empty heading | No body to migrate: campaign-base line 582 is followed immediately by the line 583 heading, which owns the load-stat content beginning at line 585 | `deduplicated` | `n/a` |
+| `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Stale empty heading | No body to migrate: campaign-base line 582 is followed immediately by the line 583 heading, which owns the load-stat content beginning at line 585 | `stale` | Git anchor `c8d926ea82bd6d8f5d6312693572c84234a6a7f3:docs/USAGE.md:582-583` |
 | `docs/USAGE.md:583` ### How long a load takes, and how to see where it goes | Dense lookup material, measurement, and implementation history | `docs/reference/model-loading.md` for `VT_LOAD_STATS` and counter semantics; `docs/BENCHMARKS.md` for accepted load ratios; `.agents/specs/load-direct-upload.md` for implementation and raw measurement evidence | `moved`; `deduplicated`; `archived` | `.agents/specs/load-direct-upload.md` |
 | `docs/USAGE.md:620` ### Quantized checkpoints: which `lm_head` forms load | Model recipe and dense lookup material | `docs/models/qwen3-6.md` for the Qwen3.6 checkpoint forms and model-specific controls; `docs/reference/model-loading.md` for the shared quantized-weight loading rules | `moved` | `n/a` |
 | `docs/USAGE.md:648` ### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified | Model recipe and design or implementation history | `docs/models/qwen3-8-27b.md` for the pinned checkpoint, supported CPU arm, CUDA shape restrictions, and current refusals; `.agents/specs/model-fp8-block-linear.md` for implementation, mutation, and gate history | `moved`; `archived` | `.agents/specs/model-fp8-block-linear.md` |
@@ -688,11 +699,70 @@ Require seven nonempty fields in each checkpoint registry row:
 python3 -c 'import pathlib,sys; s=pathlib.Path("docs/USAGE.md").read_text(); a=s.find("<!-- checkpoint-registry:begin -->"); b=s.find("<!-- checkpoint-registry:end -->"); rows=[] if a<0 or b<a else [x for x in s[a:b].splitlines() if x.startswith("|")][2:]; bad=[x for x in rows if len(x.split("|"))-2!=7 or any(not y.strip() for y in x.split("|")[1:-1])]; print("registry missing" if a<0 or b<a else "\n".join(bad)); sys.exit(a<0 or b<a or not rows or bool(bad))'
 ```
 
-Compare the campaign-base and worktree fact inventories. The inventory includes
-SHA-256 values, flags, environment variables, measurements, and result states:
+Validate the destination-aware preservation record. This check validates the
+manifest schema. It does not compare global literal counts. Extraction,
+deduplication, archival, and deliberate rewording can correctly reduce a
+literal's occurrence count. Every row must name an allowed disposition. Every
+current public owner must exist. Every archived or stale fact must name
+existing evidence or an issue or Git anchor. The semantic audits above record
+the identifier, measurement, warning, default, and refusal reviews across
+those owners.
 
 ```sh
-python3 -c 'import collections,pathlib,re,subprocess,sys; fs=["README.md",*[str(p) for p in pathlib.Path("docs").rglob("*.md")]]; pat=re.compile(r"(?:[0-9a-f]{64}|--[a-z0-9][a-z0-9-]*|\b[A-Z][A-Z0-9_]{2,}\b|\b\d+(?:\.\d+)?(?:x|%| GiB| MiB| ms| tok/s)\b|\b(?:REFUSED|PENDING|FAILED|VOID)\b)"); old=lambda p: subprocess.run(["git","show",f"c8d926ea82bd6d8f5d6312693572c84234a6a7f3:{p}"],text=True,capture_output=True).stdout; before=collections.Counter(x for p in fs for x in pat.findall(old(p))); after=collections.Counter(x for p in fs if pathlib.Path(p).exists() for x in pat.findall(pathlib.Path(p).read_text())); missing=before-after; print("\n".join(f"{k} {v}" for k,v in sorted(missing.items()))); sys.exit(bool(missing))'
+python3 - <<'PY'
+import pathlib
+import re
+import sys
+
+spec = pathlib.Path(".agents/specs/public-docs-readability.md").read_text()
+header = "| Source section | Class | Exact destination | Disposition | Evidence or owner |"
+start = spec.find(header)
+end = spec.find("\n\nCampaign-base heading count:", start)
+errors = []
+if start < 0 or end < 0:
+    errors.append("migration manifest is missing")
+    rows = []
+else:
+    rows = [line for line in spec[start:end].splitlines()[2:] if line.startswith("|")]
+
+allowed = {"kept", "moved", "deduplicated", "archived", "stale"}
+public_roots = ("README.md", "docs/")
+internal_roots = (".agents/", "docs/bench-evidence/")
+for number, row in enumerate(rows, 1):
+    cells = [cell.strip() for cell in row.split("|")[1:-1]]
+    if len(cells) != 5:
+        errors.append(f"row {number}: expected five fields")
+        continue
+    source, section_class, destination, disposition, evidence = cells
+    if not re.fullmatch(r"`(?:README\.md|docs/[^`]+\.md):\d+` #{1,3} .+", source):
+        errors.append(f"row {number}: invalid source key")
+    if not section_class:
+        errors.append(f"row {number}: missing class")
+    dispositions = set(re.findall(r"`([^`]+)`", disposition))
+    if not dispositions or not dispositions <= allowed:
+        errors.append(f"row {number}: invalid disposition {disposition}")
+    destinations = re.findall(r"`((?:README\.md|docs/[^`]+\.md))`", destination)
+    if dispositions & {"kept", "moved", "deduplicated"} and not destinations:
+        errors.append(f"row {number}: public disposition has no public destination")
+    for path in destinations:
+        if not path.startswith(public_roots) or not pathlib.Path(path).is_file():
+            errors.append(f"row {number}: missing public destination {path}")
+    if dispositions & {"archived", "stale"}:
+        owners = re.findall(r"`([^`]+)`", evidence)
+        anchored = "#" in evidence or "commit" in evidence.lower() or "git" in evidence.lower()
+        if evidence == "`n/a`" or not owners:
+            errors.append(f"row {number}: archived or stale fact has no owner")
+        for owner in owners:
+            if owner.startswith(internal_roots) and not pathlib.Path(owner).is_file():
+                errors.append(f"row {number}: missing evidence owner {owner}")
+            elif not owner.startswith(internal_roots) and not anchored:
+                errors.append(f"row {number}: unanchored evidence owner {owner}")
+
+if len(rows) != 275:
+    errors.append(f"manifest row count is {len(rows)}, expected 275")
+print("\n".join(errors))
+sys.exit(bool(errors))
+PY
 ```
 
 Require one manifest row for each campaign-base H1, H2, and H3 heading. The

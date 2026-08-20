@@ -1,0 +1,314 @@
+# LTX25-DFR-ROUNDS — DFR's temporal refinement rounds, and the upsampler they drive
+
+Issue: [#986](https://github.com/mudler/vllm.cpp/issues/986).
+Campaign: [#644](https://github.com/mudler/vllm.cpp/issues/644).
+Upstream pin: `Lightricks/LTX-2 @ fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`,
+verified at `/home/mudler/_git/LTX-2` before any anchor below was read
+(`git rev-parse HEAD` matched; `dfr_pipeline.py` is 630 lines and
+`dfr_layout.py` is 213, both as recorded).
+
+## 0. Honesty statement — what this row claims and what it does not
+
+**0.1 This row lands one thing: the rounds loop.** Everything the loop needs
+already exists. `dfr_layout.py` is ported in full and gated
+(`ltx2_dfr.h`, `test_ltx2_dfr` 11/11), the generated keyframe slots are served,
+the temporal x2 upsampler operator is ported and gated, and the `dfr` recipe is
+reachable from `--pipeline-kind dfr`. What has no local counterpart is the
+DENOISE PASS AS A CALLABLE, which is what the shipped refusal
+(`ltx2_video.cpp:2018-2021`) names as the blocker. That is a refactor of the
+render path, and this row does it.
+
+**0.2 The row's purpose is a reachability answer, not a feature.**
+`.agents/specs/ltx25-temporal-upsampler.md` §7 and `docs/FEATURES.md:172`
+record the temporal x2 latent upsampler as gated and **UNDRIVEN**. Its only
+upstream consumer is this loop. If this row lands, that cell moves; if it
+cannot, the cell stays and the reason is recorded here.
+
+**0.3 One recorded blocker turned out to be FALSE, and it was measured, not
+assumed.** The shipped refusal at `ltx2_video.cpp:2022-2027`, issue #986 itself,
+and `.agents/specs/ltx25-dfr-pipeline.md` §0.2 all state that
+`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` is **not on the NAS**,
+"re-verified 2026-08-16". **It is on the NAS.** Measured 2026-08-20:
+
+```
+/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/latent_upscale_models/
+  ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors    995778752  2026-08-12
+  ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors   261944000  2026-08-17
+```
+
+Verified SEMANTICALLY rather than by name, because an arch name is not its
+contents: the safetensors header is 7608 bytes, it declares 72 tensors, all
+`BF16`, and `8 + header + data_end == 261944000` exactly — the file is complete
+and self-consistent. Its `__metadata__.config` reads
+`{"_class_name": "LatentUpsampler", "in_channels": 128, "mid_channels": 512,
+"num_blocks_per_stage": 4, "dims": 3, "spatial_upsample": false,
+"temporal_upsample": true, "spatial_scale": 1.0, "rational_resampler": true}` —
+`spatial_upsample: false`, `temporal_upsample: true`, so it is the temporal arm
+and not a renamed spatial one.
+
+It landed on **2026-08-17**, one day AFTER the "re-verified 2026-08-16" the
+refusal carries. Both records were true when written and are false now. This is
+the "refusals go stale" risk `.agents/specs/ltx25-dfr-pipeline.md` §8 names,
+firing on that row's own text. The refusal is corrected in this change rather
+than inherited.
+
+**0.4 What 0.3 does NOT unblock.** A real-weights DFR render is still
+impossible, and for a DIFFERENT reason than the one the records give. DFR's
+base needs a `keyframe_slot_sft` transformer (`dfr_pipeline.py:157`,
+`DfrRecipe` at `ltx2_pipeline.cpp:1320`), and #1137 established by
+authenticated reads at the pinned revision that no such checkpoint is
+published: `Lightricks/LTX-2.5` ships five transformers, every one `dev` or
+`distilled`. So the temporal upsampler now HAS real weights, and the pipeline
+that would drive it still cannot load a real base. This row therefore claims a
+REDUCED-DIMENSION fixture result and no real-weight result of any kind.
+
+**0.5 No GPU.** A guided render holds `dgx:gpu0` and the fleet is contended, so
+no lease is taken. Everything here is CPU. Nothing in this row needs a device.
+
+## 1. The decision on the `keyframe_slot_sft` blocker, stated rather than worked around
+
+Three options were considered.
+
+1. **Loosen #1137's refusal.** REJECTED. It is a correctness gate that landed
+   for a reason, and the row that landed it did the authenticated reads.
+   Weakening a gate to let a test through is exactly the "never make a red gate
+   green by deleting an assertion" case in `AGENTS.md`.
+2. **Declare `keyframe_slot_sft` on a `dev`/`distilled` file.** REJECTED.
+   `docs/USAGE.md:1528` already names this as the false declaration rather than
+   the workaround, and the declaration is never checked against the header
+   (`docs/FEATURES.md:175`), so the lie would be undetectable — which makes it
+   worse, not safer.
+3. **Gate on reduced-dimension synthetic fixtures through the production entry
+   point.** TAKEN. This is how `test_ltx2_dfr` and every DFR case in
+   `test_ltx2_video` already work (`test_ltx2_video.cpp:112` returns
+   `keyframe_slot_sft` for the fixture it builds), and a fixture that declares
+   the class it genuinely implements is not a false declaration.
+
+Option 3 satisfies reachability on its own terms: `.agents/reachability.md`
+asks whether a **production entry point** reaches the change, and
+`LoadVideoEngine` + `VideoEngine::Generate` is that entry point regardless of
+whose weights are loaded. The fixture is the checkpoint, not the caller.
+
+**What stays owed: a real-weights DFR render**, blocked on a published
+`keyframe_slot_sft` base. Recorded under `## Owed` against #986.
+
+## 2. Upstream, with anchors — every one re-derived at `fd4ded7f`
+
+The loop is `dfr_pipeline.py:402-529` and the frame contract is `:531-540`.
+Step by step, with the line that decides each:
+
+| # | Step | Anchor |
+|---|---|---|
+| 1 | round index runs `1..rounds`, `rounds in {0,1,2}` | `:402`, refused at `:284-285` |
+| 2 | temporally x2-upsample the video latent | `:407` |
+| 3 | `num_frames = 2 * (num_frames - 1) + 1` | `:408` |
+| 4 | `current_fps = 2 * current_fps` | `:409` |
+| 5 | seam positions scale x2; carried latents do NOT | `:410-412` |
+| 6 | conditioning fps capped at 60.0 | `:414`, rationale `:74-78` |
+| 7 | `tile_ranges(seams, num_frames, 2**round_idx)` | `:415` |
+| 8 | per tile: `local_frames = (lat_end - lat_start - 1) * 8 + 1` | `:422` |
+| 9 | per tile: slice `video_latent[:, :, lat_start:lat_end]` | `:423` |
+| 10 | images re-attached TILE-LOCALLY, only those inside the window | `:428-437` |
+| 11 | every seam in the window is a hard keyframe at strength 0.95 | `:453-468`, `:72` |
+| 12 | mid-segment slots per tile, seeded from the tile's own latent | `:470-478` |
+| 13 | ancestral Euler at eta 0.5, PER-TILE noise seed | `:480-499`, `:73` |
+| 14 | stitch, and check `T == (num_frames-1)//8 + 1` | `:508-511` |
+| 15 | dedupe repeated slots — the EARLIER tile wins | `:516-525` |
+| 16 | merge carried anchors + this round's slots into the next bag | `:527-529` |
+| 17 | trim to `(requested - 1) * 2**rounds + 1` | `:531-540` |
+| 18 | `playback_fps = frame_rate * 2**rounds` | `:542` |
+| 19 | audio cut to `num_frames / playback_fps` | `:552-560` |
+
+Steps 7, 8, 12, 14, 15, 16 and 17 are **already ported and gated** in
+`ltx2_dfr.h` as `Ltx2DfrTileRanges`, `Ltx2DfrStitchTileLatents`,
+`Ltx2DfrSlotInitialsFromVideo`, `Ltx2DfrMergeCarryForwardKeyframes` and
+`Ltx2DfrTargetFrames`. This row supplies their first production callers.
+
+The three constants that exist today with **no reader** are steps 6, 11 and 13:
+`kLtx2DfrMaxConditioningFps` (60.0), `kLtx2DfrAnchorKeyframeStrength` (0.95),
+`kLtx2DfrTemporalAncestralEta` (0.5) — `ltx2_dfr.h:100-115`.
+
+## 3. The seam, which is the actual work
+
+Upstream's rounds invoke `self.stage(...)` — the same `DiffusionStage.__call__`
+the two base stages use (`dfr_pipeline.py:480-499` against `:332` and `:375`),
+with its own sigmas, stepper, seed, conditionings and initial latent, and with
+`audio=None`.
+
+This engine's equivalent is the body of the phase loop at
+`ltx2_video.cpp:2959-4422`, which is inline and has no seam a tile can enter
+through. **This row turns that body into one callable and calls it from three
+places** — base stage, detail stage, and per tile — exactly as upstream does.
+Writing a second denoise loop for tiles is the parallel path
+`AGENTS.md` `## Shared seams` forbids, and it is not done here.
+
+The invocation record mirrors `DiffusionStage.__call__`'s parameter list:
+sigmas, stepper and eta, frames, fps, spatial downscale, initial latent, noise
+scale, per-invocation noise seed, the extra conditionings the caller supplies,
+whether audio runs, and where the result and the read-back slots go.
+
+**This is a refactor of the shipped render path**, so every existing pipeline
+kind runs through the new seam. The floor is that the ten recipes produce
+byte-identical output before and after — proved by the existing suites rather
+than asserted.
+
+## 4. Scope
+
+**In.**
+
+1. The callable stage seam in `ltx2_video.cpp`, and the base and detail stages
+   rewritten as its first two callers.
+2. The rounds loop: steps 1-19 of §2, driving `Ltx2UpsampleVideoLatent` on the
+   temporal arm.
+3. A second upsampler slot: `temporal_upsampler_path`
+   (`dfr_pipeline.py:177`, `:578-583`), since the engine holds one upsampler
+   today and DFR needs both.
+4. `temporal_upsample_rounds` served rather than refused, and
+   `--temporal-upsample-rounds` / `--temporal-upsampler-path` on `ltx2-gen`.
+5. Retire the two refusals this makes false — the rounds refusal
+   (`ltx2_video.cpp:1995-2029`) and the "no phase consumes the temporal arm"
+   clause (`:3077-3086`) — retired WITH their tests, per the #920 precedent
+   recorded at `test_ltx2_video.cpp:1783-1793`, never widened.
+6. Correct §0.3's stale NAS claim everywhere it is carried.
+7. `docs/FEATURES.md` (the UNDRIVEN cell and the DFR row), `docs/USAGE.md`,
+   `.agents/issue-index.md`, and the owning row.
+
+**Out, refused by name or recorded as owed.**
+
+- A real-weights DFR render — §1, no published `keyframe_slot_sft` base. Owed.
+- The stage-2 detailing IC-LoRA — [#975](https://github.com/mudler/vllm.cpp/issues/975)
+  owns the reference-latent arm. Already refused by name; left refused.
+- The standalone single-frame slot decode — owed under #986 by the base row,
+  and this loop does not reach it: rounds keep slots in latent space.
+- A device arm for the rounds loop. The upsampler and the DiT keep whatever
+  arm the load resolved; the loop adds no kernel.
+
+## 5. Tests and evidence
+
+Every engine case enters at `LoadVideoEngine` + `VideoEngine::Generate` — the
+chain `vllm_video_generate` takes — never by constructing a type.
+
+| # | Test | What it falsifies |
+|---|---|---|
+| T1 | `rounds=1` renders and returns `(requested-1)*2+1` frames | the loop does not run at all |
+| T2 | `rounds=2` returns `(requested-1)*4+1` frames | the round count is ignored |
+| T3 | `rounds>0` without `temporal_upsampler_path` is refused by name | a silent no-op round |
+| T4 | the temporal upsampler is INVOKED, counted on the trace | the loop runs without upsampling |
+| T5 | tile count per round is `2**round` | the canvas is denoised whole |
+| T6 | the per-tile ancestral seed DIFFERS per tile | byte-identical noise per tile (`:496-498`) |
+| T7 | conditioning fps is capped at 60 while playback fps is not | the RoPE time base defect at `:74-78` |
+| T8 | `rounds=0` output is byte-identical to today's | the refactor moved the base path |
+| T9 | the ten non-DFR recipes are unchanged through the new seam | the refactor moved every pipeline |
+
+**T8 and T9 are the refactor's floor and matter more than T1-T7.** A rounds
+loop that works while quietly changing every other pipeline's output is a worse
+outcome than no rounds loop.
+
+**The reachability mutation is the headline evidence.** Delete the production
+call site where the rounds loop invokes `Ltx2UpsampleVideoLatent`, rerun the
+focused gate, record the RED. A green gate there means the loop is a test-only
+driver and the UNDRIVEN cell must not move.
+
+**Mutations owed**, each with four facts printed or it does not count:
+`BUILT=YES/NO`, the `': error:'` count, `git diff --stat` proving the mutation
+applied, and the failing assertion by name. A mutation that fails to build reads
+exactly like a passing test, and a mutation that never applied reads the same.
+Restore with an explicit `touch`, because `cp -p` restores the mtime and ninja
+then skips the rebuild while the harness prints `BUILT=YES`.
+
+| # | Mutation | Predicted signature |
+|---|---|---|
+| M1 | the temporal upsampler call site deleted | THE reachability proof |
+| M2 | `num_frames = 2*num_frames` instead of `2*(num_frames-1)+1` | frame count off by one per round |
+| M3 | seam positions not scaled x2 between rounds | anchors land at half their time |
+| M4 | the 60 fps conditioning cap removed | motion spike per latent border |
+| M5 | the per-tile seed made shared | identical noise in every tile |
+| M6 | anchor strength 1.0 instead of 0.95 | the seam frame cannot settle |
+| M7 | ancestral eta 0.0 instead of 0.5 | plain Euler; densification collapses |
+| M8 | slot dedupe keeps the LATER tile | lead-in slots overwrite settled ones |
+| M9 | `2**round` tiles replaced by a fixed 2 | round 2 denoises the wrong windows |
+
+## 6. Risks
+
+- **The refactor is the risk, not the loop.** The phase body is ~1460 lines and
+  every pipeline runs through it. T8/T9 are the control and are run before any
+  rounds work is believed.
+- **`docs/FEATURES.md` is a keyed record with `MAX_CELL_CHARS = 220`** and the
+  LTX-2.5 cells sit at it. Reapply by KEY, prove unrelated keys byte-identical,
+  and trim only this row's own wording.
+- **Two tests go red BY DESIGN** when the refusals retire
+  (`test_ltx2_video.cpp:2262` and the `ltx2_dfr.h` symbol re-derivation at
+  `:2379-2400`). They are retired with the refusal they describe, and each
+  assertion is replaced by one about what replaced it.
+- **The four symbols `Ltx2DfrResolveCanvas`, `Ltx2DfrTileRanges`,
+  `Ltx2DfrStitchTileLatents`, `Ltx2DfrMergeCarryForwardKeyframes` are
+  load-bearing for a refusal message** (`test_ltx2_video.cpp:2390-2398`).
+  Renaming any of them reds that case for an unrelated reason.
+- **`origin/main` moves constantly.** Merge often and diff the merge base.
+- **Anchors decay.** Issue #986 cites `docs/FEATURES.md:166` and
+  `.agents/specs/ltx25-resolution-envelope.md:436`; both had already moved to
+  `:172` and `:496` when this row read them. Every anchor here was re-derived
+  at this tree, and they are re-derived again at the final tree.
+
+## 7. Reachability — the sentence the records must carry
+
+Written before implementation as a target; `## Outcome` states what was reached.
+
+> The LTX-2.5 temporal x2 latent upsampler is **driven** by the DFR pipeline's
+> rounds loop, reachable from `vllm_video_generate` with `pipeline_kind=dfr`
+> and `temporal_upsample_rounds > 0`, and from `ltx2-gen` on the same flags. It
+> is gated at REDUCED DIMENSIONS against a fixture checkpoint. The real
+> `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` IS on the NAS as of
+> 2026-08-17, but no `keyframe_slot_sft` base is published, so DFR cannot load
+> real weights and no real-weight temporal result exists or is implied.
+
+Nothing in `docs/` may say more than that.
+
+## 8. Gates
+
+CPU only; no GPU lease is taken (§0.5).
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build -j6
+ctest --test-dir build -j4 --output-on-failure
+```
+
+`test_ltx2_video` and `test_capi` run SERIALLY — they contend over `/tmp`
+fixture directories. Known-environmental and proved pre-existing rather than
+asserted: `windows-msvc-*`, `test_engine_core_proc`/`test_async_llm` under
+`ctest -j`, `test_cpu_x86_llamacpp_floor` (#618), `test_nemotron_h_paged_forward`
+(#1371). Disk is checked before any failure is attributed to the diff, because
+ENOSPC surfaces here as a false POLICY REFUSAL.
+
+## 9. Arms
+
+NVFP4, FP8 and bf16 all reach the loop, because the loop adds no kernel and
+inherits whatever arm the load resolved. GGUF is not applicable to this family.
+Any arm that cannot run refuses by name rather than falling back.
+
+## Owed
+
+- [#986](https://github.com/mudler/vllm.cpp/issues/986) — a **real-weights DFR
+  render**, blocked on a published `keyframe_slot_sft` base (§0.4, §1). Not a
+  code gap: nothing in this tree can supply it.
+- [#986](https://github.com/mudler/vllm.cpp/issues/986) — the standalone
+  single-frame decode of a generated keyframe slot, carried forward from the
+  base row. The rounds loop keeps its slots in latent space and does not reach it.
+- [#975](https://github.com/mudler/vllm.cpp/issues/975) — DFR's stage-2 x2
+  spatial detailing IC-LoRA. Refused by name, pointing at #975.
+
+## Stop conditions
+
+- If the base and detail stages cannot be expressed through one callable seam
+  without changing their output, STOP and report. T8/T9 are the control and a
+  failure there is a finding about the refactor, not a test to adjust.
+- If the rounds loop cannot reach the temporal upsampler from a production entry
+  point, STOP and report. Landing it unreached repeats the exact defect this row
+  exists to retire.
+- If a refusal this row lifts turns out to have another live cause, keep the
+  refusal and retarget it rather than deleting it.
+
+## Now
+
+`ACTIVE`. Spec committed; implementation follows on `row/LTX25-DFR`.

@@ -2872,180 +2872,175 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 // above reports **1 case passed, 273 assertions, 0 failed, exit 0** at 99.9%
 // accounted — over a table that says the video decode is 32% of the render (it
 // is 2.4%) and that the audio decode is free (it is a quarter of it). W1 ranks
-// the campaign's levers off this table, and W5 is its largest stage. Existence
-// plus a sum is NECESSARY and it is not SUFFICIENT, because nothing in either
-// ties a NAME to the work beneath it.
+// this campaign's levers off this table and W5 is its largest stage. Existence
+// plus a sum is NECESSARY and it is not SUFFICIENT, because neither ties a NAME
+// to the work beneath it.
 //
-// WHAT DOES TIE A NAME TO ITS WORK is a differential: render the same fixture
-// TWICE, change exactly one thing that changes the work of some phases and not
-// others, and require the table to say so. `num_frames` is that knob. The video
-// decode, the frame writer, the audio decode and the vocoder all scale with the
-// clip's length; the DiT load does not, because it finished before the request
-// was read.
+// WHAT WAS TRIED FIRST AND REJECTED, MEASURED RATHER THAN ARGUED. The obvious
+// repair is a differential: render at two frame counts and require the phases
+// whose work scales with the clip to grow. It was written, built and run here,
+// and **this box cannot carry it**. Two renders of the same binary, minutes
+// apart, 9 frames against 33: the 9-frame render measured 8.03 s of leaves and
+// the 33-frame render 3.80 s — the 2.5x LONGER clip cost HALF the time, and an
+// earlier run of the same 9-frame render measured 4.80 s. Wall-clock noise here
+// is a factor of two in both directions, against a 2.5x signal, so a
+// seconds-differential is a coin flip wearing a gate. That is the same finding
+// `## Outcome — W0` already records at 76x, and it is why W1 is written as a
+// lease on an idle box.
 //
-// WHY THE ASSERTION IS A SHARE AND NEVER A SECOND. This box has moved the same
-// binary's wall by a factor of 76 at the identical geometry and REVERSED the
-// rank of its two dominant phases (`.agents/specs/ltx25-device-residency.md`
-// `## Outcome — W0`), so no absolute duration written here would survive a
-// contended run, and no fixed ratio between two phases would either. What is
-// asserted instead is each phase's SHARE OF THE GROWTH: of the extra leaf-
-// seconds the longer clip cost, a phase that really does a longer clip's work
-// carries a floor of them, while a phase whose name has been detached from its
-// work carries none of them — not "fewer", none, whichever way the noise went.
-// The floor is 0.5% of the growth, against a measured share of ~25% for the
-// audio decode: fifty times' headroom above, and the detached case sits five
-// orders of magnitude below it.
+// WHAT IS ASSERTED INSTEAD NEEDS NO CLOCK AT ALL. A phase's name is tied to its
+// work STRUCTURALLY: `decode.audio` declares that it covers the audio decode,
+// which is exactly two calls — `Ltx2AudioDecoderForward` and
+// `Ltx2VocoderWithBweForward` — and those two calls carry scopes of their own.
+// So the assertion is CONTAINMENT: the interval of each sub-scope lies inside
+// the interval of the leaf that claims to cover it. Every number involved comes
+// from one clock in one run, and no threshold is crossed, so contention cannot
+// move the verdict. Mutation M4 detaches the name from the work and this fails
+// by six orders of magnitude.
 //
-// TWO LOADS, not two generations on one engine, and that is what makes the
-// `load.dit` half meaningful. A second generation on a loaded engine cannot
-// report a DiT load at all, so the invariant "the load did not grow" would be
-// satisfied by an absent record. Loading twice measures it twice.
+// AND A FLOOR, for the leaves that have no sub-scope to contain. A name with
+// nothing beneath it measures a pair of function calls, about a microsecond, so
+// requiring each of the three phases that CARRY this render to hold at least
+// 0.05% of the leaf sum separates "does the work" from "is a label" with three
+// orders of magnitude either side. It is a SHARE and never a second, because
+// the ratio is what survives this box. It is not applied to the bookkeeping
+// leaves — `generate.setup` and its neighbours are microseconds on any host and
+// are named for completeness, which is a fact about the driver and not a defect.
 namespace {
 
-// Leaf seconds per NAME for one half of one table. Summed per name because
-// `artifacts.frames` alternates with `decode.video` and appears many times in a
-// single render — a per-name total is the only quantity two renders can be
-// compared on. `include_nested` selects the decomposition inside a leaf
-// (`decode.audio.vocoder`) rather than the leaves that partition the wall.
-//
-// `load` selects render 0 against everything else, rather than naming a render
-// ID. The ID comes from a PROCESS-wide counter (`ltx2_video.cpp`'s
-// `render_counter`) which `PhaseLog::Begin` does not reset, so the first
-// generation after a second load is render 2 and not render 1. Each table here
-// holds exactly one generation, so "not the load" names it without depending on
-// how many renders this process happened to do first.
-std::map<std::string, double> PhaseSeconds(const nlohmann::json& table, bool load,
-                                           bool include_nested) {
+// Every record of one name, in emitted (start-sorted) order.
+std::vector<nlohmann::json> RecordsNamed(const nlohmann::json& table, const std::string& name) {
+  std::vector<nlohmann::json> out;
+  for (const nlohmann::json& e : table["phases"]) {
+    if (e["name"].get<std::string>() == name) out.push_back(e);
+  }
+  return out;
+}
+
+// Leaf seconds per NAME, summed: `decode.video` alternates with
+// `artifacts.frames` and appears more than once per render, so a per-name total
+// is the only quantity that means anything. Leaves only — spans enclose leaves
+// and nested records decompose one, and the emitter's own `Sum` skips both.
+std::map<std::string, double> LeafSecondsByName(const nlohmann::json& table) {
   std::map<std::string, double> out;
   for (const nlohmann::json& e : table["phases"]) {
-    if (e.value("span", false)) continue;
-    if (e.value("nested", false) != include_nested) continue;
-    if ((e["render"].get<int64_t>() == 0) != load) continue;
+    if (e.value("span", false) || e.value("nested", false)) continue;
     out[e["name"].get<std::string>()] += e["duration_seconds"].get<double>();
   }
   return out;
 }
 
-double TotalSeconds(const std::map<std::string, double>& by_name) {
-  double total = 0.0;
-  for (const std::pair<const std::string, double>& kv : by_name) total += kv.second;
-  return total;
-}
-
 }  // namespace
 
-TEST_CASE("ltx2 video: the phase table ATTRIBUTES its wall — the decode grows with the clip and the load does not") {
+TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   Workspace ws;
-
-  // The two geometries. Everything except the frame count is identical, and the
-  // frame count is legal at 8k+1 for this fixture's temporal factor: 9 frames is
-  // 2 latent frames and 33 is 5, so the clip is 2.5x longer.
-  const int64_t kShortFrames = 9;
-  const int64_t kLongFrames = 33;
-
-  // `max_phase = 0` is a LOAD extra, and it is what keeps this case on one
-  // recipe phase: the default `distilled_two_stage` kind would need the latent
-  // spatial upsampler for its second phase and refuse without one.
+  // `max_phase = 0` is a LOAD extra and is what keeps this on one recipe phase:
+  // the default `distilled_two_stage` kind would need the latent spatial
+  // upsampler for its second phase and refuse without one.
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
-
-  const std::unique_ptr<vllm::multimodal::VideoEngine> short_engine =
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
-  REQUIRE(short_engine != nullptr);
-  vllm::multimodal::VideoGenParams short_gen = FixtureGen(ws.root + "/attr_short");
-  short_gen.num_frames = kShortFrames;
-  const vllm::multimodal::VideoResult short_result = short_engine->Generate(short_gen);
-  REQUIRE(short_result.frame_count == kShortFrames);
-  REQUIRE_MESSAGE(!short_result.phase_log_path.empty(), "the short render wrote no phase table");
-  const nlohmann::json short_table = nlohmann::json::parse(ReadAll(short_result.phase_log_path));
+  REQUIRE(engine != nullptr);
 
-  // A SECOND LOAD. `PhaseLog::Begin` discards the earlier timeline, so this
-  // engine's table carries its own `load.dit` — which is the record the
-  // "and the load does not" half of this case is about.
-  const std::unique_ptr<vllm::multimodal::VideoEngine> long_engine =
-      vllm::multimodal::LoadVideoEngine(mp);
-  REQUIRE(long_engine != nullptr);
-  vllm::multimodal::VideoGenParams long_gen = FixtureGen(ws.root + "/attr_long");
-  long_gen.num_frames = kLongFrames;
-  const vllm::multimodal::VideoResult long_result = long_engine->Generate(long_gen);
-  REQUIRE(long_result.frame_count == kLongFrames);
-  REQUIRE_MESSAGE(!long_result.phase_log_path.empty(), "the long render wrote no phase table");
-  const nlohmann::json long_table = nlohmann::json::parse(ReadAll(long_result.phase_log_path));
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(FixtureGen(ws.root + "/attribution"));
+  REQUIRE(result.frame_count == 9);
+  REQUIRE_MESSAGE(!result.phase_log_path.empty(), "the render wrote no phase table");
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
 
-  const std::map<std::string, double> short_leaves = PhaseSeconds(short_table, /*load=*/false, /*include_nested=*/false);
-  const std::map<std::string, double> long_leaves = PhaseSeconds(long_table, /*load=*/false, /*include_nested=*/false);
-  const std::map<std::string, double> short_nested = PhaseSeconds(short_table, /*load=*/false, /*include_nested=*/true);
-  const std::map<std::string, double> long_nested = PhaseSeconds(long_table, /*load=*/false, /*include_nested=*/true);
-  const std::map<std::string, double> short_load = PhaseSeconds(short_table, /*load=*/true, /*include_nested=*/false);
-  const std::map<std::string, double> long_load = PhaseSeconds(long_table, /*load=*/true, /*include_nested=*/false);
+  // (1) CONTAINMENT. `decode.audio` claims to cover the audio decode. The audio
+  // decode is two models, and #1010 asks for the vocoder by name, so each has a
+  // scope: `decode.audio.mel` around `Ltx2AudioDecoderForward` and
+  // `decode.audio.vocoder` around `Ltx2VocoderWithBweForward`. If the leaf that
+  // claims to cover them does not enclose their intervals, the name is on
+  // somebody else's work — which is precisely what mutation M4 does, and the
+  // only thing in this file that detects it.
+  const std::vector<nlohmann::json> audio = RecordsNamed(table, "decode.audio");
+  REQUIRE_MESSAGE(audio.size() == 1, "the table names " << audio.size()
+                                                        << " 'decode.audio' leaves, expected 1");
+  const double audio_start = audio[0]["start_seconds"].get<double>();
+  const double audio_end = audio[0]["end_seconds"].get<double>();
+  double covered = 0.0;
+  double previous_end = audio_start;
+  for (const std::string part : {"decode.audio.mel", "decode.audio.vocoder"}) {
+    INFO("part = " << part);
+    const std::vector<nlohmann::json> found = RecordsNamed(table, part);
+    REQUIRE_MESSAGE(found.size() == 1,
+                    "the table names " << found.size() << " '" << part << "' records, expected 1. "
+                    "#1010 asks for the vocoder BY NAME and it used to be folded into "
+                    "'decode.audio' with the mel decode");
+    const nlohmann::json& r = found[0];
+    // Recorded as a decomposition, not as a partition: a nested record is
+    // excluded from `sum_leaf_seconds`, which is what lets the split exist at
+    // all without changing what the table adds up to.
+    CHECK_MESSAGE(r.value("nested", false),
+                  "'" << part << "' is not marked nested, so it is being SUMMED as well as the "
+                                 "leaf that contains it, and the table double counts");
+    const double start = r["start_seconds"].get<double>();
+    const double end = r["end_seconds"].get<double>();
+    CHECK_MESSAGE(start >= audio_start,
+                  "'" << part << "' starts at " << start << "s, BEFORE the 'decode.audio' leaf "
+                      << "that claims to cover it opens at " << audio_start << "s");
+    CHECK_MESSAGE(end <= audio_end,
+                  "'" << part << "' ends at " << end << "s, AFTER the 'decode.audio' leaf that "
+                      << "claims to cover it closes at " << audio_end
+                      << "s. The name and the work are in different places");
+    // The mel feeds the vocoder, so they run in that order and never overlap.
+    CHECK(start >= previous_end - 1e-9);
+    previous_end = end;
+    covered += end - start;
+  }
+  // And they cover it: a `decode.audio` leaf that enclosed the two calls plus a
+  // phase nobody named would satisfy containment while still hiding time.
+  const double audio_seconds = audio_end - audio_start;
+  MESSAGE("decode.audio = " << audio_seconds << "s, of which mel+vocoder cover " << covered
+                            << "s (" << (100.0 * covered / audio_seconds) << "%)");
+  CHECK_MESSAGE(covered >= 0.90 * audio_seconds,
+                "the two named halves of the audio decode cover only " << covered << "s of the "
+                    << audio_seconds << "s 'decode.audio' leaf, so a tenth of it is a phase "
+                                        "nobody named");
 
-  // The denominator: the extra leaf-seconds the longer clip cost. A render that
-  // did not get more expensive would make every share below meaningless, so this
-  // is a REQUIRE and not a CHECK.
-  const double growth = TotalSeconds(long_leaves) - TotalSeconds(short_leaves);
-  MESSAGE("attribution: " << kShortFrames << " frames = " << TotalSeconds(short_leaves)
-                          << "s of leaves, " << kLongFrames << " frames = "
-                          << TotalSeconds(long_leaves) << "s, growth = " << growth << "s");
-  REQUIRE_MESSAGE(growth > 0.0,
-                  "a 2.5x longer clip cost no extra leaf-seconds, so nothing below can be read");
-
-  // THE PHASES THAT MUST CARRY IT. Each is a phase whose work is a function of
-  // the clip's length: the video decode runs over more latent frames, the frame
-  // writer writes more files, the audio decode and the vocoder produce more
-  // samples. A leaf that names one of these and carries none of the growth is a
-  // label on somebody else's work.
+  // (2) THE FLOOR, for the phases that carry the render and have no sub-scope.
+  // A leaf whose name has been detached from its work measures two function
+  // calls — about a microsecond, five orders of magnitude below this floor.
+  const std::map<std::string, double> leaves = LeafSecondsByName(table);
+  double leaf_total = 0.0;
+  for (const std::pair<const std::string, double>& kv : leaves) leaf_total += kv.second;
+  REQUIRE(leaf_total > 0.0);
   const double kFloor = 0.0005;
-  for (const std::string required : {"decode.video", "decode.audio", "artifacts.frames"}) {
+  for (const std::string required : {"denoise", "decode.audio", "decode.video"}) {
     INFO("phase = " << required);
-    REQUIRE_MESSAGE(short_leaves.count(required) == 1,
-                    "the short render's table names no '" << required << "' leaf");
-    REQUIRE_MESSAGE(long_leaves.count(required) == 1,
-                    "the long render's table names no '" << required << "' leaf");
-    const double moved = long_leaves.at(required) - short_leaves.at(required);
-    MESSAGE("  " << required << ": " << short_leaves.at(required) << "s -> "
-                 << long_leaves.at(required) << "s, " << (100.0 * moved / growth)
-                 << "% of the growth");
-    CHECK_MESSAGE(moved >= kFloor * growth,
-                  "'" << required << "' took " << moved << "s of the " << growth
-                      << "s a 2.5x longer clip cost, which is under the " << (100.0 * kFloor)
-                      << "% floor. Its name is on work that happens somewhere else in this "
-                         "table, and the sum cannot see that");
+    REQUIRE(leaves.count(required) == 1);
+    const double share = leaves.at(required) / leaf_total;
+    MESSAGE("  " << required << " = " << leaves.at(required) << "s, " << (100.0 * share)
+                 << "% of " << leaf_total << "s of leaves");
+    CHECK_MESSAGE(share >= kFloor,
+                  "'" << required << "' holds " << (100.0 * share) << "% of this render's named "
+                      << "leaf seconds, under the " << (100.0 * kFloor)
+                      << "% floor. A phase that carries a render and measures nothing is a name "
+                         "with the work somewhere else");
   }
 
-  // THE DECOMPOSITION INSIDE `decode.audio` (#1010 names the vocoder). Nested,
-  // so it is excluded from the sum — which is why it needs its own assertion:
-  // nothing about the arithmetic above would notice if these two stopped
-  // measuring the models they are named after.
-  for (const std::string required : {"decode.audio.mel", "decode.audio.vocoder"}) {
-    INFO("nested phase = " << required);
-    REQUIRE_MESSAGE(short_nested.count(required) == 1,
-                    "the short render's table names no '" << required << "' leaf");
-    REQUIRE_MESSAGE(long_nested.count(required) == 1,
-                    "the long render's table names no '" << required << "' leaf");
-    const double moved = long_nested.at(required) - short_nested.at(required);
-    MESSAGE("  " << required << ": " << short_nested.at(required) << "s -> "
-                 << long_nested.at(required) << "s, " << (100.0 * moved / growth)
-                 << "% of the growth");
-    CHECK_MESSAGE(moved >= kFloor * growth,
-                  "'" << required << "' took " << moved << "s of the " << growth
-                      << "s a 2.5x longer clip cost, under the " << (100.0 * kFloor) << "% floor");
+  // (3) AND THE DECODE LEAVES DO NOT OVERLAP. `decode.video` and
+  // `artifacts.frames` ALTERNATE, because the decoder streams chunks into the
+  // writer's callback; `decode.audio` follows both. Any overlap would mean a
+  // leaf was left open across work it does not name, which is the shape of the
+  // mutation this case exists for, and it would also double count the overlap
+  // into `sum_leaf_seconds`.
+  std::vector<std::pair<double, double>> spans;
+  for (const std::string name : {"decode.video", "artifacts.frames", "decode.audio"}) {
+    for (const nlohmann::json& r : RecordsNamed(table, name)) {
+      spans.push_back({r["start_seconds"].get<double>(), r["end_seconds"].get<double>()});
+    }
   }
-
-  // AND THE LOAD DID NOT. `load.dit` is paid before the request is read, so a
-  // clip 2.5x longer cannot move it — and an instrument that charged render time
-  // to a load phase would show up here and nowhere else in this file. The bound
-  // is a quarter of the growth rather than a fixed millisecond count, because
-  // this box's absolute numbers are not stable enough to bound directly.
-  REQUIRE(short_load.count("load.dit") == 1);
-  REQUIRE(long_load.count("load.dit") == 1);
-  const double load_moved = std::fabs(long_load.at("load.dit") - short_load.at("load.dit"));
-  MESSAGE("  load.dit: " << short_load.at("load.dit") << "s -> " << long_load.at("load.dit")
-                         << "s, |delta| = " << load_moved << "s = " << (100.0 * load_moved / growth)
-                         << "% of the growth");
-  CHECK_MESSAGE(load_moved < 0.25 * growth,
-                "the DiT load moved by " << load_moved << "s between a 9-frame and a 33-frame "
-                                            "request, which it cannot do: it finished before "
-                                            "either request was read");
+  std::sort(spans.begin(), spans.end());
+  for (size_t i = 1; i < spans.size(); ++i) {
+    CHECK_MESSAGE(spans[i].first >= spans[i - 1].second - 1e-9,
+                  "two of the decode/writer leaves overlap: [" << spans[i - 1].first << ", "
+                      << spans[i - 1].second << "] and [" << spans[i].first << ", "
+                      << spans[i].second << "]");
+  }
 }
 
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────

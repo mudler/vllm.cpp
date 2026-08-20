@@ -141,7 +141,13 @@ Protocol calls, in order:
    a second run loads.
 3. `GET {endpoint}api/models/{repo}/tree/{commit}?recursive=true` lists files.
 4. `GET {endpoint}{repo}/resolve/{commit}/{path}` returns bytes. Follow the
-   redirect to the content delivery network.
+   redirect to the content delivery network. **The `Location` may be a RELATIVE
+   reference**, which RFC 7231 section 7.1.2 permits and which the hub sends for
+   a file that is not in large-file storage, so resolve it against the address
+   that answered per RFC 3986 section 5 rather than treating it as a URL. Read
+   `X-Linked-Size` from a redirect answer and never its `Content-Length`, which
+   is the length of the redirect's own body. Both rules are #1511, and both were
+   measured against `huggingface.co` rather than reasoned about.
 
 Cache layout is HuggingFace's documented local cache:
 `{HF_HOME}/hub/models--org--repo/` with `refs`, `blobs`, and
@@ -864,6 +870,60 @@ which form.
   [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 
 ## Now
+
+THE FIRST FETCH THIS TREE EVER MADE FROM `huggingface.co` FAILED ON ITS FIRST
+HOP, and #1511 is that failure and its repair. W5 linked transport layer
+security, so the very next thing anyone did was point the server at a real
+repository. `--model Qwen/Qwen3-0.6B` refused with `HF_ENDPOINT
+'/api/resolve-cache/models/Qwen/Qwen3-0.6B/<commit>/config.json?...&etag="f5c3703b..."'
+has no scheme`, downloaded nothing, and blamed a variable the operator had
+never set.
+
+Two independent defects, both of them properties of what the hub answers rather
+than of what it was asked:
+
+1. The `Location` is an ABSOLUTE-PATH REFERENCE, not a URL. Both redirect loops
+   in `downloader.cpp` assigned it to `current` unresolved, so the next hop
+   parsed a path as an address. `HfResolveUrl` in `hf_hub.cpp` now resolves a
+   reference against the address that sent it, per RFC 3986 section 5, covering
+   the absolute, network-path, absolute-path, relative-path and query-only
+   forms, carrying the query and the fragment through, and removing dot
+   segments. The query is load-bearing: the hub keys its cache address on the
+   `etag` it carries.
+2. The redirect's own `Content-Length` was read as the size of the file it
+   names. Measured on 2026-08-20, the HTTP 307 answering `resolve` for
+   `config.json` carries `content-length: 234`, the length of its own text body,
+   and NO `x-linked-size`. A 726 byte file therefore probed as 234 bytes and the
+   transfer refused on a disagreement with the tree listing. `HubProbeFile` now
+   reads `Content-Length` only from a non-redirect answer. `X-Linked-Size` keeps
+   its meaning on a redirect, because the hub sets it to the LINKED file's size,
+   and the large-file-storage arm depends on that.
+
+Defect 2 is the one that shows why fixing only the reported symptom would have
+left the feature broken: resolving the address alone gets the client to the
+second hop and then refuses the file for a size it never had.
+
+WHY FOUR REVIEW ROUNDS DID NOT SEE EITHER. The redirect loops had NO hermetic
+instrument at all. `test_downloader.cpp` served every case from ONE address, so
+`IsRedirect` never returned true in a test, and the one redirect fixture in the
+whole row, `test_hf_hub.cpp`'s `a redirected API answer is refused and the token
+does not follow it`, serves an ABSOLUTE `Location` and exists to prove that the
+API client REFUSES a redirect rather than follows one. A loop with full line
+coverage and no case is what a review reads as covered. The six cases appended
+to `test_downloader.cpp` are the missing shapes, and each one is written from a
+header capture of the live hub rather than from a guess about it.
+
+The credential rule from #1485 survives untouched: the manual loop stays,
+`set_follow_location` stays off, and the token is still dropped at the first
+hop. Resolution does not weaken it, because the measured large-file-storage
+redirect crosses to `us.aws.cdn.hf.co` with its own signature in the query and
+needs no bearer token. `downloader: a cross-host redirect does not carry the
+bearer token` now pins both halves of that: the host the caller named receives
+the token and the other authority does not.
+
+LIVE PROOF, 2026-08-20, x86_64, TLS through system OpenSSL, `HF_HOME` empty:
+`--model Qwen/Qwen3-0.6B` fetched the repository and served it. What landed is
+recorded in the pull request body.
 
 State `READY`. W1 through W6 have landed. W7, the fresh review, has run once
 and returned FAIL on seven findings, and every one of them is repaired or

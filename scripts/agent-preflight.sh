@@ -76,6 +76,12 @@ for arg in "$@"; do
 done
 
 CHECKERS=(
+  # FIRST deliberately. Every other gate reads a file for its own reason and
+  # measures its own budget, so a table row that is half one branch and half
+  # another satisfies all of them (#1417). This one asks whether a merge tool
+  # wrote into a tracked file at all, and a reader who sees it fail knows to
+  # stop reading the verdicts below.
+  check-conflict-markers
   check-prompt-contract
   check-agent-record
   check-release-binary-contract
@@ -152,6 +158,7 @@ SUITES=(
   test_agent_preflight_skip_report
   test_agent_pr_body
   test_check_symbol_anchors
+  test_check_conflict_markers
 )
 
 failed=()

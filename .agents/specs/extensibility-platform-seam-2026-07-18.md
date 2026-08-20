@@ -348,6 +348,17 @@ but unimplemented; each becomes auto-selected on the appropriate capability the
 moment its self-registering TU lands — ZERO selector edit. The MLA-branch
 priorities are deferred until an MLA model ports (our gate models are non-MLA).
 
+**SUPERSEDED 2026-08-20, on the CPU sentence only**
+([#1371](https://github.com/mudler/vllm.cpp/issues/1371), PR
+[#1392](https://github.com/mudler/vllm.cpp/pull/1392)). The paragraph above
+records what was true when item 4 landed on 2026-07-19, and it is kept for that
+reason. `CPU_ATTN` IS registered now
+(`src/vllm/v1/attention/backends/cpu_attn.cpp`, ported from
+`cpu_attn.py:39-110`), so a CPU walk stops on it instead of falling through to
+FLASH_ATTN. That is upstream's own CPU answer at `cpu.py:75-87`. The NHD-layout
+deviation is unchanged. It is recorded on the backend itself now, rather than
+being the reason `CPU_ATTN` had no registrar.
+
 **Scope discipline.** PURE ENGINE-level SELECTION seam. The concrete attention
 KERNEL stays selected at seam 3 (the vt:: op table, `vt::PagedAttention` →
 `GetOp(kPagedAttention, device.type)`), already device-additive — untouched. No

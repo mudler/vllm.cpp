@@ -351,3 +351,101 @@ TEST_CASE("gelu_mul_separate bf16 in/out at Gemma-4 PLE width") {
           doctest::Approx(GeluTanhRef(g) * u).epsilon(0.01));
   }
 }
+
+// --- VT-ACT-ROUND-POLARITY (#1322) -----------------------------------------
+// Ported from vLLM `tests/kernels/core/test_activation.py::test_act_and_mul` at
+// the parity pin 5559679229bc961848b121ccdeaa8fa5d79bec98, which runs the CUDA
+// kernel and `forward_native` over the same input and asserts
+// `torch.testing.assert_close(out, ref_out, atol=0.0, rtol=0.0)` for
+// silu_and_mul / mul_and_silu / gelu / gelu_tanh / fatrelu, with the comment
+// that those implementations "are equivalent to the native PyTorch
+// implementations, so we can do exact comparison" (test_activation.py:105-108).
+//
+// The behaviour that makes them exactly equal is that BOTH narrow act(gate) to
+// the INPUT dtype before the multiply: `activation_kernels.cu:156-158`
+// `silu_kernel` returns `(T)(((float)x) / (1.0f + expf((float)-x * alpha)))`
+// and `:36` `compute` returns
+// `(scalar_t)(ACT_FN(gate, alpha) * ((float)up + beta))`, while
+// `activation.py:143` `F.silu(x[..., :d]) * x[..., d:]` yields a bf16 tensor
+// from `F.silu` on a bf16 tensor. Upstream's dims are D in [512, 13824] and
+// NUM_TOKENS in [7, 83, 2048]; the smallest of each is used here.
+//
+// The rounding target is the INPUT dtype, not the output dtype. Upstream never
+// has the two differ (`SiluAndMul.forward_cuda` allocates `out` with
+// `dtype=x.dtype`), while this seam permits an f32 input with a bf16 output, so
+// the f32-input cases below pin that an f32 input rounds NOTHING and stays
+// bit-identical to the pure-f32 expression. A value test cannot infer that.
+namespace {
+// bf16 round-trip through the tree's own codec (src/vt/dtype.cpp:297-304),
+// i.e. what `act(gate)` reads back as once narrowed to a bf16 input's dtype.
+float ThroughBf16(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)); }
+float SiluRef(float g) { return g / (1.0f + std::exp(-g)); }
+}  // namespace
+
+TEST_CASE("silu_and_mul narrows act(gate) to the bf16 INPUT dtype (upstream atol=rtol=0)") {
+  const int64_t T = 7, D = 512;
+  std::vector<uint16_t> x(static_cast<size_t>(T * 2 * D));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = vt::F32ToBF16(std::sin(0.0131f * static_cast<float>(n) + 0.37f) * 3.0f);
+  std::vector<uint16_t> out(static_cast<size_t>(T * D), 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kBF16, Cpu(), {T, 2 * D});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {T, D});
+  Queue q{Cpu(), nullptr};
+  vt::SiluAndMul(q, to, tx);
+  int64_t checked = 0;
+  for (int64_t i = 0; i < T; ++i)
+    for (int64_t j = 0; j < D; ++j) {
+      const float g = vt::BF16ToF32(x[static_cast<size_t>(i * 2 * D + j)]);
+      const float u = vt::BF16ToF32(x[static_cast<size_t>(i * 2 * D + D + j)]);
+      // act(gate) narrowed to the input dtype, THEN multiplied, THEN stored.
+      const uint16_t want = vt::F32ToBF16(ThroughBf16(SiluRef(g)) * u);
+      REQUIRE(out[static_cast<size_t>(i * D + j)] == want);  // exact, atol=rtol=0
+      ++checked;
+    }
+  CHECK(checked == T * D);
+}
+
+TEST_CASE("silu_and_mul leaves an f32 INPUT bit-identical (the target is x's dtype)") {
+  // Same op, f32 input: RoundThrough is the identity on f32, so this must equal
+  // the pure-f32 expression bit-for-bit whatever the output width is.
+  const int64_t T = 3, D = 512;
+  std::vector<float> x(static_cast<size_t>(T * 2 * D));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = std::sin(0.0113f * static_cast<float>(n) + 0.9f) * 4.0f;
+  std::vector<float> out(static_cast<size_t>(T * D), 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {T, 2 * D});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {T, D});
+  Queue q{Cpu(), nullptr};
+  vt::SiluAndMul(q, to, tx);
+  int64_t checked = 0;
+  for (int64_t i = 0; i < T; ++i)
+    for (int64_t j = 0; j < D; ++j) {
+      const float g = x[static_cast<size_t>(i * 2 * D + j)];
+      const float u = x[static_cast<size_t>(i * 2 * D + D + j)];
+      REQUIRE(out[static_cast<size_t>(i * D + j)] == SiluRef(g) * u);  // exact
+      ++checked;
+    }
+  CHECK(checked == T * D);
+}
+
+TEST_CASE("gelu_and_mul narrows act(gate) to the bf16 INPUT dtype (upstream atol=rtol=0)") {
+  const int64_t T = 7, D = 512;
+  std::vector<uint16_t> x(static_cast<size_t>(T * 2 * D));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = vt::F32ToBF16(std::cos(0.0091f * static_cast<float>(n) + 0.21f) * 3.0f);
+  std::vector<uint16_t> out(static_cast<size_t>(T * D), 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kBF16, Cpu(), {T, 2 * D});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {T, D});
+  Queue q{Cpu(), nullptr};
+  vt::GeluAndMul(q, to, tx);
+  int64_t checked = 0;
+  for (int64_t i = 0; i < T; ++i)
+    for (int64_t j = 0; j < D; ++j) {
+      const float g = vt::BF16ToF32(x[static_cast<size_t>(i * 2 * D + j)]);
+      const float u = vt::BF16ToF32(x[static_cast<size_t>(i * 2 * D + D + j)]);
+      const uint16_t want = vt::F32ToBF16(ThroughBf16(GeluTanhRef(g)) * u);
+      REQUIRE(out[static_cast<size_t>(i * D + j)] == want);  // exact, atol=rtol=0
+      ++checked;
+    }
+  CHECK(checked == T * D);
+}

@@ -106,9 +106,10 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK(policy.device_pool_cap_bytes == 0);
 
   // Attention-backend priority (item 4): CPU mirrors cpu.py's single-backend
-  // preference (CPU_ATTN) then our FLASH_ATTN fallthrough (the layout the CPU
-  // paged-attn kernel actually uses). The registry-driven selection is covered
-  // in test_attn_backend_registry.cpp.
+  // preference (CPU_ATTN), followed by FLASH_ATTN, whose NHD layout our CPU
+  // paged-attn kernel shares. Since #1371 the first entry is registered, so the
+  // walk stops there; the ORDER is what this case pins, and the registry-driven
+  // selection is covered in test_attn_backend_registry.cpp.
   const std::vector<std::string> cpu_priority{"CPU_ATTN", "FLASH_ATTN"};
   CHECK(cpu.get_attn_backend_priority() == cpu_priority);
 }

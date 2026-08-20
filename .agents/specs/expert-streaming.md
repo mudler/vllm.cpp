@@ -1586,6 +1586,40 @@ into other suites.
 | a fitting GGUF still loads | the SAME call with a generous budget: the throw is a LATER, different one (the synthetic file has no tokenizer), which is what proves the check let it through rather than that it never ran |
 | the CPU arm is untouched | the same file with `device=cpu` never refuses, whatever the budget |
 
+## The user-facing recipe and the checkpoint pin ([#1194](https://github.com/mudler/vllm.cpp/issues/1194))
+
+`docs/USAGE.md` named `Qwen3.8-2.4T-A95B UD-Q1_0` three times and pinned it zero
+times. AGENTS.md binds the pin to that file: file name, size, repo AND revision,
+and a sha256 for a quantized artifact. The streaming section there is a MECHANISM
+reference. It never said which file `--model` takes, what the load costs, what
+decode costs, or where the ceiling is, while the four sibling per-model recipes
+in the same file all do.
+
+Landed as a fifth sibling recipe, `Qwen3.8-2.4T-A95B UD-Q1_0: 370 GiB served from
+a 119 GiB box`, which LINKS the mechanism section rather than restating it, so
+each fact keeps one home. Three facts are repeated on purpose and the section
+says which ones and why: which device to use, the expert bytes a token reads, and
+the two streaming decode figures. Both places quote `ENG-EXPERT-STREAM-DEVICE`
+W0e, so the re-measure that row owes has to change both.
+
+The pin is settled against the ARTIFACT rather than against a document or the
+HuggingFace tree API, whose `lfs.oid` is fabricated for a gated repo: TEN shards
+`UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-000{01..10}-of-00010.gguf` summing to exactly
+397,256,393,248 B (369.97 GiB), with shard 1 declaring `split.count = 10` and
+`split.tensors.count = 1702` in its own metadata and carrying no tensors. That
+also answers [#1420](https://github.com/mudler/vllm.cpp/issues/1420), whose two
+copy-paste commands named `-of-00008`, a file that does not exist at that
+revision.
+
+The section publishes no new measurement. Every figure in it was already
+recorded, it carries no ratio between runs taken on different source trees, and
+it carries no `--device cuda` speed number, because that arm's token gate fails.
+The W0e and W0f figures come from the harness
+`benchmarks/expert_stream_device_w0e.cpp` and not from the `vllm-server` command
+the section publishes, and the section discloses that difference beside the
+prompt and environment differences it already disclosed. The 16 August 2026
+streaming-off run is the one figure that did come from `vllm-server` ([#1447](https://github.com/mudler/vllm.cpp/issues/1447)).
+
 ## Owed
 
 Carried debt for this row. Each item names why it is not closed here.

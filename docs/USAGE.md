@@ -471,6 +471,29 @@ two edits back gives the GPT-4o row above, so the two share one scanner's
 character classes but stay separate patterns: they disagree on `don't` and on
 every digit run longer than one.
 
+### Timing an encode on your own box
+
+`tools/bench/bpe_encode_cost.cpp` times `Tokenizer::Encode` on one synthetic
+input, at the sizes you name, through a `tokenizer.json` you name. Use it when
+you want to know what a prompt of some shape costs to tokenize here, or to
+re-derive a figure somebody else recorded instead of trusting it.
+
+Nothing RUNS it: it is registered as no test and it is not a gate. Both halves
+of that are deliberate — a growth ratio over these timings is not stable enough
+to gate on a shared machine, and one leg on a long single-class input can cost
+tens of seconds of one core. It IS compiled, as the never-linked OBJECT library
+`vllm_bpe_encode_cost`, so it cannot rot behind a `Tokenizer::Encode` or
+`FromHfJson` signature change while still being the artifact those figures are
+reproducible from. Its header carries the exact `g++` and run lines; it builds
+from the four tokenizer translation units directly and needs no `libvllm.a`.
+
+It prints one row per case and size, with the ids it produced and the
+1/5/15-minute load average sampled around each row, under a banner saying the
+output is a session reading and not a bound. Read it that way: on a 20-core box
+the same input on the same binary has read 1.7x apart on load alone, while the
+id counts came back identical. Quote a number from it only with its load beside
+it, and take the minimum of several repetitions rather than one shot.
+
 ### How much memory a Vulkan load needs
 
 On a unified-memory device (a DGX Spark) the Vulkan heap and system RAM are the
@@ -649,6 +672,12 @@ one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linea
 vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
 concatenate exactly and the merged GEMM is byte-identical to the separate ones.
 
+The `gate_proj`/`up_proj` merge always runs. The Q/K/V merge runs only when the
+fused attention preamble is available to read its row-strided output views,
+which is the default. `VT_FUSE_ATTN_PREAMBLE=0` turns that consumer off, and
+then `q_proj`, `k_proj` and `v_proj` run as three separate block GEMMs and the
+ten projections are nine GEMMs. The result is the same either way.
+
 That merge needs each projection in a group except the last to be a multiple of
 128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
 that breaks the rule is refused by name, and the message says which projection
@@ -674,28 +703,36 @@ What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
 A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**build-verified only**. It is the block-scaled CUTLASS GEMM vLLM itself
-dispatches on those devices, ported whole, with the scales applied in the
-mainloop; it is compiled by continuous integration for both architectures and
-registered, so a build for one of them no longer refuses the checkpoint at
-prepare time. **It has never been executed.** No comparison against the CPU
-reference, no token-exact comparison against vLLM, and no throughput number has
-been recorded for it, on any device. The value comparison that would settle it
-is written and registered as `test_ops_matmul_fp8_block_cuda`, and on a machine
-with no device it reports that it did not run. Treat this arm as untested until
-that test has been run on hardware and its result recorded. Milestone M5 of
-[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the kernel and the
-run it still owes; [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is
-the original report.
+**run and failing**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches
+on those devices, ported whole, with the scales applied in the mainloop; it is
+compiled by continuous integration for both architectures and registered, so a
+build for one of them no longer refuses the checkpoint at prepare time. On
+2026-08-20 `test_ops_matmul_fp8_block_cuda` was run on a GB10 (compute
+capability 12.1) for the first time, and vLLM's own ported case -- M=32, N=576,
+K=7168 -- throws `cutlass Invalid status` before any kernel launches, because
+CUTLASS refuses the configuration at `can_implement`. Two of the file's five
+cases fail this way and three pass, so the failure is shape-dependent rather
+than universal; which shapes are affected is not yet isolated, and `Invalid`
+names no constraint. No shape has yet had its output compared against the CPU
+reference: the two cases that make that comparison are the two that throw. There
+is still no token-exact comparison against vLLM and no throughput number, on any
+device. Treat this arm as broken on the shape it was measured on and unproven
+everywhere else.
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437) records the run,
+milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
+kernel and the repair it now owes, and
+[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
 
 Two shapes the CPU arm accepts are refused on CUDA, by name and with the
 dimension and its remainder in the message. The CUTLASS collective needs both
 `K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
 and reroutes those shapes to a Triton kernel this build does not have. A
-*ragged* 128-block is not affected and runs: `N = 576` is `4*128 + 64` and is the
-shape vLLM's own CUTLASS test uses. A build for any other CUDA architecture has
-no such kernel compiled and keeps refusing at prepare time, which is the honest
-answer rather than a silent fallback.
+*ragged* 128-block is not refused by that rule: `N = 576` is `4*128 + 64`, is
+16-aligned, and is the shape vLLM's own CUTLASS test uses. It does not follow
+that it runs -- on hardware that shape is exactly the one CUTLASS rejects at
+`can_implement`, above. A build for any other CUDA architecture has no such
+kernel compiled and keeps refusing at prepare time, which is the honest answer
+rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
@@ -778,6 +815,29 @@ The reason strings are vLLM's own, so a refusal here and a refusal from the
 reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
 come from the geometry the engine has just resolved for your checkpoint, so a
 refusal is about that checkpoint on this build.
+
+**A device is only ever offered the backends built for it.** On CPU the engine
+resolves `CPU_ATTN`, which is what the reference engine resolves on a CPU too. It
+is worth saying out loud because it was briefly untrue: `CPU_ATTN` was named as
+the CPU's preference while being registered nowhere, so CPU runs quietly fell
+through to `FLASH_ATTN` — harmless until `FLASH_ATTN` was taught FlashAttention-2's
+rule that a head size must be a multiple of 8. A CPU model with a head size of 6
+then had no backend at all and was refused at initialization, on hardware that
+runs it perfectly well ([#1371](https://github.com/mudler/vllm.cpp/issues/1371)).
+If you see the refusal above naming `FLASH_ATTN` alone on a device that is not an
+NVIDIA GPU, that is the shape to report: the rule quoted at you is about a kernel
+your device never runs.
+
+One consequence is worth stating on its own, because it widens what a CPU run
+accepts. `CPU_ATTN` serves **`f32` as well as `f16` and `bf16`**, which is what
+the reference engine's CPU backend serves. `FLASH_ATTN` declares the two half
+dtypes only, so while the CPU was borrowing it an `f32` model was refused at
+initialization with `dtype not supported`. It now runs. The KV-cache dtypes the
+CPU accepts are `auto`, `fp8` and `fp8_e4m3`; `fp8_e5m2` is refused by name,
+because the CPU kernel's fp8 arm reads e4m3 alone. On an NVIDIA GPU the list is
+`auto`, `float16`, `bfloat16`, `fp8` and `fp8_e4m3`, so `fp8_e5m2` is refused
+there too. That second refusal is the reference engine's own and is not
+something this project trimmed away.
 
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend
@@ -1019,6 +1079,160 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
 
 Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 `--audio-prompt-embeds` to condition from files instead.
+
+### Where the render spent its wall: `phase-log.json`
+
+Every completed LTX-2.5 render writes **`<workdir>/phase-log.json`** beside the
+frames, on the shipped default and behind no flag, and `ltx2-gen` prints its
+path on the line after `wrote N frames`. An embedder gets the same path from
+`vllm_video_last_phase_log(engine)` (ABI v23) rather than by guessing a filename.
+
+**"Completed" is the whole of it, and it is worth reading literally.** The table
+is written by the success path and by nothing else: the two write sites sit
+immediately before a successful return, and every guard above them throws past
+them. A render that is killed, that a lease governor aborts, that refuses on a
+guard, or that is still running leaves **no `phase-log.json` at all** — not a
+truncated one and not an empty one — and `vllm_video_last_phase_log` returns
+`NULL`. A 2.5-hour render stopped at 2.4 hours tells you nothing about where it
+was. Making a running or killed render legible is
+[#1413](https://github.com/mudler/vllm.cpp/issues/1413), and it is a separate
+lane from this file.
+
+It is a flat, non-overlapping timeline of named phases — the DiT load, the two
+VAE loads, the text tower and the connector, the denoise, the video and audio
+decodes, the frame and WAV writers — each carrying a start and end measured from
+the load, a duration, a **peak host byte** count and a **peak device byte**
+count. These fields say how complete it is, and how far it carries:
+
+| Field | What it means |
+|---|---|
+| `wall_seconds` | from the engine load to the end of this generation |
+| `sum_leaf_seconds` | the named phases, which do not overlap |
+| `unaccounted_seconds` | the difference — time inside no named phase |
+| `sum_rule` | which records the sum adds: `span=false` **and** `nested=false` |
+| `sampler_enabled` | whether the 100 ms sampler ran, or the peaks are boundary-only |
+| `notice` | **NOT A BENCHMARK**, and why — carried in the file rather than in a document a later reader would have to know to look for |
+
+Some phases are **decomposed rather than partitioned**. `denoise` carries one
+`denoise.step` per denoiser evaluation, `decode.video` carries
+`decode.video.chunk` per streamed chunk, `decode.audio` carries
+`decode.audio.mel` and `decode.audio.vocoder`, and a two-stage recipe's
+`phase.prepare` carries `phase.upsample_latent`. Those records are marked
+`nested`, are printed for the reader, and are **excluded from
+`sum_leaf_seconds`** — they are inside a leaf that is already counted, so adding
+them would make `unaccounted_seconds` the residue of double counting instead of
+time nobody named.
+
+A nested record is also what makes a phase NAME checkable. A leaf that claims to
+cover the denoise must enclose its own `denoise.step` records; one that stops
+short of the loop, or that hands the back half of it to a neighbouring name, no
+longer does. The three phases that carry a render each carry such an anchor for
+that reason.
+
+**Do not read a duration here as a measurement of this machine.** Every number
+is wall clock under whatever else the box was doing, which the file does not
+record: on one contended host the same binary at the same geometry has moved
+from 0.147 s to 4.463 s of wall between two runs a minute apart, and the rank of
+its two largest phases has reversed between such runs. The ratio
+`sum_leaf_seconds / wall_seconds` is stable across all of them; the seconds are
+not.
+
+`unaccounted_seconds` is emitted rather than distributed over the phases,
+because a table whose parts do not add up has a phase nobody named, and a
+plausible-looking table is worse than an obviously incomplete one. On a
+completed 64x64/9-frame render it is under 2% of wall.
+
+`peak_device_bytes` is the **driver's** in-use figure through the backend's
+`DeviceMemoryInfo`, and it is `-1` where no probe answers. It is not zero there,
+because a byte count of zero and a byte count nobody took are different facts.
+
+**Today it answers `-1` on CUDA as well as on the CPU**, and that is worth
+knowing before you read a table full of `-1` as a finding: `CudaBackend` does
+not implement `DeviceMemoryInfo`
+([#1126](https://github.com/mudler/vllm.cpp/issues/1126)); ROCm is the only
+backend that does. On a unified-memory board such as GB10 the `peak_host_bytes`
+column is not a poor substitute — host and device are one pool there, and
+`nvidia-smi --query-gpu=memory.used` reports `[N/A]` on that board while
+`--query-compute-apps=used_memory` answers.
+
+Two environment variables, both measurement lanes rather than configuration:
+`VLLM_RENDER_PHASE_LOG_STDERR=1` also prints the table as a fixed-width block —
+including when the file itself cannot be written, which is the case that lane
+exists for — and `VLLM_RENDER_PHASE_SAMPLER=0` stops the 100 ms sampler thread,
+which narrows the per-phase peaks to what the phase boundaries saw and removes
+nothing else.
+
+The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
+staging is minutes paid at the front of every render. A process that loads a
+second engine starts a new timeline, so the table describes the last load.
+
+### While the render runs: the `[render]` lines
+
+The table above is written by a generation that **returns**. A render that is
+killed, aborted by a lease governor, or still going writes none, so LTX-2.5 also
+narrates itself on stderr as it goes, on the shipped default and behind no flag:
+
+```text
+[render] + load                     t=0.000s
+[render] + load.dit                 t=0.001s
+[render] - load.dit                 t=0.002s dur=0.001s host=0.01GiB
+...
+[render] - load                     t=0.027s dur=0.027s host=0.02GiB
+[render] + generate                 t=0.027s
+...
+[render] + denoise                  t=0.027s
+[render] + denoise.step             t=0.027s
+[render]   dit forward 1  phase 0 step 1/8  t=0.027s
+[render] - denoise.step             t=0.065s dur=0.038s host=0.02GiB
+[render] + denoise.step             t=0.066s
+[render]   dit forward 2  phase 0 step 2/8  t=0.066s last=0.038s
+[render] - denoise.step             t=0.069s dur=0.003s host=0.02GiB
+...
+[render] - denoise                  t=0.146s dur=0.118s host=0.02GiB
+[render] + decode.video             t=0.146s
+[render] - decode.video             t=0.147s dur=0.001s host=0.02GiB
+[render] + artifacts.frames         t=0.147s
+...
+[render] + decode.audio             t=0.148s
+[render] + decode.audio.mel         t=0.148s
+[render] - decode.audio.mel         t=0.155s dur=0.008s host=0.02GiB
+[render] + decode.audio.vocoder     t=0.155s
+[render] - decode.audio.vocoder     t=0.236s dur=0.081s host=0.02GiB
+[render] - decode.audio             t=0.236s dur=0.089s host=0.02GiB
+[render] - generate                 t=0.237s dur=0.209s host=0.02GiB
+```
+
+**That is a real capture**, from the CPU gate render at 64x64 over 9 frames — the
+seconds and the byte counts are that render's, on a contended box, and nothing
+here is a benchmark. It is shown at this scale on purpose. The same lines from a
+21.004 B render would carry a `load.dit` of minutes and a `last=` on the order of
+[#1375](https://github.com/mudler/vllm.cpp/issues/1375)'s measured 162 s per DiT
+forward, and **no such render has been captured yet** — that is W1's lease. A
+worked example at that scale would be a projection, and a projection printed in a
+public document gets quoted back as a measurement.
+
+Read it as three things:
+
+* **The last line names what is running.** A phase prints when it opens, not
+  only when it finishes, so a run that stops inside a phase still says which one.
+  Between the banner and `wrote N frames` there was previously nothing at all,
+  and a working render and a hung one were the same observation.
+* **`last=` is the per-forward cost.** Seconds since the previous DiT forward,
+  measured by the process doing the work rather than inferred from outside it.
+* **`step k/N` is exact; the forward counter has no denominator.** The sampler
+  decides how many denoiser calls a step takes and the guider decides how many
+  forwards each call is (one to four), so a total would be a guess. Two forwards
+  per step is what `cfg_scale != 1.0` alone buys; a guider that also runs the
+  STG and modality legs does four, which is what the device-resident arm does
+  now that [#1092](https://github.com/mudler/vllm.cpp/issues/1092) gave
+  `Ltx2DitForwardDevice` its `perturbations` argument. The `k/N` fraction is
+  unaffected either way: it reads the recipe phase's own `sigmas`.
+
+`VLLM_RENDER_PROGRESS=0` silences them. It is a measurement lane so an A/B over
+what the emitter costs runs on one binary, not a setting to turn off: the cost is
+one flushed `fprintf` per phase boundary and per forward — on the order of a
+hundred writes against hours of wall — and nothing is emitted per token or per
+VAE tile.
 
 Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
 binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
@@ -1387,11 +1601,20 @@ trajectory the weights were never trained for. Their guiders are upstream's
 positive-only one, so they still issue one forward per step and their output is
 unchanged by this row.
 
-**The accelerator is refused for the perturbed and isolated-modality passes.**
-`Ltx2DitForwardDevice` takes no perturbation argument, so those two passes on
-`device = 1` would run an unperturbed forward and leave both terms at zero.
-Classifier-free guidance alone is a different context and no perturbation, and
-runs on both arms.
+**All four passes run on the accelerator too, and that costs up to twice the
+render.** `Ltx2DitForwardDevice` took no perturbation argument until 2026-08-19,
+so `device = 1` refused the perturbed and isolated-modality passes rather than
+run them unperturbed with both terms at zero. It takes one now, and the refusal
+is gone. What replaces it is a cost: at the model's own guider defaults a step
+assembles four forwards on `device = 1` where it assembled two, so a 30-step
+render is **120 forwards rather than 60**. That count is exact. The denoise TIME
+is **at most 2.0x** and no measurement of it exists — two of the four passes do
+less work than the two that were already running, because the isolated-modality
+pass skips both cross-modality attentions in every block. Plan against 2.0x as a
+ceiling, not as an estimate.
+`--video-stg-guidance-scale 0 --audio-stg-guidance-scale 0 --a2v-guidance-scale 1
+--v2a-guidance-scale 1` buys that back and is the trajectory the accelerator arm
+had before, at the cost upstream's defaults are there to avoid.
 
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
@@ -2691,6 +2914,7 @@ a stop token early.
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). The DRAFT is classified from its own `config.json` rather than from the method string: `Qwen3DSparkModel`, `Gemma4DSparkModel`, and — BEYOND-PIN, mirroring [vllm#52197](https://github.com/vllm-project/vllm/pull/52197) merged 2026-08-17 — `DSparkDraftModel` together with `model_type` `qwen3` all route to the Qwen3 DSpark lane, and every other DSpark draft that DECLARES an architecture is the DeepSeek-V4 variant, which is refused by name because this engine carries only a stub for it (`SPEC-DSPARK-QWEN3-ROUTING`, [#1193](https://github.com/mudler/vllm.cpp/issues/1193)). A draft config carrying no `architectures` key at all is not classified and loads as before, because an absent key is not evidence of a lane. Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. For `dspark`, `num_speculative_tokens` may no longer sit BELOW the draft checkpoint's block: DSpark drafts a block, our block is sized from this value alone, and a shorter one drafted a structurally wrong block in silence. It is refused now, before any weight is loaded, naming the block, the config key the block was read from, and the value given ([#1225](https://github.com/mudler/vllm.cpp/issues/1225)). The block is read from the draft config's `dspark_block_size`, or from `block_size` when that key is absent, which is the case on every published Qwen3 draft (`deepseek-ai/dspark_qwen3_4b_block7` and `RadixArk/Qwen3.8-27B-DSpark` both carry `block_size: 7`, so k must be at least 7). vLLM reads only the first key and accepts the shorter value. vLLM also builds its model config BEFORE its speculative config, so a command that names both a target directory it cannot open and a short `k` hears about the target there and about the `k` here. Those are the two recorded divergences, both argued in `.agents/specs/dspark-block-size-guard.md`. A k at or above the block behaves exactly as before. For `dflash`, the DRAFT is likewise classified from its own `config.json`. A safetensors draft that declares `DFlash2DraftModel` is ADMITTED as far as its convolution and no further (`SPEC-DFLASH2`, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)): it loads, it runs the grouped dynamic depthwise convolution around every attention and every MLP sublayer of every draft layer, and it is then REFUSED BY NAME at the candidate selector, which this engine does not implement yet. A notice at STARTUP says exactly that, so the refusal at the first generated token is not a surprise. It is refused rather than sampled with the DFlash1 per-slot argmax because that would succeed: the argmax proposes well-formed tokens, the verify is lossless, so the emitted tokens stay the target's and only acceptance falls, which no token gate can see. A `DFlashDraftModel` draft is unaffected. A GGUF DFlash2 drafter is still refused AT STARTUP, because its weight path does not exist yet — the GGUF drafter arm is a later wave. It is classified by its METADATA rather than by an architecture, because a GGUF declares no architectures and the published DFlash2 GGUF writes the same `dflash` architecture a DFlash1 one does: a file carrying `dflash.selector_rank`, `dflash.selector_top_k` or `dflash.conv_kernel_size` is refused, and a DFlash1 GGUF, which carries none of them, loads as before. Two `config.json` shapes that used to fail the draft-config builder outright now parse: a draft that nests `rope_theta` under `rope_parameters` or `block_size` under `dflash_config` (which BOTH published DFlash2 drafts do), and a draft that declares no `layer_types` at all. A draft declaring `dflash_config.attention_sink_bias` is refused by name, because this engine has no attention sink and loading without one would draft worse tokens in silence. A draft config may also carry a top-level `is_causal`, which now decides every layer's causality ahead of `dflash_config.causal` and ahead of the `layer_types` default, mirroring [vllm#52816](https://github.com/vllm-project/vllm/pull/52816); no published DFlash1 checkpoint declares the key, so their behaviour is unchanged. In a GGUF the same value arrives as `dflash.attention.causal` and is resolved identically. Either spelling is honoured whenever it is DECLARED, as a boolean or as a number, so `"is_causal": 0` means non-causal rather than falling through to the default; a value of any other type is now refused by name instead of being dropped, and the two containers answer alike. When NEITHER explicit key is present, a layer is causal only if its own declared `layer_types` entry is `sliding_attention`. `dflash_config.use_swa` moves the sliding WINDOW onto every layer and no longer makes any layer causal, which is what upstream does ([#1366](https://github.com/mudler/vllm.cpp/issues/1366)); such a draft previously ran every layer causal here and non-causal in vLLM, which cost acceptance and changed no emitted token, so nothing surfaced it. **Still no checkpoint reaches that arm here**, so it changes nothing you can run today: every published DFlash draft that declares `layer_types` also declares no `use_swa`. The one published draft of the governed shape, `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`, declares no `layer_types` at all, and that now PARSES rather than failing with `key 'layer_types' not found` — but its target architecture `MiMoV2ForCausalLM` is still not one this engine serves, so the draft has nothing to head. A GGUF drafter cannot declare `use_swa` at all. The rule is therefore correct and still INERT (`.agents/specs/dflash2-spec-decode.md` `## Owed` O4, whose parse half is discharged). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
+| `--mmproj <mmproj-*.gguf>` | (unset) | The SECOND GGUF file: a `clip`-architecture multimodal projector beside a `.gguf` `--model`, spelled as llama.cpp spells it. It is read, validated and REFUSED BY NAME before the tokenizer and before any language-model weight byte, so a wrong file costs a message instead of a 17 GB map. Refused when `--model` is not a `.gguf` (a safetensors checkpoint carries its tower in its own shards), when the file's `general.architecture` is not `clip`, when its `clip.projector_type` is not `qwen3vl_merger`, and when it carries `v.patch_embd.weight` without `v.patch_embd.weight.1` — half the input features the temporal patch embedding needs, which cannot be completed without inventing the other half. A `muse-glimmer` projector gets MuseGlimmer's own recorded refusal. **The tower is loaded and held, and nothing runs it yet**: there is no multimodal request path over HTTP for a GGUF model, so today the flag buys you validation and a loaded tower, not an image answer ([#821](https://github.com/mudler/vllm.cpp/issues/821)). Auto-discovery of a sibling `mmproj*.gguf` is deliberately not implemented — a directory holding two unrelated models must not silently fuse them |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -3338,11 +3562,16 @@ something else this port does not.
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 21`,
-`include/vllm.h:273`; **46** exported functions, the count of `^VLLM_API `
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 23`,
+`include/vllm.h:329`; **47** exported functions, the count of `^VLLM_API `
 declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
-This line read `19` and `36` until 2026-08-17; both numbers were last true
-several ABI additions ago, and neither is derived by any gate.
+This line read `19` and `36` until 2026-08-17 and `21`, `273` and `46` until the
+W0 phase log added `vllm_video_last_phase_log`; every one of those numbers was
+last true several ABI additions ago, and none of the three is derived by any
+gate — the version, the line and the count each drift independently, and the
+line number drifts on an edit that adds no ABI at all. The version moved twice
+in one day: `mmproj_path` took v22 and the phase log, written as v22 on its own
+branch, landed as v23.
 
 On native Windows/MSVC, the shared-library packaging lane keeps the runtime DLL
 name at `vllm` and gives the import/static archive the distinct name
@@ -3396,6 +3625,11 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v16 | Absolute KV-cache memory sizing |
 | v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 | v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
+| v19 | Per-modality multimodal input limits |
+| v20 | Speech and music generation through `vllm_speech_*` / `vllm_synthesize` |
+| v21 | Device selection on the speech lane (`vllm_speech_model_params.device`, `vllm_speech_engine_device`) |
+| v22 | A second GGUF for the multimodal projector (`vllm_model_params.mmproj_path`) |
+| v23 | The render phase table: `vllm_video_last_phase_log` names the `phase-log.json` a completed `vllm_video_generate` wrote |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
@@ -3654,6 +3888,95 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
+### The second GGUF file: a `clip` multimodal projector
+
+A GGUF multimodal model ships as **two** files: the language `.gguf` and a
+`clip`-architecture `mmproj-*.gguf` carrying the vision tower. Name the second
+one with `--mmproj` (`vllm-server`) or `vllm_model_params.mmproj_path` (C ABI
+v22); it is never auto-discovered from a sibling filename, because a directory
+holding two unrelated models must not silently fuse them.
+
+```console
+./build/examples/vllm-server \
+  --model /models/Qwen3.8-27B-Q4_K_M.gguf \
+  --mmproj /models/mmproj-BF16.gguf
+```
+
+What this does today, exactly: the projector is opened, its `clip.*` metadata
+and its `v.*` / `mm.*` tensors are read into the same vision tower the
+safetensors path builds, and the result is held on the engine. **No forward
+consumes it yet** — there is no multimodal request path for a GGUF model on
+either the server or the C ABI — so the flag buys validation and a loaded tower,
+not an image answer ([#821](https://github.com/mudler/vllm.cpp/issues/821)).
+
+Four things are refused **by name**, all of them before the tokenizer and before
+any language-model weight byte is read:
+
+- `--model` is not a `.gguf`. A safetensors checkpoint carries its tower in its
+  own shards and needs no projector file.
+- the file's `general.architecture` is not `clip` (this is what you get for
+  passing the language file twice).
+- its `clip.projector_type` is not `qwen3vl_merger`. A `muse-glimmer` projector
+  is routed to MuseGlimmer's own recorded refusal instead, which names the
+  missing axis.
+- it carries `v.patch_embd.weight` without `v.patch_embd.weight.1`. llama.cpp
+  writes the temporal patch embedding as two halves; with one of them absent,
+  loading would mean inventing the other, and the result would be a fluent,
+  wrong model rather than an error.
+
+#### The exact files this was gated against
+
+`--mmproj` was built and gated against the two files below. Both are
+**third-party quantizations by Unsloth**, not first-party releases from the model
+authors, and a repo id alone is not a pin, because a checkpoint gets re-quantized
+in place under an unchanged name.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| `clip` projector (`--mmproj`) | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `mmproj-BF16.gguf` | 931 146 432 | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` |
+| Q4_K_M language file (`--model`) | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `Qwen3.8-27B-Q4_K_M.gguf` | 17 106 775 008 | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` |
+
+Both sha256 values were computed locally on this project's mirrored copy, not
+read back from the hub.
+
+The projector is GGUF v3 with 334 tensors (110 BF16 + 224 F32) and 35 metadata
+keys, `general.architecture = clip`, `general.type = mmproj`,
+`clip.projector_type = qwen3vl_merger`. Its tower is 27 blocks of hidden 1152,
+16 heads, feed-forward 4304, patch 16, spatial merge 2, projected to 5120, with
+2304 position embeddings and no DeepStack tap — its
+`clip.vision.is_deepstack_layers` is 27 `false` values, and it ships no
+`v.deepstack.*` tensor.
+
+To re-run the mapping against those bytes rather than against the synthetic
+fixture CI uses, name the file and run the reader's own gate:
+
+```console
+VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf \
+  ./build/tests/test_clip_mmproj_gguf
+```
+
+That gate reads the projector alone. To confirm the other half — that a load
+which COMPLETES leaves the tower on the engine, reachable through
+`LoadedEngine::vision_tower()` — name both files and run the loader's gate:
+
+```console
+VLLM_CPP_QWEN38_27B_GGUF=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
+VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf \
+  ./build/tests/test_gguf_mmproj_reach
+```
+
+This one loads the whole 17 GB language file. Measured on an x86 CPU-only build
+reading both files over CIFS: 5 min 37 s and 6 min 22 s in two runs — the wall
+time is bound by the share, not by the build — at 33.06 GB peak resident both
+times. Do not start it on a box with less than about 40 GB of available memory.
+
+Unset, both cases skip loudly and the gates stay hermetic; CI never reads the
+file. **What is still owed on these artifacts** is the committed 334-name
+manifest and the CI accounting against it, the Q4_K_M arm's own tensor
+accounting and token gate, and any image or video answer at all —
+`QUANT-QWEN38-27B-GGUF-ARM`,
+[#821](https://github.com/mudler/vllm.cpp/issues/821).
+
 ### Per-prompt input limits
 
 vLLM caps how many items of each modality one prompt may carry
@@ -3667,6 +3990,8 @@ Both are also C ABI fields (`vllm_model_params.language_model_only` /
 a server built on it — but they do not change what a `vllm_chat` call returns:
 the C ABI has no multimodal request path yet, so an `image_url` content part sent
 through it is dropped and answered as text. The refusals below are the server's.
+`vllm_model_params.mmproj_path` (ABI v22) is in the same position: it loads and
+validates the projector, and no C-ABI call can feed the tower an image yet.
 
 The limits are the mechanism and the flag is the sugar, so it is worth stating
 what the flag actually does: it does not "skip the encoder", it makes the server
@@ -4461,10 +4786,106 @@ save.
 
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
-VT_MOE_EXPERT_STREAM_SLOTS=8000 \
-  ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+VT_MOE_EXPERT_STREAM_SLOTS=4000 \
+  ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
+
+### Which device can serve it
+
+`--device cpu` serves this today, and that is the arm every published number for
+this checkpoint was measured on. `--device cuda` now decodes it on a probed
+integrated part; see the six limits below before you rely on that.
+
+`--device cuda` refuses at load, by design, when the weights cannot be staged
+into device memory (issue
+[#1123](https://github.com/mudler/vllm.cpp/issues/1123)). The message names the
+byte counts on both sides. That refusal is now **conditional on the lane**
+(`ENG-EXPERT-STREAM-DEVICE` W0d, issue
+[#1124](https://github.com/mudler/vllm.cpp/issues/1124)): with expert streaming
+on, on a device whose kernels can dereference host memory, **and on a model
+family that actually streams its experts**, the routed-expert towers are not
+staged at all — their slices are read from the host slot store in place — so
+what has to fit is the NON-expert remainder plus the slot arena rather than the
+whole file.
+
+The lane alone was not enough to produce a token. With it on, the checkpoint
+loaded on `--device cuda` and then exhausted the machine inside its first
+forward — zero decode steps, seven attempts, every one identical (issue
+[#1299](https://github.com/mudler/vllm.cpp/issues/1299)) — because the DENSE
+weights were resident twice: once as the host buffer and once as the device
+staging copy, which on a part where device memory IS host memory comes out of the
+same RAM. `VT_QWEN35_ALIAS_HOST_WEIGHTS` (default **on**, `docs/ENVIRONMENT.md`)
+removes the second copy by handing the kernels the host bytes directly, and it is
+what makes the CUDA arm decode at all. Set it to `0` for the same-binary A/B back
+to the staging behaviour.
+
+**It now decodes: 32/32 steps, at peak RSS 97.75 GiB of a 119.631 GiB box.**
+Six limits, stated plainly rather than left to be discovered.
+
+* **The device has to be probed capable, and most are not.** The condition is
+  `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
+  unified part. A DISCRETE card answers false, keeps staging every tower and
+  keeps the refusal. That is deliberate: a slot store the card cannot read is
+  not a lane, and giving it one is later work on the same row.
+* **The model has to be one of the families whose forward reads experts through
+  the slot seam.** Today that is the Qwen3.5 MoE family:
+  `Qwen3_5MoeForConditionalGeneration` and `Qwen3_5MoeForCausalLM`, which share
+  one factory and one MoE block, and which a `qwen35moe` GGUF resolves to.
+  `Qwen3MoeForCausalLM` (Qwen3-Coder) declares the same capability truthfully
+  and NO GGUF load can reach it, because no `general.architecture` maps onto it
+  — that gap is listed under `## Owed` in the row's spec. Every other
+  architecture keeps the whole bound and keeps the refusal even with
+  `VT_MOE_EXPERT_STREAM=1` set. `DeepseekV4ForCausalLM` is the case to have in
+  mind: a `deepseek4` GGUF loads, its export carries the same `_exps.weight`
+  tensor names, and its forward stages every one of those towers, so charging
+  the device for a slot arena instead would under-count what the load really
+  needs and turn a correct refusal into an out-of-memory first forward.
+  `LagunaForCausalLM` is NOT that case and is not evidence for anything here: no
+  `laguna` GGUF architecture arm exists, so a Laguna GGUF is refused as an
+  unsupported architecture well before this check runs.
+* **The checkpoint's expert towers have to KEEP the form the file stores them
+  in, which means keep-quant OR keep-f16.** Those are the two residencies that
+  read experts a slice at a time, and they are one arm rather than two: the
+  loader sends both into the same stacked tower (`LoadExpertsStackedKq`), and the
+  slice seam sizes a row with `vt::RowSizeBytes` and so never looks at the dtype.
+  An F16 expert tower therefore gets the lane, and an operator holding one should
+  not read this section and predict a refusal. The fp4-resident and the
+  expand-to-bf16 arms of the same loader stage every tower like any other weight.
+  So `VT_GGUF_KEEP_QUANT=0` — which turns keep-f16 off with it, because keep-f16
+  rides the same condition — and an NVFP4 GGUF both keep the whole bound and keep
+  the refusal on a device and a model that otherwise qualify. This is checked per
+  file, against the residency this process resolved, and a file that mixes a kept
+  tower with a staged one keeps the whole bound as well (issue
+  [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
+* **The correctness gate does NOT pass.** The 32 ids match the CPU arm for six
+  tokens and diverge at the seventh. Both continuations are coherent, and the
+  margins around it are measured and small: at that step the CPU arm's own
+  second-ranked token is exactly the one the CUDA arm emitted, behind by 1.4% of
+  the winning logit, and one step later the margin is 0.1%. **What CAUSES the
+  divergence is NOT identified.** The host-weight alias is EXCLUDED, measured ON
+  GB10 — same shapes, same algorithm, bit-identical output from a `cudaMalloc`
+  operand and from a 256-aligned host one — but excluding one cause is not
+  identifying another, and that the two arms simply run different GEMM kernels
+  over a near-tie is a standing hypothesis rather than a reading. Treat the CUDA
+  arm as unverified against the CPU arm until that gate is settled, and **use
+  `--device cpu` for this checkpoint today**: it is the arm every published
+  number here was measured on.
+* **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
+  `VOID`, because a speed number behind a failing correctness gate is not a
+  result. The CPU arm serves this checkpoint at a steady **11.05 s/token at 4000
+  slots**, which is the count both recipes in this section set and the only count
+  that figure holds for. Device access to host-resident weights on that part also has
+  a recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
+  way, so a CUDA arm slower than the CPU arm remains a real possible outcome.
+* **More slots is not a free knob, and the reason is the page cache rather than
+  the arena.** The same binary at 8000 slots measured a 39.98-45.40 s/token
+  median over two runs, and the second consumed all 30,625 MiB of the box's swap:
+  the extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
+  mapping is served out of. The arena is also measurably not what exhausted the
+  box in [#1299](https://github.com/mudler/vllm.cpp/issues/1299) — a 64-slot
+  0.15 GiB arena failed exactly where an 8000-slot 18.55 GiB one did — so this
+  knob was never the lever there either.
 
 ### The same thing as config, and which one wins
 
@@ -4476,9 +4897,9 @@ weights from the device to host RAM, and the `vllm_cpp` key governs the tier
 below that, where weights stay borrowed out of the file mapping.
 
 ```sh
-./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
-                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+                                 "expert_stream":{"enabled":true,"slots":4000}}}'
 ```
 
 | Key | Environment equivalent | Default |
@@ -4712,6 +5133,250 @@ parser refuses it at startup.
 on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
 honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 (125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
+## Qwen3.8-2.4T-A95B `UD-Q1_0`: 370 GiB served from a 119 GiB box
+
+A 2.4-trillion-parameter mixture-of-experts checkpoint, three times the size of
+the machine's memory, loads and answers on one DGX Spark. This section is the
+recipe. The mechanism it drives is the previous section,
+[Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode),
+which owns the config schema, the precedence rule, the statistics line, the slot
+count warning and what each device can serve. This section links them rather than
+restating them. It repeats three of their facts on purpose: which device to use,
+the expert bytes a token reads, and the two streaming decode figures in
+[What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is). A
+recipe that leaves those out is not a recipe. Each of the three has one record,
+so a correction has to change both places. The decode figures are
+`ENG-EXPERT-STREAM-DEVICE` W0e in
+[`.agents/benchmark-record.md`](../.agents/benchmark-record.md).
+
+**Read the speed before you spend the download.** Steady decode on the recipe
+below is measured in seconds per token, and the floor under it is storage rather
+than this implementation. This is a capacity result, not an interactive one.
+[What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is) gives
+the figure and the arithmetic behind it.
+
+**Use `--device cpu` for this checkpoint.** `--device cuda` loads and decodes it
+too, and its token gate against the CPU arm does not pass, so every number below
+was measured on the CPU arm. The previous section states that arm's six limits.
+
+### The exact weights
+
+| Field | Value |
+|---|---|
+| Repo and revision | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` |
+| Publisher | Unsloth, a third-party quantization rather than a first-party release |
+| Arm | `UD-Q1_0`, which stores the expert towers at 1.1875 bits per weight |
+| Files | `UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-000{01..10}-of-00010.gguf`, ten shards |
+| Bytes | 397 256 393 248 over the ten files, that is 369.97 GiB |
+| Tensor records | 1702, equal to the `split.tensors.count` the shards declare |
+| sha256, shard 1 | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` for `-00001-of-00010.gguf`, 10 943 264 B |
+| sha256, shard 2 | `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` for `-00002-of-00010.gguf`, 48 759 636 544 B |
+
+**Ten shards, and the count is part of every file name.** A GGUF split writes
+the total into each member's name, so `-of-00008` and `-of-00010` name different
+files, and the wrong one gives a file-not-found after a 370 GiB download. The
+two recipes in the previous section carried `-of-00008` until this change
+([#1420](https://github.com/mudler/vllm.cpp/issues/1420)). The count is settled
+against the artifact and not against a document: shard 1's own metadata declares
+`split.count = 10` and `split.tensors.count = 1702`, its sha256 recomputed from
+the mirrored copy equals the value above, and the ten files sum to exactly the
+byte total above. Shard 1 holds **no tensors at all**. It is the metadata and the
+split declaration, so it is the file that says what the other nine are.
+
+**A repo id alone is not a pin**, because a quantized checkpoint gets
+re-quantized in place under an unchanged name. Shard 1's digest was recomputed
+from the mirrored copy. Shard 2's is the download manifest's, and its byte count
+was recomputed.
+
+```sh
+hf download unsloth/Qwen3.8-2.4T-A95B-GGUF \
+  --revision 567d3e6ac26c5474b18311e619c04350fb9a5556 \
+  --include "UD-Q1_0/*" \
+  --local-dir ./qwen3.8-2.4t-a95b-gguf
+```
+
+The files land under a `UD-Q1_0/` subdirectory of `--local-dir`, because that is
+where they live in the repo. Point `--model` at a copy on **local NVMe**. A
+network filesystem puts an uncontrolled variable in front of the expert reads
+that every token makes.
+
+**The encoding has no upstream reference.** `UD-Q1_0` stores its expert towers as
+`IQ1_XXXS`, which upstream llama.cpp does not define. The encoding exists only in
+the `unslothai/llama.cpp` fork, pinned as a secondary oracle in
+[`.agents/oracles/llama-cpp-unsloth.md`](../.agents/oracles/llama-cpp-unsloth.md).
+That fork is recorded `gateable = no`, because it has not been shown to build and
+run this model, and [#933](https://github.com/mudler/vllm.cpp/issues/933) owes
+the measurement. There is therefore no token-exact denominator for anything below.
+
+### Build and serve
+
+A plain CPU build is enough. No CUDA is involved on this path.
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+```
+
+```sh
+./build/examples/vllm-server \
+  --model ./qwen3.8-2.4t-a95b-gguf/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
+                                 "expert_stream":{"enabled":true,"slots":4000}}}' \
+  --device cpu \
+  --max-num-seqs 1 \
+  --max-model-len 512 \
+  --port 8899
+```
+
+Five things in that command are load-bearing.
+
+- **`--model` takes shard 1, not the directory.** A directory sends the loader
+  down the HuggingFace branch, which fatals on a missing `config.json` before it
+  looks for a GGUF. Given shard 1 the reader finds its nine siblings from the
+  `-NNNNN-of-MMMMM.gguf` naming and cross-checks `split.count`.
+- **`prefault: false` is the setting that decides whether this works.**
+  Pre-faulting is **on** by default, and it is the right default for a model that
+  fits: it walks every borrowed span at load, so the first-touch faults do not
+  land inside the timed prefill. For 335.62 GiB of expert towers that cannot fit,
+  it reads the whole checkpoint to populate a page cache that cannot hold it.
+- **`mmap: true` confirms the default rather than enabling it.** It is already on
+  wherever the weights stay quantized, and it is what makes the checkpoint fit at
+  all: an expert tower is borrowed from the file mapping and costs zero anonymous
+  bytes, so only the dense remainder becomes resident.
+- **`expert_stream` is off by default, and this recipe turns it on at 4000
+  slots.** That count is the one the published decode figure was measured at, and
+  the previous section explains why 8000 is worse rather than better.
+- **`--device cpu`.** The note at the top of this section says why.
+
+`--max-num-seqs 1` and a small `--max-model-len` keep the KV cache out of the
+way. Nothing is batched at this speed, and the capacity argument itself holds
+only at low concurrency: at high concurrency every step touches most of the
+experts and the working set stops being one.
+
+The recorded runs set the equivalent environment variables rather than the
+config document: `VT_GGUF_PREFAULT=0`, `VT_MOE_EXPERT_STREAM=1` and
+`VT_MOE_EXPERT_STREAM_SLOTS=4000`. The two forms are the same switches, and a
+variable beats a config field wherever both are set.
+
+They also ran a different binary. Every W0e and W0f figure below comes from
+`benchmarks/expert_stream_device_w0e.cpp`, a purpose-built C ABI client that
+reports the token ids, a per-step timestamp and the expert-stream counters
+together, which no shipped command does. The 16 August 2026 run is the one
+exception: it served through `vllm-server`, as the command above does. At
+seconds per token, the server's HTTP and SSE framing sits far below the
+run-to-run spread recorded below.
+
+### What the load costs
+
+Expect to wait. Two runs of this arm are recorded on `dgx:gpu0`, a GB10 with
+119.631 GiB of unified memory reading the checkpoint from local NVMe, with the
+page cache dropped before each one (`ENG-EXPERT-STREAM-DEVICE` W0e, 18 and
+19 August 2026, [`.agents/benchmark-record.md`](../.agents/benchmark-record.md)):
+
+| Axis | Run 1 | Run 2 |
+|---|---|---|
+| load | 271.1 s | 255.7 s |
+| first token | 85.90 s | 79.09 s |
+| peak resident set | 86.5 GiB | 86.5 GiB |
+| peak swap | not sampled | 6 883 MiB |
+
+Resident memory after the load settles at about **62 GiB** of 119 GiB, measured
+at 62.45 GiB on the same-lease CPU control run of `ENG-EXPERT-STREAM-DEVICE`
+W0f. That is the
+dense remainder plus the KV cache and the runtime, and it agrees with what the
+checkpoint's own tensor table predicts: 21.56 GiB of `attn_qkv` and 17.25 GiB of
+`ssm_out` expanded to bf16, plus 5.81 GiB of embeddings and F32 norms, so
+44.6 GiB before the KV cache and the runtime. The other 335.62 GiB is mapped,
+not copied. **The model does not fit because of streaming. It fits because of
+borrowing.**
+
+Check readiness against the model list rather than against the process:
+
+```sh
+curl -sf http://127.0.0.1:8899/v1/models
+```
+
+```sh
+curl -s http://127.0.0.1:8899/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf",
+       "prompt":"Q: What is the capital of France? A:","max_tokens":4}'
+```
+
+The 16 August 2026 run, which served with streaming off, answered
+` Paris. Q: What`. That is the whole point: the output is coherent, so the
+one-bit encoding and the borrowed-tower path are both faithful enough to serve.
+The four W0e runs drive a fixed prompt of token ids instead of this request, and
+all four returned the same 32 ids, which detokenize to ` Paris. Paris is a city
+located in the northern part of France, on the Seine River. It is the largest
+city in France and is known for its iconic`.
+
+### What decode costs, and why the ceiling is where it is
+
+Every figure here comes from the box named above.
+
+| Arm | Steady decode | Where it comes from |
+|---|---|---|
+| streaming on, 4000 slots | **11.05 s/token** | W0e rep 2, median over steps 4 to 32 |
+| streaming on, 8000 slots | 39.98 and 45.40 s/token | W0e, the medians of two reps |
+| streaming off | 66.7 s/token | 16 August 2026, streaming not yet enabled |
+
+That 4000-slot figure has a min of 9.43 and a max of 13.25 over its window, and
+rep 1 of the same arm gives 11.22, which is 1.54% above it. **The
+streaming-off row carries no ratio against the other two**, because it was taken
+on a different source tree on a different date. The two slot counts came from one
+binary on one lease and are comparable with each other; the previous section
+carries that comparison.
+
+**A bigger cache came out slower**, which is why this recipe sets 4000 slots.
+The previous section states the reason and its evidence.
+
+Do not quote a first-token time as a decode number. Token 1 carries the prefill
+and the cold expert set. From token 2 onward you are watching steady state. The
+complete measurement record is [docs/BENCHMARKS.md](BENCHMARKS.md).
+
+The arithmetic behind those seconds is short, and it decides everything. The
+first three rows are read from the checkpoint's own metadata:
+
+| Quantity | Value |
+|---|---|
+| blocks (`qwen35moe.block_count`) | 93 |
+| experts routed per block, of `qwen35moe.expert_count` | 10 of 512 |
+| projections per routed expert | 3 |
+| expert slices per token | 2790 |
+| bytes per slice | 2 490 368, that is 2.375 MiB |
+| expert working set per token | **6.95 GB**, that is 6.47 GiB |
+| slots this recipe reserves | 4000, a 9.28 GiB arena |
+
+That figure is a working set and not an I/O rate, because the slot cache serves
+part of it from memory. The recorded 32-token run at 4000 slots counted 37 096
+hits against 58 538 misses.
+
+**The floor is storage, not software.** 6.95 GB at the roughly 5 GB/s an NVMe of
+this class sustains is 1.39 s/token whatever the code does, which is 0.72 tok/s.
+Reaching 3 tok/s would demand about 21 GB/s of expert bandwidth, so most of those
+reads would have to come from memory instead. The arena holds 4000 slices against
+the 2790 a token needs, under one and a half tokens of working set, and
+top-10-of-512 routing does not give consecutive tokens enough reuse to close the
+rest. **If you need conversational speed from this model you need more memory or
+fewer active parameters, not better software.**
+
+### What this does not establish
+
+- **The quantization is extreme.** The expert towers hold 1.1875 bits per weight,
+  and they are about 97% of the parameters. The output is coherent; this is not
+  the configuration to judge the model's quality by.
+- **There is no oracle.** No entry in the oracle table runs this checkpoint on
+  this hardware, so there is no token-exact and no throughput denominator. Every
+  figure above is an absolute measurement of this implementation, compared
+  against nothing.
+- **One request at a time.** Nothing here says anything about concurrency, and
+  the capacity argument stops holding as concurrency rises.
+- **One box.** Every number was taken on one DGX Spark GB10 with the checkpoint
+  on local NVMe. Different storage or a different host changes them.
+- **Nothing here is a `--device cuda` number.** That arm decodes this checkpoint
+  and its token gate against the CPU arm fails. The previous section's sixth
+  limit states what follows for its speed axis.
 
 ## Turning CUDA graph capture off, including the break seam
 

@@ -1146,3 +1146,350 @@ TEST_CASE("ltx2 device: a single-stream model type is REFUSED") {
   CHECK_THROWS(
       (void)Ltx2DitForwardDevice(q, p, staged.weights, nullptr, &m.audio, vt::DType::kF32));
 }
+
+// ---------------------------------------------------------------------------
+// The perturbations — #1092's second half, row LTX25-GUIDED-VIDEO §12
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The perturbation shapes the guided denoiser builds (denoisers.py:100-137),
+// measured against the unperturbed baseline.
+struct PerturbationCase {
+  const char* name;
+  bool video_self;   // SKIP_VIDEO_SELF_ATTN on block 0
+  bool audio_self;   // SKIP_AUDIO_SELF_ATTN on block 0
+  bool skip_a2v;     // SKIP_A2V_CROSS_ATTN, all blocks
+  bool skip_v2a;     // SKIP_V2A_CROSS_ATTN, all blocks
+  bool moves_video;  // which stream this shape must move
+  bool moves_audio;
+};
+
+vllm::Ltx2DitPerturbation BuildPerturbation(const PerturbationCase& pc, int64_t num_layers) {
+  vllm::Ltx2DitPerturbation p;
+  if (pc.video_self) {
+    p.video_self_attn.assign(static_cast<size_t>(num_layers), 0);
+    p.video_self_attn[0] = 1;
+  }
+  if (pc.audio_self) {
+    p.audio_self_attn.assign(static_cast<size_t>(num_layers), 0);
+    p.audio_self_attn[0] = 1;
+  }
+  p.video_cross_attn_skip_all = pc.skip_a2v;
+  p.audio_cross_attn_skip_all = pc.skip_v2a;
+  return p;
+}
+
+double MaxAbsOf(const std::vector<float>& v) {
+  double m = 0.0;
+  for (const float x : v) m = std::max(m, std::abs(static_cast<double>(x)));
+  return m;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 device: the device forward HONOURS every perturbation and tracks the host arm") {
+  // WHY THIS CASE EXISTS. `Ltx2DitForwardDevice` took no `perturbations` argument
+  // until 2026-08-19, so the guided denoiser's `ptb` and `mod` passes could not
+  // run on `device != 0` and `ltx2_video.cpp` REFUSED the whole render rather
+  // than serve an unperturbed forward. The first full-model render (#1375) paid
+  // for that: it ran `one_stage --device cuda` with `stg_scale` pinned to 0.0 and
+  // `modality_scale` to 1.0, i.e. with two of upstream's four guidance terms
+  // switched off, and finished a clip along a different trajectory.
+  //
+  // TWO ASSERTIONS PER ROW, because either alone is passable by a defect:
+  //
+  //   AGREEMENT   the device arm must match the HOST arm on the same perturbed
+  //               inputs, to the same 2e-5 the existing host-tracking case uses.
+  //               A device arm that applied the flag WRONG fails this.
+  //   NON-VACUITY the perturbed result must differ from the UNPERTURBED one by
+  //               more than that same bound, on the stream the perturbation
+  //               writes. A device arm that accepted the argument and dropped it
+  //               would agree with a host arm it never diverged from, and would
+  //               pass the first assertion alone. This is the half that is RED
+  //               before the change.
+  //
+  // The bound on the second is `kDeviceRoundOff` ITSELF, and that is the precise
+  // statement: the perturbed run must miss the unperturbed one by MORE than the
+  // tolerance the agreement half is held to, or a dropped perturbation would pass
+  // this gate.
+  //
+  // CPU BACKEND, and that is not a weakening: `Ltx2DeviceKernelsAvailable(kCPU)`
+  // is what lets the whole device-forward CODE PATH be covered without a GPU, as
+  // the seam case at the top of this file argues. A GPU gates the KERNELS. What a
+  // GPU still owes here is the END-TO-END entry through `vllm_video_engine_load`
+  // on `device = 1`; see .agents/specs/ltx25-guided-video.md §12.8 link B.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, false);
+
+  const vllm::Ltx2DitOutputs base_dev =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  const vllm::Ltx2DitOutputs base_host =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  // The unperturbed baseline must itself be non-zero, or every "moved" and "did
+  // not move" comparison below is trivially satisfied by a forward that computed
+  // nothing at all.
+  REQUIRE(MaxAbsOf(base_dev.video) > 1e-6);
+  REQUIRE(MaxAbsOf(base_dev.audio) > 1e-6);
+  CHECK(MaxAbsDiff(base_dev.video, base_host.video.data(), base_host.video.size()) <
+        kDeviceRoundOff);
+  CHECK(MaxAbsDiff(base_dev.audio, base_host.audio.data(), base_host.audio.size()) <
+        kDeviceRoundOff);
+
+  const PerturbationCase cases[] = {
+      // `ptb`, video half — SKIP_VIDEO_SELF_ATTN on block 0. It moves BOTH
+      // streams, because block 0's video state is what block 0's V2A and block
+      // 1's cross attentions read.
+      {"ptb / SKIP_VIDEO_SELF_ATTN", true, false, false, false, true, true},
+      {"ptb / SKIP_AUDIO_SELF_ATTN", false, true, false, false, true, true},
+      {"ptb / both self types", true, true, false, false, true, true},
+      // `mod` — both cross directions off in every block, which is exactly what
+      // `_guided_denoise` builds when either guider's `modality_scale != 1.0`
+      // (denoisers.py:125-138, `blocks=None` on both types). Every VIDEO row of
+      // the params table defaults it to 3.0, so this is the SHIPPED shape.
+      {"mod / both cross directions", false, false, true, true, true, true},
+      {"mod-shaped / SKIP_A2V only", false, false, true, false, true, true},
+      {"mod-shaped / SKIP_V2A only", false, false, false, true, true, true},
+  };
+
+  for (const PerturbationCase& pc : cases) {
+    // `INFO(char*)` stringifies as a BOOL in doctest and prints `1`; a label that
+    // cannot name the failing row is not a label. std::string is the fix.
+    INFO("perturbation: " << std::string(pc.name));
+    const vllm::Ltx2DitPerturbation pert = BuildPerturbation(pc, p.num_layers);
+    const vllm::Ltx2DitOutputs dev =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &pert);
+    const vllm::Ltx2DitOutputs host =
+        Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32,
+                       /*cache=*/nullptr, &pert);
+    REQUIRE(dev.video.size() == base_dev.video.size());
+    REQUIRE(dev.audio.size() == base_dev.audio.size());
+
+    // AGREEMENT.
+    const double av = MaxAbsDiff(dev.video, host.video.data(), host.video.size());
+    const double aa = MaxAbsDiff(dev.audio, host.audio.data(), host.audio.size());
+    MESSAGE(std::string(pc.name) << ": device-vs-host video=" << av << " audio=" << aa);
+    CHECK(av < kDeviceRoundOff);
+    CHECK(aa < kDeviceRoundOff);
+
+    // NON-VACUITY, against the UNPERTURBED device run.
+    const double mv = MaxAbsDiff(dev.video, base_dev.video.data(), base_dev.video.size());
+    const double ma = MaxAbsDiff(dev.audio, base_dev.audio.data(), base_dev.audio.size());
+    MESSAGE(std::string(pc.name) << ": device moved by video=" << mv << " audio=" << ma);
+    if (pc.moves_video) {
+      CHECK_MESSAGE(mv > kDeviceRoundOff,
+                    "the device forward returned the UNPERTURBED video for a perturbed call, so "
+                    "`perturbations` reached no guard. That is the state #1092's refusal existed "
+                    "to prevent, now reachable instead of refused: the guider's "
+                    "`stg_scale * (cond - ptb)` and `(modality_scale - 1) * (cond - mod)` terms "
+                    "would be identically zero and the render would finish");
+    }
+    if (pc.moves_audio) {
+      CHECK_MESSAGE(ma > kDeviceRoundOff,
+                    "the device forward returned the UNPERTURBED audio for a perturbed call");
+    }
+  }
+
+  // And the bf16 PRODUCTION stream carries it too, because that is the dtype a
+  // real accelerator render runs at and the f32 arm above is the parity one.
+  // Held to the bf16 band against the host f32 arm, which is the bound every
+  // other bf16 case in this file uses.
+  const Ltx2DitDeviceWeights staged_bf16 =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
+  vllm::Ltx2DitPerturbation mod_pass;
+  mod_pass.video_cross_attn_skip_all = true;
+  mod_pass.audio_cross_attn_skip_all = true;
+  const vllm::Ltx2DitOutputs bf16_base =
+      Ltx2DitForwardDevice(q, p, staged_bf16.weights, &m.video, &m.audio, vt::DType::kBF16);
+  const vllm::Ltx2DitOutputs bf16_mod =
+      Ltx2DitForwardDevice(q, p, staged_bf16.weights, &m.video, &m.audio, vt::DType::kBF16,
+                           /*cache=*/nullptr, &mod_pass);
+  const vllm::Ltx2DitOutputs host_mod =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32,
+                     /*cache=*/nullptr, &mod_pass);
+  const double bv = MaxAbsDiff(bf16_mod.video, host_mod.video.data(), host_mod.video.size());
+  MESSAGE("bf16 mod pass vs host f32: video max|diff| = " << bv);
+  CHECK(bv < kBf16RoundOff);
+  // ... and it MOVED at bf16 too, or the assertion above would pass on a bf16 arm
+  // that dropped the perturbation and happened to sit inside the band.
+  CHECK(MaxAbsDiff(bf16_mod.video, bf16_base.video.data(), bf16_base.video.size()) >
+        kBf16RoundOff);
+}
+
+TEST_CASE("ltx2 device: each CROSS perturbation gates ITS OWN direction and no other (#1092)") {
+  // THE DEVICE TWIN OF tests/vllm/multimodal/test_ltx2_video.cpp's host case, and
+  // it exists for the same MEASURED reason. Against the host arm three mutations
+  // were GREEN until a direct per-direction case existed: apply only
+  // `video_cross_attn_skip_all`, apply only `audio_cross_attn_skip_all`, and SWAP
+  // which flag gates which direction. A both-streams-enabled forward cannot
+  // separate them, because a `mod`-shaped call still differs from `cond` with one
+  // direction applied.
+  //
+  // HOW ONE DIRECTION IS ISOLATED on a DiT with more than one block. Within a
+  // block the two directions are independent — both read the pre-cross snapshots
+  // `vx_pre` / `ax_pre` (transformer.py:333). ACROSS blocks they are not: block
+  // 1's V2A reads what block 0's A2V wrote, and this fixture has two blocks. The
+  // separation therefore comes from upstream's own predicates
+  // (transformer.py:268-269), which test the OTHER stream's PRESENCE and this
+  // stream's `enabled`:
+  //
+  //   run_a2v = run_vx and audio is present      run_vx = video.ENABLED and ...
+  //   run_v2a = run_ax and video is present      run_ax = audio.ENABLED and ...
+  //
+  // so `audio->enabled = false` with the audio stream still PRESENT runs A2V and
+  // not V2A, and `video->enabled = false` runs V2A and not A2V.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+
+  vllm::Ltx2DitPerturbation skip_a2v;
+  skip_a2v.video_cross_attn_skip_all = true;  // SKIP_A2V_CROSS_ATTN
+  vllm::Ltx2DitPerturbation skip_v2a;
+  skip_v2a.audio_cross_attn_skip_all = true;  // SKIP_V2A_CROSS_ATTN
+
+  SUBCASE("SKIP_A2V_CROSS_ATTN moves the VIDEO stream and SKIP_V2A does not") {
+    Modalities m;
+    BuildModalities(&m, false);
+    m.audio.enabled = false;  // audio still PRESENT: A2V runs, V2A does not
+    const vllm::Ltx2DitOutputs base =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    REQUIRE(MaxAbsOf(base.video) > 1e-6);
+
+    const vllm::Ltx2DitOutputs a2v_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_a2v);
+    REQUIRE(a2v_off.video.size() == base.video.size());
+    CHECK_MESSAGE(MaxAbsDiff(a2v_off.video, base.video.data(), base.video.size()) > 0.0,
+                  "`video_cross_attn_skip_all` changed nothing on a device forward where A2V is "
+                  "the only cross direction running, so the flag reaches no guard "
+                  "(transformer.py:335). The isolated-modality pass is then the conditional pass "
+                  "again in the audio->video direction, on a recipe whose modality_scale is 3.0");
+
+    const vllm::Ltx2DitOutputs v2a_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_v2a);
+    REQUIRE(v2a_off.video.size() == base.video.size());
+    // BIT-IDENTICAL, not "within a band". Nothing this flag gates runs at all on
+    // this forward, so any difference is the two flags wired to each other's
+    // directions — which is what makes the SWAP detectable and not only the
+    // omission.
+    CHECK_MESSAGE(v2a_off.video == base.video,
+                  "`audio_cross_attn_skip_all` moved the VIDEO stream on a device forward that "
+                  "runs no V2A at all, so the two flags are wired to each other's directions. "
+                  "The flag rides on the stream being WRITTEN (transformer.py:335, :367)");
+  }
+
+  SUBCASE("SKIP_V2A_CROSS_ATTN moves the AUDIO stream and SKIP_A2V does not") {
+    Modalities m;
+    BuildModalities(&m, false);
+    m.video.enabled = false;  // video still PRESENT: V2A runs, A2V does not
+    const vllm::Ltx2DitOutputs base =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    REQUIRE(MaxAbsOf(base.audio) > 1e-6);
+
+    const vllm::Ltx2DitOutputs v2a_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_v2a);
+    REQUIRE(v2a_off.audio.size() == base.audio.size());
+    CHECK_MESSAGE(MaxAbsDiff(v2a_off.audio, base.audio.data(), base.audio.size()) > 0.0,
+                  "`audio_cross_attn_skip_all` changed nothing on a device forward where V2A is "
+                  "the only cross direction running, so the flag reaches no guard "
+                  "(transformer.py:367)");
+
+    const vllm::Ltx2DitOutputs a2v_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_a2v);
+    REQUIRE(a2v_off.audio.size() == base.audio.size());
+    CHECK_MESSAGE(a2v_off.audio == base.audio,
+                  "`video_cross_attn_skip_all` moved the AUDIO stream on a device forward that "
+                  "runs no A2V at all, so the two flags are wired to each other's directions");
+  }
+
+  SUBCASE("the pre-cross snapshot stays OUTSIDE both direction guards") {
+    // `vx_pre_av = vx` sits ABOVE both guards upstream (transformer.py:333), so a
+    // pass that skips one direction still lets the surviving one read the
+    // PRE-cross state, and the two blocks stay COUPLED: block 1's V2A reads the
+    // video state block 0's A2V wrote.
+    //
+    // The instrument is that coupling. With both streams enabled, skipping A2V
+    // must move the AUDIO stream even though no V2A flag was set — it moves
+    // because block 0's A2V no longer writes the video state block 1's V2A reads.
+    // A build that hoisted the snapshot into the guards, or that applied the flags
+    // per stream instead of per direction, breaks that and this reads zero.
+    Modalities m;
+    BuildModalities(&m, false);
+    const vllm::Ltx2DitOutputs both_on =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    const vllm::Ltx2DitOutputs a2v_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_a2v);
+    const vllm::Ltx2DitOutputs v2a_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_v2a);
+    CHECK(MaxAbsDiff(a2v_off.audio, both_on.audio.data(), both_on.audio.size()) > kDeviceRoundOff);
+    CHECK(MaxAbsDiff(v2a_off.video, both_on.video.data(), both_on.video.size()) > kDeviceRoundOff);
+    // ... and the two shapes are not the same shape, so neither row above can be
+    // satisfied by a forward that treats the two flags as one.
+    CHECK(MaxAbsDiff(a2v_off.video, v2a_off.video.data(), v2a_off.video.size()) > kDeviceRoundOff);
+  }
+}
+
+TEST_CASE("ltx2 device: a malformed perturbation is REFUSED with the HOST arm's own text") {
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, false);
+
+  // A vector built for a DIFFERENT layer count is refused rather than indexed
+  // defensively: it would otherwise perturb a prefix of the blocks and leave the
+  // rest alone, which is a legal-looking STG pass over the wrong blocks. The host
+  // arm refuses it at ltx2_dit.cpp:837-842, and the two arms must not disagree
+  // about the same request — which is the divergence #1111 records on a
+  // neighbouring predicate.
+  for (const int64_t delta : {int64_t{1}, int64_t{-1}}) {
+    vllm::Ltx2DitPerturbation bad;
+    bad.video_self_attn.assign(static_cast<size_t>(p.num_layers + delta), 0);
+    const std::string msg = RefusalMessage([&] {
+      (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                                 /*cache=*/nullptr, &bad);
+    });
+    INFO(msg);
+    CHECK(msg.find("neither empty nor one entry per block") != std::string::npos);
+    // The HOST arm refuses the same request with the same WORDS, so a reader who
+    // hits it on one residency finds the other. `VT_CHECK` appends ` at
+    // <file>:<line>`, which necessarily differs between two files, so the
+    // comparison is over the sentence and not over the whole string — and the
+    // sentence is required to be non-empty so a build where both throw nothing
+    // recognisable cannot satisfy it by comparing two empty strings.
+    const std::string host_msg = RefusalMessage([&] {
+      (void)Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32,
+                           /*cache=*/nullptr, &bad);
+    });
+    const auto sentence = [](const std::string& text) {
+      const size_t at = text.rfind(" at ");
+      return at == std::string::npos ? text : text.substr(0, at);
+    };
+    REQUIRE(sentence(msg).size() > 20);
+    CHECK(sentence(host_msg) == sentence(msg));
+  }
+
+  // An EMPTY vector is not a malformed one: it is `PerturbationConfig.empty()`'s
+  // own shape and means "no block", which is what the `mod` pass carries beside
+  // its two cross booleans.
+  vllm::Ltx2DitPerturbation mod_only;
+  mod_only.video_cross_attn_skip_all = true;
+  mod_only.audio_cross_attn_skip_all = true;
+  CHECK_NOTHROW((void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio,
+                                           vt::DType::kF32, /*cache=*/nullptr, &mod_only));
+}

@@ -815,6 +815,27 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_bpe_quadratic_merge_earns_its_runnable_baseline_entry(self):
+        # SPEC-BPE-QUADRATIC-MERGE (#1365) was already gated and already carried
+        # a `## Gates` section; what changed is that the section now names the
+        # `g++` build and the run lines for `tools/bench/bpe_encode_cost.cpp`.
+        # So this is growth WITHIN the population, not arrival into it, and the
+        # baseline grows by one either way.
+        #
+        # Same shape and same reason as the two rows above: set equality holds
+        # for any membership and cannot say this row belongs, so this case says
+        # it by removing the entry and requiring the equality to go red. Without
+        # it, an entry added to quiet a red gate is indistinguishable from an
+        # entry added because a row gained a command.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("SPEC-BPE-QUADRATIC-MERGE"), "runnable")
+        reduced = set(gates.RUNNABLE_BASELINE) - {"SPEC-BPE-QUADRATIC-MERGE"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"SPEC-BPE-QUADRATIC-MERGE"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
 
 if __name__ == "__main__":
     unittest.main()

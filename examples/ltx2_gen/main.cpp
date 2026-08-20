@@ -538,6 +538,18 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "  wrote %d frames (%dx%d @ %d fps) + %s (%d Hz)\n", out.frame_count,
                out.width, out.height, out.fps, out.audio_path, out.sample_rate);
+  // WHERE THE RENDER SPENT ITS WALL (ABI v23, issue #1010). This example is a
+  // client of `vllm.h` and nothing else, so it names the table by asking the
+  // handle rather than by guessing a filename beside the frames. Printed on the
+  // shipped default: a render long enough to need the table is one nobody knew
+  // to instrument in advance, and a path printed after the fact is what makes
+  // the evidence retrievable at all.
+  const char* phase_log = vllm_video_last_phase_log(engine);
+  if (phase_log != nullptr) {
+    std::fprintf(stderr, "  phase table: %s\n", phase_log);
+  } else {
+    std::fprintf(stderr, "  phase table: none (this family emits no phase log)\n");
+  }
 
   int status = 0;
   if (!out_path.empty()) {

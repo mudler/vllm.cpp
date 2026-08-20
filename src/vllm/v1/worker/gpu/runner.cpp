@@ -718,8 +718,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     // Dense: LOUD. A model with dense full-attention groups needs a dense
     // backend; a platform whose priority list yields none (how Vulkan and ROCm
     // started) fails at init instead of silently running unlabelled. On ROCm
-    // this resolves "ROCM_ATTN" (backend.cpp, M3); on CPU/CUDA/Metal/Vulkan
-    // "FLASH_ATTN" — the name whose NHD KV layout every device kernel reads.
+    // this resolves "ROCM_ATTN" (backend.cpp, M3); on CPU "CPU_ATTN"
+    // (cpu_attn.cpp, issue #1371 — upstream's own CPU answer at cpu.py:75-87);
+    // on CUDA/Metal/Vulkan "FLASH_ATTN". All four names report the same NHD KV
+    // layout, which is the layout every one of those device kernels reads — the
+    // name changed on CPU, the geometry validated below did not.
     // Mirrors upstream resolving get_attn_backend_cls per attention layer
     // (gpu_model_runner.py:6994-7099); we group by KV-cache kind because this
     // engine allocates exactly one layout per kind.

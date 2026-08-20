@@ -20,6 +20,7 @@
 // toggles retain the split residents.
 #pragma once
 
+#include <cstddef>  // size_t, for kDeviceAliasAlignment
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -83,6 +84,30 @@ struct OwnedTensor {
   // dispatch metadata, so host reclamation must not make a populated weight look
   // absent. Mutable because ReleaseHost is logically const, like lazy residency.
   mutable bool host_released = false;
+
+  // ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). The expert-stream lane has
+  // claimed this tower: its slices are served from HOST slot storage, and the
+  // tower itself must therefore NEVER be staged into device memory.
+  //
+  // Why a flag and not a name test. `ResidentWeight` is handed an OwnedTensor
+  // and has no idea what the loader called it, and the refusal has to fire in
+  // `ResidentWeight` because that is where the 1.1875 GiB `d.b.Alloc` is. A
+  // process-global set of streamed tower ids would answer the same question at
+  // the cost of a lookup in the decode path of every weight; one bool on the
+  // tensor answers it for free.
+  //
+  // Set by `KqExpertSlice` the first time the lane serves this tower, and read
+  // by `ResidentWeight`'s staging branch, which throws by name. That refusal is
+  // a TRIPWIRE, not a path with a production caller: with the lane on, the
+  // grouped-MoE route that would stage a tower is already disabled
+  // (`Qwen35GroupedMoeEnabled`), and W0c's own fallback reads the tower's host
+  // bytes in place. It exists because the failure it guards is issue #1123 —
+  // 48 towers staged, death partway through layer 16 of 93 — and that failure
+  // is silent until the allocator runs out.
+  //
+  // Mutable for the same reason `d_dev` is: claiming a tower for the lane is
+  // logically const, like lazy residency.
+  mutable bool expert_streamed = false;
 
   // ENG-LOAD-DIRECT-UPLOAD (issue #150). Non-null when `bytes` BORROWS a
   // read-only safetensors mmap taken verbatim from the checkpoint instead of
@@ -195,6 +220,226 @@ struct OwnedTensor {
 // `VT_ADOPT_DEVICE_BYTES=0` is the same-binary A/B back to the two-copy
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
+
+// The alignment a HOST pointer must meet before a device kernel may be handed it
+// in place of the `Backend::Alloc` pointer it would otherwise have received.
+//
+// 256, because that is cuBLASLt's documented
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` DEFAULT, which this tree never
+// sets, and it dominates every explicit pointer gate in the tree. Measured, not
+// assumed: `grep -rn MIN_ALIGNMENT src/vt/` finds nothing, so the 256 default
+// applies to every cuBLASLt matmul this tree issues.
+//
+// THE POINTER GATES, ENUMERATED. Two earlier revisions of this paragraph said
+// there was exactly one, in `cuda_matmul_nvfp4.cu`, asking for 16. That was
+// wrong both times. `grep -rn 'reinterpret_cast<uintptr_t>' src/vt/cuda/` plus
+// `grep -rn PointerAligned src/vt/` finds at least seven, across four files:
+//
+//   | site | asks | operand |
+//   |---|---|---|
+//   | `cuda_nvfp4_sm12x.cu:401` `PointerAligned(gate_up, 32)`   | **32** | activation |
+//   | `cuda_nvfp4_sm12x.cu:401` `PointerAligned(packed, 8)`     | 8  | weight |
+//   | `cuda_matmul_nvfp4.cu:204` `(prow) & 0xf`                 | 16 | weight row |
+//   | `cuda_matmul_nvfp4.cu:1757,1778` `(p) & 0xF`              | 16 | scratch |
+//   | `cuda_matmul_nvfp4.cu:1841` `(out) & 0x7`                 | 8  | output |
+//   | `cuda_laguna.cu:67,70` `LagFastNormAligned{16,8}`         | 16 | weight/act |
+//   | `cuda_ops.cu:370,395` `aligned16(w.data)`                 | 16 | NORM WEIGHT |
+//
+// The strictest is 32, and `cuda_ops.cu` is the one that binds a WEIGHT pointer
+// on the ordinary decode path rather than a packed-arm buffer. The `% 32` and
+// `% 64` tests near `cuda_matmul_nvfp4.cu` still read as alignment gates and
+// still are not: they check a DIMENSION (`d`, `dv`), not an address.
+//
+// The conclusion is unchanged and is now correct at the widest of them: 256
+// dominates 32 as comfortably as it dominated 16. It is also what `cudaMalloc`
+// returns in practice, though CUDA guarantees only "suitably aligned" and
+// current devices return more — so "indistinguishable from a `cudaMalloc`
+// pointer" is the intuition, and "at least what every consumer is promised" is
+// the claim.
+//
+// WHAT ALIGNMENT DOES AND DOES NOT BUY. It makes the substitution CORRECT: no
+// kernel can fault or mis-vectorise on this pointer that would not have on the
+// other. It does not make the two pointers indistinguishable in every respect,
+// and two in-tree facts say so. `src/vllm/model_executor/models/laguna.cpp`
+// records a MEASURED GB10 penalty for reading system-allocated memory from the
+// GPU rather than a `cudaMalloc` allocation, worst on a long-K low-parallelism
+// GEMV — a consumer telling them apart by BANDWIDTH, which is why
+// `VT_QWEN35_ALIAS_HOST_WEIGHTS` exists below. And the Vulkan and Metal backends
+// resolve a tensor pointer against their own allocation tables and throw if it
+// is outside them, telling them apart by IDENTITY; harmless only because neither
+// overrides `host_memory_is_device_addressable()`, so this argument is scoped to
+// backends that take raw pointers. Deriving a smaller number would mean
+// enumerating every kernel that ever binds a weight and being right about all of
+// them, and the enumeration does not close: the widest thing any of them
+// dereferences is a 16-byte `cp.async` granule
+// (`src/vt/cuda/cuda_matmul_nvfp4.cu`, whose shape gate assumes an aligned base
+// rather than checking it), while cuBLASLt is PROMISED 256 —
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` defaults to 256 and this tree
+// never sets it (`src/vt/cuda/cuda_matmul.cu`). Matching the allocator instead
+// of the consumers makes the whole question go away, and it costs one memcpy
+// that REPLACES the host->device copy it removes.
+//
+// CAN THE SUBSTITUTION MOVE A LOGIT? MEASURED, AND THE ANSWER IS NO.
+// An earlier revision of this comment worried that "the heuristic may pick an
+// algorithm on the strength of a promise a 16-aligned pointer breaks", and a
+// fresh review was right that the worry was recorded here and never measured.
+// It is measured now, on `thor:gpu0` (NVIDIA Thor `sm_110`, driver 13020,
+// cuBLASLt 130101), which answers this file's own predicate TRUE
+// (`cudaDevAttrPageableMemoryAccess = 1`, `cudaDevAttrIntegrated = 1`) and is
+// therefore a member of the population this branch serves. Six shapes off the
+// target checkpoint (`embedding_length = 8192`; M = 1, 5 and 32) crossed with
+// BOTH formulations this tree issues — the row-major NN `MatmulKernelCuda`,
+// where the weight is operand B, and the column-major TN `MatmulBTKernelCuda`,
+// where it is operand A — for 12 measurements, `PROBE_FAILURES=0`:
+//
+//   * The heuristic CANNOT see a pointer. `cublasLtMatmulAlgoGetHeuristic` takes
+//     (handle, desc, four layouts, preference) and no operands, so alignment
+//     reaches it only through the preference. 12/12 identical on a repeated
+//     call, 12/12 identical with the 256 promise stated EXPLICITLY, and 12/12
+//     identical when the promise is weakened to 16 — the selection does not move
+//     on alignment at all. Five DIFFERENT algo configurations appear across the
+//     six shapes (tiles 393/537/573/576, workspaces 0 to 5,242,896), so the
+//     instrument does discriminate; it simply does not discriminate on this.
+//   * The OUTPUT is bit-exact. Running `cublasLtMatmul` with the same algo over
+//     the same bytes, the weight operand once from `cudaMalloc` and once from a
+//     256-aligned host block, gives byte-identical results: 12/12 with zero
+//     differing elements, every status `SUCCESS`.
+//
+// So a 256-aligned host pointer cannot change a logit.
+//
+// AND THE SAME PROBE RAN ON THE GB10 ITSELF — the silicon the token gate ran on,
+// so this is no longer a Thor result read across to another part. `rc` job
+// `7c7a05e9-be87-48f4-94ae-1bbe0340f063` on `dgx:gpu0`, 2026-08-19 17:47 UTC,
+// `NVIDIA GB10 sm_121`, driver 580.173.02, cuBLASLt 130101, the predicate
+// re-derived in the job's own output (`pageableMemoryAccess=1 integrated=1`).
+// Same six shapes, same two formulations, 12 measurements, `PROBE_EXIT=0`,
+// `PROBE_FAILURES=0`: repeated heuristic call identical 12/12, the promise
+// weakened to 16 moving nothing 12/12, and `cublasLtMatmul` output bit-exact
+// 12/12 (`differing=0`). At least five distinct algo configurations appear
+// across the twelve and they DIFFER from Thor's, so the heuristic was
+// re-resolved rather than replayed.
+//
+// WHAT THAT ESTABLISHES, AND WHAT IT DOES NOT. It EXCLUDES this branch as the
+// cause of the row's CUDA-versus-CPU token divergence, measured on the target
+// silicon. It does not IDENTIFY the cause, and no reader of this block may take
+// it as if it did: excluding one cause is not identifying another. An earlier
+// revision of this comment named the two arms' GEMM arithmetic as the cause,
+// which the row's own spec forbids asserting — that is the STANDING HYPOTHESIS,
+// together with a greedy path whose top-2 margin at the divergent step is
+// 0.264709 logits, and it is NOT MEASURED. Naming the first tensor whose values
+// differ between the arms at that step, and the operation that produced it, is
+// carried under `## Owed` in `.agents/specs/expert-stream-device-slots.md`.
+//
+// One more thing the probe does not license. The 16-aligned arm also came back
+// bit-exact at these shapes, which is NOT a reason to lower this constant: the
+// enumeration above still does not close, and a promise kept by luck at twelve
+// shapes is not a promise. The literal below is pinned by a case in
+// `tests/vllm/model_executor/test_resident_weight_host_addressable.cpp`, so
+// lowering it reds a gate instead of passing every one of them silently.
+inline constexpr size_t kDeviceAliasAlignment = 256;
+
+// Make `w.bytes` safe to hand to a device kernel directly, and say whether it
+// worked. On return `true`, `w.bytes.data()` is non-null and aligned to
+// `kDeviceAliasAlignment`. On `false` the caller must fall back to staging, and
+// nothing has changed.
+//
+// THREE CASES, and the middle one is the point (ENG-EXPERT-STREAM-DEVICE W0f,
+// issue #1299).
+//
+//   * ALREADY ALIGNED — true, and nothing is copied. A GGUF mmap borrow lands
+//     here whenever its tensor offset happens to be a multiple of 256; GGUF's
+//     `general.alignment` guarantees only 32, so this is luck rather than a
+//     contract, and the fallback below is what makes that acceptable.
+//   * OWNED AND MISALIGNED — the bytes are moved into a `kDeviceAliasAlignment`
+//     allocation and `w.bytes` is re-pointed at it, keeping the new block alive
+//     the way `AdoptDeviceBytesAsHost` keeps the device block alive. A plain
+//     `std::vector<uint8_t>` from glibc is 16-byte aligned and no more (a large
+//     block is an mmap chunk, so it lands at page+16), which is exactly what the
+//     GDN V-head reorder's ~44.6 GiB of bf16-expanded `attn_qkv` / `ssm_out`
+//     arrive as. Without this they could never be aliased and W0f would move no
+//     bytes at all.
+//   * BORROWED AND MISALIGNED — false. A borrow owns no anonymous pages: it is a
+//     clean, file-backed GGUF mapping or a tied pair's single shared expansion.
+//     Copying it would CREATE the anonymous residency this change exists to
+//     remove, and would break the tie. Staging is the right answer for it.
+//
+// Logically const, like the lazy device residency beside it: only where the
+// bytes live changes, never what they are.
+// The outcomes, so a caller and a log can say WHICH one happened.
+enum class HostAliasOutcome {
+  kAliasedInPlace,    // already aligned; nothing allocated and nothing copied
+  kRehomed,           // an OWNED misaligned buffer moved into an aligned block
+  kDeclinedBorrow,    // a misaligned BORROW; the caller must stage
+  kDeclinedEmpty,     // no host bytes at all
+  kDeclinedDisabled,  // VT_QWEN35_ALIAS_HOST_WEIGHTS=0
+};
+
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
+                                  HostAliasOutcome* outcome = nullptr);
+
+// Bytes seen by `MakeHostBytesDeviceAliasable`, split by outcome, since process
+// start.
+//
+// WHY A COUNTER AND NOT AN INFERENCE FROM RSS. W0f's first device attempt was
+// read only through `free -m`, and what it showed — about 47 GB appearing in
+// 30 seconds at the first forward — is equally consistent with "the branch
+// declined and staged as before", with "the branch re-homed and the old pages
+// did not come back", and with "something else allocated". Those three call for
+// three different changes, and no amount of staring at an RSS curve chooses
+// between them. This says how many bytes took each outcome. It is printed
+// PERIODICALLY rather than at exit, because the process it measures is one the
+// memory guard kills before any exit handler runs.
+//
+// PER CALL, NOT PER WEIGHT, AND THE DIFFERENCE IS THE WHOLE READING. There is no
+// memo on the alias branch: `ResidentWeight` re-enters it for every weight on
+// every forward step, so a weight aliased 32 times is counted 32 times. These are
+// therefore BYTES SEEN — traffic — and they become a residency statement only
+// when read at a stated point. The recorded 60.793 GiB is one such reading: the
+// first-forward totals at call 1361, where re-homing plateaus and every dense
+// weight has been seen exactly once. Quoted without that qualifier the same
+// number is a traffic count, and after two decode steps the counter has passed
+// 200 GiB on a checkpoint whose resident dense half is 60.8.
+struct HostAliasStats {
+  uint64_t aliased_in_place_bytes = 0;
+  uint64_t rehomed_bytes = 0;
+  uint64_t declined_borrow_bytes = 0;
+  uint64_t declined_other_bytes = 0;
+  uint64_t calls = 0;
+};
+HostAliasStats HostAliasSnapshot();
+
+// The same-binary A/B back to the staging behaviour, per the house convention
+// for a default-on residency change that `VT_ADOPT_DEVICE_BYTES` and
+// `VT_MOE_HOST_FREE` already follow. `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` makes
+// every call decline, so one build can measure both arms — which matters more
+// here than usual, because `src/vllm/model_executor/models/laguna.cpp` records
+// a MEASURED GB10 penalty for reading system-allocated memory from the GPU
+// rather than a `cudaMalloc` allocation, worst on a long-K low-parallelism
+// GEMV. This branch installs exactly that retag by default, and without a knob
+// W0e could not tell a decode regression from the workload.
+bool HostWeightAliasEnabled();
+
+// May the host mirror of `w` be released, because a DEVICE copy exists to be
+// authoritative in its place?
+//
+// THE INVARIANT A USE-AFTER-FREE TAUGHT US (issue #1299). `MoeBlockBf16Cuda`
+// captures `ResidentWeight(...).data` for every expert into a device-resident
+// pointer table, uploads the table once, and then releases the host mirrors. It
+// justified that with "once the device copy exists it is authoritative and
+// nothing reads the host bytes again", which was true while `ResidentWeight`
+// had two behaviours. It has three: on a host-addressable platform it ALIASES,
+// so the captured pointers ARE `w.bytes.data()` and releasing them frees memory
+// the resident table still points at, for the model's lifetime and from inside
+// captured graphs. A fresh review demonstrated it with a scratch case that takes
+// SIGSEGV.
+//
+// The question is therefore not "did we upload" but "is there something else to
+// read", and `d_dev` already answers it: null on exactly the arm that aliases,
+// non-null on every arm that staged. Named rather than inlined so the release
+// sites state the invariant they depend on, and so a gate can mutate it.
+inline bool HostMirrorIsRedundant(const OwnedTensor& w) {
+  return w.d_dev != nullptr;
+}
 
 // Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
 // #237).
@@ -362,9 +607,21 @@ struct Fp8Weight {
 // config at use time: the consumer needs them per GEMM, and a weight that knows
 // its own geometry cannot be paired with the wrong one.
 //
-// NOTHING CONSUMES THIS YET. #1189 milestone M4 owns `Fp8BlockLinearMethod` and
-// the forward wiring; `PrepareQwen3_5Dense` refuses a populated one by name so a
-// block-wise checkpoint declines to run rather than running wrong.
+// CONSUMED BY THE DENSE FORWARD since #1189 milestone M4 (`281b4bc76`), which
+// landed `Fp8BlockLinearMethod` and the wiring it names. All ten projections
+// in `qwen3_5.cpp` are read, through THREE entry points rather than one.
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them: `o_proj`,
+// `down_proj`, the three GDN projections, and q/k/v whenever the split path
+// runs. M6 (`836c13c35`) added the other two: `MatmulFp8BlockMergedD` reads
+// q/k/v as one operand when the consumer accepts row-strided views, and
+// `Fp8BlockGateUpSwiGLUD` is the ONLY reader of `gate_proj_fp8_block` and
+// `up_proj_fp8_block`. `PrepareQwen3_5Dense` no longer refuses a populated
+// weight -- it refuses a DEVICE with no block-scaled GEMM, which after M5
+// (`489a9a4c0`) means a CUDA arch outside `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a).
+//
+// The CUDA kernel has still NEVER EXECUTED on hardware and there is no token
+// gate. That debt is real and is recorded in
+// `.agents/specs/vt-matmul-fp8-block-cuda.md`; nothing here narrows it.
 struct Fp8BlockWeight {
   OwnedTensor packed;  // i8  [N, K]  one fp8-e4m3fn byte per element, verbatim
   OwnedTensor scale;   // f32 [cdiv(N, block_n), cdiv(K, block_k)]
@@ -515,8 +772,9 @@ struct FullAttnLayerWeights {
   // populated by the `weight_scale_inv` rung in `qwen3_5_dense_weights.cpp`
   // BEFORE the per-tensor rung, because a block-wise weight is also `F8_E4M3`
   // (#1166). The bf16, fp4 and per-tensor fp8 slots are left EMPTY when these
-  // are populated, and vice versa. Nothing reads them yet -- M4 owns the linear
-  // method and `PrepareQwen3_5Dense` refuses a populated one by name.
+  // are populated, and vice versa. M4 (#1189, `281b4bc76`) landed the linear
+  // method and the forward that reads them, so `PrepareQwen3_5Dense` refuses an
+  // unrunnable DEVICE rather than a populated weight.
   Fp8BlockWeight q_proj_fp8_block;  // [N=2*Hq*Dh, K=H]
   Fp8BlockWeight k_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
   Fp8BlockWeight v_proj_fp8_block;  // [N=Hkv*Dh,  K=H]

@@ -26,6 +26,7 @@
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
@@ -1466,9 +1467,17 @@ LoadedEngine::LoadedEngine(HfConfig config,
                            tok::Tokenizer tokenizer,
                            const EngineParams& params,
                            vt::Queue* preselected_queue,
-                           std::unique_ptr<DflashDraft> dflash_draft)
+                           std::unique_ptr<DflashDraft> dflash_draft,
+                           std::optional<multimodal::Qwen3VLVisionWeights>
+                               vision_tower,
+                           multimodal::Qwen3VLVisionConfig vision_config)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
+      // LOAD-GGUF-MMPROJ: the `clip` projector's tower, already loaded and
+      // already refused-or-accepted by FromModelDir before the tokenizer.
+      // nullopt on every load that named no --mmproj.
+      vision_tower_(std::move(vision_tower)),
+      vision_config_(vision_config),
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
@@ -1865,6 +1874,21 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     CheckDflash2DraftArm(*params.speculative_config->draft_model_path);
   }
 
+  // LOAD-GGUF-MMPROJ (#821): a projector is a SECOND GGUF beside a GGUF
+  // language file, and nothing else. A safetensors checkpoint carries its
+  // vision tower in its own shards, so accepting --mmproj there and quietly
+  // ignoring it would load a tower the user did not ask for and drop the one
+  // they named. Refuse by name instead, before any path or config I/O.
+  if (!params.mmproj_path.empty() &&
+      !(fs::is_regular_file(dir) && dir.extension() == ".gguf")) {
+    throw std::runtime_error(
+        "--mmproj: a multimodal projector attaches to a .gguf language file, "
+        "and '" +
+        model_dir +
+        "' is not one. A safetensors checkpoint carries its vision tower in "
+        "its own shards and needs no projector file");
+  }
+
   // A single `.gguf` file: config + weights + tokenizer all come from the
   // GGUF (M0.10). The engine stack below is unchanged.
   if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
@@ -1896,12 +1920,108 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     {
       const platforms::Platform& target = platforms::GetPlatform(
           ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The bound above sums the
+      // WHOLE tensor table, so on `Qwen3.8-2.4T-A95B UD-Q1_0` it counts all
+      // 335.62 GiB of `*_exps` and refuses before any forward exists to take the
+      // slot arm. That is right whenever those towers really are staged, and
+      // wrong when the streaming lane serves them: then they are not staged at
+      // all, and what the device pays instead is the slot arena.
+      //
+      // THE FOUR CONDITIONS, in this order because the last one LATCHES.
+      // `ResolveExpertStreamRequested()` fixes the process's answer for good, so
+      // it is asked only once the platform has already said it both stages and
+      // can read host slots, and only once the resolved MODEL has said its
+      // forward reads experts through the slot seam — which is false on every CPU
+      // load, on every discrete device and on every architecture that does not
+      // stream, i.e. everywhere the latch would be a side effect rather than the
+      // question. The offload config is installed at the top of this function,
+      // well before here, so the latched answer is the configured one.
+      //
+      // THE ARCHITECTURE TERM IS NOT COSMETIC. Without it this block is keyed on
+      // the tensor NAME alone, and `_exps.weight` is what a llama.cpp MoE export
+      // writes for families this tree does not stream:
+      // `deepseek_v4_weights.cpp` and `laguna_weights.cpp` both emit it, and
+      // neither model composes `RunMoeBlock`, so neither ever reaches
+      // `KqExpertSlice`. `CheckDeviceWeightFit` has ONE production call site —
+      // this one — and every GGUF architecture arrives at it, so a `deepseek4`
+      // load on a GB10 with `VT_MOE_EXPERT_STREAM=1` would have had its whole
+      // expert set dropped from the bound and an arena added that nothing
+      // allocates. That is the UNSAFE direction, unlike the two over-counts this
+      // bound documents (#1136): it deletes a correct refusal and puts back the
+      // 26-minute load and the `cudaMalloc: out of memory` first forward that
+      // #1123 exists to prevent. The capability is declared on the factory beside
+      // the forward that implements it, and a model that does not declare it gets
+      // the whole bound.
+      //
+      // THE RESIDENCY TERM IS THE SAME FINDING ONE LEVEL DEEPER (#1378). The four
+      // conditions above are all properties of the DEVICE and the ARCHITECTURE,
+      // and a `qwen35moe` GGUF satisfies every one of them while still staging
+      // every tower: `LoadExpertsOrNvfp4` routes the SAME `_exps.weight` tensors
+      // to `expert_*_fp4` or to `expert_*` whenever the residency is not a keep
+      // residency, and only the `expert_*_kq` arm reaches `KqExpertSlice`. With
+      // `VT_GGUF_KEEP_QUANT=0`, or on an NVFP4 GGUF, this block therefore dropped
+      // 335.62 GiB of towers from the bound on a load that stages all of them and
+      // deleted the #1123 refusal outright. `GgufExpertTowersReachSlotLane` asks
+      // the model loader's own routing function about this file under this
+      // process's policy, so the bound and the forward cannot disagree.
+      //
+      // It is asked LAST, after `ResolveExpertStreamRequested()`, only because
+      // that call LATCHES: moving a non-latching file scan in front of it would
+      // change which loads fix the process's streaming answer, and this repair
+      // has no business moving that.
+      static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
+      StreamedExpertLane lane;
+      if (target.needs_weight_staging() &&
+          target.host_memory_is_device_addressable() &&
+          gguf_arch.factory != nullptr &&
+          gguf_arch.factory->streams_routed_experts &&
+          ResolveExpertStreamRequested() &&
+          GgufExpertTowersReachSlotLane(gguf, kStreamedExpertSuffix,
+                                        GgufLoadPolicy::FromEnv())) {
+        // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
+        // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
+        // writes. The arena is the store's own arithmetic — `slots *
+        // slot_bytes` through the same two resolvers `Qwen35ExpertStream`'s
+        // constructor uses, with the largest per-expert slice in this file as
+        // the computed default, so the number here is the number that gets
+        // allocated and not an estimate of it.
+        lane.tensor_name_suffix = kStreamedExpertSuffix;
+        const size_t slice =
+            GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
+        if (slice > 0) {
+          lane.arena_bytes =
+              static_cast<size_t>(ResolveExpertStreamSlots()) *
+              static_cast<size_t>(
+                  ResolveExpertStreamSlotBytes(static_cast<int64_t>(slice)));
+        }
+      }
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.needs_weight_staging(),
           DeviceWeightBudgetBytes(
-              target.residency_policy().device_memory_total_bytes));
+              target.residency_policy().device_memory_total_bytes),
+          /*model_dtype_bytes=*/2, lane);
       if (fit.refuse) throw std::runtime_error(fit.message);
+    }
+    // LOAD-GGUF-MMPROJ (#821): the SECOND file. Opened, validated and READ
+    // here — after the architecture resolve and the device-fit refusal, and
+    // BEFORE the tokenizer and every weight byte — for the same reason the fit
+    // refusal sits there: a projector this build cannot load must cost the user
+    // a message, not a 17 GB map followed by one.
+    //
+    // llama.cpp's `--mmproj` is the user-facing convention this mirrors
+    // (b10451 `tools/mtmd/mtmd-cli.cpp`); the file is a `clip`-architecture
+    // GGUF and NOT a shard of the language file, which is why
+    // `GgufFile::Open`'s own `DetectSplit` shard merge is not the seam.
+    std::optional<multimodal::Qwen3VLVisionWeights> vision_tower;
+    multimodal::Qwen3VLVisionConfig vision_config;
+    std::optional<vllm::GgufFile> mmproj;
+    if (!params.mmproj_path.empty()) {
+      mmproj = vllm::GgufFile::Open(params.mmproj_path);
+      vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
+      vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
+      vision_tower =
+          vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
     // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
@@ -1972,7 +2092,8 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     }
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
-        /*preselected_queue=*/nullptr, std::move(dflash)));
+        /*preselected_queue=*/nullptr, std::move(dflash),
+        std::move(vision_tower), vision_config));
   }
 
   // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config

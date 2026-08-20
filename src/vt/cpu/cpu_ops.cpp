@@ -49,6 +49,11 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
   }
 }
 
+// Defined below with the Mamba2 host references. Declared here because the
+// gated activations need it too: it is the general "what this value reads back
+// as at width `dt`" helper, not a Mamba2-private one.
+float RoundThrough(DType dt, float v);
+
 // GEMM chunk worker — 16x16 block tiling inside a chunk, ported from
 // ggml_compute_forward_mul_mat_one_chunk (ggml-cpu.c:1155-1243; empty-chunk
 // yield :1181-1184, blck_0/blck_1 = 16 :1192-1194). ggml's vec_dot per output
@@ -400,12 +405,29 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
 
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  // act(gate) is narrowed to the INPUT dtype before the multiply, which is what
+  // upstream does on every accelerator path it ships:
+  // csrc/libtorch_stable/activation_kernels.cu:158 `silu_kernel` returns
+  // `(T)(((float)x) / (1.0f + expf((float)-x * alpha)))` and :36 `compute`
+  // returns `(scalar_t)(ACT_FN(gate, alpha) * ((float)up + beta))`, so ACT_FN
+  // has already narrowed by the time the multiply happens; the vectorized
+  // :72 path narrows identically. The native reference agrees --
+  // activation.py:143 is `F.silu(x[..., :d]) * x[..., d:]`, and `F.silu` on a
+  // bf16 tensor yields bf16 -- and upstream pins the two BIT-EXACTLY at
+  // tests/kernels/core/test_activation.py:108,
+  // `assert_close(out, ref_out, atol=0.0, rtol=0.0)`. Pin 555967922. (#1322)
+  //
+  // The target is x's dtype, NOT out's. Upstream never has the two differ
+  // (`SiluAndMul.forward_cuda` allocates out with `dtype=x.dtype`), while this
+  // seam permits an f32 input with a bf16 output; keying on the input leaves
+  // every f32-in path bit-identical and confines the change to bf16-in ones.
+  const DType in_dt = x.dtype;
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float gate = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
-      float silu = gate / (1.0f + std::exp(-gate));
+      float silu = RoundThrough(in_dt, gate / (1.0f + std::exp(-gate)));
       StoreF32(out, i * d + j, silu * up);
     }
   }
@@ -416,13 +438,19 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
 // sqrt(2/pi)*(g + 0.044715*g^3))) — the exact gelu_pytorch_tanh, computed in f32.
 void GeluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  // Same polarity as SiluAndMulKernel above, and the same upstream anchors:
+  // activation_kernels.cu:205 `gelu_tanh_kernel` returns
+  // `(T)(0.5f * f * (1.0f + ::tanhf(inner)))`, activation.py:418 is
+  // `F.gelu(x[..., :d], approximate=approximate) * x[..., d:]`, and gelu_tanh
+  // is one of the activations test_activation.py:108 compares at atol=rtol=0.
+  const DType in_dt = x.dtype;
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float g = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
       float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-      float gelu = 0.5f * g * (1.0f + std::tanh(inner));
+      float gelu = RoundThrough(in_dt, 0.5f * g * (1.0f + std::tanh(inner)));
       StoreF32(out, i * d + j, gelu * up);
     }
   }
@@ -451,11 +479,19 @@ void SoftCapKernel(Queue&, Tensor& out, const Tensor& x, double cap) {
 
 void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
   const int64_t n = out.Numel();
+  // Same polarity, same kernel upstream: fused_moe.py's `fused_experts_impl`
+  // reaches `activation.py::apply_moe_activation`, which calls
+  // `torch.ops._C.silu_and_mul` -- the very kernel anchored on
+  // SiluAndMulKernel above. The narrowing target is the GATE tensor's dtype,
+  // which is the activated half's input width, so the f32-gate callers
+  // (notably the grouped bf16 GEMM composite, whose partials are f32) are
+  // bit-identical to before.
+  const DType in_dt = gate.dtype;
   // Elementwise: partition the flat output range.
   ForRows(n, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     const float g = LoadF32(gate, i);
-    const float silu = g / (1.0f + std::exp(-g));
+    const float silu = RoundThrough(in_dt, g / (1.0f + std::exp(-g)));
     StoreF32(out, i, silu * LoadF32(up, i));
   }
   });

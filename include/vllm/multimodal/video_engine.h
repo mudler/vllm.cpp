@@ -115,6 +115,12 @@ struct VideoResult {
   // writes artifacts and COMPOSES the argv, and spawns nothing.
   std::vector<std::string> mux_argv;
   std::string mux_output_path;  // the -o target mux_argv names
+  // WHERE THE RENDER SAID IT SPENT ITS WALL (row LTX25-DEVICE-RESIDENCY W0,
+  // issue #1010): the phase table this generation wrote, or empty for a family
+  // that emits none. A path rather than the table itself, because the file is
+  // the deliverable — evidence that survives the process, and the box
+  // (`.agents/specs/ltx25-device-residency.md` §Risks/decisions H2).
+  std::string phase_log_path;
 };
 
 // Read a family-specific extra, or `fallback` when the key is absent.

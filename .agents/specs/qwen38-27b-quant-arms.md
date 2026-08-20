@@ -14,8 +14,9 @@ model-run-in-a-lease that this spec's NVFP4 gate depends on;
 [#809](https://github.com/mudler/vllm.cpp/issues/809) / PR
 [#876](https://github.com/mudler/vllm.cpp/pull/876) owns the GGUF architecture
 dispatch this spec builds on and which is still OPEN.
-**Lifecycle:** `READY` (all three rows). No `src/`, `include/` or `tests/` file
-changes here — this change is the spec and the records.
+**Lifecycle:** `LOAD-GGUF-MMPROJ` is `PARTIAL` (W1 landed; see
+[W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` and
+`QUANT-QWEN38-27B-NVFP4-ARM` are `READY`.
 **Owner:** unassigned
 
 ## Why this is not optional
@@ -350,7 +351,7 @@ unquantized.
    (`:147-163`) names this exact case: "A per-output-channel `[out] BF16` scale passed at two bytes an element
    and was read as one float built from the first two entries." So even after (1)
    is fixed, `weight_scale` BF16 `[10240,1]` fails the count check first. `Fp8Weight`
-   (`include/vllm/model_executor/models/qwen3_5_weights.h:318-330`) is three host
+   (`include/vllm/model_executor/models/qwen3_5_weights.h:563-576`) is three host
    floats with **no tensor-valued scale slot**, so this is a type change, not a
    read fix.
 
@@ -730,6 +731,319 @@ in Git history with a diff, an author and a date, as
 `AGENTS.md` §"Changing the rules or a checker" requires of an exception. This is
 visible debt, not a precedent: the next unrelated rider gets its own branch.
 
+## W1 outcome
+
+`LOAD-GGUF-MMPROJ` is implemented and `PARTIAL`. What follows is what W1
+actually delivered, what it deliberately did NOT deliver, and the one place it
+departs from the [Port map](#load-gguf-mmproj) above.
+
+### What landed
+
+- **The flag, on all three surfaces.** `EngineParams::mmproj_path`
+  (`include/vllm/entrypoints/model_loader.h`), `vllm_model_params.mmproj_path`
+  (`include/vllm.h`, **C ABI v22**, appended so a zero-initialised v21 struct is
+  byte-identical), and `--mmproj` on the OpenAI server. The spelling is
+  llama.cpp's, which is the flag a holder of these artifacts already types.
+- **The reader.** `include/vllm/model_executor/models/clip_mmproj_gguf.h` +
+  `src/vllm/model_executor/models/clip_mmproj_gguf.cpp`. It reads the
+  projector's own `clip.*` metadata into the SAME
+  `multimodal::Qwen3VLVisionConfig` that
+  `minimax_h3_vision_gguf.cpp::MiniMaxH3EncoderVisionConfig` builds from
+  `visual.*`, and the `v.*` / `mm.*` tensors into the SAME
+  `multimodal::Qwen3VLVisionWeights`. No second tower, no second config type.
+- **The temporal-patch join, and its refusal.** llama.cpp stores the `conv3d`
+  patch embedding as two `conv2d` halves summed over the two frames
+  (`qwen2vl.cpp::clip_graph_qwen2vl::build_inp_with_temporal_merge` at
+  `b10451`), so the join INTERLEAVES them per channel into the
+  `[out, C * T * p * p]` operand the tower reads. A concatenation has the same
+  size and the same multiset of values, so the gate checks every position rather
+  than the length. A file carrying only `v.patch_embd.weight` is refused by
+  name, with both feature counts in the message.
+- **MuseGlimmer's refusal, reached.** `clip.projector_type == "muse-glimmer"`
+  routes to `MuseGlimmerRefuseMmproj()`, whose only caller before this row was
+  `tests/vllm/models/test_muse_glimmer_gguf.cpp`. **This is a change to
+  MuseGlimmer's behaviour**, made deliberately and stated here: a user who
+  passes `mmproj-kquant.gguf` now gets that recorded message from the loader
+  instead of getting no way to name the file at all.
+- **Placement.** The projector is opened, validated and READ after the
+  architecture resolve and the device-fit refusal and **before the tokenizer**,
+  so a projector this build cannot load costs a message rather than a 17 GB map
+  followed by one.
+
+### Where W1's llama.cpp anchors were read
+
+At the pin, and this is stated because the rest of this spec cannot say the
+same. `backend-matrix.md`'s `LLM_ARCH_QWEN35` / `PROJECTOR_TYPE_QWEN3VL`
+positions were read at the superseded local fork `237ad9b96` and are owed
+re-anchoring under [#1003](https://github.com/mudler/vllm.cpp/issues/1003);
+W1's are NOT those. Every `file:line` in `clip_mmproj_gguf.h`'s UPSTREAM block
+was read with `git show 10bf611e5:<path>` — the commit the tag `b10451` names,
+contained in `ggml-org/llama.cpp` `origin/master`, so the bytes are upstream's
+at the pin and not a fork's. The commit is present in the local checkout
+`/home/mudler/_git/llama.cpp-mtp-imatrix`, whose HEAD is a fork commit and was
+therefore NOT the read position.
+
+What that confirmed at the pin rather than near it:
+`PROJECTOR_TYPE_NAMES` at `clip-impl.h:499` maps `PROJECTOR_TYPE_QWEN3VL`
+(`:444`) to `qwen3vl_merger` (`:507`) and `PROJECTOR_TYPE_MUSE_GLIMMER`
+(`:495`) to `muse-glimmer` (`:557`); the NINE `clip.*` key spellings this
+reader uses are `:33,40-44,47,58,65` — the contiguous-looking `40-47` sweeps up
+`KEY_N_HEAD_KV` (`:45`) and `KEY_N_EMBD_HEAD` (`:46`), which
+`clip_mmproj_gguf.cpp:22-30` does NOT read, so the range is written open;
+the tensor-name macros are `:104,106-108,131-132,153-155`;
+the per-block reads are `clip.cpp:2021`; and
+`qwen2vl.cpp:3::build_inp_with_temporal_merge` is two `ggml_conv_2d` halves
+combined by `ggml_add` at `:12-26`, refusing `n_batch > 2` outright at `:28` —
+which is the SUM this row's interleave join mirrors, read at the pin rather
+than inferred from a fork.
+
+### The C ABI append, and what a v21 caller does with it
+
+`mmproj_path` is APPENDED to `vllm_model_params`, so a zero-initialised v21
+struct is byte-identical to what it was and every existing caller keeps its
+behaviour. The other direction is the ordinary struct-append shape and is
+**not** something this row introduces: a caller COMPILED against v21, passing
+its shorter struct to a v22 library, has the library read `mmproj_path` past
+that allocation. The v21 `offload_config` append has exactly the same shape, as
+does every append before it, because `vllm_model_params` carries no size or
+version field for the library to check. It is stated here once rather than left
+unstated; changing it is an ABI-wide decision about the struct, not a decision
+this row may make on its own.
+
+### What did NOT land, and is owed
+
+- **Nothing runs the tower.** `LoadedEngine::vision_tower()` holds it; no
+  forward reads it. There is no multimodal request path on the C ABI (the ABI
+  v19 note in `include/vllm.h` already records this for the input limits) and no
+  GGUF image/video driver. Owed by `QUANT-QWEN38-27B-GGUF-ARM` (#821 W3), and
+  listed under `## Owed` below.
+- **No COMMITTED manifest, and no CI accounting against one.** The reader is now
+  confirmed against the real `mmproj-BF16.gguf` (see
+  [The live confirmation](#the-live-confirmation) below), but that confirmation
+  is env-gated and reads a file on the NAS. The committed 334-name manifest and
+  the accounting test that runs in CI without the bytes belong to
+  `QUANT-QWEN38-27B-GGUF-ARM`, which is where the manifest lives.
+- **Deepstack is carried, and no real weights EXERCISE it.** The discovery is
+  exercised synthetically. Qwen3.8-27B's projector taps nothing — its
+  `clip.vision.is_deepstack_layers` is 27 `false` values and it ships no
+  `v.deepstack.*` tensor, agreeing with the safetensors side's
+  `deepstack_visual_indexes: []` — so the live case can only confirm the EMPTY
+  answer. A projector that actually taps is owed to the first row that holds
+  one.
+
+### The one departure from the Port map, and why
+
+The Port map says to add "a second, explicitly-named optional projector pointer"
+to `ModelSource`. **W1 does not add it.** The tower is loaded by the loader and
+held by `LoadedEngine`, not passed through `ModelSource` into an architecture's
+weight loader.
+
+The reason is `AGENTS.md` §"Nothing lands dead". No `Qwen3_5*Weights` has a
+vision member, and no architecture's registry loader reads one: on the
+safetensors side the tower is a SEPARATE reader (`LoadQwen3_5MoeVision`) over the
+same shards, and it too has no production caller today. A `ModelSource::mmproj`
+pointer in W1 would therefore be the "unpassed parameter" shape
+[`reachability.md`](../reachability.md) names — a field the loader fills and no
+loader reads — which is worse than not adding it. `LoadedEngine` is also where a
+multimodal request path will look for the tower, and it is where the file
+actually belongs: a projector is a separate FILE the engine was handed, not part
+of the model checkpoint.
+
+The seam is not lost. When W3 gives the tower a consumer, the consumer decides
+whether it wants the tower through `ModelSource` or off the engine, and it can
+add the field in the same change that reads it.
+
+**RATIFIED by the operator on 2026-08-19.** This is a design change from the
+committed spec and it is recorded as granted rather than left open. The grounds,
+each re-verified in the tree at the ratifying head rather than carried over:
+
+- No `Qwen3_5*Weights` carries a vision member —
+  `Qwen3_5MoeWeights` (`qwen3_5_weights.h:635-656`) and `Qwen3_5DenseWeights`
+  (`qwen3_5_dense.h:125+`) both stop at `embed_tokens` / `final_norm` /
+  `lm_head` / layers, and `ModelSource` (`model_registry.h:79-102`) has fields
+  for safetensors shards, one `GgufFile*` and a load queue, and no projector.
+- No registry loader reads one. `LoadQwen3_5MoeVision`, the safetensors side's
+  separate tower reader, has exactly FIVE call sites in the tree and every one
+  of them is a test (`test_qwen3_5_moe_vision.cpp:430,459`,
+  `test_qwen3_5_moe_vl_hw.cpp:124,188,221`). This bullet said "three" before the
+  count was re-derived, and it named three of the five. The ratification rests
+  on the absence of a PRODUCTION caller, which is what re-deriving confirmed;
+  the count beside it was the part that was wrong, and it is corrected here
+  rather than carried.
+- So a `ModelSource::mmproj` pointer in W1 would be the "unpassed parameter"
+  shape [`reachability.md`](../reachability.md) names — a field the loader fills
+  and no loader reads.
+- [#1358](https://github.com/mudler/vllm.cpp/issues/1358) is an OPEN bug in this
+  repository for exactly that shape: Qwen3-VL loads its whole vision tower on
+  the production path (`qwen3_vl.cpp:418`) into `Qwen3VLWeights::vision` and
+  nothing in `src/` reads it back. Adding the field now would deliberately
+  manufacture a second instance of a filed defect.
+- The seam is not lost, because W3's consumer adds the field in the same change
+  that reads it, which is the only way it lands reached.
+
+### The live confirmation
+
+W1's CI gate is synthetic and stays synthetic: CI must not depend on a 931 MB
+file on a NAS share. Beside it, the same reader now runs over the artifact a
+user actually holds, behind `VLLM_CPP_QWEN38_27B_MMPROJ`. Unset, the case skips
+loudly; set, it adds 43 assertions to `test_clip_mmproj_gguf`.
+
+The file is `unsloth/Qwen3.8-27B-GGUF` @
+`fe1e2a23d973adb629709749dc4f6756df66ef10`, `mmproj-BF16.gguf`, 931 146 432 B,
+sha256 `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53`, GGUF
+v3, 334 tensors (110 BF16 + 224 F32), 35 metadata keys. Its companion language
+file is `Qwen3.8-27B-Q4_K_M.gguf`, 17 106 775 008 B, sha256
+`7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`, same repo
+and revision. Both sha256 values were computed locally on the mirrored copy.
+Both are third-party Unsloth quantizations, not first-party releases.
+
+**What the real bytes CONFIRMED**, none of it contradicted:
+
+- Every one of the nine `clip.*` keys the reader spells is present under the
+  spelling it reads, and so are the two `general.*` keys beside them, which the
+  header read above records as `general.architecture = clip` and
+  `general.type = mmproj`. `clip_mmproj_gguf.cpp:20-30` is nine `clip.*` plus
+  those two `general.*`, which is where the earlier count of eleven came from,
+  and `clip.*` was the wrong prefix for two of them. Eight of the nine are
+  REQUIRED: `clip.projector_type`, whose absence `RefuseUnsupportedClipMmproj`
+  reports as `<absent>` rather than defaulting, plus the six `ReqInt` geometry
+  keys and the `ReqFloat` epsilon. Only `clip.vision.spatial_merge_size` is
+  OPTIONAL, read as `OptInt` with a default of 2, so this file states it rather
+  than the reader assuming it. The geometry is hidden 1152, 16 heads, 27
+  blocks, feed-forward 4304, projection 5120, patch 16, spatial merge 2,
+  layer-norm epsilon 1e-6.
+- `in_channels = 3` and `num_position_embeddings = 2304` come off the tensor
+  shapes, which is the only place the file states them, and the shapes are the
+  ones the reader's checks demand: `v.patch_embd.weight` is torch
+  `[1152, 3, 16, 16]` and `v.position_embd.weight` is torch `[2304, 1152]`.
+- **Both patch-embedding halves ship.** `v.patch_embd.weight.1` is present with
+  the identical shape, so the real artifact takes the ACCEPTING arm and the
+  refusal is for a file that is not this one. Both halves are F32 on this
+  artifact, so the live case reads them straight out of the mmap and checks the
+  join at all 1 769 472 positions without going through the same dequant helper
+  the reader uses.
+- The name map closes in both directions and nothing is left over. The 334
+  names the reader consumes are exactly the 334 the file ships: 27 blocks x 12,
+  plus `mm.0`/`mm.2` weight and bias, `v.post_ln` weight and bias,
+  `v.patch_embd` weight, `.weight.1` and bias, and `v.position_embd.weight`.
+- `v.post_ln` is 1152 wide — the PRE-shuffle hidden size, not the merged 4608 —
+  which is the FILE confirming `use_postshuffle_norm = false` rather than the
+  reader assuming it.
+- DeepStack discovery agrees with the file's own declaration: the reader finds
+  no tap from the tensor names, and `clip.vision.is_deepstack_layers` is 27
+  `false` values.
+
+**What it did NOT confirm.** The tower is loaded, never run, so nothing here
+says the weights produce correct activations. `general.file_type = 32` and the
+BF16 tensor half are dequantized through `DequantGgufRowToF32`, which this row
+does not gate. And the discovery still reads the TENSORS rather than
+`clip.vision.is_deepstack_layers`; the two agree on this file and only on this
+file, which is why the live case asserts both.
+
+### Evidence
+
+- Red first, captured by building the tree with the reader stubbed and the
+  loader hook absent: `test_clip_mmproj_gguf` 8/8 cases failed (0 passed),
+  `test_gguf_mmproj_reach` 4/5 failed. Green after: 8/8 and 5/5, 272 and 19
+  assertions, both `Status: SUCCESS!`. Those CASE counts are the counts of that
+  head, and they are 9 and 6 now: each target has since gained one env-gated
+  live case, and a skipped live case contributes zero assertions, which is why
+  the ASSERTION counts below are still 272 and 19. Every figure in this section
+  after this bullet was measured on the tree this repair commits, over the merge
+  `b1088d317` of `origin/main` `307273764`.
+- The live case re-established its own red the same way, and its second
+  mutation is the one that says what the live case BUYS. Turning the join into
+  a concatenation reds it at `wrong == 0` (2 of 9 cases, 185 assertions).
+  Renaming `ffn_up` to `ffn_gate` in the reader AND in the synthetic fixture
+  together — a name-map defect the fixture agrees with — leaves the hermetic
+  gate **fully green at 9/9, 272 assertions, `Status: SUCCESS!`**, and reds only
+  the live case, by name: `missing tensor v.blk.0.ffn_gate.weight`. A fixture
+  cannot catch a name its own author got wrong; the shipped bytes can.
+  Green after both restores, verified by sha256: 9/9 at 272 assertions hermetic
+  and 9/9 at 315 assertions live, `test_gguf_mmproj_reach` 5/5 at 19.
+- Reachability mutation (the one `AGENTS.md` requires), RE-RUN here rather than
+  quoted. Deleting the two-line `LoadQwen3VLVisionFromClipMmproj` call site at
+  `model_loader.cpp:1974-1975` — `git diff --stat` `1 file changed, 2
+  deletions(-)`, `COMPILE_RC=0`, so neither a mutation that never applied nor
+  one that failed to build is being read as a pass — reds
+  `test_gguf_mmproj_reach` and leaves `test_clip_mmproj_gguf` green, on the same
+  binary pair:
+
+  | target | env | rc | cases | assertions | `Status:` |
+  |---|---|---:|---|---|---|
+  | `test_gguf_mmproj_reach` | unset | 1 | 6, 5 passed / 1 failed | 19, 16 / 3 | `FAILURE!` |
+  | `test_clip_mmproj_gguf` | unset | 0 | 9, 9 passed | 272 | `SUCCESS!` |
+  | `test_clip_mmproj_gguf` | live | 0 | 9, 9 passed | 315 | `SUCCESS!` |
+
+  That contrast is the evidence, not the red alone: the reader's own gate cannot
+  tell the difference, on the bytes or without them. Restored with
+  `git checkout --`, `src/vllm/entrypoints/model_loader.cpp` sha256
+  `fb0789127a61615be31e865108d0904a7b76b6f21ac1c0ae589fedafe822cef4` before and
+  after, and the rebuilt target green again at 6/6, 19.
+
+  **A correction, and where it came from.** `647f3f194`'s body reported this
+  contrast as `test_clip_mmproj_gguf` "fully green at 8/8", inside a sentence
+  saying the mutation "was re-run on this head rather than inherited". The
+  substance was right and the figure was the EARLIER head's: the live case had
+  since made that target nine cases. The number was not re-derived when the
+  sentence claiming it had been was written, which is the failure worth naming —
+  a figure quoted often enough starts reading as one somebody measured. The
+  table above is the current measurement and it lands in the pull-request body,
+  which is what `squash_merge_commit_message = PR_BODY` makes the commit message
+  on `main`.
+- Guard mutations: deleting the `RefuseUnsupportedClipMmproj` call reds 2 cases;
+  deleting the non-`.gguf` `--mmproj` refusal reds 1; turning the patch-embedding
+  interleave into a concatenation reds 128 of the join's assertions. The tree was
+  restored byte-for-byte after each, verified by sha256.
+- **The tower is HELD, and that is now measured.** Every case listed above stops
+  at a MESSAGE: the permitting reach case throws at the tokenizer one step past
+  the projector, so no `LoadedEngine` was ever constructed and nothing in the
+  tree observed the positive claim four records make. That was the finding, and
+  it was measured rather than argued. Dropping the constructor's
+  `vision_tower_(std::move(vision_tower))` to
+  `vision_tower_(((void)vision_tower, std::nullopt))` — `git diff --stat` `1
+  file changed, 1 insertion(+), 1 deletion(-)`, `COMPILE_RC=0`, because a
+  mutation that fails to build and a mutation that never applied both read as a
+  pass — left `test_gguf_mmproj_reach` hermetic at rc 0, 6/6, 19 assertions,
+  `Status: SUCCESS!` and `test_clip_mmproj_gguf` at rc 0, 9/9, 272 assertions,
+  `Status: SUCCESS!`. Every gate in this tree stayed green with the tower
+  thrown away.
+
+  So W1's repair adds
+  `test_gguf_mmproj_reach.cpp::"mmproj reach: a load that COMPLETES leaves the
+  tower ON THE ENGINE"`, which drives `LoadedEngine::FromModelDir` over the
+  REAL pair — both files pinned by bytes and sha256 in `docs/USAGE.md` — and
+  reads `vision_tower()` back off the constructed engine, then checks the
+  published `vision_config()` against the projector's own header geometry and
+  every weight extent against numbers derived from it (`patch_proj_w` at
+  1152x1536, 27 blocks, the merger's `mm.0` at 4608x4608 and `mm.2` at
+  5120x4608, no DeepStack merger) plus a non-zero energy check, so a tower of
+  the right SHAPE and the wrong content fails too. It is env-gated on BOTH
+  paths and skips loudly, so CI still reads no NAS file.
+
+  | tree | env | rc | cases | assertions | `Status:` |
+  |---|---|---:|---|---|---|
+  | restored | unset | 0 | 6, 6 passed | 19 | `SUCCESS!` |
+  | restored | live | 0 | 6, 6 passed | 232 | `SUCCESS!` |
+  | tower dropped | unset | 0 | 6, 6 passed | 19 | `SUCCESS!` |
+  | tower dropped | live | 1 | 6, 5 passed / 1 failed | 21, 20 / 1 | `FAILURE!` |
+
+  The new case's own contribution is 232 - 19 = 213 assertions, and under the
+  mutation it reaches only 2 of them before dying at the claim itself:
+  `test_gguf_mmproj_reach.cpp:221: FATAL ERROR: REQUIRE( tower != nullptr ) is
+  NOT correct!  values: REQUIRE( nullptr != nullptr )`. The mutation was
+  restored with `git checkout --` and `model_loader.cpp` re-hashed to
+  `fb0789127a61615be31e865108d0904a7b76b6f21ac1c0ae589fedafe822cef4`, its
+  pre-mutation value.
+
+  **What it costs to run, so the next reader can decide before starting one.**
+  The load is CPU-only on this host and reads 17,106,775,008 bytes over CIFS.
+  Two runs, `/usr/bin/time -v`, `Exit status: 0` both times: 6 min 21.84 s and
+  5 min 36.92 s wall, 33,062,564 and 33,062,612 kB peak resident. The wall time
+  is CIFS-bound and is NOT a constant, so it is given as the two values measured
+  rather than as one; the peak is stable to 48 kB across them. A box with less
+  than about 40 GB of available memory should not start it.
+
 ## Dependencies and blockers
 
 Named here rather than under `## Owed`, because `## Owed` means this spec owns
@@ -753,18 +1067,59 @@ the issue and each of these is owned by another row.
 Owned by this spec's three rows, and unpaid until an implementation change pays
 them:
 
-- [#821](https://github.com/mudler/vllm.cpp/issues/821) itself — every acceptance
-  bullet it lists is still open, and this change is its spec, not its closure.
-- The mirrored bytes and a **locally computed** sha256 for
-  `Qwen3.8-27B-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `model.safetensors` and
-  `model_mtp.safetensors`. Nothing in this spec records a hash it did not
+- [#821](https://github.com/mudler/vllm.cpp/issues/821) itself — its GGUF-arm
+  and NVFP4-arm acceptance bullets are still open. W1 closes only the
+  second-projector-file half of it.
+- **A consumer for the loaded vision tower.** W1 loads it and
+  `LoadedEngine::vision_tower()` holds it; no forward reads it and no C-ABI or
+  server request can feed it an image. Owned by `QUANT-QWEN38-27B-GGUF-ARM`
+  (W3 in the [Work breakdown](#work-breakdown)), tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821). Named here rather than
+  left to be discovered: a tower that loads and never runs is exactly the shape
+  [`reachability.md`](../reachability.md) exists to keep visible.
+- **The COMMITTED 334-name manifest for `mmproj-BF16.gguf`, and the CI
+  accounting against it.** W1's CI gate is synthetic and its live comparison is
+  env-gated on a NAS file, so nothing in CI accounts for that artifact's tensor
+  set. The manifest, generated the way
+  `scripts/gen-muse-glimmer-gguf-manifest.py` generates one, belongs to
+  `QUANT-QWEN38-27B-GGUF-ARM`.
+- **The merger and attention widths the reader never checks.** W1's reader
+  validates the patch embedding's shape (`clip_mmproj_gguf.cpp:241-251`: both
+  halves the same shape, `[out, in_channels, patch, patch]`) and nothing else.
+  It does NOT check `mm.0` against `hidden_size * spatial_merge_size^2`, `mm.2`
+  against `out_hidden_size`, or that `hidden_size % num_heads == 0`. Only the
+  env-gated live case in `test_gguf_mmproj_reach.cpp` compares those, so a
+  projector whose metadata and tensors disagree on any of them builds a
+  wrong-shaped tower in CI silence and fails later, inside a forward, wearing
+  somebody else's stack. Owned by `QUANT-QWEN38-27B-GGUF-ARM` (W3), tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821): W3 is the row that
+  gives the tower a consumer, and a refusal is worth writing where a forward
+  exists to be protected.
+- **The `backend-matrix.md` re-anchor at the llama.cpp pin.** W1's own
+  `file:line` citations are read at `b10451` = `10bf611e5` and the reading
+  position is stated in
+  [Where W1's llama.cpp anchors were read](#where-w1s-llamacpp-anchors-were-read),
+  so this bullet is NOT about them. `backend-matrix.md`'s
+  `LLM_ARCH_QWEN35` / `PROJECTOR_TYPE_QWEN3VL` positions were read at the
+  superseded local fork `237ad9b96` and are still owed re-anchoring under
+  [#1003](https://github.com/mudler/vllm.cpp/issues/1003). Named here because
+  W1 cites the same upstream file and a reader who finds one anchor sound will
+  assume the other is.
+- The mirrored bytes and a **locally computed** sha256 for `model.safetensors`
+  and `model_mtp.safetensors`. Nothing in this spec records a hash it did not
   compute, and no remote-reported hash may become one.
+  `Qwen3.8-27B-Q4_K_M.gguf` and `mmproj-BF16.gguf` are PAID: both are mirrored
+  and both hashes are recorded in
+  [The live confirmation](#the-live-confirmation) and in `docs/USAGE.md`.
 - `model_mtp.safetensors`'s own header parse. Its 15 tensor names came from
   `model.safetensors.index.json`, not from its header, and this spec says so
   rather than implying otherwise.
-- The `docs/USAGE.md` rows for all four artifacts, per
+- The `docs/USAGE.md` rows for the two SAFETENSORS artifacts, per
   [`porting-a-model.md`](../porting-a-model.md) §2.1. Owed by whichever row first
-  makes an arm reachable, not by this spec.
+  makes an arm reachable, not by this spec. The two GGUF rows are PAID: W1 made
+  `--mmproj` reachable, so it published the projector and its companion language
+  file under `docs/USAGE.md` §"The exact files this was gated against", named as
+  the third-party Unsloth quantizations they are.
 - A re-anchor pass over the `file:line` citations on **all three** surfaces this
   change publishes them on — this spec, the two `quantization-matrix.md` rows
   (which publish clickable `#L` permalinks), and the justifying comment in
@@ -778,15 +1133,21 @@ them:
 
 ## Now
 
-All three rows are `READY`: the gap is verified against `origin/main`
-`836c13c35` and
-against the artifacts' own headers, and this spec is committed before any
-implementation. No `src/`, `include/` or `tests/` file changes in this change —
-`git diff origin/main..HEAD` over those three paths is empty, and that emptiness
-is the claim.
+`LOAD-GGUF-MMPROJ` is `PARTIAL`: W1 landed, and what it did and did not deliver
+is [W1 outcome](#w1-outcome). Its blocker cleared before it started — PR #876
+merged as `250db75a2`, so the GGUF architecture dispatch names an unsupported
+file by its own architecture instead of falling through to qwen3_5's assert.
+A user can now pass `--mmproj mmproj-BF16.gguf` beside a `.gguf` model, and the
+projector is read, refused by name, or accepted with its tower held on the
+engine. That is confirmed on the shipped 334-tensor artifact and not only on a
+fixture ([The live confirmation](#the-live-confirmation)); CI still reads the
+fixture alone. Nothing runs that tower yet, and that is `## Owed`.
 
-Next action is `LOAD-GGUF-MMPROJ`, because it needs no lease, no checkpoint
-download and no oracle, and it is the only one of the three whose blocker
-(PR #876) is already in flight. The Q4_K_M manifest and accounting gate is the
-next CPU-only unit after it. Both token gates wait on #857 and #1185
-respectively, and are not scheduled here.
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` stay `READY`, both
+verified against the artifacts' own headers.
+
+Next action is W2, the Q4_K_M manifest and accounting gate, because it needs no
+lease, no oracle and no GPU, and because the `block_count - nextn_predict_layers`
+correction it pins is the single most likely way to get a fluent, wrong model out
+of that file. Both token gates wait on #857 and #1185 respectively, and are not
+scheduled here.

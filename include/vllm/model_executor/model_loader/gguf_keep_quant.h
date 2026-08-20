@@ -284,4 +284,16 @@ struct GgufLoadPolicy {
   GgufResidency Route(const GgufTensorInfo& tensor, GgufTensorRole role) const;
 };
 
+// The PURE routing decision, WITHOUT firing the audit hook. A call site that
+// must look at a tensor's fate BEFORE choosing which loader to run uses this, so
+// the tensor is still audited EXACTLY ONCE by whichever loader it then calls.
+//
+// It lives here, beside `RouteGgufTensor` it delegates to, rather than in the
+// model TU that first needed it: the load-time device-fit lane
+// (`gguf_device_fit.h`, ENG-EXPERT-STREAM-DEVICE W0d) has to ask the same
+// question about the same tensors, and two unpackings of `GgufLoadPolicy` into
+// `RouteGgufTensor`'s six arguments are two descriptions of one decision.
+GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
+                        GgufTensorRole role);
+
 }  // namespace vllm

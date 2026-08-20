@@ -879,15 +879,21 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 //
 // M3 refused every LOADED block weight, because the dense forward knew only
 // fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
-// through to an EMPTY bf16 tensor. The forward reads them now
-// (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
-// what is left to refuse is a DEVICE with no kernel: `vt::MatmulFp8BlockScaled`
-// is a CPU correctness reference and the mainloop-scaled CUTLASS kernel is
-// milestone M5. This runs from `PrepareQwen3_5Dense`, i.e.
+// through to an EMPTY bf16 tensor. The forward reads all ten projections now,
+// through THREE entry points rather than one:
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them,
+// `MatmulFp8BlockMergedD` reads q/k/v as one operand, and
+// `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj` and `up_proj`. So
+// what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
+// mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
+// this now fires for a CUDA arch outside that cell. It stays inert on CPU,
+// where `vt::MatmulFp8BlockScaled` is registered as a correctness reference.
+// This runs from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, which every runner calls unconditionally before the
 // first forward and before any graph capture
 // (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a
-// capture rather than inside the first GEMM. Deleted by M5.
+// capture rather than inside the first GEMM. M5 NARROWED this rather than
+// deleting it: an arch outside the CUTLASS cell must still be refused by name.
 void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
                                           vt::DeviceType device) {
   if (dense_fp8_block::BlockFp8Runnable(device)) return;
@@ -963,7 +969,31 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     Qwen3_5DenseWeights& weights) {
   size_t released = 0;
   const auto release = [&released](OwnedTensor& tensor) {
-    if (tensor.HasHostBytes() && (tensor.d_dev || tensor.d_dev_f32)) {
+    // `HostMirrorIsRedundant`, NOT `d_dev || d_dev_f32` (the second instance of
+    // the use-after-free W0f introduced; #1299).
+    //
+    // `d_dev_f32` is a bf16->f32 UPCAST into a separate device allocation. It is
+    // not a copy of these bytes and it can never stand in for them, so it never
+    // made a host mirror redundant — it only looked like it did while every
+    // weight that had one also had a `d_dev`. On the aliasing arm that stopped
+    // being true: `PrepareBf16Resident` passes exactly four weights to BOTH
+    // `raw()` and `f32()` — `gdn.conv1d_weight`, `gdn.norm_weight`,
+    // `attn.q_norm`, `attn.k_norm` — and there `raw()` ALIASES (leaving `d_dev`
+    // null) while `f32()` allocates (setting `d_dev_f32`). The disjunction then
+    // passes and frees the very bytes the aliased raw tensor points at.
+    //
+    // Nothing reaches that combination today, and the reason is worth writing
+    // down because it is an accident rather than a design:
+    // `DirectDeviceLoadEligible` above requires `!platform.is_unified_memory()`,
+    // and on CUDA `is_unified_memory()` and `host_memory_is_device_addressable()`
+    // are the SAME `pageable && integrated` conjunction, computed independently
+    // in `src/vt/cuda/cuda_backend.cu` and `src/vllm/platforms/cuda.cpp`. No
+    // rule states that equality, no document records it and no gate holds it, so
+    // a platform that ever separates the two arrives here with a live
+    // use-after-free. Asking the invariant instead of a proxy for it costs
+    // nothing: the disjunct is redundant on the staging arm, where every weight
+    // with a `d_dev_f32` has a `d_dev` too.
+    if (tensor.HasHostBytes() && HostMirrorIsRedundant(tensor)) {
       released += tensor.bytes.size();
       tensor.ReleaseHost();
     }

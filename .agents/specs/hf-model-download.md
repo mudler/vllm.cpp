@@ -822,8 +822,23 @@ which form.
   Repaired by [#1517](https://github.com/mudler/vllm.cpp/issues/1517), which
   names `libssl-dev` in both builder stages and in the five apt-based release
   lanes, and adds `scripts/check-build-runtime-deps.py` so a runtime that
-  advertises a capability its builder cannot compile is refused. Row
-  `ENG-HF-MODEL-DOWNLOAD`, issues
+  advertises a capability its builder cannot compile is refused.
+  The repair was measured as a BUILT PAIR on 20 August 2026, x86_64, one tree,
+  one variable, both images built from `d189f66dd` and both deleted afterwards:
+
+  | | RED control, no `libssl-dev` | GREEN, the shipped file |
+  |---|---|---|
+  | configure | `Could NOT find OpenSSL ... (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`, then `HTTPS support is disabled` and `no transport layer security is available` | `Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.13")`, then `HuggingFace download: HTTPS through OpenSSL 3.0.13 (system, dynamic)` |
+  | `ldd vllm-server` | `libstdc++ libm libgcc_s libc` | the same plus `libssl.so.3` and `libcrypto.so.3` |
+  | `validate-container-image.py` | exit 1, `hub reach: this image cannot speak HTTPS` | exit 0, `hub reach: verified, the hub answered with an authorization status for does-not-exist/nope; the TLS session completed` |
+  | `docker run --model does-not-exist/nope` | `this build cannot speak HTTPS, so it cannot reach https://huggingface.co/` | `HuggingFace refused repository 'does-not-exist/nope' with HTTP 401 ... Set HF_TOKEN` |
+
+  The control needed its own BuildKit cache mount id. Sharing the lane's mount
+  made the second configure read the FIRST build's `CMakeCache.txt`, report
+  OpenSSL found with an empty version, and die at generate on a missing
+  `OpenSSL::SSL` target instead of taking the downgrade. That is
+  [#1521](https://github.com/mudler/vllm.cpp/issues/1521), filed and not fixed
+  in this flow. Row `ENG-HF-MODEL-DOWNLOAD`, issues
   [#1280](https://github.com/mudler/vllm.cpp/issues/1280) and
   [#1517](https://github.com/mudler/vllm.cpp/issues/1517).
 - **A static-musl fetch, through BoringSSL.** `-DVLLM_CPP_BUILD_BORINGSSL=ON`

@@ -116,8 +116,8 @@ model family, including offload, compatibility, and backend-specific use.
 
 ## Find a model recipe
 
-[Model recipes](models/README.md) route you to commands, required weights, and
-known limits for each model family.
+[Model recipes](models/README.md) route you to commands, required weights,
+component-specific runtime settings, and known limits for each model family.
 
 ## Checkpoint registry
 

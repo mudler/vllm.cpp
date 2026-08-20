@@ -6,33 +6,46 @@
 // THREE CLAIMS, THREE INSTRUMENTS. Each is stated here because a green that
 // cannot say which claim it covers is the failure mode this file exists inside.
 //
-// (1) THE CPU PROVIDER IS THE PRE-OP HOST LOOP. The oracle is
-//     `SerialConv1d` / `SerialConvTranspose1d` below, VERBATIM copies of
+// (1) THE CPU PROVIDER WALKS THE DECLARED ORDER. The oracle is `SerialConv1d`
+//     / `SerialConvTranspose1d` below. They were VERBATIM copies of
 //     `vllm::vocoder1d::Conv1d` / `ConvTranspose1d` as they stood at 8fa405bb7,
-//     the commit every MiniMax-Music3 / MiniMax-H3 / LTX-2.5 / IndexTTS-2.5
-//     golden was taken on. Comparing the op against itself at two thread counts
-//     would prove only determinism; it would pass just as happily if the move
-//     into the seam had reassociated every sum. The pre-change code is the only
-//     oracle that can see that, so it is carried here rather than referenced.
+//     which let this clause read "IS THE PRE-OP HOST LOOP". #1474 narrowed
+//     their accumulators from `double` to `float` in lockstep with the kernels,
+//     so they no longer transcribe that loop's arithmetic and this clause is
+//     weaker than it was: what it asserts is that the ORDER did not move, not
+//     that the values match a historical implementation. Comparing the op
+//     against itself at two thread counts would still prove only determinism —
+//     it would pass just as happily if the move into the seam had reassociated
+//     every sum — so a separate scalar transcription is still the only oracle
+//     that can see an order change, and it is carried here rather than
+//     referenced. The WIDTH is gated separately and NOT against ourselves:
+//     `tests/vllm/models/test_host_parallel.cpp`, `accumulates in f32, which is
+//     what torch does`, asserts torch's own measured answer for a reduction
+//     engineered to separate the two widths.
 //     `tests/vllm/models/test_host_parallel.cpp` makes the same comparison
 //     through the four models' own entry point; this file covers the shapes
 //     that entry point cannot express — padding != 0, dilation on the transposed
 //     op, output_padding, and batch > 1.
 //
 // (2) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE. Not within a
-//     tolerance. Both walk one f64 accumulator per output element in the same
+//     tolerance. Both walk one f32 accumulator per output element in the same
 //     order; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56) and
-//     the device kernel pins itself with `__dmul_rn`/`__dadd_rn`, so every
-//     operation on both arms is an IEEE double multiply or add with
-//     round-to-nearest-even. `memcmp` is therefore the right instrument and a
+//     the device kernel pins itself with `__fmul_rn`/`__fadd_rn`, so every
+//     operation on both arms is an IEEE single multiply or add with
+//     round-to-nearest-even. NOT RUN at that width: #1474 narrowed both arms on
+//     a box with no CUDA toolkit and no lease, so these cases have skipped ever
+//     since — .agents/specs/vt-conv1d-f32-accumulator.md §7. `memcmp` is therefore the right instrument and a
 //     tolerance would be the wrong one: a transposed weight axis, a dropped
 //     zero-skip or a reassociated sweep all land well inside any epsilon anyone
 //     would write. Skips cleanly with a LOUD message when no GPU is present.
 //
 // (3) EQUALITY IS TESTED WHERE IT CAN ACTUALLY FAIL. An f64 accumulator stored
-//     through an f32 cannot show a ~2^-53 relative change, so an order defect on
-//     well-scaled data is INVISIBLE — measured, not assumed: see the mutation
-//     record in tests/vllm/models/test_host_parallel.cpp. Every claim above is
+//     through an f32 could not show a ~2^-53 relative change, so an order defect
+//     on well-scaled data was INVISIBLE — measured, not assumed: see the
+//     mutation record in tests/vllm/models/test_host_parallel.cpp. #1474
+//     narrowed the accumulator, which can only make well-scaled data more
+//     sensitive; the engineered cases stay, because a gate is not retired on the
+//     argument that something else now covers it. Every claim above is
 //     therefore also exercised on engineered catastrophic cancellation, taps of
 //     +2^40 and -2^40 against small remainders.
 //
@@ -131,7 +144,7 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
     for (int64_t oc = 0; oc < out_channels; ++oc) {
       const int64_t g = oc / out_per_group;
       for (int64_t t = 0; t < length; ++t) {
-        double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
+        float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0F;
         for (int64_t step = 0; step < in_per_group; ++step) {
           const int64_t ic = reverse_ic ? in_per_group - 1 - step : step;
           const int64_t src_c = g * in_per_group + ic;
@@ -139,13 +152,11 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
             const int64_t k = reverse_k ? kernel - 1 - tap : tap;
             const int64_t pos = t * a.stride - a.padding + k * a.dilation;
             if (pos < 0 || pos >= in_len) continue;
-            acc += static_cast<double>(
-                       in[static_cast<size_t>((n * in_channels + src_c) * in_len + pos)]) *
-                   static_cast<double>(
-                       weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
+            acc += in[static_cast<size_t>((n * in_channels + src_c) * in_len + pos)] *
+                   weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)];
           }
         }
-        out[static_cast<size_t>((n * out_channels + oc) * length + t)] = static_cast<float>(acc);
+        out[static_cast<size_t>((n * out_channels + oc) * length + t)] = acc;
       }
     }
   }
@@ -178,21 +189,20 @@ std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t b
   const int64_t out_per_group = out_channels / a.groups;
   const int64_t full = (in_len - 1) * a.stride + a.dilation * (kernel - 1) + 1;
   std::vector<float> out(static_cast<size_t>(batch * out_channels * length));
-  std::vector<double> acc(static_cast<size_t>(out_channels * full));
+  std::vector<float> acc(static_cast<size_t>(out_channels * full));
   for (int64_t n = 0; n < batch; ++n) {
-    std::fill(acc.begin(), acc.end(), 0.0);
+    std::fill(acc.begin(), acc.end(), 0.0F);
     for (int64_t step = 0; step < in_channels; ++step) {
       const int64_t ic = reverse_ic ? in_channels - 1 - step : step;
       const int64_t g = ic / in_per_group;
       for (int64_t t = 0; t < in_len; ++t) {
-        const double value = in[static_cast<size_t>((n * in_channels + ic) * in_len + t)];
-        if (value == 0.0) continue;
+        const float value = in[static_cast<size_t>((n * in_channels + ic) * in_len + t)];
+        if (value == 0.0F) continue;
         for (int64_t oc = 0; oc < out_per_group; ++oc) {
           const int64_t dst_c = g * out_per_group + oc;
           for (int64_t k = 0; k < kernel; ++k) {
             acc[static_cast<size_t>(dst_c * full + t * a.stride + k * a.dilation)] +=
-                value * static_cast<double>(
-                            weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)]);
+                value * weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)];
           }
         }
       }
@@ -200,9 +210,9 @@ std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t b
     for (int64_t c = 0; c < out_channels; ++c) {
       for (int64_t t = 0; t < length; ++t) {
         const int64_t p = t + a.padding;
-        double value = p < full ? acc[static_cast<size_t>(c * full + p)] : 0.0;
+        float value = p < full ? acc[static_cast<size_t>(c * full + p)] : 0.0F;
         if (bias != nullptr) value += (*bias)[static_cast<size_t>(c)];
-        out[static_cast<size_t>((n * out_channels + c) * length + t)] = static_cast<float>(value);
+        out[static_cast<size_t>((n * out_channels + c) * length + t)] = value;
       }
     }
   }

@@ -870,7 +870,7 @@ Stop and return `BLOCKED` if:
 W1 through W8 produced the public information architecture defined by this
 spec. At campaign base `c8d926ea82bd6d8f5d6312693572c84234a6a7f3`, `docs/`
 contained 61 Markdown files and 25,322 lines. The integrated W8 head contains 88
-Markdown files and 19,269 lines. The 27 added files are 13 model recipes plus an
+Markdown files and 19,290 lines. The 27 added files are 13 model recipes plus an
 index, seven task guides plus an index, and four references plus an index.
 
 The two pages that had become chronological logs changed most:
@@ -919,8 +919,12 @@ Issue outcomes at W8 are:
 R1 through R5 passed after fresh review and repair waves. Negative mutations
 proved a broken index link, a missing checkpoint field, a missing manifest
 destination, a removed release anchor, and duplicate environment rows are
-detected. The branch was then integrated with main at `5870cb2bf` and the
-incoming keyed records were reconciled. The W8 implementer documentation and
+detected. The branch was first integrated with main at `5870cb2bf`, then
+reconciled through `origin/main` at `ebfbcb28c`. The later integration preserves
+the incoming F32 vocoder implementation and keyed records, while its new
+user-facing precision and device-validation facts live on the MiniMax-Music3
+model page instead of expanding `USAGE.md` back into a chronological log. The
+W8 implementer documentation and
 record gates pass at the outcome head; R6 and the operator's independent
 exact-head rerun are intentionally not claimed here. GPU, oracle,
 model-download, and quiet-host measurement gates are `NOT APPLICABLE` because

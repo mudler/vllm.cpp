@@ -164,6 +164,27 @@ The table separates leaf times, containing spans, call counts, and unattributed
 time. It is a within-run attribution tool, not a benchmark harness. See
 [benchmarks](../BENCHMARKS.md) for accepted measurements.
 
+## Vocoder precision and device selection
+
+MiniMax-Music3 shares its one-dimensional vocoder convolutions with MiniMax-H3,
+LTX-2.5, and IndexTTS-2.5. These operations now accumulate in F32, matching
+torch's float-convolution behavior. This changes waveform bytes compared with
+builds that used the earlier F64 accumulator, but every committed model golden
+still passes at its existing tolerance; no tolerance was widened.
+
+Set `VLLM_CPP_VOCODER_DEVICE=cuda` to request the CUDA providers for
+`vt::Conv1d` and `vt::ConvTranspose1d`. The default remains `cpu`. The setting
+accepts any device name known to `vt`, but the build must contain providers for
+that device or startup refuses the request instead of falling back silently.
+
+The CPU and CUDA implementations use the same F32 operation order and are
+intended to be byte-identical. Their earlier F64 implementations passed a
+`memcmp` gate on Jetson Thor, but that CPU-versus-CUDA gate has not been rerun
+since the accumulator changed to F32. Treat the current CUDA vocoder arm as
+unverified until that device gate is repeated. See the
+[F32 accumulator specification](../../.agents/specs/vt-conv1d-f32-accumulator.md)
+for the precision evidence and outstanding device measurement.
+
 ## Run the checkpoint gates
 
 ```sh

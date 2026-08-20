@@ -2399,6 +2399,34 @@ target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
 target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
 
+# ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
+# `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
+# `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier
+# harnesses for that row lived in prose only, so no reader could re-derive one
+# figure and three rounds of certified constants each failed to reproduce.
+#
+# CI COMPILES IT AND RUNS NOTHING, and that is not an oversight. The row's own
+# ruling is that a growth assertion over these figures is NOT viable on a shared
+# runner, so there is nothing here for CI to decide; and one leg on the O(n^2)
+# code costs tens of seconds of one core, which no test tier should spend. What
+# CI does buy is that the file cannot rot behind a `Tokenizer::Encode` or
+# `FromHfJson` signature change while still being the only artifact a reader can
+# reproduce the row's numbers from — the #1246 failure, where the sole named
+# harness for a measurement was compiled by nothing.
+#
+# An OBJECT library, like `vllm_music3_depth_stage_ab_*` above and unlike
+# `vllm_music3_vocoder_conv_ab`: the recorded run recipe in the file's own header
+# compiles the four tokenizer translation units directly with `g++` rather than
+# linking `libvllm.a`, so a linked target here would guard nothing the compile
+# does not and would only add an entry point nobody calls.
+add_library(vllm_bpe_encode_cost OBJECT tools/bench/bpe_encode_cost.cpp)
+target_include_directories(vllm_bpe_encode_cost PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_bpe_encode_cost SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_bpe_encode_cost PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_bpe_encode_cost)
+
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and
 # reach internal C++ symbols). Here we ALSO package a SHARED libvllm.so that

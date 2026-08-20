@@ -37,6 +37,7 @@
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"   // RunMoeBlock (SEAM GAP #2)
+#include "vllm/model_executor/models/step_token_ids.h"   // #1305: the slot's device ids
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W3: the shared capture seam
@@ -116,13 +117,39 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
 // and it consumes the HOST token_ids. The graph driver runs this per step into
 // its PERSISTENT hidden buffer, then captures/replays ForwardLayers over that
 // fixed hidden address.
+// #1305 — THE SCOPED DEVICE-ID OVERRIDE is consumed here, once per forward.
+// `ForwardQwen3MoeForCausalLM` publishes `ModelForwardInput::device_token_ids`
+// through `detail::DeviceTokenIdsScope`; it is null on every path except the
+// asynchronous CUDA runner, where the combine has already spliced each decode
+// row's sampled token into the DEVICE identifiers and left the host vector
+// deliberately stale. Both readers below —
+// `detail::TakeDeviceTokenIds` on the graph path and
+// `detail::ApplyDeviceTokenIds` on the eager one — CLEAR it, so the first embed
+// in a forward is the one that gets it and a second, unrelated embed cannot be
+// handed another step's rows. Both live in `qwen3_5_internal.h` beside the scope
+// that publishes them, because four models consume it and each used to spell the
+// same two bodies out for itself.
+// EMBED FROM AN ALREADY-RESIDENT ID TENSOR. The decode-graph driver holds its
+// identifiers in a `vllm::StepTokenIds` whose device address is stable for the
+// life of the slot, so this arm takes the tensor instead of re-uploading a host
+// vector into a fresh per-step allocation.
+void EmbedInto(Dev d, DBuf& hidden, const Tensor& ids,
+               const Qwen3MoeWeights& weights, const HfConfig& config) {
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens,
+                               {config.vocab_size, config.hidden_size});
+  vt::Embedding(d.q, hidden.t(), dtab, ids);
+}
+
 void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
                const Qwen3MoeWeights& weights, const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens,
-                               {config.vocab_size, config.hidden_size});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+  // #1305: the eager arms of this model had the SAME defect as its graph arm —
+  // they embedded the host vector and never looked at the device mirror. The
+  // override's copy is enqueued on the main queue, so it is ordered AFTER the
+  // combine that produced it rather than racing it.
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3 moe embed");
+  EmbedInto(d, hidden, dids.t(), weights, config);
 }
 
 // The CAPTURABLE region: everything AFTER the embedding — the residual stream
@@ -414,6 +441,12 @@ struct Qwen3MoeDecodeGraph::Impl {
     CommonAttentionMetadata attn_meta;
     std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
+    // #1305: this slot's per-step input IDENTIFIERS, in a device buffer whose
+    // address does not move, refreshed through `vt::PersistentStepInput` from the
+    // padded host vector and then from the runner's device mirror when it is
+    // live. Before it, every arm below re-uploaded the HOST vector into a fresh
+    // allocation and the mirror was never read at all.
+    StepTokenIds ids;
     // ENG-CUDAGRAPH-BREAK W3 (#1291): the instantiated graph, its handle
     // ownership, its release and its `captured()` state now live in the shared
     // seam instead of in a raw `void*` plus a `bool` this driver maintained by
@@ -498,6 +531,17 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam);
   s.fa_cols = cols;
+  // #1305 — THE IDENTIFIERS, ON THE SEAM. Bind this padded size's device
+  // destination once, then refresh it for this step: the padded host vector
+  // first (authoritative for the inert padding rows and for every row when no
+  // mirror is live), and then the runner's DEVICE identifiers over the real
+  // prefix when the asynchronous combine has patched them there. Both copies are
+  // enqueued on the main queue, so the second is ordered after the combine
+  // instead of racing it, and all three arms below embed from the SAME stable
+  // address.
+  const detail::DeviceTokenIds ov = detail::TakeDeviceTokenIds();
+  s.ids.Ensure(d, S);
+  s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
   if (cols_changed && s.graph.captured()) {
     // Reset() releases every segment through Backend::DestroyGraph and returns
     // the container to its as-constructed state, which is also what lets the
@@ -510,7 +554,7 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, then relaunch the captured layer region.
   if (s.graph.captured()) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights, impl_->config);
     // Through the seam's container, never `Backend::ReplayGraph` directly: the
     // container replays its segments in order (one, here, because a decode
     // capture is kFull) and owns the G3 replay counter the reachability gate
@@ -525,7 +569,7 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   // this size by the previous (eager) step. CAPTURE the layer region once,
   // instantiate the graph, then launch it.
   if (s.warm) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights, impl_->config);
     // ENG-CUDAGRAPH-BREAK W3 (#1291): the capture is the SHARED SEAM's, not this
     // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
     // the segment, the handle, its release, the drain a mid-capture throw needs
@@ -610,7 +654,7 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   // per-shape scratch for this size) and defer capture to the next same-size
   // step. This is a real decode step — nothing is wasted.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
-  EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
                           impl_->weights, impl_->config, kNoGather);
   s.warm = true;

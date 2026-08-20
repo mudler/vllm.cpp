@@ -61,7 +61,7 @@ are our reading of their documented behavior, not measurements.
 | Scratch allocator keyed by device (two backends, one process) | ✅ since [#516](https://github.com/mudler/vllm.cpp/issues/516); a pool is bound to one backend and refuses any other, and a backend with no registered platform is refused rather than given another's residency cap | ✅ device is field 0 of the allocation handle | ✅ | ✅ |
 | Automatic memory sizing (no hand-tuned budget) | ☐ hand-typed block count | ☐ percent, hand-tuned | ☐ | ◐ |
 | Memory cap with a pre-flight error instead of an OOM | ☐ | ◐ KV pool only | ◐ | ☐ |
-| Routed-expert weight streaming from disk | ◐ default OFF (`VT_MOE_EXPERT_STREAM=1`), CPU keep-quant towers only; bounded slot cache; refuses an unfittable slice by name. c1-c4 capacity, not throughput. One `[expert-stream]` line on a clean exit IF a store existed | ☐ blanket `cpu_offload_gb`, not expert-granular | ☐ | ◐ mmap only |
+| Routed-expert weight streaming from disk | ◐ default OFF (`VT_MOE_EXPERT_STREAM=1`), keep-quant/keep-f16 towers (#1378); bounded slot cache; refuses an unfittable slice by name. c1-c4 capacity, not throughput. CPU, plus a host-readable staging device (#1124) | ☐ blanket `cpu_offload_gb`, not expert-granular | ☐ | ◐ mmap only |
 
 ## Quantization and weight formats
 

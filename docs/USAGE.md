@@ -471,6 +471,29 @@ two edits back gives the GPT-4o row above, so the two share one scanner's
 character classes but stay separate patterns: they disagree on `don't` and on
 every digit run longer than one.
 
+### Timing an encode on your own box
+
+`tools/bench/bpe_encode_cost.cpp` times `Tokenizer::Encode` on one synthetic
+input, at the sizes you name, through a `tokenizer.json` you name. Use it when
+you want to know what a prompt of some shape costs to tokenize here, or to
+re-derive a figure somebody else recorded instead of trusting it.
+
+Nothing RUNS it: it is registered as no test and it is not a gate. Both halves
+of that are deliberate — a growth ratio over these timings is not stable enough
+to gate on a shared machine, and one leg on a long single-class input can cost
+tens of seconds of one core. It IS compiled, as the never-linked OBJECT library
+`vllm_bpe_encode_cost`, so it cannot rot behind a `Tokenizer::Encode` or
+`FromHfJson` signature change while still being the artifact those figures are
+reproducible from. Its header carries the exact `g++` and run lines; it builds
+from the four tokenizer translation units directly and needs no `libvllm.a`.
+
+It prints one row per case and size, with the ids it produced and the
+1/5/15-minute load average sampled around each row, under a banner saying the
+output is a session reading and not a bound. Read it that way: on a 20-core box
+the same input on the same binary has read 1.7x apart on load alone, while the
+id counts came back identical. Quote a number from it only with its load beside
+it, and take the minimum of several repetitions rather than one shot.
+
 ### How much memory a Vulkan load needs
 
 On a unified-memory device (a DGX Spark) the Vulkan heap and system RAM are the
@@ -4413,10 +4436,82 @@ save.
 
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
-VT_MOE_EXPERT_STREAM_SLOTS=8000 \
+VT_MOE_EXPERT_STREAM_SLOTS=4000 \
   ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
+
+### Which device can serve it
+
+`--device cpu` serves this today, and that is the arm every published number for
+this checkpoint was measured on.
+
+`--device cuda` refuses at load, by design, when the weights cannot be staged
+into device memory (issue
+[#1123](https://github.com/mudler/vllm.cpp/issues/1123)). The message names the
+byte counts on both sides. That refusal is now **conditional on the lane**
+(`ENG-EXPERT-STREAM-DEVICE` W0d, issue
+[#1124](https://github.com/mudler/vllm.cpp/issues/1124)): with expert streaming
+on, on a device whose kernels can dereference host memory, **and on a model
+family that actually streams its experts**, the routed-expert towers are not
+staged at all — their slices are read from the host slot store in place — so
+what has to fit is the NON-expert remainder plus the slot arena rather than the
+whole file.
+
+Four limits, stated plainly rather than left to be discovered.
+
+* **The device has to be probed capable, and most are not.** The condition is
+  `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
+  unified part. A DISCRETE card answers false, keeps staging every tower and
+  keeps the refusal. That is deliberate: a slot store the card cannot read is
+  not a lane, and giving it one is later work on the same row.
+* **The model has to be one of the families whose forward reads experts through
+  the slot seam.** Today that is the Qwen3.5 MoE family:
+  `Qwen3_5MoeForConditionalGeneration` and `Qwen3_5MoeForCausalLM`, which share
+  one factory and one MoE block, and which a `qwen35moe` GGUF resolves to.
+  `Qwen3MoeForCausalLM` (Qwen3-Coder) declares the same capability truthfully
+  and NO GGUF load can reach it, because no `general.architecture` maps onto it
+  — that gap is listed under `## Owed` in the row's spec. Every other
+  architecture keeps the whole bound and keeps the refusal even with
+  `VT_MOE_EXPERT_STREAM=1` set. `DeepseekV4ForCausalLM` is the case to have in
+  mind: a `deepseek4` GGUF loads, its export carries the same `_exps.weight`
+  tensor names, and its forward stages every one of those towers, so charging
+  the device for a slot arena instead would under-count what the load really
+  needs and turn a correct refusal into an out-of-memory first forward.
+  `LagunaForCausalLM` is NOT that case and is not evidence for anything here: no
+  `laguna` GGUF architecture arm exists, so a Laguna GGUF is refused as an
+  unsupported architecture well before this check runs.
+* **The checkpoint's expert towers have to KEEP the form the file stores them
+  in, which means keep-quant OR keep-f16.** Those are the two residencies that
+  read experts a slice at a time, and they are one arm rather than two: the
+  loader sends both into the same stacked tower (`LoadExpertsStackedKq`), and the
+  slice seam sizes a row with `vt::RowSizeBytes` and so never looks at the dtype.
+  An F16 expert tower therefore gets the lane, and an operator holding one should
+  not read this section and predict a refusal. The fp4-resident and the
+  expand-to-bf16 arms of the same loader stage every tower like any other weight.
+  So `VT_GGUF_KEEP_QUANT=0` — which turns keep-f16 off with it, because keep-f16
+  rides the same condition — and an NVFP4 GGUF both keep the whole bound and keep
+  the refusal on a device and a model that otherwise qualify. This is checked per
+  file, against the residency this process resolved, and a file that mixes a kept
+  tower with a staged one keeps the whole bound as well (issue
+  [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
+* **The load now succeeds and the generation does not, so there is still no
+  speed claim.** The measurement ran on the one machine that answers true
+  (GB10, 2026-08-18) and it split: `--device cuda` loads this checkpoint in
+  255-272 s, which it could not do before, and then exhausts the machine inside
+  its first forward without emitting a token
+  ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)). The slot arena is
+  measurably not the cause — a 64-slot 0.15 GiB arena fails exactly where an
+  8000-slot 18.55 GiB one does — so raising or lowering
+  `VT_MOE_EXPERT_STREAM_SLOTS` will not get you a token. **Use `--device cpu`
+  for this checkpoint today.** That arm serves it at a steady **11.05 s/token
+  at 4000 slots**, which is the count both recipes in this section set and the
+  only count that figure holds for. The same binary at 8000 slots measured a
+  39.98-45.40 s/token median over two runs, and the second of them consumed all
+  30,625 MiB of the box's swap, so **more slots is not a free knob here**: the
+  extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
+  mapping is served out of. Read `docs/BENCHMARKS.md` before assuming the GPU is
+  the faster arm here.
 
 ### The same thing as config, and which one wins
 
@@ -4430,7 +4525,7 @@ below that, where weights stay borrowed out of the file mapping.
 ```sh
 ./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
-                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+                                 "expert_stream":{"enabled":true,"slots":4000}}}'
 ```
 
 | Key | Environment equivalent | Default |

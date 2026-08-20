@@ -191,6 +191,47 @@ at its 90-minute ceiling and its partial tree was removed.
 - Stop if a correction needs an edit to an existing `.agents/issue-index.md`
   row. That file is append-only.
 
+## The durable wheel is NOT installable under the name it was staged with
+
+Measured 2026-08-19 on `dgx:gpu0`, run `/workspace/a2q1-neartie/20260819T215514Z`
+([#1416](https://github.com/mudler/vllm.cpp/issues/1416)). The artifact this spec
+calls durable is staged as
+`vllm-0.1.dev1+g555967922-FLASHINFER-ONLY-cp312-cp312-linux_aarch64.whl`, and
+`pip` refuses it before opening the file:
+
+```
+ERROR: Invalid wheel filename (wrong number of parts):
+'vllm-0.1.dev1+g555967922-FLASHINFER-ONLY-cp312-cp312-linux_aarch64'
+```
+
+PEP 427 allows five `-`-separated parts, six with a build tag. The
+`FLASHINFER-ONLY` marker adds two more, so
+`packaging.utils.parse_wheel_filename` raises `InvalidWheelFilename`. The bytes
+are unaffected: the wheel's `METADATA` version is `0.1.dev1+g555967922`, exactly
+what a conforming name carries.
+
+**Copy to a conforming name; do not rename the staged artifact**, whose name is
+what identifies it to a reader:
+
+```sh
+WHEEL_OK=/tmp/vllm-0.1.dev1+g555967922-cp312-cp312-linux_aarch64.whl
+cp "$WHEEL" "$WHEEL_OK" && pip install "$WHEEL_OK"
+```
+
+**Two facts about WHERE this failure lands, because they are what made it
+expensive.** `pip install -q torch==2.13.0` must run first and takes about
+thirteen minutes, so `RC[pip wheel]=1` arrives long after the job looks healthy;
+and a driver that does not stop there reports the failure only as
+`ModuleNotFoundError: No module named 'vllm'` at the measurement step. That is an
+infrastructure failure presenting as a verdict about the model, which is the
+shape this repository has been caught by before. A lease driver that installs
+this wheel therefore asserts the identity and **exits** on failure rather than
+continuing.
+
+Everything else in that job was green, so nothing else here is in doubt:
+`RC[apt-get install]=0`, `nvcc` already present at `cuda_13.0.r13.0` with no
+install needed, `RC[pip torch]=0`, and `cuda True NVIDIA GB10`.
+
 ## Owed
 
 - [#1185](https://github.com/mudler/vllm.cpp/issues/1185) stays open.

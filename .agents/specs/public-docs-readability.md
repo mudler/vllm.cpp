@@ -11,8 +11,9 @@ The developer approved one campaign in one pull request. The spec and
 implementation use that pull request. The operator can merge the verified
 documentation-only pull request without waiting for continuous integration.
 
-The next action is W1, the content inventory and destination map. No public
-document changes in this spec commit.
+W1 is complete. The migration manifest accounts for 275 campaign-base H1, H2,
+and H3 headings. W2 establishes the directories, indexes, and generic usage
+path.
 
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
@@ -233,6 +234,346 @@ Never delete the only copy of:
 - an accepted, failed, pending, or void measurement;
 - a reproduction command or environment condition;
 - the reason for a narrow project divergence.
+
+## W1 migration manifest
+
+This manifest accounts for the campaign-base H1, H2, and H3 headings. A source
+line identifies headings that have the same text. `Owner` is required for
+`archived` and `stale` entries. `n/a` means that the destination remains public.
+
+| Source section | Class | Exact destination | Disposition | Evidence or owner |
+|---|---|---|---|---|
+| `README.md:38` ## News | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:84` ## Performance | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
+| `README.md:110` ### vs llama.cpp, on CPU, from the same GGUF file | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
+| `README.md:126` ### vs MLX-LM, on Apple M4, warm b=1 | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
+| `README.md:144` ### Speculative decoding | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
+| `README.md:160` ## Quickstart | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:183` ## Features: vLLM parity, then everything else | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `README.md:238` ## Supported models | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `README.md:303` ## Hardware | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `README.md:319` ## Build | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `README.md:339` ## Running inference (CLI) | Generic user procedure | `docs/USAGE.md` | `deduplicated` | `n/a` |
+| `README.md:348` ### Multimodal INPUT and video GENERATION | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:365` ## OpenAI-compatible server | Generic user procedure | `docs/USAGE.md` | `deduplicated` | `n/a` |
+| `README.md:386` ## Use it as a library (C API) | Generic user procedure | `docs/USAGE.md` | `deduplicated` | `n/a` |
+| `README.md:414` ## Why vllm.cpp | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:432` ## Documentation | Navigation index | `README.md` | `kept` | `n/a` |
+| `README.md:453` ## Credits, and what we borrow | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:480` ## Citation | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:496` ## Author | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:500` ## Trademarks | Public overview | `README.md` | `kept` | `n/a` |
+| `README.md:515` ## License | Public overview | `README.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:1` # Benchmarks <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished --> | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:3` ## At a glance: W5/W6 green; validated release artifacts pending | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:41` ## vLLM, online serving | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:63` ### GDN prefill kernels by GPU | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:72` ### Qwen3.6-27B by concurrency | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:99` ### Qwen3.6-27B NVFP4 `nvidia` @`0893e160` by concurrency (ModelOpt) | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:142` ### Qwen3.6-35B-A3B by concurrency | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:196` ### Qwen3.8-27B (bf16) by concurrency | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:232` ### Qwen3.8-27B quantized arms, both gates PENDING and no number quoted | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:241` ### DeepSeek-V2-Lite (MLA) | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:260` ### Laguna-S-2.1 (NVFP4) | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:291` ## Memory | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:308` ## llama.cpp, CPU | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:353` ## MLX-LM, Apple M4 | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:368` ## DwarfStar, GGUF | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:419` ## Speculative decoding | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:432` ## How we measure | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:494` ## Open gaps | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BENCHMARKS.md:561` ## Reproduce | Measurement | `docs/BENCHMARKS.md` | `kept` | `n/a` |
+| `docs/BUILD.md:1` # Building vllm.cpp | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:9` ## Build out-of-source | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:22` ## CPU build (the correctness / CI reference) | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:33` ## CUDA build (NVIDIA GB10 / DGX Spark) | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:49` ### CUTLASS: the one external build dependency | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:80` ### Other CUDA families | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:102` ## Metal build (Apple Silicon) | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:117` ## Vulkan build | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:127` ## Tenstorrent build (Blackhole) | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:146` ## ROCm build (AMD GPUs) — community-verified W0, blind F6 fix | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:192` ## Nix shells | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:216` ## CMake options | Generic user procedure | `docs/BUILD.md` | `kept` | `n/a` |
+| `docs/BUILD.md:243` ## Backend and hardware state | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `docs/BUILD.md:267` ## Quantization formats | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `docs/BUILD.md:277` ## Environment variables | Dense lookup material | `docs/ENVIRONMENT.md` | `deduplicated` | `n/a` |
+| `docs/ENVIRONMENT.md:1` # Environment variables | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:14` ## Six of these are also config keys, and the environment wins | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:59` ## Deployment knobs | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:86` ## GGUF loading | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:102` ## MoE expert streaming (CPU) | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:133` ## Rollback and bisect switches | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:235` ## Diagnostic | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:268` ## ROCm + Gemma-4 residency (contributor #140) | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:296` ## Kernel-internal knobs (deferred) | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/ENVIRONMENT.md:308` ## Keeping this reference honest | Dense lookup material | `docs/ENVIRONMENT.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:1` # Features <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished --> | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:18` ## At a glance | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:32` ## Serving and scheduling | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:48` ## KV cache and memory | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:66` ## Quantization and weight formats | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:93` ## Model coverage | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:114` ### Registered architectures | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:156` ### Standalone and non-registered lanes | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:193` ### Inventoried but blocked | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:213` ## Multimodal | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:234` ## Speculative decoding | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:248` ## Structured output and tool calling | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:262` ## Backends and hardware | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:294` ## Serving, API and operations | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:334` ## Parallelism and scale-out | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:352` ## Not supported yet | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/FEATURES.md:373` ## How to read this page | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:1` # KV offload and external KV caches | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:15` ## The flag | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:37` ## LMCache (`lm://` remote KV), the connector that works end to end | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:87` ### Identity and refusal | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:104` ## CPU + disk offload (`OffloadingConnector`), REFUSED by the engine today | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:136` ## Limitations | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:165` ## Consuming it programmatically | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/RELEASES.md:1` # Binary releases | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
+| `docs/RELEASES.md:12` ## Primary downloads | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
+| `docs/RELEASES.md:35` ## Verify a download | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
+| `docs/RELEASES.md:52` ## Retention | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
+| `docs/RELEASES.md:59` ## Maintainer flow | Contributor procedure | `.agents/specs/release-binary-matrix.md` | `archived` | `.agents/specs/release-binary-matrix.md` |
+| `docs/ROCM.md:1` # ROCm (AMD GPU) backend — contributor guide | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:31` ## 1. Why ROCm is the cheapest backend to add | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:59` ## 2. What a backend is, file by file | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:100` ## 3. Correctness before kernels: the reference tier | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:124` ### 3.1 The F6 fix: unified memory true by construction (approach (b)) | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:171` ## 4. Pick your first task from your hardware | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:184` ## 5. Milestones as concrete PRs | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:237` ### 5.1 Known runtime issues on the #41 boards | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:254` ### 5.2 The sequence for board owners, post-F6-fix | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:320` ## 6. What not to port | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:335` ## 7. Working with the record | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:354` ## 8. CI gates your PR will hit | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/ROCM.md:376` ## 9. Asking | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:1` # SGLang-compatible behaviors | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:25` ## 1. RadixAttention (automatic prefix caching) | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:73` ## 2. LPM cache-aware scheduling | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:120` ## 3. Jump-forward decoding | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:172` ## 4. Custom logits processors | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:208` ## When to enable (guidance) | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SGLANG-COMPAT.md:236` ## Default inertness | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:1` # Speculative decoding | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:11` ## Methods | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:27` ## Which keys the JSON accepts | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:60` ## MTP | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:98` ## DFlash (block diffusion) | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:114` ## n-gram | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:128` ## DSpark (semi-autoregressive block drafting) — in progress | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:175` ### Which DSpark draft the loader will take | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:202` ## The flag | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:237` ## Measured result | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:257` ## Concurrency above 1 | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:267` ## Limitations | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:304` ## Consuming it programmatically | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/STATUS.md:1` # vllm.cpp status | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:20` ## Parity pin | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:60` ## Capability status | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:352` ## Speculative decoding | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:663` ## Not supported yet | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:846` ## Model family notes | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:848` ### Gemma | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:932` ### OLMo | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:948` ### Frontier and hardware-blocked families | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:1720` ### Recent dense batch | Design or implementation history | `.agents/specs/roadmap-v1-completion.md` | `archived` | `.agents/specs/roadmap-v1-completion.md` |
+| `docs/STATUS.md:1786` ## Build and test lanes | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:1879` ## Performance detail | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
+| `docs/STATUS.md:1946` ## Backend detail | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `docs/STATUS.md:2225` ## Serving and API notes | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
+| `docs/STATUS.md:2619` ## Verification and parity | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
+| `docs/STATUS.md:2681` ### Feature-gap map vs pinned vLLM 0.26 (2026-07-28) | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
+| `docs/STATUS.md:2752` ## Upstream sync 2026-07-30 (`555967922..e04a30a77`, 198 commits) | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
+| `docs/USAGE.md:1` # Using vllm.cpp | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:9` ## Building | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:25` ### Host compilers | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:41` ### Setting the compiled build identity | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:57` ### One ROCm-specific behaviour | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:72` ### ROCm op coverage is incremental (and throws are by design) | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:104` ### CUTLASS is fetched as headers only | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:118` ## Confirming which CUDA architecture a build targets | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:142` ### FlashAttention-2 is used only where the build compiled it | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:168` ### A DISABLED feature removes its kernels, not the ops that do not need it | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
+| `docs/USAGE.md:193` ## Using more than one engine in a process | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:233` ## Starting an agent-assisted contribution | Contributor procedure | `.agents/porting.md` | `archived` | `.agents/porting.md` |
+| `docs/USAGE.md:261` ### `.env`: your values, and what happens when it is missing | Contributor procedure | `.agents/porting.md` | `archived` | `.agents/porting.md` |
+| `docs/USAGE.md:295` ### `GPU_LOCK`: one file mutex, and only one | Contributor procedure | `.agents/porting.md` | `archived` | `.agents/porting.md` |
+| `docs/USAGE.md:325` ## Running inference (CLI) | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:445` ### Which HF tokenizers load | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:474` ### Timing an encode on your own box | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:497` ### How much memory a Vulkan load needs | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:557` ### Running the vocoder convolutions on the GPU | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:583` ### How long a load takes, and how to see where it goes | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:620` ### Quantized checkpoints: which `lm_head` forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:648` ### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:771` ### A per-tensor scale has to be one F32 number | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:796` ### One load refusal that is about this code, not your checkpoint | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:819` ### A refusal that names the attention backend, and what it cannot tell you | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:883` ### Architectures that resolve but refuse to run | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:909` ### LTX-2.5: what runs, and what it cannot do | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1102` ### Where the render spent its wall: `phase-log.json` | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1188` ### While the render runs: the `[render]` lines | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1415` ### The DFR pipeline: `--pipeline-kind dfr` | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1455` ### LTX-2.5 text-to-audio: a render with no picture | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1536` ### LTX-2.5 video guidance: `--pipeline-kind one_stage` | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1786` ### GDN checkpoints: the `output_gate_type` key | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1810` ### Muse Glimmer: exactly what has been checked | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1852` ## OpenAI-compatible server | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:1975` ### Selecting an x86 CPU ISA tier | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1993` ### NVFP4 dense sinks | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2032` ### The NVFP4 output head | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2060` ### Validating a staged release archive | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2104` ## HuggingFace cache and credentials | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2170` ## Container images | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2208` ### Picking the right flags for your GPU | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2235` ### If the server exits at startup | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2243` ### Building and validating an image locally | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2300` ### Endpoints | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2412` ### Speech and music generation | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:2872` ### `max_tokens`: what a non-positive value means | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2886` ### Which token ids stop a generation | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2908` ### Server flags | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3044` ## DSpark drafts: the exact checkpoints | Model recipe | `docs/models/dspark.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3089` ## Muse Glimmer 30B from a GGUF k-quant | Model recipe | `docs/models/muse-glimmer.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3142` ## Nemotron-3.5-Lightning-30B: the exact weights, and which arms run | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3159` ### The checkpoint | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3186` ### The arms, and what each one costs you today | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3208` ### What has NOT been measured | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3216` ## MiniMax-H3: video + audio generation | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3218` ### The exact weights (so a render is reproducible) | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3245` ### The PRUNED checkpoints — more precision for the same footprint | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3285` ### The trap: this checkpoint does not serve every task | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3333` ### Writing the prompt (read this first) | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3392` ### Request fields | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3424` ### Video and audio references (`metadata`) | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3470` ### The job lifecycle | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3487` ### Video family, and family-specific load knobs | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3528` ## Consuming it as a library (C ABI) | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:3603` ## Consuming it from C++ | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:3797` ### KV-cache events, and `kv_cache_report_mode` | Dense lookup material | `docs/reference/c-api.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3830` ## Multimodal input (image, video, audio to text) | Cross-model workflow | `docs/guides/multimodal-input.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3857` ### The second GGUF file: a `clip` multimodal projector | Cross-model workflow | `docs/guides/multimodal-input.md` | `moved` | `n/a` |
+| `docs/USAGE.md:3983` ### `unsloth/Qwen3.8-27B-NVFP4` — what it is, and which arm is refused | Cross-model workflow | `docs/guides/multimodal-input.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4043` ### Per-prompt input limits | Cross-model workflow | `docs/guides/multimodal-input.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4094` ## MiniMax-H3 browser console (`vllm-video-studio`) | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4118` ## MiniMax-H3: video + audio generation | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4202` ## LTX-2.5: reproducing the DiT parity gate | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4274` ### The Gemma-4 text tower gate, and the interpreter it needs | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4345` ### `res2s_two_stage`: the high-quality preset, and why it is a sampler | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4392` ### Audio-to-video: rendering a clip around a soundtrack you supply | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4475` ### `ti2vid_two_stage`: the plain two-stage pipeline | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4542` ### `keyframe_interpolation`: generating the motion between pinned frames | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4618` ### Retake: regenerating a time window of an existing clip | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4663` ## LTX-2.5 quantized loaders | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4745` ### The DiT is not always quantized, and the FULL model never is | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:4782` ### LTX-2.5 DiT weights: which file, and how to tell them apart | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4841` ## Streaming routed experts from disk (capacity mode) | Cross-model workflow | `docs/guides/expert-streaming.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4857` ### Which device can serve it | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
+| `docs/USAGE.md:4953` ### The same thing as config, and which one wins | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5122` ### `--device cuda` refuses a checkpoint it cannot hold | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5200` ## Qwen3.8-2.4T-A95B `UD-Q1_0`: 370 GiB served from a 119 GiB box | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5226` ### The exact weights | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5275` ### Build and serve | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:5333` ### What the load costs | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5377` ### What decode costs, and why the ceiling is where it is | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5427` ### What this does not establish | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5444` ## Turning CUDA graph capture off, including the break seam | Cross-model workflow | `docs/guides/cuda-graph-control.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5545` ## SSE keepalives on long prefill | Cross-model workflow | `docs/guides/server-sse.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5590` ## Gemma4 FP8 on ROCm (RDNA4) | Model recipe | `docs/models/gemma-4.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5620` ## LTX-2.5 text conditioning | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5676` ## MiniMax-Music3: the exact weights (so a song is reproducible) | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5686` ### The arm that loads: `diffusers`, bf16 + fp32 | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5723` ### The arm that is REFUSED: the native `.pth` layout | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5739` ### The quantized arm that IS implemented: GGUF Q4_K, one component | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5754` ### The quantized arms that are REFUSED — and they are all third-party | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5782` ## MiniMax-Music3: the checkpoint loader | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5844` ### Running its gate | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:5874` ### MiniMax-Music3: the quantized arms | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5960` ### IndexTTS-2.5 goldens and checkpoint manifests | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:6034` ## MiniMax-Music3: the autoregressive half | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:6044` ### The token gate the spec promised does not exist | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6060` ### Running the gates | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6092` ### Two things that will bite a later phase | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6119` ## MiniMax-Music3: the acoustic half | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:6137` ### There is no token gate on this half, and that is not a gap | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6145` ### Running the gates | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6185` ### Three things that will bite a later phase | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6214` ## MiniMax-Music3: the language model, and the end-to-end path | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:6221` ### The `inputs_embeds` entry the dense path did not have | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:6248` ### `num_condition_layers: 8` does not mean eight transformer layers | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:6256` ### Running the gates | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:6284` ### Why no gate compares a generated song to the oracle's | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
+| `docs/WEIGHT-OFFLOAD.md:1` # Weight offload | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:17` ## What works today | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:39` ## The flag | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:50` ### Fields | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:62` ### Targeting by name segment | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:79` ### The two empty-set defaults are not the same | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:86` ## What the engine refuses, and what it only warns about | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:99` ### The model has to claim support, and none does yet | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:129` ## Why the budget can overshoot by one weight | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:136` ## Limitations | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:148` ## Consuming it programmatically | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+
+Campaign-base heading count: `275`.
+
+
+### Duplicate sections
+
+`docs/USAGE.md` contains two H2 sections named `MiniMax-H3: video + audio
+generation`. Both move to `docs/models/minimax-h3.md`. W3 combines their user
+procedures and removes repeated facts. Five MiniMax-Music3 H2 sections move to
+`docs/models/minimax-music3.md`. Their gate narratives and later-phase notes
+already belong to `.agents/specs/minimax-music3.md`. W3 archives those parts
+and keeps the public checkpoint, command, limitation, and refusal facts.
+
+### W1 validation commands
+
+Run these commands from the campaign worktree. Each command exits nonzero when
+its stated condition fails.
+
+Resolve relative Markdown file links:
+
+```sh
+python3 -c 'import pathlib,re,sys,urllib.parse; fs=[pathlib.Path("README.md"),*pathlib.Path("docs").rglob("*.md")]; bad=[f"{p}: {t}" for p in fs for t in re.findall(r"(?<!!)\[[^]]*\]\(([^ )]+)",p.read_text()) if not re.match(r"(?:[a-z]+:|#|<|\{)",t) and not (p.parent/urllib.parse.unquote(t.partition("#")[0])).exists()]; print("\n".join(bad)); sys.exit(bool(bad))'
+```
+
+Require one H1 and correctly nested headings on each page under `docs/`. This
+command ignores fenced code. `README.md` keeps its existing HTML title:
+
+```sh
+python3 -c 'import pathlib,re,sys; bad=[]; fs=list(pathlib.Path("docs").rglob("*.md")); exec("for p in fs:\n fence=False; levels=[]\n for s in p.read_text().splitlines():\n  if s.startswith((\"```\",\"~~~\")): fence=not fence; continue\n  m=None if fence else re.match(r\"^(#{1,6}) \",s)\n  if m: levels.append(len(m.group(1)))\n if sum(x==1 for x in levels)!=1 or any(b>a+1 for a,b in zip(levels,levels[1:])): bad.append(str(p))"); print("\n".join(bad)); sys.exit(bool(bad))'
+```
+
+Require each extracted page in exactly one index:
+
+```sh
+python3 -c 'import pathlib,re,sys,collections; roots=[pathlib.Path("docs/models"),pathlib.Path("docs/guides"),pathlib.Path("docs/reference")]; pages=[p for r in roots if r.exists() for p in r.glob("*.md")]; indexes=[pathlib.Path("docs/USAGE.md"),*[r/"README.md" for r in roots if (r/"README.md").exists()]]; links=collections.Counter((i.parent/pathlib.Path(t.partition("#")[0])).resolve() for i in indexes for t in re.findall(r"(?<!!)\[[^]]*\]\(([^ )]+\.md(?:#[^ )]+)?)\)",i.read_text())); bad=[f"{p}: {links[p.resolve()]}" for p in pages if links[p.resolve()]!=1]; print("\n".join(bad)); sys.exit(bool(bad))'
+```
+
+Require seven nonempty fields in each checkpoint registry row:
+
+```sh
+python3 -c 'import pathlib,sys; s=pathlib.Path("docs/USAGE.md").read_text(); a=s.find("<!-- checkpoint-registry:begin -->"); b=s.find("<!-- checkpoint-registry:end -->"); rows=[] if a<0 or b<a else [x for x in s[a:b].splitlines() if x.startswith("|")][2:]; bad=[x for x in rows if len(x.split("|"))-2!=7 or any(not y.strip() for y in x.split("|")[1:-1])]; print("registry missing" if a<0 or b<a else "\n".join(bad)); sys.exit(a<0 or b<a or not rows or bool(bad))'
+```
+
+Compare the campaign-base and worktree fact inventories. The inventory includes
+SHA-256 values, flags, environment variables, measurements, and result states:
+
+```sh
+python3 -c 'import collections,pathlib,re,subprocess,sys; fs=["README.md",*[str(p) for p in pathlib.Path("docs").rglob("*.md")]]; pat=re.compile(r"(?:[0-9a-f]{64}|--[a-z0-9][a-z0-9-]*|\b[A-Z][A-Z0-9_]{2,}\b|\b\d+(?:\.\d+)?(?:x|%| GiB| MiB| ms| tok/s)\b|\b(?:REFUSED|PENDING|FAILED|VOID)\b)"); old=lambda p: subprocess.run(["git","show",f"c8d926ea82bd6d8f5d6312693572c84234a6a7f3:{p}"],text=True,capture_output=True).stdout; before=collections.Counter(x for p in fs for x in pat.findall(old(p))); after=collections.Counter(x for p in fs if pathlib.Path(p).exists() for x in pat.findall(pathlib.Path(p).read_text())); missing=before-after; print("\n".join(f"{k} {v}" for k,v in sorted(missing.items()))); sys.exit(bool(missing))'
+```
+
+Require one manifest row for each campaign-base H1, H2, and H3 heading. The
+command ignores fenced code and reports missing or extra source keys:
+
+```sh
+python3 -c 'import pathlib,re,subprocess,sys; spec=pathlib.Path(".agents/specs/public-docs-readability.md").read_text(); fs=["README.md",*[str(p) for p in sorted(pathlib.Path("docs").glob("*.md"))]]; expected=set(); exec("for p in fs:\n s=subprocess.run([\"git\",\"show\",f\"2dab92076:{p}\"],text=True,capture_output=True,check=True).stdout; fence=False\n for n,line in enumerate(s.splitlines(),1):\n  if line.startswith((\"```\",\"~~~\")): fence=not fence; continue\n  if not fence and re.match(r\"^#{1,3} \",line): expected.add(f\"{p}:{n}\")"); actual=set(re.findall(r"^\| `([^`]+:\d+)` #{1,3} ",spec,re.M)); bad=sorted((expected-actual)|(actual-expected)); print("\n".join(bad)); sys.exit(bool(bad))'
+```
 
 ## Writing rules
 

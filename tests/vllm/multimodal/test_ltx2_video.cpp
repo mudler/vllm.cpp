@@ -17,7 +17,6 @@
 // the pipeline resolved, that every value is finite, that the artifacts exist at
 // the sizes the result reports, and that every refusal fires by name.
 #include "vllm/multimodal/ltx2_video.h"
-#include "vllm/multimodal/render_phase_log.h"
 
 #include <doctest/doctest.h>
 
@@ -36,6 +35,9 @@
 #include <string>
 #include <vector>
 
+#include <chrono>
+#include <thread>
+
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -52,6 +54,7 @@
 #include "vt/backend.h"
 #include "vt/device.h"
 #include "vllm/multimodal/video_engine.h"
+#include "vllm/multimodal/render_phase_log.h"
 
 namespace {
 
@@ -2890,23 +2893,70 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 // lease on an idle box.
 //
 // WHAT IS ASSERTED INSTEAD NEEDS NO CLOCK AT ALL. A phase's name is tied to its
-// work STRUCTURALLY: `decode.audio` declares that it covers the audio decode,
-// which is exactly two calls — `Ltx2AudioDecoderForward` and
-// `Ltx2VocoderWithBweForward` — and those two calls carry scopes of their own.
-// So the assertion is CONTAINMENT: the interval of each sub-scope lies inside
-// the interval of the leaf that claims to cover it. Every number involved comes
-// from one clock in one run, and no threshold is crossed, so contention cannot
-// move the verdict. Mutation M4 detaches the name from the work and this fails
-// by six orders of magnitude.
+// work STRUCTURALLY: a leaf that claims to cover a piece of work must ENCLOSE
+// the scopes that sit on that work. Every number involved comes from one clock
+// in one run, and every threshold is a ratio of two intervals measured inside
+// the same contention window, so contention cannot move the verdict.
 //
-// AND A FLOOR, for the leaves that have no sub-scope to contain. A name with
-// nothing beneath it measures a pair of function calls, about a microsecond, so
-// requiring each of the three phases that CARRY this render to hold at least
-// 0.05% of the leaf sum separates "does the work" from "is a label" with three
-// orders of magnitude either side. It is a SHARE and never a second, because
-// the ratio is what survives this box. It is not applied to the bookkeeping
-// leaves — `generate.setup` and its neighbours are microseconds on any host and
-// are named for completeness, which is a fact about the driver and not a defect.
+// AND IT IS ASSERTED FOR ALL THREE CARRYING PHASES, which is the second fresh
+// review's finding. The first repair gave `decode.audio` two sub-scopes and left
+// `denoise` and `decode.video` held by a share floor alone. The reviewer then ran
+// M4's shape one level over, on the phase #1024 and #1087 are actually about:
+// close `denoise` after the first sampler step and open `phase.finish` there. No
+// overlap, no nesting, the sum untouched — **exit 0 on both cases, 99.94%
+// accounted, and 82% of the denoise charged to a neighbour**, with the emitted
+// table reporting `phase.finish` at 55.0% against a `denoise` of 6.0% on a run
+// whose honest denoise was 73.4%. A gate blind to that is a gate this campaign
+// cannot rank levers with, because W1 ranks them off this very table.
+//
+// So each carrying phase now carries an ANCHOR, and this case asserts four
+// things about it:
+//
+//   1. CONTAINMENT  every sub-scope interval lies inside one of the leaf's own
+//                   records. `denoise.step` wraps the denoiser evaluation inside
+//                   `Evaluate`, which every sampler arm reaches, so a `denoise`
+//                   that stops short of its loop no longer contains its steps.
+//                   `decode.video.chunk` ends when the streaming decoder hands a
+//                   chunk BACK, which is a production event and not an
+//                   instrument statement. `decode.audio.mel` and
+//                   `decode.audio.vocoder` wrap the two calls #1010 names.
+//   2. COVERAGE     the sub-scopes together account for nearly all of the leaf,
+//                   so a leaf that encloses its own work PLUS a phase nobody
+//                   named still fails. The threshold is per phase and is set
+//                   from what the anchor can see, not from a round number.
+//   3. EXCLUSIVITY  no OTHER leaf overlaps the window the sub-scopes span, apart
+//                   from a partner the driver genuinely interleaves with
+//                   (`artifacts.frames` alternates with `decode.video`, because
+//                   the decoder streams chunks into the writer's callback). This
+//                   is the assertion that catches the transfer directly: M7's
+//                   `phase.finish` opens in the middle of the denoise window.
+//   4. NON-OVERLAP  the carrying leaves and the writer never overlap each other.
+//
+// WHAT WAS TRIED FIRST AND REJECTED, MEASURED RATHER THAN ARGUED. The obvious
+// repair is a differential: render at two frame counts and require the phases
+// whose work scales with the clip to grow. It was written, built and run here,
+// and **this box cannot carry it**. Two renders of the same binary, minutes
+// apart, 9 frames against 33: the 9-frame render measured 8.03 s of leaves and
+// the 33-frame render 3.80 s — the 2.5x LONGER clip cost HALF the time, and an
+// earlier run of the same 9-frame render measured 4.80 s. Wall-clock noise here
+// is a factor of two in both directions, against a 2.5x signal, so a
+// seconds-differential is a coin flip wearing a gate. That is the same finding
+// `## Outcome — W0` already records at 76x, and it is why W1 is written as a
+// lease on an idle box.
+//
+// AND THE SHARE FLOOR STAYS, WITH ITS MARGIN NAMED RATHER THAN TIGHTENED. Each
+// carrying phase must still hold at least 0.05% of the leaf sum. That is a
+// backstop against a name with NOTHING beneath it — a detached leaf measures two
+// function calls, about a microsecond, five orders of magnitude below it — and
+// it is deliberately NOT tightened toward the measured share, because the
+// measured share is exactly the quantity this box destroys. The same binary at
+// the same geometry has reported `denoise` at 38.1% and at 73.4%,
+// `decode.audio` at 50.9% and at 16.7%, and `decode.video` at 5.27% and at
+// 2.13%. A floor set at "a fraction of the measured value" would be a flake, and
+// under M7 `denoise` sat at 6.0% and cleared any floor a quiet box could
+// justify. The floor is therefore a weak assertion ON PURPOSE, and the three
+// assertions above are what now bind. Read the floor as "this name is not
+// detached", never as "this phase is honest".
 namespace {
 
 // Every record of one name, in emitted (start-sorted) order.
@@ -2931,6 +2981,128 @@ std::map<std::string, double> LeafSecondsByName(const nlohmann::json& table) {
   return out;
 }
 
+struct NamedInterval {
+  std::string name;
+  double start = 0.0;
+  double end = 0.0;
+};
+
+// Every SUMMED leaf as an interval, in start order.
+std::vector<NamedInterval> LeafIntervals(const nlohmann::json& table) {
+  std::vector<NamedInterval> out;
+  for (const nlohmann::json& e : table["phases"]) {
+    if (e.value("span", false) || e.value("nested", false)) continue;
+    NamedInterval iv;
+    iv.name = e["name"].get<std::string>();
+    iv.start = e["start_seconds"].get<double>();
+    iv.end = e["end_seconds"].get<double>();
+    out.push_back(iv);
+  }
+  std::sort(out.begin(), out.end(),
+            [](const NamedInterval& a, const NamedInterval& b) { return a.start < b.start; });
+  return out;
+}
+
+// One carrying phase and the anchor that ties its name to its work.
+struct Carrying {
+  std::string leaf;                    // the name that claims the seconds
+  std::vector<std::string> parts;      // the nested sub-scopes sitting on the work
+  double min_coverage = 0.0;           // of the leaf's own seconds
+  std::vector<std::string> partners;   // leaves the driver genuinely interleaves with
+};
+
+// The four assertions above, for one carrying phase. A free function rather than
+// three copies, because `decode.video` has N leaves and M sub-scopes while
+// `decode.audio` has one of each, and a form that only handles the second is how
+// `denoise` came to be ungated in the first place.
+void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
+  INFO("carrying phase = " << c.leaf);
+  const std::vector<nlohmann::json> leaves = RecordsNamed(table, c.leaf);
+  REQUIRE_MESSAGE(!leaves.empty(), "the table names no '" << c.leaf << "' leaf at all");
+  double leaf_seconds = 0.0;
+  for (const nlohmann::json& r : leaves) {
+    REQUIRE_FALSE(r.value("span", false));
+    REQUIRE_FALSE(r.value("nested", false));
+    leaf_seconds += r["end_seconds"].get<double>() - r["start_seconds"].get<double>();
+  }
+  REQUIRE(leaf_seconds > 0.0);
+
+  // (1) CONTAINMENT, and the sub-scopes' own intervals.
+  std::vector<std::pair<double, double>> subs;
+  for (const std::string& part : c.parts) {
+    INFO("sub-scope = " << part);
+    const std::vector<nlohmann::json> found = RecordsNamed(table, part);
+    REQUIRE_MESSAGE(!found.empty(),
+                    "the table names no '" << part << "' record. It is the anchor that ties the '"
+                        << c.leaf << "' name to the work beneath it, and without it this phase is "
+                                     "held by a share floor alone");
+    for (const nlohmann::json& r : found) {
+      // Recorded as a decomposition, not as a partition: a nested record is
+      // excluded from `sum_leaf_seconds`, which is what lets the split exist at
+      // all without changing what the table adds up to.
+      CHECK_MESSAGE(r.value("nested", false),
+                    "'" << part << "' is not marked nested, so it is being SUMMED as well as the "
+                                   "leaf that contains it, and the table double counts");
+      const double start = r["start_seconds"].get<double>();
+      const double end = r["end_seconds"].get<double>();
+      bool inside = false;
+      for (const nlohmann::json& leaf : leaves) {
+        if (start >= leaf["start_seconds"].get<double>() - 1e-9 &&
+            end <= leaf["end_seconds"].get<double>() + 1e-9) {
+          inside = true;
+        }
+      }
+      CHECK_MESSAGE(inside, "'" << part << "' runs [" << start << ", " << end << "] and NO '"
+                                << c.leaf << "' leaf encloses it. The name and the work are in "
+                                             "different places, which is the whole defect this "
+                                             "case exists for");
+      subs.push_back({start, end});
+    }
+  }
+  REQUIRE(!subs.empty());
+  std::sort(subs.begin(), subs.end());
+  // The sub-scopes decompose one leaf, so they run in sequence and never overlap
+  // each other. Two that did would double count into the coverage below.
+  for (size_t i = 1; i < subs.size(); ++i) {
+    CHECK_MESSAGE(subs[i].first >= subs[i - 1].second - 1e-9,
+                  "two sub-scopes of '" << c.leaf << "' overlap: [" << subs[i - 1].first << ", "
+                      << subs[i - 1].second << "] and [" << subs[i].first << ", " << subs[i].second
+                      << "]");
+  }
+
+  // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
+  // named would satisfy containment while still hiding time.
+  double covered = 0.0;
+  for (const std::pair<double, double>& iv : subs) covered += iv.second - iv.first;
+  MESSAGE("  " << c.leaf << " = " << leaf_seconds << "s over " << leaves.size()
+               << " leaf record(s), of which " << subs.size() << " sub-scope(s) cover " << covered
+               << "s (" << (100.0 * covered / leaf_seconds) << "%)");
+  CHECK_MESSAGE(covered >= c.min_coverage * leaf_seconds,
+                "the named parts of '" << c.leaf << "' cover only " << covered << "s of its "
+                    << leaf_seconds << "s, under the " << (100.0 * c.min_coverage)
+                    << "% this phase's anchor is expected to reach. The rest is a phase nobody "
+                       "named, wearing this one's label");
+
+  // (3) EXCLUSIVITY. Nothing else may run in the window the anchor spans. This
+  // is the assertion that sees a TRANSFER directly rather than through a sum:
+  // M7 opens `phase.finish` in the middle of the denoise, and the denoise's own
+  // steps keep running around it.
+  const double window_start = subs.front().first;
+  const double window_end = subs.back().second;
+  for (const NamedInterval& iv : LeafIntervals(table)) {
+    if (iv.name == c.leaf) continue;
+    if (std::find(c.partners.begin(), c.partners.end(), iv.name) != c.partners.end()) continue;
+    // One bool, because doctest refuses to decompose a `||` inside an assertion.
+    const bool outside = iv.end <= window_start + 1e-9 || iv.start >= window_end - 1e-9;
+    CHECK_MESSAGE(outside,
+                  "the leaf '" << iv.name << "' runs [" << iv.start << ", " << iv.end
+                      << "], INSIDE the window that '" << c.leaf << "' work occupies ["
+                      << window_start << ", " << window_end
+                      << "]. Either the work is not where the name says, or a second name is "
+                         "charging itself for this phase's seconds");
+  }
+}
+
 }  // namespace
 
 TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
@@ -2950,61 +3122,42 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   REQUIRE_MESSAGE(!result.phase_log_path.empty(), "the render wrote no phase table");
   const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
 
-  // (1) CONTAINMENT. `decode.audio` claims to cover the audio decode. The audio
-  // decode is two models, and #1010 asks for the vocoder by name, so each has a
-  // scope: `decode.audio.mel` around `Ltx2AudioDecoderForward` and
-  // `decode.audio.vocoder` around `Ltx2VocoderWithBweForward`. If the leaf that
-  // claims to cover them does not enclose their intervals, the name is on
-  // somebody else's work — which is precisely what mutation M4 does, and the
-  // only thing in this file that detects it.
-  const std::vector<nlohmann::json> audio = RecordsNamed(table, "decode.audio");
-  REQUIRE_MESSAGE(audio.size() == 1, "the table names " << audio.size()
-                                                        << " 'decode.audio' leaves, expected 1");
-  const double audio_start = audio[0]["start_seconds"].get<double>();
-  const double audio_end = audio[0]["end_seconds"].get<double>();
-  double covered = 0.0;
-  double previous_end = audio_start;
-  for (const std::string part : {"decode.audio.mel", "decode.audio.vocoder"}) {
-    INFO("part = " << part);
-    const std::vector<nlohmann::json> found = RecordsNamed(table, part);
-    REQUIRE_MESSAGE(found.size() == 1,
-                    "the table names " << found.size() << " '" << part << "' records, expected 1. "
-                    "#1010 asks for the vocoder BY NAME and it used to be folded into "
-                    "'decode.audio' with the mel decode");
-    const nlohmann::json& r = found[0];
-    // Recorded as a decomposition, not as a partition: a nested record is
-    // excluded from `sum_leaf_seconds`, which is what lets the split exist at
-    // all without changing what the table adds up to.
-    CHECK_MESSAGE(r.value("nested", false),
-                  "'" << part << "' is not marked nested, so it is being SUMMED as well as the "
-                                 "leaf that contains it, and the table double counts");
-    const double start = r["start_seconds"].get<double>();
-    const double end = r["end_seconds"].get<double>();
-    CHECK_MESSAGE(start >= audio_start,
-                  "'" << part << "' starts at " << start << "s, BEFORE the 'decode.audio' leaf "
-                      << "that claims to cover it opens at " << audio_start << "s");
-    CHECK_MESSAGE(end <= audio_end,
-                  "'" << part << "' ends at " << end << "s, AFTER the 'decode.audio' leaf that "
-                      << "claims to cover it closes at " << audio_end
-                      << "s. The name and the work are in different places");
-    // The mel feeds the vocoder, so they run in that order and never overlap.
-    CHECK(start >= previous_end - 1e-9);
-    previous_end = end;
-    covered += end - start;
-  }
-  // And they cover it: a `decode.audio` leaf that enclosed the two calls plus a
-  // phase nobody named would satisfy containment while still hiding time.
-  const double audio_seconds = audio_end - audio_start;
-  MESSAGE("decode.audio = " << audio_seconds << "s, of which mel+vocoder cover " << covered
-                            << "s (" << (100.0 * covered / audio_seconds) << "%)");
-  CHECK_MESSAGE(covered >= 0.90 * audio_seconds,
-                "the two named halves of the audio decode cover only " << covered << "s of the "
-                    << audio_seconds << "s 'decode.audio' leaf, so a tenth of it is a phase "
-                                        "nobody named");
+  // (1)-(3) THE THREE PHASES THAT CARRY THIS RENDER, each with its anchor.
+  //
+  // The coverage thresholds are NOT round numbers and are not the same, because
+  // what each anchor can see differs:
+  //
+  //  * `decode.audio` is exactly two calls and the leaf holds nothing else, so
+  //    mel+vocoder measure 99.997%, 99.9995% and 99.995% of it across three
+  //    runs, over a leaf of 0.1 s to 1.2 s where a scheduling hiccup at a scope
+  //    boundary is noise. 0.99 is the threshold, and the 0.90 this case shipped
+  //    with was a HOLE the second review named: at 0.90 `decode.audio` could
+  //    open 11% early and swallow 0.13 s, which is 87% of this render's entire
+  //    `decode.video`, while passing everything in this file.
+  //  * `denoise.step` covers the denoiser EVALUATIONS, measured at 99.67% over
+  //    8 of them. The uncovered part is real work — the post-process and the
+  //    Euler or res_2s step, which no anchor wraps — PLUS two instrument
+  //    boundaries per evaluation, and a preempted `/proc/self/statm` read at one
+  //    of those costs a percent of a 40 ms leaf on this fixture. 0.95.
+  //  * `decode.video.chunk` runs from the leaf's own open to the moment the
+  //    decoder hands a chunk back, so the only uncovered part is TWO instrument
+  //    boundaries — measured 99.44% — and that is why its threshold is the
+  //    loosest of the three rather than the tightest. This leaf is 1.6 ms on
+  //    this fixture. One preemption between `Close(chunk)` and `Close(decode)`
+  //    is a millisecond, i.e. 60% of it, so a threshold set near the measured
+  //    value would be a coin flip and not a gate. 0.90 here permits 0.16 ms to
+  //    go unnamed, which is three orders of magnitude below the 0.13 s the same
+  //    0.90 permitted on the audio decode: the fraction is the same and the
+  //    stake is not, which is why these three numbers are not one number.
+  const std::vector<Carrying> carrying = {
+      {"denoise", {"denoise.step"}, 0.95, {}},
+      {"decode.video", {"decode.video.chunk"}, 0.90, {"artifacts.frames"}},
+      {"decode.audio", {"decode.audio.mel", "decode.audio.vocoder"}, 0.99, {}},
+  };
+  for (const Carrying& c : carrying) CheckCarryingPhase(table, c);
 
-  // (2) THE FLOOR, for the phases that carry the render and have no sub-scope.
-  // A leaf whose name has been detached from its work measures two function
-  // calls — about a microsecond, five orders of magnitude below this floor.
+  // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the
+  // note above this case for why it is not tightened toward the measured share.
   const std::map<std::string, double> leaves = LeafSecondsByName(table);
   double leaf_total = 0.0;
   for (const std::pair<const std::string, double>& kv : leaves) leaf_total += kv.second;
@@ -3023,14 +3176,17 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
                          "with the work somewhere else");
   }
 
-  // (3) AND THE DECODE LEAVES DO NOT OVERLAP. `decode.video` and
+  // (5) AND THE CARRYING LEAVES DO NOT OVERLAP. `decode.video` and
   // `artifacts.frames` ALTERNATE, because the decoder streams chunks into the
-  // writer's callback; `decode.audio` follows both. Any overlap would mean a
-  // leaf was left open across work it does not name, which is the shape of the
-  // mutation this case exists for, and it would also double count the overlap
-  // into `sum_leaf_seconds`.
+  // writer's callback; `decode.audio` follows both; `denoise` precedes all of
+  // them and is in this list because the review found it was in NO list — the
+  // loop that shipped covered the decode and the writer and left the largest
+  // phase of the render out of it. Any overlap would mean a leaf was left open
+  // across work it does not name, and it would double count into
+  // `sum_leaf_seconds`.
   std::vector<std::pair<double, double>> spans;
-  for (const std::string name : {"decode.video", "artifacts.frames", "decode.audio"}) {
+  for (const std::string name :
+       {"denoise", "decode.video", "artifacts.frames", "decode.audio"}) {
     for (const nlohmann::json& r : RecordsNamed(table, name)) {
       spans.push_back({r["start_seconds"].get<double>(), r["end_seconds"].get<double>()});
     }
@@ -3038,7 +3194,7 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   std::sort(spans.begin(), spans.end());
   for (size_t i = 1; i < spans.size(); ++i) {
     CHECK_MESSAGE(spans[i].first >= spans[i - 1].second - 1e-9,
-                  "two of the decode/writer leaves overlap: [" << spans[i - 1].first << ", "
+                  "two of the carrying/writer leaves overlap: [" << spans[i - 1].first << ", "
                       << spans[i - 1].second << "] and [" << spans[i].first << ", "
                       << spans[i].second << "]");
   }
@@ -3116,7 +3272,54 @@ TEST_CASE("ltx2 phase log: the stderr copy is emitted when the FILE write FAILS"
                   "which is the one case the lane exists for");
   CHECK(captured.find("denoise") != std::string::npos);
   CHECK(captured.find("decode.video") != std::string::npos);
+  log.Reset();
+}
 
+// ─── F10: the sampler STOPS when the last scope closes ───────────────────────
+//
+// THE FIRST UNIT CASE THIS INSTRUMENT HAS. Every other gate in this file reaches
+// `PhaseLog` through a complete render, which costs about 40 s and cannot see a
+// thread that is still running after the render ended. The row's spec said F10
+// was ungated because "F10 is an absence — a thread that keeps running — which
+// no assertion in this suite is positioned to observe". A fresh review refuted
+// that in twelve lines, and this is those twelve lines: the sample COUNT is
+// public (`PhaseLog::Samples()`), the worker increments it every 100 ms, and a
+// worker that outlived its timeline therefore moves a number a test can read.
+// No injected scheduler, no timing threshold that contention can cross — an idle
+// process either takes samples or it does not.
+//
+// F10 itself is `render_phase_log.cpp`'s last `Close`: when nothing is live any
+// more it takes the worker and joins it. Before the repair, only `Reset()` and
+// the destructor ever stopped the thread, so a SERVER that rendered one clip
+// kept a `/proc/self/statm` read under the process-wide mutex for the rest of
+// its life and folded that idle time into the next table's sample count.
+TEST_CASE("ltx2 phase log: the last Close stops the sampler") {
+  using vllm::multimodal::phase::PhaseLog;
+  PhaseLog& log = PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+  const int64_t before = log.Samples();
+  {
+    const vllm::multimodal::phase::Scope work("f10.probe");
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  const int64_t at_close = log.Samples();
+  // THE INSTRUMENT'S OWN PRECONDITION. With `VLLM_RENDER_PHASE_SAMPLER=0` no
+  // worker is ever started, and "the count did not move" would then be true for
+  // the wrong reason — a mute switch wearing a pass. 250 ms at a 100 ms period
+  // is at least one tick on top of the Open and Close samples.
+  REQUIRE_MESSAGE(at_close - before >= 3,
+                  "the sampler took " << (at_close - before) << " samples across a 250 ms scope, "
+                      "so it was not running and this case cannot observe whether it STOPS. Is "
+                      "VLLM_RENDER_PHASE_SAMPLER=0 set?");
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  const int64_t idle = log.Samples();
+  CHECK_MESSAGE(idle == at_close,
+                "the sample count moved by " << (idle - at_close)
+                    << " over 600 ms in which NOTHING was open, so the 100 ms sampler outlived "
+                       "the timeline that started it. A process that renders once then serves "
+                       "keeps that read under the process-wide mutex for life, and the next "
+                       "render's table inherits the idle samples");
   log.Reset();
 }
 

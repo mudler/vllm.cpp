@@ -375,14 +375,22 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
   // two phases had reversed between two runs of the same binary. A reader who
   // opens one of these files months later gets the caveat from the file rather
   // than from a document they would have to know to look for.
+  // NO MEASURED NUMBER IN THIS STRING, and that is a repair rather than a
+  // shortening. The sentence used to name three wall times from one contended
+  // box. A measurement baked into library source is a number that goes stale
+  // where nobody looks for it: it is not a projection document, no gate reads
+  // it, and the next run that refutes it edits a file in `src/`. The counts and
+  // the ratios belong to the artifact, whose `_caveat` carries them beside the
+  // run they came from.
   out["notice"] =
       "NOT A BENCHMARK. Every duration here is wall clock on whatever host ran this render, "
       "under whatever else that host was doing at the time, and this file records neither. "
-      "The same binary at the same geometry has measured 0.158 s, 6.138 s and 12.030 s of "
-      "wall on one contended box, and the RANK of its two largest phases reversed between "
-      "two of those runs. What this table supports is the SHAPE of a render and the ratio "
-      "sum_leaf_seconds/wall_seconds. Quote a duration only with the host, the checkpoint "
-      "and the contention state beside it. See .agents/specs/ltx25-device-residency.md.";
+      "On a contended box the same binary at the same geometry has moved by more than an "
+      "order of magnitude in wall, and the RANK of its two largest phases has reversed "
+      "between two such runs. What this table supports is the SHAPE of a render and the "
+      "ratio sum_leaf_seconds/wall_seconds. Quote a duration only with the host, the "
+      "checkpoint and the contention state beside it. "
+      "See .agents/specs/ltx25-device-residency.md.";
   out["sum_rule"] =
       "sum_leaf_seconds adds only records with span=false and nested=false. A span encloses "
       "leaves and a nested record decomposes one, so adding either would make "

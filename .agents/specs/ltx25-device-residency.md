@@ -25,14 +25,13 @@ dispatched to its own fresh implementer and its own fresh reviewer.
 timeline of named phases, each carrying a monotone timestamp, a duration, a peak
 host byte count and a peak device byte count, with `unaccounted_seconds` emitted
 beside the sum rather than smeared over the phases. On a completed 64x64/9-frame
-render through the `vllm.h` video ABI the named leaves account for **99.88% of
-wall** (1.673613 s of 1.675671 s, residue 2.06 ms over 23 entries), so **the
+render through the `vllm.h` video ABI the named leaves account for **99.94% of
+wall** (4.459892 s of 4.462572 s, residue 2.68 ms over 33 entries), so **the
 phases sum and W1 may start**. That is the artifact's own run and the figure
-`## Outcome — W0` records; a superseded 98.33% at a 0.1575 s wall used to stand
-here, and it is the run whose phase ranking `## Outcome — W0` says may not be
-quoted. **The RATIO is what the gate reads. No wall here is a benchmark** — the
-same binary at the same geometry has measured 0.158 s, 1.676 s, 6.138 s and
-12.030 s on a contended box. The artifact is
+`## Outcome — W0` records. **The RATIO is what the gate reads. No wall here is a
+benchmark** — the same binary at the same geometry has measured 0.147 s, 0.158 s,
+1.676 s, 4.463 s, 6.138 s and 12.030 s on a contended box, and the first two of
+those are one minute apart. The artifact is
 [`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json)
 and its provenance is in `## Outcome — W0` below.
 
@@ -669,6 +668,15 @@ Also owed, and not attached to a stage:
 * **The third single-core stretch** of the #1208 trace (2589 s+, RSS flat at
   31 GiB), unattributed. W1's phase table should name it; if it does not, that is
   a W0 gap and W0 iterates.
+* **A VAE-SIDE sub-scope for `decode.video`.** The anchor W0 lands sits in the
+  driver: `decode.video.chunk` runs from the leaf's own open to the moment
+  `Ltx2VideoDecodeStreaming` hands a chunk back. That END is a production event
+  and it is what catches M10, but the WORK it wraps is the whole call rather than
+  the tile accumulation inside it. The honest sub-scope is around
+  `AccumulateTemporalGroup`
+  (`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp`), which is outside
+  the authority W0 was dispatched with. Owed to W5, whose lever this phase is,
+  and it is a refinement of a gated phase rather than an ungated one.
 
 ## Outcome — W0, the instrument
 
@@ -678,26 +686,31 @@ Landed on `row/LTX25-RESIDENCY-W0`, issue
 ### The gate, and the number
 
 **PASS.** One completed render through the `vllm.h` video ABI emits a phase
-table whose named leaves sum to **99.88% of wall** — 1.673613 s of leaves
-against 1.675671 s of wall, residue **2.06 ms** over 23 entries and 70 samples.
+table whose named leaves sum to **99.94% of wall** — 4.459892 s of leaves
+against 4.462572 s of wall, residue **2.68 ms** over 33 entries and 118 samples.
 The tolerance was fixed at **>= 95%** in the test's own comment and in the
 red-first commit message *before* the instrumented run, and the sum is checked
 in the same case that checks the named boundaries, because one leaf called
 `render` would sum to wall exactly and measure nothing.
 
-The same case has produced **98.33% at a 0.158 s wall, 99.88% at 1.676 s, 99.96%
-at 6.138 s and 99.84% at 12.030 s** on four runs of the identical binary at the
-identical geometry. The RATIO is what the gate reads and it never came near the
-95% floor; the WALL moved by a factor of 76 across those runs because the box was
-building other sessions' trees, which is why no wall figure in this section is a
-benchmark and why W1 is written as a lease on an idle box.
+The same case has produced **98.33% at a 0.158 s wall, 98.74% at 0.147 s, 99.88%
+at 1.676 s, 99.94% at 4.463 s, 99.96% at 6.138 s and 99.84% at 12.030 s** on six
+runs of the identical binary at the identical geometry. The RATIO is what the
+gate reads and it never came near the 95% floor; the WALL moved by a factor of 82
+across those runs because the box was building other sessions' trees — and the
+0.147 s and the 4.463 s are ONE MINUTE apart, which is the sharpest form this
+finding has taken. That is why no wall figure in this section is a benchmark and
+why W1 is written as a lease on an idle box.
 
 The evidence file is
 [`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json),
-sha256 `c2854ad27be9f974b7721405f469af7febf9c93c73fb3da4f83c20dc194ecd0e`.
-**Re-taken for the fresh review's F4**, which found the first artifact carrying
-no provenance at all in a directory whose every sibling carries `_source`,
-`hardware`, `workload` and `footnotes`. Every phase record in it is the render's
+sha256 `59a860163e6ab2569c789209be709858915ba58393e8eb6900559f192ea7b950`.
+**Re-taken twice.** First for the first review's F4, which found the original
+artifact carrying no provenance at all in a directory whose every sibling carries
+`_source`, `hardware`, `workload` and `footnotes`; then for the second review's
+finding above, because an artifact taken before the `denoise.step` and
+`decode.video.chunk` anchors existed cannot show the containment the gate now
+requires. Every phase record in it is the render's
 own output; the four keys above them — `_source`, `_caveat`, `_headline`,
 `_footnotes` — are written by hand at commit time, because a render cannot know
 its host, its checkpoint or what else the box was doing, and those are exactly
@@ -708,9 +721,9 @@ the part it CAN know into every phase log it produces: `notice`, `sum_rule` and
 | | |
 |---|---|
 | producer | `examples/ltx2_gen` (`build/examples/ltx2-gen`), through `vllm_video_engine_load` + `vllm_video_generate` |
-| tree | binary built from `e3f46560e` on `row/LTX25-RESIDENCY-W0`, which is a merge of `origin/main` `307273764` |
-| build | `cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_SERVER=OFF -G Ninja`, gcc 13.3.0 |
-| host | `mudler-ubuntu-box`, Linux 6.8.0-136-generic x86_64, **20 cores and CONTENDED** — 1-minute load average **74** at the time of the render, other sessions building throughout |
+| tree | binary built from `3dc2ae98b` on `row/LTX25-RESIDENCY-W0` |
+| build | `cmake -DCMAKE_BUILD_TYPE=Release -G Ninja`, gcc 13.3.0 |
+| host | `mudler-ubuntu-box`, Linux 6.8.0-136-generic x86_64, **20 cores and CONTENDED** — 1-minute load average between **31 and 55** across the render and the one a minute before it, other sessions building throughout |
 | checkpoint | the reduced-dimension fixture `tests/vllm/multimodal/ltx2_video_fixture.h` writes, in the shipped file format |
 | geometry | `--frames 9 --width 64 --height 64 --seed 7 --max-phase 0 --device cpu` |
 | completion | 9 frames written, **9 distinct per-frame md5s**, plus a 48 kHz WAV. The exit code is not the completion gate here ([#1149](https://github.com/mudler/vllm.cpp/issues/1149)); the distinct md5s are |
@@ -718,8 +731,8 @@ the part it CAN know into every phase log it produces: `notice`, `sum_rule` and
 
 **The wall figures are NOT a benchmark and nothing may quote them as one.** The
 host was contended, the checkpoint is a reduced fixture, and the same case has
-measured 0.16 s, 1.68 s, 6.14 s and 12.03 s of wall on four runs of the
-identical binary. What the artifact supports is the SHAPE of the table and the fact that
+measured 0.15 s, 0.16 s, 1.68 s, 4.46 s, 6.14 s and 12.03 s of wall on six runs
+of the identical binary. What the artifact supports is the SHAPE of the table and the fact that
 its parts add up. `docs/BENCHMARKS.md` is therefore untouched, which is what
 this spec's `### Decisions taken here` already said W0 owes: W1 owes the
 benchmark edit, on a leased idle box, at two geometries.
@@ -731,14 +744,19 @@ changed between two runs of the identical binary**. On the artifact this row
 first shipped, `denoise` was 8.127 s (67.7% of the named leaves) against
 `decode.audio` 3.062 s (25.5%). On an earlier run of the same case at the same
 geometry the order was reversed: `decode.audio` 0.0889 s against `denoise`
-0.0539 s of a 0.158 s wall. **The re-taken artifact records a third split
-again** — `denoise` 48.3% against `decode.audio` 42.6% — so the gap between the
-two has been 2.7x, 0.6x and 1.1x on one binary at one geometry.
+0.0539 s of a 0.158 s wall. The first re-take recorded a third split again —
+`denoise` 48.3% against `decode.audio` 42.6% — and **the artifact this row now
+ships records a fourth**: `denoise` 75.79% against `decode.audio` 18.07%. The
+gap between the two has been 2.7x, 0.6x, 1.1x and 4.2x on one binary at one
+geometry.
 
 The re-take also names something the first artifact could not, because F1 split
-it: **`decode.audio.vocoder` alone is 0.7036 s, 42.0% of the named leaves.**
-Almost the whole of `decode.audio` is the vocoder, and until this change that
-phase had no name of its own anywhere in the tree.
+it: **`decode.audio.vocoder` alone is 0.8006 s, 17.95% of the named leaves, and
+99.998% of `decode.audio`.** Almost the whole of `decode.audio` is the vocoder,
+and until this row that phase had no name of its own anywhere in the tree. The
+same is now true one level up: `denoise.step` covers **99.993%** of `denoise`
+over 8 denoiser evaluations, and `decode.video.chunk` **99.982%** of
+`decode.video`.
 
 That reversal is worth more than either number. The host was building other
 sessions' trees throughout, and the two phases do not have the same threading —
@@ -851,9 +869,10 @@ together cover at least 90% of it, and the decode and writer leaves never
 overlap. Every number comes from one clock in one run and no threshold is
 crossed, so contention cannot move the verdict. A **share floor** of 0.05% of the
 leaf sum covers `denoise`, `decode.audio` and `decode.video`, the three phases
-that carry this render and have no sub-scope to contain: a name detached from its
-work measures two function calls, five orders of magnitude below the floor, while
-the smallest of the three holds 3.7%.
+that carry this render: a name detached from its work measures two function
+calls, five orders of magnitude below the floor, while the smallest of the three
+holds 3.7%. **That repair covered ONE of those three, and the next section is a
+second fresh review demonstrating what the other two could still do.**
 
 **F1 — #1010 named six phases and two of them were folded away.** `decode.audio`
 carried `Ltx2AudioDecoderForward` and `Ltx2VocoderWithBweForward` in one leaf,
@@ -941,6 +960,97 @@ two on this box, which is why F2 asserts a floor three orders of magnitude below
 them rather than a value, and why no ordering in any table this row produced may
 be quoted.
 
+### What a SECOND fresh review found, and what closed it
+
+The repair above asserted containment for `decode.audio`, because `decode.audio`
+was the only leaf with sub-scopes. `denoise` and `decode.video` were held by the
+0.05% share floor alone, and the non-overlap loop did not mention `denoise` at
+all. A second fresh reviewer ran M4's shape one level over, on the phase that
+carries this render.
+
+**M7 — the transfer, on the largest phase in the table.** Close `denoise` after
+the first sampler step and open `phase.finish` there. No overlap, no nesting, the
+sum untouched: 1 file, **+7/-0**, compile rc 0, 0 errors. The containment case
+reported **exit 0, 1/1 cases, 26/26 assertions**. The SUMS case reported **exit
+0, 1/1 cases, 314/314 assertions**, 99.94% accounted over 24 entries. The table
+it emitted put `phase.finish` at **2.129 s, 55.0%** of a 3.873 s leaf sum and
+`denoise` at **0.232 s, 6.0%**, on a binary whose honest run measured `denoise`
+at **73.4%**. **82% of the denoise was re-labelled and both gates passed.**
+
+That is the same defect M4 named, on the phase #1024 and #1087 are about, in the
+table W1 ranks this campaign's levers from. The reviewer recommended a prose
+correction. The operator overrode it, and the right call: a prose correction
+would have been honest and would still have shipped a gate that cannot see an
+82% misattribution.
+
+**What closed it: every carrying phase now has an anchor.** `denoise.step` wraps
+the denoiser evaluation inside `Evaluate`, which every sampler arm reaches — the
+first-order loop calls it directly and the res_2s loop reaches it through
+`hooks.denoise` — so one nested leaf per evaluation says where the sampler
+actually spent its time. `decode.video.chunk` runs from the leaf's own open to
+the moment the streaming decoder hands a chunk BACK, so its end is a production
+event rather than an instrument statement. Both are nested, so
+`sum_leaf_seconds` does not move.
+
+**And a third assertion, which sees a transfer directly rather than through a
+sum: EXCLUSIVITY.** No other leaf may overlap the window a phase's sub-scopes
+span. Containment says "the work is not inside the name"; exclusivity says "a
+second name is inside the work". M7 fails both — seven of its eight
+`denoise.step` records fall outside the shortened `denoise` leaf, and
+`phase.finish` opens in the middle of the denoise window while the steps keep
+running around it.
+
+**Why the sub-scope for `decode.video` sits in the driver and not in the VAE.**
+The per-chunk decode itself is `AccumulateTemporalGroup` in
+`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp`, one directory outside
+this stage's authority. The driver-side anchor is weaker and it is not nothing:
+its END is the production callback firing, so a `decode.video` leaf that closes
+before its chunk arrives, or that is re-labelled after one, stops containing the
+chunk it produced. M10 below is that case. A VAE-side sub-scope naming the tile
+accumulation is **owed** and is listed under `## Owed`.
+
+| # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
+|---|---|---|---|---|---|
+| **M7** | close `denoise` after the first sampler step and open `phase.finish` there — the **transfer** mutation | 1 file, +7/-0 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **124 assertions, 8 failed** — 7 containment, 1 exclusivity | exit 0, 434/434 |
+| M4 | re-anchored onto the repaired tree: leave `decode.video` open across the audio decode and give `decode.audio` a name with no work | 1 file, +2/-2 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **124 assertions, 5 failed** | exit 0, 422/422 |
+| M10 | the M7 shape on the VIDEO side: after the first chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **122 assertions, 1 failed** | exit 0, 422/422 |
+| M9 | revert F10: the last `Close` no longer stops the sampler | 1 file, +0/-1 | rc 0, 0 errors | n/a | **RED**, exit 1, 1 case failed, 2 assertions, 1 failed, at 10 samples against 4 |
+
+The SUMS column is not a defect. It is the measurement: **a sum cannot see a
+transfer**, in three independent mutations, which is exactly why the containment
+case exists and why it is the one that must be run.
+
+On the unmutated tree the containment case reports **exit 0, 1/1 cases, 124/124
+assertions**, with `denoise.step` covering **99.667%** of `denoise` over 8
+evaluations, `decode.video.chunk` **99.439%** of `decode.video` over 2 leaf
+records, and mel+vocoder **99.995%** of `decode.audio`.
+
+**Two more findings from the same review, repaired here.**
+
+*The coverage threshold and the share floor were both mute switches.* At 0.90,
+`decode.audio` could have opened 11% early and swallowed 0.13 s — 87% of this
+render's entire `decode.video` — while passing everything in the file. Coverage
+is a ratio of two intervals measured inside the same contention window, so it is
+the one number here that a loaded box does not move, and the audio threshold is
+now **0.99**. The three thresholds are deliberately not one number:
+`decode.video` is 1.6 ms on this fixture, where a single preempted
+`/proc/self/statm` read at a scope boundary is percent-scale, so its threshold is
+the loosest at 0.90 and the reason is written beside it. **The 0.05% share floor
+is kept and its margin is NAMED rather than tightened**, because the measured
+share is precisely the quantity this box destroys: the same binary at the same
+geometry has reported `denoise` at 38.1% and at 73.4%, `decode.audio` at 50.9%
+and at 16.7%, and `decode.video` at 5.27% and at 2.13%. A floor set at a fraction
+of the measured value would be a flake, and under M7 `denoise` sat at 6.0% and
+would have cleared any floor a quiet box could justify. The floor now reads "this
+name is not detached" and nothing more.
+
+*The emitter baked measured wall times into library source.* The `notice` string
+named "0.158 s, 6.138 s and 12.030 s" from one contended box, in `src/`, where no
+gate reads it and the next run that refutes it would have to edit a source file
+to say so. That is a live number in a place nobody looks — the failure this row
+exists to stop, one directory over. The notice is qualitative now and the
+artifact's `_caveat` keeps the numbers beside the run they came from.
+
 ### No claim file, and the checker says why
 
 A `CLAIM-LTX25-RESIDENCY-W0.md` was written and then removed.
@@ -979,15 +1089,26 @@ which is where this spec's `### Decisions taken here` already said they would be
   three phases that carry the render and say nothing about these. That is a fact
   about the driver — they really are bookkeeping — but it means their PLACEMENT
   is unproven, and a shipped-checkpoint render is where it would show.
-* **F9 and F10 are FIXED AND UNGATED, and this is stated rather than implied.**
-  The sampler-lifetime repairs carry no mutation of their own. F9 is a race
-  between `Reset()` and `Open` whose window is a few instructions wide, and a
-  test that loses it reliably would have to instrument the emitter's internals;
-  F10 is an absence — a thread that keeps running — which no assertion in this
-  suite is positioned to observe. What the 91-case suite proves is that neither
-  repair regressed anything, not that either is detected. A gate for them would
-  need a `PhaseLog`-level unit case with an injected scheduler, which is a
-  different row's shape and is not claimed here.
+* **F10 IS NOW GATED, and the sentence that said it could not be was wrong.**
+  This entry used to read "F10 is an absence — a thread that keeps running —
+  which no assertion in this suite is positioned to observe", and asserted that a
+  gate would need an injected scheduler. A second fresh review refuted it in
+  twelve lines against the PUBLIC surface: `PhaseLog::Samples()` is a counter the
+  worker increments every 100 ms, so a worker that outlived its timeline moves a
+  number a test can read. Those twelve lines are now
+  `ltx2 phase log: the last Close stops the sampler` — the first `PhaseLog`-level
+  unit case this instrument has, and the first gate in the file that does not pay
+  for a complete render. Reverting F10 (dropping the `TakeSamplerLocked` in the
+  last `Close`) makes it fail: **exit 1, 1 case failed, 2 assertions, 1 failed**,
+  at 10 samples against 4 over 600 ms of idle. The lesson is the one the row
+  keeps re-learning: "no assertion is positioned to observe it" was a claim about
+  what had been tried, written as a claim about what is possible.
+* **F9 is FIXED AND UNGATED, and that justification stands.** F9 is a race
+  between `Reset()` and `Open` whose window is a few instructions wide. It is a
+  logic race and not a data race — every access is already under `mu` — so a
+  sanitizer would not flag it, and a test that loses it reliably would have to
+  instrument the emitter's internals. What the suite proves for F9 is that the
+  repair regressed nothing, not that it is detected.
 * **`phase.upsample_latent` is gated only on the reduced two-phase fixture.** It
   is the only leaf whose sole reader is the DFR case, because every other render
   in `test_ltx2_video` pins `max_phase = 0`, where the input transform is never

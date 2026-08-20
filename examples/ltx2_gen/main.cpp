@@ -100,6 +100,9 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                                                           REQUIRED: which class of\n"
       "                                                           transformer --dit points at\n"
       "                [--upsampler <latent-spatial-x2.safetensors>]  phase 2 needs it\n"
+      "                [--temporal-upsampler <latent-temporal-x2.safetensors>]\n"
+      "                [--temporal-upsample-rounds 0|1|2]         dfr only; each round\n"
+      "                                                           doubles the frame count\n"
       "                [--max-phase N] [--allow-unported]\n"
       "                [--lora <ic-lora.safetensors> [STRENGTH]]  fused at load; 1.0\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
@@ -278,6 +281,7 @@ int main(int argc, char** argv) {
   // prompt` above is shared by both, which is why it is not repeated here.
   std::string video_cfg_scale, video_stg_scale, video_rescale, video_skip_step;
   std::string video_stg_blocks, a2v_scale, v2a_scale;
+  std::string temporal_rounds;  // DFR's temporal x2/x4 refinement rounds (#986)
   std::string negative_embeds, negative_audio_embeds;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
@@ -321,6 +325,15 @@ int main(int argc, char** argv) {
     else if (f == "--checkpoint-class")
       SetExtra("checkpoint_class", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--upsampler") SetExtra("upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    // DFR's SECOND upsampler, and its round count (#986). Upstream splits these
+    // the same way: `--temporal-upsampler-path` is a constructor argument
+    // (dfr_pipeline.py:578-583, :177) and `--temporal-upsample-rounds` is a
+    // `__call__` argument (:584-590, :277), so one is a LOAD extra here and the
+    // other rides the per-generation array.
+    else if (f == "--temporal-upsampler")
+      SetExtra("temporal_upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    else if (f == "--temporal-upsample-rounds")
+      temporal_rounds = Need(argc, argv, ++i, f.c_str());
     else if (f == "--negative-prompt-embeds") {
       negative_embeds = Need(argc, argv, ++i, f.c_str());
       SetExtra("negative_prompt_embeds_path", negative_embeds);
@@ -510,7 +523,14 @@ int main(int argc, char** argv) {
                          std::make_pair("video_skip_step", &video_skip_step),
                          std::make_pair("video_stg_blocks", &video_stg_blocks),
                          std::make_pair("a2v_guidance_scale", &a2v_scale),
-                         std::make_pair("v2a_guidance_scale", &v2a_scale)};
+                         std::make_pair("v2a_guidance_scale", &v2a_scale),
+                         // DFR'S TEMPORAL ROUNDS (#986), mirroring upstream's own
+                         // `--temporal-upsample-rounds` (dfr_pipeline.py:584-590).
+                         // Per-generation because upstream takes it on `__call__`
+                         // (:277) rather than on the constructor, unlike the
+                         // temporal upsampler PATH beside it, which is a load knob
+                         // for the same reason (:177).
+                         std::make_pair("temporal_upsample_rounds", &temporal_rounds)};
   for (const auto& kv : retake_knobs) {
     if (kv.second->empty()) continue;
     gen_keys.emplace_back(kv.first);

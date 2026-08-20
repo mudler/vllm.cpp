@@ -358,6 +358,89 @@ Ltx2LatentVolume Ltx2DfrStitchTileLatents(const std::vector<Ltx2LatentVolume>& t
   return out;
 }
 
+Ltx2LatentVolume Ltx2DfrSliceLatentFrames(const Ltx2LatentVolume& latent, int64_t start,
+                                          int64_t end_exclusive) {
+  if (start < 0 || end_exclusive > latent.frames || start >= end_exclusive) {
+    Refuse("frame slice [" + std::to_string(start) + ", " + std::to_string(end_exclusive) +
+           ") is not a non-empty sub-range of a " + std::to_string(latent.frames) +
+           "-frame latent");
+  }
+  if (static_cast<int64_t>(latent.data.size()) != latent.elems()) {
+    Refuse("the latent carries " + std::to_string(latent.data.size()) + " values for a " +
+           std::to_string(latent.elems()) + "-element volume, so a slice of it would read past "
+           "the buffer or silently return zeros");
+  }
+
+  Ltx2LatentVolume out;
+  out.batch = latent.batch;
+  out.channels = latent.channels;
+  out.height = latent.height;
+  out.width = latent.width;
+  out.frames = end_exclusive - start;
+  out.data.assign(static_cast<size_t>(out.elems()), 0.0F);
+
+  // [B, C, T, H, W] row-major: one (batch, channel) plane run is contiguous, so
+  // the slice is a copy per plane run rather than one copy of a flat range.
+  const int64_t plane = latent.height * latent.width;
+  for (int64_t b = 0; b < latent.batch; ++b) {
+    for (int64_t c = 0; c < latent.channels; ++c) {
+      const size_t src =
+          static_cast<size_t>(((b * latent.channels + c) * latent.frames + start) * plane);
+      const size_t dst = static_cast<size_t>((b * out.channels + c) * out.frames * plane);
+      const size_t count = static_cast<size_t>(out.frames * plane);
+      std::copy(latent.data.begin() + static_cast<ptrdiff_t>(src),
+                latent.data.begin() + static_cast<ptrdiff_t>(src + count),
+                out.data.begin() + static_cast<ptrdiff_t>(dst));
+    }
+  }
+  return out;
+}
+
+Ltx2LatentVolume Ltx2DfrConcatLatentFrames(const std::vector<Ltx2LatentVolume>& pieces) {
+  if (pieces.empty()) Refuse("cannot concatenate an empty list of latent volumes");
+
+  Ltx2LatentVolume out;
+  out.batch = pieces.front().batch;
+  out.channels = pieces.front().channels;
+  out.height = pieces.front().height;
+  out.width = pieces.front().width;
+  out.frames = 0;
+  for (const Ltx2LatentVolume& piece : pieces) {
+    if (piece.batch != out.batch || piece.channels != out.channels ||
+        piece.height != out.height || piece.width != out.width) {
+      Refuse("`torch.cat(..., dim=2)` concatenates along T only and raises on any other axis; "
+             "a piece is " + std::to_string(piece.batch) + "x" + std::to_string(piece.channels) +
+             "x*x" + std::to_string(piece.height) + "x" + std::to_string(piece.width) +
+             " against " + std::to_string(out.batch) + "x" + std::to_string(out.channels) +
+             "x*x" + std::to_string(out.height) + "x" + std::to_string(out.width));
+    }
+    if (static_cast<int64_t>(piece.data.size()) != piece.elems()) {
+      Refuse("a piece carries " + std::to_string(piece.data.size()) + " values for a " +
+             std::to_string(piece.elems()) + "-element volume");
+    }
+    out.frames += piece.frames;
+  }
+
+  out.data.assign(static_cast<size_t>(out.elems()), 0.0F);
+  const int64_t plane = out.height * out.width;
+  int64_t cursor = 0;
+  for (const Ltx2LatentVolume& piece : pieces) {
+    for (int64_t b = 0; b < out.batch; ++b) {
+      for (int64_t c = 0; c < out.channels; ++c) {
+        const size_t src = static_cast<size_t>((b * out.channels + c) * piece.frames * plane);
+        const size_t dst =
+            static_cast<size_t>(((b * out.channels + c) * out.frames + cursor) * plane);
+        const size_t count = static_cast<size_t>(piece.frames * plane);
+        std::copy(piece.data.begin() + static_cast<ptrdiff_t>(src),
+                  piece.data.begin() + static_cast<ptrdiff_t>(src + count),
+                  out.data.begin() + static_cast<ptrdiff_t>(dst));
+      }
+    }
+    cursor += piece.frames;
+  }
+  return out;
+}
+
 std::vector<int64_t> Ltx2DfrRemapPositionsToLocal(const std::vector<int64_t>& positions,
                                                   int64_t pixel_start) {
   std::vector<int64_t> local;

@@ -1155,6 +1155,12 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // where the recipe resolves, and the only thing that reads it is the
       // refusal, which is what this key exists to produce.
       vllm::multimodal::kLtx2CheckpointClassExtra,
+      // Row LTX25-DFR-ROUNDS (#986): the TEMPORAL x2 latent upsampler, DFR's
+      // second upsampler slot. It has three readers, which is why it is served
+      // rather than refused: the load parses its config and refuses the wrong
+      // arm by name, the request surface refuses positive rounds without it, and
+      // the rounds loop calls it once per round.
+      vllm::multimodal::kLtx2TemporalUpsamplerPathExtra,
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect #611 records.
@@ -2299,12 +2305,31 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
   }
 }
 
-TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
-  // Row LTX25-DFR-PIPELINE (#986). The rounds LOOP is unported; the upsampler it
-  // drives is not, and neither is the canvas layout it tiles with. That
-  // distinction is the entire content of the refusal, and it is the distinction
-  // this campaign has now got wrong twice — `ltx2_video.cpp` keeps a tally of
-  // refusals whose stated reason turned out false.
+TEST_CASE("ltx2 video: temporal rounds are refused where they mean nothing") {
+  // Row LTX25-DFR-ROUNDS (#986). THE REFUSAL THIS REPLACES, and why it is retired
+  // rather than widened.
+  //
+  // Until this row the whole knob was refused above 0, and the message named the
+  // ROUNDS LOOP as what was missing while ruling three other causes out by name.
+  // The loop has landed, so that message is now false about this tree and the
+  // assertions that re-derived it go WITH it — the same disposal #920's tripwire
+  // got when the readback landed (see the retirement record above, around the
+  // `GENERATED keyframe slots are SERVED` case). Each of its assertions is
+  // replaced below by one about what replaced it, never deleted and never
+  // loosened to keep a green.
+  //
+  // ONE OF ITS FOUR STATED CAUSES WAS ALREADY FALSE WHEN THIS ROW READ IT, and
+  // that is the more useful record. The message ended with "AND ONE THING IS
+  // MISSING THAT NO CODE CAN SUPPLY: the checkpoint", asserting that
+  // `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` is not on the NAS,
+  // "re-verified 2026-08-16". It is on the NAS, and it arrived 2026-08-17 — one
+  // day after that check. Nothing in the tree could notice: a refusal's stated
+  // reason is prose, and the only instrument on it is a reader who goes and
+  // looks. This suite is that reader, for the claims it CAN reach.
+  //
+  // What survives the retirement is the part that is still true: a value outside
+  // upstream's own `{0, 1, 2}` is a malformed request and is still refused first,
+  // and the knob still belongs to `DFRPipeline` alone.
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -2326,52 +2351,46 @@ TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
 
   SUBCASE("a value outside {0,1,2} gets upstream's OWN refusal first") {
     // `dfr_pipeline.py:284-285` raises at the top of `__call__`, before any work
-    // is paid for. A malformed request and an unported loop are different
-    // answers, and upstream gives the malformed one first.
+    // is paid for. UNCHANGED by this row: a malformed request is still a
+    // different answer from a legal one, and it still comes first.
     const std::string msg = refusal("3", "tr3");
     INFO(msg);
     CHECK(msg.find("must be 0, 1, or 2") != std::string::npos);
     CHECK(msg.find("dfr_pipeline.py:284-285") != std::string::npos);
-    // NOT the unported-loop message: that would send a caller who typed 3 off to
-    // read about tiling.
-    CHECK(msg.find("ROUNDS LOOP") == std::string::npos);
   }
 
-  SUBCASE("a legal count names the LOOP, and rules three other causes OUT") {
-    const std::string msg = refusal("1", "tr1");
+  SUBCASE("a legal count on a NON-DFR pipeline is refused, and says whose knob it is") {
+    // THE BRANCH THAT BECAME REACHABLE IN THE SAME CHANGE THAT MADE IT TRUE.
+    // While the loop was unported this check could not fire — every caller was
+    // already refused by the "not served" message whatever their pipeline — so
+    // landing it then would have been the unselected-branch shape
+    // `.agents/reachability.md` enumerates. This engine is loaded on the DEFAULT
+    // `distilled_two_stage` kind, so the refusal below is the pipeline one.
+    const std::string msg = refusal("1", "trkind");
     INFO(msg);
-    // The upstream span a reader can go and check.
-    CHECK(msg.find("dfr_pipeline.py:402-529") != std::string::npos);
-    CHECK(msg.find("ROUNDS LOOP") != std::string::npos);
-    // WHAT IS NOT THE REASON — the shape this campaign requires for a ruled-out
-    // cause, so the next reader RE-CHECKS the refutation rather than re-deriving
-    // it. All three must be named.
-    CHECK(msg.find("NOT* THE REASON") != std::string::npos);
-    CHECK(msg.find("LTX25-TEMPORAL-UPSAMPLER") != std::string::npos);
-    CHECK(msg.find("PixelShuffle1d") != std::string::npos);
-    CHECK(msg.find("resolve_canvas") != std::string::npos);
-    // And the one thing no code can supply.
-    CHECK(msg.find("latent-temporal-upscaler") != std::string::npos);
-    CHECK(msg.find("#986") != std::string::npos);
+    CHECK(msg.find("dfr_pipeline.py:277") != std::string::npos);
+    CHECK(msg.find("distilled_two_stage") != std::string::npos);
+    // And it says what silently dropping the knob would have cost, which is the
+    // half that makes "refused rather than ignored" a reason instead of a slogan.
+    CHECK(msg.find("2**rounds") != std::string::npos);
+    // NOT the retired message. A caller must not be told the loop is unported.
+    CHECK(msg.find("are not served") == std::string::npos);
   }
 
-  SUBCASE("its LOCAL claims are re-derived from this tree, not read back from the message") {
-    // THE ASSERTION THE #920 REPAIR EXISTS FOR, carried forward to this refusal
-    // because the failure it guards is a property of refusals in general rather
-    // than of that one. Every assertion above is on an UPSTREAM symbol name, and
-    // no change to THIS tree can move one — so a suite built only on them stays
-    // green through exactly the event that falsifies the message.
+  SUBCASE("the canvas layout is still declared where the rounds loop reads it from") {
+    // THE ASSERTION THE #920 REPAIR EXISTS FOR, RETARGETED rather than retired
+    // with the message it used to guard. Its subject changed and its reason did
+    // not: every other check in this file is on an UPSTREAM symbol name, and no
+    // change to THIS tree can move one, so a suite built only on them stays green
+    // through exactly the event that falsifies what we claim about ourselves.
     //
-    // Measured on this campaign: a mutation that replaced the local-cause clause
-    // with a self-declared falsehood, leaving the upstream names alone, kept the
-    // #920 suite GREEN at 18/18, exit 0.
-    //
-    // The refusal claims the canvas layout is ported HERE. That is a claim about
-    // this tree, so it is checked against this tree — and against a DIFFERENT
-    // file from the one that makes it, which is what stops the check from being
-    // the tautology #911 records.
-    const std::string msg = refusal("2", "trclaims");
-    INFO(msg);
+    // What it guarded before: a refusal claiming the canvas layout was ported
+    // here. What it guards now: the rounds loop actually CALLING that layout.
+    // Those four symbols were the first production callers this row added, so a
+    // rename or a removal is no longer a stale sentence — it is a build failure
+    // in `ltx2_video.cpp`. This check is what makes the failure say why, and it
+    // reads a DIFFERENT file from the one that uses them, which is what stops it
+    // being the tautology #911 records.
     const std::vector<std::string> header_lines =
         SplitLines(ReadSourceFile(LTX2_DFR_HEADER_PATH));
     REQUIRE(header_lines.size() > 100);
@@ -2387,20 +2406,336 @@ TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
     // comment block would answer every check below for free.
     REQUIRE_MESSAGE(declarations.find("struct Ltx2DfrTileRange") != std::string::npos,
                     "comment stripping removed the declarations it was meant to keep");
-    // The message rules the canvas layout out as a blocker BECAUSE it is ported
-    // here. If a later change removes one of these, that clause becomes false
-    // and this goes red with the reason attached.
-    CHECK(msg.find("canvas layout") != std::string::npos);
     for (const char* name : {"Ltx2DfrResolveCanvas", "Ltx2DfrTileRanges",
-                             "Ltx2DfrStitchTileLatents", "Ltx2DfrMergeCarryForwardKeyframes"}) {
-      INFO("claimed ported HERE: " << name);
+                             "Ltx2DfrStitchTileLatents", "Ltx2DfrMergeCarryForwardKeyframes",
+                             "Ltx2DfrSliceLatentFrames", "Ltx2DfrConcatLatentFrames"}) {
+      INFO("called by the rounds loop: " << name);
       CHECK_MESSAGE(declarations.find(name) != std::string::npos,
-                    "the refusal rules the canvas layout out as a blocker because it is ported "
-                    "here, and '"
+                    "the DFR rounds loop calls '"
                         << name
-                        << "' is no longer declared in ltx2_dfr.h. The message is stale about "
-                           "THIS tree");
+                        << "' and it is no longer declared in ltx2_dfr.h");
     }
+  }
+}
+
+TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsampler") {
+  // Row LTX25-DFR-ROUNDS (#986). THIS CASE IS THE ROW'S REACHABILITY PROOF, and
+  // the reason the row exists at all.
+  //
+  // The temporal x2 latent upsampler has been ported, loader-parsed and gated
+  // against executed upstream at reduced dimensions since #644, and until this
+  // row NOTHING CALLED IT. `docs/FEATURES.md` carried that as
+  // `Temporal x2 ups gated, UNDRIVEN`, and `.agents/reachability.md` names the
+  // shape: a capability whose only driver is the test written for it. Its single
+  // upstream consumer is DFR's rounds loop (`dfr_pipeline.py:407`), so porting
+  // the loop is what retires the debt — and a unit test that hands the operator a
+  // latent by hand proves the class works, never that anything reaches it.
+  //
+  // So every subcase here enters at `LoadVideoEngine` then `VideoEngine::Generate`
+  // — the chain `vllm_video_generate` takes — and asks for the rounds through the
+  // same `temporal_upsample_rounds` extra a caller has.
+  //
+  // WHY A FIXTURE CHECKPOINT, stated rather than left to be discovered: DFR's
+  // base needs a `keyframe_slot_sft` transformer and NOBODY PUBLISHES ONE (#1137
+  // established that by authenticated reads at the pinned revision), so `dfr` is
+  // refused in practice on real weights. The reduced fixture below declares the
+  // class it genuinely implements, which is not the false declaration
+  // `docs/USAGE.md` warns about — that is declaring `keyframe_slot_sft` for a
+  // `dev` or `distilled` FILE to get past the refusal. Every claim in this case
+  // is therefore a reduced-dimension claim, and no real-weight temporal result
+  // exists or is implied. The real temporal upsampler checkpoint IS on the NAS as
+  // of 2026-08-17; the base it would run beside is what is missing.
+  Workspace ws;
+
+  // The TEMPORAL arm as its own checkpoint. DFR holds two upsamplers at once
+  // upstream — `spatial_upsampler_path` (dfr_pipeline.py:174) for stage 2's input
+  // transform and `temporal_upsampler_path` (:177) for the rounds — so this
+  // engine has two slots rather than one reinterpreted one.
+  vllm::Ltx2UpsamplerConfig temporal =
+      ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+  temporal.spatial_upsample = false;
+  temporal.temporal_upsample = true;
+  const std::string temporal_path = ws.root + "/dfr_temporal_upsampler.safetensors";
+  ltx2_fixture::WriteReducedUpsampler(temporal, temporal_path);
+
+  auto load = [&](bool with_temporal) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    mp.extras["upsampler_path"] = ws.paths.upsampler;  // stage 2, the SPATIAL arm
+    if (with_temporal) {
+      mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = temporal_path;
+    }
+    return vllm::multimodal::LoadVideoEngine(mp);
+  };
+
+  SUBCASE("one round doubles the caller's frame contract AND invokes the upsampler") {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_r1");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "1";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    // THE CONTRACT: `(requested - 1) * 2**rounds + 1` (dfr_pipeline.py:534). The
+    // fixture asks for 9, so one round owes 17 — and the canvas it was denoised
+    // on is larger again, which is the half no output can show.
+    CHECK(result.frame_count == 17);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.temporal_rounds == 1);
+    // THE REACHABILITY ASSERTION. Everything else in this subcase — the frame
+    // count, the shape, the exit status — is satisfied by a loop that resized the
+    // latent and never called the operator. This is the only line that separates
+    // "the rounds ran" from "the rounds drove the upsampler", which is exactly
+    // the distinction `.agents/reachability.md` says a green gate cannot make for
+    // you. Deleting the `Ltx2UpsampleVideoLatent` call in the rounds loop must
+    // turn this red; that mutation is the row's headline evidence.
+    CHECK(trace.temporal_upsample_calls == 1);
+    // (:415) `2**round_idx` windows — AND THE CLAMP, which this expectation got
+    // wrong on the first pass and which is worth recording rather than quietly
+    // fixing. `tile_ranges` takes `min(num_tiles, n_segments)`
+    // (dfr_layout.py:171), and this fixture's canvas has exactly ONE segment: a
+    // 9-frame request pads to 25 with its single keyframe position at 24, so the
+    // boundaries are [0, 24] and round 1 asks for 2 windows over 1 segment.
+    //
+    // So the value here is 1, and it is upstream's value rather than a shortfall.
+    // STATED PLAINLY BECAUSE IT BOUNDS THE CLAIM: this fixture cannot exercise
+    // the UNCLAMPED `2**round` tiling, and no assertion in this file gates it.
+    // What is gated is that the count comes from the layout at all — a loop that
+    // denoised the canvas whole reports 1 here too, which is why the round-2
+    // subcase below carries the assertion that separates them.
+    REQUIRE(trace.round_tile_counts.size() == 1);
+    CHECK(trace.round_tile_counts[0] == 1);
+    // PLAYBACK fps doubles (:542). Reporting the conditioning fps instead hands
+    // back a clip of the right length that plays at half speed, which no frame
+    // count can see.
+    CHECK(result.fps == 48);
+  }
+
+  SUBCASE("two rounds quadruple it, and the tile count doubles with the round") {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_r2");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    CHECK(result.frame_count == 33);  // (9 - 1) * 4 + 1
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.temporal_rounds == 2);
+    // ONE UPSAMPLE PER ROUND, not one per render and not one per tile. A loop
+    // that upsampled once and then re-tiled twice produces a clip of the right
+    // length at half the temporal detail.
+    CHECK(trace.temporal_upsample_calls == 2);
+    // THE TILE COUNT GROWS WITH THE ROUND, which is the assertion that separates
+    // a real re-tiling from a loop that denoises the canvas whole. Both values
+    // are clamped by `min(num_tiles, n_segments)` (dfr_layout.py:171) — see the
+    // round-1 subcase — but they are clamped to DIFFERENT numbers, and that is
+    // what makes the pair informative where either alone is not.
+    //
+    // Derived rather than observed: round 1 runs on boundaries [0, 24] (one
+    // segment, so `min(2, 1) = 1`) and invents a mid-segment slot at 12. Round 2
+    // therefore carries TWO positions, its seams double to [48, 96] against a
+    // 97-frame canvas, the boundaries become [0, 48, 96] — two segments — and it
+    // asks for 4, taking `min(4, 2) = 2`. A loop that re-tiled without carrying
+    // the round's new slots forward would report 1 again here.
+    REQUIRE(trace.round_tile_counts.size() == 2);
+    CHECK(trace.round_tile_counts[0] == 1);
+    CHECK(trace.round_tile_counts[1] == 2);
+    CHECK(trace.round_tile_counts[1] > trace.round_tile_counts[0]);
+    CHECK(result.fps == 96);
+  }
+
+  SUBCASE("the CONDITIONING fps is capped at 60 while playback is not") {
+    // dfr_pipeline.py:414 caps the conditioning fps at 60.0, and :74-78 says why
+    // in terms: RoPE time is `pixel_frame / fps`, so a 120 fps time base halves
+    // every token's temporal span against the trained distribution and the model
+    // can no longer lay out 8 pixel frames inside one latent token — it decodes
+    // as a motion spike at each latent border followed by a stall.
+    //
+    // THIS IS INVISIBLE TO EVERY OTHER ASSERTION IN THIS FILE. An uncapped port
+    // renders the right number of frames, at the right size, at the right
+    // playback rate, and reports success. The fixture runs at 24 fps, so round 1
+    // conditions at 48 (under the cap, unchanged) and round 2 would reach 96 and
+    // is held at 60 — which is what makes this two values rather than one.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_fps");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    REQUIRE(trace.round_conditioning_fps.size() == 2);
+    CHECK(trace.round_conditioning_fps[0] == doctest::Approx(48.0));
+    CHECK(trace.round_conditioning_fps[1] == doctest::Approx(60.0));
+    // And PLAYBACK went past the cap, which is the other half of the claim: one
+    // value capped and the other not. A port that capped both reports 60 here.
+    CHECK(result.fps == 96);
+  }
+
+  SUBCASE("the four PER-TILE guarantees, none of which the rendered clip can show") {
+    // Four values upstream's tile call overrides, mirrored in the rounds loop
+    // and, until this subcase, gated by NOTHING. A fresh review mutated each one
+    // and the full suite stayed green at 102 cases / 4141 assertions, which is
+    // the shape `.agents/reachability.md` calls unasserted-live code: the lines
+    // execute, they change the pixels, and no assertion in the tree reads them.
+    //
+    // They are gathered in one subcase because they are one render's worth of
+    // observations about the same three tile invocations — round 1's single tile
+    // and round 2's two — and separating them would run the same fixture three
+    // more times to assert on different fields of the same trace.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_tileguards");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 33);  // the render still has to be the render
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    // THREE tile invocations: round 1 clamps to 1 window, round 2 to 2. Read off
+    // the tile counts rather than restated, so this stays the same claim if the
+    // clamp ever changes.
+    REQUIRE(trace.round_tile_counts.size() == 2);
+    const size_t tiles = static_cast<size_t>(trace.round_tile_counts[0] + trace.round_tile_counts[1]);
+    REQUIRE(tiles == 3);
+
+    // ── 1. THE PER-TILE SEED (dfr_pipeline.py:496-498) ──────────────────────
+    // `seed + 1000 * round + tile`, and the seed is what the loop generator was
+    // CONSTRUCTED with rather than the offset that was asked for. Upstream names
+    // the failure: the tiles are positionally identical, so a shared seed injects
+    // byte-identical noise into every window and the clip renders with the same
+    // grain pattern repeating across it — right length, right shape, exit 0.
+    //
+    // `FixtureGen` seeds at 7, so round 1's single tile owes 1007 and round 2's
+    // two owe 2007 and 2008. THE LOAD-BEARING PART IS THAT THEY DIFFER, and the
+    // `+ tile` term is the only thing that separates the last two: dropping it
+    // leaves 2007 twice.
+    REQUIRE(trace.round_tile_seeds.size() == tiles);
+    CHECK(trace.round_tile_seeds[0] == 1007u);
+    CHECK(trace.round_tile_seeds[1] == 2007u);
+    CHECK(trace.round_tile_seeds[2] == 2008u);
+    CHECK(trace.round_tile_seeds[2] != trace.round_tile_seeds[1]);
+
+    // ── 2. THE ANCESTRAL ETA (dfr_pipeline.py:495) ──────────────────────────
+    // Recorded inside the ancestral branch when it takes a step, so a tile that
+    // fell onto the deterministic Euler arm contributes no entry at all and the
+    // size check below is red before any value is compared. At eta 0 the
+    // ancestral step degenerates to plain Euler: the round re-runs the denoiser
+    // over the upsampled latent and injects no new detail, which is the entire
+    // reason the round exists and is invisible in every count above.
+    REQUIRE(trace.round_stepper_eta.size() == tiles);
+    for (size_t i = 0; i < trace.round_stepper_eta.size(); ++i) {
+      INFO("tile ", i);
+      CHECK(trace.round_stepper_eta[i] == doctest::Approx(0.5));
+    }
+
+    // ── 3. THE SEAM ANCHOR STRENGTH (dfr_pipeline.py:466, :70-72) ───────────
+    // 0.95, "pinned just short of fully clean so a tile can still settle its seam
+    // frame". At 1.0 the seam frame is frozen and cannot move to meet the frames
+    // either side of it, so each window border keeps a discontinuity — and the
+    // token count, the tile count and the stitched length are all unchanged.
+    //
+    // The count is a floor rather than an equality: every tile pins at least its
+    // own local frame 0 (:453-468), so fewer entries than tiles means a tile
+    // denoised its window with no seam pinned at all.
+    REQUIRE(trace.round_anchor_strengths.size() >= tiles);
+    for (size_t i = 0; i < trace.round_anchor_strengths.size(); ++i) {
+      INFO("anchor ", i);
+      CHECK(trace.round_anchor_strengths[i] == doctest::Approx(0.95));
+    }
+
+    // ── 4. THE DEDUPE ORDER (dfr_pipeline.py:519-522) ───────────────────────
+    // `first_index.setdefault(position, index)` — FIRST WINS. A lead-in segment
+    // makes a later tile re-emit a slot an earlier tile already denoised, and the
+    // earlier copy is the one denoised inside the window that OWNS the slot
+    // rather than inside a lead-in.
+    //
+    // THE POSITIONS ARE IDENTICAL UNDER EITHER RULE. Both rules keep exactly one
+    // entry per position and both sort the bag, so the position list, its length,
+    // the carry-forward count and every downstream shape are byte-for-byte the
+    // same whichever copy is kept. The winning TILE is the only observable the
+    // rule moves, which is why it is recorded.
+    //
+    // This fixture: round 1 emits one slot at 24; round 2's tile 0 re-emits 24
+    // and its tile 1 emits 24 again as a lead-in plus 72 of its own. Four
+    // emissions, three survivors — so a duplicate genuinely occurred here and the
+    // rule genuinely decided something.
+    CHECK(trace.round_slots_emitted == 4);
+    REQUIRE(trace.round_merged_slot_positions.size() == 3);
+    CHECK(trace.round_slots_emitted > static_cast<int64_t>(trace.round_merged_slot_positions.size()));
+    CHECK(trace.round_merged_slot_positions[0] == 24);
+    CHECK(trace.round_merged_slot_positions[1] == 24);
+    CHECK(trace.round_merged_slot_positions[2] == 72);
+    // The assertion the rule lives or dies on. Under last-wins this reads
+    // `0 1 1`.
+    REQUIRE(trace.round_merged_slot_tiles.size() == 3);
+    CHECK(trace.round_merged_slot_tiles[0] == 0);
+    CHECK(trace.round_merged_slot_tiles[1] == 0);
+    CHECK(trace.round_merged_slot_tiles[2] == 1);
+  }
+
+  SUBCASE("rounds without a temporal upsampler are refused, not silently skipped") {
+    // Upstream's second refusal, raised at the top of `__call__` beside the
+    // malformed-value one (dfr_pipeline.py:286-287). Refused rather than run at
+    // 0 rounds because the rounds are what set the frame count: a skipped round
+    // returns a clip a fraction of the requested length, and nothing else about
+    // the render can flag it.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(false);
+    REQUIRE(engine != nullptr);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_nots");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "1";
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("rounds without a temporal upsampler must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("temporal_upsampler_path") != std::string::npos);
+      CHECK(msg.find("dfr_pipeline.py:286-287") != std::string::npos);
+    }
+  }
+
+  SUBCASE("zero rounds is unchanged, which is the refactor's floor") {
+    // THE CONTROL, and it matters more than any assertion above it. Landing the
+    // rounds meant turning this engine's inline per-phase denoise into a callable
+    // the tiles could enter — a refactor of the shipped render path that EVERY
+    // pipeline kind now runs through. A rounds loop that works while quietly
+    // moving the base path is a worse outcome than no rounds loop.
+    //
+    // At 0 rounds the seam must be a no-op: same frame count, same canvas, same
+    // slot grid, and no upsample call. The wider control is the other 100 cases
+    // in this file plus `test_ltx2_pipeline`, `test_ltx2_retake` and
+    // `test_ltx2_dfr`, all of which run through the new seam unchanged.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_r0");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    CHECK(result.frame_count == 9);  // (9 - 1) * 2**0 + 1
+    CHECK(result.fps == 24);
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.temporal_rounds == 0);
+    // The upsampler is LOADED and still not called, which is the distinction
+    // between "the checkpoint is present" and "the rounds ran".
+    CHECK(trace.temporal_upsample_calls == 0);
+    CHECK(trace.round_tile_counts.empty());
+    CHECK(trace.canvas_frames == 25);  // the canvas still pads, exactly as before
   }
 }
 

@@ -388,20 +388,36 @@ inline constexpr char kLtx2GeneratedKeyframesExtra[] = "num_generated_keyframes"
 
 // DFR's temporal x2/x4 refinement rounds — `temporal_upsample_rounds`,
 // `type=int`, `choices=(0, 1, 2)`, `default=0`
-// (ltx-pipelines/dfr_pipeline.py:277, :584-590). Row LTX25-DFR-PIPELINE (#986).
+// (ltx-pipelines/dfr_pipeline.py:277, :584-590). Row LTX25-DFR-ROUNDS (#986).
 //
-// DEFINED, and REFUSED above 0. `0` is upstream's default and is the served
-// path; a positive count is refused by name, and what it names is the rounds
-// LOOP rather than the upsampler. The operator itself is ported and gated
-// (row LTX25-TEMPORAL-UPSAMPLER, `.agents/specs/ltx25-temporal-upsampler.md`) —
-// `PixelShuffle1d`, the first-frame drop, and the loader arm that reads
-// `temporal_upsample` off the checkpoint config all exist and pass.
+// SERVED. A value outside `{0, 1, 2}` is still a malformed request and is
+// refused first, before any work is paid for, exactly where upstream refuses it
+// (:284-285). Inside the set it runs the loop at `dfr_pipeline.py:402-529`,
+// which is the ONLY consumer of the temporal x2 latent upsampler in upstream or
+// here. Each round doubles the frame count as `2 * (frames - 1) + 1` (:408) and
+// the caller's contract is `(requested - 1) * 2**rounds + 1` (:534), so a
+// 9-frame request at 2 rounds returns 33.
 //
-// The key is defined here rather than left to the generic "unknown extra"
-// message for the reason #611 established: that message asserts the family does
-// not define the key, which is false, and sends the reader looking for a typo
-// instead of for the unported loop.
+// The knob is DFR's alone: no other pipeline `__call__` upstream takes one
+// (:277), so it is refused on every other `pipeline_kind` rather than ignored.
 inline constexpr char kLtx2TemporalRoundsExtra[] = "temporal_upsample_rounds";
+
+// The TEMPORAL x2 latent upsampler checkpoint — `temporal_upsampler_path`, a
+// LOAD extra, mirroring `DFRPipeline.__init__`'s own separate constructor
+// argument (ltx-pipelines/dfr_pipeline.py:174 against :177) and its separate
+// CLI flag (:578-583). Row LTX25-DFR-ROUNDS (#986).
+//
+// It is a SECOND slot rather than a reinterpretation of `upsampler_path`
+// because DFR needs both at once and they are different checkpoints: stage 2's
+// input transform takes the SPATIAL x2 upscaler, and the rounds loop takes the
+// TEMPORAL one. The engine refuses a checkpoint supplied in the wrong slot by
+// reading `spatial_upsample` / `temporal_upsample` off its own config rather
+// than trusting the file name, because the two share a class name and a tensor
+// layout and so the wrong one loads and runs and returns a wrongly shaped
+// latent.
+//
+// Required only when `temporal_upsample_rounds > 0`; absent it costs nothing.
+inline constexpr char kLtx2TemporalUpsamplerPathExtra[] = "temporal_upsampler_path";
 
 // ── RETAKE: regenerate a time window of an existing clip. Row LTX25-RETAKE ──
 // (#924), spec .agents/specs/ltx25-retake.md.
@@ -705,6 +721,89 @@ struct Ltx2ConditioningTrace {
   int64_t slot_marked_tokens = 0;
   int64_t canvas_frames = 0;
   int64_t canvas_segment = 0;
+
+  // ── DFR's temporal refinement ROUNDS (row LTX25-DFR-ROUNDS, #986) ──────────
+  //
+  // `temporal_rounds` is how many x2 rounds this render RAN, which is not the
+  // same question as how many were requested: they differ if the loop stops
+  // early, and a render that reports the requested count from the request
+  // rather than from the loop cannot tell the two apart.
+  //
+  // `temporal_upsample_calls` IS THE REACHABILITY INSTRUMENT. It counts calls
+  // to `Ltx2UpsampleVideoLatent` on the TEMPORAL arm, which before this row had
+  // no production call site anywhere in the tree — the operator was ported and
+  // gated at reduced dimensions and driven by nothing, which `docs/FEATURES.md`
+  // carried as `Temporal x2 ups gated, UNDRIVEN`. A render that reports rounds
+  // while this stays 0 upsampled nothing, and every other observable about it —
+  // the frame count, the shape, the exit status — is identical either way. That
+  // is exactly the "test-only driver" shape `.agents/reachability.md` names as
+  // the hardest to see, so it gets its own counter rather than an inference.
+  //
+  // `round_tile_counts` is the tile count per round. Upstream fixes it at
+  // `2**round_idx` (dfr_pipeline.py:415); a loop that denoised the canvas whole
+  // returns a correctly shaped, finite, plausible clip and reports 1 here.
+  //
+  // `round_conditioning_fps` is the CAPPED conditioning fps of each round
+  // (dfr_pipeline.py:414), capped at 60.0 for the reason upstream gives at
+  // :74-78: RoPE time is `pixel_frame / fps`, so an uncapped 120 fps time base
+  // halves every token's temporal span against the trained distribution and the
+  // clip decodes as a motion spike at each latent border followed by a stall.
+  // PLAYBACK fps is NOT capped (:542). A port that used one value for both is
+  // invisible in the frame count and in every shape assertion.
+  int64_t temporal_rounds = 0;
+  int64_t temporal_upsample_calls = 0;
+  std::vector<int64_t> round_tile_counts;
+  std::vector<double> round_conditioning_fps;
+
+  // The four upstream tile guarantees that NOTHING ELSE ON THIS STRUCT CAN SEE.
+  // Each one is mirrored in the rounds loop, each one changes the pixels, and
+  // each one leaves the frame count, the canvas, the tile counts, the upsample
+  // calls and the exit status exactly where they were. They are recorded for the
+  // reason `round_conditioning_fps` is: a render that got them wrong is a
+  // correctly shaped, finite, plausible clip.
+  //
+  // `round_tile_seeds` is the seed each tile's ANCESTRAL loop generator was
+  // actually constructed with, not the offset that was requested — read at the
+  // `SplitMixGaussian` that consumes it. Upstream varies it per tile,
+  // `seed + 1000 * round + tile` (dfr_pipeline.py:496-498), and says what a
+  // shared seed does: the tiles are positionally identical, so one seed injects
+  // BYTE-IDENTICAL noise into every window and the clip comes out with the same
+  // grain pattern repeating across it, at the right shape and the right length.
+  // Flat across rounds, delimited by `round_tile_counts`.
+  //
+  // `round_anchor_strengths` is the strength of every seam keyframe a tile
+  // pinned, read at the `Ltx2ConditionVideoByKeyframe` call that applies it.
+  // Upstream pins at 0.95, not 1.0 (:466, :70-72) — "pinned just short of fully
+  // clean so a tile can still settle its seam frame". At 1.0 the seam frame is
+  // frozen and cannot move to meet the frames either side of it, which shows up
+  // as a discontinuity at each window border and in no assertion about shape.
+  //
+  // `round_stepper_eta` is the ancestral eta each tile's sampler stepped with,
+  // recorded INSIDE the ancestral branch on the first non-terminal step, so it
+  // reports 0 entries for a tile that took the deterministic arm. Upstream's
+  // tile call switches the stepper to Euler-ancestral at eta 0.5 (:495); at eta
+  // 0 the step is plain Euler and the round adds no new detail at all, which is
+  // the whole point of running it.
+  //
+  // `round_merged_slot_positions` and `round_merged_slot_tiles` are the
+  // carry-forward bag each round hands the next one: the position, and THE TILE
+  // WHOSE COPY WON. Lead-in segments make a later tile re-emit an earlier tile's
+  // slot, and upstream's `setdefault` keeps the FIRST (:519-521) because that
+  // tile denoised the slot inside the window that owns it rather than inside a
+  // lead-in. The POSITIONS are identical under either rule — only the winning
+  // tile moves — so the tile index is the field that can detect the order and
+  // the position list alone cannot.
+  //
+  // `round_slots_emitted` is how many slots the tiles produced BEFORE the merge.
+  // It exists so the dedupe assertion is readable rather than magic: a render
+  // where it equals `round_merged_slot_positions.size()` had no duplicate to
+  // resolve, and its winning-tile sequence is therefore evidence of nothing.
+  std::vector<uint64_t> round_tile_seeds;
+  std::vector<double> round_anchor_strengths;
+  std::vector<double> round_stepper_eta;
+  std::vector<int64_t> round_merged_slot_positions;
+  std::vector<int64_t> round_merged_slot_tiles;
+  int64_t round_slots_emitted = 0;
 
   // ── AUDIO-TO-VIDEO: the supplied take, as the DiT received it (#922) ───────
   //

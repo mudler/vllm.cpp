@@ -263,7 +263,7 @@ both refuse, naming what is missing.
 | Backend | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
-| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ | ◐ | ☐ | ✅ |
+| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ `CPU_ATTN` registered (#1371/#1392, [spec](../.agents/specs/attn-validate-configuration.md)) | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ builds under Apple Clang with project warnings promoted to errors, the Qwen3.5 MoE loader included; its layout-refusal path uses the same messages and behavior on every platform (#1054) | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0: 5 gfx archs; dense/GDN all-native; 0.8B dispatch fixed. **M4:** Qwen3-0.6B/3.5-0.8B 16/16 (#41). **M3:** `ROCM_ATTN` registered (#1056/#1065, [spec](../.agents/specs/rocm-attn-backend.md)). CPU parity open (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |

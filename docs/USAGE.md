@@ -797,7 +797,10 @@ the reference engine's CPU backend serves. `FLASH_ATTN` declares the two half
 dtypes only, so while the CPU was borrowing it an `f32` model was refused at
 initialization with `dtype not supported`. It now runs. The KV-cache dtypes the
 CPU accepts are `auto`, `fp8` and `fp8_e4m3`; `fp8_e5m2` is refused by name,
-because the CPU kernel's fp8 arm reads e4m3 alone.
+because the CPU kernel's fp8 arm reads e4m3 alone. On an NVIDIA GPU the list is
+`auto`, `float16`, `bfloat16`, `fp8` and `fp8_e4m3`, so `fp8_e5m2` is refused
+there too. That second refusal is the reference engine's own and is not
+something this project trimmed away.
 
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend

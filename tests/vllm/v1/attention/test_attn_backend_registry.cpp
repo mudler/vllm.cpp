@@ -592,7 +592,7 @@ TEST_CASE("fp32 on a CPU platform resolves CPU_ATTN (ported test_fp32_fallback)"
   //
   // WHY THIS CASE IS THE ONE THE #1371 CHANGE OWED. `supported_dtypes` is the
   // one declaration in the new capability surface that changes a live answer:
-  // FLASH_ATTN declares {f16, bf16} (backend.py:59, which flash_attn.py:71
+  // FLASH_ATTN declares {f16, bf16} (backend.py:59, which flash_attn.py:73
   // repeats verbatim), so before CPU_ATTN was registered an f32 CPU request was
   // REFUSED with "dtype not supported" and there was nothing behind it. Both
   // halves are asserted below, so neither the refusal nor the fallback can move
@@ -683,7 +683,7 @@ TEST_CASE("CPU_ATTN declares cpu_attn.py's capability surface, entry for entry")
   CHECK(b->supports_kv_cache_dtype("fp8_e4m3"));
   CHECK_FALSE(b->supports_kv_cache_dtype("fp8_e5m2"));
   // Upstream's CPU list omits the explicit half-dtype names that FLASH_ATTN's
-  // carries (flash_attn.py:71-78), so ours does too — the deviation is e5m2 and
+  // carries (flash_attn.py:74-80), so ours does too — the deviation is e5m2 and
   // ONLY e5m2.
   CHECK_FALSE(b->supports_kv_cache_dtype("float16"));
   CHECK_FALSE(b->supports_kv_cache_dtype("bfloat16"));

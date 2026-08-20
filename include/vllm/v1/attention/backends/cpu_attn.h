@@ -67,7 +67,7 @@
 //    This is NOT the same omission FlashAttentionBackend makes, and an earlier
 //    draft of this comment said it was. FLASH_ATTN's list here is
 //    ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3"], which is
-//    flash_attn.py:71-78 VERBATIM — upstream's FA backend never claimed e5m2, so
+//    flash_attn.py:74-80 VERBATIM — upstream's FA backend never claimed e5m2, so
 //    nothing was trimmed from it and it is no precedent for anything. This
 //    deviation stands on our own kernel's single encoding, and on that alone.
 #ifndef VLLM_V1_ATTENTION_BACKENDS_CPU_ATTN_H_

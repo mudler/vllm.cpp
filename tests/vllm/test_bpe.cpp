@@ -25,7 +25,6 @@
 using vllm::tok::BpeSplit;
 using vllm::tok::ByteToUnicode;
 using vllm::tok::MapBytesToUnicode;
-using vllm::tok::MergeKey;
 using vllm::tok::MergeRanks;
 using vllm::tok::SplitPattern;
 using vllm::tok::Tokenizer;
@@ -203,10 +202,13 @@ TEST_CASE("MapBytesToUnicode/UnmapUnicodeToBytes round-trip all bytes") {
 
 TEST_CASE("BpeSplit merges lowest rank first, leftmost on ties") {
   MergeRanks ranks;
-  ranks[MergeKey("l", "l")] = 0;
-  ranks[MergeKey("h", "e")] = 1;
-  ranks[MergeKey("ll", "o")] = 2;
-  ranks[MergeKey("he", "llo")] = 3;
+  CHECK(ranks.Insert("l", "l", 0));
+  CHECK(ranks.Insert("h", "e", 1));
+  CHECK(ranks.Insert("ll", "o", 2));
+  CHECK(ranks.Insert("he", "llo", 3));
+  // A repeated pair is refused rather than silently re-ranked; the loader
+  // turns that into a named failure.
+  CHECK_FALSE(ranks.Insert("l", "l", 99));
   using V = std::vector<std::string>;
   // h e l l o -> h e ll o -> he ll o -> he llo -> hello
   CHECK(BpeSplit("hello", ranks) == V{"hello"});
@@ -219,8 +221,60 @@ TEST_CASE("BpeSplit merges lowest rank first, leftmost on ties") {
   CHECK(BpeSplit("h", ranks) == V{"h"});
   // Multi-byte mapped symbols merge as whole codepoints.
   MergeRanks r2;
-  r2[MergeKey("Ġ", "Ġ")] = 0;
+  CHECK(r2.Insert("Ġ", "Ġ", 0));
   CHECK(BpeSplit("ĠĠĠ", r2) == V{"ĠĠ", "Ġ"});  // leftmost tie
+}
+
+TEST_CASE("MergeRanks interns symbols and keys merges on identifier pairs") {
+  // Mirrors HF `tokenizers` `MergeMap` (models/bpe/model.rs:19): the key is a
+  // pair of identifiers and the value carries `(rank, new_id)`.
+  MergeRanks ranks;
+  REQUIRE(ranks.empty());
+  CHECK(ranks.Insert("a", "b", 0));
+  CHECK(ranks.Insert("ab", "c", 1));
+  CHECK(ranks.size() == 2);
+  // "a", "b", "ab", "c", "abc" — the concatenation is interned too, which is
+  // what makes `new_id` a real identifier the next probe can use.
+  CHECK(ranks.SymbolCount() == 5);
+
+  const auto a = ranks.Find("a");
+  const auto b = ranks.Find("b");
+  const auto ab = ranks.Find("ab");
+  REQUIRE(a != MergeRanks::kNoSymbol);
+  REQUIRE(b != MergeRanks::kNoSymbol);
+  REQUIRE(ab != MergeRanks::kNoSymbol);
+  CHECK(ranks.Text(a) == "a");
+  CHECK(ranks.Text(ab) == "ab");
+
+  const MergeRanks::Entry* e = ranks.Find(a, b);
+  REQUIRE(e != nullptr);
+  CHECK(e->rank == 0);
+  CHECK(e->new_id == ab);          // new_id IS the identifier of "ab"
+  CHECK(ranks.Text(e->new_id) == "ab");
+  CHECK(ranks.Find(b, a) == nullptr);  // the pair is ordered
+
+  // A symbol no merge names has no identifier, and no merge can apply to it.
+  CHECK(ranks.Find("z") == MergeRanks::kNoSymbol);
+  CHECK(ranks.Find(MergeRanks::kNoSymbol, a) == nullptr);
+  CHECK(ranks.Find(a, MergeRanks::kNoSymbol) == nullptr);
+}
+
+TEST_CASE("MergeRanks: two pairs with the same concatenation share one new_id") {
+  // This is what upstream's staleness test rests on. `word.rs:197-205` compares
+  // `new_id`, NOT the pair, so a table where two distinct pairs produce the
+  // same string treats a queued entry for either as live. A pair comparison
+  // would reject it. The property is only expressible on an identifier-keyed
+  // table, which is why W2 comes before W3.
+  MergeRanks ranks;
+  CHECK(ranks.Insert("ab", "c", 0));   // -> "abc"
+  CHECK(ranks.Insert("a", "bc", 1));   // -> "abc", a DIFFERENT pair
+  const MergeRanks::Entry* left_first = ranks.Find(ranks.Find("ab"), ranks.Find("c"));
+  const MergeRanks::Entry* right_first = ranks.Find(ranks.Find("a"), ranks.Find("bc"));
+  REQUIRE(left_first != nullptr);
+  REQUIRE(right_first != nullptr);
+  CHECK(left_first->rank != right_first->rank);
+  CHECK(left_first->new_id == right_first->new_id);
+  CHECK(ranks.Text(left_first->new_id) == "abc");
 }
 
 TEST_CASE("FromHfJson: oracle-verified encode/decode on tiny fixture") {
@@ -537,6 +591,68 @@ TEST_CASE("FromGguf: matches the FromHfJson-loaded tiny fixture") {
   CHECK(tok.Encode("hello<|end|>of world") == Ids{13, 21, 17});
   CHECK(tok.TokenText(17) == "Ġworld");
   CHECK(tok.TokenText(19) == "<|end|>");
+}
+
+TEST_CASE("merge naming a token outside the vocabulary is refused AT LOAD") {
+  // Mirrors HF `tokenizers` `MergeTokenOutOfVocabulary`
+  // (tokenizers/src/models/bpe/model.rs:174-192). Before this rule the failure
+  // arrived PER REQUEST, out of Tokenizer::EncodePlain, as `symbol "..." not in
+  // vocab` — a message naming a string the checkpoint's author never wrote.
+  //
+  // Both load surfaces reach the same table through the same InsertMerge, and
+  // both are gated here: `tokenizer.ggml.merges` is written by a CONVERTER
+  // rather than copied from the original checkpoint, and HF never reads GGUF,
+  // so that arm has no oracle and needs its own case.
+  SUBCASE("FromHfJson: left token absent") {
+    // "q" is in no vocab entry of kTinyJson.
+    const std::string body =
+        ReplaceOnce(kTinyJson, R"(["Ġw", "orld"]])", R"(["Ġw", "orld"], ["q", "e"]])");
+    CheckThrowsContains([&] { LoadTiny(body); }, "\"q\"");
+  }
+  SUBCASE("FromHfJson: right token absent") {
+    const std::string body =
+        ReplaceOnce(kTinyJson, R"(["Ġw", "orld"]])", R"(["Ġw", "orld"], ["h", "q"]])");
+    CheckThrowsContains([&] { LoadTiny(body); }, "\"q\"");
+  }
+  SUBCASE("FromHfJson: the CONCATENATION is absent") {
+    // Both halves are in the vocab; "hw" is not. Upstream refuses this too,
+    // because `new_id` has to exist for the merge to name a token.
+    const std::string body =
+        ReplaceOnce(kTinyJson, R"(["Ġw", "orld"]])", R"(["Ġw", "orld"], ["h", "w"]])");
+    CheckThrowsContains([&] { LoadTiny(body); }, "\"hw\"");
+  }
+  SUBCASE("FromHfJson: the message names the merge as well as the token") {
+    const std::string body =
+        ReplaceOnce(kTinyJson, R"(["Ġw", "orld"]])", R"(["Ġw", "orld"], ["h", "q"]])");
+    CheckThrowsContains([&] { LoadTiny(body); }, "h q");
+  }
+  SUBCASE("FromGguf: a merge naming an absent token is refused, with the name") {
+    auto kvs = TinyGgufKvs();
+    const std::vector<std::string> merges = {"l l",   "h e",   "ll o",
+                                             "he llo", "Ġ w",  "o r",
+                                             "l d",   "or ld", "Ġw orld",
+                                             "h q"};
+    kvs[4] = gguf_test::StrArrayKv("tokenizer.ggml.merges", merges);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "\"q\"");
+  }
+  SUBCASE("FromGguf: the well-formed fixture still loads") {
+    // The regression the refusal can cause, asserted rather than assumed.
+    const Tokenizer tok = LoadGguf(TinyGgufKvs());
+    CHECK(tok.Encode("hello world") == Ids{13, 17});
+  }
+  SUBCASE("every committed HF golden still loads") {
+    // The stop condition of the spec: if the mirror costs us a checkpoint that
+    // works today, that is a developer decision, not a quiet widening.
+    for (const char* rel : {"/tokenizer_qwen36/tokenizer.json",
+                            "/tokenizer_mistral/tokenizer.json",
+                            "/tokenizer_deepseek_v2/tokenizer.json",
+                            "/tokenizer_muse_glimmer/tokenizer.json"}) {
+      CAPTURE(rel);
+      const std::string path = std::string(PARITY_GOLDENS_DIR) + rel;
+      const Tokenizer tok = Tokenizer::FromHfJson(path);
+      CHECK(tok.VocabSize() > 0);
+    }
+  }
 }
 
 TEST_CASE("FromGguf: pre \"llama-bpe\" maps to kLlama3, bos kv honored") {

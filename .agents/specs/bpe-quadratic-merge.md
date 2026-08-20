@@ -323,9 +323,9 @@ selects this version. The implementing row records the version it read.
 | `word.rs:37-43` `Symbol {c, prev, next, len}` | `std::vector<std::string>` with `erase` per merge | a linked symbol list with `len = 0` tombstones |
 | `word.rs:28-35` `Ord for Merge` | `strict <` inside the scan | an explicit comparator, with the tie pinned by a test |
 | `mod.rs:9`, `model.rs:19` identifier-keyed `MergeMap` | `MergeRanks = unordered_map<string, int32_t>` in `include/vllm/tokenizer/bpe.h` | an identifier-pair-keyed table built at load |
-| `src/vllm/tokenizer/bpe.cpp::MergeKey` | one `std::string` per probe | deleted; there is no key to build |
+| `MergeKey` in `src/vllm/tokenizer/bpe.cpp`, deleted by this row | one `std::string` per probe | deleted; there is no key to build |
 | `model.rs:180-189` `MergeTokenOutOfVocabulary` | no rule; the failure appears per request in `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` | refused at load, naming the missing token, on `FromHfJson` AND `FromGguf` |
-| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: `src/vllm/tokenizer/bpe.cpp::MergeKey` concatenates `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
+| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: the `MergeKey` this row deletes concatenated `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
 | `model.rs:382-460` `merge_word` | `src/vllm/tokenizer/tokenizer.cpp::EncodePlainSp`'s symbol builder | unchanged in behaviour, emitting identifiers |
 | `model.rs:475-496` word cache | absent | still absent, and out of scope |
 

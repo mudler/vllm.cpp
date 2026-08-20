@@ -963,6 +963,10 @@ vllm_cpp_add_test(test_tokenizer_metaspace_split
 target_compile_definitions(test_tokenizer_metaspace_split PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
+# The load-time MergeTokenOutOfVocabulary refusal asserts that every
+# committed HF golden still loads, so test_bpe reaches the goldens dir.
+target_compile_definitions(test_bpe PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 # SPEC-BPE-QUADRATIC-MERGE (#1365) — the long-pretoken equivalence corpus and
 # the absolute cost bound. The corpus ids are HF `tokenizers` 0.22.2 output over
 # the two committed goldens (an oracle, not a snapshot of ours); the cost case

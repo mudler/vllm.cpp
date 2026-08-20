@@ -88,6 +88,25 @@ Dflash2ProposeState Dflash2SelectCandidates(const std::vector<float>& block_logi
   const int64_t vocab = weights.draft_vocab_size;
   const int64_t H = config.hidden_size;
   VT_CHECK(vocab > 0 && H > 0, "dflash2 select-candidates: invalid draft vocab/hidden");
+  // SPEC-DFLASH2 W5 (#1314): the codebooks must SPAN the vocabulary the
+  // candidates are drawn from, and this is the first wave where the two numbers
+  // can disagree. `vocab` is the TARGET's head width (`draft_vocab_size`, set
+  // from `lm_head.shape[0]` by the loader); the codebook extent comes from the
+  // DRAFT checkpoint. On the safetensors arm both trace back to one
+  // `config.json`, so they could not differ. A GGUF draft declares no vocab at
+  // all -- it is sized from its own `tokenizer.ggml.tokens` -- so a drafter
+  // paired with the wrong target now reaches here with a codebook SHORTER than
+  // the ids that index it, which is an out-of-range read of a 127 MB tensor
+  // rather than a wrong answer. Refused by name, and the numbers are quoted
+  // because the fix is to pair the draft with the target it was trained on.
+  const int64_t codebook_rows =
+      weights.candidate_selector.predecessor_codebook.shape[0];
+  VT_CHECK(codebook_rows == vocab,
+           "dflash2 select-candidates: the draft's candidate-selector codebooks "
+           "hold " + std::to_string(codebook_rows) +
+               " rows but the target's head is " + std::to_string(vocab) +
+               " wide; the codebooks are indexed by TARGET token id, so this "
+               "draft was not trained against this target (SPEC-DFLASH2, #1314)");
   VT_CHECK(static_cast<int64_t>(block_logits.size()) == P * nq * vocab,
            "dflash2 select-candidates: block_logits must be [num_reqs*(1+k), draft_vocab]");
   VT_CHECK(static_cast<int64_t>(block_hidden.size()) == P * nq * H,

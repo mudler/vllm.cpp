@@ -76,6 +76,10 @@ proposals losslessly, so the emitted tokens do not change. Pass the draft with
 build/examples/vllm-server   --model /path/to/target   --speculative-config '{"method":"dflash","model":"/path/to/draft","num_speculative_tokens":7}'
 ```
 
+The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
+DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
+picking a smaller quantization saves download and disk and does not save memory.
+
 [Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
 draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other

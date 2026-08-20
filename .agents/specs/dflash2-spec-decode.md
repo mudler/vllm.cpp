@@ -350,6 +350,12 @@ Ours, red-first, beyond the ports:
   deficit that was a divergent-trajectory measurement confound, and D9 refuted
   it. This gate does not repeat that mistake.
 - G4: the GGUF drafter arm, with the lower bound of `## Tests to port`.
+  **DISCHARGED by W5 on CPU**, at the three published encodings (bf16, Q8_0,
+  Q4_K) and with the lower bound's three legs measured rather than argued:
+  the block-encoded byte count, bit-exact values against the suite's own
+  encoders, and difference from the bf16 arm at both the tensor and the block
+  logits. What G4 does NOT cover and G2/G3 still owe is a GGUF-sourced DFlash2
+  draft running against a real 27B target on a device.
 - G5: reachability, as above. **DISCHARGED by W4** for the whole DFlash2 chain:
   `tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` drives a real
   `LoadedEngine` through `GPUModelRunner::propose_drafts_block`, the engine
@@ -409,7 +415,7 @@ reviewer who mutates the guarantee rather than reading it.
   realized-q draft-logit cache moved with it, for the same reason and by
   upstream's own polarity: at `66e5414c` `_generate_draft` calls it only when a
   proposal distribution exists.
-- **W5 — the GGUF drafter arm**, with its lower bound.
+- **W5 — the GGUF drafter arm**, with its lower bound. LANDED 2026-08-20.
 - **W6 — the gates.** G2 and G3 on a leased GPU against the PR-head oracle,
   then `## Outcome`.
 
@@ -547,9 +553,12 @@ reviewer who mutates the guarantee rather than reading it.
   first generated token rather than at startup. It is paid down by a STARTUP
   NOTICE from `CheckDflash2DraftArm` naming the mechanism that runs, the one that
   does not, the wave that owns it and the issue, so nothing is a surprise. The
-  GGUF arm KEEPS the startup refusal, because its drafter arm (W5) has no conv
-  weight path at all and admitting the file would load a DFlash1 draft out of a
-  DFlash2 checkpoint.
+  GGUF arm KEPT the startup refusal through W4, because its drafter arm had no
+  conv weight path at all and admitting the file would have loaded a DFlash1
+  draft out of a DFlash2 checkpoint. **W5 lands that path, so the refusal is gone
+  from that container too** and `CheckDflash2DraftArm` now only ever prints. The
+  polarity D10 set is what made the sequence safe: each container was admitted in
+  the wave that could actually run it, and never one wave earlier.
 
 - **D13 — the PROBABILISTIC draft-sample arm is NOT ported, and the greedy arm
   this row ships is upstream's greedy arm exactly.** W4 decision, 2026-08-20.
@@ -1141,6 +1150,44 @@ list items.
   an argument, not on a measurement, and the operator's lease owes the
   measurement together with everything else in this entry.
 
+- **O13 — a GGUF drafter is DEQUANTIZED to bf16 at load, so the k-quant arms
+  ship without their memory saving.** Owner: this row, recorded rather than
+  fixed. Issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  This is the DFlash GGUF lane's own design, established by `SPEC-DFLASH-GGUF`
+  and argued in the file comment on
+  `src/vllm/model_executor/models/qwen3_dflash_gguf.cpp`: the resolver
+  dequantizes wholesale so that the ENTIRE safetensors weight body is reused
+  unchanged, which is affordable because a DFlash draft is a handful of layers.
+  W5 does not change it, and deliberately: doing so would be a keep-quant
+  residency port of the whole DFlash lane, not a DFlash2 wave.
+
+  What W5 changes is the SIZE of the bill, so it is measured here rather than
+  left to a gate host. Summed over `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`'s own
+  tensor table on 2026-08-20: 1 924 404 480 elements, so 3 848 808 960 bytes
+  (3.584 GiB) resident bf16 against 1 143 006 752 bytes on disk -- a 3.37x
+  expansion, where the DFlash1 drafter's ratio at the same quant is smaller
+  because it has no selector. 254 279 680 of those bytes are the two codebooks,
+  which is `## Risks/decisions` D5's number arriving on the container most users
+  run. The consequence is bounded and named: choosing Q4_K_M over BF16 saves
+  download and disk and saves NOTHING at runtime. `docs/SPECULATIVE-DECODING.md`
+  says so where a user picking a file will read it.
+
+- **O14 — `LoadDflashDraft`'s GGUF branch is still not gated from a production
+  entry point.** Owner: this row. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). This is O5's shape,
+  unchanged by W5 and named again because W5 adds lines to that branch's
+  neighbourhood rather than to the branch. `test_qwen3_dflash2_gguf.cpp` drives
+  the exact pair `LoadDflashDraft` calls -- `MakeDflashGgufConfig` then
+  `LoadQwen3DFlashFromGguf` -- and `test_dflash2_draft_routing.cpp` drives
+  `FromModelDir` far enough to prove the classification runs on a real GGUF
+  ahead of every path operation. What neither reaches is the function itself,
+  for O5's reason: it is `static` inside the loader's anonymous namespace, and
+  the only real-engine harness enters through the in-memory `DflashDraft`
+  overload. The bounded consequence is unchanged: a dropped
+  `conv_block_size = draft->k + 1` leaves 0 and the first DFlash2 forward
+  refuses BY NAME, which W4 made true by removing the checkpoint-derived seed.
+
 - **O12 — the PROBABILISTIC draft-sample arm and its realized-q cache are NOT
   ported.** Owner: `SPEC-ACCEPT-VARIANTS` (`.agents/engine-matrix.md`) for the
   configuration and the verify; this row for the DFlash2 half when that lands.
@@ -1181,8 +1228,9 @@ list items.
 `SPEC-DFLASH2` is `ACTIVE`. W1 landed on 2026-08-19 (the route and D4's
 `is_causal` precedence). W2 landed on 2026-08-19 (the grouped dynamic depthwise
 convolution, REACHED). W3 landed on 2026-08-20 (the candidate selector, reached
-from the runner). **W4 landed on 2026-08-20: THE PATH WALK. A DFlash2 draft
-DRAFTS.**
+from the runner). W4 landed on 2026-08-20 (the path walk; a safetensors DFlash2
+draft DRAFTS). **W5 landed on 2026-08-20: THE GGUF DRAFTER ARM. Both containers
+draft, and the startup refusal is gone from both.**
 
 **What W4 ships is the end of the mechanism.** `vt::Dflash2PathWalk`
 (`OpId::kDflash2PathWalk`, kernel-matrix row `KERNEL-DFLASH2-PATH-WALK`) turns
@@ -1345,10 +1393,88 @@ it reachable), O10 (the CUDA top-k's NaN ordering, owned by
 arm, written and never compiled here) and O12 (the probabilistic arm). O6, O7 and
 O8 stay discharged.
 
-Next action: W5, the GGUF drafter arm with its lower bound — the one container
-that still refuses a DFlash2 checkpoint at startup, and the arm most users run.
-Then W6's G2/G3 on a leased GPU against the PR-head oracle. **No throughput
-number is claimed by this wave and none is admissible yet**: `## Gates` defers
-every ratio until G2 and G3 read, and a DFlash2 draft is additionally off the
-paged CUDA-graph fast path, because the selector needs the hidden states of the
-same forward its logits came from.
+**W5 LANDED on 2026-08-20: THE GGUF DRAFTER ARM. Both containers now draft.**
+
+**What W5 ships is a name for what the file already contained.** The published
+DFlash2 GGUF is not a different model from the safetensors draft; it is the same
+81 tensors under llama.cpp's own vocabulary, and through W4 this tree had a name
+for none of the eleven that make it DFlash2. `MakeDflashGgufConfig` now carries
+`conv_kernel_size`, `conv_group_size`, `selector_rank` and `selector_top_k` into
+`dflash_config`, and `LoadQwen3DFlashFromGguf` resolves
+`blk.N.{attn,ffn}_conv_{base,proj.weight}` and
+`selector_{hidden,predecessor,successor}.weight`. The KEY SPELLING IS MEASURED
+rather than mirrored from HF by hope: every DFlash2 config key the published file
+writes is the HF key name VERBATIM under the `dflash.` prefix, five of five, read
+off the artifact on 2026-08-20. The TENSOR names are not derivable at all —
+`attention_conv` becomes `attn_conv`, `mlp_conv` becomes `ffn_conv`,
+`kernel_projection` becomes `conv_proj`, `candidate_selector.X_codebook` becomes
+`selector_X.weight`, and the base kernel keeps no `.weight` suffix while the
+projection does — so they are read and then held against all three published
+arms by an asset-gated case.
+
+**THE STARTUP REFUSAL IS GONE ON BOTH CONTAINERS, and the notice that replaces it
+is now the function's whole output.** `CheckDflash2DraftArm` no longer throws for
+any DFlash2 draft. It still runs, and it still prints, for three things a user
+cannot read off a checkpoint: the port is BEYOND the parity pin, no throughput
+number has been taken, and a GGUF drafter is dequantized to bf16 at load. That
+last one is `## Owed` O13 and is the honest cost of this arm.
+
+**THE NAME MAP IS GATED BY CONSTRUCTION, not by reading it.** The bf16 GGUF arm
+is required BIT-IDENTICAL to the same draft written as safetensors under the
+published HF names — 1 120 000 bf16 elements over 25 tensors, from one set of
+source values written into two containers. A name pointed at the wrong tensor,
+transposed, or dropped moves those bytes; nothing in the gate restates the
+mapping. Mutation-proven: swapping the two codebook names, pointing
+`attention_conv.base_kernel` at the MLP sublayer, and pointing the MLP projection
+at the attention one each redden 3 cases / 6 assertions.
+
+**AND THE QUANTIZED ARMS CARRY A LOWER BOUND, because a token gate here cannot.**
+This lane dequantizes by design, so the standing trap is acute rather than
+absent: a k-quant tensor that never decoded would leave every token matching and
+every golden passing. The gate therefore has three legs, none of them a token
+comparison. L1 the BYTES, read off the tensor table the loader itself reads —
+MEASURED at 22 quantized tensors, 1 114 112 elements in 626 688 bytes for Q4_K
+and 1 183 744 for Q8_0, against 2 228 224 for the same tensors in bf16. L2 the
+VALUES, bit-for-bit over 266 240 elements against an expectation the test
+computes from the block integers it CHOSE — the suite carries its own Q8_0 and
+Q4_K encoders, including the inverse of `get_scale_min_k4`'s 6-bit scale pack, so
+the comparison is a round trip through two implementations rather than a shared
+helper agreeing with itself. L3 DIFFERENCE from the bf16 arm, at 7 of 7
+quantized DFlash2 tensors and 2048 of 2048 block logits, with the F32 tensors no
+arm quantizes required IDENTICAL so the leg cannot be satisfied by a loader that
+garbled everything.
+
+**Two guards land with the arm, and both are gated by message rather than by a
+bare throw.** All four DFlash2 geometry keys are REQUIRED once the file is
+classified — `IsDflash2Gguf` answers on any one of three, so a subset would
+otherwise be admitted with a guessed `conv_group_size`, which sizes the
+projection wrong and is acceptance-only. And the selector's codebooks must SPAN
+the target's head: W5 is the first wave where the two numbers can disagree,
+because a GGUF draft declares no vocabulary and is sized from its own
+`tokenizer.ggml.tokens` while the ids that index the codebooks come from the
+target's `lm_head`. A mispaired checkpoint used to be an out-of-range read of a
+127 MB tensor; it is now a refusal naming both widths. The vocabulary is taken
+from the tokenizer and NOT from the codebooks, because a check that read its own
+expectation off the tensor under test would report a transposed or truncated pair
+as correct.
+
+**D9's OUTPUT SCALARS are gated on this container too**, against declared values
+rather than defaults, even though NEITHER published DFlash2 GGUF sets them — that
+absence is exactly why, since a gate built from those files alone measures the
+default path and reports it as coverage. `input_embedding_scale` stays REFUSED BY
+NAME here as it is on the safetensors arm, with the equal-to-default arm asserted
+not to refuse.
+
+**Owed after W5:** O5 and O14 (the loader's GGUF and DFlash2 lines are still not
+reachable from a production entry point, for the same structural reason, with the
+bounded consequence named), O9 (`input_embedding_scale`), O10 (the CUDA top-k's
+NaN ordering, [#1489](https://github.com/mudler/vllm.cpp/issues/1489)), O11 (the
+walk's CUDA arm, never compiled here), O12 (the probabilistic arm) and the new
+O13 (a GGUF drafter's bf16 residency, measured at 3.584 GiB against 1.06 GiB on
+disk). O6, O7 and O8 stay discharged.
+
+Next action: W6's G2/G3 on a leased GPU against the PR-head oracle, then
+`## Outcome`. **No throughput number is claimed by this wave and none is
+admissible yet**: `## Gates` defers every ratio until G2 and G3 read, and a
+DFlash2 draft is additionally off the paged CUDA-graph fast path, because the
+selector needs the hidden states of the same forward its logits came from.

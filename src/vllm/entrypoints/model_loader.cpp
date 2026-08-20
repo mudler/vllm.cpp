@@ -490,10 +490,15 @@ std::vector<std::string> ReadDflashDraftArchitectures(const std::string& path) {
 //    `## Nothing lands dead`. The notice below is what a user gets at STARTUP so
 //    the later refusal is not a surprise; it is a notice and not a warning about
 //    a degraded result, because there is no degraded result: the engine refuses.
-//  * GGUF is still REFUSED, because the GGUF drafter ARM is wave W5: neither the
-//    config reader nor the weight path has a name for a conv tensor, so admitting
-//    the file would load a DFlash1 draft out of a DFlash2 checkpoint -- the exact
-//    silent degradation this function exists to prevent.
+//  * GGUF was REFUSED through W4, because the GGUF drafter ARM was wave W5:
+//    neither the config reader nor the weight path had a name for a conv tensor,
+//    so admitting the file would have loaded a DFlash1 draft out of a DFlash2
+//    checkpoint -- the exact silent degradation this function exists to prevent.
+//    W5 (#1314) LANDS that arm, so the refusal is gone and this container gets
+//    the same startup notice the other one does. Both arms now print and neither
+//    throws; the function stays because the notice is what tells a user the port
+//    is beyond the parity pin and carries no throughput number, which is not
+//    readable off any checkpoint.
 void CheckDflash2DraftArm(const std::string& draft_model_path) {
   // WHAT IDENTIFIED THE FILE, which differs by container and is quoted back to
   // the user because the two arms are otherwise indistinguishable in a message.
@@ -514,57 +519,43 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
     } catch (const std::exception&) {
       return;
     }
-    identity = "carries the DFlash2-only metadata key \"" + matched + "\"";
+    identity = "carries the DFlash2-only metadata key \"" + matched +
+               "\" (a GGUF declares no architecture this could read: the "
+               "published DFlash2 drafter writes the same \"dflash\" a DFlash1 "
+               "drafter writes)";
   } else {
-    // The safetensors arm, ADMITTED as of W2 -- with the boundary stated at
-    // startup rather than discovered at the first generated token.
+    // The safetensors arm, ADMITTED as of W2 and drafting as of W4. This is the
+    // container upstream classifies on, and the only one that HAS an
+    // architecture string to classify with.
     const std::vector<std::string> architectures =
         ReadDflashDraftArchitectures(draft_model_path);
     if (!vllm::SpeculativeConfig::IsDflash2Draft(architectures)) return;
-    // W4 (#1314): the boundary this notice reported for three waves is GONE on
-    // this arm. It still prints, because two things a user cannot read off the
-    // checkpoint are still true -- the port is beyond the parity pin, and no
-    // throughput number has been taken for it -- and because a notice that
-    // vanished the moment the lane started working would leave a DFlash2 run
-    // indistinguishable from a DFlash1 one in the log.
-    std::cerr
-        << "vllm.cpp: the draft checkpoint at \"" << draft_model_path
-        << "\" declares architecture \"DFlash2DraftModel\". Its grouped dynamic "
-           "depthwise convolution, its CANDIDATE SELECTOR and its PATH WALK are "
-           "all implemented and will run, so this draft DRAFTS (row SPEC-DFLASH2 "
-           "waves W1-W4, .agents/specs/dflash2-spec-decode.md, issue #1314). Two "
-           "things are still owed and neither is silent: the GGUF DFlash2 drafter "
-           "arm is refused by name (wave W5), and no throughput number has been "
-           "taken for this architecture -- a DFlash2 draft runs its block forward "
-           "off the paged CUDA-graph fast path, because the candidate selector "
-           "needs the hidden states of the same forward its logits came from. "
-           "This port mirrors vllm-project/vllm#52816, which is OPEN upstream at "
-           "head 66e5414c6d75a8529473d977f7458c140bbab8a0; it does not advance the "
-           "parity pin.\n";
-    return;
+    identity = "declares architecture \"DFlash2DraftModel\"";
   }
-  throw std::invalid_argument(
-      "speculative-config: the draft checkpoint at \"" + draft_model_path +
-      "\" " + identity +
-      ", and the DFlash2 GGUF drafter ARM "
-      "is not implemented here. A GGUF DFlash2 drafter needs its own weight path: "
-      "`MakeDflashGgufConfig` reads none of the DFlash2 metadata beyond the keys "
-      "that identify the file, and `LoadQwen3DFlashFromGguf` has no name for the "
-      "conv or selector tensors. The SAFETENSORS DFlash2 draft is admitted as of "
-      "SPEC-DFLASH2 W2: its grouped dynamic depthwise convolution, its candidate "
-      "selector (W3) and its path walk (W4) are all implemented and run, so a "
-      "safetensors DFlash2 draft DRAFTS "
-      "(vllm/model_executor/models/qwen3_dflash2.py and "
-      "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py @ "
-      "vllm-project/vllm#52816 head 66e5414c6d75a8529473d977f7458c140bbab8a0). "
-      "Loading this file through the DFlash1 GGUF lane instead would succeed, "
-      "because a DFlash2 GGUF carries DFlash1's whole tensor set and declares the "
-      "same `general.architecture`, and it would draft worse tokens with no "
-      "visible symptom: the verify is lossless, so the emitted tokens are still "
-      "the target's and only acceptance falls. Owed by row SPEC-DFLASH2 wave W5 "
-      "(.agents/specs/dflash2-spec-decode.md), issue #1314 "
-      "(https://github.com/mudler/vllm.cpp/issues/1314). Use a DFlashDraftModel "
-      "checkpoint until that wave lands.");
+  // W4 (#1314) removed the boundary on the safetensors arm; W5 removes it on the
+  // GGUF one, so this notice is now the function's WHOLE output and both
+  // containers reach it. It still prints, because three things a user cannot
+  // read off the checkpoint are true -- the port is beyond the parity pin, no
+  // throughput number has been taken for it, and the GGUF arm dequantizes a
+  // quantized drafter to bf16 -- and because a notice that vanished the moment
+  // the lane started working would leave a DFlash2 run indistinguishable from a
+  // DFlash1 one in the log.
+  std::cerr
+      << "vllm.cpp: the draft checkpoint at \"" << draft_model_path << "\" "
+      << identity
+      << ". Its grouped dynamic depthwise convolution, its CANDIDATE SELECTOR "
+         "and its PATH WALK are all implemented and will run, so this draft "
+         "DRAFTS -- from safetensors and from GGUF alike (row SPEC-DFLASH2 waves "
+         "W1-W5, .agents/specs/dflash2-spec-decode.md, issue #1314). Two things "
+         "are still owed and neither is silent: a GGUF drafter is DEQUANTIZED "
+         "wholesale to bf16 at load, so a k-quant draft costs its bf16 residency "
+         "rather than its file size, and no throughput number has been taken for "
+         "this architecture -- a DFlash2 draft runs its block forward off the "
+         "paged CUDA-graph fast path, because the candidate selector needs the "
+         "hidden states of the same forward its logits came from. This port "
+         "mirrors vllm-project/vllm#52816, which is OPEN upstream at head "
+         "66e5414c6d75a8529473d977f7458c140bbab8a0; it does not advance the "
+         "parity pin.\n";
 }
 
 // SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark

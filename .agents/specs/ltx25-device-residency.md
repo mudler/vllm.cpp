@@ -1268,3 +1268,255 @@ report nothing, which is the failure mode the spike's sampler already had.
   visible on a killed run; it does not make `phase-log.json` appear for one. A
   signal handler that flushed the table is a separate change with its own
   re-entrancy argument, and it is not this one.
+
+## W5 — the video VAE decode's device arm (#1007)
+
+Issue: [#1007](https://github.com/mudler/vllm.cpp/issues/1007). Branch
+`row/LTX25-DEVICE-RESIDENCY-W5`, base `b537a5344`.
+
+### W5.0 Why this stage runs before W1, and what it is therefore NOT allowed to claim
+
+`## Now` above orders the stages `W0 -> W1 -> ... -> W5` and says in as many
+words that **W4/W5 do not start** if W1 reports `BLOCKED`. W1 is a lease on
+`dgx:gpu0`, this stage was dispatched while a render holds that box, and it was
+dispatched with the lease explicitly withheld. So the precondition is not met,
+and saying otherwise would be the first defect in this section.
+
+The reconciliation is narrow, and it is a scope reconciliation rather than a
+waiver. **W1 is a gate on the RANKING, and this stage makes no ranking claim, no
+ratio claim and no speed claim at all.** It lands the primitive whose absence is
+the reason #1007 is filed — `vt` has no three-dimensional convolution on any
+device — plus the dispatch that reaches it. Nothing here asserts that the decode
+is the dominant phase, that the 7.25 TFLOP figure is where a render's wall goes,
+or that this change makes a render faster. Those are exactly W1's to settle, and
+`## Now` stays unamended by this section.
+
+Two things follow, and they are limits rather than caveats:
+
+* **No number in this section is a benchmark.** The only measured quantities are
+  a byte comparison and a dispatch count.
+* **If W1's table puts `decode.video` low, this change is still correct and
+  still reachable — it is just not the lever.** The `vt::Conv3d` op is owed by
+  four other host convolution loops (§W5.4), so it does not become dead work
+  under either W1 outcome.
+
+### W5.1 Scope
+
+**In.**
+
+1. `vt::OpId::kConv3d`, `vt::Conv3dArgs` and `vt::Conv3d(...)` — the general
+   three-dimensional convolution `vt` has never had, on any device.
+2. A CPU arm (`src/vt/cpu/cpu_conv3d.cpp`) whose accumulation order is
+   **byte-identical** to the host loop the LTX-2.5 goldens were taken through.
+3. A CUDA arm (`src/vt/cuda/cuda_conv3d.cu`), one thread per output element,
+   walking the same order with `__fmul_rn`/`__fadd_rn` so the two arms are
+   bit-identical by construction rather than within a tolerance.
+4. The convolution of `Ltx2ConvVideoDecode` — all nine `CausalConv3d` call sites
+   in `ltx2_video_vae.cpp`, decoder and encoder — dispatched through that op on
+   a queue.
+5. That queue threaded from the engine: `Ltx2VideoEngine::Generate` hands the
+   decode the queue `Load` resolved, so **placement is decided once at load and
+   never per call**, which is upstream's polarity (§W5.2).
+
+**Out, and each named with what owns it.**
+
+* **Residency.** Every buffer between the convolutions — the norms, the SiLU,
+  the AdaLN, the noise injection, `DepthToSpaceUpsample`, `AttnBlock3d`,
+  `unpatchify` — stays on the host, so a non-CPU queue pays an upload and a
+  download per convolution. That is a staged slice; it is named in the commit
+  body and the pull request body, and it is owed under `## Owed` with its own
+  issue. It is also the shape `parakeet_encoder.cpp:156-171` already ships for
+  `vt::Conv2d`: host vectors in, one `vt::` op, host vectors out.
+* **A device `Ltx2VaeWeights`.** The stage table calls for one. Without
+  residency it would buy nothing but a re-upload of the same weight per call,
+  which is what the current shape already does, so it is deferred to the
+  residency issue rather than half-built here.
+* **[#1011](https://github.com/mudler/vllm.cpp/issues/1011), the memory
+  format**, stays a rider and stays owed. `[C, T, H, W]` is what both arms
+  consume today.
+* **The `AccumulateTemporalGroup` sub-phase** that `## Owed` above owes to W5.
+  It is an instrument refinement, not a device arm, and
+  [#1439](https://github.com/mudler/vllm.cpp/issues/1439) has the phase table's
+  own sum gate RED on `main` at fixture scale — adding leaves under it while its
+  ratio assertion is coin-flipping would make two changes indistinguishable.
+
+### W5.2 Upstream chain, re-derived at the pin
+
+Lightricks `LTX-2` @ `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`, the pin
+[`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) records. Every line below was
+read at that revision while writing this section.
+
+| What | Upstream | What it settles |
+|---|---|---|
+| the decoder's ONE convolution module | `packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:266` `class CausalConv3d` | the whole decode's arithmetic is this module; `:292-302` builds one `nn.Conv3d` |
+| the temporal pad | `convolution.py:305-311` | causal prepends `k_t - 1` copies of frame 0 (`:306-307`); non-causal replicates first AND last `(k_t-1)//2` times (`:309-311`). A `torch.concatenate`, i.e. a MATERIALIZED pad, before the conv |
+| the spatial pad | `convolution.py:288-291,299` | `padding=(0, kh//2, kw//2)` with `padding_mode=spatial_padding_mode.value`. torch realises a non-`zeros` `padding_mode` as `F.pad` and then a zero-padded convolution, so upstream materialises this pad too |
+| the conv call itself | `convolution.py:312` `x = self.conv(x)` | the single call site the issue names |
+| placement is a BUILD-time decision | `packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py:267-288`, defaulting to CUDA at `:273`; `packages/ltx-core/src/ltx_core/devices.py:29-39` resolves CUDA -> MPS -> CPU | the decoder is never asked per call where to run. It is `.to(device)` once (`:288`) and the latent follows it |
+| the pipeline's decode entry | `packages/ltx-pipelines/src/ltx_pipelines/utils/blocks.py:1139` | `self._decoder_builder.build(device=self._device, dtype=build_dtype)` — the device is the pipeline's, fixed before the first frame |
+| the dtype/device polarity | `conv_video_decoder.py:283-286` `sample = sample.to(weights_dtype)` | the latent takes the WEIGHTS' dtype and device, not the other way round |
+
+Two secondary oracles, cited for placement only and never for arithmetic, at the
+revisions [`oracles/sglang.md`](../oracles/sglang.md) and
+[`oracles/vllm-omni.md`](../oracles/vllm-omni.md) pin:
+
+* SGLang `f63458b5b`,
+  `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/decoding_av.py:71`
+  moves the latent to `get_local_torch_device()`.
+* vLLM-Omni `a4ea67a21`, `vllm_omni/diffusion/models/interface.py:92` — *"VAE(s)
+  (always on GPU)"*.
+
+**What we mirror, precisely:** the polarity, not a call-time switch. The queue is
+resolved once in `Ltx2VideoEngine::Load` and the decode runs on it. **What we do
+NOT mirror yet:** the tensor staying resident between modules. That is the
+residency issue, written down rather than implied.
+
+### W5.3 Design
+
+**The op.**
+
+```
+vt::Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+           const Tensor* bias, const Conv3dArgs& args)
+  out    [Cout, Tout, Hout, Wout]
+  x      [Cin,  Tin,  Hin,  Win ]
+  weight [Cout * Cin/groups, KT, KH, KW]
+  bias   optional rank-1 [Cout]
+```
+
+`Conv3dArgs` mirrors `nn.Conv3d`'s constructor keywords 1:1 — `stride_t/h/w`,
+`pad_t/h/w`, `dilation_t/h/w`, `groups` — exactly as `Conv2dArgs` mirrors
+`nn.Conv2d`'s.
+
+**Two shape decisions, both forced, both stated rather than hidden.**
+
+* **BATCH 1, so `x` is rank 4 and not rank 5.** `vt::Tensor` caps rank at 4
+  (`include/vt/tensor.h:12`, `constexpr int kMaxRank = 4`). Raising that cap
+  changes the one struct every op in the tree passes, and it is not this stage's
+  to make. Batch 1 is what the model decodes — this port drives the LTX-2.5 VAE
+  at batch 1 throughout — so the restriction costs nothing here, and it is
+  refused by name rather than silently ignored.
+* **The weight's two leading axes are MERGED.** torch's parameter is
+  `[Cout, Cin/groups, KT, KH, KW]`, rank 5. `Cout` is `out.shape[0]` and
+  `Cin/groups` is derivable from `x` and `args.groups`, so the merged
+  `[Cout * Cin/groups, KT, KH, KW]` is the same bytes in the same order with no
+  information lost — and the wrapper CHECKS `weight.shape[0] == Cout * Cin/groups`
+  rather than trusting it.
+
+**The accumulation order, and why it is not `kConv2d`'s.**
+
+`cpu_conv2d.cpp:86-100` keeps ONE f32 accumulator over the whole `(ic, kh, kw)`
+sweep. This op must not. `ltx2_video_vae.cpp` documents, with a measured number,
+that a single naive f32 sum over all `ci * kernel^3` taps pushes the non-causal
+tiled golden to `5.00679e-06` against a `5e-06` tolerance, and that torch's f32
+convolution is a blocked GEMM which sums one partial per input channel. So
+`kConv3d`'s contract is **one f32 partial per input channel, walked
+`(kt, kh, kw)`, added into a running f32 accumulator seeded with the bias**, and
+that order is published contract, not implementation detail.
+
+`kConv1d` and `kDepthwiseConv1d` are the precedent for two convolution ops in
+this tree deliberately differing in accumulator width and order, with the reason
+written at `include/vt/ops.h` `OpId::kConv1d`: *"the ACCUMULATOR WIDTH differs
+and is part of the contract"*. `kConv2d` is untouched by this stage for the same
+reason its siblings were left alone: changing it would move a shipped model's
+numerics.
+
+**Why that matters more than it looks.** It is what makes the routed host arm
+**byte-identical** to the unrouted one, so the LTX-2.5 VAE goldens are a real
+regression gate on this change rather than a re-baselined one. A tolerance would
+have hidden exactly the defects this seam can introduce: a transposed weight
+axis, a dropped group offset, a reassociated sweep.
+
+**The padding stays in the model, and that is the mirror.** `CausalConv3d` keeps
+building the padded volume — causal and non-causal temporal replication,
+`zeros`/`reflect`/`replicate` spatially — and hands `vt::Conv3d` a zero-`pad_*`
+call. That is what torch does: `nn.Conv3d` with a non-`zeros` `padding_mode`
+runs `F.pad` and then a zero-padded convolution. Pushing LTX's padding enum into
+the shared op would put one model's vocabulary in a shared header for no gain.
+
+**The queue.**
+
+`VideoConvSpec` gains a `const vt::Queue* queue` field, so the nine call sites
+thread it without nine new parameters. `Ltx2ConvVideoDecode`,
+`Ltx2VideoDecode`, `Ltx2ConvVideoDecodeTiled` and `Ltx2VideoDecodeStreaming`
+gain a trailing `const vt::Queue* queue = nullptr`. `nullptr` means **the CPU
+queue**, not "the old path" — there is exactly one code path, and the device is
+a property of the queue. That is deliberate: a `queue != nullptr ? device : host`
+ternary would put the interesting branch where nothing in a CPU build can
+execute it, which is the shape
+[#1426](https://github.com/mudler/vllm.cpp/issues/1426) already records for the
+DiT.
+
+On a CPU queue the tensors are **views over the existing host vectors** — no
+copy, no extra byte moved, which is what lets the byte-identity claim also be a
+no-regression claim for the host arm. On any other device the padded volume, the
+weight and the bias are uploaded through `vt::Backend::Alloc`/`Copy` and the
+output is downloaded, in the `parakeet_encoder.cpp` `Buf` shape.
+
+The production call site is the `decode.video` phase in
+`Ltx2VideoEngine::Generate` (`src/vllm/multimodal/ltx2_video.cpp`), which passes
+the engine's queue when the engine is on an accelerator.
+
+### W5.4 What else this op is owed by, stated so it is not read as LTX-only
+
+`grep -rni conv3d src include` finds four other host convolution loops with no
+device op to route to: `minimax_h3_vae_cnn.cpp`, `minimax_h3_video_vae.cpp`,
+`ltx2_upsampler.cpp` and `clip_mmproj_gguf.cpp`. **None of them is rewired by
+this stage** — each has its own accumulation order and its own goldens, and
+re-baselining four models to land one is a change a reviewer should refuse.
+They are named here so the op reads as the shared primitive it is, and so a
+later row can find it.
+
+### W5.5 Tests
+
+| # | Case | Where | Red before |
+|---|---|---|---|
+| T1 | the op's contract and byte-exactness against an INDEPENDENT in-test scalar reference written from the convolution definition in the published order — dtype combinations over f32/f16/bf16, dense/grouped/dilated/strided/padded, ragged extents that fall off every edge, kernel 1 and 3 | `tests/vt/test_ops_conv3d.cpp` | yes — the op resolves no kernel and throws |
+| T2 | determinism: thread counts 1/2/4/8 produce `memcmp`-equal output | `tests/vt/test_ops_conv3d.cpp` | yes, with T1 |
+| T3 | every committed LTX-2.5 video VAE golden, decoder and encoder, unchanged and not re-baselined | `tests/vllm/models/test_ltx2_vae.cpp` | n/a — the regression gate |
+| T4 | the production decode DISPATCHES `kConv3d`, counted through `vt::GetOpProviderStats`, entered at `Ltx2VideoDecodeStreaming` | `tests/vllm/models/test_ltx2_vae.cpp` | yes |
+| T5 | a decode on a NON-CPU queue — the fake XPU backend — produces `memcmp`-equal frames to the host arm, and the kXPU provider's selection count moves | `tests/vllm/multimodal/test_diffusion_device_seam.cpp` | yes |
+
+**T5 is the case that makes the device arm more than a compile.** The upload,
+the dispatch on a device that is not `kCPU`, and the download all execute on a
+box with no GPU, because `FakeXpuBackend`
+(`tests/vllm/multimodal/test_diffusion_device_seam.cpp:60-73`) is a
+unified-memory backend in a separate executable and `vt::RegisterOp` is a public
+API (`include/vt/op_provider.h:127`). What T5 does NOT prove is that a GPU runs
+it. That is hardware, and it is owed.
+
+### W5.6 Gates
+
+* Focused: `test_ops_conv3d`, `test_ltx2_vae`, `test_diffusion_device_seam`,
+  `test_ltx2_tiling`, `test_ltx2_video`. `test_capi` and `test_ltx2_video`
+  contend over `/tmp` fixture directories and are run serially.
+* Full: `ctest --test-dir build`, plus `scripts/agent-preflight.sh --staged`.
+* **No performance gate and no performance claim.** See W5.0.
+
+### W5.7 Risks
+
+1. **The CUDA arm cannot be compiled on this box.** There is no `nvcc` here and
+   CI does not complete in this environment, so the `cuda-fat-build` job's
+   verdict is not available before landing. Mitigated by keeping the kernel a
+   near-transcription of `src/vt/cuda/cuda_conv1d_general.cu`, which compiles in
+   that job today, and by using no construct that file does not. It is a risk,
+   not a mitigation: state it in the pull request rather than discover it.
+2. **The CUDA arm has never executed.** Nothing in this tree can run it. It is
+   registered, it is reachable by construction from the same dispatch T5
+   exercises, and it is owed a hardware run.
+3. **A host-arm regression would be silent if the accumulation order drifted.**
+   T3 is the instrument, and it is only an instrument because the order is
+   byte-identical rather than within a band.
+4. **The device branch of the production ternary is not executed here**, for the
+   reason §12.8 of [`ltx25-guided-video.md`](ltx25-guided-video.md) gives for
+   the DiT's: `Ltx2VideoEngine::Load` refuses `device != 0` without a registered
+   accelerator. T5 gates the callee on a non-CPU device; the SWITCH is
+   [#1426](https://github.com/mudler/vllm.cpp/issues/1426)'s shape, and it is
+   named rather than claimed.
+
+### W5.8 Stop conditions
+
+* Stop and report `NEEDS_DECISION` if the routed host arm cannot be made
+  byte-identical. Never widen a golden's tolerance to absorb the difference.
+* Stop if `vt::Tensor`'s rank cap turns out to be load-bearing for a caller this
+  op must serve. Refuse rank 5 by name; do not silently fold an axis.

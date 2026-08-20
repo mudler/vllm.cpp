@@ -2122,6 +2122,13 @@ target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}
 # end-to-end bit-identity gate is tests/vllm/models/test_host_parallel.cpp.
 vllm_cpp_add_test(test_ops_conv1d_general vt/test_ops_conv1d_general.cpp)
 target_include_directories(test_ops_conv1d_general PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007): vt::Conv3d against
+# an independent in-test scalar reference, plus the case that proves its
+# per-input-channel partial is a DIFFERENT number from kConv2d's flat
+# accumulator. The LTX-2.5 decode's own byte-identity gate is
+# tests/vllm/models/test_ltx2_vae.cpp.
+vllm_cpp_add_test(test_ops_conv3d vt/test_ops_conv3d.cpp)
+target_include_directories(test_ops_conv3d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)

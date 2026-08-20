@@ -441,6 +441,18 @@ enum class OpId : uint8_t {
   // them in the MAINLOOP. See vt::MatmulFp8BlockScaled below for the contract.
   // Appended before kCount so no existing op's id shifts.
   kMatmulFp8BlockScaled,
+  // --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007). The
+  // primitive `vt` has never had on ANY device, and the reason the LTX-2.5
+  // video VAE decode ran on the host while every oracle runs it GPU-resident.
+  // It is NOT a parameter of kConv2d, and the difference is the ACCUMULATION
+  // ORDER rather than the rank: kConv2d keeps one f32 accumulator over the whole
+  // (ic, kh, kw) sweep, while this op keeps one f32 PARTIAL PER INPUT CHANNEL —
+  // which is what torch's blocked-GEMM f32 convolution does, and what every
+  // committed LTX-2.5 video VAE golden was taken through. Same sibling
+  // relationship, and the same reason, as kConv1d vs kDepthwiseConv1d above.
+  // See vt::Conv3d below for the contract. Appended before kCount so no
+  // existing op's id shifts.
+  kConv3d,
   kCount
 };
 
@@ -643,6 +655,35 @@ struct Conv2dArgs {
   int64_t stride_w = 1;
   int64_t pad_h = 0;
   int64_t pad_w = 0;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  int64_t groups = 1;
+};
+
+// --- General 3-D convolution args (LTX25-DEVICE-RESIDENCY W5, #1007). --------
+
+// torch `nn.Conv3d` arguments, in `(T, H, W)` axis order. Field names mirror the
+// constructor keywords 1:1, exactly as Conv2dArgs mirrors `nn.Conv2d`'s, so a
+// reader of `CausalConv3d.__init__` (Lightricks/LTX-2 @ fd4ded7f2,
+// packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:267-302) can map
+// every field by name.
+//
+// `padding` here is ZERO padding on both sides of an axis, and that is the whole
+// of what this op does: a non-zero `padding_mode` — LTX's `reflect` and
+// `replicate` — is realised by the CALLER materialising the padded volume and
+// passing pad 0, which is what torch itself does (`nn.Conv3d` with a non-`zeros`
+// `padding_mode` runs `F.pad` and then a zero-padded convolution). The LTX
+// decoder's asymmetric CAUSAL temporal pad is materialised the same way, and for
+// the same reason: upstream materialises it too, with a `torch.concatenate`
+// (convolution.py:305-311).
+struct Conv3dArgs {
+  int64_t stride_t = 1;
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t pad_t = 0;
+  int64_t pad_h = 0;
+  int64_t pad_w = 0;
+  int64_t dilation_t = 1;
   int64_t dilation_h = 1;
   int64_t dilation_w = 1;
   int64_t groups = 1;
@@ -1165,6 +1206,9 @@ using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Te
 using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*weight*/, const Tensor* /*bias*/,
                                    const DepthwiseConv1dArgs&);
+// General 3-D convolution (#1007).
+using Conv3dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv3dArgs&);
 // BigVGAN / DAC vocoder 1-D convolutions (#672).
 using Conv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
                           const Tensor* /*bias*/, const Conv1dArgs&);
@@ -2736,6 +2780,53 @@ void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& ke
 // x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
 void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
             const Conv2dArgs& args);
+
+// --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) --------------
+// Spec: .agents/specs/ltx25-device-residency.md `## W5`. Upstream mirror:
+// torch `nn.Conv3d` as `CausalConv3d` instantiates it — Lightricks/LTX-2 @
+// fd4ded7f2, packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:292-302,
+// called once at :312, which is the WHOLE of the LTX-2.5 video VAE's arithmetic.
+//
+//   out    [Cout, Tout, Hout, Wout]
+//   x      [Cin,  Tin,  Hin,  Win ]
+//   weight [Cout * Cin/groups, KT, KH, KW]
+//   bias   optional rank-1 [Cout]
+// Tout = (Tin + 2*pad_t - dilation_t*(KT-1) - 1)/stride_t + 1, likewise H and W.
+// `groups` must divide both Cin and Cout; output channel oc reads input group
+// oc/(Cout/groups). Zero padding: taps outside the input extent are SKIPPED.
+//
+// BATCH 1, DELIBERATELY. torch's tensor is [N, Cin, T, H, W] and this one drops
+// the N axis, because `vt::Tensor` caps rank at 4 (include/vt/tensor.h:12) and
+// raising that cap changes the one struct every op in the tree passes. Batch 1
+// is what the video VAE decodes. A caller that needs N > 1 gets a refusal by
+// name from the wrapper, never a silently folded axis.
+//
+// THE WEIGHT'S TWO LEADING AXES ARE MERGED, for the same rank reason: torch's
+// [Cout, Cin/groups, KT, KH, KW] is rank 5, and [Cout * Cin/groups, KT, KH, KW]
+// is the same bytes in the same order. `Cout` comes from `out` and `Cin/groups`
+// from `x` and `args.groups`, so nothing is lost and the wrapper CHECKS the
+// product rather than trusting it.
+//
+// ACCUMULATION ORDER — CONTRACT, NOT DETAIL, AND NOT kConv2d's. Per output
+// element: one f32 accumulator seeded with the bias, then ONE f32 PARTIAL PER
+// INPUT CHANNEL walked strictly in (kt, kh, kw) order and added into it. That is
+// what torch's f32 convolution does — it is a blocked GEMM and sums one partial
+// per channel block — and it is what every committed LTX-2.5 video VAE golden
+// was taken through. kConv2d's single flat accumulator is a DIFFERENT number:
+// src/vllm/model_executor/models/ltx2_video_vae.cpp measures the flat order
+// pushing the non-causal tiled golden to 5.00679e-06 against a 5e-06 tolerance.
+// The two ops are siblings for exactly the reason kConv1d and kDepthwiseConv1d
+// are, and neither may be re-pointed at the other.
+//
+// The order is why the CPU and CUDA arms are BYTE-IDENTICAL rather than close:
+// the device kernel walks the same sweep with __fmul_rn/__fadd_rn, and the host
+// side is already pinned against FMA contraction by -ffp-contract=off
+// (CMakeLists.txt). tests/vt/test_ops_conv3d.cpp gates the order against an
+// independent in-test scalar reference.
+//
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv3dArgs& args);
 
 // P2 — NON-CAUSAL depthwise `nn.Conv1d(C, C, K, stride, padding, groups=C)`, the
 // conformer convolution module's temporal mixer.

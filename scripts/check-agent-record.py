@@ -283,7 +283,15 @@ MATRICES = {
     # of rank-1 factors) rather than how one step is tiled, and it adds three cache
     # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
     # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
+    # 53 since 2026-08-20 (#1007): +`KERNEL-CONV3D`, the general 3-D convolution
+    # `vt` had on NO device. It is not a variant of `KERNEL-CPU-CONV2D-SUBSAMPLE`:
+    # the ACCUMULATION ORDER differs and is part of the contract (one f32 partial
+    # per input channel with the bias seeded first, against kConv2d's single flat
+    # accumulator with the bias last), which is the same sibling relationship
+    # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
+    # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
+    # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 53),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

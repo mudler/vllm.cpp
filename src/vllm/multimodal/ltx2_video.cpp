@@ -4604,7 +4604,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         write_phase.Close();
         decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
         chunk_handle = phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
-      });
+      },
+      /*timestep=*/nullptr,
+      // W5 (#1007): WHERE THE VIDEO VAE'S CONVOLUTION RUNS. The engine resolved
+      // this queue once in `Load` (`vt::CreateQueue(im.device)`), which is the
+      // polarity upstream has — the decoder is built onto a device once
+      // (single_gpu_model_builder.py:267-288, CUDA by default at :273) and the
+      // latent follows the weights (conv_video_decoder.py:283-286), never a
+      // per-call choice. A null queue is the CPU queue, byte-identical to the
+      // pre-seam host arm.
+      im.on_device ? &*im.queue : nullptr);
   phase::PhaseLog::Instance().Close(chunk_handle);
   phase::PhaseLog::Instance().Close(decode_handle);
 

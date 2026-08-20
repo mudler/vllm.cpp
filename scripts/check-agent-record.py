@@ -296,7 +296,15 @@ MATRICES = {
     # Bumped because the row EXISTS, never to make a state transition pass; the
     # row is `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
     # (spec `## Owed` O6, no `nvcc` on the authoring host).
-    # 55 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
+    # 54 since 2026-08-20 (#1007): +`KERNEL-CONV3D`, the general 3-D convolution
+    # `vt` had on NO device. It is not a variant of `KERNEL-CPU-CONV2D-SUBSAMPLE`:
+    # the ACCUMULATION ORDER differs and is part of the contract (one f32 partial
+    # per input channel with the bias seeded first, against kConv2d's single flat
+    # accumulator with the bias last), which is the same sibling relationship
+    # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
+    # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
+    # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
+    # 56 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
     # +`KERNEL-TOPK-PAIRS`, the DFlash2 candidate selector's two kernels. TWO
     # rows and not one because they are two kernels with different shapes and
     # different gates: the first is a small dense contraction over two
@@ -312,7 +320,7 @@ MATRICES = {
     # because the rows EXIST, never to make a state transition pass; both are
     # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
     # (spec `## Owed` O10, no `nvcc` on the authoring host).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 55),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 56),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

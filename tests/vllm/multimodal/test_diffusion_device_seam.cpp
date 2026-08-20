@@ -48,12 +48,15 @@
 #include <string_view>
 #include <vector>
 
+#include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/multimodal/ltx2_video.h"
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/video_engine.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/device.h"
+#include "vt/op_provider.h"
+#include "vt/ops.h"
 
 namespace {
 
@@ -181,7 +184,133 @@ std::string QuotedArchitecture(std::string_view family) {
   return std::string("architecture '") + std::string(family) + "'";
 }
 
+// --- W5 (#1007): the smallest conv video decoder that decodes ---------------
+//
+// `decoder_blocks = {}`, patch_size 1, no timestep conditioning, so the decode
+// is exactly `conv_in` -> PixelNorm -> SiLU -> `conv_out` -> unpatchify: TWO
+// convolutions and no noise draw. The weights are drawn from a deterministic LCG
+// rather than set to constants, because a symmetric weight can hide a
+// transposed axis and this case's whole job is to compare two arms element by
+// element.
+struct TinyDecoder {
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  vllm::Ltx2VaeWeights weights;
+  std::vector<float> latent;
+  int64_t lt = 3, lh = 5, lw = 4;
+};
+
+TinyDecoder MakeTinyDecoder() {
+  TinyDecoder d;
+  d.cfg.prefix = "w5.dev.";
+  d.cfg.in_channels = 1;
+  d.cfg.out_channels = 1;
+  d.cfg.patch_size = 1;
+  d.cfg.base_channels = 8;
+  d.cfg.causal = false;
+  d.cfg.timestep_conditioning = false;
+  d.cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  d.cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReflect;
+  d.cfg.decoder_blocks = {};
+
+  uint64_t seed = 20260820ULL;
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>((seed >> 33) % 20001) / 10000.0f - 1.0f;
+  };
+  auto fill = [&next](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = next();
+    return v;
+  };
+
+  const std::string p = d.cfg.prefix;
+  d.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  d.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+  d.weights.tensors[p + "conv_in.conv.weight"] = fill(8 * 1 * 27);
+  d.weights.tensors[p + "conv_in.conv.bias"] = fill(8);
+  d.weights.tensors[p + "conv_out.conv.weight"] = fill(1 * 8 * 27);
+  d.weights.tensors[p + "conv_out.conv.bias"] = fill(1);
+  d.latent = fill(static_cast<size_t>(d.lt * d.lh * d.lw));
+  return d;
+}
+
 }  // namespace
+
+TEST_CASE("ltx2 vae: the video decode RUNS ITS CONVOLUTION on a non-CPU queue, byte-identically") {
+  // W5, #1007. The LTX-2.5 video VAE decode had no device arm at all: `vt` had
+  // no 3-D convolution on any device, so the ~7.25 TFLOP of dense 3x3x3
+  // convolution ran as host loops while every oracle runs the same decode
+  // GPU-resident (Lightricks/LTX-2 @ fd4ded7f2
+  // packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py:273
+  // defaults the decoder onto CUDA; vLLM-Omni @ a4ea67a21
+  // vllm_omni/diffusion/models/interface.py:92 says "VAE(s) (always on GPU)").
+  //
+  // WHAT THIS CASE MEASURES, AND WHAT IT DOES NOT. It executes the whole device
+  // arm — the upload through `vt::Backend::Alloc`/`Copy`, a `vt::Conv3d`
+  // dispatch on a device that is NOT `kCPU`, and the download — and requires the
+  // pixels to be `memcmp`-identical to the host arm. It does NOT prove a GPU
+  // runs it: that is hardware, this box has none, and it is owed. What it
+  // removes is the failure mode where the device branch exists, compiles, and
+  // has never once been entered.
+  //
+  // WHY THIS EXECUTABLE. `vt::DeviceType` is a closed enum
+  // (include/vt/device.h), so a fake accelerator must impersonate a real vendor
+  // and would flip `CurrentPlatform()` for every case in its process. This file
+  // is already a separate executable for exactly that reason, and it already
+  // carries a unified-memory `FakeXpuBackend`.
+  //
+  // WHY REGISTERING THE CPU KERNEL FOR kXPU IS THE RIGHT INSTRUMENT AND NOT A
+  // TAUTOLOGY. The kernel is not what is under test here — `test_ops_conv3d`
+  // gates the arithmetic against an independent scalar reference. What is under
+  // test is the MARSHALLING: that the decode allocates on the queue's backend,
+  // copies both operands and the bias in the right shapes, dispatches on the
+  // queue's device rather than on kCPU, and copies the result back. A wrong
+  // extent, a missing bias upload, or a dispatch that silently fell back to the
+  // host would all show here. `vt::RegisterOp` is the public registration API
+  // (include/vt/op_provider.h:127) and this is a NATIVE registration, the same
+  // call `src/vt/cpu/cpu_conv3d.cpp` makes.
+  const TinyDecoder d = MakeTinyDecoder();
+
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+
+  vt::RegisterBackend(vt::DeviceType::kXPU, &Backend());
+  REQUIRE(vt::TryGetBackend(vt::Device{vt::DeviceType::kXPU, 0}) != nullptr);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  REQUIRE(vt::OpRegistered(vt::OpId::kConv3d, vt::DeviceType::kXPU));
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kXPU);
+  vt::ResetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kCPU);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  const vllm::Ltx2VideoFrames dev =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, &q);
+
+  const vt::OpProviderStats xpu =
+      vt::GetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kXPU);
+  const vt::OpProviderStats cpu =
+      vt::GetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+
+  // The dispatch went to the QUEUE'S device. Asserting only that the xpu counter
+  // moved would pass on an implementation that ran both arms; the cpu counter
+  // staying at zero is what makes it exclusive.
+  INFO("kConv3d dispatches: xpu=" << xpu.selections << " cpu=" << cpu.selections);
+  CHECK(xpu.selections == 2u);
+  CHECK(cpu.selections == 0u);
+
+  REQUIRE(dev.channels == host.channels);
+  REQUIRE(dev.frames == host.frames);
+  REQUIRE(dev.height == host.height);
+  REQUIRE(dev.width == host.width);
+  REQUIRE(dev.data.size() == host.data.size());
+  CHECK(std::memcmp(dev.data.data(), host.data.data(), host.data.size() * sizeof(float)) == 0);
+}
 
 TEST_CASE("ltx2 video: a platform that DECLINES the architecture refuses device 1 by name") {
   RegisterPartialAccelerator(/*accepts_everything=*/false);

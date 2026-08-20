@@ -59,6 +59,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/ltx2_audio_vae.h"  // Ltx2VaeWeights
+#include "vt/device.h"                                // vt::Queue
 
 namespace vllm {
 
@@ -226,11 +227,33 @@ struct Ltx2VideoFrames {
 // default is used otherwise, conv_video_decoder.py:304-305). `noise` must be
 // non-null whenever `timestep_conditioning` is set or any block sets
 // `inject_noise`.
+//
+// `queue` is WHERE THE CONVOLUTION RUNS (#1007, LTX25-DEVICE-RESIDENCY W5).
+// Every one of the decode's `nn.Conv3d` calls — the whole of its arithmetic,
+// convolution.py:312 — dispatches through `vt::Conv3d` on this queue. NULL means
+// the CPU queue, and it is NOT a second code path: the CPU arm is the same
+// dispatch with a CPU device, its tensors are views over the host buffers, and
+// it is byte-identical to the pre-seam host loop. Upstream decides placement the
+// same way and never per call, building the decoder onto a device once
+// (blocks.py:1139; single_gpu_model_builder.py:267-288, CUDA by default at
+// :273). Those two anchors carry the PLACEMENT claim on their own.
+// conv_video_decoder.py:283-286 is deliberately NOT cited for it: that block
+// reads `weights_dtype = next(self.parameters()).dtype` and then
+// `sample = sample.to(weights_dtype)`, so the latent follows the weights' DTYPE
+// there, and the function contains no `.to(device)` at all (#1007 fresh review
+// F2).
+//
+// STAGED: only the CONVOLUTION is on the queue's device. The norms, the SiLU,
+// the AdaLN, the noise injection, the depth-to-space upsample, the attention
+// block and the unpatchify are still host loops, so a non-CPU queue pays an
+// upload and a download per convolution. Residency is owed — see `## Owed` in
+// .agents/specs/ltx25-device-residency.md.
 Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
                                     const Ltx2VaeWeights& weights,
                                     const std::vector<float>& latent, int64_t latent_channels,
                                     int64_t latent_t, int64_t latent_h, int64_t latent_w,
-                                    Ltx2NoiseStream* noise, const double* timestep = nullptr);
+                                    Ltx2NoiseStream* noise, const double* timestep = nullptr,
+                                    vt::Queue* queue = nullptr);
 
 // The seam a caller reaches for when it holds a checkpoint rather than a decided
 // kind. `kConv` forwards to Ltx2ConvVideoDecode; `kDiffusion` THROWS, naming
@@ -241,6 +264,6 @@ Ltx2VideoFrames Ltx2VideoDecode(Ltx2VideoDecoderKind kind,
                                 const Ltx2VaeWeights& weights, const std::vector<float>& latent,
                                 int64_t latent_channels, int64_t latent_t, int64_t latent_h,
                                 int64_t latent_w, Ltx2NoiseStream* noise,
-                                const double* timestep = nullptr);
+                                const double* timestep = nullptr, vt::Queue* queue = nullptr);
 
 }  // namespace vllm

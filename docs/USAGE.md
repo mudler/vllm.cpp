@@ -1100,6 +1100,35 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
 Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 `--audio-prompt-embeds` to condition from files instead.
 
+**Where the video VAE decode runs.** Its convolution — the whole of the
+decoder's arithmetic — dispatches through the `vt::Conv3d` op on the queue the
+engine resolved at load, so `--device cuda` puts it on the accelerator and the
+default puts it on the CPU, byte-identically to before the seam existed
+([#1007](https://github.com/mudler/vllm.cpp/issues/1007)). Two limits are worth
+knowing before you read a timing from it: **no GPU has yet executed the CUDA
+kernel** ([#1452](https://github.com/mudler/vllm.cpp/issues/1452)), and only the
+convolution is on the device — the norms, the activations, the upsample and the
+attention block are still host loops, so a device queue pays a round trip per
+convolution ([#1451](https://github.com/mudler/vllm.cpp/issues/1451)). No speed
+number is published for this path.
+
+**The first non-CPU convolution announces itself on stderr,** once per process,
+on the shipped default and behind no flag:
+
+```text
+[vt] first non-CPU vt::Conv3d dispatch (device type 4). This arm has never been
+run on real hardware; see issue #1452.
+```
+
+It is a notice and not a warning: nothing is degraded, nothing falls back, and
+the line is printed at most once however many convolutions follow. It exists
+because the CUDA arm of this op has never been compiled or executed anywhere in
+this project's reach, and no gate here can catch a kernel that compiles and
+computes the wrong pixels — so the first machine that runs it should see the
+moment it happened beside whatever the frames look like. Compare the frames
+before you read a timing. The line disappears from this document when
+[#1452](https://github.com/mudler/vllm.cpp/issues/1452) closes.
+
 ### Where the render spent its wall: `phase-log.json`
 
 Every completed LTX-2.5 render writes **`<workdir>/phase-log.json`** beside the

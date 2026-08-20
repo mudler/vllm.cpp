@@ -2,6 +2,8 @@
 #include "vt/ops.h"
 
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -2762,6 +2764,103 @@ void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
              "conv2d: bias must be a contiguous float tensor on the queue device");
   }
   reinterpret_cast<Conv2dFn>(GetOp(OpId::kConv2d, q.device.type))(q, out, x, weight, bias, args);
+}
+
+// --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) --------------
+// Mirrors torch `nn.Conv3d`'s own shape contract at batch 1, so a caller that
+// passes what `CausalConv3d` passes (Lightricks/LTX-2 @ fd4ded7f2,
+// video_vae/convolution.py:292-302) is accepted verbatim. The rank-5 shapes
+// torch uses are expressed at rank 4 for the reason include/vt/ops.h states at
+// vt::Conv3d; both foldings are CHECKED here rather than assumed.
+void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv3dArgs& args) {
+  VT_CHECK(x.rank == 4 && out.rank == 4,
+           "conv3d: x/out must be rank-4 [C,T,H,W] — this op is BATCH 1, because vt::Tensor caps "
+           "rank at 4; pass one clip per call rather than folding N into a channel axis");
+  VT_CHECK(weight.rank == 4, "conv3d: weight must be rank-4 [Cout*Cin/groups,KT,KH,KW]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv3d: groups must be >= 1");
+  const int64_t cin = x.shape[0], tin = x.shape[1], hin = x.shape[2], win = x.shape[3];
+  const int64_t cout = out.shape[0];
+  const int64_t kt = weight.shape[1], kh = weight.shape[2], kw = weight.shape[3];
+  VT_CHECK(cin > 0 && tin > 0 && hin > 0 && win > 0, "conv3d: x extents must be positive");
+  VT_CHECK(cout > 0 && kt > 0 && kh > 0 && kw > 0,
+           "conv3d: out channels and kernel extents must be positive");
+  VT_CHECK(cin % g == 0 && cout % g == 0, "conv3d: groups must divide both Cin and Cout");
+  const int64_t cin_g = cin / g;
+  VT_CHECK(weight.shape[0] == cout * cin_g,
+           "conv3d: weight dim 0 must be Cout*(Cin/groups) — torch's [Cout,Cin/groups,KT,KH,KW] "
+           "with its two leading axes merged");
+  VT_CHECK(args.stride_t >= 1 && args.stride_h >= 1 && args.stride_w >= 1,
+           "conv3d: stride must be >= 1");
+  VT_CHECK(args.dilation_t >= 1 && args.dilation_h >= 1 && args.dilation_w >= 1,
+           "conv3d: dilation must be >= 1");
+  VT_CHECK(args.pad_t >= 0 && args.pad_h >= 0 && args.pad_w >= 0,
+           "conv3d: padding must be >= 0");
+  // The SPAN is separated from the division, and that is the whole of the
+  // shape contract's agreement with torch (#1007 fresh review F7).
+  //
+  // torch FLOORS `(in + 2*pad - dilation*(k-1) - 1) / stride`; C++ integer
+  // division TRUNCATES TOWARD ZERO. The two agree for a non-negative numerator
+  // and disagree for a negative one whenever stride > 1: at
+  // `tin = 2, k = 3, stride = 2, pad = 0` the numerator is -1, so torch gets
+  // `floor(-1/2) + 1 = 0` and raises "Output size is too small" while truncation
+  // gets `-1/2 + 1 = 1` and ACCEPTS an extent of 1, convolving over taps the
+  // stride skipped. Refusing on a negative span makes the two identical without
+  // a signed-division idiom, and it is the shape `Conv1dOutLength` below already
+  // uses for the same reason.
+  //
+  // UNREACHABLE FROM LTX — `CausalConv3d` materialises a pad of at least the
+  // kernel on every axis (video_vae/convolution.py:305-311), so the padded
+  // extent never falls below the kernel. It is gated because this op is offered
+  // as a SHARED SEAM and the contract at vt::Conv3d claims to mirror nn.Conv3d;
+  // tests/vt/test_ops_conv3d.cpp holds it.
+  const int64_t span_t = tin + 2 * args.pad_t - args.dilation_t * (kt - 1) - 1;
+  const int64_t span_h = hin + 2 * args.pad_h - args.dilation_h * (kh - 1) - 1;
+  const int64_t span_w = win + 2 * args.pad_w - args.dilation_w * (kw - 1) - 1;
+  VT_CHECK(span_t >= 0 && span_h >= 0 && span_w >= 0,
+           "conv3d: kernel/dilation larger than the padded input");
+  const int64_t tout = span_t / args.stride_t + 1;
+  const int64_t hout = span_h / args.stride_h + 1;
+  const int64_t wout = span_w / args.stride_w + 1;
+  VT_CHECK(tout > 0 && hout > 0 && wout > 0, "conv3d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[1] == tout && out.shape[2] == hout && out.shape[3] == wout,
+           "conv3d: out must be [Cout,Tout,Hout,Wout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "conv3d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv3d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv3d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout, "conv3d: bias must be rank-1 [Cout]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "conv3d: bias must be a contiguous float tensor on the queue device");
+  }
+  // #1007 fresh review, non-blocking suggestion. The FIRST non-CPU kConv3d
+  // dispatch in a process announces itself, once, on stderr.
+  //
+  // The CUDA arm of this op has never been compiled and has never been run —
+  // there is no `nvcc` on the authoring host and no GPU runner in CI — and no
+  // gate anywhere in this tree can catch a kernel that compiles and computes the
+  // wrong pixels. This line does not remove that risk; it converts a SILENT
+  // first execution of never-run code into an announced one, so whoever gets a
+  // GPU first sees the moment it happened beside whatever the pixels look like.
+  //
+  // Deliberately on the DEVICE-TYPE rather than on CUDA: the same argument holds
+  // for every accelerator arm this seam gains, and putting it here keeps it in
+  // code that this box compiles and `test_diffusion_device_seam` executes,
+  // rather than in a `.cu` file nothing here can build.
+  if (q.device.type != DeviceType::kCPU) {
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) {
+      std::fprintf(stderr,
+                   "[vt] first non-CPU vt::Conv3d dispatch (device type %d). This arm has never "
+                   "been run on real hardware; see issue #1452.\n",
+                   static_cast<int>(q.device.type));
+    }
+  }
+  reinterpret_cast<Conv3dFn>(GetOp(OpId::kConv3d, q.device.type))(q, out, x, weight, bias, args);
 }
 
 void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,

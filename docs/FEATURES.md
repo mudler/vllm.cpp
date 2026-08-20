@@ -61,7 +61,7 @@ are our reading of their documented behavior, not measurements.
 | Scratch allocator keyed by device (two backends, one process) | ✅ since [#516](https://github.com/mudler/vllm.cpp/issues/516); a pool is bound to one backend and refuses any other, and a backend with no registered platform is refused rather than given another's residency cap | ✅ device is field 0 of the allocation handle | ✅ | ✅ |
 | Automatic memory sizing (no hand-tuned budget) | ☐ hand-typed block count | ☐ percent, hand-tuned | ☐ | ◐ |
 | Memory cap with a pre-flight error instead of an OOM | ☐ | ◐ KV pool only | ◐ | ☐ |
-| Routed-expert weight streaming from disk | ◐ default OFF (`VT_MOE_EXPERT_STREAM=1`), CPU keep-quant towers only; bounded slot cache; refuses an unfittable slice by name. c1-c4 capacity, not throughput. One `[expert-stream]` line on a clean exit IF a store existed | ☐ blanket `cpu_offload_gb`, not expert-granular | ☐ | ◐ mmap only |
+| Routed-expert weight streaming from disk | ◐ default OFF (`VT_MOE_EXPERT_STREAM=1`), keep-quant/keep-f16 towers (#1378); bounded slot cache; refuses an unfittable slice by name. c1-c4 capacity, not throughput. CPU, plus a host-readable staging device (#1124) | ☐ blanket `cpu_offload_gb`, not expert-granular | ☐ | ◐ mmap only |
 
 ## Quantization and weight formats
 
@@ -324,7 +324,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Custom logits processor | `vllm_logits_processor` | reachable |
 | Embeddings / pooling (task=embed) | `vllm_embed`, `vllm_embedding_result_free` (ABI v15; pooling checkpoints load via `vllm_engine_load`) | reachable |
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
-| Video+audio generation (MiniMax-H3, LTX-2.5) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv`, `vllm_video_engine_family` (ABI v18 family registry) | reachable |
+| Video+audio generation (MiniMax-H3, LTX-2.5) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv`, `vllm_video_engine_family` (ABI v18 family registry), `vllm_video_last_phase_log` (ABI v22 render phase table) | reachable |
 | Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
 | Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v18) | reachable |
 | Speech + music generation (MiniMax-Music3; the IndexTTS-2.5 seam) | `vllm_speech_engine_load`, `vllm_synthesize`, `vllm_speech_result_free`, `vllm_speech_engine_family`, `vllm_speech_engine_sample_rate`, `vllm_speech_engine_requires_reference_audio` (ABI v20) | reachable |

@@ -331,8 +331,9 @@ std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
   // `activation_scheme` other than `dynamic`, and a block shape other than
   // 128x128. A supported `[128, 128]` `dynamic` checkpoint now passes and its
   // projections load through the `weight_scale_inv` rung in
-  // `qwen3_5_dense_weights.cpp`. Nothing READS the resulting weight yet, and
-  // that gap is refused by name one step later, at `ModelRegistry::Prepare`.
+  // `qwen3_5_dense_weights.cpp`. The dense forward READS the resulting weight
+  // since #1189 M4 (`281b4bc76`). What `ModelRegistry::Prepare` still refuses by
+  // name one step later is a device with no block-scaled GEMM, not the weight.
   //
   // AFTER `Resolve`, so an unsupported architecture still reports the
   // architecture rather than its quantization. BEFORE `load_weights`, because

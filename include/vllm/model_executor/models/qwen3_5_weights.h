@@ -84,6 +84,30 @@ struct OwnedTensor {
   // absent. Mutable because ReleaseHost is logically const, like lazy residency.
   mutable bool host_released = false;
 
+  // ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). The expert-stream lane has
+  // claimed this tower: its slices are served from HOST slot storage, and the
+  // tower itself must therefore NEVER be staged into device memory.
+  //
+  // Why a flag and not a name test. `ResidentWeight` is handed an OwnedTensor
+  // and has no idea what the loader called it, and the refusal has to fire in
+  // `ResidentWeight` because that is where the 1.1875 GiB `d.b.Alloc` is. A
+  // process-global set of streamed tower ids would answer the same question at
+  // the cost of a lookup in the decode path of every weight; one bool on the
+  // tensor answers it for free.
+  //
+  // Set by `KqExpertSlice` the first time the lane serves this tower, and read
+  // by `ResidentWeight`'s staging branch, which throws by name. That refusal is
+  // a TRIPWIRE, not a path with a production caller: with the lane on, the
+  // grouped-MoE route that would stage a tower is already disabled
+  // (`Qwen35GroupedMoeEnabled`), and W0c's own fallback reads the tower's host
+  // bytes in place. It exists because the failure it guards is issue #1123 —
+  // 48 towers staged, death partway through layer 16 of 93 — and that failure
+  // is silent until the allocator runs out.
+  //
+  // Mutable for the same reason `d_dev` is: claiming a tower for the lane is
+  // logically const, like lazy residency.
+  mutable bool expert_streamed = false;
+
   // ENG-LOAD-DIRECT-UPLOAD (issue #150). Non-null when `bytes` BORROWS a
   // read-only safetensors mmap taken verbatim from the checkpoint instead of
   // being copied into an owned buffer, and records the exact source range so
@@ -362,9 +386,21 @@ struct Fp8Weight {
 // config at use time: the consumer needs them per GEMM, and a weight that knows
 // its own geometry cannot be paired with the wrong one.
 //
-// NOTHING CONSUMES THIS YET. #1189 milestone M4 owns `Fp8BlockLinearMethod` and
-// the forward wiring; `PrepareQwen3_5Dense` refuses a populated one by name so a
-// block-wise checkpoint declines to run rather than running wrong.
+// CONSUMED BY THE DENSE FORWARD since #1189 milestone M4 (`281b4bc76`), which
+// landed `Fp8BlockLinearMethod` and the wiring it names. All ten projections
+// in `qwen3_5.cpp` are read, through THREE entry points rather than one.
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them: `o_proj`,
+// `down_proj`, the three GDN projections, and q/k/v whenever the split path
+// runs. M6 (`836c13c35`) added the other two: `MatmulFp8BlockMergedD` reads
+// q/k/v as one operand when the consumer accepts row-strided views, and
+// `Fp8BlockGateUpSwiGLUD` is the ONLY reader of `gate_proj_fp8_block` and
+// `up_proj_fp8_block`. `PrepareQwen3_5Dense` no longer refuses a populated
+// weight -- it refuses a DEVICE with no block-scaled GEMM, which after M5
+// (`489a9a4c0`) means a CUDA arch outside `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a).
+//
+// The CUDA kernel has still NEVER EXECUTED on hardware and there is no token
+// gate. That debt is real and is recorded in
+// `.agents/specs/vt-matmul-fp8-block-cuda.md`; nothing here narrows it.
 struct Fp8BlockWeight {
   OwnedTensor packed;  // i8  [N, K]  one fp8-e4m3fn byte per element, verbatim
   OwnedTensor scale;   // f32 [cdiv(N, block_n), cdiv(K, block_k)]
@@ -515,8 +551,9 @@ struct FullAttnLayerWeights {
   // populated by the `weight_scale_inv` rung in `qwen3_5_dense_weights.cpp`
   // BEFORE the per-tensor rung, because a block-wise weight is also `F8_E4M3`
   // (#1166). The bf16, fp4 and per-tensor fp8 slots are left EMPTY when these
-  // are populated, and vice versa. Nothing reads them yet -- M4 owns the linear
-  // method and `PrepareQwen3_5Dense` refuses a populated one by name.
+  // are populated, and vice versa. M4 (#1189, `281b4bc76`) landed the linear
+  // method and the forward that reads them, so `PrepareQwen3_5Dense` refuses an
+  // unrunnable DEVICE rather than a populated weight.
   Fp8BlockWeight q_proj_fp8_block;  // [N=2*Hq*Dh, K=H]
   Fp8BlockWeight k_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
   Fp8BlockWeight v_proj_fp8_block;  // [N=Hkv*Dh,  K=H]

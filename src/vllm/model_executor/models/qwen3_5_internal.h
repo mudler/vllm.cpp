@@ -9,9 +9,11 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/tensor.h"
 
 namespace vt {
 struct Queue;
+class Backend;
 }  // namespace vt
 
 namespace vllm {
@@ -19,6 +21,7 @@ namespace vllm {
 struct GdnStateCache;
 struct HfConfig;
 struct GdnLayerWeights;
+struct OwnedTensor;
 
 namespace v1 {
 struct GDNAttentionMetadata;
@@ -450,6 +453,43 @@ struct DeviceTokenIdsScope {
   DeviceTokenIds prev;
 };
 
+// ─── THE CONSUMER SIDE, ONCE (#1305) ────────────────────────────────────────
+//
+// The scope above publishes. Reading it back is four lines of take-and-clear
+// plus five of bounds-checked copy, and until #1305 every model that consumed it
+// wrote its own pair: `qwen3.cpp`, `qwen3_5.cpp`, and then — in a row whose
+// stated purpose is deleting hand-rolled copies — `qwen3_moe.cpp` and
+// `deepseek_v2.cpp` as a third and fourth. A fresh review named that, and this
+// is the answer: one declaration here beside the publisher, one definition in
+// `qwen3_5.cpp` beside `DeviceTokenIdsOverride()`, four call sites.
+
+// TAKE the published override and CLEAR it, so the FIRST embed in a forward is
+// the one that gets it. A forward can reach a second, unrelated embed — the
+// multimodal generate helper embeds a prompt and then single tokens — and
+// consuming on first use means those cannot be handed a row count that was never
+// meant for them. Returns a null `ids` when no override is live, which is every
+// path except the asynchronous CUDA runner.
+DeviceTokenIds TakeDeviceTokenIds();
+
+// TAKE the override and SPLICE it over an embed's device identifier buffer.
+// `dst` holds `dst_count` int32 identifiers that a host upload has already
+// filled; the override replaces its first `ov.count` rows. That is right for the
+// PADDED graph case, where only the real prefix is patched and the inert tail
+// must keep the host vector's values, and it degenerates to "replace everything"
+// on the eager path where `ov.count == dst_count`.
+//
+// The copy is enqueued on `queue`, so it is ordered AFTER the runner's combine
+// that produced the source rather than racing it — which is the whole point, and
+// the reason a host read of `ModelForwardInput::token_ids` cannot substitute.
+//
+// An override LONGER than `dst_count` can only mean the runner and the model
+// disagree about this step's shape, so it throws with `what` naming the caller
+// rather than embedding past the end. Returns true when an override was applied,
+// false when none was live — in which case nothing is written and the caller is
+// byte-identical to its pre-#1305 self.
+bool ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue, void* dst,
+                         int64_t dst_count, const char* what);
+
 // ─── ENG-EXPERT-STREAM (#912): the streamed-expert lane, seen from outside ───
 //
 // The lane lives in the anonymous namespace of qwen3_5.cpp because nothing
@@ -501,6 +541,30 @@ ExpertStreamStats ExpertStreamSnapshot();
 // reaches it), exposed so one process can compare the streamed and unstreamed
 // arms and prove they produce identical bytes.
 void ExpertStreamSetForceFallback(bool on);
+
+// ENG-EXPERT-STREAM-DEVICE W0c (issue #1124). The expert-slice seam and the
+// weight-staging helper, callable from a gate.
+//
+// WHY THEY ARE EXPOSED, given that a unit test which constructs a type by hand
+// proves nothing about reachability. Reachability of `KqExpertSlice` itself is
+// NOT what these are for and is not what they claim: it is already gated through
+// the production forward by `test_expert_stream_wiring`, which asserts the lane
+// filled slots during `Qwen3_5Model::Forward`. What these two reach is the
+// PLATFORM BRANCH inside that seam, which only a weight-staging,
+// host-addressable device takes — a device this project owns exactly one of, and
+// which no CPU test tier can register a real one of. Without them the branch
+// that decides whether a 369.96 GiB checkpoint loads at all would be provable
+// only on `dgx:gpu0`, which is the untestable-device shape this row has been
+// bitten by before.
+//
+// `StageWeightForTest` is the same shape as `ExpertStreamSetForceFallback`
+// above: no production path calls it, and it exists so a gate can observe a
+// guarantee from inside a running process. Here the guarantee is the refusal
+// that fires when a streamed tower reaches device staging — a tripwire whose
+// whole value is that it never fires in production.
+vt::Tensor ExpertSliceForTest(vt::Queue& q, const OwnedTensor& w, int64_t N,
+                              int64_t K, int64_t row_off, int64_t expert);
+void StageWeightForTest(vt::Queue& q, const OwnedTensor& w);
 
 // End one decode step for the streamed-expert cache. The Qwen3.5 MoE forward
 // runs this from its own layer driver; a SECOND full-attention MoE model

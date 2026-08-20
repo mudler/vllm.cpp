@@ -25,9 +25,13 @@ dispatched to its own fresh implementer and its own fresh reviewer.
 timeline of named phases, each carrying a monotone timestamp, a duration, a peak
 host byte count and a peak device byte count, with `unaccounted_seconds` emitted
 beside the sum rather than smeared over the phases. On a completed 64x64/9-frame
-render through the `vllm.h` video ABI the named leaves account for **98.33% of
-wall** (0.1549 s of 0.1575 s, residue 2.63 ms), so **the phases sum and W1 may
-start**. The artifact is
+render through the `vllm.h` video ABI the named leaves account for **99.94% of
+wall** (4.459892 s of 4.462572 s, residue 2.68 ms over 33 entries), so **the
+phases sum and W1 may start**. That is the artifact's own run and the figure
+`## Outcome — W0` records. **The RATIO is what the gate reads. No wall here is a
+benchmark** — the same binary at the same geometry has measured 0.147 s, 0.158 s,
+1.676 s, 4.463 s, 6.138 s and 12.030 s on a contended box, and the first two of
+those are one minute apart. The artifact is
 [`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json)
 and its provenance is in `## Outcome — W0` below.
 
@@ -45,9 +49,19 @@ does not override `vt::Backend::DeviceMemoryInfo` at all** —
 W0 did not wire it, and the reason is written down where the seam is:
 `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that
 seam is load-bearing, because `Gemma4MoE`'s device-expert LRU is its only
-consumer and is currently dead on CUDA, so an override wakes a landed residency
-policy and is a behaviour change with its own measurement. That is #1126's
-change, not an instrument's. **Until it lands, W1 samples
+consumer. **Which arm of that LRU the override would wake is narrower than this
+row first claimed, and the narrower statement is the one to carry.** The bf16
+arm, `EnsureGemma4Fp8ExpertOnDevice` (`src/vllm/model_executor/models/gemma4_moe.cpp:548`),
+is dead on CUDA for a SECOND and independent reason: it refuses at `:571` on
+`vt::HasMatmulBTAlphaBeta`, whose only implementation in this tree is ROCm's
+([#1205](https://github.com/mudler/vllm.cpp/issues/1205)), so wiring
+`DeviceMemoryInfo` does not wake it at all. What the override WOULD wake is the
+**FP8-native arm**, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches
+`DevExpertLru::MakeRoom` behind no device gate other than the probe itself and
+whose budget defaults to a 2048 MiB fill-only device cache when
+`VT_GEMMA4_EXPERT_VRAM_MB` is unset (`:416-432`). So the override is still a
+behaviour change with its own measurement, on one named arm rather than on
+"every CUDA model". That is #1126's change, not an instrument's. **Until it lands, W1 samples
 `--query-compute-apps=used_memory` per phase beside the table** — which is the
 fallback this spec's W6 row already names, and the only device-memory instrument
 GB10 answers. `## Owed` states what the column cannot report and why.
@@ -621,9 +635,10 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | Issue | Stage | State |
 |---|---|---|
 | [#1264](https://github.com/mudler/vllm.cpp/issues/1264) | this row: the staged campaign spec | closed by this row landing |
-| [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | **closed.** The render writes a phase table on the shipped default; the ABI names it through `vllm_video_last_phase_log` (v22) |
+| [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | **closed, for a run that FINISHES.** The render writes a phase table on the shipped default and the ABI names it through `vllm_video_last_phase_log` (v22). Read the row below it before quoting that as "the render is instrumented" |
 | [#1413](https://github.com/mudler/vllm.cpp/issues/1413) | W0-live | **closed by `## W0-live` below.** W0's table is written by the success path only, and nothing at all is emitted while a render runs, so an aborted render and a working one both report nothing and the ~162 s DiT forward of [#1375](https://github.com/mudler/vllm.cpp/issues/1375) has no in-process counter |
-| the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:358`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and it is currently DEAD on CUDA, so implementing the override wakes a landed residency policy and is a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
+| **a table on a run that does NOT finish** | [#1413](https://github.com/mudler/vllm.cpp/issues/1413), stage W0-live | **the LIVE half is closed by this change; a PARTIAL TABLE on abort is still owed and has no issue.** `WritePhaseLog` has exactly two call sites (`ltx2_video.cpp:2259` audio-only, `:4677` video) and both sit immediately before a successful `return`, three lines after `im.trace.completed = true`. Nineteen `VT_CHECK` sites throw out of `Ltx2VideoEngine::Generate` above them and that body contains no `try` and no `catch`; `vllm_video_generate`'s own two catches set an error and return, and `engine->last_phase_log` is assigned on the success path only. **So a render that is killed, aborted by a lease governor, refused by a guard, or still running leaves no `phase-log.json` at all** — not a truncated one, not an empty one, nothing. The mutation is the demonstration: deleting the video call site removes the file entirely and the W0 gate goes red on `REQUIRE(probe.good())`. That matters here more than anywhere, because the runs this campaign has are the ones that died: [#1375](https://github.com/mudler/vllm.cpp/issues/1375) is `child exit=-15` at 0 frames, and [`ltx25-decode-speed.md`](ltx25-decode-speed.md)'s two rungs are `EXIT=137` and `EXIT=1` at 0 frames. A reader who takes "the render writes a phase table" at face value will expect a 2.5 h render that is killed at 2.4 h to leave a table naming where it was. It leaves none. #1413 CLOSED the live half, in `## W0-live` below — a line per phase boundary and per DiT forward, so a killed run is legible from its stderr; a signal handler that flushed a PARTIAL table on abort is a separate change with its own re-entrancy argument and is not owed by either |
+| the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:358`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and is DEAD on CUDA. Narrowed, because the broad form of this sentence is wrong: the bf16 arm `EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is dead for a SECOND, independent reason — it refuses at `:571` on `vt::HasMatmulBTAlphaBeta`, implemented only by ROCm ([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override alone would not wake it. The arm the override WOULD wake is the FP8-native one, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches `MakeRoom` behind no device gate but the probe, with a 2048 MiB fill-only budget by default (`:416-432`). One named arm, not every CUDA model — and still a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | W0 (contract) + W1 (closes) | contract half **met** — the table is a file beside the frames rather than a console line, and it is retrievable from this repo at `benchmarks/demo/`. The closing half is W1's |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | W1 | owed; its `utilization.gpu` positive control is still unrecorded in this tree |
 | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | W2a | owed |
@@ -654,6 +669,15 @@ Also owed, and not attached to a stage:
 * **The third single-core stretch** of the #1208 trace (2589 s+, RSS flat at
   31 GiB), unattributed. W1's phase table should name it; if it does not, that is
   a W0 gap and W0 iterates.
+* **A VAE-SIDE sub-scope for `decode.video`.** The anchor W0 lands sits in the
+  driver: `decode.video.chunk` runs from the leaf's own open to the moment
+  `Ltx2VideoDecodeStreaming` hands a chunk back. That END is a production event
+  and it is what catches M10, but the WORK it wraps is the whole call rather than
+  the tile accumulation inside it. The honest sub-scope is around
+  `AccumulateTemporalGroup`
+  (`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp`), which is outside
+  the authority W0 was dispatched with. Owed to W5, whose lever this phase is,
+  and it is a refinement of a gated phase rather than an ungated one.
 
 ## Outcome — W0, the instrument
 
@@ -663,41 +687,53 @@ Landed on `row/LTX25-RESIDENCY-W0`, issue
 ### The gate, and the number
 
 **PASS.** One completed render through the `vllm.h` video ABI emits a phase
-table whose named leaves sum to **99.84% of wall** — 12.010601 s of leaves
-against 12.030305 s of wall, residue **19.7 ms** over 21 entries and 169
-samples. The tolerance was fixed at **>= 95%** in the test's own comment and in
-the red-first commit message *before* the instrumented run, and the sum is
-checked in the same case that checks the named boundaries, because one leaf
-called `render` would sum to wall exactly and measure nothing.
+table whose named leaves sum to **99.94% of wall** — 4.459892 s of leaves
+against 4.462572 s of wall, residue **2.68 ms** over 33 entries and 118 samples.
+The tolerance was fixed at **>= 95%** in the test's own comment and in the
+red-first commit message *before* the instrumented run, and the sum is checked
+in the same case that checks the named boundaries, because one leaf called
+`render` would sum to wall exactly and measure nothing.
 
-The same case has produced **98.33% at a 0.158 s wall, 99.96% at 6.138 s and
-99.84% at 12.030 s** on three runs of the identical binary at the identical
-geometry. The RATIO is what the gate reads and it never came near the 95% floor;
-the WALL moved by a factor of 76 across those runs because the box was building
-other sessions' trees, which is why no wall figure in this section is a
-benchmark and why W1 is written as a lease on an idle box.
+The same case has produced **98.33% at a 0.158 s wall, 98.74% at 0.147 s, 99.88%
+at 1.676 s, 99.94% at 4.463 s, 99.96% at 6.138 s and 99.84% at 12.030 s** on six
+runs of the identical binary at the identical geometry. The RATIO is what the
+gate reads and it never came near the 95% floor; the WALL moved by a factor of 82
+across those runs because the box was building other sessions' trees — and the
+0.147 s and the 4.463 s are ONE MINUTE apart, which is the sharpest form this
+finding has taken. That is why no wall figure in this section is a benchmark and
+why W1 is written as a lease on an idle box.
 
 The evidence file is
 [`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json),
-sha256 `3444151a613a1f1f53ae5ca5bdf221bf9ad688f244eb0c1db1e4280e805ae6a9`,
-written verbatim by the render that produced it. Provenance, because the file
-carries none of this itself:
+sha256 `59a860163e6ab2569c789209be709858915ba58393e8eb6900559f192ea7b950`.
+**Re-taken twice.** First for the first review's F4, which found the original
+artifact carrying no provenance at all in a directory whose every sibling carries
+`_source`, `hardware`, `workload` and `footnotes`; then for the second review's
+finding above, because an artifact taken before the `denoise.step` and
+`decode.video.chunk` anchors existed cannot show the containment the gate now
+requires. Every phase record in it is the render's
+own output; the four keys above them — `_source`, `_caveat`, `_headline`,
+`_footnotes` — are written by hand at commit time, because a render cannot know
+its host, its checkpoint or what else the box was doing, and those are exactly
+the facts whose absence made #1040 and #1087 unreadable. The library now writes
+the part it CAN know into every phase log it produces: `notice`, `sum_rule` and
+`sampler_enabled`. Provenance:
 
 | | |
 |---|---|
 | producer | `examples/ltx2_gen` (`build/examples/ltx2-gen`), through `vllm_video_engine_load` + `vllm_video_generate` |
-| tree | binary built from `4fe6b47deaf06141c248a5e95c2c32880e5dd7ed` on `row/LTX25-RESIDENCY-W0`, which is a merge of `origin/main` `96ed8346f` |
-| build | `cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF`, gcc 13.3.0 |
-| host | `mudler-ubuntu-box`, Linux 6.8.0-136-generic x86_64, **20 cores and CONTENDED** — other sessions were compiling throughout |
+| tree | binary built from `3dc2ae98b` on `row/LTX25-RESIDENCY-W0` |
+| build | `cmake -DCMAKE_BUILD_TYPE=Release -G Ninja`, gcc 13.3.0 |
+| host | `mudler-ubuntu-box`, Linux 6.8.0-136-generic x86_64, **20 cores and CONTENDED** — 1-minute load average between **31 and 55** across the render and the one a minute before it, other sessions building throughout |
 | checkpoint | the reduced-dimension fixture `tests/vllm/multimodal/ltx2_video_fixture.h` writes, in the shipped file format |
 | geometry | `--frames 9 --width 64 --height 64 --seed 7 --max-phase 0 --device cpu` |
 | completion | 9 frames written, **9 distinct per-frame md5s**, plus a 48 kHz WAV. The exit code is not the completion gate here ([#1149](https://github.com/mudler/vllm.cpp/issues/1149)); the distinct md5s are |
 | device column | **every row reads `-1`.** See `## Owed` — this is the CPU arm, and `CudaBackend` would read `-1` as well |
 
 **The wall figures are NOT a benchmark and nothing may quote them as one.** The
-host was contended, the checkpoint is a reduced fixture, and the same case
-measured 0.26 s, 6.14 s and 12.03 s of wall on three runs of the identical
-binary. What the artifact supports is the SHAPE of the table and the fact that
+host was contended, the checkpoint is a reduced fixture, and the same case has
+measured 0.15 s, 0.16 s, 1.68 s, 4.46 s, 6.14 s and 12.03 s of wall on six runs
+of the identical binary. What the artifact supports is the SHAPE of the table and the fact that
 its parts add up. `docs/BENCHMARKS.md` is therefore untouched, which is what
 this spec's `### Decisions taken here` already said W0 owes: W1 owes the
 benchmark edit, on a leased idle box, at two geometries.
@@ -705,10 +741,23 @@ benchmark edit, on a leased idle box, at two geometries.
 ### What the table says about this render, which is not what anybody expected
 
 Two leaves are the whole render on this fixture, and **which of them is larger
-changed between two runs of the identical binary**. On the artifact's run
-`denoise` is 8.127 s (67.6% of a 12.030 s wall) and `decode.audio` is 3.062 s
-(25.5%). On an earlier run of the same case at the same geometry the order was
-reversed: `decode.audio` 0.0889 s against `denoise` 0.0539 s of a 0.158 s wall.
+changed between two runs of the identical binary**. On the artifact this row
+first shipped, `denoise` was 8.127 s (67.7% of the named leaves) against
+`decode.audio` 3.062 s (25.5%). On an earlier run of the same case at the same
+geometry the order was reversed: `decode.audio` 0.0889 s against `denoise`
+0.0539 s of a 0.158 s wall. The first re-take recorded a third split again —
+`denoise` 48.3% against `decode.audio` 42.6% — and **the artifact this row now
+ships records a fourth**: `denoise` 75.79% against `decode.audio` 18.07%. The
+gap between the two has been 2.7x, 0.6x, 1.1x and 4.2x on one binary at one
+geometry.
+
+The re-take also names something the first artifact could not, because F1 split
+it: **`decode.audio.vocoder` alone is 0.8006 s, 17.95% of the named leaves, and
+99.998% of `decode.audio`.** Almost the whole of `decode.audio` is the vocoder,
+and until this row that phase had no name of its own anywhere in the tree. The
+same is now true one level up: `denoise.step` covers **99.993%** of `denoise`
+over 8 denoiser evaluations, and `decode.video.chunk` **99.982%** of
+`decode.video`.
 
 That reversal is worth more than either number. The host was building other
 sessions' trees throughout, and the two phases do not have the same threading —
@@ -757,10 +806,19 @@ rejected, and this is the one rejection a reader should not skip.** It would
 have made W0's own gate look complete on a CUDA box, and it is
 [#1126](https://github.com/mudler/vllm.cpp/issues/1126)'s change:
 `include/vllm/platforms/interface.h:68-72` records that the seam's only consumer,
-`Gemma4MoE`'s device-expert LRU, is DEAD on CUDA precisely because the override
-is absent, so adding it wakes a landed residency policy on every CUDA model in
-the tree. An instrument that changes model behaviour to make its own column
-non-empty is not an instrument. The column reports `-1` and `## Owed` says why.
+`Gemma4MoE`'s device-expert LRU, is DEAD on CUDA. **This row first wrote that as
+"wakes a landed residency policy on every CUDA model", which claims more than the
+code supports and is corrected here.** The bf16 arm
+`EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is separately dead behind
+`vt::HasMatmulBTAlphaBeta` at `:571` — ROCm holds the only implementation
+([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override
+would not wake that one. It would wake `EnsureGemma4Fp8NativeOnDevice`
+(`:611-628`), which reaches `MakeRoom` with the probe as its only device gate and
+a 2048 MiB fill-only default budget (`:416-432`). One arm, named, and still a
+behaviour change with its own measurement — which is the reason, and the reason
+did not need the overstatement. An instrument that changes model behaviour to
+make its own column non-empty is not an instrument. The column reports `-1` and
+`## Owed` says why.
 
 ### Mutations, each with its diff, its compile status and its exit code
 
@@ -773,6 +831,226 @@ non-empty is not an instrument. The column reports `-1` and `## Owed` says why.
 M1 is the mutation `.agents/reachability.md` asks for: the production call site
 is deleted in a scratch copy and the focused gate goes red, so the gate measures
 a capability rather than a class.
+
+### What a fresh review found, and the mutations that closed it
+
+A fresh reviewer returned `PASS_WITH_FINDINGS`. It reproduced M1, M2 and M3
+exactly, confirmed the instrument is reachable on the shipped default, and found
+no correctness defect. Its central finding is the one that mattered, because W0
+gates a campaign: **this gate could not tell a correct table from a useless one,
+and the reviewer built the useless one.**
+
+**F2 — existence plus a sum is not attribution.** Mutation M4 leaves the
+`decode.video` leaf open across the audio decode and gives `decode.audio` its
+name with no work beneath it. All six required names are present, no leaf nests,
+and the leaves account for 99.9% of wall — so the gate passed, over a table that
+reported the video decode as 32% of the render (it is 2.4%) and the audio decode
+as free (it is a quarter of it). A W1 reader ranking levers off that sends W5,
+this campaign's largest stage, at the wrong phase and drops the audio decode
+entirely. Seven of the 21 leaves also read 0.0000 s on the gate's own render, so
+nothing about their placement was proven either.
+
+**The suggested repair was a differential over two frame counts, and this box
+refuted it.** Render at 9 frames and at 33, and require the phases whose work
+scales with the clip to grow. It was written, built and run here. The 9-frame
+render measured **8.03 s** of named leaves and the 33-frame render **3.80 s**,
+minutes apart on the same binary — the 2.5x longer clip cost HALF the time — and
+an earlier run of the same 9-frame render measured **4.80 s**. Wall noise here is
+a factor of two in both directions against a 2.5x signal, so a
+seconds-differential is a coin flip wearing a gate. The form is dropped and the
+measurement is kept, because it is the same finding this section already records
+at 76x and it is the concrete reason W1 is written as a lease on an idle box.
+
+**What closed F2 instead needs no clock.** `decode.audio` declares that it covers
+the audio decode, and the audio decode is exactly two calls —
+`Ltx2AudioDecoderForward` and `Ltx2VocoderWithBweForward` — each of which F1 gives
+a scope of its own. The new case asserts **containment**: each sub-scope's
+interval lies inside the interval of the leaf that claims to cover it, the two
+together cover at least 90% of it, and the decode and writer leaves never
+overlap. Every number comes from one clock in one run and no threshold is
+crossed, so contention cannot move the verdict. A **share floor** of 0.05% of the
+leaf sum covers `denoise`, `decode.audio` and `decode.video`, the three phases
+that carry this render: a name detached from its work measures two function
+calls, five orders of magnitude below the floor, while the smallest of the three
+holds 3.7%. **That repair covered ONE of those three, and the next section is a
+second fresh review demonstrating what the other two could still do.**
+
+**F1 — #1010 named six phases and two of them were folded away.** `decode.audio`
+carried `Ltx2AudioDecoderForward` and `Ltx2VocoderWithBweForward` in one leaf,
+which on the first artifact was 3.062 s, 25.5% of wall, the second-largest phase
+in the table and un-decomposed. The two-stage recipe's latent spatial upsampler
+ran inside `phase.prepare`, a leaf whose name does not mention it. Both are now
+split as NESTED leaves — `decode.audio.mel`, `decode.audio.vocoder`,
+`phase.upsample_latent` — which decomposes them without moving what the table
+adds up to, since nested records are excluded from the sum. The vocoder split is
+what makes F2's containment invariant expressible at all; the upsampler is gated
+by the two-phase DFR case, the only render in `test_ltx2_video` that reaches it.
+
+**F3 — the gate reddened on the next refinement it needed.** The reconciliation in
+the SUMS case accumulated every record that was not a `span`, while the emitter's
+own `Sum` skips `span || nested`. So the case silently asserted "no nested leaf
+has a non-trivial duration" although the header advertises nesting as supported,
+and splitting the mel decode out failed it on `CHECK( 0.0118791 < 1e-06 )` — a
+message that says nothing about nesting and reads as "the emitter does not
+reconcile". Repaired to skip both, which is what made F1's split possible at all.
+M6 below re-runs the reviewer's demonstration against the landed split.
+
+**F4 — the artifact had no provenance and sits under `benchmarks/`.** Every
+sibling in that directory carries `_source`, `hardware`, `workload`, `headline`
+and `footnotes`; the first phase-log artifact carried none of them, so a reader
+opening `denoise 8.13 s (67.6%)` beside `decode.audio 3.06 s (25.5%)` in a
+directory called `benchmarks/` had nothing telling them the host was contended,
+the checkpoint was a two-block fixture, or that the rank of those two phases had
+reversed between two runs. That is #1040 and #1087's failure in miniature, inside
+the row that exists to stop it. Two changes: **the emitter now writes the caveat
+into every phase log it produces** — `notice`, `sum_rule` and `sampler_enabled`,
+so the warning travels with the file rather than living in a document a later
+reader would have to know to look for — and the committed artifact carries a
+`_source` provenance header in the shape its siblings use.
+
+**F5 — `## Now` quoted the superseded run.** It carried 98.33% of a 0.1575 s wall,
+which is the run whose phase ranking this section says may not be quoted. It now
+carries the artifact's own 99.84%, with both walls named as the non-benchmarks
+they are.
+
+**F9 and F10 — the sampler's lifetime.** `StopSampler` hands the thread object out
+under `mu` and joins it outside; between those two points an `Open` on another
+thread could run `StartSamplerLocked`, which cleared the single `stop` member the
+old worker was still reading, so the old worker never exited and the join blocked
+forever with two samplers live. The flag is now owned by the worker that reads
+it, so nobody else's start can clear it. Separately, nothing but `Reset()` and the
+destructor ever stopped the sampler, so a server that rendered one clip kept a
+100 ms `/proc/self/statm` read under the process-wide mutex for the rest of its
+life and accumulated that idle time into the next table's sample count. The last
+`Close` now stops it and `Begin` stops whatever the previous timeline left
+running. On this driver that is two starts per process, because the `load` and
+`generate` spans each stay open across everything beneath them.
+
+**F6 and F8 — two one-line record defects.** `docs/FEATURES.md`'s ABI capability
+table listed the video entry points and omitted `vllm_video_last_phase_log`. And
+the comment above the monotone-`start` assertion said the sequence holds *because*
+the records are appended in completion order, which is backwards: completion order
+is what would break it (`load` closes at start 0.0001 and is appended after
+`load.prompt_embeds`, which starts at 0.0625), and what the line actually pins is
+`ByStart`'s `stable_sort`.
+
+**A claim this row made about #1126 was too broad, and is narrowed.** See `## Now`
+and `## Owed`: the override would wake one named arm, not "a landed residency
+policy on every CUDA model".
+
+| # | Mutation | `git diff --stat` | compile | focused gate |
+|---|---|---|---|---|
+| M4 | leave `decode.video` open across the audio decode and give `decode.audio` its name with no work beneath it — the **attribution** mutation | 1 file, +4/-2 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **26 assertions, 4 failed** — two containment failures (`start >= audio_start`), the mel/vocoder ordering, and the floor at 8.85e-5% against 0.05% |
+| M6 | revert F3: reconcile over `span` only, so a nested leaf is summed twice | 1 file, +1/-1 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, 302 assertions, 1 failed, on `fabs((wall - leaves) - unaccounted) < 1e-6` |
+
+**M4 is the acceptance test for F2, and the number that matters is the one
+beside it.** Under M4 the pre-existing SUMS case still reports **exit 0, 1 case
+passed, 302 assertions, 302 passed**, at 8.00802 s of leaves against 8.01027 s
+of wall — 99.97% accounted over 23 entries, every required name present. So the
+gate that shipped is blind to M4 exactly as the reviewer said, and the
+containment case is what sees it. On the unmutated tree that same case reports
+exit 0, 26 assertions, 26 passed, with mel+vocoder covering **99.9994%** of
+`decode.audio` and the three floors clearing by 40x (`decode.video`, 1.99%),
+286x (`decode.audio`, 14.32%) and 1562x (`denoise`, 78.10%).
+
+**Read those three shares beside the artifact's own and the point makes
+itself:** the artifact recorded `denoise` at 67.66%, `decode.audio` at 25.50%
+and `decode.video` at 3.73%, and the run above recorded 78.10%, 14.32% and
+1.99% on the same binary at the same geometry. The SHARES move by a factor of
+two on this box, which is why F2 asserts a floor three orders of magnitude below
+them rather than a value, and why no ordering in any table this row produced may
+be quoted.
+
+### What a SECOND fresh review found, and what closed it
+
+The repair above asserted containment for `decode.audio`, because `decode.audio`
+was the only leaf with sub-scopes. `denoise` and `decode.video` were held by the
+0.05% share floor alone, and the non-overlap loop did not mention `denoise` at
+all. A second fresh reviewer ran M4's shape one level over, on the phase that
+carries this render.
+
+**M7 — the transfer, on the largest phase in the table.** Close `denoise` after
+the first sampler step and open `phase.finish` there. No overlap, no nesting, the
+sum untouched: 1 file, **+7/-0**, compile rc 0, 0 errors. The containment case
+reported **exit 0, 1/1 cases, 26/26 assertions**. The SUMS case reported **exit
+0, 1/1 cases, 314/314 assertions**, 99.94% accounted over 24 entries. The table
+it emitted put `phase.finish` at **2.129 s, 55.0%** of a 3.873 s leaf sum and
+`denoise` at **0.232 s, 6.0%**, on a binary whose honest run measured `denoise`
+at **73.4%**. **82% of the denoise was re-labelled and both gates passed.**
+
+That is the same defect M4 named, on the phase #1024 and #1087 are about, in the
+table W1 ranks this campaign's levers from. The reviewer recommended a prose
+correction. The operator overrode it, and the right call: a prose correction
+would have been honest and would still have shipped a gate that cannot see an
+82% misattribution.
+
+**What closed it: every carrying phase now has an anchor.** `denoise.step` wraps
+the denoiser evaluation inside `Evaluate`, which every sampler arm reaches — the
+first-order loop calls it directly and the res_2s loop reaches it through
+`hooks.denoise` — so one nested leaf per evaluation says where the sampler
+actually spent its time. `decode.video.chunk` runs from the leaf's own open to
+the moment the streaming decoder hands a chunk BACK, so its end is a production
+event rather than an instrument statement. Both are nested, so
+`sum_leaf_seconds` does not move.
+
+**And a third assertion, which sees a transfer directly rather than through a
+sum: EXCLUSIVITY.** No other leaf may overlap the window a phase's sub-scopes
+span. Containment says "the work is not inside the name"; exclusivity says "a
+second name is inside the work". M7 fails both — seven of its eight
+`denoise.step` records fall outside the shortened `denoise` leaf, and
+`phase.finish` opens in the middle of the denoise window while the steps keep
+running around it.
+
+**Why the sub-scope for `decode.video` sits in the driver and not in the VAE.**
+The per-chunk decode itself is `AccumulateTemporalGroup` in
+`src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp`, one directory outside
+this stage's authority. The driver-side anchor is weaker and it is not nothing:
+its END is the production callback firing, so a `decode.video` leaf that closes
+before its chunk arrives, or that is re-labelled after one, stops containing the
+chunk it produced. M10 below is that case. A VAE-side sub-scope naming the tile
+accumulation is **owed** and is listed under `## Owed`.
+
+| # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
+|---|---|---|---|---|---|
+| **M7** | close `denoise` after the first sampler step and open `phase.finish` there — the **transfer** mutation | 1 file, +7/-0 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **124 assertions, 8 failed** — 7 containment, 1 exclusivity | exit 0, 434/434 |
+| M4 | re-anchored onto the repaired tree: leave `decode.video` open across the audio decode and give `decode.audio` a name with no work | 1 file, +2/-2 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **124 assertions, 5 failed** | exit 0, 422/422 |
+| M10 | the M7 shape on the VIDEO side: after the first chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **122 assertions, 1 failed** | exit 0, 422/422 |
+| M9 | revert F10: the last `Close` no longer stops the sampler | 1 file, +0/-1 | rc 0, 0 errors | n/a | **RED**, exit 1, 1 case failed, 2 assertions, 1 failed, at 10 samples against 4 |
+
+The SUMS column is not a defect. It is the measurement: **a sum cannot see a
+transfer**, in three independent mutations, which is exactly why the containment
+case exists and why it is the one that must be run.
+
+On the unmutated tree the containment case reports **exit 0, 1/1 cases, 124/124
+assertions**, with `denoise.step` covering **99.667%** of `denoise` over 8
+evaluations, `decode.video.chunk` **99.439%** of `decode.video` over 2 leaf
+records, and mel+vocoder **99.995%** of `decode.audio`.
+
+**Two more findings from the same review, repaired here.**
+
+*The coverage threshold and the share floor were both mute switches.* At 0.90,
+`decode.audio` could have opened 11% early and swallowed 0.13 s — 87% of this
+render's entire `decode.video` — while passing everything in the file. Coverage
+is a ratio of two intervals measured inside the same contention window, so it is
+the one number here that a loaded box does not move, and the audio threshold is
+now **0.99**. The three thresholds are deliberately not one number:
+`decode.video` is 1.6 ms on this fixture, where a single preempted
+`/proc/self/statm` read at a scope boundary is percent-scale, so its threshold is
+the loosest at 0.90 and the reason is written beside it. **The 0.05% share floor
+is kept and its margin is NAMED rather than tightened**, because the measured
+share is precisely the quantity this box destroys: the same binary at the same
+geometry has reported `denoise` at 38.1% and at 73.4%, `decode.audio` at 50.9%
+and at 16.7%, and `decode.video` at 5.27% and at 2.13%. A floor set at a fraction
+of the measured value would be a flake, and under M7 `denoise` sat at 6.0% and
+would have cleared any floor a quiet box could justify. The floor now reads "this
+name is not detached" and nothing more.
+
+*The emitter baked measured wall times into library source.* The `notice` string
+named "0.158 s, 6.138 s and 12.030 s" from one contended box, in `src/`, where no
+gate reads it and the next run that refutes it would have to edit a source file
+to say so. That is a live number in a place nobody looks — the failure this row
+exists to stop, one directory over. The notice is qualitative now and the
+artifact's `_caveat` keeps the numbers beside the run they came from.
 
 ### No claim file, and the checker says why
 
@@ -787,13 +1065,55 @@ which is where this spec's `### Decisions taken here` already said they would be
 
 ### Owed out of W0
 
-* **The device column has never executed.** See `## Owed`.
+* **The device column has never executed.** See `## Owed`. Every
+  `peak_device_bytes` in the artifact is the `-1` no-probe sentinel, and it would
+  read `-1` on CUDA too, for the reason #1126 names.
 * **A render on the SHIPPED 21.00B checkpoint has not been instrumented**, which
   is W1's whole job. Nothing here says what the table looks like when the DiT
-  load is minutes rather than milliseconds.
+  load is minutes rather than milliseconds; every number in this section is the
+  reduced two-block fixture.
 * **`GenerateAudioOnly` writes the table but has no gate on it.** The t2a arm
   flushes through the same helper and the case that would check it was not
-  written; the video arm is gated at two levels.
+  written; the video arm is now gated at three levels — the sum, the named
+  boundaries, and the containment case.
+* **No gate reads a phase table on a host that is not contended,** and this is
+  the one W1 must close first. The seconds-differential written for F2 was
+  refuted on this box, and the refutation is a property of the box: the same
+  binary at the same geometry has moved a factor of 76 in wall and has reversed
+  the rank of its two dominant phases. Until W1 takes a lease on an idle box, no
+  DURATION in any phase table this row produced may be compared with any other
+  duration, including its own from the run before.
+* **The sub-millisecond leaves are named, not measured.** `generate.setup`,
+  `generate.geometry`, `generate.guiders`, `generate.image_cond`,
+  `generate.audio_input`, `generate.retake` and `phase.finish` are each under
+  0.001% of the leaf sum on the fixture; F2's containment and floor cover the
+  three phases that carry the render and say nothing about these. That is a fact
+  about the driver — they really are bookkeeping — but it means their PLACEMENT
+  is unproven, and a shipped-checkpoint render is where it would show.
+* **F10 IS NOW GATED, and the sentence that said it could not be was wrong.**
+  This entry used to read "F10 is an absence — a thread that keeps running —
+  which no assertion in this suite is positioned to observe", and asserted that a
+  gate would need an injected scheduler. A second fresh review refuted it in
+  twelve lines against the PUBLIC surface: `PhaseLog::Samples()` is a counter the
+  worker increments every 100 ms, so a worker that outlived its timeline moves a
+  number a test can read. Those twelve lines are now
+  `ltx2 phase log: the last Close stops the sampler` — the first `PhaseLog`-level
+  unit case this instrument has, and the first gate in the file that does not pay
+  for a complete render. Reverting F10 (dropping the `TakeSamplerLocked` in the
+  last `Close`) makes it fail: **exit 1, 1 case failed, 2 assertions, 1 failed**,
+  at 10 samples against 4 over 600 ms of idle. The lesson is the one the row
+  keeps re-learning: "no assertion is positioned to observe it" was a claim about
+  what had been tried, written as a claim about what is possible.
+* **F9 is FIXED AND UNGATED, and that justification stands.** F9 is a race
+  between `Reset()` and `Open` whose window is a few instructions wide. It is a
+  logic race and not a data race — every access is already under `mu` — so a
+  sanitizer would not flag it, and a test that loses it reliably would have to
+  instrument the emitter's internals. What the suite proves for F9 is that the
+  repair regressed nothing, not that it is detected.
+* **`phase.upsample_latent` is gated only on the reduced two-phase fixture.** It
+  is the only leaf whose sole reader is the DFR case, because every other render
+  in `test_ltx2_video` pins `max_phase = 0`, where the input transform is never
+  the spatial upsample.
 
 ## W0-live — the lane that runs while the render is alive (#1413)
 

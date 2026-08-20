@@ -3070,6 +3070,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "loop, which is not ported. Supply the spatial upsampler "
              "('ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors').");
       }
+      // W0 repair (#1010 review): #1010 names "any latent-upsampler stage" and
+      // this one had no name — it ran inside `phase.prepare`, whose name says
+      // nothing about it. NESTED inside that leaf for the same reason the audio
+      // split is: the decomposition is readable and the sum does not move.
+      // Reached only by a recipe phase whose input transform is the spatial
+      // upsample, i.e. stage 2 of the two-stage recipes.
+      const ::vllm::multimodal::phase::Scope upsample_phase("phase.upsample_latent");
       Ltx2LatentVolume in;
       in.batch = 1;
       in.channels = video_lc;
@@ -3853,6 +3860,25 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                               const std::vector<float>& a_latent, double sigma_hp,
                               int64_t step_index, std::vector<float>& v_denoised,
                               std::vector<float>& a_denoised) {
+      // W0 repair (#1010, second fresh review): THE SUB-SCOPE THAT TIES THE
+      // `denoise` NAME TO THE WORK BENEATH IT.
+      //
+      // The first review's M4 showed that existence plus a sum cannot see a leaf
+      // whose name sits on somebody else's seconds. The repair asserted
+      // CONTAINMENT — and asserted it for `decode.audio` alone, because that was
+      // the only phase with sub-scopes. The second review then ran the same
+      // mutation one level over, on the phase that carries this render: close
+      // `denoise` after the first sampler step and open `phase.finish` there. No
+      // overlap, no nesting, the sum untouched, 99.94% accounted — and 82% of the
+      // denoise re-labelled with BOTH gates green.
+      //
+      // This is the anchor that closes it. Every sampler arm reaches `Evaluate`,
+      // and `Evaluate` is the denoiser evaluation itself, so one nested leaf per
+      // evaluation says where the sampler actually spent its time. A `denoise`
+      // leaf that stops short of the loop no longer contains its own steps.
+      // NESTED, so the sum does not move: the marking is automatic, because a
+      // leaf opened while `denoise` is live is excluded from `Sum`.
+      const ::vllm::multimodal::phase::Scope step_phase("denoise.step");
       const float sigma = static_cast<float>(sigma_hp);
       const std::vector<float> v_timesteps = TimestepsFromMask(video, sigma);
       const std::vector<float> a_timesteps = TimestepsFromMask(audio, sigma);
@@ -4550,11 +4576,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // Folding the writes into `decode.video` would charge W5's lever with the cost
   // of a `write(2)`; nesting them would take the writer out of the sum entirely.
   size_t decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
+  // W0 repair (#1010, second fresh review): the same anchor on the video side.
+  // `decode.video.chunk` opens with the leaf and closes when the decoder hands a
+  // chunk BACK, so its end is a production event rather than an instrument
+  // statement. A `decode.video` leaf that closes before its chunk arrives, or
+  // that is re-labelled after one, no longer contains the chunk it produced.
+  // Nested, so the sum does not move.
+  size_t chunk_handle =
+      phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
   Ltx2VideoDecodeStreaming(
       im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
       video_lh, video_lw, &decode_noise,
       Ltx2AutoTileSizeConfig(rendered_h, rendered_w, video_factors),
       [&](const Ltx2VideoChunk& chunk) {
+        phase::PhaseLog::Instance().Close(chunk_handle);
         phase::PhaseLog::Instance().Close(decode_handle);
         phase::Scope write_phase("artifacts.frames");
         MiniMaxH3VideoFrameShape shape;
@@ -4579,7 +4614,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         rendered_channels = chunk.frames.channels;
         write_phase.Close();
         decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
+        chunk_handle = phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
       });
+  phase::PhaseLog::Instance().Close(chunk_handle);
   phase::PhaseLog::Instance().Close(decode_handle);
 
   // ── the soundtrack ────────────────────────────────────────────────────────
@@ -4601,11 +4638,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     audio_samples = a2v_source.samples_per_channel;
     audio_rate = a2v_source.sample_rate;
   } else {
+    // W0 repair (#1010 review): `decode.audio` FOLDED TWO MODELS, and one of
+    // them was the second-largest phase in the first artifact this row shipped
+    // — 3.062 s, 25.5% of wall, un-decomposed. #1010 asks for the vocoder by
+    // name. The two are split as NESTED leaves inside the same `decode.audio`
+    // leaf rather than as siblings: nested records are excluded from the sum
+    // (`render_phase_log.cpp` `Sum`), so the decomposition is readable without
+    // changing what the table adds up to, and `decode.audio` stays the boundary
+    // the gate requires.
     const phase::Scope audio_decode_phase("decode.audio");
+    phase::Scope mel_phase("decode.audio.mel");
     const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
         im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+    mel_phase.Close();
+    phase::Scope vocoder_phase("decode.audio.vocoder");
     waveform = Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data,
                                          mel.channels, mel.frames, mel.mel_bins, &audio_samples);
+    vocoder_phase.Close();
     audio_channels = mel.channels;
     audio_rate = im.vocoder_cfg.output_sampling_rate;
   }

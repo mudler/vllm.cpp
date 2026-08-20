@@ -213,6 +213,13 @@ const ModelFactory kQwen3_5MoeFactory{
     .forward = &ForwardQwen3_5Moe,
     .make_kv_cache = &MakeQwen3_5KVCache,
     .is_dense_model = false,
+    // ENG-EXPERT-STREAM-DEVICE W0d (#1124). `ForwardQwen3_5Moe` reaches
+    // `RunMoeBlock` -> `ExpertMlpKq` -> `KqExpertSlice`, which is the slot seam,
+    // so this family's `*_exps.weight` towers ARE served a slice at a time when
+    // the lane is on. Both arms registered below share this factory and therefore
+    // this answer; the DENSE Qwen3.5 arms have no expert tower and keep the
+    // default.
+    .streams_routed_experts = true,
 };
 
 }  // namespace

@@ -320,7 +320,20 @@ MATRICES = {
     # because the rows EXIST, never to make a state transition pass; both are
     # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
     # (spec `## Owed` O10, no `nvcc` on the authoring host).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 56),
+    # 57 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-PATH-WALK`, the DFlash2
+    # candidate selector's PATH WALK. A separate family from
+    # `KERNEL-DFLASH2-SELECTOR-EDGES` rather than a second entry point into it,
+    # on the axis that decides kernel families here: the lattice op is a dense
+    # CONTRACTION whose difficulty is a reduction (and which is therefore gated
+    # within an f32 envelope), while the walk performs no arithmetic at all --
+    # only comparisons and one gather -- and is specified BIT-EXACT across
+    # backends. Their grids follow from that: one block per (request, step,
+    # predecessor slot) against one block per REQUEST with the step loop INSIDE
+    # it, which is spec `## Risks/decisions` D3's requirement and upstream's own
+    # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
+    # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
+    # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
+    "KERNEL": (AGENTS / "kernel-matrix.md", 57),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

@@ -192,11 +192,16 @@ struct Qwen3DFlashWeights {
   // The QUERY block the conv masks its taps against: `1 + num_speculative_tokens`,
   // NOT `dflash_config.block_size`. Upstream sizes it from the speculative config
   // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
-  // `19c9351904df4c63042671bc67a866ca48dc7d6f`) and the checkpoint key only
-  // supplies that value's DEFAULT. `LoadQwen3DFlash` fills it from the config's
-  // `block_size` so a direct caller has a usable value; the loader OVERWRITES it
-  // with `1 + k` once the resolved speculative config is known, because a CLI `k`
-  // that differs from the checkpoint's default must move the conv's block with it.
+  // `66e5414c6d75a8529473d977f7458c140bbab8a0`) and the checkpoint key only ever
+  // supplies that value's DEFAULT, through `k`.
+  //
+  // `LoadQwen3DFlash` DOES NOT FILL IT. Whoever knows the resolved `k` is the
+  // only writer -- `LoadDflashDraft` in production -- and until then it is 0,
+  // which every DFlash2 forward refuses by name. W3 and earlier seeded it from
+  // the checkpoint key so a direct caller had a usable value, and that is what
+  // made the loader's own assignment ungateable: deleting it left a plausible
+  // block behind and no gate could see the difference (spec `## Owed` O5,
+  // mutation-proven green by W2). SPEC-DFLASH2 W4 (#1314) removes the seed.
   int64_t conv_block_size = 0;
   // SPEC-DFLASH2 W3 (#1314): TRUE when the SHARED lm_head above was produced by
   // DEQUANTIZING a quantized target tensor rather than read as dense floats.

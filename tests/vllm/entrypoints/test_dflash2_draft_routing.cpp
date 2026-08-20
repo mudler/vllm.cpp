@@ -191,21 +191,22 @@ std::string RefusalForDraft(const std::string& draft_path) {
 
 }  // namespace
 
-TEST_CASE("W2: a safetensors DFlash2 draft is now ADMITTED as far as the conv") {
+TEST_CASE("W2: a safetensors DFlash2 draft is ADMITTED, and as of W4 it DRAFTS") {
   // W1 REFUSED this draft here, before any weight was read, because BOTH
   // mechanisms were missing. SPEC-DFLASH2 W2 implements one of them -- the
   // grouped dynamic depthwise convolution -- and a startup refusal would leave
   // every line of it unreachable from any production entry point, which is what
   // AGENTS.md `## Nothing lands dead` forbids. So the draft is admitted here and
-  // refused one step later, AFTER the conv has run. W3 moves that boundary
-  // again -- the candidate selector is implemented now and the PATH WALK is what
-  // is refused (`RefuseDflash2PathWalk`, gated in
-  // tests/vllm/v1/spec_decode/test_dflash2_walk_refusal.cpp, and reached from
+  // refused one step later, AFTER the conv has run. W3 moved that boundary to
+  // the PATH WALK, and W4 lands the walk -- so on this arm there is no boundary
+  // left, and the guard now points the other way: the DFlash1 per-slot argmax is
+  // refused for a DFlash2 block (`RefuseDflash1ArgmaxOnDflash2Block`, gated in
+  // tests/vllm/v1/spec_decode/test_dflash2_argmax_guard.cpp, and reached from
   // the runner in tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp).
   //
-  // What must NOT happen is a fall-through into a resolved config with nothing
-  // named: the boundary is stated at STARTUP so the later refusal is not a
-  // surprise. That notice goes to stderr and is asserted below.
+  // The STARTUP notice stays, and what it says moved with the boundary each
+  // time. It is asserted below, because a notice that goes stale is exactly what
+  // W3's fresh review found in the loader's other copy.
   const ScratchDraft draft(kDflash2DraftConfig);
   CHECK(RefusalForDraft(draft.path()).empty());
   const std::optional<SpeculativeConfig> cfg =
@@ -215,10 +216,14 @@ TEST_CASE("W2: a safetensors DFlash2 draft is now ADMITTED as far as the conv") 
   CHECK(cfg->ResolvedNumSpeculativeTokens() == 8);
 }
 
-TEST_CASE("W2: admitting the DFlash2 draft STATES the boundary at startup") {
-  // A user who is admitted silently and refused at the first generated token has
-  // been told nothing. The notice names the mechanism that runs, the one that
-  // does not, the wave that owns it and the issue.
+TEST_CASE("W4: admitting the DFlash2 draft STATES what runs and what is owed") {
+  // Through W3 this notice existed so that a user admitted silently and refused
+  // at the first generated token had been told something. W4 removes the
+  // refusal, and the notice stays for the two things a user cannot read off the
+  // checkpoint: that the port is BEYOND the parity pin, and that no throughput
+  // number has been taken for it. Every wave that moved the boundary had to move
+  // this text, and W3's review found the loader's OTHER copy still naming the
+  // wave that had just shipped -- so it is asserted, not assumed.
   const ScratchDraft draft(kDflash2DraftConfig);
   std::ostringstream captured;
   std::streambuf* const previous = std::cerr.rdbuf(captured.rdbuf());
@@ -233,10 +238,15 @@ TEST_CASE("W2: admitting the DFlash2 draft STATES the boundary at startup") {
   INFO("notice: ", notice);
   CHECK(notice.find("DFlash2DraftModel") != std::string::npos);
   CHECK(notice.find("grouped dynamic") != std::string::npos);
-  // W3: the notice names what RUNS and what does not, and both halves moved.
-  CHECK(notice.find("CANDIDATE SELECTOR are implemented") != std::string::npos);
-  CHECK(notice.find("PATH WALK is not implemented") != std::string::npos);
-  CHECK(notice.find("wave W4") != std::string::npos);
+  // W4: all three mechanisms run, and the notice says so rather than naming a
+  // wave that has landed.
+  CHECK(notice.find("PATH WALK are all implemented") != std::string::npos);
+  CHECK(notice.find("this draft DRAFTS") != std::string::npos);
+  CHECK(notice.find("PATH WALK is not implemented") == std::string::npos);
+  // What IS still owed, named: the GGUF drafter arm and the absent number.
+  CHECK(notice.find("wave W5") != std::string::npos);
+  CHECK(notice.find("no throughput number") != std::string::npos);
+  CHECK(notice.find("52816") != std::string::npos);
   CHECK(notice.find("SPEC-DFLASH2") != std::string::npos);
   CHECK(notice.find("#1314") != std::string::npos);
 }

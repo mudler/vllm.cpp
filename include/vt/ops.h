@@ -115,6 +115,7 @@ enum class OpId : uint8_t {
   kDFlashPagedBlockAttention,
   kDFlashGroupedConv,
   kDflash2SelectorEdges,
+  kDflash2PathWalk,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -919,6 +920,82 @@ struct Dflash2SelectorEdgesArgs {
   int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
 };
 
+// Arguments for vt::Dflash2PathWalk — the DFlash2 candidate selector's PATH WALK
+// (SPEC-DFLASH2 W4, #1314).
+//
+// BEYOND-PIN. Ported from `_selector_walk_kernel`
+// (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:16-79 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`).
+//
+// WHAT IT IS. The selector scores every (predecessor, child) transition of every
+// step; the walk turns that lattice into k tokens. It starts at the verified
+// anchor -- which the lattice already carries as EVERY predecessor slot of step
+// 0, so the walk enters at slot 0 -- takes the best child, and reads the NEXT
+// step's block at the predecessor row it just chose. The slot-to-slot dependency
+// is the whole shape of the problem: step l cannot start until step l-1 has
+// picked, so `L` steps are inherently sequential.
+//
+// ITS SHAPE IS UPSTREAM'S SHAPE, and that is a decision rather than a detail.
+// Upstream runs ONE program per request: the K scores of a slot stay in
+// registers and the step loop lives INSIDE the program, so `L` steps cost one
+// launch rather than `L`. Spec `## Risks/decisions` D3 requires the walk to be
+// on device from the first landing, because the identical sequential shape in
+// DSpark shipped host-side and measured 28% of the 27B draft step
+// (https://github.com/mudler/vllm.cpp/issues/436) before
+// `SampleSequentialDevice` moved it. The CUDA arm here is one block per request
+// with a shuffle argmax; the CPU arm is the authoritative reference.
+//
+// GREEDY IS THE ONLY ARM, and it is upstream's greedy arm exactly. At the moved
+// head the walk's two hand-written branches collapse into one
+// `gumbel_noised_argmax` call whose temperature argument is
+// `temperature if SAMPLE_PROBABILISTIC else 0.0`, and `SAMPLE_PROBABILISTIC` is
+// `self.draft_logits is not None`, which is set only for
+// `draft_sample_method == "probabilistic"`. At temperature 0 that helper divides
+// by nothing, adds no noise, and returns `tl.max(logits, axis=0,
+// return_indices=True)`; the `USE_FP64` cast it may apply is order-preserving on
+// fp32 inputs and cannot move a greedy answer. This engine refuses
+// `draft_sample_method: "probabilistic"` BY NAME at
+// `vllm::ParseSpeculativeConfigJson` (src/vllm/config/speculative.cpp) and
+// verifies accept-iff-equal, so no configuration can reach the noised arm and
+// nothing could consume the realized proposal distribution it exists to feed.
+// Landing that arm would be landing code no entry point can reach; it is owed,
+// with its layout, at `## Owed` of .agents/specs/dflash2-spec-decode.md.
+//
+// THE TIE-BREAK AND THE -inf ROW ARE PART OF THE CONTRACT. `tl.max(...,
+// return_indices=True)` resolves a tie to the LOWEST index, and upstream loads
+// masked lanes as -inf, so a row that is entirely -inf resolves to index 0
+// rather than to "no index". Both are pinned by literal cases and both arms
+// implement them identically: the reduction is seeded at -inf with slot index
+// `top_k`, keeps a candidate only when it STRICTLY exceeds the running best (so
+// a NaN never wins, on either arm), and collapses a `top_k` seed back to 0. A
+// different tie rule would pick a different PREDECESSOR for the next step, so it
+// moves the whole remaining path and not one token.
+//
+// UNLIKE vt::Dflash2SelectorEdges this op is specified BIT-EXACT across
+// backends. It performs no arithmetic -- only comparisons and one gather -- so
+// there is no reduction order for a backend to differ in.
+//
+// STRICTNESS IS THE WHOLE OF THAT CLAIM, and it was not free. W4's fresh review
+// measured the two arms apart on a NaN-bearing row: the CUDA per-lane scan
+// carried `|| (v == best && j < slot)` beside its strict `>`, a clause that is
+// unreachable once a lane has claimed anything (`j` only ascends) and whose one
+// effect was at the SEED -- a lane holding -inf compared equal to the -inf seed
+// and claimed a slot the CPU arm refuses. `[NaN,-inf]` read cpu 0 / cuda 1,
+// `[NaN,NaN,-inf]` read cpu 0 / cuda 2, and every NaN-free row agreed,
+// including the all -inf row and the forced tie group, so no fixture without a
+// NaN could see it. The clause is now DELETED rather than this claim narrowed,
+// and the lower-slot tie rule stays where it is needed: the cross-lane
+// butterfly, which combines lane winners out of slot order. That deletion has
+// never been compiled or run on a device -- the authoring host has no `nvcc` --
+// and is owed with the rest of the CUDA arm at `## Owed` O11 of
+// .agents/specs/dflash2-spec-decode.md. NO SHIPPED PATH FEEDS THIS OP A NaN:
+// the lattice comes from vt::Dflash2SelectorEdges over a target LM head, so the
+// row that measured the difference is synthetic, and it is a gap in the reach
+// of the contract rather than in any draft a user can obtain.
+struct Dflash2PathWalkArgs {
+  int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
+};
+
 // Arguments for vt::TopKValuesIndices — the vocabulary top-k that EMITS the
 // surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314).
 //
@@ -1413,6 +1490,8 @@ using DFlashGroupedConvFn = void (*)(Queue&, Tensor&, const Tensor&, const Tenso
 using Dflash2SelectorEdgesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                         const Tensor&, const Tensor&, const Tensor&,
                                         const Tensor&, const Dflash2SelectorEdgesArgs&);
+using Dflash2PathWalkFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                   const Dflash2PathWalkArgs&);
 using TopKValuesIndicesFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                      const TopKValuesIndicesArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
@@ -3305,6 +3384,17 @@ void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
                           const Tensor& succ_codebook, const Tensor& candidate_ids,
                           const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
                           const Dflash2SelectorEdgesArgs& args);
+
+// DFlash2 candidate-selector PATH WALK (SPEC-DFLASH2 W4, #1314). See
+// Dflash2PathWalkArgs for the contract, the tie-break and the upstream anchor.
+// Tensors:
+//   tokens        [B, L] i64        the drafted token per (request, step)
+//   scores        [B, L, K, K] f32  vt::Dflash2SelectorEdges' output
+//   candidate_ids [B, L, K] i64     compute_candidates' ids (target vocab)
+// One request is one program: the step loop is INSIDE it, because step l reads
+// the predecessor row step l-1 chose.
+void Dflash2PathWalk(Queue& q, Tensor& tokens, const Tensor& scores,
+                     const Tensor& candidate_ids, const Dflash2PathWalkArgs& args);
 
 // Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2,
 // #1314). See TopKValuesIndicesArgs for the contract, the tie-break and the

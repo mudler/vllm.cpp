@@ -72,7 +72,8 @@ feature once. The [Usage index](USAGE.md) links each runnable workflow.
 | Tenstorrent Blackhole | Active, partial runtime support | The full rerun and performance path remain open |
 | Intel XPU | Hardware-blocked | No accepted runtime gate |
 
-v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending. The
+The eight v0.0.2 server bundles are published; Windows v0.0.3-pre.1 remains
+pending. The
 [release reference](RELEASES.md) owns artifact names, checksums, provenance,
 and verification instructions. Windows ZIP downloads do not exist while the
 hosted runtime, merged-SHA dry run, prerelease publication, and 32-asset audit

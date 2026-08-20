@@ -146,6 +146,16 @@ rows. All five pass after the edit. The release, Windows publication,
 environment inventory, supported-model, public-table, and README structure
 checks also pass without a product, lifecycle, release, or measurement change.
 
+The R4 repair audits all 17 campaign-base `STATUS.md` headings. The six current
+summary headings remain on `STATUS.md`; model, backend, serving, speculative,
+build, and verification detail now names its current public projection and its
+internal evidence owner where applicable. The repair also keeps the required
+release anchor only in the OpenAI-server row, so removing that row produces the
+release checker's intended missing-anchor failure. `VT_KIMI_DEVICE_KDA_CHUNK`
+and `VT_KIMI_DEVICE_MLA` now each have one environment-table row, retaining the
+more complete current description. A direct row-name count fails on the two
+duplicates before this repair and reports none afterward.
+
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
 #1463 uses the accepted spec-owned form in the append-only issue index.
@@ -504,18 +514,18 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/STATUS.md:1` # vllm.cpp status | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:20` ## Parity pin | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:60` ## Capability status | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:352` ## Speculative decoding | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:352` ## Speculative decoding | Current feature state | `docs/FEATURES.md` for the keyed support summary; `docs/SPECULATIVE-DECODING.md` for methods, configuration, and limitations | `deduplicated` | `n/a` |
 | `docs/STATUS.md:663` ## Not supported yet | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:846` ## Model family notes | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:848` ### Gemma | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:932` ### OLMo | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:948` ### Frontier and hardware-blocked families | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:1720` ### Recent dense batch | Current family state, checkpoint gates, and implementation history | `docs/STATUS.md` for the current family-state summary; `.agents/specs/sweep-recent-dense-batch.md` for the named family, checkpoint, oracle, and gate record; `.agents/benchmark-record.md` for retained gate evidence | `kept`; `archived` | `.agents/specs/sweep-recent-dense-batch.md`; `.agents/benchmark-record.md` |
-| `docs/STATUS.md:1786` ## Build and test lanes | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
+| `docs/STATUS.md:846` ## Model family notes | Current feature state | `docs/FEATURES.md` model-coverage tables | `deduplicated` | `n/a` |
+| `docs/STATUS.md:848` ### Gemma | Current feature state | `docs/FEATURES.md` registered-architecture table | `deduplicated` | `n/a` |
+| `docs/STATUS.md:932` ### OLMo | Current feature state | `docs/FEATURES.md` registered-architecture table | `deduplicated` | `n/a` |
+| `docs/STATUS.md:948` ### Frontier and hardware-blocked families | Current feature state | `docs/FEATURES.md` registered, standalone, and inventoried-but-blocked tables | `deduplicated` | `n/a` |
+| `docs/STATUS.md:1720` ### Recent dense batch | Current family state, checkpoint gates, and implementation history | `docs/FEATURES.md` registered-architecture table for current family state; `.agents/specs/sweep-recent-dense-batch.md` for the named family, checkpoint, oracle, and gate record; `.agents/benchmark-record.md` for retained gate evidence | `deduplicated`; `archived` | `.agents/specs/sweep-recent-dense-batch.md`; `.agents/benchmark-record.md` |
+| `docs/STATUS.md:1786` ## Build and test lanes | Build procedure and contributor verification detail | `docs/BUILD.md` for public build instructions; `.agents/verification.md` for the contributor gate procedure | `deduplicated`; `archived` | `.agents/verification.md` |
 | `docs/STATUS.md:1879` ## Performance detail | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
 | `docs/STATUS.md:1946` ## Backend detail | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
 | `docs/STATUS.md:2225` ## Serving and API notes | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
-| `docs/STATUS.md:2619` ## Verification and parity | Current verification procedure, checker and migration history, gate evidence, environment-document repair, and README history | `docs/STATUS.md` for a concise current verification summary; `.agents/verification.md` for the active generic procedure; `scripts/check-fusion-consistency.py` and `scripts/check-runner-routing-consistency.py` for current checker behavior; `.agents/specs/arch-fusion-fold-plan-2026-07-30.md` for the Gemma fusion migration; `.agents/benchmark-record.md` for the runner/fusion gates, Gemma and Qwen gate evidence, environment-document repair, and README restructure record | `kept`; `deduplicated`; `archived` | `.agents/verification.md`; `.agents/specs/arch-fusion-fold-plan-2026-07-30.md`; `.agents/benchmark-record.md` |
+| `docs/STATUS.md:2619` ## Verification and parity | Current verification procedure, checker and migration history, gate evidence, environment-document repair, and README history | `.agents/verification.md` for the active generic procedure; `scripts/check-fusion-consistency.py` and `scripts/check-runner-routing-consistency.py` for current checker behavior; `.agents/specs/arch-fusion-fold-plan-2026-07-30.md` for the Gemma fusion migration; `.agents/benchmark-record.md` for the runner/fusion gates, Gemma and Qwen gate evidence, environment-document repair, and README restructure record | `deduplicated`; `archived` | `.agents/verification.md`; `.agents/specs/arch-fusion-fold-plan-2026-07-30.md`; `.agents/benchmark-record.md` |
 | `docs/STATUS.md:2681` ### Feature-gap map vs pinned vLLM 0.26 (2026-07-28) | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
 | `docs/STATUS.md:2752` ## Upstream sync 2026-07-30 (`555967922..e04a30a77`, 198 commits) | Design or implementation history | `.agents/specs/upstream-sync-2026-07-30.md` for the ranked queue and decisions; `.agents/sync/2026-07-30-e04a30a.md` for the dated sync report; `.agents/upstream-sync.md` for the current pin and sync procedure | `archived` | `.agents/specs/upstream-sync-2026-07-30.md`; `.agents/sync/2026-07-30-e04a30a.md`; `.agents/upstream-sync.md` |
 | `docs/USAGE.md:1` # Using vllm.cpp | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |

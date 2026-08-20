@@ -474,9 +474,9 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:4841` ## Streaming routed experts from disk (capacity mode) | Cross-model workflow | `docs/guides/expert-streaming.md` | `moved` | `n/a` |
 | `docs/USAGE.md:4857` ### Which device can serve it | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:4953` ### The same thing as config, and which one wins | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
-| `docs/USAGE.md:5122` ### `--device cuda` refuses a checkpoint it cannot hold | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5122` ### `--device cuda` refuses a checkpoint it cannot hold | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5200` ## Qwen3.8-2.4T-A95B `UD-Q1_0`: 370 GiB served from a 119 GiB box | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
-| `docs/USAGE.md:5226` ### The exact weights | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5226` ### The exact weights | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5275` ### Build and serve | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
 | `docs/USAGE.md:5333` ### What the load costs | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5377` ### What decode costs, and why the ceiling is where it is | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
@@ -493,7 +493,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:5782` ## MiniMax-Music3: the checkpoint loader | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5844` ### Running its gate | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
 | `docs/USAGE.md:5874` ### MiniMax-Music3: the quantized arms | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
-| `docs/USAGE.md:5960` ### IndexTTS-2.5 goldens and checkpoint manifests | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:5960` ### IndexTTS-2.5 goldens and checkpoint manifests | Model recipe and contributor procedure | `docs/models/indextts-2-5.md` for the current refusal; `.agents/specs/indextts-2-5.md` for golden regeneration and checkpoint manifest evidence | `moved`; `archived` | `.agents/specs/indextts-2-5.md` |
 | `docs/USAGE.md:6034` ## MiniMax-Music3: the autoregressive half | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:6044` ### The token gate the spec promised does not exist | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:6060` ### Running the gates | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |

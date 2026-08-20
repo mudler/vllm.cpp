@@ -184,11 +184,13 @@ jobs:
           python3 scripts/check-windows-release-state.py
           python3 scripts/check-container-matrix.py
           python3 scripts/check-container-workflow.py
+          python3 scripts/check-build-runtime-deps.py
           python3 tests/scripts/test_release_pipeline.py
           python3 tests/scripts/test_check_windows_release_state.py
           python3 tests/scripts/test_release_postpublish_audit.py
           python3 tests/scripts/test_check_container_matrix.py
           python3 tests/scripts/test_check_container_workflow.py
+          python3 tests/scripts/test_check_build_runtime_deps.py
           python3 tests/scripts/test_validate_container_image.py
           python3 tests/scripts/test_release_index.py
       - name: CPU release metadata and tier execution gates fail closed

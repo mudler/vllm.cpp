@@ -75,6 +75,65 @@ bool IsSafeEntryPath(const std::string& path) {
   return true;
 }
 
+// RFC 3986 section 3.1: `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+// followed by ':'. A reference that begins with one is absolute and is used as
+// it stands; everything else is resolved against the address that sent it.
+bool HasScheme(const std::string& reference) {
+  if (reference.empty()) return false;
+  const unsigned char first = static_cast<unsigned char>(reference.front());
+  const bool alpha = (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z');
+  if (!alpha) return false;
+  for (size_t i = 1; i < reference.size(); ++i) {
+    const char c = reference[i];
+    if (c == ':') return true;
+    const bool valid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                       (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.';
+    if (!valid) return false;
+  }
+  return false;
+}
+
+// RFC 3986 section 5.2.4, transcribed. `..` walks a segment off the output
+// buffer, which is why the algorithm cannot be written as a single pass over
+// the input: `/a/b/../../c` has to end at `/c` and not at `/a/c`.
+std::string RemoveDotSegments(const std::string& path) {
+  std::string in = path;
+  std::string out;
+  const auto drop_last_segment = [&out]() {
+    const size_t slash = out.rfind('/');
+    out = slash == std::string::npos ? std::string() : out.substr(0, slash);
+  };
+  while (!in.empty()) {
+    if (in.rfind("../", 0) == 0) {
+      in.erase(0, 3);
+    } else if (in.rfind("./", 0) == 0) {
+      in.erase(0, 2);
+    } else if (in.rfind("/./", 0) == 0) {
+      in.replace(0, 3, "/");
+    } else if (in == "/.") {
+      in = "/";
+    } else if (in.rfind("/../", 0) == 0) {
+      in.replace(0, 4, "/");
+      drop_last_segment();
+    } else if (in == "/..") {
+      in = "/";
+      drop_last_segment();
+    } else if (in == "." || in == "..") {
+      in.clear();
+    } else {
+      const size_t next = in.find('/', in.front() == '/' ? 1 : 0);
+      if (next == std::string::npos) {
+        out += in;
+        in.clear();
+      } else {
+        out += in.substr(0, next);
+        in.erase(0, next);
+      }
+    }
+  }
+  return out;
+}
+
 // GET a JSON document from the hub. `repo_id` appears in every refusal, because
 // a message that does not name the repository cannot be acted on.
 json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
@@ -92,7 +151,7 @@ json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
         "holds the repository.");
   }
 
-  const HfParsedUrl url = HfParseUrl(opts.endpoint);
+  const HfParsedUrl url = HfParseUrl(opts.endpoint, "HF_ENDPOINT");
 
   HfRefuseHttpsWithoutTls(opts.endpoint);
 
@@ -178,11 +237,11 @@ std::vector<std::pair<std::string, std::string>> CollectRefs(const json& doc) {
 
 }  // namespace
 
-HfParsedUrl HfParseUrl(const std::string& url) {
+HfParsedUrl HfParseUrl(const std::string& url, const std::string& role) {
   HfParsedUrl parts;
   const size_t scheme_end = url.find("://");
   if (scheme_end == std::string::npos) {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+    throw std::runtime_error("vllm.cpp: " + role + " '" + url +
                              "' has no scheme; expected http:// or https://");
   }
   parts.scheme = url.substr(0, scheme_end);
@@ -201,7 +260,7 @@ HfParsedUrl HfParseUrl(const std::string& url) {
   if (!parts.host.empty() && parts.host.front() == '[') {
     const size_t close = parts.host.find(']');
     if (close == std::string::npos) {
-      throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+      throw std::runtime_error("vllm.cpp: " + role + " '" + url +
                                "' has an unterminated IPv6 host");
     }
     const std::string after = parts.host.substr(close + 1);
@@ -222,14 +281,71 @@ HfParsedUrl HfParseUrl(const std::string& url) {
   } else if (parts.scheme == "https") {
     parts.port = 443;
   } else {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+    throw std::runtime_error("vllm.cpp: " + role + " '" + url +
                              "' uses the unsupported scheme '" + parts.scheme +
                              "'");
   }
   if (parts.host.empty()) {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url + "' has no host");
+    throw std::runtime_error("vllm.cpp: " + role + " '" + url +
+                             "' has no host");
   }
   return parts;
+}
+
+std::string HfResolveUrl(const std::string& base, const std::string& location) {
+  // An absolute URL is already resolved. The scheme test is RFC 3986 section
+  // 3.1's grammar rather than a search for "://", so that a `Location` of
+  // `mailto:x` or a Windows-looking `c:/x` is not mistaken for a path.
+  if (HasScheme(location)) return location;
+
+  const size_t scheme_end = base.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("vllm.cpp: cannot resolve the redirect target '" +
+                             location + "' because the address that sent it, '" +
+                             base + "', is not absolute");
+  }
+  const std::string scheme = base.substr(0, scheme_end);
+  const size_t authority_start = scheme_end + 3;
+  size_t authority_end = base.find_first_of("/?#", authority_start);
+  if (authority_end == std::string::npos) authority_end = base.size();
+  // The authority is taken as TEXT rather than re-serialised from a parse, so
+  // an address that named no port keeps naming none and the address in a later
+  // refusal is the one the hub actually sent.
+  const std::string origin =
+      scheme + "://" + base.substr(authority_start, authority_end - authority_start);
+
+  if (location.empty()) return base;
+  // A network-path reference keeps the base's scheme and nothing else.
+  if (location.rfind("//", 0) == 0) return scheme + ":" + location;
+
+  const size_t location_split = location.find_first_of("?#");
+  const std::string location_path = location.substr(0, location_split);
+  const std::string location_tail =
+      location_split == std::string::npos ? std::string()
+                                          : location.substr(location_split);
+
+  // An absolute-path reference replaces the base's path outright. THE FORM
+  // huggingface.co SENDS.
+  if (location.front() == '/') {
+    return origin + RemoveDotSegments(location_path) + location_tail;
+  }
+
+  std::string base_path = base.substr(authority_end);
+  const size_t base_split = base_path.find_first_of("?#");
+  if (base_split != std::string::npos) base_path = base_path.substr(0, base_split);
+  if (base_path.empty()) base_path = "/";
+
+  // A reference with an empty path keeps the base's path and replaces only what
+  // it does carry, per RFC 3986 section 5.3's `defined(R.query)` arm.
+  if (location_path.empty()) return origin + base_path + location_tail;
+
+  // A relative-path reference is merged onto the base's DIRECTORY, which is the
+  // base path up to and including its last slash.
+  const size_t last_slash = base_path.rfind('/');
+  const std::string directory =
+      last_slash == std::string::npos ? std::string("/")
+                                      : base_path.substr(0, last_slash + 1);
+  return origin + RemoveDotSegments(directory + location_path) + location_tail;
 }
 
 std::string HfFormatHost(const std::string& host) {

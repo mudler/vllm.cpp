@@ -36,7 +36,7 @@ listed in [the environment reference](../ENVIRONMENT.md).
 NVFP4 optimization defaults and current measurements are listed in
 [the environment reference](../ENVIRONMENT.md) and
 [the benchmark report](../BENCHMARKS.md).
-### Endpoints
+## Endpoints
 
 Registered in
 [`src/vllm/entrypoints/openai/api_server.cpp`](../../src/vllm/entrypoints/openai/api_server.cpp).
@@ -100,7 +100,7 @@ to one built without video support. Use the
 [MiniMax-H3 recipe](../models/minimax-h3.md) for the combined video and audio
 workflow.
 
-### `max_tokens`: what a non-positive value means
+## `max_tokens`: what a non-positive value means
 
 Some clients (Hermes among them) send `max_tokens: -1` to mean "no client-side
 limit". A non-positive `max_tokens`, or `max_completion_tokens` on
@@ -114,7 +114,7 @@ client would see `finish_reason: length` with no way to tell it apart from a
 limit it set itself. Use `VT_SERVER_MAX_NEW_TOKENS` when you want a serving-side
 ceiling.
 
-### Which token ids stop a generation
+## Which token ids stop a generation
 
 Stop ids come from two files in the checkpoint, not one. `config.json`'s
 `eos_token_id` supplies the **primary** eos id, and the sibling
@@ -136,7 +136,7 @@ generation then runs to the token budget. The ids still count toward
 `min_tokens` masking either way, so `min_tokens` cannot be satisfied by emitting
 a stop token early.
 
-### Server flags
+## Server flags
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -175,7 +175,7 @@ a stop token early.
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
 
-#### Accepted for recipe compatibility, these flags have NO effect
+### Accepted for recipe compatibility, these flags have NO effect
 
 A published `vllm serve` line has to reach model load. The flags below appear in
 most official [vllm-project/recipes](https://github.com/vllm-project/recipes)
@@ -210,7 +210,7 @@ only because the capability is missing (`--tensor-parallel-size` and the other
 parallelism flags), silently accepting those would let you believe you got
 tensor parallelism when you did not.
 
-#### What `--gpu-memory-utilization` does not do yet
+### What `--gpu-memory-utilization` does not do yet
 
 The flag is accepted, keeps vLLM's exact name and fraction semantics, and is
 then discarded. It does not size the KV pool. Passing
@@ -247,7 +247,7 @@ and this flag starts to bind, choose the fraction on such a board against the
 whole 119 GiB pool and leave the host its headroom. Until then the flag reserves
 nothing, on any board.
 
-#### Context length vs the KV pool
+### Context length vs the KV pool
 
 The KV pool holds `--num-blocks × --block-size` tokens, `256 × 32 = 8192` by
 default. A request longer than that can never be scheduled, so the engine

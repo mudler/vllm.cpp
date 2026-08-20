@@ -2,15 +2,15 @@
 
 Use the published container lane that matches your backend.
 
-Published to one GHCR package with the lane in the tag. Every lane is a
+The project publishes one GHCR package with the lane in the tag. Every lane is a
 `linux/amd64` + `linux/arm64` manifest, so the same tag works on both.
 
-| tag | what it is |
+| Tag | Meaning |
 |---|---|
-| `:<version>-cuda` / `-vulkan` / `-cpu` | **immutable.** Never republished |
-| `:latest-cuda` / `-vulkan` / `-cpu` | moves to the newest **release** |
-| `:latest` | the **cpu** lane, so pulling it on a machine with no accelerator gets a working server rather than a library-load failure |
-| `:main-cuda` / `-vulkan` / `-cpu` | moves with **main**: rebuilt when container infrastructure changes and nightly otherwise. Convenience, not a release, no support claim |
+| `:<version>-cuda`, `-vulkan`, or `-cpu` | Immutable and never republished |
+| `:latest-cuda`, `-vulkan`, or `-cpu` | Moves to the newest release |
+| `:latest` | Selects the CPU lane, which works without an accelerator |
+| `:main-cuda`, `-vulkan`, or `-cpu` | Moves with `main`. The project rebuilds it after container infrastructure changes and on the nightly schedule. It is not a release. |
 
 The entrypoint is `vllm-server`, so flags go straight after the image name and
 the server keeps its own default of `0.0.0.0:8000`:
@@ -33,23 +33,24 @@ docker run --rm --gpus all -p 8000:8000 \
 ```
 
 `/models` is the weights mount and `/cache` is the tokenizer/HF cache. The
-container runs as **uid 1000**, so `/cache` must be writable by it and the
-weights under `/models` must be READABLE by it. A model file with mode `0600`
-owned by another uid fails as `safetensors: cannot open file`, which reads like
+container runs as UID `1000`, so that user must be able to write to `/cache`
+and read the weights under `/models`. A model file with mode `0600` owned by
+another user fails as `safetensors: cannot open file`, which can look like
 a corrupt checkpoint rather than a permissions problem.
 
-## Picking the right flags for your GPU
+## Pick the flags for your GPU
 
-The two NVIDIA families need **different** invocations, and this is verified on
-both rather than inferred:
+The two NVIDIA families need different invocations. Both rows were verified on
+the listed hardware.
 
-| host | verified on | flags |
+| Host | Verified on | Flags |
 |---|---|---|
 | SBSA / datacenter arm64, x86_64 | GB10 `sm_121a` | `--gpus all` |
 | Jetson / Tegra (L4T) | AGX Orin `sm_87`, L4T R36.4.3 | `--runtime nvidia --gpus all` |
 
-On Jetson, `--gpus all` **alone is refused** ("invoking the NVIDIA Container
-Runtime Hook directly ... is not supported"), and `--runtime nvidia` **alone**
+On Jetson, the runtime refuses `--gpus all` by itself ("invoking the NVIDIA
+Container Runtime Hook directly ... is not supported"). Using only
+`--runtime nvidia`
 starts a container with no driver that dies on `libcuda.so.1: cannot open
 shared object file`, which looks like a broken image rather than a missing
 flag. Use both:
@@ -67,14 +68,14 @@ generation, so decode is on the GPU.
 
 ## If the server exits at startup
 
-| symptom | cause |
+| Symptom | Cause |
 |---|---|
-| `safetensors: cannot open file` | the weights are not readable by **uid 1000**. The container runs as uid 1000; a `0600` model owned by another user fails here and looks like a corrupt checkpoint |
+| `safetensors: cannot open file` | UID `1000` cannot read the weights. A `0600` model owned by another user fails here and can look corrupt. |
 | `libcuda.so.1: cannot open shared object file` | no driver in the container, on Jetson, add `--gpus all` alongside `--runtime nvidia` |
 | `--model <dir> is required` | the server takes flags directly; everything after the image name goes to `vllm-server` |
 
 
-Any OpenAI client works by pointing its `base_url` at it:
+Point any OpenAI client `base_url` at the server:
 
 ```python
 from openai import OpenAI

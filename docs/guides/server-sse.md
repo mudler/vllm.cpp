@@ -2,11 +2,11 @@
 
 Use keepalives only when a proxy closes inactive response streams.
 
-Async chat/completion streams can emit SSE **comment** frames (`:\n\n`) while
-waiting on the engine (long prefill / TTFT), so a proxy with an inactivity
-timeout sees body bytes before the first token. Interval is
-`VT_SERVER_SSE_PING_S`, **default `0`, off**; a positive value enables it and
-is clamped to 600.
+Async chat and completion streams can emit SSE comment frames (`:\n\n`) while
+waiting on the engine during a long prefill or time to first token (TTFT). A
+proxy with an inactivity timeout sees body bytes before the first token. The
+interval is `VT_SERVER_SSE_PING_S`. The default is `0`, which disables
+keepalives. A positive value enables them and is clamped to 600.
 
 
 Leave keepalives off unless a proxy closes inactive streams. Some benchmark
@@ -24,15 +24,15 @@ instant the engine has something for that request. A positive interval swaps in
 expires when the collector produced nothing at all. Deltas are therefore never
 collapsed or delayed either way.
 
-**A value the server cannot parse disables the keepalive; it is not an error.**
+An invalid value disables the keepalive without returning an error.
 `VT_SERVER_SSE_PING_S=fifteen`, an empty value and an unset variable all resolve
 to `0`, so if you enable this and no comment frames appear, check the spelling
 before looking anywhere else. The fallback points at OFF deliberately: under the
 previous default a typo silently switched the keepalive ON, and that is the
 direction that costs you requests.
 
-**The interval bounds silence on one request's stream, not its time to first
-token.** Each wait restarts whenever anything reaches that request, so a long
+The interval bounds silence on one request's stream. It does not bound TTFT.
+Each wait restarts whenever anything reaches that request, so a long
 prefill that keeps producing intermediate results never pings however long its
 first token takes, while a request whose stream goes quiet for the whole
 interval does.

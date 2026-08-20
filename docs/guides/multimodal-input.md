@@ -2,7 +2,7 @@
 
 Use the OpenAI-compatible server for image, video, and audio input.
 
-Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:
+The OpenAI API accepts multimodal input. `vllm-cli` accepts only text:
 `--model --prompt --max-tokens --temperature --top-k --top-p --seed --stream
 --speculative-config --tokenizer-config`.
 
@@ -27,9 +27,9 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
-## The second GGUF file: a `clip` multimodal projector
+## Add a `clip` multimodal projector to GGUF
 
-A GGUF multimodal model ships as **two** files: the language `.gguf` and a
+A GGUF multimodal model has two files: the language `.gguf` and a
 `clip`-architecture `mmproj-*.gguf` carrying the vision tower. Name the second
 one with `--mmproj` (`vllm-server`) or `vllm_model_params.mmproj_path` (C ABI
 v22); it is never auto-discovered from a sibling filename, because a directory
@@ -41,15 +41,15 @@ holding two unrelated models must not silently fuse them.
   --mmproj /models/mmproj-BF16.gguf
 ```
 
-What this does today, exactly: the projector is opened, its `clip.*` metadata
-and its `v.*` / `mm.*` tensors are read into the same vision tower the
-safetensors path builds, and the result is held on the engine. **No forward
-consumes it yet**, there is no multimodal request path for a GGUF model on
-either the server or the C ABI, so the flag buys validation and a loaded tower,
-not an image answer ([#821](https://github.com/mudler/vllm.cpp/issues/821)).
+The loader opens the projector and reads its `clip.*` metadata and `v.*` and
+`mm.*` tensors. The engine then holds the same vision tower that the
+safetensors path builds. No forward pass consumes this tower yet. Neither the
+server nor the C ABI has a multimodal GGUF request path, so the flag validates
+and loads the tower but does not produce an image answer
+([#821](https://github.com/mudler/vllm.cpp/issues/821)).
 
-Four things are refused **by name**, all of them before the tokenizer and before
-any language-model weight byte is read:
+The loader refuses four conditions by name before it reads the tokenizer or
+any language-model weight bytes:
 
 - `--model` is not a `.gguf`. A safetensors checkpoint carries its tower in its
   own shards and needs no projector file.
@@ -86,9 +86,8 @@ through it is dropped and answered as text. The refusals below are the server's.
 `vllm_model_params.mmproj_path` (ABI v22) is in the same position: it loads and
 validates the projector, and no C-ABI call can feed the tower an image yet.
 
-The limits are the mechanism and the flag is the sugar, so it is worth stating
-what the flag actually does: it does not "skip the encoder", it makes the server
-**refuse** multimodal requests.
+The flag sets all modality limits to zero. It does not skip the encoder. The
+server refuses multimodal requests.
 
 ```console
 $ curl -s localhost:8000/v1/chat/completions -d '{... three image_url parts ...}'

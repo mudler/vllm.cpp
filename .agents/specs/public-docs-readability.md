@@ -182,6 +182,23 @@ made those destinations the current public owners. W6 therefore records the
 remaining README drift for the product or landing-source flow that can update
 it honestly.
 
+W7 applies the technical-English, no-AI-slop, and humanizer passes to the
+campaign's public surface. The red inventory found 21 reader-blaming or
+formulaic terms and 141 headings or emphasized sentence openers that needed
+human review. Most matches were exact status labels, warnings, commands, or
+technical terms and remain unchanged.
+
+The pass removes the 250-line temporary legacy reference from `docs/USAGE.md`.
+Its build, backend, release, and model facts already have the public and
+internal owners recorded in the W1 manifest. `docs/USAGE.md` now ends with the
+checkpoint registry and the reference index. Focused edits also remove
+decorative emphasis, rhetorical setup, and ambiguous instructions from the
+container, multimodal-input, and server-sent event guides. Commands, flags,
+environment names, revisions, hashes, sizes, lifecycle states, measurements,
+limitations, API contracts, links, and checker-bound literals remain unchanged.
+The Windows publication sentence and its state anchor remain in `docs/USAGE.md`
+because `check-windows-release-state` binds that exact public surface.
+
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
 #1463 uses the accepted spec-owned form in the append-only issue index.

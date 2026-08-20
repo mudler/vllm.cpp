@@ -460,6 +460,16 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-ASYNC-LLM",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
+    # SPEC-BPE-QUADRATIC-MERGE (2026-08-19, issue #1365): GROWTH, re-pinned in
+    # the same change. The row was gated and command-free; its spec's `## Gates`
+    # now carries the `g++` build and the two run lines for
+    # `tools/bench/bpe_encode_cost.cpp`, the harness that replaces three
+    # prose-only ones, so the section names a command that can fail and the row
+    # joins this population. Named here so the growth is not silent: the harness
+    # itself is deliberately NOT a gate -- the row rules that a growth assertion
+    # over its figures is not viable on a shared runner -- and what became
+    # runnable is the RECIPE the section owes under AGENTS.md §Gates.
+    "SPEC-BPE-QUADRATIC-MERGE",
 })
 
 

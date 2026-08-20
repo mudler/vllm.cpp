@@ -471,6 +471,29 @@ two edits back gives the GPT-4o row above, so the two share one scanner's
 character classes but stay separate patterns: they disagree on `don't` and on
 every digit run longer than one.
 
+### Timing an encode on your own box
+
+`tools/bench/bpe_encode_cost.cpp` times `Tokenizer::Encode` on one synthetic
+input, at the sizes you name, through a `tokenizer.json` you name. Use it when
+you want to know what a prompt of some shape costs to tokenize here, or to
+re-derive a figure somebody else recorded instead of trusting it.
+
+Nothing RUNS it: it is registered as no test and it is not a gate. Both halves
+of that are deliberate — a growth ratio over these timings is not stable enough
+to gate on a shared machine, and one leg on a long single-class input can cost
+tens of seconds of one core. It IS compiled, as the never-linked OBJECT library
+`vllm_bpe_encode_cost`, so it cannot rot behind a `Tokenizer::Encode` or
+`FromHfJson` signature change while still being the artifact those figures are
+reproducible from. Its header carries the exact `g++` and run lines; it builds
+from the four tokenizer translation units directly and needs no `libvllm.a`.
+
+It prints one row per case and size, with the ids it produced and the
+1/5/15-minute load average sampled around each row, under a banner saying the
+output is a session reading and not a bound. Read it that way: on a 20-core box
+the same input on the same binary has read 1.7x apart on load alone, while the
+id counts came back identical. Quote a number from it only with its load beside
+it, and take the minimum of several repetitions rather than one shot.
+
 ### How much memory a Vulkan load needs
 
 On a unified-memory device (a DGX Spark) the Vulkan heap and system RAM are the
@@ -648,6 +671,12 @@ Those ten projections are seven GEMMs, because `gate_proj` and `up_proj` run as
 one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linears
 vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
 concatenate exactly and the merged GEMM is byte-identical to the separate ones.
+
+The `gate_proj`/`up_proj` merge always runs. The Q/K/V merge runs only when the
+fused attention preamble is available to read its row-strided output views,
+which is the default. `VT_FUSE_ATTN_PREAMBLE=0` turns that consumer off, and
+then `q_proj`, `k_proj` and `v_proj` run as three separate block GEMMs and the
+ten projections are nine GEMMs. The result is the same either way.
 
 That merge needs each projection in a group except the last to be a multiple of
 128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
@@ -4431,7 +4460,7 @@ save.
 
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
-VT_MOE_EXPERT_STREAM_SLOTS=8000 \
+VT_MOE_EXPERT_STREAM_SLOTS=4000 \
   ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
@@ -4490,13 +4519,23 @@ Four limits, stated plainly rather than left to be discovered.
   file, against the residency this process resolved, and a file that mixes a kept
   tower with a staged one keeps the whole bound as well (issue
   [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
-* **No speed claim is attached.** The decode measurement on the one machine that
-  answers capable has not run at the time of writing; `docs/BENCHMARKS.md`
-  carries it as `PENDING` and records what HAS been measured there, which is the
-  device probe itself. Device access to host-resident weights on that part has a
-  recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
-  way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
-  the benchmarks file before assuming the GPU is the faster arm here.
+* **The load now succeeds and the generation does not, so there is still no
+  speed claim.** The measurement ran on the one machine that answers true
+  (GB10, 2026-08-18) and it split: `--device cuda` loads this checkpoint in
+  255-272 s, which it could not do before, and then exhausts the machine inside
+  its first forward without emitting a token
+  ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)). The slot arena is
+  measurably not the cause — a 64-slot 0.15 GiB arena fails exactly where an
+  8000-slot 18.55 GiB one does — so raising or lowering
+  `VT_MOE_EXPERT_STREAM_SLOTS` will not get you a token. **Use `--device cpu`
+  for this checkpoint today.** That arm serves it at a steady **11.05 s/token
+  at 4000 slots**, which is the count both recipes in this section set and the
+  only count that figure holds for. The same binary at 8000 slots measured a
+  39.98-45.40 s/token median over two runs, and the second of them consumed all
+  30,625 MiB of the box's swap, so **more slots is not a free knob here**: the
+  extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
+  mapping is served out of. Read `docs/BENCHMARKS.md` before assuming the GPU is
+  the faster arm here.
 
 ### The same thing as config, and which one wins
 
@@ -4510,7 +4549,7 @@ below that, where weights stay borrowed out of the file mapping.
 ```sh
 ./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
-                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+                                 "expert_stream":{"enabled":true,"slots":4000}}}'
 ```
 
 | Key | Environment equivalent | Default |

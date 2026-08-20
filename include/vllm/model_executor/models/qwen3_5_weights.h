@@ -386,9 +386,21 @@ struct Fp8Weight {
 // config at use time: the consumer needs them per GEMM, and a weight that knows
 // its own geometry cannot be paired with the wrong one.
 //
-// NOTHING CONSUMES THIS YET. #1189 milestone M4 owns `Fp8BlockLinearMethod` and
-// the forward wiring; `PrepareQwen3_5Dense` refuses a populated one by name so a
-// block-wise checkpoint declines to run rather than running wrong.
+// CONSUMED BY THE DENSE FORWARD since #1189 milestone M4 (`281b4bc76`), which
+// landed `Fp8BlockLinearMethod` and the wiring it names. All ten projections
+// in `qwen3_5.cpp` are read, through THREE entry points rather than one.
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them: `o_proj`,
+// `down_proj`, the three GDN projections, and q/k/v whenever the split path
+// runs. M6 (`836c13c35`) added the other two: `MatmulFp8BlockMergedD` reads
+// q/k/v as one operand when the consumer accepts row-strided views, and
+// `Fp8BlockGateUpSwiGLUD` is the ONLY reader of `gate_proj_fp8_block` and
+// `up_proj_fp8_block`. `PrepareQwen3_5Dense` no longer refuses a populated
+// weight -- it refuses a DEVICE with no block-scaled GEMM, which after M5
+// (`489a9a4c0`) means a CUDA arch outside `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a).
+//
+// The CUDA kernel has still NEVER EXECUTED on hardware and there is no token
+// gate. That debt is real and is recorded in
+// `.agents/specs/vt-matmul-fp8-block-cuda.md`; nothing here narrows it.
 struct Fp8BlockWeight {
   OwnedTensor packed;  // i8  [N, K]  one fp8-e4m3fn byte per element, verbatim
   OwnedTensor scale;   // f32 [cdiv(N, block_n), cdiv(K, block_k)]
@@ -539,8 +551,9 @@ struct FullAttnLayerWeights {
   // populated by the `weight_scale_inv` rung in `qwen3_5_dense_weights.cpp`
   // BEFORE the per-tensor rung, because a block-wise weight is also `F8_E4M3`
   // (#1166). The bf16, fp4 and per-tensor fp8 slots are left EMPTY when these
-  // are populated, and vice versa. Nothing reads them yet -- M4 owns the linear
-  // method and `PrepareQwen3_5Dense` refuses a populated one by name.
+  // are populated, and vice versa. M4 (#1189, `281b4bc76`) landed the linear
+  // method and the forward that reads them, so `PrepareQwen3_5Dense` refuses an
+  // unrunnable DEVICE rather than a populated weight.
   Fp8BlockWeight q_proj_fp8_block;  // [N=2*Hq*Dh, K=H]
   Fp8BlockWeight k_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
   Fp8BlockWeight v_proj_fp8_block;  // [N=Hkv*Dh,  K=H]

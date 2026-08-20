@@ -361,6 +361,21 @@ target_link_libraries(vocoder-conv-ab PRIVATE vllm::vllm)
 target_include_directories(vocoder-conv-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_set_warnings(vocoder-conv-ab)
 
+# expert-stream-device-w0e: the W0e measurement harness for row
+# ENG-EXPERT-STREAM-DEVICE (#1124). It exists because one generation has to
+# yield three things together that no shipped command produces at once: the
+# generated token ids, a per-step arrival timestamp, and the expert-stream
+# counters at both ends of the run — and a live gate needs the DECODE-phase
+# delta of those counters, not the total, because prefill exhaustion here is
+# structural. Unlike the A/B harnesses above it is a pure client of
+# `include/vllm.h` and links `vllm::shared`, so it stays inside the ABI-client
+# rule and needs no `src/` include path. Not gated on CUDA: the CPU arm is the
+# baseline the CUDA arm is compared against.
+add_executable(expert-stream-device-w0e
+               ${CMAKE_SOURCE_DIR}/benchmarks/expert_stream_device_w0e.cpp)
+target_link_libraries(expert-stream-device-w0e PRIVATE vllm::shared)
+vllm_cpp_set_warnings(expert-stream-device-w0e)
+
 # vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar
 # GEMM, SAME BINARY with VT_VULKAN_COOPMAT as the only variable. Built only in a
 # Vulkan build, because it links the Vulkan context directly to report which

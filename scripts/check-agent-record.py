@@ -610,8 +610,29 @@ ENGINE_PREFIXES = (
 # implementation, `model_loader.cpp:279-303`, reads an existing cache for the
 # DFlash draft alone and never downloads. `READY`, spec
 # `specs/hf-model-download.md`, issue #1280.
+# 168 since 2026-08-19: +`SPEC-BPE-QUADRATIC-MERGE` (the BPE merge loop is O(n^2)
+# in pretoken length, on the request path, before `ValidatePromptLen`). Genuinely
+# new and not expressible by the two tokenizer rows beside it: `LOAD-HF-BPE` and
+# `LOAD-SENTENCEPIECE` both own a FORMAT -- which `tokenizer.json` shapes parse and
+# which token identifiers come out -- and both are token-exact against HF goldens
+# today and stay that way. This row changes no identifier at all. It replaces the
+# algorithm underneath both of them, and its gate is a COST bound, which is the one
+# thing a token gate provably cannot see. It is also not a benchmark row: the encode
+# runs synchronously on the HTTP worker five lines before the only length check, so
+# `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
+# MEASURED, and stated as the two SESSION-INVARIANT quantities only: over 1 KB to
+# 64 KB of ordinary English prose the fit through the committed Mistral golden has
+# exponent 2.01, and at 64 KB our cost is 2,507x HF `tokenizers` 0.22.2's on the
+# same file for byte-identical identifiers. Both are ratios taken inside one
+# session, so contention cancels. The ABSOLUTE milliseconds are deliberately not
+# repeated here: they moved 54% between two runs of one binary on one input, so a
+# constant copied into this comment would be a fourth place for a number nobody
+# can reproduce to drift. They live in the spec's tables, each beside its own load
+# average, and `## Gates` owes the idle-host re-measure. The exponent, not the
+# constant, is what makes this a row.
+# `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 167
+ENGINE_ROWS = 168
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

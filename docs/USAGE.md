@@ -703,28 +703,36 @@ What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
 A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**build-verified only**. It is the block-scaled CUTLASS GEMM vLLM itself
-dispatches on those devices, ported whole, with the scales applied in the
-mainloop; it is compiled by continuous integration for both architectures and
-registered, so a build for one of them no longer refuses the checkpoint at
-prepare time. **It has never been executed.** No comparison against the CPU
-reference, no token-exact comparison against vLLM, and no throughput number has
-been recorded for it, on any device. The value comparison that would settle it
-is written and registered as `test_ops_matmul_fp8_block_cuda`, and on a machine
-with no device it reports that it did not run. Treat this arm as untested until
-that test has been run on hardware and its result recorded. Milestone M5 of
-[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the kernel and the
-run it still owes; [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is
-the original report.
+**run and failing**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches
+on those devices, ported whole, with the scales applied in the mainloop; it is
+compiled by continuous integration for both architectures and registered, so a
+build for one of them no longer refuses the checkpoint at prepare time. On
+2026-08-20 `test_ops_matmul_fp8_block_cuda` was run on a GB10 (compute
+capability 12.1) for the first time, and vLLM's own ported case -- M=32, N=576,
+K=7168 -- throws `cutlass Invalid status` before any kernel launches, because
+CUTLASS refuses the configuration at `can_implement`. Two of the file's five
+cases fail this way and three pass, so the failure is shape-dependent rather
+than universal; which shapes are affected is not yet isolated, and `Invalid`
+names no constraint. No shape has yet had its output compared against the CPU
+reference: the two cases that make that comparison are the two that throw. There
+is still no token-exact comparison against vLLM and no throughput number, on any
+device. Treat this arm as broken on the shape it was measured on and unproven
+everywhere else.
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437) records the run,
+milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
+kernel and the repair it now owes, and
+[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
 
 Two shapes the CPU arm accepts are refused on CUDA, by name and with the
 dimension and its remainder in the message. The CUTLASS collective needs both
 `K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
 and reroutes those shapes to a Triton kernel this build does not have. A
-*ragged* 128-block is not affected and runs: `N = 576` is `4*128 + 64` and is the
-shape vLLM's own CUTLASS test uses. A build for any other CUDA architecture has
-no such kernel compiled and keeps refusing at prepare time, which is the honest
-answer rather than a silent fallback.
+*ragged* 128-block is not refused by that rule: `N = 576` is `4*128 + 64`, is
+16-aligned, and is the shape vLLM's own CUTLASS test uses. It does not follow
+that it runs -- on hardware that shape is exactly the one CUTLASS rejects at
+`can_implement`, above. A build for any other CUDA architecture has no such
+kernel compiled and keeps refusing at prepare time, which is the honest answer
+rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires

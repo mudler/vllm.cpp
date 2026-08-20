@@ -1700,7 +1700,7 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (`CheckMoeExpertLayoutSupported`, same file), per AGENTS.md §Shared seams.
     **The DENSE arm is NOT affected and the asymmetry is deliberate record:**
     `LoadQwen3_5Dense` routes BF16 vs FP8 vs NVFP4 per projection by tensor
-    presence (`qwen3_5_dense_weights.cpp:354-360,472-503`) and routes the head by
+    presence (`qwen3_5_dense_weights.cpp:355-361,473-504`) and routes the head by
     dtype (`LoadDenseLmHead` / `LoadLmHeadAnyDtype`, `:215-233,515-547`), so it
     may genuinely load a flat bf16 checkpoint. The whole deviation is discharged
     by a pin advance that includes `ad5d29db7`, at which point (a) and the

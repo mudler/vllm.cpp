@@ -4571,6 +4571,24 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // statement. A `decode.video` leaf that closes before its chunk arrives, or
   // that is re-labelled after one, no longer contains the chunk it produced.
   // Nested, so the sum does not move.
+  //
+  // ITS OPEN IS STILL THE STATEMENT NEXT DOOR, and the third fresh review showed
+  // what that costs: move the two `Close`s below to after the PPM write and the
+  // leaf AND its anchor grow together, so containment and coverage both hold
+  // while the whole writer is charged to `decode.video`. Two things close it.
+  // `decode.video.vae` is opened inside `Ltx2ConvVideoDecodeTiled` around
+  // `AccumulateTemporalGroup`, so `decode.video` has one sub-scope whose ends
+  // are both production events; and the gate asserts that nothing but an anchor
+  // is emitted NESTED, which is what a swallowed `artifacts.frames` becomes.
+  //
+  // AND THE VAE SUB-SCOPE IS HELD BY A COVERAGE FLOOR, not by its existence. A
+  // fourth fresh review moved that scope off `AccumulateTemporalGroup` and onto
+  // the `buffer.Allocate` beside it — seven lines — and the table reported
+  // `decode.video.vae = 0.000 s` beside a five-millisecond `decode.video`, with
+  // the tile decode inside no sub-scope at all and both gates green, because the
+  // vae anchor was checked for cardinality, `nested` and containment and its
+  // DURATION was compared against nothing. The gate now requires it to cover at
+  // least half of this render's `decode.video.chunk` seconds.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
   Ltx2VideoDecodeStreaming(
@@ -4586,6 +4604,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         shape.t = chunk.frames.frames;
         shape.h = chunk.frames.height;
         shape.w = chunk.frames.width;
+        // W0 repair (#1010, third fresh review): THE WRITER'S OWN ANCHOR, bound
+        // to the `WriteFileBytes` loop rather than to the scope beside it.
+        //
+        // Without it the writer is held by nothing. Empty this leaf and leave
+        // the `write(2)`s inside `decode.video` — which is what happens if the
+        // two `Close`s above move below the loop — and the table charges W5's
+        // lever with the cost of the writes while `artifacts.frames` reports
+        // four microseconds for nine files. Every interval assertion still
+        // holds, because the leaves stay disjoint and nothing nests. This scope
+        // moves with the WRITES, so a leaf that stops covering them stops
+        // containing it. Nested, so the sum does not move.
+        phase::Scope ppm_phase("artifacts.frames.ppm");
         for (int64_t f = 0; f < chunk.frames.frames; ++f) {
           char name[64];
           // The GLOBAL frame index, which the chunk carries so the writer does not
@@ -4599,8 +4629,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
           WriteFileBytes(JoinPath(gen.output_dir, name),
                          MiniMaxH3WritePpmFrame(chunk.frames.data, shape, f));
         }
+        ppm_phase.Close();
         rendered_frames += chunk.frames.frames;
         rendered_channels = chunk.frames.channels;
+        // COUNTED BY THE RENDER, not by the instrument (#1010, third fresh
+        // review). W0's containment case needs one number about this decode that
+        // no phase-scope placement can move; this is it, and it sits beside the
+        // frame count for the same reason that one does.
+        im.trace.video_decode_chunks += 1;
         write_phase.Close();
         decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
         chunk_handle = phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);

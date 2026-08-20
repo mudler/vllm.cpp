@@ -2755,6 +2755,14 @@ void GPUModelRunner::propose_drafts_block(
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
             stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
     const auto t_fwd1 = std::chrono::steady_clock::now();
+    // SPEC-DFLASH2 W2 (#1314): the PRODUCTION boundary of the DFlash2 port. The
+    // block forward above just ran the draft's grouped dynamic convolution
+    // (vt::DFlashGroupedConv, wrapped around every attention and MLP sublayer of
+    // every layer); the candidate selector that must choose from these logits is
+    // W3 and is refused BY NAME here rather than silently replaced by the DFlash1
+    // per-slot argmax `sample` is about to apply. See
+    // RefuseDflash2CandidateSelector for why a fallback is not admissible.
+    RefuseDflash2CandidateSelector(backbone);
     const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
     if (propose_trace) {

@@ -572,6 +572,11 @@ vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_forward vllm/models/test_qwen3_dflash_forward.cpp)
 target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W2 (#1314): the DFlash2 draft -- the published configs' nested
+# spellings (spec `## Owed` O3/O4), the conv weights, and the draft forward that
+# runs the grouped convolution.
+vllm_cpp_add_test(test_qwen3_dflash2_draft vllm/models/test_qwen3_dflash2_draft.cpp)
+target_include_directories(test_qwen3_dflash2_draft PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
 vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
 target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1340,6 +1345,10 @@ target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # assertion that a DFlash1 checkpoint's resolution is unchanged.
 vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
+# SPEC-DFLASH2 W2 (#1314): the candidate-selector refusal -- the boundary the
+# DFlash2 architecture is left at once its grouped convolution runs.
+vllm_cpp_add_test(test_dflash2_selector_refusal
+  vllm/v1/spec_decode/test_dflash2_selector_refusal.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
@@ -2082,6 +2091,10 @@ vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.c
 vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
+# SPEC-DFLASH2 W2 (#1314): the DFlash2 grouped dynamic depthwise convolution,
+# gated against upstream's own sequential reference at block 5 (modulo arm), 8
+# and 16 (the two published checkpoints) plus CUDA==CPU bit-identity.
+vllm_cpp_add_test(test_ops_dflash2_grouped_conv vt/test_ops_dflash2_grouped_conv.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.
@@ -2531,6 +2544,21 @@ vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
 
 vllm_cpp_add_test(test_qwen3_5_lm_head_dtypes
   vllm/models/test_qwen3_5_lm_head_dtypes.cpp)
+
+# QUANT-QWEN38-27B-NVFP4-ARM W4 (#821, .agents/specs/qwen38-27b-quant-arms.md):
+# the compressed-tensors `mixed-precision` accounting + scheme-resolution gate
+# for `unsloth/Qwen3.8-27B-NVFP4`. Hermetic — it reads the two COMMITTED
+# manifests and the COMMITTED `config.json`, never a weight byte; the live
+# re-verification arm is env-gated on VLLM_CPP_QWEN38_27B_NVFP4_DIR and SKIPS
+# loudly without it. `src` is on the include path because the resolver under
+# test is a model-private header under src/, not an include/vllm/ surface.
+vllm_cpp_add_test(test_qwen38_27b_nvfp4_arm
+  vllm/models/test_qwen38_27b_nvfp4_arm.cpp)
+target_compile_definitions(test_qwen38_27b_nvfp4_arm PRIVATE
+  QWEN38_27B_NVFP4_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_nvfp4")
+target_include_directories(test_qwen38_27b_nvfp4_arm PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine
   vllm/models/test_qwen3_32b_nvfp4a16_paged_engine.cpp)
 target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE

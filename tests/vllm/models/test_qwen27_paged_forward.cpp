@@ -409,7 +409,7 @@ TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
     // removed that term, so the assertion is replaced by the two terms that
     // ACTUALLY keep a MoE checkpoint off this path, neither of which is a model
     // shape. The merged BA owner below is built only by the dense loader
-    // (qwen3_5_dense_weights.cpp:436) — that is #1169, and it is owed. The
+    // (qwen3_5_dense_weights.cpp:437) — that is #1169, and it is owed. The
     // second is the dtype rule, already pinned by the `dtype_compatible` case
     // further down: `core_out` is `outdt` and GdnPackedDecodeDTypesCompatible
     // pins it to BF16, so an f32 recurrence output deselects on EITHER arm,

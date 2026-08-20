@@ -14,6 +14,7 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
@@ -849,6 +850,29 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // Default-constructed (`block_quant == false`) on every non-block checkpoint,
   // which leaves the routing below byte-identical to before this row.
   const Fp8BlockQuantConfig block = ReadFp8BlockQuantConfig(config);
+
+  // QUANT-QWEN38-27B-NVFP4-ARM (#821). The SECOND whole-checkpoint read of the
+  // quantization config, for the compressed-tensors spelling this file's
+  // per-projection dtype probe cannot resolve.
+  //
+  // `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d...` declares
+  // `format: "mixed-precision"`: layers 0-55's MLP is NVFP4 W4A4 and layers
+  // 56-63's MLP is FP8 W8A8, under the SAME module names. Which arm a
+  // projection takes is a REGEX OVER LAYER INDICES in `config_groups`, so no
+  // dtype probe can recover it — and its FP8 group ships a PER-OUTPUT-CHANNEL
+  // BF16 `weight_scale` with DYNAMIC per-token activations, which this file's
+  // `LoadFp8Raw` rung cannot represent. Before this call the loader entered the
+  // per-tensor arm anyway and died on `tensor not found:
+  // ...in_proj_qkv.input_scale`, a sentence about a checkpoint that is
+  // complete: the artifact ships ZERO `*.input_scale` because its activation
+  // scheme is dynamic, exactly as its config says.
+  //
+  // Empty on every checkpoint that is not compressed-tensors, and on every
+  // compressed-tensors checkpoint whose groups this build can execute, so every
+  // arm that loaded before this row still loads byte-identically.
+  const std::string ct_refusal =
+      layers::compressed_tensors::RefusalForHfConfigRaw(config.raw, all_names);
+  VT_CHECK(ct_refusal.empty(), "qwen3_5 dense: " + ct_refusal);
 
   Qwen3_5DenseWeights w;
   w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");

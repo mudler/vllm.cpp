@@ -973,6 +973,26 @@ struct Ltx2ConditioningTrace {
   // re-noises a keyframe.
   std::vector<float> video_first_timesteps;
 
+  // ── THE VIDEO DECODE, counted by the RENDER (row LTX25-DEVICE-RESIDENCY W0)
+  //
+  // How many chunks the streaming video VAE handed back, incremented in the
+  // driver's own sink beside `rendered_frames`. It is here because W0's phase
+  // table needs ONE number about the decode that the phase table did not
+  // produce.
+  //
+  // WHY THAT MATTERS AND WHY A COUNTER RATHER THAN A LONGER COMMENT. Every
+  // assertion W0's containment case makes about `decode.video` — containment,
+  // coverage, exclusivity, non-overlap — is a RATIO against the leaf, so an
+  // instrument defect that moves the leaf and its sub-scope TOGETHER satisfies
+  // all four at once. A count taken by the render is the one quantity such a
+  // defect cannot move: emit the chunk scope once instead of once per chunk and
+  // the count disagrees, whatever the clock did.
+  //
+  // ONE PER `emit`, so it is the group count `Ltx2GroupTilesByTemporalSlice`
+  // produces for this request's tiling — which the gate re-derives from that
+  // function rather than trusting this field.
+  int64_t video_decode_chunks = 0;
+
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,
   // because that is the only point at which the exact buffers cross-attention

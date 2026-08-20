@@ -2293,3 +2293,51 @@ reduce the residual risk the review named, which is real and unchanged: a
 compiling-but-wrong CUDA kernel would produce wrong pixels on `--device cuda`,
 and no gate anywhere in this tree catches it. That is
 [#1452](https://github.com/mudler/vllm.cpp/issues/1452).
+
+### W5.12 The gate after the review repair, re-stamped
+
+The numbers in §W5.9 were taken at `7f23aadb5` over base `01854663c`. This is the
+rerun after the review repair and after `origin/main` was merged TWICE, because
+it moved under the branch while the repair was in flight.
+
+| | |
+|---|---|
+| base (merge base) | `01854663c` |
+| `origin/main` merged in | `fdefb4529`, then `7481a2eec` |
+| build | `cmake -DCMAKE_BUILD_TYPE=Release -G Ninja`, gcc, x86-64, CPU-only, `-DVLLM_CPP_BUILD_TESTS=ON` |
+| full build | `ninja -C build` **exit 0, 0 compile errors**, 586 targets |
+| `scripts/agent-preflight.sh` | **exit 0, `All gates green.`**, and 0 SKIPPED |
+| `ctest -j 6` | **574 of 574 passed, 0 failed**, exit 0, 130 s wall; 3 skipped by their own guards (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`, `test_qwen35_paged_engine`) |
+
+Focused, each run on its own:
+
+| Suite | Cases | Assertions | Status |
+|---|---|---|---|
+| `test_ops_conv3d` | 4 of 4 | 2036 of 2036 | `SUCCESS!`, exit 0 |
+| `test_ltx2_vae` | 44 of 44 | 3131 of 3131 | `SUCCESS!`, exit 0 |
+| `test_ltx2_video` | 101 of 101 | 4109 of 4109 | `SUCCESS!`, exit 0 |
+| `test_capi` | 65 of 65 | 654 of 654 | `SUCCESS!`, exit 0 |
+| `test_diffusion_device_seam` | 7 of 7 | 49 of 49 | `SUCCESS!`, exit 0 |
+| `test_ops_conv2d` | 4 of 4 | 1631 of 1631 | `SUCCESS!`, exit 0 |
+
+`test_ops_conv2d` is in that list deliberately, and it is a CONTROL rather than a
+gate for this row: F7 changed a shape expression that `vt::Conv2d` shares in form
+and does not share in code, and #1471 owns the sibling. Its 4 of 4 says the
+Conv3d repair did not reach it, which is the claim, not that `vt::Conv2d` is
+correct.
+
+**Two SKIPs became two runs, and that is the point of re-stamping.** Before the
+merge, `agent-preflight.sh` SKIPPED `commit-trailers` and `commit-style` with
+*"Neither gate reported anything about this tree"*, because the branch was behind
+`origin/main`. A skip is not a pass, so §W5.9's claimed `exit 0` was not
+reproducible for those two gates at the time it was written. Both RUN and PASS
+here, against `origin/main` `7481a2eec`.
+
+**No environmental red had to be discounted, which was not expected.** `main`
+carried two live reds when this repair started: #1439, and #1458, which reddened
+`test_ltx2_text_encoder`, `test_muse_glimmer_text`,
+`test_muse_glimmer_text_fallback` and `test_minimax_music3_ar`. #1458's fix
+landed in `5ba99ac4e` and is inside the second merge, so all four are green here
+and are counted in the 574 rather than excused. `test_engine_core_proc`,
+`test_async_llm` and `test_cpu_x86_llamacpp_floor`, which starve or drift under
+parallel `ctest`, also passed at `-j 6` on this run and needed no serial rerun.

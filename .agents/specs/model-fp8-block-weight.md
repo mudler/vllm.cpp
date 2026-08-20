@@ -139,7 +139,7 @@ its own geometry cannot be paired with the wrong one.
 
 ### The loader rung
 
-`load_projection` in `LoadAttnDense` (`qwen3_5_dense_weights.cpp:470-479`)
+`load_projection` in `LoadAttnDense` (`qwen3_5_dense_weights.cpp:471-480`)
 probes NVFP4, then `dtype == "F8_E4M3"`, then bf16. A block-wise weight **is**
 `F8_E4M3`, so it fell into the per-tensor arm and asked for a `weight_scale`
 that a block-wise checkpoint spells `weight_scale_inv`. That is #1166.

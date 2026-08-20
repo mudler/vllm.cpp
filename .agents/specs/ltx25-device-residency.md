@@ -230,7 +230,7 @@ LTX loaders call `MaybeReleaseSourcePages` nowhere while 14 other files under
 `src/vllm` do — `grep -rl` returns 15 files, one of which is the defining
 `safetensors_reader.cpp` and one of the remaining 14 a header
 (`safetensors_reader.cpp:339` is the definition;
-`qwen3_5_dense_weights.cpp:87` and `gemma4_weights.cpp:149-150` are two of the
+`qwen3_5_dense_weights.cpp:88` and `gemma4_weights.cpp:149-150` are two of the
 callers). Note the fix is armed by default —
 `LoadWindowedReleaseEnabled()` (`safetensors_reader.cpp:303-312`) reads
 `VT_LOAD_WINDOWED_RELEASE` and defaults ON — so adding the call changes behaviour

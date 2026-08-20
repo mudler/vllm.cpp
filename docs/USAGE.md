@@ -3924,6 +3924,66 @@ accounting and token gate, and any image or video answer at all —
 `QUANT-QWEN38-27B-GGUF-ARM`,
 [#821](https://github.com/mudler/vllm.cpp/issues/821).
 
+### `unsloth/Qwen3.8-27B-NVFP4` — what it is, and which arm is refused
+
+This artifact's repo name says NVFP4 and its `quantization_config.format` says
+`mixed-precision`. **This engine cannot run it yet**, and it now says so at load
+instead of failing on a missing tensor. It is documented here because it is a
+checkpoint people reach for, and because the refusal is the shipped behaviour.
+
+Also a **third-party quantization by Unsloth**, not a first-party release. A repo
+id is not a pin: the revision [#821](https://github.com/mudler/vllm.cpp/issues/821)
+originally named, `a767244d27bd76589a3e3b2ab4e64032c4ebc7af`, no longer resolves,
+and this is the second in-place re-quantization this publisher has done in this
+model family.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| mixed FP8 + NVFP4 backbone | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `model.safetensors` | 22 568 192 096 | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` |
+| bf16 MTP drafter | same revision | `model_mtp.safetensors` | 849 400 392 | not mirrored here, so no locally computed hash — and no remote-reported one is recorded |
+
+Total resident size of the set is 23 417 592 488 B, which is
+`model.safetensors.index.json`'s own `metadata.total_size` and the sum of the two
+files. The sha256 above was computed locally on this project's mirrored copy, not
+read back from the hub.
+
+The 1968 names of that index split into two schemes plus the parts no group
+claims:
+
+| Scheme | Modules | Tensors | Covers |
+|---|---:|---:|---|
+| `group_1`, `nvfp4-pack-quantized` W4A4, `group_size` 16 | 168 | 672 | `mlp.(gate\|up\|down)_proj` on layers 0-55 |
+| `group_0`, `float-quantized` FP8 W8A8 | 233 | 466 | `self_attn.(q\|k\|v\|o)_proj`, `linear_attn.(in_proj_qkv\|in_proj_z\|out_proj)`, `lm_head`, and layers 56-63's MLP |
+| on the config's `ignore` list | 317 | 475 | the GDN low-rank projections and norms, the 27 vision blocks, the merger, the whole MTP head |
+| named by no target | 267 | 323 | norms, `conv1d`, the embedding table, the patch and position embeddings |
+| `kv_cache_scheme` scales | 16 | 32 | `k_scale` / `v_scale` on the 16 full-attention layers |
+
+**The NVFP4 arm loads. The FP8 arm is REFUSED**, by name, before any weight is
+read, because its `group_0` needs two things this build does not have: a
+per-output-channel weight scale (`weights.strategy: channel`, so `weight_scale`
+ships `[out, 1]` rather than the one element a per-tensor scale is) and dynamic
+per-token activation quantization (`input_activations.dynamic: true`, so the
+checkpoint correctly ships **no** `*.input_scale` at all and the scale is
+computed per forward). The declared `kv_cache_scheme` is refused for the same
+reason: nothing here reads `k_scale` / `v_scale`, and there is no quantized KV
+cache to apply them to. Since layers 0-55 and 56-63 use the SAME module names and
+differ only by a regex over the layer index, no per-tensor dtype probe can tell
+the two groups apart; the split is read from `config_groups`.
+
+To re-verify the committed manifests and config against the shipped bytes rather
+than against the fixture CI reads:
+
+```console
+VLLM_CPP_QWEN38_27B_NVFP4_DIR=/path/to/qwen3.8-27b-nvfp4 \
+  ./build/tests/test_qwen38_27b_nvfp4_arm
+```
+
+Unset, that case skips loudly and the gate stays hermetic; CI reads no NAS file.
+**What is still owed on this artifact** is the FP8 tower itself, a consumed
+`kv_cache_scheme`, a resident-bytes assertion, and every token gate —
+`QUANT-QWEN38-27B-NVFP4-ARM`,
+[#821](https://github.com/mudler/vllm.cpp/issues/821).
+
 ### Per-prompt input limits
 
 vLLM caps how many items of each modality one prompt may carry

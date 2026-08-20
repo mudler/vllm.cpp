@@ -1117,8 +1117,8 @@ the latter with the caveat that vLLM's figure is set by
 
 **Its quantized arms are not gated.** Three rows on
 [#821](https://github.com/mudler/vllm.cpp/issues/821)
-([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` is
-`PARTIAL`, `QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are
+([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` and
+`QUANT-QWEN38-27B-NVFP4-ARM` are `PARTIAL`, `QUANT-QWEN38-27B-GGUF-ARM` is
 `READY`. `AGENTS.md` makes the quantized arms a standing requirement, and these
 are the arms a user can run: 17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
 
@@ -1136,12 +1136,19 @@ CI keeps the synthetic fixture and reads no NAS file. **Nothing runs that tower
 yet**, and the committed 334-name manifest with its CI accounting is owed by
 `QUANT-QWEN38-27B-GGUF-ARM`.
 
-The other two arms are not implemented. The artifact published as
-`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision` checkpoint
-with **zero `*.input_scale` tensors**, which is why the reported load dies. And
-the Q4_K_M file ships the MTP drafter as block 64, so a loader reading
-`block_count` as decoder depth builds a 65-layer model out of a 64-layer
-checkpoint.
+**`QUANT-QWEN38-27B-NVFP4-ARM` landed its accounting and its refusal.**
+`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision`
+checkpoint with **zero `*.input_scale` tensors**, re-pinned to
+`7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` with a locally computed sha256. All
+1968 of its index names are accounted per scheme in CI from committed
+header-only manifests, and its FP8 group — 233 modules, per-channel weight scale
+and dynamic per-token activations — is now refused by name at load with both
+missing pieces stated. **It still does not run:** no FP8 tower, no consumed
+`kv_cache_scheme`, and no token or resident-byte measurement.
+
+The Q4_K_M arm is not implemented. That file ships the MTP drafter as block 64,
+so a loader reading `block_count` as decoder depth builds a 65-layer model out of
+a 64-layer checkpoint.
 
 **Both token gates are `PENDING` on named external authorities, and this page
 claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,

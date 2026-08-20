@@ -290,7 +290,7 @@ TEST_CASE("dense gate_up fusion: an MXFP4 pair is REFUSED by the DENSE guard") {
   // E8M0 misread as group-16 fp8-e4m3, "GROSSLY wrong".
   //
   // No dense loader sets `is_mxfp4` today (LoadNvfp4AnyNaming,
-  // qwen3_5_dense_weights.cpp:358-395, only ever produces NVFP4), so this is one
+  // qwen3_5_dense_weights.cpp:359-396, only ever produces NVFP4), so this is one
   // loader line away rather than live. The guard refuses it so that line cannot
   // silently light up a mis-scaled kernel; the split pair, which routes MXFP4
   // correctly through MatmulMxfp4W4A16D, stays the answer.

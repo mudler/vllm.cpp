@@ -2514,6 +2514,21 @@ vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
 
 vllm_cpp_add_test(test_qwen3_5_lm_head_dtypes
   vllm/models/test_qwen3_5_lm_head_dtypes.cpp)
+
+# QUANT-QWEN38-27B-NVFP4-ARM W4 (#821, .agents/specs/qwen38-27b-quant-arms.md):
+# the compressed-tensors `mixed-precision` accounting + scheme-resolution gate
+# for `unsloth/Qwen3.8-27B-NVFP4`. Hermetic — it reads the two COMMITTED
+# manifests and the COMMITTED `config.json`, never a weight byte; the live
+# re-verification arm is env-gated on VLLM_CPP_QWEN38_27B_NVFP4_DIR and SKIPS
+# loudly without it. `src` is on the include path because the resolver under
+# test is a model-private header under src/, not an include/vllm/ surface.
+vllm_cpp_add_test(test_qwen38_27b_nvfp4_arm
+  vllm/models/test_qwen38_27b_nvfp4_arm.cpp)
+target_compile_definitions(test_qwen38_27b_nvfp4_arm PRIVATE
+  QWEN38_27B_NVFP4_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_nvfp4")
+target_include_directories(test_qwen38_27b_nvfp4_arm PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine
   vllm/models/test_qwen3_32b_nvfp4a16_paged_engine.cpp)
 target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE

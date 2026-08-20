@@ -13,7 +13,7 @@
 // set and ships ZERO `*.input_scale` tensors: it has no FP8 W8A8 weight
 // anywhere. Every fp8-tower lever — the fp8 GDN input projection and its
 // merged-qkvz collapse, the fp8 out_proj, the fp8 attention qkv — is selected by
-// probing an on-disk tensor dtype (`qwen3_5_dense_weights.cpp:425-432,437-447,
+// probing an on-disk tensor dtype (`qwen3_5_dense_weights.cpp:426-433,438-448,
 // 472-485`: `dtype == "F8_E4M3"`), so on that checkpoint every one of those
 // branches is DEAD CODE and the gate cannot fail for an fp8 defect.
 //

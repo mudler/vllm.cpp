@@ -266,7 +266,7 @@ The premise this row started from was that Edit 2 unlocks packed GDN decode on
 the MoE arms. **It does not**, and the correction is #1169.
 `ShouldUsePackedGdnDecode` also requires `e.has_packed_ba`, populated at `:4410`
 as `!w.in_proj_ba.Empty()`, and `in_proj_ba` is written at exactly one site in the
-tree — `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:436`, the dense
+tree — `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:437`, the dense
 loader. The MoE loader loads the shards split (`qwen3_5_weights.cpp:563-564`) and
 so does the GGUF loader (`qwen3_5_gguf_weights.cpp:1067-1070`). `qwen3_5.cpp:3220`
 states it in the tree: *"the only path that populates `in_proj_ba`"*.
@@ -437,7 +437,7 @@ Nothing in this spec is measured; the row has produced no numbers.
 | the tree already derived the finding | `:3172-3189` |
 | packed decode carries the shape term | `:76-84`, populated `:4406`; entered at `f344decf4` |
 | the dtype rule already deselects MoE | `:115-122` |
-| `has_packed_ba` is dense-only | `qwen3_5_dense_weights.cpp:436` is the one writer; `qwen3_5_weights.cpp:563-564`; `qwen3_5_gguf_weights.cpp:1067-1070` |
+| `has_packed_ba` is dense-only | `qwen3_5_dense_weights.cpp:437` is the one writer; `qwen3_5_weights.cpp:563-564`; `qwen3_5_gguf_weights.cpp:1067-1070` |
 | vLLM keeps core/z at the model dtype | `qwen_gdn_linear_attn.py:870-873`, `:843`, `:859-860`, `:459-465` @ `5559679` |
 | vLLM does not gate packed decode on shape | `vllm/envs.py:124` @ `5559679` |
 | SGLang agrees | `sglang/srt/models/qwen3_5.py:522-536`, `:515-527`; `gdn_triton.py:43`, `:79-83` @ `f63458b5be` |

@@ -84,90 +84,19 @@ two edits back gives the GPT-4o row above, so the two share one scanner's
 character classes but stay separate patterns: they disagree on `don't` and on
 every digit run longer than one.
 
-## Timing an encode on your own box
-
-`tools/bench/bpe_encode_cost.cpp` times `Tokenizer::Encode` on one synthetic
-input, at the sizes you name, through a `tokenizer.json` you name. Use it when
-you want to know what a prompt of some shape costs to tokenize here, or to
-re-derive a figure somebody else recorded instead of trusting it.
-
-Nothing RUNS it: it is registered as no test and it is not a gate. Both halves
-of that are deliberate, a growth ratio over these timings is not stable enough
-to gate on a shared machine, and one leg on a long single-class input can cost
-tens of seconds of one core. It IS compiled, as the never-linked OBJECT library
-`vllm_bpe_encode_cost`, so it cannot rot behind a `Tokenizer::Encode` or
-`FromHfJson` signature change while still being the artifact those figures are
-reproducible from. Its header carries the exact `g++` and run lines; it builds
-from the four tokenizer translation units directly and needs no `libvllm.a`.
-
-It prints one row per case and size, with the ids it produced and the
-1/5/15-minute load average sampled around each row, under a banner saying the
-output is a session reading and not a bound. Read it that way: on a 20-core box
-the same input on the same binary has read 1.7x apart on load alone, while the
-id counts came back identical. Quote a number from it only with its load beside
-it, and take the minimum of several repetitions rather than one shot.
-
-## How much memory a Vulkan load needs
+## Load memory and diagnostics
 
 On a unified-memory device (a DGX Spark) the Vulkan heap and system RAM are the
-same bytes, so budget roughly **the checkpoint size plus about 5%**, plus your KV
-pool. Measured on GB10: Qwen3.6-27B bf16 (50.89 GiB on disk) peaks at 53.4 GiB of
-process RSS. Reading the checkpoint also fills the page cache with about the file
-size; that is reclaimable and does not need to be budgeted, but it does make
-`MemFree` look alarming during a load. Use `MemAvailable`, not `MemFree`, to
-decide whether a model fits. `VT_VULKAN_ALLOC_STATS=1` prints the running device
-total and the `/proc` context if you need to see where it goes.
-A Tenstorrent build (`-DVLLM_CPP_TENSTORRENT=ON`) needs TT-Metalium and TT-NN
-on `CMAKE_PREFIX_PATH`. Blackhole currently runs OPT-125m through the shared
-engine and has the Qwen3-0.6B correctness gate wired with device-specific
-goldens. The full Qwen3 16x16 gate remains pending because paged attention is
-still host-bound. This is an active correctness backend, not a performance
-backend. See [the current project status](../STATUS.md) and the
-[Tenstorrent backend spec](../../.agents/specs/tenstorrent-backend.md).
+same bytes. Include the checkpoint and the KV pool when you estimate capacity.
+Reading a checkpoint also fills the reclaimable page cache. Use `MemAvailable`,
+not `MemFree`, to decide whether a model fits.
 
-A Vulkan build (`-DVLLM_CPP_VULKAN=ON`) adds three kernel-measurement binaries.
-They exist so a Vulkan tuning knob can be A/B'd in ONE binary, which is this
-project's benchmark protocol, and each one prints WHICH kernel variant it ran so
-a silent fallback cannot post a plausible number:
+Set `VT_VULKAN_ALLOC_STATS=1` to print the running device allocation total and
+the `/proc` memory context. See [Benchmarks](../BENCHMARKS.md) for accepted
+measurements and the [Vulkan support spec](../../.agents/specs/vulkan-full-support.md)
+for measurement history.
 
-- `vulkan-gemm-ab`, cooperative-matrix versus the portable scalar GEMM
-  (`VT_VULKAN_COOPMAT=0` picks the arm). Takes `M K N [reps]`.
-- `vulkan-dispatch-floor`, one op swept across a 65,536x range of element counts,
-  to separate per-dispatch overhead from real kernel cost.
-- `vulkan-gemv-ab`, the decode GEMV swept over the (k, n) shapes a 27B model
-  actually dispatches, with `VT_VULKAN_GEMV_ROWS` / `VT_VULKAN_GEMV_PACK` /
-  `VT_VULKAN_GEMV_UNROLL` selecting the arm. Takes `[reps] [warmup] [GB/s roof]`
-  and reports GB/s against that roof. Set `VT_VULKAN_DISPATCH_STATS=1` so it
-  reports GPU-timestamp time rather than wall clock; see
-  [the environment reference](../ENVIRONMENT.md) for what each knob does and what it measured.
-
-  Audio note: the Voxtral/Whisper encoder attention has an opt-in FlashAttention-2
-  tensor-core path, `VT_WHISPER_ENC_FA2=1`, which makes the encoder forward 5.50x
-  faster, from 15.90x down to 2.89x vLLM's whole time-to-first-token. Those are
-  encoder-forward-versus-TTFT ratios, not TTFT ratios: our projector, merge and
-  prefill are not yet measured. It is off by default because it differs numerically
-  from the shipping kernel and shifts three tokens within the ratified near-tie band
-  on the gate clip, so turn it on only where encoder latency matters more than exact
-  reproduction of the default output.
-
-Every build, not only a Vulkan one, additionally gets `vocoder-conv-ab`, the
-same-binary A/B for the shared 1-D BigVGAN vocoder convolution chain that
-MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and IndexTTS-2.5 all
-decode through. `VLLM_CPP_VOCODER_DEVICE` is the only variable, and the binary
-prints the arm it RESOLVED rather than the one that was asked for, so a silent
-fallback to the host cannot post a plausible pair of timings:
-
-```sh
-VLLM_CPP_VOCODER_DEVICE=cpu  ./build/vocoder-conv-ab --frames 96 --reps 3
-VLLM_CPP_VOCODER_DEVICE=cuda ./build/vocoder-conv-ab --frames 96 --reps 3
-```
-
-It runs the four upsample stages at the shipped decoder's real channel counts and
-strides, and prints a per-stage checksum so two arms that report the same time can
-still be told apart if one of them computed something else. The transposed
-convolution it times is 88.5 % of MiniMax-Music3's acoustic-half profile.
-### Quantized checkpoints: which weight forms load
-### How long a load takes, and how to see where it goes
+### Inspect load phases and moved bytes
 
 `VT_LOAD_STATS=1` prints one line per load phase with its wall time, plus the
 bytes the load actually MOVED: `host_copy` (materialized into a host buffer),
@@ -183,26 +112,19 @@ $ VT_LOAD_STATS=1 build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt 
 [vt load] bytes@exit      host_copy=31.162 GiB borrowed=18.936 GiB device_upload=50.098 GiB
 ```
 
-A weight the device consumes verbatim is READ FROM the checkpoint mapping rather
-than copied into a host buffer first, so it is moved once instead of twice; that
-is `borrowed` above, and on this 27B it is 37.8% of the model and worth 1.54x on
-the load phase warm, 1.61x cold. Tensors that are merged (`qkv`, `gate_up`),
-transposed (`lm_head`) or dequantized at load are not verbatim and still copy.
-`VT_LOAD_DIRECT_UPLOAD=0` turns the direct path off in the same binary; the
-loaded bytes, and therefore the tokens, are identical either way.
+`borrowed` counts weights that the device reads from the checkpoint mapping.
+Merged, transposed, and dequantized tensors use `host_copy` instead. Set
+`VT_LOAD_DIRECT_UPLOAD=0` to disable direct upload.
 
 Safetensors payloads are byte-addressed and do not promise natural scalar
 alignment. Borrowed BF16/F16/F32 inputs therefore use defined byte-copy loads;
 an odd payload offset neither forces a host copy nor changes the loaded bits.
 
-`device_upload` counts every single-source weight upload: the bf16/fp8 weights
-through `ResidentWeight` and the compressed-tensors NVFP4/MXFP4 `packed`/`scale`
-residents through `ResidentNvfp4`. It does NOT yet count the merged fp4 operands
-(`qkv`, `gate_up`) or the Marlin repack residents, which build one device buffer
-out of several host tensors; on a bf16 checkpoint like the one above there are
-none, so the line is the whole model. Once a weight has been uploaded its source
-pages are released, and that release is independent of `VT_ADOPT_DEVICE_BYTES` --
-switching the adoption off leaves the release on.
+`device_upload` counts single-source BF16, FP8, NVFP4, and MXFP4 uploads. It does
+not count merged FP4 operands or Marlin repack buffers. The loader releases the
+source pages after upload, regardless of `VT_ADOPT_DEVICE_BYTES`. See the
+[direct-upload spec](../../.agents/specs/load-direct-upload.md) for measurement
+history and counter coverage.
 
 ### A per-tensor scale has to be one F32 number
 
@@ -218,18 +140,13 @@ dense loader: 'model.layers.0.self_attn.q_proj.weight_scale' ships shape
 [12288, 1] (12288 elements), not the ONE element a per-tensor scale is
 ```
 
-The two layouts this refuses in practice are per-output-channel FP8, which
-stores one scale per output row, and block-wise FP8, which stores a grid. Both
-used to load. The reader took the first four bytes and used them as the scale
-of the whole matrix, which is a finite plausible number and therefore fluent
-plausible wrong output rather than a failure. Issue
-[#1181](https://github.com/mudler/vllm.cpp/issues/1181) has the detail, and the
-per-output-channel arm itself is not implemented yet.
+The loader refuses per-output-channel and block-wise FP8 layouts at these
+single-value fields. Per-output-channel FP8 is not implemented. `lm_head` has
+its own per-output-channel scale path. See the
+[scalar-scale guard spec](../../.agents/specs/read-f32-scalar-guard.md) for the
+defect history.
 
-`lm_head` is not affected. It has always read a per-output-channel scale
-correctly, as the table above records.
-
-### A refusal that names the attention backend, and what it cannot tell you
+### Attention backend refusals
 
 Starting an engine resolves an attention backend for each KV-cache group, and
 that backend is now asked whether it can serve the request before it is chosen.
@@ -243,53 +160,17 @@ No valid attention backend for device type 1 from
 (use_mla=false, use_sparse=false)
 ```
 
-The reason strings are vLLM's own, so a refusal here and a refusal from the
-reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
-come from the geometry the engine has just resolved for your checkpoint, so a
-refusal is about that checkpoint on this build.
+The message uses the checkpoint's resolved head size, block size, and KV-cache
+dtype. CPU accepts model dtypes `f32`, `f16`, and `bf16`. Its KV cache accepts
+`auto`, `fp8`, and `fp8_e4m3`. NVIDIA GPUs accept `auto`, `float16`, `bfloat16`,
+`fp8`, and `fp8_e4m3`. Both devices refuse `fp8_e5m2` by name.
 
-**A device is only ever offered the backends built for it.** On CPU the engine
-resolves `CPU_ATTN`, which is what the reference engine resolves on a CPU too. It
-is worth saying out loud because it was briefly untrue: `CPU_ATTN` was named as
-the CPU's preference while being registered nowhere, so CPU runs quietly fell
-through to `FLASH_ATTN`, harmless until `FLASH_ATTN` was taught FlashAttention-2's
-rule that a head size must be a multiple of 8. A CPU model with a head size of 6
-then had no backend at all and was refused at initialization, on hardware that
-runs it perfectly well ([#1371](https://github.com/mudler/vllm.cpp/issues/1371)).
-If you see the refusal above naming `FLASH_ATTN` alone on a device that is not an
-NVIDIA GPU, that is the shape to report: the rule quoted at you is about a kernel
-your device never runs.
-
-One consequence is worth stating on its own, because it widens what a CPU run
-accepts. `CPU_ATTN` serves **`f32` as well as `f16` and `bf16`**, which is what
-the reference engine's CPU backend serves. `FLASH_ATTN` declares the two half
-dtypes only, so while the CPU was borrowing it an `f32` model was refused at
-initialization with `dtype not supported`. It now runs. The KV-cache dtypes the
-CPU accepts are `auto`, `fp8` and `fp8_e4m3`; `fp8_e5m2` is refused by name,
-because the CPU kernel's fp8 arm reads e4m3 alone. On an NVIDIA GPU the list is
-`auto`, `float16`, `bfloat16`, `fp8` and `fp8_e4m3`, so `fp8_e5m2` is refused
-there too. That second refusal is the reference engine's own and is not
-something this project trimmed away.
-
-**What this check cannot tell you.** It reports what a backend *claims*, never
-what your binary contains and never whether the kernel will launch. A backend
-whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
-when the build carries no compiled code for that GPU.
-
-That is a real failure mode, not a hypothetical one, and it surfaces as a launch
-error rather than as the refusal above. It has been measured on a GB10 board
-(compute capability 12,1) against the reference engine, same wheel and same
-prompt: asking for its `FLASHINFER` backend generates text and exits cleanly,
-while the default, which resolves `FLASH_ATTN`, the reference engine's *first*
-preference for that device, dies at the first attention call with
-`cudaErrorUnsupportedPtxVersion`. The first preference could not run and the
-second could, and no capability check on either side could tell them apart.
-
-So if a run dies inside attention rather than being refused before it starts,
-the backend was accepted on a claim your build does not honour. Confirming which
-architectures a build actually targets is a separate question, answered under
-"Confirming which CUDA architecture a build targets" above. Tracked as
-[#1332](https://github.com/mudler/vllm.cpp/issues/1332).
+This validation checks the backend's declared capabilities. It does not prove
+that the binary contains code for the current GPU. A later kernel launch error,
+such as `cudaErrorUnsupportedPtxVersion`, indicates a build-architecture
+mismatch. See the [compiled-architecture spec](../../.agents/specs/cuda-compiled-arch-manifest.md)
+for that diagnostic path and the [attention validation spec](../../.agents/specs/attn-validate-configuration.md)
+for the validation boundary.
 
 Selecting a backend by name is not exposed yet; the engine always resolves one.
 

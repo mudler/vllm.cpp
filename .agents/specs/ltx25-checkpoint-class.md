@@ -554,6 +554,26 @@ check the count with BOTH greps rather than one, because the difference between
 | `test_ltx2_video` (whole binary) | 101 cases, 3599 assertions, **0 assertions failed**, 100/101 cases passed; the one case that did not is a transient `cannot write .../audio.wav` at 94% disk with three concurrent `test_ltx2_video` runs on the box, and it passes in isolation (1 case, 103 assertions, 0 failed, `SUCCESS!`, exit 0) |
 | `test_capi` (run serially; it contends with `test_ltx2_video` over `/tmp`) | 65 cases, 654 assertions, 0 failed, `SUCCESS!`, exit 0 — run strictly after `test_ltx2_video` exited |
 
+**Re-run after the review repairs and the fourth `origin/main` merge**, at
+`c9954f5c6`, from a clean configure and a cold build (`BUILT=YES`,
+`compile_err=0`):
+
+| Gate | Result |
+|---|---|
+| `test_ltx2_pipeline` (whole binary) | 59 cases, **3415** assertions, 0 failed, `SUCCESS!`, exit 0 |
+| `test_ltx2_pipeline -tc='ltx2 checkpoint class*'` | 3 cases, **99** assertions, 0 failed, exit 0 |
+| `test_ltx2_video -tc='ltx2 checkpoint class*'` | 5 cases, 90 assertions, 0 failed, exit 0 |
+| `test_ltx2_video` (whole binary) | **101 cases, 101 passed, 0 failed**, 3647 assertions, `SUCCESS!`, exit 0 |
+| `test_capi` | 65 cases, 654 assertions, 0 failed, `SUCCESS!`, exit 0, started after `test_ltx2_video` had exited |
+| `scripts/agent-preflight.sh` | 1 gate failed, **0 SKIPPED**: `audit-live-rows`, which is `main`'s own [#1468](https://github.com/mudler/vllm.cpp/issues/1468) (`KERNEL-DFLASH2-GROUPED-CONV` is an abandoned `ACTIVE` row, arriving with `028438e68`). This branch touches no matrix file. `commit-trailers` and `commit-style` both ran and both passed, which is what the merge existed to achieve |
+
+Three numbers moved and each one has a reason rather than a shrug. The two
+pipeline counts gained **+2 assertions**: the refusal message now carries the
+header measurement, and `677,616` and `4349` are pinned so a string nobody
+gates cannot drift. `test_ltx2_video` gained 48 assertions and one case against
+the earlier run because the earlier run's I/O flake aborted a case partway; it
+did not recur here, and 101 of 101 cases passed.
+
 ### Mutations
 
 Each one was applied to the working tree, built, run, then restored from a byte

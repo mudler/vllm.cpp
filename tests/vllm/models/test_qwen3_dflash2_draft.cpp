@@ -15,8 +15,9 @@
 // `c.at("layer_types")`, which `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash` does not
 // declare, while upstream reads `getattr(config, "layer_types", None)`
 // (`qwen3_dflash.py:134` and `:66` @ that head). The configs embedded below are
-// the PUBLISHED files verbatim, with their sha256 recorded, so the gate does not
-// depend on a checkout being present.
+// the PUBLISHED files BYTE-FOR-BYTE, each with the sha256 OF THE EMBEDDED
+// LITERAL recorded beside it, so the gate does not depend on a checkout being
+// present and the recorded hash describes what the compiler actually sees.
 //
 // The `attention_sink_bias` refusal is the other half of O4 and is not
 // bookkeeping. Upstream reads `dflash_config.attention_sink_bias` and passes a
@@ -71,6 +72,12 @@ namespace {
 // 2026-08-19). Kept whole rather than reduced: what this case gates is that the
 // PUBLISHED document parses, and a reduced copy would only prove that a document
 // this test wrote parses.
+//
+// The sha256 hashes THE LITERAL BELOW, trailing newline included, so the claim
+// is checkable from this file alone rather than only against a copy on a share.
+// The three literals in this file were all re-fetched and re-hashed on
+// 2026-08-20; one of them (`kMimoDflashConfig`) had been re-indented and had
+// lost a key, and it is now the published bytes.
 constexpr const char* kQwen38Dflash2Config = R"JSON({
   "architectures": [
     "DFlash2DraftModel"
@@ -127,11 +134,14 @@ constexpr const char* kQwen38Dflash2Config = R"JSON({
   "use_cache": true,
   "use_sliding_window": true,
   "vocab_size": 248320
-})JSON";
+}
+)JSON";
 
-// `z-lab/Muse-Glimmer-30B-DFlash2`, config.json VERBATIM (sha256
-// cb684d6f688a22619a63ea1debe7d30c139c195bf3141fd86a763763ab34b5d9, read on
-// 2026-08-19). The SECOND published DFlash2 checkpoint, and the one that makes
+// `z-lab/Muse-Glimmer-30B-DFlash2` @ `b54ffdd11fa9cfe2af370012e5763d492c904128`,
+// config.json VERBATIM (1326 bytes, sha256
+// cb684d6f688a22619a63ea1debe7d30c139c195bf3141fd86a763763ab34b5d9 over the
+// literal below, read on 2026-08-19 and re-verified 2026-08-20). The SECOND
+// published DFlash2 checkpoint, and the one that makes
 // #1327 a correction rather than a note: `block_size` 16 against the 27B's 8,
 // and `output_multiplier`/`final_logit_softcapping` SET rather than defaulted.
 constexpr const char* kMuseGlimmerDflash2Config = R"JSON({
@@ -192,16 +202,30 @@ constexpr const char* kMuseGlimmerDflash2Config = R"JSON({
   "use_cache": false,
   "use_sliding_window": true,
   "vocab_size": 202048
-})JSON";
+}
+)JSON";
 
-// `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash` `dflash/config.json` VERBATIM (sha256
-// 2ed5a998f5f57e00a9fe14d2b3e767f06e49462a97eb09d80c927e112a585c9e, read on
-// 2026-08-19). A DFlash1 draft, present here for O4: it is the ONLY published
-// draft that declares no `layer_types`, and it is also the only one that
-// declares `attention_sink_bias`.
+// `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash` @
+// `b754e6c86008bdb5cc901308dda5a38173ec7276`, `dflash/config.json` VERBATIM
+// (1251 bytes, sha256
+// 2ed5a998f5f57e00a9fe14d2b3e767f06e49462a97eb09d80c927e112a585c9e over the
+// literal below, re-fetched 2026-08-20). A DFlash1 draft, present here for O4:
+// it is the ONLY published draft that declares no `layer_types`, and it is also
+// the only one that declares `attention_sink_bias`.
+//
+// This copy was NOT verbatim when W2 landed. It had been re-indented to two
+// spaces and had dropped `auto_map`, so the recorded sha256 hashed a file that
+// was not in this repository and nothing here hashed what the test parsed. The
+// published bytes are in, and the two facts the case turns on -- no
+// `layer_types`, `attention_sink_bias` present -- are unchanged by the repair.
 constexpr const char* kMimoDflashConfig = R"JSON({
-    "architectures": ["DFlashDraftModel"],
+    "architectures": [
+        "DFlashDraftModel"
+    ],
     "model_type": "qwen3",
+    "auto_map": {
+        "AutoModel": "dflash.DFlashDraftModel"
+    },
     "hidden_size": 6144,
     "intermediate_size": 16384,
     "num_hidden_layers": 5,
@@ -212,7 +236,13 @@ constexpr const char* kMimoDflashConfig = R"JSON({
     "partial_rotary_factor": 0.5,
     "block_size": 8,
     "dflash_config": {
-        "target_layer_ids": [0, 15, 31, 47, 69],
+        "target_layer_ids": [
+            0,
+            15,
+            31,
+            47,
+            69
+        ],
         "mask_token_id": 151669,
         "num_anchors": 4096,
         "block_size": 8,
@@ -781,10 +811,8 @@ TEST_CASE("dflash2 forward: a ragged query block is REFUSED rather than mis-mask
 }
 
 TEST_CASE("dflash2 propose: the conv RUNS and THEN the selector refuses by name") {
-  // The ORDER is the claim. `DflashProposeBlock` is one of the two places that
-  // turn draft logits into draft tokens (the other is
-  // `GPUModelRunner::propose_drafts_block`), and it runs the draft block forward
-  // -- grouped convolution and all -- BEFORE anything samples. So a DFlash2 draft
+  // The ORDER is the claim. `DflashProposeBlock` runs the draft block forward --
+  // grouped convolution and all -- BEFORE anything samples. So a DFlash2 draft
   // reaching here has already executed every line of W2, and what it is refused
   // for is the candidate selector alone.
   //
@@ -793,6 +821,16 @@ TEST_CASE("dflash2 propose: the conv RUNS and THEN the selector refuses by name"
   // point, which is what .agents/reachability.md calls the test-only driver.
   // Deleting the `RefuseDflash2CandidateSelector` call inside `DflashProposeBlock`
   // turns this case red.
+  //
+  // WHAT THIS CASE DOES NOT PROVE, stated because W2's first review found the
+  // claim overstated here: `DflashProposeBlock` itself has NO caller outside
+  // `tests/` at this commit, so the refusal call this case gates is the
+  // test-reachable one. The refusal a user arrives through is the identical call
+  // in `GPUModelRunner::propose_drafts_block`, and deleting THAT one leaves every
+  // suite in this repository green. It is `## Owed` O7 and it belongs to W4. The
+  // CONVOLUTION is a different matter and is genuinely production-reached: see
+  // the ForwardBlockLogitsWithDeviceKV cases below, whose call sites redden this
+  // suite one at a time.
   Dims dm;
   dm.conv_taps = 2;
   dm.attn_conv_active = true;

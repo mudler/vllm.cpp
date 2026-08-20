@@ -2843,6 +2843,59 @@ takes the GGUF branch above the hoist, which carries its own named refusal for a
 GGUF DSpark target (`SPEC-DSPARK`). Either way the draft is refused and nothing
 loads it as a Qwen3 draft.
 
+## DFlash2 drafts: the exact checkpoints
+
+A DFlash2 draft is a SEPARATE checkpoint named by the `model` key of
+`--speculative-config`, and it heads one specific target. A repo id alone is not
+a pin, because a checkpoint can be re-quantized in place under an unchanged name,
+so the revision is part of the identity.
+
+**Read what these weights currently buy you before you download 3.6 GiB.** A
+safetensors `DFlash2DraftModel` draft is admitted as far as its CONVOLUTION and
+no further: it loads, it runs the grouped dynamic depthwise convolution around
+every attention and every MLP sublayer of every draft layer, and it is then
+refused BY NAME at the candidate selector, which this engine does not implement
+yet (`SPEC-DFLASH2`, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
+A startup notice says so, so the refusal at the first generated token is not a
+surprise. These are therefore the checkpoints the port was BUILT and READ
+against, not checkpoints that produce a draft token here today.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| Draft, bf16 safetensors — ADMITTED to the convolution | `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `model.safetensors` | 3 848 817 896 | `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
+| Draft, GGUF — REFUSED at startup | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
+| Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
+| Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
+| Target the draft heads | `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | published shards | — | — |
+
+Every sha256 above was computed over the local copy on 2026-08-20, not read from
+a hub API: an unauthenticated tree API can return an `lfs.oid` that is not a
+hash of anything. Each file's size matches what the hub reports, and the
+safetensors shard was checked semantically as well — 81 tensors, every one BF16,
+and its last data offset lands exactly on the file size.
+
+**The GGUF rows are the REFUSED arm, and they are listed so the refusal is
+checkable.** A GGUF DFlash2 drafter is refused at startup because its weight path
+does not exist yet; it is classified by METADATA rather than by an architecture,
+because a GGUF declares no architectures and the published DFlash2 GGUF writes
+the same `dflash` architecture a DFlash1 one does. A file carrying
+`dflash.selector_rank`, `dflash.selector_top_k` or `dflash.conv_kernel_size` is
+refused, and a DFlash1 GGUF, which carries none of them, loads as before. The
+GGUF drafter arm is a later wave of the row.
+
+**What the gate actually reads, which is not these bytes.** The published
+`config.json` of `z-lab/Qwen3.8-27B-DFlash2` and of the second published DFlash2
+draft, `z-lab/Muse-Glimmer-30B-DFlash2` @
+`b54ffdd11fa9cfe2af370012e5763d492c904128`, are embedded BYTE-FOR-BYTE in
+`tests/vllm/models/test_qwen3_dflash2_draft.cpp` with their sha256 recorded, and
+the gate drives those documents through the production config builder. The
+weight-loading cases run over a safetensors file the test WRITES, carrying the
+published tensor names and shapes (`layers.N.attention_conv.base_kernel` bf16
+`[2, taps, hidden]`, `layers.N.mlp_conv.kernel_projection.weight`), because a
+3.6 GiB download cannot be a unit-gate dependency. The two published drafts
+differ in ways the gate needs: block 8 against block 16, and Muse Glimmer sets
+`output_multiplier` and `final_logit_softcapping` where the 27B defaults them.
+
 ## Muse Glimmer 30B from a GGUF k-quant
 
 The text tower loads from a `muse-glimmer`-architecture GGUF, so the 30B model

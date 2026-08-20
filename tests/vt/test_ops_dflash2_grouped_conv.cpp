@@ -35,9 +35,18 @@
 //  * The SIDE. `base_kernel` dim 0 is prepare/finish, NOT a tap. The case
 //    asserts side 1 reads base[1] and coefficients[:,1] and differs from side 0
 //    on the same input.
-//  * CUDA == CPU, BIT-FOR-BIT. Every step of this op is elementwise with a
-//    rounding to the tensor dtype, exactly as upstream's bf16 chain materializes
-//    it, so there is no reduction-order freedom and no envelope to hide behind.
+//  * THE ROUNDING POLICY, in bf16 and on CPU. Every step of this op rounds to
+//    the tensor dtype, exactly as upstream's bf16 chain materializes it. The
+//    cases above the CUDA section run in f32, where that rounding is the
+//    IDENTITY by construction and therefore invisible; the two bf16 cases pin it
+//    directly, one with hand-computed literals that differ from the
+//    round-once-at-the-end answer and one bit-exact against a reference that
+//    rounds where upstream materializes.
+//  * CUDA == CPU, BIT-FOR-BIT. The consequence of the policy above: no
+//    reduction-order freedom and no envelope to hide behind. That case is
+//    written and has NEVER RUN on this host (no `nvcc`, so it reports `no CUDA
+//    backend; skipping`); it is `## Owed` O6 of the row's spec and is not
+//    counted as coverage here.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -101,6 +110,61 @@ std::vector<float> RandF32(size_t n, uint32_t seed) {
     x = (static_cast<float>(s >> 8) / static_cast<float>(1u << 24)) * 4.0f - 2.0f;
   }
   return v;
+}
+
+// bf16 helpers. Every published DFlash2 checkpoint stores this op's tensors in
+// bf16, and bf16 is the ONLY arm on which the rounding policy is observable: on
+// f32 the kernel's per-step rounding is the identity by construction, so no f32
+// case can see it.
+std::vector<uint16_t> ToBf16(const std::vector<float>& v) {
+  std::vector<uint16_t> o(v.size());
+  for (size_t i = 0; i < v.size(); ++i) o[i] = vt::F32ToBF16(v[i]);
+  return o;
+}
+Tensor Bf16(std::vector<uint16_t>& v, const std::vector<int64_t>& shape) {
+  return Contig(v.data(), DType::kBF16, Cpu(), shape);
+}
+// Round an f32 through bf16 and back -- one MATERIALIZATION of an intermediate.
+float RB(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)); }
+
+// UPSTREAM's reference loop again, at upstream's bf16 MATERIALIZATION points.
+// Written from the upstream chain rather than from our kernel: `base + delta`,
+// `coefficients * blocks` and `output += ...` each produce a tensor of the model
+// dtype, so on a bf16 draft each of the three rounds, and the accumulation runs
+// tap-ascending because upstream's `for tap in range(1, taps)` does.
+//
+// This is the whole reason the CUDA arm can be specified BIT-IDENTICAL rather
+// than within an envelope, and it is not free: rounding ONCE at the end gives a
+// different answer, which the hand-computed case below pins with literals.
+std::vector<uint16_t> ReferenceBf16(const std::vector<uint16_t>& hidden,
+                                    const std::vector<uint16_t>& delta,
+                                    const std::vector<uint16_t>& base, int64_t batch,
+                                    int64_t block, int64_t taps, int64_t groups,
+                                    int64_t gsize, int64_t sides, int64_t side) {
+  const int64_t H = groups * gsize;
+  std::vector<uint16_t> out(static_cast<size_t>(batch * block * H), 0);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t pos = 0; pos < block; ++pos) {
+      const int64_t row = b * block + pos;
+      for (int64_t g = 0; g < groups; ++g) {
+        for (int64_t j = 0; j < gsize; ++j) {
+          const int64_t c = g * gsize + j;
+          float acc = 0.0f;
+          for (int64_t tap = 0; tap < taps && tap <= pos; ++tap) {
+            const size_t di =
+                static_cast<size_t>(((row * sides + side) * taps + tap) * groups + g);
+            const size_t bi = static_cast<size_t>((side * taps + tap) * H + c);
+            const float k = RB(vt::BF16ToF32(base[bi]) + vt::BF16ToF32(delta[di]));
+            const float term =
+                RB(k * vt::BF16ToF32(hidden[static_cast<size_t>((row - tap) * H + c)]));
+            acc = (tap == 0) ? term : RB(acc + term);
+          }
+          out[static_cast<size_t>(row * H + c)] = vt::F32ToBF16(acc);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 // UPSTREAM's reference loop, transcribed from
@@ -259,6 +323,98 @@ TEST_CASE("dflash2-grouped-conv: base_kernel dim 0 is the SIDE, not a tap") {
 }
 
 // ===========================================================================
+// bf16 — the ROUNDING POLICY, on the only arm that can see it.
+//
+// The cases above run in f32, where the kernel's per-step rounding is the
+// identity by construction, so NOTHING above this line can tell per-step
+// rounding from rounding once at the end. That distinction is not cosmetic: it
+// is the reason `DFlashGroupedConvArgs` specifies the CUDA mirror as
+// BIT-IDENTICAL to this CPU reference rather than within a tolerance, and it is
+// what makes the op agree with upstream's bf16 chain element for element. Both
+// cases below are CPU-ONLY and do not wait for a GPU.
+
+TEST_CASE("dflash2-grouped-conv bf16: the answer rounds PER STEP, not once at the end") {
+  // Hand-computed with literals, so the expectation is independent of any
+  // reference loop in this file. bf16 carries 8 significand bits, so above 256
+  // it steps by 2 and round-to-nearest-EVEN decides every halfway case.
+  //
+  // Two blocks of 2 rows; taps 2; TWO groups of one channel each (so each
+  // channel gets its own delta); one side. x alternates a large row and a small
+  // one, base = {3, 5} per channel for both taps, delta = 2^-9 everywhere.
+  //
+  //   k(ch0) = bf16(3 + 0.001953125) = 3        (the `base + delta` rounding)
+  //   k(ch1) = bf16(5 + 0.001953125) = 5
+  //
+  //   row 0 / row 2  (pos 0, tap 1 masked by the block boundary)
+  //     ch0: bf16(3*89) = bf16(267) = 268   (267 is halfway; 268 is the even one)
+  //     ch1: bf16(5*53) = bf16(265) = 264   (265 is halfway; 264 is the even one)
+  //   row 1 / row 3  (pos 1, both taps)
+  //     ch0: bf16(bf16(3*1) + bf16(3*89)) = bf16(3 + 268) = bf16(271) = 272
+  //     ch1: bf16(bf16(5*1) + bf16(5*53)) = bf16(5 + 264) = bf16(269) = 268
+  //
+  // Round ONCE at the end instead and six of these eight outputs move:
+  // row 0/2 ch1 -> 266, row 1/3 ch0 -> 270 and ch1 -> 270. That is the whole
+  // difference between the two policies, and it is why the numbers below are
+  // 268/264/272/268 rather than 268/266/270/270.
+  const float kDelta = 0.001953125f;  // 2^-9, exactly representable in bf16
+  std::vector<uint16_t> x = ToBf16({89.0f, 53.0f, 1.0f, 1.0f, 89.0f, 53.0f, 1.0f, 1.0f});
+  std::vector<uint16_t> delta = ToBf16(std::vector<float>(4 * 1 * 2 * 2, kDelta));
+  std::vector<uint16_t> base = ToBf16({3.0f, 5.0f, 3.0f, 5.0f});
+  std::vector<uint16_t> got(8, 0);
+  Tensor tx = Bf16(x, {4, 2});
+  Tensor tc = Bf16(delta, {4, 1, 2, 2});
+  Tensor tb = Bf16(base, {1, 2, 2});
+  Tensor to = Bf16(got, {4, 2});
+  Queue q = Q();
+  vt::DFlashGroupedConv(q, to, tx, tc, tb,
+                        Args(/*block=*/2, /*taps=*/2, /*groups=*/2, /*gsize=*/1, /*side=*/0));
+  const std::vector<float> want = {268.0f, 264.0f, 272.0f, 268.0f,
+                                   268.0f, 264.0f, 272.0f, 268.0f};
+  for (size_t i = 0; i < want.size(); ++i) {
+    INFO("row ", i / 2, " channel ", i % 2, " got ", vt::BF16ToF32(got[i]));
+    CHECK(got[i] == vt::F32ToBF16(want[i]));
+  }
+}
+
+TEST_CASE("dflash2-grouped-conv bf16 is BIT-EXACT against the per-step reference") {
+  // The same claim at shapes with real fan-in, against ReferenceBf16 — which
+  // rounds where UPSTREAM materializes rather than where our kernel does. Both
+  // published block shapes and both sides; taps 3 at block 16 so more than one
+  // accumulate rounding is chained. Asserted on the STORED bf16 patterns, not
+  // through a tolerance, because bit-identity is what the op promises.
+  struct Case {
+    int64_t batch, block, taps, groups, gsize, sides, side;
+    uint32_t seed;
+  };
+  const Case cases[] = {
+      {2, 8, 2, 4, 2, 2, 0, 44}, {2, 8, 2, 4, 2, 2, 1, 55}, {2, 16, 3, 4, 2, 1, 0, 66}};
+  for (const Case& cs : cases) {
+    const int64_t H = cs.groups * cs.gsize;
+    const int64_t T = cs.batch * cs.block;
+    std::vector<uint16_t> x = ToBf16(RandF32(static_cast<size_t>(T * H), cs.seed));
+    std::vector<uint16_t> delta = ToBf16(
+        RandF32(static_cast<size_t>(T * cs.sides * cs.taps * cs.groups), cs.seed + 1));
+    std::vector<uint16_t> base =
+        ToBf16(RandF32(static_cast<size_t>(cs.sides * cs.taps * H), cs.seed + 2));
+    std::vector<uint16_t> got(static_cast<size_t>(T * H), 0);
+    Tensor tx = Bf16(x, {T, H});
+    Tensor tc = Bf16(delta, {T, cs.sides, cs.taps, cs.groups});
+    Tensor tb = Bf16(base, {cs.sides, cs.taps, H});
+    Tensor to = Bf16(got, {T, H});
+    Queue q = Q();
+    vt::DFlashGroupedConv(q, to, tx, tc, tb,
+                          Args(cs.block, cs.taps, cs.groups, cs.gsize, cs.side));
+    const std::vector<uint16_t> want = ReferenceBf16(x, delta, base, cs.batch, cs.block,
+                                                     cs.taps, cs.groups, cs.gsize,
+                                                     cs.sides, cs.side);
+    for (size_t i = 0; i < want.size(); ++i) {
+      INFO("block ", cs.block, " taps ", cs.taps, " side ", cs.side, " index ", i);
+      CHECK(got[i] == want[i]);
+    }
+  }
+}
+
+// ===========================================================================
 // CUDA parity. Unlike the attention ops, this one is elementwise with a rounding
 // to the tensor dtype after each materialized step, so CPU and CUDA must agree
 // BIT-FOR-BIT and the gate asserts equality rather than an envelope.
@@ -311,12 +467,6 @@ class DeviceTensor {
   size_t bytes_ = 0;
   Tensor t_;
 };
-
-std::vector<uint16_t> ToBf16(const std::vector<float>& v) {
-  std::vector<uint16_t> o(v.size());
-  for (size_t i = 0; i < v.size(); ++i) o[i] = vt::F32ToBF16(v[i]);
-  return o;
-}
 
 // One shape, run on CPU and CUDA in the SAME dtype, asserted BIT-EQUAL.
 void RunCudaParity(int64_t batch, int64_t block, int64_t taps, int64_t groups, int64_t gsize,

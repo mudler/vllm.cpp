@@ -806,7 +806,18 @@ struct DFlashPagedBlockAttentionArgs {
 // step, because upstream's chain materializes bf16 tensors at each one
 // (`base + delta`, `coefficients * blocks`, `output += ...`). This is elementwise
 // with no reduction-order freedom, so the CPU reference and the CUDA kernel are
-// BIT-IDENTICAL rather than within an envelope, and the gate asserts that.
+// specified BIT-IDENTICAL rather than within an envelope.
+//
+// WHAT IS ACTUALLY GATED, because the two halves of that sentence are not
+// equally proven. The per-step POLICY is pinned on CPU in bf16 by
+// `tests/vt/test_ops_dflash2_grouped_conv.cpp` — one hand-computed case with
+// literal expectations that differ from the rounded-once-at-the-end answer in
+// six of eight outputs, plus three shapes asserted bit-exact against a reference
+// that rounds where UPSTREAM materializes. On f32 this rounding is the identity
+// by construction, so no f32 case can see it and none is claimed to. The CPU ==
+// CUDA half is NOT proven: that case exists and is written to run, but it has
+// never compiled on a host without `nvcc` and reports `no CUDA backend;
+// skipping`. See `## Owed` O6 of `.agents/specs/dflash2-spec-decode.md`.
 struct DFlashGroupedConvArgs {
   int64_t block_size = 0;   // 1 + num_speculative_tokens (the query block)
   int64_t taps = 0;         // dflash_config.conv_kernel_size

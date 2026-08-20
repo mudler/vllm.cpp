@@ -61,10 +61,16 @@ namespace vllm::v1 {
 // why this is a refusal and not a fallback, and why it is placed AFTER the
 // forward: the forward is implemented and gated, the choice is not.
 //
-// Called from the production draft step (`GPUModelRunner::propose_drafts_block`,
-// src/vllm/v1/worker/gpu/runner.cpp) and from `DflashProposeBlock` below, which
-// are the only two places that turn draft logits into draft tokens. Owed by W3 of
-// the row.
+// Two call sites turn draft logits into draft tokens and both refuse here:
+// `GPUModelRunner::propose_drafts_block` (src/vllm/v1/worker/gpu/runner.cpp) and
+// `DflashProposeBlock` below. Only the FIRST is production. `DflashProposeBlock`
+// has no caller outside `tests/` at this commit -- grep it -- so the refusal that
+// a test can delete-and-redden is the test-reachable one, and the site a user
+// actually arrives through is UNGATED. Entering it needs a runner whose
+// `dflash_weights_` is set, which only the `LoadedModel` construction path does,
+// so a gate on it needs an on-disk target plus draft driven through the loader.
+// That harness is W4's. See `## Owed` O7 of
+// `.agents/specs/dflash2-spec-decode.md`; the refusal itself is owed by W3.
 void RefuseDflash2CandidateSelector(const Qwen3DFlashWeights& weights);
 
 // Greedy per-request draft pick over the (1+k) block logits — the greedy branch of

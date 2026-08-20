@@ -4,12 +4,18 @@ Use a model recipe when a checkpoint needs extra files, model-specific flags,
 or a known limitation. The documentation campaign is moving these recipes out
 of the legacy section in [`USAGE.md`](../USAGE.md#temporary-legacy-reference).
 
-Current recipes remain in that section until their focused pages land:
+Choose the model family you want to run:
 
-- [DSpark draft checkpoints](../USAGE.md#dspark-drafts-the-exact-checkpoints)
-- [Muse Glimmer 30B](../USAGE.md#muse-glimmer-30b-from-a-gguf-k-quant)
-- [Nemotron-3.5-Lightning-30B](../USAGE.md#nemotron-35-lightning-30b-the-exact-weights-and-which-arms-run)
-- [MiniMax-H3](../USAGE.md#minimax-h3-video--audio-generation)
-- [MiniMax-Music3](../USAGE.md#minimax-music3-the-exact-weights-so-a-song-is-reproducible)
-
-Each focused page replaces its legacy entry when it lands.
+- [DSpark](dspark.md)
+- [Gemma 4](gemma-4.md)
+- [IndexTTS 2.5](indextts-2-5.md)
+- [LTX 2.5](ltx-2-5.md)
+- [MiniMax-H3](minimax-h3.md)
+- [MiniMax-Music3](minimax-music3.md)
+- [Muse Glimmer](muse-glimmer.md)
+- [Nemotron 3.5 Lightning](nemotron-3-5-lightning.md)
+- [Qwen3.5](qwen3-5.md)
+- [Qwen3.6](qwen3-6.md)
+- [Qwen3.8 2.4T](qwen3-8-2-4t.md)
+- [Qwen3.8 27B](qwen3-8-27b.md)
+- [Qwen3-Next](qwen3-next.md)

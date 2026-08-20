@@ -14,7 +14,20 @@ documentation-only pull request without waiting for continuous integration.
 W1 is complete. The migration manifest accounts for 275 campaign-base H1, H2,
 and H3 headings. W2 adds the public directory indexes and places the generic
 CLI, server, C ABI, and C++ paths before a temporary legacy-reference boundary.
-The legacy body remains in place for the W3 to W5 migrations.
+W3 extracts the model recipes, combines the repeated MiniMax sections, and adds
+the seven-field checkpoint registry. The remaining legacy body stays in place
+for the W4 and W5 migrations.
+
+The W3 MiniMax-H3 registry metadata was resolved on 20 August 2026 with the
+Hugging Face revision API and raw Git LFS pointers. No model weight was
+downloaded. The resolved revisions are `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7`
+for `realrebelai/MiniMax-H3_GGUFs`,
+`d629413c2e5b51b38c453668b75ca3b06ca92703` for
+`unsloth/MiniMax-H3-GGUF`, `42ed227ee7df40d41602854ae760620d6eb651fe`
+for `MiniMaxAI/MiniMax-H3`, and `8c5abfed61e1b6a170240792b65253fba1a65b7b`
+for `lilcheaty/MiniMax-H3-NVFP4`. Registry rows cover the Q4_K_M artifacts
+verified end to end and the pruned Q8_0 artifacts recorded as rendered. The
+model page records the other published variants and their current state.
 
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue

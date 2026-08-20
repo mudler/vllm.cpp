@@ -119,6 +119,33 @@ The LTX registry and model page restore the base facts from
 LoRA, H3 VAE, and IndexTTS headings identify the commits that introduced those
 facts before the W3 extraction.
 
+W5 reduces `docs/STATUS.md` from 2,906 to 96 lines. The page now contains the
+current parity pin, lifecycle terms, user-facing surface state, backend and
+release state, and the unsupported summary. The detailed current projections
+remain in `docs/FEATURES.md` and the five canonical internal matrices linked at
+the top of the page. Dated implementation and verification details remain in
+Git, row specs, `.agents/parity-ledger.md`,
+`.agents/completed/state-events/`, and `docs/BENCHMARKS.md`, as assigned by the
+W1 manifest.
+
+W5 also removes backend, quantization, and environment ownership from
+`docs/BUILD.md`. The build page now links to `FEATURES.md`, `STATUS.md`,
+`BENCHMARKS.md`, and `ENVIRONMENT.md`. `docs/ENVIRONMENT.md` keeps one row for
+each of the duplicated server limit and MiniMax-H3 diagnostic variables. Its
+GGUF section links to the quantization table in `FEATURES.md`. The feature page
+keeps its keyed support tables and replaces the dated claim-triage narrative
+with a short explanation of its marks. Issue #704's public tool-parser count is
+already current at 38 families, and the registry gate confirms the 40 current
+architectures described by issue #342's broader drift report. W6 still owns the
+README changes in those issues.
+
+The W5 focused assertions failed before the edit on five conditions: the
+status line count, its dated upstream-sync heading, build-owned capability
+sections, the duplicate build environment section, and duplicate environment
+rows. All five pass after the edit. The release, Windows publication,
+environment inventory, supported-model, public-table, and README structure
+checks also pass without a product, lifecycle, release, or measurement change.
+
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
 #1463 uses the accepted spec-owned form in the append-only issue index.

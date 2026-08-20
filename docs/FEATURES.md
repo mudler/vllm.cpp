@@ -372,21 +372,11 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 
 ## How to read this page
 
-A ✅ means the feature is implemented **and** carries a gate: for model rows that
-is a token-for-token comparison against the pinned vLLM oracle on the same
-workload, and for engine rows it is a named test in the tree. A ◐ means the code
-path exists and works within stated limits, and the limits are named in
-[STATUS.md](STATUS.md) rather than glossed. We do not mark a row ✅ because the
-code compiles, and we do not mark a competitor ☐ to flatter a column.
+A ✅ means the implementation has a named gate. For a model, that gate compares
+the same workload with the pinned oracle. For an engine feature, the gate is a
+named test in the tree. A ◐ means the path works only within the limits in its
+table row.
 
-Feature parity is not the same as speed parity. Most architectures here are
-correctness-complete and speed-pending, and [BENCHMARKS.md](BENCHMARKS.md) says
-which is which.
-
-The marks track implementation and gates, not who is working on something. The
-2026-08-04 claim triage moved 58 agent-record rows out of `ACTIVE` because
-nobody is flying them; the 2026-08-05 device inventory put 11 llama.cpp ggml
-backends in scope as inventoried rows. Neither changed a capability, so **no
-mark on this page moved**. An inventoried backend is not a supported one, and the same
-holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
-are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
+The marks describe support, not speed or current ownership. See
+[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+performance. An inventoried row is not a supported feature.

@@ -66,6 +66,21 @@ checkpoints](guides/hugging-face-access.md) for the build options,
 release lanes that carry no fetch. `vllm-cli` and the C ABI still take a local
 path only.
 
+## Draft with a second checkpoint
+
+Speculative decoding runs a small draft model beside the target and verifies its
+proposals losslessly, so the emitted tokens do not change. Pass the draft with
+`--speculative-config`:
+
+```sh
+build/examples/vllm-server   --model /path/to/target   --speculative-config '{"method":"dflash","model":"/path/to/draft","num_speculative_tokens":7}'
+```
+
+[Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
+draft checkpoints each was gated against, and what each one refuses by name.
+Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
+value is refused at startup rather than silently ignored.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in

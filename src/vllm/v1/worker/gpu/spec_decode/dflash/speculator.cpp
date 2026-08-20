@@ -86,8 +86,12 @@ DflashProposeResult DflashProposeBlock(
           block_positions, block_cu, weights, config, queue, nullptr,
           dflash2 ? &block_hidden : nullptr);
 
-  // SPEC-DFLASH2 W3 (#1314): the conv and the CANDIDATE SELECTOR have both run
-  // by the end of this block; the PATH WALK has not, and is refused by name.
+  // SPEC-DFLASH2 W4 (#1314): the conv (W2), the CANDIDATE SELECTOR (W3) and the
+  // PATH WALK (W4) all run for a DFlash2 draft, and the walk -- not the DFlash1
+  // per-slot argmax below -- is what produces its tokens. Same sequence as
+  // upstream's `DFlash2Speculator._generate_draft`, and the same call as
+  // `GPUModelRunner::propose_drafts_block`: one implementation, two entries.
+  DflashProposeResult out;
   if (dflash2) {
     std::vector<int32_t> anchors(static_cast<size_t>(num_reqs));
     for (int r = 0; r < num_reqs; ++r)
@@ -95,12 +99,19 @@ DflashProposeResult DflashProposeBlock(
           block_input_ids[static_cast<size_t>(static_cast<int64_t>(r) * block)];
     const Dflash2ProposeState selected = Dflash2SelectCandidates(
         block_logits, block_hidden, anchors, num_reqs, k, weights, config, queue);
-    RefuseDflash2PathWalk(weights, selected);
+    out.draft_token_ids = Dflash2WalkPath(selected, queue).draft_token_ids;
   }
 
-  DflashProposeResult out;
-  out.draft_token_ids = SampleDflashBlockDrafts(block_logits, num_reqs, k,
-                                                weights.draft_vocab_size);
+  // The DFlash1 arm. It is entered on emptiness rather than on `!dflash2` so
+  // that DELETING the walk above lands here instead of falling past an else --
+  // and `RefuseDflash1ArgmaxOnDflash2Block` then makes that loud. A DFlash2
+  // block sampled by the per-slot argmax succeeds and loses only acceptance,
+  // which no token gate can see.
+  if (out.draft_token_ids.empty()) {
+    RefuseDflash1ArgmaxOnDflash2Block(weights);
+    out.draft_token_ids = SampleDflashBlockDrafts(block_logits, num_reqs, k,
+                                                  weights.draft_vocab_size);
+  }
   return out;
 }
 

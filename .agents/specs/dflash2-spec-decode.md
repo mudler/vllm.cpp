@@ -63,6 +63,7 @@ with `git diff --no-index --numstat` over the two raw blobs fetched from
 |---|---|---|
 | `vllm/model_executor/models/qwen3_dflash2.py` | +24 / −11 | W3 |
 | `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` | +37 / −34 | W4 |
+| `vllm/v1/worker/gpu/spec_decode/speculator.py` (the BASE class) | +24 / −6 | W4 |
 
 In `qwen3_dflash2.py` it IS exactly two things, both infrastructure rather than
 math:
@@ -99,6 +100,20 @@ read the old sentence would under-scope the wave:
   reverses 0.68% of candidate pairs.
 - `_generate_draft`'s tail is conditional: `_cache_draft_logits` runs only when
   `self.draft_logits is not None`.
+- (a SEVENTH, in the BASE class rather than in `dflash2/`, and this section did
+  not list it until W4 read the file: `DraftModelSpeculator.__init__` no longer
+  hard-codes `torch.zeros(..., dtype=head_dtype)` for the cache. It calls the new
+  virtual `draft_logits_spec(vllm_config)` and `torch.full`s with what that
+  returns, defaulting to `(head_dtype, 0.0)` with a docstring saying a speculator
+  that writes only a SUBSET of columns has to override it. That is the seam the
+  DFlash2 override exists to use, and the allocation is still guarded by
+  `draft_sample_method == "probabilistic"` at both heads.)
+
+**W4 VERIFIED THIS ENUMERATION rather than trusting it.** All six items above
+were re-read at `66e5414c6d75a8529473d977f7458c140bbab8a0` in a local clone and
+diffed against `19c93519` with `git diff`; every one is present as described.
+The seventh is the only correction, and the `+24 / −6` row it belongs to was
+missing from the table.
 
 `_score_edges`, `CandidateSelector`, `hidden_projection`, the two codebooks,
 `_topk`, `output_multiplier` and `final_logit_softcapping` are BYTE-IDENTICAL at
@@ -138,8 +153,20 @@ The two mechanisms, in upstream's own terms:
 2. **Candidate selector**, replacing the independent per-slot argmax: keep the
    target head's top-K per slot, score adjacent transitions
    `edge(p->c) = <A[p] * project(h), B[c]> + unary[c]`, walk the best path from
-   the verified anchor. At T>0 the walk is by inverse CDF and returns q over the
-   K candidates, which the lossless verify requires.
+   the verified anchor. At T>0 the walk draws with GUMBEL-MAX noise keyed by the
+   candidate token ids and caches the realized scores as the proposal
+   distribution q over the K candidates, which the lossless verify requires.
+
+   **"Inverse CDF" is what this line said until W4, and it was wrong at BOTH
+   heads** ([#1501](https://github.com/mudler/vllm.cpp/issues/1501)). At `19c93519` the walk's non-greedy branch already drew
+   `-log(-log1p(-u))` Gumbel noise and took the argmax of `scores/temperature +
+   noise`; at `66e5414c` that hand-written branch is replaced by a call to
+   `gumbel_noised_argmax`, which is the same draw. No inverse-CDF walk exists
+   upstream. The mistake was inherited from the brief that opened this row and
+   never re-read against the source, which is why `## Gates` requires the port to
+   cite what it read. It changes nothing that landed -- W4 ships the GREEDY arm
+   and `## Risks/decisions` D13 records why the noised arm is not reachable here
+   -- but it would have mis-scoped the wave that lands it.
 
 Upstream's measurements, recorded as THEIR numbers and not as an expectation for
 this engine (H200, `Qwen/Qwen3.8-27B`, k=7): per-request acceptance 5.34 against
@@ -248,8 +275,8 @@ Absent, and owed by this row:
 | `qwen3_dflash2.py` conv | `vt::DFlashGroupedConv` op, kernel-matrix row `KERNEL-DFLASH2-GROUPED-CONV`, wrapped into the existing `src/vllm/model_executor/models/qwen3_dflash.cpp` layer bodies | CPU reference first, CUDA after, as `KERNEL-ATTN-DFLASH-BLOCK` did. LANDED in W2. The conv wraps sublayers of the SHIPPED DFlash block rather than a new file, because upstream subclasses `DFlashQwen3DecoderLayer` and overrides only `forward`; a parallel `qwen3_dflash2.cpp` copy of that body is what AGENTS.md `## Shared seams` forbids |
 | `qwen3_dflash2.py` selector | `src/vllm/model_executor/models/qwen3_dflash2.cpp` + `vt::Dflash2SelectorEdges`, kernel-matrix row `KERNEL-DFLASH2-SELECTOR-EDGES` | LANDED in W3. `_score_edges` is one einsum; it is not the cost. The op is NOT bit-identical across backends -- the rank contraction is a reduction -- unlike `KERNEL-DFLASH2-GROUPED-CONV`, which is elementwise |
 | `_topk` / FlashInfer radix | `vt::TopKValuesIndices`, kernel-matrix row `KERNEL-TOPK-PAIRS`, extending the pivot-bracket search in `src/vt/cuda/cuda_sample.cu` to emit pairs | D2. LANDED in W3. The TIE-BREAK is the contract: descending value, ties by ascending index |
-| `dflash2/speculator.py` walk kernel | `src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp` + a CUDA walk kernel | D3: device from day one |
-| `dflash2/speculator.py` draft-logit cache | same file | the realized q the rejection sampler reads at T>0 |
+| `dflash2/speculator.py` walk kernel | `vt::Dflash2PathWalk`, kernel-matrix row `KERNEL-DFLASH2-PATH-WALK`, consumed by `src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp::Dflash2WalkPath` | D3: device from day one. LANDED in W4, in upstream's OWN grid -- one program per request with the step loop inside it. Specified BIT-EXACT across backends, unlike the lattice op: the walk compares and gathers and performs no arithmetic |
+| `dflash2/speculator.py` draft-logit cache | not ported; `## Owed` O12 | D13. At the MOVED head `_cache_draft_logits` runs only `if self.draft_logits is not None`, which is set only for `draft_sample_method == "probabilistic"` -- a value `ParseSpeculativeConfigJson` refuses BY NAME here, against a verify that is accept-iff-equal. Its layout is recorded (`draft_logits_spec`: fp32, `-inf` fill, `None` for greedy) so the wave that lands the probabilistic arm does not re-derive it |
 | `registry.py` + `spec_decode/__init__.py` | `include/vllm/config/speculative.h`, `src/vllm/entrypoints/model_loader.cpp` | classify from the draft's own config, as `IsDsparkDraft` does |
 | `_dflash_layer_causal` | `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::DeclaredCausal` + `src/vllm/model_executor/models/qwen3_dflash_weights.cpp::ResolveQwen3DFlashAttnModes` | D4; the ONE shared-behaviour edit. LANDED in W1 |
 | `use_v2_model_runner` | no analogue | we have one runner; record the reason rather than porting a switch |
@@ -305,12 +332,32 @@ Ours, red-first, beyond the ports:
   established that strict token identity is bf16-irreducible on portable
   kernels, so the ratified near-tie gate is the admissible form and a strict
   claim is not.
+  **`19c93519` here is a CHOICE and not a leftover, and W6 owns the final
+  call.** The port mirrors `66e5414c`, which superseded `19c93519` on 2026-08-19
+  ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)), so the gate head and
+  the port head differ by name. It is defensible because the greedy ANSWER is
+  identical at both: the two heads differ in this path only by collapsing the
+  walk's hand-written `temperature == 0.0` and Gumbel branches into one
+  `gumbel_noised_argmax` call, by deleting the private `_selector_tokens` buffer
+  and its `copy_`, and by making the proposal distribution optional and `None`
+  for greedy — none of which a greedy run can observe, and `## Upstream chain`
+  carries the diff. It is stated rather than assumed because a gate head that
+  merely drifted from the port head is how a parity claim quietly stops meaning
+  what it says. W6 takes the gate and reconciles this to ONE head at that
+  point: `66e5414c` if #52816 has not merged, and the merge commit if it has.
 - G3: **acceptance**, measured SAME-TRAJECTORY — both engines teacher-forced on
   identical tokens. `SPEC-DFLASH` D8 spent a whole campaign on an acceptance
   deficit that was a divergent-trajectory measurement confound, and D9 refuted
   it. This gate does not repeat that mistake.
 - G4: the GGUF drafter arm, with the lower bound of `## Tests to port`.
-- G5: reachability, as above.
+- G5: reachability, as above. **DISCHARGED by W4** for the whole DFlash2 chain:
+  `tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` drives a real
+  `LoadedEngine` through `GPUModelRunner::propose_drafts_block`, the engine
+  GENERATES, and the drafts it emits are read off the production trace and
+  required to move with the selector's own output scalars — which the DFlash1
+  per-slot argmax cannot do. Deleting the runner's walk call site reddens it, and
+  so does replacing the walk with that argmax. `## Now` carries the full mutation
+  set and the two that came back green.
 
 **Speed.** No ratio is claimed by this row until G2 and G3 read. When one is
 taken it uses vLLM's production configuration as the denominator, never
@@ -322,7 +369,11 @@ engine and are not treated as one.
 vLLM built at `19c93519`, recorded with its measured runtime version, and it is
 a BEYOND-PIN oracle rather than a pin advance. If #52816 merges before the
 implementation lands, the anchors move to the merge commit and this section is
-reconciled rather than reinterpreted.
+reconciled rather than reinterpreted. The head named here is the same deliberate
+choice G2 states, with the same reason and the same owner: the port mirrors
+`66e5414c`, the greedy answer is identical at both heads, and W6 reconciles the
+oracle build to one head when it takes the gate. No oracle has been BUILT at
+either head yet, so nothing is invalidated by moving it.
 
 ## Dependencies
 
@@ -348,15 +399,16 @@ reviewer who mutates the guarantee rather than reading it.
   block wiring. G1's conv half.
 - **W3 — the selector.** Lattice op, codebooks in the loader, the top-k that
   emits pairs (D2). G1's lattice half.
-- **W4 — the speculator.** The device path walk, the realized-q draft-logit
-  cache, the T>0 inverse-CDF arm, and the wiring that makes a DFlash2 draft
-  reach it. G5 lands here. **Read `## Upstream chain`'s speculator table
-  first**: `speculator.py` is +37 / −34 between the two PR heads W1/W2 and W3
-  were written against, and every one of those six changes is math or state
-  layout in W4's own territory — the `SAMPLE_PROBABILISTIC` constexpr, the
-  `gumbel_noised_argmax` routing, the deleted `_selector_tokens`, the optional
-  `draft_logits` with its new fp32 `draft_logits_spec`, and the conditional
-  `_generate_draft` tail. W3 reconciled the head for the SELECTOR file only.
+- **W4 — the speculator. LANDED 2026-08-20.** The device path walk and the
+  wiring that makes a DFlash2 draft reach it; G5 landed here. The head-move
+  warning this entry carried was correct and it bit exactly where it predicted:
+  the T>0 arm this wave was scoped to write **is not inverse CDF at the moved
+  head** — it is Gumbel-max through `gumbel_noised_argmax` — and it is not
+  landed at all, because no configuration this engine admits can reach it. D13
+  carries that decision and `## Owed` O12 carries what it leaves owed. The
+  realized-q draft-logit cache moved with it, for the same reason and by
+  upstream's own polarity: at `66e5414c` `_generate_draft` calls it only when a
+  proposal distribution exists.
 - **W5 — the GGUF drafter arm**, with its lower bound.
 - **W6 — the gates.** G2 and G3 on a leased GPU against the PR-head oracle,
   then `## Outcome`.
@@ -499,6 +551,51 @@ reviewer who mutates the guarantee rather than reading it.
   weight path at all and admitting the file would load a DFlash1 draft out of a
   DFlash2 checkpoint.
 
+- **D13 — the PROBABILISTIC draft-sample arm is NOT ported, and the greedy arm
+  this row ships is upstream's greedy arm exactly.** W4 decision, 2026-08-20.
+  Issues [#1314](https://github.com/mudler/vllm.cpp/issues/1314) and
+  [#1501](https://github.com/mudler/vllm.cpp/issues/1501), the latter being the
+  record defect this decision was taken while correcting: the row had recorded
+  the T>0 walk as inverse CDF since its opening brief, and it is Gumbel-max at
+  both heads.
+
+  At the moved head `_selector_walk_kernel` calls `gumbel_noised_argmax` with
+  `temperature if SAMPLE_PROBABILISTIC else 0.0`, and `SAMPLE_PROBABILISTIC` is
+  `self.draft_logits is not None`, which `DraftModelSpeculator.__init__` sets
+  only for `speculative_config.draft_sample_method == "probabilistic"`. At
+  temperature 0 that helper divides by nothing, adds no noise, and returns
+  `tl.max(logits, axis=0, return_indices=True)`; the `USE_FP64` cast it may apply
+  is order-preserving on fp32 inputs and cannot move a greedy answer. So the
+  greedy walk this row ports is not an approximation of upstream's walk, it is
+  one of its two arms, byte-for-byte.
+
+  **This engine cannot reach the other arm**, and the refusal predates this row
+  by a long way: `vllm::ParseSpeculativeConfigJson`
+  (`src/vllm/config/speculative.cpp`) refuses `draft_sample_method:
+  "probabilistic"` BY NAME, owed to row `SPEC-ACCEPT-VARIANTS`, because this
+  engine's verify is accept-iff-equal
+  (`include/vllm/v1/spec_decode/rejection_sampler.h`) and there is nothing to
+  consume a proposal distribution. Landing the noised arm and the realized-q
+  cache would therefore land two mechanisms no production entry point can reach,
+  which is what AGENTS.md `## Nothing lands dead` forbids — and it would land
+  them WITHOUT a gate, because bit-parity for the noise needs Triton's Philox
+  stream (`tl.randint4x`, Philox 4x32-10) reproduced exactly, which is its own
+  port with its own oracle.
+
+  What is recorded instead of built is the LAYOUT, so the wave that lands it does
+  not re-derive it: `draft_logits_spec` returns `(torch.float32, -inf)` for
+  DFlash2 — fp32 rather than the head dtype because rounding real selector scores
+  to bf16 moves a candidate row's argmax 0.81% of the time and reverses 0.68% of
+  candidate pairs, and an `-inf` fill because `_cache_draft_logits_kernel` writes
+  only the K candidate columns and every column it never touches has to read as
+  impossible. `## Owed` O12 carries it.
+
+  The half of `draft_logits_spec` that IS honoured here is the one W4 could
+  honour: `None` for greedy. This engine allocates no proposal distribution and
+  caches no realized scores on the arm it ships, which is the moved head's own
+  polarity and the reverse of `19c93519`, where DFlash2 forced the allocation
+  unconditionally.
+
 ## Owed
 
 Everything here is landed-but-not-yet-reachable, or found and not fixed. Each
@@ -555,8 +652,48 @@ list items.
   model that draft heads. The parse is correct and the refusal is loud; the
   drafter is still not runnable, and that belongs to the MiMo model row.
 
-- **O5 — `LoadDflashDraft`'s own DFlash2 lines are not gated.** Owner: this row,
-  discharged by W4. Issue
+- **O5 — PART DISCHARGED by W4, STRUCTURALLY rather than by a gate, and one
+  item remains.** Owner: this row.
+
+  **Item 1, `conv_block_size = draft->k + 1`: the SILENT-WRONG is gone; the line
+  is still not driven by any gate, and W4 measured that rather than claiming
+  otherwise.** What made this line dangerous was never the line — it was that
+  `LoadQwen3DFlash` ALSO wrote the field, from the checkpoint's own
+  `dflash_config.block_size`, so deleting the loader's assignment left a
+  PLAUSIBLE block behind and the conv masked its taps against the wrong one:
+  acceptance-only, token-invisible, and W2 measured every suite staying green
+  under exactly that mutation. W4 removes the seed
+  (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp`, in the `has_taps`
+  branch). The field is now 0 until whoever knows the resolved `k` writes it, and
+  `Qwen3DFlashModel`'s existing `VT_CHECK(weights.conv_block_size > 0)` turns a
+  dropped assignment into a LOUD refusal on the first DFlash2 forward. That is
+  the same remedy W3 applied to the `lm_head_dequantized` carry: remove the
+  mutation's SHAPE rather than add a test that first has to reach an
+  anonymous-namespace function. The removal itself is gated —
+  `tests/vllm/models/test_qwen3_dflash2_draft.cpp` drives a real on-disk DFlash2
+  shard through the production loader, asserts `conv_block_size == 0` beside a
+  `block_size` the checkpoint DOES declare, and asserts the forward refuses by
+  name without it and runs with it; restoring the seed reds that case (1 case /
+  2 assertions). **Deleting the loader's line is still GREEN**, measured on
+  2026-08-20 across `test_qwen3_dflash2_draft` 27/27, `test_dflash2_runner_reach`
+  3/3 and `test_dflash2_draft_routing` 12/12, because the only harness that
+  reaches a real engine enters through the in-memory `DflashDraft` overload,
+  which bypasses `LoadDflashDraft` by construction. A gate on the line itself
+  still needs a draft read off DISK through that function against a live target;
+  what changed is that its failure mode is now a refusal rather than a wrong
+  answer.
+
+  **Item 2, the conv-geometry NOTICE beside it, is unchanged and still owed.**
+  Its cost is a missing diagnostic, not a wrong answer, and it is witnessed by no
+  gate for the same reason.
+
+  **Item 3, the `lm_head_dequantized` carry, was DISCHARGED by W3** by removing
+  the defaulted parameter, so dropping the argument is a compile error.
+
+  The struck record of what this entry said before W4 is kept below, because the
+  reason it existed is what a later reader needs.
+
+- **O5 (the W2/W3 text) — `LoadDflashDraft`'s own DFlash2 lines are not gated.** Issue
   [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Mutation-proven by W2
   on 2026-08-19: deleting `draft->weights.conv_block_size = draft->k + 1;` from
   `LoadDflashDraft` (`src/vllm/entrypoints/model_loader.cpp`) COMPILES CLEAN and
@@ -778,6 +915,13 @@ list items.
   no-op and is not refused). Gated in
   `tests/vllm/models/test_qwen3_dflash2_draft.cpp`. The cost is bounded and
   named: a checkpoint that sets it does not load, rather than loading wrong.
+
+  **W4 RE-ASKED and the answer is unchanged.** W4 was asked to implement it if
+  the wave made it reachable. It does not: the walk consumes the selector's
+  lattice, it touches no embedding, and neither published DFlash2 draft has
+  gained the key. Implementing it would still land a third call site in each of
+  the three layer bodies with no checkpoint able to reach any of them, so the
+  refusal stands and the entry keeps its owner.
 - **O10 — MOSTLY DISCHARGED on 2026-08-20, and what remains is ONE MEASURED
   DIVERGENCE with its own issue.** Owner: this row for the record;
   [#1489](https://github.com/mudler/vllm.cpp/issues/1489) owns the kernel change.
@@ -925,286 +1069,286 @@ list items.
     cannot happen. Naming it is still what this entry can do.
 
 
+- **O11 — the CUDA arm of `vt::Dflash2PathWalk` is UNVERIFIED.** Owner: this
+  row, discharged by the operator's GPU lease. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Same shape as O6 and
+  O10 and the same host: the kernel and its registration are written
+  (`src/vt/cuda/cuda_ops.cu`, `Dflash2PathWalkKernel` /
+  `Dflash2PathWalkKernelCuda`) and the CUDA==CPU BIT-EXACT case exists and is
+  written to run (`tests/vt/test_ops_dflash2_path_walk.cpp`, three shapes — a
+  sub-warp `top_k` 3, the published 16, and 40 so the strided load and the
+  `__shfl_xor_sync` reduction both run past one warp — with a forced exact tie
+  group and a forced all `-inf` row layered onto the random fixture, because
+  neither shape occurs by chance and O10 recorded what it cost to assume one
+  did). It has NEVER COMPILED here: the authoring host has no `nvcc`, so the case
+  reports `no CUDA backend; skipping CUDA dflash2-path-walk parity`.
+
+  Two things are unproven rather than merely unrun, and they are different from
+  O6's and O10's. That the kernel compiles at all. And that the PARALLEL
+  reduction reaches the SEQUENTIAL rule: the CPU arm scans ascending and keeps
+  what strictly exceeds the running best, the CUDA arm strides across lanes and
+  then butterflies. Get that comparator wrong in one direction and a tie
+  resolves to the wrong slot, which then selects the wrong PREDECESSOR row and
+  moves every remaining token of the block — and it is acceptance-only and
+  token-invisible, like everything else on this row. The all `-inf` row is the
+  same class: both arms have to answer slot 0 rather than "no index", and they
+  reach it by the same `top_k` seed rather than by coincidence.
+
+  **W4's FRESH REVIEW MEASURED THE COMPARATOR WRONG, and the wave repaired it
+  rather than narrowing the claim.** The reviewer emulated the kernel's exact
+  32-lane rule on the host and found the two arms disagreeing on a NaN-bearing
+  row: `[NaN,-inf]` read cpu 0 / cuda 1, `[NaN,-inf,-inf]` cpu 0 / cuda 1, and
+  `[NaN,NaN,-inf]` cpu 0 / cuda 2, while every NaN-free case agreed — the
+  all `-inf` row, the all-NaN row and the forced tie group included. Four written
+  claims said the arms were bit-exact (`include/vt/ops.h`,
+  `src/vt/cpu/cpu_ops.cpp`, `src/vt/cuda/cuda_ops.cu`, `.agents/kernel-matrix.md`
+  row `KERNEL-DFLASH2-PATH-WALK`), and on that row they were not.
+
+  The mechanism is one disjunct. The per-lane scan read
+  `if (v > best || (v == best && (int)j < slot))` against the seed
+  `best = -inf, slot = top_k`. Because `j` only ascends inside a lane, the
+  equality arm is unreachable once the lane has claimed anything; its ONLY
+  reachable effect was at the seed, where a lane holding `-inf` compared equal to
+  the `-inf` seed and claimed a slot the CPU arm's strict scan refuses. On a
+  NaN-free row that is invisible, because a real `-inf` lane and a never-claiming
+  lane both collapse to slot 0 in the end. So the disjunct is DELETED: the lane
+  scan is now strict `>` only, which is the CPU arm's own rule reached the CPU
+  arm's own way, and the lower-slot tie preference stays in the cross-lane
+  BUTTERFLY, where it is genuinely needed because lanes combine out of slot
+  order. The invariant that makes the butterfly safe is now stated beside it:
+  with a strict lane scan, `best == -inf` implies `slot == top_k` on every lane,
+  so the tie arm never compares a real slot against a seed.
+
+  **Narrowing the four claims to "bit-exact on any NaN-free lattice" was the
+  alternative and was rejected.** It would have been true, and no shipped path
+  can feed this op a NaN (the lattice comes from `vt::Dflash2SelectorEdges` over
+  a target LM head), so the reachable behaviour is identical either way. It was
+  rejected because the divergence is a two-token deletion of a provably dead
+  disjunct: recording an accommodation for a defect that costs one line to remove
+  is worse than removing it. That is the difference between this entry and O10,
+  where `TopKValuesIndicesRowKernel` cannot be made NaN-first without a redesign
+  of its pivot bracket, and narrowing was therefore the honest result.
+
+  **What this adds to the debt, precisely.** The CPU half of the strictness claim
+  is now gated and mutation-proven: `dflash2-path-walk: a NaN never wins a slot`
+  (`tests/vt/test_ops_dflash2_path_walk.cpp`) is the case a `>=` reduction fails
+  while still answering the tie rows and the -inf row, and turning `>` into `>=`
+  reddens 3 cases / 5 assertions. The CUDA half is NOT gated here and cannot be:
+  the deleted disjunct has never been compiled, and the CUDA parity case — whose
+  fixture now CHAINS a third forced row, a NaN row at step 2 predecessor 0,
+  reached because the tie group and the -inf row each answer slot 0 — still
+  reports `no CUDA backend; skipping`. So the repair is a source change made on
+  an argument, not on a measurement, and the operator's lease owes the
+  measurement together with everything else in this entry.
+
+- **O12 — the PROBABILISTIC draft-sample arm and its realized-q cache are NOT
+  ported.** Owner: `SPEC-ACCEPT-VARIANTS` (`.agents/engine-matrix.md`) for the
+  configuration and the verify; this row for the DFlash2 half when that lands.
+  Issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+  `## Risks/decisions` D13 carries the decision and its reason: no configuration
+  this engine admits can reach the arm, because `ParseSpeculativeConfigJson`
+  refuses `draft_sample_method: "probabilistic"` by name and the verify is
+  accept-iff-equal, so landing it would land two mechanisms no production entry
+  point can reach.
+
+  **This is a NOT-PORTED entry, not a landed-unreached one**, and the difference
+  matters for what the next reader has to do. Nothing of it is in the tree: the
+  walk op has no noised arm and no realized-score output, `Dflash2WalkPath`
+  returns tokens only, and no `draft_logits` buffer is allocated anywhere. What
+  IS recorded is the layout, so it is not re-derived: upstream's
+  `DFlash2Speculator.draft_logits_spec` returns `(torch.float32, -inf)`, the
+  cache is `[max_num_reqs, num_steps, vocab]`, `_cache_draft_logits_kernel`
+  writes ONLY the K candidate columns of `[req_state, step]` after clearing the
+  previous step's K, and the values it writes are the RAW edge scores of the
+  chosen predecessor row — not temperature-divided and not noised, which is what
+  lets the rejection sampler divide by the same temperature and reproduce the
+  walk's number bitwise.
+
+  The cost of leaving it is bounded and named: a user who asks for probabilistic
+  drafting is refused at config parse with the owning row named, on DFlash2
+  exactly as on every other method here. Nothing degrades silently.
+
+  Bit-parity for the noise is its own port and should be scoped as one: the draw
+  is Triton's `tl.randint(seed, pos)` seeding `tl.rand`/`tl.randint4x` (Philox
+  4x32-10) keyed by the CANDIDATE TOKEN IDS, and `-log(-log1p(-u))` rather than
+  the naive `-log(-log(u))` — upstream's own comment says why, and it is a
+  precision argument about where fp32 resolves the winning tail, not a stylistic
+  one.
+
+
 ## Now
 
 `SPEC-DFLASH2` is `ACTIVE`. W1 landed on 2026-08-19 (the route and D4's
 `is_causal` precedence). W2 landed on 2026-08-19 (the grouped dynamic depthwise
-convolution, REACHED). **W3 landed on 2026-08-20: the CANDIDATE SELECTOR, reached
-from the RUNNER.**
+convolution, REACHED). W3 landed on 2026-08-20 (the candidate selector, reached
+from the runner). **W4 landed on 2026-08-20: THE PATH WALK. A DFlash2 draft
+DRAFTS.**
 
-**What W3 ships is the choosing, up to but not including the walk.** Two `vt`
-ops: `Dflash2SelectorEdges` scores the transition lattice
-`edge(b,l,p,c) = unary[b,l,c] + <pred[pid(b,l,p)] * project(h)[b,l], succ[cand[b,l,c]]>`,
-with the request's verified ANCHOR as every predecessor slot at step 0 and the
-previous step's candidate at every later one; `TopKValuesIndices` is the
-vocabulary top-k that EMITS (id, value) pairs, extending the sort-free
-pivot-bracket threshold search this repository already carries rather than
-porting FlashInfer's 3380-line radix kernel (D2). Around them,
-`Qwen3DFlash2Model::ComputeCandidates` applies the org-vocab rebase,
-`output_multiplier` and `final_logit_softcapping` to the candidate VALUES in
-upstream's own order, and `::SelectorEdgeScores` runs the hidden projection and
-the lattice. The three selector tensors load through the production loader under
-the published names.
+**What W4 ships is the end of the mechanism.** `vt::Dflash2PathWalk`
+(`OpId::kDflash2PathWalk`, kernel-matrix row `KERNEL-DFLASH2-PATH-WALK`) turns
+the selector's lattice into k tokens: start at the verified anchor — already
+present as every predecessor slot of step 0, so the walk enters at slot 0 — take
+the best child, then read the NEXT step's block at the predecessor row just
+chosen. It runs in UPSTREAM'S OWN GRID, one program per request with the step
+loop INSIDE it, which is what `## Risks/decisions` D3 requires from the first
+landing: the identical sequential walk shipped host-side in DSpark and measured
+28% of the 27B draft step ([#436](https://github.com/mudler/vllm.cpp/issues/436))
+before `SampleSequentialDevice` moved it. Unlike the lattice op it is specified
+BIT-EXACT across backends, because it performs no arithmetic at all — only
+comparisons and one gather — so there is no reduction order for a backend to
+differ in.
 
-**THE TIE-BREAK IS THE CONTRACT, not an implementation detail.** The threshold
-search converges to an exact array VALUE, so the survivor set keeps whole tie
-groups and can hold more than k members; something has to choose among equals,
-and choosing differently reorders the selector's candidate slots and moves
-acceptance without raising anything. The order is descending value, ties by
-ascending index — `torch.topk`'s CPU order and what FlashInfer's
-`deterministic=True` exists to provide — and hand-written rows pin it, including
-a tie group STRADDLING the k-th boundary, which is the one the search actually
-has to resolve. A GB10 has now run those rows on the device arm too and they
-agree (#1489); the ONE row of that table the two arms do not share is NaN
-ordering, which the CUDA kernel cannot produce and which #1489 owns.
+**Two contract points decide tokens, and both are pinned by literal cases.** A
+tie resolves to the LOWEST slot, which is `tl.max(..., return_indices=True)`'s
+own rule and is not cosmetic: it picks the next step's PREDECESSOR row too, so it
+moves the whole remaining path rather than one token. An all `-inf` row —
+upstream's fully masked lane — resolves to slot 0 rather than to "no index",
+which is the answer the natural parallel formulation does NOT give unless the
+seed is named. Both arms reach both answers the same way: seed at `-inf` with
+slot index `top_k`, keep only what STRICTLY exceeds the running best (so a NaN
+never wins on either side), then collapse a `top_k` seed to 0. The CUDA arm did
+not do that until W4's fresh review — its per-lane scan carried an equality
+disjunct that let a lane holding `-inf` claim on the `-inf` seed — and `## Owed`
+O11 carries the measurement and the repair.
 
-**The REFUSAL moved again, and the duplicate that made W2's O7 possible is
-gone.** `RefuseDflash2CandidateSelector` is retired. Both propose paths —
-`GPUModelRunner::propose_drafts_block` and `DflashProposeBlock` — now call ONE
-`Dflash2SelectCandidates`, so the sequence a user arrives through and the
-sequence a gate drives are the same implementation rather than two copies. The
-boundary is `RefuseDflash2PathWalk`, and it TAKES the scored lattice: the message
-names how many transitions were scored over how many requests, steps and
-candidates, which tells a user how far the port got and makes the selector's
-execution observable at the call site.
+**THE REFUSAL IS GONE, AND WHAT REPLACES IT POINTS THE OTHER WAY.** W1 refused
+before any weight was read, W2 at the candidate selector, W3 at the path walk;
+each time because a mechanism was missing and because falling back to the DFlash1
+per-slot argmax would SUCCEED — well-formed tokens, a lossless verify, the
+target's tokens still emitted, and only ACCEPTANCE falling, which no token gate
+here can see. Nothing on the greedy arm is missing now, so
+`RefuseDflash2PathWalk` is retired and `RefuseDflash1ArgmaxOnDflash2Block` takes
+its place: it throws when a DFlash2 block reaches the argmax, and it is a no-op
+on every DFlash1 propose. It lives INSIDE the DFlash1 sampler's own closure in
+`propose_drafts_dflash` rather than beside the walk it defends, because a guard
+adjacent to the call site it protects is deleted in the same edit that deletes
+that call site.
 
-**O7 IS DISCHARGED, AND ITS RECORDED REASON WAS WRONG.** W2 said a gate on the
-runner needed an on-disk target plus an on-disk draft through the loader plus a
-populated device KV store, and that this was W4's harness. It needed a fifteen-line
-overload: a way to hand a `DflashDraft` to a `LoadedEngine` built from in-memory
-weights, which is the seam `mtp_weights` already had for exactly this reason.
-`test_dflash2_runner_reach.cpp` now drives a real engine over a synthetic
-Qwen3.5-dense target and an in-memory DFlash2 draft, generates, and reads the walk
-refusal's own text: `scored-transitions=27 requests=1 steps=3 top_k=3`. Those
-counts ARE the selector's output, so one string proves the runner entered
-`propose_drafts_block`, that the block forward ran there, and that the selector
-ran there. Two waves shipped production code nothing could reach because that
-reason went unchallenged; it is corrected in `## Owed` rather than annotated.
+**REACHABILITY IS MEASURED, and "it generated" is deliberately NOT the
+assertion.** Through W3 the gate was the refusal's own text. Now the engine
+generates, and a runner that dropped the DFlash2 arm entirely also generates —
+that is the whole silent-wrong this row exists to remove. So
+`tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` asserts two things an
+argmax fallback cannot produce. It reads the drafts off the production
+`VT_SPEC_TRACE` line at REAL fd 2 (a `std::cerr` rdbuf swap cannot see a
+`std::fprintf(stderr, ...)`, and a capture that could not see the line it exists
+to read would report "the propose did not run"). And it requires those drafts to
+MOVE between two engines that differ ONLY in D9's `output_multiplier` and
+`final_logit_softcapping` — scalars that touch nothing but the candidate VALUES
+the selector's unary term reads, so the block forward, the convolution and the
+block logits are identical between the two runs and the DFlash1 argmax would
+answer the same for both. MEASURED at 2 of 8 blocks differing there and 5 of 6
+over the wider sweep in the model suite, with both counts logged rather than
+assumed.
 
-**D9's scalars are gated against values that DIFFER from the defaults.**
-`z-lab/Qwen3.8-27B-DFlash2` sets neither `output_multiplier` nor
-`final_logit_softcapping`, so a gate built from that draft alone measures the
-default path and reports it as coverage. The model suite drives BOTH arms and
-asserts the exact formula at Muse Glimmer's 0.19611613513818404 and 20.0, in
-upstream's order (multiply first, then cap the SCALED value). It also asserts the
-half that makes them matter: the two scalars touch the UNARY term and not the
-codebook contraction, so the arms do not differ by a monotone rescale — the
-argmax over children FLIPS under some predecessor, which is what moves the path
-the W4 walk takes. The flip counter carries its own precondition, because a
-counter that cannot read zero measures nothing.
+**The mutation set that DOES redden**, each applied with its match count printed,
+each with `compile_rc` printed, each restored byte-for-byte and verified by
+sha256, each followed by a rebuild: dropping the walk's `previous` CARRY (op
+suite 2 cases / 17 assertions red); `>` to `>=` in the argmax, i.e. the tie-break
+(2/3); the all `-inf` collapse answering `K-1` instead of 0 (1/1); the gather
+ignoring the winning slot (4/26); the walk's per-request row indexing (guard
+suite 1/2); DELETING the runner's walk call site (reach suite 2 cases / 5
+assertions red, `24` assertions run against `83` clean because the cases abort on
+the throw); REPLACING the runner's walk with the DFlash1 argmax (reach 1/1 — the
+D9-scalars case, and this is the GUARD-INDEPENDENT reachability proof, because it
+reddens without the guard firing at all); deleting `DflashProposeBlock`'s walk
+call (draft suite 1 case red); restoring the checkpoint-derived `conv_block_size`
+seed (draft suite 1 case / 2 assertions red); breaking the startup notice (reach
+1/1 and routing 1/1); and dropping the `final_out` capture the selector needs
+(reach 2/5).
 
-**The bf16 ROUNDING PLACEMENT has an executing assertion, which is the hole W2's
-second review found in the convolution's evidence.** Upstream materializes two
-bf16 tensors inside the einsum chain and this op rounds at those two points and
-nowhere else; on f32 both roundings are the identity, so no f32 case can see the
-policy. The literals in the lattice suite are chosen so the three candidate
-placements answer differently: ours 7.71875, round-once-at-the-end 7.6875,
-unrounded 7.699830055236816.
+**Two mutations came back GREEN and are recorded as such rather than as passes.**
+Deleting `LoadDflashDraft`'s `conv_block_size = draft->k + 1` leaves every suite
+green, because the only harness that reaches a real engine enters through the
+in-memory `DflashDraft` overload and bypasses that function by construction —
+`## Owed` O5, where W4 also records that the line's failure mode is now a LOUD
+refusal rather than a wrong answer, because `LoadQwen3DFlash` no longer seeds the
+field. And deleting the argmax guard's own call leaves every suite green, which
+is what a guard reachable only under another mutation looks like; its throwing
+arm is gated directly in `test_dflash2_argmax_guard.cpp` and its production value
+is that it converts a deleted call site into a named failure.
 
-**Two things about the upstream head, and one about ours.** The PR head moved to
-`66e5414c6d75a8529473d977f7458c140bbab8a0` (#1404); the selector's math is
-byte-identical at both, and the only two changes are `set_model_tag` (a
-deliberate NON-PORT, D11) and the widened LM-head guard (PORTED, D12). Ours is
-that the LM-head guard is LIVE here rather than decorative: a GGUF target's
-`output.weight` reaches this lane DEQUANTIZED, and the selector consumes the
-target head's EXACT top-K, so `Qwen3DFlashWeights` now carries
-`lm_head_dequantized` and `RefuseQuantizedDflash2LmHead` reads it.
+**What is NOT here, and it is upstream's own polarity at the moved head.** The
+probabilistic draft-sample arm and its realized-q cache are not ported.
+`## Risks/decisions` D13 and `## Owed` O12 carry it: `_generate_draft` calls
+`_cache_draft_logits` only `if self.draft_logits is not None`, which is set only
+for `draft_sample_method == "probabilistic"`, and
+`vllm::ParseSpeculativeConfigJson` refuses that value BY NAME here against a
+verify that is accept-iff-equal. Landing it would land two mechanisms no
+production entry point can reach. The half of `draft_logits_spec` this engine CAN
+honour is honoured — `None` for greedy, so no proposal distribution is allocated
+and no realized score is cached on the arm that ships — and that is the reverse
+of `19c93519`, where DFlash2 forced the allocation unconditionally.
 
-**O8 is ANSWERED, not deferred.** The context-KV precompute applies no
-convolution, and the reviewer asked whether that stays equivalent now that a
-convolution exists. It does, because it is not a shortcut: upstream's
-`precompute_and_store_context_kv` projects every layer's context K/V from one
-shared `rms_norm(context_states, hidden_norm)` too, `DFlash2Qwen3Model` does not
-override it, and `DFlash2Speculator` inherits the propose that calls it. Our
-`PrecomputeContextKVDevice` is the port of that function and not a divergence
-from it.
+**And the T>0 walk was never inverse CDF.** `## Upstream chain` said so from the
+row's opening brief until this wave; at both heads the non-greedy branch draws
+GUMBEL-MAX noise keyed by the candidate token ids. It is corrected in place
+rather than annotated, because a wave scoped to write an inverse-CDF walk would
+have written the wrong thing. `## Upstream chain`'s six-item enumeration of the
+speculator's head move was RE-READ against the two blobs and is correct; the one
+correction is a SEVENTH item in the base class (`draft_logits_spec`) and the
+`+24 / −6` file it lives in, which the table did not list.
 
-**FIVE gate weaknesses were found BY the mutation pass, not by reading, and all
-five are repaired.** W2 recorded three of the same kind; this is the fourth
-consecutive wave on this row where running the mutation found something reading
-the test could not. Four were found by the wave's own pass and the fifth by its
-fresh review, and it is counted here rather than filed elsewhere because the
-count is the point: reading did not find any of them. Each came back GREEN and
-had to be fixed before the wave could land:
+**W4'S FRESH REVIEW RETURNED FAIL, AND THE REPAIR IS IN THE SAME WAVE.** One
+MEDIUM, three LOW and one INFO, all repaired here rather than deferred, because
+each is a gate that could not say how.
 
-- **The two CODEBOOKS were swappable at load.** Exchanging the
-  `predecessor_codebook` and `successor_codebook` reads in `LoadQwen3DFlash`
-  compiled clean and left EVERY suite in this repository green. The two share a
-  shape, so the swap loads, scores every transition with the roles reversed, and
-  is invisible: the verify is lossless, the emitted tokens stay the target's,
-  only acceptance falls. Repaired by asserting the loaded BYTES against the
-  fixture's own two generators, which is a non-circular check on which tensor
-  landed where.
-- **The selector-key requirement was gated by an INCIDENTAL throw.** The case
-  that erases `selector_rank` used a bare `CHECK_THROWS`, and it passed with the
-  guard removed — because an absent key leaves `rank` at 0 and the
-  `hidden_projection` shape check then throws for an unrelated reason. A gate
-  that cannot tell the refusal it means from another one measures nothing.
-  Repaired by asserting the message.
-- **The selector SHAPE assertions were unexercised.** Removing them left every
-  suite green; a transposed codebook is a tensor that still loads and still
-  produces finite scores. Repaired with a case that writes one.
-- **The `lm_head_dequantized` CARRY was ungated.** Making
-  `LoadGgufSharedEmbedAndHeadBf16` always report `false` left every suite green,
-  so D12's guard had a live trigger that nothing proved was connected to it.
-  Repaired with a two-arm case over a real GGUF fixture — bf16 head and Q8_0
-  head — because a carry that always reported `true` would satisfy the DFlash2
-  guard while refusing every bf16 GGUF target the DFlash1 lane has shipped.
-- **And the LINK between those two ends was ungated too — the fifth, found by
-  the wave's FRESH REVIEW after the four above were repaired.** Deleting the
-  THIRD ARGUMENT of
-  `shared.LoadInto(&…embed_tokens, &…lm_head, &…lm_head_dequantized)` in
-  `LoadDflashDraft` compiled clean and left all 38 dflash/gguf suites green after
-  a full `libvllm` relink, including `test_qwen3_dflash2_draft` 214/214 and
-  `test_gguf_keep_quant` 6093/6093, every one `Status: SUCCESS!`. The wave gated
-  the setter (which reddens) and the reader (gated directly) and not the wire
-  between them, which is what makes D12's guard live. The cause was a defaulted
-  parameter — `bool* head_was_quantized = nullptr` — so the deletion silently
-  turned the carry off. Repaired by REMOVING the default rather than by adding a
-  case: both callers now name the argument and dropping it is a compile error.
-  Recorded in `## Owed` O5, which is where the two remaining ungated
-  `LoadDflashDraft` lines live.
+*The MEDIUM was a prose guarantee with nothing behind it.* `src/vt/ops.cpp`
+carries a written note above the walk's `[B,L,K,K]` check saying that BOTH
+trailing axes are checked because they are the predecessor axis and the child
+axis and inferring one from the other would admit a lattice indexed the wrong
+way round. The reviewer proved that unmeasured: dropping either conjunct, and
+deleting the whole `VT_CHECK`, each compiled clean and left all four suites
+green. The mechanism is generic and worth carrying forward — the case built a
+`{B,L,K,K}` tensor with `Contig(...)` and then wrote `bad.shape[2] = K - 1`,
+which desynchronises the strides, so `Tensor::IsContiguous()` turned false and
+`contiguous tensors required` threw FIRST, and a bare `CHECK_THROWS` cannot tell
+two guards apart. Both axes are now driven by GENUINELY CONTIGUOUS wrong-extent
+lattices (`{B,L,K,K-1}` and `{B,L,K-1,K}`, built with matching strides, over a
+buffer sized for the full lattice so a deleted guard reads in bounds and simply
+fails to throw) and matched with `CHECK_THROWS_WITH_AS(..., doctest::Contains(
+"scores must be [B,L,K,K]"), std::runtime_error)`. All three mutations now
+redden: child conjunct 1 case / 1 assertion, predecessor conjunct 1/1, whole
+check 1/2.
 
-**The mutation set that DOES redden**, each restored byte-for-byte and verified
-by sha256, each with its compile status printed and its application checked at
-the BYTE level rather than by `git diff` (three of these files are new in this
-wave and untracked, and `git diff --stat` prints nothing for an untracked file —
-an applied-check that cannot see the change it checks): the lattice's bf16
-rounding placement; the anchor arm; the predecessor off-by-one; the unary
-broadcast axis; the top-k tie-break; the org-vocab padding mask; the org-vocab
-rebase; `output_multiplier`; `final_logit_softcapping`; the ORDER of those two;
-the sample-row gather; the `input_embedding_scale` refusal; the dequantized-head
-guard and its carry; the selector-key requirement; the codebook shapes; the
-codebook roles; the RUNNER's `Dflash2SelectCandidates` call; the runner's whole
-DFlash2 arm; the runner's walk refusal; the runner's `final_out` capture; and
-`DflashProposeBlock`'s own call. It does NOT redden for the TWO lines inside
-`LoadDflashDraft` that no entry point this repository can drive reaches:
-`conv_block_size = k + 1` and the conv-geometry notice beside it. Both are O5,
-which the wave's first draft of this sentence named as one line. The third
-DFlash2 line in that function — the `lm_head_dequantized` carry — was ungated
-too, and is now a compile error to delete rather than a mutation the inventory
-has to cover.
+*The reviewer also asked whether the sibling shared the weakness. It did.*
+`tests/vt/test_ops_dflash2_selector_edges.cpp` carried two bare `CHECK_THROWS`,
+each answered by a neighbouring guard rather than by the one it named — deleting
+the selector's own `[B,L,K,K]` output-lattice check alone left the suite green.
+It is repaired in the same shape and in the same wave: every refusal matched on
+its message, plus two contiguous wrong-extent output views. Deleting that check
+now reddens 1 case / 2 assertions.
 
-**The repair delta adds three mutations of its own and removes one vacuous
-assertion.** Reverting the NaN comparator still reds the CPU literal case
-(counts above). Forcing the device-case exclusion `RunsOnCuda` to `true` reds it,
-and forcing it to `false` reds it — a filter that matched nothing would put the
-NaN row back on a device that cannot answer it, and one that matched everything
-would leave both device cases asserting nothing, and neither shape can fail on a
-host with no `nvcc`, so both are asserted on the CPU arm. Every arm printed
-`compile_rc=0`, every mutation printed its MATCH COUNT before the build, and
-every source was restored `sha256`-verified. The removal is
-`CHECK(flips >= 0)` in `test_qwen3_dflash2_draft.cpp`, which no `int` counter
-could violate and which existed only to give a doctest `INFO` something to attach
-to; the INFO is scoped to the block and stays live for the per-block
-`count_flips(sp, sp) == 0` precondition below it. Putting the five copies back
-moves that suite from `26 cases / 232 assertions` to `26 / 237`, all passing,
-which is what shows the deletion took those five and nothing else.
+*The three LOW findings.* `Dflash2WalkPath`'s candidate-set check and its
+i32-range refusal were both ungated — deleted together they compiled clean and
+left every suite green — and are now gated by message, reddening 1 case / 2
+assertions each and 1/4 together. The `tests/CMakeLists.txt` comment above the
+renamed suite still described the W2 refusal and is rewritten to describe the
+inverse guard the file now holds. And the CUDA lane comparator was NOT bit-exact
+with the CPU arm on a NaN-bearing row, against four written claims that it was;
+`## Owed` O11 carries the measurement, the one-disjunct mechanism, the repair,
+and why narrowing was rejected in favour of it.
 
-**THE KERNELS HAVE NOW RUN ON A DEVICE, and one row of one table disagreed.**
-The operator took a lease on `dgx:gpu0` (GB10, sm_121a, `nvcc` 13.0) and ran the
-DFlash2 suites at this row's W3 head `b29b6f886`:
-[#1489](https://github.com/mudler/vllm.cpp/issues/1489). `BUILD_RC=0`,
-`COMPILE_ERRORS=0`, and — the precondition without which a green proves nothing
-here — **zero `no CUDA backend; skipping` lines**, with
-`test_ops_topk_values_indices` reporting 562 device assertions against 202 on the
-CPU-only build. **O6 is DISCHARGED**: W2's convolution and both W3 ops compile,
-and five of the six suites pass. **The tie divergence O10 called the real risk
-did NOT materialise** — the straddling group, the group larger than k, the ties
-inside the kept set and the `-inf`-saturated row all agree across the two
-algorithms.
+*The INFO.* `docs/FEATURES.md` carried no DFlash2 entry at all while `STATUS.md`
+and `docs/SPECULATIVE-DECODING.md` both said a DFlash2 draft drafts; this is the
+wave where it starts drafting, so the entry is added rather than left to W5. And
+`## Gates` G2 and the `**Oracle**` paragraph name PR head `19c93519` while the
+port mirrors `66e5414c` — defensible, because the greedy answer is identical at
+both, but it was not STATED as a choice. It is now, with W6 named as the owner
+of the reconciliation.
 
-**What failed is NaN ordering, and it is repaired by NARROWING the gate rather
-than by recording the divergence again.** `test_ops_topk_values_indices` read
-`7 cases | 5 passed | 2 failed`, `assertions: 562 | 550 passed | 12 failed`,
-`Status: FAILURE!`, every one of the twelve on the literal row
-`"NaN sorts first, as torch.topk does"`, including the direct cross-arm pair
-`gpu.indices[i] == cpu.indices[i]` reading `2 == 1`. The CUDA arm cannot select a
-NaN at all: `TopKValuesIndicesRowKernel`'s bracket uses `fmaxf`/`fminf`, which
-return the non-NaN operand, and its survivor pass tests `r[j] > thr`, which is
-false for a NaN. So W3 shipped a suite that reds on any CUDA build, while
-`include/vt/ops.h` asserted an ordering no shipped backend delivers — two results
-for one rule, which AGENTS.md `## Gates` does not permit. The row is now excluded
-BY NAME from both device cases and kept on the CPU arm where it is the
-guarantee; `ops.h` states the asymmetry beside the contract; and #1489 owns
-reconciling the kernel, which needs a lease and is not attempted from a host with
-no `nvcc`. Nothing a user can obtain changes: no shipped path feeds this op a NaN
-logit.
+**Owed after W4:** O5 (item 2, the loader's conv-geometry notice; item 1 is
+structurally discharged and its remaining gap is stated precisely), O9
+(`input_embedding_scale` still REFUSED — W4 re-asked and the wave does not make
+it reachable), O10 (the CUDA top-k's NaN ordering, owned by
+[#1489](https://github.com/mudler/vllm.cpp/issues/1489)), O11 (the walk's CUDA
+arm, written and never compiled here) and O12 (the probabilistic arm). O6, O7 and
+O8 stay discharged.
 
-**Owed, and none of it is a claim wearing a pass.** O5 (`LoadDflashDraft` carries
-TWO ungated DFlash2 lines, not one — `conv_block_size = k + 1` and the
-conv-geometry notice — because the new harness enters through the in-memory
-overload and bypasses that function by construction; its third line, the
-`lm_head_dequantized` carry, was ungated as well and is now structurally
-undeletable, and deleting the notice narrowed the startup discriminator from
-`conv_taps > 0` to the declared architecture), O9 (`input_embedding_scale` is
-REFUSED rather than implemented, because no published checkpoint can reach an
-implementation and a silent omission is the defect class this row exists to
-remove), and O10 (reduced to ONE measured item: the CUDA top-k does not order NaN
-first, owned by #1489, with the compaction's silent `slot >= k` truncation still
-named and still unexhibited). O6 is DISCHARGED.
-
-**One user-facing message in the loader said the opposite of the other, and the
-stale one named W3.** `LoadDflashDraft` still appended "the candidate selector is
-NOT implemented and this draft will be refused by name at its first propose
-(SPEC-DFLASH2 W3, #1314)" to its conv-geometry line — the wave that shipped the
-selector, named as still owing it — while `CheckDflash2DraftArm`'s notice, in the
-same file and correct, said the selector runs and the PATH WALK is W4's. A user
-loading a real DFlash2 directory got both. Neither gate could see the second one,
-because the harness that reads `cerr` enters through the
-in-memory `LoadedEngine` overload. D10 pays for the moved refusal WITH that
-notice, so this was the obligation D10 records and not a wording problem. The
-boundary now has one owner: `CheckDflash2DraftArm` runs ahead of every path that
-reaches `LoadDflashDraft` and its notice is gated in two suites, so the loader
-line prints only the resolved conv geometry, which is the one thing it knows.
-
-**THE TIE CASES DID NOT RUN WHERE THE TIE RISK IS.** O10 named the top-k's tie
-handling as the port's real divergence risk and said the hand-written cases would
-exercise it once the CUDA arm could run. They could not: every one of them called
-a helper that builds a CPU queue, and the single device case ran four LCG shapes
-under a comment claiming the generator repeats values at that width. It does not
-— reproduced in exact float32, in Python and again in C++ which agree, those four
-shapes hold 513/513, 128/128, 200/200 and 64/64 DISTINCT values per row, with the
-k-th largest at multiplicity 1 everywhere, and the bulk-sort case's `{5,257,16}`
-is the same. The literals now live in one `LiteralRows()` table that BOTH arms
-iterate — the CUDA arm skipping the single NaN row it does not implement — and
-both assert the literals rather than each other, because two implementations
-agreeing on a wrong tie rule is exactly what asserting one against the other
-cannot catch. #1489 then RAN that table on a GB10, which is the run this
-paragraph was written in anticipation of: the tie rows agreed.
-
-**And the CPU comparator was undefined behaviour on a NaN row.**
-`if (src[a] != src[b]) return src[a] > src[b]; return a < b;` makes NaN compare
-EQUIVALENT to every value while those values are not equivalent to each other —
-an intransitive equivalence, which is not a strict weak ordering and is UB in
-`std::partial_sort` rather than a merely surprising answer. NaN now sorts FIRST
-on the CPU arm, which is `torch.topk(largest=True)`'s own order, and a table row
-pins it: before the fix that row returned `{2, 1, 3}` where the contract is
-`{1, 2, 3}`. **The red-before COUNTS W3 first recorded here were wrong**, and the
-wave's fresh review could not reproduce them: the entry said
-`199 assertions / 2 failed`, and reverting the comparator at `b29b6f886` gives
-`7 cases | 6 passed | 1 failed`, `assertions: 202 | 198 passed | 4 failed`,
-`Status: FAILURE!`. Both numbers were wrong; the qualitative claim was not.
-RE-MEASURED in the repair delta, which adds eight CPU assertions of its own, one
-build directory on the CI recipe, x86_64, `compile_rc=0` on every arm and the
-source restored `sha256`-verified: with the comparator reverted,
-`7 cases | 6 passed | 1 failed`, `assertions: 210 | 206 passed | 4 failed`,
-`Status: FAILURE!`, all four `logged: row "NaN sorts first, as torch.topk does"`;
-restored, `7 cases | 7 passed`, `assertions: 210 | 210 passed`,
-`Status: SUCCESS!`. The counts are corrected rather than annotated, because a
-number nobody can reproduce is what the next reader spends a build finding out.
-No shipped path feeds this op a NaN logit, so the row is synthetic in the sense
-the padding row is.
-
-**D9's flip margin was 1 of 9, and it is now 8 of 45.** The half of D9 that
-matters is that the argmax over children FLIPS between the two scalar arms, not
-that the values differ. One synthetic block gives nine predecessor slots and
-exactly one of them flipped, so `> 0` was one arithmetic accident from passing
-for the wrong reason and nothing let a reader see it. The case sweeps five blocks
-now, pins the slot count exactly, floors the flips under the measured values, and
-keeps the zero-reading precondition per block.
-
-Next action: W4, the speculator — the device path walk, the realized-q
-draft-logit cache, and the T>0 inverse-CDF arm. It is the wave that lifts the
-refusal W3 leaves behind, and it inherits a production entry point that a gate
-can now reach.
+Next action: W5, the GGUF drafter arm with its lower bound — the one container
+that still refuses a DFlash2 checkpoint at startup, and the arm most users run.
+Then W6's G2/G3 on a leased GPU against the PR-head oracle. **No throughput
+number is claimed by this wave and none is admissible yet**: `## Gates` defers
+every ratio until G2 and G3 read, and a DFlash2 draft is additionally off the
+paged CUDA-graph fast path, because the selector needs the hidden states of the
+same forward its logits came from.

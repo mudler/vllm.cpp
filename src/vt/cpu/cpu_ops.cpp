@@ -3205,6 +3205,68 @@ void Dflash2SelectorEdgesKernel(Queue&, Tensor& scores, const Tensor& pred_codeb
 }
 
 // ---------------------------------------------------------------------------
+// DFlash2 candidate-selector PATH WALK (SPEC-DFLASH2 W4, #1314) — the
+// AUTHORITATIVE reference. `Dflash2PathWalkArgs` (include/vt/ops.h) carries the
+// contract, the tie-break, the -inf rule and the upstream anchor.
+//
+// Ported from `_selector_walk_kernel`
+// (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:16-79 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`) at
+// `SAMPLE_PROBABILISTIC=False`, where `gumbel_noised_argmax` reduces to
+// `tl.max(logits, axis=0, return_indices=True)`.
+//
+// THE THREE THINGS THIS LOOP HAS TO GET RIGHT, none of which raises when wrong:
+//   * `previous` carries. Step l reads block row `previous`, the slot step l-1
+//     chose. Step 0 reads row 0 because the lattice puts the verified ANCHOR in
+//     every predecessor slot of step 0, so a walk that never carried would agree
+//     with this one at L == 1 and diverge at every longer block.
+//   * the tie-break is the LOWEST slot, which is `tl.max`'s own. It picks the
+//     next step's predecessor row too, so it moves the rest of the path.
+//   * an all -inf row answers slot 0. Upstream reaches that value by loading
+//     masked lanes with `other=-inf`; the seed below (`best = -inf`, `index =
+//     K`, strict `>`, then collapse `K` to 0) is the same answer in a form the
+//     CUDA arm can reduce in parallel and reach bit-identically. Strictness is
+//     also what keeps a NaN from ever winning on either arm, and it is the one
+//     part of the seed the tie rows and the -inf row do NOT measure: a `>=`
+//     reduction answers both of those correctly. The case that fails under
+//     `>=` is `dflash2-path-walk: a NaN never wins a slot`
+//     (tests/vt/test_ops_dflash2_path_walk.cpp).
+//
+// Requests are independent, so the OUTER loop parallelizes and the inner step
+// loop stays serial -- which is exactly the shape upstream's one-program-per-
+// request grid has.
+void Dflash2PathWalkKernel(Queue&, Tensor& tokens, const Tensor& scores,
+                           const Tensor& candidate_ids,
+                           const Dflash2PathWalkArgs& args) {
+  const int64_t B = candidate_ids.shape[0];
+  const int64_t L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  const float* sc = scores.Ptr<float>();
+  const int64_t* cand = candidate_ids.Ptr<int64_t>();
+  int64_t* out = tokens.Ptr<int64_t>();
+  ForRows(B, [&](int64_t b0, int64_t b1) {
+    for (int64_t b = b0; b < b1; ++b) {
+      int64_t previous = 0;
+      for (int64_t l = 0; l < L; ++l) {
+        const int64_t flat = b * L + l;
+        const float* row = sc + (flat * K + previous) * K;
+        float best = -std::numeric_limits<float>::infinity();
+        int64_t index = K;
+        for (int64_t j = 0; j < K; ++j) {
+          if (row[j] > best) {
+            best = row[j];
+            index = j;
+          }
+        }
+        if (index == K) index = 0;  // an all -inf (fully masked) row
+        out[flat] = cand[flat * K + index];
+        previous = index;
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314)
 // — the AUTHORITATIVE reference. `TopKValuesIndicesArgs` (include/vt/ops.h)
 // carries the contract, the tie-break and the upstream anchor.
@@ -3703,6 +3765,9 @@ struct Registrar {
     RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernel)));
+    RegisterOp(OpId::kDflash2PathWalk, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2PathWalkFn>(&Dflash2PathWalkKernel)));
     RegisterOp(OpId::kTopKValuesIndices, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<TopKValuesIndicesFn>(&TopKValuesIndicesKernel)));

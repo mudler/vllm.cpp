@@ -398,12 +398,27 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
       // (`DFlashGroupedConv.__init__` @ the PR head), with the same polarity.
       VT_CHECK(config.hidden_size % out.conv_group_size == 0,
                "qwen3_dflash: conv_group_size must divide hidden_size");
-      // The DEFAULT query block, from the checkpoint. The loader overwrites it
-      // with `1 + k` once the resolved speculative config is known; see the field
-      // comment on Qwen3DFlashWeights::conv_block_size.
-      if (config.raw.contains("block_size") && config.raw.at("block_size").is_number()) {
-        out.conv_block_size = config.raw.at("block_size").get<int64_t>();
-      }
+      // `conv_block_size` IS DELIBERATELY NOT SEEDED HERE, and this is the
+      // SPEC-DFLASH2 W4 (#1314) discharge of `## Owed` O5's first item.
+      //
+      // Through W3 this read `dflash_config.block_size` off the checkpoint so a
+      // direct caller had "a usable value". That is exactly what made
+      // `LoadDflashDraft`'s `draft->weights.conv_block_size = draft->k + 1;`
+      // ungateable: deleting that line left a PLAUSIBLE block behind -- the
+      // checkpoint's default -- so the conv masked its taps against the wrong
+      // one, which is acceptance-only and token-invisible, and W2 measured every
+      // suite staying green under exactly that mutation.
+      //
+      // Upstream never reads the key for this either: it sizes the conv from
+      // `1 + speculative_config.num_speculative_tokens`
+      // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+      // `66e5414c6d75a8529473d977f7458c140bbab8a0`). So the field is left at 0,
+      // the caller that knows the resolved `k` is the only writer, and
+      // `Qwen3DFlashModel`'s existing `VT_CHECK(weights.conv_block_size > 0)`
+      // turns a dropped assignment into a LOUD failure on the first DFlash2
+      // forward instead of a quiet wrong answer. Same remedy W3 applied to the
+      // `lm_head_dequantized` carry: remove the mutation's shape rather than add
+      // a test that has to reach an unreachable function.
     }
     // SPEC-DFLASH2 W3 (#1314): the CANDIDATE SELECTOR's geometry and the two
     // output scalars, read off the same dflash_config. A DFlash2 checkpoint

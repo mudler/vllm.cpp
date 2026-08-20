@@ -1135,19 +1135,46 @@ count. These fields say how complete it is, and how far it carries:
 
 Some phases are **decomposed rather than partitioned**. `denoise` carries one
 `denoise.step` per denoiser evaluation, `decode.video` carries
-`decode.video.chunk` per streamed chunk, `decode.audio` carries
-`decode.audio.mel` and `decode.audio.vocoder`, and a two-stage recipe's
-`phase.prepare` carries `phase.upsample_latent`. Those records are marked
-`nested`, are printed for the reader, and are **excluded from
-`sum_leaf_seconds`** — they are inside a leaf that is already counted, so adding
-them would make `unaccounted_seconds` the residue of double counting instead of
-time nobody named.
+`decode.video.chunk` per streamed chunk and `decode.video.vae` per temporal
+group the tiled VAE decodes, `decode.audio` carries `decode.audio.mel` and
+`decode.audio.vocoder`, `artifacts.frames` carries `artifacts.frames.ppm` per
+write callback, and a two-stage recipe's `phase.prepare` carries
+`phase.upsample_latent`. Those records are marked `nested`, are printed for the
+reader, and are **excluded from `sum_leaf_seconds`** — they are inside a leaf
+that is already counted, so adding them would make `unaccounted_seconds` the
+residue of double counting instead of time nobody named.
 
-A nested record is also what makes a phase NAME checkable. A leaf that claims to
-cover the denoise must enclose its own `denoise.step` records; one that stops
-short of the loop, or that hands the back half of it to a neighbouring name, no
-longer does. The three phases that carry a render each carry such an anchor for
-that reason.
+A nested record is also what makes a phase NAME checkable, and it is checkable in
+four ways rather than one. A leaf that claims to cover the denoise must ENCLOSE
+its own `denoise.step` records; one that stops short of the loop, or that hands
+the back half of it to a neighbouring name, no longer does. The anchor must
+appear once per unit of work the RENDER counted — one `denoise.step` per
+denoiser evaluation, one `decode.video.chunk` per streamed chunk plus the reopen
+after the last one — which is the only check that is not a ratio against the
+leaf, and therefore the only one an anchor that moves WITH its leaf cannot
+satisfy. Two SIBLING anchors under one leaf must appear in the order the render
+runs them, because nothing else distinguishes them: swapping the
+`decode.audio.mel` and `decode.audio.vocoder` names moves 96.8% of that leaf's
+decomposed seconds onto the wrong model and changes nothing any ratio can see.
+And `decode.video.vae` must cover most of the `decode.video.chunk` seconds,
+because a cardinality alone permits the anchor to sit beside the tile decode
+rather than on it. The four phases that carry a render each carry such an anchor.
+
+**What the anchors do NOT prove**, stated here because the table invites the
+opposite reading. An anchor proves that the name is where the work is, in the
+order the render runs it; it does not prove that a name covers the call it is
+named after — that needs a scope inside the callee, and `load.dit` and the two
+`conditioning.*` leaves do not have one. A leaf may also grow over adjacent time
+that NOBODY named, up to its coverage slack: 5.3% for `denoise`, 11% for
+`decode.video`, 1% for `decode.audio` and up to 100% for `artifacts.frames`,
+whose threshold is loose because the leaf is sub-millisecond. Growing over a
+NEIGHBOUR is caught, because the neighbour turns `nested`; growing over
+`unaccounted_seconds` is not.
+
+A record that is `nested` and is NOT one of those anchors means a leaf was left
+open across a phase it does not name: the neighbour turns `nested`, leaves
+`sum_leaf_seconds`, and overlaps nothing, so a table can lose a whole phase to
+its neighbour without any two intervals crossing.
 
 **Do not read a duration here as a measurement of this machine.** Every number
 is wall clock under whatever else the box was doing, which the file does not

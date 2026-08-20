@@ -69,6 +69,7 @@
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/config/offload.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/transformers_utils/model_resolver.h"
 #include <fstream>
 #include "vllm/entrypoints/openai/server_main.h"
 #include "vllm/entrypoints/openai/api_server.h"
@@ -170,6 +171,18 @@ int RunFfmpegArgv(const std::vector<std::string>& args) {
 
 struct Args {
   std::string model_dir;
+  // ENG-HF-MODEL-DOWNLOAD W4 (#1280): what the user TYPED after `--model`,
+  // kept because the resolver replaces `model_dir` with a cache path and the
+  // served model name still defaults to the name the user asked for, exactly
+  // as vLLM's `served_model_name` defaults to `model` (`arg_utils.py:839`).
+  std::string model_argument;
+  // vLLM's own `--revision` (`arg_utils.py:839`, `config/model.py:183`).
+  // Applies to both HuggingFace forms. There is deliberately no inline
+  // `org/repo@rev` syntax, because vLLM does not spell it that way.
+  std::string revision;
+  // vLLM's own `--download-dir` (`config/model.py:183`): the directory that
+  // holds the `models--org--repo` folders.
+  std::string download_dir;
   std::string host = "0.0.0.0";
   int port = 8000;
   std::string tokenizer_config;  // default: <model_dir>/tokenizer_config.json
@@ -399,6 +412,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--enable-force-include-usage]\n"
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
+         "               [--revision REF] [--download-dir DIR]\n"
          "               [--verbose]\n"
          "               [--enable-thinking|--no-enable-thinking]\n"
          "               [--enable-log-requests|--disable-log-requests]\n"
@@ -440,6 +454,11 @@ Args ParseArgs(int argc, char** argv) {
     const std::string flag = argv[i];
     if (flag == "--model") {
       a.model_dir = NextArg(argc, argv, i, argv[0]);
+      a.model_argument = a.model_dir;
+    } else if (flag == "--revision") {
+      a.revision = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--download-dir") {
+      a.download_dir = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--host") {
       a.host = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--port") {
@@ -799,6 +818,43 @@ Args ParseArgs(int argc, char** argv) {
 }
 
 
+// ENG-HF-MODEL-DOWNLOAD W4 (#1280): turn what the user typed after `--model`
+// into a path the loader can open, fetching the checkpoint when it names a
+// HuggingFace repository.
+//
+// THIS IS THE PRODUCTION CALL SITE, and the ONLY one. `vllm-server` reaches
+// `--model` through `VllmServerMain`, so a repository identifier that is not
+// resolved here is not resolved anywhere. Deleting this call leaves the loader
+// opening `org/repo` as a relative path, which is the behavior this row
+// replaces, and the end-to-end case in
+// `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` turns red.
+//
+// `vllm-cli` deliberately does NOT reach it. That example includes `vllm.h` and
+// nothing else, because an example is an application binary interface client
+// only, and this row adds no ABI function, so `vllm-cli --model org/repo` still
+// takes a local path. It is recorded under `## Owed` in
+// `.agents/specs/hf-model-download.md`.
+//
+// An existing directory and an existing `.gguf` file come back unchanged and
+// open no socket, so a local run is byte-identical to the one before this row.
+void ResolveModelArgument(Args& a) {
+  if (a.model_dir.empty()) return;
+  vllm::transformers_utils::ModelResolveOptions opts;
+  opts.revision = a.revision;
+  opts.download_dir = a.download_dir;
+  opts.verbose = a.verbose;
+  const std::string resolved =
+      vllm::transformers_utils::ResolveModelPath(a.model_dir, opts);
+  if (resolved == a.model_dir) return;
+  // The SERVED name stays the name the user asked for. Without this the
+  // default would become the 40 character commit directory the cache happens
+  // to hold, and no client could name the model it just started.
+  if (a.served_model_name.empty()) a.served_model_name = a.model_argument;
+  std::cerr << "server: --model " << a.model_argument << " resolved to "
+            << resolved << "\n";
+  a.model_dir = resolved;
+}
+
 }  // namespace
 
 namespace vllm {
@@ -807,11 +863,12 @@ namespace openai {
 
 int VllmServerMain(int argc, char** argv) {
   try {
-    const Args args = ParseArgs(argc, argv);
+    Args args = ParseArgs(argc, argv);
     if (args.verbose) {
       SetEnvironment("VT_SERVER_VERBOSE", "1");
       std::cerr << "server: verbose stage logging enabled (debug_stages)\n";
     }
+    ResolveModelArgument(args);
     {
       vllm::entrypoints::openai::RequestLogConfig log_cfg;
       log_cfg.enable_log_requests = args.enable_log_requests;

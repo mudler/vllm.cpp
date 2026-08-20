@@ -2206,11 +2206,76 @@ dependencies.
 
 ## HuggingFace cache and credentials
 
-`--model` takes a local directory or a `.gguf` file. It does not take a
-repository identifier yet, and nothing in the tree fetches a checkpoint over the
-network. Row `ENG-HF-MODEL-DOWNLOAD`, issue
-[#1280](https://github.com/mudler/vllm.cpp/issues/1280), adds that, and this
-section records the part of it that has landed.
+`--model` takes four forms, and leaves anything else alone. The two local forms
+are probed FIRST, so a network call can never shadow a path that exists on
+disk.
+
+| `--model` value | What happens |
+|---|---|
+| a directory | Opened as it always was. No network |
+| a `.gguf` file | Opened as it always was. No network |
+| `org/repo` | The checkpoint is fetched into the HuggingFace cache and the snapshot directory is served |
+| `org/repo:Q4_K_M` | ONE GGUF file for that quantization is fetched and served |
+| anything else | The error it produced before, unchanged |
+
+`org/repo` mirrors vLLM, which is the only upstream that defines it.
+`org/repo:QUANT` is llama.cpp's form and vLLM does not implement it, so it is a
+tracked divergence rather than a silent one.
+
+Two flags go with them, spelled as vLLM spells them. There is deliberately no
+inline `org/repo@revision` syntax, because vLLM does not have one.
+
+| Flag | Meaning |
+|---|---|
+| `--revision <ref>` | A branch, a tag, or a 40 character commit. Applies to both hub forms |
+| `--download-dir <path>` | The directory that holds the `models--org--repo` folders. Overrides the cache root below |
+
+This is the SHAPE of a run on a machine that holds no checkpoint. The repository
+name is an illustration: no fetch from the live hub has been gated in this tree
+yet, because this build speaks no transport layer security and the hermetic
+suites run against an in-process fake hub. The online gate is owed by W5 of
+`.agents/specs/hf-model-download.md`.
+
+```sh
+vllm-server --model Qwen/Qwen3-0.6B --port 8000
+curl localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-0.6B","prompt":"hello","max_tokens":16}'
+```
+
+The name a client puts in `"model"` is the name you typed, not the commit
+directory the cache happens to hold.
+
+**`vllm-server` is the only entry point that resolves a repository identifier.**
+`vllm-cli` and the C ABI's `vllm_model_load` still take a local path, because an
+example is an application binary interface client only and this work adds no ABI
+function. It is recorded under `## Owed` in
+`.agents/specs/hf-model-download.md`.
+
+The fetch is TWO PHASE. The configuration JSON, the tokenizer and the shard
+index come first, and the weights follow, so a repository that is not a model
+fails after a few hundred kilobytes rather than after sixty gigabytes. It is
+also INDEX DRIVEN: when the repository ships a `model.safetensors.index.json`,
+the exact file names in its `weight_map` are fetched, so a published
+checkpoint's duplicate-format `original/` directory is never requested. Where
+there is no index, `*.safetensors` is preferred over `*.bin` and only the first
+of the two that matches is fetched.
+
+A transfer resumes. A partial file is kept as `{blob}.incomplete` and the next
+run asks for `Range: bytes=N-`. **A server that answers that request with `200`
+and the whole file is refused, not appended to**: appending a whole body to a
+partial file writes the first N bytes twice, and a corrupt weight still emits
+tokens, so nothing downstream would notice. Delete the named `.incomplete` file
+and run again to start over. `Ctrl-C` cancels and keeps the partial file.
+
+Nothing takes the name of a finished file until it has proven itself from its
+own bytes: a safetensors satisfies `8 + header_len + max(data_offsets[1]) ==
+file_size`, and a GGUF is opened by this project's own reader, which validates
+every tensor span against the real file size. A `Content-Length` that matches is
+not accepted as proof on its own.
+
+`--verbose` prints one line per file, and one lock is taken per repository so
+two servers started at once against one cache do not write one blob twice.
 
 The library now reads the HuggingFace environment. The values below are resolved
 in `vllm/transformers_utils/hf_hub` and `vllm/transformers_utils/hf_cache`, and
@@ -2230,12 +2295,14 @@ The cache is HuggingFace's documented layout,
 `huggingface_hub` cache is read rather than re-downloaded. A repository holding
 more than one snapshot resolves to the one written most recently.
 
-Reading that layout is what the server does today. Writing into it is landed
-code with no caller yet: where the file system holds no symbolic link, which is
-the case for a CIFS mount and can be the case for the `/cache` container volume,
-a snapshot entry will become a real file, and the switch will be logged one time
-for each cache directory it happens in. The fetcher that calls it is W3 of the
-row, so nothing prints that line at this commit.
+The server reads that layout and now writes it. Where the file system holds no
+symbolic link, which is the case for a CIFS mount and can be the case for the
+`/cache` container volume, a snapshot entry becomes a real file, and the switch
+is logged one time for each cache directory it happens in.
+
+A cached blob is named by the object identifier the listing carried, and by the
+commit plus the repository-relative path when it carried none. `--verbose` says
+which of the two the run used.
 
 A repository listing is refused, rather than partly used, when it fails either
 of two integrity checks. An object identifier given to two entries that disagree
@@ -2263,9 +2330,11 @@ against nothing, and it cannot stand in as the reference for the entries that
 follow it, so a mirror named by `HF_ENDPOINT` cannot switch the check off by
 omitting one field.
 
-Two limits are worth stating plainly. No command-line surface reaches any of
-this yet, so setting `HF_TOKEN` today changes nothing a server does. And the
-DFlash draft path, which is the one caller that already resolves a repository
+Two limits are worth stating plainly. This build speaks plain hypertext
+transfer protocol only, so an `https` endpoint is refused with a message naming
+the build options that would add transport layer security rather than with a
+connection error; point `HF_ENDPOINT` at an `http` mirror until that lands. And
+the DFlash draft path, which is the other caller that resolves a repository
 identifier against the cache, still reads `$HOME/.cache/huggingface/hub` and
 ignores `HF_HOME`. Both are recorded under `## Owed` in
 `.agents/specs/hf-model-download.md`.
@@ -3012,10 +3081,12 @@ a stop token early.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`) |
+| `--model <dir\|file.gguf\|org/repo\|org/repo:QUANT>` | (required) | A local directory or `.gguf` file, opened as before, or a HuggingFace repository, which is fetched into the cache. The local forms are probed first, so a network call can never shadow a path on disk. See [HuggingFace cache and credentials](#huggingface-cache-and-credentials) |
+| `--revision <ref>` | repository default branch | A branch, a tag, or a 40 character commit for a `--model org/repo`. vLLM's own flag; there is no inline `org/repo@rev` syntax |
+| `--download-dir <path>` | the resolved HuggingFace cache root | The directory that holds the `models--org--repo` folders. vLLM's own flag |
 | `--host H` | `0.0.0.0` | Bind host |
 | `--port P` | `8000` | Bind port |
-| `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
+| `--served-model-name N` | model dir basename, or the `org/repo` you typed | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
 | `--block-size N` | `32` | KV block size. **Must be a multiple of 16** — the attention backends' `get_kv_cache_shape` refuses anything else, and the server now rejects it at startup rather than throwing during engine init |
 | `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |

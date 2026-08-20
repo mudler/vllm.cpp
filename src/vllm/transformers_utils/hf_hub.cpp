@@ -74,73 +74,6 @@ bool IsSafeEntryPath(const std::string& path) {
   return true;
 }
 
-struct ParsedUrl {
-  std::string scheme;
-  std::string host;
-  int port = 0;
-  std::string path;  // always begins with '/'
-};
-
-// Mirrors llama.cpp `common/http.h:33-98 @ b10451`, narrowed to what an
-// endpoint needs: no user information, because a hub endpoint carries none.
-ParsedUrl ParseUrl(const std::string& url) {
-  ParsedUrl parts;
-  const size_t scheme_end = url.find("://");
-  if (scheme_end == std::string::npos) {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
-                             "' has no scheme; expected http:// or https://");
-  }
-  parts.scheme = url.substr(0, scheme_end);
-  std::string rest = url.substr(scheme_end + 3);
-
-  const size_t slash = rest.find('/');
-  if (slash != std::string::npos) {
-    parts.host = rest.substr(0, slash);
-    parts.path = rest.substr(slash);
-  } else {
-    parts.host = rest;
-    parts.path = "/";
-  }
-
-  std::string port_text;
-  if (!parts.host.empty() && parts.host.front() == '[') {
-    const size_t close = parts.host.find(']');
-    if (close == std::string::npos) {
-      throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
-                               "' has an unterminated IPv6 host");
-    }
-    const std::string after = parts.host.substr(close + 1);
-    if (!after.empty() && after.front() == ':') port_text = after.substr(1);
-    parts.host = parts.host.substr(1, close - 1);
-  } else {
-    const size_t colon = parts.host.find(':');
-    if (colon != std::string::npos) {
-      port_text = parts.host.substr(colon + 1);
-      parts.host = parts.host.substr(0, colon);
-    }
-  }
-
-  if (!port_text.empty()) {
-    parts.port = std::stoi(port_text);
-  } else if (parts.scheme == "http") {
-    parts.port = 80;
-  } else if (parts.scheme == "https") {
-    parts.port = 443;
-  } else {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
-                             "' uses the unsupported scheme '" + parts.scheme +
-                             "'");
-  }
-  if (parts.host.empty()) {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url + "' has no host");
-  }
-  return parts;
-}
-
-std::string FormatHost(const std::string& host) {
-  return host.find(':') != std::string::npos ? "[" + host + "]" : host;
-}
-
 // GET a JSON document from the hub. `repo_id` appears in every refusal, because
 // a message that does not name the repository cannot be acted on.
 json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
@@ -158,21 +91,11 @@ json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
         "holds the repository.");
   }
 
-  const ParsedUrl url = ParseUrl(opts.endpoint);
+  const HfParsedUrl url = HfParseUrl(opts.endpoint);
 
-#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
-  if (url.scheme == "https") {
-    throw std::runtime_error(
-        "vllm.cpp: this build cannot speak HTTPS, so it cannot reach " +
-        opts.endpoint +
-        ". Rebuild with -DVLLM_CPP_HF_DOWNLOAD=ON and one of "
-        "-DVLLM_CPP_OPENSSL=ON (default, needs the OpenSSL development files) "
-        "or -DVLLM_CPP_BUILD_BORINGSSL=ON, or set HF_ENDPOINT to an http:// "
-        "mirror.");
-  }
-#endif
+  HfRefuseHttpsWithoutTls(opts.endpoint);
 
-  httplib::Client client(url.scheme + "://" + FormatHost(url.host) + ":" +
+  httplib::Client client(url.scheme + "://" + HfFormatHost(url.host) + ":" +
                          std::to_string(url.port));
   // NO `set_follow_location(true)`. httplib copies the whole request, headers
   // included, when it follows a redirect (third_party/httplib/httplib.h:7774)
@@ -253,6 +176,79 @@ std::vector<std::pair<std::string, std::string>> CollectRefs(const json& doc) {
 }
 
 }  // namespace
+
+HfParsedUrl HfParseUrl(const std::string& url) {
+  HfParsedUrl parts;
+  const size_t scheme_end = url.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+                             "' has no scheme; expected http:// or https://");
+  }
+  parts.scheme = url.substr(0, scheme_end);
+  std::string rest = url.substr(scheme_end + 3);
+
+  const size_t slash = rest.find('/');
+  if (slash != std::string::npos) {
+    parts.host = rest.substr(0, slash);
+    parts.path = rest.substr(slash);
+  } else {
+    parts.host = rest;
+    parts.path = "/";
+  }
+
+  std::string port_text;
+  if (!parts.host.empty() && parts.host.front() == '[') {
+    const size_t close = parts.host.find(']');
+    if (close == std::string::npos) {
+      throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+                               "' has an unterminated IPv6 host");
+    }
+    const std::string after = parts.host.substr(close + 1);
+    if (!after.empty() && after.front() == ':') port_text = after.substr(1);
+    parts.host = parts.host.substr(1, close - 1);
+  } else {
+    const size_t colon = parts.host.find(':');
+    if (colon != std::string::npos) {
+      port_text = parts.host.substr(colon + 1);
+      parts.host = parts.host.substr(0, colon);
+    }
+  }
+
+  if (!port_text.empty()) {
+    parts.port = std::stoi(port_text);
+  } else if (parts.scheme == "http") {
+    parts.port = 80;
+  } else if (parts.scheme == "https") {
+    parts.port = 443;
+  } else {
+    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
+                             "' uses the unsupported scheme '" + parts.scheme +
+                             "'");
+  }
+  if (parts.host.empty()) {
+    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url + "' has no host");
+  }
+  return parts;
+}
+
+std::string HfFormatHost(const std::string& host) {
+  return host.find(':') != std::string::npos ? "[" + host + "]" : host;
+}
+
+void HfRefuseHttpsWithoutTls(const std::string& url) {
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+  if (url.rfind("https://", 0) == 0) {
+    throw std::runtime_error(
+        "vllm.cpp: this build cannot speak HTTPS, so it cannot reach " + url +
+        ". Rebuild with -DVLLM_CPP_HF_DOWNLOAD=ON and one of "
+        "-DVLLM_CPP_OPENSSL=ON (default, needs the OpenSSL development files) "
+        "or -DVLLM_CPP_BUILD_BORINGSSL=ON, or set HF_ENDPOINT to an http:// "
+        "mirror.");
+  }
+#else
+  (void)url;
+#endif
+}
 
 bool IsValidHfRepoId(const std::string& repo_id) {
   // Mirrors llama.cpp `common/hf-cache.cpp:121-142 @ b10451`: base characters

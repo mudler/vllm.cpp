@@ -538,7 +538,7 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "  wrote %d frames (%dx%d @ %d fps) + %s (%d Hz)\n", out.frame_count,
                out.width, out.height, out.fps, out.audio_path, out.sample_rate);
-  // WHERE THE RENDER SPENT ITS WALL (ABI v22, issue #1010). This example is a
+  // WHERE THE RENDER SPENT ITS WALL (ABI v23, issue #1010). This example is a
   // client of `vllm.h` and nothing else, so it names the table by asking the
   // handle rather than by guessing a filename beside the frames. Printed on the
   // shipped default: a render long enough to need the table is one nobody knew

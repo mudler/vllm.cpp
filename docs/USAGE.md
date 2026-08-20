@@ -1054,7 +1054,7 @@ Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 Every completed LTX-2.5 render writes **`<workdir>/phase-log.json`** beside the
 frames, on the shipped default and behind no flag, and `ltx2-gen` prints its
 path on the line after `wrote N frames`. An embedder gets the same path from
-`vllm_video_last_phase_log(engine)` (ABI v22) rather than by guessing a filename.
+`vllm_video_last_phase_log(engine)` (ABI v23) rather than by guessing a filename.
 
 **"Completed" is the whole of it, and it is worth reading literally.** The table
 is written by the success path and by nothing else: the two write sites sit
@@ -3464,7 +3464,8 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v19 | Per-modality multimodal input limits |
 | v20 | Speech and music generation through `vllm_speech_*` / `vllm_synthesize` |
 | v21 | Device selection on the speech lane (`vllm_speech_model_params.device`, `vllm_speech_engine_device`) |
-| v22 | The render phase table: `vllm_video_last_phase_log` names the `phase-log.json` a completed `vllm_video_generate` wrote |
+| v22 | A second GGUF for the multimodal projector (`vllm_model_params.mmproj_path`) |
+| v23 | The render phase table: `vllm_video_last_phase_log` names the `phase-log.json` a completed `vllm_video_generate` wrote |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.

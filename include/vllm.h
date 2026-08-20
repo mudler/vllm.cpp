@@ -270,7 +270,7 @@ extern "C" {
  * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
  * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
  * acoustic half are still host reference loops (see docs/FEATURES.md). */
-/* v22 — vllm_video_last_phase_log, WHERE A RENDER SPENT ITS WALL (issue #1010,
+/* v23 — vllm_video_last_phase_log, WHERE A RENDER SPENT ITS WALL (issue #1010,
  * row LTX25-DEVICE-RESIDENCY stage W0).
  *
  * Before this the LTX-2.5 render path emitted one line per render, so a render
@@ -291,8 +291,18 @@ extern "C" {
  * why the path is a QUERY on the handle rather than a new member on
  * vllm_video_result. Growing an OUTPUT struct is the one append a caller cannot
  * absorb by zero-initializing, since the library writes the field with its own
- * sizeof. A family that emits no table returns NULL. */
-#define VLLM_ABI_VERSION 22
+ * sizeof. A family that emits no table returns NULL.
+ *
+ * IT IS v23 AND IT WAS WRITTEN AS v22. `vllm_model_params.mmproj_path` (issue
+ * #821) took v22 on `main` while this branch was open, and both features had
+ * merged into a tree that defined 22 twice. Two additions under one version is
+ * not a textual conflict a merge tool resolves — the number is the caller's only
+ * question ("does the library I loaded have this?"), and one that answers yes
+ * for a feature the build does not carry is worse than no version at all. So
+ * this one moved. The dependent sites moved with it: the >= floor in
+ * `tests/capi/test_capi.cpp`, the table row and the version line in
+ * `docs/USAGE.md`, and the surface row in `docs/FEATURES.md`. */
+#define VLLM_ABI_VERSION 23
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -1086,7 +1096,7 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
  * is caller storage. NULL is a no-op. */
 VLLM_API void vllm_video_result_free(vllm_video_result* out);
 
-/* v22: the phase table the LAST completed vllm_video_generate on this handle
+/* v23: the phase table the LAST completed vllm_video_generate on this handle
  * wrote — an absolute path to a JSON file holding, per phase, a monotone
  * timestamp, a duration, and peak host and device byte counts, plus the wall
  * and the time the named phases did not cover.

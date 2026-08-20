@@ -1485,7 +1485,7 @@ VLLM_API vllm_video_params vllm_video_params_default(void) {
 struct vllm_video_engine {
   std::unique_ptr<vllm::multimodal::VideoEngine> engine;
   std::string family;
-  // v22 (#1010): the phase table the last completed generation wrote. Held on
+  // v23 (#1010): the phase table the last completed generation wrote. Held on
   // the HANDLE rather than appended to vllm_video_result, because growing an
   // output struct is the one append a caller cannot absorb by
   // zero-initializing — the library writes the field with its own sizeof.

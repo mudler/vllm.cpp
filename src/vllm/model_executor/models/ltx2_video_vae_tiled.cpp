@@ -41,6 +41,16 @@
 
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+// W0 of LTX25-DEVICE-RESIDENCY (#1010). The one include in this file that is not
+// about decoding video, and it is here deliberately: `decode.video` is the leaf
+// W5's lever is measured against, and every other assertion the gate makes about
+// that leaf is a RATIO taken against the leaf itself. A sub-scope opened in the
+// DRIVER, two statements from the leaf's own `Open`, moves with the leaf and
+// constrains nothing; a sub-scope opened HERE, around the tile decode the render
+// actually spends the seconds in, does not. `render_phase_log.h` is a
+// process-wide instrument rather than a multimodal model, and it is the first
+// thing under `multimodal/` this directory includes.
+#include "vllm/multimodal/render_phase_log.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -235,9 +245,27 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
 
     ChunkBuffer buffer;
     buffer.Allocate(config.out_channels, curr_stop - curr_start, full_h, full_w);
-    std::vector<float> curr_weights =
-        AccumulateTemporalGroup(config, weights, latent, latent_channels, latent_t, latent_h,
-                                latent_w, noise, timestep, group, &buffer, complementary);
+    // W0 (#1010): THE VIDEO DECODE'S OWN WORK, bounded by production events on
+    // both ends. One record per temporal group, which is one record per chunk
+    // the sink is handed, so the count is a quantity the instrument cannot move.
+    // Nested, so the table's sum does not change.
+    //
+    // THE PLACEMENT IS GATED BY A COVERAGE FLOOR AND NOT BY THE COUNT ALONE.
+    // Moving this scope one statement up, onto `buffer.Allocate`, keeps the
+    // count, the `nested` flag and the containment in a chunk window — and a
+    // fourth fresh review measured what that costs: `decode.video.vae = 0.000 s`
+    // beside a five-millisecond `decode.video`, with the tile decode inside no
+    // sub-scope, both gates green. `test_ltx2_video`'s containment case now
+    // requires these records to cover at least half of the render's
+    // `decode.video.chunk` seconds (measured 91.1%-98.6%), so an anchor that
+    // sits BESIDE the work rather than ON it is a red.
+    std::vector<float> curr_weights;
+    {
+      const ::vllm::multimodal::phase::Scope vae_phase("decode.video.vae");
+      curr_weights =
+          AccumulateTemporalGroup(config, weights, latent, latent_channels, latent_t, latent_h,
+                                  latent_w, noise, timestep, group, &buffer, complementary);
+    }
 
     if (have_previous) {
       if (previous_stop > curr_start) {

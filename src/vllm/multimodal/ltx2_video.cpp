@@ -413,7 +413,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 889 899 900 968 1064 1080 1128 1221 1247 1355 1397 1439 1441
+// 890 900 901 969 1065 1081 1147 1151 1244 1270 1378 1420 1462 1464
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -422,6 +422,7 @@ const char* const kKnownLoadExtras[] = {
     "upsampler_path",            kLtx2DurationHeadPathExtra,
     kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
     kLtx2NegativePromptEmbedsExtra, kLtx2NegativeAudioPromptEmbedsExtra,
+    kLtx2CheckpointClassExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -1124,6 +1125,28 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
          "undistilled weights returns a clip of the right size, frame count and sample rate. "
          "The adapter runs on the phases the recipe's `loras` scope names, which for these "
          "pipelines is stage 2 alone.");
+  }
+  // ── the CHECKPOINT CLASS the pipeline can run (#1137) ─────────────────────
+  //
+  // THE PRODUCTION CALL SITE for row LTX25-CHECKPOINT-CLASS. Deleting this one
+  // line is the reachability mutation the row records: every test that gates the
+  // refusal enters through `vllm_video_engine_load` and reds without it.
+  //
+  // PLACED AFTER THE ADAPTER REFUSAL ABOVE, deliberately. A two-stage load
+  // carrying no adapter fails BOTH checks, and the adapter message names a
+  // missing file the caller can go and fetch, while a class message would send
+  // the same reader to a different question. Order decides which one they read.
+  //
+  // THE DECISION IS NOT HERE. `Ltx2CheckpointClassRefusal` lives beside the
+  // recipe table it reads (`ltx2_pipeline.cpp`), so the table and the rule that
+  // consumes it cannot drift into two files. This site supplies the two facts
+  // the table does not hold: what the caller DECLARED, and whether the load
+  // carries an adapter.
+  {
+    const std::string class_refusal = Ltx2CheckpointClassRefusal(
+        im.recipe, im.pipeline_kind, VideoExtra(params.extras, kLtx2CheckpointClassExtra),
+        !VideoExtra(params.extras, kLtx2LoraPathExtra).empty());
+    if (!class_refusal.empty()) Fail(class_refusal);
   }
   im.max_phase = ExtraInt(params.extras, kLtx2MaxPhaseExtra, -1);
   if (im.max_phase >= static_cast<int64_t>(im.recipe.phases.size())) {
@@ -4571,6 +4594,24 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // statement. A `decode.video` leaf that closes before its chunk arrives, or
   // that is re-labelled after one, no longer contains the chunk it produced.
   // Nested, so the sum does not move.
+  //
+  // ITS OPEN IS STILL THE STATEMENT NEXT DOOR, and the third fresh review showed
+  // what that costs: move the two `Close`s below to after the PPM write and the
+  // leaf AND its anchor grow together, so containment and coverage both hold
+  // while the whole writer is charged to `decode.video`. Two things close it.
+  // `decode.video.vae` is opened inside `Ltx2ConvVideoDecodeTiled` around
+  // `AccumulateTemporalGroup`, so `decode.video` has one sub-scope whose ends
+  // are both production events; and the gate asserts that nothing but an anchor
+  // is emitted NESTED, which is what a swallowed `artifacts.frames` becomes.
+  //
+  // AND THE VAE SUB-SCOPE IS HELD BY A COVERAGE FLOOR, not by its existence. A
+  // fourth fresh review moved that scope off `AccumulateTemporalGroup` and onto
+  // the `buffer.Allocate` beside it — seven lines — and the table reported
+  // `decode.video.vae = 0.000 s` beside a five-millisecond `decode.video`, with
+  // the tile decode inside no sub-scope at all and both gates green, because the
+  // vae anchor was checked for cardinality, `nested` and containment and its
+  // DURATION was compared against nothing. The gate now requires it to cover at
+  // least half of this render's `decode.video.chunk` seconds.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
   Ltx2VideoDecodeStreaming(
@@ -4586,6 +4627,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         shape.t = chunk.frames.frames;
         shape.h = chunk.frames.height;
         shape.w = chunk.frames.width;
+        // W0 repair (#1010, third fresh review): THE WRITER'S OWN ANCHOR, bound
+        // to the `WriteFileBytes` loop rather than to the scope beside it.
+        //
+        // Without it the writer is held by nothing. Empty this leaf and leave
+        // the `write(2)`s inside `decode.video` — which is what happens if the
+        // two `Close`s above move below the loop — and the table charges W5's
+        // lever with the cost of the writes while `artifacts.frames` reports
+        // four microseconds for nine files. Every interval assertion still
+        // holds, because the leaves stay disjoint and nothing nests. This scope
+        // moves with the WRITES, so a leaf that stops covering them stops
+        // containing it. Nested, so the sum does not move.
+        phase::Scope ppm_phase("artifacts.frames.ppm");
         for (int64_t f = 0; f < chunk.frames.frames; ++f) {
           char name[64];
           // The GLOBAL frame index, which the chunk carries so the writer does not
@@ -4599,8 +4652,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
           WriteFileBytes(JoinPath(gen.output_dir, name),
                          MiniMaxH3WritePpmFrame(chunk.frames.data, shape, f));
         }
+        ppm_phase.Close();
         rendered_frames += chunk.frames.frames;
         rendered_channels = chunk.frames.channels;
+        // COUNTED BY THE RENDER, not by the instrument (#1010, third fresh
+        // review). W0's containment case needs one number about this decode that
+        // no phase-scope placement can move; this is it, and it sits beside the
+        // frame count for the same reason that one does.
+        im.trace.video_decode_chunks += 1;
         write_phase.Close();
         decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
         chunk_handle = phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);

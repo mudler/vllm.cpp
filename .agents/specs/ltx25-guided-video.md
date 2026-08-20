@@ -487,19 +487,23 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
 - ~~**The device-resident `ptb` and `mod` passes.**~~ CLOSED by §12 on
   2026-08-19. `Ltx2DitForwardDevice` takes `perturbations` and honours all four
   fields, and the two refusals that stood in for it are gone.
-- **Link B of §12.8 — the device branch of the x0 model's ternary is entered by
-  no test on a box without an accelerator.** `Ltx2VideoEngine::Load` refuses
-  `device != 0` where no accelerator backend is registered, and no CI job here
-  has a GPU runner, so mutation D10 (drop `p` from that one branch) is GREEN on
-  this host. Owned by this row under
-  [#1092](https://github.com/mudler/vllm.cpp/issues/1092) until a leased run
-  renders `one_stage` on `device = 1` at the model's own guider defaults and
-  records `dit_forwards == 4 * dit_evaluations`. The same shape
+- **[#1426](https://github.com/mudler/vllm.cpp/issues/1426) — link B of §12.8.**
+  The device branch of the x0 model's ternary is entered by no test on a box
+  without an accelerator, so mutation D10 (drop `p` from that one branch) is
+  GREEN here while its sibling D11 (drop it from both) is RED.
+  `Ltx2VideoEngine::Load` refuses `device != 0` where no accelerator backend is
+  registered and no CI job here has a GPU runner, so this is a missing RUNNER and
+  not a missing test. Owned by this row. Closes on one leased run of `one_stage`
+  on `device = 1` at the model's own guider defaults recording
+  `dit_forwards == 4 * dit_evaluations`. The same shape
   [#1131](https://github.com/mudler/vllm.cpp/issues/1131) records for
   MiniMax-Music3.
 - **The 2.0x forward-count cost of §12.5, unmeasured on hardware.** 120 forwards
-  where #1375 measured 60, at ~162 s/forward on GB10 at 1024x576. Arithmetic,
-  not a measurement: nothing here ran it.
+  where [#1375](https://github.com/mudler/vllm.cpp/issues/1375) measured 60, at
+  ~162 s/forward on GB10 at 1024x576. Arithmetic, not a measurement: nothing here
+  ran it. Closes with the same leased run #1426 needs, and
+  [#1413](https://github.com/mudler/vllm.cpp/issues/1413)'s per-forward `last=`
+  tick supplies the duration directly (§12.10).
 - **The other four pipelines** — `a2vid_two_stage`, `ti2vid_two_stages`
   ([#1093](https://github.com/mudler/vllm.cpp/issues/1093)),
   `ti2vid_two_stages_hq` (#921),
@@ -867,24 +871,40 @@ arm's text.
 **T4 — reachability, and its limit.** See §12.8. The end-to-end device case is
 conditional on an accelerator backend and this host has none.
 
-### 12.7 The mutations this gate must survive
+### 12.7 The mutations, and what each measured
 
-| # | Mutation | Must go RED at |
-|---|---|---|
-| D1 | `Ltx2DitForwardDevice` accepts `perturbations` and ignores it | T1 non-vacuity, every row |
-| D2 | the device self-attention ignores `all_perturbed` | T1 video / audio self-attn rows |
-| D3 | the device arm ignores `video_cross_attn_skip_all` | T2 A2V row |
-| D4 | the device arm ignores `audio_cross_attn_skip_all` | T2 V2A row |
-| D5 | the device arm SWAPS which flag gates which direction | T2 both rows |
-| D6 | the perturbed path returns `v` WITHOUT `to_out` | T1 agreement, every perturbed row |
-| D7 | the perturbed path skips the per-head gate | T1 agreement, every perturbed row |
-| D8 | the wrong-length vector check deleted | T3 |
-| D9 | the `vx_pre` / `ax_pre` snapshot moved INSIDE the direction guards | T2 both rows |
-| D10 | the production call site drops `p` on the device arm | see §12.8 — GREEN on a box with no accelerator, and that is reported rather than hidden |
+Eleven, each carrying four facts: whether it BUILT, the compiler error count,
+`git diff --stat` proving it applied, and the exit status captured directly. All
+eleven built clean at `compile_err=0`. Every one restored the file byte-for-byte,
+verified by sha256, **and rebuilt the target** — see the note below.
 
-Each mutation reports four facts: `BUILT=YES/NO`, the compiler error count,
-`git diff --stat` proving it applied, and the failing assertion by name. A
-mutation that fails to build reads exactly like a passing test.
+| # | Mutation | Gate | diff | Result |
+|---|---|---|---|---|
+| D1 | `Ltx2DitForwardDevice` accepts `perturbations` and IGNORES it — the pre-change state | `test_ltx2_device` | 1+/1- | **RED** exit 1, 2 cases / 31 assertions. `CHECK(mv > kDeviceRoundOff)`, `CHECK(ma > kDeviceRoundOff)`, `CHECK(av < kDeviceRoundOff)` |
+| D2 | the device self-attention ignores `all_perturbed` | `test_ltx2_device` | 1+/1- | **RED** exit 1, 1 case / 12 assertions. `CHECK(mv > kDeviceRoundOff)` |
+| D3 | the device arm ignores `video_cross_attn_skip_all` | `test_ltx2_device` | 1+/1- | **RED** exit 1, 2 cases / 9 assertions. `CHECK(bv < kBf16RoundOff)`, `CHECK(mv > kDeviceRoundOff)` |
+| D4 | the device arm ignores `audio_cross_attn_skip_all` | `test_ltx2_device` | 1+/1- | **RED** exit 1, 2 cases / 7 assertions. `CHECK(MaxAbsDiff(v2a_off.audio, base.audio...) > 0.0)` |
+| D5 | the device arm SWAPS which flag gates which direction | `test_ltx2_device` | 2+/2- | **RED** exit 1, 2 cases / 8 assertions. `CHECK(MaxAbsDiff(a2v_off.video, base.video...) > 0.0)` AND `CHECK(v2a_off.video == base.video)` — both halves, which is what separates a swap from an omission |
+| D6 | the perturbed path returns `v` WITHOUT `to_out` | `test_ltx2_device` | 1+/1- | **RED** exit 1, 1 case / 6 assertions. `CHECK(av < kDeviceRoundOff)` |
+| D7 | the perturbed path skips the per-head gate | `test_ltx2_device` | 1+/1- | **RED** exit 1, 1 case / 4 assertions. `CHECK(av < kDeviceRoundOff)` |
+| D8 | the wrong-length vector check deleted | `test_ltx2_device` | 1+/2- | **RED** exit 1, 1 case / 2 assertions. `CHECK(msg.find("neither empty nor one entry per block") != npos)` and `REQUIRE(sentence(msg).size() > 20)` |
+| D9 | the `vx_pre` / `ax_pre` snapshot moved INSIDE the direction guards | `test_ltx2_device` | 4+/0- | **RED** exit 1, 4 cases / 13 assertions. Caught by the PRE-EXISTING golden cases at `:338`, `:347`, `:356`, `:368`, `:380`, `:426` — `CHECK(r.audio < kDeviceRoundOff)` |
+| D10 | the production call site drops `p` on the DEVICE branch alone | `test_ltx2_video` | 1+/1- | **GREEN** exit 0, 88 cases / 2755 assertions. The residual; §12.8 |
+| D11 | the production call site drops `p` on BOTH branches — the reachability mutation | `test_ltx2_video` | 3+/2- | **RED** exit 1, 2 cases / 3 assertions. `CHECK(MaxAbsDiffOf(t.video_first_perturbed, t.video_first_cond) > 1e-6 * latent_span)`, the same for `video_first_modality`, and `CHECK(n.video_first_perturbed != n.video_first_cond)` |
+
+**D11 had to be re-formed to be a result at all.** Its naive form — delete `p`
+from both call sites — leaves the lambda parameter unused and
+`-Werror=unused-parameter` refuses the build (`ltx2_video.cpp:3851`, 1 compile
+error). A non-building mutation reads exactly like a passing test, so it was run
+in the form that builds: `(void)p;` plus `nullptr` at both call sites. The
+compiler diagnostic is a second, weaker instrument on the same defect and is
+recorded as one rather than counted as the gate.
+
+**Restoring the source is not enough, and this was measured.** After D1 restored
+`ltx2_device.cpp` byte-for-byte, a direct run of `test_ltx2_device` still read
+2 failed / 31 assertions, because the BINARY still carried the mutation. The
+harness now rebuilds the target after every restore. A stale binary reports the
+mutation as if it were the tree.
 
 ### 12.8 Reachability, and what this host cannot prove
 
@@ -898,23 +918,72 @@ with `Ltx2StreamDitToDevice` (`:847`) -> `Generate` -> the phase loop ->
 `modality_scale = 3.0`, so `p` is non-null on the `ptb` and `mod` passes without
 any request extra.
 
-**What a test can enter through, here.** Nothing. `Ltx2VideoEngine::Load` refuses
-`device != 0` unless the platform seam resolves a REGISTERED accelerator backend
-(`ltx2_video.cpp:749-758`), and it refuses a partial backend beside that
-(`:779-788`). This build registers neither, no CI job in `.github/workflows/ci.yml`
-has a GPU runner, and this row is explicitly barred from taking a lease. So the
-last link of the chain — the ternary that selects `Ltx2DitForwardDevice` over
-`Ltx2DitForward` — is not executable on this host or in CI.
+**What a test can enter through, here, and what it cannot.** The chain is entered
+end to end by the existing `one_stage` guidance case, and the perturbation
+argument on it is gated: mutation D11 deletes `p` from the x0 model's argument
+list and the focused gate goes RED. What is NOT executable here is the RESIDENCY
+branch. `Ltx2VideoEngine::Load` refuses `device != 0` unless the platform seam
+resolves a REGISTERED accelerator backend (`ltx2_video.cpp:749-758`), and it
+refuses a partial backend beside that (`:779-788`). This build registers neither,
+no CI job in `.github/workflows/ci.yml` has a GPU runner, and this row is
+explicitly barred from taking a lease. So the ternary that selects
+`Ltx2DitForwardDevice` over `Ltx2DitForward` always takes its second branch here,
+and D10 — which drops `p` from the first branch alone — is GREEN.
 
 **Stated as a result, not as an omission.** Mutation D10 — delete `p` from the
-device branch of the x0 model's ternary — is **GREEN** here, and it is green for
-lack of hardware rather than for lack of a test. The three links, separately:
+device branch of the x0 model's ternary — is **GREEN** here (exit 0, 88 cases /
+2755 assertions), and it is green for lack of hardware rather than for lack of a
+test. Its sibling D11, which deletes `p` from BOTH branches, is **RED** (exit 1,
+2 cases / 3 assertions). The three links, separately:
 
 | Link | What it is | Gated by |
 |---|---|---|
-| A | entry point -> the x0 model, carrying `p` | the existing end-to-end `one_stage` guidance case, on the host arm. Deleting `p` from the lambda's argument list reds it. |
-| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **nothing on this host.** The residual. |
-| C | `Ltx2DitForwardDevice` honours `p` | T1, T2, T3 — new, and RED before this change |
+| A | entry point -> the x0 model, carrying `p` | the end-to-end `one_stage` guidance case, which enters through `LoadVideoEngine` + `Generate` — what `include/vllm.h`'s `vllm_video_engine_load`, the server and `ltx2-gen` all reach (`test_ltx2_video.cpp:365-372`). Mutation D11 deletes `p` from the lambda's argument list and it is RED. |
+| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **nothing on this host.** The residual, and it is ONE branch of one ternary whose other branch link A gates. |
+| C | `Ltx2DitForwardDevice` honours `p` | T1, T2, T3 — new, and RED before this change (D1-D9) |
+
+**D11 is the reachability mutation this row can run, and it is RED.** Deleting
+the perturbation from the production call site — the argument list the entry-point
+chain reaches — reds the focused gate, so the test enters through the production
+path rather than constructing the seam by hand. D10 narrows that to the one thing
+it cannot cover: deleting `p` from the DEVICE branch alone, which no runner here
+executes.
+
+Note that `-Werror=unused-parameter` is a second, weaker instrument on D11: the
+first form of that mutation did not build at all, because dropping `p` from both
+branches leaves the lambda parameter unused. That is a compiler diagnostic and not
+a gate, so D11 is run in the form that BUILDS — otherwise the mutation reads
+exactly like a passing test.
+
+**One approach was considered and REJECTED, recorded so the next reader does not
+re-derive it.** A synthetic accelerator — a `vt::Backend` reporting
+`UnifiedMemory() == true` and registered from a static initializer — would get
+every `vt::` op for free through `RegisterReferenceTier`
+(`op_provider.h:220-233`), which installs the CPU kernel on any unified-memory
+device at `kReferenceTierPriority`. It would make `im.on_device` true, enter the
+first branch, and turn D10 RED. Three measured facts close it:
+
+1. **`vt::DeviceType` is a closed 7-value enum** (`device.h:16-28`) with no spare
+   slot, so a synthetic device has to impersonate a real vendor — `kXPU`,
+   `kVULKAN` — and every `CurrentPlatform()` answer in the binary changes with
+   it. `test_ltx2_video`'s "device 1 runs on the resolved accelerator, refused by
+   name without one" would silently take its other branch, on a file with a
+   recorded 88-case baseline.
+2. **The `kLtx2` glue table has no public registration API.** `Ltx2Device` and
+   `Ltx2DeviceKernelsAvailable` (`ltx2_kernels.h:149-151`) are readers; the
+   tables are registered inside each backend's own translation unit. `Glue()`
+   returns `nullptr` for an unregistered type and the forward dereferences it.
+   The reference tier covers `vt::` ops and not this table.
+3. **It would prove the predicate, not the residency.** The dispatch is
+   `im.on_device`, set from `params.device != 0`. A fake device satisfies that
+   predicate while running the CPU kernels — which is exactly the substitution
+   `ltx2_video.cpp:749-758` refuses BY NAME, on the ground that serving the CPU
+   forward behind an accelerator handle makes every later "it ran on the GPU"
+   claim false. A gate built on it would measure the label.
+
+So link B stays open and owned by
+[#1426](https://github.com/mudler/vllm.cpp/issues/1426) rather than closed by an
+instrument that answers a different question.
 
 Link C is what did not exist at all before this section, and it is the whole of
 what a box without a GPU can hold. Link B is one argument in one ternary whose
@@ -933,6 +1002,60 @@ test" — and naming it is the difference between a staged link and dead code.
 - Stop if any perturbation shape cannot be served on the device arm. Refuse it by
   name and record it; never run an unperturbed forward where the recipe asked for
   a perturbed one.
+
+### 12.10 The concurrent live-tick lane, and whether a perturbed forward is its own tick
+
+`LTX25-RESIDENCY-W0-LIVE` ([#1413](https://github.com/mudler/vllm.cpp/issues/1413),
+pull request [#1419](https://github.com/mudler/vllm.cpp/pull/1419), stacked on
+[#1408](https://github.com/mudler/vllm.cpp/pull/1408)) adds `phase::Tick`
+immediately ABOVE the `Ltx2DitForwardDevice` call this section edits — one stderr
+line per DiT forward, emitted BEFORE the forward so a run killed inside forward 37
+says 37. It is on `origin/row/LTX25-RESIDENCY-W0-LIVE` at `bca9b2911`, based on
+`row/LTX25-RESIDENCY-W0`, and neither is on `origin/main` yet.
+
+`git merge-tree` against this branch reports **exactly one conflict**, in
+`src/vllm/multimodal/ltx2_video.cpp`, and it is textual rather than semantic:
+their 24-line tick block lands at `:3984-4007` of their tree, in the same lines
+this change deleted the `VT_CHECK(!im.on_device || p == nullptr, ...)` from.
+
+**Resolution: keep both, tick first.** Take their whole tick block verbatim, drop
+the `VT_CHECK` this change removes, and take this change's argument list on the
+forward below it. The tick must stay immediately above the forward, which is the
+ordering their spec argues for and this row has no reason to move. This change
+contributes one argument to the call below and the deletion of a refusal above,
+and nothing else in that lambda — deliberately, so the conflict stays resolvable
+by inspection rather than by re-deriving either side.
+
+**A perturbed forward is the SAME tick, not a separate one, and not an
+attribute.** Three reasons, and the first is decisive:
+
+1. **Their code already says so.** The tick's own comment refuses a denominator
+   on the forward counter precisely because "`Ltx2GuidedDenoise` decides how many
+   forwards each call is (one to four — cond, uncond, ptb, mod,
+   `denoisers.py:100-137`)". It counts `im.trace.dit_forwards + 1`, which is the
+   counter this row's passes increment. Nothing needs to change on either side.
+2. **Upstream counts passes, not perturbation kinds.** `_guided_denoise` runs one
+   transformer call over a batch of `n` passes and `chunk(n)`s it back; a
+   perturbed pass is one row of that batch and not a different operation.
+3. **The tick exists to project remaining time, and a non-uniform unit breaks
+   that.** A perturbed forward costs almost the same as an unperturbed one: it
+   skips `to_q`, `to_k`, the q/k RMSNorms and the scores of the perturbed
+   self-attentions only, which is a fraction of one block, and the `mod` pass
+   skips two cross-attention branches out of a block's six attentions. Splitting
+   the counter would make `last=` compare unlike things.
+
+**What this row DOES change for that lane, and it is the important half:** the
+structural forward count. #1375's 60 (`30 x 2`) was a property of the
+configuration the refusal forced, not of the sampler. On a guided arm at the
+model's own defaults it is `30 x 4 = 120`, so a projection built on 60 will
+under-read by half. Their tick is already denominator-free for this exact reason,
+so nothing there is wrong — but any reader who has 60 memorised from #1375 now
+has a stale number.
+
+**What their lane will finally give this row:** `last=` on each tick is a
+per-forward duration measured live, which is the number §12.5 currently has to
+compute rather than measure. Once both land, one leased run reads the perturbed
+and unperturbed forward costs directly and closes the §12.5 owed line.
 
 ## Now
 

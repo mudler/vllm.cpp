@@ -122,6 +122,7 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_validate_container_image
   test_release_index
   test_release_metadata
   test_release_accelerator_metadata

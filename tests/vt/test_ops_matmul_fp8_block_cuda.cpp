@@ -6,14 +6,34 @@
 // 5559679229bc961848b121ccdeaa8fa5d79bec98, asserted as the local checkout's
 // HEAD before every anchor below was read.
 //
-// THIS FILE HAS NEVER RUN AGAINST A DEVICE. It is registered, it builds, and on
-// a host with no CUDA device it SKIPS — and a skip is not a pass. #1189 M5's
-// spec records the on-hardware leg as OWED under `## Owed`, in the commit body
-// and in the pull request body, and no number produced here appears in any
-// document as a measurement. Whoever first runs it on a leased sm_12xa box owns
-// filling in that section.
+// THIS FILE HAS RUN AGAINST A DEVICE, ON SEVEN SHAPES. The suite ran UNPATCHED
+// on `dgx:gpu0` (NVIDIA GB10, driver 580.173.02, compute capability 12.1) in an
+// `rc` lease on 2026-08-20, at tree 7481a2eecbb26b3d5c977e8707b0384994caf136 —
+// an ancestor of `main` — and reported 5 cases, 136 assertions, 0 failed, with
+// REFERENCE_TIER_LINES=0 and TEST_RC=0. A device-free run of this file prints
+// 41, so 95 of those assertions ran on the board, and that delta is the
+// discriminator between a run and a skip. #1189 M5's spec records it under
+// `## Owed`, and the user-facing documentation for Qwen3.8-27B-FP8 states the
+// same 5/136/0 result. No path to it is named here on purpose: a docs
+// reorganisation does not open this file, and no checker ties the two. On a host with no
+// CUDA device this file still SKIPS, and a skip is still not a pass — the four
+// NO CUDA DEVICE messages below say exactly that, per case.
 //
-// WHAT IT MEASURES WHEN IT DOES RUN. The CUDA kernel against
+// WHAT THAT RUN DOES NOT ESTABLISH, written here so that no later reader widens
+// it. There is NO TOKEN GATE: `Qwen/Qwen3.8-27B-FP8` has not been run against
+// the pinned oracle on this arm, on any device, and that leg stays OWED — see
+// #1189. There is NO SPEED CLAIM of any kind: the lease took no clock control,
+// recorded no contention and had no denominator, which are the three things
+// `.agents/benchmarking.md` requires before a ratio means anything. And the
+// correctness evidence covers the SEVEN SHAPES THAT WERE ACTUALLY RUN — G7's
+// six servable grid entries, which between them span all three tile configs and
+// both the swapped and the unswapped path, plus G2's {32,512,7168} under
+// upstream's own fixture — and says nothing about a shape outside those seven.
+// The capability gap STANDS: DSV3's `kv_a_proj_with_mqa` is N=576 and this arm
+// cannot serve it on sm120 until CUTLASS's sm120 collective supports partial
+// scale blocks, which is an upstream limitation and not a defect in this tree.
+//
+// WHAT IT MEASURES ON A DEVICE. The CUDA kernel against
 // `vt::MatmulFp8BlockScaled`'s CPU arm — the reference #1189 M2 landed
 // (`770e49486`) precisely to be this comparison's oracle. That arm is upstream's
 // `native_w8a8_block_matmul` (tests/kernels/quant_utils.py) ported whole, so
@@ -453,8 +473,12 @@ TEST_CASE("G6 every shape this file drives gets the refusal the collective gives
 //      value comparison this case exists for still happens and still fails
 //      loudly if the kernel regresses on a shape it CAN serve.
 //
-// Half 2 is NOT evidence that the arm works: it has never run on a device. The
-// row's `## Owed` says so and nothing here softens it.
+// Half 2 HAS now run on a device, once. Its {32,512,7168} was one of the seven
+// shapes compared against the CPU reference in the 2026-08-20 GB10 run the row's
+// `## Owed` records. That is evidence the kernel computes correct values on
+// those seven shapes and on nothing else: it is not a token gate, it is not a
+// speed number, and it does not reach a shape outside the grid. Nothing here
+// softens any of the three.
 TEST_CASE("G2 upstream's CUTLASS case is refused by name, and its criterion runs on the "
           "nearest servable N") {
   // Half 1's host tier runs EVERYWHERE, because the predicate is host-side and a
@@ -463,8 +487,9 @@ TEST_CASE("G2 upstream's CUTLASS case is refused by name, and its criterion runs
   CHECK(Fp8BlockScaledRefusalFor(up.n, up.k, up.block_n, up.block_k) == up.expect);
 
   if (!HasCuda()) {
-    MESSAGE("NO CUDA DEVICE: G2's device half did not run. #1189 M5's on-hardware leg is "
-            "OWED, not passed.");
+    MESSAGE("NO CUDA DEVICE: G2's device half did not run HERE, and a skip is not a pass. "
+            "The on-hardware result is recorded in #1189 M5's `## Owed`: dgx:gpu0 (GB10, cc "
+            "12.1), 2026-08-20, 5 cases / 136 assertions / 0 failed.");
     return;
   }
 
@@ -536,7 +561,9 @@ TEST_CASE("G2 upstream's CUTLASS case is refused by name, and its criterion runs
 TEST_CASE("G7 every tile config matches the CPU reference, and every unservable shape is "
           "refused by name") {
   if (!HasCuda()) {
-    MESSAGE("NO CUDA DEVICE: G7 did not run. #1189 M5's on-hardware leg is OWED, not passed.");
+    MESSAGE("NO CUDA DEVICE: G7 did not run HERE, and a skip is not a pass. The on-hardware "
+            "result is recorded in #1189 M5's `## Owed`: dgx:gpu0 (GB10, cc 12.1), 2026-08-20, "
+            "5 cases / 136 assertions / 0 failed.");
     return;
   }
   uint32_t seed = 100;
@@ -629,7 +656,9 @@ TEST_CASE("G7 every tile config matches the CPU reference, and every unservable 
 // ---------------------------------------------------------------------------
 TEST_CASE("G8 an f32 out is the bf16 epilogue value cast up") {
   if (!HasCuda()) {
-    MESSAGE("NO CUDA DEVICE: G8 did not run. #1189 M5's on-hardware leg is OWED, not passed.");
+    MESSAGE("NO CUDA DEVICE: G8 did not run HERE, and a skip is not a pass. The on-hardware "
+            "result is recorded in #1189 M5's `## Owed`: dgx:gpu0 (GB10, cc 12.1), 2026-08-20, "
+            "5 cases / 136 assertions / 0 failed.");
     return;
   }
   const BlockCase c{8, 512, 1024, 128, 128};
@@ -669,7 +698,9 @@ TEST_CASE("G8 an f32 out is the bf16 epilogue value cast up") {
 // ---------------------------------------------------------------------------
 TEST_CASE("G9 the CUDA arm refuses by name what cutlass cannot implement") {
   if (!HasCuda()) {
-    MESSAGE("NO CUDA DEVICE: G9 did not run. #1189 M5's on-hardware leg is OWED, not passed.");
+    MESSAGE("NO CUDA DEVICE: G9 did not run HERE, and a skip is not a pass. The on-hardware "
+            "result is recorded in #1189 M5's `## Owed`: dgx:gpu0 (GB10, cc 12.1), 2026-08-20, "
+            "5 cases / 136 assertions / 0 failed.");
     return;
   }
   Backend& backend = vt::GetBackend(DeviceType::kCUDA);

@@ -142,7 +142,7 @@ a stop token early.
 |---|---|---|
 | `--model <dir\|file.gguf\|org/repo\|org/repo:QUANT>` | Required except when `--speech-model` selects a speech/music-only server | A local directory or `.gguf` file, opened as before, or a Hugging Face repository, which is fetched into the cache. The local forms are probed first, so a network call can never shadow a path on disk. See [Access Hugging Face checkpoints](../guides/hugging-face-access.md) |
 | `--revision <ref>` | repository default branch | A branch, a tag, or a 40 character commit for a `--model org/repo`. vLLM's own flag, and there is no inline `org/repo@rev` syntax |
-| `--download-dir <path>` | the resolved Hugging Face cache root | The directory that holds the `models--org--repo` folders. vLLM's own flag |
+| `--download-dir <path>` | the resolved Hugging Face cache root | The directory that holds the `models--org--repo` folders. vLLM's own flag. Fetching a repository needs a build that carries transport layer security. See [Access Hugging Face checkpoints](../guides/hugging-face-access.md) for the three build options, the environment variables, and which release lanes carry it |
 | `--host H` | `0.0.0.0` | Bind host |
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename, or the `org/repo` you typed | Model id in `/v1/models` and responses |

@@ -172,6 +172,15 @@ RUN set -eux; mkdir -p /cudart; \
 
 FROM ${UBUNTU_BASE} AS runtime-base
 ARG DEBIAN_FRONTEND=noninteractive
+# libssl3 is what `--model org/repo` needs: the server links libssl/libcrypto for
+# the HuggingFace fetch (ENG-HF-MODEL-DOWNLOAD, #1280) and `huggingface.co`
+# speaks nothing but https. `ca-certificates` below was already here and is the
+# other half: without a trust store the handshake fails even with the library
+# present. `scripts/validate-container-image.py` boots this image against an
+# unknown repository and requires an HTTP STATUS FROM THE HUB, which is the only
+# assertion that separates a working TLS build from one where the option
+# silently resolved OFF. Measured 20 August 2026: the live hub answers 401, not
+# 404, for an unknown repository asked anonymously.
 # ffmpeg is a DELIBERATE divergence from the archive contract's no-vendor rule.
 # An archive is extracted onto a host that has a PATH to inherit; a container
 # has none, so the archive rule would ship a /v1/videos endpoint that can never
@@ -180,6 +189,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       ca-certificates \
       ffmpeg \
       libgomp1 \
+      libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && userdel --remove ubuntu \
     && useradd --create-home --uid 1000 --user-group vllm \

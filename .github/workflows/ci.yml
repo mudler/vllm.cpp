@@ -189,6 +189,7 @@ jobs:
           python3 tests/scripts/test_release_postpublish_audit.py
           python3 tests/scripts/test_check_container_matrix.py
           python3 tests/scripts/test_check_container_workflow.py
+          python3 tests/scripts/test_validate_container_image.py
           python3 tests/scripts/test_release_index.py
       - name: CPU release metadata and tier execution gates fail closed
         run: |

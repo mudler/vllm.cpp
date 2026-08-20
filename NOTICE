@@ -17,6 +17,16 @@ ports, and/or vendors code from third-party projects, including:
   - NVIDIA CUTLASS (BSD-3-Clause) — used for FP4/FP8 GEMM kernels.
   - xgrammar (Apache-2.0) — C++ grammar core, vendored for structured output.
   - cpp-httplib (MIT) and nlohmann/json (MIT) — header-only dependencies.
+  - OpenSSL (Apache-2.0) — a DYNAMIC SYSTEM dependency, not vendored and not
+    redistributed here. The build links it (libssl, libcrypto) when
+    VLLM_CPP_HF_DOWNLOAD and VLLM_CPP_OPENSSL are on, which is what lets the
+    HuggingFace client reach an https endpoint. Its licence travels with the
+    system package, and the release manifest records the linked libraries.
+  - BoringSSL (a mix of OpenSSL/SSLeay, ISC and MIT licences; see its own
+    LICENSE file) — OPTIONAL and STATIC, fetched at configure time only under
+    -DVLLM_CPP_BUILD_BORINGSSL=ON and off by default. When that option is used,
+    BoringSSL is linked into the binary and its LICENSE must be carried with
+    the artifact.
   - google/minja (MIT) - header-only Jinja engine vendored under
     third_party/minja/ (with its LICENSE), used as the chat-template renderer
     in src/vllm/entrypoints/chat_template.cpp.

@@ -332,6 +332,19 @@ Ours, red-first, beyond the ports:
   established that strict token identity is bf16-irreducible on portable
   kernels, so the ratified near-tie gate is the admissible form and a strict
   claim is not.
+  **`19c93519` here is a CHOICE and not a leftover, and W6 owns the final
+  call.** The port mirrors `66e5414c`, which superseded `19c93519` on 2026-08-19
+  ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)), so the gate head and
+  the port head differ by name. It is defensible because the greedy ANSWER is
+  identical at both: the two heads differ in this path only by collapsing the
+  walk's hand-written `temperature == 0.0` and Gumbel branches into one
+  `gumbel_noised_argmax` call, by deleting the private `_selector_tokens` buffer
+  and its `copy_`, and by making the proposal distribution optional and `None`
+  for greedy — none of which a greedy run can observe, and `## Upstream chain`
+  carries the diff. It is stated rather than assumed because a gate head that
+  merely drifted from the port head is how a parity claim quietly stops meaning
+  what it says. W6 takes the gate and reconciles this to ONE head at that
+  point: `66e5414c` if #52816 has not merged, and the merge commit if it has.
 - G3: **acceptance**, measured SAME-TRAJECTORY — both engines teacher-forced on
   identical tokens. `SPEC-DFLASH` D8 spent a whole campaign on an acceptance
   deficit that was a divergent-trajectory measurement confound, and D9 refuted
@@ -356,7 +369,11 @@ engine and are not treated as one.
 vLLM built at `19c93519`, recorded with its measured runtime version, and it is
 a BEYOND-PIN oracle rather than a pin advance. If #52816 merges before the
 implementation lands, the anchors move to the merge commit and this section is
-reconciled rather than reinterpreted.
+reconciled rather than reinterpreted. The head named here is the same deliberate
+choice G2 states, with the same reason and the same owner: the port mirrors
+`66e5414c`, the greedy answer is identical at both heads, and W6 reconciles the
+oracle build to one head when it takes the gate. No oracle has been BUILT at
+either head yet, so nothing is invalidated by moving it.
 
 ## Dependencies
 
@@ -1070,13 +1087,59 @@ list items.
   O6's and O10's. That the kernel compiles at all. And that the PARALLEL
   reduction reaches the SEQUENTIAL rule: the CPU arm scans ascending and keeps
   what strictly exceeds the running best, the CUDA arm strides across lanes and
-  then butterflies, and the two agree only because the lane rule carries the slot
-  index and prefers the LOWER one on an exact tie. Get that comparator wrong in
-  one direction and a tie resolves to the wrong slot, which then selects the
-  wrong PREDECESSOR row and moves every remaining token of the block — and it is
-  acceptance-only and token-invisible, like everything else on this row. The all
-  `-inf` row is the same class: both arms have to answer slot 0 rather than "no
-  index", and they reach it by the same `top_k` seed rather than by coincidence.
+  then butterflies. Get that comparator wrong in one direction and a tie
+  resolves to the wrong slot, which then selects the wrong PREDECESSOR row and
+  moves every remaining token of the block — and it is acceptance-only and
+  token-invisible, like everything else on this row. The all `-inf` row is the
+  same class: both arms have to answer slot 0 rather than "no index", and they
+  reach it by the same `top_k` seed rather than by coincidence.
+
+  **W4's FRESH REVIEW MEASURED THE COMPARATOR WRONG, and the wave repaired it
+  rather than narrowing the claim.** The reviewer emulated the kernel's exact
+  32-lane rule on the host and found the two arms disagreeing on a NaN-bearing
+  row: `[NaN,-inf]` read cpu 0 / cuda 1, `[NaN,-inf,-inf]` cpu 0 / cuda 1, and
+  `[NaN,NaN,-inf]` cpu 0 / cuda 2, while every NaN-free case agreed — the
+  all `-inf` row, the all-NaN row and the forced tie group included. Four written
+  claims said the arms were bit-exact (`include/vt/ops.h`,
+  `src/vt/cpu/cpu_ops.cpp`, `src/vt/cuda/cuda_ops.cu`, `.agents/kernel-matrix.md`
+  row `KERNEL-DFLASH2-PATH-WALK`), and on that row they were not.
+
+  The mechanism is one disjunct. The per-lane scan read
+  `if (v > best || (v == best && (int)j < slot))` against the seed
+  `best = -inf, slot = top_k`. Because `j` only ascends inside a lane, the
+  equality arm is unreachable once the lane has claimed anything; its ONLY
+  reachable effect was at the seed, where a lane holding `-inf` compared equal to
+  the `-inf` seed and claimed a slot the CPU arm's strict scan refuses. On a
+  NaN-free row that is invisible, because a real `-inf` lane and a never-claiming
+  lane both collapse to slot 0 in the end. So the disjunct is DELETED: the lane
+  scan is now strict `>` only, which is the CPU arm's own rule reached the CPU
+  arm's own way, and the lower-slot tie preference stays in the cross-lane
+  BUTTERFLY, where it is genuinely needed because lanes combine out of slot
+  order. The invariant that makes the butterfly safe is now stated beside it:
+  with a strict lane scan, `best == -inf` implies `slot == top_k` on every lane,
+  so the tie arm never compares a real slot against a seed.
+
+  **Narrowing the four claims to "bit-exact on any NaN-free lattice" was the
+  alternative and was rejected.** It would have been true, and no shipped path
+  can feed this op a NaN (the lattice comes from `vt::Dflash2SelectorEdges` over
+  a target LM head), so the reachable behaviour is identical either way. It was
+  rejected because the divergence is a two-token deletion of a provably dead
+  disjunct: recording an accommodation for a defect that costs one line to remove
+  is worse than removing it. That is the difference between this entry and O10,
+  where `TopKValuesIndicesRowKernel` cannot be made NaN-first without a redesign
+  of its pivot bracket, and narrowing was therefore the honest result.
+
+  **What this adds to the debt, precisely.** The CPU half of the strictness claim
+  is now gated and mutation-proven: `dflash2-path-walk: a NaN never wins a slot`
+  (`tests/vt/test_ops_dflash2_path_walk.cpp`) is the case a `>=` reduction fails
+  while still answering the tie rows and the -inf row, and turning `>` into `>=`
+  reddens 3 cases / 5 assertions. The CUDA half is NOT gated here and cannot be:
+  the deleted disjunct has never been compiled, and the CUDA parity case — whose
+  fixture now CHAINS a third forced row, a NaN row at step 2 predecessor 0,
+  reached because the tie group and the -inf row each answer slot 0 — still
+  reports `no CUDA backend; skipping`. So the repair is a source change made on
+  an argument, not on a measurement, and the operator's lease owes the
+  measurement together with everything else in this entry.
 
 - **O12 — the PROBABILISTIC draft-sample arm and its realized-q cache are NOT
   ported.** Owner: `SPEC-ACCEPT-VARIANTS` (`.agents/engine-matrix.md`) for the
@@ -1143,7 +1206,10 @@ upstream's fully masked lane — resolves to slot 0 rather than to "no index",
 which is the answer the natural parallel formulation does NOT give unless the
 seed is named. Both arms reach both answers the same way: seed at `-inf` with
 slot index `top_k`, keep only what STRICTLY exceeds the running best (so a NaN
-never wins on either side), then collapse a `top_k` seed to 0.
+never wins on either side), then collapse a `top_k` seed to 0. The CUDA arm did
+not do that until W4's fresh review — its per-lane scan carried an equality
+disjunct that let a lane holding `-inf` claim on the `-inf` seed — and `## Owed`
+O11 carries the measurement and the repair.
 
 **THE REFUSAL IS GONE, AND WHAT REPLACES IT POINTS THE OTHER WAY.** W1 refused
 before any weight was read, W2 at the candidate selector, W3 at the path walk;
@@ -1222,6 +1288,54 @@ have written the wrong thing. `## Upstream chain`'s six-item enumeration of the
 speculator's head move was RE-READ against the two blobs and is correct; the one
 correction is a SEVENTH item in the base class (`draft_logits_spec`) and the
 `+24 / −6` file it lives in, which the table did not list.
+
+**W4'S FRESH REVIEW RETURNED FAIL, AND THE REPAIR IS IN THE SAME WAVE.** One
+MEDIUM, three LOW and one INFO, all repaired here rather than deferred, because
+each is a gate that could not say how.
+
+*The MEDIUM was a prose guarantee with nothing behind it.* `src/vt/ops.cpp`
+carries a written note above the walk's `[B,L,K,K]` check saying that BOTH
+trailing axes are checked because they are the predecessor axis and the child
+axis and inferring one from the other would admit a lattice indexed the wrong
+way round. The reviewer proved that unmeasured: dropping either conjunct, and
+deleting the whole `VT_CHECK`, each compiled clean and left all four suites
+green. The mechanism is generic and worth carrying forward — the case built a
+`{B,L,K,K}` tensor with `Contig(...)` and then wrote `bad.shape[2] = K - 1`,
+which desynchronises the strides, so `Tensor::IsContiguous()` turned false and
+`contiguous tensors required` threw FIRST, and a bare `CHECK_THROWS` cannot tell
+two guards apart. Both axes are now driven by GENUINELY CONTIGUOUS wrong-extent
+lattices (`{B,L,K,K-1}` and `{B,L,K-1,K}`, built with matching strides, over a
+buffer sized for the full lattice so a deleted guard reads in bounds and simply
+fails to throw) and matched with `CHECK_THROWS_WITH_AS(..., doctest::Contains(
+"scores must be [B,L,K,K]"), std::runtime_error)`. All three mutations now
+redden: child conjunct 1 case / 1 assertion, predecessor conjunct 1/1, whole
+check 1/2.
+
+*The reviewer also asked whether the sibling shared the weakness. It did.*
+`tests/vt/test_ops_dflash2_selector_edges.cpp` carried two bare `CHECK_THROWS`,
+each answered by a neighbouring guard rather than by the one it named — deleting
+the selector's own `[B,L,K,K]` output-lattice check alone left the suite green.
+It is repaired in the same shape and in the same wave: every refusal matched on
+its message, plus two contiguous wrong-extent output views. Deleting that check
+now reddens 1 case / 2 assertions.
+
+*The three LOW findings.* `Dflash2WalkPath`'s candidate-set check and its
+i32-range refusal were both ungated — deleted together they compiled clean and
+left every suite green — and are now gated by message, reddening 1 case / 2
+assertions each and 1/4 together. The `tests/CMakeLists.txt` comment above the
+renamed suite still described the W2 refusal and is rewritten to describe the
+inverse guard the file now holds. And the CUDA lane comparator was NOT bit-exact
+with the CPU arm on a NaN-bearing row, against four written claims that it was;
+`## Owed` O11 carries the measurement, the one-disjunct mechanism, the repair,
+and why narrowing was rejected in favour of it.
+
+*The INFO.* `docs/FEATURES.md` carried no DFlash2 entry at all while `STATUS.md`
+and `docs/SPECULATIVE-DECODING.md` both said a DFlash2 draft drafts; this is the
+wave where it starts drafting, so the entry is added rather than left to W5. And
+`## Gates` G2 and the `**Oracle**` paragraph name PR head `19c93519` while the
+port mirrors `66e5414c` — defensible, because the greedy answer is identical at
+both, but it was not STATED as a choice. It is now, with W6 named as the owner
+of the reconciliation.
 
 **Owed after W4:** O5 (item 2, the loader's conv-geometry notice; item 1 is
 structurally discharged and its remaining gap is stated precisely), O9

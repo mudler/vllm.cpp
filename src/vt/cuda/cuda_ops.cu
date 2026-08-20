@@ -3721,8 +3721,24 @@ void Dflash2SelectorEdgesKernelCuda(Queue& q, Tensor& scores, const Tensor& pred
 // BIT-EXACT with the CPU arm by construction, unlike Dflash2SelectorEdgesKernel:
 // there is no arithmetic here to reorder, only comparisons and a gather. The
 // reduction is seeded the same way on both arms (-inf with slot index `top_k`,
-// strict `>`), which is what makes the all -inf row and the tie rows agree
-// rather than merely usually agreeing.
+// strict `>`), which is what makes the all -inf row, the tie rows and a
+// NaN-bearing row agree rather than merely usually agreeing.
+//
+// WHERE THE TIE RULE LIVES IS NOT ARBITRARY. The per-lane scan is STRICT ONLY,
+// because `j` ascends within a lane and a strict `>` therefore already keeps
+// the LOWEST-indexed maximum -- the CPU arm's answer, reached the CPU arm's
+// way. The lower-slot preference belongs to the cross-lane BUTTERFLY, which
+// combines lane winners in no particular slot order and would otherwise resolve
+// a tie by lane geometry. Until W4's fresh review the lane scan ALSO carried
+// `|| (v == best && j < slot)`. That clause is unreachable once a lane has
+// claimed anything, so its only effect was at the SEED: a lane holding -inf
+// compared equal to the -inf seed and claimed a slot, which the CPU arm's
+// strict scan refuses. On a NaN-bearing row the arms then answered differently
+// (`[NaN,-inf]` read cpu 0 / cuda 1) while every NaN-free row still agreed, so
+// no fixture without a NaN could see it. The clause is deleted rather than the
+// bit-exactness claim narrowed. The deletion is UNVERIFIED on a device -- the
+// authoring host has no `nvcc` -- and is owed with the rest of this arm at
+// `## Owed` O11 of .agents/specs/dflash2-spec-decode.md.
 __global__ void Dflash2PathWalkKernel(int64_t* tokens, const float* scores,
                                       const int64_t* cand, int64_t L, int64_t K) {
   const int64_t b = blockIdx.x;
@@ -3736,14 +3752,19 @@ __global__ void Dflash2PathWalkKernel(int64_t* tokens, const float* scores,
     int slot = static_cast<int>(K);
     for (int64_t j = lane; j < K; j += width) {
       const float v = row[j];
-      // STRICT `>` against the running best, and a lower slot wins an exact tie
-      // -- the same rule the CPU arm's ascending scan produces, expressed so a
-      // tree reduction reaches it too.
-      if (v > best || (v == best && static_cast<int>(j) < slot)) {
+      // STRICT `>` and nothing else, which is the CPU arm's own scan: `j`
+      // ascends, so the first maximum a lane meets is the lowest-indexed one it
+      // holds. A `v == best` arm here would let a lane claim a slot on the -inf
+      // seed, which is where the two arms used to part on a NaN row.
+      if (v > best) {
         best = v;
         slot = static_cast<int>(j);
       }
     }
+    // The lower slot wins an exact tie HERE, because lanes combine out of slot
+    // order. `best == -inf` implies `slot == top_k` on every lane (the strict
+    // scan above never claims on -inf), so the tie arm compares real slots or
+    // two seeds and never a real slot against a seed.
     for (int off = 16; off > 0; off >>= 1) {
       const float ov = __shfl_xor_sync(0xFFFFFFFFu, best, off);
       const int os = __shfl_xor_sync(0xFFFFFFFFu, slot, off);

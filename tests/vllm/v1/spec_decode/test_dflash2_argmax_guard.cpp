@@ -23,6 +23,8 @@
 // argmax must never silently answer for a DFlash2 block.
 #include <doctest/doctest.h>
 
+#include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -153,10 +155,11 @@ TEST_CASE("dflash2: the WALK turns a scored lattice into the candidates it chose
   CHECK(out.draft_token_ids[1][1] != 401);
 }
 
-TEST_CASE("dflash2: the walk REFUSES a lattice that does not match its candidates") {
-  // The postcondition `Dflash2SelectCandidates` asserts, re-asserted where the
-  // walk consumes it: a lattice that is not [num_reqs, num_steps, K, K] would
-  // index plausible scores from the wrong rows and move acceptance silently.
+namespace {
+
+// A lattice `Dflash2WalkPath` accepts: 1 request, 2 steps, K 3, every transition
+// scored 0, so the walk answers slot 0 at both steps.
+vllm::v1::Dflash2ProposeState GoodState() {
   vllm::v1::Dflash2ProposeState scored;
   scored.num_reqs = 1;
   scored.num_steps = 2;
@@ -165,9 +168,65 @@ TEST_CASE("dflash2: the walk REFUSES a lattice that does not match its candidate
   scored.candidates.top_k = 3;
   scored.candidates.ids.assign(6, 7);
   scored.candidates.values.assign(6, 0.0f);
-  scored.edge_scores.assign(2 * 3 * 3 - 1, 0.0f);  // one transition short
-  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-  CHECK_THROWS(vllm::v1::Dflash2WalkPath(scored, q));
   scored.edge_scores.assign(2 * 3 * 3, 0.0f);
-  CHECK_NOTHROW(vllm::v1::Dflash2WalkPath(scored, q));
+  return scored;
+}
+
+}  // namespace
+
+TEST_CASE("dflash2: the walk REFUSES a lattice that does not match its candidates") {
+  // The postcondition `Dflash2SelectCandidates` asserts, re-asserted where the
+  // walk consumes it: a lattice that is not [num_reqs, num_steps, K, K] would
+  // index plausible scores from the wrong rows and move acceptance silently.
+  //
+  // Each refusal is matched on its MESSAGE. These three checks sit next to each
+  // other over the same state, so a bare `CHECK_THROWS` would be satisfied by
+  // whichever of them still stood after the others were deleted -- which is what
+  // W4's fresh review measured: deleting the candidate-set check and the i32
+  // refusal together left this suite green.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  CHECK_NOTHROW(vllm::v1::Dflash2WalkPath(GoodState(), q));
+
+  // The LATTICE, one transition short.
+  {
+    vllm::v1::Dflash2ProposeState scored = GoodState();
+    scored.edge_scores.assign(2 * 3 * 3 - 1, 0.0f);
+    CHECK_THROWS_WITH_AS(vllm::v1::Dflash2WalkPath(scored, q),
+                         doctest::Contains("must score every (step, predecessor"),
+                         std::runtime_error);
+  }
+  // The CANDIDATE SET's own shape, both axes. `rows` is the flattened
+  // (request, step) count and `top_k` the slot count; either one wrong reads the
+  // ids of a different step, and the ids are well-formed token ids either way.
+  {
+    vllm::v1::Dflash2ProposeState scored = GoodState();
+    scored.candidates.rows = 3;  // not num_reqs * num_steps
+    CHECK_THROWS_WITH_AS(vllm::v1::Dflash2WalkPath(scored, q),
+                         doctest::Contains("candidate set must be"),
+                         std::runtime_error);
+  }
+  {
+    vllm::v1::Dflash2ProposeState scored = GoodState();
+    scored.candidates.top_k = 2;  // not the top_k the lattice was scored at
+    CHECK_THROWS_WITH_AS(vllm::v1::Dflash2WalkPath(scored, q),
+                         doctest::Contains("candidate set must be"),
+                         std::runtime_error);
+  }
+  // The i32 RANGE the verify, the KV rollback and the input batch all carry.
+  // The walk gathers an i64 id; one that does not fit would TRUNCATE into a
+  // different, valid-looking token rather than fail, so it is named instead.
+  {
+    vllm::v1::Dflash2ProposeState scored = GoodState();
+    scored.candidates.ids[0] = static_cast<int64_t>(INT32_MAX) + 1;
+    CHECK_THROWS_WITH_AS(vllm::v1::Dflash2WalkPath(scored, q),
+                         doctest::Contains("outside the i32 range"),
+                         std::runtime_error);
+  }
+  {
+    vllm::v1::Dflash2ProposeState scored = GoodState();
+    scored.candidates.ids[0] = -1;
+    CHECK_THROWS_WITH_AS(vllm::v1::Dflash2WalkPath(scored, q),
+                         doctest::Contains("outside the i32 range"),
+                         std::runtime_error);
+  }
 }

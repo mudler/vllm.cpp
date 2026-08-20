@@ -3226,7 +3226,11 @@ void Dflash2SelectorEdgesKernel(Queue&, Tensor& scores, const Tensor& pred_codeb
 //     masked lanes with `other=-inf`; the seed below (`best = -inf`, `index =
 //     K`, strict `>`, then collapse `K` to 0) is the same answer in a form the
 //     CUDA arm can reduce in parallel and reach bit-identically. Strictness is
-//     also what keeps a NaN from ever winning on either arm.
+//     also what keeps a NaN from ever winning on either arm, and it is the one
+//     part of the seed the tie rows and the -inf row do NOT measure: a `>=`
+//     reduction answers both of those correctly. The case that fails under
+//     `>=` is `dflash2-path-walk: a NaN never wins a slot`
+//     (tests/vt/test_ops_dflash2_path_walk.cpp).
 //
 // Requests are independent, so the OUTER loop parallelizes and the inner step
 // loop stays serial -- which is exactly the shape upstream's one-program-per-

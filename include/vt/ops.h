@@ -974,6 +974,24 @@ struct Dflash2SelectorEdgesArgs {
 // UNLIKE vt::Dflash2SelectorEdges this op is specified BIT-EXACT across
 // backends. It performs no arithmetic -- only comparisons and one gather -- so
 // there is no reduction order for a backend to differ in.
+//
+// STRICTNESS IS THE WHOLE OF THAT CLAIM, and it was not free. W4's fresh review
+// measured the two arms apart on a NaN-bearing row: the CUDA per-lane scan
+// carried `|| (v == best && j < slot)` beside its strict `>`, a clause that is
+// unreachable once a lane has claimed anything (`j` only ascends) and whose one
+// effect was at the SEED -- a lane holding -inf compared equal to the -inf seed
+// and claimed a slot the CPU arm refuses. `[NaN,-inf]` read cpu 0 / cuda 1,
+// `[NaN,NaN,-inf]` read cpu 0 / cuda 2, and every NaN-free row agreed,
+// including the all -inf row and the forced tie group, so no fixture without a
+// NaN could see it. The clause is now DELETED rather than this claim narrowed,
+// and the lower-slot tie rule stays where it is needed: the cross-lane
+// butterfly, which combines lane winners out of slot order. That deletion has
+// never been compiled or run on a device -- the authoring host has no `nvcc` --
+// and is owed with the rest of the CUDA arm at `## Owed` O11 of
+// .agents/specs/dflash2-spec-decode.md. NO SHIPPED PATH FEEDS THIS OP A NaN:
+// the lattice comes from vt::Dflash2SelectorEdges over a target LM head, so the
+// row that measured the difference is synthetic, and it is a gap in the reach
+// of the contract rather than in any draft a user can obtain.
 struct Dflash2PathWalkArgs {
   int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
 };

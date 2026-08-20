@@ -56,17 +56,22 @@
 //  * THE GATHER. What is stored is `candidate_ptr[base + index]` and NOT the
 //    index; a fixture whose ids are the identity permutation cannot tell those
 //    apart, so every id here differs from its slot.
+//  * A NaN NEVER WINS. Strictness is what the tie rows and the -inf row do not
+//    measure: a `>=` reduction answers both of those correctly. This case is
+//    the one that fails under `>=`, and it is also the row on which the CUDA
+//    arm disagreed with this one until W4's repair (see the CUDA case below).
 //  * CUDA vs CPU, BIT-EXACT. Unlike vt::Dflash2SelectorEdges -- a reduction
 //    within an f32 envelope -- this op compares and gathers, so the two arms
-//    must agree exactly, including on the tie rows and the -inf row. That case
-//    is written and has NEVER RUN on this host (no `nvcc`, so it reports `no
-//    CUDA backend; skipping`); it is owed to the operator's GPU lease and is not
-//    counted as coverage here.
+//    must agree exactly, including the tie rows, the -inf row and the NaN row.
+//    That case is written and has NEVER RUN on this host (no `nvcc`, so it
+//    reports `no CUDA backend; skipping`); it is owed to the operator's GPU
+//    lease and is not counted as coverage here.
 #include <doctest/doctest.h>
 
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -265,17 +270,75 @@ TEST_CASE("dflash2-path-walk: an all -inf row resolves to slot 0") {
   CHECK(got[1] == 63);  // predecessor row 0 -> slot 2
 }
 
-TEST_CASE("dflash2-path-walk: refuses a lattice that is not [B,L,K,K]") {
+TEST_CASE("dflash2-path-walk: a NaN never wins a slot") {
+  // STRICTNESS, on its own. The tie rows and the all -inf row above are both
+  // answered correctly by a `>=` reduction too, so nothing there measures the
+  // word "strictly" in the contract; this case does. A NaN compares false
+  // against everything, so a strict `>` can never let one claim a slot, and a
+  // row whose only non -inf lane is a NaN collapses to slot 0 exactly as a
+  // fully masked row does.
   const int64_t B = 1, L = 2, K = 3;
+  const float kNan = std::numeric_limits<float>::quiet_NaN();
+  std::vector<float> scores(static_cast<size_t>(B * L * K * K), kNegInf);
+  auto at = [&](int64_t l, int64_t p, int64_t c) -> float& {
+    return scores[static_cast<size_t>((l * K + p) * K + c)];
+  };
+  // Step 0, row 0: a NaN beside two masked lanes. Under `>=` the LAST -inf lane
+  // would claim the row instead and the walk would emit slot 2.
+  at(0, 0, 0) = kNan;
+  // Step 1 reads predecessor row 0, because step 0 answered slot 0. A NaN sits
+  // between two real values: a rule that let a NaN win answers slot 1, and the
+  // contract answers slot 2.
+  at(1, 0, 0) = 1.0f;
+  at(1, 0, 1) = kNan;
+  at(1, 0, 2) = 2.0f;
+  std::vector<int64_t> cand = {81, 82, 83, 91, 92, 93};
+  const std::vector<int64_t> got = RunCpu(scores, cand, B, L, K);
+  REQUIRE(got.size() == 2);
+  CHECK(got[0] == 81);  // slot 0: neither the NaN nor a masked lane claimed it
+  CHECK(got[0] != 83);  // what a `>=` reduction answers
+  CHECK(got[1] == 93);  // slot 2
+  CHECK(got[1] != 92);  // what a NaN-wins reduction answers
+}
+
+TEST_CASE("dflash2-path-walk: refuses a lattice that is not [B,L,K,K]") {
+  // BOTH trailing axes, each on its own, each over a GENUINELY CONTIGUOUS
+  // tensor, and each matched on the message.
+  //
+  // Mutating one `shape` field of a tensor built by `Contig` does NOT test this
+  // guard. It desynchronises the strides, `Tensor::IsContiguous()` turns false,
+  // and `dflash2-path-walk: contiguous tensors required` throws FIRST -- so a
+  // bare `CHECK_THROWS` is satisfied by a guard it was not written for, and it
+  // still passes with the shape check deleted outright. That is what W4's fresh
+  // review measured on the previous version of this case. The lattices below
+  // are built at the wrong extent WITH matching strides, so the only guard that
+  // can answer is the one named.
+  const int64_t B = 1, L = 2, K = 3;
+  // Sized for the FULL [B,L,K,K] lattice, so a DELETED guard reads in bounds
+  // and simply fails to throw rather than running off the end of the buffer.
   std::vector<float> scores(static_cast<size_t>(B * L * K * K), 0.0f);
   std::vector<int64_t> cand(static_cast<size_t>(B * L * K), 0);
   std::vector<int64_t> tokens(static_cast<size_t>(B * L), 0);
   Queue q = Q();
   Tensor c = Contig(cand.data(), DType::kI64, Cpu(), {B, L, K});
   Tensor t = Contig(tokens.data(), DType::kI64, Cpu(), {B, L});
-  Tensor bad = Contig(scores.data(), DType::kF32, Cpu(), {B, L, K, K});
-  bad.shape[2] = K - 1;  // a predecessor axis that is not top_k
-  CHECK_THROWS(vt::Dflash2PathWalk(q, t, bad, c, Args(K)));
+
+  // The CHILD axis, [B,L,K,K-1]: a row that is short of one candidate.
+  Tensor child = Contig(scores.data(), DType::kF32, Cpu(), {B, L, K, K - 1});
+  REQUIRE(child.IsContiguous());
+  CHECK_THROWS_WITH_AS(vt::Dflash2PathWalk(q, t, child, c, Args(K)),
+                       doctest::Contains("scores must be [B,L,K,K]"),
+                       std::runtime_error);
+  // The PREDECESSOR axis, [B,L,K-1,K]: the same extent mistake one axis to the
+  // left, which is the lattice indexed the wrong way round. It reads plausible
+  // scores from the wrong rows and moves acceptance without raising, which is
+  // why the wrapper checks both axes instead of checking one and inferring.
+  Tensor pred = Contig(scores.data(), DType::kF32, Cpu(), {B, L, K - 1, K});
+  REQUIRE(pred.IsContiguous());
+  CHECK_THROWS_WITH_AS(vt::Dflash2PathWalk(q, t, pred, c, Args(K)),
+                       doctest::Contains("scores must be [B,L,K,K]"),
+                       std::runtime_error);
+
   Tensor good = Contig(scores.data(), DType::kF32, Cpu(), {B, L, K, K});
   CHECK_NOTHROW(vt::Dflash2PathWalk(q, t, good, c, Args(K)));
 }
@@ -353,14 +416,27 @@ TEST_CASE("dflash2-path-walk: CUDA equals CPU bit-for-bit, ties and -inf include
         RandF32(static_cast<size_t>(cs.B * cs.L * cs.K * cs.K), 0x91u);
     std::vector<int64_t> cand =
         RandIds(static_cast<size_t>(cs.B * cs.L * cs.K), cs.V, 0x92u);
-    // Force the two rows a random fixture cannot produce: an exact tie group
-    // straddling the winning slot of request 0 step 0, and an all -inf row at
-    // request 0 step 1 predecessor 0. Both are asserted against the CPU arm,
+    // Force the three rows a random fixture cannot produce, CHAINED so each one
+    // is certain to be READ: request 0 step 0 is an exact tie group, which
+    // answers slot 0; step 1 predecessor row 0 is therefore read and is all
+    // -inf, which answers slot 0; step 2 predecessor row 0 is therefore read
+    // and is a NaN beside masked lanes. Each is asserted against the CPU arm,
     // which the hand-written CPU cases above pin against literals.
+    //
+    // The NaN row is the one the two arms DISAGREED on before W4's repair. The
+    // CUDA lane scan carried an `|| (v == best && j < slot)` clause whose only
+    // reachable effect was at the seed, where a lane holding -inf compared
+    // equal to the -inf seed and claimed a slot the CPU arm's strict scan
+    // refuses: `[NaN,-inf]` read cpu 0 / cuda 1. Every NaN-free row agreed,
+    // including this fixture's tie group and its all -inf row, so nothing that
+    // ran here could see it.
     const int64_t K = cs.K;
     for (int64_t c = 0; c < K; ++c) scores[static_cast<size_t>(c)] = 1.25f;
     const size_t inf_row = static_cast<size_t>(((0 * cs.L + 1) * K + 0) * K);
     for (int64_t c = 0; c < K; ++c) scores[inf_row + static_cast<size_t>(c)] = kNegInf;
+    const size_t nan_row = static_cast<size_t>(((0 * cs.L + 2) * K + 0) * K);
+    for (int64_t c = 0; c < K; ++c) scores[nan_row + static_cast<size_t>(c)] = kNegInf;
+    scores[nan_row] = std::numeric_limits<float>::quiet_NaN();
     std::vector<float> scores_cpu = scores;
     std::vector<int64_t> cand_cpu = cand;
     const std::vector<int64_t> cpu = RunCpu(scores_cpu, cand_cpu, cs.B, cs.L, K);
@@ -376,9 +452,10 @@ TEST_CASE("dflash2-path-walk: CUDA equals CPU bit-for-bit, ties and -inf include
       CHECK(got[i] == cpu[i]);
     }
     // The forced rows, asserted directly so the parity above cannot pass by
-    // two arms agreeing on nothing: slot 0 of the tie group, and slot 0 of the
-    // -inf row.
+    // two arms agreeing on nothing: slot 0 of the tie group, slot 0 of the -inf
+    // row, and slot 0 of the NaN row.
     CHECK(cpu[0] == cand[0]);
     CHECK(cpu[1] == cand[static_cast<size_t>(K)]);
+    CHECK(cpu[2] == cand[static_cast<size_t>(2 * K)]);
   }
 }

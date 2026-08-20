@@ -1345,10 +1345,16 @@ target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # assertion that a DFlash1 checkpoint's resolution is unchanged.
 vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
-# SPEC-DFLASH2 W2 (#1314): the candidate-selector refusal -- the boundary the
-# DFlash2 architecture is left at once its grouped convolution runs.
+# SPEC-DFLASH2 W4 (#1314): the INVERSE guard, once the walk lands and there is
+# no missing mechanism left to refuse -- a DFlash2 block that reaches the DFlash1
+# per-slot argmax throws by name, and the walk's own refusals are gated beside
+# it. W1/W2/W3 read "the candidate-selector refusal" here, which was the boundary
+# the architecture was left at while its selector was unported.
 vllm_cpp_add_test(test_dflash2_argmax_guard
   vllm/v1/spec_decode/test_dflash2_argmax_guard.cpp)
+# SPEC-DFLASH2 W4 (#1314): reachability (spec G5) -- a real LoadedEngine through
+# GPUModelRunner::propose_drafts_block, with the drafts read off the production
+# trace.
 vllm_cpp_add_test(test_dflash2_runner_reach
   vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)

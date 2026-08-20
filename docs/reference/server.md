@@ -62,62 +62,18 @@ Registered in
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
 | POST | `/v1/audio/speech` | Text (or lyrics + a music description) to audio; responds with `audio/wav` bytes. Registered **only** when a synthesizer is attached (`--speech-model`) |
 
-The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
-clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
-layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
-the semantic codec to discrete codes, and the talker's prompt is assembled from
-that conditioning plus the text -- but none of it is reachable from a command or
-a route yet. The greedy generate loop that turns the prompt into mel codes is
-ported too, and so is the STATED-emotion path -- eight weights selecting rows
-from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
-text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a COMMAND or ROUTE. TEXT DOES REACH AUDIO in the library:
-`test_indextts2_e2e` tokenizes with the checkpoint's own vocabulary, runs the
-talker to mel codes, and drives those through the length regulator, the CFM loop
-and BigVGAN to samples. Point it at all four checkpoint paths:
+`/v1/audio/speech` is registered only when you start the server with
+`--speech-model`. Without that flag, the route returns 404. MiniMax-Music3
+returns a 44.1 kHz stereo WAV. See the
+[MiniMax-Music3 recipe](../models/minimax-music3.md).
 
-```sh
-VLLM_CPP_INDEXTTS2_S2MEL=... VLLM_CPP_INDEXTTS2_BIGVGAN=... \
-VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
-  ./build/tests/test_indextts2_e2e
-```
-
-A REAL LIMITATION to know before using it: the reference clip is required and
-then IGNORED. Its encoders are ported and their checkpoints are staged, but the
-conditioning rows are zeros, so two different reference voices give the same
-output today. `campplus::LoadCampplus` reads its weights but
-`campplus::Forward` returns NaN on them, which is an open defect recorded in
-the spec and blocks the wiring.
-
-It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
-is unpinned (#633). The TOKENIZER it uses:
-`tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
-`tiktoken::Encode` reproduces python tiktoken's ids exactly on the cases
-gated, CJK included. The checkpoint now
-LOADS through `vllm::multimodal::SpeechRegistry`, reports its family and its
-22.05 kHz output rate, and states that a reference clip is required; asking
-it to synthesize refuses by naming the one gap between text and the render
-path, which is that the shipped vocabulary is tiktoken and this tree has no
-reader for one. The pipeline itself renders on the real
-checkpoints: the talker emits its own mel codes, the length regulator resamples
-them to the mel frame rate, a classifier-free guided CFM Euler loop integrates
-the S2Mel estimator, and BigVGAN turns the mel into a bounded 22.05 kHz
-waveform. `indextts2::Render` is the entry point, and
-`test_indextts2_render` drives it end to end when the three checkpoint
-environment variables are set. It is NOT yet measured against the vLLM-Omni
-oracle, which is unpinned (#633), so nothing here is a quality claim. Inferring the emotion from a clip instead of stating it needs a
-Conformer and a Perceiver that are not ported.
-
-`/v1/audio/speech` is served, but **only** by a server started with
-`--speech-model`, and what it can render depends on the family that flag loads
-(#1112). MiniMax-Music3 renders: a composed request returns a real 44100 Hz
-stereo WAV (#852). **IndexTTS-2.5 does not**: its stages are ported and gated at
-reduced dimensions, further stages are named as missing by the checkpoint's own
-manifest, and loading the family refuses with a message naming the missing
-pieces (#634). Without `--speech-model` the route is a 404 at the route table
-rather than a runtime error, which is the accurate signal: the endpoint is opt
-in, not absent. See
-[the MiniMax-Music3 recipe](../models/minimax-music3.md).
+IndexTTS-2.5 loads from `--speech-model` and returns a 22.05 kHz mono WAV. Each
+request must include `reference_audio` as a data URL for a 16-bit PCM mono WAV.
+The current engine does not use the reference clip for conditioning, so the
+clip does not select the output voice. The vLLM-Omni quality comparison is also
+pending. See the
+[owning model specification](../../.agents/specs/indextts-2-5.md) for the owned
+limitations and verification evidence.
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it, every prompt position is scored against the token
@@ -140,14 +96,9 @@ request asked.
 
 The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
-to one built without video support. See
-Use the [model recipe index](../USAGE.md#find-a-model-recipe) to open the current combined
-MiniMax-H3 video and audio workflow.
-
-`/v1/audio/speech` is registered **only** when the server was started with
-`--speech-model`; without it the route is absent (404) and the server is
-identical to one built before it existed. See the
-[MiniMax-Music3 recipe](../models/minimax-music3.md).
+to one built without video support. Use the
+[MiniMax-H3 recipe](../models/minimax-h3.md) for the combined video and audio
+workflow.
 
 ### `max_tokens`: what a non-positive value means
 

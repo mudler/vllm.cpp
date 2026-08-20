@@ -77,6 +77,13 @@ reference-page histories with current lookup facts. Their method details,
 benchmarks, and owed work remain in the linked speculative-decoding guide,
 model recipe, benchmark page, and internal specs.
 
+The final server-reference repair replaces contradictory IndexTTS-2.5 phase
+history with the current endpoint contract. The route loads the family and
+renders audio, but it requires a reference clip that it does not yet use for
+conditioning. The owning IndexTTS specification retains the implementation and
+verification history. The repair also replaces a malformed video-guide link
+with one instruction that points directly to the MiniMax-H3 recipe.
+
 The inventory's other zero-after literals are semantically accounted for.
 `HALF` and `KEYFRAME` were emphasis around the two-stage LTX behavior, which the
 LTX model page now states without all caps. `SAMPLER` is the restored `res_2s`

@@ -3692,7 +3692,21 @@ VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf \
   ./build/tests/test_clip_mmproj_gguf
 ```
 
-Unset, the case skips loudly and the gate stays hermetic; CI never reads the
+That gate reads the projector alone. To confirm the other half — that a load
+which COMPLETES leaves the tower on the engine, reachable through
+`LoadedEngine::vision_tower()` — name both files and run the loader's gate:
+
+```console
+VLLM_CPP_QWEN38_27B_GGUF=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
+VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf \
+  ./build/tests/test_gguf_mmproj_reach
+```
+
+This one loads the whole 17 GB language file. Measured on an x86 CPU-only build
+reading both files over CIFS: 6 min 22 s, 33.06 GB peak resident. Do not start
+it on a box with less than about 40 GB of available memory.
+
+Unset, both cases skip loudly and the gates stay hermetic; CI never reads the
 file. **What is still owed on these artifacts** is the committed 334-name
 manifest and the CI accounting against it, the Q4_K_M arm's own tensor
 accounting and token gate, and any image or video answer at all —

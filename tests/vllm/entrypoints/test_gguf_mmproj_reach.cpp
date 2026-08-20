@@ -24,6 +24,8 @@
 // instead, which is red here.
 #include <doctest/doctest.h>
 
+#include <cstdlib>
+#include <memory>
 #include <string>
 
 #include "vllm/entrypoints/model_loader.h"
@@ -161,4 +163,116 @@ TEST_CASE("mmproj reach: --mmproj on a non-GGUF model path is refused, not ignor
   // It fires BEFORE the directory probe, so the message is about the flag and
   // not about the missing directory.
   CHECK(message.find("model path is not a directory") == std::string::npos);
+}
+
+// ── The ENGINE HOLDS IT ─────────────────────────────────────────────────────
+//
+// Every case above stops at a MESSAGE. The permitting one throws at the
+// tokenizer, one step past the projector, so no `LoadedEngine` is ever
+// constructed and nothing above observes the tower being HELD. That left the
+// positive claim four records make — `LoadedEngine::vision_tower()` holds the
+// loaded tower — measured by nothing: deleting `vision_tower_(std::move(
+// vision_tower))` from the constructor kept every gate in this tree green.
+//
+// This case is that missing observation, and it needs a load that COMPLETES,
+// which needs a real language GGUF: the synthetic fixture above carries no
+// tokenizer and no backbone weights on purpose. So it is env-gated on BOTH
+// paths and SKIPS LOUDLY when either is unset — CI reads no NAS file, exactly
+// as `test_clip_mmproj_gguf`'s live case does:
+//
+//   VLLM_CPP_QWEN38_27B_GGUF=/path/to/Qwen3.8-27B-Q4_K_M.gguf
+//   VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf
+//   ./build/tests/test_gguf_mmproj_reach
+//
+// Both artifacts are pinned with their bytes and sha256 in `docs/USAGE.md`
+// §"The exact files this was gated against" (`unsloth/Qwen3.8-27B-GGUF` @
+// `fe1e2a23d973adb629709749dc4f6756df66ef10`).
+//
+// The geometry below is the PROJECTOR's, restated from that file's own header
+// rather than from the reader, and every size is derived from it here rather
+// than read back off the same config the engine reports — so a tower whose
+// weights do not match the geometry the engine publishes is a disagreement
+// between two sources instead of a tautology.
+TEST_CASE("mmproj reach: a load that COMPLETES leaves the tower ON THE ENGINE") {
+  const char* model_env = std::getenv("VLLM_CPP_QWEN38_27B_GGUF");
+  const char* mmproj_env = std::getenv("VLLM_CPP_QWEN38_27B_MMPROJ");
+  if (model_env == nullptr || mmproj_env == nullptr) {
+    MESSAGE(
+        "SKIPPED: set VLLM_CPP_QWEN38_27B_GGUF to Qwen3.8-27B-Q4_K_M.gguf AND "
+        "VLLM_CPP_QWEN38_27B_MMPROJ to mmproj-BF16.gguf to observe the loaded "
+        "tower being HELD by the engine (docs/USAGE.md pins both files)");
+    return;
+  }
+
+  vllm::entrypoints::EngineParams params;
+  params.mmproj_path = mmproj_env;
+  // The smallest KV pool the engine will build. This case is about what the
+  // load LEAVES on the engine, not about serving, and a 27B pool is memory
+  // this observation does not need.
+  params.num_blocks = 8;
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> engine =
+      vllm::entrypoints::LoadedEngine::FromModelDir(model_env, params);
+  REQUIRE(engine != nullptr);
+
+  // THE CLAIM. Not "the reader returned a tower" — the four records say the
+  // ENGINE holds it, and this is the only line in the tree that reads it back
+  // off a `LoadedEngine` a production entry point built.
+  const vllm::multimodal::Qwen3VLVisionWeights* tower = engine->vision_tower();
+  REQUIRE(tower != nullptr);
+
+  // The geometry the engine publishes beside it, which `vision_tower()`'s own
+  // contract says is meaningless without the tower.
+  const vllm::multimodal::Qwen3VLVisionConfig& cfg = engine->vision_config();
+  CHECK(cfg.hidden_size == 1152);
+  CHECK(cfg.num_heads == 16);
+  CHECK(cfg.depth == 27);
+  CHECK(cfg.intermediate_size == 4304);
+  CHECK(cfg.out_hidden_size == 5120);
+  CHECK(cfg.patch_size == 16);
+  CHECK(cfg.temporal_patch_size == 2);
+  CHECK(cfg.spatial_merge_size == 2);
+  CHECK(cfg.in_channels == 3);
+  CHECK(cfg.num_position_embeddings == 2304);
+  CHECK(cfg.deepstack_visual_indexes.empty());
+
+  // ── The WEIGHTS match that geometry ──────────────────────────────────────
+  // Sizes computed from the numbers above, so a tower that is present but is
+  // some OTHER file's fails here rather than passing on non-nullness.
+  const size_t hidden = 1152, depth = 27, ffn = 4304, out_hidden = 5120;
+  const size_t patch_in = 3 * 2 * 16 * 16;  // C * temporal * p * p = 1536
+  const size_t merged = hidden * 2 * 2;     // hidden * spatial_merge^2 = 4608
+
+  CHECK(tower->patch_proj_w.size() == hidden * patch_in);
+  CHECK(tower->patch_proj_b.size() == hidden);
+  CHECK(tower->pos_embed_w.size() == 2304 * hidden);
+  REQUIRE(tower->blocks.size() == depth);
+  for (size_t l = 0; l < depth; ++l) {
+    CAPTURE(l);
+    const vllm::multimodal::VisionBlockWeights& b = tower->blocks[l];
+    CHECK(b.norm1_w.size() == hidden);
+    CHECK(b.norm2_w.size() == hidden);
+    CHECK(b.qkv_w.size() == 3 * hidden * hidden);
+    CHECK(b.qkv_b.size() == 3 * hidden);
+    CHECK(b.proj_w.size() == hidden * hidden);
+    CHECK(b.fc1_w.size() == ffn * hidden);
+    CHECK(b.fc2_w.size() == hidden * ffn);
+  }
+  // The merger, whose fc1/fc2 are the `mm.0`/`mm.2` pair: `v.post_ln` is the
+  // PRE-shuffle norm (1152 wide, not the merged 4608), which is the file
+  // saying use_postshuffle_norm is false rather than the reader assuming it.
+  CHECK_FALSE(tower->merger.use_postshuffle_norm);
+  CHECK(tower->merger.norm_w.size() == hidden);
+  CHECK(tower->merger.fc1_w.size() == merged * merged);
+  CHECK(tower->merger.fc2_w.size() == out_hidden * merged);
+  CHECK(tower->merger.fc2_b.size() == out_hidden);
+  CHECK(tower->deepstack_mergers.empty());
+
+  // Not all zeros: a default-constructed tower of the right SHAPE would pass
+  // every size check above.
+  double sum = 0.0;
+  for (size_t i = 0; i < 4096 && i < tower->merger.fc2_w.size(); ++i) {
+    sum += static_cast<double>(tower->merger.fc2_w[i]) *
+           static_cast<double>(tower->merger.fc2_w[i]);
+  }
+  CHECK(sum > 0.0);
 }

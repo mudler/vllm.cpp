@@ -240,8 +240,13 @@ struct EngineParams {
   // error.
   //
   // Empty (the default) is byte-identical to the pre-row behaviour: no second
-  // file is opened and no vision tower is built. Ignored on a safetensors
-  // model directory, whose tower comes off the same shards.
+  // file is opened and no vision tower is built. NON-EMPTY against anything
+  // that is not a `.gguf` FILE is REFUSED BY NAME, not ignored: a safetensors
+  // checkpoint carries its vision tower in its own shards, so accepting the
+  // flag there and dropping it would load a tower the user did not ask for and
+  // silently discard the one they named. The refusal fires in `FromModelDir`
+  // before any path or config I/O, and its message begins `--mmproj: a
+  // multimodal projector attaches to a .gguf language file`.
   std::string mmproj_path;
 };
 

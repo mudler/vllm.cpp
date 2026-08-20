@@ -9,25 +9,41 @@
 // already mirrors in `multimodal::Qwen3VLVisionForward` from
 // `vllm/model_executor/models/qwen3_vl.py` — and llama.cpp defines only the
 // CONTAINER. The container is read at the pinned secondary oracle
-// llama.cpp `b10451` = `10bf611e533d81f739128304991c5e133c6aebd8`:
+// llama.cpp `b10451` = `10bf611e533d81f739128304991c5e133c6aebd8`. The line
+// numbers below were read AT THAT COMMIT (`git show 10bf611e5:<path>`), which
+// the tag `b10451` names and which `ggml-org/llama.cpp` `origin/master`
+// contains — NOT at the superseded local fork `237ad9b96` whose positions
+// `backend-matrix.md` records as owed re-anchoring (#1003):
 //
-//   tools/mtmd/clip-impl.h::PROJECTOR_TYPE_NAMES  — `qwen3vl_merger`,
-//       `muse-glimmer`, and the `clip.*` metadata key spellings (KEY_N_EMBD,
-//       KEY_N_FF, KEY_N_BLOCK, KEY_PROJ_DIM, KEY_N_HEAD, KEY_PATCH_SIZE,
-//       KEY_SPATIAL_MERGE_SIZE, KEY_LAYER_NORM_EPS, KEY_PROJ_TYPE)
-//   tools/mtmd/clip-impl.h::TN_PATCH_EMBD / TN_PATCH_EMBD_1 / TN_PATCH_BIAS /
-//       TN_POS_EMBD / TN_LN_1 / TN_LN_2 / TN_ATTN_QKV / TN_ATTN_OUTPUT /
-//       TN_FFN_UP / TN_FFN_DOWN / TN_LN_POST / TN_LLAVA_PROJ /
-//       TN_DEEPSTACK_NORM / TN_DEEPSTACK_FC1 / TN_DEEPSTACK_FC2
-//   tools/mtmd/clip.cpp::clip_model_loader::load_tensors — the per-block reads
-//   tools/mtmd/models/qwen3vl.cpp::clip_graph_qwen3vl::build — which tensor
+//   tools/mtmd/clip-impl.h:499::PROJECTOR_TYPE_NAMES — `qwen3vl_merger`
+//       (:444 enum, :507 name) and `muse-glimmer` (:495 enum, :557 name)
+//   tools/mtmd/clip-impl.h:33,40-44,47,58,65 — the `clip.*` metadata key
+//       spellings (KEY_PROJ_TYPE :33, KEY_N_EMBD :40, KEY_N_FF :41,
+//       KEY_N_BLOCK :42, KEY_PROJ_DIM :43, KEY_N_HEAD :44,
+//       KEY_LAYER_NORM_EPS :47, KEY_PATCH_SIZE :58,
+//       KEY_SPATIAL_MERGE_SIZE :65)
+//   tools/mtmd/clip-impl.h:104,106-108,131-132,153-155 —
+//       TN_POS_EMBD :104, TN_PATCH_EMBD :106, TN_PATCH_EMBD_1 :107,
+//       TN_PATCH_BIAS :108, TN_LN_POST :131, TN_LLAVA_PROJ :132,
+//       TN_DEEPSTACK_NORM / _FC1 / _FC2 :153-155, plus TN_LN_1 / TN_LN_2 /
+//       TN_ATTN_QKV / TN_ATTN_OUTPUT / TN_FFN_UP / TN_FFN_DOWN in the same
+//       block
+//   tools/mtmd/clip.cpp:2021::clip_model_loader::load_tensors — the per-block
+//       reads
+//   tools/mtmd/models/qwen3vl.cpp:3::clip_graph_qwen3vl::build — which tensor
 //       plays which role, including that `v.post_ln` is applied BEFORE the
-//       merge reshape (so it is our merger's PRE-shuffle norm) and that the
-//       projection is `mm.0` -> GELU -> `mm.2`
-//   tools/mtmd/models/qwen2vl.cpp::clip_graph_qwen2vl::build_inp_with_temporal_merge
+//       merge reshape (:164-165, so it is our merger's PRE-shuffle norm) and
+//       that the projection is `mm.0` -> GELU -> `mm.2` (:172-176, the one
+//       `build_ffn` call; `mm_1_w` is `TN_LLAVA_PROJ` index 2 for this
+//       projector type — `clip.cpp:2392`, inside the `PROJECTOR_TYPE_QWEN3VL`
+//       case that opens at `:2388`, NOT the identical-looking `:2385` in the
+//       QWEN2VL/QWEN25VL/EXAONE4_5 case above it — which is why `mm.1` is not
+//       a name here)
+//   tools/mtmd/models/qwen2vl.cpp:3::clip_graph_qwen2vl::build_inp_with_temporal_merge
 //       — the two patch-embedding halves are two `conv2d`s over the two
-//       temporal frames, SUMMED; that is a `conv3d` with
-//       `temporal_patch_size = 2` split along its temporal axis
+//       temporal frames, SUMMED by `ggml_add` (:12-26); that is a `conv3d`
+//       with `temporal_patch_size = 2` split along its temporal axis, and
+//       `n_batch > 2` is refused outright (:28)
 //
 // The mapping target for the config is the SAME `Qwen3VLVisionConfig` that
 // `src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp::MiniMaxH3EncoderVisionConfig`

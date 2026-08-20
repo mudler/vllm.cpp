@@ -311,6 +311,45 @@ would be unrecoverable -- which tensors survive, under which names -- with fakes
 and no torch, because a dropped weight looks exactly like a weight that was
 never there.
 
+### Contributor reproduction commands
+
+These commands previously lived in the public MiniMax-Music3 recipe. They stay
+here because they regenerate IndexTTS manifests and test goldens.
+
+```sh
+python3 scripts/read-torch-manifest.py \
+  https://huggingface.co/IndexTeam/IndexTTS-2.5/resolve/main/s2mel.pth
+
+WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-wavenet-goldens.py --out tests/vllm/models/wavenet_goldens.inc
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-front-goldens.py --out tests/vllm/models/dit_front_goldens.inc
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-stack-goldens.py --out tests/vllm/models/dit_stack_goldens.inc
+BIGVGAN_SRC=/path/to/index-tts/indextts/s2mel/modules/bigvgan \
+  python3 scripts/gen-bigvgan-goldens.py --out tests/vllm/models/bigvgan_goldens.inc
+CODEC_SRC=/path/to/index-tts/indextts \
+  python3 scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
+python3 scripts/gen-w2v-fbank-goldens.py --out tests/vllm/models/w2v_fbank_goldens.inc
+python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
+
+python3 scripts/convert-indextts2-checkpoint.py \
+  --checkpoint "$CHECKPOINT_ROOT/IndexTTS-2.5" \
+  --out "$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors" \
+  --manifest tests/vllm/models/indextts2_pth_manifest.json
+
+VLLM_CPP_INDEXTTS2_S2MEL="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors" \
+  ./build/tests/test_indextts2_s2mel_loader
+VLLM_CPP_INDEXTTS2_GPT="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors" \
+  ./build/tests/test_indextts2_talker_loader
+VLLM_CPP_INDEXTTS2_AUX="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors" \
+  ./build/tests/test_emovec
+VLLM_CPP_INDEXTTS2_BIGVGAN="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/bigvgan.safetensors" \
+  ./build/tests/test_bigvgan
+```
+
 ### What the three .pth checkpoints actually hold
 
 `gpt.pth`, `codec.pth` and `s2mel.pth` are torch ZIPs: one small pickle names

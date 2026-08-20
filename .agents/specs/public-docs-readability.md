@@ -37,6 +37,22 @@ includes the official video VAE, audio VAE, and tokenizer. The exact official
 sizes come from the pinned Hugging Face tree and raw Git LFS pointers at
 `42ed227ee7df40d41602854ae760620d6eb651fe` on 20 August 2026.
 
+The R2 closure pass removes generic CLI copies from three Qwen pages and keeps
+the MiniMax-Music3 server recipe only on its model page. It restores the six
+real-checkpoint Music3 commands, the `LTX_2_3_HQ_PARAMS` defaults, and the
+upstream `FRAME_IDX` limitation to their model pages. The W3 set inventory has
+no unexplained loss after this classification.
+
+The inventory's other zero-after literals are semantically accounted for.
+`HALF` and `KEYFRAME` were emphasis around the two-stage LTX behavior, which the
+LTX model page now states without all caps. `SAMPLER` is the restored `res_2s`
+fact. `SUBJECT` was a command comment; the MiniMax-H3 page retains the
+`subject.ppm` example and its subject-conditioning explanation. `MATH` belongs
+to the archived attention-gate analysis in `.agents/specs/minimax-music3.md`.
+The obsolete revision `a767244d27bd76589a3e3b2ab4e64032c4ebc7af` remains in
+the issue index, quantization matrix, and Qwen3.8 quant-arm spec with its stale
+classification. None of these five literals needs another public copy.
+
 The LTX registry and model page restore the base facts from
 `docs/USAGE.md:4380-4510` and `docs/USAGE.md:4782-4865` at
 `c8d926ea82bd6d8f5d6312693572c84234a6a7f3`. The Qwen description comes from

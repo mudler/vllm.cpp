@@ -61,6 +61,10 @@ Where the embedding does bite is the FIRST latent frame of every render, which
 was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
 is now applied on every render.)
 
+The CLI exposes two fixed image slots. Upstream instead accepts repeatable
+`--image PATH FRAME_IDX STRENGTH [CRF]` values. This port cannot request an
+interior `FRAME_IDX`; it can condition only the first and last frames.
+
 **Generated keyframe slots are a different feature, and they are now SERVED.**
 Upstream also lets the model *generate* extra frames at interior positions,
 `--num-generated-keyframes N` there and the per-generation extra
@@ -644,6 +648,26 @@ at the recipe's own guider values.
 **The accelerator is refused by name.** `device = 1` gets a refusal on this
 pipeline: the device forward takes both streams by reference and this pipeline
 has no video stream to give it. Use `--device cpu`.
+
+## High-quality two-stage preset
+
+`res2s_two_stage` selects upstream's `TI2VidTwoStagesHQPipeline`. It uses
+`LTX_2_3_HQ_PARAMS`: 15 steps, STG disabled, video rescale 0.45, video CFG 3.0,
+audio CFG 7.0, and modality scale 3.0. Both stages use the second-order `res_2s`
+sampler instead of Euler. Stage 1 also loads the distilled LoRA and derives its
+schedule from the stage-1 latent shape.
+
+## Plain two-stage and keyframe interpolation
+
+`ti2vid_two_stage` runs stage 1 at half the requested resolution on the base
+model. Stage 2 upsamples the latent by 2x and refines it with the distilled
+adapter. The final height and width must divide by 64 because the first stage
+must remain on the VAE's 32-pixel grid.
+
+`keyframe_interpolation` uses the same two stages. It appends the first image as
+keyframe guidance instead of replacing the first latent frame. The stage-2
+soundtrack is returned; `ti2vid_two_stage` returns the stage-1 soundtrack.
+Both pipelines require `--lora-path` and `--upsampler-path`.
 
 
 ## LTX-2.5 video guidance: `--pipeline-kind one_stage`

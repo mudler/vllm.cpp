@@ -257,79 +257,34 @@ The lower bound is the important one: a silent dequant fallback to the bf16
 weights lands *closer* to the golden (mean|d| 0.00182) than the genuine
 quantized arm (0.0324), so upper bounds alone cannot tell them apart.
 
-## IndexTTS-2.5 goldens and checkpoint manifests
+## Reproduce the real-checkpoint gates
 
-IndexTTS-2.5 is not servable yet — `/v1/audio/speech` exists and serves
-MiniMax-Music3, but this family still refuses naming its missing pieces (#634,
-#1112). These regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
-names and shapes from its pickle header over HTTP range requests, so it inspects
-a multi-GB checkpoint without downloading the weights:
+Set `VLLM_CPP_MUSIC3_CHECKPOINT` to the 27 GB MiniMax-Music3 checkpoint tree.
+Each test skips with a message when the variable is unset.
 
 ```sh
-python3 scripts/read-torch-manifest.py \
-  https://huggingface.co/IndexTeam/IndexTTS-2.5/resolve/main/s2mel.pth
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_loader
+
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_ar_real
+
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_acoustic_real
+
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_acoustic_real
+
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_llm_real
+
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_e2e_real
 ```
 
-The stage goldens need the upstream source checked out, and emit `.inc` files
-that carry no weight bytes: both sides rebuild parameters from one shared
-pseudo-random stream.
-
-```sh
-WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
-  python3 scripts/gen-wavenet-goldens.py --out tests/vllm/models/wavenet_goldens.inc
-
-DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
-  python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
-
-DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
-  python3 scripts/gen-dit-front-goldens.py --out tests/vllm/models/dit_front_goldens.inc
-
-DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
-  python3 scripts/gen-dit-stack-goldens.py --out tests/vllm/models/dit_stack_goldens.inc
-
-BIGVGAN_SRC=/path/to/index-tts/indextts/s2mel/modules/bigvgan \
-  python3 scripts/gen-bigvgan-goldens.py --out tests/vllm/models/bigvgan_goldens.inc
-
-CODEC_SRC=/path/to/index-tts/indextts \
-  python3 scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
-
-python3 scripts/gen-w2v-fbank-goldens.py --out tests/vllm/models/w2v_fbank_goldens.inc
-```
-
-The U-Net skip routing is recorded rather than generated into an `.inc`: this
-prints the schedule upstream's own Transformer actually performs, at several
-depths, and the expected values are quoted in `tests/vllm/models/test_dit_skip.cpp`.
-
-```sh
-python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
-```
-
-Convert the checkpoints once, then point the loader gate at the result to check
-the real weights (it is skipped, loudly, when the variable is unset):
-
-```sh
-python3 scripts/convert-indextts2-checkpoint.py \
-  --checkpoint $CHECKPOINT_ROOT/IndexTTS-2.5 \
-  --out $CHECKPOINT_ROOT/IndexTTS-2.5-safetensors \
-  --manifest tests/vllm/models/indextts2_pth_manifest.json
-
-VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors \
-  ./build/tests/test_indextts2_s2mel_loader
-
-VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors \
-  ./build/tests/test_indextts2_talker_loader
-
-VLLM_CPP_INDEXTTS2_AUX=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors \
-  ./build/tests/test_emovec
-
-The vocoder is a SEPARATE download (`nvidia/bigvgan_v2_22khz_80band_256x`),
-which IndexTTS-2.5 fetches rather than ships. Convert it the same way, then:
-
-```sh
-VLLM_CPP_INDEXTTS2_BIGVGAN=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/bigvgan.safetensors \
-  ./build/tests/test_bigvgan
-```
-```
+The DiT cases need `VLLM_CPP_MUSIC3_DIT=1` because they load 9.1 GB of fp32
+weights. The acoustic DiT gate runs four 2.4B forwards on the host.
 
 
 ## MiniMax-Music3: the autoregressive half

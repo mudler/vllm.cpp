@@ -413,6 +413,16 @@ vllm_cpp_add_test(test_clip_mmproj_gguf
   vllm/models/test_clip_mmproj_gguf.cpp)
 vllm_cpp_add_test(test_gguf_mmproj_reach
   vllm/entrypoints/test_gguf_mmproj_reach.cpp)
+# QUANT-QWEN38-27B-GGUF-ARM (#821 W2): the committed 866- and 334-name
+# manifests of `unsloth/Qwen3.8-27B-GGUF` @ fe1e2a23d9, and the tensor
+# accounting against them. Split the same way for the same reason — the first
+# target calls the two enumerations, the second enters through
+# `LoadedEngine::FromModelDir`, so deleting either refusal call site in
+# `model_loader.cpp` reds the second and leaves the first green.
+vllm_cpp_add_test(test_qwen38_27b_gguf_manifest
+  vllm/models/test_qwen38_27b_gguf_manifest.cpp)
+vllm_cpp_add_test(test_gguf_accounting_reach
+  vllm/entrypoints/test_gguf_accounting_reach.cpp)
 # FIX-FP8-BLOCKWISE-REFUSAL #1166: block-wise (128x128) FP8 is refused BY NAME
 # at load. Every case enters through `ModelRegistry::Load` rather than through
 # the predicate, so deleting that call site reds this target. That is the

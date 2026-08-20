@@ -1,8 +1,8 @@
 # Model recipes
 
 Use a model recipe when a checkpoint needs extra files, model-specific flags,
-or a known limitation. The documentation campaign is moving these recipes out
-of the legacy section in [`USAGE.md`](../USAGE.md#temporary-legacy-reference).
+or a known limitation. See the [generic usage guide](../USAGE.md) for the
+shared CLI, server, C ABI, and source-tree workflows.
 
 Choose the model family you want to run:
 

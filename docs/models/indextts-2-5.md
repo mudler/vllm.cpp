@@ -30,7 +30,7 @@ checkpoint.
 ## Start a speech-only server
 
 ```sh
-./build/bin/vllm-server \
+build/examples/vllm-server \
   --speech-model "$CHECKPOINT_ROOT/IndexTTS-2.5" \
   --speech-family indextts2 \
   --port 8000

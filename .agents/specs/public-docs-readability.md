@@ -158,12 +158,13 @@ duplicates before this repair and reports none afterward.
 
 W6 reconciles the four linked issues without changing a claim that the current
 tree cannot support. Issue #1275 is fixed: `docs/FEATURES.md` says block-wise
-FP8 runs on CPU and names the unproven CUDA arm. Issue #342 is fixed on the
-purpose-specific surfaces. `docs/USAGE.md` uses `build/examples/vllm-server`,
+FP8 runs on CPU and names the unproven CUDA arm. The purpose-specific
+documentation parts of issue #342 are fixed. `docs/USAGE.md` uses
+`build/examples/vllm-server`,
 `docs/reference/c-api.md` reports ABI v23, and `docs/reference/server.md` lists
 the conditional embedding and transcription routes. The architecture registry
 gate reports 40 entries. The README still carries the old executable, ABI,
-architecture, and gate claims, so #342 remains partial.
+architecture, and gate claims. Issue #342 therefore remains open and partial.
 
 Issues #704 and #1281 also remain open. The tool-parser source has 38 parser
 classes and 42 accepted names. `docs/FEATURES.md` reports 38 families, but the
@@ -198,6 +199,14 @@ environment names, revisions, hashes, sizes, lifecycle states, measurements,
 limitations, API contracts, links, and checker-bound literals remain unchanged.
 The Windows publication sentence and its state anchor remain in `docs/USAGE.md`
 because `check-windows-release-state` binds that exact public surface.
+
+The R5 repair corrects the IndexTTS source-tree server path and removes
+implementation chronology from the MiniMax-Music3 and LTX 2.5 model recipes.
+Those pages retain current checkpoint metadata, commands, defaults,
+limitations, diagnostics, and gate commands. Their named specifications retain
+the implementation sequence, mutation evidence, rejected approaches, and issue
+history. This pass covers campaign-created public pages. It does not claim to
+rewrite every legacy page under `docs/`.
 
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue

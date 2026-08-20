@@ -978,6 +978,15 @@ which is where this spec's `### Decisions taken here` already said they would be
   three phases that carry the render and say nothing about these. That is a fact
   about the driver — they really are bookkeeping — but it means their PLACEMENT
   is unproven, and a shipped-checkpoint render is where it would show.
+* **F9 and F10 are FIXED AND UNGATED, and this is stated rather than implied.**
+  The sampler-lifetime repairs carry no mutation of their own. F9 is a race
+  between `Reset()` and `Open` whose window is a few instructions wide, and a
+  test that loses it reliably would have to instrument the emitter's internals;
+  F10 is an absence — a thread that keeps running — which no assertion in this
+  suite is positioned to observe. What the 91-case suite proves is that neither
+  repair regressed anything, not that either is detected. A gate for them would
+  need a `PhaseLog`-level unit case with an injected scheduler, which is a
+  different row's shape and is not claimed here.
 * **`phase.upsample_latent` is gated only on the reduced two-phase fixture.** It
   is the only leaf whose sole reader is the DFR case, because every other render
   in `test_ltx2_video` pins `max_phase = 0`, where the input transform is never

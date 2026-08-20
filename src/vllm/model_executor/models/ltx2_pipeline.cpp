@@ -1510,8 +1510,21 @@ Ltx2PipelineRecipe Res2sTwoStageRecipe(const std::string& version) {
   // stages)` (CLAUDE.md:26). The CHECKPOINT half is `Full`. The ADAPTER half is
   // `requires_distilled_lora`, which this recipe still leaves false; that is a
   // separate defect with its own issue (#1445) and the row that added this line
-  // deliberately did not change it, because setting it refuses loads that
-  // succeed today.
+  // deliberately did not change it.
+  //
+  // The reason is BLAST RADIUS, and not "it would refuse loads that succeed
+  // today" as this comment first said — the row that added this line already
+  // refuses every load that omits `checkpoint_class`, so that reason separates
+  // nothing. Setting `requires_distilled_lora` changes an EXISTING field on an
+  // arm whose gates assert an adapter-less load succeeds, and it is a sampling
+  // decision rather than a declaration. `ltx25-checkpoint-class.md` section 6
+  // named that boundary as a stop condition before the implementation started.
+  //
+  // What #1445 is actually about, visible from right here: `stage2.sigmas`
+  // above is `Stage2DistilledSigmas()` while this flag is false, so a FULL
+  // transformer runs a distilled stage-2 schedule with no adapter and the load
+  // is accepted. That is structurally what `retake`'s `kFullOrDistilled`
+  // condition refuses in `RetakeRecipe` above.
   recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   return recipe;
 }
@@ -2285,14 +2298,15 @@ std::string WhyNoDetector() {
   return
       "Nothing in a checkpoint header separates them, measured rather than assumed: the full "
       "'ltx-2.5-22b-dev-transformer-bf16.safetensors' and the distilled "
-      "'ltx-2.5-22b-distilled-transformer-bf16.safetensors' are BOTH 42,018,190,584 bytes, so "
-      "size does not separate them; and on the two files that could be read here, the full bf16 "
-      "one and the distilled NVFP4 one, __metadata__[\"config\"] is 2199 bytes and "
-      "byte-identical and __metadata__[\"model_version\"] is '2.5.0' on each. The one structural "
-      "difference, 'keyframes_abs_pos_embedding', is an architecture-support flag and not a "
-      "distillation marker: the distilled NVFP4 config still declares "
-      "\"use_keyframes_abs_pos_embedding\": true with the tensor absent, and a third distilled "
-      "file carries the tensor. So this engine cannot tell, and it refuses rather than guessing: "
+      "'ltx-2.5-22b-distilled-transformer-bf16.safetensors' are BOTH 42,018,190,584 bytes, and "
+      "their safetensors HEADERS are byte-identical apart from the key ORDER of the __metadata__ "
+      "sub-map, which no format rule fixes and any re-save reorders: 677,616 header bytes each, "
+      "the same 4349 tensor names, every per-tensor dtype, shape and data_offsets equal, and all "
+      "four __metadata__ values byte-identical, __metadata__[\"config\"] at 2199 bytes and "
+      "__metadata__[\"model_version\"] at '2.5.0' among them. The one structural candidate, "
+      "'keyframes_abs_pos_embedding', is an architecture-support flag and not a distillation "
+      "marker: BOTH bf16 files carry it, as BF16 [1, 4096] at the same offsets. So this engine "
+      "cannot tell, and it refuses rather than guessing: "
       "a distilled schedule on full weights, or a full schedule on distilled weights, renders a "
       "clip of the requested size, frame count and sample rate in a sampling regime the model was "
       "never trained for, and no pixel, RMS, windowed-energy or spectral check can see it.";

@@ -4215,6 +4215,13 @@ TEST_CASE("ltx2 checkpoint class: the refusal accepts exactly the upstream combi
     CHECK(msg.find("checkpoint_class") != std::string::npos);
     CHECK(msg.find("42,018,190,584") != std::string::npos);  // the measured size tie
     CHECK(msg.find("byte-identical") != std::string::npos);  // the measured config tie
+    // The measured HEADER tie, which is the strongest of the three and the one
+    // a reader can act on: the two bf16 files declare the same 677,616 header
+    // bytes over the same 4349 tensor names. Pinned because the message is the
+    // only place this measurement reaches an operator, and an unpinned number
+    // in a string drifts silently.
+    CHECK(msg.find("677,616") != std::string::npos);
+    CHECK(msg.find("4349") != std::string::npos);
     CHECK(msg.find("'full'") != std::string::npos);
     CHECK(msg.find("'distilled'") != std::string::npos);
     CHECK(msg.find("'keyframe_slot_sft'") != std::string::npos);

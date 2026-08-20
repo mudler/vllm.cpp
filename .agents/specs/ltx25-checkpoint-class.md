@@ -28,13 +28,18 @@ measurement that says why detection is not available, and the refusal message
 says the same thing to the operator.
 
 **No render on real weights is claimed.** No GPU lease was taken. The gate is
-the reduced fixture plus the four real safetensors headers listed in section 2,
+the reduced fixture plus the six real safetensors headers listed in section 2,
 read by parsing their JSON prologue and no payload.
 
-**The distilled bf16 transformer was not read.** It is the one file that would
-settle section 2 by direct comparison, `Lightricks/LTX-2.5` is gated, and an
+**The distilled bf16 transformer WAS read, and its header does not differ.** It
+is the one file that settles section 2 by direct comparison. This row first
+recorded it as unreadable, because `Lightricks/LTX-2.5` is gated and an
 unauthenticated range request for its first 8 bytes answered `401` on
-2026-08-20. Section 2.4 states exactly what that leaves unproven.
+2026-08-20; the same request carrying this box's HuggingFace token answers `206`,
+and the whole header is 677,624 bytes off a 42 GB file. Section 2.4 is that
+measurement. It **strengthens** the conclusion rather than narrowing it: the two
+bf16 headers are byte-identical apart from the key order of the `__metadata__`
+sub-map, so there is nothing left for a header detector to key on.
 
 ---
 
@@ -91,19 +96,24 @@ The question this row had to answer before it could design anything: does the
 safetensors header of a distilled LTX-2.5 transformer differ from a full one, in
 any field a loader can read?
 
-Four real files were read on 2026-08-20 by parsing the 8-byte length prefix and
-the JSON header, and no payload byte.
+Six real files were read on 2026-08-20 by parsing the 8-byte length prefix and
+the JSON header, and no payload byte. Four are on local disk. Two — the
+distilled bf16 transformer and the PUBLISHED NVFP4 artifact — were read over the
+network by authenticated HTTP range request, which is section 2.4's method.
 
-| Short name | Path | Bytes | Header bytes | Tensors |
+| Short name | Path or source | Bytes | Header bytes | Tensors |
 |---|---|---:|---:|---:|
 | FULL-BF16 | `.../lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 | 677,616 | 4349 |
-| DIST-NVFP4 | `.../lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,432,024 | 1,179,408 | 7876 |
+| DIST-BF16 | `Lightricks/LTX-2.5` @ `6c7e5e57`, `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors`, RANGE-read | 42,018,190,584 | 677,616 | 4349 |
+| DIST-NVFP4 | `.../lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, the LOCAL copy | 18,721,432,024 | 1,179,408 | 7876 |
+| PUB-NVFP4 | `Lightricks/LTX-2.5` @ `6c7e5e57`, the same name PUBLISHED, RANGE-read | 18,721,548,408 | 1,287,600 | 7877 |
 | DIST-FP8 | `.../vonkaiser-fp8-nvfp4/transformer/ltx-2.5-22b-distilled-fp8.safetensors` | 21,025,119,068 | 881,048 | 6124 |
 | DIST-LORA | `.../lightricks-ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 | 526,744 | 3320 |
 
-All three transformers are semantically complete: `8 + header + max(data_offsets[1])`
-equals the file size exactly, on each one. So every absence recorded below is a
-real absence and not a truncated download.
+Every transformer here is semantically complete: `8 + header + max(data_offsets[1])`
+equals the file size exactly, on each one, including both range-read files, whose
+size comes from their own `Content-Range` denominator. So every absence recorded
+below is a real absence and not a truncated download.
 
 ### 2.1 `__metadata__` carries nothing
 
@@ -123,30 +133,56 @@ each string taken on both files:
 whole `__metadata__` map is one and the same map on a full checkpoint and on a
 distilled one, and it survives re-quantization unchanged.
 
+**DIST-BF16 makes the same statement without the re-quantization step**, which
+is the stronger form of it: all four values compare equal to FULL-BF16's, byte
+for byte, on two files of the same dtype and the same size that differ only in
+class. Section 2.4 is that comparison in full.
+
 DIST-FP8 carries **no `__metadata__` at all**, which is why the FP8 recipes in
 `docs/USAGE.md` need `--dit-config`.
 
-So the only metadata a loader could key on is identical across the class
-boundary, or absent.
+**One file carries a fifth key, and it is not a class signal.** PUB-NVFP4 holds
+`_quantization_metadata` beside the four, and the local DIST-NVFP4 copy of the
+same name does not. It says the file was quantized, which its own dtypes already
+say, and both files are distilled builds, so it separates two BUILDS of one
+class rather than the classes. Recorded because a reader who greps for a fifth
+metadata key will find it and should not have to work out what it is.
 
-### 2.2 The one structural difference is NOT a class marker, and two facts falsify it
+So the only metadata a loader could key on is identical across the class
+boundary, or absent, or a quantization marker.
+
+### 2.2 The one structural difference is NOT a class marker, and four facts falsify it
 
 Comparing tensor NAME sets after stripping quantization sidecar suffixes, the
-only name present in FULL-BF16 and absent from DIST-NVFP4 is
+only name present in FULL-BF16 and absent from the LOCAL DIST-NVFP4 copy is
 `model.diffusion_model.keyframes_abs_pos_embedding` (`BF16 [1, 4096]`). #1137
-reports this and correctly declines to use it. Two measurements taken here say
-why that decline was right:
+reports this and correctly declines to use it. Four measurements taken here say
+why that decline was right, and the fourth is decisive on its own:
 
 1. **DIST-NVFP4's own `config` still declares it.** The byte-identical config in
    2.1 contains `"use_keyframes_abs_pos_embedding": true`, while the tensor is
-   absent from the file. The config is therefore a verbatim copy that describes
+   absent from that file. The config is therefore a verbatim copy that describes
    the architecture, not the build, and the tensor's absence is a
-   quantization-time drop.
+   build-time drop.
 2. **A third file named `distilled` CARRIES it.** DIST-FP8 holds
    `model.diffusion_model.keyframes_abs_pos_embedding` as `F8_E4M3 [1, 4096]`
    with an `F32` `..._scale` beside it, and its base tensor-name set is exactly
    FULL-BF16's 4349 names plus 1775 `_scale` sidecars — zero names in FULL-BF16
    are missing from it.
+3. **The PUBLISHED file of the same name as DIST-NVFP4 carries it too.**
+   PUB-NVFP4 holds it as `BF16 [1, 4096]` among 7877 tensors, against the local
+   copy's 7876. So the absence in point 1 is a property of ONE build sitting on
+   this project's NAS under a published name, and not of the NVFP4 arm, of the
+   distilled class, or of anything a loader could generalise. That is section
+   2.3's local-copy divergence again, now with the differing tensor named
+   instead of only a byte-count delta.
+4. **Both bf16 transformers carry it, at the same offsets.** FULL-BF16 and
+   DIST-BF16 each hold `model.diffusion_model.keyframes_abs_pos_embedding` as
+   `BF16 [1, 4096]` with identical `data_offsets`. On the one pair where a class
+   marker would have decided anything, the tensor is present and identically
+   DECLARED on both sides. Its payload was not read and is not claimed equal —
+   the declaration is the whole of what a header detector could ever see, and
+   the two declarations are the same.
 
 This agrees with what this tree already says about that tensor: it is the
 architecture-support flag for keyframe slots
@@ -168,31 +204,82 @@ blobs does differ (`b0b8c2de...` against `3ba48d13...`), which proves the two
 files are not the same bytes; it is not a fact any loader can read from the file
 it was handed.
 
-**One local copy already disagrees with the published artifact.** The tree
-listing gives the NVFP4 transformer as 18,721,548,408 bytes. The local
-DIST-NVFP4 above is 18,721,432,024, a difference of 116,384 bytes, and it is
-internally complete. So a file under the published name on this project's own
-NAS is not the published build. That is the same hazard `AGENTS.md` names for
-re-quantized checkpoints, observed rather than argued, and it is why section 3
-reads no filename.
+**One local copy already disagrees with the published artifact, and the
+difference is now NAMED.** The tree listing gives the NVFP4 transformer as
+18,721,548,408 bytes. The local DIST-NVFP4 above is 18,721,432,024, a difference
+of 116,384 bytes, and it is internally complete. Both headers were then parsed —
+the local one from disk, PUB-NVFP4 by range request — and they are 7876 tensors
+against 7877, with `model.diffusion_model.keyframes_abs_pos_embedding` present
+in the published build and absent from the local one, plus a
+`_quantization_metadata` key the local copy does not carry. So a file under the
+published name on this project's own NAS is not the published build, and the
+difference is a whole tensor rather than padding. That is the same hazard
+`AGENTS.md` names for re-quantized checkpoints, observed rather than argued, and
+it is why section 3 reads no filename.
 
-### 2.4 What this leaves unproven
+### 2.4 The direct comparison, made: the two bf16 headers are the same header
 
-The direct comparison — FULL-BF16 against the distilled bf16, the pair that
-matters most because they are the same size and the same dtype — was **not
-made**. `Lightricks/LTX-2.5` is gated: an unauthenticated range request for the
-first 8 bytes of `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors`
-returned HTTP `401` on 2026-08-20, and the file is 42 GB, so no cheap
-authenticated path was available inside this row.
+FULL-BF16 against DIST-BF16 is the pair that matters most, because they are the
+same size and the same dtype and differ only in class. The comparison **was
+made**, and the answer is that their headers are identical apart from one
+serializer artifact.
 
-`docs/USAGE.md` currently asserts of that unread file that it is "4349 tensors"
-with "the same four `__metadata__` keys". That claim has no measurement behind
-it. This row corrects the sentence rather than inheriting it.
+**Method, recorded so the next reader does not repeat this row's mistake.**
+`Lightricks/LTX-2.5` is gated, and an UNAUTHENTICATED range request for the
+file's first 8 bytes answers HTTP `401`. This row first read that `401` as "no
+cheap path exists" and deferred the measurement. It is not what a `401` means.
+The box carries a HuggingFace token at `~/.cache/huggingface/token`; the same
+request with `Authorization: Bearer <token>` answers `206`, and a safetensors
+header is reachable in two of them:
 
-The conclusion this row acts on is therefore stated at its real strength: **no
-field measured here separates the classes, and the one candidate is falsified
-twice**. A detector built on any of these fields would be a guess, and #1137 is
-explicit that a wrong detector is worse than none.
+```sh
+# 1. the 8-byte little-endian header length, then 2. the header itself
+Range: bytes=0-7          ->  206, 8 bytes,       Content-Range .../42018190584
+Range: bytes=8-677623     ->  206, 677,616 bytes, Content-Range .../42018190584
+```
+
+677,624 bytes off a 42 GB file, per file, no payload byte and no `hf download`.
+The file's own size arrives free in the `Content-Range` denominator, which is
+what makes the completeness check above possible without a tree listing.
+
+**What the comparison says**, with FULL-BF16 read the same way on the same day:
+
+| Property | FULL-BF16 | DIST-BF16 | Equal |
+|---|---|---|---|
+| header bytes | 677,616 | 677,616 | yes |
+| tensor names | 4349 | 4349 | yes, as SETS |
+| per-tensor entry (`dtype`, `shape`, `data_offsets`) | — | — | yes, on all 4349 |
+| `__metadata__` keys | 4 | 4 | yes |
+| `__metadata__` values | — | — | yes, all four byte-identical |
+| `keyframes_abs_pos_embedding` | `BF16 [1, 4096]` | `BF16 [1, 4096]` | yes, same offsets |
+| `8 + header + max(data_offsets[1])` | 42,018,190,584 | 42,018,190,584 | yes, = file size |
+| raw header bytes | — | — | **no** |
+
+**The single difference is key ORDER inside `__metadata__`**: `model_version`
+first on FULL-BF16, `gemma_source_checkpoint` first on DIST-BF16. The raw headers
+first differ at byte 18 and last differ at byte 37,708 — the whole divergence is
+inside that ~37 KB sub-map, and every byte after it is identical. Re-serialize
+the sub-map with its keys sorted and the two headers compare EQUAL.
+
+That order is not a field and cannot become one. Nothing in the safetensors
+format fixes it, it is whatever the writing process's dictionary iteration
+produced, and any re-save reorders it. A detector on it would fail on the first
+file anybody round-trips, silently, in the direction that admits the wrong
+checkpoint.
+
+The conclusion this row acts on is therefore stated at its real strength, and it
+is stronger than the version this section replaced: **nothing in either header
+separates the classes, on the exact pair where a separation would have decided
+the question, and the one structural candidate is falsified four ways** (2.2). A
+detector built on any of these fields would be a guess, and #1137 is explicit
+that a wrong detector is worse than none.
+
+`docs/USAGE.md` previously asserted of this file, without a measurement, that it
+is "4349 tensors" with "the same four `__metadata__` keys". That sentence was
+withdrawn for the right reason — nothing had measured it — and the measurement
+now agrees with it. Both facts are recorded, because "it turned out to be true"
+is not a reason to have asserted it, and the page now says which of its
+statements are measured and how.
 
 ---
 
@@ -356,18 +443,32 @@ Both are behaviour changes on shipped, gated arms and belong to their own rows.
      class is this" into "which build is this", which is strictly stronger.
      `Lightricks/LTX-2.5` is gated and its unauthenticated tree API returns 64
      literal `*` characters for every `lfs.oid` and `xetHash`, so this needs an
-     authenticated fetch. Owned by
+     authenticated fetch — and, unlike the header in 2.4, a digest needs the
+     whole 42 GB, so an authenticated RANGE request does not reach it. Owned by
      [#1048](https://github.com/mudler/vllm.cpp/issues/1048).
-  3. **A payload-level signature.** Unknown, and unknowable from here: it needs
-     the header-and-payload diff of the two bf16 transformers that section 2.4
-     could not make. If a stable, cheap discriminator exists it is in the
-     weights, not in the header.
+  3. **A payload-level signature.** Unknown, and now known to be the ONLY place
+     left to look. Section 2.4 made the header half of the diff the earlier
+     draft of this bullet said was unavailable, and it came back empty: the two
+     bf16 headers are the same header. So a cheap discriminator, if one exists,
+     is in the weights. Whoever tries it should say up front how many bytes it
+     costs to read, because that is the property that decides whether a loader
+     can afford it at all.
 
   Until one of those lands, the declaration is **load-bearing rather than
   belt-and-braces**: a wrong declaration is the only remaining path to the
   silent wrong-regime render, and nothing downstream can catch it.
 - `dmd2` has no stated checkpoint class in either reference, so it is the one
   kind this row does not gate (`kUnstated`).
+- **`dfr` has no obtainable base checkpoint, and no issue here can fix that.**
+  Its class is `keyframe_slot_sft` and nobody publishes one: `CLAUDE.md:24` and
+  `dfr_pipeline.py:157` name the class and never a file, and the authenticated
+  `/api/models` listing of `Lightricks/LTX-2.5` @ `6c7e5e57` (2026-08-20) has 17
+  files whose five transformers are all `dev` or `distilled`. This is external
+  debt, so it is recorded rather than assigned: it clears when Lightricks
+  publishes such a base, and the real-weight LTX-2.5 gate that would then use it
+  is [#1048](https://github.com/mudler/vllm.cpp/issues/1048)'s. Until then
+  `docs/USAGE.md` and `docs/FEATURES.md` say the arm cannot be fed, and this row
+  does NOT loosen the refusal to make it reachable.
 - `dfr` and `res2s_two_stage` do not set `requires_distilled_lora`, although
   upstream's table gives both a `+ distilled LoRA` half
   (`CLAUDE.md:24`, `:26`; `dfr_pipeline.py:595` passes `args.distilled_lora`
@@ -400,8 +501,27 @@ explicitly; none relies on the field's default.
 Captured at the pre-implementation tree (`include/`, `src/` and both test files
 at the spec commit), with the five shipped engine cases appended and ONE textual
 substitution: `vllm::multimodal::kLtx2CheckpointClassExtra`, which does not
-exist yet, for its literal spelling `"checkpoint_class"`, at 12 sites. No
-assertion was changed.
+exist yet, for its literal spelling `"checkpoint_class"`. No assertion was
+changed.
+
+**The site count in this paragraph read "12" and the shipped file has 39.** The
+correction matters more than the number does, because a red captured against a
+text that is not what ships is not evidence of anything. `grep -c` on
+`tests/vllm/multimodal/test_ltx2_video.cpp` at the head returns **40** matches:
+39 uses of the symbol, plus `test_ltx2_video.cpp:1298`, where the name appears
+as the string literal `"kLtx2CheckpointClassExtra"` inside the `served_tokens`
+anchor list and must NOT be substituted. So the substitution is 39 sites, and
+the 40th is the reason a bare `grep -c` disagrees with it.
+
+**How the red was re-established.** The fresh review of this head did not take
+the capture on trust. It rebuilt the pre-implementation tree, took the HEAD's own
+`test_ltx2_video.cpp`, applied the substitution at its 39 symbol sites, built,
+ran, and got the counts this section records — `5 cases | 0 passed | 5 failed`,
+`20 assertions | 6 passed | 14 failed`, the FATAL at the undeclared case with
+`msg` empty. So the recorded red is now evidence about the text that ships,
+which is what the wrong site count had put in doubt. Anyone re-running it should
+check the count with BOTH greps rather than one, because the difference between
+40 and 39 is the whole trap.
 
 - `BUILT=YES`, `compile_err=0`, `git diff --stat` against the spec commit
   `1 file changed, 234 insertions(+)` — the test file alone.
@@ -410,7 +530,9 @@ assertion was changed.
   is a run and not a filter that matched nothing.
 - The defect itself is the FATAL in
   `ltx2 checkpoint class: an UNDECLARED load refuses instead of rendering` at
-  `kind = one_stage`, `test_ltx2_video.cpp:9917`: `REQUIRE_FALSE( msg.empty() )`
+  `kind = one_stage`, `test_ltx2_video.cpp:10019` at this head — the capture's
+  own `:9917` was taken before the file grew above it, which is #911 again:
+  `REQUIRE_FALSE( msg.empty() )`
   with `msg` empty — the load SUCCEEDED. A `Full`-arm load that declared nothing
   rendered.
 - This capture was taken TWICE: once on the first draft of the cases, and again
@@ -476,9 +598,34 @@ still pass every check this tree owns.
 condition mirrors `retake.py:71-73`.
 
 **Changing `requires_distilled_lora` on `res2s_two_stage` and `dfr`.** Found
-while reading the table; it refuses loads that succeed today on two shipped
-arms, so it went to [#1445](https://github.com/mudler/vllm.cpp/issues/1445) and
-section 6's stop condition rather than into this diff.
+while reading the table; it went to
+[#1445](https://github.com/mudler/vllm.cpp/issues/1445) and section 6's stop
+condition rather than into this diff.
+
+The reason first recorded here — *"it refuses loads that succeed today on two
+shipped arms"* — is a weak one, and the correction matters because a weak reason
+invites the next reader to overturn a decision that is right. **This pull
+request already refuses every load that succeeds today**: any load omitting
+`checkpoint_class` is refused on nine of ten kinds. "It would break working
+loads" therefore separates nothing. The real reason is **blast radius**. Setting
+that flag changes an EXISTING field on arms that are already gated, whose tests
+assert an adapter-less load succeeds, and whose behaviour change is a sampling
+decision rather than a declaration; this row adds a new field and touches no
+existing one. Section 6 named that boundary as a stop condition **before** the
+implementation started, in the committed spec, which is what makes the deferral
+a plan rather than a retreat from work that turned out to be inconvenient.
+
+**#1445's premise holds in this port, and it is worth writing down where the
+next reader will look for it.** `Res2sTwoStageRecipe` gives stage 2
+`Stage2DistilledSigmas()` (`ltx2_pipeline.cpp:1457`, `:1460`) and leaves
+`requires_distilled_lora` false, which the comment beside its
+`checkpoint_class` line states outright. `DfrRecipe` (`:1303`) inherits
+`DistilledTwoStageRecipe`'s (`:1229`) schedule on both stages and
+leaves it false as well. So the arm this row ships **accepts** a full
+transformer running a distilled stage-2 schedule with no adapter on
+`res2s_two_stage` — structurally the same hazard that `retake`'s
+`kFullOrDistilled` condition refuses. That is #1445's whole content, and it is
+now grounded in this tree rather than only in upstream's table.
 
 ### Why each default has its value
 
@@ -497,9 +644,24 @@ section 6's stop condition rather than into this diff.
 ### Limits
 
 - No GPU lease was taken and no render on real weights is claimed. The gate is
-  the reduced fixture plus four real safetensors headers.
+  the reduced fixture plus six real safetensors headers.
 - The engine cannot check the declaration. A false declaration still renders in
   the wrong regime.
-- The distilled bf16 transformer was not read (section 2.4). If it ever becomes
-  readable and its header does differ from the full one, this row's conclusion
-  narrows and a detector becomes possible; the refusal stays correct either way.
+- The distilled bf16 transformer WAS read (section 2.4), and its header does not
+  differ from the full one. An earlier draft of this bullet left open the
+  question *"if it ever becomes readable and its header does differ, a detector
+  becomes possible"*; it is readable, it does not differ, and no header detector
+  is possible on that pair. What stays unmeasured is its PAYLOAD, and the
+  `## Owed` bullet 3 above says that is now the only place a discriminator could
+  be.
+- **`dfr` cannot be fed here at all**, and that is an artifact gap rather than a
+  gate gap. Its class is `keyframe_slot_sft`; upstream names the class and never
+  an artifact (`CLAUDE.md:24`, `dfr_pipeline.py:157`); and the authenticated
+  `/api/models` listing of `Lightricks/LTX-2.5` @ `6c7e5e57` on 2026-08-20 gives
+  17 files, of which the five transformers are all `dev` or `distilled`. So the
+  refusal this row ships is, for that one kind, the whole of what a user can
+  reach. `docs/USAGE.md` and `docs/FEATURES.md` both say so rather than
+  advertising a runnable arm, and the row deliberately did NOT loosen the
+  refusal to compensate: a declaration a user cannot honestly make is a missing
+  checkpoint, and pretending otherwise would put #1137 back on the one arm whose
+  weights nobody has.

@@ -1421,6 +1421,31 @@ describing different frames, and the render would still finish. Use
 `--pipeline-kind distilled_two_stage` or `one_stage` if you want to place slots
 by count. An explicit `0` still passes, because that is upstream's default.
 
+**No published checkpoint can run this arm, so `dfr` is refused in practice.**
+Its required `checkpoint_class` is `keyframe_slot_sft`, and upstream names that
+class without ever naming a file: `packages/ltx-pipelines/CLAUDE.md:24 @
+fd4ded7f` gives `DFRPipeline` the model `Keyframe-slot SFT + distilled LoRA
+(+ detailing IC-LoRA stage 2)`, and `dfr_pipeline.py:157` says the same in prose
+— *"on a keyframe-slot-capable SFT base plus a distilled LoRA"*. Neither states
+an artifact. Read from the AUTHENTICATED `/api/models` listing on 2026-08-20,
+`Lightricks/LTX-2.5` at revision `6c7e5e573ac1667efc83407806fe9b0b93730e60`
+publishes 17 files, of which five are transformers, and every one of them is a
+`dev` (full) or a `distilled` build — the same five the pin table below carries.
+`Lightricks/LTX-2.5-Pre-Trained` (revision
+`290c9c49958def5c68b5acdf45aac55d314b3f61`) holds `ltx-2.5-22b-pt-bf16.safetensors`,
+a PRE-TRAINED base rather than a keyframe-slot SFT one. So there is nothing this
+page can pin for `dfr`, and every DFR claim in this tree is a reduced-fixture
+claim (`test_ltx2_dfr`, 11 cases against executed upstream helpers).
+
+That has a consequence worth stating flatly, because the alternative is a reader
+working it out at a refusal: declaring `--checkpoint-class keyframe_slot_sft`
+for a `dev` or a `distilled` file, to get past that refusal, is exactly the
+deliberate false declaration the `checkpoint_class` section below names as the
+last remaining path to a silent wrong-regime render. Do not do it. If you hold a
+keyframe-slot SFT base privately the arm runs and this paragraph does not apply
+to you; if you do not, the honest state is that the arm cannot be fed here, and
+that is a missing artifact rather than a missing implementation.
+
 **How to reach it.** `pipeline_kind` is a LOAD knob, not a per-generation one, so
 all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
 `vllm_video_model_params.extra_keys` / `extra_values`, and the server's
@@ -4261,7 +4286,7 @@ pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 | `one_stage` | 2, 2.3, 2.4, 2.5 | `full` | — |
 | `distilled_two_stage` | 2, 2.5 | `distilled` | `upsampler_path` for its second phase |
 | `res2s_two_stage` | **2.5 only** | `full` | `upsampler_path` for its second phase |
-| `dfr` | **2.5 only** | `keyframe_slot_sft` | `upsampler_path` |
+| `dfr` | **2.5 only** | `keyframe_slot_sft` | `upsampler_path`, and a base NOBODY PUBLISHES — see `--pipeline-kind dfr` above |
 | `dmd2` | 2, 2.3 | none stated | — |
 | `retake` | 2, 2.5 | `full` **with** `lora_path`, or `distilled` | a source clip as a `frame_%06d.ppm` directory |
 | `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | `full` | a text tower; no video VAE is asked for |
@@ -4288,23 +4313,49 @@ the `checkpoint_class` load extra on the C API, and
 `--video-extra checkpoint_class=...` on the server.
 
 **The engine asks because it cannot tell.** Measured on 2026-08-20 by parsing
-four LTX-2.5 safetensors headers and no payload byte:
+six LTX-2.5 safetensors headers and no payload byte:
 
-- `ltx-2.5-22b-dev-transformer-bf16.safetensors` (full) and
-  `ltx-2.5-22b-distilled-transformer-bf16.safetensors` (distilled) are **both
-  42,018,190,584 bytes**, so `ls -l` does not separate them.
-- The **whole `__metadata__` map** of the full file and of the distilled NVFP4
-  build is byte-identical, key by key: `config` (2199 bytes, sha256 opening
-  `13be9edf16635af9`), `gemma_source_checkpoint` (62), `license` (34562) and
-  `model_version` (`2.5.0`). It survives re-quantization unchanged, so there is
-  no metadata field left to key on.
-- The one structural difference between those two,
-  `keyframes_abs_pos_embedding`, is an architecture-support flag and not a
-  distillation marker. The distilled NVFP4 file's own copied config still
-  declares `"use_keyframes_abs_pos_embedding": true` with the tensor absent, and
+- **The two bf16 transformers have the SAME HEADER.** This is the pair a
+  detector would have to separate, and it is the measurement that settles the
+  question. `ltx-2.5-22b-dev-transformer-bf16.safetensors` (full) and
+  `ltx-2.5-22b-distilled-transformer-bf16.safetensors` (distilled) each declare
+  **677,616** header bytes, the same **4349** tensor names, and per-tensor
+  entries — dtype, shape, `data_offsets` — that compare **equal on every one of
+  the 4349**. Both are **42,018,190,584 bytes**, so `ls -l` does not separate
+  them either, and `8 + header + max(data_offsets[1])` equals that size on each,
+  so both are semantically complete files rather than truncated reads.
+- The **whole `__metadata__` map** is byte-identical across the class boundary,
+  key by key: `config` (2199 bytes, sha256 opening `13be9edf16635af9`),
+  `gemma_source_checkpoint` (62), `license` (34562) and `model_version`
+  (`2.5.0`). That holds between the two bf16 files AND between the full file and
+  the distilled NVFP4 build, so it survives re-quantization unchanged and there
+  is no metadata field left to key on.
+- **The only byte difference in either bf16 header is key ORDER inside
+  `__metadata__`** — `model_version` first on the full file,
+  `gemma_source_checkpoint` first on the distilled one. Re-serialize that
+  sub-map with its keys sorted and the two headers are byte-identical. Order is
+  not a field: no safetensors rule fixes it, it is whatever the writer's
+  dictionary iteration produced, and any re-save can change it. A detector on it
+  would be a guess wearing a measurement.
+- `keyframes_abs_pos_embedding` is an architecture-support flag and not a
+  distillation marker, and **three** files say so. Both bf16 transformers carry
+  `model.diffusion_model.keyframes_abs_pos_embedding` as `BF16 [1, 4096]` at the
+  same offsets, so it does not separate the classes at all;
   `vonkaiser/LTX-2.5-FP8-NVFP4`'s `ltx-2.5-22b-distilled-fp8.safetensors`
-  **carries** the tensor, as `F8_E4M3 [1, 4096]` with an `F32` scale, over a base
-  tensor-name set that is exactly the dev file's 4349 names.
+  carries it as `F8_E4M3 [1, 4096]` with an `F32` scale, over a base tensor-name
+  set that is exactly the dev file's 4349 names; and the one file it is absent
+  from is a LOCAL NVFP4 copy whose own copied config still declares
+  `"use_keyframes_abs_pos_embedding": true` — that copy is 7876 tensors against
+  the published artifact's 7877, which is the build divergence recorded under
+  the pin table below and not a class signal.
+
+**How those headers were read, so the next reader does not have to re-derive
+it.** `Lightricks/LTX-2.5` is gated and an unauthenticated range request answers
+`401`, but an authenticated RANGE request is cheap and needs no download:
+`Authorization: Bearer $(cat ~/.cache/huggingface/token)` with
+`Range: bytes=0-7` for the 8-byte length prefix, then `Range: bytes=8-677623`
+for the header itself. Two `206`s and 677,624 bytes off a 42 GB file, per file,
+no payload byte and no `hf download`.
 
 So there is no field to detect, a wrong detector would be worse than none, and
 the load refuses rather than guessing. Pointing `--dit` at the distilled file on
@@ -4782,7 +4833,7 @@ API's tree listing.
 | Arm | File under `diffusion_models/` | Bytes | sha256 |
 |---|---|---:|---|
 | unquantized bf16, FULL (dev) | `ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 | `792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584` (the local copy; see below) |
-| unquantized bf16, distilled | `ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 | not obtainable here |
+| unquantized bf16, distilled | `ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 | not obtainable here — a whole-file digest needs the whole 42 GB. Its HEADER was read; see below |
 | NVFP4 (`nvfp4-prequant`), distilled | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 | not obtainable here |
 | `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
 | `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
@@ -4805,18 +4856,28 @@ compare it to.
 each, re-read from the tree API on 2026-08-20. The file name is the only cheap
 thing that separates them, and a file name is not a pin.
 
-**What is measured about the distilled bf16 file, and what is not.** Its SIZE is
-the tree listing's. Nothing else here is: it is 42 GB in a gated repository, an
-unauthenticated range request for its first 8 bytes answers HTTP `401`, and no
-copy of it exists on this project's NAS. An earlier version of this paragraph
-asserted that it is "4349 tensors" carrying "the same four `__metadata__` keys",
-which no measurement supported; that sentence is withdrawn. What IS measured, on
-the files that are here, is the full bf16 file against the distilled NVFP4 one:
-byte-identical 2199-byte `__metadata__["config"]`, the same `model_version`
-`2.5.0`, and one structural difference that is an architecture flag rather than
-a class marker. The full derivation is in the `checkpoint_class` section above
+**What is measured about the distilled bf16 file, and what is not.** Its HEADER
+is measured, and it is the one comparison that matters here: it is
+byte-for-byte the full `dev` file's header apart from the key ORDER of the
+`__metadata__` sub-map. Same 677,616 header bytes, the same 4349 tensor names,
+every per-tensor dtype/shape/`data_offsets` equal, all four metadata values
+byte-identical, `keyframes_abs_pos_embedding` present on both, and
+`8 + header + max(data_offsets[1])` equal to the file size on both. The
+derivation and the reading method are in the `checkpoint_class` section above,
 and in [`.agents/specs/ltx25-checkpoint-class.md`](../.agents/specs/ltx25-checkpoint-class.md)
 section 2.
+
+What is still NOT measured is its CONTENT digest, and that limit is a size
+rather than a permission: a sha256 needs all 42 GB, no copy exists on this
+project's NAS, and the gated tree API answers an unauthenticated caller with a
+fabricated `lfs.oid`. **An earlier version of this paragraph said the header
+itself was unreadable, because an unauthenticated range request for the first 8
+bytes answers HTTP `401`.** That was wrong, and it is corrected here rather than
+left as inherited context: the box holds a token, the same request WITH it
+answers `206`, and reading a 42 GB file's header costs 677,624 bytes. A `401`
+was read as "no cheap path exists" when it meant "this request was
+unauthenticated", and the cost of that mistake was a measurement deferred that
+took under a second to make.
 
 **The load now validates the checkpoint CLASS**
 ([#1137](https://github.com/mudler/vllm.cpp/issues/1137)). Pointing
@@ -4824,12 +4885,23 @@ section 2.
 wrong sampling regime with no diagnostic; it is refused now, by the declaration
 the caller supplies rather than by a detector, for the reason above.
 
-**A local copy already disagrees with the published artifact.** The tree listing
-gives the NVFP4 transformer as 18,721,548,408 bytes. The copy under that name on
-this project's NAS is 18,721,432,024, a difference of 116,384 bytes, and it is
-internally complete — its `8 + header + data_end` equals its own size. So it is a
-different build under an unchanged name, which is exactly the hazard the class
-declaration exists for.
+**A local copy already disagrees with the published artifact, and now WHAT
+differs is known.** The tree listing gives the NVFP4 transformer as
+18,721,548,408 bytes. The copy under that name on this project's NAS is
+18,721,432,024, a difference of 116,384 bytes, and it is internally complete —
+its `8 + header + data_end` equals its own size. Both headers were parsed on
+2026-08-20, the local one from disk and the published one by authenticated range
+request: the local copy holds **7876** tensors and the published artifact
+**7877**, and the extra name is
+`model.diffusion_model.keyframes_abs_pos_embedding` (`BF16 [1, 4096]`), which is
+present in the published build and absent from the local one. So the difference
+is not a rounding artifact of some re-quantization; it is a whole tensor, on the
+one name this page ever considered as a class signal. A different build under an
+unchanged name is exactly the hazard the class declaration exists for.
+
+**`dfr` has no row in this table**, because no keyframe-slot SFT transformer is
+published anywhere this page can reach. That is stated where a reader meets it,
+under `--pipeline-kind dfr` above.
 
 Read from the FULL model's own header on 2026-08-17, by parsing its
 677,616-byte JSON prologue and no payload: 4349 tensors, every one

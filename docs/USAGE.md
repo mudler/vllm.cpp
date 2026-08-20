@@ -1065,20 +1065,29 @@ count. These fields say how complete it is, and how far it carries:
 | `sampler_enabled` | whether the 100 ms sampler ran, or the peaks are boundary-only |
 | `notice` | **NOT A BENCHMARK**, and why — carried in the file rather than in a document a later reader would have to know to look for |
 
-Some phases are **decomposed rather than partitioned**. `decode.audio` carries
-`decode.audio.mel` and `decode.audio.vocoder` beneath it, and a two-stage
-recipe's `phase.prepare` carries `phase.upsample_latent`. Those records are
-marked `nested`, are printed for the reader, and are **excluded from
+Some phases are **decomposed rather than partitioned**. `denoise` carries one
+`denoise.step` per denoiser evaluation, `decode.video` carries
+`decode.video.chunk` per streamed chunk, `decode.audio` carries
+`decode.audio.mel` and `decode.audio.vocoder`, and a two-stage recipe's
+`phase.prepare` carries `phase.upsample_latent`. Those records are marked
+`nested`, are printed for the reader, and are **excluded from
 `sum_leaf_seconds`** — they are inside a leaf that is already counted, so adding
 them would make `unaccounted_seconds` the residue of double counting instead of
 time nobody named.
 
+A nested record is also what makes a phase NAME checkable. A leaf that claims to
+cover the denoise must enclose its own `denoise.step` records; one that stops
+short of the loop, or that hands the back half of it to a neighbouring name, no
+longer does. The three phases that carry a render each carry such an anchor for
+that reason.
+
 **Do not read a duration here as a measurement of this machine.** Every number
 is wall clock under whatever else the box was doing, which the file does not
-record: the same binary at the same geometry has measured 0.158 s, 6.138 s and
-12.030 s of wall on one contended host, and the rank of its two largest phases
-reversed between two of those runs. The ratio `sum_leaf_seconds / wall_seconds`
-is stable across all of them; the seconds are not.
+record: on one contended host the same binary at the same geometry has moved
+from 0.147 s to 4.463 s of wall between two runs a minute apart, and the rank of
+its two largest phases has reversed between such runs. The ratio
+`sum_leaf_seconds / wall_seconds` is stable across all of them; the seconds are
+not.
 
 `unaccounted_seconds` is emitted rather than distributed over the phases,
 because a table whose parts do not add up has a phase nobody named, and a

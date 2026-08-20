@@ -1177,3 +1177,16 @@ about magnitudes. **Two greedy prompts are not a token-exactness claim.**
 - **The drafter has still never run.** §10.5's acceptance A/B is unchanged.
 - **No speed axis.** §0 stands: the pinned oracle cannot load `muse_glimmer`, so
   there is no denominator and none is claimed here on any axis.
+
+## Owed
+
+- [#1466](https://github.com/mudler/vllm.cpp/issues/1466) —
+  `tests/vllm/models/test_muse_glimmer_text.cpp:532`, `CHECK(diff <= 5e-4)` is
+  the W1 measurement rounded up (`3a54c4b7d`'s body quotes 1.21e-04) with no
+  derivation beside it. `4712dac40` gave `vt`'s gated activations upstream's
+  rounding polarity, which is correct, and grew the envelope 2.8x to 3.43e-04 —
+  0.687 of the bound. Found while gating
+  [#1458](https://github.com/mudler/vllm.cpp/issues/1458), which repairs the
+  other member of the same class in the same case (`bdiff <= 1e-5`) and
+  deliberately leaves this one to its own derivation. A repair owes a measured
+  floor or a precision argument, never a bigger constant.

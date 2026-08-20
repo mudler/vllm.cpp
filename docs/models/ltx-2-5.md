@@ -162,6 +162,36 @@ with the embeddings connector, that count must be a multiple of 128. Set
 Pass `--dit-config` only when the selected DiT has no safetensors metadata. The
 loader refuses a config beside a checkpoint that already declares one.
 
+Declare the checkpoint family with `--checkpoint-class`: use `full` for the
+development transformer, `distilled` for the distilled transformer, and
+`keyframe_slot_sft` for that specialized arm. Every pipeline except `dmd2`
+requires a declaration. The loader checks it against the checkpoint rather than
+using it as an unchecked hint, and refuses a missing or mismatched class before
+generation.
+
+## Where video VAE decode runs
+
+The video VAE convolution dispatches through `vt::Conv3d` on the queue selected
+when the engine loads. `--device cuda` therefore selects the CUDA convolution;
+the default selects the CPU implementation, which remains byte-identical to the
+previous host loop.
+
+No GPU has run the CUDA arm yet, so this path has no accelerator correctness or
+speed claim. Norms, activations, upsampling, and attention still run on the
+host, which also means a device queue currently crosses the host-device boundary
+for each convolution ([#1451](https://github.com/mudler/vllm.cpp/issues/1451),
+[#1452](https://github.com/mudler/vllm.cpp/issues/1452)).
+
+The first non-CPU convolution prints this notice once per process:
+
+```text
+[vt] first non-CPU vt::Conv3d dispatch (device type 4). This arm has never been
+run on real hardware; see issue #1452.
+```
+
+The notice reports that the unverified arm was reached. It does not report a
+fallback or a degraded result.
+
 ## Inspect a render
 
 Each completed render writes `<workdir>/phase-log.json`. The C ABI function

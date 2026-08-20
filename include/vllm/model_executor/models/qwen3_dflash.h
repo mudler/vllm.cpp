@@ -66,6 +66,32 @@ struct Qwen3DFlashLayerAttnMode {
   int64_t sliding_window = 0;  // >0 for SWA layers; 0 for full layers
 };
 
+// SPEC-DFLASH2 W2 (#1314): the grouped dynamic depthwise convolution that wraps
+// ONE sublayer of a DFlash2 draft block. EMPTY on a DFlash1 draft, which is what
+// `Qwen3DFlashWeights::IsDflash2` reads.
+//
+// BEYOND-PIN, from `DFlashGroupedConv` (vllm/model_executor/models/qwen3_dflash2.py
+// @ vllm-project/vllm#52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`).
+//
+// Both tensors are named exactly as the published checkpoint stores them
+// (`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+// safetensors header read 2026-08-19):
+//   layers.N.attention_conv.base_kernel               bf16 (2, 2, 5120)
+//   layers.N.attention_conv.kernel_projection.weight  bf16 (1280, 5120)
+// and the same pair under `mlp_conv`.
+//
+// `base_kernel` dim 0 is the SIDE -- 0 = `prepare` (before the sublayer), 1 =
+// `finish` (after it) -- and NOT a tap. On this checkpoint `taps` is also 2, so
+// the two axes are indistinguishable by shape and only the port note separates
+// them. `kernel_projection` maps hidden -> `2 * taps * num_groups` (1280 =
+// 2*2*320 at hidden 5120 / conv_group_size 16), i.e. ONE projection of the
+// sublayer input carrying BOTH sides' deltas.
+struct Qwen3DFlashConvWeights {
+  OwnedTensor base_kernel;        // bf16 [2, taps, H]; dim 0 is the SIDE
+  OwnedTensor kernel_projection;  // bf16 raw-NK [2*taps*num_groups, H], nk
+  bool Empty() const { return base_kernel.bytes.empty(); }
+};
+
 // One DFlash draft decoder layer: input/post standard RMSNorm + plain Qwen3
 // attention (merged qkv, per-head q/k norm, NeoX RoPE) + SwiGLU MLP. Weights are
 // kept in the on-disk torch-Linear [N=out,K=in] orientation (nk=true) for
@@ -80,6 +106,11 @@ struct Qwen3DFlashLayerWeights {
   OwnedTensor gate_up_proj;  // bf16 raw-NK [2*I, H] (rows gate|up), nk
   OwnedTensor down_proj;     // bf16 raw-NK [H, I], nk
   Qwen3DFlashLayerAttnMode attn_mode;
+  // SPEC-DFLASH2 W2 (#1314): the two grouped convolutions of a DFlash2 block,
+  // wrapping the attention and the MLP sublayer respectively. Both EMPTY on a
+  // DFlash1 draft, and the forward then runs byte-for-byte as before.
+  Qwen3DFlashConvWeights attention_conv;
+  Qwen3DFlashConvWeights mlp_conv;
 };
 
 // Whole DFlash draft weights. The draft owns its OWN embed_tokens and lm_head
@@ -99,6 +130,22 @@ struct Qwen3DFlashWeights {
   int64_t num_taps = 0;         // len(target_layer_ids); fc input = H*num_taps
   int32_t mask_token_id = -1;   // dflash_config.mask_token_id (248070 for 27B)
   int64_t draft_vocab_size = 0;
+  // SPEC-DFLASH2 W2 (#1314): the conv geometry. `conv_taps` is
+  // `dflash_config.conv_kernel_size` and is 0 on a DFlash1 draft, which is what
+  // makes it the DFlash2 discriminator here -- a DFlash1 checkpoint declares
+  // none of these keys and carries no conv tensor.
+  int64_t conv_taps = 0;        // dflash_config.conv_kernel_size (2 on both drafts)
+  int64_t conv_group_size = 0;  // dflash_config.conv_group_size (16 on both drafts)
+  // The QUERY block the conv masks its taps against: `1 + num_speculative_tokens`,
+  // NOT `dflash_config.block_size`. Upstream sizes it from the speculative config
+  // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f`) and the checkpoint key only
+  // supplies that value's DEFAULT. `LoadQwen3DFlash` fills it from the config's
+  // `block_size` so a direct caller has a usable value; the loader OVERWRITES it
+  // with `1 + k` once the resolved speculative config is known, because a CLI `k`
+  // that differs from the checkpoint's default must move the conv's block with it.
+  int64_t conv_block_size = 0;
+  bool IsDflash2() const { return conv_taps > 0; }
 };
 
 // Load the z-lab DFlash draft checkpoint. The on-disk names follow vLLM's

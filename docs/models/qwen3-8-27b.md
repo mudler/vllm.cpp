@@ -97,16 +97,14 @@ CPU reference GEMM executes them, so this checkpoint runs on CPU today
 What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
-A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**run, and shape-restricted: unproven on every shape it can serve**. It is the
-block-scaled CUTLASS GEMM vLLM itself dispatches on those devices, ported whole,
-with the scales applied in the mainloop; it is compiled by continuous
-integration for both architectures and registered, so a build for one of them no
-longer refuses the checkpoint at prepare time. On
-2026-08-20 `test_ops_matmul_fp8_block_cuda` was run on a GB10 (compute
-capability 12.1) for the first time, and vLLM's own ported case -- M=32, N=576,
-K=7168 -- threw `cutlass Invalid status` before any kernel launched, because
-CUTLASS refused the configuration at `can_implement`.
+A CUDA kernel exists for the sm_120a and sm_121a architectures. It is
+shape-restricted and matches the CPU reference on the seven GB10 shapes that
+have been run. It is the block-scaled CUTLASS GEMM vLLM dispatches on those
+devices, with scales applied in the mainloop. Continuous integration compiles
+it for both architectures, and a build for either one registers the kernel.
+
+The first GB10 run also exposed the shape boundary: vLLM's ported M=32, N=576,
+K=7168 case was refused by CUTLASS at `can_implement` before launch.
 
 Which shapes are affected is now isolated, and the answer is a **shape
 restriction, not a bug in this tree**: on sm120 the CUTLASS block-wise
@@ -138,14 +136,18 @@ affected the same way. The CPU reference arm runs every one of these shapes.
 `Qwen/Qwen3.8-27B-FP8`, the checkpoint above, is not affected: its ten
 projections are all round.
 
-None of that makes the arm proven. **No shape has yet had its output compared
-against the CPU reference on any device**, there is still no token-exact
-comparison against vLLM and no throughput number. What changed is what a user is
-told when the shape cannot be served, not whether the shapes that can be served
-produce the right numbers.
-[#1437](https://github.com/mudler/vllm.cpp/issues/1437) records the run,
+Seven distinct shapes now match the CPU reference: six cover M from 1 to 512
+across all three tile configurations, and one runs vLLM's fixture at N=512, the
+nearest supported width to 576. The run reported 5 cases and 136 assertions
+with no failures or portable-fallback line. Unsupported shapes returned their
+named refusal.
+
+This is not a model gate or a speed result. No token-exact comparison against
+vLLM has run through this arm, and the device run recorded neither controlled
+clocks nor contention. It proves only the shapes that were run.
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437) records both runs,
 milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
-kernel and the repair it now owes, and
+kernel, and
 [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32

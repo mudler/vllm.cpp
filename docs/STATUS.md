@@ -49,9 +49,9 @@ The project uses these lifecycle terms:
 | OpenAI server | Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending | Some vLLM endpoints, pooling paths, and multimodal server paths remain incomplete |
 | C ABI and C++ library | Available | The C ABI is the stable public embedding surface; internal C++ headers are not ABI-stable |
 | Continuous batching, chunked prefill, prefix caching, and recompute | Available on the documented engine paths | Some hybrid-cache modes and scheduling policies still need broader gates |
-| Quantized inference | Available for the formats and backends listed in Features | Unsupported format/backend pairs refuse or fall back as documented |
-| Speculative decoding | Partial | Support depends on the draft method and model family; use the dedicated guide |
-| Image, video, audio, speech, music, and diffusion models | Partial by model | Each model guide names its reachable command, checkpoint arms, and remaining quality or serving gates |
+| Quantized inference | Available for the formats and backends listed in Features | Block-wise FP8 matches the CPU reference on seven GB10 shapes, but has no model token gate or speed result; unsupported format/backend pairs refuse or fall back as documented (#1437) |
+| Speculative decoding | Partial | DFlash2 safetensors drafts reach the grouped convolution, then refuse at the unimplemented candidate selector; GGUF DFlash2 drafts still refuse at startup (#1314) |
+| Image, video, audio, speech, music, and diffusion models | Partial by model | LTX-2.5 validates declared checkpoint class; its video VAE convolution routes through `vt::Conv3d`, but the CUDA arm has not run on a GPU and other decode stages remain on the host (#1007, #1451, #1452) |
 | Distributed execution | Inventoried or partial by lane | Tensor, pipeline, data, and expert parallel coverage is not a general shipped promise |
 | LoRA and adapters | Partial | The standalone implementation is not a general server-integrated capability |
 

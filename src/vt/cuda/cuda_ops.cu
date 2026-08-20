@@ -3557,6 +3557,73 @@ void FusedChainKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& 
   }
 }
 
+// ---------------------------------------------------------------------------
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314) — the
+// CUDA MIRROR of the CPU reference `DFlashGroupedConvKernel` (cpu_ops.cpp),
+// which carries the full port note and the upstream anchor.
+//
+// One thread per (row, channel). Every step is elementwise, so this kernel has
+// NO reduction-order freedom and is asserted BIT-IDENTICAL to the CPU reference
+// rather than within an envelope
+// (tests/vt/test_ops_dflash2_grouped_conv.cpp).
+//
+// The two rounding helpers are `__fadd_rn`/`__fmul_rn` rather than `+`/`*` on
+// purpose: on the f32 arm `ResRound` is the identity, so `acc + k * x` is an
+// FMA contraction pattern and nvcc would fuse it by default, which the CPU
+// reference (built with `-ffp-contract=off`) does not. The intrinsics forbid
+// the contraction, so the two arms answer the same bits.
+template <typename T>
+__global__ void DFlashGroupedConvKernel(T* out, const T* x, const T* coefficients, const T* base,
+                                        int64_t rows, int64_t h, int64_t taps, int64_t groups,
+                                        int64_t gsize, int64_t sides, int64_t side,
+                                        int64_t block, bool pot) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * h) return;
+  const int64_t i = idx / h;
+  const int64_t c = idx - i * h;
+  const int64_t g = c / gsize;
+  const int64_t pos = pot ? (i & (block - 1)) : (i % block);
+  float acc = 0.0f;
+  for (int64_t t = 0; t < taps && t <= pos; ++t) {
+    const float b = Load(base, (side * taps + t) * h + c);
+    const float d = Load(coefficients, ((i * sides + side) * taps + t) * groups + g);
+    const float k = ResRound<T>(__fadd_rn(b, d));
+    const float term = ResRound<T>(__fmul_rn(k, Load(x, (i - t) * h + c)));
+    acc = (t == 0) ? term : ResRound<T>(__fadd_rn(acc, term));
+  }
+  Store(out, idx, acc);
+}
+
+void DFlashGroupedConvKernelCuda(Queue& q, Tensor& out, const Tensor& x,
+                                 const Tensor& coefficients, const Tensor& base,
+                                 const DFlashGroupedConvArgs& args) {
+  const int64_t rows = x.shape[0];
+  const int64_t h = args.num_groups * args.group_size;
+  const int64_t sides = coefficients.shape[1];
+  const int64_t n = rows * h;
+  if (n == 0) return;
+  constexpr int kBlock = 256;
+  const int64_t grid = (n + kBlock - 1) / kBlock;
+  const bool pot = (args.block_size & (args.block_size - 1)) == 0;
+  cudaStream_t s = AsStream(q);
+  switch (x.dtype) {
+    case DType::kF32:
+      DFlashGroupedConvKernel<float><<<static_cast<unsigned>(grid), kBlock, 0, s>>>(
+          out.Ptr<float>(), x.Ptr<float>(), coefficients.Ptr<float>(), base.Ptr<float>(), rows, h,
+          args.taps, args.num_groups, args.group_size, sides, args.side, args.block_size, pot);
+      break;
+    case DType::kBF16:
+      DFlashGroupedConvKernel<__nv_bfloat16><<<static_cast<unsigned>(grid), kBlock, 0, s>>>(
+          out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(), coefficients.Ptr<__nv_bfloat16>(),
+          base.Ptr<__nv_bfloat16>(), rows, h, args.taps, args.num_groups, args.group_size, sides,
+          args.side, args.block_size, pot);
+      break;
+    default:
+      VT_CHECK(false, "cuda dflash2-grouped-conv: unsupported dtype (f32/bf16 only)");
+  }
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-grouped-conv: launch failed");
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -3608,6 +3675,9 @@ struct Registrar {
                    static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernelCuda)));
     RegisterOp(OpId::kFusedChain, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernelCuda)));
+    RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernelCuda)));
   }
 } registrar;
 

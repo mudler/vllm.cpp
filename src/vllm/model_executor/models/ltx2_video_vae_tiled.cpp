@@ -41,6 +41,16 @@
 
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+// W0 of LTX25-DEVICE-RESIDENCY (#1010). The one include in this file that is not
+// about decoding video, and it is here deliberately: `decode.video` is the leaf
+// W5's lever is measured against, and every other assertion the gate makes about
+// that leaf is a RATIO taken against the leaf itself. A sub-scope opened in the
+// DRIVER, two statements from the leaf's own `Open`, moves with the leaf and
+// constrains nothing; a sub-scope opened HERE, around the tile decode the render
+// actually spends the seconds in, does not. `render_phase_log.h` is a
+// process-wide instrument rather than a multimodal model, and it is the first
+// thing under `multimodal/` this directory includes.
+#include "vllm/multimodal/render_phase_log.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -81,7 +91,7 @@ std::vector<float> AccumulateTemporalGroup(const Ltx2ConvVideoDecoderConfig& con
                                            int64_t latent_h, int64_t latent_w,
                                            Ltx2NoiseStream* noise, const double* timestep,
                                            const std::vector<Ltx2Tile>& group, ChunkBuffer* buffer,
-                                           bool complementary) {
+                                           bool complementary, vt::Queue* queue) {
   const int64_t group_start = group.front().out_t.start;
   std::vector<float> group_weights;
   if (!complementary) {
@@ -110,7 +120,8 @@ std::vector<float> AccumulateTemporalGroup(const Ltx2ConvVideoDecoderConfig& con
     }
 
     const Ltx2VideoFrames decoded =
-        Ltx2ConvVideoDecode(config, weights, crop, latent_channels, ct, ch, cw, noise, timestep);
+        Ltx2ConvVideoDecode(config, weights, crop, latent_channels, ct, ch, cw, noise, timestep,
+                            queue);
 
     const int64_t temporal_offset = tile.out_t.start - group_start;
     // conv_video_decoder.py:533-537: the OUT-COORD length is authoritative, and
@@ -168,7 +179,7 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
                               int64_t latent_channels, int64_t latent_t, int64_t latent_h,
                               int64_t latent_w, Ltx2NoiseStream* noise,
                               const Ltx2TileSizeConfig& tiling, const Ltx2VideoChunkSink& emit,
-                              const double* timestep) {
+                              const double* timestep, vt::Queue* queue) {
   VT_CHECK(latent_channels == config.in_channels,
            "ltx2 tiled decode: latent channel count does not match in_channels");
   VT_CHECK(static_cast<int64_t>(latent.size()) == latent_channels * latent_t * latent_h * latent_w,
@@ -235,9 +246,27 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
 
     ChunkBuffer buffer;
     buffer.Allocate(config.out_channels, curr_stop - curr_start, full_h, full_w);
-    std::vector<float> curr_weights =
-        AccumulateTemporalGroup(config, weights, latent, latent_channels, latent_t, latent_h,
-                                latent_w, noise, timestep, group, &buffer, complementary);
+    // W0 (#1010): THE VIDEO DECODE'S OWN WORK, bounded by production events on
+    // both ends. One record per temporal group, which is one record per chunk
+    // the sink is handed, so the count is a quantity the instrument cannot move.
+    // Nested, so the table's sum does not change.
+    //
+    // THE PLACEMENT IS GATED BY A COVERAGE FLOOR AND NOT BY THE COUNT ALONE.
+    // Moving this scope one statement up, onto `buffer.Allocate`, keeps the
+    // count, the `nested` flag and the containment in a chunk window — and a
+    // fourth fresh review measured what that costs: `decode.video.vae = 0.000 s`
+    // beside a five-millisecond `decode.video`, with the tile decode inside no
+    // sub-scope, both gates green. `test_ltx2_video`'s containment case now
+    // requires these records to cover at least half of the render's
+    // `decode.video.chunk` seconds (measured 91.1%-98.6%), so an anchor that
+    // sits BESIDE the work rather than ON it is a red.
+    std::vector<float> curr_weights;
+    {
+      const ::vllm::multimodal::phase::Scope vae_phase("decode.video.vae");
+      curr_weights =
+          AccumulateTemporalGroup(config, weights, latent, latent_channels, latent_t, latent_h,
+                                  latent_w, noise, timestep, group, &buffer, complementary, queue);
+    }
 
     if (have_previous) {
       if (previous_stop > curr_start) {
@@ -357,7 +386,7 @@ void Ltx2VideoDecodeStreaming(Ltx2VideoDecoderKind kind,
                               int64_t latent_channels, int64_t latent_t, int64_t latent_h,
                               int64_t latent_w, Ltx2NoiseStream* noise,
                               const Ltx2TileSizeConfig& tiling, const Ltx2VideoChunkSink& emit,
-                              const double* timestep) {
+                              const double* timestep, vt::Queue* queue) {
   // The same refusal Ltx2VideoDecode makes, for the same reason: a silent
   // downgrade to the conv decoder returns a worse render as if it were the
   // requested one, and no gate this project owns can detect that.
@@ -367,7 +396,7 @@ void Ltx2VideoDecodeStreaming(Ltx2VideoDecoderKind kind,
            "neighborhood-attention kernel and has its own row. It is refused rather than "
            "downgraded to the Conv video VAE, which would silently return a worse render");
   Ltx2ConvVideoDecodeTiled(config, weights, latent, latent_channels, latent_t, latent_h, latent_w,
-                           noise, tiling, emit, timestep);
+                           noise, tiling, emit, timestep, queue);
 }
 
 }  // namespace vllm

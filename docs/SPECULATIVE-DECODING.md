@@ -111,6 +111,22 @@ ratified near-tie rule, and at concurrency 1 it is 2.9x our own speculative-off
 throughput and at or above vLLM's own DFlash-on decode. Speculative-off stays
 byte-identical.
 
+### DFlash2 checkpoints
+
+DFlash2 adds a grouped dynamic depthwise convolution and a different candidate
+selector. A safetensors checkpoint that declares `DFlash2DraftModel` now loads
+and runs the convolution around every attention and MLP sublayer, then refuses
+at the candidate selector because that selector is not implemented. Startup
+prints a notice before the later refusal. The engine does not substitute the
+DFlash1 per-slot argmax, which would emit valid target tokens while silently
+reducing draft acceptance.
+
+A GGUF DFlash2 checkpoint still refuses at startup because its weight path is
+not implemented. It is identified from DFlash2-specific metadata; ordinary
+DFlash1 GGUF drafts remain unchanged. No DFlash2 speed result is admissible
+until the selector is implemented and its acceptance gate passes
+([#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
+
 ## n-gram
 
 The draft-free proposer: candidates come from matching the sequence's own

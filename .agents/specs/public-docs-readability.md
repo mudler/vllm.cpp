@@ -11,6 +11,16 @@ The developer approved one campaign in one pull request. The spec and
 implementation use that pull request. The operator can merge the verified
 documentation-only pull request without waiting for continuous integration.
 
+Before landing, the campaign was reconciled with `origin/main` at `5870cb2bf`
+(seven commits after the reviewed campaign head). The compact projections now
+carry main's DFlash2 convolution-before-selector-refusal state, LTX-2.5 explicit
+checkpoint-class validation and `vt::Conv3d` device route, and the seven-shape
+GB10 block-wise FP8 result. Detailed workflow text lives in the speculative
+decoding and model guides; `docs/USAGE.md` remains the generic workflow and
+checkpoint index. The auto-merged keyed feature and benchmark rows, issue-index
+union, and incoming row specs were inspected before the conflict resolution was
+staged.
+
 W1 is complete. The migration manifest accounts for 275 campaign-base H1, H2,
 and H3 headings. W2 adds the public directory indexes and places the generic
 CLI, server, C ABI, and C++ paths before a temporary legacy-reference boundary.

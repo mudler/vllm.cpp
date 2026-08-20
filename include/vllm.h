@@ -270,7 +270,30 @@ extern "C" {
  * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
  * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
  * acoustic half are still host reference loops (see docs/FEATURES.md). */
-#define VLLM_ABI_VERSION 21
+/* v22 — vllm_model_params.mmproj_path, THE SECOND GGUF FILE (row
+ * `LOAD-GGUF-MMPROJ`, issue #821). A GGUF multimodal model ships as two files:
+ * the language `.gguf` and a `clip`-architecture `mmproj-*.gguf` carrying the
+ * vision tower. Before this field the ABI could name only the first, so a GGUF
+ * multimodal checkpoint could be loaded only as a text model and the projector
+ * had nowhere to arrive.
+ *
+ * The spelling mirrors llama.cpp's user-facing `--mmproj`, which is the flag
+ * every holder of these artifacts already types. It is EXPLICIT by design:
+ * auto-discovery of a sibling `mmproj*.gguf` is deliberately not implemented,
+ * because a directory holding two unrelated models would then silently fuse
+ * them and the failure would be a wrong-shaped model rather than an error.
+ *
+ * SCOPE, and it carries the same weight as the field: this loads the tower and
+ * hands it to the engine. THIS ABI STILL HAS NO MULTIMODAL REQUEST PATH, so
+ * `vllm_chat` / `vllm_generate` cannot yet feed the tower an image — exactly
+ * the state the v19 note above records for the multimodal limits. What the
+ * field buys today is that the projector is READ, VALIDATED and REFUSED BY
+ * NAME at load instead of being unnameable.
+ *
+ * Appended at the END of vllm_model_params, so a zero-initialized v21 struct is
+ * byte-identical: NULL/empty means no projector, which is every load that
+ * existed before. */
+#define VLLM_ABI_VERSION 22
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -595,6 +618,20 @@ typedef struct vllm_model_params {
    * per the paragraph above fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
   const char* limit_mm_per_prompt;
+  /* ── The `clip` multimodal projector (ABI v22) ────────────────────────────
+   * Path to the SECOND GGUF file — `mmproj-*.gguf`, `general.architecture` =
+   * `clip` — beside a `.gguf` model path. NULL or empty (the zero value) means
+   * no projector, which is byte-identical to pre-v22.
+   *
+   * Refused BY NAME with VLLM_ERR_MODEL_LOAD — the code every FromModelDir
+   * failure reports, exactly as an absent named device does — when: the model path is
+   * not a `.gguf` (a safetensors checkpoint carries its tower in its own
+   * shards); the file is not a `clip` projector; its `clip.projector_type` is
+   * not one this build loads; or it carries only the first half of the
+   * temporal patch embedding, which cannot be completed without inventing the
+   * other half. Every one of those fires BEFORE the tokenizer and before any
+   * language-model weight byte is read. Borrowed for the call only. */
+  const char* mmproj_path;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────

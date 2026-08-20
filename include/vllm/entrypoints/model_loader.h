@@ -24,6 +24,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_vl_vision.h"  // LOAD-GGUF-MMPROJ tower
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft bundle
 #include "vllm/tokenizer/tokenizer.h"
@@ -221,6 +222,32 @@ struct EngineParams {
   // "no config" state distinct from "the default config" would be a second
   // spelling of the same thing, and upstream has one.
   vllm::MultiModalConfig multimodal;
+
+  // ── The SECOND GGUF file: a `clip` multimodal projector (row
+  // `LOAD-GGUF-MMPROJ`, issue #821) ─────────────────────────────────────────
+  //
+  // A GGUF multimodal model ships as TWO files, and until this field existed
+  // the projector had nowhere to arrive: `ModelSource` carries a VECTOR of
+  // safetensors shards and exactly one `GgufFile*`, and `GgufFile::Open`'s
+  // shard merge (`DetectSplit`) is about shards of ONE split, not a second,
+  // differently-architected file.
+  //
+  // The spelling is llama.cpp's user-facing one (`--mmproj`), because that is
+  // the flag every user of these artifacts already types, and it is EXPLICIT on
+  // purpose. Auto-discovery of a sibling `mmproj*.gguf` is deliberately NOT
+  // implemented: a directory holding two unrelated models would then silently
+  // fuse them, and the failure would be a wrong-shaped model rather than an
+  // error.
+  //
+  // Empty (the default) is byte-identical to the pre-row behaviour: no second
+  // file is opened and no vision tower is built. NON-EMPTY against anything
+  // that is not a `.gguf` FILE is REFUSED BY NAME, not ignored: a safetensors
+  // checkpoint carries its vision tower in its own shards, so accepting the
+  // flag there and dropping it would load a tower the user did not ask for and
+  // silently discard the one they named. The refusal fires in `FromModelDir`
+  // before any path or config I/O, and its message begins `--mmproj: a
+  // multimodal projector attaches to a .gguf language file`.
+  std::string mmproj_path;
 };
 
 // The shared queue-selection seam used by every LoadedEngine construction
@@ -299,6 +326,29 @@ class LoadedEngine {
   // shards, unparseable config).
   static std::unique_ptr<LoadedEngine> FromModelDir(const std::string& model_dir,
                                                     const EngineParams& params);
+
+  // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
+  //
+  // Non-null exactly when `EngineParams::mmproj_path` named a loadable
+  // `qwen3vl_merger` projector beside a `.gguf` language file. The tower is
+  // host-side f32, the shared `multimodal::Qwen3VLVisionWeights` that
+  // `multimodal::Qwen3VLVisionForward` consumes and that the safetensors
+  // reader (`LoadQwen3VLVisionWeights`) and the MiniMax-H3 encoder reader
+  // (`LoadQwen3VLVisionFromGguf`) also fill.
+  //
+  // It lives on the ENGINE rather than inside an architecture's weights struct
+  // because that is where the tower already lives on the safetensors side —
+  // `LoadQwen3_5MoeVision` is a separate reader over the same shards, and no
+  // `Qwen3_5*Weights` has a vision member — and because the projector is a
+  // separate FILE the engine was handed, not part of the model checkpoint.
+  const multimodal::Qwen3VLVisionWeights* vision_tower() const {
+    return vision_tower_.has_value() ? &*vision_tower_ : nullptr;
+  }
+  // The geometry read from the projector's own `clip.*` metadata. Meaningless
+  // unless `vision_tower()` is non-null.
+  const multimodal::Qwen3VLVisionConfig& vision_config() const {
+    return vision_config_;
+  }
 
   // Resolve the per-step token budget (max_num_batched_tokens) for chunked
   // prefill. An explicit EngineParams override wins; otherwise a PER-ARCH
@@ -450,7 +500,10 @@ class LoadedEngine {
   LoadedEngine(HfConfig config, std::unique_ptr<LoadedModel> model,
                tok::Tokenizer tokenizer, const EngineParams& params,
                vt::Queue* preselected_queue = nullptr,
-               std::unique_ptr<DflashDraft> dflash_draft = nullptr);
+               std::unique_ptr<DflashDraft> dflash_draft = nullptr,
+               std::optional<multimodal::Qwen3VLVisionWeights> vision_tower =
+                   std::nullopt,
+               multimodal::Qwen3VLVisionConfig vision_config = {});
 
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
@@ -507,6 +560,13 @@ class LoadedEngine {
 
   bool hash_ready_;  // declared first: forces EnsureNoneHash() ahead of the rest.
   HfConfig config_;
+  // LOAD-GGUF-MMPROJ: the `clip` projector's tower + its geometry. Empty on
+  // every load that named no --mmproj, which is every load that existed before
+  // this row. Nothing below borrows them, so their declaration position is
+  // free; they sit beside config_ because they are, like it, checkpoint
+  // metadata resolved once at load.
+  std::optional<multimodal::Qwen3VLVisionWeights> vision_tower_;
+  multimodal::Qwen3VLVisionConfig vision_config_;
   // SPEC-MTP I5d: the finalized speculative config (method/k/n_predict), or
   // nullopt on the production default path. Declared before model_/kv_cfg_/runner_
   // because the KV-cache widening, the draft build, the scheduler lookahead, and

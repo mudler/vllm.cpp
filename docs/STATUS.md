@@ -1115,19 +1115,33 @@ Resource axes on the same series: cold start to first `/health` **53 s vs
 the latter with the caveat that vLLM's figure is set by
 `--gpu-memory-utilization 0.85` pre-reserving KV on a unified-memory box.
 
-**Its quantized arms are not gated.** Three rows enter `READY` on
+**Its quantized arms are not gated.** Three rows on
 [#821](https://github.com/mudler/vllm.cpp/issues/821)
-([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ`,
-`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM`. `AGENTS.md` makes
-the quantized arms a standing requirement, and these are the arms a user can run:
-17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
+([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` is
+`PARTIAL`, `QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are
+`READY`. `AGENTS.md` makes the quantized arms a standing requirement, and these
+are the arms a user can run: 17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
 
-Nothing is implemented. No production path accepts a second `clip` GGUF projector
-beside the language file. The artifact published as `unsloth/Qwen3.8-27B-NVFP4`
-is a compressed-tensors `mixed-precision` checkpoint with **zero `*.input_scale`
-tensors**, which is why the reported load dies. And the Q4_K_M file ships the MTP
-drafter as block 64, so a loader reading `block_count` as decoder depth builds a
-65-layer model out of a 64-layer checkpoint.
+**`LOAD-GGUF-MMPROJ` landed the loader half.** `--mmproj` on the server and
+`vllm_model_params.mmproj_path` on the C ABI (v22) accept a second `clip` GGUF
+projector, read its tower into the same Qwen3-VL weights the safetensors path
+builds, join the two-tensor temporal patch embedding, and refuse four wrong-file
+cases by name before the tokenizer.
+
+The mapping is confirmed on the shipped bytes, not only on a fixture: the same
+reader runs over the real `mmproj-BF16.gguf` (931 146 432 B, GGUF v3, 334
+tensors, 35 keys) behind `VLLM_CPP_QWEN38_27B_MMPROJ`, and its 334 consumed
+names, its `clip.*` geometry and its two-half patch-embedding join all agree.
+CI keeps the synthetic fixture and reads no NAS file. **Nothing runs that tower
+yet**, and the committed 334-name manifest with its CI accounting is owed by
+`QUANT-QWEN38-27B-GGUF-ARM`.
+
+The other two arms are not implemented. The artifact published as
+`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision` checkpoint
+with **zero `*.input_scale` tensors**, which is why the reported load dies. And
+the Q4_K_M file ships the MTP drafter as block 64, so a loader reading
+`block_count` as decoder depth builds a 65-layer model out of a 64-layer
+checkpoint.
 
 **Both token gates are `PENDING` on named external authorities, and this page
 claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,

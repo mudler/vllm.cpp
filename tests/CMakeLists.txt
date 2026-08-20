@@ -404,6 +404,15 @@ vllm_cpp_add_test(test_gguf_device_fit
   vllm/model_executor/test_gguf_device_fit.cpp)
 vllm_cpp_add_test(test_gguf_device_fit_reach
   vllm/entrypoints/test_gguf_device_fit_reach.cpp)
+# LOAD-GGUF-MMPROJ (#821): the `clip` mmproj reader, and — separately — the
+# proof that the production loader reaches it. The second target enters through
+# `LoadedEngine::FromModelDir` with `--mmproj` set, so deleting the call site in
+# `model_loader.cpp` reds it; the first would stay green, which is exactly the
+# difference between gating a class and gating a capability.
+vllm_cpp_add_test(test_clip_mmproj_gguf
+  vllm/models/test_clip_mmproj_gguf.cpp)
+vllm_cpp_add_test(test_gguf_mmproj_reach
+  vllm/entrypoints/test_gguf_mmproj_reach.cpp)
 # FIX-FP8-BLOCKWISE-REFUSAL #1166: block-wise (128x128) FP8 is refused BY NAME
 # at load. Every case enters through `ModelRegistry::Load` rather than through
 # the predicate, so deleting that call site reds this target. That is the

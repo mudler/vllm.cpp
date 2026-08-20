@@ -82,7 +82,7 @@ and the same `chunk_tokens` as the peer's LMCache `chunk_size` (LMCache's defaul
 is 256). Under those settings our `CacheEngineKey` strings, chunk boundaries and
 folded hashes are byte-identical to LMCache's own `ChunkedTokenDatabase`, and a
 chunk written by the peer is found and decoded by us (and vice versa). See the
-LMCache W4/W5 rows in [BENCHMARKS.md](BENCHMARKS.md) for the exact evidence.
+LMCache W4/W5 rows in [the benchmark record](BENCHMARKS.md) for the exact evidence.
 
 ### Identity and refusal
 

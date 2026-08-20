@@ -906,12 +906,12 @@ Decompose, dispatch, verify, integrate. You do not write the feature.
 
 For each task, serially — never two implementers in one worktree:
 
-1. Dispatch a **fresh** implementer ([prompt](prompts/implementer.md)). It works
+1. Dispatch a **fresh** implementer ([prompt](../../../.agents/prompts/implementer.md)). It works
    TDD and commits in the worktree, and returns the SHA.
 2. **Run the row's gate yourself.** This is the one failure mode nothing else
    catches: if "done" is the implementer's opinion of its own work, the loop has
    no floor.
-3. Dispatch a **fresh reviewer** ([prompt](prompts/reviewer.md)) — never the
+3. Dispatch a **fresh reviewer** ([prompt](../../../.agents/prompts/reviewer.md)) — never the
    agent that wrote the code. Its binding instruction is to **mutate, not read**:
    delete the line each test names and re-run. A test that stays green is a
    finding. Eleven such tests shipped on the two branches that built this

@@ -172,7 +172,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, VAEs+ENCs, cond, pipeline, quant loaders gated, reduced dims. Prompt AdaLN host+dev; Gemma-4->xattn FIXTURE-gated. Img chain PPM->resize->encode->place->noise. Temporal x2 ups gated, UNDRIVEN. Render OWED | `ltx-2.5`/`ltx2-gen`. NVFP4 ~29 GB/GB10, FP8 ~44, bf16 42.0; +24 GB tower. FP8/torchao/NVFP4/**bf16**; kf abs-pos ported; ALL 3 load, NO `allow_unported`. IMG+LAST kf `crf=0`, A2V WAV+LoRA; DiffVAE/ref refused. PENDING |
 | MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, diffusers lane) | MiniMax-Music3 (8.6B Qwen3 LLM + 0.646B RVQ decoder + 2.4B fp32 DiT + DAC Flow-VAE); diffusers arm, ~28.5 GB | `ACTIVE`. Loader 1413/1413; AR, acoustic and the 8.6B LM forward all gated vs real weights; `SpeechRegistry` + `vllm_speech_*` v21 + `/v1/audio/speech`; GGUF Q4_K depth decoder value-gated. HTTP request OBSERVED (#852) | No reference number. Host kernels multi-core, same song bytes (§12). PARTIAL device arm (#672): 8.6B LM + 2.4B fp32 DiT staged once (§14); rest host. Denominator SGLang-Omni production |
 | LTX-2.5 DFR base + generated keyframe slots | LTX-2.5 (21.00B video+audio) | gated vs EXECUTED upstream `dfr_layout` + 3 `dfr_pipeline` helpers @ `fd4ded7f` (`test_ltx2_dfr` 11/11, 652 assertions); canvas, tiles, stitch, carry-forward as EXACT index vectors, since each defect is plausible| `--pipeline-kind dfr`, but NO `keyframe_slot_sft` base is published, so the arm is REFUSED in practice. Canvas PADS 9->25, trims back; x8-grid slots MARKED, read before trim. ROUNDS (#986), detail LoRA (#975) refused|
-| LTX-2.5 checkpoint CLASS declaration | LTX-2.5 DiT, all ten kinds | `ltx2 checkpoint class*`: 3 `test_ltx2_pipeline` + 5 `test_ltx2_video` cases via `LoadVideoEngine`/`vllm_video_engine_load`; deleting the call site reds 4 of the 5 engine cases, unit cases GREEN | `--checkpoint-class` (`full`, `distilled`, `keyframe_slot_sft`), the `checkpoint_class` load extra, `--video-extra`. REQUIRED on every kind but `dmd2` (#1137). A DECLARATION never checked: the bf16 headers match |
+| LTX-2.5 checkpoint class | LTX-2.5 DiT | 8 load-path cases; deleting validation reds 4 engine cases | `--checkpoint-class`: `full`, `distilled`, or `keyframe_slot_sft`. Required except for `dmd2`; declarations are checked, but matching bf16 headers prevent automatic detection (#1137) |
 | LTX-2.5 tiled + streaming Conv VAE decode | LTX-2.5 video VAE | gated vs executed upstream `ltx_core` @ `fd4ded7f` (`test_ltx2_tiling` 10/10, 915 assertions); one-tile and untiled-spatial controls BIT-EXACT vs untiled on both causality arms; an untiled frames axis is REFUSED | Streams temporal chunks through upstream's AUTO layout (768/64 px, 80/24 frames); above one tile the pixel volume is never materialized. NO-OP below 768px and 81 frames; 81-120 IS tiled, differing 6.70% of range |
 | LTX-2.5 Conv VAE decode arithmetic width | LTX-2.5 video VAE | `test_ltx2_vae` "the decode's convolution accumulates in f32", entering through `Ltx2VideoDecodeStreaming`; widening the accumulator to `double`, or deleting the production call site, each turns it RED | **f32**, the width `F.conv3d` uses at f32 AND bf16 (MEASURED). Was f64 at 8 sites ([#1008](https://github.com/mudler/vllm.cpp/issues/1008)). Conv sums BLOCKED per input channel, as torch's. STORAGE stays f32; bf16 owed |
 | LTX-2.5 Conv VAE decode threading | LTX-2.5 video VAE | `test_ltx2_vae` "the decode DISPATCHES its convolutions to the CPU threadpool" and "...BIT-IDENTICAL across thread counts", through `Ltx2VideoDecodeStreaming`; 34 golden margins UNCHANGED; TSan clean | **Parallel** over CONV output lines via `vt::cpu::ParallelForRows` ([#1009](https://github.com/mudler/vllm.cpp/issues/1009)). ~9x at 16-20 workers, contended box, 21-23% spread. Bit-identical at any count |
@@ -269,7 +269,7 @@ both refuse, naming what is missing.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ `CPU_ATTN` registered (#1371/#1392, [spec](../.agents/specs/attn-validate-configuration.md)) | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ builds under Apple Clang with project warnings promoted to errors, the Qwen3.5 MoE loader included; its layout-refusal path uses the same messages and behavior on every platform (#1054) | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | W0: 5 gfx archs; dense/GDN all-native; 0.8B dispatch fixed. **M4:** Qwen3-0.6B/3.5-0.8B 16/16 (#41). **M3:** `ROCM_ATTN` registered (#1056/#1065, [spec](../.agents/specs/rocm-attn-backend.md)). CPU parity open (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
+| ROCm | W0: 5 gfx archs; dense/GDN all-native; 0.8B dispatch fixed. **M4:** Qwen3-0.6B/3.5-0.8B 16/16 (#41). **M3:** `ROCM_ATTN` registered (#1056/#1065, [spec](../.agents/specs/rocm-attn-backend.md)). CPU parity open (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCm guide](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
 | Tenstorrent host-free decode | ◐ env-gated `VT_TT_HOST_FREE_DECODE`; implementer P150 79-replay/5.8x. Default inert. New batch after capture refused. Engine golden owed | ☐ | ☐ | ☐ |
@@ -312,7 +312,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | OpenAI speech generation `/v1/audio/speech` (createSpeech shape) | ◐ route + ABI live, opt-in behind `--speech-model`; `lyrics` + `description` are extra named fields for a music family; 20 unsupported keys refused by name; every key read at the top level and under `extra_params` | ◐ (vllm-omni) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
 
-#### C-ABI capability coverage <!-- abi-capability-table:begin -->
+### C-ABI capability coverage <!-- abi-capability-table:begin -->
 - Which capabilities an embedder drives through the flat C ABI (`include/vllm.h`, the only installed header), gated by `scripts/check-surface-coverage.py`: a `reachable` row names an entry point that exists; an `embedder-unreachable` row is tracked in `scripts/abi-capability-allowlist.txt` against its fold row (`ARCH-ONE-SURFACE`). The ABI is text-generation-complete; the one `embedder-unreachable` row (multimodal input) is the open capability gap.
 
 | Capability | C-ABI surface | Embedder-reachable |
@@ -366,7 +366,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed. Open: no mm-forward on `Request.mm_features`; no image codec. Video/audio/multi-image now **refuse** with HTTP 400 rather than drop ([#686](https://github.com/mudler/vllm.cpp/issues/686)) |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
-| ROCm | W0 community-verified on 5 gfx archs; classic-dense and GDN-hybrid e2e run all-native; correctness gaps remain | 44 registered ops including the GDN state/conv/postconv/recurrence set; APU managed-allocation branch remains unverified. [ROCM.md](ROCM.md) |
+| ROCm | W0 community-verified on 5 gfx archs; classic-dense and GDN-hybrid e2e run all-native; correctness gaps remain | 44 registered ops including the GDN state/conv/postconv/recurrence set; APU managed-allocation branch remains unverified. [ROCm guide](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
@@ -374,21 +374,11 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 
 ## How to read this page
 
-A ✅ means the feature is implemented **and** carries a gate: for model rows that
-is a token-for-token comparison against the pinned vLLM oracle on the same
-workload, and for engine rows it is a named test in the tree. A ◐ means the code
-path exists and works within stated limits, and the limits are named in
-[STATUS.md](STATUS.md) rather than glossed. We do not mark a row ✅ because the
-code compiles, and we do not mark a competitor ☐ to flatter a column.
+A ✅ means the implementation has a named gate. For a model, that gate compares
+the same workload with the pinned oracle. For an engine feature, the gate is a
+named test in the tree. A ◐ means the path works only within the limits in its
+table row.
 
-Feature parity is not the same as speed parity. Most architectures here are
-correctness-complete and speed-pending, and [BENCHMARKS.md](BENCHMARKS.md) says
-which is which.
-
-The marks track implementation and gates, not who is working on something. The
-2026-08-04 claim triage moved 58 agent-record rows out of `ACTIVE` because
-nobody is flying them; the 2026-08-05 device inventory put 11 llama.cpp ggml
-backends in scope as inventoried rows. Neither changed a capability, so **no
-mark on this page moved**. An inventoried backend is not a supported one, and the same
-holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
-are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
+The marks describe support, not speed or current ownership. See
+[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+performance. An inventoried row is not a supported feature.

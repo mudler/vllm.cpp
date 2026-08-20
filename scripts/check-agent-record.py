@@ -681,8 +681,20 @@ ENGINE_PREFIXES = (
 # average, and `## Gates` owes the idle-host re-measure. The exponent, not the
 # constant, is what makes this a row.
 # `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
+# 169 since 2026-08-21: +`SPEC-DRAFTER-CHAIN` (a preference-ordered chain of
+# speculators: try the first, and if it yields no draft for a sequence, try the
+# next). Genuinely new and not expressible by the per-method rows beside it: each
+# of `SPEC-MTP`, `SPEC-DFLASH`, `SPEC-DSPARK` and `SPEC-NGRAM` owns ONE
+# speculator's mechanism, and every one of them assumes it is the only speculator
+# resolved for a step. This row owns the composition -- a new optional field on
+# `--speculative-config` that is inert when absent, per-sequence resolution, and
+# the per-drafter attribution none of those rows has any reason to carry. vLLM
+# implements no composition at all (`SpeculativeMethod` is a single `Literal` at
+# the pin AND at `origin/main` `c20572610`), so this is a DIVERGENCE with
+# llama.cpp as a secondary oracle for semantics only, not a port. `READY`, spec
+# `specs/drafter-chain.md`, issue #1522.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 168
+ENGINE_ROWS = 169
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

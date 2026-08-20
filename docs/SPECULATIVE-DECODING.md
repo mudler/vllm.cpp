@@ -22,7 +22,7 @@ the list of accepted ones (`src/vllm/config/speculative.cpp`).
 | `draft_model` | a separate full model | from the draft | **Config only.** The JSON parses, but the engine has no branch for it and refuses the load |
 
 MTP and DFlash are the two with binding numbers behind them; the per-method
-detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
+detail below and in [the benchmark record](BENCHMARKS.md) says which is which.
 
 ## Which keys the JSON accepts
 
@@ -111,6 +111,22 @@ ratified near-tie rule, and at concurrency 1 it is 2.9x our own speculative-off
 throughput and at or above vLLM's own DFlash-on decode. Speculative-off stays
 byte-identical.
 
+### DFlash2 checkpoints
+
+DFlash2 adds a grouped dynamic depthwise convolution and a different candidate
+selector. A safetensors checkpoint that declares `DFlash2DraftModel` now loads
+and runs the convolution around every attention and MLP sublayer, then refuses
+at the candidate selector because that selector is not implemented. Startup
+prints a notice before the later refusal. The engine does not substitute the
+DFlash1 per-slot argmax, which would emit valid target tokens while silently
+reducing draft acceptance.
+
+A GGUF DFlash2 checkpoint still refuses at startup because its weight path is
+not implemented. It is identified from DFlash2-specific metadata; ordinary
+DFlash1 GGUF drafts remain unchanged. No DFlash2 speed result is admissible
+until the selector is implemented and its acceptance gate passes
+([#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
+
 ## n-gram
 
 The draft-free proposer: candidates come from matching the sequence's own
@@ -125,7 +141,7 @@ server --model /models/Qwen3.6-27B \
 It is wired end to end and reuses the same verify machinery as MTP. No
 throughput number is published for it.
 
-## DSpark (semi-autoregressive block drafting) — in progress
+## DSpark (semi-autoregressive block drafting), in progress
 
 DSpark drafts a whole block in one parallel pass and then adds intra-block
 dependency with a small sequential head, so a block draft stops being k
@@ -156,8 +172,8 @@ with a SINGLE COLD oracle invocation per paired run, so the denominator paid
 compile-JIT the numerator did not; with the oracle warm and generation length
 matched, the paired measurement is **0.834x**. Those two cannot be differenced
 directly, because the gate host was reimaged in between and is no longer the same
-machine. The deciding experiment — a single cold oracle invocation on the CURRENT
-box — is specified in the benchmark record and has not yet run. Until it does, no
+machine. The deciding experiment, a single cold oracle invocation on the CURRENT
+box, is specified in the benchmark record and has not yet run. Until it does, no
 speed claim in either direction is supportable. The acceptance-rate band and the
 other target families remain owed. A GGUF target, and a target architecture with no aux
 multi-tap, are both refused by name.
@@ -168,7 +184,7 @@ main --model /models/Qwen3-4B \
 ```
 
 `num_speculative_tokens` is required for a DSpark draft (a native DSpark config
-carries no `n_predict`), and it must be at least the checkpoint's block size —
+carries no `n_predict`), and it must be at least the checkpoint's block size,
 a smaller value produces incorrect output rather than merely lower acceptance,
 so it is rejected.
 
@@ -252,7 +268,7 @@ engine is already about 4% faster than vLLM with speculation off, so the lead is
 preserved with it on. The extra state speculation needs (a doubled recurrent-state
 slot at k=1, plus the draft cache and head) costs about 3.6 GB, well inside the
 box's unified memory. The full A/B, including the higher-concurrency numbers, is
-in [BENCHMARKS.md](BENCHMARKS.md).
+in [the benchmark record](BENCHMARKS.md).
 
 ## Concurrency above 1
 
@@ -293,7 +309,7 @@ Each of these names the method it applies to.
   such a tie speculative-on and speculative-off, and even two speculative-off
   runs, can pick differently. The same weights loaded from GGUF, which expands
   to bf16, show no such ties and are token-identical. Open; see
-  [docs/STATUS.md](STATUS.md).
+  [the current project status](STATUS.md).
 - **Concurrency above 1 is not token-stable for the 27B.** Its greedy output is
   not bit-stable across batch shapes even with speculation off (changing the batch
   size flips a few near-tie tokens), so exact token-for-token agreement between

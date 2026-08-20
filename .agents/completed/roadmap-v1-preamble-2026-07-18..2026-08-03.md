@@ -497,4 +497,3 @@ nested `text_config`/`vision_config`/`quantization_config` descent, the 93-layer
 gate 6/6 (`kimi_k3{,_registry,_weights}.cpp`, `test_kimi_k3_scaffold.cpp`). MXFP4 / KDA delta /
 MoonViT-V2 correctly left NOT-YET-BUILDABLE (shared DeepSeek-V4 MXFP4 row, Kimi-Linear KDA row, W7).
 Row stays SPIKE. NEXT: W1 proxy primitive gate (shares the KDA kernel campaign).
-

@@ -149,7 +149,7 @@ There is no binding speed result.
 > on four community boards — gfx1151, gfx1103, gfx1100, gfx1201
 > ([issue #41](https://github.com/mudler/vllm.cpp/issues/41)). The
 > unified-memory fix on top of them (approach (b),
-> [docs/ROCM.md §3.1](ROCM.md)) was again written with **no AMD GPU or ROCm
+> [ROCm guide §3.1](ROCM.md)) was again written with **no AMD GPU or ROCm
 > toolchain on any maintainer machine**, so a compile error in it is expected,
 > useful, and belongs on #41.
 
@@ -187,7 +187,7 @@ What exists today is the W0 skeleton — the `vt::Backend`, the `Platform`, one
 registered kernel (RmsNorm), and the tests that gate them — plus the approach-(b)
 unified-memory branch for integrated APUs. What that does and
 does not get you, and where to start on your specific board, is
-[docs/ROCM.md](ROCM.md).
+[ROCm guide](ROCM.md).
 
 ## Nix shells
 
@@ -240,41 +240,12 @@ defaults.
 | `VLLM_CPP_BUILD_EXAMPLES` | `ON` | Build the example CLI, server, and bench binaries |
 | `VLLM_CPP_BENCH_PROFILE_CONTROL` | `OFF` | Trace-only profiler replay control (never for production timing builds) |
 
-## Backend and hardware state
+## Related runtime references
 
-| Backend | Hardware | State |
-|---|---|---|
-| CPU | x86-64 and arm64 | Correctness / CI reference; at or ahead of llama.cpp on every GGUF axis, with an Arm i8mm quant-GEMM tier. That verdict's denominator is SUPERSEDED: it was our own fork `237ad9b96`, and the oracle is now stock `b10451` (re-take owed, #1003) |
-| CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
-| CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
-| CUDA | Hopper, sm_90a | Build-supported; the fast GDN (Triton-AOT) path is build-verified, not runtime-proven here |
-| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a) | Build-supported; the fast GDN path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
-| CUDA | Jetson Thor, sm_110 | Runtime-verified: the portable bf16 path ran the Llama-3.2-1B greedy gate token-exact on real silicon. Community reports add a 32B NVFP4A16 serving through the portable dequant-GEMM, and CUDA 13.2 passing the CUDA gates. fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY for `110` |
-| Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
-| Vulkan | Portable GPU | `opt-125m` is strict token-exact; Qwen3.6-27B decode matches llama.cpp Vulkan on GB10. See [BENCHMARKS.md](BENCHMARKS.md) for the measured scope |
-| Intel XPU | Intel GPUs | Spiked, hardware-blocked |
-| ROCm | AMD GPUs | W0 tests passed on four community `gfx` targets; ROCm 6.x build fix landed. Model and oracle gates remain open: [ROCM.md](ROCM.md) |
-| Tenstorrent | Blackhole | `ACTIVE`: OPT-125m strict 6/6 on real hardware; Qwen3-0.6B gate wired, full 16x16 rerun and performance path pending |
-| ANE | Apple Neural Engine | Post-parity roadmap |
+Build success does not imply runtime coverage. See [Features](FEATURES.md) for
+the current backend and quantization support table. See
+[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+measured results.
 
-Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell
-(`120a`) plus the cross-family targets are build-supported (they compile and emit
-real machine code, with the fast GDN path build-verified on several) but unproven
-at runtime here (no such board), and non-Apple / non-NVIDIA backends run a subset
-of operations. Per-op detail is in the
-[backend matrix](../.agents/backend-matrix.md).
-
-## Quantization formats
-
-| Format | State |
-|---|---|
-| NVFP4 W4A4 / W4A16 | Both gate-model paths run on GB10, token-exact. FP4 tactics match vLLM; Marlin NVFP4 W4A16 grouped-MoE is the 35B expert path |
-| compressed-tensors NVFP4A16 (W4A16), dense | Correctness-complete via the Marlin weight-only path; speed not yet measured |
-| GGUF F32 / F16 and block quantization | Supported. CPU keeps the supported Q, IQ, and MXFP4 blocks compressed through the matrix multiply. CUDA also keeps the supported Q8_K-activation formats compressed; other formats fall back to expansion or CPU compute. Set `VT_GGUF_KEEP_QUANT=0` to disable the direct path. See [STATUS.md](STATUS.md) for the exact format and backend coverage |
-| FP8 (W8A8) | The 35B ModelOpt static per-tensor projection slice is implemented; generic FP8 modes and FP8 KV remain open |
-| compressed-tensors MXFP4 (W4A16) | Qwen3 dense weights load and run through the Marlin path on CUDA. Qwen3-8B is correctness-gated and benchmarked against vLLM; c1 passes the speed floor, while c2-c8 remain below it. MXFP8 compute remains open |
-
-## Environment variables
-
-Runtime knobs (op providers, keep-quant, profiling) are documented in
-[docs/ENVIRONMENT.md](ENVIRONMENT.md).
+Runtime environment variables are in the
+[environment-variable reference](ENVIRONMENT.md).

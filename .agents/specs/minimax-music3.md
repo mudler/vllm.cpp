@@ -1891,19 +1891,28 @@ of a forward one.
 
 The second is that **the accumulator width is part of the contract, not an
 implementation detail.** `vt::DepthwiseConv1d` accumulates in **f32** and its
-byte-exactness gate pins that. These two accumulate in **f64**, because f64 is
-what the `vocoder1d` host loops used and therefore what every committed golden
-for all four consumers was taken with. Widening the depthwise op would move the
-conformer encoders; narrowing these would re-gate four audio models. So they are
-SIBLINGS, and `vt::DepthwiseConv1d` is untouched — the same call that op itself
-made against `vt::CausalConv1dFwd`.
+byte-exactness gate pins that. These two accumulated in **f64** when this row
+landed, because f64 is what the `vocoder1d` host loops used. Widening the
+depthwise op would move the conformer encoders; narrowing these re-gated four
+audio models. So they are SIBLINGS, and `vt::DepthwiseConv1d` is untouched —
+the same call that op itself made against `vt::CausalConv1dFwd`.
 
-That f64 is a **deliberate divergence from torch**, which accumulates an f32
-conv in f32. It is recorded here rather than inherited silently because
-`.agents/porting.md` "Mirror the memory format" cuts both ways and a WIDER
-accumulator is exactly the class of divergence a token gate cannot see. It costs
-nothing in bytes moved: activations and weights stay f32 in memory and only the
-register width differs.
+**CORRECTED by `VT-CONV1D-F32-ACC`
+([#1474](https://github.com/mudler/vllm.cpp/issues/1474),
+[`vt-conv1d-f32-accumulator.md`](vt-conv1d-f32-accumulator.md)): these two
+accumulate in f32 now, and the sentence this paragraph used to carry was
+false.** It said f64 was "what every committed golden for all four consumers was
+taken with". It was not. All three generators run torch in f32 —
+`scripts/gen-bigvgan-goldens.py:48` builds f64 and then calls `.float()`,
+`gen-ltx2-vae-goldens.py:223,234` and `gen-minimax-music3-acoustic-goldens.py:81,134`
+cast every parameter and input with `astype(np.float32)` — so the goldens were
+the output of an **f32-accumulating** reference and this op was wider than the
+oracle its own goldens came from. torch accumulates a float convolution in f32,
+measured on a probe that separates the two widths, and vLLM owns neither op at
+the parity pin. Narrowing moved the port toward its goldens: over 194 arms, 182
+unchanged, 10 improved, 2 one unit-in-the-last-place worse and three or more
+decimal orders inside their bounds. The width remains part of the contract; what
+changed is which width the contract names.
 
 ### 13.3 The CPU path did not move, and it is PROVED
 
@@ -3803,18 +3812,23 @@ The two arms' mechanisms are different either way. The property they both turn o
 — and the only one this row changes on the host — is that the arithmetic is f64
 and arranged as one accumulator per output cell.
 
-### 18.3 The f64 stays, and it does not have to move
+### 18.3 The f64 does not have to move for THIS row, and the reason it was kept was wrong
 
-§13.2 records why the accumulator is f64: it is what the `vocoder1d` host loops
-used, therefore what every committed golden for all FOUR consumers was taken
-with — MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and
-IndexTTS-2.5 — and it is what makes the CUDA provider `memcmp`-identical to the
-host. torch accumulates an f32 conv in f32; this is a deliberate, recorded
-divergence.
+**Superseded in part by `VT-CONV1D-F32-ACC`
+([#1474](https://github.com/mudler/vllm.cpp/issues/1474),
+[`vt-conv1d-f32-accumulator.md`](vt-conv1d-f32-accumulator.md)), which narrowed
+the accumulator to f32.** The paragraph this section used to open with said the
+f64 was "what every committed golden for all FOUR consumers was taken with".
+That was false — every one of those generators runs torch in f32, so the
+goldens came from an f32-accumulating reference and this op was wider than its
+own oracle. §13.2 carries the correction and the evidence.
 
-Narrowing it to f32 is a real lever and it is NOT this row (§18.9). It would
-re-gate four shipped models, it cannot inherit §13.4's `memcmp`, and it is worth
-strictly less after this row than before it.
+What survives, and is the point of this section, is the part that never
+depended on the width: **this row did not need to touch it.** Narrowing was a
+separate lever, it re-gated four shipped models, it could not inherit §13.4's
+`memcmp` against the pre-op host loop, and it was worth strictly less after this
+row than before it — which is exactly why it was taken as its own row with its
+own goldens measurement rather than folded in here.
 
 **Because the chain can be broken without touching the width.** Hold one f64
 accumulator per output cell over a TILE of output positions, and hoist the
@@ -4111,10 +4125,13 @@ else.
 
 ### 18.9 What is OWED after this row, named rather than left to a profile
 
-- **The f32-accumulate variant** (§13.10 step 3) is untouched and is now worth
-  less, because the f64 path costs several times less than it did. It still
-  needs its own gate against each of the four consumers' goldens and cannot
-  inherit §13.4's `memcmp`.
+- **The f32-accumulate variant** (§13.10 step 3) is **DISCHARGED**, by
+  `VT-CONV1D-F32-ACC` ([#1474](https://github.com/mudler/vllm.cpp/issues/1474),
+  [`vt-conv1d-f32-accumulator.md`](vt-conv1d-f32-accumulator.md)). It did what
+  this bullet asked: its own gate against each of the four consumers' goldens,
+  measured per arm before and after, and it did not inherit §13.4's `memcmp`
+  against the pre-op host loop — it replaced that standing with a width gate
+  against torch's own answer and said so.
 - **The device arm's staging** (§13.6's owed list: device-resident weights, one
   persistent queue, a chain that stays on the device between stages) is
   untouched. This row does not make the device arm win, and after it the host

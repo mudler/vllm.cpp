@@ -329,7 +329,7 @@ asserts a non-zero case count, reads the `Status:` line rather than grepping
 | W3 | `downloader`: `HEAD`, resume, structural checks, lock, progress | Resume, truncation, and integrity cases green |
 | W4 | `model_resolver` and the `server_main.cpp` call site | The end-to-end case green, and red when the call site is deleted |
 | W5 | Build and packaging: the three options, `NOTICE`, `libssl3`, the container check | Every lane builds, and the container check distinguishes a working build from a disabled one |
-| W6 | `docs/USAGE.md` and `docs/FEATURES.md` | The new flags, environment variables, and workflow are documented |
+| W6 | `docs/guides/hugging-face-access.md`, `docs/reference/server.md` and `docs/FEATURES.md` | The new flags, environment variables, and workflow are documented |
 | W7 | Fresh review, mutation table, repair | A fresh reviewer returns `PASS` |
 
 That plan said W1 through W7 land in one pull request, which is the repository
@@ -581,7 +581,8 @@ wrong, not the fact. W5 confirms by building and running the archive validator.
 
 **The GGUF form diverges from vLLM by design.** vLLM has no `org/repo:QUANT`
 form. This is a tracked exception under the secondary-oracle rule, not a silent
-divergence. `docs/USAGE.md` states which upstream defines which form.
+divergence. `docs/guides/hugging-face-access.md` states which upstream defines
+which form.
 
 ## Owed
 
@@ -679,6 +680,13 @@ files with the macro defined yields zero surviving assertions at `e25d3d344` and
 the TLS arm at this head. And the object-identifier preference in `BlobNameFor`
 was unpinned, so `test_model_resolver.cpp` now gives one listed file an
 identifier and asserts the two blob names apart.
+
+#1491 landed while this branch was open and split `docs/USAGE.md` into
+`docs/guides/`, `docs/models/` and `docs/reference/`. The merge takes that file
+unchanged from `origin/main` and re-applies this row's documentation where the
+split put it: the fetch, the cache layout and the limits in
+`docs/guides/hugging-face-access.md`, and the `--model`, `--revision` and
+`--download-dir` rows in `docs/reference/server.md`.
 
 W5, W6 and W7 have not been done: there is no transport layer security option,
 no `docs/FEATURES.md` entry, and no fresh review.

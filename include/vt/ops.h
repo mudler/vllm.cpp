@@ -414,12 +414,14 @@ enum class OpId : uint8_t {
   //   * `vt` had NO transposed 1-D convolution of any kind. kCausalConv1dFwd is
   //     causal/stateful/SiLU-folded and kDepthwiseConv1d is centre-padded and
   //     depthwise; neither can express a scatter that GROWS the time axis.
-  //   * the ACCUMULATOR WIDTH differs and is part of the contract, not an
-  //     implementation detail. kDepthwiseConv1d accumulates in f32 and its
-  //     byte-exactness gate pins that; these two accumulate in f64, because f64
-  //     is what every committed `vocoder1d` golden was taken with. Widening or
-  //     narrowing either one moves a shipped model's numerics, so these are
-  //     SIBLINGS and kDepthwiseConv1d is untouched.
+  //   * the bias seeding and the zero-skip differ and are part of the contract,
+  //     not implementation detail — see vt::ConvTranspose1d clause (3), where
+  //     the skip decides the SIGN of a zero output cell. The ACCUMULATOR WIDTH
+  //     used to differ too and no longer does: kDepthwiseConv1d accumulates in
+  //     f32 and since #1474 so do these, because f32 is what torch accumulates
+  //     a float convolution in. Either one's width still moves a shipped
+  //     model's numerics, so they remain SIBLINGS and kDepthwiseConv1d is
+  //     untouched.
   // See vt::Conv1d / vt::ConvTranspose1d below for the exact contracts.
   // Appended before kCount so no existing op's id shifts.
   kConv1d,
@@ -2956,26 +2958,46 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 //
 // THE NUMERIC CONTRACT, which is the load-bearing part.
 //
-// (1) Every output element owns ONE f64 accumulator. Not f32. The host
-//     reference these replace accumulated in double
-//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), every
-//     committed golden under `tests/parity/goldens/` for all four consumers was
-//     taken through it, and a narrower accumulator would move four shipped
-//     models at once. This is a DELIBERATE divergence from torch, which
-//     accumulates an f32 conv in f32; it is recorded rather than silently
-//     inherited because `.agents/porting.md` "Mirror the memory format" cuts
-//     both ways and a WIDER accumulator is exactly the class of divergence a
-//     token gate cannot see. Cost: the activations and weights stay f32 in
-//     memory, so nothing moves more bytes; only the register width differs.
+// (1) Every output element owns ONE f32 accumulator. Not f64. That is what
+//     torch accumulates a float convolution in, MEASURED rather than read: on a
+//     27-tap `[+1e8, 0.1 x 25, -1e8]` probe, where an f32 accumulator lands on
+//     exactly 0.0 in ANY summation order and an f64 one lands near 2.5,
+//     `F.conv1d` returns 0.0 at f32 and at bf16 and `F.conv_transpose1d`
+//     returns 0.0 at f32 (torch 2.11.0+cu130). vLLM owns neither op at the
+//     parity pin `555967922` — it drops the vocoder it would otherwise own,
+//     `qwen3_omni_moe_thinker.py:1975` — so torch is the reference here through
+//     the per-consumer secondary oracles, and where vLLM DOES own a convolution
+//     it states the same polarity itself (`csrc/cpu/mamba_kernels.hpp`,
+//     "Accumulate in float32 for precision").
+//
+//     THIS WAS f64 UNTIL VT-CONV1D-F32-ACC (#1474), justified by a claim that
+//     did not hold. The host reference these replaced did accumulate in double
+//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), but the
+//     goldens were never taken through it at that width: all four consumers'
+//     generators run torch in f32 (`scripts/gen-bigvgan-goldens.py:48` builds
+//     f64 and then calls `.float()`; `gen-ltx2-vae-goldens.py:223,234` and
+//     `gen-minimax-music3-acoustic-goldens.py:81,134` cast with
+//     `astype(np.float32)`), so this op was WIDER than the oracle its own
+//     goldens came from. The clause also cited `tests/parity/goldens/`, a
+//     directory that contains no vocoder, BigVGAN, LTX-2.5 VAE, FVQ or
+//     general-conv1d golden at all — they are `.inc` headers beside their tests
+//     (`tests/vllm/models/bigvgan_goldens.inc`, `ltx2_vae_goldens.inc`,
+//     `minimax_music3_acoustic_goldens.inc`). An uncheckable citation is how
+//     the first claim survived. Narrowing moved the port TOWARD its goldens:
+//     over 194 arms, 182 unchanged, 10 improved, 2 one ULP worse and three or
+//     more decimal orders inside their bounds.
+//     .agents/specs/vt-conv1d-f32-accumulator.md.
 //
 // (2) THE VISIT ORDER IS PINNED, not merely the value.
 //     Conv1d accumulates over (ic ascending, k ascending) with the bias seeded
 //     FIRST — `acc = bias; for ic: for k: acc += x*w`.
 //     ConvTranspose1d accumulates over (ic ascending, then input position t
 //     ascending, taking the single tap k with `t*stride + k*dilation == p`) with
-//     the bias added LAST. That is the exact sequence of additions the host
-//     scatter performed into each destination cell, which is what lets the
-//     gather-form kernels here be BIT-IDENTICAL to it rather than merely close.
+//     the bias added LAST. That is the sequence of additions the host scatter
+//     performed into each destination cell, which is what lets the gather-form
+//     kernels here be BIT-IDENTICAL to each other rather than merely close. The
+//     ORDER is the host loop's; since #1474 the WIDTH is not, so the identity
+//     holds between the providers here and not against that loop.
 //
 // (3) ConvTranspose1d SKIPS an input whose value compares equal to 0.0, exactly
 //     as the host loop did. That is not an optimisation that may be dropped: it
@@ -2984,16 +3006,26 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 //
 // Parallelism partitions OUTPUT elements only, so results do not depend on the
 // thread count or the launch geometry. Gated in
-// tests/vt/test_ops_conv1d_general.cpp against a verbatim copy of the pre-op
-// host loop, and in tests/vllm/models/test_host_parallel.cpp end to end.
+// tests/vt/test_ops_conv1d_general.cpp and tests/vllm/models/test_host_parallel.cpp
+// against in-test serial references that walk the declared order. Those
+// references were verbatim copies of the pre-op host loop until #1474 narrowed
+// them in lockstep with the kernels, so what they now assert is that the ORDER
+// did not move, not that the arithmetic matches a historical loop. Clause (1)
+// is what gates the WIDTH, and it is gated against torch's own answer rather
+// than against a copy of ourselves — `tests/vllm/models/test_host_parallel.cpp`,
+// `vocoder1d Conv1d / ConvTranspose1d accumulates in f32, which is what torch
+// does`, entering through the production `vllm::vocoder1d::*` entry point.
 //
 // (4) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE, not merely close.
-//     Both are one f64 accumulator per output element walked in the order
+//     Both are one f32 accumulator per output element walked in the order
 //     above; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56)
-//     and the device kernel uses `__dmul_rn`/`__dadd_rn`, so every operation on
-//     both arms is an IEEE double multiply or add with round-to-nearest-even on
+//     and the device kernel uses `__fmul_rn`/`__fadd_rn`, so every operation on
+//     both arms is an IEEE single multiply or add with round-to-nearest-even on
 //     the same values in the same sequence. The gate asserts `memcmp` equality,
-//     not a tolerance.
+//     not a tolerance. **UNVERIFIED at the narrowed width**: #1474 had no CUDA
+//     toolkit and no lease, so this clause rests on the construction and not on
+//     a run. Owed, and named as owed:
+//     .agents/specs/vt-conv1d-f32-accumulator.md §7.
 //
 // x/weight/bias/out are f32 only. f16/bf16 are REFUSED with a message naming
 // the gap rather than silently widened — no consumer has them and no golden

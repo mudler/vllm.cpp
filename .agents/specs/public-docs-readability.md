@@ -18,6 +18,22 @@ W3 extracts the model recipes, combines the repeated MiniMax sections, and adds
 the seven-field checkpoint registry. The remaining legacy body stays in place
 for the W4 and W5 migrations.
 
+W4 extracts twelve cross-model guides and four dense references. The guide and
+reference indexes own each new destination. Five existing focused guides move
+under `docs/guides/`, and every public and internal caller now names the moved
+path. `docs/USAGE.md` retains the generic workflows, checkpoint registry,
+generic speech route, and the build and release material that W5 still owns.
+
+The W4 red check failed first on the missing
+`docs/guides/hugging-face-access.md` destination. The green destination and
+index check accounts for all 16 manifest destinations. The W3-to-W4 set audit
+compared flags, environment names, revisions, hashes, lifecycle words,
+measurements, warnings, defaults, and error literals. Values removed from the
+public usage body are either present in a W4 destination or already owned by
+the exact internal archive named in the manifest. For example, the two SASS
+hashes remain in `.agents/specs/gdn-replayssm.md`; ignored benchmark logs need
+`rg -uu` when the inventory scans `docs/bench-evidence/`.
+
 The W3 MiniMax-H3 registry metadata was resolved on 20 August 2026 with the
 Hugging Face revision API and raw Git LFS pointers. No model weight was
 downloaded. The resolved revisions are `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7`
@@ -370,51 +386,51 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/FEATURES.md:334` ## Parallelism and scale-out | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
 | `docs/FEATURES.md:352` ## Not supported yet | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
 | `docs/FEATURES.md:373` ## How to read this page | Current feature state | `docs/FEATURES.md` | `kept` | `n/a` |
-| `docs/KV-OFFLOAD.md:1` # KV offload and external KV caches | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
-| `docs/KV-OFFLOAD.md:15` ## The flag | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
-| `docs/KV-OFFLOAD.md:37` ## LMCache (`lm://` remote KV), the connector that works end to end | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
-| `docs/KV-OFFLOAD.md:87` ### Identity and refusal | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
-| `docs/KV-OFFLOAD.md:104` ## CPU + disk offload (`OffloadingConnector`), REFUSED by the engine today | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
-| `docs/KV-OFFLOAD.md:136` ## Limitations | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
-| `docs/KV-OFFLOAD.md:165` ## Consuming it programmatically | Cross-model workflow | `docs/guides/kv-offload.md` | `moved` | `n/a` |
+| `docs/KV-OFFLOAD.md:1` # KV offload and external KV caches | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:15` ## The flag | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:37` ## LMCache (`lm://` remote KV), the connector that works end to end | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:87` ### Identity and refusal | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:104` ## CPU + disk offload (`OffloadingConnector`), REFUSED by the engine today | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:136` ## Limitations | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/KV-OFFLOAD.md:165` ## Consuming it programmatically | Cross-model workflow | `docs/KV-OFFLOAD.md` | `kept` | `n/a` |
 | `docs/RELEASES.md:1` # Binary releases | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
 | `docs/RELEASES.md:12` ## Primary downloads | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
 | `docs/RELEASES.md:35` ## Verify a download | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
 | `docs/RELEASES.md:52` ## Retention | Dense lookup material | `docs/RELEASES.md` | `kept` | `n/a` |
 | `docs/RELEASES.md:59` ## Maintainer flow | Contributor procedure | `.agents/specs/release-binary-matrix.md` | `archived` | `.agents/specs/release-binary-matrix.md` |
-| `docs/ROCM.md:1` # ROCm (AMD GPU) backend — contributor guide | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:31` ## 1. Why ROCm is the cheapest backend to add | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:59` ## 2. What a backend is, file by file | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:100` ## 3. Correctness before kernels: the reference tier | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:124` ### 3.1 The F6 fix: unified memory true by construction (approach (b)) | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:171` ## 4. Pick your first task from your hardware | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:184` ## 5. Milestones as concrete PRs | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:237` ### 5.1 Known runtime issues on the #41 boards | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:254` ### 5.2 The sequence for board owners, post-F6-fix | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:320` ## 6. What not to port | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:335` ## 7. Working with the record | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:354` ## 8. CI gates your PR will hit | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/ROCM.md:376` ## 9. Asking | Cross-model workflow | `docs/guides/rocm.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:1` # SGLang-compatible behaviors | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:25` ## 1. RadixAttention (automatic prefix caching) | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:73` ## 2. LPM cache-aware scheduling | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:120` ## 3. Jump-forward decoding | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:172` ## 4. Custom logits processors | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:208` ## When to enable (guidance) | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SGLANG-COMPAT.md:236` ## Default inertness | Cross-model workflow | `docs/guides/sglang-compatibility.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:1` # Speculative decoding | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:11` ## Methods | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:27` ## Which keys the JSON accepts | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:60` ## MTP | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:98` ## DFlash (block diffusion) | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:114` ## n-gram | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:128` ## DSpark (semi-autoregressive block drafting) — in progress | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:175` ### Which DSpark draft the loader will take | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:202` ## The flag | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/ROCM.md:1` # ROCm (AMD GPU) backend — contributor guide | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:31` ## 1. Why ROCm is the cheapest backend to add | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:59` ## 2. What a backend is, file by file | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:100` ## 3. Correctness before kernels: the reference tier | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:124` ### 3.1 The F6 fix: unified memory true by construction (approach (b)) | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:171` ## 4. Pick your first task from your hardware | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:184` ## 5. Milestones as concrete PRs | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:237` ### 5.1 Known runtime issues on the #41 boards | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:254` ### 5.2 The sequence for board owners, post-F6-fix | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:320` ## 6. What not to port | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:335` ## 7. Working with the record | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:354` ## 8. CI gates your PR will hit | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/ROCM.md:376` ## 9. Asking | Cross-model workflow | `docs/ROCM.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:1` # SGLang-compatible behaviors | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:25` ## 1. RadixAttention (automatic prefix caching) | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:73` ## 2. LPM cache-aware scheduling | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:120` ## 3. Jump-forward decoding | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:172` ## 4. Custom logits processors | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:208` ## When to enable (guidance) | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SGLANG-COMPAT.md:236` ## Default inertness | Cross-model workflow | `docs/SGLANG-COMPAT.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:1` # Speculative decoding | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:11` ## Methods | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:27` ## Which keys the JSON accepts | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:60` ## MTP | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:98` ## DFlash (block diffusion) | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:114` ## n-gram | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:128` ## DSpark (semi-autoregressive block drafting) — in progress | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:175` ### Which DSpark draft the loader will take | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:202` ## The flag | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
 | `docs/SPECULATIVE-DECODING.md:237` ## Measured result | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:257` ## Concurrency above 1 | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:267` ## Limitations | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
-| `docs/SPECULATIVE-DECODING.md:304` ## Consuming it programmatically | Cross-model workflow | `docs/guides/speculative-decoding.md` | `moved` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:257` ## Concurrency above 1 | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:267` ## Limitations | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
+| `docs/SPECULATIVE-DECODING.md:304` ## Consuming it programmatically | Cross-model workflow | `docs/SPECULATIVE-DECODING.md` | `kept` | `n/a` |
 | `docs/STATUS.md:1` # vllm.cpp status | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:20` ## Parity pin | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:60` ## Capability status | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
@@ -552,17 +568,17 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:6248` ### `num_condition_layers: 8` does not mean eight transformer layers | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:6256` ### Running the gates | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:6284` ### Why no gate compares a generated song to the oracle's | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
-| `docs/WEIGHT-OFFLOAD.md:1` # Weight offload | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:17` ## What works today | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:39` ## The flag | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:50` ### Fields | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:62` ### Targeting by name segment | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:79` ### The two empty-set defaults are not the same | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:86` ## What the engine refuses, and what it only warns about | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:99` ### The model has to claim support, and none does yet | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:129` ## Why the budget can overshoot by one weight | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:136` ## Limitations | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
-| `docs/WEIGHT-OFFLOAD.md:148` ## Consuming it programmatically | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:1` # Weight offload | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:17` ## What works today | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:39` ## The flag | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:50` ### Fields | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:62` ### Targeting by name segment | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:79` ### The two empty-set defaults are not the same | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:86` ## What the engine refuses, and what it only warns about | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:99` ### The model has to claim support, and none does yet | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:129` ## Why the budget can overshoot by one weight | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:136` ## Limitations | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
+| `docs/WEIGHT-OFFLOAD.md:148` ## Consuming it programmatically | Cross-model workflow | `docs/WEIGHT-OFFLOAD.md` | `kept` | `n/a` |
 
 Campaign-base heading count: `275`.
 

@@ -45,7 +45,7 @@ spelling rather than an absent one, so it is an override and is reported as one.
 It joined the config surface after the other five
 ([#1127](https://github.com/mudler/vllm.cpp/issues/1127)).
 
-See [USAGE.md](USAGE.md#streaming-routed-experts-from-disk-capacity-mode) for the
+See the [expert streaming guide](guides/expert-streaming.md) for the
 config form and
 [`.agents/specs/weight-residency-config.md`](../.agents/specs/weight-residency-config.md)
 for why the extension is a namespaced key rather than a field on vLLM's mirrored
@@ -67,7 +67,7 @@ These change how the engine runs and have no CLI flag (or complement one).
 | `VLLM_PREFIX_CACHING_HASH_SEED` | `0` (fixed) | Seed for the prefix-cache block hash, mirroring vLLM's `PYTHONHASHSEED`. `random` makes block hashes non-deterministic across processes, which takes any persisted or shared KV cache to a 0% hit rate. Keep it fixed if you rely on cross-process prefix reuse |
 | `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES` | `1` (on) | Whether published KV-cache events carry block hashes as an int (the low 64 bits of the sha256 digest) rather than the raw 32 bytes, mirroring vLLM's env of the same name and its default. Set `0` to publish the raw bytes. Only affects the KV-cache event payload (`--kv-events-config`); it does not change the internal block hashing or the cache itself |
 | `VLLM_PLUGINS` | unset (load all registered) | Comma-separated allowlist of general plugins to load in `LoadGeneralPlugins()`, mirroring vLLM's `VLLM_PLUGINS`. Unset loads every registered plugin; an empty string loads none; a list loads only the named plugins. A plugin that throws is logged and skipped (the load never aborts the engine). See [.agents/specs/plugin-system.md](../.agents/specs/plugin-system.md) |
-| `VT_LMCACHE_HOST` | `127.0.0.1` | Default LMCache server host for the `lm://` connector. The `kv_connector_extra_config.host` key overrides it. See [KV-OFFLOAD.md](KV-OFFLOAD.md) |
+| `VT_LMCACHE_HOST` | `127.0.0.1` | Default LMCache server host for the `lm://` connector. The `kv_connector_extra_config.host` key overrides it. See [KV offload](KV-OFFLOAD.md) |
 | `VT_LMCACHE_PORT` | `65432` | Default LMCache server port. The `kv_connector_extra_config.port` key overrides it |
 | `VT_LMCACHE_HASH_ALGO` | `blake3` | Default LMCache key-derivation algorithm. Set `vllm` (alias `sha256_cbor`) for byte-for-byte interop with a real vLLM + LMCache peer. The `kv_connector_extra_config.hash_algo` key overrides it |
 | `VT_SERVER_MAX_PROMPT_CHARS` | `200000` characters | Rejects chat-completion prompts larger than this many characters. Set `0` to disable the prompt-size guard |

@@ -149,7 +149,7 @@ There is no binding speed result.
 > on four community boards — gfx1151, gfx1103, gfx1100, gfx1201
 > ([issue #41](https://github.com/mudler/vllm.cpp/issues/41)). The
 > unified-memory fix on top of them (approach (b),
-> [docs/ROCM.md §3.1](ROCM.md)) was again written with **no AMD GPU or ROCm
+> [ROCm guide §3.1](ROCM.md)) was again written with **no AMD GPU or ROCm
 > toolchain on any maintainer machine**, so a compile error in it is expected,
 > useful, and belongs on #41.
 
@@ -187,7 +187,7 @@ What exists today is the W0 skeleton — the `vt::Backend`, the `Platform`, one
 registered kernel (RmsNorm), and the tests that gate them — plus the approach-(b)
 unified-memory branch for integrated APUs. What that does and
 does not get you, and where to start on your specific board, is
-[docs/ROCM.md](ROCM.md).
+[ROCm guide](ROCM.md).
 
 ## Nix shells
 
@@ -253,7 +253,7 @@ defaults.
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
 | Vulkan | Portable GPU | `opt-125m` is strict token-exact; Qwen3.6-27B decode matches llama.cpp Vulkan on GB10. See [BENCHMARKS.md](BENCHMARKS.md) for the measured scope |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
-| ROCm | AMD GPUs | W0 tests passed on four community `gfx` targets; ROCm 6.x build fix landed. Model and oracle gates remain open: [ROCM.md](ROCM.md) |
+| ROCm | AMD GPUs | W0 tests passed on four community `gfx` targets; ROCm 6.x build fix landed. Model and oracle gates remain open: [ROCm guide](ROCM.md) |
 | Tenstorrent | Blackhole | `ACTIVE`: OPT-125m strict 6/6 on real hardware; Qwen3-0.6B gate wired, full 16x16 rerun and performance path pending |
 | ANE | Apple Neural Engine | Post-parity roadmap |
 

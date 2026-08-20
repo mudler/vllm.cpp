@@ -353,7 +353,7 @@ honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 A 2.4-trillion-parameter mixture-of-experts checkpoint, three times the size of
 the machine's memory, loads and answers on one DGX Spark. This section is the
 recipe. The mechanism it drives is the previous section,
-[Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode),
+[expert streaming guide](../guides/expert-streaming.md),
 which owns the config schema, the precedence rule, the statistics line, the slot
 count warning and what each device can serve. This section links them rather than
 restating them. It repeats three of their facts on purpose: which device to use,

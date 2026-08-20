@@ -3624,6 +3624,84 @@ void DFlashGroupedConvKernelCuda(Queue& q, Tensor& out, const Tensor& x,
   VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-grouped-conv: launch failed");
 }
 
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314) — the CUDA
+// MIRROR of the CPU reference `Dflash2SelectorEdgesKernel` (cpu_ops.cpp), which
+// carries the full port note and the upstream anchor.
+//
+// One block per (request, step, predecessor slot). The block first materializes
+// upstream's `predecessors * hidden[:, :, None]` for its own slot into dynamic
+// shared memory — rounded to the codebook dtype, because upstream materializes
+// that tensor — and then block-reduces one rank contraction per child candidate.
+//
+// UNLIKE vt::DFlashGroupedConv this kernel is NOT bit-identical to the CPU
+// reference and is not specified to be: the rank contraction is a REDUCTION, and
+// this tree reduction sums in a different order than the CPU reference's serial
+// loop. It is gated within an f32 envelope. The two ROUNDING PLACEMENTS are
+// still exact — the elementwise product and the single round of the completed
+// sum — because those are what upstream's materializations pin.
+template <typename T>
+__global__ void Dflash2SelectorEdgesKernel(float* scores, const T* pred_codebook,
+                                           const T* succ_codebook, const int64_t* cand,
+                                           const float* unary, const T* hidden,
+                                           const int64_t* anchors, int64_t L, int64_t K,
+                                           int64_t R) {
+  extern __shared__ float gated[];
+  const int64_t slot = blockIdx.x;
+  const int64_t p = slot % K;
+  const int64_t idx = slot / K;  // flattened (b, l)
+  const int64_t b = idx / L, l = idx - b * L;
+  const int64_t pid = (l == 0) ? anchors[b] : cand[(b * L + (l - 1)) * K + p];
+  for (int64_t r = threadIdx.x; r < R; r += blockDim.x)
+    gated[r] = ResRound<T>(__fmul_rn(Load(pred_codebook, pid * R + r),
+                                     Load(hidden, idx * R + r)));
+  __syncwarp();
+  for (int64_t c = 0; c < K; ++c) {
+    const int64_t cid = cand[idx * K + c];
+    float acc = 0.0f;
+    for (int64_t r = threadIdx.x; r < R; r += blockDim.x)
+      acc += gated[r] * Load(succ_codebook, cid * R + r);
+    // ONE WARP per block, so the contraction reduces with __shfl_xor_sync and
+    // needs no shared scratch and no __syncthreads inside this loop.
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    if (threadIdx.x == 0)
+      scores[idx * K * K + p * K + c] = unary[idx * K + c] + ResRound<T>(acc);
+  }
+}
+
+void Dflash2SelectorEdgesKernelCuda(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                                    const Tensor& succ_codebook, const Tensor& candidate_ids,
+                                    const Tensor& unary, const Tensor& hidden,
+                                    const Tensor& anchors,
+                                    const Dflash2SelectorEdgesArgs& args) {
+  const int64_t B = candidate_ids.shape[0], L = candidate_ids.shape[1];
+  const int64_t K = args.top_k, R = pred_codebook.shape[1];
+  const int64_t blocks = B * L * K;
+  if (blocks == 0) return;
+  constexpr int kThreads = 32;  // ONE warp: the contraction reduces by shuffle
+  const size_t shared = static_cast<size_t>(R) * sizeof(float);
+  cudaStream_t s = AsStream(q);
+  switch (pred_codebook.dtype) {
+    case DType::kF32:
+      Dflash2SelectorEdgesKernel<float>
+          <<<static_cast<unsigned>(blocks), kThreads, shared, s>>>(
+              scores.Ptr<float>(), pred_codebook.Ptr<float>(), succ_codebook.Ptr<float>(),
+              candidate_ids.Ptr<int64_t>(), unary.Ptr<float>(), hidden.Ptr<float>(),
+              anchors.Ptr<int64_t>(), L, K, R);
+      break;
+    case DType::kBF16:
+      Dflash2SelectorEdgesKernel<__nv_bfloat16>
+          <<<static_cast<unsigned>(blocks), kThreads, shared, s>>>(
+              scores.Ptr<float>(), pred_codebook.Ptr<__nv_bfloat16>(),
+              succ_codebook.Ptr<__nv_bfloat16>(), candidate_ids.Ptr<int64_t>(),
+              unary.Ptr<float>(), hidden.Ptr<__nv_bfloat16>(), anchors.Ptr<int64_t>(), L, K, R);
+      break;
+    default:
+      VT_CHECK(false, "cuda dflash2-selector-edges: unsupported dtype (f32/bf16 only)");
+  }
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-selector-edges: launch failed");
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -3678,6 +3756,9 @@ struct Registrar {
     RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernelCuda)));
+    RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernelCuda)));
   }
 } registrar;
 

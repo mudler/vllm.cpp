@@ -35,7 +35,8 @@
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) the graph-eligibility predicate
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
-#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
+#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 SampleDflashBlockDrafts
+#include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"  // SPEC-DFLASH2 W3 Dflash2SelectCandidates
 #include "vllm/v1/worker/gpu/spec_decode/dspark/speculator.h"  // SPEC-DSPARK W5 SampleDsparkBlockDrafts
 #include "vllm/v1/spec_decode/ngram_proposer.h"  // SPEC-NGRAM D3 NgramPropose
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
@@ -2751,18 +2752,40 @@ void GPUModelRunner::propose_drafts_block(
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
     const auto t_fwd0 = std::chrono::steady_clock::now();
+    // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out` off
+    // this forward -- the post-final-norm hidden the candidate selector's
+    // `hidden_projection` reads. Upstream's `_generate_draft` takes both from
+    // one forward, and it must: the selector projects the SAME hidden states
+    // these logits came from. A DFlash1 draft passes nullptr and this call is
+    // byte-for-byte what it was.
+    //
+    // COST, named rather than discovered: asking for `final_out` takes this
+    // forward off the single-request PAGED fast path, which is guarded on
+    // `final_out == nullptr` (ForwardBlockLogitsWithDeviceKV). That costs a
+    // DFlash2 draft the CUDA-graph draft step until W4 computes the candidates
+    // inside the forward instead of after it. It costs a DFlash1 draft nothing,
+    // and this row claims no throughput number.
+    std::vector<float> block_hidden;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
-            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
+            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
+            nullptr, backbone.IsDflash2() ? &block_hidden : nullptr);
     const auto t_fwd1 = std::chrono::steady_clock::now();
-    // SPEC-DFLASH2 W2 (#1314): the PRODUCTION boundary of the DFlash2 port. The
-    // block forward above just ran the draft's grouped dynamic convolution
-    // (vt::DFlashGroupedConv, wrapped around every attention and MLP sublayer of
-    // every layer); the candidate selector that must choose from these logits is
-    // W3 and is refused BY NAME here rather than silently replaced by the DFlash1
-    // per-slot argmax `sample` is about to apply. See
-    // RefuseDflash2CandidateSelector for why a fallback is not admissible.
-    RefuseDflash2CandidateSelector(backbone);
+    // SPEC-DFLASH2 W3 (#1314): the PRODUCTION boundary of the DFlash2 port, one
+    // step further out than W2 left it. The block forward above ran the draft's
+    // grouped dynamic convolution; `Dflash2SelectCandidates` then runs the
+    // target head's top-K, the codebook lattice and the edge scores -- the SAME
+    // function `DflashProposeBlock` calls, so this path and the one a gate can
+    // drive are one implementation rather than two. What is still missing is the
+    // PATH WALK, refused BY NAME rather than silently replaced by the DFlash1
+    // per-slot argmax `sample` is about to apply. See RefuseDflash2PathWalk for
+    // why a fallback is not admissible.
+    if (backbone.IsDflash2()) {
+      const vllm::v1::Dflash2ProposeState selected = vllm::v1::Dflash2SelectCandidates(
+          block_logits, block_hidden, anchors, P, num_query_per_req - 1, backbone,
+          config, queue_);
+      vllm::v1::RefuseDflash2PathWalk(backbone, selected);
+    }
     const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
     if (propose_trace) {

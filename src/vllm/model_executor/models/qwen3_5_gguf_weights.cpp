@@ -986,7 +986,7 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
 // at startup. Correctness first; the sharing is an RSS optimization that only
 // pays on a tied file, which neither gate model is.
 void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& g, OwnedTensor* embed,
-                                    OwnedTensor* head) {
+                                    OwnedTensor* head, bool* head_was_quantized) {
   const std::string kEmbed = "token_embd.weight";
   VT_CHECK(HasTensor(g, kEmbed),
            "gguf shared head: the target file has no " + kEmbed +
@@ -1004,6 +1004,10 @@ void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& g, OwnedTensor* embed,
            "gguf shared head: " + head_name + " must be 2-D");
   *head = OwnBf16(g, head_name, ht.shape);  // [N = vocab, K = H]
   head->nk = true;
+  // A scalar ggml type packs ONE element per "block"; anything else is
+  // block-quantized and `OwnBf16` above dequantized it. SPEC-DFLASH2 W3 (#1314).
+  if (head_was_quantized != nullptr)
+    *head_was_quantized = GgmlTraits(ht.ggml_type).block_elems != 1;
 }
 
 // --- weights -------------------------------------------------------------

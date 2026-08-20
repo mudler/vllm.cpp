@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -413,13 +414,14 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 890 900 901 969 1065 1081 1147 1151 1244 1270 1378 1420 1462 1464
+// 902 912 913 981 1077 1093 1159 1163 1256 1318 1426 1468 1510 1512
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
     "upsampler_path",            kLtx2DurationHeadPathExtra,
+    kLtx2TemporalUpsamplerPathExtra,
     kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
     kLtx2NegativePromptEmbedsExtra, kLtx2NegativeAudioPromptEmbedsExtra,
     kLtx2CheckpointClassExtra,
@@ -669,6 +671,16 @@ struct Ltx2VideoEngine::Impl {
   bool has_upsampler = false;
   Ltx2UpsamplerConfig upsampler_cfg;
   Ltx2VaeWeights upsampler_weights;
+
+  // The TEMPORAL x2 latent upsampler, a SECOND and separate slot (#986).
+  // `DFRPipeline.__init__` holds two upsamplers at once — `spatial_upsampler_path`
+  // at dfr_pipeline.py:174 and `temporal_upsampler_path` at :177 — because stage
+  // 2's input transform needs the spatial one while the rounds loop needs the
+  // temporal one, in the same render. Reusing one slot for both would make the
+  // two arms mutually exclusive, which is not upstream's shape.
+  bool has_temporal_upsampler = false;
+  Ltx2UpsamplerConfig temporal_upsampler_cfg;
+  Ltx2VaeWeights temporal_upsampler_weights;
 
   // Conditioning. `has_encoder` is true exactly when `encoder_path` named a
   // Gemma-4 text tower and it materialized; see the header's item 2.
@@ -1249,6 +1261,42 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
     im.upsampler_weights = Ltx2LoadVaeWeights(f);
     im.has_upsampler = true;
+  }
+
+  // ── the optional latent TEMPORAL upsampler (DFR's rounds loop, #986) ───────
+  //
+  // Refused at LOAD rather than at the first round, because the round is paid
+  // for after two full denoise stages and a caller who supplied the wrong file
+  // would otherwise learn about it several minutes in. The arm is identified
+  // from the checkpoint's OWN config rather than from its file name: the
+  // spatial and temporal upsamplers share `_class_name: LatentUpsampler` and
+  // the `upsampler.0.*` tensor names, so the wrong file loads and runs and
+  // returns a wrongly shaped latent instead of failing.
+  const std::string temporal_upsampler_path =
+      VideoExtra(params.extras, kLtx2TemporalUpsamplerPathExtra);
+  if (!temporal_upsampler_path.empty()) {
+    const phase::Scope temporal_upsampler_phase("load.temporal_upsampler");
+    const SafetensorsFile f = SafetensorsFile::Open(temporal_upsampler_path);
+    const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
+    im.temporal_upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
+    if (!im.temporal_upsampler_cfg.temporal_upsample) {
+      Fail("the checkpoint at '" + std::string(kLtx2TemporalUpsamplerPathExtra) +
+           "' declares temporal_upsample=false, so it is not the temporal x2 latent upsampler "
+           "DFR's rounds loop calls (ltx-pipelines/dfr_pipeline.py:407). The shipped temporal "
+           "arm is 'ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors', whose config "
+           "declares spatial_upsample=false and temporal_upsample=true. The SPATIAL upscaler "
+           "goes in 'upsampler_path' instead, where stage 2's input transform reads it.");
+    }
+    if (im.temporal_upsampler_cfg.spatial_upsample) {
+      Fail("the checkpoint at '" + std::string(kLtx2TemporalUpsamplerPathExtra) +
+           "' declares BOTH spatial_upsample=true and temporal_upsample=true, so it is the "
+           "SPATIOTEMPORAL arm rather than the temporal x2 one. DFR's rounds loop scales the "
+           "frame axis alone (dfr_pipeline.py:407-408 doubles frames and leaves height and "
+           "width untouched), so a checkpoint that also doubles the spatial axes would return "
+           "a latent no tile range can index.");
+    }
+    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f);
+    im.has_temporal_upsampler = true;
   }
 
   // ── the text tower (phase L13) ────────────────────────────────────────────
@@ -1965,13 +2013,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
   CheckGeneratedKeyframes(gen.extras, im.pipeline_kind);
 
-  // ── DFR's temporal x2/x4 rounds — DEFINED, refused above 0 (#986) ──────────
+  // ── DFR's temporal x2/x4 rounds — SERVED (row LTX25-DFR-ROUNDS, #986) ──────
   //
   // `temporal_upsample_rounds` (dfr_pipeline.py:277, :584-590), `choices=(0, 1,
-  // 2)`, `default=0`. Two answers, and giving the same one to both would be
-  // wrong: a value outside the set is a MALFORMED REQUEST and upstream refuses
-  // it first (:284-285), before the pipeline looks at anything; a value INSIDE
-  // the set is a legal request for a loop this port does not have.
+  // 2)`, `default=0`. Three answers, and collapsing any two of them would be
+  // wrong. A value outside the set is a MALFORMED REQUEST and upstream refuses
+  // it first (:284-285), before the pipeline looks at anything. A positive value
+  // on a non-DFR pipeline is a knob that pipeline does not have. A positive
+  // value with no temporal upsampler is upstream's own second refusal (:286-287).
+  // Anything left runs the loop at :402-529.
+  const bool is_dfr_kind = im.pipeline_kind == "dfr";
+  int64_t requested_temporal_rounds = 0;
   {
     const std::string raw = VideoExtra(gen.extras, kLtx2TemporalRoundsExtra);
     if (!raw.empty()) {
@@ -1983,50 +2035,37 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "(ltx-pipelines/dfr_pipeline.py:284-285), raised at the top of `__call__` before "
              "any work is paid for.");
       }
-      // DELIBERATELY NOT GUARDED ON `pipeline_kind` FIRST. A "this knob only
-      // means something on the dfr pipeline" refusal would be true, and it would
-      // be UNREACHABLE: the rounds loop is unported on every pipeline including
-      // `dfr`, so the check below already answers every caller and the
-      // pipeline-specific branch could never fire. That is the unselected-branch
-      // shape `.agents/reachability.md` enumerates, and writing it now would
-      // land a refusal nothing can trip. It belongs to whichever row serves the
-      // rounds, and the message below says the knob is DFR's so a caller on
-      // another pipeline still learns it.
-      if (rounds != 0) {
-        Fail(
-            "DFR's temporal refinement rounds are not served. This knob is `DFRPipeline`'s alone "
-            "(ltx-pipelines/dfr_pipeline.py:277); no other pipeline `__call__` takes one. "
-            "WHAT IS MISSING IS THE ROUNDS "
-            "LOOP (ltx-pipelines/dfr_pipeline.py:402-529), not the upsampler it calls. Each "
-            "round temporally x2-upsamples the video latent (:407), doubles both the playback "
-            "and the conditioning fps under a 60 fps cap (:409, :414, :74-78), re-tiles the "
-            "canvas into `2**round` keyframe-seam windows (:415), invents mid-segment slots per "
-            "tile (:470-478), denoises each tile with an ancestral Euler step at eta 0.5 and a "
-            "PER-TILE noise seed (:495-499), stitches the tiles back (:508) and merges the "
-            "denoised slots into the next round's anchor bag (:527-529). "
-            "WHAT IS *NOT* THE REASON, and each of these was re-derived at this tree rather "
-            "than inherited. FIRST, NOT the temporal x2 latent upsampler: it is ported and "
-            "gated against executed upstream at reduced dimensions (row "
-            "LTX25-TEMPORAL-UPSAMPLER, `.agents/specs/ltx25-temporal-upsampler.md`), including "
-            "`PixelShuffle1d` and the first-frame drop (model/upsampler/model.py:68-71, "
-            "109-113), and `Ltx2ParseUpsamplerConfig` already reads `temporal_upsample` off a "
-            "checkpoint config. SECOND, NOT the canvas layout: `resolve_canvas`, `tile_ranges`, "
-            "`stitch_tile_latents` and the carry-forward merge are ported and gated in this "
-            "same row (`ltx2_dfr.h`, `test_ltx2_dfr`), so the tile geometry every round needs "
-            "already exists and is checked against upstream's own return values. THIRD, NOT the "
-            "generated keyframe slots: they are SERVED here, which is what the base and detail "
-            "stages run on. What has no local counterpart is the DENOISE PASS AS A CALLABLE — "
-            "upstream's rounds loop invokes the same `DiffusionStage.__call__` the two stages "
-            "use, per tile, with its own sigmas, stepper and seed, and this engine's denoise is "
-            "written inline in one per-phase loop with no seam a tile can enter through. "
-            "AND ONE THING IS MISSING THAT NO CODE CAN SUPPLY: the checkpoint. "
-            "`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` "
-            "(ltx-pipelines/docs/pipelines.md:176) is NOT on the NAS — the "
-            "`latent_upscale_models/` directory holds the SPATIAL upscaler and nothing else, "
-            "re-verified 2026-08-16 — so even a complete loop would have no real weights to "
-            "run. Use 0, which is upstream's default and the served path. "
-            "Tracked as owed by issue #986.");
+      // NOW GUARDED ON `pipeline_kind`, and this branch became REACHABLE in the
+      // same change that made it true. While the rounds loop was unported the
+      // check below could never fire — every caller was already refused by the
+      // "not served" message regardless of pipeline — and landing it then would
+      // have been the unselected-branch shape `.agents/reachability.md`
+      // enumerates. Serving the loop on `dfr` is what gives a non-DFR caller a
+      // different answer from a DFR one, so the branch is written now.
+      if (rounds != 0 && !is_dfr_kind) {
+        Fail("the '" + std::string(kLtx2TemporalRoundsExtra) +
+             "' extra is " + std::to_string(rounds) + " on the '" + im.pipeline_kind +
+             "' pipeline, and this knob is `DFRPipeline`'s alone "
+             "(ltx-pipelines/dfr_pipeline.py:277) — no other pipeline `__call__` upstream "
+             "takes one. Refused rather than ignored: the rounds change the frame count the "
+             "caller gets back to `(requested - 1) * 2**rounds + 1` (:534), so silently "
+             "dropping the knob would return a clip a fraction of the requested length and "
+             "look like a completed request. Load with 'pipeline_kind=dfr' to use it.");
       }
+      if (rounds != 0 && !im.has_temporal_upsampler) {
+        Fail("the '" + std::string(kLtx2TemporalRoundsExtra) + "' extra is " +
+             std::to_string(rounds) + ", and no '" +
+             std::string(kLtx2TemporalUpsamplerPathExtra) +
+             "' load extra was supplied. Upstream raises the same refusal at the top of "
+             "`__call__`, before any work is paid for: "
+             "`temporal_upsample_rounds > 0 requires temporal_upsampler_path` "
+             "(ltx-pipelines/dfr_pipeline.py:286-287). Refusing rather than running 0 rounds: "
+             "each round is what doubles the frame count, so a silently skipped round returns "
+             "a clip of the wrong length that nothing else about the render can flag. The "
+             "checkpoint is "
+             "'ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors'.");
+      }
+      requested_temporal_rounds = rounds;
     }
   }
 
@@ -2529,6 +2568,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // (:317-320). The request cannot carry a conflicting one — that is refused
   // above — so this is a substitution rather than a precedence rule.
   const double fps = wants_retake ? retake_fps : recipe.frame_rate;
+  // The fps the finished clip is PLAYED at, which is the render's own fps until
+  // DFR's temporal rounds double it (`playback_fps = frame_rate * 2**rounds`,
+  // dfr_pipeline.py:542). Separate from `fps` because `fps` is the CONDITIONING
+  // time base every phase builds its RoPE positions on, and a round caps that at
+  // 60 while leaving playback uncapped (:414 against :542). Conflating the two
+  // is invisible to the frame count and to every shape this render reports.
+  double playback_fps = fps;
   const int64_t height = wants_retake ? retake_source.height
                                       : (gen.height > 0 ? gen.height : recipe.height);
   const int64_t width = wants_retake ? retake_source.width
@@ -2566,7 +2612,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // the reference.
   //
   // `requested_frames` is captured BEFORE the pad, because it is the contract.
-  const bool is_dfr = im.pipeline_kind == "dfr";
+  const bool is_dfr = is_dfr_kind;
   const int64_t requested_frames = frames;
   std::vector<int64_t> slot_positions;
 
@@ -2956,8 +3002,86 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
 
   prep_guiders.Close();
-  for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
-    const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
+
+  // ── THE STAGE SEAM (row LTX25-DFR-ROUNDS, #986) ────────────────────────────
+  //
+  // Upstream has ONE callable that every denoise goes through:
+  // `DiffusionStage.__call__` (utils/blocks.py:505-582). The two-stage
+  // pipelines call it once per stage, and DFR's rounds loop calls it again
+  // PER TILE with its own sigmas, stepper, seed, conditionings and initial
+  // latent (dfr_pipeline.py:480-499 against :332 and :375).
+  //
+  // This engine had no such callable: the denoise was written inline in the
+  // per-phase loop, which is exactly what the rounds refusal named as the
+  // blocker before this row. Writing a second denoise loop for tiles would be
+  // the parallel path `AGENTS.md` `## Shared seams` forbids, so the body below
+  // became one lambda and the loop became its first caller. The base stages and
+  // the tiles now run the SAME code, which is the property that matters: a
+  // divergence between them cannot be introduced by editing one of two copies.
+  //
+  // The invocation record mirrors upstream's parameter list. Everything not
+  // named here is shared state the body already read from the enclosing scope,
+  // and it stays shared — this is a seam, not a rewrite.
+  // One seam keyframe handed to a tile, already encoded. Upstream builds these
+  // with `_keyframe_conditionings_from_latents` (dfr_pipeline.py:81-98): a
+  // `VideoConditionByKeyframeIndex` per position, each carrying ONE latent
+  // frame sliced out of the carry-forward bag, all at the same strength.
+  struct Ltx2DfrAnchorConditioning {
+    int64_t frame_idx = 0;  // TILE-LOCAL pixel frame (dfr_pipeline.py:465)
+    Ltx2LatentVolume keyframe;
+    double strength = kLtx2DfrAnchorKeyframeStrength;
+  };
+
+  struct StageInvocation {
+    // The phase whose schedule, guidance, stepper and LoRA scope this runs. A
+    // tile passes a LOCALLY BUILT phase rather than a recipe entry, because
+    // upstream's tile call overrides exactly those fields (`sigmas`, `stepper`)
+    // and inherits the rest.
+    const Ltx2PhaseRecipe* phase = nullptr;
+    // Indexes `phase_guidance` and the `phase_index == 0` trace captures. A tile
+    // reports the phase it inherits from, so a tile cannot be mistaken for the
+    // first phase and overwrite its first-step trace.
+    int64_t phase_index = 0;
+    int64_t frames = 0;  // PIXEL frames of this invocation's canvas
+    double fps = 0.0;    // the CONDITIONING fps, which a round caps at 60
+    // Overrides the input transform. `nullptr` keeps the phase's own transform,
+    // which is what both base stages want; a tile supplies its slice of the
+    // temporally upsampled latent and takes no transform at all.
+    const std::vector<float>* initial_latent = nullptr;
+    // Upstream's tile call passes `audio=None` (dfr_pipeline.py:494) and drops
+    // the returned audio state on the floor. That is not only a saving: with no
+    // audio stream the DiT's cross-modal attention sees no audio tokens, so
+    // running audio anyway would change the VIDEO a tile produces.
+    bool run_audio = true;
+    // This invocation's generated keyframe slots, in PIXEL frames local to it.
+    std::vector<int64_t> slot_positions;
+    // Extra conditioning applied after the phase's own. A tile's seam anchors
+    // arrive here as already-encoded single-frame latents.
+    std::vector<Ltx2DfrAnchorConditioning> anchors;
+    // The ancestral loop's seed offset rides on `Ltx2PhaseRecipe::noise_seed_offset`,
+    // which already exists and is already what `loop_noise` is built from, so a
+    // tile varies it by handing in its own phase rather than by growing a second
+    // channel for the same value.
+    //
+    // Records this invocation's seed, anchor strengths and ancestral eta onto the
+    // trace, AT THE POINTS THAT CONSUME THEM. Off for the base stages, whose
+    // values are the recipe's own and are covered elsewhere; on for a tile,
+    // because the three values upstream overrides per tile are otherwise
+    // unobservable in the rendered clip.
+    bool record_tile_trace = false;
+  };
+
+  auto RunStage = [&](const StageInvocation& inv) {
+    // Shadowing rather than renaming, deliberately. The body below is the
+    // pre-existing phase body; binding the four values it varies on as locals
+    // of the same names keeps the diff to this seam instead of spreading it
+    // across a thousand lines, and keeps the base-stage path textually
+    // identical to what it was.
+    const Ltx2PhaseRecipe& phase = *inv.phase;
+    const int64_t phase_index = inv.phase_index;
+    const int64_t frames = inv.frames;
+    const double fps = inv.fps;
+    const std::vector<int64_t>& slot_positions = inv.slot_positions;
     // W0: one set of leaves PER RECIPE PHASE. The two-stage recipe renders its
     // stages at different resolutions, so a table that summed them would hide
     // exactly the term the campaign is looking for.
@@ -3023,10 +3147,21 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const double latents_per_second = static_cast<double>(ap.sample_rate) /
                                         static_cast<double>(ap.hop_length) /
                                         static_cast<double>(ap.audio_latent_downsample_factor);
-      ashape.frames = static_cast<int64_t>(
-          std::llround(static_cast<double>(frames) / fps * latents_per_second));
+      ashape.frames = inv.run_audio
+                          ? static_cast<int64_t>(
+                                std::llround(static_cast<double>(frames) / fps * latents_per_second))
+                          // A DFR tile runs with NO audio stream at all
+                          // (dfr_pipeline.py:494 passes `audio=None`, and
+                          // utils/blocks.py:560-563 builds an audio state only
+                          // when the spec is present). Zero frames is how that
+                          // reaches the DiT: `Ltx2DitForward` already takes
+                          // `audio_tokens = 0` for a null stream, so the tile's
+                          // cross-modal attention sees no audio tokens. Running
+                          // audio anyway would not merely waste the compute — it
+                          // would change the VIDEO the tile produces.
+                          : 0;
     }
-    if (ashape.frames < 1) Fail("the audio latent resolved to zero frames");
+    if (inv.run_audio && ashape.frames < 1) Fail("the audio latent resolved to zero frames");
 
     // ── the input transform (ltx2_recipes.py:38) ────────────────────────────
     std::vector<float> video_initial;
@@ -3149,6 +3284,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
 
+    // The caller's own initial latent, which is how a DFR tile enters (#986).
+    // It comes LAST so it wins over the phase's input transform: upstream's
+    // tile call passes `initial_latent=tile_video` (dfr_pipeline.py:492) and no
+    // transform at all, the tile latent having already been produced by the
+    // round's temporal upsample and sliced by the tile range.
+    if (inv.initial_latent != nullptr) video_initial = *inv.initial_latent;
+
     // ── build the two states (create_noised_state, helpers.py:428-445) ───────
     //
     // `target_tokens` is `patchifier.get_token_count(target_shape)` — the count
@@ -3243,7 +3385,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     StreamState audio;
     audio.width = ashape.channels * ashape.mel_bins;
     audio.tokens = ashape.frames;
-    {
+    if (!inv.run_audio) {
+      // The whole audio state is SKIPPED, not built empty and then ignored.
+      // `audio.tokens` is already 0, so `Ltx2DitForward` receives a stream of
+      // no tokens — its `audio_tokens = audio != nullptr ? audio->tokens : 0`
+      // is the same value upstream's `audio_state = None` produces. Building it
+      // would also be wrong rather than merely wasteful: the carry between
+      // phases below asserts the audio latent keeps its size, and a tile's
+      // canvas is a different duration from the render's.
+    } else {
       std::vector<float> volume(static_cast<size_t>(ashape.channels) *
                                 static_cast<size_t>(ashape.frames) *
                                 static_cast<size_t>(ashape.mel_bins));
@@ -3623,6 +3773,40 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                    "renders a clip of the right length that pins the image to the wrong end");
     }
 
+    // ── A ROUND'S SEAM ANCHORS (row LTX25-DFR-ROUNDS, #986) ─────────────────
+    //
+    // Every seam keyframe inside a tile's window is re-applied as a HARD
+    // keyframe, including the one at the window's own local frame 0
+    // (dfr_pipeline.py:453-468). They are what makes the tiles agree with each
+    // other: the seam a tile shares with its neighbour is pinned to the same
+    // latent on both sides, so the stitch has nothing to blend.
+    //
+    // Strength is 0.95 rather than 1.0, and upstream says why at :70-72 — the
+    // carried anchors are "ours, pinned just short of fully clean so a tile can
+    // still settle its seam frame". At 1.0 the seam frame is frozen and cannot
+    // move to meet the frames either side of it.
+    //
+    // BEFORE the slots, which is upstream's list order (:462 `extend` then :473
+    // `append`). Items append to the END of the sequence, so the order here is
+    // what makes the slot layout's recorded `first_token` describe the tokens
+    // the slots actually occupy.
+    for (const Ltx2DfrAnchorConditioning& anchor : inv.anchors) {
+      const int64_t before_anchor = video.tokens;
+      Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
+      Ltx2ConditionVideoByKeyframe(&state, anchor.keyframe, /*patch_size=*/1, factors, fps,
+                                   anchor.frame_idx, anchor.strength,
+                                   /*num_pixel_frames=*/1, /*causal_fix=*/true);
+      // Read off the argument that was just applied, not off the assignment that
+      // produced it, so a strength lost between the two is red as well.
+      if (inv.record_tile_trace) im.trace.round_anchor_strengths.push_back(anchor.strength);
+      FromLatentState(state, &video);
+      VT_CHECK(video.tokens > before_anchor,
+               "ltx2 video: a DFR seam anchor must APPEND tokens like any other keyframe "
+               "conditioning (keyframe_cond.py:79-82), and this one left the sequence length "
+               "unchanged. An anchor that appends nothing pins nothing, and the tile still "
+               "renders — with a seam that agrees with its neighbour only by luck.");
+    }
+
     // ── GENERATED KEYFRAME SLOTS (#986) ─────────────────────────────────────
     //
     // LAST among the appending items, and the order is upstream's: DFR builds
@@ -3712,8 +3896,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     const float noise_scale = static_cast<float>(phase.noise_scale);
     ApplyGaussianNoise(video, state_noise.Draw(static_cast<int64_t>(video.latent.size())),
                        noise_scale);
-    ApplyGaussianNoise(audio, state_noise.Draw(static_cast<int64_t>(audio.latent.size())),
-                       noise_scale);
+    // Only when there IS an audio stream. A DFR tile runs with none
+    // (dfr_pipeline.py:494), and the noiser refuses an empty state by name
+    // rather than treating it as a no-op — which is the right polarity, because
+    // everywhere else an empty audio latent would be a defect.
+    if (inv.run_audio) {
+      ApplyGaussianNoise(audio, state_noise.Draw(static_cast<int64_t>(audio.latent.size())),
+                         noise_scale);
+    }
 
     // The audio arm of the trace (#922), read AFTER the noiser and off the mask
     // the loop will actually use.
@@ -4084,7 +4274,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
       Ltx2GuidedDenoiseInputs denoise_in;
       denoise_in.video = &vin;
-      denoise_in.audio = &ain;
+      // A NULL audio stream when this invocation has none, which is upstream's
+      // own shape rather than an optimization: `DiffusionStage.__call__` builds
+      // an audio state only when the spec is present (utils/blocks.py:560-563),
+      // and DFR's tile call passes `audio=None` (dfr_pipeline.py:494).
+      // `Ltx2DitForward` already resolves `audio_tokens` to 0 for a null pointer
+      // (ltx2_dit.cpp), so the tile's cross-modal attention sees no audio tokens.
+      // A zero-token stream is NOT the same thing and cannot be substituted:
+      // `vt::Tensor` refuses a non-positive dimension by name, which is the
+      // right polarity everywhere else in this engine.
+      denoise_in.audio = inv.run_audio ? &ain : nullptr;
       denoise_in.video_negative_context = negative_video_context;
       denoise_in.audio_negative_context = negative_audio_context;
       denoise_in.video_guider = video_guidance;
@@ -4155,7 +4354,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // The ancestral arm's loop generator is seeded from the pipeline seed plus
     // the recipe's own offset (distilled.py:69-73, :178-184) — a separate stream
     // from the state noise, so its first draw is not the initial latent's.
-    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
+    const uint64_t loop_seed = seed + static_cast<uint64_t>(phase.noise_seed_offset);
+    SplitMixGaussian loop_noise(loop_seed);
+    // The seed the generator was CONSTRUCTED with. A tile that inherited the
+    // render's seed draws the same noise as every other tile at the same shape.
+    if (inv.record_tile_trace) im.trace.round_tile_seeds.push_back(loop_seed);
+    // Set once, by the ancestral arm, when it takes a step — so a tile that fell
+    // onto the deterministic arm records nothing rather than recording an eta
+    // nobody used.
+    bool tile_eta_recorded = false;
     const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
 
     phase_prepare.Close();
@@ -4274,6 +4481,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
             if (phase_index == 0 && step == 0) im.trace.video_first_next_latent = video.latent;
             continue;
           }
+          if (inv.record_tile_trace && !tile_eta_recorded) {
+            im.trace.round_stepper_eta.push_back(phase.stepper_eta);
+            tile_eta_recorded = true;
+          }
           const std::vector<float> v_noise =
               loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
           const std::vector<float> a_noise =
@@ -4284,19 +4495,28 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                      static_cast<int64_t>(video.latent.size()),
                                      phase.stepper_eta, phase.stepper_s_noise, v_noise.data()),
               video);
-          audio.latent = PostProcessLatent<float>(
-              Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
-                                     sigma_count, step,
-                                     static_cast<int64_t>(audio.latent.size()),
-                                     phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
-              audio);
+          // The audio arm of the step runs only when there IS an audio stream.
+          // A DFR tile has none (dfr_pipeline.py:494), and both steppers refuse
+          // an empty tensor by name rather than returning it unchanged — the
+          // right polarity everywhere else, since an empty audio latent inside
+          // a render that asked for audio is a defect.
+          if (inv.run_audio) {
+            audio.latent = PostProcessLatent<float>(
+                Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                       sigma_count, step,
+                                       static_cast<int64_t>(audio.latent.size()),
+                                       phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
+                audio);
+          }
         } else {
           video.latent = Ltx2EulerStep(video.latent.data(), v_denoised.data(), sigmas.data(),
                                        sigma_count, step,
                                        static_cast<int64_t>(video.latent.size()));
-          audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
-                                       sigma_count, step,
-                                       static_cast<int64_t>(audio.latent.size()));
+          if (inv.run_audio) {
+            audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                         sigma_count, step,
+                                         static_cast<int64_t>(audio.latent.size()));
+          }
         }
         // What the sampler WROTE, recorded after the step rather than derived
         // from what was recorded before it. It is the only observable that says
@@ -4375,10 +4595,19 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     video_lf = vshape.frames;
     video_lh = vshape.height;
     video_lw = vshape.width;
-    audio_latent_volume = Ltx2AudioUnpatchify(audio.latent.data(), ashape);
-    audio_lc = ashape.channels;
-    audio_lf = ashape.frames;
-    audio_lm = ashape.mel_bins;
+    // A tile that ran no audio must not CLOBBER the render's soundtrack. This
+    // is the half a shape assertion cannot see: writing an empty volume here
+    // leaves a correctly shaped video beside no audio at all, and every check
+    // on the video passes. Upstream has the same asymmetry for the same reason
+    // — `tile_state, _ = self.stage(...)` (dfr_pipeline.py:480) discards the
+    // tile's audio return rather than assigning it — and the shipped audio comes
+    // from stage 1 regardless (:552-554).
+    if (inv.run_audio) {
+      audio_latent_volume = Ltx2AudioUnpatchify(audio.latent.data(), ashape);
+      audio_lc = ashape.channels;
+      audio_lf = ashape.frames;
+      audio_lm = ashape.mel_bins;
+    }
 
     // PHASE CHANGE. The denoise loop just left the shared scratch pool holding
     // every activation size class this phase touched, and on an UNCAPPED pool
@@ -4419,6 +4648,316 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
       }
     }
+  };  // RunStage
+
+  // The seam's first caller: the recipe's own phases, one invocation each. This
+  // is what every pipeline kind in the table runs, and it is deliberately the
+  // thinnest possible wrapper — the values it passes are the ones the body used
+  // to read directly from this scope, so the base path is unchanged.
+  for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
+    StageInvocation inv;
+    inv.phase = &recipe.phases[static_cast<size_t>(phase_index)];
+    inv.phase_index = phase_index;
+    inv.frames = frames;
+    inv.fps = fps;
+    inv.run_audio = true;
+    inv.slot_positions = slot_positions;
+    RunStage(inv);
+  }
+
+  // ── DFR: THE TEMPORAL REFINEMENT ROUNDS (dfr_pipeline.py:402-529) ──────────
+  //
+  // Row LTX25-DFR-ROUNDS (#986), and this loop is the ONLY consumer of the
+  // temporal x2 latent upsampler — upstream's and this tree's alike. Until it
+  // landed, `docs/FEATURES.md` carried that operator as
+  // `Temporal x2 ups gated, UNDRIVEN`: ported, gated at reduced dimensions, and
+  // reachable from nothing a user could ask for.
+  //
+  // Each round doubles the temporal resolution of the finished latent and then
+  // RE-DENOISES it in `2**round` overlapping windows, so the new intermediate
+  // frames are generated rather than interpolated. The tiles exist because the
+  // canvas after a round is longer than the trained context; they are cut on
+  // KEYFRAME SEAMS so that every window boundary is a frame both neighbours
+  // pin to the same latent.
+  if (requested_temporal_rounds > 0) {
+    VT_CHECK(is_dfr, "ltx2 video: the temporal rounds loop ran on the '" + im.pipeline_kind +
+                         "' pipeline. The knob is DFR's alone and is refused at the request "
+                         "surface on every other kind, so reaching here means that refusal was "
+                         "bypassed rather than that another pipeline grew rounds.");
+    VT_CHECK(im.has_temporal_upsampler,
+             "ltx2 video: the temporal rounds loop ran with no temporal upsampler loaded. The "
+             "request surface refuses that combination, so reaching here means the refusal and "
+             "this loop disagree about what a servable request is.");
+    phase::Scope rounds_phase("generate.temporal_rounds");
+
+    // Stage 2's slots become the first round's anchors (dfr_pipeline.py:396-398).
+    std::vector<int64_t> carry_positions = slot_positions;
+    Ltx2LatentVolume carry_keyframes = slot_keyframes;
+    // PLAYBACK fps doubles every round and is NOT capped (:409, :542); the
+    // CONDITIONING fps is the capped one (:414). They are separate variables
+    // because conflating them is invisible to every shape and count this render
+    // reports — see the header note on `round_conditioning_fps`.
+    double current_fps = fps;
+    // `DISTILLED_SIGMAS[4:]` (:400) — the tail of the distilled schedule, which
+    // is a partial re-noise rather than a fresh denoise: the latent arriving in
+    // a round is already a finished render at half the frame rate.
+    // Read off PHASE 0 rather than from a second copy of the constant. The DFR
+    // recipe is the distilled two-stage recipe with DFR's phase names
+    // (`DfrRecipe`, ltx2_pipeline.cpp:1303-1322), and its stage 1 sigmas ARE
+    // `DISTILLED_SIGMAS` — which is exactly what `dfr_pipeline.py:281` passes
+    // and what `:400` then slices. Taking it from the recipe means a change to
+    // the distilled schedule cannot leave the rounds running the old one.
+    const std::vector<float>& full_distilled = recipe.phases[0].sigmas;
+    VT_CHECK(full_distilled.size() > 4,
+             "ltx2 video: DFR's temporal rounds take `DISTILLED_SIGMAS[4:]` "
+             "(dfr_pipeline.py:400) and phase 0's schedule has only " +
+                 std::to_string(full_distilled.size()) +
+                 " entries, so the slice would be empty and every tile would run zero steps — "
+                 "which returns the upsampled latent unchanged, at the right shape and the "
+                 "right length.");
+    const std::vector<float> temporal_sigmas(full_distilled.begin() + 4, full_distilled.end());
+
+    for (int64_t round_idx = 1; round_idx <= requested_temporal_rounds; ++round_idx) {
+      if (carry_positions.empty() || carry_keyframes.frames == 0) {
+        Fail("temporal round " + std::to_string(round_idx) +
+             ": the carry-forward keyframe bag is empty. Upstream raises the same "
+             "(dfr_pipeline.py:404-405): the round's anchors are the previous stage's generated "
+             "keyframe slots, so an empty bag means the slots were never read back.");
+      }
+
+      // ── (:407) THE TEMPORAL x2 UPSAMPLE ────────────────────────────────────
+      //
+      // THIS IS THE CALL THIS ROW EXISTS TO MAKE. Deleting it is the
+      // reachability mutation `.agents/reachability.md` asks for, and the gate
+      // must go red without it.
+      Ltx2LatentVolume before_round;
+      before_round.batch = 1;
+      before_round.channels = video_lc;
+      before_round.frames = video_lf;
+      before_round.height = video_lh;
+      before_round.width = video_lw;
+      before_round.data = video_latent_volume;
+      const Ltx2LatentVolume upsampled = Ltx2UpsampleVideoLatent(
+          im.temporal_upsampler_cfg, im.temporal_upsampler_weights, before_round,
+          im.video_weights.Get("per_channel_statistics.std-of-means"),
+          im.video_weights.Get("per_channel_statistics.mean-of-means"));
+      ++im.trace.temporal_upsample_calls;
+
+      // (:408) The canvas doubles as `2 * (frames - 1) + 1`, not as `2 * frames`.
+      // The arithmetic matters: frame 0 is a single-pixel-frame token under
+      // causal encoding and is not duplicated, so a round inserts one new frame
+      // between each existing PAIR and the count grows by `frames - 1`.
+      frames = 2 * (frames - 1) + 1;
+      current_fps = 2.0 * current_fps;  // (:409)
+
+      const int64_t expected_lf = (frames - 1) / factors.time + 1;
+      if (upsampled.frames != expected_lf || upsampled.height != video_lh ||
+          upsampled.width != video_lw || upsampled.channels != video_lc) {
+        Fail("temporal round " + std::to_string(round_idx) + ": the upsampler returned " +
+             std::to_string(upsampled.channels) + "x" + std::to_string(upsampled.frames) + "x" +
+             std::to_string(upsampled.height) + "x" + std::to_string(upsampled.width) +
+             " and the round needs " + std::to_string(video_lc) + "x" +
+             std::to_string(expected_lf) + "x" + std::to_string(video_lh) + "x" +
+             std::to_string(video_lw) +
+             ". The temporal arm scales the FRAME axis alone and drops the first frame "
+             "(model/upsampler/model.py:68-71, 109-113); a spatial or spatiotemporal "
+             "checkpoint in this slot returns a plausible latent of the wrong shape.");
+      }
+
+      // (:410-412) Only the POSITIONS scale. The carried keyframes are
+      // single-frame latents whose content is already correct — they are stills,
+      // and a still does not change when the timeline around it stretches.
+      std::vector<int64_t> seam_positions;
+      seam_positions.reserve(carry_positions.size());
+      for (const int64_t position : carry_positions) seam_positions.push_back(2 * position);
+
+      // (:414, :74-78) The CONDITIONING fps cap. RoPE time is `pixel_frame / fps`,
+      // so an uncapped time base shrinks every token's temporal span against the
+      // trained distribution and the clip decodes as a motion spike at each
+      // latent border followed by a stall.
+      const double cond_fps = std::min(current_fps, kLtx2DfrMaxConditioningFps);
+
+      // (:415) `2**round_idx` windows — 2 on the first round, 4 on the second.
+      const int64_t num_tiles = int64_t{1} << round_idx;
+      const std::vector<Ltx2DfrTileRange> tiles =
+          Ltx2DfrTileRanges(seam_positions, frames, num_tiles, factors.time);
+      im.trace.round_tile_counts.push_back(static_cast<int64_t>(tiles.size()));
+      im.trace.round_conditioning_fps.push_back(cond_fps);
+
+      std::map<int64_t, size_t> seam_to_index;  // (:413)
+      for (size_t i = 0; i < seam_positions.size(); ++i) seam_to_index[seam_positions[i]] = i;
+
+      std::vector<Ltx2LatentVolume> tile_latents;
+      std::vector<int64_t> round_slot_positions;
+      std::vector<Ltx2LatentVolume> round_slot_latents;
+      // Parallel to `round_slot_latents`, which is indexed by SLOT-PRODUCING tile
+      // rather than by tile, so that the trace can report the tile a merged slot
+      // came from rather than its rank among the tiles that produced any.
+      std::vector<int64_t> round_slot_latent_tile;
+
+      for (size_t tile_index = 0; tile_index < tiles.size(); ++tile_index) {
+        const Ltx2DfrTileRange& tile = tiles[tile_index];
+        // (:422) The tile's own pixel-frame count, derived from its latent span.
+        const int64_t local_frames =
+            (tile.latent_end_exclusive - tile.latent_start - 1) * factors.time + 1;
+        // (:423) The tile's slice of the upsampled latent.
+        const Ltx2LatentVolume tile_video =
+            Ltx2DfrSliceLatentFrames(upsampled, tile.latent_start, tile.latent_end_exclusive);
+
+        StageInvocation inv;
+        // The DETAIL phase's recipe, with upstream's tile overrides applied.
+        // Built from the phase rather than from scratch so the tile inherits the
+        // guidance, the LoRA scope and the schedule-token policy the detail
+        // stage ran under — upstream's tile call inherits exactly those, passing
+        // only `sigmas`, `stepper` and `loop` of its own.
+        Ltx2PhaseRecipe tile_phase = recipe.phases[static_cast<size_t>(last_phase)];
+        tile_phase.name = "dfr_round" + std::to_string(round_idx) + "_tile" +
+                          std::to_string(tile_index);
+        tile_phase.sigmas = temporal_sigmas;
+        tile_phase.noise_scale = static_cast<double>(temporal_sigmas.front());  // (:491)
+        tile_phase.stepper = Ltx2StepperKind::kEulerAncestral;                  // (:495)
+        tile_phase.stepper_eta = kLtx2DfrTemporalAncestralEta;                  // eta 0.5
+        // The tile latent is already at full resolution; no input transform.
+        tile_phase.input_transform = Ltx2PhaseInputTransform::kInitial;
+        tile_phase.spatial_downscale = 1;
+
+        inv.phase = &tile_phase;
+        inv.phase_index = last_phase;
+        inv.frames = local_frames;
+        inv.fps = cond_fps;
+        inv.initial_latent = &tile_video.data;
+        inv.run_audio = false;  // (:494) `audio=None`
+        inv.record_tile_trace = true;
+        // (:496-498) A PER-TILE ancestral seed, `seed + 1000 * round_idx +
+        // tile_index`. Upstream states the failure it prevents: the tiles are
+        // positionally identical, so a shared seed injects byte-identical noise
+        // into every one of them — which renders a clip whose windows all carry
+        // the same grain pattern, at the right shape and the right length.
+        // `loop_noise` is already built as `seed + phase.noise_seed_offset`, so
+        // the tile varies it through the phase it hands in.
+        tile_phase.noise_seed_offset = 1000 * round_idx + static_cast<int64_t>(tile_index);
+
+        // (:453-468) Every seam in the window is a hard keyframe, including the
+        // one at local frame 0.
+        for (const int64_t anchor_global : tile.anchor_kf_global) {
+          const auto found = seam_to_index.find(anchor_global);
+          if (found == seam_to_index.end()) {
+            Fail("temporal round " + std::to_string(round_idx) + ", tile " +
+                 std::to_string(tile_index) + ": anchor seam " + std::to_string(anchor_global) +
+                 " is missing from the carry-forward bag (dfr_pipeline.py:456-458). The tile "
+                 "ranges and the bag are built on the same seam grid, so a miss means they "
+                 "were derived from different position lists.");
+          }
+          Ltx2DfrAnchorConditioning anchor;
+          anchor.frame_idx = anchor_global - tile.pixel_start;  // (:465)
+          anchor.keyframe = Ltx2DfrSliceLatentFrames(
+              carry_keyframes, static_cast<int64_t>(found->second),
+              static_cast<int64_t>(found->second) + 1);
+          anchor.strength = kLtx2DfrAnchorKeyframeStrength;  // (:466), 0.95
+          inv.anchors.push_back(std::move(anchor));
+        }
+
+        // (:470-478) The mid-segment slots this window invents, seeded from the
+        // tile's OWN latent rather than from noise.
+        const std::vector<int64_t> slot_local =
+            Ltx2DfrRemapPositionsToLocal(tile.slot_kf_global, tile.pixel_start);
+        inv.slot_positions = slot_local;
+        const bool tile_has_slots = !slot_local.empty();
+        if (tile_has_slots) {
+          slot_keyframes = Ltx2DfrSlotInitialsFromVideo(tile_video, slot_local, factors.time);
+        } else {
+          slot_keyframes = Ltx2LatentVolume{};
+        }
+
+        RunStage(inv);
+
+        Ltx2LatentVolume produced;
+        produced.batch = 1;
+        produced.channels = video_lc;
+        produced.frames = video_lf;
+        produced.height = video_lh;
+        produced.width = video_lw;
+        produced.data = video_latent_volume;
+        tile_latents.push_back(std::move(produced));
+
+        if (tile_has_slots) {
+          if (slot_keyframes.frames != static_cast<int64_t>(slot_local.size())) {
+            Fail("temporal round " + std::to_string(round_idx) + ", tile " +
+                 std::to_string(tile_index) + ": the tile produced " +
+                 std::to_string(slot_keyframes.frames) + " keyframe slots for " +
+                 std::to_string(slot_local.size()) +
+                 " requested (dfr_pipeline.py:502-506).");
+          }
+          for (const int64_t position : tile.slot_kf_global) {
+            round_slot_positions.push_back(position);
+            ++im.trace.round_slots_emitted;
+          }
+          round_slot_latents.push_back(slot_keyframes);
+          round_slot_latent_tile.push_back(static_cast<int64_t>(tile_index));
+        }
+      }
+
+      // (:508-511) Stitch, and check the length the stitch has to produce.
+      const Ltx2LatentVolume stitched = Ltx2DfrStitchTileLatents(tile_latents, tiles);
+      if (stitched.frames != expected_lf) {
+        Fail("temporal round " + std::to_string(round_idx) + ": the stitched latent is " +
+             std::to_string(stitched.frames) + " latent frames and the round needs " +
+             std::to_string(expected_lf) +
+             " (dfr_pipeline.py:509-511). The tiles are gapless by construction, so a "
+             "disagreement means a tile dropped the wrong prefix.");
+      }
+      video_latent_volume = stitched.data;
+      video_lf = stitched.frames;
+
+      // (:516-525) Lead-in segments make a tile repeat the previous tile's
+      // slots. The EARLIER tile's version wins, because it denoised that slot
+      // inside the window that owns it rather than inside a lead-in.
+      std::vector<int64_t> merged_positions;
+      Ltx2LatentVolume merged_slots;
+      {
+        // `first_index.setdefault(position, index)` (:519-521) — FIRST wins, and
+        // `sorted(first_index)` (:522) puts the bag back in position order.
+        std::map<int64_t, std::pair<size_t, size_t>> first_seen;  // position -> (tile, index)
+        size_t flat = 0;
+        for (size_t t = 0; t < round_slot_latents.size(); ++t) {
+          for (int64_t k = 0; k < round_slot_latents[t].frames; ++k) {
+            const int64_t position = round_slot_positions[flat++];
+            first_seen.emplace(position, std::make_pair(t, static_cast<size_t>(k)));
+          }
+        }
+        std::vector<Ltx2LatentVolume> pieces;
+        pieces.reserve(first_seen.size());
+        for (const auto& entry : first_seen) {
+          const Ltx2LatentVolume& source = round_slot_latents[entry.second.first];
+          merged_positions.push_back(entry.first);
+          // THE TILE WHOSE COPY WON, which is the only observable the dedupe rule
+          // moves — the position set is identical under first-wins and last-wins.
+          im.trace.round_merged_slot_positions.push_back(entry.first);
+          im.trace.round_merged_slot_tiles.push_back(round_slot_latent_tile[entry.second.first]);
+          pieces.push_back(Ltx2DfrSliceLatentFrames(source,
+                                                    static_cast<int64_t>(entry.second.second),
+                                                    static_cast<int64_t>(entry.second.second) + 1));
+        }
+        if (!pieces.empty()) merged_slots = Ltx2DfrConcatLatentFrames(pieces);
+      }
+
+      // (:527-529) The next round's anchor bag: the seams carried into this
+      // round, plus the slots this round denoised, in position order.
+      const Ltx2DfrCarryForward carried = Ltx2DfrMergeCarryForwardKeyframes(
+          seam_positions, &carry_keyframes, merged_positions,
+          merged_slots.frames > 0 ? &merged_slots : nullptr);
+      carry_positions = carried.positions;
+      carry_keyframes = carried.keyframes;
+      ++im.trace.temporal_rounds;
+    }
+
+    // (:542) The soundtrack was generated once, for the ORIGINAL canvas, and the
+    // rounds multiplied the picture's frame count without touching it. Playback
+    // fps scales by the same factor, so the clip's duration in SECONDS is
+    // unchanged and the existing audio cut still matches the picture — which is
+    // why nothing is re-cut here. Scaled by the rounds that RAN rather than by
+    // the rounds requested, so a short loop cannot leave the clip playing fast.
+    playback_fps = fps * static_cast<double>(int64_t{1} << im.trace.temporal_rounds);
   }
 
   phase::Scope trim_phase("generate.trim");
@@ -4426,10 +4965,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   //
   // `dfr_pipeline.py:531-540`. The canvas padded its tail up to a whole number
   // of keyframe segments, and what the caller is owed is
-  // `(requested - 1) * 2**rounds + 1`. With the rounds arm refused above, that
-  // is `requested` itself — written through `Ltx2DfrTargetFrames` anyway rather
-  // than as `requested_frames`, so the two expressions cannot drift apart when
-  // the rounds land.
+  // `(requested - 1) * 2**rounds + 1`. At 0 rounds that is `requested` itself,
+  // and the rounds this render actually RAN are what the count scales by — read
+  // off the trace rather than off the request, so a loop that stopped early
+  // cannot be trimmed to a length it never generated.
   //
   // `requested - 1` is a multiple of the VAE temporal scale — `resolve_canvas`
   // refuses anything else (dfr_layout.py:71-72) — so the trim always lands on a
@@ -4437,7 +4976,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // the target exceeds the canvas (:535-536), which is a statement about the
   // arithmetic rather than a defensive check: the canvas only ever pads UP.
   if (is_dfr) {
-    const int64_t target_frames = Ltx2DfrTargetFrames(requested_frames, /*rounds=*/0);
+    const int64_t target_frames =
+        Ltx2DfrTargetFrames(requested_frames, im.trace.temporal_rounds);
     if (target_frames > frames) {
       Fail("target " + std::to_string(target_frames) + " frames exceeds the generated canvas " +
            std::to_string(frames) +
@@ -4776,7 +5316,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   result.frame_count = rendered_frames;
   result.width = rendered_w;
   result.height = rendered_h;
-  result.fps = static_cast<int64_t>(std::llround(fps));
+  // PLAYBACK fps, which equals `fps` on every pipeline but a DFR render that ran
+  // temporal rounds (dfr_pipeline.py:542, and `encode_video(fps=...)` at :622
+  // takes the same scaled value). Reporting the conditioning fps here would hand
+  // back a clip of the right length that plays at a fraction of its speed.
+  result.fps = static_cast<int64_t>(std::llround(playback_fps));
   result.sample_rate = audio_rate;
 
   MiniMaxH3MuxRequest mux;

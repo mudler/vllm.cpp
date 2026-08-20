@@ -117,6 +117,46 @@ Audio-only generation fixes modality guidance at `1.0` because it has no video
 stream. The prompt-embeds path needs a text tower for negative conditioning
 unless you set audio CFG to `1.0`.
 
+## Dynamic frame-rate temporal rounds
+
+`--temporal-upsample-rounds N` on a `dfr` render drives the temporal x2 latent
+upsampler, and nothing else in this project does. Each round doubles the latent
+along time, re-tiles the canvas into keyframe-seam windows, invents a
+mid-segment keyframe slot per window, densifies each window with ancestral Euler
+at eta `0.5` under its own noise seed, and stitches the windows back.
+
+The caller gets `(num_frames - 1) * 2**rounds + 1` frames. A 9-frame request
+returns 17 at one round and 33 at two. The playback frame rate scales with the
+count, so the clip's duration in seconds does not change. The conditioning frame
+rate is capped at 60 while playback is not.
+
+Rounds need a second checkpoint. Pass `--temporal-upsampler`, which is a
+different file from `--upsampler`: stage 2's input transform takes the spatial x2
+upscaler and the rounds take the temporal one, and `dfr` holds both at once. The
+loader reads `spatial_upsample` and `temporal_upsample` from the checkpoint's own
+config and refuses a file supplied in the wrong slot, because the two share a
+class name and a tensor layout and the wrong file otherwise loads, runs, and
+returns a plausible latent of the wrong shape. Asking for rounds without the
+checkpoint is refused rather than run at zero rounds, because a silently skipped
+round returns a clip a fraction of the requested length.
+
+The flag is per generation. The C ABI reaches it through
+`vllm_video_gen_params.extra_keys` as `temporal_upsample_rounds`, and
+`--temporal-upsampler` maps to the `temporal_upsampler_path` load extra.
+`/v1/videos` does not carry it: that endpoint forwards no per-generation extra to
+any engine yet (#928).
+
+Two limits this arm does not hide. The tile count is `2**round` clamped to the
+canvas's segment count, which is upstream's `min(num_tiles, n_segments)` and not
+a shortfall, but it means a short canvas denoises in fewer windows than the round
+asks for. No test in this tree reaches the unclamped arm either, so that
+expression is ungated and #1493 owns closing it. And the whole arm is gated on
+reduced-dimension fixtures only, because the `keyframe_slot_sft` base that DFR
+needs is unpublished (#1137). The real
+`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` exists and loads; the
+transformer it would run beside is what is missing, so no real-weight DFR result
+exists or is implied.
+
 ## Conditioning and current limits
 
 Image conditioning accepts a binary PPM first frame. Set `image_crf=0`

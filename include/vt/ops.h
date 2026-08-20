@@ -114,6 +114,7 @@ enum class OpId : uint8_t {
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
   kDFlashGroupedConv,
+  kDflash2SelectorEdges,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -124,6 +125,7 @@ enum class OpId : uint8_t {
   kApplyTemperature,
   kGreedyArgmax,
   kApplyTopKTopP,
+  kTopKValuesIndices,
   kComputeProbs,
   kComputeLogprobs,
   kRandomSample,
@@ -869,6 +871,117 @@ struct DFlashGroupedConvArgs {
   int64_t side = 0;         // 0 = prepare, 1 = finish (selects base/coefficient half)
 };
 
+// Arguments for vt::Dflash2SelectorEdges — the DFlash2 CANDIDATE SELECTOR's edge
+// lattice (SPEC-DFLASH2 W3, #1314).
+//
+// BEYOND-PIN. Ported from `_score_edges` and `CandidateSelector.forward`
+// (vllm/model_executor/models/qwen3_dflash2.py:208-276 @ vllm-project/vllm#52816
+// head `66e5414c6d75a8529473d977f7458c140bbab8a0`); the parity pin `555967922`
+// does not carry the architecture at all and this op does NOT advance it. The
+// PR head MOVED from `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19
+// (#1404); `_score_edges` and `CandidateSelector` are BYTE-IDENTICAL at the two
+// heads, and only the enclosing model's `set_model_tag` and the LM-head guard
+// changed, so this op cites the NEW head and its math is unaffected.
+//
+// The math, in upstream's own terms:
+//
+//   edge(b, l, p, c) = unary[b,l,c]
+//                    + sum_r (pred_codebook[pid(b,l,p), r] * hidden[b,l,r])
+//                            * succ_codebook[cand[b,l,c], r]
+//
+// where `pid(b,l,p)` is the PREDECESSOR token of slot `p` at step `l`: the
+// request's verified ANCHOR token at `l == 0` (the same token for every `p`,
+// upstream's `anchor_token_ids[:, None, None].expand(-1, 1, top_k)`), and
+// `cand[b, l-1, p]` at every later step. So `p` indexes the previous step's K
+// candidates and `c` this step's K candidates, which is exactly the transition
+// lattice the W4 path walk consumes.
+//
+// `unary` is the candidate VALUE from `compute_candidates` — the target head's
+// top-K logit AFTER `output_multiplier` and `final_logit_softcapping` — and it
+// is f32 there and f32 here. Upstream broadcasts it over `p`
+// (`unary_logits[:, :, None]`), so it is a per-CHILD bias and not a per-edge one.
+//
+// ACCUMULATION AND DTYPE. Upstream materializes two bf16 tensors inside the
+// einsum chain and then promotes: `predecessors * hidden[:, :, None]` is a bf16
+// tensor, the einsum's own output is a bf16 tensor, and `unary_logits + <bf16>`
+// promotes to f32 by torch's own type-promotion rule. This op mirrors that
+// placement exactly: the elementwise product rounds to the codebook dtype, the
+// rank reduction accumulates in f32 and rounds ONCE to the codebook dtype, and
+// only then is the f32 `unary` added. On f32 codebooks both roundings are the
+// identity, so the policy is observable ONLY in bf16 — which is where it is
+// gated, for the reason `## Owed` O6 records for the W2 convolution.
+//
+// The rank reduction IS a reduction, so unlike vt::DFlashGroupedConv this op is
+// NOT specified bit-identical across backends: a CUDA mirror is free to reduce
+// in a different order and is gated within an f32 envelope. That is a real
+// difference from W2 and is stated here rather than inherited by analogy.
+struct Dflash2SelectorEdgesArgs {
+  int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
+};
+
+// Arguments for vt::TopKValuesIndices — the vocabulary top-k that EMITS the
+// surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314).
+//
+// BEYOND-PIN. Ported from `_topk`
+// (vllm/model_executor/models/qwen3_dflash2.py:60-64 @ vllm-project/vllm#52816
+// head `66e5414c6d75a8529473d977f7458c140bbab8a0`), which is `torch.topk(scores,
+// k, dim=-1)` off CUDA and FlashInfer's radix `top_k(..., sorted=True,
+// deterministic=True)` on it.
+//
+// WHY NOT FLASHINFER'S RADIX KERNEL. Spec `## Risks/decisions` D2: `topk.cuh` is
+// 3380 lines of general kernel (multi-CTA, deterministic mode, three tie-break
+// modes, dynamic shared-memory sizing) for a shape that is fixed and small here
+// — K = 16 over a 248320 vocabulary for `num_reqs * k` rows, about 224 at
+// concurrency 32. The CUDA arm instead extends the sort-free block-cooperative
+// pivot-bracket threshold search this repository already carries and gates
+// (`src/vt/cuda/cuda_sample.cu::ApplyTopKTopPRowKernel`, ported from the SAME
+// FlashInfer `TopK/TopPRenormProb` approach) so that it COMPACTS and ORDERS the
+// survivors instead of masking below the k-th largest.
+//
+// TIE-BREAK IS PART OF THE CONTRACT, not an implementation detail. The threshold
+// search finds an exact array VALUE, so it keeps whole tie groups atomically and
+// can leave more than k survivors; something then has to choose among equals.
+// This op returns exactly k pairs ordered by DESCENDING value with ties broken
+// by ASCENDING index, which is `torch.topk`'s CPU order and what FlashInfer's
+// `deterministic=True` exists to provide. A backend that broke ties differently
+// would reorder the selector's candidate slots and move acceptance without
+// raising anything, so the CPU reference pins it and the CUDA arm mirrors it.
+//
+// NaN IS THE ONE POINT WHERE THE TWO ARMS ARE NOT EQUAL, and this is stated here
+// because a contract that claimed otherwise would be a claim no shipped backend
+// delivers. The CPU arm orders NaN FIRST, which is `torch.topk(largest=True)`'s
+// own answer, and it is stated rather than left to the sort: leaving it implicit
+// made the CPU comparator an intransitive equivalence and therefore undefined
+// behaviour, not merely an unusual result. The CUDA arm DOES NOT ORDER NaN
+// FIRST and cannot as written -- `TopKValuesIndicesRowKernel`'s pivot bracket
+// uses `fmaxf`/`fminf`, which return the non-NaN operand, and its survivor pass
+// tests `r[j] > thr`, which is false for a NaN, so the search can never select
+// one. Measured on a GB10 on 2026-08-20 rather than argued:
+// [#1489](https://github.com/mudler/vllm.cpp/issues/1489), where the direct
+// cross-arm comparison read `gpu.indices[0] == cpu.indices[0]` as `2 == 1`.
+// Reconciling the kernel to NaN-first is owed to that issue; until it lands the
+// device gate is scoped to the rows the kernel implements. NO SHIPPED PATH FEEDS
+// THIS OP A NaN LOGIT -- the candidate values come from a target LM head -- so
+// the row that pins the CPU order is synthetic in the same sense the padding row
+// is, and the asymmetry is a gap in the contract's reach rather than in any
+// output a user can obtain.
+//
+// `num_org_vocab_padding` mirrors upstream's
+// `lm_head.shard_indices.num_org_vocab_padding`: that many columns at the END of
+// each row are forced to -inf BEFORE the search, so a padded head can never
+// contribute a candidate. It is 0 on every path this engine ships today (the
+// DFlash lane's lm_head is the raw unpadded checkpoint tensor and there is no
+// vocab-parallel sharding), and it is implemented and gated synthetically rather
+// than claimed as checkpoint coverage — the same posture `## Upstream chain`
+// records for the three output scalars. Upstream's companion
+// `org_vocab_start_index` is applied by the CALLER
+// (`vllm::Qwen3DFlash2Model::ComputeCandidates`), not here, because it is an
+// id-space rebase of the result rather than a property of the search.
+struct TopKValuesIndicesArgs {
+  int64_t k = 0;                        // dflash_config.selector_top_k
+  int64_t num_org_vocab_padding = 0;    // trailing columns forced to -inf first
+};
+
 // Backend-neutral local-attention window, matching FlashAttention's
 // `window_size=(left, right)` convention. The bounds are inclusive distances
 // from the bottom-right-aligned absolute query position: (W-1, 0) is a causal
@@ -1297,6 +1410,11 @@ using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, con
                                              const DFlashPagedBlockAttentionArgs&);
 using DFlashGroupedConvFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                      const Tensor&, const DFlashGroupedConvArgs&);
+using Dflash2SelectorEdgesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Dflash2SelectorEdgesArgs&);
+using TopKValuesIndicesFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
+                                     const TopKValuesIndicesArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -3170,6 +3288,34 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
 // reference; CUDA mirrors it bit-for-bit.
 void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
                        const Tensor& base, const DFlashGroupedConvArgs& args);
+
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314). See
+// Dflash2SelectorEdgesArgs for the contract and the upstream anchor. Tensors:
+//   scores          [B, L, K, K] f32   edge(b,l,predecessor,child)
+//   pred_codebook   [V, R]             candidate_selector.predecessor_codebook
+//   succ_codebook   [V, R]             candidate_selector.successor_codebook
+//   candidate_ids   [B, L, K] i64      compute_candidates' ids (target vocab)
+//   unary           [B, L, K] f32      compute_candidates' values
+//   hidden          [B, L, R]          hidden_projection(final hidden states)
+//   anchors         [B] i64            each request's verified anchor token
+// The two codebooks and `hidden` share one float dtype (bf16 on every published
+// checkpoint); `scores` and `unary` are always f32. CPU is the authoritative
+// reference.
+void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                          const Tensor& succ_codebook, const Tensor& candidate_ids,
+                          const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
+                          const Dflash2SelectorEdgesArgs& args);
+
+// Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2,
+// #1314). See TopKValuesIndicesArgs for the contract, the tie-break and the
+// upstream anchor. Tensors:
+//   values   [rows, k] f32   the k largest logits of each row, DESCENDING
+//   indices  [rows, k] i64   their column indices, ties broken ASCENDING
+//   logits   [rows, V] f32   read-only (unlike vt::ApplyTopKTopP, which masks
+//                            its input in place)
+// `args.k` must be in [1, V - args.num_org_vocab_padding].
+void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                       const TopKValuesIndicesArgs& args);
 
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;

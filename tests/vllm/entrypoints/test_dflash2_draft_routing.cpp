@@ -3,7 +3,8 @@
 // WHAT THIS ROW SHIPS. Before W1 nothing in this tree routed the
 // `DFlash2DraftModel` architecture string. Upstream adds it beside
 // `DFlashDraftModel` in the model registry and selects a DIFFERENT speculator on
-// it (vllm-project/vllm#52816 @ `19c9351904df4c63042671bc67a866ca48dc7d6f`,
+// it (vllm-project/vllm#52816 @ `66e5414c6d75a8529473d977f7458c140bbab8a0`,
+// which superseded `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19,
 // `vllm/model_executor/models/registry.py:628` and
 // `vllm/v1/worker/gpu/spec_decode/__init__.py:12-17`). Here the draft path was
 // selected by the CLI method string alone, so a DFlash2 checkpoint pointed at
@@ -196,9 +197,11 @@ TEST_CASE("W2: a safetensors DFlash2 draft is now ADMITTED as far as the conv") 
   // grouped dynamic depthwise convolution -- and a startup refusal would leave
   // every line of it unreachable from any production entry point, which is what
   // AGENTS.md `## Nothing lands dead` forbids. So the draft is admitted here and
-  // refused one step later, at the candidate selector, AFTER the conv has run
-  // (`RefuseDflash2CandidateSelector`, gated in
-  // tests/vllm/v1/spec_decode/test_dflash2_selector_refusal.cpp).
+  // refused one step later, AFTER the conv has run. W3 moves that boundary
+  // again -- the candidate selector is implemented now and the PATH WALK is what
+  // is refused (`RefuseDflash2PathWalk`, gated in
+  // tests/vllm/v1/spec_decode/test_dflash2_walk_refusal.cpp, and reached from
+  // the runner in tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp).
   //
   // What must NOT happen is a fall-through into a resolved config with nothing
   // named: the boundary is stated at STARTUP so the later refusal is not a
@@ -230,7 +233,10 @@ TEST_CASE("W2: admitting the DFlash2 draft STATES the boundary at startup") {
   INFO("notice: ", notice);
   CHECK(notice.find("DFlash2DraftModel") != std::string::npos);
   CHECK(notice.find("grouped dynamic") != std::string::npos);
-  CHECK(notice.find("CANDIDATE SELECTOR") != std::string::npos);
+  // W3: the notice names what RUNS and what does not, and both halves moved.
+  CHECK(notice.find("CANDIDATE SELECTOR are implemented") != std::string::npos);
+  CHECK(notice.find("PATH WALK is not implemented") != std::string::npos);
+  CHECK(notice.find("wave W4") != std::string::npos);
   CHECK(notice.find("SPEC-DFLASH2") != std::string::npos);
   CHECK(notice.find("#1314") != std::string::npos);
 }
@@ -342,6 +348,7 @@ TEST_CASE("the loader refuses a DFlash2 GGUF drafter, which declares no architec
   INFO("what: ", message);
   CHECK(message.find("grouped dynamic") != std::string::npos);
   CHECK(message.find("candidate selector") != std::string::npos);
+  CHECK(message.find("path walk") != std::string::npos);
   CHECK(message.find("not implemented") != std::string::npos);
   CHECK(message.find("SPEC-DFLASH2") != std::string::npos);
   CHECK(message.find("#1314") != std::string::npos);

@@ -294,6 +294,10 @@ const char* OpNameImpl(OpId op) {
       return "DFlashPagedBlockAttention";
     case OpId::kDFlashGroupedConv:
       return "DFlashGroupedConv";
+    case OpId::kDflash2SelectorEdges:
+      return "Dflash2SelectorEdges";
+    case OpId::kTopKValuesIndices:
+      return "TopKValuesIndices";
     case OpId::kReshapeAndCache:
       return "ReshapeAndCache";
     case OpId::kConcatAndCacheMla:

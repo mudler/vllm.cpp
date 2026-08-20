@@ -304,7 +304,23 @@ MATRICES = {
     # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
     # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
     # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 54),
+    # 56 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
+    # +`KERNEL-TOPK-PAIRS`, the DFlash2 candidate selector's two kernels. TWO
+    # rows and not one because they are two kernels with different shapes and
+    # different gates: the first is a small dense contraction over two
+    # per-token codebooks, whose difficulty is the PREDECESSOR indexing (step 0
+    # is the verified anchor, every later step is the previous step's candidate)
+    # and the bf16 ROUNDING PLACEMENT; the second is a sort-free selection over a
+    # 248320 vocabulary, whose difficulty is the TIE-BREAK, because the
+    # pivot-bracket search converges to an exact array VALUE and therefore keeps
+    # whole tie groups. `KERNEL-TOPK-PAIRS` is also a distinct family from the
+    # shipped sampling threshold search rather than a variant of it: that kernel
+    # masks below the k-th largest IN PLACE and returns no indices, this one
+    # compacts the survivors, orders them and emits (id, value) pairs. Bumped
+    # because the rows EXIST, never to make a state transition pass; both are
+    # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
+    # (spec `## Owed` O10, no `nvcc` on the authoring host).
+    "KERNEL": (AGENTS / "kernel-matrix.md", 56),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

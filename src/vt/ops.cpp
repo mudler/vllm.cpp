@@ -3262,6 +3262,81 @@ void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coe
       q, out, x, coefficients, base, args);
 }
 
+void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                          const Tensor& succ_codebook, const Tensor& candidate_ids,
+                          const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
+                          const Dflash2SelectorEdgesArgs& args) {
+  VT_CHECK(args.top_k >= 1, "dflash2-selector-edges: top_k must be >= 1");
+  VT_CHECK(pred_codebook.rank == 2 && succ_codebook.rank == 2,
+           "dflash2-selector-edges: codebooks must be rank-2 [vocab, rank]");
+  VT_CHECK(candidate_ids.rank == 3 && unary.rank == 3 && hidden.rank == 3,
+           "dflash2-selector-edges: candidate_ids/unary must be [B,L,K] and hidden [B,L,R]");
+  VT_CHECK(scores.rank == 4, "dflash2-selector-edges: scores must be rank-4 [B,L,K,K]");
+  VT_CHECK(anchors.rank == 1, "dflash2-selector-edges: anchors must be rank-1 [B]");
+  const int64_t b = candidate_ids.shape[0], l = candidate_ids.shape[1];
+  const int64_t k = args.top_k, r = pred_codebook.shape[1];
+  VT_CHECK(candidate_ids.shape[2] == k,
+           "dflash2-selector-edges: candidate_ids last dim must be top_k");
+  VT_CHECK(unary.shape[0] == b && unary.shape[1] == l && unary.shape[2] == k,
+           "dflash2-selector-edges: unary must be [B,L,K] matching candidate_ids");
+  VT_CHECK(hidden.shape[0] == b && hidden.shape[1] == l && hidden.shape[2] == r,
+           "dflash2-selector-edges: hidden must be [B,L,rank]");
+  VT_CHECK(scores.shape[0] == b && scores.shape[1] == l && scores.shape[2] == k &&
+               scores.shape[3] == k,
+           "dflash2-selector-edges: scores must be [B,L,K,K]");
+  VT_CHECK(anchors.shape[0] == b, "dflash2-selector-edges: anchors must be [B]");
+  VT_CHECK(succ_codebook.shape[0] == pred_codebook.shape[0] &&
+               succ_codebook.shape[1] == r,
+           "dflash2-selector-edges: the two codebooks must share [vocab, rank]");
+  // ONE float dtype across the codebooks and the projected hidden — upstream's
+  // params_dtype, the model dtype. `unary` and `scores` are f32 because upstream
+  // makes the candidate values f32 in compute_candidates and torch then promotes
+  // the bf16 einsum output to f32 on the add.
+  VT_CHECK(IsFloat(pred_codebook.dtype) && succ_codebook.dtype == pred_codebook.dtype &&
+               hidden.dtype == pred_codebook.dtype,
+           "dflash2-selector-edges: codebooks and hidden must share one float dtype");
+  VT_CHECK(unary.dtype == DType::kF32 && scores.dtype == DType::kF32,
+           "dflash2-selector-edges: unary and scores must be f32");
+  VT_CHECK(candidate_ids.dtype == DType::kI64 && anchors.dtype == DType::kI64,
+           "dflash2-selector-edges: candidate_ids and anchors must be i64");
+  VT_CHECK(pred_codebook.IsContiguous() && succ_codebook.IsContiguous() &&
+               candidate_ids.IsContiguous() && unary.IsContiguous() &&
+               hidden.IsContiguous() && anchors.IsContiguous() && scores.IsContiguous(),
+           "dflash2-selector-edges: contiguous tensors required");
+  VT_CHECK(pred_codebook.device == q.device && succ_codebook.device == q.device &&
+               candidate_ids.device == q.device && unary.device == q.device &&
+               hidden.device == q.device && anchors.device == q.device &&
+               scores.device == q.device,
+           "dflash2-selector-edges: device mismatch");
+  reinterpret_cast<Dflash2SelectorEdgesFn>(
+      GetOp(OpId::kDflash2SelectorEdges, q.device.type))(
+      q, scores, pred_codebook, succ_codebook, candidate_ids, unary, hidden, anchors, args);
+}
+
+void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                       const TopKValuesIndicesArgs& args) {
+  VT_CHECK(logits.rank == 2 && values.rank == 2 && indices.rank == 2,
+           "topk-values-indices: logits/values/indices must be rank-2");
+  const int64_t rows = logits.shape[0], v = logits.shape[1];
+  const int64_t pad = args.num_org_vocab_padding;
+  VT_CHECK(pad >= 0 && pad < v, "topk-values-indices: num_org_vocab_padding must be in [0, V)");
+  VT_CHECK(args.k >= 1 && args.k <= v - pad,
+           "topk-values-indices: k must be in [1, V - num_org_vocab_padding]");
+  VT_CHECK(values.shape[0] == rows && indices.shape[0] == rows &&
+               values.shape[1] == args.k && indices.shape[1] == args.k,
+           "topk-values-indices: values/indices must be [rows, k]");
+  VT_CHECK(logits.dtype == DType::kF32 && values.dtype == DType::kF32,
+           "topk-values-indices: logits and values must be f32");
+  VT_CHECK(indices.dtype == DType::kI64, "topk-values-indices: indices must be i64");
+  VT_CHECK(logits.IsContiguous() && values.IsContiguous() && indices.IsContiguous(),
+           "topk-values-indices: contiguous tensors required");
+  VT_CHECK(logits.device == q.device && values.device == q.device &&
+               indices.device == q.device,
+           "topk-values-indices: device mismatch");
+  reinterpret_cast<TopKValuesIndicesFn>(GetOp(OpId::kTopKValuesIndices, q.device.type))(
+      q, values, indices, logits, args);
+}
+
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3,

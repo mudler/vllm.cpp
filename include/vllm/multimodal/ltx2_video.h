@@ -217,6 +217,32 @@ inline constexpr char kLtx2MaxPhaseExtra[] = "max_phase";
 inline constexpr char kLtx2LoraPathExtra[] = "lora_path";
 inline constexpr char kLtx2LoraStrengthExtra[] = "lora_strength";
 
+// WHICH CLASS OF TRANSFORMER the caller handed over. Row LTX25-CHECKPOINT-CLASS,
+// issue #1137. One of `full`, `distilled` or `keyframe_slot_sft`.
+//
+// REQUIRED on every pipeline kind whose upstream row states a class, which is
+// every kind this family resolves except `dmd2`. That is a deliberate break for
+// existing callers and it is what the row buys: upstream keys a checkpoint class
+// per pipeline (ltx-pipelines CLAUDE.md:17-30 at fd4ded7f) and most rows read
+// `Full`, so a distilled transformer on `one_stage`, `t2a_one_stage`,
+// `ti2vid_two_stage`, `res2s_two_stage`, `a2vid_two_stage` or
+// `keyframe_interpolation` renders in a sampling regime the weights were never
+// trained for. It RENDERS: right size, right frame count, right sample rate, and
+// no pixel, RMS, windowed-energy or spectral check can see it.
+//
+// A DECLARATION AND NOT A DETECTION, because detection is not available. The
+// full and distilled bf16 transformers are the same 42,018,190,584 bytes, their
+// `__metadata__["config"]` is 2199 bytes and byte-identical, and their
+// `model_version` is `2.5.0` on both. The one structural difference,
+// `keyframes_abs_pos_embedding`, is an architecture flag rather than a
+// distillation marker and is falsified twice. The measurement is
+// `.agents/specs/ltx25-checkpoint-class.md` section 2, and
+// `Ltx2CheckpointClass` in `ltx2_pipeline.h` carries the short form.
+//
+// THE ENGINE CANNOT CHECK THE CLAIM. What the extra buys is that the wrong
+// sampling regime now needs a deliberate false statement instead of silence.
+inline constexpr char kLtx2CheckpointClassExtra[] = "checkpoint_class";
+
 // How many of the supplied prompt-embeds rows are REAL tokens; the rest are
 // padding. Absent means every row is real.
 //

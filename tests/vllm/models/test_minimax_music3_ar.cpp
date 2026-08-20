@@ -1698,14 +1698,37 @@ TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws th
 
   int64_t host_draws = 0;
   int64_t device_draws = 0;
-  const auto make_sampler = [](int64_t* counter) {
+  // Each draw records the code it took AND the probability vector it took it
+  // from. The code comparison below needs the vector: an argmax whose top two
+  // candidates sit closer together than the two arms' own arithmetic resolution
+  // is not a property either arm can be held to, and the only way to say that
+  // without asserting a coincidence is to ask what the OTHER arm's pick was
+  // worth in this arm's own distribution. See #1458.
+  struct DrawRecord {
+    int64_t code = 0;
+    std::vector<float> probs;
+    double best() const { return static_cast<double>(probs[static_cast<size_t>(code)]); }
+    double runner_up() const {
+      double r = -std::numeric_limits<double>::infinity();
+      for (size_t i = 0; i < probs.size(); ++i)
+        if (static_cast<int64_t>(i) != code) r = std::max(r, static_cast<double>(probs[i]));
+      return r;
+    }
+  };
+  std::vector<DrawRecord> host_rec;
+  std::vector<DrawRecord> device_rec;
+  const auto make_sampler = [](int64_t* counter, std::vector<DrawRecord>* rec) {
     return m3::Music3CodeSampler(
-        [counter](const std::vector<float>& probs, const m3::Music3Draw&) -> int64_t {
+        [counter, rec](const std::vector<float>& probs, const m3::Music3Draw&) -> int64_t {
           ++*counter;
           size_t best = 0;
           for (size_t i = 1; i < probs.size(); ++i) {
             if (probs[i] > probs[best]) best = i;
           }
+          DrawRecord r;
+          r.code = static_cast<int64_t>(best);
+          r.probs = probs;
+          rec->push_back(std::move(r));
           return static_cast<int64_t>(best);
         });
   };
@@ -1714,8 +1737,8 @@ TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws th
   // default-constructed arm — which is what every existing caller passes.
   std::vector<int32_t> host_codes{semantic_code};
   const std::vector<float> host = m3::Music3DepthStage(
-      last_conditional, last_unconditional, frame_index, weights, make_sampler(&host_draws),
-      &host_codes);
+      last_conditional, last_unconditional, frame_index, weights,
+      make_sampler(&host_draws, &host_rec), &host_codes);
 
   vt::Queue queue = CpuQueue();
   m3::DepthDecoderWeights stage_source = depth;
@@ -1731,7 +1754,7 @@ TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws th
   std::vector<int32_t> device_codes{semantic_code};
   const std::vector<float> device =
       m3::Music3DepthStage(last_conditional, last_unconditional, frame_index, weights,
-                           make_sampler(&device_draws), &device_codes, arm);
+                           make_sampler(&device_draws, &device_rec), &device_codes, arm);
   const uint64_t after = m3::Music3DepthDeviceForwardCount();
 
   // THE ASSERTION #1131 SAYS IS MISSING. `num_codebooks` appends a frame: one
@@ -1754,7 +1777,86 @@ TEST_CASE("music3 ar: the COMPOSED depth stage TAKES the device arm and draws th
   // A tolerance CANNOT see a dropped stage — the prefix append, the fed-back
   // projection row — because a schedule missing one still produces finite,
   // plausible numbers. The drawn codes can.
-  CHECK_MESSAGE(device_codes == host_codes, "the two arms drew different residual codes");
+  //
+  // WHAT THE CODES CANNOT DECIDE, and why this is a per-draw comparison rather
+  // than one `==`. The two arms are two implementations of the same block, not
+  // two runs of one: the device arm goes through `vt` GEMMs and the host arm
+  // through the `ArCompute::kBFloat16` reference, and this suite measures their
+  // separation at 174.5 to 6924 bf16 ULP across its device/host comparisons —
+  // 308 in this case. Both store at bf16, so their probabilities agree to about
+  // one bf16 unit roundoff: 2^-8, the largest relative error a store at that
+  // width can carry. An argmax whose top two candidates are separated by LESS
+  // than that is decided by rounding, and holding the two arms to the same code
+  // there asserts a coincidence, not a guarantee.
+  //
+  // MEASURED on this fixture at `aeba0de6f`: draws 0..5 have relative top-2
+  // margins of 1.74e-02 to 3.53e-01 — 4.5x to 90x the resolution — and both arms
+  // agree at every one. Draw 6 is a tie at 1.95e-03 (device) and 2.93e-03
+  // (host), BELOW one unit roundoff, between codes 2 and 17, and each arm
+  // ranks the other's pick inside it. It flipped when `4712dac40` gave
+  // `vt`'s gated activations upstream's rounding polarity, which is the correct
+  // polarity and the only one that reproduces the committed
+  // `silu_and_mul_bf16_8x256` oracle golden bit-exactly. The blanket `==` was
+  // reading a coin. #1458.
+  //
+  // A dropped stage is NOT let through: it moves the distributions by O(1), so
+  // the arms stop agreeing about which candidates are tied at all. MEASURED —
+  // deleting the MLP residual add in `minimax_music3_depth_device.cpp` diverges
+  // at draw 1 with the DEVICE's pick 1.60e-01 below the host's own best, 41x the
+  // unit roundoff this admits, and `shared_tie` is RED.
+  // 2^-8 is bf16's UNIT ROUNDOFF -- the largest relative error a correctly
+  // rounded bf16 store can carry. It is NOT the format's relative spacing
+  // (machine epsilon), which is twice it at 2^-7, and it is not the `Bf16Ulp`
+  // helper this file uses for its value metric either. The unit roundoff is what
+  // bounds a stored probability's departure, which is what this comparison wants.
+  constexpr double kBf16UnitRoundoff = 1.0 / 256.0;
+  REQUIRE(host_rec.size() == device_rec.size());
+  REQUIRE(host_codes.size() == device_codes.size());
+  REQUIRE(host_rec.size() + 1 == host_codes.size());
+  int64_t compared = 0;
+  bool diverged = false;
+  for (size_t i = 0; i < host_rec.size() && !diverged; ++i) {
+    ++compared;
+    const DrawRecord& h = host_rec[i];
+    const DrawRecord& d = device_rec[i];
+    if (h.code == d.code) continue;
+    // Each arm is about to be indexed with the OTHER arm's argmax, so the two
+    // heads must agree on the vocabulary width before that read happens. A
+    // defect that changed the device head's output width would otherwise be
+    // undefined behaviour here, and NDEBUG is the configuration this runs in.
+    REQUIRE(h.probs.size() == d.probs.size());
+    REQUIRE(h.code >= 0);
+    REQUIRE(d.code >= 0);
+    REQUIRE(static_cast<size_t>(h.code) < h.probs.size());
+    REQUIRE(static_cast<size_t>(d.code) < d.probs.size());
+    // A divergence is admissible ONLY as a shared near-tie: each arm must rank
+    // the OTHER arm's pick within one bf16 unit roundoff of its own. That is not a
+    // tolerance anybody chose — it is the width the two arms store at, so a gap
+    // narrower than it is decided by rounding and not by the model. If either
+    // arm ranked the other's pick BELOW that, the two arms disagree about the
+    // distribution and not merely about a tie, and this fires.
+    const double h_gap = (h.best() - static_cast<double>(h.probs[static_cast<size_t>(d.code)])) /
+                         std::max(h.best(), 1e-30);
+    const double d_gap = (d.best() - static_cast<double>(d.probs[static_cast<size_t>(h.code)])) /
+                         std::max(d.best(), 1e-30);
+    const bool shared_tie = (h_gap <= kBf16UnitRoundoff) && (d_gap <= kBf16UnitRoundoff);
+    CHECK_MESSAGE(shared_tie,
+                  "draw " << i << ": the two arms drew different codes (host " << h.code
+                          << ", device " << d.code
+                          << ") and it is NOT a shared tie — in the host's own distribution "
+                             "the device's pick is "
+                          << h_gap << " below its best, and in the device's the host's pick is "
+                          << d_gap << " below its best, against one bf16 unit roundoff " << kBf16UnitRoundoff);
+    if (shared_tie)
+      MESSAGE("draw " << i << ": shared near-tie, host drew " << h.code << " (runner-up gap "
+                    << ((h.best() - h.runner_up()) / h.best()) << "), device drew " << d.code
+                    << " (runner-up gap " << ((d.best() - d.runner_up()) / d.best())
+                    << "), both inside one bf16 unit roundoff " << kBf16UnitRoundoff
+                    << ". Every later draw is fed a different code, so the comparison stops "
+                       "here.");
+    diverged = true;
+  }
+  CHECK_MESSAGE(compared > 0, "no draw was compared, so the code comparison gated nothing");
   CHECK(device_draws == host_draws);
   CHECK(device_draws == config.residual_codebooks());
   CHECK(static_cast<int64_t>(device_codes.size()) == config.num_codebooks);

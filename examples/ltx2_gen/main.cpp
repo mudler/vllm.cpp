@@ -96,6 +96,9 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--dit-config <transformer-config.json>]   REQUIRED when the DiT\n"
       "                                                           carries no __metadata__\n"
       "                [--model-version 2.5] [--pipeline-kind distilled_two_stage]\n"
+      "                --checkpoint-class full|distilled|keyframe_slot_sft\n"
+      "                                                           REQUIRED: which class of\n"
+      "                                                           transformer --dit points at\n"
       "                [--upsampler <latent-spatial-x2.safetensors>]  phase 2 needs it\n"
       "                [--max-phase N] [--allow-unported]\n"
       "                [--lora <ic-lora.safetensors> [STRENGTH]]  fused at load; 1.0\n"
@@ -176,6 +179,15 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "freezes the clip instead; --regenerate-audio has no effect while the source is\n"
       "a frame folder, because a folder carries no audio and both of upstream\'s audio\n"
       "predicates test for one.\n\n"
+      "WHICH TRANSFORMER --dit POINTS AT is something this tool cannot work out, so\n"
+      "--checkpoint-class is REQUIRED on every pipeline kind but dmd2 (#1137).\n"
+      "Upstream keys a checkpoint class per pipeline and most read Full, while the\n"
+      "distilled arms need the distilled file. The two 22B bf16 transformers are the\n"
+      "same 42,018,190,584 bytes, carry a byte-identical embedded config and both\n"
+      "declare model_version 2.5.0, so no header field separates them. Passing the\n"
+      "wrong one used to RENDER: right size, right frame count, right sample rate,\n"
+      "in a sampling regime the weights were never trained for. It is refused now.\n"
+      "\n"
       "TEXT-TO-AUDIO renders a soundtrack and NO PICTURE. --pipeline-kind\n"
       "t2a_one_stage selects it; the result carries an audio.wav, zero frames and no\n"
       "ffmpeg argv, because there is nothing to mux. --video-vae is not needed and\n"
@@ -300,6 +312,14 @@ int main(int argc, char** argv) {
     else if (f == "--dit-config") SetExtra("dit_config_path", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--model-version") SetExtra("model_version", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--pipeline-kind") SetExtra("pipeline_kind", Need(argc, argv, ++i, f.c_str()));
+    // WHICH CLASS OF TRANSFORMER `--dit` points at: `full`, `distilled` or
+    // `keyframe_slot_sft` (row LTX25-CHECKPOINT-CLASS, issue #1137). REQUIRED on
+    // every pipeline kind whose upstream row states a class, which is every kind
+    // but `dmd2`. The library refuses the load without it and says why; this CLI
+    // forwards the flag rather than defaulting one, because every default here
+    // would pick a sampling regime for the caller.
+    else if (f == "--checkpoint-class")
+      SetExtra("checkpoint_class", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--upsampler") SetExtra("upsampler_path", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--negative-prompt-embeds") {
       negative_embeds = Need(argc, argv, ++i, f.c_str());

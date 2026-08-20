@@ -1157,6 +1157,8 @@ Ltx2PipelineRecipe OneStageRecipe(const Ltx2PipelineParams& params,
   recipe.num_inference_steps = params.num_inference_steps;
   recipe.default_image_crf = params.default_image_crf;
   recipe.negative_prompt = negative_prompt;
+  // `TI2VidOneStagePipeline` — `Model` column `Full` (CLAUDE.md:19).
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   return recipe;
 }
 
@@ -1194,6 +1196,11 @@ Ltx2PipelineRecipe T2aOneStageRecipe(const Ltx2PipelineParams& params,
   // (guiders.py:283-285). Applied at the recipe rather than at the call site so
   // no caller can reach the isolated-modality forward this port does not have.
   recipe.phases[0].audio_guidance.modality_scale = 1.0;
+  // `T2AOneStagePipeline` — `Model` column `Full` (CLAUDE.md:20), which is what
+  // `OneStageRecipe` above already set. Restated because upstream says it a
+  // second time in prose for THIS pipeline and nowhere else: "Assumes full non
+  // distilled model is provided in the checkpoint_path" (t2a_one_stage.py:50).
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   return recipe;
 }
 
@@ -1206,6 +1213,13 @@ Ltx2PipelineRecipe PositiveOnlyRecipe() {
   phase.use_official_sigma_schedule = false;
   recipe.phases = {phase};
   recipe.negative_prompt = kOmniNegativePrompt;
+  // `dmd2` is the ONE kind with no stated checkpoint class. It has no row in
+  // Lightricks' pipeline table, and vLLM-Omni's `_PIPELINE_RECIPES`
+  // (ltx2_recipes.py:160-167 at a4ea67a2) — where this recipe comes from — has
+  // no `Model` column at all. Recorded as unstated rather than defaulted to a
+  // permissive value; see `Ltx2RequiredCheckpointClass::kUnstated` and the row's
+  // `## Owed`.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kUnstated;
   return recipe;
 }
 
@@ -1264,6 +1278,8 @@ Ltx2PipelineRecipe DistilledTwoStageRecipe(const std::string& version) {
   recipe.allow_request_latents = false;
   recipe.allow_negative_prompt = false;
   recipe.fixed_num_inference_steps = true;
+  // `DistilledPipeline` — `Model` column `Distilled only` (CLAUDE.md:25).
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kDistilled;
   return recipe;
 }
 
@@ -1294,6 +1310,14 @@ Ltx2PipelineRecipe DfrRecipe(const std::string& version) {
   }
   recipe.phases[0].name = "dfr_base";
   recipe.phases[1].name = "dfr_detail";
+  // THE CHECKPOINT IS NOT THE DISTILLED ONE, although the schedule is. The
+  // `Model` column reads `Keyframe-slot SFT + distilled LoRA (+ detailing
+  // IC-LoRA stage 2)` (CLAUDE.md:24), and `dfr_pipeline.py:157` says the same in
+  // prose: "on a keyframe-slot-capable SFT base plus a distilled LoRA". So this
+  // line OVERRIDES what `DistilledTwoStageRecipe` set two calls up, and the
+  // divergence between "the sigmas are the distilled ones" and "the weights are
+  // not" is upstream's own shape rather than a local approximation.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kKeyframeSlotSft;
   return recipe;
 }
 
@@ -1345,6 +1369,15 @@ Ltx2PipelineRecipe RetakeRecipe(const std::string& version) {
   recipe.allow_request_latents = false;
   recipe.allow_negative_prompt = false;
   recipe.fixed_num_inference_steps = true;
+  // `RetakePipeline` — `Model` column `Full or distilled` (CLAUDE.md:29), the
+  // one permissive row in the table, and a CONDITION rather than a hole. This
+  // recipe mirrors upstream's `distilled=True` arm (retake.py:336, :359), whose
+  // stated precondition is "using distilled model or passing distillation lora
+  // with full model" (retake.py:71-73), so `Ltx2CheckpointClassRefusal` asks for
+  // an adapter on the `full` arm. Without that half the permissive enumerator
+  // would run DISTILLED_SIGMAS (:287) on undistilled weights, which is #1137
+  // again on one arm.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFullOrDistilled;
   return recipe;
 }
 
@@ -1473,6 +1506,26 @@ Ltx2PipelineRecipe Res2sTwoStageRecipe(const std::string& version) {
   recipe.allow_request_latents = true;
   recipe.allow_negative_prompt = true;
   recipe.fixed_num_inference_steps = false;
+  // `TI2VidTwoStagesHQPipeline` — `Model` column `Full + distilled LoRA (both
+  // stages)` (CLAUDE.md:26). The CHECKPOINT half is `Full`. The ADAPTER half is
+  // `requires_distilled_lora`, which this recipe still leaves false; that is a
+  // separate defect with its own issue (#1445) and the row that added this line
+  // deliberately did not change it.
+  //
+  // The reason is BLAST RADIUS, and not "it would refuse loads that succeed
+  // today" as this comment first said — the row that added this line already
+  // refuses every load that omits `checkpoint_class`, so that reason separates
+  // nothing. Setting `requires_distilled_lora` changes an EXISTING field on an
+  // arm whose gates assert an adapter-less load succeeds, and it is a sampling
+  // decision rather than a declaration. `ltx25-checkpoint-class.md` section 6
+  // named that boundary as a stop condition before the implementation started.
+  //
+  // What #1445 is actually about, visible from right here: `stage2.sigmas`
+  // above is `Stage2DistilledSigmas()` while this flag is false, so a FULL
+  // transformer runs a distilled stage-2 schedule with no adapter and the load
+  // is accepted. That is structurally what `retake`'s `kFullOrDistilled`
+  // condition refuses in `RetakeRecipe` above.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   return recipe;
 }
 
@@ -1608,6 +1661,11 @@ Ltx2PipelineRecipe A2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   recipe.allow_negative_prompt = true;
   recipe.requires_audio_input = true;
   recipe.requires_distilled_lora = true;
+  // `A2VidPipelineTwoStage` — `Model` column `Full + distilled LoRA`
+  // (CLAUDE.md:23). The line above is the ADAPTER half of that cell; this one
+  // is the CHECKPOINT half, and the two are separate because an adapter does
+  // not turn a distilled transformer into a full one.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   return recipe;
 }
 
@@ -1777,6 +1835,9 @@ Ltx2PipelineRecipe Ti2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   // parser `:319` selects, and stage 2's three-sigma refinement is what that
   // adapter was trained for.
   recipe.requires_distilled_lora = true;
+  // `TI2VidTwoStagesPipeline` — `Model` column `Full + distilled LoRA`
+  // (CLAUDE.md:21). The CHECKPOINT half of the same cell.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   // ...and NOT `requires_audio_input`, which is the field that separates this
   // recipe from `A2VidTwoStageRecipe` above. There is no `--audio-path` here:
   // the soundtrack is GENERATED, and `__call__` takes `images` rather than a
@@ -1954,6 +2015,9 @@ Ltx2PipelineRecipe KeyframeInterpolationRecipe(const Ltx2PipelineParams& params,
   // pipeline cannot even be CONSTRUCTED without one — and `--distilled-lora` is
   // `required=True` (utils/args.py:1140-1155) on the parser `:301` selects.
   recipe.requires_distilled_lora = true;
+  // `KeyframeInterpolationPipeline` — `Model` column `Full + distilled LoRA`
+  // (CLAUDE.md:22). The CHECKPOINT half of the same cell.
+  recipe.checkpoint_class = Ltx2RequiredCheckpointClass::kFull;
   // ...and NOT `requires_audio_input`: there is no `--audio-path` here, the
   // soundtrack is GENERATED, and `__call__` takes `images` rather than a
   // waveform. A recipe written by copying `A2VidTwoStageRecipe` would inherit
@@ -2189,6 +2253,181 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
              marker + owed);
   }
   Refuse("ltx2: unknown unported pipeline feature." + owed);
+}
+
+// ---------------------------------------------------------------------------
+// The checkpoint class (row LTX25-CHECKPOINT-CLASS, issue #1137)
+// ---------------------------------------------------------------------------
+
+const char* Ltx2CheckpointClassName(Ltx2CheckpointClass value) {
+  switch (value) {
+    case Ltx2CheckpointClass::kFull:
+      return "full";
+    case Ltx2CheckpointClass::kDistilled:
+      return "distilled";
+    case Ltx2CheckpointClass::kKeyframeSlotSft:
+      return "keyframe_slot_sft";
+  }
+  Refuse("ltx2: unknown Ltx2CheckpointClass");
+}
+
+namespace {
+
+// THE LOAD-EXTRA KEYS these messages name. They are SPELLED here rather than
+// taken from `include/vllm/multimodal/ltx2_video.h`, because nothing in
+// `src/vllm/model_executor/` includes a `multimodal` header and this row does
+// not invert that direction for two strings. The engine reads the keys through
+// its own `kLtx2CheckpointClassExtra` and `kLtx2LoraPathExtra`, so the two
+// spellings have to agree: `test_ltx2_video` holds a real refusal against both
+// constants, which is what makes the duplication gated rather than trusted.
+constexpr char kCheckpointClassExtraKey[] = "checkpoint_class";
+constexpr char kLoraPathExtraKey[] = "lora_path";
+
+// The complete class list, in one place. Every function below walks it, so a
+// fourth class cannot be added without the parser and the messages following it.
+constexpr Ltx2CheckpointClass kAllCheckpointClasses[] = {
+    Ltx2CheckpointClass::kFull,
+    Ltx2CheckpointClass::kDistilled,
+    Ltx2CheckpointClass::kKeyframeSlotSft,
+};
+
+// THE ONE PLACE the measurement lives, quoted by both refusals that have to say
+// why the engine does not detect this. Numbers over prose on purpose: a reader
+// who doubts the claim can check every one of them against the files.
+std::string WhyNoDetector() {
+  return
+      "Nothing in a checkpoint header separates them, measured rather than assumed: the full "
+      "'ltx-2.5-22b-dev-transformer-bf16.safetensors' and the distilled "
+      "'ltx-2.5-22b-distilled-transformer-bf16.safetensors' are BOTH 42,018,190,584 bytes, and "
+      "their safetensors HEADERS are byte-identical apart from the key ORDER of the __metadata__ "
+      "sub-map, which no format rule fixes and any re-save reorders: 677,616 header bytes each, "
+      "the same 4349 tensor names, every per-tensor dtype, shape and data_offsets equal, and all "
+      "four __metadata__ values byte-identical, __metadata__[\"config\"] at 2199 bytes and "
+      "__metadata__[\"model_version\"] at '2.5.0' among them. The one structural candidate, "
+      "'keyframes_abs_pos_embedding', is an architecture-support flag and not a distillation "
+      "marker: BOTH bf16 files carry it, as BF16 [1, 4096] at the same offsets. So this engine "
+      "cannot tell, and it refuses rather than guessing: "
+      "a distilled schedule on full weights, or a full schedule on distilled weights, renders a "
+      "clip of the requested size, frame count and sample rate in a sampling regime the model was "
+      "never trained for, and no pixel, RMS, windowed-energy or spectral check can see it.";
+}
+
+}  // namespace
+
+std::string Ltx2CheckpointClassSpellings() {
+  std::string out;
+  for (const Ltx2CheckpointClass value : kAllCheckpointClasses) {
+    out += std::string(out.empty() ? "" : ", ") + "'" + Ltx2CheckpointClassName(value) + "'";
+  }
+  return out;
+}
+
+bool Ltx2ParseCheckpointClass(const std::string& text, Ltx2CheckpointClass* out) {
+  for (const Ltx2CheckpointClass value : kAllCheckpointClasses) {
+    if (text == Ltx2CheckpointClassName(value)) {
+      if (out != nullptr) *out = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string Ltx2RequiredCheckpointClassName(Ltx2RequiredCheckpointClass value) {
+  // Upstream's own words from the `Model` column, so a reader can find the row.
+  switch (value) {
+    case Ltx2RequiredCheckpointClass::kFull:
+      return "the FULL (undistilled) transformer";
+    case Ltx2RequiredCheckpointClass::kDistilled:
+      return "the DISTILLED transformer";
+    case Ltx2RequiredCheckpointClass::kKeyframeSlotSft:
+      return "the KEYFRAME-SLOT SFT transformer";
+    case Ltx2RequiredCheckpointClass::kFullOrDistilled:
+      return "the FULL or the DISTILLED transformer";
+    case Ltx2RequiredCheckpointClass::kUnstated:
+      return "no stated checkpoint class";
+  }
+  Refuse("ltx2: unknown Ltx2RequiredCheckpointClass");
+}
+
+std::string Ltx2CheckpointClassRefusal(const Ltx2PipelineRecipe& recipe,
+                                       const std::string& pipeline_kind,
+                                       const std::string& declared, bool has_lora) {
+  const Ltx2RequiredCheckpointClass required = recipe.checkpoint_class;
+  // `dmd2` alone. Neither reference states a class for it, so there is nothing
+  // to hold a caller to; see the enumerator's comment and the row's `## Owed`.
+  if (required == Ltx2RequiredCheckpointClass::kUnstated) return "";
+
+  const std::string table_anchor =
+      "Upstream keys a checkpoint class per pipeline (ltx-pipelines CLAUDE.md:17-30 at "
+      "fd4ded7f), and the '" + pipeline_kind + "' row reads " +
+      Ltx2RequiredCheckpointClassName(required) + ".";
+
+  if (declared.empty()) {
+    return "the '" + pipeline_kind + "' pipeline needs " +
+           Ltx2RequiredCheckpointClassName(required) + " and the '" +
+           std::string(kCheckpointClassExtraKey) +
+           "' load extra was not supplied. " + table_anchor + " " + WhyNoDetector() +
+           " Declare what you handed over through the '" +
+           std::string(kCheckpointClassExtraKey) + "' load extra: " +
+           Ltx2CheckpointClassSpellings() + ".";
+  }
+
+  Ltx2CheckpointClass supplied = Ltx2CheckpointClass::kFull;
+  if (!Ltx2ParseCheckpointClass(declared, &supplied)) {
+    return "the '" + std::string(kCheckpointClassExtraKey) + "' load extra is '" + declared +
+           "', which is not a checkpoint class this engine knows. It accepts " +
+           Ltx2CheckpointClassSpellings() +
+           ". Refused rather than defaulted, because every default here picks a sampling regime "
+           "for the caller.";
+  }
+
+  bool accepted = false;
+  switch (required) {
+    case Ltx2RequiredCheckpointClass::kFull:
+      accepted = supplied == Ltx2CheckpointClass::kFull;
+      break;
+    case Ltx2RequiredCheckpointClass::kDistilled:
+      accepted = supplied == Ltx2CheckpointClass::kDistilled;
+      break;
+    case Ltx2RequiredCheckpointClass::kKeyframeSlotSft:
+      accepted = supplied == Ltx2CheckpointClass::kKeyframeSlotSft;
+      break;
+    case Ltx2RequiredCheckpointClass::kFullOrDistilled:
+      accepted = supplied == Ltx2CheckpointClass::kFull ||
+                 supplied == Ltx2CheckpointClass::kDistilled;
+      break;
+    case Ltx2RequiredCheckpointClass::kUnstated:
+      accepted = true;
+      break;
+  }
+
+  if (!accepted) {
+    return "the '" + std::string(kCheckpointClassExtraKey) + "' load extra says '" +
+           Ltx2CheckpointClassName(supplied) + "' but the '" + pipeline_kind +
+           "' pipeline needs " + Ltx2RequiredCheckpointClassName(required) + ". " + table_anchor +
+           " Refused rather than rendered: the checkpoint loads, every shape matches, and the "
+           "sampler then runs a schedule these weights were never trained for, returning a clip "
+           "of the requested size, frame count and sample rate that no output check can "
+           "distinguish from a correct one.";
+  }
+
+  // `Full or distilled` is a CONDITION, not a hole — retake.py:71-73. See the
+  // `kFullOrDistilled` comment in the header.
+  if (required == Ltx2RequiredCheckpointClass::kFullOrDistilled &&
+      supplied == Ltx2CheckpointClass::kFull && !has_lora) {
+    return "the '" + pipeline_kind + "' pipeline accepts a full OR a distilled transformer, the '" +
+           std::string(kCheckpointClassExtraKey) +
+           "' load extra says 'full', and no adapter was supplied. Upstream's own condition for "
+           "the arm this recipe mirrors is \"using distilled model or passing distillation lora "
+           "with full model\" (ltx-pipelines retake.py:71-73), and its command line hard-codes "
+           "that arm (retake.py:336, :359), which then takes DISTILLED_SIGMAS (:287). So a full "
+           "transformer with no adapter runs the distilled schedule on undistilled weights. "
+           "Supply the distillation LoRA through the '" +
+           std::string(kLoraPathExtraKey) +
+           "' load extra, or declare 'distilled' if that is what you handed over.";
+  }
+
+  return "";
 }
 
 }  // namespace vllm

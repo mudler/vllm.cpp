@@ -44,6 +44,7 @@
 #include "ltx2_video_fixture.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
+#include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
@@ -82,6 +83,44 @@ struct Workspace {
   }
 };
 
+// The class a fixture load must DECLARE for a given pipeline kind — row
+// LTX25-CHECKPOINT-CLASS, issue #1137.
+//
+// RESOLVED FROM THE RECIPE TABLE rather than listed here on purpose. This is
+// fixture SETUP and not an assertion: the table's own gate is
+// `test_ltx2_pipeline`, and a per-case list here would be a second copy of it
+// that could disagree without anything saying so.
+//
+// `kFullOrDistilled` declares `distilled`, which is the arm that needs no
+// adapter. `kUnstated` declares nothing, which is what `dmd2` accepts.
+std::string FixtureCheckpointClass(const std::string& kind) {
+  // The fixture DiT declares `model_version` 2.5.0, so 2.5 is tried first; the
+  // older keys are there for the cases that override the version extra.
+  for (const char* version : {"2.5", "2.4", "2.3", "2"}) {
+    vllm::Ltx2PipelineRecipe recipe;
+    try {
+      recipe = vllm::ResolveLtx2PipelineRecipe(kind, version);
+    } catch (const std::exception&) {
+      continue;
+    }
+    switch (recipe.checkpoint_class) {
+      case vllm::Ltx2RequiredCheckpointClass::kFull:
+        return "full";
+      case vllm::Ltx2RequiredCheckpointClass::kDistilled:
+        return "distilled";
+      case vllm::Ltx2RequiredCheckpointClass::kKeyframeSlotSft:
+        return "keyframe_slot_sft";
+      case vllm::Ltx2RequiredCheckpointClass::kFullOrDistilled:
+        return "distilled";
+      case vllm::Ltx2RequiredCheckpointClass::kUnstated:
+        return "";
+    }
+  }
+  // A kind no version resolves is the caller's own refusal case; declare nothing
+  // and let the recipe table refuse it by name, which is what those cases assert.
+  return "";
+}
+
 vllm::multimodal::VideoModelParams FixtureParams(const ltx2_fixture::Paths& paths) {
   vllm::multimodal::VideoModelParams mp;
   mp.dit_path = paths.dit;
@@ -99,6 +138,17 @@ vllm::multimodal::VideoModelParams FixtureParams(const ltx2_fixture::Paths& path
   mp.extras[vllm::multimodal::kLtx2NegativePromptEmbedsExtra] = paths.negative_video_embeds;
   mp.extras[vllm::multimodal::kLtx2NegativeAudioPromptEmbedsExtra] = paths.negative_audio_embeds;
   mp.device = 0;
+  // THE CHECKPOINT CLASS (row LTX25-CHECKPOINT-CLASS, #1137). Every kind this
+  // family resolves except `dmd2` now refuses a load that does not declare which
+  // class of transformer it was handed, because nothing in a checkpoint header
+  // separates a distilled LTX-2.5 DiT from a full one. The default kind here is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  //
+  // DERIVED, NOT LISTED, by `FixtureCheckpointClass` above: a fixture that
+  // hard-coded a class per case would be a second copy of the recipe table, and
+  // the two would drift.
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("distilled_two_stage");
   return mp;
 }
 
@@ -807,6 +857,7 @@ TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, p
   SUBCASE("a one-stage width BELOW the divisor names 32 as the smallest legal size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os16");
@@ -850,6 +901,7 @@ TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, p
   SUBCASE("a one-stage width that is not a multiple of 32 is refused BY VALUE") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os100");
@@ -888,6 +940,7 @@ TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, p
   SUBCASE("96 is a legal ONE-STAGE size, because that divisor is 32") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/one_stage_96");
@@ -1098,6 +1151,10 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // unconditional forward.
       vllm::multimodal::kLtx2NegativePromptEmbedsExtra,
       vllm::multimodal::kLtx2NegativeAudioPromptEmbedsExtra,
+      // Row LTX25-CHECKPOINT-CLASS (#1137): the class the caller declares. Read
+      // where the recipe resolves, and the only thing that reads it is the
+      // refusal, which is what this key exists to produce.
+      vllm::multimodal::kLtx2CheckpointClassExtra,
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect #611 records.
@@ -1228,16 +1285,17 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
   }
   REQUIRE(array_end > array_line);
 
-  // The thirteen SERVED keys, by the token each is spelled with in the source.
+  // The fourteen SERVED keys, by the token each is spelled with in the source.
   // Order is irrelevant — the comparison is on the sorted set — so this list is
-  // not a second place the anchors live. The last two arrived with row
-  // LTX25-GUIDED-VIDEO (#1092).
+  // not a second place the anchors live. Two arrived with row
+  // LTX25-GUIDED-VIDEO (#1092) and the last with LTX25-CHECKPOINT-CLASS (#1137).
   const std::vector<std::string> served_tokens = {
       "kLtx2AudioPromptEmbedsExtra", "kLtx2PipelineKindExtra",  "kLtx2ModelVersionExtra",
       "kLtx2AllowUnportedExtra",     "kLtx2MaxPhaseExtra",      "kLtx2DitConfigPathExtra",
       "kLtx2PromptValidRowsExtra",   "kLtx2EncoderConfigPathExtra", "\"upsampler_path\"",
       "kLtx2LoraPathExtra",          "kLtx2LoraStrengthExtra",
       "kLtx2NegativePromptEmbedsExtra", "kLtx2NegativeAudioPromptEmbedsExtra",
+      "kLtx2CheckpointClassExtra",
   };
   std::vector<size_t> derived;
   for (const std::string& token : served_tokens) {
@@ -1972,6 +2030,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
   // Phase 0 only: phase 1 needs the latent spatial upsampler, and this case is
   // about the canvas and the slots rather than about the detailing stage.
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -2063,6 +2122,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     // outer one pins phase 0.
     vllm::multimodal::VideoModelParams two = FixtureParams(ws.paths);
     two.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    two.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
     two.extras["upsampler_path"] = ws.paths.upsampler;
     const std::unique_ptr<vllm::multimodal::VideoEngine> full =
         vllm::multimodal::LoadVideoEngine(two);
@@ -2610,9 +2670,14 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
   Workspace ws;
   const std::string audio_embeds = ws.paths.audio_embeds;
   const std::string max_phase = "0";
+  // The CHECKPOINT CLASS rides the ABI like every other load extra (row
+  // LTX25-CHECKPOINT-CLASS, #1137). No kind is declared here, so the recipe is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  const std::string checkpoint_class = FixtureCheckpointClass("distilled_two_stage");
   const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
-                        vllm::multimodal::kLtx2MaxPhaseExtra};
-  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+                        vllm::multimodal::kLtx2MaxPhaseExtra,
+                        vllm::multimodal::kLtx2CheckpointClassExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str(), checkpoint_class.c_str()};
 
   vllm_video_model_params mp = vllm_video_model_params_default();
   mp.dit_path = ws.paths.dit.c_str();
@@ -2621,7 +2686,7 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
   mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
   mp.extra_keys = keys;
   mp.extra_values = values;
-  mp.n_extras = 2;
+  mp.n_extras = 3;
   mp.device = 0;  // the family refuses 1 by name; the ABI carries the refusal
 
   vllm_video_engine* engine = nullptr;
@@ -2719,9 +2784,14 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   Workspace ws;
   const std::string audio_embeds = ws.paths.audio_embeds;
   const std::string max_phase = "0";
+  // The CHECKPOINT CLASS rides the ABI like every other load extra (row
+  // LTX25-CHECKPOINT-CLASS, #1137). No kind is declared here, so the recipe is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  const std::string checkpoint_class = FixtureCheckpointClass("distilled_two_stage");
   const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
-                        vllm::multimodal::kLtx2MaxPhaseExtra};
-  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+                        vllm::multimodal::kLtx2MaxPhaseExtra,
+                        vllm::multimodal::kLtx2CheckpointClassExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str(), checkpoint_class.c_str()};
 
   vllm_video_model_params mp = vllm_video_model_params_default();
   mp.dit_path = ws.paths.dit.c_str();
@@ -2730,7 +2800,7 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
   mp.extra_keys = keys;
   mp.extra_values = values;
-  mp.n_extras = 2;
+  mp.n_extras = 3;
   mp.device = 0;
 
   vllm_video_engine* engine = nullptr;
@@ -4066,9 +4136,14 @@ TEST_CASE("ltx2 video: a render through the ABI PRINTS its progress while it run
   Workspace ws;
   const std::string audio_embeds = ws.paths.audio_embeds;
   const std::string max_phase = "0";
+  // The CHECKPOINT CLASS rides the ABI like every other load extra (row
+  // LTX25-CHECKPOINT-CLASS, #1137). No kind is declared here, so the recipe is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  const std::string checkpoint_class = FixtureCheckpointClass("distilled_two_stage");
   const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
-                        vllm::multimodal::kLtx2MaxPhaseExtra};
-  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+                        vllm::multimodal::kLtx2MaxPhaseExtra,
+                        vllm::multimodal::kLtx2CheckpointClassExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str(), checkpoint_class.c_str()};
 
   vllm_video_model_params mp = vllm_video_model_params_default();
   mp.dit_path = ws.paths.dit.c_str();
@@ -4077,7 +4152,7 @@ TEST_CASE("ltx2 video: a render through the ABI PRINTS its progress while it run
   mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
   mp.extra_keys = keys;
   mp.extra_values = values;
-  mp.n_extras = 2;
+  mp.n_extras = 3;
   mp.device = 0;
 
   const std::string out_dir = ws.root + "/progress_out";
@@ -5235,6 +5310,8 @@ TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is tr
     // re-shift the entire trajectory the moment a keyframe was supplied.
     vllm::multimodal::VideoModelParams one_stage = FixtureParams(ws.paths);
     one_stage.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    one_stage.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+        FixtureCheckpointClass("one_stage");
 
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(one_stage);
@@ -5532,6 +5609,11 @@ vllm::multimodal::VideoModelParams EncoderParams(const ltx2_fixture::Paths& path
   mp.encoder_path = paths.encoder;
   mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = paths.encoder_config;
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  // This helper builds its params from scratch rather than from `FixtureParams`,
+  // so it declares the checkpoint class itself (row LTX25-CHECKPOINT-CLASS,
+  // #1137). No kind is set, so the recipe is `distilled_two_stage`.
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("distilled_two_stage");
   mp.device = 0;
   return mp;
 }
@@ -6561,6 +6643,7 @@ namespace {
 vllm::multimodal::VideoModelParams RetakeParams(const ltx2_fixture::Paths& paths) {
   vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "retake";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("retake");
   return mp;
 }
 
@@ -6881,6 +6964,7 @@ vllm::multimodal::VideoModelParams T2aParams(const ltx2_fixture::Paths& paths) {
   mp.encoder_path = paths.encoder;
   mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = paths.encoder_config;
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "t2a_one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("t2a_one_stage");
   mp.device = 0;
   return mp;
 }
@@ -7140,6 +7224,7 @@ TEST_CASE("ltx2: the AUDIO guider knobs are NOT t2a-only, and this case used to 
   // and refuses every override, so asking it would test the other guard.
   vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
   REQUIRE(engine != nullptr);
@@ -7939,6 +8024,7 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
   const auto forwards = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     // Stage 1 only. Both recipes' second phase needs the latent spatial
     // upsampler, which the fixture does not carry and which is refused BY NAME
     // in its own case above — that refusal is not what this case is about.
@@ -8048,6 +8134,7 @@ TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per eva
   const auto render = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     // Stage 1 only, for the reason the case above gives: the second phase needs
     // the latent spatial upsampler the fixture does not carry.
     mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -8110,6 +8197,7 @@ TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per eva
   // real render rather than computed from the HQ numbers.
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -8145,6 +8233,8 @@ TEST_CASE("ltx2 video: the res_2s SUBSTEP converts x0 against the midpoint, not 
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("res2s_two_stage");
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -8241,6 +8331,7 @@ namespace {
 vllm::multimodal::VideoModelParams OneStageParams(const ltx2_fixture::Paths& paths) {
   vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
   return mp;
 }
 
@@ -9023,6 +9114,8 @@ vllm::multimodal::VideoModelParams A2VidParams(const ltx2_fixture::Paths& paths,
                                                const std::string& lora) {
   vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "a2vid_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("a2vid_two_stage");
   mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
   return mp;
 }
@@ -9518,6 +9611,8 @@ vllm::multimodal::VideoModelParams Ti2VidParams(const ltx2_fixture::Paths& paths
                                                 const std::string& lora) {
   vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "ti2vid_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("ti2vid_two_stage");
   mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
   return mp;
 }
@@ -9717,6 +9812,7 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
                           const std::string& tag) -> Rendered {
     vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -9904,6 +10000,8 @@ vllm::multimodal::VideoModelParams KeyframeParams(const ltx2_fixture::Paths& pat
                                                   const std::string& lora) {
   vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "keyframe_interpolation";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("keyframe_interpolation");
   mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
   return mp;
 }
@@ -9957,6 +10055,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   auto render = [&](const char* kind, bool with_image, const std::string& tag) -> Conditioned {
     vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -10074,6 +10173,7 @@ TEST_CASE("ltx2 keyframe: BOTH ends pin at once - two appends, and each is locat
   auto render = [&](const char* kind, bool first, bool last, const std::string& tag) -> Pinned {
     vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -10311,6 +10411,7 @@ TEST_CASE("ltx2 keyframe: stage 1's sigma shift takes the 4096 anchor, not the t
   auto rendered_for = [&](const char* kind, int64_t size, const std::string& tag) -> Rendered {
     vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -10496,4 +10597,239 @@ TEST_CASE("ltx2 video: a PROMPTED render names the tower and the connector separ
   // holds, which is what says the split did not double count the tower.
   CHECK(table["unaccounted_seconds"].get<double>() <=
         0.05 * table["wall_seconds"].get<double>());
+}
+
+// ─── the CHECKPOINT CLASS, through the PRODUCTION ENTRY POINT ────────────────
+//
+// Row LTX25-CHECKPOINT-CLASS, issue #1137.
+//
+// THE DEFECT IS SILENCE, so the case that matters is a load that SUCCEEDED
+// before this row and must refuse after it. `one_stage` is `TI2VidOneStagePipeline`,
+// whose upstream `Model` column reads `Full` (ltx-pipelines CLAUDE.md:19 at
+// fd4ded7f). Before this row the engine never asked which transformer it was
+// handed, so pointing it at the distilled 22B file rendered a clip of the
+// requested size, frame count and sample rate, sampled in a regime those weights
+// were never trained for — and every output check this suite owns passed on it.
+//
+// EVERY CASE HERE ENTERS THROUGH `vllm_video_engine_load` or `LoadVideoEngine`,
+// which is what `include/vllm.h`, the server and `ltx2-gen` all reach.
+// `test_ltx2_pipeline` gates the recipe table and the pure decision; a case that
+// called `Ltx2CheckpointClassRefusal` by hand would prove the function works and
+// never that anything reaches it. Deleting the one call site in
+// `Ltx2VideoEngine::Load` reds every case below.
+
+namespace {
+
+// A fixture load with the class declaration REMOVED, which is what a caller who
+// has not heard of #1137 sends.
+vllm::multimodal::VideoModelParams UndeclaredParams(const ltx2_fixture::Paths& paths,
+                                                    const std::string& kind) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+  mp.extras.erase(vllm::multimodal::kLtx2CheckpointClassExtra);
+  return mp;
+}
+
+// The message of the refusal a load produced, or the empty string if it loaded.
+// Returning the message rather than a bool is deliberate: "it threw" is the
+// assertion that let a wrong refusal pass for a right one.
+std::string LoadRefusal(const vllm::multimodal::VideoModelParams& mp) {
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    return engine == nullptr ? std::string("LoadVideoEngine returned nullptr") : std::string();
+  } catch (const std::exception& e) {
+    return std::string(e.what());
+  }
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 checkpoint class: a FULL-model arm refuses a distilled declaration") {
+  Workspace ws;
+
+  // THE MISMATCH. `one_stage` needs the full transformer and the caller says it
+  // handed over the distilled one.
+  vllm::multimodal::VideoModelParams mismatch = UndeclaredParams(ws.paths, "one_stage");
+  mismatch.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "distilled";
+  const std::string msg = LoadRefusal(mismatch);
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  // The message names WHICH class was supplied, WHICH is needed, and the
+  // upstream row — the three things that make it actionable rather than a bare
+  // "wrong checkpoint".
+  CHECK(msg.find("'distilled'") != std::string::npos);
+  CHECK(msg.find("FULL") != std::string::npos);
+  CHECK(msg.find("one_stage") != std::string::npos);
+  CHECK(msg.find("CLAUDE.md:17-30") != std::string::npos);
+  // ...and it says WHY it refuses rather than renders, which is the whole reason
+  // the row exists: the render would finish.
+  CHECK(msg.find("no output check") != std::string::npos);
+
+  // THE CONTROL: the same load with the honest declaration goes through, so the
+  // case above measures the class check and not a broken `one_stage` fixture.
+  vllm::multimodal::VideoModelParams honest = UndeclaredParams(ws.paths, "one_stage");
+  honest.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  honest.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  CHECK(LoadRefusal(honest).empty());
+
+  // AND THE OTHER POLARITY, so this is not a one-way test. `distilled_two_stage`
+  // is `DistilledPipeline`, `Distilled only` (CLAUDE.md:25), and it refuses the
+  // full model just as hard.
+  vllm::multimodal::VideoModelParams reversed =
+      UndeclaredParams(ws.paths, "distilled_two_stage");
+  reversed.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  const std::string reversed_msg = LoadRefusal(reversed);
+  INFO(reversed_msg);
+  REQUIRE_FALSE(reversed_msg.empty());
+  CHECK(reversed_msg.find("'full'") != std::string::npos);
+  CHECK(reversed_msg.find("DISTILLED") != std::string::npos);
+}
+
+TEST_CASE("ltx2 checkpoint class: an UNDECLARED load refuses instead of rendering") {
+  Workspace ws;
+
+  // THE RED-FIRST CASE. Before row LTX25-CHECKPOINT-CLASS this load SUCCEEDED
+  // and rendered. Nothing about the checkpoint changed; what changed is that the
+  // engine now asks.
+  //
+  // THE ADAPTER FLAG DECIDES WHICH REFUSAL A CALLER READS, and the second column
+  // is where that is stated. The class check sits AFTER the
+  // `requires_distilled_lora` one deliberately: a two-stage load with no adapter
+  // fails both, and the adapter message names a missing file the caller can go
+  // and fetch, while a class message would send the same reader to a different
+  // question. So the three kinds that demand an adapter get a REAL one here.
+  //
+  // A real file and not a placeholder path, and that is measured rather than
+  // assumed: the load builds and READS the adapter before it resolves the
+  // recipe, so a non-existent path refuses with `safetensors: open failed` and
+  // this case would be gating the wrong refusal.
+  const std::string adapter =
+      WriteFixtureLora(ws.root + "/class_adapter.safetensors", kFixtureLoraTarget, 1.0F);
+  struct Arm {
+    const char* kind;
+    bool needs_adapter;
+  };
+  for (const Arm arm : {Arm{"one_stage", false}, Arm{"distilled_two_stage", false},
+                        Arm{"t2a_one_stage", false}, Arm{"a2vid_two_stage", true},
+                        Arm{"ti2vid_two_stage", true}, Arm{"keyframe_interpolation", true},
+                        Arm{"res2s_two_stage", false}, Arm{"dfr", false},
+                        Arm{"retake", false}}) {
+    INFO("kind = " << std::string(arm.kind));
+    vllm::multimodal::VideoModelParams mp = UndeclaredParams(ws.paths, arm.kind);
+    if (arm.needs_adapter) {
+      mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = adapter;
+    }
+    const std::string msg = LoadRefusal(mp);
+    INFO("refusal = " << msg);
+    REQUIRE_FALSE(msg.empty());
+    // It has to be THIS refusal and not some other one the kind happens to
+    // produce first — several of these kinds refuse for other reasons too.
+    CHECK(msg.find("checkpoint_class") != std::string::npos);
+    // The message carries the MEASUREMENT, because "declare the class" without
+    // it reads as bureaucracy rather than as a fact about these two files.
+    CHECK(msg.find("42,018,190,584") != std::string::npos);
+    CHECK(msg.find("byte-identical") != std::string::npos);
+    // ...and the three spellings, so the caller can act on it.
+    CHECK(msg.find("'full'") != std::string::npos);
+    CHECK(msg.find("'distilled'") != std::string::npos);
+    CHECK(msg.find("'keyframe_slot_sft'") != std::string::npos);
+  }
+
+  // THE DEFAULT KIND IS NOT EXEMPT. `pipeline_kind` defaults to
+  // `distilled_two_stage`, so a caller who names no kind at all still declares.
+  vllm::multimodal::VideoModelParams defaulted = FixtureParams(ws.paths);
+  defaulted.extras.erase(vllm::multimodal::kLtx2CheckpointClassExtra);
+  CHECK_FALSE(LoadRefusal(defaulted).empty());
+
+  // AN UNPARSEABLE VALUE is refused too, and with a DIFFERENT message: refused
+  // rather than defaulted, because every default here picks a sampling regime
+  // for the caller. `dev` is the realistic typo — it is what the full file is
+  // named after.
+  vllm::multimodal::VideoModelParams typo = UndeclaredParams(ws.paths, "one_stage");
+  typo.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "dev";
+  const std::string typo_msg = LoadRefusal(typo);
+  INFO(typo_msg);
+  REQUIRE_FALSE(typo_msg.empty());
+  CHECK(typo_msg.find("'dev'") != std::string::npos);
+  CHECK(typo_msg.find("'full'") != std::string::npos);
+  // NOT the absent-declaration message, which quotes the measurement.
+  CHECK(typo_msg.find("42,018,190,584") == std::string::npos);
+}
+
+TEST_CASE("ltx2 checkpoint class: `Full or distilled` is a CONDITION, not a hole") {
+  Workspace ws;
+
+  // `retake` is `RetakePipeline`, the one `Full or distilled` row
+  // (CLAUDE.md:29). This recipe mirrors upstream's `distilled=True` arm
+  // (retake.py:336, :359), which takes DISTILLED_SIGMAS (:287), and upstream's
+  // stated condition for that arm is "using distilled model or passing
+  // distillation lora with full model" (retake.py:71-73).
+  //
+  // So `full` with no adapter is refused: it would run the distilled schedule on
+  // undistilled weights, which is #1137 again on the one permissive row.
+  vllm::multimodal::VideoModelParams full_no_lora = UndeclaredParams(ws.paths, "retake");
+  full_no_lora.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  const std::string msg = LoadRefusal(full_no_lora);
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  CHECK(msg.find("retake.py:71-73") != std::string::npos);
+  CHECK(msg.find("lora_path") != std::string::npos);
+
+  // ...and `distilled` on the same recipe is accepted with no adapter at all,
+  // which is what makes the case above a condition on the CLASS rather than a
+  // blanket adapter requirement on the kind.
+  vllm::multimodal::VideoModelParams distilled = UndeclaredParams(ws.paths, "retake");
+  distilled.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "distilled";
+  CHECK(LoadRefusal(distilled).empty());
+}
+
+TEST_CASE("ltx2 checkpoint class: the refusal names the extras by the keys the engine reads") {
+  Workspace ws;
+
+  // The refusal text is assembled in `ltx2_pipeline.cpp`, which does not include
+  // a `multimodal` header and therefore spells `checkpoint_class` and
+  // `lora_path` as literals. This case is what makes that duplication GATED
+  // rather than trusted: it holds a REAL refusal against the constants the
+  // engine actually reads, so a rename on either side fails here instead of
+  // producing a message that names a key nothing consumes.
+  const std::string undeclared = LoadRefusal(UndeclaredParams(ws.paths, "one_stage"));
+  INFO(undeclared);
+  REQUIRE_FALSE(undeclared.empty());
+  CHECK(undeclared.find(vllm::multimodal::kLtx2CheckpointClassExtra) != std::string::npos);
+
+  vllm::multimodal::VideoModelParams retake_full = UndeclaredParams(ws.paths, "retake");
+  retake_full.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  const std::string retake_msg = LoadRefusal(retake_full);
+  INFO(retake_msg);
+  REQUIRE_FALSE(retake_msg.empty());
+  CHECK(retake_msg.find(vllm::multimodal::kLtx2LoraPathExtra) != std::string::npos);
+}
+
+TEST_CASE("ltx2 checkpoint class: the declaration is a CLAIM, and the engine says so") {
+  Workspace ws;
+
+  // WHAT THIS ROW DOES NOT BUY, asserted rather than left to the reader. The
+  // fixture DiT is neither the full nor the distilled 22B transformer, and the
+  // engine accepts BOTH declarations for it, because it never opens the file to
+  // check. There is nothing in the header to check against — that is the
+  // measurement in `.agents/specs/ltx25-checkpoint-class.md` section 2.
+  //
+  // What the row buys is that the wrong sampling regime now needs a deliberate
+  // false statement instead of silence. A case asserting the opposite would be
+  // asserting a detector this engine does not have.
+  vllm::multimodal::VideoModelParams as_full = UndeclaredParams(ws.paths, "one_stage");
+  as_full.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  as_full.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  CHECK(LoadRefusal(as_full).empty());
+
+  vllm::multimodal::VideoModelParams as_distilled =
+      UndeclaredParams(ws.paths, "distilled_two_stage");
+  as_distilled.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "distilled";
+  as_distilled.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  CHECK(LoadRefusal(as_distilled).empty());
+
+  // The SAME file, two contradictory declarations, both accepted. The pair is
+  // the assertion: it is one file and the two loads disagree about what it is.
+  CHECK(as_full.dit_path == as_distilled.dit_path);
 }

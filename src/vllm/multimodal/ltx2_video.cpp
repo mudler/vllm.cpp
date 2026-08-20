@@ -413,7 +413,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 889 899 900 968 1064 1080 1128 1221 1247 1355 1397 1439 1441
+// 890 900 901 969 1065 1081 1147 1151 1244 1270 1378 1420 1462 1464
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -422,6 +422,7 @@ const char* const kKnownLoadExtras[] = {
     "upsampler_path",            kLtx2DurationHeadPathExtra,
     kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
     kLtx2NegativePromptEmbedsExtra, kLtx2NegativeAudioPromptEmbedsExtra,
+    kLtx2CheckpointClassExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -1124,6 +1125,28 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
          "undistilled weights returns a clip of the right size, frame count and sample rate. "
          "The adapter runs on the phases the recipe's `loras` scope names, which for these "
          "pipelines is stage 2 alone.");
+  }
+  // ── the CHECKPOINT CLASS the pipeline can run (#1137) ─────────────────────
+  //
+  // THE PRODUCTION CALL SITE for row LTX25-CHECKPOINT-CLASS. Deleting this one
+  // line is the reachability mutation the row records: every test that gates the
+  // refusal enters through `vllm_video_engine_load` and reds without it.
+  //
+  // PLACED AFTER THE ADAPTER REFUSAL ABOVE, deliberately. A two-stage load
+  // carrying no adapter fails BOTH checks, and the adapter message names a
+  // missing file the caller can go and fetch, while a class message would send
+  // the same reader to a different question. Order decides which one they read.
+  //
+  // THE DECISION IS NOT HERE. `Ltx2CheckpointClassRefusal` lives beside the
+  // recipe table it reads (`ltx2_pipeline.cpp`), so the table and the rule that
+  // consumes it cannot drift into two files. This site supplies the two facts
+  // the table does not hold: what the caller DECLARED, and whether the load
+  // carries an adapter.
+  {
+    const std::string class_refusal = Ltx2CheckpointClassRefusal(
+        im.recipe, im.pipeline_kind, VideoExtra(params.extras, kLtx2CheckpointClassExtra),
+        !VideoExtra(params.extras, kLtx2LoraPathExtra).empty());
+    if (!class_refusal.empty()) Fail(class_refusal);
   }
   im.max_phase = ExtraInt(params.extras, kLtx2MaxPhaseExtra, -1);
   if (im.max_phase >= static_cast<int64_t>(im.recipe.phases.size())) {

@@ -1002,6 +1002,13 @@ TE=$CHECKPOINT_ROOT/ltx-2.5/vonkaiser-fp8-nvfp4/text_encoders/gemma4-12b-with-pr
   --text-encoder "$TE" \
   --out tests/vllm/models/ltx2_prompt_tokens_goldens.inc
 
+# Gate the real vocabulary against the generated token goldens.
+CHECKPOINT_ROOT=... ./build/tests/test_ltx2_text_encoder --test-case="ltx2 prompt: REAL*"
+
+# The full 12B tower needs approximately 33 GB of host memory and minutes of CPU time.
+CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
+  ./build/tests/test_ltx2_text_encoder --test-case="ltx2 e2e*"
+```
 
 ## LTX-2.5 quantized loaders
 

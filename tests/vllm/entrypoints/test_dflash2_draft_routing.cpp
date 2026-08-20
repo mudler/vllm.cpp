@@ -45,7 +45,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -188,32 +190,49 @@ std::string RefusalForDraft(const std::string& draft_path) {
 
 }  // namespace
 
-TEST_CASE("the loader refuses a DFlash2 draft instead of drafting it as DFlash1") {
+TEST_CASE("W2: a safetensors DFlash2 draft is now ADMITTED as far as the conv") {
+  // W1 REFUSED this draft here, before any weight was read, because BOTH
+  // mechanisms were missing. SPEC-DFLASH2 W2 implements one of them -- the
+  // grouped dynamic depthwise convolution -- and a startup refusal would leave
+  // every line of it unreachable from any production entry point, which is what
+  // AGENTS.md `## Nothing lands dead` forbids. So the draft is admitted here and
+  // refused one step later, at the candidate selector, AFTER the conv has run
+  // (`RefuseDflash2CandidateSelector`, gated in
+  // tests/vllm/v1/spec_decode/test_dflash2_selector_refusal.cpp).
+  //
+  // What must NOT happen is a fall-through into a resolved config with nothing
+  // named: the boundary is stated at STARTUP so the later refusal is not a
+  // surprise. That notice goes to stderr and is asserted below.
   const ScratchDraft draft(kDflash2DraftConfig);
-  const std::string message = RefusalForDraft(draft.path());
-  REQUIRE_FALSE(message.empty());  // RED before this row: nothing classifies.
-  // AGENTS.md `## Shared seams`: refuse with a message that NAMES the missing
-  // part. Both mechanisms, because a user who reads only "DFlash2" cannot tell
-  // what is absent, and both are separately owed by the spec's `## Work
-  // breakdown` (W2 and W3).
-  INFO("what: ", message);
-  CHECK(message.find("DFlash2DraftModel") != std::string::npos);
-  CHECK(message.find("grouped dynamic") != std::string::npos);
-  CHECK(message.find("candidate selector") != std::string::npos);
-  CHECK(message.find("not implemented") != std::string::npos);
-  // The row and the issue, so the reader can find who owns the wiring.
-  CHECK(message.find("SPEC-DFLASH2") != std::string::npos);
-  CHECK(message.find("#1314") != std::string::npos);
+  CHECK(RefusalForDraft(draft.path()).empty());
+  const std::optional<SpeculativeConfig> cfg =
+      LoadedEngine::ResolveSpecConfig(DflashParams(draft.path(), 8), vllm::HfConfig{});
+  REQUIRE(cfg.has_value());
+  CHECK(cfg->method == "dflash");
+  CHECK(cfg->ResolvedNumSpeculativeTokens() == 8);
 }
 
-TEST_CASE("the DFlash2 refusal THROWS rather than resolving a dflash config") {
-  // The failure mode this row removes is not a wrong message, it is a resolved
-  // config: falling through leaves a spec-ON engine whose draft silently lacks
-  // the convolution and the selector.
+TEST_CASE("W2: admitting the DFlash2 draft STATES the boundary at startup") {
+  // A user who is admitted silently and refused at the first generated token has
+  // been told nothing. The notice names the mechanism that runs, the one that
+  // does not, the wave that owns it and the issue.
   const ScratchDraft draft(kDflash2DraftConfig);
-  CHECK_THROWS_AS(
-      LoadedEngine::ResolveSpecConfig(DflashParams(draft.path(), 8), vllm::HfConfig{}),
-      std::invalid_argument);
+  std::ostringstream captured;
+  std::streambuf* const previous = std::cerr.rdbuf(captured.rdbuf());
+  try {
+    (void)LoadedEngine::ResolveSpecConfig(DflashParams(draft.path(), 8), vllm::HfConfig{});
+  } catch (...) {
+    std::cerr.rdbuf(previous);
+    throw;
+  }
+  std::cerr.rdbuf(previous);
+  const std::string notice = captured.str();
+  INFO("notice: ", notice);
+  CHECK(notice.find("DFlash2DraftModel") != std::string::npos);
+  CHECK(notice.find("grouped dynamic") != std::string::npos);
+  CHECK(notice.find("CANDIDATE SELECTOR") != std::string::npos);
+  CHECK(notice.find("SPEC-DFLASH2") != std::string::npos);
+  CHECK(notice.find("#1314") != std::string::npos);
 }
 
 TEST_CASE("the loader still admits a DFlashDraftModel draft") {
@@ -239,7 +258,29 @@ TEST_CASE("a draft with no config.json to read resolves exactly as before") {
   CHECK(RefusalForDraft(draft.path()).empty());
 }
 
-TEST_CASE("the loader refuses a DFlash2 draft BEFORE it touches the model directory") {
+TEST_CASE("W2: the early FromModelDir guard no longer refuses a safetensors DFlash2 draft") {
+  // The mirror of the case above at the OTHER production call site. `FromModelDir`
+  // loads the dflash draft before it builds the `LoadedEngine`, so W1 guarded it
+  // separately; W2 admits the safetensors arm at both sites, and the failure a
+  // user now sees for a nonexistent target is the target error, not a DFlash2
+  // refusal. The GGUF arm below still refuses at this same site.
+  const ScratchDraft draft(kDflash2DraftConfig);
+  EngineParams params = DflashParams(draft.path(), 8);
+  std::ostringstream sink;
+  std::streambuf* const previous = std::cerr.rdbuf(sink.rdbuf());
+  std::string what;
+  try {
+    (void)LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/dflash2/target", params);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  std::cerr.rdbuf(previous);
+  INFO("what: ", what);
+  CHECK(what.find("model path is not a directory") != std::string::npos);
+  CHECK(what.find("not implemented") == std::string::npos);
+}
+
+TEST_CASE("the loader refuses a DFlash2 GGUF draft BEFORE it touches the model directory") {
   // The SECOND production call site, and the one the constructor's resolution
   // cannot cover. `FromModelDir` loads a dflash draft (`maybe_load_dflash`)
   // BEFORE it builds the `LoadedEngine`, and that site resolves the draft from
@@ -251,15 +292,15 @@ TEST_CASE("the loader refuses a DFlash2 draft BEFORE it touches the model direct
   // directory, so the refusal is proven to land ahead of every path, config,
   // tokenizer and weight operation. RED without the guard: the failure is
   // "model path is not a directory" and the draft classification never runs.
-  const ScratchDraft draft(kDflash2DraftConfig);
+  const gguf_test::TempFile draft(DflashGgufBytes(/*dflash2=*/true));
   EngineParams params = DflashParams(draft.path(), 8);
   try {
     (void)LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/dflash2/target", params);
-    FAIL("expected a refusal for a DFlash2 draft");
+    FAIL("expected a refusal for a DFlash2 GGUF draft");
   } catch (const std::exception& e) {
     const std::string what = e.what();
     INFO("what: ", what);
-    CHECK(what.find("DFlash2DraftModel") != std::string::npos);
+    CHECK(what.find("GGUF drafter ARM") != std::string::npos);
     CHECK(what.find("model path is not a directory") == std::string::npos);
   }
 }

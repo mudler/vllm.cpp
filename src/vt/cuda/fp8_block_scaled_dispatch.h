@@ -82,6 +82,40 @@ inline constexpr int kFp8BlockScaledBlockK = 128;
 inline constexpr int kFp8BlockScaledAlignK = 16;
 inline constexpr int kFp8BlockScaledAlignN = 16;
 
+// The sm120 collective's OWN floor, which is a different and stricter thing.
+// `cutlass/gemm/collective/sm120_mma_tma_blockwise_scaling.hpp::can_implement`
+// (CUTLASS 4.5.0, and byte-identical at upstream's pinned v4.4.2) adds three
+// lines the TMA-alignment checks above do not imply:
+//
+//     // Ensure complete scale blocks
+//     implementable = implementable && (M % ScaleGranularityM == 0);
+//     implementable = implementable && (N % ScaleGranularityN == 0);
+//     // We expect full tiles in K
+//     implementable = implementable && (K % size<2>(TileShape{}) == 0);
+//
+// The sm90 sibling
+// `sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp` has NO such
+// block, only four `check_alignment` calls, which is why this is an sm120
+// limitation and not a property of block-wise FP8.
+//
+// WORKING THE THREE CONFIGS THROUGH. The collective reads its granularities off
+// the deduced scale layouts -- `ScaleGranularityM = size<0,0>(LayoutSFA)`,
+// `ScaleGranularityN = size<0,0>(LayoutSFB)` (the same file, :129-131) -- and
+// `RunBlockwiseGemm` hands it `(m,n,k)` unswapped and `(n,m,k)` under swap:
+//
+//   default  128x128x128, `Sm120BlockwiseScaleConfig<1,128,128>`, prob (m,n,k):
+//            M%1 trivial, N%128 -> n % 128 == 0, K%TileShape_K -> k % 128 == 0.
+//   pingpong  64x128x128, same granularities, prob (m,n,k): identical.
+//   swapab   128x32x128,  `Sm120BlockwiseScaleConfig<128,1,128>`, prob (n,m,k):
+//            M%128 -> n % 128 == 0, N%1 trivial, K%TileShape_K -> k % 128 == 0.
+//
+// So THE SWAP DOES NOT MOVE THE CONSTRAINT. `n` is the constrained extent in all
+// three -- as the collective's N unswapped and as its M under swap -- and `m` is
+// never constrained by these lines in any of them. TileShape_K is 128 in all
+// three configs, so one constant covers K as well.
+inline constexpr int kFp8BlockScaledScaleBlockN = 128;
+inline constexpr int kFp8BlockScaledTileK = 128;
+
 // ---------------------------------------------------------------------------
 // Which tile config runs
 // ---------------------------------------------------------------------------
@@ -136,21 +170,49 @@ enum class Fp8BlockScaledRefusal : uint8_t {
   kBlockK,  // block_k != 128
   kAlignK,  // K % 16 != 0 — CUTLASS cannot implement it; upstream reroutes
   kAlignN,  // N % 16 != 0 — same
+  kTileK,   // K % 128 != 0 — the sm120 collective expects full tiles in K
+  kScaleBlockN,  // N % 128 != 0 — the sm120 collective wants complete scale blocks
 };
 
-// A RAGGED BLOCK IS NOT A REFUSAL. `tile_atom_to_shape_SFB` sizes the scale grid
-// with `ceil_div(N, 128)`, so a short final N-block is expressible and CUTLASS
-// predicates it. Upstream's own CUTLASS test is `M=32, N=576, K=7168` — 576 is
+// A RAGGED BLOCK IS A REFUSAL ON sm120, AND THIS HEADER SAID THE OPPOSITE UNTIL
+// [#1437](https://github.com/mudler/vllm.cpp/issues/1437). `tile_atom_to_shape_SFB`
+// does size the scale grid with `ceil_div(N, 128)`, so a short final N-block is
+// EXPRESSIBLE — but the sm120 collective refuses to implement it anyway, three
+// lines further down in `can_implement` (see `kFp8BlockScaledScaleBlockN`
+// above). Upstream's own CUTLASS test is `M=32, N=576, K=7168` — 576 is
 // 4*128 + 64 — precisely because DSV3's `kv_a_proj_with_mqa` has that shape
 // (`tests/kernels/quantization/test_block_fp8.py`,
-// `test_w8a8_block_fp8_cutlass_matmul`). What IS refused is the alignment floor
-// beneath it, which is a different question and a coarser one.
+// `test_w8a8_block_fp8_cutlass_matmul`), and on 2026-08-20 that case threw
+// `cutlass Invalid status` on a GB10 while THIS PREDICATE ACCEPTED IT. Upstream
+// gates the same module at `get_device_capability() < (9, 0)` only, so cc 12.1
+// passes its gate and its test cannot succeed there either; the shape is served
+// by the sm90/sm100 collectives, which carry no such constraint.
+//
+// ORDER. The coarse 16-alignment floor is asked BEFORE the 128 floors even
+// though 128 is the stricter number, because the two answer to different
+// authorities and a reader deserves the one that applies to them: `% 16` is
+// UPSTREAM's line, where vllm reroutes to triton rather than refusing
+// (`_custom_ops.py`, `cutlass_compatible_b`), and `% 128` is CUTLASS's sm120
+// line, which upstream never reaches because it never asks. Both messages name
+// the other, so neither answer sends a reader to a shape that is still refused.
+// THE SIGNATURE HAS NO `m`, AND THAT IS A CLAIM ABOUT THE CONFIGS rather than
+// about this function. `can_implement` constrains `m` in none of the three —
+// the granularity `m` meets is 1 on the unswapped path and 1 under swap, worked
+// through at `kFp8BlockScaledScaleBlockN` above — so there is nothing for a
+// fourth parameter to ask. A config with `ScaleGranularityM != 1` unswapped, or
+// `ScaleGranularityN != 1` swapped, WOULD bind `m`, and this signature would
+// then have to change. That condition is not left to this comment:
+// `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu` static_asserts it against the
+// three configs' own granularities and TileShapes, so a config that broke it
+// fails the build rather than the fleet.
 inline Fp8BlockScaledRefusal Fp8BlockScaledRefusalFor(int64_t n, int64_t k, int block_n,
                                                       int block_k) {
   if (block_n != kFp8BlockScaledBlockN) return Fp8BlockScaledRefusal::kBlockN;
   if (block_k != kFp8BlockScaledBlockK) return Fp8BlockScaledRefusal::kBlockK;
   if ((k % kFp8BlockScaledAlignK) != 0) return Fp8BlockScaledRefusal::kAlignK;
   if ((n % kFp8BlockScaledAlignN) != 0) return Fp8BlockScaledRefusal::kAlignN;
+  if ((k % kFp8BlockScaledTileK) != 0) return Fp8BlockScaledRefusal::kTileK;
+  if ((n % kFp8BlockScaledScaleBlockN) != 0) return Fp8BlockScaledRefusal::kScaleBlockN;
   return Fp8BlockScaledRefusal::kNone;
 }
 
@@ -183,14 +245,47 @@ inline std::string Fp8BlockScaledRefusalMessage(Fp8BlockScaledRefusal refusal, i
              "(cutlass AlignmentA/AlignmentB = 128 / sizeof_bits<e4m3> = 16). vllm refuses " +
              "the same shape one rung higher and reroutes it to triton " +
              "(vllm/_custom_ops.py, cutlass_compatible_b); there is no triton block arm " +
-             "here. The CPU reference arm runs this shape.";
+             "here. The CPU reference arm runs this shape. Rounding K up to a multiple of " +
+             "16 is not enough on this arch: see the K % 128 refusal below, which is the " +
+             "sm120 collective's own full-tile-in-K line.";
     case Fp8BlockScaledRefusal::kAlignN:
       return head + "N is " + std::to_string(n) + ", which leaves a remainder of " +
              std::to_string(n % kFp8BlockScaledAlignN) +
              " modulo 16, and the output needs N aligned to 16 elements " +
              "(vllm/_custom_ops.py, cutlass_compatible_b, requires it of both weight " +
-             "extents). A RAGGED 128-BLOCK IS FINE and is not this: N = 576 is 4*128 + 64 " +
-             "and runs. The CPU reference arm runs this shape.";
+             "extents). Rounding N up to a multiple of 16 is not enough on this arch: see " +
+             "the N % 128 refusal below, which is the sm120 collective's own " +
+             "complete-scale-block line and is stricter. The CPU reference arm runs this " +
+             "shape.";
+    case Fp8BlockScaledRefusal::kTileK:
+      return head + "K is " + std::to_string(k) + ", which leaves a remainder of " +
+             std::to_string(k % kFp8BlockScaledTileK) +
+             " modulo 128, and the sm120 blockwise collective expects FULL TILES IN K: " +
+             "cutlass gemm/collective/sm120_mma_tma_blockwise_scaling.hpp can_implement " +
+             "requires K % size<2>(TileShape{}) == 0, and TileShape K is 128 in all three " +
+             "sm120 configs (default 128x128x128, pingpong 64x128x128, swapab 128x32x128), " +
+             "so K must be a multiple of 128. THIS IS AN sm120 LIMITATION, NOT A GENERAL " +
+             "ONE: the sm90 sibling sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_" +
+             "scaling.hpp checks TMA alignment only and takes a ragged final K-block. " +
+             "vllm.cpp #1437 has the derivation. This op's own contract tiles K with cdiv " +
+             "and the CPU reference arm runs this shape.";
+    case Fp8BlockScaledRefusal::kScaleBlockN:
+      return head + "N is " + std::to_string(n) + ", which leaves a remainder of " +
+             std::to_string(n % kFp8BlockScaledScaleBlockN) +
+             " modulo 128, and the sm120 blockwise collective wants COMPLETE SCALE BLOCKS: " +
+             "cutlass gemm/collective/sm120_mma_tma_blockwise_scaling.hpp can_implement " +
+             "requires N % ScaleGranularityN == 0 and M % ScaleGranularityM == 0, so N must " +
+             "be a multiple of 128. THE SWAP DOES NOT MOVE THIS: N is the constrained " +
+             "extent in all three sm120 configs — the collective's N at granularity 128 on " +
+             "the unswapped path, and its M at granularity 128 under swap_ab, which is the " +
+             "path every M <= 64 takes. THIS IS AN sm120 LIMITATION, NOT A GENERAL ONE: the " +
+             "sm90 sibling sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp " +
+             "checks TMA alignment only and takes a ragged final scale block. It refuses " +
+             "DSV3's kv_a_proj_with_mqa, N = 576 = 4*128 + 64, which is upstream's own " +
+             "cutlass test case (tests/kernels/quantization/test_block_fp8.py, " +
+             "test_w8a8_block_fp8_cutlass_matmul) and which this arm therefore cannot serve " +
+             "on an sm120 device at all; vllm.cpp #1437 has the derivation. The CPU " +
+             "reference arm runs this shape.";
   }
   return head + "unclassified refusal";
 }

@@ -113,6 +113,7 @@ enum class OpId : uint8_t {
   kAttentionDenseFa2,
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
+  kDFlashGroupedConv,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -759,6 +760,72 @@ struct DFlashPagedBlockAttentionArgs {
   int64_t block_size = 0;         // rows per paged context page (>0)
 };
 
+// Arguments for vt::DFlashGroupedConv — the DFlash2 draft's GROUPED DYNAMIC
+// DEPTHWISE CONVOLUTION, wrapped around each attention and each MLP sublayer
+// (SPEC-DFLASH2 W2, #1314).
+//
+// BEYOND-PIN. Ported from `_grouped_conv` and `DFlashGroupedConv`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`); the parity pin `555967922` does
+// not carry the architecture at all and this op does NOT advance it.
+//
+// The math, in upstream's own terms:
+//
+//   out[i,c] = sum_{t=0..taps-1} (base[side,t,c] + delta[i,side,t,g(c)]) * x[i-t,c]
+//
+// with `g(c) = c / group_size` the channel's GROUP, and tap `t` contributing only
+// where `(i mod block_size) >= t`. That mask is what makes the op a BLOCK
+// convolution rather than a sequence one: a proposal position sees the positions
+// before it inside its own (1+k) query block and NOTHING across the block
+// boundary, which is how a DFlash2 draft gets causal structure without another
+// backbone pass. `i` is the GLOBAL row index, exactly as upstream's
+// `torch.arange(hidden_states.shape[0])` is, and it is the right one here for the
+// same reason it is there: every request's block is contiguous and
+// block_size-aligned, so `i mod block_size` IS the intra-block offset.
+//
+// Upstream computes that mask on a POWER-OF-TWO block as `position & (block-1)`
+// and otherwise as `position % block`. Both arms are mirrored, and both are
+// gated: the two published DFlash2 checkpoints ship block 8 and block 16 (both
+// power-of-two, `z-lab/Qwen3.8-27B-DFlash2` and `z-lab/Muse-Glimmer-30B-DFlash2`)
+// and upstream's own reference test parametrises 5 to reach the modulo arm.
+//
+// `block_size` is `1 + num_speculative_tokens`, NOT `dflash_config.block_size` —
+// upstream sizes the conv by the QUERY block (the bonus token plus the mask
+// tokens) rather than by the checkpoint key, which only supplies that value's
+// default (`DFlash2Qwen3DecoderLayer.__init__` @ that head).
+//
+// SIDES. `base_kernel` is `[2, taps, hidden]` and dim 0 is the SIDE — 0 =
+// `prepare` (before the sublayer), 1 = `finish` (after it) — NOT a tap. One
+// projection of the sublayer input produces BOTH sides' deltas
+// (`kernel_projection`: hidden -> 2*taps*num_groups), so `coefficients` is the
+// same buffer for both calls and `side` selects the half. Passing the whole
+// buffer rather than a slice mirrors upstream's `coefficients[:, side]` view
+// without materializing a copy of a non-contiguous slice.
+//
+// ACCUMULATION. Every intermediate is rounded to the tensor dtype after each
+// step, because upstream's chain materializes bf16 tensors at each one
+// (`base + delta`, `coefficients * blocks`, `output += ...`). This is elementwise
+// with no reduction-order freedom, so the CPU reference and the CUDA kernel are
+// specified BIT-IDENTICAL rather than within an envelope.
+//
+// WHAT IS ACTUALLY GATED, because the two halves of that sentence are not
+// equally proven. The per-step POLICY is pinned on CPU in bf16 by
+// `tests/vt/test_ops_dflash2_grouped_conv.cpp` — one hand-computed case with
+// literal expectations that differ from the rounded-once-at-the-end answer in
+// six of eight outputs, plus three shapes asserted bit-exact against a reference
+// that rounds where UPSTREAM materializes. On f32 this rounding is the identity
+// by construction, so no f32 case can see it and none is claimed to. The CPU ==
+// CUDA half is NOT proven: that case exists and is written to run, but it has
+// never compiled on a host without `nvcc` and reports `no CUDA backend;
+// skipping`. See `## Owed` O6 of `.agents/specs/dflash2-spec-decode.md`.
+struct DFlashGroupedConvArgs {
+  int64_t block_size = 0;   // 1 + num_speculative_tokens (the query block)
+  int64_t taps = 0;         // dflash_config.conv_kernel_size
+  int64_t num_groups = 0;   // hidden_size / conv_group_size
+  int64_t group_size = 0;   // dflash_config.conv_group_size
+  int64_t side = 0;         // 0 = prepare, 1 = finish (selects base/coefficient half)
+};
+
 // Backend-neutral local-attention window, matching FlashAttention's
 // `window_size=(left, right)` convention. The bounds are inclusive distances
 // from the bottom-right-aligned absolute query position: (W-1, 0) is a causal
@@ -1182,6 +1249,8 @@ using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, con
                                              const Tensor&, const Tensor&, const Tensor&,
                                              const Tensor&, const Tensor&, const Tensor&,
                                              const DFlashPagedBlockAttentionArgs&);
+using DFlashGroupedConvFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                     const Tensor&, const DFlashGroupedConvArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -2966,6 +3035,18 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
                                const Tensor& cu_seqlens, const Tensor& seq_lens,
                                const Tensor& block_table,
                                const DFlashPagedBlockAttentionArgs& args);
+
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314). See
+// DFlashGroupedConvArgs for the contract and the upstream anchor. Tensors:
+//   out           [T, H]                       the convolved sublayer stream
+//   x             [T, H]                       the sublayer input/output stream
+//   coefficients  [T, sides, taps, num_groups] the per-position kernel DELTAS
+//   base          [sides, taps, H]             the checkpoint's base_kernel
+// with H == num_groups * group_size and `args.side` in [0, sides). All four share
+// one float dtype (bf16 on every published checkpoint). CPU is the authoritative
+// reference; CUDA mirrors it bit-for-bit.
+void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                       const Tensor& base, const DFlashGroupedConvArgs& args);
 
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;

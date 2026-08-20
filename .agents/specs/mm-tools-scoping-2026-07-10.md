@@ -11,7 +11,7 @@ vLLM pin `e24d1b24`, deps `~/venvs/vllm-oracle`).
    `Qwen3VLForConditionalGeneration` (`vllm/model_executor/models/qwen3_5.py:389,604`).
    Both gate checkpoints ship the full 27-block SigLIP-shaped ViT — **333
    `model.visual.*` tensors, bf16 — which our loader silently drops**
-   (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:210`). vLLM
+   (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:211`). vLLM
    serves these exact checkpoints as VLMs by default → vision enablement on
    the gate models is a MIRROR obligation, not an expansion.
 2. **Our Qwen3 tool parser targets the WRONG format.** The shipped gate

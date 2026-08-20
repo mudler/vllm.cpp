@@ -94,7 +94,7 @@ void ResetQwen3_5MixedSpecInvocations() {
 // Do not read that as "and now the removal is observable in production", because
 // it is not, in either order (fresh-review finding). `has_packed_ba` needs
 // `in_proj_ba`, written at exactly one site in the tree — the dense loader,
-// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// qwen3_5_dense_weights.cpp:432 — so on a MoE checkpoint the eligibility is
 // false before the shape term is ever read. Removing it therefore reaches packed
 // decode on NO checkpoint; it removes a contradiction with both references and a
 // second answer to a question the dtype rule already answers. Reaching packed

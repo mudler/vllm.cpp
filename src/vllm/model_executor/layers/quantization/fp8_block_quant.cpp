@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"  // DeviceTypeName
 
@@ -16,15 +17,15 @@ namespace {
 // (`src/vllm/transformers_utils/hf_config.cpp:564`), so both are reachable from
 // here. `Qwen/Qwen3.8-27B-FP8` uses the top-level spelling, measured: its
 // `text_config` carries no `quantization_config`.
+//
+// ONE implementation, in
+// `layers/quantization/compressed_tensors/compressed_tensors_config.h`. This
+// file carried its own copy until `QUANT-QWEN38-27B-NVFP4-ARM` needed the same
+// lookup: two copies are two answers to "where does the quantization config
+// live", and the wrapper shape (`Qwen3_5ForConditionalGeneration`) is exactly
+// where they would drift apart.
 const nlohmann::json* QuantizationConfigOf(const HfConfig& config) {
-  if (!config.raw.is_object()) return nullptr;
-  const auto top = config.raw.find("quantization_config");
-  if (top != config.raw.end() && top->is_object()) return &*top;
-  const auto text = config.raw.find("text_config");
-  if (text == config.raw.end() || !text->is_object()) return nullptr;
-  const auto nested = text->find("quantization_config");
-  if (nested != text->end() && nested->is_object()) return &*nested;
-  return nullptr;
+  return layers::compressed_tensors::QuantizationConfigOf(config.raw);
 }
 
 std::string DimensionList(const std::vector<int64_t>& dims) {

@@ -703,36 +703,55 @@ What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
 A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**run and failing**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches
-on those devices, ported whole, with the scales applied in the mainloop; it is
-compiled by continuous integration for both architectures and registered, so a
-build for one of them no longer refuses the checkpoint at prepare time. On
+**run, and shape-restricted: unproven on every shape it can serve**. It is the
+block-scaled CUTLASS GEMM vLLM itself dispatches on those devices, ported whole,
+with the scales applied in the mainloop; it is compiled by continuous
+integration for both architectures and registered, so a build for one of them no
+longer refuses the checkpoint at prepare time. On
 2026-08-20 `test_ops_matmul_fp8_block_cuda` was run on a GB10 (compute
 capability 12.1) for the first time, and vLLM's own ported case -- M=32, N=576,
-K=7168 -- throws `cutlass Invalid status` before any kernel launches, because
-CUTLASS refuses the configuration at `can_implement`. Two of the file's five
-cases fail this way and three pass, so the failure is shape-dependent rather
-than universal; which shapes are affected is not yet isolated, and `Invalid`
-names no constraint. No shape has yet had its output compared against the CPU
-reference: the two cases that make that comparison are the two that throw. There
-is still no token-exact comparison against vLLM and no throughput number, on any
-device. Treat this arm as broken on the shape it was measured on and unproven
-everywhere else.
+K=7168 -- threw `cutlass Invalid status` before any kernel launched, because
+CUTLASS refused the configuration at `can_implement`.
+
+Which shapes are affected is now isolated, and the answer is a **shape
+restriction, not a bug in this tree**: on sm120 the CUTLASS block-wise
+collective serves only an N and a K that are whole multiples of 128. It requires
+complete scale blocks and full tiles in K, its sm90 counterpart requires
+neither, and 576 is `4*128 + 64`. A coarser floor sits under that one and is
+asked first where it applies -- `K % 16` and `N % 16`, the fp8 operand
+alignment, which is the line vLLM draws before rerouting such a shape to a
+Triton kernel this build does not have -- so four shape classes are refused in
+all, two of them at 16 by vLLM's authority and two at 128 by the sm120
+collective's. This arm refuses every one of the four **by name**, before it
+allocates anything:
+
+```text
+matmul_fp8_block_scaled: no CUDA kernel for this shape. N is 576, which leaves a
+remainder of 64 modulo 128, and the sm120 blockwise collective wants COMPLETE
+SCALE BLOCKS [...] so N must be a multiple of 128
+```
+
+The message names the dimension, its value, the granularity, the CUTLASS line it
+comes from, and that the sm90 collective has no such limit. It replaces
+`cutlass Invalid status`, which named none of those.
+
+**One real capability gap follows, and it is not repairable here.** DeepSeek-V3's
+`kv_a_proj_with_mqa` is exactly N=576 -- which is why vLLM chose that shape for
+its own test -- so on an sm120 device this arm cannot serve it at all. Any
+block-wise FP8 checkpoint whose projections are not all a multiple of 128 wide is
+affected the same way. The CPU reference arm runs every one of these shapes.
+`Qwen/Qwen3.8-27B-FP8`, the checkpoint above, is not affected: its ten
+projections are all round.
+
+None of that makes the arm proven. **No shape has yet had its output compared
+against the CPU reference on any device**, there is still no token-exact
+comparison against vLLM and no throughput number. What changed is what a user is
+told when the shape cannot be served, not whether the shapes that can be served
+produce the right numbers.
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437) records the run,
 milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
 kernel and the repair it now owes, and
 [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
-
-Two shapes the CPU arm accepts are refused on CUDA, by name and with the
-dimension and its remainder in the message. The CUTLASS collective needs both
-`K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
-and reroutes those shapes to a Triton kernel this build does not have. A
-*ragged* 128-block is not refused by that rule: `N = 576` is `4*128 + 64`, is
-16-aligned, and is the shape vLLM's own CUTLASS test uses. It does not follow
-that it runs -- on hardware that shape is exactly the one CUTLASS rejects at
-`can_implement`, above. A build for any other CUDA architecture has no such
-kernel compiled and keeps refusing at prepare time, which is the honest answer
-rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
@@ -2946,7 +2965,7 @@ a stop token early.
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend, an unknown TOP-LEVEL key (the four legal ones are `offload_backend`, `uva`, `prefetch` and `vllm_cpp`) or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md). The same document also carries the **`vllm_cpp` key**, which governs the tier BELOW this one — weights borrowed out of the file mapping rather than moved to host RAM — and which is live rather than refused: see [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode). A `vllm_cpp`-only document does not enable vLLM's offload backends and is not subject to the refusal above. The flag is accepted by `vllm-server` (the generate/chat and the pooling/embedding paths), by `vllm-cli`, and by the C ABI; the server's transcription-only path REFUSES it by name, because that path builds no engine and could only accept the document and ignore it ([#1195](https://github.com/mudler/vllm.cpp/issues/1195)) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). The DRAFT is classified from its own `config.json` rather than from the method string: `Qwen3DSparkModel`, `Gemma4DSparkModel`, and — BEYOND-PIN, mirroring [vllm#52197](https://github.com/vllm-project/vllm/pull/52197) merged 2026-08-17 — `DSparkDraftModel` together with `model_type` `qwen3` all route to the Qwen3 DSpark lane, and every other DSpark draft that DECLARES an architecture is the DeepSeek-V4 variant, which is refused by name because this engine carries only a stub for it (`SPEC-DSPARK-QWEN3-ROUTING`, [#1193](https://github.com/mudler/vllm.cpp/issues/1193)). A draft config carrying no `architectures` key at all is not classified and loads as before, because an absent key is not evidence of a lane. Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. For `dspark`, `num_speculative_tokens` may no longer sit BELOW the draft checkpoint's block: DSpark drafts a block, our block is sized from this value alone, and a shorter one drafted a structurally wrong block in silence. It is refused now, before any weight is loaded, naming the block, the config key the block was read from, and the value given ([#1225](https://github.com/mudler/vllm.cpp/issues/1225)). The block is read from the draft config's `dspark_block_size`, or from `block_size` when that key is absent, which is the case on every published Qwen3 draft (`deepseek-ai/dspark_qwen3_4b_block7` and `RadixArk/Qwen3.8-27B-DSpark` both carry `block_size: 7`, so k must be at least 7). vLLM reads only the first key and accepts the shorter value. vLLM also builds its model config BEFORE its speculative config, so a command that names both a target directory it cannot open and a short `k` hears about the target there and about the `k` here. Those are the two recorded divergences, both argued in `.agents/specs/dspark-block-size-guard.md`. A k at or above the block behaves exactly as before. For `dflash`, the DRAFT is likewise classified from its own `config.json`, and a draft that declares `DFlash2DraftModel` is REFUSED at startup, before any weight is read, naming both mechanisms this engine does not implement yet: the grouped dynamic depthwise convolution and the candidate selector (`SPEC-DFLASH2`, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)). It is refused rather than loaded because a DFlash2 checkpoint carries DFlash1's whole tensor set, so the DFlash1 lane would load it with nothing missing and draft worse tokens with no visible symptom: the verify is lossless, so the emitted tokens stay the target's and only acceptance falls. A `DFlashDraftModel` draft is unaffected. A GGUF drafter is classified the same way but by its METADATA, because a GGUF declares no architectures and the published DFlash2 GGUF writes the same `dflash` architecture a DFlash1 one does: a file carrying `dflash.selector_rank`, `dflash.selector_top_k` or `dflash.conv_kernel_size` is refused, and a DFlash1 GGUF, which carries none of them, loads as before. A draft config may also carry a top-level `is_causal`, which now decides every layer's causality ahead of `dflash_config.causal` and ahead of the `layer_types` default, mirroring [vllm#52816](https://github.com/vllm-project/vllm/pull/52816); no published DFlash1 checkpoint declares the key, so their behaviour is unchanged. In a GGUF the same value arrives as `dflash.attention.causal` and is resolved identically. Either spelling is honoured whenever it is DECLARED, as a boolean or as a number, so `"is_causal": 0` means non-causal rather than falling through to the default; a value of any other type is now refused by name instead of being dropped, and the two containers answer alike. When NEITHER explicit key is present, a layer is causal only if its own declared `layer_types` entry is `sliding_attention`. `dflash_config.use_swa` moves the sliding WINDOW onto every layer and no longer makes any layer causal, which is what upstream does ([#1366](https://github.com/mudler/vllm.cpp/issues/1366)); such a draft previously ran every layer causal here and non-causal in vLLM, which cost acceptance and changed no emitted token, so nothing surfaced it. **No checkpoint reaches that arm here yet**, so it changes nothing you can run today: every published DFlash draft that declares `layer_types` also declares no `use_swa`, and the one published draft of the governed shape, `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`, declares no `layer_types` at all — which this engine's draft-config builder requires, so it fails with the raw `key 'layer_types' not found` before any causality is resolved — while its target architecture `MiMoV2ForCausalLM` is not one this engine serves. A GGUF drafter cannot declare `use_swa` at all. The rule is therefore correct and INERT, and both halves of the gap are owed by `SPEC-DFLASH2` W2 (`.agents/specs/dflash2-spec-decode.md` `## Owed` O4). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). The DRAFT is classified from its own `config.json` rather than from the method string: `Qwen3DSparkModel`, `Gemma4DSparkModel`, and — BEYOND-PIN, mirroring [vllm#52197](https://github.com/vllm-project/vllm/pull/52197) merged 2026-08-17 — `DSparkDraftModel` together with `model_type` `qwen3` all route to the Qwen3 DSpark lane, and every other DSpark draft that DECLARES an architecture is the DeepSeek-V4 variant, which is refused by name because this engine carries only a stub for it (`SPEC-DSPARK-QWEN3-ROUTING`, [#1193](https://github.com/mudler/vllm.cpp/issues/1193)). A draft config carrying no `architectures` key at all is not classified and loads as before, because an absent key is not evidence of a lane. Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. For `dspark`, `num_speculative_tokens` may no longer sit BELOW the draft checkpoint's block: DSpark drafts a block, our block is sized from this value alone, and a shorter one drafted a structurally wrong block in silence. It is refused now, before any weight is loaded, naming the block, the config key the block was read from, and the value given ([#1225](https://github.com/mudler/vllm.cpp/issues/1225)). The block is read from the draft config's `dspark_block_size`, or from `block_size` when that key is absent, which is the case on every published Qwen3 draft (`deepseek-ai/dspark_qwen3_4b_block7` and `RadixArk/Qwen3.8-27B-DSpark` both carry `block_size: 7`, so k must be at least 7). vLLM reads only the first key and accepts the shorter value. vLLM also builds its model config BEFORE its speculative config, so a command that names both a target directory it cannot open and a short `k` hears about the target there and about the `k` here. Those are the two recorded divergences, both argued in `.agents/specs/dspark-block-size-guard.md`. A k at or above the block behaves exactly as before. For `dflash`, the DRAFT is likewise classified from its own `config.json`. A safetensors draft that declares `DFlash2DraftModel` is ADMITTED as far as its convolution and no further (`SPEC-DFLASH2`, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)): it loads, it runs the grouped dynamic depthwise convolution around every attention and every MLP sublayer of every draft layer, and it is then REFUSED BY NAME at the candidate selector, which this engine does not implement yet. A notice at STARTUP says exactly that, so the refusal at the first generated token is not a surprise. It is refused rather than sampled with the DFlash1 per-slot argmax because that would succeed: the argmax proposes well-formed tokens, the verify is lossless, so the emitted tokens stay the target's and only acceptance falls, which no token gate can see. A `DFlashDraftModel` draft is unaffected. A GGUF DFlash2 drafter is still refused AT STARTUP, because its weight path does not exist yet — the GGUF drafter arm is a later wave. It is classified by its METADATA rather than by an architecture, because a GGUF declares no architectures and the published DFlash2 GGUF writes the same `dflash` architecture a DFlash1 one does: a file carrying `dflash.selector_rank`, `dflash.selector_top_k` or `dflash.conv_kernel_size` is refused, and a DFlash1 GGUF, which carries none of them, loads as before. Two `config.json` shapes that used to fail the draft-config builder outright now parse: a draft that nests `rope_theta` under `rope_parameters` or `block_size` under `dflash_config` (which BOTH published DFlash2 drafts do), and a draft that declares no `layer_types` at all. A draft declaring `dflash_config.attention_sink_bias` is refused by name, because this engine has no attention sink and loading without one would draft worse tokens in silence. A draft config may also carry a top-level `is_causal`, which now decides every layer's causality ahead of `dflash_config.causal` and ahead of the `layer_types` default, mirroring [vllm#52816](https://github.com/vllm-project/vllm/pull/52816); no published DFlash1 checkpoint declares the key, so their behaviour is unchanged. In a GGUF the same value arrives as `dflash.attention.causal` and is resolved identically. Either spelling is honoured whenever it is DECLARED, as a boolean or as a number, so `"is_causal": 0` means non-causal rather than falling through to the default; a value of any other type is now refused by name instead of being dropped, and the two containers answer alike. When NEITHER explicit key is present, a layer is causal only if its own declared `layer_types` entry is `sliding_attention`. `dflash_config.use_swa` moves the sliding WINDOW onto every layer and no longer makes any layer causal, which is what upstream does ([#1366](https://github.com/mudler/vllm.cpp/issues/1366)); such a draft previously ran every layer causal here and non-causal in vLLM, which cost acceptance and changed no emitted token, so nothing surfaced it. **Still no checkpoint reaches that arm here**, so it changes nothing you can run today: every published DFlash draft that declares `layer_types` also declares no `use_swa`. The one published draft of the governed shape, `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`, declares no `layer_types` at all, and that now PARSES rather than failing with `key 'layer_types' not found` — but its target architecture `MiMoV2ForCausalLM` is still not one this engine serves, so the draft has nothing to head. A GGUF drafter cannot declare `use_swa` at all. The rule is therefore correct and still INERT (`.agents/specs/dflash2-spec-decode.md` `## Owed` O4, whose parse half is discharged). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--mmproj <mmproj-*.gguf>` | (unset) | The SECOND GGUF file: a `clip`-architecture multimodal projector beside a `.gguf` `--model`, spelled as llama.cpp spells it. It is read, validated and REFUSED BY NAME before the tokenizer and before any language-model weight byte, so a wrong file costs a message instead of a 17 GB map. Refused when `--model` is not a `.gguf` (a safetensors checkpoint carries its tower in its own shards), when the file's `general.architecture` is not `clip`, when its `clip.projector_type` is not `qwen3vl_merger`, and when it carries `v.patch_embd.weight` without `v.patch_embd.weight.1` — half the input features the temporal patch embedding needs, which cannot be completed without inventing the other half. A `muse-glimmer` projector gets MuseGlimmer's own recorded refusal. **The tower is loaded and held, and nothing runs it yet**: there is no multimodal request path over HTTP for a GGUF model, so today the flag buys you validation and a loaded tower, not an image answer ([#821](https://github.com/mudler/vllm.cpp/issues/821)). Auto-discovery of a sibling `mmproj*.gguf` is deliberately not implemented — a directory holding two unrelated models must not silently fuse them |
@@ -3101,6 +3120,59 @@ check sits ahead of the classification in the same branch. And a `.gguf` target
 takes the GGUF branch above the hoist, which carries its own named refusal for a
 GGUF DSpark target (`SPEC-DSPARK`). Either way the draft is refused and nothing
 loads it as a Qwen3 draft.
+
+## DFlash2 drafts: the exact checkpoints
+
+A DFlash2 draft is a SEPARATE checkpoint named by the `model` key of
+`--speculative-config`, and it heads one specific target. A repo id alone is not
+a pin, because a checkpoint can be re-quantized in place under an unchanged name,
+so the revision is part of the identity.
+
+**Read what these weights currently buy you before you download 3.6 GiB.** A
+safetensors `DFlash2DraftModel` draft is admitted as far as its CONVOLUTION and
+no further: it loads, it runs the grouped dynamic depthwise convolution around
+every attention and every MLP sublayer of every draft layer, and it is then
+refused BY NAME at the candidate selector, which this engine does not implement
+yet (`SPEC-DFLASH2`, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
+A startup notice says so, so the refusal at the first generated token is not a
+surprise. These are therefore the checkpoints the port was BUILT and READ
+against, not checkpoints that produce a draft token here today.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| Draft, bf16 safetensors — ADMITTED to the convolution | `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `model.safetensors` | 3 848 817 896 | `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
+| Draft, GGUF — REFUSED at startup | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
+| Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
+| Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
+| Target the draft heads | `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | published shards | — | — |
+
+Every sha256 above was computed over the local copy on 2026-08-20, not read from
+a hub API: an unauthenticated tree API can return an `lfs.oid` that is not a
+hash of anything. Each file's size matches what the hub reports, and the
+safetensors shard was checked semantically as well — 81 tensors, every one BF16,
+and its last data offset lands exactly on the file size.
+
+**The GGUF rows are the REFUSED arm, and they are listed so the refusal is
+checkable.** A GGUF DFlash2 drafter is refused at startup because its weight path
+does not exist yet; it is classified by METADATA rather than by an architecture,
+because a GGUF declares no architectures and the published DFlash2 GGUF writes
+the same `dflash` architecture a DFlash1 one does. A file carrying
+`dflash.selector_rank`, `dflash.selector_top_k` or `dflash.conv_kernel_size` is
+refused, and a DFlash1 GGUF, which carries none of them, loads as before. The
+GGUF drafter arm is a later wave of the row.
+
+**What the gate actually reads, which is not these bytes.** The published
+`config.json` of `z-lab/Qwen3.8-27B-DFlash2` and of the second published DFlash2
+draft, `z-lab/Muse-Glimmer-30B-DFlash2` @
+`b54ffdd11fa9cfe2af370012e5763d492c904128`, are embedded BYTE-FOR-BYTE in
+`tests/vllm/models/test_qwen3_dflash2_draft.cpp` with their sha256 recorded, and
+the gate drives those documents through the production config builder. The
+weight-loading cases run over a safetensors file the test WRITES, carrying the
+published tensor names and shapes (`layers.N.attention_conv.base_kernel` bf16
+`[2, taps, hidden]`, `layers.N.mlp_conv.kernel_projection.weight`), because a
+3.6 GiB download cannot be a unit-gate dependency. The two published drafts
+differ in ways the gate needs: block 8 against block 16, and Muse Glimmer sets
+`output_multiplier` and `final_logit_softcapping` where the 27B defaults them.
 
 ## Muse Glimmer 30B from a GGUF k-quant
 
@@ -3999,6 +4071,66 @@ the pinned llama.cpp, which is `PENDING` on
 [#857](https://github.com/mudler/vllm.cpp/issues/857) because that oracle is
 recorded `gateable = no`, and any image or video answer at all —
 `QUANT-QWEN38-27B-GGUF-ARM`,
+[#821](https://github.com/mudler/vllm.cpp/issues/821).
+
+### `unsloth/Qwen3.8-27B-NVFP4` — what it is, and which arm is refused
+
+This artifact's repo name says NVFP4 and its `quantization_config.format` says
+`mixed-precision`. **This engine cannot run it yet**, and it now says so at load
+instead of failing on a missing tensor. It is documented here because it is a
+checkpoint people reach for, and because the refusal is the shipped behaviour.
+
+Also a **third-party quantization by Unsloth**, not a first-party release. A repo
+id is not a pin: the revision [#821](https://github.com/mudler/vllm.cpp/issues/821)
+originally named, `a767244d27bd76589a3e3b2ab4e64032c4ebc7af`, no longer resolves,
+and this is the second in-place re-quantization this publisher has done in this
+model family.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| mixed FP8 + NVFP4 backbone | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `model.safetensors` | 22 568 192 096 | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` |
+| bf16 MTP drafter | same revision | `model_mtp.safetensors` | 849 400 392 | not mirrored here, so no locally computed hash — and no remote-reported one is recorded |
+
+Total resident size of the set is 23 417 592 488 B, which is
+`model.safetensors.index.json`'s own `metadata.total_size` and the sum of the two
+files. The sha256 above was computed locally on this project's mirrored copy, not
+read back from the hub.
+
+The 1968 names of that index split into two schemes plus the parts no group
+claims:
+
+| Scheme | Modules | Tensors | Covers |
+|---|---:|---:|---|
+| `group_1`, `nvfp4-pack-quantized` W4A4, `group_size` 16 | 168 | 672 | `mlp.(gate\|up\|down)_proj` on layers 0-55 |
+| `group_0`, `float-quantized` FP8 W8A8 | 233 | 466 | `self_attn.(q\|k\|v\|o)_proj`, `linear_attn.(in_proj_qkv\|in_proj_z\|out_proj)`, `lm_head`, and layers 56-63's MLP |
+| on the config's `ignore` list | 317 | 475 | the GDN low-rank projections and norms, the 27 vision blocks, the merger, the whole MTP head |
+| named by no target | 267 | 323 | norms, `conv1d`, the embedding table, the patch and position embeddings |
+| `kv_cache_scheme` scales | 16 | 32 | `k_scale` / `v_scale` on the 16 full-attention layers |
+
+**The NVFP4 arm loads. The FP8 arm is REFUSED**, by name, before any weight is
+read, because its `group_0` needs two things this build does not have: a
+per-output-channel weight scale (`weights.strategy: channel`, so `weight_scale`
+ships `[out, 1]` rather than the one element a per-tensor scale is) and dynamic
+per-token activation quantization (`input_activations.dynamic: true`, so the
+checkpoint correctly ships **no** `*.input_scale` at all and the scale is
+computed per forward). The declared `kv_cache_scheme` is refused for the same
+reason: nothing here reads `k_scale` / `v_scale`, and there is no quantized KV
+cache to apply them to. Since layers 0-55 and 56-63 use the SAME module names and
+differ only by a regex over the layer index, no per-tensor dtype probe can tell
+the two groups apart; the split is read from `config_groups`.
+
+To re-verify the committed manifests and config against the shipped bytes rather
+than against the fixture CI reads:
+
+```console
+VLLM_CPP_QWEN38_27B_NVFP4_DIR=/path/to/qwen3.8-27b-nvfp4 \
+  ./build/tests/test_qwen38_27b_nvfp4_arm
+```
+
+Unset, that case skips loudly and the gate stays hermetic; CI reads no NAS file.
+**What is still owed on this artifact** is the FP8 tower itself, a consumed
+`kv_cache_scheme`, a resident-bytes assertion, and every token gate —
+`QUANT-QWEN38-27B-NVFP4-ARM`,
 [#821](https://github.com/mudler/vllm.cpp/issues/821).
 
 ### Per-prompt input limits

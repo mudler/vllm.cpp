@@ -159,14 +159,21 @@ its f32 sinks, and recorded here for the same reason: nothing widens the GEMM,
 the extra width buys no precision, and a reader must not mistake the f32 sink
 for an f32 compute path. One instantiation per config, three in total.
 
-### Ragged edges — supported, with the refusal upstream itself takes
+### Ragged edges — refused by name, at two different floors
 
-**Ragged block boundaries are SUPPORTED.** `tile_atom_to_shape_SFB` sizes the
-scale grid with `ceil_div(N, 128)`, so a short final N-block is expressible and
-CUTLASS predicates it. That is not inference: upstream's own CUTLASS test is
-`M=32, N=576, K=7168` — `576 = 4*128 + 64` — chosen because DSV3's
-`kv_a_proj_with_mqa` has that shape, and it asserts against the same reference
-this arm is measured against. G2 ports that case whole.
+**Ragged block boundaries are REFUSED on sm120, and this section said the
+opposite until [#1437](https://github.com/mudler/vllm.cpp/issues/1437).**
+`tile_atom_to_shape_SFB` does size the scale grid with `ceil_div(N, 128)`, so a
+short final N-block is EXPRESSIBLE — that part was right, and it is why the
+error looked safe. It is not sufficient: `sm120_mma_tma_blockwise_scaling.hpp`'s
+`can_implement` refuses the configuration three lines further down, requiring
+`N % ScaleGranularityN == 0` and `K % size<2>(TileShape{}) == 0`, and the sm90
+sibling requires neither. Upstream's own CUTLASS test is `M=32, N=576, K=7168` —
+`576 = 4*128 + 64` — chosen because DSV3's `kv_a_proj_with_mqa` has that shape,
+and on sm120 that shape cannot reach the GEMM at all. The full derivation, per
+config, is in `## Owed` below; `kScaleBlockN` and `kTileK` are that refusal, G4
+pins both by message and G6 pins the grid's partition. G2 ports upstream's case
+as a REFUSAL plus upstream's fixture on the nearest servable `N`.
 
 **The CUTLASS ALIGNMENT floor is refused by name.** `AlignmentA` and
 `AlignmentB` are `128 / sizeof_bits<e4m3>` = 16 elements, and both operands
@@ -199,6 +206,19 @@ blockwise config is built at `(1, 128, 128)` or `(128, 1, 128)`. The loader
 already refuses a `weight_block_size` other than `[128, 128]` at load
 (#1189 M3), so this is the same refusal restated where the kernel can see it,
 not a new limit.
+
+**`Fp8BlockScaledRefusalFor` takes `(n, k, block_n, block_k)` and cannot ask
+about `m`.** That is correct today and it is a claim about the CONFIGS, not
+about the predicate: `can_implement` meets `m` at granularity 1 on the unswapped
+path and at granularity 1 under swap, so there is nothing for a fourth parameter
+to ask. A fourth config with `ScaleGranularityM != 1` unswapped — or
+`ScaleGranularityN != 1` swapped — would bind `m`, and the signature would then
+have to change. That condition is not left to a comment:
+`cuda_matmul_fp8_block_cutlass.cu` `static_assert`s it against the three
+configs' own granularities and against `size<2>(TileShape{})`, the same
+expression `can_implement` uses, so the constant cannot agree with the config by
+having been copied from it. A config that broke the tie fails the build rather
+than the fleet.
 
 ### The host-side decision is a pure function, and it is where the gate lands
 
@@ -300,7 +320,7 @@ TU present and that the new registration is the only one for its OpId.
 |---|---|
 | the activation scale is passed row-major, so every element after the first K-block reads the wrong scale | G3 pins both deduced layout formulas against a hand-derived table taken from `blockwise_scale_layout.hpp`, not from the implementation; G2 would fail on hardware |
 | the transpose is skipped for `k_tiles == 1`, where row-major and column-major coincide, and the bug hides | G3's table includes `k_tiles == 1` AND `k_tiles > 1`, and the kernel has no `k_tiles == 1` special case to skip |
-| a ragged N silently mis-slices | AT M5: ragged N is supported and G2 is upstream's own `N=576` case; G4 asserts no refusal for it. FALSIFIED IN PART by [#1437](https://github.com/mudler/vllm.cpp/issues/1437): the HOST-side guard indeed does not refuse `N=576`, but on hardware CUTLASS itself rejects that configuration at `can_implement`, so the control did not hold. Whether raggedness is the CAUSE is a HYPOTHESIS and is not isolated -- `Invalid` names no constraint |
+| a ragged N silently mis-slices | AT M5: ragged N is supported and G2 is upstream's own `N=576` case; G4 asserts no refusal for it. FALSIFIED by [#1437](https://github.com/mudler/vllm.cpp/issues/1437), and the control is now the opposite one. Raggedness IS the cause and it is isolated by source: `sm120_mma_tma_blockwise_scaling.hpp::can_implement` requires `N % ScaleGranularityN == 0` and `K % size<2>(TileShape{}) == 0`, the sm90 sibling requires neither, and `N=576` is `4*128+64`. `Fp8BlockScaledRefusalFor` now REFUSES `N % 128 != 0` and `K % 128 != 0` by name, G4 pins both refusals and their messages, and G6 pins the grid's partition |
 | a misaligned K takes the kernel anyway and reads past a tile | refused by name; G4 asserts the refusal for `K=3884` and that the message names K and its remainder |
 | the M heuristic drifts from upstream, so decode silently stops using `swapab` | G1 pins all three boundaries by value, including `M=1`, `M=64`, `M=65`, `M=66`, `M=68`, `M=256`, `M=257` |
 | a block size other than 128x128 reaches a collective built for 128 | refused by name; G4 |
@@ -334,9 +354,16 @@ machine including this one**, registered in `tests/CMakeLists.txt` with
   and a transpose bug is invisible.
 - **G4** the refusals, each by name and each with the message asserted:
   `K % 16 != 0` (upstream's `K=3884`), `N % 16 != 0`, `block_n != 128`,
-  `block_k != 128`, and the three shapes that must NOT be refused —
-  `N=576` ragged, `K=7168`, and the target checkpoint's `q_proj`
-  `N=12288, K=5120`.
+  `block_k != 128`, and — since [#1437](https://github.com/mudler/vllm.cpp/issues/1437) —
+  the sm120 collective's own two floors, `K % 128 != 0` (`kTileK`) and
+  `N % 128 != 0` (`kScaleBlockN`), with `N=576` in the REFUSED half rather than
+  the accepted one. The shapes that must NOT be refused are the target
+  checkpoint's `q_proj` `N=12288, K=5120`, its transpose, and `N=128, K=128`.
+  The `% 16` floor is asked FIRST although `% 128` is stricter, because the two
+  answer to different authorities — `% 16` is vLLM's own reroute line
+  (`_custom_ops.py`, `cutlass_compatible_b`) and `% 128` is CUTLASS's sm120
+  line, which vLLM never reaches because it never asks — and each message names
+  the other, so no answer sends a reader to a shape that is still refused.
 - **G5** the counter's accounting: it advances per config, by one per
   dispatch, on the config the heuristic named; a refusal advances the refusal
   counter and no config counter; and the four counters are read as one
@@ -352,16 +379,43 @@ a hardcoded path would be a second, weaker copy of it.
 with no device, and a skip is not a pass.** The file is registered so that CI
 builds it and a leased box runs it.
 
-- **G2** upstream's `test_w8a8_block_fp8_cutlass_matmul` ported whole:
-  `M=32, N=576, K=7168`, `block_size=[128,128]`, `out_dtype=bf16`, scales
-  `U(0,1) * 1e-2`, compared against **M2's CPU arm on a CPU queue in the same
-  process** with upstream's own criterion, `rel_diff < 0.001`, computed by
-  upstream's own formula. Plus a per-element bound and a vacuity guard, because
-  a mean-relative criterion cannot see a single wrong element and an all-zero
-  output passes any ratio of means.
+- **G2** upstream's `test_w8a8_block_fp8_cutlass_matmul`, `M=32, N=576,
+  K=7168`, `block_size=[128,128]`, `out_dtype=bf16`, scales `U(0,1) * 1e-2`,
+  compared against **M2's CPU arm on a CPU queue in the same process** with
+  upstream's own criterion, `rel_diff < 0.001`, computed by upstream's own
+  formula. Plus a per-element bound and a vacuity guard, because a
+  mean-relative criterion cannot see a single wrong element and an all-zero
+  output passes any ratio of means. **ONE ADAPTATION, forced by the arch and
+  documented at the case** ([#1437](https://github.com/mudler/vllm.cpp/issues/1437)):
+  upstream's `N=576` cannot reach this collective at all, so the case asserts
+  the NAMED REFUSAL for upstream's exact shape — on the host predicate
+  everywhere, and on a device with the message and the counter — and then runs
+  upstream's fixture, criterion and formula on `N=512`, the nearest servable N.
+  Upstream's own test cannot pass on sm120 either: it gates the module only at
+  `get_device_capability() < (9, 0)` (`test_block_fp8.py`), which cc 12.1
+  passes.
+- **G6** the grid's PARTITION against a hand-written `expect` column, not "the
+  arm accepts everything". The old wording is the defect #1437 found: G6 passed
+  while three grid shapes threw. It also asserts that both lanes are non-empty,
+  that the servable half still covers all three tile configs, and that the
+  refused half spans the swapped AND the unswapped path — the last being what
+  makes "the swap is the bug" falsifiable rather than merely unasserted.
+  **The servable half reaches `N = 128`, and that entry is what binds
+  OVER-refusal.** A grid whose every servable `N` is 512 cannot tell 128 from
+  256, because `512 % 256 == 0`: raising `kFp8BlockScaledScaleBlockN` to 256 —
+  a predicate that turns away shapes the collective CAN implement — left this
+  whole file green at `37 | 37 passed`, and only one host-tier boundary
+  assertion caught it. `{200, 128, 1024}` is servable, sits at the collective's
+  own floor of one complete scale block, reuses an `M` already in the sweep so
+  it adds no new `M` behaviour, and fails the moment the predicate refuses more
+  than `can_implement` does. G6 asserts that such an entry EXISTS, so it cannot
+  silently drift out of the grid again.
 - **G7** the M sweep: `M` at 1, 7, 8, 32, 83, 200, 512 against the same
   reference, so all three configs are exercised, with the counter asserted to
-  show the config `Fp8BlockScaledConfigFor` predicted for each.
+  show the config `Fp8BlockScaledConfigFor` predicted for each. Since #1437 the
+  sweep also DRIVES each unservable shape and asserts a named refusal, no
+  dispatch and one counted refusal. It no longer aborts at `Grid()[0]`, which is
+  how seven of eight shapes went unattempted on the first hardware run.
 - **G8** the f32 sink equals the bf16 result cast up, elementwise.
 - **G9** the refusals from §Ragged, on a device, with the message.
 
@@ -416,9 +470,80 @@ builds it and a leased box runs it.
 
   This is a WORSE position than the sentence it replaces, not a better one. The
   row was "unmeasured"; it is now "measured and failing". Tracked by
-  [#1437](https://github.com/mudler/vllm.cpp/issues/1437), which carries the
-  ragged-N hypothesis (N=576 is 4*128+64) and marks it explicitly as a
-  hypothesis that has not been isolated.
+  [#1437](https://github.com/mudler/vllm.cpp/issues/1437).
+
+  **ROOT CAUSE, ISOLATED BY SOURCE, AND THE HOST-SIDE HALF FIXED.** The
+  ragged-N hypothesis is confirmed and it is no longer a hypothesis. CUTLASS's
+  sm120 blockwise collective refuses a shape without complete scale blocks --
+  `include/cutlass/gemm/collective/sm120_mma_tma_blockwise_scaling.hpp`,
+  `can_implement`, three lines that the TMA-alignment checks above them do not
+  imply:
+
+  ```cpp
+  // Ensure complete scale blocks
+  implementable = implementable && (M % ScaleGranularityM == 0);
+  implementable = implementable && (N % ScaleGranularityN == 0);
+  // We expect full tiles in K
+  implementable = implementable && (K % size<2>(TileShape{}) == 0);
+  ```
+
+  The sm90 sibling
+  `sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp` has NO such
+  block -- four `check_alignment` calls and nothing about scale-block
+  completeness -- so this is an sm120 property, not a property of block-wise
+  FP8. Read in CUTLASS 4.5.0, which this tree builds against; the same lines are
+  byte-identical at upstream's pinned `CUTLASS_REVISION "v4.4.2"`, so the
+  version is not the cause and downgrading is impossible anyway
+  (`CMakeLists.txt` requires >= 4.5.0 for the sm120a NVFP4 fp4xfp4 GEMM).
+
+  **The constrained extent is N in all three configs, and the swap does not move
+  it.** The collective reads its granularities off the deduced scale layouts
+  (`ScaleGranularityM = size<0,0>(LayoutSFA)`,
+  `ScaleGranularityN = size<0,0>(LayoutSFB)`, the same file `:129-131`), and
+  `RunBlockwiseGemm` builds the problem shape as `(m,n,k)` unswapped and
+  `(n,m,k)` under swap:
+
+  | config | tile | granularities | problem shape | the lines that bind |
+  |---|---|---|---|---|
+  | default | 128x128x128 | `(1,128,128)` | `(m,n,k)` | `N % 128` -> `n`; `K % 128` -> `k` |
+  | pingpong | 64x128x128 | `(1,128,128)` | `(m,n,k)` | `N % 128` -> `n`; `K % 128` -> `k` |
+  | swapab | 128x32x128 | `(128,1,128)` | `(n,m,k)` | `M % 128` -> `n`; `K % 128` -> `k` |
+
+  So `n` is constrained in every config -- as the collective's N unswapped and
+  as its M under swap -- `m` is constrained in none, and `TileShape_K` is 128 in
+  all three. Same number, different slot. `M=32, N=576, K=7168` takes `swapab`
+  because `M <= 64`, and `576 % 128 = 64` fails `M % ScaleGranularityM`; the
+  unswapped path fails the identical arithmetic one slot over.
+
+  **The defect that was OURS, and is now repaired.** Not the port: the TU
+  matches upstream's `scaled_mm_blockwise_sm120_fp8_dispatch.cuh` at the pin
+  line for line, including both clauses of the heuristic, all three configs and
+  every `conditional_t` switch. The defect is that `Fp8BlockScaledRefusalFor`
+  ACCEPTED these shapes, so the user-visible answer was a raw
+  `cutlass Invalid status` -- a string that names no dimension, no granularity
+  and no architecture -- instead of a refusal that names the missing part, which
+  this project requires of an unimplemented arm. G6 asserted that every shape
+  the file drives is accepted and therefore PASSED while the kernel threw on
+  three of them: the predicate and `can_implement` disagreed, and the
+  precondition agreed with the wrong side. The predicate now carries
+  `kScaleBlockN` (`N % 128 != 0`) and `kTileK` (`K % 128 != 0`); G4 pins both by
+  name and by message on a device-free host, G6 pins the grid's partition, and
+  G2/G7 drive each unservable shape to its named refusal.
+
+  **THIS FIXES THE MESSAGE, NOT THE KERNEL.** The number of shapes on which this
+  kernel's output has been compared with the CPU reference is still ZERO. A user
+  on `sm_12xa` now gets a refusal that says which dimension and which
+  granularity instead of `Invalid`, and that is the whole of the improvement.
+
+  **The capability gap this makes explicit.** DSV3's `kv_a_proj_with_mqa` is
+  `N=576`, and this arm CANNOT serve it on sm120 -- not as a defect of this
+  tree, and not repairable here, until CUTLASS's sm120 collective supports
+  partial scale blocks. A user learns this from three places, and the first is
+  the one they will actually hit: the runtime refusal message, which names
+  `kv_a_proj_with_mqa`, the arithmetic `576 = 4*128 + 64`, the sm90 contrast and
+  this issue. The other two are `docs/USAGE.md`'s block-wise FP8 section and
+  `docs/FEATURES.md`'s block-wise FP8 row. Any model whose block-wise FP8
+  projections are not all multiples of 128 wide is affected the same way.
 
   What remains established is unchanged: the TU compiles for `sm_120a`/`sm_121a`
   and the host-side dispatch decision is correct against upstream's source. What

@@ -1234,7 +1234,7 @@ const char* MoeProjDtypeName(MoeProjDtype dtype) {
   return "unknown";
 }
 
-// THE DENSE ARM'S LADDER, MIRRORED EXACTLY (qwen3_5_dense_weights.cpp:357-359
+// THE DENSE ARM'S LADDER, MIRRORED EXACTLY (qwen3_5_dense_weights.cpp:358-360
 // `IsNvfp4Projection`, :475-484 `load_projection`). See the header for why the
 // order matters and what binds the two in test.
 MoeProjDtype ClassifyQwen3_5Projection(const TensorDtypeProbe& dtype_of,

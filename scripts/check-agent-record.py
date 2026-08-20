@@ -283,7 +283,20 @@ MATRICES = {
     # of rank-1 factors) rather than how one step is tiled, and it adds three cache
     # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
     # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
+    # 53 since 2026-08-19 (#1314): +`KERNEL-DFLASH2-GROUPED-CONV`, the DFlash2
+    # draft's grouped DYNAMIC depthwise convolution. A genuinely new family and
+    # not a variant of `KERNEL-DEPTHWISE-CONV1D`, on all three axes that decide
+    # a kernel's shape: the weights are DYNAMIC (a per-position delta projected
+    # from the sublayer input, added to a static per-channel base) rather than
+    # static, they are GROUPED (one delta per group of channels against one base
+    # per channel) rather than per-channel, and the tap mask is over the QUERY
+    # BLOCK (`i mod (1+k)`) rather than causal over the sequence. It also carries
+    # a SIDE axis no other convolution here has: one projection of the sublayer
+    # input produces both the prepare-side and the finish-side coefficients.
+    # Bumped because the row EXISTS, never to make a state transition pass; the
+    # row is `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # (spec `## Owed` O6, no `nvcc` on the authoring host).
+    "KERNEL": (AGENTS / "kernel-matrix.md", 53),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

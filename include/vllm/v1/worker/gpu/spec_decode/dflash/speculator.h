@@ -40,6 +40,39 @@
 
 namespace vllm::v1 {
 
+// SPEC-DFLASH2 W2 (#1314) — refuse a DFlash2 draft's CANDIDATE SELECTOR BY NAME,
+// after the draft block forward and before anything samples from its logits.
+//
+// This is the boundary W2 leaves the architecture at. A `DFlash2DraftModel` draft
+// now LOADS and its block forward RUNS, grouped dynamic convolution and all
+// (vt::DFlashGroupedConv, wrapped around every attention and MLP sublayer). What
+// it cannot do is CHOOSE: upstream replaces the independent per-slot argmax with
+// a candidate selector -- keep the target head's top-K per slot, score adjacent
+// transitions `<A[p] * project(h), B[c]> + unary[c]`, and walk the best path from
+// the verified anchor (`vllm/model_executor/models/qwen3_dflash2.py`
+// `CandidateSelector` + `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` @
+// vllm-project/vllm#52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`), and
+// none of that exists here.
+//
+// Falling through to `SampleDflashBlockDrafts` instead would SUCCEED and be
+// silent: the per-slot argmax proposes well-formed tokens, the verify is
+// lossless, so the engine still emits the target's tokens and only ACCEPTANCE
+// falls -- the one defect class no token gate in this repository can see. That is
+// why this is a refusal and not a fallback, and why it is placed AFTER the
+// forward: the forward is implemented and gated, the choice is not.
+//
+// Two call sites turn draft logits into draft tokens and both refuse here:
+// `GPUModelRunner::propose_drafts_block` (src/vllm/v1/worker/gpu/runner.cpp) and
+// `DflashProposeBlock` below. Only the FIRST is production. `DflashProposeBlock`
+// has no caller outside `tests/` at this commit -- grep it -- so the refusal that
+// a test can delete-and-redden is the test-reachable one, and the site a user
+// actually arrives through is UNGATED. Entering it needs a runner whose
+// `dflash_weights_` is set, which only the `LoadedModel` construction path does,
+// so a gate on it needs an on-disk target plus draft driven through the loader.
+// That harness is W4's. See `## Owed` O7 of
+// `.agents/specs/dflash2-spec-decode.md`; the refusal itself is owed by W3.
+void RefuseDflash2CandidateSelector(const Qwen3DFlashWeights& weights);
+
 // Greedy per-request draft pick over the (1+k) block logits — the greedy branch of
 // DFlash sample_draft (dflash/speculator.py:_generate_draft :259-273 with
 // temperature 0 => argmax). `block_logits` is the ForwardBlockLogitsWithContext

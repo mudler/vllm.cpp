@@ -3123,6 +3123,46 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
       args);
 }
 
+void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                       const Tensor& base, const DFlashGroupedConvArgs& args) {
+  VT_CHECK(args.taps >= 1 && args.num_groups >= 1 && args.group_size >= 1,
+           "dflash2-grouped-conv: taps/num_groups/group_size must be >= 1");
+  VT_CHECK(args.block_size >= 1, "dflash2-grouped-conv: block_size must be >= 1 (1 + k)");
+  VT_CHECK(x.rank == 2 && out.rank == 2, "dflash2-grouped-conv: x/out must be rank-2 [T,H]");
+  VT_CHECK(coefficients.rank == 4,
+           "dflash2-grouped-conv: coefficients must be rank-4 [T,sides,taps,num_groups]");
+  VT_CHECK(base.rank == 3, "dflash2-grouped-conv: base must be rank-3 [sides,taps,H]");
+  const int64_t t = x.shape[0];
+  const int64_t h = args.num_groups * args.group_size;
+  const int64_t sides = coefficients.shape[1];
+  VT_CHECK(x.shape[1] == h,
+           "dflash2-grouped-conv: x hidden must be num_groups*group_size");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == h,
+           "dflash2-grouped-conv: out must be [T,H] matching x");
+  VT_CHECK(coefficients.shape[0] == t && coefficients.shape[2] == args.taps &&
+               coefficients.shape[3] == args.num_groups,
+           "dflash2-grouped-conv: coefficients must be [T,sides,taps,num_groups]");
+  VT_CHECK(base.shape[0] == sides && base.shape[1] == args.taps && base.shape[2] == h,
+           "dflash2-grouped-conv: base must be [sides,taps,H] with the coefficients' sides");
+  VT_CHECK(args.side >= 0 && args.side < sides,
+           "dflash2-grouped-conv: side must index the sides dimension "
+           "(0 = prepare, 1 = finish)");
+  // ONE dtype across all four. The rounding after each step is what makes the
+  // CPU reference and the CUDA kernel bit-identical, and a mixed set would make
+  // "the dtype" ambiguous rather than merely inconvenient.
+  VT_CHECK(IsFloat(x.dtype) && coefficients.dtype == x.dtype && base.dtype == x.dtype &&
+               out.dtype == x.dtype,
+           "dflash2-grouped-conv: x/coefficients/base/out must share one float dtype");
+  VT_CHECK(x.IsContiguous() && coefficients.IsContiguous() && base.IsContiguous() &&
+               out.IsContiguous(),
+           "dflash2-grouped-conv: contiguous tensors required");
+  VT_CHECK(x.device == q.device && coefficients.device == q.device &&
+               base.device == q.device && out.device == q.device,
+           "dflash2-grouped-conv: device mismatch (x/coefficients/base/out/queue)");
+  reinterpret_cast<DFlashGroupedConvFn>(GetOp(OpId::kDFlashGroupedConv, q.device.type))(
+      q, out, x, coefficients, base, args);
+}
+
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3,

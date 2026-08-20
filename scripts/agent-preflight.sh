@@ -89,6 +89,7 @@ CHECKERS=(
   check-windows-release-state
   check-container-matrix
   check-container-workflow
+  check-build-runtime-deps
   check-role-discipline
   claim-view
   check-readme-structure
@@ -122,6 +123,7 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_check_build_runtime_deps
   test_validate_container_image
   test_release_index
   test_release_metadata

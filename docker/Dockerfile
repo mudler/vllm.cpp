@@ -32,6 +32,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 # `file`, `readelf` and `ldd` are not conveniences: the release scripts end in
 # validate-release-archive.py, which refuses to certify an archive it cannot
 # inspect. Without them the build fails late, after a full compile.
+#
+# `libssl-dev` is the BUILD half of the HuggingFace fetch, and its absence is
+# issue #1517. CMakeLists.txt:2440-2482 runs `find_package(OpenSSL)` and, when
+# it fails, DOWNGRADES: a warning, `VLLM_CPP_HF_DOWNLOAD` set OFF, and a green
+# build that ships a server which cannot speak https. Nothing else in the image
+# notices, because the runtime stage's `libssl3` is a runtime library and a
+# binary that never linked it does not need it. Every image this file produced
+# between #1280 and #1517 was in that state.
 RUN apt-get update && apt-get install --yes --no-install-recommends \
       binutils \
       build-essential \
@@ -40,6 +48,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       curl \
       file \
       git \
+      libssl-dev \
       ninja-build \
       python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -74,6 +83,11 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
 
 FROM ${CUDA_BUILDER_BASE} AS builder-cuda
 ARG DEBIAN_FRONTEND=noninteractive
+# This list is builder-toolchain's, repeated because the CUDA base is not
+# ubuntu:24.04 and cannot inherit it. `libssl-dev` carries the same #1517
+# reason: the CUDA lane resolves the same `find_package(OpenSSL)` and takes the
+# same silent downgrade without it. Keep the two lists in step; the two are what
+# `scripts/check-build-runtime-deps.py` reads.
 RUN apt-get update && apt-get install --yes --no-install-recommends \
       binutils \
       build-essential \
@@ -82,6 +96,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       curl \
       file \
       git \
+      libssl-dev \
       ninja-build \
       python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -172,12 +187,22 @@ RUN set -eux; mkdir -p /cudart; \
 
 FROM ${UBUNTU_BASE} AS runtime-base
 ARG DEBIAN_FRONTEND=noninteractive
-# libssl3 is what `--model org/repo` needs: the server links libssl/libcrypto for
-# the HuggingFace fetch (ENG-HF-MODEL-DOWNLOAD, #1280) and `huggingface.co`
-# speaks nothing but https. `ca-certificates` below was already here and is the
-# other half: without a trust store the handshake fails even with the library
-# present. `scripts/validate-container-image.py` boots this image against an
-# unknown repository and requires an HTTP STATUS FROM THE HUB, which is the only
+# libssl3 is HALF of what `--model org/repo` needs, and shipping only this half
+# is issue #1517. It is the RUNTIME library the server loads; the server only
+# links libssl/libcrypto if `libssl-dev` was present in the BUILDER stage when
+# CMake ran `find_package(OpenSSL)`, and until #1517 no builder stage here had
+# it. An image can therefore carry libssl3 while its `vllm-server` names only
+# libstdc++, libm, libgcc_s and libc, which is what `ldd` reported for every
+# image this file produced between #1280 and #1517.
+#
+# So the guarantee is a PAIR, and both halves are now written down: this line,
+# and `libssl-dev` in builder-toolchain and builder-cuda above.
+# `scripts/check-build-runtime-deps.py` refuses a Dockerfile that carries one
+# without the other, because nothing else in the tree relates them.
+# `ca-certificates` below was already here and is the third part: without a
+# trust store the handshake fails even with the library linked.
+# `scripts/validate-container-image.py` boots this image against an unknown
+# repository and requires an HTTP STATUS FROM THE HUB, which is the only
 # assertion that separates a working TLS build from one where the option
 # silently resolved OFF. Measured 20 August 2026: the live hub answers 401, not
 # 404, for an unknown repository asked anonymously.

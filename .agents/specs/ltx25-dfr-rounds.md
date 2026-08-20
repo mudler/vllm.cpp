@@ -436,6 +436,32 @@ CPU only, no GPU lease (§0.5). `Release`, `VLLM_CPP_CUDA=OFF`, `compile_err=0`.
 - `test_ltx2_video` alone: **102 cases / 4141 assertions / 0 failed**, exit 0.
 - `scripts/agent-preflight.sh` — exit 0.
 
+**Re-gated 2026-08-20 after the review repair, on the merge of `origin/main`
+`aee6c48d6`** (`Release`, `VLLM_CPP_CUDA=OFF`, full `ninja` with 0 `FAILED:`
+lines and `compile_err=0`):
+
+- `ctest -j4 -E "test_ltx2_video|test_capi"` — **572/572 passed, 0 failed**, the
+  same 3 skipped, 48.21 s.
+- `ctest -R "test_ltx2_video|test_capi"` serially — **2/2 passed**, 30.91 s, at
+  loadavg 9.9.
+- `test_ltx2_video` alone: **102 cases / 4170 assertions / 0 failed**, exit 0.
+  The 29 new assertions are the four per-tile guarantees; the case count is
+  unchanged at 102 because the new subcase joins an existing `TEST_CASE`.
+- `scripts/agent-preflight.sh` and `--staged` — exit 0.
+
+**One test in this file is load-dependent and it is not this row's**, filed as
+[#1494](https://github.com/mudler/vllm.cpp/issues/1494): `ltx2 video: the three
+carrying phases contain their work and the load keeps its order` compares a
+95% wall-clock coverage ratio at `test_ltx2_video.cpp:3696`, sibling to the one
+[#1439](https://github.com/mudler/vllm.cpp/issues/1439) already tracks at
+`:3259`. Five consecutive runs of ONE binary with no source change, at loadavg 17
+to 19, read 99.28%, 95.46%, **94.90% RED**, 98.77% and 98.35% — four green and
+one red. The polarity is the instrument, not the code: the three runs that passed
+comfortably are the runs where `denoise` took 0.037 s, 0.025 s and 0.016 s, and
+the run that reded is the one where it took 0.0049 s. The un-named residue is
+about 0.00025 s in every one of them, so the RATIO moves with the leaf while the
+residue does not, and at fixture scale the floor sits inside the scatter.
+
 **The refactor's floor is the 101 pre-existing cases in `test_ltx2_video`, not
 the 6 new ones.** Every pipeline kind now runs through the new seam, and all of
 them are unchanged in what they assert. Two record gates went red and were

@@ -1321,9 +1321,14 @@ TEST_CASE("dflash2 selector: the SCALARS reweight the lattice against the codebo
     // The SCORES always move; whether the ORDER moves is the question below.
     CHECK(sp.edge_scores != sm.edge_scores);
     const int flips = count_flips(sp, sm);
+    // The per-block INFO stays live for the precondition CHECKs below, which are
+    // in this same scope. It used to be followed by `CHECK(flips >= 0)`, which
+    // asserted nothing an `int` counter could ever violate and existed only to
+    // give the INFO something to attach to; the assertion that carries the block
+    // is `count_flips(sp, sp) == 0` below, and the ones that carry the sweep are
+    // the aggregate floors after the loop.
     INFO("anchor ", blk.anchor, " argmax flips ", flips, " of ",
          sp.num_steps * sp.top_k);
-    CHECK(flips >= 0);
     total_flips += flips;
     total_slots += static_cast<int>(sp.num_steps * sp.top_k);
     if (flips > 0) ++blocks_that_flipped;

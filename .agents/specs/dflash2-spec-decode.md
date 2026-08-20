@@ -606,6 +606,20 @@ list items.
      stale again at W4 and at W5; deleting it is what stops that, and rewording
      it would not have. What stays owed is that the geometry line itself is
      witnessed by no gate. Its cost is a missing diagnostic, not a wrong answer.
+
+     **The deletion NARROWED the discriminator, and W3's second fresh review is
+     right that this is worth writing down.** The two notices never shared a
+     trigger. `CheckDflash2DraftArm` classifies on the `architectures` list
+     containing `DFlash2DraftModel`
+     (`include/vllm/config/speculative.h:133`), while the deleted loader line
+     fired on `Qwen3DFlashWeights::IsDflash2()`, which is `conv_taps > 0`
+     (`include/vllm/model_executor/models/qwen3_dflash.h:216`). So a safetensors
+     draft that carries the convolution tensors but does NOT declare the
+     architecture gets no startup notice where it previously got one. That is a
+     lost diagnostic and not an unwarned user: `RefuseDflash2PathWalk` is keyed
+     to `IsDflash2()` too and still refuses such a draft BY NAME at its first
+     propose, and upstream selects the speculator by architecture as well, so a
+     checkpoint in that shape is out of contract on both sides.
   3. `shared.LoadInto(&…embed_tokens, &…lm_head, &…lm_head_dequantized)` — the
      wiring that gives D12's `RefuseQuantizedDflash2LmHead` its trigger. **Found
      by mutation and not by reading, and REPAIRED STRUCTURALLY.** Deleting the
@@ -623,23 +637,36 @@ list items.
      rather than a green run. This removes the mutation's shape rather than
      adding a test, because any test that could catch it would first have to
      reach the ungated function this entry exists to record.
-- **O6 — the CUDA arm of `vt::DFlashGroupedConv` is UNVERIFIED.** Owner: this
-  row, discharged by the operator's GPU lease before W6. Issue
-  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). The kernel and its
-  registration are written and reviewed
-  (`src/vt/cuda/cuda_ops.cu`, `DFlashGroupedConvKernel` /
-  `DFlashGroupedConvKernelCuda`), and the CUDA==CPU bit-identity case exists and
-  is written to run
+- **O6 — DISCHARGED on 2026-08-20 by the operator's lease. The CUDA arm of
+  `vt::DFlashGroupedConv` COMPILES AND RUNS.** Evidence:
+  [#1489](https://github.com/mudler/vllm.cpp/issues/1489), an `rc` job on
+  `dgx:gpu0` (GB10, sm_121a, `nvcc` 13.0 matched to the driver) against this
+  row's W3 head `b29b6f8869a9eeacc451647e859498491ef6bf1e`. That run reports
+  `BUILD_RC=0` and `COMPILE_ERRORS=0` for `test_ops_dflash2_grouped_conv`,
+  `test_ops_dflash2_selector_edges`, `test_ops_topk_values_indices`,
+  `test_qwen3_dflash2_draft`, `test_dflash2_runner_reach` and
+  `test_dflash2_walk_refusal`, and — the precondition that makes a green a result
+  rather than a skip wearing a pass — **zero `no CUDA backend; skipping` lines
+  across every suite**. The grouped convolution's CUDA==CPU bit-identity case is
+  one of the five suites that passed. The per-suite counts live in #1489; this
+  entry does not restate numbers it did not take.
+
+  The struck text below is what this entry said before that run, kept because the
+  reason it existed is what a later reader needs. ~~The kernel and its
+  registration are written and reviewed (`src/vt/cuda/cuda_ops.cu`,
+  `DFlashGroupedConvKernel` / `DFlashGroupedConvKernelCuda`), and the CUDA==CPU
+  bit-identity case exists and is written to run
   (`tests/vt/test_ops_dflash2_grouped_conv.cpp`, six shapes covering both
-  published blocks in bf16 and the modulo arm in f32). It has NEVER COMPILED:
-  the authoring host has no `nvcc`, so the CUDA case reports
-  `no CUDA backend; skipping CUDA dflash2-grouped-conv parity` and every one of
-  the file's assertions runs on CPU. Two specific things are unproven rather than
-  merely unrun: that the kernel compiles at all, and that
-  `__fadd_rn`/`__fmul_rn` plus `ResRound` reproduce the CPU reference BIT-FOR-BIT
-  on the f32 arm, where the intrinsics are the only thing forbidding an FMA
-  contraction the CPU build pins off. This is named here rather than reported as
-  a pass.
+  published blocks in bf16 and the modulo arm in f32). It has NEVER COMPILED: the
+  authoring host has no `nvcc`, so the CUDA case reports `no CUDA backend;
+  skipping CUDA dflash2-grouped-conv parity` and every one of the file's
+  assertions runs on CPU. Two specific things are unproven rather than merely
+  unrun: that the kernel compiles at all, and that `__fadd_rn`/`__fmul_rn` plus
+  `ResRound` reproduce the CPU reference BIT-FOR-BIT on the f32 arm, where the
+  intrinsics are the only thing forbidding an FMA contraction the CPU build pins
+  off.~~ Both are now measured. The authoring host still has no `nvcc`, so the
+  CUDA case still reports `no CUDA backend; skipping` HERE; that is a property of
+  this box and no longer of the kernel.
 
   **What the wave's second fresh review corrected here.** The sentence above used
   to read "the file's 9410 assertions are all CPU". That was true and still read
@@ -751,26 +778,84 @@ list items.
   no-op and is not refused). Gated in
   `tests/vllm/models/test_qwen3_dflash2_draft.cpp`. The cost is bounded and
   named: a checkpoint that sets it does not load, rather than loading wrong.
-- **O10 — the CUDA arms of `vt::Dflash2SelectorEdges` and
-  `vt::TopKValuesIndices` are UNVERIFIED.** Owner: this row, discharged by the
-  operator's GPU lease before W6. Issue
-  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Same shape as O6 and
-  the same host: both kernels and both registrations are written, and both
-  parity cases exist and are written to run
+- **O10 — MOSTLY DISCHARGED on 2026-08-20, and what remains is ONE MEASURED
+  DIVERGENCE with its own issue.** Owner: this row for the record;
+  [#1489](https://github.com/mudler/vllm.cpp/issues/1489) owns the kernel change.
+  Row issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  The operator's `rc` job on `dgx:gpu0` (GB10, sm_121a, `nvcc` 13.0) ran both
+  arms at W3 head `b29b6f8869a9eeacc451647e859498491ef6bf1e`. **The kernels
+  compile** (`BUILD_RC=0`, `COMPILE_ERRORS=0`), **the device arms genuinely ran**
+  (zero `no CUDA backend; skipping` lines; `test_ops_topk_values_indices` reports
+  **562 assertions on device against 202 on the CPU-only build**, so the parity
+  table added 360 and this is not a green skip), and the lattice suite is among
+  the five of six that passed.
+
+  **The tie divergence this entry called "the real risk" did NOT materialise.**
+  The CPU arm sorts under an explicit comparator while the CUDA arm
+  threshold-searches, compacts and fills from the lowest-indexed equals — two
+  different algorithms — and they agree. No tie-row assertion failed: not the
+  group straddling the k-th boundary, not the group larger than k, not the ties
+  inside the kept set, not the `-inf`-saturated row.
+
+  **What DID fail is the NaN row, and this entry has to report it as a failing
+  gate rather than as recorded debt.** `test_ops_topk_values_indices`:
+  `7 cases | 5 passed | 2 failed`, `assertions: 562 | 550 passed | 12 failed`,
+  `Status: FAILURE!`. All twelve failures name the single literal row
+  `"NaN sorts first, as torch.topk does"`. The decisive pair is the direct
+  cross-arm comparison — `CHECK( gpu.indices[i] == cpu.indices[i] )` reading
+  `2 == 1`, and `CHECK( std::isnan(gpu.values[i]) )` reading `false`, at
+  `tests/vt/test_ops_topk_values_indices.cpp:421` and `:424` AS THAT FILE STOOD
+  AT `b29b6f886` (this wave's repair moves both lines, so the numbers are quoted
+  against the commit that produced them and not against the tree) — so it is a
+  genuine backend disagreement and not a wrong expectation on one side.
+
+  The mechanism was derived from the source before those results were read, and
+  they agree with it: `TopKValuesIndicesRowKernel`
+  (`src/vt/cuda/cuda_sample.cu:548-698`, the kernel body) brackets with `fmaxf`/`fminf`, which
+  return the non-NaN operand, and selects survivors with `r[j] > thr`, which is
+  false for a NaN. The kernel therefore CANNOT select a NaN, whatever the
+  threshold converges to.
+
+  **REPAIRED BY NARROWING, not by a spec paragraph.** AGENTS.md `## Gates` says a
+  rule has exactly one result and that a permanent report-only state is not one;
+  a suite that reds on every CUDA build is a failing gate, and recording the
+  divergence while shipping the red assertion was reporting two results at once.
+  So the NaN row is now excluded BY NAME from both device cases
+  (`kNanRowName` / `RunsOnCuda`, `tests/vt/test_ops_topk_values_indices.cpp`) and
+  kept in `LiteralRows()`, because the CPU order IS the guarantee and is
+  mutation-proven. `include/vt/ops.h` states the asymmetry where it states the
+  contract, instead of asserting an ordering no shipped backend delivers. The
+  exclusion's own match count is asserted on the CPU arm — `CpuOnlyRowCount() ==
+  1` — because a filter matching zero rows or every row is invisible on a host
+  with no device, and WHICH row it selects is asserted against the row's own
+  `want_val` holding a NaN rather than against the name string, so the check is
+  not the name compared with itself. Both shapes are mutation-proven: forcing
+  `RunsOnCuda` to `true` gives `7 cases | 6 passed | 1 failed`,
+  `assertions: 210 | 208 passed | 2 failed`, `Status: FAILURE!`, and forcing it
+  to `false` gives `210 | 203 passed | 7 failed`, `Status: FAILURE!`; restored,
+  `7/7` and `210/210`, `Status: SUCCESS!`.
+
+  **What is OWED, and to whom.** #1489 owns reconciling
+  `TopKValuesIndicesRowKernel` to the NaN-first contract, which is what makes
+  `include/vt/ops.h` true on both arms and lets the row go back into the device
+  cases. It needs a lease to verify and is not attempted from a host without
+  `nvcc`. The cost of leaving it is bounded and named: no shipped path feeds this
+  op a NaN logit — the candidate values come from a target LM head — so the gap
+  is in the contract's reach and not in any output a user can obtain.
+
+  ~~Same shape as O6 and the same host: both kernels and both registrations are
+  written, and both parity cases exist and are written to run
   (`tests/vt/test_ops_dflash2_selector_edges.cpp`,
   `tests/vt/test_ops_topk_values_indices.cpp`), but the authoring host has no
   `nvcc`, so neither has ever compiled and both report `no CUDA backend;
-  skipping`.
-
-  Two things are unproven per kernel rather than merely unrun. For the lattice:
-  that it compiles at all, and that the warp-shuffle contraction lands inside the
-  1e-4 relative envelope the case asserts at rank 256. For the top-k: that it
-  compiles at all, and — the real risk — that its TIE handling agrees with the
-  CPU reference. The CPU arm sorts under an explicit comparator; the CUDA arm
-  finds a threshold, compacts everything strictly above it, then fills the
-  remaining slots with the lowest-indexed elements EQUAL to it, dropping the
-  value when that group is exhausted. Those are two different algorithms reaching
-  for one answer, and only a run can say they do.
+  skipping`. Two things are unproven per kernel rather than merely unrun. For the
+  lattice: that it compiles at all, and that the warp-shuffle contraction lands
+  inside the 1e-4 relative envelope the case asserts at rank 256. For the top-k:
+  that it compiles at all, and — the real risk — that its TIE handling agrees
+  with the CPU reference.~~ All of that is now measured. The authoring host still
+  has no `nvcc` and still prints `no CUDA backend; skipping` for both cases; that
+  is a property of this box.
 
   **W3's fresh review proved this entry's own MITIGATION false, and the
   mitigation is now real.** O10 used to end "the hand-written tie cases in the
@@ -800,7 +885,9 @@ list items.
   catch — and the parity case asserts the two arms against each other over the
   same table plus the four bulk shapes, which cover the bracket at widths the
   literals do not reach and say nothing about ties. Both still report
-  `no CUDA backend; skipping` here.
+  `no CUDA backend; skipping` on this host, and both RAN on the GB10 under #1489:
+  the tie rows agreed and only the NaN row did not, which is why that one row is
+  now the only member of the table the device cases skip.
 
   **Two more top-k divergence modes this entry did not name, both found by
   reading the kernels rather than running them.**
@@ -816,11 +903,14 @@ list items.
     the fix: the row returned indices `{2, 1, 3}` where the contract is
     `{1, 2, 3}`). No shipped path feeds this op a NaN logit, so the row is
     synthetic in the same sense the padding row is. **The CUDA arm is NOT
-    reconciled to it and the table row is expected to DIVERGE there**: `fmaxf` /
-    `fminf` return the non-NaN operand and `r[j] > thr` is false for a NaN, so
-    the threshold search cannot select one. That divergence is owed to the same
-    lease as the rest of this entry, and it is written down here rather than
-    hidden by leaving the CPU side undefined too.
+    reconciled to it, and the divergence is now MEASURED rather than expected**:
+    `fmaxf` / `fminf` return the non-NaN operand and `r[j] > thr` is false for a
+    NaN, so the threshold search cannot select one, and #1489's device run failed
+    twelve assertions on exactly that row. The prediction was right and the
+    posture that followed it was not: this entry recorded the divergence and then
+    left the assertion in both device cases, which ships a red suite on every
+    CUDA build. The device cases now skip the row by name and #1489 owns the
+    kernel change; see the head of this entry.
   - **Silent truncation in the CUDA compaction**, which is a different failure
     from a tie disagreement. `TopKValuesIndicesRowKernel` compacts survivors with
     `const int slot = atomicAdd(&sh_count, 1);` and writes only `if (slot < k)`;
@@ -829,8 +919,10 @@ list items.
     k-th largest inside `kThreshMaxIter` (64). If it did not, the extras are
     dropped in nondeterministic atomic order, so the failure is intermittent and
     row-dependent rather than reproducible — the shape hardest to attribute once
-    a GPU is finally available. Nothing here can measure it; naming it is what
-    this entry can do.
+    a GPU is finally available. #1489's run did not exhibit it — every bulk shape
+    and every non-NaN literal row matched — which is evidence that the bracket
+    converged inside `kThreshMaxIter` on those shapes and not that the drop
+    cannot happen. Naming it is still what this entry can do.
 
 
 ## Now
@@ -860,9 +952,11 @@ groups and can hold more than k members; something has to choose among equals,
 and choosing differently reorders the selector's candidate slots and moves
 acceptance without raising anything. The order is descending value, ties by
 ascending index — `torch.topk`'s CPU order and what FlashInfer's
-`deterministic=True` exists to provide — and three hand-written cases pin it,
-including a tie group STRADDLING the k-th boundary, which is the one the search
-actually has to resolve.
+`deterministic=True` exists to provide — and hand-written rows pin it, including
+a tie group STRADDLING the k-th boundary, which is the one the search actually
+has to resolve. A GB10 has now run those rows on the device arm too and they
+agree (#1489); the ONE row of that table the two arms do not share is NaN
+ordering, which the CUDA kernel cannot produce and which #1489 owns.
 
 **The REFUSAL moved again, and the duplicate that made W2's O7 possible is
 gone.** `RefuseDflash2CandidateSelector` is retired. Both propose paths —
@@ -991,19 +1085,64 @@ DFlash2 line in that function — the `lm_head_dequantized` carry — was ungate
 too, and is now a compile error to delete rather than a mutation the inventory
 has to cover.
 
+**The repair delta adds three mutations of its own and removes one vacuous
+assertion.** Reverting the NaN comparator still reds the CPU literal case
+(counts above). Forcing the device-case exclusion `RunsOnCuda` to `true` reds it,
+and forcing it to `false` reds it — a filter that matched nothing would put the
+NaN row back on a device that cannot answer it, and one that matched everything
+would leave both device cases asserting nothing, and neither shape can fail on a
+host with no `nvcc`, so both are asserted on the CPU arm. Every arm printed
+`compile_rc=0`, every mutation printed its MATCH COUNT before the build, and
+every source was restored `sha256`-verified. The removal is
+`CHECK(flips >= 0)` in `test_qwen3_dflash2_draft.cpp`, which no `int` counter
+could violate and which existed only to give a doctest `INFO` something to attach
+to; the INFO is scoped to the block and stays live for the per-block
+`count_flips(sp, sp) == 0` precondition below it. Putting the five copies back
+moves that suite from `26 cases / 232 assertions` to `26 / 237`, all passing,
+which is what shows the deletion took those five and nothing else.
+
+**THE KERNELS HAVE NOW RUN ON A DEVICE, and one row of one table disagreed.**
+The operator took a lease on `dgx:gpu0` (GB10, sm_121a, `nvcc` 13.0) and ran the
+DFlash2 suites at this row's W3 head `b29b6f886`:
+[#1489](https://github.com/mudler/vllm.cpp/issues/1489). `BUILD_RC=0`,
+`COMPILE_ERRORS=0`, and — the precondition without which a green proves nothing
+here — **zero `no CUDA backend; skipping` lines**, with
+`test_ops_topk_values_indices` reporting 562 device assertions against 202 on the
+CPU-only build. **O6 is DISCHARGED**: W2's convolution and both W3 ops compile,
+and five of the six suites pass. **The tie divergence O10 called the real risk
+did NOT materialise** — the straddling group, the group larger than k, the ties
+inside the kept set and the `-inf`-saturated row all agree across the two
+algorithms.
+
+**What failed is NaN ordering, and it is repaired by NARROWING the gate rather
+than by recording the divergence again.** `test_ops_topk_values_indices` read
+`7 cases | 5 passed | 2 failed`, `assertions: 562 | 550 passed | 12 failed`,
+`Status: FAILURE!`, every one of the twelve on the literal row
+`"NaN sorts first, as torch.topk does"`, including the direct cross-arm pair
+`gpu.indices[i] == cpu.indices[i]` reading `2 == 1`. The CUDA arm cannot select a
+NaN at all: `TopKValuesIndicesRowKernel`'s bracket uses `fmaxf`/`fminf`, which
+return the non-NaN operand, and its survivor pass tests `r[j] > thr`, which is
+false for a NaN. So W3 shipped a suite that reds on any CUDA build, while
+`include/vt/ops.h` asserted an ordering no shipped backend delivers — two results
+for one rule, which AGENTS.md `## Gates` does not permit. The row is now excluded
+BY NAME from both device cases and kept on the CPU arm where it is the
+guarantee; `ops.h` states the asymmetry beside the contract; and #1489 owns
+reconciling the kernel, which needs a lease and is not attempted from a host with
+no `nvcc`. Nothing a user can obtain changes: no shipped path feeds this op a NaN
+logit.
+
 **Owed, and none of it is a claim wearing a pass.** O5 (`LoadDflashDraft` carries
 TWO ungated DFlash2 lines, not one — `conv_block_size = k + 1` and the
 conv-geometry notice — because the new harness enters through the in-memory
 overload and bypasses that function by construction; its third line, the
 `lm_head_dequantized` carry, was ungated as well and is now structurally
-undeletable), O6 (the convolution's CUDA arm has never compiled), O9
-(`input_embedding_scale` is REFUSED rather than implemented, because no published
-checkpoint can reach an implementation and a silent omission is the defect class
-this row exists to remove), and O10 (both W3 CUDA arms have never compiled; the
-top-k's TIE handling is two different algorithms reaching for one answer and only
-a run can say they agree — and the literal tie rows now RUN on the device arm,
-which they could not before, plus two divergence modes the entry did not name:
-NaN ordering and the compaction's silent truncation).
+undeletable, and deleting the notice narrowed the startup discriminator from
+`conv_taps > 0` to the declared architecture), O9 (`input_embedding_scale` is
+REFUSED rather than implemented, because no published checkpoint can reach an
+implementation and a silent omission is the defect class this row exists to
+remove), and O10 (reduced to ONE measured item: the CUDA top-k does not order NaN
+first, owned by #1489, with the compaction's silent `slot >= k` truncation still
+named and still unexhibited). O6 is DISCHARGED.
 
 **One user-facing message in the loader said the opposite of the other, and the
 stale one named W3.** `LoadDflashDraft` still appended "the candidate selector is
@@ -1028,22 +1167,34 @@ under a comment claiming the generator repeats values at that width. It does not
 shapes hold 513/513, 128/128, 200/200 and 64/64 DISTINCT values per row, with the
 k-th largest at multiplicity 1 everywhere, and the bulk-sort case's `{5,257,16}`
 is the same. The literals now live in one `LiteralRows()` table that BOTH arms
-iterate, and both assert the literals rather than each other, because two
-implementations agreeing on a wrong tie rule is exactly what asserting one
-against the other cannot catch.
+iterate — the CUDA arm skipping the single NaN row it does not implement — and
+both assert the literals rather than each other, because two implementations
+agreeing on a wrong tie rule is exactly what asserting one against the other
+cannot catch. #1489 then RAN that table on a GB10, which is the run this
+paragraph was written in anticipation of: the tie rows agreed.
 
 **And the CPU comparator was undefined behaviour on a NaN row.**
 `if (src[a] != src[b]) return src[a] > src[b]; return a < b;` makes NaN compare
 EQUIVALENT to every value while those values are not equivalent to each other —
 an intransitive equivalence, which is not a strict weak ordering and is UB in
-`std::partial_sort` rather than a merely surprising answer. NaN now sorts FIRST,
-which is `torch.topk(largest=True)`'s own order, and a table row pins it: before
-the fix that row returned `{2, 1, 3}` where the contract is `{1, 2, 3}`, 7 cases /
-1 failed, 199 assertions / 2 failed, `Status: FAILURE!`; after it, 7/7 and
-202/202, `Status: SUCCESS!`. No shipped path feeds this op a NaN logit, so the
-row is synthetic in the sense the padding row is. The CUDA arm is NOT reconciled
-to it and is expected to diverge there — recorded in O10 beside the compaction's
-silent `slot >= k` truncation, a second divergence mode that entry did not name.
+`std::partial_sort` rather than a merely surprising answer. NaN now sorts FIRST
+on the CPU arm, which is `torch.topk(largest=True)`'s own order, and a table row
+pins it: before the fix that row returned `{2, 1, 3}` where the contract is
+`{1, 2, 3}`. **The red-before COUNTS W3 first recorded here were wrong**, and the
+wave's fresh review could not reproduce them: the entry said
+`199 assertions / 2 failed`, and reverting the comparator at `b29b6f886` gives
+`7 cases | 6 passed | 1 failed`, `assertions: 202 | 198 passed | 4 failed`,
+`Status: FAILURE!`. Both numbers were wrong; the qualitative claim was not.
+RE-MEASURED in the repair delta, which adds eight CPU assertions of its own, one
+build directory on the CI recipe, x86_64, `compile_rc=0` on every arm and the
+source restored `sha256`-verified: with the comparator reverted,
+`7 cases | 6 passed | 1 failed`, `assertions: 210 | 206 passed | 4 failed`,
+`Status: FAILURE!`, all four `logged: row "NaN sorts first, as torch.topk does"`;
+restored, `7 cases | 7 passed`, `assertions: 210 | 210 passed`,
+`Status: SUCCESS!`. The counts are corrected rather than annotated, because a
+number nobody can reproduce is what the next reader spends a build finding out.
+No shipped path feeds this op a NaN logit, so the row is synthetic in the sense
+the padding row is.
 
 **D9's flip margin was 1 of 9, and it is now 8 of 45.** The half of D9 that
 matters is that the argmax over children FLIPS between the two scalar arms, not

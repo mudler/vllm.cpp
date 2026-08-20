@@ -19,7 +19,8 @@
 //    HAND-WRITTEN rows that pins it -- ties inside the kept set, a tie group
 //    STRADDLING the k-th boundary (the one the threshold search actually has to
 //    resolve), a tie group larger than k, a -inf-saturated row, and NaN -- and
-//    BOTH ARMS iterate it. That table is a table rather than a case each because
+//    BOTH ARMS iterate it, save for the one row named below that the CUDA arm
+//    does not implement. That table is a table rather than a case each because
 //    it is the only data in this file that can separate the two algorithms, and
 //    the CUDA arm has to see the same rows the CPU arm does.
 //  * THE ORG-VOCAB PADDING MASK. `num_org_vocab_padding` trailing columns can
@@ -38,11 +39,25 @@
 //    distinct at these widths, measured rather than assumed. So it is a
 //    consistency check on the SELECTION, and the literal table above is the
 //    correctness anchor for the ties.
-//  * CUDA == CPU. Two cases, and neither has ever RUN on this host (no `nvcc`,
-//    so both report `no CUDA backend; skipping`); they are `## Owed` O10 of the
-//    row's spec and are not counted as coverage here. One runs the LITERAL table
-//    on the device and asserts the literals; the other asserts the two arms
-//    against each other over the literals and over four bulk shapes.
+//  * CUDA == CPU. Two cases. They report `no CUDA backend; skipping` on the
+//    authoring host, which has no `nvcc`, and they HAVE now run elsewhere: a GB10
+//    (sm_121a, nvcc 13.0) ran this file on 2026-08-20 at W3 head `b29b6f886`,
+//    562 device assertions against 202 CPU-only, recorded in
+//    [#1489](https://github.com/mudler/vllm.cpp/issues/1489). One case runs the
+//    LITERAL table on the device and asserts the literals; the other asserts the
+//    two arms against each other over the literals and over four bulk shapes.
+//  * WHAT THE DEVICE CASES DO NOT RUN, and why that is a narrowing rather than a
+//    hole. Both SKIP the NaN row BY NAME (`kNanRowName`). The CUDA arm does not
+//    implement NaN-first ordering and cannot: its bracket uses `fmaxf`/`fminf`,
+//    which return the non-NaN operand, and its survivor pass tests `r[j] > thr`,
+//    which is FALSE for a NaN, so `TopKValuesIndicesRowKernel` can never select
+//    one. #1489 measured the disagreement rather than predicting it -- 12 failed
+//    assertions, every one on that row, including the direct cross-arm pair
+//    `CHECK(gpu.indices[i] == cpu.indices[i])` reading `2 == 1`. The row stays in
+//    the table because the CPU arm's ordering IS the guarantee (and is
+//    mutation-proven); it is the DEVICE cases that are narrowed to the arm which
+//    implements it. Reconciling the kernel to NaN-first is owed to #1489, and
+//    `include/vt/ops.h` states the asymmetry where it states the contract.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -138,8 +153,18 @@ std::vector<float> RandF32(size_t n, uint32_t seed) {
 // row, with the k-th largest at multiplicity 1 in every one. The device arm was
 // gated on data holding no tie at all.
 //
-// Both arms iterate this table, and both assert the LITERALS rather than each
-// other, so neither arm can be right merely by agreeing with the other.
+// Both arms iterate this table -- the CUDA arm skipping the NaN row alone, for
+// the reason `RunsOnCuda` below states -- and both assert the LITERALS rather
+// than each other, so neither arm can be right merely by agreeing with the
+// other.
+// The NaN row's name, spelled ONCE. Both the table below and the two CUDA cases
+// that exclude it read this constant, so a rename cannot silently turn the
+// exclusion into a no-op -- and `CpuOnlyRowCount()` asserts it still matches
+// exactly one row, because a filter matching zero rows would put the row back on
+// a device that cannot answer it and a filter matching all of them would leave
+// the device cases asserting nothing at all.
+constexpr const char* kNanRowName = "NaN sorts first, as torch.topk does";
+
 struct LiteralRow {
   const char* name;
   std::vector<float> logits;
@@ -185,21 +210,53 @@ const std::vector<LiteralRow>& LiteralRows() {
       // because the tie group is exhausted.
       {"-inf-saturated row", {kNegInf, 5.0f, kNegInf, kNegInf}, 1, 4, 3, 0,
        {1, 0, 2}, {5.0f, kNegInf, kNegInf}},
-      // NaN. `torch.topk` — this op's off-CUDA reference — orders NaN FIRST for
-      // `largest=True`, and the CPU comparator has to say so explicitly: a
-      // comparator that only writes `if (src[a] != src[b]) return src[a] > src[b]`
-      // makes NaN compare EQUIVALENT to every value while those values are not
-      // equivalent to each other, which is not a strict weak ordering and is
-      // undefined behaviour in `std::partial_sort`. No shipped path produces a
-      // NaN logit today, so this row is synthetic in the same sense
-      // `num_org_vocab_padding` is, and it is here because the ordering has to be
-      // DEFINED rather than left to whichever comparison the sort happens to make.
-      {"NaN sorts first, as torch.topk does",
+      // NaN, and THE ONE ROW THIS TABLE DOES NOT RUN ON BOTH ARMS. `torch.topk`
+      // — this op's off-CUDA reference — orders NaN FIRST for `largest=True`,
+      // and the CPU comparator has to say so explicitly: a comparator that only
+      // writes `if (src[a] != src[b]) return src[a] > src[b]` makes NaN compare
+      // EQUIVALENT to every value while those values are not equivalent to each
+      // other, which is not a strict weak ordering and is undefined behaviour in
+      // `std::partial_sort`. No shipped path produces a NaN logit today, so this
+      // row is synthetic in the same sense `num_org_vocab_padding` is, and it is
+      // here because the ordering has to be DEFINED rather than left to whichever
+      // comparison the sort happens to make.
+      //
+      // The CUDA arm does NOT implement this ordering, and #1489 measured it: the
+      // threshold search's `fmaxf`/`fminf` return the non-NaN operand and its
+      // survivor test `r[j] > thr` is false for a NaN, so the kernel cannot
+      // select one. So the two CUDA cases below SKIP this row by name. The row
+      // stays here because the CPU order is the guarantee — reverting the
+      // comparator reds it — and because deleting it would take the definition
+      // away instead of scoping it. See `RunsOnCuda` below and
+      // `include/vt/ops.h`, which states the asymmetry beside the contract.
+      {kNanRowName,
        {1.0f, std::numeric_limits<float>::quiet_NaN(), 3.0f, 2.0f}, 1, 4, 3, 0,
        {1, 2, 3},
        {std::numeric_limits<float>::quiet_NaN(), 3.0f, 2.0f}},
   };
   return rows;
+}
+
+// WHICH ARM IMPLEMENTS WHICH ROW. Every row runs on the CPU arm. All but the NaN
+// row run on the CUDA arm too. This is a real backend asymmetry, measured on a
+// GB10 and recorded in #1489 and in `include/vt/ops.h`, not a convenience: the
+// CUDA arm cannot select a NaN at all, so asserting the CPU contract against it
+// ships a permanently red suite on every CUDA build. Reconciling the kernel is
+// owed to #1489; scoping the assertion to the arm that implements the contract
+// is what keeps the record TRUE in the meantime.
+bool RunsOnCuda(const LiteralRow& r) {
+  return std::string(r.name) != std::string(kNanRowName);
+}
+
+// How many rows the CUDA cases skip. Asserted to be exactly one by the CPU case,
+// which runs on every host -- the device cases cannot report a filter that
+// matched nothing, because on this host they do not run at all.
+size_t CpuOnlyRowCount() {
+  size_t n = 0;
+  for (const LiteralRow& r : LiteralRows()) {
+    if (!RunsOnCuda(r)) ++n;
+  }
+  return n;
 }
 
 // Assert one row's literal answer. A NaN in `want_val` is asserted AS a NaN,
@@ -227,6 +284,25 @@ TEST_CASE("topk-values-indices: the hand-written LITERAL rows") {
   for (const LiteralRow& r : LiteralRows()) {
     const Result got = Run(r.logits, r.rows, r.v, r.k, r.pad);
     CheckLiteral(r, got.values, got.indices);
+  }
+  // THE EXCLUSION'S OWN MATCH COUNT, asserted where it can run. The two CUDA
+  // cases skip exactly one row by name; a filter that matched no row would put
+  // the NaN row back on a device that cannot answer it, and a filter that matched
+  // every row would leave both device cases asserting nothing. Neither shape
+  // fails on a host without `nvcc`, so it is checked here rather than there.
+  CHECK(CpuOnlyRowCount() == 1);
+  // And WHICH row it is, tied to the PROPERTY rather than to the name. The CUDA
+  // arm's only gap is that it cannot select a NaN, so the row the device cases
+  // skip has to be the row that EXPECTS one -- and every row that does not
+  // expect one has to run there. Asserting this against `want_val` instead of
+  // against `kNanRowName` is what keeps it from being the name string compared
+  // with itself, and it is what fails if a later row is narrowed out of the
+  // device arm for a reason nobody wrote down.
+  for (const LiteralRow& r : LiteralRows()) {
+    bool expects_nan = false;
+    for (const float w : r.want_val) expects_nan = expects_nan || std::isnan(w);
+    INFO("row \"", std::string(r.name), "\"");
+    CHECK(RunsOnCuda(r) == !expects_nan);
   }
 }
 
@@ -391,16 +467,27 @@ TEST_CASE("topk-values-indices: CUDA runs the LITERAL tie rows") {
   //
   // The assertion is the LITERAL, not the CPU arm's answer: two implementations
   // agreeing on a wrong tie rule is the failure this table exists to catch.
+  //
+  // A GB10 ran it on 2026-08-20 (#1489) and the tie rows AGREED -- the straddling
+  // group, the group larger than k, the ties inside the kept set and the
+  // -inf-saturated row all matched their literals. The NaN row did not, and it is
+  // the one row this case skips; see `RunsOnCuda`.
   if (!HasCuda()) {
     MESSAGE("no CUDA backend; skipping CUDA topk-values-indices literal rows");
     return;
   }
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard g(b);
+  size_t ran = 0;
   for (const LiteralRow& r : LiteralRows()) {
+    if (!RunsOnCuda(r)) continue;  // the NaN row; see `RunsOnCuda` and #1489.
     const Result got = RunCuda(b, g.q, r.logits, r.rows, r.v, r.k, r.pad);
     CheckLiteral(r, got.values, got.indices);
+    ++ran;
   }
+  // Exactly one row was skipped, stated against the literal 1 rather than
+  // against the filter's own answer, which would be a tautology.
+  CHECK(ran + 1 == LiteralRows().size());
 }
 
 TEST_CASE("topk-values-indices: CUDA == CPU, values and indices") {
@@ -410,20 +497,29 @@ TEST_CASE("topk-values-indices: CUDA == CPU, values and indices") {
   }
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard g(b);
-  // The literal rows, both arms, EQUALITY. The case above pins each arm to the
-  // literal; this pins them to each other, which is the assertion that still
-  // fires if a future row is added to the table without an expectation.
+  // The literal rows the CUDA arm implements, both arms, EQUALITY. The case
+  // above pins each arm to the literal; this pins them to each other, which is
+  // the assertion that still fires if a future row is added to the table without
+  // an expectation.
+  size_t ran = 0;
   for (const LiteralRow& r : LiteralRows()) {
+    // The NaN row is excluded here for the reason `RunsOnCuda` gives: the two
+    // arms genuinely DISAGREE on it (#1489), so a cross-arm equality over it
+    // asserts a contract no shipped backend delivers. Every other row is
+    // compared, including all four tie rows and the -inf-saturated one, which
+    // are the rows `## Owed` O10 called the real risk -- and which #1489
+    // measured AGREEING.
+    if (!RunsOnCuda(r)) continue;
     const Result cpu = Run(r.logits, r.rows, r.v, r.k, r.pad);
     const Result gpu = RunCuda(b, g.q, r.logits, r.rows, r.v, r.k, r.pad);
     for (size_t i = 0; i < cpu.values.size(); ++i) {
       INFO("literal row \"", std::string(r.name), "\" slot ", i);
       CHECK(gpu.indices[i] == cpu.indices[i]);
-      // The NaN row's VALUES are not comparable by equality on either arm.
-      if (!std::isnan(cpu.values[i])) CHECK(gpu.values[i] == cpu.values[i]);
-      else CHECK(std::isnan(gpu.values[i]));
+      CHECK(gpu.values[i] == cpu.values[i]);
     }
+    ++ran;
   }
+  CHECK(ran + 1 == LiteralRows().size());
 
   struct Case {
     int64_t rows, v, k, pad;

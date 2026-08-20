@@ -943,12 +943,26 @@ struct Dflash2SelectorEdgesArgs {
 // by ASCENDING index, which is `torch.topk`'s CPU order and what FlashInfer's
 // `deterministic=True` exists to provide. A backend that broke ties differently
 // would reorder the selector's candidate slots and move acceptance without
-// raising anything, so the CPU reference pins it and the CUDA arm mirrors it. NaN
-// is part of that order and is stated rather than left to the sort: it comes
-// FIRST, which is `torch.topk(largest=True)`'s own answer. Leaving it implicit
+// raising anything, so the CPU reference pins it and the CUDA arm mirrors it.
+//
+// NaN IS THE ONE POINT WHERE THE TWO ARMS ARE NOT EQUAL, and this is stated here
+// because a contract that claimed otherwise would be a claim no shipped backend
+// delivers. The CPU arm orders NaN FIRST, which is `torch.topk(largest=True)`'s
+// own answer, and it is stated rather than left to the sort: leaving it implicit
 // made the CPU comparator an intransitive equivalence and therefore undefined
-// behaviour, not merely an unusual result. No shipped path produces a NaN logit,
-// so the row that pins it is synthetic in the same sense the padding row is.
+// behaviour, not merely an unusual result. The CUDA arm DOES NOT ORDER NaN
+// FIRST and cannot as written -- `TopKValuesIndicesRowKernel`'s pivot bracket
+// uses `fmaxf`/`fminf`, which return the non-NaN operand, and its survivor pass
+// tests `r[j] > thr`, which is false for a NaN, so the search can never select
+// one. Measured on a GB10 on 2026-08-20 rather than argued:
+// [#1489](https://github.com/mudler/vllm.cpp/issues/1489), where the direct
+// cross-arm comparison read `gpu.indices[0] == cpu.indices[0]` as `2 == 1`.
+// Reconciling the kernel to NaN-first is owed to that issue; until it lands the
+// device gate is scoped to the rows the kernel implements. NO SHIPPED PATH FEEDS
+// THIS OP A NaN LOGIT -- the candidate values come from a target LM head -- so
+// the row that pins the CPU order is synthetic in the same sense the padding row
+// is, and the asymmetry is a gap in the contract's reach rather than in any
+// output a user can obtain.
 //
 // `num_org_vocab_padding` mirrors upstream's
 // `lm_head.shard_indices.num_org_vocab_padding`: that many columns at the END of

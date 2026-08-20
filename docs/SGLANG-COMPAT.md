@@ -2,13 +2,13 @@
 
 vllm.cpp mirrors vLLM by default, and additionally exposes a small set of
 **SGLang-inspired runtime knobs** as first-class, documented toggles. Each one is
-**opt-in and defaults to today's behavior** — a caller (library, C ABI, or
+**opt-in and defaults to today's behavior**, a caller (library, C ABI, or
 server) that sets none of them gets an engine byte-identical to one built without
 them.
 
 Four behaviors are covered here. For each: what it does, how to enable it three
-ways — (a) the C++ library API (`vllm::entrypoints::EngineParams`), (b) the C ABI
-(`include/vllm.h`, `vllm_model_params`), (c) the OpenAI server CLI — and the
+ways, (a) the C++ library API (`vllm::entrypoints::EngineParams`), (b) the C ABI
+(`include/vllm.h`, `vllm_model_params`), (c) the OpenAI server CLI, and the
 honest caveat where one applies. The behavior parity itself is tracked in
 [`.agents/sglang-matrix.md`](../.agents/sglang-matrix.md); the ABI-field table and
 grounding live in [`.agents/specs/sglang-enablement.md`](../.agents/specs/sglang-enablement.md).
@@ -26,7 +26,7 @@ grounding live in [`.agents/specs/sglang-enablement.md`](../.agents/specs/sglang
 
 **What it does.** SGLang's RadixAttention keeps a radix tree of KV prefixes and
 serves the longest cached prefix of each new request instead of recomputing it.
-In vllm.cpp this is **fused into our block-hash automatic prefix caching (APC)** —
+In vllm.cpp this is **fused into our block-hash automatic prefix caching (APC)**,
 there is no separate radix code path; `--enable-radix-attention` is a documented
 alias for the APC toggle (see
 [`.agents/specs/sglang-radixattention.md`](../.agents/specs/sglang-radixattention.md)
@@ -34,7 +34,7 @@ alias for the APC toggle (see
 
 **Enable it.**
 
-(a) C++ library API — `EngineParams::enable_prefix_caching` (tri-state
+(a) C++ library API, `EngineParams::enable_prefix_caching` (tri-state
 `std::optional<bool>`):
 
 ```cpp
@@ -43,7 +43,7 @@ ep.enable_prefix_caching = true;   // force ON; std::nullopt => model default
 auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 ```
 
-(b) C ABI — `vllm_model_params.enable_prefix_caching` (ABI v7), tri-state
+(b) C ABI, `vllm_model_params.enable_prefix_caching` (ABI v7), tri-state
 `0`=model default, `1`=on, `2`=off:
 
 ```c
@@ -54,7 +54,7 @@ vllm_engine *engine = NULL;
 vllm_engine_load(&mp, &engine);
 ```
 
-(c) Server CLI — vLLM's flag, with the SGLang alias:
+(c) Server CLI, vLLM's flag, with the SGLang alias:
 
 ```bash
 server --model /models/Qwen3.6-27B --enable-prefix-caching
@@ -65,7 +65,7 @@ server --model /models/Qwen3.6-27B --enable-prefix-caching
 **Caveat.** SGLang's SW2 throughput lever (avoiding a redundant same-step prefill
 by de-prioritizing the second in-batch collider) is **NOT-APPLICABLE** to our APC:
 we cache blocks at allocation time, so the second same-step collider already hits
-the first's just-cached prefix — the redundant prefill never occurs here. The
+the first's just-cached prefix, the redundant prefill never occurs here. The
 admission-order half of that behavior is folded into LPM scheduling below.
 
 ---
@@ -76,13 +76,13 @@ admission-order half of that behavior is folded into LPM scheduling below.
 each request's **longest matched cached prefix**, so requests that will hit the
 cache are admitted first (maximizing cache reuse under load). vllm.cpp implements
 this as the `lpm` scheduling policy over our block-hash APC index. It is
-**output-neutral** — it changes admission *order* only; every request computes
-identical tokens — and is meaningful **only with prefix caching ON**. With APC
+**output-neutral**, it changes admission *order* only; every request computes
+identical tokens, and is meaningful **only with prefix caching ON**. With APC
 off it degrades to `fcfs`.
 
 **Enable it.**
 
-(a) C++ library API — `EngineParams::policy`:
+(a) C++ library API, `EngineParams::policy`:
 
 ```cpp
 vllm::entrypoints::EngineParams ep;
@@ -90,9 +90,9 @@ ep.policy = vllm::SchedulerPolicy::kLPM;   // kFCFS (default) / kPriority / kLPM
 ep.enable_prefix_caching = true;           // LPM needs a cache to match against
 ```
 
-(b) C ABI — `vllm_model_params.scheduling_policy` (ABI v9). A string naming the
+(b) C ABI, `vllm_model_params.scheduling_policy` (ABI v9). A string naming the
 policy: `"fcfs"` (default), `"priority"`, or `"lpm"`; `NULL`/`""` => `"fcfs"`.
-(There is no separate int scheduler-policy field — the string is the one knob.)
+(There is no separate int scheduler-policy field, the string is the one knob.)
 
 ```c
 vllm_model_params mp = vllm_model_params_default();
@@ -103,7 +103,7 @@ vllm_engine *engine = NULL;
 vllm_engine_load(&mp, &engine);
 ```
 
-(c) Server CLI — vLLM's flag name (`--scheduling-policy`) and SGLang's alias
+(c) Server CLI, vLLM's flag name (`--scheduling-policy`) and SGLang's alias
 (`--schedule-policy`), both taking `fcfs|priority|lpm`:
 
 ```bash
@@ -120,7 +120,7 @@ is a scoped opt-in behavior flag, not a blind mirror (vLLM has no `lpm` policy).
 ## 3. Jump-forward decoding
 
 **What it does.** When a structured-output grammar has a **deterministic forced
-continuation**, jump-forward emits it *without* running the model per token — the
+continuation**, jump-forward emits it *without* running the model per token, the
 speed win on constrained decoding. vllm.cpp lands the **provably byte-identical
 token-unique subset**: it jumps only while the grammar admits exactly one valid
 token at a non-accepting state, so the emitted token is the argmax under any
@@ -130,7 +130,7 @@ boundary rollback) is deliberately not jumped.
 
 **Enable it.**
 
-(a) C++ library API — `EngineParams::enable_jump_forward` (tri-state
+(a) C++ library API, `EngineParams::enable_jump_forward` (tri-state
 `std::optional<bool>`):
 
 ```cpp
@@ -138,7 +138,7 @@ vllm::entrypoints::EngineParams ep;
 ep.enable_jump_forward = true;   // nullopt (default) => OFF unless env override
 ```
 
-(b) C ABI — `vllm_model_params.enable_jump_forward` (ABI v10), tri-state
+(b) C ABI, `vllm_model_params.enable_jump_forward` (ABI v10), tri-state
 `0`=default (env-resolved, off), `1`=on, `2`=off:
 
 ```c
@@ -160,7 +160,7 @@ as an override: **when it is set, it wins** over the C-ABI / C++ / server field
 (`1`/`true`/`on` => on, anything else => off), mirroring the `VT_ASYNC_SCHED`
 convention. When it is unset, the field decides (default off).
 
-**Caveat.** This is the **token-unique subset only** — the general jump-forward
+**Caveat.** This is the **token-unique subset only**, the general jump-forward
 span is a named residual. The behavior stays **off by default** until the
 production scheduler splice (which must recompute KV for the jumped tokens) lands;
 SGLang itself removed its own jump-forward scheduler wiring upstream. Enabling it
@@ -180,7 +180,7 @@ non-argmax-invariant logits-processor stage.
 
 **Enable it.**
 
-(a) / (b) C ABI — `vllm_sampling_params.logits_processor` +
+(a) / (b) C ABI, `vllm_sampling_params.logits_processor` +
 `logits_processor_user_data` (ABI v8). The C++ library drives the same sampler
 stage; the callback is the delivery surface:
 
@@ -195,7 +195,7 @@ sp.logits_processor_user_data = NULL;
 vllm_complete(engine, "hi", &sp, &out);
 ```
 
-(c) Server CLI — not a CLI flag: it is a per-request programmatic hook (a function
+(c) Server CLI, not a CLI flag: it is a per-request programmatic hook (a function
 pointer), so it is exposed through the C ABI / library, not the server flags.
 
 **Caveat.** This is a single C callback per request (a function pointer +
@@ -207,24 +207,24 @@ per-request logit processor.
 
 ## When to enable (guidance)
 
-These knobs are **correctness-neutral plumbing, not free speed switches** — whether
+These knobs are **correctness-neutral plumbing, not free speed switches**, whether
 they help is workload-dependent, and the shared-prefix performance arm that would
 put a number on the gain is **not yet measured** (tracked as
 `BACKEND-GATE-CUDA-SGLANG-PREFIX`; the first SGLang competitor-floor run was
 cache-neutral). Honest per-knob guidance:
 
-- **RadixAttention / prefix caching** — enable when the workload has **shared
+- **RadixAttention / prefix caching**, enable when the workload has **shared
   prefixes** (a common system prompt, few-shot exemplars, multi-turn chat). It
   reuses cached prefix KV instead of recomputing, a real win there; neutral to
   slight overhead when there is no sharing. Already on by default for dense models.
-- **LPM scheduling** — enable **together with prefix caching** when concurrent
+- **LPM scheduling**, enable **together with prefix caching** when concurrent
   requests share prefixes: it admits cache-hitting requests first, raising the hit
   rate under load. It has no effect without APC (falls back to `fcfs`), and it
   changes admission order, so leave it off for latency-sensitive single-stream use.
-- **Jump-forward decoding** — a niche constrained-decoding speed lever, off by
+- **Jump-forward decoding**, a niche constrained-decoding speed lever, off by
   default and conservative (token-unique subset only). Enable only for structured
   output that matches that pattern; it is not a general throughput knob.
-- **Custom logits processors** — a programmatic per-request hook, not a performance
+- **Custom logits processors**, a programmatic per-request hook, not a performance
   knob; use it when you need per-request logit control (a bias, a mask, a forced
   token, a thinking budget).
 

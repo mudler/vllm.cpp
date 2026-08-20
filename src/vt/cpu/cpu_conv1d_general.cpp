@@ -1,32 +1,44 @@
 // CPU providers for `vt::Conv1d` and `vt::ConvTranspose1d` — the BigVGAN / DAC
 // vocoder convolutions (#672, .agents/specs/minimax-music3.md §11.4).
 //
-// PROVENANCE, and why this is a MOVE rather than a rewrite. Both kernel bodies
-// below are the `vllm::vocoder1d::Conv1d` / `vllm::vocoder1d::ConvTranspose1d`
-// host loops as they stood at 8fa405bb7
-// (src/vllm/model_executor/models/vocoder1d.cpp:65-161), carried here
-// statement for statement. The accumulator width, the visit order, the seeding
-// of the bias, the `value == 0.0` skip and the output-channel partition are all
-// unchanged — only the buffer type changed, from `std::vector<float>` to a
-// `vt::Tensor` view over the same bytes. That is what lets the four models that
-// decode through `vocoder1d` (MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's
-// audio VAE, IndexTTS-2.5) keep every committed golden they already had.
+// PROVENANCE. Both kernel bodies below descend from the
+// `vllm::vocoder1d::Conv1d` / `vllm::vocoder1d::ConvTranspose1d` host loops as
+// they stood at 8fa405bb7 (src/vllm/model_executor/models/vocoder1d.cpp:65-161).
+// The visit order, the seeding of the bias, the `value == 0.0` skip and the
+// output-channel partition are unchanged from that transcription. The
+// ACCUMULATOR WIDTH is not: it was f64 there and it is f32 here, narrowed by
+// VT-CONV1D-F32-ACC (#1474) to the width torch accumulates a float convolution
+// in. The four models that decode through `vocoder1d` (MiniMax-Music3,
+// MiniMax-H3's audio VAE, LTX-2.5's audio VAE, IndexTTS-2.5) keep every
+// committed golden they already had, MEASURED rather than argued: over the 194
+// golden arms in their four suites, 182 did not move at all, 10 moved toward
+// the golden, and 2 moved away from it by a single unit in the last place —
+// MiniMax-H3's audio-VAE waveform from 4.19095e-09 to 4.65661e-09 against a
+// 1e-05 bound (0.047 % of it), and MiniMax-Music3's vocoder arm from
+// 2.98023e-08 to 5.96046e-08 against a 1e-06 absolute floor (5.96 % of it).
+// Both are reported rather than absorbed; neither is near anything.
 //
 // Upstream semantics: `torch.nn.functional.conv1d` / `conv_transpose1d` as the
 // checkpoints instantiate them — minimax_music3_vocoder.py:42,44,89,98
 // (`nn.Conv1d`) and :55 (`nn.ConvTranspose1d`); LTX-2.5
 // audio_vae/vocoder.py:104-184 for the alias-free resample pair.
 //
-// WHY f64 AND NOT f32. torch accumulates an f32 conv in f32. This deliberately
-// does not, because f64 is what the host reference used and therefore what every
-// golden was taken with; see include/vt/ops.h at vt::Conv1d for the full
-// argument and the byte cost (none — only the register width differs).
+// WHY f32. It is what torch accumulates a float convolution in, MEASURED on a
+// 27-tap `[+1e8, 0.1 x 25, -1e8]` probe where an f32 accumulator lands on
+// exactly 0.0 in any summation order and an f64 one lands near 2.5: `F.conv1d`
+// and `F.conv_transpose1d` both return 0.0 at f32, and `F.conv1d` returns 0.0
+// at bf16 as well. vLLM owns neither op at the parity pin `555967922`, so torch
+// is the reference through the per-consumer secondary oracles — and it is the
+// same oracle all four consumers' goldens came from, because every one of those
+// generators casts to f32. The width this replaced was recorded as "what every
+// golden was taken with", which was not true. See include/vt/ops.h at
+// vt::Conv1d and .agents/specs/vt-conv1d-f32-accumulator.md.
 //
-// WHY NOT A MODE OF `vt::DepthwiseConv1d`. That op is f32-accumulate and its
-// byte-exactness gate (tests/vt/test_ops_conv1d_depthwise.cpp) pins that width.
-// Widening it would move the conformer encoders; narrowing these would move four
-// audio models. They are siblings, and the depthwise op is untouched — the same
-// call the depthwise op itself made against `vt::CausalConv1dFwd`.
+// WHY NOT A MODE OF `vt::DepthwiseConv1d`. A transposed convolution is not a
+// parameterisation of a forward one, and these two ops differ from the
+// depthwise one in the bias seeding and the zero-skip. The WIDTHS now agree —
+// that op accumulates f32 and so do these — so the sibling relationship is
+// about expressiveness, and is no longer also about a divergence in width.
 //
 // SELF-REGISTERING translation unit (the src/vt/cpu/cpu_ops.cpp Registrar
 // idiom), like src/vt/cpu/cpu_conv1d_depthwise.cpp.
@@ -67,10 +79,13 @@ void ForOutputRows(int64_t rows, int64_t work_per_row,
 
 // How many OUTPUT POSITIONS share one sweep of the (ic, k) weights. It is not a
 // blocking heuristic and it is not tunable at run time: it is the number of
-// INDEPENDENT f64 accumulator chains the kernel offers the machine, and the
-// whole of #1334 is that the shipped loop offered exactly one. 32 doubles is
-// four AVX-512 registers or sixteen NEON ones, and it measured best of {8, 16,
-// 32, 64} at the vocoder's shapes on both -O2 and -O3.
+// INDEPENDENT accumulator chains the kernel offers the machine, and the whole
+// of #1334 is that the shipped loop offered exactly one. It measured best of
+// {8, 16, 32, 64} at the vocoder's shapes on both -O2 and -O3 — measured while
+// these accumulators were f64. The tile was NOT re-swept after #1474 halved
+// their width, which doubles how many fit one vector register and may well move
+// the optimum. Recorded as owed rather than assumed away:
+// .agents/specs/vt-conv1d-f32-accumulator.md §7.
 constexpr int64_t kConv1dPosTile = 32;
 
 // The fixed width the in-range part of a tile is chunked into when the tile is
@@ -89,7 +104,7 @@ constexpr int64_t kConv1dChunk = 8;
 // THE ORDER IS TOO. What changed (#1334) is only which cells are in flight at
 // once. The shipped form seeded one accumulator with the bias and swept
 // (ic ascending, k ascending) into it, which for a MiniMax-Music3 residual unit
-// is in_per_group * kernel = 384 * 7 = 2688 STRICTLY DEPENDENT f64 additions per
+// is in_per_group * kernel = 384 * 7 = 2688 STRICTLY DEPENDENT additions per
 // output element: no instruction-level parallelism, no vectorisation at any
 // width, and a measured ~2.8-3.0 cycles per multiply-accumulate, which is what
 // an `fadd` latency of 3 predicts and nothing else does.
@@ -97,12 +112,13 @@ constexpr int64_t kConv1dChunk = 8;
 // This form holds kConv1dPosTile accumulators, one per output position, and
 // hoists the (ic, k) sweep outside them. Fix ANY single output cell and read
 // what it receives, in order: the bias, then (ic=0,k=0), (ic=0,k=1), ... — the
-// identical sequence of IEEE-754 double additions of the identical double
-// products, in the identical order. The additions are INTERLEAVED across
-// independent cells rather than serialised into one. That is a scheduling
-// change and not an arithmetic one, so `memcmp` equality with the pre-change
-// loop, with the CUDA provider, and with all four consumers' goldens survives BY
-// CONSTRUCTION rather than within a tolerance.
+// identical sequence of IEEE-754 additions of the identical products, in the
+// identical order. The additions are INTERLEAVED across independent cells
+// rather than serialised into one. That is a scheduling change and not an
+// arithmetic one, so `memcmp` equality with the CUDA provider survives BY
+// CONSTRUCTION rather than within a tolerance. That is equality with the CUDA
+// provider at the SAME width: #1474 narrowed both arms in one change, so this
+// is no longer also equality with the f64 host loop at 8fa405bb7.
 //
 // The zero-padding skip moves from a per-position test to a CLAMP on the tile,
 // which is the same set: for a fixed k the positions with 0 <= t*stride - pad +
@@ -134,14 +150,14 @@ void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const T
 
   const int64_t rows = batch * out_channels;
   ForOutputRows(rows, length * in_per_group * kernel, [&](int64_t r0, int64_t r1) {
-    alignas(64) double acc[kConv1dPosTile];
+    alignas(64) float acc[kConv1dPosTile];
     for (int64_t r = r0; r < r1; ++r) {
       const int64_t n = r / out_channels;
       const int64_t oc = r - n * out_channels;
       const int64_t g = oc / out_per_group;
       const float* xn = xp + n * in_channels * in_len;
       float* on = op + (n * out_channels + oc) * length;
-      const double seed = bp != nullptr ? bp[oc] : 0.0;
+      const float seed = bp != nullptr ? bp[oc] : 0.0F;
       for (int64_t t0 = 0; t0 < length; t0 += kConv1dPosTile) {
         const int64_t tile = std::min<int64_t>(kConv1dPosTile, length - t0);
         for (int64_t i = 0; i < tile; ++i) acc[i] = seed;
@@ -149,7 +165,7 @@ void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const T
           const float* xc = xn + (g * in_per_group + ic) * in_len;
           const float* wc = wp + (oc * in_per_group + ic) * kernel;
           for (int64_t k = 0; k < kernel; ++k) {
-            const double wv = static_cast<double>(wc[k]);
+            const float wv = wc[k];
             // Position of tile slot i is `base + i * stride`; it contributes iff
             // that lies in [0, in_len), which bounds i to [lo, hi).
             const int64_t base = t0 * stride - pad + k * dilation;
@@ -159,29 +175,26 @@ void Conv1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w, const T
             if (lo >= hi) continue;
             // Formed only after the clamp, so it never points before `xc`.
             const float* xs = xc + base + lo * stride;
-            double* ap = acc + lo;
+            float* ap = acc + lo;
             const int64_t span = hi - lo;
             if (stride != 1) {
-              for (int64_t i = 0; i < span; ++i)
-                ap[i] += static_cast<double>(xs[i * stride]) * wv;
+              for (int64_t i = 0; i < span; ++i) ap[i] += xs[i * stride] * wv;
             } else if (span == kConv1dPosTile) {
               // The whole-tile case, and the only loop here with a compile-time
               // trip count. It is what the vocoder's own shapes take.
-              for (int64_t i = 0; i < kConv1dPosTile; ++i)
-                ap[i] += static_cast<double>(xs[i]) * wv;
+              for (int64_t i = 0; i < kConv1dPosTile; ++i) ap[i] += xs[i] * wv;
             } else {
               int64_t i = 0;
               for (; i + kConv1dChunk <= span; i += kConv1dChunk) {
-                double* a8 = ap + i;
+                float* a8 = ap + i;
                 const float* x8 = xs + i;
-                for (int64_t j = 0; j < kConv1dChunk; ++j)
-                  a8[j] += static_cast<double>(x8[j]) * wv;
+                for (int64_t j = 0; j < kConv1dChunk; ++j) a8[j] += x8[j] * wv;
               }
-              for (; i < span; ++i) ap[i] += static_cast<double>(xs[i]) * wv;
+              for (; i < span; ++i) ap[i] += xs[i] * wv;
             }
           }
         }
-        for (int64_t i = 0; i < tile; ++i) on[t0 + i] = static_cast<float>(acc[i]);
+        for (int64_t i = 0; i < tile; ++i) on[t0 + i] = acc[i];
       }
     }
   });
@@ -193,8 +206,9 @@ constexpr int64_t kConvTranspose1dTapChunk = 4;
 
 // torch.nn.functional.conv_transpose1d. Weight is [Cin, Cout/groups, K].
 //
-// The SCATTER form, verbatim from vocoder1d.cpp:136-158 @ 8fa405bb7: one
-// destination channel at a time, a scratch f64 line of `full` cells, inputs
+// The SCATTER form of vocoder1d.cpp:136-158 @ 8fa405bb7, at f32 rather than
+// that loop's f64 (#1474): one destination channel at a time, a scratch line of
+// `full` cells, inputs
 // visited (ic ascending, t ascending), the `value == 0.0` skip intact, the bias
 // added LAST on the way out. Both the skip and the ordering are load-bearing —
 // see include/vt/ops.h at vt::ConvTranspose1d for why the skip decides the sign
@@ -217,20 +231,20 @@ void ConvTranspose1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
 
   const int64_t rows = batch * out_channels;
   ForOutputRows(rows, in_per_group * in_len * kernel, [&](int64_t r0, int64_t r1) {
-    std::vector<double> acc(static_cast<size_t>(full));
+    std::vector<float> acc(static_cast<size_t>(full));
     for (int64_t r = r0; r < r1; ++r) {
       const int64_t n = r / out_channels;
       const int64_t dst_c = r - n * out_channels;
-      std::fill(acc.begin(), acc.end(), 0.0);
+      std::fill(acc.begin(), acc.end(), 0.0F);
       const int64_t g = dst_c / out_per_group;
       const int64_t oc = dst_c - g * out_per_group;
       const float* xn = xp + n * in_channels * in_len;
       for (int64_t ic = g * in_per_group; ic < (g + 1) * in_per_group; ++ic) {
         const float* wc = wp + (ic * out_per_group + oc) * kernel;
         for (int64_t t = 0; t < in_len; ++t) {
-          const double value = xn[ic * in_len + t];
-          if (value == 0.0) continue;
-          double* dst = acc.data() + t * stride;
+          const float value = xn[ic * in_len + t];
+          if (value == 0.0F) continue;
+          float* dst = acc.data() + t * stride;
           // The taps of ONE input value land in `kernel` DISTINCT cells, so this
         // scatter already has instruction-level parallelism and chunking it
         // reorders nothing: no cell receives two of these adds. What the chunk
@@ -241,24 +255,22 @@ void ConvTranspose1dKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
         if (dilation == 1) {
           int64_t k = 0;
           for (; k + kConvTranspose1dTapChunk <= kernel; k += kConvTranspose1dTapChunk) {
-            double* dk = dst + k;
+            float* dk = dst + k;
             const float* wk = wc + k;
-            for (int64_t j = 0; j < kConvTranspose1dTapChunk; ++j)
-              dk[j] += value * static_cast<double>(wk[j]);
+            for (int64_t j = 0; j < kConvTranspose1dTapChunk; ++j) dk[j] += value * wk[j];
           }
-          for (; k < kernel; ++k) dst[k] += value * static_cast<double>(wc[k]);
+          for (; k < kernel; ++k) dst[k] += value * wc[k];
         } else {
-          for (int64_t k = 0; k < kernel; ++k)
-            dst[k * dilation] += value * static_cast<double>(wc[k]);
+          for (int64_t k = 0; k < kernel; ++k) dst[k * dilation] += value * wc[k];
         }
         }
       }
       float* on = op + (n * out_channels + dst_c) * length;
       for (int64_t t = 0; t < length; ++t) {
         const int64_t p = t + pad;
-        double value = p < full ? acc[static_cast<size_t>(p)] : 0.0;
+        float value = p < full ? acc[static_cast<size_t>(p)] : 0.0F;
         if (bp != nullptr) value += bp[dst_c];
-        on[t] = static_cast<float>(value);
+        on[t] = value;
       }
     }
   });

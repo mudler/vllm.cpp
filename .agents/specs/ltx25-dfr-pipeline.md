@@ -586,14 +586,17 @@ nothing in this tree can supply.
 [#1481](https://github.com/mudler/vllm.cpp/pull/1481) found the third written and
 the first two not, and raised it. Each is answered here:
 
-- **`docs/STATUS.md` WAS owed, and is written.** It carried no DFR line at all —
-  neither this row nor `LTX25-DFR-ROUNDS` had one — so there was nothing to keep
-  current and the omission read as compliance. The new row is keyed on the
-  capability the way `LTX-2.5 video VAE decode, device arm (KERNEL-CONV3D)` is,
-  and it carries what `STATUS` carries and `FEATURES` does not: the lifecycle
-  state and the blocker that binds it. It deliberately does NOT restate the
-  parameters, the anchors or the gate counts, because those are
-  `docs/FEATURES.md:174-175` and a fact stated in two projections is how two
+- **`docs/STATUS.md` is written, in the shape it has since #1491.** That change
+  reduced it to current state and REMOVED the per-capability table this row would
+  once have gained a line in; it now carries one row per user-facing SURFACE and
+  routes per-row lifecycle to the internal matrices it names, with
+  `docs/FEATURES.md` called out in the file as "the current keyed capability
+  projection". So there is no DFR row to write and never will be. What was
+  genuinely stale is the `Image, video, audio, speech, music, and diffusion
+  models` surface, whose limitation cell named three LTX-2.5 issues and not the
+  one that binds this arm, and that cell now carries the unpublished
+  `keyframe_slot_sft` base and the ungated tiling. The capability detail stays in
+  `docs/FEATURES.md`, because a fact stated in two projections is how two
   projections drift apart.
 - **`docs/BENCHMARKS.md` is NOT owed, and the rule says so on its own terms.** It
   changes when a row "gains an accepted or explicitly pending/failed/void

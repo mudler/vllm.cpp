@@ -466,8 +466,9 @@ insertions moved all fourteen) and the served-load-extras list (the new
 - [#1493](https://github.com/mudler/vllm.cpp/issues/1493) — the **unclamped
   `2**round_idx` tiling**, which nothing in this tree exercises because every
   fixture canvas here has one keyframe segment and the tiles clamp to 1 and 2
-  (`dfr_layout.py:171`). Disclosed in the test body and in `docs/USAGE.md` since
-  this row landed; owned here since the fresh review of #1481. Left open on
+  (`dfr_layout.py:171`). Disclosed in the test body and in the public LTX-2.5
+  guide since this row landed — `docs/USAGE.md` until #1491 moved the model
+  recipes to `docs/models/ltx-2-5.md`; owned here since the fresh review of #1481. Left open on
   purpose: reaching 4 segments needs a materially longer canvas and round 2 would
   then denoise 4 tiles on a canvas already doubled twice, which is a new fixture
   and a substantially longer CPU run rather than an assertion added to the

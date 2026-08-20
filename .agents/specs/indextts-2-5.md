@@ -311,6 +311,45 @@ would be unrecoverable -- which tensors survive, under which names -- with fakes
 and no torch, because a dropped weight looks exactly like a weight that was
 never there.
 
+### Contributor reproduction commands
+
+These commands previously lived in the public MiniMax-Music3 recipe. They stay
+here because they regenerate IndexTTS manifests and test goldens.
+
+```sh
+python3 scripts/read-torch-manifest.py \
+  https://huggingface.co/IndexTeam/IndexTTS-2.5/resolve/main/s2mel.pth
+
+WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-wavenet-goldens.py --out tests/vllm/models/wavenet_goldens.inc
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-front-goldens.py --out tests/vllm/models/dit_front_goldens.inc
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-stack-goldens.py --out tests/vllm/models/dit_stack_goldens.inc
+BIGVGAN_SRC=/path/to/index-tts/indextts/s2mel/modules/bigvgan \
+  python3 scripts/gen-bigvgan-goldens.py --out tests/vllm/models/bigvgan_goldens.inc
+CODEC_SRC=/path/to/index-tts/indextts \
+  python3 scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
+python3 scripts/gen-w2v-fbank-goldens.py --out tests/vllm/models/w2v_fbank_goldens.inc
+python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
+
+python3 scripts/convert-indextts2-checkpoint.py \
+  --checkpoint "$CHECKPOINT_ROOT/IndexTTS-2.5" \
+  --out "$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors" \
+  --manifest tests/vllm/models/indextts2_pth_manifest.json
+
+VLLM_CPP_INDEXTTS2_S2MEL="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors" \
+  ./build/tests/test_indextts2_s2mel_loader
+VLLM_CPP_INDEXTTS2_GPT="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors" \
+  ./build/tests/test_indextts2_talker_loader
+VLLM_CPP_INDEXTTS2_AUX="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors" \
+  ./build/tests/test_emovec
+VLLM_CPP_INDEXTTS2_BIGVGAN="$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/bigvgan.safetensors" \
+  ./build/tests/test_bigvgan
+```
+
 ### What the three .pth checkpoints actually hold
 
 `gpt.pth`, `codec.pth` and `s2mel.pth` are torch ZIPs: one small pickle names
@@ -553,11 +592,11 @@ MUSIC3's W6 (#799) and this family reaches both through
 2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
    `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the
    emotion instead, which is why this sits behind a render rather than in front.
-3. **`/v1/audio/speech` is unproven by request.** The wiring was read, not
-   exercised: `server_main.cpp` loads from the same registry this family
-   registers into. A live check needs a TEXT model too -- `vllm-server` refuses
-   `--speech-model` without `--model`, so the speech route cannot be served
-   standalone. Worth knowing before someone tries.
+3. **The public route loads and renders.** `server_main.cpp` accepts
+   `--speech-model` without `--model`, loads this family from
+   `GlobalSpeechRegistry`, and serves `/v1/audio/speech` as a speech-only
+   server. The route returns a 22.05 kHz mono WAV. This reachability result does
+   not establish output quality or parity with vLLM-Omni.
 4. **The `exact` flag on `tiktoken::Pretokenize` is not proven load-bearing**: a
    mutation disabling every range check still passes. Recorded in the test.
 5. **W7 speed**, which additionally needs #633.

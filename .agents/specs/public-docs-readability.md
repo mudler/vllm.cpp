@@ -379,14 +379,14 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/STATUS.md:848` ### Gemma | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:932` ### OLMo | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:948` ### Frontier and hardware-blocked families | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
-| `docs/STATUS.md:1720` ### Recent dense batch | Design or implementation history | `.agents/specs/roadmap-v1-completion.md` | `archived` | `.agents/specs/roadmap-v1-completion.md` |
+| `docs/STATUS.md:1720` ### Recent dense batch | Current family state, checkpoint gates, and implementation history | `docs/STATUS.md` for the current family-state summary; `.agents/specs/sweep-recent-dense-batch.md` for the named family, checkpoint, oracle, and gate record; `.agents/benchmark-record.md` for retained gate evidence | `kept`; `archived` | `.agents/specs/sweep-recent-dense-batch.md`; `.agents/benchmark-record.md` |
 | `docs/STATUS.md:1786` ## Build and test lanes | Current feature state | `docs/STATUS.md` | `kept` | `n/a` |
 | `docs/STATUS.md:1879` ## Performance detail | Measurement | `docs/BENCHMARKS.md` | `deduplicated` | `n/a` |
 | `docs/STATUS.md:1946` ## Backend detail | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
 | `docs/STATUS.md:2225` ## Serving and API notes | Current feature state | `docs/FEATURES.md` | `deduplicated` | `n/a` |
-| `docs/STATUS.md:2619` ## Verification and parity | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
+| `docs/STATUS.md:2619` ## Verification and parity | Current verification procedure, checker and migration history, gate evidence, environment-document repair, and README history | `docs/STATUS.md` for a concise current verification summary; `.agents/verification.md` for the active generic procedure; `scripts/check-fusion-consistency.py` and `scripts/check-runner-routing-consistency.py` for current checker behavior; `.agents/specs/arch-fusion-fold-plan-2026-07-30.md` for the Gemma fusion migration; `.agents/benchmark-record.md` for the runner/fusion gates, Gemma and Qwen gate evidence, environment-document repair, and README restructure record | `kept`; `deduplicated`; `archived` | `.agents/verification.md`; `.agents/specs/arch-fusion-fold-plan-2026-07-30.md`; `.agents/benchmark-record.md` |
 | `docs/STATUS.md:2681` ### Feature-gap map vs pinned vLLM 0.26 (2026-07-28) | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
-| `docs/STATUS.md:2752` ## Upstream sync 2026-07-30 (`555967922..e04a30a77`, 198 commits) | Design or implementation history | `.agents/upstream-sync.md` | `archived` | `.agents/upstream-sync.md` |
+| `docs/STATUS.md:2752` ## Upstream sync 2026-07-30 (`555967922..e04a30a77`, 198 commits) | Design or implementation history | `.agents/specs/upstream-sync-2026-07-30.md` for the ranked queue and decisions; `.agents/sync/2026-07-30-e04a30a.md` for the dated sync report; `.agents/upstream-sync.md` for the current pin and sync procedure | `archived` | `.agents/specs/upstream-sync-2026-07-30.md`; `.agents/sync/2026-07-30-e04a30a.md`; `.agents/upstream-sync.md` |
 | `docs/USAGE.md:1` # Using vllm.cpp | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
 | `docs/USAGE.md:9` ## Building | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
 | `docs/USAGE.md:25` ### Host compilers | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
@@ -406,7 +406,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:474` ### Timing an encode on your own box | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:497` ### How much memory a Vulkan load needs | Build procedure, current feature state, measurement, cross-model workflow, and design or implementation history | `docs/reference/model-loading.md` for Vulkan unified-memory sizing and `VT_VULKAN_ALLOC_STATS`; `docs/BUILD.md` for the Vulkan measurement tools and Tenstorrent build requirements; `docs/STATUS.md` for current Tenstorrent backend state; `docs/BENCHMARKS.md` for the Voxtral/Whisper FlashAttention-2 and vocoder A/B measurements; `docs/guides/vocoder-device.md` for the cross-model vocoder A/B workflow; `.agents/specs/backend-fanout-metal-vulkan-xpu.md`, `.agents/specs/tenstorrent-backend.md`, `.agents/specs/multimodal-speed.md`, and `.agents/specs/minimax-music3.md` for implementation, gate, and raw-measurement history | `moved`; `deduplicated`; `archived` | `.agents/specs/backend-fanout-metal-vulkan-xpu.md`; `.agents/specs/tenstorrent-backend.md`; `.agents/specs/multimodal-speed.md`; `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:557` ### Running the vocoder convolutions on the GPU | Cross-model workflow and design or implementation history | `docs/guides/vocoder-device.md` for device selection, defaults, supported device names, refusals, and the A/B workflow; `.agents/specs/minimax-music3.md` for byte-identity gates, rollout decisions, and implementation history | `moved`; `archived` | `.agents/specs/minimax-music3.md` |
-| `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Stale empty heading | No body to migrate: campaign-base line 582 is followed immediately by the line 583 heading, which owns the load-stat content beginning at line 585 | `deduplicated` | `n/a` |
 | `docs/USAGE.md:583` ### How long a load takes, and how to see where it goes | Dense lookup material, measurement, and implementation history | `docs/reference/model-loading.md` for `VT_LOAD_STATS` and counter semantics; `docs/BENCHMARKS.md` for accepted load ratios; `.agents/specs/load-direct-upload.md` for implementation and raw measurement evidence | `moved`; `deduplicated`; `archived` | `.agents/specs/load-direct-upload.md` |
 | `docs/USAGE.md:620` ### Quantized checkpoints: which `lm_head` forms load | Model recipe and dense lookup material | `docs/models/qwen3-6.md` for the Qwen3.6 checkpoint forms and model-specific controls; `docs/reference/model-loading.md` for the shared quantized-weight loading rules | `moved` | `n/a` |
 | `docs/USAGE.md:648` ### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified | Model recipe and design or implementation history | `docs/models/qwen3-8-27b.md` for the pinned checkpoint, supported CPU arm, CUDA shape restrictions, and current refusals; `.agents/specs/model-fp8-block-linear.md` for implementation, mutation, and gate history | `moved`; `archived` | `.agents/specs/model-fp8-block-linear.md` |
@@ -544,7 +544,17 @@ Qwen or Muse pages. Shared loader rules go to
 `docs/reference/model-loading.md`. Container runtime guidance goes to the
 container guide. Release-package validation goes to `docs/RELEASES.md`. No
 reviewed section routes to the unrelated Nemotron, Hugging Face access, or
-server-reference pages.
+server-reference pages. The apparent quantized-checkpoint section at campaign-
+base line 582 is an empty heading immediately followed by the line 583 heading;
+the manifest removes that stale heading and assigns no nonexistent body.
+
+The STATUS review also split three broad archival routes. The recent-dense row
+now retains its current family state and names its existing sweep spec and gate
+evidence. Verification keeps only the current summary and procedure in public,
+while its checker, Gemma migration, gate, environment-document, and README
+history route to their exact existing owners. The dated 2026-07-30 sync routes
+to its named ranked-queue spec and sync report as well as the current sync
+procedure.
 
 
 ### Duplicate sections

@@ -7,231 +7,45 @@ Base: `c8d926ea82bd6d8f5d6312693572c84234a6a7f3`.
 
 ## Now
 
-The developer approved one campaign in one pull request. The spec and
-implementation use that pull request. The operator can merge the verified
-documentation-only pull request without waiting for continuous integration.
+W1 through W8 are implemented on the integrated campaign head. The branch was
+reconciled with `origin/main` at `5870cb2bf`; merge commit `df38068da` preserves
+main's DFlash2, LTX-2.5, and GB10 block-wise FP8 record changes. The keyed
+feature, benchmark, issue-index, and row-spec edits were inspected during the
+merge.
 
-Before landing, the campaign was reconciled with `origin/main` at `5870cb2bf`
-(seven commits after the reviewed campaign head). The compact projections now
-carry main's DFlash2 convolution-before-selector-refusal state, LTX-2.5 explicit
-checkpoint-class validation and `vt::Conv3d` device route, and the seven-shape
-GB10 block-wise FP8 result. Detailed workflow text lives in the speculative
-decoding and model guides; `docs/USAGE.md` remains the generic workflow and
-checkpoint index. The auto-merged keyed feature and benchmark rows, issue-index
-union, and incoming row specs were inspected before the conflict resolution was
-staged.
+The 275-row migration manifest accounts for every campaign-base H1, H2, and H3
+heading. `docs/USAGE.md` now owns the generic CLI, server, C ABI, and C++ paths,
+the checkpoint registry, and the indexes. Thirteen model recipes, seven task
+guides, and four dense references have their own pages; their three directory
+indexes provide one route to each extracted page. Five focused guides remain at
+their canonical top-level paths because moving them would add redirects without
+improving navigation.
 
-W1 is complete. The migration manifest accounts for 275 campaign-base H1, H2,
-and H3 headings. W2 adds the public directory indexes and places the generic
-CLI, server, C ABI, and C++ paths before a temporary legacy-reference boundary.
-W3 extracts the model recipes, combines the repeated MiniMax sections, and adds
-the seven-field checkpoint registry. The remaining legacy body stays in place
-for the W4 and W5 migrations.
+`docs/STATUS.md` is a current-state projection. `docs/FEATURES.md`,
+`docs/BUILD.md`, and `docs/ENVIRONMENT.md` retain their keyed purposes without
+duplicating lifecycle history. Unique implementation, verification, and
+measurement evidence remains in the manifest's named specs, completed records,
+benchmark evidence, and Git history. W7 removed the temporary legacy appendix
+from `docs/USAGE.md` and applied the technical-English, no-AI-slop, and
+humanizer passes to the campaign-created public surface.
 
-W4 forms a twelve-guide surface from seven new task guides and five existing
-focused guides retained at their canonical top-level paths. The guide index
-links the new destinations and those five retained paths, while the reference
-index owns four dense references. `docs/USAGE.md` retains the generic workflows,
-checkpoint registry, generic speech route, and the build and release material
-that W5 still owns.
+R1 through R5 reported `PASS` after their repair loops. Their negative checks
+proved the index-link gate, seven-field checkpoint registry, manifest
+destination validation, release-anchor check, and duplicate-environment-row
+check detect the defects they claim to detect. The W8 stale-state assertion
+failed before this update because this section still described the legacy body
+and future waves. It passes after the outcome update.
 
-The W4 red check failed first on the missing
-`docs/guides/hugging-face-access.md` destination. The green destination and
-index check accounts for all 16 manifest destinations. The W3-to-W4 set audit
-compared flags, environment names, revisions, hashes, lifecycle words,
-measurements, warnings, defaults, and error literals. Values removed from the
-public usage body are either present in a W4 destination or already owned by
-the exact internal archive named in the manifest. For example, the two SASS
-hashes remain in `.agents/specs/gdn-replayssm.md`; ignored benchmark logs need
-`rg -uu` when the inventory scans `docs/bench-evidence/`.
+Fresh full-head review R6, the operator's final local gate, pull request body
+validation, push, and merge remain pending. The developer authorized the
+operator to merge the verified documentation-only pull request without waiting
+for continuous integration. No GPU, oracle, model download, or quiet-host
+measurement applies to this documentation campaign; those external gates are
+`NOT APPLICABLE`, not unrun correctness evidence.
 
-The W3 MiniMax-H3 registry metadata was resolved on 20 August 2026 with the
-Hugging Face revision API and raw Git LFS pointers. No model weight was
-downloaded. The resolved revisions are `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7`
-for `realrebelai/MiniMax-H3_GGUFs`,
-`d629413c2e5b51b38c453668b75ca3b06ca92703` for
-`unsloth/MiniMax-H3-GGUF`, `42ed227ee7df40d41602854ae760620d6eb651fe`
-for `MiniMaxAI/MiniMax-H3`, and `8c5abfed61e1b6a170240792b65253fba1a65b7b`
-for `lilcheaty/MiniMax-H3-NVFP4`. Registry rows cover the Q4_K_M artifacts
-verified end to end and the pruned Q8_0 artifacts recorded as rendered. The
-model page records the other published variants and their current state.
-
-The R2 repair restores the complete W3 ownership boundary. IndexTTS keeps its
-public model recipe, while its golden commands and evidence remain in
-`.agents/specs/indextts-2-5.md`. The Qwen3.8 mixed FP8 and NVFP4 description now
-lives in its model page. MiniMax-H3 uses one ordered workflow and its registry
-includes the official video VAE, audio VAE, and tokenizer. The exact official
-sizes come from the pinned Hugging Face tree and raw Git LFS pointers at
-`42ed227ee7df40d41602854ae760620d6eb651fe` on 20 August 2026.
-
-The R2 closure pass removes generic CLI copies from three Qwen pages and keeps
-the MiniMax-Music3 server recipe only on its model page. It restores the six
-real-checkpoint Music3 commands, the `LTX_2_3_HQ_PARAMS` defaults, and the
-upstream `FRAME_IDX` limitation to their model pages. The W3 set inventory has
-no unexplained loss after this classification.
-
-The W4 R3 repair removes release packaging, benchmark forensics, ABI chronology,
-and model implementation history from user task and interface pages. Current
-release facts route to `docs/BUILD.md` and `docs/RELEASES.md`. Current
-measurements route to `docs/BENCHMARKS.md`, while exact implementation and gate
-evidence remains in `server-concurrency-failures.md`, `minimax-music3.md`,
-`qwen38-27b-quant-arms.md`, and the model recipes. The required Qwen3.8 artifact
-revision, sizes, and checksums remain in the `docs/USAGE.md` checkpoint registry.
-The repair also resolves the three reported local fragments to the server flag
-reference, the MiniMax-Music3 recipe, and the model recipe index.
-
-The final R3 repair restores the two Qwen3.8 GGUF artifact rows that the W4
-extraction omitted from the public checkpoint registry. Both rows retain the
-full Unsloth revision, exact byte size, locally computed SHA-256, supported
-loader arm, and missing multimodal forward. The repair also replaces four
-reference-page histories with current lookup facts. Their method details,
-benchmarks, and owed work remain in the linked speculative-decoding guide,
-model recipe, benchmark page, and internal specs.
-
-The final server-reference repair replaces contradictory IndexTTS-2.5 phase
-history with the current endpoint contract. The route loads the family and
-renders audio, but it requires a reference clip that it does not yet use for
-conditioning. The owning IndexTTS specification retains the implementation and
-verification history. The repair also replaces a malformed video-guide link
-with one instruction that points directly to the MiniMax-H3 recipe.
-
-The R3 closure repair makes the server flag table match the accepted startup
-contract: `--model` is required except when `--speech-model` selects a
-speech/music-only server. The focused check first failed while the table called
-`--model` unconditionally required, then passed after the table stated the
-speech-only exception already enforced by the server.
-
-The inventory's other zero-after literals are semantically accounted for.
-`HALF` and `KEYFRAME` were emphasis around the two-stage LTX behavior, which the
-LTX model page now states without all caps. `SAMPLER` is the restored `res_2s`
-fact. `SUBJECT` was a command comment; the MiniMax-H3 page retains the
-`subject.ppm` example and its subject-conditioning explanation. `MATH` belongs
-to the archived attention-gate analysis in `.agents/specs/minimax-music3.md`.
-The obsolete revision `a767244d27bd76589a3e3b2ab4e64032c4ebc7af` remains in
-the issue index, quantization matrix, and Qwen3.8 quant-arm spec with its stale
-classification. None of these five literals needs another public copy.
-
-The R3 closure review found that the original global literal-count command no
-longer represented preservation after extraction. It exited 1 with 703 removed
-occurrences. These occurrences included expected duplicates and archived
-contributor commands. The replacement check validates all 275 manifest rows.
-Each row names its current public destination or internal evidence owner. The
-check passes on this tree. It exits 1 when a destination is changed to a
-nonexistent page. The campaign-base heading check still rejects missing or
-extra source sections. The empty heading at campaign-base `USAGE.md:582` is
-`stale` and cites the exact Git anchor. It does not claim a deduplicated body
-that never existed.
-
-The LTX registry and model page restore the base facts from
-`docs/USAGE.md:4380-4510` and `docs/USAGE.md:4782-4865` at
-`c8d926ea82bd6d8f5d6312693572c84234a6a7f3`. The Qwen description comes from
-`docs/USAGE.md:3983-4044` at the same base. Git history searches for the LTX
-LoRA, H3 VAE, and IndexTTS headings identify the commits that introduced those
-facts before the W3 extraction.
-
-W5 reduces `docs/STATUS.md` from 2,906 to 96 lines. The page now contains the
-current parity pin, lifecycle terms, user-facing surface state, backend and
-release state, and the unsupported summary. The detailed current projections
-remain in `docs/FEATURES.md` and the five canonical internal matrices linked at
-the top of the page. Dated implementation and verification details remain in
-Git, row specs, `.agents/parity-ledger.md`,
-`.agents/completed/state-events/`, and `docs/BENCHMARKS.md`, as assigned by the
-W1 manifest.
-
-W5 also removes backend, quantization, and environment ownership from
-`docs/BUILD.md`. The build page now links to `FEATURES.md`, `STATUS.md`,
-`BENCHMARKS.md`, and `ENVIRONMENT.md`. `docs/ENVIRONMENT.md` keeps one row for
-each of the duplicated server limit and MiniMax-H3 diagnostic variables. Its
-GGUF section links to the quantization table in `FEATURES.md`. The feature page
-keeps its keyed support tables and replaces the dated claim-triage narrative
-with a short explanation of its marks. Issue #704's public tool-parser count is
-already current at 38 families, and the registry gate confirms the 40 current
-architectures described by issue #342's broader drift report. W6 still owns the
-README changes in those issues.
-
-The W5 focused assertions failed before the edit on five conditions: the
-status line count, its dated upstream-sync heading, build-owned capability
-sections, the duplicate build environment section, and duplicate environment
-rows. All five pass after the edit. The release, Windows publication,
-environment inventory, supported-model, public-table, and README structure
-checks also pass without a product, lifecycle, release, or measurement change.
-
-The R4 repair audits all 17 campaign-base `STATUS.md` headings. The six current
-summary headings remain on `STATUS.md`; model, backend, serving, speculative,
-build, and verification detail now names its current public projection and its
-internal evidence owner where applicable. The repair also keeps the required
-release anchor only in the OpenAI-server row, so removing that row produces the
-release checker's intended missing-anchor failure. `VT_KIMI_DEVICE_KDA_CHUNK`
-and `VT_KIMI_DEVICE_MLA` now each have one environment-table row, retaining the
-more complete current description. A direct row-name count fails on the two
-duplicates before this repair and reports none afterward.
-
-W6 reconciles the four linked issues without changing a claim that the current
-tree cannot support. Issue #1275 is fixed: `docs/FEATURES.md` says block-wise
-FP8 runs on CPU and names the unproven CUDA arm. The purpose-specific
-documentation parts of issue #342 are fixed. `docs/USAGE.md` uses
-`build/examples/vllm-server`,
-`docs/reference/c-api.md` reports ABI v23, and `docs/reference/server.md` lists
-the conditional embedding and transcription routes. The architecture registry
-gate reports 40 entries. The README still carries the old executable, ABI,
-architecture, and gate claims. Issue #342 therefore remains open and partial.
-
-Issues #704 and #1281 also remain open. The tool-parser source has 38 parser
-classes and 42 accepted names. `docs/FEATURES.md` reports 38 families, but the
-README still reports 36 families and 40 names. Issue #1281 depends on the open
-#1280 model-fetch work and requires three executed model rows. This campaign
-has no GPU or model-run evidence for those rows. It does not create the proposed
-quick-start page from unexecuted commands.
-
-The README checkpoint forbids a claim-changing README edit unless the same
-commit changes `.agents/mission.md`, a named build or example entry point, or a
-named benchmark source. This documentation-only wave changes none of those
-landing sources. Editing one only to authorize README churn would fabricate a
-source change. The existing README links to `docs/USAGE.md`, `docs/BUILD.md`,
-`docs/FEATURES.md`, `docs/STATUS.md`, and `docs/BENCHMARKS.md`; W2 through W5
-made those destinations the current public owners. W6 therefore records the
-remaining README drift for the product or landing-source flow that can update
-it honestly.
-
-W7 applies the technical-English, no-AI-slop, and humanizer passes to the
-campaign's public surface. The red inventory found 21 reader-blaming or
-formulaic terms and 141 headings or emphasized sentence openers that needed
-human review. Most matches were exact status labels, warnings, commands, or
-technical terms and remain unchanged.
-
-The pass removes the 250-line temporary legacy reference from `docs/USAGE.md`.
-Its build, backend, release, and model facts already have the public and
-internal owners recorded in the W1 manifest. `docs/USAGE.md` now ends with the
-checkpoint registry and the reference index. Focused edits also remove
-decorative emphasis, rhetorical setup, and ambiguous instructions from the
-container, multimodal-input, and server-sent event guides. Commands, flags,
-environment names, revisions, hashes, sizes, lifecycle states, measurements,
-limitations, API contracts, links, and checker-bound literals remain unchanged.
-The Windows publication sentence and its state anchor remain in `docs/USAGE.md`
-because `check-windows-release-state` binds that exact public surface.
-
-The R5 repair corrects the IndexTTS source-tree server path and removes
-implementation chronology from the MiniMax-Music3 and LTX 2.5 model recipes.
-Those pages retain current checkpoint metadata, commands, defaults,
-limitations, diagnostics, and gate commands. Their named specifications retain
-the implementation sequence, mutation evidence, rejected approaches, and issue
-history. This pass covers campaign-created public pages. It does not claim to
-rewrite every legacy page under `docs/`.
-
-The R5 semantic repair restores the current operating contract that the first
-task-focused pass removed from the MiniMax-Music3 and LTX 2.5 recipes. The
-Music3 page now uses the DiT guidance default of `1.7`, the full checkpoint
-revision, the quantized refusal and real Q4 gates, the duration rules, exact
-request refusals, and the speech-device contract. The LTX page now uses only
-the pinned first-party DiT, states the `res2s_two_stage` LoRA boundary, and
-restores the HQ defaults, geometry, frame grid, pipeline refusals, guidance,
-prompt-embeds, config, progress, and CPU-thread contracts. These are current
-user constraints. The implementation history remains in each model's owning
-specification.
-
-This work ID is a claim and branch identifier. It is not a new lifecycle row in
-the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
-#1463 uses the accepted spec-owned form in the append-only issue index.
+This work ID is a branch and claim identifier, not a new engine-matrix
+lifecycle row. Roadmap campaign `A6` owns the unit, and issue #1463 remains open
+until the pull request reaches `main`.
 
 ## Problem
 
@@ -300,7 +114,7 @@ use another documentation site as a content or structure oracle.
 
 ## Our baseline
 
-The base has 11 top-level public Markdown files and 12,124 lines in those files.
+The base has 12 top-level public Markdown files and 12,124 lines in those files.
 
 | Surface | Lines | Current role | Campaign decision |
 |---|---:|---|---|
@@ -1053,4 +867,66 @@ Stop and return `BLOCKED` if:
 
 ## Outcome
 
-Pending implementation and final gate evidence.
+W1 through W8 produced the public information architecture defined by this
+spec. At campaign base `c8d926ea82bd6d8f5d6312693572c84234a6a7f3`, `docs/`
+contained 61 Markdown files and 25,322 lines. The integrated W8 head contains 88
+Markdown files and 19,269 lines. The 27 added files are 13 model recipes plus an
+index, seven task guides plus an index, and four references plus an index.
+
+The two pages that had become chronological logs changed most:
+
+| Surface | Base lines | W8 lines | Result |
+|---|---:|---:|---|
+| `docs/USAGE.md` | 6,303 | 161 | Generic workflows, indexes, and checkpoint registry |
+| `docs/STATUS.md` | 2,906 | 97 | Current lifecycle and capability projection |
+| `docs/BUILD.md` | 280 | 251 | Build procedures without feature or environment duplication |
+| `docs/ENVIRONMENT.md` | 316 | 309 | One keyed environment-variable reference |
+| `docs/FEATURES.md` | 392 | 384 | Current feature projection without claim-triage history |
+
+Seven new task guides and four references were extracted. Five existing focused
+guides remain at their top-level paths: `KV-OFFLOAD.md`, `ROCM.md`,
+`SGLANG-COMPAT.md`, `SPECULATIVE-DECODING.md`, and `WEIGHT-OFFLOAD.md`. Moving
+those files was rejected because their names already state one purpose and a
+move would create link churn or routing pages without making the task easier to
+find. A generated documentation site was also rejected because the problem was
+content ownership, not rendering. Claim-changing README edits were rejected in
+W6 because the README checkpoint requires an honest landing-source change; this
+documentation-only campaign had none.
+
+The structure defaults follow the public-document contract: common commands
+stay in `USAGE.md`; model-specific weights, commands, limits, and refusals live
+in model recipes; cross-model procedures live in guides; dense values live in
+references; lifecycle and feature facts remain separate projections. The
+seven-field checkpoint table remains in `USAGE.md` because `AGENTS.md` requires
+that literal public surface. Lowercase kebab-case names and one index per
+directory make destinations predictable without adding a publishing toolchain.
+
+Issue outcomes at W8 are:
+
+- #1463 owns this campaign and closes only after the pull request reaches
+  `main`.
+- #1275 is fixed: the feature projection states that block-wise FP8 runs on CPU
+  and identifies the unproven CUDA arm.
+- #342 is partially reconciled. Purpose-specific docs use the current server
+  executable, ABI v23, conditional routes, and 40-entry architecture registry;
+  stale README claims remain for a landing-source change.
+- #704 is partially reconciled. `FEATURES.md` reports 38 parser families, while
+  the README's 36-family and 40-name claims remain for the same reason.
+- #1281 is not fixed. It depends on #1280 and requires three executed model
+  rows. No model-run evidence exists in this documentation-only campaign, so an
+  unverified quick-start page was rejected.
+
+R1 through R5 passed after fresh review and repair waves. Negative mutations
+proved a broken index link, a missing checkpoint field, a missing manifest
+destination, a removed release anchor, and duplicate environment rows are
+detected. The branch was then integrated with main at `5870cb2bf` and the
+incoming keyed records were reconciled. The W8 implementer documentation and
+record gates pass at the outcome head; R6 and the operator's independent
+exact-head rerun are intentionally not claimed here. GPU, oracle,
+model-download, and quiet-host measurement gates are `NOT APPLICABLE` because
+no runtime behavior, parity claim, or benchmark changes.
+
+Remaining landing steps are fresh R6 review of the immutable full head, the
+operator's exact-head gate, pull request body validation, the exact-SHA push,
+and the authorized squash merge. Continuous integration completion is not a
+merge dependency for this documentation-only campaign.

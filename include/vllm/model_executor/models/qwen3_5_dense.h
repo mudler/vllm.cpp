@@ -266,7 +266,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // the forward reads these weights now, so the remaining gap is the kernel and
 // not the wiring. Called from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, so the refusal lands before the first forward and
-// before any graph capture. Milestone M5 deletes it along with the gap.
+// before any graph capture. M5 (`489a9a4c0`) NARROWED this rather than deleting
+// it: the mainloop-scaled CUTLASS kernel covers `VT_CUTLASS_FP8_ARCHS` (12.0a,
+// 12.1a) only, so a CUDA arch outside that cell is still refused here by name.
 void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
                                           vt::DeviceType device);
 

@@ -672,6 +672,12 @@ one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linea
 vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
 concatenate exactly and the merged GEMM is byte-identical to the separate ones.
 
+The `gate_proj`/`up_proj` merge always runs. The Q/K/V merge runs only when the
+fused attention preamble is available to read its row-strided output views,
+which is the default. `VT_FUSE_ATTN_PREAMBLE=0` turns that consumer off, and
+then `q_proj`, `k_proj` and `v_proj` run as three separate block GEMMs and the
+ten projections are nine GEMMs. The result is the same either way.
+
 That merge needs each projection in a group except the last to be a multiple of
 128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
 that breaks the rule is refused by name, and the message says which projection

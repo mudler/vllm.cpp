@@ -1,244 +1,279 @@
 {
+  "_source": "MEASURED 2026-08-20 on mudler-ubuntu-box (Linux 6.8.0-136-generic x86_64, 20 cores, CONTENDED -- other sessions were compiling throughout). Produced by `build/examples/ltx2-gen`, the shipped example, which is a client of `vllm.h` and nothing else: it calls `vllm_video_engine_load` + `vllm_video_generate` and asks `vllm_video_last_phase_log` for this file's path. Geometry `--frames 9 --width 64 --height 64 --seed 7 --max-phase 0 --device cpu`. Built from e3f46560e on row/LTX25-RESIDENCY-W0 with `cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_SERVER=OFF -G Ninja`, gcc 13.3.0. Every byte below `_source`, `_caveat`, `_headline` and `_footnotes` is the render's own output.",
+  "_caveat": "NOT A BENCHMARK, AND NOT A PROFILE OF ANY SHIPPED CHECKPOINT. The weights are the REDUCED two-block fixture `tests/vllm/multimodal/ltx2_video_fixture.h` writes, not Lightricks' 21.00B DiT, so no duration here describes a real render. The host was contended: the same binary at the same geometry has now measured 0.158 s, 1.676 s, 6.138 s and 12.030 s of wall -- a factor of 76 -- and the RANK of its two largest phases reversed between two of those runs. Nothing in this file may be quoted as a speed, a ratio between phases, or an ordering. What it supports is the SHAPE of the table -- which phases exist, that they do not overlap, and that they add up. The `notice` field says the same thing and travels with every phase log the library writes.",
+  "_headline": "99.88% of an LTX-2.5 render's wall now has a phase name on it, over 23 entries.",
+  "_footnotes": [
+    "The two largest phases of THIS run are denoise at 48.3% of the named leaves and decode.audio at 42.6%, of which the vocoder alone (decode.audio.vocoder, nested) is 0.7036 s = 42.0% of the leaf sum. On the run this artifact replaced the same two read 67.7% and 25.5%. The shares move by a factor of two on this box between runs of one binary, so read WHICH phases exist and that they add up, never how big they are.",
+    "peak_device_bytes is -1 in every row. This is the CPU arm, where -1 is correct, and CudaBackend does not override vt::Backend::DeviceMemoryInfo either (#1126), so a CUDA render would print -1 too. A byte count of zero and a byte count nobody took are different facts, which is why the sentinel is not 0.",
+    "sum_leaf_seconds adds only records with span=false and nested=false. `load` and `generate` are spans that enclose leaves; `decode.audio.mel`, `decode.audio.vocoder` and `phase.upsample_latent` are nested decompositions of a leaf that is already counted. Adding either would make unaccounted_seconds the residue of double counting.",
+    "unaccounted_seconds is emitted rather than smeared over the phases. Time inside no named leaf is a phase nobody named, and W0's stop condition is that naming it is the work rather than rounding it away.",
+    "Evidence for .agents/specs/ltx25-device-residency.md stage W0, issue #1010. This directory is where the row put it so it is retrievable from the repository rather than from a host that stopped answering (#1040) -- it is not a benchmark figure and no README or docs/BENCHMARKS.md row reads it."
+  ],
   "device": "cpu",
   "device_bytes_source": "none",
   "family": "ltx-2.5",
   "host_bytes_source": "/proc/self/statm",
+  "notice": "NOT A BENCHMARK. Every duration here is wall clock on whatever host ran this render, under whatever else that host was doing at the time, and this file records neither. The same binary at the same geometry has measured 0.158 s, 6.138 s and 12.030 s of wall on one contended box, and the RANK of its two largest phases reversed between two of those runs. What this table supports is the SHAPE of a render and the ratio sum_leaf_seconds/wall_seconds. Quote a duration only with the host, the checkpoint and the contention state beside it. See .agents/specs/ltx25-device-residency.md.",
   "phases": [
     {
-      "duration_seconds": 0.392582493,
-      "end_seconds": 0.39263987,
+      "duration_seconds": 0.100807967,
+      "end_seconds": 0.100855688,
       "name": "load",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15581184,
+      "peak_host_bytes": 15540224,
       "render": 0,
       "span": true,
-      "start_seconds": 5.7377e-05
+      "start_seconds": 4.7721e-05
     },
     {
-      "duration_seconds": 0.010127357,
-      "end_seconds": 0.029284717,
+      "duration_seconds": 0.0013246839999999998,
+      "end_seconds": 0.002777974,
       "name": "load.dit",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 8212480,
+      "peak_host_bytes": 8142848,
       "render": 0,
       "span": false,
-      "start_seconds": 0.01915736
+      "start_seconds": 0.00145329
     },
     {
-      "duration_seconds": 0.007868114999999998,
-      "end_seconds": 0.037349913,
+      "duration_seconds": 0.0005947970000000002,
+      "end_seconds": 0.003499255,
       "name": "load.video_vae",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 9818112,
+      "peak_host_bytes": 9748480,
       "render": 0,
       "span": false,
-      "start_seconds": 0.029481798
+      "start_seconds": 0.002904458
     },
     {
-      "duration_seconds": 0.025144491999999997,
-      "end_seconds": 0.062496008,
+      "duration_seconds": 0.002700085,
+      "end_seconds": 0.006200522,
       "name": "load.audio_vae",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 14020608,
+      "peak_host_bytes": 13950976,
       "render": 0,
       "span": false,
-      "start_seconds": 0.037351516
+      "start_seconds": 0.003500437
     },
     {
-      "duration_seconds": 0.329936671,
-      "end_seconds": 0.392437278,
+      "duration_seconds": 0.09446191200000001,
+      "end_seconds": 0.100668005,
       "name": "load.prompt_embeds",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15581184,
+      "peak_host_bytes": 15540224,
       "render": 0,
       "span": false,
-      "start_seconds": 0.062500607
+      "start_seconds": 0.006206093
     },
     {
-      "duration_seconds": 11.637613059,
-      "end_seconds": 12.030291963,
+      "duration_seconds": 1.5745993530000002,
+      "end_seconds": 1.675604569,
       "name": "generate",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 18800640,
+      "peak_host_bytes": 19025920,
       "render": 1,
       "span": true,
-      "start_seconds": 0.392678904
+      "start_seconds": 0.101005216
     },
     {
-      "duration_seconds": 1.698199999999872e-05,
-      "end_seconds": 0.392701386,
+      "duration_seconds": 8.09499999999963e-06,
+      "end_seconds": 0.101019593,
       "name": "generate.setup",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15548416,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392684404
+      "start_seconds": 0.101011498
     },
     {
-      "duration_seconds": 5.27099999997338e-06,
-      "end_seconds": 0.392709131,
+      "duration_seconds": 5.891000000007862e-06,
+      "end_seconds": 0.101027659,
       "name": "generate.image_cond",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15548416,
       "render": 1,
       "span": false,
-      "start_seconds": 0.39270386
+      "start_seconds": 0.101021768
     },
     {
-      "duration_seconds": 9.498000000052187e-06,
-      "end_seconds": 0.392718869,
+      "duration_seconds": 9.538000000003377e-06,
+      "end_seconds": 0.101037448,
       "name": "generate.geometry",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15548416,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392709371
+      "start_seconds": 0.10102791
     },
     {
-      "duration_seconds": 5.399999999988747e-06,
-      "end_seconds": 0.392724399,
+      "duration_seconds": 5.789999999991635e-06,
+      "end_seconds": 0.101043519,
       "name": "generate.audio_input",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15548416,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392718999
+      "start_seconds": 0.101037729
     },
     {
-      "duration_seconds": 1.556999999996478e-05,
-      "end_seconds": 0.392776097,
+      "duration_seconds": 5.7009999999968475e-06,
+      "end_seconds": 0.10108022,
       "name": "generate.retake",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15548416,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392760527
+      "start_seconds": 0.101074519
     },
     {
-      "duration_seconds": 7.735000000008707e-06,
-      "end_seconds": 0.392784202,
+      "duration_seconds": 7.685999999992865e-06,
+      "end_seconds": 0.101088156,
       "name": "generate.guiders",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15548416,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392776467
+      "start_seconds": 0.10108047
     },
     {
-      "duration_seconds": 7.331900000001612e-05,
-      "end_seconds": 0.392857811,
+      "duration_seconds": 6.296100000000027e-05,
+      "end_seconds": 0.101151247,
       "name": "phase.prepare",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15458304,
+      "peak_host_bytes": 15613952,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392784492
+      "start_seconds": 0.101088286
     },
     {
-      "duration_seconds": 8.126633607,
-      "end_seconds": 8.519491788,
+      "duration_seconds": 0.809123135,
+      "end_seconds": 0.910274632,
       "name": "denoise",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15536128,
+      "peak_host_bytes": 15695872,
       "render": 1,
       "span": false,
-      "start_seconds": 0.392858181
+      "start_seconds": 0.101151497
     },
     {
-      "duration_seconds": 1.2033000000855054e-05,
-      "end_seconds": 8.519506055,
+      "duration_seconds": 1.4237000000028033e-05,
+      "end_seconds": 0.910290092,
       "name": "phase.finish",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15536128,
+      "peak_host_bytes": 15695872,
       "render": 1,
       "span": false,
-      "start_seconds": 8.519494022
+      "start_seconds": 0.910275855
     },
     {
-      "duration_seconds": 0.00013736799999897187,
-      "end_seconds": 8.519644856,
+      "duration_seconds": 8.928199999991282e-05,
+      "end_seconds": 0.910380746,
       "name": "generate.trim",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 15785984,
+      "peak_host_bytes": 15958016,
       "render": 1,
       "span": false,
-      "start_seconds": 8.519507488
+      "start_seconds": 0.910291464
     },
     {
-      "duration_seconds": 0.44752791300000005,
-      "end_seconds": 8.967174092,
+      "duration_seconds": 0.05075850999999998,
+      "end_seconds": 0.961139407,
       "name": "decode.video",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 16097280,
+      "peak_host_bytes": 16203776,
       "render": 1,
       "span": false,
-      "start_seconds": 8.519646179
+      "start_seconds": 0.910380897
     },
     {
-      "duration_seconds": 0.0004998800000013404,
-      "end_seconds": 8.967675976,
+      "duration_seconds": 0.0003520599999999874,
+      "end_seconds": 0.96149299,
       "name": "artifacts.frames",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 16162816,
+      "peak_host_bytes": 16269312,
       "render": 1,
       "span": false,
-      "start_seconds": 8.967176096
+      "start_seconds": 0.96114093
     },
     {
-      "duration_seconds": 7.911900000046046e-05,
-      "end_seconds": 8.967758242,
+      "duration_seconds": 4.436500000004617e-05,
+      "end_seconds": 0.961538376,
       "name": "decode.video",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 16162816,
+      "peak_host_bytes": 16269312,
       "render": 1,
       "span": false,
-      "start_seconds": 8.967679123
+      "start_seconds": 0.961494011
     },
     {
-      "duration_seconds": 3.0623125050000013,
-      "end_seconds": 12.03007243,
+      "duration_seconds": 0.7137334609999999,
+      "end_seconds": 1.675272639,
       "name": "decode.audio",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 18800640,
+      "peak_host_bytes": 19025920,
       "render": 1,
       "span": false,
-      "start_seconds": 8.967759925
+      "start_seconds": 0.961539178
     },
     {
-      "duration_seconds": 0.0001885850000000744,
-      "end_seconds": 12.030265714,
+      "duration_seconds": 0.010158632999999972,
+      "end_seconds": 0.971701438,
+      "name": "decode.audio.mel",
+      "nested": true,
+      "peak_device_bytes": -1,
+      "peak_host_bytes": 16158720,
+      "render": 1,
+      "span": false,
+      "start_seconds": 0.961542805
+    },
+    {
+      "duration_seconds": 0.7035639980000001,
+      "end_seconds": 1.675266528,
+      "name": "decode.audio.vocoder",
+      "nested": true,
+      "peak_device_bytes": -1,
+      "peak_host_bytes": 19025920,
+      "render": 1,
+      "span": false,
+      "start_seconds": 0.97170253
+    },
+    {
+      "duration_seconds": 0.0003107500000001373,
+      "end_seconds": 1.675587477,
       "name": "artifacts.audio",
       "nested": false,
       "peak_device_bytes": -1,
-      "peak_host_bytes": 17788928,
+      "peak_host_bytes": 17887232,
       "render": 1,
       "span": false,
-      "start_seconds": 12.030077129
+      "start_seconds": 1.675276727
     }
   ],
-  "samples": 169,
+  "sampler_enabled": true,
+  "samples": 70,
   "schema": "vllm.cpp render phase log v1",
-  "sum_leaf_seconds": 12.010601420000004,
-  "unaccounted_seconds": 0.019703307999996866,
-  "wall_seconds": 12.030304728
+  "sum_leaf_seconds": 1.67361294,
+  "sum_rule": "sum_leaf_seconds adds only records with span=false and nested=false. A span encloses leaves and a nested record decomposes one, so adding either would make unaccounted_seconds the residue of double counting instead of time nobody named.",
+  "unaccounted_seconds": 0.0020583180000000034,
+  "wall_seconds": 1.675671258
 }

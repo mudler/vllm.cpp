@@ -26,6 +26,7 @@
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
@@ -1417,9 +1418,17 @@ LoadedEngine::LoadedEngine(HfConfig config,
                            tok::Tokenizer tokenizer,
                            const EngineParams& params,
                            vt::Queue* preselected_queue,
-                           std::unique_ptr<DflashDraft> dflash_draft)
+                           std::unique_ptr<DflashDraft> dflash_draft,
+                           std::optional<multimodal::Qwen3VLVisionWeights>
+                               vision_tower,
+                           multimodal::Qwen3VLVisionConfig vision_config)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
+      // LOAD-GGUF-MMPROJ: the `clip` projector's tower, already loaded and
+      // already refused-or-accepted by FromModelDir before the tokenizer.
+      // nullopt on every load that named no --mmproj.
+      vision_tower_(std::move(vision_tower)),
+      vision_config_(vision_config),
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
@@ -1816,6 +1825,21 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     RefuseDflash2Draft(*params.speculative_config->draft_model_path);
   }
 
+  // LOAD-GGUF-MMPROJ (#821): a projector is a SECOND GGUF beside a GGUF
+  // language file, and nothing else. A safetensors checkpoint carries its
+  // vision tower in its own shards, so accepting --mmproj there and quietly
+  // ignoring it would load a tower the user did not ask for and drop the one
+  // they named. Refuse by name instead, before any path or config I/O.
+  if (!params.mmproj_path.empty() &&
+      !(fs::is_regular_file(dir) && dir.extension() == ".gguf")) {
+    throw std::runtime_error(
+        "--mmproj: a multimodal projector attaches to a .gguf language file, "
+        "and '" +
+        model_dir +
+        "' is not one. A safetensors checkpoint carries its vision tower in "
+        "its own shards and needs no projector file");
+  }
+
   // A single `.gguf` file: config + weights + tokenizer all come from the
   // GGUF (M0.10). The engine stack below is unchanged.
   if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
@@ -1930,6 +1954,26 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           /*model_dtype_bytes=*/2, lane);
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
+    // LOAD-GGUF-MMPROJ (#821): the SECOND file. Opened, validated and READ
+    // here — after the architecture resolve and the device-fit refusal, and
+    // BEFORE the tokenizer and every weight byte — for the same reason the fit
+    // refusal sits there: a projector this build cannot load must cost the user
+    // a message, not a 17 GB map followed by one.
+    //
+    // llama.cpp's `--mmproj` is the user-facing convention this mirrors
+    // (b10451 `tools/mtmd/mtmd-cli.cpp`); the file is a `clip`-architecture
+    // GGUF and NOT a shard of the language file, which is why
+    // `GgufFile::Open`'s own `DetectSplit` shard merge is not the seam.
+    std::optional<multimodal::Qwen3VLVisionWeights> vision_tower;
+    multimodal::Qwen3VLVisionConfig vision_config;
+    std::optional<vllm::GgufFile> mmproj;
+    if (!params.mmproj_path.empty()) {
+      mmproj = vllm::GgufFile::Open(params.mmproj_path);
+      vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
+      vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
+      vision_tower =
+          vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+    }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
     // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
     // branch's inline `IsDenseArch` split is superseded by
@@ -1999,7 +2043,8 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     }
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
-        /*preselected_queue=*/nullptr, std::move(dflash)));
+        /*preselected_queue=*/nullptr, std::move(dflash),
+        std::move(vision_tower), vision_config));
   }
 
   // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config

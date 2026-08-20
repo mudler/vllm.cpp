@@ -1515,8 +1515,9 @@ TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(vllm_abi_version() >= 16);
   // The multimodal input limits are ABI v19; the speech/music slice
   // (vllm_speech_* / vllm_synthesize) is ABI v20; the speech device selector is
-  // v21; the render phase table (vllm_video_last_phase_log, issue #1010) is v22.
-  CHECK(vllm_abi_version() >= 22);
+  // v21; `vllm_model_params.mmproj_path` (issue #821) is v22; the render phase
+  // table (vllm_video_last_phase_log, issue #1010) is v23.
+  CHECK(vllm_abi_version() >= 23);
   // And the symbol is LINKED, not merely declared: a NULL handle answers NULL
   // rather than crashing, which is the contract every other handle query here
   // holds to.

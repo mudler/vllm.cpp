@@ -344,15 +344,45 @@ TEST_CASE("a STREAMED tower that reaches device staging is refused BY NAME") {
   CHECK(tower.d_dev == nullptr);
 }
 
-TEST_CASE("an unclaimed tower still stages normally, so the refusal is not a blanket") {
+TEST_CASE("an unclaimed tower is served normally, so the refusal is not a blanket") {
   // The negative control for the case above. A refusal that fired for every
   // tower would pass that case and break every model, so the same helper must
-  // succeed on a tower the lane never touched.
+  // SUCCEED on a tower the lane never touched.
+  //
+  // WHAT IT MEANS BY "NORMALLY" CHANGED UNDER IT, and the change is the point of
+  // W0f (issue #1299). This case used to assert `d_dev != nullptr` — that the
+  // tower was STAGED. On a host-addressable platform `ResidentWeight` no longer
+  // stages anything: it hands back the tower's own host bytes, because the
+  // second copy bought nothing on a part where device memory IS host memory and
+  // cost the whole box. So the assertion here is the property this case was
+  // always about — the refusal did NOT fire and a usable tensor came back —
+  // stated without pinning WHICH residency serves it. The discrete arm, where
+  // "normally" still means a staged copy, is asserted in the case above and in
+  // `test_resident_weight_host_addressable`.
   const HostAddressable host_addressable(true);
   const OwnedTensor plain = MakeTower(/*tag=*/5);
   Queue q = XpuQueue();
 
   CHECK_FALSE(plain.expert_streamed);
-  CHECK_NOTHROW(vllm::detail::StageWeightForTest(q, plain));
-  CHECK(plain.d_dev != nullptr);
+  Tensor t;
+  CHECK_NOTHROW(t = vllm::detail::StageWeightForTest(q, plain));
+  REQUIRE(t.data != nullptr);
+  // Served from the tower's own host bytes, and not staged (W0f).
+  CHECK(plain.d_dev == nullptr);
+  CHECK(t.data == static_cast<const void*>(plain.bytes.data()));
+  CHECK(std::memcmp(t.data, plain.bytes.data(), plain.bytes.size()) == 0);
+
+  // And on a DISCRETE platform the same helper still stages, which is what keeps
+  // "the refusal is not a blanket" true on both arms rather than only the one
+  // W0f changed.
+  {
+    const HostAddressable discrete_platform(false);
+    const OwnedTensor discrete = MakeTower(/*tag=*/6);
+    const int allocs_before = Fake().allocs;
+    Tensor dt;
+    CHECK_NOTHROW(dt = vllm::detail::StageWeightForTest(q, discrete));
+    CHECK(discrete.d_dev != nullptr);
+    CHECK(Fake().allocs == allocs_before + 1);
+    CHECK(dt.data == discrete.d_dev.get());
+  }
 }

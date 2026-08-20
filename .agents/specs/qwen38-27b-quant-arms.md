@@ -899,10 +899,19 @@ Both are third-party Unsloth quantizations, not first-party releases.
 
 **What the real bytes CONFIRMED**, none of it contradicted:
 
-- Every one of the eleven `clip.*` keys the reader requires is present under the
-  spelling it reads, and the geometry is hidden 1152, 16 heads, 27 blocks,
-  feed-forward 4304, projection 5120, patch 16, spatial merge 2, layer-norm
-  epsilon 1e-6.
+- Every one of the nine `clip.*` keys the reader spells is present under the
+  spelling it reads, and so are the two `general.*` keys beside them, which the
+  header read above records as `general.architecture = clip` and
+  `general.type = mmproj`. `clip_mmproj_gguf.cpp:20-30` is nine `clip.*` plus
+  those two `general.*`, which is where the earlier count of eleven came from,
+  and `clip.*` was the wrong prefix for two of them. Eight of the nine are
+  REQUIRED: `clip.projector_type`, whose absence `RefuseUnsupportedClipMmproj`
+  reports as `<absent>` rather than defaulting, plus the six `ReqInt` geometry
+  keys and the `ReqFloat` epsilon. Only `clip.vision.spatial_merge_size` is
+  OPTIONAL, read as `OptInt` with a default of 2, so this file states it rather
+  than the reader assuming it. The geometry is hidden 1152, 16 heads, 27
+  blocks, feed-forward 4304, projection 5120, patch 16, spatial merge 2,
+  layer-norm epsilon 1e-6.
 - `in_channels = 3` and `num_position_embeddings = 2304` come off the tensor
   shapes, which is the only place the file states them, and the shapes are the
   ones the reader's checks demand: `v.patch_embd.weight` is torch

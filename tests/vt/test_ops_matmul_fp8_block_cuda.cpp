@@ -21,18 +21,22 @@
 // criterion below is upstream's own.
 //
 //   G2  upstream's `test_w8a8_block_fp8_cutlass_matmul`
-//       (tests/kernels/quantization/test_block_fp8.py) ported whole:
-//       M=32, N=576, K=7168, block [128,128], bf16 out, scales U(0,1)*1e-2,
-//       compared at `rel_diff < 0.001` computed by upstream's own formula. N=576
-//       is 4*128 + 64 — a RAGGED final block, which is why upstream chose it
-//       (DSV3's kv_a_proj_with_mqa).
+//       (tests/kernels/quantization/test_block_fp8.py): M=32, N=576, K=7168,
+//       block [128,128], bf16 out, scales U(0,1)*1e-2, compared at
+//       `rel_diff < 0.001` computed by upstream's own formula. N=576 is
+//       4*128 + 64 — a RAGGED final block, which is why upstream chose it
+//       (DSV3's kv_a_proj_with_mqa) and which is exactly why THE sm120 ARM
+//       CANNOT SERVE IT (#1437). The case therefore asserts the named refusal
+//       for upstream's own shape and runs upstream's fixture and criterion on
+//       the nearest servable N; the adaptation is documented at the case.
 //   G6  the test's own precondition, and it runs on EVERY host including one
-//       with no device: every shape the cases below use must be accepted by
-//       `Fp8BlockScaledRefusalFor`. A grid that the arm refuses would make every
-//       case throw, and a harness that then reported "skipped" would be lying in
-//       the other direction.
+//       with no device: every shape the cases below use must get the refusal the
+//       hand-written `expect` column names. It used to assert that every shape
+//       is ACCEPTED, and it passed while three of them threw — a precondition
+//       that agrees with the wrong side certifies a grid nothing can run.
 //   G7  the M sweep across all three tile configs, with the dispatch counter
-//       asserted to advance on the config the heuristic named.
+//       asserted to advance on the config the heuristic named, plus the named
+//       refusal for each unservable shape.
 //   G8  the f32 sink equals the bf16 result cast up.
 //   G9  the refusals, on a device, by message.
 //
@@ -68,6 +72,7 @@ using vt::cuda::Fp8BlockScaledRefusal;
 using vt::cuda::Fp8BlockScaledRefusalFor;
 using vt::cuda::Fp8BlockScaledStats;
 using vt::cuda::Fp8BlockScaledStatsSnapshot;
+using vt::cuda::kFp8BlockScaledScaleBlockN;
 
 bool HasCuda() {
   try {
@@ -164,6 +169,11 @@ std::vector<float> RandomScales(size_t n, uint32_t seed) {
 struct BlockCase {
   int64_t m = 0, n = 0, k = 0;
   int block_n = 128, block_k = 128;
+  // The refusal this shape MUST get from `Fp8BlockScaledRefusalFor`, written out
+  // by hand from the sm120 collective's `can_implement` and never computed from
+  // the predicate. G6 asserts the predicate against this column; G7 then drives
+  // each shape down the arm the column names.
+  Fp8BlockScaledRefusal expect = Fp8BlockScaledRefusal::kNone;
 };
 
 // The CPU reference arm of the SAME op, run on a CPU queue in this process.
@@ -280,23 +290,59 @@ void CheckNonVacuous(const std::vector<float>& v) {
   CHECK(nonzero * 10 > v.size() * 9);
 }
 
-// The full grid this file drives, in one place, so G6 can assert the arm accepts
-// every shape in it before any of them is run.
+// The full grid this file drives, in one place, with the refusal each shape must
+// get. THREE OF THESE ARE REFUSED SINCE #1437, and the column is why this file
+// no longer pretends otherwise: the sm120 blockwise collective's `can_implement`
+// requires complete scale blocks (`N % 128 == 0`, on the collective's N
+// unswapped and on its M under swap_ab) and full tiles in K (`K % 128 == 0`).
+// A ragged N or K is expressible in the deduced scale layout and CUTLASS refuses
+// it anyway. The sm90 sibling collective does not, which is why this is an sm120
+// gap and not a property of block-wise FP8.
 const std::vector<BlockCase>& Grid() {
   static const std::vector<BlockCase> grid = {
-      // upstream's own CUTLASS case: DSV3 kv_a_proj_with_mqa, ragged N.
-      {32, 576, 7168, 128, 128},
+      // upstream's own CUTLASS case: DSV3 kv_a_proj_with_mqa, ragged N. 576 is
+      // 4*128 + 64, and THE sm120 ARM CANNOT SERVE IT. This is the shape that
+      // threw `cutlass Invalid status` on a GB10 on 2026-08-20.
+      {32, 576, 7168, 128, 128, Fp8BlockScaledRefusal::kScaleBlockN},
       // the M sweep, one per tile config and both clauses of the swap_ab OR.
       {1, 512, 1024, 128, 128},     // swapab: M <= 64, and decode's own shape
       {7, 512, 1024, 128, 128},     // swapab: M <= 64
-      {8, 576, 1024, 128, 128},     // swapab: M <= 64, ragged N
+      // ragged N again, on the OTHER tile config, so the refusal is not pinned
+      // to one config by accident.
+      {8, 576, 1024, 128, 128, Fp8BlockScaledRefusal::kScaleBlockN},
       {83, 512, 1024, 128, 128},    // swapab: M > 64 but 83 % 4 != 0
       {200, 512, 1024, 128, 128},   // pingpong: M > 64, 200 % 4 == 0, M <= 256
       {512, 512, 1024, 128, 128},   // default: M > 256
-      // a ragged K-block that is still 16-aligned: 1088 = 8*128 + 64.
-      {8, 512, 1088, 128, 128},
+      // THE N FLOOR, AND THE ONLY ENTRY THAT BINDS OVER-REFUSAL. Every other
+      // servable N here is 512, and 512 is a multiple of 256, 128 and 64 alike,
+      // so a `kFp8BlockScaledScaleBlockN` raised above 128 -- a predicate that
+      // turns away shapes the collective CAN implement -- left this whole file
+      // green while refusing real work. 128 is the smallest N the sm120
+      // collective serves: one complete scale block, and exactly one N-tile of
+      // the pingpong config. M = 200 is reused from the entry above on purpose
+      // (200 > 64, 200 % 4 == 0, 200 <= 256, so `Fp8BlockScaledConfigFor` names
+      // pingpong for both) -- this entry is an N-axis probe and adds no new M
+      // behaviour to the sweep.
+      {200, 128, 1024, 128, 128},   // pingpong, N at the collective's floor
+      // ragged N on the UNSWAPPED path: M=512 takes `default`, where the ragged
+      // extent is the collective's own N at ScaleGranularityN=128 rather than its
+      // M under swap. Same number, different slot, same refusal — which is what
+      // makes "the swap is the bug" falsifiable here.
+      {512, 576, 1024, 128, 128, Fp8BlockScaledRefusal::kScaleBlockN},
+      // a ragged K-block that is still 16-aligned: 1088 = 8*128 + 64. It fails a
+      // DIFFERENT line of `can_implement` from the two above, which is what makes
+      // it the independent check on the root cause rather than a repetition.
+      {8, 512, 1088, 128, 128, Fp8BlockScaledRefusal::kTileK},
   };
   return grid;
+}
+
+// The servable half, which is the half G7 compares against the CPU reference.
+std::vector<BlockCase> ServableGrid() {
+  std::vector<BlockCase> v;
+  for (const BlockCase& c : Grid())
+    if (c.expect == Fp8BlockScaledRefusal::kNone) v.push_back(c);
+  return v;
 }
 
 }  // namespace
@@ -304,23 +350,42 @@ const std::vector<BlockCase>& Grid() {
 // ---------------------------------------------------------------------------
 // G6 — the instrument's own precondition. RUNS EVERYWHERE, device or not.
 // ---------------------------------------------------------------------------
-TEST_CASE("G6 every shape this file drives is one the CUDA arm accepts") {
+//
+// IT USED TO ASSERT THAT EVERY SHAPE HERE IS ACCEPTED, AND IT PASSED WHILE THE
+// KERNEL THREW ON THREE OF THEM (#1437). The predicate and the collective's
+// `can_implement` disagreed, and a precondition that agrees with the wrong side
+// is worse than none: it certified the grid on the very machine that could not
+// run it. So the case now asserts the PARTITION against the hand-written
+// `expect` column, which is the same obligation stated in a form that can fail.
+TEST_CASE("G6 every shape this file drives gets the refusal the collective gives it") {
+  size_t servable = 0, scale_block_n = 0, tile_k = 0;
   for (const BlockCase& c : Grid()) {
     CAPTURE(c.m);
     CAPTURE(c.n);
     CAPTURE(c.k);
-    CHECK(Fp8BlockScaledRefusalFor(c.n, c.k, c.block_n, c.block_k) ==
-          Fp8BlockScaledRefusal::kNone);
+    CHECK(Fp8BlockScaledRefusalFor(c.n, c.k, c.block_n, c.block_k) == c.expect);
     // ... and the activation quant's own divisibility is not assumed: the op
     // tiles K with cdiv, so a ragged K is legal for THIS op even where
     // vt::QuantFp8Group would refuse it.
     CHECK(c.k > 0);
     CHECK(CDiv(c.k, c.block_k) >= 1);
+    if (c.expect == Fp8BlockScaledRefusal::kNone) ++servable;
+    if (c.expect == Fp8BlockScaledRefusal::kScaleBlockN) ++scale_block_n;
+    if (c.expect == Fp8BlockScaledRefusal::kTileK) ++tile_k;
   }
-  // All three tile configs are exercised by the grid; a sweep that silently
-  // covered one config would prove far less than it looks.
+  // BOTH LANES ARE NON-EMPTY. A grid that drifted to all-servable would silently
+  // stop testing the refusal, and a grid that drifted to all-refused would leave
+  // G7 with nothing to compare against the CPU reference while still reporting a
+  // pass — which is the exact shape of the failure #1437 found.
+  CHECK(servable >= 6);
+  CHECK(scale_block_n >= 2);
+  CHECK(tile_k >= 1);
+  CHECK(servable + scale_block_n + tile_k == Grid().size());
+
+  // All three tile configs are exercised by the SERVABLE half; a sweep whose
+  // only entry for a config was a refused shape would compare nothing there.
   bool swap = false, ping = false, deflt = false;
-  for (const BlockCase& c : Grid()) {
+  for (const BlockCase& c : ServableGrid()) {
     switch (Fp8BlockScaledConfigFor(c.m)) {
       case Fp8BlockScaledConfig::kSwapAb:
         swap = true;
@@ -337,17 +402,111 @@ TEST_CASE("G6 every shape this file drives is one the CUDA arm accepts") {
   CHECK(swap);
   CHECK(ping);
   CHECK(deflt);
+  // AND THE SERVABLE LANE REACHES THE N FLOOR, which is what makes the partition
+  // above bind in the OVER-refusal direction. A grid whose servable N is 512
+  // everywhere cannot tell 128 from 256 or 64: raise
+  // `kFp8BlockScaledScaleBlockN` to 256 and every check in this file still
+  // passes, because 512 % 256 == 0. One servable entry at N = 128 fails the
+  // moment the predicate refuses more than the collective does.
+  bool servable_at_n_floor = false;
+  for (const BlockCase& c : ServableGrid())
+    if (c.n == kFp8BlockScaledScaleBlockN) servable_at_n_floor = true;
+  CHECK(servable_at_n_floor);
+  // The refused half spans the SWAPPED and the UNSWAPPED path, so "the swap is
+  // the bug" is falsifiable rather than merely unasserted. A ragged N is refused
+  // on both, because it is the collective's M under swap and its N without it,
+  // at granularity 128 either way.
+  bool refused_swapped = false, refused_unswapped = false;
+  for (const BlockCase& c : Grid()) {
+    if (c.expect == Fp8BlockScaledRefusal::kNone) continue;
+    if (Fp8BlockScaledConfigFor(c.m) == Fp8BlockScaledConfig::kSwapAb)
+      refused_swapped = true;
+    else
+      refused_unswapped = true;
+  }
+  CHECK(refused_swapped);
+  CHECK(refused_unswapped);
 }
 
 // ---------------------------------------------------------------------------
-// G2 — upstream's CUTLASS case, against the CPU reference arm
+// G2 — upstream's CUTLASS case, and the one adaptation the arch forces
 // ---------------------------------------------------------------------------
-TEST_CASE("G2 the CUDA block-scaled GEMM matches the CPU reference on upstream's case") {
+//
+// THE ADAPTATION, STATED IN FULL, because `.agents/porting.md` allows one only
+// when it is unavoidable and only when it is documented. Upstream's
+// `test_w8a8_block_fp8_cutlass_matmul` is M=32, N=576, K=7168, and N=576 is
+// 4*128 + 64 because DSV3's `kv_a_proj_with_mqa` is that wide. On sm120 that
+// shape CANNOT REACH THE GEMM: the collective's `can_implement` requires
+// `N % ScaleGranularityN == 0` with the granularity at 128. Upstream gates the
+// module only at `get_device_capability() < (9, 0)`
+// (`tests/kernels/quantization/test_block_fp8.py`), so cc 12.1 passes its gate
+// and upstream's own test cannot succeed on this arch either; the shape is
+// served by the sm90/sm100 collectives, which have no such line.
+//
+// So this case does BOTH halves, and neither is the other's substitute:
+//
+//   1. upstream's exact shape must be REFUSED BY NAME. That is the fix #1437
+//      owns — before it, the shape reached CUTLASS and came back as
+//      `cutlass Invalid status`, which names no constraint and no dimension.
+//   2. upstream's FIXTURE, CRITERION AND FORMULA are then run on the nearest
+//      servable N — 512 instead of 576, everything else identical — so the
+//      value comparison this case exists for still happens and still fails
+//      loudly if the kernel regresses on a shape it CAN serve.
+//
+// Half 2 is NOT evidence that the arm works: it has never run on a device. The
+// row's `## Owed` says so and nothing here softens it.
+TEST_CASE("G2 upstream's CUTLASS case is refused by name, and its criterion runs on the "
+          "nearest servable N") {
+  // Half 1's host tier runs EVERYWHERE, because the predicate is host-side and a
+  // GPU-less box can hold it to the collective's line.
+  const BlockCase up{32, 576, 7168, 128, 128, Fp8BlockScaledRefusal::kScaleBlockN};
+  CHECK(Fp8BlockScaledRefusalFor(up.n, up.k, up.block_n, up.block_k) == up.expect);
+
   if (!HasCuda()) {
-    MESSAGE("NO CUDA DEVICE: G2 did not run. #1189 M5's on-hardware leg is OWED, not passed.");
+    MESSAGE("NO CUDA DEVICE: G2's device half did not run. #1189 M5's on-hardware leg is "
+            "OWED, not passed.");
     return;
   }
-  const BlockCase c{32, 576, 7168, 128, 128};
+
+  // Half 1, on the device: the arm refuses before it allocates or launches, and
+  // the message names the dimension, its value and the granularity — the three
+  // things `cutlass Invalid status` did not say.
+  {
+    Backend& backend = vt::GetBackend(DeviceType::kCUDA);
+    QueueGuard g(backend);
+    const int64_t kt = CDiv(up.k, up.block_k), nt = CDiv(up.n, up.block_n);
+    DeviceTensor da(backend, g.q, DType::kI8, {up.m, up.k});
+    DeviceTensor das(backend, g.q, DType::kF32, {up.m, kt});
+    DeviceTensor db(backend, g.q, DType::kI8, {up.n, up.k});
+    DeviceTensor dbs(backend, g.q, DType::kF32, {nt, kt});
+    DeviceTensor dout(backend, g.q, DType::kBF16, {up.m, up.n});
+    const Fp8BlockScaledStats before = Fp8BlockScaledStatsSnapshot();
+    std::string what;
+    try {
+      vt::MatmulFp8BlockScaled(g.q, dout.tensor(), da.tensor(), das.tensor(), db.tensor(),
+                               dbs.tensor(), up.block_n, up.block_k);
+      FAIL("N = 576 must be refused by name on the sm120 arm");
+    } catch (const std::runtime_error& e) {
+      what = e.what();
+    }
+    CHECK(what.find("N is 576") != std::string::npos);
+    CHECK(what.find("multiple of 128") != std::string::npos);
+    CHECK(what.find("sm120") != std::string::npos);
+    // NOT the bare CUTLASS status. That string is what a user got before #1437,
+    // and a refusal that degraded back to it would pass every check above that
+    // only looked for a throw.
+    CHECK(what.find("cutlass Invalid status") == std::string::npos);
+    const Fp8BlockScaledStats after = Fp8BlockScaledStatsSnapshot();
+    CHECK(after.refused - before.refused == 1);
+    CHECK(after.dispatched() == before.dispatched());
+  }
+
+  // Half 2: upstream's fixture and criterion, with N = 512. 512 is the largest
+  // multiple of 128 below 576, so it is the nearest shape of upstream's own case
+  // that this collective can implement.
+  const BlockCase c{32, 512, 7168, 128, 128};
+  REQUIRE(Fp8BlockScaledRefusalFor(c.n, c.k, c.block_n, c.block_k) ==
+          Fp8BlockScaledRefusal::kNone);
   const auto a = RandomFp8Bytes(static_cast<size_t>(c.m) * c.k, 1);
   const auto b = RandomFp8Bytes(static_cast<size_t>(c.n) * c.k, 2);
   const auto as = RandomScales(static_cast<size_t>(c.m) * CDiv(c.k, c.block_k), 3);
@@ -367,7 +526,15 @@ TEST_CASE("G2 the CUDA block-scaled GEMM matches the CPU reference on upstream's
 // ---------------------------------------------------------------------------
 // G7 — the M sweep, with the dispatch counter
 // ---------------------------------------------------------------------------
-TEST_CASE("G7 every tile config matches the CPU reference and reports itself") {
+//
+// SINCE #1437 the sweep has two arms, because the grid does. A shape the sm120
+// collective cannot implement is driven to its NAMED REFUSAL, and a shape it can
+// is compared against the CPU reference exactly as before. Neither arm is
+// weakened by the other's presence: the servable half still covers all three
+// tile configs (G6 asserts that it does), so a kernel that regressed on a shape
+// it can serve still fails here.
+TEST_CASE("G7 every tile config matches the CPU reference, and every unservable shape is "
+          "refused by name") {
   if (!HasCuda()) {
     MESSAGE("NO CUDA DEVICE: G7 did not run. #1189 M5's on-hardware leg is OWED, not passed.");
     return;
@@ -377,6 +544,48 @@ TEST_CASE("G7 every tile config matches the CPU reference and reports itself") {
     CAPTURE(c.m);
     CAPTURE(c.n);
     CAPTURE(c.k);
+
+    // THE REFUSED ENTRIES ARE STILL DRIVEN, and that is deliberate. Skipping
+    // them would leave the sweep proving nothing about the shapes the arm has to
+    // turn away, and the previous version of this loop ABORTED AT Grid()[0] on
+    // one of them, so seven of eight shapes were never attempted at all. Each
+    // refused entry now asserts a named refusal, no dispatch, and one refusal
+    // counted — the same three facts the servable entries assert in the mirror.
+    if (c.expect != Fp8BlockScaledRefusal::kNone) {
+      Backend& backend = vt::GetBackend(DeviceType::kCUDA);
+      QueueGuard g(backend);
+      const int64_t kt = CDiv(c.k, c.block_k), nt = CDiv(c.n, c.block_n);
+      DeviceTensor da(backend, g.q, DType::kI8, {c.m, c.k});
+      DeviceTensor das(backend, g.q, DType::kF32, {c.m, kt});
+      DeviceTensor db(backend, g.q, DType::kI8, {c.n, c.k});
+      DeviceTensor dbs(backend, g.q, DType::kF32, {nt, kt});
+      DeviceTensor dout(backend, g.q, DType::kBF16, {c.m, c.n});
+      const Fp8BlockScaledStats before = Fp8BlockScaledStatsSnapshot();
+      std::string what;
+      try {
+        vt::MatmulFp8BlockScaled(g.q, dout.tensor(), da.tensor(), das.tensor(), db.tensor(),
+                                 dbs.tensor(), c.block_n, c.block_k);
+        FAIL("this shape must be refused by name on the sm120 arm");
+      } catch (const std::runtime_error& e) {
+        what = e.what();
+      }
+      // The message names the RAGGED DIMENSION, not merely some dimension: a
+      // kTileK that answered with the N text would name 512 here and pass a
+      // check that only looked for "128".
+      const std::string ragged =
+          c.expect == Fp8BlockScaledRefusal::kTileK
+              ? "K is " + std::to_string(c.k)
+              : "N is " + std::to_string(c.n);
+      CAPTURE(ragged);
+      CHECK(what.find(ragged) != std::string::npos);
+      CHECK(what.find("multiple of 128") != std::string::npos);
+      CHECK(what.find("cutlass Invalid status") == std::string::npos);
+      const Fp8BlockScaledStats after = Fp8BlockScaledStatsSnapshot();
+      CHECK(after.refused - before.refused == 1);
+      CHECK(after.dispatched() == before.dispatched());
+      continue;
+    }
+
     const auto a = RandomFp8Bytes(static_cast<size_t>(c.m) * c.k, seed++);
     const auto b = RandomFp8Bytes(static_cast<size_t>(c.n) * c.k, seed++);
     const auto as = RandomScales(static_cast<size_t>(c.m) * CDiv(c.k, c.block_k), seed++);

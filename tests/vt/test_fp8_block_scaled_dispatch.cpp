@@ -20,8 +20,10 @@
 //       shape, against a hand-derived table.
 //   G4  the refusals, each by name and by message, and — the other half, which
 //       is the one a refusal test usually forgets — the shapes that must NOT be
-//       refused, including the ragged N=576 that upstream's own CUTLASS test
-//       runs.
+//       refused. The ragged N=576 that upstream's own CUTLASS test uses is in
+//       the REFUSED half since #1437: this file asserted it was accepted, that
+//       assertion passed, and the kernel then threw `cutlass Invalid status` on
+//       it.
 //   G5  the dispatch counter's accounting.
 //
 // (G2 and G6-G9 are the device-tier cases in the sibling file. The numbering is
@@ -190,21 +192,51 @@ TEST_CASE("G3 the deduced scale layouts match a hand-derived index table") {
 // ---------------------------------------------------------------------------
 TEST_CASE("G4 the CUDA arm refuses exactly what cutlass cannot implement") {
   // --- accepted, and this half is load-bearing --------------------------------
-  // A RAGGED 128-BLOCK IS NOT A REFUSAL. Upstream's own CUTLASS test is
-  // M=32, N=576, K=7168 — 576 is 4*128 + 64 — chosen because DSV3's
-  // kv_a_proj_with_mqa has that shape
-  // (tests/kernels/quantization/test_block_fp8.py,
-  // test_w8a8_block_fp8_cutlass_matmul). A refusal predicate that keyed on
-  // `N % 128` instead of `N % 16` would reject the one shape upstream gates.
-  CHECK(Fp8BlockScaledRefusalFor(576, 7168, 128, 128) == Fp8BlockScaledRefusal::kNone);
   // The target checkpoint's ten projections are all round; q_proj is the
   // largest.
   CHECK(Fp8BlockScaledRefusalFor(12288, 5120, 128, 128) == Fp8BlockScaledRefusal::kNone);
   CHECK(Fp8BlockScaledRefusalFor(5120, 12288, 128, 128) == Fp8BlockScaledRefusal::kNone);
-  // Ragged on both axes at once, still aligned to 16.
-  CHECK(Fp8BlockScaledRefusalFor(576, 4096 + 64, 128, 128) == Fp8BlockScaledRefusal::kNone);
-  // Exactly 16 is aligned; the boundary is `% 16`, not `>= 128`.
-  CHECK(Fp8BlockScaledRefusalFor(16, 16, 128, 128) == Fp8BlockScaledRefusal::kNone);
+
+  // Ragged in NEITHER, and the smallest such shape: 128 is one whole scale block
+  // and one whole K tile.
+  CHECK(Fp8BlockScaledRefusalFor(128, 128, 128, 128) == Fp8BlockScaledRefusal::kNone);
+
+  // --- #1437: the sm120 collective's own two floors -----------------------------
+  // A RAGGED 128-BLOCK *IS* A REFUSAL HERE, and this file asserted the opposite
+  // until the shape was run. `sm120_mma_tma_blockwise_scaling.hpp::can_implement`
+  // adds three lines the TMA-alignment floor does not imply:
+  //
+  //     implementable = implementable && (M % ScaleGranularityM == 0);
+  //     implementable = implementable && (N % ScaleGranularityN == 0);
+  //     implementable = implementable && (K % size<2>(TileShape{}) == 0);
+  //
+  // The sm90 sibling has no such block. Derived per config, by hand, from the
+  // granularities the three configs instantiate and the problem shape
+  // `RunBlockwiseGemm` builds — `(m,n,k)` unswapped, `(n,m,k)` under swap:
+  //
+  //   default  <1,128,128>   prob (m,n,k): N % 128 -> n, K % 128 -> k
+  //   pingpong <1,128,128>   prob (m,n,k): N % 128 -> n, K % 128 -> k
+  //   swapab   <128,1,128>   prob (n,m,k): M % 128 -> n, K % 128 -> k
+  //
+  // so `n` is constrained in all three and `m` in none, and THE SWAP DOES NOT
+  // MOVE IT. Upstream's own CUTLASS case is the first line below: M=32 N=576
+  // K=7168, ragged N, which threw `cutlass Invalid status` on a GB10 on
+  // 2026-08-20 while this predicate accepted it (#1437).
+  CHECK(Fp8BlockScaledRefusalFor(576, 7168, 128, 128) == Fp8BlockScaledRefusal::kScaleBlockN);
+  // The M=8 grid entry of the same file: swapab rather than the same config, and
+  // refused for the same reason, which is the point of deriving all three.
+  CHECK(Fp8BlockScaledRefusalFor(576, 1024, 128, 128) == Fp8BlockScaledRefusal::kScaleBlockN);
+  // 16-aligned, 128-ragged. This is the pair that tells the two floors apart: a
+  // predicate that only carried `% 16` accepts both of these.
+  CHECK(Fp8BlockScaledRefusalFor(16, 4096, 128, 128) == Fp8BlockScaledRefusal::kScaleBlockN);
+  CHECK(Fp8BlockScaledRefusalFor(512, 1088, 128, 128) == Fp8BlockScaledRefusal::kTileK);
+  // Ragged on BOTH axes: K is asked first, so the K message is the one a reader
+  // gets, and rounding K alone would then return the N refusal.
+  CHECK(Fp8BlockScaledRefusalFor(576, 4096 + 64, 128, 128) == Fp8BlockScaledRefusal::kTileK);
+  CHECK(Fp8BlockScaledRefusalFor(16, 16, 128, 128) == Fp8BlockScaledRefusal::kTileK);
+  // The COARSE floor still answers first where it applies, because `% 16` is
+  // upstream's line and `% 128` is CUTLASS's, and they are different authorities.
+  // 578 and 3884 fail both; the assertions further down pin which one answers.
 
   // --- refused ----------------------------------------------------------------
   // K = 3884 is the other non-round shape in upstream's grid
@@ -251,10 +283,53 @@ TEST_CASE("G4 the CUDA arm refuses exactly what cutlass cannot implement") {
       Fp8BlockScaledRefusalMessage(Fp8BlockScaledRefusal::kAlignN, 578, 4096, 128, 128);
   CHECK(Contains(n_msg, "578"));
   CHECK(Contains(n_msg, "remainder of 2"));
-  // The N message says out loud that a ragged 128-block is a DIFFERENT thing, so
-  // the next reader does not "fix" the predicate into `% 128`.
-  CHECK(Contains(n_msg, "576"));
-  CHECK(Contains(n_msg, "RAGGED"));
+  // The coarse N message must POINT AT the stricter floor, or a reader rounds
+  // 578 up to 592 and is refused again by a different line. It used to say the
+  // opposite — "a ragged 128-block is fine, N = 576 runs" — which is the claim
+  // #1437 falsified on hardware.
+  CHECK(Contains(n_msg, "N % 128"));
+  CHECK(!Contains(n_msg, "576"));
+
+  // --- the two sm120-collective messages, #1437 --------------------------------
+  // Each must name the DIMENSION, its VALUE, the granularity it has to be a
+  // multiple of, and that this is the sm120 collective's line and not a general
+  // property of block-wise FP8 — because the same shape runs on sm90 and on the
+  // CPU arm of this same op, and a reader told only "invalid" cannot tell those
+  // apart. That is exactly what `cutlass Invalid status` failed to say.
+  const std::string sbn_msg =
+      Fp8BlockScaledRefusalMessage(Fp8BlockScaledRefusal::kScaleBlockN, 576, 7168, 128, 128);
+  CHECK(Contains(sbn_msg, "N is 576"));
+  CHECK(Contains(sbn_msg, "remainder of 64"));
+  CHECK(Contains(sbn_msg, "multiple of 128"));
+  CHECK(Contains(sbn_msg, "sm120"));
+  // The WHOLE clause, not the bare token: "sm120" appears five times in this
+  // message, so a bare-token check stays green with the "not a general one"
+  // sentence deleted — the one sentence that tells a reader the shape is not
+  // universally unservable.
+  CHECK(Contains(sbn_msg, "NOT A GENERAL ONE"));
+  CHECK(Contains(sbn_msg, "sm90"));
+  // The swap is named, because "the swap will fix it" is the first thing a
+  // reader of the three configs guesses, and it is wrong.
+  CHECK(Contains(sbn_msg, "SWAP DOES NOT MOVE THIS"));
+  // The capability consequence, by name, so a DSV3 user is not left deriving it.
+  CHECK(Contains(sbn_msg, "kv_a_proj_with_mqa"));
+  CHECK(Contains(sbn_msg, "#1437"));
+  CHECK(Contains(sbn_msg, "CPU reference arm runs this shape"));
+
+  const std::string tk_msg =
+      Fp8BlockScaledRefusalMessage(Fp8BlockScaledRefusal::kTileK, 512, 1088, 128, 128);
+  CHECK(Contains(tk_msg, "K is 1088"));
+  CHECK(Contains(tk_msg, "remainder of 64"));
+  CHECK(Contains(tk_msg, "multiple of 128"));
+  CHECK(Contains(tk_msg, "TileShape"));
+  CHECK(Contains(tk_msg, "NOT A GENERAL ONE"));
+  CHECK(Contains(tk_msg, "sm90"));
+  CHECK(Contains(tk_msg, "CPU reference arm runs this shape"));
+  // The two messages are DIFFERENT text. A `kTileK` that fell through to the
+  // `kScaleBlockN` arm would name the wrong dimension and pass every check above
+  // that is common to both.
+  CHECK(sbn_msg != tk_msg);
+  CHECK(!Contains(tk_msg, "N is 512"));
 
   const std::string bn_msg =
       Fp8BlockScaledRefusalMessage(Fp8BlockScaledRefusal::kBlockN, 512, 4096, 64, 128);
@@ -268,7 +343,7 @@ TEST_CASE("G4 the CUDA arm refuses exactly what cutlass cannot implement") {
 
   // Every message names the op, so the refusal is greppable from a log that
   // carries nothing else.
-  for (const std::string& m : {k_msg, n_msg, bn_msg, bk_msg})
+  for (const std::string& m : {k_msg, n_msg, bn_msg, bk_msg, sbn_msg, tk_msg})
     CHECK(Contains(m, "matmul_fp8_block_scaled"));
 }
 

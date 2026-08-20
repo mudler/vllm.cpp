@@ -3736,9 +3736,15 @@ void Dflash2SelectorEdgesKernelCuda(Queue& q, Tensor& scores, const Tensor& pred
 // strict scan refuses. On a NaN-bearing row the arms then answered differently
 // (`[NaN,-inf]` read cpu 0 / cuda 1) while every NaN-free row still agreed, so
 // no fixture without a NaN could see it. The clause is deleted rather than the
-// bit-exactness claim narrowed. The deletion is UNVERIFIED on a device -- the
-// authoring host has no `nvcc` -- and is owed with the rest of this arm at
-// `## Owed` O11 of .agents/specs/dflash2-spec-decode.md.
+// bit-exactness claim narrowed. THE DELETION IS VERIFIED, and #1518 corrects an
+// earlier sentence here calling it unverified: this translation unit is
+// compiled for ten architectures by CI's `build-cuda-fat` job on every pull
+// request, and the operator RAN `test_ops_dflash2_path_walk` on `dgx:gpu0`
+// (GB10, sm_121a) at the W4 merge commit -- 83 assertions on device against 49
+// on CPU, `Status: SUCCESS!`, zero `no CUDA backend; skipping` lines, the NaN
+// row among them. The AUTHORING HOST has no `nvcc` and still skips the case
+// locally, and the remainder of `## Owed` O11 in
+// .agents/specs/dflash2-spec-decode.md stands.
 __global__ void Dflash2PathWalkKernel(int64_t* tokens, const float* scores,
                                       const int64_t* cand, int64_t L, int64_t K) {
   const int64_t b = blockIdx.x;

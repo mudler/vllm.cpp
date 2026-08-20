@@ -381,7 +381,14 @@ either head yet, so nothing is invalidated by moving it.
   `ssh` to a fleet box.
 - The 27B target and the DFlash2 drafter resident where the gate host can read
   them, with a recorded revision, since a repo id alone is not a pin.
-- A vLLM build at `19c93519`. The parity pin stays where it is.
+- A vLLM build at `19c93519`. The parity pin stays where it is. **That head is
+  the same DELIBERATE CHOICE `## Gates` G2 and `## Oracle` state, and W6 owns
+  the reconciliation**: the port mirrors `66e5414c`, which superseded
+  `19c93519` on 2026-08-19
+  ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)), and the greedy
+  answer is identical at both heads. This line named the head bare until
+  [#1518](https://github.com/mudler/vllm.cpp/issues/1518), which reads as a
+  leftover beside the other two.
 - [#1193](https://github.com/mudler/vllm.cpp/issues/1193) touches the same
   classification code. Whichever lands second reconciles; neither blocks.
 - No dependency on the V1/V2 runner distinction, which this engine does not have.
@@ -1080,8 +1087,11 @@ list items.
   `__shfl_xor_sync` reduction both run past one warp — with a forced exact tie
   group and a forced all `-inf` row layered onto the random fixture, because
   neither shape occurs by chance and O10 recorded what it cost to assume one
-  did). It has NEVER COMPILED here: the authoring host has no `nvcc`, so the case
-  reports `no CUDA backend; skipping CUDA dflash2-path-walk parity`.
+  did). It does not run HERE — the authoring host has no `nvcc`, so the case
+  reports `no CUDA backend; skipping CUDA dflash2-path-walk parity` — but see
+  the closing paragraph of this entry: it compiles in CI on every pull request
+  and it has since RUN on `dgx:gpu0`
+  ([#1518](https://github.com/mudler/vllm.cpp/issues/1518)).
 
   Two things are unproven rather than merely unrun, and they are different from
   O6's and O10's. That the kernel compiles at all. And that the PARALLEL
@@ -1130,16 +1140,40 @@ list items.
   of its pivot bracket, and narrowing was therefore the honest result.
 
   **What this adds to the debt, precisely.** The CPU half of the strictness claim
-  is now gated and mutation-proven: `dflash2-path-walk: a NaN never wins a slot`
-  (`tests/vt/test_ops_dflash2_path_walk.cpp`) is the case a `>=` reduction fails
-  while still answering the tie rows and the -inf row, and turning `>` into `>=`
-  reddens 3 cases / 5 assertions. The CUDA half is NOT gated here and cannot be:
-  the deleted disjunct has never been compiled, and the CUDA parity case — whose
-  fixture now CHAINS a third forced row, a NaN row at step 2 predecessor 0,
-  reached because the tie group and the -inf row each answer slot 0 — still
-  reports `no CUDA backend; skipping`. So the repair is a source change made on
-  an argument, not on a measurement, and the operator's lease owes the
-  measurement together with everything else in this entry.
+  is now gated and mutation-proven: turning `>` into `>=` in
+  `Dflash2PathWalkKernel` reddens **3 cases / 5 assertions**, `Status:
+  FAILURE!` — `a tie resolves to the LOWEST slot` (2 assertions, got 13 for 11
+  and 22 for 20), `an all -inf row resolves to slot 0` (1, got 33 for 31) and
+  `dflash2-path-walk: a NaN never wins a slot` (2, got 83 for 81 and 83 != 83),
+  in `tests/vt/test_ops_dflash2_path_walk.cpp`. An earlier revision of this
+  entry called the NaN case the one a `>=` reduction fails "while still
+  answering the tie rows and the -inf row", which contradicted the count printed
+  in the same sentence;
+  [#1518](https://github.com/mudler/vllm.cpp/issues/1518) corrects it. All three
+  fail, because this scan ascends and `>=` keeps the LAST maximum, so the tie
+  row answers slot K-1 and the all -inf row claims K-1 instead of leaving the
+  seed for the collapse. What the NaN case adds that the other two do not is the
+  NaN CLASS, and that it is the row on which the two backends actually
+  diverged.
+
+  The CUDA half is not gated on THIS host, which has no `nvcc`, so the case
+  still reports `no CUDA backend; skipping` here. It is gated elsewhere, and
+  [#1518](https://github.com/mudler/vllm.cpp/issues/1518) corrects an earlier
+  revision of this entry that called the deleted disjunct never compiled and the
+  repair "a source change made on an argument, not on a measurement". Both
+  halves are covered. COMPILE: `src/vt/cuda/cuda_ops.cu` is in the CUDA source
+  list in `CMakeLists.txt` (`target_sources(vllm PRIVATE ...)` under
+  `if(VLLM_CPP_CUDA)`), which CI's `build-cuda-fat` job builds for ten
+  architectures (`80;86;87;89;90a;100a;103a;110;120a;121a`) on every non-closed
+  `pull_request` event, so the deletion goes through `nvcc` pre-merge. RUN: the
+  operator executed this suite on `dgx:gpu0` (GB10, sm_121a) at the W4 merge
+  commit and it reported **83 assertions on device against 49 on CPU**,
+  `Status: SUCCESS!`, with zero `no CUDA backend; skipping` lines and
+  `CUDA_OBJECTS_BUILT=34`. The increment includes the CUDA parity case — whose
+  fixture CHAINS a third forced row, a NaN row at step 2 predecessor 0, reached
+  because the tie group and the -inf row each answer slot 0 — which is the row
+  that measured the divergence. What this entry still owes is the rest of it,
+  not the comparator.
 
 - **O12 — the PROBABILISTIC draft-sample arm and its realized-q cache are NOT
   ported.** Owner: `SPEC-ACCEPT-VARIANTS` (`.agents/engine-matrix.md`) for the
@@ -1299,11 +1333,31 @@ trailing axes are checked because they are the predecessor axis and the child
 axis and inferring one from the other would admit a lattice indexed the wrong
 way round. The reviewer proved that unmeasured: dropping either conjunct, and
 deleting the whole `VT_CHECK`, each compiled clean and left all four suites
-green. The mechanism is generic and worth carrying forward — the case built a
-`{B,L,K,K}` tensor with `Contig(...)` and then wrote `bad.shape[2] = K - 1`,
-which desynchronises the strides, so `Tensor::IsContiguous()` turned false and
-`contiguous tensors required` threw FIRST, and a bare `CHECK_THROWS` cannot tell
-two guards apart. Both axes are now driven by GENUINELY CONTIGUOUS wrong-extent
+green. **THE MECHANISM RECORDED HERE WAS BACKWARDS, and
+[#1518](https://github.com/mudler/vllm.cpp/issues/1518) corrects it.** This
+paragraph used to say the case built a `{B,L,K,K}` tensor with `Contig(...)`,
+wrote `bad.shape[2] = K - 1`, and that the resulting stride desynchronisation
+made `contiguous tensors required` throw FIRST, so a bare `CHECK_THROWS` was
+satisfied by a guard it was not written for. Measured on untouched production
+code, that is false. The strides do desynchronise — `probe IsContiguous=0` for
+`shape[2]` and `shape[3]` alike — but the walk checks shape at
+`src/vt/ops.cpp:3331` and contiguity at `:3339`, in that order, so the SHAPE
+guard still answered: `probe threw: vt: dflash2-path-walk: scores must be
+[B,L,K,K] matching candidate_ids at src/vt/ops.cpp:3331`. The pre-repair case
+DID reach the guard it named.
+
+The true mechanism is the reverse, and it is the one worth carrying forward:
+DELETING the shape guard hands the throw to `contiguous tensors required`
+(measured at `src/vt/ops.cpp:3336` with the check removed), because the mutated
+tensor is already non-contiguous. A bare `CHECK_THROWS` therefore still passes
+with the guard gone, and the deletion is INVISIBLE — the pre-repair case form
+with the whole `VT_CHECK` deleted ran **7 cases / 47 assertions,
+`Status: SUCCESS!`, rc 0**. The generic rule is about what a DELETION exposes,
+not about which guard fires today: build a negative input that no OTHER guard
+can refuse, and match on the message. The conclusion W4 reached was right and the
+repair is correct — the guard was ungated and is gated now — but an implementer
+who took the old explanation as guidance would build the next negative case
+against the wrong hazard. Both axes are now driven by GENUINELY CONTIGUOUS wrong-extent
 lattices (`{B,L,K,K-1}` and `{B,L,K-1,K}`, built with matching strides, over a
 buffer sized for the full lattice so a deleted guard reads in bounds and simply
 fails to throw) and matched with `CHECK_THROWS_WITH_AS(..., doctest::Contains(
@@ -1312,9 +1366,13 @@ redden: child conjunct 1 case / 1 assertion, predecessor conjunct 1/1, whole
 check 1/2.
 
 *The reviewer also asked whether the sibling shared the weakness. It did.*
-`tests/vt/test_ops_dflash2_selector_edges.cpp` carried two bare `CHECK_THROWS`,
-each answered by a neighbouring guard rather than by the one it named — deleting
-the selector's own `[B,L,K,K]` output-lattice check alone left the suite green.
+`tests/vt/test_ops_dflash2_selector_edges.cpp` carried two bare `CHECK_THROWS`
+that would have been answered by a neighbouring guard ONCE THE NAMED ONE WAS
+DELETED — the same correction [#1518](https://github.com/mudler/vllm.cpp/issues/1518)
+applies above, measured here too: with the selector's own `[B,L,K,K]` check
+present the case throws `scores must be [B,L,K,K]` (`src/vt/ops.cpp:3284`), and
+with it deleted the throw falls through to `contiguous tensors required`
+(`:3299`), so deleting the check alone left the suite green.
 It is repaired in the same shape and in the same wave: every refusal matched on
 its message, plus two contiguous wrong-extent output views. Deleting that check
 now reddens 1 case / 2 assertions.

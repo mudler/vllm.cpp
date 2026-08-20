@@ -3226,11 +3226,21 @@ void Dflash2SelectorEdgesKernel(Queue&, Tensor& scores, const Tensor& pred_codeb
 //     masked lanes with `other=-inf`; the seed below (`best = -inf`, `index =
 //     K`, strict `>`, then collapse `K` to 0) is the same answer in a form the
 //     CUDA arm can reduce in parallel and reach bit-identically. Strictness is
-//     also what keeps a NaN from ever winning on either arm, and it is the one
-//     part of the seed the tie rows and the -inf row do NOT measure: a `>=`
-//     reduction answers both of those correctly. The case that fails under
-//     `>=` is `dflash2-path-walk: a NaN never wins a slot`
-//     (tests/vt/test_ops_dflash2_path_walk.cpp).
+//     also what keeps a NaN from ever winning on either arm.
+//
+// A `>=` REDUCTION BREAKS ALL THREE OF THE ABOVE, not just the NaN row (#1518
+// corrects an earlier note here that said the tie rows and the -inf row do not
+// measure strictness). This scan ascends, so `>=` keeps the LAST maximum
+// instead of the first: the tie row then answers slot K-1 rather than slot 0,
+// and the all -inf row claims K-1 rather than leaving `index == K` for the
+// collapse. Measured by turning `>` into `>=` in this function
+// (tests/vt/test_ops_dflash2_path_walk.cpp): `a tie resolves to the LOWEST
+// slot` fails 2 assertions (got 13 for 11, 22 for 20), `an all -inf row
+// resolves to slot 0` fails 1 (33 for 31) and `a NaN never wins a slot` fails
+// 2 (83 for 81, and 83 != 83) -- 3 cases / 5 assertions, `Status: FAILURE!`.
+// What the NaN case adds that the other two do not is the NaN CLASS itself,
+// and it is the row on which the two backends actually diverged before W4's
+// review reconciled the CUDA lane comparator.
 //
 // Requests are independent, so the OUTER loop parallelizes and the inner step
 // loop stays serial -- which is exactly the shape upstream's one-program-per-

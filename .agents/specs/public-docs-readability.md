@@ -391,25 +391,25 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:9` ## Building | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
 | `docs/USAGE.md:25` ### Host compilers | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
 | `docs/USAGE.md:41` ### Setting the compiled build identity | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
-| `docs/USAGE.md:57` ### One ROCm-specific behaviour | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:57` ### One ROCm-specific behaviour | Build and backend reference; implementation history | `docs/BUILD.md` for the current HIP optimization rule; `docs/reference/server.md` for the current sampler and `max_tokens` behavior; `.agents/specs/rocm-backend-w0.md` for the hostcall investigation | `moved`; `archived` | `.agents/specs/rocm-backend-w0.md` |
 | `docs/USAGE.md:72` ### ROCm op coverage is incremental (and throws are by design) | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
 | `docs/USAGE.md:104` ### CUTLASS is fetched as headers only | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
-| `docs/USAGE.md:118` ## Confirming which CUDA architecture a build targets | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:118` ## Confirming which CUDA architecture a build targets | Build procedure and implementation history | `docs/BUILD.md` for the current cache and feature-table procedure; `.agents/specs/cuda-architecture-inventory.md` for the superseded cache-report investigation | `moved`; `archived` | `.agents/specs/cuda-architecture-inventory.md` |
 | `docs/USAGE.md:142` ### FlashAttention-2 is used only where the build compiled it | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
 | `docs/USAGE.md:168` ### A DISABLED feature removes its kernels, not the ops that do not need it | Generic user procedure | `docs/BUILD.md` | `deduplicated` | `n/a` |
-| `docs/USAGE.md:193` ## Using more than one engine in a process | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:193` ## Using more than one engine in a process | Dense engine-lifecycle reference and implementation history | `docs/reference/engine-lifecycle.md` for current multi-engine, multi-backend, and pool-debug behavior; `.agents/specs/pool-device-key.md` for the device-key and scratch-pool investigation | `moved`; `archived` | `.agents/specs/pool-device-key.md` |
 | `docs/USAGE.md:233` ## Starting an agent-assisted contribution | Contributor procedure | `.agents/porting.md` | `archived` | `.agents/porting.md` |
 | `docs/USAGE.md:261` ### `.env`: your values, and what happens when it is missing | Contributor procedure | `.agents/porting.md` | `archived` | `.agents/porting.md` |
 | `docs/USAGE.md:295` ### `GPU_LOCK`: one file mutex, and only one | Contributor procedure | `.agents/porting.md` | `archived` | `.agents/porting.md` |
-| `docs/USAGE.md:325` ## Running inference (CLI) | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:325` ## Running inference (CLI) | Generic user procedure, model recipe, and implementation history | `docs/USAGE.md` for the runnable CLI path and common flags; `docs/reference/model-loading.md` for shared loader rules; `docs/models/qwen3-8-27b.md` and `docs/models/qwen3-8-2-4t.md` for Qwen checkpoint-specific state; `.agents/specs/qwen38-text-only.md` and `.agents/specs/qwen35-plain-bf16-direct-load.md` for load-plan and gate history | `kept`; `moved`; `archived` | `.agents/specs/qwen38-text-only.md`; `.agents/specs/qwen35-plain-bf16-direct-load.md` |
 | `docs/USAGE.md:445` ### Which HF tokenizers load | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:474` ### Timing an encode on your own box | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:497` ### How much memory a Vulkan load needs | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:557` ### Running the vocoder convolutions on the GPU | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
-| `docs/USAGE.md:583` ### How long a load takes, and how to see where it goes | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:583` ### How long a load takes, and how to see where it goes | Dense lookup material, measurement, and implementation history | `docs/reference/model-loading.md` for `VT_LOAD_STATS` and counter semantics; `docs/BENCHMARKS.md` for accepted load ratios; `.agents/specs/load-direct-upload.md` for implementation and raw measurement evidence | `moved`; `deduplicated`; `archived` | `.agents/specs/load-direct-upload.md` |
 | `docs/USAGE.md:620` ### Quantized checkpoints: which `lm_head` forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
-| `docs/USAGE.md:648` ### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:648` ### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified | Model recipe and design or implementation history | `docs/models/qwen3-8-27b.md` for the pinned checkpoint, supported CPU arm, CUDA shape restrictions, and current refusals; `.agents/specs/model-fp8-block-linear.md` for implementation, mutation, and gate history | `moved`; `archived` | `.agents/specs/model-fp8-block-linear.md` |
 | `docs/USAGE.md:771` ### A per-tensor scale has to be one F32 number | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:796` ### One load refusal that is about this code, not your checkpoint | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
 | `docs/USAGE.md:819` ### A refusal that names the attention backend, and what it cannot tell you | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
@@ -433,7 +433,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:2235` ### If the server exits at startup | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2243` ### Building and validating an image locally | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2300` ### Endpoints | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
-| `docs/USAGE.md:2412` ### Speech and music generation | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:2412` ### Speech and music generation | Generic user procedure, model recipe, measurement, and design or implementation history | `docs/USAGE.md` for the generic speech endpoint and request shape; `docs/models/minimax-music3.md` and `docs/models/indextts-2-5.md` for family-specific commands, fields, devices, limits, and refusals; `docs/BENCHMARKS.md` for accepted performance values; `.agents/specs/minimax-music3.md` for stage gates, experiments, and implementation history | `kept`; `moved`; `deduplicated`; `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:2872` ### `max_tokens`: what a non-positive value means | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2886` ### Which token ids stop a generation | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2908` ### Server flags | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
@@ -452,8 +452,8 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:3424` ### Video and audio references (`metadata`) | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:3470` ### The job lifecycle | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:3487` ### Video family, and family-specific load knobs | Model recipe | `docs/models/minimax-h3.md` | `moved` | `n/a` |
-| `docs/USAGE.md:3528` ## Consuming it as a library (C ABI) | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
-| `docs/USAGE.md:3603` ## Consuming it from C++ | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:3528` ## Consuming it as a library (C ABI) | Generic user procedure, dense lookup material, and implementation history | `docs/USAGE.md` for one runnable C ABI example; `docs/reference/c-api.md` for the ABI version and export surface; `.agents/specs/c-api-library.md` for ABI growth and packaging history | `kept`; `moved`; `archived` | `.agents/specs/c-api-library.md` |
+| `docs/USAGE.md:3603` ## Consuming it from C++ | Generic user procedure, model recipe, dense lookup material, and implementation history | `docs/USAGE.md` for one runnable C++ example; `docs/reference/c-api.md` for shared sampler and interface semantics; `docs/models/ltx-2-5.md` and `docs/models/minimax-h3.md` for video-family configuration, limits, and refusals; `.agents/specs/c-api-library.md`, `.agents/specs/ltx-2-5.md`, and `.agents/specs/lora-adapter.md` for interface, LTX, and unwired-LoRA history | `kept`; `moved`; `archived` | `.agents/specs/c-api-library.md`; `.agents/specs/ltx-2-5.md`; `.agents/specs/lora-adapter.md` |
 | `docs/USAGE.md:3797` ### KV-cache events, and `kv_cache_report_mode` | Dense lookup material | `docs/reference/c-api.md` | `moved` | `n/a` |
 | `docs/USAGE.md:3830` ## Multimodal input (image, video, audio to text) | Cross-model workflow | `docs/guides/multimodal-input.md` | `moved` | `n/a` |
 | `docs/USAGE.md:3857` ### The second GGUF file: a `clip` multimodal projector | Cross-model workflow | `docs/guides/multimodal-input.md` | `moved` | `n/a` |
@@ -469,7 +469,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:4542` ### `keyframe_interpolation`: generating the motion between pinned frames | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
 | `docs/USAGE.md:4618` ### Retake: regenerating a time window of an existing clip | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
 | `docs/USAGE.md:4663` ## LTX-2.5 quantized loaders | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
-| `docs/USAGE.md:4745` ### The DiT is not always quantized, and the FULL model never is | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:4745` ### The DiT is not always quantized, and the FULL model never is | Model recipe and design or implementation history | `docs/models/ltx-2-5.md` for supported DiT formats, dtype refusals, residency, and owed real-weight run; `.agents/specs/ltx25-bf16-dit.md` for the prior refusal, upstream analysis, and gate history | `moved`; `archived` | `.agents/specs/ltx25-bf16-dit.md` |
 | `docs/USAGE.md:4782` ### LTX-2.5 DiT weights: which file, and how to tell them apart | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
 | `docs/USAGE.md:4841` ## Streaming routed experts from disk (capacity mode) | Cross-model workflow | `docs/guides/expert-streaming.md` | `moved` | `n/a` |
 | `docs/USAGE.md:4857` ### Which device can serve it | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
@@ -477,7 +477,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:5122` ### `--device cuda` refuses a checkpoint it cannot hold | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5200` ## Qwen3.8-2.4T-A95B `UD-Q1_0`: 370 GiB served from a 119 GiB box | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5226` ### The exact weights | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
-| `docs/USAGE.md:5275` ### Build and serve | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:5275` ### Build and serve | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5333` ### What the load costs | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5377` ### What decode costs, and why the ceiling is where it is | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5427` ### What this does not establish | Model recipe | `docs/models/qwen3-8-2-4t.md` | `moved` | `n/a` |
@@ -491,7 +491,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:5739` ### The quantized arm that IS implemented: GGUF Q4_K, one component | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5754` ### The quantized arms that are REFUSED — and they are all third-party | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5782` ## MiniMax-Music3: the checkpoint loader | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
-| `docs/USAGE.md:5844` ### Running its gate | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
+| `docs/USAGE.md:5844` ### Running its gate | Contributor procedure and design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:5874` ### MiniMax-Music3: the quantized arms | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5960` ### IndexTTS-2.5 goldens and checkpoint manifests | Model recipe and contributor procedure | `docs/models/indextts-2-5.md` for the current refusal; `.agents/specs/indextts-2-5.md` for golden regeneration and checkpoint manifest evidence | `moved`; `archived` | `.agents/specs/indextts-2-5.md` |
 | `docs/USAGE.md:6034` ## MiniMax-Music3: the autoregressive half | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
@@ -520,6 +520,21 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/WEIGHT-OFFLOAD.md:148` ## Consuming it programmatically | Cross-model workflow | `docs/guides/weight-offload.md` | `moved` | `n/a` |
 
 Campaign-base heading count: `275`.
+
+### W1 `USAGE.md` semantic audit
+
+The second W1 repair reviewed all 14 `docs/USAGE.md` rows that the first
+manifest marked `kept`. A row satisfies the `USAGE.md` contract when it teaches
+a common CLI, server, C ABI, or C++ path. A short generic entry point can stay.
+The same manifest row must map its other content to named destinations.
+
+The audit retained six rows in whole or in part. They cover the introduction,
+the generic CLI, server, and speech paths, and one C ABI and C++ example. It
+corrected the four reviewed findings at lines 648, 4745, 5275, and 5844. It also
+corrected eight other misplaced or mixed sections. These sections cover builds,
+engine lifecycle, load statistics, speech, and dense CLI or library details.
+Every named archive owner exists at W1. Every new public destination uses the
+approved `docs/models/` or `docs/reference/` architecture.
 
 
 ### Duplicate sections

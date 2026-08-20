@@ -109,8 +109,9 @@ void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
   // question is asked at `ModelRegistry::Prepare` — called by every runner
   // before the first forward and before graph capture — so a CUDA user is told
   // here rather than inside the first GEMM or, worse, inside a capture. Inert
-  // on CPU and on every other checkpoint. Milestone M5 removes this with the
-  // kernel it names.
+  // on CPU and on every other checkpoint. M5 (`489a9a4c0`) narrowed rather than
+  // removed it: the CUTLASS kernel covers `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a)
+  // only, and a CUDA arch outside that cell is still refused here by name.
   RefuseUnrunnableQwen3_5DenseFp8Block(
       ModelAs<Qwen3_5DenseLoadedModel>(model,
                                         "Qwen3_5ForConditionalGeneration")

@@ -39,12 +39,15 @@
 // which is exactly the hand-rolled parallel path AGENTS.md §"Shared seams"
 // forbids. One definition, two instantiations, no copy.
 //
-// DEVICE REACH — CPU ONLY, and that is inherited from the op table rather than
-// chosen here. `vt::MatmulFp8BlockScaled` is a CPU correctness reference that
-// makes no speed claim; the mainloop-scaled CUTLASS kernel for `sm_121a` is
-// #1189 milestone M5. `RefuseUnrunnableQwen3_5DenseFp8Block` asks the same
-// question at `ModelRegistry::Prepare` so a CUDA user is told BEFORE a graph is
-// captured rather than at the first GEMM.
+// DEVICE REACH — inherited from the op table rather than chosen here. The CPU
+// arm `vt::MatmulFp8BlockScaled` is a correctness reference that makes no speed
+// claim. #1189 milestone M5 (`489a9a4c0`) added the mainloop-scaled CUTLASS
+// kernel, registered only for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a); a CUDA arch
+// outside that cell leaves the op unregistered, and that is the honest answer
+// rather than a fall-through. `RefuseUnrunnableQwen3_5DenseFp8Block` asks the
+// same question at `ModelRegistry::Prepare` so such a user is told BEFORE a
+// graph is captured rather than at the first GEMM. The CUDA kernel has never
+// executed on hardware.
 #pragma once
 
 #include <atomic>
@@ -94,10 +97,11 @@ inline uint64_t BlockGemmCount() {
 
 // Is there a block-wise FP8 arm on this device?
 //
-// BOTH ops, not one. `vt::QuantFp8Group` has a CUDA arm and
-// `vt::MatmulFp8BlockScaled` does not (M5 owns it), so asking about the quant
-// alone would answer yes on CUDA and then fail one frame deeper with a message
-// about the wrong op.
+// BOTH ops, not one. They register independently -- `vt::QuantFp8Group` across
+// the CUDA archs this build targets, `vt::MatmulFp8BlockScaled` only for
+// `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a) since M5 -- so asking about the quant
+// alone would answer yes on an unsupported arch and then fail one frame deeper
+// with a message about the wrong op.
 inline bool BlockFp8Runnable(vt::DeviceType device) {
   return vt::OpRegistered(vt::OpId::kQuantFp8Group, device) &&
          vt::OpRegistered(vt::OpId::kMatmulFp8BlockScaled, device);

@@ -871,11 +871,19 @@ TEST_CASE("dflash2 propose: the conv and the SELECTOR run, THEN the walk refuses
   // It does NOT prove that the RUNNER's call site is entered. W3 collapses W2's
   // two copies of the post-forward step into ONE function
   // (`Dflash2SelectCandidates`), so the code this case drives IS the code
-  // `GPUModelRunner::propose_drafts_block` runs -- but the hop from that method
-  // to this function is still ungated, for the reason `## Owed` O7 gives, and
-  // `DflashProposeBlock` still has no caller outside `tests/`. Entering the
-  // runner's site needs a populated `exec_state_.spec_aux` from a verify
-  // forward, which only a loader-built engine produces. That harness is W4's.
+  // `GPUModelRunner::propose_drafts_block` runs, and `DflashProposeBlock` still
+  // has no caller outside `tests/`. What proves the runner's own hop is a
+  // DIFFERENT file, in this same wave:
+  // `tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` drives a real
+  // `LoadedEngine` over a synthetic Qwen3.5-dense target and an in-memory
+  // DFlash2 draft and reads the walk refusal's own counts.
+  //
+  // An earlier revision of this comment said entering the runner's site "needs a
+  // populated `exec_state_.spec_aux` from a verify forward, which only a
+  // loader-built engine produces. That harness is W4's." That was the W2 reason
+  // `## Owed` O7 records as WRONG, and W3 falsified it in the same commit that
+  // left this sentence standing: the harness needed a fifteen-line in-memory
+  // `LoadedEngine` overload, not a loader-built engine, and it exists now.
   Dims dm;
   dm.conv_taps = 2;
   dm.attn_conv_active = true;
@@ -1262,20 +1270,11 @@ TEST_CASE("dflash2 selector: the SCALARS reweight the lattice against the codebo
 
   const int P = 1, k = 3;
   const int64_t nq = k + 1;
-  const std::vector<float> block_logits = Ramp(P * nq, plain.vocab, 0.9);
-  const std::vector<float> block_hidden = Ramp(P * nq, plain.H, 1.7);
-  const std::vector<int32_t> anchors = {2};
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-  const vllm::v1::Dflash2ProposeState sp = vllm::v1::Dflash2SelectCandidates(
-      block_logits, block_hidden, anchors, P, k, wp, cp, q);
-  const vllm::v1::Dflash2ProposeState sm = vllm::v1::Dflash2SelectCandidates(
-      block_logits, block_hidden, anchors, P, k, wm, cm, q);
-  REQUIRE(sp.edge_scores.size() == sm.edge_scores.size());
-  CHECK(sp.edge_scores != sm.edge_scores);
 
-  const int64_t K = sp.top_k;
-  const auto count_flips = [K](const vllm::v1::Dflash2ProposeState& x,
-                               const vllm::v1::Dflash2ProposeState& y) {
+  const auto count_flips = [](const vllm::v1::Dflash2ProposeState& x,
+                              const vllm::v1::Dflash2ProposeState& y) {
+    const int64_t K = x.top_k;
     int flips = 0;
     for (int64_t l = 0; l < x.num_steps; ++l) {
       for (int64_t p = 0; p < K; ++p) {
@@ -1294,14 +1293,58 @@ TEST_CASE("dflash2 selector: the SCALARS reweight the lattice against the codebo
     }
     return flips;
   };
-  const int argmax_flips = count_flips(sp, sm);
-  INFO("argmax flips: ", argmax_flips);
-  CHECK(argmax_flips > 0);
-  // THE INSTRUMENT'S OWN PRECONDITION. The counter above has to be able to read
-  // zero, or `> 0` measures nothing: comparing an arm with ITSELF must flip
-  // nothing at all.
-  CHECK(count_flips(sp, sp) == 0);
-  CHECK(count_flips(sm, sm) == 0);
+  // SWEEP, and the reason it is a sweep. A single block gives `num_steps * K` =
+  // 3 * 3 = 9 predecessor slots to compare, and W3's fresh review measured that
+  // exactly ONE of those nine flips. `> 0` on a margin of 1-of-9 is non-vacuous
+  // but thin: it is one arithmetic accident away from a gate that passes for the
+  // wrong reason, and a reader has no way to see how thin it is. So the same
+  // comparison runs over several blocks -- different anchors, different logit and
+  // hidden ramps -- and the assertion is on the TOTAL, with the per-block counts
+  // logged. The floor is on the aggregate rather than on any one block, because
+  // which block flips is a property of the synthetic ramp and not of the port.
+  struct Block {
+    int32_t anchor;
+    double logit_seed, hidden_seed;
+  };
+  const Block blocks[] = {{2, 0.9, 1.7}, {0, 0.31, 2.9}, {5, 1.55, 0.44},
+                          {7, 2.2, 3.1}, {3, 0.05, 1.05}};
+  int total_flips = 0, total_slots = 0, blocks_that_flipped = 0;
+  for (const Block& blk : blocks) {
+    const std::vector<float> bl = Ramp(P * nq, plain.vocab, blk.logit_seed);
+    const std::vector<float> bh = Ramp(P * nq, plain.H, blk.hidden_seed);
+    const std::vector<int32_t> anchors = {blk.anchor};
+    const vllm::v1::Dflash2ProposeState sp = vllm::v1::Dflash2SelectCandidates(
+        bl, bh, anchors, P, k, wp, cp, q);
+    const vllm::v1::Dflash2ProposeState sm = vllm::v1::Dflash2SelectCandidates(
+        bl, bh, anchors, P, k, wm, cm, q);
+    REQUIRE(sp.edge_scores.size() == sm.edge_scores.size());
+    // The SCORES always move; whether the ORDER moves is the question below.
+    CHECK(sp.edge_scores != sm.edge_scores);
+    const int flips = count_flips(sp, sm);
+    INFO("anchor ", blk.anchor, " argmax flips ", flips, " of ",
+         sp.num_steps * sp.top_k);
+    CHECK(flips >= 0);
+    total_flips += flips;
+    total_slots += static_cast<int>(sp.num_steps * sp.top_k);
+    if (flips > 0) ++blocks_that_flipped;
+    // THE INSTRUMENT'S OWN PRECONDITION, per block. The counter has to be able
+    // to read zero, or a floor on it measures nothing: comparing an arm with
+    // ITSELF must flip nothing at all.
+    CHECK(count_flips(sp, sp) == 0);
+    CHECK(count_flips(sm, sm) == 0);
+  }
+  INFO("total argmax flips ", total_flips, " over ", total_slots, " slots in ",
+       blocks_that_flipped, " of 5 blocks");
+  // MEASURED 2026-08-20 on this fixture: 8 flips over 45 slots, in 4 of the 5
+  // blocks -- against 1 of 9 in one block before the sweep. The slot count is
+  // pinned exactly, because it is a shape and a change to it means the sweep
+  // stopped measuring what this comment says. The flip floors are stated as
+  // floors well under the measured 8 and 4, so a rounding-level change does not
+  // red the suite for a reason that is not a defect, while a port that stopped
+  // reordering children altogether still cannot pass.
+  CHECK(total_slots == 45);
+  CHECK(total_flips >= 3);
+  CHECK(blocks_that_flipped >= 2);
 }
 
 TEST_CASE("dflash2 selector: the org-vocab shard indices rebase the candidates") {

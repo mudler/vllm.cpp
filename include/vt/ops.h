@@ -943,7 +943,12 @@ struct Dflash2SelectorEdgesArgs {
 // by ASCENDING index, which is `torch.topk`'s CPU order and what FlashInfer's
 // `deterministic=True` exists to provide. A backend that broke ties differently
 // would reorder the selector's candidate slots and move acceptance without
-// raising anything, so the CPU reference pins it and the CUDA arm mirrors it.
+// raising anything, so the CPU reference pins it and the CUDA arm mirrors it. NaN
+// is part of that order and is stated rather than left to the sort: it comes
+// FIRST, which is `torch.topk(largest=True)`'s own answer. Leaving it implicit
+// made the CPU comparator an intransitive equivalence and therefore undefined
+// behaviour, not merely an unusual result. No shipped path produces a NaN logit,
+// so the row that pins it is synthetic in the same sense the padding row is.
 //
 // `num_org_vocab_padding` mirrors upstream's
 // `lm_head.shard_indices.num_org_vocab_padding`: that many columns at the END of
@@ -954,8 +959,8 @@ struct Dflash2SelectorEdgesArgs {
 // than claimed as checkpoint coverage — the same posture `## Upstream chain`
 // records for the three output scalars. Upstream's companion
 // `org_vocab_start_index` is applied by the CALLER
-// (`ComputeDflash2Candidates`), not here, because it is an id-space rebase of
-// the result rather than a property of the search.
+// (`vllm::Qwen3DFlash2Model::ComputeCandidates`), not here, because it is an
+// id-space rebase of the result rather than a property of the search.
 struct TopKValuesIndicesArgs {
   int64_t k = 0;                        // dflash_config.selector_top_k
   int64_t num_org_vocab_padding = 0;    // trailing columns forced to -inf first

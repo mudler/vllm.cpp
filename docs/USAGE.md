@@ -3205,8 +3205,20 @@ the selector's transition lattice over its two codebooks. It is then refused BY
 NAME at the PATH WALK, which this engine does not implement yet
 (`SPEC-DFLASH2`, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
 A startup notice says so, so the refusal at the first generated token is not a
-surprise, and the refusal itself names how much of the lattice was scored. These
-are therefore the checkpoints the port was BUILT and READ against, not
+surprise, and the refusal itself names how much of the lattice was scored.
+
+**What that draft prints at startup is ONE notice and one geometry line.** The
+notice names the mechanisms that run, the one that does not, the wave that owns
+it and the issue; it is emitted once, from the draft classification, before any
+weight is read. Beside it the loader reports the RESOLVED grouped-conv geometry
+for the draft it just read -- `taps=`, `group=` and `block=` -- and says nothing
+about the boundary, because the boundary has one owner and a second copy of it
+went stale within one wave: through W3 the loader also printed "the candidate
+selector is NOT implemented", which by then was false and contradicted the notice
+above it. If you are reading a log from an older build, that sentence is the
+stale one.
+
+These are therefore the checkpoints the port was BUILT and READ against, not
 checkpoints that produce a draft token here today.
 
 | Arm | Repo and revision | File | Bytes | sha256 |

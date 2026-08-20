@@ -3230,9 +3230,24 @@ void TopKValuesIndicesKernel(Queue&, Tensor& values, Tensor& indices, const Tens
     for (int64_t row = r0; row < r1; ++row) {
       const float* src = lg + row * V;
       for (int64_t j = 0; j < usable; ++j) order[static_cast<size_t>(j)] = j;
+      // DESCENDING value, ties by ASCENDING index -- `torch.topk`'s CPU order,
+      // which `## Owed` O10 records as the contract this op's CUDA arm has to
+      // reproduce. NaN is handled EXPLICITLY and first, for two reasons. It is
+      // upstream's order (`torch.topk(largest=True)` treats NaN as the largest
+      // value), and without it this is not a strict weak ordering at all:
+      // `src[a] != src[b]` is TRUE for a NaN against anything, both `>` are
+      // FALSE, so NaN compares EQUIVALENT to every value while those values are
+      // not equivalent to each other -- and an intransitive equivalence is
+      // undefined behaviour in `std::partial_sort`, not merely a surprising
+      // answer. No shipped path feeds this op a NaN logit today; the ordering is
+      // defined here so that the day one arrives it is a defined answer rather
+      // than whichever comparison the sort happened to make.
       std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k),
                         order.end(), [src](int64_t a, int64_t b) {
-                          if (src[a] != src[b]) return src[a] > src[b];
+                          const float x = src[a], y = src[b];
+                          const bool nx = std::isnan(x), ny = std::isnan(y);
+                          if (nx != ny) return nx;
+                          if (!nx && x != y) return x > y;
                           return a < b;
                         });
       for (int64_t j = 0; j < k; ++j) {

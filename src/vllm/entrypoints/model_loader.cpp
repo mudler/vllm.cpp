@@ -348,8 +348,19 @@ class SharedHeadSource {
   // Fill the draft's two shared tensors. Both arms produce the SAME thing: bf16
   // `[vocab, H]` with nk=false for the gather table and the same `[vocab, H]`
   // with nk=true for the MatmulBT head. Throws naming the source on absence.
+  //
+  // `head_was_quantized` is REQUIRED and has no default, which is a deliberate
+  // change from the defaulted `= nullptr` it carried through W3. SPEC-DFLASH2's
+  // fresh review found that deleting the third ARGUMENT at the DFlash call site
+  // below compiled clean and left all 38 dflash/gguf suites green after a full
+  // relink: the default silently turned the carry off, `lm_head_dequantized`
+  // stayed false, and D12's `RefuseQuantizedDflash2LmHead` guard lost its
+  // trigger while every gate stayed green. That is a silent-wrong the type system
+  // can refuse outright, so it does: every caller now names what it wants, and
+  // dropping the argument is a COMPILE ERROR rather than a green run. The DSpark
+  // caller passes `nullptr` explicitly and says why.
   void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
-                bool* head_was_quantized = nullptr) const {
+                bool* head_was_quantized) const {
     if (head_was_quantized != nullptr) *head_was_quantized = false;
     if (gguf_ != nullptr) {
       vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
@@ -736,7 +747,10 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    shared.LoadInto(&shared_embed, &shared_lm_head);
+    // nullptr, and NOT a default: the DSpark lane has no DFlash2 selector, so no
+    // guard reads a dequantized-head flag here. Named rather than omitted so the
+    // DFlash caller's third argument cannot be deleted without a build failure.
+    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {
       draft->dspark->backbone.embed_tokens = std::move(shared_embed);
     }
@@ -835,12 +849,28 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // block is acceptance-only and token-invisible, so it is set from one place.
   if (draft->weights.IsDflash2()) {
     draft->weights.conv_block_size = draft->k + 1;
+    // GEOMETRY ONLY, and deliberately NOT the boundary. This line used to append
+    // "the candidate selector is NOT implemented", which W3 made false in the
+    // same wave that wrote it: the selector landed and the boundary moved to the
+    // path walk. A user loading a real DFlash2 directory then got that sentence
+    // AND `CheckDflash2DraftArm`'s corrected notice, which contradict each other,
+    // and the stale one named the wave that had just shipped as still owing the
+    // mechanism.
+    //
+    // The boundary has exactly ONE owner, for the reason `FromModelDir` already
+    // states beside its own call: `CheckDflash2DraftArm` runs on every path that
+    // reaches this function -- `ResolveSpecConfig` for the constructor and
+    // `FromModelDir` line ~1889 ahead of every load -- so its notice has already
+    // been printed by the time anything gets here. A second copy adds nothing a
+    // user can act on and cannot be gated from any entry point this repository
+    // can drive (spec `## Owed` O5), so it went stale within one wave and would
+    // again at W4 and W5. What this line uniquely knows is the RESOLVED conv
+    // geometry, which the notice above cannot report because it runs before any
+    // weight is read, so that is all it says.
     std::cerr << "vllm.cpp: DFlash2 draft: grouped conv taps="
               << draft->weights.conv_taps
               << " group=" << draft->weights.conv_group_size
-              << " block=" << draft->weights.conv_block_size
-              << "; the candidate selector is NOT implemented and this draft will "
-                 "be refused by name at its first propose (SPEC-DFLASH2 W3, #1314)\n";
+              << " block=" << draft->weights.conv_block_size << "\n";
   }
   std::cerr << "vllm.cpp: DFlash draft loaded from " << source_kind << " "
             << draft_dir << " (k=" << draft->k << ", taps=" << num_taps

@@ -15,28 +15,34 @@
 //    array VALUE, so `{x >= thr}` keeps whole tie groups atomically and can hold
 //    MORE than k elements; something has to choose among equals, and choosing
 //    differently reorders the DFlash2 selector's candidate slots and moves
-//    acceptance without raising anything. Three cases pin it with HAND-WRITTEN
-//    literals, which is the only kind of expectation that can: ties inside the
-//    kept set, a tie group STRADDLING the k-th boundary (the one the threshold
-//    search actually has to resolve), and a tie group larger than k.
+//    acceptance without raising anything. `LiteralRows()` below is the table of
+//    HAND-WRITTEN rows that pins it -- ties inside the kept set, a tie group
+//    STRADDLING the k-th boundary (the one the threshold search actually has to
+//    resolve), a tie group larger than k, a -inf-saturated row, and NaN -- and
+//    BOTH ARMS iterate it. That table is a table rather than a case each because
+//    it is the only data in this file that can separate the two algorithms, and
+//    the CUDA arm has to see the same rows the CPU arm does.
 //  * THE ORG-VOCAB PADDING MASK. `num_org_vocab_padding` trailing columns can
 //    never contribute a candidate, mirroring upstream's
-//    `logits[..., -num_pad:] = -float("inf")`. The case puts the row's two
-//    LARGEST values inside the padded tail, so an unmasked implementation
-//    returns them and this case names the difference.
+//    `logits[..., -num_pad:] = -float("inf")`. The table's padded row puts the
+//    row's two LARGEST values inside the padded tail, so an unmasked
+//    implementation returns them, and a separate case asserts what the unmasked
+//    answer is.
 //  * THAT THE INPUT IS NOT MUTATED. Unlike `vt::ApplyTopKTopP`, which masks its
 //    logits in place, this op is read-only: the DFlash2 caller keeps the same
 //    block logits for the DFlash1 comparison arm and for the trace.
-//  * A -inf-SATURATED ROW. Fewer than k finite entries is the shape a masked
-//    vocabulary produces, and the op still returns exactly k pairs.
 //  * BULK SHAPES against a full sort with the same comparator. That reference is
 //    INDEPENDENT IN ALGORITHM (a full `std::sort` of every column, against the
 //    kernel's `partial_sort` of k) but NOT in the tie rule, which it restates
-//    rather than derives -- so it is a consistency check on the ordering and the
-//    hand-written literals above are the correctness anchor for the ties.
-//  * CUDA == CPU. That case is written and has NEVER RUN on this host (no
-//    `nvcc`, so it reports `no CUDA backend; skipping`); it is `## Owed` O10 of
-//    the row's spec and is not counted as coverage here.
+//    rather than derives. It also contains NO TIE: the LCG's rows are all
+//    distinct at these widths, measured rather than assumed. So it is a
+//    consistency check on the SELECTION, and the literal table above is the
+//    correctness anchor for the ties.
+//  * CUDA == CPU. Two cases, and neither has ever RUN on this host (no `nvcc`,
+//    so both report `no CUDA backend; skipping`); they are `## Owed` O10 of the
+//    row's spec and are not counted as coverage here. One runs the LITERAL table
+//    on the device and asserts the literals; the other asserts the two arms
+//    against each other over the literals and over four bulk shapes.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -121,64 +127,113 @@ std::vector<float> RandF32(size_t n, uint32_t seed) {
   return v;
 }
 
+// THE HAND-WRITTEN LITERAL ROWS, and the reason they are a TABLE rather than a
+// case each. These are the rows that actually CONTAIN a tie, so they are the
+// only data in this file that can separate the CPU arm's explicit comparator
+// from the CUDA arm's threshold-compact-and-fill — which spec `## Owed` O10
+// calls the real risk of the port. Until this table existed the CUDA parity
+// case ran only LCG rows, and the comment claiming those rows repeat values was
+// false: reproducing the generator in exact float32 for all four of its
+// parameter sets gives 513/513, 128/128, 200/200 and 64/64 DISTINCT values per
+// row, with the k-th largest at multiplicity 1 in every one. The device arm was
+// gated on data holding no tie at all.
+//
+// Both arms iterate this table, and both assert the LITERALS rather than each
+// other, so neither arm can be right merely by agreeing with the other.
+struct LiteralRow {
+  const char* name;
+  std::vector<float> logits;
+  int64_t rows, v, k, pad;
+  std::vector<int64_t> want_idx;
+  std::vector<float> want_val;
+};
+
+const std::vector<LiteralRow>& LiteralRows() {
+  static const std::vector<LiteralRow> rows = {
+      // Plain descending order over DISTINCT values: the baseline that makes the
+      // tie rows below separable from "the op returns something sorted".
+      {"distinct values", {0.5f, -1.0f, 3.0f, 2.0f, 7.0f, 0.0f}, 1, 6, 3, 0,
+       {4, 2, 3}, {7.0f, 3.0f, 2.0f}},
+      // Ties INSIDE the kept set. Every 5 is equal, so only the index rule
+      // decides; a descending-index rule answers {3, 1}.
+      {"ties inside the kept set", {5.0f, 5.0f, 1.0f, 5.0f}, 1, 4, 2, 0,
+       {0, 1}, {5.0f, 5.0f}},
+      // THE case the threshold search has to resolve: a tie group STRADDLING the
+      // k-th boundary. The k-th largest value is 4 and THREE columns attain it,
+      // so `{x >= thr}` has four members for two slots. One slot goes to the 9;
+      // the other must go to the LOWEST-indexed 4, column 1. Column 3 is the
+      // answer a descending-index or an arbitrary-compaction rule gives — and
+      // arbitrary compaction is exactly what the CUDA arm's `atomicAdd` slot
+      // assignment would produce if the fill step were wrong.
+      {"tie group straddling the k-th boundary", {9.0f, 4.0f, 4.0f, 4.0f, 1.0f}, 1, 5, 2, 0,
+       {0, 1}, {9.0f, 4.0f}},
+      // A tie group LARGER than k: every column ties, so the whole answer is the
+      // index rule and nothing else.
+      {"tie group larger than k", {4.0f, 4.0f, 4.0f, 4.0f}, 1, 4, 3, 0,
+       {0, 1, 2}, {4.0f, 4.0f, 4.0f}},
+      // The org-vocab padding tail can never be a candidate. Upstream forces the
+      // last `pad` columns to -inf before the search
+      // (`logits[..., -num_pad:] = -inf`, compute_candidates @ the PR head), so
+      // the answer is drawn from {1, 2} only. WITHOUT the mask it is {99, 98} at
+      // columns {2, 3}, which the case below asserts separately.
+      {"org-vocab padding tail masked", {1.0f, 2.0f, 99.0f, 98.0f}, 1, 4, 2, 2,
+       {1, 0}, {2.0f, 1.0f}},
+      // A -inf-SATURATED row. Fewer FINITE entries than k is what a masked
+      // vocabulary looks like; the op returns k pairs regardless and the -inf
+      // columns are ordered by ascending index like any other tie group. This is
+      // also the row where the CUDA arm's `cur` has to DROP below the threshold
+      // because the tie group is exhausted.
+      {"-inf-saturated row", {kNegInf, 5.0f, kNegInf, kNegInf}, 1, 4, 3, 0,
+       {1, 0, 2}, {5.0f, kNegInf, kNegInf}},
+      // NaN. `torch.topk` — this op's off-CUDA reference — orders NaN FIRST for
+      // `largest=True`, and the CPU comparator has to say so explicitly: a
+      // comparator that only writes `if (src[a] != src[b]) return src[a] > src[b]`
+      // makes NaN compare EQUIVALENT to every value while those values are not
+      // equivalent to each other, which is not a strict weak ordering and is
+      // undefined behaviour in `std::partial_sort`. No shipped path produces a
+      // NaN logit today, so this row is synthetic in the same sense
+      // `num_org_vocab_padding` is, and it is here because the ordering has to be
+      // DEFINED rather than left to whichever comparison the sort happens to make.
+      {"NaN sorts first, as torch.topk does",
+       {1.0f, std::numeric_limits<float>::quiet_NaN(), 3.0f, 2.0f}, 1, 4, 3, 0,
+       {1, 2, 3},
+       {std::numeric_limits<float>::quiet_NaN(), 3.0f, 2.0f}},
+  };
+  return rows;
+}
+
+// Assert one row's literal answer. A NaN in `want_val` is asserted AS a NaN,
+// because `NaN == NaN` is false and a bare equality would silently pass on any
+// value at all -- the shape of a check that measures nothing.
+void CheckLiteral(const LiteralRow& r, const std::vector<float>& values,
+                  const std::vector<int64_t>& indices) {
+  for (int64_t j = 0; j < r.rows * r.k; ++j) {
+    const size_t s = static_cast<size_t>(j);
+    INFO("row \"", std::string(r.name), "\" slot ", j);
+    CHECK(indices[s] == r.want_idx[s]);
+    if (std::isnan(r.want_val[s])) CHECK(std::isnan(values[s]));
+    else CHECK(values[s] == r.want_val[s]);
+  }
+}
+
 }  // namespace
 
-TEST_CASE("topk-values-indices: descending order over distinct values") {
-  // Hand-written. row = [0.5, -1.0, 3.0, 2.0, 7.0, 0.0], k = 3.
-  const Result r = Run({0.5f, -1.0f, 3.0f, 2.0f, 7.0f, 0.0f}, 1, 6, 3);
-  CHECK(r.values[0] == 7.0f);
-  CHECK(r.values[1] == 3.0f);
-  CHECK(r.values[2] == 2.0f);
-  CHECK(r.indices[0] == 4);
-  CHECK(r.indices[1] == 2);
-  CHECK(r.indices[2] == 3);
+TEST_CASE("topk-values-indices: the hand-written LITERAL rows") {
+  // The tie-break contract, on the CPU arm. Every row here is also run on the
+  // device by the CUDA parity case at the bottom of this file, against these
+  // same literals -- which is what `## Owed` O10 asks for and what the file did
+  // not have: before this table the device arm saw only LCG rows, and those rows
+  // hold no duplicate value at all.
+  for (const LiteralRow& r : LiteralRows()) {
+    const Result got = Run(r.logits, r.rows, r.v, r.k, r.pad);
+    CheckLiteral(r, got.values, got.indices);
+  }
 }
 
-TEST_CASE("topk-values-indices: ties INSIDE the kept set break by ASCENDING index") {
-  // row = [5, 5, 1, 5], k = 2. Every 5 is equal, so only the index rule decides;
-  // a descending-index rule would answer {3, 1}.
-  const Result r = Run({5.0f, 5.0f, 1.0f, 5.0f}, 1, 4, 2);
-  CHECK(r.values[0] == 5.0f);
-  CHECK(r.values[1] == 5.0f);
-  CHECK(r.indices[0] == 0);
-  CHECK(r.indices[1] == 1);
-}
-
-TEST_CASE("topk-values-indices: a tie group STRADDLING the k-th boundary") {
-  // THE case the threshold search has to resolve. row = [9, 4, 4, 4, 1], k = 2.
-  // The k-th largest value is 4 and THREE columns attain it, so `{x >= thr}` has
-  // four members for two slots. One slot goes to the 9; the other must go to the
-  // LOWEST-indexed 4, which is column 1. Column 3 is the answer a
-  // descending-index or an arbitrary-compaction rule gives.
-  const Result r = Run({9.0f, 4.0f, 4.0f, 4.0f, 1.0f}, 1, 5, 2);
-  CHECK(r.values[0] == 9.0f);
-  CHECK(r.values[1] == 4.0f);
-  CHECK(r.indices[0] == 0);
-  CHECK(r.indices[1] == 1);
-}
-
-TEST_CASE("topk-values-indices: a tie group LARGER than k") {
-  // row = [4, 4, 4, 4], k = 3: every column ties, so the whole answer is the
-  // index rule and nothing else.
-  const Result r = Run({4.0f, 4.0f, 4.0f, 4.0f}, 1, 4, 3);
-  CHECK(r.indices[0] == 0);
-  CHECK(r.indices[1] == 1);
-  CHECK(r.indices[2] == 2);
-  for (int j = 0; j < 3; ++j) CHECK(r.values[static_cast<size_t>(j)] == 4.0f);
-}
-
-TEST_CASE("topk-values-indices: the org-vocab padding tail can never be a candidate") {
-  // row = [1, 2, 99, 98] with the LAST TWO columns padded. Upstream forces them
-  // to -inf before the search (`logits[..., -num_pad:] = -inf`,
-  // compute_candidates @ the PR head), so the answer is drawn from {1, 2} only.
-  // Without the mask it is {99, 98} at columns {2, 3}, which is what makes this
-  // case separate the two rather than merely exercise the parameter.
-  const Result masked = Run({1.0f, 2.0f, 99.0f, 98.0f}, 1, 4, 2, /*pad=*/2);
-  CHECK(masked.values[0] == 2.0f);
-  CHECK(masked.values[1] == 1.0f);
-  CHECK(masked.indices[0] == 1);
-  CHECK(masked.indices[1] == 0);
-
+TEST_CASE("topk-values-indices: WITHOUT the padding mask the tail wins") {
+  // The other half of the padded row above, and what makes that row separate the
+  // two rather than merely exercise the parameter: unmasked, the same logits
+  // answer {99, 98} at columns {2, 3}.
   const Result unmasked = Run({1.0f, 2.0f, 99.0f, 98.0f}, 1, 4, 2, /*pad=*/0);
   CHECK(unmasked.indices[0] == 2);
   CHECK(unmasked.indices[1] == 3);
@@ -199,25 +254,18 @@ TEST_CASE("topk-values-indices: the logits are NOT mutated") {
   CHECK(logits == before);
 }
 
-TEST_CASE("topk-values-indices: a -inf-saturated row still returns exactly k pairs") {
-  // Fewer FINITE entries than k is what a masked vocabulary looks like. The op
-  // returns k pairs regardless, and the -inf columns are ordered by ascending
-  // index like any other tie group.
-  const Result r = Run({kNegInf, 5.0f, kNegInf, kNegInf}, 1, 4, 3);
-  CHECK(r.values[0] == 5.0f);
-  CHECK(r.indices[0] == 1);
-  CHECK(std::isinf(r.values[1]));
-  CHECK(std::isinf(r.values[2]));
-  CHECK(r.indices[1] == 0);
-  CHECK(r.indices[2] == 2);
-}
-
 TEST_CASE("topk-values-indices: bulk rows against a full sort") {
   // CONSISTENCY, not correctness of the tie rule: this reference restates the
   // comparator rather than deriving it. What it independently checks is the
   // SELECTION -- a full std::sort of every column against the kernel's partial
-  // selection -- over shapes with repeated values (the LCG's 24-bit quantisation
-  // produces them at this width).
+  // selection.
+  //
+  // IT CONTAINS NO TIE, and an earlier revision of this comment claimed it did
+  // ("the LCG's 24-bit quantisation produces them at this width"). Reproducing
+  // the generator in exact float32 gives 257/257 DISTINCT values in every one of
+  // these five rows, with the k-th largest at multiplicity 1. So this case
+  // measures the SELECTION and the ordering of distinct values; the tie rule is
+  // pinned by the literal table above and by nothing here.
   constexpr int64_t rows = 5, v = 257, k = 16;
   const std::vector<float> logits = RandF32(static_cast<size_t>(rows * v), 0xC0FFEEu);
   const Result got = Run(logits, rows, v, k);
@@ -308,7 +356,52 @@ class DeviceTensor {
   Tensor t_;
 };
 
+// Run one shape on the device and hand back what it wrote.
+Result RunCuda(Backend& b, Queue& q, const std::vector<float>& logits, int64_t rows,
+               int64_t v, int64_t k, int64_t pad) {
+  DeviceTensor dl(b, q, DType::kF32, {rows, v}, logits.data());
+  DeviceTensor dv(b, q, DType::kF32, {rows, k});
+  DeviceTensor di(b, q, DType::kI64, {rows, k});
+  vt::TopKValuesIndices(q, dv.tensor(), di.tensor(), dl.tensor(),
+                        Args(k, pad));
+  Result r;
+  r.values.assign(static_cast<size_t>(rows * k), 0.0f);
+  r.indices.assign(static_cast<size_t>(rows * k), -1);
+  dv.Download(q, r.values.data());
+  di.Download(q, r.indices.data());
+  return r;
+}
+
 }  // namespace
+
+TEST_CASE("topk-values-indices: CUDA runs the LITERAL tie rows") {
+  // SPEC-DFLASH2 `## Owed` O10, and the case that file did not have. O10 names
+  // the TIE handling as the real risk of this op: the CPU arm sorts under an
+  // explicit comparator, while the CUDA arm finds a threshold, compacts
+  // everything strictly above it through an `atomicAdd` slot counter, then fills
+  // the remaining slots with the lowest-indexed elements EQUAL to it. Those are
+  // two different algorithms reaching for one answer, and only a row that
+  // CONTAINS a tie can tell them apart.
+  //
+  // O10 used to say the hand-written tie cases would exercise that path when the
+  // CUDA arm could finally run them. They could not: every one of them called
+  // `Run()`, which builds a CPU queue, and the only case that touched the device
+  // ran four LCG shapes whose rows hold no duplicate value at all. This case
+  // puts the literals on the device.
+  //
+  // The assertion is the LITERAL, not the CPU arm's answer: two implementations
+  // agreeing on a wrong tie rule is the failure this table exists to catch.
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping CUDA topk-values-indices literal rows");
+    return;
+  }
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  for (const LiteralRow& r : LiteralRows()) {
+    const Result got = RunCuda(b, g.q, r.logits, r.rows, r.v, r.k, r.pad);
+    CheckLiteral(r, got.values, got.indices);
+  }
+}
 
 TEST_CASE("topk-values-indices: CUDA == CPU, values and indices") {
   if (!HasCuda()) {
@@ -317,29 +410,43 @@ TEST_CASE("topk-values-indices: CUDA == CPU, values and indices") {
   }
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard g(b);
+  // The literal rows, both arms, EQUALITY. The case above pins each arm to the
+  // literal; this pins them to each other, which is the assertion that still
+  // fires if a future row is added to the table without an expectation.
+  for (const LiteralRow& r : LiteralRows()) {
+    const Result cpu = Run(r.logits, r.rows, r.v, r.k, r.pad);
+    const Result gpu = RunCuda(b, g.q, r.logits, r.rows, r.v, r.k, r.pad);
+    for (size_t i = 0; i < cpu.values.size(); ++i) {
+      INFO("literal row \"", std::string(r.name), "\" slot ", i);
+      CHECK(gpu.indices[i] == cpu.indices[i]);
+      // The NaN row's VALUES are not comparable by equality on either arm.
+      if (!std::isnan(cpu.values[i])) CHECK(gpu.values[i] == cpu.values[i]);
+      else CHECK(std::isnan(gpu.values[i]));
+    }
+  }
+
   struct Case {
     int64_t rows, v, k, pad;
   };
-  // The last two carry the tie shapes the hand-written cases pin on CPU: the LCG
-  // repeats values at this width, and a padded tail exercises the search bound.
+  // BULK SHAPES, and what they do and do not cover. These four rows are LCG
+  // data, and the LCG produces NO duplicate value in any row of any of them:
+  // reproducing the generator in exact float32 gives 513/513, 128/128, 200/200
+  // and 64/64 distinct values, with the k-th largest at multiplicity 1
+  // everywhere. So they exercise the threshold search's BRACKET at widths the
+  // literal rows do not reach -- including one wider than the block and one with
+  // a padded tail -- and they say nothing about the tie rule. An earlier comment
+  // here claimed the opposite ("the LCG repeats values at this width"), which is
+  // what left the device arm ungated for ties.
   const Case cases[] = {{4, 513, 16, 0}, {2, 128, 8, 0}, {3, 200, 16, 24}, {1, 64, 16, 0}};
   for (const Case& cs : cases) {
     const std::vector<float> logits =
         RandF32(static_cast<size_t>(cs.rows * cs.v), 0x5EEDu + static_cast<uint32_t>(cs.v));
     const Result cpu = Run(logits, cs.rows, cs.v, cs.k, cs.pad);
-
-    DeviceTensor dl(b, g.q, DType::kF32, {cs.rows, cs.v}, logits.data());
-    DeviceTensor dv(b, g.q, DType::kF32, {cs.rows, cs.k});
-    DeviceTensor di(b, g.q, DType::kI64, {cs.rows, cs.k});
-    vt::TopKValuesIndices(g.q, dv.tensor(), di.tensor(), dl.tensor(), Args(cs.k, cs.pad));
-    std::vector<float> gv(static_cast<size_t>(cs.rows * cs.k), 0.0f);
-    std::vector<int64_t> gi(static_cast<size_t>(cs.rows * cs.k), -1);
-    dv.Download(g.q, gv.data());
-    di.Download(g.q, gi.data());
-    for (size_t i = 0; i < gv.size(); ++i) {
+    const Result gpu = RunCuda(b, g.q, logits, cs.rows, cs.v, cs.k, cs.pad);
+    for (size_t i = 0; i < gpu.values.size(); ++i) {
       INFO("rows ", cs.rows, " v ", cs.v, " k ", cs.k, " pad ", cs.pad, " slot ", i);
-      CHECK(gv[i] == cpu.values[i]);
-      CHECK(gi[i] == cpu.indices[i]);
+      CHECK(gpu.values[i] == cpu.values[i]);
+      CHECK(gpu.indices[i] == cpu.indices[i]);
     }
   }
 }

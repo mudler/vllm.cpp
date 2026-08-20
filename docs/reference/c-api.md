@@ -3,16 +3,8 @@
 Use the public C ABI in `include/vllm.h` for external applications.
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 23`,
-`include/vllm.h:329`; **47** exported functions, the count of `^VLLM_API `
-declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
-This line read `19` and `36` until 2026-08-17 and `21`, `273` and `46` until the
-W0 phase log added `vllm_video_last_phase_log`; every one of those numbers was
-last true several ABI additions ago, and none of the three is derived by any
-gate, the version, the line and the count each drift independently, and the
-line number drifts on an edit that adds no ABI at all. The version moved twice
-in one day: `mmproj_path` took v22 and the phase log, written as v22 on its own
-branch, landed as v23.
+It exposes a flat, exception-free C ABI for `dlopen`, FFI, and LocalAI
+integration. Read `VLLM_ABI_VERSION` in the header for the current ABI version.
 
 On native Windows/MSVC, the shared-library packaging lane keeps the runtime DLL
 name at `vllm` and gives the import/static archive the distinct name
@@ -106,68 +98,10 @@ help. A family adds itself with `RegisterVideoFamily`, which refuses a name that
 is already registered, because two families under one name would collapse into a
 single claimant and leave the choice of loader to link order.
 
-Two families are registered. `minimax-h3` is detected by `video_patch_proj` plus
-`audio_patch_proj`; `ltx-2.5` by `patchify_proj` plus `audio_patchify_proj`, with
-or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its own
-knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
-`audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
-seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
-`dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
-declares none), `dit_config_path`, `encoder_config_path`,
-`negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
-negative half of the same fallback, for the unconditional forward),
-`allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
-`upsampler_path`, `duration_head_path`, `lora_path` and `lora_strength`, twelve
-keys, which is `kKnownLoadExtras` (`ltx2_video.cpp:377-383`) in order. The two
-LoRA keys landed with issue #923 and were missing from this list until
-2026-08-17; the array's own neighbouring comment still says "nine of these ten",
-which is [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
-An extra a family does not define is
-refused, never ignored. One caveat inside that set: `duration_head_path` is
-defined but UNSERVED, the duration head is ported and gated as a brick, and
-nothing in the video engine constructs one, so supplying it is **refused by
-name** at load rather than accepted. It used to be accepted and read by nothing,
-which silently substituted the recipe default for the file you named. Give
-`num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
-rate) instead. Every other key in that list reaches a reader.
 
-One LTX-2.5 arm is refused where a render would otherwise silently downgrade:
-the spatiotemporal latent upsampler. It is reachable, supplying that checkpoint
-as `upsampler_path` gets a refusal naming the arm you actually supplied. The
-spatiotemporal upsampler is the arm with `spatial_upsample` AND
-`temporal_upsample` set, which upstream builds as a different operator
-(`Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`). The temporal-only x2 upsampler is
-**ported** and is not refused; nothing shipped drives it yet, so it is gated
-rather than served. **Three** more are
-recorded as out of scope but are **not requestable**, so no flag or extra can
-reach them: `int8-convrot`, single-node multi-GPU, and
-`BetaScheduler`. (LoRA fusion was in that list until 2026-08-15 and is now
-SERVED - see `--lora` above - so its marker was retired rather than moved. This
-sentence still said "Four more" until 2026-08-17, counting the retired marker in
-the same breath as it explained the retirement.) That is four
-`Ltx2UnportedPipelineFeature` enumerators in total, one reachable and three
-markers (`ltx2_pipeline.h:768-803`), and the split is derived from the tree by
-`test_ltx2_pipeline` rather than restated here. Their messages
-say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
-`BetaScheduler` is in that group rather than the reachable one because upstream
-selects it nowhere: every `ltx-pipelines` entry point hard-codes
-`LTX2Scheduler()`, so there is no scheduler-kind field to mirror and nothing here
-carries one either. `int8-convrot`
-in particular is a ComfyUI-ecosystem format: upstream LTX-2's own inference
-quantization kinds are `fp8-cast`, `fp8-scaled-mm`, `nvfp4-cast` and
-`nvfp4-prequant`, and nothing wired upstream reaches int8 at all.
-
-What is **not** on that list, and why: **multi-shot or multi-scene generation.**
-A request that composes several camera takes into one output has no flag here
-because upstream LTX-2 has no such mode to mirror, its `shot` is one continuous
-take, and its own prompt-enhancement prompts instruct the model to keep a "single
-continuous take" and not to describe scene cuts. `scene` does appear across the
-upstream tree, in three unrelated senses (`scene-linear` HDR colour, PySceneDetect
-in the trainer's dataset preprocessor, and that prompt-writing guidance); none of
-them is a generation mode. This port carried a `multishot` refusal until
-2026-08-13, which was a defect in our own record rather than a gap, and it was
-retired. Generate one take per request.
+For video-family load options, defaults, and refused arms, see the
+[LTX 2.5 recipe](../models/ltx-2-5.md) and
+[MiniMax-H3 recipe](../models/minimax-h3.md).
 
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector

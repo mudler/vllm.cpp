@@ -8,20 +8,12 @@ timeout sees body bytes before the first token. Interval is
 `VT_SERVER_SSE_PING_S`, **default `0`, off**; a positive value enables it and
 is clamped to 600.
 
-**It is off by default, and it should stay off unless a proxy forces your
-hand.** vLLM's streaming endpoints emit no comment frame at any point, so a
-server that sends one is putting a byte on the wire that OpenAI-compatible
-clients written against vLLM have never had to parse. vLLM's own benchmark
-client is one of them: `vllm bench serve` strips each network chunk before
-parsing, which destroys the `\n\n` separator at chunk boundaries, and its only
-resynchronisation path looks for a `data: ` prefix, so one comment frame
-arriving before a request's first token makes it report
-`Never received a valid chunk to calculate TTFT` and count that request
-**failed**, while this server completes it normally and logs nothing. The
-requests that reach a keepalive are by construction the slowest ones, so the
-effect is to delete your own worst latencies from a measurement
-([#931](https://github.com/mudler/vllm.cpp/issues/931),
-[#577](https://github.com/mudler/vllm.cpp/issues/577)).
+
+Leave keepalives off unless a proxy closes inactive streams. Some benchmark
+clients do not accept SSE comment frames. Keep `VT_SERVER_SSE_PING_S=0` during
+comparative measurements. See
+[the server-concurrency spec](../../.agents/specs/server-concurrency-failures.md)
+for the compatibility evidence.
 
 Comment frames are not `data:` events and carry no tokens, and neither setting
 turns token streaming into a poll loop. At the `0` default both streams take the

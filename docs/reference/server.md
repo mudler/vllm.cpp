@@ -10,118 +10,9 @@ Use this page to look up server behavior, flags, and defaults.
 build/examples/vllm-server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
 ```
 
-The install component and deterministic archive target both stage from install
-rules rather than copying the build tree:
 
-```sh
-cmake --build build --target vllm-server-stage
-cmake --build build --target vllm-server-archive
-build/release/stage/bin/vllm-server --help
-```
-
-At the current numeric project version, `vllm-server-archive` emits exactly one
-deterministic developer tarball named
-`build/release/vllm.cpp-0.0.3-<configured-artifact-id>.tar.gz`. The target
-selects `tar.gz` explicitly; it does not infer the format from the filename.
-This is separate from the release workflow, whose `0.0.3-pre.1` asset names and
-per-tuple formats come from the release matrix, including `.zip` for Windows.
-
-On native Windows, run the release-bundle gate from a Visual Studio 2022 x64
-developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
-`bin/vllm-server.exe`, runs the focused Win32 tests, exercises the portable and
-AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
-`--help`, `/health`, `/version`, and a clean CTRL_BREAK shutdown:
-
-The MSVC build defines `NOMINMAX` and the portable ISO CRT contract centrally,
-and compiles C++ sources as UTF-8. Do not add those definitions per target or
-disable `/WX`; both CPU and Vulkan release configurations share this contract.
-
-```powershell
-$env:SOURCE_SHA = git rev-parse HEAD
-$env:VERSION = "0.0.3-pre.1"
-$env:SOURCE_DATE_EPOCH = git show -s --format=%ct HEAD
-$env:EVIDENCE_URL = "https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE"
-pwsh -File scripts/build-windows-release.ps1 -Backend cpu
-pwsh -File scripts/build-windows-release.ps1 -Backend vulkan `
-  -BuildDir build-release-windows-vulkan `
-  -StageDir build-release-windows-vulkan/stage
-```
-
-The adaptive binary keeps its F16C translation unit at `/arch:AVX`; AVX2 and
-AVX-512 remain separate runtime-selected translation units. The gate derives
-the complete server source set from CMake's generated codemodel, recursively
-checks its project-local header closure, and refuses required runtime sources
-that are not reachable from the shipped target. After installation it audits
-project COFF directives for static `LIBCMT` and rejects dynamic/debug CRT
-imports before running the staged executable's `--help`, forced-tier, or HTTP
-shutdown smokes. The Win32 console-control regression uses bounded waits so a
-teardown failure reports an error instead of hanging the gate.
-
-The CUDA graph-replay profiler and its FIFO diagnostic controls remain
-POSIX-only and are not exposed by native Windows server builds. Native Windows
-process launch, environment updates, process IDs, and console shutdown stay on
-the direct CRT/Win32 adapters; they do not require a POSIX compatibility layer
-or a command shell.
-
-Each invocation emits a deterministic `.zip` plus its exact `.sha256` and
-`.provenance.json` sidecars. ZIP members are sorted, use the
-`SOURCE_DATE_EPOCH` timestamp, and reject traversal, drive-qualified paths,
-backslashes, symlinks, and reparse points. The PE audit requires AMD64, `/MT`,
-system DLL imports, and no build/debug/MSYS paths. The Vulkan archive bundles no
-loader, ICD, or driver: `vulkan-1.dll` and a working host Vulkan stack remain
-external, and runtime evidence stays absent unless the extracted server is
-actually probed against a real ICD.
-
-The default smoke model is the committed tiny embedding fixture; pass
-`-SmokeModel C:\path\to\model` to use another complete model directory. This
-command produces a staged developer tree only. The Windows CPU and Vulkan ZIP
-downloads do not exist until the `v0.0.3-pre.1` prerelease workflow and
-post-publication audit succeed. <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
-
-The basic CMake archive under `build/release/` includes the version, configured
-backend, OS, and host architecture in its name. It is a developer package. The
-release workflow separately produces host-ABI-specific archives with a
-manifest, `VERSION`, SPDX SBOM, notices, licenses, and detached checksum and
-provenance sidecars; no release download is claimed until that workflow has
-completed on a release tag.
-
-To reproduce the W1 heterogeneous CUDA archive candidate, configure the exact
-release architecture set. Portable translation units compile for all ten SMs;
-architecture-specific kernels compile only for their supported intersection.
-`VLLM_CPP_TRITON` is left to its default, which is `ON` here, a fat CUDA build
-embeds every vendored per-arch cubin tree and selects one by exact SM at
-runtime, which is what the released archive contains:
-
-```sh
-cmake -S . -B build-cuda-fat -G Ninja \
-  -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
-  -DVLLM_CPP_CUTLASS_FETCH=ON
-cmake --build build-cuda-fat --target vllm
-python3 scripts/check-cuda-fat-gencode.py \
-  --compile-commands build-cuda-fat/compile_commands.json \
-  --library build-cuda-fat/libvllm.a
-```
-
-The release workflow applies this audit to independently linked x86_64 and
-arm64 host executables, packages each as a preview `cuda` archive, and then
-runs the extracted-archive validator. Each archive must contain all ten SM
-images and the six available exact-SM Triton AOT namespaces; the manifest keeps
-runtime evidence separate per SM. These build-only preview candidates are not
-a downloadable release claim until the tagged workflow publishes them.
-
-The complete primary download matrix and its runtime boundaries are documented
-in [the release guide](../RELEASES.md). A manual workflow dispatch runs all eight tuples
-without publication. An exact version tag runs the same build, produces
-`release-index.json` and `RELEASE_INDEX.md` from the verified archive manifests,
-attests the archive bytes, and publishes every archive/checksum/provenance
-triplet through the protected release environment.
-
-Inside the workflow, generated archives live under `release-assets` (and then
-`unverified/release-assets` / `verified/release-assets`). This transient root is
-deliberately separate from the checkout's tracked `assets/` directory, so exact
-handoff validation sees only the planned archive/checksum/provenance triplets.
-The release filenames and published eight-tuple inventory are unchanged.
+For build and packaging commands, see [Building vllm.cpp](../BUILD.md). For
+published artifacts and verification steps, see [Binary releases](../RELEASES.md).
 
 ## Selecting an x86 CPU ISA tier
 
@@ -141,72 +32,10 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [the environment reference](../ENVIRONMENT.md).
 
-## NVFP4 dense sinks
 
-The `E=1` dense NVFP4 projections run on vLLM's own dense Marlin GEMM rather
-than the single-expert grouped-MoE route, which pays `moe_align` bookkeeping and
-row padding for a problem that has neither. `VT_MARLIN_DENSE` covers the single
-projections and `VT_MARLIN_DENSE_PAIR` the fused shared-expert gate_up sink;
-both default ON, opt out with `=0`. The pair sink was the last one still on the
-MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
-`nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
-throughput changes; the routed experts still use the grouped MoE kernel, which
-is where they belong.
-
-The **dense** MLP's W4A16 gate/up pair takes that same fused gate_up GEMM
-(`VT_DENSE_MARLIN_GATEUP`, **default ON**, opt out with `=0`). vLLM's dense
-Qwen3.6 MLP is one `MergedColumnParallelLinear` `gate_up_proj`, so one
-`[T,H]x[2I,H]` GEMM per layer is the mirrored topology; ours used to launch two,
-which was 193 Marlin calls per decode step against the oracle's 129. The default
-moved on a same-binary A/B: interleaved 4 reps per arm on
-`nvidia/Qwen3.6-27B-NVFP4`@`0893e160` (GB10) with the toggle as the only
-variable measured **+2.12% at c1 and +1.70% at c8**, every fused rep beating
-every split rep at both concurrencies, and the 64-token greedy continuation
-identical on both arms. It is still only ~29% of a measured +4.40 ms/step gap on
-the 27B and does not reach parity on its own. It applies only to an **NVFP4**
-W4A16 pair whose two shards share a global scale; a true-W4A4 checkpoint already
-takes the merged CUTLASS path instead, and a **dense MXFP4** pair is refused and
-keeps the split pair. That MXFP4 refusal is deliberate: the fused entry point the
-dense MLP reaches is NVFP4-only, it sizes the merged block-scale grid at K/16
-and pins `group_size = 16`, so admitting group-32 E8M0 scales would misread them
-as group-16 fp8-e4m3, the defect this project already recorded for the sibling
-implementation. No dense loader produces MXFP4 today, so the refusal changes no
-shipped configuration; it stops one future loader line from silently selecting a
-mis-scaled kernel.
-
-The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
-f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
-bf16 in-kernel, which is exact, and re-round through bf16 on store, so the
-f32 form was writing and re-reading a whole `[T,H]` buffer for a value it
-already had. The change is bit-identical and worth **+2.05% at c8**.
-
-## The NVFP4 output head
-
-On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
-`weight`/`weight_scale`/`weight_scale_2`, or compressed-tensors
-`weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
-GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
-head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
-2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
-GiB, a 1.70 GiB saving on CUDA; the figure is owed a re-measurement after
-`ENG-LOAD-DIRECT-UPLOAD` changed the RSS accounting).
-
-That accounting is CUDA's. A backend with no fp4 GEMM (CPU, Vulkan, Metal, HIP,
-Tenstorrent) has to multiply against a dequantized bf16 copy, so on those the
-head costs the packed bytes **plus** one `2*K*N` operand, built once when the
-model is prepared rather than per call, 0.666 + 2.368 = 3.034 GiB on the same
-checkpoint. The sign of the change therefore depends on the backend: on Vulkan,
-which used to stage a host bf16 head *and* a device copy of it, the head goes
-4.736 to 3.034 GiB, the same **-1.70 GiB**; on plain CPU it goes 2.368 to 3.034,
-a **+0.67 GiB** regression, paid once instead of rebuilding 2.368 GiB on every
-decode step as that backend did before. Only the head is kept that way; every
-other NVFP4 projection dequantizes per call, so a quantized tower is never
-expanded in memory. The head runs W4A16 under both namings: the on-disk
-activation divisor next to it (`input_scale`, or `input_global_scale` in the
-compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
-matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a
-same-binary A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF
-and `tie_word_embeddings` heads are unaffected by either setting.
+NVFP4 optimization defaults and current measurements are listed in
+[the environment reference](../ENVIRONMENT.md) and
+[the benchmark report](../BENCHMARKS.md).
 ### Endpoints
 
 Registered in
@@ -288,7 +117,7 @@ manifest, and loading the family refuses with a message naming the missing
 pieces (#634). Without `--speech-model` the route is a 404 at the route table
 rather than a runtime error, which is the accurate signal: the endpoint is opt
 in, not absent. See
-[Speech and music generation](#speech-and-music-generation).
+[the MiniMax-Music3 recipe](../models/minimax-music3.md).
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it, every prompt position is scored against the token
@@ -312,7 +141,7 @@ request asked.
 The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. See
-Use the [model recipe index](#find-a-model-recipe) to open the current combined
+Use the [model recipe index](../USAGE.md#find-a-model-recipe) to open the current combined
 MiniMax-H3 video and audio workflow.
 
 `/v1/audio/speech` is registered **only** when the server was started with

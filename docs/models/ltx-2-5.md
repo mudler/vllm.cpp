@@ -785,7 +785,7 @@ reasons the reference-video arm is refused above.
 On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
 and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
 knobs the flags above map onto. Both are described under
-[the server's video flags](#video-family-and-family-specific-load-knobs).
+[the server's video flags](../reference/server.md#server-flags).
 
 **Three things about that command are worth knowing before you run it.**
 

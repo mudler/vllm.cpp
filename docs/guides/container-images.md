@@ -73,52 +73,6 @@ generation, so decode is on the GPU.
 | `libcuda.so.1: cannot open shared object file` | no driver in the container, on Jetson, add `--gpus all` alongside `--runtime nvidia` |
 | `--model <dir> is required` | the server takes flags directly; everything after the image name goes to `vllm-server` |
 
-## Building and validating an image locally
-
-One Dockerfile, one target per lane. The builder stage runs the same
-`scripts/build-*-release.sh` the release workflow runs, so there is no second
-build definition to drift:
-
-```sh
-docker build -f docker/Dockerfile --target cpu \
-  --build-arg VERSION=0.0.1 \
-  --build-arg SOURCE_SHA=$(git rev-parse HEAD) \
-  --build-arg JOBS=$(nproc) \
-  -t vllm-cpp:local-cpu .
-```
-
-Then gate it. Without `--model` the validator checks configuration and layout
-and says plainly that the image has no runtime evidence; with one it also boots
-the server, requires `/health` and `/version`, runs the image's own declared
-healthcheck, and requires a clean SIGTERM shutdown:
-
-```sh
-python3 scripts/validate-container-image.py \
-  --image vllm-cpp:local-cpu --lane cpu --version 0.0.1 \
-  --model /path/to/opt-125m
-```
-
-`scripts/check-container-matrix.py` keeps `release/container-matrix.json` and
-the Dockerfile agreeing about lanes, tags and digest-pinned bases;
-`scripts/check-container-workflow.py` holds the publish workflow to its
-least-privilege stages. Both run in preflight and CI.
-
-To exercise the release pipeline without publishing anything, trigger its
-manual entry point:
-
-```sh
-gh workflow run release.yml --ref main
-```
-
-Manual runs are always dry runs. Publication additionally requires the exact
-tag declared in `release/release-version.json` (currently
-`v0.0.3-pre.1`), a release matrix whose required lanes are all marked
-ready, successful verification and attestation jobs, and approval of the
-protected `release` environment. Build and verification jobs have read-only
-repository permissions; only attestation receives OIDC authority, and only the
-final protected job receives `contents: write`. The current declaration is a
-prerelease; the publisher must pass GitHub's prerelease flag and a manual dry
-run cannot publish.
 
 Any OpenAI client works by pointing its `base_url` at it:
 

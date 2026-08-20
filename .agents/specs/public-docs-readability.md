@@ -59,6 +59,16 @@ real-checkpoint Music3 commands, the `LTX_2_3_HQ_PARAMS` defaults, and the
 upstream `FRAME_IDX` limitation to their model pages. The W3 set inventory has
 no unexplained loss after this classification.
 
+The W4 R3 repair removes release packaging, benchmark forensics, ABI chronology,
+and model implementation history from user task and interface pages. Current
+release facts route to `docs/BUILD.md` and `docs/RELEASES.md`. Current
+measurements route to `docs/BENCHMARKS.md`, while exact implementation and gate
+evidence remains in `server-concurrency-failures.md`, `minimax-music3.md`,
+`qwen38-27b-quant-arms.md`, and the model recipes. The required Qwen3.8 artifact
+revision, sizes, and checksums remain in the `docs/USAGE.md` checkpoint registry.
+The repair also resolves the three reported local fragments to the server flag
+reference, the MiniMax-Music3 recipe, and the model recipe index.
+
 The inventory's other zero-after literals are semantically accounted for.
 `HALF` and `KEYFRAME` were emphasis around the two-stage LTX behavior, which the
 LTX model page now states without all caps. `SAMPLER` is the restored `res_2s`

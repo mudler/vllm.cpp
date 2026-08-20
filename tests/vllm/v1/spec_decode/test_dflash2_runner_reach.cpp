@@ -19,18 +19,34 @@
 // the aux-multi-tap refusal, `set_dflash_draft`, `propose_drafts` ->
 // `propose_drafts_dflash` -> `propose_drafts_block`.
 //
-// WHAT THIS GATE ASSERTS, and why the assertion is the refusal's TEXT. A DFlash2
-// draft cannot generate: its path walk is W4, and the engine refuses by name at
-// `RefuseDflash2PathWalk`. That refusal carries the lattice the selector
-// produced -- scored transitions, requests, steps, top_k -- so the message
-// proves three things at once that no exit status could:
+// WHAT THIS GATE ASSERTS AS OF W4, and why generation SUCCEEDING is not the
+// assertion. Through W3 a DFlash2 draft could not generate at all: the path walk
+// was missing and the engine refused by name, so the refusal's own text -- which
+// carried the selector's counts -- was the whole gate. W4 lands the walk, so the
+// engine generates, and "it generated" would be satisfied by a runner that
+// dropped the DFlash2 arm entirely and drafted with the DFlash1 per-slot argmax.
+// That is the exact silent-wrong this row exists to remove: the verify is
+// lossless, the emitted tokens stay the target's, and only acceptance falls.
 //
-//   1. the runner entered `propose_drafts_block` (nothing else raises this),
-//   2. the block forward ran there (the counts are sized from its output),
-//   3. the CANDIDATE SELECTOR ran there (the counts ARE its output).
+// So this file asserts the two things an argmax fallback cannot produce:
 //
-// Delete the `Dflash2SelectCandidates` call in `runner.cpp` and pass a
-// default-constructed state -- which compiles -- and every count reads zero.
+//   1. THE DRAFTS EXIST AND COME OUT OF THE PROPOSE, read off the production
+//      `VT_SPEC_TRACE` line at real fd 2 rather than a test-only sink.
+//   2. THE DRAFTS MOVE WITH THE SELECTOR'S VALUES. Two engines that differ ONLY
+//      in `output_multiplier` and `final_logit_softcapping` -- D9's Muse Glimmer
+//      scalars -- must draft DIFFERENT tokens. Those two scalars touch nothing
+//      but the candidate VALUES the selector's unary term reads, so the block
+//      forward, the convolution and the draft logits are byte-identical between
+//      the two runs. The DFlash1 argmax reads the block LOGITS and would answer
+//      identically for both; only a draft produced by walking the selector's
+//      lattice can differ. The difference is MEASURED by this case, not asserted
+//      about the fixture.
+//
+// And the third leg is structural rather than observational: both propose paths
+// enter the DFlash1 argmax on EMPTINESS and call
+// `RefuseDflash1ArgmaxOnDflash2Block` first, so deleting the walk's call site --
+// the mutation `.agents/reachability.md` requires -- throws by name instead of
+// quietly drafting worse tokens.
 //
 // The target is the same tiny synthetic Qwen3.5 DENSE model
 // tests/vllm/v1/spec_decode/test_mtp_depth.cpp builds, because
@@ -45,6 +61,7 @@
 #include <iostream>
 #include <sstream>
 #include <map>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -52,6 +69,7 @@
 #include <vector>
 
 #include <unistd.h>
+#include <cstdlib>
 
 #include <nlohmann/json.hpp>
 
@@ -487,36 +505,117 @@ std::string GenerateAndCatch(LoadedEngine& eng, const std::string& prompt) {
   return std::string();
 }
 
-}  // namespace
+// `VT_SPEC_TRACE` is latched by a function-local `static` on the FIRST propose in
+// the process, so setting it inside a test case would be a race with whichever
+// case ran first. This runs before main.
+const bool kSpecTraceEnabled = [] {
+  ::setenv("VT_SPEC_TRACE", "1", 1);
+  return true;
+}();
 
-TEST_CASE("dflash2 runner: the selector RUNS inside propose_drafts_block") {
-  const HfConfig target = MakeDenseConfig();
-  const ScratchDraftDir dir;
-  LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(),
-                   DflashSpecParams(dir), MakeDflash2Draft(target, false));
-  const std::string what = GenerateAndCatch(eng, "hello");
-  INFO("what: ", what);
-  REQUIRE_FALSE(what.empty());
-
-  // (1) The runner entered the DFlash propose. Nothing else raises this.
-  CHECK(what.find("PATH WALK") != std::string::npos);
-  // (2) and (3) The block forward and the CANDIDATE SELECTOR ran there, because
-  // these counts ARE the selector's own output on this block: one proposing
-  // request, k = 3 steps, selector_top_k = 3, so 1*3*3*3 = 27 scored
-  // transitions. Delete the `Dflash2SelectCandidates` call in
-  // `GPUModelRunner::propose_drafts_block` and pass a default-constructed state
-  // -- which compiles -- and all four read zero.
-  CHECK(what.find("scored-transitions=27") != std::string::npos);
-  CHECK(what.find("requests=1") != std::string::npos);
-  CHECK(what.find("steps=3") != std::string::npos);
-  CHECK(what.find("top_k=3") != std::string::npos);
+// REAL fd 2, by dup/dup2, and not a `std::cerr` rdbuf swap: the propose trace is
+// written with `std::fprintf(stderr, ...)`, which an rdbuf swap cannot see. A
+// capture that could not see the line it exists to read would report an empty
+// string and look like "the propose did not run", which is the instrument
+// failing toward a verdict about the code.
+std::string CaptureStderr(const std::function<void()>& body) {
+  std::FILE* cap = std::tmpfile();
+  REQUIRE(cap != nullptr);
+  std::fflush(stderr);
+  const int saved = ::dup(STDERR_FILENO);
+  REQUIRE(saved >= 0);
+  REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+  body();
+  std::fflush(stderr);
+  const int restored = ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  std::rewind(cap);
+  std::string out;
+  char buf[4096];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) out.append(buf, n);
+  std::fclose(cap);
+  REQUIRE(restored >= 0);
+  return out;
 }
 
-TEST_CASE("dflash2 runner: the STARTUP notice names the boundary that is real") {
+// Every `first=[...]` payload of the production propose trace, in step order.
+// One entry per decode step that proposed.
+std::vector<std::string> DraftedBlocks(const std::string& captured) {
+  std::vector<std::string> out;
+  const std::string key = "first=[";
+  size_t at = 0;
+  while ((at = captured.find(key, at)) != std::string::npos) {
+    const size_t open = at + key.size();
+    const size_t close = captured.find(']', open);
+    if (close == std::string::npos) break;
+    out.push_back(captured.substr(open, close - open));
+    at = close;
+  }
+  return out;
+}
+
+}  // namespace
+
+namespace {
+
+// One engine run, returning the drafted blocks the production trace reported.
+std::vector<std::string> RunAndCollectDrafts(bool muse_glimmer_scalars,
+                                             std::string* threw) {
+  const HfConfig target = MakeDenseConfig();
+  const ScratchDraftDir dir;
+  std::string what;
+  std::string captured = CaptureStderr([&] {
+    LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(),
+                     DflashSpecParams(dir), MakeDflash2Draft(target, muse_glimmer_scalars));
+    what = GenerateAndCatch(eng, "hello");
+  });
+  if (threw != nullptr) *threw = what;
+  return DraftedBlocks(captured);
+}
+
+}  // namespace
+
+TEST_CASE("dflash2 runner: a DFlash2 draft DRAFTS through the PATH WALK") {
+  std::string threw;
+  const std::vector<std::string> blocks = RunAndCollectDrafts(false, &threw);
+  // W3 refused here by name. W4 must not.
+  INFO("threw: ", threw);
+  CHECK(threw.empty());
+  // The propose ran, and it produced a whole block per step. `kSpecTokens` is 3,
+  // so each traced block carries three ids.
+  REQUIRE_FALSE(blocks.empty());
+  for (const std::string& b : blocks) {
+    INFO("block: [", b, "]");
+    int ids = 0;
+    for (size_t i = 0; i < b.size(); ++i)
+      if (b[i] == ' ') ++ids;
+    CHECK(ids == kSpecTokens);
+  }
+  // And every drafted id is a real token of this vocabulary rather than a
+  // sentinel or an uninitialized slot -- the walk gathers `candidates.ids`, and
+  // a walk that emitted the SLOT INDEX instead would still print three numbers.
+  // kSelTopK is 3 and the vocabulary is 24, so "every id < top_k" would be the
+  // signature of that mistake; this asserts at least one id is not.
+  bool any_beyond_top_k = false;
+  for (const std::string& b : blocks) {
+    std::istringstream is(b);
+    int id = 0;
+    while (is >> id) {
+      CHECK(id >= 0);
+      CHECK(id < kVocab);
+      if (id >= kSelTopK) any_beyond_top_k = true;
+    }
+  }
+  CHECK(any_beyond_top_k);
+}
+
+TEST_CASE("dflash2 runner: the STARTUP notice names what runs, not what is owed") {
   // `## Risks/decisions` D10 pays for the moved refusal with a startup notice,
-  // and W3 moves the boundary again -- so the notice has to move with it. A
-  // notice still naming the selector as the missing mechanism would send a user
-  // to wait for a wave that has landed.
+  // and every wave that moves the boundary has to move the notice with it. W3's
+  // fresh review found the OTHER copy of this text still naming the wave that had
+  // just shipped; the obligation is that the notice is TRUE at its own commit,
+  // and this is what holds it.
   const HfConfig target = MakeDenseConfig();
   const ScratchDraftDir dir;
   std::string captured;
@@ -528,26 +627,54 @@ TEST_CASE("dflash2 runner: the STARTUP notice names the boundary that is real") 
   }
   INFO("notice: ", captured);
   CHECK(captured.find("DFlash2DraftModel") != std::string::npos);
-  CHECK(captured.find("CANDIDATE SELECTOR are implemented") != std::string::npos);
-  CHECK(captured.find("PATH WALK is not implemented") != std::string::npos);
-  CHECK(captured.find("wave W4") != std::string::npos);
+  CHECK(captured.find("PATH WALK are all implemented") != std::string::npos);
+  CHECK(captured.find("this draft DRAFTS") != std::string::npos);
+  // What is still owed, named -- the GGUF drafter arm and the absent throughput
+  // number -- so the notice is not a claim that the row is finished.
+  CHECK(captured.find("wave W5") != std::string::npos);
+  CHECK(captured.find("no throughput number") != std::string::npos);
   CHECK(captured.find("#1314") != std::string::npos);
+  // And that the port is BEYOND-PIN, which is the one thing a user of a DFlash2
+  // checkpoint cannot discover from the checkpoint.
+  CHECK(captured.find("52816") != std::string::npos);
 }
 
-TEST_CASE("dflash2 runner: the DEFAULT scalars and Muse Glimmer's both reach the runner") {
-  // `## Risks/decisions` D9 at the PRODUCTION entry. Both drafts run the same
-  // block and reach the same refusal; what differs is the candidate values the
-  // selector scored, and the shape of the lattice does not change with them --
-  // so the counts are the same and this case's value is that the SCALARS do not
-  // break the production path, not that they move it (the model suite gates
-  // that they move it).
-  const HfConfig target = MakeDenseConfig();
-  const ScratchDraftDir dir;
-  LoadedEngine muse(target, MakeDenseWeights(target), BuildFixture(),
-                    DflashSpecParams(dir), MakeDflash2Draft(target, true));
-  const std::string what = GenerateAndCatch(muse, "hello");
-  INFO("what: ", what);
-  REQUIRE_FALSE(what.empty());
-  CHECK(what.find("PATH WALK") != std::string::npos);
-  CHECK(what.find("scored-transitions=27") != std::string::npos);
+TEST_CASE("dflash2 runner: D9's SCALARS move the drafted tokens, in production") {
+  // THE REACHABILITY ASSERTION, and the reason it is this one. Both runs share
+  // the same draft weights, the same target, the same prompt and the same block
+  // forward; the ONLY difference is `output_multiplier` and
+  // `final_logit_softcapping`, which `Qwen3DFlash2Model::ComputeCandidates`
+  // applies to the candidate VALUES the selector's unary term reads. Nothing
+  // else in the engine sees them.
+  //
+  // So the DFlash1 per-slot argmax -- which reads the block LOGITS -- answers
+  // IDENTICALLY for both. A difference here can only come from a draft that was
+  // produced by walking the selector's lattice, on the production path, at the
+  // runner's own call site. That is what no exit status and no "it generated"
+  // could show.
+  std::string threw_default, threw_muse;
+  const std::vector<std::string> plain = RunAndCollectDrafts(false, &threw_default);
+  const std::vector<std::string> muse = RunAndCollectDrafts(true, &threw_muse);
+  INFO("default threw: ", threw_default);
+  INFO("muse threw: ", threw_muse);
+  CHECK(threw_default.empty());
+  CHECK(threw_muse.empty());
+  REQUIRE_FALSE(plain.empty());
+  REQUIRE(plain.size() == muse.size());
+  int differing = 0;
+  for (size_t i = 0; i < plain.size(); ++i) {
+    INFO("step ", i, " default [", plain[i], "] muse [", muse[i], "]");
+    if (plain[i] != muse[i]) ++differing;
+  }
+  // MEASURED, not assumed, and the MARGIN is written down: on 2026-08-20 this
+  // fixture drafts 8 blocks and 2 of them differ between the two scalar arms.
+  // A block only moves when the scalars flip the argmax at one of the `k` slots
+  // the walk actually visits, so 2-of-8 is the shape of the synthetic ramp
+  // rather than a weakness in the wiring -- the model suite measures the same
+  // comparison at 5 of 6 blocks over a wider sweep of inputs
+  // (tests/vllm/models/test_qwen3_dflash2_draft.cpp). The count is printed so a
+  // fixture change that made the two arms agree is visible as a number rather
+  // than as a silent pass.
+  INFO("blocks: ", plain.size(), " differing: ", differing);
+  CHECK(differing > 0);
 }

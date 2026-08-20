@@ -156,6 +156,32 @@ and `VT_KIMI_DEVICE_MLA` now each have one environment-table row, retaining the
 more complete current description. A direct row-name count fails on the two
 duplicates before this repair and reports none afterward.
 
+W6 reconciles the four linked issues without changing a claim that the current
+tree cannot support. Issue #1275 is fixed: `docs/FEATURES.md` says block-wise
+FP8 runs on CPU and names the unproven CUDA arm. Issue #342 is fixed on the
+purpose-specific surfaces. `docs/USAGE.md` uses `build/examples/vllm-server`,
+`docs/reference/c-api.md` reports ABI v23, and `docs/reference/server.md` lists
+the conditional embedding and transcription routes. The architecture registry
+gate reports 40 entries. The README still carries the old executable, ABI,
+architecture, and gate claims, so #342 remains partial.
+
+Issues #704 and #1281 also remain open. The tool-parser source has 38 parser
+classes and 42 accepted names. `docs/FEATURES.md` reports 38 families, but the
+README still reports 36 families and 40 names. Issue #1281 depends on the open
+#1280 model-fetch work and requires three executed model rows. This campaign
+has no GPU or model-run evidence for those rows. It does not create the proposed
+quick-start page from unexecuted commands.
+
+The README checkpoint forbids a claim-changing README edit unless the same
+commit changes `.agents/mission.md`, a named build or example entry point, or a
+named benchmark source. This documentation-only wave changes none of those
+landing sources. Editing one only to authorize README churn would fabricate a
+source change. The existing README links to `docs/USAGE.md`, `docs/BUILD.md`,
+`docs/FEATURES.md`, `docs/STATUS.md`, and `docs/BENCHMARKS.md`; W2 through W5
+made those destinations the current public owners. W6 therefore records the
+remaining README drift for the product or landing-source flow that can update
+it honestly.
+
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue
 #1463 uses the accepted spec-owned form in the append-only issue index.

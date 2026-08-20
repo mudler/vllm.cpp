@@ -18,11 +18,12 @@ W3 extracts the model recipes, combines the repeated MiniMax sections, and adds
 the seven-field checkpoint registry. The remaining legacy body stays in place
 for the W4 and W5 migrations.
 
-W4 extracts twelve cross-model guides and four dense references. The guide and
-reference indexes own each new destination. Five existing focused guides move
-under `docs/guides/`, and every public and internal caller now names the moved
-path. `docs/USAGE.md` retains the generic workflows, checkpoint registry,
-generic speech route, and the build and release material that W5 still owns.
+W4 forms a twelve-guide surface from seven new task guides and five existing
+focused guides retained at their canonical top-level paths. The guide index
+links the new destinations and those five retained paths, while the reference
+index owns four dense references. `docs/USAGE.md` retains the generic workflows,
+checkpoint registry, generic speech route, and the build and release material
+that W5 still owns.
 
 The W4 red check failed first on the missing
 `docs/guides/hugging-face-access.md` destination. The green destination and

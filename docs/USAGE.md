@@ -816,6 +816,29 @@ reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
 come from the geometry the engine has just resolved for your checkpoint, so a
 refusal is about that checkpoint on this build.
 
+**A device is only ever offered the backends built for it.** On CPU the engine
+resolves `CPU_ATTN`, which is what the reference engine resolves on a CPU too. It
+is worth saying out loud because it was briefly untrue: `CPU_ATTN` was named as
+the CPU's preference while being registered nowhere, so CPU runs quietly fell
+through to `FLASH_ATTN` — harmless until `FLASH_ATTN` was taught FlashAttention-2's
+rule that a head size must be a multiple of 8. A CPU model with a head size of 6
+then had no backend at all and was refused at initialization, on hardware that
+runs it perfectly well ([#1371](https://github.com/mudler/vllm.cpp/issues/1371)).
+If you see the refusal above naming `FLASH_ATTN` alone on a device that is not an
+NVIDIA GPU, that is the shape to report: the rule quoted at you is about a kernel
+your device never runs.
+
+One consequence is worth stating on its own, because it widens what a CPU run
+accepts. `CPU_ATTN` serves **`f32` as well as `f16` and `bf16`**, which is what
+the reference engine's CPU backend serves. `FLASH_ATTN` declares the two half
+dtypes only, so while the CPU was borrowing it an `f32` model was refused at
+initialization with `dtype not supported`. It now runs. The KV-cache dtypes the
+CPU accepts are `auto`, `fp8` and `fp8_e4m3`; `fp8_e5m2` is refused by name,
+because the CPU kernel's fp8 arm reads e4m3 alone. On an NVIDIA GPU the list is
+`auto`, `float16`, `bfloat16`, `fp8` and `fp8_e4m3`, so `fp8_e5m2` is refused
+there too. That second refusal is the reference engine's own and is not
+something this project trimmed away.
+
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend
 whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
@@ -5220,12 +5243,13 @@ config document: `VT_GGUF_PREFAULT=0`, `VT_MOE_EXPERT_STREAM=1` and
 `VT_MOE_EXPERT_STREAM_SLOTS=4000`. The two forms are the same switches, and a
 variable beats a config field wherever both are set.
 
-They also ran a different binary. Every figure below comes from
+They also ran a different binary. Every W0e and W0f figure below comes from
 `benchmarks/expert_stream_device_w0e.cpp`, a purpose-built C ABI client that
 reports the token ids, a per-step timestamp and the expert-stream counters
-together, which no shipped command does. The command above starts `vllm-server`
-over the same engine. At seconds per token, the server's HTTP and SSE framing
-sits far below the run-to-run spread recorded below.
+together, which no shipped command does. The 16 August 2026 run is the one
+exception: it served through `vllm-server`, as the command above does. At
+seconds per token, the server's HTTP and SSE framing sits far below the
+run-to-run spread recorded below.
 
 ### What the load costs
 

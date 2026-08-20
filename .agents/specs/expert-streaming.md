@@ -1614,10 +1614,11 @@ revision.
 The section publishes no new measurement. Every figure in it was already
 recorded, it carries no ratio between runs taken on different source trees, and
 it carries no `--device cuda` speed number, because that arm's token gate fails.
-The figures come from the W0e harness `benchmarks/expert_stream_device_w0e.cpp`
-and not from the `vllm-server` command the section publishes, and the section
-discloses that difference beside the prompt and environment differences it
-already disclosed.
+The W0e and W0f figures come from the harness
+`benchmarks/expert_stream_device_w0e.cpp` and not from the `vllm-server` command
+the section publishes, and the section discloses that difference beside the
+prompt and environment differences it already disclosed. The 16 August 2026
+streaming-off run is the one figure that did come from `vllm-server` ([#1447](https://github.com/mudler/vllm.cpp/issues/1447)).
 
 ## Owed
 

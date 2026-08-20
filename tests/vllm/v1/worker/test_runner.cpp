@@ -453,11 +453,13 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
 
   // M3: the runner resolves the ENGINE-level attention backend at init, per
   // attention group. On CPU the dense priority walk (cpu.cpp) is
-  // [CPU_ATTN (unregistered), FLASH_ATTN] so it lands on FLASH_ATTN —
-  // behavior-preserving, and the proof that selection is now part of the
-  // runtime path, not just the registry test. One name per attention layer.
+  // [CPU_ATTN, FLASH_ATTN] and, since #1371 registered it, lands on CPU_ATTN —
+  // upstream's own CPU answer (cpu.py:75-87). This is the proof that selection
+  // is part of the runtime path, not just the registry test: the name below is
+  // resolved inside GPUModelRunner::initialize_kv_cache. One name per attention
+  // layer.
   REQUIRE(runner.attn_backend_names().size() == 1);
-  CHECK(runner.attn_backend_names()[0] == "FLASH_ATTN");
+  CHECK(runner.attn_backend_names()[0] == "CPU_ATTN");
 
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);

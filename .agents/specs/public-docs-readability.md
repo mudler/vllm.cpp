@@ -404,14 +404,14 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:325` ## Running inference (CLI) | Generic user procedure, model recipe, and implementation history | `docs/USAGE.md` for the runnable CLI path and common flags; `docs/reference/model-loading.md` for shared loader rules; `docs/models/qwen3-8-27b.md` and `docs/models/qwen3-8-2-4t.md` for Qwen checkpoint-specific state; `.agents/specs/qwen38-text-only.md` and `.agents/specs/qwen35-plain-bf16-direct-load.md` for load-plan and gate history | `kept`; `moved`; `archived` | `.agents/specs/qwen38-text-only.md`; `.agents/specs/qwen35-plain-bf16-direct-load.md` |
 | `docs/USAGE.md:445` ### Which HF tokenizers load | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:474` ### Timing an encode on your own box | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
-| `docs/USAGE.md:497` ### How much memory a Vulkan load needs | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
-| `docs/USAGE.md:557` ### Running the vocoder convolutions on the GPU | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:497` ### How much memory a Vulkan load needs | Build procedure, current feature state, measurement, cross-model workflow, and design or implementation history | `docs/reference/model-loading.md` for Vulkan unified-memory sizing and `VT_VULKAN_ALLOC_STATS`; `docs/BUILD.md` for the Vulkan measurement tools and Tenstorrent build requirements; `docs/STATUS.md` for current Tenstorrent backend state; `docs/BENCHMARKS.md` for the Voxtral/Whisper FlashAttention-2 and vocoder A/B measurements; `docs/guides/vocoder-device.md` for the cross-model vocoder A/B workflow; `.agents/specs/backend-fanout-metal-vulkan-xpu.md`, `.agents/specs/tenstorrent-backend.md`, `.agents/specs/multimodal-speed.md`, and `.agents/specs/minimax-music3.md` for implementation, gate, and raw-measurement history | `moved`; `deduplicated`; `archived` | `.agents/specs/backend-fanout-metal-vulkan-xpu.md`; `.agents/specs/tenstorrent-backend.md`; `.agents/specs/multimodal-speed.md`; `.agents/specs/minimax-music3.md` |
+| `docs/USAGE.md:557` ### Running the vocoder convolutions on the GPU | Cross-model workflow and design or implementation history | `docs/guides/vocoder-device.md` for device selection, defaults, supported device names, refusals, and the A/B workflow; `.agents/specs/minimax-music3.md` for byte-identity gates, rollout decisions, and implementation history | `moved`; `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:582` ### Quantized checkpoints: which weight forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
 | `docs/USAGE.md:583` ### How long a load takes, and how to see where it goes | Dense lookup material, measurement, and implementation history | `docs/reference/model-loading.md` for `VT_LOAD_STATS` and counter semantics; `docs/BENCHMARKS.md` for accepted load ratios; `.agents/specs/load-direct-upload.md` for implementation and raw measurement evidence | `moved`; `deduplicated`; `archived` | `.agents/specs/load-direct-upload.md` |
-| `docs/USAGE.md:620` ### Quantized checkpoints: which `lm_head` forms load | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:620` ### Quantized checkpoints: which `lm_head` forms load | Model recipe and dense lookup material | `docs/models/qwen3-6.md` for the Qwen3.6 checkpoint forms and model-specific controls; `docs/reference/model-loading.md` for the shared quantized-weight loading rules | `moved` | `n/a` |
 | `docs/USAGE.md:648` ### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified | Model recipe and design or implementation history | `docs/models/qwen3-8-27b.md` for the pinned checkpoint, supported CPU arm, CUDA shape restrictions, and current refusals; `.agents/specs/model-fp8-block-linear.md` for implementation, mutation, and gate history | `moved`; `archived` | `.agents/specs/model-fp8-block-linear.md` |
 | `docs/USAGE.md:771` ### A per-tensor scale has to be one F32 number | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
-| `docs/USAGE.md:796` ### One load refusal that is about this code, not your checkpoint | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
+| `docs/USAGE.md:796` ### One load refusal that is about this code, not your checkpoint | Model recipe and dense lookup material | `docs/models/qwen3-5.md` for the affected dense loader; `docs/reference/model-loading.md` for the shared diagnostic and reporting guidance | `moved` | `n/a` |
 | `docs/USAGE.md:819` ### A refusal that names the attention backend, and what it cannot tell you | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:883` ### Architectures that resolve but refuse to run | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
 | `docs/USAGE.md:909` ### LTX-2.5: what runs, and what it cannot do | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
@@ -420,17 +420,17 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:1415` ### The DFR pipeline: `--pipeline-kind dfr` | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
 | `docs/USAGE.md:1455` ### LTX-2.5 text-to-audio: a render with no picture | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
 | `docs/USAGE.md:1536` ### LTX-2.5 video guidance: `--pipeline-kind one_stage` | Model recipe | `docs/models/ltx-2-5.md` | `moved` | `n/a` |
-| `docs/USAGE.md:1786` ### GDN checkpoints: the `output_gate_type` key | Model recipe | `docs/models/nemotron-3-5-lightning.md` | `moved` | `n/a` |
-| `docs/USAGE.md:1810` ### Muse Glimmer: exactly what has been checked | Dense lookup material | `docs/reference/model-loading.md` | `moved` | `n/a` |
+| `docs/USAGE.md:1786` ### GDN checkpoints: the `output_gate_type` key | Model recipe and dense lookup material | `docs/models/qwen3-5.md` and `docs/models/qwen3-next.md` for the affected model families; `docs/reference/model-loading.md` for the shared config-resolution, default, alias, and refusal rules | `moved` | `n/a` |
+| `docs/USAGE.md:1810` ### Muse Glimmer: exactly what has been checked | Model recipe, measurement, and design or implementation history | `docs/models/muse-glimmer.md` for current supported paths, defaults, limitations, and unverified arms; `docs/BENCHMARKS.md` for the reduced-depth verification result and explicitly absent performance denominator; `.agents/specs/muse-glimmer.md` for gate, issue, and implementation history | `moved`; `deduplicated`; `archived` | `.agents/specs/muse-glimmer.md` |
 | `docs/USAGE.md:1852` ## OpenAI-compatible server | Generic user procedure | `docs/USAGE.md` | `kept` | `n/a` |
 | `docs/USAGE.md:1975` ### Selecting an x86 CPU ISA tier | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
 | `docs/USAGE.md:1993` ### NVFP4 dense sinks | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2032` ### The NVFP4 output head | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
-| `docs/USAGE.md:2060` ### Validating a staged release archive | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2060` ### Validating a staged release archive | Release procedure and design or implementation history | `docs/RELEASES.md` for the staged-package validation command, required sidecars, and current checks; `.agents/specs/release-binary-matrix.md` for release-package gate design and implementation history | `moved`; `archived` | `.agents/specs/release-binary-matrix.md` |
 | `docs/USAGE.md:2104` ## HuggingFace cache and credentials | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2170` ## Container images | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
-| `docs/USAGE.md:2208` ### Picking the right flags for your GPU | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
-| `docs/USAGE.md:2235` ### If the server exits at startup | Cross-model workflow | `docs/guides/hugging-face-access.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2208` ### Picking the right flags for your GPU | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
+| `docs/USAGE.md:2235` ### If the server exits at startup | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2243` ### Building and validating an image locally | Cross-model workflow | `docs/guides/container-images.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2300` ### Endpoints | Dense lookup material | `docs/reference/server.md` | `moved` | `n/a` |
 | `docs/USAGE.md:2412` ### Speech and music generation | Generic user procedure, model recipe, measurement, and design or implementation history | `docs/USAGE.md` for the generic speech endpoint and request shape; `docs/models/minimax-music3.md` and `docs/models/indextts-2-5.md` for family-specific commands, fields, devices, limits, and refusals; `docs/BENCHMARKS.md` for accepted performance values; `.agents/specs/minimax-music3.md` for stage gates, experiments, and implementation history | `kept`; `moved`; `deduplicated`; `archived` | `.agents/specs/minimax-music3.md` |
@@ -534,7 +534,17 @@ corrected the four reviewed findings at lines 648, 4745, 5275, and 5844. It also
 corrected eight other misplaced or mixed sections. These sections cover builds,
 engine lifecycle, load statistics, speech, and dense CLI or library details.
 Every named archive owner exists at W1. Every new public destination uses the
-approved `docs/models/` or `docs/reference/` architecture.
+approved public-document architecture.
+
+The exhaustive review checked all 120 `docs/USAGE.md` manifest rows. It found
+nine incorrect destinations across model, backend, release, container, and
+vocoder sections. The mixed Vulkan-load section now names a destination for
+each topic and its internal evidence. Model-specific loader facts go to their
+Qwen or Muse pages. Shared loader rules go to
+`docs/reference/model-loading.md`. Container runtime guidance goes to the
+container guide. Release-package validation goes to `docs/RELEASES.md`. No
+reviewed section routes to the unrelated Nemotron, Hugging Face access, or
+server-reference pages.
 
 
 ### Duplicate sections

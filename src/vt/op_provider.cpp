@@ -296,6 +296,8 @@ const char* OpNameImpl(OpId op) {
       return "DFlashGroupedConv";
     case OpId::kDflash2SelectorEdges:
       return "Dflash2SelectorEdges";
+    case OpId::kDflash2PathWalk:
+      return "Dflash2PathWalk";
     case OpId::kTopKValuesIndices:
       return "TopKValuesIndices";
     case OpId::kReshapeAndCache:

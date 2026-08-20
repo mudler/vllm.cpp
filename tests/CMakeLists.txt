@@ -1347,8 +1347,8 @@ vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causalit
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
 # SPEC-DFLASH2 W2 (#1314): the candidate-selector refusal -- the boundary the
 # DFlash2 architecture is left at once its grouped convolution runs.
-vllm_cpp_add_test(test_dflash2_walk_refusal
-  vllm/v1/spec_decode/test_dflash2_walk_refusal.cpp)
+vllm_cpp_add_test(test_dflash2_argmax_guard
+  vllm/v1/spec_decode/test_dflash2_argmax_guard.cpp)
 vllm_cpp_add_test(test_dflash2_runner_reach
   vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -2099,6 +2099,10 @@ vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_bloc
 vllm_cpp_add_test(test_ops_dflash2_grouped_conv vt/test_ops_dflash2_grouped_conv.cpp)
 vllm_cpp_add_test(test_ops_topk_values_indices vt/test_ops_topk_values_indices.cpp)
 vllm_cpp_add_test(test_ops_dflash2_selector_edges vt/test_ops_dflash2_selector_edges.cpp)
+# SPEC-DFLASH2 W4 (#1314): the candidate selector's PATH WALK -- one program per
+# request with the slot-to-slot dependency as a loop inside it, gated against
+# upstream's own `_selector_walk_kernel` control flow plus CUDA==CPU bit-exactness.
+vllm_cpp_add_test(test_ops_dflash2_path_walk vt/test_ops_dflash2_path_walk.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.

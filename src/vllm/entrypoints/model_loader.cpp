@@ -521,16 +521,26 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
     const std::vector<std::string> architectures =
         ReadDflashDraftArchitectures(draft_model_path);
     if (!vllm::SpeculativeConfig::IsDflash2Draft(architectures)) return;
+    // W4 (#1314): the boundary this notice reported for three waves is GONE on
+    // this arm. It still prints, because two things a user cannot read off the
+    // checkpoint are still true -- the port is beyond the parity pin, and no
+    // throughput number has been taken for it -- and because a notice that
+    // vanished the moment the lane started working would leave a DFlash2 run
+    // indistinguishable from a DFlash1 one in the log.
     std::cerr
         << "vllm.cpp: the draft checkpoint at \"" << draft_model_path
         << "\" declares architecture \"DFlash2DraftModel\". Its grouped dynamic "
-           "depthwise convolution and its CANDIDATE SELECTOR are implemented and "
-           "will run; its PATH WALK is not implemented, and this draft will be "
-           "refused by name at its first propose rather than sampled with the "
-           "DFlash1 per-slot argmax (which would propose worse tokens with no "
-           "visible symptom, because the verify is lossless). Owed by row "
-           "SPEC-DFLASH2 wave W4 (.agents/specs/dflash2-spec-decode.md), issue "
-           "#1314.\n";
+           "depthwise convolution, its CANDIDATE SELECTOR and its PATH WALK are "
+           "all implemented and will run, so this draft DRAFTS (row SPEC-DFLASH2 "
+           "waves W1-W4, .agents/specs/dflash2-spec-decode.md, issue #1314). Two "
+           "things are still owed and neither is silent: the GGUF DFlash2 drafter "
+           "arm is refused by name (wave W5), and no throughput number has been "
+           "taken for this architecture -- a DFlash2 draft runs its block forward "
+           "off the paged CUDA-graph fast path, because the candidate selector "
+           "needs the hidden states of the same forward its logits came from. "
+           "This port mirrors vllm-project/vllm#52816, which is OPEN upstream at "
+           "head 66e5414c6d75a8529473d977f7458c140bbab8a0; it does not advance the "
+           "parity pin.\n";
     return;
   }
   throw std::invalid_argument(
@@ -541,9 +551,9 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
       "`MakeDflashGgufConfig` reads none of the DFlash2 metadata beyond the keys "
       "that identify the file, and `LoadQwen3DFlashFromGguf` has no name for the "
       "conv or selector tensors. The SAFETENSORS DFlash2 draft is admitted as of "
-      "SPEC-DFLASH2 W2: its grouped dynamic depthwise convolution and (as of W3) "
-      "its candidate selector are implemented and run, and it is refused at the "
-      "path walk instead "
+      "SPEC-DFLASH2 W2: its grouped dynamic depthwise convolution, its candidate "
+      "selector (W3) and its path walk (W4) are all implemented and run, so a "
+      "safetensors DFlash2 draft DRAFTS "
       "(vllm/model_executor/models/qwen3_dflash2.py and "
       "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py @ "
       "vllm-project/vllm#52816 head 66e5414c6d75a8529473d977f7458c140bbab8a0). "
@@ -839,14 +849,21 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
     draft->config.vocab_size = draft->weights.embed_tokens.shape[0];
   }
   // SPEC-DFLASH2 W2 (#1314): the conv's block is the QUERY block, and the
-  // resolved `k` is its authority. `LoadQwen3DFlash` seeded it from the
-  // checkpoint's own `block_size`, which is only that value's DEFAULT; a CLI
-  // `--speculative-config` that names a different k must move the conv's tap mask
-  // with it, exactly as upstream sizes the conv from
+  // resolved `k` is its authority -- exactly as upstream sizes the conv from
   // `1 + speculative_config.num_speculative_tokens` and never from the config key
   // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
-  // `19c9351904df4c63042671bc67a866ca48dc7d6f`). A conv masking against the wrong
-  // block is acceptance-only and token-invisible, so it is set from one place.
+  // `66e5414c6d75a8529473d977f7458c140bbab8a0`). A conv masking against the wrong
+  // block is acceptance-only and token-invisible, so it is set from ONE place.
+  //
+  // W4 (#1314) made that one place the ONLY place: `LoadQwen3DFlash` no longer
+  // seeds the field from the checkpoint's `block_size`, so deleting this line
+  // leaves 0 rather than a plausible default and the first DFlash2 forward
+  // refuses by name (`Qwen3DFlashModel`'s `conv_block_size must be set` check).
+  // That is the discharge of spec `## Owed` O5's first item: the line was
+  // mutation-proven UNGATED by W2 -- deleting it compiled clean and left every
+  // suite green -- and it is now covered by the production reachability gate,
+  // tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp, which generates
+  // through this loader path.
   if (draft->weights.IsDflash2()) {
     draft->weights.conv_block_size = draft->k + 1;
     // GEOMETRY ONLY, and deliberately NOT the boundary. This line used to append

@@ -3702,6 +3702,74 @@ void Dflash2SelectorEdgesKernelCuda(Queue& q, Tensor& scores, const Tensor& pred
   VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-selector-edges: launch failed");
 }
 
+// MIRROR of the CPU reference `Dflash2PathWalkKernel` (cpu_ops.cpp), which
+// carries the full port note. `Dflash2PathWalkArgs` (include/vt/ops.h) carries
+// the contract.
+//
+// ONE BLOCK PER REQUEST, which is upstream's own grid: `_selector_walk_kernel`
+// launches `(num_reqs,)` programs with `num_warps=1` and keeps the step loop
+// INSIDE the program, so a k-token block costs one launch instead of k. Spec
+// `## Risks/decisions` D3 requires that shape from the first landing -- the same
+// sequential walk shipped host-side in DSpark and measured 28% of the 27B draft
+// step (#436) before it was moved.
+//
+// The block is one warp. `previous` is a per-thread register that every lane
+// computes identically from the same shuffle reduction, so the carry needs no
+// shared memory and no __syncthreads: after the __shfl_xor_sync butterfly every
+// lane holds the same winner.
+//
+// BIT-EXACT with the CPU arm by construction, unlike Dflash2SelectorEdgesKernel:
+// there is no arithmetic here to reorder, only comparisons and a gather. The
+// reduction is seeded the same way on both arms (-inf with slot index `top_k`,
+// strict `>`), which is what makes the all -inf row and the tie rows agree
+// rather than merely usually agreeing.
+__global__ void Dflash2PathWalkKernel(int64_t* tokens, const float* scores,
+                                      const int64_t* cand, int64_t L, int64_t K) {
+  const int64_t b = blockIdx.x;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int width = static_cast<int>(blockDim.x);
+  int64_t previous = 0;
+  for (int64_t l = 0; l < L; ++l) {
+    const int64_t flat = b * L + l;
+    const float* row = scores + (flat * K + previous) * K;
+    float best = -CUDART_INF_F;
+    int slot = static_cast<int>(K);
+    for (int64_t j = lane; j < K; j += width) {
+      const float v = row[j];
+      // STRICT `>` against the running best, and a lower slot wins an exact tie
+      // -- the same rule the CPU arm's ascending scan produces, expressed so a
+      // tree reduction reaches it too.
+      if (v > best || (v == best && static_cast<int>(j) < slot)) {
+        best = v;
+        slot = static_cast<int>(j);
+      }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+      const int os = __shfl_xor_sync(0xFFFFFFFFu, slot, off);
+      if (ov > best || (ov == best && os < slot)) {
+        best = ov;
+        slot = os;
+      }
+    }
+    if (slot == static_cast<int>(K)) slot = 0;  // an all -inf (fully masked) row
+    previous = slot;
+    if (lane == 0) tokens[flat] = cand[flat * K + slot];
+  }
+}
+
+void Dflash2PathWalkKernelCuda(Queue& q, Tensor& tokens, const Tensor& scores,
+                               const Tensor& candidate_ids,
+                               const Dflash2PathWalkArgs& args) {
+  const int64_t B = candidate_ids.shape[0], L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  if (B == 0 || L == 0) return;
+  constexpr int kThreads = 32;  // ONE warp: the argmax reduces by shuffle
+  Dflash2PathWalkKernel<<<static_cast<unsigned>(B), kThreads, 0, AsStream(q)>>>(
+      tokens.Ptr<int64_t>(), scores.Ptr<float>(), candidate_ids.Ptr<int64_t>(), L, K);
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-path-walk: launch failed");
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -3756,6 +3824,9 @@ struct Registrar {
     RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernelCuda)));
+    RegisterOp(OpId::kDflash2PathWalk, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2PathWalkFn>(&Dflash2PathWalkKernelCuda)));
     RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernelCuda)));

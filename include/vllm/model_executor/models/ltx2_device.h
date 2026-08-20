@@ -133,10 +133,24 @@ Ltx2DitDeviceWeights Ltx2StageDitWeightsToDevice(vt::Queue& queue, const Ltx2Dit
 // non-null `cache` is REFUSED BY NAME rather than silently ignored — an ignored
 // cache would recompute correctly and quietly lose the optimization, which is
 // exactly the kind of divergence that is discovered a phase later.
+//
+// `perturbations` is upstream's `perturbations` argument (model.py:493) and means
+// exactly what it means on the host forward (ltx2.h:578-586): `nullptr` is
+// upstream's `perturbations=None` (model.py:509-511), and a config selects the
+// STG (`ptb`) and isolated-modality (`mod`) passes of the guided denoiser.
+//
+// IT WAS ABSENT UNTIL 2026-08-19, and its absence was the whole of #1092's second
+// half. Without it this arm could not run either perturbed pass, so a
+// `pipeline_kind = one_stage` render on `device != 0` was REFUSED rather than
+// served an unperturbed forward — and the first full-model render (#1375) had to
+// pin `stg_scale` to 0.0 and `modality_scale` to 1.0, two of upstream's four
+// guidance terms, to get a clip at all. The refusal was right and the gap was the
+// defect; this parameter closes it. See .agents/specs/ltx25-guided-video.md §12.
 Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& params,
                                     const Ltx2DitWeights& weights,
                                     const Ltx2ModalityInput* video,
                                     const Ltx2ModalityInput* audio, vt::DType compute_dtype,
-                                    Ltx2PromptKvCache* cache = nullptr);
+                                    Ltx2PromptKvCache* cache = nullptr,
+                                    const Ltx2DitPerturbation* perturbations = nullptr);
 
 }  // namespace vllm

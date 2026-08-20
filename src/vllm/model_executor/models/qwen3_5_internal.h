@@ -564,7 +564,7 @@ void ExpertStreamSetForceFallback(bool on);
 // whole value is that it never fires in production.
 vt::Tensor ExpertSliceForTest(vt::Queue& q, const OwnedTensor& w, int64_t N,
                               int64_t K, int64_t row_off, int64_t expert);
-void StageWeightForTest(vt::Queue& q, const OwnedTensor& w);
+vt::Tensor StageWeightForTest(vt::Queue& q, const OwnedTensor& w);
 
 // End one decode step for the streamed-expert cache. The Qwen3.5 MoE forward
 // runs this from its own layer driver; a SECOND full-attention MoE model

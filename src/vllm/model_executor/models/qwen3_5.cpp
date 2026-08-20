@@ -1069,6 +1069,61 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // model's lifetime. On CPU the bytes are already host-resident, so a direct view
 // avoids the copy. The weight is a read-only matmul-B / norm / embed operand, so
 // the const_cast is safe. `shape` defaults to the owned shape.
+// Print what the W0f aliasing branch has actually done, every 4 GiB of weight it
+// has seen, on the same `VT_LOAD_STATS` switch the loader's byte counters use.
+//
+// WHY PERIODIC AND NOT AT EXIT. The `[vt load] bytes@exit` line is registered
+// with `std::atexit`, and the run this instruments is one a memory guard
+// SIGKILLs — no exit handler runs, so the one number that would have explained
+// the run is the one number the run cannot print. W0f's first device attempt was
+// read from an RSS curve for exactly that reason, and an RSS curve cannot tell
+// "declined and staged" from "re-homed and the pages did not come back".
+void ReportHostAliasResidency() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LOAD_STATS");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (!on) return;
+  const vllm::HostAliasStats s = vllm::HostAliasSnapshot();
+  const uint64_t total = s.aliased_in_place_bytes + s.rehomed_bytes +
+                         s.declined_borrow_bytes + s.declined_other_bytes;
+  static uint64_t last = 0;
+  constexpr uint64_t kStep = 4ULL << 30;
+  if (total < last + kStep && last != 0) return;
+  last = total;
+  // BOUNDED, because the counter this trips on is CUMULATIVE OVER CALLS and
+  // never stops growing. `ResidentWeight` re-enters the alias branch about 1,361
+  // times per decode step, roughly 70 GiB of counted bytes, so a 4 GiB step
+  // prints about 17 lines EVERY step for the life of the process. The first
+  // forward is what this instrument exists to explain — it is where the aliasing
+  // set is established and where the recorded 60.793 GiB was read — and that
+  // fits inside the cap with room to spare. Everything after it is the same
+  // weights being counted again.
+  static int lines = 0;
+  constexpr int kMaxLines = 24;
+  if (lines >= kMaxLines) return;
+  ++lines;
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+  // "per call", spelled out in the line itself. These are BYTES SEEN, not bytes
+  // resident: a weight aliased on every step is counted on every step, so the
+  // figures are traffic and become a residency measurement only when read at a
+  // stated point (see HostAliasStats in qwen3_5_weights.h).
+  std::fprintf(stderr,
+               "[vt load] w0f-alias per-call totals: calls=%llu "
+               "aliased_in_place=%.3f GiB rehomed=%.3f GiB "
+               "declined_borrow=%.3f GiB declined_other=%.3f GiB\n",
+               static_cast<unsigned long long>(s.calls),
+               static_cast<double>(s.aliased_in_place_bytes) / gib,
+               static_cast<double>(s.rehomed_bytes) / gib,
+               static_cast<double>(s.declined_borrow_bytes) / gib,
+               static_cast<double>(s.declined_other_bytes) / gib);
+  if (lines == kMaxLines)
+    std::fprintf(stderr,
+                 "[vt load] w0f-alias: %d lines printed; further lines are "
+                 "suppressed (the counters keep running)\n",
+                 kMaxLines);
+}
+
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY (issue
@@ -1135,6 +1190,93 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
            "expert-stream lane serves its slices from host slot storage and the "
            "whole tower must never be uploaded (ENG-EXPERT-STREAM-DEVICE W0c, "
            "issues #1123 and #1124)");
+  // The SAME invariant as the elem_kn_repacked guard above, for the i8mm
+  // interleave, and it was missing until now (issue #1320). The CUDA
+  // quant dot reads `block_q8_0`; `VT_CPU_QUANT_REPACK` rewrites the buffer to
+  // `block_q8_0x4` at load and only the CPU MatmulBTKernel understands that.
+  // Unlike `elem_kn_repack`, whose policy IS gated on the CPU platform
+  // (gguf_keep_quant.cpp), `quant_repack` rides `QuantRepackActive()` alone —
+  // a HOST-CPU i8mm probe — so an aarch64 box doing `--device cuda` can repack a
+  // Q8_0 weight and then upload it verbatim to a kernel that misreads it. That is
+  // silent wrong tokens, not a crash. Measured harmless on the target checkpoint
+  // (one Q8_0 tensor, 0.01% of parameters, and the instrumented load recorded
+  // `quant_repack = 0`), which is why it is a tripwire here rather than a
+  // campaign; `VT_CPU_QUANT_REPACK=0` is the operator's way past it.
+  VT_CHECK(!w.repacked,
+           "qwen3_5: an i8mm-repacked (block_q8_0x4) weight reached device "
+           "residency; VT_CPU_QUANT_REPACK is a CPU-only load transform and the "
+           "device quant kernels read plain block_q8_0");
+  // ENG-EXPERT-STREAM-DEVICE W0f (issue #1299). THE SECOND COPY THIS ROW EXISTS
+  // TO PREVENT, at the one line that makes it.
+  //
+  // Everything below this branch is a VERBATIM byte copy: `Alloc(w.bytes.size())`,
+  // `Copy`, then a tensor with the same dtype, the same shape and the same
+  // (dropped) marker set as the source. Nothing about the bytes changes, which is
+  // exactly why a token gate cannot see the cost — and the cost is a second full
+  // resident copy of every dense weight. On a discrete device that copy is the
+  // whole point: the kernel cannot follow a host pointer. On a part whose kernels
+  // CAN, it buys nothing and comes out of the same RAM the first copy did.
+  //
+  // MEASURED (#1299, `dgx:gpu0`, seven runs). `Qwen3.8-2.4T-A95B UD-Q1_0` loads
+  // on `--device cuda` at 61.20 GiB resident and then exhausts a 119.631 GiB box
+  // inside the FIRST forward, zero decode steps, every time. A 0.15 GiB slot
+  // arena died exactly where an 18.55 GiB one did, so the arena is not the cost;
+  // growth was anonymous while file-backed stayed flat, so the mapping is not
+  // pinned. About 39 GiB of that 61.20 is `attn_qkv` (21.56) and `ssm_out`
+  // (17.25), which the GDN V-head reorder makes `kTransformedWeight` and
+  // therefore expands to bf16 in OWNED host buffers — the split is measured in
+  // `.agents/specs/expert-streaming.md`, not derived here. The CPU arm pays that
+  // once and serves. This branch is what stops the CUDA arm paying it twice.
+  //
+  // WHY THE SAME PREDICATE AS W0c AND NOT A NEW ONE. `KqExpertSlice` already
+  // hands this platform a host pointer for every expert slice it serves; a dense
+  // weight is the same question about a different tensor. `is_cpu()` is what the
+  // early return above answers, `needs_weight_staging()` is true on CUDA
+  // everywhere and would gate nothing, and `is_unified_memory()` answers the
+  // opposite question — GB10 reports unified while a `cudaMalloc` pointer is
+  // still not host-dereferenceable (vt/backend.h). A DISCRETE device answers
+  // false here, falls through, and gets byte-for-byte what it gets today.
+  if (vllm::platforms::GetPlatform(d.q.device.type)
+          .host_memory_is_device_addressable()) {
+    // A weight with NEITHER host bytes NOR a device copy cannot be served at
+    // all, and the staging branch below would not notice: it would `Alloc(0)`,
+    // copy nothing, and hand out a pointer to nothing. That is the precondition
+    // this states.
+    //
+    // THE `w.d_dev` HALF IS NOT DEFENSIVE, AND THIS CHANGE IS WHAT CREATED THE
+    // POPULATION IT SERVES (found by a fresh review of #1299). A weight whose
+    // host mirror is gone but whose `d_dev` is populated has ALWAYS been served,
+    // by the memo below, and it returned the device tensor without complaint.
+    // W0f put this check ABOVE that memo, so the same weight began to throw. The
+    // justification written here first — "`ReleaseHost()` is not reachable for
+    // the dense weights this branch serves" — is true of the dense weights and
+    // FALSE of the expert weights the same function serves at the `gp/up/dp`
+    // capture below, whose misaligned GGUF borrows decline the alias, stage, get
+    // a `d_dev`, and are then released by the guarded loop beside that capture.
+    // So the condition is "nothing to serve", not "no host bytes".
+    VT_CHECK(!w.bytes.empty() || w.d_dev != nullptr,
+             "qwen3_5: a weight reaching device residency has no host bytes and "
+             "no device copy; its host mirror was released and there is nothing "
+             "to alias or upload");
+    // ...and with no host bytes there is nothing to alias, so skip the attempt
+    // rather than charging a `kDeclinedEmpty` to the residency instrument for a
+    // weight that is already device-resident.
+    if (!w.bytes.empty()) {
+      const bool aliased = MakeHostBytesDeviceAliasable(w);
+      ReportHostAliasResidency();
+      if (aliased) {
+        // NOT `load_stats::AddDeviceUpload`: nothing was uploaded. Issue #150's
+        // counter measures bytes moved host->device, and this branch moves none.
+        return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
+                          shape);
+      }
+    }
+    // A MISALIGNED BORROW, or the `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` A/B, reaches
+    // here. A borrow's pages are clean and file-backed, so staging copies them
+    // without adding anonymous residency. Falling through is deliberate and is
+    // not a failure; `ReportHostAliasResidency` above says how often it happens
+    // and for how many bytes.
+  }
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
@@ -6853,11 +6995,32 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
             /*committed_compute_path=*/MoeBf16FastEnabled(),
             /*host_free_env=*/host_free_on)) {
       d.b.Synchronize(d.q);  // all E x 3 H2D uploads complete before any free
+      // W0f (#1299) FALSIFIED THIS BLOCK'S PREMISE, AND THIS IS THE REPAIR.
+      //
+      // The paragraph above says "once the device copy exists it is
+      // authoritative and nothing reads the host bytes again", and it was true
+      // while `ResidentWeight` had exactly two behaviours. It has three now: on
+      // a platform whose kernels can dereference host storage the function
+      // ALIASES, `d_dev` is never populated, and the pointers captured into
+      // `gp/up/dp` above ARE `w.bytes.data()`. Releasing the host mirror then
+      // frees the memory the resident device pointer table points at, and the
+      // grouped GEMM keeps reading it for the model's lifetime — including from
+      // inside a captured graph. A fresh review caught it with a scratch case
+      // that replays this exact sequence and takes SIGSEGV.
+      //
+      // The condition is therefore not "did we upload" but "IS THERE A DEVICE
+      // COPY TO BE AUTHORITATIVE", asked per weight, which is what `d_dev`
+      // already answers. It is `nullptr` on precisely the arm that aliases, and
+      // non-null on every arm that staged, so the discrete behaviour this
+      // paragraph was written for is unchanged.
       for (int64_t e = 0; e < E; ++e) {
         const size_t se = static_cast<size_t>(e);
-        w.expert_gate[se].ReleaseHost();
-        w.expert_up[se].ReleaseHost();
-        w.expert_down[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_gate[se]))
+          w.expert_gate[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_up[se]))
+          w.expert_up[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_down[se]))
+          w.expert_down[se].ReleaseHost();
       }
     }
     mr.ready = true;
@@ -7786,9 +7949,9 @@ vt::Tensor detail::ExpertSliceForTest(vt::Queue& q, const OwnedTensor& w,
   return KqExpertSlice(d, w, N, K, row_off, expert);
 }
 
-void detail::StageWeightForTest(vt::Queue& q, const OwnedTensor& w) {
+vt::Tensor detail::StageWeightForTest(vt::Queue& q, const OwnedTensor& w) {
   Dev d{vt::GetBackend(q.device.type), q};
-  (void)ResidentWeight(d, w);
+  return ResidentWeight(d, w);
 }
 
 void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }

@@ -28,6 +28,7 @@
 #include <cstring>
 #include <cctype>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -2075,6 +2076,23 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     CHECK(result.width == 64);
     CHECK(result.height == 64);
 
+    // W0 (#1010) names "any latent-upsampler stage", and this leaf is the answer
+    // to it. The latent SPATIAL x2 upsampler used to run inside `phase.prepare`,
+    // a leaf whose name says nothing about it, and this two-phase render is the
+    // ONLY one in this file that reaches it — every other case pins `max_phase`
+    // at 0, where the input transform is never the spatial upsample.
+    REQUIRE_MESSAGE(!result.phase_log_path.empty(),
+                    "the two-phase render wrote no phase table");
+    const nlohmann::json upsample_table =
+        nlohmann::json::parse(ReadAll(result.phase_log_path));
+    bool named_upsample = false;
+    for (const nlohmann::json& entry : upsample_table["phases"]) {
+      if (entry["name"].get<std::string>() == "phase.upsample_latent") named_upsample = true;
+    }
+    CHECK_MESSAGE(named_upsample,
+                  "the two-phase render's table names no 'phase.upsample_latent' leaf, so the "
+                  "latent upsampler is back inside 'phase.prepare' with nothing saying so");
+
     const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2_full->last_conditioning();
     // The trace describes the LAST phase that ran, so a slot count here means
     // stage 2 placed slots of its own rather than inheriting stage 1's tokens.
@@ -2744,6 +2762,17 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   probe.close();
   const nlohmann::json table = nlohmann::json::parse(ReadAll(log_path));
 
+  // THE CAVEAT TRAVELS WITH THE FILE. A phase log is read by somebody who did
+  // not run it, months later, out of a directory named `benchmarks/`; the row's
+  // whole subject is evidence that got separated from its context. The emitter
+  // therefore writes what it knows about how far these numbers carry, and this
+  // is the assertion that keeps it there.
+  REQUIRE(table.contains("notice"));
+  CHECK(table["notice"].get<std::string>().find("NOT A BENCHMARK") != std::string::npos);
+  REQUIRE(table.contains("sum_rule"));
+  CHECK(!table["sum_rule"].get<std::string>().empty());
+  REQUIRE(table.contains("sampler_enabled"));
+
   REQUIRE(table.contains("wall_seconds"));
   REQUIRE(table.contains("phases"));
   REQUIRE(table["phases"].is_array());
@@ -2751,10 +2780,15 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   const double wall = table["wall_seconds"].get<double>();
   CHECK(wall > 0.0);
 
-  // (2) EVERY ENTRY carries a monotone timestamp and a byte count. `start` is
-  // measured from the instrument's origin, so the sequence is non-decreasing by
-  // construction ONLY if the records are appended in completion order; a table
-  // that sorted or re-based them would break here.
+  // (2) EVERY ENTRY carries a monotone timestamp and a byte count. What the
+  // non-decreasing `start` sequence pins is the EMITTER'S SORT, and this comment
+  // used to say the opposite — that the sequence holds *because* the records are
+  // appended in completion order. Completion order is what would BREAK it: the
+  // `load` span closes at start 0.0001 and is appended AFTER
+  // `load.prompt_embeds`, which starts at 0.0625, so the appended order is not
+  // monotone in `start` at all. `ByStart`'s `stable_sort` in
+  // `render_phase_log.cpp` is what makes it monotone, and deleting that sort is
+  // what this line detects.
   double previous_start = -1.0;
   double leaves = 0.0;
   std::vector<std::string> names;
@@ -2783,7 +2817,14 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
     CHECK(entry["peak_host_bytes"].get<int64_t>() > 0);
     CHECK(entry["peak_device_bytes"].get<int64_t>() >= -1);
     names.push_back(name);
-    if (entry.value("span", false)) continue;
+    // SPAN **AND** NESTED, which is what `render_phase_log.cpp`'s own `Sum`
+    // skips. Skipping only spans here made this loop silently assert something
+    // else — "no nested leaf has a non-trivial duration" — although the header
+    // advertises nesting as supported and recorded. A fresh review split the mel
+    // decode out as a nested leaf and this case failed the reconciliation below
+    // with `CHECK( 0.0118791 < 1e-06 )`, a message that says nothing about
+    // nesting and reads as "the emitter does not reconcile".
+    if (entry.value("span", false) || entry.value("nested", false)) continue;
     leaves += end - start;
   }
 
@@ -2819,6 +2860,192 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 
   vllm_video_result_free(&result);
   vllm_video_engine_free(engine);
+}
+
+// ─── W0 repair: the table ATTRIBUTES its time, which a SUM cannot say ────────
+//
+// WHY A SECOND CASE, when the one above already passes. The case above pins two
+// things: that six names EXIST, and that the leaves ADD UP to wall within 5%.
+// A fresh review of this row's pull request built a table that satisfies both
+// and is worse than useless. Leave the `decode.video` leaf open across the audio
+// decode and give `decode.audio` its name with no work beneath it, and the case
+// above reports **1 case passed, 273 assertions, 0 failed, exit 0** at 99.9%
+// accounted — over a table that says the video decode is 32% of the render (it
+// is 2.4%) and that the audio decode is free (it is a quarter of it). W1 ranks
+// the campaign's levers off this table, and W5 is its largest stage. Existence
+// plus a sum is NECESSARY and it is not SUFFICIENT, because nothing in either
+// ties a NAME to the work beneath it.
+//
+// WHAT DOES TIE A NAME TO ITS WORK is a differential: render the same fixture
+// TWICE, change exactly one thing that changes the work of some phases and not
+// others, and require the table to say so. `num_frames` is that knob. The video
+// decode, the frame writer, the audio decode and the vocoder all scale with the
+// clip's length; the DiT load does not, because it finished before the request
+// was read.
+//
+// WHY THE ASSERTION IS A SHARE AND NEVER A SECOND. This box has moved the same
+// binary's wall by a factor of 76 at the identical geometry and REVERSED the
+// rank of its two dominant phases (`.agents/specs/ltx25-device-residency.md`
+// `## Outcome — W0`), so no absolute duration written here would survive a
+// contended run, and no fixed ratio between two phases would either. What is
+// asserted instead is each phase's SHARE OF THE GROWTH: of the extra leaf-
+// seconds the longer clip cost, a phase that really does a longer clip's work
+// carries a floor of them, while a phase whose name has been detached from its
+// work carries none of them — not "fewer", none, whichever way the noise went.
+// The floor is 0.5% of the growth, against a measured share of ~25% for the
+// audio decode: fifty times' headroom above, and the detached case sits five
+// orders of magnitude below it.
+//
+// TWO LOADS, not two generations on one engine, and that is what makes the
+// `load.dit` half meaningful. A second generation on a loaded engine cannot
+// report a DiT load at all, so the invariant "the load did not grow" would be
+// satisfied by an absent record. Loading twice measures it twice.
+namespace {
+
+// Leaf seconds per NAME for one half of one table. Summed per name because
+// `artifacts.frames` alternates with `decode.video` and appears many times in a
+// single render — a per-name total is the only quantity two renders can be
+// compared on. `include_nested` selects the decomposition inside a leaf
+// (`decode.audio.vocoder`) rather than the leaves that partition the wall.
+//
+// `load` selects render 0 against everything else, rather than naming a render
+// ID. The ID comes from a PROCESS-wide counter (`ltx2_video.cpp`'s
+// `render_counter`) which `PhaseLog::Begin` does not reset, so the first
+// generation after a second load is render 2 and not render 1. Each table here
+// holds exactly one generation, so "not the load" names it without depending on
+// how many renders this process happened to do first.
+std::map<std::string, double> PhaseSeconds(const nlohmann::json& table, bool load,
+                                           bool include_nested) {
+  std::map<std::string, double> out;
+  for (const nlohmann::json& e : table["phases"]) {
+    if (e.value("span", false)) continue;
+    if (e.value("nested", false) != include_nested) continue;
+    if ((e["render"].get<int64_t>() == 0) != load) continue;
+    out[e["name"].get<std::string>()] += e["duration_seconds"].get<double>();
+  }
+  return out;
+}
+
+double TotalSeconds(const std::map<std::string, double>& by_name) {
+  double total = 0.0;
+  for (const std::pair<const std::string, double>& kv : by_name) total += kv.second;
+  return total;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: the phase table ATTRIBUTES its wall — the decode grows with the clip and the load does not") {
+  Workspace ws;
+
+  // The two geometries. Everything except the frame count is identical, and the
+  // frame count is legal at 8k+1 for this fixture's temporal factor: 9 frames is
+  // 2 latent frames and 33 is 5, so the clip is 2.5x longer.
+  const int64_t kShortFrames = 9;
+  const int64_t kLongFrames = 33;
+
+  // `max_phase = 0` is a LOAD extra, and it is what keeps this case on one
+  // recipe phase: the default `distilled_two_stage` kind would need the latent
+  // spatial upsampler for its second phase and refuse without one.
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> short_engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(short_engine != nullptr);
+  vllm::multimodal::VideoGenParams short_gen = FixtureGen(ws.root + "/attr_short");
+  short_gen.num_frames = kShortFrames;
+  const vllm::multimodal::VideoResult short_result = short_engine->Generate(short_gen);
+  REQUIRE(short_result.frame_count == kShortFrames);
+  REQUIRE_MESSAGE(!short_result.phase_log_path.empty(), "the short render wrote no phase table");
+  const nlohmann::json short_table = nlohmann::json::parse(ReadAll(short_result.phase_log_path));
+
+  // A SECOND LOAD. `PhaseLog::Begin` discards the earlier timeline, so this
+  // engine's table carries its own `load.dit` — which is the record the
+  // "and the load does not" half of this case is about.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> long_engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(long_engine != nullptr);
+  vllm::multimodal::VideoGenParams long_gen = FixtureGen(ws.root + "/attr_long");
+  long_gen.num_frames = kLongFrames;
+  const vllm::multimodal::VideoResult long_result = long_engine->Generate(long_gen);
+  REQUIRE(long_result.frame_count == kLongFrames);
+  REQUIRE_MESSAGE(!long_result.phase_log_path.empty(), "the long render wrote no phase table");
+  const nlohmann::json long_table = nlohmann::json::parse(ReadAll(long_result.phase_log_path));
+
+  const std::map<std::string, double> short_leaves = PhaseSeconds(short_table, /*load=*/false, /*include_nested=*/false);
+  const std::map<std::string, double> long_leaves = PhaseSeconds(long_table, /*load=*/false, /*include_nested=*/false);
+  const std::map<std::string, double> short_nested = PhaseSeconds(short_table, /*load=*/false, /*include_nested=*/true);
+  const std::map<std::string, double> long_nested = PhaseSeconds(long_table, /*load=*/false, /*include_nested=*/true);
+  const std::map<std::string, double> short_load = PhaseSeconds(short_table, /*load=*/true, /*include_nested=*/false);
+  const std::map<std::string, double> long_load = PhaseSeconds(long_table, /*load=*/true, /*include_nested=*/false);
+
+  // The denominator: the extra leaf-seconds the longer clip cost. A render that
+  // did not get more expensive would make every share below meaningless, so this
+  // is a REQUIRE and not a CHECK.
+  const double growth = TotalSeconds(long_leaves) - TotalSeconds(short_leaves);
+  MESSAGE("attribution: " << kShortFrames << " frames = " << TotalSeconds(short_leaves)
+                          << "s of leaves, " << kLongFrames << " frames = "
+                          << TotalSeconds(long_leaves) << "s, growth = " << growth << "s");
+  REQUIRE_MESSAGE(growth > 0.0,
+                  "a 2.5x longer clip cost no extra leaf-seconds, so nothing below can be read");
+
+  // THE PHASES THAT MUST CARRY IT. Each is a phase whose work is a function of
+  // the clip's length: the video decode runs over more latent frames, the frame
+  // writer writes more files, the audio decode and the vocoder produce more
+  // samples. A leaf that names one of these and carries none of the growth is a
+  // label on somebody else's work.
+  const double kFloor = 0.0005;
+  for (const std::string required : {"decode.video", "decode.audio", "artifacts.frames"}) {
+    INFO("phase = " << required);
+    REQUIRE_MESSAGE(short_leaves.count(required) == 1,
+                    "the short render's table names no '" << required << "' leaf");
+    REQUIRE_MESSAGE(long_leaves.count(required) == 1,
+                    "the long render's table names no '" << required << "' leaf");
+    const double moved = long_leaves.at(required) - short_leaves.at(required);
+    MESSAGE("  " << required << ": " << short_leaves.at(required) << "s -> "
+                 << long_leaves.at(required) << "s, " << (100.0 * moved / growth)
+                 << "% of the growth");
+    CHECK_MESSAGE(moved >= kFloor * growth,
+                  "'" << required << "' took " << moved << "s of the " << growth
+                      << "s a 2.5x longer clip cost, which is under the " << (100.0 * kFloor)
+                      << "% floor. Its name is on work that happens somewhere else in this "
+                         "table, and the sum cannot see that");
+  }
+
+  // THE DECOMPOSITION INSIDE `decode.audio` (#1010 names the vocoder). Nested,
+  // so it is excluded from the sum — which is why it needs its own assertion:
+  // nothing about the arithmetic above would notice if these two stopped
+  // measuring the models they are named after.
+  for (const std::string required : {"decode.audio.mel", "decode.audio.vocoder"}) {
+    INFO("nested phase = " << required);
+    REQUIRE_MESSAGE(short_nested.count(required) == 1,
+                    "the short render's table names no '" << required << "' leaf");
+    REQUIRE_MESSAGE(long_nested.count(required) == 1,
+                    "the long render's table names no '" << required << "' leaf");
+    const double moved = long_nested.at(required) - short_nested.at(required);
+    MESSAGE("  " << required << ": " << short_nested.at(required) << "s -> "
+                 << long_nested.at(required) << "s, " << (100.0 * moved / growth)
+                 << "% of the growth");
+    CHECK_MESSAGE(moved >= kFloor * growth,
+                  "'" << required << "' took " << moved << "s of the " << growth
+                      << "s a 2.5x longer clip cost, under the " << (100.0 * kFloor) << "% floor");
+  }
+
+  // AND THE LOAD DID NOT. `load.dit` is paid before the request is read, so a
+  // clip 2.5x longer cannot move it — and an instrument that charged render time
+  // to a load phase would show up here and nowhere else in this file. The bound
+  // is a quarter of the growth rather than a fixed millisecond count, because
+  // this box's absolute numbers are not stable enough to bound directly.
+  REQUIRE(short_load.count("load.dit") == 1);
+  REQUIRE(long_load.count("load.dit") == 1);
+  const double load_moved = std::fabs(long_load.at("load.dit") - short_load.at("load.dit"));
+  MESSAGE("  load.dit: " << short_load.at("load.dit") << "s -> " << long_load.at("load.dit")
+                         << "s, |delta| = " << load_moved << "s = " << (100.0 * load_moved / growth)
+                         << "% of the growth");
+  CHECK_MESSAGE(load_moved < 0.25 * growth,
+                "the DiT load moved by " << load_moved << "s between a 9-frame and a 33-frame "
+                                            "request, which it cannot do: it finished before "
+                                            "either request was read");
 }
 
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────

@@ -95,7 +95,16 @@ struct PhaseLog::Impl {
 
   std::thread sampler;
   std::condition_variable stop_cv;
-  bool stop = false;
+  // ONE STOP FLAG PER WORKER, not one per PhaseLog, and the difference is a
+  // hang. A single `stop` member is written true by `StopSampler` and back to
+  // false by the next `StartSamplerLocked`; between the moment `StopSampler`
+  // hands the thread object out under `mu` and the moment it joins outside it,
+  // an `Open` on another thread can run that `StartSamplerLocked` and clear the
+  // flag the OLD worker is still reading. The old worker then never leaves its
+  // loop, the join blocks forever, and the process ends with two samplers live.
+  // Reachable through `Reset()` racing `Open`. A flag OWNED by the worker cannot
+  // be cleared by anybody else's start.
+  std::shared_ptr<bool> stop_flag;
 
   double Now() const {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count();
@@ -119,15 +128,26 @@ struct PhaseLog::Impl {
 
   void StartSamplerLocked() {
     if (sampler.joinable() || !SamplerEnabled()) return;
-    stop = false;
-    sampler = std::thread([this]() {
+    stop_flag = std::make_shared<bool>(false);
+    std::shared_ptr<bool> mine = stop_flag;
+    sampler = std::thread([this, mine]() {
       std::unique_lock<std::mutex> lock(mu);
-      while (!stop) {
+      while (!*mine) {
         stop_cv.wait_for(lock, std::chrono::milliseconds(100));
-        if (stop) break;
+        if (*mine) break;
         SampleLocked();
       }
     });
+  }
+
+  // Is anything open that a sample could be attributed to? A sample taken with
+  // no live scope updates no peak and is charged to nobody, so it is a
+  // `/proc/self/statm` read under the process-wide mutex that buys nothing.
+  bool AnythingLive() const {
+    for (const Open& o : open) {
+      if (o.live) return true;
+    }
+    return false;
   }
 
   // The thread object is HANDED OUT under `mu` and joined outside it. Reading
@@ -137,12 +157,20 @@ struct PhaseLog::Impl {
   // second mutex for the thread's lifetime would invert the lock order against
   // `Open`, which already holds `mu` when it starts the sampler. Moving the
   // handle out is the one shape that has neither problem.
+  // Caller holds `mu`. Marks the running worker stopped and hands its thread
+  // object out; the caller joins it after releasing the lock, because the worker
+  // needs `mu` to finish its wait.
+  std::thread TakeSamplerLocked() {
+    if (stop_flag) *stop_flag = true;
+    stop_flag.reset();
+    return std::move(sampler);
+  }
+
   void StopSampler() {
     std::thread victim;
     {
       std::lock_guard<std::mutex> lock(mu);
-      stop = true;
-      victim = std::move(sampler);
+      victim = TakeSamplerLocked();
     }
     stop_cv.notify_all();
     if (victim.joinable()) victim.join();
@@ -162,6 +190,11 @@ PhaseLog& PhaseLog::Instance() {
 }
 
 void PhaseLog::Begin() {
+  // The previous timeline's sampler is stopped BEFORE this one starts. `Begin`
+  // discards the records and the open scopes, so a surviving worker would sample
+  // into nothing, and its 100 ms `/proc/self/statm` read under the process-wide
+  // mutex would outlive the render that asked for it.
+  impl_->StopSampler();
   std::lock_guard<std::mutex> lock(impl_->mu);
   impl_->records.clear();
   impl_->open.clear();
@@ -213,23 +246,40 @@ size_t PhaseLog::Open(const std::string& name, bool span) {
 }
 
 void PhaseLog::Close(size_t handle) {
-  std::lock_guard<std::mutex> lock(impl_->mu);
-  impl_->SampleLocked();
-  for (size_t i = 0; i < impl_->open.size(); ++i) {
-    Impl::Open& o = impl_->open[i];
-    if (o.handle != handle || !o.live) continue;
-    Record r;
-    r.name = o.name;
-    r.render = o.render;
-    r.start = o.start;
-    r.end = impl_->Now();
-    r.peak_host_bytes = o.peak_host;
-    r.peak_device_bytes = o.peak_device;
-    r.span = o.span;
-    r.nested = o.nested;
-    impl_->records.push_back(std::move(r));
-    impl_->open.erase(impl_->open.begin() + static_cast<std::ptrdiff_t>(i));
-    return;
+  // THE LAST CLOSE STOPS THE SAMPLER, and the reason is a process this
+  // instrument does not own. `Begin` starts the timeline and `Open` starts the
+  // worker, but nothing except `Reset` and the destructor ever stopped it, so a
+  // server that rendered one clip kept a 100 ms `/proc/self/statm` read under
+  // the process-wide mutex for the rest of its life and accumulated that idle
+  // time into the NEXT table's sample count. Restarting it costs one thread
+  // creation, and on this driver that happens twice per process: the `load` span
+  // and the `generate` span each stay open across everything beneath them, so
+  // the scope stack is empty only BETWEEN a load and a generation.
+  std::thread victim;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->SampleLocked();
+    for (size_t i = 0; i < impl_->open.size(); ++i) {
+      Impl::Open& o = impl_->open[i];
+      if (o.handle != handle || !o.live) continue;
+      Record r;
+      r.name = o.name;
+      r.render = o.render;
+      r.start = o.start;
+      r.end = impl_->Now();
+      r.peak_host_bytes = o.peak_host;
+      r.peak_device_bytes = o.peak_device;
+      r.span = o.span;
+      r.nested = o.nested;
+      impl_->records.push_back(std::move(r));
+      impl_->open.erase(impl_->open.begin() + static_cast<std::ptrdiff_t>(i));
+      break;
+    }
+    if (!impl_->AnythingLive()) victim = impl_->TakeSamplerLocked();
+  }
+  if (victim.joinable()) {
+    impl_->stop_cv.notify_all();
+    victim.join();
   }
 }
 
@@ -316,6 +366,30 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
 #endif
   out["device_bytes_source"] = device == "cpu" ? "none" : "vt::Backend::DeviceMemoryInfo";
   out["samples"] = Samples();
+  // WHAT THIS FILE IS NOT, WRITTEN INTO THE FILE. A phase log is evidence, and
+  // evidence separated from its context is the failure this whole row exists to
+  // stop (#1040's sampler CSVs, #1087's unnamed 1731 s phase). The first
+  // artifact this row committed landed under `benchmarks/` carrying a `denoise`
+  // of 8.13 s and a `decode.audio` of 3.06 s and NOTHING that said the host was
+  // contended, the checkpoint was a two-block fixture, or that the rank of those
+  // two phases had reversed between two runs of the same binary. A reader who
+  // opens one of these files months later gets the caveat from the file rather
+  // than from a document they would have to know to look for.
+  out["notice"] =
+      "NOT A BENCHMARK. Every duration here is wall clock on whatever host ran this render, "
+      "under whatever else that host was doing at the time, and this file records neither. "
+      "The same binary at the same geometry has measured 0.158 s, 6.138 s and 12.030 s of "
+      "wall on one contended box, and the RANK of its two largest phases reversed between "
+      "two of those runs. What this table supports is the SHAPE of a render and the ratio "
+      "sum_leaf_seconds/wall_seconds. Quote a duration only with the host, the checkpoint "
+      "and the contention state beside it. See .agents/specs/ltx25-device-residency.md.";
+  out["sum_rule"] =
+      "sum_leaf_seconds adds only records with span=false and nested=false. A span encloses "
+      "leaves and a nested record decomposes one, so adding either would make "
+      "unaccounted_seconds the residue of double counting instead of time nobody named.";
+  // Whether the 100 ms sampler ran. With it off the peaks are what the phase
+  // BOUNDARIES saw, which is a different measurement rather than a worse one.
+  out["sampler_enabled"] = SamplerEnabled();
   nlohmann::json phases = nlohmann::json::array();
   for (const Record& r : records) {
     nlohmann::json e;

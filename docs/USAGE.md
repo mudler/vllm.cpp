@@ -1031,13 +1031,31 @@ It is a flat, non-overlapping timeline of named phases — the DiT load, the two
 VAE loads, the text tower and the connector, the denoise, the video and audio
 decodes, the frame and WAV writers — each carrying a start and end measured from
 the load, a duration, a **peak host byte** count and a **peak device byte**
-count. Two fields at the top say how complete it is:
+count. These fields say how complete it is, and how far it carries:
 
 | Field | What it means |
 |---|---|
 | `wall_seconds` | from the engine load to the end of this generation |
 | `sum_leaf_seconds` | the named phases, which do not overlap |
 | `unaccounted_seconds` | the difference — time inside no named phase |
+| `sum_rule` | which records the sum adds: `span=false` **and** `nested=false` |
+| `sampler_enabled` | whether the 100 ms sampler ran, or the peaks are boundary-only |
+| `notice` | **NOT A BENCHMARK**, and why — carried in the file rather than in a document a later reader would have to know to look for |
+
+Some phases are **decomposed rather than partitioned**. `decode.audio` carries
+`decode.audio.mel` and `decode.audio.vocoder` beneath it, and a two-stage
+recipe's `phase.prepare` carries `phase.upsample_latent`. Those records are
+marked `nested`, are printed for the reader, and are **excluded from
+`sum_leaf_seconds`** — they are inside a leaf that is already counted, so adding
+them would make `unaccounted_seconds` the residue of double counting instead of
+time nobody named.
+
+**Do not read a duration here as a measurement of this machine.** Every number
+is wall clock under whatever else the box was doing, which the file does not
+record: the same binary at the same geometry has measured 0.158 s, 6.138 s and
+12.030 s of wall on one contended host, and the rank of its two largest phases
+reversed between two of those runs. The ratio `sum_leaf_seconds / wall_seconds`
+is stable across all of them; the seconds are not.
 
 `unaccounted_seconds` is emitted rather than distributed over the phases,
 because a table whose parts do not add up has a phase nobody named, and a

@@ -25,9 +25,14 @@ dispatched to its own fresh implementer and its own fresh reviewer.
 timeline of named phases, each carrying a monotone timestamp, a duration, a peak
 host byte count and a peak device byte count, with `unaccounted_seconds` emitted
 beside the sum rather than smeared over the phases. On a completed 64x64/9-frame
-render through the `vllm.h` video ABI the named leaves account for **98.33% of
-wall** (0.1549 s of 0.1575 s, residue 2.63 ms), so **the phases sum and W1 may
-start**. The artifact is
+render through the `vllm.h` video ABI the named leaves account for **99.84% of
+wall** (12.010601 s of 12.030305 s, residue 19.7 ms over 21 entries), so **the
+phases sum and W1 may start**. That is the artifact's own run and the figure
+`## Outcome — W0` records; the superseded 98.33% at a 0.1575 s wall used to
+stand here, and it is the run whose phase ranking `## Outcome — W0` says may not
+be quoted. **The RATIO is what the gate reads. Neither wall is a benchmark** —
+the same binary at the same geometry has measured 0.158 s, 6.138 s and 12.030 s
+on a contended box. The artifact is
 [`benchmarks/demo/ltx25_phase_log_fixture_cpu.json`](../../benchmarks/demo/ltx25_phase_log_fixture_cpu.json)
 and its provenance is in `## Outcome — W0` below.
 
@@ -45,9 +50,19 @@ does not override `vt::Backend::DeviceMemoryInfo` at all** —
 W0 did not wire it, and the reason is written down where the seam is:
 `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that
 seam is load-bearing, because `Gemma4MoE`'s device-expert LRU is its only
-consumer and is currently dead on CUDA, so an override wakes a landed residency
-policy and is a behaviour change with its own measurement. That is #1126's
-change, not an instrument's. **Until it lands, W1 samples
+consumer. **Which arm of that LRU the override would wake is narrower than this
+row first claimed, and the narrower statement is the one to carry.** The bf16
+arm, `EnsureGemma4Fp8ExpertOnDevice` (`src/vllm/model_executor/models/gemma4_moe.cpp:548`),
+is dead on CUDA for a SECOND and independent reason: it refuses at `:571` on
+`vt::HasMatmulBTAlphaBeta`, whose only implementation in this tree is ROCm's
+([#1205](https://github.com/mudler/vllm.cpp/issues/1205)), so wiring
+`DeviceMemoryInfo` does not wake it at all. What the override WOULD wake is the
+**FP8-native arm**, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches
+`DevExpertLru::MakeRoom` behind no device gate other than the probe itself and
+whose budget defaults to a 2048 MiB fill-only device cache when
+`VT_GEMMA4_EXPERT_VRAM_MB` is unset (`:416-432`). So the override is still a
+behaviour change with its own measurement, on one named arm rather than on
+"every CUDA model". That is #1126's change, not an instrument's. **Until it lands, W1 samples
 `--query-compute-apps=used_memory` per phase beside the table** — which is the
 fallback this spec's W6 row already names, and the only device-memory instrument
 GB10 answers. `## Owed` states what the column cannot report and why.
@@ -622,7 +637,7 @@ its phase table lands, and W5 owes one when its wall is accepted.
 |---|---|---|
 | [#1264](https://github.com/mudler/vllm.cpp/issues/1264) | this row: the staged campaign spec | closed by this row landing |
 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | **closed.** The render writes a phase table on the shipped default; the ABI names it through `vllm_video_last_phase_log` (v22) |
-| the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:358`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and it is currently DEAD on CUDA, so implementing the override wakes a landed residency policy and is a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
+| the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:358`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and is DEAD on CUDA. Narrowed, because the broad form of this sentence is wrong: the bf16 arm `EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is dead for a SECOND, independent reason — it refuses at `:571` on `vt::HasMatmulBTAlphaBeta`, implemented only by ROCm ([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override alone would not wake it. The arm the override WOULD wake is the FP8-native one, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches `MakeRoom` behind no device gate but the probe, with a 2048 MiB fill-only budget by default (`:416-432`). One named arm, not every CUDA model — and still a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | W0 (contract) + W1 (closes) | contract half **met** — the table is a file beside the frames rather than a console line, and it is retrievable from this repo at `benchmarks/demo/`. The closing half is W1's |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | W1 | owed; its `utilization.gpu` positive control is still unrecorded in this tree |
 | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | W2a | owed |
@@ -756,10 +771,19 @@ rejected, and this is the one rejection a reader should not skip.** It would
 have made W0's own gate look complete on a CUDA box, and it is
 [#1126](https://github.com/mudler/vllm.cpp/issues/1126)'s change:
 `include/vllm/platforms/interface.h:68-72` records that the seam's only consumer,
-`Gemma4MoE`'s device-expert LRU, is DEAD on CUDA precisely because the override
-is absent, so adding it wakes a landed residency policy on every CUDA model in
-the tree. An instrument that changes model behaviour to make its own column
-non-empty is not an instrument. The column reports `-1` and `## Owed` says why.
+`Gemma4MoE`'s device-expert LRU, is DEAD on CUDA. **This row first wrote that as
+"wakes a landed residency policy on every CUDA model", which claims more than the
+code supports and is corrected here.** The bf16 arm
+`EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is separately dead behind
+`vt::HasMatmulBTAlphaBeta` at `:571` — ROCm holds the only implementation
+([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override
+would not wake that one. It would wake `EnsureGemma4Fp8NativeOnDevice`
+(`:611-628`), which reaches `MakeRoom` with the probe as its only device gate and
+a 2048 MiB fill-only default budget (`:416-432`). One arm, named, and still a
+behaviour change with its own measurement — which is the reason, and the reason
+did not need the overstatement. An instrument that changes model behaviour to
+make its own column non-empty is not an instrument. The column reports `-1` and
+`## Owed` says why.
 
 ### Mutations, each with its diff, its compile status and its exit code
 

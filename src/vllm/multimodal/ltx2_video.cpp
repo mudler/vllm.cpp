@@ -3070,6 +3070,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "loop, which is not ported. Supply the spatial upsampler "
              "('ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors').");
       }
+      // W0 repair (#1010 review): #1010 names "any latent-upsampler stage" and
+      // this one had no name — it ran inside `phase.prepare`, whose name says
+      // nothing about it. NESTED inside that leaf for the same reason the audio
+      // split is: the decomposition is readable and the sum does not move.
+      // Reached only by a recipe phase whose input transform is the spatial
+      // upsample, i.e. stage 2 of the two-stage recipes.
+      const ::vllm::multimodal::phase::Scope upsample_phase("phase.upsample_latent");
       Ltx2LatentVolume in;
       in.batch = 1;
       in.channels = video_lc;
@@ -4568,11 +4575,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     audio_samples = a2v_source.samples_per_channel;
     audio_rate = a2v_source.sample_rate;
   } else {
+    // W0 repair (#1010 review): `decode.audio` FOLDED TWO MODELS, and one of
+    // them was the second-largest phase in the first artifact this row shipped
+    // — 3.062 s, 25.5% of wall, un-decomposed. #1010 asks for the vocoder by
+    // name. The two are split as NESTED leaves inside the same `decode.audio`
+    // leaf rather than as siblings: nested records are excluded from the sum
+    // (`render_phase_log.cpp` `Sum`), so the decomposition is readable without
+    // changing what the table adds up to, and `decode.audio` stays the boundary
+    // the gate requires.
     const phase::Scope audio_decode_phase("decode.audio");
+    phase::Scope mel_phase("decode.audio.mel");
     const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
         im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+    mel_phase.Close();
+    phase::Scope vocoder_phase("decode.audio.vocoder");
     waveform = Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data,
                                          mel.channels, mel.frames, mel.mel_bins, &audio_samples);
+    vocoder_phase.Close();
     audio_channels = mel.channels;
     audio_rate = im.vocoder_cfg.output_sampling_rate;
   }

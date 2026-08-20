@@ -2590,3 +2590,53 @@ now — and this change neither created nor widened it. Owner: row
 **`ENG-CUDAGRAPH-BREAK`**, the stage that gets a `dgx` window WITH the
 Qwen3-0.6B/4B checkpoints, which is the same window the decline and the depth-2
 battery already owe runs to.
+
+**A duplicate of the block-table defect, and why the sanitizer describes it
+badly** ([#1403](https://github.com/mudler/vllm.cpp/issues/1403), a re-report of
+[#1394](https://github.com/mudler/vllm.cpp/issues/1394)). `#1403` was filed
+against `96ed8346f` while the fix `7dec1d990` was in flight, so it names a red
+that `main` no longer carried by the time anybody read it. No code was owed, and
+the useful part is what the re-derivation measured rather than the conclusion it
+reached.
+
+The obvious reading of the first report is wrong in a specific way worth keeping.
+`5f68e60df` is the right commit to start from — `git log -S'SpecAttnMeta'` and
+`git log -S'W6: two spec shapes of EQUAL S'` each return it alone — but the
+defect is in the TEST FIXTURE that commit added, not in the graph eligibility it
+widened. A reader who starts at the eligibility predicate is reading production
+code that was correct, and the widening is only what first drove a shape through
+the fixture that the fixture could not describe.
+
+**Both halves of `7dec1d990` are load-bearing, which its own gate could not show.**
+That commit repairs `SpecAttnMeta` and adds the kernel bound, and after the repair
+its gate no longer reaches the bound — the point
+[#1407](https://github.com/mudler/vllm.cpp/issues/1407) makes when it moves the
+refusal's gate to `tests/test_ops_paged_attn`. Reverting the two halves
+separately, in this binary, closes that: with only the fixture reverted the bound
+refuses by name at `src/vt/cpu/cpu_paged_attn.cpp:152` and the case THROWS
+(exit 1); with the bound reverted as well the crash returns (Release exit 139,
+three runs of three); with both restored the file is exit 0, 8/8, 138 assertions.
+
+**The sanitizer calls this a SEGV, not a `heap-buffer-overflow`, and that is not
+a limitation of the tool.** Debug plus `VLLM_CPP_SANITIZE=address,undefined`
+(NDEBUG OFF) on the fully reverted tree reports
+`AddressSanitizer: SEGV on unknown address 0x5045f5f84900`,
+`The signal is caused by a READ memory access`, at
+`src/vt/cpu/cpu_paged_attn.cpp:59` in `KvElem<KvKind::K>` reached from `:224`, on
+threadpool worker T1. There is NO free site to report, because nothing is freed:
+the out-of-bounds block-table read is IN-BOUNDS for ASan, landing inside the
+neighbouring pooled allocation, and it is the VALUE read that becomes a wild
+block index which `KvElem` multiplies by the KV block stride and dereferences.
+The consequence for the next reader is that **a clean ASan report at the table
+read is not evidence the read is in bounds** for this defect class. The pool
+places the tables, so ASan sees one live region; only the bound at `:152` knows
+where the table's own last column is. It also explains the order dependence
+[#1407](https://github.com/mudler/vllm.cpp/issues/1407) measured: whether the
+neighbouring bytes decode to a mapped address is the allocator's business.
+
+The truncation in [#1405](https://github.com/mudler/vllm.cpp/issues/1405) is
+worse than a short count when the fault is on a worker thread. Doctest printed
+its summary TWICE with different totals, `135` then `141`, because the main
+thread kept running after T1 died. A gate that pins a total therefore sees count
+drift, and a gate that greps for one summary line can read whichever of the two
+it reaches first. The exit code remains the authority.

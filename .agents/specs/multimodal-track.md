@@ -755,7 +755,7 @@ scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRo
   (`full_attention_interval:4`), hidden 5120, 24 heads / 4 kv, head_dim 256,
   `attn_output_gate:true`, vocab 248320, `tie_word_embeddings:false` (owns lm_head).
 - **The bf16 GDN-hybrid LLM loader ALREADY EXISTS.** `LoadQwen3_5Dense`
-  (`qwen3_5_dense_weights.cpp:369`) routes each Linear bf16-vs-NVFP4 by the presence
+  (`qwen3_5_dense_weights.cpp:370`) routes each Linear bf16-vs-NVFP4 by the presence
   of `.weight_packed`; on `Qwen/Qwen3.6-27B` (no `.weight_packed`) it loads every
   projection bf16 (`LoadBf16RawNK`/`LoadMergedBf16RawNK`) into the SAME
   `Qwen3_5DenseWeights` the existing forward reads, and the GDN-hybrid forward's

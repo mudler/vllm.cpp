@@ -126,7 +126,7 @@ token-for-token correctness against the pinned oracle.
 | Capability | State | Notes |
 |---|---|---|
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **flat 0.937-0.956 c1-c32** (#349; 0.838 void) |
-| Qwen3.8-2.4T-A95B (`UD-Q1_0`, 370 GiB) | **Loads and generates on ONE 119 GiB GB10**; speed is the gap | Resident 62 GiB; 66.7 s/tok, streaming OFF. Streaming lands but its decode figure is VOID: the step clock had no caller, so the cache died in token 3 ([#912](https://github.com/mudler/vllm.cpp/issues/912)) |
+| Qwen3.8-2.4T-A95B (`UD-Q1_0`, 370 GiB) | **Loads and generates on ONE 119 GiB GB10**; speed is the gap | Resident 62 GiB; 66.7 s/tok, streaming OFF. Streaming-ON decode was VOID: the step clock had no caller, so the cache died in token 3 (#912). Re-measured LIVE in the `ENG-EXPERT-STREAM-DEVICE` row |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32), STALE as of 2026-08-12 (+136 src commits then, incl. a +2.05% c8 lever); regrid owed | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration. Router warp kernel (#378) device-gated 315/315 both arms, kernel 1.363x, step-level not separable |
 | Qwen3.6-35B-A3B (published BF16, GDN MoE) — TEXT | Correctness-gated 2026-08-15 (#740, #864, both `DONE`); **no throughput, latency or memory number exists for this checkpoint, and none is claimed** | Greedy vs the pinned oracle @`995ad96e`: **6/7 prompts STRICT 16/16**; the 7th is one exact logit tie (`0.0 mnats`) our argmax breaks toward the higher id (#910). SACRED 3/3, goldens byte-identical |
 | Qwen3.6-35B-A3B (BF16) — IMAGE / VIDEO | Implemented, **NOT gated** (#891); row stays `PARTIAL` | The 333 `model.visual.*` tensors load and the tower computes (`[1,28,28]`→`[196,2048]`, finite, absmax 2.08) on sm_110 FALLBACK attention. The token-exact mm gate vs the oracle is OWED |
@@ -1118,8 +1118,8 @@ the latter with the caveat that vLLM's figure is set by
 **Its quantized arms are not gated.** Three rows on
 [#821](https://github.com/mudler/vllm.cpp/issues/821)
 ([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` and
-`QUANT-QWEN38-27B-GGUF-ARM` are `PARTIAL`, `QUANT-QWEN38-27B-NVFP4-ARM` is
-`READY`. `AGENTS.md` makes the quantized arms a standing requirement, and these
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are all
+`PARTIAL`. `AGENTS.md` makes the quantized arms a standing requirement, and these
 are the arms a user can run: 17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
 
 **`LOAD-GGUF-MMPROJ` landed the loader half.** `--mmproj` on the server and
@@ -1151,12 +1151,15 @@ already true and was ungated; the accounting is what now fails if it stops
 being true. **Text decode against llama.cpp is still owed**, and so are the
 image and video legs.
 
-The NVFP4 arm is not implemented. The artifact published as
-`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision` checkpoint
-with **zero `*.input_scale` tensors**, which is why the reported load dies. And
-the Q4_K_M file ships the MTP drafter as block 64, so a loader reading
-`block_count` as decoder depth builds a 65-layer model out of a 64-layer
-checkpoint.
+**`QUANT-QWEN38-27B-NVFP4-ARM` landed its accounting and its refusal.**
+`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision`
+checkpoint with **zero `*.input_scale` tensors**, re-pinned to
+`7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` with a locally computed sha256. All
+1968 of its index names are accounted per scheme in CI from committed
+header-only manifests, and its FP8 group — 233 modules, per-channel weight scale
+and dynamic per-token activations — is now refused by name at load with both
+missing pieces stated. **It still does not run:** no FP8 tower, no consumed
+`kv_cache_scheme`, and no token or resident-byte measurement.
 
 **Both token gates are `PENDING` on named external authorities, and this page
 claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,

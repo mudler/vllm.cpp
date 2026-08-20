@@ -703,36 +703,55 @@ What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
 A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**run and failing**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches
-on those devices, ported whole, with the scales applied in the mainloop; it is
-compiled by continuous integration for both architectures and registered, so a
-build for one of them no longer refuses the checkpoint at prepare time. On
+**run, and shape-restricted: unproven on every shape it can serve**. It is the
+block-scaled CUTLASS GEMM vLLM itself dispatches on those devices, ported whole,
+with the scales applied in the mainloop; it is compiled by continuous
+integration for both architectures and registered, so a build for one of them no
+longer refuses the checkpoint at prepare time. On
 2026-08-20 `test_ops_matmul_fp8_block_cuda` was run on a GB10 (compute
 capability 12.1) for the first time, and vLLM's own ported case -- M=32, N=576,
-K=7168 -- throws `cutlass Invalid status` before any kernel launches, because
-CUTLASS refuses the configuration at `can_implement`. Two of the file's five
-cases fail this way and three pass, so the failure is shape-dependent rather
-than universal; which shapes are affected is not yet isolated, and `Invalid`
-names no constraint. No shape has yet had its output compared against the CPU
-reference: the two cases that make that comparison are the two that throw. There
-is still no token-exact comparison against vLLM and no throughput number, on any
-device. Treat this arm as broken on the shape it was measured on and unproven
-everywhere else.
+K=7168 -- threw `cutlass Invalid status` before any kernel launched, because
+CUTLASS refused the configuration at `can_implement`.
+
+Which shapes are affected is now isolated, and the answer is a **shape
+restriction, not a bug in this tree**: on sm120 the CUTLASS block-wise
+collective serves only an N and a K that are whole multiples of 128. It requires
+complete scale blocks and full tiles in K, its sm90 counterpart requires
+neither, and 576 is `4*128 + 64`. A coarser floor sits under that one and is
+asked first where it applies -- `K % 16` and `N % 16`, the fp8 operand
+alignment, which is the line vLLM draws before rerouting such a shape to a
+Triton kernel this build does not have -- so four shape classes are refused in
+all, two of them at 16 by vLLM's authority and two at 128 by the sm120
+collective's. This arm refuses every one of the four **by name**, before it
+allocates anything:
+
+```text
+matmul_fp8_block_scaled: no CUDA kernel for this shape. N is 576, which leaves a
+remainder of 64 modulo 128, and the sm120 blockwise collective wants COMPLETE
+SCALE BLOCKS [...] so N must be a multiple of 128
+```
+
+The message names the dimension, its value, the granularity, the CUTLASS line it
+comes from, and that the sm90 collective has no such limit. It replaces
+`cutlass Invalid status`, which named none of those.
+
+**One real capability gap follows, and it is not repairable here.** DeepSeek-V3's
+`kv_a_proj_with_mqa` is exactly N=576 -- which is why vLLM chose that shape for
+its own test -- so on an sm120 device this arm cannot serve it at all. Any
+block-wise FP8 checkpoint whose projections are not all a multiple of 128 wide is
+affected the same way. The CPU reference arm runs every one of these shapes.
+`Qwen/Qwen3.8-27B-FP8`, the checkpoint above, is not affected: its ten
+projections are all round.
+
+None of that makes the arm proven. **No shape has yet had its output compared
+against the CPU reference on any device**, there is still no token-exact
+comparison against vLLM and no throughput number. What changed is what a user is
+told when the shape cannot be served, not whether the shapes that can be served
+produce the right numbers.
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437) records the run,
 milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
 kernel and the repair it now owes, and
 [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
-
-Two shapes the CPU arm accepts are refused on CUDA, by name and with the
-dimension and its remainder in the message. The CUTLASS collective needs both
-`K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
-and reroutes those shapes to a Triton kernel this build does not have. A
-*ragged* 128-block is not refused by that rule: `N = 576` is `4*128 + 64`, is
-16-aligned, and is the shape vLLM's own CUTLASS test uses. It does not follow
-that it runs -- on hardware that shape is exactly the one CUTLASS rejects at
-`can_implement`, above. A build for any other CUDA architecture has no such
-kernel compiled and keeps refusing at prepare time, which is the honest answer
-rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
@@ -4012,6 +4031,66 @@ the pinned llama.cpp, which is `PENDING` on
 [#857](https://github.com/mudler/vllm.cpp/issues/857) because that oracle is
 recorded `gateable = no`, and any image or video answer at all —
 `QUANT-QWEN38-27B-GGUF-ARM`,
+[#821](https://github.com/mudler/vllm.cpp/issues/821).
+
+### `unsloth/Qwen3.8-27B-NVFP4` — what it is, and which arm is refused
+
+This artifact's repo name says NVFP4 and its `quantization_config.format` says
+`mixed-precision`. **This engine cannot run it yet**, and it now says so at load
+instead of failing on a missing tensor. It is documented here because it is a
+checkpoint people reach for, and because the refusal is the shipped behaviour.
+
+Also a **third-party quantization by Unsloth**, not a first-party release. A repo
+id is not a pin: the revision [#821](https://github.com/mudler/vllm.cpp/issues/821)
+originally named, `a767244d27bd76589a3e3b2ab4e64032c4ebc7af`, no longer resolves,
+and this is the second in-place re-quantization this publisher has done in this
+model family.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| mixed FP8 + NVFP4 backbone | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `model.safetensors` | 22 568 192 096 | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` |
+| bf16 MTP drafter | same revision | `model_mtp.safetensors` | 849 400 392 | not mirrored here, so no locally computed hash — and no remote-reported one is recorded |
+
+Total resident size of the set is 23 417 592 488 B, which is
+`model.safetensors.index.json`'s own `metadata.total_size` and the sum of the two
+files. The sha256 above was computed locally on this project's mirrored copy, not
+read back from the hub.
+
+The 1968 names of that index split into two schemes plus the parts no group
+claims:
+
+| Scheme | Modules | Tensors | Covers |
+|---|---:|---:|---|
+| `group_1`, `nvfp4-pack-quantized` W4A4, `group_size` 16 | 168 | 672 | `mlp.(gate\|up\|down)_proj` on layers 0-55 |
+| `group_0`, `float-quantized` FP8 W8A8 | 233 | 466 | `self_attn.(q\|k\|v\|o)_proj`, `linear_attn.(in_proj_qkv\|in_proj_z\|out_proj)`, `lm_head`, and layers 56-63's MLP |
+| on the config's `ignore` list | 317 | 475 | the GDN low-rank projections and norms, the 27 vision blocks, the merger, the whole MTP head |
+| named by no target | 267 | 323 | norms, `conv1d`, the embedding table, the patch and position embeddings |
+| `kv_cache_scheme` scales | 16 | 32 | `k_scale` / `v_scale` on the 16 full-attention layers |
+
+**The NVFP4 arm loads. The FP8 arm is REFUSED**, by name, before any weight is
+read, because its `group_0` needs two things this build does not have: a
+per-output-channel weight scale (`weights.strategy: channel`, so `weight_scale`
+ships `[out, 1]` rather than the one element a per-tensor scale is) and dynamic
+per-token activation quantization (`input_activations.dynamic: true`, so the
+checkpoint correctly ships **no** `*.input_scale` at all and the scale is
+computed per forward). The declared `kv_cache_scheme` is refused for the same
+reason: nothing here reads `k_scale` / `v_scale`, and there is no quantized KV
+cache to apply them to. Since layers 0-55 and 56-63 use the SAME module names and
+differ only by a regex over the layer index, no per-tensor dtype probe can tell
+the two groups apart; the split is read from `config_groups`.
+
+To re-verify the committed manifests and config against the shipped bytes rather
+than against the fixture CI reads:
+
+```console
+VLLM_CPP_QWEN38_27B_NVFP4_DIR=/path/to/qwen3.8-27b-nvfp4 \
+  ./build/tests/test_qwen38_27b_nvfp4_arm
+```
+
+Unset, that case skips loudly and the gate stays hermetic; CI reads no NAS file.
+**What is still owed on this artifact** is the FP8 tower itself, a consumed
+`kv_cache_scheme`, a resident-bytes assertion, and every token gate —
+`QUANT-QWEN38-27B-NVFP4-ARM`,
 [#821](https://github.com/mudler/vllm.cpp/issues/821).
 
 ### Per-prompt input limits

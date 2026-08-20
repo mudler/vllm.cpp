@@ -36,33 +36,14 @@ if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
 vllm_engine_free(engine);
 ```
 
-The ABI covers lifecycle, blocking and streaming completion, non-blocking
-concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
+The ABI covers engine lifecycle, completion, chat, embeddings, transcription,
+media generation, speech generation, memory helpers, and diagnostics. It also
+exposes blocking, streaming, and concurrent request interfaces. The current
+version is `VLLM_ABI_VERSION 23`.
 
-| ABI | Adds |
-|---:|---|
-| v2 | Structured output (JSON schema, JSON object, regex, choice, GBNF) |
-| v3 | Chat with tools and chat templates |
-| v4 | Tool-parser selection |
-| v5 | Reasoning-parser selection |
-| v6 | Speculative decoding |
-| v7 | Prefix caching (tri-state) |
-| v8 | Custom logits processors |
-| v9 | Engine sizing: chunked-prefill token budget, scheduling policy, external KV connector / LMCache |
-| v10 | Jump-forward decoding (tri-state, default off) |
-| v11 | Audio transcription through `vllm_transcribe` |
-| v12 | Video and audio generation through `vllm_video_*` |
-| v13 | Pre-tokenized completion through `vllm_complete_tokens` |
-| v14 | Explicit device selection (`auto`, CPU, or CUDA) |
-| v15 | Embeddings through `vllm_embed` |
-| v16 | Absolute KV-cache memory sizing |
-| v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
-| v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
-| v19 | Per-modality multimodal input limits |
-| v20 | Speech and music generation through `vllm_speech_*` / `vllm_synthesize` |
-| v21 | Device selection on the speech lane (`vllm_speech_model_params.device`, `vllm_speech_engine_device`) |
-| v22 | A second GGUF for the multimodal projector (`vllm_model_params.mmproj_path`) |
-| v23 | The render phase table: `vllm_video_last_phase_log` names the `phase-log.json` a completed `vllm_video_generate` wrote |
+Read [`include/vllm.h`](../../include/vllm.h) for the fields and functions in
+the current ABI. Call `vllm_abi_version()` at runtime to detect a header and
+library mismatch.
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.

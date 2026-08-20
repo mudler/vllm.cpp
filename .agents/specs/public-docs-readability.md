@@ -69,6 +69,14 @@ revision, sizes, and checksums remain in the `docs/USAGE.md` checkpoint registry
 The repair also resolves the three reported local fragments to the server flag
 reference, the MiniMax-Music3 recipe, and the model recipe index.
 
+The final R3 repair restores the two Qwen3.8 GGUF artifact rows that the W4
+extraction omitted from the public checkpoint registry. Both rows retain the
+full Unsloth revision, exact byte size, locally computed SHA-256, supported
+loader arm, and missing multimodal forward. The repair also replaces four
+reference-page histories with current lookup facts. Their method details,
+benchmarks, and owed work remain in the linked speculative-decoding guide,
+model recipe, benchmark page, and internal specs.
+
 The inventory's other zero-after literals are semantically accounted for.
 `HALF` and `KEYFRAME` were emphasis around the two-stage LTX behavior, which the
 LTX model page now states without all caps. `SAMPLER` is the restored `res_2s`

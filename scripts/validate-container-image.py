@@ -340,7 +340,12 @@ def check_boot(
 
 # The repository identifier the hub-reach audit asks for. It is a well-formed
 # `org/repo` -- `IsValidHfRepoId` accepts it -- that does not exist, so the hub
-# answers 404 and nothing is downloaded.
+# ANSWERS rather than serving, and nothing is downloaded. MEASURED on
+# 20 August 2026 the answer is HTTP 401, not 404: an anonymous `GET
+# /api/models/does-not-exist/nope/refs` cannot be told apart from a request for
+# a private repository, so the hub declines to say which. `classify_hub_reach`
+# accepts 401, 403 and 404 for that reason, and the module docstring above and
+# `HUB_ANSWER_AUTH` below record the same measurement.
 HUB_REACH_MODEL = "does-not-exist/nope"
 
 # The message `HfRefuseHttpsWithoutTls` prints when the build carries no
@@ -348,11 +353,11 @@ HUB_REACH_MODEL = "does-not-exist/nope"
 # failure this audit exists for: the image shipped with the feature disabled.
 NO_TLS_MARKERS = ("cannot speak HTTPS", "VLLM_CPP_OPENSSL", "VLLM_CPP_HF_DOWNLOAD")
 
-# A completed HTTP conversation with the hub. 404 is what an unknown repository
-# earns and is what this audit asks for. 401 and 403 are accepted as proof of
-# the same thing -- the handshake finished and the hub judged the request --
-# because a hub may answer a gated or renamed name that way, and either one
-# rules out both failure modes the audit is looking for.
+# A completed HTTP conversation with the hub. 401 is what the live hub actually
+# returned when this was measured, and 403 and 404 are accepted as proof of the
+# same thing -- the handshake finished and the hub judged the request -- because
+# a mirror may answer an unknown, gated or renamed name any of those ways, and
+# each one rules out both failure modes the audit is looking for.
 HUB_ANSWER_404 = "HuggingFace answered HTTP 404"
 HUB_ANSWER_AUTH = "HuggingFace refused repository"
 

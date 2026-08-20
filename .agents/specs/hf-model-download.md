@@ -296,26 +296,42 @@ the test result. A mutation that fails to build and a mutation that never
 applied both read as a passing test, and this tree has recorded both.
 
 TLS gates. The hermetic hub suites speak plain hypertext transfer protocol and
-prove nothing about transport security, so W5 added three separate instruments
+prove nothing about transport security, so W5 added four separate instruments
 rather than one.
 
 1. `ctest -R test_tls_transport`, which is HERMETIC and speaks REAL TLS. Its
-   fourth case generates a self-signed loopback certificate through the OpenSSL
+   fifth case generates a self-signed loopback certificate through the OpenSSL
    application programming interface, starts an `httplib::SSLServer` on an
    ephemeral port, points the endpoint at `https://127.0.0.1:<port>/`, trusts
    the certificate through `SSL_CERT_FILE` rather than by weakening the
    production client, and drives the production `HubResolveRefToCommit` through
    a genuine handshake. The commit comes back AND the server counts exactly one
-   request, so the answer cannot have come from a cache. At this head: 5 cases,
-   17 assertions, `Status: SUCCESS!`, exit 0.
+   request, so the answer cannot have come from a cache. At the W7 head: 5
+   cases, 23 assertions, `Status: SUCCESS!`, exit 0.
 2. `scripts/validate-container-image.py` boots the image with
    `--model does-not-exist/nope` and asserts the failure is an ANSWER FROM THE
    HUB, not the message that names the build options. A symbol check would pass
    on a build where the option resolved `OFF`. See "The hub answers 401, not
    404" under `## Risks and decisions` for what the live hub actually returns.
    `tests/scripts/test_validate_container_image.py` pins the classifier: 11
-   tests, exit 0.
-3. One opt-in online test that fetches a real repository, following the pattern
+   tests, exit 0. That suite is INVOKED by
+   `scripts/agent-preflight.sh`'s `SUITES` array and by the container block of
+   `.github/workflows/ci.yml`. W7 wired it there after a review found it
+   invoked by nothing at all: this tree treats an unrun gate as a distinct
+   third state, and a suite no runner names pins nothing. Breaking one of its
+   11 tests and running `scripts/agent-preflight.sh` reddens the run with
+   `FAIL test_validate_container_image`, measured at W7.
+3. The one-definition-rule instrument reads ALL THREE library translation units
+   that include the vendored httplib header, not two.
+   `include/vllm/http_transport_abi.h` names `api_server.cpp`, `hf_hub.cpp` and
+   `downloader.cpp`, and `HttpTransportAbiMismatch` compares the other two
+   against the server's reading. W5 shipped it reading only the first two, and
+   a review measured the hole: `-UCPPHTTPLIB_OPENSSL_SUPPORT` on
+   `downloader.cpp` ALONE compiled at exit 0 and left the suite at 5 of 5 cases
+   and 17 of 17 assertions green while `sizeof(httplib::Result)` was 72 in that
+   unit and 88 in the other two. With the third reading in place the same
+   mutation reddens 2 of 5 cases and 5 of 23 assertions.
+4. One opt-in online test that fetches a real repository, following the pattern
    in `tests/tools/test_online_gate_server_binary.py`. It does not run in the
    default continuous integration lane. STILL OWED, and listed under `## Owed`.
    What exists in its place is a manual measurement recorded here: the server
@@ -325,12 +341,53 @@ rather than one.
    HTTP 401. That is a real live https session through the production path, and
    it is a MEASUREMENT rather than a gate, because nothing reruns it.
 
+The production REFUSAL, and what gates it. `VllmServerMain` calls
+`HttpTransportAbiMismatch` before it parses an argument or binds a socket, so a
+binary built with the macro set per file refuses to serve rather than serving a
+corrupted response object. Two instruments cover it and neither covers it
+alone.
+
+- STATIC, and it reruns. The citation
+  `src/vllm/entrypoints/openai/server_main.cpp::HttpTransportAbiMismatch` in
+  this section is checked by `scripts/check-symbol-anchors.py`, which runs in
+  `scripts/agent-preflight.sh` and in continuous integration. Deleting the
+  five-line refusal removes the only occurrence of that identifier from that
+  file and the checker reddens with `symbol not found`. Measured at W7. It
+  proves the call site EXISTS. It does not prove the refusal WORKS.
+- MANUAL, and nothing reruns it, because the behavior needs two binaries and a
+  single-binary gate for it is not constructible. The reproduction recipe, run
+  at W5 and again at W7:
+
+  ```sh
+  # 1. Mutate ONE translation unit, then rebuild.
+  # `i\` inserts the line above the match. An `s|...|...\n&|` form was tried
+  # first and the shell ate the `&`, which left a literal ampersand in the
+  # source and turned the mutation into a BUILD FAILURE. A mutation that fails
+  # to build reads as a passing test, which is why step 1 prints its status.
+  sed -i '/#include <httplib\/httplib.h>/i #undef CPPHTTPLIB_OPENSSL_SUPPORT' \
+      src/vllm/transformers_utils/downloader.cpp
+  cmake --build build --target vllm-server   # must exit 0; a build failure
+                                             # reads as a passing test
+  # 2. The refusal fires BEFORE argument parsing, so any argv reaches it.
+  ./build/examples/vllm-server --model /does/not/matter ; echo "rc=$?"
+  # EXPECT rc=2 and a message naming CPPHTTPLIB_OPENSSL_SUPPORT and all three
+  # readings, one of which reports sizeof(httplib::Result)=72 against 88.
+  # 3. Restore and verify byte-for-byte.
+  git checkout -- src/vllm/transformers_utils/downloader.cpp && git diff --quiet
+  ```
+
+  Deleting the refusal instead of mutating the macro makes step 2 print the
+  ordinary startup path, which is the negative half of the same measurement.
+
 Mutations W5 ran, each compiled at exit 0, each restored and verified with
 `git diff --stat`:
 
 | Mutation | Turned red |
 |---|---|
 | `-UCPPHTTPLIB_OPENSSL_SUPPORT` on `hf_hub.cpp` alone | `test_tls_transport`, 4 of 5 cases, 11 assertions |
+| `-UCPPHTTPLIB_OPENSSL_SUPPORT` on `downloader.cpp` alone, BEFORE W7 added the third reading | NOTHING. 5 of 5 cases, 17 of 17 assertions, `Status: SUCCESS!`. This is the hole, not a pass |
+| `-UCPPHTTPLIB_OPENSSL_SUPPORT` on `downloader.cpp` alone, AFTER it | `test_tls_transport`, 2 of 5 cases, 5 of 23 assertions |
+| Expect `unverified` where `classify_hub_reach` returns `ok` | `scripts/agent-preflight.sh`, `FAIL test_validate_container_image`. Before W7 wired the suite in, the same break reddened NOTHING |
 | Invert `ApiServerListenerIsTls` | `test_tls_transport`, 1 case, 1 assertion |
 | The hub client dials `http` whatever the scheme says | `test_tls_transport`, 1 case, 3 assertions |
 | Neutralise the no-TLS marker check in `classify_hub_reach` | `test_validate_container_image.py`, 2 tests |
@@ -752,8 +809,31 @@ which form.
 - **A static-musl fetch, through BoringSSL.** `-DVLLM_CPP_BUILD_BORINGSSL=ON`
   is implemented and available, and the `linux-x86_64-musl-cpu-static` lane
   does not use it because it fetches from the network at configure time. It has
-  NOT been built here, for the same reason and because this box was at 97
-  percent disk. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  NEVER BEEN COMPILED here, for the same reason and because this box was at 97
+  percent disk. No lane ships it and nothing measures it, so it is untested
+  code that the guide OFFERS, which is why `docs/guides/hugging-face-access.md`
+  now marks the option `UNTESTED` in its own row and says so in prose. Row
+  `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **The release manifest does not record whether an archive can fetch.**
+  `scripts/release_metadata.py`'s `REQUIRED_FLAGS` carries no
+  `VLLM_CPP_HF_DOWNLOAD`, so a manifest is silent about a capability the guide
+  now documents as a per-lane, user-visible fact. W7 considered the one-line
+  addition and REJECTED it, because it would publish a value that is wrong
+  exactly where it matters most. `backend_flags` reads `CMakeCache.txt`, and
+  `CMakeLists.txt`'s downgrade is a plain `set(VLLM_CPP_HF_DOWNLOAD OFF)`,
+  which shadows the cache entry inside the directory scope and never writes it
+  back. Measured on this box: a configure that resolved TLS ON leaves
+  `VLLM_CPP_HF_DOWNLOAD:BOOL=ON` in the cache, and a host with no OpenSSL
+  development files leaves the SAME line while the feature is off. The cache
+  records what the user ASKED FOR, and the resolved TLS source
+  (`_vllm_tls_source`) is a local variable that reaches no cache entry at all.
+  A manifest field fed from that would read `true` on the very lane that
+  refuses. Closing this needs the RESOLVED state published, either as a new
+  cache entry or through the `VLLM_CPP_HF_DOWNLOAD_REQUESTED` pattern already
+  used by `tests/CMakeLists.txt`, plus the manifest schema and its release
+  contract checkers moved together. That is a release-contract change and it
+  needs its own row. Row `ENG-HF-MODEL-DOWNLOAD`, issue
   [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 - The quickstart page, issue
   [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
@@ -785,7 +865,10 @@ which form.
 
 ## Now
 
-State `READY`. W1 through W6 have landed and W7, the fresh review, has not.
+State `READY`. W1 through W6 have landed. W7, the fresh review, has run once
+and returned FAIL on seven findings, and every one of them is repaired or
+recorded at this head. What that round changed is in the paragraph beginning
+"A SIXTH FRESH REVIEW" below.
 
 W5 is what made the feature real. Before it, `--model org/repo` fetched and
 served, but only over plain hypertext transfer protocol, because nothing in the
@@ -800,13 +883,15 @@ reaches `https://huggingface.co` and prints the hub's answer.
 
 The define is set on the TARGET and `PUBLIC`, never per file, and that is
 MEASURED rather than asserted: `include/vllm/http_transport_abi.h` takes one
-reading from the server translation unit and one from the fetcher translation
-unit, `VllmServerMain` refuses to start when they disagree, and undefining the
-macro for one file alone leaves the two halves 16 bytes apart on
-`httplib::Result` with a clean link and a red suite.
+reading from EACH of the three library translation units that include the
+vendored header, `VllmServerMain` refuses to start when any of them disagrees
+with the server's, and undefining the macro for one file alone leaves that unit
+16 bytes apart from the others on `httplib::Result` with a clean link and a red
+suite. W5 shipped only two of the three readings, and the paragraph beginning
+"A SIXTH FRESH REVIEW" records what that missed.
 
 `tests/vllm/transformers_utils/test_tls_transport.cpp` is the new suite: five
-cases, seventeen assertions, and its fourth case is a REAL TLS handshake against
+cases, twenty-three assertions, and its fifth case is a REAL TLS handshake against
 an in-process `httplib::SSLServer` on loopback, driven through the production
 `HubResolveRefToCommit`. It opens no network connection. The two no-TLS cases
 the fifth review repaired were re-read in a TLS build and both still count four
@@ -861,6 +946,29 @@ completes a `/v1/completions` request. Neutralising the resolver call site in
 that case red. DELETING the call instead does not compile, and the mutation
 table above records why.
 
+A SIXTH FRESH REVIEW returned FAIL on seven findings, and this head repairs six
+and records the seventh. `tests/scripts/test_validate_container_image.py` ran in
+NO gate: it was invoked by neither `scripts/agent-preflight.sh` nor
+`.github/workflows/ci.yml`, so the spec's claim that it pinned the classifier
+was a claim about a suite nothing ran. It is now in both, and breaking one of
+its eleven tests reddens a preflight run. The one-definition-rule instrument
+named three translation units and read two, and undefining the macro for
+`downloader.cpp` alone was measured to leave the suite fully green; it now takes
+a third reading from that unit and the same mutation reddens 2 of 5 cases. The
+production refusal in `server_main.cpp` had no gate at all, and a symbol
+citation in `## Gates` now reddens `scripts/check-symbol-anchors.py` when the
+call site is deleted, with the two-configuration behavior recorded there as a
+manual measurement and its recipe. `VLLM_CPP_BUILD_BORINGSSL` was offered
+without saying it has never been compiled, and the guide now marks it
+`UNTESTED`. Two comment defects are corrected: the `HUB_REACH_MODEL` comment
+claimed a 404 the same file elsewhere records as a measured 401, and a guide
+sentence promised two refusing lanes above a three-row table whose first row
+works. The seventh finding, `VLLM_CPP_HF_DOWNLOAD` missing from
+`release_metadata.py`'s `REQUIRED_FLAGS`, is recorded under `## Owed` with the
+reason the one-line fix was rejected: the CMake cache carries the REQUESTED
+value and the downgrade never writes back, so the field would read `true` on
+exactly the lane that refuses.
+
 A FIFTH FRESH REVIEW returned FAIL on six findings, and every one is repaired at
 this head. The end-to-end case leaked a listening socket and the retry loop hid
 it, both recorded under `## Risks and decisions` with the measurement.
@@ -885,7 +993,7 @@ split put it: the fetch, the cache layout and the limits in
 
 At the end of W4, W5, W6 and W7 had not been done: there was no transport layer
 security option, no `docs/FEATURES.md` entry, and no fresh review. W5 and W6 are
-described at the top of this section. W7 is still open.
+described at the top of this section. W7 has run one round.
 
 The paragraph below records the state W2 left, and is kept because the size-rule
 findings it names are what the current head's integrity rules are built from.

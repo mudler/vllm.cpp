@@ -55,8 +55,13 @@ into the cache before it binds:
 build/examples/vllm-server --model Qwen/Qwen3-0.6B --port 8000
 ```
 
-That form needs a build that carries transport layer security. See [Access
-Hugging Face checkpoints](guides/hugging-face-access.md) for the build options,
+That form needs a build that carries transport layer security. The default
+`-DVLLM_CPP_OPENSSL=ON` is the tested path, and every release lane and every
+container image uses it; `-DVLLM_CPP_BUILD_BORINGSSL=ON` is offered and has
+never been compiled here. A build that mixes the two states across its own
+source files refuses to start with exit 2 and a message naming what disagrees,
+rather than serving corrupted responses. See [Access Hugging Face
+checkpoints](guides/hugging-face-access.md) for the build options,
 `--revision`, `--download-dir`, the `HF_*` environment variables, and the
 release lanes that carry no fetch. `vllm-cli` and the C ABI still take a local
 path only.

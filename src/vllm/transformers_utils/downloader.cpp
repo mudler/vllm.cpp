@@ -23,6 +23,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "vllm/http_transport_abi.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace vllm {
@@ -625,4 +626,22 @@ HfDownloadResult HubDownloadFile(const std::string& url, const fs::path& dest,
 }
 
 }  // namespace transformers_utils
+
+// The TRANSFER half of the one-definition-rule instrument declared in
+// `include/vllm/http_transport_abi.h`. It is defined HERE, in the translation
+// unit that runs the `HEAD`, the ranged `GET` and the resume, so the reading is
+// that unit's own. Without it, undefining `CPPHTTPLIB_OPENSSL_SUPPORT` for this
+// file alone compiles cleanly and no instrument in the tree says so.
+HttpTransportAbi DownloaderHttpTransportAbi() {
+  HttpTransportAbi abi;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  abi.tls = true;
+#else
+  abi.tls = false;
+#endif
+  abi.result_size = sizeof(httplib::Result);
+  abi.client_connection_size = sizeof(httplib::ClientConnection);
+  return abi;
+}
+
 }  // namespace vllm

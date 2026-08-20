@@ -166,7 +166,7 @@ options decide whether the binary you have carries one.
 |---|---|---|
 | `VLLM_CPP_HF_DOWNLOAD` | `ON` | The feature. Resolves `OFF`, with a configure-time warning, when no TLS library is available |
 | `VLLM_CPP_OPENSSL` | `ON` | Links the system OpenSSL. Needs the development files, version 3.0 or later |
-| `VLLM_CPP_BUILD_BORINGSSL` | `OFF` | Fetches and statically links BoringSSL instead. Reaches the network at configure time |
+| `VLLM_CPP_BUILD_BORINGSSL` | `OFF` | **UNTESTED.** Fetches and statically links BoringSSL instead. Reaches the network at configure time |
 
 `cmake` prints which one answered:
 
@@ -185,14 +185,20 @@ https://huggingface.co/. Rebuild with -DVLLM_CPP_HF_DOWNLOAD=ON and one of
 -DVLLM_CPP_BUILD_BORINGSSL=ON, or set HF_ENDPOINT to an http:// mirror.
 ```
 
-Two lanes deliberately carry no transport layer security, and both refuse that
-way:
+Where each shipped lane stands. The two that carry no transport layer security
+do so deliberately, and both refuse the way shown above:
 
 | Lane | TLS source | `--model org/repo` |
 |---|---|---|
 | Container images, and every glibc release archive | system OpenSSL, dynamic | works |
 | A local build on a host with no OpenSSL development files | none | refused, naming the options |
 | `linux-x86_64-musl-cpu-static` | none | refused, naming the options |
+
+`VLLM_CPP_BUILD_BORINGSSL=ON` has NEVER BEEN COMPILED here. The option is
+implemented and it is offered, and no build in this repository has ever taken
+it, so no lane ships it and nothing measures it. Treat it as untested code and
+expect to debug the configure-time fetch yourself. `VLLM_CPP_OPENSSL=ON`, the
+default, is the path every release lane and every container image uses.
 
 The static musl archive is the deliberate one. Its contract forbids ANY dynamic
 dependency, and a statically fetched BoringSSL would make the archive depend on

@@ -4,11 +4,16 @@
 // THREE THINGS ARE PINNED HERE, and each is a separate failure this row can
 // ship.
 //
-//  1. The server half and the fetcher half agree on what
-//     `CPPHTTPLIB_OPENSSL_SUPPORT` was. That define changes the layout of
+//  1. ALL THREE library translation units that include the vendored httplib
+//     header agree on what `CPPHTTPLIB_OPENSSL_SUPPORT` was: the listener
+//     (`api_server.cpp`), the protocol client (`hf_hub.cpp`) and the transfer
+//     loop (`downloader.cpp`). That define changes the layout of
 //     `httplib::Result`, so a build that set it per FILE rather than per TARGET
 //     links cleanly and then reads a response object sixteen bytes short. No
 //     compiler diagnoses it and no other test in this tree would notice.
+//     The transfer unit is read because a review MEASURED its absence:
+//     undefining the macro for `downloader.cpp` alone left this suite at 5 of
+//     5 cases and 17 of 17 assertions green.
 //  2. The OpenAI listener is still plain hypertext transfer protocol. The same
 //     define makes `httplib::SSLServer` compilable, and this row deliberately
 //     does not enable a listener.
@@ -51,6 +56,7 @@ namespace fs = std::filesystem;
 
 using vllm::ApiServerHttpTransportAbi;
 using vllm::ApiServerListenerIsTls;
+using vllm::DownloaderHttpTransportAbi;
 using vllm::HttpTransportAbi;
 using vllm::HttpTransportAbiMismatch;
 using vllm::HubHttpTransportAbi;
@@ -211,23 +217,35 @@ class TlsHub {
 }  // namespace
 
 TEST_CASE(
-    "tls transport: the listener half and the fetcher half agree on the "
-    "httplib layout") {
+    "tls transport: every library translation unit agrees on the httplib "
+    "layout") {
   const HttpTransportAbi server = ApiServerHttpTransportAbi();
   const HttpTransportAbi fetcher = HubHttpTransportAbi();
+  const HttpTransportAbi downloader = DownloaderHttpTransportAbi();
 
   INFO("server tls=" << server.tls << " result=" << server.result_size
                      << " conn=" << server.client_connection_size);
   INFO("fetcher tls=" << fetcher.tls << " result=" << fetcher.result_size
                       << " conn=" << fetcher.client_connection_size);
+  INFO("downloader tls=" << downloader.tls
+                         << " result=" << downloader.result_size
+                         << " conn=" << downloader.client_connection_size);
 
   CHECK(server.tls == fetcher.tls);
   CHECK(server.result_size == fetcher.result_size);
   CHECK(server.client_connection_size == fetcher.client_connection_size);
-  // A zero would mean the reading never ran, which would make the three
-  // comparisons above agree about nothing.
+  // The transfer unit, compared against the SERVER rather than against
+  // `hf_hub.cpp`, so the two fetcher files cannot agree with each other and
+  // outvote the listener.
+  CHECK(server.tls == downloader.tls);
+  CHECK(server.result_size == downloader.result_size);
+  CHECK(server.client_connection_size == downloader.client_connection_size);
+  // A zero would mean the reading never ran, which would make the comparisons
+  // above agree about nothing.
   CHECK(server.result_size > 0);
   CHECK(fetcher.client_connection_size > 0);
+  CHECK(downloader.result_size > 0);
+  CHECK(downloader.client_connection_size > 0);
   // The production refusal `VllmServerMain` makes before it binds.
   const std::string mismatch = HttpTransportAbiMismatch();
   INFO("mismatch: " << mismatch);
@@ -245,6 +263,7 @@ TEST_CASE(
 #ifdef VLLM_CPP_TEST_EXPECT_TLS
   CHECK(HubHttpTransportAbi().tls);
   CHECK(ApiServerHttpTransportAbi().tls);
+  CHECK(DownloaderHttpTransportAbi().tls);
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
   FAIL_CHECK(
       "the build was configured with VLLM_CPP_HF_DOWNLOAD=ON and "
@@ -255,6 +274,7 @@ TEST_CASE(
   // No expectation was recorded, so the only statement available is that the
   // build is internally consistent about not having TLS.
   CHECK(HubHttpTransportAbi().tls == ApiServerHttpTransportAbi().tls);
+  CHECK(DownloaderHttpTransportAbi().tls == ApiServerHttpTransportAbi().tls);
 #endif
 }
 

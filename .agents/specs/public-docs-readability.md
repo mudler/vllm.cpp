@@ -84,6 +84,12 @@ conditioning. The owning IndexTTS specification retains the implementation and
 verification history. The repair also replaces a malformed video-guide link
 with one instruction that points directly to the MiniMax-H3 recipe.
 
+The R3 closure repair makes the server flag table match the accepted startup
+contract: `--model` is required except when `--speech-model` selects a
+speech/music-only server. The focused check first failed while the table called
+`--model` unconditionally required, then passed after the table stated the
+speech-only exception already enforced by the server.
+
 The inventory's other zero-after literals are semantically accounted for.
 `HALF` and `KEYFRAME` were emphasis around the two-stage LTX behavior, which the
 LTX model page now states without all caps. `SAMPLER` is the restored `res_2s`

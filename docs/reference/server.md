@@ -140,7 +140,7 @@ a stop token early.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`) |
+| `--model <dir>` | Required except when `--speech-model` selects a speech/music-only server | Model directory (safetensors or `.gguf`) |
 | `--host H` | `0.0.0.0` | Bind host |
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |

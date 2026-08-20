@@ -1769,6 +1769,8 @@ Two things this arm does NOT claim. The tile count is `2**round` **clamped to th
 canvas's segment count**, so a short canvas denoises in fewer windows than the
 round asks for — that is upstream's `min(num_tiles, n_segments)` and not a
 shortfall, but it means a small request never exercises the unclamped tiling.
+No test in this tree does either, so the unclamped expression is ungated and
+[#1493](https://github.com/mudler/vllm.cpp/issues/1493) owns closing it.
 And the whole arm is gated on reduced-dimension fixtures only, because the
 `keyframe_slot_sft` base that DFR needs is still unpublished (above). The real
 `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` exists and is

@@ -579,3 +579,27 @@ landed. The temporal rounds this row owed are landed too, by `LTX25-DFR-ROUNDS`
 is DRIVEN and `docs/FEATURES.md` says so. What stays owed on this row is a
 real-weights DFR render, blocked on a published `keyframe_slot_sft` base that
 nothing in this tree can supply.
+
+**The surfaces this `ACTIVE` -> `DONE` owes, decided rather than left implicit.**
+`AGENTS.md` `## Public documents` says a lifecycle change owes `docs/STATUS.md`,
+`docs/BENCHMARKS.md` and the moved row spec's `## Now`. The fresh review of
+[#1481](https://github.com/mudler/vllm.cpp/pull/1481) found the third written and
+the first two not, and raised it. Each is answered here:
+
+- **`docs/STATUS.md` WAS owed, and is written.** It carried no DFR line at all —
+  neither this row nor `LTX25-DFR-ROUNDS` had one — so there was nothing to keep
+  current and the omission read as compliance. The new row is keyed on the
+  capability the way `LTX-2.5 video VAE decode, device arm (KERNEL-CONV3D)` is,
+  and it carries what `STATUS` carries and `FEATURES` does not: the lifecycle
+  state and the blocker that binds it. It deliberately does NOT restate the
+  parameters, the anchors or the gate counts, because those are
+  `docs/FEATURES.md:174-175` and a fact stated in two projections is how two
+  projections drift apart.
+- **`docs/BENCHMARKS.md` is NOT owed, and the rule says so on its own terms.** It
+  changes when a row "gains an accepted or explicitly pending/failed/void
+  measurement". This row gained none of the four. It took no lease, ran no
+  oracle and made no throughput, latency or memory claim, and its arm is refused
+  on real weights, so there is no workload either side could run. Writing a row
+  there would be inventing a keyed record with no measurement in it, which is
+  worse than the silence: a reader would take it for a measurement that exists.
+- **The moved row's `## Now`** is this section.

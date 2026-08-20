@@ -31,10 +31,21 @@ and `.agents/specs/ltx25-dfr-pipeline.md` §0.2 all state that
 "re-verified 2026-08-16". **It is on the NAS.** Measured 2026-08-20:
 
 ```
-/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/latent_upscale_models/
+$CHECKPOINT_ROOT/ltx-2.5/lightricks-ltx-2.5/latent_upscale_models/
   ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors    995778752  2026-08-12
   ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors   261944000  2026-08-17
 ```
+
+**THE CANONICAL PREFIX IS `/usr/local/nas_share/checkpoints`**, which is what
+`CHECKPOINT_ROOT` resolves to in the shared checkout's `.env`. The measurement
+above was taken through `/mnt/nas_share/...`, where the same files are also
+visible right now, and that path is the WRONG one to record: `.env` says in terms
+that the NAS mounts at `/usr/local/nas_share` and NOT `/mnt`, because `/mnt` lives
+on the ephemeral root overlay of the immutable OS and dies on every reboot. That
+comment is dated 2026-08-16 and was written after a reboot left `CHECKPOINT_ROOT`
+dangling and every checkpoint path in this campaign broken. Recording the
+ephemeral path is how that happened; both are named here, and the durable one is
+canonical.
 
 Verified SEMANTICALLY rather than by name, because an arch name is not its
 contents: the safetensors header is 7608 bytes, it declares 72 tensors, all
@@ -370,15 +381,49 @@ the pre-mutation copy, and `touch`ed so ninja could not skip the rebuild).
 | M1 | temporal upsampler call site deleted | RED — `temporal_upsample_calls`; 33/35 still green |
 | M2 | `frames = 2 * frames` for `2 * (frames - 1) + 1` | RED — the layout's own seam guard, `dfr_layout.py:153-154` |
 | M4 | the 60 fps conditioning cap removed | RED — `round_conditioning_fps[1]`; 34/35 still green |
+| M5 | `+ tile_index` dropped from the tile seed | RED — `round_tile_seeds[2] == 2008u` and the `!=` beside it |
+| M6 | anchor strength 0.95 to 1.0 | RED — `round_anchor_strengths[i] == Approx(0.95)` |
+| M7 | ancestral eta 0.5 to 0.0 | RED — `round_stepper_eta[i] == Approx(0.5)` |
+| M8 | slot dedupe first-wins to last-wins | RED — `round_merged_slot_tiles[1] == 0` |
 
-**M5 through M9 were NOT run, and that is a gap rather than a pass.** The
-per-tile ancestral seed (M5), the 0.95 anchor strength (M6), the eta (M7) and the
-slot dedupe order (M8) have no assertion in this row that could detect them: the
-fixture renders one tile on round 1 and two on round 2, and nothing compares tile
-CONTENT. Running a mutation with no instrument on it would have produced a GREEN
-that reads like coverage. They are named here so the next reader knows the
-guarantee is mirrored but ungated, and a fresh reviewer should treat them as the
-first place to look.
+**M5 through M8 were NOT run when this row first landed, and that was a gap
+rather than a pass.** It is now closed. The original text said the fixture had
+"no assertion that could detect them", and running a mutation with no instrument
+on it would have produced a green that reads like coverage — which is exactly
+what the fresh review of [#1481](https://github.com/mudler/vllm.cpp/pull/1481)
+then measured: it mutated all four and the full suite stayed green at 102 cases /
+4141 assertions. That is unasserted-live code rather than dead code, and the same
+review proved both paths execute, by throwing from inside the anchor loop and
+from a repeated slot position across tiles.
+
+The four are gated by the subcase *the four PER-TILE guarantees, none of which
+the rendered clip can show*, which records each value AT THE POINT THAT CONSUMES
+IT — the seed off the `SplitMixGaussian` the loop generator is constructed with,
+the strength off the `Ltx2ConditionVideoByKeyframe` argument, the eta inside the
+ancestral branch on the step it takes. A tile that fell onto the deterministic
+Euler arm therefore records no eta at all, and the size check is red before any
+value is compared.
+
+**M8 needed a different observable than the finding named.**
+`round_merged_slot_positions` cannot detect the dedupe order: first-wins and
+last-wins each keep exactly one entry per position and both sort the bag, so the
+position list, its length, the carry-forward count and every downstream shape are
+byte-for-byte identical. The winning TILE is the only thing the rule moves. The
+M8 run is the proof — with last-wins in the tree, the three position CHECKs stay
+GREEN and only `round_merged_slot_tiles[1]` reds, 63 of 64 assertions passing.
+`round_slots_emitted` carries the other half: it says how many slots the tiles
+produced BEFORE the merge, so a reader can see that a duplicate genuinely
+occurred rather than take a winning-tile sequence on faith. This fixture emits 4
+and keeps 3.
+
+Observed rather than derived, and named as such: the seeds are 1007, 2007, 2008,
+so `round_idx` is ONE-BASED here (`seed 7 + 1000 * round + tile`). The merged bag
+is positions 24, 24, 72 with winning tiles 0, 0, 1 — round 1's single slot, then
+round 2's tile 0 slot at 24 that its tile 1 re-emits as a lead-in, plus tile 1's
+own at 72. The anchor-strength count is a FLOOR (`>= tiles`) rather than an
+equality, because every tile pins at least its own local frame 0
+(`dfr_pipeline.py:453-468`) and the exact total is a property of this fixture's
+tile ranges, not of upstream.
 
 ### Gates
 
@@ -418,6 +463,21 @@ insertions moved all fourteen) and the served-load-extras list (the new
   base row. The rounds loop keeps its slots in latent space and does not reach it.
 - [#975](https://github.com/mudler/vllm.cpp/issues/975) — DFR's stage-2 x2
   spatial detailing IC-LoRA. Refused by name, pointing at #975.
+- [#1493](https://github.com/mudler/vllm.cpp/issues/1493) — the **unclamped
+  `2**round_idx` tiling**, which nothing in this tree exercises because every
+  fixture canvas here has one keyframe segment and the tiles clamp to 1 and 2
+  (`dfr_layout.py:171`). Disclosed in the test body and in `docs/USAGE.md` since
+  this row landed; owned here since the fresh review of #1481. Left open on
+  purpose: reaching 4 segments needs a materially longer canvas and round 2 would
+  then denoise 4 tiles on a canvas already doubled twice, which is a new fixture
+  and a substantially longer CPU run rather than an assertion added to the
+  existing render. §5 states what would close it.
+
+The four per-tile guarantees that this section used to owe — the seed, the anchor
+strength, the eta and the dedupe order — are **no longer owed**. They are gated
+by the subcase named under `### Mutations`, and M5 through M8 each red by name.
+Honesty in prose was not ownership, so they are listed here as closed rather than
+silently dropped.
 
 ## Stop conditions
 

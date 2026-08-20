@@ -755,6 +755,56 @@ struct Ltx2ConditioningTrace {
   std::vector<int64_t> round_tile_counts;
   std::vector<double> round_conditioning_fps;
 
+  // The four upstream tile guarantees that NOTHING ELSE ON THIS STRUCT CAN SEE.
+  // Each one is mirrored in the rounds loop, each one changes the pixels, and
+  // each one leaves the frame count, the canvas, the tile counts, the upsample
+  // calls and the exit status exactly where they were. They are recorded for the
+  // reason `round_conditioning_fps` is: a render that got them wrong is a
+  // correctly shaped, finite, plausible clip.
+  //
+  // `round_tile_seeds` is the seed each tile's ANCESTRAL loop generator was
+  // actually constructed with, not the offset that was requested — read at the
+  // `SplitMixGaussian` that consumes it. Upstream varies it per tile,
+  // `seed + 1000 * round + tile` (dfr_pipeline.py:496-498), and says what a
+  // shared seed does: the tiles are positionally identical, so one seed injects
+  // BYTE-IDENTICAL noise into every window and the clip comes out with the same
+  // grain pattern repeating across it, at the right shape and the right length.
+  // Flat across rounds, delimited by `round_tile_counts`.
+  //
+  // `round_anchor_strengths` is the strength of every seam keyframe a tile
+  // pinned, read at the `Ltx2ConditionVideoByKeyframe` call that applies it.
+  // Upstream pins at 0.95, not 1.0 (:466, :70-72) — "pinned just short of fully
+  // clean so a tile can still settle its seam frame". At 1.0 the seam frame is
+  // frozen and cannot move to meet the frames either side of it, which shows up
+  // as a discontinuity at each window border and in no assertion about shape.
+  //
+  // `round_stepper_eta` is the ancestral eta each tile's sampler stepped with,
+  // recorded INSIDE the ancestral branch on the first non-terminal step, so it
+  // reports 0 entries for a tile that took the deterministic arm. Upstream's
+  // tile call switches the stepper to Euler-ancestral at eta 0.5 (:495); at eta
+  // 0 the step is plain Euler and the round adds no new detail at all, which is
+  // the whole point of running it.
+  //
+  // `round_merged_slot_positions` and `round_merged_slot_tiles` are the
+  // carry-forward bag each round hands the next one: the position, and THE TILE
+  // WHOSE COPY WON. Lead-in segments make a later tile re-emit an earlier tile's
+  // slot, and upstream's `setdefault` keeps the FIRST (:519-521) because that
+  // tile denoised the slot inside the window that owns it rather than inside a
+  // lead-in. The POSITIONS are identical under either rule — only the winning
+  // tile moves — so the tile index is the field that can detect the order and
+  // the position list alone cannot.
+  //
+  // `round_slots_emitted` is how many slots the tiles produced BEFORE the merge.
+  // It exists so the dedupe assertion is readable rather than magic: a render
+  // where it equals `round_merged_slot_positions.size()` had no duplicate to
+  // resolve, and its winning-tile sequence is therefore evidence of nothing.
+  std::vector<uint64_t> round_tile_seeds;
+  std::vector<double> round_anchor_strengths;
+  std::vector<double> round_stepper_eta;
+  std::vector<int64_t> round_merged_slot_positions;
+  std::vector<int64_t> round_merged_slot_tiles;
+  int64_t round_slots_emitted = 0;
+
   // ── AUDIO-TO-VIDEO: the supplied take, as the DiT received it (#922) ───────
   //
   // Zero and false everywhere when the request carried no `audio_path`.

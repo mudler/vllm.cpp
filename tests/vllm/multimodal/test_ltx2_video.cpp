@@ -2582,6 +2582,110 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     CHECK(result.fps == 96);
   }
 
+  SUBCASE("the four PER-TILE guarantees, none of which the rendered clip can show") {
+    // Four values upstream's tile call overrides, mirrored in the rounds loop
+    // and, until this subcase, gated by NOTHING. A fresh review mutated each one
+    // and the full suite stayed green at 102 cases / 4141 assertions, which is
+    // the shape `.agents/reachability.md` calls unasserted-live code: the lines
+    // execute, they change the pixels, and no assertion in the tree reads them.
+    //
+    // They are gathered in one subcase because they are one render's worth of
+    // observations about the same three tile invocations — round 1's single tile
+    // and round 2's two — and separating them would run the same fixture three
+    // more times to assert on different fields of the same trace.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_tileguards");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 33);  // the render still has to be the render
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    // THREE tile invocations: round 1 clamps to 1 window, round 2 to 2. Read off
+    // the tile counts rather than restated, so this stays the same claim if the
+    // clamp ever changes.
+    REQUIRE(trace.round_tile_counts.size() == 2);
+    const size_t tiles = static_cast<size_t>(trace.round_tile_counts[0] + trace.round_tile_counts[1]);
+    REQUIRE(tiles == 3);
+
+    // ── 1. THE PER-TILE SEED (dfr_pipeline.py:496-498) ──────────────────────
+    // `seed + 1000 * round + tile`, and the seed is what the loop generator was
+    // CONSTRUCTED with rather than the offset that was asked for. Upstream names
+    // the failure: the tiles are positionally identical, so a shared seed injects
+    // byte-identical noise into every window and the clip renders with the same
+    // grain pattern repeating across it — right length, right shape, exit 0.
+    //
+    // `FixtureGen` seeds at 7, so round 1's single tile owes 1007 and round 2's
+    // two owe 2007 and 2008. THE LOAD-BEARING PART IS THAT THEY DIFFER, and the
+    // `+ tile` term is the only thing that separates the last two: dropping it
+    // leaves 2007 twice.
+    REQUIRE(trace.round_tile_seeds.size() == tiles);
+    CHECK(trace.round_tile_seeds[0] == 1007u);
+    CHECK(trace.round_tile_seeds[1] == 2007u);
+    CHECK(trace.round_tile_seeds[2] == 2008u);
+    CHECK(trace.round_tile_seeds[2] != trace.round_tile_seeds[1]);
+
+    // ── 2. THE ANCESTRAL ETA (dfr_pipeline.py:495) ──────────────────────────
+    // Recorded inside the ancestral branch when it takes a step, so a tile that
+    // fell onto the deterministic Euler arm contributes no entry at all and the
+    // size check below is red before any value is compared. At eta 0 the
+    // ancestral step degenerates to plain Euler: the round re-runs the denoiser
+    // over the upsampled latent and injects no new detail, which is the entire
+    // reason the round exists and is invisible in every count above.
+    REQUIRE(trace.round_stepper_eta.size() == tiles);
+    for (size_t i = 0; i < trace.round_stepper_eta.size(); ++i) {
+      INFO("tile ", i);
+      CHECK(trace.round_stepper_eta[i] == doctest::Approx(0.5));
+    }
+
+    // ── 3. THE SEAM ANCHOR STRENGTH (dfr_pipeline.py:466, :70-72) ───────────
+    // 0.95, "pinned just short of fully clean so a tile can still settle its seam
+    // frame". At 1.0 the seam frame is frozen and cannot move to meet the frames
+    // either side of it, so each window border keeps a discontinuity — and the
+    // token count, the tile count and the stitched length are all unchanged.
+    //
+    // The count is a floor rather than an equality: every tile pins at least its
+    // own local frame 0 (:453-468), so fewer entries than tiles means a tile
+    // denoised its window with no seam pinned at all.
+    REQUIRE(trace.round_anchor_strengths.size() >= tiles);
+    for (size_t i = 0; i < trace.round_anchor_strengths.size(); ++i) {
+      INFO("anchor ", i);
+      CHECK(trace.round_anchor_strengths[i] == doctest::Approx(0.95));
+    }
+
+    // ── 4. THE DEDUPE ORDER (dfr_pipeline.py:519-522) ───────────────────────
+    // `first_index.setdefault(position, index)` — FIRST WINS. A lead-in segment
+    // makes a later tile re-emit a slot an earlier tile already denoised, and the
+    // earlier copy is the one denoised inside the window that OWNS the slot
+    // rather than inside a lead-in.
+    //
+    // THE POSITIONS ARE IDENTICAL UNDER EITHER RULE. Both rules keep exactly one
+    // entry per position and both sort the bag, so the position list, its length,
+    // the carry-forward count and every downstream shape are byte-for-byte the
+    // same whichever copy is kept. The winning TILE is the only observable the
+    // rule moves, which is why it is recorded.
+    //
+    // This fixture: round 1 emits one slot at 24; round 2's tile 0 re-emits 24
+    // and its tile 1 emits 24 again as a lead-in plus 72 of its own. Four
+    // emissions, three survivors — so a duplicate genuinely occurred here and the
+    // rule genuinely decided something.
+    CHECK(trace.round_slots_emitted == 4);
+    REQUIRE(trace.round_merged_slot_positions.size() == 3);
+    CHECK(trace.round_slots_emitted > static_cast<int64_t>(trace.round_merged_slot_positions.size()));
+    CHECK(trace.round_merged_slot_positions[0] == 24);
+    CHECK(trace.round_merged_slot_positions[1] == 24);
+    CHECK(trace.round_merged_slot_positions[2] == 72);
+    // The assertion the rule lives or dies on. Under last-wins this reads
+    // `0 1 1`.
+    REQUIRE(trace.round_merged_slot_tiles.size() == 3);
+    CHECK(trace.round_merged_slot_tiles[0] == 0);
+    CHECK(trace.round_merged_slot_tiles[1] == 0);
+    CHECK(trace.round_merged_slot_tiles[2] == 1);
+  }
+
   SUBCASE("rounds without a temporal upsampler are refused, not silently skipped") {
     // Upstream's second refusal, raised at the top of `__call__` beside the
     // malformed-value one (dfr_pipeline.py:286-287). Refused rather than run at

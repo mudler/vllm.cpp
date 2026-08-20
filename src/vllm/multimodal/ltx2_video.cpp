@@ -3062,6 +3062,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // which already exists and is already what `loop_noise` is built from, so a
     // tile varies it by handing in its own phase rather than by growing a second
     // channel for the same value.
+    //
+    // Records this invocation's seed, anchor strengths and ancestral eta onto the
+    // trace, AT THE POINTS THAT CONSUME THEM. Off for the base stages, whose
+    // values are the recipe's own and are covered elsewhere; on for a tile,
+    // because the three values upstream overrides per tile are otherwise
+    // unobservable in the rendered clip.
+    bool record_tile_trace = false;
   };
 
   auto RunStage = [&](const StageInvocation& inv) {
@@ -3789,6 +3796,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       Ltx2ConditionVideoByKeyframe(&state, anchor.keyframe, /*patch_size=*/1, factors, fps,
                                    anchor.frame_idx, anchor.strength,
                                    /*num_pixel_frames=*/1, /*causal_fix=*/true);
+      // Read off the argument that was just applied, not off the assignment that
+      // produced it, so a strength lost between the two is red as well.
+      if (inv.record_tile_trace) im.trace.round_anchor_strengths.push_back(anchor.strength);
       FromLatentState(state, &video);
       VT_CHECK(video.tokens > before_anchor,
                "ltx2 video: a DFR seam anchor must APPEND tokens like any other keyframe "
@@ -4344,7 +4354,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // The ancestral arm's loop generator is seeded from the pipeline seed plus
     // the recipe's own offset (distilled.py:69-73, :178-184) — a separate stream
     // from the state noise, so its first draw is not the initial latent's.
-    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
+    const uint64_t loop_seed = seed + static_cast<uint64_t>(phase.noise_seed_offset);
+    SplitMixGaussian loop_noise(loop_seed);
+    // The seed the generator was CONSTRUCTED with. A tile that inherited the
+    // render's seed draws the same noise as every other tile at the same shape.
+    if (inv.record_tile_trace) im.trace.round_tile_seeds.push_back(loop_seed);
+    // Set once, by the ancestral arm, when it takes a step — so a tile that fell
+    // onto the deterministic arm records nothing rather than recording an eta
+    // nobody used.
+    bool tile_eta_recorded = false;
     const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
 
     phase_prepare.Close();
@@ -4462,6 +4480,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
             audio.latent = a_denoised;
             if (phase_index == 0 && step == 0) im.trace.video_first_next_latent = video.latent;
             continue;
+          }
+          if (inv.record_tile_trace && !tile_eta_recorded) {
+            im.trace.round_stepper_eta.push_back(phase.stepper_eta);
+            tile_eta_recorded = true;
           }
           const std::vector<float> v_noise =
               loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
@@ -4768,6 +4790,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       std::vector<Ltx2LatentVolume> tile_latents;
       std::vector<int64_t> round_slot_positions;
       std::vector<Ltx2LatentVolume> round_slot_latents;
+      // Parallel to `round_slot_latents`, which is indexed by SLOT-PRODUCING tile
+      // rather than by tile, so that the trace can report the tile a merged slot
+      // came from rather than its rank among the tiles that produced any.
+      std::vector<int64_t> round_slot_latent_tile;
 
       for (size_t tile_index = 0; tile_index < tiles.size(); ++tile_index) {
         const Ltx2DfrTileRange& tile = tiles[tile_index];
@@ -4801,6 +4827,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         inv.fps = cond_fps;
         inv.initial_latent = &tile_video.data;
         inv.run_audio = false;  // (:494) `audio=None`
+        inv.record_tile_trace = true;
         // (:496-498) A PER-TILE ancestral seed, `seed + 1000 * round_idx +
         // tile_index`. Upstream states the failure it prevents: the tiles are
         // positionally identical, so a shared seed injects byte-identical noise
@@ -4863,8 +4890,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
           }
           for (const int64_t position : tile.slot_kf_global) {
             round_slot_positions.push_back(position);
+            ++im.trace.round_slots_emitted;
           }
           round_slot_latents.push_back(slot_keyframes);
+          round_slot_latent_tile.push_back(static_cast<int64_t>(tile_index));
         }
       }
 
@@ -4901,6 +4930,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         for (const auto& entry : first_seen) {
           const Ltx2LatentVolume& source = round_slot_latents[entry.second.first];
           merged_positions.push_back(entry.first);
+          // THE TILE WHOSE COPY WON, which is the only observable the dedupe rule
+          // moves — the position set is identical under first-wins and last-wins.
+          im.trace.round_merged_slot_positions.push_back(entry.first);
+          im.trace.round_merged_slot_tiles.push_back(round_slot_latent_tile[entry.second.first]);
           pieces.push_back(Ltx2DfrSliceLatentFrames(source,
                                                     static_cast<int64_t>(entry.second.second),
                                                     static_cast<int64_t>(entry.second.second) + 1));

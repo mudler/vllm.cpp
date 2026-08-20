@@ -884,13 +884,24 @@ never a configuration and nothing in the tree sets it.
 
 ### Cost
 
-One `std::fprintf` to stderr per phase boundary and per DiT forward. On the
-21.004 B geometry that is ~110 writes against 2.7 h of wall. There is **no
+One `std::fprintf` to stderr per phase boundary and per DiT forward, flushed,
+under the process-wide phase mutex the 100 ms sampler also takes — so a tick is a
+held global lock plus a flushed write rather than a bare `fprintf`, which at ~110
+lines per render is a footnote and is written down rather than left in a profile.
+On the 21.004 B geometry that is ~110 writes against 2.7 h of wall. There is **no
 per-token and no per-tile emission**: the VAE decode's tile loop and the frame
 writer's inner loop are untouched, and the decode's per-chunk boundary lines are
-bounded by the chunk count, which is bounded by the frame count. The line is
-formatted only when the emitter is enabled, so `VLLM_RENDER_PROGRESS=0` costs one
-`getenv` per process.
+bounded by the chunk count, which is bounded by the frame count.
+
+**`VLLM_RENDER_PROGRESS=0` costs one `getenv` per process, and that took a second
+edit to become true.** `ProgressEnabled()` caches the read and `Tick` returns on
+its first line, but the `detail` argument is built by the CALLER and was built
+unconditionally: a `std::string` from a literal, three `std::to_string`s and four
+concatenations, per DiT forward. Against a 162 s forward the magnitude is
+nothing; the sentence was still false as written, and a cost claim that is false
+in the small is the shape that gets quoted in the large. The call site now asks
+`phase::ProgressEnabled()` before it formats anything, which is why that function
+is declared in the header instead of living in an anonymous namespace.
 
 ### Gate
 

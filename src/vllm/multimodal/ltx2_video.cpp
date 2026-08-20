@@ -4000,11 +4000,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         // `n_full_steps`, so on that arm the step number is the DENOISER's index
         // and not a monotone loop counter. The forward counter is the monotone
         // one, which is why the progress claim rests on it.
-        ::vllm::multimodal::phase::Tick(
-            "dit forward", im.trace.dit_forwards + 1,
-            "phase " + std::to_string(phase_index) + " step " +
-                std::to_string(step_index + 1) + "/" +
-                std::to_string(static_cast<int64_t>(sigmas.size()) - 1));
+        //
+        // GUARDED AT THE CALL SITE, not only inside `Tick`. `Tick` returns on
+        // its first line when the lane is off, but `detail` is already built by
+        // then: one `std::string` from a literal, three `std::to_string`s and
+        // four concatenations, per forward. Negligible against 162 s and not
+        // zero, and the spec claims `VLLM_RENDER_PROGRESS=0` costs one `getenv`
+        // per process — which is true only with this `if` here.
+        if (::vllm::multimodal::phase::ProgressEnabled()) {
+          ::vllm::multimodal::phase::Tick(
+              "dit forward", im.trace.dit_forwards + 1,
+              "phase " + std::to_string(phase_index) + " step " +
+                  std::to_string(step_index + 1) + "/" +
+                  std::to_string(static_cast<int64_t>(sigmas.size()) - 1));
+        }
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
                                                 im.compute_dtype)

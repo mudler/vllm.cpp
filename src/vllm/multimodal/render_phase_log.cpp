@@ -77,6 +77,10 @@ bool StderrEnabled() {
 // READ ONCE. This is consulted at every phase boundary and every DiT forward, so
 // a `getenv` per call would put a process-environment lookup inside the
 // instrument whose cost this row claims is negligible.
+}  // namespace
+
+// Defined outside the anonymous namespace because the LTX-2.5 call site has to
+// ask BEFORE it formats `detail`; see the declaration in the header.
 bool ProgressEnabled() {
   static const bool on = []() {
     const char* off = std::getenv("VLLM_RENDER_PROGRESS");
@@ -84,8 +88,6 @@ bool ProgressEnabled() {
   }();
   return on;
 }
-
-}  // namespace
 
 struct PhaseLog::Impl {
   mutable std::mutex mu;
@@ -214,6 +216,13 @@ void PhaseLog::SetDeviceProbe(DeviceByteProbe probe) {
 void PhaseLog::SetRender(int64_t render) {
   std::lock_guard<std::mutex> lock(impl_->mu);
   impl_->render = render;
+  // The per-unit tick clock belongs to ONE generation. A process that renders
+  // twice calls this between them, and carrying `last_tick` across would give
+  // the second render's first DiT forward a `last=` measuring the gap between
+  // two renders — a number that looks exactly like a very slow forward. `Begin`
+  // and `Reset` clear it for the same reason; this is the third door into a new
+  // timeline and it was the one left open.
+  impl_->last_tick.clear();
 }
 
 double PhaseLog::Elapsed() const {

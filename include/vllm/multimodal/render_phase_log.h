@@ -191,6 +191,18 @@ void SampleNow();
 // exists so an A/B over what the emitter itself costs runs on ONE binary, and
 // nothing in this tree sets it.
 
+// Whether the live lane is on for this process. Read once, from
+// `VLLM_RENDER_PROGRESS`, and cached.
+//
+// PUBLIC BECAUSE A CALLER HAS TO BUILD `detail` BEFORE IT CAN PASS IT. `Tick`
+// returns immediately when the lane is off, but the argument is already built by
+// then — a `std::string` and three `std::to_string`s per DiT forward at the
+// LTX-2.5 call site. That is negligible against a 162 s forward and it is not
+// nothing, so the claim "`VLLM_RENDER_PROGRESS=0` costs one `getenv` per
+// process" is only true if the call site skips the formatting too. This is how
+// it does that.
+bool ProgressEnabled();
+
 // One progress line for the `index`-th occurrence of a repeating unit of work.
 // The emitter appends the elapsed clock and `last=`, the seconds since the
 // previous tick of the SAME unit, which is the per-forward cost #1375 could
@@ -202,6 +214,31 @@ void SampleNow();
 // flight when the run stopped. The cost is that the last unit of a completed
 // run has no line of its own, and its duration is inside the enclosing phase's
 // close line.
+//
+// AND SAY WHAT THE GATE CAN SEE OF THAT, because the choice is presented above
+// as though it were checked. On a render that COMPLETES the two placements are
+// indistinguishable end to end: same ticks, same intervals, same ordering
+// relative to the phase boundaries. Moving the production call below the forward
+// leaves `test_ltx2_video` green. The two differ only on a run that dies inside
+// a unit, which no gate here can stage through the ABI. What IS gated is this
+// function's own contract — that the line reaches fd 2, FLUSHED, before the
+// caller's next statement runs, so that a `SIGKILL` between the two leaves the
+// announcement behind (`a live tick is FLUSHED BEFORE the work it announces`).
+// The production placement rests on that contract plus a reading of the call
+// site, and this comment is the whole of the evidence for it.
+//
+// `last=` IS KEYED BY `unit`, and the key's lifetime is the RENDER. The map is
+// cleared by `Begin`, by `Reset` and by `SetRender`, so the first tick of each
+// generation has no `last=` rather than one spanning the gap since the previous
+// generation ended. Two units ticking in the same phase keep independent clocks.
+//
+// THE LINE IS WRITTEN UNDER THE PROCESS-WIDE PHASE MUTEX — the same one the
+// 100 ms sampler thread takes. So the cost of a tick is a held global lock plus
+// a flushed `fwrite`, not a bare `fprintf`, and a tick can briefly block a
+// sample. That is the price of emitting the interval and the elapsed clock from
+// the same guarded state the table is built from; at this lane's cadence
+// (~110 lines per render) it is not a contention story, and it is written down
+// here rather than left to be discovered from a profile.
 void Tick(const std::string& unit, int64_t index, const std::string& detail);
 
 

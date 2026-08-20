@@ -17,6 +17,7 @@
 // the pipeline resolved, that every value is finite, that the artifacts exist at
 // the sizes the result reports, and that every refusal fires by name.
 #include "vllm/multimodal/ltx2_video.h"
+#include "vllm/multimodal/render_phase_log.h"
 
 #include <doctest/doctest.h>
 
@@ -3039,6 +3040,130 @@ TEST_CASE("ltx2 video: a render through the ABI PRINTS its progress while it run
   vllm_video_engine_free(engine);
 }
 #endif  // !_WIN32
+
+// ─── the tick's OWN contract: emitted at the call, not at the return ────────
+//
+// WHY THIS CASE EXISTS. The case above renders through the ABI and asserts that
+// the ticks appear, that the counter moves and that they sit inside `denoise`.
+// It cannot see the decision the design rests on. On a render that COMPLETES,
+// calling `Tick` before the forward and calling it after produce the same lines,
+// the same intervals and the same ordering against the phase boundaries — moving
+// the production call below the forward leaves that case green. The two
+// placements differ only on a run that dies mid-unit, and no gate here can stage
+// a `SIGKILL` inside `Ltx2DitForwardDevice` through `vllm.h`.
+//
+// So this pins the half that IS testable, which is the half the production
+// placement rests on: `Tick` reaches the real fd 2 and FLUSHES before the
+// caller's next statement runs. If the line were buffered, or emitted lazily, or
+// deferred to the end of the phase, then announcing a unit before starting it
+// would buy nothing — the announcement would die in the buffer with the process.
+// Below, a fake unit of work writes its own marker to the same stream, and the
+// tick has to be there first every time.
+//
+// AND THE SHAPE THAT MATTERS IS THE LAST ONE. The loop announces unit 4 and then
+// stops without finishing it, which is what a killed render looks like from
+// stderr: the log's last word is the unit that was in flight. Under an
+// after-the-work emitter that capture would end at unit 3, and #1375 would still
+// be un-attributed.
+//
+// Nothing between the redirect and its restore may assert, for the reason the
+// case above gives: a `REQUIRE` that aborted in there would leave every later
+// case writing stderr into a temporary file.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 phase log: a live tick is FLUSHED BEFORE the work it announces") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+
+  const int kFinished = 3;  // units 1..3 complete; unit 4 is announced and never does
+  std::string captured;
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    for (int k = 1; k <= kFinished; ++k) {
+      phase::Tick("unit", k, "step " + std::to_string(k) + "/4");
+      // The work. It writes its own marker to the SAME stream, so the ordering
+      // question is answered by the bytes rather than by a clock.
+      std::fprintf(stderr, "[work] unit %d finished\n", k);
+      std::fflush(stderr);
+    }
+    // Announced, then the "process dies" here. No marker follows.
+    phase::Tick("unit", kFinished + 1, "step 4/4");
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+  log.Reset();
+
+  MESSAGE("captured " << captured.size() << " bytes of stderr from the tick contract case");
+  REQUIRE_MESSAGE(!captured.empty(), "phase::Tick emitted nothing at all");
+
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+      if (line.rfind("[work] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  auto index_of = [&lines](const std::string& needle) -> long {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+    }
+    return -1;
+  };
+
+  // Each announcement precedes the work it announces. `std::string` and never a
+  // `char*` in a stream: doctest stringifies a streamed `char*` as a bool.
+  for (int k = 1; k <= kFinished; ++k) {
+    const std::string tick = "unit " + std::to_string(k) + " ";
+    const std::string work = "[work] unit " + std::to_string(k) + " finished";
+    const long at_tick = index_of(tick);
+    const long at_work = index_of(work);
+    CHECK_MESSAGE(at_tick >= 0, "no tick line for unit " << k);
+    CHECK_MESSAGE(at_work >= 0, "no work marker for unit " << k);
+    CHECK_MESSAGE(at_tick < at_work,
+                  "the tick for unit " << k << " was not flushed before the work it announces");
+  }
+
+  // The killed-run shape: unit 4 was announced, never finished, and the capture
+  // still names it — and names it LAST.
+  const long announced = index_of("unit 4 ");
+  CHECK_MESSAGE(announced >= 0,
+                "the unit that was in flight when the run stopped is missing from the log, "
+                "which is what an after-the-work emitter produces");
+  CHECK_MESSAGE(index_of("[work] unit 4 finished") < 0,
+                "the case did not stage an unfinished unit, so it proves nothing");
+  REQUIRE(!lines.empty());
+  CHECK_MESSAGE(lines.back().find("unit 4 ") != std::string::npos,
+                "the last line of the capture is not the unit in flight: " << lines.back());
+
+  // `last=` is the per-unit interval, absent on the first tick by construction
+  // and present on every one after it.
+  const long first = index_of("unit 1 ");
+  REQUIRE(first >= 0);
+  CHECK(lines[static_cast<size_t>(first)].find(" last=") == std::string::npos);
+  const long second = index_of("unit 2 ");
+  REQUIRE(second >= 0);
+  CHECK_MESSAGE(lines[static_cast<size_t>(second)].find(" last=") != std::string::npos,
+                "the second tick of a unit carries no interval: "
+                    << lines[static_cast<size_t>(second)]);
+}
+#endif  // !_WIN32
+
 
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────
 //

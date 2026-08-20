@@ -493,17 +493,24 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
   GREEN here while its sibling D11 (drop it from both) is RED.
   `Ltx2VideoEngine::Load` refuses `device != 0` where no accelerator backend is
   registered and no CI job here has a GPU runner, so this is a missing RUNNER and
-  not a missing test. Owned by this row. Closes on one leased run of `one_stage`
+  not a missing test. **Two halves, and §12.8 now separates them.** A synthetic
+  unified-memory accelerator would close the SOFTWARE half — the parts exist, it
+  costs a new test executable plus a staged fixture DiT, and it is deferred on
+  cost rather than rejected on impossibility. A GPU closes the HARDWARE half, and
+  nothing else can. Owned by this row. Closes on one leased run of `one_stage`
   on `device = 1` at the model's own guider defaults recording
   `dit_forwards == 4 * dit_evaluations`. The same shape
   [#1131](https://github.com/mudler/vllm.cpp/issues/1131) records for
   MiniMax-Music3.
-- **The 2.0x forward-count cost of §12.5, unmeasured on hardware.** 120 forwards
-  where [#1375](https://github.com/mudler/vllm.cpp/issues/1375) measured 60, at
-  ~162 s/forward on GB10 at 1024x576. Arithmetic, not a measurement: nothing here
-  ran it. Closes with the same leased run #1426 needs, and
+- **The WALL-CLOCK cost of §12.5, unmeasured on hardware.** The forward COUNT is
+  exact — 120 where [#1375](https://github.com/mudler/vllm.cpp/issues/1375)
+  measured 60 — and needs no lease. The **2.0x is an UPPER BOUND**, because it
+  prices all four passes at #1375's `cond` cost while `ptb` and especially `mod`
+  do strictly less work (§12.5). The true figure is above 1.5x and below 2.0x and
+  nothing here ran it. Closes with the same leased run #1426 needs, and
   [#1413](https://github.com/mudler/vllm.cpp/issues/1413)'s per-forward `last=`
-  tick supplies the duration directly (§12.10).
+  tick supplies the PER-PASS duration directly (§12.10), which is what separates
+  the bound from the number.
 - **The other four pipelines** — `a2vid_two_stage`, `ti2vid_two_stages`
   ([#1093](https://github.com/mudler/vllm.cpp/issues/1093)),
   `ti2vid_two_stages_hq` (#921),
@@ -519,7 +526,12 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
 - **An oracle-run comparison.** vLLM-Omni is UNPINNED (#633) and carries no
   LTX-2.5 recipe; no LTX-2.5 checkpoint here has a recorded sha256 (#1048). The
   guidance arithmetic is gated against upstream **source**, not against upstream
-  **output**, and that is the ceiling on this row's evidence.
+  **output**, and that is the ceiling on this row's evidence. Sharper than it
+  read: the source this row cites is `Lightricks/LTX-2` at `fd4ded7f`, a THIRD
+  repository with no registry row, no `.agents/oracles/` file and no pin at all —
+  filed as [#1433](https://github.com/mudler/vllm.cpp/issues/1433) and owned by
+  `MODEL-DIFFUSION-LTX25`, because adding a row to the `AGENTS.md` oracle table
+  is a policy edit.
 
 ## 10. What the implementation actually did, against §4
 
@@ -752,6 +764,30 @@ sequential chunks internally" (`denoisers.py:66-70`). This port runs the passes
 sequentially at batch 1, which is that shape. Nothing is shared and nothing is
 lost.
 
+**And batch 1 is upstream's OWN DEFAULT, not a degenerate case of it.** Every
+shipped pipeline declares `max_batch_size: int = 1` — `ti2vid_one_stage.py:149`,
+`ti2vid_two_stages.py:176`, `ti2vid_two_stages_hq.py:191`,
+`keyframe_interpolation.py:164`, `a2vid_two_stage.py:162`,
+`t2a_one_stage.py:120`, `retake.py:170` — and the shared denoise helper both
+declares the same default and ALWAYS wraps the transformer in the adapter:
+`wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)`
+(`utils/blocks.py:514`, `:565`). So an unflagged upstream run splits the batched
+call back into one forward per pass before the transformer sees it. Two
+consequences the earlier argument left on the table:
+
+- **`all_in_batch` IS the per-pass flag at batch 1.** It reduces to
+  `(block_masks[type, block] == 0).all()` over the batch dimension
+  (`perturbations.py:130-132`), so with one sample it is that sample's own bit.
+- **The partial blend is unreachable at upstream's default.** The three-way
+  self-attention path is selected by `(any_in_batch and not all_in_batch)`
+  (`transformer_args.py:99-102`), which is false for every single-sample batch,
+  and `attention.py:573`'s `out * mask + v * (1 - mask)` never runs.
+
+So this port's all-or-nothing `all_perturbed` is upstream's EXECUTING path on
+its own defaults, and the unported partial blend is an arm that upstream's
+shipped configurations do not enter. That is a stronger claim than "degenerate at
+batch 1" and it is the one the anchors support.
+
 ### 12.4 Design
 
 **One parameter, mirroring the host signature.**
@@ -801,13 +837,36 @@ arm refuses with the same text.
 
 ### 12.5 Cost, stated before it is discovered
 
-**Forward count.** `#1375` measured 60 forwards as structural for a 30-step
-`one_stage` render: 30 steps x 2, cond + uncond, because the refusal pinned the
-other two guiders to identity. With the model's own defaults every step assembles
-all four passes (`denoisers.py:100-137`), so the same render becomes **30 x 4 =
-120 forwards**. At the ~162 s/forward that run measured on GB10 at 1024x576 that
-is ~5.4 h of denoise where it was ~2.7 h — **2.0x**, not the 1.5x a third leg
-alone would cost.
+**Forward count is EXACT. Wall clock is an UPPER BOUND.** `#1375` measured 60
+forwards as structural for a 30-step `one_stage` render: 30 steps x 2, cond +
+uncond, because the refusal pinned the other two guiders to identity. With the
+model's own defaults every step assembles all four passes
+(`denoisers.py:100-137`), so the same render becomes **30 x 4 = 120 forwards**.
+That count is exact, it is derived from upstream's own pass list, and it is the
+quantity this row changes.
+
+The wall clock is not exact, and the arithmetic below it does not measure what it
+looks like it measures. Pricing all four passes at the ~162 s/forward `#1375`
+measured on GB10 at 1024x576 gives ~5.4 h of denoise where it was ~2.7 h. That
+number is **at most 2.0x**, not 2.0x, because `#1375` timed a `cond` pass and two
+of the four passes do strictly less work than a `cond` pass does:
+
+- **`ptb` is close to full price.** At the `one_stage` defaults `stg_blocks =
+  {29}` is ONE block (`ltx2_pipeline.cpp:955,961`), and in that one block the
+  perturbed self-attention skips `to_q`, `to_k` and the attention itself and
+  keeps only `to_v` (`attention.py:556-565`). One block's partial saving against
+  a whole DiT rounds to nothing.
+- **`mod` is materially cheaper.** Its two perturbations carry `blocks=None`
+  (`denoisers.py:125-138`), and `blocks=None` means EVERY block
+  (`perturbations.py:24`, `is_perturbed` at `:26-33`), so `mod` skips BOTH
+  cross-modality directions — `audio_to_video_attn` and its V2A twin,
+  `transformer.py:335`, `:367` — in every block of the forward.
+
+So the true multiplier is above 1.5x and below 2.0x, and **nobody has measured
+it**: this host has no accelerator and the only per-forward number in the record
+is `#1375`'s `cond` cost. Quote the count, not the wall, until a leased run
+prices a `ptb` and a `mod` pass separately. A render planned off 5.4 h is planned
+off a ceiling, and 2.0x has already been repeated as if it were measured.
 
 This is upstream's own default and correctness comes first, so it is not traded
 away. The two extras that were the workaround remain the way to buy the time
@@ -930,6 +989,11 @@ explicitly barred from taking a lease. So the ternary that selects
 `Ltx2DitForwardDevice` over `Ltx2DitForward` always takes its second branch here,
 and D10 — which drops `p` from the first branch alone — is GREEN.
 
+"Not executable here" means in THIS binary as it is built. A dedicated test
+executable that registers its own accelerator could enter that branch, and the
+closing paragraph of this section says what that would take and what about it is
+still unverified. It is deferred on cost, not closed on impossibility.
+
 **Stated as a result, not as an omission.** Mutation D10 — delete `p` from the
 device branch of the x0 model's ternary — is **GREEN** here (exit 0, 88 cases /
 2755 assertions), and it is green for lack of hardware rather than for lack of a
@@ -939,7 +1003,7 @@ test. Its sibling D11, which deletes `p` from BOTH branches, is **RED** (exit 1,
 | Link | What it is | Gated by |
 |---|---|---|
 | A | entry point -> the x0 model, carrying `p` | the end-to-end `one_stage` guidance case, which enters through `LoadVideoEngine` + `Generate` — what `include/vllm.h`'s `vllm_video_engine_load`, the server and `ltx2-gen` all reach (`test_ltx2_video.cpp:365-372`). Mutation D11 deletes `p` from the lambda's argument list and it is RED. |
-| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **nothing on this host.** The residual, and it is ONE branch of one ternary whose other branch link A gates. |
+| B | the x0 model -> `Ltx2DitForwardDevice(..., p)` | **nothing in this binary.** The residual, and it is ONE branch of one ternary whose other branch link A gates. A dedicated executable with a synthetic accelerator could gate it; see the closing paragraph. |
 | C | `Ltx2DitForwardDevice` honours `p` | T1, T2, T3 — new, and RED before this change (D1-D9) |
 
 **D11 is the reachability mutation this row can run, and it is RED.** Deleting
@@ -955,35 +1019,81 @@ branches leaves the lambda parameter unused. That is a compiler diagnostic and n
 a gate, so D11 is run in the form that BUILDS — otherwise the mutation reads
 exactly like a passing test.
 
-**One approach was considered and REJECTED, recorded so the next reader does not
-re-derive it.** A synthetic accelerator — a `vt::Backend` reporting
-`UnifiedMemory() == true` and registered from a static initializer — would get
-every `vt::` op for free through `RegisterReferenceTier`
-(`op_provider.h:220-233`), which installs the CPU kernel on any unified-memory
-device at `kReferenceTierPriority`. It would make `im.on_device` true, enter the
-first branch, and turn D10 RED. Three measured facts close it:
+**A synthetic accelerator is DEFERRED, not impossible.** The first draft of this
+paragraph closed it on three numbered facts. One of them — the closed enum — is
+true and is not a blocker. The other two are FALSE against the source, and they
+carry three separate false claims between them. They are corrected below rather
+than deleted, because a wrong reason is worse than an open item: the next reader
+would trust it and not build the instrument. What the source actually says,
+re-read at this head:
 
-1. **`vt::DeviceType` is a closed 7-value enum** (`device.h:16-28`) with no spare
-   slot, so a synthetic device has to impersonate a real vendor — `kXPU`,
-   `kVULKAN` — and every `CurrentPlatform()` answer in the binary changes with
-   it. `test_ltx2_video`'s "device 1 runs on the resolved accelerator, refused by
-   name without one" would silently take its other branch, on a file with a
-   recorded 88-case baseline.
-2. **The `kLtx2` glue table has no public registration API.** `Ltx2Device` and
-   `Ltx2DeviceKernelsAvailable` (`ltx2_kernels.h:149-151`) are readers; the
-   tables are registered inside each backend's own translation unit. `Glue()`
-   returns `nullptr` for an unregistered type and the forward dereferences it.
-   The reference tier covers `vt::` ops and not this table.
-3. **It would prove the predicate, not the residency.** The dispatch is
-   `im.on_device`, set from `params.device != 0`. A fake device satisfies that
-   predicate while running the CPU kernels — which is exactly the substitution
-   `ltx2_video.cpp:749-758` refuses BY NAME, on the ground that serving the CPU
-   forward behind an accelerator handle makes every later "it ran on the GPU"
-   claim false. A gate built on it would measure the label.
+1. **The `kLtx2` glue table HAS a public registration API.**
+   `vt::RegisterOp(OpId, DeviceType, void*)` is declared at
+   `include/vt/op_provider.h:127` and is documented there as
+   `RegisterOpProvider` at `kNativeProviderName` and priority 0 — a NATIVE
+   registration. It is exactly the call `src/vt/cpu/cpu_ltx2.cpp:201-205` makes
+   to install `&kKernels` for `kCPU`. `OpId::kLtx2` is public and
+   `ltx2_device_resolve.cpp:11,15` already names it, so a test can read the CPU
+   table back with `vt::GetOp(OpId::kLtx2, kCPU)` and register that same pointer
+   for a second device type.
+2. **`Glue()` does not return `nullptr`.**
+   `src/vllm/model_executor/models/ltx2_device.cpp:81-86` `VT_CHECK`s
+   `Ltx2DeviceKernelsAvailable` and refuses BY NAME. There is no null for the
+   forward to dereference, so the failure mode the first draft named does not
+   exist.
+3. **`RegisterReferenceTier` is not `vt::`-op-specific.**
+   `src/vt/op_provider.cpp:795-807` loops `for (size_t o = 0; o < kOpCount; ++o)`
+   over EVERY OpId, and `MaybeInstallReferenceTier` (`:204-225`) copies
+   `src->fn` verbatim with no op-kind discrimination — and `kLtx2`'s CPU `fn` IS
+   the table pointer. What the tier does NOT do is satisfy this seam's own
+   predicate: `Ltx2DeviceKernelsAvailable` reads `vt::OpRegistered`, which
+   EXCLUDES the reference tier deliberately and by name
+   (`op_provider.cpp:677-701`, "a FALLBACK, not a native kernel"). So the tier
+   is the route for the `vt::` ops the staging and the forward need, and the
+   direct `RegisterOp` of point 1 is the route for the glue table. Neither alone
+   is enough. That is a design fact the next reader should have, not a reason to
+   stop.
+
+**The ENUM argument is true and is not a blocker.** `vt::DeviceType`
+is a closed 7-value enum (`include/vt/device.h:16-28`), so a fake must
+impersonate a real vendor and would flip every `CurrentPlatform()` answer in the
+binary. The tree already solved that, for this same family:
+`tests/vllm/multimodal/test_diffusion_device_seam.cpp` is a SEPARATE EXECUTABLE
+for exactly this reason (`:19-23`, `tests/CMakeLists.txt:317`), and it already
+registers a `FakeXpuBackend` whose `UnifiedMemory()` returns true (`:60-73`), a
+platform in the XPU AND CUDA slots (`:116-121`), and a `device = 1` load of
+`kLtx2VideoFamily` itself (`:127-133`). A separate executable leaves
+`test_ltx2_video`'s 88-case baseline byte-for-byte untouched, which is the whole
+of what that argument was protecting.
+
+**The PREDICATE argument charges one measurement for another.** "It would prove
+the predicate, not the residency" conflates link B with hardware residency. Link B as
+the table above DEFINES it is "the x0 model -> `Ltx2DitForwardDevice(..., p)`",
+and a fake accelerator DOES execute that call and would turn D10 RED. What a fake
+cannot prove is that a GPU runs it. Both halves are owed; they are not the same
+measurement, and `ltx2_video.cpp:749-758` refuses the substitution for the
+SECOND one.
+
+**What it would cost, and what is NOT verified.** A new test executable, for the
+enum reason above, plus a fixture DiT staged through the fake unified-memory
+backend — `tests/vllm/multimodal/ltx2_video_fixture.h` already writes a complete
+reduced model. Two of the `Load` gates on that route were checked while writing
+this and PASS by construction: `vt::RegisterBackend(kXPU, ...)` writes slot 0
+(`src/vt/backend.cpp:81-84`), so the third check's `TryGetBackend(Device{kXPU,
+0})` at `ltx2_video.cpp:800` resolves for `params.device = 1`; and
+`vt::CreateQueue(Device)` takes its `entry.backend->CreateQueue()` arm
+(`backend.cpp:146-153`), whose `q.device == device` assertion the fake already
+satisfies. What is NOT verified is whether `Ltx2StreamDitToDevice`
+(`ltx2_video.cpp:847`) stages the checkpoint onto that queue, and whether the
+bf16 render that follows (`im.compute_dtype = kBF16`, `:812`) completes through
+the reference tier. **Nobody has built this. The route is PLAUSIBLE, not
+proven**, and stating it as proven would be the same defect as the three claims
+above, one confident sentence in the other direction.
 
 So link B stays open and owned by
-[#1426](https://github.com/mudler/vllm.cpp/issues/1426) rather than closed by an
-instrument that answers a different question.
+[#1426](https://github.com/mudler/vllm.cpp/issues/1426) — on the cost of the
+instrument and on those two unknowns, NOT on an impossibility, and NOT on the
+three facts the first draft asserted.
 
 Link C is what did not exist at all before this section, and it is the whole of
 what a box without a GPU can hold. Link B is one argument in one ternary whose

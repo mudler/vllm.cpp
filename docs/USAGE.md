@@ -1416,13 +1416,17 @@ trajectory the weights were never trained for. Their guiders are upstream's
 positive-only one, so they still issue one forward per step and their output is
 unchanged by this row.
 
-**All four passes run on the accelerator too, and that doubles the render.**
-`Ltx2DitForwardDevice` took no perturbation argument until 2026-08-19, so
-`device = 1` refused the perturbed and isolated-modality passes rather than run
-them unperturbed with both terms at zero. It takes one now, and the refusal is
-gone. What replaces it is a cost: at the model's own guider defaults a step
+**All four passes run on the accelerator too, and that costs up to twice the
+render.** `Ltx2DitForwardDevice` took no perturbation argument until 2026-08-19,
+so `device = 1` refused the perturbed and isolated-modality passes rather than
+run them unperturbed with both terms at zero. It takes one now, and the refusal
+is gone. What replaces it is a cost: at the model's own guider defaults a step
 assembles four forwards on `device = 1` where it assembled two, so a 30-step
-render is 120 forwards rather than 60 — about **2.0x** the denoise time.
+render is **120 forwards rather than 60**. That count is exact. The denoise TIME
+is **at most 2.0x** and no measurement of it exists — two of the four passes do
+less work than the two that were already running, because the isolated-modality
+pass skips both cross-modality attentions in every block. Plan against 2.0x as a
+ceiling, not as an estimate.
 `--video-stg-guidance-scale 0 --audio-stg-guidance-scale 0 --a2v-guidance-scale 1
 --v2a-guidance-scale 1` buys that back and is the trajectory the accelerator arm
 had before, at the cost upstream's defaults are there to avoid.

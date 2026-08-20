@@ -12,8 +12,9 @@ implementation use that pull request. The operator can merge the verified
 documentation-only pull request without waiting for continuous integration.
 
 W1 is complete. The migration manifest accounts for 275 campaign-base H1, H2,
-and H3 headings. W2 establishes the directories, indexes, and generic usage
-path.
+and H3 headings. W2 adds the public directory indexes and places the generic
+CLI, server, C ABI, and C++ paths before a temporary legacy-reference boundary.
+The legacy body remains in place for the W3 to W5 migrations.
 
 This work ID is a claim and branch identifier. It is not a new lifecycle row in
 the engine matrix. Roadmap campaign `A6` owns this documentation unit. Issue

@@ -1,5 +1,133 @@
 # Using vllm.cpp
 
+Use this page for the common ways to run vllm.cpp. Model-specific commands and
+specialized tasks have separate indexes below.
+
+## Before you run a model
+
+Build vllm.cpp before you use these commands. See [Building
+vllm.cpp](BUILD.md) for CPU, CUDA, Metal, Vulkan, ROCm, and Tenstorrent build
+instructions.
+
+The examples use `/path/to/model` for a local model directory. Replace that
+path with a compatible checkpoint for the workflow you select.
+
+## Run a local completion
+
+Run one completion with `vllm-cli`:
+
+```sh
+build/examples/vllm-cli \
+  --model /path/to/model \
+  --prompt "The capital of France is" \
+  --max-tokens 64
+```
+
+Run `build/examples/vllm-cli --help` to list the flags in your build.
+
+## Start the OpenAI-compatible server
+
+Start the server with a local model directory:
+
+```sh
+build/examples/vllm-server \
+  --model /path/to/model \
+  --port 8000 \
+  --max-num-seqs 32
+```
+
+Send a completion request from another terminal:
+
+```sh
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","prompt":"The capital of France is","max_tokens":64}'
+```
+
+The server also supports OpenAI clients that use
+`http://localhost:8000/v1` as their base URL. The model-specific guides record
+extra files and launch flags when a model needs them.
+
+## Use the C ABI
+
+Link `libvllm` and include [`include/vllm.h`](../include/vllm.h). The public
+header defines the complete C ABI. This example shows the blocking completion
+shape:
+
+```c
+#include "vllm.h"
+
+vllm_model_params model = vllm_model_params_default();
+model.model_path = "/path/to/model";
+
+vllm_engine *engine = NULL;
+if (vllm_engine_load(&model, &engine) != VLLM_OK) {
+    fprintf(stderr, "%s\n", vllm_last_error());
+    return 1;
+}
+
+vllm_sampling_params sampling = vllm_sampling_params_default();
+sampling.max_tokens = 64;
+
+vllm_completion output;
+if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLLM_OK) {
+    printf("%s\n", output.text);
+    vllm_completion_free(&output);
+}
+vllm_engine_free(engine);
+```
+
+## Use the C++ library
+
+The C++ headers live under [`include/vllm/`](../include/vllm/). Load a model
+directory through `LoadedEngine`, which gives you the engine used by the
+server:
+
+```cpp
+vllm::entrypoints::EngineParams params;
+params.enable_prefix_caching = true;
+params.policy = vllm::SchedulerPolicy::kLPM;
+auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, params);
+```
+
+See [`entrypoints/model_loader.h`](../include/vllm/entrypoints/model_loader.h),
+[`v1/engine/llm_engine.h`](../include/vllm/v1/engine/llm_engine.h), and
+[`v1/engine/async_llm.h`](../include/vllm/v1/engine/async_llm.h) for the public
+types.
+
+## First-line troubleshooting
+
+- Run the executable with `--help` and confirm that you are using the expected
+  build directory.
+- Check [Environment variables](ENVIRONMENT.md) for settings that can override
+  command-line or configuration values.
+- Check [Features](FEATURES.md) for the current backend and model surface.
+- Read the matching model or task guide before you add model-specific flags.
+- If startup fails, use the exact error text to find the refused file, option,
+  operation, or checkpoint arm in the focused guides.
+
+## Find a focused guide
+
+[Task guides](guides/README.md) cover workflows that apply to more than one
+model family, including offload, compatibility, and backend-specific use.
+
+## Find a model recipe
+
+[Model recipes](models/README.md) route you to commands, required weights, and
+known limits for each model family.
+
+## Look up interface details
+
+[Reference pages](reference/README.md) collect dense lookup material such as
+build settings, environment variables, feature state, and release artifacts.
+
+## Temporary legacy reference
+
+The remaining sections preserve the previous usage reference while the
+campaign moves each model, guide, and reference topic to its public home.
+
+<!-- legacy-reference:begin -->
+
 The complete surface: the CLI, the OpenAI-compatible server, and the library
 (C ABI and C++). The [README](../README.md) carries the quickstart; this page is
 the reference behind it. Per-capability lifecycle state is

@@ -11,8 +11,8 @@ oracle), *speed-pending* (correct, throughput work in progress), *build-only*
 (compiles for a target with no runtime proof here), and *hardware-blocked*
 (cannot run on the hardware available).
 
-Chronology and raw evidence live in the structured
-[state manifest](../.agents/state.csv), immutable events,
+Chronology lives in Git history. Raw evidence lives in the
+[archived state events](../.agents/completed/state-events/),
 [parity ledger](../.agents/parity-ledger.md), area matrices, and
 [docs/BENCHMARKS.md](BENCHMARKS.md). This file keeps one binding current-state
 line per capability, not a run log.

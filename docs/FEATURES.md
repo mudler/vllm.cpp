@@ -310,7 +310,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | OpenAI speech generation `/v1/audio/speech` (createSpeech shape) | ◐ route + ABI live, opt-in behind `--speech-model`; `lyrics` + `description` are extra named fields for a music family; 20 unsupported keys refused by name; every key read at the top level and under `extra_params` | ◐ (vllm-omni) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
 
-#### C-ABI capability coverage <!-- abi-capability-table:begin -->
+### C-ABI capability coverage <!-- abi-capability-table:begin -->
 - Which capabilities an embedder drives through the flat C ABI (`include/vllm.h`, the only installed header), gated by `scripts/check-surface-coverage.py`: a `reachable` row names an entry point that exists; an `embedder-unreachable` row is tracked in `scripts/abi-capability-allowlist.txt` against its fold row (`ARCH-ONE-SURFACE`). The ABI is text-generation-complete; the one `embedder-unreachable` row (multimodal input) is the open capability gap.
 
 | Capability | C-ABI surface | Embedder-reachable |

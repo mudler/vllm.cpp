@@ -29,9 +29,11 @@ does not take.
 
 **This row's landed change took no GPU lease and performed no on-hardware run.**
 The fleet was contended. What that change establishes is the compile leg and the
-host-side dispatch decision. The first on-hardware run came later, under
-[#1437](https://github.com/mudler/vllm.cpp/issues/1437), and is recorded in
-§`## Owed`; that section states plainly what is and is not established after it.
+host-side dispatch decision. Two on-hardware runs came later, both under
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437) and both recorded in
+§`## Owed`: the first FAILED, and the second MATCHES the CPU reference on the
+seven shapes it was run on. That section states plainly what is and is not
+established after them, and the token gate is not.
 
 ## Which implementation actually runs, and why
 
@@ -270,10 +272,12 @@ kernel that, **at M5's landing**, had never executed. `docs/USAGE.md` and
 record.
 
 **SUPERSEDED, and the rest of this section is kept as the reasoning taken at M5
-rather than as a current description.** The kernel has since executed, on
-`dgx:gpu0`, and it FAILS -- see `## Owed` and
+rather than as a current description.** The kernel has since executed on
+`dgx:gpu0` twice. The first run FAILED; after the intervening repair it MATCHES
+the CPU reference on the shapes it was run on, with no token gate and no speed
+number -- see `## Owed` and
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437). Both pages were
-corrected in the change that recorded that run and no longer carry a
+corrected in the change that recorded each run and no longer carry a
 never-executed label, so any sentence below asserting that they do is history.
 The design decision itself is unchanged and is not being re-argued here.
 
@@ -293,14 +297,17 @@ The honest control is a LABEL rather than a flag, and the tree has one:
 and gencode-proven, never run on the board they target. That label remains
 correct for those two features. At M5's landing this arm was in the same state
 and was described in those words in `docs/USAGE.md`, `docs/FEATURES.md`, the
-commit body, the pull request body and `## Owed`. **It no longer is**: the run
-under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) moved it to RUN AND
-FAILING, and both pages now carry that instead. What made the label acceptable
-rather than reckless was that the first person to run it would get a written,
-registered test saying what to compare against and what the criterion is, instead
-of a kernel and a shrug. That is what happened, and the test is what produced the
-throw `## Owed` records -- so the control worked as designed even though the
-kernel did not.
+commit body, the pull request body and `## Owed`. **It no longer is**: the runs
+under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) took it first to
+RUN AND FAILING and then, once
+[#1453](https://github.com/mudler/vllm.cpp/pull/1453) had encoded the shape
+partition, to RUN AND MATCHING THE CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN
+ON, with no token gate. Both pages carry the second position. What made the label
+acceptable rather than reckless was that the first person to run it would get a
+written, registered test saying what to compare against and what the criterion
+is, instead of a kernel and a shrug. That is what happened twice over: the test
+produced the throw the first run recorded, and the same test produced the
+comparison the second one records.
 
 ### `check-cuda-op-arch-gate`: checked, and correctly NOT extended
 
@@ -328,7 +335,7 @@ TU present and that the new registration is the only one for its OpId.
 | the f32 sink is read as an f32 compute path | recorded above and in the TU's header comment; the collective is instantiated for bf16 only |
 | a grown workspace is freed while a captured graph still holds its pointer | `RetireGraphScratch`, the same discipline both sibling CUTLASS TUs use |
 | the counter advances on a call that then throws, overstating dispatch | incremented after `run` returns `kSuccess`, and G5 asserts the ordering by counting a refused call |
-| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it has been measured, and the same five surfaces now have to keep saying it FAILED and that no shape has been compared against the CPU reference |
+| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the same five surfaces now have to keep saying exactly how far that reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO token gate and NO speed number |
 
 ## Tests
 
@@ -431,11 +438,17 @@ builds it and a leased box runs it.
 | the arch gate | `python3 scripts/check-cuda-op-arch-gate.py` |
 | record | `scripts/agent-preflight.sh --fail-on-skip` |
 | **compile leg** | CI `cuda-fat-build`, which configures `120a;121a` among ten archs with `-DVLLM_CPP_CUTLASS_FETCH=ON` and audits per-source gencode |
-| **the on-hardware leg** | RUN 2026-08-20 on `dgx:gpu0` and FAILING, so this is not a passing gate. No command is named here because the run needs a lease and hardware this table cannot invoke. See `## Owed` and [#1437](https://github.com/mudler/vllm.cpp/issues/1437). |
+| **the on-hardware leg** | RUN TWICE on `dgx:gpu0`, both on 2026-08-20. At `63d87805c` it FAILED with two throws. At `7481a2eec`, which carries [#1453](https://github.com/mudler/vllm.cpp/pull/1453), the same suite run UNPATCHED reports 5 cases, 136 assertions, 0 failed, and zero reference-tier lines. No command is named here because the run needs a lease and hardware this table cannot invoke. See `## Owed` and [#1437](https://github.com/mudler/vllm.cpp/issues/1437). |
 
 ## Owed
 
-- ~~**No on-hardware run.**~~ **RUN, AND FAILING.** Measured 2026-08-20 on
+- ~~**No on-hardware run.**~~ ~~**RUN, AND FAILING.**~~ **RUN, AND MATCHING THE
+  CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN ON.** Two runs, both 2026-08-20, and the
+  second one is the current position: read the FIRST RUN and the ROOT CAUSE
+  below as the history that produced it, and `CONFIRMED ON HARDWARE` at the end
+  as where this row stands.
+
+  **FIRST RUN, AND FAILING.** Measured 2026-08-20 on
   `dgx:gpu0` (NVIDIA GB10, driver 580.173.02, compute capability 12.1) in an
   `rc` lease, at tree `63d87805c`, CUDA 13.0 Release,
   `-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_FETCH=ON`. The kernel
@@ -466,7 +479,9 @@ builds it and a leased box runs it.
   carries no `HasCuda()` guard and prints identically on a box with no device
   (8 grid entries x 3 `CHECK`, plus the 3 tile-config `CHECK`s); the
   device-only remainder is G8's **2** and G9's **5**. A pure skip of this file
-  prints 27.
+  printed 27 AT THAT TREE. #1453 later grew the host tier to 41, which is the
+  baseline the second run below is measured against; the two numbers describe
+  two trees and do not disagree.
 
   This is a WORSE position than the sentence it replaces, not a better one. The
   row was "unmeasured"; it is now "measured and failing". Tracked by
@@ -530,10 +545,13 @@ builds it and a leased box runs it.
   name and by message on a device-free host, G6 pins the grid's partition, and
   G2/G7 drive each unservable shape to its named refusal.
 
-  **THIS FIXES THE MESSAGE, NOT THE KERNEL.** The number of shapes on which this
-  kernel's output has been compared with the CPU reference is still ZERO. A user
-  on `sm_12xa` now gets a refusal that says which dimension and which
-  granularity instead of `Invalid`, and that is the whole of the improvement.
+  **AT THAT POINT THIS FIXED THE MESSAGE, NOT THE KERNEL.** The number of shapes
+  on which this kernel's output had been compared with the CPU reference was
+  still ZERO. A user on `sm_12xa` got a refusal that says which dimension and
+  which granularity instead of `Invalid`, and that was the whole of the
+  improvement. **That sentence is no longer the position** -- the second run
+  below is what closed it, and it is recorded here rather than deleted because
+  the repair and the measurement of the repair are two different events.
 
   **The capability gap this makes explicit.** DSV3's `kv_a_proj_with_mqa` is
   `N=576`, and this arm CANNOT serve it on sm120 -- not as a defect of this
@@ -545,19 +563,91 @@ builds it and a leased box runs it.
   `docs/FEATURES.md`'s block-wise FP8 row. Any model whose block-wise FP8
   projections are not all multiples of 128 wide is affected the same way.
 
-  What remains established is unchanged: the TU compiles for `sm_120a`/`sm_121a`
-  and the host-side dispatch decision is correct against upstream's source. What
-  is still NOT established is that the kernel produces the reference's numbers on
-  **ANY** shape. The only two cases that compare device output against the CPU
-  reference are G2 and G7, and both threw before their first assertion; G7's
-  sweep aborted at `Grid()[0]` -- the same M=32 N=576 K=7168 case, as its
-  `CAPTURE` output records -- so its remaining seven shapes, including the second
-  ragged-N entry M=8 N=576 K=1024, were never attempted. The one shape the kernel
-  did run to completion is G8's M=8 N=512 K=1024, and G8 compares a device f32
-  out against a device bf16 out, which is the kernel against itself and never
-  against `ReferenceBf16`. So the number of shapes on which this kernel's output
-  has been compared with the reference is ZERO, and that is a wider debt than the
-  refusal set.
+  What the first run left established was the compile leg and the host-side
+  dispatch decision. What it did NOT establish was that the kernel produces the
+  reference's numbers on **ANY** shape: the only two cases that compare device
+  output against the CPU reference are G2 and G7, and both threw before their
+  first assertion; G7's sweep aborted at `Grid()[0]` -- the same M=32 N=576
+  K=7168 case, as its `CAPTURE` output records -- so its remaining shapes,
+  including the second ragged-N entry M=8 N=576 K=1024, were never attempted.
+  The one shape the kernel ran to completion was G8's M=8 N=512 K=1024, and G8
+  compares a device f32 out against a device bf16 out, which is the kernel
+  against itself and never against `ReferenceBf16`. **That debt is what the
+  second run closed.**
+
+  **CONFIRMED ON HARDWARE, AND THE ZERO-COMPARISON DEBT IS CLOSED.** Measured
+  2026-08-20 on `dgx:gpu0` (NVIDIA GB10, driver 580.173.02, compute capability
+  12.1) in an `rc` lease, at tree
+  `7481a2eecbb26b3d5c977e8707b0384994caf136` -- an ancestor of `main`, and one
+  that carries [#1453](https://github.com/mudler/vllm.cpp/pull/1453), which the
+  job asserted by grepping for `kFp8BlockScaledScaleBlockN` before it built.
+  CUDA 13.0 Release, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+  -DVLLM_CPP_CUTLASS_FETCH=ON`. **The suite ran UNPATCHED**, so the tree's own
+  `expect` column was the prediction rather than a hand-edited probe:
+
+  ```text
+  [doctest] test cases:   5 |   5 passed | 0 failed | 0 skipped
+  [doctest] assertions: 136 | 136 passed | 0 failed |
+  [doctest] Status: SUCCESS!
+  REFERENCE_TIER_LINES=0   TEST_RC=0
+  ```
+
+  **Why this is an execution and not a skip wearing a pass.** A device-free run
+  of this file prints **41** assertions, and that number is derived from the
+  source rather than assumed: G6 carries no `HasCuda()` guard and contributes 40
+  (10 grid entries x 3 `CHECK`, then 4 partition, 3 tile-config, 1 N-floor and 2
+  swapped/unswapped checks), and G2's host half contributes the 1 `CHECK` that
+  precedes its guard, while G7, G8 and G9 return before their first assertion.
+  So **95 of the 136 ran on the board**, and that delta -- 136 against 41 -- is
+  the discriminator. **The job's own assertion floor is INERT and is not
+  evidence.** `run5.sh` exits `RESULT=VOID` below 38, a number sized for the
+  27-assertion skip of the pre-#1453 file; #1453 grew the host tier to 41, which
+  clears 38, so the guard can no longer fire on this file. A run whose
+  `nvidia-smi` succeeds on the host while the CUDA backend throws inside the
+  container would print 41 assertions, `TEST_RC=0`, `REFERENCE_TIER_LINES=0` and
+  `RESULT=CONFIRMED`, and only the 136-against-41 delta separates that from this
+  one. The verdict stands on the delta; the floor is recorded as inert so that
+  nobody credits it twice. **Zero
+  `[vt reference-tier]` lines**, so the op was registered and nothing fell
+  through to the portable host kernel -- the failure mode that produced a
+  SIGSEGV and a wrong headline on an earlier attempt at this measurement. The
+  configure step aborts on `CUTLASS headers NOT found`, so the TU cannot have
+  quietly left the build. Evidence: `run5.log`, `test5.out`, `configure5.log`
+  and `build5.log` in the job's `fp8block-g2` output directory, written by
+  `run5.sh`, which also records the prediction it was testing.
+
+  **The root cause is confirmed.** #1453 encoded the prediction into the tree:
+  `Grid()` carries a hand-written `expect` column derived from CUTLASS's source,
+  G6 asserts the grid's PARTITION rather than "everything is accepted", and G7
+  drives every unservable shape to a named refusal instead of aborting at entry
+  zero. All four unservable entries came back refused BY NAME -- the three
+  ragged-N shapes `{32,576,7168}`, `{8,576,1024}` and `{512,576,1024}`, which
+  between them span the swapped and the unswapped path, and the ragged-K shape
+  `{8,512,1088}`, which fails a DIFFERENT line of `can_implement` and is
+  therefore the independent check rather than a repetition -- and every
+  complete-scale-block entry was served. A wrong reading of the collective would
+  have failed G6's partition and said which entry.
+
+  **SEVEN shapes are now compared against the CPU reference, where the count was
+  ZERO.** G7 compared its six servable grid entries -- `{1,512,1024}`,
+  `{7,512,1024}`, `{83,512,1024}`, `{200,512,1024}`, `{512,512,1024}` and the
+  N-floor probe `{200,128,1024}`, which between them exercise all three tile
+  configs -- and G2 ran upstream's own fixture, criterion and formula on
+  `{32,512,7168}`, the nearest servable N to upstream's 576. **This is the first
+  evidence that this kernel computes correct values on any shape.**
+
+  **What the run does NOT establish, stated so that no later reader widens it.**
+  There is **no token gate**: `Qwen/Qwen3.8-27B-FP8` has still not been run
+  against the pinned oracle on this arm, on any device, and that item is
+  untouched below. There is **no speed claim of any kind**: the lease took no
+  clock control, recorded no contention and had no denominator, so per
+  `.agents/benchmarking.md` no ratio from this run would mean anything. It is
+  **not "correct on every shape"** -- it is correct on this grid, which spans
+  all three tile configs and both the swapped and the unswapped path, and it
+  says nothing about a shape outside it. And the **capability gap STANDS**:
+  DSV3's `kv_a_proj_with_mqa` is `N=576` and remains unservable by this arm on
+  sm120 until CUTLASS's sm120 collective supports partial scale blocks, which is
+  an upstream limitation and not a defect in this tree.
 - **A CUDA build without CUTLASS headers SEGFAULTS on this path rather than
   refusing by name.** Found in the same session and tracked by
   [#1435](https://github.com/mudler/vllm.cpp/issues/1435): with the TU absent,
@@ -568,18 +658,38 @@ builds it and a leased box runs it.
   The same issue records that `vt_cuda_report_feature` prints
   `cutlass-fp8: ENABLED` for a build in which no FP8 CUTLASS TU is compiled.
 - **No token gate.** `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned
-  oracle on this arm, on any device.
-- **No speed claim.** None is made anywhere in this change. The row takes no
-  lease, so it has no denominator, no clock state and no contention record —
-  the three things `.agents/benchmarking.md` requires before a ratio means
-  anything.
+  oracle on this arm, on any device. This is the item the confirmation run above
+  did NOT touch, and it is the one that stands between this arm and a capability
+  claim.
+- **Comments in `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` still say the arm
+  has never run on a device**, and they are now false. The loudest is the FILE
+  HEADER, which is the first thing a reader of that file sees: it opens "THIS
+  FILE HAS NEVER RUN AGAINST A DEVICE" and adds that "no number produced here
+  appears in any document as a measurement" -- doubly false now, because the
+  5/136/0 line appears both in this section and in `docs/USAGE.md`. Then G2's
+  header block, which reads "Half 2 is NOT evidence that the arm works: it has
+  never run on a device", and the four `NO CUDA DEVICE` messages that G2, G7,
+  G8 and G9 print, each reading "#1189 M5's on-hardware leg is OWED, not
+  passed". Six sites in all, and an implementer who repairs only the five below
+  the header leaves the headline asserting the opposite. The leg is no longer
+  owed for the shapes this arm was run on. They were left standing because the change
+  that recorded the second run under
+  [#1437](https://github.com/mudler/vllm.cpp/issues/1437) is records-only and
+  edits no compiled or test source; this row owns the correction, and a reader
+  of that file gets the wrong position until it lands.
+- **No speed claim.** None is made anywhere in this row. Both hardware runs
+  above took a lease for CORRECTNESS only: neither took clock control, neither
+  recorded contention and neither had a denominator — the three things
+  `.agents/benchmarking.md` requires before a ratio means anything.
 - **A `sm_12xa` CUDA user is no longer refused.** Registering the arm narrows
-  M4's `Prepare` refusal automatically. The run above has now happened, so
-  BUILD-VERIFIED ONLY is no longer the right label and `docs/USAGE.md` and
-  `docs/FEATURES.md` are corrected in the same change that records the run: the
-  arm is RUN AND FAILING on upstream's own ported case, with no shape yet
-  compared against the CPU reference and no token gate. Neither page may carry a
-  capability claim for it.
+  M4's `Prepare` refusal automatically. Both runs above have now happened, so
+  BUILD-VERIFIED ONLY is not the right label and neither is RUN AND FAILING;
+  `docs/USAGE.md` and `docs/FEATURES.md` are corrected in the same change that
+  records each run, and they now say that the arm serves only `N % 128 == 0` and
+  `K % 128 == 0`, that it MATCHES the CPU reference on the seven shapes it was
+  run on, and
+  that it has NO token gate and NO speed number. Neither page may carry a
+  capability claim wider than that.
 - **The column-major and TMA-aligned activation-scale layouts**
   (`utils/fp8_utils.py:610-628`), which `vt::QuantFp8Group` could emit and does
   not. M1 shipped row-major only and recorded both as owed; M2 repeated it.
@@ -669,10 +779,12 @@ passed.` **`assertions: 0` is a skip wearing a pass**, and it is recorded here a
 the measurement it is: the load-bearing comparison of this row did not run.
 
 This whole section is the `27d5432f9` HOST run and stays as written. It is not
-superseded by the later device run in `## Owed`; it is the CONTROL for it. The
-27-assertion figure here is the measured pure-skip count of this file, which is
-why `## Owed` can say that 27 of the device run's 34 assertions prove nothing
-about a device.
+superseded by the two later device runs in `## Owed`; it is the CONTROL for the
+FIRST of them. The 27-assertion figure here is the measured pure-skip count of
+this file **at `27d5432f9`**, which is why `## Owed` can say that 27 of the
+first device run's 34 assertions prove nothing about a device. It is NOT the
+control for the second run: #1453 grew the host tier of this file to 41, and
+that is the baseline the second run's 136 is measured against.
 
 | Block | Cases | Assertions | What that means |
 |---|---:|---:|---|

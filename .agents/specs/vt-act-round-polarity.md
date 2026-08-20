@@ -3,7 +3,10 @@
 Issues: [#1322](https://github.com/mudler/vllm.cpp/issues/1322) (the filed gap),
 [#1342](https://github.com/mudler/vllm.cpp/issues/1342) (Vulkan/Metal silu
 spelling), [#1343](https://github.com/mudler/vllm.cpp/issues/1343)
-(`RmsNormPlusAdd` arm asymmetry).
+(`RmsNormPlusAdd` arm asymmetry),
+[#1458](https://github.com/mudler/vllm.cpp/issues/1458) (four model suites red
+on `main` behind the landed narrowing; fixed, see `## The four suites #1458
+reds, and why the kernel is not the defect`).
 Row: `VT-ACT-ROUND-POLARITY`.
 
 ## Now
@@ -19,7 +22,18 @@ existing f32 golden and every existing byte-exact composite contract unmoved,
 and it is asserted directly rather than inferred (see
 `tests/vt/test_ops_activation.cpp`, "leaves an f32 INPUT bit-identical").
 
-**Five providers are still owed and are listed under `
+**The narrowing survived a second, independent challenge.**
+[#1458](https://github.com/mudler/vllm.cpp/issues/1458) reported four model
+suites red behind `4712dac40`, attributed by mutation in both directions. The
+kernel was re-verified from source at the pin and from the committed oracle
+golden, and it is right; the four bounds were not. See `## The four suites #1458
+reds, and why the kernel is not the defect`.
+
+**Five providers are still owed and are listed under `## Owed`.** CUDA, ROCm,
+Metal and Tenstorrent cannot be compiled from the dev box at all, and the Vulkan
+arm additionally needs a GLSL toolchain to regenerate its committed SPIR-V. This
+row does NOT claim provider parity it did not test.
+
 ## What landed, and what it measured
 
 `RoundThrough(DType, float)` — the helper `kRmsNormGatedGroup` already uses for
@@ -48,11 +62,6 @@ golden pass ran 46 cases on both sides:
 **No golden got worse.** The one oracle-captured activation golden improves: see
 the table under `## Premise`, where the worst element margin against the
 harness's own `atol + rtol*|want|` moves 0.5364 -> 0.2989.
-
-## Owed`.** CUDA, ROCm,
-Metal and Tenstorrent cannot be compiled from the dev box at all, and the Vulkan
-arm additionally needs a GLSL toolchain to regenerate its committed SPIR-V. This
-row does NOT claim provider parity it did not test.
 
 ## Gap verification
 
@@ -371,6 +380,122 @@ That is why this spec stops here.
 - **The gate for those arms is PENDING on named resources**, not waived: a CUDA
   box for the byte-exact composite suites, a ROCm box, a Mac, and a glslang for
   the SPIR-V regenerate.
+
+## The four suites #1458 reds, and why the kernel is not the defect
+
+[#1458](https://github.com/mudler/vllm.cpp/issues/1458) reported
+`test_ltx2_text_encoder`, `test_muse_glimmer_text`,
+`test_muse_glimmer_text_fallback` and `test_minimax_music3_ar` red on `main`
+behind `4712dac40`, attributed by mutation in both directions. All four
+reproduce at `aeba0de6f`, CPU-only Release (`-DCMAKE_BUILD_TYPE=Release`, so
+NDEBUG), x86_64.
+
+**The premise was re-derived rather than taken.** Every anchor the landing
+commit cites is exact at the pin `555967922`, read in the checkout whose
+`git rev-parse HEAD` is that sha:
+`csrc/libtorch_stable/activation_kernels.cu:158` (`silu_kernel` returns
+`(T)(...)`), `:36` (`compute` returns `(scalar_t)(ACT_FN(gate, alpha) * ...)`,
+so `ACT_FN` has already narrowed), `:205` (`gelu_tanh_kernel`, same shape),
+`vllm/model_executor/layers/activation.py:143` and `:418` (the native arms,
+`F.silu` / `F.gelu` on a bf16 tensor yielding bf16), and
+`tests/kernels/core/test_activation.py:108`
+(`assert_close(out, ref_out, atol=0.0, rtol=0.0)`, which pins the two together
+bit-exactly). The VECTORIZED arm agrees: `packed_compute` at
+`activation_kernels.cu:50-95` narrows through `cast_to_packed<packed_t>` as
+well, so upstream has ONE polarity across both of its arms and the `atol=0.0`
+test has no second behaviour to hide.
+
+**The committed oracle golden settles it without reading a kernel.**
+Recomputing `tests/parity/goldens/silu_and_mul_bf16_8x256/out.npy` from its own
+`x.npy` in numpy, with bf16 round-to-nearest-even applied by hand:
+
+| expression | max abs err vs golden | bit-exact |
+|---|---|---|
+| `silu_f32(g) * up`, no store round | 1.434994e-02 | no |
+| `bf16(silu_f32(g) * up)` — the PRE-`4712dac40` kernel | 1.562500e-02 | no |
+| `bf16(silu_f32(g)) * up`, no store round | 7.812500e-03 | no |
+| `bf16(bf16(silu_f32(g)) * up)` — the POST kernel | **0** | **yes** |
+
+The golden's every value is exactly bf16-representable, so it came from a vLLM
+that rounds twice. The landed kernel is the only one of the four that reproduces
+it. Reverting it is not available.
+
+**What the four bounds were, and what each one actually measured.**
+
+- `test_ltx2_text_encoder`, the prompt->conditioning VALUES case. Its floor is
+  the oracle's own f32-vs-bf16 spread carried through the same projection, which
+  is the right SCALE. Its constant was not: the bf16 arm carried `1.0x` while the
+  f32 arm carried `2.0x`, and the `1.0x` was imported from the state-level parity
+  case, where the same two objects are compared elementwise. This case compares
+  them through `Ltx2TextEncoderConditioning`, which stacks all 13 states — the
+  floor is the projection of ONE error vector and the gated quantity is the
+  projection of a DIFFERENT one, and a linear map that combines 13 states does
+  not preserve the relation. Both arms now carry `2.0x`, which is the triangle
+  bound with each side's departure from the shared f32 trajectory taken at one
+  floor. Video 1.209x -> margin 0.60; audio 1.313x -> margin 0.66.
+  The state-level case is untouched and still green at 0.870x of its `1.0x`.
+- `test_muse_glimmer_text` and its `VT_FUSED_CHAIN_ADOPT=0` registration.
+  `bdiff <= 1e-5` was the W1 measurement (5.28e-06 at `3a54c4b7d`) rounded up,
+  1.89x of headroom and no derivation. The biting-soft-cap case exists to pin the
+  ORDER of the output multiplier and the cap, and the order is an ALGEBRAIC
+  property of the output range, not a max|diff| band: at `cap = 1e-3` the logits
+  saturate the tanh to within 1e-40, so upstream's order reaches `cap` and the
+  swap reaches `out_mult * cap`. Measured: our saturation and the reference's
+  agree EXACTLY (delta 0) and the swap moves it by 2.5e-04, 32x the bound, which
+  is two bf16 relative spacings on `cap`. The knee-driven max|diff| is kept at
+  its rigorous Lipschitz value (`bdiff <= diff`; the cap is a contraction).
+- `test_minimax_music3_ar`, the composed depth stage. `device_codes ==
+  host_codes` over an argmax on two implementations whose measured separation is
+  308 bf16 ULP. Draw 6 is a tie: relative top-2 margins 1.95e-03 (device) and
+  2.93e-03 (host), both BELOW one bf16 ULP (2^-8 = 3.91e-03), between codes 2 and
+  17. Draws 0..5 have margins 1.74e-02 to 3.53e-01 and agree. The `==` was
+  reading a coin. It is now: codes agree, or the divergence is a SHARED near-tie
+  in which each arm ranks the other's pick within one bf16 ULP of its own.
+
+**Two candidate replacements were tried and rejected**, recorded so nobody
+re-derives them. For muse, `bdiff <= diff` alone is rigorous but does NOT red the
+order swap (uncapped envelope 3.4e-04, defect 2.5e-04). A measured twin at
+`out_mult = 1`, where the two orders coincide by algebra, gives 6.10e-06 — but it
+is a different model sitting at a different point on the tanh knee, and the gated
+run reaches 2.4x it with nothing wrong.
+
+**What this costs, MEASURED, and it is `4712dac40` that spent it rather than the
+new bound.** The ltx2 conditioning case documents that renumbering the positions
+from zero reds it at 1.10x the audio floor. Ratios to the propagated floor, one
+build directory, compile rc 0 on every arm, every source restored and
+`sha256sum`-verified:
+
+| `src/vt/cpu/cpu_ops.cpp` | production code | video | audio | at the old `1.0x` |
+|---|---|---:|---:|---|
+| before `4712dac40` | correct | 0.565 | 0.688 | pass |
+| before `4712dac40` | renumbered | 0.831 | **1.099** | **RED** — the documented 1.10x |
+| at `aeba0de6f` | correct | **1.209** | **1.313** | **RED** |
+| at `aeba0de6f` | renumbered | 0.683 | 0.931 | pass |
+
+Read the bottom two rows together: post-`4712dac40` the instrument is INVERTED —
+it reds the correct code and passes the mutant, and the mutant is measurably
+CLOSER to the oracle than the port is. The `2.0x` restores a functioning
+instrument; it does not recover that detection, and no constant can, because the
+ordering of the two has reversed. It is also a property of the defect —
+upstream's own f32 answers for positions 12..19 and 0..7 agree to 3.6e-06
+relative — and `scripts/gen-ltx2-gemma-tower-goldens.py:363-375` already records
+that the end-to-end states are the wrong instrument for that class and the f32
+rope table is the right one. Filed as
+[#1467](https://github.com/mudler/vllm.cpp/issues/1467) and owed by
+[`ltx-2-5.md`](ltx-2-5.md).
+
+**One more bound of the same class is left standing, and it is filed rather than
+re-tuned.** `tests/vllm/models/test_muse_glimmer_text.cpp:532`'s
+`CHECK(diff <= 5e-4)` is the other W1 measurement rounded up (1.21e-04 at
+`3a54c4b7d`), and `4712dac40` moved it from 0.242 to 0.687 of its bound. It is
+green, it is out of scope for this repair because it needs its own derivation,
+and it is [#1466](https://github.com/mudler/vllm.cpp/issues/1466), owed by
+[`muse-glimmer.md`](muse-glimmer.md).
+
+**The narrowing did not make the port worse.** At the state level, where the
+comparison is elementwise and the amplification above does not apply, our
+distance to the f32 oracle IMPROVED at 11 of the 13 states (worst ratio 0.644 ->
+0.572) and the bf16 arm stayed inside its `1.0x` floor (0.714 -> 0.870).
 
 ## Stop conditions
 

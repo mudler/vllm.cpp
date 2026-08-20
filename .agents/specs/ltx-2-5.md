@@ -947,6 +947,22 @@ none of them. Per AGENTS.md that is the worse half of the silent/refused split: 
 naming a missing part is documented debt, and silence is not. Each now has its own issue,
 each saying what is absent, what a future row starts from, and what blocks it.
 
+- [#1467](https://github.com/mudler/vllm.cpp/issues/1467) — the
+  `"ltx2 prompt -> conditioning: the VALUES"` case no longer detects position
+  renumbering, and the note in it that claims 1.10x-of-floor detection is stale.
+  MEASURED while gating [#1458](https://github.com/mudler/vllm.cpp/issues/1458):
+  before `4712dac40` the mutant reached 1.099x the audio floor and reded; at
+  `aeba0de6f` it reaches 0.683x/0.931x while the CORRECT code reaches
+  1.209x/1.313x, so the instrument is INVERTED — the mutant is closer to the
+  oracle than the port is. `4712dac40` is right (it is the only form that
+  reproduces the `silu_and_mul_bf16_8x256` oracle golden bit-exactly); it raised
+  this comparison's noise floor above the defect's signal. #1458 restores a
+  functioning instrument and does not recover the detection, and no constant on
+  this quantity can. A repair owes an instrument with no bf16 accumulation
+  between the defect and the assertion — the integer `positions` contract, or
+  the f32 rope table the generator already names as the right one for this class
+  (`scripts/gen-ltx2-gemma-tower-goldens.py:363-375`).
+
 - [#1093](https://github.com/mudler/vllm.cpp/issues/1093) — `TI2VidTwoStagesPipeline`
   (`ti2vid_two_stages.py:61`). NOT our `distilled_two_stage`: stage 1 is CFG-guided on the
   FULL model (`:247-259`), stage 2 carries the distilled LoRA alone (`:151`), and stage-1

@@ -246,9 +246,16 @@ Reachability, answered as two separate questions, as
 [`reachability.md`](../reachability.md) requires.
 
 The production entry point is `vllm-server`, which calls `vllm_server_main`,
-which parses `--model` at `server_main.cpp:433` and calls the resolver.
-`vllm-cli` reaches the same flag. Both are registered command-line paths on
-their default configuration.
+which parses `--model` and calls the resolver. It is a registered command-line
+path on its default configuration.
+
+`vllm-cli` does NOT reach the resolver, and the earlier sentence claiming it did
+was wrong. `examples/cli/main.cpp` includes `vllm.h` and nothing else, because
+an example is an application binary interface client only, and this row
+deliberately adds no ABI function. So `vllm-cli --model org/repo` and any C ABI
+caller of `vllm_model_load` still take a local path. That is listed under
+`## Owed`: closing it means adding an ABI entry point, which is a public-surface
+decision and its own row.
 
 The smallest failing test calls `vllm_server_main(argc, argv)` with
 `--model org/repo` and `HF_ENDPOINT` aimed at the fake hub, then asserts that
@@ -261,7 +268,10 @@ byte for byte:
 
 | Mutation | Must turn red |
 |---|---|
-| Delete the resolver call in `server_main.cpp` | The end-to-end case |
+| Neutralise the resolver call in `server_main.cpp` with `if (false)` | The end-to-end case |
+| Delete the `--revision` branch in `ParseArgs` | The end-to-end case |
+| Delete the `--download-dir` branch in `ParseArgs` | The end-to-end case |
+| Drop the object-identifier preference in `BlobNameFor` | The blob-name case |
 | Range mismatch warns instead of failing | The range-ignored case |
 | Accept an all-identical object identifier listing | The fabricated-identifier case |
 | Own an identifier with an entry that reports no size | The not-disarmable case |
@@ -269,6 +279,17 @@ byte for byte:
 | Remove the case fold on the object identifier | The mixed-case-two-sizes case and the blob-name case |
 | Remove index-driven selection | The decoy-file case |
 | Remove the offline short circuit | The offline cases |
+
+THE RESOLVER MUTATION IS A NEUTRALISATION, NOT A DELETION, and the row above
+says `if (false)` for a measured reason. DELETING the call does not compile:
+`ResolveModelArgument` is file local, so `server_main.cpp:840` fails with
+`error: 'ResolveModelArgument(Args&)' defined but not used
+[-Werror=unused-function]` and the exit status is 1. A reviewer who ran the
+deletion got a stale binary and a false green, which is exactly the trap this
+repository has already recorded. `if (false) ResolveModelArgument(args);` is one
+changed line, compiles at exit 0, and reddens the end-to-end case at
+`test_serve_hf_model.cpp` `REQUIRE(healthy)` with an empty hub-path list,
+because the loader then opens `tiny/llama` as a relative directory.
 
 Each mutation run prints the compiler exit status and `git diff --stat` beside
 the test result. A mutation that fails to build and a mutation that never
@@ -308,11 +329,23 @@ asserts a non-zero case count, reads the `Status:` line rather than grepping
 | W3 | `downloader`: `HEAD`, resume, structural checks, lock, progress | Resume, truncation, and integrity cases green |
 | W4 | `model_resolver` and the `server_main.cpp` call site | The end-to-end case green, and red when the call site is deleted |
 | W5 | Build and packaging: the three options, `NOTICE`, `libssl3`, the container check | Every lane builds, and the container check distinguishes a working build from a disabled one |
-| W6 | `docs/USAGE.md` and `docs/FEATURES.md` | The new flags, environment variables, and workflow are documented |
+| W6 | `docs/guides/hugging-face-access.md`, `docs/reference/server.md` and `docs/FEATURES.md` | The new flags, environment variables, and workflow are documented |
 | W7 | Fresh review, mutation table, repair | A fresh reviewer returns `PASS` |
 
-W1 through W7 land in one pull request, which is the repository default when no
-`## Git integration` preference is recorded.
+That plan said W1 through W7 land in one pull request, which is the repository
+default when no `## Git integration` preference is recorded. It was overtaken by
+what happened. W1 and W2 landed in `31f93787c` through pull request
+[#1282](https://github.com/mudler/vllm.cpp/pull/1282), after four fresh reviews
+returned findings on the tree-listing size rule, and W3 and W4 land in a SECOND
+pull request on `row/ENG-HF-MODEL-DOWNLOAD-W3`. The split is recorded rather
+than corrected, because a spec that describes a landing that did not happen is
+a false record and this one is read by whoever picks up W5.
+
+| Stage | Landed in |
+|---|---|
+| W1, W2 | `31f93787c`, pull request #1282 |
+| W3, W4 | `row/ENG-HF-MODEL-DOWNLOAD-W3`, the second pull request |
+| W5, W6, W7 | not started |
 
 ## Risks and decisions
 
@@ -458,6 +491,89 @@ is recorded here. The regression case for the measured event survives it: the
 `Lightricks/LTX-2.5` fixture is refused by the degeneracy rule, and its shards
 are given different sizes so that the size rule would catch it independently.
 
+**A range request answered 200 is REFUSED, where llama.cpp warns.** llama.cpp
+`common/download.cpp:222-235 @ b10451` logs "server did not respond with 206"
+and carries on. W3 throws. A `200` carries the WHOLE body, and appending a whole
+body onto a partial file writes the first N bytes twice. On a safetensors the
+data-end rule catches the result, and on a format with no structural proof it is
+a silently corrupt weight that a token gate cannot see, because the model still
+emits tokens. The refusal costs one re-run and names the partial file to delete.
+The refusal is taken in the RESPONSE HANDLER rather than after the transfer,
+which is a second decision the same case pinned: with the check after the call,
+the suite measured a 12 byte partial file grown to 48 bytes under a refusal that
+still reported the right reason.
+
+**The end-to-end case leaked a listening socket, and the retry loop that hid it
+is gone.** This paragraph previously blamed box contention at load 32 and
+scheduler starvation, and said that whether a completion can genuinely hang
+under contention was not settled by this work. That was WRONG, the cause was
+inside this row's own diff, and it is recorded here because a committed spec is
+the binding record and a false cause sends the next reader into the serving
+core, which this row does not touch.
+
+`FreePort` in `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` bound an
+ephemeral port with an `httplib::Server` and called `probe.stop()`. That
+released nothing. `Server::stop()` at `third_party/httplib/httplib.h:11460` is
+guarded by `if (is_running_)`, the function never called `listen_after_bind()`,
+so `is_running_` was false and the socket was never shut down, and
+`Server::~Server()` is `= default` and does not close it either. httplib sets
+`SO_REUSEPORT` at `httplib.h:9455`, so the forked child bound the SAME port
+successfully and the kernel load balanced inbound connections between the
+orphan, which nobody ever accepted on, and the real server.
+
+Measured with `ss -ltnp` during an unmutated run at `e25d3d344`: two LISTEN rows
+on one port, one owned by the parent and one by the child, the parent's carrying
+`Recv-Q 1`, which is the hung request sitting in a backlog nobody drains.
+
+| Variant | wall, one binary, one box | verdict |
+|---|---|---|
+| `e25d3d344`, three runs at load 12 to 15 | 90.4 s, 240.4 s, 180.4 s | one FAILED |
+| `FreePort` closing its socket, five runs at load 20 to 25 | 0.12 to 0.15 s | five passed |
+
+Every stall was an exact multiple of a client read timeout, 30 s health and
+60 s completion, never an intermediate value. A contended box gives a
+distribution, not quantised multiples of the client's own timeout, and the
+repaired case is FASTER at load 25 than the committed one was at load 13.
+
+`FreePort` now uses a POSIX `socket`, `bind`, `getsockname`, `close`, because
+the close has to be unconditional. The three-attempt retry loop is DELETED: with
+the leak gone there is nothing left for it to absorb, and sixty seconds of dead
+time read as a green run with no output at all. The serving core was cleared by
+inspection in the same pass, and every wait on the path is a predicate-guarded
+`condition_variable::wait`, at `httplib.h:10444`, in
+`include/vllm/v1/engine/core_proc.h`, and at
+`src/vllm/v1/engine/output_processor.cpp:48`.
+
+`--max-num-seqs 4` stays on the command line, and the reason recorded for it was
+also wrong. The worker-pool arithmetic is true, the default 32 does start a
+36-thread pool for one four-token request, but that is not why the case was
+slow, and the comment now says so.
+
+**`--revision` and `--download-dir` were parsed and never reached.** Both
+`ParseArgs` branches could be deleted with `test_downloader`, `test_model_resolver`
+and `test_serve_hf_model` all still green, because the two cases named for those
+flags set `ModelResolveOptions` fields by hand and never touch a flag. That is
+`.agents/reachability.md`'s own sentence: a unit test that constructs the type by
+hand proves the class works, never that anything reaches it. The end-to-end case
+now carries both flags and they are LOAD BEARING. The fake hub publishes the
+checkpoint on a non-default branch and lists nothing under the commit `main`
+names, so a run without `--revision` fetches nothing and never binds, and the
+cache is asserted to land under `--download-dir` and NOT under `HF_HOME`.
+
+**A blob is named by the object identifier, else by the COMMIT and the path.**
+The `## Port map` above says "by the entity tag from the resolve response or by
+a locally computed sha256". W3 keeps the object identifier as the first choice
+and replaces both fallbacks with the commit and the path, for two reasons. An
+entity tag is a transport artifact that a mirror may respell without the bytes
+changing, and naming a cache file after one costs a `HEAD` request per file on a
+WARM cache, where the correct number of requests is zero and this row has a case
+asserting it. A locally computed sha256 has to be computed from the whole file,
+and the tree's one sha256 (`kv_cache_utils.h:175`, which the tree may not have a
+second of) takes a `std::string`, so a 60 GB shard would be hashed in memory. A
+commit plus a repository-relative path already names exactly one byte sequence,
+which is the property a content hash was wanted for. The choice the run made is
+printed under `--verbose`.
+
 **A null grep is not absence.** This spec states that no document pins a runtime
 dependency list, based on a grep of `docs/RELEASES.md`, `docs/BUILD.md`, and
 `scripts/check-release-binary-contract.py`. That grep proves the search terms
@@ -465,7 +581,8 @@ wrong, not the fact. W5 confirms by building and running the archive validator.
 
 **The GGUF form diverges from vLLM by design.** vLLM has no `org/repo:QUANT`
 form. This is a tracked exception under the secondary-oracle rule, not a silent
-divergence. `docs/USAGE.md` states which upstream defines which form.
+divergence. `docs/guides/hugging-face-access.md` states which upstream defines
+which form.
 
 ## Owed
 
@@ -473,11 +590,37 @@ divergence. `docs/USAGE.md` states which upstream defines which form.
 - `--tokenizer-revision` and `--code-revision`, `vllm/config/model.py:186,190`.
 - LoRA adapter fetch, `vllm/lora/utils.py:346`.
 - The llama.cpp Docker-registry model path, `common/download.cpp:847`.
+- **A `.bin`-only repository is fetched and then refused by the loader.**
+  `SelectWeightFiles` mirrors vLLM's format preference, `["*.safetensors",
+  "*.bin"]` with the first matching pattern winning
+  (`default_loader.py:167-184`), so a repository that publishes only
+  `pytorch_model.bin` is downloaded in full and then refused by `LoadShards`
+  with `no *.safetensors shards found`. vLLM loads that format and this engine
+  does not, so mirroring the preference is right and the wasted transfer is
+  the cost of it. Refusing after phase one, before the weights, would save the
+  bandwidth and is what the two-phase fetch exists for, but it needs its own
+  case and its own message. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **`vllm-cli` and the C ABI do not resolve a repository identifier.** W4 wires
+  the resolver into `server_main.cpp` only. `examples/cli/main.cpp` is an ABI
+  client and this row adds no ABI function, so `vllm-cli --model org/repo` and
+  `vllm_model_load("org/repo")` still take a local path and refuse anything
+  else exactly as they did. Closing it moves the public surface, so it needs its
+  own row. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 - The macOS and Windows TLS lanes, resolved as a table in W5.
 - The quickstart page, issue
   [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
-- **Wiring `hf_hub` to a production entry point.** W2 lands `hf_hub` reached
-  only by its own suite. Of `hf_cache`, only `ResolveCachedSnapshotDir` is
+- ~~**Wiring `hf_hub` to a production entry point.**~~ CLOSED by W4. The
+  paragraph below records why the debt existed. `HubResolveCommitCached`,
+  `HubListRepoFiles`, `HfBlobPath`, `HfSnapshotPath` and
+  `HfFinalizeSnapshotEntry` are now all reached from
+  `server_main.cpp`'s `--model` branch through `model_resolver.cpp`, and
+  `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` turns red when that
+  call site is deleted. `HfReadRef` and `HfWriteRef` are reached through
+  `HubResolveCommitCached` on the same path.
+
+  W2 landed `hf_hub` reached only by its own suite. Of `hf_cache`, only `ResolveCachedSnapshotDir` is
   reached, through the DFlash draft path in `model_loader.cpp`, and
   `tests/vllm/entrypoints/test_dflash_draft_hf_cache.cpp` gates that reach by
   entering the loader with a repository identifier. `HfReadRef`, `HfWriteRef`,
@@ -496,7 +639,62 @@ divergence. `docs/USAGE.md` states which upstream defines which form.
 
 ## Now
 
-State `READY`, and W1 and W2 have landed. W1 corrected the llama.cpp anchor
+State `READY`, and W1 through W4 have landed. W3 added
+`src/vllm/transformers_utils/downloader.{h,cpp}`: a `HEAD` probe for size,
+entity tag and range support, a `Range: bytes=N-` resume that REFUSES a `200`
+answer rather than appending it, a `.incomplete` temporary file renamed only
+after the structural proof passes, the safetensors data-end rule and the GGUF
+proof through the tree's own reader, a per-repository `flock` beside the
+repository directory, progress under `--verbose`, and `SIGINT` cancellation that
+keeps the partial file so the next run resumes.
+
+W4 added `src/vllm/transformers_utils/model_resolver.{h,cpp}` and the call site
+in `src/vllm/entrypoints/openai/server_main.cpp`, which is what makes
+`--model org/repo` and `--model org/repo:Q4_K_M` fetch and serve. `--revision`
+and `--download-dir` are the vLLM flags rather than an invented inline syntax.
+The fetch is two phase, configuration JSON before weights, and index driven, so
+a published checkpoint's `original/` copy is never requested.
+
+Three suites cover W3 and W4. `tests/vllm/transformers_utils/test_downloader.cpp`
+and `tests/vllm/transformers_utils/test_model_resolver.cpp` run against
+in-process fake hubs, and `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp`
+is the REACHABILITY gate: it enters at `VllmServerMain(argc, argv)` with
+`--model tiny/llama --revision serving --download-dir <dir>`, and the server
+fetches the committed `llama_embed_e2e` checkpoint from the fake hub, boots, and
+completes a `/v1/completions` request. Neutralising the resolver call site in
+`server_main.cpp` with `if (false)` leaves the server unable to bind and turns
+that case red. DELETING the call instead does not compile, and the mutation
+table above records why.
+
+A FIFTH FRESH REVIEW returned FAIL on six findings, and every one is repaired at
+this head. The end-to-end case leaked a listening socket and the retry loop hid
+it, both recorded under `## Risks and decisions` with the measurement.
+`--revision` and `--download-dir` were parsed and never reached, and the
+end-to-end case now carries both and reddens when either `ParseArgs` branch is
+deleted. The recorded resolver mutation did not compile, and the table now
+records the one that does. The two no-TLS cases were wrapped in
+`#ifndef CPPHTTPLIB_OPENSSL_SUPPORT` and would have become zero-assertion skips
+the moment W5 defines that macro, so the preprocessor now selects WHICH
+statement each case makes rather than whether it makes one. Preprocessing both
+files with the macro defined yields zero surviving assertions at `e25d3d344` and
+the TLS arm at this head. And the object-identifier preference in `BlobNameFor`
+was unpinned, so `test_model_resolver.cpp` now gives one listed file an
+identifier and asserts the two blob names apart.
+
+#1491 landed while this branch was open and split `docs/USAGE.md` into
+`docs/guides/`, `docs/models/` and `docs/reference/`. The merge takes that file
+unchanged from `origin/main` and re-applies this row's documentation where the
+split put it: the fetch, the cache layout and the limits in
+`docs/guides/hugging-face-access.md`, and the `--model`, `--revision` and
+`--download-dir` rows in `docs/reference/server.md`.
+
+W5, W6 and W7 have not been done: there is no transport layer security option,
+no `docs/FEATURES.md` entry, and no fresh review.
+
+The paragraph below records the state W2 left, and is kept because the size-rule
+findings it names are what the current head's integrity rules are built from.
+
+W1 and W2 landed first. W1 corrected the llama.cpp anchor
 table onto stock tag `b10451`. W2 landed `hf_hub` and `hf_cache` under
 `src/vllm/transformers_utils/`, with `include/vllm/transformers_utils/`
 headers, and moved the DFlash draft path's copy of the cache walk onto the
@@ -526,6 +724,4 @@ documented on the function and on `HfFile::oid`. `test_hf_hub.cpp` now carries
 
 The row stays `READY` rather than moving to `ACTIVE`, because an `ACTIVE` row
 needs a `CLAIM-*` owner recorded in a claim source and that is the operator's
-record to write, not an implementer's. W3 through W7 have not been done: there
-is no downloader, no `--model` grammar, no transport layer security option, and
-no user-facing workflow. `--model` still takes a local path only.
+record to write, not an implementer's.

@@ -355,6 +355,21 @@ class RocmBackend final : public Backend {
 
   bool UnifiedMemory() const override { return unified_memory_; }
 
+  // The SAME value, and deliberately not `managed_alloc_`. The registrar sets
+  // `unified_memory_ = managed_alloc || (pageable_memory_access && integrated)`,
+  // and BOTH branches give host code a pointer it may dereference: the managed
+  // branch by the hipMallocManaged API contract, the other by the
+  // PageableMemoryAccess attribute on an integrated device. So every allocation
+  // this backend hands out on a `unified_memory_` device is host-addressable.
+  //
+  // Answered explicitly because `DeviceMemoryIsHostAddressable()` defaults to
+  // false and is what gates the portable CPU reference tier (#844, #1435). That
+  // gate used to read `UnifiedMemory()`, which is a WIDER property — true on
+  // CUDA/GB10, where a cudaMalloc pointer is still not host-dereferenceable.
+  // Without this override ROCm would lose the tier that makes an APU run a model
+  // with one registered kernel.
+  bool DeviceMemoryIsHostAddressable() const override { return unified_memory_; }
+
   bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes) const override {
     size_t free_b = 0, tot_b = 0;
     if (hipSetDevice(device_) != hipSuccess) return false;

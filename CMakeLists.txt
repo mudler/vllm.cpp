@@ -2347,6 +2347,12 @@ if(VLLM_CPP_SERVER)
   # vendored cpp-httplib header api_server.cpp uses, so it shares that gate. The
   # cache half above stays unconditional because it opens no socket.
   target_sources(vllm PRIVATE src/vllm/transformers_utils/hf_hub.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W3/W4 (#1280): the byte transport and the `--model`
+  # grammar. Both speak HTTP through the same vendored header, so both share
+  # api_server.cpp's gate. The resolver is what `server_main.cpp` calls, so a
+  # build without the server has no `--model` flag to resolve either.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/downloader.cpp)
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/model_resolver.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party

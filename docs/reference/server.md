@@ -140,10 +140,12 @@ a stop token early.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <dir>` | Required except when `--speech-model` selects a speech/music-only server | Model directory (safetensors or `.gguf`) |
+| `--model <dir\|file.gguf\|org/repo\|org/repo:QUANT>` | Required except when `--speech-model` selects a speech/music-only server | A local directory or `.gguf` file, opened as before, or a Hugging Face repository, which is fetched into the cache. The local forms are probed first, so a network call can never shadow a path on disk. See [Access Hugging Face checkpoints](../guides/hugging-face-access.md) |
+| `--revision <ref>` | repository default branch | A branch, a tag, or a 40 character commit for a `--model org/repo`. vLLM's own flag, and there is no inline `org/repo@rev` syntax |
+| `--download-dir <path>` | the resolved Hugging Face cache root | The directory that holds the `models--org--repo` folders. vLLM's own flag |
 | `--host H` | `0.0.0.0` | Bind host |
 | `--port P` | `8000` | Bind port |
-| `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
+| `--served-model-name N` | model dir basename, or the `org/repo` you typed | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
 | `--block-size N` | `32` | KV block size. **Must be a multiple of 16**, the attention backends' `get_kv_cache_shape` refuses anything else, and the server now rejects it at startup rather than throwing during engine init |
 | `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |

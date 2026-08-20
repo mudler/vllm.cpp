@@ -153,6 +153,34 @@ std::string HubResolveCommitCached(const std::string& repo_id,
                                    const std::string& revision,
                                    const HfHubOptions& opts);
 
+// A parsed hypertext address, and the two checks every call in this file and
+// in `downloader.h` runs before it opens a socket. They are declared HERE so
+// the byte transport speaks ONE address grammar with the protocol half rather
+// than growing a second one that drifts.
+//
+// Mirrors llama.cpp `common/http.h:33-98 @ b10451`, narrowed to what a hub
+// address needs: no user information, because a hub endpoint carries none.
+struct HfParsedUrl {
+  std::string scheme;
+  std::string host;
+  int port = 0;
+  std::string path;  // always begins with '/'
+};
+
+// Throws std::runtime_error naming `url` on a missing scheme, an unterminated
+// bracketed IPv6 authority, an unsupported scheme, or an empty host.
+HfParsedUrl HfParseUrl(const std::string& url);
+
+// `[host]` for an IPv6 literal, `host` otherwise. What httplib's scheme-host-port
+// constructor needs.
+std::string HfFormatHost(const std::string& host);
+
+// Throw when `url` is `https` and this build carries no transport layer
+// security, with a message that NAMES the three build options. A build where
+// the option resolved OFF otherwise fails with a connection error that reads
+// like a network fault.
+void HfRefuseHttpsWithoutTls(const std::string& url);
+
 // True when `repo_id` has the shape the hub accepts: base characters
 // `[A-Za-z0-9_]`, the special characters `/.-` only between base characters,
 // and exactly one '/'. Mirrors llama.cpp `common/hf-cache.cpp:121-142`.

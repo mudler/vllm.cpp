@@ -1521,6 +1521,12 @@ if(VLLM_CPP_SERVER)
   # hub. It starts a REAL cpp-httplib server on an ephemeral port, so it shares
   # api_server.cpp's gate and the RUN_SERIAL treatment two rows below.
   vllm_cpp_add_test(test_hf_hub vllm/transformers_utils/test_hf_hub.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W3/W4 (#1280): the byte transport and the `--model`
+  # grammar, both against an in-process fake hub on an ephemeral port. Same
+  # gate and same RUN_SERIAL treatment as the suite above.
+  vllm_cpp_add_test(test_downloader vllm/transformers_utils/test_downloader.cpp)
+  vllm_cpp_add_test(test_model_resolver
+    vllm/transformers_utils/test_model_resolver.cpp)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1545,6 +1551,7 @@ if(VLLM_CPP_SERVER)
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
+    test_downloader test_model_resolver
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
@@ -1553,6 +1560,18 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_recipe_args
     vllm/entrypoints/openai/test_serve_recipe_args.cpp)
   target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-HF-MODEL-DOWNLOAD W4 (#1280): THE REACHABILITY GATE. It enters at the
+  # REAL VllmServerMain with `--model org/repo` and an in-process fake hub, so
+  # it needs src/ on the include path for server_main.h, exactly as the suite
+  # above does, and the committed llama_embed_e2e checkpoint as the payload the
+  # hub serves. It binds a port and forks a server, so it is RUN_SERIAL for the
+  # same starvation reason as test_openai_api_server.
+  vllm_cpp_add_test(test_serve_hf_model
+    vllm/entrypoints/openai/test_serve_hf_model.cpp)
+  target_include_directories(test_serve_hf_model PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(test_serve_hf_model PRIVATE
+    VLLM_LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  set_tests_properties(test_serve_hf_model PROPERTIES RUN_SERIAL ON)
   # ENG-MM-INPUT-PIPELINE wave L2 (#607): --language-model-only /
   # --limit-mm-per-prompt. Same shape and the same reason as the row above — it
   # re-execs the REAL VllmServerMain to observe the flags reaching the config and

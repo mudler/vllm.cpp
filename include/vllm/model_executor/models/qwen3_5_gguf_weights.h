@@ -37,6 +37,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -118,6 +120,61 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
 // attention, the rest linear/GDN). Throws std::runtime_error on a missing
 // required key or an unexpected architecture.
 HfConfig HfConfigFromGguf(const GgufFile& gguf);
+
+// ─── Tensor accounting (QUANT-QWEN38-27B-GGUF-ARM, issue #821) ──────────────
+//
+// True when `general.architecture` names one of the three GGUF families this
+// translation unit loads (`qwen35`, `qwen35moe`, `qwen3next`). Mirrors
+// `IsNemotronHGguf`'s shape: the model that owns the family answers the
+// question, so the dispatch in `model_loader.cpp` does not carry a second copy
+// of the arch list.
+bool IsQwen3_5Gguf(const GgufFile& gguf);
+
+// The EXACT set of tensor names the loaders in this file read for `config`:
+// the embedding and head, the trunk blocks under their `layer_types`, and — when
+// `mtp_num_hidden_layers` is set — the MTP head blocks `LoadQwen3_5MTPFromGguf`
+// reads at `blk.{num_hidden_layers + i}`.
+//
+// `has_output_weight` picks the tied-embedding arm: a GGUF that omits
+// `output.weight` has the head aliased onto `token_embd.weight` (llama.cpp
+// TENSOR_DUPLICATED), and `LoadEmbedAndHead` resolves it that way, so the name
+// is expected only when the file ships it.
+std::vector<std::string> Qwen3_5GgufExpectedTensors(const HfConfig& config,
+                                                    bool has_output_weight);
+
+// What the enumeration above says about a file's actual tensor table.
+struct Qwen3_5GgufAccounting {
+  std::vector<std::string> missing;      // enumerated, absent from the file
+  std::vector<std::string> unaccounted;  // in the file, read by nothing
+  int64_t enumerated = 0;
+  int64_t present = 0;
+};
+
+// Account `present` (a file's tensor names) against the enumeration for
+// `config`. An NVFP4 sidecar (`<stem>.scale`, `<stem>.input_scale`, read by
+// `GgufNvfp4SidecarScalars`) is accounted whenever its `<stem>.weight` is
+// enumerated, because whether it exists is a property of the ENCODING of that
+// weight rather than of the architecture.
+Qwen3_5GgufAccounting Qwen3_5GgufAccountTensors(
+    const HfConfig& config, const std::vector<std::string>& present);
+
+// Refuse a qwen3_5-family GGUF that carries tensors NOTHING in this file reads,
+// naming them.
+//
+// ONE DIRECTION, deliberately. A tensor the loaders ask for and the file lacks
+// already refuses by name, at `GgufFile::Get`, on every arm. A tensor the file
+// carries and no loader reads has no detector at all, and it is the direction
+// that is SILENT: `Qwen3.8-27B-Q4_K_M.gguf` states `qwen35.block_count = 65`
+// and `qwen35.nextn_predict_layers = 1`, so a reader that spends the whole 65
+// on the trunk builds a 65-layer model out of a 64-layer checkpoint plus an MTP
+// drafter, loads, decodes fluently, and is the wrong graph. Under that defect
+// `blk.64`'s four `nextn.*` tensors and its six full-attention projections stop
+// being read, and this is what says so.
+//
+// The other direction is still gated, on the committed manifest rather than
+// here: `tests/vllm/models/test_qwen38_27b_gguf_manifest.cpp` asserts zero in
+// BOTH directions against the real 866-name table with no asset in CI.
+void RefuseUnaccountedQwen3_5Gguf(const GgufFile& gguf, const HfConfig& config);
 
 // Load the whole model from a GGUF file into owned host bf16 tensors, matching
 // the safetensors loader's layouts (transposes) and semantics (raw-HF values).

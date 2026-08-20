@@ -61,6 +61,10 @@ struct Options {
   // Add a DeepStack tap at this layer (-1 = none). Qwen3.8-27B's projector has
   // none; MiniMax-H3's encoder has three.
   int deepstack_layer = -1;
+  // A tensor NOTHING in the reader reads, so the loader's accounting refusal
+  // (`RefuseUnaccountedClipMmproj`, QUANT-QWEN38-27B-GGUF-ARM / #821) has a
+  // file to fire on. Empty = the ordinary, fully-accounted export.
+  std::string stray_tensor;
 };
 
 inline std::string F32Bytes(int64_t numel,
@@ -195,6 +199,10 @@ inline std::string Build(const Dims& d, const Options& o = Options{}) {
            [](int64_t i) { return 45.0F + static_cast<float>(i); });
     AddF32(b, p + "fc2.bias", {static_cast<uint64_t>(d.out_hidden)},
            [](int64_t i) { return 46.0F + static_cast<float>(i); });
+  }
+  if (!o.stray_tensor.empty()) {
+    AddF32(b, o.stray_tensor, {static_cast<uint64_t>(d.hidden)},
+           [](int64_t i) { return 51.0F + static_cast<float>(i); });
   }
   return b.Build();
 }

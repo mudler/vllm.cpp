@@ -1118,8 +1118,8 @@ the latter with the caveat that vLLM's figure is set by
 **Its quantized arms are not gated.** Three rows on
 [#821](https://github.com/mudler/vllm.cpp/issues/821)
 ([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` and
-`QUANT-QWEN38-27B-NVFP4-ARM` are `PARTIAL`, `QUANT-QWEN38-27B-GGUF-ARM` is
-`READY`. `AGENTS.md` makes the quantized arms a standing requirement, and these
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are all
+`PARTIAL`. `AGENTS.md` makes the quantized arms a standing requirement, and these
 are the arms a user can run: 17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
 
 **`LOAD-GGUF-MMPROJ` landed the loader half.** `--mmproj` on the server and
@@ -1133,8 +1133,23 @@ reader runs over the real `mmproj-BF16.gguf` (931 146 432 B, GGUF v3, 334
 tensors, 35 keys) behind `VLLM_CPP_QWEN38_27B_MMPROJ`, and its 334 consumed
 names, its `clip.*` geometry and its two-half patch-embedding join all agree.
 CI keeps the synthetic fixture and reads no NAS file. **Nothing runs that tower
-yet**, and the committed 334-name manifest with its CI accounting is owed by
-`QUANT-QWEN38-27B-GGUF-ARM`.
+yet.**
+
+**`QUANT-QWEN38-27B-GGUF-ARM` landed the accounting.** Both files now have a
+committed manifest — 866 and 334 names with their ggml dims, type ids and
+scalar metadata, no weight bytes — and CI accounts each against the loaders'
+own enumeration with zero unaccounted in both directions. The load itself now
+refuses a qwen3_5 GGUF, or a projector, that carries tensors nothing reads,
+naming them before the tokenizer and before any weight byte. That is the
+direction that was silent: a tensor the loader asks for and the file lacks
+already refused by name; one the file ships and no loader reads was dropped.
+
+The Q4_K_M file ships an MTP drafter as `blk.64` under
+`qwen35.block_count = 65` and `qwen35.nextn_predict_layers = 1`, and the loader
+subtracts the second from the first, so the trunk is 64 layers. That was
+already true and was ungated; the accounting is what now fails if it stops
+being true. **Text decode against llama.cpp is still owed**, and so are the
+image and video legs.
 
 **`QUANT-QWEN38-27B-NVFP4-ARM` landed its accounting and its refusal.**
 `unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision`
@@ -1145,10 +1160,6 @@ header-only manifests, and its FP8 group — 233 modules, per-channel weight sca
 and dynamic per-token activations — is now refused by name at load with both
 missing pieces stated. **It still does not run:** no FP8 tower, no consumed
 `kv_cache_scheme`, and no token or resident-byte measurement.
-
-The Q4_K_M arm is not implemented. That file ships the MTP drafter as block 64,
-so a loader reading `block_count` as decoder depth builds a 65-layer model out of
-a 64-layer checkpoint.
 
 **Both token gates are `PENDING` on named external authorities, and this page
 claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,

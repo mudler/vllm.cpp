@@ -331,4 +331,71 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromClipMmproj(
   return vw;
 }
 
+// ─── Tensor accounting (QUANT-QWEN38-27B-GGUF-ARM, issue #821) ──────────────
+
+std::vector<std::string> Qwen3VLClipMmprojExpectedTensors(
+    const multimodal::Qwen3VLVisionConfig& cfg) {
+  std::vector<std::string> out;
+  // The patch embedding, BOTH temporal halves, and the position table.
+  out.emplace_back(kTnPatchEmbd);
+  out.emplace_back(kTnPatchEmbd1);
+  out.emplace_back(kTnPatchBias);
+  out.emplace_back(kTnPosEmbd);
+  for (int64_t l = 0; l < cfg.depth; ++l) {
+    const std::string p = "v.blk." + std::to_string(l) + ".";
+    for (const char* stem :
+         {"ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+          "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight",
+          "attn_out.bias", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight",
+          "ffn_down.bias"}) {
+      out.push_back(p + stem);
+    }
+  }
+  // The merger: `v.post_ln` is the PRE-shuffle norm and `mm.0` / `mm.2` are
+  // fc1 / fc2. There is no `mm.1` in a qwen3vl_merger export.
+  for (const char* name : {"v.post_ln.weight", "v.post_ln.bias", "mm.0.weight",
+                           "mm.0.bias", "mm.2.weight", "mm.2.bias"}) {
+    out.emplace_back(name);
+  }
+  for (int idx : cfg.deepstack_visual_indexes) {
+    const std::string p = "v.deepstack." + std::to_string(idx) + ".";
+    for (const char* stem : {"norm.weight", "norm.bias", "fc1.weight",
+                             "fc1.bias", "fc2.weight", "fc2.bias"}) {
+      out.push_back(p + stem);
+    }
+  }
+  return out;
+}
+
+void RefuseUnaccountedClipMmproj(const GgufFile& gguf,
+                                 const multimodal::Qwen3VLVisionConfig& cfg,
+                                 const std::string& path) {
+  const std::vector<std::string> want = Qwen3VLClipMmprojExpectedTensors(cfg);
+  const std::set<std::string> wanted(want.begin(), want.end());
+  std::vector<std::string> extra;
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (wanted.count(t.name) == 0) extra.push_back(t.name);
+  }
+  if (extra.empty()) return;
+  constexpr size_t kMaxNamed = 12;
+  std::string names;
+  for (size_t i = 0; i < extra.size() && i < kMaxNamed; ++i) {
+    names += (i == 0 ? "" : ", ") + extra[i];
+  }
+  if (extra.size() > kMaxNamed) {
+    names += ", ... (" + std::to_string(extra.size() - kMaxNamed) + " more)";
+  }
+  VT_CHECK(false,
+           "--mmproj: '" + path + "' carries " + std::to_string(extra.size()) +
+               " tensor(s) that this build's " + kClipProjectorQwen3VL +
+               " reader NEVER reads, out of " +
+               std::to_string(gguf.Tensors().size()) + " present against " +
+               std::to_string(wanted.size()) + " enumerated for depth " +
+               std::to_string(cfg.depth) + " and " +
+               std::to_string(cfg.deepstack_visual_indexes.size()) +
+               " deepstack tap(s): " + names +
+               ". Loading it would drop them SILENTLY and build a tower that "
+               "runs and is wrong");
+}
+
 }  // namespace vllm

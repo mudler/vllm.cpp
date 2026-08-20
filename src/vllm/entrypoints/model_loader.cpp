@@ -1954,6 +1954,25 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           /*model_dtype_bytes=*/2, lane);
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
+    // QUANT-QWEN38-27B-GGUF-ARM (#821): refuse a qwen3_5-family GGUF carrying
+    // tensors NOTHING in its loader reads, here, before the projector, the
+    // tokenizer and every weight byte.
+    //
+    // The reason it is worth a refusal rather than a warning is one file.
+    // `Qwen3.8-27B-Q4_K_M.gguf` states `qwen35.block_count = 65` and
+    // `qwen35.nextn_predict_layers = 1`: 64 decoder blocks plus an MTP drafter
+    // at `blk.64`. A reader that spends the whole 65 on the trunk gets a model
+    // that loads, decodes fluently, and is the wrong graph — and the ten of
+    // `blk.64`'s tensors that stop being read are the ONLY evidence of it,
+    // because nothing downstream ever asks about a tensor it did not want.
+    //
+    // Placed AFTER the device-fit refusal so the existing error ordering this
+    // branch documents is unchanged, and gated on the architecture the same way
+    // `HfConfigFromGgufDispatch` gates its builders, so a family whose
+    // enumeration lives elsewhere is not accounted against qwen3_5's.
+    if (vllm::IsQwen3_5Gguf(gguf)) {
+      vllm::RefuseUnaccountedQwen3_5Gguf(gguf, config);
+    }
     // LOAD-GGUF-MMPROJ (#821): the SECOND file. Opened, validated and READ
     // here — after the architecture resolve and the device-fit refusal, and
     // BEFORE the tokenizer and every weight byte — for the same reason the fit
@@ -1971,6 +1990,11 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       mmproj = vllm::GgufFile::Open(params.mmproj_path);
       vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
       vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
+      // QUANT-QWEN38-27B-GGUF-ARM (#821): the projector's own accounting, and
+      // it runs BEFORE the read, so a file this reader would only partly
+      // consume costs a message rather than a silently incomplete tower.
+      vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
+                                        params.mmproj_path);
       vision_tower =
           vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
     }

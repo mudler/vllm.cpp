@@ -3709,8 +3709,9 @@ VLLM_CPP_QWEN38_27B_MMPROJ=/path/to/mmproj-BF16.gguf \
 ```
 
 This one loads the whole 17 GB language file. Measured on an x86 CPU-only build
-reading both files over CIFS: 6 min 22 s, 33.06 GB peak resident. Do not start
-it on a box with less than about 40 GB of available memory.
+reading both files over CIFS: 5 min 37 s and 6 min 22 s in two runs — the wall
+time is bound by the share, not by the build — at 33.06 GB peak resident both
+times. Do not start it on a box with less than about 40 GB of available memory.
 
 Unset, both cases skip loudly and the gates stay hermetic; CI never reads the
 file. **What is still owed on these artifacts** is the committed 334-name

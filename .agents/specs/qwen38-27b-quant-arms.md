@@ -1028,9 +1028,12 @@ file, which is why the live case asserts both.
   pre-mutation value.
 
   **What it costs to run, so the next reader can decide before starting one.**
-  The load is CPU-only on this host and reads 17,106,775,008 bytes over CIFS:
-  6 min 22 s wall, 33.06 GB peak RSS (`/usr/bin/time -v`), `Exit status: 0`. A
-  box with less than about 40 GB of available memory should not start it.
+  The load is CPU-only on this host and reads 17,106,775,008 bytes over CIFS.
+  Two runs, `/usr/bin/time -v`, `Exit status: 0` both times: 6 min 21.84 s and
+  5 min 36.92 s wall, 33,062,564 and 33,062,612 kB peak resident. The wall time
+  is CIFS-bound and is NOT a constant, so it is given as the two values measured
+  rather than as one; the peak is stable to 48 kB across them. A box with less
+  than about 40 GB of available memory should not start it.
 
 ## Dependencies and blockers
 

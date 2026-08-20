@@ -154,7 +154,7 @@ the honest statement that **half the stages have no upstream to mirror at all**:
 | W2 load memory | none for #1015/#1016; upstream offloads transformer weights and never the VAE (`installation.md:90`) | spike §6 lever 5 |
 | W3 staging | none — `Alloc`/`Copy`/`Synchronize` is our seam | local |
 | W4 text tower device arm | `feature_extractor.py:85-129`, `encoder_configurator.py:187,206-208` for the extractor contract this port already mirrors | already ported; see `include/vllm/model_executor/models/ltx2_text_encoder.h:282-293` |
-| W5 VAE decode device arm | `blocks.py:1139` + `single_gpu_model_builder.py:273`; `decoding_av.py:71`; `interface.py:92`; `conv_video_decoder.py:282-284`; `normalization.py:32-40` | spike §6 levers 1 and 2, which read them |
+| W5 VAE decode device arm | `blocks.py:1139` + `single_gpu_model_builder.py:273`; `decoding_av.py:71`; `interface.py:92`; `conv_video_decoder.py:282-286` (DTYPE only — see §W5.10); `normalization.py:32-40` | spike §6 levers 1 and 2, which read them |
 | W5 rider (#1011) | `memory_efficient_decode.py:1-20`, `:91-105`, `:122-204`, `:234-248`, `:541-609`, `:617-627`; default `True` at `blocks.py:1059` | spike §6 lever 4, which read them |
 | W6 residency | upstream offloads the transformer, never the VAE (`installation.md:90`) | spike §6 lever 5 |
 | O1 oracle record | AGENTS.md oracle table; [`.agents/oracles/diffusers.md`](../oracles/diffusers.md) | — |
@@ -659,8 +659,9 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | W3 | owed |
 | [#1269](https://github.com/mudler/vllm.cpp/issues/1269) | W4 | owed; filed by this row |
 | [#1007](https://github.com/mudler/vllm.cpp/issues/1007) | W5 | **closed by `## W5` below, for the CONVOLUTION.** `vt::OpId::kConv3d` exists with a CPU and a CUDA arm, and the decode dispatches every `nn.Conv3d` call through it on the queue the engine resolved. Read the two rows under it before quoting that as "the decode runs on the device" |
-| [#1451](https://github.com/mudler/vllm.cpp/issues/1451) | W5 | **owed, filed by W5.** The arm is CONVOLUTION-ONLY. Every buffer between the convolutions — the norms, the SiLU, the AdaLN, the noise injection, `DepthToSpaceUpsample`, `AttnBlock3d`, `Linear3d`, `unpatchify` — is still a host loop, and there is no device `Ltx2VaeWeights`, so a non-CPU queue pays an upload and a download per convolution and re-uploads each weight. Upstream never moves the tensor back (`single_gpu_model_builder.py:267-288`, `conv_video_decoder.py:283-286`; vLLM-Omni `interface.py:92` "VAE(s) (always on GPU)"), so this is a divergence in memory behaviour and not only a cost. **No number is attached** — W5 took no lease |
+| [#1451](https://github.com/mudler/vllm.cpp/issues/1451) | W5 | **owed, filed by W5.** The arm is CONVOLUTION-ONLY. Every buffer between the convolutions — the norms, the SiLU, the AdaLN, the noise injection, `DepthToSpaceUpsample`, `AttnBlock3d`, `Linear3d`, `unpatchify` — is still a host loop, and there is no device `Ltx2VaeWeights`, so a non-CPU queue pays an upload and a download per convolution and re-uploads each weight. Upstream never moves the tensor back (`single_gpu_model_builder.py:267-288` at `:273`, `blocks.py:1139`; vLLM-Omni `interface.py:92` "VAE(s) (always on GPU)"), so this is a divergence in memory behaviour and not only a cost. **No number is attached** — W5 took no lease |
 | [#1452](https://github.com/mudler/vllm.cpp/issues/1452) | W5 | **owed, filed by W5, and it is the honest limit of the whole stage.** `src/vt/cuda/cuda_conv3d.cu` has never been compiled or executed anywhere in this project's reach: no `nvcc` on the box that wrote it, no GPU runner in CI, and CI does not complete in that environment so even `cuda-fat-build`'s verdict is unread. Its bit-identity with the CPU arm is a design argument (`__fmul_rn`/`__fadd_rn` against `-ffp-contract=off`), not a measurement. Owed: a compile, a `memcmp` CPU-vs-CUDA arm, an end-to-end pixel comparison before any wall-clock number, and the f16/bf16 storage the arm refuses by name |
+| [#1471](https://github.com/mudler/vllm.cpp/issues/1471) | W5 | **owed, filed in flow by W5's fresh review (F7) and NOT fixed here.** `vt::Conv2d` (`src/vt/ops.cpp:2749-2750`) and `vt::DepthwiseConv1d` (`:2883`) carry the identical truncating output-extent expression that F7 fixed in `vt::Conv3d`, so both disagree with the torch shape contract they advertise when the span is negative and stride > 1. Fixing them means two more red-first cases and a fresh review over ops this row does not own, and no caller is yet known to reach either path — that audit is part of the issue. `Conv1dOutLength` and `ConvTranspose1dOutLength` already guard it correctly, so the right shape is in the same file |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | W5 rider | owed. W5 did not take it: `[C, T, H, W]` is what both arms consume, and the memory format only decides which kernel family a RESIDENT arm can reach, which is [#1451](https://github.com/mudler/vllm.cpp/issues/1451) |
 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | W6 | owed, conditional |
 | [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | O1 | owed |
@@ -1716,7 +1717,11 @@ report nothing, which is the failure mode the spike's sampler already had.
 ## W5 — the video VAE decode's device arm (#1007)
 
 Issue: [#1007](https://github.com/mudler/vllm.cpp/issues/1007). Branch
-`row/LTX25-DEVICE-RESIDENCY-W5`, base `b537a5344`. Kernel-matrix row
+`row/LTX25-DEVICE-RESIDENCY-W5`, base `01854663c` (the MERGE BASE with
+`origin/main`, verified by `git merge-base`; an earlier draft of this section
+said `b537a5344`, which is 8 commits earlier and was never this branch's base —
+`AGENTS.md` and [`verification.md`](../verification.md) require the immutable
+SHA, so the number is corrected rather than dropped). Kernel-matrix row
 `KERNEL-CONV3D`, claim `CLAIM-LTX25-DEVICE-RESIDENCY-W5`.
 
 ### W5.0 Why this stage runs before W1, and what it is therefore NOT allowed to claim
@@ -1799,7 +1804,7 @@ read at that revision while writing this section.
 | the conv call itself | `convolution.py:312` `x = self.conv(x)` | the single call site the issue names |
 | placement is a BUILD-time decision | `packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py:267-288`, defaulting to CUDA at `:273`; `packages/ltx-core/src/ltx_core/devices.py:29-39` resolves CUDA -> MPS -> CPU | the decoder is never asked per call where to run. It is `.to(device)` once (`:288`) and the latent follows it |
 | the pipeline's decode entry | `packages/ltx-pipelines/src/ltx_pipelines/utils/blocks.py:1139` | `self._decoder_builder.build(device=self._device, dtype=build_dtype)` — the device is the pipeline's, fixed before the first frame |
-| the dtype/device polarity | `conv_video_decoder.py:283-286` `sample = sample.to(weights_dtype)` | the latent takes the WEIGHTS' dtype and device, not the other way round |
+| the dtype polarity, and ONLY the dtype | `conv_video_decoder.py:283-286` `weights_dtype = next(self.parameters()).dtype` then `sample = sample.to(weights_dtype)` | the latent takes the WEIGHTS' DTYPE, not the other way round. **NOT a device move:** there is no `.to(device)` anywhere in that function. Placement is settled by the two rows above and by nothing here |
 
 Two secondary oracles, cited for placement only and never for arithmetic, at the
 revisions [`oracles/sglang.md`](../oracles/sglang.md) and
@@ -2014,8 +2019,11 @@ merging `main` brought its fix (`9ecaf1bb3`) and it passes post-merge.
 
 ### W5.9 What was measured, and what stayed green
 
-Base `b537a5344` + this branch, x86-64, GCC, CPU-only, `-DVLLM_CPP_BUILD_TESTS=ON`,
-Ninja. Every mutation was applied to the source, REBUILT, run, then restored and
+Base `01854663c` + this branch, x86-64, GCC, CPU-only, `-DVLLM_CPP_BUILD_TESTS=ON`,
+Ninja. (The first draft of this line said `b537a5344`; that SHA is 8 commits
+before the real merge base and named the wrong tree for every number below. A
+fresh review re-ran the focused numbers at the branch head `7f23aadb5` and every
+one reproduced, so what was wrong was the ADDRESS and not the measurement.) Every mutation was applied to the source, REBUILT, run, then restored and
 REBUILT again with the green reconfirmed — a stale binary reads exactly like a
 working mutation.
 
@@ -2056,7 +2064,7 @@ applied, and the failing assertion BY NAME.
 | M1' | the same call textually DELETED | **NO** | 2 | Does not build: `unused parameter 'bias' [-Werror=unused-parameter]` and `Conv3dThroughSeam defined but not used [-Werror=unused-function]`. Recorded because a mutation that fails to build reads exactly like a passing test. M1 is the form that BUILDS, and it is the one the verdict rests on |
 | M2 | the queue's device ignored; every dispatch forced to `kCPU` | YES | 0 | **RED.** `test_diffusion_device_seam` exit 1, `FAILURE!`, 1 of 7 cases. `CHECK( xpu.selections == 2u )` reads `0 == 2` and `CHECK( cpu.selections == 0u )` reads `2 == 0` in *the video decode RUNS ITS CONVOLUTION on a non-CPU queue, byte-identically*. This is T5's red-before |
 | M3 | the CPU kernel's per-input-channel partial replaced by `kConv2d`'s flat accumulator, bias last | YES | 0 | **RED on the op, GREEN on the model.** `test_ops_conv3d` exit 1, 2 of 4 cases, 140 of 2035 assertions; `CHECK( std::memcmp(got.data(), blocked.data(), blocked.size()) == 0 )` reads `6 == 0` in *the per-input-channel partial is NOT the flat accumulator*. `test_ltx2_vae` stays **44/44 GREEN**. Reported as a result, not omitted: it is why the op carries its own order case |
-| M4 | the production call site passes `nullptr` instead of the engine's queue | YES | 0 | **GREEN** on `test_ltx2_vae` (44/44), `test_diffusion_device_seam` (7/7) and the end-to-end ABI case *an ABI client loads, detects and generates through vllm.h* (1 case / 15 assertions, the same numbers as the unmutated baseline). Green for lack of hardware rather than for lack of a test — see §W5.10 |
+| M4 | the production call site passes `nullptr` instead of the engine's queue | YES | 0 | **GREEN** on `test_ltx2_vae` (44/44) and `test_diffusion_device_seam` (7/7). Green for lack of hardware rather than for lack of a test — see §W5.10. **The end-to-end ABI case is NOT listed here any more.** It was, and a fresh review showed it is not a control for M4: it is equally green under M1, which removes the dispatch entirely. A test that cannot separate the two mutations is evidence about neither — F6 below |
 
 ### W5.10 The one link nothing here can gate, stated as a result
 
@@ -2073,9 +2081,215 @@ What that leaves, split honestly into three links rather than one claim:
 
 | Link | What it is | Gated by |
 |---|---|---|
-| A | the entry point -> the decode -> `vt::Conv3d` | the video goldens and the dispatch-count case, both entered at `Ltx2VideoDecodeStreaming`. M1 reds them |
-| B | a NON-CPU queue -> upload, dispatch, download, byte-identical pixels | T5, on the fake XPU backend. M2 reds it. **This is what W5 adds that §12.8 could not**: the callee half of the residency question is now executable on a box with no GPU |
+| A | `Ltx2VideoDecodeStreaming` -> the decode -> `vt::Conv3d` | the video goldens and the dispatch-count case, both entered at `Ltx2VideoDecodeStreaming`. M1 reds them. That entry is **ONE HOP BELOW** `include/vllm.h`, not the ABI itself: `Ltx2VideoEngine::Generate` calls it (`src/vllm/multimodal/ltx2_video.cpp::Ltx2VideoEngine::Generate`; the anchor is by SYMBOL because both this PR and its review quoted a line number — `:4612` and `:4616` — that the PR's own edits had already moved off the call, which is exactly the rot `ENG-RECORD-ANCHOR-RATCHET` measures). Far stronger than constructing the type by hand, and not the same claim — see F6 below |
+| B | a NON-CPU queue -> upload, dispatch, download, byte-identical pixels | T5, on the fake XPU backend. M2 reds it. **W5 BUILT THE INSTRUMENT §12.8 DEFERRED**, and measured what it costs: the callee half of the residency question is now executable on a box with no GPU. See F8 below for what that does and does not settle |
 | C | the engine's own `on_device` ternary -> a real accelerator | **nothing here.** #1426, and a GPU |
 
 Link C is one argument in one ternary whose other branch link A gates. Naming it
 is the difference between a staged link and dead code.
+
+### W5.11 What a fresh review returned, and what each finding cost
+
+A fresh review of `7f23aadb5` returned **PASS with 8 findings, none blocking the
+design**. It resolved every anchor, reproduced every gate number at the true
+head, and validated the new device-seam instrument with a mutation of its own.
+The repairs are recorded here rather than summarised, because six of the eight
+are corrections to THIS document and a correction that does not say what it
+corrected is indistinguishable from a rewrite.
+
+**F1 — the merge, and the value that was neither side's.** The branch went behind
+`origin/main` while it was in review, and `check-agent-record.py` conflicted.
+`main` bumped its `KERNEL` count 52 -> **53** for `KERNEL-DFLASH2-GROUPED-CONV`
+(#1314); this row bumped 52 -> **53** for `KERNEL-CONV3D`. **Both sides said 53
+and the merged value is 54**, so a resolution that picks a side is wrong
+whichever side it picks. `.agents/kernel-matrix.md` union-merges to 54 rows, so
+53 would have RED the gate rather than passing quietly — it fails safe — but it
+was resolved to 54 deliberately and both justification paragraphs were kept.
+`.agents/engine-matrix.md` conflicted on `ENG-RECORD-ANCHOR-RATCHET`, where this
+row had bumped five line anchors by +8 and `main` had replaced the same five with
+SYMBOL anchors for that precise reason; `main`'s side was taken whole.
+`ltx2_video_vae_tiled.cpp` conflicted a third time, after `fdefb4529`
+(`LTX25-RESIDENCY-W0`) landed a `decode.video.vae` phase scope around the call
+this row had given a `queue` argument — resolved by keeping BOTH, which no
+automatic merge would have produced.
+
+The op-enum auto-merge was re-verified rather than trusted: extracting `OpId`
+from the merge base, from `origin/main` and from the merged tree gives 124, 125
+and 126 names, `main` adds `kDFlashGroupedConv` alone, the merged tree adds
+`kConv3d` alone, and `kConv3d` is still the last name before `kCount`.
+
+**F2 — a citation used for more than it says.** `conv_video_decoder.py:283-286`
+was cited for *"the latent following the weights"* inside paragraphs about DEVICE
+PLACEMENT. At that anchor upstream reads `weights_dtype =
+next(self.parameters()).dtype` and then `sample = sample.to(weights_dtype)`: a
+DTYPE follow, with no `.to(device)` anywhere in that function. The substantive
+placement claim was already carried correctly by `single_gpu_model_builder.py:273`
+and `blocks.py:1139`, so nothing downstream was wrong and no conclusion moved —
+what changed is that the anchor no longer stands behind a claim it cannot
+support, in `include/vllm/model_executor/models/ltx2_video_vae.h`, in
+`src/vllm/multimodal/ltx2_video.cpp`, in the `## Owed` row for
+[#1451](https://github.com/mudler/vllm.cpp/issues/1451) above, and in the
+polarity table in §W5.8.
+
+*The two ranges are reconciled, and the reconciliation is stated rather than
+guessed.* This tree cites the same dtype block two ways: `:282-284` (in the stage
+table above, and in [`ltx25-decode-speed.md`](ltx25-decode-speed.md) for
+`output_dtype = sample.dtype`) and `:283-286` (for `sample =
+sample.to(weights_dtype)`). They OVERLAP and name adjacent statements of one
+block rather than contradicting each other, so the stage table now reads
+`:282-286` and says `DTYPE only`. **LIMITATION, recorded because it bounds this
+repair:** the Lightricks/LTX-2 checkout is not present on this host, so the exact
+bytes at those lines were NOT re-read here. The correction is conservative in the
+only direction that matters — it NARROWS a claim onto anchors that two
+independent citations in this tree already support — and re-reading upstream is
+owed to whoever next has that checkout.
+
+*The index row could not be corrected in place, and this paragraph is the
+correction.* [#1451](https://github.com/mudler/vllm.cpp/issues/1451)'s row in
+[`issue-index.md`](../issue-index.md) carries the same overreach. That file is
+append-only and carries `merge=union`, so editing the row means a REMOVED line —
+which `check-issue-index-append-only.py` refuses, and which union-merge would
+DUPLICATE rather than merge. Appending a second #1451 row would be worse than the
+defect it repairs. So the row stands and the correction lives here, which is what
+`AGENTS.md` §Records asks for.
+
+**F3 — the gate evidence named the wrong base SHA.** §W5 and §W5.9 said base
+`b537a5344`. The true merge base is `01854663c`, eight commits later. The review
+re-ran every focused number at the real head and all of them reproduced, so the
+measurements were sound and only their ADDRESS was wrong;
+[`verification.md`](../verification.md) requires the immutable SHA, so both
+stamps are corrected in place rather than deleted.
+
+**F4 — one public document was missing a limit the commit body claimed it
+carried.** The head commit body asserts that STATUS, BENCHMARKS, FEATURES and
+USAGE *"all say the same two limits"*. Three of them named both #1451 and #1452;
+`docs/BENCHMARKS.md` named only #1452. The sentence was made TRUE rather than
+softened: BENCHMARKS now carries the host-loop limit too. Under a squash the
+false sentence would not have landed, but `AGENTS.md` also permits a local
+operator merge, under which it would have.
+
+**F5 — index rows were not at the tail, and MEASURING it reversed the answer.**
+#1451 and #1452 sat five rows above the end of `issue-index.md`, against
+`AGENTS.md`'s *"Append a row at the end."* It is gate-invisible: the append-only
+checker inspects REMOVED lines only and has no positional check.
+
+The obvious reasoning says leave it — moving a row means removing a line, which
+is the one edit that checker refuses. **That reasoning is wrong here, and a probe
+said so.** `check-issue-index-append-only.py` diffs the MERGE BASE against the
+head, not the previous commit, and these two rows do not exist at the merge base:
+this row added them. Relative to `01854663c` a move within their own addition
+removes NOTHING. Measured on a detached scratch commit built through a private
+`GIT_INDEX_FILE` — because a working-tree mutation of a commit-reading checker
+returns 0 without ever reading the mutated bytes, which is #1417's lesson — the
+moved index gives `OK: issue index append-only`, rc 0. So the rows were moved to
+the tail and the written rule is satisfied rather than excused.
+
+The union-merge hazard the rule exists to prevent is untouched by this, for the
+same reason: a line that is new on this branch cannot be an EDIT of a line
+another branch also has.
+
+**F6 — the only test that enters at the ABI is PIXEL-BLIND.** Under M1, with the
+whole convolution dispatch removed so the decode emits all-zero pixels, the
+end-to-end case *"ltx2 video: an ABI client loads, detects and generates through
+vllm.h"* stays **GREEN** — the same case count and assertion count as the
+unmutated baseline, with the filter confirmed to have matched.
+
+This is NOT a "nothing lands dead" failure and it is not recorded as one. The
+code is unambiguously reached: `Ltx2VideoEngine::Generate` calls
+`Ltx2VideoDecodeStreaming`, the video goldens and the dispatch-count case enter
+there, and M1 reds twelve of their forty-four cases. Entering one hop below the
+ABI is far stronger than constructing the type by hand. What the finding changes
+is how link A above should be READ — `Ltx2VideoDecodeStreaming` is one hop below
+`include/vllm.h`, not the entry point — and it removes the ABI case from M4's
+evidence row, because a case that is equally green under M1 and under M4
+discriminates neither and was never a control for either.
+
+**F7 — the shape contract diverged from the contract it advertises, and it is
+FIXED rather than documented.** `vt::Conv3d`'s output-extent formula used C++
+integer division, which truncates toward zero; torch FLOORS. The two differ only
+when `(in + 2*pad - dilation*(k-1) - 1)` is negative AND stride > 1. At
+`tin = 2, k = 3, stride = 2, pad = 0` the numerator is -1: torch computes
+`floor(-1/2) + 1 = 0` and raises *"Output size is too small"*, while truncation
+computed `-1/2 + 1 = 1` and ACCEPTED a `Tout` of 1, convolving over taps the
+stride had skipped.
+
+**Unreachable from LTX**, which is why no model gate here could hold it:
+`CausalConv3d` materialises a pad of at least the kernel on every axis, so the
+padded extent is never below the kernel and the numerator is never negative. The
+review reasoned it from source without executing it. It was reproduced BY
+EXECUTION here, in a three-step cycle over one build directory:
+
+| Step | BUILT | compile err | `git diff --stat` | `test_ops_conv3d` |
+|---|---|---|---|---|
+| the floored guard in place | YES | 0 | `src/vt/ops.cpp` 54 +++ | exit 0, **4 of 4 cases, 2036 of 2036 assertions**, `Status: SUCCESS!` |
+| M-F7: reverted to C++ truncating division | YES | 0 | `src/vt/ops.cpp` 43 +++ | **exit 1, 1 of 4 cases failed, 1 of 2036 assertions.** `CHECK_THROWS( vt::Conv3d(q, to, tx2, tw, nullptr, strided) ) did NOT throw at all!` at `tests/vt/test_ops_conv3d.cpp:446` |
+| restored byte-for-byte | YES | 0 | `src/vt/ops.cpp` 54 +++ | exit 0, 4 of 4, 2036 of 2036, `SUCCESS!` |
+
+Every rewritten file was `touch`ed twice around a sleep before each rebuild,
+because a file that keeps its old mtime makes ninja SKIP the rebuild and the
+no-op then reports `BUILT=YES compile_err=0` over the PREVIOUS binary. The
+`git diff --stat` column is the other half of that trap: a mutation that never
+applied reads exactly like a passing test, and the 54 / 43 / 54 line counts are
+what prove it moved and moved back.
+
+**The first attempt at this case was a FALSE red, and it is recorded because it
+nearly landed.** It reused the enclosing fixture's `tx`, whose `Tin` is 3. At
+`Tin = 3` the span is `3 + 0 - 2 - 1` = **0**, which is non-negative, so floor and
+truncation AGREE and torch accepts that geometry too — the `CHECK_THROWS` was
+failing against CORRECT behaviour. It was red before the fix and still red after
+it, and only that second symptom exposed it. A case that is red for the wrong
+reason is indistinguishable from one that is red for the right reason, right up
+until the fix fails to move it.
+
+*The decision, and why it went this way rather than into a header note.* §W5.4
+offers this op to other models as a SHARED SEAM, and the header at `vt::Conv3d`
+states that it mirrors `nn.Conv3d`'s shape contract. A shared seam that silently
+disagrees with the contract it advertises is the more expensive option later, and
+the fix is a strict no-op on every reachable path: for a non-negative numerator
+floor and truncation are the same value, so no shipped geometry, golden or
+tolerance moves. Documenting the divergence instead would have cost every reader
+of the seam the exact guarantee the header sells. The sibling SUBCASE at stride 1
+is kept and now says why it cannot substitute: at stride 1 the two divisions
+AGREE, so that case is blind to this defect.
+
+*The sibling ops carry the same expression, and they are FILED rather than
+fixed.* `vt::Conv2d` (`src/vt/ops.cpp:2749-2750`) and `vt::DepthwiseConv1d`
+(`:2883`) compute their extents the same truncating way.
+[#1471](https://github.com/mudler/vllm.cpp/issues/1471) owns them and is listed
+under `## Owed` above. They are not repaired here because that means two more
+red-first cases and a fresh review over ops this row does not own, and because no
+caller is yet known to reach a negative span on either — an audit, not an
+assumption. `Conv1dOutLength` (`:2886`) and `ConvTranspose1dOutLength` already
+refuse a negative span explicitly, so three of the five conv wrappers in this
+file were right all along, which is the strongest argument that the other two are
+a slip rather than a decision.
+
+**F8 — one sentence overstated, and the true version is stronger.** §W5.10 said
+link B is *"what W5 adds that §12.8 could not"*. §12.8 of
+[`ltx25-guided-video.md`](ltx25-guided-video.md) actually says the branch is
+*"deferred on cost, not closed on impossibility"*, and its link B is the **DiT**
+forward `Ltx2DitForwardDevice` — a different path from this row's VAE
+convolution. **W5 does not close
+[#1426](https://github.com/mudler/vllm.cpp/issues/1426).**
+
+What W5 did do is BUILD the instrument §12.8 deferred, and measure its cost:
+**129 lines added to `tests/vllm/multimodal/test_diffusion_device_seam.cpp`**, an
+executable that already existed (`d415c931d`). That is the number that matters to
+#1426, because #1426's blocking assessment was a COST assessment, and a cost
+measured at ~130 lines inside an existing binary makes the same technique cheap
+to apply to the DiT. Weakening a deferral is not closing it, and this row claims
+only the first.
+
+**The non-blocking suggestion was taken, and moved one level up.** The review
+offered a one-line log on the first CUDA `kConv3d` dispatch naming #1452, to turn
+a silent first execution of never-compiled, never-run code into an announced one.
+It is in `vt::Conv3d` in `src/vt/ops.cpp` and fires once per process on the first
+NON-CPU dispatch of any device type, rather than inside the `.cu` file. Two
+reasons: the same argument holds for every accelerator arm this seam gains, and
+host code is code this box COMPILES and `test_diffusion_device_seam` EXECUTES —
+putting the answer to "never-compiled code runs unannounced" inside
+never-compiled code would have been the defect wearing the repair. It does not
+reduce the residual risk the review named, which is real and unchanged: a
+compiling-but-wrong CUDA kernel would produce wrong pixels on `--device cuda`,
+and no gate anywhere in this tree catches it. That is
+[#1452](https://github.com/mudler/vllm.cpp/issues/1452).

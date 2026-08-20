@@ -417,4 +417,32 @@ TEST_CASE("conv3d: the shape contract refuses by name") {
     Tensor tw = Tensor::Contiguous(big.data(), DType::kF32, Cpu(), {4, 5, 5, 5});
     CHECK_THROWS(vt::Conv3d(q, to, tx, tw, nullptr, args));
   }
+  SUBCASE("a kernel larger than the padded input, WITH a stride over 1") {
+    // #1007 fresh review F7. The extent formula's numerator is NEGATIVE here —
+    // `tin + 2*pad - dilation*(kt-1) - 1` = `2 + 0 - 2 - 1` = -1 — and C++
+    // integer division TRUNCATES TOWARD ZERO while torch's shape contract
+    // FLOORS. Truncation gives `-1 / 2 + 1` = 1 and accepts a `Tout` of 1,
+    // convolving over taps the stride skipped; torch gives `floor(-1/2) + 1` = 0
+    // and raises "Output size is too small".
+    //
+    // The header at vt::Conv3d claims to mirror torch's shape contract, and
+    // `LTX25-DEVICE-RESIDENCY` §W5.4 offers this op to other models as a shared
+    // seam, so the divergence had to close rather than be documented.
+    // UNREACHABLE FROM LTX — `CausalConv3d` materialises a pad of at least the
+    // kernel on every axis — which is why no model gate here can hold it and
+    // why this case exists.
+    //
+    // Stride 1 keeps the sibling SUBCASE above red for its own reason: at
+    // stride 1 truncation and floor AGREE (`-1 / 1` is -1 either way), so that
+    // case cannot detect this defect and this one cannot replace it.
+    // Tin must be 2, not the enclosing fixture's 3: at Tin = 3 the span is
+    // `3 + 0 - 2 - 1` = 0, which is NON-NEGATIVE, and floor and truncation agree
+    // on it. The case is only discriminating where the span is negative.
+    std::vector<float> xs2(2 * 2 * 4 * 4, 0.5f);
+    Tensor tx2 = Tensor::Contiguous(xs2.data(), DType::kF32, Cpu(), {2, 2, 4, 4});
+    Conv3dArgs strided = args;
+    strided.stride_t = 2;
+    Tensor tw = Tensor::Contiguous(ws.data(), DType::kF32, Cpu(), {4, 3, 3, 3});
+    CHECK_THROWS(vt::Conv3d(q, to, tx2, tw, nullptr, strided));
+  }
 }

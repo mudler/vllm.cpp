@@ -1111,6 +1111,23 @@ attention block are still host loops, so a device queue pays a round trip per
 convolution ([#1451](https://github.com/mudler/vllm.cpp/issues/1451)). No speed
 number is published for this path.
 
+**The first non-CPU convolution announces itself on stderr,** once per process,
+on the shipped default and behind no flag:
+
+```text
+[vt] first non-CPU vt::Conv3d dispatch (device type 4). This arm has never been
+run on real hardware; see issue #1452.
+```
+
+It is a notice and not a warning: nothing is degraded, nothing falls back, and
+the line is printed at most once however many convolutions follow. It exists
+because the CUDA arm of this op has never been compiled or executed anywhere in
+this project's reach, and no gate here can catch a kernel that compiles and
+computes the wrong pixels — so the first machine that runs it should see the
+moment it happened beside whatever the frames look like. Compare the frames
+before you read a timing. The line disappears from this document when
+[#1452](https://github.com/mudler/vllm.cpp/issues/1452) closes.
+
 ### Where the render spent its wall: `phase-log.json`
 
 Every completed LTX-2.5 render writes **`<workdir>/phase-log.json`** beside the

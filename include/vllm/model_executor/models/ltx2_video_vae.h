@@ -235,8 +235,13 @@ struct Ltx2VideoFrames {
 // dispatch with a CPU device, its tensors are views over the host buffers, and
 // it is byte-identical to the pre-seam host loop. Upstream decides placement the
 // same way and never per call, building the decoder onto a device once
-// (single_gpu_model_builder.py:267-288, CUDA by default at :273) with the latent
-// following the weights (conv_video_decoder.py:283-286).
+// (blocks.py:1139; single_gpu_model_builder.py:267-288, CUDA by default at
+// :273). Those two anchors carry the PLACEMENT claim on their own.
+// conv_video_decoder.py:283-286 is deliberately NOT cited for it: that block
+// reads `weights_dtype = next(self.parameters()).dtype` and then
+// `sample = sample.to(weights_dtype)`, so the latent follows the weights' DTYPE
+// there, and the function contains no `.to(device)` at all (#1007 fresh review
+// F2).
 //
 // STAGED: only the CONVOLUTION is on the queue's device. The norms, the SiLU,
 // the AdaLN, the noise injection, the depth-to-space upsample, the attention

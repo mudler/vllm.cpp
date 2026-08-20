@@ -1527,6 +1527,28 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_downloader vllm/transformers_utils/test_downloader.cpp)
   vllm_cpp_add_test(test_model_resolver
     vllm/transformers_utils/test_model_resolver.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W5 (#1280): the transport-layer-security suite. It is
+  # the ONE place in this row that speaks https, and the one place that measures
+  # whether the server half and the fetcher half were compiled against the same
+  # cpp-httplib layout. Its TLS arm starts a real `httplib::SSLServer` on
+  # loopback, so it shares the RUN_SERIAL treatment below.
+  vllm_cpp_add_test(test_tls_transport
+    vllm/transformers_utils/test_tls_transport.cpp)
+  # THE EXPECTATION, computed on a path that does NOT read the macro under test.
+  # `VLLM_CPP_TEST_EXPECT_TLS` says "the user asked for the download feature and
+  # this host has the OpenSSL development files", which is a fact about the
+  # CONFIGURATION. The suite then asserts that the BUILD delivered transport
+  # layer security. Deriving the expectation from `CPPHTTPLIB_OPENSSL_SUPPORT`
+  # instead would make the case a tautology that a silently disabled feature
+  # passes, which is the exact failure `scripts/validate-container-image.py`
+  # exists to catch in the container.
+  if(VLLM_CPP_HF_DOWNLOAD_REQUESTED AND VLLM_CPP_OPENSSL)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+      target_compile_definitions(test_tls_transport PRIVATE
+        VLLM_CPP_TEST_EXPECT_TLS=1)
+    endif()
+  endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1551,7 +1573,7 @@ if(VLLM_CPP_SERVER)
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
-    test_downloader test_model_resolver
+    test_downloader test_model_resolver test_tls_transport
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same

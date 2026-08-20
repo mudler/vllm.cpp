@@ -305,6 +305,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Container images | ◐ `cuda`/`vulkan`/`cpu` lanes build and gate from one Dockerfile (amd64+arm64, `ENTRYPOINT vllm-server`, ffmpeg included); **nothing published to GHCR yet** | ✅ | ✅ | ✅ |
 | Graceful shutdown on `SIGTERM` | ✅ clean exit in 0.25 s, including as container PID 1 (#312) | ✅ | ✅ | ✅ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
+| Fetch a checkpoint from Hugging Face by name | ◐ `vllm-server --model org/repo[:QUANT]` fetches into the HF cache. HTTPS via system OpenSSL (`VLLM_CPP_HF_DOWNLOAD`, ON). The musl-static archive has no TLS. `vllm-cli` and the C ABI take a local path (#1280) | ✅ | ✅ | ✅ |
 | A registered forward opens its OWN model type, not whatever it was handed | ✅ all 35 entry points establish the concrete type first and refuse a mismatch by name (#775, swept in [#847](https://github.com/mudler/vllm.cpp/issues/847)) | n/a | n/a | n/a |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |

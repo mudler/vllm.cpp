@@ -48,6 +48,19 @@ The server also supports OpenAI clients that use
 `http://localhost:8000/v1` as their base URL. The model-specific guides record
 extra files and launch flags when a model needs them.
 
+`--model` also takes a Hugging Face repository name, which the server fetches
+into the cache before it binds:
+
+```sh
+build/examples/vllm-server --model Qwen/Qwen3-0.6B --port 8000
+```
+
+That form needs a build that carries transport layer security. See [Access
+Hugging Face checkpoints](guides/hugging-face-access.md) for the build options,
+`--revision`, `--download-dir`, the `HF_*` environment variables, and the
+release lanes that carry no fetch. `vllm-cli` and the C ABI still take a local
+path only.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in

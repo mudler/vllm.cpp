@@ -12,6 +12,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "vllm/http_transport_abi.h"
 #include "vllm/transformers_utils/hf_cache.h"
 
 namespace vllm {
@@ -537,4 +538,21 @@ std::string HubResolveCommitCached(const std::string& repo_id,
 }
 
 }  // namespace transformers_utils
+
+// The FETCHER half of the one-definition-rule instrument declared in
+// `include/vllm/http_transport_abi.h`. It is defined HERE, in the translation
+// unit that actually opens the hub connection, so the reading is that unit's
+// own and not a shared constant compiled once.
+HttpTransportAbi HubHttpTransportAbi() {
+  HttpTransportAbi abi;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  abi.tls = true;
+#else
+  abi.tls = false;
+#endif
+  abi.result_size = sizeof(httplib::Result);
+  abi.client_connection_size = sizeof(httplib::ClientConnection);
+  return abi;
+}
+
 }  // namespace vllm

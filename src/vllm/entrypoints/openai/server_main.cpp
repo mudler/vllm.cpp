@@ -68,6 +68,7 @@
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/config/offload.h"
+#include "vllm/http_transport_abi.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/transformers_utils/model_resolver.h"
 #include <fstream>
@@ -863,6 +864,18 @@ namespace openai {
 
 int VllmServerMain(int argc, char** argv) {
   try {
+    // ENG-HF-MODEL-DOWNLOAD W5 (#1280). BEFORE anything is parsed, bound or
+    // fetched: `CPPHTTPLIB_OPENSSL_SUPPORT` is a whole-header switch that
+    // changes the layout of `httplib::Result`, and this binary carries both a
+    // listener and a hub client compiled from that one header. A build that
+    // defined it for some translation units and not for others LINKS CLEANLY
+    // and then corrupts every response object handed across the seam. Refusing
+    // here is the only place a user finds out before a wrong answer.
+    const std::string transport_mismatch = vllm::HttpTransportAbiMismatch();
+    if (!transport_mismatch.empty()) {
+      std::cerr << transport_mismatch << "\n";
+      return 2;
+    }
     Args args = ParseArgs(argc, argv);
     if (args.verbose) {
       SetEnvironment("VT_SERVER_VERBOSE", "1");

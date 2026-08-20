@@ -225,6 +225,95 @@ TEST_CASE("BpeSplit merges lowest rank first, leftmost on ties") {
   CHECK(BpeSplit("ĠĠĠ", r2) == V{"ĠĠ", "Ġ"});  // leftmost tie
 }
 
+TEST_CASE("the leftmost tie holds on a long symbol list") {
+  // The comparator is where leftmost-wins lives. `Ord for Merge`
+  // (tokenizers/src/models/bpe/word.rs:28-35) inverts both comparisons so the
+  // max-heap yields the lowest rank first and the lowest POSITION on a tie. A
+  // three-symbol case cannot separate leftmost from rightmost past the first
+  // merge; these can.
+  //
+  // ORACLE: HF tokenizers 0.22.2 on a tokenizer.json with vocab {"a":0,"aa":1}
+  // and merges [["a","a"]] returns, for "aa".."aaaaaa":
+  //   [1] [1,0] [1,1] [1,1,0] [1,1,1] = aa / aa a / aa aa / aa aa a / aa aa aa
+  // A rightmost-wins order gives "a aa" for "aaa" and "a aa aa" for "aaaaa".
+  MergeRanks ranks;
+  CHECK(ranks.Insert("a", "a", 0));
+  using V = std::vector<std::string>;
+  CHECK(BpeSplit("aa", ranks) == V{"aa"});
+  CHECK(BpeSplit("aaa", ranks) == V{"aa", "a"});
+  CHECK(BpeSplit("aaaa", ranks) == V{"aa", "aa"});
+  CHECK(BpeSplit("aaaaa", ranks) == V{"aa", "aa", "a"});
+  CHECK(BpeSplit("aaaaaa", ranks) == V{"aa", "aa", "aa"});
+}
+
+TEST_CASE("a queued candidate invalidated by an earlier merge is SKIPPED") {
+  // The stale-entry case, built so that applying the stale entry produces
+  // DIFFERENT identifiers rather than the same ones by luck.
+  //
+  //   rank 0  b + c  -> bc
+  //   rank 1  a + b  -> ab
+  //   rank 2  a + bc -> abc
+  //
+  // Seeded from "a b c" the queue holds (pos 0, rank 1, new_id ab) and
+  // (pos 1, rank 0, new_id bc). Rank 0 pops first and merges b+c, which leaves
+  // the rank-1 entry at position 0 STALE: the pair there is now (a, bc).
+  //
+  // (a, bc) IS in the table, so "does the pair exist" ACCEPTS the stale entry
+  // and applies it with new_id = ab, yielding {"ab"} and losing "c" entirely.
+  // Upstream compares `new_id` instead (word.rs:197-205): abc != ab, so the
+  // entry is skipped, the rank-2 entry runs, and the answer is {"abc"}.
+  //
+  // ORACLE: HF tokenizers 0.22.2 on a tokenizer.json with that vocab and those
+  // merges returns abc -> ["abc"], ababc -> ["ab", "abc"], aab -> ["a", "ab"],
+  // abcb -> ["abc", "b"].
+  MergeRanks ranks;
+  CHECK(ranks.Insert("b", "c", 0));
+  CHECK(ranks.Insert("a", "b", 1));
+  CHECK(ranks.Insert("a", "bc", 2));
+  using V = std::vector<std::string>;
+  CHECK(BpeSplit("abc", ranks) == V{"abc"});
+  CHECK(BpeSplit("ababc", ranks) == V{"ab", "abc"});
+  CHECK(BpeSplit("aab", ranks) == V{"a", "ab"});
+  CHECK(BpeSplit("abcb", ranks) == V{"abc", "b"});
+  // The two pairs that reach position 0 do NOT share a new_id, which is what
+  // makes the comparison observable at all.
+  const MergeRanks::Entry* ab = ranks.Find(ranks.Find("a"), ranks.Find("b"));
+  const MergeRanks::Entry* abc = ranks.Find(ranks.Find("a"), ranks.Find("bc"));
+  REQUIRE(ab != nullptr);
+  REQUIRE(abc != nullptr);
+  CHECK(ab->new_id != abc->new_id);
+}
+
+TEST_CASE("a queued candidate whose left symbol lost its right neighbour") {
+  // The second validation (word.rs:191). Same three tokens as the case above,
+  // different merge ORDER, chosen so a queued entry survives the merge that
+  // takes its position's right neighbour away:
+  //
+  //   rank 0  b + c  -> bc      rank 1  a + bc -> abc      rank 2  a + b -> ab
+  //
+  // Seeded from "a b c" the queue holds (pos 0, rank 2) and (pos 1, rank 0).
+  // Rank 0 merges b+c and pushes (pos 0, rank 1). Rank 1 then merges a+bc, and
+  // position 0's `next` becomes -1 because bc was the last symbol. The rank-2
+  // entry is still queued at position 0, and it pops with NO RIGHT NEIGHBOUR.
+  //
+  // Deleting that guard does not change these ids: `next` is -1, the cast to an
+  // index reads one Symbol BEFORE the vector, and the garbage identifier it
+  // finds does not name a merge. It is a memory-safety guard, so its proof is
+  // the sanitizer, not a value comparison — see the spec's `## Outcome`. This
+  // case exists so the branch is REACHED at all, which is the half a value
+  // assertion can still carry.
+  //
+  // ORACLE: HF tokenizers 0.22.2 on that vocab and that merge order returns
+  // abc -> ["abc"].
+  MergeRanks ranks;
+  CHECK(ranks.Insert("b", "c", 0));
+  CHECK(ranks.Insert("a", "bc", 1));
+  CHECK(ranks.Insert("a", "b", 2));
+  using V = std::vector<std::string>;
+  CHECK(BpeSplit("abc", ranks) == V{"abc"});
+  CHECK(BpeSplit("abcabc", ranks) == V{"abc", "abc"});
+}
+
 TEST_CASE("MergeRanks interns symbols and keys merges on identifier pairs") {
   // Mirrors HF `tokenizers` `MergeMap` (models/bpe/model.rs:19): the key is a
   // pair of identifiers and the value carries `(rank, new_id)`.

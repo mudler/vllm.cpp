@@ -31,11 +31,11 @@
 // `[128, 128]` `dynamic` checkpoint now LOADS, and only the shapes and schemes
 // nothing here can execute are still refused.
 //
-// SCOPE. Reading the config and refusing what M3 does not cover. The loader
-// rung lives in `qwen3_5_dense_weights.cpp`, the weight in
-// `models/qwen3_5_weights.h`, and the linear method does not exist yet — #1189
-// milestone M4 owns it, and `PrepareQwen3_5Dense` refuses a loaded-but-unread
-// block weight by name rather than letting the forward produce a number.
+// SCOPE. Reading the config and refusing what this file does not cover. The
+// loader rung lives in `qwen3_5_dense_weights.cpp` and the weight in
+// `models/qwen3_5_weights.h`. The linear method landed in #1189 milestone M4
+// (`281b4bc76`), so `PrepareQwen3_5Dense` no longer refuses a loaded-but-unread
+// block weight: it refuses a device with no block-scaled GEMM.
 #pragma once
 
 #include "vt/device.h"  // vt::DeviceType

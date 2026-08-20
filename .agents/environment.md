@@ -529,6 +529,57 @@ environment:
     parallel-flake advice in the Apple/Metal profile below does not transfer
     here. Serialising also means every other probe queues behind the suite, so
     run attribution arms BEFORE a full suite, never during one.
+  - **★ TREAT A SERVING LEG AS AT RISK OF A REBOOT TOO, NOT ONLY A BUILD OR A
+    LOAD — THOUGH ONLY THE REBOOT IS OBSERVED AND ITS PLACEMENT NEXT TO THE LEG
+    IS DERIVED — AND FROM INSIDE A LEASE `boot_id` IS THE ONLY INSTRUMENT THAT
+    SEES A REBOOT AT ALL
+    (measured 2026-08-19, [#915](https://github.com/mudler/vllm.cpp/issues/915)).**
+    **Read the heading at the strength of its parts.** What `boot_id` observes is
+    that a reboot happened somewhere between two readings about **11.2 hours**
+    apart, and across the same unpinned clock boundary: the old value is last
+    recorded in `clock-vllm-c1-r3.json`, written 10:18:51.7Z on `dgx`, and the
+    new one landed in a log written 21:29:35.6Z on the local host. The serving
+    leg occupied about
+    **6.5 minutes** of that span. Putting the reboot next to the leg needs the
+    DERIVED `/proc/uptime` bound below, and tying it to the worker's death is not
+    claimed at all. So "under a serving load" is the working assumption this
+    bullet is written for, not a measured fact.
+    The pinned oracle's c8 denominator leg for `Qwen/Qwen3.8-27B` bf16 — vLLM's
+    production graphed shape at `--gpu-memory-utilization 0.85
+    --max-num-batched-tokens 8192` — answered `GET /health 200 OK` at 10:25:07Z
+    with about 9,950 MB of `MemAvailable`, read 6,261 MB at 10:25:26Z, and the
+    worker was then lost inside one 2-second sample, during the untimed warmup.
+    That is OBSERVED, and it is the loss rather than the reboot. That
+    configuration leaves roughly **6-7 GB of headroom** on this box. The
+    earlier reboots this file records for this machine are a `ctest -j 4` and an
+    oracle LOAD; this one is only ASSOCIATED with a server that was already
+    healthy and serving-ready, and on that association "survived startup" is not
+    a safe state.
+    **Read `boot_id` in every leased job that loads anything large.** A lease
+    gives you a pod, not the box's history: `uptime` resetting and
+    `journalctl --list-boots` are host instruments a pod does not have, and a
+    lost worker looks identical whether the pod died or the machine did. That
+    ambiguity stood unresolved in the campaign record for a day.
+    `/proc/sys/kernel/random/boot_id` is kernel-wide and regenerated per boot,
+    so a changed value is a reboot and nothing else can forge it: a later job
+    (`97cf3e63-e4a4-4506-bde7-f19f19be3bbf`) read
+    `64c495a3-8c9c-4b20-8496-a97efda0e332` against the benchmark's
+    `3fd9745a-d25a-426c-ba3c-97c958a85515`. **Do not promote a boot TIME derived
+    from `/proc/uptime` to the same strength.** Read inside a pod, `/proc/uptime`
+    is the host's only if the worker does not virtualize `/proc` — `lxcfs` does,
+    and it cannot touch `boot_id` — so the identity change is observed and any
+    derived timestamp carries that assumption. State it beside the number. The
+    bound is also ONE-SIDED: the log mtime you subtract from is when the LAST
+    line landed, so it is an upper bound on the read instant and never a
+    midpoint. Here that gives a boot at or before 10:41:47.6Z with no lower
+    bound, and the mtime is on a different host's clock from the uptime, with the
+    offset unmeasured.
+    **And a sampling watchdog cannot guard the REBOOT CLASS of failure at all.**
+    A userspace sampler dies with the kernel, so there is no floor and no cadence
+    at which it reports a reboot; that holds on its own and needs no link to any
+    particular worker loss. Here the 2-second sampler never even saw a value
+    below its own 5,000 MB floor. Detail in
+    [`specs/qwen38-27b-bf16-gate.md`](specs/qwen38-27b-bf16-gate.md).
   - **GPU mutex:** this runs INSIDE an `rc` lease, never instead of one. The
     lease decides who gets the box. The mutex serialises the work of whoever
     holds it. Every CUDA test/model/serve/benchmark/profile holds the

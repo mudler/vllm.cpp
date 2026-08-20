@@ -1100,11 +1100,15 @@ migration to leases removed clock pinning and no record said so until now. Same
 class as [#1265](https://github.com/mudler/vllm.cpp/issues/1265), and the root
 cause of the discarded pairing.
 
-**Undetermined, and recorded as owed rather than guessed.** Whether the host
-rebooted or only the k3s pod was lost when the worker died cannot be decided
-from these artifacts. One command settles it: compare
-`/proc/sys/kernel/random/boot_id` against `3fd9745a-d25a-426c-ba3c-97c958a85515`
-inside any later `dgx:gpu0` job.
+**Settled, and only one half of it is observed.** A later `dgx:gpu0` job read
+`/proc/sys/kernel/random/boot_id` as `64c495a3-...` against the benchmark's
+`3fd9745a-...`, so the HOST rebooted and it was not a lost k3s pod. The boot
+TIME is DERIVED from `/proc/uptime` inside the worker, is ONE-SIDED — at or
+before 10:41:47.6Z, with no lower bound — and is conditional on that worker not
+virtualizing `/proc`. That the reboot KILLED the worker is consistent but
+untraced, so it is not claimed and no number changes. What the reboot does
+establish is narrower and stands on its own: no sampling watchdog can guard the
+REBOOT CLASS of failure, because a userspace sampler dies with the kernel.
 
 Resource axes on the same series: cold start to first `/health` **53 s vs
 780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —

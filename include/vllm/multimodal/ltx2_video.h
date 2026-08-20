@@ -388,20 +388,36 @@ inline constexpr char kLtx2GeneratedKeyframesExtra[] = "num_generated_keyframes"
 
 // DFR's temporal x2/x4 refinement rounds — `temporal_upsample_rounds`,
 // `type=int`, `choices=(0, 1, 2)`, `default=0`
-// (ltx-pipelines/dfr_pipeline.py:277, :584-590). Row LTX25-DFR-PIPELINE (#986).
+// (ltx-pipelines/dfr_pipeline.py:277, :584-590). Row LTX25-DFR-ROUNDS (#986).
 //
-// DEFINED, and REFUSED above 0. `0` is upstream's default and is the served
-// path; a positive count is refused by name, and what it names is the rounds
-// LOOP rather than the upsampler. The operator itself is ported and gated
-// (row LTX25-TEMPORAL-UPSAMPLER, `.agents/specs/ltx25-temporal-upsampler.md`) —
-// `PixelShuffle1d`, the first-frame drop, and the loader arm that reads
-// `temporal_upsample` off the checkpoint config all exist and pass.
+// SERVED. A value outside `{0, 1, 2}` is still a malformed request and is
+// refused first, before any work is paid for, exactly where upstream refuses it
+// (:284-285). Inside the set it runs the loop at `dfr_pipeline.py:402-529`,
+// which is the ONLY consumer of the temporal x2 latent upsampler in upstream or
+// here. Each round doubles the frame count as `2 * (frames - 1) + 1` (:408) and
+// the caller's contract is `(requested - 1) * 2**rounds + 1` (:534), so a
+// 9-frame request at 2 rounds returns 33.
 //
-// The key is defined here rather than left to the generic "unknown extra"
-// message for the reason #611 established: that message asserts the family does
-// not define the key, which is false, and sends the reader looking for a typo
-// instead of for the unported loop.
+// The knob is DFR's alone: no other pipeline `__call__` upstream takes one
+// (:277), so it is refused on every other `pipeline_kind` rather than ignored.
 inline constexpr char kLtx2TemporalRoundsExtra[] = "temporal_upsample_rounds";
+
+// The TEMPORAL x2 latent upsampler checkpoint — `temporal_upsampler_path`, a
+// LOAD extra, mirroring `DFRPipeline.__init__`'s own separate constructor
+// argument (ltx-pipelines/dfr_pipeline.py:174 against :177) and its separate
+// CLI flag (:578-583). Row LTX25-DFR-ROUNDS (#986).
+//
+// It is a SECOND slot rather than a reinterpretation of `upsampler_path`
+// because DFR needs both at once and they are different checkpoints: stage 2's
+// input transform takes the SPATIAL x2 upscaler, and the rounds loop takes the
+// TEMPORAL one. The engine refuses a checkpoint supplied in the wrong slot by
+// reading `spatial_upsample` / `temporal_upsample` off its own config rather
+// than trusting the file name, because the two share a class name and a tensor
+// layout and so the wrong one loads and runs and returns a wrongly shaped
+// latent.
+//
+// Required only when `temporal_upsample_rounds > 0`; absent it costs nothing.
+inline constexpr char kLtx2TemporalUpsamplerPathExtra[] = "temporal_upsampler_path";
 
 // ── RETAKE: regenerate a time window of an existing clip. Row LTX25-RETAKE ──
 // (#924), spec .agents/specs/ltx25-retake.md.
@@ -705,6 +721,39 @@ struct Ltx2ConditioningTrace {
   int64_t slot_marked_tokens = 0;
   int64_t canvas_frames = 0;
   int64_t canvas_segment = 0;
+
+  // ── DFR's temporal refinement ROUNDS (row LTX25-DFR-ROUNDS, #986) ──────────
+  //
+  // `temporal_rounds` is how many x2 rounds this render RAN, which is not the
+  // same question as how many were requested: they differ if the loop stops
+  // early, and a render that reports the requested count from the request
+  // rather than from the loop cannot tell the two apart.
+  //
+  // `temporal_upsample_calls` IS THE REACHABILITY INSTRUMENT. It counts calls
+  // to `Ltx2UpsampleVideoLatent` on the TEMPORAL arm, which before this row had
+  // no production call site anywhere in the tree — the operator was ported and
+  // gated at reduced dimensions and driven by nothing, which `docs/FEATURES.md`
+  // carried as `Temporal x2 ups gated, UNDRIVEN`. A render that reports rounds
+  // while this stays 0 upsampled nothing, and every other observable about it —
+  // the frame count, the shape, the exit status — is identical either way. That
+  // is exactly the "test-only driver" shape `.agents/reachability.md` names as
+  // the hardest to see, so it gets its own counter rather than an inference.
+  //
+  // `round_tile_counts` is the tile count per round. Upstream fixes it at
+  // `2**round_idx` (dfr_pipeline.py:415); a loop that denoised the canvas whole
+  // returns a correctly shaped, finite, plausible clip and reports 1 here.
+  //
+  // `round_conditioning_fps` is the CAPPED conditioning fps of each round
+  // (dfr_pipeline.py:414), capped at 60.0 for the reason upstream gives at
+  // :74-78: RoPE time is `pixel_frame / fps`, so an uncapped 120 fps time base
+  // halves every token's temporal span against the trained distribution and the
+  // clip decodes as a motion spike at each latent border followed by a stall.
+  // PLAYBACK fps is NOT capped (:542). A port that used one value for both is
+  // invisible in the frame count and in every shape assertion.
+  int64_t temporal_rounds = 0;
+  int64_t temporal_upsample_calls = 0;
+  std::vector<int64_t> round_tile_counts;
+  std::vector<double> round_conditioning_fps;
 
   // ── AUDIO-TO-VIDEO: the supplied take, as the DiT received it (#922) ───────
   //

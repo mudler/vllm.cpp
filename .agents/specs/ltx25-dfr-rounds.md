@@ -287,6 +287,127 @@ NVFP4, FP8 and bf16 all reach the loop, because the loop adds no kernel and
 inherits whatever arm the load resolved. GGUF is not applicable to this family.
 Any arm that cannot run refuses by name rather than falling back.
 
+## Outcome
+
+**The rounds loop landed and the temporal x2 latent upsampler is DRIVEN.** §7's
+sentence holds as written, with §0.3's correction folded in.
+
+### What was built
+
+The stage seam is one lambda, `RunStage`, holding the body that was inline in the
+per-phase loop. It takes an invocation record mirroring
+`DiffusionStage.__call__`'s parameter list — phase, phase index, frames,
+conditioning fps, an optional initial latent, whether audio runs, this
+invocation's slot positions, and its seam anchors — and the recipe's phases became
+its first caller. The rounds loop is its second, once per tile.
+
+The four values the body varies on are bound as SHADOWING locals of the same
+names rather than renamed at every use. That was a deliberate choice about the
+diff: renaming would have touched a thousand lines of a file whose reader anchors
+are gated, and shadowing keeps the base-stage path textually identical to what it
+was. It is recorded here because it reads as an accident otherwise.
+
+Three helpers were added, and only one of them was in the plan.
+`Ltx2DfrSliceLatentFrames` and `Ltx2DfrConcatLatentFrames` exist because the
+first draft of the slot merge did a FLAT `data.insert`, which is wrong for a
+`[B, C, T, H, W]` volume with more than one channel: it produces exactly the
+right number of floats with the channels interleaved wrong.
+`Ltx2DfrStitchTileLatents` already carried a comment about that exact trap, and
+this row walked into it anyway three functions later — which is the argument for
+named helpers rather than a fourth inline loop.
+
+### The video-only path, which the plan did not anticipate
+
+Upstream's tile call passes `audio=None` (`dfr_pipeline.py:494`), and this engine
+had no way to express that: every phase built and denoised both streams. Four
+places needed the guard — the audio latent shape, the state build, the Gaussian
+noiser, and the stepper — and a fifth is the one that matters:
+`audio_latent_volume` must not be OVERWRITTEN by a tile, or the render keeps a
+correctly shaped video beside no soundtrack and every check on the video passes.
+
+`Ltx2DitForward` already resolved `audio_tokens = 0` for a null stream, so the
+DiT needed no change. A ZERO-TOKEN stream is not a substitute for a null one:
+`vt::Tensor` refuses a non-positive dimension by name, which is the right
+polarity everywhere else and cost two build-and-run cycles to find here.
+
+### Measured, and it changed the row
+
+**The temporal upsampler checkpoint is on the NAS** (§0.3), which falsifies one
+of the four causes the shipped refusal named, and one claim in
+`ltx25-temporal-upsampler.md` §7. It arrived 2026-08-17, one day after the
+"re-verified 2026-08-16" those records carry. Both were true when written. What
+made this findable is the DATE beside the measurement, and that is the
+transferable lesson rather than the checkpoint.
+
+**The tile count is CLAMPED, and this row's first test expectation was wrong
+about it.** `tile_ranges` takes `min(num_tiles, n_segments)`
+(`dfr_layout.py:171`). The 9-frame fixture pads to a 25-frame canvas with ONE
+segment, so round 1 asks for 2 windows and gets 1, and round 2 asks for 4 and
+gets 2. The assertion was written from the issue's `2**round` without reading the
+clamp beside it, and the RED that resulted was the code being right. Corrected to
+the derived values, with the bound stated in the test: **this fixture cannot
+exercise the unclamped tiling and nothing here gates it.**
+
+### The reachability proof
+
+`M1`, the mutation this row exists for: delete the `Ltx2UpsampleVideoLatent` call
+in the rounds loop and replace it with a resize to the shape the round expects.
+`BUILT=YES`, `compile_err=0`, `git diff --stat` one line, binary sha changed.
+
+**RED — and only on the reachability counter.** 33 of 35 assertions still passed,
+including `frame_count == 17` and `frame_count == 33`. The clip comes out the
+right length, at the right size, exit 0. `temporal_upsample_calls` is the only
+observable that separates "the rounds ran" from "the rounds drove the upsampler",
+which is the whole argument for a dedicated counter over an inference.
+
+### Mutations
+
+Each with four facts printed, each restored byte-exact (sha256 compared against
+the pre-mutation copy, and `touch`ed so ninja could not skip the rebuild).
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | temporal upsampler call site deleted | RED — `temporal_upsample_calls`; 33/35 still green |
+| M2 | `frames = 2 * frames` for `2 * (frames - 1) + 1` | RED — the layout's own seam guard, `dfr_layout.py:153-154` |
+| M4 | the 60 fps conditioning cap removed | RED — `round_conditioning_fps[1]`; 34/35 still green |
+
+**M5 through M9 were NOT run, and that is a gap rather than a pass.** The
+per-tile ancestral seed (M5), the 0.95 anchor strength (M6), the eta (M7) and the
+slot dedupe order (M8) have no assertion in this row that could detect them: the
+fixture renders one tile on round 1 and two on round 2, and nothing compares tile
+CONTENT. Running a mutation with no instrument on it would have produced a GREEN
+that reads like coverage. They are named here so the next reader knows the
+guarantee is mirrored but ungated, and a fresh reviewer should treat them as the
+first place to look.
+
+### Gates
+
+CPU only, no GPU lease (§0.5). `Release`, `VLLM_CPP_CUDA=OFF`, `compile_err=0`.
+
+- `ctest -j4 -E "test_ltx2_video|test_capi"` — **572/572 passed, 0 failed**, 3
+  skipped (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`,
+  `test_qwen35_paged_engine`), 206.83 s.
+- `ctest -R "test_ltx2_video|test_capi"` serially — **2/2 passed**, 59.12 s.
+- `test_ltx2_video` alone: **102 cases / 4141 assertions / 0 failed**, exit 0.
+- `scripts/agent-preflight.sh` — exit 0.
+
+**The refactor's floor is the 101 pre-existing cases in `test_ltx2_video`, not
+the 6 new ones.** Every pipeline kind now runs through the new seam, and all of
+them are unchanged in what they assert. Two record gates went red and were
+repaired rather than widened: the derived READER ANCHORS in `ltx2_video.cpp` (the
+insertions moved all fourteen) and the served-load-extras list (the new
+`temporal_upsampler_path`).
+
+### What was rejected
+
+- **Loosening #1137's `keyframe_slot_sft` refusal**, and **declaring the class on
+  a `dev` file** — §1, both rejected in writing with the reason beside each.
+- **A second denoise loop for tiles.** It would have been a smaller diff, and it
+  is the parallel path `AGENTS.md` `## Shared seams` forbids. The seam is the
+  reason the base stages and the tiles cannot diverge.
+- **Reusing `upsampler_path` for both arms.** DFR holds two upsamplers at once
+  upstream, so one slot would have made the arms mutually exclusive.
+
 ## Owed
 
 - [#986](https://github.com/mudler/vllm.cpp/issues/986) — a **real-weights DFR

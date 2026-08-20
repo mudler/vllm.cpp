@@ -205,6 +205,27 @@ Ltx2LatentVolume Ltx2DfrStitchTileLatents(const std::vector<Ltx2LatentVolume>& t
 std::vector<int64_t> Ltx2DfrRemapPositionsToLocal(const std::vector<int64_t>& positions,
                                                   int64_t pixel_start);
 
+// `latent[:, :, start:end]` — the half-open frame slice upstream writes inline
+// wherever it needs one: the tile's own window (`dfr_pipeline.py:423`), a single
+// keyframe out of the carry-forward bag (`:460`), and a single slot out of a
+// tile's return (`:524`).
+//
+// It is a named function rather than three inline loops because the volume is
+// [B, C, T, H, W] ROW-MAJOR and a flat `data.begin() + start * plane` is wrong
+// for any volume with more than one channel: it returns a correctly sized
+// buffer holding channel 0's later frames instead of every channel's window.
+// That is the same defect `Ltx2DfrStitchTileLatents` carries a comment about,
+// and the two now share the reason as well as the layout.
+Ltx2LatentVolume Ltx2DfrSliceLatentFrames(const Ltx2LatentVolume& latent, int64_t start,
+                                          int64_t end_exclusive);
+
+// `torch.cat(pieces, dim=2)` over single-frame volumes — the bag builder behind
+// `dfr_pipeline.py:459-461`, `:523-525` and `:139`. Same reason as the slice:
+// concatenating along T in a [B, C, T, H, W] buffer is a per-plane copy, and
+// appending the pieces end to end interleaves the channels wrong while
+// producing exactly the right number of floats.
+Ltx2LatentVolume Ltx2DfrConcatLatentFrames(const std::vector<Ltx2LatentVolume>& pieces);
+
 // `_slot_initials_from_video` (dfr_pipeline.py:101-111): stack the NEAREST video
 // latent frames as `(B, C, K, H, W)` slot seeds.
 //

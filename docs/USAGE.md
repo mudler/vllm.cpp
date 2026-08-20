@@ -1539,12 +1539,18 @@ all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
 `--video-extra pipeline_kind=dfr` at launch. A server started that way renders
 every `/v1/videos` request through DFR.
 
-The two knobs beside it are per-GENERATION and therefore **ABI only**, because
-`/v1/videos` forwards no per-generation extra to any engine yet (issue #928):
-`num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
-below. This paragraph said "CLI and ABI only" until 2026-08-17, and the CLI half
-was never true — `examples/ltx2_gen/main.cpp` carries no flag for either name, so
-`vllm_video_gen_params.extra_keys` is the only surface that reaches them.
+The two knobs beside it are per-GENERATION, so `/v1/videos` does not carry them:
+that endpoint forwards no per-generation extra to any engine yet (issue #928).
+They are `num_generated_keyframes` on the other pipelines, and
+`temporal_upsample_rounds` below.
+
+This paragraph said "CLI and ABI only" until 2026-08-17, and the CLI half was
+not true then — `examples/ltx2_gen/main.cpp` carried no flag for either name, so
+`vllm_video_gen_params.extra_keys` was the only surface that reached them. **It
+is true again for `temporal_upsample_rounds` as of 2026-08-20**, which
+`ltx2-gen --temporal-upsample-rounds` now carries beside the
+`--temporal-upsampler` load flag. `num_generated_keyframes` still has no flag and
+is still ABI-only.
 
 ### LTX-2.5 text-to-audio: a render with no picture
 
@@ -1738,14 +1744,37 @@ ceiling, not as an estimate.
 --v2a-guidance-scale 1` buys that back and is the trajectory the accelerator arm
 had before, at the cost upstream's defaults are there to avoid.
 
-**What is not served.** `temporal_upsample_rounds` is defined and refused above
-`0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
-stitches it back is not ported. The refusal names it, and it names three things
-that are NOT the reason, because each is the one a reader reaches for first: the
-temporal upsampler operator is ported and gated, the canvas and tiling
-arithmetic is ported and gated in this same change, and the generated keyframe
-slots are served. What has no counterpart here is the per-tile denoise pass as a
-callable. Stage 2's x2 spatial detailing IC-LoRA is refused separately, for the
+**`temporal_upsample_rounds` is SERVED, and it is the only thing that drives the
+temporal x2 latent upsampler.** Each round temporally doubles the latent,
+re-tiles the canvas into keyframe-seam windows, invents a mid-segment keyframe
+slot per window, densifies each one with ancestral Euler at eta 0.5 under its own
+noise seed, and stitches the windows back. The caller gets
+`(num_frames - 1) * 2**rounds + 1` frames: a 9-frame request returns 17 at one
+round and 33 at two. Playback frame rate scales with it, so the clip's duration
+in seconds does not change.
+
+It needs a second checkpoint, `--temporal-upsampler` (the
+`temporal_upsampler_path` load extra), which is a DIFFERENT file from
+`--upsampler`: stage 2's input transform takes the SPATIAL x2 upscaler and the
+rounds take the TEMPORAL one, and DFR holds both at once. A checkpoint supplied
+in the wrong slot is refused at load by reading `spatial_upsample` /
+`temporal_upsample` off its own config, because the two share a class name and a
+tensor layout and so the wrong file otherwise loads, runs, and returns a
+plausible latent of the wrong shape. Asking for rounds without it is refused
+rather than run at zero rounds, which is upstream's own behaviour and matters
+because a silently skipped round returns a clip a fraction of the requested
+length.
+
+Two things this arm does NOT claim. The tile count is `2**round` **clamped to the
+canvas's segment count**, so a short canvas denoises in fewer windows than the
+round asks for — that is upstream's `min(num_tiles, n_segments)` and not a
+shortfall, but it means a small request never exercises the unclamped tiling.
+And the whole arm is gated on reduced-dimension fixtures only, because the
+`keyframe_slot_sft` base that DFR needs is still unpublished (above). The real
+`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` exists and is
+loadable; the transformer it would run beside is what is missing.
+
+Stage 2's x2 spatial detailing IC-LoRA is still refused separately, for the
 reasons the reference-video arm is refused above.
 
 On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
@@ -3800,13 +3829,18 @@ declares none), `dit_config_path`, `encoder_config_path`,
 `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
 negative half of the same fallback, for the unconditional forward),
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
-`upsampler_path`, `duration_head_path`, `lora_path`, `lora_strength` and
+`upsampler_path`, `duration_head_path`, `temporal_upsampler_path` (DFR's SECOND
+upsampler, the temporal x2 arm its rounds loop drives — a different checkpoint
+from `upsampler_path`, and refused at load if the two are swapped),
+`lora_path`, `lora_strength` and
 `checkpoint_class` (which class of transformer `dit_path` holds; see the
-`pipeline_kind` table above) — fifteen keys, which is `kKnownLoadExtras`
+`pipeline_kind` table above) — sixteen keys, which is `kKnownLoadExtras`
 (`ltx2_video.cpp`, the `kKnownLoadExtras` array) in order. The two LoRA keys
 landed with issue #923 and were missing from this list until 2026-08-17;
 `checkpoint_class` landed with
-[#1137](https://github.com/mudler/vllm.cpp/issues/1137). The array's own
+[#1137](https://github.com/mudler/vllm.cpp/issues/1137), and
+`temporal_upsampler_path` with
+[#986](https://github.com/mudler/vllm.cpp/issues/986). The array's own
 neighbouring comment still says "nine of these ten", which is
 [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
 An extra a family does not define is
@@ -4486,7 +4520,7 @@ pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 | `one_stage` | 2, 2.3, 2.4, 2.5 | `full` | — |
 | `distilled_two_stage` | 2, 2.5 | `distilled` | `upsampler_path` for its second phase |
 | `res2s_two_stage` | **2.5 only** | `full` | `upsampler_path` for its second phase |
-| `dfr` | **2.5 only** | `keyframe_slot_sft` | `upsampler_path`, and a base NOBODY PUBLISHES — see `--pipeline-kind dfr` above |
+| `dfr` | **2.5 only** | `keyframe_slot_sft` | `upsampler_path`; `temporal_upsampler_path` when `temporal_upsample_rounds > 0`; and a base NOBODY PUBLISHES — see `--pipeline-kind dfr` above |
 | `dmd2` | 2, 2.3 | none stated | — |
 | `retake` | 2, 2.5 | `full` **with** `lora_path`, or `distilled` | a source clip as a `frame_%06d.ppm` directory |
 | `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | `full` | a text tower; no video VAE is asked for |

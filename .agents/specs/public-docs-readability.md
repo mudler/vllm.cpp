@@ -45,8 +45,8 @@ for `lilcheaty/MiniMax-H3-NVFP4`. Registry rows cover the Q4_K_M artifacts
 verified end to end and the pruned Q8_0 artifacts recorded as rendered. The
 model page records the other published variants and their current state.
 
-The R2 repair restores the complete W3 ownership boundary. IndexTTS keeps only
-its public refusal, while its golden and conversion commands remain in
+The R2 repair restores the complete W3 ownership boundary. IndexTTS keeps its
+public model recipe, while its golden commands and evidence remain in
 `.agents/specs/indextts-2-5.md`. The Qwen3.8 mixed FP8 and NVFP4 description now
 lives in its model page. MiniMax-H3 uses one ordered workflow and its registry
 includes the official video VAE, audio VAE, and tokenizer. The exact official
@@ -579,7 +579,7 @@ line identifies headings that have the same text. `Owner` is required for
 | `docs/USAGE.md:5782` ## MiniMax-Music3: the checkpoint loader | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:5844` ### Running its gate | Contributor procedure and design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:5874` ### MiniMax-Music3: the quantized arms | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
-| `docs/USAGE.md:5960` ### IndexTTS-2.5 goldens and checkpoint manifests | Model recipe and contributor procedure | `docs/models/indextts-2-5.md` for the current refusal; `.agents/specs/indextts-2-5.md` for golden regeneration and checkpoint manifest evidence | `moved`; `archived` | `.agents/specs/indextts-2-5.md` |
+| `docs/USAGE.md:5960` ### IndexTTS-2.5 goldens and checkpoint manifests | Model recipe and contributor procedure | `docs/models/indextts-2-5.md` for the current server recipe and limitations; `.agents/specs/indextts-2-5.md` for golden regeneration and checkpoint manifest evidence | `moved`; `archived` | `.agents/specs/indextts-2-5.md` |
 | `docs/USAGE.md:6034` ## MiniMax-Music3: the autoregressive half | Model recipe | `docs/models/minimax-music3.md` | `moved` | `n/a` |
 | `docs/USAGE.md:6044` ### The token gate the spec promised does not exist | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |
 | `docs/USAGE.md:6060` ### Running the gates | Design or implementation history | `.agents/specs/minimax-music3.md` | `archived` | `.agents/specs/minimax-music3.md` |

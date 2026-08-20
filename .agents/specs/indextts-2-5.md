@@ -592,11 +592,11 @@ MUSIC3's W6 (#799) and this family reaches both through
 2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
    `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the
    emotion instead, which is why this sits behind a render rather than in front.
-3. **`/v1/audio/speech` is unproven by request.** The wiring was read, not
-   exercised: `server_main.cpp` loads from the same registry this family
-   registers into. A live check needs a TEXT model too -- `vllm-server` refuses
-   `--speech-model` without `--model`, so the speech route cannot be served
-   standalone. Worth knowing before someone tries.
+3. **The public route loads and renders.** `server_main.cpp` accepts
+   `--speech-model` without `--model`, loads this family from
+   `GlobalSpeechRegistry`, and serves `/v1/audio/speech` as a speech-only
+   server. The route returns a 22.05 kHz mono WAV. This reachability result does
+   not establish output quality or parity with vLLM-Omni.
 4. **The `exact` flag on `tiktoken::Pretokenize` is not proven load-bearing**: a
    mutation disabling every range check still passes. Recorded in the test.
 5. **W7 speed**, which additionally needs #633.

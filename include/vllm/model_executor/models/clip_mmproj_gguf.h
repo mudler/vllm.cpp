@@ -57,6 +57,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_vl_vision.h"
@@ -117,5 +118,28 @@ multimodal::Qwen3VLVisionConfig ClipMmprojVisionConfig(const GgufFile& gguf);
 //     than an error.
 multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromClipMmproj(
     const GgufFile& gguf, const multimodal::Qwen3VLVisionConfig& cfg);
+
+// ─── Tensor accounting (QUANT-QWEN38-27B-GGUF-ARM, issue #821) ──────────────
+
+// The EXACT set of tensor names `LoadQwen3VLVisionFromClipMmproj` reads for
+// `cfg`: the two patch-embedding halves and their bias, the position table, the
+// `cfg.depth` blocks, the merger, and one six-tensor merger per entry in
+// `cfg.deepstack_visual_indexes`.
+std::vector<std::string> Qwen3VLClipMmprojExpectedTensors(
+    const multimodal::Qwen3VLVisionConfig& cfg);
+
+// Refuse a projector that carries tensors the reader NEVER reads, naming them
+// and the file.
+//
+// W1 read `mmproj-BF16.gguf`'s 334 names and closed the map in both directions
+// once, behind an env gate over a 931 MB file on a share. CI read nothing, so a
+// projector whose extra tensors are silently dropped — a deepstack tap the
+// discovery loop missed, a second merger, a `clip` variant this build maps only
+// part of — produced a tower that runs and is wrong. The MISSING direction is
+// already named tensor by tensor inside the reader's own `load` lambda; this is
+// the direction that had no detector.
+void RefuseUnaccountedClipMmproj(const GgufFile& gguf,
+                                 const multimodal::Qwen3VLVisionConfig& cfg,
+                                 const std::string& path);
 
 }  // namespace vllm

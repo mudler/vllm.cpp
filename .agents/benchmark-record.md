@@ -26310,3 +26310,110 @@ so no mutation of it — and no production-call-site deletion — can be execute
 this box. The always-on case exists so the liveness RULE is gated where it runs;
 the WIRING is owed a device run.
 
+
+## 2026-08-21 — KERNEL-ATTENTION-CROSS-CUDA: `vt::AttentionCross` gets FlashAttention-2's decomposition — 7.62x on the kernel, 1.6461x on the MiniMax-Music3 DiT bucket (#672, #1542, #1555)
+
+**Result: ACCEPTED as a same-binary, same-box A/B and a within-run split. NOT a
+per-kernel or cross-box figure** — `nvidia-smi` reports `clocks.sm` as `[N/A]` on
+this device, so no clock window was taken. No parity claim: vLLM and vLLM-Omni
+register nothing for this architecture.
+
+**Box and lease.** `rc` job `0fc0bd6e-754e-43d6-9210-a9dfb4075c41` on
+`thor:gpu0`, worker `rc-worker-m4d7t`, Linux 6.8.12-1021-tegra aarch64, 14 cores,
+NVIDIA Thor sm_110, driver 595.78, boot id
+`c99b7805-6e26-47a7-bc9d-93d592d676a6`. No `ssh`, no `rc hold`, no `$GPU_LOCK`.
+`uptime` **0 logins throughout**, load 9.4-14.7 during the runs and 4.4-5.7
+between them — our own 14-thread host vocoder, the same self-generated pattern
+§21.9 records, and the arms are ALTERNATED so it cancels.
+
+**Tree and build.** `0ecff9e9b` (`row/KERNEL-ATTENTION-CROSS-CUDA`), asserted
+equal to the requested sha before anything was built. `Release`,
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_BUILD_TESTS=ON`, nvcc 13.0.88.
+
+**Checkpoint STAGED, and asserted.** `findmnt /workspace` ->
+`//192.168.68.102/Data[/rc] cifs`; `findmnt -T /tmp/ckpt` -> `overlay overlay /`.
+`SRC_BYTES=28517617303` = `DST_BYTES=28517617303` = the recorded `EXPECT_BYTES`,
+hard fail on mismatch. `STAGE_SECONDS=994`.
+
+**ONE BINARY, and the control is what the ENGINE says.** [#1516](https://github.com/mudler/vllm.cpp/issues/1516)
+records the two-binary sha256 guard as unfalsifiable for `minimax-music3-gen`, so
+the arms are one build under two environments, selected by
+`VT_OP_PROVIDER_DISABLE=vt-cross-blocked`. The behavioural control is the
+provider the engine announces under `VT_OP_PROVIDER_STATS=1`: arm A printed
+`op=19 device=1 selected=vt-cross-blocked priority=10 registered=2`, arm B
+printed `selected=vt-native priority=0 registered=2`. `OpId` 19 is
+`kAttentionCross`, counted from the enum. **That line is also this row's
+reachability evidence** — it is the shipped binary on the real checkpoint at its
+default configuration, not a test driver.
+
+### The A/B — `--duration 20 --steps 2 --device 1 --seed 7`, spans OFF, three ALTERNATED pairs
+
+| pair | arm A `vt-cross-blocked` | arm B `vt-native` | ratio |
+|---|---:|---:|---:|
+| routing (stats on) | 15.050 | 24.774 | 1.6461 |
+| headline 1 | 15.035 | 24.732 | 1.6450 |
+| headline 2 | 15.046 | 24.770 | 1.6463 |
+| **median** | **15.046** | **24.770** | **1.6461** |
+
+`denoise.dit_device`, seconds over 8 calls. **Spread across the three pairs is
+0.080 %**, so the statistic is the median and the most conservative pair
+(1.6450) is quoted wherever one number has to be defended.
+
+**The instrument costs 0.1 %**, measured rather than assumed: the same arm reads
+15.050 with per-call selection counting on and 15.035 with it off, so the routing
+pair is quotable beside the headline pairs.
+
+**Nothing outside the DiT moved.** `vocoder.decode_window` 124.42-124.99 s across
+all six runs, `ar.lm_decode_step` 55.98-56.49, `ar.depth_staging` 0.748-0.761 —
+and the depth-decoder bucket is present in every run, so that device arm engaged
+throughout. Wall is only **1.040x** because at 2 steps the DiT is 6.2 % of the
+run; the shipped 30-step configuration is where it is 62 %.
+
+**Each arm is byte-deterministic across runs** — arm A always WAV
+`576cd9fd77e7f8ed14`, arm B always `61a8989763bba749ed`, both 3 530 796 bytes —
+and the two arms DIFFER, which is the expected consequence of a kernel that never
+claimed bit-identity.
+
+### The kernel itself — a standalone probe, and the mechanism it settles
+
+`rc` job `90c42f65-10f7-4040-8dbe-7ecd192105e1`, same box, probe source sha256
+`9db64d3309bbe925ba71a6cd343b1330bfc02e13736b7b6dca00408970f838f6`, three rounds
+agreeing to 0.03 %. At the DiT's own geometry (Tq = S = 690, Hq = Hkv = 32,
+head_dim 64, f32): **16.591 -> 2.176 ms, 7.62x**, 0.235 -> 1.792 TFLOP/s. At
+LTX-2.5's video geometry (2352, head_dim 128): **206.454 -> 93.527 ms, 2.21x**.
+
+**`ncu` hardware counters are UNAVAILABLE on this device** —
+`ERR_NVGPUCTRPERM` from the root `rc` worker, because
+`NVreg_RestrictProfilingToAdminUsers` lives on the host driver module. No counter
+is quoted anywhere in this entry. The two timings the profiled runs printed
+(17.25 ms and 7.48 ms against 16.59 and 2.18 unprofiled) are **VOID**: serialised
+replay is not a timing.
+
+The mechanism is ABLATION, one per hypothesis, on a verbatim transcription:
+deleting the `__shfl_xor_sync` butterfly buys **18.1 %**; deleting the online
+softmax buys **19.8 %**; deleting the whole K/V global re-read is **8.4 %
+SLOWER**; halving the CTA to double blocks per SM at the same 32 warps per SM is
+**2.3 % SLOWER**. So **occupancy is refuted** (already 0.67 by the CUDA occupancy
+API) and **bandwidth is refuted** (32 MiB of L2 against 11.3 MiB of K plus V).
+[#1555](https://github.com/mudler/vllm.cpp/issues/1555)'s stated mechanism is at
+best a fifth of the cost; the rest is the decomposition.
+
+### Correctness, taken BEFORE the speed numbers in the same job
+
+`test_ops_attention_cross` **19 cases, 142 assertions, `Status: SUCCESS!`**;
+`test_minimax_music3_acoustic` **36 cases, 353 assertions, `Status: SUCCESS!`**.
+The depth-decoder shape declines and is **byte-for-byte unchanged, bitdiff
+0/256**. On a deliberate catastrophic-cancellation case over four seeds the new
+kernel is **7.2x MORE accurate** than the one it replaces (worst 9.10163e-05
+against 8.50797e-04), because it trades 96 per-key softmax rescales for 3
+per-tile ones.
+
+### What this entry does NOT contain
+
+The **30-step shipped configuration** and the intra-DiT `dit.attn` attribution
+pair are being measured in a second lease and are **not in this table**. Scaling
+the measured per-call cost predicts the shipped kernel's 30-step bucket at
+371.6 s against §20.5's independently measured **370.556 s** — 0.28 % — which is
+why the projection is stated at all, and it is still a projection until that pair
+lands.

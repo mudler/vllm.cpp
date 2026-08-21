@@ -209,6 +209,33 @@ COMPLETED_STATE_EVENT = re.compile(
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
+# A PER-RUN evidence directory: docs/bench-evidence/<run-id>/<file> (#1448).
+# AGENTS.md requires the exact build and run recipe beside a measurement, so one
+# run arrives as a dated directory of logs, dumps and the scripts that produced
+# them, not as one flat file. BENCH_EVIDENCE above matches exactly ONE path
+# segment, so all ten files of the first such directory
+# (`gdn-replayssm-w0-20260818`, landed 2026-08-18) were unclassified.
+# `classify_path` FAILS CLOSED, and the sweep in
+# tests/scripts/test_check_pr_size.py classifies every TRACKED path, so that
+# suite went red on `main` and every PR touching this checker was refused
+# through its own evidence contract. Fourth instance of the class after #856,
+# #668 and #989, and repaired the same way: name the surface, do not widen a
+# rule.
+#
+# The extension list is EXACTLY the set this directory carries, and it
+# deliberately omits `.md` and `.json`. Those two already classify as
+# public_document through DOC below, and the evidence arm is tested FIRST, so
+# admitting them here would silently RECLASSIFY
+# docs/bench-evidence/mxfp4-qwen/*.md and its golden .json. Preserving the class
+# of a path that already had one matters more than making the directory
+# uniform.
+#
+# `.sh` and `.cu` are evidence, not product: they are the recipe that produced
+# the number. Nothing builds them, nothing installs them, and no entry point
+# reaches them.
+BENCH_EVIDENCE_RUN = re.compile(
+    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
+)
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
     r"\.agents/completed/state-migration-manifest-"
@@ -328,6 +355,16 @@ CREATION_MUTATIONS = {
     # checker as a module and calls into it, so the disabled stub fails at import
     # rather than quietly passing a reduced set of cases.
     "scripts/check-cuda-op-arch-gate.py": DISABLED_CREATION_CHECKER,
+    # GATE-CONFLICT-MARKERS (#1417). Created in this range, so there is no BASE
+    # version to mutate. The empty stub exits 0 and prints nothing, which fails
+    # 16 of the 21 cases in tests/scripts/test_check_conflict_markers.py --
+    # measured, not asserted. The five survivors are the four OrdinaryTextTests
+    # cases, which assert only that an ordinary document exits 0 and are
+    # therefore satisfied by silence, and the registration case, which reads two
+    # files and never runs the checker at all. Every case that reads an exit
+    # code of 1 or an examined count out of the report goes red, which is what
+    # makes the stub a mutation rather than a weaker checker.
+    "scripts/check-conflict-markers.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
@@ -417,6 +454,7 @@ def classify_path(path: str) -> str:
         or SPEC_EVIDENCE.fullmatch(path)
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
+        or BENCH_EVIDENCE_RUN.fullmatch(path)
     ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:

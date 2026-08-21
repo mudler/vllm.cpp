@@ -106,6 +106,12 @@ inline std::string U64Kv(const std::string& key, uint64_t val) {
   return GStr(key) + U32Le(10) + U64Le(val);  // type 10 = u64
 }
 
+// GGUF bool kv: type 7, one byte. Written by llama.cpp for
+// `dflash.attention.causal`, which is the GGUF spelling of the HF `is_causal`.
+inline std::string BoolKv(const std::string& key, bool val) {
+  return GStr(key) + U32Le(7) + std::string(1, val ? '\1' : '\0');
+}
+
 inline std::string BoolArrayKv(const std::string& key,
                                const std::vector<bool>& vals) {
   std::string s = GStr(key) + U32Le(9) + U32Le(7) + U64Le(vals.size());

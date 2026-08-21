@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Tokenizer parity oracle: dumps golden encodings for the parity corpus.
 
-Runs on dgx.casa in the oracle venv (HF `tokenizers` is a vllm dependency):
+Runs on the gate host in the oracle venv (HF `tokenizers` is a vllm dependency):
 
-    ssh dgx.casa 'cd ~/work/vllm.cpp && ~/venvs/vllm-oracle/bin/python \
+    ssh "${GATE_HOST}" 'cd "${GATE_CHECKOUT}" && "${VLLM_ORACLE}"/bin/python \
       tools/parity/dump_tokenizer.py'
 
 Loads the unsloth Qwen3.6-27B snapshot's tokenizer.json, copies it into the
@@ -98,7 +98,7 @@ def main() -> int:
             "tokenizer_json": args.label,
             "tokenizer_json_sha256": sha,
             "add_special_tokens": False,
-            "regenerate": "~/venvs/vllm-oracle/bin/python tools/parity/dump_tokenizer.py",
+            "regenerate": "${VLLM_ORACLE}/bin/python tools/parity/dump_tokenizer.py",
         },
         "entries": entries,
     }

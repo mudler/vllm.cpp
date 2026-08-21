@@ -40,6 +40,25 @@
 
 namespace vllm::v1 {
 
+// SPEC-DFLASH2 W3 (#1314) RETIRED `RefuseDflash2CandidateSelector`, which used
+// to be declared here.
+//
+// W2's boundary was the candidate selector: the draft loaded, its grouped
+// convolution ran, and it was refused because nothing could CHOOSE among its
+// logits. W3 implements the choosing up to but not including the walk -- the
+// target head's top-K (`vt::TopKValuesIndices`), the two codebooks and the edge
+// lattice (`vt::Dflash2SelectorEdges`), through
+// `vllm::v1::Dflash2SelectCandidates`
+// (include/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h) -- so the
+// boundary MOVED one step, to `RefuseDflash2PathWalk` in that same header.
+//
+// The refusal is not declared in two places any more, and neither is the step
+// before it. Both propose paths call ONE `Dflash2SelectCandidates`, so the
+// sequence a user arrives through and the sequence a gate drives are the same
+// code. W2 had two copies of its refusal and only the test-reachable one was
+// gated (spec `## Owed` O7); collapsing the duplicate is how this wave stops
+// that shape from recurring.
+
 // Greedy per-request draft pick over the (1+k) block logits — the greedy branch of
 // DFlash sample_draft (dflash/speculator.py:_generate_draft :259-273 with
 // temperature 0 => argmax). `block_logits` is the ForwardBlockLogitsWithContext

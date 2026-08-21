@@ -24,8 +24,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,8 +37,10 @@
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"   // RunMoeBlock (SEAM GAP #2)
+#include "vllm/model_executor/models/step_token_ids.h"   // #1305: the slot's device ids
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W3: the shared capture seam
 #include "vt/ops.h"
 #include "vt/recipes.h"
 
@@ -113,13 +117,39 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
 // and it consumes the HOST token_ids. The graph driver runs this per step into
 // its PERSISTENT hidden buffer, then captures/replays ForwardLayers over that
 // fixed hidden address.
+// #1305 — THE SCOPED DEVICE-ID OVERRIDE is consumed here, once per forward.
+// `ForwardQwen3MoeForCausalLM` publishes `ModelForwardInput::device_token_ids`
+// through `detail::DeviceTokenIdsScope`; it is null on every path except the
+// asynchronous CUDA runner, where the combine has already spliced each decode
+// row's sampled token into the DEVICE identifiers and left the host vector
+// deliberately stale. Both readers below —
+// `detail::TakeDeviceTokenIds` on the graph path and
+// `detail::ApplyDeviceTokenIds` on the eager one — CLEAR it, so the first embed
+// in a forward is the one that gets it and a second, unrelated embed cannot be
+// handed another step's rows. Both live in `qwen3_5_internal.h` beside the scope
+// that publishes them, because four models consume it and each used to spell the
+// same two bodies out for itself.
+// EMBED FROM AN ALREADY-RESIDENT ID TENSOR. The decode-graph driver holds its
+// identifiers in a `vllm::StepTokenIds` whose device address is stable for the
+// life of the slot, so this arm takes the tensor instead of re-uploading a host
+// vector into a fresh per-step allocation.
+void EmbedInto(Dev d, DBuf& hidden, const Tensor& ids,
+               const Qwen3MoeWeights& weights, const HfConfig& config) {
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens,
+                               {config.vocab_size, config.hidden_size});
+  vt::Embedding(d.q, hidden.t(), dtab, ids);
+}
+
 void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
                const Qwen3MoeWeights& weights, const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens,
-                               {config.vocab_size, config.hidden_size});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+  // #1305: the eager arms of this model had the SAME defect as its graph arm —
+  // they embedded the host vector and never looked at the device mirror. The
+  // override's copy is enqueued on the main queue, so it is ordered AFTER the
+  // combine that produced it rather than racing it.
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3 moe embed");
+  EmbedInto(d, hidden, dids.t(), weights, config);
 }
 
 // The CAPTURABLE region: everything AFTER the embedding — the residual stream
@@ -380,21 +410,25 @@ ForwardLogits Qwen3MoeModel::ForwardDevice(
 struct Qwen3MoeDecodeGraph::Impl {
   Impl(const Qwen3MoeWeights& w, const HfConfig& c, vt::Queue q, int64_t max_reqs)
       : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
-    // The framework-wide graph switch, plus a Qwen3-Coder-local rollback for a
-    // same-binary A/B of exactly this lever.
-    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
-    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the FRAMEWORK-WIDE switch is the SEAM's,
+    // not this driver's. `vt::GraphCaptureEnabled()` reads `VLLM_CPP_CUDAGRAPH`
+    // once per process into a function-local static; six drivers each read that
+    // variable for themselves before this row, so there was no one switch that
+    // turned capture off. The Qwen3-Coder-LOCAL rollback stays here, because it
+    // is a per-model A/B lever of exactly this driver and not a copy of the
+    // shared one.
     const char* local = std::getenv("VT_QWEN3MOE_CUDAGRAPH");
     const bool local_on = (local == nullptr) || local[0] != '0';
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on && local_on &&
+    enabled = vt::GraphCaptureEnabled() && local_on &&
               platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {
-    Backend& b = vt::GetBackend(queue.device.type);
-    for (auto& kv : slots)
-      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+    // No DestroyGraph loop: every segment handle belongs to the slot's
+    // `vt::BreakableGraph`, whose destructor releases it through
+    // `Backend::DestroyGraph`. That routing is what lets ENG-CUDAGRAPH-DEDUP
+    // (#1162) interpose at the backend later without editing this driver.
   }
 
   // One captured padded batch size. Owns its OWN persistent host inputs (the
@@ -407,9 +441,19 @@ struct Qwen3MoeDecodeGraph::Impl {
     CommonAttentionMetadata attn_meta;
     std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
-    void* graph = nullptr;         // instantiated cudaGraphExec (opaque)
-    int fa_cols = -1;              // captured block-table column count
-    bool captured = false;
+    // #1305: this slot's per-step input IDENTIFIERS, in a device buffer whose
+    // address does not move, refreshed through `vt::PersistentStepInput` from the
+    // padded host vector and then from the runner's device mirror when it is
+    // live. Before it, every arm below re-uploaded the HOST vector into a fresh
+    // allocation and the mirror was never read at all.
+    StepTokenIds ids;
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the instantiated graph, its handle
+    // ownership, its release and its `captured()` state now live in the shared
+    // seam instead of in a raw `void*` plus a `bool` this driver maintained by
+    // hand. `vt::BreakableGraph` is non-copyable and is constructed in place by
+    // `slots[S]`, so the map still owns one per padded size.
+    vt::BreakableGraph graph;
+    int fa_cols = -1;  // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
 
@@ -487,18 +531,35 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam);
   s.fa_cols = cols;
-  if (cols_changed && s.graph != nullptr) {
-    b.DestroyGraph(s.graph);
-    s.graph = nullptr;
-    s.captured = false;
+  // #1305 — THE IDENTIFIERS, ON THE SEAM. Bind this padded size's device
+  // destination once, then refresh it for this step: the padded host vector
+  // first (authoritative for the inert padding rows and for every row when no
+  // mirror is live), and then the runner's DEVICE identifiers over the real
+  // prefix when the asynchronous combine has patched them there. Both copies are
+  // enqueued on the main queue, so the second is ordered after the combine
+  // instead of racing it, and all three arms below embed from the SAME stable
+  // address.
+  const detail::DeviceTokenIds ov = detail::TakeDeviceTokenIds();
+  s.ids.Ensure(d, S);
+  s.ids.Refresh(d, s.token_ids, ov.ids, ov.count);
+  if (cols_changed && s.graph.captured()) {
+    // Reset() releases every segment through Backend::DestroyGraph and returns
+    // the container to its as-constructed state, which is also what lets the
+    // next capture open a scope on it (the scope refuses a container that
+    // already holds one).
+    s.graph.Reset();
     s.warm = false;
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, then relaunch the captured layer region.
-  if (s.captured) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-    b.ReplayGraph(impl_->queue, s.graph);
+  if (s.graph.captured()) {
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights, impl_->config);
+    // Through the seam's container, never `Backend::ReplayGraph` directly: the
+    // container replays its segments in order (one, here, because a decode
+    // capture is kFull) and owns the G3 replay counter the reachability gate
+    // reads.
+    s.graph.Replay(impl_->queue);
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -508,20 +569,81 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   // this size by the previous (eager) step. CAPTURE the layer region once,
   // instantiate the graph, then launch it.
   if (s.warm) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-    b.BeginCapture(impl_->queue);
-    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
-                            impl_->weights, impl_->config, kNoGather);
-    s.graph = b.EndCaptureGraph(impl_->queue);
-    s.logits = std::make_unique<DBuf>(std::move(lg));
-    s.captured = true;
+    EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights, impl_->config);
+    // ENG-CUDAGRAPH-BREAK W3 (#1291): the capture is the SHARED SEAM's, not this
+    // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
+    // the segment, the handle, its release, the drain a mid-capture throw needs
+    // (three drivers each hand-rolled the same
+    // `try { EndCaptureGraph(); } catch (...) {}`) and the G3 counters.
+    //
+    // kFULL, and the mode is the whole argument. vLLM's v1 default
+    // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63`) is documented at
+    // `:630-632` as a FULL graph for DECODE batches and a piecewise one for
+    // prefill and mixed batches, and `decode_mode()` (`:65-66`) returns the full
+    // half. This is a decode driver, so its capture is ONE segment with the
+    // attention calls INSIDE it — byte-identical in shape to the region this
+    // replaces. Opening it kPiecewise would turn every layer's attention into an
+    // eager call between two graph replays, which is not vLLM's decode behaviour
+    // and which nothing in this row's record supports. The piecewise arm reaches
+    // this driver at W6, when the eligibility predicate moves off `pure_decode`;
+    // the spec's `## Owed` names what has to be true first.
+    std::optional<DBuf> lg;
+    {
+      vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                         impl_->weights, impl_->config, kNoGather);
+    }  // ~GraphCaptureScope closes the segment and files it on s.graph
+    // NOT CAPTURED covers TWO states, and returning `*lg` is correct for exactly
+    // one of them. `~GraphCaptureScope` must swallow a throwing `EndCaptureGraph`
+    // — a destructor that propagates terminates — so a FAILED capture leaves the
+    // container reporting what an INERT scope reports.
+    //
+    //   * INERT (`capture_failed() == false`): the backend cannot capture, or
+    //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, the layer
+    //     region above ran EAGERLY, and `*lg` is a real result. Return it and go
+    //     back to cold so the next same-size step re-warms.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph` threw —
+    //     `cudaStreamEndCapture` returning
+    //     `cudaErrorStreamCaptureInvalidated`/`WrongThread`, or a failing
+    //     `cudaGraphInstantiate` (`src/vt/cuda/cuda_backend.cu:229`, `Check()` at
+    //     `:50`). Under stream capture NOTHING between `BeginCapture` and the
+    //     throw executed: every kernel was RECORDED, so `*lg` is pool-recycled
+    //     memory. Returning it would hand this step uncomputed device memory as
+    //     its logits — silently wrong tokens, no fault, and a token gate cannot
+    //     see it.
+    //
+    // So the failure PROPAGATES, carrying the runtime's own exception. This is
+    // exactly what the pre-W3 driver did (`s.graph = b.EndCaptureGraph(...)` was
+    // unguarded), and it is not a recovery this stage can justify inventing: a
+    // stream whose capture was INVALIDATED has not told us it is usable. Gated at
+    // `tests/vllm/models/test_qwen3_moe_decode_graph_seam.cpp`.
+    if (!s.graph.captured()) {
+      s.warm = false;  // either way this slot goes back to cold
+      if (s.graph.capture_failed()) {
+        const std::exception_ptr err = s.graph.capture_error();
+        s.graph.Reset();  // clear the failure with the graph it described
+        // The runtime's OWN diagnosis where the seam holds it. It is empty only
+        // on the arm where an exception was already propagating THROUGH the
+        // scope, which cannot reach this line; the refusal below is what makes
+        // that unreachability an assertion rather than a claim.
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "Qwen3MoeDecodeGraph: the decode capture was ABANDONED and its logits "
+                 "were never computed; refusing to return uncaptured device memory");
+      }
+      ForwardLogits drained = WrapDeviceLogits(d, std::move(*lg), B, vocab);
+      drained.device_tensor =
+          MakeTensor(drained.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+      return drained;
+    }
+    s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
       std::fprintf(stderr,
                    "[Qwen3MoeDecodeGraph] captured bf16 MoE decode graph for "
                    "padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
-    b.ReplayGraph(impl_->queue, s.graph);
+    s.graph.Replay(impl_->queue);
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -532,11 +654,10 @@ ForwardLogits Qwen3MoeDecodeGraph::Step(
   // per-shape scratch for this size) and defer capture to the next same-size
   // step. This is a real decode step — nothing is wasted.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
-  EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  EmbedInto(d, *s.hidden, s.ids.t(), impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
                           impl_->weights, impl_->config, kNoGather);
   s.warm = true;
-  s.captured = false;
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), B, vocab);
   fl.device_tensor =

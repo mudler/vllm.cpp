@@ -25,7 +25,8 @@ namespace vocoder1d {
 
 // One 1-D convolution over [C_in, T] with stride/dilation/groups. Weight is
 // [C_out, C_in/groups, K]; the input must ALREADY be padded. Accumulates in
-// double, and reports the produced length through `out_len`.
+// float — the width torch accumulates a float convolution in (#1474) — and
+// reports the produced length through `out_len`.
 std::vector<float> Conv1d(const std::vector<float>& in, int64_t in_channels,
                                    int64_t in_len, const std::vector<float>& weight,
                                    const std::vector<float>* bias, int64_t out_channels,

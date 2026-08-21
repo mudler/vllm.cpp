@@ -1406,7 +1406,7 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
 
   SUBCASE("NVFP4 experts but an UNQUANTIZED lm_head — now LOADS (#864)") {
     // The dense arm has always accepted a bf16 head (`LoadLmHeadAnyDtype`,
-    // qwen3_5_dense_weights.cpp:246-340); the MoE arm hard-required NVFP4 and
+    // qwen3_5_dense_weights.cpp:247-341); the MoE arm hard-required NVFP4 and
     // refused here. #864 gave it the bf16 arm, so the same fixture loads and
     // binds the head to the bf16 slot. Kept, inverted, for the reason above.
     CHECK(load(MoeSpecsWithBf16LmHead("model."), "bf16_lmhead").empty());

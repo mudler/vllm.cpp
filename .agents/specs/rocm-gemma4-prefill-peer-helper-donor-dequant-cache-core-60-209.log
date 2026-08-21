@@ -1,0 +1,150 @@
+// Multi-expert sticky FP8→BF16 weight cache (OPT-IN).
+// rocprof p11k: Fp8ChannelDequant ~10–18% device time. Single-slot thrash is real
+// within a layer's multi-chunk GEMM, BUT each MoE layer owns distinct expert weight
+// tensors — uniq_keys grows to ~O(layers×experts) (~1k+ @ p11k). A small LRU cannot
+// absorb cross-layer dequant without multi-GB BF16 twins. Default OFF (1 slot).
+// VT_GEMMA4_PREFILL_DEQUANT_CACHE = slot count (default 1, max 128).
+inline int PrefillDequantCacheSlots() {
+  static const int n = [] {
+    if (const char* e = std::getenv("VT_GEMMA4_PREFILL_DEQUANT_CACHE")) {
+      int v = std::atoi(e);
+      if (v <= 0) return 1;
+      return std::min(v, 128);
+    }
+    return 1;  // legacy single-slot; multi-slot is lab opt-in only
+  }();
+  return n;
+}
+
+// Per-device LRU of dequantized [gu_w, dn_w] keyed by stable fp8_gu (or weight_id).
+struct PrefillDequantCache {
+  struct Slot {
+    const void* key = nullptr;
+    void* gu = nullptr;
+    void* dn = nullptr;
+    uint64_t lru = 0;
+    int pins = 0;
+  };
+  int dev = -1;
+  int I = 0, H = 0;
+  int nslots = 0;
+  uint64_t clock = 0;
+  uint64_t hits = 0, misses = 0;
+  Slot slots[128]{};
+
+  void FreeAll() {
+    if (dev >= 0) (void)hipSetDevice(dev);
+    for (int i = 0; i < nslots; ++i) {
+      if (slots[i].gu) {
+        (void)hipFree(slots[i].gu);
+        slots[i].gu = nullptr;
+      }
+      if (slots[i].dn) {
+        (void)hipFree(slots[i].dn);
+        slots[i].dn = nullptr;
+      }
+      slots[i].key = nullptr;
+      slots[i].lru = 0;
+      slots[i].pins = 0;
+    }
+    nslots = 0;
+    dev = -1;
+    I = H = 0;
+  }
+
+  bool Ensure(int device, int i_dim, int h_dim) {
+    const int want = PrefillDequantCacheSlots();
+    if (dev == device && I == i_dim && H == h_dim && nslots == want) return true;
+    FreeAll();
+    if (device < 0 || i_dim <= 0 || h_dim <= 0 || want <= 0) return false;
+    if (hipSetDevice(device) != hipSuccess) return false;
+    const size_t gu_b = static_cast<size_t>(2 * i_dim) * static_cast<size_t>(h_dim) * 2;
+    const size_t dn_b = static_cast<size_t>(h_dim) * static_cast<size_t>(i_dim) * 2;
+    for (int i = 0; i < want; ++i) {
+      if (hipMalloc(&slots[i].gu, gu_b) != hipSuccess) {
+        FreeAll();
+        return false;
+      }
+      if (hipMalloc(&slots[i].dn, dn_b) != hipSuccess) {
+        FreeAll();
+        return false;
+      }
+    }
+    dev = device;
+    I = i_dim;
+    H = h_dim;
+    nslots = want;
+    clock = 0;
+    return true;
+  }
+
+  // On hit: returns cached BF16 weights. On miss: dequant into LRU victim.
+  // Caller must hold mu. Sets *pin_out so caller can Unpin after GEMM.
+  bool GetLocked(vt::Queue& q, const void* key, const void* fp8_gu, const void* s_gu,
+                 const void* fp8_dn, const void* s_dn, void** gu_out, void** dn_out,
+                 int* pin_out) {
+    if (!key || !fp8_gu || !gu_out || !dn_out || nslots <= 0) return false;
+    int hit = -1;
+    int victim = -1;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < nslots; ++i) {
+      if (slots[i].key == key) {
+        hit = i;
+        break;
+      }
+      // Never evict a pinned slot.
+      if (slots[i].pins > 0) continue;
+      if (slots[i].key == nullptr) {
+        if (victim < 0) victim = i;
+      } else if (slots[i].lru < oldest) {
+        oldest = slots[i].lru;
+        if (victim < 0 || slots[victim].key != nullptr) victim = i;
+      }
+    }
+    if (hit >= 0) {
+      ++hits;
+      slots[hit].lru = ++clock;
+      slots[hit].pins++;
+      *gu_out = slots[hit].gu;
+      *dn_out = slots[hit].dn;
+      if (pin_out) *pin_out = hit;
+      return true;
+    }
+    if (victim < 0) {
+      // All pinned — fall back to any unpinned or slot 0
+      for (int i = 0; i < nslots; ++i) {
+        if (slots[i].pins == 0) {
+          victim = i;
+          break;
+        }
+      }
+      if (victim < 0) return false;
+    }
+    ++misses;
+    Slot& s = slots[victim];
+    vt::DequantFp8ChannelBf16(q, s.gu, fp8_gu, s_gu, 2 * I, H);
+    vt::DequantFp8ChannelBf16(q, s.dn, fp8_dn, s_dn, H, I);
+    s.key = key;
+    s.lru = ++clock;
+    s.pins++;
+    *gu_out = s.gu;
+    *dn_out = s.dn;
+    if (pin_out) *pin_out = victim;
+    // One-time unique-key census (lab)
+    {
+      static std::mutex uk_mu;
+      static std::unordered_set<const void*> uniq;
+      static int uk_logs = 0;
+      std::lock_guard<std::mutex> ulk(uk_mu);
+      uniq.insert(key);
+      if (uk_logs < 3 || misses == 64 || misses == 128 || misses == 256 ||
+          (misses % 2048ull) == 0ull) {
+        std::fprintf(stderr,
+                     "INFO gemma4-moe dequant_cache dev=%d slots=%d miss=%llu hit=%llu "
+                     "uniq_keys=%zu key=%p\n",
+                     dev, nslots, static_cast<unsigned long long>(misses),
+                     static_cast<unsigned long long>(hits), uniq.size(), key);
+        ++uk_logs;
+      }
+    }
+    return true;

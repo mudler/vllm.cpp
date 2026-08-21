@@ -76,6 +76,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/minimax_music3_ar.h"
+#include "vllm/model_executor/models/minimax_music3_depth_device.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
 #include "vllm/model_executor/models/qwen3.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -265,6 +266,47 @@ struct Music3ArResult {
   bool stopped_on_end_token = false;
 };
 
+// The depth decoder's DEVICE arm, selected per call (#1309, spec §19).
+//
+// Both fields or neither. One alone is a caller that thinks it asked for the
+// device arm and did not, so it is REFUSED rather than silently ignored — the
+// same shape, and the same reason, as `Music3DenoiseDeviceArm`.
+//
+// A default-constructed arm keeps the host loop, so every existing caller and
+// every existing gate is unchanged by construction.
+struct Music3DepthDeviceArm {
+  vt::Queue* queue = nullptr;
+  const Music3DepthDeviceWeights* depth = nullptr;
+  bool engaged() const { return queue != nullptr && depth != nullptr; }
+  bool half_set() const { return (queue != nullptr) != (depth != nullptr); }
+};
+
+// THE PRODUCTION SELECTION of that arm, as a function rather than as an `if` in
+// the engine (#1309, [#1131](https://github.com/mudler/vllm.cpp/issues/1131),
+// spec §19.5).
+//
+// WHY IT IS A FUNCTION. The engine's condition is `queue_.device.type != kCPU`,
+// and that condition is FALSE on every runner CI owns, so an `if` written there
+// is the one line a CPU-only gate can never enter — which is #1131 exactly, and
+// #1131 is the reason this row exists. The same function runs on both sides of
+// the condition, so a gate CAN enter it: with a CPU queue, and with a fabricated
+// non-CPU one.
+//
+// THREE OUTCOMES, AND THE THIRD IS THE DEFECT. A CPU queue stages nothing and
+// returns an arm that is not engaged, so the caller keeps the host reference loop
+// every Music3 gate was taken on. Any other device stages the decoder into
+// `*staged` and returns an ENGAGED arm — or, on a build or a box that has no
+// provider for it, `StageMusic3DepthWeights` REFUSES by name and that refusal
+// propagates. What must never happen is a non-CPU queue quietly taking the host
+// arm, and that is what `test_minimax_music3_ar` asserts over every non-CPU
+// `vt::DeviceType`.
+//
+// `staged` outlives the returned arm's use or the arm dangles; the engine holds
+// both in the same scope. Throws if it is null.
+Music3DepthDeviceArm Music3SelectDepthArm(vt::Queue& queue, const DepthDecoderConfig& config,
+                                          DepthDecoderWeights& weights, bool release_host,
+                                          Music3DepthDeviceWeights* staged);
+
 // `MiniMaxMusic3SemanticGenerationStep.__call__` (encoders.py:299-353).
 //
 // `prompt_ids` is the CONDITIONAL row; the unconditional row is derived with
@@ -278,13 +320,22 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
                                           int64_t max_frames,
                                           const Music3ArWeights& weights,
                                           const Music3CodeSampler& sampler,
-                                          vt::Queue& queue);
+                                          vt::Queue& queue,
+                                          const Music3DepthDeviceArm& device_arm = {});
 
-// The same loop with the language model's own hidden states SUPPLIED rather than
-// produced — the teacher-forcing entry the LLM parity gate drives, and nothing
-// else. Kept beside the real loop instead of duplicated inside a test so the two
-// cannot drift: `Music3GenerateFrameHiddens` is this function with a session
-// attached.
+// One frame's DEPTH stage, with the language model's own hidden states SUPPLIED
+// rather than produced. `Music3GenerateFrameHiddens` calls it once per frame,
+// which is how the registered speech family reaches it; it is kept out of line
+// rather than inlined there so a gate can drive the schedule without a
+// checkpoint.
+//
+// WHAT DRIVES IT. An earlier revision of this comment said "the teacher-forcing
+// entry the LLM parity gate drives, and nothing else". That was wrong:
+// `test_minimax_music3_llm_real` never called this function, and until #1246
+// nothing but the loop did, so the schedule it composes — the 3-row prefix
+// projection, the batch-2 sequencing, the fed-back projection row — had no gate
+// of its own. `test_minimax_music3_ar`'s composed-stage case now drives it
+// directly against a transcription of the whole-sequence schedule it replaced.
 //
 // Not exposed on any request path: a caller with the hidden states already has
 // what the loop exists to compute.
@@ -292,7 +343,8 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
                                     const std::vector<float>& last_hidden_unconditional,
                                     int64_t frame_index, const Music3ArWeights& weights,
                                     const Music3CodeSampler& sampler,
-                                    std::vector<int32_t>* out_frame_codes);
+                                    std::vector<int32_t>* out_frame_codes,
+                                    const Music3DepthDeviceArm& device_arm = {});
 
 }  // namespace music3
 }  // namespace models

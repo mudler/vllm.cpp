@@ -68,6 +68,46 @@ inline constexpr MergedGemmGroup kKeepQuantGateUpSwiGLU = {
     /*name=*/"keepquant_gate_up_swiglu",
 };
 
+// The BLOCK-WISE (fine-grained 128x128) FP8 groups — MODEL-FP8-BLOCK-MERGED
+// (#1189 milestone M6, spec .agents/specs/model-fp8-block-merged.md). Two
+// descriptors, because vLLM runs two merged linears over this arm: one
+// MergedColumnParallelLinear for `gate_up_proj` and one QKVParallelLinear for
+// `q`/`k`/`v` — the model declares both
+// (vllm/model_executor/models/qwen3_5.py:288-298 `packed_modules_mapping` @
+// 5559679229), and the two loaders live at layers/linear.py:660 and :1021.
+//
+// WHY A BLOCK SCHEME MERGES WHERE THE PER-TENSOR ONE CANNOT. A per-tensor fp8
+// shard folds its own `input_scale * weight_scale` scalar, and two scalars do
+// not concatenate — the per-tensor merged QKV in this tree therefore runs the
+// GEMM at alpha=1 and applies a per-output-column alpha vector afterwards
+// (qwen3_5.cpp::MergedFp8QkvD), guarded on all shards sharing ONE input_scale
+// and OFF by default. A block scale is indexed by `n / block_n`, so
+// N-concatenating the shards is EXACT whenever each shard's rows start on a
+// block boundary, which is upstream's own merged-partition rule
+// (fp8_utils.py:1229-1244: every partition except the LAST must be a multiple
+// of block_n). No alpha vector, no shared-scale guard, no opt-in flag.
+//
+// `fast_op` is kNoMergedFastOp on BOTH, and that is the honest value rather
+// than a placeholder: no fused single-launch kernel exists for this family, and
+// #1189 milestone M5 owns the mainloop-scaled CUTLASS kernel. Until one is
+// registered, MergedGemmFp8Block runs the composite below on every device.
+inline constexpr MergedGemmGroup kFp8BlockGateUpSwiGLU = {
+    /*arity=*/2,
+    /*epilogue=*/MergedEpilogue::kSiluMulClamp,
+    /*fast_op=*/kNoMergedFastOp,
+    /*name=*/"fp8_block_gate_up_swiglu",
+};
+
+// The QKV group. `kNone` because a QKVParallelLinear has no fused tail at all —
+// the merged output is sliced into three row-strided q/k/v views and the attn
+// preamble consumes them.
+inline constexpr MergedGemmGroup kFp8BlockQkv = {
+    /*arity=*/3,
+    /*epilogue=*/MergedEpilogue::kNone,
+    /*fast_op=*/kNoMergedFastOp,
+    /*name=*/"fp8_block_qkv",
+};
+
 // The BF16-native SIBLING arm of this gate+up+SwiGLU family (Tier-A4 fold) is NOT a
 // MergedGemmGroup instance: the bf16 grouped-MoE archs (Qwen3-Coder, DeepSeek-V2,
 // kimi) marshal their experts as per-expert weight-POINTER ARRAYS [E] i64 with a
@@ -107,5 +147,32 @@ inline constexpr MergedGemmGroup kKeepQuantGateUpSwiGLU = {
 void MergedGemm(Queue& q, const MergedGemmGroup& desc, Tensor& out, const Tensor& act,
                 const Tensor& gate_w, const Tensor& up_w, const Tensor& expert_ids,
                 float epilogue_scalar, bool force_composite = false);
+
+// Run a BLOCK-WISE FP8 merged group (kFp8BlockGateUpSwiGLU, kFp8BlockQkv).
+//
+// A SECOND realization function under the SAME descriptor type, not a widening
+// of MergedGemm above: that one's operand list is the grouped-MoE one
+// (`expert_ids`, [E*N,K] expert towers, a broadcast activation) and a DENSE
+// block-FP8 group has none of those. What the two share is the descriptor and
+// the tiering rule — `desc.fast_op` when a device has registered it, else the
+// composite — so a model site never re-derives either.
+//
+//   merged  [M, sum N_i]   out_dtype   the ONE block-scaled GEMM's output
+//   out     [M, sum N_i / arity]       the epilogue's output, or nullptr
+//   a_fp8   [M,K] i8, a_scale [M, cdiv(K,block_k)] f32   from vt::QuantFp8Group
+//   w_fp8   [sum N_i, K] i8            the N-concatenated weight
+//   w_scale [sum cdiv(N_i,block_n), cdiv(K,block_k)] f32
+//
+// The concatenation is the CALLER's, because it is a load-time, once-only
+// device residency question rather than a per-call one; this function is the
+// launch. `epilogue_scalar` is the kSiluMulClamp limit and must be +inf, which
+// merged_gemm.h's enumerator already documents as the plain SwiGLU reduction —
+// no clamped block-fp8 kernel is bound, so a finite limit is refused rather
+// than silently ignored. For kNone, `out` must be nullptr and `merged` IS the
+// result.
+void MergedGemmFp8Block(Queue& q, const MergedGemmGroup& desc, Tensor& merged,
+                        Tensor* out, const Tensor& a_fp8, const Tensor& a_scale,
+                        const Tensor& w_fp8, const Tensor& w_scale, int block_n,
+                        int block_k, float epilogue_scalar);
 
 }  // namespace vt

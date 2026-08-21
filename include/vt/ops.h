@@ -113,6 +113,9 @@ enum class OpId : uint8_t {
   kAttentionDenseFa2,
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
+  kDFlashGroupedConv,
+  kDflash2SelectorEdges,
+  kDflash2PathWalk,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -123,6 +126,7 @@ enum class OpId : uint8_t {
   kApplyTemperature,
   kGreedyArgmax,
   kApplyTopKTopP,
+  kTopKValuesIndices,
   kComputeProbs,
   kComputeLogprobs,
   kRandomSample,
@@ -413,12 +417,14 @@ enum class OpId : uint8_t {
   //   * `vt` had NO transposed 1-D convolution of any kind. kCausalConv1dFwd is
   //     causal/stateful/SiLU-folded and kDepthwiseConv1d is centre-padded and
   //     depthwise; neither can express a scatter that GROWS the time axis.
-  //   * the ACCUMULATOR WIDTH differs and is part of the contract, not an
-  //     implementation detail. kDepthwiseConv1d accumulates in f32 and its
-  //     byte-exactness gate pins that; these two accumulate in f64, because f64
-  //     is what every committed `vocoder1d` golden was taken with. Widening or
-  //     narrowing either one moves a shipped model's numerics, so these are
-  //     SIBLINGS and kDepthwiseConv1d is untouched.
+  //   * the bias seeding and the zero-skip differ and are part of the contract,
+  //     not implementation detail — see vt::ConvTranspose1d clause (3), where
+  //     the skip decides the SIGN of a zero output cell. The ACCUMULATOR WIDTH
+  //     used to differ too and no longer does: kDepthwiseConv1d accumulates in
+  //     f32 and since #1474 so do these, because f32 is what torch accumulates
+  //     a float convolution in. Either one's width still moves a shipped
+  //     model's numerics, so they remain SIBLINGS and kDepthwiseConv1d is
+  //     untouched.
   // See vt::Conv1d / vt::ConvTranspose1d below for the exact contracts.
   // Appended before kCount so no existing op's id shifts.
   kConv1d,
@@ -441,6 +447,18 @@ enum class OpId : uint8_t {
   // them in the MAINLOOP. See vt::MatmulFp8BlockScaled below for the contract.
   // Appended before kCount so no existing op's id shifts.
   kMatmulFp8BlockScaled,
+  // --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007). The
+  // primitive `vt` has never had on ANY device, and the reason the LTX-2.5
+  // video VAE decode ran on the host while every oracle runs it GPU-resident.
+  // It is NOT a parameter of kConv2d, and the difference is the ACCUMULATION
+  // ORDER rather than the rank: kConv2d keeps one f32 accumulator over the whole
+  // (ic, kh, kw) sweep, while this op keeps one f32 PARTIAL PER INPUT CHANNEL —
+  // which is what torch's blocked-GEMM f32 convolution does, and what every
+  // committed LTX-2.5 video VAE golden was taken through. Same sibling
+  // relationship, and the same reason, as kConv1d vs kDepthwiseConv1d above.
+  // See vt::Conv3d below for the contract. Appended before kCount so no
+  // existing op's id shifts.
+  kConv3d,
   kCount
 };
 
@@ -648,6 +666,35 @@ struct Conv2dArgs {
   int64_t groups = 1;
 };
 
+// --- General 3-D convolution args (LTX25-DEVICE-RESIDENCY W5, #1007). --------
+
+// torch `nn.Conv3d` arguments, in `(T, H, W)` axis order. Field names mirror the
+// constructor keywords 1:1, exactly as Conv2dArgs mirrors `nn.Conv2d`'s, so a
+// reader of `CausalConv3d.__init__` (Lightricks/LTX-2 @ fd4ded7f2,
+// packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:267-302) can map
+// every field by name.
+//
+// `padding` here is ZERO padding on both sides of an axis, and that is the whole
+// of what this op does: a non-zero `padding_mode` — LTX's `reflect` and
+// `replicate` — is realised by the CALLER materialising the padded volume and
+// passing pad 0, which is what torch itself does (`nn.Conv3d` with a non-`zeros`
+// `padding_mode` runs `F.pad` and then a zero-padded convolution). The LTX
+// decoder's asymmetric CAUSAL temporal pad is materialised the same way, and for
+// the same reason: upstream materialises it too, with a `torch.concatenate`
+// (convolution.py:305-311).
+struct Conv3dArgs {
+  int64_t stride_t = 1;
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t pad_t = 0;
+  int64_t pad_h = 0;
+  int64_t pad_w = 0;
+  int64_t dilation_t = 1;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  int64_t groups = 1;
+};
+
 // torch `nn.Conv1d(C, C, K, stride, padding, groups=C)` arguments — the
 // NON-CAUSAL depthwise conv1d of `ParakeetEncoderConvolutionModule`
 // (modeling_parakeet.py:116, ctor :138-146; padding = (K-1)//2 at :136). Not to
@@ -757,6 +804,270 @@ struct DFlashPagedBlockAttentionArgs {
   int64_t sliding_window = 0;     // SWA window (>0); 0 = full causal when causal
   int num_reqs = 1;               // number of (1+k) query blocks
   int64_t block_size = 0;         // rows per paged context page (>0)
+};
+
+// Arguments for vt::DFlashGroupedConv — the DFlash2 draft's GROUPED DYNAMIC
+// DEPTHWISE CONVOLUTION, wrapped around each attention and each MLP sublayer
+// (SPEC-DFLASH2 W2, #1314).
+//
+// BEYOND-PIN. Ported from `_grouped_conv` and `DFlashGroupedConv`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`); the parity pin `555967922` does
+// not carry the architecture at all and this op does NOT advance it.
+//
+// The math, in upstream's own terms:
+//
+//   out[i,c] = sum_{t=0..taps-1} (base[side,t,c] + delta[i,side,t,g(c)]) * x[i-t,c]
+//
+// with `g(c) = c / group_size` the channel's GROUP, and tap `t` contributing only
+// where `(i mod block_size) >= t`. That mask is what makes the op a BLOCK
+// convolution rather than a sequence one: a proposal position sees the positions
+// before it inside its own (1+k) query block and NOTHING across the block
+// boundary, which is how a DFlash2 draft gets causal structure without another
+// backbone pass. `i` is the GLOBAL row index, exactly as upstream's
+// `torch.arange(hidden_states.shape[0])` is, and it is the right one here for the
+// same reason it is there: every request's block is contiguous and
+// block_size-aligned, so `i mod block_size` IS the intra-block offset.
+//
+// Upstream computes that mask on a POWER-OF-TWO block as `position & (block-1)`
+// and otherwise as `position % block`. Both arms are mirrored, and both are
+// gated: the two published DFlash2 checkpoints ship block 8 and block 16 (both
+// power-of-two, `z-lab/Qwen3.8-27B-DFlash2` and `z-lab/Muse-Glimmer-30B-DFlash2`)
+// and upstream's own reference test parametrises 5 to reach the modulo arm.
+//
+// `block_size` is `1 + num_speculative_tokens`, NOT `dflash_config.block_size` —
+// upstream sizes the conv by the QUERY block (the bonus token plus the mask
+// tokens) rather than by the checkpoint key, which only supplies that value's
+// default (`DFlash2Qwen3DecoderLayer.__init__` @ that head).
+//
+// SIDES. `base_kernel` is `[2, taps, hidden]` and dim 0 is the SIDE — 0 =
+// `prepare` (before the sublayer), 1 = `finish` (after it) — NOT a tap. One
+// projection of the sublayer input produces BOTH sides' deltas
+// (`kernel_projection`: hidden -> 2*taps*num_groups), so `coefficients` is the
+// same buffer for both calls and `side` selects the half. Passing the whole
+// buffer rather than a slice mirrors upstream's `coefficients[:, side]` view
+// without materializing a copy of a non-contiguous slice.
+//
+// ACCUMULATION. Every intermediate is rounded to the tensor dtype after each
+// step, because upstream's chain materializes bf16 tensors at each one
+// (`base + delta`, `coefficients * blocks`, `output += ...`). This is elementwise
+// with no reduction-order freedom, so the CPU reference and the CUDA kernel are
+// specified BIT-IDENTICAL rather than within an envelope.
+//
+// WHAT IS ACTUALLY GATED, because the two halves of that sentence are not
+// equally proven. The per-step POLICY is pinned on CPU in bf16 by
+// `tests/vt/test_ops_dflash2_grouped_conv.cpp` — one hand-computed case with
+// literal expectations that differ from the rounded-once-at-the-end answer in
+// six of eight outputs, plus three shapes asserted bit-exact against a reference
+// that rounds where UPSTREAM materializes. On f32 this rounding is the identity
+// by construction, so no f32 case can see it and none is claimed to. The CPU ==
+// CUDA half is NOT proven: that case exists and is written to run, but it has
+// never compiled on a host without `nvcc` and reports `no CUDA backend;
+// skipping`. See `## Owed` O6 of `.agents/specs/dflash2-spec-decode.md`.
+struct DFlashGroupedConvArgs {
+  int64_t block_size = 0;   // 1 + num_speculative_tokens (the query block)
+  int64_t taps = 0;         // dflash_config.conv_kernel_size
+  int64_t num_groups = 0;   // hidden_size / conv_group_size
+  int64_t group_size = 0;   // dflash_config.conv_group_size
+  int64_t side = 0;         // 0 = prepare, 1 = finish (selects base/coefficient half)
+};
+
+// Arguments for vt::Dflash2SelectorEdges — the DFlash2 CANDIDATE SELECTOR's edge
+// lattice (SPEC-DFLASH2 W3, #1314).
+//
+// BEYOND-PIN. Ported from `_score_edges` and `CandidateSelector.forward`
+// (vllm/model_executor/models/qwen3_dflash2.py:208-276 @ vllm-project/vllm#52816
+// head `66e5414c6d75a8529473d977f7458c140bbab8a0`); the parity pin `555967922`
+// does not carry the architecture at all and this op does NOT advance it. The
+// PR head MOVED from `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19
+// (#1404); `_score_edges` and `CandidateSelector` are BYTE-IDENTICAL at the two
+// heads, and only the enclosing model's `set_model_tag` and the LM-head guard
+// changed, so this op cites the NEW head and its math is unaffected.
+//
+// The math, in upstream's own terms:
+//
+//   edge(b, l, p, c) = unary[b,l,c]
+//                    + sum_r (pred_codebook[pid(b,l,p), r] * hidden[b,l,r])
+//                            * succ_codebook[cand[b,l,c], r]
+//
+// where `pid(b,l,p)` is the PREDECESSOR token of slot `p` at step `l`: the
+// request's verified ANCHOR token at `l == 0` (the same token for every `p`,
+// upstream's `anchor_token_ids[:, None, None].expand(-1, 1, top_k)`), and
+// `cand[b, l-1, p]` at every later step. So `p` indexes the previous step's K
+// candidates and `c` this step's K candidates, which is exactly the transition
+// lattice the W4 path walk consumes.
+//
+// `unary` is the candidate VALUE from `compute_candidates` — the target head's
+// top-K logit AFTER `output_multiplier` and `final_logit_softcapping` — and it
+// is f32 there and f32 here. Upstream broadcasts it over `p`
+// (`unary_logits[:, :, None]`), so it is a per-CHILD bias and not a per-edge one.
+//
+// ACCUMULATION AND DTYPE. Upstream materializes two bf16 tensors inside the
+// einsum chain and then promotes: `predecessors * hidden[:, :, None]` is a bf16
+// tensor, the einsum's own output is a bf16 tensor, and `unary_logits + <bf16>`
+// promotes to f32 by torch's own type-promotion rule. This op mirrors that
+// placement exactly: the elementwise product rounds to the codebook dtype, the
+// rank reduction accumulates in f32 and rounds ONCE to the codebook dtype, and
+// only then is the f32 `unary` added. On f32 codebooks both roundings are the
+// identity, so the policy is observable ONLY in bf16 — which is where it is
+// gated, for the reason `## Owed` O6 records for the W2 convolution.
+//
+// The rank reduction IS a reduction, so unlike vt::DFlashGroupedConv this op is
+// NOT specified bit-identical across backends: a CUDA mirror is free to reduce
+// in a different order and is gated within an f32 envelope. That is a real
+// difference from W2 and is stated here rather than inherited by analogy.
+struct Dflash2SelectorEdgesArgs {
+  int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
+};
+
+// Arguments for vt::Dflash2PathWalk — the DFlash2 candidate selector's PATH WALK
+// (SPEC-DFLASH2 W4, #1314).
+//
+// BEYOND-PIN. Ported from `_selector_walk_kernel`
+// (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:16-79 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`).
+//
+// WHAT IT IS. The selector scores every (predecessor, child) transition of every
+// step; the walk turns that lattice into k tokens. It starts at the verified
+// anchor -- which the lattice already carries as EVERY predecessor slot of step
+// 0, so the walk enters at slot 0 -- takes the best child, and reads the NEXT
+// step's block at the predecessor row it just chose. The slot-to-slot dependency
+// is the whole shape of the problem: step l cannot start until step l-1 has
+// picked, so `L` steps are inherently sequential.
+//
+// ITS SHAPE IS UPSTREAM'S SHAPE, and that is a decision rather than a detail.
+// Upstream runs ONE program per request: the K scores of a slot stay in
+// registers and the step loop lives INSIDE the program, so `L` steps cost one
+// launch rather than `L`. Spec `## Risks/decisions` D3 requires the walk to be
+// on device from the first landing, because the identical sequential shape in
+// DSpark shipped host-side and measured 28% of the 27B draft step
+// (https://github.com/mudler/vllm.cpp/issues/436) before
+// `SampleSequentialDevice` moved it. The CUDA arm here is one block per request
+// with a shuffle argmax; the CPU arm is the authoritative reference.
+//
+// GREEDY IS THE ONLY ARM, and it is upstream's greedy arm exactly. At the moved
+// head the walk's two hand-written branches collapse into one
+// `gumbel_noised_argmax` call whose temperature argument is
+// `temperature if SAMPLE_PROBABILISTIC else 0.0`, and `SAMPLE_PROBABILISTIC` is
+// `self.draft_logits is not None`, which is set only for
+// `draft_sample_method == "probabilistic"`. At temperature 0 that helper divides
+// by nothing, adds no noise, and returns `tl.max(logits, axis=0,
+// return_indices=True)`; the `USE_FP64` cast it may apply is order-preserving on
+// fp32 inputs and cannot move a greedy answer. This engine refuses
+// `draft_sample_method: "probabilistic"` BY NAME at
+// `vllm::ParseSpeculativeConfigJson` (src/vllm/config/speculative.cpp) and
+// verifies accept-iff-equal, so no configuration can reach the noised arm and
+// nothing could consume the realized proposal distribution it exists to feed.
+// Landing that arm would be landing code no entry point can reach; it is owed,
+// with its layout, at `## Owed` of .agents/specs/dflash2-spec-decode.md.
+//
+// THE TIE-BREAK AND THE -inf ROW ARE PART OF THE CONTRACT. `tl.max(...,
+// return_indices=True)` resolves a tie to the LOWEST index, and upstream loads
+// masked lanes as -inf, so a row that is entirely -inf resolves to index 0
+// rather than to "no index". Both are pinned by literal cases and both arms
+// implement them identically: the reduction is seeded at -inf with slot index
+// `top_k`, keeps a candidate only when it STRICTLY exceeds the running best (so
+// a NaN never wins, on either arm), and collapses a `top_k` seed back to 0. A
+// different tie rule would pick a different PREDECESSOR for the next step, so it
+// moves the whole remaining path and not one token.
+//
+// UNLIKE vt::Dflash2SelectorEdges this op is specified BIT-EXACT across
+// backends. It performs no arithmetic -- only comparisons and one gather -- so
+// there is no reduction order for a backend to differ in.
+//
+// STRICTNESS IS THE WHOLE OF THAT CLAIM, and it was not free. W4's fresh review
+// measured the two arms apart on a NaN-bearing row: the CUDA per-lane scan
+// carried `|| (v == best && j < slot)` beside its strict `>`, a clause that is
+// unreachable once a lane has claimed anything (`j` only ascends) and whose one
+// effect was at the SEED -- a lane holding -inf compared equal to the -inf seed
+// and claimed a slot the CPU arm refuses. `[NaN,-inf]` read cpu 0 / cuda 1,
+// `[NaN,NaN,-inf]` read cpu 0 / cuda 2, and every NaN-free row agreed,
+// including the all -inf row and the forced tie group, so no fixture without a
+// NaN could see it. The clause is now DELETED rather than this claim narrowed,
+// and the lower-slot tie rule stays where it is needed: the cross-lane
+// butterfly, which combines lane winners out of slot order. BOTH HALVES OF
+// THAT DELETION ARE NOW COVERED, and #1518 corrects an earlier sentence here
+// saying it had never been compiled or run on a device. It COMPILES on every
+// pull request: `src/vt/cuda/cuda_ops.cu` is in the CUDA source list
+// (CMakeLists.txt, `target_sources(vllm PRIVATE ...)` under `if(VLLM_CPP_CUDA)`)
+// that CI's `build-cuda-fat` job builds for ten architectures
+// (`80;86;87;89;90a;100a;103a;110;120a;121a`). And it has RUN: the operator
+// executed this suite on `dgx:gpu0` (GB10, sm_121a) at the W4 merge commit,
+// reporting 83 assertions on device against 49 on CPU, `Status: SUCCESS!`, with
+// zero `no CUDA backend; skipping` lines -- the increment includes the NaN row
+// chained into the parity fixture, which is the row that measured the
+// divergence. What remains owed at `## Owed` O11 of
+// .agents/specs/dflash2-spec-decode.md is the rest of that entry, not this
+// deletion; the AUTHORING HOST still has no `nvcc` and still skips the case
+// locally. NO SHIPPED PATH FEEDS THIS OP A NaN:
+// the lattice comes from vt::Dflash2SelectorEdges over a target LM head, so the
+// row that measured the difference is synthetic, and it is a gap in the reach
+// of the contract rather than in any draft a user can obtain.
+struct Dflash2PathWalkArgs {
+  int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
+};
+
+// Arguments for vt::TopKValuesIndices — the vocabulary top-k that EMITS the
+// surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314).
+//
+// BEYOND-PIN. Ported from `_topk`
+// (vllm/model_executor/models/qwen3_dflash2.py:60-64 @ vllm-project/vllm#52816
+// head `66e5414c6d75a8529473d977f7458c140bbab8a0`), which is `torch.topk(scores,
+// k, dim=-1)` off CUDA and FlashInfer's radix `top_k(..., sorted=True,
+// deterministic=True)` on it.
+//
+// WHY NOT FLASHINFER'S RADIX KERNEL. Spec `## Risks/decisions` D2: `topk.cuh` is
+// 3380 lines of general kernel (multi-CTA, deterministic mode, three tie-break
+// modes, dynamic shared-memory sizing) for a shape that is fixed and small here
+// — K = 16 over a 248320 vocabulary for `num_reqs * k` rows, about 224 at
+// concurrency 32. The CUDA arm instead extends the sort-free block-cooperative
+// pivot-bracket threshold search this repository already carries and gates
+// (`src/vt/cuda/cuda_sample.cu::ApplyTopKTopPRowKernel`, ported from the SAME
+// FlashInfer `TopK/TopPRenormProb` approach) so that it COMPACTS and ORDERS the
+// survivors instead of masking below the k-th largest.
+//
+// TIE-BREAK IS PART OF THE CONTRACT, not an implementation detail. The threshold
+// search finds an exact array VALUE, so it keeps whole tie groups atomically and
+// can leave more than k survivors; something then has to choose among equals.
+// This op returns exactly k pairs ordered by DESCENDING value with ties broken
+// by ASCENDING index, which is `torch.topk`'s CPU order and what FlashInfer's
+// `deterministic=True` exists to provide. A backend that broke ties differently
+// would reorder the selector's candidate slots and move acceptance without
+// raising anything, so the CPU reference pins it and the CUDA arm mirrors it.
+//
+// NaN IS THE ONE POINT WHERE THE TWO ARMS ARE NOT EQUAL, and this is stated here
+// because a contract that claimed otherwise would be a claim no shipped backend
+// delivers. The CPU arm orders NaN FIRST, which is `torch.topk(largest=True)`'s
+// own answer, and it is stated rather than left to the sort: leaving it implicit
+// made the CPU comparator an intransitive equivalence and therefore undefined
+// behaviour, not merely an unusual result. The CUDA arm DOES NOT ORDER NaN
+// FIRST and cannot as written -- `TopKValuesIndicesRowKernel`'s pivot bracket
+// uses `fmaxf`/`fminf`, which return the non-NaN operand, and its survivor pass
+// tests `r[j] > thr`, which is false for a NaN, so the search can never select
+// one. Measured on a GB10 on 2026-08-20 rather than argued:
+// [#1489](https://github.com/mudler/vllm.cpp/issues/1489), where the direct
+// cross-arm comparison read `gpu.indices[0] == cpu.indices[0]` as `2 == 1`.
+// Reconciling the kernel to NaN-first is owed to that issue; until it lands the
+// device gate is scoped to the rows the kernel implements. NO SHIPPED PATH FEEDS
+// THIS OP A NaN LOGIT -- the candidate values come from a target LM head -- so
+// the row that pins the CPU order is synthetic in the same sense the padding row
+// is, and the asymmetry is a gap in the contract's reach rather than in any
+// output a user can obtain.
+//
+// `num_org_vocab_padding` mirrors upstream's
+// `lm_head.shard_indices.num_org_vocab_padding`: that many columns at the END of
+// each row are forced to -inf BEFORE the search, so a padded head can never
+// contribute a candidate. It is 0 on every path this engine ships today (the
+// DFlash lane's lm_head is the raw unpadded checkpoint tensor and there is no
+// vocab-parallel sharding), and it is implemented and gated synthetically rather
+// than claimed as checkpoint coverage — the same posture `## Upstream chain`
+// records for the three output scalars. Upstream's companion
+// `org_vocab_start_index` is applied by the CALLER
+// (`vllm::Qwen3DFlash2Model::ComputeCandidates`), not here, because it is an
+// id-space rebase of the result rather than a property of the search.
+struct TopKValuesIndicesArgs {
+  int64_t k = 0;                        // dflash_config.selector_top_k
+  int64_t num_org_vocab_padding = 0;    // trailing columns forced to -inf first
 };
 
 // Backend-neutral local-attention window, matching FlashAttention's
@@ -1165,6 +1476,9 @@ using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Te
 using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*weight*/, const Tensor* /*bias*/,
                                    const DepthwiseConv1dArgs&);
+// General 3-D convolution (#1007).
+using Conv3dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv3dArgs&);
 // BigVGAN / DAC vocoder 1-D convolutions (#672).
 using Conv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
                           const Tensor* /*bias*/, const Conv1dArgs&);
@@ -1182,6 +1496,15 @@ using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, con
                                              const Tensor&, const Tensor&, const Tensor&,
                                              const Tensor&, const Tensor&, const Tensor&,
                                              const DFlashPagedBlockAttentionArgs&);
+using DFlashGroupedConvFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                     const Tensor&, const DFlashGroupedConvArgs&);
+using Dflash2SelectorEdgesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Dflash2SelectorEdgesArgs&);
+using Dflash2PathWalkFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                   const Dflash2PathWalkArgs&);
+using TopKValuesIndicesFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
+                                     const TopKValuesIndicesArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -2737,6 +3060,53 @@ void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& ke
 void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
             const Conv2dArgs& args);
 
+// --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) --------------
+// Spec: .agents/specs/ltx25-device-residency.md `## W5`. Upstream mirror:
+// torch `nn.Conv3d` as `CausalConv3d` instantiates it — Lightricks/LTX-2 @
+// fd4ded7f2, packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:292-302,
+// called once at :312, which is the WHOLE of the LTX-2.5 video VAE's arithmetic.
+//
+//   out    [Cout, Tout, Hout, Wout]
+//   x      [Cin,  Tin,  Hin,  Win ]
+//   weight [Cout * Cin/groups, KT, KH, KW]
+//   bias   optional rank-1 [Cout]
+// Tout = (Tin + 2*pad_t - dilation_t*(KT-1) - 1)/stride_t + 1, likewise H and W.
+// `groups` must divide both Cin and Cout; output channel oc reads input group
+// oc/(Cout/groups). Zero padding: taps outside the input extent are SKIPPED.
+//
+// BATCH 1, DELIBERATELY. torch's tensor is [N, Cin, T, H, W] and this one drops
+// the N axis, because `vt::Tensor` caps rank at 4 (include/vt/tensor.h:12) and
+// raising that cap changes the one struct every op in the tree passes. Batch 1
+// is what the video VAE decodes. A caller that needs N > 1 gets a refusal by
+// name from the wrapper, never a silently folded axis.
+//
+// THE WEIGHT'S TWO LEADING AXES ARE MERGED, for the same rank reason: torch's
+// [Cout, Cin/groups, KT, KH, KW] is rank 5, and [Cout * Cin/groups, KT, KH, KW]
+// is the same bytes in the same order. `Cout` comes from `out` and `Cin/groups`
+// from `x` and `args.groups`, so nothing is lost and the wrapper CHECKS the
+// product rather than trusting it.
+//
+// ACCUMULATION ORDER — CONTRACT, NOT DETAIL, AND NOT kConv2d's. Per output
+// element: one f32 accumulator seeded with the bias, then ONE f32 PARTIAL PER
+// INPUT CHANNEL walked strictly in (kt, kh, kw) order and added into it. That is
+// what torch's f32 convolution does — it is a blocked GEMM and sums one partial
+// per channel block — and it is what every committed LTX-2.5 video VAE golden
+// was taken through. kConv2d's single flat accumulator is a DIFFERENT number:
+// src/vllm/model_executor/models/ltx2_video_vae.cpp measures the flat order
+// pushing the non-causal tiled golden to 5.00679e-06 against a 5e-06 tolerance.
+// The two ops are siblings for exactly the reason kConv1d and kDepthwiseConv1d
+// are, and neither may be re-pointed at the other.
+//
+// The order is why the CPU and CUDA arms are BYTE-IDENTICAL rather than close:
+// the device kernel walks the same sweep with __fmul_rn/__fadd_rn, and the host
+// side is already pinned against FMA contraction by -ffp-contract=off
+// (CMakeLists.txt). tests/vt/test_ops_conv3d.cpp gates the order against an
+// independent in-test scalar reference.
+//
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv3dArgs& args);
+
 // P2 — NON-CAUSAL depthwise `nn.Conv1d(C, C, K, stride, padding, groups=C)`, the
 // conformer convolution module's temporal mixer.
 //   out    [N, C, Lout]
@@ -2796,26 +3166,46 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 //
 // THE NUMERIC CONTRACT, which is the load-bearing part.
 //
-// (1) Every output element owns ONE f64 accumulator. Not f32. The host
-//     reference these replace accumulated in double
-//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), every
-//     committed golden under `tests/parity/goldens/` for all four consumers was
-//     taken through it, and a narrower accumulator would move four shipped
-//     models at once. This is a DELIBERATE divergence from torch, which
-//     accumulates an f32 conv in f32; it is recorded rather than silently
-//     inherited because `.agents/porting.md` "Mirror the memory format" cuts
-//     both ways and a WIDER accumulator is exactly the class of divergence a
-//     token gate cannot see. Cost: the activations and weights stay f32 in
-//     memory, so nothing moves more bytes; only the register width differs.
+// (1) Every output element owns ONE f32 accumulator. Not f64. That is what
+//     torch accumulates a float convolution in, MEASURED rather than read: on a
+//     27-tap `[+1e8, 0.1 x 25, -1e8]` probe, where an f32 accumulator lands on
+//     exactly 0.0 in ANY summation order and an f64 one lands near 2.5,
+//     `F.conv1d` returns 0.0 at f32 and at bf16 and `F.conv_transpose1d`
+//     returns 0.0 at f32 (torch 2.11.0+cu130). vLLM owns neither op at the
+//     parity pin `555967922` — it drops the vocoder it would otherwise own,
+//     `qwen3_omni_moe_thinker.py:1975` — so torch is the reference here through
+//     the per-consumer secondary oracles, and where vLLM DOES own a convolution
+//     it states the same polarity itself (`csrc/cpu/mamba_kernels.hpp`,
+//     "Accumulate in float32 for precision").
+//
+//     THIS WAS f64 UNTIL VT-CONV1D-F32-ACC (#1474), justified by a claim that
+//     did not hold. The host reference these replaced did accumulate in double
+//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), but the
+//     goldens were never taken through it at that width: all four consumers'
+//     generators run torch in f32 (`scripts/gen-bigvgan-goldens.py:48` builds
+//     f64 and then calls `.float()`; `gen-ltx2-vae-goldens.py:223,234` and
+//     `gen-minimax-music3-acoustic-goldens.py:81,134` cast with
+//     `astype(np.float32)`), so this op was WIDER than the oracle its own
+//     goldens came from. The clause also cited `tests/parity/goldens/`, a
+//     directory that contains no vocoder, BigVGAN, LTX-2.5 VAE, FVQ or
+//     general-conv1d golden at all — they are `.inc` headers beside their tests
+//     (`tests/vllm/models/bigvgan_goldens.inc`, `ltx2_vae_goldens.inc`,
+//     `minimax_music3_acoustic_goldens.inc`). An uncheckable citation is how
+//     the first claim survived. Narrowing moved the port TOWARD its goldens:
+//     over 194 arms, 182 unchanged, 10 improved, 2 one ULP worse and three or
+//     more decimal orders inside their bounds.
+//     .agents/specs/vt-conv1d-f32-accumulator.md.
 //
 // (2) THE VISIT ORDER IS PINNED, not merely the value.
 //     Conv1d accumulates over (ic ascending, k ascending) with the bias seeded
 //     FIRST — `acc = bias; for ic: for k: acc += x*w`.
 //     ConvTranspose1d accumulates over (ic ascending, then input position t
 //     ascending, taking the single tap k with `t*stride + k*dilation == p`) with
-//     the bias added LAST. That is the exact sequence of additions the host
-//     scatter performed into each destination cell, which is what lets the
-//     gather-form kernels here be BIT-IDENTICAL to it rather than merely close.
+//     the bias added LAST. That is the sequence of additions the host scatter
+//     performed into each destination cell, which is what lets the gather-form
+//     kernels here be BIT-IDENTICAL to each other rather than merely close. The
+//     ORDER is the host loop's; since #1474 the WIDTH is not, so the identity
+//     holds between the providers here and not against that loop.
 //
 // (3) ConvTranspose1d SKIPS an input whose value compares equal to 0.0, exactly
 //     as the host loop did. That is not an optimisation that may be dropped: it
@@ -2824,16 +3214,26 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 //
 // Parallelism partitions OUTPUT elements only, so results do not depend on the
 // thread count or the launch geometry. Gated in
-// tests/vt/test_ops_conv1d_general.cpp against a verbatim copy of the pre-op
-// host loop, and in tests/vllm/models/test_host_parallel.cpp end to end.
+// tests/vt/test_ops_conv1d_general.cpp and tests/vllm/models/test_host_parallel.cpp
+// against in-test serial references that walk the declared order. Those
+// references were verbatim copies of the pre-op host loop until #1474 narrowed
+// them in lockstep with the kernels, so what they now assert is that the ORDER
+// did not move, not that the arithmetic matches a historical loop. Clause (1)
+// is what gates the WIDTH, and it is gated against torch's own answer rather
+// than against a copy of ourselves — `tests/vllm/models/test_host_parallel.cpp`,
+// `vocoder1d Conv1d / ConvTranspose1d accumulates in f32, which is what torch
+// does`, entering through the production `vllm::vocoder1d::*` entry point.
 //
 // (4) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE, not merely close.
-//     Both are one f64 accumulator per output element walked in the order
+//     Both are one f32 accumulator per output element walked in the order
 //     above; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56)
-//     and the device kernel uses `__dmul_rn`/`__dadd_rn`, so every operation on
-//     both arms is an IEEE double multiply or add with round-to-nearest-even on
+//     and the device kernel uses `__fmul_rn`/`__fadd_rn`, so every operation on
+//     both arms is an IEEE single multiply or add with round-to-nearest-even on
 //     the same values in the same sequence. The gate asserts `memcmp` equality,
-//     not a tolerance.
+//     not a tolerance. **UNVERIFIED at the narrowed width**: #1474 had no CUDA
+//     toolkit and no lease, so this clause rests on the construction and not on
+//     a run. Owed, and named as owed:
+//     .agents/specs/vt-conv1d-f32-accumulator.md §7.
 //
 // x/weight/bias/out are f32 only. f16/bf16 are REFUSED with a message naming
 // the gap rather than silently widened — no consumer has them and no golden
@@ -2966,6 +3366,57 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
                                const Tensor& cu_seqlens, const Tensor& seq_lens,
                                const Tensor& block_table,
                                const DFlashPagedBlockAttentionArgs& args);
+
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314). See
+// DFlashGroupedConvArgs for the contract and the upstream anchor. Tensors:
+//   out           [T, H]                       the convolved sublayer stream
+//   x             [T, H]                       the sublayer input/output stream
+//   coefficients  [T, sides, taps, num_groups] the per-position kernel DELTAS
+//   base          [sides, taps, H]             the checkpoint's base_kernel
+// with H == num_groups * group_size and `args.side` in [0, sides). All four share
+// one float dtype (bf16 on every published checkpoint). CPU is the authoritative
+// reference; CUDA mirrors it bit-for-bit.
+void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                       const Tensor& base, const DFlashGroupedConvArgs& args);
+
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314). See
+// Dflash2SelectorEdgesArgs for the contract and the upstream anchor. Tensors:
+//   scores          [B, L, K, K] f32   edge(b,l,predecessor,child)
+//   pred_codebook   [V, R]             candidate_selector.predecessor_codebook
+//   succ_codebook   [V, R]             candidate_selector.successor_codebook
+//   candidate_ids   [B, L, K] i64      compute_candidates' ids (target vocab)
+//   unary           [B, L, K] f32      compute_candidates' values
+//   hidden          [B, L, R]          hidden_projection(final hidden states)
+//   anchors         [B] i64            each request's verified anchor token
+// The two codebooks and `hidden` share one float dtype (bf16 on every published
+// checkpoint); `scores` and `unary` are always f32. CPU is the authoritative
+// reference.
+void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                          const Tensor& succ_codebook, const Tensor& candidate_ids,
+                          const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
+                          const Dflash2SelectorEdgesArgs& args);
+
+// DFlash2 candidate-selector PATH WALK (SPEC-DFLASH2 W4, #1314). See
+// Dflash2PathWalkArgs for the contract, the tie-break and the upstream anchor.
+// Tensors:
+//   tokens        [B, L] i64        the drafted token per (request, step)
+//   scores        [B, L, K, K] f32  vt::Dflash2SelectorEdges' output
+//   candidate_ids [B, L, K] i64     compute_candidates' ids (target vocab)
+// One request is one program: the step loop is INSIDE it, because step l reads
+// the predecessor row step l-1 chose.
+void Dflash2PathWalk(Queue& q, Tensor& tokens, const Tensor& scores,
+                     const Tensor& candidate_ids, const Dflash2PathWalkArgs& args);
+
+// Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2,
+// #1314). See TopKValuesIndicesArgs for the contract, the tie-break and the
+// upstream anchor. Tensors:
+//   values   [rows, k] f32   the k largest logits of each row, DESCENDING
+//   indices  [rows, k] i64   their column indices, ties broken ASCENDING
+//   logits   [rows, V] f32   read-only (unlike vt::ApplyTopKTopP, which masks
+//                            its input in place)
+// `args.k` must be in [1, V - args.num_org_vocab_padding].
+void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                       const TopKValuesIndicesArgs& args);
 
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;

@@ -11,13 +11,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
 #include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W5: the shared capture seam
 #include "vt/ops.h"
 
 namespace vllm {
@@ -30,6 +33,103 @@ using vt::Tensor;
 using namespace dense_attn;  // Dev, DBuf, ResidentWeight, Reshape, MakeRopeArgs
 
 constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/utils.py:45)
+
+// ---------------------------------------------------------------------------
+// SPEC-DFLASH2 W2 (#1314) — the grouped dynamic depthwise convolution that wraps
+// each attention and each MLP sublayer of a DFlash2 draft block.
+//
+// BEYOND-PIN, from `DFlashGroupedConv.prepare` / `.finish` and
+// `DFlash2Qwen3DecoderLayer.forward`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`). Upstream's decoder layer is:
+//
+//     hidden, coefficients = self.attention_conv.prepare(hidden)
+//     hidden               = self.self_attn(positions, hidden)
+//     hidden               = self.attention_conv.finish(hidden, coefficients)
+//     hidden, residual     = self.post_attention_layernorm(hidden, residual)
+//     hidden, coefficients = self.mlp_conv.prepare(hidden)
+//     hidden               = self.mlp(hidden)
+//     hidden               = self.mlp_conv.finish(hidden, coefficients)
+//
+// TWO things about the shape of this pair are load-bearing and neither is
+// visible in a token gate, because a DFlash2 draft whose conv is wrong still
+// emits the TARGET's tokens (the verify is lossless) and loses only acceptance:
+//
+//  * ONE projection, TWO sides. `prepare` projects the sublayer INPUT once into
+//    `[T, 2, taps, num_groups]` and convolves with side 0; `finish` reuses that
+//    SAME buffer with side 1, over the sublayer OUTPUT. So the finish
+//    coefficients are a function of the input, not of the output, and computing
+//    them again after the sublayer would be a different model.
+//  * The conv's block is the QUERY block, `1 + k`, and the taps are zeroed
+//    across its boundary, which is what `weights.conv_block_size` carries.
+//
+// `stream` is convolved IN PLACE (the DBuf is replaced by the conv output),
+// mirroring upstream's rebinding of `hidden_states`.
+DBuf DflashConvPrepare(Dev d, const Qwen3DFlashConvWeights& cw,
+                       const Qwen3DFlashWeights& weights, const HfConfig& config,
+                       DBuf* stream) {
+  const int64_t T = stream->t().shape[0];
+  const int64_t H = config.hidden_size;
+  const int64_t taps = weights.conv_taps;
+  const int64_t groups = H / weights.conv_group_size;
+  // ONE projection of the sublayer input -> [T, 2, taps, num_groups]. The GEMM
+  // writes a flat [T, 2*taps*num_groups] view of the same buffer, which is the
+  // reshape upstream spells as `.reshape(hidden.shape[0], 2, taps, num_groups)`.
+  DBuf coef(d, DType::kBF16, {T, 2, taps, groups});
+  {
+    Tensor flat = Reshape(coef.t(), {T, 2 * taps * groups});
+    Tensor wp = ResidentWeight(d, cw.kernel_projection);
+    vt::MatmulBT(d.q, flat, stream->t(), wp);
+  }
+  DBuf out(d, DType::kBF16, {T, H});
+  Tensor base = ResidentWeight(d, cw.base_kernel, {2, taps, H});
+  vt::DFlashGroupedConvArgs a;
+  a.block_size = weights.conv_block_size;
+  a.taps = taps;
+  a.num_groups = groups;
+  a.group_size = weights.conv_group_size;
+  a.side = 0;  // prepare
+  vt::DFlashGroupedConv(d.q, out.t(), stream->t(), coef.t(), base, a);
+  *stream = std::move(out);
+  return coef;
+}
+
+void DflashConvFinish(Dev d, const Qwen3DFlashConvWeights& cw,
+                      const Qwen3DFlashWeights& weights, const HfConfig& config,
+                      DBuf* stream, const DBuf& coef) {
+  const int64_t T = stream->t().shape[0];
+  const int64_t H = config.hidden_size;
+  const int64_t taps = weights.conv_taps;
+  const int64_t groups = H / weights.conv_group_size;
+  DBuf out(d, DType::kBF16, {T, H});
+  Tensor base = ResidentWeight(d, cw.base_kernel, {2, taps, H});
+  vt::DFlashGroupedConvArgs a;
+  a.block_size = weights.conv_block_size;
+  a.taps = taps;
+  a.num_groups = groups;
+  a.group_size = weights.conv_group_size;
+  a.side = 1;  // finish, reading the SAME coefficients the prepare projected
+  vt::DFlashGroupedConv(d.q, out.t(), stream->t(), coef.t(), base, a);
+  *stream = std::move(out);
+}
+
+// The conv masks its taps by `row index mod conv_block_size`, exactly as
+// upstream's `torch.arange(hidden_states.shape[0]) % block_size` does. That is
+// the intra-block offset ONLY while every request block is contiguous and
+// `conv_block_size`-aligned, which is the uniform (1+k) DFlash batch. A ragged
+// batch would silently mask the wrong taps -- acceptance-only and token-invisible
+// -- so it is refused here rather than discovered on a gate host.
+void CheckDflashConvBatch(const Qwen3DFlashWeights& weights, const std::vector<int32_t>& cu) {
+  VT_CHECK(weights.conv_block_size > 0,
+           "qwen3_dflash2: conv_block_size must be set (1 + num_speculative_tokens)");
+  for (size_t r = 0; r + 1 < cu.size(); ++r) {
+    VT_CHECK(cu[r] % weights.conv_block_size == 0 &&
+                 cu[r + 1] - cu[r] == static_cast<int32_t>(weights.conv_block_size),
+             "qwen3_dflash2: the grouped convolution needs a uniform "
+             "conv_block_size-aligned query block per request");
+  }
+}
+
 
 // Device-resident per-layer context K/V (D7). The D5 path downloaded each layer's
 // projected K/V to host (2 D->H copies/layer) and re-uploaded them in the block
@@ -237,6 +337,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
            "qwen3_dflash: cu_seqlens must span [0,T]");
   VT_CHECK(weights.layers.size() == static_cast<size_t>(config.num_hidden_layers),
            "qwen3_dflash: one layer weight per config.num_hidden_layers");
+  if (weights.IsDflash2()) CheckDflashConvBatch(weights, cu);
 
   // Embed: hidden[T,H] bf16 = embed_tokens[input_ids]; mask slots take
   // embed_tokens[mask_token_id] naturally (in-vocab), or the dedicated mask
@@ -283,6 +384,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       vt::FusedChain(d.q, dhn.t(), hidden.t(), w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
     else
       vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
+
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare, before the sublayer.
+    DBuf attn_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
 
     // attention over the context-free block (routes through DFlashBlockAttention).
     // Reuse the block helper but feed the real positions to RoPE.
@@ -333,6 +439,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       return o;
     }();
 
+    // SPEC-DFLASH2 W2: attention_conv.finish, over the sublayer OUTPUT with the
+    // coefficients the prepare projected off the sublayer INPUT.
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.attention_conv, weights, config, &attn, attn_coef);
+
     // post_attention_layernorm (std add+RMSNorm).
     Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {T, H});
@@ -346,11 +457,17 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     // — byte-for-byte the same op sequence the inline path ran, now on the same
     // exemplar as qwen3.cpp MlpBlock. (Tier-A1 fold, arch-fusion-fold-plan.)
     const int64_t I = config.intermediate_size;
+    // SPEC-DFLASH2 W2: mlp_conv.prepare / .finish around the MLP sublayer.
+    DBuf mlp_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
     DBuf act =
         layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {T, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     if (per_layer_out != nullptr) {
       DBuf tmp(d, DType::kF32, {T, H});
       vt::CastF32(d.q, tmp.t(), down.t());
@@ -452,6 +569,7 @@ static std::vector<float> ForwardWithCtxKVDev(
   const int64_t C = ckv.num_ctx;
   VT_CHECK(ctx_cu.back() == static_cast<int32_t>(C),
            "ForwardWithCtxKVDev: ctx_cu.back() must equal num_ctx");
+  if (weights.IsDflash2()) CheckDflashConvBatch(weights, cu);
 
   // Combined [context; block] per-request layout for the attention (cu_comb), plus
   // the DEVICE index maps (D7) that place context/block rows into the combined
@@ -524,6 +642,11 @@ static std::vector<float> ForwardWithCtxKVDev(
     else
       vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
 
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare, before the sublayer.
+    DBuf attn_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
+
     // Block q/k/v: same per-layer path as the context-free forward.
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
     DBuf q(d, DType::kBF16, {Tq, qdim});
@@ -587,6 +710,11 @@ static std::vector<float> ForwardWithCtxKVDev(
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a.t(), wo);
 
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.finish. Its prepare ran above, on
+    // the input_layernorm output, before the qkv projection.
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.attention_conv, weights, config, &attn, attn_coef);
+
     // post_attention_layernorm + SwiGLU MLP (unchanged from ForwardBlockLogits).
     Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {Tq, H});
@@ -595,6 +723,9 @@ static std::vector<float> ForwardWithCtxKVDev(
     else
       vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
     const int64_t I = config.intermediate_size;
+    DBuf mlp_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
     Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
     DBuf gu(d, DType::kBF16, {Tq, 2 * I});
     vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
@@ -603,6 +734,8 @@ static std::vector<float> ForwardWithCtxKVDev(
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     if (per_layer_out != nullptr) {
       DBuf tmp(d, DType::kF32, {Tq, H});
       vt::CastF32(d.q, tmp.t(), down.t());
@@ -766,14 +899,16 @@ struct DflashDeviceKVStore {
   std::unique_ptr<DBuf> g_dpos;     // [Tq] i32
   std::unique_ptr<DBuf> g_cu;       // [2] i32 {0, Tq}
   std::unique_ptr<DBuf> g_logits;   // [Tq, vocab] f32 (persistent graph output)
-  void* g_graph = nullptr;          // cudaGraphExec (opaque)
+  // ENG-CUDAGRAPH-BREAK W5 (#1335): the instantiated graph, the ownership of its
+  // handle, its release and its `captured()` state live in the SHARED SEAM
+  // instead of in a raw `void*` plus a `Backend*` this store kept alive only so
+  // its destructor could call `DestroyGraph`. `vt::BreakableGraph` releases every
+  // segment it holds through `Backend::DestroyGraph`, which is the routing that
+  // lets ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
+  // editing this file.
+  vt::BreakableGraph g_graph;
   int64_t g_tq = -1;                // captured (1+k); -1 = not yet
   int g_state = 0;                  // 0 cold, 1 warm (pool warmed, capture next), 2 captured
-  Backend* g_backend = nullptr;     // for DestroyGraph in the dtor
-
-  ~DflashDeviceKVStore() {
-    if (g_graph != nullptr && g_backend != nullptr) g_backend->DestroyGraph(g_graph);
-  }
 };
 
 std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
@@ -783,7 +918,6 @@ std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
   const int64_t Dh = config.head_dim;
   const int64_t L = config.num_hidden_layers;
   auto s = std::make_shared<DflashDeviceKVStore>();
-  s->g_backend = &d.b;
   s->num_layers = L;
   s->block_size = kDflashPageSize;
   s->max_pages = kDflashMaxCtxSlots / kDflashPageSize;
@@ -898,6 +1032,10 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   const int64_t vocab = weights.draft_vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
+  // SPEC-DFLASH2 W2 (#1314): this body serves ONE request whose whole (1+k)
+  // query block is rows [0, Tq), so the conv's alignment condition is just
+  // Tq == conv_block_size.
+  if (weights.IsDflash2()) CheckDflashConvBatch(weights, {0, static_cast<int32_t>(Tq)});
   Tensor cur = hidden_in;
   std::vector<DBuf> keep;  // keep each layer's post-MLP `down` alive across iterations
   keep.reserve(static_cast<size_t>(config.num_hidden_layers));
@@ -911,6 +1049,14 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
       vt::FusedChain(d.q, dhn.t(), cur, w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
     else
       vt::RmsNorm(d.q, dhn.t(), cur, w_in, vt::RmsNormArgs{eps, false}, &res.t());
+
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare. This body is the one the
+    // production decode path reaches (runner.cpp -> ForwardBlockLogitsWithDeviceKV)
+    // and the one that is CUDA-graph captured; vt::DFlashGroupedConv is a plain
+    // stream kernel with no host upload, so it captures like every other op here.
+    DBuf attn_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
 
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
     DBuf q(d, DType::kBF16, {Tq, qdim});
@@ -946,6 +1092,10 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a, wo);
 
+    // SPEC-DFLASH2 W2: attention_conv.finish.
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.attention_conv, weights, config, &attn, attn_coef);
+
     Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {Tq, H});
     if (FusedChainAdoptEnabled())
@@ -953,6 +1103,9 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     else
       vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
     const int64_t I = config.intermediate_size;
+    DBuf mlp_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
     Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
     DBuf gu(d, DType::kBF16, {Tq, 2 * I});
     vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
@@ -961,6 +1114,8 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     keep.push_back(std::move(down));
     cur = keep.back().t();
   }
@@ -1008,11 +1163,24 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     VT_CHECK(ctx_cu.back() == static_cast<int32_t>(st.num_ctx),
              "ForwardBlockLogitsWithDeviceKV(paged): ctx_cu.back() must equal store num_ctx");
 
+    // `vt::GraphCaptureEnabled()` is the THIRD conjunct and it is not decoration
+    // (#1352, found and fixed while landing #1335). Before W5 this driver's
+    // capture was its own `BeginCapture` pair, so `VLLM_CPP_CUDAGRAPH` could not
+    // reach it and the two conjuncts below were the whole predicate. The capture
+    // is now the seam's, and the seam reads that switch itself — so without this
+    // conjunct `VLLM_CPP_CUDAGRAPH=0` would still route into the CAPTURE lane,
+    // run the eager warm pass, open an INERT scope, and run the whole
+    // `ForwardPagedBody` a SECOND time inside it. Two full draft forwards per
+    // propose, forever, because the driver would never reach `g_state == 2`.
+    // Not wrong, just wasteful, which is exactly the kind of defect that
+    // survives a token gate. Asking here makes the switch select this driver's
+    // existing single-forward eager path, which is what it means everywhere else.
     const bool graph_ok =
-        UseDflashGraph() && d.b.SupportsGraphCapture() &&
+        UseDflashGraph() && vt::GraphCaptureEnabled() && d.b.SupportsGraphCapture() &&
         platforms::GetPlatform(queue.device.type).support_static_graph_mode();
 
-    // --- Eager paged path (VT_DFLASH_GRAPH=0, or capture unsupported) ---------
+    // --- Eager paged path (VT_DFLASH_GRAPH=0, VLLM_CPP_CUDAGRAPH=0, or capture
+    //     unsupported) --------------------------------------------------------
     if (!graph_ok) {
       DBuf hidden(d, DType::kBF16, {Tq, H});
       {
@@ -1034,10 +1202,12 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // per config, so this fires once per request lifetime). A width change invalidates a
     // prior graph.
     if (st.g_tq != Tq) {
-      if (st.g_graph != nullptr) {
-        d.b.DestroyGraph(st.g_graph);
-        st.g_graph = nullptr;
-      }
+      // Reset() releases every segment through Backend::DestroyGraph and returns
+      // the container to its as-constructed state, which is also what lets the
+      // next capture open a scope on it: the scope REFUSES a container that
+      // already holds one, because appending to it would leave
+      // `break_count() == segment_count()` and Replay would drop the last break.
+      st.g_graph.Reset();
       st.g_hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{Tq, H});
       st.g_dpos = std::make_unique<DBuf>(d, DType::kI32, std::vector<int64_t>{Tq});
       const std::vector<int32_t> cus = {0, static_cast<int32_t>(Tq)};
@@ -1062,7 +1232,10 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     if (st.g_state == 2) {
       // Captured: relaunch the graph over the refreshed persistent inputs + grown context
       // (which enters purely via the in-place seq_lens value + paged store), then download.
-      d.b.ReplayGraph(queue, st.g_graph);
+      // Through the seam's container, never `Backend::ReplayGraph` directly: the
+      // container replays its segments in order (one, here, because this capture
+      // is kFull) and owns the G3 replay counter the reachability gate reads.
+      st.g_graph.Replay(queue);
       st.g_logits->Download(d, out.data());
       if (DflashGraphStats()) {
         ++g_dflash_replays;
@@ -1088,24 +1261,68 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
                                       weights, config);
       warm_lg.Download(d, out.data());
     }  // warm_lg + all ForwardPagedBody scratch freed to the pool free-list here.
-    d.b.BeginCapture(queue);
-    try {
-      DBuf lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
-                                 weights, config);
-      st.g_graph = d.b.EndCaptureGraph(queue);
-      st.g_logits = std::make_unique<DBuf>(std::move(lg));
-      if (DflashGraphStats()) {
-        ++g_dflash_captures;
-        std::fprintf(stderr, "[DFLASH-GRAPH] captured #%lld Tq=%lld C=%lld\n",
-                     static_cast<long long>(g_dflash_captures), static_cast<long long>(Tq),
-                     static_cast<long long>(st.num_ctx));
+    // ENG-CUDAGRAPH-BREAK W5 (#1335): the capture is the SHARED SEAM's, not this
+    // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair with its own
+    // `try`/drain. The scope owns the segment, the handle, its release, the drain
+    // a mid-capture throw needs, and the G3 counters.
+    //
+    // kFULL, INHERITED FROM W2 AND NOT RE-ARGUED. vLLM's v1 default
+    // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63` @ pin `5559679229`)
+    // is documented at `:630-632` as a FULL graph for DECODE batches and a
+    // piecewise one for prefill and mixed batches, and `decode_mode()` (`:65-66`)
+    // returns the full half. This is the (1+k) DRAFT step of a speculative
+    // decode, which is a decode batch, so its capture is ONE segment with the
+    // attention calls INSIDE it — byte-identical in shape to the region this
+    // replaces. Opening it kPiecewise would turn every draft layer's attention
+    // into an eager call between two graph replays, which is not vLLM's decode
+    // behaviour and which nothing in this row's record supports.
+    std::optional<DBuf> lg;
+    {
+      vt::GraphCaptureScope scope(d.b, queue, st.g_graph, vt::GraphCaptureMode::kFull);
+      lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
+                            weights, config);
+    }  // ~GraphCaptureScope closes the segment and files it on st.g_graph
+    // NOT CAPTURED covers TWO states, and only one of them may continue.
+    //
+    //   * INERT (`capture_failed() == false`): unreachable here, because
+    //     `graph_ok` above already required `SupportsGraphCapture()`; the
+    //     remaining inert cause is `VLLM_CPP_CUDAGRAPH=0`, which the seam reads
+    //     and this driver no longer does. The region ran EAGERLY, `*lg` is a real
+    //     result, and the step falls back to the eager lane for good.
+    //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph` threw.
+    //     Under stream capture NOTHING between `BeginCapture` and the throw
+    //     executed — every kernel was RECORDED — so `*lg` is pool-recycled memory
+    //     and downloading it would hand this draft step uncomputed device memory
+    //     as its logits. No fault, and a token gate cannot see it, because a
+    //     draft the target rejects is indistinguishable from a bad draft.
+    //
+    // The pre-W5 driver rethrew after draining, and so does this.
+    if (!st.g_graph.captured()) {
+      if (st.g_graph.capture_failed()) {
+        const std::exception_ptr err = st.g_graph.capture_error();
+        st.g_graph.Reset();  // clear the failure with the graph it described
+        std::fprintf(stderr, "[DFLASH-GRAPH] capture FAILED\n");
+        if (err) std::rethrow_exception(err);
+        VT_CHECK(false,
+                 "DFlash draft graph: the capture was ABANDONED and its logits were "
+                 "never computed; refusing to return uncaptured device memory");
       }
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "[DFLASH-GRAPH] capture FAILED: %s\n", e.what());
-      void* g = nullptr;
-      try { g = d.b.EndCaptureGraph(queue); } catch (...) {}  // drain, unstick the stream
-      if (g != nullptr) d.b.DestroyGraph(g);
-      throw;
+      // INERT is now UNREACHABLE from here: `graph_ok` above required both
+      // `vt::GraphCaptureEnabled()` and `SupportsGraphCapture()`, which are the
+      // only two things that make a scope inert. Kept as a total branch rather
+      // than an assertion, because a future inert cause added to the seam must
+      // degrade to a correct eager step rather than to undefined behaviour —
+      // the region DID run eagerly, so `*lg` holds real values.
+      st.g_state = 0;  // stay eager, and re-warm rather than re-capture
+      lg->Download(d, out.data());
+      return out;
+    }
+    st.g_logits = std::make_unique<DBuf>(std::move(*lg));
+    if (DflashGraphStats()) {
+      ++g_dflash_captures;
+      std::fprintf(stderr, "[DFLASH-GRAPH] captured #%lld Tq=%lld C=%lld\n",
+                   static_cast<long long>(g_dflash_captures), static_cast<long long>(Tq),
+                   static_cast<long long>(st.num_ctx));
     }
     st.g_state = 2;  // subsequent steps replay
     return out;      // this step's output is the eager warm pass (bit-identical to the graph)

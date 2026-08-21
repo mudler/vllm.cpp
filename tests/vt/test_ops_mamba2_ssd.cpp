@@ -1065,15 +1065,24 @@ Backend* MaybeCuda() {
 }
 
 // A GREEN TEST DOES NOT PROVE THE DEVICE RAN IT — and on THIS box it very nearly
-// proves the opposite. GB10 is `integrated && pageable_memory_access`, so
-// `Backend::UnifiedMemory()` is TRUE (cuda_backend.cu Registrar) and therefore
-// `ReferenceTierEligible(kCUDA)` is TRUE. Absent a native kernel, `GetOp` does
-// not throw: it installs the CPU HOST kernel as a `kReferenceProviderName`
-// provider and runs THAT over the device pointers (op_provider.h, "portable
-// reference tier"). Every numeric assertion below would then pass — the device
-// arm would be gated by running the host arm twice, the exact false-green shape
-// of [[absent-hook-looks-like-armed-instrument]] and
+// proved the opposite. GB10 is `integrated && pageable_memory_access`, so
+// `Backend::UnifiedMemory()` is TRUE (cuda_backend.cu Registrar), and the
+// reference tier USED TO gate on that: absent a native kernel `GetOp` did not
+// throw, it installed the CPU HOST kernel as a `kReferenceProviderName` provider
+// and ran THAT over the device pointers (op_provider.h, "portable reference
+// tier"). Every numeric assertion below would then pass — the device arm gated by
+// running the host arm twice, the exact false-green shape of
+// [[absent-hook-looks-like-armed-instrument]] and
 // [[gate-comparing-shared-helper-proves-consistency-not-correctness]].
+//
+// SINCE #844 / #1435 that specific false-green is CLOSED, and the guard stays.
+// `ReferenceTierEligible` now reads `Backend::DeviceMemoryIsHostAddressable()`,
+// which CUDA answers FALSE because `CudaBackend::Alloc` calls `cudaMalloc`, so a
+// missing kernel is a named refusal rather than a silent host run. The paragraph
+// above is kept as the REASON this guard exists, not as current behaviour. Do not
+// delete the guard on the strength of the fix: it also catches a provider that
+// DECLINES at run time, and a future backend that answers the narrow predicate
+// true would restore the original hazard exactly.
 //
 // So every CUDA case asserts the SELECTED provider is native. These are EAGER
 // dispatches rather than a captured graph, so the counters are genuinely

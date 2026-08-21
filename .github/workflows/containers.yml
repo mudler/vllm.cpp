@@ -128,6 +128,12 @@ jobs:
           echo "publish=$(python3 scripts/container_tags.py --build-matrix --release)" >> "$GITHUB_OUTPUT"
       - name: Gate this workflow against its own contract
         run: python3 scripts/check-container-workflow.py
+      - name: Builder stages can build what the runtime stage advertises
+        # Issue #1517. The runtime stage carried libssl3 while no builder
+        # stage carried libssl-dev, so every image this workflow published
+        # shipped a server that could not fetch from huggingface.co, and
+        # every other gate here stayed green.
+        run: python3 scripts/check-build-runtime-deps.py
 
   verify:
     needs: plan
@@ -138,12 +144,48 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.verify_matrix) }}
     runs-on: ${{ matrix.runner }}
+    # Issue #1548. No job here declared timeout-minutes, so the default six
+    # hours applied and a job that died at 35 minutes reported only "the runner
+    # has received a shutdown signal" and exit 143. That message is the same
+    # whether the cause was memory, a reclaimed VM, or a genuine hang, and the
+    # absence of a budget is what made the three indistinguishable.
+    #
+    # The value is deliberately LOOSE. Its purpose is to LABEL the next failure,
+    # not to police the duration: a job that dies before the budget is external,
+    # and a job that dies at the budget hung. The slowest lane is cuda, which
+    # the 512-of-787 data point projects near two hours at the cap the build
+    # step sets, so 300
+    # minutes leaves room for the arm64 legs this repository has never built
+    # while still bounding the job below the default.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build the lane image for this architecture
         run: |
           set -euo pipefail
+          # Build parallelism is LANE-AWARE, and issue #1548 is why.
+          #
+          # Every .cu file in the cuda lane is compiled for the ten device
+          # architectures scripts/build-linux-accelerator-release.sh:24 sets, so
+          # one compiler process there holds many times the resident set of a
+          # cpu or vulkan translation unit, and $(nproc) of them run at once.
+          # Run 32447481128 died at object 512 of 787 about 35 minutes in with
+          # exit 143 and "the runner has received a shutdown signal".
+          #
+          # That reading is a HYPOTHESIS. Memory exhaustion and GitHub
+          # infrastructure reclamation produce the same message and the same
+          # exit code, and the available logs cannot separate them. The cap
+          # below removes the one of the two this repository can control.
+          #
+          # 2 is measured, not guessed. ci.yml:801 builds the SAME ten-SM fat
+          # gencode set on a hosted runner at --parallel 2 and is green. The
+          # 512-of-787 data point puts a halved build near two hours, far
+          # inside the timeout below, which answers the concern in
+          # .agents/specs/container-images.md:200-204 that two jobs would not
+          # finish. The cpu and vulkan lanes are not failing and keep $(nproc).
+          jobs=$(nproc)
+          if [ "${{ matrix.lane }}" = "cuda" ]; then jobs=2; fi
           docker buildx build \
             --file docker/Dockerfile \
             --target "${{ matrix.lane }}" \
@@ -152,7 +194,7 @@ jobs:
             --build-arg "SOURCE_SHA=${GITHUB_SHA}" \
             --build-arg "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" \
             --build-arg "EVIDENCE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --build-arg "JOBS=$(nproc)" \
+            --build-arg "JOBS=${jobs}" \
             --tag "vllm-cpp-verify:${{ matrix.lane }}" \
             --load \
             .
@@ -175,6 +217,20 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.publish_matrix) }}
     runs-on: ${{ matrix.runner }}
+    # Issue #1548. No job here declared timeout-minutes, so the default six
+    # hours applied and a job that died at 35 minutes reported only "the runner
+    # has received a shutdown signal" and exit 143. That message is the same
+    # whether the cause was memory, a reclaimed VM, or a genuine hang, and the
+    # absence of a budget is what made the three indistinguishable.
+    #
+    # The value is deliberately LOOSE. Its purpose is to LABEL the next failure,
+    # not to police the duration: a job that dies before the budget is external,
+    # and a job that dies at the budget hung. The slowest lane is cuda, which
+    # the 512-of-787 data point projects near two hours at the cap the build
+    # step sets, so 300
+    # minutes leaves room for the arm64 legs this repository has never built
+    # while still bounding the job below the default.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -197,6 +253,13 @@ jobs:
       - name: Build the exact image this job will push
         run: |
           set -euo pipefail
+          # The same lane-aware cap the verify job takes, and issue #1548
+          # records the reason in full there. This job rebuilds the identical
+          # image, so the two must never resolve a different JOBS: a cap that
+          # held in verify and not here would let publish die on exactly the
+          # build verify proved.
+          jobs=$(nproc)
+          if [ "${{ matrix.lane }}" = "cuda" ]; then jobs=2; fi
           docker buildx build \
             --file docker/Dockerfile \
             --target "${{ matrix.lane }}" \
@@ -205,7 +268,7 @@ jobs:
             --build-arg "SOURCE_SHA=${GITHUB_SHA}" \
             --build-arg "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" \
             --build-arg "EVIDENCE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --build-arg "JOBS=$(nproc)" \
+            --build-arg "JOBS=${jobs}" \
             --tag "vllm-cpp-publish:${{ matrix.lane }}" \
             --load \
             .

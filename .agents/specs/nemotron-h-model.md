@@ -511,6 +511,23 @@ Until the GGUF arm lands it is **refused by name** at load, naming the missing
 piece, never silently dequantized to a supported path — a silent fallback is
 exactly what a token gate cannot see. Tracked as W7.
 
+**That refusal became REACHABLE on 2026-08-15
+([#809](https://github.com/mudler/vllm.cpp/issues/809)).** It was written in W3
+and its text was right, but nothing a user could do reached it: it fires on the
+registry factory's `ModelSource::Kind`, and a real `.gguf` argument goes through
+the entrypoint's GGUF architecture dispatch first. That dispatch had no default
+and fell through to qwen3_5's config builder, which hard-asserts its own three
+keys — so `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf`
+(`general.architecture = nemotron_h_moe`, read off the staged file) died with
+`qwen3_5 gguf: unexpected architecture`, naming a model unrelated to the file it
+was handed. The dispatch now has an explicit default that refuses by the file's
+OWN architecture, and `nemotron_h` / `nemotron_h_moe`
+(`ggml-org/llama.cpp src/llama-arch.cpp:92-93`) get this row's refusal through
+`vllm::NemotronHGgufRefusal`, which is the single owner of that string. The W3
+subcase that claimed the guarantee passed throughout, because it built a
+`Kind::kGguf` `ModelSource` by hand — a state no user is ever in. It now also
+drives `LoadedEngine::FromModelDir` on a synthetic `nemotron_h*` GGUF.
+
 ## 5c. W3 result — registered, parsed, enumerated, KV-shaped (2026-08-13)
 
 W3 landed on `row/MODEL-NEMOTRON-H-W3B` (base `fafa16f0`). It makes the

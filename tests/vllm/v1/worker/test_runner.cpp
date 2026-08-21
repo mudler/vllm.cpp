@@ -453,11 +453,13 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
 
   // M3: the runner resolves the ENGINE-level attention backend at init, per
   // attention group. On CPU the dense priority walk (cpu.cpp) is
-  // [CPU_ATTN (unregistered), FLASH_ATTN] so it lands on FLASH_ATTN —
-  // behavior-preserving, and the proof that selection is now part of the
-  // runtime path, not just the registry test. One name per attention layer.
+  // [CPU_ATTN, FLASH_ATTN] and, since #1371 registered it, lands on CPU_ATTN —
+  // upstream's own CPU answer (cpu.py:75-87). This is the proof that selection
+  // is part of the runtime path, not just the registry test: the name below is
+  // resolved inside GPUModelRunner::initialize_kv_cache. One name per attention
+  // layer.
   REQUIRE(runner.attn_backend_names().size() == 1);
-  CHECK(runner.attn_backend_names()[0] == "FLASH_ATTN");
+  CHECK(runner.attn_backend_names()[0] == "CPU_ATTN");
 
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);
@@ -1526,4 +1528,33 @@ TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") 
   CHECK_THROWS_WITH_AS(runner.execute_model(s1),
                        doctest::Contains("qwen3_5 dense paged forward"),
                        std::runtime_error);
+}
+
+// ─── M3: THE BLOCK-SIZE CONTRACT AT ITS PRODUCTION CALL SITE ─────────────────
+//
+// `CheckKvCacheShape` is well tested in isolation (test_attn_backend_registry /
+// test_common_attn_metadata), but its PRODUCTION call site — the install inside
+// `GPUModelRunner::initialize_kv_cache` — was not: no test drove the runner
+// with a non-multiple-of-16 block size, so deleting that install left every
+// gate green (the #1065 Owed item). The FLASH_ATTN backend's own
+// `get_kv_cache_shape` refuses block_size % 16 != 0, and the runner resolves
+// FLASH_ATTN for the CPU device, so construction must throw the backend's
+// `invalid_argument` from init — the same failure the server's --block-size
+// validation and the bench rounding exist to prevent at the entry points.
+TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size") {
+  const HfConfig c = MakeDenseOnlyConfig();
+  const Qwen3_5DenseWeights w = MakeDenseOnlyWeights(c);
+
+  KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+  kv.kv_cache_groups[0].kv_cache_spec = std::make_shared<FullAttentionSpec>(
+      /*block_size=*/8, static_cast<int>(c.num_key_value_heads),
+      static_cast<int>(c.head_dim), vllm::v1::ResolveKvCacheDType());
+
+  auto make_runner = [&]() {
+    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+  };
+  CHECK_THROWS_WITH_AS(make_runner(),
+                       doctest::Contains("Block size must be a multiple of 16"),
+                       std::invalid_argument);
 }

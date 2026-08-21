@@ -98,5 +98,9 @@ record.
 Land squashes or a local `--no-ff` merge commit carrying the trailers. GitHub
 authors its own message for `gh pr merge --merge`, which loses them.
 
+A squash lands the pull request BODY, so read it before you merge with
+`python3 scripts/agent-pr-body.py --pr <N>`. The CI job that reads it sits in a
+queue and has been outrun by a merge (#1263).
+
 Verified PRs merge in-session. Obsolete PRs close with the reason recorded.
 Never end a session with a verified, unmerged PR.

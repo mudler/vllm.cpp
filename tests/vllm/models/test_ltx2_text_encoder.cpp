@@ -2382,7 +2382,8 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
   // The floor, propagated rather than borrowed: it is the oracle's OWN
   // f32-vs-bf16 spread carried through the identical projection, so it is the
   // smallest difference this comparison can resolve. It cannot be widened to
-  // rescue a failure without regenerating the oracle.
+  // rescue a failure without regenerating the oracle; what the two CHECKs below
+  // carry is a derivation over it, stated where they stand.
   auto max_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size()) return std::numeric_limits<double>::infinity();
     double d = 0.0;
@@ -2404,9 +2405,61 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
           << "x the propagated floor " << video_floor << "), vs f32 oracle = "
           << video_f32 << "; audio " << audio_bf16 << " ("
           << (audio_bf16 / audio_floor) << "x " << audio_floor << ") / " << audio_f32);
-  CHECK(video_bf16 <= video_floor);
+  // BOTH arms carry the SAME bound. The reasoning is the triangle step the
+  // state-level parity case above spells out; the NUMBER comes from this case's
+  // own measurements, cited below. `out.conditioning` is OUR bf16 realization,
+  // `want_bf16` is the ORACLE's, and neither is a rounding of the other. Both depart from the shared f32 trajectory `want_f32`, so
+  //
+  //   |ours - oracle_bf16| <= |ours - oracle_f32| + |oracle_f32 - oracle_bf16|
+  //
+  // and the second term IS the propagated floor. The first term is `video_f32`,
+  // which THIS case measures a line above: 0.79x the floor on video and 0.475x
+  // on audio, so taking it at one floor is the measurement, not an assumption.
+  // Hence 2x on the bf16 arm as well as on the f32 one.
+  //
+  // WHY NOT 3x, since the sibling assertion below gates that first term at 2x.
+  // Chaining the two ASSERTED bounds would give 3x, and 3x is a bound that can
+  // never fire: `|ours - oracle_bf16| <= |ours - oracle_f32| + floor` is the
+  // triangle inequality itself, so once the f32 arm passes at 2x the bf16 arm at
+  // 3x is arithmetic rather than a gate. 2x is the tighter value the measured
+  // premise supports, and it is the one that can still say something.
+  //
+  // WHY IT USED TO SAY 1x, AND WHY THAT WAS NEVER DERIVED. The state-level case
+  // gates `d_bf16 <= floor` and derives its f32 arm from that primitive. This
+  // case IMPORTED the 1x across `Ltx2TextEncoderConditioning`, which stacks all
+  // 13 states and combines them. A per-state relation that holds elementwise
+  // does not survive that: the floor is the projection of ONE error vector and
+  // this quantity is the projection of a DIFFERENT one, and the projection can
+  // amplify the second relative to the first. It held until the seam's bf16
+  // rounding polarity was corrected to upstream's in `4712dac40`, which re-rolled
+  // both error directions and moved the video arm from 0.56x to 1.21x and the
+  // audio arm from 0.69x to 1.31x — with our distance to the f32 oracle
+  // IMPROVING at 11 of the 13 states. The old constant broke, not the port.
+  // #1458.
+  //
+  // WHAT THIS COSTS, MEASURED rather than estimated, and it is not this bound
+  // that spent it. The position-renumbering note at the top of this case claims
+  // detection at 1.10x the audio floor. Ratios to the propagated floor, one
+  // build directory, every source restored sha256-verified:
+  //
+  //   cpu_ops.cpp        code          video    audio
+  //   before 4712dac40   correct       0.565    0.688   -> pass at 1.0x
+  //   before 4712dac40   renumbered    0.831    1.099   -> RED at 1.0x
+  //   at aeba0de6f       correct       1.209    1.313   -> RED at 1.0x
+  //   at aeba0de6f       renumbered    0.683    0.931   -> pass at 1.0x
+  //
+  // Read the bottom two rows together: post-`4712dac40` the instrument is
+  // INVERTED, reding the correct code and passing the mutant, and the mutant is
+  // measurably CLOSER to the oracle than the port is. The 2x here restores a
+  // functioning instrument; it does not recover that detection, and no constant
+  // can, because the ordering of the two has reversed. It is also a property of
+  // the defect — upstream's own f32 answers for positions 12..19 and 0..7 agree
+  // to 3.6e-06 relative — and `gen-ltx2-gemma-tower-goldens.py:363-375` already
+  // records that the end-to-end states are the wrong instrument for this class
+  // and the f32 rope table is the right one. Owed as #1467.
+  CHECK(video_bf16 <= 2.0 * video_floor);
   CHECK(video_f32 <= 2.0 * video_floor);
-  CHECK(audio_bf16 <= audio_floor);
+  CHECK(audio_bf16 <= 2.0 * audio_floor);
   CHECK(audio_f32 <= 2.0 * audio_floor);
 
   // The reorder and the mask, compared EXACTLY — but read what that does and does

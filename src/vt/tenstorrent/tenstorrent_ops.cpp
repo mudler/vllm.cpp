@@ -1846,8 +1846,14 @@ std::map<int64_t, DecodePosEntry>& DecodePosCache() {
 namespace {
 struct RacIdxEntry {
   ttnn::Tensor update_idxs;  // int32 [C] device (persistent, content refreshed)
-  ttnn::Tensor page_table;   // int32 [C,1] device (persistent, content refreshed)
-  std::vector<int32_t> idx_host;  // content identity for reuse check
+  ttnn::Tensor page_table;   // int32 [C,pt_width] device (persistent, content refreshed)
+  std::vector<int32_t> pt_host;   // last page-table content copied to device
+  int64_t pt_width = 0;           // columns of the allocated page_table
+  // Retired page-table tensors from width growth, kept ALIVE deliberately:
+  // a freed device buffer can hand its address to a new allocation while a
+  // (doomed, never-replayed-again) trace still records it. Bounded by the
+  // number of block boundaries crossed (~context/block_size).
+  std::vector<ttnn::Tensor> retired_pts;
   // Persistent height-sharded RAC input: logical [1,1,nkv,d], padded
   // [1,1,nkv_pad,d] (shard [nkv_pad,d] on one core). The in-region RAC
   // ttnn::copy's the rope output into it; paged_update_cache reads only the
@@ -3536,9 +3542,11 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src) {
   // (which the decode-graph framework runs BEFORE capture) also exercises
   // ttnn::empty+ttnn::copy, compiling those programs into the cache so the
   // subsequent capture doesn't hit "Cannot load new binaries during trace
-  // capture."
-  static const bool host_free =
-      std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  // capture." Read LIVE, not cached in a static: the inertness-guard case in
+  // test_tenstorrent_backend unsets the env mid-process and must observe the
+  // decline, and a suite run under an ambient flag must not pin the armed
+  // behavior for cases that unset it.
+  const bool host_free = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
   if (!tt_capture_active() && !host_free) return false;
   static bool once = [&] {
     // Enable program cache once on the first host-free path use — ttnn trace
@@ -3583,8 +3591,8 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src) {
 // Reinterprets the buffer as a 2D [rows, cols] f32 tensor matching the
 // existing device shadow's numel (zeros is the only value the forward uses).
 bool MemsetDeviceIfCapture(void* p, int value) {
-  static const bool host_free =
-      std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  // Live read for the same reason as CopyDeviceDeviceIfCapture above.
+  const bool host_free = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
   if (!tt_capture_active() && !host_free) return false;
   if (value != 0) return false;  // only zero-fill is handled on-device
   // Need an existing shadow to know shape/dtype; or allocate from the slot.
@@ -3750,13 +3758,19 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
   // exactly that position for the PA to see the current token's KV.
   std::vector<int32_t> ptv;
   std::vector<int32_t> idxv;
-  ptv.reserve(static_cast<size_t>(num_slots));
+  // The kernel maps update_idx -> page_table_ptr[update_idx / block_size]
+  // (reader_{,paged_fused_}update_cache: virtual_block_id indexes the
+  // page-table STICK), so the device page_table must carry the user's WHOLE
+  // block-table row, not just the current virtual block (#1476: the old
+  // [C,1] tensor made every write past the first block land in a garbage
+  // physical block the moment cur_pos crossed block_size).
+  ptv.reserve(static_cast<size_t>(num_slots * block_table_cols));
   idxv.reserve(static_cast<size_t>(num_slots));
   for (int64_t t = 0; t < num_slots; ++t) {
     const int64_t slot = slots[t];
     if (slot < 0 || seq_lens == nullptr || block_table == nullptr) {
       // Padding slot: paged_update_cache skips when update_idx == -1.
-      ptv.push_back(0);
+      for (int64_t c = 0; c < block_table_cols; ++c) ptv.push_back(0);
       idxv.push_back(-1);
       continue;
     }
@@ -3766,14 +3780,18 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
     // which must equal the slot_mapping from the scheduler.
     const int32_t cur_pos = seq_lens[t] - 1;
     idxv.push_back(cur_pos);
-    // page_table = the physical block for cur_pos's virtual block.
-    const int32_t vblk = cur_pos / static_cast<int32_t>(block_size);
-    const int32_t pblk = block_table[t * block_table_cols + vblk];
-    ptv.push_back(pblk);
-    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
+    // Full row: every virtual block the kernel may resolve this step and
+    // later in this width regime (steady state refreshes on content change).
+    for (int64_t c = 0; c < block_table_cols; ++c) {
+      ptv.push_back(block_table[t * block_table_cols + c]);
+    }
+    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr) {
+      const int32_t vblk = cur_pos / static_cast<int32_t>(block_size);
+      const int32_t pblk = block_table[t * block_table_cols + vblk];
       std::fprintf(stderr, "[TT-TRACE] WarmRacIdx user=%lld slot=%lld cur_pos=%d vblk=%d pblk=%d bt_cols=%lld (expect slot=%d)\n",
                    (long long)t, (long long)slot, cur_pos, vblk, pblk, (long long)block_table_cols,
                    pblk * static_cast<int32_t>(block_size) + cur_pos % static_cast<int32_t>(block_size));
+    }
   }
   const auto key = std::make_pair(num_slots, block_size);
   std::lock_guard<std::mutex> g(RacIdxMutex());
@@ -3782,15 +3800,18 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
   // refreshed in place each step (copy_to_device, outside capture). The
   // captured paged_update_cache replays against the stable address and reads
   // the fresh values device-side.
-  ttnn::Tensor pt_host = ttnn::Tensor::from_vector<int32_t>(
-      ptv, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_slots), 1u}),
-                  ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
-  ttnn::Tensor idx_host = ttnn::Tensor::from_vector<int32_t>(
-      idxv, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_slots)}),
-                   ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
-  if (!e.allocated) {
+  if (!e.allocated || block_table_cols != e.pt_width) {
+    // ANY width change (block boundary growth, or the shrink when the longest
+    // request of a multi-request batch finishes and block_table_num_cols drops)
+    // reallocates: the else-branch copy_to_device would TT_FATAL on a shape
+    // mismatch, and the driver resets + re-captures on any column-count change
+    // (`cols_changed` compares with `!=`), so the new address is what the next
+    // capture records. The retired tensor stays alive (see the field) — never
+    // free a buffer a recorded trace addresses.
+    if (e.allocated) e.retired_pts.push_back(std::move(e.page_table));
     e.page_table = ttnn::Tensor::from_vector<int32_t>(
-        ptv, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_slots), 1u}),
+        ptv, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_slots),
+                    static_cast<uint32_t>(block_table_cols)}),
                     ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
         &device);
     // R2: alias update_idxs to the on-device-advanced cur_pos (DecodePosCache)
@@ -3819,19 +3840,25 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
           &device);
     }
     e.allocated = true;
+    e.pt_width = block_table_cols;
   } else {
-    // R2 steady state: skip the per-step RAC page_table + update_idxs copies.
-    // update_idxs is aliased to the on-device-advanced cur_pos (plus_one).
-    // The RAC page_table (where paged_update_cache WRITES) only matters at
-    // block boundaries for decode T=1; for now skip in steady state (the PA
-    // page_table in WarmPaMeta handles the sdpa_decode read with on-change
-    // refresh). Phase 2 full: on-change refresh for RAC page_table too.
-    if (!r2_steady) {
+    // Steady state within one width: update_idxs is aliased to the
+    // on-device-advanced cur_pos (plus_one on replay steps, WarmDecodePos
+    // re-seed on cold/capture steps) — never copied here. The RAC page_table
+    // refreshes ONLY when its content changed (a new block was mapped):
+    // zero copies inside a block, so the toxic every-step-interleaved-write
+    // class stays out of the steady state; the copy that does fire rides the
+    // same step as the boundary re-capture (#1476 — the "Phase 2 full"
+    // refresh the old comment owed but never implemented).
+    if (ptv != e.pt_host) {
+      ttnn::Tensor pt_host = ttnn::Tensor::from_vector<int32_t>(
+          ptv, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_slots),
+                      static_cast<uint32_t>(block_table_cols)}),
+                      ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
       ttnn::copy_to_device(pt_host, e.page_table);
-      ttnn::copy_to_device(idx_host, e.update_idxs);
     }
   }
-  e.idx_host = idxv;
+  e.pt_host = ptv;
   // Build the persistent sharded RAC input ONCE from the first available
   // paged-KV shadow's geometry (same nkv/d as the cache): logical
   // [1,1,nkv,d], padded [1,1,nkv_pad,d], HEIGHT_SHARDED L1, shard
@@ -3989,15 +4016,13 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
 // R2: seed the persistent cur_pos device tensor (= seq_lens - 1) and warm the
 // plus_one program (program cache) so CaptureDecodePosAdvance can run inside
 // the trace. Called on the capture/warm step (re-seed), NOT every replay.
-void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs) {
+void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime) {
   if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
   if (num_reqs < 1 || seq_lens == nullptr) return;
-  // R2: only seed/warm on the capture step (GraphCapturesDone()==0). On replay
-  // steps, cur_pos is advanced on-device by the captured plus_one — re-seeding
-  // here would overwrite the advance and break correctness.
-  // A new num_reqs after the first capture was never seeded: refuse rather
-  // than return and let WarmPaMeta/WarmRacIdx allocate a frozen standalone.
-  if (GraphCapturesDone() > 0) {
+  // Replay regime: cur_pos advances on-device by the captured plus_one —
+  // re-seeding here would overwrite the advance and break correctness.
+  // A new num_reqs that was never seeded is refused rather than left frozen.
+  if (replay_regime) {
     std::lock_guard<std::mutex> g(DecodePosMutex());
     auto it = DecodePosCache().find(num_reqs);
     VT_CHECK(it != DecodePosCache().end() && it->second.allocated,
@@ -4006,6 +4031,14 @@ void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs) {
              "cache entry; recapture does NOT clear this (#1105).");
     return;
   }
+  // Cold/warm/capture step: (re-)seed cur_pos = seq_lens - 1 for THIS step.
+  // The regime flag comes from the driver (graph captured?), NOT from
+  // GraphCapturesDone(): Reset() releases the trace without clearing that
+  // process-global counter, and the cold eager step that follows a Reset
+  // runs no plus_one — so after a re-capture the on-device cur_pos is one
+  // position behind unless it is re-seeded here (#1476). This also keeps the
+  // FIRST capture correct (its capture step re-seeds, which is why the bug
+  // only surfaced at the first block boundary, where Reset+re-capture runs).
   MeshDevice& device = SharedMeshDevice();
   std::vector<int32_t> cpos(static_cast<size_t>(num_reqs));
   for (int64_t r = 0; r < num_reqs; ++r)

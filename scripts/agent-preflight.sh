@@ -76,6 +76,12 @@ for arg in "$@"; do
 done
 
 CHECKERS=(
+  # FIRST deliberately. Every other gate reads a file for its own reason and
+  # measures its own budget, so a table row that is half one branch and half
+  # another satisfies all of them (#1417). This one asks whether a merge tool
+  # wrote into a tracked file at all, and a reader who sees it fail knows to
+  # stop reading the verdicts below.
+  check-conflict-markers
   check-prompt-contract
   check-agent-record
   check-release-binary-contract
@@ -83,9 +89,11 @@ CHECKERS=(
   check-windows-release-state
   check-container-matrix
   check-container-workflow
+  check-build-runtime-deps
   check-role-discipline
   claim-view
   check-readme-structure
+  check-quickstart-recipes
   check-public-doc-tables
   check-model-checklist
   check-supported-models
@@ -98,6 +106,7 @@ CHECKERS=(
   check-test-registration
   check-snapshot-pins
   check-oracle-pins
+  check-oracle-denominator-flags
   check-now-current
   check-gate-commands
   check-symbol-anchors
@@ -116,6 +125,8 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_check_build_runtime_deps
+  test_validate_container_image
   test_release_index
   test_release_metadata
   test_release_accelerator_metadata
@@ -126,10 +137,12 @@ SUITES=(
   test_agent_onboard
   test_agent_start
   test_gate_bringup
+  test_env_agnostic_tooling
   test_claim_view
   test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
+  test_check_quickstart_recipes
   test_check_public_doc_tables
   test_check_model_checklist
   test_check_supported_models
@@ -149,7 +162,10 @@ SUITES=(
   test_gpu_lock_one_truth
   test_main_baseline
   test_agent_preflight_skip_report
+  test_agent_pr_body
   test_check_symbol_anchors
+  test_check_oracle_denominator_flags
+  test_check_conflict_markers
 )
 
 failed=()
@@ -318,6 +334,14 @@ for checker in "${CHECKERS[@]}"; do
     # is the flag. Wiring either without --check installs a gate that cannot
     # fail, which for check-gate-commands is the very defect it classifies.
     claim-view|check-gate-commands) run "$checker" python3 "scripts/$checker.py" --check ;;
+    # check-agent-record also carries the record-anchor ratchet
+    # (ENG-RECORD-ANCHOR-RATCHET, #632): a citation that names a line no longer
+    # holding the symbol beside it fails HERE, on the plain call, and the error
+    # names the bucket that moved. Deliberately NOT wired as --report: `run`
+    # shows only the first 12 lines of a failure, and the report's offender list
+    # would push the error message out of that window. The full list is one
+    # command away (`scripts/check-agent-record.py --report`) and CI prints it
+    # unconditionally.
     *) run "$checker" python3 "scripts/$checker.py" ;;
   esac
 done

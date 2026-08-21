@@ -509,9 +509,14 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    major-10 vs else) and `cpu.py:75-87` (`CpuPlatform`). FLASH_ATTN/GDN_ATTN
    self-register. It reuses (does not extend) the pre-existing CPU FA-NHD-layout
    deviation (§9.1 / `cpu_paged_attn.cpp`): upstream CPU picks CPU_ATTN's
-   `[N,H,block,head]` layout, our CPU paged-attn reuses FlashAttention's NHD
-   layout, so CPU_ATTN is named-but-unregistered and the walk falls through to
-   FLASH_ATTN — behavior-preserving. The concrete attention KERNEL stays selected
+   `[N,H,block,head]` layout while our CPU paged-attn reuses FlashAttention's NHD
+   layout. CPU_ATTN was therefore named-but-unregistered here and the walk fell
+   through to FLASH_ATTN. **Since [#1371](https://github.com/mudler/vllm.cpp/issues/1371)
+   `CPU_ATTN` IS registered** (`src/vllm/v1/attention/backends/cpu_attn.cpp`,
+   ported from `cpu_attn.py:39-110`) and the CPU walk stops on it, which is
+   upstream's answer; the layout deviation is unchanged and is now recorded on the
+   backend itself rather than being the reason it had no registrar.
+   The concrete attention KERNEL stays selected
    at the vt:: op table (§9.1), so this is an organizing engine-SELECTION seam
    over the existing runtime, introducing no new deviation. Adding a backend's
    attention = one self-registering TU + one priority slot, ZERO selector/model/
@@ -1695,7 +1700,7 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (`CheckMoeExpertLayoutSupported`, same file), per AGENTS.md §Shared seams.
     **The DENSE arm is NOT affected and the asymmetry is deliberate record:**
     `LoadQwen3_5Dense` routes BF16 vs FP8 vs NVFP4 per projection by tensor
-    presence (`qwen3_5_dense_weights.cpp:354-360,472-503`) and routes the head by
+    presence (`qwen3_5_dense_weights.cpp:355-361,473-504`) and routes the head by
     dtype (`LoadDenseLmHead` / `LoadLmHeadAnyDtype`, `:215-233,515-547`), so it
     may genuinely load a flat bf16 checkpoint. The whole deviation is discharged
     by a pin advance that includes `ad5d29db7`, at which point (a) and the

@@ -20,8 +20,18 @@
 // layers are causal within their window. This routes through the new
 // vt::DFlashBlockAttention primitive (ops.h) rather than the causal
 // vt::PagedAttention every other model uses. Per-layer causality is resolved from
-// config exactly as vLLM _resolve_layer_attention (:86-146): a layer is causal iff
-// it is a sliding_attention layer (unless dflash_config.causal overrides).
+// config exactly as vLLM _resolve_layer_attention (:109-169) + _dflash_layer_causal
+// (:58-67), both @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`: a DECLARED top-level `is_causal`
+// wins, else a declared `dflash_config.causal`, else a layer is causal iff its
+// DECLARED `layer_types[i]` is `sliding_attention`. That last arm reads the
+// declared value and not the resolved layer type, so `dflash_config.use_swa` --
+// which forces SWA onto every layer -- moves the WINDOW and never the causality
+// (#1366). Both explicit arms test presence and then coerce, as upstream's
+// `bool(...)` does, so a checkpoint spelling the value `0` is honoured. The
+// top-level arm is BEYOND-PIN (SPEC-DFLASH2 W1, #1314); no DFlash1 checkpoint
+// declares the key, so their resolution is unchanged by it. See
+// ResolveQwen3DFlashAttnModes.
 //
 // Context-KV precompute (qwen3_dflash.py:548-619 precompute_and_store_context_kv)
 // and prepare_dflash_inputs are D3 (DF-DRAFT-KV-PREP); this header/cpp owns the
@@ -56,6 +66,85 @@ struct Qwen3DFlashLayerAttnMode {
   int64_t sliding_window = 0;  // >0 for SWA layers; 0 for full layers
 };
 
+// SPEC-DFLASH2 W2 (#1314): the grouped dynamic depthwise convolution that wraps
+// ONE sublayer of a DFlash2 draft block. EMPTY on a DFlash1 draft, which is what
+// `Qwen3DFlashWeights::IsDflash2` reads.
+//
+// BEYOND-PIN, from `DFlashGroupedConv` (vllm/model_executor/models/qwen3_dflash2.py
+// @ vllm-project/vllm#52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`).
+//
+// Both tensors are named exactly as the published checkpoint stores them
+// (`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+// safetensors header read 2026-08-19):
+//   layers.N.attention_conv.base_kernel               bf16 (2, 2, 5120)
+//   layers.N.attention_conv.kernel_projection.weight  bf16 (1280, 5120)
+// and the same pair under `mlp_conv`.
+//
+// `base_kernel` dim 0 is the SIDE -- 0 = `prepare` (before the sublayer), 1 =
+// `finish` (after it) -- and NOT a tap. On this checkpoint `taps` is also 2, so
+// the two axes are indistinguishable by shape and only the port note separates
+// them. `kernel_projection` maps hidden -> `2 * taps * num_groups` (1280 =
+// 2*2*320 at hidden 5120 / conv_group_size 16), i.e. ONE projection of the
+// sublayer input carrying BOTH sides' deltas.
+struct Qwen3DFlashConvWeights {
+  OwnedTensor base_kernel;        // bf16 [2, taps, H]; dim 0 is the SIDE
+  OwnedTensor kernel_projection;  // bf16 raw-NK [2*taps*num_groups, H], nk
+  bool Empty() const { return base_kernel.bytes.empty(); }
+};
+
+// SPEC-DFLASH2 W3 (#1314): the CANDIDATE SELECTOR of a DFlash2 draft. EMPTY on a
+// DFlash1 draft, which is what `Qwen3DFlashWeights::IsDflash2` reads.
+//
+// BEYOND-PIN, from `CandidateSelector` and `DFlash2Qwen3ForCausalLM`
+// (vllm/model_executor/models/qwen3_dflash2.py:231-356 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`). The
+// PR head MOVED from `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19
+// (#1404). `_score_edges`, `CandidateSelector` and every line of
+// `compute_candidates` except the LM-head guard are BYTE-IDENTICAL at the two
+// heads; the two things that changed are ported or recorded on
+// `Dflash2SelectorWeights::kNonPortSetModelTag` below.
+//
+// The three tensors are named exactly as the published checkpoint stores them
+// (`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+// safetensors header read 2026-08-19):
+//   candidate_selector.hidden_projection.weight  bf16 (256, 5120)
+//   candidate_selector.predecessor_codebook      bf16 (248320, 256)   127 MB
+//   candidate_selector.successor_codebook        bf16 (248320, 256)   127 MB
+//
+// The two codebooks are ~254 MB resident that the DFlash1 lane never allocates
+// (`## Risks/decisions` D5). Upstream stores them bf16 and so do we; whether a
+// narrower dtype would serve is NOT decided by this row.
+struct Dflash2SelectorWeights {
+  OwnedTensor hidden_projection;     // bf16 raw-NK [rank, H], nk
+  OwnedTensor predecessor_codebook;  // bf16 [vocab, rank]
+  OwnedTensor successor_codebook;    // bf16 [vocab, rank]
+  int64_t rank = 0;    // dflash_config.selector_rank (256 on both drafts)
+  int64_t top_k = 0;   // dflash_config.selector_top_k (16 on both drafts)
+  // The two OUTPUT SCALARS, applied to the candidate VALUES in
+  // `compute_candidates` BEFORE the selector scores them
+  // (`DFlash2Qwen3ForCausalLM.compute_candidates` @ that head). A wrong value
+  // reorders the top-K and moves acceptance without raising anything, which is
+  // this row's signature invisible defect, so `## Risks/decisions` D9 requires
+  // them gated against a checkpoint that SETS them:
+  // `z-lab/Muse-Glimmer-30B-DFlash2` ships 0.19611613513818404 and 20.0, while
+  // `z-lab/Qwen3.8-27B-DFlash2` ships neither and takes both defaults (#1327).
+  float output_multiplier = 1.0f;
+  // `float(dflash_config.get("final_logit_softcapping") or 0.0)`, then DISABLED
+  // when not > 0 — upstream's own `softcap if softcap > 0 else None`. So 0 here
+  // means "no softcap" and never "cap at zero".
+  float final_logit_softcapping = 0.0f;
+  bool Empty() const { return predecessor_codebook.bytes.empty(); }
+  // A DELIBERATE NON-PORT, recorded rather than skipped in silence. Upstream
+  // wraps the selector's construction in `set_model_tag("dflash2_candidate_selector")`
+  // because `CandidateSelector` carries its own `@support_torch_compile` and is
+  // built while the draft's model tag is still active, so without a tag of its
+  // own the two share a torch.compile cache namespace and the selector loads the
+  // draft's graph. It is the only behavioural change #52816 made to this file
+  // between the two heads. This engine has no torch.compile and no compile
+  // cache, so there is nothing for a tag to disambiguate.
+  static constexpr const char* kNonPortSetModelTag = "dflash2_candidate_selector";
+};
+
 // One DFlash draft decoder layer: input/post standard RMSNorm + plain Qwen3
 // attention (merged qkv, per-head q/k norm, NeoX RoPE) + SwiGLU MLP. Weights are
 // kept in the on-disk torch-Linear [N=out,K=in] orientation (nk=true) for
@@ -70,6 +159,11 @@ struct Qwen3DFlashLayerWeights {
   OwnedTensor gate_up_proj;  // bf16 raw-NK [2*I, H] (rows gate|up), nk
   OwnedTensor down_proj;     // bf16 raw-NK [H, I], nk
   Qwen3DFlashLayerAttnMode attn_mode;
+  // SPEC-DFLASH2 W2 (#1314): the two grouped convolutions of a DFlash2 block,
+  // wrapping the attention and the MLP sublayer respectively. Both EMPTY on a
+  // DFlash1 draft, and the forward then runs byte-for-byte as before.
+  Qwen3DFlashConvWeights attention_conv;
+  Qwen3DFlashConvWeights mlp_conv;
 };
 
 // Whole DFlash draft weights. The draft owns its OWN embed_tokens and lm_head
@@ -89,6 +183,42 @@ struct Qwen3DFlashWeights {
   int64_t num_taps = 0;         // len(target_layer_ids); fc input = H*num_taps
   int32_t mask_token_id = -1;   // dflash_config.mask_token_id (248070 for 27B)
   int64_t draft_vocab_size = 0;
+  // SPEC-DFLASH2 W2 (#1314): the conv geometry. `conv_taps` is
+  // `dflash_config.conv_kernel_size` and is 0 on a DFlash1 draft, which is what
+  // makes it the DFlash2 discriminator here -- a DFlash1 checkpoint declares
+  // none of these keys and carries no conv tensor.
+  int64_t conv_taps = 0;        // dflash_config.conv_kernel_size (2 on both drafts)
+  int64_t conv_group_size = 0;  // dflash_config.conv_group_size (16 on both drafts)
+  // The QUERY block the conv masks its taps against: `1 + num_speculative_tokens`,
+  // NOT `dflash_config.block_size`. Upstream sizes it from the speculative config
+  // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+  // `66e5414c6d75a8529473d977f7458c140bbab8a0`) and the checkpoint key only ever
+  // supplies that value's DEFAULT, through `k`.
+  //
+  // `LoadQwen3DFlash` DOES NOT FILL IT. Whoever knows the resolved `k` is the
+  // only writer -- `LoadDflashDraft` in production -- and until then it is 0,
+  // which every DFlash2 forward refuses by name. W3 and earlier seeded it from
+  // the checkpoint key so a direct caller had a usable value, and that is what
+  // made the loader's own assignment ungateable: deleting it left a plausible
+  // block behind and no gate could see the difference (spec `## Owed` O5,
+  // mutation-proven green by W2). SPEC-DFLASH2 W4 (#1314) removes the seed.
+  int64_t conv_block_size = 0;
+  // SPEC-DFLASH2 W3 (#1314): TRUE when the SHARED lm_head above was produced by
+  // DEQUANTIZING a quantized target tensor rather than read as dense floats.
+  // Only the GGUF target arm can set it (`LoadGgufSharedEmbedAndHeadBf16`
+  // dequantizes a q6_K/NVFP4 `output.weight` to bf16); the safetensors arm
+  // refuses a non-BF16 head one layer up in `LoadNamedBf16`. It exists because
+  // the DFlash2 selector's whole input is the target head's EXACT top-K, which a
+  // dequantized head does not produce -- the case upstream's LM-head guard
+  // refuses by name. See `RefuseQuantizedDflash2LmHead`
+  // (qwen3_dflash2.h). Read only by that guard; the DFlash1 lane is unaffected,
+  // which is why the flag is recorded rather than refused at load.
+  bool lm_head_dequantized = false;
+  // SPEC-DFLASH2 W3 (#1314): the candidate selector. EMPTY on a DFlash1 draft.
+  // It is loaded whenever `IsDflash2()`, because a DFlash2 checkpoint that
+  // carried the conv and no selector is not a shape this port knows how to run.
+  Dflash2SelectorWeights candidate_selector;
+  bool IsDflash2() const { return conv_taps > 0; }
 };
 
 // Load the z-lab DFlash draft checkpoint. The on-disk names follow vLLM's
@@ -107,10 +237,30 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
                                    const HfConfig& config, int64_t num_taps,
                                    int32_t mask_token_id);
 
-// Resolve the per-layer attention modes from config.layer_types (and the optional
-// dflash_config overrides). Exposed for the loader + tests. Mirrors
-// _resolve_layer_attention (qwen3_dflash.py:86-146).
+// Resolve the per-layer attention modes from config.layer_types, the optional
+// dflash_config overrides, and the optional top-level `is_causal`. Exposed for
+// the loader + tests. Mirrors _resolve_layer_attention (qwen3_dflash.py:86-146 @
+// the parity pin 555967922, :109-169 @ vllm-project/vllm#52816 head
+// 19c9351904df4c63042671bc67a866ca48dc7d6f, identical body at both) and
+// _dflash_layer_causal (:58-64 @ the pin, :58-67 @ that head, where the top-level
+// `is_causal` arm is added), whose precedence the definition documents in full.
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config);
+
+// Build a DFlash draft HfConfig from the draft checkpoint's own config.json (the
+// real nested {block_size, dflash_config:{mask_token_id,target_layer_ids},
+// layer_types, ...}). Mirrors the D3 parity harness MakeConfig; kept manual
+// rather than routed through LoadHfConfig so the DFlashDraftModel architecture
+// and the nested dflash_config parse deterministically. It was `MakeDflashDraftConfig`
+// in the loader's anonymous namespace until SPEC-DFLASH2 W1 moved it here.
+//
+// It lives beside ResolveQwen3DFlashAttnModes because the two are one decision
+// split in half: this copies the named keys the draft resolution reads, and that
+// function reads them. A key this builder drops is a key that resolution can
+// never see, whatever the checkpoint declares -- which is why `is_causal` is
+// carried here and gated in tests/vllm/v1/spec_decode/test_dflash_causality.cpp.
+// The loader (src/vllm/entrypoints/model_loader.cpp, LoadDflashDraft) is the
+// production caller.
+HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c);
 
 // D11 (Part A) — DEVICE-RESIDENT append-only draft-KV store. Opaque handle (defined
 // in qwen3_dflash.cpp) holding, per request, the projected bf16 K/V for every draft

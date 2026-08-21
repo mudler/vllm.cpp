@@ -71,7 +71,7 @@ requires matching nsys traces under the project parity protocol.
 
 ## Our baseline
 
-- `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:115-165` assumes
+- `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:116-166` assumes
   NVFP4 companions for attention, GDN output, and dense MLP projections.
 - `src/vllm/model_executor/models/qwen3_5_dense.cpp:60-80` loads after the queue
   context is lost and has an empty dense prepare hook.

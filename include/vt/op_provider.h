@@ -203,11 +203,19 @@ bool OpProviderDisabled(const char* name);
 // provider on a UNIFIED-MEMORY device, so an op the device lacks a native kernel
 // for falls back to the CPU reference instead of throwing.
 //
-// SAFETY (the load-bearing invariant). A CPU kernel dereferences host pointers.
-// That is correct ONLY where host and device memory alias (Metal StorageMode-
-// Shared, GB10 / integrated Vulkan, CPU) — `Backend::UnifiedMemory()`. On a
-// DISCRETE GPU a CPU kernel reading a device pointer is memory corruption, so the
-// tier is gated on the unified-memory property, never on DeviceType blindly.
+// SAFETY (the load-bearing invariant). A CPU kernel dereferences the pointers it
+// is given. That is correct ONLY where the HOST MAY DEREFERENCE what
+// `Backend::Alloc` returned — `Backend::DeviceMemoryIsHostAddressable()`. The
+// tier is gated on that property, never on DeviceType blindly.
+//
+// IT IS NOT `Backend::UnifiedMemory()`, and the difference is two crashes
+// (#844, #1435). Unified memory says host and device address the same physical
+// RAM; it does NOT say a device allocation is host-dereferenceable. CUDA on GB10
+// reports unified memory and allocates with `cudaMalloc`, which the host may not
+// touch, so gating on the wide property ran host kernels over device pointers
+// and the process took SIGSEGV under a banner claiming a correct fallback.
+// include/vt/backend.h carries the same distinction beside the narrow predicate,
+// including why its default is `false`.
 //
 // DETERMINISM / no-change-on-native. The fallback registers at
 // kReferenceTierPriority (strictly below every native kernel's priority >= 0), so
@@ -220,8 +228,9 @@ inline constexpr int kReferenceTierPriority = -1000;  // strictly below any nati
 
 // THE SAFETY GATE. True iff `device` may host the CPU reference tier: it is not
 // the CPU source device itself, a backend is registered for it, and that backend
-// reports UnifiedMemory() == true. Consulted at registration time; a device that
-// answers false NEVER gets a CPU fallback installed.
+// reports DeviceMemoryIsHostAddressable() == true. Consulted at registration
+// time; a device that answers false NEVER gets a CPU fallback installed, and
+// GetOp refuses it by name instead, naming which precondition it failed.
 bool ReferenceTierEligible(DeviceType device);
 
 // Eagerly install the reference tier for `target`: for every op that has a CPU

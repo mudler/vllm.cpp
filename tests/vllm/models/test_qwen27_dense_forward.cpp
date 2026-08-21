@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
@@ -665,4 +667,193 @@ TEST_CASE("qwen27 dense forward: the silu arm is silu, not merely 'not sigmoid'"
                            std::abs(static_cast<double>(ref[i]) - sigmoid_out[i]));
   MESSAGE("z=0 sigmoid arm departs from the no-GDN reference by " << sigmoid_gap);
   CHECK(sigmoid_gap > 0.0);
+}
+
+// FIX-PROBE-CANNOT-SAY-NO (#1258) ------------------------------------------
+//
+// #1256 named TWO always-true `TensorExists` stubs; #1257 fixed the
+// `LoadQwen3_5DenseGdn` one. The other lives in the resolver-only overload of
+// `LoadQwen3_5DenseLayer`, whose live caller is the `qwen36_gdn_layer_27b`
+// isolated-layer golden (`tests/parity/test_op_parity.cpp`), SKIPped on a host
+// without the pinned 27B snapshot and therefore invisible to every CPU lane.
+//
+// This bag builds an all-BF16 `linear_attention` layer: nothing in it is
+// quantized, nothing carries a `weight_scale_inv`, and nothing disagrees with
+// anything. A truthful probe routes it down the bf16 arm. A probe that cannot
+// say no reports a block-wise FP8 scale on every projection and the load is
+// refused over a tensor that does not exist.
+namespace {
+
+struct DenseLayerBag {
+  std::unordered_map<std::string, StTensor> tensors;
+  std::vector<std::vector<uint16_t>> storage;
+
+  void AddBf16(const std::string& name, std::vector<int64_t> shape,
+               uint16_t fill) {
+    int64_t n = 1;
+    for (const int64_t d : shape) n *= d;
+    storage.emplace_back(static_cast<size_t>(n), fill);
+    const std::vector<uint16_t>& v = storage.back();
+    StTensor t;
+    t.dtype = "BF16";
+    t.shape = std::move(shape);
+    t.data = reinterpret_cast<const uint8_t*>(v.data());
+    t.nbytes = v.size() * sizeof(uint16_t);
+    tensors[name] = t;
+  }
+
+  // Absence is signalled by THROWING, which is the whole contract a resolver
+  // has: it returns a reference and so has no other way to say "not here"
+  // (`SafetensorsFile::Get` documents the same, safetensors_reader.h).
+  TensorResolver Resolver() const {
+    return [this](const std::string& name) -> const StTensor& {
+      const auto it = tensors.find(name);
+      if (it == tensors.end()) throw std::runtime_error("missing tensor: " + name);
+      return it->second;
+    };
+  }
+
+  std::function<bool(const std::string&)> Has() const {
+    return [this](const std::string& name) {
+      return tensors.find(name) != tensors.end();
+    };
+  }
+};
+
+// An all-BF16 `linear_attention` layer under `{prefix}layers.{idx}.`.
+DenseLayerBag Bf16LinearAttentionLayer(const std::string& base) {
+  constexpr int64_t kH = 16, kI = 8, kHeads = 2, kConv = 16;
+  DenseLayerBag bag;
+  const std::string la = base + "linear_attn.";
+  bag.AddBf16(base + "input_layernorm.weight", {kH}, 0x3f80);
+  bag.AddBf16(base + "post_attention_layernorm.weight", {kH}, 0x3f80);
+  bag.AddBf16(la + "in_proj_qkv.weight", {kConv, kH}, 0x3f80);
+  bag.AddBf16(la + "in_proj_z.weight", {kConv, kH}, 0x3f00);
+  bag.AddBf16(la + "in_proj_b.weight", {kHeads, kH}, 0x4000);
+  bag.AddBf16(la + "in_proj_a.weight", {kHeads, kH}, 0x4100);
+  bag.AddBf16(la + "conv1d.weight", {kConv, 1, 4}, 0x3e80);
+  bag.AddBf16(la + "A_log", {kHeads}, 0x3f80);
+  bag.AddBf16(la + "dt_bias", {kHeads}, 0x3f00);
+  bag.AddBf16(la + "norm.weight", {8}, 0x3f80);
+  bag.AddBf16(la + "out_proj.weight", {kH, kH}, 0x3f80);
+  bag.AddBf16(base + "mlp.gate_proj.weight", {kI, kH}, 0x3f80);
+  bag.AddBf16(base + "mlp.up_proj.weight", {kI, kH}, 0x3f00);
+  bag.AddBf16(base + "mlp.down_proj.weight", {kH, kI}, 0x3f80);
+  return bag;
+}
+
+bool Names(const std::string& haystack, const std::string& needle) {
+  return haystack.find(needle) != std::string::npos;
+}
+
+// `e.what()`, or "" when the call returned. The M3 loader gate
+// (test_fp8_block_weight_load.cpp) reports refusals the same way: "threw
+// something" and "threw THIS" are different results and only one of them is
+// evidence.
+std::string LayerLoadFailure(const DenseLayerBag& bag,
+                             const std::string& prefix) {
+  try {
+    const Qwen3_5DenseLayerWeights layer =
+        vllm::LoadQwen3_5DenseLayer(bag.Resolver(), "linear_attention", 0, prefix);
+    (void)layer;
+    return "";
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+}
+
+}  // namespace
+
+// T1 -------------------------------------------------------------------------
+TEST_CASE("qwen27 dense layer: the resolver-only seam loads a bf16 layer without refusing") {
+  const DenseLayerBag bag = Bf16LinearAttentionLayer("m.layers.0.");
+
+  const std::string failure = LayerLoadFailure(bag, "m.");
+  INFO("refusal was: " << failure);
+  REQUIRE(failure.empty());
+
+  const Qwen3_5DenseLayerWeights layer =
+      vllm::LoadQwen3_5DenseLayer(bag.Resolver(), "linear_attention", 0, "m.");
+  CHECK(layer.is_linear_attention);
+  // Routed BF16, which is what this checkpoint is: one merged qkvz owner, one
+  // merged gate_up owner, and every quantized slot left empty.
+  CHECK_FALSE(layer.gdn.in_proj_qkvz.Empty());
+  CHECK_FALSE(layer.gdn.out_proj.Empty());
+  CHECK_FALSE(layer.mlp.gate_up_proj.Empty());
+  CHECK(layer.gdn.in_proj_qkv_fp8_block.scale.Empty());
+  CHECK(layer.gdn.out_proj_fp8_block.scale.Empty());
+  CHECK(layer.mlp.gate_proj_fp8_block.scale.Empty());
+  CHECK(layer.gdn.out_proj_fp4.packed.Empty());
+  CHECK(layer.mlp.gate_proj_fp4.packed.Empty());
+
+  // The SAME layer through the explicit-probe overload with a truthful probe
+  // must land in the same arm, which is what makes the resolver-only seam a
+  // shorthand rather than a second routing policy.
+  const Qwen3_5DenseLayerWeights via_probe = vllm::LoadQwen3_5DenseLayer(
+      bag.Resolver(), bag.Has(), "linear_attention", 0, "m.");
+  CHECK(via_probe.gdn.in_proj_qkvz.bytes == layer.gdn.in_proj_qkvz.bytes);
+  CHECK(via_probe.mlp.gate_up_proj.bytes == layer.mlp.gate_up_proj.bytes);
+}
+
+// T2 -------------------------------------------------------------------------
+//
+// The mutation of the chosen guard, run as a test rather than by hand: hand the
+// explicit-probe overload the exact stub #1256 found twice, and require that it
+// is refused for BEING a stub. Before this row it was refused too — naming
+// `in_proj_qkv.weight_scale_inv`, a tensor the fixture does not have and never
+// had, which is a report about the checkpoint for a defect in the caller.
+TEST_CASE("qwen27 dense layer: a presence probe that cannot answer no is refused") {
+  const DenseLayerBag bag = Bf16LinearAttentionLayer("m.layers.0.");
+  const std::function<bool(const std::string&)> cannot_say_no =
+      [](const std::string&) { return true; };
+
+  std::string message;
+  try {
+    const Qwen3_5DenseLayerWeights layer = vllm::LoadQwen3_5DenseLayer(
+        bag.Resolver(), cannot_say_no, "linear_attention", 0, "m.");
+    (void)layer;
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("refusal was: " << message);
+  REQUIRE_FALSE(message.empty());
+  // Refused for the right reason: it names the probe, the seam and the sentinel.
+  CHECK(Names(message, "tensor-presence probe"));
+  CHECK(Names(message, "LoadQwen3_5DenseLayer"));
+  CHECK(Names(message, vllm::dense_loaders::kAbsentProbeSentinel));
+  // And NOT for the wrong one — the old report blamed a checkpoint that is fine.
+  CHECK_FALSE(Names(message, "weight_scale_inv"));
+
+  // The same bag with a truthful probe loads, which is what makes the assertion
+  // above a statement about the PROBE rather than about the fixture.
+  const Qwen3_5DenseLayerWeights ok = vllm::LoadQwen3_5DenseLayer(
+      bag.Resolver(), bag.Has(), "linear_attention", 0, "m.");
+  CHECK_FALSE(ok.gdn.in_proj_qkvz.Empty());
+}
+
+// T3 -------------------------------------------------------------------------
+//
+// The negative control for both helpers, at the unit level: a resolver-derived
+// probe answers BOTH ways, and a truthful probe passes the guard. Without this,
+// T2 is satisfied by a guard that refuses every probe.
+TEST_CASE("dense loaders: a resolver-derived presence probe answers both ways") {
+  const DenseLayerBag bag = Bf16LinearAttentionLayer("m.layers.0.");
+  const std::function<bool(const std::string&)> probe =
+      vllm::dense_loaders::ProbeThroughResolver(bag.Resolver());
+
+  CHECK(probe("m.layers.0.linear_attn.in_proj_qkv.weight"));
+  CHECK_FALSE(probe("m.layers.0.linear_attn.in_proj_qkv.weight_scale_inv"));
+  CHECK_FALSE(probe(vllm::dense_loaders::kAbsentProbeSentinel));
+
+  // The probe OUTLIVES the temporary `bag.Resolver()` it was built from, which
+  // it can only do because `ProbeThroughResolver` captures by VALUE. Stated
+  // honestly: a by-reference capture would be undefined behaviour here rather
+  // than a deterministic failure, so this line is a detector only under the
+  // `sanitize-cpu` lanes. It is kept because that is exactly where a lifetime
+  // bug in a loader helper should be caught.
+  CHECK(probe("m.layers.0.mlp.gate_proj.weight"));
+
+  vllm::dense_loaders::CheckProbeCanAnswerNo(probe, "T3 resolver-derived");
+  vllm::dense_loaders::CheckProbeCanAnswerNo(bag.Has(), "T3 map-backed");
+  CHECK(true);  // reached, so neither call above threw
 }

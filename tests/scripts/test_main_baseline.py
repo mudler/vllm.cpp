@@ -457,6 +457,249 @@ def resolve_boolean(expression: str, event: str) -> bool:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Group keys, resolved to a VALUE
+# ---------------------------------------------------------------------------
+#
+# `resolve_boolean` above answers "does this expression mean true for this
+# event". A group key is not a boolean, and since #274's follow-on it is not a
+# constant either: the baseline events carry a conditional that admits the run
+# identity, and every other event must resolve to exactly the key it resolved to
+# before. Half-resolving the string cannot see that, so the resolver below
+# evaluates the same grammar over VALUES, with GitHub's truthiness for `&&` and
+# `||` (`null`, `false`, `0` and `''` are falsy, and both operators return an
+# OPERAND rather than a boolean).
+#
+# Contexts split into two classes, and the split is the whole point. A
+# RUN-VARYING context takes a different value in two different runs of the same
+# workflow on the same ref. A STABLE one does not. Resolving one key twice, once
+# per synthetic run, turns "does this key carry `github.run_id`" into the
+# property that actually matters: does this key put two runs in the same group.
+
+RUN_A = {
+    "github.run_id": "5000000001",
+    "github.run_number": "801",
+    "github.run_attempt": "1",
+    "github.sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "github.event.head_commit.id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "github.event.pull_request.head.sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+}
+RUN_B = {
+    "github.run_id": "5000000002",
+    "github.run_number": "802",
+    "github.run_attempt": "2",
+    "github.sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "github.event.head_commit.id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "github.event.pull_request.head.sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+}
+assert set(RUN_A) == set(RUN_B) == set(RUN_VARYING_TOKENS), (
+    "the run-varying contexts and the by-name blocklist must name the same set"
+)
+assert all(RUN_A[k] != RUN_B[k] for k in RUN_A), "two runs must differ everywhere"
+
+# Stable for a given event: the same in run A and run B. `matrix.lane` is stable
+# because it identifies the lane, not the run, which is exactly why
+# `sanitize-cpu`'s two lanes are allowed to hold separate groups.
+STABLE_CONTEXTS = {
+    "push": {
+        "github.event_name": "push",
+        "github.ref": "refs/heads/main",
+        "github.ref_name": "main",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": None,
+        "matrix.lane": "thread",
+    },
+    "pull_request": {
+        "github.event_name": "pull_request",
+        "github.ref": "refs/pull/1234/merge",
+        "github.ref_name": "1234/merge",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": 1234,
+        "matrix.lane": "thread",
+    },
+    "schedule": {
+        "github.event_name": "schedule",
+        "github.ref": "refs/heads/main",
+        "github.ref_name": "main",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": None,
+        "matrix.lane": "thread",
+    },
+    "workflow_dispatch": {
+        "github.event_name": "workflow_dispatch",
+        "github.ref": "refs/heads/main",
+        "github.ref_name": "main",
+        "github.repository": "mudler/vllm.cpp",
+        "github.event.pull_request.number": None,
+        "matrix.lane": "thread",
+    },
+}
+assert set(STABLE_CONTEXTS) == set(EVENTS)
+
+VALUE_TOKEN = re.compile(
+    r"""\s*(?:
+        (?P<op>&&|\|\||==|!=|\(|\))
+      | (?P<text>'[^']*')
+      | (?P<literal>true|false|null)
+      | (?P<number>[0-9]+)
+      | (?P<ctx>[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)
+    )\s*""",
+    re.VERBOSE,
+)
+
+
+def _truthy(value) -> bool:
+    """GitHub's truthiness. `null`, `false`, `0` and the empty string are false."""
+    return not (value is None or value is False or value == 0 or value == "")
+
+
+def _render(value) -> str:
+    """How GitHub substitutes a resolved value back into the key text."""
+    if value is None:
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+class _Expression:
+    """Recursive descent over the subset these keys use.
+
+    An unrecognised token or an unknown context RAISES. A key this suite cannot
+    read must red it, never resolve to something plausible -- the failure mode
+    the workflow half of this file exists to refuse.
+    """
+
+    def __init__(self, source: str, contexts: dict) -> None:
+        self.source = source
+        self.contexts = contexts
+        self.tokens: list[tuple[str, str]] = []
+        position = 0
+        while position < len(source):
+            match = VALUE_TOKEN.match(source, position)
+            if match is None:
+                raise AssertionError(
+                    f"unrecognised token in {source!r} at {source[position:]!r}"
+                )
+            position = match.end()
+            kind = match.lastgroup
+            self.tokens.append((kind, match.group(kind)))
+        self.index = 0
+
+    def peek(self):
+        return self.tokens[self.index] if self.index < len(self.tokens) else (None, None)
+
+    def take(self):
+        token = self.peek()
+        self.index += 1
+        return token
+
+    def parse(self):
+        value = self.parse_or()
+        if self.index != len(self.tokens):
+            raise AssertionError(f"trailing tokens in {self.source!r}")
+        return value
+
+    def parse_or(self):
+        value = self.parse_and()
+        while self.peek() == ("op", "||"):
+            self.take()
+            right = self.parse_and()
+            value = value if _truthy(value) else right
+        return value
+
+    def parse_and(self):
+        value = self.parse_compare()
+        while self.peek() == ("op", "&&"):
+            self.take()
+            right = self.parse_compare()
+            value = right if _truthy(value) else value
+        return value
+
+    def parse_compare(self):
+        left = self.parse_primary()
+        kind, text = self.peek()
+        if kind == "op" and text in ("==", "!="):
+            self.take()
+            right = self.parse_primary()
+            return (left == right) if text == "==" else (left != right)
+        return left
+
+    def parse_primary(self):
+        kind, text = self.take()
+        if (kind, text) == ("op", "("):
+            value = self.parse_or()
+            if self.take() != ("op", ")"):
+                raise AssertionError(f"unbalanced parenthesis in {self.source!r}")
+            return value
+        if kind == "text":
+            return text[1:-1]
+        if kind == "number":
+            return int(text)
+        if kind == "literal":
+            return {"true": True, "false": False, "null": None}[text]
+        if kind == "ctx":
+            if text not in self.contexts:
+                raise AssertionError(
+                    f"unknown context {text!r} in {self.source!r}; add it to "
+                    "STABLE_CONTEXTS or to the run-varying set, and say which"
+                )
+            return self.contexts[text]
+        raise AssertionError(f"unexpected token {text!r} in {self.source!r}")
+
+
+def resolve_group(expression: str, event: str, run: dict) -> str:
+    """Render a concurrency group key the way GitHub renders it for one run."""
+
+    contexts = dict(STABLE_CONTEXTS[event])
+    contexts.update(run)
+    out: list[str] = []
+    position = 0
+    while position < len(expression):
+        start = expression.find("${{", position)
+        if start < 0:
+            out.append(expression[position:])
+            break
+        out.append(expression[position:start])
+        end = expression.find("}}", start)
+        if end < 0:
+            raise AssertionError(f"unterminated ${{{{ in {expression!r}")
+        out.append(_render(_Expression(expression[start + 3 : end], contexts).parse()))
+        position = end + 2
+    return "".join(out)
+
+
+def varies_per_run(expression: str, event: str) -> bool:
+    """Do two runs of this workflow, same event and same ref, get SEPARATE groups?
+
+    True means the group can never make one run wait for another, so GitHub can
+    never discard it while it is pending. False means the group is shared, which
+    is what `cancel-in-progress: true` needs to have anything to cancel.
+    """
+
+    return resolve_group(expression, event, RUN_A) != resolve_group(
+        expression, event, RUN_B
+    )
+
+
+def concurrency_blocks(ci: dict) -> list[tuple[str, dict]]:
+    """Every concurrency block in the workflow, workflow level first.
+
+    Enumerated from the parsed file rather than from a fixed list, so a job that
+    joins later is covered by the pull request that adds it.
+    """
+
+    blocks = []
+    if ci.get("concurrency"):
+        blocks.append(("<workflow>", ci["concurrency"]))
+    for name, job in ci["jobs"].items():
+        if job.get("concurrency"):
+            blocks.append((name, job["concurrency"]))
+    return blocks
+
+
 def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
@@ -609,28 +852,64 @@ class WorkflowLaneTests(unittest.TestCase):
         dedupe outright -- walked straight through it.
         """
         marker = "-${{ github.ref }}"
+        expected_shape = "-${{ github.event_name }}" + marker
         for name in GROUPED_JOBS:
             base = BASE_GROUPS[name]
             self.assertEqual(base.count(marker), 1, f"{name}: base key shape changed")
+            expected = base.replace(marker, expected_shape)
             groups = GROUP_LINE.findall(job_block(self.text, name))
             self.assertEqual(len(groups), 1, f"{name} must have exactly one group")
-            for event in EVENTS:
+            for event in ("push", "pull_request"):
                 with self.subTest(job=name, event=event):
-                    resolved = groups[0].replace("${{ github.event_name }}", event)
                     self.assertEqual(
-                        resolved, base.replace(marker, f"-{event}{marker}")
+                        resolve_group(groups[0], event, RUN_A),
+                        resolve_group(expected, event, RUN_A),
+                        f"{name}: the {event} key no longer resolves to the base "
+                        "key plus the event constant, so this lane's runs are "
+                        "partitioned into different groups than they were",
+                    )
+            for event in BASELINE_EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertTrue(
+                        varies_per_run(groups[0], event),
+                        f"{name}: two {event} runs share one group, and a group "
+                        "that never cancels holds ONE pending run -- the third "
+                        "arrival discards the second before it starts a job",
                     )
 
-    def test_no_group_key_carries_a_run_varying_token(self) -> None:
-        """An independent statement of the same defect, by name."""
+    def test_a_baseline_group_is_unique_per_run_and_a_contributor_group_is_not(
+        self,
+    ) -> None:
+        """An independent statement of the same defect, in both directions.
+
+        Its predecessor blocked `github.run_id` by SUBSTRING, for every event.
+        That was right about the push and pull request lanes and wrong about the
+        baseline lane, where a shared key is not dedupe but a one-slot queue
+        that discards its own contents: runs 32140419182 and 32206456661 each
+        returned `startedAt: null` for EVERY job and were cancelled the second
+        their successor was created.
+
+        The assertion is now the resolved property rather than the token.
+        Resolving one key against two synthetic runs asks the question the token
+        was standing in for: do two runs of this workflow, same event and same
+        ref, land in the same group.
+        """
         for name in GROUPED_JOBS:
             group = GROUP_LINE.findall(job_block(self.text, name))[0]
-            for token in RUN_VARYING_TOKENS:
-                with self.subTest(job=name, token=token):
-                    self.assertNotIn(
-                        token,
-                        group,
-                        f"{token} makes {name}'s key unique per run, disabling dedupe",
+            for event in ("push", "pull_request"):
+                with self.subTest(job=name, event=event):
+                    self.assertFalse(
+                        varies_per_run(group, event),
+                        f"{name}: two {event} runs get separate groups, so "
+                        "cancel-in-progress has nothing to cancel and dedupe "
+                        "is off",
+                    )
+            for event in BASELINE_EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertTrue(
+                        varies_per_run(group, event),
+                        f"{name}: two {event} runs share one group, so the "
+                        "second waits and the third discards it",
                     )
 
     def test_cancellation_resolves_to_the_right_boolean_for_every_event(self) -> None:
@@ -801,6 +1080,145 @@ class WorkflowLaneTests(unittest.TestCase):
         """Out of scope for this row: it is the closing step of the hardening
         row. The baseline lane gets its bindingness from baseline-summary."""
         self.assertIn("continue-on-error: true", job_block(self.text, "sanitize-cpu"))
+
+
+class GroupEvictionTests(unittest.TestCase):
+    """A group that never cancels has ONE remaining behaviour: it queues.
+
+    GitHub's concurrency contract has two halves. `cancel-in-progress` is the
+    half this file already resolved per event. The other half is the queue, and
+    it holds exactly ONE pending run: when a third run joins a group that has
+    one run in progress and one pending, GitHub cancels the pending one.
+
+    That half discarded two of the last 39 scheduled baselines. Runs
+    32140419182 and 32206456661 each returned `startedAt: null` for EVERY job
+    and were cancelled at 16:46:51 and 04:49:54, the seconds their successors
+    32162114781 and 32217173498 were created -- 2 out of 2. `cancel-in-progress`
+    resolves to false for `schedule`, so it cancelled nothing; the shared key
+    `ci-schedule-refs/heads/main-mudler/vllm.cpp` did. The suite reached queue
+    depth two because run 32118587477 took 9 h 28 min with no predecessor to
+    wait for, on 345 job-minutes of work, so the four-hour cron laps it.
+
+    The invariant below is derived from `cancel-in-progress` rather than from a
+    list of jobs, and it runs over every concurrency block the file declares:
+
+      cancel-in-progress false for an event  =>  the group MUST vary per run
+      cancel-in-progress true  for an event  =>  the group MUST NOT vary
+
+    Both directions are load-bearing and neither implies the other. Dropping the
+    first discards a baseline. Dropping the second gives every push its own
+    group, which turns cancellation off while every substring still reads right
+    -- the `${{ github.sha }}` mutation `WorkflowLaneTests` was rebuilt for.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import yaml
+
+        cls.ci = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        cls.blocks = concurrency_blocks(cls.ci)
+
+    def test_the_enumeration_finds_every_block_this_suite_knows_about(self) -> None:
+        """A resolver that reads no block passes every assertion below."""
+        names = [name for name, _ in self.blocks]
+        self.assertEqual(len(names), len(set(names)), "duplicate block name")
+        self.assertIn("<workflow>", names)
+        for name in GROUPED_JOBS:
+            self.assertIn(name, names)
+        self.assertGreaterEqual(len(names), len(GROUPED_JOBS) + 1)
+        for name, block in self.blocks:
+            with self.subTest(block=name):
+                self.assertIn("group", block, f"{name}: concurrency without a group")
+                self.assertIn(
+                    "cancel-in-progress",
+                    block,
+                    f"{name}: a group with no cancel key defaults to FALSE, so it "
+                    "queues, so it can be evicted, and no assertion here can tell",
+                )
+
+    def test_no_non_cancellable_group_can_be_evicted(self) -> None:
+        """THE invariant. Red at 250db75a2 on all 11 blocks x 2 baseline events."""
+        for name, block in self.blocks:
+            group = str(block["group"])
+            cancel = str(block["cancel-in-progress"])
+            for event in EVENTS:
+                if resolve_boolean(cancel, event):
+                    continue
+                with self.subTest(block=name, event=event):
+                    self.assertTrue(
+                        varies_per_run(group, event),
+                        f"{name} never cancels on {event}, so it QUEUES on "
+                        f"{resolve_group(group, event, RUN_A)!r}. That queue "
+                        "holds one pending run and discards it when a third "
+                        "arrives, which cost runs 32140419182 and 32206456661 "
+                        "their whole verdict without executing a single job. "
+                        "Admit the run identity into the key for this event.",
+                    )
+
+    def test_a_cancellable_group_is_shared_so_it_has_something_to_cancel(self) -> None:
+        """The opposite direction, and it is not implied by the first.
+
+        A key that varies per run cannot cancel anything. Latest-only on the
+        push lane (#822) and pull request dedupe are exactly this property.
+        """
+        for name, block in self.blocks:
+            group = str(block["group"])
+            cancel = str(block["cancel-in-progress"])
+            for event in EVENTS:
+                if not resolve_boolean(cancel, event):
+                    continue
+                with self.subTest(block=name, event=event):
+                    self.assertFalse(
+                        varies_per_run(group, event),
+                        f"{name} cancels in progress on {event} but every run "
+                        "gets its own group, so it cancels nothing",
+                    )
+
+    def test_the_workflow_level_group_is_unique_per_baseline_run(self) -> None:
+        """Named separately because the run level is where the loss happened.
+
+        Both discarded runs were discarded as RUNS, before any job existed to
+        carry a job-level key. A fix applied only to the job blocks would leave
+        this file green and the lane broken in exactly the measured way.
+        """
+        block = self.ci["concurrency"]
+        for event in BASELINE_EVENTS:
+            with self.subTest(event=event):
+                self.assertFalse(
+                    resolve_boolean(str(block["cancel-in-progress"]), event)
+                )
+                self.assertTrue(varies_per_run(str(block["group"]), event))
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                self.assertFalse(varies_per_run(str(block["group"]), event))
+
+    def test_the_baseline_key_is_the_contributor_key_with_the_run_admitted(self) -> None:
+        """The run identity enters on the baseline events and NOWHERE else.
+
+        Pinned as a pair of equalities against the keys resolved for `push` and
+        `pull_request`, so widening the conditional to admit a third event, or
+        replacing `github.ref` outright, is red here rather than only in the
+        base-key equality one class up.
+        """
+        for name, block in self.blocks:
+            group = str(block["group"])
+            for event in ("push", "pull_request"):
+                with self.subTest(block=name, event=event):
+                    self.assertEqual(
+                        resolve_group(group, event, RUN_A),
+                        resolve_group(group, event, RUN_B),
+                        f"{name}: the {event} key moved between two runs",
+                    )
+            for event in BASELINE_EVENTS:
+                with self.subTest(block=name, event=event):
+                    resolved = resolve_group(group, event, RUN_A)
+                    self.assertIn(
+                        RUN_A["github.run_id"],
+                        resolved,
+                        f"{name}: the {event} key varies per run without "
+                        "carrying the run id, so say which token it varies on",
+                    )
+
 
 
 class VerdictJobCannotSwallowFailureTests(unittest.TestCase):

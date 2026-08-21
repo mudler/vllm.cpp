@@ -288,4 +288,34 @@ std::vector<NemotronHTensor> EnumerateNemotronHTensors(
 v1::KVCacheConfig MakeNemotronHKVCache(const HfConfig& config, int block_size,
                                        int num_blocks);
 
+// ─── the OWED GGUF arm (spec §5b, W7) ────────────────────────────────────────
+//
+// llama.cpp's two `general.architecture` strings for the Nemotron-H family,
+// both of which convert onto the ONE registered HF architecture
+// `NemotronHForCausalLM`: the dense hybrid and the MoE hybrid this row's
+// checkpoint ships (`LLM_ARCH_NEMOTRON_H` / `LLM_ARCH_NEMOTRON_H_MOE`,
+// ggml-org/llama.cpp `src/llama-arch.cpp:92-93`). The released
+// `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf` header carries
+// `general.architecture = nemotron_h_moe`, read directly off the staged file.
+//
+// `nemotron` (`LLM_ARCH_NEMOTRON`, `llama-arch.cpp:91`) is deliberately NOT
+// here: that is Nemotron-4/Minitron's plain dense transformer, a DIFFERENT HF
+// architecture (`NemotronForCausalLM`) that this build does not register at
+// all. Claiming it here would make the dispatch refuse it by the wrong model's
+// name, which is the whole defect this seam exists to remove (#809).
+inline constexpr const char* kNemotronHGgufArch = "nemotron_h";
+inline constexpr const char* kNemotronHMoeGgufArch = "nemotron_h_moe";
+
+// True when this file's `general.architecture` is a Nemotron-H family arch.
+// Consumed by the entrypoint's GGUF architecture dispatch, exactly as
+// `IsMuseGlimmerGguf` is — this header owns the arch keys, not the entrypoint.
+bool IsNemotronHGguf(const GgufFile& gguf);
+
+// The ONE owner of the W7 refusal text. Both doors a GGUF can arrive at — the
+// registry factory's source-kind guard (`LoadNemotronHForCausalLM`) and the
+// entrypoint's GGUF architecture dispatch — throw THIS string, so whichever one
+// a user reaches, the message names this model, this arm and the spec section
+// that owes it. A second spelling of the same refusal is how the two drift.
+std::string NemotronHGgufRefusal();
+
 }  // namespace vllm

@@ -83,12 +83,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vt/backend.h"
 #include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 
 namespace vllm {
 
@@ -131,6 +134,107 @@ int64_t SpatialIndex(int64_t index, int64_t size, Ltx2PaddingMode mode, bool* ze
   return 0;
 }
 
+// ─── THE DEVICE SEAM (LTX25-DEVICE-RESIDENCY W5, #1007) ──────────────────────
+//
+// One device allocation with its tensor view, in the shape
+// src/vllm/model_executor/models/parakeet_encoder.cpp:59-95 already ships for
+// `vt::Conv2d`: host vectors in, one `vt::` op, host vectors out. It is only
+// reached on a NON-CPU queue — a CPU tensor is already a view over host memory,
+// so the host arm moves no byte it did not move before this seam existed, which
+// is what lets the byte-identity claim also be a no-regression claim.
+class DevBuf {
+ public:
+  DevBuf(vt::Backend& backend, vt::Queue& q, vt::Tensor view, size_t bytes, const float* host)
+      : backend_(backend), bytes_(bytes) {
+    ptr_ = backend_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    view.data = ptr_;
+    view.device = q.device;
+    tensor_ = view;
+    if (host != nullptr) backend_.Copy(q, ptr_, host, bytes_);
+  }
+  ~DevBuf() { backend_.Free(ptr_); }
+  DevBuf(const DevBuf&) = delete;
+  DevBuf& operator=(const DevBuf&) = delete;
+
+  vt::Tensor& tensor() { return tensor_; }
+  void Download(vt::Queue& q, float* host) {
+    backend_.Copy(q, host, ptr_, bytes_);
+    backend_.Synchronize(q);
+  }
+
+ private:
+  vt::Backend& backend_;
+  size_t bytes_ = 0;
+  void* ptr_ = nullptr;
+  vt::Tensor tensor_;
+};
+
+// The one convolution dispatch of the whole video VAE, decoder and encoder.
+//
+// `queue` is NULL for "the CPU queue", NOT for "the old host path": there is
+// exactly one code path here and the device is a property of the queue. That is
+// deliberate — a `queue != nullptr ? device : host` ternary would put the
+// interesting branch where nothing in a CPU build can execute it, which is the
+// shape #1426 already records for the DiT's device forward.
+//
+// Upstream decides the same thing the same way and never per call: the decoder
+// is built onto a device once (`single_gpu_model_builder.py:267-288`, CUDA by
+// default at `:273`) and the latent follows the weights
+// (`conv_video_decoder.py:283-286`).
+void Conv3dThroughSeam(vt::Queue* queue, const std::vector<float>& x, int64_t cin, int64_t tin,
+                       int64_t hin, int64_t win, const std::vector<float>& weight,
+                       const std::vector<float>* bias, int64_t cout, int64_t kernel,
+                       const vt::Conv3dArgs& args, std::vector<float>* out, int64_t tout,
+                       int64_t hout, int64_t wout) {
+  vt::Queue cpu_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Queue& q = queue != nullptr ? *queue : cpu_queue;
+  const int64_t wrows = cout * (cin / args.groups);
+  if (q.device.type == vt::DeviceType::kCPU) {
+    vt::Tensor tx = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
+                                           q.device, {cin, tin, hin, win});
+    vt::Tensor tw = vt::Tensor::Contiguous(const_cast<float*>(weight.data()), vt::DType::kF32,
+                                           q.device, {wrows, kernel, kernel, kernel});
+    vt::Tensor to =
+        vt::Tensor::Contiguous(out->data(), vt::DType::kF32, q.device, {cout, tout, hout, wout});
+    vt::Tensor tb;
+    if (bias != nullptr) {
+      tb = vt::Tensor::Contiguous(const_cast<float*>(bias->data()), vt::DType::kF32, q.device,
+                                  {cout});
+    }
+    vt::Conv3d(q, to, tx, tw, bias != nullptr ? &tb : nullptr, args);
+    return;
+  }
+  vt::Backend* backend = vt::TryGetBackend(q.device);
+  VT_CHECK(backend != nullptr,
+           "ltx2 conv3d: the decode was handed a queue on a device with no registered backend");
+  DevBuf dx(*backend, q,
+            vt::Tensor::Contiguous(nullptr, vt::DType::kF32, q.device, {cin, tin, hin, win}),
+            x.size() * sizeof(float), x.data());
+  DevBuf dw(*backend, q,
+            vt::Tensor::Contiguous(nullptr, vt::DType::kF32, q.device,
+                                   {wrows, kernel, kernel, kernel}),
+            weight.size() * sizeof(float), weight.data());
+  DevBuf dout(*backend, q,
+              vt::Tensor::Contiguous(nullptr, vt::DType::kF32, q.device,
+                                     {cout, tout, hout, wout}),
+              out->size() * sizeof(float), nullptr);
+  // THE BIAS BUFFER OUTLIVES THE DISPATCH, and that is not a style choice. A
+  // `DevBuf` scoped to an `if (bias != nullptr)` block would `Free` its device
+  // allocation between the kernel LAUNCH and the `Synchronize` inside
+  // `Download`. On the CPU backend and on a unified-memory backend that is
+  // harmless; on a real asynchronous device it is a free of memory a running
+  // kernel is still reading, and no test on a box without a GPU could see it.
+  // Every operand therefore lives until after the download.
+  std::unique_ptr<DevBuf> db;
+  if (bias != nullptr) {
+    db = std::make_unique<DevBuf>(
+        *backend, q, vt::Tensor::Contiguous(nullptr, vt::DType::kF32, q.device, {cout}),
+        bias->size() * sizeof(float), bias->data());
+  }
+  vt::Conv3d(q, dout.tensor(), dx.tensor(), dw.tensor(), db ? &db->tensor() : nullptr, args);
+  dout.Download(q, out->data());
+}
+
 // CausalConv3d (convolution.py:266-317). Two things that are NOT interchangeable
 // with MiniMax-H3's causal Conv3d:
 //   * the temporal pad REPLICATES FRAME 0 `k_t - 1` times (H3 pads with zeros);
@@ -143,8 +247,8 @@ int64_t SpatialIndex(int64_t index, int64_t size, Ltx2PaddingMode mode, bool* ze
 // calls the strided `nn.Conv3d` (convolution.py:305-312), so a stride-2 temporal
 // convolution still prepends TWO frames, not one. The video ENCODER is the only
 // caller that passes a stride; every decoder call site keeps the defaults.
-Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool causal,
-                    Ltx2PaddingMode mode, const std::vector<float>& weight,
+Volume CausalConv3d(vt::Queue* queue, const Volume& in, int64_t out_channels, int64_t kernel,
+                    bool causal, Ltx2PaddingMode mode, const std::vector<float>& weight,
                     const std::vector<float>* bias, int64_t stride_t = 1, int64_t stride_h = 1,
                     int64_t stride_w = 1) {
   const int64_t ci = in.channels;
@@ -195,67 +299,39 @@ Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool
   VT_CHECK(pt >= kernel && ph >= kernel && pw >= kernel && out.t > 0 && out.h > 0 && out.w > 0,
            "ltx2 conv3d: empty output");
   out.data.resize(static_cast<size_t>(out_channels * out.spatial()));
-  // THE PARALLEL AXIS IS THE OUTPUT LINE (oc, ti, hi), AND THAT CHOICE IS THE
-  // WHOLE OF THIS ROW'S RISK (#1009, .agents/specs/ltx25-decode-threads.md).
+  // THE REDUCTION IS DISPATCHED, NOT WRITTEN HERE (#1007, W5). It used to be a
+  // `ParallelForRows` loop in this function, and the whole of what moved is
+  // WHERE it runs: `vt::Conv3d` on the queue this decode was given, whose CPU
+  // arm (src/vt/cpu/cpu_conv3d.cpp) is that loop transcribed with no arithmetic
+  // change. The order is the op's published contract now — one f32 accumulator
+  // per output element SEEDED WITH THE BIAS, then one f32 PARTIAL PER INPUT
+  // CHANNEL swept (kt, kh, kw) — so this file's goldens are a real regression
+  // gate on the MOVE rather than a re-baselined one: deleting the dispatch below
+  // reds 12 of test_ltx2_vae's 44 cases, decoder and encoder alike.
   //
-  // `Volume::At(oc, ti, hi, wi)` is `((oc*t + ti)*h + hi)*w + wi`, so row `r` is
-  // exactly the contiguous span [r*out.w, (r+1)*out.w) of `out.data`: no output
-  // element is written by more than one worker. And the entire `ci * kernel^3`
-  // reduction below stays inside one `wi` iteration of one row, so a worker
-  // executes precisely the serial arm's instruction sequence, in the serial
-  // arm's order, for every element it owns. The result is therefore bit-identical
-  // at any thread count AND under any row-to-thread assignment — which matters,
-  // because ParallelForRows STEALS work through an atomic cursor and the
-  // assignment is genuinely non-deterministic run to run.
+  // They are NOT the gate on the ORDER, and the difference matters. Mutating the
+  // CPU kernel to a flat accumulator leaves test_ltx2_vae at 44/44 GREEN and
+  // reds only tests/vt/test_ops_conv3d.cpp, which carries a case for exactly
+  // this. The 5.00679e-06 figure recorded above is a mutation that ALSO narrowed
+  // the accumulator width; order alone does not move these goldens at their
+  // fixture scale.
   //
-  // Splitting the REDUCTION axis `ic` into per-thread partials would also be a
-  // legal convolution, and it is deliberately not taken: it would make the
-  // summation order a function of the thread count, which is the defect #1008
-  // spent its whole budget removing. `cpu_conv2d.cpp:75-78` partitions 2-D
-  // convolution the same way, and `cpu_threadpool.h:39-43` states the contract
-  // for the whole CPU backend.
-  const int64_t rows = out_channels * out.t * out.h;
-  vt::cpu::ParallelForRows(vt::cpu::CurrentThreadpool(), rows, [&](int64_t r0, int64_t r1) {
-    for (int64_t r = r0; r < r1; ++r) {
-      const int64_t hi = r % out.h;
-      const int64_t ti = (r / out.h) % out.t;
-      const int64_t oc = r / (out.h * out.t);
-      for (int64_t wi = 0; wi < out.w; ++wi) {
-        // f32, because that is the width `nn.Conv3d` accumulates in — MEASURED,
-        // not assumed: F.conv3d returns 0.0 on the separable reduction in
-        // tests/vllm/models/test_ltx2_vae.cpp for f32 AND for bf16 tensors,
-        // where an f64 accumulator returns 2.5 (#1008).
-        float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0f;
-        for (int64_t ic = 0; ic < ci; ++ic) {
-          // BLOCKED, one partial sum per input channel, and this is the ORDER
-          // as well as the width. A single naive serial f32 sum over all
-          // `ci * kernel^3` taps accumulates error with sqrt of the whole
-          // length; splitting it into `ci` blocks of `kernel^3` accumulates
-          // with sqrt of each. That is not a local optimisation — torch's f32
-          // convolution is a blocked GEMM and sums exactly this way, which is
-          // why `torch.sum` on the separable reduction returns 2.0999999 where
-          // a naive serial f32 sum returns 0.0. Narrowing the width alone,
-          // with the naive order kept, pushed the non-causal tiled golden to
-          // 5.00679e-06 against a 5e-06 tolerance — MEASURED, and the reason
-          // this loop is shaped this way. The partition above does not touch it.
-          float tap = 0.0f;
-          for (int64_t a = 0; a < kernel; ++a) {
-            for (int64_t b = 0; b < kernel; ++b) {
-              for (int64_t d = 0; d < kernel; ++d) {
-                tap += padded[static_cast<size_t>(
-                           ((ic * pt + ti * stride_t + a) * ph + hi * stride_h + b) * pw +
-                           wi * stride_w + d)] *
-                       weight[static_cast<size_t>(
-                           (((oc * ci + ic) * kernel + a) * kernel + b) * kernel + d)];
-              }
-            }
-          }
-          acc += tap;
-        }
-        out.data[out.At(oc, ti, hi, wi)] = acc;
-      }
-    }
-  });
+  // WHY THE PAD IS STILL BUILT HERE, and is not an argument to the op. torch
+  // does the same: `nn.Conv3d` with a non-`zeros` `padding_mode` runs `F.pad`
+  // and then a ZERO-padded convolution, and upstream materialises the temporal
+  // pad itself with a `torch.concatenate` (convolution.py:305-311). So the op
+  // is handed an already-padded volume and `pad_* = 0`, and LTX's padding-mode
+  // enum stays out of a shared header.
+  //
+  // The parallel partition and the determinism argument that used to live here
+  // moved with the loop: src/vt/cpu/cpu_conv3d.cpp states them, and
+  // tests/vt/test_ops_conv3d.cpp gates them at 1/2/4/8 threads.
+  vt::Conv3dArgs args;
+  args.stride_t = stride_t;
+  args.stride_h = stride_h;
+  args.stride_w = stride_w;
+  Conv3dThroughSeam(queue, padded, ci, pt, ph, pw, weight, bias, out_channels, kernel, args,
+                    &out.data, out.t, out.h, out.w);
   return out;
 }
 
@@ -339,10 +415,16 @@ struct VideoConvSpec {
   // (conv_video_decoder.py:307); the encoder never passes it at all and so always
   // gets the `causal: bool = True` DEFAULT (convolution.py:304).
   bool causal = true;
+  // The device this decode runs on (#1007, W5). NULL means the CPU queue, NOT
+  // "the old host path": there is one code path and the device is a property of
+  // the queue. It lives on the SPEC rather than on nine call sites because the
+  // spec is already threaded to every one of them.
+  vt::Queue* queue = nullptr;
 };
 
-VideoConvSpec SpecOf(const Ltx2ConvVideoDecoderConfig& config) {
+VideoConvSpec SpecOf(const Ltx2ConvVideoDecoderConfig& config, vt::Queue* queue = nullptr) {
   VideoConvSpec spec;
+  spec.queue = queue;
   spec.norm_layer = config.norm_layer;
   spec.norm_num_groups = config.norm_num_groups;
   spec.norm_eps = config.norm_eps;
@@ -480,8 +562,8 @@ Volume ResnetBlock3d(const VideoConvSpec& config, const Ltx2VaeWeights& weights,
     ApplyAdaLn(hidden, weights.Get(prefix + ".scale_shift_table"), *timestep_embed, 4, 0, 1);
   }
   Silu(hidden.data);
-  hidden = CausalConv3d(hidden, out_channels, 3, config.causal, config.spatial_padding_mode,
-                        weights.Get(prefix + ".conv1.conv.weight"),
+  hidden = CausalConv3d(config.queue, hidden, out_channels, 3, config.causal,
+                        config.spatial_padding_mode, weights.Get(prefix + ".conv1.conv.weight"),
                         &weights.Get(prefix + ".conv1.conv.bias"));
   if (inject_noise) {
     FeedSpatialNoise(hidden, weights.Get(prefix + ".per_channel_scale1"), noise);
@@ -492,8 +574,8 @@ Volume ResnetBlock3d(const VideoConvSpec& config, const Ltx2VaeWeights& weights,
     ApplyAdaLn(hidden, weights.Get(prefix + ".scale_shift_table"), *timestep_embed, 4, 2, 3);
   }
   Silu(hidden.data);
-  hidden = CausalConv3d(hidden, out_channels, 3, config.causal, config.spatial_padding_mode,
-                        weights.Get(prefix + ".conv2.conv.weight"),
+  hidden = CausalConv3d(config.queue, hidden, out_channels, 3, config.causal,
+                        config.spatial_padding_mode, weights.Get(prefix + ".conv2.conv.weight"),
                         &weights.Get(prefix + ".conv2.conv.bias"));
   if (inject_noise) {
     FeedSpatialNoise(hidden, weights.Get(prefix + ".per_channel_scale2"), noise);
@@ -589,7 +671,8 @@ Volume DepthToSpaceUpsample(const VideoConvSpec& config, const Ltx2VaeWeights& w
     skip = st == 2 ? drop_first_frame(repeated) : repeated;
   }
 
-  Volume packed = CausalConv3d(x, conv_out_channels, 3, config.causal, config.spatial_padding_mode,
+  Volume packed = CausalConv3d(config.queue, x, conv_out_channels, 3, config.causal,
+                               config.spatial_padding_mode,
                                weights.Get(prefix + ".conv.conv.weight"),
                                &weights.Get(prefix + ".conv.conv.bias"));
   Volume out = expand(packed);
@@ -719,13 +802,14 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
                                     const Ltx2VaeWeights& weights,
                                     const std::vector<float>& latent, int64_t latent_channels,
                                     int64_t latent_t, int64_t latent_h, int64_t latent_w,
-                                    Ltx2NoiseStream* noise, const double* timestep) {
+                                    Ltx2NoiseStream* noise, const double* timestep,
+                                    vt::Queue* queue) {
   VT_CHECK(latent_channels == config.in_channels,
            "ltx2 video vae: latent channel count does not match in_channels");
   VT_CHECK(static_cast<int64_t>(latent.size()) == latent_channels * latent_t * latent_h * latent_w,
            "ltx2 video vae: latent size does not match [C, T, H, W]");
   const std::string p = config.prefix;
-  const VideoConvSpec spec = SpecOf(config);
+  const VideoConvSpec spec = SpecOf(config, queue);
 
   Volume x;
   x.channels = latent_channels;
@@ -793,7 +877,7 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
   // (conv_video_decoder.py:307), and that is `self.causal`, i.e. this config's
   // field. So `config.causal` is the value that belongs here; hardcoding `true`
   // would silently make a non-causal decoder pad one-sidedly.
-  x = CausalConv3d(x, config.base_channels * multiplier, 3, config.causal,
+  x = CausalConv3d(spec.queue, x, config.base_channels * multiplier, 3, config.causal,
                    config.spatial_padding_mode, weights.Get(p + "conv_in.conv.weight"),
                    &weights.Get(p + "conv_in.conv.bias"));
 
@@ -853,8 +937,9 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
     ApplyAdaLn(x, weights.Get(p + "last_scale_shift_table"), embed, 2, 0, 1);
   }
   Silu(x.data);
-  x = CausalConv3d(x, config.out_channels * config.patch_size * config.patch_size, 3, config.causal,
-                   config.spatial_padding_mode, weights.Get(p + "conv_out.conv.weight"),
+  x = CausalConv3d(spec.queue, x, config.out_channels * config.patch_size * config.patch_size, 3,
+                   config.causal, config.spatial_padding_mode,
+                   weights.Get(p + "conv_out.conv.weight"),
                    &weights.Get(p + "conv_out.conv.bias"));
 
   // --- unpatchify (ops.py:35-60): `b (c p r q) f h w -> b c (f p) (h q) (w r)`
@@ -892,7 +977,8 @@ Ltx2VideoFrames Ltx2VideoDecode(Ltx2VideoDecoderKind kind,
                                 const Ltx2ConvVideoDecoderConfig& config,
                                 const Ltx2VaeWeights& weights, const std::vector<float>& latent,
                                 int64_t latent_channels, int64_t latent_t, int64_t latent_h,
-                                int64_t latent_w, Ltx2NoiseStream* noise, const double* timestep) {
+                                int64_t latent_w, Ltx2NoiseStream* noise, const double* timestep,
+                                vt::Queue* queue) {
   // REFUSE, never downgrade: falling back to the conv decoder would return a
   // lower-quality render as if it were the requested one, and no gate this
   // project owns could detect that (.agents/specs/ltx-2-5.md section 0 item 2).
@@ -902,7 +988,7 @@ Ltx2VideoFrames Ltx2VideoDecode(Ltx2VideoDecoderKind kind,
            "neighborhood-attention kernel and has its own row. It is refused rather than "
            "downgraded to the Conv video VAE, which would silently return a worse render");
   return Ltx2ConvVideoDecode(config, weights, latent, latent_channels, latent_t, latent_h, latent_w,
-                             noise, timestep);
+                             noise, timestep, queue);
 }
 
 // ===========================================================================
@@ -1043,7 +1129,8 @@ Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& w
 
   // --- the conv branch, at stride 1, on the SAME duplicated input ---
   const Volume convolved =
-      CausalConv3d(grown, conv_out_channels, 3, spec.causal, spec.spatial_padding_mode,
+      CausalConv3d(spec.queue, grown, conv_out_channels, 3, spec.causal,
+                   spec.spatial_padding_mode,
                    weights.Get(prefix + ".conv.conv.weight"),
                    &weights.Get(prefix + ".conv.conv.bias"));
   Volume out = SpaceToDepthFold(convolved, st, sh, sw);
@@ -1057,8 +1144,9 @@ bool StartsWith(const std::string& value, const char* prefix) {
   return value.rfind(prefix, 0) == 0;
 }
 
-VideoConvSpec SpecOf(const Ltx2ConvVideoEncoderConfig& config) {
+VideoConvSpec SpecOf(const Ltx2ConvVideoEncoderConfig& config, vt::Queue* queue = nullptr) {
   VideoConvSpec spec;
+  spec.queue = queue;
   spec.norm_layer = config.norm_layer;
   spec.norm_num_groups = config.norm_num_groups;
   spec.norm_eps = config.norm_eps;
@@ -1154,7 +1242,7 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
 
   // --- patchify -> conv_in (video_vae.py:291-292) ---
   x = Patchify(x, config.patch_size);
-  x = CausalConv3d(x, config.out_channels, 3, spec.causal, spec.spatial_padding_mode,
+  x = CausalConv3d(spec.queue, x, config.out_channels, 3, spec.causal, spec.spatial_padding_mode,
                    weights.Get(p + "conv_in.conv.weight"), &weights.Get(p + "conv_in.conv.bias"));
 
   // --- the FORWARD block walk (video_vae.py:221-236, 294-295) ---
@@ -1182,7 +1270,7 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
       // the only one of the four that changes the channel count.
       const int64_t st = block.name == "compress_space" ? 1 : 2;
       const int64_t ss = block.name == "compress_time" ? 1 : 2;
-      x = CausalConv3d(x, out_channels, 3, spec.causal, spec.spatial_padding_mode,
+      x = CausalConv3d(spec.queue, x, out_channels, 3, spec.causal, spec.spatial_padding_mode,
                        weights.Get(bp + ".conv.weight"), &weights.Get(bp + ".conv.bias"), st, ss,
                        ss);
     } else if (block.name == "compress_all_res" || block.name == "compress_space_res" ||
@@ -1212,7 +1300,7 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
              config.latent_log_var == Ltx2LogVarianceType::kConstant) {
     conv_out_channels += 1;
   }
-  x = CausalConv3d(x, conv_out_channels, 3, spec.causal, spec.spatial_padding_mode,
+  x = CausalConv3d(spec.queue, x, conv_out_channels, 3, spec.causal, spec.spatial_padding_mode,
                    weights.Get(p + "conv_out.conv.weight"), &weights.Get(p + "conv_out.conv.bias"));
 
   // --- the log-variance fix-ups and the mean split (video_vae.py:301-336) ---

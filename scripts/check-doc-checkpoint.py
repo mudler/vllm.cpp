@@ -53,17 +53,74 @@ ROW_TABLES = (
 # An accepted or retracted measurement is a claim too, even without a state move.
 MEASUREMENT_RECORDS = (".agents/benchmark-record.md",)
 
+# WHAT COUNTS AS A LIFECYCLE STATE. These two tuples are the whole definition,
+# and a state missing from BOTH is not mislabelled -- row_states DROPS the row
+# and transitions() iterates the AFTER map, so leaving the resolved set is
+# silent by construction.
+#
+# 2026-08-21 (GATE-DOC-CHECKPOINT-STATES, #1434): +PARTIAL. It was absent while
+# being the second most used state in the matrices -- 118 backticked cells at
+# 947e5f648 against 77 for DONE -- so READY -> PARTIAL and PARTIAL -> READY both
+# returned rc 0, and PARTIAL -> ACTIVE red for the wrong reason, calling a row
+# that had existed for months `added as ACTIVE`. Admitting it takes the resolved
+# population over ROW_TABLES from 153 rows to 226.
+#
+# STATES are the CLAIM states: a move between two of them is something
+# docs/STATUS.md carries a term for. `Partial` is on that page (docs/STATUS.md:39).
 STATES = (
     "TODO",
     "READY",
     "ACTIVE",
     "GATING",
+    "PARTIAL",
     "BLOCKED",
     "DONE",
     "DROPPED",
     "N/A",
 )
+
+# RECORD states are real lifecycle positions that the public pages carry NO term
+# for. .agents/feature-matrix.md:14-20 names all three: INVENTORIED and SPIKE are
+# pre-claim, and ANCHOR-BACKFILL is a property of the RECORD -- "a legacy
+# implemented row without exact code, test and real-spec anchors" -- so the
+# capability is already implemented and only the row's anchors are missing.
+#
+# 2026-08-21, W2 of the same row: they are RESOLVED but not CLASSIFIED as claims.
+# The earlier reading (recorded in doc-checkpoint-lifecycle-states.md `## Owed`)
+# was that paying the `## Now` half needed REQUIRED to carry a spec-only class.
+# That premise was wrong, and measuring it is what closed the residual:
+# spec_now_errors() is called from errors_for() DIRECTLY, never through classify()
+# or REQUIRED, so the spec-only obligation already existed. The only reason an
+# ANCHOR-BACKFILL move was unobserved is that row_states DROPPED the row before
+# any of it ran. So the fix is resolution, not a new REQUIRED class: these three
+# states resolve, a move that touches one is a record move, and a record move
+# owes its spec's `## Now` and NOT (STATUS, BENCHMARKS) -- which would be a
+# public-document edit with nothing true to write, the exact shape this file's
+# header records as the reason for the rewrite.
+#
+# Resolution takes the population over ROW_TABLES from 226 rows to 793.
+RECORD_STATES = ("INVENTORIED", "SPIKE", "ANCHOR-BACKFILL")
+
+LIFECYCLE_STATES = STATES + RECORD_STATES
+
 STATE_CELL = re.compile(r"`(" + "|".join(re.escape(s) for s in STATES) + r")`")
+
+# A record state counts only where it OPENS a markdown cell, which a claim state
+# is not required to do. That asymmetry is measured, not stylistic. row_states
+# takes the LAST backticked state on the line because earlier ones belong to the
+# evidence columns, and the evidence prose in this repository narrates record
+# states far more often than claim ones -- "the row stays `SPIKE`" appears mid
+# sentence on two model rows whose real State cells read `BLOCKED` and `ACTIVE`.
+# Matching those anywhere on the line resolved both rows to `SPIKE` and would
+# have turned a correct resolution into a wrong one. Cell-anchored, the same two
+# rows keep their true states, and the two rows the widening REPAIRS
+# (engine-matrix KV-EXTERNAL-CACHE ACTIVE -> ANCHOR-BACKFILL, quantization-matrix
+# QUANT-GGUF-PRESETS READY -> INVENTORIED) still resolve correctly. Measured over
+# all 793 rows against a column-position proxy: 12 of 226 resolutions disagreed
+# with it before, 10 of 793 after, and no previously-correct row regresses.
+RECORD_CELL = re.compile(
+    r"\|\s*`(" + "|".join(re.escape(s) for s in RECORD_STATES) + r")`"
+)
 ROW_ID = re.compile(r"^\|\s*`([A-Z0-9][A-Za-z0-9_.-]*)`")
 
 # Support-surface triggers. These four records ARE the claim, so editing one is
@@ -106,6 +163,18 @@ USER_USAGE_PREFIXES = (
 # README permission and obligation come only from underlying landing sources.
 # Co-edited public projections can NEVER justify README churn -- that rule is
 # deliberate and directly tested.
+#
+# docs/QUICKSTART.md joined the set on 2026-08-20 (#1520). Every other member is
+# something the README QUOTES: the mission, the build entry point, the demo
+# numbers, the two example mains. The quickstart page is the same relation with
+# the direction made explicit -- the README `## Quickstart` block stopped
+# carrying the commands and now points at that page, so the claim "this is where
+# a reader starts" changed BECAUSE the page exists. It is a source, not a
+# projection: nothing else records what it says, and the README defers to it.
+#
+# This admits exactly one document and no class. docs/BUILD.md, docs/STATUS.md
+# and every other page under docs/ still cannot license a README claim change,
+# which tests/scripts/test_doc_checkpoint.py pins directly.
 LANDING_SOURCE_FILES = frozenset(
     {
         ".agents/mission.md",
@@ -113,6 +182,7 @@ LANDING_SOURCE_FILES = frozenset(
         "benchmarks/demo/footprint_gb10.json",
         "benchmarks/demo/qwen36_27b_c1_c32.json",
         "benchmarks/demo/vulkan_27b_llamacpp.json",
+        "docs/QUICKSTART.md",
         "examples/cli/main.cpp",
         "examples/server/main.cpp",
     }
@@ -133,13 +203,24 @@ def blob(revision: str, path: str) -> str:
 
 
 def row_states(text: str) -> dict[str, str]:
-    """Map row ID -> lifecycle state for every keyed row in a table."""
+    """Map row ID -> lifecycle state for every keyed row in a table.
+
+    A cell-anchored RECORD state wins outright, because a row whose State cell
+    reads `INVENTORIED`, `SPIKE` or `ANCHOR-BACKFILL` is by definition making no
+    claim, and resolving it to a claim state mentioned later in its evidence
+    prose is the one error that makes this gate demand the wrong surfaces. See
+    the RECORD_CELL comment for the measurement behind the asymmetry.
+    """
     states: dict[str, str] = {}
     for line in text.splitlines():
         if not line.startswith("|"):
             continue
         identifier = ROW_ID.match(line)
         if not identifier:
+            continue
+        record = RECORD_CELL.findall(line)
+        if record:
+            states[identifier.group(1)] = record[-1]
             continue
         cells = STATE_CELL.findall(line)
         if cells:
@@ -153,20 +234,55 @@ SPEC_LINK = re.compile(r"\.agents/specs/([A-Za-z0-9_.-]+\.md)|\(specs/([A-Za-z0-
 NOW_SECTION = re.compile(r"^##\s+Now\s*$", re.MULTILINE)
 
 
-def moved_rows(paths: set[str], before: str, after: str) -> dict[str, str]:
-    """Map row ID -> the table it moved in, for every lifecycle move."""
-    moved: dict[str, str] = {}
+# A row absent from the BEFORE map is only a claim once it arrives in one of
+# these.
+#
+# 2026-08-21, W2 (#1434): +PARTIAL, which OVERTURNS the exclusion the first wave
+# pinned. That exclusion rested on an unmeasured premise -- "the dominant real
+# cause of a row being absent from BEFORE is a record RELOCATION between
+# matrices" -- and the premise is false here. Replayed over the 400 non-merge
+# commits ending at e2a9e035d, 126 of which touch a row table: 45 arrivals, ALL
+# of them genuinely new (the row ID was in no other ROW_TABLE beforehand), ZERO
+# relocations, and ZERO departures. Two of the 45 arrived as PARTIAL, so the
+# case the exclusion protected does not occur and the case it hid does.
+#
+# `Partial` is a docs/STATUS.md term (:39), so a row arriving in it asserts
+# exactly what that page projects: a usable path with named missing behavior.
+#
+# The record states stay out for the opposite and still-sound reason: a row
+# arriving as INVENTORIED or SPIKE has no prior position and claims nothing.
+CLAIM_ON_ARRIVAL = frozenset({"ACTIVE", "GATING", "DONE", "PARTIAL"})
+
+CLAIM = "claim"
+RECORD = "record"
+
+
+def transitions(
+    paths: set[str], before: str, after: str
+) -> list[tuple[str, str, str | None, str, str]]:
+    """Every lifecycle move, as (table, row, previous, state, kind).
+
+    `kind` is CLAIM when both endpoints are states docs/STATUS.md has a term for,
+    and RECORD when either endpoint is one it does not. A RECORD move is still a
+    lifecycle move -- AGENTS.md `## Public documents` owes the moved row spec's
+    `## Now` for ANY state change -- it simply owes nothing the public pages
+    could truthfully say.
+    """
+    moves: list[tuple[str, str, str | None, str, str]] = []
     for path in sorted(paths & set(ROW_TABLES)):
         old = row_states(blob(before, path))
         new = row_states(blob(after, path))
         for row, state in sorted(new.items()):
             previous = old.get(row)
             if previous is None:
-                if state in {"ACTIVE", "GATING", "DONE"}:
-                    moved[row] = path
-            elif previous != state:
-                moved[row] = path
-    return moved
+                if state in CLAIM_ON_ARRIVAL:
+                    moves.append((path, row, None, state, CLAIM))
+                continue
+            if previous == state:
+                continue
+            kind = CLAIM if previous in STATES and state in STATES else RECORD
+            moves.append((path, row, previous, state, kind))
+    return moves
 
 
 def spec_for_row(text: str, row: str) -> str | None:
@@ -191,13 +307,22 @@ def spec_now_errors(paths: set[str], before: str, after: str) -> list[str]:
     moving it here is the whole point: a spec has ONE writer, so the requirement
     stops serialising every concurrent PR through one shared digest.
 
-    Reported, never inferred: a row whose matrix line links no spec is an error
-    naming the row, not a silent pass.
+    Reported, never inferred for a CLAIM move: a row whose matrix line links no
+    spec is an error naming the row, not a silent pass. A RECORD move is the one
+    exception, and the loop below carries the count behind it.
     """
     errors: list[str] = []
-    for row, table in sorted(moved_rows(paths, before, after).items()):
+    for table, row, _previous, _state, kind in transitions(paths, before, after):
         spec = spec_for_row(blob(after, table), row)
         if spec is None:
+            if kind == RECORD:
+                # A pre-claim row links a `CLAIM-*`, not a spec: 416 of the 463
+                # INVENTORIED rows link no spec at all, by protocol rather than
+                # by omission. Demanding one here would demand a document
+                # .agents/feature-matrix.md says does not exist yet. The `## Now`
+                # obligation still binds every record row that DOES link a spec,
+                # which is 50 of 56 ANCHOR-BACKFILL rows and 52 of 52 SPIKE rows.
+                continue
             errors.append(
                 f"{table}: {row} moved lifecycle state but its row links no spec, "
                 "so there is nowhere to record what happens next; add the "
@@ -231,20 +356,19 @@ def spec_now_errors(paths: set[str], before: str, after: str) -> list[str]:
 
 
 def lifecycle_moves(paths: set[str], before: str, after: str) -> list[str]:
-    """Return 'ROW: OLD -> NEW' for every row that changed lifecycle state."""
-    moves: list[str] = []
-    for path in sorted(paths & set(ROW_TABLES)):
-        old = row_states(blob(before, path))
-        new = row_states(blob(after, path))
-        for row, state in sorted(new.items()):
-            previous = old.get(row)
-            if previous is None:
-                # A brand new row only counts once it is making a claim.
-                if state in {"ACTIVE", "GATING", "DONE"}:
-                    moves.append(f"{path}: {row} added as {state}")
-            elif previous != state:
-                moves.append(f"{path}: {row} {previous} -> {state}")
-    return moves
+    """Return 'ROW: OLD -> NEW' for every CLAIM move.
+
+    Record moves are deliberately absent: this list is what makes classify() add
+    the "lifecycle" class, and that class is (STATUS, BENCHMARKS). They are
+    reported by spec_now_errors instead, which owes only the row's own spec.
+    """
+    return [
+        f"{path}: {row} added as {state}"
+        if previous is None
+        else f"{path}: {row} {previous} -> {state}"
+        for path, row, previous, state, kind in transitions(paths, before, after)
+        if kind == CLAIM
+    ]
 
 
 MARKDOWN_LINK_TARGET = re.compile(r"\]\([^)]*\)")

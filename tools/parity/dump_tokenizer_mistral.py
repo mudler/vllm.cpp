@@ -7,11 +7,11 @@ spaces with U+2581, a byte-fallback vocab of `<0xNN>` tokens, and a
 `TemplateProcessing` post-processor prepending BOS=1). The C++
 `Tokenizer::FromHfJson` must reproduce these ids byte-for-byte.
 
-Runs against the pinned vLLM 0.25.0 oracle's HF `tokenizers` on dgx.casa
+Runs against the pinned vLLM 0.25.0 oracle's HF `tokenizers` on the gate host
 (SACRED goldens) OR locally with any recent `tokenizers` (it matches, since
 vLLM tokenizes through the identical HF backend):
 
-    ssh dgx.casa 'cd ~/work/vllm.cpp && ~/venvs/vllm-oracle/bin/python \
+    ssh "${GATE_HOST}" 'cd "${GATE_CHECKOUT}" && "${VLLM_ORACLE}"/bin/python \
       tools/parity/dump_tokenizer_mistral.py'
 
 Copies the tokenizer.json into the golden dir (the C++ test loads THAT copy, so

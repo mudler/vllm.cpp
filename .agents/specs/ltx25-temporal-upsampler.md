@@ -271,6 +271,25 @@ the measurement rather than picked to fit.
 
 Nothing in `docs/` may say more than that.
 
+**SUPERSEDED 2026-08-20 on both of its claims, by `LTX25-DFR-ROUNDS`
+([#986](https://github.com/mudler/vllm.cpp/issues/986)).** The paragraph above is
+kept as written, because it was true of this row and of the tree it measured.
+What replaced it:
+
+> The temporal x2 latent upsampler is **DRIVEN** by DFR's temporal rounds loop,
+> reachable from `vllm_video_generate` with `pipeline_kind=dfr` and
+> `temporal_upsample_rounds > 0`, and from `ltx2-gen --temporal-upsample-rounds`.
+> The gate is still at REDUCED DIMENSIONS against a fixture checkpoint.
+
+And the second claim went stale on its own, without anybody editing code:
+`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` **IS on the NAS**,
+mtime 2026-08-17, 261944000 bytes, 72 BF16 tensors, config
+`spatial_upsample: false, temporal_upsample: true`, verified by header arithmetic
+rather than by name. It arrived one day after the "re-verified 2026-08-16" that
+several records in this campaign carry. A real-weight result still does not
+exist, but the reason is now the missing `keyframe_slot_sft` BASE and not the
+upsampler — see [`ltx25-dfr-rounds.md`](ltx25-dfr-rounds.md) §0.3 and §0.4.
+
 ## 8. Outcome
 
 **Ported and gated. Not reachable from any shipped pipeline.** §7's sentence

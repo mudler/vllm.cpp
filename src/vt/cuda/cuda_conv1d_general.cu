@@ -13,7 +13,9 @@
 // instantiated at minimax_music3_vocoder.py:42,44,55,89,98 and LTX-2.5
 // audio_vae/vocoder.py:104-184. The CPU provider
 // (src/vt/cpu/cpu_conv1d_general.cpp) is the numeric reference these must agree
-// with, because it is the host loop the committed goldens were taken through.
+// with, and both arms accumulate in f32 — the width torch accumulates a float
+// convolution in, and the width the four consumers' goldens were generated at
+// (VT-CONV1D-F32-ACC, #1474; before it both arms were f64).
 //
 // THE ONE DESIGN DECISION WORTH READING: both kernels are GATHER form, one
 // thread per OUTPUT element, and each thread walks its inputs in the SAME ORDER
@@ -28,15 +30,15 @@
 // a destination cell `p` and ask which additions land in it, in what order: `ic`
 // ascending, then `t` ascending, and for each `t` at most ONE tap `k`, namely
 // the one with `t*stride + k*dilation == p`. So a thread that owns `p` and sweeps
-// `ic` then `t` in increasing order performs the identical sequence of f64
-// additions into the identical f64 accumulator. Not "within a tolerance" —
+// `ic` then `t` in increasing order performs the identical sequence of f32
+// additions into the identical f32 accumulator. Not "within a tolerance" —
 // the same additions in the same order.
 //
 // Two details that are load-bearing rather than cosmetic:
 //   * the `value == 0.0` SKIP is reproduced exactly. It is not an optimisation:
 //     dropping it changes the sign of a zero output cell, because
 //     (-0.0) + (+0.0) == +0.0 while (-0.0) left alone stays -0.0.
-//   * the accumulator is f64, and the bias is added LAST for the transposed op
+//   * the accumulator is f32, and the bias is added LAST for the transposed op
 //     and FIRST for the forward one, matching each host loop respectively.
 //
 // That leaves exactly ONE way the two arms could still disagree: FMA
@@ -46,9 +48,9 @@
 // `-ffp-contract=off` precisely so two textually identical reductions cannot
 // compile one contracted and one not. nvcc has no such pin (its `-fmad` default
 // is on and its flags are separate), so the device side pins itself, locally and
-// visibly, with `__dmul_rn` / `__dadd_rn`.
+// visibly, with `__fmul_rn` / `__fadd_rn`.
 //
-// With that, every arithmetic operation on both arms is an IEEE-754 double
+// With that, every arithmetic operation on both arms is an IEEE-754 single
 // multiply or add with round-to-nearest-even, performed in the same order on the
 // same values. The arms are BIT-IDENTICAL, and the gate asserts `memcmp`
 // equality rather than a tolerance — tests/vt/test_ops_conv1d_general.cpp,
@@ -57,8 +59,16 @@
 // a transposed weight axis, a dropped zero-skip, a reassociated sweep — lands
 // well inside any epsilon anyone would write.
 //
-// f32 in memory, f64 in the accumulator: see include/vt/ops.h at vt::Conv1d for
-// why that widening is deliberate and what it costs (nothing in bytes moved).
+// f32 in memory AND in the accumulator: see include/vt/ops.h at vt::Conv1d for
+// why that width mirrors torch and how it was measured.
+//
+// THIS FILE HAS NOT BEEN COMPILED OR RUN AT THE NARROWED WIDTH. #1474 was taken
+// on a box with no CUDA toolkit and no fleet lease, so the `memcmp` claim above
+// rests on the construction — one accumulator per output cell, the same order,
+// non-contracted intrinsics, now at f32 on both arms — and not on a
+// measurement. That is the same debt .agents/specs/minimax-music3.md §18.9
+// already carries for #1334's tiled host kernel, which has also never been
+// compiled against this arm. .agents/specs/vt-conv1d-f32-accumulator.md §7.
 //
 // SELF-REGISTERING translation unit in the established additive pattern
 // (src/vt/cuda/cuda_glue.cu, src/vt/cuda/cuda_layernorm.cu): no existing kernel
@@ -117,21 +127,20 @@ __global__ void Conv1dKernelCudaImpl(float* __restrict__ out, const float* __res
     const int64_t g = oc / p.out_per_group;
     const float* xn = x + n * p.in_channels * p.in_len;
 
-    double acc = bias != nullptr ? static_cast<double>(bias[oc]) : 0.0;
+    float acc = bias != nullptr ? bias[oc] : 0.0F;
     for (int64_t ic = 0; ic < p.in_per_group; ++ic) {
       const int64_t src_c = g * p.in_per_group + ic;
       const float* wc = w + (oc * p.in_per_group + ic) * p.kernel;
       for (int64_t k = 0; k < p.kernel; ++k) {
         const int64_t pos = t * p.stride - p.padding + k * p.dilation;
         if (pos < 0 || pos >= p.in_len) continue;
-        // __dmul_rn/__dadd_rn, never `a += b * c`: see the file header. nvcc
+        // __fmul_rn/__fadd_rn, never `a += b * c`: see the file header. nvcc
         // would contract the latter into an fma and break byte agreement with
         // the -ffp-contract=off host provider.
-        acc = __dadd_rn(acc, __dmul_rn(static_cast<double>(xn[src_c * p.in_len + pos]),
-                                       static_cast<double>(wc[k])));
+        acc = __fadd_rn(acc, __fmul_rn(xn[src_c * p.in_len + pos], wc[k]));
       }
     }
-    out[row * p.out_len + t] = static_cast<float>(acc);
+    out[row * p.out_len + t] = acc;
   }
 }
 
@@ -155,7 +164,7 @@ __global__ void ConvTranspose1dKernelCudaImpl(float* __restrict__ out, const flo
     const float* xn = x + n * p.in_channels * p.in_len;
 
     const int64_t pos = t_out + p.padding;
-    double acc = 0.0;
+    float acc = 0.0F;
     if (pos < full) {
       // t*stride + k*dilation == pos, with 0 <= k < kernel and 0 <= t < in_len.
       const int64_t span = p.dilation * (p.kernel - 1);
@@ -170,18 +179,18 @@ __global__ void ConvTranspose1dKernelCudaImpl(float* __restrict__ out, const flo
         for (int64_t t = t_lo; t <= t_hi; ++t) {
           const int64_t off = pos - t * p.stride;
           if (off % p.dilation != 0) continue;
-          const double value = xc[t];
+          const float value = xc[t];
           // The host loop skips a zero input BEFORE touching the destination;
           // reproducing that is what keeps the sign of a zero cell.
-          if (value == 0.0) continue;
+          if (value == 0.0F) continue;
           // Non-contracted, as in Conv1dKernelCudaImpl above.
-          acc = __dadd_rn(acc, __dmul_rn(value, static_cast<double>(wc[off / p.dilation])));
+          acc = __fadd_rn(acc, __fmul_rn(value, wc[off / p.dilation]));
         }
       }
     }
     // Bias added LAST, matching the host scatter's crop-then-bias tail.
-    if (bias != nullptr) acc = __dadd_rn(acc, static_cast<double>(bias[dst_c]));
-    out[row * p.out_len + t_out] = static_cast<float>(acc);
+    if (bias != nullptr) acc = __fadd_rn(acc, bias[dst_c]);
+    out[row * p.out_len + t_out] = acc;
   }
 }
 

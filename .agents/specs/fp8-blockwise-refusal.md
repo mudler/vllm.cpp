@@ -29,11 +29,11 @@ scheme means.
 
 This tree stops on that checkpoint, so the defect is not wrong numerics. It
 stops on the wrong sentence. `LoadAttnDense` branches on the weight dtype alone
-(`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:479`), so an
+(`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:480`), so an
 `F8_E4M3` block-wise projection enters the per-tensor arm at `:480`, and
 `LoadFp8Raw` (`src/vllm/model_executor/models/qwen3_5_weights.cpp:449`) asks for
 `<proj>.weight_scale` at `:458`. The checkpoint spells that tensor
-`weight_scale_inv`, so the resolver lambda at `qwen3_5_dense_weights.cpp:682`
+`weight_scale_inv`, so the resolver lambda at `qwen3_5_dense_weights.cpp:683`
 raises
 
 ```
@@ -181,13 +181,46 @@ pull request with the spec committed first.
 
 ## Owed
 
-- Block-wise FP8 execution itself. Reading `weight_scale_inv`, dequantizing or
-  applying a 128x128 block scale, and the dynamic per-token activation quant
-  upstream pairs with it (`fp8.py:301-310`). This is the arm the refusal names,
-  it needs a GPU gate and a checkpoint, and it has no row yet. Tracked by
-  [#1166](https://github.com/mudler/vllm.cpp/issues/1166), which stays open
-  after this change lands, because this change makes the gap legible and does
-  not close it.
+- ~~Block-wise FP8 execution itself.~~ **DELIVERED** by the #1189 milestones,
+  which this row's refusal made legible: `ad5f175e7` (M1, the dynamic per-token
+  group quant upstream pairs with it, `fp8.py:301-310`), `770e49486` (M2, the CPU
+  reference GEMM), `09597106e` (M3, the `weight_scale_inv` load),
+  `281b4bc76` (M4, the linear method and the dense forward that reads it),
+  `489a9a4c0` (M5, the mainloop-scaled CUTLASS kernel) and `836c13c35` (M6, the
+  merged `gate_up` and QKV). What this row refused by name is now executed.
+  [#1166](https://github.com/mudler/vllm.cpp/issues/1166) and
+  [#1189](https://github.com/mudler/vllm.cpp/issues/1189) both stay OPEN, because
+  the remaining debt is not the code:
+  **the CUDA kernel has never executed on hardware and there is no token gate
+  against `Qwen/Qwen3.8-27B-FP8`.** That is recorded in
+  `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` and is not narrowed here.
+- Eight more places still say the block-wise FP8 CUDA kernel is owed, outside
+  the eight comment anchors [#1396](https://github.com/mudler/vllm.cpp/issues/1396)
+  corrected. Three are LIVE refusal messages that tell a user on an unsupported
+  CUDA arch to wait for milestone M5, which landed at `489a9a4c0`
+  (`layers/quantization/fp8_block_quant.cpp:188-190`;
+  `models/dense_fp8_block_gemm.h:200-202` in the `MatmulFp8BlockScaledD`
+  guard; and `:428-430` in the shared `CheckFp8BlockMergedActivation` helper
+  that both `MatmulFp8BlockMergedD` and `Fp8BlockGateUpSwiGLUD` call, so that
+  message also fires on the merged `gate_up` path and not only on QKV -- a
+  fixer who looks in `MatmulFp8BlockMergedD` will not find it). Five are
+  comments (`include/vt/ops.h:1637,1658`, `src/vt/cpu/cpu_ops.cpp:668`,
+  `include/vt/merged_gemm.h:92`,
+  `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:605`,
+  `tests/vllm/model_executor/models/test_fp8_block_linear.cpp:267`). The
+  measurement `include/vt/ops.h:1637` names is still genuinely owed, so that one
+  is a tense defect and not a retired obligation. Found by the fresh review of
+  #1396 and left unfixed there rather than widening a comment-only change.
+  A ninth place, the `RefuseUnrunnableQwen3_5DenseFp8Block` comment block in
+  `qwen3_5_dense_weights.cpp`, WAS fixed in flow by #1396 and is no longer owed.
+  It carries no line anchor here because #1396 edits that same block. It
+  claimed `MatmulFp8BlockScaledD` reads each of the ten projections when it
+  reads eight, because `qwen3_5.cpp` reaches those ten through three entry
+  points -- `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj_fp8_block`
+  and `up_proj_fp8_block`, and `MatmulFp8BlockMergedD` reads q/k/v as one
+  operand.
+  Tracked by [#1411](https://github.com/mudler/vllm.cpp/issues/1411), which this
+  row owns.
 - `ReadF32Scalar` (`src/vllm/model_executor/models/qwen3_5_weights.cpp:312`)
   bounds its input with `t.nbytes >= sizeof(float)`, a lower bound, and returns
   the first 4 bytes. A multi-element scale passes that check and reads as block

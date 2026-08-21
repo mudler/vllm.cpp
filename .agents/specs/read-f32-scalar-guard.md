@@ -79,7 +79,7 @@ differently and a sixth model file reaches it.
 | Definition | dtype checked | element count checked |
 |---|---|---|
 | `src/vllm/model_executor/models/qwen3_5_weights.cpp:312` `ReadF32Scalar` | no | no |
-| `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:37` `ReadF32Scalar` | no | no |
+| `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:38` `ReadF32Scalar` | no | no |
 | `include/vllm/model_executor/models/dense_weight_loaders.h:376` `ReadCtF32Scalar` | no | no |
 | `src/vllm/model_executor/models/laguna_weights.cpp:249` `LnReadF32Scalar` | yes | no |
 | `src/vllm/model_executor/models/laguna_shared_fp4.cpp:73` `ShReadF32Scalar` | yes | no |
@@ -104,13 +104,13 @@ REACHED by one, and that is the second finding below.
 | `qwen3_5_weights.cpp:459` `LoadFp8Raw` | `<proj>.input_scale` | F32 scalar |
 | `qwen3_5_weights.cpp:480` `LoadFp8Transposed` | `<proj>.weight_scale` | F32 scalar |
 | `qwen3_5_weights.cpp:510` `LoadNvfp4Raw` | `<proj>.weight_scale_2` | F32 scalar (ModelOpt) |
-| `qwen3_5_dense_weights.cpp:180` `LoadCtNvfp4Raw` | `<proj>.weight_global_scale` | F32 scalar (CT divisor) |
-| `qwen3_5_dense_weights.cpp:193` `LoadCtNvfp4Raw` | `<proj>.input_global_scale` | F32 scalar (CT divisor) |
-| `qwen3_5_dense_weights.cpp:305` `LoadLmHeadAnyDtype` | `<name>_scale_2` | F32 scalar (ModelOpt) |
-| `qwen3_5_dense_weights.cpp:312` `LoadLmHeadAnyDtype` | `<name>_global_scale` | F32 scalar (CT) |
-| `qwen3_5_dense_weights.cpp:377` `LoadModelOptNvfp4Raw` | `<proj>.weight_scale_2` | F32 scalar |
-| `qwen3_5_dense_weights.cpp:393` `LoadModelOptNvfp4Raw` | `<proj>.input_scale` | F32 scalar, behind `VT_MODELOPT_W4A4` |
-| `qwen3_5_dense_weights.cpp:611` | `<proj>.weight_global_scale` | F32 scalar (CT) |
+| `qwen3_5_dense_weights.cpp:181` `LoadCtNvfp4Raw` | `<proj>.weight_global_scale` | F32 scalar (CT divisor) |
+| `qwen3_5_dense_weights.cpp:194` `LoadCtNvfp4Raw` | `<proj>.input_global_scale` | F32 scalar (CT divisor) |
+| `qwen3_5_dense_weights.cpp:306` `LoadLmHeadAnyDtype` | `<name>_scale_2` | F32 scalar (ModelOpt) |
+| `qwen3_5_dense_weights.cpp:313` `LoadLmHeadAnyDtype` | `<name>_global_scale` | F32 scalar (CT) |
+| `qwen3_5_dense_weights.cpp:378` `LoadModelOptNvfp4Raw` | `<proj>.weight_scale_2` | F32 scalar |
+| `qwen3_5_dense_weights.cpp:394` `LoadModelOptNvfp4Raw` | `<proj>.input_scale` | F32 scalar, behind `VT_MODELOPT_W4A4` |
+| `qwen3_5_dense_weights.cpp:612` | `<proj>.weight_global_scale` | F32 scalar (CT) |
 | `dense_weight_loaders.h:421` `LoadCtNvfp4W4A16` | `<proj>.weight_global_scale` | F32 scalar (CT) |
 | `laguna_weights.cpp:296` `LnLoadCtNvfp4Raw` | `<proj>.weight_global_scale` | F32 scalar |
 | `laguna_weights.cpp:303` `LnLoadCtNvfp4Raw` | `<proj>.input_global_scale` | F32 scalar |
@@ -149,11 +149,11 @@ true for the class, and the tree already documents the counterexample.
 @`ccdaab7e` "went FP8 across the whole tower with BF16 per-output-channel
 scales", and `docs/BENCHMARKS.md:52` records the same revision as "the same repo
 name re-quantized to FP8 W8A8 throughout, not NVFP4".
-`qwen3_5_dense_weights.cpp:258` names that layout again for `lm_head`, where it
+`qwen3_5_dense_weights.cpp:259` names that layout again for `lm_head`, where it
 is handled correctly.
 
 `LoadAttnDense` branches on the weight dtype alone
-(`qwen3_5_dense_weights.cpp:478-480`), so an `F8_E4M3` projection of that
+(`qwen3_5_dense_weights.cpp:479-481`), so an `F8_E4M3` projection of that
 checkpoint enters the per-tensor arm and `LoadFp8Raw` reads
 `<proj>.weight_scale` through the unchecked reader. A `BF16 [out, 1]` scale
 there is read as element `(0, 0)` of the wrong dtype: both defects at once, on a
@@ -161,7 +161,7 @@ real published revision, with the tensor NAME the loader asked for. Naming luck
 does not protect this one, because nothing is misspelled.
 
 No recorded gate covers it. Every recorded 27B NVFP4 measurement ran
-@`890bdef7` (`qwen3_5_dense_weights.cpp:227-229`, `docs/BENCHMARKS.md:52`), and
+@`890bdef7` (`qwen3_5_dense_weights.cpp:228-230`, `docs/BENCHMARKS.md:52`), and
 @`ccdaab7e` is documented as historically rejected by the bf16 dense loader.
 So this row turns a silent wrong scale into a named refusal on a path no gate
 was reading. The per-output-channel FP8 arm itself is a separate capability and

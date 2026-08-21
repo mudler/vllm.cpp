@@ -4,11 +4,14 @@
 // DF-ENGINE-INTEGRATION.
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"
 
+#include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"
+
 #include <cstddef>
 
 #include "vt/backend.h"
 
 namespace vllm::v1 {
+
 
 std::vector<std::vector<int32_t>> SampleDflashBlockDrafts(
     const std::vector<float>& block_logits, int num_reqs, int k,
@@ -69,14 +72,46 @@ DflashProposeResult DflashProposeBlock(
   // The context-aware (1+k) block forward (D3): PrecomputeContextKV the accumulated
   // combined features + attend the block over [context; block] per request. Returns
   // [num_reqs*(1+k), draft_vocab] f32 draft logits (lm_head applied).
+  //
+  // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out`, the
+  // post-final-norm hidden the candidate selector's `hidden_projection` reads.
+  // Upstream's `_generate_draft` gets both from one forward for the same reason
+  // -- the selector must project the SAME hidden states the logits came from,
+  // and a second forward would be a second model state.
+  const bool dflash2 = weights.IsDflash2();
+  std::vector<float> block_hidden;
   const std::vector<float> block_logits =
       Qwen3DFlashModel::ForwardBlockLogitsWithContext(
           context_states, context_positions, ctx_cu, block_input_ids,
-          block_positions, block_cu, weights, config, queue);
+          block_positions, block_cu, weights, config, queue, nullptr,
+          dflash2 ? &block_hidden : nullptr);
 
+  // SPEC-DFLASH2 W4 (#1314): the conv (W2), the CANDIDATE SELECTOR (W3) and the
+  // PATH WALK (W4) all run for a DFlash2 draft, and the walk -- not the DFlash1
+  // per-slot argmax below -- is what produces its tokens. Same sequence as
+  // upstream's `DFlash2Speculator._generate_draft`, and the same call as
+  // `GPUModelRunner::propose_drafts_block`: one implementation, two entries.
   DflashProposeResult out;
-  out.draft_token_ids = SampleDflashBlockDrafts(block_logits, num_reqs, k,
-                                                weights.draft_vocab_size);
+  if (dflash2) {
+    std::vector<int32_t> anchors(static_cast<size_t>(num_reqs));
+    for (int r = 0; r < num_reqs; ++r)
+      anchors[static_cast<size_t>(r)] =
+          block_input_ids[static_cast<size_t>(static_cast<int64_t>(r) * block)];
+    const Dflash2ProposeState selected = Dflash2SelectCandidates(
+        block_logits, block_hidden, anchors, num_reqs, k, weights, config, queue);
+    out.draft_token_ids = Dflash2WalkPath(selected, queue).draft_token_ids;
+  }
+
+  // The DFlash1 arm. It is entered on emptiness rather than on `!dflash2` so
+  // that DELETING the walk above lands here instead of falling past an else --
+  // and `RefuseDflash1ArgmaxOnDflash2Block` then makes that loud. A DFlash2
+  // block sampled by the per-slot argmax succeeds and loses only acceptance,
+  // which no token gate can see.
+  if (out.draft_token_ids.empty()) {
+    RefuseDflash1ArgmaxOnDflash2Block(weights);
+    out.draft_token_ids = SampleDflashBlockDrafts(block_logits, num_reqs, k,
+                                                  weights.draft_vocab_size);
+  }
   return out;
 }
 

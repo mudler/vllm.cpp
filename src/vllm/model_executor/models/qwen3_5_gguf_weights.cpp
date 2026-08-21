@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -702,15 +703,12 @@ std::vector<Nvfp4Weight> OwnGgufNvfp4Experts(const GgufFile& g,
   return out;
 }
 
-// The PURE routing decision, WITHOUT firing the audit hook. Call sites that must
-// look at a tensor's fate before choosing which loader to run use this, so the
-// tensor is still audited EXACTLY ONCE by whichever loader they then call. Same
-// pattern (and same reason) as the tied-head probe in LoadEmbedAndHead.
-GgufResidency PeekRoute(const GgufLoadPolicy& pol, const GgufTensorInfo& t,
-                        GgufTensorRole role) {
-  return RouteGgufTensor(pol.keep_quant, pol.keep_f16, pol.nvfp4_fp4,
-                         pol.cpu_ref, role, t.ggml_type, t.shape);
-}
+// `PeekRoute` — the pure routing decision without the audit hook — used to live
+// here, next to its first caller (the tied-head probe in LoadEmbedAndHead uses
+// the same pattern). It now lives in `gguf_keep_quant.h` beside the routing
+// function it delegates to, because the load-time device-fit lane asks the same
+// question of the same expert towers and one decision may have only one
+// description. These call sites bind to `vllm::PeekRoute` unchanged.
 
 // A policy copy with the fp4 residency DISABLED, for the call sites whose
 // consumer is an OwnedTensor and has no `Nvfp4Weight` field to fill: the
@@ -988,7 +986,7 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
 // at startup. Correctness first; the sharing is an RSS optimization that only
 // pays on a tied file, which neither gate model is.
 void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& g, OwnedTensor* embed,
-                                    OwnedTensor* head) {
+                                    OwnedTensor* head, bool* head_was_quantized) {
   const std::string kEmbed = "token_embd.weight";
   VT_CHECK(HasTensor(g, kEmbed),
            "gguf shared head: the target file has no " + kEmbed +
@@ -1006,6 +1004,10 @@ void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& g, OwnedTensor* embed,
            "gguf shared head: " + head_name + " must be 2-D");
   *head = OwnBf16(g, head_name, ht.shape);  // [N = vocab, K = H]
   head->nk = true;
+  // A scalar ggml type packs ONE element per "block"; anything else is
+  // block-quantized and `OwnBf16` above dequantized it. SPEC-DFLASH2 W3 (#1314).
+  if (head_was_quantized != nullptr)
+    *head_was_quantized = GgmlTraits(ht.ggml_type).block_elems != 1;
 }
 
 // --- weights -------------------------------------------------------------
@@ -1530,6 +1532,187 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
     w.layers.push_back(std::move(layer));
   }
   return w;
+}
+
+// ─── Tensor accounting (QUANT-QWEN38-27B-GGUF-ARM, issue #821) ──────────────
+
+bool IsQwen3_5Gguf(const GgufFile& gguf) {
+  const GgufValue* arch_v = gguf.FindKv("general.architecture");
+  if (arch_v == nullptr || arch_v->TypeId() != kGgufString) return false;
+  const std::string& arch = std::get<std::string>(arch_v->v);
+  return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next";
+}
+
+namespace {
+
+// The MTP head depth this CHECKPOINT declares, which is ZERO when it declares
+// none.
+//
+// `NumMtpLayers` answers 1 for an absent key, because it answers "how deep is
+// the head" for a spec resolver that already knows there is one. Accounting is
+// asking a different question — "does this file ship one at all" — and reusing
+// the first answer would enumerate a drafter block on every head-less GGUF and
+// then report its eleven tensors as missing. `HfConfigFromGguf` publishes the
+// key only when `<arch>.nextn_predict_layers` is set and positive, so its
+// PRESENCE is the checkpoint's own statement.
+int64_t DeclaredMtpDepth(const HfConfig& config) {
+  const nlohmann::json& text =
+      (config.raw.is_object() && config.raw.contains("text_config") &&
+       config.raw.at("text_config").is_object())
+          ? config.raw.at("text_config")
+          : config.raw;
+  if (!text.is_object() || !text.contains("mtp_num_hidden_layers")) return 0;
+  const int64_t n = NumMtpLayers(config);
+  return n > 0 ? n : 0;
+}
+
+// One block's names, exactly as the loaders above read them: the two norms,
+// the attention family the layer's KIND selects, and the MLP the architecture
+// selects.
+void AppendBlockTensors(int64_t il, bool linear_attention, bool moe,
+                        std::vector<std::string>* out) {
+  out->push_back(Blk(il, "attn_norm.weight"));
+  out->push_back(Blk(il, "post_attention_norm.weight"));
+  if (linear_attention) {
+    // LoadGdnGguf, in its own order.
+    for (const char* stem :
+         {"attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight",
+          "ssm_alpha.weight", "ssm_conv1d.weight", "ssm_out.weight", "ssm_a",
+          "ssm_dt.bias", "ssm_norm.weight"}) {
+      out->push_back(Blk(il, stem));
+    }
+  } else {
+    // LoadAttnGguf.
+    for (const char* stem :
+         {"attn_q.weight", "attn_k.weight", "attn_v.weight",
+          "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"}) {
+      out->push_back(Blk(il, stem));
+    }
+  }
+  if (moe) {
+    // LoadMoeGguf.
+    for (const char* stem :
+         {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
+          "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+          "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+          "ffn_down_shexp.weight"}) {
+      out->push_back(Blk(il, stem));
+    }
+  } else {
+    for (const char* stem :
+         {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}) {
+      out->push_back(Blk(il, stem));
+    }
+  }
+}
+
+}  // namespace
+
+std::vector<std::string> Qwen3_5GgufExpectedTensors(const HfConfig& config,
+                                                    bool has_output_weight) {
+  const bool moe = config.num_experts > 0;
+  std::vector<std::string> out;
+
+  // LoadEmbedAndHead + the trunk's final norm. `output.weight` is absent on a
+  // tied-embedding export (llama.cpp TENSOR_DUPLICATED), where the head IS
+  // token_embd, so it is expected only when the file ships it.
+  out.emplace_back("token_embd.weight");
+  if (has_output_weight) out.emplace_back("output.weight");
+  out.emplace_back("output_norm.weight");
+
+  for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
+    const bool linear =
+        il < static_cast<int64_t>(config.layer_types.size()) &&
+        config.layer_types[static_cast<size_t>(il)] == "linear_attention";
+    AppendBlockTensors(il, linear, moe, &out);
+  }
+
+  // LoadQwen3_5MTPFromGguf. llama.cpp's converter folds the head into the block
+  // list at `blk.{num_hidden_layers + i}`, with the four scalar `nextn.*`
+  // tensors on the FIRST head block. The head block is always FULL ATTENTION —
+  // it is a transformer block over the fused [embedding; hidden] state — so it
+  // is not looked up in `layer_types`, which covers only the trunk.
+  const int64_t n_mtp = DeclaredMtpDepth(config);
+  const int64_t L = config.num_hidden_layers;
+  if (n_mtp > 0) {
+    for (const char* stem :
+         {"nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+          "nextn.shared_head_norm.weight"}) {
+      out.push_back(Blk(L, stem));
+    }
+    for (int64_t i = 0; i < n_mtp; ++i) {
+      AppendBlockTensors(L + i, /*linear_attention=*/false, moe, &out);
+    }
+  }
+  return out;
+}
+
+Qwen3_5GgufAccounting Qwen3_5GgufAccountTensors(
+    const HfConfig& config, const std::vector<std::string>& present) {
+  const std::set<std::string> have(present.begin(), present.end());
+  const std::vector<std::string> want =
+      Qwen3_5GgufExpectedTensors(config, have.count("output.weight") != 0);
+  const std::set<std::string> wanted(want.begin(), want.end());
+
+  Qwen3_5GgufAccounting out;
+  out.enumerated = static_cast<int64_t>(wanted.size());
+  out.present = static_cast<int64_t>(have.size());
+  for (const std::string& name : wanted) {
+    if (have.count(name) == 0) out.missing.push_back(name);
+  }
+  for (const std::string& name : have) {
+    if (wanted.count(name) != 0) continue;
+    // An NVFP4 sidecar belongs to the weight it scales, and whether it exists
+    // is a property of that weight's ENCODING rather than of the architecture,
+    // so it is accounted by its stem instead of being enumerated.
+    bool sidecar = false;
+    for (const char* suffix : {".scale", ".input_scale"}) {
+      const std::string s(suffix);
+      if (name.size() <= s.size()) continue;
+      if (name.compare(name.size() - s.size(), s.size(), s) != 0) continue;
+      if (wanted.count(name.substr(0, name.size() - s.size()) + ".weight") != 0) {
+        sidecar = true;
+        break;
+      }
+    }
+    if (!sidecar) out.unaccounted.push_back(name);
+  }
+  return out;
+}
+
+void RefuseUnaccountedQwen3_5Gguf(const GgufFile& gguf,
+                                  const HfConfig& config) {
+  std::vector<std::string> present;
+  present.reserve(gguf.Tensors().size());
+  for (const GgufTensorInfo& t : gguf.Tensors()) present.push_back(t.name);
+  const Qwen3_5GgufAccounting acct = Qwen3_5GgufAccountTensors(config, present);
+  if (acct.unaccounted.empty()) return;
+
+  // Name them, up to a bound: a 65th-block defect produces ten and a
+  // wholly-misread file produces hundreds, and a message that scrolls is a
+  // message nobody reads.
+  constexpr size_t kMaxNamed = 12;
+  std::string names;
+  for (size_t i = 0; i < acct.unaccounted.size() && i < kMaxNamed; ++i) {
+    names += (i == 0 ? "" : ", ") + acct.unaccounted[i];
+  }
+  if (acct.unaccounted.size() > kMaxNamed) {
+    names += ", ... (" + std::to_string(acct.unaccounted.size() - kMaxNamed) +
+             " more)";
+  }
+  VT_CHECK(false,
+           "qwen3_5 gguf: this file carries " +
+               std::to_string(acct.unaccounted.size()) +
+               " tensor(s) that NOTHING in this loader reads, out of " +
+               std::to_string(acct.present) + " present against " +
+               std::to_string(acct.enumerated) + " enumerated for " +
+               std::to_string(config.num_hidden_layers) + " trunk layers + " +
+               std::to_string(DeclaredMtpDepth(config)) +
+               " MTP block(s): " + names +
+               ". Loading it would leave those weights out of the graph "
+               "SILENTLY. Check <arch>.block_count against "
+               "<arch>.nextn_predict_layers, and see "
+               ".agents/specs/qwen38-27b-quant-arms.md");
 }
 
 }  // namespace vllm

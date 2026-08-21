@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -160,6 +161,36 @@ struct GraphBreakStats {
   int64_t segments_captured = 0;
   int64_t breaks_registered = 0;
   int64_t replays = 0;  // BreakableGraph::Replay calls
+  // ACTIVE scopes opened in each mode. ENG-CUDAGRAPH-BREAK W3 (#1291) added
+  // these because the mode was UNOBSERVABLE from outside a driver, and the mode
+  // is the difference between one graph and one eager attention call per layer.
+  //
+  // W2 could gate its driver's mode only because `qwen3.cpp` registers a
+  // `vt::GraphBreak`, so `breaks_registered` moved in one mode and not the
+  // other. The three drivers W3 migrated register none — the one production
+  // break point in the tree is W1's — so for them `breaks_registered` is 0 in
+  // BOTH modes and a `== 0` assertion cannot tell them apart. Measured: flipping
+  // `kFull` to `kPiecewise` in `qwen3_moe.cpp` compiled clean and left that
+  // driver's whole gate GREEN, 226/226. A guard that holds under the mutation it
+  // names is a mute switch, so the mode is now a counter rather than an
+  // inference from a side effect.
+  //
+  // They count ACTIVE scopes only. An inert scope (no capture support, or
+  // `VLLM_CPP_CUDAGRAPH=0`) captures nothing in either mode, so counting it
+  // would make the number report a mode that never reached a backend.
+  int64_t full_scopes = 0;
+  int64_t piecewise_scopes = 0;
+  // D10, the auxiliary-stream fork set. ENG-CUDAGRAPH-BREAK W5 (#1335) added
+  // these for the same reason W3 added the mode counters: the rule is invisible
+  // from outside the scope, and a guard nothing can observe is a guard nothing
+  // can prove. `forks_tracked` counts `GraphNoteFork` registrations that reached
+  // an ACTIVE scope; `forks_auto_joined` counts the forks the scope itself had
+  // to join because they were still outstanding when a segment closed. The
+  // second is the one that matters: it is ZERO for a model that joins its own
+  // fork inside the segment, and non-zero exactly when the seam did the work
+  // upstream's `_end_current_segment` (`:353-361`) does.
+  int64_t forks_tracked = 0;
+  int64_t forks_auto_joined = 0;
 };
 GraphBreakStats GetGraphBreakStats();
 void ResetGraphBreakStats();
@@ -171,6 +202,40 @@ void ResetGraphBreakStats();
 bool GraphCaptureEnabled();
 
 class GraphCaptureScope;
+
+// ---------------------------------------------------------------------------
+// vt::GraphCaptureMode — WHICH of vLLM's two capture modes this scope is.
+// Port of `CUDAGraphMode` (`vllm/config/compilation.py:59-63` @ pin
+// `5559679229`); the runtime selection is `decode_mode()`/`mixed_mode()`
+// (`:65-69`), read per batch at `vllm/v1/worker/gpu/cudagraph_utils.py:185-186`.
+// ---------------------------------------------------------------------------
+//
+// THE BOUNDARY AND THE MODE ARE TWO DIFFERENT QUESTIONS, and W1 shipped only
+// one of them. `splitting_ops` says WHERE a graph may be split; `cudagraph_mode`
+// says WHETHER this batch's graph is split at all. vLLM's v1 default is
+// `FULL_AND_PIECEWISE = (FULL, PIECEWISE)` (`:63`), documented at `:630-632` as
+// "Capture full cudagraph for DECODE batches and piecewise cudagraph for prefill
+// and mixed prefill-decode batches", and `decode_mode()` returns `value[0]`, so
+// a uniform decode batch upstream gets ONE graph with attention INSIDE it. The
+// secondary oracle agrees: SGLang reaches its breakable graph through
+// `--cuda-graph-backend-prefill=breakable`
+// (`test_breakable_cuda_graph.py:279-281` @ `f63458b5be`) — prefill, not decode.
+//
+// So a capture scope has to carry the mode, and a DECODE driver has to open it
+// in `kFull`. Without this a migrated decode driver would convert a fully
+// graphed decode step into one eager attention call per layer, which is not
+// vLLM's decode behaviour and which nothing in this row's record supports. This
+// is a MIRRORING requirement, not a performance argument: the row claims no
+// throughput and measures none, and `kFull` is what keeps a migrated decode
+// step's shape the one it already had.
+//
+// `kPiecewise` is the default because it is the mode the seam was built for and
+// the one every unit case exercises; a scope that means `kFull` says so.
+enum class GraphCaptureMode {
+  kPiecewise,  // CUDAGraphMode.PIECEWISE (`:60`): every GraphBreak splits.
+  kFull,       // CUDAGraphMode.FULL (`:61`): GraphBreak runs its function INSIDE
+               // the single segment and splits nothing.
+};
 
 // ---------------------------------------------------------------------------
 // vt::BreakableGraph — the segment container. Port of `BreakableCUDAGraph`
@@ -201,9 +266,51 @@ class BreakableGraph {
   void Replay(Queue& q);
 
   size_t segment_count() const { return segments_.size(); }
+  // THE OPAQUE HANDLE OF ONE SEGMENT, for a caller that must hand it to a
+  // profiler or a debugger. It is NOT an invitation to interpret it: spec
+  // `## Risks/decisions` D4 requires every acquisition and release to go through
+  // `Backend::EndCaptureGraph` and `Backend::DestroyGraph` so
+  // ENG-CUDAGRAPH-DEDUP (#1162) can interpose at the backend without editing
+  // this container. The one caller is the `VT_BENCH_PROFILE_CONTROL` replay
+  // marker in `qwen3_5.cpp`, which is a bench-only build.
+  void* segment(size_t i) const { return i < segments_.size() ? segments_[i] : nullptr; }
   size_t break_count() const { return break_fns_.size(); }
   bool captured() const { return !segments_.empty(); }
   int64_t replay_count() const { return replays_; }
+
+  // WHY A DRAINED CAPTURE HAS TO SAY SO, and why a bool would not do.
+  //
+  // `~GraphCaptureScope` must swallow (a destructor that propagates
+  // terminates), so after a FAILED capture the container reports exactly what an
+  // INERT scope reports: `captured() == false`. Those two states mean OPPOSITE
+  // things to the caller. An inert scope ran the forward EAGERLY, so the values
+  // the caller holds are real. A failed capture ran NOTHING: under stream
+  // capture every operation between `BeginCapture` and the failure was RECORDED,
+  // not executed, so the caller's buffers hold whatever the allocator last left
+  // there. A driver that reads only `captured()` returns uncomputed device
+  // memory as its step's result — silently wrong numbers, no fault, and a token
+  // gate cannot see it. That is the defect this accessor exists to make
+  // impossible to write, and it was a live HIGH in the first driver migration.
+  //
+  // TWO ACCESSORS AND NOT ONE, because the drain has two arms and only one of
+  // them can name the cause. `capture_failed()` is the state a caller branches
+  // on. `capture_error()` is the ORIGINAL exception when the seam holds it, so
+  // the caller rethrows the runtime's own diagnosis instead of inventing one.
+  //
+  // It is EMPTY on the other arm, and the reason is a language rule rather than
+  // an omission: when the scope is abandoned because an exception is propagating
+  // THROUGH it, no handler has been entered yet, so `std::current_exception()`
+  // in the destructor returns null ([propagation]/7 — it names the currently
+  // HANDLED exception). Fabricating a stand-in there would be a message that
+  // describes nothing. It costs nothing either, because on that arm the real
+  // exception is already propagating to the caller under its own power; the
+  // arm a caller can actually observe and must branch on is the throwing close.
+  //
+  // Both are cleared by `Reset()` and at the start of every fresh capture,
+  // because a failure that outlives the graph it describes is a verdict nobody
+  // can trust twice.
+  bool capture_failed() const { return capture_failed_; }
+  const std::exception_ptr& capture_error() const { return capture_error_; }
 
   // Releases every segment through Backend::DestroyGraph, clears the breaks, and
   // returns the container to its as-constructed state — replay count included,
@@ -217,6 +324,8 @@ class BreakableGraph {
   std::vector<void*> segments_;
   std::vector<std::function<void()>> break_fns_;
   int64_t replays_ = 0;
+  bool capture_failed_ = false;
+  std::exception_ptr capture_error_;
 };
 
 // ---------------------------------------------------------------------------
@@ -258,6 +367,13 @@ class BreakableGraph {
 // capture must never be reported as `captured()`, because a partial capture is
 // replayable, and replaying half a forward is silently wrong numerics.
 //
+// A DRAIN IS NOT A RECOVERY, and the container says which one happened. The
+// failure is recorded on the container as `capture_failed()`, with the swallowed
+// exception as `capture_error()` where the seam holds it, so the caller can tell
+// a capture that FAILED from a scope that was INERT — two states the drain
+// otherwise leaves identical and whose meanings are opposite. See those
+// accessors for what reading only `captured()` costs.
+//
 // THE DRAIN'S LIMIT, stated because it is not obvious. It compares
 // `std::uncaught_exceptions()` against the depth at entry, so it sees an
 // exception that is PROPAGATING at scope exit. An exception CAUGHT INSIDE the
@@ -267,12 +383,19 @@ class BreakableGraph {
 // inside a capture scope. Owed to W2 in the spec's `## Owed`.
 class GraphCaptureScope {
  public:
-  GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out);
+  explicit GraphCaptureScope(Backend& b, Queue& q, BreakableGraph& out,
+                             GraphCaptureMode mode = GraphCaptureMode::kPiecewise);
   ~GraphCaptureScope();
   GraphCaptureScope(const GraphCaptureScope&) = delete;
   GraphCaptureScope& operator=(const GraphCaptureScope&) = delete;
 
   bool active() const { return active_; }
+  GraphCaptureMode mode() const { return mode_; }
+  // Whether a `GraphBreak` inside this scope splits the capture. FALSE for an
+  // inert scope AND for a `kFull` one, and those are different states: an inert
+  // scope captures nothing, while a `kFull` scope captures the break's work
+  // INSIDE its single segment. `GraphBreak` needs only the one question.
+  bool splits() const { return active_ && mode_ == GraphCaptureMode::kPiecewise; }
   static GraphCaptureScope* Current();
 
   Backend& backend() const { return *b_; }
@@ -296,10 +419,42 @@ class GraphCaptureScope {
   // share an address — and the cell is what actually aliases.
   void AppendBreak(std::function<void()> fn, const void* destination);
 
+  // ---------------------------------------------------------------------
+  // D10 — THE OUTSTANDING-FORK SET. Port of upstream's `wait_stream` hook
+  // (`:101-153`, installed `:310`, removed `:332`) and of the auto-join inside
+  // `_end_current_segment` (`:353-361`).
+  // ---------------------------------------------------------------------
+  //
+  // WHY THIS EXISTS. Closing a segment while a side stream forked inside it is
+  // still participating in the capture is illegal: `cudaStreamEndCapture` fails
+  // on a capture graph with an unjoined fork. Upstream keeps the whole
+  // `torch.cuda.Stream.wait_stream` monkey-patch for no other purpose than to
+  // know WHICH streams are outstanding, then joins them itself before
+  // `capture_end()`.
+  //
+  // WHY OURS IS CHEAPER. Our fork and join are explicit `Backend::RecordEvent`
+  // and `Backend::QueueWaitEvent` calls on a seam we control, not an implicit
+  // torch API, so the model TELLS the scope instead of the scope patching the
+  // runtime. `NoteFork` registers; `NoteJoin` retires the registration when the
+  // model joined the queue itself, which is the common case and the one that
+  // must cost nothing.
+  //
+  // `join_event` is the event the scope RECORDS on `aux` and then WAITS on the
+  // capture queue if it still has to join. It must outlive this scope — the
+  // natural owner is the capture driver that created the queue, which is what
+  // `laguna.cpp`'s `LagunaGraph` does with `aux_done` (created in the
+  // constructor, destroyed in the destructor). Registering an event that dies
+  // first is lifetime rule 2 at the `GraphBreak` declaration, applied to an
+  // event instead of a buffer.
+  void NoteFork(Queue& aux, Event& join_event);
+  void NoteJoin(Queue& aux);
+  size_t outstanding_forks() const { return forks_.size(); }
+
  private:
   Backend* b_;
   Queue* q_;
   BreakableGraph* g_;
+  GraphCaptureMode mode_ = GraphCaptureMode::kPiecewise;
   bool active_ = false;
   bool segment_open_ = false;
   int uncaught_on_entry_ = 0;
@@ -307,7 +462,36 @@ class GraphCaptureScope {
   // this capture. A capture has as many breaks as the model has split points,
   // so a linear scan here is cheaper than the map that would replace it.
   std::vector<const void*> destinations_;
+  // The forks registered since this segment opened and not yet retired. One
+  // entry per outstanding side queue; a model forks as many queues as it has
+  // overlap paths, so a linear scan is cheaper than the map that would replace
+  // it — the same argument `destinations_` makes.
+  struct ForkedQueue {
+    Queue* q;
+    Event* e;
+  };
+  std::vector<ForkedQueue> forks_;
+  // Joins every outstanding fork onto the capture queue and clears the set.
+  // Called by `EndSegment` BEFORE `Backend::EndCaptureGraph`.
+  void JoinOutstandingForks();
 };
+
+// ---------------------------------------------------------------------------
+// vt::GraphNoteFork / vt::GraphNoteJoin — the D10 registration at the SITE.
+// ---------------------------------------------------------------------------
+//
+// Same shape as `GraphBreak`: OUTSIDE a capture scope both are no-ops making
+// ZERO backend calls, so a non-capturing forward is byte-identical to today.
+// Inside an ACTIVE scope `GraphNoteFork` adds the queue to the outstanding set
+// and `GraphNoteJoin` retires it.
+//
+// THE MODEL STILL ISSUES ITS OWN FORK AND JOIN. These do not replace
+// `Backend::RecordEvent` / `Backend::QueueWaitEvent`; they tell the scope that
+// a fork is open, so the scope can close the window if a segment ends before
+// the model's own join runs. A model that always joins inside its segment sees
+// `forks_auto_joined == 0` and pays two vector operations.
+void GraphNoteFork(Queue& aux, Event& join_event);
+void GraphNoteJoin(Queue& aux);
 
 // ---------------------------------------------------------------------------
 // vt::GraphBreak — the break point. Port of `eager_on_graph` (`:204-243`),
@@ -367,7 +551,7 @@ void GraphBreak();
 template <class Fn, class = std::enable_if_t<std::is_void_v<decltype(std::declval<Fn&>()())>>>
 void GraphBreak(Fn&& fn) {
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     fn();  // pass-through: byte-identical to today, zero backend calls
     detail::CountBreakPoint();
     return;
@@ -399,7 +583,7 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
                 "the following segment baked, or use the in-place form GraphBreak(fn), or "
                 "ask for the non-copyable fallback explicitly with vt::NoWriteback{}.");
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     *out = fn();  // pass-through: a move, never a copy, and the cell stays unpinned
     detail::CountBreakPoint();
     return;
@@ -432,7 +616,7 @@ void GraphBreak(Fn&& fn, BreakSlot<Out>& out) {
 template <class Fn, class Out>
 void GraphBreak(Fn&& fn, BreakSlot<Out>& out, NoWriteback) {
   GraphCaptureScope* s = GraphCaptureScope::Current();
-  if (s == nullptr || !s->active()) {
+  if (s == nullptr || !s->splits()) {
     *out = fn();
     detail::CountBreakPoint();
     return;

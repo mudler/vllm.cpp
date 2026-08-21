@@ -290,4 +290,10 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
   return r;
 }
 
+GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
+                        GgufTensorRole role) {
+  return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
+                         policy.cpu_ref, role, tensor.ggml_type, tensor.shape);
+}
+
 }  // namespace vllm

@@ -47,6 +47,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "support/process_id.h"
+
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 
@@ -65,7 +67,7 @@ class ScratchDraft {
   explicit ScratchDraft(const std::string& config_json) {
     static int counter = 0;
     dir_ = fs::temp_directory_path() /
-           ("vllmcpp_dspark_guard_" + std::to_string(::getpid()) + "_" +
+           ("vllmcpp_dspark_guard_" + std::to_string(vllm_test::ProcessId()) + "_" +
             std::to_string(counter++));
     fs::create_directories(dir_);
     std::ofstream out(dir_ / "config.json");

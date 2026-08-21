@@ -65,7 +65,14 @@ stamps a recorded caveat rather than passing silently — the GPU, driver, maxim
 SM clock, applications clock and persistence mode are compared across the arms
 unconditionally, because a waived boot is not a waived machine. Within a run the
 SM-clock spread must stay at or below **5%**, and the two arms' medians within
-**1%** of each other. A window must also have been **observed**: at least **30
+**1%** of each other — and their **means** within 1% too, which is a separate
+rule and not a restatement: on the three 2026-08-19 Qwen3.8-27B c1 pairings the
+median offset reads exactly **0.00%** on all three while the arms' mean clocks
+are 0.10 to 0.25 points apart, because the excursion population sits below the
+median and is the part that does not cancel between the arms (#1546). Throughput
+is an integral over the window, so the mean is what transfers. A record captured
+before that term carries no mean and is refused rather than skipped, so an
+archived evidence tree has to be re-recorded rather than re-summarized. A window must also have been **observed**: at least **30
 retained busy samples** and a **majority** of the window busy, because the
 spread over one sample is definitionally 0.00% — the best score the gate can
 award — so without a floor the window nobody watched outscores the one that was.
@@ -80,6 +87,14 @@ available on `dgx`, and `-lgc` is supported:
 sudo nvidia-smi -lgc 2100        # pin, before the first leg
 sudo nvidia-smi -rgc             # release, after the last one
 ```
+
+**This works on the host path only.** Inside an `rc` lease `nvidia-smi -lgc`
+returns `LGC_RC=4`, "The current user does not have permission to change
+clocks", even as root, measured 2026-08-19 on `dgx:gpu0` in three jobs. Fleet
+devices are reachable by lease only, so for them the SM clock can be SAMPLED and
+not pinned, and a pairing may be refused on within-run spread with no lever to
+fix it. Read
+[`environment.md`](environment.md) before you plan a paired series.
 
 Pinning is a **shared-host mutation**. Never run `-lgc` or `-rgc` while another
 session holds `$HOME/gpu.lock` — it silently reprices their in-flight

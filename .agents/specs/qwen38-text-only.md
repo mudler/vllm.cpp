@@ -137,7 +137,7 @@ published Qwen bf16 MoE repo**.
 
 **The dense/MoE asymmetry is real and must not be flattened.**
 `LoadQwen3_5Dense` DOES route BF16 vs FP8 vs NVFP4 per projection by tensor
-presence (`qwen3_5_dense_weights.cpp:354-360,472-503`, and
+presence (`qwen3_5_dense_weights.cpp:355-361,473-504`, and
 `LoadDenseLmHead`/`LoadLmHeadAnyDtype` at `:215-233,515-547`), so the DENSE
 text-only arm may genuinely load a flat bf16 checkpoint. Only the MoE arm
 cannot. Any statement about "the text-only arms" that does not make that

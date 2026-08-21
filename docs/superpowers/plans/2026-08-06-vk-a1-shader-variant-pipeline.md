@@ -1091,7 +1091,7 @@ MSG
 is correct. Change the feature-matrix row to:
 
 ```markdown
-| `BACKEND-VULKAN` | Vulkan | `ACTIVE` | gated skeleton: 8 of the CPU backend's 83 registered ops, no model runs | [backend matrix](backend-matrix.md) |
+| `BACKEND-VULKAN` | Vulkan | `ACTIVE` | gated skeleton: 8 of the CPU backend's 83 registered ops, no model runs | [backend matrix](../../../.agents/backend-matrix.md) |
 ```
 
 - [ ] **Step 2: Verify the two matrices now agree**

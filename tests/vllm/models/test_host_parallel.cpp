@@ -8,14 +8,28 @@
 // that claim.
 //
 // WHAT THE ORACLE IS, AND WHY IT IS NOT THE SHIPPED CODE. Each case compares
-// the shipped function against `SerialLinearNoBias` / `SerialConvTranspose1d`
-// below, which are VERBATIM copies of the loops as they stood at `d9441ef3`
-// — the commit every MiniMax-Music3 gate was taken on. Comparing the shipped
-// function to itself at two thread counts would prove only that it is
-// deterministic; it would pass just as happily if the pivot had reassociated
-// every sum, because a consistently reassociated sum is still consistent. The
-// pre-change code is the only oracle that can see that, so it is carried here
-// rather than referenced.
+// the shipped function against `SerialLinearNoBias` / `SerialConv1d` /
+// `SerialConvTranspose1d` below. Comparing the shipped function to itself at
+// two thread counts would prove only that it is deterministic; it would pass
+// just as happily if the pivot had reassociated every sum, because a
+// consistently reassociated sum is still consistent. A separate scalar
+// transcription of the declared order is the only oracle that can see that, so
+// it is carried here rather than referenced.
+//
+// WHAT THOSE REFERENCES NO LONGER ARE, said plainly. The two convolution ones
+// were VERBATIM copies of the loops as they stood at `d9441ef3`, and that is
+// what let them assert agreement with the pre-op host loop itself. #1474
+// narrowed their accumulators from `double` to `float` in lockstep with the
+// kernels, so they are transcriptions of the declared ORDER at the current
+// WIDTH, and nothing here still compares against `d9441ef3`'s arithmetic. What
+// they gate is unchanged in kind — that no reduction order moved, at any thread
+// count — but the standing is weaker and pretending otherwise would be the
+// defect. `SerialLinearNoBias` is untouched and is still the `d9441ef3` copy.
+//
+// A self-referential gate cannot see its own width, either: widening a kernel
+// and its reference together leaves every case here green. That is what the two
+// `accumulates in f32, which is what torch does` cases at the end of this file
+// are for, and they assert torch's own measured answer rather than ours.
 //
 // EQUALITY IS BITWISE, NOT `Approx`. A tolerance would defeat the purpose:
 // every defect this file exists to catch — a split accumulator, a reordered
@@ -27,6 +41,7 @@
 // runs the body inline below `kMinParallelWork`, so a case sized under the
 // guard tests the serial path twice and reports a green that means nothing.
 // Every case states its work product and REQUIREs it over the threshold.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -89,7 +104,8 @@ std::vector<float> SerialLinearNoBias(const std::vector<float>& x, int64_t rows,
   return out;
 }
 
-// VERBATIM vocoder1d.cpp @ d9441ef3 :70-92.
+// vocoder1d.cpp @ d9441ef3 :70-92, verbatim EXCEPT the accumulator, which
+// #1474 narrowed from `double` to `float` in lockstep with the kernel.
 std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t in_channels, int64_t in_len,
                                 const std::vector<float>& weight, const std::vector<float>* bias,
                                 int64_t out_channels, int64_t kernel, int64_t stride,
@@ -102,24 +118,24 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t in_channel
   for (int64_t oc = 0; oc < out_channels; ++oc) {
     const int64_t g = oc / out_per_group;
     for (int64_t t = 0; t < length; ++t) {
-      double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
+      float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0F;
       for (int64_t ic = 0; ic < in_per_group; ++ic) {
         const int64_t src_c = g * in_per_group + ic;
         for (int64_t k = 0; k < kernel; ++k) {
           const int64_t pos = t * stride + k * dilation;
-          acc += static_cast<double>(in[static_cast<size_t>(src_c * in_len + pos)]) *
-                 static_cast<double>(
-                     weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
+          acc += in[static_cast<size_t>(src_c * in_len + pos)] *
+                 weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)];
         }
       }
-      out[static_cast<size_t>(oc * length + t)] = static_cast<float>(acc);
+      out[static_cast<size_t>(oc * length + t)] = acc;
     }
   }
   *out_len = length;
   return out;
 }
 
-// VERBATIM vocoder1d.cpp @ d9441ef3 :100-129.
+// vocoder1d.cpp @ d9441ef3 :100-129, verbatim EXCEPT the accumulator, which
+// #1474 narrowed from `double` to `float` in lockstep with the kernel.
 std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t in_channels,
                                          int64_t in_len, const std::vector<float>& weight,
                                          const std::vector<float>* bias, int64_t out_channels,
@@ -129,18 +145,17 @@ std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t i
   const int64_t length = full - 2 * padding;
   const int64_t in_per_group = in_channels / groups;
   const int64_t out_per_group = out_channels / groups;
-  std::vector<double> acc(static_cast<size_t>(out_channels * full), 0.0);
+  std::vector<float> acc(static_cast<size_t>(out_channels * full), 0.0F);
   for (int64_t ic = 0; ic < in_channels; ++ic) {
     const int64_t g = ic / in_per_group;
     for (int64_t t = 0; t < in_len; ++t) {
-      const double value = in[static_cast<size_t>(ic * in_len + t)];
-      if (value == 0.0) continue;
+      const float value = in[static_cast<size_t>(ic * in_len + t)];
+      if (value == 0.0F) continue;
       for (int64_t oc = 0; oc < out_per_group; ++oc) {
         const int64_t dst_c = g * out_per_group + oc;
         for (int64_t k = 0; k < kernel; ++k) {
           acc[static_cast<size_t>(dst_c * full + t * stride + k)] +=
-              value *
-              static_cast<double>(weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)]);
+              value * weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)];
         }
       }
     }
@@ -148,9 +163,9 @@ std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t i
   std::vector<float> out(static_cast<size_t>(out_channels * length));
   for (int64_t c = 0; c < out_channels; ++c) {
     for (int64_t t = 0; t < length; ++t) {
-      double value = acc[static_cast<size_t>(c * full + t + padding)];
+      float value = acc[static_cast<size_t>(c * full + t + padding)];
       if (bias != nullptr) value += (*bias)[static_cast<size_t>(c)];
-      out[static_cast<size_t>(c * length + t)] = static_cast<float>(value);
+      out[static_cast<size_t>(c * length + t)] = value;
     }
   }
   *out_len = length;
@@ -385,8 +400,11 @@ TEST_CASE("vocoder1d Conv1d is bit-identical to the pre-parallel serial loop") {
 TEST_CASE("vocoder1d Conv1d is bit-identical under CATASTROPHIC CANCELLATION") {
   // The companion to the LinearNoBias cancellation case, and it exists for the
   // same measured reason: reversing Conv1d's `ic` walk left the four ordinary
-  // shapes above entirely GREEN (mutation M7), because a double accumulator
-  // stored through a float cannot show a ~2^-53 relative change.
+  // shapes above entirely GREEN (mutation M7), because the accumulator was a
+  // `double` stored through a `float` and could not show a ~2^-53 relative
+  // change. #1474 narrowed that accumulator, which makes the ordinary shapes
+  // MORE sensitive to an order change rather than less — but the case stays,
+  // because a gate is not retired on the argument that it is now redundant.
   //
   // Here the BIAS is -2^40 and input channel 0 is all ones with a +2^40 tap, so
   // the serial (ic, k) walk cancels the two on its FIRST tap and accumulates the
@@ -425,9 +443,11 @@ TEST_CASE("vocoder1d Conv1d is bit-identical under CATASTROPHIC CANCELLATION") {
 TEST_CASE("vocoder1d ConvTranspose1d is bit-identical under CATASTROPHIC CANCELLATION") {
   // The transposed op had no cancellation case until #672 moved its body behind
   // `vt::ConvTranspose1d`, and it needs one for the same measured reason the
-  // other two do: with well-scaled taps a double accumulator stored through a
-  // float cannot show a reduction-order change at all, so the five ordinary
-  // shapes above stay green under a reassociated sweep.
+  // other two do: with well-scaled taps a `double` accumulator stored through a
+  // `float` could not show a reduction-order change at all, so the five ordinary
+  // shapes above stayed green under a reassociated sweep. The accumulator is
+  // `float` since #1474; the case is kept for the reason given on the Conv1d
+  // one.
   //
   // The engineered cancellation is on the INPUT-CHANNEL axis, because that is
   // the axis a GATHER transcription of the scatter has to get right — and the
@@ -530,4 +550,90 @@ TEST_CASE("host_parallel size guard runs the body inline below the threshold") {
       CHECK(big[i] == 1);
     }
   }
+}
+
+// --- The ACCUMULATOR WIDTH, gated against torch rather than against us -------
+//
+// The two cases below are the instrument for `VT-CONV1D-F32-ACC` (#1474), and
+// they exist because every other case in this file is SELF-REFERENTIAL. Each
+// one compares the shipped kernel to a serial reference carried in this file,
+// so widening BOTH back to `double` in one edit leaves the whole suite green.
+// That is inherent to a bitwise order gate and is not a defect in it — but it
+// means the WIDTH needs a gate that does not read the width off ourselves.
+//
+// THE VALUE ASSERTED IS torch's, MEASURED. 27 taps over a uniform-1.0 input
+// with weights `[+1e8, 0.1 x 25, -1e8]`. `1e8` is exactly representable in f32,
+// and every partial sum `1e8 + j*0.1` for `j <= 25` sits below half an ulp of
+// it (an ulp at 1e8 is 8.0), so an f32 accumulator holds exactly `1e8` until
+// the final `-1e8` and lands on EXACTLY zero — in any summation order, which is
+// what makes this a width probe and not an order probe. An f64 accumulator
+// lands near 2.5, three decimal orders away. Run against torch 2.11.0+cu130:
+// `F.conv1d` f32 -> 0.0, `F.conv1d` bf16 -> 0.0, `F.conv1d` f64 -> 2.4999998510,
+// `F.conv_transpose1d` f32 -> 0.0, f64 -> 2.4999998510. So `0.0` is upstream's
+// own answer for this reduction at the dtype its checkpoints carry, and the
+// case gates a MIRRORED property rather than a local convention.
+//
+// vLLM owns neither op at the parity pin `555967922` — it drops the vocoder it
+// would otherwise own (`qwen3_omni_moe_thinker.py:1975`) — and the one
+// convolution it does own says the same thing in a comment
+// (`csrc/cpu/mamba_kernels.hpp`, "Accumulate in float32 for precision").
+//
+// Both cases enter through `vllm::vocoder1d::*`, the production entry point the
+// four audio consumers call, not through `vt::` directly.
+namespace {
+
+// [+1e8, 0.1 x 25, -1e8], in the order the accumulator receives them.
+constexpr int64_t kWidthTaps = 27;
+
+std::vector<float> WidthProbeWeights() {
+  std::vector<float> w(static_cast<size_t>(kWidthTaps), 0.1F);
+  w.front() = 1e8F;
+  w.back() = -1e8F;
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("vocoder1d Conv1d accumulates in f32, which is what torch does") {
+  const int64_t in_channels = 1, in_len = 64, out_channels = 1;
+  const std::vector<float> in(static_cast<size_t>(in_channels * in_len), 1.0F);
+  const std::vector<float> weight = WidthProbeWeights();
+
+  int64_t out_len = 0;
+  const std::vector<float> got =
+      vllm::vocoder1d::Conv1d(in, in_channels, in_len, weight, /*bias=*/nullptr, out_channels,
+                              kWidthTaps, /*stride=*/1, /*dilation=*/1, /*groups=*/1, &out_len);
+
+  // 64 - 27 + 1 = 38, which spans one WHOLE tile of 32 and a 6-wide remainder,
+  // so both the constant-trip fast path and the chunked tail are covered.
+  REQUIRE(out_len == 38);
+  REQUIRE(got.size() == static_cast<size_t>(out_len));
+  for (size_t i = 0; i < got.size(); ++i) {
+    CAPTURE(i);
+    // EXACTLY zero, not Approx: an f64 accumulator lands on ~2.5 here and any
+    // tolerance wide enough to be written by hand would admit it.
+    CHECK(got[i] == 0.0F);
+  }
+}
+
+TEST_CASE("vocoder1d ConvTranspose1d accumulates in f32, which is what torch does") {
+  // The transposed op walks its taps in the OPPOSITE sense: destination cell
+  // `p` receives `x[t] * w[p - t]` for t ascending, so the tap index descends.
+  // The probe weights are therefore reversed, which puts `+1e8` first and
+  // `-1e8` last in the sequence the accumulator actually sees.
+  const int64_t in_channels = 1, in_len = kWidthTaps, out_channels = 1;
+  const std::vector<float> in(static_cast<size_t>(in_channels * in_len), 1.0F);
+  std::vector<float> weight = WidthProbeWeights();
+  std::reverse(weight.begin(), weight.end());
+
+  int64_t out_len = 0;
+  const std::vector<float> got = vllm::vocoder1d::ConvTranspose1d(
+      in, in_channels, in_len, weight, /*bias=*/nullptr, out_channels, kWidthTaps, /*stride=*/1,
+      /*padding=*/0, /*groups=*/1, &out_len);
+
+  REQUIRE(out_len == (in_len - 1) + kWidthTaps);
+  REQUIRE(got.size() == static_cast<size_t>(out_len));
+  // Cell 26 is the only one every one of the 27 taps reaches; the cells around
+  // it receive a prefix or a suffix of the sequence and are not the probe.
+  CHECK(got[static_cast<size_t>(kWidthTaps - 1)] == 0.0F);
 }

@@ -454,9 +454,62 @@ the output mapping are all different code.
 The LTX-2.5 suites are still run and reported, because byte-identical is a claim
 that has to be measured rather than asserted.
 
-### 6.3 Evidence
+### 6.3 The tolerances, MEASURED — and the reordering went the other way
 
-Filled in from the run, in §8.
+`rc` job `0fc0bd6e-754e-43d6-9210-a9dfb4075c41` on `thor:gpu0`, tree
+`0ecff9e9b`, `Release`, sm_110, nvcc 13.0.88.
+
+`tests/vt/test_ops_attention_cross.cpp` **19 test cases, 19 passed, 0 failed,
+142 assertions, 142 passed, `Status: SUCCESS!`**.
+
+The benign cases sit where they always did — `cuda max|diff|` against the f64
+reference is **6.6e-07 to 1.3e-06** across the blocked geometries, inside the
+op's committed `2e-5` f32 band with more than an order of magnitude to spare, and
+the two arms agree with each other to **2.15e-06**.
+
+The cancellation case is the one that had to be measured, and its answer is the
+opposite of what a reordering usually gives:
+
+| seed | blocked max\|diff\| | shipped max\|diff\| | ratio |
+|---:|---:|---:|---:|
+| 251 | 8.61287e-05 | 8.50797e-04 | 0.1012 |
+| 263 | 7.06390e-05 | 5.17908e-04 | 0.1364 |
+| 271 | 9.10163e-05 | 6.51047e-04 | 0.1398 |
+| 281 | 6.71158e-05 | 7.78854e-04 | 0.0862 |
+| **worst** | **9.10163e-05** | **8.50797e-04** | **0.1398** |
+
+**The blocked kernel is 7.2x MORE accurate than the one it replaces** on
+ill-conditioned data, and all four seeds agree to within a factor of 1.6, so this
+is not one sample.
+
+**Why, and it is worth stating because it inverts the intuition.** The head-dim
+sum did get worse: 64 sequential f32 adds against a 32-lane pairwise butterfly.
+But that is not where this kernel's error lives. The shipped kernel advances the
+online-softmax recurrence **once per key** — 96 dependent rescales of `acc` and
+`l` at this geometry — and each one rounds. The blocked kernel advances it once
+per 32-key tile, which is **three**. Trading 96 rescales for 3 buys far more than
+the pairwise-to-sequential change costs. The same property is what makes it fast,
+so speed and accuracy move together here rather than against each other.
+
+**The bounds follow from that.** The absolute bound `kCancellationTol = 2e-3` is
+set on the BINDING arm, which is the shipped kernel at 8.51e-04 with 2.35x of
+margin, not on the better one. The ratio bound is **2.0** rather than the
+measured 0.14 plus a margin, because what it exists to catch is a DEGRADATION —
+the blocked kernel must not become less accurate than the kernel it replaces —
+and 2.0 gives that claim 14x of headroom while still failing on any real
+inversion.
+
+**The case is not a mute switch, and that is asserted rather than argued.** It
+requires the SHIPPED kernel to miss the f64 reference by more than the benign
+`2e-5` band; it misses by 8.51e-04, which is **42x** above it. A first draft of
+this case used the natural `1/sqrt(D)` scale, and at that scale the softmax is a
+one-hot, both kernels return one row of V exactly, and BOTH reported
+`max|diff| = 0` — a case that passed while measuring nothing. Its own
+ill-conditioning assertion is what caught that.
+
+**MiniMax-Music3's acoustic suite** ran in the same job: **36 test cases, 36
+passed, 353 assertions, 353 passed, `Status: SUCCESS!`**.
+
 
 ## 7. Owed
 

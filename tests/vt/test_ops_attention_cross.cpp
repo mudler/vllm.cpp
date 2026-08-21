@@ -484,10 +484,18 @@ namespace {
 
 constexpr const char* kBlockedProvider = "vt-cross-blocked";
 
-// MEASURED, not chosen. See the cancellation case below for what the two numbers
-// were on `thor:gpu0` and why a ratio is asserted alongside an absolute bound.
+// MEASURED, not chosen. On `thor:gpu0`, worst of four seeds, the cancellation
+// case below reports the SHIPPED kernel at 8.50797e-04 and the BLOCKED one at
+// 9.10163e-05 -- a ratio of 0.1398, so the restructure is 7.2x MORE accurate
+// there, not less. The absolute bound is set on the binding arm (the shipped
+// kernel, 2.35x of margin) rather than on the better one.
+//
+// The RATIO bound is 2.0 and not the measured 0.14 plus a margin, because what
+// it has to catch is a DEGRADATION: the blocked kernel must not become less
+// accurate than the kernel it replaces. 2.0 gives that claim 14x of headroom
+// against today's reading while still failing on any real inversion.
 constexpr double kCancellationTol = 2e-3;
-constexpr double kCancellationRatio = 8.0;
+constexpr double kCancellationRatio = 2.0;
 
 // The shape gate, restated from cuda_attention_cross.cu so a case can assert the
 // regime it claims rather than believe its own comment. A copy is deliberate:

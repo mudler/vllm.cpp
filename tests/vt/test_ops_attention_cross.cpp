@@ -508,6 +508,40 @@ bool BlockedShape(const Geometry& g) {
   return false;
 }
 
+// THE FALLBACK STATIC HAS TO BE WARM BEFORE ANY COUNTED WINDOW, and the reason
+// is a defect in the seam rather than in this file
+// ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)). `GetOpFallback`
+// increments `OpProviderStats::declines` itself (`op_provider.cpp:709`), and the
+// caching pattern `op_provider.h` prescribes ALSO calls `NoteOpDecline`, so the
+// FIRST decline in a process counts twice while the header says the count "stays
+// exact". Without this warm-up every `declines ==` assertion below would pass or
+// fail on whether some earlier case in the same binary happened to decline first
+// -- so a full run would be green and `doctest -tc=` on one case would be red,
+// which is a test passing for a reason unrelated to what it claims.
+//
+// One declining call, made OUTSIDE any reset window, resolves the static once per
+// process. It is a decline by construction: head_dim 8 is not a blocked tiling.
+void WarmDeclineOnce() {
+  static bool done = false;
+  if (done || !HasCuda()) return;
+  done = true;
+  // ENABLED for the duration, or a first call made on the disabled arm would mark
+  // this done without the blocked provider ever being selected -- and so without
+  // resolving the static it exists to resolve. The caller sets the arm it wants
+  // immediately after this returns.
+  vt::DisableOpProvider(kBlockedProvider, false);
+  Backend& gpu = *vt::TryGetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  AttentionCrossArgs args;
+  args.scale = 1.0f;
+  DeviceTensor dq(gpu, guard.q, DType::kF32, {1, 1, 8});
+  DeviceTensor dk(gpu, guard.q, DType::kF32, {1, 1, 8});
+  DeviceTensor dv(gpu, guard.q, DType::kF32, {1, 1, 8});
+  DeviceTensor dout(gpu, guard.q, DType::kF32, {1, 1, 8});
+  vt::AttentionCross(guard.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), nullptr, args);
+  gpu.Synchronize(guard.q);
+}
+
 struct ProviderStatsGuard {
   ProviderStatsGuard() {
     vt::EnableOpProviderCallStats(true);
@@ -536,6 +570,8 @@ CudaRun RunCuda(const Geometry& g, const Inputs& in, DType stream, bool disable_
   CudaRun r;
   r.out.assign(static_cast<size_t>(g.tq * g.hq * g.d), 0.0f);
 
+  // Before the arm is selected and before any counted window opens (#1584).
+  WarmDeclineOnce();
   vt::DisableOpProvider(kBlockedProvider, disable_blocked);
   ProviderStatsGuard stats;
   {

@@ -561,6 +561,22 @@ this row and applies equally to the kernel being replaced.
   would require the bias to be pre-multiplied too.
 - **`Tq < 64` at head_dim 64 keeps the warp-per-query kernel** and therefore
   keeps its cost. That regime is not measured by this row.
+- **[#1584](https://github.com/mudler/vllm.cpp/issues/1584) — the provider seam
+  double-counts the FIRST decline of every process.** `GetOpFallback` increments
+  `OpProviderStats::declines` itself (`op_provider.cpp:709`) and the caching
+  pattern `op_provider.h` prescribes calls `NoteOpDecline` beside it, so the
+  header's "stays exact" is one too high, once. Found by this row's own audit and
+  **worked around here rather than fixed**: the suite warms the fallback static
+  outside every counted window, so its routing assertions are order-independent
+  instead of depending on which case declined first. The seam fix changes
+  semantics for four backends and for the callers that use `GetOpFallback`
+  WITHOUT the caching pattern, so it needs its own row.
+- **The op does not check that `key.dtype` and `value.dtype` equal
+  `query.dtype`.** `Tensor::Ptr<T>` is an unchecked `static_cast`, so an f32
+  query against a bf16 key reads twice the buffer. This is a contract-level
+  exposure of the op that `LaunchAttentionCross` has identically, so it predates
+  this row and is not introduced by it — recorded because the audit surfaced it
+  and nobody had written it down.
 - **[#1131](https://github.com/mudler/vllm.cpp/issues/1131) is NOT closed by this
   row.** It remains open on the DiT device arm.
 

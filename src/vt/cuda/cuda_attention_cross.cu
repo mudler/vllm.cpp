@@ -331,6 +331,18 @@ __global__ __launch_bounds__(kBlockedThreads) void AttentionCrossBlockedKernel(
   constexpr int QT = BR / kBlockedQGroups;
   constexpr int KT = BC / kBlockedKGroups;
   constexpr int DT = D / kBlockedKGroups;
+  // The coverage argument below -- that every element of `sP` the P.V loop reads
+  // was written this iteration, and that every `sRed` slot a row reduces over was
+  // filled -- rests ENTIRELY on these three divisions being exact. A tiling with,
+  // say, BR = 40 would truncate QT to 2, leave `sP` columns 32-39 unwritten, and
+  // the P.V loop would read uninitialised shared memory with no diagnostic
+  // anywhere. Enforced rather than left as a convention the next tiling has to
+  // remember.
+  static_assert(BR % kBlockedQGroups == 0, "BR must divide into 16 query groups");
+  static_assert(BC % kBlockedKGroups == 0, "BC must divide into 8 key groups");
+  static_assert(D % kBlockedKGroups == 0, "D must divide into 8 key groups");
+  static_assert(kBlockedQGroups * kBlockedKGroups == kBlockedThreads,
+                "the thread grid must be exactly 16 query groups x 8 key groups");
 
   // The staging tiles are f32 for BOTH streams. A bf16 operand is widened once
   // on the way in rather than on every one of the `D` reads the inner loop makes
@@ -521,6 +533,12 @@ bool TryBlockedOut(cudaStream_t stream, Tensor& out, const Tensor& query, const 
                    const Tensor& value, const float* bias_data, int64_t bias_rows,
                    const AttentionCrossArgs& args) {
   const int64_t d = query.shape[2];
+  // The head dim is checked HERE as well as in `BlockedShape`, and the duplication
+  // is deliberate. A `d == 64` test read as exhaustive would send every other head
+  // dim into the D = 128 instantiation, which indexes query, key, value AND out
+  // with a hard-coded stride of 128 -- wrong results plus out-of-bounds global
+  // WRITES, from a one-line widening of the gate in a different function. The two
+  // are coupled by nothing but this pair of switches, so both state the set.
   switch (out.dtype) {
     case DType::kF32:
       if (d == 64) {
@@ -528,18 +546,24 @@ bool TryBlockedOut(cudaStream_t stream, Tensor& out, const Tensor& query, const 
                                               args);
         return true;
       }
-      LaunchBlocked<Tin, float, 128, 32, 16>(stream, out, query, key, value, bias_data, bias_rows,
-                                             args);
-      return true;
+      if (d == 128) {
+        LaunchBlocked<Tin, float, 128, 32, 16>(stream, out, query, key, value, bias_data, bias_rows,
+                                               args);
+        return true;
+      }
+      return false;
     case DType::kBF16:
       if (d == 64) {
         LaunchBlocked<Tin, __nv_bfloat16, 64, 64, 32>(stream, out, query, key, value, bias_data,
                                                       bias_rows, args);
         return true;
       }
-      LaunchBlocked<Tin, __nv_bfloat16, 128, 32, 16>(stream, out, query, key, value, bias_data,
-                                                     bias_rows, args);
-      return true;
+      if (d == 128) {
+        LaunchBlocked<Tin, __nv_bfloat16, 128, 32, 16>(stream, out, query, key, value, bias_data,
+                                                       bias_rows, args);
+        return true;
+      }
+      return false;
     default: return false;
   }
 }

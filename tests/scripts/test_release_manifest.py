@@ -905,6 +905,28 @@ class ReleaseManifestTests(unittest.TestCase):
             })
             self.assert_invalid(mutant, name)
 
+        # Issue #1547. The container `vulkan` lane publishes a multi-arch
+        # manifest, so its arm64 leg produces this tuple, and before the fix no
+        # policy row named it. The tuple is PREVIEW ONLY: no arm64 Vulkan leg
+        # has been built or gated here, so `stable` must stay refused.
+        vulkan_arm64 = accelerator(
+            "linux-aarch64-glibc-vulkan",
+            "vulkan",
+            {"arch": "aarch64"},
+            copy.deepcopy(vulkan["dependencies"]),
+        )
+        self.assertEqual(
+            self.tool.validate_manifest(vulkan_arm64, self.schema, ROOT), []
+        )
+        claimed_stable = copy.deepcopy(vulkan_arm64)
+        claimed_stable["artifact"]["channel"] = "stable"
+        self.assert_invalid(
+            claimed_stable, "wrong channel for linux-aarch64-glibc-vulkan"
+        )
+        wrong_arch = copy.deepcopy(vulkan_arm64)
+        wrong_arch["host"]["arch"] = "x86_64"
+        self.assert_invalid(wrong_arch, "tuple policy mismatch")
+
         frameworks = [
             {"name": name, "version": "macOS-system", "kind": "framework", "linkage": "external", "bundled": False, "role": "external-runtime"}
             for name in ("Metal.framework", "Foundation.framework")

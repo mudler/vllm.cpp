@@ -17,10 +17,24 @@ import release_manifest  # noqa: E402
 import release_metadata  # noqa: E402
 
 
+# The (arch, backend) tuple each Linux accelerator artifact id names.
+#
+# `linux-aarch64-glibc-vulkan` is issue #1547. `docker/Dockerfile:145-146`
+# selected it for every non-amd64 container build while nothing registered it,
+# so the `vulkan` lane's arm64 leg failed with `unsupported Linux accelerator
+# artifact`, and the failed leg skipped `manifest` and left the pushed `cpu`
+# digests with no tag pointing at them.
+#
+# This registry names a BUILD tuple, not a downloadable release archive. The
+# download matrix is `release/release-matrix.json`, which
+# `scripts/release_pipeline.py:137` requires to equal `PRIMARY_ARTIFACT_FORMATS`
+# exactly, and `.github/workflows/release.yml` builds no aarch64 Vulkan tarball.
+# The id is deliberately absent there.
 ARTIFACTS = {
     "linux-x86_64-glibc-cuda": ("x86_64", "cuda"),
     "linux-aarch64-glibc-cuda": ("aarch64", "cuda"),
     "linux-x86_64-glibc-vulkan": ("x86_64", "vulkan"),
+    "linux-aarch64-glibc-vulkan": ("aarch64", "vulkan"),
 }
 
 

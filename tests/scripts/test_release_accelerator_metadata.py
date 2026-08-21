@@ -101,6 +101,38 @@ class AcceleratorMetadataContract(unittest.TestCase):
             self.assertTrue({"vulkan-loader", "vulkan-icd", "vulkan-driver"} <= names)
             self.assertNotIn("cuda", manifest)
 
+    def test_aarch64_vulkan_is_registered_preview_and_claims_no_evidence(self) -> None:
+        # Issue #1547. `docker/Dockerfile:145-146` selects this id for every
+        # non-amd64 container build, and before the fix the script refused it
+        # with `unsupported Linux accelerator artifact`, which failed the
+        # `vulkan` lane's arm64 leg, skipped `manifest`, and left the pushed
+        # `cpu` digests with no tag.
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self.fixture(Path(temporary), "linux-aarch64-glibc-vulkan")
+            manifest = self.tool.prepare_accelerator_metadata(args)
+            self.assertEqual(manifest["host"]["arch"], "aarch64")
+            self.assertEqual(manifest["backend"]["name"], "vulkan")
+            self.assertNotIn("cuda", manifest)
+            names = {row["name"] for row in manifest["dependencies"]}
+            self.assertTrue({"vulkan-loader", "vulkan-icd", "vulkan-driver"} <= names)
+            # The lane is unbuilt and ungated, and the metadata must say so.
+            self.assertEqual(manifest["artifact"]["channel"], "preview")
+            for axis in ("correctness", "runtime", "performance"):
+                self.assertEqual(manifest["evidence"][axis]["state"], "absent")
+
+    def test_aarch64_vulkan_is_not_a_downloadable_release_artifact(self) -> None:
+        # The build tuple above is NOT a release download. `release_pipeline.py`
+        # requires `release/release-matrix.json` to equal its primary tuple
+        # policy exactly, and `.github/workflows/release.yml` builds no aarch64
+        # Vulkan tarball, so declaring one there would claim an archive that
+        # never exists.
+        matrix = json.loads(
+            (ROOT / "release/release-matrix.json").read_text(encoding="utf-8")
+        )
+        ids = {item["id"] for item in matrix["artifacts"]}
+        self.assertNotIn("linux-aarch64-glibc-vulkan", ids)
+        self.assertIn("linux-x86_64-glibc-vulkan", ids)
+
     def test_cuda_refuses_partial_sm_or_disabled_triton_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self.fixture(Path(temporary), "linux-x86_64-glibc-cuda")

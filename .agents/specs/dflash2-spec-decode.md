@@ -43,9 +43,23 @@ defers with its reason.
 
 ## Upstream chain
 
-**Not merged upstream.** Read at
-[vllm-project/vllm#52816](https://github.com/vllm-project/vllm/pull/52816) head
-`66e5414c6d75a8529473d977f7458c140bbab8a0`, base `9842d701`, opened 2026-08-18.
+**MERGED UPSTREAM on 2026-08-21 at 05:27:22Z**, at head
+`3406ec1dae9916f920b90f0dbf90dcf54923d042`, merge commit
+`b389ac29465b33f9e9c534df221ea3c129e9793f`.
+[vllm-project/vllm#52816](https://github.com/vllm-project/vllm/pull/52816) was
+opened 2026-08-18 on base `9842d701`. This row's gates were read against head
+`66e5414c6d75a8529473d977f7458c140bbab8a0`.
+
+**THIS SECTION SAID "Not merged upstream" AFTER THE MERGE HAD ALREADY HAPPENED,
+and so did four other places in this file plus the `#1538` index row.** The
+merge landed at `05:27:22Z`; W6's work commit `bb416e0ae` was authored at
+`06:13:50Z`, 46 minutes later. Every open-PR statement W6 wrote was therefore
+already false when it was written, and W6 did not re-read the forge before
+committing. Corrected on 2026-08-21 by the W6 repair wave, which read
+`gh api repos/vllm-project/vllm/pulls/52816` itself rather than inheriting the
+claim. The reconciliation the merge makes due is
+[#1561](https://github.com/mudler/vllm.cpp/issues/1561); `## Owed` O21 carries
+it.
 
 **THE HEAD MOVED under this row, and W3 is the wave that reconciles it**
 ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)). W1 and W2 were written
@@ -328,11 +342,29 @@ Ours, red-first, beyond the ports:
   owed to a GPU lease.
 - G2: draft-token identity against vLLM at PR head `66e5414c` on
   `z-lab/Qwen3.8-27B-DFlash2` over `Qwen/Qwen3.8-27B`, identical prompts and
-  identical k, greedy. **RECONCILED TO ONE HEAD BY W6 on 2026-08-21**, by the
-  rule the paragraph below wrote: #52816 was still open, so the gate head is the
-  head the port mirrors. It read `19c93519` until then, and the reconciliation is
-  applied in place rather than annotated, because a gate head and a port head
-  that differ by name are exactly what the paragraph below warns against. The DFlash near-tie envelope applies: `SPEC-DFLASH`
+  identical k, greedy. **RECONCILED TO ONE HEAD BY W6 on 2026-08-21**, to
+  `66e5414c`. It read `19c93519` until then, and the reconciliation is applied in
+  place rather than annotated, because a gate head and a port head that differ by
+  name are exactly what the paragraph below warns against.
+
+  **W6 APPLIED THIS RULE'S WRONG BRANCH, AND THE RESULT STANDS ANYWAY BECAUSE
+  THE CAPTURE PREDATES THE MERGE.** The rule below is "`66e5414c` if #52816 has
+  not merged, and the merge commit if it has". #52816 HAD merged --
+  `2026-08-21T05:27:22Z`, merge commit `b389ac29`, head `3406ec1d` -- 46 minutes
+  before W6's work commit was authored, and W6 recorded it as open without
+  re-reading the forge. What the rule selects today is therefore `b389ac29` and
+  not `66e5414c`.
+
+  **The gate head stays `66e5414c` for the W6 capture, and this is a DATED
+  exception rather than the rule.** The reason is that the capture was taken
+  against a wheel built at `66e5414c` on a leased GPU BEFORE the merge existed
+  to select; re-labelling that run with a head it never executed would be a
+  false pin, and the honest move is to date what was measured. It is not a
+  reason to leave the head at `66e5414c` for the NEXT reading of these gates:
+  [#1561](https://github.com/mudler/vllm.cpp/issues/1561) owns moving the gate
+  head to `b389ac29` and re-reading G2 and G3 there, and until that happens this
+  row's gates are read against a head that is one merge behind vLLM's `main`.
+  `## Owed` O21 carries the difference between the two heads, re-measured. The DFlash near-tie envelope applies: `SPEC-DFLASH`
   established that strict token identity is bf16-irreducible on portable
   kernels, so the ratified near-tie gate is the admissible form and a strict
   claim is not.
@@ -349,10 +381,29 @@ Ours, red-first, beyond the ports:
   merely drifted from the port head is how a parity claim quietly stops meaning
   what it says. W6 takes the gate and reconciles this to ONE head at that
   point: `66e5414c` if #52816 has not merged, and the merge commit if it has.
-- G3: **acceptance**, measured SAME-TRAJECTORY — both engines teacher-forced on
-  identical tokens. `SPEC-DFLASH` D8 spent a whole campaign on an acceptance
-  deficit that was a divergent-trajectory measurement confound, and D9 refuted
-  it. This gate does not repeat that mistake.
+- G3: **acceptance**, measured SAME-TRAJECTORY. `SPEC-DFLASH` D8 spent a whole
+  campaign on an acceptance deficit that was a divergent-trajectory measurement
+  confound, and D9 refuted it. This gate does not repeat that mistake.
+
+  **NOTHING IS TEACHER-FORCED, and this line said it was until 2026-08-21.**
+  G2's wording was reconciled to the implementation during W6 and G3's was not,
+  so the spec kept describing a mechanism the gate has never had. What the gate
+  actually does is an ADMISSION CONDITION: both engines run FREE, and a prompt
+  contributes to the acceptance comparison only when the two independently
+  emitted the SAME token stream
+  (`tests/parity/test_qwen38_dflash2_spec_decode.cpp:640-645`, the `is_exact`
+  admission). A prompt that
+  diverges is excluded and named.
+
+  The substitution is defensible and is arguably the stronger claim -- a
+  same-trajectory pair that arose without being forced is evidence about the
+  engine, where a forced one is evidence about the verify rule alone -- but it
+  costs something the forced form would not, and the cost is stated rather than
+  hidden. **G3 is UN-TAKEABLE on a diverging prompt.** With no same-trajectory
+  prompt the gate reports "G3 NOT TAKEN", which it correctly calls a measurement
+  gap rather than an acceptance result. That is exactly the regime the D8/D9
+  confound arose in, so on the day this row has to answer for a divergence, G3
+  will have nothing to say until an actual teacher-forced arm is built.
 - G4: the GGUF drafter arm, with the lower bound of `## Tests to port`.
   **DISCHARGED by W5 on CPU**, at the three published encodings (bf16, Q8_0,
   Q4_K) and with the lower bound's three legs measured rather than argued:
@@ -379,9 +430,19 @@ engine and are not treated as one.
 pinned oracle cannot run this architecture. The gate oracle is vLLM at
 `66e5414c6d75a8529473d977f7458c140bbab8a0` — the head the port mirrors — and it
 is a BEYOND-PIN oracle rather than a pin advance. This section named `19c93519`
-until W6; the reconciliation rule `## Gates` G2 wrote is what selected the new
-value, and #52816 was still OPEN when W6 applied it (read from the forge, not
-assumed).
+until W6.
+
+**W6 wrote that #52816 "was still OPEN when W6 applied it (read from the forge,
+not assumed)", and that is the one claim in this section that is false.** The
+pull request had merged 46 minutes earlier. Whatever W6 read, it was not the
+state of the forge at the time it committed. Corrected 2026-08-21 by the repair
+wave, which re-read it: merged `05:27:22Z`, merge commit `b389ac29`, head
+`3406ec1d`.
+
+The oracle stays `66e5414c` because that is the wheel that was BUILT AND RUN on
+the lease, before the merge existed. `## Gates` G2 carries why that is a dated
+exception and not the rule, and
+[#1561](https://github.com/mudler/vllm.cpp/issues/1561) owns moving it.
 
 The artifact, so a later reader can tell whether they hold the same one:
 
@@ -460,13 +521,19 @@ reviewer who mutates the guarantee rather than reading it.
 - **W6 — the gates.** G2 and G3 on a leased GPU against the PR-head oracle,
   then `## Outcome`.
 
-  **The gate head is reconciled to ONE head here, as G2 required, and it is
-  `66e5414c`.** vllm#52816 is still OPEN on 2026-08-21 (checked through the
-  forge, not inferred), so G2's own rule selects the head the port mirrors. Its
-  head has since moved a THIRD time, to `3406ec1d`; that is recorded under
-  `## Owed` O21 and [#1538](https://github.com/mudler/vllm.cpp/issues/1538) and
-  deliberately not chased, because reconciling a port onto a third unmerged head
-  DURING the gate would move the thing being measured.
+  **The gate head is reconciled to ONE head here and it is `66e5414c`, which is
+  NOT what G2's rule selects.** W6 wrote that vllm#52816 was "still OPEN on
+  2026-08-21 (checked through the forge, not inferred)". It was not: it merged
+  at `05:27:22Z` that morning, 46 minutes before this wave's work commit, at
+  head `3406ec1d` and merge commit `b389ac29`. G2's rule therefore selects
+  `b389ac29`, and W6 selected `66e5414c`.
+
+  The measurement is not invalidated by that, because the capture ran against a
+  wheel built at `66e5414c` BEFORE the merge landed, and a run cannot be
+  re-pinned to a head it never executed. What is invalidated is the REASON W6
+  gave. The head is kept, dated, and the reconciliation onto merged upstream is
+  [#1561](https://github.com/mudler/vllm.cpp/issues/1561). `## Owed` O21 carries
+  the two-head diff, re-measured against the merged head.
 
   **THE ORACLE'S DRAFT TOKENS COME FROM A HOOK, AND THE HOOK'S OWN PRECONDITIONS
   ARE THE HARD PART.** vLLM exposes no per-block draft-token counter, so G2's
@@ -494,6 +561,13 @@ reviewer who mutates the guarantee rather than reading it.
   a settled design. Cost: the anchors can move under review, and the port
   reconciles if they do. Precedent: `SPEC-DSPARK-QWEN3-ROUTING` toward
   vllm#52197. This does NOT advance the parity pin.
+
+  **SETTLED 2026-08-21: it merged.** vllm#52816 merged at `05:27:22Z` at head
+  `3406ec1d`, merge commit `b389ac29`, so the bet D1 took paid off and the
+  anchors did move under review exactly as the cost line predicted — three times.
+  The port is NOT yet reconciled onto merged upstream and that is
+  [#1561](https://github.com/mudler/vllm.cpp/issues/1561). The parity pin is
+  still not advanced by this row.
 - **D2 — do not port FlashInfer's radix top-k.** `topk.cuh` is 3380 lines of
   general kernel: multi-CTA, deterministic mode, three tie-break modes, dynamic
   shared-memory sizing. Our shape is fixed and small — K=16 over 248320 for
@@ -1491,6 +1565,16 @@ list items.
   cold CIFS mount, which is a LOAD figure and not a decode figure and is recorded
   as neither a speed result nor an axis.
 
+  **THE DISCHARGE IS NOT REPRODUCIBLE FROM THIS TREE**
+  ([#1562](https://github.com/mudler/vllm.cpp/issues/1562)), and that is recorded
+  rather than left for a reader to discover. No runner script and no log is
+  committed for any of it: not the `examples/vllm-cli` invocation, not the
+  `/usr/bin/time -v` capture, not the `[SPECTRACE]` lines quoted above. The
+  finding stands — the artifact was loaded and it drafted — but the numbers
+  cannot be re-derived by anyone who was not on that lease, and neither can the
+  safetensors arm they are compared against. What is owed is committing the
+  runner, or saying plainly that it was lost with the lease.
+
   "Drafts in all three published arms" is an inference from the ENCODINGS, and
   the record should say so. What is measured is: a synthetic fixture at
   `H = 256` that writes each arm's block format itself and drafts from it, plus
@@ -1584,26 +1668,44 @@ list items.
   first three.
 
 
-- **O21 — vllm#52816's head moved a THIRD time, to `3406ec1d`, and the port is
-  NOT reconciled onto it.** Owner: `SPEC-DFLASH2`. Issue
-  [#1538](https://github.com/mudler/vllm.cpp/issues/1538). Measured by W6 on
-  2026-08-21 from `raw.githubusercontent.com` at both heads, while taking the
-  gates.
+- **O21 — vllm#52816 MERGED at `3406ec1d`, and the port is NOT reconciled onto
+  it.** Owner: `SPEC-DFLASH2`. Issues
+  [#1538](https://github.com/mudler/vllm.cpp/issues/1538) (the head move) and
+  [#1561](https://github.com/mudler/vllm.cpp/issues/1561) (the reconciliation the
+  merge makes due). Measured by W6 on 2026-08-21 from `raw.githubusercontent.com`
+  at both heads, while taking the gates; RE-MEASURED and restated on 2026-08-21
+  by the W6 repair wave.
 
-  The pull request is still OPEN, so `## Gates` G2's own rule decides the gate
-  head and it decides `66e5414c` — which is what W6 built, ran and gated
-  against. The head is recorded here rather than chased, because reconciling a
-  port onto a third unmerged head DURING the gate would move the thing being
-  measured.
+  **W6 wrote this entry as "the pull request is still OPEN", and it had already
+  merged.** `2026-08-21T05:27:22Z`, merge commit `b389ac29`, head `3406ec1d` --
+  46 minutes before W6's work commit. So `3406ec1d` is not "a third unmerged
+  head" this row may decline to chase; it is what vLLM's `main` now carries, and
+  the port is one merge behind upstream rather than one revision behind a branch.
 
-  The delta is +11/−80, +4/−16 and +2/−5 over the three ported files, and the
+  `## Gates` G2's rule selects the merge commit `b389ac29` for the gate head.
+  W6's capture stays pinned to `66e5414c` because that is the wheel that ran,
+  and G2 records that as a dated exception. Re-reading G2 and G3 at `b389ac29`
+  is #1561 and is owed.
+
+  The delta is +11/−80, +4/−16 and +2/−5 over the three ported files
+  (`qwen3_dflash2.py`, `dflash2/speculator.py`, and the BASE
+  `v1/worker/gpu/spec_decode/speculator.py`). **All three RE-MEASURED on
+  2026-08-21 by the repair wave** with the same method W6 used --
+  `git diff --no-index --numstat` over the raw blobs at each head -- and all
+  three hold unchanged. The fresh review reported the base file as +3/−6; that
+  reading does not reproduce. At `66e5414c` -> `3406ec1d` the base
+  `speculator.py` changes only `draft_logits_spec`'s docstring, two lines added
+  against five deleted. The DFlash1 `dflash/speculator.py` is byte-IDENTICAL at
+  both heads (sha256 `a8f03bbe...`), which is worth recording because it is the
+  file a reader is most likely to reach for by that name. And the
   large one is a RELOCATION: `compute_candidates` loses its whole body to
   `LogitsProcessor.get_top_k_tokens`, with `output_multiplier` and
   `final_logit_softcapping` moved into a `LogitsProcessor(vocab_size, scale=,
   soft_cap=)` built in `__init__`, and `_topk` absorbed there too. The padding
   mask, the id rebase, the TP all-gather and the scale-THEN-softcap order are all
   preserved (`logits_processor.py:241-286` @ `3406ec1d`), so the answer is
-  unchanged and O16's reading holds at BOTH heads.
+  unchanged and O16's reading holds at BOTH heads -- and now at MERGED upstream,
+  which is the same tree.
 
   **One behavioural thing is not preserved and it is the one this row mirrors by
   name:** the explicit `UnquantizedEmbeddingMethod`/`UnquantizedLinearMethod`
@@ -1611,7 +1713,13 @@ list items.
   DELETED at `3406ec1d`. Our guard's own reason is independent of upstream's and
   stands — the GGUF arm dequantizes a q6_K/NVFP4 `output.weight` to bf16 and a
   GGUF target with a safetensors DFlash2 draft is an admitted combination here —
-  so nothing changes today. What is owed is the decision when #52816 settles.
+  so nothing changes today. **What was owed was "the decision when #52816
+  settles". It has settled, onto vLLM's `main`**, so the decision is due rather
+  than parked, and it is [#1561](https://github.com/mudler/vllm.cpp/issues/1561).
+  Our guard stands on its own reason; what #1561 owes is writing that down
+  against a merged upstream rather than against a branch, because "upstream
+  deleted it on an unmerged head" and "upstream deleted it on main" are
+  different facts.
 
 
 - **O22 — the row's declared oracle backend rests on a premise a W6 run
@@ -1636,6 +1744,20 @@ list items.
   denominator is the failure this protocol exists to stop. What W6 does instead
   is take BOTH arms, name each in its own golden, and leave the choice recorded
   rather than assumed.
+
+  **AND THE FLASH_ATTN GOLDEN'S BACKEND LABEL DOES NOT MEET THE RULE THIS ENTRY
+  ITSELF LAYS DOWN** ([#1562](https://github.com/mudler/vllm.cpp/issues/1562)).
+  The rule above is: pass the kwarg and read the resolved value back off the
+  built engine. That golden's label was not read back. It carries
+  `attention_backend_source: "corrected from the run log by w6-relabel.py; the
+  capture's original value came from VLLM_ATTENTION_BACKEND, which does not exist
+  in this wheel and selected nothing"` -- a POST-HOC relabel of a run whose
+  recorded value was known to be meaningless. The run log it was corrected from
+  is not committed and neither is `w6-relabel.py`, so the label cannot be
+  re-derived from anything in this tree. The evidence for `FLASH_ATTN` is the
+  wheel's own `Using FlashAttention version 2` startup line as W6 read it, and
+  that reading is now unauditable. The TRITON_ATTN golden's label WAS read back
+  off the built engine and is not affected.
 
   **Taking both bought something the row needed anyway: A CONTROL ON THE NEAR-TIE
   ENVELOPE, measured on vLLM AGAINST ITSELF.** Same wheel, same host, same
@@ -1694,6 +1816,26 @@ list items.
      preconditions it checked were TRUE and the instrument was still blind. The
      hook moved to `propose`, below the branch.
 
+  **AND NONE OF THE REPAIRED INSTRUMENT IS COMMITTED**
+  ([#1562](https://github.com/mudler/vllm.cpp/issues/1562)). This entry exists so
+  the next agent does not pay the three 51.75 GiB loads again, and it describes
+  the hook on `propose` below the `cg_mode == FULL` branch, the
+  `torch.cuda.is_current_stream_capturing()` delegation, the backend read-back
+  and the abort-on-zero -- as PROSE. There is no script in the tree, no run log
+  and no `w6-relabel.py`. So the next agent rewrites the harness from this
+  paragraph, which is exactly the cost this entry was written to prevent, and the
+  entry is only half of what it claims to be until the code lands beside it.
+
+  A related residual the harness would explain and nothing currently does: the
+  TRITON_ATTN golden's `hook_stats` reads
+  `{propose_calls: 59, skipped_dummy: 1, skipped_capture: 0}` against 55 recorded
+  blocks whose `call` ids run contiguously 3..57. `59 - 1 - 0 = 58`, so THREE
+  calls are unaccounted for. Nothing in the gate read `hook_stats` at all until
+  the W6 repair wave, which now bounds it one-sidedly
+  (`sum(blocks) <= propose_calls - skipped`, because a lost record is possible
+  and an invented one is not) and pins the residual at 3 so it cannot drift
+  unnoticed.
+
   The reason this is `## Owed` and not just a note: EVERY one of the three
   presents as a verdict about the CODE. The first reads as "the draft is empty",
   the second as "the oracle cannot capture graphs with a DFlash2 speculator" —
@@ -1715,17 +1857,86 @@ OTHER's DFlash2 draft proposed.
 assertions / 0 failed / `Status: SUCCESS!` / exit 0**, against the committed
 golden `tests/parity/goldens/dflash2_27b/dflash2_27b_spec_on.json`, sha256
 `b051b4143d1b214d415951513c43f7148b3026a9e975f8c08d8cd3a60af7ee59` — the exact
-bytes the run read. Reproduce with
+bytes the run read.
+
+**A RERUN TODAY WILL NOT PRINT 142, and the figure above is W6's run rather than
+the current one.** The repair wave added a fourth case and its own assertions, so
+the suite now reads 4 cases / 65 assertions on a box with no checkpoint (the e2e
+case SKIPs) against 3 / 41 before it; the device count moves by the same delta
+plus the two new ours-vs-theirs assertions. The 142 is retained because it is
+what was measured; it is not a number to reproduce.
+
+Reproduce with
 
 ```sh
 VLLM_DFLASH2_TARGET=<Qwen3.8-27B dir> VLLM_DFLASH2_DRAFT=<z-lab/Qwen3.8-27B-DFlash2 dir> \
   ./build/tests/test_qwen38_dflash2_spec_decode
 ```
 
+**THE TREE THAT PRODUCED THAT 142/0 IS NOT THE TREE THE RECORD PINNED, and the
+repair wave identified it.** `.agents/benchmark-record.md` pins the ours side as
+tree `81b530cff097db493e44e4de9a1c727530ed4467`. That tree LACKS
+`Reconstructed::verified`, the per-prompt `CHECK(our_recon_here == their_acc)`
+and three instrument assertions -- exactly **+8** executed assertions on this
+workload. The record's own text says the pre-fix run was 134 assertions with one
+failure, and `134 + 8 = 142`, so `81b530cff` is the FAILING run's tree.
+
+The passing tree is identified rather than guessed, because the two recorded
+trees differ in exactly ONE compiled file. `git diff --name-only 81b530cff
+bb416e0ae -- src include tests examples tools CMakeLists.txt` returns the two
+goldens (data, not compiled) and
+`tests/parity/test_qwen38_dflash2_spec_decode.cpp`. So the passing binary's
+compiled sources are `81b530cff`'s with that one blob replaced, and that tree is
+**`0ac277b3a66b5deabe4871959f0f03566c08deda`**, reconstructible in two commands:
+
+```sh
+GIT_INDEX_FILE=$(mktemp) git read-tree 81b530cff097db493e44e4de9a1c727530ed4467
+GIT_INDEX_FILE=$SAME git update-index --cacheinfo \
+  100644,47c53d17a58584987599028519148747b3f018e9,tests/parity/test_qwen38_dflash2_spec_decode.cpp
+GIT_INDEX_FILE=$SAME git write-tree   # -> 0ac277b3a66b5deabe4871959f0f03566c08deda
+```
+
+**What is still not known, and is stated rather than papered over:** no
+`git write-tree` was taken after the fix, so no tree object recorded at the time
+names the passing run. `0ac277b3` is a RECONSTRUCTION resting on the inference
+above, not a value read off the run. The dispatched mutation counts W6 recorded
+(5 and 37) were taken on `81b530cff` by the same arithmetic and carry the same
+caveat. `81b530cff` also does not contain the goldens at all, so the run read one
+through `VLLM_DFLASH2_GOLDEN` from the lease rather than from the tree; the
+golden's sha256 above is what pins the DATA, and it matches the committed file
+byte for byte.
+
 The FLASH_ATTN arm of the same capture is committed beside it as
 `dflash2_27b_spec_on_flash_attn.json` and is selected with
-`VLLM_DFLASH2_EXPECT_BACKEND=FLASH_ATTN`; it carries no per-block drafts,
-because it was taken before the hook reached the replayed graph.
+`VLLM_DFLASH2_EXPECT_BACKEND=FLASH_ATTN`; it carries no per-block drafts on any
+of its four records, because it was taken before the hook reached the replayed
+graph.
+
+**AND SELECTING IT USED TO PRODUCE A VERDICT ABOUT THIS ENGINE.** Through W6 the
+gate's only liveness check on the golden was
+`CHECK(golden.value("draft_hook_installed", false))`, which that golden passes:
+the flag is `true` and every `blocks` list is empty. The run then found no block
+to pair and reported "STRUCTURAL: not a single block pair was anchor-aligned
+inside a shared prefix", plus a 49-vs-0 acceptance mismatch on three prompts and
+a 209-against-0 total -- five failures naming our drafts, on a capture where the
+oracle's instrument was what was missing.
+
+Repaired by the W6 repair wave: `InspectGoldenDrafts` decides liveness from the
+golden's own records, per record and not by total, and a drafts-less golden makes
+G2b and G3 **VOID** with a message that says whose instrument is absent. G2a
+(output identity) still runs, because such a golden can still answer it. The rule
+is gated on every box by
+`dflash2 gate: a golden's drafts decide whether G2b and G3 are takeable`, which
+reads both committed goldens with no checkpoint and no GPU, and holds the flag
+against the drafts in the tree as it stands today.
+
+**THE FLASH_ATTN LABEL IS A POST-HOC RELABEL, not a read-back**
+([#1562](https://github.com/mudler/vllm.cpp/issues/1562)). That golden carries
+`attention_backend_source: "corrected from the run log by w6-relabel.py; the
+capture's original value came from VLLM_ATTENTION_BACKEND, which does not exist
+in this wheel and selected nothing"`. `## Owed` O22 lays down the rule that the
+resolved backend must be read back off the built engine, and this label does not
+meet it. Neither the log nor the script is committed, so nobody can re-derive it.
 
 ### G2 — SATISFIED, and STRICTLY, which the envelope did not require
 
@@ -1743,17 +1954,68 @@ than as the strict form, because the DFlash1 precedent and the backend control
 below both say this margin is not guaranteed.
 
 The two draft blocks that differ each differ by ONE token, in the middle of the
-proposal, and both are the shape `## Port map` predicts: the lattice op is a
-REDUCTION over `selector_rank` and is specified within-envelope across backends,
-unlike the walk. `[14227 369 14227 13 198 760 6511]` against
+proposal. `[14227 369 14227 13 198 760 6511]` against
 `[14227 369 24844 13 198 760 6511]` at slot 2, and
 `[39262 279 9861 2574 314 539 279]` against `[39262 279 10895 2574 314 539 279]`
 at slot 2. Both blocks then emitted the same target tokens.
 
-### G3 — SATISFIED, SAME-TRAJECTORY, and the two engines' acceptance is IDENTICAL
+**THE ATTRIBUTION IS WITHDRAWN**
+([#1564](https://github.com/mudler/vllm.cpp/issues/1564)). W6 wrote that both
+flips are "the shape `## Port map` predicts: the lattice op is a REDUCTION over
+`selector_rank`". Nothing in this capture measured that. The golden records
+`{call, req_row, anchor, drafts}` per block and nothing else -- no candidate
+values, no logits, no top-2 gap -- so it cannot say whether either flip was a
+near-tie at all, let alone which reduction it happened in.
+
+**And the block SHAPE argues against the op that was named.** In both blocks
+only slot 2 changes and slots 3-6 are byte-identical. Per
+`src/vt/cpu/cpu_ops.cpp:3219` -- "Step l reads block row `previous`, the slot
+step l-1 chose" -- a flipped CHILD INDEX in `SelectorEdgeScores` moves the
+predecessor row that every later step reads, so four identical later slots would
+be four coincidences per block, twice. A different candidate ID at the SAME
+winning slot, which is a rank swap in `ComputeCandidates`' top-k over the target
+head's logits, produces exactly this shape with none. Neither is measured, so
+neither is claimed here.
+
+`SPEC-DFLASH` D6 licenses a near-tie envelope. It does not license labelling an
+unmeasured flip as one, and it never licensed naming the op.
+
+**The instrument is named and the measurement is OWED.**
+`Qwen3DFlash2Model::ComputeCandidates` already returns `(ids, values)`, and so
+does upstream's `compute_candidates`, so the next capture can record the top-2
+candidate margin at the flipping slot on both sides. That turns the envelope
+into a measurement and lets the data name the op instead of the prose.
+
+### G3 — SATISFIED, SAME-TRAJECTORY, and IDENTICAL — but it is a COROLLARY of G2 on this capture, not a second measurement
+
+**Read this heading before the table.** The per-prompt equality below is real,
+and it is very nearly ENTAILED by G2's own result rather than independent of it.
+Established by the W6 repair wave on 2026-08-21, by recomputing the oracle side
+from the committed golden:
+
+- Both engines are free-running and both emitted the SAME output on all four
+  prompts, and the prompt ids are asserted equal first, so the reconstruction
+  runs on the same `out` on both sides.
+- 45 of 47 blocks are BYTE-IDENTICAL, so for those 45 `ReconstructAcceptance`
+  runs on identical inputs and must return identical counts.
+- **Both divergent blocks have their divergent slot rejected on BOTH sides.**
+  Record 0 block 13: the output's slot 2 is `31785`, which is neither draft's
+  candidate (`14227` against `24844`), so both accept 2. Record 3 block 6: both
+  drafts carry `279` at slot 1 against an output of `9861`, so both accept 1.
+
+Per-prompt equality therefore follows arithmetically, and so do the 216-vs-216
+counter pair and the 7-token truncation deficit. The result is NOT deleted and
+NOT weakened -- it is a genuine consistency check on the reconstruction, and had
+either divergent block's flipped slot been ACCEPTED on one side the two counts
+would have parted -- but it must not be quoted as a second, independent gate
+reading. An acceptance gate that could disagree with G2 needs a prompt where the
+two engines' drafts differ AND the difference reaches the accepted prefix, and
+this capture contains no such prompt.
 
 Same-trajectory by construction: all four prompts produced the SAME token stream
-on both engines, so there is no trajectory confound to argue about.
+on both engines, so there is no trajectory confound to argue about. "By
+construction" here means by ADMISSION, not by teacher forcing -- see
+`## Gates` G3.
 
 | prompt | our accepted | oracle accepted |
 |---|---:|---:|
@@ -1766,8 +2028,26 @@ on both engines, so there is no trajectory confound to argue about.
 Both counted the same way, from drafts and output. On the OTHER instrument the
 two also agree: our runner's cumulative counter reads **216** and vLLM's
 `spec_decode_num_accepted_tokens` reads **216**. And the block counts agree
-exactly too -- our production trace emits 47 verified blocks and vLLM's
-`spec_decode_num_drafts` reads 47.
+exactly too -- our reconstruction verifies 47 blocks, the oracle's verifies 47,
+and vLLM's `spec_decode_num_drafts` reads 47.
+
+**W6 PRINTED BOTH OF THOSE AND ASSERTED NEITHER, and the wording above claimed
+them as ours-vs-theirs results.** `our_acc_sum` was a `MESSAGE` and was never
+CHECKed against vLLM's counter; our verified block count was not computed at
+all, and the "47" the gate printed was `draft_blocks_compared`, which is bounded
+by the shared-prefix cut and is a count of blocks the gate could PAIR rather
+than blocks this engine verified. What W6 actually asserted was the oracle's
+reconstruction against vLLM's two counters, and the per-prompt
+reconstruction-vs-reconstruction equality.
+
+Both are asserted now, by the repair wave, guarded on `same_traj == total`
+because vLLM's counters are pooled over the whole capture: `our_blocks_all ==
+oracle_blocks_all` (which, chained with the already-asserted `oracle_blocks_all
+== counted_drafts`, makes "our 47 and vLLM's 47" an asserted identity) and
+`our_acc_sum == counted_acc`. **Neither new assertion has been executed on the
+device**, because this repair wave took no lease and the case is dgx-only; they
+encode numbers W6 measured and printed, and the next device run is what confirms
+them.
 
 The 209/216 gap is `max_tokens` truncating the last block of three of the four
 requests, it appears on BOTH engines, and it is why the comparison is stated as
@@ -1836,6 +2116,48 @@ the 51.75 GiB target read from a CIFS mount, which put wall-clock at 11-12
 minutes for 24 tokens; that is a LOAD number and not a decode number. The
 per-prompt acceptance identity above is what the row needed before any of that,
 and it now has it.
+
+### W6's MUTATION SET, recorded here because W6 recorded none
+
+W4 and W5 each record their mutations in this file; W6 recorded none anywhere,
+and there was no `CLAIM-SPEC-DFLASH2-W6`. Both are repaired. Every count below
+was taken by the W6 repair wave on the CPU dev box at the merged tree, each
+mutation applied to a file whose sha256 was taken first and restored and rebuilt
+after, with the match count, `git diff --stat` and the compile rc printed for
+each. The suite reads **4 cases / 65 assertions / 0 failed / `Status: SUCCESS!`
+/ rc 0** unmutated there (the e2e case SKIPs without a checkpoint); it read 3
+cases / 41 assertions before this wave.
+
+The three that gate what W6 landed:
+
+| mutation | result |
+|---|---|
+| `ListField` drops the last id of every list | 1 case / **7 of 65** red, `Status: FAILURE!`, rc 1 |
+| `len += 1 + acc` becomes `len += acc` (the bonus token forgotten) | 1 case / **7 of 65** red, `Status: FAILURE!`, rc 1 |
+| the `len + j >= out.size()` truncation guard deleted | **SIGSEGV, rc 139** |
+
+**And the third one is the reason a doctest assertion line is not a verdict.**
+Under it the run prints `assertions: 64 | 64 passed | 0 failed` -- one FEWER
+assertion than green, all of them passing -- while the case failed and the
+process died on a signal. `Status: FAILURE!` and the exit code are what bind;
+the assertions line reads like a pass and is not one.
+
+The four that gate what this repair wave adds, all in the new always-on case:
+
+| mutation | result |
+|---|---|
+| liveness decided by the TOTAL block count instead of per record | 1 case / 1 assertion red |
+| every golden declared live (`g.live = true`) | 1 case / 2 assertions red |
+| `with_blocks` counts every record whether or not it carries drafts | 1 case / 4 assertions red |
+| the `hook_stats` residual claimed to be 0 instead of 3 | 1 case / 1 assertion red |
+
+**NOT MUTATED, and named rather than left to be assumed:** the e2e case's own
+`gd.live` guards on the G2b/G3 hard bars and its two new ours-vs-theirs
+assertions. That case is dgx-only and SKIPs without a checkpoint, so no mutation
+of it can be executed on this box. Deleting the production call site is not
+available either, for the same reason. The always-on case exists precisely so the
+liveness RULE is gated somewhere it runs; the WIRING of that rule into the e2e
+case is owed a device run.
 
 ---
 
@@ -2156,9 +2478,46 @@ arrival, not owed: the coverage counters now read the same tensor population the
 comparison reads, and the asset-gated case reports each half's absence by its own
 variable instead of only when both are unset.
 
-Next action: W6's G2/G3 on a leased GPU against the PR-head oracle — which also
-carries O16 and O17 — then
-`## Outcome`. **No throughput number is claimed by this wave and none is
-admissible yet**: `## Gates` defers every ratio until G2 and G3 read, and a
-DFlash2 draft is additionally off the paged CUDA-graph fast path, because the
-selector needs the hidden states of the same forward its logits came from.
+**Owed after W6:** O5 and O14 (the loader's GGUF and DFlash2 lines are still
+not reachable from a production entry point), O9 (`input_embedding_scale`), O10
+(the CUDA top-k's NaN ordering,
+[#1489](https://github.com/mudler/vllm.cpp/issues/1489)), O11 (the walk's CUDA arm — its own entry
+already records that it has RUN on `dgx:gpu0`, and W6 ran all seven DFlash2
+suites there with zero skips; what is stale is the "never compiled here" gloss in
+the `Owed after W5` line above, which this line supersedes), O12 (the probabilistic arm), O13
+(a GGUF drafter's bf16 residency, 3.584 GiB against 1.06 GiB on disk), O15 (the
+three output-scalar GGUF key spellings), O21 (now a MERGED upstream, #1538 and
+#1561) and O22/O23. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
+discharged.
+
+**And five things this row owes that W6 did not name**, all opened by the repair
+wave on 2026-08-21:
+
+1. **The gate head is one merge behind vLLM's `main`.**
+   [#1561](https://github.com/mudler/vllm.cpp/issues/1561). `## Gates` G2's own
+   rule selects `b389ac29`; the W6 capture is dated at `66e5414c` and re-reading
+   G2/G3 at the merged head is owed. O21's parked D12 decision comes due with it.
+2. **The oracle capture harness exists only as PROSE.**
+   [#1562](https://github.com/mudler/vllm.cpp/issues/1562). O22 and O23 describe
+   the repaired hook, the backend read-back, the abort-on-zero and
+   `w6-relabel.py`; none of it, and no run log, is in the tree. The next agent to
+   instrument this oracle rewrites it, which is the cost O23 was written to
+   prevent. The FLASH_ATTN golden's post-hoc backend label and O17's
+   unreproducible discharge are the same issue.
+3. **The two divergent draft blocks are UNATTRIBUTED.**
+   [#1564](https://github.com/mudler/vllm.cpp/issues/1564). The instrument is
+   named — the top-2 candidate margin at the flipping slot, on both sides — and
+   the next capture takes it.
+4. **Three propose calls in the TRITON_ATTN golden are unaccounted for.**
+   `hook_stats` says 59 calls less 1 dummy; 55 blocks are recorded. Bounded
+   one-sidedly by the gate now, and unexplained, under #1562.
+5. **The two new ours-vs-theirs assertions have never run on a device.** They
+   encode numbers W6 measured and printed; the next device run confirms them.
+
+Next action: **#1561** — move the gate head onto merged upstream `b389ac29` and
+re-read G2 and G3 there, taking #1564's top-2 margin in the same capture and
+committing #1562's harness with it — then `## Outcome`. **No throughput number
+is claimed by this row and none is admissible yet**: `## Gates` defers every
+ratio until G2 and G3 read at the head the rule selects, and a DFlash2 draft is
+additionally off the paged CUDA-graph fast path, because the selector needs the
+hidden states of the same forward its logits came from.

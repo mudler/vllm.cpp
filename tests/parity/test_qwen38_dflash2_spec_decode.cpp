@@ -310,6 +310,45 @@ Reconstructed ReconstructAcceptance(const std::vector<std::vector<int32_t>>& dra
   return r;
 }
 
+// ── THE GOLDEN'S OWN LIVENESS PRECONDITION ──────────────────────────────────
+//
+// `draft_hook_installed: true` IS NOT LIVENESS, and reading it as liveness is
+// how a drafts-less golden passes the one check that exists to stop exactly
+// that. MEASURED 2026-08-21 on the committed FLASH_ATTN arm: it carries
+// `draft_hook_installed: true` and `blocks: []` on all four records, because it
+// was captured before the hook reached the REPLAYED graph (`## Owed` O23's third
+// failure). Selecting it with `VLLM_DFLASH2_EXPECT_BACKEND=FLASH_ATTN` then
+// drove the gate through the flag, found no block to pair, and reported
+// "STRUCTURAL: not a single block pair was anchor-aligned inside a shared
+// prefix" -- a sentence about OUR engine, on a run where our engine was never
+// the thing missing.
+//
+// So the golden is asked whether it can answer G2b and G3 at all, BEFORE either
+// is read out of it. A golden that carries no drafts makes those two gates VOID.
+// It does NOT make them fail, and it does not make G2a (output identity) void,
+// which such a golden can still answer.
+struct GoldenDrafts {
+  size_t records = 0;
+  size_t with_blocks = 0;   // records carrying at least one block
+  size_t total_blocks = 0;
+  bool live = false;        // every record carries drafts
+};
+
+GoldenDrafts InspectGoldenDrafts(const json& golden) {
+  GoldenDrafts g;
+  if (!golden.contains("records")) return g;
+  for (const auto& rec : golden.at("records")) {
+    ++g.records;
+    const size_t n = rec.contains("blocks") ? rec.at("blocks").size() : 0;
+    g.total_blocks += n;
+    if (n > 0) ++g.with_blocks;
+  }
+  // EVERY record, not the total. One drafts-less record among four would leave
+  // the total positive and silently contribute nothing to G2b on that prompt.
+  g.live = (g.records > 0 && g.with_blocks == g.records);
+  return g;
+}
+
 size_t SharedPrefix(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
   const size_t n = std::min(a.size(), b.size());
   size_t i = 0;
@@ -368,6 +407,49 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
   CHECK(golden.value("spec", std::string()) == "on");
   CHECK(golden.value("draft_hook_installed", false));
 
+  // THE GOLDEN'S LIVENESS, read from the golden's own records rather than from
+  // its `draft_hook_installed` flag. See `InspectGoldenDrafts`.
+  const GoldenDrafts gd = InspectGoldenDrafts(golden);
+  MESSAGE("golden drafts: " << gd.with_blocks << "/" << gd.records
+          << " records carry blocks, " << gd.total_blocks << " blocks total -> "
+          << (gd.live ? "G2b and G3 are TAKEABLE" : "G2b and G3 are VOID"));
+  if (!gd.live) {
+    MESSAGE("VOID for G2b/G3: this golden carries no per-block drafts on "
+            << (gd.records - gd.with_blocks) << " of " << gd.records
+            << " records, so there is nothing to pair a draft block against. "
+               "That is a property of the CAPTURE, not a finding about this "
+               "engine: it is what a capture taken before the hook reached the "
+               "replayed graph looks like (`## Owed` O23). G2a (output "
+               "identity) is still taken below; the draft-identity and "
+               "acceptance bars are NOT, and reporting them as failures would "
+               "name our engine for the oracle's missing instrument.");
+  }
+
+  // AND THE CAPTURE'S OWN BOOKKEEPING IS BOUNDED. `hook_stats` counts what the
+  // instrument saw; the records are what it wrote down. A golden that lost
+  // records between the two is a golden that under-reports the oracle's drafts,
+  // which reads as a draft-identity finding. MEASURED on the committed
+  // TRITON_ATTN arm: 59 propose calls, 1 skipped dummy, 0 skipped in capture,
+  // and 55 recorded blocks -- so THREE calls are unaccounted for and the
+  // residual is printed rather than absorbed (#1562). The bound is one-sided
+  // because a skipped-but-uncounted call can only lose a record, never invent
+  // one, and no wave has explained the residual well enough to close it.
+  if (golden.contains("hook_stats")) {
+    const auto& hs = golden.at("hook_stats");
+    const int64_t calls = hs.value("propose_calls", static_cast<int64_t>(-1));
+    const int64_t sk_dummy = hs.value("skipped_dummy", static_cast<int64_t>(0));
+    const int64_t sk_cap = hs.value("skipped_capture", static_cast<int64_t>(0));
+    if (calls >= 0) {
+      const int64_t recorded = calls - sk_dummy - sk_cap;
+      MESSAGE("golden hook_stats: " << calls << " propose calls - " << sk_dummy
+              << " dummy - " << sk_cap << " capture = " << recorded
+              << " expected records, against " << gd.total_blocks
+              << " written (residual " << (recorded - static_cast<int64_t>(gd.total_blocks))
+              << ", UNEXPLAINED, #1562)");
+      CHECK(static_cast<int64_t>(gd.total_blocks) <= recorded);
+    }
+  }
+
   const int k = golden.at("num_speculative_tokens").get<int>();
   const int max_tokens = golden.at("max_tokens").get<int>();
   const auto& records = golden.at("records");
@@ -388,6 +470,12 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
   int64_t our_acc_sum = 0, their_acc_sum = 0;
   int64_t oracle_acc_all = 0, oracle_blocks_all = 0;
   int64_t our_recon_sum = 0;
+  // OUR verified block count, derived by the SAME routine from OUR drafts and
+  // OUR output. `draft_blocks_compared` is NOT this number: it is bounded by the
+  // `g > shared` cut below, so it counts blocks the gate could PAIR, not blocks
+  // this engine verified. Recording both separately is what lets the ours-vs-
+  // theirs block claim be asserted instead of printed.
+  int64_t our_blocks_all = 0;
   int prompt_idx = 0;
 
   for (const auto& rec : records) {
@@ -530,6 +618,7 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
       CHECK(deficit >= 0);
       CHECK(deficit <= k);
       our_recon_here = check.total;
+      our_blocks_all += check.verified;
     }
 
     // ---- G3: acceptance, SAME-TRAJECTORY ONLY ------------------------------
@@ -563,7 +652,7 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
     // alone. That is a small confound and it is exactly the shape of the one
     // `SPEC-DFLASH` D8 got wrong at a larger scale, so it is named and both
     // pairs are reported.
-    if (is_exact) {
+    if (is_exact && gd.live) {
       MESSAGE("  G3 prompt[" << (prompt_idx - 1) << "] RECONSTRUCTION vs "
               "RECONSTRUCTION: ours " << our_recon_here << " against the "
               "oracle's " << their_acc << std::string(
@@ -609,7 +698,7 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
   // The counter is POOLED over the whole capture, which is exactly comparable
   // here because the capture ran at max_num_seqs 1 and generated the same four
   // prompts in the same order.
-  if (golden.contains("metrics")) {
+  if (golden.contains("metrics") && gd.live) {
     const auto& m = golden.at("metrics");
     const int64_t counted_acc =
         m.value("vllm:spec_decode_num_accepted_tokens", static_cast<int64_t>(-1));
@@ -630,6 +719,41 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
     if (counted_acc >= 0) {
       CHECK(oracle_acc_all <= counted_acc);
       CHECK(counted_acc - oracle_acc_all <= max_deficit);
+    }
+
+    // OURS AGAINST THEIRS, ASSERTED RATHER THAN PRINTED. Through W6 both of
+    // these were `MESSAGE` only, and the spec then read them as ours-vs-theirs
+    // results. They are asserted here, and BOTH are guarded on
+    // `same_traj == total`: vLLM's counters are POOLED over the whole capture,
+    // so they are comparable to our per-prompt sums only when every prompt
+    // contributed on both sides. On a partially diverging capture the numbers
+    // measure different populations and the comparison is skipped and said so.
+    if (same_traj == total) {
+      // Our verified block count against the oracle's, both from the same
+      // routine on each engine's own drafts and output. Chained with the
+      // `oracle_blocks_all == counted_drafts` line above, this is what makes
+      // "our 47 and vLLM's 47" an asserted identity rather than two printed
+      // numbers that happen to agree.
+      MESSAGE("OURS vs THEIRS, blocks: our reconstruction verifies "
+              << our_blocks_all << " blocks against the oracle's "
+              << oracle_blocks_all << " and vLLM's own counter's "
+              << counted_drafts);
+      CHECK(our_blocks_all == oracle_blocks_all);
+      // COUNTER against COUNTER -- the other matched pair. Our runner's
+      // cumulative `acc` sees the accepted tokens of a block `max_tokens` then
+      // truncated, and so does vLLM's, which is exactly why these two are
+      // comparable to each other and neither is comparable to a reconstruction.
+      if (counted_acc >= 0) {
+        MESSAGE("OURS vs THEIRS, counters: our runner's cumulative acceptance "
+                << our_acc_sum << " against vLLM's "
+                "spec_decode_num_accepted_tokens " << counted_acc);
+        CHECK(our_acc_sum == counted_acc);
+      }
+    } else {
+      MESSAGE("OURS vs THEIRS counter comparison SKIPPED: only " << same_traj
+              << " of " << total << " prompts walked the same trajectory, and "
+                 "vLLM's counters are pooled over the whole capture, so the two "
+                 "sides would count different populations.");
     }
   }
 
@@ -657,16 +781,107 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
   //     A fallback does not produce a majority; it produces near-zero.
   // Zero comparable blocks means the two engines diverged before the FIRST
   // block's context, which is a structural break rather than a near-tie.
-  if (draft_blocks_compared == 0) {
-    MESSAGE("STRUCTURAL: not a single block pair was anchor-aligned inside a "
-            "shared prefix. A bf16 near-tie diverges LATE; diverging before the "
-            "first block does not.");
+  //
+  // AND BOTH RUN ONLY ON A GOLDEN THAT CARRIES DRAFTS. Without that guard a
+  // drafts-less capture reports "STRUCTURAL" -- a verdict about this engine --
+  // when what is missing is the oracle's instrument. `gd.live` is decided from
+  // the golden's own records before any of this is read.
+  if (!gd.live) {
+    MESSAGE("G2b and G3 NOT TAKEN on this golden: it carries no per-block "
+            "drafts, so draft identity and acceptance cannot be measured from "
+            "it. This is a MEASUREMENT gap in the CAPTURE. G2a above still ran "
+            "and is a result.");
+  } else {
+    if (draft_blocks_compared == 0) {
+      MESSAGE("STRUCTURAL: not a single block pair was anchor-aligned inside a "
+              "shared prefix. A bf16 near-tie diverges LATE; diverging before "
+              "the first block does not.");
+    }
+    CHECK(draft_blocks_compared > 0);
+    CHECK(draft_blocks_identical * 2 > draft_blocks_compared);
   }
-  CHECK(draft_blocks_compared > 0);
-  CHECK(draft_blocks_identical * 2 > draft_blocks_compared);
   // (3) The drafter is alive on every prompt (checked in the loop) and our
   //     acceptance on the same-trajectory prompts is nonzero.
   CHECK(our_acc_sum > 0);
+}
+
+// ── THE GOLDENS' OWN LIVENESS, GATED ON EVERY BOX ───────────────────────────
+//
+// The e2e case above is dgx-only, so the rule it now enforces -- a golden that
+// carries no drafts makes G2b and G3 VOID rather than failed -- would otherwise
+// be unexecuted everywhere the gate actually runs. This case reads the two
+// COMMITTED goldens directly and holds `InspectGoldenDrafts` against what each
+// one really contains. It needs no checkpoint, no GPU and no engine.
+//
+// WHY IT IS WORTH A CASE. `draft_hook_installed` is `true` in BOTH goldens and
+// one of them has `blocks: []` on every record, so the flag and the drafts
+// disagree in the committed tree, today. A gate that read the flag as liveness
+// would call that golden live.
+TEST_CASE("dflash2 gate: a golden's drafts decide whether G2b and G3 are takeable") {
+  const fs::path dir = fs::path(PARITY_GOLDENS_DIR) / "dflash2_27b";
+  const fs::path triton = dir / "dflash2_27b_spec_on.json";
+  const fs::path flash = dir / "dflash2_27b_spec_on_flash_attn.json";
+  REQUIRE(fs::exists(triton));
+  REQUIRE(fs::exists(flash));
+
+  json gt, gf;
+  {
+    std::ifstream f(triton.string());
+    REQUIRE(f.good());
+    f >> gt;
+  }
+  {
+    std::ifstream f(flash.string());
+    REQUIRE(f.good());
+    f >> gf;
+  }
+
+  // THE FLAG IS TRUE ON BOTH, which is the whole point of this case.
+  CHECK(gt.value("draft_hook_installed", false));
+  CHECK(gf.value("draft_hook_installed", false));
+
+  // The TRITON_ATTN arm is the one the gates were read from: four records, all
+  // carrying drafts, 55 blocks. LIVE.
+  const GoldenDrafts t = InspectGoldenDrafts(gt);
+  CHECK(t.records == 4);
+  CHECK(t.with_blocks == 4);
+  CHECK(t.total_blocks == 55);
+  CHECK(t.live);
+
+  // The FLASH_ATTN arm carries NO drafts at all, on any record, because it was
+  // captured before the hook reached the replayed graph (`## Owed` O23). It can
+  // still answer G2a; it cannot answer G2b or G3, and `live` says so.
+  const GoldenDrafts f = InspectGoldenDrafts(gf);
+  CHECK(f.records == 4);
+  CHECK(f.with_blocks == 0);
+  CHECK(f.total_blocks == 0);
+  CHECK(!f.live);
+
+  // LIVENESS IS PER RECORD, NOT A TOTAL. One drafts-less record among four
+  // leaves the total positive while that prompt contributes nothing to G2b, so
+  // a total-based rule would read a partly blind capture as fully live. Built
+  // from the real golden so the shape is the shape the gate meets.
+  json partial = gt;
+  partial["records"][2]["blocks"] = json::array();
+  const GoldenDrafts pg = InspectGoldenDrafts(partial);
+  CHECK(pg.records == 4);
+  CHECK(pg.with_blocks == 3);
+  CHECK(pg.total_blocks > 0);   // a total-based rule would call this live
+  CHECK(!pg.live);              // and this one does not
+
+  // AND THE hook_stats RESIDUAL IS REAL, not a rounding of it. 59 propose calls
+  // less 1 dummy less 0 capture-skips is 58 expected records against 55
+  // written: three unaccounted for, tracked by #1562. The gate's bound is
+  // one-sided, and this pins both the bound and the residual so neither can
+  // drift unnoticed.
+  REQUIRE(gt.contains("hook_stats"));
+  const auto& hs = gt.at("hook_stats");
+  CHECK(hs.value("propose_calls", -1) == 59);
+  CHECK(hs.value("skipped_dummy", -1) == 1);
+  CHECK(hs.value("skipped_capture", -1) == 0);
+  const int64_t expected_records = 59 - 1 - 0;
+  CHECK(static_cast<int64_t>(t.total_blocks) <= expected_records);
+  CHECK(expected_records - static_cast<int64_t>(t.total_blocks) == 3);
 }
 
 // ── THE INSTRUMENT'S OWN GATE ───────────────────────────────────────────────

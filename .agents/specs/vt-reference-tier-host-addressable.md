@@ -279,6 +279,23 @@ is the landed commit message. The two GB10 logs that motivated the row are
   the remainder is what keeps it owned by an OPEN issue instead of a closed one.
 - A CUDA re-run of `tests/vt/test_ops_matmul_fp8_block_cuda` on a CUTLASS-less
   build, to record the refusal replacing exit 139. Owned by this row.
+- **This row widened the reach of `VT_ADOPT_DEVICE_BYTES`, and nobody has
+  measured the new arms.** Moving `ReferenceTierEligible` onto
+  `Backend::DeviceMemoryIsHostAddressable()` required truthful overrides so no
+  backend silently lost the tier, and `MetalBackend` and `RocmBackend` now answer
+  the predicate. That predicate is also what gates the weight-loader lever, at
+  both `AdoptDeviceBytesAsHost` branches in
+  `src/vllm/model_executor/models/qwen3_5_weights.cpp` — so since this row landed,
+  the lever ACTS on Apple silicon (`MetalContext::unified_memory()`, i.e.
+  `dev.hasUnifiedMemory`) and on an integrated ROCm part (`unified_memory_`, i.e.
+  a managed allocator or `PageableMemoryAccess` on an integrated device). Every
+  number recorded for that lever is GB10 through Vulkan.
+  [#1502](https://github.com/mudler/vllm.cpp/issues/1502) is the DOCUMENT half and
+  is fixed: `docs/ENVIRONMENT.md` had said "Vulkan today" and "No effect on
+  CUDA/CPU/Metal", and it now separates the backends the lever is MEASURED on from
+  the backends that merely satisfy the predicate. What stays owed is the
+  MEASUREMENT itself on the two new arms, which needs an Apple-silicon box or an
+  integrated AMD part and cannot be taken here. Owned by this row.
 
 ## Now
 

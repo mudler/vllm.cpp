@@ -185,6 +185,42 @@ c1 pairing even though the cross-arm rule passed perfectly. Two arms measured in
 a lease may not be dividable, so budget for absolutes and say so in advance
 rather than discovering it after the GPU time is spent.
 
+**The missing capability is `CAP_SYS_ADMIN`, and it is missing from the BOUNDING
+set. Measured 2026-08-21 inside leases on `thor:gpu0` and `orin:gpu0`.**
+`/proc/self/status` in the worker reads `CapEff = CapPrm = CapBnd =
+0x00000000a80425fb` on both boxes, byte-identical -- the default 14-capability
+OCI set, which holds neither `CAP_SYS_ADMIN` nor `CAP_PERFMON` nor
+`CAP_SYS_NICE`. Those three are the whole Linux privilege surface of the NVIDIA
+open kernel module: at tag `580.173.02`, `grep -n 'capable(\|CAP_'` over
+`kernel-open/common/inc/nv-linux.h` and `kernel-open/nvidia/os-interface.c`
+returns `NV_IS_SUSER() == capable(CAP_SYS_ADMIN)` at `nv-linux.h:537`,
+`capable(CAP_PERFMON)` at `os-interface.c:390`, and `capable(CAP_SYS_NICE)` at
+`os-interface.c:397`, and nothing else. **`CapBnd` is why no job can route around
+it**: a capability absent from the bounding set cannot be regained by `setcap`,
+by a setuid binary, or by re-execing, so this is container configuration and not
+job authorship. `thor:gpu0` reproduced the refusal itself on driver `595.78`
+(`LGC_RC=4`), so the refusal is measured on two boxes and two driver versions.
+`/proc/driver/nvidia/params` reads `RmProfilingAdminOnly: 1` in the lease, which
+governs PROFILING COUNTERS and is a different gate -- do not reach for an `NVreg`
+knob expecting `-lgc` to start working. The ask, the acceptance test that
+falsifies it, and the cost are in
+[`lease-gpu-capability.md`](specs/lease-gpu-capability.md).
+
+**Clock pinning DOES work from the leased HOST, and the pod path is still
+refused. Measured 2026-08-21.** Under an `rc hold` lease on `dgx:gpu0`, over
+`ssh` to the host, `sudo -n nvidia-smi -pm 1` then `-lgc 2100` held **0.29%**
+SM-clock spread over a ten-minute decode load (120 samples, min 2080, max 2086),
+against the 12.92%-26.36% the unpinned windows above recorded. **That path needs
+an authorization most rows do not have**: `.agents/developer-preferences.md`
+scopes `rc hold` plus `ssh` to the `BENCH-QWEN38-27B-SOTA` campaign and leaves
+the standing rule unchanged for every other row. So a ratio is derivable on that
+box by that path, and the pod path -- the only path for every other row -- still
+returns `LGC_RC=4`. Two caveats travel with the host path: persistence mode had
+to be enabled first, and it can be lost when the last GPU client detaches, so
+**verify the clock DURING the run and never only before it**; and the recorded
+`-lgc 2100` recipe is about 69% of this device's 3003 MHz maximum SM clock, which
+is right for a RATIO and wrong for an ABSOLUTE.
+
 **A model DOES run inside a lease.** The same series ran the pinned oracle
 `0.1.dev1+g555967922` as a server on a 52 GiB bf16 checkpoint from a lease, no
 `ssh` and no container image, and it served three clean benchmark legs. That

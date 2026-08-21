@@ -159,25 +159,13 @@ every figure traces back to the run that produced it.
 
 ## Quickstart
 
-```sh
-# Build (CPU; the server is ON by default)
-cmake -S . -B build && cmake --build build -j
-```
+Start at **[docs/QUICKSTART.md](docs/QUICKSTART.md)**. It runs one model from one command, with
+no build and no checkpoint of your own: a container lane, the `curl` that answers it, the release
+archive for a host without Docker, and the cache, token, and offline notes. `--model` accepts a
+directory, a `.gguf` file, `org/repo`, or `org/repo:TAG`, and fetches what your cache lacks.
 
-```sh
-# Serve an OpenAI-compatible endpoint
-build/examples/server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
-```
-
-```sh
-curl http://localhost:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model": "Qwen3.6-27B", "prompt": "The capital of France is", "max_tokens": 64}'
-```
-
-Any OpenAI client works by pointing its `base_url` at it. For a one-shot completion without a
-server: `build/examples/vllm-cli --model <dir> --prompt "..."`. Full CLI, server, and library
-reference: [docs/USAGE.md](docs/USAGE.md). CUDA, Metal, Vulkan, and every CMake option:
+Full CLI, server, and library reference: [docs/USAGE.md](docs/USAGE.md) and
+[docs/reference/](docs/reference/README.md). CUDA, Metal, Vulkan, and every CMake option:
 [docs/BUILD.md](docs/BUILD.md).
 
 ## Features: vLLM parity, then everything else

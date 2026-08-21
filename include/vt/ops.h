@@ -985,10 +985,21 @@ struct Dflash2SelectorEdgesArgs {
 // including the all -inf row and the forced tie group, so no fixture without a
 // NaN could see it. The clause is now DELETED rather than this claim narrowed,
 // and the lower-slot tie rule stays where it is needed: the cross-lane
-// butterfly, which combines lane winners out of slot order. That deletion has
-// never been compiled or run on a device -- the authoring host has no `nvcc` --
-// and is owed with the rest of the CUDA arm at `## Owed` O11 of
-// .agents/specs/dflash2-spec-decode.md. NO SHIPPED PATH FEEDS THIS OP A NaN:
+// butterfly, which combines lane winners out of slot order. BOTH HALVES OF
+// THAT DELETION ARE NOW COVERED, and #1518 corrects an earlier sentence here
+// saying it had never been compiled or run on a device. It COMPILES on every
+// pull request: `src/vt/cuda/cuda_ops.cu` is in the CUDA source list
+// (CMakeLists.txt, `target_sources(vllm PRIVATE ...)` under `if(VLLM_CPP_CUDA)`)
+// that CI's `build-cuda-fat` job builds for ten architectures
+// (`80;86;87;89;90a;100a;103a;110;120a;121a`). And it has RUN: the operator
+// executed this suite on `dgx:gpu0` (GB10, sm_121a) at the W4 merge commit,
+// reporting 83 assertions on device against 49 on CPU, `Status: SUCCESS!`, with
+// zero `no CUDA backend; skipping` lines -- the increment includes the NaN row
+// chained into the parity fixture, which is the row that measured the
+// divergence. What remains owed at `## Owed` O11 of
+// .agents/specs/dflash2-spec-decode.md is the rest of that entry, not this
+// deletion; the AUTHORING HOST still has no `nvcc` and still skips the case
+// locally. NO SHIPPED PATH FEEDS THIS OP A NaN:
 // the lattice comes from vt::Dflash2SelectorEdges over a target LM head, so the
 // row that measured the difference is synthetic, and it is a gap in the reach
 // of the contract rather than in any draft a user can obtain.

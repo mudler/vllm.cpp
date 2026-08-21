@@ -771,6 +771,18 @@ which form.
 ## Owed
 
 - ModelScope resolution, `vllm/transformers_utils/repo_utils.py:239`.
+- **Every row of the `docs/QUICKSTART.md` model table.** The page, its
+  `PENDING(#N)` grammar and `scripts/check-quickstart-recipes.py` landed as
+  scaffolding, and the table carries exactly one row whose every cell is a
+  placeholder. The bar for a real row is that somebody ran it end to end, image
+  pulled and model fetched and tokens returned, recording the date and the host.
+  Two things block that today and neither is a judgement about a model:
+  [#1511](https://github.com/mudler/vllm.cpp/issues/1511) reads a relative HTTP
+  `Location` header as a URL, so `--model org/repo` fetches nothing from the
+  real hub, and no container image has been published, so no lane image can be
+  pulled. The two `PENDING` recipes on the page carry the same cause. Row
+  `ROAD-V1-QUICKSTART`, issue
+  [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
 - `--tokenizer-revision` and `--code-revision`, `vllm/config/model.py:186,190`.
 - LoRA adapter fetch, `vllm/lora/utils.py:346`.
 - The llama.cpp Docker-registry model path, `common/download.cpp:847`.

@@ -179,11 +179,14 @@ TEST_CASE("dflash2: the walk REFUSES a lattice that does not match its candidate
   // walk consumes it: a lattice that is not [num_reqs, num_steps, K, K] would
   // index plausible scores from the wrong rows and move acceptance silently.
   //
-  // Each refusal is matched on its MESSAGE. These three checks sit next to each
-  // other over the same state, so a bare `CHECK_THROWS` would be satisfied by
-  // whichever of them still stood after the others were deleted -- which is what
-  // W4's fresh review measured: deleting the candidate-set check and the i32
-  // refusal together left this suite green.
+  // Each refusal is matched on its MESSAGE. The FIVE blocks below drive THREE
+  // guards -- the lattice-size check, the candidate-set shape check on each of
+  // its two axes, and the i32-range check on each end of the range (#1518
+  // corrects an earlier sentence here that counted them as three checks). They
+  // sit next to each other over the same state, so a bare `CHECK_THROWS` would
+  // be satisfied by whichever guard still stood after the others were deleted --
+  // which is what W4's fresh review measured: deleting the candidate-set check
+  // and the i32 refusal together left this suite green.
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
   CHECK_NOTHROW(vllm::v1::Dflash2WalkPath(GoodState(), q));
 

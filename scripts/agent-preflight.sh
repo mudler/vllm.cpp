@@ -93,6 +93,7 @@ CHECKERS=(
   check-role-discipline
   claim-view
   check-readme-structure
+  check-quickstart-recipes
   check-public-doc-tables
   check-model-checklist
   check-supported-models
@@ -140,6 +141,7 @@ SUITES=(
   test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
+  test_check_quickstart_recipes
   test_check_public_doc_tables
   test_check_model_checklist
   test_check_supported_models

@@ -164,6 +164,35 @@ The table separates leaf times, containing spans, call counts, and unattributed
 time. It is a within-run attribution tool, not a benchmark harness. See
 [benchmarks](../BENCHMARKS.md) for accepted measurements.
 
+### Split the flow-matching transformer
+
+The table above reports one `denoise.dit_device` row for the whole transformer
+forward. Add `VLLM_CPP_MUSIC3_DIT_SPANS=1` to split that row into sixteen spans:
+the host packing, the input projections, the timestep embedding, the rotary
+tables, nine per-layer spans covering the two normalizations, the query-key-value
+projections, the rotary application, the attention, the output projection, the
+gated projections and the activation, and the output projections and readback.
+The run also reports `dit.seq_sum` and `dit.length_sum`, the summed window
+geometry the split has to be read against.
+
+```sh
+VLLM_CPP_MUSIC3_PROFILE=1 VLLM_CPP_MUSIC3_DIT_SPANS=1 minimax-music3-gen \
+  --model "$CHECKPOINT_ROOT/minimax-music3" \
+  --duration 20 --steps 2 --device 1
+```
+
+The spans require a device synchronization at every boundary, because the
+transformer's operations are asynchronous on one stream and a boundary that does
+not drain the queue measures the launch instead of the kernel. That
+synchronization perturbs the total it splits. `VLLM_CPP_MUSIC3_DIT_SPANS`
+therefore stays separate from `VLLM_CPP_MUSIC3_PROFILE`: with only the latter
+set, the forward is exactly the path every recorded `denoise.dit_device`
+measurement was taken on. Read the split as a ratio within its own run, and read
+the total from a run with the spans off.
+
+The spans are printed and never summed, so `sum(leaf)`, `unattributed` and every
+recorded stage total are unchanged whichever way the flag is set.
+
 ## Vocoder precision and device selection
 
 MiniMax-Music3 shares its one-dimensional vocoder convolutions with MiniMax-H3,

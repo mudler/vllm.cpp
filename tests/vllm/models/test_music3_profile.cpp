@@ -61,6 +61,36 @@ TEST_CASE("music3 profile is OFF unless the environment asks for it") {
   CHECK(profile::ParseEnabled("yes"));
 }
 
+TEST_CASE("music3 profile: the DiT spans are a SECOND opt-in and cannot arm the instrument") {
+  // Spec §21.3. The intra-DiT spans synchronize the device queue at every
+  // bracket, which perturbs the very total they split, so they are deliberately
+  // NOT reachable from `VLLM_CPP_MUSIC3_PROFILE` alone — that flag has to keep
+  // producing byte for byte the path §20 timed, or `denoise.dit_device` stops
+  // being comparable to §15.7's and §20's tables.
+  const bool prev_profile = profile::EnabledFlag();
+  const bool prev_spans = profile::DitSpansFlag();
+
+  // Asking for spans with the instrument OFF is a no-op, never a partial arming:
+  // there is no table for a span to land in.
+  profile::EnabledFlag() = false;
+  profile::DitSpansFlag() = true;
+  CHECK_FALSE(profile::DitSpans());
+  CHECK_FALSE(profile::Enabled());
+
+  // The instrument ON without the second flag is the SHIPPED profiled path.
+  profile::EnabledFlag() = true;
+  profile::DitSpansFlag() = false;
+  CHECK(profile::Enabled());
+  CHECK_FALSE(profile::DitSpans());
+
+  // Both, and only both.
+  profile::DitSpansFlag() = true;
+  CHECK(profile::DitSpans());
+
+  profile::EnabledFlag() = prev_profile;
+  profile::DitSpansFlag() = prev_spans;
+}
+
 TEST_CASE("music3 profile records nothing while disabled") {
   const bool previous = profile::EnabledFlag();
   profile::EnabledFlag() = false;

@@ -25787,3 +25787,204 @@ bucket table for all seventeen runs. The checkpoint is `/workspace/music3/ckpt`
 and the lyrics `/workspace/music3/lyrics.txt`; `ar.prompt_tokens` is **282** on
 every run here, against §15.8's 223, so the prompt is not the one §16.6b used and
 `ar.lm_prefill` is the only bucket that difference reaches.
+
+## 2026-08-21 — MUSIC3-DIT-SPLIT: the flow-matching DiT is ATTENTION-bound, not GEMM-bound — `vt::AttentionCross` is 43.9% of the forward for 4.0% of its flops (#672, #1542, #1555)
+
+**Result: ACCEPTED as a within-run SPLIT and a same-box A/B. NOT a per-kernel or
+cross-box figure** — `nvidia-smi` reports `clocks.sm` as `[N/A]` on this device,
+so no clock window was taken (`.agents/benchmarking.md` §The clock is part of the
+measurement). No parity claim: vLLM and vLLM-Omni register nothing for this
+architecture.
+
+**Box and lease.** `rc` job `0f95377f-70dd-4bf8-93b5-8e44fd762713` on
+`thor:gpu0`, `--max-runtime 180m`, worker `rc-worker-m4d7t`, Linux
+6.8.12-1021-tegra aarch64, 14 cores, NVIDIA Thor sm_110, driver 595.78, boot id
+`c99b7805-6e26-47a7-bc9d-93d592d676a6`. No `ssh`, no `rc hold`, no `$GPU_LOCK`:
+the lease is the whole of the serialisation. `uptime` **3.46 with 0 logins** at
+job start — this box's idle floor (§20.1 read 3.27, §18.8a 3.29) — rising to
+10-13 inside our own 14-thread host vocoder and falling between runs.
+
+**Tree and build.** `0e18f8afd` (`row/MUSIC3-DIT-SPEED`), asserted equal to the
+expected sha before anything was built. `Release`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_BUILD_TESTS=ON`, nvcc 13.0.88.
+
+**Checkpoint STAGED, and asserted.** `findmnt /workspace` ->
+`//192.168.68.102/Data[/rc] cifs`; `findmnt -T /tmp/ckpt` -> `overlay overlay /`.
+`SRC_BYTES=28517617303` = `DST_BYTES=28517617303` = the recorded
+`EXPECT_BYTES`, hard fail on mismatch. `STAGE_SECONDS=708` = 40.3 MB/s off CIFS.
+
+**Arms and the behavioural control.** #1516 records the two-binary sha256 guard
+as UNFALSIFIABLE for `minimax-music3-gen` (a 72 744-byte client of the shared
+`vllm::shared`), so the arms here are ONE binary under two environments and the
+control is the BUCKET SET: `dit.*` spans are present exactly when
+`VLLM_CPP_MUSIC3_DIT_SPANS=1`, and `ar.depth_staging` (0.754-0.757 s) is present
+in every run, so the depth device arm engaged throughout.
+
+### The split — `--duration 20 --steps 2 --device 1`, 8 calls = 16 forwards
+
+Geometry MEASURED rather than inferred: `dit.seq_sum / 16 = 690`,
+`dit.length_sum / 16 = 689`.
+
+`denoise.dit_device` **25.104 s**; the sixteen spans sum to **25.100 s** — a
+**99.98 % partition**.
+
+| group | seconds | % of the DiT | TFLOP/forward | TFLOP/s |
+|---|---:|---:|---:|---:|
+| **`dit.attn` (`vt::AttentionCross`)** | **11.010** | **43.9 %** | **0.140** | **0.204** |
+| the four `vt::MatmulBT` GEMMs | 13.390 | 53.3 % | 3.334 | **3.98** |
+| norms, rope, SiLU, packing, readback | 0.700 | 2.8 % | — | — |
+
+Per span: `dit.attn` 11.010, `dit.ff_in` 6.635, `dit.ff_out` 3.238, `dit.qkv`
+2.591, `dit.attn_out` 0.926, `dit.silu` 0.225, `dit.temb` 0.167, `dit.pre`
+0.122, `dit.rope` 0.062, `dit.norm1` 0.046, `dit.norm2` 0.045, and
+`dit.pack`/`dit.rope_build`/`dit.post`/`dit.readback`/`dit.untranspose` 0.033
+between them.
+
+**The attention kernel does 4.0 % of the forward's arithmetic in 43.9 % of its
+time — 19.5x slower per flop than the GEMMs beside it, on the same tensors, in
+the same forward, on the same device.** At the developer's 30 steps that is
+0.6881 s x 240 forwards = **165.2 s of the 370.556 s `denoise.dit_device`
+bucket and 27.7 % of the whole 595.9 s run**. Owned by #1555.
+
+**This refutes the arithmetic that opened the row.** Spec §21.1 divided §20's
+370.556 s by 240 forwards and 3.33 TFLOP of GEMM and reported "~2.2 TFLOP/s".
+The GEMMs run at **3.98 TFLOP/s**; 2.2 was an average over a forward that is
+nearly half something else, and every inference drawn from it is superseded.
+
+### The instrument's own perturbation, MEASURED rather than assumed
+
+Arms ALTERNATED `on, off, on, off` in one job on one staged checkpoint:
+
+| | spans ON | spans OFF | ratio |
+|---|---:|---:|---:|
+| round 1 `denoise.dit_device` (8 calls) | 25.104 | 24.737 | 1.0148 |
+| round 2 `denoise.dit_device` (8 calls) | 25.117 | 24.749 | 1.0149 |
+| round 1 wall | 252.902 | 253.577 | 0.9973 |
+| round 2 wall | 253.049 | 253.097 | 0.9998 |
+
+**The 331 synchronizes per forward cost 1.49 % of the DiT bucket, reproduced to
+0.01 % across two independent pairs, and do not register on wall clock at all.**
+So `denoise.dit_device` with the flag unset stays comparable to §15.7's
+370.746 s and §20's 370.556 s value for value, and the split above is
+trustworthy at the 1.5 % level.
+
+Two spans-ON rounds agree to better than 0.2 % on EVERY span (`dit.attn` 11.010
+vs 11.025, `dit.ff_in` 6.635 vs 6.625, `dit.qkv` 2.591 vs 2.591), which is the
+evidence that the box was quiet.
+
+### The audio does not move
+
+**All four short runs wrote ONE WAV hash** —
+`61a8989763bba749edab8ddc3e597d7a`, 3 530 796 bytes — across both spans arms.
+The instrument is a pure timing arm.
+
+### The instrument reproduces the record, across two jobs
+
+The AR half and the vocoder do not depend on the step count, so §20's 20 s /
+30 steps figures and this job's 20 s / 2 steps figures are a cross-job control
+on identical call counts:
+
+| bucket | §20 | here | calls | delta |
+|---|---:|---:|---:|---:|
+| `ar.lm_decode_step` | 56.174 | 56.437 | 500 | +0.5 % |
+| `ar.depth_forward` | 21.099 | 21.180 | 4008 | +0.4 % |
+| `ar.depth_projection` | 6.966 | 7.007 | 3507 | +0.6 % |
+| `ar.semantic_guide_and_draw` | 3.701 | 3.710 | 501 | +0.2 % |
+| `ar.depth_head_and_draw` | 3.489 | 3.632 | 3507 | +4.1 % |
+| `vocoder.decode_window` | 122.169 | 124.897 | 4 | +2.2 % |
+
+### The 30-step point — the §20 configuration, and it reproduces to 0.012 %
+
+`--duration 20 --steps 30 --device 1`, spans OFF, staged checkpoint, `uptime`
+14.14 before / 12.80 after:
+
+| bucket | §20 (`a50c57d69`) | here (`0e18f8afd`) | calls | delta |
+|---|---:|---:|---:|---:|
+| **`denoise.dit_device`** | **370.556** | **370.510** | 120 | **-0.012 %** |
+| `vocoder.decode_window` | 122.169 | 124.429 | 4 | +1.85 % |
+| `ar.lm_decode_step` | 56.174 | 56.395 | 500 | +0.39 % |
+| `ar.depth_forward` | 21.099 | 21.158 | 4008 | +0.28 % |
+| `ar.depth_projection` | 6.966 | 6.880 | 3507 | -1.23 % |
+| wall | 595.899 | 598.207 | — | +0.39 % |
+
+`sum(leaf)` 597.247, `unattributed` 0.313 (0.05 %). **Two commits, two jobs, two
+days, identical call counts.** With the flag unset this tree produces the number
+§20 recorded, so the instrument did not move the quantity it exists to explain.
+
+**The audio is BYTE-IDENTICAL to the record**: `55856deb3b5b727a4ca4fcc473e01a56`,
+3 530 796 bytes — the hash §20.5 recorded for its 20 s pair at `a50c57d69`.
+
+The per-forward geometry is identical at 2 and 30 steps (`seq` 690 both), so
+`dit.attn` at 0.6881 s x 240 forwards is **165.1 s of 370.510 s = 44.6 % of the
+DiT and 27.6 % of the whole 598.207 s run**.
+
+### One candidate lever is MEASURED UNAVAILABLE
+
+`CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY` — cuBLASLt's fp32 emulation, the one
+precision-adjacent lever that would have kept the declared dtype at fp32 — **is
+undefined in nvcc/cuBLASLt 13.0.88 on this device**. A probe transcribing
+`MatmulBTKernelCuda`'s descriptor construction fails to compile:
+`PROBE_BUILD_RC=2`, `identifier "CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY" is
+undefined`. It is an enumerator, not a macro, so no preprocessor test can guard
+it. Costs nothing: the split says the lever is the attention kernel, not
+precision.
+
+### What is NOT established
+
+* **The mechanism.** #1555 names the per-key five-step `__shfl_xor_sync`
+  butterfly and an occupancy near 8 warps per scheduler as the leading
+  hypothesis, with the instruction-count arithmetic beside it (~1.8 ms/layer
+  predicted against 19.1 ms measured). **No `ncu` counter was read on either
+  side and no occupancy figure was measured.** The split is measured; its
+  attribution is not.
+* **Any speed claim for a fix.** Nothing was made faster by this row.
+* **A cross-box or per-kernel figure.** No clock window exists on this device.
+
+### The GEMM half is at the device's fp32 CEILING, so the attention lever is the only one left in-oracle
+
+Standalone probe transcribing `MatmulBTKernelCuda`'s descriptor, three layouts,
+`TRANSA=T`/`TRANSB=N`, `CUBLAS_COMPUTE_32F`, `CUDA_R_32F` scale, 32 MB workspace
+and `requestedAlgoCount=1` — so it prices OUR invocation, not a generic SGEMM.
+`thor:gpu0`, nvcc/cuBLASLt 13.0.88 / 13.1, driver 13020, binary
+`9960f5e1e1fb41b90c1d0669c507927830bb486572a43d3030910bdfeeda44b0`, 3 rounds
+agreeing to 0.3 % on the fp32 arms.
+
+`NVIDIA Thor cc=11.0`, **20 SMs at 1.049 GHz** => fp32 CUDA-core peak
+**5.369 TFLOP/s** (128 lanes/SM assumed, stated because the percentages rest on
+it); memory bandwidth 273.0 GB/s.
+
+At the DiT's own **M = 690**, TFLOP/s:
+
+| shape | f32 `COMPUTE_32F` | % fp32 peak | f32 `FAST_TF32` | bf16 | plan rebuild |
+|---|---:|---:|---:|---:|---:|
+| `qkv` `[690,2048]x[2048,2048]` | **3.84** | **71.5 %** | 52.84 | 134.66 | 0.9 us |
+| `attn_out` | **3.84** | **71.5 %** | 52.97 | 134.45 | 0.9 us |
+| `ff_in` `[690,2048]x[16384,2048]` | **4.17** | **77.7 %** | 59.04 | 94.40 | 1.1 us |
+| `ff_out` `[690,8192]x[2048,8192]` | **4.24** | **79.0 %** | 29.51 | 48.03 | 0.9 us |
+
+TF32 and bf16 run on TENSOR cores, so the fp32-CUDA-core denominator does not
+apply to them and no percentage is quoted; they price what precision would be
+worth, and precision is a divergence from the oracle (§21.2).
+
+**1. The GEMMs are at the ceiling.** 71.5-79.0 % of the device's true-fp32 peak,
+which is what a well-served SGEMM looks like; the in-situ half measured
+**3.98 TFLOP/s**, inside that band.
+
+**2. The in-situ calls ARE those calls, within 2.9 %.** Summing the probe's
+isolated per-call times over a block (3x`qkv` + `attn_out` + `ff_in` + `ff_out`
+= 22.59 ms) over 36 blocks predicts **813.5 ms** of GEMM per forward against a
+measured **836.9 ms**. No dispatch overhead, no launch-gap term, no untuned-shape
+term hides in the 53.3 %.
+
+**3. The per-call plan rebuild is REFUTED as a lever.** `MatmulBTKernelCuda`
+rebuilds descriptor + 3 layouts + preference + heuristic on EVERY call, 252 per
+forward, measured at **0.9-1.1 us** each = **~0.25 ms of a 1569 ms forward,
+0.016 %**. A plan cache for this op buys nothing here. This was the row's
+second-ranked hypothesis and it is closed, not left open.
+
+**The prize, as a BOUND and not a promise.** If `vt::AttentionCross` merely
+matched the GEMMs' measured 3.98 TFLOP/s, its 0.140 TFLOP would cost **35.2 ms
+instead of 688.1 ms**: forward 1569 -> 916 ms (**1.71x on the DiT**), bucket
+370.510 -> 216.3 s, run 598.207 -> 444.0 s (**1.35x end to end**). An upper
+bound from a flop ratio on a kernel nobody has written.

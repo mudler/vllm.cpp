@@ -314,5 +314,65 @@ class TagResolutionTests(unittest.TestCase):
             )
 
 
+class BuildParallelismMutationTests(unittest.TestCase):
+    """Issue #1548. The ten-SM fat cuda lane may not take the whole runner.
+
+    Each .cu file in that lane is compiled for ten device architectures, so one
+    compiler process holds many times the resident set of a cpu or vulkan
+    translation unit. Run 32447481128 died at object 512 of 787 with exit 143.
+    The two building jobs build the identical image, so a cap that holds in one
+    and not the other lets publish die on the build verify proved.
+    """
+
+    def test_an_uncapped_nproc_reaching_every_lane_is_rejected(self):
+        for job in ("verify", "publish"):
+            marker = (
+                "vllm-cpp-verify" if job == "verify" else "vllm-cpp-publish"
+            )
+            text = SHIPPED.replace(
+                '            --build-arg "JOBS=${jobs}" \\\n'
+                f'            --tag "{marker}:',
+                '            --build-arg "JOBS=$(nproc)" \\\n'
+                f'            --tag "{marker}:',
+            )
+            self.assertNotEqual(text, SHIPPED, f"{job} mutation did not apply")
+            assert_flags(self, text, f"job {job!r} hands JOBS=$(nproc)")
+
+    def test_dropping_the_cuda_cap_from_either_building_job_is_rejected(self):
+        for job, marker in (
+            ("verify", "vllm-cpp-verify"),
+            ("publish", "vllm-cpp-publish"),
+        ):
+            block = guard.job_block(SHIPPED, job)
+            self.assertIn(marker, block)
+            text = SHIPPED.replace(
+                block,
+                block.replace(
+                    '          if [ "${{ matrix.lane }}" = "cuda" ]; then jobs=2; fi\n',
+                    "",
+                ),
+            )
+            self.assertNotEqual(text, SHIPPED, f"{job} mutation did not apply")
+            assert_flags(self, text, f"job {job!r} must lower build parallelism")
+
+    def test_capping_a_lane_that_is_not_failing_is_still_accepted(self):
+        # The gate is on the SHAPE, not on the number. Tuning the cuda value is
+        # a measurement decision and must not need a checker edit.
+        text = SHIPPED.replace(
+            'then jobs=2; fi', 'then jobs=3; fi'
+        )
+        self.assertNotEqual(text, SHIPPED)
+        self.assertEqual(errors_for(text), [])
+
+    def test_removing_the_timeout_from_either_building_job_is_rejected(self):
+        for job in ("verify", "publish"):
+            block = guard.job_block(SHIPPED, job)
+            text = SHIPPED.replace(
+                block, block.replace("    timeout-minutes: 300\n", "", 1)
+            )
+            self.assertNotEqual(text, SHIPPED, f"{job} mutation did not apply")
+            assert_flags(self, text, f"job {job!r} must declare timeout-minutes")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

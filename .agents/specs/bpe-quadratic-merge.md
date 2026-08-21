@@ -23,15 +23,19 @@ of `## Tests to port` item 2 RED against unchanged code, so a split would leave
 
 ## Now
 
-**Landed.** `src/vllm/tokenizer/bpe.cpp::BpeMerge` is the heap of HF
-`tokenizers` `Word::merge_all` (`tokenizers/src/models/bpe/word.rs:162-250`),
-`MergeRanks` is an identifier-keyed table mirroring `MergeMap`
+**Closed. The row is `DONE`.** `src/vllm/tokenizer/bpe.cpp::BpeMerge` is the
+heap of HF `tokenizers` `Word::merge_all`
+(`tokenizers/src/models/bpe/word.rs:162-250`), `MergeRanks` is an
+identifier-keyed table mirroring `MergeMap`
 (`tokenizers/src/models/bpe/model.rs:19`), and a merge naming a token absent
 from the vocabulary is refused at load on both load surfaces, mirroring
-`MergeTokenOutOfVocabulary` (`model.rs:174-192`). The row's state is `GATING`
-rather than `DONE`: every declared gate is green on the branch, and promotion is
-the operator's rerun plus the closing commit and the parity-ledger line, not a
-records edit by the implementer.
+`MergeTokenOutOfVocabulary` (`model.rs:174-192`). The fix landed as
+`67823aee2`, which is the owner the row now names, and the closing commit
+promoted `GATING` -> `DONE` on 2026-08-21 after the rerun recorded under
+`### The closing rerun`. Nothing about this row is open. The next step on this
+surface belongs to a different row: [#1541](https://github.com/mudler/vllm.cpp/issues/1541),
+the refusing request-boundary length guard, which is a second layer after the
+algorithmic fix and never a substitute for it.
 
 `## Tests to port` item 2 was landed RED against the shipped code and turned
 green by W3. `tests/vllm/test_bpe_equivalence.cpp` holds 80 corpus entries
@@ -984,54 +988,143 @@ than per request.
    forbids taking a lease for anything in this row's tests, and the operator
    owns the closing run.
 
-### Owed at landing, and not filed here
+### Owed at landing, and not filed here -- PAID
 
 `## Defence in depth` asks for one issue to be filed when the row lands: a
 REFUSING length guard at the request boundary, which is worth having after the
-algorithmic fix and never instead of it. It is not filed by this branch, because
-the implementing task carries no recorded remote-write authority and an issue
-opened without one is a remote write nobody asked for. It is named here so the
-operator files it at the merge rather than discovering the sentence later. The
-two binding constraints on it are unchanged: it must REFUSE with an error naming
-the limit, never truncate, and it belongs at the request boundary rather than in
+algorithmic fix and never instead of it. It was not filed by the implementing
+branch, because that task carried no recorded remote-write authority and an
+issue opened without one is a remote write nobody asked for. It was named here
+so the operator files it at the merge rather than discovering the sentence
+later, and that is what happened.
+
+**The debt is paid.** The operator filed it as
+[#1541](https://github.com/mudler/vllm.cpp/issues/1541) against `67823aee2`, and
+the closing commit appends its [`issue-index.md`](../issue-index.md) row and
+lists it under `## Owed` below, which is what makes it an owned filing rather
+than a deferred one. Both binding constraints survive into the issue text: it
+must REFUSE with an error naming the limit, never truncate, and it belongs at
+the request boundary rather than in
 `src/vllm/v1/engine/input_processor.cpp::ValidatePromptLen`, which needs the
-token count the expensive step produces.
+token count the expensive step produces. Nothing else was owed at landing.
+
+### The closing rerun
+
+Run on 2026-08-21 by a fresh session that did not write the implementation, at
+base `6b48edb2c`, in its own linked worktree, from a FRESH build directory
+configured `-DVLLM_CPP_BUILD_TESTS=ON` with no build type -- 505 of 505 Ninja
+targets compiled and linked, zero compiler warnings, so no stale binary can be
+printing this green. Every suite was run as its own executable so that
+`Status:` could be read beside `assertions:`, and every one reports a NON-ZERO
+case count, which is the shape a `-tc` filter typo or a class after a `__main__`
+guard would break silently.
+
+| suite | cases | assertions | `Status:` | exit |
+|---|---:|---:|---|---:|
+| `test_bpe` | 24 | 971 | `SUCCESS!` | 0 |
+| `test_bpe_equivalence` | 2 | 334 | `SUCCESS!` | 0 |
+| `test_tokenizer_metaspace_split` | 7 | 28 | `SUCCESS!` | 0 |
+| `test_detokenizer` | 12 | 221 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity` | 4 | 1175 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity_mistral` | 6 | 421 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity_deepseek` | 6 | 2461 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity_gpt4o` | 5 | 1000 | `SUCCESS!` | 0 |
+
+**The equivalence still holds and was counted, not quoted.** The corpus case
+prints `compared 320 id vectors; longest corpus entry 8034 bytes`, and
+`CHECK(compared == entries.size() * 4)` ties that 320 to 80 committed entries
+rather than to a literal, so a corpus that silently lost entries cannot report a
+full sweep. 320 of 320 match HF `tokenizers` 0.22.2, zero mismatches.
+
+**The one timing assertion, re-derived, and what its numbers are worth.** The
+box was CONTENDED throughout: 1-minute load average 24.44 at configure, 34.20 at
+the run, and 38.48 recorded by the test itself on both sides of each timed leg.
+`mistral/english/65536` read **72.486 ms** for 17,476 ids and `qwen36/a/65536`
+**83.647 ms** for 8,192 ids, against the 2,000 ms bound: 27x and 24x of margin.
+Those are about 9x and 8x the idle-window figures `### What was measured`
+records (7.797 and 10.563 ms), which is the load talking and is exactly why the
+gate is an ABSOLUTE bound with three orders of headroom rather than a ratio.
+Read them as gate margin. They are session readings and neither is a constant.
+Nothing was re-benchmarked: the W4 A/B stands as recorded, and no growth-ratio
+assertion was reintroduced in any form.
+
+**Rerun again after the merge, because the base moved under the branch.**
+`origin/main` advanced to `483cd3198` while the closing commit was being gated,
+so it was merged and all eight suites were run again on the merged head with no
+rebuild needed (`ninja: no work to do` -- the merge carries `README.md`, one
+spec and one index row, and touches no source). Same eight `exit 0`, same eight
+`SUCCESS!`, same case and assertion counts, and the same **320 id vectors, 0
+mismatches**. The cost case read 76.624 ms and 84.892 ms at a 1-minute load
+average of 91.79, against the same 2,000 ms bound. Two runs at two loads, 38.48
+and 91.79, moved those figures by about 6% and 1.5% while the bound has three
+orders of headroom, which is the whole argument for an absolute bound over a
+ratio, restated as a measurement instead of a claim.
 
 ### Promotion
 
-The row is `GATING`, not `DONE`. A `DONE` row owes an exact parity-ledger link
-and an owner that is the hexadecimal closing commit, and neither exists until
-this branch merges. Promotion is the operator's rerun, as it is for
-`ENG-PRIORITY-SCHED` and `ENG-CORE-BUSY-LOOP`, not a records edit by the
-implementer.
+**Promoted `GATING` -> `DONE` on 2026-08-21.** The rerun above is the operator's
+own, not an implementer's report, and it supports the move: every declared gate
+in `## Gates` is green at a merge of this row's records onto `6b48edb2c`. The
+two things a `DONE` row owes now exist. The exact parity-ledger link is
+[parity-ledger.md#L945](../parity-ledger.md#L945), appended by the closing
+commit. The owner is `67823aee2`, the hexadecimal commit that landed the fix
+(PR [#1539](https://github.com/mudler/vllm.cpp/pull/1539)); the closing commit
+carries records only and changes no product code, so naming it as the owner
+would point a reader at a diff that contains none of the behaviour.
+
+The GB10 end-to-end re-measure of #1365's legs is NOT part of this promotion and
+was not taken. `## Gates` calls it the row's closing evidence rather than its
+correctness gate, `### Limitations` item 3 discloses it, and `## Stop
+conditions` forbids taking a lease for anything in this row's tests. The row is
+`DONE` on the gate it declared, with that limitation on the record.
 
 ## Owed
 
-Nothing. This row files no issue it does not fix, and it owes no
-[`issue-index.md`](../issue-index.md) row: #1365's row already exists and a
-second one for the same number is a checker failure, argued under
-`## Dependencies`.
+Nothing this row leaves behind, and no defect. What stands open is one FOLLOW-ON
+issue, and one index row that says something true of the past:
 
-One issue is owed AT LANDING rather than by this branch, and
-`## Outcome` says why: the request-boundary length guard of
-`## Defence in depth`. It is a separate row's work, it is not a defect this
-row leaves behind, and it has no index row yet because none has been filed.
+- [#1541](https://github.com/mudler/vllm.cpp/issues/1541) -- the REFUSING
+  request-boundary length guard of `## Defence in depth`, filed by the operator
+  at the merge against `67823aee2` and listed here so the index row that the
+  closing commit appends for it names an owner. It is a separate row's work and
+  a second layer after the algorithmic fix, never a substitute for it, and it is
+  NOT a defect this row leaves behind. `## Outcome`'s `### Owed at landing`
+  records the debt as paid.
+- [#1365](https://github.com/mudler/vllm.cpp/issues/1365) itself is FIXED, and
+  it is named in this list only so that its append-only index row keeps an owner
+  without anyone editing it. See the next paragraph, which is the whole
+  reconciliation.
 
-**The landed #1365 index row describes this row's OLD scope, and the closing
-commit owns the reconciliation.** That row is the 4-second TTFT outlier at a
-fixed request index -- the SYMPTOM as it was found in
-`out/bench-20260819T035148Z/` -- and it says the cause is deliberately not
-chased and is owed under `## Owed` in
-[qwen38-27b-bf16-gate.md](qwen38-27b-bf16-gate.md). This row chased it and
-fixed it: a pretoken long enough to make the quadratic merge visible is the
-mechanism behind that outlier. The index is append-only and carries
-`merge=union`, so the row is NOT edited and no second row for the same number
-is appended; both would be checker failures, argued under `## Dependencies`.
-What the closing commit owes is the ownership move -- #1365's cause now belongs
-to this row rather than to `qwen38-27b-bf16-gate.md`'s `## Owed`, and that
-spec's list is where the change is recorded. Named here because a reader who
-follows the index row alone would otherwise find a stale owner and a stale
-scope.
+**The landed #1365 index row reads as the SYMPTOM, the issue was re-scoped onto
+the CAUSE, and the row is left standing because the rule forbids touching it.**
+That row -- [`issue-index.md`](../issue-index.md), the `#1365` line -- describes
+a reproducible ~4 s TTFT outlier at a fixed request index, found in
+`out/bench-20260819T035148Z/`, and it says the cause is deliberately not chased
+and is owed under `## Owed` in
+[qwen38-27b-bf16-gate.md](qwen38-27b-bf16-gate.md). That was true when it was
+written. On 2026-08-19 the issue was re-titled and re-scoped IN PLACE onto the
+measured cause, the O(n^2) merge loop, which is the row this spec owns; a
+pretoken long enough to make that loop visible is the mechanism behind the
+outlier. So the index row now under-describes its own issue.
+
+**It is not repaired, and that is the correct outcome rather than a shortfall.**
+AGENTS.md makes [`issue-index.md`](../issue-index.md) append-only: never edit a
+row, never delete one. Appending a second `#1365` row is not the escape either,
+because `scripts/check-agent-record.py` reports exactly that as `issue #1365
+listed twice` -- under `merge=union` a duplicate is what two branches appending
+the same issue look like, which is the failure the append-only rule exists to
+prevent. Both available edits are gate failures, so the reconciliation is PROSE,
+it lives here, and this paragraph is it. A reader who arrives from the index row
+alone finds a stale scope; a reader who follows the issue link finds the current
+one; and this spec, which the index row's own owner-spec chain reaches, says why
+the two differ.
+
+**One thing did move, because it could move without an edit to the index.**
+Ownership of #1365's cause is no longer
+[qwen38-27b-bf16-gate.md](qwen38-27b-bf16-gate.md)'s. That spec's `## Owed`
+entry is rewritten by the closing commit to record that the cause was chased and
+fixed here, and this row is where #1365 now lives. Specs are per-row files with
+one writer, so moving the ownership costs no shared surface and no append.
 
 ## Stop conditions
 

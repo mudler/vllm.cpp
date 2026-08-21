@@ -342,6 +342,14 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         "macos-arm64-metal": ("macos", "aarch64", "macos", "metal", "static-core", {"preview", "stable"}),
         "macos-arm64-metal-mlx": ("macos", "aarch64", "macos", "mlx", "static-core", {"preview"}),
         "linux-x86_64-glibc-vulkan": ("linux", "x86_64", "glibc", "vulkan", "static-core", {"preview"}),
+        # Issue #1547. The container `vulkan` lane publishes a multi-arch
+        # manifest, so its arm64 leg produces this tuple. PREVIEW ONLY, and the
+        # narrower set is the point: no arm64 Vulkan leg has ever been built or
+        # gated here, `.agents/roadmap_v1.md` records both arm64 container legs
+        # as unbuilt, and `scripts/build-linux-accelerator-release.sh` passes
+        # `--channel preview` for every accelerator artifact. A `stable` entry
+        # would claim evidence that does not exist.
+        "linux-aarch64-glibc-vulkan": ("linux", "aarch64", "glibc", "vulkan", "static-core", {"preview"}),
         "linux-x86_64-musl-cpu-static": ("linux", "x86_64", "musl", "cpu", "literal-static", {"experimental-preview"}),
         "windows-x86_64-msvc-cpu": ("windows", "x86_64", "msvc", "cpu", "static-core", {"preview"}),
         "windows-x86_64-msvc-vulkan": ("windows", "x86_64", "msvc", "vulkan", "static-core", {"preview"}),

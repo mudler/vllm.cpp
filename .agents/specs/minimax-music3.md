@@ -5000,3 +5000,471 @@ above 0.24 s.
 **Evidence:** `.agents/benchmark-record.md`, section `MUSIC3-E2E-ON-MAIN`. Raw
 log `/workspace/music3-e2e/log-20260820T221735Z.txt` on the shared NAS, 1080
 lines, every bucket table for all seventeen runs.
+
+---
+
+## 21. The DiT gets a profile below the stage boundary (#672, [#1542](https://github.com/mudler/vllm.cpp/issues/1542)) — §20.6's "the DiT at 62 % of the run has no row"
+
+§20 measured `denoise.dit_device` at **370.556 s, 62.24 % of the developer's
+20 s / 30 steps run**, over 120 calls = 240 forwards, and closed with "the next
+row is the DiT". This is that row.
+
+### 21.1 The gap, stated exactly
+
+The instrument reports **one bucket** for the whole forward
+(`minimax_music3_speech.cpp:321`) and nothing inside it. Everything known about
+where those 370.556 s go is arithmetic performed on the outside of a black box.
+
+**The one number that frames the row.** 370.556 s over 240 forwards is
+**~1.544 s per forward**. At the shipped geometry — 36 blocks, `inner_dim` 2048,
+`ff_inner_dim` 8192, `num_attention_heads` 32 x `attention_head_dim` 64, and a
+window of ~689 latent frames so `seq` ~690 — one forward is
+
+| term | per forward at seq 690 |
+|---|---:|
+| block-stack GEMM (qkv, out, ff_in, ff_out) | 4.83 GFLOP/token x 690 = **3.33 TFLOP** |
+| attention scores + values, 36 layers | 0.14 TFLOP |
+| fp32 weight bytes read | 9.66 GB |
+
+so the forward runs at **~2.2 TFLOP/s** and reads its weights at ~6.3 GB/s. The
+weight traffic alone is ~35 ms at this box's bandwidth, so the forward is **44x
+above its memory floor** and the question is entirely what the compute is doing.
+That fraction of the device is not known, and this row's first job is to stop
+guessing it.
+
+### 21.2 THE DTYPE — settled against the oracle before any lever is proposed
+
+AGENTS.md is explicit that a token gate cannot detect a dtype that is too wide,
+so the DiT's fp32 was re-derived from the pinned oracle rather than taken from
+§2.1, and it is **upstream's resolved choice, not a too-wide accident**:
+
+| question | oracle answer, at pin `c6da9936` |
+|---|---|
+| what dtype does the converter give the transformer? | `scripts/convert_minimax_music3_to_diffusers.py:267` — `--dtype` defaults to `float32`; `:208` applies it as `convert_transformer(...).to(args.dtype)` |
+| is that overridden anywhere for this component? | no. `:214` forces the RVQ depth decoder to `torch.bfloat16` and **only** that one, which is what makes the transformer's fp32 a deliberate default rather than an unset one |
+| what does the pipeline cast into it? | `src/diffusers/modular_pipelines/minimax_music3/denoise.py:83` — `condition = condition.to(components.transformer.dtype)` |
+| what does the released artifact carry? | the checkpoint's `transformer/diffusion_pytorch_model-00001-of-00002.safetensors` header reports **`F32` for all 231 tensors** |
+
+**So a bf16 or TF32 DiT would be a divergence from the oracle, not a repair of
+one, and this row does not propose one.** The one precision-adjacent lever that
+is admissible is a mechanism that keeps the declared operand and accumulate
+dtype at fp32 — CUDA 13's cuBLASLt fp32 emulation
+(`CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY`) is the candidate, and it is
+admissible only if it holds the EXISTING `kDitRelTol` 1e-4 / `kDitAbsFloor` 5e-5
+/ `kDitMeanAbsTol` 5e-6 bounds against the upstream capture with the margin
+§14.4 already records. It is measured before it is proposed, and rejected if the
+margin moves.
+
+**vLLM owns none of this.** vLLM and vLLM-Omni do not register this
+architecture, so `diffusers` is the primary oracle for the DiT under AGENTS.md
+`## When vLLM has no implementation`. The op beneath it is a different question:
+`vt::MatmulBT`'s CUDA provider is shared with every vLLM-mirrored path in the
+tree, so a change to its numerics or its plan handling is a **vLLM-owned**
+surface and is out of this row's scope unless it is bit-identical by
+construction.
+
+### 21.3 The instrument this row adds
+
+`music3_profile.h` already separates a LEAF from a SPAN: leaves partition the
+run and are summed, spans enclose leaves, are printed for context and are
+**never added**. The intra-DiT buckets are therefore SPANS, so
+`denoise.dit_device` stays the leaf, `sum(leaf)` is unchanged, `unattributed`
+stays a real quantity, and §15.7's and §20's tables stay comparable value for
+value.
+
+**They are behind a SECOND opt-in, and that is a correctness property of the
+measurement rather than caution.** Attributing time inside the forward needs a
+`Backend::Synchronize` at every span boundary, because the ops are asynchronous
+on one stream and an un-synchronized bracket measures the launch, not the
+kernel. Those syncs perturb the total. So `VLLM_CPP_MUSIC3_DIT_SPANS=1` is
+separate from `VLLM_CPP_MUSIC3_PROFILE=1`: with only the latter set the forward
+is byte-for-byte the path §20 timed, and the perturbation is MEASURED by running
+both arms in the same job rather than argued to be small.
+
+**The bucket set is the engagement control, which is the pattern §20.2
+established.** `Music3DepthDeviceForwardCount()` is unreachable from any
+production run, so a counter proves nothing about a shipped binary; a span that
+is present *iff* the code ran is the observable. `dit.*` spans appear only from
+`DitForwardDevice`, so their presence is the assertion that the device arm — not
+the host `DitForward` — produced the numbers beside them.
+
+### 21.4 Gates
+
+| id | gate |
+|---|---|
+| G1 | the spans partition the forward: `sum(dit.*)` is within the sync overhead of `denoise.dit_device` on the same run, and a deleted bracket shows up as a gap |
+| G2 | spans OFF is byte-for-byte the §20 path: no `Synchronize` and no clock read on the default configuration |
+| G3 | correctness unmoved — `test_minimax_music3_acoustic_real` at the SAME `kDitRelTol` / `kDitAbsFloor` / `kDitMeanAbsTol`, both arms, nothing widened |
+| G4 | reachability — deleting the production call site reddens the focused gate |
+| G5 | the A/B for whatever lever the profile names, alternated, on `thor:gpu0` under an `rc` lease, checkpoint staged with `SRC_BYTES == DST_BYTES`, `uptime` on both sides, and a BEHAVIOURAL control rather than a binary hash (#1516) |
+
+### 21.5 Risks
+
+* **The sync-per-span perturbation could exceed the split it reports.** Mitigated
+  by measuring both arms in one job and quoting the split as a within-arm ratio
+  only.
+* **A cuBLASLt lever moves a shared vLLM-mirrored op.** Any change to
+  `cuda_matmul.cu` is scoped to be bit-identical by construction or to be
+  refused; a numerics change there needs its own row and its own oracle.
+* **The window geometry is inferred.** ~689 latent frames per window is derived
+  from §20's vocoder call and the condition encoder's 25 Hz -> 86.13 Hz
+  resample; this row PRINTS `seq` from the running forward rather than carrying
+  the inference.
+
+### 21.6 Stop conditions
+
+Stop and report `NEEDS_DECISION` if the profile says the forward is at the
+device's fp32 ceiling, because then the only remaining lever is a precision
+change that §21.2 has already ruled a divergence from the oracle, and that is
+the developer's call and not this row's.
+
+### 21.7 Owed
+
+* **[#1555](https://github.com/mudler/vllm.cpp/issues/1555) — the attention
+  kernel.** §21.9 measures `vt::AttentionCross` at 43.9 % of the DiT forward for
+  4.0 % of its arithmetic. This row measures it and does not fix it: the kernel
+  has TWO consumers (this DiT and LTX-2.5, which reaches it six times per layer),
+  every candidate reorders the head-dim summation so none is bit-identical, and
+  admitting one needs both consumers to hold their EXISTING tolerances. That is
+  its own row with its own numerics gate, not a change taken in passing here.
+* **[#1131](https://github.com/mudler/vllm.cpp/issues/1131) is NOT closed by this
+  row, and the shape of what is missing is now sharper.** That issue owes a gate
+  that drives the engine through `Music3DenoiseDeviceArm` and asserts the device
+  path was taken. The `dit.*` span set is exactly the "present iff the arm
+  engaged" observable it asks for, and §21.9's runs show a production
+  `minimax-music3-gen --device 1` emitting it — but the focused gate here drives
+  `DitForwardDevice` directly, so deleting the `on_device ? DitForwardDevice(...)`
+  call site at `minimax_music3_speech.cpp:323` leaves it green. A unit gate would
+  need a reduced-dimension `Music3AcousticWeights` and `frame_hiddens` to drive
+  `Music3DenoiseChunks`, which is a fixture this row did not build.
+* **The synchronize is not gated.** §21.8's M3 establishes that the focused suite
+  runs on the CPU backend, where `Backend::Synchronize` is a no-op, so no case in
+  it can distinguish a drained bracket from an undrained one. The drain's
+  necessity rests on §21.9's device pair.
+* **The GEMM half's headroom.** The four `vt::MatmulBT` calls are 53.3 % of the
+  forward at 3.98 TFLOP/s, and no measurement says what cuBLASLt could deliver at
+  those shapes on this device. That is the row after
+  [#1555](https://github.com/mudler/vllm.cpp/issues/1555), not this one.
+
+### 21.8 The gate earns its teeth — four mutations, and one of them produced NO verdict
+
+Every mutation below reports the COMPILER return code, `git diff --stat` and the
+sha256 of the BINARY, because a mutation that fails to build and a mutation that
+never applied both read as a passing test. `x86_64`, `Release`, at `0e18f8afd`.
+Baseline binary `6d356119bd4c7e61...`, 36 cases / 345 assertions / `SUCCESS!`.
+
+| mutation | compile | binary moved | result |
+|---|---|---|---|
+| **M1** the `dit.qkv` bracket deleted | rc 0 | `8038c347...` | **36 cases, 2 failed, 311 assertions, `FAILURE!`, rc 1** — restored to `6d356119...` byte for byte |
+| **M2** `AddSince(..., span=false)`, so the sixteen land as LEAVES | rc 0 | `c5445572...` | **36 cases, 1 failed, 16 assertions failed, `FAILURE!`, rc 1** |
+| **M3** `backend->Synchronize(queue)` deleted | **rc 1** | — | **NO VERDICT** — did not compile. Re-run as `(void)queue;`: rc 0, `a5a1271a...`, **36 cases / 345 assertions / `SUCCESS!` / rc 0** — GREEN by design; see below |
+| **M4** `span_backend` forced null | rc 0 | `80a9a22b...` | **36 cases, 3 failed, 294 assertions, `FAILURE!`, rc 1** |
+
+**M3 is the finding inside the mutation pass.** Deleting the drain orphaned the
+`queue` parameter into `-Werror=unused-parameter`
+(`minimax_music3_device.cpp:124`), the object failed to compile, and the run
+produced no test result at all. Had the runner not printed `COMPILE_RC` the
+STALE binary from the previous mutation would have printed `SUCCESS!` and the
+line would have read as "the gate does not detect a missing synchronize" — a
+conclusion about the code drawn from a broken instrument, which is the shape
+[`.agents/verification.md`](../verification.md) names. It was re-run in a form
+that keeps the parameter used (`(void)queue;`).
+
+**The re-run's answer is a SCOPE STATEMENT rather than a pass, and the reason is
+a code fact rather than an inference.** `Backend::Synchronize` is declared
+`virtual void Synchronize(Queue&) {}` at `include/vt/backend.h:42` — an EMPTY
+body — and no CPU backend overrides it. So on the CPU queue this suite runs on,
+M3 removes a call to a function that does nothing, and no case here can
+distinguish a drained bracket from an undrained one however it is written. The
+necessity of the drain is established on the DEVICE, by §21.9's spans-on /
+spans-off pair, and not by this suite.
+
+**The re-run is GREEN, and the mutation reached the binary**, which is the pair
+that makes it evidence rather than noise:
+
+| | value |
+|---|---|
+| `COMPILE_RC` | **0** |
+| binary | `6d356119...` -> **`a5a1271a...`** |
+| result | **36 cases / 345 assertions / 0 failed / `SUCCESS!` / `TEST_RC=0`** |
+
+So the drain can be deleted and this suite does not notice, on a compiled and
+executed binary rather than by inference from `backend.h:42`. The inference and
+the measurement agree.
+
+**AND THE FIRST REPORT OF THIS LINE WAS WRONG, WHICH IS ITSELF THE THIRD
+INSTRUMENT DEFECT IN THIS ROW.** An earlier revision recorded the re-run as
+pending "because the authoring host sat at load 68-101 and the rebuild had not
+finished". It had not been dispatched at all. The launcher waited on
+`until ! pgrep -f mutate.sh` and the wait loop's OWN command line contains the
+string `mutate.sh`, so the pattern matched the watcher; the loop could never
+exit and never reached the line below it. Every later check then ran
+`pgrep -f mutate3.sh`, which matched ITS own watcher for the same reason, so
+"still running" was a process watching itself for the better part of an hour.
+The tells were all present and all read the wrong way: `/tmp/mut3-build.log` did
+not exist, no `ninja` or `cc1plus` was alive, and the test binary still hashed to
+the untouched baseline. **A self-matching `pgrep` reports a job that was never
+started as a job still in progress**, and the load average supplied a plausible
+cause for a state that had a different one. Recorded here beside M3's compile
+failure and the probe's two build failures because it is the same class as both:
+an instrument failing toward a confident answer.
+
+**M2 is the one that matters most and it is the least obvious.** Sixteen spans
+landing as leaves changes no call count, no bucket name and no number inside the
+DiT — it changes only whether `Report` adds them to `sum(leaf)`. Every §15.7 and
+§20 table would then double-count the DiT and `unattributed` would go negative,
+and the run would still print a plausible-looking split. Sixteen assertions fire.
+
+### 21.9 The split, MEASURED — and §21.1's premise is wrong in the useful direction
+
+`rc` job **`0f95377f-70dd-4bf8-93b5-8e44fd762713`** on **`thor:gpu0`**,
+`--max-runtime 180m`, worker `rc-worker-m4d7t`, `Linux 6.8.12-1021-tegra`
+aarch64, 14 cores, NVIDIA Thor sm_110, driver 595.78, boot id
+`c99b7805-6e26-47a7-bc9d-93d592d676a6`. No `ssh`, no `rc hold`, no `$GPU_LOCK` —
+the lease is the whole of the serialisation. `uptime` **3.46 with 0 logins** at
+job start, which is this box's idle floor (§20.1 read 3.27, §18.8a 3.29); it
+sits at 4.8-13.6 across the runs and the peaks are our own 14-thread host
+vocoder, not a foreign job.
+
+Tree `0e18f8afd`, `Release`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, nvcc 13.0.88.
+
+**The checkpoint was staged and the assertion is why the figures are quotable.**
+
+| check | result |
+|---|---|
+| what `--model` would have read | `findmnt /workspace` -> `//192.168.68.102/Data[/rc] cifs` |
+| what it actually read | `findmnt -T /tmp/ckpt` -> `overlay overlay /` |
+| copy completed | `SRC_BYTES=28517617303` = `DST_BYTES=28517617303`, hard fail on mismatch |
+| against the recorded count | `EXPECT_BYTES=28517617303`, equal |
+| staging cost | `STAGE_SECONDS=708` = 40.3 MB/s off CIFS |
+
+**`nvidia-smi` reports `clocks.sm` as `[N/A]` on this device**, so — as in §20 —
+every figure here is a within-run SPLIT or a same-box A/B, and none is quotable
+as a per-kernel or cross-box number.
+
+#### The geometry, measured rather than inferred
+
+`dit.seq_sum / 16 = 690` and `dit.length_sum / 16 = 689`. §21.1 derived `seq`
+~690 from §20's vocoder latent count and the condition encoder's 25 Hz -> 86.13
+Hz resample; the forward now prints it, and the inference was right.
+
+#### The split — `--duration 20 --steps 2 --device 1`, 8 calls = 16 forwards
+
+`denoise.dit_device` **25.104 s**; the sixteen spans sum to **25.100 s**, a
+**99.98 % partition**. `sum(leaf)` 251.910 and `unattributed` 0.304 (0.12 %),
+so the spans were printed and never summed and no §15.7 or §20 table moved.
+
+| span | seconds | per forward | % of the DiT |
+|---|---:|---:|---:|
+| **`dit.attn`** | **11.010** | **0.6881** | **43.9 %** |
+| `dit.ff_in` | 6.635 | 0.4147 | 26.4 % |
+| `dit.ff_out` | 3.238 | 0.2024 | 12.9 % |
+| `dit.qkv` | 2.591 | 0.1619 | 10.3 % |
+| `dit.attn_out` | 0.926 | 0.0579 | 3.7 % |
+| `dit.silu` | 0.225 | 0.0141 | 0.9 % |
+| `dit.temb` | 0.167 | 0.0104 | 0.7 % |
+| `dit.pre` | 0.122 | 0.0076 | 0.5 % |
+| `dit.rope` | 0.062 | 0.0039 | 0.2 % |
+| `dit.norm1` | 0.046 | 0.0029 | 0.2 % |
+| `dit.norm2` | 0.045 | 0.0028 | 0.2 % |
+| `dit.pack`, `dit.rope_build`, `dit.post`, `dit.untranspose`, `dit.readback` | 0.033 total | — | 0.1 % |
+
+#### THE FINDING: the DiT is attention-bound, not GEMM-bound, and not at any fp32 ceiling
+
+| group | seconds | % of the DiT | TFLOP per forward | TFLOP/s |
+|---|---:|---:|---:|---:|
+| **`vt::AttentionCross`** | **11.010** | **43.9 %** | **0.140** | **0.204** |
+| the four `vt::MatmulBT` GEMMs | 13.390 | 53.3 % | 3.334 | **3.98** |
+| norms, rope, SiLU, packing, readback | 0.700 | 2.8 % | — | — |
+
+**The attention kernel does 4.0 % of the forward's arithmetic in 43.9 % of its
+time — 19.5x slower per flop than the GEMMs beside it, on the same tensors, in
+the same forward, on the same device.**
+
+**§21.1's own premise is refuted, and in the useful direction.** That section
+divided 370.556 s by 240 forwards and 3.33 TFLOP and reported "~2.2 TFLOP/s",
+attributing the whole forward to the GEMM. The GEMMs are **3.98 TFLOP/s**; the
+2.2 figure was an average over a forward that is nearly half something else.
+Every sentence in §21.1 that rests on the 2.2 number is therefore superseded by
+this section rather than merely refined.
+
+**§21.6's stop condition does NOT fire.** It said to report `NEEDS_DECISION` if
+the forward were at the device's fp32 ceiling, because the only remaining lever
+would then be a precision change §21.2 has already shown to be a divergence from
+the oracle. The forward is not at that ceiling and the lever is not a precision
+change, so the oracle-divergence question never arises.
+
+**At the developer's configuration** `dit.attn` is 0.6881 s x 240 forwards =
+**165.2 s of the 370.556 s `denoise.dit_device` bucket, and 27.7 % of the whole
+595.9 s run** (§20.5).
+
+#### The perturbation is MEASURED, which is the whole reason the spans are a second opt-in
+
+Arms alternated in one job, on one staged checkpoint:
+
+| arm | `denoise.dit_device`, 8 calls | wall |
+|---|---:|---:|
+| spans ON | 25.104 s | 252.902 s |
+| spans OFF | **24.737 s** | 253.577 s |
+
+**The 331 synchronizes per forward cost 1.48 % of the DiT bucket**, and the two
+wall clocks differ by 0.27 % in the OPPOSITE direction, which is inside this
+harness's noise. So the split above is trustworthy at the 1.5 % level, and
+`denoise.dit_device` with the flag unset stays comparable to §15.7's 370.746 s
+and §20's 370.556 s value for value.
+
+#### The engagement controls, per §20.2
+
+`ar.depth_staging` 0.757 s is present in every run, so the depth device arm
+engaged; the `dit.*` span set is present exactly in the spans-on runs, so those
+numbers came from `DitForwardDevice` and not from the host `DitForward`. A
+bucket set is the observable because `Music3DepthDeviceForwardCount()` is
+unreachable from any production run.
+
+#### The 30-step point — the §20 configuration, spans OFF, and it reproduces to 0.012 %
+
+`--duration 20 --steps 30 --device 1`, checkpoint staged, box `uptime` 14.14
+before and 12.80 after (both inside our own host vocoder):
+
+| bucket | §20 (`a50c57d69`) | here (`0e18f8afd`) | calls | delta |
+|---|---:|---:|---:|---:|
+| **`denoise.dit_device`** | **370.556** | **370.510** | 120 | **-0.012 %** |
+| `vocoder.decode_window` | 122.169 | 124.429 | 4 | +1.85 % |
+| `ar.lm_decode_step` | 56.174 | 56.395 | 500 | +0.39 % |
+| `ar.depth_forward` | 21.099 | 21.158 | 4008 | +0.28 % |
+| `ar.depth_projection` | 6.966 | 6.880 | 3507 | -1.23 % |
+| `ar.semantic_guide_and_draw` | 3.701 | 3.757 | 501 | +1.51 % |
+| `ar.depth_head_and_draw` | 3.489 | 3.400 | 3507 | -2.55 % |
+| wall | 595.899 | 598.207 | — | +0.39 % |
+
+`sum(leaf)` 597.247 and `unattributed` 0.313 (**0.05 %**), so the table still
+adds up with the sixteen spans compiled in.
+
+**`denoise.dit_device` at 370.510 s against §20's 370.556 s over an identical
+120 calls is 0.012 % — two commits, two jobs, two days.** That is G2 measured
+end to end rather than argued: with `VLLM_CPP_MUSIC3_DIT_SPANS` unset this tree
+produces the number §20 recorded, so the row's instrument did not move the
+quantity the row exists to explain.
+
+**And the audio is BYTE-IDENTICAL to the record.** This run wrote
+`55856deb3b5b727a4ca4fcc473e01a56`, 3 530 796 bytes — the same hash §20.5
+recorded for its 20 s pair at `a50c57d69`. The four short runs likewise wrote one
+hash (`61a8989763bba749edab8ddc3e597d7a`) across both spans arms. So the
+instrument is a pure timing arm at both durations, proved on the real checkpoint
+rather than inferred from the diff.
+
+**The finding therefore lands on the shipped configuration directly.** The
+per-forward geometry is identical at 2 and 30 steps (`seq` 690 both times), so
+`dit.attn` at 0.6881 s per forward x 240 forwards is **165.1 s of this run's
+370.510 s DiT bucket — 44.6 % of the DiT and 27.6 % of the whole 598.207 s
+run**.
+
+#### One lever named in §21.2 is MEASURED UNAVAILABLE
+
+§21.2 named CUDA's cuBLASLt fp32 emulation
+(`CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY`) as the single precision-adjacent
+candidate that would keep the declared operand and accumulate dtype at fp32.
+**It does not exist in this toolkit.** A probe transcribing
+`MatmulBTKernelCuda`'s descriptor construction fails to compile on `thor:gpu0`
+under nvcc/cuBLASLt **13.0.88**: `identifier
+"CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY" is undefined`, `PROBE_BUILD_RC=2`. It
+is an enumerator rather than a macro, so no preprocessor test can guard it and
+the arm is refused at run time instead.
+
+That is a negative result and it costs nothing, because §21.9's split says the
+GEMMs are 53.3 % of a forward that is 43.9 % attention. **The lever is the
+attention kernel, and it is not a precision question at all.**
+
+#### What is NOT established
+
+* **The mechanism of the attention deficit.**
+  [#1555](https://github.com/mudler/vllm.cpp/issues/1555) names the per-key
+  five-step `__shfl_xor_sync` butterfly in `AttentionCrossFlashKernel` and an
+  occupancy near 8 warps per scheduler as the leading hypothesis, with the
+  instruction-count arithmetic beside it (~1.8 ms per layer predicted against
+  19.1 ms measured, so roughly a 10x latency-hiding deficit; and 17.9 GB of K/V
+  re-reads per forward, ~65 ms, about 10 % of the 688 ms). **No `ncu` counter
+  was read on either side and no occupancy figure was measured.** The split is
+  measured; its attribution is a hypothesis.
+* **Any speed claim.** Nothing was made faster by this row.
+* **A per-kernel or cross-box figure.** `nvidia-smi` reports `clocks.sm` as
+  `[N/A]` on this device, so no clock window exists.
+
+### 21.10 The GEMM half is at the device's fp32 ceiling — measured, so the attention lever is the ONLY one left in-oracle
+
+A standalone probe transcribing `MatmulBTKernelCuda`'s descriptor, three
+layouts, `TRANSA=T`/`TRANSB=N`, `CUBLAS_COMPUTE_32F`, `CUDA_R_32F` scale type,
+32 MB workspace and `requestedAlgoCount=1` — so what it prices is OUR
+invocation and not a generic SGEMM. `rc` job on `thor:gpu0`, nvcc/cuBLASLt
+**13.0.88 / 13.1**, driver 13020, binary
+`9960f5e1e1fb41b90c1d0669c507927830bb486572a43d3030910bdfeeda44b0`, three
+rounds.
+
+**The device.** `NVIDIA Thor cc=11.0`, **20 SMs at 1.049 GHz**, so the fp32
+CUDA-core peak is `2 x 128 x 20 x 1.049e9` = **5.369 TFLOP/s**, and the memory
+bandwidth is 273.0 GB/s. (The lane count is an assumption, stated because the
+percentages rest on it.)
+
+**At the DiT's own M = 690**, medians of three rounds that agree to 0.3 %:
+
+| shape | f32 `COMPUTE_32F` | % of fp32 peak | f32 `FAST_TF32` | bf16 | plan rebuild |
+|---|---:|---:|---:|---:|---:|
+| `qkv` `[690,2048]x[2048,2048]` | **3.84** | **71.5 %** | 52.84 | 134.66 | 0.9 us |
+| `attn_out` same | **3.84** | **71.5 %** | 52.97 | 134.45 | 0.9 us |
+| `ff_in` `[690,2048]x[16384,2048]` | **4.17** | **77.7 %** | 59.04 | 94.40 | 1.1 us |
+| `ff_out` `[690,8192]x[2048,8192]` | **4.24** | **79.0 %** | 29.51 | 48.03 | 0.9 us |
+
+TFLOP/s. The TF32 and bf16 columns run on TENSOR cores, so the fp32-CUDA-core
+denominator does not apply to them and no percentage is quoted; they are here
+only to price what precision would be worth, and §21.2 has already shown
+precision to be a divergence from the oracle.
+
+**Three things this settles.**
+
+**1. The GEMM half is essentially at the ceiling.** cuBLASLt's true-fp32 GEMMs
+reach **71.5-79.0 %** of this device's fp32 CUDA-core peak at the DiT's shapes,
+which is what a well-served SGEMM looks like. §21.9 measured the in-situ GEMM
+half at **3.98 TFLOP/s**, inside that 3.84-4.24 band.
+
+**2. And the in-situ calls ARE those calls, within 2.9 %.** Summing the probe's
+isolated per-call times over one block (3 x `qkv` + `attn_out` + `ff_in` +
+`ff_out` = 22.59 ms) and over 36 blocks predicts **813.5 ms** of GEMM per
+forward; §21.9 measures **836.9 ms**. So there is no dispatch overhead, no
+launch-gap term and no untuned-shape term hiding in the 53.3 %: the GEMM half
+costs what the library costs.
+
+**3. The per-call plan rebuild is REFUTED as a lever.** `MatmulBTKernelCuda`
+builds a descriptor, three layouts, a preference and a heuristic on EVERY call,
+and the DiT makes 252 of them per forward. Measured at **0.9-1.1 us** each, that
+is **~0.25 ms of a 1569 ms forward — 0.016 %**. A plan cache for this op would
+buy nothing here. Named because it was this row's second-ranked hypothesis and
+it is now closed rather than left open.
+
+**So the only lever left inside the oracle is the attention kernel.** fp32 is
+upstream's resolved dtype (§21.2, with anchors); cuBLASLt's fp32 emulation is
+measured unavailable in this toolkit (§21.9); the GEMMs are at the fp32 ceiling;
+and the plan rebuild is 0.016 %. Everything else in the forward is 2.8 %.
+
+**The size of the prize, as a BOUND rather than a promise.** If
+`vt::AttentionCross` merely matched the GEMMs' measured per-flop rate of
+3.98 TFLOP/s, its 0.140 TFLOP would cost **35.2 ms instead of 688.1 ms**, the
+forward would fall from 1569 to 916 ms (**1.71x on the DiT**), the bucket from
+370.510 to 216.3 s, and the run from 598.207 to 444.0 s (**1.35x end to end**).
+That is an upper bound derived from a flop ratio on a kernel nobody has written,
+not a projection of any design, and it is stated so that the next row knows what
+it is playing for.
+
+### 21.11 What this closes, and what it does not
+
+Closed: §20.6's "the DiT at 62 % of the run has no row"; the DiT's dtype
+question, settled against the pinned oracle with anchors rather than carried
+from §2.1; and the attribution of the 370.556 s, which is now a measured split
+rather than an arithmetic guess.
+
+Not closed, and deliberately not turned into a ceiling: the attention kernel
+itself ([#1555](https://github.com/mudler/vllm.cpp/issues/1555)), which is the
+next row and has two consumers; the 53.3 % GEMM half, whose headroom against
+cuBLASLt at the DiT's own shapes is still unmeasured; and
+[#1131](https://github.com/mudler/vllm.cpp/issues/1131), which this row does not
+close — see `## Owed`.

@@ -212,8 +212,12 @@ target_include_directories(test_minimax_music3_llm_real PRIVATE
 # (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
 # companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
 vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+# Reaches src/ for `music3_profile.h` — an INTERNAL instrument, deliberately not
+# on the public surface — because the intra-DiT spans (#1542) live inside
+# `DitForwardDevice` and this is the only suite that drives that forward.
 target_include_directories(test_minimax_music3_acoustic PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  ${CMAKE_SOURCE_DIR}/src)
 # The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
 # the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
 # vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;

@@ -146,6 +146,11 @@ is a larger semantic change than #1434 describes and wants its own argument.
 
 ## Scope
 
+Everything from here to `## Stop conditions` describes W1, the wave that added
+`PARTIAL`. It is left standing as the record of what that wave decided and
+measured. `## W2` below states its own scope and says which of these rulings it
+keeps, which it pays, and which one it overturns.
+
 In:
 
 - `scripts/check-doc-checkpoint.py`: `PARTIAL` added to `STATES`, with a dated
@@ -268,21 +273,236 @@ changes.
 - Stop if the widening reds a commit already on `main` inside this branch's
   range.
 
+## W2 — the four residuals
+
+W1 (`4c193bd55`, #1577) added `PARTIAL` and filed four residuals below. W2 closes
+all four in one change, because they are one issue, one checker and one spec.
+Two of them turned out to rest on premises this wave measured and falsified.
+
+### The premise W1 got wrong, and it was the whole blocker
+
+W1 wrote that paying the `ANCHOR-BACKFILL` obligation "needs `REQUIRED` to carry
+a spec-only class". It does not. `errors_for` calls `spec_now_errors` DIRECTLY:
+
+```python
+def errors_for(paths, before, after):
+    classes, reasons = classify(paths, before, after)
+    errors = spec_now_errors(paths, before, after)      # never routed via REQUIRED
+```
+
+`REQUIRED` maps a CLASS to public surfaces, and `classify()` is what assigns a
+class. The spec `## Now` obligation was never a member of that mapping, so the
+expressiveness W1 said was missing already existed. The only reason an
+`ANCHOR-BACKFILL` move was unobserved is that `row_states` DROPPED the row before
+any of it ran.
+
+So the fix is RESOLUTION, not a new `REQUIRED` class:
+
+```python
+RECORD_STATES = ("INVENTORIED", "SPIKE", "ANCHOR-BACKFILL")
+LIFECYCLE_STATES = STATES + RECORD_STATES
+CLAIM_ON_ARRIVAL = frozenset({"ACTIVE", "GATING", "DONE", "PARTIAL"})
+```
+
+`transitions()` replaces the duplicated loop in `moved_rows` and
+`lifecycle_moves` and labels each move CLAIM or RECORD. A move is CLAIM when
+both endpoints are states `docs/STATUS.md` has a term for; otherwise RECORD.
+`lifecycle_moves` reports only CLAIM moves, so only those reach
+`REQUIRED["lifecycle"] = (STATUS, BENCHMARKS)`. `spec_now_errors` reports both,
+so every lifecycle move owes its row spec's `## Now` — which is what AGENTS.md
+`## Public documents` says, without qualification by state.
+
+This answers residual 1 as asked: `REQUIRED` **cannot** express a `## Now`-only
+obligation, and it does not need to, because that obligation does not live
+there. Adding a class would have been the disproportionate change; nothing was
+added.
+
+### Residual 1 — `ANCHOR-BACKFILL` owes `## Now`: **PAID**
+
+`DONE <-> ANCHOR-BACKFILL` is now a RECORD move. It owes the row spec's `## Now`
+and owes `docs/STATUS.md` and `docs/BENCHMARKS.md` nothing, so W1's ruling — that
+page has no term for it and would have nothing true to write — stands unchanged
+and is now enforced rather than only argued.
+
+### Residual 3 — leaving the matched set: **PAID, without reporting deletions**
+
+W1 recorded that `READY -> INVENTORIED` "is still silent, because `moved_rows`
+iterates the AFTER map", and that reporting disappearances "would red legitimate
+relocations between matrices". Both halves are addressed without touching the
+AFTER-map iteration: once the destination state RESOLVES, the row never
+disappears, so it is compared against its predecessor like any other. No
+disappearance is reported and no relocation can red.
+
+The genuinely remaining hole is a row ID that leaves a table entirely. It is
+still unobserved, and it is now sized: over the 400 non-merge commits ending at
+`e2a9e035d`, **zero** departures occurred.
+
+### Residual 4 — a new row added as `PARTIAL`: **OVERTURNED, and admitted**
+
+W1 excluded it and pinned the exclusion in a test. The stated reason was that
+"the dominant real cause of a row being absent from the BEFORE map in this
+repository is a record RELOCATION between matrices, not a new capability". That
+was never measured. Replayed over the same 400 commits, 126 of which touch a row
+table:
+
+| arrivals (row absent from BEFORE in that table) | count |
+|---|---:|
+| genuinely new (the ID was in no `ROW_TABLES` file beforehand) | **45** |
+| relocations from another matrix | **0** |
+| departures of any kind | **0** |
+
+By arrival state: `ACTIVE` 11, `INVENTORIED` 14, `READY` 12, `SPIKE` 5,
+`PARTIAL` **2**, `GATING` 1. The case the exclusion protected does not occur in
+400 commits, and the case it hid occurred twice. `Partial` is a `docs/STATUS.md`
+term (`:39`), so a row arriving in it asserts exactly what that page projects.
+
+Admitting it costs nothing retroactively: `5498b4aea`, the one commit carrying
+`PARTIAL` arrivals, already paid `STATUS`, `BENCHMARKS` and the spec, and stays
+green. The record states stay out of the arrival set for the opposite and still
+sound reason — a row arriving as `INVENTORIED` has no prior position and claims
+nothing.
+
+### Residual 2 — `.agents/sglang-matrix.md` in `ROW_TABLES`: **DECLINED**
+
+Measured, not assumed. The file has **46 keyed rows**. Its own header says it
+carries "a **classification** in place of a lifecycle state", and that axis reads
+`FUSED` 24, `OUT-OF-SCOPE` 8, `INVENTORIED` 6, `SGLANG-DISTINCT` 5 — written
+unbackticked, so `row_states` matches none of them.
+
+What it DOES match is three rows, and all three are phantoms quoted from the
+"our implementation" column about OTHER matrices' rows:
+
+| row | matched | what the line actually says | its own classification |
+|---|---|---|---|
+| `SGLANG-SCHED-OVERLAP` (`:80`) | `DONE` | `ENG-ASYNC-SCHED` `DONE` | `FUSED` |
+| `SGLANG-SPEC-EAGLE` (`:102`) | `DONE` | our `SPEC-MTP` `DONE` | `FUSED` |
+| `SGLANG-SPEC-DFLASH` (`:104`) | `DONE` | `SPEC-DFLASH` `DONE` | `FUSED` |
+
+Admitting the file would therefore observe **zero of 46 rows on their own axis
+and three on prose about other rows**. Rewording one of those three sentences —
+say, updating `ENG-ASYNC-SCHED` to `PARTIAL` where it is quoted — would read as
+`SGLANG-SCHED-OVERLAP` changing lifecycle state and would demand `STATUS`,
+`BENCHMARKS` and a spec `## Now` for a move that never happened. That is a
+false-positive generator, which is the failure mode this file's header records.
+
+The decline is pinned executably rather than only argued:
+`TheSglangMatrixIsNotALifecycleTable` asserts the classification vocabulary is
+disjoint from `LIFECYCLE_STATES` and that every row the checker CAN resolve there
+still carries its own classification cell. A real State cell added later leaves
+that row without one, the test fails, and someone decides again.
+
+### The resolution asymmetry, and why it is measured
+
+`row_states` takes the LAST backticked state on a line, because earlier ones
+belong to the evidence columns. Applying that unchanged to the record states
+regresses two real rows: `MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm` and
+`MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` both narrate "the row stays
+`SPIKE`" in prose that follows State cells reading `BLOCKED` and `ACTIVE`.
+
+So `RECORD_CELL` requires the token to OPEN a markdown cell, and a cell-anchored
+record state wins outright over a later claim state. Against a column-position
+proxy over every row:
+
+| resolution | population | rows resolved | disagreeing with the proxy |
+|---|---:|---:|---:|
+| before this change | 226 | 226 | 12 |
+| record states matched anywhere | 793 | 793 | 11 |
+| record states cell-anchored (shipped) | 793 | 793 | **10** |
+
+Exactly two previously-resolved rows change state, and both are REPAIRS:
+`engine-matrix.md` `KV-EXTERNAL-CACHE` `ACTIVE -> ANCHOR-BACKFILL` (the row W1's
+audit table listed as staying wrong) and `quantization-matrix.md`
+`QUANT-GGUF-PRESETS` `READY -> INVENTORIED`, whose `READY` came from the prose
+"split exact preset IDs before `READY`". No previously-correct row regresses.
+
+Those two rows are also the only place this change is a NARROWING, and it is
+stated rather than buried: their true states are record states, so moves
+involving them now owe the spec's `## Now` instead of `STATUS` and `BENCHMARKS`.
+Demanding the public pages for a row whose State cell reads `ANCHOR-BACKFILL` was
+the wrong demand, so the narrowing is the repair, not a relaxation of it.
+
+The second narrowing is the pre-claim carve-out in `spec_now_errors`: a RECORD
+move on a row that links NO spec is not an error. `.agents/feature-matrix.md`
+gives a pre-claim row a `CLAIM-*` rather than a spec, and **416 of the 463**
+`INVENTORIED` rows link none, so the error would demand a document the protocol
+says does not exist yet. It loosens nothing: before this change the move was not
+observed at all. A CLAIM move on an unlinked row is still an error, and
+`test_a_claim_move_on_a_row_linking_no_spec_is_still_an_error` holds that line.
+
+### What it costs, replayed
+
+400 non-merge commits ending at `e2a9e035d`; 126 touch a row table. Each commit
+run through the W1 checker and the W2 checker on the same paths and blobs:
+
+| verdict | commits |
+|---|---:|
+| red under both | 12 |
+| **newly red under W2** | **1** |
+| newly green under W2 | **0** |
+
+The one newly red commit is a true positive: `ab6e65216` moved
+`ENG-CUDAGRAPH-BREAK` `INVENTORIED -> READY`, a real lifecycle move that no gate
+observed. Its message names the wrong spec — see `## Owed`.
+
+### W2 counters, re-measured rather than inherited
+
+W1 measured its counters and W2 measures them again, because adding a table to
+`ROW_TABLES` would have moved a different population than adding a state does.
+
+| counter | before | after | why |
+|---|---|---|---|
+| `check-gate-commands.py --check` | rc 0 | rc 0 | `GATED_STATES` (`:56`) is its own tuple and it does not import this one; `RUNNABLE_BASELINE` (`:424`) keys on matrix rows, and `GATE-DOC-CHECKPOINT-STATES` has no matrix row at all |
+| `check-agent-record.py` | rc 0, `ENGINE=169 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` | identical | no matrix row and no index row changes; #1434's index row already names this owning row, so `UNOWNED_HIGH_WATER = 33` cannot move |
+| record-anchor ratchet | unchanged | unchanged | no matrix row changes |
+| `docs/STATUS.md` prose ratchet | untouched | untouched | no public document changes |
+
+No counter is re-pinned, and no row moves lifecycle state, so this change owes no
+checkpoint surface.
+
+### W2 tests
+
+`RecordStatesAreResolvedButNotClaims`, `ANewPartialRowIsAClaim` and
+`TheSglangMatrixIsNotALifecycleTable` in `tests/scripts/test_doc_checkpoint.py`,
+plus the flipped `test_a_new_row_added_as_partial_is_a_claim`. Four mutations,
+each rebinding every derived name so it cannot apply to nothing:
+
+1. `RECORD_STATES` emptied AND `RECORD_CELL` rebound — the gate goes blind on
+   `DONE -> ANCHOR-BACKFILL`.
+2. `transitions()` forced to label every move CLAIM — the same edit starts
+   demanding `docs/STATUS.md`, the outcome the ruling rejects. This is the
+   mutation for the SPLIT, which resolution alone does not prove.
+3. `RECORD_CELL` unanchored — the prose line resolves `SPIKE` instead of
+   `BLOCKED`, which is the two-row regression above.
+4. `PARTIAL` removed from `CLAIM_ON_ARRIVAL` — a new `PARTIAL` row stops being a
+   claim.
+
 ## Owed
 
-- [#1434](https://github.com/mudler/vllm.cpp/issues/1434) is closed by this
-  change for `PARTIAL` only. The remainder is listed here so it is visible debt:
-  - `ANCHOR-BACKFILL` moves still owe their spec's `## Now` and no gate observes
-    them. Paying it needs `REQUIRED` to carry a spec-only class.
-  - `.agents/sglang-matrix.md` is a keyed row table with State cells and is
-    absent from `ROW_TABLES`, so none of its rows are observed at all.
-  - A row that leaves the matched set entirely — `READY -> INVENTORIED`,
-    `READY -> ANCHOR-BACKFILL` — is still silent, because `moved_rows` iterates
-    the AFTER map. Reporting disappearances would red legitimate relocations
-    between matrices and needs its own design.
-  - A new row added directly as `PARTIAL` is still not a claim.
+- [#1434](https://github.com/mudler/vllm.cpp/issues/1434) is closed by W1 for
+  `PARTIAL` and by W2 for all four residuals it filed. What remains is narrower
+  than what it replaced, and each item is sized rather than asserted:
+  - `spec_for_row` returns the FIRST `specs/*.md` link on a row line, which is
+    not always the `Spike/spec` column. **97 of 793 rows (12%)** link more than
+    one spec, so on those the error can name a spec the change did not have to
+    touch. `ab6e65216` above is exactly this: the move is real, the spec named is
+    an evidence link. Pre-existing and unchanged by W2, which raises its
+    exposure. Fixing it means deciding which column is authoritative per matrix,
+    or accepting any linked spec — the second is a loosening and needs its own
+    argument.
+  - A row ID that leaves a table entirely is still unobserved. Measured at
+    **zero occurrences in 400 commits**, so this is a hole with no known traffic
+    rather than a live gap.
+  - The last-match heuristic still resolves **10 of 793** rows differently from a
+    column-position proxy. A column-aware resolver would change 11 rows at once
+    and is a different row: it moves what counts as a move for rows this change
+    does not touch.
+  - `.agents/sglang-matrix.md` stays out of `ROW_TABLES` by decision, not by
+    omission. If it ever gains a real lifecycle State column,
+    `test_every_row_the_checker_could_resolve_there_is_a_phantom` fails and the
+    decision is made again.
 
 ## Now
 
-Landed on `row/RECORDS-LIFECYCLE-STATES-1434`. Next: fresh scoped review of the
-immutable head, mutating case 4 above and confirming no pinned counter moved.
+W2 landed on `row/GATE-DOC-CHECKPOINT-STATES-W2` from base `e2a9e035d`. Next:
+fresh scoped review of the immutable head, re-running the four W2 mutations and
+the 400-commit replay to confirm the newly-red count is still 1.

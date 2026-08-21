@@ -170,6 +170,14 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
+  means the tokenizer file names a merge whose left token, right token, or
+  joined result is missing from its own vocabulary. Both `tokenizer.json` and a
+  GGUF's `tokenizer.ggml.merges` are checked, and the message names the missing
+  token. HF `tokenizers` refuses the same file for the same reason, so the file
+  is malformed rather than unsupported; a GGUF that fails this and whose
+  original `tokenizer.json` loads was damaged by its converter. Before this
+  check the same file loaded and then failed on some prompts instead.
 
 ## Find a focused guide
 

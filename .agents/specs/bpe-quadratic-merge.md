@@ -23,27 +23,23 @@ of `## Tests to port` item 2 RED against unchanged code, so a split would leave
 
 ## Now
 
-`origin/main` at `31f93787c` encodes every prompt through
-`src/vllm/tokenizer/bpe.cpp::BpeMerge`. That function is O(n^2) in the number of
-symbols of one pretoken, and the comment above it states the premise the design
-rests on:
+**Landed.** `src/vllm/tokenizer/bpe.cpp::BpeMerge` is the heap of HF
+`tokenizers` `Word::merge_all` (`tokenizers/src/models/bpe/word.rs:162-250`),
+`MergeRanks` is an identifier-keyed table mirroring `MergeMap`
+(`tokenizers/src/models/bpe/model.rs:19`), and a merge naming a token absent
+from the vocabulary is refused at load on both load surfaces, mirroring
+`MergeTokenOutOfVocabulary` (`model.rs:174-192`). The row's state is `GATING`
+rather than `DONE`: every declared gate is green on the branch, and promotion is
+the operator's rerun plus the closing commit and the parity-ledger line, not a
+records edit by the implementer.
 
-```
-$ sed -n '91,93p' src/vllm/tokenizer/bpe.cpp
-void BpeMerge(std::vector<std::string>& symbols, const MergeRanks& ranks) {
-  // Repeatedly merge the lowest-ranked adjacent pair; leftmost wins ties
-  // (strict < keeps the first best). O(n^2) scan; pretokens are tiny.
-```
-
-Nothing bounds a pretoken. Five of the seven pretokenizer rules return a run of
-unbounded length, and on the SentencePiece family the pretoken is the entire
-prompt. Measured on this tree, 64 KB of the letter `a` costs 24.4 s of one core
-and 64 KB of ASCII spaces costs 45.8 s, both on a path that runs before any
-length check. HF `tokenizers` 0.22.2, reading the same committed tokenizer file,
-returns the identical token identifiers for 64 KB of English in 10.1 ms against
-our 25.3 s. The row is `READY`: this spec is committed before any product
-code, because the fix replaces the merge algorithm on a token-exact path and the
-design has to be agreed before anyone edits the tokenizer.
+`## Tests to port` item 2 was landed RED against the shipped code and turned
+green by W3. `tests/vllm/test_bpe_equivalence.cpp` holds 80 corpus entries
+across both committed goldens and both special-token modes, 320 id vectors,
+every one of them recorded from HF `tokenizers` 0.22.2 rather than from our own
+output. The identifiers did not move. `## Outcome` carries the idle-host
+re-measure, what was rejected, and the two limitations this row is disclosing
+rather than closing.
 
 ## Scope
 
@@ -323,9 +319,9 @@ selects this version. The implementing row records the version it read.
 | `word.rs:37-43` `Symbol {c, prev, next, len}` | `std::vector<std::string>` with `erase` per merge | a linked symbol list with `len = 0` tombstones |
 | `word.rs:28-35` `Ord for Merge` | `strict <` inside the scan | an explicit comparator, with the tie pinned by a test |
 | `mod.rs:9`, `model.rs:19` identifier-keyed `MergeMap` | `MergeRanks = unordered_map<string, int32_t>` in `include/vllm/tokenizer/bpe.h` | an identifier-pair-keyed table built at load |
-| `src/vllm/tokenizer/bpe.cpp::MergeKey` | one `std::string` per probe | deleted; there is no key to build |
+| `MergeKey` in `src/vllm/tokenizer/bpe.cpp`, deleted by this row | one `std::string` per probe | deleted; there is no key to build |
 | `model.rs:180-189` `MergeTokenOutOfVocabulary` | no rule; the failure appears per request in `src/vllm/tokenizer/tokenizer.cpp::EncodePlain` | refused at load, naming the missing token, on `FromHfJson` AND `FromGguf` |
-| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: `src/vllm/tokenizer/bpe.cpp::MergeKey` concatenates `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
+| `model.rs:169-173`, `:186` `new_token = format!("{}{}", a, &b[prefix_len..])` | no counterpart: the `MergeKey` this row deletes concatenated `a` and `b` whole | still whole. `prefix_len` is `continuing_subword_prefix.len()`, and `src/vllm/tokenizer/tokenizer.cpp:624-631` already REFUSES a non-empty `continuing_subword_prefix` at load, so `prefix_len` is 0 on every checkpoint we accept and the term is inert for us. Port the concatenation without it, and do not silently drop the refusal that makes that legal |
 | `model.rs:382-460` `merge_word` | `src/vllm/tokenizer/tokenizer.cpp::EncodePlainSp`'s symbol builder | unchanged in behaviour, emitting identifiers |
 | `model.rs:475-496` word cache | absent | still absent, and out of scope |
 
@@ -802,12 +798,240 @@ exponent, the ratio against HF on identical output, and the direction — every
 one of which is invariant across all four — and no absolute figure in this
 document is quotable as a constant.
 
+## Outcome
+
+Recorded at the close of W4, on the branch, before the merge.
+
+### What landed, and where the mirror is exact
+
+`BpeMerge` is `Word::merge_all` (`word.rs:162-250`): a linked symbol list with
+`len = 0` tombstones, a 4-ary max-heap seeded once from every adjacent pair,
+two pushes per applied merge, and the three validations of `word.rs:187,191`
+and `:197-205`. `MergeRanks` is the identifier-keyed `MergeMap` of `model.rs:19`
+and `mod.rs:9`, built at load, and `InsertMerge` applies the
+`MergeTokenOutOfVocabulary` rule of `model.rs:174-192` on BOTH load surfaces.
+`MergeKey` is deleted.
+
+**One adaptation, and it is the only divergence.** Upstream interns to
+VOCABULARY ids because the model owns the vocabulary; `MergeRanks` owns none, so
+it assigns its own dense identifiers in order of first appearance among the
+merge entries. The numberings differ and the equivalence they induce does not:
+upstream's `new_id` is the vocabulary id of the concatenated string, and ours is
+keyed on that same string, so two merges share an identifier under exactly the
+same condition. `prefix_len` is 0 throughout, because `FromHfJson` refuses a
+non-empty `continuing_subword_prefix` at load; that refusal is what makes the
+whole-string concatenation legal and it was NOT dropped.
+
+### What was measured
+
+Same-harness A/B: one `tools/bench/bpe_encode_cost.cpp` source compiled against
+the shipped tokenizer (`a50c57d69`) and against this branch, with the BEFORE and
+AFTER legs interleaved so a drift in box state cannot land entirely on one side.
+
+**Which instrument produced which number.** The HF legs were produced by a
+scratch script, `/tmp/bpe_ab/hf_cost.py`, whose banner (`# hf_cost --`) is in the
+log. `tools/bench/bpe_encode_cost_hf.py` is committed here as its id-equivalent
+generalization -- same case units, same repeat-and-truncate rule, same min-of-k,
+same load line, plus argument parsing the scratch version did not have -- and it
+is NOT the binary that produced the figures below. It is committed for the same
+reason its C++ sibling was: the reference arm of this comparison had no
+committed artifact, and a recipe nobody can execute is not a recipe. The HF legs
+also ran LAST rather than interleaved, after both reps of both arms, which is
+why the load beside them is not the load beside ours.
+
+**What "idle host" meant here, stated because it is not what the word usually
+means.** `## Gates` requires an idle-host re-measure and this box does not go
+idle: concurrent sessions built on it throughout. The run therefore waited for
+an UNCONTENDED window -- a 1-minute load average below 4.00, so at least sixteen
+of twenty cores free, sustained over three consecutive 30-second samples --
+which is the condition a SINGLE-THREADED measurement actually needs. `AB.log`
+records that wait as 23:57:37 to 00:37:08 on 2026-08-21, 39 minutes 31 seconds,
+with the 1-minute load reaching 95.39 inside it. A threshold nothing can satisfy
+yields no measurement rather than a careful one, so the threshold is written
+down rather than quietly met.
+
+An EARLIER attempt polled the same box for a 2.00 threshold and never got a
+window. Its log was truncated by the rerun that replaced it, so its figures are
+not quotable and none is quoted. That it happened is recorded; what it read is
+not, because this row has already burned three generations of constants no
+reviewer could re-derive and an unlogged fourth is the same defect.
+
+| case (tokenizer) | bytes | ids | BEFORE `a50c57d69` | AFTER this branch | before/after | HF 0.22.2 |
+|---|---:|---:|---:|---:|---:|---:|
+| Mistral, English prose | 1,000 | 267 | 5.376 | 0.066 | 81x | 0.116 |
+| | 4,096 | 1,093 | 90.990 | 0.440 | 207x | 0.547 |
+| | 16,384 | 4,370 | 1,458.602 | 1.793 | 814x | 2.384 |
+| | 65,536 | 17,476 | **23,620.695** | **7.797** | **3,029x** | 10.546 |
+| Qwen3.6, one repeated `a` | 1,000 | 125 | 5.233 | 0.101 | 52x | 0.187 |
+| | 4,096 | 512 | 88.308 | 0.539 | 164x | 0.847 |
+| | 16,384 | 2,048 | 1,423.630 | 2.388 | 596x | 4.262 |
+| | 65,536 | 8,192 | **22,813.108** | **10.563** | **2,160x** | 15.402 |
+
+Milliseconds, min over k, from the rep-1 legs. Every BEFORE and AFTER figure
+above was taken inside the window, at a 1-minute load of 1.98 to 2.59 AT LEG
+START; the last of them, the BEFORE `a` 65,536 leg, closed at 9.74 as the window
+gave out. The window opened at 00:37:08 UTC on 2026-08-21, after 39 minutes 31
+seconds and 80 samples of polling.
+
+**The shape is the finding, not the ratio.** Read down a BEFORE column and each
+4x of input costs 16.9x, 16.0x, 16.2x on Mistral and 16.9x, 16.1x, 16.0x on
+Qwen3.6 -- 4^2, to three readings each. Read down an AFTER column and the same
+4x costs 6.7x, 4.1x, 4.3x and 5.3x, 4.4x, 4.4x -- 4^1, once the constant
+factors stop dominating at the smallest size. That is the whole claim: the
+exponent moved from 2 to 1. The before/after ratio quadruples per step for
+exactly that reason, so the 3,029x is the largest input measured and not a
+property of the change.
+
+**Against HF the honest reading is PARITY, and it needs the rep-2 legs to be
+checkable.** The window closed before rep 2 and before the HF legs, which is why
+rep 2 is tabulated here rather than dismissed: it is the only one of our legs
+taken at a load comparable to HF's.
+
+| 65,536 B, Mistral English | 1-minute load | ms |
+|---|---:|---:|
+| AFTER, rep 1 (in the window) | 1.98 | 7.797 |
+| AFTER, rep 2 (window closed) | 10.49 | **10.563** |
+| HF `tokenizers` 0.22.2 (ran last) | 13.96 | **10.546** |
+
+Setting rep 1 beside HF spans a 7x load gap and reads as a win over the
+reference. It is not one, and it is not claimed. The like-for-like pair is rep 2
+against HF: **10.563 against 10.546 ms, a ratio of 1.002**, which is parity
+inside the noise of a shared box -- and even that still favours HF slightly on
+load, so parity is the ceiling of what these legs support, not a floor.
+
+Two claims survive, and only two. **Ours against our own past** is clean: both
+sides of every before/after figure were compiled from one harness source and
+interleaved inside one window. **Ours against the reference we mirror** is
+parity on the input this row exists for, where before it was three orders
+larger. We are not faster than HF `tokenizers` and this row does not say so.
+
+Every figure above is a SESSION READING and none is quotable as a constant.
+This row's own history is why that sentence is here: three revisions of the
+spec each certified a growth window that no reviewer reproduced, and one binary
+on one input moved 54% on load alone. What the readings support is the
+SEPARATION and the DIRECTION, and both are three orders of magnitude wide.
+
+The committed gate is the shorter statement. `test_bpe_equivalence`'s cost case
+read 23,918.5 ms and 23,077.3 ms against the shipped code and 8.273 ms and
+11.814 ms after W3, against a 2,000 ms bound: crossed by 12x before, cleared by
+170x after.
+
+### Why each default has its value
+
+**The bound is 2,000 ms and not tighter.** It sits an order of magnitude below
+the measured defective figures and two orders above the measured fixed ones. A
+tighter bound buys nothing — the defect is 2,800x, not 2x — and a bound whose
+margin approaches the noise of a shared runner measures the box. That is the
+failure `## Tests to port` item 3 records for the growth-ratio assertion, and
+nothing here reintroduces one in any form.
+
+**The heap is 4-ary because upstream's is.** The ORDER is decided by the
+comparator alone: two entries compare equal only when rank and position are both
+equal, rank is the merge's index in the checkpoint's merge list, so equal rank
+means the same pair and the same `new_id`, and fully identical entries are
+interchangeable. Any correct heap yields the same sequence. The arity is a
+constant, and it is mirrored rather than chosen because upstream's is the
+constant this design was measured against.
+
+**The refusal is at load, on both surfaces, and it names the token.** All seven
+`tokenizer.json` files committed under `tests/` carry zero offending merges,
+checked before the rule was written; `test_bpe` asserts that the four parity
+goldens still load, and that the well-formed GGUF fixture still loads. The GGUF
+arm has no oracle — HF `tokenizers` never reads GGUF — so the message names the
+missing token, which is what makes a converter defect actionable at load rather
+than per request.
+
+### What was rejected
+
+- **A growth-shape assertion.** Ruled out by `## Tests to port` item 3 before
+  this row started. Not implemented, not skipped, not deferred.
+- **A cap on pretoken length.** It changes the identifiers on exactly the
+  inputs it claims to protect.
+- **Upstream's word cache** (`model.rs:475-496`). It stores only sequences below
+  `MAX_LENGTH = 256` (`tokenizers/src/utils/cache.rs:10`), so it never touches
+  this regime. Still out of scope, still a separate measurable question.
+- **Removing the string key alone.** W2 measures what it is worth and the
+  answer does not change the ruling: interning took the 65,536-byte Mistral case
+  from 23,918.5 ms to 8,335.3 ms, at load 7.65 and 46 respectively, so the two
+  are not comparable and neither is quotable. It was still four times over the
+  bound and still quadratic. Removing a constant from a quadratic leaves a
+  quadratic.
+
+### Limitations, disclosed rather than closed
+
+1. **The six literal #1365 prompts are not reproducible from this tree.** They
+   were read out of `out/bench-20260819T035148Z/`, a `vllm bench serve
+   --dataset-name random` run on a leased GB10 against a checkpoint that is not
+   committed. The corpus therefore carries the SHAPE of prompt 2 — 8,034 bytes
+   that pretokenize to one pretoken, no whitespace or class boundary in it —
+   under the name `issue1365/prompt2-shape`, and says so at its definition
+   rather than claiming a provenance it does not have.
+2. **The second staleness validation is a memory-safety guard, and no value
+   assertion catches its removal.** `word.rs:191` prevents an index cast of `-1`;
+   deleting it leaves both `test_bpe` and the 80-entry corpus green, because the
+   `Symbol` read one slot before the vector holds an identifier that names no
+   merge. Under ASan the same deletion is a heap-buffer-overflow READ of size 16
+   at `bpe.cpp:284` on the fixture added for it, and the guarded build is clean.
+   The `sanitize-cpu` leg is what fails on its removal; the added case exists so
+   the branch is reached at all. This is recorded because a green mutation is a
+   finding, not a detail. The guarded code was also swept under ASan over the
+   whole committed corpus -- 160 encodes, 80 entries through both goldens,
+   `checked=160 mismatch=0` and no sanitizer report -- so the guard is not
+   merely present, the path it protects is exercised clean.
+3. **No GB10 end-to-end re-measure of #1365's legs.** `## Gates` names it as the
+   row's closing evidence rather than its correctness gate, and it needs the
+   bf16 27B server under an `rc` lease. Not taken here: `## Stop conditions`
+   forbids taking a lease for anything in this row's tests, and the operator
+   owns the closing run.
+
+### Owed at landing, and not filed here
+
+`## Defence in depth` asks for one issue to be filed when the row lands: a
+REFUSING length guard at the request boundary, which is worth having after the
+algorithmic fix and never instead of it. It is not filed by this branch, because
+the implementing task carries no recorded remote-write authority and an issue
+opened without one is a remote write nobody asked for. It is named here so the
+operator files it at the merge rather than discovering the sentence later. The
+two binding constraints on it are unchanged: it must REFUSE with an error naming
+the limit, never truncate, and it belongs at the request boundary rather than in
+`src/vllm/v1/engine/input_processor.cpp::ValidatePromptLen`, which needs the
+token count the expensive step produces.
+
+### Promotion
+
+The row is `GATING`, not `DONE`. A `DONE` row owes an exact parity-ledger link
+and an owner that is the hexadecimal closing commit, and neither exists until
+this branch merges. Promotion is the operator's rerun, as it is for
+`ENG-PRIORITY-SCHED` and `ENG-CORE-BUSY-LOOP`, not a records edit by the
+implementer.
+
 ## Owed
 
 Nothing. This row files no issue it does not fix, and it owes no
 [`issue-index.md`](../issue-index.md) row: #1365's row already exists and a
 second one for the same number is a checker failure, argued under
 `## Dependencies`.
+
+One issue is owed AT LANDING rather than by this branch, and
+`## Outcome` says why: the request-boundary length guard of
+`## Defence in depth`. It is a separate row's work, it is not a defect this
+row leaves behind, and it has no index row yet because none has been filed.
+
+**The landed #1365 index row describes this row's OLD scope, and the closing
+commit owns the reconciliation.** That row is the 4-second TTFT outlier at a
+fixed request index -- the SYMPTOM as it was found in
+`out/bench-20260819T035148Z/` -- and it says the cause is deliberately not
+chased and is owed under `## Owed` in
+[qwen38-27b-bf16-gate.md](qwen38-27b-bf16-gate.md). This row chased it and
+fixed it: a pretoken long enough to make the quadratic merge visible is the
+mechanism behind that outlier. The index is append-only and carries
+`merge=union`, so the row is NOT edited and no second row for the same number
+is appended; both would be checker failures, argued under `## Dependencies`.
+What the closing commit owes is the ownership move -- #1365's cause now belongs
+to this row rather than to `qwen38-27b-bf16-gate.md`'s `## Owed`, and that
+spec's list is where the change is recorded. Named here because a reader who
+follows the index row alone would otherwise find a stale owner and a stale
+scope.
 
 ## Stop conditions
 

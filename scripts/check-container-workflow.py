@@ -34,6 +34,26 @@ TAG_GATED_JOBS = PUBLISH_JOBS + RELEASE_ONLY_JOBS
 RELEASE_GUARD = "if: needs.plan.outputs.is_release == 'true'"
 PUBLISH_GUARD = "if: needs.plan.outputs.publishes == 'true'"
 
+# The two jobs that run `docker buildx build`. They build the IDENTICAL image,
+# so anything true of the build in one has to be true in the other: a cap that
+# held in verify and not in publish would let publish die on exactly the build
+# verify had just proved.
+BUILDING_JOBS = ("verify", "publish")
+# Issue #1548. Each .cu in the cuda lane is compiled for the ten device
+# architectures scripts/build-linux-accelerator-release.sh sets, so one compiler
+# process there holds many times the resident set of a cpu or vulkan
+# translation unit. Run 32447481128 handed that lane $(nproc) and died at object
+# 512 of 787 with exit 143.
+#
+# This gate is on the SHAPE and not on the number. Lane-awareness is the
+# contract. The value is a measurement that a future run may move, and a gate
+# that reds on tuning it would be the defect rather than the discipline.
+CUDA_JOBS_CAP = re.compile(
+    r'if \[ "\$\{\{ matrix\.lane \}\}" = "cuda" \]; then jobs=(\d+); fi'
+)
+UNCAPPED_JOBS = 'JOBS=$(nproc)'
+JOB_TIMEOUT = re.compile(r"(?m)^    timeout-minutes: (\d+)$")
+
 
 def job_names(text: str) -> list[str]:
     return re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):\n", text.split("\njobs:\n", 1)[-1])
@@ -204,6 +224,28 @@ def validate(text: str) -> list[str]:
     if "fromJSON(needs.plan.outputs.verify_matrix)" not in verify_block:
         errors.append("the verify job must consume verify_matrix")
 
+    # Build parallelism and a stated time budget, both issue #1548.
+    for name in BUILDING_JOBS:
+        block = blocks[name]
+        if UNCAPPED_JOBS in block:
+            errors.append(
+                f"job {name!r} hands JOBS=$(nproc) to the build: the ten-SM fat cuda "
+                "lane compiles every .cu for ten device architectures and cannot take "
+                "the whole runner"
+            )
+        if CUDA_JOBS_CAP.search(block) is None:
+            errors.append(
+                f"job {name!r} must lower build parallelism for the cuda lane and only "
+                "that lane. The cpu and vulkan lanes are not failing and keep "
+                "$(nproc)"
+            )
+        if JOB_TIMEOUT.search(block) is None:
+            errors.append(
+                f"job {name!r} must declare timeout-minutes: under the six-hour default "
+                "a hang, a reclaimed runner and an exhausted one all report the same "
+                "exit 143, and nothing separates them"
+            )
+
     promote = blocks["promote"]
     if "container_tags.py" not in promote:
         errors.append(
@@ -232,7 +274,12 @@ def main() -> int:
             print(f"  - {error}")
         return 1
 
-    print("container workflow OK: least-privilege stages, tag-gated publish, validated push")
+    caps = sorted({match.group(1) for match in CUDA_JOBS_CAP.finditer(text)})
+    budgets = sorted({match.group(1) for match in JOB_TIMEOUT.finditer(text)})
+    print(
+        "container workflow OK: least-privilege stages, tag-gated publish, validated "
+        f"push, cuda lane at -j {','.join(caps)}, build budget {','.join(budgets)} min"
+    )
     return 0
 
 

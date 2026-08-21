@@ -35,6 +35,10 @@
 //    driver-API-only and is dropped. Dropping a signature component can only produce a
 //    false HIT, which Register probes and rejects, never a false miss that silently
 //    shares an executable.
+//  * WHICH parameter fields a payload carries is no longer decided here. It moved to
+//    vt/graph_dedup_signature.h under VT_CUDA_GRAPH_DEDUP_COARSE_KEY (#1226), so the
+//    choice is device-free, argued in one place, and driven by a CPU test rather than
+//    only by a leased box. What stays here is the runtime query that fills the params.
 #ifndef VT_GRAPH_DEDUP_RUNTIME_H_
 #define VT_GRAPH_DEDUP_RUNTIME_H_
 
@@ -88,6 +92,7 @@ using Stream = cudaStream_t;
 namespace vt::graph_dedup_rt {
 
 using vt::graph_dedup_sig::AppendNumber;
+using vt::GraphDedupCoarseKeyEnabled;
 
 // cudaGraphGetEdges gained a fifth `cudaGraphEdgeData*` parameter in CUDA 13; the
 // four-argument form is what CUDA 12 and HIP ship. Both shapes are bound here rather
@@ -113,19 +118,18 @@ inline bool GetEdgesRaw(Graph graph, Node* from, Node* to, std::size_t* num_edge
 #endif
 }
 
-// (func, gridDim, blockDim, sharedMemBytes) — cuda_graph_dedup_mixin.py:105-114 minus
-// the driver-API attribute tuple, per the header note.
-inline bool AppendKernelPayload(Node node, std::string* out) {
+// Reads the node's parameters and hands the FIELD SELECTION to
+// vt/graph_dedup_signature.h, which owns which of them the key carries and argues why.
+// The device half of this function is now one call: the rest is device-free and gated on
+// every platform by tests/vt/test_graph_dedup_runtime.cpp, which drives the very same
+// AppendKernelFields production reaches here.
+inline bool AppendKernelPayload(Node node, std::string* out, bool coarse) {
   KernelNodeParams params{};
   if (VTGD_FN(GraphKernelNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
-  AppendNumber(out, static_cast<long long>(reinterpret_cast<std::uintptr_t>(params.func)));
-  AppendNumber(out, params.gridDim.x);
-  AppendNumber(out, params.gridDim.y);
-  AppendNumber(out, params.gridDim.z);
-  AppendNumber(out, params.blockDim.x);
-  AppendNumber(out, params.blockDim.y);
-  AppendNumber(out, params.blockDim.z);
-  AppendNumber(out, params.sharedMemBytes);
+  vt::graph_dedup_sig::AppendKernelFields(
+      out, static_cast<long long>(reinterpret_cast<std::uintptr_t>(params.func)),
+      params.gridDim.x, params.gridDim.y, params.gridDim.z, params.blockDim.x,
+      params.blockDim.y, params.blockDim.z, params.sharedMemBytes, coarse);
   return true;
 }
 
@@ -167,27 +171,33 @@ struct Runtime {
   // is set only for a child-graph node; the depth bound that governs recursing into it
   // belongs to the walk, not to this switch.
   static bool AppendNodePayload(Node node, std::string* out, Graph* child) {
+    // Read once per node, not once per process here, because the accessor IS the
+    // read-once: it caches the environment on first call and announces the mode. Asking
+    // it per node costs a guarded load and keeps the flag out of this switch's state.
+    const bool coarse = GraphDedupCoarseKeyEnabled();
     NodeType type{};
     if (VTGD_FN(GraphNodeGetType)(node, &type) != VTGD_SUCCESS) return false;
     AppendNumber(out, static_cast<long long>(type));
     switch (type) {
       case VTGD_NODE_KERNEL:
-        return AppendKernelPayload(node, out);
+        return AppendKernelPayload(node, out, coarse);
       case VTGD_NODE_MEMCPY: {
         MemcpyNodeParams params{};
         if (VTGD_FN(GraphMemcpyNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
-        AppendNumber(out, static_cast<long long>(params.kind));
-        AppendNumber(out, static_cast<long long>(params.extent.width));
-        AppendNumber(out, static_cast<long long>(params.extent.height));
-        AppendNumber(out, static_cast<long long>(params.extent.depth));
+        vt::graph_dedup_sig::AppendMemcpyFields(
+            out, static_cast<long long>(params.kind),
+            static_cast<long long>(params.extent.width),
+            static_cast<long long>(params.extent.height),
+            static_cast<long long>(params.extent.depth), coarse);
         return true;
       }
       case VTGD_NODE_MEMSET: {
         MemsetNodeParams params{};
         if (VTGD_FN(GraphMemsetNodeGetParams)(node, &params) != VTGD_SUCCESS) return false;
-        AppendNumber(out, static_cast<long long>(params.elementSize));
-        AppendNumber(out, static_cast<long long>(params.width));
-        AppendNumber(out, static_cast<long long>(params.height));
+        vt::graph_dedup_sig::AppendMemsetFields(
+            out, static_cast<long long>(params.elementSize),
+            static_cast<long long>(params.width), static_cast<long long>(params.height),
+            coarse);
         return true;
       }
       case VTGD_NODE_GRAPH: {

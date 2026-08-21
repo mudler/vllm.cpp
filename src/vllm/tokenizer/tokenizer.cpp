@@ -44,6 +44,21 @@ constexpr const char* kGpt4oRegex =
   throw std::runtime_error("tokenizer: " + msg);
 }
 
+// The SentencePiece unk sentinel. `Tokenizer::EncodePlainSp` pushes it as a
+// symbol for a character with no vocabulary token and no byte fallback, so it
+// travels through `BpeMerge` and must never be merged. Upstream keeps the same
+// split -- `merge_word` builds the Word, including its unk handling, before
+// `merge_all` runs (`tokenizers/src/models/bpe/model.rs:382-460`).
+//
+// `Tokenizer::FinalizeTables` asserts at LOAD that no merge names it, which is
+// the reserved-identifier guarantee `.agents/specs/bpe-quadratic-merge.md`
+// §Risks asks for: `MergeRanks::Find` then answers `kNoSymbol` for it on every
+// checkpoint we accept, and no merge can apply to a `kNoSymbol` symbol.
+const std::string& UnkSentinel() {
+  static const std::string kUnk("\x01\x01unk\x01\x01");
+  return kUnk;
+}
+
 // Splits a legacy-form merge entry "left right" (exactly one space, both
 // halves nonempty); used by both the HF and GGUF loaders.
 void SplitMergeEntry(const std::string& s, std::string& left,
@@ -59,13 +74,42 @@ void SplitMergeEntry(const std::string& s, std::string& left,
 
 // Inserts one merge pair at `rank`; duplicates fail loud (HF silently keeps
 // the LAST rank for duplicates; we keep neither).
-void InsertMerge(MergeRanks& ranks, const std::string& left,
-                 const std::string& right, int32_t rank) {
-  const auto [it, inserted] = ranks.emplace(MergeKey(left, right), rank);
-  if (!inserted) {
+//
+// The VOCABULARY RULE mirrors HF `tokenizers`
+// (`tokenizers/src/models/bpe/model.rs:174-192`): a merge whose left token,
+// right token, or concatenation is absent from the vocabulary is
+// `MergeTokenOutOfVocabulary` AT LOAD. We had no such rule, so a merge could
+// produce a symbol that `Tokenizer::EncodePlain` then failed on PER REQUEST,
+// with a message about a symbol nobody wrote. Moving the failure to load is
+// where upstream puts it and where a user can act on it.
+//
+// This is a behaviour change on malformed inputs, and it is deliberate: a
+// checkpoint that loads today and fails on some prompts is refused at load
+// instead. All seven `tokenizer.json` files committed under `tests/` carry zero
+// offending merges, so it costs nothing that this tree can load. The GGUF arm
+// is the one with no oracle -- HF never reads GGUF, and
+// `tokenizer.ggml.merges` is written by a CONVERTER rather than copied -- which
+// is why the message names the missing token.
+//
+// `merged` is `left + right` whole. Upstream trims
+// `continuing_subword_prefix` off the right half (`model.rs:169-173,186`), and
+// `FromHfJson` below already refuses a non-empty `continuing_subword_prefix`,
+// so that term is 0 on everything we accept.
+void InsertMerge(MergeRanks& ranks,
+                 const std::unordered_map<std::string, int32_t>& vocab,
+                 const std::string& left, const std::string& right,
+                 int32_t rank) {
+  const std::string merged = left + right;
+  for (const std::string* token : {&left, &right, &merged}) {
+    if (vocab.find(*token) == vocab.end()) {
+      Fail("merge token \"" + *token + "\" at merge rank " +
+           std::to_string(rank) + " (\"" + left + " " + right +
+           "\") is not in the vocabulary");
+    }
+  }
+  if (!ranks.Insert(left, right, rank)) {
     Fail("duplicate merge pair \"" + left + " " + right + "\" at rank " +
-         std::to_string(rank) + " (first seen at rank " +
-         std::to_string(it->second) + ")");
+         std::to_string(rank));
   }
 }
 
@@ -505,6 +549,16 @@ void Tokenizer::FinalizeTables() {
   for (const auto& t : added_tokens_) check_id(t.id);
   if (vocab_.empty() && added_tokens_.empty()) Fail("empty vocab");
 
+  // The unk sentinel must stay outside the merge table's identifier space, or
+  // `EncodePlainSp` could merge a symbol that is not a token. `InsertMerge`
+  // above already refuses any merge naming a token absent from the vocabulary,
+  // so this can only fire on a checkpoint that puts the sentinel's bytes in its
+  // vocabulary AND names them in a merge. Checked once here rather than per
+  // request.
+  if (merge_ranks_.Find(UnkSentinel()) != MergeRanks::kNoSymbol) {
+    Fail("the unk sentinel is named by a merge; it must not be a real symbol");
+  }
+
   token_text_.assign(max_id + 1, std::string());
   is_added_.assign(max_id + 1, 0);
   for (const auto& kv : vocab_) {
@@ -677,7 +731,7 @@ Tokenizer Tokenizer::FromHfJsonBytes(std::string_view tokenizer_json,
         right.find(' ') != std::string::npos) {
       Fail("malformed merge entry at rank " + std::to_string(rank));
     }
-    InsertMerge(tok.merge_ranks_, left, right, rank);
+    InsertMerge(tok.merge_ranks_, tok.vocab_, left, right, rank);
     ++rank;
   }
 
@@ -861,7 +915,7 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     std::string left;
     std::string right;
     SplitMergeEntry(std::get<std::string>(entry.v), left, right);
-    InsertMerge(tok.merge_ranks_, left, right, rank);
+    InsertMerge(tok.merge_ranks_, tok.vocab_, left, right, rank);
     ++rank;
   }
 
@@ -942,7 +996,7 @@ void Tokenizer::EncodePlainSp(std::string_view text, bool at_input_start,
   //    present in the vocab, else (with byte_fallback) decomposes into its
   //    UTF-8 bytes as "<0xNN>" tokens, else becomes unk. Merges then run over
   //    these symbols; fuse_unk collapses consecutive unks WITHIN the pretoken.
-  static const std::string kUnk("\x01\x01unk\x01\x01");  // never a real symbol
+  const std::string& kUnk = UnkSentinel();  // never a real symbol
   const auto encode_piece = [&](std::string_view piece) {
     std::vector<std::string> symbols;
     size_t pos = 0;

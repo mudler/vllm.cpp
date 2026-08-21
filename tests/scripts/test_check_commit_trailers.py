@@ -652,5 +652,225 @@ class PullRequestBodyMode(unittest.TestCase):
         self.assertNotEqual(neither.returncode, 0)
 
 
+class LandedMessageExceptions(unittest.TestCase):
+    """One landed commit, one exact error, excused by name (#1262).
+
+    `281b4bc76c0e` is on `main` carrying `Assisted-by: AGENT:claude-opus-5 CLI`,
+    with no bracketed tool. It cannot be repaired, because that rewrites `main`,
+    and it does not clear itself, because the main lane walks `LAST_GREEN..head`
+    and `LAST_GREEN` advances only on a green run.
+
+    `--cutover` is the wrong shape for it and was measured before it was
+    rejected: it downgrades every ancestor of one sha to the marker-only check
+    (2986 commits here), so it waives defects nobody has read, and it does not
+    even excuse the sha you name -- `merge-base --is-ancestor X X` succeeds, so
+    the cutover commit itself stays strict.
+
+    These cases are the scope proof for the narrow instrument that replaced it.
+    The registry excuses ONE commit and ONE exact error string; a different
+    error in the same commit, the same error in a different commit, and any
+    error in a message that has not landed yet are all still red.
+    """
+
+    OFFENDER = "281b4bc76c0e635adbc7ed38317035b07c99864d"
+    OFFENDING_VALUE = "AGENT:claude-opus-5 CLI"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.checker = load_checker()
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Test"], check=True
+        )
+
+    def commit(self, message: str) -> str:
+        marker = self.repo / "history"
+        marker.write_text(marker.read_text() + "x" if marker.exists() else "x")
+        subprocess.run(["git", "-C", str(self.repo), "add", "history"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-q", "-F", "-"],
+            input=message, text=True, check=True,
+        )
+        return subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+    def register(self, oid: str, error: str) -> None:
+        """Point the registry at a fixture commit for the length of one test.
+
+        The module is loaded per class by `load_checker`, so this touches this
+        class's own copy; it is restored anyway, because a test that leaves a
+        registry entry behind would excuse a commit in a later test.
+        """
+        registry = self.checker.LANDED_MESSAGE_EXCEPTIONS
+        original = dict(registry)
+        self.addCleanup(lambda: (registry.clear(), registry.update(original)))
+        registry.clear()
+        registry[oid] = self.checker.LandedException(error, "fixture reason (#1262)")
+
+    def malformed(self, value: str) -> str:
+        return STRICT_MESSAGE.replace("Codex:GPT-5 [Codex]", value)
+
+    def malformed_error(self, value: str) -> str:
+        return f"[attribution] malformed Assisted-by value {value!r}"
+
+    def run_checker(self, *args: str, stdin: str | None = None):
+        return subprocess.run(
+            [sys.executable, str(CHECKER), *args],
+            input=stdin, capture_output=True, text=True, check=False, cwd=ROOT,
+        )
+
+    def offender_present(self) -> bool:
+        return subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{self.OFFENDER}^{{commit}}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+
+    # -- the real landed commit -------------------------------------------
+
+    def test_the_registered_exception_clears_the_real_landed_red(self) -> None:
+        """GREEN-AFTER on the commit this row exists for, run as CI runs it.
+
+        RED-BEFORE, measured on the same command at `27d5432f9`:
+        `281b4bc76c0e: [attribution] malformed Assisted-by value
+        'AGENT:claude-opus-5 CLI'`, exit 1.
+        """
+        if not self.offender_present():
+            self.skipTest(
+                f"{self.OFFENDER[:12]} is not in this object store; a shallow "
+                "clone cannot measure a landed message"
+            )
+        result = self.run_checker("--range", f"{self.OFFENDER}~1..{self.OFFENDER}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Visible debt: a reader of the GREEN lane still sees the offender.
+        self.assertIn(self.OFFENDER[:12], result.stdout)
+        self.assertIn(self.OFFENDING_VALUE, result.stdout)
+        self.assertIn("debt", result.stdout.casefold())
+
+    def test_every_registered_exception_is_live(self) -> None:
+        """No dead and no overbroad entry.
+
+        Each entry is re-derived against the commit it names: the error it
+        excuses must be an error that commit actually produces. An entry whose
+        commit was fixed, or whose text was guessed, is red here rather than
+        sitting in the registry excusing nothing.
+        """
+        for oid, entry in self.checker.LANDED_MESSAGE_EXCEPTIONS.items():
+            with self.subTest(commit=oid[:12]):
+                if subprocess.run(
+                    ["git", "-C", str(ROOT), "cat-file", "-e", f"{oid}^{{commit}}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                ).returncode != 0:
+                    self.skipTest("shallow clone: the commit is not present")
+                message = subprocess.check_output(
+                    ["git", "-C", str(ROOT), "show", "-s", "--format=%B", oid],
+                    text=True,
+                ) + "\n"
+                errors = self.checker.validate_commit_message(message, strict=True)
+                self.assertIn(entry.error, errors)
+
+    def test_the_registry_holds_exactly_the_one_landed_commit(self) -> None:
+        """Nothing else is excused.
+
+        The count is the whole guard. Adding an entry has to edit this number
+        and say why, in a diff a reviewer reads, which is the property a
+        `--cutover` sha does not have: moving a cutover changes no count and
+        names no defect.
+        """
+        registry = self.checker.LANDED_MESSAGE_EXCEPTIONS
+        self.assertEqual(list(registry), [self.OFFENDER])
+        for oid, entry in registry.items():
+            self.assertEqual(len(oid), 40, "key must be a FULL commit oid")
+            self.assertEqual(oid, oid.lower())
+            int(oid, 16)
+            self.assertIn("#", entry.reason, "an entry must name its issue")
+
+    # -- scope: what stays red --------------------------------------------
+
+    def test_a_different_violation_in_the_excused_commit_still_fails(self) -> None:
+        """The excused commit is not an excused commit; ONE error is excused.
+
+        This is the property `--cutover` cannot hold: a cutover downgrades the
+        whole message to the marker check, so a second defect in the same
+        commit disappears with the first.
+        """
+        base = self.commit(STRICT_MESSAGE)
+        head = self.commit(
+            self.malformed("Codex:GPT-5 Codex")
+            + "Signed-off-by: Claude <claude@anthropic.com>\n"
+        )
+        self.register(head, self.malformed_error("Codex:GPT-5 Codex"))
+        failures = self.checker.validate_range(self.repo, base, head, cutover=None)
+        self.assertTrue(
+            any("Signed-off-by is forbidden" in f for f in failures), failures
+        )
+        self.assertFalse(
+            any("malformed Assisted-by" in f for f in failures), failures
+        )
+
+    def test_a_later_violation_is_still_caught(self) -> None:
+        """A violation introduced AFTER the excused commit is still red."""
+        base = self.commit(STRICT_MESSAGE)
+        excused = self.commit(self.malformed("Codex:GPT-5 Codex"))
+        later = self.commit(self.malformed("Codex:GPT-5 Codex"))
+        self.register(excused, self.malformed_error("Codex:GPT-5 Codex"))
+        failures = self.checker.validate_range(self.repo, base, later, cutover=None)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertTrue(failures[0].startswith(later[:12]), failures)
+
+    def test_the_exception_is_keyed_on_the_exact_error_text(self) -> None:
+        """A near-miss registration excuses nothing.
+
+        The registry cannot be written loosely enough to cover a defect it does
+        not literally name.
+        """
+        base = self.commit(STRICT_MESSAGE)
+        head = self.commit(self.malformed("Codex:GPT-5 Codex"))
+        self.register(head, self.malformed_error("Codex:GPT-5 CLI"))
+        failures = self.checker.validate_range(self.repo, base, head, cutover=None)
+        self.assertTrue(
+            any("malformed Assisted-by" in f for f in failures), failures
+        )
+
+    def test_an_unlisted_commit_is_never_excused(self) -> None:
+        """The same defect in a commit the registry does not name stays red."""
+        base = self.commit(STRICT_MESSAGE)
+        listed = self.commit(self.malformed("Codex:GPT-5 Codex"))
+        unlisted = self.commit(self.malformed("Codex:GPT-5 Codex"))
+        self.register(listed, self.malformed_error("Codex:GPT-5 Codex"))
+        failures = self.checker.validate_range(
+            self.repo, listed, unlisted, cutover=None
+        )
+        self.assertTrue(
+            any(f.startswith(unlisted[:12]) for f in failures), failures
+        )
+        self.assertNotEqual(base, listed)
+
+    def test_a_pull_request_body_is_never_excused(self) -> None:
+        """The registry cannot become a way to land a NEW malformed body.
+
+        `--message-file` gates the pull request body BEFORE it becomes a commit,
+        under `squash_merge_commit_message = PR_BODY`. It runs
+        `validate_commit_message`, which does not consult the registry at all,
+        so the exact string that landed in `281b4bc76c0e` is still rejected in
+        anything written today.
+        """
+        result = self.run_checker(
+            "--message-file", "-", "--filled",
+            stdin=self.malformed(self.OFFENDING_VALUE),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("malformed Assisted-by", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,13 +10,31 @@
 // The cases are upstream's own worked examples, from the docstring of
 // vllm/platforms/rocm.py:223-291 `_capability_from_gcn_arch`, plus the three
 // boards offered on issue #41 (gfx1100, gfx1103, gfx1151).
+#include <array>
+#include <string>
+
 #include <doctest/doctest.h>
 
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_skinny_gemm_arch.h"
 
 using vt::rocm::CapabilityFromGcnArch;
 
 namespace {
+std::array<int, 4> skinny_arch_resolves{};
+
+std::string SimulatedSkinnyArch(int device_index) noexcept {
+  if (device_index >= 0 && device_index < static_cast<int>(skinny_arch_resolves.size())) {
+    ++skinny_arch_resolves[static_cast<size_t>(device_index)];
+  }
+  switch (device_index) {
+    case 0: return "gfx1100";
+    case 1: return "gfx942:sramecc+:xnack-";
+    case 2: return "gfx1201";
+    default: return "future-arch";
+  }
+}
+
 // Reads as (major, minor) at the call site instead of .first / .second.
 void CheckArch(const char* gcn, int major, int minor) {
   const auto cap = CapabilityFromGcnArch(gcn);
@@ -98,4 +116,14 @@ TEST_CASE("the parse is constexpr, so a wrong answer is a compile error") {
   static_assert(CapabilityFromGcnArch("gfx1151")->second == 5);
   static_assert(!CapabilityFromGcnArch("sm_121a").has_value());
   CHECK(true);
+}
+
+TEST_CASE("skinny GEMM architecture eligibility follows device hops") {
+  skinny_arch_resolves.fill(0);
+  CHECK(vt::rocm::SkinnyGemmArchOk(0, SimulatedSkinnyArch));
+  CHECK_FALSE(vt::rocm::SkinnyGemmArchOk(1, SimulatedSkinnyArch));
+  CHECK(vt::rocm::SkinnyGemmArchOk(2, SimulatedSkinnyArch));
+  CHECK_FALSE(vt::rocm::SkinnyGemmArchOk(3, SimulatedSkinnyArch));
+  CHECK(vt::rocm::SkinnyGemmArchOk(0, SimulatedSkinnyArch));
+  CHECK(skinny_arch_resolves == std::array<int, 4>{1, 1, 1, 1});
 }

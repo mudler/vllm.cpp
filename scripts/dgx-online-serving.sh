@@ -481,6 +481,9 @@ start_server() {
     # backend aborts engine start (BackendSupportedError mm_fp4 cap 121), so we
     # force the Marlin W4A16 keep-quant kernel our arm mirrors. Dense Qwen3 has no
     # mamba SSM state, so the hybrid-only SSM cache-dtype flag is omitted here.
+    # ORACLE-DENOMINATOR-EXEMPT: dense Qwen3-8B has no multimodal_config, so text_only is already True
+    # and the flag decides nothing. multimodal.py:78 never applies, qwen3_next.py:325 already resolves
+    # True, and adding the flag to a measured harness that does not need it is noise, not rigour.
     server_cmd=(
       env "PATH=$(dirname "${client}"):${PATH}"
       "VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel"
@@ -493,10 +496,24 @@ start_server() {
       --port "${port}"
     )
   else
+    # 27 / 27n / 35 are Qwen3.6 checkpoints, which load as
+    # Qwen3_5*ForConditionalGeneration. Their multimodal_config is therefore
+    # non-None, and multimodal.py:78 defaults language_model_only to False, so
+    # without the flag qwen3_next.py:325 computes text_only == False and the
+    # oracle DISABLES use_fused_qk_norm_rope_gate: four ops per full-attention
+    # layer where its own production configuration issues one, against our arm's
+    # single fused launch. That is a handicapped denominator whose cost scales
+    # with prompt tokens, so it lands hardest on TTFT, and it flatters us (#414).
+    # `tools/bench/run_serve_low.py` has passed the flag since it was written;
+    # this driver did not, so the two harnesses disagreed about the oracle's own
+    # configuration. The 2026-08-13 clock-controlled series passed it and is the
+    # binding record; this makes the canonical driver agree with it, and
+    # scripts/check-oracle-denominator-flags.py keeps them agreeing.
     server_cmd=(
       env "PATH=$(dirname "${client}"):${PATH}"
       "${client}" serve "${snapshot}"
       --served-model-name gate
+      --language-model-only
       --gpu-memory-utilization 0.6
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"

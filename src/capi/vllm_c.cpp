@@ -526,6 +526,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.language_model_only = 0;        // 0 => off; limits stay at 999 (ABI v19).
   p.limit_mm_per_prompt = nullptr;  // NULL => no limits configured (ABI v19).
   p.offload_config = nullptr;       // NULL => no weight offload (ABI v21).
+  p.mmproj_path = nullptr;          // NULL => no clip projector (ABI v22).
   return p;
 }
 
@@ -662,6 +663,12 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
       // (multimodal.py:326-327), so setting both is well-defined and the flag
       // wins — mirrored rather than reimplemented here.
       ep.multimodal.language_model_only = params->language_model_only != 0;
+      // ABI v22 (LOAD-GGUF-MMPROJ, #821): the SECOND GGUF. Copied, not parsed:
+      // the file is opened and refused by name inside FromModelDir, before the
+      // tokenizer, so a wrong projector costs a message rather than a 17 GB map.
+      if (params->mmproj_path != nullptr && params->mmproj_path[0] != '\0') {
+        ep.mmproj_path = params->mmproj_path;
+      }
       if (params->limit_mm_per_prompt != nullptr &&
           params->limit_mm_per_prompt[0] != '\0') {
         ep.multimodal.limit_per_prompt = vllm::ParseLimitMmPerPromptJson(
@@ -1485,6 +1492,11 @@ VLLM_API vllm_video_params vllm_video_params_default(void) {
 struct vllm_video_engine {
   std::unique_ptr<vllm::multimodal::VideoEngine> engine;
   std::string family;
+  // v23 (#1010): the phase table the last completed generation wrote. Held on
+  // the HANDLE rather than appended to vllm_video_result, because growing an
+  // output struct is the one append a caller cannot absorb by
+  // zero-initializing — the library writes the field with its own sizeof.
+  std::string last_phase_log;
 };
 
 namespace {
@@ -1670,6 +1682,7 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
     r.height = static_cast<int32_t>(result.height);
     r.fps = static_cast<int32_t>(result.fps);
     r.sample_rate = static_cast<int32_t>(result.sample_rate);
+    engine->last_phase_log = result.phase_log_path;
     *out = r;
     ClearError();
     return VLLM_OK;
@@ -1680,6 +1693,11 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
     SetError("vllm_video_generate: unknown error");
     return VLLM_ERR_UNKNOWN;
   }
+}
+
+VLLM_API const char* vllm_video_last_phase_log(const vllm_video_engine* engine) {
+  if (engine == nullptr || engine->last_phase_log.empty()) return nullptr;
+  return engine->last_phase_log.c_str();
 }
 
 VLLM_API void vllm_video_result_free(vllm_video_result* out) {

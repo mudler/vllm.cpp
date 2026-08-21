@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
+import json
 import re
 import sys
 import tempfile
@@ -297,11 +299,11 @@ class AgentRecordMutationTests(unittest.TestCase):
 
         Same shape as the #117, #606 and #633 assertions above. Worth naming
         here for one reason beyond the count: this row exists BECAUSE the
-        `path:line` citations in these matrices are 82% unparsed by the very
-        checker this test guards, so the row's own anchors into
-        `check-agent-record.py` are — until it lands — as unchecked as the ones
-        it is filed about. Pinning the row is the only mechanical statement
-        available about it today.
+        `path:line` citations in these matrices were 83% unparsed by the very
+        checker this test guards. That is no longer true, and the row is now
+        the first thing its own ratchet polices -- `RecordAnchorRatchet` below
+        counts the anchors in this row's `Our code` cell like any other. Pinning
+        the row still says the thing a count cannot: that it exists.
         """
 
         errors: list[str] = []
@@ -1392,6 +1394,177 @@ class IssueIndexTests(unittest.TestCase):
         self.assertIsInstance(agent_record.owed_issues(), set)
 
 
+class RecordAnchorRatchet(unittest.TestCase):
+    """ENG-RECORD-ANCHOR-RATCHET (#632), .agents/specs/record-anchor-ratchet.md.
+
+    Ten cases. Seven cover a row of the spec's test table; the other three pin
+    the two gate directions and the tree-against-baseline agreement. The
+    table-driven cases build a SYNTHETIC tree and a synthetic row rather than
+    asserting against the live matrices, because the live count is a moving
+    backlog and a case that reds when somebody else repairs an unrelated anchor
+    teaches people to ignore this suite.
+
+    The fourth case is the load-bearing one. `is_code_anchor` answers with
+    `any()`, so before this row one good link in a cell made every rotted
+    citation beside it invisible -- and that is the exact shape three stale
+    anchors hid in during the 2026-08-13/14 campaign.
+    """
+
+    HEADER = ("id", "item", "upstream", "our code", "tests evidence", "state", "owner")
+
+    def row(self, state: str, code: str, tests: str = "-", *, source=None):
+        cells = ("ENG-RATCHET-FIXTURE", "item", "up", code, tests, f"`{state}`", "-")
+        return agent_record.ClaimRow(
+            path=source if source is not None else agent_record.ENGINE_MATRIX,
+            line_no=1,
+            item_id="ENG-RATCHET-FIXTURE",
+            state=state,
+            header=self.HEADER,
+            cells=cells,
+            raw="| " + " | ".join(cells) + " |",
+        )
+
+    @staticmethod
+    def tree(root: Path) -> None:
+        """A cited file whose symbol sits at :4, not at :2."""
+        target = root / "src/vllm/toy.cpp"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "#include <cstdio>\n"          # 1
+            "// a comment that moved\n"    # 2
+            "\n"                           # 3
+            "void RatchetTarget() {}\n",   # 4
+            encoding="utf-8",
+        )
+
+    def scan(self, root: Path, rows):
+        return agent_record.scan_record_anchors(rows, root=Path(root))
+
+    def test_bare_citation_at_the_wrong_line_counts_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp))
+            res = self.scan(tmp, [self.row("PARTIAL", "`RatchetTarget` `src/vllm/toy.cpp:2`")])
+        self.assertEqual(res.counts["stale"], 1, res.offenders)
+        self.assertEqual(res.counts["broken"], 0, res.offenders)
+        self.assertEqual(res.counts["ok"], 0, res.offenders)
+
+    def test_bare_citation_out_of_range_counts_broken(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp))
+            res = self.scan(tmp, [self.row("PARTIAL", "`RatchetTarget` `src/vllm/toy.cpp:99`")])
+        self.assertEqual(res.counts["broken"], 1, res.offenders)
+        self.assertEqual(res.counts["stale"], 0, res.offenders)
+
+    def test_correct_bare_citation_counts_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp))
+            res = self.scan(tmp, [self.row("PARTIAL", "`RatchetTarget` `src/vllm/toy.cpp:4`")])
+        self.assertEqual(res.counts["ok"], 1, res.offenders)
+        self.assertEqual(res.total, 0, res.offenders)
+
+    def test_one_good_link_does_not_cover_a_rotted_bare_citation(self) -> None:
+        """The `any()` shape that hid the rot: BOTH citations must be counted.
+
+        Built against REAL tree paths rather than a synthetic root, because the
+        half of the claim that matters is the interaction with `is_code_anchor`,
+        and that function resolves against `ROOT` by construction. `:1` of this
+        checker is its shebang -- in range, and forever without the symbol the
+        cell names beside it.
+        """
+        cell = (
+            "[checker](../scripts/check-agent-record.py#L1); "
+            "`RatchetFixtureSymbol` `scripts/check-agent-record.py:1`"
+        )
+        source = agent_record.ENGINE_MATRIX
+        # `any()` semantics are DELIBERATELY retained for the STATE gate -- one
+        # good anchor still evidences the row (spec, "Scope"). Before this row
+        # that was ALSO the whole of the anchor check, so the rotted citation
+        # beside it was invisible.
+        self.assertTrue(agent_record.is_code_anchor(cell, source))
+        res = agent_record.scan_record_anchors([self.row("PARTIAL", cell, source=source)])
+        self.assertEqual(res.counts["ok"], 1, res.offenders)
+        self.assertEqual(res.counts["stale"], 1, res.offenders)
+
+    def test_active_row_anchors_are_counted(self) -> None:
+        """EVIDENCED_STATES omits ACTIVE, so this row got no anchor check at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp))
+            res = self.scan(tmp, [self.row("ACTIVE", "`RatchetTarget` `src/vllm/toy.cpp:2`")])
+        self.assertEqual(res.counts["stale"], 1, res.offenders)
+        self.assertIn("ACTIVE", agent_record.RECORD_ANCHOR_STATES)
+        self.assertIn("READY", agent_record.RECORD_ANCHOR_STATES)
+
+    def test_write_baseline_refuses_to_ratchet_upward(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = Path(tmp) / "record-anchor-baseline.json"
+            baseline.write_text(
+                json.dumps({"total": 1, "buckets": {"stale": 1, "broken": 0}}) + "\n",
+                encoding="utf-8",
+            )
+            before = baseline.read_text(encoding="utf-8")
+            result = agent_record.RecordAnchorResult()
+            result.counts["stale"] = 3
+            result.counts["broken"] = 1
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), mock.patch.object(
+                agent_record, "RECORD_ANCHOR_BASELINE", baseline
+            ):
+                rc = agent_record.write_record_anchor_baseline(result)
+            self.assertEqual(rc, 1, err.getvalue())
+            self.assertIn("REFUS", err.getvalue().upper())
+            self.assertEqual(baseline.read_text(encoding="utf-8"), before)
+
+    def test_baseline_matches_the_tree_exactly(self) -> None:
+        """The committed baseline is the tree's rot, in BOTH directions.
+
+        Only the rot buckets are pinned. `ok` is deliberately absent from the
+        baseline file -- pinning it would make every change that adds or removes
+        a citation rewrite one shared file.
+        """
+        result = agent_record.scan_record_anchors()
+        stored = agent_record.load_record_anchor_baseline()
+        self.assertEqual(
+            {b: result.counts[b] for b in agent_record.RECORD_ANCHOR_BUCKETS},
+            stored,
+            agent_record.record_anchor_report(result),
+        )
+        self.assertNotIn("ok", stored)
+
+    def test_a_repair_fails_until_the_baseline_is_lowered(self) -> None:
+        """A ratchet, not a threshold: banking the improvement is mandatory."""
+        result = agent_record.scan_record_anchors()
+        result.counts["stale"] -= 1
+        errors: list[str] = []
+        agent_record.check_record_anchors(result, errors)
+        require(errors, r"record-anchor baseline STALE in bucket 'stale'")
+
+    def test_new_rot_fails_the_gate(self) -> None:
+        result = agent_record.scan_record_anchors()
+        result.counts["broken"] += 1
+        errors: list[str] = []
+        agent_record.check_record_anchors(result, errors)
+        require(errors, r"RECORD ANCHOR REGRESSION in bucket 'broken'")
+
+    def test_a_baseline_is_never_banked_from_a_tree_with_record_errors(self) -> None:
+        """`--write-baseline` must not run before the checker finishes.
+
+        The mode returned as soon as it had a number. That return happened
+        before the `if errors:` gate, so a tree that failed any other record
+        check could still bank its rot. The banked figure then carried the
+        authority of a run that never passed. The write now happens after the
+        gate.
+        """
+        digest = agent_record.RECORD_ANCHOR_BASELINE.read_bytes()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            agent_record, "check_roadmap", side_effect=lambda *a: a[1].append("SYNTHETIC")
+        ), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            code = agent_record.main(["--write-baseline"])
+        self.assertEqual(code, 1)
+        self.assertIn("SYNTHETIC", stderr.getvalue())
+        self.assertEqual(agent_record.RECORD_ANCHOR_BASELINE.read_bytes(), digest)
+
+
 class IssueIndexTableShape(unittest.TestCase):
     """The index is a TABLE, and until #1033 nothing counted its cells.
 
@@ -1423,7 +1596,11 @@ class IssueIndexTableShape(unittest.TestCase):
         with mock.patch.object(agent_record, "check_table_shapes", capture):
             with mock.patch.object(sys, "stdout", io.StringIO()):
                 with mock.patch.object(sys, "stderr", io.StringIO()):
-                    agent_record.main()
+                    # `main([])` rather than `main()`: #632 gave the checker
+                    # an argparse front end, and `main(None)` therefore parses
+                    # `sys.argv`, which under a test runner holds the runner's
+                    # own arguments and exits 2. The real call site is unchanged.
+                    agent_record.main([])
         return captured
 
     def test_check_table_shapes_covers_the_issue_index(self) -> None:
@@ -1476,6 +1653,168 @@ class IssueIndexTableShape(unittest.TestCase):
             agent_record.check_table_shapes([mutated], errors)
 
         require(errors, rf"issue-index\.md:{len(rows)}: table has 4 pipes; expected 5")
+
+
+class HfModelDownloadRowIsCounted(unittest.TestCase):
+    """The ENGINE ratchet bump 164 -> 165 is backed by a real row (#1280).
+
+    Same shape and the same reason as `MtpDepthRowIsCounted`, applied to the pin
+    this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump with
+    nothing behind it looks exactly like a bump for a row that landed.
+    `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS by moving it,
+    which holds for any value and cannot say whether 165 is the right one. This
+    class says that, by tying the pin to the row the matrix carries.
+    """
+
+    ROW = "ENG-HF-MODEL-DOWNLOAD"
+
+    def test_the_row_exists_in_the_engine_matrix(self) -> None:
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        """A row whose issue lives only in the PR body is untraceable."""
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("hf-model-download.md", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/1280)", index)
+
+    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the ENGINE matrix at a mutated copy on disk, for the
+        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
+        globally would feed engine content to every matrix, and this case would
+        then pass on errors that have nothing to do with the removal.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "engine rows" in e], [])
+
+        path = agent_record.ENGINE_MATRIX
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "engine-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("engine rows" in e for e in errors),
+            f"removing {self.ROW} must break the engine count; got {errors}",
+        )
+
+    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
+        """MUTATION TARGET: `ENGINE_ROWS` back at 164 must be an error.
+
+        The pin and the matrix are two hand-maintained records of one number.
+        This asserts they agree at the value this change lands, so lowering the
+        constant to the previous 164 while the row is present reds here.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([e for e in errors if "engine rows" in e], [])
+        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
+        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
+        self.assertIn(self.ROW, {r.item_id for r in engine})
+
+
+class BpeQuadraticMergeRowIsCounted(unittest.TestCase):
+    """The ENGINE ratchet bump 167 -> 168 is backed by a real row (#1365).
+
+    Same shape and the same reason as `HfModelDownloadRowIsCounted`, applied to
+    the pin this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump
+    with nothing behind it looks exactly like a bump for a row that landed.
+    `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS by moving it,
+    which holds for any value and cannot say whether 168 is the right one. This
+    class says that, by tying the pin to the row the matrix carries.
+
+    This class asserts nothing about `.agents/issue-index.md`, where the sibling
+    classes assert their issue number, and this change appends no row there.
+    #1365's row already landed in `9e1a5e573` and a second row for one issue
+    number is what `check-agent-record.py` reports as `issue #1365 listed
+    twice`. The row's TEXT is stale, because #1365 was re-scoped in place from
+    the symptom onto the cause after the row landed, so `assertIn("issues/1365)",
+    index)` would pass here against a row describing the symptom and would
+    measure nothing about this row's work. The staleness is recorded in the
+    spec's `## Dependencies` instead, where prose can say it.
+    """
+
+    ROW = "SPEC-BPE-QUADRATIC-MERGE"
+
+    def test_the_row_exists_in_the_engine_matrix(self) -> None:
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_spec(self) -> None:
+        """A row whose spec lives only in the PR body is untraceable."""
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("bpe-quadratic-merge.md", row)
+        self.assertTrue(
+            (ROOT / ".agents/specs/bpe-quadratic-merge.md").is_file(),
+            "the spec the row cites must exist",
+        )
+
+    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the ENGINE matrix at a mutated copy on disk, for the
+        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
+        globally would feed engine content to every matrix, and this case would
+        then pass on errors that have nothing to do with the removal.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "engine rows" in e], [])
+
+        path = agent_record.ENGINE_MATRIX
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "engine-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("engine rows" in e for e in errors),
+            f"removing {self.ROW} must break the engine count; got {errors}",
+        )
+
+    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
+        """MUTATION TARGET: `ENGINE_ROWS` back at 167 must be an error.
+
+        The pin and the matrix are two hand-maintained records of one number.
+        This asserts they agree at the value this change lands, so lowering the
+        constant to the previous 167 while the row is present reds here.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([e for e in errors if "engine rows" in e], [])
+        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
+        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
+        self.assertIn(self.ROW, {r.item_id for r in engine})
 
 
 if __name__ == "__main__":

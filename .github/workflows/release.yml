@@ -55,10 +55,18 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install feature-poor userspace emulator
+      - name: Install feature-poor userspace emulator and the TLS build files
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-user
+          # libssl-dev is named here rather than inherited. The ubuntu-latest
+          # image happens to preinstall it, so this lane got the HuggingFace
+          # fetch by accident; issue #1517 is what that accident looks like
+          # when the environment does NOT carry it. CMakeLists.txt:2440-2482
+          # downgrades silently on a failed find_package(OpenSSL), so a runner
+          # image change would ship archives with `--model org/repo` disabled
+          # and every gate still green.
+          sudo apt-get install --yes libssl-dev
           scripts/install-intel-sde.sh "$RUNNER_TEMP/intel-sde"
       - name: Build, execute, package, and validate adaptive x86 CPU bundle
         env:
@@ -99,10 +107,12 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install feature-poor userspace emulator
+      - name: Install feature-poor userspace emulator and the TLS build files
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-user
+          # Named, not inherited. See the x86 CPU lane above and issue #1517.
+          sudo apt-get install --yes libssl-dev
       - name: Build, execute, package, and validate adaptive Arm CPU bundle
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -189,8 +199,13 @@ jobs:
       - name: Install build and archive inspection tools
         run: |
           apt-get update
+          # libssl-dev, or this lane publishes an archive whose vllm-server
+          # cannot speak https. The job runs INSIDE nvidia/cuda:...-devel, so
+          # there is no runner image to inherit from and the omission is total.
+          # That is issue #1517, which was found in docker/Dockerfile's
+          # builder-cuda stage carrying the identical list.
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils ca-certificates cmake file g++ git ninja-build python3
+            binutils ca-certificates cmake file g++ git libssl-dev ninja-build python3
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v4
       - name: Build and validate the x86 ten-SM CUDA bundle
@@ -229,8 +244,13 @@ jobs:
       - name: Install build and archive inspection tools
         run: |
           apt-get update
+          # libssl-dev, or this lane publishes an archive whose vllm-server
+          # cannot speak https. The job runs INSIDE nvidia/cuda:...-devel, so
+          # there is no runner image to inherit from and the omission is total.
+          # That is issue #1517, which was found in docker/Dockerfile's
+          # builder-cuda stage carrying the identical list.
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils ca-certificates cmake file g++ git ninja-build python3
+            binutils ca-certificates cmake file g++ git libssl-dev ninja-build python3
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v4
       - name: Build and validate the Arm ten-SM CUDA bundle
@@ -265,10 +285,12 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Vulkan software runtime and archive inspectors
+      - name: Install Vulkan software runtime, archive inspectors, TLS build files
         run: |
           sudo apt-get update
           sudo apt-get install --yes mesa-vulkan-drivers
+          # Named, not inherited. See the x86 CPU lane above and issue #1517.
+          sudo apt-get install --yes libssl-dev
       - name: Build, execute, package, and validate Vulkan preview
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

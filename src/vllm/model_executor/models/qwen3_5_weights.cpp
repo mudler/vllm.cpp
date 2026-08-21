@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>  // over-aligned operator new/delete (kDeviceAliasAlignment)
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -122,6 +123,190 @@ void ReleaseDirectUploadSource(const OwnedTensor& w) {
 }
 
 }  // namespace
+
+namespace {
+
+// Drop the resident anonymous pages of `[p, p + nb)` without touching the
+// allocator's boundary metadata. Interior WHOLE pages only, for the reason
+// spelled out in `ReleaseHost` above: glibc's `free()` alone often leaves the
+// pages resident on the sbrk arena's free list, and the whole subject here is
+// the RSS.
+void DropResidentInteriorPages(const uint8_t* p, size_t nb) {
+#if defined(__unix__) || defined(__APPLE__)
+  if (p == nullptr || nb == 0) return;
+  const long ps_l = ::sysconf(_SC_PAGESIZE);
+  const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+  const auto begin = reinterpret_cast<uintptr_t>(p);
+  const uintptr_t end = begin + nb;
+  const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
+  const uintptr_t page_end = end & ~(ps - 1);
+  if (page_end > page_begin) {
+    ::madvise(reinterpret_cast<void*>(page_begin),
+              static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+  }
+#else
+  (void)p;
+  (void)nb;
+#endif
+}
+
+}  // namespace
+
+namespace {
+
+// ATOMIC, although the function that feeds it is single-threaded by
+// precondition. The re-homing branch below genuinely requires one thread — it
+// destroys the source vector — and saying so is honest. These counters are a
+// different thing: a DIAGNOSTIC that `HostAliasSnapshot` publishes to any
+// caller, so a plain `uint64_t` incremented on the model path and read
+// elsewhere is a data race in the standard's terms whatever the precondition
+// says about the branch. Relaxed ordering costs nothing measurable here (five
+// increments against a memcpy of a weight) and makes the snapshot well defined.
+struct AtomicHostAliasStats {
+  std::atomic<uint64_t> aliased_in_place_bytes{0};
+  std::atomic<uint64_t> rehomed_bytes{0};
+  std::atomic<uint64_t> declined_borrow_bytes{0};
+  std::atomic<uint64_t> declined_other_bytes{0};
+  std::atomic<uint64_t> calls{0};
+};
+
+AtomicHostAliasStats& AliasStats() {
+  static AtomicHostAliasStats s;
+  return s;
+}
+
+}  // namespace
+
+HostAliasStats HostAliasSnapshot() {
+  const AtomicHostAliasStats& s = AliasStats();
+  HostAliasStats out;
+  out.aliased_in_place_bytes = s.aliased_in_place_bytes.load(std::memory_order_relaxed);
+  out.rehomed_bytes = s.rehomed_bytes.load(std::memory_order_relaxed);
+  out.declined_borrow_bytes = s.declined_borrow_bytes.load(std::memory_order_relaxed);
+  out.declined_other_bytes = s.declined_other_bytes.load(std::memory_order_relaxed);
+  out.calls = s.calls.load(std::memory_order_relaxed);
+  return out;
+}
+
+bool HostWeightAliasEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_QWEN35_ALIAS_HOST_WEIGHTS");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
+                                  HostAliasOutcome* outcome) {
+  AtomicHostAliasStats& st = AliasStats();
+  st.calls.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t nbytes = static_cast<uint64_t>(w.bytes.size());
+  auto report = [&](HostAliasOutcome o, bool ok) {
+    if (outcome != nullptr) *outcome = o;
+    switch (o) {
+      case HostAliasOutcome::kAliasedInPlace:
+        st.aliased_in_place_bytes.fetch_add(nbytes, std::memory_order_relaxed);
+        break;
+      case HostAliasOutcome::kRehomed:
+        st.rehomed_bytes.fetch_add(nbytes, std::memory_order_relaxed);
+        break;
+      case HostAliasOutcome::kDeclinedBorrow:
+        st.declined_borrow_bytes.fetch_add(nbytes, std::memory_order_relaxed);
+        break;
+      default:
+        st.declined_other_bytes.fetch_add(nbytes, std::memory_order_relaxed);
+        break;
+    }
+    return ok;
+  };
+  if (!HostWeightAliasEnabled())
+    return report(HostAliasOutcome::kDeclinedDisabled, false);
+  // Nothing to alias. The caller refuses this by name rather than handing a
+  // kernel a null pointer; see ResidentWeight.
+  if (w.bytes.empty()) return report(HostAliasOutcome::kDeclinedEmpty, false);
+  if (reinterpret_cast<uintptr_t>(w.bytes.data()) % kDeviceAliasAlignment == 0) {
+    // ISSUE #150's WINDOWED RELEASE STILL HAS TO HAPPEN, and this branch is the
+    // third path that can skip it. A safetensors direct-upload borrow whose
+    // offset happens to be a multiple of 256 is aliased here and never reaches
+    // `AdoptDeviceBytesAsHost`, which is the only other caller of
+    // `ReleaseDirectUploadSource` — so its consumed source pages would stay
+    // resident, data-dependently, for roughly one borrow in eight. The comment
+    // on the ordering inside `AdoptDeviceBytesAsHost` insists the release
+    // happens on EVERY path including the `VT_ADOPT_DEVICE_BYTES=0` arm, and
+    // this honours the same rule. A no-op unless `mmap_src` is set, which the
+    // GGUF loader never does.
+    //
+    // ONCE, AND THE MEMO IS THE RECORD ITSELF (a fresh review of #1299 caught
+    // the repeat). `AdoptDeviceBytesAsHost` calls this from behind
+    // `if (!w.d_dev)`, so it ran exactly once per weight. THIS branch has no
+    // memo: `ResidentWeight` re-tests the alignment on every call, about 1,361
+    // times per forward step on the target checkpoint. Left uncleared,
+    // `mmap_src` would make every one of those steps `madvise(MADV_DONTNEED)`
+    // the very pages the GPU is about to read, and the kernel would fault them
+    // straight back in. Correctness survives that; throughput does not. Clearing
+    // the record IS the memo, and it says the true thing: these source pages are
+    // spent. It also matches what `ReleaseHost` and the adoption branch below
+    // already do after they consume the same record. The borrow itself is
+    // untouched and stays a valid, re-faultable PROT_READ MAP_PRIVATE view.
+    ReleaseDirectUploadSource(w);
+    auto& consumed = *const_cast<OwnedTensor*>(&w);
+    consumed.mmap_src = nullptr;
+    consumed.mmap_src_bytes = 0;
+    return report(HostAliasOutcome::kAliasedInPlace, true);
+  }
+  // A borrow owns no anonymous pages, so re-homing it would ADD residency
+  // instead of removing it, and a tied pair's shared expansion must keep its one
+  // keep-alive. Same reasoning, and the same answer, as `ReleaseHost`'s and
+  // `AdoptDeviceBytesAsHost`'s borrowed branches.
+  //
+  // ONE EXCEPTION TO "A BORROW OWNS NO ANONYMOUS PAGES" NOW EXISTS, AND IT IS
+  // THE ONE THIS FUNCTION CREATES. The block below turns an OWNED buffer into a
+  // BORROWED one whose keep-alive is an over-aligned `operator new` block —
+  // anonymous memory. That does not change the answer here (such a buffer is
+  // already aligned and returns above), but it does mean the sentence is no
+  // longer universally true, and the three places that reason from it —
+  // `ReleaseHost`'s borrowed branch, `AdoptDeviceBytesAsHost`'s, and this one —
+  // are now reasoning about GGUF mappings and tied expansions specifically. The
+  // consequence worth naming: `ReleaseHost()` on a re-homed weight drops the
+  // keep-alive rather than madvising, which frees the block through the deleter
+  // and is correct, but it does not take the `MADV_DONTNEED` path. Nothing calls
+  // `ReleaseHost` on a dense weight today; `HostMirrorIsRedundant` is what keeps
+  // the one caller that could from doing it to an aliased one.
+  if (w.bytes.borrowed())
+    return report(HostAliasOutcome::kDeclinedBorrow, false);
+
+  // SINGLE-THREADED BY PRECONDITION, stated rather than enforced. The
+  // re-pointing below destroys the source vector, so two threads reaching it for
+  // the same weight would race — and unlike `AdoptDeviceBytesAsHost`, which
+  // hides behind `if (!w.d_dev)`, this branch has no memo and re-tests alignment
+  // on every call. It is safe because the first touch of every weight happens
+  // inside one forward on one thread, which is the same assumption the `d_dev`
+  // memo two branches down has always made. A model that ever builds residents
+  // from several threads must add a `call_once` here and there.
+  auto& self = *const_cast<OwnedTensor*>(&w);
+  const size_t nb = self.bytes.size();
+  // Over-aligned `operator new` rather than `aligned_alloc`/`posix_memalign`:
+  // it is the one spelling that is standard C++17 AND available on MSVC, which
+  // this tree still compiles for, and it does not require the size to be a
+  // multiple of the alignment.
+  void* p = ::operator new(nb, std::align_val_t{kDeviceAliasAlignment});
+  // The keep-alive is built IMMEDIATELY, before anything that can throw, so the
+  // block is owned from the instant it exists. `shared_ptr`'s own control-block
+  // allocation is the throwing step, and holding a raw `p` across it is how an
+  // allocation leaks on a path nobody tests.
+  std::shared_ptr<const void> keep(static_cast<const void*>(p), [](const void* q) {
+    ::operator delete(const_cast<void*>(q), std::align_val_t{kDeviceAliasAlignment});
+  });
+  std::memcpy(p, self.bytes.data(), nb);
+  // ORDER: release the OLD pages while they are still mapped, then re-point.
+  // The assignment below destroys the vector that owns them, and madvise'ing a
+  // range after it has been unmapped is at best a silent no-op and at worst
+  // discards whatever mapped into the hole first — the same trap
+  // `AdoptDeviceBytesAsHost` documents at length.
+  DropResidentInteriorPages(self.bytes.data(), nb);
+  self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(p), nb, std::move(keep));
+  return report(HostAliasOutcome::kRehomed, true);
+}
 
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
   if (w.d_dev == nullptr) return;
@@ -1049,7 +1234,7 @@ const char* MoeProjDtypeName(MoeProjDtype dtype) {
   return "unknown";
 }
 
-// THE DENSE ARM'S LADDER, MIRRORED EXACTLY (qwen3_5_dense_weights.cpp:357-359
+// THE DENSE ARM'S LADDER, MIRRORED EXACTLY (qwen3_5_dense_weights.cpp:358-360
 // `IsNvfp4Projection`, :475-484 `load_projection`). See the header for why the
 // order matters and what binds the two in test.
 MoeProjDtype ClassifyQwen3_5Projection(const TensorDtypeProbe& dtype_of,

@@ -172,7 +172,7 @@ h = norm(h)                                          # -> lm_head (shared)
 - **NVFP4 gotcha** (`:86-103`): `mtp.fc` is stored BF16 but missing from the
   quant-config exclude list → vLLM forces `fc` unquantized when quant is
   `modelopt_fp4`. Our loader must treat ALL `mtp.*` as bf16-unquantized (our
-  27B loader already declares this: `qwen3_5_dense_weights.cpp:209`).
+  27B loader already declares this: `qwen3_5_dense_weights.cpp:210`).
 - Weight names remap `mtp.` → `model.` (`:282-295`); the draft's KV layer is
   registered as a NEW attention layer (index `num_hidden_layers`, i.e. layer
   64/40) → it gets its **own KV-cache layer** (draft layer names = all minus

@@ -497,6 +497,16 @@ takes a different path entirely.
   This row does not drive that arm and does not change that fact. The file is a
   known lock (#595), so the edit is one appended row rather than a rewrite, to
   keep the conflict surface with the sibling rows editing it at a single line.
+
+  **Superseded 2026-08-20 by `LTX25-DFR-ROUNDS`
+  ([#986](https://github.com/mudler/vllm.cpp/issues/986)), and left standing
+  rather than rewritten.** That row landed DFR's temporal rounds loop, which is
+  the arm's only consumer upstream or here, so the cell now reads
+  `Temporal x2 ups DRIVEN.` The sentence above was true of THIS row and of the
+  tree it was written against; what it recorded was that this row did not touch
+  the cell, and that remains true. See
+  [`ltx25-dfr-rounds.md`](ltx25-dfr-rounds.md) §7 for the sentence the records
+  carry now.
 - `.agents/issue-index.md` — append-only, two rows appended, zero removed.
 - No lifecycle change, so `docs/STATUS.md`, `docs/BENCHMARKS.md` and `## Now`
   are untouched.

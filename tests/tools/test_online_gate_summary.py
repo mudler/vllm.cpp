@@ -902,6 +902,41 @@ class OnlineGateSummaryTests(unittest.TestCase):
             report = _report(runs, ratios)
             self.assertIn("3 busy / 900 idle", report)
 
+    def test_an_asymmetric_excursion_burden_cannot_pass_at_a_zero_median_offset(
+        self,
+    ) -> None:
+        """The #1546 defect, end to end and through the rendered report.
+
+        Both arms sit at a median of exactly 2489 MHz, one boot, matched
+        hardware, spread 3.5757% under the 5.0% ceiling and no throttle bit --
+        every existing rule silent -- while our arm's excursion population puts
+        its MEAN 1.15% below vLLM's. Before the cross-arm mean term this pairing
+        summarized CLEAN and its ratio was binding.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for repetition in (1, 2, 3):
+                _write_clock_leg(
+                    root, "ours", repetition, [2489] * 105 + [2400] * 50
+                )
+                _write_clock_leg(root, "vllm", repetition, [2489] * 155)
+            runs, ratios = self._summarize(root)
+            clock = ratios["clocks"]["27"]
+            self.assertAlmostEqual(clock["median_offset_pct"], 0.0)
+            self.assertAlmostEqual(clock["mean_offset_pct"], -1.153462, places=5)
+            self.assertEqual(len(clock["reasons"]), 1, clock["reasons"])
+            self.assertIn("MEAN SM clocks", clock["reasons"][0])
+            self.assertFalse(ratios["gate_pass"])
+            self.assertFalse(
+                any(ratio["binding_eligible"] for ratio in ratios["ratios"])
+            )
+            # A refusal nothing prints is a refusal nobody reads.
+            report = _report(runs, ratios)
+            self.assertIn("MEAN SM clocks", report)
+            self.assertIn("mean: ours 2460.3 MHz vs vLLM 2489.0 MHz (-1.15%)", report)
+
     def test_the_override_does_not_waive_an_over_spread_window(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

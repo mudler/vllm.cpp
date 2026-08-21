@@ -22,7 +22,7 @@ is accepted here.
 | The `uva` backend object and its byte budget | Built. It answers the offload decision and counts approved bytes |
 | The `prefetch` backend | Not built. A config that selects it is accepted and reported as unbuilt |
 | A loader that asks the offloader and keeps a weight off the device | **Not wired.** This is the part that frees memory, and it does not exist yet |
-| A model that accepts an enabled offload | **None.** Every architecture is refused at startup — see [What the engine refuses](#what-the-engine-refuses-and-what-it-only-warns-about) |
+| A model that accepts an enabled offload | **None.** Every architecture is refused at startup, see [What the engine refuses](#what-the-engine-refuses-and-what-it-only-warns-about) |
 | Pinned host copies and device views | Not built |
 
 So the honest summary is: you can write and validate a weight-offload
@@ -111,7 +111,7 @@ would stay on the device and the budget would free nothing
 
 It is raised after the architecture resolves and **before any weight I/O**, so
 nothing is read from disk before you are told. The support flag defaults to off,
-which means a newly added model is refused until someone wires its loader —
+which means a newly added model is refused until someone wires its loader,
 the default is the mechanism, not an oversight.
 
 A model that *claims* support and then never asks the offloader about a single

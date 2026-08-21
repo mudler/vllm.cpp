@@ -527,6 +527,9 @@ TEST_CASE("muse_glimmer text: matches the fp32 reference transcribed from upstre
   double scale = 0.0;
   for (float x : want) scale = std::max(scale, std::abs(static_cast<double>(x)));
   const double diff = MaxAbsDiff(got, want);
+  // This band is the same rounded-up W1 measurement class the biting case below
+  // no longer carries, and `4712dac40` moved it from 0.242 to 0.687 of its
+  // bound. Owed as #1466, with its own derivation; not re-tuned here.
   MESSAGE("muse_glimmer text vs fp32 reference: max|diff|=" << diff
           << " over logits of max|.|=" << scale);
   CHECK(diff <= 5e-4);
@@ -534,12 +537,65 @@ TEST_CASE("muse_glimmer text: matches the fp32 reference transcribed from upstre
   // Same model with a BITING soft-cap, so the reference also pins the ORDER of the
   // output multiplier and the cap (:1618-1621). At the default cap of 20 the tanh is
   // linear over these logits and the order is unobservable; at 1e-3 it is not.
+  //
+  // WHERE THE ORDER IS VISIBLE, and it is not in a max|diff| band. At cap = 1e-3
+  // the logits (max|.| = 4.88e-2) drive |x / cap| ~ 50, so the tanh is saturated
+  // to within 1e-40 and the two candidate orders reach DIFFERENT saturation
+  // magnitudes: `cap * tanh(mult * x / cap)` reaches `cap`, and the swapped
+  // `mult * cap * tanh(x / cap)` reaches `out_mult * cap`. On this fixture that
+  // is 1.0e-03 against 7.5e-04. So the order is an ALGEBRAIC property of the
+  // output's range, and gating it there costs no band to tune: MEASURED, our
+  // saturation and the reference's agree EXACTLY (delta 0), and the swap moves it
+  // by |1 - out_mult| * cap = 2.5e-04 — 32x the bound below.
+  //
+  // The bound: our logits pass a bf16 store, so the saturation we can report
+  // departs from `cap` by at most one bf16 unit roundoff (2^-8) on each side.
+  //
+  // WHAT THIS REPLACES, AND WHY. `bdiff <= 1e-5` was the W1 measurement (5.28e-06
+  // at `3a54c4b7d`) rounded up, carrying 1.89x of headroom and no derivation.
+  // `4712dac40` narrowed `act(gate)` to the input dtype — upstream's polarity, and
+  // the only form that reproduces the committed `silu_and_mul_bf16_8x256` oracle
+  // golden bit-exactly — which adds one legitimate bf16 rounding per activation
+  // element and grew this envelope 2.8x, to 1.48e-05. A constant a CORRECT kernel
+  // change consumes was never a bound. #1458.
+  //
+  // Two replacements were tried and REJECTED, recorded so nobody re-derives them:
+  // `bdiff <= diff` is rigorous (the cap is 1-Lipschitz, so it cannot enlarge a
+  // difference) but does NOT red the swap, because the uncapped envelope is
+  // 3.4e-04 and the defect is 2.5e-04. A measured twin at `out_mult = 1`, where
+  // the two orders coincide by algebra, gives 6.10e-06 — but it is a DIFFERENT
+  // model, and its max|diff| sits at a different point on the tanh knee, so the
+  // gated run reaches 2.4x it with nothing wrong. The band is knee-driven and is
+  // kept only at its rigorous Lipschitz value.
   TinySpec biting;
   biting.softcap = 1e-3;
   const MuseGlimmerWeights wb = TinyWeights(MakeConfig(biting));
-  const double bdiff = MaxAbsDiff(RunForward(wb, Positions()), RefForward(wb, Positions()));
-  MESSAGE("muse_glimmer text vs fp32 reference (biting soft-cap): max|diff|=" << bdiff);
-  CHECK(bdiff <= 1e-5);
+  const std::vector<float> bgot = RunForward(wb, Positions());
+  const std::vector<float> bwant = RefForward(wb, Positions());
+  const double bdiff = MaxAbsDiff(bgot, bwant);
+  double got_sat = 0.0, want_sat = 0.0;
+  for (float x : bgot) got_sat = std::max(got_sat, std::abs(static_cast<double>(x)));
+  for (float x : bwant) want_sat = std::max(want_sat, std::abs(static_cast<double>(x)));
+  // THE PRECONDITION, ASSERTED. Everything above turns on the tanh being
+  // saturated at this cap; if the fixture ever drifts so that it is not, the two
+  // orders stop having different ranges and this case degrades silently from an
+  // order gate into a weak magnitude comparison that the swap no longer reds.
+  // Saturated, the reference's own maximum IS the cap, and both sides are f32
+  // values, so the check is an equality with nothing to tune.
+  REQUIRE(want_sat > 0.0);
+  REQUIRE(static_cast<float>(want_sat) == static_cast<float>(biting.softcap));
+  // 2^-8 is bf16's UNIT ROUNDOFF -- the largest relative error a correctly
+  // rounded bf16 store can carry. It is NOT the format's relative spacing
+  // (machine epsilon), which is twice it at 2^-7. The unit roundoff is what a
+  // stored value's departure is bounded by, which is what both uses want.
+  constexpr double kBf16UnitRoundoff = 1.0 / 256.0;
+  MESSAGE("muse_glimmer text vs fp32 reference (biting soft-cap): max|diff|="
+          << bdiff << " (uncapped envelope " << diff << "); saturation ours="
+          << got_sat << " ref=" << want_sat << ", delta="
+          << std::abs(got_sat - want_sat) << " against "
+          << (2.0 * kBf16UnitRoundoff * want_sat));
+  CHECK(std::abs(got_sat - want_sat) <= 2.0 * kBf16UnitRoundoff * want_sat);
+  CHECK(bdiff <= diff);
 }
 
 TEST_CASE("muse_glimmer text: embed_norm is WEIGHTLESS RMSNorm, not a sqrt(H) scale") {

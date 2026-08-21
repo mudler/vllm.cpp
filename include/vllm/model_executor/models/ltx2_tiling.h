@@ -296,7 +296,7 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
                               int64_t latent_channels, int64_t latent_t, int64_t latent_h,
                               int64_t latent_w, Ltx2NoiseStream* noise,
                               const Ltx2TileSizeConfig& tiling, const Ltx2VideoChunkSink& emit,
-                              const double* timestep = nullptr);
+                              const double* timestep = nullptr, vt::Queue* queue = nullptr);
 
 // `ConvVideoDecoder.decode_video` (conv_video_decoder.py:486-506) minus the [0,1]
 // rescale, which upstream does in `to_rgb` and this project's frame writer does
@@ -305,12 +305,17 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
 //
 // REFUSES the diffusion decoder by name, never downgrading, for the reason
 // Ltx2VideoDecode gives.
+//
+// `queue` is forwarded verbatim to every per-tile `Ltx2ConvVideoDecode`, and it
+// is WHERE THE CONVOLUTION RUNS (#1007, LTX25-DEVICE-RESIDENCY W5). NULL means
+// the CPU queue and is byte-identical to the pre-seam host arm; see
+// ltx2_video_vae.h for what is and is not on the device.
 void Ltx2VideoDecodeStreaming(Ltx2VideoDecoderKind kind,
                               const Ltx2ConvVideoDecoderConfig& config,
                               const Ltx2VaeWeights& weights, const std::vector<float>& latent,
                               int64_t latent_channels, int64_t latent_t, int64_t latent_h,
                               int64_t latent_w, Ltx2NoiseStream* noise,
                               const Ltx2TileSizeConfig& tiling, const Ltx2VideoChunkSink& emit,
-                              const double* timestep = nullptr);
+                              const double* timestep = nullptr, vt::Queue* queue = nullptr);
 
 }  // namespace vllm

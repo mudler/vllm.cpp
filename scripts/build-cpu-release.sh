@@ -23,6 +23,29 @@ if [[ "$artifact_id" == linux-x86_64-musl-cpu-static ]]; then
   literal_static=ON
 fi
 
+# ENG-HF-MODEL-DOWNLOAD W5 (#1280): the HuggingFace fetch needs transport layer
+# security, and TLS on the literal-static lane is a dependency that lane cannot
+# carry. `scripts/validate-release-archive.py:404` refuses ANY ELF dependency,
+# interpreter or run path on an artifact whose `static_boundary` is
+# `literal-static`, so a dynamically linked `libssl.so.3` would fail the archive
+# gate outright, and `scripts/release_metadata.py:124-133` declares nothing but
+# static musl-libc for a musl artifact, so it would also be UNDECLARED.
+#
+# The spec offered two dispositions and THIS LANE TOOK THE SECOND: the feature
+# resolves OFF and the binary refuses a repository identifier with a message
+# that names the three build options
+# (`src/vllm/transformers_utils/hf_hub.cpp`, `HfRefuseHttpsWithoutTls`). The
+# first disposition, a fully static BoringSSL through
+# `-DVLLM_CPP_BUILD_BORINGSSL=ON`, is implemented and available, and it is not
+# taken HERE because it fetches from the network at configure time, which a
+# release lane must not do: the archive would then depend on
+# `boringssl.googlesource.com` being reachable and on a tag nothing in this
+# repository can pin by content. Every other lane keeps the default ON.
+hf_download=ON
+if [[ "$literal_static" == ON ]]; then
+  hf_download=OFF
+fi
+
 cmake -S . -B "$build_dir" -G Ninja \
   -DVLLM_CPP_BUILD_TESTS=ON \
   -DVLLM_CPP_BUILD_VERSION="$VERSION" \
@@ -33,6 +56,7 @@ cmake -S . -B "$build_dir" -G Ninja \
   -DVLLM_CPP_HIP=OFF \
   -DVLLM_CPP_HIP_ARCHITECTURES= \
   -DVLLM_CPP_LITERAL_STATIC="$literal_static" \
+  -DVLLM_CPP_HF_DOWNLOAD="$hf_download" \
   -DVLLM_CPP_METAL=OFF \
   -DVLLM_CPP_MLX=OFF \
   -DMLX_ROOT= \

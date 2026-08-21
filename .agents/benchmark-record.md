@@ -19,6 +19,51 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## ENG-EXPERT-STREAM-DEVICE W0a — a GB10 kernel CAN dereference the host slot arena (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0`, #1124)
+
+**W0a is the probe the whole W0 mechanism rests on, and it answered
+`W0A_VERDICT=PAGEABLE_OK`.** It is recorded here rather than only in the
+scoreboard because it is a MEASUREMENT, and because the row's spec and
+`docs/BENCHMARKS.md` had both carried it as "not run" after it had run.
+
+The question. `HostExpertSlotStore`'s arena is a plain `std::vector<uint8_t>`.
+W0c serves an expert slice by handing a CUDA GEMM a pointer INTO that vector.
+If a GB10 kernel cannot dereference ordinary host storage, the design is wrong
+at the root, `Platform::host_memory_is_device_addressable()` answers false on the
+one box that matters, the lane never engages, and the row returns
+`NEEDS_DECISION` in favour of a `cudaHostAlloc` arena, which is a different
+allocator and a different ownership story.
+
+The answer, on `dgx:gpu0` inside an `rc` lease:
+
+| Quantity | Value |
+|---|---|
+| `cudaDevAttrPageableMemoryAccess` | 1 |
+| `cudaDevAttrIntegrated` | 1 |
+| kernel read AND write of a 2,490,368 B slot in `std::vector` storage | correct |
+| bandwidth ratio over that access, range across reps | 2.06-2.28x |
+| verdict | `W0A_VERDICT=PAGEABLE_OK` |
+
+Two things this deliberately does not say. The attribute pair is exactly what
+`CudaPlatform` conjoins, so it is the predicate's own input and not a proxy for
+it; but an attribute is a CLAIM, which is why the probe also ran the access. The
+slot size is 2,490,368 B because that is one real IQ1_XXXS expert slice on
+`Qwen3.8-2.4T-A95B UD-Q1_0` (1,275,068,416 / 512), so the measured access is the
+access the lane will perform and not a synthetic stand-in.
+
+Two of the four attributes the spec's port map names,
+`cudaDevAttrPageableMemoryAccessUsesHostPageTables` and
+`cudaDevAttrConcurrentManagedAccess`, are NOT carried here. The verdict turns on
+the two that are, and writing down two numbers that were not handed over would be
+worse than the gap.
+
+**This is not a decode number and does not become one.** W0e — G0-CORRECT,
+G0-LIVE and G0-SPEED — is still queued on the box, no speed floor is set for it,
+and a CUDA arm slower than the CPU arm remains a real publishable outcome: the
+recorded GB10 ATS penalty applies to all ~6.95 GB of expert bytes this lane reads
+per token, and the 2.06-2.28x above is a microbenchmark of one access, not of a
+decode step.
+
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 
 **This supersedes the entry that recorded the A3 gate as a 6/96 device failure
@@ -9886,7 +9931,7 @@ M=$HOME/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/6
 | fp8 cuBLASLt plan cache (`KERNEL-GEMM-FP8`) | **DONE / MEASURED NEUTRAL - bit-exact mirror, OPT-IN (`VT_FP8_PLAN_CACHE=1`), premise disproven** | The fp8 dense GEMM (`cuda_matmul.cu`) rebuilt the cuBLASLt descriptor + 3 TN layouts + heuristic every call; vLLM reuses an in-graph plan. Added a per-device `{desc,layouts,algo}` cache keyed on the full shape/config (`fp8_plan_cache.h`); BIT-EXACT (algo process-deterministic per shape - byte-exact cached==fresh `test_ops_fp8_cutlass` + CPU key/flag 4/4; 27B 235/235 + 35B 315/315 both flags). **Same-binary 35B A/B (one flock) is wall-clock NEUTRAL**: prefill TTFT in1024/c8 async-on ON 1491.5/OFF 1496.8, async-off ~1496.7/~1503.2; decode TPOT c1 15.16/15.14, c4 21.79/21.83. **nsys (async-off eager prefill): the pre-fp8-GEMM GPU gap is UNCHANGED - median 210 µs (off) vs 204 µs (on)** ⇒ the grounded "~0.8 ms removable gap" premise is NOT reproduced; the heuristic host cost is negligible/hidden (prefill GPU-bound; decode graph-captured so the heuristic runs at capture, not per replay-step). Kept opt-in for eager/non-graph regimes; default NOT flipped (faster unmet). Evidence `dgx:/tmp/fp8pc-*` + `~/work/prefill-attr-35b` | None - the vLLM-mirror lands opt-in; no default-flip and no speed credit |
 | Serving transport (TCP_NODELAY) | **DONE / MEASURED NEUTRAL on the gate workload** | Mirror landed (`SERVE-HTTP-TRANSPORT`): `set_tcp_nodelay(true)` matches vLLM's uvicorn/asyncio default; behavioral accepted-socket test RED **0** → GREEN **1**, 22/22 cases. The non-binding one-lock localhost A/B (`~/work/vllm.cpp-tcpnodelay-sizing/ff915e8…`, 4a450f9 Nagle-ON vs ff915e8 Nagle-OFF, c1/c2 ×2 reps, identical pinned-client workload; raw-set SHA `f5b52900…2128`) is **neutral within noise** on every ITL/TPOT/throughput metric (c1 mean ITL ~102.7 both arms; c2 ~108-109; first cold-start leg excluded). Mechanism: ~100 ms per-token write cadence vs µs loopback ACKs means Nagle never coalesces - the rescan's rank-1 gain hypothesis is REFUTED for the loopback gate; the mirror stays for real-network parity | None for the gate - the c2/c8 full-step attribution is complete (transport ruled out; c2 gap is GPU-busy kernel glue) |
 | Block-table host-cluster cleanup ([rescan](specs/rescan-lost-lanes-2026-07-16.md) §1,§5,§6) | **CPU-SIDE, BIT-IDENTICAL; `benchmark_binding=false`, no speed credit** - the payoff is measured by the dispatched correct-state c2/c8 full-step probe and the next authorized exact grid, not by these mirrors. **(c) LANDED** - `block_table.compute_slot_mapping` drops the dead tail-pad (`~2×(max_num_batched_tokens−total)` int64 writes/step; the decode graph re-pads via `BuildPaddedDecode`, the only other consumer slices `[0,total)`); test_block_table 11/11, test_prepare_inputs 6/6. **(d) LANDED** - the decode-graph capture-size set is DERIVED from `max_num_seqs` (`include/vllm/model_executor/models/decode_graph_sizes.h`, `DecodeGraphSizes`/`PadToCaptureSize`; mirrors vLLM `_set_cudagraph_sizes` reduced to the full-decode-cudagraph regime): `max_num_seqs=32` → `{1,2,4,8,16,24,32}` (adds the missing 24 bucket, drops the never-reachable 64; batches 17-24 stop over-padding to 32, +1 captured graph). CUDA-only; padding rows inert → token-exact. RED→GREEN `test_decode_graph_sizes` 5 cases/478 asserts (RED = 24 bucket absent under the old fixed set). **(e) LANDED** - `InputBatch::make_sampling_metadata` caches + rebuilds only on batch change (add/remove/condense/swap set a dirty flag), mirroring vLLM `refresh_metadata` (gpu_input_batch.py:812-830); deviation: the penalty-active path rebuilds every step (our port copies output_token_ids where vLLM holds a live ref), so the greedy/no-penalties gate gets the full win bit-identically. `scheduler.cpp:371,377` `std::move`s the `num_scheduled_tokens` map + `finished_req_ids` set (container plumbing, zero policy change; move-then-clear keeps observable behavior identical). RED→GREEN `test_input_batch` (+2 cases; RED = stale cache after a 2nd add returns size 1 != 2); `test_scheduler` 31/31, `test_runner` 228/228, `test_sampling_metadata` 6/6 unchanged. Items (a)-runner + (b) (GDN col-0) are in `runner.cpp` (async/GDN-claim owned) - reported, not touched. Landed `8a717b2`/`81afc36`/`0c4b41c` (merged `e027ad5`); clean full `-Werror` rebuild 0 warnings, CPU battery + tools 164/164 green. **DGX token-exactness gate PASSED** on the `e027ad5` build (GB10, one `flock /tmp/gpu` series, root `dgx:~/work/vllm.cpp-blocktable-gate`): 27B default **235/235**, 27B `VT_GDN_PACKED_DECODE=0` rollback **235/235**, 35B **315/315**, all exit 0 | **CLOSED - claim released.** No A/B by design (`benchmark_binding=false`, no speed credit); payoff measured by the c2/c8 attribution probe + the next authorized exact grid |
-| Host-weight ownership | **Established 27B binding memory axes remain PASS at `246a23c`. Local plain-BF16 4B remains `GATING`.** Current direct ON/OFF/stable-vLLM peak PSS is **2.406/8.592/7.662 GiB**, stable PSS **0.759/8.589/4.029 GiB**, and peak VRAM **12850.7/12843.3/12942.7 MiB**. Direct ON=OFF output IDs match 128/128 in every pair; direct loading cuts peak/stable PSS **72.0%/91.2%** and stays within the +8 MiB ON-vs-OFF VRAM gate. | H32 AOT, plain-BF16 graph and ratio-4 FA2 are complete. Current total throughput is **5769.99/5660.70/5849.80 tok/s** for ON/OFF/vLLM, so ON is **0.9864x** vLLM; TPOT/ITL **43.72 vs 38.55 ms** keeps speed open. Implement a compaction-safe device-resident sampled-token map for discrete CUDA, remove the immediate main-stream wait, then rerun the exact series. [Binding evidence](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md). |
+| Host-weight ownership | **Established 27B binding memory axes remain PASS at `246a23c`. Local plain-BF16 4B remains `GATING`.** Current direct ON/OFF/stable-vLLM peak PSS is **2.406/8.592/7.662 GiB**, stable PSS **0.759/8.589/4.029 GiB**, and peak VRAM **12850.7/12843.3/12942.7 MiB**. Direct ON=OFF output IDs match 128/128 in every pair; direct loading cuts peak/stable PSS **72.0%/91.2%** and stays within the +8 MiB ON-vs-OFF VRAM gate. | H32 AOT, plain-BF16 graph and ratio-4 FA2 are complete. As of 2026-07-25 total throughput was **5769.99/5660.70/5849.80 tok/s** for ON/OFF/vLLM, so ON was **0.9864x** vLLM; TPOT/ITL **43.72 vs 38.55 ms**. **SUPERSEDED 2026-08-12 ([#527](https://github.com/mudler/vllm.cpp/issues/527)):** the "implement a compaction-safe device-resident sampled-token map for discrete CUDA, remove the immediate main-stream wait, then rerun the exact series" next-action is DONE and its premise REFUTED — the map landed `deed7c2a1` (2026-07-27) and is DEFAULT ON since `1718bf155` (2026-08-05), and `deed7c2a1` records that the 497-`cudaStreamSynchronize` attribution motivating the wait removal is wrong for this workload (`vllm-bench` drives the synchronous `LLMEngine::step()`, so `sample_tokens_async` never runs). The series was rerun through 2026-08-09: throughput **6831.71 vs 6643.40 tok/s (1.0283x PASS)**; TPOT/ITL **1.0165x** and peak VRAM **+118.7 MiB** remain the open axes. Next action is same-tool interval profiling to split the residual TTFT into intake vs prefill. [2026-07-25 binding evidence](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md); [current sm_120 baseline](../docs/bench-evidence/qwen35-4b-sm120-main-20260807.md). |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN (grid crash FIXED)** | Correctness passes; no current v0.25.0 performance denominator exists. The 35B online-serving **c2+ crash that blocked the grid is root-caused + FIXED** (2026-07-18, `CLAIM-35B-GRAPH-SCRATCH-1`, [spec](specs/decode-graph-scratch-uaf-2026-07-18.md)): at concurrency > 1 the engine died with `cudaEventSynchronize: an illegal memory access`. cuda-gdb pinned the faulting kernel to `marlin_moe_wna16::Marlin<…><<<(144,1,1),(128,1,1)>>>` - its fp32-reduce scratch `c_tmp` (`EnsureCtmp`, `cuda_moe_marlin.cu`) is a grow-on-free per-stream buffer whose pointer is baked into the captured pure-decode CUDA graph; a bigger later prefill/decode `cudaFreeAsync`s it → the next graph replay reads freed memory (single-stream c1 never grows it → never crashed). Differential isolation: needs graphs ON + concurrency > 1 + long context; async/WMMA ruled OUT (async-off + wmma-off still 5/5 crash; graphs-off CLEAN); memcheck masks it. Fix = retire-on-grow (`RetireGraphScratch`, `src/vt/cuda/graph_safe_scratch.h`) across the four decode-graph-reached scratch allocators. Sweep c1-c16 pre-fix 5/5 crash → post-fix 0; 315/315 token-exact preserved. `benchmark_binding=false` (correctness fix, no speed credit) | Run the v0.25.0 performance grid (now unblocked) after 27B reaches 124/124 |
 | 35B FA2-prefill + fused-preamble lever | **LANDED / default-ON (2026-07-18, `CLAIM-35B-FA2-FLIP-1`); `benchmark_binding=false` (offline op A/B, no grid speed credit - the 35B grid re-measures in-situ)** ([spec](specs/qwen36-35b-fa2-prefill-oracle-2026-07-18.md)) | `FuseAttnPreambleOn` flipped default-ON all arches ⇒ the 35B ratio-8 full-attn layers take the exact `flash_fwd_splitkv` kernel (kernel-side `fa2_prefill` admits any GQA ratio at head_dim 256, `cuda_paged_attn.cu:2494`). FULL current-main default-set gate (async + GDN cubin + all fast kernels + flip): **35B `test_qwen36_paged_engine` 315/315 + 27B `test_qwen27_paged_engine` 235/235** (`dgx:/tmp/fa2gates_u.log`); **memcheck 35B prefill 0 errors** (`dgx:/tmp/fa2_memcheck2.log`); `test_ops_attn_preamble` 14/14. Realistic input-1024 TTFT A/B (same binary, FA2 default vs `VT_FA2_PREFILL=0`, conc8/num-prompts32, 3 interleaved on/off pairs + dropped warmup, `dgx:/tmp/fa2_ttft2.log`): **FA2-on Mean TTFT 824.7 ms vs off 874.4 ms = −5.7%** (median 638.6 vs 676.9 = −5.7%; prefill token-throughput 5170.5 vs 4902.5 tok/s = +5.5%; per-arm spread <7 ms, so the ~50 ms gap is well-separated). Below the ~7-9% offline-kernel target because the 1.86× attention-kernel win dilutes across the whole prefill (GEMM/MoE/GDN dominate); no decode/TPOT regression (prefill-only lever, both arms 315/315 token-exact). The "round normed q/k→bf16 before RoPE" tighten (`fused_qk_norm_rope.py:67`) was op-level bit-identical (fused-bf16 == unfused-bf16, q/k 0-mismatch) but flipped the 27B tok6 whitespace near-tie away from the pip-vLLM oracle (233/235) in COMBINATION (RMSNorm-saga) ⇒ NOT shipped; preamble ships UNTIGHTENED, both arches token-exact. CPU gate: clean `-Werror` rebuild 0 errors/0 warnings, full DGX ctest **156/157** (both engine gates green; the sole failure `test_capi` is a KNOWN pre-existing nondeterministic dgx-box detokenizer UTF-8 flake - 3 runs of the same binary give 3 different results - not a regression, unrelated to the attention path), tools unittest 164/164, checkers green | The 35B v0.25.0 perf grid (orchestrator-owned) re-measures the in-situ prefill/TTFT gain from this lever |
 | 35B FA2-decode lever (split-KV, ratio-8) | **LANDED / default-ON (2026-07-19, `CLAIM-35B-FA2-DECODE-1`); `benchmark_binding=false` (focused same-binary in-situ A/B - the 35B grid re-measures)** ([spec §35B ratio-8 extension](specs/fa2-gqa-split-kv-decode.md)) | Extended the ratio-6-only FA2 split-KV DECODE to the 35B ratio-8 (Hq/Hkv=16/2) hd-256 full-attn layers (new env `VT_FA2_DECODE_35B`, default ON). The old ratio-8 decode ran `PagedAttentionDecodeGqaKernel` at **grid=(num_reqs,num_kv_heads) = 2 blocks** at single-request decode (near-zero GB10 occupancy); the vendored `flash_fwd_splitkv` main+combine splits the KV dimension so the grid fills the machine. nsys `--cuda-graph-trace=node` (`test_qwen36_paged_engine`): clean 1:1 decode-kernel swap - OFF `PagedAttentionDecodeGqaKernel<...(int)8...>` ×300 (grid (1,2,1)=2 / (8,2,1)=16, no combine) → ON `flash_fwd_splitkv_kernel` ×300 + `flash_fwd_splitkv_combine_kernel` ×300 (split axis GridZ up to 16), old kernel absent. FULL current-main default-set token gate: 35B `test_qwen36_paged_engine` **315/315** + 27B `test_qwen27_paged_engine` **235/235**; operator `test_ops_paged_attn` **21 cases / 454,358 assertions** (adds ratio-8 parity ladder B∈{1,2,4,8,16} + ratio-4/window/toggle fallback); memcheck 35B decode **0 illegal-access errors** (315/315; `--leak-check full` leaks are engine exit-time model residency). IN-SITU A/B (35B NVFP4, input-1024/output-128, greedy, same binary `VT_FA2_DECODE_35B=1` vs `=0`, one flock, 4 interleaved ON/OFF pairs, first dropped, pooled pairs 2-4): **c1 Mean TPOT 14.96 vs 16.72 ms = −10.5%** (total tput 540.1 vs 489.3 = +10.4%); **c8 Mean TPOT 33.02 vs 34.12 ms = −3.2%** (tput 1835.1 vs 1785.7 = +2.8%); Mean TTFT neutral (c1 ~233, c8 ~826 ms both arms - decode-only lever). Per-arm spread <0.15 ms TPOT, well-separated. Token-exact + faster ⇒ default-ON. Evidence `dgx:~/work/vllm.cpp-35b-fa2-decode/{gpu_series,gates_engine,gates_default,memcheck35,nsys_ON,nsys_OFF}.log`. CPU gate: clean `-Werror` CUDA build 0/0, tools 164/164, checkers green; full DGX ctest `-j8` **157/160** - 3 non-numerics misses: `test_async_llm` (parallel-port flake, passes 1/1 isolated), `test_capi` (documented nondeterministic dgx detokenizer UTF-8 flake, fails even isolated, unrelated to attention), `test_qwen36_gguf_engine` (MEMORY-capacity artifact: loads TWO full 35B GGUF models sequentially; with FA2 decode ON the first runs 16/16 correct through the FA2 decode path then the second model load OOMs; `VT_FA2_DECODE_35B=0` rerun passes 2 cases / 28/28, so the added decode scratch tips an already-marginal ~119 GiB unified-memory box - NOT a correctness regression; the production safetensors NVFP4 35B is 315/315 ON - flagged for a decode-scratch-pool follow-up) | The 35B v0.25.0 perf grid (orchestrator-owned) re-measures the in-situ c1-c4 decode-TPOT gain; this directly targets the 35B c1 decode 0.810× low-batch residual |
@@ -23149,3 +23194,2876 @@ reads max abs 2.12e-05 / mean rel 2.88e-05, f64-then-store reads 5.88e-08 /
 below one bf16 ulp of the value it produces. Ten of twelve goldens are unchanged;
 the two that moved are the V1 arm at 1.19e-07 and 7.45e-08 against a 1e-5 bound.
 No tolerance was widened.
+
+## ROCM-GEMMA4-PREFILL-PEER-BARRIER — incremental Finish success-path barrier cost at T=2029 (2026-08-18, #1047 item 3)
+
+**Attribution only. Not a product ship number. Deleting the two Finish barriers is not authorized to land.**
+
+Under the frozen dual-R9700 T=2029 prefill-peer recipe, deleting only the two
+explicit Finish success-path `hipEventSynchronize(tls.ev_e)` +
+`hipStreamSynchronize(cst)` barriers improved end-to-end throughput by 2.55%
+(1122.10 vs 1094.24 tok/s; about 46.05 ms/request). This measures the incremental
+aggregate cost of those barriers relative to the retained RecordedEvent wait in
+`RetirePinThenUnpin`. It does not measure total blocking-retirement cost, prove
+asynchronous overlap recovery, or generalize beyond this recipe.
+
+Researcher verdict `20260818T040236-Researcher-fa20`: active T=2029 timing GREEN.
+T=19 remains an optional unused negative control.
+
+### Construction
+
+| Arm | Role | Source | BIN sha256 | Size |
+|-----|------|--------|------------|------|
+| A / BEFORE | wait-only (no extra Finish barriers) | parent `1de7b132` | `4526f3f9122444c8e10d564a7fa87d3ab60b87a5bc6f1cae5e9b411f20a96dca` | 27153608 |
+| B / AFTER | two Finish success-path barriers | `cf31e5e98` | `3324394bb1bf1368e86882aa267c2054e53cbbe26dd739f27c636b241b05bf62` | 27153608 |
+
+Timing BINs are counter-free. Separate identical witness pair (not used for timing):
+
+| Witness | HEAD | BIN sha256 | Size |
+|---------|------|------------|------|
+| BEFORE-W | `2b69f6f4` | `a40137930a8652920901abed9be8b71ec65eec8ca4bfef7c9a35b8440dac92a7` | 27155560 |
+| AFTER-W | `3aa12542` | `a38e57238920738397140aa90cfd5cabc865ca9bfac2504a27b3b7647020fc71` | 27155560 |
+
+Harness (frozen at fire):
+
+| Artifact | SHA256 |
+|----------|--------|
+| `prefill_peer_client.py` | `adc497419a98e13a1413fea1f64db5060b71900aac945117d7b06061385f027a` |
+| `run-1047-item3-timing.sh` | `3c482c6ee6ae27227dd9092cb8d17df916b34fc138c274ac78cc645a2e4ef196` |
+| `compare_1047_item3.py` | `e33c2273190f6b3ea5db98e2b6e94b4d06bb972ecb3bd67a9aabbc10b2d38dbc` |
+| `parse_prefill_peer_witness.py` | `8ca3cf58c5c192fa142acfad1c24d425d1a3642adb58949de4d3544a40709430` |
+
+### Recipe
+
+Isolated `:8012` only. Never `:8010`. Dual Radeon AI PRO R9700 (gfx1201). Model
+`gemma-4-26B-A4B-it-fp8`. Order calib then A1 -> B1 -> B2 -> A2, separate
+processes, teardown between each.
+
+Env: `HIP_VISIBLE_DEVICES=0,1` `PREFIX_CACHE=0` `MAX_MODEL_LEN=65536`
+`NUM_BLOCKS=2048` `MAX_NUM_SEQS=4` `MAX_BATCHED_TOKENS=8192`
+`VT_GEMMA4_PREFILL_PEER_ACT=1` `VT_GEMMA4_SWA_PHYSICAL=0`
+`VT_GEMMA4_GPU0_HEADROOM_GB=16`. `VT_GEMMA4_PREFILL_PEER_WITNESS` and
+`VT_GEMMA4_PROFILE` unset on every timing arm.
+
+Counter-free calibration on the BEFORE timing BIN froze prompt SHA
+`bdd0bfac665d250ede60f1f49f6a77106736afac01a80c559bf2143142ec54b8`
+(`usage.prompt_tokens=2029` exact). Same file reused on all four legs.
+
+Identity gate (all four legs): HTTP 200, `prompt_tokens=2029`,
+`completion_tokens=2`, tokens `["**","Count"]`, `seq_sha=cf33d9bd3b418e54e49f2358`.
+
+Each timing leg: 3 discarded warmups, 5 measured bursts (`burst=1`,
+`out-tokens=1`). `n_tok` from API `usage` only. `dirty_excluded=0`, `resets=[]`.
+Zero `prefill_peer_witness:` lines in timing serve logs.
+
+### 20 raw measured samples (tok_sum=2030 each)
+
+| leg | i0 | i1 | i2 | i3 | i4 |
+|-----|---:|---:|---:|---:|---:|
+| A1 | 1125.2743 | 1122.6271 | 1122.5586 | 1121.6334 | 1119.2061 |
+| B1 | 1092.3775 | 1095.8747 | 1092.4946 | 1092.6152 | 1089.7476 |
+| B2 | 1096.5926 | 1099.3896 | 1084.0359 | 1096.2230 | 1098.4552 |
+| A2 | 1120.4249 | 1117.9151 | 1123.3178 | 1121.0147 | 1125.8531 |
+
+### Comparator (independent recompute matches)
+
+- A pool median **1122.0960** tok/s, range 7.9380
+- B pool median **1094.2450** tok/s, range 15.3537
+- A/B **1.025452x** (+2.5452% without the barriers)
+- Median request wall: A **1.809115 s**, B **1.855165 s**; delta **46.050 ms**
+- Effect **27.8510** tok/s; max pooled arm range **15.3537**; effect/max-range **1.814x**; `inside_disp=false`
+- Leg medians keep direction across the interleave: A1 1122.5586, B1 1092.4946, B2 1096.5926, A2 1121.0147
+- A1<->A2 drift 1.5439; B1<->B2 drift 4.0980
+- dirty A1=0 B1=0 B2=0 A2=0
+- `PROTOCOL_OK`; comparator printed `CANDIDATE_PROMOTE`; lab did not self-promote
+
+### Live witness (equal-call proof, unmeasured)
+
+Event-derived each arm: `n_lines=4844`, `launch_ok=finish_ok=2422`, fails=0,
+`y_host_fb=0`. A/B M histograms identical (639 keys, sum 2422, M in [1,2020]).
+`witness-compare.json` sha256
+`74ae4180db5a3d0b499c371932f71e4fa50f2cc31b267fafb394f0a689a38101`.
+WITNESS absent during calib, present on both witness arms.
+
+### Artifacts
+
+`/home/don/.cache/hermes-builds/pr1047-cost/ab-out-item3-timing/`
+(orchestrator.log, compare.txt, timing-arm{A1,B1,B2,A2}-T2029.json,
+ident-arm*-T2029.json, serve-arm*.log, environ-arm*.txt, frozen prompt).
+Witness pack: `ab-out-item3-witness/`. Bus RESULT `20260818T040119-hermes-1f25`.
+
+### What this is NOT
+
+- Not a license to delete the Finish waits in product.
+- Not total blocking-retirement cost vs a no-host-wait baseline.
+- Not overlap / async-unpin recovery.
+- Not a KEEP `:8010` or p42k number.
+- Not T=19 (control not authorized).
+
+## LTX25-LORA-FUSE-SEAM — the IC-LoRA delta product, 143x and byte-identical (2026-08-18, `row/LTX25-LORA-FUSE-SEAM`, base `origin/main` `7b9e207b1`, #1202)
+
+`Ltx2FuseLoraIntoTensor` computed `(B * strength) @ A` with a scalar
+single-threaded triple loop. It is now `vt::Matmul`, the row-major member of the
+GEMM seam whose transposed member `LTX25-TEXT-LINEAR-SEAM` took the same day.
+**The output is byte-identical, and that is measured rather than argued.**
+
+### Recipe
+
+x86 development box, **not GB10 and not a fleet device** — 20 vCPU under KVM on
+an AMD Ryzen 9 9950X3D, AVX-512 present, 84 GiB RAM, Ubuntu 24.04, GCC 13.3.0.
+CMake `Release` (`-DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF`; no CUDA
+compiler present, so the CPU tier), `-O3 -DNDEBUG -ffp-contract=off`; the harness
+itself `-O2 -std=c++17 -ffp-contract=off`. **Box NOT idle:** loadavg 1.73 at the
+start of the A/B and 2.09 at the end.
+
+The harness drives the **production** fuser: it writes a real safetensors
+adapter, opens it with `vllm::Ltx2LoraAdapter::Open`, and times
+`vllm::Ltx2FuseLoraIntoTensor`. Identical harness source and flags on both arms;
+only `libvllm.a` differs. Geometry is one real `to_q`-shaped module of the
+shipped DiT — `inner_dim = num_attention_heads * attention_head_dim = 32 * 128 =
+4096` — at the shipped distilled adapter's rank 450, so `4096 x 450 x 4096` =
+7.55e9 MAC. Five repeats per arm.
+
+### The A/B
+
+| arm | wall (median of 5) | spread | fuser throughput | FNV-1a of the fused buffer |
+|---|---:|---:|---:|---|
+| before, scalar triple loop | **17.7761 s** | 17.7324 – 18.1529 | 0.4247 GMAC/s | `a23e7f876694c537` |
+| after, `vt::Matmul` | **0.1242 s** | 0.1235 – 0.1355 | 60.86 GMAC/s | `a23e7f876694c537` |
+
+**17.7761 s -> 0.1242 s, 143.1x.** The digest is over the whole 4096x4096 bf16
+result and it is the same on all ten runs across the two binaries, so the
+correctness claim is byte equality at production scale and not a tolerance.
+
+The 0.4247 GMAC/s before-arm rate is the independent cross-check on #1202's GB10
+attribution, which derived ~0.53 GFLOP/s from an f32 working-set growth rate.
+Same order, different box, different method.
+
+### Where the time goes now, because it is no longer the GEMM
+
+Re-running the same harness at `rank = 1` keeps the output size and makes the
+product negligible, so what it measures is the surrounding per-element work:
+
+| | `rank = 450` | `rank = 1` |
+|---|---:|---:|
+| after | 0.1242 s | **0.0733 s** |
+| before | 17.7761 s | 0.0955 s |
+
+So the GEMM is now ~0.046 s (~164 GMAC/s) and **~0.073 s, 59% of the call, is the
+aggregator zero-fill plus the single-threaded bf16 add-back loop** — three
+out-of-line conversions per element. Before this row that loop was 0.5% of the
+call and was correctly ignored. Filed as
+[#1254](https://github.com/mudler/vllm.cpp/issues/1254) and owed by this row's
+spec; NOT fixed here, because `vt::Add` matches the bf16 branch exactly and does
+NOT match the f32 branch, which rounds its sum through bf16 before an f32 store
+to mirror `fuse_loras.py:67-68`.
+
+### Decomposing the 143x
+
+Standalone probe at `3072x450x3072`, same box. Each row carries its OWN paired
+scalar arm, computed in the same process immediately before the seam arm, so
+every ratio is against that number and not against another row's:
+
+| configuration | scalar arm | seam wall | ratio |
+|---|---:|---:|---:|
+| default (20 threads, AVX-512 tier) | 9.8942 s | 0.0247 s | **400.4x** |
+| `VLLM_CPP_CPU_THREADS=1` | 9.8694 s | 0.3593 s | 27.5x |
+| `VT_CPU_MATMUL_TIER=ref`, 1 thread | 9.8397 s | 18.088 s | **0.54x — SLOWER** |
+
+So 27.5x is the micro-kernel, the 16-lane output blocking, the inlined widening
+and an operand order that stops striding a cache line per innermost load; the
+remaining 14.5x is the threadpool over 20 cores. The `ref` row is kept because it
+is the one configuration in which routing through the seam LOSES, and it is still
+bit-identical — the determinism contract holding, not a coincidence.
+
+`mismatched = 0` in every configuration above and at every shape tried:
+`3072x450x3072`, `128x450x3072`, `3072x32x8192`, `37x7x29`, `64x1x64`.
+
+### Full-model projection, stated as a projection
+
+Across the 1660 targeted modules of the 21.004 B DiT (#1202's 8.53e12 MAC, and
+~1.9e10 output elements if the whole adapter is rank 450) the product falls from
+~20,280 s to ~52 s **on this box**, and #1254's loop is ~79 s of the ~131 s that
+remains. This is arithmetic on measured rates. **No full-model fusion pass has
+run here**, and #1202's own number was itself a rate extrapolated over a
+10.4-minute window.
+
+### What is NOT claimed
+
+**No GB10 number.** #1202's stacks, thread count and rate are from GB10; every
+number above is from a 20-core Zen 5, and the per-core ratio between them is the
+same unmeasured quantity `LTX25-TEXT-LINEAR-SEAM` carries. The threading half of
+the win is available on GB10, which also has 20 cores; the SIMD half is not
+transferable, because GB10 is Arm and takes the NEON tier rather than AVX-512.
+
+**Nothing about the shipped 8.9 GB distilled adapter.** No real adapter was read
+on this box. The harness adapter is synthetic at the real geometry.
+
+### Mutations
+
+Five, each restored byte-for-byte (`git checkout -- .`, then `git diff --stat`
+empty). `compile_err` counts `error:` lines in the build log.
+
+| # | mutation | `git diff --stat` | `BUILT` | `compile_err` | verdict |
+|---|---|---|---|---|---|
+| M1 | `vt::Matmul` -> the pre-row scalar triple loop | 1 file, +12 / -10 | YES | 0 | **RED.** `test_ltx2_lora` 15 cases / 1 failed: `CHECK(stats.selections == matmuls_before + fused_tensors)` read `0 == 3`, `REQUIRE(stats.last_selected != nullptr)` read `nullptr != nullptr`. `test_ltx2_loader` 37 / 3 failed: `CHECK(matmuls_after == matmuls_before + fused.lora_fused_tensors)` read `0 == 1` on all three arms. The byte-equality assertions stayed GREEN, which is the point — they are the oracle, not the discriminator |
+| M2 | `FuseLorasInto` no longer calls the fuser (the production call site) | 1 file, +3 / -2 | YES | 0 | **RED in the loader only.** `test_ltx2_loader` 37 / **5** failed, every one a thrown `fused into ZERO tensors of this checkpoint`. `test_ltx2_lora` stayed 15/15 — which is exactly why the loader assertion had to exist: the direct-call suite cannot see reachability. Note the reporting trap: the loader run printed `assertions: 5975 | 0 failed` beside `Status: FAILURE!`, because a thrown case fails without failing an assertion |
+| M3 | `strength` applied AFTER the product instead of rounding `B * strength` to bf16 before it — mathematically the same product, different roundings | 1 file, +5 / -4 | YES | 0 | **RED.** `test_ltx2_lora` 15 / 2 failed, 5 assertions. New case: `CHECK(mismatched == 0)` read `207 == 0` at `19x5x37` and `2228 == 0` at `64x13x96`. The pre-existing rank-192 accumulator case also red (`got[0] == Approx(192.0)`), so the two gates are independent and agree |
+| M4 | shape-mismatch `Fail` deleted | 1 file, +1 / -6 | YES | 0 | **RED.** `CHECK(Mentions(err, "[2, 2] delta"))` and `CHECK(Mentions(err, "[4, 4]"))` |
+| M5 | second-adapter `Fail` disarmed (`adapters.size() > 1` -> `false`) | 1 file, +1 / -1 | YES | 0 | **RED.** `CHECK(Mentions(err, "exactly ONE adapter"))` and `CHECK(Mentions(err, "LTX25-IC-LORA"))` |
+
+**The first attempt at M2 did not build**, and it is recorded because a mutation
+that fails to build reads exactly like a passing test. Deleting the call left
+`buffer` unused and `-Werror=unused-parameter` failed the compile; the harness
+reported `BUILT=NO` and refused to draw a verdict, and the mutant was fixed with
+a `(void)buffer` rather than believed. This is the same trap #1252's reviewer hit
+on the same day.
+
+### Red-then-green counts
+
+| suite | red (pre-change source, tests in place) | green |
+|---|---|---|
+| `test_ltx2_lora` | 15 cases / 14 passed / **1 failed**; 113 assertions / 2 failed | 15 / 15; 114 assertions |
+| `test_ltx2_loader` | 37 cases / 34 passed / **3 failed**; 64204 assertions / 3 failed | 37 / 37; 64204 assertions |
+
+The case counts moved on both suites, so neither run is a filter that matched
+nothing. The red assertion-count is 113 rather than 114 because the `REQUIRE` on
+`last_selected` aborted the case before its last `CHECK`.
+
+## KERNEL-MOE-ROUTER-WARP — first DEVICE run of a kernel that had never been compiled; kernel-level 1.363x ESTABLISHED, step-level NOT SEPARABLE; and the canonical 35B grid is STALE (2026-08-12, `row/A-35B-RESIDUAL`, base `origin/main` `bbc482a2`, source `6c3be5c3`, GB10 sm_121a, #378)
+
+Ran under punch-list item 5 of [roadmap-v1-completion.md](specs/roadmap-v1-completion.md) §3
+(`ROAD-V1-A`, "close the 35B c1/c2 residual"). Two findings, one of them a record correction
+that matters more than the measurement.
+
+**1. The warp-shuffle MoE router had NOT landed.** The premise this task was dispatched on —
+that the router landed and took 35B c1/c4 to ~0.98x — is false in both halves. `git
+merge-base --is-ancestor` says none of `9f7afa7a`, `cce81c7e`, `be6a1f57`, `4f4ee725` is an
+ancestor of `bbc482a2`, and `git log -S` on `MoeRouterTopKWarpKernel`,
+`MoeRouterWarpEnabled`, `VT_MOE_ROUTER_WARP`, `MoeRouterWarpTreeSum` and `moe_router_warp`
+returns **0 commits on main** for every one of them. The work sits on a local-only branch
+`row/KERNEL-MOE-ROUTER-WARP`, never pushed to origin, no PR, 9 commits behind main, and
+`cce81c7e` states outright that the `.cu` was never compiled or run. The tree never claimed
+otherwise: `KERNEL-MOE-ROUTER-WARP` appears in no matrix and no doc on main. So the 35B
+residual was, in this part, a **landing** problem and not an optimisation problem.
+
+The `~0.98x / 0.87x / 0.92x` figures in the dispatch appear to be the **`SPEC-DSPARK`** row
+(`0.870x-0.981x` -> `0.986x-0.995x`, #442) — speculative decoding, a different row — not the
+router and not the 35B grid.
+
+**2. The canonical 35B grid on record is STALE.** `docs/BENCHMARKS.md` carries "CANONICAL
+2026-08-11 @`348c265d`: 0.918x-0.972x (c1 0.9708, c2 0.9293, c4 0.9719, c8 0.9183, c16
+0.9264, c32 0.9377)". `348c265d` is an ancestor of main, but **136 `src/`+`include/` commits
+have landed since**, including `972a152c` *"perf(35B): shared-expert down_proj emits bf16 —
+one CastF32 per layer-step gone (+2.05% c8)"*, which merged **1 h 36 min after** the grid was
+captured and reports +2.05% c8 / +0.79% c4 measured, bit-identical. Holding the vLLM arm
+fixed that implies c8 ~0.937 and c4 ~0.980 today — an **estimate, not a measurement**. So the
+honest answer to "where is the 35B gap today" is: **nobody knows, and a regrid is owed**; the
+last measured value is stale in our favour by at least one landed lever. No axis is claimed
+closed and none is claimed open beyond what `348c265d` measured.
+
+**3. The router, measured for the first time.** Full method, gate table and caveats in
+[moe-router-topk-single-warp.md](specs/moe-router-topk-single-warp.md) §12. Summary:
+
+- It **compiles** — not previously known. Correctness holds everywhere: gates 1/2/3/6 green,
+  35B `test_qwen36_paged_engine` **315/315 on both arms of the same binary**, plus six more
+  green legs during the A/B. Gate-1 mutation RED re-proven (76 assertions, 2 cases).
+- Which kernel ran is proven **by name** in `nsys --cuda-graph-trace=node`:
+  `MoeRouterTopKWarpKernel<__nv_bfloat16,(int)8>` (VPT=8 = E=256) in the ON arm with no block
+  kernel present, and the converse under `VT_MOE_ROUTER_WARP=0`. 1280 calls in every leg.
+- **Kernel-level, 3 reps/arm order-alternated, one flock:** warp 10.422 ms (10.307/10.529)
+  vs block 14.201 ms (14.141/14.275) — **-3.779 ms, -26.6%, 1.363x, bands non-overlapping.**
+- **Step-level: NOT SEPARABLE, not claimed.** Total GPU-busy read 1601.890 vs 1619.395 ms
+  (ratio 0.9892) but the *unchanged* kernels — identical code, identical 155,310 launches —
+  differ 13.726 ms between arms with a 24.140 ms spread across the six legs, **6.4x the
+  3.779 ms effect**. The window is prefill+decode aggregated, which dilutes 40 router
+  calls/step across ~1600 ms. Sized against #378's 16.1863 ms/step decode GPU-busy the saving
+  is **0.083-0.118 ms/step = ~0.5-0.75% of decode GPU-busy**, i.e. **below** #378's ~1.5%
+  estimate: the warp kernel closes ~79% of the gap to `topkGating` (12.98 -> 8.14 us/call
+  mean vs 6.85), not all of it.
+- Therefore **no default-flip credit** under spec gate 7, and #378 cannot close `ROAD-V1-A`
+  alone — as its own §10 already said.
+
+**Denominator note.** No vLLM arm was run here, so no ratio-vs-vLLM is asserted. The pinned
+oracle source is at the pin (`5559679229bc`, asserted by commit), but the shared
+`~/venvs/vllm-oracle` symlink currently resolves to `vllm-oracle-v0.25.0-stage`, **not** the
+pin; it was left untouched for other sessions. Any denominator taken through that symlink is
+the 0.25.0 rollback — the caveat #378 already carries.
+
+**Next traceable hypotheses:** a decode-only profiler window to turn the 0.5-0.75% estimate
+into a measurement; then the gate-GEMM epilogue fold and batching the 40 per-step launches.
+No ceiling is declared. **Owed:** gate 5 `compute-sanitizer memcheck`; the 35B canonical
+regrid on current main; a vLLM denominator re-measured against the pin.
+## MUSIC3-DEPTH-INCREMENTAL — the depth stage, whole-sequence vs incremental, x86-64 20-core (2026-08-18, `row/MUSIC3-DEPTH-SPEED`, BEFORE arm `fc163f62b`, #672)
+
+**Not a parity ratio and not an end-to-end number.** A STAGE A/B between two
+builds of this project: `fc163f62b` (the `row/MUSIC3-PERF-VS-ORACLE` head this
+change was measured against) and that commit plus `row/MUSIC3-DEPTH-SPEED`,
+which differ in exactly four files. No reference leg; SGLang-Omni is still
+`gateable = no` and every axis in `docs/BENCHMARKS.md` against it stays
+`PENDING`.
+
+**ONE base, and which one (#1247).** An earlier revision of this heading named
+`origin/main` `727163997` while the paragraph above named `fc163f62b`, and the
+two are not the same commit. The BEFORE arm that was BUILT AND TIMED is
+**`fc163f62b`**; `727163997` is only the `origin/main` commit it had merged, so
+it belongs in this sentence rather than in the heading. The delta between them is
+`7a2dabd65`, #1231's per-stage profiler and nothing else, and the driver never
+enters it: every function the driver calls lives in
+`src/vllm/model_executor/models/minimax_music3_ar.cpp`, which contains zero
+`profile::` uses, while `music3_profile.h` is included only by
+`minimax_music3_llm.cpp` and `minimax_music3_speech.cpp`. So the measurement
+stands as taken; what was wrong was the record. `fc163f62b` is reachable from
+`origin/row/MUSIC3-PERF-VS-ORACLE` and is NOT an ancestor of this row's head —
+that profiler reached `main` as the squashed `aba8d5ffb`, which is.
+
+### What is timed
+
+ONE frame of the depth stage as `Music3DepthStage` drives it: seven codebook
+steps, two CFG rows, the projection and the decoder, with a fixed code per step
+so the two arms traverse identical rows. `DepthDecoderConfig`'s defaults are the
+REAL geometry — hidden 4096, 4 layers, 16 heads, ffn 6144, 8 codebooks — and the
+2.5 GB of weights are seeded pseudo-random floats drawn identically on both arms.
+
+* BEFORE arm: `DepthSequenceEmbeds` + `DepthDecoderForward` over the whole
+  growing sequence, twice per step. 70 row-forwards, 70 weight sweeps.
+* AFTER arm: one 3-row prefix projection, then eight `DepthDecoderAppend` calls
+  at batch 2. 16 row-forwards, 8 weight sweeps.
+
+### Recipe
+
+x86-64, 20 cores, 84 GB. ONE driver source compiled twice and linked against the
+two `libvllm.a` builds, the shape §12.4 used:
+
+    g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
+        -I<wt>/build/include -isystem <wt>/third_party [-DMUSIC3_AFTER] \
+        tools/bench/music3_depth_stage_ab.cpp -o depthbench-<arm> \
+        <wt>/build/libvllm.a <wt>/build/libblake3_vendored.a -lpthread
+
+### Why the minimum, and what was NOT run
+
+The box was carrying three other sessions' `test_ltx2_video` runs and two full
+`ctest` builds throughout, at a 1-minute load average of **39.30 before the
+series and 51.98 after** (5-minute 71-92) on 20 cores. A wall-clock e2e pair
+taken there measures somebody else's scheduler — the same confound that voided
+§12.5's pair — so the e2e pair was NOT attempted. A short stage loop can be
+repeated, so the MINIMUM over rounds is available and is the least-disturbed
+sample.
+
+The Thor per-stage pair, which is the one that prices this against #1231's own
+`ar.depth_forward` = 347.3 s / 1414 calls, is **QUEUED on `thor:gpu0`** behind
+two other jobs and is PENDING, not estimated.
+
+### Result — 8 alternating pairs, 17 timed rounds per arm
+
+| series | BEFORE (s) | AFTER (s) | pair ratio |
+|---|---|---|---|
+| A pair 1 | 6.7769 | 1.7795 | 3.81 |
+| A pair 2 | 6.6714 | 2.0487 | 3.26 |
+| A pair 3 | 6.9562 | 2.5047 | 2.78 |
+| A pair 4 | 7.5485 | 2.4196 | 3.12 |
+| A pair 5 | 6.4413 | 2.1171 | 3.04 |
+| B pair 1 | 6.5467 5.8667 6.2444 6.0943 | 1.9943 2.0208 1.8607 1.6766 | 3.50 |
+| B pair 2 | 6.3505 5.9991 5.8783 6.5534 | 2.0193 2.1022 1.6981 1.8891 | 3.46 |
+| B pair 3 | 6.3186 6.3508 8.6671 7.6575 | 3.3631 3.0259 3.4770 3.7275 | 2.09 |
+| **minimum over all rounds** | **5.8667** | **1.6766** | **3.50x** |
+| median of the 8 pair ratios | | | **3.19x** |
+
+B pair 3 is the loudest on BOTH arms and is kept rather than dropped.
+
+### Bit-identity at production geometry
+
+**16 processes, one printed fingerprint each, all `f0cfeed6eee4f55d`.** The
+denominator is stated exactly because it is the evidence (#1247). The table above
+is 8 alternating pairs x 2 arms = **16 processes**, carrying 5 + 12 = **17 timed
+rounds per arm**; `music3_depth_stage_ab.cpp` computes the FNV-1a fingerprint of
+the frame's 28 672 depth hidden values every round but prints ONE line per
+process, after the round loop, so 16 fingerprints were printed and every one of
+them read `f0cfeed6eee4f55d`. An earlier revision said "all 20 runs", which is
+neither the round count nor the process count.
+
+The unit gate (`test_minimax_music3_ar`, 32 cases / 470 assertions) proves the
+identity against the reference forward at reduced dimensions; this proves it
+4096-wide, across two separately compiled libraries.
+
+### 3.5x, not the 8.75x the byte accounting predicts
+
+Weight traffic falls 8.75x per frame (70 sweeps to 8) and arithmetic 4.375x (70
+row-forwards to 16). The measured 3.5x sits just below the ARITHMETIC ratio, so
+on this box the stage is closer to compute-bound than the ~4 bytes per
+multiply-accumulate suggested. That inference came from a 14-core Jetson Thor
+with unified LPDDR5X; a 20-core x86-64 with a large L3 is a different regime, and
+which side of the bound each box sits on is exactly what the queued Thor pair
+would say. Two costs are also real: the incremental arm makes 8 pooled calls per
+frame where the old one made 14 larger ones, so it pays proportionally more
+`Threadpool::Barrier`, and its per-step attention is a scalar loop over one query
+row that no longer rides the output-row partition. Both show up as the after
+arm's wider relative spread (1.68-3.73 against 5.87-8.67).
+## MUSIC3-DEPTH-THOR-PAIR-1 — VOID: the two arms were the same binary (2026-08-18, `thor:gpu0`, job `56848b2e`, #672)
+
+**Status: VOID. This pair measured nothing about the depth schedule, and its
+numbers must not be quoted.** It is recorded because a voided measurement with
+its cause named is evidence, and a silently dropped one is not.
+
+**The cause, from the job's own log:**
+
+```text
+gen_before: 72744 bytes sha=b98a5dbba37a67f1
+gen_after:  72744 bytes sha=b98a5dbba37a67f1
+```
+
+The job used ONE source tree and ONE build dir for both arms. After the first
+build, the second configure-and-build found the tree up to date and emitted no
+distinct binary, so `gen_before` and `gen_after` are the same program under two
+names. Both arms hashed `b98a5dbba37a67f1`.
+
+**What it reported, marked as not a result:** `ar.depth_forward` 77.930 s on the
+nominal BEFORE arm against 77.726 s on the nominal AFTER arm, at **808 calls on
+both**. That is a 0.26 % spread between two runs of one binary. The identical
+call count is the internal control that catches it: the whole claim of
+`MUSIC3-DEPTH-INCREMENTAL` is that the schedule goes from 14 depth calls per
+frame to 8, so **a pair whose call count does not move cannot contain the
+change**. Taken at face value this pair reads as a refutation of the 3.50x in
+`MUSIC3-DEPTH-INCREMENTAL`, and it is not one.
+
+**Generalisation, because this is the third shape of the same defect in this
+tree.** A mutation that fails to rebuild reads as a passing test; a restore
+without a rebuild leaves the previous mutation's object in `libvllm.a`; an A/B
+that fails to rebuild reads as a levelled speedup. In every case the instrument
+measures the previous artifact and returns a confident verdict about the code.
+**Whenever two artifacts are required to differ, assert that they differ — by
+hash — before reading anything downstream of them.**
+
+**Replacement in flight:** job `7b22b5b0`, `thor:gpu0`, `--max-runtime 150m`.
+Separate clones and separate build dirs per arm; a hard `FATAL_ARMS_IDENTICAL`
+guard on the two binaries' `sha256` so this failure aborts rather than tabulates;
+the checkpoint staged to local disk first (spec §15.6); three alternating pairs;
+and a cross-arm comparison of the output WAV `sha256`, which puts the
+bit-identity claim at Thor geometry alongside the speed. Arms `c802dba8d` (the
+`row/MUSIC3-DEPTH-SPEED` merge-base, so the delta is exactly the 10 files the row
+touches) and `4568c6e71`. Spec §16.6a.
+
+## MUSIC3-DEPTH-THOR-PAIR-2 — the real-checkpoint Thor pair: 4.45x depth, 2.74x wall, byte-identical audio (2026-08-18, `thor:gpu0` sm_110, job `7b22b5b0`, arms `c802dba8d` / `4568c6e71`, #672)
+
+**Status: TAKEN. This replaces the PENDING left by `MUSIC3-DEPTH-THOR-PAIR-1`,
+which is VOID and stays on the record above.**
+
+Thor sm_110, `--device 1 --duration 4 --steps 4 --seed 7`, 100 frames, three
+alternating pairs. Arms are `c802dba8d` (the `row/MUSIC3-DEPTH-SPEED`
+merge-base, so the delta is exactly the 10 files the row touches) and
+`4568c6e71`.
+
+**Preconditions asserted before any timing was read**, which is the entire point
+of this second pair:
+
+```text
+gen_before sha=33f5c5fb18a7e91a5fe7b2fe26f7f5c1 size=72744
+gen_after  sha=d2fdac95a34ce177bbdd9e766e87078a size=72744
+ARMS_DIFFER=yes
+STAGE_SECONDS=815 SRC_BYTES=28517617303 DST_BYTES=28517617303
+```
+
+The checkpoint was staged to local disk with source and destination byte counts
+asserted equal, so the cold-CIFS load is outside these figures.
+
+| bucket | BEFORE mean of 3 | AFTER mean of 3 | ratio | calls |
+|---|---|---|---|---|
+| `ar.depth_forward` | 348.273 s | 78.316 s | **4.45x** | 1414 -> 808 |
+| `ar.depth_projection` | 10.102 s | 1.307 s | **7.73x** | 1414 -> 707 |
+| `ar.depth_stage` | 359.090 s | 80.221 s | **4.48x** | 101 -> 101 |
+| `ar.TOTAL_loop` | 375.687 s | 94.084 s | **3.99x** | 1 -> 1 |
+| **wall clock** | **446.33 s** | **163.00 s** | **2.74x** | — |
+| `vocoder.decode_window` | 53.648 s | 53.605 s | 1.00x | 1 -> 1 |
+| `ar.lm_decode_step` | 14.989 s | 12.339 s | 1.21x | 100 -> 100 |
+
+Per-run, so the spread is visible rather than implied. `depth_forward` before
+348.076 / 349.588 / 347.154, after 78.190 / 78.627 / 78.131. Wall before
+450 / 446 / 443 s, after 164 / 163 / 162 s. The bands do not approach each other.
+
+**The call count is the control the void pair failed.** `depth_forward` goes
+1414 -> 808, which is 101 frames x 14 against 101 frames x 8; `depth_projection`
+goes 1414 -> 707, which is 101 x 14 against 101 x 7. That is the schedule change
+exactly. `MUSIC3-DEPTH-THOR-PAIR-1`'s 808-calls-on-both-arms is
+now positively explained as the AFTER binary run twice.
+
+**Decomposition.** `depth_forward` costs 246.30 ms per call before and 96.93 ms
+after, so 4.45x is **1.75x fewer calls times 2.54x cheaper per call**. The
+per-call figures are not like-for-like by design: a BEFORE call re-forwards the
+whole growing depth sequence, an AFTER call appends one position against a cache.
+
+### Quote 2.74x to a user, not 4.45x
+
+The depth stage was **80.5 % of wall before and is 49.2 % after**. What now
+dominates is a term this change does not touch: `vocoder.decode_window` is
+**53.6 s on both arms**, moving from 12.0 % of wall to **32.9 %**. A fixed serial
+phase does not shrink when the parallel one does. The stage saved 278.9 s and
+wall fell 283.3 s, so the wall saving is accounted for and nothing unexplained is
+hiding in the total.
+
+**One delta is unexplained and is recorded, not smoothed.** `ar.lm_decode_step`
+fell 14.989 -> 12.339 s over an unchanged 100 calls, and this change does not
+touch the LM decode. A smaller AR working set is the plausible reading and it is
+a **hypothesis**: 2.65 s of the 283.3 s saving has no established cause.
+
+### E2E byte-identity, at full scale
+
+**All three pairs wrote `sha 5e81fc133d653560` on BOTH arms — six runs, one
+hash**, with identical `RMS 0.01350`, `peak 0.25180` and geometry (3.994 s,
+44100 Hz, 2 channels, 176 128 samples/channel). This runs the real checkpoint
+through every stage including the vocoder and compares the finished file, so it
+is strictly stronger than the unit gate or than `MUSIC3-DEPTH-INCREMENTAL`'s
+in-process fingerprint. The leg the spec carried as owed is closed.
+
+### 4.45x here against 3.50x in `MUSIC3-DEPTH-INCREMENTAL` — two measurements
+
+Different boxes, different weight sources, different arms, and neither confirms
+the other. `MUSIC3-DEPTH-INCREMENTAL` is a synthetic in-process bench on a
+20-core x86-64 under load 39-52 driving seeded pseudo-random weights, arms
+`fc163f62b` and that commit plus the change. This is the shipped binary on a
+14-core Jetson Thor against the real 28.5 GB checkpoint.
+
+**Why Thor is higher is a labelled HYPOTHESIS.** The byte accounting predicts
+8.75x and the arithmetic 4.375x; Thor's 4.45x sits just above the arithmetic
+ratio and x86's 3.50x just below it, the direction a unified-LPDDR5X box against
+a large-L3 x86 box would give. The prediction matching is not a measurement, and
+the ~46 GB/s figure it reasons from was itself inferred from Thor, so this is the
+same argument returning rather than independent support. Settling it needs a
+measured bandwidth on both boxes.
+
+## ENG-CUDAGRAPH-DEDUP W5 — the coarse-key experiment: the fold HAPPENS, the driver refuses NOTHING, and the OFF/OFF control VOIDED one workload (2026-08-18, `row/ENG-CUDAGRAPH-DEDUP-KEY-RESULT`, experiment branch `row/ENG-CUDAGRAPH-DEDUP-KEY` at `b48b51df1`, PR #1232 DRAFT, GB10 sm_121a, #1226 / #1162 / #1283)
+
+**This does not supersede `ENG-CUDAGRAPH-DEDUP W4`. It answers the one hypothesis
+W4 left open.** W4 measured the SHIPPED exact key and found `N == M` in every ON
+cell. That result stands, unchanged, for that key. W5 measures a DIFFERENT key,
+behind its own opt-in, on a branch that has not landed.
+
+### What was being tested
+
+W4's negative was attributed, from source, to `AppendKernelPayload`
+(`src/vt/graph_dedup_runtime.h:119-129`) hashing `(func, gridDim.{x,y,z},
+blockDim.{x,y,z}, sharedMemBytes)` while decode buckets differ precisely in launch
+dimensions, so no candidate group ever forms. The hypothesis filed as
+[#1226](https://github.com/mudler/vllm.cpp/issues/1226): `cudaGraphExecUpdate`
+requires *topology* to match and is designed to permit *parameter* changes, and a
+kernel's launch configuration is a parameter. Because the registry probes BEFORE it
+folds, a coarser key that groups two graphs the driver then refuses costs one wasted
+probe and a private executable, never a wrong replay. That makes it a cost question.
+
+### Recipe
+
+`dgx:gpu0` through an `rc` lease, pod `rc-worker-4b8lj`, boot_id
+`3fd9745a-d25a-426c-ba3c-97c958a85515` — **the same value at both ends of the log**,
+so the box did not reboot mid-series. GB10, driver `580.173.02`. `### AB_KEY START
+2026-08-18T20:49:31Z` to `### DONE_AB_KEY 2026-08-18T20:58:46Z`.
+
+Source: `git archive` of `b48b51df1`, tar sha256
+`7aa50f3bc165bb471f4e9b45512127716a2e603450dbe76a149ac2d382c772ad`, **asserted by
+the harness before extraction** (`got=7aa50f3b…`). The coarse-key assertion strings,
+which exist only at that commit, were verified before configure. Binary sha256
+`ca114abb6055223c24127beb414ee033c562c17deee0223de91c641242240b63`, copied out of the
+build tree before anything ran it. Model Qwen3-0.6B bf16 (`Qwen3ForCausalLM`, 28
+layers, hidden 1024), `model.safetensors` sha256
+`11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641`.
+
+All four mandatory production-stack configure assertions GREEN, quoted from
+`ab.log`:
+
+```text
+-- CUTLASS found at /tmp/dedupkey/cutlass; enabling sm120a NVFP4 cutlass GEMM
+-- FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)
+-- Triton AOT: gdn_deltah_h48 <- sm_121a as vt_aot_sm_121a_gdn_deltah_h48_default
+VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a
+```
+
+`### BUILD END 2026-08-18T20:56:08Z rc=0`, `compile_errors=0`. Both CPU dedup suites
+green before any cell ran: `test_graph_dedup` 13/13 cases / 65 assertions,
+`test_graph_dedup_runtime` 22/22 cases / 88 assertions, `Status: SUCCESS!` on both.
+Loader path `/tmp/dedupkey/cu13lt:/usr/local/cuda/targets/sbsa-linux/lib:/tmp/dedupkey/run`
+(oracle cuBLASLt + toolkit cudart), qualified by a preflight that had to exit 0,
+capture a decode graph AND write its token artifact: `smoke c1 rc=0
+captured_graphs=1 cublas_errors=0 loader_errors=0 ids=present`.
+
+Every cell: `vllm-bench --model <qwen3-0.6b> --input-len 64 --temperature 0
+--output-token-ids <ids>` with `VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1`
+throughout. **Greedy, fixed seed.** The only variables are `VT_CUDA_GRAPH_DEDUP` and
+`VT_CUDA_GRAPH_DEDUP_COARSE_KEY`.
+
+| Workload | `--concurrency` | `--num-prompts` | `--output-len` | `--seed` | `--max-num-batched-tokens` | captured padded sizes |
+|---|---:|---:|---:|---:|---|---|
+| A | 24 | 24 | 40 | 4242 | 128 | 24, 16, 8 |
+| B | 16 | 21 | 32 | 777 | not passed | 16, 8 |
+| C | 32 | 49 | 24 | 31337 | not passed | 32, 24 |
+
+### Result 1 — THE HYPOTHESIS IS CONFIRMED
+
+The `### FOLD SUMMARY` block, verbatim from `logs-ab/ab.log`:
+
+```text
+a_exact:    captured 3 graphs, deduped to 3 execs  (probes=0 refused=0)
+a_coarse_a: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+a_coarse_b: captured 3 graphs, deduped to 2 execs  (probes=1 refused=0)
+b_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+b_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+c_exact:    captured 2 graphs, deduped to 2 execs  (probes=0 refused=0)
+c_coarse_a: captured 2 graphs, deduped to 1 execs  (probes=1 refused=0)
+```
+
+Each COARSE cell announced itself: `vt graph dedup: key mode = COARSE (launch
+dimensions and extents dropped)`; each EXACT cell announced `key mode = EXACT`. The
+harness VOIDs a cell that fails to announce the arm it claims, and no cell did.
+
+**`probes=0` on every exact-key cell is the direct proof of W4's diagnosis, not a
+restatement of it.** W4 concluded from reading `graph_dedup_runtime.h` that no
+candidate group forms and `cudaGraphExecUpdate` is never asked. The probe counter says
+exactly that, from the running process, which is a different and stronger kind of
+evidence. Drop the launch dimensions and the driver is asked once per fold and
+**accepts every time**. So on this hardware `cudaGraphExecUpdate` does tolerate a
+grid-dimension change, and the benefit W4 recorded as unreachable **is reachable via
+the key**.
+
+**`refused=0` is one driver on one hardware and toolkit pair.** AGENTS.md forbids
+declaring a ceiling; it equally forbids declaring a floor from one box. Nothing here
+says the driver accepts a grid change elsewhere, and a refusal elsewhere would be a
+cost, not a correctness failure.
+
+### Result 2 — byte-identity holds on A and C
+
+`--output-token-ids`, real generated identifiers, `empty_rows=0` everywhere.
+
+| Workload | cells | `ids_sha256` | bytes | requests x tokens |
+|---|---|---|---:|---|
+| A | `off_a`, `off_b`, `exact`, `coarse_a`, `coarse_b` — all five | `59ebff4a22362086b9fcf426feba847b15b0dc7bf31b37892b1bfc7221b435dc` | 3655 | 24 x 40 = 960 |
+| C | `off_a`, `off_b`, `exact`, `coarse_a` — all four | `ff205260c1fa41a8cc10ad1b8fd0c29f40bd6a2324aa8a64f5192f62cedbd76b` | 4608 | 49 x 24 = 1176 |
+
+A and C hash to two different values, so the identity is not vacuous. On both, the
+OFF/OFF control passed FIRST (`IDENTICAL a_off_a == a_off_b`, `IDENTICAL c_off_a ==
+c_off_b`) and only then were the ON arms compared.
+
+### Result 3 — WORKLOAD B IS VOID, and the cause is a NEW DEFECT
+
+```text
+*** DIFFERS *** b_off_a vs b_off_b
+b_off_a  = 5973c5a10a6210085417fb25a29edbd0dc15fe61d7d4f774dd8ff3883dae1d64  bytes=2638
+b_off_b  = 4cf7923080db6aa29759537f2192f3d9500db11c0e8d72bbb2b4ac6e4614af7c  bytes=2650
+ids_b_off_a.json ids_b_off_b.json differ: char 2166, line 1
+```
+
+Both cells had `VT_CUDA_GRAPH_DEDUP` **unset** — this is the OFF/OFF control. One
+binary, one workload, greedy `--temperature 0 --seed 777`, 23 seconds apart
+(`20:57:42Z` and `20:58:05Z`), same captured sizes `16 8`, same 59 replays across 3
+slots. Different token ids.
+
+What the divergence is, read out of the artifacts rather than inferred: both runs emit
+`ids_requests=21 ids_total_tokens=672 empty_rows=0`, so **the token counts are
+identical** and the 2638-vs-2650 delta is JSON decimal width, not a truncation and not
+an early stop. Exactly two of the 21 rows differ, and both diverge mid-decode rather
+than at the first token — row 17 at token index 11, row 18 at token index 5. Rows 17
+and 18 sit in the ragged tail that `--num-prompts 21` at `--concurrency 16` leaves.
+
+**Consequence: B's `b_off_a == b_exact` and `b_off_a == b_coarse_a` lines are
+worthless**, because they compare against a baseline that does not reproduce itself.
+**B is VOID, not a pass.** Only the OFF/OFF control makes that visible; without it, B
+would have read as three more byte-identity confirmations. This is the second time on
+this row that a control, not a result, carried the finding.
+
+This is **not** a dedup defect — the feature is off in both cells that disagree — and
+it is not diagnosed here beyond what the evidence shows. Filed as
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283) with the hashes, the exact cell
+configuration, and an isolation plan: establish the rate over N repetitions; re-run with
+`VLLM_CPP_CUDAGRAPH=0` to separate the scheduler from the graph path; test the
+ragged-tail hypothesis with `--num-prompts` an exact multiple of `--concurrency`;
+compare per-step batch composition for the two diverging requests; and check the top-2
+logit margin at the divergence step, because a near-tie a reduction order can flip is a
+different defect from a wrong value.
+
+### Caveats — every one of these bounds the result above
+
+- **The toolkit is NOT the one the completed baseline ran on.** W5 built under nvcc
+  **`13.3.73`** (`### NVCC_RELEASE=13.3`); the completed baseline gate recorded in
+  `fe24a3029` ran under **`13.0.88`**, which is the version the recorded dgx gate stack
+  names. The pod's toolkit is a property of the shared pod, not of the job — the
+  16:43Z attempt on this same boot saw 13.0.88 and the 20:49Z run saw 13.3.73. The
+  OFF-vs-ON and EXACT-vs-COARSE comparisons **within this one binary** are valid.
+  **This run and that baseline are not directly comparable to each other.**
+- **Clocks were NOT pinned:** 2405 MHz current, 3003 MHz max, 2418 MHz applications,
+  53 °C, throttling `Disabled`. **No throughput number is claimed or implied.** The
+  `Benchmark duration` figures (2.52-2.72 s) and `replay branch avg` figures
+  (0.038-0.124 ms/step) in the logs are diagnostics, not measurements.
+- **No memory number either, and this one is not about the clocks.** Nothing in this
+  run measured bytes. The fold counts EXECUTABLES. What one `cudaGraphExec_t` costs on
+  this model, and therefore what 3→2 returns, is unmeasured on both keys.
+- **Load was not controlled**, only recorded: `loadavg_series_start=10.63 9.15 6.73`,
+  `loadavg_series_end=2.11 4.82 5.80`, falling monotonically across the series. Cell
+  order is fixed in the harness, so a load-correlated effect is not separable from a
+  cell-order effect here.
+- **Only the Qwen3 dense decode driver was exercised**, as in W4. Whether any other
+  capture site, or two models sharing the process-singleton registry, folds under
+  either key is untested.
+- **PR [#1232](https://github.com/mudler/vllm.cpp/pull/1232) is a DRAFT.** The coarse
+  key is behind `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`, default OFF, inside
+  `VT_CUDA_GRAPH_DEDUP`, itself default OFF. **Nothing on `main` folds today**, and
+  this entry must not be read as though it does.
+
+### Evidence
+
+`/mnt/nas_share/rc/dedup-key/` — `README.md` (the harness, its guards, and the
+2026-08-18T15:47Z VOID it was repaired after), `run.sh`, `build.sh`,
+`src-b48b51df1.tar`, `logs/` (configure, build, unit suites, binary and model sha256,
+nvcc version), `logs-ab/ab.log` and `logs-ab/run_<tag>.log` for all 13 cells, and
+`out-ab/ids_<tag>.json` for the token artifacts.
+
+### Next traceable hypotheses
+
+No ceiling and no floor is declared. **Owed:** the byte measurement that would price
+the fold, on pinned clocks; the probe cost at the bucket churn a real serving grid
+produces (7 or 11 buckets across nine capture drivers, not the 2-3 measured here); a
+second driver and a second CUDA release for the `refused=0` rate; landing #1232 before
+any of that, because the key it would default to is still a draft; and
+[#1283](https://github.com/mudler/vllm.cpp/issues/1283), without which no future A/B on
+this row can use a ragged-tail workload shape.
+
+## ENG-CUDAGRAPH-DEDUP W6 — the DEVICE-BYTE measurement: the fold ENGAGES at the shipped bucket set, the saving DOES NOT SURVIVE its own null control, and the driver refuses 73% of probes on TOPOLOGY (2026-08-19, `row/ENG-CUDAGRAPH-DEDUP-BYTES-RESULT`, tested `origin/main` `2c8f53d93`, GB10 sm_121a, #1162 / #1226)
+
+**This supersedes nothing. It delivers the one measurement W4 and W5 both named as
+owed** — the row's saving is a MEMORY saving, every earlier number counted
+executables, and nobody had measured bytes. It also removes W5's largest caveat:
+[PR #1232](https://github.com/mudler/vllm.cpp/pull/1232) LANDED as `2c8f53d93`, so the
+coarse key is on `main` (default OFF inside a default-OFF flag) and this entry measures
+a configuration that ships rather than a draft.
+
+**The decision this run was taken to make is DELIVERED and NEGATIVE: leave
+`VT_CUDA_GRAPH_DEDUP` default OFF.**
+
+### Recipe
+
+`dgx:gpu0` through an `rc` lease, job `93f783de-228f-47d5-806d-c5b56aa72c3a`, pod
+`rc-worker-4b8lj`, `### BYTES START 2026-08-19T04:30:07Z` to
+`### DONE_BYTES 2026-08-19T04:57:19Z`. GB10, driver `580.173.02`, persistence Enabled,
+boot_id `3fd9745a-d25a-426c-ba3c-97c958a85515` — **the same value at both ends**, so the
+box did not reboot mid-series. `loadavg` start `2.16 2.18 2.33`, end `3.17 3.93 3.80`.
+
+Source: `git archive` of `origin/main` `2c8f53d93`, tar sha256
+`8fc4109b10b5070ae6b531f8ba1c2f3ec227e2d78dad5a7d1d9e41c5b89d0cc9`, asserted by the
+harness before extraction. Binary `vllm-bench` sha256
+`be6972682fa7ba2dacbd5d03166314c45e46960875d0b0b61690715a0ce657a7`, copied out of the
+build tree before anything ran it. Release build, `VLLM_CPP_CUDA_ARCHITECTURES=121a`,
+CUTLASS 4.5.0 sm120a NVFP4 ENABLED, FlashAttention-2 ENABLED, vendored sm_121a Triton
+AOT. `nvcc` **13.0.88**. Model Qwen3-0.6B bf16, 28 layers, from
+`/workspace/dedup-gate/model`.
+
+`VT_ASYNC_RUNNER=0` and `VT_DECODE_GRAPH_STATS=1` throughout; the only variables are
+`VT_CUDA_GRAPH_DEDUP` and `VT_CUDA_GRAPH_DEDUP_COARSE_KEY`. Twelve cells (two
+calibration, ten A/B), all exit 0, zero VOID markers.
+
+| Workload | `--concurrency` | `--num-prompts` | `--input-len` | `--output-len` | `--max-num-batched-tokens` | captured padded sizes |
+|---|---:|---:|---:|---:|---|---|
+| W32 | 32 | 32 | 128 | 96 | 64 | 1, 2, 4, 8, 16, 24, 32 — **7 of 7** |
+| W64 | 64 | 64 | 256 | 256 | 128 | 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64 — **11 of 11** |
+
+`vllm-bench` sets `max_num_seqs = concurrency`, so these are exactly the shipped bucket
+sets of `include/vllm/model_executor/models/decode_graph_sizes.h:32-41`. **This is the
+churn W5 could not produce**: W5's three workloads reached 2-3 buckets, and every W4 and
+W5 conclusion about probe behaviour was drawn from a process that presented the driver
+with one pair.
+
+### Instruments, and the assertion each one had to pass first
+
+**A — `nvidia-smi --query-compute-apps=used_memory`**, sampled against the benchmark pid
+every 0.3 s. `--query-gpu=memory.used` returns `[N/A]` on this box and was NOT used.
+
+**B — an `LD_PRELOAD` shim** reading `cudaMemGetInfo` immediately before and after every
+`cudaGraphInstantiate`, `cudaGraphExecUpdate` and `cudaGraphExecDestroy`, plus
+`cudaGraphGetNodes` for a node count per instantiate. Interposition was asserted at
+build time (`vllm-bench: undefined cudaGraphInstantiate refs = 1`) and again by a
+preflight cell that had to exit 0, capture a graph AND write its token artifact.
+
+### Result 1 — THE FOLD ENGAGES, at the bucket set that ships
+
+```text
+w32_coarse_a  vt graph dedup: captured 7 graphs, deduped to 3 execs (probes=7 refused=3)
+w32_coarse_b  vt graph dedup: captured 7 graphs, deduped to 3 execs (probes=7 refused=3)
+w32_exact_a   vt graph dedup: captured 7 graphs, deduped to 7 execs (probes=0 refused=0)
+w64_coarse_a  vt graph dedup: captured 11 graphs, deduped to 5 execs (probes=22 refused=16)
+w64_coarse_b  vt graph dedup: captured 11 graphs, deduped to 5 execs (probes=22 refused=16)
+w64_exact_a   vt graph dedup: captured 11 graphs, deduped to 11 execs (probes=0 refused=0)
+```
+
+Both OFF cells of each workload emit no dedup line at all and instantiate 7 and 11
+executables respectively. Token ids are byte-identical across every cell of a workload,
+**including both OFF/OFF controls**: W32 all
+`ff0db6c6f4cf0eaa9cba7278880b2c24ec5f6602df6e47d16f9f0cea0b15be9d` (11720 B), W64 all
+`e1cbf5fcd3843a07787b39fd167fa713084e84a7b6e5a80836e044912298e5d0` (57620 B). Neither
+workload reproduces [#1283](https://github.com/mudler/vllm.cpp/issues/1283)'s
+ragged-tail shape, and neither hit it.
+
+### Result 2 — THE DRIVER REFUSES, and it says TOPOLOGY
+
+| buckets | probes | refused | rate | reason, verbatim |
+|---:|---:|---:|---:|---|
+| 7 | 7 | 3 | 43% | `vt graph dedup: probe refused a fold (err=910 result=2)` x3 |
+| 11 | 22 | 16 | **73%** | `vt graph dedup: probe refused a fold (err=910 result=2)` x16 |
+
+`err=910` is `cudaErrorGraphExecUpdateFailure`; `result=2` is
+`cudaGraphExecUpdateErrorTopologyChanged`. **Every refusal in this run gave that one
+reason.** W5's `refused=0` was an artefact of a workload whose buckets only ever shrank,
+so only one pair was ever presented.
+
+The shim's `cudaGraphGetNodes` reading says why false candidates form at all: the decode
+graphs are **not one topology**. They come in two node counts, **376 and 404**, mixed
+across the bucket set — `w32_off_a` instantiated, in capture order,
+`404 404 376 376 404 404 404`, and `w64_coarse_a` saw
+`376 376 376 376 376 376 404 404 376 …`.
+
+**This inverts the hypothesis the coarse key was built on.** Every refusal is about
+topology, never about a parameter. A key that cannot see a topology difference therefore
+produces MORE false candidates, not more folds, and coarsening it further makes the
+refusal rate worse rather than better. A refusal is a cost and never a wrong replay —
+the probe is the authority and a refused capture gets its own executable — but it is the
+cost that decides the flip.
+
+### Result 3 — THE BYTES, and why the saving is NOT ESTABLISHED
+
+**Instrument A, per-process device footprint, tail median (MiB):**
+
+| workload | OFF a | OFF b | COARSE a | COARSE b | EXACT a |
+|---|---:|---:|---:|---:|---:|
+| W32 (7 buckets) | 3252 | 3262 | 3262 | 3275 | 3262 |
+| W64 (11 buckets) | 9737 | 9737 | 9737 | 9737 | 9737 |
+
+**No saving is visible at MiB resolution.** W64 is identical to the megabyte in all five
+cells. W32's coarse arm reads 10-23 MiB *higher* than its OFF arm.
+
+**Instrument B, signed sum of `cudaMemGetInfo` free-byte deltas over every
+`cudaGraphInstantiate` in the cell:**
+
+| cell | retained execs | instantiate calls | bytes | MiB |
+|---|---:|---:|---:|---:|
+| w32_off_a | 7 | 7 | 29,356,032 | 28.00 |
+| w32_off_b | 7 | 7 | 31,952,896 | 30.47 |
+| **w32_exact_a** (null control) | **7** | **7** | **18,206,720** | **17.36** |
+| w32_coarse_a | 3 | 10 | 16,654,336 | 15.88 |
+| w32_coarse_b | 3 | 10 | 15,654,912 | 14.93 |
+| w64_off_a | 11 | 11 | 43,134,976 | 41.14 |
+| w64_off_b | 11 | 11 | 24,014,848 | 22.90 |
+| **w64_exact_a** (null control) | **11** | **11** | **43,855,872** | **41.82** |
+| w64_coarse_a | 5 | 27 | 35,045,376 | 33.42 |
+| w64_coarse_b | 5 | 27 | 33,673,216 | 32.11 |
+
+**The nominal effect.** W32: OFF mean 29.24 MiB against COARSE mean 15.40 MiB, a nominal
+**13.83 MiB**, which is **0.42%** of the 3262 MiB process footprint instrument A
+measured. W64: OFF mean 32.02 MiB against COARSE mean 32.77 MiB, i.e. **−0.75 MiB,
+nothing, in the wrong direction**, on a 9737 MiB process.
+
+**And the nominal effect is not established, on four independent grounds:**
+
+1. **The null control disagrees by as much as the candidate effect.** `EXACT` retains
+   exactly as many executables as `OFF` (7 and 11) at `probes=0`, so it allocates the
+   same executables and its true difference from OFF is ZERO. It measured 17.36 MiB
+   where OFF measured 28.00 and 30.47 — a **10.6-13.1 MiB** disagreement, against a
+   candidate effect of 13.83 MiB.
+2. **An OFF/OFF pair disagrees with itself by more.** W64 OFF a/b are 41.14 and 22.90
+   MiB: **18.2 MiB** apart on two runs of one binary on one workload.
+3. **One instantiate recorded a NEGATIVE delta.** `w32_exact_a` recorded, in order,
+   `10,055,680 / -5,165,056 / 2,326,528 / 2,727,936 / 4,153,344 / 2,273,280 /
+   1,835,008` bytes: one instantiate left MORE device memory free than it found, which
+   is only possible if something else in the process released memory inside the same
+   window.
+4. **`cudaGraphExecDestroy` reclaimed nothing, in every cell.** `reclaimed_bytes=0`
+   everywhere. A destroy that returns no measurable memory says the reading is pool
+   growth, not per-object cost.
+
+The mechanism is the same one in all four. Per-instantiate deltas for byte-identical
+404-node graphs range from **0 to 10,514,432 bytes**, and 17 of 27 instantiates in
+`w64_coarse_a` read exactly `delta_bytes=0`. The driver serves these allocations from a
+pool that grows in chunks and does not shrink, so a per-cell total measures POOL GROWTH,
+and the coarse arm's throwaway probe executables grow that pool exactly like retained
+ones do. That is how an 11→5 fold arrives at no measurable saving.
+
+**What CAN be priced.** Over the four OFF cells, bytes ÷ retained execs gives **2.08 to
+4.35 MiB for one ~390-node decode-graph executable** (4.00, 4.35, 3.74, 2.08). The
+harness also printed bytes per node for a reader sizing the same fold on a deeper
+checkpoint: `w32_off_a mean_nodes=396.0 mean_bytes_per_node=10590.2`,
+`w64_off_a mean_nodes=391.3 mean_bytes_per_node=10022.1`.
+
+### Result 4 — THE PROBE COST, exact and clock-independent
+
+| workload | arm | instantiate calls | exec destroys | `cudaGraphExecUpdate` calls |
+|---|---|---:|---:|---:|
+| W32 | OFF | 7 | 7 | 0 |
+| W32 | COARSE | **10** (3 retained + 7 probes) | 10 | 11 |
+| W64 | OFF | 11 | 11 | 0 |
+| W64 | COARSE | **27** (5 retained + 22 probes) | 27 | 28 |
+
+At 11 buckets the coarse key runs **2.45x the instantiate calls** and adds 28 update
+calls on the capture path, to retain 6 fewer executables.
+
+**Peak transient memory did NOT double.** In every ON cell the shim's live-bytes trace
+peaks at its end value (W32 COARSE `live_bytes_peak=16654336 live_bytes_end=16654336`;
+W64 COARSE `35045376 = 35045376`), because `Register` destroys the probe executable
+before it returns. The feared "double the peak to save the steady state" trade did not
+occur.
+
+**A replay-time re-point DID occur, and it is arithmetic, not a counter.** `probes=7`
+against 11 update calls, and `probes=22` against 28, leaves 4 and 6 updates that are not
+probes — the reverse re-point W5 recorded as untested on a device. Those cells exit 0
+with byte-identical ids, so the transitivity assumption in `Replay` did not abort and did
+not change a token here. It is stated as ARITHMETIC over two printed totals, because the
+registry still counts probe refusals only and a replay-time refusal would abort on
+`Replay`'s `VT_CHECK` rather than increment anything.
+
+### What this run does NOT establish
+
+- **NO time-based figure is attributable.** The clock pin was REFUSED inside the lease:
+  `The current user does not have permission to change clocks for GPU 0000000F:01:00.0`,
+  and the log records `clocks_pinned=0`. The instantiate-wall and update-wall figures in
+  `bytes.log` are diagnostics and are deliberately not quoted as results anywhere in
+  this record.
+- **nvcc was 13.0.88 here and 13.3.73 for the W5 fold run.** The OFF-vs-ON and
+  EXACT-vs-COARSE comparisons WITHIN this one binary are valid; this run and W5 are
+  **not directly comparable to each other**. 13.0.88 is the toolkit the completed W4
+  baseline gate ran.
+- **`result=2` is one driver (`580.173.02`), one GB10, one toolkit.** A different
+  refusal rate elsewhere is a different cost, not a different correctness.
+- **Only the Qwen3 dense decode driver was exercised**, as in W4 and W5. The other eight
+  capture drivers, and two models sharing the process-singleton registry, are untested.
+- **`VT_ASYNC_RUNNER=0` throughout.** Dedup engages only there, because the async path
+  captures no decode graph, so the feature remains unreachable on the DEFAULT serving
+  path ([#1179](https://github.com/mudler/vllm.cpp/issues/1179)).
+- **`cudaMemGetInfo` cannot separate an executable's own cost from the pool chunk that
+  satisfied it.** Every byte figure above inherits that limit.
+- **Two summaries of the same rows differ, and neither is wrong.** `run.sh`'s per-cell
+  `shim_inst … sum_bytes` reducer sums only POSITIVE deltas and therefore reads higher in
+  the two cells containing a negative one (`w32_exact_a` 23,371,776 against the signed
+  18,206,720). The tables above use the SIGNED sum, which agrees with the shim's own
+  in-process `SUMMARY` counter in every cell.
+
+### Verdict
+
+1. **`VT_CUDA_GRAPH_DEDUP` stays default OFF — supported by these numbers, not merely
+   ungated.** Best nominal saving 13.83 MiB (0.42% of process) at 7 buckets, smaller
+   than its own null control's disagreement; nothing at 11 buckets; cost is 16 extra
+   instantiate/destroy pairs and 28 update calls on the capture path.
+2. **`VT_CUDA_GRAPH_DEDUP_COARSE_KEY` alone is a NO-OP, not merely unsupported.**
+   `GraphDedupCoarseKeyEnabled()` (`src/vt/graph_dedup.h:114`) is read only by the
+   signature builder (`src/vt/graph_dedup_runtime.h:177`), which runs only from
+   `Register`, which `src/vt/cuda/cuda_backend.cu:237` calls only under
+   `GraphDedupEnabled()`. With dedup off its sole observable is one stderr line.
+3. **Both on — not supported.** Same numbers plus a 73% probe-refusal rate.
+
+### Next traceable hypotheses — NO CEILING is declared
+
+- **Find where the 376/404 node split comes from.** The FA-2 split-KV grid is the first
+  suspect. If a capture exists that fixes the node set across buckets, every refusal in
+  this run disappears and the fold ratio is the whole bucket set rather than 3/7 and
+  5/11. Until then a coarser key is the wrong direction.
+- **An instrument that resolves a single 2-4 MiB executable against driver pool
+  granularity.** `cuMemGetAllocationGranularity`, a driver-pool statistics query, or a
+  build with pool instrumentation would price the fold directly instead of through a
+  total whose noise exceeds the effect.
+- **A 60-80 layer checkpoint.** Bytes scale with node count and this graph is 376-404
+  nodes on a 28-layer 0.6B model. The measured 10.0-10.6 KB per node is the number to
+  re-run against before the flip is refused permanently for large models.
+
+### Evidence
+
+`/mnt/nas_share/rc/dedup-bytes/` — `RESULT.md` and `STATUS.md` (the pre-registered
+"what must be true before any number here is quoted" list and the result against it),
+`run.sh`, `build.sh`, `memshim.c`, `src-2c8f53d93.tar`, `logs-bytes/bytes.log`,
+`logs-bytes/clockpin.log` (the refusal), `logs-bytes/run_<tag>.log` for all 12 cells,
+`mem/mem_<tag>.csv` (the per-call `cudaMemGetInfo` trace with node counts),
+`mem/smp_<tag>.csv` (the `nvidia-smi` and RSS sampler) and `out-bytes/ids_<tag>.json`
+(the token artifacts).
+
+## BENCH-QWEN38-27B-BF16 c1/c8 RE-MEASURE — our arm lands complete, the c1 pairing is DISCARDED on clock spread, and the c8 vLLM denominator is NOT MEASURABLE on this box (2026-08-19, `row/BENCH-QWEN38-27B-BF16-RESULT`, `dgx:gpu0` GB10 sm_121a via `rc` leases, #915 / #979, cause #931)
+
+Subject `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, bf16,
+`config.json` `architectures = ['Qwen3_5ForConditionalGeneration']`,
+`model_type = qwen3_5`, 18 shards. Ours built at `1dac4f9a70195b282d16c536f319e8b171c925f8`
+(`origin/main` at run time), source tarball sha256
+`c74c45d1dc910087c313f5f29b81b4cbc6f8d649886618f2399d7988b0bd2fc0`, binary sha256
+`7d0c3cafb224f66ef6789f40df3caeb2b22987605922911fffcaa3e188344b0a` asserted
+`WANT == GOT` at launch. Oracle `0.1.dev1+g555967922`, the pin, used as the
+CLIENT for both arms and as the server for the vLLM arm. Client identity read
+from `vllm.__file__` in the lease and printed per series.
+
+Workload, identical string on both arms: `vllm bench serve --backend openai
+--endpoint /v1/completions --dataset-name random --random-input-len 1024
+--random-output-len 128 --random-range-ratio 0 --num-prompts <6 x C>
+--max-concurrency C --request-rate inf --ignore-eos --temperature 0 --seed 0`.
+Fresh server per concurrency, one untimed discarded warmup, then 3 reps.
+Ours: `--device cuda --max-model-len 2048 --max-num-seqs 32
+--max-num-batched-tokens 8192 --no-enable-prefix-caching --language-model-only`,
+with `VT_SERVER_SSE_PING_S=0` exported. vLLM: the recorded #915 configuration
+UNMODIFIED — `--gpu-memory-utilization 0.85 --max-num-seqs 32
+--max-num-batched-tokens 8192 --max-model-len 2048 --no-enable-prefix-caching
+--language-model-only --mamba-ssm-cache-dtype float32 --seed 0`.
+
+Box state asserted rather than assumed. Both series printed
+`COTENANTS_AT_SERIES_START=0` and `IDLE_BOX=YES` from a
+`nvidia-smi --query-compute-apps` count, and exit 38 instead of measuring when
+that count is non-zero. Both teardowns printed `COMPUTE_APPS_AFTER_TEARDOWN=0`
+and `TEARDOWN_VERDICT=CLEAN`.
+
+### OUR ARM — three clean legs at each concurrency, every request completed
+
+`out/bench-20260819T035148Z/`. Medians over 3 reps; CV is the population
+coefficient of variation over the same three values.
+
+| Axis | c1 | c8 |
+|---|---:|---:|
+| completed / num_prompts, per rep | 6, 6, 6 of 6 | 48, 48, 48 of 48 |
+| `failed`, per rep | 0, 0, 0 | 0, 0, 0 |
+| non-empty `errors` entries | 0 | 0 |
+| output token throughput, median | **4.4040 tok/s** | **22.6402 tok/s** |
+| output token throughput, CV over 3 reps | 0.039% | 0.205% |
+| total token throughput, median — **CORRUPTED, [#1355](https://github.com/mudler/vllm.cpp/issues/1355); NOT comparable to vLLM's** | 38.4776 tok/s, over 5,942 input tokens where the workload intends 6,144 | 196.0967 tok/s, over 47,072 where it intends 49,152 |
+| median TPOT | 218.11 ms | 250.57 ms |
+| median ITL | 216.56 ms | 232.83 ms |
+| median TTFT | 883.78 ms | 3623.5 ms |
+| median E2EL | 28,586.6 ms | 35,098.0 ms |
+| cold start to first `/health` | 30 s | 54 s |
+| SM clock median over the timed window | 2489 MHz, all three legs | 2515 MHz, all three legs |
+| within-run SM-clock spread | 13.58% / 26.36% / 14.34% | 14.99% / 13.44% / 12.92% |
+
+162 of 162 requests completed across the whole series, zero failures. The floor
+of `MemAvailable` over 1,077 samples spanning both legs was 21,100 MB.
+
+### vLLM ARM c1 — three clean legs, on the production graphed configuration
+
+`out/vllm-20260819T095758Z/`. The configuration is read back from the engine's
+own startup line rather than from the command line: `enforce_eager=False`,
+`cudagraph_mode: FULL_AND_PIECEWISE`, `cudagraph_capture_sizes [1, 2, 4, 8, 16,
+24, 32, 40, 48, 56, 64]`, `FLASH_ATTN` (FlashAttention version 2),
+`dtype=torch.bfloat16`, `enable_chunked_prefill=True`. That is vLLM's production
+shape and not `--enforce-eager`.
+
+| Axis | c1 |
+|---|---:|
+| completed / num_prompts, per rep | 6, 6, 6 of 6 |
+| `failed`, per rep | 0, 0, 0 |
+| output token throughput, median | **4.2835 tok/s** |
+| output token throughput, CV over 3 reps | 0.033% |
+| total token throughput, median — **do not set this beside ours**; ours is deflated by 202 missing prompt tokens ([#1355](https://github.com/mudler/vllm.cpp/issues/1355)), so the axis is not comparable | 38.5516 tok/s, over the full 6,144 input tokens |
+| median TPOT | 228.36 ms |
+| median ITL | 226.86 ms |
+| median TTFT | 876.4 ms |
+| cold start to first `/health` | 426 s |
+| SM clock median over the timed window | 2489 MHz, all three legs |
+| within-run SM-clock spread | 10.16% / 17.48% / 18.52% |
+
+### NO RATIO IS DERIVED AT c1, AND THE REASON IS THE WITHIN-RUN RULE
+
+`tools/bench/gpu_clock_state.py compare` returned rc=1 with a non-empty
+`reasons` list on all three c1 pairings. `PAIRING_VERDICT=DISCARD`. The shape of
+the refusal is unusual and is recorded precisely, because reading it as "the two
+arms disagree" inverts it:
+
+- **The cross-arm rule passed perfectly.** Same boot id
+  `3fd9745a-d25a-426c-ba3c-97c958a85515` on both arms. Median SM clock 2489 MHz
+  on BOTH arms in all three reps, a median offset of **0.0%** against a 1%
+  ceiling. Same GPU (`NVIDIA GB10`), same driver `580.173.02`, same
+  `clocks.max.sm` 3003 MHz, same `clocks.applications.graphics` 2418 MHz, same
+  persistence mode `Enabled`.
+- **The within-run rule failed on BOTH arms.** Ours 13.58% / 26.36% / 14.34%,
+  vLLM 10.16% / 17.48% / 18.52%, against the 5% ceiling
+  `.agents/benchmarking.md` sets. `SwThermalSlowdown` (`0x20`) is active in
+  EVERY one of the nine windows across both arms and both concurrencies; our c1
+  rep 2 additionally carries `HwSlowdown + SwThermal + HwThermal` (`0x68`).
+
+So both c1 absolutes are recorded above as facts with their own clock blocks,
+and **no ours-over-vLLM ratio is derived from them, here or anywhere else**.
+The ratio is OWED, not withheld because it is unflattering: the two absolutes
+happen to sit within a few percent of each other, and the reason there is no
+number is that the instrument that decides whether a pair may be divided
+refused the pair. A number the clock gate discarded is not a number.
+
+The window itself was observed rather than nominal: 155-163 retained busy
+samples per c1 window and 244-246 per c8 window, against the 30-sample floor,
+with 15-26 idle samples excluded per window.
+
+An observation that is an ARGUMENT and not a licence: three c1 legs with
+spreads of 13.58%, 26.36% and 14.34%, one of them hardware-throttled, produced
+output throughput within 0.039% and median TPOT within 0.007% of each other.
+That is evidence this batch-1 path is not clock-limited. It says nothing about
+c8, nothing about a different kernel mix, and nothing about any other boot, and
+it does not convert a DISCARD into a pairing.
+
+### THE c8 vLLM DENOMINATOR IS NOT MEASURABLE ON THIS BOX AT THE RECORDED CONFIGURATION
+
+This is the ANSWER to the c8 denominator question, not a gap in it, and it is a
+statement about headroom and guard granularity on this box. **It is not a claim
+that vLLM is defective**, and no reader may take it as one.
+
+The c8 vLLM server loaded, reached `/health` after 373 s (launched 10:18:54 UTC,
+first `GET /health 200 OK` logged at 10:25:07 UTC), and the worker was then lost
+during the untimed warmup, before any timed leg ran. The memory trajectory is
+the finding, from the series' own 2-second `MemAvailable` sampler
+(`out/vllm-20260819T095758Z/mem.samples`, epoch seconds and MB). One row is NOT
+from the sampler: the `before launch` value is `MemAvailable_MB_before_server`
+from `job.log:214`, read once at launch, and `116869` appears nowhere in
+`mem.samples`.
+
+| Sample time (UTC) | MemAvailable | What it is |
+|---|---:|---|
+| 10:18:54 | 116,869 MB | before launch |
+| 10:24:41 | 58,453 MB | weights loaded, compile and capture done |
+| 10:24:43 | 38,708 MB | the KV reservation, first step |
+| 10:24:45 | 9,738 MB | the KV reservation, second step |
+| 10:25:07 | ~9,950 MB | first `GET /health 200 OK` |
+| 10:25:26 | 6,261 MB | last observed value; no sample after it |
+
+**48,715 MB left in a single 4-second window.** The last observed value was
+6,261 MB and the worker died inside one 2-second sampling interval.
+
+CONSEQUENCE, stated narrowly. At `--gpu-memory-utilization 0.85
+--max-num-batched-tokens 8192`, graphed, this box leaves roughly **6-7 GB of
+headroom**, and the fall from healthy to dead is faster than a 2-second sampler
+can resolve. **A sampling watchdog is therefore not a viable guard for the c8
+denominator here at ANY floor that still lets the configuration run**: 12,000 MB
+kills a healthy server (below), and 5,000 MB was never reached before the worker
+was lost — `watchdog.log` is empty, zero bytes, because the last value the
+sampler saw was above it. **A separate and NARROWER statement holds for the
+reboot settled below, and it is not this conclusion made stronger.** A watchdog
+is a userspace process on the box, so a kernel reboot ends it with everything it
+was guarding: against the REBOOT CLASS of failure there is no floor and no
+cadence at which a sampler survives the event it is supposed to report. That is
+a general property of samplers and kernels and it stands on its own. It does not
+strengthen the c8 sentence above, because strengthening THAT would require the
+reboot to be what killed THIS worker, which is exactly what is NOT established
+below.
+
+Every way to create that headroom is an ENGINE KNOB. Lowering
+`gpu_memory_utilization` or `max_num_batched_tokens` produces a
+surviving-but-different engine whose number is not the denominator #915 and #979
+ask for. That is why none was attempted, and why the honest result is
+NOT MEASURABLE rather than a number taken at a configuration nobody recorded.
+
+For scale on the same box and the same workload, ours held a `MemAvailable`
+floor of 21,100 MB across both of its legs.
+
+**SETTLED THE SAME DAY — THE HOST REBOOTED, AND THE TWO HALVES OF THAT ARE NOT
+EQUALLY STRONG.** This entry carried the pod-versus-host question as owed. An
+`rc run` job on `dgx:gpu0`, job id `97cf3e63-e4a4-4506-bde7-f19f19be3bbf`,
+answered it. This is the probe log in full and verbatim, 312 bytes,
+sha256 `25b88023d85dbd7c751389be6427547ceb75f58992be18ba6d7f421a0418fd94`:
+
+```text
+rc: queued at position 1 for dgx:gpu0
+rc: job 97cf3e63-e4a4-4506-bde7-f19f19be3bbf on dgx:gpu0
+BOOT_ID_NOW=64c495a3-8c9c-4b20-8496-a97efda0e332
+BOOT_ID_AT_BENCH=3fd9745a-d25a-426c-ba3c-97c958a85515
+VERDICT=REBOOTED -- the host boot_id changed since the 2026-08-19 benchmark
+UPTIME_S=38868
+MemAvailable_MB=117436
+```
+
+**OBSERVED: the machine rebooted.** `/proc/sys/kernel/random/boot_id` is
+kernel-wide and regenerated once per boot, so a changed value is a reboot and
+nothing else. A pod restart, a container teardown and a `k3s` restart all leave
+it unchanged. The disjunction is retired.
+
+**DERIVED, conditional, and ONE-SIDED.** `UPTIME_S=38868` is `/proc/uptime`
+read from INSIDE the `rc` worker, so it is the HOST's uptime only if that worker
+does not virtualize `/proc`. `lxcfs` and its equivalents do virtualize
+`/proc/uptime` and none of them can touch `boot_id`, which is exactly why the
+observed half above does not inherit this caveat. The worker is a k3s pod, where
+an unvirtualized `/proc` is the default, and no artifact here asserts that
+`lxcfs` is absent. The VALUE argues against virtualization on its own: a
+container-scoped `/proc/uptime` reports the POD's age, and 38,868 s is 10.8 h,
+which is not a plausible age for a job submitted minutes before the read. That
+is an argument and not the missing assertion, so the caveat stands.
+
+**The arithmetic is one-sided, and the interval recorded here earlier was not.**
+That earlier text also said no tighter figure was supportable, which was wrong
+in both directions: a tighter UPPER bound exists and the LOWER bound is not
+established at all. 38,868 s is 10:47:48. The probe log's last write is
+21:29:35.606816Z, and that mtime is when the FINAL line (`MemAvailable_MB`)
+landed, so `UPTIME_S` was read strictly BEFORE it. The mtime is therefore an
+UPPER bound on the read instant rather than a midpoint, and 21:30:02Z, when the
+run was reported, is later still and bounds nothing usefully. Both endpoints
+that were recorded here are at or after the true read instant, so the interval
+they formed excluded the whole region the value occupies:
+
+```text
+21:29:35.606816Z  -  10:47:48  =  10:41:47.606816Z
+```
+
+So the derived boot is **at or before 2026-08-19T10:41:47.6Z**, half a second
+later still if `UPTIME_S` rounds `/proc/uptime` rather than truncating it — the
+probe script was not retained, so which one is unknown. No LOWER bound is
+stated. One would have to come from when the probe STARTED, which is not in the
+log's content, and it would cross the same unpinned clock boundary as the upper
+one.
+
+**The two clocks are not pinned to each other and nothing here quantifies the
+skew.** 21:29:35.606816Z is the mtime of a file on the LOCAL host, written there
+by the `rc` client. `UPTIME_S` was read on `dgx`, and the timeline below is
+`dgx`-side content plus mtimes on the shared CIFS mount. Neither is the local
+host's clock, so the derived instant is compared across an offset no artifact
+here measures.
+
+| Time (UTC) | Strength | Event |
+|---|---|---|
+| 10:18:51 | observed | c1 legs complete, `TEARDOWN_VERDICT=CLEAN`, `MemAvailable` 116,869 MB |
+| 10:18:54 | observed | c8 vLLM server launched, `SERVER_PID=123868`; also `job.log`'s last CONTENT line |
+| 10:25:07 | observed | c8 server answers `GET /health 200 OK`; `vllm-server-c8.log`'s last CONTENT line |
+| 10:25:26 | observed | last `MemAvailable` sample, 6,261 MB; nothing after it. `mem.samples` mtime is 10:25:28.570640 |
+| **at or before 10:41:47.6** | **derived** | **upper bound on the boot of the kernel now running** |
+| 11:26:32.079 | mtime only | `job.log` and `vllm-server-c8.log` both re-stamped. NOT a content write and NOT established as liveness |
+
+**The 11:26 row is a file mtime, and this entry earlier recorded it as
+`11:26:00`, "the job's last write".** Both halves are wrong: the actual mtimes
+are `11:26:32`, and nothing establishes that the job wrote them. No CONTENT
+anywhere in `out/vllm-20260819T095758Z/` is later than 10:25:07
+(`vllm-server-c8.log`) or
+10:25:26 (`mem.samples`), and `job.log`'s last content line is the 10:18:54
+launch banner. The two 11:26:32 mtimes — `job.log` at `.079517600` and
+`vllm-server-c8.log` at `.079047100` — are **0.47 ms apart**, which is one bulk
+event touching both files, not a job writing to either.
+
+**Two readings of that row are possible, they are incompatible, and NEITHER is
+established.** If a process flushed at 11:26:32 the box was alive then, which
+contradicts a boot at or before 10:41:47.6Z that ended it. If it was a reaper or
+a CIFS flush, then the last evidence of anything alive is `mem.samples` at
+10:25:28.570640 and the derived boot is about 16 minutes AFTER it. The row is
+recorded at mtime strength and the tension is left open, rather than resolved by
+preferring whichever reading fits the rest.
+
+**A second open discrepancy comes from this box's own prior reboot.**
+[`environment.md`](environment.md) records that one with an exact
+`journalctl --list-boots` pair: boot `-1` ending 09:10:15Z against boot `0`
+beginning 09:13:55Z, about **3m40s** of downtime. Apply that shape here and a
+boot at 10:41:47 puts the box GOING DOWN around 10:38, thirteen minutes after
+every writer in the evidence directory had already stopped, which does not fit a
+simple crash at 10:25:28. Recorded as an open discrepancy and not resolved: the
+3m40s is one sample from one reboot, the bound above is one-sided so the true
+boot may be much earlier, and the two clocks are unpinned.
+
+**The WARMUP clause belongs to the worker LOSS, not to the boot.** The loss was
+during the untimed warmup before any timed leg ran, which is observed and is
+what this entry records above. At the derived boot instant nothing had written
+for about 16 minutes, so that instant is not "during the warmup" in any useful
+sense. Against the observed marks the bound sits at most 16m41s after the
+`/health` 200 and at most 16m22s after the last memory sample.
+
+**NOT ESTABLISHED: that the reboot killed the worker.** Three facts are
+consistent with it — the bound above, the descent this entry already records
+(9,738 -> 6,261 MB, then a loss inside one 2-second sample), and this box's
+documented habit of rebooting instead of OOM-killing. Consistency is not a
+trace, nothing here ties the reboot to the worker's death, and an apparent
+explanation is a hypothesis until it is traced. Recorded as an observed reboot
+with a one-sided derived bound, never as a cause.
+
+**NO NUMBER MOVES.** This settles provenance and creates nothing. The c8 vLLM
+denominator is still NOT MEASURABLE at the recorded configuration, the c1
+pairing is still `PAIRING_VERDICT=DISCARD`, and no ratio is derived or restored
+from either. What the finding does is explain the shape of the absence.
+
+### FINDING THAT OUTLIVES THIS CAMPAIGN 1 — CLOCK PINNING IS UNAVAILABLE INSIDE AN `rc` LEASE
+
+Measured 2026-08-19 on `dgx:gpu0`, in a job running as root in the `rc` worker
+pod:
+
+```text
+$ nvidia-smi -lgc 2190
+The current user does not have permission to change clocks for GPU 0000000F:01:00.0.
+LGC_RC=4
+```
+
+Reproduced in both attempts of the vLLM arm and in our arm, three jobs.
+
+`.agents/benchmarking.md` instructs "Pin the clocks before measuring, under the
+lock", and **every clock-pinned figure in this repository's records was taken
+over the retired host + `ssh` + `flock` path**. The migration to `rc` leases
+silently removed clock pinning and no record said so. Same class as
+[#1265](https://github.com/mudler/vllm.cpp/issues/1265): a capability the
+records assume, which the current access path does not provide. Inside a lease
+the SM clock can only be SAMPLED. `tools/bench/gpu_clock_state.py` remains
+usable and is the only attribution these numbers carry — and it is what turned
+this campaign's c1 pairing into a DISCARD.
+
+Not the first sighting: this record already carries the refusal once, as a
+per-run note under `ENG-CUDAGRAPH-DEDUP W6`. What is new is that the refusal is
+a property of the ACCESS PATH rather than of one run, and that a task guide
+still tells the next reader to do the impossible thing. Recorded in
+`.agents/environment.md` beside the other measured lease capabilities, and
+`.agents/benchmarking.md` now names the exception where it instructs the pin.
+
+### FINDING THAT OUTLIVES THIS CAMPAIGN 2 — A GUARD SET INSIDE A CONFIGURATION'S OWN OPERATING POINT MANUFACTURES THE FINDING IT WAS MEANT TO DETECT
+
+`out/vllm-20260819T073125Z/`, the FIRST vLLM attempt. Its `MemAvailable`
+watchdog fired 18 s after the server reached `/health` and killed it:
+
+```text
+WATCHDOG: MemAvailable 11917MB < 12000MB -- KILLING vllm pgid=110154 to save the box
+```
+
+The obvious reading — "the recorded denominator configuration collapses inside a
+lease" — was WRONG, and wrong in the most dangerous way, because it matched the
+hypothesis already held and would have been believed. The arithmetic refutes it:
+
+| Quantity | Value |
+|---|---:|
+| `MemTotal` | 122,502 MB |
+| `0.85 x MemTotal`, reserved BY DESIGN | 104,127 MB |
+| `MemAvailable_MB_before_server`, from the job log | 116,350 MB |
+| predicted free after the reservation | 12,223 MB |
+| OBSERVED floor at which the guard fired | 11,917 MB |
+| difference | **306 MB** |
+
+The 46 GB "collapse" is the KV reservation doing exactly what
+`gpu_memory_utilization` configures, which on GB10's unified pool comes out of
+host RAM. The watchdog floor of 12,000 MB sat ABOVE the configuration's own
+steady-state free memory, so it fired on a healthy server. Attempt 2 confirmed
+it directly: with the floor moved to 5,000 MB, the c1 legs ran to completion at
+a steady state around 7,500 MB — BELOW the floor of attempt 1.
+
+**THE REUSABLE RULE.** A tripped guard is evidence about the GUARD until its
+threshold is shown to sit outside the guarded thing's operating point. Predict
+the number from the configuration and compare; a 306 MB match settled in one
+line what no amount of log-reading would have. And distinguish an ENGINE KNOB
+from an INSTRUMENT THRESHOLD: `gpu_memory_utilization` and
+`max_num_batched_tokens` define the denominator and may never be tuned to make a
+run survive, while the watchdog floor appears nowhere in the engine
+configuration and changes nothing about what is measured. Between attempt 1 and
+attempt 2 the floor moved 12,000 -> 5,000 MB and **no engine knob moved**.
+
+Two further defects in the same harness, both repaired between the attempts: the
+watchdog `break`s after firing, which would have left every later leg
+unprotected; and the reps kept driving a dead server, recording
+`completed=0 / failed=6 / duration 0.013 s` three times.
+
+### WHAT #915's TWO WITHHELD CELLS LOOK LIKE NOW
+
+Against the previously recorded cells (2026-08-15, a DIFFERENT boot
+`03717c9d-63c8-4652-a8fe-a63d012c5718`, clocks PINNED flat at 2184 MHz):
+
+| Axis | prior | this series | completion, prior -> now |
+|---|---:|---:|---|
+| c1 output tok/s, ours | 2.37 | 4.4040 | 5, 5, 5 of 6 -> 6, 6, 6 of 6 |
+| c1 median TPOT ms, ours | 220.6 | 218.11 | as above |
+| c8 output tok/s, ours | 15.96 | 22.6402 | 36, 37, 36 of 48 -> 48, 48, 48 of 48 |
+| c8 median TPOT ms, ours | 261.1 | 250.57 | as above |
+
+**The SHAPE of that difference is the diagnosis, and the MAGNITUDE is not
+established by these two rows.** The throughput axis moves a great deal while
+the per-token axis barely moves at all — and that comparison is qualitative on
+purpose, because the two rows straddle the 2184 MHz-pinned / 2489 MHz-sampled
+boundary this paragraph goes on to declare non-dividable, so quoting a percentage
+here (220.6 -> 218.11 and 261.1 -> 250.57) would break the rule stated three
+sentences later. That is exactly what
+[#931](https://github.com/mudler/vllm.cpp/issues/931) predicts: the per-token
+axis was always measuring the engine, because it is computed over completed
+requests, while `output_throughput` was dividing live tokens by a wall duration
+that still contained the dead requests. Withholding rather than publishing
+0.677x was correct, and this is the evidence for that judgement.
+
+The magnitude is NOT established because the two rows come from different boots
+with different clock attribution — 2184 MHz pinned then, 2489/2515 MHz sampled
+and thermally throttled now, which is 14-15% apart on the median alone. Per
+`.agents/benchmarking.md`, a ratio is valid only between two arms measured in
+the same window, and these are not. Read the direction and the shape; do not
+read the percentage.
+
+**One caveat on the #931 fix.** The measured arm exported
+`VT_SERVER_SSE_PING_S=0` explicitly. So this series demonstrates that the
+keepalive frame was the cause and that disabling it removes the drops. It does
+NOT independently demonstrate that the shipped DEFAULT is `0`, because the
+harness never depended on the default.
+
+### A DIVERGENCE THE CAMPAIGN DID NOT SET OUT TO FIND — THE TWO ARMS REPORTED DIFFERENT PROMPT-TOKEN COUNTS
+
+Read out of the raw result files rather than out of any summary. On the
+IDENTICAL client invocation, seed and dataset, `input_lens` (which
+`vllm/benchmarks/lib/endpoint_request_func.py:247` overwrites from the SERVER's
+`usage.prompt_tokens`) differs between the arms:
+
+| Leg | ours | vLLM |
+|---|---|---|
+| c1, per request | `[915, 931, 1024, 1024, 1024, 1024]`, sum **5,942** | `[1024] x 6`, sum **6,144** |
+| c8, distribution | 29 of 48 at 1024, 19 short (877-941), sum **47,072** | not measured |
+
+Deterministic: byte-identical `input_lens` across all three c1 reps and all
+three c8 reps. `vllm bench serve` re-aligns prompts against the server's own
+`/tokenize` when the first prompt disagrees
+(`vllm/benchmarks/serve.py:2041-2044`), and it printed no `tokenizer mismatch`
+warning on either arm, so our `/tokenize` agreed on 1024 while our
+`usage.prompt_tokens` reported 915 for the same request.
+
+**What this does and does not touch, BOUNDED rather than asserted.**
+`total_token_throughput` has input tokens in its numerator and is corrupted
+outright: our c1 figure of 38.4776 tok/s is computed over 5,942 input tokens and
+our c8 figure of 196.10 tok/s over 47,072, where the intended workload is 6,144
+and 49,152. `output_lens` is `[128] x N` on BOTH arms in every leg, so TPOT and
+ITL — both computed per completed request — stand.
+
+**`output_throughput` does NOT stand unconditionally, and the earlier wording
+"affects total-token throughput only" was too strong.** It is
+`total_output_tokens / duration`, and under GENUINE truncation the missing
+prompt tokens mean less prefill and therefore a shorter wall, which biases it
+UP. The size is derivable from these files. At c1 the wall equals the sum of the
+per-request E2ELs to within 1 ms (174.4387 s against a 174.4397 s `duration`),
+so the whole effect is in TTFT: over the 15 non-outlier c1 points the marginal
+prefill cost is 1.10 ms/token, so the missing 202 tokens are 0.22 s, and the two
+short prompts' TTFTs sit 0.20, 0.23 and 0.20 s below the 1024-token mean of
+884.6 ms across the three reps — **~0.22 s of 174.39 s, about 0.13%, against a
+published CV of 0.039%**. At c8 the first wave prefills at 1,300-1,800
+tok/s (six of eight first tokens by 4.579 s in rep 3), so 2,080 missing tokens
+are **~1.1-1.6 s of 271.0 s, about 0.4-0.6%, against a published CV of 0.205%**.
+Both are LOWER bounds, because a shorter context also cheapens every decode step.
+So the systematic bias on our headline throughput figures is larger than the
+precision printed beside them, and a reader must see that.
+
+**The two median TTFTs ARE comparable, and by evidence rather than by luck.**
+883.78 ms ours against 876.4 ms vLLM: every vLLM prompt is 1024 tokens, and on
+our side the two short prompts (915 and 931) produce the two LOWEST TTFTs in all
+three reps — sorted rep 1 `0.7381, 0.8264, 0.8436, 0.8484, 0.9047, 3.9243`, rep 2
+`0.7295, 0.8078, 0.8523, 0.9152, 0.9248, 4.0061`, rep 3 `0.7294, 0.8363, 0.8899,
+0.8900, 0.8921, 3.9548`. The median of six averages the third and fourth, both of
+which are 1024-token requests in every rep, so both arms' medians fall on the same
+prompt length. Had a short prompt landed at rank three or four, this comparison
+would have been wrong and nothing in the record would have said so.
+
+**Two causes remain open and the artifacts cannot separate them**: our server
+under-reports `usage.prompt_tokens`, or our server actually processed a
+truncated prompt. Filed, not fixed in flow — this row writes no product code
+and holds no GPU.
+
+### A SECOND THING THE CAMPAIGN DID NOT SET OUT TO FIND — A REPRODUCIBLE TTFT OUTLIER AT A FIXED REQUEST INDEX
+
+[#1365](https://github.com/mudler/vllm.cpp/issues/1365). At c1 the six requests
+are strictly serialized, and OUR arm puts a ~4 s TTFT on request 3 of every leg:
+
+| leg | `ttfts`, seconds |
+|---|---|
+| `warmup-c1.json` | 77.005, 0.727, **3.981**, 0.850, 0.845, 0.839 |
+| `c1-r1.json` | 0.738, 0.826, **3.924**, 0.844, 0.905, 0.848 |
+| `c1-r2.json` | 0.729, 0.808, **4.006**, 0.915, 0.925, 0.852 |
+| `c1-r3.json` | 0.729, 0.836, **3.955**, 0.890, 0.892, 0.890 |
+
+Four legs of four, always index 2, and request 3 carries a 1024-token prompt
+exactly as requests 4, 5 and 6 do, so prompt length does not separate it. The
+77.005 s first value is the separate, already-recorded first-inference cost
+behind a liveness-only `/health`. The oracle has no such point: 18 requests
+across its three c1 legs, every TTFT between 0.834 and 1.015 s.
+
+**Nothing recorded above is wrong, and that is exactly why this is filed.** The
+figure this repository quotes is the MEDIAN, labelled as such, and the median of
+six averages ranks three and four, which the outlier never occupies. What it does
+move is the MEAN — ours 1347.6 / 1372.6 / 1365.4 ms against the oracle's 873.3 /
+883.4 / 900.2 ms, while the medians read 883.78 ms and 876.4 ms — and the wall:
+request 4 starts 31.63 s after request 3 where every other gap is ~28.4 s, so
+roughly 3.1 s of the 174.39 s c1 wall. A reproducible outlier at a FIXED request
+index is a behaviour rather than noise. The cause is deliberately NOT chased
+here; this row writes no product code and holds no GPU.
+
+### EVIDENCE
+
+`/mnt/nas_share/rc/q38bf16/` — `NOTES.txt` (the campaign's own 253-line
+provenance and reasoning file, the primary source for this entry), `build.sh`,
+`bench.sh`, `job.sh`, `vllm-arm.sh`, `reap-orphans.sh`, `STAGED-SHA256.txt`
+(hashes of all five), `src-1dac4f9a7.tar.gz` with `src.sha256`, and under `out/`:
+`RESULT.txt`, `build.log`, `cfg.log`, `bench-20260819T035148Z/` (our arm: six
+result JSONs, six `clock-*.json` windows with their raw samples, `CLOCKS.txt`,
+`SUMMARY.txt`, `mem.samples`, `job.log`, `ckpt-sha256.txt`,
+`ckpt-resolved.txt`, `client-identity.txt`, per-leg server logs),
+`vllm-20260819T073125Z/` (attempt 1, including the non-empty `watchdog.log`),
+and `vllm-20260819T095758Z/` (attempt 2: three c1 JSONs and clock windows, both
+server logs, `mem.samples`, the empty `watchdog.log`).
+
+**Three inconsistencies inside the evidence directory, resolved in favour of the
+executing artifact.** `NOTES.txt` states a binary sha256 of `ab0b9a1e...`; the
+job log asserted and printed `7d0c3caf...` as both `WANT` and `GOT` at launch,
+and `out/RESULT.txt` agrees, so `7d0c3caf...` is the binary that ran and
+`NOTES.txt` carries a stale value. `NOTES.txt` gives the checkpoint as
+55,586,040,114 bytes where `.agents/specs/qwen38-27b-bf16-gate.md` records
+55,586,114,863, a difference of 74,749 bytes; the run DID re-derive it and it
+agrees with `NOTES.txt` — `out/bench-20260819T035148Z/job.log:47,49` print
+`CKPT_SRC_BYTES=55586040114` and `CKPT_DST_BYTES=55586040114` over the staged tree
+that served every leg — so what is unadjudicated is why the spec's figure differs,
+not whether anybody measured. And `NOTES.txt:208` gives the c8 cold start as 374 s
+where this entry derives 373 s from the log's own timestamps (10:18:54 launch,
+10:25:07 first `GET /health 200 OK`); the derived value is the better one and the
+disagreement is recorded here rather than left silent, since the other two were.
+
+## LTX25-TEXT-LINEAR-MEM — #1252 costs 0.24 GiB of peak host memory, not 26 GiB, and the 8.4x survives (2026-08-19, `row/LTX25-TEXT-LINEAR-MEM`, base `origin/main` `678fc672c`, 20-core Zen 5 under KVM, #1286 / #1252 / #1259 / #1317)
+
+**This entry refutes [#1286](https://github.com/mudler/vllm.cpp/issues/1286).**
+That issue reported that routing the LTX-2.5 caption projection through
+`vt::MatmulBT` ([#1252](https://github.com/mudler/vllm.cpp/issues/1252)) raised
+peak host memory from ~79 GiB to 105.85 GiB on a 119 GiB GB10 and aborted a
+full-model render, and named the seam's per-thread tiles as the first suspect.
+It is not the seam, it is not the call site, and it is not an interaction. **The
++26 GiB is the box's occupancy before the job started.**
+
+### The paired GB10 evidence
+
+`runguard.py:236-237,260` fixes what the compared column is: `used_gib` is the
+SYSTEM-WIDE `MemTotal - MemAvailable`, `anon_gib` is system-wide `AnonPages`,
+and only `rss_gib` is the child's own. Both runs are retained under
+`/mnt/nas_share/rc/ltx25-fullmodel/out/`.
+
+| | pre-#1252, `1024x576-25f/` | #1252, `20260818T220620Z/1024x576-25f/` |
+|---|---:|---:|
+| `used_gib` at `t=0` | **4.741** | **31.553** |
+| `avail_gib` at `t=0` | 114.890 | 88.078 |
+| peak `used_gib` | 79.206 at t=1867.4 s, `cpu=1885.5%` | 105.853 at t=199.2 s, `cpu=1925.2%` |
+| samples / terminal | 3018, `signal=15 (supervisor asked to stop)` | 391, `exit=90 guard:PROJECTION` |
+
+Starting difference **26.812 GiB**; claimed regression `105.853 - 79.206 =`
+**26.647 GiB**. They agree to **0.165 GiB**.
+
+Peak minus each run's own `t=0`, on three independent columns:
+
+| axis | pre-#1252 | #1252 | delta |
+|---|---:|---:|---:|
+| `used_gib` peak minus own `t=0` | **74.465** | **74.300** | **-0.165** |
+| `anon_gib` peak minus own `t=0` | 38.012 | 38.217 | +0.205 |
+| child `rss_gib` at the peak sample | 41.952 | 42.090 | +0.138 |
+
+Both peaks sit inside a ~1900% CPU stretch, so this is the same phase class and
+not two different ones. On a box as clean as the first run's, the #1252 binary's
+own 74.300 GiB would have left **40.59 GiB** available — above the 12 GiB hard
+floor and the 8 GiB projection floor, and consistent with the "never below
+~40 GiB" the pre-#1252 runs showed.
+
+Two readings that each look like support for #1286 in isolation and are not.
+First, during its single-core projection (`cpu ~ 100%`, t=124-1801 s, 1676
+samples) the pre-#1252 run is DEAD FLAT — `anon` 34.283-34.441, `rss`
+33.484-33.570, `used` 74.405-74.573 — while the #1252 run's threaded stretch
+(`cpu > 500%`, t=137.1-385.5 s, 236 samples) is a RAMP, not a plateau: `anon`
+climbs 34.280 -> 42.593, `rss` 30.322 -> 42.120, `used` 97.350 -> 105.853. The
+two coincide on `anon` at the ramp's FIRST SAMPLE (34.280 against 34.283) and
+nowhere after it, so that near-identity is where the ramp starts rather than a
+matching steady state; `used` is 23 GiB apart there and 26.6 GiB apart at the
+peak. The section's argument is peak-minus-own-`t=0` and does not rest on any
+single sample. Second,
+NEITHER run ever loaded the DiT (`dit_runs=0` in both; the first was stopped
+from outside at t=3017.3 s still inside conditioning), so neither peak is a
+whole-render peak and neither is presented as one. Filed as
+[#1317](https://github.com/mudler/vllm.cpp/issues/1317).
+
+### The local A/B, before vs after, at the shipped geometry
+
+Same probe source and flags on both arms, only the `Linear` body differing.
+Peak RSS is `VmHWM` read before and after the call with every operand already
+allocated and touched, so the figure is the call's own. 20-core Zen 5 under KVM,
+Release, `-ffp-contract=off`, `K = 188160`, `out_features = 4096`,
+`rows = 64` (REDUCED from the shipped 1024 to keep the single-threaded arm
+inside a sensible wall; the tile term the sweep isolates is independent of rows
+by construction). Box NOT idle, loadavg 5.4-13.3, three replicates, median:
+
+| arm (`rows = 64`, reduced) | wall | rate | peak-RSS growth |
+|---|---:|---:|---:|
+| before, scalar `double` loop | **28.488 s** | 1.732 GMAC/s | **1.0 MiB** |
+| after, `vt::MatmulBT` | **3.378 s** | 14.60 GMAC/s | **232 MiB** |
+
+**8.43x, and +231 MiB** — reproducing #1252's 8.57x, and **0.85% of the
+26.6 GiB #1286 attributes to the change**, i.e. 117x too small to be it.
+
+Swept over threadpool width, same reduced `rows = 64` geometry:
+
+| workers (`rows = 64`, reduced) | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| peak-RSS growth (MiB) | 12.9 | 24.7 | 47.8 | 93.8 | 186.1 | **232.1** |
+| per worker (MiB) | 12.9 | 12.3 | 12.0 | 11.7 | 11.6 | 11.6 |
+
+The model is `cpu_ops.cpp:130`'s `static thread_local std::vector<float> af`,
+sized by ggml's 16-row `blck_1` tile: `16 x 188160 x 4 = 11.48 MiB` per worker.
+The measurement lands on it, and the output checksum is **byte-identical across
+all six thread counts** — the dispatch determinism contract holding.
+
+Full shipped geometry, `rows = 1024`, both projections, default 20 workers. The
+box was heavily loaded (loadavg 15.9 then 28.5) so **the wall times below are
+not a speed claim**, only the memory column is:
+
+| projection | wall | rate | peak-RSS growth |
+|---|---:|---:|---:|
+| `1024 x 188160 x 4096` | 57.34 s | 13.76 GMAC/s | **247 MiB** |
+| `1024 x 188160 x 2048` | 28.95 s | 13.63 GMAC/s | **239 MiB** |
+
+16x the rows moved the growth by 15 MiB, which is the output buffer
+(`1024 x 4096 x 4 = 16.8 MB`) allocated inside the timed region. The tile does
+not scale with rows.
+
+### #1259, the sibling that has never run on the full model
+
+`Ltx2FuseLoraIntoTensor` takes `vt::Matmul`, the other member of the same seam;
+`MatmulOneChunk` is one template shared by both orientations, so the per-worker
+buffer is `16 x K x 4` there too with `K = rank`. Measured at the shipped
+`4096 x 450 x 4096` with a replaced global `operator new`:
+
+| workers | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| bytes requested | 28,864 | 28,864 | 86,464 | 201,664 | 432,064 | **547,264** |
+
+**0.52 MiB at 20 workers**, exactly `19 x 28,800 + 64`. `bs` and `agg` are
+unchanged by #1259. It cannot reach the wall #1286 describes; nothing fixed,
+nothing filed.
+
+### The refuted instrument, recorded because it read as a pass
+
+The bound this row lands (`tests/vt/test_ops_matmul_mem.cpp`) was FIRST written
+against peak RSS, measuring `VmHWM` across `/proc/self/clear_refs`. It read
+`growth_bytes = 0` for **every** thread count and **every** row count while
+passing every bound: the operands are freed between measurements, glibc keeps
+the arena, and the next tile is served from pages that are already resident. A
+mute switch reporting green over a kernel doing anything at all. The shipped
+gate counts what the seam ASKS FOR through replaced global `operator new`
+overloads, a figure the allocator's RETENTION policy cannot silence, with a
+liveness case requiring the counter to see at least six of eight fresh workers
+take a tile on each of the two orientations. It counts every global
+`operator new` -- plain, array, nothrow and the C++17 aligned family -- and
+nothing below that: a `std::malloc` or `posix_memalign` in the kernel would be
+invisible to it. That is the narrowed claim, and it is narrowed because the
+first form of it was broader than the instrument (see the mutation table).
+
+### Mutation M1 — the hypothesis, written into the kernel
+
+`af` widened from the 16-row tile to the whole activation.
+
+- **First attempt: `BUILT=NO`, `compile_err=2`** —
+  `cpu_ops.cpp:134:19: error: unused variable 'nrows' [-Werror=unused-variable]`.
+  Recorded because a mutation that fails to build reads exactly like a passing
+  test.
+- **Second attempt: `BUILT=YES`, `compile_err=0`**, `git diff --stat` =
+  `src/vt/cpu/cpu_ops.cpp | 2 +-, 1 file changed, 1 insertion(+), 1 deletion(-)`.
+  `test_ops_matmul_mem` **exit 1**, `Status: FAILURE!`,
+  `2 test cases | 1 passed | 1 failed`, `13 assertions | 7 passed | 6 failed`.
+  By name: `CHECK(growth <= Bound(nthreads))` at three worker counts
+  (`67,108,928 <= 25,165,824`; `201,326,656 <= 41,943,040`;
+  `469,762,112 <= 75,497,472`) and all three row-scaling assertions, with
+  `rows=1024` reading **1,073,741,888 bytes**.
+- Restored byte-for-byte, `sha256(cpu_ops.cpp) =`
+  `dc39eccdece48879e82be7209e95d182c6ed624eb04389de689fa4b58fe4f1f3` before and
+  after; rebuilt (binary mtime 07:15:48 -> 07:16:27, so the green is not stale)
+  and green: **2 cases, 13 assertions, 0 failed, exit 0**.
+
+### The review of that bound, and the three regressions it did NOT catch
+
+The fresh review of `39b34c0c8` returned nine findings and no PASS. The
+refutation above was confirmed and is unchanged; what failed was the gate. Three
+of the reviewer's mutations passed 13 of 13 assertions over an obvious memory
+regression. Every row below was rebuilt and re-run, and
+`sha256(cpu_ops.cpp) = dc39eccdece48879e82be7209e95d182c6ed624eb04389de689fa4b58fe4f1f3`
+before and after each one.
+
+| mutation | defect written into `cpu_ops.cpp` | `BUILT`/`compile_err` | at `39b34c0c8` | after the repair |
+|---|---|---|---|---|
+| M-A | `nrows` = the chunk's row span | `YES`/0 | green, 13/13 | **exit 1**, 2 of 38 failed |
+| M-A2 | `nrows` = the whole activation | `YES`/0 | red | **exit 1**, 14 of 38 failed |
+| M-B | a SECOND tile-sized buffer per worker | `YES`/0 | green, 13/13 | **exit 1**, 10 of 38 failed |
+| M-D | whole activation via 64-byte-aligned `operator new` | `YES`/0 | green, 13/13 | **exit 1**, 14 of 38 failed |
+| M-E | whole activation via `std::malloc` | `YES`/0 | green, 13/13 | **exit 1**, 14 of 38 failed, 1,086,324,800 bytes |
+| M-W | the `--wrap=malloc` link flag removed | **`NO`**/1 | n/a | **link fails**, `undefined reference to '__real_malloc'` |
+
+M-E was closed by counting the C allocator through the LINKER rather than by
+defining `malloc`: `-Wl,--wrap=malloc` and four siblings, scoped to this target.
+That redirects the calls made by the objects in this link (`libvllm.a`, and so
+`cpu_ops.cpp`) without introducing a second strong `malloc` definition beside
+AddressSanitizer's interceptor. The C-allocator figure reads **zero on a clean
+run**, so it adds no noise to any bound.
+
+The three causes. `Bound(n)` was `8 MiB + n * 2 * kTileBytes`, so its per-thread
+term was two tiles and it admitted a doubling at EVERY worker count while its
+comment claimed the opposite; it is now `1 MiB + n * kTileBytes` over a fixed
+term measured at 64 bytes. Only the non-aligned `operator new` overloads were
+replaced, so the C++17 aligned family fell through to the library; all eight are
+now replaced. And replaying `MatmulChunked`'s grid arithmetic over all
+twelve shapes the sweeps use gives `dr1` = 16 at eleven and 8 at the twelfth,
+never above 16, which is the whole reason a chunk-sized buffer was invisible.
+The collapse to one chunk per thread is LIVE and the shipped default, so a case
+now runs at `rows = 128, n = 16, nth = 4` where it gives `dr1 = 32`. The larger
+form is recorded rather than tested: `IsNuma()` is `constexpr false` here
+(`cpu_threadpool.h:74`, NUMA unported per `:25`), and where it is implemented it
+forces the collapse unconditionally — at the shipped caption projection the
+weight is the longer axis (`n = 4096 > rows = 1024`), giving `nchunk1 = 1` and
+`dr1 = 1024`, at which a chunk-sized `af` is 770 MB per worker and 15.4 GB
+across 20.
+
+Both `MatmulOneChunk` instantiations are now measured, not just `<true>`. The
+liveness case reads 33,554,496 bytes for `vt::MatmulBT` on 8 fresh workers and
+33,554,496 again for the `vt::Matmul` call after it — eight tiles both times
+rather than eight then seven, which is direct evidence that the two
+instantiations hold SEPARATE `thread_local` buffers. The retention figure is
+therefore per instantiation: up to **464 MiB**, not 232 MiB, for a process that
+runs both orientations at `K = 188160` on 20 workers.
+
+The reviewed gate's green was REPRODUCED rather than taken on report: the test
+file from `39b34c0c8` was restored over the repaired one, M-B applied to
+`cpu_ops.cpp`, and the result was `exit 0`, **2 cases, 13 assertions, 0 failed,
+`Status: SUCCESS!`** — the reviewed bound passing over a doubled per-worker
+allocation in this session's own build. `align_val_t` appears 0 times in the
+reviewed file and 13 times in the repaired one, so the aligned half needs no
+re-run to establish. The tree was restored to the same `sha256(cpu_ops.cpp)` and
+rebuilt green.
+
+Green after the repair: **5 cases, 38 assertions, 0 failed, exit 0**. The
+`sanitize-cpu` lane was run in its own configuration
+(`VLLM_CPP_SANITIZE='address,undefined'`, `VLLM_CPP_CUDA=OFF`,
+`UBSAN_OPTIONS=print_stacktrace=1`) against the ALIGNED-`operator new` widening:
+**5 cases, 36 assertions, 0 failed, exit 0**, no diagnostic. Rebuilding it after
+`--wrap` was added hit `No space left on device` (other sessions filled the
+shared disk to 100%), so that lane was NOT re-run with `--wrap` in place. In its
+place a standalone probe reproducing the whole mechanism — replaced plain and
+aligned `operator new`/`delete`, the five `--wrap` redirections, and a separate
+TU standing in for `cpu_ops.cpp` — was built and run under
+`-fsanitize=address,undefined`: clean build, all three C-allocator routes
+intercepted, alignment preserved, no diagnostic, exit 0. That establishes the
+mechanism against ASan and is not offered as a full-lane run.
+
+### Not claimed
+
+No GB10 number of any kind. The bound is a CPU bound; `vt::MatmulBT` on
+CUDA/ROCm/Vulkan is not covered. The counter sees every global `operator new`
+and nothing below it, so a raw `std::malloc` in the kernel is outside it (M-E
+above). No full-model render has been rerun, so nothing here says what such a
+run would now do — only that #1252 is not what stopped the last one.
+
+## MODEL-DIFFUSION-LTX25 FULL MODEL, the first render on the 21.004 B DiT, and the geometry ceiling beside it (2026-08-19, `row/MODEL-DIFFUSION-LTX25-FULLMODEL-RENDER`, binary `0a43a750` built from `7b9e207b1`, GB10, #1375 / #1252 / #1092)
+
+Every previous LTX-2.5 artifact was rendered on the DISTILLED arm. This is the
+first on the full `ltx-2.5-22b-dev-transformer-bf16.safetensors`: 42,018,190,584
+bytes, 4349 tensors, 21,004,025,600 elements, BF16 4059 / F32 290, zero
+quantisation scales. The checkpoint was verified semantically before use (header
+parses, tensor count matches, last tensor's `data_end` lands exactly on the file
+size), because a byte-count match alone does not prove a copy is whole.
+
+### The accepted measurement
+
+| | |
+|---|---|
+| Geometry | 768x448, 25 frames, 24 fps (1344 latent tokens) |
+| Wall | 2990 s (49.8 min), 2987 samples at 1 Hz |
+| Output | 25 frames + `audio.wav`, 1.01 s, 48 kHz stereo, plus `video.mp4` |
+| Own demand | 74.247 GiB above a 5.397 GiB baseline; peak system 79.644 GiB |
+| Min MemAvailable | 39.99 GiB against a 12.0 GiB hard floor |
+| GPU busy | 1010 of 2987 samples above 50% |
+
+Verifier verdict `PASS` on both arms, with the numbers rather than the verdict:
+25 distinct frame hashes of 25, zero near-uniform and zero near-black frames,
+adjacent-frame MAD 2.01 against far-frame (lag 12) MAD 9.34, a ratio of 0.215
+where uncorrelated noise gives ~1.0. Audio RMS -15.63 dBFS, envelope CV 0.112,
+spectral crest 52.0, active window fraction 1.0.
+
+### The rung that was refused, on the same lease
+
+1024x576/25f (2304 tokens) ran 3251 s and was refused by the governor rather than
+run to the wall: `first_dit = 481.5 s`, `per_forward ~ 162.0 s` from 7 resolved
+forward starts, so the recipe's fixed 60 forwards plus a 600 s tail project
+10803 s against that rung's 7153 s budget. The forward count is not tunable:
+`one_stage` at model version 2.5 resolves to 30 inference steps
+(`ltx2_pipeline.cpp:968` via `Ltx2Params24`), and `cfg_scale` 3.0 != 1.0 forces
+an unconditional forward per step (`ltx2_pipeline.cpp:521-523`), giving exactly
+2 forwards per step. So the ceiling here is geometry against lease length.
+
+### What this render is NOT
+
+It is not a full-fidelity reference render. `Ltx2DitForwardDevice` takes no
+`perturbations` argument, so the device-resident arm refuses the perturbed and
+isolated-modality passes by name (`ltx2_video.cpp:2738-2749`, #1092), while
+LTX-2.5's own params carry `stg_scale` 1.0 and `modality_scale` 3.0. The run used
+the engine's own sanctioned escape, `--video-stg-guidance-scale 0
+--audio-stg-guidance-scale 0 --a2v-guidance-scale 1.0 --v2a-guidance-scale 1.0`,
+which keeps real classifier-free guidance (video 3.0, audio 7.0) and gives up the
+STG term and the isolated-modality term. No oracle ran against it, so no parity
+claim is made and the speed axis stays `PENDING`.
+
+### Two instrument facts, recorded because both have already caused a wrong reading
+
+`gpu_edges = 0` means SATURATED, not idle. The counter looks for a GPU busy to
+idle transition, and the 1024x576 rung sat above 50% utilisation in 2704 of 3191
+samples, so there was no idle gap to sample. Reading that counter as "no work
+ran" is the available reading and the wrong one.
+
+`eu-stack` attaches inside the rc worker container and resolves ZERO frames, so
+every phase label came back `OTHER`. Phase attribution in this record is derived
+from the cpu%/rss signature instead: a single-threaded phase pins ~100% of one
+core of twenty with rss flat, weight loading ramps rss, and device staging shows
+above 800%. Do not budget on stack sampling in that container.
+
+### Why this was reachable at all
+
+Before #1252 the caption projection was a scalar triple loop with a `double`
+accumulator (`ltx2_text_encoder.cpp:61-70`) that could not reach an f32 FMA.
+Runs on the pre-fix binary measured single-core stretches of 1740 s and 1738 s,
+0.11% apart, reproducing the ~1731 s figure in #1087 twice in one render. After
+#1252 routed it through `vt::MatmulBT`, the same phase appears as `first_dit`
+481 s. That is the difference between a render that cannot fit a 4 h lease at any
+useful geometry and one that fits at 768x448.
+
+### Reproduce
+
+    rc run -d dgx:gpu0 --max-runtime 4h -- \
+      bash -lc 'BUDGET_S=14400 bash /workspace/ltx25-fullmodel/job/build_and_render.sh'
+
+The job builds `ltx2-gen` from `7b9e207b1` in-lease, refusing to proceed unless
+`vt::MatmulBT` is present in the unpacked source, then renders. Weights,
+`bin/` and `job/` are staged under `/workspace/ltx25-fullmodel` on the house NAS.
+Run evidence is `out/20260819T150230Z/` with `PROVENANCE`, `memguard.tsv`,
+`phases.tsv`, `verify.txt` and `render.log` per rung.
+---
+
+## MUSIC3-VOCODER-CONV — the vocoder decode window, dependent-chain vs tiled f64 accumulators, Jetson Thor sm_110 (2026-08-19, `row/MUSIC3-VOCODER-CONV-SPEED`, #672, #1334)
+
+### What was measured, and what it is not
+
+`music3::VocoderDecode` at the shipped `MiniMaxMusic3VocoderConfig` geometry —
+the call `Music3DecodeChunks` brackets as the `vocoder.decode_window` profile
+bucket (`minimax_music3_speech.cpp:397-398`) — over a sweep of latent window
+lengths, on the DEFAULT arm (`VLLM_CPP_VOCODER_DEVICE` unset, so the host
+kernel). Driver `tools/bench/music3_vocoder_conv_ab.cpp`, recipe
+`scripts/music3-vocoder-conv-ab.sh`.
+
+It is NOT an end-to-end synthesis. The weights are synthetic, so nothing here is
+a claim about audio, and **no checkpoint was read** — the staging assertion
+`SRC_BYTES == DST_BYTES` is therefore NOT APPLICABLE rather than skipped, because
+there is no path to assert. The e2e pair on the real checkpoint is owed
+(`minimax-music3.md` §18.9).
+
+It takes **no GPU clock window** and it is a CPU measurement, so nothing here is
+quotable as a per-kernel or cross-box figure.
+
+**53.6 s is the CUDA arm.** §15.2's profile ran `VLLM_CPP_VOCODER_DEVICE=cuda`,
+so the 53.6 s / 33.2 %-of-wall figure that defined this row is the DEVICE arm's
+decode window, while the default is `cpu` (§13.6) and that is the arm this row
+moves. No projection from 1.42x onto 53.6 s is made, because that would multiply
+two different arms.
+
+### The lease, and why it is the whole of the serialisation
+
+`rc` job `da3a2f94-90e3-4e97-b519-9456310673b7` on **`thor:gpu0`**,
+`--max-runtime 150m`. Worker `rc-worker-hqfj4`, `Linux 6.8.12-1021-tegra`
+aarch64, 14 cores. No `ssh`, no `rc hold`, no `$GPU_LOCK`. §13.10's whole speed
+axis is VOID because its arms went in over `ssh` under the file mutex while
+another session held the same box through `rc`, so the two mutexes did not
+exclude each other; this run has exactly one.
+
+### The arms — two trees, two build directories, two binaries
+
+Both built INSIDE the lease from two clones under `/tmp` (local overlay, not the
+CIFS `/workspace`), `CMAKE_BUILD_TYPE=Release` (`-O3`), CPU-only, `ninja -j 8`.
+
+| | before | after |
+|---|---|---|
+| ref | `f06b9e93d` (kernel only) | `c16bacc13` = `row/MUSIC3-VOCODER-CONV-SPEED` |
+| `src/vt/cpu/cpu_conv1d_general.cpp` sha256 | `6fb15174c1533b93b1bc58401e3a21fe0f4da9101729108d89118ee72fb146db` | `a0e429ace35364798dfa060f08002941544b3136a59c62712778df1c2174dba1` |
+| `vllm_music3_vocoder_conv_ab` sha256 | `d90e3912cd636666067df089b0267fbd428300cac80a29706113693b46610b22` | `41ba78d2b7a8b99ef34a32fd6620b1530c88ac1cc279a811d338482543b811b5` |
+
+`diff -rq` over `src/` names that ONE file as the only difference, and the recipe
+HARD-FAILS (`exit 5`) when the two binaries hash the same. That guard is there
+because the depth row's first Thor pair was VOID for precisely this — both arms
+were one binary, and the tell was identical call counts, since equal times are
+noise where equal binaries are identity (§16.6a).
+
+**The `after` ref `c16bacc13` was later rewritten** (the branch was rebuilt to
+fold `docs/USAGE.md` into the commit that owed it, because
+`check-doc-checkpoint` validates each commit individually). The kernel is
+BYTE-IDENTICAL across that rewrite — `a0e429ace3536479...` at both
+`c16bacc13` and the branch head — so the measurement is unaffected, and this is
+recorded rather than left for a reader to discover that the sha is unreachable.
+
+### Correctness, established before any speed number was read
+
+On the after arm, in the same container. `test cases`, `assertions` AND `Status`
+are quoted for each, because `assertions: 0` is a skip wearing a pass.
+
+| suite | result | rc |
+|---|---|---|
+| `test_ops_conv1d_general` | 9 cases, 375 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_host_parallel` | 8 cases, 877 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_vocoder1d` | 10 cases, 58 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_bigvgan` | 6 cases, 65 assertions, 0 failed, `SUCCESS!` | 0 |
+
+Three `[SKIP]` lines printed and are read rather than ignored: this worker has
+**no `nvcc`**, so the build is CPU-only and every CPU-vs-CUDA arm in that file
+did NOT run. The device provider is untouched by the change and §18.3's argument
+says its `memcmp` must still hold, but an argument is not a measurement, and the
+re-measurement is OWED.
+
+(That probe also CORRECTS §13.10's record of this worker: it carries `gcc`,
+`g++`, `cmake`, `ninja`, `make`, `python3` and `git`, and only `nvcc` is
+missing. §13.10 recorded "no compiler and no toolchain at all" and named a
+worker image as the blocker for re-measuring under a lease. For a CPU arm that
+blocker does not exist.)
+
+### The sweep — arms ALTERNATED, 3 rounds, best-of-3 per point
+
+`uptime` load average **3.29 before the build, 9.07 before the sweep, 8.48
+after** it, 0 other users. The box was NOT idle; both arms ate the same
+contention, which is what alternating them is for.
+
+Medians of the three rounds, in seconds:
+
+| latent frames | before | after | ratio | s/latent after |
+|---|---|---|---|---|
+| 20 | 5.5688 | 4.0831 | **1.364x** | 0.2042 |
+| 40 | 11.0535 | 7.8186 | **1.414x** | 0.1955 |
+| 86 | 23.5149 | 16.6614 | **1.411x** | 0.1937 |
+| 172 | 47.9201 | 33.6498 | **1.424x** | 0.1954 |
+| 344 | 97.4463 | 67.7083 | **1.439x** | 0.1974 |
+
+The loudest pair is KEPT and not dropped: 20 frames is the weakest ratio in the
+set, and it is the size §15.9 priced the device arm at. Round-to-round spread
+within an arm is under 1 % at every point (e.g. before@344: 97.1298 / 97.4463 /
+97.9561; after@344: 67.4177 / 67.7083 / 67.9122), so the 1.36-1.44x band is well
+clear of the noise.
+
+**Flat across a 17x span of work**, which is the signature of a RATE change
+rather than of a fixed overhead — the same test §13.10 applied to the device arm,
+run in the other direction.
+
+### The arms are BIT-IDENTICAL at full scale
+
+The driver prints an FNV-1a fingerprint over the whole stereo waveform. Across
+all six arm-rounds every length produced ONE value on both arms:
+
+| latent frames | fingerprint (both arms, all rounds) |
+|---|---|
+| 20 | `0x7c31c2ea73418503` |
+| 40 | `0x35a02aad4c9cb983` |
+| 86 | `0xc2d5eaf095d1c483` |
+| 172 | `0x2dc69976150a5903` |
+| 344 | `0x95e771d5f0051283` |
+
+Six processes, two binaries, one answer per length. A sum would let two different
+waveforms agree; a byte-wise hash cannot.
+
+### The x86 half, labelled as what it is
+
+Design-selection measurements, single-threaded, `taskset -c 2`, AMD Ryzen 9
+9950X3D, g++ 13.3.0, `-ffp-contract=off`, min of 5, `memcmp`-identical on every
+case. These SELECTED the design; they do not gate it, and they carry no clock
+attribution.
+
+| stage (per stereo stream, latent 20) | MMAC | shipped | tiled | |
+|---|---|---|---|---|
+| `conv_in` k7 1024->1536 | 220.2 | 0.1096 | 0.0322 | 3.40x |
+| `b0.res.conv1` k7 768 | 660.6 | 0.3289 | 0.0612 | 5.37x |
+| `b1.res.conv1` k7 384 d3 | 1321.2 | 0.6630 | 0.1260 | 5.26x |
+| `b1.res.conv2` k1 384 | 188.7 | 0.1585 | 0.0245 | 6.48x |
+| `b2.res.conv1` k7 192 | 1321.2 | 0.6760 | 0.1238 | 5.46x |
+| `b3.res.conv1` k7 96 | 660.6 | 0.3281 | 0.0613 | 5.35x |
+
+Every ratio in the table above is a KERNEL figure at one stage geometry, not a
+decode-window figure. The window also runs `vt::ConvTranspose1d`, the alias-free
+activations, the strided downsamples and the threadpool around all of them; the
+window ratios on this row are 1.36-1.44x (14 threads, §18.8a) and 2.16x (one
+thread, §18.8b), and the review that asked for this distinction measured the real
+project build at `-O2` single-threaded and got 2.56x / 2.67x on the window
+against the 5.2-5.8x the kernel gives there. The two quantities are never
+multiplied or substituted.
+
+The shipped kernel's rate is **1.76-1.86 GMAC/s on one core** of the 20-core Zen
+5 — 1.86 / 1.82 / 1.84 at ranks 8 / 16 / 32 and 1.7622 at rank 1024 for the depth
+decoder's loop of the same shape, recorded in the MUSIC3-DEPTH entry above, and
+1.827 for THIS loop at `in_per_group = 384`, `kernel = 7` under GCC 13.3 `-O2
+-ffp-contract=off`, pinned, measured by this row's fresh review on 2026-08-19.
+
+**The cycles-per-MAC conversion this entry first carried is WITHDRAWN.** It read
+"1.7-2.0 GMAC/s ... ~2.8-3.0 cycles per multiply-accumulate on a 5.0 GHz Zen 5
+whose `fadd` latency is 3", which is not self-consistent — 2.0 GMAC/s at 5.0 GHz
+is 2.5 cycles per MAC, and a strictly dependent chain of latency-3 `fadd`s cannot
+exceed 5.0 / 3 = 1.67 GMAC/s at all, so the top of that band sat above its own
+ceiling. The deeper problem is the instrument: the x86 host is a KVM guest
+reporting a nominal 4291.948 MHz with no `cpufreq` interface and
+`perf_event_paranoid` at 4, so neither its boost clock nor a cycle count is
+observable from inside it, and every cycles-per-MAC number here was a conversion
+through an assumed clock. What survives is the arithmetic identity — a dependent
+chain of latency-`L` adds cannot beat `clock / L` MACs per second — and the fact
+that breaking the chain, changing nothing else about the arithmetic, its order or
+its width, is worth 2.16x per core. `minimax-music3.md` §18.2 carries the full
+correction.
+
+`vt::ConvTranspose1d` measured separately: at `-O3` the compiler already
+vectorises its scatter and the op is **~6 % of the chain's wall** against
+`vt::Conv1d`'s ~94 %; at `-O2` it does not, and the fixed tap chunk is worth
+2.7-2.9x on the three kernels of 8 taps or more.
+
+### The single-thread pair: the KERNEL is 2.16x, the THREADPOOL returns 1.37x
+
+Second lease, `rc` job `5b98f95e-a37b-4fa2-8ee9-81959caa828f` on `thor:gpu0`,
+`--max-runtime 45m`, a FRESH container with both arms rebuilt from the same two
+refs into a NEW pair of binaries (`a3b14f2995...` before, `5b894d6b67...` after),
+so this is an independent build as well as an independent run. Latent length 20,
+the point where the 14-thread ratio is weakest:
+
+| threads | before | after | ratio |
+|---|---|---|---|
+| **1** (`VLLM_CPP_CPU_THREADS=1`) | 37.0508 s | 17.1751 s | **2.157x** |
+| 14 (default), same container, same binaries | 5.4845 s | 4.0182 s | **1.365x** |
+
+The 14-thread control reproduces the main run's 1.364x to three digits on
+different binaries, which is what makes the single-thread leg comparable rather
+than merely adjacent. Fingerprint `0x7c31c2ea73418503` on every leg of both runs.
+
+Scaling, which is where the cause is:
+
+| arm | 1 -> 14 threads | of a possible 14x |
+|---|---|---|
+| before | 6.76x | 48 % |
+| after | **4.27x** | **31 %** |
+
+Neither arm scales and the FASTER one scales worse — the signature of a shared
+resource that the tiled kernel reaches sooner because it needs the same bytes in
+less time. This does NOT identify the resource: no bandwidth counter was read and
+none is available on this worker, so "memory bandwidth" is the leading candidate
+and not a finding. What it does establish is that the next lever is the
+vocoder's PARALLEL DECOMPOSITION and not the kernel: `ForOutputRows` partitions
+output channels, so all 14 threads sweep the whole input tensor.
+
+It also settles the aarch64-vs-x86 question posed by the headline ratios: per
+core the same source is worth 2.16x here against ~5x on AVX-512, a gap the 4x
+narrower f64 vector explains without anything further.
+
+### No parity claim
+
+SGLang-Omni is still `gateable = no`. Every reference axis in `docs/BENCHMARKS.md`
+stays `PENDING`. Everything above is an internal two-arm number on one named box.
+
+## ENG-EXPERT-STREAM-DEVICE W0e — the CPU arm is measured and the CUDA arm loads without generating (2026-08-18/19, `dgx:gpu0`, source `95883dcae`, #1124)
+
+One `rc hold` (`edb4b3d0-5d6e-422f-ade6-bff5339e3396`, 22:13:12Z to 00:58Z,
+released by interrupting its client). GB10, sm_121a, driver 580.173.02, CUDA
+13.0.88, 20 cores, 122,502 MiB RAM, 30,625 MiB swap. Checkpoint
+`Qwen3.8-2.4T-A95B-UD-Q1_0` (369.97 GiB, 10 shards) from LOCAL NVMe at
+`/home/mudler/ckpt/qwen3.8-q1_0`. Prompt fixed as token ids
+`760,6511,314,9338,369`, greedy, 32 tokens, `--max-num-seqs 1`,
+`VT_GGUF_PREFAULT=0 VT_MOE_EXPERT_STREAM=1 VT_MOE_EXPERT_STREAM_STATS_EVERY=1`.
+Page cache dropped before every arm. Same binary both arms, built with CUTLASS
+4.5.0 and Triton AOT: the configure log reports `fp4-mma`, `cutlass-nvfp4`,
+`cutlass-fp8`, `marlin-nvfp4` and `fa2` all `ENABLED for [121a]`, plus
+`FlashAttention-2 prefill/decode: ENABLED` and `Triton AOT W2: embedded trees
+[sm_80;sm_86;sm_89;sm_90a;sm_100a;sm_121a]`.
+
+Harness: `benchmarks/expert_stream_device_w0e.cpp`, a thin C-ABI client. It
+exists because one generation has to yield three things no shipped command gives
+together: the generated token ids (`vllm_complete_tokens`), a per-step arrival
+timestamp (a logits processor used as a pure observer, which edits nothing so
+the argmax is unchanged), and the expert-stream counters at both ends of the run.
+
+### CPU arm, four runs, two slot counts
+
+| slots | arena | load | TTFT | steady s/token, steps 4-32 | generate | peak RSS | min avail | peak swap |
+|---|---|---|---|---|---|---|---|---|
+| 4000 | 9.28 GiB | 271.1 s | 85.90 s | median 11.22, min 9.62, max 12.51 | 502.3 s | 86.5 GiB | 16,840 MiB | not sampled |
+| 4000 | 9.28 GiB | 255.7 s | 79.09 s | median **11.05**, min 9.43, max 13.25 | 460.7 s | 86.5 GiB | 16,347 MiB | 6,883 MiB |
+| 8000 | 18.55 GiB | 261.6 s | 94.25 s | median 45.40, min 20.73, max 82.68 | 1643.2 s | 86.6 GiB | 6,985 MiB | not sampled |
+| 8000 | 18.55 GiB | 266.5 s | 132.74 s | median 39.98, min 16.06, max 94.30 | 1581.6 s | 86.6 GiB | 6,941 MiB | 30,625 MiB (all) |
+
+The 8000-slot rows are a MEMORY result, not a cache result. A bigger cache came
+out slower on every pairing of the medians: 3.62x same-rep on the pair carrying
+the publishable figure (39.98 against 11.05), 4.05x pairing rep 1 with rep 1
+(45.40 against 11.22), and 3.56x to 4.11x over all four pairings. It also came
+out much less steady, stated as the max/min ratio of the steady window: 3.99x in
+rep 1 (20.73 to 82.68 s) and 5.87x in rep 2 (16.06 to 94.30 s), against 1.30x
+and 1.40x at 4000 slots.
+
+The cause is NOT that the arena does not fit. 18.55 GiB of arena beside 62 GiB
+of dense weights is 80.55 GiB on a 119.63 GiB box, and the columns agree that
+nothing overflowed: peak RSS moves 86.5 -> 86.6 GiB for a 9.27 GiB arena delta.
+The columns that DO move are `min avail`, 16,347 -> 6,941 MiB, a 9,406 MiB fall
+that is about the arena delta, and peak swap, 6,883 -> 30,625 MiB, all of it.
+The best-supported reading of that pattern is page-cache displacement: the
+borrowed 370 GiB expert mapping is served out of whatever memory is free, the
+arena takes that memory, and the reclaim pressure it creates pushes anonymous
+pages to swap. That is a reading of these columns and not a proven mechanism.
+This run sampled no page-cache size and no major-fault counter, so it cannot
+separate displacement from plain reclaim pressure, and a run that wants to
+settle it has to sample both.
+
+The operational conclusion does not depend on which of the two it is. Both reps
+of each slot count reproduce each other, so this is the box and not a fluke,
+more slots is not a free knob, and the publishable figure is the 4000-slot one.
+
+Per-token deltas, 4000-slot rep 2, seconds: 79.09, 51.14, 12.52, then 11.69,
+11.51, 11.35, 11.59, 13.25, 11.58, 9.48, 12.16, 11.22, 11.42, 11.51, 11.05,
+10.70, 10.69, 11.93, 11.12, 11.26, 10.99, 9.85, 10.39, 9.58, 11.35, 10.17,
+11.03, 10.31, 9.43, 10.25, 10.38, 10.64. Step 1 is prefill; steps 2 and 3 are
+still filling a cold cache.
+
+G0-LIVE, gated on the DIFFERENCE and never the total. At 4000 slots the
+after-prefill snapshot reads `steps=1 hits=0 misses=10074 evictions=0 fills=4000
+bytes=9961472000 exhausted=6074` and the final one `steps=32 hits=37096
+misses=58538 evictions=48464 fills=52464 bytes=130654666752 exhausted=6074`, so
+the decode-phase delta is 0 over 31 decode steps. At 8000 slots the same pair
+reads 2074 and 2074, delta 0. Counters are byte-identical between the reps of
+each slot count.
+
+All four runs produced the same 32 ids:
+`11751,13,11751,369,264,3177,7172,303,279,17631,919,314,9338,11,383,279,181474,10629,13,1049,369,279,7526,3177,303,9338,321,369,3750,364,1141,25438`,
+which detokenize to " Paris. Paris is a city located in the northern part of
+France, on the Seine River. It is the largest city in France and is known for
+its iconic", `finish_reason=length`.
+
+### CUDA arm, seven attempts, zero decode steps
+
+| slots | arena | prompt tokens | load | RSS after load | steps | peak system used | peak swap |
+|---|---|---|---|---|---|---|---|
+| 8000 | 18.55 GiB | 5 | 267.2 s | 61.20 GiB | 0 | 100,215 MiB | not sampled |
+| 4000 | 9.28 GiB | 5 | 271.6 s | 61.20 GiB | 0 | 94,737 MiB | not sampled |
+| 4000 | 9.28 GiB | 5 | 255.3 s | 61.20 GiB | 0 | 120,351 MiB | 30,569 MiB |
+| 3500 | 8.12 GiB | 1 | 262.8 s | 61.20 GiB | 0 | 120,296 MiB | 28,138 MiB |
+| 3500 | 8.12 GiB | 1 | 265.3 s | 61.20 GiB | 0 | 120,347 MiB | 30,461 MiB |
+| 3500 | 8.12 GiB | 1 | 272.3 s | 61.20 GiB | 0 | 120,306 MiB | 30,172 MiB |
+| 64 | 0.15 GiB | 1 | 268.9 s | 61.20 GiB | 0 | 118,257 MiB | 30,211 MiB |
+
+The LOAD is new and it works: this checkpoint used to refuse on `--device cuda`
+(#1123) and now loads, and the `[expert-stream] ON` banner prints on the device
+arm, which is the first production evidence that W0b's CUDA leg is reached and
+answers true on real hardware.
+
+The last row is the diagnosis. A 0.15 GiB arena dies where an 18.55 GiB one
+does, 124x smaller and no further along, so the slot arena is not the cost. The
+in-place tower fallback is not the cost either: a 1-token prompt has a protected
+set of 93 x 3 x 10 = 2,790 slices, fits 3500 slots with no fallback taken, and
+behaves exactly like the 5-token prompt whose 13,950-slice set fits no arena
+here.
+
+Growth is anonymous, not file-backed, so the GPU is not pinning the mapping's
+pages through its address translation. That was the first hypothesis and it is
+refuted. Sampling the container process every 5 s: `RssAnon` 8.1, 13.9, 25.9,
+38.3, 49.4, 61.4 GB through the load while `RssFile` stays at 0.1-0.2 GB, then
+`VmSwap` 0, 5.4, 11.4, 16.5, 27.1, 31.0 GB inside the forward. Host `RssAnon`
+plus `VmSwap` reaches about 65 GB while the system reports ~119 GiB used, and
+the ~42 GiB difference is device memory this unified part does not charge to the
+process RSS. The non-expert weights are therefore resident twice, once as the
+host-side `OwnedTensor` and once as the `ResidentWeight` device staging copy.
+About 50 GiB of the 61.20 is the bf16 expansion the GDN V-head reorder forces on
+`attn_qkv` and `ssm_out`, already measured in
+[expert-streaming.md](specs/expert-streaming.md). Filed as
+[#1299](https://github.com/mudler/vllm.cpp/issues/1299).
+
+Each CUDA run was stopped by a guard that kills the container when MemAvailable
+plus SwapFree falls under a floor, because an out-of-memory kill on GB10 takes
+the machine down rather than the process. The guard is not what makes them fail:
+the last rows were climbing at roughly 10 GB of swap per minute with under
+600 MiB of swap left. The guard's own first version counted MemAvailable ALONE
+and killed two runs while 29 GiB of swap sat untouched, which is worth recording
+because it reported a box about to die when the kernel had a whole tier left.
+
+Contention: the lease excluded every other `rc` job. Two things it did not
+exclude are recorded rather than assumed away. An orphaned `VLLM::EngineCore`
+from an earlier session held 3.32 GiB of host RSS throughout; it is not this
+row's process and it was left alone. And the FIRST arm started seconds after the
+previous holder's four-hour render released the device, with the one-minute load
+average still at 17.5, which is one reason the first 8000-slot run is the
+noisiest of the four. Every later arm started from a quiet box.
+
+## ENG-EXPERT-STREAM-DEVICE W0f — `--device cuda` decodes a 369.97 GiB checkpoint on a 119.631 GiB GB10, and the token gate fails on a near-tie (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0F`, source `9c783a8be`, #1299)
+
+**Read the W0e section above first; this one is a different run of the same
+harness on a different tree.** W0e measured the CPU arm and found the CUDA arm
+loading without generating, at source `95883dcae`, which is W0f's parent. This
+section is the re-run WITH W0f, at `9c783a8be`. The CPU figures therefore do not
+agree between the two sections and must not be mixed: W0e's **11.05 s/token at
+4000 slots** is the standing CPU number, taken on its own lease against a live
+cache, and the CPU column below is a same-lease interleaved control for the CUDA
+arm rather than a second attempt at that measurement. Where they disagree, W0e's
+is the one `docs/BENCHMARKS.md` carries.
+
+**Setup.** One `rc hold` on `dgx:gpu0` (GB10, `sm_121a`, CUDA 13.0.1 in
+`vllmcpp-build:gb10`, driver 580.173.02). `Qwen3.8-2.4T-A95B UD-Q1_0`
+(369.97 GiB, 10 shards) from the host at `/home/mudler/ckpt/qwen3.8-q1_0`.
+Streaming ON, 4000 slots (9.28 GiB arena), greedy, 32 tokens, prompt ids
+`760,6511,314,9338,369`. Both arms on the SAME binary and the SAME lease, page
+cache dropped between them. Harness `w0e_gen`, logs under
+`/home/mudler/work/es-w0e/logs` on `dgx.casa`.
+
+**Two VOID runs first, and why they were void.** The first two CUDA attempts
+reproduced #1299 exactly (guard trip, zero decode steps) and looked like a W0f
+result. They were not: the build ran `cmake --build build --target vllm`, which
+is the STATIC library, while the harness links `build/libvllm.so`. That file was
+still the previous day's pre-W0f build, `LIB_EXIT=0` all the same. W0e's own
+`build.sh` had it right with `--target vllm-cli`. The corrected script records
+the shared object's mtime and sha256 before and after and greps the built binary
+for a string that exists only in the new code: `87c58eec` to `cf771cec`, marker
+count 0 to 1. A build that does not relink is now reported as STALE rather than
+as a pass.
+
+**G0-LIVE: PASS.**
+
+| Observable | CUDA | CPU |
+|---|---|---|
+| load | 266.330 s | 253.504 s |
+| RSS after load | 61.20 GiB | 62.45 GiB |
+| decode steps | 32 | 32 |
+| `exhausted` at step 1 / step 32 | 6077 / 6077 | 6074 / 6074 |
+| decode-phase `exhausted` delta | **0** | **0** |
+| peak RSS | 97.75 GiB | 92.19 GiB |
+| swap used at peak | 0 | 0 |
+| container exit | `W0E_DOCKER_RC=0` | `W0E_DOCKER_RC=0` |
+
+**What W0f moved, counted rather than inferred.** An RSS curve cannot separate
+"the branch declined and staged", "the branch re-homed and the pages did not come
+back" and "something else allocated", so `MakeHostBytesDeviceAliasable` reports
+its outcome per weight and `ResidentWeight` prints the split every 4 GiB on
+`VT_LOAD_STATS`. First-forward totals, at the point re-homing plateaus (call
+1361):
+
+| Outcome | Bytes |
+|---|---|
+| re-homed into an aligned host block, then aliased | **60.793 GiB** |
+| declined, misaligned GGUF borrow, still staged | ~9.2 GiB |
+| aliased in place (already 256-aligned) | 0.02 GiB at that point |
+
+On the CPU arm the same counter reads **0 calls**, which is the live control that
+the branch is platform-gated rather than an argument that it is.
+
+**G0-CORRECT: FAIL, on a measured near-tie.**
+
+```
+CPU  11751,13,11751,369,264,3177,7172,303,279,17631,919,314,9338,11,383,279,...
+CUDA 11751,13,11751,369,264,3177, 303,9338, 13, 9338,369,264,3046,303,4357,13,...
+                                  ^ first divergence, step 7
+```
+
+The CPU arm on this binary reproduces its four-times-recorded ids byte for byte.
+**That does NOT by itself acquit W0f, and an earlier draft of this entry said it
+did.** Both of the grounds first offered constrain only the arm W0f cannot reach:
+the CPU arm returns at `ResidentWeight`'s `is_cpu()` early return
+(the `is_cpu()` branch of `qwen3_5.cpp`'s `ResidentWeight`) roughly ninety lines above the alias branch (the `host_memory_is_device_addressable()` branch of the same function; no line number, because this change moves it), so
+`w0f-alias calls = 0` there is true by construction for every possible state of
+W0f, correct or corrupt. It shows the branch is platform-gated. It cannot
+discriminate "the arms' GEMM arithmetic differs" from "W0f moved a logit". The
+experiment that does is recorded under **Algo identity** below. An instrumented
+CPU run printing the top-2 logits per step gives the shape of the disagreement:
+
+| step | top-1 | logit | top-2 | logit | margin |
+|---|---|---|---|---|---|
+| 5 | 264 | 18.954491 | 279 | 18.668240 | 0.286251 |
+| 6 | 3177 | 19.375208 | 6037 | 18.425795 | 0.949413 |
+| **7** | **7172** | **18.779411** | **303** | **18.514702** | **0.264709** |
+| 8 | 303 | 20.953234 | 383 | 18.930481 | 2.022753 |
+| **9** | 279 | 19.850554 | 9338 | 19.827751 | **0.022802** |
+
+At the divergent step the CPU arm's own runner-up IS the token CUDA emitted,
+1.4 % behind; one step later the margin is 0.1 %. The two arms rank the same
+candidates and disagree about a coin flip. The declared gate still fails and the
+wave still stops.
+
+**G0-SPEED: VOID and NOT claimed**, because a speed number behind a failing
+correctness gate is the #912 F1 shape. Taken for the record only, over the 31
+DECODE steps of each arm (step 1 is prefill and is excluded), interleaved on one
+lease:
+
+| arm | n | min | median | max |
+|---|---|---|---|---|
+| CUDA | 31 | 3.012 | **4.598** | 126.456 |
+| CPU | 31 | 7.857 | **9.055** | 23.174 |
+
+The medians are the figures; the maxima are the first decode step after prefill,
+when the slot cache is cold, and quoting either end of the range would be
+quoting the least representative number in it. **NO RATIO IS WRITTEN HERE, and
+the omission is deliberate.** A ratio of these two medians is not a result: the
+correctness gate that would license one FAILS, so it may not be published,
+quoted, or carried into `docs/BENCHMARKS.md`. An earlier revision of this entry
+did write the figure out in digits in order to disown it, which is the shape
+this repository has watched turn a disowned number into a measured one -- the
+digits survive a copy-paste and the disclaimer does not. Nothing is lost by
+removing them, because both medians are in the table above and anyone entitled
+to the quotient can do the division; what is removed is the pre-computed string
+a later reader can lift without its gate. Note also that this CPU arm is FASTER
+than the 11.05 s/token previously recorded for the CPU arm at 4000 slots, so the
+same-lease interleaved denominator here and that earlier figure are not the same
+measurement and must not be mixed.
+
+**Algo identity: the discriminating experiment, and it clears W0f.** The grounds
+first offered above could not separate "the arms' GEMM arithmetic differs" from
+"W0f moved a logit", so the mechanism was measured directly on `thor:gpu0`
+(NVIDIA Thor `sm_110`, driver 13020, cudart 13000, cuBLASLt 130101, `rc` job
+`c625e836`, 2026-08-19 13:50). Thor answers this branch's own predicate TRUE —
+`cudaDevAttrPageableMemoryAccess = 1`, `cudaDevAttrIntegrated = 1` — so it is a
+member of the population W0f serves, and a `cudaMalloc` pointer there is a real
+device pointer exactly as on GB10.
+
+The probe transcribes both cuBLASLt formulations out of
+`src/vt/cuda/cuda_matmul.cu` at this branch — the row-major NN
+`MatmulKernelCuda` (weight is operand B) and the column-major TN
+`MatmulBTKernelCuda` (weight is operand A) — over six shapes off the
+checkpoint's own `embedding_length = 8192` at M = 1, 5 and 32. Twelve
+measurements, `PROBE_FAILURES=0`:
+
+| Question | Result |
+|---|---|
+| Does a repeated heuristic call return the same selection? | **12/12 identical** |
+| Is the tree's unset preference the documented 256 default? | **12/12** `default == MIN_ALIGNMENT 256` |
+| Does STATING a weaker 16-byte promise move the selection? | **12/12 unchanged** (`256 == 16`) |
+| `cublasLtMatmul` with weight from `cudaMalloc` vs a 256-aligned HOST block | **12/12 bit-exact**, 0 differing elements, every status `SUCCESS` |
+| ...and from a 16-aligned-only host block | 12/12 bit-exact as well |
+
+The selection is reported in full rather than by id alone. At M=1 N=8192 K=8192,
+both layouts: `id=66 tile=573 stages=35 splitK=5 reduction=2 swizzle=0 custom=1
+inner=0 ws=163856 waves=0.8000`, identical across all four queries. **The
+instrument discriminates:** five DIFFERENT configurations appear across the six
+shapes (tiles 393, 537, 573, 576; workspaces 0 through 5,242,896), so a uniform
+answer is not a probe that reports one thing regardless.
+
+The structural reason sits in the API and needs no lease:
+`cublasLtMatmulAlgoGetHeuristic` takes `(handle, operationDesc, Adesc, Bdesc,
+Cdesc, Ddesc, preference, count, results, returned)` and **no operand
+pointers**, so the only channel by which alignment can reach the heuristic is
+`CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_*_BYTES`, which this tree never sets.
+
+**Conclusion on Thor: identical algo AND bit-exact output, so W0f cannot move a
+logit there.** What that leg could not establish is that it ran on Thor and not
+on the GB10 the token gate ran on: same predicate class, not the same silicon.
+
+**The GB10 leg RAN, on the target silicon, and it agrees.** `rc` job
+`7c7a05e9-be87-48f4-94ae-1bbe0340f063` on `dgx:gpu0`, worker `rc-worker-4b8lj`,
+2026-08-19 17:47 UTC, output `/workspace/w0f-algo-probe/out-rc-worker-4b8lj-20260819T174748.txt`.
+The box re-derived inside the job rather than inherited: `NVIDIA GB10 sm_121`,
+driver 580.173.02, cudart 13000, driver 13000, cuBLASLt 130101 resolved from
+`/usr/local/cuda-13.0/lib64/libcublasLt.so.13.1.1.3`, headers at
+`/usr/local/cuda/include`. It answers this branch's predicate TRUE in the job's
+own print: `pageableMemoryAccess=1 integrated=1 hostPageTables=1 uva=1`. The same
+six shapes crossed with the same two formulations, `PROBE_EXIT=0`,
+`PROBE_FAILURES=0`:
+
+| Question | Result on GB10 |
+|---|---|
+| Does a repeated heuristic call return the same selection? | **12/12 identical** (`VERDICT-A repeat-identical=YES`) |
+| Is the tree's unset preference the documented 256 default? | **12/12** (`VERDICT-B default==256:YES`) |
+| Does STATING a weaker 16-byte promise move the selection? | **12/12 unchanged** (`256==16:YES`) |
+| `cublasLtMatmul` with weight from `cudaMalloc` vs a 256-aligned HOST block | **12/12 bit-exact**, `differing=0`, every status `SUCCESS` |
+| ...and from a 16-aligned-only host block | 12/12 bit-exact as well, no sync error |
+
+The pointers are printed per case, so the arms are not assumed to differ: e.g.
+`d_w=0x331200000 %256=0 | host256=0xed1243ffd000 %256=0 | host16=0xed123bffa010
+%256=16`. The largest case compared `out_elems=262144` with `differing=0`.
+
+**The GB10 instrument discriminates too**, and more finely than Thor's: at least
+five distinct selections appear across the twelve measurements — `id=23 tile=21
+stages=10 splitK=1 ws=0`, `id=13 tile=0 custom=75 ws=0`, `id=21 tile=11 stages=8
+splitK=64 ws=1920`, `id=13 tile=0 custom=96 splitK=16 ws=32784`, `id=21 tile=5
+stages=19 splitK=5 ws=5120`, `id=21 tile=5 stages=20 splitK=9 ws=737280` and
+`id=67 tile=18 stages=35 custom=28 ws=0` — so a uniform verdict on alignment is
+not an instrument that returns one answer regardless. The GB10 selections differ
+from Thor's, which is expected of a different architecture and is itself evidence
+that the heuristic was re-resolved rather than replayed.
+
+**So the attribution is now measured on the target silicon: W0f cannot move a
+logit, and the step-7 divergence is not the alias.** What it does NOT establish
+is what the divergence IS. "The two arms' GEMM arithmetic" remains the standing
+hypothesis and it is not measured; naming the operation that first differs is
+owed. The 16-aligned arm also came back bit-exact on both boxes, which is NOT a
+licence to lower `kDeviceAliasAlignment`: twelve shapes is not the enumeration,
+and cuBLASLt is still promised 256.
+
+**Owed from this run.** The CUDA arm's own top-2 margin: the scratch instrument
+that reads `logits` in the completion callback SIGSEGVs on that arm
+(`SCRIPT_EXIT=139`), and **why it faults is UNMEASURED**. An earlier draft wrote
+"almost certainly because the pointer is not host memory there", which is a
+hypothesis: nothing printed the pointer, nothing called
+`cudaPointerGetAttributes` on it, and no fault address was recorded. In a change
+whose central risk is handing device kernels host pointers, a segfault whose
+cause was guessed at is the finding that must not be dismissed, so it is carried
+as unmeasured. The next lease prints `cudaPointerGetAttributes(logits)` in that
+callback first. Also owed: a ratified gate for a two-arm comparison whose greedy
+path is this finely balanced, which `AGENTS.md` reserves as an explicit operator
+decision. And still owed, now that the alias is excluded on the target silicon:
+WHAT the step-7 divergence is. Excluding one cause is not identifying another,
+and the next traceable hypothesis is a per-operation two-arm comparison of the
+step-7 forward, first differing tensor named.
+
+---
+
+## TT host-free decode: the 22/22 argmax is withdrawn; the operator gate records a step-46 near-tie (#1476, #1488) (2026-08-20)
+
+Row `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, evidence moved out of its
+`docs/BENCHMARKS.md` cell by the 220-char entry budget.
+
+The 2026-08-16 implementer figure "22/22 argmax vs the per-step-copy baseline"
+predates the final on-device `cur_pos` plus_one integration and does not
+reproduce on the landed tree. The operator gate at `206afb63` (2026-08-20) found
+captured replay deterministic-degenerate (word salad from ~generated token 30 =
+the first KV block boundary) while host-free eager stayed coherent; issue #1476
+carries the full derivation.
+
+After the fix (operator rerun at `2b06f98a`, identical bytes to the implementer
+and re-review runs): captured `Hello`/80-tok answer 284 bytes md5
+`3b5a579d82d58396fe4e344826946403`, eager 286 bytes md5
+`f5ffdf6aa290e11fd187673c2f3c52bb`, first divergence at byte 174 = decode step
+46, a swapped top-2 near-tie (captured gap 0.25 nats, eager 0.125 nats; the
+0.5-nat bar of `scripts/qwen3-neartie-gap.py`). 45/80 steps argmax-identical;
+the 34 later differences are prefix divergence. `VT_TT_RECAPTURE_EVERY=8` (9
+captures / mid-generation re-captures) is byte-identical to the plain captured
+arm. The #1476 degeneration is gone — G1 (`[C,1]` page_table) and G4
+(steady-state refresh suppressed) mutations each regenerate the exact word
+salad; G2 (regime early-return) reds at step 11 under the recapture arm.
+
+Whether the step-46 flip is teacher-forced-benign stays UNADJUDICATED on the
+full engine: that is #1488's `VT_DUMP_IDS` re-adjudication, the same band as
+the paged-engine anchor drift it owns. No speed number is quoted from any of
+these runs; a same-binary A/B on an idle host precedes any future figure.
+## MUSIC3-E2E-ON-MAIN — five merges priced end to end, and the vocoder device arm answered on an idle box (2026-08-20, `row/MUSIC3-E2E-ON-MAIN`, arms `d0598a255` and `a50c57d69`, `thor:gpu0` sm_110, #672 / #1512 / #1516)
+
+### What was measured
+
+`minimax-music3-gen` end to end on the real 28.5 GB `MiniMaxAI/MiniMax-Music3`
+diffusers checkpoint, instrumented with `VLLM_CPP_MUSIC3_PROFILE=1`
+(`src/vllm/model_executor/models/music3_profile.h`, off by default). Seventeen
+runs in one job: three engagement controls at `--duration 0.24 --steps 2`, a
+four-cell matrix at `--duration 4 --steps 4 --seed 7` over three alternated
+rounds, and both vocoder arms at the developer's `--duration 20 --steps 30`.
+
+It takes **no GPU clock window** (`.agents/benchmarking.md`). Every figure is a
+within-run split or a same-box A/B and none is quotable as a per-kernel or a
+cross-box number. It is not a parity ratio: no oracle ran.
+
+### The lease
+
+`rc` job **`c206ec87-65eb-4d0d-93ad-05538325e66e`** on **`thor:gpu0`**,
+`--max-runtime 480m`, submitter `claude/music3-e2e-main`. Worker
+`rc-worker-m4d7t`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, NVIDIA Thor
+capability (11,0), driver 595.78, 169 GB free on the overlay root, `/workspace`
+the CIFS NAS. No `ssh`, no `rc hold`, no `$GPU_LOCK`: the lease is the whole of
+the serialisation, which is what `.agents/specs/minimax-music3.md` §13.10 did not
+have and why its numbers are VOID.
+
+`uptime` **3.27 with 0 logins** at job start, which is this box's idle floor
+(§18.8a read 3.29 on the same worker). 4.8-16 across the timed runs, and the
+peaks are our own 14-thread host vocoder: the load rises inside a
+`vocoder.decode_window` and falls between runs. `dgx:gpu0` carried another
+session throughout and `thor:gpu0` carried nobody.
+
+### The arms
+
+| | OLD | NEW |
+|---|---|---|
+| commit | `d0598a255427d2ddc3235ce26cd714c1224c4b8e` (`main` before PR #1330) | `a50c57d69b5c9077d1aaddef4457497789a1207d` (`origin/main`) |
+| checked-out sha asserted | yes, `FATAL_WRONG_SHA` guard | yes |
+| clone | own `git clone`, `FATAL_CLONE` guard | own clone |
+| build dir | `/tmp/b-old` | `/tmp/b-new` |
+| build time | 291 s | 303 s |
+| `minimax-music3-gen` sha256 | `91387d74e27cdf64492dd2632ad1162febd606bd4d3eef5f5f87df4ffca4bfa2` | `e2742d4ab471159feec407cc72ddfd430baada0ad931fff8599b35daa192d9bb` |
+
+`CMAKE_BUILD_TYPE=Release`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, `ninja -j 6`, both
+inside the lease, after `apt` installed `cuda-nvcc-13-0 cuda-cudart-dev-13-0
+libcublas-dev-13-0` (nvcc 13.0.88). `diff -rq` reports 73 files differing under
+`src/` and 49 under `include/`.
+
+**The sha256 pair is NOT the arms-differ evidence, and that is
+[#1516](https://github.com/mudler/vllm.cpp/issues/1516).** `minimax-music3-gen`
+is a 72 744-byte ABI client of the SHARED `vllm::shared`
+(`examples/CMakeLists.txt:425-426`, `CMakeLists.txt:2633`); both arms are that
+size to the byte, no `CMAKE_SKIP_BUILD_RPATH` is set, and two build directories
+give two RPATH strings whatever the source says.
+
+**What separates the arms is the bucket SET.** `Music3SelectDepthArm`
+(`minimax_music3_llm.cpp:569-586`) brackets its staging as `ar.depth_staging`
+only when it stages, and the loop takes the device path iff the arm is engaged
+(`:469-476`). Three controls, `--duration 0.24 --steps 2`, 56 depth forwards
+each:
+
+| control | `ar.depth_staging` | `ar.depth_forward` | denoise | wall |
+|---|---|---|---|---|
+| OLD `--device 1` | absent | 5.982 s | `dit_device` 0.472 | 22.001 s |
+| NEW `--device 1` | **0.917 s** | **0.352 s** | `dit_device` 0.478 | 19.440 s |
+| NEW `--device 0` | absent | 5.814 s | `dit_host` **196.691 s** | 286.569 s |
+
+One binary cannot emit two different bucket sets. `Music3DepthDeviceForwardCount()`
+(`minimax_music3_depth_device.cpp:154`) would have been the direct instrument and
+is readable only from `test_minimax_music3_ar`, so it is unavailable to any
+production run.
+
+### Staging
+
+| check | result |
+|---|---|
+| source filesystem | `findmnt /workspace` -> `//192.168.68.102/Data[/rc] cifs` |
+| path actually read | `findmnt -T /tmp/ckpt` -> `overlay overlay /` |
+| copy completed | `SRC_BYTES=28517617303` = `DST_BYTES=28517617303`, hard fail on mismatch |
+| against the recorded count | `EXPECT_BYTES=28517617303`, equal |
+| staging cost | `STAGE_SECONDS=999`, 28.5 MB/s off CIFS |
+| local read ceiling | `cat` of all 28.518 GB: 6 s = **4752 MB/s** |
+| what the loader paid | `load.ar_weights` 5.37-6.21 s, `load.acoustic_weights` 1.93-2.13 s |
+
+§15.6 measured 780.015 s cold-CIFS and 5.689 s local for `load.ar_weights`; this
+job reads 5.37 s, so the staging result reproduces and no load figure implies
+more than the control.
+
+### The matrix — 4 s / 4 steps / 100 frames / seed 7, three alternated rounds
+
+`--device 1` on every run. `VLLM_CPP_VOCODER_DEVICE` unset resolves to `kCPU`
+(`vocoder1d.cpp:96-98`) and is the shipped default; `=cuda` is the opt-in arm.
+Medians of three, raw triples beneath.
+
+| bucket | OLD·host | OLD·cuda | NEW·host | NEW·cuda |
+|---|---|---|---|---|
+| wall clock | **166.038** | **165.449** | **48.070** | **52.684** |
+| | 166.038/165.610/167.042 | 166.039/165.011/165.449 | 48.193/48.070/47.918 | 52.435/52.684/52.795 |
+| `ar.depth_forward` (808) | 80.728 | 81.070 | 4.272 | 4.305 |
+| | 80.118/80.728/81.694 | 81.513/80.734/81.070 | 4.247/4.289/4.272 | 4.305/4.312/4.294 |
+| `vocoder.decode_window` (1, 344 latents) | 54.091 | 53.580 | 15.078 | 19.288 |
+| | 54.091/54.042/54.646 | 53.580/53.593/53.553 | 15.107/15.078/14.897 | 19.218/19.288/19.306 |
+| `ar.lm_decode_step` (100) | 12.338 | 12.349 | 9.517 | 9.516 |
+| `denoise.dit_device` (4) | 5.060 | 5.060 | 5.048 | 5.050 |
+| `ar.depth_staging` | — | — | 0.908 | 0.915 |
+| WAV sha256 | `8a997f193b589adac37abe0a77ad029e` | same | `9b7d0a2a92aa3388010349fd70742fb6` | same |
+| RMS / peak | 0.01943 / 0.23248 | same | 0.02940 / 0.38700 | same |
+
+The loudest round is kept: round 3's OLD·host is the slowest leg in the set at
+167.042 s and stays in the median.
+
+**The instrument reproduces §16.6b**, whose AFTER arm `4568c6e71` read wall
+163.00 s, `ar.depth_forward` 78.316 s, `vocoder.decode_window` 53.605 s and
+`ar.lm_decode_step` 12.339 s. OLD·cuda here reads 165.449 / 81.070 / 53.580 /
+12.349 across two different commits, two jobs and two prompts.
+
+### The developer's configuration — 20 s / 30 steps / 500 frames / 4 windows
+
+One run per vocoder arm on NEW, checkpoint staged, beside the recorded §15.7
+figure which was taken on CIFS on pre-#1238 code.
+
+| bucket | recorded §15.7 | NEW·cuda | NEW·host |
+|---|---|---|---|
+| wall | **3269.789** | 624.127 | **595.899** |
+| `denoise.dit_device` | 370.746 / 120 | 370.634 / 120 | **370.556 / 120** |
+| `vocoder.decode_window` | 421.670 / 4 | 150.060 / 4 | **122.169 / 4** |
+| `ar.lm_decode_step` | 83.629 / 500 | 56.082 / 500 | 56.174 / 500 |
+| `ar.depth_forward` | 1710.456 / 7014 | 21.055 / 4008 | 21.099 / 4008 |
+| `ar.depth_projection` | 49.580 / 7014 | 7.090 / 3507 | 6.966 / 3507 |
+| `ar.semantic_guide_and_draw` | 1.725 / 501 | 3.635 / 501 | 3.701 / 501 |
+| `ar.depth_head_and_draw` | 3.300 / 3507 | 3.733 / 3507 | 3.489 / 3507 |
+| `load.ar_weights` | 397.909 | 5.369 | 5.442 |
+| `load.acoustic_weights` | 210.482 | 2.035 | 1.979 |
+| `unattributed` | 5.540 | 0.331 | 0.331 |
+| WAV sha256 | — | `55856deb3b5b727a4ca4fcc473e01a56` | same |
+| audio | 20.016 s | 20.016 s, RMS 0.07155, peak 0.63320 | same |
+
+### The results
+
+| claim | before | after | ratio |
+|---|---|---|---|
+| wall, 4 s, host vocoder both sides | 166.038 s | 48.070 s | **3.45x** |
+| wall, 4 s, CUDA vocoder both sides | 165.449 s | 52.684 s | **3.14x** |
+| wall, 4 s, each side's best arm | 165.449 s | 48.070 s | **3.44x** |
+| `ar.depth_forward`, 808 calls both sides | 80.728 s | 4.272 s | **18.90x** |
+| `vocoder.decode_window`, host arm, 344 latents | 54.091 s | 15.078 s | **3.59x** |
+| `vocoder.decode_window`, CUDA arm, 344 latents | 53.580 s | 19.288 s | **2.78x** |
+| wall, 20 s / 30 steps, as measured | 3269.789 s | 595.899 s | **5.49x** |
+| wall, 20 s / 30 steps, both loads excluded | 2661.398 s | 587.951 s | **4.53x** |
+| `denoise.dit_device`, 120 calls both sides | 370.746 s | 370.556 s | **1.000x** |
+
+The 20 s pair crosses two jobs AND two storage states, so both the raw ratio and
+the load-excluded one are given and neither alone is quoted as the answer.
+
+**The vocoder CUDA arm still LOSES.** At 344 latents it is 0.782x of the host arm
+on NEW and 1.010x on OLD; at ~689 latents x 4 windows it is 0.814x. The f32
+accumulator is worth **2.78x on the device arm**, so §13.10's fp64 suspicion was
+correct and Thor's fp64 rate was a large term; the arm loses because #1356 and
+#1474 together moved the host kernel 3.59x. Taken on an idle box under one lease,
+which is what §13.10's VOID axis lacked.
+
+**The device vocoder is byte-identical to the host vocoder end to end**, at f64
+and at f32: six OLD runs wrote one WAV hash, six NEW runs wrote one WAV hash, and
+the 20 s pair wrote one hash across both arms. This is the re-measurement §18.9
+carries as owed for §13.4's `memcmp` against the tiled host kernel.
+
+### Where the time goes on current main
+
+`--device 1`, default host vocoder, staged, 20 s / 30 steps, wall 595.899 s:
+
+| rank | bucket | seconds | % | calls |
+|---|---|---|---|---|
+| 1 | **`denoise.dit_device`** | **370.556** | **62.24** | 120 |
+| 2 | `vocoder.decode_window` | 122.169 | 20.52 | 4 |
+| 3 | `ar.lm_decode_step` | 56.174 | 9.44 | 500 |
+| 4 | `ar.depth_forward` | 21.099 | 3.54 | 4008 |
+| 5 | `ar.depth_projection` | 6.966 | 1.17 | 3507 |
+| 6 | `load.ar_weights` | 5.442 | 0.91 | 1 |
+| 7 | `ar.semantic_guide_and_draw` | 3.701 | 0.62 | 501 |
+| 8 | `ar.depth_head_and_draw` | 3.489 | 0.59 | 3507 |
+
+§15.2 read the same bucket at 0.34 % and wrote "the GPU is not the problem, and
+no further DiT work will move this number". The DiT did not get slower — 370.6 s
+against 370.7 s over an identical 120 calls — everything around it got faster.
+
+### Four things that did not behave as the record predicts
+
+1. **The untiled host vocoder is 54.091 s here and 97.4463 s in §18.8a's kernel
+   bench, at the same 344 latents through the same call.** A 1.80x instrument
+   disagreement. Neither is withdrawn: this one is e2e on the real checkpoint,
+   that one is a two-binary A/B internally consistent across a 17x span of work.
+   Hypothesis, labelled as one: synthetic pseudo-random weights can drive an f64
+   dependent accumulate chain into subnormals in a way a trained checkpoint does
+   not. No counter was read on either side. **Consequence: the 1.364x-1.439x
+   tiling figure must not be multiplied onto an e2e bucket**, and the 3.59x above
+   is tiling AND f32 together, not decomposable from these data.
+2. **`ar.lm_decode_step` fell 1.30x at 4 s and 1.49x at 20 s across unchanged
+   call counts**, and nothing in the five merges touches the LM decode. §16.6b
+   recorded 1.21x of the same shape with a smaller-working-set hypothesis; it
+   recurs, larger, still unmeasured.
+3. **Two host remainders got SLOWER**: `ar.semantic_guide_and_draw` 1.725 ->
+   3.701 s over 501 unchanged calls, `ar.depth_head_and_draw` 3.300 -> 3.489 over
+   3507. 1.2 % of the run, named rather than absorbed.
+4. **Round 1's two OLD runs agree to 1 ms on wall** (166.038, 166.039) while
+   every bucket inside them differs. Two runs, not one; recorded because an equal
+   wall clock is the tell §16.6a taught this lane to distrust, and here the
+   bucket table is what refutes it.
+
+### Reproduce
+
+```sh
+rc run -d thor:gpu0 --max-runtime 480m --as claude/music3-e2e-main -- \
+  bash -c "bash /workspace/music3-e2e/run.sh 2>&1 | tee /workspace/music3-e2e/log-<ts>.txt"
+```
+
+The recipe is `/workspace/music3-e2e/run.sh` on the shared NAS; the raw log is
+`/workspace/music3-e2e/log-20260820T221735Z.txt`, 1080 lines, carrying every
+bucket table for all seventeen runs. The checkpoint is `/workspace/music3/ckpt`
+and the lyrics `/workspace/music3/lyrics.txt`; `ar.prompt_tokens` is **282** on
+every run here, against §15.8's 223, so the prompt is not the one §16.6b used and
+`ar.lm_prefill` is the only bucket that difference reaches.
+
+## 2026-08-21 — MUSIC3-DIT-SPLIT: the flow-matching DiT is ATTENTION-bound, not GEMM-bound — `vt::AttentionCross` is 43.9% of the forward for 4.0% of its flops (#672, #1542, #1555)
+
+**Result: ACCEPTED as a within-run SPLIT and a same-box A/B. NOT a per-kernel or
+cross-box figure** — `nvidia-smi` reports `clocks.sm` as `[N/A]` on this device,
+so no clock window was taken (`.agents/benchmarking.md` §The clock is part of the
+measurement). No parity claim: vLLM and vLLM-Omni register nothing for this
+architecture.
+
+**Box and lease.** `rc` job `0f95377f-70dd-4bf8-93b5-8e44fd762713` on
+`thor:gpu0`, `--max-runtime 180m`, worker `rc-worker-m4d7t`, Linux
+6.8.12-1021-tegra aarch64, 14 cores, NVIDIA Thor sm_110, driver 595.78, boot id
+`c99b7805-6e26-47a7-bc9d-93d592d676a6`. No `ssh`, no `rc hold`, no `$GPU_LOCK`:
+the lease is the whole of the serialisation. `uptime` **3.46 with 0 logins** at
+job start — this box's idle floor (§20.1 read 3.27, §18.8a 3.29) — rising to
+10-13 inside our own 14-thread host vocoder and falling between runs.
+
+**Tree and build.** `0e18f8afd` (`row/MUSIC3-DIT-SPEED`), asserted equal to the
+expected sha before anything was built. `Release`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_BUILD_TESTS=ON`, nvcc 13.0.88.
+
+**Checkpoint STAGED, and asserted.** `findmnt /workspace` ->
+`//192.168.68.102/Data[/rc] cifs`; `findmnt -T /tmp/ckpt` -> `overlay overlay /`.
+`SRC_BYTES=28517617303` = `DST_BYTES=28517617303` = the recorded
+`EXPECT_BYTES`, hard fail on mismatch. `STAGE_SECONDS=708` = 40.3 MB/s off CIFS.
+
+**Arms and the behavioural control.** #1516 records the two-binary sha256 guard
+as UNFALSIFIABLE for `minimax-music3-gen` (a 72 744-byte client of the shared
+`vllm::shared`), so the arms here are ONE binary under two environments and the
+control is the BUCKET SET: `dit.*` spans are present exactly when
+`VLLM_CPP_MUSIC3_DIT_SPANS=1`, and `ar.depth_staging` (0.754-0.757 s) is present
+in every run, so the depth device arm engaged throughout.
+
+### The split — `--duration 20 --steps 2 --device 1`, 8 calls = 16 forwards
+
+Geometry MEASURED rather than inferred: `dit.seq_sum / 16 = 690`,
+`dit.length_sum / 16 = 689`.
+
+`denoise.dit_device` **25.104 s**; the sixteen spans sum to **25.100 s** — a
+**99.98 % partition**.
+
+| group | seconds | % of the DiT | TFLOP/forward | TFLOP/s |
+|---|---:|---:|---:|---:|
+| **`dit.attn` (`vt::AttentionCross`)** | **11.010** | **43.9 %** | **0.140** | **0.204** |
+| the four `vt::MatmulBT` GEMMs | 13.390 | 53.3 % | 3.334 | **3.98** |
+| norms, rope, SiLU, packing, readback | 0.700 | 2.8 % | — | — |
+
+Per span: `dit.attn` 11.010, `dit.ff_in` 6.635, `dit.ff_out` 3.238, `dit.qkv`
+2.591, `dit.attn_out` 0.926, `dit.silu` 0.225, `dit.temb` 0.167, `dit.pre`
+0.122, `dit.rope` 0.062, `dit.norm1` 0.046, `dit.norm2` 0.045, and
+`dit.pack`/`dit.rope_build`/`dit.post`/`dit.readback`/`dit.untranspose` 0.033
+between them.
+
+**The attention kernel does 4.0 % of the forward's arithmetic in 43.9 % of its
+time — 19.5x slower per flop than the GEMMs beside it, on the same tensors, in
+the same forward, on the same device.** At the developer's 30 steps that is
+0.6881 s x 240 forwards = **165.2 s of the 370.556 s `denoise.dit_device`
+bucket and 27.7 % of the whole 595.9 s run**. Owned by #1555.
+
+**This refutes the arithmetic that opened the row.** Spec §21.1 divided §20's
+370.556 s by 240 forwards and 3.33 TFLOP of GEMM and reported "~2.2 TFLOP/s".
+The GEMMs run at **3.98 TFLOP/s**; 2.2 was an average over a forward that is
+nearly half something else, and every inference drawn from it is superseded.
+
+### The instrument's own perturbation, MEASURED rather than assumed
+
+Arms ALTERNATED `on, off, on, off` in one job on one staged checkpoint:
+
+| | spans ON | spans OFF | ratio |
+|---|---:|---:|---:|
+| round 1 `denoise.dit_device` (8 calls) | 25.104 | 24.737 | 1.0148 |
+| round 2 `denoise.dit_device` (8 calls) | 25.117 | 24.749 | 1.0149 |
+| round 1 wall | 252.902 | 253.577 | 0.9973 |
+| round 2 wall | 253.049 | 253.097 | 0.9998 |
+
+**The 331 synchronizes per forward cost 1.49 % of the DiT bucket, reproduced to
+0.01 % across two independent pairs, and do not register on wall clock at all.**
+So `denoise.dit_device` with the flag unset stays comparable to §15.7's
+370.746 s and §20's 370.556 s value for value, and the split above is
+trustworthy at the 1.5 % level.
+
+Two spans-ON rounds agree to better than 0.2 % on EVERY span (`dit.attn` 11.010
+vs 11.025, `dit.ff_in` 6.635 vs 6.625, `dit.qkv` 2.591 vs 2.591), which is the
+evidence that the box was quiet.
+
+### The audio does not move
+
+**All four short runs wrote ONE WAV hash** —
+`61a8989763bba749edab8ddc3e597d7a`, 3 530 796 bytes — across both spans arms.
+The instrument is a pure timing arm.
+
+### The instrument reproduces the record, across two jobs
+
+The AR half and the vocoder do not depend on the step count, so §20's 20 s /
+30 steps figures and this job's 20 s / 2 steps figures are a cross-job control
+on identical call counts:
+
+| bucket | §20 | here | calls | delta |
+|---|---:|---:|---:|---:|
+| `ar.lm_decode_step` | 56.174 | 56.437 | 500 | +0.5 % |
+| `ar.depth_forward` | 21.099 | 21.180 | 4008 | +0.4 % |
+| `ar.depth_projection` | 6.966 | 7.007 | 3507 | +0.6 % |
+| `ar.semantic_guide_and_draw` | 3.701 | 3.710 | 501 | +0.2 % |
+| `ar.depth_head_and_draw` | 3.489 | 3.632 | 3507 | +4.1 % |
+| `vocoder.decode_window` | 122.169 | 124.897 | 4 | +2.2 % |
+
+### The 30-step point — the §20 configuration, and it reproduces to 0.012 %
+
+`--duration 20 --steps 30 --device 1`, spans OFF, staged checkpoint, `uptime`
+14.14 before / 12.80 after:
+
+| bucket | §20 (`a50c57d69`) | here (`0e18f8afd`) | calls | delta |
+|---|---:|---:|---:|---:|
+| **`denoise.dit_device`** | **370.556** | **370.510** | 120 | **-0.012 %** |
+| `vocoder.decode_window` | 122.169 | 124.429 | 4 | +1.85 % |
+| `ar.lm_decode_step` | 56.174 | 56.395 | 500 | +0.39 % |
+| `ar.depth_forward` | 21.099 | 21.158 | 4008 | +0.28 % |
+| `ar.depth_projection` | 6.966 | 6.880 | 3507 | -1.23 % |
+| wall | 595.899 | 598.207 | — | +0.39 % |
+
+`sum(leaf)` 597.247, `unattributed` 0.313 (0.05 %). **Two commits, two jobs, two
+days, identical call counts.** With the flag unset this tree produces the number
+§20 recorded, so the instrument did not move the quantity it exists to explain.
+
+**The audio is BYTE-IDENTICAL to the record**: `55856deb3b5b727a4ca4fcc473e01a56`,
+3 530 796 bytes — the hash §20.5 recorded for its 20 s pair at `a50c57d69`.
+
+The per-forward geometry is identical at 2 and 30 steps (`seq` 690 both), so
+`dit.attn` at 0.6881 s x 240 forwards is **165.1 s of 370.510 s = 44.6 % of the
+DiT and 27.6 % of the whole 598.207 s run**.
+
+### One candidate lever is MEASURED UNAVAILABLE
+
+`CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY` — cuBLASLt's fp32 emulation, the one
+precision-adjacent lever that would have kept the declared dtype at fp32 — **is
+undefined in nvcc/cuBLASLt 13.0.88 on this device**. A probe transcribing
+`MatmulBTKernelCuda`'s descriptor construction fails to compile:
+`PROBE_BUILD_RC=2`, `identifier "CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY" is
+undefined`. It is an enumerator, not a macro, so no preprocessor test can guard
+it. Costs nothing: the split says the lever is the attention kernel, not
+precision.
+
+### What is NOT established
+
+* **The mechanism.** #1555 names the per-key five-step `__shfl_xor_sync`
+  butterfly and an occupancy near 8 warps per scheduler as the leading
+  hypothesis, with the instruction-count arithmetic beside it (~1.8 ms/layer
+  predicted against 19.1 ms measured). **No `ncu` counter was read on either
+  side and no occupancy figure was measured.** The split is measured; its
+  attribution is not.
+* **Any speed claim for a fix.** Nothing was made faster by this row.
+* **A cross-box or per-kernel figure.** No clock window exists on this device.
+
+### The GEMM half is at the device's fp32 CEILING, so the attention lever is the only one left in-oracle
+
+Standalone probe transcribing `MatmulBTKernelCuda`'s descriptor, three layouts,
+`TRANSA=T`/`TRANSB=N`, `CUBLAS_COMPUTE_32F`, `CUDA_R_32F` scale, 32 MB workspace
+and `requestedAlgoCount=1` — so it prices OUR invocation, not a generic SGEMM.
+`thor:gpu0`, nvcc/cuBLASLt 13.0.88 / 13.1, driver 13020, binary
+`9960f5e1e1fb41b90c1d0669c507927830bb486572a43d3030910bdfeeda44b0`, 3 rounds
+agreeing to 0.3 % on the fp32 arms.
+
+`NVIDIA Thor cc=11.0`, **20 SMs at 1.049 GHz** => fp32 CUDA-core peak
+**5.369 TFLOP/s** (128 lanes/SM assumed, stated because the percentages rest on
+it); memory bandwidth 273.0 GB/s.
+
+At the DiT's own **M = 690**, TFLOP/s:
+
+| shape | f32 `COMPUTE_32F` | % fp32 peak | f32 `FAST_TF32` | bf16 | plan rebuild |
+|---|---:|---:|---:|---:|---:|
+| `qkv` `[690,2048]x[2048,2048]` | **3.84** | **71.5 %** | 52.84 | 134.66 | 0.9 us |
+| `attn_out` | **3.84** | **71.5 %** | 52.97 | 134.45 | 0.9 us |
+| `ff_in` `[690,2048]x[16384,2048]` | **4.17** | **77.7 %** | 59.04 | 94.40 | 1.1 us |
+| `ff_out` `[690,8192]x[2048,8192]` | **4.24** | **79.0 %** | 29.51 | 48.03 | 0.9 us |
+
+TF32 and bf16 run on TENSOR cores, so the fp32-CUDA-core denominator does not
+apply to them and no percentage is quoted; they price what precision would be
+worth, and precision is a divergence from the oracle (§21.2).
+
+**1. The GEMMs are at the ceiling.** 71.5-79.0 % of the device's true-fp32 peak,
+which is what a well-served SGEMM looks like; the in-situ half measured
+**3.98 TFLOP/s**, inside that band.
+
+**2. The in-situ calls ARE those calls, within 2.9 %.** Summing the probe's
+isolated per-call times over a block (3x`qkv` + `attn_out` + `ff_in` + `ff_out`
+= 22.59 ms) over 36 blocks predicts **813.5 ms** of GEMM per forward against a
+measured **836.9 ms**. No dispatch overhead, no launch-gap term, no untuned-shape
+term hides in the 53.3 %.
+
+**3. The per-call plan rebuild is REFUTED as a lever.** `MatmulBTKernelCuda`
+rebuilds descriptor + 3 layouts + preference + heuristic on EVERY call, 252 per
+forward, measured at **0.9-1.1 us** each = **~0.25 ms of a 1569 ms forward,
+0.016 %**. A plan cache for this op buys nothing here. This was the row's
+second-ranked hypothesis and it is closed, not left open.
+
+**The prize, as a BOUND and not a promise.** If `vt::AttentionCross` merely
+matched the GEMMs' measured 3.98 TFLOP/s, its 0.140 TFLOP would cost **35.2 ms
+instead of 688.1 ms**: forward 1569 -> 916 ms (**1.71x on the DiT**), bucket
+370.510 -> 216.3 s, run 598.207 -> 444.0 s (**1.35x end to end**). An upper
+bound from a flop ratio on a kernel nobody has written.
+### The Qwen3.5-4B `1.0283x` row ran against an UNFUSED denominator (#414, #1345)
+
+Found 2026-08-19 while landing [#607](https://github.com/mudler/vllm.cpp/issues/607)
+wave L4, which gated the CLI oracle-launch surface. This leg is on the OTHER
+surface, so the new checker does not see it, and it is the one published figure
+the L4 sweep found still carrying the #414 defect unmarked.
+
+The chain, each link checked rather than assumed:
+
+1. `docs/BENCHMARKS.md` cites `docs/bench-evidence/qwen35-4b-sm120-main-20260807.md`,
+   whose reproduction identity names `Qwen/Qwen3.5-4B` and the exact workload
+   (128 requests, 128 output tokens, concurrency 32,
+   `max_num_batched_tokens=2048`, greedy) that `tools/bench/run_qwen35_4b_compare.sh`
+   drives.
+2. `tools/bench/run_qwen35_4b_compare.sh:120` runs the vLLM arm through
+   `tools/bench/vllm_closed_loop_metrics.py`. Its `LLM(...)` at `:160` never
+   passes `language_model_only` and exposes no argument that could set it.
+3. Upstream registers `Qwen/Qwen3.5-4B` under `Qwen3_5ForConditionalGeneration`
+   (`tests/models/registry.py:1322-1324`, `extras={"4b": "Qwen/Qwen3.5-4B"}`), so
+   `multimodal_config` is non-`None` and `text_only` resolves `False`
+   (`vllm/config/multimodal.py:78`, `vllm/model_executor/models/qwen3_next.py:325`).
+4. The conjunct was live at the time of the run. `git log -S'use_fused_qk_norm_rope_gate'`
+   over `vllm/model_executor/models/qwen3_next.py` dates its introduction to
+   `16282a9c4` on 2026-06-10, two months before the 2026-08-07 measurement.
+5. The remaining conjuncts hold: sm_120 is CUDA, and Qwen3.5-4B carries
+   `attn_output_gate` with NeoX-style RoPE.
+
+So the oracle issued four ops per full-attention layer where its own production
+configuration issues one, against our single fused launch.
+
+**Direction: it flatters us**, for the reason #414 gives. **Magnitude: NOT
+MEASURED, and deliberately not estimated.** The model is GDN-hybrid, so only its
+full-attention layers are exposed, and the L4 wave took no measurement: both
+fleet devices were held and it carried no lease authority. Quoting a corrected
+ratio here would be a number nobody took.
+
+The row keeps its values and gains the attribution, per AGENTS.md: evidence is
+annotated, never deleted. Re-measurement is owed with
+[#1345](https://github.com/mudler/vllm.cpp/issues/1345), which also owns the
+repair to the three in-process harnesses.
+
+**Not affected, so the next reader does not re-derive it.** #414 reaches a figure
+only where the full-attention layers are `Qwen3NextAttention` AND the checkpoint
+loads as a `*ForConditionalGeneration`. That is the Qwen3.5/3.6/3.8 family alone.
+The OPT, GLM-4, InternLM2, Qwen3-dense, Qwen3-Coder and DeepSeek-V2-Lite legs
+never construct `Qwen3NextAttention`. The `Qwen3.8-27B` rows ran through
+`tools/bench/run_serve_low.py`, which has passed `--language-model-only` since it
+was written. The Qwen3.5-4B GDN prefill kernel row is conv and post-conv timing
+on the LINEAR-attention path, which the full-attention preamble does not touch.

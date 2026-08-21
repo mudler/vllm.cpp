@@ -142,7 +142,7 @@ const int32_t* AsI32(const parity::NpyArray& a) {
 // vLLM's argmax in vLLM's own logits (strict where our token IS vLLM's argmax).
 // Reports the strict token-exact count and the max gap.
 void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
-             const char* label) {
+             const std::string& label) {
   const std::string snap = FindSnapshot(repo_dir);
   if (snap.empty()) {
     MESSAGE(label << " checkpoint absent; skipping (dgx-only) — " << repo_dir
@@ -262,10 +262,13 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
   const int32_t* anchor_ids = od;   // hard anchor for THIS device
   const int32_t* gap_ids = gapd;    // vLLM teacher-forced gaps for THIS device
   parity::NpyArray o_dev, gap_dev;  // keep device arrays alive for the loop
-  const char* ids_name =
+  // std::string, not const char*: doctest's MessageBuilder stream has no
+  // const char* overload and would render a bare pointer as bool "1" in the
+  // REQUIRE_MESSAGE below (#1508).
+  const std::string ids_name =
       metal ? "our_ids_metal.npy"
             : (rocm ? "our_ids_rocm.npy" : "our_ids_tenstorrent.npy");
-  const char* gap_name =
+  const std::string gap_name =
       metal ? "neartie_gap_mnats_metal.npy"
             : (rocm ? "neartie_gap_mnats_rocm.npy"
                     : "neartie_gap_mnats_tenstorrent.npy");
@@ -277,7 +280,8 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       // qwen3-neartie-gap.py then teacher-forces vLLM on that sequence.
       bootstrap_only = true;
       MESSAGE(label << ": BOOTSTRAP dump (device golden absent) for "
-              << (metal ? "Metal" : (rocm ? "ROCm" : "Tenstorrent")) << "...");
+              << std::string(metal ? "Metal" : (rocm ? "ROCm" : "Tenstorrent"))
+              << "...");
     } else {
       REQUIRE_MESSAGE(have_dev,
                       label << ": device oracle golden absent (" << ids_name << " / "
@@ -338,7 +342,7 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
                     << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
                     << " committed anchor="
                     << (first_div < 0 ? -1 : anchor_ids[i * T + first_div])
-                    << (device_golden
+                    << std::string(device_golden
                             ? " — re-capture the device golden pair via "
                               "qwen3-neartie-gap.py"
                             : " — re-run qwen3-neartie-gap.py to refresh the gap "
@@ -427,7 +431,8 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
           << strict_exact << "/" << N << "; near-tie-band only: " << neartie_only
           << "/" << N << "; max gap " << (worst_gap / 1000.0) << " nats @ prompt["
           << worst_i << "] tok=" << worst_j << "; " << fail << " forward-divergent"
-          << (device_golden ? "; anchor+gaps = device oracle-backed golden" : "")
+          << std::string(device_golden ? "; anchor+gaps = device oracle-backed golden"
+                                        : "")
           << ")");
   REQUIRE(fail == 0);
 }

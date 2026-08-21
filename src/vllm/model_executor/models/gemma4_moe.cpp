@@ -1,5 +1,6 @@
 // Gemma-4 MoE: BF16 fused or FP8 per-expert + optional device resident.
 #include "vllm/model_executor/models/gemma4_moe.h"
+#include "vllm/model_executor/models/gemma4_indexed_gate.h"
 
 #include <atomic>
 #include <algorithm>
@@ -757,9 +758,22 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   const bool fp8_res_same = fp8_res && ex.dev_id == compute_dev;
   const bool fp8_res_peer = fp8_res && ex.dev_id != compute_dev;
 
-  // Decode T=1: fully device MoE — no router D2H, no host top-k gather.
-  if (T == 1 && fp8_res && top_k <= 8 && top_k > 0) {
-    // per-expert scale on device (once per layer/E).
+  // Device-indexed FP8 MoE for T=1..min(MAX, batch_min-1). No router D2H.
+  // T=1: hipGraph-stable TLS acc. T>1: owned [T,H] + per-token existing helpers.
+  // VT_GEMMA4_DECODE_INDEXED_MAX_T: default 63; =1 → T=1 only; clamp [1,63].
+  const int64_t indexed_max_t = Gemma4DecodeIndexedMaxT();
+  const bool indexed_eligible = Gemma4IndexedOkT(T, indexed_max_t, top_k, fp8_res);
+  auto emit_moe_dispatch = [&](const char* path, bool fallthrough) {
+    if (!profile) return;
+    std::fprintf(stderr,
+                 "gemma4 moe dispatch: T=%lld indexed_max_t=%lld path=%s eligible=%d top_k=%d "
+                 "compute_dev=%d expert_dev=%d fallthrough=%d\n",
+                 static_cast<long long>(T), static_cast<long long>(indexed_max_t), path,
+                 indexed_eligible ? 1 : 0, top_k, compute_dev, ex.dev_id, fallthrough ? 1 : 0);
+    std::fflush(stderr);
+  };
+  if (Gemma4IndexedOkT(T, indexed_max_t, top_k, fp8_res)) {
+    // per-expert scale on device (once per layer/E; apply each token — helper is G-wide).
     struct EscTls {
       int dev = -1;
       int64_t E = 0;
@@ -780,71 +794,164 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         esc.host_key = hk;
       }
       escale_ptr = static_cast<float*>(esc.sc->ptr());
-      vt::ApplyExpertScaleRw(d.q, static_cast<float*>(rw.ptr()), static_cast<const int32_t*>(ri.ptr()),
-                             escale_ptr, top_k, static_cast<int>(E));
     }
 
-    // Stable T=1 acc for hipGraph (do not pool-Release).
-    struct AccFastTls {
+    // Never mutate router `rw` in place — fallback must still see unscaled weights.
+    // T=1: TLS-stable copy (hipGraph bakes the pointer). T>1: per-call pooled DBuf.
+    struct RwIdxTls {
       int dev = -1;
-      int64_t H = 0;
-      std::optional<DBuf> acc;
+      int64_t n = 0;  // T*top_k
+      std::optional<DBuf> buf;
     };
-    static thread_local AccFastTls aft;
-    if (aft.dev != d.q.device.index || aft.H != H || !aft.acc) {
-      aft.acc.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
-      aft.dev = d.q.device.index;
-      aft.H = H;
-    }
-    DBuf& acc_fast = *aft.acc;
-    // expert_in is already [1,H] bf16 on device
-    const void* xin = expert_in.data;
-    void* yout = acc_fast.ptr();
-    bool ok = false;
-    if (fp8_res_same) {
-      ok = vt::ExpertGeGLUFp8TopKIndexed(
-          d.q, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base, ex.fp8_sdn_base,
-          static_cast<const int32_t*>(ri.ptr()), static_cast<const float*>(rw.ptr()), top_k,
-          static_cast<int>(I), static_cast<int>(H));
-    } else if (fp8_res_peer) {
-      ok = RunGemma4Fp8TopKIndexedOnExpertDevice(
-          d.q, ex.dev_id, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base,
-          ex.fp8_sdn_base, static_cast<const int32_t*>(ri.ptr()),
-          static_cast<const float*>(rw.ptr()), top_k, static_cast<int>(I), static_cast<int>(H));
-    }
-    if (ok) {
-      const auto t_router1 = profile ? clock::now() : clock::time_point{};
-      Gemma4MoeScratch r;
-      r.tensor = acc_fast.t();
-      r.storage = std::shared_ptr<void>(acc_fast.ptr(), [](void*) {});
-      if (profile) {
-        d.b.Synchronize(d.q);
-        const auto t_all1 = clock::now();
-        static std::atomic<uint64_t> ncalls{0};
-        static std::atomic<uint64_t> us_router{0};
-        static std::atomic<uint64_t> us_total{0};
-        const auto ur =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_router1 - t_all0).count();
-        const auto ut =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_all1 - t_all0).count();
-        us_router.fetch_add(static_cast<uint64_t>(ur), std::memory_order_relaxed);
-        us_total.fetch_add(static_cast<uint64_t>(ut), std::memory_order_relaxed);
-        const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (c == 1 || c % 64 == 0) {
-          const uint64_t tr = us_router.load(std::memory_order_relaxed);
-          const uint64_t tt = us_total.load(std::memory_order_relaxed);
-          std::fprintf(stderr,
-                       "gemma4 moe profile: calls=%llu router_us/call=%.1f expert+rest_us/call=%.1f "
-                       "total_us/call=%.1f (router%%=%.0f) [indexed-device]\n",
-                       static_cast<unsigned long long>(c), static_cast<double>(tr) / c,
-                       static_cast<double>(tt - tr) / c, static_cast<double>(tt) / c,
-                       tt ? 100.0 * static_cast<double>(tr) / static_cast<double>(tt) : 0.0);
+    static thread_local RwIdxTls rwt;
+    std::optional<DBuf> rw_idx_owned;
+    const float* helper_rw = static_cast<const float*>(rw.ptr());
+    if (escale_ptr) {
+      const int64_t n = T * top_k;
+      const bool t1_tls = Gemma4IndexedScratchKindFor(T) == Gemma4IndexedScratchKind::TlsT1;
+      DBuf* scaled = nullptr;
+      if (t1_tls) {
+        if (rwt.dev != compute_dev || rwt.n != n || !rwt.buf) {
+          rwt.buf.emplace(d, DType::kF32, std::vector<int64_t>{T, top_k});
+          rwt.dev = compute_dev;
+          rwt.n = n;
         }
+        scaled = &*rwt.buf;
+      } else {
+        rw_idx_owned.emplace(d, DType::kF32, std::vector<int64_t>{T, top_k});
+        scaled = &*rw_idx_owned;
       }
-      return r;
+      d.b.Copy(d.q, scaled->ptr(), rw.ptr(), static_cast<size_t>(n) * sizeof(float));
+      for (int64_t t = 0; t < T; ++t) {
+        const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
+        vt::ApplyExpertScaleRw(d.q, static_cast<float*>(scaled->ptr()) + off.route,
+                               static_cast<const int32_t*>(ri.ptr()) + off.route, escale_ptr, top_k,
+                               static_cast<int>(E));
+      }
+      helper_rw = static_cast<const float*>(scaled->ptr());
     }
+
+    const auto indexed_arm = Gemma4IndexedSelectArm(fp8_res_same, fp8_res_peer);
+    auto run_one = [&](void* yout, const void* xin, const int32_t* ri_t, const float* rw_t) -> bool {
+      const auto args = Gemma4IndexedPackArgs(yout, xin, ri_t, rw_t);
+      return Gemma4IndexedRunSelectedArm(
+          indexed_arm,
+          [&] {
+            return vt::ExpertGeGLUFp8TopKIndexed(d.q, args.y, args.x, ex.fp8_gu_base, ex.fp8_dn_base,
+                                                 ex.fp8_sgu_base, ex.fp8_sdn_base, args.ri, args.rw,
+                                                 top_k, static_cast<int>(I), static_cast<int>(H));
+          },
+          [&] {
+            return RunGemma4Fp8TopKIndexedOnExpertDevice(
+                d.q, ex.dev_id, args.y, args.x, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base,
+                ex.fp8_sdn_base, args.ri, args.rw, top_k, static_cast<int>(I), static_cast<int>(H));
+          });
+    };
+    auto restore_compute = [] {};
+    bool indexed_retired = false;
+    auto retire_indexed = [&]() -> bool {
+      if (indexed_retired) return true;
+      bool ok = true;
+      if (fp8_res_peer) {
+        ok = RetireGemma4Fp8TopKIndexedPeer(d.q, ex.dev_id);
+      } else {
+        d.b.Synchronize(d.q);
+      }
+      indexed_retired = ok;
+      return ok;
+    };
+
+    if (Gemma4IndexedScratchKindFor(T) == Gemma4IndexedScratchKind::TlsT1) {
+      // Stable T=1 acc for hipGraph (do not pool-Release). rw_idx is RwIdxTls.
+      struct AccFastTls {
+        int dev = -1;
+        int64_t H = 0;
+        std::optional<DBuf> acc;
+      };
+      static thread_local AccFastTls aft;
+      if (aft.dev != d.q.device.index || aft.H != H || !aft.acc) {
+        aft.acc.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
+        aft.dev = d.q.device.index;
+        aft.H = H;
+      }
+      DBuf& acc_fast = *aft.acc;
+      const auto disp = Gemma4IndexedDispatchTokens(
+          1, H, top_k, fp8_res_peer, static_cast<uint16_t*>(acc_fast.ptr()),
+          static_cast<const uint16_t*>(expert_in.data), static_cast<const int32_t*>(ri.ptr()),
+          helper_rw, [&](const Gemma4IndexedCall<uint16_t, uint16_t>& c) {
+            return run_one(c.y, c.x, c.ri, c.rw);
+          },
+          restore_compute);
+      if (disp.ok) {
+        emit_moe_dispatch(indexed_arm == Gemma4IndexedArm::Peer ? "indexed_peer" : "indexed_same",
+                          /*fallthrough=*/false);
+        const auto t_router1 = profile ? clock::now() : clock::time_point{};
+        Gemma4MoeScratch r;
+        r.tensor = acc_fast.t();
+        r.storage = std::shared_ptr<void>(acc_fast.ptr(), [](void*) {});
+        if (profile) {
+          d.b.Synchronize(d.q);
+          const auto t_all1 = clock::now();
+          static std::atomic<uint64_t> ncalls{0};
+          static std::atomic<uint64_t> us_router{0};
+          static std::atomic<uint64_t> us_total{0};
+          const auto ur =
+              std::chrono::duration_cast<std::chrono::microseconds>(t_router1 - t_all0).count();
+          const auto ut =
+              std::chrono::duration_cast<std::chrono::microseconds>(t_all1 - t_all0).count();
+          us_router.fetch_add(static_cast<uint64_t>(ur), std::memory_order_relaxed);
+          us_total.fetch_add(static_cast<uint64_t>(ut), std::memory_order_relaxed);
+          const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (c == 1 || c % 64 == 0) {
+            const uint64_t tr = us_router.load(std::memory_order_relaxed);
+            const uint64_t tt = us_total.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "gemma4 moe profile: calls=%llu router_us/call=%.1f expert+rest_us/call=%.1f "
+                         "total_us/call=%.1f (router%%=%.0f) [indexed-device]\n",
+                         static_cast<unsigned long long>(c), static_cast<double>(tr) / c,
+                         static_cast<double>(tt - tr) / c, static_cast<double>(tt) / c,
+                         tt ? 100.0 * static_cast<double>(tr) / static_cast<double>(tt) : 0.0);
+          }
+        }
+        return r;
+      }
+      (void)retire_indexed();  // T=1 TLS acc/rw_idx are not pooled; retire before leaving arm
+    } else {
+      std::optional<DBuf> acc_idx;
+      acc_idx.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
+      auto* x_base = static_cast<const uint16_t*>(expert_in.data);
+      auto* y_base = static_cast<uint16_t*>(acc_idx->ptr());
+      auto* ri_base = static_cast<const int32_t*>(ri.ptr());
+      const Gemma4IndexedScratchChoice scratch_choice{Gemma4IndexedScratchKindFor(T), y_base,
+                                                      T * H};
+      if (!Gemma4IndexedScratchValidForT(scratch_choice, T, H)) {
+        if (!retire_indexed()) (void)acc_idx->Release();  // quarantine
+        // fall through with acc_idx still in scope until this block ends
+      } else {
+        const auto disp = Gemma4IndexedDispatchTokens(
+            T, H, top_k, fp8_res_peer, y_base, x_base, ri_base, helper_rw,
+            [&](const Gemma4IndexedCall<uint16_t, uint16_t>& c) {
+              return run_one(c.y, c.x, c.ri, c.rw);
+            },
+            restore_compute);
+        if (disp.ok) {
+          emit_moe_dispatch(indexed_arm == Gemma4IndexedArm::Peer ? "indexed_peer" : "indexed_same",
+                            /*fallthrough=*/false);
+          Gemma4MoeScratch r;
+          r.tensor = acc_idx->t();
+          r.storage = acc_idx->ReleaseShared();
+          return r;
+        }
+        // retire-before-acc_idx-dtor: still lexically inside acc_idx scope
+        if (!retire_indexed()) (void)acc_idx->Release();  // quarantine, do not Put
+      }
+    }
+    if (!indexed_retired) (void)retire_indexed();
+    if (!indexed_retired && rw_idx_owned) (void)rw_idx_owned->Release();
     // fall through to legacy host-gather path
   }
+
+  emit_moe_dispatch("legacy", /*fallthrough=*/indexed_eligible);
 
   std::vector<float> hw(static_cast<size_t>(T * top_k));
   std::vector<int32_t> hi(static_cast<size_t>(T * top_k));
@@ -859,14 +966,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     const auto* pe = reinterpret_cast<const uint16_t*>(moe.per_expert_scale.bytes.data());
     for (int64_t e = 0; e < E; ++e) hscale[static_cast<size_t>(e)] = vt::BF16ToF32(pe[e]);
   }
-  // Apply per-expert scale to selected weights.
-  for (int64_t t = 0; t < T; ++t) {
-    for (int i = 0; i < top_k; ++i) {
-      const size_t o = static_cast<size_t>(t * top_k + i);
-      const int e = hi[o];
-      if (e >= 0 && e < static_cast<int>(E)) hw[o] *= hscale[static_cast<size_t>(e)];
-    }
-  }
+  // Apply per-expert scale to selected weights (once; indexed scratch is a copy).
+  Gemma4ApplyHostExpertScaleOnce(hw.data(), hi.data(), hscale.data(), T, top_k, E,
+                                 /*already_scaled=*/false);
   const bool need_peer_sc = (!same_dev && ex.gate_up_dev && ex.down_dev && ex.dev_id >= 0) ||
                             fp8_res_peer;
 
@@ -1007,7 +1109,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   // Prefer fused M=1 FP8 for short T (decode + tiny prefills). Batch dequant+GEMM
   // only pays off once enough tokens share experts (lab: T=818 ~3×, T=6k ~6×;
   // T=13 was slower than fused M=1).
-  constexpr int64_t kPrefillBatchMinT = 64;
+  constexpr int64_t kPrefillBatchMinT = kGemma4PrefillBatchMinT;
   const bool prefill_batch_moe =
       (T >= kPrefillBatchMinT) && !host_axpy &&
       ((prefill_batch_env == 1) ||
@@ -1645,6 +1747,7 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue&, int, void*, const void*, 
                                            const float*, int, int, int) {
   return false;
 }
+bool RetireGemma4Fp8TopKIndexedPeer(vt::Queue&, int) { return true; }
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
 void UnpinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
 #endif  // VLLM_CPP_HIP

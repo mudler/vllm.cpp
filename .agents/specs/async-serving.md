@@ -7,12 +7,65 @@ split), `ENG-ASYNC-SCHED` (async/overlap scheduling), `ENG-PRIORITY-SCHED`
 `ROAD-V1-A` (see priority justification). Upstream pin:
 `/home/mudler/_git/vllm` @ `e24d1b24`.
 
+## Now (record reconciliation 2026-08-12, [#534](https://github.com/mudler/vllm.cpp/issues/534))
+
+Punch-list item 9 of [roadmap-v1-completion.md](roadmap-v1-completion.md) §3 was
+this block's plan of record. Re-verified against the tree, **two of its three
+clauses were already stale when that spec was committed** (`489f7771`,
+2026-07-27), so it is reconciled there and here. Nothing below is deleted; the
+checkpoint text that follows is history and is kept as written.
+
+| Clause | Reality |
+|---|---|
+| land the depth-2 throughput lever | Landed `6ea7856` (2026-07-16) and **REFUTED in the same commit**; the objective itself was retired by the 2026-07-17 discriminator addendum below (*"There is NO depth-2 throughput unlock to find"*). Acting on it re-opens a closed negative result. |
+| flip `runner_supports_async` prod-ON | Flipped `a0013a2` (2026-07-17), default-ON via `AsyncRunnerFlagIsOn`. The item's title conflates this with `SERVE-ASYNC-LLM`, a different row, which is **also** already the production path (`src/vllm/entrypoints/openai/server_main.cpp:731-734`). |
+| close priority/busy-loop GPU gates | `ENG-CORE-BUSY-LOOP` covered in substance; `ENG-PRIORITY-SCHED` genuinely OPEN — see below. |
+
+**The one real residual in this block is W4's gate, and it does not exist yet.**
+`--scheduling-policy priority|fcfs` is plumbed all the way to the production
+server (`server_main.cpp:408-411,672-673` → `SchedulerPolicyFromString` →
+`SchedulerConfig::policy`), and the CPU tier is green (93/93, 12 ported
+priority-scheduler cases + 14 priority-queue cases incl. the seeded random
+property test) — but **no priority-vs-FCFS gate exists at the engine/model
+level**. Everything that exists is scheduler-unit (`test_scheduler.cpp:674,916`
+admission/preemption ordering, `test_request_queue.cpp` heap ordering) or C-ABI
+wire-name validation (`tests/capi/test_capi.cpp:1159`); nothing drives a real
+engine with `policy=kPriority` and compares its token stream against the fcfs
+arm. G1 as written here cannot be "rerun"; a next owner writes it first,
+RED-first, then runs it. The blocker both W1 and W4 still record — *"GPU
+held by the `SERVE-GATE-ONLINE` campaign"* — is a scheduling note from
+2026-07-10 that five successive bindings have since expired; it is not what is stopping
+anyone.
+
+**W1 `ENG-CORE-BUSY-LOOP`'s GPU gates are covered in substance, unrecorded on the
+row.** G1 (token-exact twins): `tests/parity/test_qwen36_async_serving.cpp`
+(`1718bf155`, 2026-08-05) drives `LoadedEngine::async_engine()` → `AsyncLLM` →
+`EngineCoreProc::step_with_batch_queue` (depth-2) token-exact against the same
+pinned oracle continuation the SACRED sync gate uses, proven RED→GREEN on GB10
+under `compute-sanitizer`; `tests/parity/test_qwen3_dense_async_serving.cpp`
+(`52d76f3a9`) adds the classic-dense arm. G4 (no-throughput-regression): the
+`SERVE-GATE-ONLINE` binding `9ecd9d0` 114/124 runs exactly this path with async
+default ON. Promoting the row is the operator's call, not this reconciliation's.
+
+**W2 `SERVE-ASYNC-LLM` is not waiting on a flip.** It holds at `GATING` on its
+declared *broader every-axis parity*: 27B ratified (115/124 two-grid effective
+parity), 35B open and owned by `ROAD-V1-A`. Its own open bug is
+[#294](https://github.com/mudler/vllm.cpp/issues/294). The consumer dependency
+recorded in [cuda-sglang-low-concurrency.md](cuda-sglang-low-concurrency.md) —
+exit *"Real incremental SSE, in-flight batching, and streaming timing test
+pass"* — was met by W2 on 2026-07-10; its "current endpoint buffers the whole
+result" rationale describes the pre-W2 server, and the arrival-time assertion
+that retired it is `tests/vllm/entrypoints/openai/test_api_server.cpp:622-634`
+(`dispatched < first_arrival < completed`).
+
 ## Current checkpoint and priority
 
 **W3 `ENG-ASYNC-SCHED` is DONE (2026-07-17): the async-scheduling default is
 FLIPPED ON** (`VT_ASYNC_RUNNER` default ON, mirror `vllm/config/vllm.py:992-1044`),
 DGX-re-confirmed token-neutral (235/235 + 315/315, log "enabled, mcb=2"), owner
-`6ea7856`; rollbacks `VT_ASYNC_RUNNER=0` / `VT_ASYNC_SCHED=0`. See the 2026-07-17
+`6ea7856` (the SHA the discriminator ran on; the flip commit itself is
+`a0013a2` — see the reconciliation above); rollbacks `VT_ASYNC_RUNNER=0` /
+`VT_ASYNC_SCHED=0`. See the 2026-07-17
 addendum below. The historical W3 landing narrative (machinery → runner halves →
 enable-flip → discriminator) is retained below for reference.
 

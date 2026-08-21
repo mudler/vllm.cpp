@@ -335,6 +335,17 @@ def audit() -> list[dict]:
 # the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
 # the gated population, so its verdict is None rather than a downgraded one.
 # A shrink for a real record edit, named as the message demands.
+# 2026-08-21: -SPEC-BPE-QUADRATIC-MERGE. It entered on 2026-08-19 as GROWTH,
+# when its `## Gates` section gained the `g++` build and the two run lines for
+# `tools/bench/bpe_encode_cost.cpp`, and it leaves now because the row was
+# promoted `GATING` -> `DONE` by its closing commit (fix `67823aee2`, PR #1539,
+# issue #1365). Same shape and same reason as ENG-TRAILER-MERGE-ARTIFACTS above:
+# `DONE` is not in GATED_STATES, so the row leaves the AUDITED population and its
+# verdict becomes None rather than a downgraded one. It did NOT lose its command
+# -- the recipe is still in the spec and still runnable by hand -- which is
+# exactly the distinction `ratchet_errors` draws, and why this is a shrink for a
+# real record edit rather than a gate erasing its own finding. A shrink, named as
+# the message demands, and re-pinned in the SAME change as the promotion.
 # 2026-08-11: +ENG-FORGE-COAUTHOR. Reaches ACTIVE on its committed spec (issue
 # #418), whose Gates section names the preflight, tests/scripts and
 # agent-integration invocations plus the per-commit re-verification of
@@ -346,6 +357,15 @@ def audit() -> list[dict]:
 # focused test file, and records that no CUDA/GPU/SACRED/oracle gate is
 # implicated because the change is argument parsing and reaches no forward pass.
 # Growth from a lifecycle move, so the set is re-pinned in the same change.
+# 2026-08-14: +ENG-RECORD-ANCHOR-RATCHET. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #632), which puts it in GATED_STATES for the first time.
+# Its spec's Gates section names five invocations, and this is a STRONG credit
+# rather than one of the weak ones described above: the row's gate IS
+# `scripts/check-agent-record.py`, so the credited command is the thing under
+# test, and it fails on either direction of the ratchet. The suite
+# (`tests/scripts/test_agent_record.py`) is proven red against the BASE checker
+# by `scripts/check-pr-size.py`, which is itself one of the five. Growth from a
+# lifecycle move, so the set is re-pinned in the same change.
 # 2026-08-16: +SPEC-MTP-K-GT-1. A NEW row arriving at ACTIVE (issue #81), so it
 # enters GATED_STATES for the first time. Its spec's Gates section names
 # `scripts/agent-preflight.sh` plus the built CPU suite (493 passed / 0 failed /
@@ -375,11 +395,40 @@ def audit() -> list[dict]:
 # session did not have, so it is carried under the spec's `## Owed` rather than
 # reported as run, and the CUDA leg's compile rests on the `cuda-fat-build` CI
 # job. Growth, so the set is re-pinned in the same change.
+# 2026-08-18: +ENG-HF-MODEL-DOWNLOAD. A NEW row arriving at READY (issue #1280),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `scripts/validate-container-image.py`, which boots the image and asserts the
+# failure for an unknown repository is an HTTP 404 from the hub rather than the
+# message that names the build options. That distinction is the point: a symbol
+# check passes on a build where `VLLM_CPP_HF_DOWNLOAD` resolved OFF, so the
+# container gate is the only instrument that separates a working TLS build from
+# a silently disabled one. The section also records what the runnable gates do
+# NOT cover: the hermetic suite speaks plain hypertext transfer protocol, so it
+# proves nothing about transport layer security, and the second instrument is an
+# opt-in online test that does not run in the default lane. Growth, so the set
+# is re-pinned in the same change.
+# 2026-08-19: +ENG-CUDAGRAPH-BREAK, and this entry is a REPAIR rather than a
+# landing. W5 of that row (#1361, commit 601b576c6) filled its spec's Gates
+# section with runnable evidence, including a named test binary with its case
+# and assertion counts and an exit status, which is what moves a row into the
+# runnable population. The re-pin this ratchet's own error text demands was not
+# made in that change, so `main` itself has been red on
+# tests/scripts/test_check_gate_commands.py since it landed: 8 failures of 44,
+# every one a comparison between the computed runnable set and this pin,
+# measured in a detached worktree of origin/main. The continuous integration
+# lane that would have caught it independently has not executed for this
+# repository since roughly 07:43Z that day, so the change landed with no remote
+# verdict. Found while merging origin/main into row/ENG-HF-MODEL-DOWNLOAD and
+# fixed in that flow under #1376, because the fix is small and clear and a red
+# main blocks every other row's gate. Growth, so the set is re-pinned.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-CUDAGRAPH-BREAK",
+    "ENG-HF-MODEL-DOWNLOAD",
     "ENG-RESIDENCY-CONFIG",
     "ENG-CUDAGRAPH-DEDUP",
     "SPEC-MTP-K-GT-1",
     "ATTN-CHUNKED-LOCAL",
+    "ENG-RECORD-ANCHOR-RATCHET",
     "SERVE-RECIPE-ARGS",
     "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",

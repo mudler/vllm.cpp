@@ -528,6 +528,23 @@ checker here may make one. If the landed commits start failing the trailer gate
 again, read the setting first. `tests/scripts/test_check_commit_trailers.py`
 pins both squash shapes, so the difference between them is executable.
 
+**Read the body before you merge it.** The CI job that holds a body to this
+contract runs in a queue and can be outrun. On #1257 it was still `pending` when
+the merge went ahead, so nothing ever read the body, and its malformed
+attribution value became a message on `main` that cannot be repaired (#1262,
+#1263). Run the same check yourself, on the bytes that are about to become the
+commit:
+
+```sh
+python3 scripts/agent-pr-body.py --pr <N>
+```
+
+It exits 0 when the body will land clean, 1 when the body was read and fails the
+contract, and 3 when it could not be read at all. A 3 is `REMOTE_UNVERIFIED` and
+is never a pass. The command is a belt to the CI guard's braces and not a
+replacement for it: the forge reads the body again from its own event payload,
+which is what catches an edit made after you looked.
+
 Every commit contains a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and these
 trailers:
 
@@ -600,6 +617,7 @@ python3 scripts/agent-role.py show
 scripts/agent-preflight.sh                      # before edits
 scripts/agent-preflight.sh --staged             # before commit
 python3 scripts/agent-ready.py                  # before remote handoff
+python3 scripts/agent-pr-body.py --pr <N>      # before merging: the body IS the message
 python3 scripts/agent-integration.py --base origin/main
 rc devices                                      # the GPU fleet, and who holds it
 ```

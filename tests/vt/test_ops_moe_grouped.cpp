@@ -10,12 +10,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <vector>
 
+#include "moe_router_warp_env.h"
 #include "vllm/model_executor/model_loader/mxfp4_dequant.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/cuda/moe_decode_ref.h"
@@ -495,6 +497,15 @@ TEST_CASE("moe_grouped_gemm_nvfp4 validates shapes loudly (CPU dispatch)") {
 // softmax + comparison-only argmax with the same lowest-index tie-break); this
 // test pins it on adversarial inputs — exact ties, near-ties, uneven loads, and
 // M in {1,8,16}, for f32 and bf16 logits (bf16 rounding manufactures ties).
+//
+// It is ALSO the on-device gate for the single-warp router (VT_MOE_ROUTER_WARP,
+// issue #378), which is what `vt::MoeRouterTopK` dispatches by default for
+// E in {32,64,128,256}: that kernel's whole claim is that it is byte-identical
+// to this same serial reference, so it must survive every case here. The
+// portable companion tests/vt/test_moe_router_warp_map.cpp proves the REDUCTION
+// ORDER with no GPU; this one proves the KERNEL. Neither substitutes for the
+// other, and neither comparison is ever loosened: weights are compared with
+// memcmp and indices with ==.
 // Guarded on VLLM_CPP_CUDA: the parallel-vs-serial cross-check calls the
 // CUDA-only reference vt::cuda::MoeRouterTopKSerialCuda (cuda_moe.cu), so a
 // runtime HasCuda() skip is not enough — the symbol is undefined at link time
@@ -506,6 +517,43 @@ TEST_CASE("CUDA moe_router_topk parallel == serial byte-for-byte (adversarial)")
     return;
   }
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  // ── The kernels' `-1` sentinel is UNREACHABLE through this op. ────────────
+  // An earlier revision of this case ran `k = E + 3` to exercise the `best < 0`
+  // path (indices -1, weights -INFINITY, denom<=0 -> 1). That is not an input
+  // vt::MoeRouterTopK has: it validates
+  //     VT_CHECK(args.top_k >= 1 && args.top_k <= e,
+  //              "moe_router_topk: top_k must be in [1, num_experts]");
+  // (src/vt/ops.cpp) BEFORE dispatch, so the arm threw, this whole case aborted
+  // partway, and the byte-exactness sweep below never finished — while every
+  // assertion that HAD run still reported passed. Within `1 <= k <= E` the
+  // sentinel cannot fire either: after `sum > 0 ? sp/sum : 0` and the isfinite
+  // clamp every prob is finite and >= 0 (cuda_moe.cu), the argmax seeds
+  // best_v = -INFINITY, and only masking ALL E experts leaves nothing greater —
+  // which needs a (k+1)-th round, i.e. k > E. The sentinel is a defensive guard,
+  // not a reachable behaviour of this op.
+  //
+  // It was also UNSAFE to drive from here: the serial oracle this case compares
+  // against is called directly (vt::cuda::MoeRouterTopKSerialCuda), bypassing
+  // the validator, and its `sp[best] = -INFINITY` carries no `best >= 0` guard
+  // — so a k > E round writes shared memory at sp[-1]. That is the oracle, so
+  // the fix is to stop feeding it an input the op forbids, never to edit it.
+  //
+  // The two kernels' sentinel guards are still compared, at the level where the
+  // sentinel exists: tests/vt/test_moe_router_warp_map.cpp models the block and
+  // warp kernels directly and keeps its `k > E` arm. Here we pin the contract
+  // that makes the sentinel dead.
+  {
+    QueueGuard gq(gpu);
+    const int64_t T = 2, E = 32;
+    const int k = static_cast<int>(E) + 3;
+    DeviceTensor dlog(gpu, gq.q, DType::kF32, {T, E});
+    DeviceTensor w_bad(gpu, gq.q, DType::kF32, {T, static_cast<int64_t>(k)});
+    DeviceTensor i_bad(gpu, gq.q, DType::kI32, {T, static_cast<int64_t>(k)});
+    const vt::MoeRouterTopKArgs args{k, false};
+    CHECK_THROWS_AS(vt::MoeRouterTopK(gq.q, w_bad.tensor(), i_bad.tensor(), dlog.tensor(), args),
+                    std::runtime_error);
+  }
 
   auto run = [&](int64_t T, int64_t E, int k, bool renorm, DType dt,
                  const std::vector<float>& logits) {
@@ -550,40 +598,110 @@ TEST_CASE("CUDA moe_router_topk parallel == serial byte-for-byte (adversarial)")
     CHECK(idiff == 0);
   };
 
+  // ── The sweep runs TWICE, with VT_MOE_ROUTER_WARP PINNED both ways. ───────
+  // vt::cuda::MoeRouterWarpEnabled() (cuda_moe.cu) is a FRESH getenv per launch,
+  // so WHICH kernel vt::MoeRouterTopK runs below is decided by the environment
+  // ctest was started in. An earlier revision of this case neither set, cleared
+  // nor asserted that variable, which made it unable to say what it had tested:
+  // with `VT_MOE_ROUTER_WARP=0` exported — exactly what spec §9 gates 6/7 tell
+  // the operator to export for the same-binary A/B, in the same shell — every
+  // `run()` below silently exercised the BLOCK kernel, i.e. block-vs-serial,
+  // green since 6a8c5cf9, reporting the identical case and assertion counts. A
+  // green run could not distinguish "the warp kernel is byte-exact" from "the
+  // warp kernel never ran".
+  //
+  // So: pin it, assert the pinned state, and run the sweep under BOTH arms —
+  // "1" pins the candidate warp kernel, "0" pins the same-binary rollback, and
+  // each must be byte-identical to the serial oracle. The pin restores the
+  // ambient value (or its absence) on scope exit.
+  //
+  // This DOUBLES this case's assertion count on purpose. Spec §9 gate 2 treats a
+  // changed count as a red flag; the change is this, and it is the point.
+  //
+  // The body below keeps its original indentation so this change reads as what
+  // it is — a pure wrapper — and a reviewer can see that not one line of the
+  // sweep itself moved.
+  auto sweep = [&]() {
   for (DType dt : {DType::kF32, DType::kBF16}) {
     for (bool renorm : {true, false}) {
       for (int64_t T : {int64_t{1}, int64_t{8}, int64_t{16}}) {
-        // 35B routing shape: E=128, top-8. Random distinct logits.
-        {
-          const int64_t E = 128;
-          std::vector<float> lg(static_cast<size_t>(T * E));
-          std::mt19937 rng(1234u + static_cast<uint32_t>(T));
-          std::uniform_real_distribution<float> d(-4.0f, 4.0f);
-          for (auto& v : lg) v = d(rng);
-          run(T, E, 8, renorm, dt, lg);
-        }
-        // Exact-tie storm: blocks of identical logits so many experts tie at
-        // the max; the tie-break (lowest index) must agree across paths.
-        {
-          const int64_t E = 128;
-          std::vector<float> lg(static_cast<size_t>(T * E));
-          for (int64_t t = 0; t < T; ++t)
-            for (int64_t e = 0; e < E; ++e)
-              lg[static_cast<size_t>(t * E + e)] = static_cast<float>((e / 4) % 5);  // 5 tie groups
-          run(T, E, 8, renorm, dt, lg);
-        }
-        // Uneven load + near-ties around the top-k boundary (E=256, top-8).
-        {
-          const int64_t E = 256;
-          std::vector<float> lg(static_cast<size_t>(T * E));
-          for (int64_t t = 0; t < T; ++t)
-            for (int64_t e = 0; e < E; ++e)
-              lg[static_cast<size_t>(t * E + e)] =
-                  (e < 12 ? 3.0f : 0.0f) + 1e-4f * static_cast<float>((e * 7 + t) % 3);
-          run(T, E, 8, renorm, dt, lg);
+        // E in {32,64,128,256}: EVERY width the single-warp router dispatches
+        // (VPT = E/32 in {1,2,4,8}, VT_MOE_ROUTER_WARP, issue #378), so the
+        // byte-exactness of each derived lane map is pinned on device and not
+        // only by the portable reduction-order test.
+        //
+        // The 35B-A3B gate model is E=256 top-8, NOT the E=128 this case used
+        // to claim: num_experts=256, num_experts_per_tok=8, and its 40 MoE
+        // layers are the 40 router calls/step the decode trace shows. E=256 had
+        // only a hand-built near-tie pattern here and never random logits.
+        for (int64_t E : {int64_t{32}, int64_t{64}, int64_t{128}, int64_t{256}}) {
+          // Random distinct logits.
+          {
+            std::vector<float> lg(static_cast<size_t>(T * E));
+            std::mt19937 rng(1234u + static_cast<uint32_t>(T) + 7919u * static_cast<uint32_t>(E));
+            std::uniform_real_distribution<float> d(-4.0f, 4.0f);
+            for (auto& v : lg) v = d(rng);
+            run(T, E, 8, renorm, dt, lg);
+            run(T, E, 1, renorm, dt, lg);  // k=1
+            // NO k > E arm here — it is not an input this op has. See the
+            // contract block at the top of this case.
+          }
+          // Exact-tie storm: blocks of identical logits so many experts tie at
+          // the max; the tie-break (lowest index) must agree across paths.
+          {
+            std::vector<float> lg(static_cast<size_t>(T * E));
+            for (int64_t t = 0; t < T; ++t)
+              for (int64_t e = 0; e < E; ++e)
+                lg[static_cast<size_t>(t * E + e)] =
+                    static_cast<float>((e / 4) % 5);  // 5 tie groups
+            run(T, E, 8, renorm, dt, lg);
+          }
+          // Uneven load + near-ties around the top-k boundary.
+          {
+            std::vector<float> lg(static_cast<size_t>(T * E));
+            for (int64_t t = 0; t < T; ++t)
+              for (int64_t e = 0; e < E; ++e)
+                lg[static_cast<size_t>(t * E + e)] =
+                    (e < 12 ? 3.0f : 0.0f) + 1e-4f * static_cast<float>((e * 7 + t) % 3);
+            run(T, E, 8, renorm, dt, lg);
+          }
+          // Degenerate rows. The -INFINITY max seed ERASES NaN, so an all-NaN
+          // row normalizes to all zeros and the tie-break must hand back
+          // 0,1,...,k-1; Inf rows exercise the same clamp from the other side.
+          // These are the rows CUDA-graph padding actually produces.
+          {
+            run(T, E, 8, renorm, dt,
+                std::vector<float>(static_cast<size_t>(T * E), std::nanf("")));
+            run(T, E, 8, renorm, dt,
+                std::vector<float>(static_cast<size_t>(T * E), INFINITY));
+            run(T, E, 8, renorm, dt,
+                std::vector<float>(static_cast<size_t>(T * E), -INFINITY));
+            std::vector<float> lg(static_cast<size_t>(T * E), 1.0f);
+            for (int64_t t = 0; t < T; ++t) {
+              lg[static_cast<size_t>(t * E)] = std::nanf("");
+              lg[static_cast<size_t>(t * E + 1)] = INFINITY;
+              lg[static_cast<size_t>(t * E + E - 1)] = -INFINITY;
+            }
+            run(T, E, 8, renorm, dt, lg);
+          }
         }
       }
     }
+  }
+  };  // sweep
+
+  {
+    // ON: vt::MoeRouterTopK dispatches MoeRouterTopKWarpKernel for every E here.
+    vt_test::ScopedMoeRouterWarp pin("1");
+    REQUIRE(vt_test::ScopedMoeRouterWarp::EffectiveFlag());
+    sweep();
+  }
+  {
+    // OFF: the same binary falls through to the unchanged block kernel. This arm
+    // is what the pre-existing evidence actually covered, and it stays covered.
+    vt_test::ScopedMoeRouterWarp pin("0");
+    REQUIRE_FALSE(vt_test::ScopedMoeRouterWarp::EffectiveFlag());
+    sweep();
   }
 }
 #endif  // VLLM_CPP_CUDA

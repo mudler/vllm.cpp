@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,6 +22,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "vllm/http_transport_abi.h"
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -53,6 +55,15 @@ size_t HttpWorkerCount(size_t max_concurrent_streams,
 
 }  // namespace
 
+// The listener type this server constructs, named ONCE so that
+// `vllm::ApiServerListenerIsTls()` below and the member two dozen lines down
+// cannot disagree. The same `CPPHTTPLIB_OPENSSL_SUPPORT` define that gives the
+// HuggingFace fetcher `https` also makes `httplib::SSLServer` compilable, and
+// ENG-HF-MODEL-DOWNLOAD W5 deliberately does NOT enable a listener: that is a
+// separate decision with its own certificate, key, flags and documentation.
+// Changing this alias changes the listener AND the reported value together.
+using ApiServerListener = httplib::Server;
+
 // Opaque httplib::Server (pimpl — keeps httplib.h out of api_server.h).
 struct ApiServer::Impl {
   Impl(size_t max_concurrent_streams, HttpWorkerPoolMode mode)
@@ -80,7 +91,7 @@ struct ApiServer::Impl {
     server.set_tcp_nodelay(true);
   }
 
-  httplib::Server server;
+  ApiServerListener server;
   size_t http_worker_count;
   // The legacy LLMEngine serving constructors remain for small synthetic
   // tests and embedding compatibility. Unlike AsyncLLM, that engine is driven
@@ -1270,3 +1281,30 @@ void ConfigureUtilityEndpoints(ApiServer& server,
 }
 
 }  // namespace vllm::entrypoints::openai
+
+namespace vllm {
+
+// The SERVER half of the one-definition-rule instrument declared in
+// `include/vllm/http_transport_abi.h`. It is defined HERE, in the translation
+// unit that owns the listener, so the reading is that unit's own.
+HttpTransportAbi ApiServerHttpTransportAbi() {
+  HttpTransportAbi abi;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  abi.tls = true;
+#else
+  abi.tls = false;
+#endif
+  abi.result_size = sizeof(httplib::Result);
+  abi.client_connection_size = sizeof(httplib::ClientConnection);
+  return abi;
+}
+
+// Read from the TYPE of the listener this file constructs, not from a constant
+// beside it, so replacing that member with `httplib::SSLServer` flips this to
+// true and the case that asserts it false turns red.
+bool ApiServerListenerIsTls() {
+  return !std::is_same_v<entrypoints::openai::ApiServerListener,
+                         httplib::Server>;
+}
+
+}  // namespace vllm

@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <string>
@@ -48,6 +49,7 @@
 #include "vllm/model_executor/models/laguna_ops.h"
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vt/backend.h"  // vt::GetBackend (device drain for the keep-quant GEMMs)
+#include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W5: the shared capture seam
 #include "vt/dtype.h"    // vt::IsBlockQuant / RowSizeBytes
 #include "vt/ops.h"      // vt::MatmulBT (dispatches kMatmulBTQuant on block weights)
 #include "vt/recipes.h"  // vt::kFusedAddRmsNormStd (L4 residual-add + RMSNorm fusion)
@@ -2113,10 +2115,13 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
 }
 
 // The decode CUDA-GRAPH capture class is irreducibly device-coupled at build time —
-// graph capture/replay is a CUDA driver concept with no portable vt op today. REPAIR
-// OWED: a portable `vt` capture/replay seam (the same one deepseek_v4.cpp's V4Graph would
-// move behind), after which both graphs leave the shared layer together.
-// DSR-ALLOW(S1): decode CUDA-graph capture class; no portable vt capture seam yet.
+// the CHAIN it captures is `VT_MARLIN_NVFP4` CUDA code, so the class compiles only in
+// that build. The REPAIR this note owed has LANDED: the portable `vt` capture/replay
+// seam is `vt::GraphCaptureScope` + `vt::BreakableGraph`
+// (`include/vt/breakable_graph.h`, row ENG-CUDAGRAPH-BREAK, #1163), and this class and
+// `deepseek_v4.cpp`'s `V4Graph` — the sibling this note named — moved onto it together
+// in W5 (#1335). What is left device-coupled is the captured CHAIN, not the capture.
+// DSR-ALLOW(S1): decode CUDA-graph capture class; the CHAIN is CUDA/Marlin, not the seam.
 #ifdef VT_MARLIN_NVFP4
 namespace {
 // ─── Brick A2: the DECODE CUDA GRAPH (mirror of deepseek_v4.cpp V4Graph) ──────────
@@ -2224,7 +2229,15 @@ struct LagunaGraph {
   vt::Event aux_done{};   // recorded on aux after the shared MLP; main waits it (join)
   std::vector<int64_t> argmax_id;
   int32_t last_sampled = -1;
-  void* graph = nullptr;
+  // ENG-CUDAGRAPH-BREAK W5 (#1335): the instantiated graph, its handle ownership
+  // and its release live in the SHARED SEAM instead of in a raw `void*` this
+  // class destroyed by hand. Every segment is released through
+  // `Backend::DestroyGraph`, which is the routing that lets ENG-CUDAGRAPH-DEDUP
+  // (#1162) interpose at the backend later without editing this file. `gstate`
+  // STAYS: it is this driver's cold/warm/captured ladder, not a duplicate of
+  // `captured()` — the seam has no notion of the eager warm-run that grows the
+  // pool so a capture may allocate nothing.
+  vt::BreakableGraph graph;
   int gstate = 0;  // 0 cold (eager warm-run), 1 warm (capture+replay), 2 captured (replay)
 
   LagunaGraph(const LagunaWeights& w_, vt::Queue& q, LagunaKvCache& cache)
@@ -2370,7 +2383,9 @@ struct LagunaGraph {
   ~LagunaGraph() {
     if (qp == nullptr) return;
     vt::Backend& b = vt::GetBackend(qp->device);
-    if (graph != nullptr) b.DestroyGraph(graph);
+    // No `DestroyGraph` here: `graph` releases its own segments. The aux queue
+    // and its two events are still this class's, because the SEAM tracks a fork
+    // and never owns one — see `vt::GraphNoteFork`.
     if (shared_aux) {
       b.DestroyEvent(aux_fork);
       b.DestroyEvent(aux_done);
@@ -2571,6 +2586,17 @@ struct LagunaGraph {
           vt::Backend& b = vt::GetBackend(dev);
           b.RecordEvent(aux_fork, q);          // event0.record() on the main stream (hn ready)
           b.QueueWaitEvent(aux_q, aux_fork);   // aux waits event0 before reading hn
+          // D10 (ENG-CUDAGRAPH-BREAK W5, #1335): tell the capture scope that a
+          // side queue is now participating in this capture. Closing a segment
+          // while a fork is outstanding FAILS at `cudaStreamEndCapture`, and the
+          // scope is the only thing that can see a segment about to close.
+          // Upstream keeps its whole `torch.cuda.Stream.wait_stream` monkey-patch
+          // (`breakable_cuda_graph.py:101-153`) for no other purpose than to know
+          // this; ours is one call, because our fork is explicit. OUTSIDE a
+          // capture it is a no-op making zero backend calls, so the eager arm is
+          // byte-identical. `aux_done` is the join event, and it outlives every
+          // scope because this class owns it.
+          vt::GraphNoteFork(aux_q, aux_done);
           ActivePoolScope guard(&AuxPool(b));  // shared scratch from AuxPool (see device_pool.h)
           LagunaSharedExpertMarlinInto(aux_q, lw.moe, hn.data(), H, so.data());  // fp4 shared on aux
           b.RecordEvent(aux_done, aux_q);      // event1.record() on the aux stream (join target)
@@ -2609,7 +2635,13 @@ struct LagunaGraph {
         // Make the main stream wait for the aux shared MLP (event1.wait) so the combine
         // below reads a fully-computed `so`. Both the routed path (main) and the shared
         // path (aux) are now complete → the combine result is byte-identical to serial.
-        if (do_aux) vt::GetBackend(dev).QueueWaitEvent(q, aux_done);
+        if (do_aux) {
+          vt::GetBackend(dev).QueueWaitEvent(q, aux_done);
+          // D10: the model joined its own fork, so retire the registration. This
+          // is the common arm and the one that must cost nothing — without it the
+          // scope would issue a REDUNDANT second join before every segment close.
+          vt::GraphNoteJoin(aux_q);
+        }
         // LEVER A: hidden += routed + shared; hn = rms_norm(hidden)*next_norm in ONE node
         // (byte-exact vs AddInto(doutb) + FusedAddNorm(so)). Only in the glue-fused regime
         // (the split path is what it replaces); =0 restores the two-node split.
@@ -2686,13 +2718,56 @@ struct LagunaGraph {
       RunChain();
       gstate = 1;
     } else if (gstate == 1) {  // warm: capture the region once, then replay it
-      b.BeginCapture(q);
-      RunChain();
-      graph = b.EndCaptureGraph(q);
-      b.ReplayGraph(q, graph);
-      gstate = 2;
+      // ENG-CUDAGRAPH-BREAK W5 (#1335): the capture is the SHARED SEAM's, not
+      // this class's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope
+      // owns the segment, the handle, its release, the drain a mid-capture throw
+      // needs, the D10 fork set, and the G3 counters.
+      //
+      // kFULL, INHERITED FROM W2 AND NOT RE-ARGUED. vLLM's v1 default
+      // `FULL_AND_PIECEWISE` (`vllm/config/compilation.py:63` @ pin
+      // `5559679229`) is documented at `:630-632` as a FULL graph for DECODE
+      // batches and a piecewise one for prefill and mixed batches, and
+      // `decode_mode()` (`:65-66`) returns the full half. This is the T=1
+      // resident decode step, so its capture is ONE segment with the attention
+      // calls INSIDE it — byte-identical in shape to the region this replaces.
+      {
+        vt::GraphCaptureScope scope(b, q, graph, vt::GraphCaptureMode::kFull);
+        RunChain();
+      }  // ~GraphCaptureScope joins any outstanding fork, closes the segment,
+         // and files it on `graph`
+      // NOT CAPTURED covers TWO states and they mean opposite things.
+      //
+      //   * FAILED (`capture_failed() == true`): `Backend::EndCaptureGraph`
+      //     threw. Under stream capture NOTHING between `BeginCapture` and the
+      //     throw executed — every kernel was RECORDED — so `logits` (and
+      //     `argmax_id` on the on-device-sample arm) hold whatever the pool last
+      //     left there, and returning them would hand this step uncomputed
+      //     device memory as its logits: no fault, and a token gate cannot see
+      //     it. It PROPAGATES, carrying the runtime's own exception, which is
+      //     what the pre-W5 unguarded `EndCaptureGraph` did.
+      //   * INERT (`capture_failed() == false`): capture is unsupported here, or
+      //     `VLLM_CPP_CUDAGRAPH=0`. The scope made no backend call, `RunChain`
+      //     ran EAGERLY, and the buffers hold a real result — so this step
+      //     returns normally and the driver stays in `gstate == 1`, running
+      //     eager every step rather than pretending to hold a graph.
+      if (!graph.captured()) {
+        if (graph.capture_failed()) {
+          const std::exception_ptr err = graph.capture_error();
+          graph.Reset();  // clear the failure with the graph it described
+          if (err) std::rethrow_exception(err);
+          VT_CHECK(false,
+                   "laguna decode graph: the capture was ABANDONED and its logits were "
+                   "never computed; refusing to return uncaptured device memory");
+        }
+      } else {
+        graph.Replay(q);
+        gstate = 2;
+      }
     } else {                   // captured: one cudaGraphLaunch
-      b.ReplayGraph(q, graph);
+      // Through the seam's container, never `Backend::ReplayGraph` directly: it
+      // replays its segments in order (one, here, because this capture is kFull)
+      // and owns the G3 replay counter.
+      graph.Replay(q);
     }
     // LEVER A: the per-layer K/V append is now IN-GRAPH (append_kv_row writes the new row
     // at the device-read slot *len_buf inside RunChain), so the old between-replay host

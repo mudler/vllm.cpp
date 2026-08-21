@@ -70,6 +70,54 @@ class Fp8BlockLinearMethod : public LinearMethodBase {
   const Fp8BlockWeight* w_;
 };
 
+// Block-wise FP8 W8A8 merged `gate_up` + SiluAndMul — MODEL-FP8-BLOCK-MERGED
+// (#1189 milestone M6, spec `.agents/specs/model-fp8-block-merged.md`).
+//
+// vLLM's `gate_up_proj` is ONE MergedColumnParallelLinear
+// (`models/qwen3_5.py:288-298` names the merge, `layers/linear.py:660` is the
+// loader, @ `5559679229`), so this runs
+// ONE block-scaled GEMM over the N-concatenated `[2I,K]` operand and the SwiGLU
+// tail over its halves, rather than two GEMMs and a two-input activation. The
+// merge is exact because a block scale is indexed by `n / block_n`; see
+// `dense_fp8_block::CheckFp8BlockMergeable` for the one geometry it refuses and
+// why upstream cannot express that one either.
+//
+// The SwiGLU sibling of `Nvfp4W4A16MlpGateUpMethod` beside it, and the same
+// shape: a thin policy wrapper over one templated compute body, so the model
+// layer and this seam are the same code rather than two copies of it. The
+// merged device operand lives on the weights, not here, because it is built
+// once for the model's lifetime and this object is a view.
+class Fp8BlockMlpGateUpMethod : public MlpGateUpMethodBase {
+ public:
+  Fp8BlockMlpGateUpMethod(const Fp8BlockWeight* gate, const Fp8BlockWeight* up,
+                          const Fp8BlockMergedResident* merged,
+                          int64_t intermediate)
+      : gate_(gate), up_(up), merged_(merged), I_(intermediate) {}
+
+  DBuf Apply(Dev d, const vt::Tensor& x) const override {
+    const dense_fp8_block::Fp8BlockShard shards[2] = {{gate_, "gate_proj"},
+                                                      {up_, "up_proj"}};
+    const dense_fp8_block::Fp8BlockMergedView view =
+        dense_fp8_block::ResidentFp8BlockMerged(
+            d, vt::kFp8BlockGateUpSwiGLU, "gate_up_proj", shards, 2, *merged_);
+    VT_CHECK(view.n_total == 2 * I_,
+             "fp8-w8a8-block-gate-up: the merged operand's N does not match "
+             "twice the intermediate size");
+    // bf16, because that is upstream's `out_dtype` here -- the model dtype
+    // (`fp8.py:284`) -- and it is what every other arm of this seam emits.
+    return dense_fp8_block::Fp8BlockGateUpSwiGLUD<DBuf>(d, x, view,
+                                                        vt::DType::kBF16);
+  }
+
+  const char* Name() const override { return "fp8-w8a8-block-gate-up"; }
+
+ private:
+  const Fp8BlockWeight* gate_;
+  const Fp8BlockWeight* up_;
+  const Fp8BlockMergedResident* merged_;
+  int64_t I_;
+};
+
 // --- Selection factory (mirrors get_quant_method) ---------------------------
 // The scheme is chosen ONCE, here, from the checkpoint's populated weights:
 // M3's loader rung fills the block field and leaves the bf16 and per-tensor
@@ -82,6 +130,19 @@ inline std::unique_ptr<LinearMethodBase> MakeLinearMethod(
     const OwnedTensor& bf16_w, const Fp8BlockWeight& block_w) {
   if (!block_w.Empty()) return std::make_unique<Fp8BlockLinearMethod>(&block_w);
   return std::make_unique<UnquantizedLinearMethod>(&bf16_w);
+}
+
+// The merged `gate_up` sibling, chosen the same way and by the same rule: M3's
+// loader fills the two block slots and leaves the bf16 merged owner EMPTY.
+inline std::unique_ptr<MlpGateUpMethodBase> MakeMlpGateUpMethod(
+    const OwnedTensor& bf16_gate_up, const Fp8BlockWeight& gate_block,
+    const Fp8BlockWeight& up_block, const Fp8BlockMergedResident& merged,
+    int64_t intermediate) {
+  if (!gate_block.Empty())
+    return std::make_unique<Fp8BlockMlpGateUpMethod>(&gate_block, &up_block,
+                                                     &merged, intermediate);
+  return std::make_unique<UnquantizedMlpGateUpMethod>(&bf16_gate_up,
+                                                      intermediate);
 }
 
 }  // namespace layers

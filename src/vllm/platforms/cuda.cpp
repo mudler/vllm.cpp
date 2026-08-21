@@ -8,7 +8,9 @@
 #include <cstddef>
 #include <vector>
 
+#include "vllm/platforms/cuda_arch_manifest.h"
 #include "vllm/platforms/cuda_attn_priority.h"
+#include "vllm/platforms/cuda_compiled_archs.h"
 #include "vllm/platforms/interface.h"
 
 #include "vt/backend.h"
@@ -19,9 +21,11 @@ namespace {
 class CudaPlatform final : public Platform {
  public:
   CudaPlatform(int cc_major, int cc_minor, bool integrated,
+               bool host_memory_device_addressable,
                size_t device_memory_total_bytes)
       : cap_{cc_major, cc_minor},
         integrated_{integrated},
+        host_memory_device_addressable_{host_memory_device_addressable},
         device_memory_total_bytes_{device_memory_total_bytes} {}
 
   DeviceType device_type() const override { return DeviceType::kCUDA; }
@@ -59,6 +63,16 @@ class CudaPlatform final : public Platform {
   // reports integrated. Surface parity for the ROCm/memory-reporting port.
   bool is_integrated_gpu() const override { return integrated_; }
 
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). Probed once at registration
+  // from `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — the same
+  // conjunction `src/vt/cuda/cuda_arch_tactics.cu::ProbeDeviceCaps` already
+  // gathers for the kernel layer, kept in one shape so the two layers cannot
+  // answer differently. See the base declaration for why neither attribute alone is
+  // the predicate, and why this is NOT `needs_weight_staging()` inverted.
+  bool host_memory_is_device_addressable() const override {
+    return host_memory_device_addressable_;
+  }
+
   // cuda.py:662 support_static_graph_mode -> True (CUDA graph capture mode).
   bool support_static_graph_mode() const override { return true; }
 
@@ -70,11 +84,28 @@ class CudaPlatform final : public Platform {
   // direct-view reference path. Exactly what `device==kCUDA` returned.
   bool needs_weight_staging() const override { return true; }
 
-  // S7 attention fast-path POLICY -> True: this device carries the vendored
+  // S7 attention fast-path POLICY: does THIS device carry the vendored
   // flash-attention-2 native-bf16 split-KV kernel the FA2 dispatch selects
-  // (cuda_paged_attn.cu). Base false answers the f32 graph-captured fallback.
-  // Exactly what `device==kCUDA` returned at the FA2 dispatch gate.
-  bool supports_fa2_attention() const override { return true; }
+  // (cuda_paged_attn.cu)? False answers the f32 graph-captured fallback.
+  // Consumed at qwen3_5.cpp's FA2 dispatch gate, where it decides `attn_dt`.
+  //
+  // THIS RETURNED `true` UNCONDITIONALLY UNTIL ISSUE #1357, for every CUDA
+  // device the registrar probes, while CMakeLists.txt defaults
+  // VLLM_CPP_CUDA_ARCHITECTURES to `121a` alone and the feature table narrows
+  // FA2 further. A default build run on an sm_86 card therefore took the FA2
+  // path with no SASS for the device. That is the same class of claim that made
+  // the reference engine select an unrunnable FlashAttention on a GB10
+  // (#1332): a predicate answering from the DEVICE when the question that
+  // decides the launch is about the BINARY.
+  //
+  // It now asks the build. The manifest is GENERATED from VT_FA2_ARCHS beside
+  // the vt_cuda_set_source_gencode call that turns that same variable into
+  // nvcc's -gencode options, so it cannot name an architecture the compiler was
+  // not handed, and it is empty whenever FA2 was not compiled at all.
+  bool supports_fa2_attention() const override {
+    return ArchIsCompiled(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS, cap_.major,
+                          cap_.minor);
+  }
 
   // interface.py:181-187 supported_dtypes order (bf16 default fallback).
   std::vector<DType> supported_dtypes() const override {
@@ -136,6 +167,7 @@ class CudaPlatform final : public Platform {
  private:
   DeviceCapability cap_;
   bool integrated_ = false;
+  bool host_memory_device_addressable_ = false;
   // cudaMemGetInfo's `total`, probed once at registration; 0 == UNKNOWN.
   size_t device_memory_total_bytes_ = 0;
 };
@@ -164,6 +196,17 @@ struct Registrar {
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) != cudaSuccess) {
       integrated = 0;
     }
+    // host_memory_is_device_addressable (ENG-EXPERT-STREAM-DEVICE W0b, issue
+    // #1124) — probed here, beside the attribute above, because it is the SAME
+    // question asked of the other direction of the bus. A query failure defaults
+    // to 0, which answers false: handing a host pointer to a device kernel on a
+    // device that cannot follow it is a fault, so the conservative answer is the
+    // one that keeps staging.
+    int pageable = 0;
+    if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) !=
+        cudaSuccess) {
+      pageable = 0;
+    }
     // ResidencyPolicy::device_memory_total_bytes (issue #1123) — probe once here,
     // beside the other device probes. `nvidia-smi` is the WRONG instrument for
     // this on a GB10: `--query-gpu=memory.total,memory.free,memory.used` answers
@@ -187,8 +230,16 @@ struct Registrar {
     // static outlives the registrar as RegisterPlatform requires.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
-    static CudaPlatform platform(major, minor, integrated != 0,
-                                 total_bytes);  // device 0 only
+    static CudaPlatform platform(
+        major, minor, integrated != 0,
+        // #1378: the conjunction is a named, CPU-testable decision now
+        // (`HostMemoryIsDeviceAddressableFromAttrs`, declared in
+        // `platforms/interface.h`), not two `!= 0` tests written here where no
+        // reachable box can falsify either of them. The probe still owns the two
+        // VALUES, including the 0 a failed query leaves; the rule that combines
+        // them is gated on the CPU tier.
+        HostMemoryIsDeviceAddressableFromAttrs(pageable, integrated),
+        total_bytes);  // device 0 only
 #pragma GCC diagnostic pop
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }

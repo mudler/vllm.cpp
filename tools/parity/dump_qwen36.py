@@ -10,7 +10,8 @@ by vLLM itself. We attach forward hooks to capture per-layer hidden states and
 compute logits from the model's own bf16 lm_head. See
 .agents/specs/qwen36-forward-notes.md for the full recipe + rationale.
 
-Run on dgx (GB10, 119 GiB unified) in the pip oracle venv (`~/venvs/vllm-oracle`,
+Run on the gate host (a GB10 with 119 GiB unified memory) in the pip oracle
+venv (`${VLLM_ORACLE}`,
 pip vLLM 0.24.0 — same release family as pin e24d1b24). The pinned-Python-over-
 pip-kernels overlay was TRIED and BLOCKED (the post-0.24.0-tag pinned Python
 expects a newer vendored/compiled API than the pip 0.24.0 wheel ships — see
@@ -18,8 +19,8 @@ expects a newer vendored/compiled API than the pip 0.24.0 wheel ships — see
 forward-math module in these checkpoints is byte-identical to the pin; only
 weight-loader plumbing + ROCm code differ. The ACTUAL working command (§4):
 
-    ssh dgx.casa 'cd ~/work/vllm.cpp && VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-        PATH=~/venvs/vllm-oracle/bin:$PATH ~/venvs/vllm-oracle/bin/python \
+    ssh "${GATE_HOST}" 'cd "${GATE_CHECKOUT}" && VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+        PATH="${VLLM_ORACLE}/bin:$PATH" "${VLLM_ORACLE}/bin/python" \
         tools/parity/dump_qwen36.py --model <snapshot_dir> --tag <27b|35b> \
         --out tests/parity/goldens'
 

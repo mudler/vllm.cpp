@@ -16,10 +16,21 @@ function(vllm_cpp_set_warnings target)
     set(_vllm_cpp_werror "")
   endif()
 
-  # GCC >= 16 reports -Warray-bounds inside LIBSTDC++ and the vendored nlohmann
+  # GCC >= 15 reports -Warray-bounds inside LIBSTDC++ and the vendored nlohmann
   # json for code that is correct, so the diagnostic stays VISIBLE but stops
-  # being fatal on those compilers only. Everything <= 15 is unchanged and still
+  # being fatal on those compilers only. Everything <= 14 is unchanged and still
   # fails the build on a real out-of-bounds.
+  #
+  # The bound was 16 until gcc 15.2.0 reproduced the same class from the OTHER
+  # libstdc++ container: `std::vector<float>`'s inlined copy-construct plus
+  # `_M_allocate`, reported against `ltx2_samplers.cpp:161,163` as "array
+  # subscript -1 is outside array bounds of 'float [2305843009213693951]'". That
+  # bound is SIZE_MAX/4, the giveaway that the allocator's unconstrained size
+  # range reached the subscript check rather than a real object. The subscripts
+  # are `sigmas.back()` guarded by an explicit `VT_CHECK(sigmas_in.size() >= 2)`
+  # three lines above, which GCC does not propagate through the inlined copy. So
+  # `main` did not build on gcc 15.x at all, and no CI lane covers that release:
+  # `build-newest-gcc` runs 16 (already exempt) and `build-test-cpu` runs older.
   #
   # It is the same false-positive class this file already documents above for
   # the sanitizer lanes, and it is not something the calling code can avoid:
@@ -37,7 +48,7 @@ function(vllm_cpp_set_warnings target)
   # check the same way on the affected releases.
   set(_vllm_cpp_array_bounds "")
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
-     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
     set(_vllm_cpp_array_bounds -Wno-error=array-bounds)
   endif()
   if(MSVC)

@@ -1,11 +1,11 @@
 # Parity harness (test-time oracle)
 
 Goldens under `tests/parity/goldens/` are produced by UPSTREAM vLLM code —
-never re-implemented math. Oracle venv (dgx.casa): `~/venvs/vllm-oracle`
-(`python3 -m venv ~/venvs/vllm-oracle && pip install vllm==0.24.0`).
+never re-implemented math. Oracle venv, `${VLLM_ORACLE}` in `.env`
+(`python3 -m venv "${VLLM_ORACLE}" && pip install vllm==0.24.0`).
 
 Regenerate:
-    ssh dgx.casa 'cd ~/work/vllm.cpp && ~/venvs/vllm-oracle/bin/python \
+    ssh "${GATE_HOST}" 'cd "${GATE_CHECKOUT}" && "${VLLM_ORACLE}"/bin/python \
       tools/parity/dump_ops.py --out tests/parity/goldens'
 then commit the changed goldens. Manifests record the oracle version + pin.
 
@@ -16,7 +16,7 @@ pinned-source dumper:
       --out tests/parity/goldens --only yarn llama3 longrope dynamic
 
 It first tries the installed oracle. If that import is unavailable, it verifies
-the full `/home/mudler/_git/vllm` commit and executes the exact pinned
+the full `${VLLM_SOURCE}` commit and executes the exact pinned
 `common.py`, `base.py`, `yarn_scaling_rope.py`, `mrope.py`, `llama3_rope.py`,
 `phi3_long_rope_scaled_rope.py`, and both `dynamic_ntk_*_rope.py` class files
 with
@@ -34,11 +34,11 @@ The oracle venv runs pip vLLM **0.24.0**, which is NEWER than the porting pin
 drift-verified vs the pin (byte-identical); matmul/embedding are pure-torch
 oracles. Before adding any new dumper (MoE, attention, quant), diff that op's
 `forward_native` between the installed 0.24.0 package and the pinned checkout
-at /home/mudler/_git/vllm — if semantics differ, dump from the pinned source
+at `${VLLM_SOURCE}` — if semantics differ, dump from the pinned source
 instead and record how in the manifest args. Manifests always record the
 oracle version, so a silent regen with a different version shows up in git.
 
 Model/layer-level goldens (M0.7+) MUST be dumped from the pinned checkout
-(`PYTHONPATH=/home/mudler/_git/vllm` at the pin), not pip vLLM — per-op drift
+(`PYTHONPATH=${VLLM_SOURCE}` at the pin), not pip vLLM — per-op drift
 audits don't scale to whole-model forwards. torch version: manifests record it
 (2.11.0); keep the venv's torch matching when regenerating.

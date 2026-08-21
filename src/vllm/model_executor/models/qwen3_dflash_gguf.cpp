@@ -129,6 +129,17 @@ HfConfig MakeDflashGgufConfig(const GgufFile& gguf) {
   c.raw = nlohmann::json::object();
   c.raw["block_size"] = ReqI64(gguf, p + "block_size");
 
+  // SPEC-DFLASH2 W1 (#1314): `dflash.attention.causal` is the GGUF spelling of
+  // the HF top-level `is_causal`, and it resolves in the same precedence --
+  // ahead of `dflash_config.causal` and ahead of the pattern-derived rule
+  // above. The published DFlash2 GGUF declares it FALSE beside an all-true
+  // sliding-window pattern, so the pattern alone answers CAUSAL for every layer
+  // and the drafter loses acceptance with nothing to see. Optional: a DFlash1
+  // GGUF declares no such key and keeps the pattern-derived answer.
+  if (const GgufValue* causal = gguf.FindKv(p + "attention.causal")) {
+    c.raw["is_causal"] = KvI64(*causal, p + "attention.causal") != 0;
+  }
+
   // target_layer_ids: llama.cpp's DFlashModel::set_gguf_parameters writes
   // `[i + 1 for i in target_layer_ids]`, so the stored list is OFFSET BY ONE
   // from the HF value the engine expects. Undo it here. Getting this wrong is
@@ -155,8 +166,85 @@ HfConfig MakeDflashGgufConfig(const GgufFile& gguf) {
            "dflash gguf: missing 'tokenizer.ggml.mask_token_id' (the block "
            "drafter masks nothing without it)");
   dcfg["mask_token_id"] = KvI64(*mask, "tokenizer.ggml.mask_token_id");
+
+  // SPEC-DFLASH2 W5 (#1314): the DFlash2 geometry, which through W4 this reader
+  // did not carry at all -- so a DFlash2 GGUF resolved to a DFlash1 config, and
+  // the arm was refused at startup rather than loaded as a lesser model.
+  //
+  // THE KEY SPELLING IS MEASURED, not inferred. Every DFlash2 config key that
+  // `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed`
+  // writes is the HF `dflash_config` key name VERBATIM under the `dflash.`
+  // prefix: `dflash.block_size`, `dflash.conv_kernel_size`,
+  // `dflash.conv_group_size`, `dflash.selector_rank`, `dflash.selector_top_k`.
+  // Five of five, read off the file on 2026-08-20.
+  //
+  // ALL FOUR OR NONE, and `ReqI64` names the one that is missing. `IsDflash2Gguf`
+  // answers on ANY ONE of three of them, so a file carrying a subset would
+  // otherwise be admitted with a guessed geometry -- and a wrong
+  // `conv_group_size` sizes the kernel projection wrong, which is
+  // acceptance-only and token-invisible because the verify is lossless.
+  // `LoadQwen3DFlash` applies the same both-or-neither polarity to the pair it
+  // reads.
+  if (IsDflash2Gguf(gguf, nullptr)) {
+    dcfg["conv_kernel_size"] = ReqI64(gguf, p + "conv_kernel_size");
+    dcfg["conv_group_size"] = ReqI64(gguf, p + "conv_group_size");
+    dcfg["selector_rank"] = ReqI64(gguf, p + "selector_rank");
+    dcfg["selector_top_k"] = ReqI64(gguf, p + "selector_top_k");
+    // The three OUTPUT SCALARS, under the same measured convention. NEITHER
+    // published DFlash2 GGUF declares any of them, so these reads are inert on
+    // every artifact that exists today -- and that is exactly why they are here
+    // rather than owed: `z-lab/Muse-Glimmer-30B-DFlash2` SETS two of them in
+    // safetensors (#1327), both are applied to the candidate VALUES before the
+    // selector scores them, and a GGUF conversion of that draft that this reader
+    // silently ignored would run a quietly different model. Absent means
+    // upstream's default, which `LoadQwen3DFlash` supplies; present and
+    // uncoercible is refused there by name.
+    for (const char* key : {"output_multiplier", "final_logit_softcapping",
+                            "input_embedding_scale"}) {
+      const std::string full = p + key;
+      if (const GgufValue* v = gguf.FindKv(full)) dcfg[key] = KvF64(*v, full);
+    }
+  }
   c.raw["dflash_config"] = std::move(dcfg);
   return c;
+}
+
+int64_t DflashGgufTokenizerVocab(const GgufFile& gguf) {
+  // The draft's OWN vocabulary, and the only one it declares. A DFlash draft
+  // GGUF carries no `*.vocab_size` key and no embedding tensor, because it
+  // SHARES the target's -- which is why `MakeDflashGgufConfig` leaves
+  // `HfConfig::vocab_size` 0 for the caller to fill from the target.
+  //
+  // The candidate selector needs a number BEFORE that point: its two codebooks
+  // are `[vocab, rank]` and `LoadQwen3DFlash` checks their extent at load. The
+  // tokenizer array is the right source because it is INDEPENDENT of the
+  // codebooks -- checking the codebooks against a number read off the codebooks
+  // is a tautology, and would report a transposed or truncated pair as correct.
+  // Measured 2026-08-20: 248320 tokens on the published DFlash2 drafter, exactly
+  // its codebook row count, and 202048 on `muse-glimmer-30b-gguf/dflash-kquant.gguf`.
+  const GgufValue* toks = gguf.FindKv("tokenizer.ggml.tokens");
+  VT_CHECK(toks != nullptr,
+           "dflash gguf: missing 'tokenizer.ggml.tokens' (a DFlash2 draft needs "
+           "the vocabulary to size its candidate-selector codebooks, and it "
+           "declares no vocab_size key of its own)");
+  return static_cast<int64_t>(
+      KvArray(*toks, "tokenizer.ggml.tokens")->elems.size());
+}
+
+bool IsDflash2Gguf(const GgufFile& gguf, std::string* matched_key) {
+  // Ordered so the message names the most specific key a reader can grep for.
+  static const char* kDflash2Keys[] = {
+      "dflash.selector_rank",
+      "dflash.selector_top_k",
+      "dflash.conv_kernel_size",
+  };
+  for (const char* key : kDflash2Keys) {
+    if (gguf.FindKv(key) != nullptr) {
+      if (matched_key != nullptr) *matched_key = key;
+      return true;
+    }
+  }
+  return false;
 }
 
 // Owns the dequantized bf16 buffers the resolver hands out views over. The
@@ -193,6 +281,19 @@ class DflashGgufTensors {
     if (n == "fc.weight") return "fc.weight";
     if (n == "hidden_norm.weight") return "enc.output_norm.weight";
     if (n == "norm.weight") return "output_norm.weight";
+    // SPEC-DFLASH2 W5 (#1314): the candidate selector's three tensors. The
+    // converter drops the `candidate_selector.` component and the `_codebook`
+    // suffix and gives all three the `.weight` a GGUF tensor carries, so none of
+    // the three names is derivable from the HF one -- they are READ off
+    // `z-lab/Qwen3.8-27B-DFlash2-GGUF` @
+    // `57ab3265056d4024870b0621cfc2c127537020ed` and held against the artifact
+    // by tests/vllm/models/test_qwen3_dflash2_gguf.cpp's asset-gated case.
+    if (n == "candidate_selector.hidden_projection.weight")
+      return "selector_hidden.weight";
+    if (n == "candidate_selector.predecessor_codebook")
+      return "selector_predecessor.weight";
+    if (n == "candidate_selector.successor_codebook")
+      return "selector_successor.weight";
     VT_CHECK(n.rfind("layers.", 0) == 0,
              "dflash gguf: unexpected tensor name '" + n + "'");
     const size_t dot = n.find('.', 7);
@@ -212,6 +313,15 @@ class DflashGgufTensors {
         {"mlp.gate_proj.weight", "ffn_gate.weight"},
         {"mlp.up_proj.weight", "ffn_up.weight"},
         {"mlp.down_proj.weight", "ffn_down.weight"},
+        // SPEC-DFLASH2 W5 (#1314): the two grouped convolutions. llama.cpp names
+        // the sublayers `attn_` and `ffn_`, so `attention_conv` and `mlp_conv`
+        // do NOT survive the conversion and neither does `kernel_projection`.
+        // The BASE kernel keeps no `.weight` suffix while the PROJECTION does,
+        // which is the converter's own asymmetry and not a typo here.
+        {"attention_conv.base_kernel", "attn_conv_base"},
+        {"attention_conv.kernel_projection.weight", "attn_conv_proj.weight"},
+        {"mlp_conv.base_kernel", "ffn_conv_base"},
+        {"mlp_conv.kernel_projection.weight", "ffn_conv_proj.weight"},
     };
     const auto it = kSuffix.find(rest);
     VT_CHECK(it != kSuffix.end(),
@@ -232,6 +342,21 @@ Qwen3DFlashWeights LoadQwen3DFlashFromGguf(const GgufFile& gguf,
   const TensorResolver get = [&tensors](const std::string& name) -> const StTensor& {
     return tensors.Get(name);
   };
+  // SPEC-DFLASH2 W5 (#1314): a DFlash2 draft needs a vocabulary AT LOAD, and a
+  // DFlash draft GGUF declares none -- `MakeDflashGgufConfig` deliberately
+  // leaves `vocab_size` 0 so the caller fills it from the target whose head the
+  // draft shares. The selector's codebooks are `[vocab, rank]` and are checked
+  // against that number inside `LoadQwen3DFlash`, so 0 would refuse every
+  // DFlash2 GGUF at `selector_top_k must not exceed the vocabulary`.
+  //
+  // The substitution is LOCAL, on a copy: the returned config the caller holds
+  // still carries 0, so `LoadDflashDraft`'s own fill from the target's embedding
+  // rows is unchanged, and a DFlash1 GGUF never enters this branch at all.
+  if (IsDflash2Gguf(gguf, nullptr) && config.vocab_size == 0) {
+    HfConfig with_vocab = config;
+    with_vocab.vocab_size = DflashGgufTokenizerVocab(gguf);
+    return LoadQwen3DFlash(get, with_vocab, num_taps, mask_token_id);
+  }
   return LoadQwen3DFlash(get, config, num_taps, mask_token_id);
 }
 

@@ -109,8 +109,9 @@ void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
   // question is asked at `ModelRegistry::Prepare` — called by every runner
   // before the first forward and before graph capture — so a CUDA user is told
   // here rather than inside the first GEMM or, worse, inside a capture. Inert
-  // on CPU and on every other checkpoint. Milestone M5 removes this with the
-  // kernel it names.
+  // on CPU and on every other checkpoint. M5 (`489a9a4c0`) narrowed rather than
+  // removed it: the CUTLASS kernel covers `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a)
+  // only, and a CUDA arch outside that cell is still refused here by name.
   RefuseUnrunnableQwen3_5DenseFp8Block(
       ModelAs<Qwen3_5DenseLoadedModel>(model,
                                         "Qwen3_5ForConditionalGeneration")
@@ -182,12 +183,31 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
     const char* v = std::getenv("VT_SPEC_DECODE_GRAPH");
     return v == nullptr || (v[0] != '\0' && v[0] != '0');
   }();
+  //
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): the predicate itself is the RUNNER's now.
+  // This file used to re-derive uniformity, the GDN-prefill conjunct and the
+  // configured-width comparison for itself, and `qwen3_5_dense.cpp` carried a
+  // byte-identical copy of the same twenty lines -- one predicate written twice,
+  // which is the shape this row exists to remove. `input.uniform_query_len` is
+  // the answer, computed once in `GPUModelRunner::execute_model` through
+  // `v1::ActualUniformDecodeQueryLen`.
+  //
+  // WHAT WIDENED, AND IT IS [#1020]. The old test demanded the batch's uniform
+  // length equal `1 + num_speculative_tokens` EXACTLY, the width configured for
+  // the engine's lifetime. The scheduler clamps drafts to the step's token
+  // budget, so a step every request entered with the same SHORTER draft prefix
+  // is uniform at a shorter length, is exactly the shape a graph can serve, and
+  // got none. `uniform_query_len > 1` admits it at its actual depth. The driver
+  // keys its slot ring on `(S, q, spec)` so the wider predicate cannot reach a
+  // graph captured for a different shape.
+  //
+  // `> 1` rather than `>= 1` because the pure-decode arm is `input.pure_decode`
+  // on the left: at q == 1 the two are the same population and `pure_decode` is
+  // the one every other driver reads. A value above 1 also PROVES speculation is
+  // configured, because the runner bounds the length by `1 + num_spec()`.
   const bool uniform_decode =
       input.pure_decode ||
-      (spec_graph && input.num_speculative_tokens > 0 && input.gdn_meta.num_prefill_tokens == 0 &&
-       v1::IsUniformDecodeBatch(input.num_reqs, input.attn_meta.num_actual_tokens,
-                                input.attn_meta.max_query_len,
-                                input.num_speculative_tokens) &&
+      (spec_graph && input.uniform_query_len > 1 &&
        // The captured region emits EVERY row, so only a no-op gather may take it.
        // A spec verify needs all 1+k rows anyway, so this holds there.
        (input.logits_indices.empty() ||

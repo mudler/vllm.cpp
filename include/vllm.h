@@ -270,7 +270,63 @@ extern "C" {
  * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
  * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
  * acoustic half are still host reference loops (see docs/FEATURES.md). */
-#define VLLM_ABI_VERSION 21
+/* v22 — vllm_model_params.mmproj_path, THE SECOND GGUF FILE (row
+ * `LOAD-GGUF-MMPROJ`, issue #821). A GGUF multimodal model ships as two files:
+ * the language `.gguf` and a `clip`-architecture `mmproj-*.gguf` carrying the
+ * vision tower. Before this field the ABI could name only the first, so a GGUF
+ * multimodal checkpoint could be loaded only as a text model and the projector
+ * had nowhere to arrive.
+ *
+ * The spelling mirrors llama.cpp's user-facing `--mmproj`, which is the flag
+ * every holder of these artifacts already types. It is EXPLICIT by design:
+ * auto-discovery of a sibling `mmproj*.gguf` is deliberately not implemented,
+ * because a directory holding two unrelated models would then silently fuse
+ * them and the failure would be a wrong-shaped model rather than an error.
+ *
+ * SCOPE, and it carries the same weight as the field: this loads the tower and
+ * hands it to the engine. THIS ABI STILL HAS NO MULTIMODAL REQUEST PATH, so
+ * `vllm_chat` / `vllm_generate` cannot yet feed the tower an image — exactly
+ * the state the v19 note above records for the multimodal limits. What the
+ * field buys today is that the projector is READ, VALIDATED and REFUSED BY
+ * NAME at load instead of being unnameable.
+ *
+ * Appended at the END of vllm_model_params, so a zero-initialized v21 struct is
+ * byte-identical: NULL/empty means no projector, which is every load that
+ * existed before. */
+
+/* v23 — vllm_video_last_phase_log, WHERE A RENDER SPENT ITS WALL (issue #1010,
+ * row LTX25-DEVICE-RESIDENCY stage W0).
+ *
+ * Before this the LTX-2.5 render path emitted one line per render, so a render
+ * that took two hours could not say which of its phases took them. Every
+ * attempt to act on that profile has since failed on a measurement defect: the
+ * evidence existed only on a host that stopped answering (#1040), the 1731 s
+ * phase #1087 measures is unnamed, and #1024's GPU-zero window is known to be
+ * neither the denoise nor the decode.
+ *
+ * A completed generation now WRITES a phase table — `phase-log.json`, beside
+ * the frames, on the shipped default and behind no flag — carrying, per phase,
+ * a monotone timestamp, a duration, a peak host byte count and a peak device
+ * byte count, plus the wall and the `unaccounted_seconds` the named phases did
+ * NOT cover. That residue is emitted rather than smeared over the phases,
+ * because a table whose parts do not add up has a phase nobody named.
+ *
+ * PURELY ADDITIVE: no struct changed and no existing signature moved, which is
+ * why the path is a QUERY on the handle rather than a new member on
+ * vllm_video_result. Growing an OUTPUT struct is the one append a caller cannot
+ * absorb by zero-initializing, since the library writes the field with its own
+ * sizeof. A family that emits no table returns NULL.
+ *
+ * IT IS v23 AND IT WAS WRITTEN AS v22. `vllm_model_params.mmproj_path` (issue
+ * #821) took v22 on `main` while this branch was open, and both features had
+ * merged into a tree that defined 22 twice. Two additions under one version is
+ * not a textual conflict a merge tool resolves — the number is the caller's only
+ * question ("does the library I loaded have this?"), and one that answers yes
+ * for a feature the build does not carry is worse than no version at all. So
+ * this one moved. The dependent sites moved with it: the >= floor in
+ * `tests/capi/test_capi.cpp`, the table row and the version line in
+ * `docs/USAGE.md`, and the surface row in `docs/FEATURES.md`. */
+#define VLLM_ABI_VERSION 23
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -595,6 +651,20 @@ typedef struct vllm_model_params {
    * per the paragraph above fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
   const char* limit_mm_per_prompt;
+  /* ── The `clip` multimodal projector (ABI v22) ────────────────────────────
+   * Path to the SECOND GGUF file — `mmproj-*.gguf`, `general.architecture` =
+   * `clip` — beside a `.gguf` model path. NULL or empty (the zero value) means
+   * no projector, which is byte-identical to pre-v22.
+   *
+   * Refused BY NAME with VLLM_ERR_MODEL_LOAD — the code every FromModelDir
+   * failure reports, exactly as an absent named device does — when: the model path is
+   * not a `.gguf` (a safetensors checkpoint carries its tower in its own
+   * shards); the file is not a `clip` projector; its `clip.projector_type` is
+   * not one this build loads; or it carries only the first half of the
+   * temporal patch embedding, which cannot be completed without inventing the
+   * other half. Every one of those fires BEFORE the tokenizer and before any
+   * language-model weight byte is read. Borrowed for the call only. */
+  const char* mmproj_path;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────
@@ -1063,6 +1133,20 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
 /* Free the owned members of a result and zero the struct. The struct itself
  * is caller storage. NULL is a no-op. */
 VLLM_API void vllm_video_result_free(vllm_video_result* out);
+
+/* v23: the phase table the LAST completed vllm_video_generate on this handle
+ * wrote — an absolute path to a JSON file holding, per phase, a monotone
+ * timestamp, a duration, and peak host and device byte counts, plus the wall
+ * and the time the named phases did not cover.
+ *
+ * Points at storage the library owns for the lifetime of the handle (the
+ * vllm_video_engine_family precedent); the caller must NOT free it, and the
+ * next generate replaces it. NULL when this handle has completed no
+ * generation, when the family emits no table, or when the engine is NULL.
+ *
+ * The FILE is the deliverable, not this string: a number that lives only in a
+ * process nobody attached to is the evidence class issue #1040 is made of. */
+VLLM_API const char* vllm_video_last_phase_log(const vllm_video_engine* engine);
 
 /* ── Standalone MP4 mux-argv composer ─────────────────────────────────────────
  * The encoding contract (h264/yuv420p + AAC, -shortest, +faststart) is the

@@ -16,6 +16,7 @@
 // CUDA parity tests are HasCuda-guarded.
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
@@ -506,6 +507,208 @@ void ApplyTopKTopPCuda(Queue& q, Tensor& logits, const Tensor* k, const Tensor* 
   Check(cudaGetLastError(), "top_k_top_p launch");
 }
 
+// --- top-k that EMITS the surviving (id, value) pairs -----------------------
+// SPEC-DFLASH2 W3 / D2 (#1314). The CUDA arm of vt::TopKValuesIndices, whose
+// contract, tie-break and upstream anchor live on `TopKValuesIndicesArgs`
+// (include/vt/ops.h). `src/vt/cpu/cpu_ops.cpp::TopKValuesIndicesKernel` is the
+// authoritative reference.
+//
+// This is the SAME pivot-bracket threshold search ApplyTopKTopPRowKernel above
+// runs -- deliberately, because D2 rejects porting FlashInfer's 3380-line radix
+// kernel for a shape that is K=16 over 248320 for about 224 rows. The difference
+// is what happens after `thr_k`: that kernel masks everything below it in place
+// and returns no indices, and this one COMPACTS the survivors and orders exactly
+// k of them.
+//
+// THE TIE IS THE WHOLE DIFFICULTY. The bracket search converges to an exact
+// array VALUE, so `{x >= thr_k}` keeps whole tie groups and can hold MORE than k
+// elements. Everything strictly greater than `thr_k` survives unconditionally
+// (there are at most k-1 such elements, by the definition of the k-th largest),
+// and the remaining `k - cnt_gt` slots go to the LOWEST-INDEXED elements equal
+// to `thr_k` -- which is the (value DESC, index ASC) order the CPU reference
+// pins. The equal-valued slots are filled by repeated block-wide min-index
+// passes rather than by a scan, because a single-threaded scan of a 248320-wide
+// row would cost more than the search that produced the threshold.
+//
+// NOT gated on this host: there is no `nvcc` here, so this kernel has never
+// compiled. See `## Owed` of .agents/specs/dflash2-spec-decode.md.
+__device__ inline int BlockRedMinI(int v, int* s) {
+  const int t = threadIdx.x;
+  s[t] = v;
+  __syncthreads();
+  for (int o = kBlock / 2; o > 0; o >>= 1) {
+    if (t < o) s[t] = min(s[t], s[t + o]);
+    __syncthreads();
+  }
+  const int r = s[0];
+  __syncthreads();
+  return r;
+}
+
+__global__ void TopKValuesIndicesRowKernel(float* out_values, int64_t* out_indices,
+                                           const float* logits, int64_t v, int64_t usable,
+                                           int k) {
+  const int64_t row = blockIdx.x;
+  const float* r = logits + row * v;
+  const int t = threadIdx.x;
+
+  __shared__ float red[kBlock];
+  __shared__ int redi[kBlock];
+  __shared__ float sh_thr;
+  __shared__ int sh_count;
+  extern __shared__ float pairs[];  // k floats of value, then k ints of index
+  int* pair_idx = reinterpret_cast<int*>(pairs + k);
+
+  // Bracket over the USABLE columns only: `usable = V - num_org_vocab_padding`,
+  // so an org-vocab padding tail can never contribute a candidate. This is
+  // upstream's `logits[..., -num_pad:] = -inf`, done by restricting the search
+  // rather than by writing to a read-only input.
+  float lmax = kNegInf, lmin = INFINITY;
+  for (int64_t j = t; j < usable; j += kBlock) {
+    const float x = r[j];
+    lmax = fmaxf(lmax, x);
+    if (x != kNegInf) lmin = fminf(lmin, x);
+  }
+  const float mx = BlockRedMaxF(lmax, red);
+  const float mn = BlockRedMinF(lmin, red);
+
+  float thr = mn;  // k-th largest; every usable element is >= mn by construction
+  {
+    int lc = 0;
+    for (int64_t j = t; j < usable; j += kBlock)
+      if (r[j] > mn) ++lc;
+    const int cnt_gt_min = BlockRedSumI(lc, redi);
+    if (cnt_gt_min >= k) {
+      float low = mn, high = mx, min_gt_low = mx, max_le_high = mn;
+      for (int iter = 0; iter < kThreshMaxIter; ++iter) {
+        const float p0 = (2.0f * low + high) / 3.0f;
+        const float p1 = (low + 2.0f * high) / 3.0f;
+        int l0 = 0, l1 = 0;
+        float lmglow = high, lmleh = low;
+        for (int64_t j = t; j < usable; j += kBlock) {
+          const float x = r[j];
+          if (x > p0) ++l0;
+          if (x > p1) ++l1;
+          if (x > low) lmglow = fminf(lmglow, x);
+          if (x <= high) lmleh = fmaxf(lmleh, x);
+        }
+        const int c0 = BlockRedSumI(l0, redi);
+        const int c1 = BlockRedSumI(l1, redi);
+        min_gt_low = BlockRedMinF(lmglow, red);
+        max_le_high = BlockRedMaxF(lmleh, red);
+        if (c1 >= k) {
+          low = p1;
+        } else if (c0 >= k) {
+          low = p0;
+          high = fminf(p1, max_le_high);
+        } else {
+          high = fminf(p0, max_le_high);
+        }
+        if (min_gt_low == max_le_high) break;
+      }
+      thr = min_gt_low;
+    }
+  }
+  if (t == 0) sh_thr = thr;
+  __syncthreads();
+  thr = sh_thr;
+
+  // Everything STRICTLY greater than the threshold survives: at most k-1 of
+  // them, so the shared pair buffer of k entries cannot overflow.
+  if (t == 0) sh_count = 0;
+  __syncthreads();
+  for (int64_t j = t; j < usable; j += kBlock) {
+    if (r[j] > thr) {
+      const int slot = atomicAdd(&sh_count, 1);
+      if (slot < k) {
+        pairs[slot] = r[j];
+        pair_idx[slot] = static_cast<int>(j);
+      }
+    }
+  }
+  __syncthreads();
+  int filled = sh_count < k ? sh_count : k;
+
+  // The remaining slots go to the LOWEST-INDEXED elements equal to `cur`, one
+  // block-wide min-index pass each. `k - filled` is 1 in the ordinary case
+  // (exactly one element attains the k-th largest value), so this loop is one
+  // pass and not k of them.
+  //
+  // `cur` starts at the threshold and DROPS when that value's tie group is
+  // exhausted. It has to: a row whose usable columns hold fewer than k values
+  // at or above `thr` -- a heavily -inf-masked row is the real case -- would
+  // otherwise return fewer than k pairs, while the CPU reference always returns
+  // exactly k. Dropping `cur` to the largest value strictly below it and
+  // continuing keeps the two arms answering the same thing on such a row instead
+  // of only on the ordinary one.
+  float cur = thr;
+  int taken = -1;
+  while (filled < k) {
+    int local = INT_MAX;
+    for (int64_t j = t; j < usable; j += kBlock)
+      if (r[j] == cur && static_cast<int>(j) > taken) {
+        local = min(local, static_cast<int>(j));
+        break;  // ascending j: the first match in this thread's stride is its min
+      }
+    const int pick = BlockRedMinI(local, redi);
+    if (pick != INT_MAX) {
+      if (t == 0) {
+        pairs[filled] = cur;
+        pair_idx[filled] = pick;
+      }
+      taken = pick;
+      ++filled;
+      __syncthreads();
+      continue;
+    }
+    // This value is exhausted: drop to the largest one strictly below it.
+    float below = kNegInf;
+    for (int64_t j = t; j < usable; j += kBlock)
+      if (r[j] < cur) below = fmaxf(below, r[j]);
+    const float next = BlockRedMaxF(below, red);
+    if (next == kNegInf && cur == kNegInf) break;  // nothing left at all
+    cur = next;
+    taken = -1;
+  }
+
+  // Order the (at most k) pairs: value DESCENDING, ties by index ASCENDING. k is
+  // 16 on both published checkpoints, so an O(k^2) selection sort in one thread
+  // is cheaper than any cooperative alternative.
+  if (t == 0) {
+    for (int a = 0; a < filled; ++a) {
+      int best = a;
+      for (int b = a + 1; b < filled; ++b) {
+        const bool better = (pairs[b] > pairs[best]) ||
+                            (pairs[b] == pairs[best] && pair_idx[b] < pair_idx[best]);
+        if (better) best = b;
+      }
+      const float fv = pairs[a];
+      const int fi = pair_idx[a];
+      pairs[a] = pairs[best];
+      pair_idx[a] = pair_idx[best];
+      pairs[best] = fv;
+      pair_idx[best] = fi;
+    }
+  }
+  __syncthreads();
+  for (int j = t; j < k; j += kBlock) {
+    out_values[row * k + j] = j < filled ? pairs[j] : kNegInf;
+    out_indices[row * k + j] = j < filled ? static_cast<int64_t>(pair_idx[j]) : 0;
+  }
+}
+
+void TopKValuesIndicesCuda(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                           const TopKValuesIndicesArgs& args) {
+  const int64_t rows = logits.shape[0], v = logits.shape[1];
+  if (rows == 0) return;
+  const int k = static_cast<int>(args.k);
+  const size_t shared = static_cast<size_t>(k) * (sizeof(float) + sizeof(int));
+  TopKValuesIndicesRowKernel<<<static_cast<unsigned>(rows), kBlock, shared, AsStream(q)>>>(
+      values.Ptr<float>(), indices.Ptr<int64_t>(), logits.Ptr<float>(), v,
+      v - args.num_org_vocab_padding, k);
+  Check(cudaGetLastError(), "topk_values_indices launch");
+}
+
 // --- apply_penalties (fused repetition + frequency + presence) --------------
 __global__ void ApplyPenaltiesKernel(float* logits, const int8_t* prompt_mask,
                                      const int32_t* output_bin_counts, const int8_t* output_mask,
@@ -733,6 +936,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ApplyTemperatureFn>(&ApplyTemperatureCuda)));
     RegisterOp(OpId::kGreedyArgmax, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxCuda)));
+    RegisterOp(OpId::kTopKValuesIndices, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<TopKValuesIndicesFn>(&TopKValuesIndicesCuda)));
     RegisterOp(OpId::kApplyTopKTopP, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<ApplyTopKTopPFn>(&ApplyTopKTopPCuda)));
     RegisterOp(OpId::kComputeProbs, DeviceType::kCUDA,

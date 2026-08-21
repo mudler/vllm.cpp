@@ -28,7 +28,27 @@ namespace vllm {
 // ahead of the pattern-derived rule. The published DFlash2 GGUF sets it false
 // beside an ALL-TRUE sliding-window pattern, so without the read every layer
 // runs causal. A DFlash1 GGUF declares no such key and is unchanged.
+//
+// SPEC-DFLASH2 W5 (#1314): for a DFlash2 file it also carries the four geometry
+// keys the two mechanisms need -- `conv_kernel_size`, `conv_group_size`,
+// `selector_rank`, `selector_top_k` -- and any of the three output scalars the
+// file declares, all under the MEASURED `dflash.<hf key>` spelling. All four
+// geometry keys are REQUIRED once the file is classified DFlash2, because
+// guessing one sizes the projection or the codebooks wrong, and that is
+// acceptance-only and token-invisible.
 HfConfig MakeDflashGgufConfig(const GgufFile& gguf);
+
+// The draft GGUF's own vocabulary, taken from `tokenizer.ggml.tokens`.
+//
+// SPEC-DFLASH2 W5 (#1314). A DFlash draft declares no vocab key -- it shares the
+// target's embedding and head -- so `MakeDflashGgufConfig` leaves
+// `HfConfig::vocab_size` 0 on purpose. The candidate selector's codebooks are
+// `[vocab, rank]` and are checked at load, before the target is anywhere in
+// scope, so the check needs a number from the draft file itself. The tokenizer
+// array is used rather than the codebook extent because a check that read its
+// own expectation off the tensor under test would pass for a transposed or
+// truncated codebook. Throws by name when the key is absent.
+int64_t DflashGgufTokenizerVocab(const GgufFile& gguf);
 
 // SPEC-DFLASH2 W1 (#1314): whether a `dflash`-arch GGUF is a DFlash2 drafter.
 //
@@ -49,6 +69,16 @@ bool IsDflash2Gguf(const GgufFile& gguf, std::string* matched_key = nullptr);
 // `DFlashModel` converter class does NOT inherit the Qwen3Next `(w + 1)` norm
 // shift, so unlike the trunk and the MTP head these must not be un-shifted.
 // embed_tokens / lm_head are NOT read here; they come from the target.
+//
+// SPEC-DFLASH2 W5 (#1314): for a DFlash2 file it also resolves the four conv
+// tensors and the selector's three, under the GGUF names llama.cpp writes them
+// with (`attn_conv_base`, `attn_conv_proj.weight`, `ffn_conv_base`,
+// `ffn_conv_proj.weight`, `selector_hidden.weight`,
+// `selector_predecessor.weight`, `selector_successor.weight`). Every tensor is
+// DEQUANTIZED to bf16 on the way in, which is this lane's design and not a
+// fallback -- see the file comment on the .cpp for why, and
+// tests/vllm/models/test_qwen3_dflash2_gguf.cpp for the lower bound that a token
+// gate cannot supply because of it.
 Qwen3DFlashWeights LoadQwen3DFlashFromGguf(const GgufFile& gguf,
                                            const HfConfig& config,
                                            int64_t num_taps,

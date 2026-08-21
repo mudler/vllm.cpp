@@ -140,12 +140,36 @@ yet**: correctness comes first on this lane, and a DFlash2 draft additionally
 runs its block forward off the paged CUDA-graph fast path, because the candidate
 selector needs the hidden states of the same forward its logits came from.
 
-A GGUF DFlash2 checkpoint still refuses at startup because its weight path is
-not implemented. It is identified from DFlash2-specific metadata rather than
-from an architecture string, because a GGUF declares none and the published
-DFlash2 GGUF writes `general.architecture = dflash`, the same value a DFlash1
-drafter writes. Ordinary DFlash1 GGUF drafts are unchanged. No DFlash2 speed
-result is admissible until its acceptance gate passes
+**A GGUF DFlash2 checkpoint now drafts too**, in all three published arms:
+bf16, Q8_0 and Q4_K_M. Point `--speculative-config` at the `.gguf` file exactly
+as you would at a safetensors directory. The file is identified from
+DFlash2-specific metadata rather than from an architecture string, because a
+GGUF declares none and the published DFlash2 GGUF writes
+`general.architecture = dflash`, the same value a DFlash1 drafter writes.
+Ordinary DFlash1 GGUF drafts are unchanged.
+
+What that claim rests on, so you can weigh it: the three ENCODINGS are gated by a
+synthetic draft this engine writes itself in each block format and then drafts
+from, value-for-value against the suite's own encoders, and the published files
+are read for their NAMES, SHAPES and TYPES. No test has yet loaded 7 GB of
+published tensor data end to end -- that lands with the acceptance gate below.
+`Q4_K_M` is also llama.cpp's usual mixture rather than one encoding: the
+published file is 32 F32, 45 Q4_K and 4 Q6_K tensors
+(`blk.{2,4}.{attn_v,ffn_down}.weight`), all of which this loader decodes.
+
+One property of this container is worth knowing before you pick an arm: **a GGUF
+drafter is dequantized to bf16 at load.** That is this lane's design rather than
+a fallback -- a DFlash draft is a handful of layers, so the loader hands the
+shared weight path bf16 views and reuses the whole safetensors body -- but it
+means a Q4_K_M draft costs its bf16 residency and not its file size. Summed
+over the published 27B drafter's own tensor table, that is 3 848 808 960 bytes
+(3.584 GiB) of draft weights whichever of the three files you load -- against
+1.06 GiB on disk for the Q4_K_M one -- of which 254 279 680 bytes are the
+candidate selector's two codebooks, which the DFlash1 lane never allocates at
+all. Pick the smallest file to save disk and download time; it will not save
+memory.
+
+No DFlash2 speed result is admissible until its acceptance gate passes
 ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
 
 **The exact checkpoints this was built and gated against.** Every sha256 below
@@ -156,9 +180,9 @@ evidence here.
 | Arm | Repo and revision | File | Bytes | sha256 |
 |---|---|---|---|---|
 | Draft, bf16 safetensors — DRAFTS | `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `model.safetensors` | 3 848 817 896 | `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
-| Draft, GGUF — REFUSED at startup | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
-| Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
-| Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
+| Draft, GGUF — DRAFTS | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
+| Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
+| Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
 | Target the draft heads | `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | published shards | — | — |
 
 A repo id alone is not a pin, because checkpoints get re-quantized in place

@@ -768,6 +768,26 @@ form. This is a tracked exception under the secondary-oracle rule, not a silent
 divergence. `docs/guides/hugging-face-access.md` states which upstream defines
 which form.
 
+**W5's define reached the sanitizer lanes; its libraries did not.**
+`CPPHTTPLIB_OPENSSL_SUPPORT` and `OpenSSL::SSL` are both PUBLIC on `vllm`, so
+they travel together for every consumer that links `vllm::vllm` -- which is what
+made this look safe. A sanitizer build does not link that target. It links
+`vllm_sanitize_test_shared`, a shared image of the instrumented archive that
+exists so ASan test binaries do not each force-link hundreds of megabytes
+(`CMakeLists.txt`, `vllm_sanitize_test_shared`). That shim forwarded three of
+`vllm`'s usage requirements by property genex and not the fourth: include
+directories, system include directories and compile definitions, but never
+`INTERFACE_LINK_LIBRARIES`. The define therefore arrived at every test including
+the vendored httplib header, the libraries it now requires did not, and the only
+libssl anywhere was a `DT_NEEDED` entry of the shim -- which GNU ld refuses to
+resolve a client reference through. Eight targets failed to link and both
+sanitizer lanes reported `fail` without executing a case, from `a50c57d69` until
+[#1531](https://github.com/mudler/vllm.cpp/issues/1531) forwarded the fourth
+property beside the other three. The general lesson is not about OpenSSL: a
+partial forward of a target's usage requirements is silent until one of the
+un-forwarded ones is first needed, and the half that was forwarded is what
+creates the demand for the half that was not.
+
 ## Owed
 
 - ModelScope resolution, `vllm/transformers_utils/repo_utils.py:239`.

@@ -89,6 +89,10 @@ proposals losslessly, so the emitted tokens do not change. Pass the draft with
 build/examples/vllm-server   --model /path/to/target   --speculative-config '{"method":"dflash","model":"/path/to/draft","num_speculative_tokens":7}'
 ```
 
+The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
+DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
+picking a smaller quantization saves download and disk and does not save memory.
+
 [Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
 draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
@@ -143,6 +147,18 @@ See [`entrypoints/model_loader.h`](../include/vllm/entrypoints/model_loader.h)
 for `LoadedEngine`. The source-tree examples declare their link targets in
 [`examples/CMakeLists.txt`](../examples/CMakeLists.txt). External consumers
 must use the C ABI in `include/vllm.h`.
+
+Configuring with `-DVLLM_CPP_SANITIZE=address,undefined` or
+`-DVLLM_CPP_SANITIZE=thread` changes what a test target links. Instrumented
+test executables link one internal shared image of the instrumented archive
+instead of force-linking `vllm::vllm` into each of them, because the
+force-linked form runs a hosted runner out of disk. That image forwards the
+same include directories, compile definitions and link libraries, so a target's
+own CMake is the same in both configurations. It does not LINK identically: the
+archive is force-linked into each executable only in the default build, and not
+propagating that is the reason the instrumented image exists. Link `vllm::vllm`
+as above and let the build choose; naming the internal image yourself is not
+supported.
 
 ## First-line troubleshooting
 

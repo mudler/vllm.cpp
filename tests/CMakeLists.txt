@@ -577,6 +577,13 @@ target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}
 # runs the grouped convolution.
 vllm_cpp_add_test(test_qwen3_dflash2_draft vllm/models/test_qwen3_dflash2_draft.cpp)
 target_include_directories(test_qwen3_dflash2_draft PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W5 (#1314): the GGUF DFlash2 drafter arm. The container the other
+# suite cannot reach -- a GGUF declares no `architectures` and writes the same
+# `general.architecture = dflash` a DFlash1 drafter writes -- plus the LOWER
+# BOUND its k-quant arms need, because this lane dequantizes to bf16 by design
+# and a token gate therefore cannot see a quantized tensor that never decoded.
+vllm_cpp_add_test(test_qwen3_dflash2_gguf vllm/models/test_qwen3_dflash2_gguf.cpp)
+target_include_directories(test_qwen3_dflash2_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
 vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
 target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)

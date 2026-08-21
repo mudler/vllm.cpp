@@ -666,7 +666,7 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | W6 | owed, conditional |
 | [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | O1 | owed |
 | [#1202](https://github.com/mudler/vllm.cpp/issues/1202) | deferred behind W1 | owed, with a number: 2.3% of one pass |
-| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | W0 (its own gate) | **owed, and RED on `main` rather than on any branch.** `CHECK(leaves >= 0.95 * wall)` in `ltx2 video: a render through the ABI emits a phase table that SUMS to wall` is a RATIO, and the un-named residue is 4.80% to 6.32% of `wall` across twelve runs on one x86 box - so the 95% floor sits INSIDE the measurement's own range at the 64x64 / 9-frame fixture scale, and the case decides by coin flip, mostly red. With this lane's four files reverted so the binary is main at `89261c955`, six runs read 94.32%, 95.20%, 93.74%, 94.20%, 94.69%, 94.19%; the W0-live merge reads 93.82%, 93.68%, 94.34%, 94.62%, 94.39%, and 94.12% with `VLLM_RENDER_PROGRESS=0`, which exonerates the live emitter. Box contention is NOT the cause and main's one green disproves it: that run had `wall=0.579684s`, more than double the others, because the box was loaded - a SLOWER render passes. The tolerance was argued for the 21.004 B render, where the residue is a far smaller fraction of the wall. Naming the un-named time, or bounding `unaccounted_seconds` beside the ratio so the assertion says the same thing at both scales, is gate semantics and owes its own row |
+| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | W0 (its own gate) | **REPAIRED but NOT CLOSED, by the `#1439 repaired` section below: the prologue is now named `load.open`, so the time is measured rather than tolerated, and the assertion is byte-for-byte unchanged. It stays OPEN because the repair was measured on a box at loadavg 24-31, where the render's wall is 7-10 s and BOTH arms sit near 99.96% — the flattering regime this issue itself identified. What is owed is one quiet-box run at fixture scale, in the 0.22-0.58 s regime where the floor actually bites. What follows is the record of why it was red.** **It was RED on `main` rather than on any branch.** `CHECK(leaves >= 0.95 * wall)` in `ltx2 video: a render through the ABI emits a phase table that SUMS to wall` is a RATIO, and the un-named residue is 4.80% to 6.32% of `wall` across twelve runs on one x86 box - so the 95% floor sits INSIDE the measurement's own range at the 64x64 / 9-frame fixture scale, and the case decides by coin flip, mostly red. With this lane's four files reverted so the binary is main at `89261c955`, six runs read 94.32%, 95.20%, 93.74%, 94.20%, 94.69%, 94.19%; the W0-live merge reads 93.82%, 93.68%, 94.34%, 94.62%, 94.39%, and 94.12% with `VLLM_RENDER_PROGRESS=0`, which exonerates the live emitter. Box contention is NOT the cause and main's one green disproves it: that run had `wall=0.579684s`, more than double the others, because the box was loaded - a SLOWER render passes. The tolerance was argued for the 21.004 B render, where the residue is a far smaller fraction of the wall. Naming the un-named time, or bounding `unaccounted_seconds` beside the ratio so the assertion says the same thing at both scales, is gate semantics and owes its own row |
 | [#1164](https://github.com/mudler/vllm.cpp/issues/1164) | W7 decision point | not owed here — owned by `ENG-CUDAGRAPH-DIFFUSION`; this row owns its unblock order |
 
 **[#1009](https://github.com/mudler/vllm.cpp/issues/1009) is not owed. It
@@ -2868,3 +2868,85 @@ they move from a 3 ms bound to 30 ms, which can only turn a red green -- and the
 worst sanitizer slack anybody has recorded, 3.354 ms, is 8.9x inside the new
 bound. The per-record split is the part that could newly red there, and it is
 that same 3.354 ms observation that shows it does not.
+
+### #1439 repaired: the prologue is now a NAMED phase, `load.open`
+
+The section above left #1439 with one route standing and refused the other. This
+is that route taken. **The issue stays OPEN**, for the reason the last two
+paragraphs of this section give: the repair is measured, the regime where the
+floor bites is not. **Nothing about the assertion changed.**
+`CHECK(leaves >= 0.95 * wall)` reads byte-for-byte as it did; the residue it
+divides by is smaller because a phase that was un-named is now named.
+
+**What moved, in three lines of production code.**
+`src/vllm/multimodal/ltx2_video.cpp` opens `phase::Scope open_phase("load.open")`
+immediately after the `load` span and calls `open_phase.Close()` immediately
+before the `load.dit` block. `Scope::Close` rather than a nested block is the
+shape `render_phase_log.h` documents for this driver, whose regions are
+sequential statements in one function; a `Fail()` throw out of the prologue
+closes it through the destructor instead, which costs nothing because a load that
+throws writes no table.
+
+**What the phase contains** is what the probe named: device resolution, the
+platform probe, the two refusals, the device-byte probe installation, the DiT
+safetensors header open (`SafetensorsFile::Open`) and the LoRA option parsing.
+
+#### Red first, and the red is the production scope's absence
+
+Measured on the shared x86_64 dev box, 20 cores, `Release`,
+`VLLM_CPP_CUDA=OFF`, one build directory. The test change was applied and built
+ALONE, so the red arm is this tree with the gate asking for the name and no
+production scope to answer it:
+
+| arm | `ltx2 video: a render through the ABI emits a phase table that SUMS to wall` |
+|---|---|
+| test change only | **RED**, exit 1, 447 assertions / 1 failed: `the phase table names no 'load.open' phase` |
+| test + production scope | **GREEN**, 459 assertions / 0 failed |
+
+That red IS the reachability mutation this change owes: deleting the production
+call site is precisely the first arm, and the focused gate does not stay green
+without it.
+
+**A second mutation pins the CLOSE, not only the OPEN.** Sinking
+`open_phase.Close()` to below the `load.dit` block — so the prologue scope
+swallows the DiT load — compiles, keeps the SUM case GREEN at 459/459, and is
+caught by the #1440 nested-record rule instead: `the three carrying phases
+contain their work and the load keeps its order` goes RED, 595 assertions /
+1 failed, with `'load.dit' is emitted NESTED, and it is not one of this render's
+anchors`. Tree restored and md5-verified between arms
+(`src/vllm/multimodal/ltx2_video.cpp` identical before and after).
+
+#### What the residue did, and the honest limit on this number
+
+Six runs per arm of the case alone, same binary per arm, box under other
+sessions' builds at loadavg 24-31:
+
+| arm | `unaccounted_seconds` (ms) | median | wall (s) |
+|---|---|---:|---|
+| before | 2.190, 3.907, 2.783, 2.602, 3.174, 3.042 | **2.91** | 7.18-9.24 |
+| after | 0.950, 4.706, 1.221, 1.206, 0.815, 0.936 | **0.94** | 8.15-9.89 |
+
+`load.open` is emitted as a LEAF at `t=0.000` (not `nested`, not a span) and
+measures about 1.3 ms here. It is the same interval, and the drop in the residue
+is its duration.
+
+**Two things this run does NOT establish, said plainly.** First, it does not
+reproduce the red: at loadavg 24-31 the render's wall is 7-10 s rather than the
+0.22-0.58 s of #1439's population, and that is the exact regime #1439 identified
+as the FLATTERING one — a slower render passes, because the residue grows more
+slowly than the wall it is divided by. Both arms sit near 99.96%, so this box
+measures the residue in SECONDS, which is the scale-free quantity, and not the
+ratio. Second, it does not reproduce the **11.3 ms** head the earlier probe
+recorded; the prologue is about 1.3 ms at this build type and with the fixture
+warm in the page cache. The direction and the mechanism are measured here. The
+magnitude at which the floor bites is inherited from that probe and is not
+re-measured, so the claim "this makes the 0.95 floor honest instead of marginal"
+rests on the earlier measurement plus this one, and a quiet-box run at fixture
+scale stays owed.
+
+**Not owed: a `docs/models/ltx-2-5.md` edit.** The section above says this change
+"owes the phase names published in `docs/models/ltx-2-5.md`". It does not, and
+the reason is that the document publishes none: `## Inspect a render` describes
+`sum_leaf_seconds`, `unaccounted_seconds` and the two environment switches, and
+names no individual phase. Checked rather than assumed, because a sentence
+written when a document had a different shape is how a stale obligation survives.

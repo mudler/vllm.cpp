@@ -20,7 +20,9 @@ the **bf16** arm of the same model and is the harness this row reuses;
 [#1354](https://github.com/mudler/vllm.cpp/issues/1354) records that clock
 pinning is unavailable inside an `rc` lease, which is why this row makes no
 speed claim.
-**Lifecycle:** `BLOCKED` -- on the checkpoint, see [`## Owed`](#owed).
+**Lifecycle:** `BLOCKED` -- on the gate RUN. It is no longer blocked on the
+checkpoint, which was staged and verified on 2026-08-21; see
+[`## Owed`](#owed).
 **Owner:** unassigned
 
 ## Scope
@@ -69,6 +71,41 @@ revision [#1189](https://github.com/mudler/vllm.cpp/issues/1189) named, asserted
 again here by reading the redirect target of the unauthenticated
 `resolve/main/config.json`.
 
+**It is staged.** The developer granted download authority on **2026-08-21**,
+and the artifact is on the share at `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8`,
+which a leased worker reads as `/workspace/ckpt/qwen38-27b-fp8`. The
+HuggingFace repository is confirmed to need no access grant. Read what staging
+discharges and what it does not in
+[`## Owed`](#owed): the checkpoint is STAGED, it is not REACHED, and it is not
+GATED. Those are three different states and this spec keeps them apart.
+
+**How the staged bytes were verified, in two independent legs.** The
+HuggingFace API returned **zero LFS oids** for this repository, so there was no
+upstream hash to compare against, and neither leg uses one.
+
+1. **File sizes against a manifest captured from the API BEFORE the download
+   began.** **81 of 81 files present, 0 missing, 30,890,049,597 B =
+   28.769 GiB.**
+2. **Safetensors header self-consistency**, which validates the bytes against
+   themselves and needs no HuggingFace metadata at all: per shard,
+   `8 + header_len + max(data_offsets.end) == file size`, and every tensor's
+   span equals `numel * dtype_width`. **66 safetensors files, 0
+   header-inconsistent.** Leg 2 is what would catch a truncated CIFS write. A
+   file count would not.
+
+The staged headers reproduce the pre-staging audit below exactly: **1606
+tensors = 1199 BF16 + 407 F8_E4M3**; **all 407 FP8 tensors satisfy
+`N % 128 == 0` AND `K % 128 == 0`, violations 0**; **`weight_scale_inv` present
+407 times, 0 FP8 weights missing one**.
+
+**The two byte totals count different things and both are correct.** The
+28.75 GiB in the table below is the SAFETENSORS sum, derived from the shard
+headers before staging; the staged shards measure 28.747 GiB, which is the same
+figure. **28.769 GiB is the whole 81-file tree**, which adds 22.11 MiB of
+config, index, tokenizer and chat-template files that carry no tensor. Neither
+number supersedes the other, so this spec now says which one it means at each
+site.
+
 Everything below was derived **without downloading the weights**, by HTTP RANGE
 request over each shard's safetensors header. The method is in
 [`## Evidence`](#evidence) and is reproducible in about nine megabytes of
@@ -80,7 +117,7 @@ question that could have made this gate impossible.
 | `quant_method` / `weight_block_size` / `activation_scheme` / `fmt` | `fp8` / `[128, 128]` / `dynamic` / `e4m3` |
 | shard layout | **66 shards, `layers-<i>.safetensors` + `mtp.safetensors` + `outside.safetensors`** -- NOT the bf16 repo's `model-000NN-of-00018` |
 | tensors | 1606 (1199 `BF16`, 407 `F8_E4M3`) |
-| bytes | 28.75 GiB total, 27.89 GiB outside the vision tower |
+| bytes | 28.75 GiB of safetensors, 27.89 GiB of them outside the vision tower (the staged 81-file tree is 28.769 GiB) |
 | `modules_to_not_convert` | 882 entries, 636 of them non-visual |
 
 **Every one of the 407 FP8 tensors has `N % 128 == 0` AND `K % 128 == 0`. The
@@ -194,8 +231,13 @@ instruments beside it, each of which fails LOUDLY rather than degrading:
 
 ## Risks
 
-- **R1. The gate is unrunnable because the artifact is absent.** This is the
-  live state, not a hypothesis. See [`## Owed`](#owed).
+- **R1. The gate is unrunnable because the artifact is absent. RETIRED
+  2026-08-21**, when download authority was granted and the checkpoint was
+  staged and verified at `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8`. It is written
+  here rather than deleted, because what replaced it is narrower and still
+  live: a run asserts that path at revision `017b9c7a` and STOPS if it cannot,
+  which belongs under [`## Stop conditions`](#stop-conditions) rather than
+  here. See [`## Owed`](#owed).
 - **R2. A pass that measured the wrong kernel.** Mitigated by the three
   instruments above; each of them, not the token count, is what makes the pass
   mean something.
@@ -241,7 +283,10 @@ M3, M4 and M6; they are preconditions of this run, not substitutes for it.
 
 **The checkpoint audit above, reproducible without the weights.** Both files are
 public and unauthenticated. The `lfs.oid` values in the HuggingFace tree API are
-fabricated for some repos and are never used here: what is read below is the
+fabricated for some repos and are never used here -- for THIS repository the API
+returned zero of them, so there was no upstream hash to use even had one been
+wanted, which is why the staged-bytes verification above rests on two legs that
+need none. What is read below is the
 FILE BYTES of each shard's own safetensors header, and the `data_offsets`
 arithmetic checks the dtype independently of the declared label.
 
@@ -297,8 +342,14 @@ Configure with `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
 Report `NEEDS_DECISION` and stop, rather than widening the gate, if any of these
 holds.
 
-- The checkpoint is not staged and no download authority has been given. **This
-  is the current state.**
+- The checkpoint is not staged at
+  `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8` (`/workspace/ckpt/qwen38-27b-fp8`
+  from a leased worker), at revision
+  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`. **This condition is discharged:**
+  authority was granted on 2026-08-21 and the checkpoint is staged and
+  verified. It stays written because a run that cannot see those bytes at that
+  revision must still stop rather than substitute another artifact, and because
+  the share also holds two Qwen3.8 artifacts that are not this row's subject.
 - The oracle's greedy decode is not deterministic across three repeats. A
   distributional gate is not pre-ratified and may not be substituted.
 - The oracle refuses `Qwen/Qwen3.8-27B-FP8` on GB10.
@@ -310,15 +361,25 @@ holds.
 
 ## Now
 
-`BLOCKED`. The gate is designed, its preconditions are audited, and it has not
-run. `Qwen/Qwen3.8-27B-FP8` has still never been executed against the pinned
-oracle on this arm, on any device, and no sentence in this tree may say
-otherwise.
+`BLOCKED`. The gate is designed, its preconditions are audited, the checkpoint
+is staged, and it has not run. `Qwen/Qwen3.8-27B-FP8` has still never been
+executed against the pinned oracle on this arm, on any device, and no sentence
+in this tree may say otherwise.
+
+**Staged is not reached, and reached is not gated.** As this is written, a
+REACHABILITY probe is QUEUED as `rc` job
+`1b34633c-1374-416c-abfe-6e16290351dd` on `dgx:gpu0`, behind another session's
+`rc hold`, and it has produced NO result. That probe is not this row's gate even
+after it returns: it asks only whether the kernel is REACHED -- CUTLASS present
+in the binary, zero reference-tier lines, a non-zero block-scaled dispatch
+counter, and coherent output. It adjudicates no token against any oracle. The
+token gate in [`## Gates`](#gates) is untouched by it and is entirely owed.
 
 **No lease was taken by this row.** `rc devices` read `dgx:gpu0 busy`, held by
 `claude/BENCH-QWEN38-27B-SOTA` under `hold` for 30m55s, at the time this spec was
-written. Queuing behind it would have bought nothing, because the artifact the
-job needs is not on the share.
+written. Queuing behind it would have bought nothing THEN, because the artifact
+the job needs was not on the share. That reason is spent: the artifact is now on
+the share, so the next queue this row joins is one it can use.
 
 ## Owed
 
@@ -330,16 +391,27 @@ job needs is not on the share.
   ragged GDN tensors are excluded by the checkpoint itself, the BF16
   `weight_scale_inv` is already handled by value, and the per-layer shard naming
   already resolves.
-- **The checkpoint is not staged, and that is the whole blocker.**
-  `/mnt/nas_share/rc/ckpt/` holds `qwen3.8-27b-hf` -- which is the **bf16**
-  artifact, `config.json` carrying no `quantization_config` and `dtype:
-  bfloat16` -- and `qwen3.8-q1_0`. Neither is this row's subject. Staging costs
-  **28.75 GiB** and the share has 3.4 TiB free, so the cost is authority and not
-  space: `.agents/developer-preferences.md` authorizes large downloads for the
-  `SPEC-DFLASH2` assets only and says "Any other large download, package
-  installation, or service management: ask first". **Asking is the next action
-  on this row.** Tracked by
-  [#1613](https://github.com/mudler/vllm.cpp/issues/1613).
+- **The checkpoint is STAGED, so the blocker this bullet used to name is
+  discharged. What is owed here is the RUN, not the staging.** The developer
+  granted download authority on **2026-08-21**, and `Qwen/Qwen3.8-27B-FP8` @
+  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` -- a HuggingFace repository
+  confirmed to need no access grant -- is at
+  `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8`, which a leased worker
+  reads as `/workspace/ckpt/qwen38-27b-fp8`. Verified as **81 of 81 files, 0
+  missing, 30,890,049,597 B = 28.769 GiB**; **66 safetensors files, 0
+  header-inconsistent**; **1606 tensors = 1199 BF16 + 407 F8_E4M3**; **all 407
+  FP8 tensors `N % 128 == 0` AND `K % 128 == 0`, violations 0**; and
+  **`weight_scale_inv` present 407 times, with 0 FP8 weights missing one**. The
+  method is the two-leg one recorded in the checkpoint section above, and it
+  uses no HuggingFace hash because the API returned zero LFS oids for this
+  repository. The share still holds `qwen3.8-27b-hf` -- the **bf16** artifact,
+  `config.json` carrying no `quantization_config` and `dtype: bfloat16` -- and
+  `qwen3.8-q1_0`; neither was this row's subject before staging and neither is
+  now. [#1613](https://github.com/mudler/vllm.cpp/issues/1613) tracked the
+  staging and the ask for authority, and staging discharges it. **Staging
+  discharges nothing else.** The run this bullet used to block is owed by the
+  bullet above, and no sentence anywhere may read the staged bytes as a gate
+  result.
 - **The oracle's gateability on this arm.** The FLASHINFER wheel is measured to
   run `Qwen/Qwen3.8-27B` bf16 on GB10. It has never been asked to load the FP8
   artifact, so `gateable` for THIS arm is unmeasured rather than yes. The first

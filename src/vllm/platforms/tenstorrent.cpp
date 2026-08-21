@@ -66,13 +66,11 @@ class TenstorrentPlatform final : public Platform {
     return {"FLASH_ATTN"};
   }
 
-  // HOST-FREE-FORWARD R1 measurement (local, gated on VT_TT_HOST_FREE_DECODE):
-  // enable the shared decode-graph framework so we can probe whether the
-  // RmsNorm+RoPE threshold flip gets capture past the to_vector fatal.
-  // NOT for shipping as-is: a real flip belongs to R4 and must be unconditional
-  // only once the forward is host-free end-to-end.
+  // HOST-FREE-FORWARD R5 flip: host-free decode is now the DEFAULT
+  // (VT_TT_HOST_FREE_DECODE unset or any value except "0"). Set
+  // VT_TT_HOST_FREE_DECODE=0 to opt out and restore the pre-flip default path.
   bool support_static_graph_mode() const override {
-    return std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+    return vt::tenstorrent::HostFreeDecodeEnabled();
   }
 };
 

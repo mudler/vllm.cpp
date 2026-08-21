@@ -56,16 +56,24 @@
 //  * THE GATHER. What is stored is `candidate_ptr[base + index]` and NOT the
 //    index; a fixture whose ids are the identity permutation cannot tell those
 //    apart, so every id here differs from its slot.
-//  * A NaN NEVER WINS. Strictness is what the tie rows and the -inf row do not
-//    measure: a `>=` reduction answers both of those correctly. This case is
-//    the one that fails under `>=`, and it is also the row on which the CUDA
-//    arm disagreed with this one until W4's repair (see the CUDA case below).
+//  * A NaN NEVER WINS. This case covers the NaN CLASS, and it is the row on
+//    which the CUDA arm disagreed with this one until W4's repair (see the CUDA
+//    case below). It is NOT the only case a non-strict reduction breaks: #1518
+//    corrects an earlier note here that said so. Turning the CPU scan's `>`
+//    into `>=` reddens THREE cases / 5 assertions -- the tie row, the all -inf
+//    row and this one -- because an ascending scan under `>=` keeps the LAST
+//    maximum, so the tie row answers slot K-1 and the all -inf row claims K-1
+//    instead of leaving the seed for the collapse.
 //  * CUDA vs CPU, BIT-EXACT. Unlike vt::Dflash2SelectorEdges -- a reduction
 //    within an f32 envelope -- this op compares and gathers, so the two arms
 //    must agree exactly, including the tie rows, the -inf row and the NaN row.
-//    That case is written and has NEVER RUN on this host (no `nvcc`, so it
-//    reports `no CUDA backend; skipping`); it is owed to the operator's GPU
-//    lease and is not counted as coverage here.
+//    That case does not run on THIS host (no `nvcc`, so it reports `no CUDA
+//    backend; skipping`) and is not counted as coverage here. It is no longer
+//    OWED, and #1518 corrects an earlier sentence saying it had never run: the
+//    operator ran it on `dgx:gpu0` (GB10, sm_121a) at the W4 merge commit --
+//    83 assertions on device against 49 here, `Status: SUCCESS!`, zero skip
+//    lines -- and CI's `build-cuda-fat` job compiles `src/vt/cuda/cuda_ops.cu`
+//    for ten architectures on every pull request.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -271,12 +279,20 @@ TEST_CASE("dflash2-path-walk: an all -inf row resolves to slot 0") {
 }
 
 TEST_CASE("dflash2-path-walk: a NaN never wins a slot") {
-  // STRICTNESS, on its own. The tie rows and the all -inf row above are both
-  // answered correctly by a `>=` reduction too, so nothing there measures the
-  // word "strictly" in the contract; this case does. A NaN compares false
-  // against everything, so a strict `>` can never let one claim a slot, and a
-  // row whose only non -inf lane is a NaN collapses to slot 0 exactly as a
-  // fully masked row does.
+  // The NaN CLASS. A NaN compares false against everything, so a strict `>` can
+  // never let one claim a slot, and a row whose only non -inf lane is a NaN
+  // collapses to slot 0 exactly as a fully masked row does. This is also the
+  // row on which the CPU and CUDA arms actually diverged, which is what the
+  // case is here for.
+  //
+  // It is NOT the sole detector of a non-strict comparison. #1518 corrects an
+  // earlier note here claiming that the tie rows and the all -inf row are both
+  // answered correctly by a `>=` reduction: they are not. Measured by turning
+  // the CPU scan's `>` into `>=`, three cases redden -- `a tie resolves to the
+  // LOWEST slot` (2 assertions, 13 for 11 and 22 for 20), `an all -inf row
+  // resolves to slot 0` (1, 33 for 31) and this one (2) -- 3 cases / 5
+  // assertions, `Status: FAILURE!`. An ascending scan under `>=` keeps the LAST
+  // maximum, so both of those rows answer slot K-1.
   const int64_t B = 1, L = 2, K = 3;
   const float kNan = std::numeric_limits<float>::quiet_NaN();
   std::vector<float> scores(static_cast<size_t>(B * L * K * K), kNegInf);
@@ -306,13 +322,26 @@ TEST_CASE("dflash2-path-walk: refuses a lattice that is not [B,L,K,K]") {
   // tensor, and each matched on the message.
   //
   // Mutating one `shape` field of a tensor built by `Contig` does NOT test this
-  // guard. It desynchronises the strides, `Tensor::IsContiguous()` turns false,
-  // and `dflash2-path-walk: contiguous tensors required` throws FIRST -- so a
-  // bare `CHECK_THROWS` is satisfied by a guard it was not written for, and it
-  // still passes with the shape check deleted outright. That is what W4's fresh
-  // review measured on the previous version of this case. The lattices below
-  // are built at the wrong extent WITH matching strides, so the only guard that
-  // can answer is the one named.
+  // guard, and #1518 corrects the reason W4 recorded for that. The mutation
+  // does desynchronise the strides, so `Tensor::IsContiguous()` turns false --
+  // but the SHAPE check runs first and still answers it. Measured on untouched
+  // production code: `probe IsContiguous=0` and `probe threw: vt:
+  // dflash2-path-walk: scores must be [B,L,K,K] matching candidate_ids at
+  // src/vt/ops.cpp:3331`, for `shape[2]` and `shape[3]` alike. The pre-repair
+  // case DID reach the guard it named.
+  //
+  // The defect is what happens when the guard is DELETED. `IsContiguous()` is
+  // already false, so the throw falls through to `dflash2-path-walk: contiguous
+  // tensors required` (`src/vt/ops.cpp:3339` in the shipped file; the probe
+  // read it at `:3336` because deleting the check moved it up three lines), a
+  // bare `CHECK_THROWS` still passes, and the deletion is
+  // INVISIBLE: the pre-repair case form with the whole `VT_CHECK` deleted ran
+  // 7 cases / 47 assertions, `Status: SUCCESS!`, rc 0. The generic rule is
+  // therefore about the DELETED state, not the present one -- build a negative
+  // input that no OTHER guard can refuse, and match on the message. The
+  // lattices below are built at the wrong extent WITH matching strides, so
+  // nothing but the named guard can answer and deleting it reddens 1 case / 2
+  // assertions.
   const int64_t B = 1, L = 2, K = 3;
   // Sized for the FULL [B,L,K,K] lattice, so a DELETED guard reads in bounds
   // and simply fails to throw rather than running off the end of the buffer.

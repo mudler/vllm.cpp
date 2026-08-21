@@ -383,7 +383,8 @@ TEST_CASE("dflash2-selector-edges: the wrapper refuses what it cannot answer") {
   // not match `candidate_ids` also fails the `scores` lattice check two lines
   // below it, so a bare `CHECK_THROWS` here is answered by whichever guard is
   // left standing and cannot tell the two apart -- the shape W4's fresh review
-  // measured on the sibling path-walk suite.
+  // measured on the sibling path-walk suite, with the mechanism as #1518
+  // corrects it: what a DELETION exposes, not what throws first today.
   CHECK_THROWS_WITH_AS(
       vt::Dflash2SelectorEdges(q, to, tp, ts, tc, tu, th, ta, Args(f.K + 1)),
       doctest::Contains("candidate_ids last dim must be top_k"), std::runtime_error);
@@ -395,9 +396,15 @@ TEST_CASE("dflash2-selector-edges: the wrapper refuses what it cannot answer") {
   //
   // Both views are built at the wrong extent WITH MATCHING STRIDES rather than
   // by mutating a `shape` field of a tensor `Contig` produced. A mutated field
-  // desynchronises the strides, `Tensor::IsContiguous()` turns false, and
-  // `dflash2-selector-edges: contiguous tensors required` throws first -- so the
-  // case would pass with the shape guard deleted entirely.
+  // desynchronises the strides, so `Tensor::IsContiguous()` turns false --
+  // which, per #1518, is NOT the same as the contiguity guard answering the
+  // case. With the shape guard present it still throws `scores must be
+  // [B,L,K,K]` (measured at `src/vt/ops.cpp:3284`). What the mutated field
+  // costs is the DELETED state: remove the shape guard and the throw falls
+  // through to `dflash2-selector-edges: contiguous tensors required`
+  // (`src/vt/ops.cpp:3299`), so a bare `CHECK_THROWS` would pass with the guard
+  // gone. Built at matching strides, nothing else can answer, and deleting the
+  // guard reddens 1 case / 2 assertions.
   {
     Tensor child = F32(out, {f.B, f.L, f.K, f.K - 1});
     REQUIRE(child.IsContiguous());

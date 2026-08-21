@@ -17,22 +17,32 @@
 // trap acute rather than absent: if a k-quant tensor never took the quantized
 // path, every token would still match and every golden would still pass, because
 // the arm that is claimed shipped is the arm that never ran. So the quantized
-// cases below carry a LOWER BOUND with three independent legs, and none of them
-// is a token comparison:
+// cases below carry a LOWER BOUND, and none of its parts is a token comparison.
+// THE PARTS ARE NOT THREE EQUAL LEGS, and the W5 review was right to say so
+// (#1314 F3): only L2 bounds the decode.
 //
-//   L1  the BYTES. The tensor the loader reads is stored at the block-encoded
-//       size — 144 bytes per 256 elements for Q4_K, 34 per 32 for Q8_0 — which
-//       is strictly less than the 2 bytes/element a bf16 tensor occupies. A
-//       tensor that had quietly become bf16 fails on the byte count alone.
-//   L2  the VALUES, bit-for-bit, against an expectation this file COMPUTES from
-//       the block integers it chose, never by calling the production
-//       dequantizer. The encoder here is the inverse of the format, so the
-//       comparison is a round trip through two independent implementations and
-//       not a shared helper agreeing with itself.
-//   L3  DIFFERENCE from the bf16 arm, tensor by tensor and again at the block
-//       logits. Every arm is encoded from the SAME source values, so a loader
-//       that ignored the quantized bytes and produced the dense answer is caught
-//       end to end rather than only at the tensor.
+//   L1  a PRECONDITION on the FIXTURE, not a bound on the decode. It reads the
+//       ggml type and the byte count off the tensor table of the file this test
+//       has just written, so what it proves is that the fixture really is
+//       block-encoded — 144 bytes per 256 elements for Q4_K, 34 per 32 for
+//       Q8_0, strictly under the 2 bytes/element bf16 costs. That matters,
+//       because a fixture that had quietly become bf16 would make L2 and L3
+//       compare the wrong thing. It says NOTHING about the loader: a loader
+//       that hashed the bytes and returned garbage passes L1 unchanged.
+//   L2  THE BOUND. The VALUES, bit-for-bit, against an expectation this file
+//       COMPUTES from the block integers it chose, never by calling the
+//       production dequantizer. The encoder here is the inverse of the format,
+//       so the comparison is a round trip through two independent
+//       implementations and not a shared helper agreeing with itself. This is
+//       the leg every decoder mutation lands on: truncating either 6-bit field
+//       of `get_scale_min_k4` reddens here and nowhere else.
+//   L3  a COROLLARY of L2 that is cheap and reaches further: DIFFERENCE from the
+//       bf16 arm, tensor by tensor and again at the block logits. Every arm is
+//       encoded from the SAME source values, so a loader that ignored the
+//       quantized bytes and produced the dense answer is caught end to end
+//       rather than only at the tensor. A byte-hashing loader passes L1 and L3
+//       — the hash differs from bf16 — and fails L2 hard, which is the ordering
+//       these three have.
 //
 // AND THE NAME MAP IS GATED BY CONSTRUCTION, not by reading it. The bf16 GGUF
 // arm is required BIT-IDENTICAL to the same draft written as safetensors under
@@ -141,15 +151,34 @@ std::vector<float> RoundTripBf16(const std::vector<float>& v) {
 // them, which is exactly what is being gated.
 // ---------------------------------------------------------------------------
 
+// Q4_K only: WHAT THE ENCODER ACTUALLY DROVE, per packed field. Every number
+// here is accumulated while encoding and asserted by `CheckQuantArm`; none of it
+// is a claim in a comment. Index 0 is sub-blocks 0..3 (`get_scale_min_k4`'s
+// whole-field half) and index 1 is sub-blocks 4..7 (its split half); for the
+// nibbles, index 0 is the LOW nibble of a byte (even sub-blocks) and index 1 the
+// HIGH nibble (odd sub-blocks).
+struct Q4KCoverage {
+  int scale_above_15[2] = {0, 0};  // sub-blocks whose 6-bit scale exceeds 15
+  int min_above_15[2] = {0, 0};    // sub-blocks whose 6-bit min exceeds 15
+  int scale_bits[2] = {0, 0};      // OR of every 6-bit scale -> 63 covers the field
+  int min_bits[2] = {0, 0};        // OR of every 6-bit min
+  int nibble_bits[2] = {0, 0};     // OR of every 4-bit q -> 15 covers the field
+  void Merge(const Q4KCoverage& o) {
+    for (int i = 0; i < 2; ++i) {
+      scale_above_15[i] += o.scale_above_15[i];
+      min_above_15[i] += o.min_above_15[i];
+      scale_bits[i] |= o.scale_bits[i];
+      min_bits[i] |= o.min_bits[i];
+      nibble_bits[i] |= o.nibble_bits[i];
+    }
+  }
+};
+
 // A blob plus the values it decodes to, in the tensor's flat order.
 struct Encoded {
   std::string bytes;
   std::vector<float> expect;  // exact; every value below is a small n / 2^p
-  // Q4_K only: how many sub-blocks were given a scale ABOVE 15, i.e. one whose
-  // top two bits live in the SPLIT half of the packed `scales` array. Counted
-  // rather than assumed, because an encoder that never produced one would leave
-  // half of `get_scale_min_k4` untested while every assertion still passed.
-  int high_scale_subblocks = 0;
+  Q4KCoverage q4k;            // Q4_K only; see above
 };
 
 // Q8_0: { fp16 d; int8 qs[32] } per 32 elements, y = qs * d.
@@ -193,16 +222,41 @@ Encoded EncodeQ8_0(const std::vector<float>& x) {
 // numerator is kept within eight significant bits so it survives the loader's
 // bf16 store EXACTLY and the comparison can be bit-for-bit.
 //
-// THE UPPER SUB-BLOCKS ARE DELIBERATELY GIVEN A SCALE ABOVE 15. `sc` and `m` are
-// six-bit fields, and for j >= 4 `get_scale_min_k4` assembles them from a LOW
-// nibble in `scales[j+4]` and a HIGH pair of bits in a different byte. An
-// encoder that only ever emitted small scales would leave that assembly
-// untested: `sc >> 4` would be 0, the high bits would be zero, and a production
-// unpack that dropped them entirely would still reproduce every value. So
-// sub-blocks 4..7 get `sc + 16*(sb-3)`, capped at 63, which forces the high pair
-// non-zero; the larger scale costs those sub-blocks resolution (q falls to 0/1),
-// which a fixture can afford and a decode test does not measure. `m` already
-// reaches past 15 from the data, so its own split is exercised either way.
+// THE PACKED FIELDS ARE DRIVEN ACROSS THEIR OWN WIDTH, AND THE COVERAGE IS
+// COUNTED. `sc` and `m` are SIX-bit fields and `q` is a FOUR-bit one, and a
+// fixture whose values do not span a field cannot detect a decoder that ignores
+// part of it: every assertion still passes, because the bits that were dropped
+// were never set. W5 fixed one instance of that and left two. This is the whole
+// set, driven here and asserted in `CheckQuantArm` rather than described:
+//
+//   sc, sub-blocks 4..7 — the SPLIT half. `get_scale_min_k4` assembles these
+//       from a LOW nibble in `scales[j+4]` and a HIGH pair of bits in a
+//       DIFFERENT byte, so a scale never above 15 leaves that assembly untested:
+//       `sc >> 4` is 0, the high pair is zero, and an unpack that dropped it
+//       reproduces every value. Lifted by `16*(sb-3)`, capped at 63.
+//   sc, sub-blocks 0..3 — the WHOLE-field half, and the W5 review's F1. `j < 4`
+//       reads `q[j] & 63` in one piece, and the data-derived scale here is
+//       EXACTLY 3 for every low sub-block of every tensor this fixture writes:
+//       two bits of six. A production `q[j] & 15` therefore reproduced every
+//       value and the suite stayed green at 9/9. Sub-block 0 is lifted by 16 and
+//       sub-block 1 saturates at 63, so the OR over the half is all six bits and
+//       no dropped bit survives.
+//   m, both halves. Derived from the data it lands at 36..38 — above 15, so a
+//       `& 15` mutation is caught, but bits 3 and 4 are never set. `m` is the
+//       encoder's FREE CHOICE as long as it reaches the block floor, so
+//       sub-blocks 2 and 6 take 63 and the OR over each half is again six bits.
+//       The scale is derived AFTER this, from a span that includes it.
+//   q, both nibble positions — and this is why sub-blocks 2 and 3 KEEP their
+//       data-derived scale. A large scale costs resolution: q falls to 0..2, and
+//       lifting all four low sub-blocks the way the high half is lifted would
+//       have collapsed the low nibble AND the high one to that range, trading
+//       the repair for the same defect one field down. An EVEN sub-block writes
+//       the LOW nibble of its byte and the ODD one above it writes the HIGH
+//       nibble, so one fine sub-block of each parity keeps both spanning 0..15.
+//
+// Nothing here aims to be llama.cpp's quantizer. The container does not care how
+// the scales and mins were chosen, only that the decode reproduces them, which
+// is exactly what is being gated.
 constexpr uint16_t kQ4KDfp16 = 0x2400;     // 2^-6
 constexpr uint16_t kQ4KDminfp16 = 0x2000;  // 2^-7
 
@@ -221,16 +275,30 @@ Encoded EncodeQ4_K(const std::vector<float>& x) {
         hi = std::max(hi, x[base + l]);
       }
       // decoded(q) = (2*sc*q - m)/128, q in [0,15]: m sets the floor, sc the span.
+      // `m` need only REACH the floor, so two sub-blocks take the widest legal
+      // value instead and the scale below adapts to the span that results.
       mn[sb] = std::max(0, std::min(63, static_cast<int>(std::lround(-lo * 128.0f))));
+      if (sb == 2 || sb == 6) mn[sb] = 63;
       const float span = hi * 128.0f + static_cast<float>(mn[sb]);
       sc[sb] = std::max(1, std::min(7, static_cast<int>(std::ceil(span / 30.0f))));
-      if (sb >= 4) sc[sb] = std::min(63, sc[sb] + 16 * (sb - 3));
-      if (sc[sb] > 15) ++e.high_scale_subblocks;
+      if (sb >= 4) {
+        sc[sb] = std::min(63, sc[sb] + 16 * (sb - 3));  // the SPLIT half
+      } else if (sb == 0) {
+        sc[sb] = std::min(63, sc[sb] + 16);  // the whole-field half, past 15
+      } else if (sb == 1) {
+        sc[sb] = std::min(63, sc[sb] + 60);  // ...and saturated, so its OR is 63
+      }
+      const int half = sb < 4 ? 0 : 1;
+      if (sc[sb] > 15) ++e.q4k.scale_above_15[half];
+      if (mn[sb] > 15) ++e.q4k.min_above_15[half];
+      e.q4k.scale_bits[half] |= sc[sb];
+      e.q4k.min_bits[half] |= mn[sb];
       for (size_t l = 0; l < 32; ++l) {
         int q = static_cast<int>(
             std::lround((x[base + l] * 128.0f + static_cast<float>(mn[sb])) /
                         (2.0f * static_cast<float>(sc[sb]))));
         q = std::max(0, std::min(15, q));
+        e.q4k.nibble_bits[sb % 2] |= q;
         // Nibble placement, straight off `dequantize_row_q4_K`: an EVEN
         // sub-block reads the low nibbles of its 32 bytes and the ODD one above
         // it reads the high nibbles of the SAME bytes.
@@ -346,7 +414,7 @@ constexpr uint32_t kGgmlF32 = 0, kGgmlQ8_0 = 8, kGgmlQ4_K = 12, kGgmlBf16 = 30;
 struct BuiltGguf {
   std::string bytes;
   std::map<std::string, std::vector<float>> expect;
-  int q4k_high_scale_subblocks = 0;  // see Encoded::high_scale_subblocks
+  Q4KCoverage q4k;  // see Q4KCoverage; summed over every Q4_K tensor written
 };
 
 BuiltGguf BuildDraftGguf(const Dims& d, Arm arm, bool dflash2) {
@@ -428,7 +496,7 @@ BuiltGguf BuildDraftGguf(const Dims& d, Arm arm, bool dflash2) {
       const Encoded e = EncodeQ4_K(src);
       b.AddTensor(t.gguf, dims, kGgmlQ4_K, e.bytes);
       out.expect[t.hf] = e.expect;
-      out.q4k_high_scale_subblocks += e.high_scale_subblocks;
+      out.q4k.Merge(e.q4k);
     }
   }
   out.bytes = b.Build();
@@ -728,10 +796,16 @@ TEST_CASE("dflash2 gguf: a bf16 GGUF draft loads BIT-IDENTICALLY to its safetens
     compared += kv.second.size();
   }
   // The instrument's own precondition: a comparison over an empty set is
-  // satisfied by everything, so the element count is asserted rather than hoped
-  // for. MEASURED at this fixture: 11 DFlash2 tensors inside a 25-tensor draft.
-  INFO("bf16 elements compared across the two containers: ", compared);
-  CHECK(compared > 1000000);
+  // satisfied by everything, so the extent is asserted EXACTLY rather than
+  // bounded below, and the two numbers are the ones the records quote. MEASURED
+  // at this fixture: the DFlash2 draft writes 36 GGUF tensors, of which the
+  // loader's q/k/v and gate/up merges leave 30 comparable slots holding
+  // 1 120 000 bf16 elements, 11 of the slots DFlash2's own. (25 is the DFLASH1
+  // fixture's tensor count and was quoted here in error through W5, #1314 F6.)
+  INFO("bf16 elements compared across the two containers: ", compared,
+       " over ", gm.size(), " tensors");
+  CHECK(gm.size() == 30);
+  CHECK(compared == 1120000);
   for (const std::string& n : Dflash2Names()) {
     REQUIRE(gm.count(n) == 1);
     CHECK_FALSE(gm.at(n).empty());
@@ -800,12 +874,31 @@ void CheckQuantArm(Arm arm, uint32_t ggml_type, int64_t block_elems,
   }
   INFO(std::string(ArmName(arm)), ": values checked over ", value_assertions, " elements");
   CHECK(value_assertions > 0);
-  // The Q4_K arm's own precondition: at least one sub-block must carry a scale
-  // above 15, or the split half of the packed 6-bit `scales` array is never
-  // read and this leg cannot see a production unpack that ignores it.
+  // The Q4_K arm's own preconditions, ONE PER PACKED FIELD. L2 above compares
+  // values; these say that the values it compared actually drove each field
+  // across its width, which is the difference between a bound and a bound that
+  // cannot see half of what it names. Both halves of `get_scale_min_k4` are
+  // covered, because `j < 4` reads the scale WHOLE and `j >= 4` assembles it
+  // from two bytes, and a fixture that only ever exercised one of the two would
+  // pass every assertion here with the other deleted.
   if (arm == Arm::kQ4_K) {
-    INFO("Q4_K sub-blocks with a scale above 15: ", built.q4k_high_scale_subblocks);
-    CHECK(built.q4k_high_scale_subblocks > 0);
+    const Q4KCoverage& cov = built.q4k;
+    for (int half = 0; half < 2; ++half) {
+      INFO("Q4_K sub-blocks ", half == 0 ? "0..3 (whole field)" : "4..7 (split field)",
+           ": ", cov.scale_above_15[half], " scales above 15, ",
+           cov.min_above_15[half], " mins above 15, scale bits ",
+           cov.scale_bits[half], ", min bits ", cov.min_bits[half]);
+      CHECK(cov.scale_above_15[half] > 0);
+      CHECK(cov.min_above_15[half] > 0);
+      CHECK(cov.scale_bits[half] == 63);
+      CHECK(cov.min_bits[half] == 63);
+    }
+    // ...and the 4-bit quant itself, in BOTH nibble positions. Driving the
+    // scales up costs resolution, so this is the field the repair above could
+    // have broken while every other assertion stayed green.
+    INFO("Q4_K nibble bits: low ", cov.nibble_bits[0], " high ", cov.nibble_bits[1]);
+    CHECK(cov.nibble_bits[0] == 15);
+    CHECK(cov.nibble_bits[1] == 15);
   }
 
   // --- L3: DIFFERENCE from the bf16 arm, which is encoded from the SAME source.
@@ -1160,6 +1253,14 @@ TEST_CASE("REAL published DFlash2 GGUF drafters carry the names and types this a
         // A DFlash2 tensor is stored dense (F32 for the conv bases) or in one of
         // the two encodings this arm decodes. A published re-quant that moved
         // one of them to a third encoding is a change this gate must report.
+        //
+        // The FILE is mixed and the arm name understates it: measured on
+        // `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` on 2026-08-21, 32 F32 / 45 Q4_K /
+        // FOUR Q6_K (`blk.{2,4}.{attn_v,ffn_down}.weight`, llama.cpp's usual
+        // `_M` mixture). None of the four is a DFlash2 tensor, which is why this
+        // list stays at two encodings; Q6_K reaches the shared `DequantQ6_K`
+        // and is gated by `tests/vllm/test_gguf_dequant.cpp`, not here
+        // (#1314 F5).
         CHECK((t.ggml_type == kGgmlF32 || t.ggml_type == kGgmlBf16 ||
                t.ggml_type == kGgmlQ8_0 || t.ggml_type == kGgmlQ4_K));
       };

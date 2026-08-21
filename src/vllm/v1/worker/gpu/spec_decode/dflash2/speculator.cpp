@@ -89,16 +89,30 @@ Dflash2ProposeState Dflash2SelectCandidates(const std::vector<float>& block_logi
   const int64_t H = config.hidden_size;
   VT_CHECK(vocab > 0 && H > 0, "dflash2 select-candidates: invalid draft vocab/hidden");
   // SPEC-DFLASH2 W5 (#1314): the codebooks must SPAN the vocabulary the
-  // candidates are drawn from, and this is the first wave where the two numbers
-  // can disagree. `vocab` is the TARGET's head width (`draft_vocab_size`, set
-  // from `lm_head.shape[0]` by the loader); the codebook extent comes from the
-  // DRAFT checkpoint. On the safetensors arm both trace back to one
-  // `config.json`, so they could not differ. A GGUF draft declares no vocab at
-  // all -- it is sized from its own `tokenizer.ggml.tokens` -- so a drafter
-  // paired with the wrong target now reaches here with a codebook SHORTER than
-  // the ids that index it, which is an out-of-range read of a 127 MB tensor
-  // rather than a wrong answer. Refused by name, and the numbers are quoted
-  // because the fix is to pair the draft with the target it was trained on.
+  // candidates are drawn from. `vocab` is the TARGET's head width
+  // (`draft_vocab_size`, which `src/vllm/entrypoints/model_loader.cpp` sets from
+  // the target's `lm_head.shape[0]`); the codebook extent comes from the DRAFT,
+  // checked at load against the DRAFT config's own `vocab_size`
+  // (`qwen3_dflash_weights.cpp`, the `[vocab, rank]` assertion).
+  //
+  // THE TWO HAVE ALWAYS BEEN ABLE TO DIFFER, on BOTH container arms. Through W5
+  // this comment said that on safetensors they "trace back to one `config.json`,
+  // so they could not differ"; that is wrong, and W5's fresh review found it
+  // (#1314 F7). Even there the two numbers are read from two different files --
+  // the DRAFT directory's `config.json` and the TARGET's `lm_head` -- so nothing
+  // ever forced them equal. What the GGUF arm changes is how LIKELY the mismatch
+  // is: a GGUF draft declares no vocabulary at all and is sized from its own
+  // `tokenizer.ggml.tokens`, so a drafter paired with the wrong target reaches
+  // here with a codebook SHORTER than the ids that index it, which is an
+  // out-of-range read of a 127 MB tensor rather than a wrong answer. Refused by
+  // name, and the numbers are quoted because the fix is to pair the draft with
+  // the target it was trained on.
+  //
+  // The comparison is STRICT, which is stricter than the out-of-range read
+  // requires. That is deliberate and it is also OWED: `## Owed` O16 hands W6 the
+  // job of reading upstream's own condition at the PR-head oracle, because a
+  // strict `==` is a NEW refusal class on the already-shipping safetensors lane
+  // for any target whose head is padded relative to the draft's codebooks.
   const int64_t codebook_rows =
       weights.candidate_selector.predecessor_codebook.shape[0];
   VT_CHECK(codebook_rows == vocab,

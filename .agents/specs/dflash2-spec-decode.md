@@ -1257,6 +1257,102 @@ list items.
   one.
 
 
+- **O15 — the three OUTPUT-SCALAR key spellings on the GGUF container are
+  INFERRED, not measured.** Owner: this row for the record, W6 for the
+  measurement. Issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  `MakeDflashGgufConfig` reads `dflash.output_multiplier`,
+  `dflash.final_logit_softcapping` and `dflash.input_embedding_scale`. The five
+  GEOMETRY keys beside them ARE measured — the published file writes the HF key
+  name verbatim under the `dflash.` prefix, five of five — and these three
+  extrapolate that convention. Re-read on 2026-08-21 across all three published
+  arms of `z-lab/Qwen3.8-27B-DFlash2-GGUF`: 47 KV entries each, and NONE of the
+  three appears in any of them. So the convention is unconfirmed exactly where it
+  is being relied on.
+
+  The cost if llama.cpp's converter spells them otherwise is the class D9 exists
+  to prevent: the reader finds no key, `LoadQwen3DFlash` supplies upstream's
+  default, and the drafter runs with a multiplier of 1.0 and no softcapping
+  against a checkpoint that asked for 0.196 and 20.0. Both are applied to the
+  candidate VALUES before the selector scores them, so the top-K reorders and
+  ACCEPTANCE moves with the tokens still verifying losslessly — invisible to
+  every token gate. It is not fixed here because the only fix that closes it is a
+  measurement on an artifact that does not exist yet: `z-lab/Muse-Glimmer-30B-DFlash2`
+  is the checkpoint that SETS two of the scalars (#1327) and it has no published
+  DFlash2 GGUF conversion. Refusing an unknown `dflash.*` key instead was
+  considered and rejected: the published files carry `dflash.context_length` and
+  `dflash.target_layers`, which this reader does not read, so a refusal on
+  unknown keys would refuse every artifact that exists. W6 discharges this by
+  converting that draft with llama.cpp and reading the keys it writes.
+
+- **O16 — the codebook-span guard compares `==`, and upstream's own condition has
+  NOT been read.** Owner: W6. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  `Dflash2SelectCandidates` requires the predecessor codebook's row count to
+  EQUAL the target head's width. The out-of-range read it exists to refuse needs
+  only `>=`, so the guard as written is strictly stronger than its own stated
+  reason, and W5's fresh review was right to flag the gap between the two
+  (#1314 F7). It is left strict rather than relaxed here because the question is
+  not answerable in this checkout: the local oracle sits at the parity pin and
+  carries no DFlash2 at all, so nothing here can say whether upstream pads a
+  target head relative to the draft's codebooks or forbids it.
+
+  The consequence of guessing wrong in either direction is named so W6 does not
+  have to re-derive it. Keeping `==` introduces a NEW REFUSAL CLASS on the
+  already-shipping safetensors lane: any target whose `lm_head` is padded — to a
+  tensor-parallel multiple, or by an added special token — now fails to draft
+  where before it read a codebook row that existed. Relaxing to `>=` would admit
+  a genuinely mispaired checkpoint that happens to be narrower, which is the
+  wrong answer rather than the crash. W6 settles it by reading
+  `DFlash2Speculator` at the PR-head oracle and mirroring what upstream does.
+
+- **O17 — nothing in this row has yet LOADED a published DFlash2 artifact.**
+  Owner: W6. Issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  "Drafts in all three published arms" is an inference from the ENCODINGS, and
+  the record should say so. What is measured is: a synthetic fixture at
+  `H = 256` that writes each arm's block format itself and drafts from it, plus
+  an asset-gated case that opens all three published files and reads their
+  HEADERS — the KV block and the tensor table, kilobytes rather than the 7 GB the
+  three arms weigh. No case maps a byte of published tensor data, and no case
+  runs the real geometry (`H = 5120`, 5 layers, a 248320-row codebook). The
+  fixture's own coverage is what carries the decode, which is why W5's repair
+  wave counts every packed field it drives (#1314 F1).
+
+  The gap this leaves is a shape or an encoding that only the real file has: a
+  248320 x 256 codebook is 127 MB and the synthetic one is 128 KB, and a row
+  stride or an offset defect that appears only past a size threshold would pass
+  everything here. It is not closed in W5 because a full load of the three arms
+  is a 7 GB read and a 3.584 GiB residency (O13), which belongs with W6's leased
+  GPU run and not in a CPU suite that must stay CI-cheap. W6 loads at least the
+  Q4_K_M arm end to end and records the residency it actually paid.
+
+- **O18 — the fixture's BLOCK SCALES are each exercised at ONE fp16 value.**
+  Owner: this row. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  W5's repair wave drove every PACKED INTEGER field across its width and counted
+  it — the 6-bit scale in both halves of `get_scale_min_k4`, the 6-bit min in
+  both, and the 4-bit quant in both nibble positions. The fp16 SCALARS in front
+  of them are not covered the same way: `EncodeQ8_0` fixes `d` at `0x1C00` in
+  every block of every tensor, and `EncodeQ4_K` fixes `d` at `0x2400` and `dmin`
+  at `0x2000`. That is the same class of instrument gap as #1314 F1, one field
+  over and lower in severity: `ReadF16` is a `memcpy` plus the shared
+  `vt::F16ToF32`, which its own suite gates across the exponent range, so the
+  defect this cannot see is confined to the block header's OFFSET and WIDTH —
+  and those two are pinned by the byte-count precondition and by every value
+  after them decoding correctly.
+
+  It is recorded rather than fixed because varying `d` per block costs the
+  property that makes this suite's comparison BIT-EXACT: the fixed powers of two
+  are what keep every decoded value a small integer over 128, exactly
+  representable in the loader's bf16 store, so the assertion can be equality
+  rather than a tolerance. A wave that wants this covered should add ONE extra
+  Q8_0 tensor at a second `d` rather than vary `d` everywhere, keeping both
+  properties.
+
+
 ## Now
 
 `SPEC-DFLASH2` is `ACTIVE`. W1 landed on 2026-08-19 (the route and D4's
@@ -1479,28 +1575,64 @@ last one is `## Owed` O13 and is the honest cost of this arm.
 
 **THE NAME MAP IS GATED BY CONSTRUCTION, not by reading it.** The bf16 GGUF arm
 is required BIT-IDENTICAL to the same draft written as safetensors under the
-published HF names — 1 120 000 bf16 elements over 25 tensors, from one set of
-source values written into two containers. A name pointed at the wrong tensor,
-transposed, or dropped moves those bytes; nothing in the gate restates the
-mapping. Mutation-proven: swapping the two codebook names, pointing
+published HF names — 1 120 000 bf16 elements over 30 COMPARED TENSORS, from one
+set of source values written into two containers. The fixture writes 36 GGUF
+tensors and the loader's q/k/v and gate/up merges leave 30 comparable slots; the
+"25 tensors" this section carried through W5 is the DFLASH1 fixture's count and
+was wrong (#1314 F6). Both numbers are now asserted rather than quoted —
+`CHECK(gm.size() == 30)` and `CHECK(compared == 1120000)`, mutation-proven by
+dropping one tensor from the comparison map (2 assertions red). A name pointed at
+the wrong tensor, transposed, or dropped moves those bytes; nothing in the gate
+restates the mapping. Mutation-proven: swapping the two codebook names, pointing
 `attention_conv.base_kernel` at the MLP sublayer, and pointing the MLP projection
 at the attention one each redden 3 cases / 6 assertions.
 
 **AND THE QUANTIZED ARMS CARRY A LOWER BOUND, because a token gate here cannot.**
 This lane dequantizes by design, so the standing trap is acute rather than
 absent: a k-quant tensor that never decoded would leave every token matching and
-every golden passing. The gate therefore has three legs, none of them a token
-comparison. L1 the BYTES, read off the tensor table the loader itself reads —
-MEASURED at 22 quantized tensors, 1 114 112 elements in 626 688 bytes for Q4_K
-and 1 183 744 for Q8_0, against 2 228 224 for the same tensors in bf16. L2 the
-VALUES, bit-for-bit over 266 240 elements against an expectation the test
-computes from the block integers it CHOSE — the suite carries its own Q8_0 and
-Q4_K encoders, including the inverse of `get_scale_min_k4`'s 6-bit scale pack, so
-the comparison is a round trip through two implementations rather than a shared
-helper agreeing with itself. L3 DIFFERENCE from the bf16 arm, at 7 of 7
-quantized DFlash2 tensors and 2048 of 2048 block logits, with the F32 tensors no
-arm quantizes required IDENTICAL so the leg cannot be satisfied by a loader that
-garbled everything.
+every golden passing. The gate therefore has three parts, none of them a token
+comparison — **and they are NOT three equal legs**, which is how W5 first
+described them and what its fresh review corrected (#1314 F3).
+
+L1 is a PRECONDITION ON THE FIXTURE. It reads the ggml type and the byte count
+off the tensor table of the file the test has just written — MEASURED at 22
+quantized tensors, 1 114 112 elements in 626 688 bytes for Q4_K and 1 183 744 for
+Q8_0, against 2 228 224 for the same tensors in bf16. What it proves is that the
+bytes L2 goes on to compare really are block-encoded; it says nothing about the
+loader, and a loader that hashed the bytes and returned garbage passes it
+unchanged.
+
+L2 IS THE BOUND. The VALUES, bit-for-bit over 266 240 elements against an
+expectation the test computes from the block integers it CHOSE — the suite
+carries its own Q8_0 and Q4_K encoders, including the inverse of
+`get_scale_min_k4`'s 6-bit scale pack, so the comparison is a round trip through
+two implementations rather than a shared helper agreeing with itself. Every
+decoder mutation this row records lands here.
+
+L3 is a cheap COROLLARY of L2 that reaches further: DIFFERENCE from the bf16 arm,
+at 7 of 7 quantized DFlash2 tensors and 2048 of 2048 block logits, with the F32
+tensors no arm quantizes required IDENTICAL so it cannot be satisfied by a loader
+that garbled everything. The ordering is exact: a byte-hashing loader passes L1
+and L3 and fails L2 hard.
+
+**AND THE FIXTURE'S OWN COVERAGE IS COUNTED, ONE COUNTER PER PACKED FIELD**,
+because L2 can only bound what the fixture drove. W5 shipped one instance of
+that defect and its review found two more (#1314 F1). Measured over this
+fixture's own source values, the Q4_K encoder produced a scale of EXACTLY 3 for
+all 17 408 low-half sub-blocks — two bits of a six-bit field — so
+`get_scale_min_k4`'s `*d = q[j] & 63` mutated to `& 15` left the suite at 9 cases
+/ 4720 assertions / `SUCCESS!` / rc 0. The min field carried a weaker form of the
+same thing: 36..38 in every sub-block, which catches `& 15` but not `& 47`, and
+that mutation also passed. The repair drives sub-block 0 to 19 and sub-block 1 to
+63 (the whole-field half), pins the min of sub-blocks 2 and 6 at 63, and
+DELIBERATELY leaves sub-blocks 2 and 3 at their data-derived scale so the 4-bit
+quant still spans 0..15 in BOTH nibble positions — lifting all four, the obvious
+repair, collapses q to 0..2 and trades the fix for the same defect one field
+down. All five counters are asserted (`scale_bits`, `min_bits` = 63 per half;
+`nibble_bits` = 15 per position; plus the two above-15 counts) and all of it is
+mutation-proven, both ways: `& 15` and `& 47` now redden 1 case / 7 assertions
+each, removing the scale lift reddens 2, removing the min pin reddens 2, and the
+naive all-four lift reddens the nibble precondition at 2.
 
 **Two guards land with the arm, and both are gated by message rather than by a
 bare throw.** All four DFlash2 geometry keys are REQUIRED once the file is
@@ -1527,11 +1659,17 @@ not to refuse.
 reachable from a production entry point, for the same structural reason, with the
 bounded consequence named), O9 (`input_embedding_scale`), O10 (the CUDA top-k's
 NaN ordering, [#1489](https://github.com/mudler/vllm.cpp/issues/1489)), O11 (the
-walk's CUDA arm, never compiled here), O12 (the probabilistic arm) and the new
-O13 (a GGUF drafter's bf16 residency, measured at 3.584 GiB against 1.06 GiB on
-disk). O6, O7 and O8 stay discharged.
+walk's CUDA arm, never compiled here), O12 (the probabilistic arm), O13 (a GGUF
+drafter's bf16 residency, measured at 3.584 GiB against 1.06 GiB on disk), and
+the four the W5 REVIEW added: O15 (the three output-scalar GGUF key spellings are
+inferred and no published file declares any of them), O16 (the codebook-span
+guard is `==` and upstream's own condition is unread here), O17 (no wave has
+LOADED a published artifact — the asset case reads headers and the fixture runs
+at `H = 256`) and O18 (the fixture's fp16 block scales are each exercised at one
+value). O6, O7 and O8 stay discharged.
 
-Next action: W6's G2/G3 on a leased GPU against the PR-head oracle, then
+Next action: W6's G2/G3 on a leased GPU against the PR-head oracle — which also
+carries O16 and O17 — then
 `## Outcome`. **No throughput number is claimed by this wave and none is
 admissible yet**: `## Gates` defers every ratio until G2 and G3 read, and a
 DFlash2 draft is additionally off the paged CUDA-graph fast path, because the

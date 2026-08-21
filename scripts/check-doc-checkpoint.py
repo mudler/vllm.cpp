@@ -79,11 +79,49 @@ STATES = (
     "N/A",
 )
 
-# RECORD states are real lifecycle positions that the public pages carry NO term
-# for. .agents/feature-matrix.md:14-20 names all three: INVENTORIED and SPIKE are
-# pre-claim, and ANCHOR-BACKFILL is a property of the RECORD -- "a legacy
-# implemented row without exact code, test and real-spec anchors" -- so the
-# capability is already implemented and only the row's anchors are missing.
+# RECORD states are lifecycle positions of the ROW'S RECORD rather than of the
+# CAPABILITY. .agents/feature-matrix.md:14-20 names all three: INVENTORIED and
+# SPIKE are pre-claim, and ANCHOR-BACKFILL is a property of the RECORD -- "a
+# legacy implemented row without exact code, test and real-spec anchors" -- so
+# the capability is already implemented and only the row's anchors are missing.
+#
+# 2026-08-21, W3: the criterion W2 wrote here -- "real lifecycle positions that
+# the public pages carry NO term for" -- is FALSE, and it was derived for one
+# state and then applied to three. docs/STATUS.md:42 defines
+# `| Inventoried | The gap has a stable record but no accepted implementation |`
+# and :56 uses it in a live projection cell ("Distributed execution | Inventoried
+# or partial by lane"). In the other direction READY, TODO, BLOCKED, DROPPED and
+# N/A are all in STATES and docs/STATUS.md carries no term for any of them, grep
+# count 0 each. Word-on-the-page is therefore neither necessary nor sufficient,
+# and tests/scripts/test_doc_checkpoint.py pins both halves of that so the wrong
+# criterion cannot be reintroduced by quoting this file.
+#
+# Re-derived per state, separately, on what REQUIRED["lifecycle"] actually
+# demands -- (STATUS, BENCHMARKS), carried all or none:
+#
+#   INVENTORIED -- ADMITTED to the page, DECLINED for the tuple. STATUS.md's own
+#     definition describes the RECORD ("the gap has a stable record") together
+#     with the ABSENCE of an implementation, so carrying the word does not make
+#     arriving there a capability claim. Neither obvious cost decides it, and
+#     both were measured rather than argued: moving it into STATES changes 0 of
+#     793 row resolutions, and the 400-commit replay ending at e2a9e035d is
+#     identical either way. What decides it is that INVENTORIED is where a
+#     PRE-CLAIM row and a DEMOTED row both sit, so admitting it makes
+#     SPIKE -> INVENTORIED demand docs/STATUS.md and docs/BENCHMARKS.md for a row
+#     that has never claimed anything -- the public-document edit with nothing
+#     true to write that this file's header records as the reason for the
+#     rewrite. The half that genuinely goes unpaid is a DEMOTION out of a claim
+#     state into it; that is listed under `## Owed` in the row's spec, and it is
+#     0 of the 17 non-arrival transitions in the same 400 commits.
+#
+#   SPIKE -- pre-claim by protocol: .agents/feature-matrix.md gives a SPIKE row a
+#     `CLAIM-*` and not a spec, and docs/STATUS.md carries no term (grep 0).
+#     Neither limb of the criterion argues for admitting it.
+#
+#   ANCHOR-BACKFILL -- W1's ruling, re-derived independently and unchanged. It is
+#     a property of the record BY DEFINITION, docs/STATUS.md carries no term
+#     (grep 0), and a DONE <-> ANCHOR-BACKFILL move changes nothing a reader of
+#     that page could be told.
 #
 # 2026-08-21, W2 of the same row: they are RESOLVED but not CLASSIFIED as claims.
 # The earlier reading (recorded in doc-checkpoint-lifecycle-states.md `## Owed`)
@@ -118,6 +156,16 @@ STATE_CELL = re.compile(r"`(" + "|".join(re.escape(s) for s in STATES) + r")`")
 # QUANT-GGUF-PRESETS READY -> INVENTORIED) still resolve correctly. Measured over
 # all 793 rows against a column-position proxy: 12 of 226 resolutions disagreed
 # with it before, 10 of 793 after, and no previously-correct row regresses.
+#
+# THE OUTRIGHT WIN IS A LATENT HAZARD, recorded here so the next reader does not
+# have to rediscover it. row_states takes the record cell and `continue`s past
+# STATE_CELL, so an EVIDENCE cell that OPENS with a backticked record state
+# demotes a claim row no matter where the real State column sits. Zero rows do
+# that today, and the sized repair is already measured: taking whichever of the
+# last RECORD_CELL and the last STATE_CELL match ends LATER in the line changes
+# 0 of the same 793 resolutions. It is not made here because it is a separate
+# semantic change to the resolver and wants its own red-before case; it is
+# listed under `## Owed` in .agents/specs/doc-checkpoint-lifecycle-states.md.
 RECORD_CELL = re.compile(
     r"\|\s*`(" + "|".join(re.escape(s) for s in RECORD_STATES) + r")`"
 )
@@ -262,11 +310,42 @@ def transitions(
 ) -> list[tuple[str, str, str | None, str, str]]:
     """Every lifecycle move, as (table, row, previous, state, kind).
 
-    `kind` is CLAIM when both endpoints are states docs/STATUS.md has a term for,
-    and RECORD when either endpoint is one it does not. A RECORD move is still a
+    `kind` is keyed on the DESTINATION alone. A move INTO a claim state is a
+    CLAIM. A move into a record state is a RECORD move, which is still a
     lifecycle move -- AGENTS.md `## Public documents` owes the moved row spec's
     `## Now` for ANY state change -- it simply owes nothing the public pages
     could truthfully say.
+
+    2026-08-21, W3 (#1434). W2 keyed on BOTH endpoints, and that LOOSENED the
+    gate on nine transitions. Before W2 a row sitting in INVENTORIED, SPIKE or
+    ANCHOR-BACKFILL was absent from the BEFORE map, so `previous` was None and
+    the ARRIVAL rule fired, pulling in REQUIRED["lifecycle"]. Resolving the
+    record states made `previous` resolve, which made the arrival rule
+    unreachable, and the both-endpoints test then sent the move down the RECORD
+    branch and dropped (STATUS, BENCHMARKS). So every member of
+    {INVENTORIED, SPIKE, ANCHOR-BACKFILL} x {ACTIVE, GATING, DONE} went RED ->
+    GREEN across W2, with the spec `## Now` paid and the public surfaces
+    withheld: 9 of 9 rc 1 at e2a9e035d, 9 of 9 rc 0 at ba4634204, measured on
+    scratch commits. 569 of the 793 resolved rows sit in a record state, so that
+    is the exit path of most of the tree.
+
+    Destination-keying closes all nine, keeps W1's ANCHOR-BACKFILL ruling
+    (DONE -> ANCHOR-BACKFILL is still RECORD), and matches the polarity
+    CLAIM_ON_ARRIVAL already uses -- a rule that reads the destination and
+    ignores where the row came from. Replayed over the 400 non-merge commits
+    ending at e2a9e035d: 3 newly red against the pre-W2 gate and 0 newly green,
+    each of the three a genuinely unpaid surface (67e53e716, 33f570ea9,
+    ab6e65216).
+
+    THE REPLAY CANNOT BE THE WHOLE EVIDENCE, which is the lesson W2 missed. It
+    measures newly-GREEN over commits that landed UNDER the obligation being
+    removed, so no such commit can exist and "0 newly green" is an artifact
+    rather than a safety result. The three real commits that exercise these
+    transitions -- 2a976eb9f, 678fc672c, 7a0e6c82b -- are green under every
+    variant BECAUSE they paid both surfaces; withhold those two paths from the
+    same tree change and W2 alone reports no lifecycle move at all. The nine
+    transitions are therefore pinned as CONSTRUCTED cases in
+    tests/scripts/test_doc_checkpoint.py, not by replay.
     """
     moves: list[tuple[str, str, str | None, str, str]] = []
     for path in sorted(paths & set(ROW_TABLES)):
@@ -280,7 +359,9 @@ def transitions(
                 continue
             if previous == state:
                 continue
-            kind = CLAIM if previous in STATES and state in STATES else RECORD
+            # Destination-keyed. The both-endpoints form is what W2
+            # loosened; see the docstring for the nine transitions.
+            kind = CLAIM if state in STATES else RECORD
             moves.append((path, row, previous, state, kind))
     return moves
 
@@ -321,7 +402,9 @@ def spec_now_errors(paths: set[str], before: str, after: str) -> list[str]:
                 # by omission. Demanding one here would demand a document
                 # .agents/feature-matrix.md says does not exist yet. The `## Now`
                 # obligation still binds every record row that DOES link a spec,
-                # which is 50 of 56 ANCHOR-BACKFILL rows and 52 of 52 SPIKE rows.
+                # which is 50 of 56 ANCHOR-BACKFILL rows and 50 of 50 SPIKE rows
+                # (re-derived over the seven ROW_TABLES at 503e45900; W2 recorded
+                # 52 of 52 and the population has moved since).
                 continue
             errors.append(
                 f"{table}: {row} moved lifecycle state but its row links no spec, "

@@ -25565,3 +25565,130 @@ decision. And still owed, now that the alias is excluded on the target silicon:
 WHAT the step-7 divergence is. Excluding one cause is not identifying another,
 and the next traceable hypothesis is a per-operation two-arm comparison of the
 step-7 forward, first differing tensor named.
+
+## SPEC-DFLASH2 W6 — the gates, taken against a beyond-pin oracle that had to be made to answer (2026-08-21, `row/SPEC-DFLASH2-W6`, `dgx:gpu0`, #1314 / #1456 / #1538)
+
+**The first time either engine has been asked what the OTHER's DFlash2 draft
+proposed.** Everything before this wave measured mechanisms; this measures the
+two claims the mechanisms were built to make.
+
+### The two engines, pinned
+
+| | ours | oracle |
+|---|---|---|
+| revision | tree `81b530cff097db493e44e4de9a1c727530ed4467`, base `origin/main` `5702d8f83` | vLLM `0.1.dev1+g66e5414c6` ([vllm#52816](https://github.com/vllm-project/vllm/pull/52816) head `66e5414c6`) |
+| artifact | built in-lease, `nvcc` 13.0, `sm_121a`, `CUDA_OBJECTS_BUILT=34` | wheel sha256 `fbc247ab1bda93a81ff7a68658cdda65b697e263ad2c43a2bc62c2591d207439` |
+| attention | our own kernels | `TRITON_ATTN`, read back off the built engine and asserted |
+| graphs | DFlash2 draft runs OFF the paged CUDA-graph fast path | `Capturing dflash2 CUDA graphs (FULL)`, 77 s |
+| concurrency | 1 | `max_num_seqs=1`, `enforce_eager=False` |
+
+Target `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, 18
+shards, 51.75 GiB, verified against the pinned checkout by `config.json` and
+`model.safetensors.index.json` sha256 rather than by directory name. Draft
+`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+sha256 `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c`
+recomputed from the staged copy. k=7, greedy, `max_tokens` 64, the four
+`SPEC-DFLASH` D5 prompts.
+
+### G2 — 4/4 token-exact, 45/47 draft blocks byte-identical
+
+| prompt | tokens | shared | draft blocks identical |
+|---|---|---:|---:|
+| `The capital of France is` | exact | 64/64 | 14/15 |
+| `def fibonacci(n):` | exact | 64/64 | 10/10 |
+| `Q: What is 17 * 23?\nA:` | exact | 64/64 | 10/10 |
+| `The three laws of robotics are` | exact | 64/64 | 11/12 |
+
+The two blocks that differ each differ by ONE token at slot 2 and then emit the
+same target tokens: `[14227 369 14227 13 198 760 6511]` against
+`[14227 369 24844 ...]`, and `[39262 279 9861 2574 314 539 279]` against
+`[39262 279 10895 ...]`. That is the selector's rank contraction, which the row
+specifies within-envelope across backends, unlike the walk.
+
+### G3 — acceptance IDENTICAL, same-trajectory by construction
+
+All four prompts produced the same token stream on both engines, so there is no
+trajectory to confound.
+
+| prompt | ours | oracle |
+|---|---:|---:|
+| 0 | 49 | 49 |
+| 1 | 54 | 54 |
+| 2 | 54 | 54 |
+| 3 | 52 | 52 |
+| total | **209** | **209** |
+
+Counted the same way on both sides, from drafts and output. On the other
+instrument they also agree: our runner's counter reads 216 and
+`vllm:spec_decode_num_accepted_tokens` reads 216; our trace emits 47 verified
+blocks and `vllm:spec_decode_num_drafts` reads 47. The 209/216 gap is
+`max_tokens` truncating the last block of three of four requests, it appears on
+BOTH engines, and mixing the two instruments is the D8 shape in miniature.
+
+### G4 / O17 — a published artifact LOADED, and O13 measured at runtime
+
+`examples/vllm-cli` was pointed at `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`
+(1 143 006 752 B, sha256 `18a380ef...`) over the real 27B target. It loaded,
+proposed 7 speculative blocks and generated 24 tokens.
+
+| arm | on disk | peak RSS |
+|---|---:|---:|
+| Q4_K_M GGUF | 1.06 GiB | 47 028 616 KB (44.85 GiB) |
+| safetensors | 3.58 GiB | 46 701 608 KB (44.54 GiB) |
+
+0.70% apart on files 2.52 GiB apart, and the QUANTIZED arm is the LARGER by
+319 MiB. The two arms propose DIFFERENT drafts and emit the SAME tokens.
+
+### The oracle's own backend A/B, which reprices what G2 may demand
+
+Same wheel, same host, same workload, FULL decode graphs on both; only the
+attention backend differs.
+
+| | FLASH_ATTN | TRITON_ATTN |
+|---|---:|---:|
+| `spec_decode_num_drafts` | 50 | 47 |
+| `spec_decode_num_draft_tokens` | 350 | 329 |
+| `spec_decode_num_accepted_tokens` | 209 | 216 |
+| accepted / drafted | 0.597 | 0.657 |
+
+**Identical output on 3 of 4 prompts**; `def fibonacci(n):` diverges at
+generated index 4. vLLM does not reproduce its own greedy continuation across
+two of its own backends on this model, so a 4-of-4 strict bar would be one vLLM
+fails against itself.
+
+### FLASH_ATTN is USABLE here, which #1456 concluded it was not
+
+The first capture exported `VLLM_ATTENTION_BACKEND=TRITON_ATTN`, vLLM ignored it
+because that variable does not exist at this revision, auto-selection took
+`FLASH_ATTN`, and the run worked end to end -- 54.87 GiB loaded, graphs captured,
+256 coherent tokens, speculation live. #1456's SASS measurement stands;
+`sm_80` PTX JITs forward and `cudaErrorUnsupportedPtxVersion` is the opposite
+failure. Posted to #1456.
+
+### SPEED — NOT TAKEN
+
+No ratio is claimed and none should be inferred. No idle-host same-binary A/B was
+run. Our DFlash2 draft is off the paged CUDA-graph fast path while the oracle
+graphs its draft step. And every wall-clock here was dominated by reading a
+51.75 GiB checkpoint over CIFS: 11:17 and 12:15 for 24 tokens, `tok_s` 0.115 and
+0.090, which measure loading and are recorded so nobody quotes them as decode.
+
+### The device arms, on hardware, zero skips
+
+`test_ops_dflash2_grouped_conv` 9936 assertions, `test_ops_dflash2_selector_edges`
+3859, `test_ops_topk_values_indices` 560, `test_ops_dflash2_path_walk` 83,
+`test_qwen3_dflash2_draft` 277, `test_dflash2_runner_reach` 86,
+`test_dflash2_argmax_guard` 30. All `Status: SUCCESS!`, all
+`CUDA_SKIP_LINES=0`, `DEVICE_SUITES_FAILED=0`.
+
+### Four instrument defects, three in the oracle hook and one in our own gate
+
+Recorded in the spec's `## Owed` O23. The pattern is the finding: each presents
+as a verdict about the CODE. The engine core is a separate process by default;
+`capture_model()` calls the hooked method inside a CUDA graph capture; and
+`_generate_draft` is the wrong seam entirely because `propose` replays the
+captured graph. The third asserted `InprocClient`, `HOOK_ON_CLASS=traced` and
+the resolved backend, and was still blind. Only the abort-on-zero caught them.
+The fourth was ours: the gate compared 55 raw propose calls against vLLM's 47
+drafts, which counts only blocks starting inside the output. One assertion of
+134 failed on it.

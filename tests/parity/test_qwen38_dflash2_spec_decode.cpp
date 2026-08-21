@@ -1,0 +1,820 @@
+// vllm.cpp original (checkpoint-gated spec-decode gate); no upstream mirror.
+//
+// THE DFlash2 e2e CORRECTNESS GATE (SPEC-DFLASH2 W6, #1314). This is the case
+// the whole row exists to produce: G2 (draft-token identity against the
+// beyond-pin oracle) and G3 (acceptance, measured SAME-TRAJECTORY).
+//
+// WHAT THIS GATES, AND WHY EACH BAR IS SHAPED THE WAY IT IS
+//
+// (G2) DRAFT-TOKEN identity, not only output identity. A DFlash2 draft that
+//      proposed nothing useful still emits the target's tokens, because the
+//      verify is lossless -- that is the silent-wrong this whole row is built to
+//      remove, and an output-token gate cannot see it. So the bar reads the
+//      PRODUCTION `[SPECTRACE]` line and compares the DRAFTS block by block
+//      against the drafts upstream's own `DFlash2Speculator._generate_draft`
+//      wrote into `self.draft_tokens`.
+//
+// (G3) ACCEPTANCE, SAME-TRAJECTORY. `SPEC-DFLASH` D8 spent an entire campaign
+//      concluding a 0.85x acceptance deficit that D9 refuted as a
+//      divergent-trajectory confound. This gate does not repeat that: a prompt
+//      contributes to the acceptance comparison ONLY when the two engines
+//      emitted the SAME token stream, which makes the trajectories identical by
+//      construction rather than by assumption. A prompt that diverges is
+//      reported with its divergence index and is EXCLUDED from the acceptance
+//      bar rather than silently averaged into it.
+//
+// (VOID) TOKENIZER identity is a PRECONDITION, not a bar. If our prompt token
+//      ids differ from the oracle's, the two engines were not fed the same
+//      thing and no comparison below means anything. That is reported as a VOID
+//      gate -- a hard failure with its own message -- rather than as a token
+//      mismatch, because the two have different causes and different repairs.
+//
+// THE NEAR-TIE ENVELOPE APPLIES AND A STRICT CLAIM DOES NOT. `SPEC-DFLASH` D6
+// established that strict token identity against vLLM is bf16-IRREDUCIBLE on
+// portable kernels (an inline context-KV recompute envelope plus a from-scratch
+// block attention against vLLM's flashinfer paged one), and the ratified
+// near-tie form is what this lane gates. So a divergence is reported with its
+// index and its shared prefix, and the bar is that a divergence is a LATE
+// near-tie rather than a structural break at index 0.
+//
+// THE ORACLE IS BEYOND-PIN AND THE BACKEND IS CONSTRAINED. The parity pin
+// carries no DFlash2 at all. The gate oracle is vLLM at
+// 66e5414c6d75a8529473d977f7458c140bbab8a0 (vllm-project/vllm#52816), and it
+// runs on TRITON_ATTN because vllm-flash-attn does not target sm_12x at that
+// revision (#1456). Both facts are carried in the golden and asserted here, so
+// a golden captured under a different oracle or backend cannot be read as this
+// one.
+//
+// Checkpoint-GATED + dgx-only. On the CPU dev box and in CI the body emits a
+// loud SKIP naming exactly what is absent (it still compiles and links).
+#include <doctest/doctest.h>
+
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "vllm/config/speculative.h"
+#include "vllm/entrypoints/model_loader.h"
+#include "vllm/sampling_params.h"
+
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+
+namespace {
+
+std::string Env(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr ? std::string(v) : std::string();
+}
+
+vllm::SamplingParams Greedy(int max_tokens) {
+  vllm::SamplingParams sp;
+  sp.temperature = 0.0;
+  sp.max_tokens = max_tokens;
+  sp.PostInit();
+  return sp;
+}
+
+std::string Ids(const std::vector<int32_t>& v) {
+  std::string s;
+  for (const int32_t id : v) s += std::to_string(id) + " ";
+  return s;
+}
+
+// `VT_SPEC_TRACE` is latched by a function-local `static` on the FIRST propose
+// in the process, so setting it inside a case would race whichever case ran
+// first. This runs before main.
+const bool kSpecTraceEnabled = [] {
+  ::setenv("VT_SPEC_TRACE", "1", 1);
+  return true;
+}();
+
+// REAL fd 2, by dup/dup2, and not a `std::cerr` rdbuf swap: the trace is written
+// with `std::fprintf(stderr, ...)`, which an rdbuf swap cannot see. A capture
+// that could not see the line it exists to read would come back empty and look
+// like "the propose did not run" -- the instrument failing toward a verdict
+// about the code.
+std::string CaptureStderr(const std::function<void()>& body) {
+  std::FILE* cap = std::tmpfile();
+  REQUIRE(cap != nullptr);
+  std::fflush(stderr);
+  const int saved = ::dup(STDERR_FILENO);
+  REQUIRE(saved >= 0);
+  REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+  body();
+  std::fflush(stderr);
+  const int restored = ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  std::rewind(cap);
+  std::string out;
+  char buf[8192];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) out.append(buf, n);
+  std::fclose(cap);
+  REQUIRE(restored >= 0);
+  return out;
+}
+
+// One decode step that proposed, as the production verify-side trace reports it:
+//   [SPECTRACE] req=<id> pos=<n> k=<k> ns=<n> acc=<a> draft=[ ... ] emit=[ ... ]
+// `pos` is the request's token count BEFORE this step's write-back, so blocks
+// from two runs line up by POSITION rather than by ordinal alone.
+struct TraceBlock {
+  std::string req;
+  int pos = -1;
+  int k = 0;
+  int accepted = 0;
+  std::vector<int32_t> draft;
+  std::vector<int32_t> emit;
+};
+
+std::vector<int32_t> ParseIdList(const std::string& s) {
+  std::vector<int32_t> out;
+  std::istringstream is(s);
+  int64_t v = 0;
+  while (is >> v) out.push_back(static_cast<int32_t>(v));
+  return out;
+}
+
+// Field lookup by NAME rather than by offset, so a future field added to the
+// trace line does not silently shift what this reads.
+bool ScalarField(const std::string& line, const std::string& key, int* out) {
+  const std::string k = " " + key + "=";
+  const size_t at = line.find(k);
+  if (at == std::string::npos) return false;
+  *out = std::atoi(line.c_str() + at + k.size());
+  return true;
+}
+
+bool StringField(const std::string& line, const std::string& key, std::string* out) {
+  const std::string k = " " + key + "=";
+  const size_t at = line.find(k);
+  if (at == std::string::npos) return false;
+  const size_t open = at + k.size();
+  const size_t close = line.find(' ', open);
+  *out = line.substr(open, close == std::string::npos ? close : close - open);
+  return true;
+}
+
+bool ListField(const std::string& line, const std::string& key,
+               std::vector<int32_t>* out) {
+  const std::string k = " " + key + "=[";
+  const size_t at = line.find(k);
+  if (at == std::string::npos) return false;
+  const size_t open = at + k.size();
+  const size_t close = line.find(']', open);
+  if (close == std::string::npos) return false;
+  *out = ParseIdList(line.substr(open, close - open));
+  return true;
+}
+
+std::vector<TraceBlock> ParseSpecTrace(const std::string& captured) {
+  std::vector<TraceBlock> out;
+  std::istringstream is(captured);
+  std::string line;
+  while (std::getline(is, line)) {
+    if (line.find("[SPECTRACE]") == std::string::npos) continue;
+    if (line.find(" draft=[") == std::string::npos) continue;  // the propose-side line
+    TraceBlock b;
+    if (!StringField(line, "req", &b.req)) continue;
+    if (!ScalarField(line, "pos", &b.pos)) continue;
+    if (!ScalarField(line, "k", &b.k)) continue;
+    if (!ScalarField(line, "acc", &b.accepted)) continue;
+    if (!ListField(line, "draft", &b.draft)) continue;
+    if (!ListField(line, "emit", &b.emit)) continue;
+    out.push_back(std::move(b));
+  }
+  return out;
+}
+
+struct OurRun {
+  std::vector<int32_t> out_ids;
+  std::vector<int32_t> prompt_ids;
+  std::vector<TraceBlock> blocks;
+  int64_t proposed = 0;
+  int64_t accepted = 0;
+  std::string text;
+};
+
+// ONE ENGINE, EVERY PROMPT. Not a style choice: this target is 51.75 GiB off a
+// CIFS mount and vLLM measured 522.9 s to read it once, so an engine per prompt
+// would spend most of a GPU lease re-reading weights that did not change. The
+// DFlash1 gate beside this one loads once for the same reason.
+//
+// The per-block trace is split back out by REQUEST ID rather than by ordinal,
+// because one captured stream now carries every prompt's blocks. `req=` is a
+// field of the production line, so the split is read off the instrument rather
+// than reconstructed from call order.
+std::vector<OurRun> RunDflash2All(const std::string& target, const std::string& draft,
+                                  int k, const std::vector<std::string>& prompts,
+                                  int max_tokens) {
+  vllm::entrypoints::EngineParams params;
+  params.max_num_seqs = 1;  // concurrency 1: the pooled acceptance IS per-request.
+  params.speculative_config = vllm::ParseSpeculativeConfigJson(
+      std::string("{\"method\":\"dflash\",\"model\":\"") + draft +
+      "\",\"num_speculative_tokens\":" + std::to_string(k) + "}");
+
+  std::vector<OurRun> runs(prompts.size());
+  std::vector<std::string> ids(prompts.size());
+  const std::string captured = CaptureStderr([&] {
+    auto loaded = vllm::entrypoints::LoadedEngine::FromModelDir(target, params);
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      ids[i] = "dflash2_" + std::to_string(i);
+      const int64_t acc_before = loaded->runner().spec_drafts_accepted();
+      const int64_t prop_before = loaded->runner().spec_drafts_proposed();
+      const vllm::RequestOutput out =
+          loaded->engine().generate(prompts[i], Greedy(max_tokens), ids[i]);
+      OurRun& r = runs[i];
+      r.out_ids = out.outputs.empty() ? std::vector<int32_t>{}
+                                      : out.outputs[0].token_ids;
+      r.text = out.outputs.empty() ? std::string() : out.outputs[0].text;
+      r.prompt_ids = out.prompt_token_ids;
+      // DELTAS, not totals. The counters are cumulative over the engine's life,
+      // and reading a total as a per-prompt count is how a second prompt gets
+      // credited with the first one's acceptance.
+      r.accepted = loaded->runner().spec_drafts_accepted() - acc_before;
+      r.proposed = loaded->runner().spec_drafts_proposed() - prop_before;
+    }
+  });
+
+  const std::vector<TraceBlock> all = ParseSpecTrace(captured);
+  for (size_t i = 0; i < runs.size(); ++i)
+    for (const TraceBlock& b : all)
+      if (b.req == ids[i]) runs[i].blocks.push_back(b);
+  return runs;
+}
+
+// ACCEPTANCE, RECONSTRUCTED FROM THE DRAFTS AND THE OUTPUT ALONE.
+//
+// The verify here and upstream is ACCEPT-IFF-EQUAL under greedy sampling
+// (`include/vllm/v1/spec_decode/rejection_sampler.h`), so a block's accepted
+// count is a FUNCTION of what it proposed and what the request emitted: the
+// longest prefix of the draft that the output actually took, at the position the
+// block started from. That makes the ORACLE's per-block acceptance recoverable
+// from a capture that recorded only drafts and output -- which is what this
+// row's capture recorded, because vLLM exposes no per-block counter.
+//
+// The recovery is not trusted on the strength of that argument. It is run
+// against OUR OWN blocks first, where the true per-block count is printed by the
+// production trace, and the gate refuses to read the oracle's derived numbers
+// unless the derivation reproduces ours exactly.
+//
+// `len` starts at 1: the prefill step emits one token before any block proposes.
+// The last block can be TRUNCATED by max_tokens, so matching stops at the end of
+// the output rather than at k -- measured, not assumed: on the first W6 capture
+// `4 + 50 + 209 = 263` against 256 tokens actually generated, and the 7 missing
+// are exactly that truncation.
+struct Reconstructed {
+  std::vector<int> per_block;
+  int64_t total = 0;
+  // Blocks that STARTED inside the output, i.e. the ones the run actually
+  // verified. A capture records every `propose` call, and the last one or two of
+  // a request are proposals the run never consumed because `max_tokens` had
+  // already been reached. MEASURED 2026-08-21 on the oracle capture: 55 blocks
+  // recorded, 47 of them starting inside the output, and vLLM's own
+  // `spec_decode_num_drafts` reads exactly 47. So this -- not the raw count --
+  // is the quantity vLLM counts, and the cross-check below is EXACT rather than
+  // banded.
+  int64_t verified = 0;
+};
+
+Reconstructed ReconstructAcceptance(const std::vector<std::vector<int32_t>>& drafts,
+                                    const std::vector<int32_t>& out) {
+  Reconstructed r;
+  size_t len = 1;  // the prefill token
+  for (const std::vector<int32_t>& d : drafts) {
+    if (len < out.size()) ++r.verified;
+    int acc = 0;
+    for (size_t j = 0; j < d.size(); ++j) {
+      if (len + j >= out.size()) break;                 // truncated by max_tokens
+      if (out[len + j] != d[j]) break;                  // the first rejection
+      ++acc;
+    }
+    r.per_block.push_back(acc);
+    r.total += acc;
+    len += 1 + static_cast<size_t>(acc);
+  }
+  return r;
+}
+
+size_t SharedPrefix(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+  const size_t n = std::min(a.size(), b.size());
+  size_t i = 0;
+  while (i < n && a[i] == b[i]) ++i;
+  return i;
+}
+
+}  // namespace
+
+TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory acceptance") {
+  (void)kSpecTraceEnabled;
+  const std::string target = Env("VLLM_DFLASH2_TARGET");
+  const std::string draft = Env("VLLM_DFLASH2_DRAFT");
+  std::string golden_env = Env("VLLM_DFLASH2_GOLDEN");
+  const fs::path golden_path =
+      golden_env.empty()
+          ? fs::path(PARITY_GOLDENS_DIR) / "dflash2_27b" / "dflash2_27b_spec_on.json"
+          : fs::path(golden_env);
+
+  if (target.empty() || draft.empty() || !fs::exists(golden_path)) {
+    MESSAGE("SKIP (dgx-only): the DFlash2 e2e gate needs VLLM_DFLASH2_TARGET "
+            "(the Qwen3.8-27B bf16 safetensors dir, HF revision "
+            "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0), VLLM_DFLASH2_DRAFT "
+            "(z-lab/Qwen3.8-27B-DFlash2 @ "
+            "50307d4c4cde6860d4eee73e2547cd786fe8e8a4, a directory or a .gguf), "
+            "and the committed golden. Got target="
+            << (target.empty() ? "ABSENT" : target)
+            << " draft=" << (draft.empty() ? "ABSENT" : draft)
+            << " golden=" << (fs::exists(golden_path) ? golden_path.string()
+                                                      : std::string("ABSENT")));
+    return;
+  }
+
+  std::ifstream gf(golden_path.string());
+  REQUIRE(gf.good());
+  json golden;
+  gf >> golden;
+
+  // THE GOLDEN'S OWN IDENTITY, asserted before anything is read out of it. A
+  // golden captured against a different oracle revision or a different attention
+  // backend describes a different measurement, and reading it as this one is how
+  // a parity claim quietly stops meaning what it says.
+  const std::string oracle_version = golden.value("oracle_version", std::string());
+  const std::string backend = golden.value("attention_backend", std::string());
+  // The DECLARED backend defaults to TRITON_ATTN, which is the developer's
+  // recorded decision for this row's denominator (#1456). It is an env override
+  // rather than a widened set: this row measured BOTH arms, and a run that wants
+  // the FLASH_ATTN golden has to say so, so a golden from the other arm can
+  // never be read silently as this one.
+  std::string want_backend = Env("VLLM_DFLASH2_EXPECT_BACKEND");
+  if (want_backend.empty()) want_backend = "TRITON_ATTN";
+  MESSAGE("golden oracle_version=" << oracle_version << " backend=" << backend
+          << " (expected " << want_backend << ")");
+  CHECK(oracle_version.find("66e5414c") != std::string::npos);
+  CHECK(backend == want_backend);
+  CHECK(golden.value("spec", std::string()) == "on");
+  CHECK(golden.value("draft_hook_installed", false));
+
+  const int k = golden.at("num_speculative_tokens").get<int>();
+  const int max_tokens = golden.at("max_tokens").get<int>();
+  const auto& records = golden.at("records");
+  REQUIRE(records.size() > 0);
+
+  std::vector<std::string> prompts;
+  for (const auto& rec : records) prompts.push_back(rec.at("prompt").get<std::string>());
+
+  MESSAGE("dflash2 gate: loading the 27B target " << target << " + DFlash2 draft "
+          << draft << " (k=" << k << ", max_tokens=" << max_tokens << ", "
+          << prompts.size() << " prompts, ONE engine)...");
+  const std::vector<OurRun> runs =
+      RunDflash2All(target, draft, k, prompts, max_tokens);
+  REQUIRE(runs.size() == records.size());
+
+  int total = 0, exact = 0, same_traj = 0;
+  int64_t draft_blocks_compared = 0, draft_blocks_identical = 0;
+  int64_t our_acc_sum = 0, their_acc_sum = 0;
+  int64_t oracle_acc_all = 0, oracle_blocks_all = 0;
+  int64_t our_recon_sum = 0;
+  int prompt_idx = 0;
+
+  for (const auto& rec : records) {
+    const std::string prompt = rec.at("prompt").get<std::string>();
+    const std::vector<int32_t> want_prompt_ids =
+        rec.at("prompt_token_ids").get<std::vector<int32_t>>();
+    const std::vector<int32_t> want_out =
+        rec.at("output_token_ids").get<std::vector<int32_t>>();
+    const OurRun& r = runs[static_cast<size_t>(prompt_idx)];
+    ++total;
+    ++prompt_idx;
+
+    // ---- PRECONDITION: same input, or the whole comparison is VOID ----------
+    if (r.prompt_ids != want_prompt_ids) {
+      MESSAGE("VOID prompt[" << (prompt_idx - 1) << "]: our prompt token ids ("
+              << Ids(r.prompt_ids) << ") differ from the oracle's ("
+              << Ids(want_prompt_ids) << "). The two engines were not fed the "
+                 "same thing, so nothing below this line is a parity result. "
+                 "Repair the tokenizer before reading any bar.");
+    }
+    REQUIRE(r.prompt_ids == want_prompt_ids);
+
+    // ---- PRECONDITION: the drafter is ALIVE --------------------------------
+    // Token identity ALONE passes on a dead drafter (the I5e dead-drafter trap),
+    // and a DFlash2 draft that fell back to the DFlash1 per-slot argmax would
+    // also emit the target's tokens. So liveness is asserted before identity.
+    CHECK(r.proposed > 0);
+    CHECK(!r.blocks.empty());
+    for (const TraceBlock& b : r.blocks) CHECK(b.k == k);
+
+    // ---- G2a: OUTPUT tokens, under the ratified near-tie envelope -----------
+    const bool is_exact = (r.out_ids == want_out);
+    const size_t shared = SharedPrefix(r.out_ids, want_out);
+    if (is_exact) ++exact;
+    if (!is_exact) {
+      // A structural break diverges at index 0; a bf16 near-tie does not. This
+      // is the discriminator, and it is the only thing the envelope licenses.
+      MESSAGE("prompt[" << (prompt_idx - 1) << "] output divergence at index "
+              << shared << " of " << want_out.size()
+              << "; ours=" << Ids(r.out_ids) << " theirs=" << Ids(want_out));
+      CHECK(shared > 0);
+    }
+
+    // ---- G2b: DRAFT tokens, block by block ---------------------------------
+    //
+    // ALIGNMENT IS PROVED, NOT ASSUMED. Two engines that emit the same tokens
+    // can still reach block i from different acceptance patterns (accept 3 then
+    // 4 against 4 then 3), so pairing purely by ordinal would compare two blocks
+    // that started at different positions and report the difference as a draft
+    // defect. Every pair is therefore checked on the ANCHOR -- the verified
+    // token the walk starts from, which the oracle's own `_generate_draft` reads
+    // out of `input_buffers.input_ids[self._anchor_indices[:num_reqs]]` and which
+    // our block's `pos` names in the same stream. A mismatch STOPS the walk for
+    // that prompt and is reported; it is not silently skipped, because "the
+    // blocks stopped lining up" and "the drafts differ" are different findings.
+    //
+    // And the comparison never runs past the SHARED PREFIX. A draft is a
+    // function of the context before it, so a block starting at generated index
+    // g is comparable only while g <= the shared prefix length: past that the
+    // two engines are drafting from different text, and `SPEC-DFLASH` D8 spent a
+    // campaign mistaking exactly that for an acceptance deficit.
+    const auto& their_blocks = rec.at("blocks");
+    const int64_t plen = static_cast<int64_t>(want_prompt_ids.size());
+    std::vector<int32_t> full = want_prompt_ids;  // prompt + OUR continuation
+    full.insert(full.end(), r.out_ids.begin(), r.out_ids.end());
+
+    size_t identical_here = 0, compared_here = 0;
+    bool anchor_broke = false;
+    size_t stopped_at = 0;
+    for (size_t b = 0; b < r.blocks.size() && b < their_blocks.size(); ++b) {
+      const TraceBlock& ours = r.blocks[b];
+      const int64_t g = static_cast<int64_t>(ours.pos) - plen;  // generated index
+      stopped_at = b;
+      if (g < 0 || g > static_cast<int64_t>(shared)) break;     // past the prefix
+      // The anchor is the last token BEFORE this block, at absolute pos-1.
+      if (ours.pos <= 0 || static_cast<size_t>(ours.pos) > full.size()) break;
+      const int32_t our_anchor = full[static_cast<size_t>(ours.pos) - 1];
+      const int64_t their_anchor =
+          their_blocks[b].value("anchor", static_cast<int64_t>(-1));
+      if (their_anchor >= 0 && their_anchor != static_cast<int64_t>(our_anchor)) {
+        MESSAGE("  ALIGNMENT LOST at block[" << b << "] pos=" << ours.pos
+                << ": our anchor " << our_anchor << " vs the oracle's "
+                << their_anchor << ". Blocks past here are NOT compared, and "
+                   "this is an alignment finding rather than a draft one.");
+        anchor_broke = true;
+        break;
+      }
+      const std::vector<int32_t> theirs =
+          their_blocks[b].at("drafts").get<std::vector<int32_t>>();
+      ++compared_here;
+      if (ours.draft == theirs) {
+        ++identical_here;
+      } else if (compared_here - identical_here <= 3) {
+        MESSAGE("  draft block[" << b << "] pos=" << ours.pos << " g=" << g
+                << " ours=[" << Ids(ours.draft) << "] theirs=[" << Ids(theirs)
+                << "]");
+      }
+      stopped_at = b + 1;
+    }
+    draft_blocks_compared += static_cast<int64_t>(compared_here);
+    draft_blocks_identical += static_cast<int64_t>(identical_here);
+    (void)anchor_broke;
+    (void)stopped_at;
+
+    int64_t our_recon_here = 0;
+
+    // ---- THE RECONSTRUCTION IS VALIDATED ON OUR OWN BLOCKS FIRST -----------
+    // If it cannot reproduce a count the production trace printed, it cannot be
+    // trusted to produce the oracle's, and the gate says so instead of quoting a
+    // derived number as a measured one.
+    //
+    // THE LAST BLOCK IS EXCLUDED FROM THE EQUALITY, and the reason is a real
+    // state rather than a hedge. A request that hits `max_tokens` mid-block has
+    // its emitted stream CUT, so the reconstruction -- which can only see the
+    // tokens that survived -- reads fewer accepted than the counter, which
+    // counted them before the cut. Measured on the first W6 capture: vLLM's own
+    // arithmetic gives `4 prefills + 50 blocks + 209 accepted = 263` against 256
+    // tokens actually returned, and the 7 missing are exactly this. So every
+    // INTERIOR block must reproduce EXACTLY, the last may only UNDERCOUNT, and
+    // the deficit is printed rather than absorbed.
+    {
+      std::vector<std::vector<int32_t>> our_drafts;
+      for (const TraceBlock& b : r.blocks) our_drafts.push_back(b.draft);
+      const Reconstructed check = ReconstructAcceptance(our_drafts, r.out_ids);
+      REQUIRE(check.per_block.size() == r.blocks.size());
+      const size_t interior = r.blocks.empty() ? 0 : r.blocks.size() - 1;
+      size_t agree = 0;
+      for (size_t b = 0; b < interior; ++b)
+        if (check.per_block[b] == r.blocks[b].accepted) ++agree;
+      const int64_t deficit = r.accepted - check.total;
+      MESSAGE("  reconstruction check on OUR blocks: " << agree << "/" << interior
+              << " INTERIOR per-block counts reproduced exactly; last block "
+              << (r.blocks.empty() ? 0 : check.per_block.back()) << " against "
+              << (r.blocks.empty() ? 0 : r.blocks.back().accepted)
+              << "; total " << check.total << " against the trace's "
+              << r.accepted << " (deficit " << deficit << ", expected 0.."
+              << k << " from max_tokens truncation)");
+      CHECK(agree == interior);
+      if (!r.blocks.empty()) CHECK(check.per_block.back() <= r.blocks.back().accepted);
+      CHECK(deficit >= 0);
+      CHECK(deficit <= k);
+      our_recon_here = check.total;
+    }
+
+    // ---- G3: acceptance, SAME-TRAJECTORY ONLY ------------------------------
+    // A prompt contributes here only when the two engines emitted the SAME
+    // stream. That is what makes this a same-trajectory measurement rather than
+    // the D8 confound, and a diverging prompt is EXCLUDED and named rather than
+    // averaged in.
+    //
+    // The oracle's count is RECONSTRUCTED from its own drafts and its own
+    // output by the routine validated three lines above, because vLLM exposes no
+    // per-block counter and its aggregate is pooled over the whole run.
+    std::vector<std::vector<int32_t>> their_drafts;
+    for (const auto& tb : their_blocks)
+      their_drafts.push_back(tb.at("drafts").get<std::vector<int32_t>>());
+    const Reconstructed theirs_acc = ReconstructAcceptance(their_drafts, want_out);
+    const int64_t their_acc = theirs_acc.total;
+    oracle_acc_all += their_acc;
+    oracle_blocks_all += theirs_acc.verified;
+    if (is_exact) {
+      ++same_traj;
+      our_acc_sum += r.accepted;
+      their_acc_sum += their_acc;
+      our_recon_sum += our_recon_here;
+    }
+
+    // LIKE FOR LIKE, PER PROMPT. Our COUNTER sees the accepted tokens of a
+    // block that `max_tokens` then truncated; a RECONSTRUCTION from the emitted
+    // stream cannot, on either side. So the counter is only comparable to the
+    // other engine's counter, and the reconstruction only to the other engine's
+    // reconstruction -- and mixing them subtracts the truncation from one arm
+    // alone. That is a small confound and it is exactly the shape of the one
+    // `SPEC-DFLASH` D8 got wrong at a larger scale, so it is named and both
+    // pairs are reported.
+    if (is_exact) {
+      MESSAGE("  G3 prompt[" << (prompt_idx - 1) << "] RECONSTRUCTION vs "
+              "RECONSTRUCTION: ours " << our_recon_here << " against the "
+              "oracle's " << their_acc << std::string(
+                  our_recon_here == their_acc ? "  (IDENTICAL)" : "  (DIFFER)"));
+      // `std::string(...)`, not the bare ternary: doctest's stringifier prints a
+      // `const char*` as its BOOL conversion, so the first run of this line read
+      // "the oracle's 491" -- the count and a `1` for the message. Cosmetic, and
+      // the CHECK below is what binds, but a garbled evidence line is how a
+      // number gets misread later.
+      CHECK(our_recon_here == their_acc);
+    }
+
+    MESSAGE("dflash2 prompt[" << (prompt_idx - 1) << "] \"" << prompt
+            << "\": exact=" << (is_exact ? "YES" : "NO")
+            << " shared=" << shared
+            << "  our drafts " << r.accepted << "/" << r.proposed
+            << " accepted over " << r.blocks.size() << " blocks"
+            << "  (oracle blocks " << their_blocks.size()
+            << ", oracle accepted " << their_acc << ")"
+            << "  draft-blocks identical " << identical_here << "/"
+            << compared_here
+            << "  text=\"" << r.text << "\"");
+  }
+
+  MESSAGE("DFLASH2 G2 OUTPUT: " << exact << "/" << total << " prompts token-exact "
+          "against the beyond-pin oracle (66e5414c, TRITON_ATTN).");
+  MESSAGE("DFLASH2 G2 DRAFTS: " << draft_blocks_identical << "/"
+          << draft_blocks_compared << " draft blocks identical on the "
+          << same_traj << " same-trajectory prompts.");
+  MESSAGE("DFLASH2 G3 ACCEPTANCE (same-trajectory only, " << same_traj << "/"
+          << total << " prompts). RECONSTRUCTION vs RECONSTRUCTION -- the "
+          "comparable pair -- ours " << our_recon_sum << " against the oracle's "
+          << their_acc_sum << ". Our COUNTER reads " << our_acc_sum
+          << ", which includes the accepted tokens of blocks max_tokens then "
+             "truncated and is comparable only to vLLM's own counter, below.");
+
+  // THE RECONSTRUCTION, CROSS-CHECKED AGAINST vLLM'S OWN AGGREGATE COUNTER.
+  // The per-block derivation was validated against OUR trace prompt by prompt;
+  // this validates the same routine on the ORACLE's side, against a number vLLM
+  // measured itself. Without it the oracle's per-prompt acceptance would rest
+  // entirely on an argument about the verify rule.
+  //
+  // The counter is POOLED over the whole capture, which is exactly comparable
+  // here because the capture ran at max_num_seqs 1 and generated the same four
+  // prompts in the same order.
+  if (golden.contains("metrics")) {
+    const auto& m = golden.at("metrics");
+    const int64_t counted_acc =
+        m.value("vllm:spec_decode_num_accepted_tokens", static_cast<int64_t>(-1));
+    const int64_t counted_drafts =
+        m.value("vllm:spec_decode_num_drafts", static_cast<int64_t>(-1));
+    // The VERIFIED block count must match EXACTLY -- that is the quantity vLLM
+    // counts, and `Reconstructed::verified` records why. The ACCEPTED count may
+    // only undercount, by at most one truncated block per prompt, for the reason
+    // recorded on our own side above.
+    const int64_t max_deficit = static_cast<int64_t>(records.size()) * k;
+    MESSAGE("ORACLE RECONSTRUCTION vs vLLM's OWN COUNTER: reconstructed "
+            << oracle_acc_all << " accepted over " << oracle_blocks_all
+            << " blocks; vLLM counted " << counted_acc << " over "
+            << counted_drafts << " (deficit "
+            << (counted_acc >= 0 ? counted_acc - oracle_acc_all : -1)
+            << ", expected 0.." << max_deficit << " from max_tokens truncation)");
+    if (counted_drafts >= 0) CHECK(oracle_blocks_all == counted_drafts);
+    if (counted_acc >= 0) {
+      CHECK(oracle_acc_all <= counted_acc);
+      CHECK(counted_acc - oracle_acc_all <= max_deficit);
+    }
+  }
+
+  // HARD BARS.
+  //
+  // (1) At least one prompt walks the same trajectory END TO END. Without one,
+  //     G3 IS NOT TAKEN -- and that is what this failure means. It is NOT an
+  //     acceptance deficit, and the message says so, because reporting "G3
+  //     failed" for "G3 could not be measured" is the confusion `SPEC-DFLASH`
+  //     D8/D9 already paid for once.
+  if (same_traj == 0) {
+    MESSAGE("G3 NOT TAKEN: no prompt produced an identical token stream on both "
+            "engines, so there is no end-to-end same-trajectory pair to compare "
+            "acceptance over. This is a MEASUREMENT gap, not an acceptance "
+            "result; the per-prompt shared prefixes above say how close each got, "
+            "and the draft-block bar below still ran over the shared prefixes.");
+  }
+  CHECK(same_traj > 0);
+  // (2) On a same-trajectory prompt the draft blocks are the oracle's drafts.
+  //     This is the bar that a DFlash1-argmax fallback fails and an output-token
+  //     gate cannot see. It is stated as a majority rather than as identity for
+  //     the D6 reason: the lattice op is a REDUCTION and is specified
+  //     within-envelope across backends, unlike the walk, so a late block can
+  //     legitimately flip on a bf16 near-tie in the selector's rank contraction.
+  //     A fallback does not produce a majority; it produces near-zero.
+  // Zero comparable blocks means the two engines diverged before the FIRST
+  // block's context, which is a structural break rather than a near-tie.
+  if (draft_blocks_compared == 0) {
+    MESSAGE("STRUCTURAL: not a single block pair was anchor-aligned inside a "
+            "shared prefix. A bf16 near-tie diverges LATE; diverging before the "
+            "first block does not.");
+  }
+  CHECK(draft_blocks_compared > 0);
+  CHECK(draft_blocks_identical * 2 > draft_blocks_compared);
+  // (3) The drafter is alive on every prompt (checked in the loop) and our
+  //     acceptance on the same-trajectory prompts is nonzero.
+  CHECK(our_acc_sum > 0);
+}
+
+// ── THE INSTRUMENT'S OWN GATE ───────────────────────────────────────────────
+//
+// `ParseSpecTrace` is the whole of G2's draft-token evidence, and it runs on a
+// dgx-only path where a silent defect in it would present as a verdict about
+// the CODE: an empty block list reads as "the propose did not run", and a
+// mis-parsed field reads as "the drafts differ". So it is gated here, on every
+// box, against literals rather than against a live engine.
+//
+// THE FIXTURE SPANS THE FIELDS IT DECODES. Every scalar takes a DIFFERENT value
+// (pos 41, k 7, ns 5, acc 4) so a parser that read the wrong one cannot answer
+// correctly by coincidence; the draft ids are not a prefix of the emit ids and
+// neither list is the identity sequence; and one id is negative and one is past
+// 2^16, because the production field is an int32 token id and a fixture that
+// only ever holds small positives cannot detect a narrow parse.
+TEST_CASE("dflash2 gate instrument: the production SPECTRACE line parses field by field") {
+  // Byte-for-byte the shape `GPUModelRunner::sample_tokens_with_rejection`
+  // writes (`src/vllm/v1/worker/gpu/runner.cpp`), trailing space inside each
+  // bracket included.
+  const std::string captured =
+      "some unrelated stderr chatter\n"
+      "[SPECTRACE] req=r0 pos=41 k=7 ns=5 acc=4 draft=[ 11 -3 70000 5 5 9 12 ] "
+      "emit=[ 11 -3 70000 5 88 ]\n"
+      "[SPECTRACE] req=r0 pos=46 k=7 ns=1 acc=0 draft=[ 1 2 3 4 5 6 7 ] "
+      "emit=[ 99 ]\n";
+
+  const std::vector<TraceBlock> blocks = ParseSpecTrace(captured);
+  REQUIRE(blocks.size() == 2);
+
+  // The REQUEST ID is load-bearing now that one captured stream carries every
+  // prompt's blocks: the gate splits by it, so a parser that dropped it would
+  // hand prompt 0 every prompt's drafts.
+  CHECK(blocks[0].req == "r0");
+  CHECK(blocks[1].req == "r0");
+  CHECK(blocks[0].pos == 41);
+  CHECK(blocks[0].k == 7);
+  CHECK(blocks[0].accepted == 4);
+  CHECK(blocks[0].draft == std::vector<int32_t>{11, -3, 70000, 5, 5, 9, 12});
+  CHECK(blocks[0].emit == std::vector<int32_t>{11, -3, 70000, 5, 88});
+
+  CHECK(blocks[1].pos == 46);
+  CHECK(blocks[1].accepted == 0);
+  CHECK(blocks[1].draft == std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7});
+  CHECK(blocks[1].emit == std::vector<int32_t>{99});
+
+  // A line that is not a propose trace contributes nothing. Both halves matter:
+  // a parser that accepted the first would inflate the block count, and one that
+  // rejected the second by looking for the wrong key would report zero blocks
+  // from a live run and read as "the propose did not run".
+  CHECK(ParseSpecTrace("[SPECTRACE] req=r0 something else\n").empty());
+  CHECK(ParseSpecTrace("").empty());
+
+  // NAME-KEYED, not offset-keyed. `k=` must not be answered by the `k` inside
+  // `req=`, and a field appended after `emit` must not shift anything.
+  const std::vector<TraceBlock> reordered = ParseSpecTrace(
+      "[SPECTRACE] req=knsacc pos=3 k=2 ns=2 acc=1 draft=[ 7 8 ] emit=[ 7 9 ] "
+      "extra=[ 1 2 3 ]\n");
+  REQUIRE(reordered.size() == 1);
+  CHECK(reordered[0].pos == 3);
+  CHECK(reordered[0].k == 2);
+  CHECK(reordered[0].accepted == 1);
+  CHECK(reordered[0].draft == std::vector<int32_t>{7, 8});
+  CHECK(reordered[0].emit == std::vector<int32_t>{7, 9});
+
+  // TWO REQUESTS INTERLEAVED, which is the shape the gate's one captured stream
+  // actually has. The ids differ only in their last character, and one is a
+  // PREFIX of nothing else, so a split that compared loosely would mix them.
+  const std::vector<TraceBlock> two = ParseSpecTrace(
+      "[SPECTRACE] req=dflash2_0 pos=5 k=2 ns=3 acc=2 draft=[ 4 5 ] emit=[ 4 5 6 ]\n"
+      "[SPECTRACE] req=dflash2_1 pos=5 k=2 ns=1 acc=0 draft=[ 7 8 ] emit=[ 9 ]\n"
+      "[SPECTRACE] req=dflash2_0 pos=8 k=2 ns=2 acc=1 draft=[ 1 2 ] emit=[ 1 3 ]\n");
+  REQUIRE(two.size() == 3);
+  int n0 = 0, n1 = 0;
+  for (const TraceBlock& b : two) {
+    if (b.req == "dflash2_0") ++n0;
+    if (b.req == "dflash2_1") ++n1;
+  }
+  CHECK(n0 == 2);
+  CHECK(n1 == 1);
+  CHECK(two[2].draft == std::vector<int32_t>{1, 2});
+}
+
+// ── THE RECONSTRUCTION'S OWN GATE ───────────────────────────────────────────
+//
+// `ReconstructAcceptance` is the only source of the ORACLE's per-block accepted
+// counts, because vLLM exposes no per-block counter. In the e2e case it is
+// validated twice against real measurements -- against our production trace per
+// prompt, and against vLLM's own aggregate counter -- but both of those live on
+// a dgx-only path. This pins it everywhere, on literals.
+//
+// THE FIXTURE SPANS THE OUTCOMES rather than repeating one. Block 0 accepts
+// EVERY draft (so the `len` advance is k+1 and an off-by-one shows), block 1
+// accepts NONE (so a routine that credited the bonus token would read 1), block
+// 2 accepts a strict middle prefix, and block 3 is TRUNCATED by the output
+// ending mid-draft -- which is a real state, measured at 7 tokens on the first
+// W6 capture, not a hypothetical. No two blocks share an accepted count.
+TEST_CASE("dflash2 gate instrument: acceptance reconstructs from drafts and output") {
+  // len starts at 1 (the prefill token).
+  //   out[0]            = 100                     prefill
+  //   block0 drafts 1 2 -> out[1]=1, out[2]=2      accept 2, then bonus out[3]=7
+  //   block1 drafts 9 9 -> out[4]=5                accept 0, bonus is out[4]
+  //   block2 drafts 5 8 -> out[5]=5 then out[6]!=8 accept 1, bonus out[7]=11
+  //   block3 drafts 4 4 -> out[8]=4 and the output ENDS: accept 1, truncated
+  //   out[0]            = 100                     prefill, len = 1
+  //   block0 drafts 1 2 -> out[1]=1 out[2]=2       accept 2, bonus out[3]=7, len 4
+  //   block1 drafts 9 9 -> out[4]=5 != 9           accept 0, bonus out[4],  len 5
+  //   block2 drafts 5 8 -> out[5]=5, out[6]=6 != 8 accept 1, bonus out[6],  len 7
+  //   block3 drafts 4 4 -> out[7]=4, then the OUTPUT ENDS: accept 1, TRUNCATED
+  const std::vector<int32_t> out = {100, 1, 2, 7, 5, 5, 6, 4};
+  const std::vector<std::vector<int32_t>> drafts = {
+      {1, 2}, {9, 9}, {5, 8}, {4, 4}};
+
+  const Reconstructed r = ReconstructAcceptance(drafts, out);
+  REQUIRE(r.per_block.size() == 4);
+  CHECK(r.per_block[0] == 2);
+  CHECK(r.per_block[1] == 0);
+  CHECK(r.per_block[2] == 1);
+  CHECK(r.per_block[3] == 1);
+  CHECK(r.total == 4);
+  // All four started inside an 8-token output, so all four are verified.
+  CHECK(r.verified == 4);
+
+  // A block that starts PAST the end of the output is a proposal the run never
+  // consumed. It contributes 0 accepted and, critically, does NOT count as
+  // verified -- which is what makes the cross-check against vLLM's own
+  // `spec_decode_num_drafts` exact rather than banded.
+  const Reconstructed tail = ReconstructAcceptance(
+      {{1, 2}, {9, 9}, {5, 8}, {4, 4}, {6, 6}, {7, 7}}, out);
+  CHECK(tail.per_block.size() == 6);
+  CHECK(tail.verified == 4);
+  CHECK(tail.total == 4);
+
+  // The `len` advance is 1 + accepted, not accepted. A routine that forgot the
+  // bonus token would read block 2's draft against out[4] instead of out[5] and
+  // answer 0 there; the literals above are built so that difference is visible.
+  // MEASURED, not asserted: with `len += 1 + accepted` this fixture reads
+  // [2, 0, 2] / total 4, and with `len += accepted` it reads [2, 0, 0] / total 2.
+  const std::vector<int32_t> shifted = {100, 1, 2, 7, 5, 5, 8, 11, 4};
+  const Reconstructed r2 = ReconstructAcceptance({{1, 2}, {9, 9}, {5, 8}}, shifted);
+  REQUIRE(r2.per_block.size() == 3);
+  CHECK(r2.per_block[0] == 2);
+  CHECK(r2.per_block[1] == 0);
+  CHECK(r2.per_block[2] == 2);
+  CHECK(r2.total == 4);
+
+  // An empty draft list and an empty output are both real edge states on a
+  // prompt that never proposed, and neither may throw.
+  CHECK(ReconstructAcceptance({}, out).total == 0);
+  CHECK(ReconstructAcceptance(drafts, {}).total == 0);
+}

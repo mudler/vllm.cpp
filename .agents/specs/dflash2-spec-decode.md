@@ -326,9 +326,13 @@ Ours, red-first, beyond the ports:
   W2 discharges the conv half of G1 on CPU at 5, 8 and 16; the CUDA half is
   written and registered but UNVERIFIED (no `nvcc` on the authoring host) and is
   owed to a GPU lease.
-- G2: draft-token identity against vLLM at PR head `19c93519` on
+- G2: draft-token identity against vLLM at PR head `66e5414c` on
   `z-lab/Qwen3.8-27B-DFlash2` over `Qwen/Qwen3.8-27B`, identical prompts and
-  identical k, greedy. The DFlash near-tie envelope applies: `SPEC-DFLASH`
+  identical k, greedy. **RECONCILED TO ONE HEAD BY W6 on 2026-08-21**, by the
+  rule the paragraph below wrote: #52816 was still open, so the gate head is the
+  head the port mirrors. It read `19c93519` until then, and the reconciliation is
+  applied in place rather than annotated, because a gate head and a port head
+  that differ by name are exactly what the paragraph below warns against. The DFlash near-tie envelope applies: `SPEC-DFLASH`
   established that strict token identity is bf16-irreducible on portable
   kernels, so the ratified near-tie gate is the admissible form and a strict
   claim is not.
@@ -371,15 +375,46 @@ taken it uses vLLM's production configuration as the denominator, never
 `.agents/benchmarking.md`. Upstream's H200 numbers are not a floor for this
 engine and are not treated as one.
 
-**Oracle.** The pinned oracle cannot run this architecture. The gate oracle is
-vLLM built at `19c93519`, recorded with its measured runtime version, and it is
-a BEYOND-PIN oracle rather than a pin advance. If #52816 merges before the
-implementation lands, the anchors move to the merge commit and this section is
-reconciled rather than reinterpreted. The head named here is the same deliberate
-choice G2 states, with the same reason and the same owner: the port mirrors
-`66e5414c`, the greedy answer is identical at both heads, and W6 reconciles the
-oracle build to one head when it takes the gate. No oracle has been BUILT at
-either head yet, so nothing is invalidated by moving it.
+**Oracle. RECONCILED BY W6 ON 2026-08-21, AND IT IS BUILT AND IT RUNS.** The
+pinned oracle cannot run this architecture. The gate oracle is vLLM at
+`66e5414c6d75a8529473d977f7458c140bbab8a0` — the head the port mirrors — and it
+is a BEYOND-PIN oracle rather than a pin advance. This section named `19c93519`
+until W6; the reconciliation rule `## Gates` G2 wrote is what selected the new
+value, and #52816 was still OPEN when W6 applied it (read from the forge, not
+assumed).
+
+The artifact, so a later reader can tell whether they hold the same one:
+
+| | |
+|---|---|
+| wheel | `vllm-0.1.dev1+g66e5414c6-cp312-cp312-linux_aarch64.whl` |
+| sha256 | `fbc247ab1bda93a81ff7a68658cdda65b697e263ad2c43a2bc62c2591d207439` |
+| runtime version | `0.1.dev1+g66e5414c6`, asserted from `/` so the source tree cannot answer |
+| `DFlash2DraftModel` | registered, asserted against `_SPECULATIVE_DECODING_MODELS` |
+| gateable | **yes** — it loads `Qwen/Qwen3.8-27B`, captures CUDA graphs including the DFlash2 speculator's own, and GENERATES with speculation live |
+
+**Three operational facts about driving it, each of which cost a 51.75 GiB
+load.** They are here rather than in a runbook because the next agent to
+instrument this oracle needs them before writing a script, not after.
+
+1. **`VLLM_ATTENTION_BACKEND` does not exist at this revision.** Grepping every
+   `.py` in the wheel returns nothing. The knob is `EngineArgs.attention_backend`
+   (`arg_utils.py:706`), folded into `AttentionConfig.backend` (`:2382`) and read
+   in `vllm/v1/attention/selector.py:179`. The old export selects nothing and
+   auto-selection wins SILENTLY, so a run can record one backend while executing
+   another. Pass the kwarg and read the resolved value back off the built engine.
+   `## Owed` O22, [#1456](https://github.com/mudler/vllm.cpp/issues/1456).
+2. **The engine core is a separate process by default**, so an in-process
+   monkeypatch never reaches the object that drafts.
+   `VLLM_ENABLE_V1_MULTIPROCESSING=0` is the switch. `## Owed` O23.
+3. **`capture_model()` calls `_generate_draft`**, so any host copy in a hook on
+   it is illegal inside a CUDA graph capture. `## Owed` O23.
+
+**And the constraint this row inherited is weaker than it was written.** `## Gates`
+declares `TRITON_ATTN` because #1456 concluded the GB10 oracle has no
+`FLASH_ATTN` denominator; a W6 run generated on `FLASH_ATTN` anyway. W6 keeps the
+DECLARED backend rather than substituting one, and takes both arms.
+`## Owed` O22 carries it.
 
 ## Dependencies
 
@@ -387,14 +422,13 @@ either head yet, so nothing is invalidated by moving it.
   `ssh` to a fleet box.
 - The 27B target and the DFlash2 drafter resident where the gate host can read
   them, with a recorded revision, since a repo id alone is not a pin.
-- A vLLM build at `19c93519`. The parity pin stays where it is. **That head is
-  the same DELIBERATE CHOICE `## Gates` G2 and `## Oracle` state, and W6 owns
-  the reconciliation**: the port mirrors `66e5414c`, which superseded
-  `19c93519` on 2026-08-19
-  ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)), and the greedy
-  answer is identical at both heads. This line named the head bare until
-  [#1518](https://github.com/mudler/vllm.cpp/issues/1518), which reads as a
-  leftover beside the other two.
+- A vLLM build at `66e5414c`. The parity pin stays where it is. **W6 SETTLED
+  this on 2026-08-21 and the build EXISTS**: `## Oracle` carries the wheel, its
+  sha256, its asserted runtime version and the three operational facts about
+  driving it. The line read `19c93519` through W5 — the head #52816 was opened
+  at, superseded on 2026-08-19
+  ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)) — and is reconciled
+  in place rather than annotated, for the reason G2 gives.
 - [#1193](https://github.com/mudler/vllm.cpp/issues/1193) touches the same
   classification code. Whichever lands second reconciles; neither blocks.
 - No dependency on the V1/V2 runner distinction, which this engine does not have.
@@ -425,6 +459,32 @@ reviewer who mutates the guarantee rather than reading it.
 - **W5 — the GGUF drafter arm**, with its lower bound. LANDED 2026-08-20.
 - **W6 — the gates.** G2 and G3 on a leased GPU against the PR-head oracle,
   then `## Outcome`.
+
+  **The gate head is reconciled to ONE head here, as G2 required, and it is
+  `66e5414c`.** vllm#52816 is still OPEN on 2026-08-21 (checked through the
+  forge, not inferred), so G2's own rule selects the head the port mirrors. Its
+  head has since moved a THIRD time, to `3406ec1d`; that is recorded under
+  `## Owed` O21 and [#1538](https://github.com/mudler/vllm.cpp/issues/1538) and
+  deliberately not chased, because reconciling a port onto a third unmerged head
+  DURING the gate would move the thing being measured.
+
+  **THE ORACLE'S DRAFT TOKENS COME FROM A HOOK, AND THE HOOK'S OWN PRECONDITIONS
+  ARE THE HARD PART.** vLLM exposes no per-block draft-token counter, so G2's
+  distinctive half — draft identity rather than output identity — needs
+  `DFlash2Speculator._generate_draft` instrumented. Two things make that hook
+  silently dead, and both cost a full 51.75 GiB load to discover: the engine core
+  runs in a SEPARATE PROCESS by default, and `capture_model()` calls the hooked
+  method inside a CUDA graph capture where a host copy is illegal. `## Owed` O23
+  carries both with their exact failure text. The capture ABORTS on zero blocks
+  rather than writing an empty golden, which is what turned the first failure
+  into a message instead of a wrong measurement.
+
+  **The oracle's per-block ACCEPTANCE is reconstructed, not counted**, because
+  vLLM's counter is pooled over the run. The verify is accept-iff-equal under
+  greedy, so a block's accepted count is the longest prefix of its draft that the
+  output took. That derivation is validated twice before any number is read from
+  it: against OUR production `[SPECTRACE]` line, which prints the true per-block
+  count, and against vLLM's own aggregate counter.
 
 ## Risks/decisions
 
@@ -1196,6 +1256,32 @@ list items.
   W5 does not change it, and deliberately: doing so would be a keep-quant
   residency port of the whole DFlash lane, not a DFlash2 wave.
 
+  **W6 MEASURED THE BILL ON A GATE HOST, and O13's claim survives contact with
+  a running process.** Both arms were driven through `examples/vllm-cli` against
+  the real 27B target on `dgx:gpu0`, same prompt, same k, `/usr/bin/time -v`
+  around each:
+
+  | arm | file on disk | peak RSS |
+  |---|---:|---:|
+  | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 B (1.06 GiB) | 47 028 616 KB (**44.85 GiB**) |
+  | `z-lab/Qwen3.8-27B-DFlash2` safetensors | 3 848 817 896 B (3.58 GiB) | 46 701 608 KB (**44.54 GiB**) |
+
+  The two files differ by 2.52 GiB on disk and the two processes differ by
+  **0.70%** — and the QUANTIZED one is the LARGER of the two, by 319 MiB, which
+  is the transient cost of dequantizing at load. So "choosing Q4_K_M saves
+  download and disk and saves NOTHING at runtime" is now a measurement rather
+  than an inference from a tensor table, and the direction of the residual is
+  the opposite of the one a reader would assume.
+
+  A SECOND thing that run settles, and it is worth more than the memory number:
+  **the two arms propose DIFFERENT drafts.** Block 1 of the same prompt reads
+  `[248069 271 760 6511 314 9338 369]` from the GGUF drafter and
+  `[248069 271 760 6511 314 11751 25]` from the safetensors one, while both
+  emit the same target tokens. The quantization moves the drafter's proposals
+  without moving the answer, which is exactly the acceptance-only, token-invisible
+  regime this row exists to gate — and it also proves the GGUF arm is not
+  quietly reading the safetensors weights.
+
   What W5 changes is the SIZE of the bill, so it is measured here rather than
   left to a gate host. Summed over `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`'s own
   tensor table on 2026-08-20: 1 924 404 480 elements, so 3 848 808 960 bytes
@@ -1296,8 +1382,65 @@ list items.
   unchanged either way. W6 discharges this by converting that draft with
   llama.cpp and reading the keys it writes.
 
-- **O16 — the codebook-span guard compares `==`, and upstream's own condition has
-  NOT been read.** Owner: W6. Issue
+- **O16 — SETTLED by W6 on 2026-08-21, and the answer is neither `==` nor `>=`:
+  upstream has NO comparison at all.** Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314). Read directly out of
+  the beyond-pin oracle wheel (`vllm-0.1.dev1+g66e5414c6`, sha256
+  `fbc247ab1bda93a81ff7a68658cdda65b697e263ad2c43a2bc62c2591d207439`), which is
+  the artifact this row's gate runs, so the reading is of the code that executes
+  rather than of a page.
+
+  `DFlash2Qwen3ForCausalLM.compute_candidates`
+  (`vllm/model_executor/models/qwen3_dflash2.py`, the `num_pad` block just before
+  `_topk`) never compares the codebook row count against anything. It prevents
+  the out-of-range read STRUCTURALLY:
+
+  ```python
+  num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+  if num_pad > 0:
+      logits[..., -num_pad:] = -float("inf")
+  values, ids = _topk(logits, selector.top_k)
+  ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+  ```
+
+  The head vLLM materialises is `pad_vocab_size(org_vocab_size, 64)`
+  (`vocab_parallel_embedding.py`, `DEFAULT_VOCAB_PADDING_SIZE = 64`), so it is
+  routinely WIDER than the true vocabulary; `num_org_vocab_padding` is that
+  excess, and masking it to `-inf` means no padded column can ever survive the
+  top-k. Every id that reaches the codebooks therefore lies in the target's
+  ORIGINAL vocabulary range, and the codebooks are sized from the DRAFT config's
+  `vocab_size`. Upstream's invariant is an equality between those two ORG
+  vocabularies, held by checkpoint pairing and enforced by nothing.
+
+  **So the guard's polarity is right and its OPERAND is the thing to watch.**
+  Ours compares against the MATERIALISED head width; upstream's reachable span is
+  the width MINUS the padding. The two are the same number here and only here:
+  this engine is single-device with no tensor parallelism and pads no head, so
+  `Dflash2CandidateArgs::num_org_vocab_padding` is structurally 0 on every path
+  that reaches the guard, and the materialised width IS the org span. The new
+  refusal class this entry warned about is therefore LATENT rather than live, and
+  its trigger is named: the first time this engine pads an `lm_head` — a
+  tensor-parallel shard, or a checkpoint that ships padded rows — the comparison
+  has to move to `vocab - num_org_vocab_padding` in the same edit, or a target
+  vLLM would happily draft for is refused here.
+
+  **Measured on the shipping pair rather than argued**: the target's
+  `lm_head.weight` is `[248320, 5120]` (read from
+  `model-00018-of-00018.safetensors`'s own header) and both codebooks are
+  `[248320, 256]`, so `codebook_rows == vocab` holds, and `248320 % 64 == 0` so
+  vLLM pads this head by zero columns as well. The two engines agree on this
+  checkpoint by measurement, not by coincidence.
+
+  **The guard is KEPT and NOT relaxed to `>=`.** Relaxing would admit a
+  genuinely mispaired draft whose codebooks merely happen to be longer, which is
+  a wrong answer rather than a crash — the direction this entry already argued
+  is worse. Rewriting it to subtract a quantity that is provably 0 today would
+  add an arm no production entry point can reach, which AGENTS.md `## Nothing
+  lands dead` forbids. What W6 owed was the READING, and the reading is here.
+
+  The struck text below is what this entry said before the oracle could answer
+  it. ~~The codebook-span guard compares `==`, and upstream's own condition has
+  NOT been read.~~ Owner: W6. Issue
   [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
 
   `Dflash2SelectCandidates` requires the predecessor codebook's row count to
@@ -1318,8 +1461,35 @@ list items.
   wrong answer rather than the crash. W6 settles it by reading
   `DFlash2Speculator` at the PR-head oracle and mirroring what upstream does.
 
-- **O17 — nothing in this row has yet LOADED a published DFlash2 artifact.**
-  Owner: W6. Issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+- **O17 — DISCHARGED by W6 on 2026-08-21. A published DFlash2 artifact has now
+  been LOADED, at its real geometry, through a PRODUCTION ENTRY POINT, and it
+  DRAFTED.** Issue [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  Not a header read and not a unit harness: `examples/vllm-cli` — an ABI client,
+  which is what `.agents/reachability.md` means by a production entry point — was
+  pointed at `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1 143 006 752 B, sha256
+  `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594`, recomputed
+  from the staged copy) over the real `Qwen/Qwen3.8-27B` target on `dgx:gpu0`,
+  greedy, k=7. It loaded, it proposed **7 speculative blocks**, and it emitted 24
+  tokens with `finish_reason=length`. Blocks read off the production
+  `[SPECTRACE]` line, first three:
+
+  ```
+  [SPECTRACE] req=0 pos=6 k=7 ns=2 acc=1 draft=[ 13 271 22916 6970 279 6511 314 ] emit=[ 13 198 ]
+  [SPECTRACE] req=0 pos=8 k=7 ns=1 acc=0 draft=[ 248069 271 760 6511 314 9338 369 ] emit=[ 760 ]
+  [SPECTRACE] req=0 pos=9 k=7 ns=3 acc=2 draft=[ 6511 314 9564 369 11751 13 198 ] emit=[ 6511 314 9564 ]
+  ```
+
+  That closes the gap this entry named: a 248320 x 256 codebook is 127 MB and the
+  synthetic fixture's was 128 KB, so a row stride or an offset defect past a size
+  threshold would have passed every earlier case. Every published byte of this
+  file is now mapped and decoded, at `H = 5120` with 5 layers.
+
+  **The residency it actually paid: peak RSS 47 028 616 KB (44.85 GiB)**,
+  measured by `/usr/bin/time -v` around the whole process, whose presence was
+  asserted before the run rather than assumed. Wall 11:17 for 24 tokens off a
+  cold CIFS mount, which is a LOAD figure and not a decode figure and is recorded
+  as neither a speed result nor an axis.
 
   "Drafts in all three published arms" is an inference from the ENCODINGS, and
   the record should say so. What is measured is: a synthetic fixture at
@@ -1414,7 +1584,260 @@ list items.
   first three.
 
 
+- **O21 — vllm#52816's head moved a THIRD time, to `3406ec1d`, and the port is
+  NOT reconciled onto it.** Owner: `SPEC-DFLASH2`. Issue
+  [#1538](https://github.com/mudler/vllm.cpp/issues/1538). Measured by W6 on
+  2026-08-21 from `raw.githubusercontent.com` at both heads, while taking the
+  gates.
+
+  The pull request is still OPEN, so `## Gates` G2's own rule decides the gate
+  head and it decides `66e5414c` — which is what W6 built, ran and gated
+  against. The head is recorded here rather than chased, because reconciling a
+  port onto a third unmerged head DURING the gate would move the thing being
+  measured.
+
+  The delta is +11/−80, +4/−16 and +2/−5 over the three ported files, and the
+  large one is a RELOCATION: `compute_candidates` loses its whole body to
+  `LogitsProcessor.get_top_k_tokens`, with `output_multiplier` and
+  `final_logit_softcapping` moved into a `LogitsProcessor(vocab_size, scale=,
+  soft_cap=)` built in `__init__`, and `_topk` absorbed there too. The padding
+  mask, the id rebase, the TP all-gather and the scale-THEN-softcap order are all
+  preserved (`logits_processor.py:241-286` @ `3406ec1d`), so the answer is
+  unchanged and O16's reading holds at BOTH heads.
+
+  **One behavioural thing is not preserved and it is the one this row mirrors by
+  name:** the explicit `UnquantizedEmbeddingMethod`/`UnquantizedLinearMethod`
+  guard `## Risks/decisions` D12 ports as `RefuseQuantizedDflash2LmHead` is
+  DELETED at `3406ec1d`. Our guard's own reason is independent of upstream's and
+  stands — the GGUF arm dequantizes a q6_K/NVFP4 `output.weight` to bf16 and a
+  GGUF target with a safetensors DFlash2 draft is an admitted combination here —
+  so nothing changes today. What is owed is the decision when #52816 settles.
+
+
+- **O22 — the row's declared oracle backend rests on a premise a W6 run
+  FALSIFIED, and the reconciliation is not this wave's.** Owner:
+  `SPEC-DFLASH2` for this row's own denominator, the operator for the oracle
+  record. Issue [#1456](https://github.com/mudler/vllm.cpp/issues/1456), where
+  the measurement is posted in full.
+
+  `## Gates` and the staged `FA-CONSTRAINT.txt` name `TRITON_ATTN` because
+  #1456 measured vLLM's vendored flash-attention emitting `sm_80`/`sm_75` at
+  `CUDA_ARCHS=12.0` and concluded the GB10 oracle has no `FLASH_ATTN`
+  denominator. The ARCH measurement is not disputed. The CONCLUSION is: W6's
+  first capture accidentally ran on `FLASH_ATTN` — the export it used,
+  `VLLM_ATTENTION_BACKEND`, does not exist in this wheel — and vLLM loaded the
+  27B, captured CUDA graphs including the DFlash2 speculator's own, and generated
+  4 x 64 coherent tokens with speculation live (209 accepted of 350 drafted,
+  mean acceptance length 5.00). `sm_80` PTX JITs FORWARD;
+  `cudaErrorUnsupportedPtxVersion` is the opposite failure.
+
+  W6 does not change the declared backend on that finding. The developer
+  recorded `TRITON_ATTN` for this row, and a wave that quietly substitutes a
+  denominator is the failure this protocol exists to stop. What W6 does instead
+  is take BOTH arms, name each in its own golden, and leave the choice recorded
+  rather than assumed.
+
+  **Taking both bought something the row needed anyway: A CONTROL ON THE NEAR-TIE
+  ENVELOPE, measured on vLLM AGAINST ITSELF.** Same wheel, same host, same
+  workload, same k, greedy, `max_num_seqs` 1, FULL decode graphs on both — only
+  the attention backend differs. The two arms:
+
+  | | FLASH_ATTN | TRITON_ATTN |
+  |---|---:|---:|
+  | `spec_decode_num_drafts` | 50 | 47 |
+  | `spec_decode_num_draft_tokens` | 350 | 329 |
+  | `spec_decode_num_accepted_tokens` | 209 | 216 |
+  | accepted / drafted | 0.597 | 0.657 |
+  | generated tokens | 256 | 256 |
+
+  The two arms produce the SAME 64 tokens on 3 of the 4 prompts. The one that
+  moves is `def fibonacci(n):`, and it diverges at generated index **4** of 64.
+
+  **This reprices what G2 may demand of us.** vLLM does not reproduce its own
+  greedy continuation across two of its own attention backends on this model, and
+  its acceptance moves 6 points between them. A bar requiring our engine to be
+  4-of-4 token-exact against one arm would be a bar vLLM fails against itself on
+  the same hardware. That is the ratified near-tie envelope arriving as a
+  MEASUREMENT rather than as an inherited argument, and `SPEC-DFLASH` D6 is
+  corroborated rather than merely cited.
+
+- **O23 — a hook on `_generate_draft` must stand aside during CUDA graph
+  capture, and the capture instrument that proves the hook ran must not be the
+  hook itself.** Owner: this row's tooling, recorded because the next agent to
+  instrument this oracle pays it again otherwise. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  Two failures, both found by the instrument's own precondition check rather
+  than by reading:
+
+  1. **The engine core is a SEPARATE PROCESS by default.** vLLM V1 spawns
+     `EngineCore`, which re-imports vllm clean, so an in-process monkeypatch is
+     never on the object that drafts. The capture generated 4 x 64 tokens, vLLM's
+     counters reported 50 drafts / 350 draft tokens / 209 accepted, and the hook
+     recorded ZERO blocks. `VLLM_ENABLE_V1_MULTIPROCESSING=0` is the switch, and
+     the repair asserts the client class rather than trusting the variable.
+  2. **`capture_model()` calls `_generate_draft`**, so a `.tolist()` in the hook
+     is a device-to-host copy inside a CUDA graph capture and torch refuses it
+     (`RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph
+     capture`), at `dflash/speculator.py:147`. The hook now delegates whenever
+     `torch.cuda.is_current_stream_capturing()`.
+  3. **AND `_generate_draft` IS THE WRONG SEAM ENTIRELY under the production
+     configuration.** `DFlashSpeculator.propose` branches
+     `if batch_desc.cg_mode == CUDAGraphMode.FULL: run_fullgraph(...) else:
+     self._generate_draft(...)` and returns `self.draft_tokens[:num_reqs]` on
+     both arms, so with FULL decode graphs — which is what a denominator must
+     use — the replay never enters `_generate_draft` in Python at all. This is
+     the third failure and the most instructive: the run asserted
+     `ENGINE_CORE_CLIENT=InprocClient` AND `HOOK_ON_CLASS=traced`, resolved
+     `TRITON_ATTN`, generated 4 x 64 tokens, vLLM counted 47 drafts / 329 draft
+     tokens / 216 accepted — and the hook still recorded ZERO blocks. Both
+     preconditions it checked were TRUE and the instrument was still blind. The
+     hook moved to `propose`, below the branch.
+
+  The reason this is `## Owed` and not just a note: EVERY one of the three
+  presents as a verdict about the CODE. The first reads as "the draft is empty",
+  the second as "the oracle cannot capture graphs with a DFlash2 speculator" —
+  which is false, and would have been a serious mis-record about upstream — and
+  the third as "the drafter proposed nothing", on a run where vLLM's own counters
+  say it proposed 329 tokens. The general rule is the one `.agents/verification.md`
+  already states and this row paid for three times in one wave: a precondition
+  check bounds only the failure it names, and a passing one is not evidence that
+  the instrument SAW anything. Only the ABORT ON ZERO caught all three.
+
+
 ## Now
+
+**W6 TOOK THE GATES on 2026-08-21, on `dgx:gpu0` through an `rc` lease, and G2
+and G3 both READ.** This is the first time either engine has been asked what the
+OTHER's DFlash2 draft proposed.
+
+`tests/parity/test_qwen38_dflash2_spec_decode` on device: **3 cases / 142
+assertions / 0 failed / `Status: SUCCESS!` / exit 0**, against the committed
+golden `tests/parity/goldens/dflash2_27b/dflash2_27b_spec_on.json`, sha256
+`b051b4143d1b214d415951513c43f7148b3026a9e975f8c08d8cd3a60af7ee59` — the exact
+bytes the run read. Reproduce with
+
+```sh
+VLLM_DFLASH2_TARGET=<Qwen3.8-27B dir> VLLM_DFLASH2_DRAFT=<z-lab/Qwen3.8-27B-DFlash2 dir> \
+  ./build/tests/test_qwen38_dflash2_spec_decode
+```
+
+The FLASH_ATTN arm of the same capture is committed beside it as
+`dflash2_27b_spec_on_flash_attn.json` and is selected with
+`VLLM_DFLASH2_EXPECT_BACKEND=FLASH_ATTN`; it carries no per-block drafts,
+because it was taken before the hook reached the replayed graph.
+
+### G2 — SATISFIED, and STRICTLY, which the envelope did not require
+
+| prompt | tokens exact | shared prefix | draft blocks identical |
+|---|---|---:|---:|
+| `The capital of France is` | YES | 64/64 | 14/15 |
+| `def fibonacci(n):` | YES | 64/64 | 10/10 |
+| `Q: What is 17 * 23?\nA:` | YES | 64/64 | 10/10 |
+| `The three laws of robotics are` | YES | 64/64 | 11/12 |
+
+**4 of 4 prompts token-exact** against the beyond-pin oracle, and **45 of 47
+draft blocks byte-identical**. The ratified near-tie envelope permits a
+divergence and none occurred on the output; it is claimed as measured rather
+than as the strict form, because the DFlash1 precedent and the backend control
+below both say this margin is not guaranteed.
+
+The two draft blocks that differ each differ by ONE token, in the middle of the
+proposal, and both are the shape `## Port map` predicts: the lattice op is a
+REDUCTION over `selector_rank` and is specified within-envelope across backends,
+unlike the walk. `[14227 369 14227 13 198 760 6511]` against
+`[14227 369 24844 13 198 760 6511]` at slot 2, and
+`[39262 279 9861 2574 314 539 279]` against `[39262 279 10895 2574 314 539 279]`
+at slot 2. Both blocks then emitted the same target tokens.
+
+### G3 — SATISFIED, SAME-TRAJECTORY, and the two engines' acceptance is IDENTICAL
+
+Same-trajectory by construction: all four prompts produced the SAME token stream
+on both engines, so there is no trajectory confound to argue about.
+
+| prompt | our accepted | oracle accepted |
+|---|---:|---:|
+| 0 | 49 | 49 |
+| 1 | 54 | 54 |
+| 2 | 54 | 54 |
+| 3 | 52 | 52 |
+| **total** | **209** | **209** |
+
+Both counted the same way, from drafts and output. On the OTHER instrument the
+two also agree: our runner's cumulative counter reads **216** and vLLM's
+`spec_decode_num_accepted_tokens` reads **216**. And the block counts agree
+exactly too -- our production trace emits 47 verified blocks and vLLM's
+`spec_decode_num_drafts` reads 47.
+
+The 209/216 gap is `max_tokens` truncating the last block of three of the four
+requests, it appears on BOTH engines, and it is why the comparison is stated as
+two matched pairs rather than one mixed one. The first gate run mixed them --
+our counter against the oracle's reconstruction -- which is the D8 shape in
+miniature, and it is corrected here.
+
+### G4 — SATISFIED end to end, which discharges `## Owed` O17
+
+The published `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` was loaded through
+`examples/vllm-cli` against the real 27B target, proposed 7 speculative blocks
+and generated. Peak RSS **44.85 GiB**, against **44.54 GiB** for the safetensors
+drafter -- 0.70% apart on files that differ by 2.52 GiB, which is O13's claim
+measured rather than argued. The two arms propose DIFFERENT drafts and emit the
+SAME tokens, which is the acceptance-only regime this row exists to gate.
+
+### The device arms, verified on hardware
+
+All seven DFlash2 suites green on `sm_121a` with **zero** `no CUDA backend;
+skipping` lines: `test_ops_dflash2_grouped_conv` 9936 assertions,
+`test_ops_dflash2_selector_edges` 3859, `test_ops_topk_values_indices` 560,
+`test_ops_dflash2_path_walk` 83, `test_qwen3_dflash2_draft` 277,
+`test_dflash2_runner_reach` 86, `test_dflash2_argmax_guard` 30.
+
+### THREE INSTRUMENT FAILURES, EACH OF WHICH READ AS A VERDICT ABOUT THE CODE
+
+vLLM exposes no per-block draft-token counter, so G2's distinctive half needed
+its speculator instrumented, and getting a hook that could SEE the drafts cost
+three full 51.75 GiB loads. Recorded in `## Owed` O23 with the exact failure
+text, and summarised here because the pattern is the point:
+
+1. The engine core runs in a SEPARATE PROCESS by default, so an in-process
+   monkeypatch never reaches the object that drafts. Reads as "the draft is
+   empty" on a run whose counters say it drafted 350 tokens.
+2. `capture_model()` calls the hooked method inside a CUDA graph capture, where a
+   host copy is illegal. Reads as "the oracle cannot capture graphs with a
+   DFlash2 speculator", which is FALSE.
+3. And `_generate_draft` is the WRONG SEAM under the production configuration.
+   `DFlashSpeculator.propose` branches on `cg_mode == FULL` and REPLAYS the
+   captured graph, so the Python method is never entered. This one is the
+   instructive one: the run asserted `ENGINE_CORE_CLIENT=InprocClient`,
+   `HOOK_ON_CLASS=traced` AND `RESOLVED_ATTENTION_BACKEND=TRITON_ATTN`, every
+   precondition it checked was TRUE, and the instrument was still blind.
+
+Only the ABORT ON ZERO BLOCKS caught all three. The general rule, which
+`.agents/verification.md` already states and this wave paid for three times: a
+precondition check bounds only the failure it names, and a passing one is not
+evidence that the instrument SAW anything.
+
+**A FOURTH defect was in OUR gate rather than in the oracle hook, and the first
+gate run found it.** The gate compared the oracle's RAW propose count against
+vLLM's `spec_decode_num_drafts` -- 55 against 47 -- when the quantity vLLM counts
+is blocks that STARTED inside the output. That single `CHECK` is the only one of
+134 assertions that failed. It is corrected to the verified count, at which point
+it is EXACT rather than banded, and our own trace independently reads 47.
+
+### SPEED — NOT TAKEN, and deliberately
+
+No ratio is claimed. Nothing in this wave ran an idle-host same-binary A/B, and
+two facts would bound any figure taken today. Our DFlash2 draft runs OFF the
+paged CUDA-graph fast path, because the selector needs the hidden states of the
+same forward its logits came from -- while the oracle GRAPHS its DFlash2 draft
+step, which this wave measured directly in its startup log (`Capturing dflash2
+CUDA graphs (FULL)`, 77 s). And every figure this wave produced was taken with
+the 51.75 GiB target read from a CIFS mount, which put wall-clock at 11-12
+minutes for 24 tokens; that is a LOAD number and not a decode number. The
+per-prompt acceptance identity above is what the row needed before any of that,
+and it now has it.
+
+---
 
 `SPEC-DFLASH2` is `ACTIVE`. W1 landed on 2026-08-19 (the route and D4's
 `is_causal` precedence). W2 landed on 2026-08-19 (the grouped dynamic depthwise

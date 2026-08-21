@@ -170,6 +170,15 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
+  expert blocks (Q8_0, Q4_K, Q5_K, Q6_K) instead of being dequantized to
+  bf16 at load time.
+- On ROCm, mixture-of-experts models run the shared-expert gate and both
+  expert-combine steps on device. Before these ops were registered the
+  engine refused with `no kernel for op` on that path.
+- On ROCm, decode-shaped GEMMs (batch of 4 or fewer, bf16) run on a split-K
+  skinny-GEMM kernel rather than the tiled BLAS path. Set `VT_ROCM_SKINNY=0`
+  to restore the BLAS path when you want to compare the two.
 - On ROCm, Gemma-4 FP8 mixture-of-experts decode uses the device-indexed
   expert gate for batches up to 63 tokens; wider batches use the
   prefill-batch path. Set `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` to restore the

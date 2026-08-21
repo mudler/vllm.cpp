@@ -59,8 +59,9 @@ struct Fp8BlockQuantConfig {
   // `dynamic` whenever `block_quant` is true; the reader refuses anything else.
   std::string activation_scheme;
   // `modules_to_not_convert`, or `ignored_layers` when the checkpoint spells it
-  // that way. `Qwen/Qwen3.8-27B-FP8` ships ~400 entries here, which is why the
-  // loader reads this list rather than inferring exclusion from a dtype probe.
+  // that way. `Qwen/Qwen3.8-27B-FP8` @`017b9c7a` ships 882 entries here, 636 of
+  // them outside the vision tower, which is why the loader reads this list
+  // rather than inferring exclusion from a dtype probe (#1614).
   std::vector<std::string> modules_to_not_convert;
 
   // Exact-membership test on the MODULE prefix — the tensor name with its

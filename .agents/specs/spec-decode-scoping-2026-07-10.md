@@ -23,7 +23,7 @@ KV layer(s); Mamba/hybrid targets get `MambaSpec.num_speculative_blocks`.
   model `qwen3_5_mtp.py:63,129-165` (fc(cat[norm(embed),norm(hidden)]) → one decoder layer →
   norm → SHARED lm_head). Gotcha: `mtp.fc` is bf16-unquantized in NVFP4 checkpoints (:86-94).
 
-**C++ port needs:** stop skipping `mtp.*` (`qwen3_5_dense_weights.cpp:209`,
+**C++ port needs:** stop skipping `mtp.*` (`qwen3_5_dense_weights.cpp:210`,
 `qwen3_5_weights.cpp:328`); the hidden-state tap already exists (logits-gather rows,
 `qwen3_5.cpp:3074-3094`); MTP forward reuses our decoder-layer blocks; flip the scheduler
 stubs (`scheduler.h:217`, `output.h:148`, rollback TODO `scheduler.cpp:406`); greedy verify =

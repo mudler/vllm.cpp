@@ -14,6 +14,7 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
@@ -686,14 +687,12 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
   // none, and `IsFp8BlockProjection` refuses the disagreement it just invented.
   // `TensorResolver` throws on a missing tensor, so probing it is the honest
   // answer and the only one available at this seam.
-  const TensorExists has = [&get](const std::string& name) {
-    try {
-      (void)get(name);
-      return true;
-    } catch (const std::exception&) {
-      return false;
-    }
-  };
+  //
+  // FIX-PROBE-CANNOT-SAY-NO (#1258): the `try`/`catch` this used to spell out
+  // now lives ONCE in `dense_loaders`, because the sibling seam below needs the
+  // identical probe and two copies of a subtle thing is the next defect.
+  const TensorExists has = dense_loaders::ProbeThroughResolver(get);
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5DenseGdn");
   return LoadGdnDense(get, has, layer_base, Fp8BlockQuantConfig{});
 }
 
@@ -758,6 +757,10 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const TensorExists& has,
     const std::string& layer_type, int64_t layer_idx,
     const std::string& backbone_prefix, const Fp8BlockQuantConfig& block) {
+  // FIX-PROBE-CANNOT-SAY-NO (#1258): every dense-layer path funnels through this
+  // overload, so one check here covers the production loader, both resolver-only
+  // seams, and whatever probe a caller supplies next.
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5DenseLayer");
   const std::string base =
       backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5DenseLayerWeights layer;
@@ -789,9 +792,18 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
     const std::string& backbone_prefix) {
-  // The public resolver-only seam is used by the compressed-tensors parity
-  // fixture, where every routed projection is NVFP4.
-  const TensorExists has = [](const std::string&) { return true; };
+  // FIX-PROBE-CANNOT-SAY-NO (#1258). This was the SECOND always-true stub named
+  // by #1256; #1257 fixed only the sibling above. It was not latent: the
+  // `qwen36_gdn_layer_27b` isolated-layer golden replays through THIS overload
+  // (`tests/parity/test_op_parity.cpp`) with `layer_type == "linear_attention"`,
+  // which routes to `LoadGdnDense`, whose first act is the
+  // `IsFp8BlockProjection` cross-check a constant `true` lies to. That leg is
+  // SKIPped without the pinned 27B snapshot, which is why no CPU lane saw it.
+  //
+  // The compressed-tensors parity fixture this seam was written for really does
+  // carry `weight_packed` on every routed projection, so a truthful probe leaves
+  // its routing where it was and merely stops inventing the tensors it lacks.
+  const TensorExists has = dense_loaders::ProbeThroughResolver(get);
   return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx,
                                backbone_prefix);
 }
@@ -820,6 +832,11 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   const TensorExists has = [&where](const std::string& name) {
     return where.find(name) != where.end();
   };
+  // FIX-PROBE-CANNOT-SAY-NO (#1258). Truthful by construction today; checked
+  // anyway, because the guard's value is that it does not depend on how the
+  // probe was built — a name index filled from the wrong shard list fails here
+  // too.
+  dense_loaders::CheckProbeCanAnswerNo(has, "LoadQwen3_5Dense");
 
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
@@ -833,6 +850,29 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // Default-constructed (`block_quant == false`) on every non-block checkpoint,
   // which leaves the routing below byte-identical to before this row.
   const Fp8BlockQuantConfig block = ReadFp8BlockQuantConfig(config);
+
+  // QUANT-QWEN38-27B-NVFP4-ARM (#821). The SECOND whole-checkpoint read of the
+  // quantization config, for the compressed-tensors spelling this file's
+  // per-projection dtype probe cannot resolve.
+  //
+  // `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d...` declares
+  // `format: "mixed-precision"`: layers 0-55's MLP is NVFP4 W4A4 and layers
+  // 56-63's MLP is FP8 W8A8, under the SAME module names. Which arm a
+  // projection takes is a REGEX OVER LAYER INDICES in `config_groups`, so no
+  // dtype probe can recover it — and its FP8 group ships a PER-OUTPUT-CHANNEL
+  // BF16 `weight_scale` with DYNAMIC per-token activations, which this file's
+  // `LoadFp8Raw` rung cannot represent. Before this call the loader entered the
+  // per-tensor arm anyway and died on `tensor not found:
+  // ...in_proj_qkv.input_scale`, a sentence about a checkpoint that is
+  // complete: the artifact ships ZERO `*.input_scale` because its activation
+  // scheme is dynamic, exactly as its config says.
+  //
+  // Empty on every checkpoint that is not compressed-tensors, and on every
+  // compressed-tensors checkpoint whose groups this build can execute, so every
+  // arm that loaded before this row still loads byte-identically.
+  const std::string ct_refusal =
+      layers::compressed_tensors::RefusalForHfConfigRaw(config.raw, all_names);
+  VT_CHECK(ct_refusal.empty(), "qwen3_5 dense: " + ct_refusal);
 
   Qwen3_5DenseWeights w;
   w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
@@ -863,15 +903,21 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 //
 // M3 refused every LOADED block weight, because the dense forward knew only
 // fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
-// through to an EMPTY bf16 tensor. The forward reads them now
-// (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
-// what is left to refuse is a DEVICE with no kernel: `vt::MatmulFp8BlockScaled`
-// is a CPU correctness reference and the mainloop-scaled CUTLASS kernel is
-// milestone M5. This runs from `PrepareQwen3_5Dense`, i.e.
+// through to an EMPTY bf16 tensor. The forward reads all ten projections now,
+// through THREE entry points rather than one:
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them,
+// `MatmulFp8BlockMergedD` reads q/k/v as one operand, and
+// `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj` and `up_proj`. So
+// what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
+// mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
+// this now fires for a CUDA arch outside that cell. It stays inert on CPU,
+// where `vt::MatmulFp8BlockScaled` is registered as a correctness reference.
+// This runs from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, which every runner calls unconditionally before the
 // first forward and before any graph capture
 // (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a
-// capture rather than inside the first GEMM. Deleted by M5.
+// capture rather than inside the first GEMM. M5 NARROWED this rather than
+// deleting it: an arch outside the CUTLASS cell must still be refused by name.
 void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
                                           vt::DeviceType device) {
   if (dense_fp8_block::BlockFp8Runnable(device)) return;
@@ -947,7 +993,31 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     Qwen3_5DenseWeights& weights) {
   size_t released = 0;
   const auto release = [&released](OwnedTensor& tensor) {
-    if (tensor.HasHostBytes() && (tensor.d_dev || tensor.d_dev_f32)) {
+    // `HostMirrorIsRedundant`, NOT `d_dev || d_dev_f32` (the second instance of
+    // the use-after-free W0f introduced; #1299).
+    //
+    // `d_dev_f32` is a bf16->f32 UPCAST into a separate device allocation. It is
+    // not a copy of these bytes and it can never stand in for them, so it never
+    // made a host mirror redundant — it only looked like it did while every
+    // weight that had one also had a `d_dev`. On the aliasing arm that stopped
+    // being true: `PrepareBf16Resident` passes exactly four weights to BOTH
+    // `raw()` and `f32()` — `gdn.conv1d_weight`, `gdn.norm_weight`,
+    // `attn.q_norm`, `attn.k_norm` — and there `raw()` ALIASES (leaving `d_dev`
+    // null) while `f32()` allocates (setting `d_dev_f32`). The disjunction then
+    // passes and frees the very bytes the aliased raw tensor points at.
+    //
+    // Nothing reaches that combination today, and the reason is worth writing
+    // down because it is an accident rather than a design:
+    // `DirectDeviceLoadEligible` above requires `!platform.is_unified_memory()`,
+    // and on CUDA `is_unified_memory()` and `host_memory_is_device_addressable()`
+    // are the SAME `pageable && integrated` conjunction, computed independently
+    // in `src/vt/cuda/cuda_backend.cu` and `src/vllm/platforms/cuda.cpp`. No
+    // rule states that equality, no document records it and no gate holds it, so
+    // a platform that ever separates the two arrives here with a live
+    // use-after-free. Asking the invariant instead of a proxy for it costs
+    // nothing: the disjunct is redundant on the staging arm, where every weight
+    // with a `d_dev_f32` has a `d_dev` too.
+    if (tensor.HasHostBytes() && HostMirrorIsRedundant(tensor)) {
       released += tensor.bytes.size();
       tensor.ReleaseHost();
     }

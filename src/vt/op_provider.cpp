@@ -224,6 +224,38 @@ bool MaybeInstallReferenceTier(OpId op, DeviceType device) {
   return true;
 }
 
+// Why the portable CPU reference tier did not answer for (op, device). Called
+// only on the refusal path, so it may take the slow, readable route. The clauses
+// name the tier's preconditions in the order MaybeInstallReferenceTier and
+// ReferenceTierEligible test them; the last one asks OpRegistered on the CPU
+// slot rather than repeating that function's Choose call, which is the same
+// question for the CPU device, where no reference provider ever exists.
+std::string ReferenceTierRefusalReason(OpId op, DeviceType device) {
+  if (device == DeviceType::kCPU) {
+    return "the portable CPU reference tier is the SOURCE of that kernel, not a "
+           "fallback for it";
+  }
+  Backend* b = TryGetBackend(device);
+  if (b == nullptr) {
+    return "no backend is registered for that device in this build, so the "
+           "portable CPU reference tier has nothing to install onto";
+  }
+  if (!b->DeviceMemoryIsHostAddressable()) {
+    return std::string("the portable CPU reference tier is NOT eligible: this "
+                       "backend does not report its device memory "
+                       "host-addressable, so a host kernel may not dereference "
+                       "what it allocated (unified memory is ") +
+           (b->UnifiedMemory() ? "true" : "false") +
+           ", which is a DIFFERENT property). Build a native kernel for this op "
+           "or run it on the CPU device";
+  }
+  if (!OpRegistered(op, DeviceType::kCPU)) {
+    return "the portable CPU reference tier is eligible but has no CPU kernel "
+           "for this op to install";
+  }
+  return "the portable CPU reference tier declined it";
+}
+
 void Announce(OpId op, DeviceType device, Slot& slot, const OpProvider* chosen,
               const ProviderCaps& caps) {
   if (!AnnounceEnabled()) return;
@@ -292,6 +324,14 @@ const char* OpNameImpl(OpId op) {
       return "DFlashBlockAttention";
     case OpId::kDFlashPagedBlockAttention:
       return "DFlashPagedBlockAttention";
+    case OpId::kDFlashGroupedConv:
+      return "DFlashGroupedConv";
+    case OpId::kDflash2SelectorEdges:
+      return "Dflash2SelectorEdges";
+    case OpId::kDflash2PathWalk:
+      return "Dflash2PathWalk";
+    case OpId::kTopKValuesIndices:
+      return "TopKValuesIndices";
     case OpId::kReshapeAndCache:
       return "ReshapeAndCache";
     case OpId::kConcatAndCacheMla:
@@ -493,6 +533,8 @@ const char* OpNameImpl(OpId op) {
       return "QuantFp8Group";
     case OpId::kMatmulFp8BlockScaled:
       return "MatmulFp8BlockScaled";
+    case OpId::kConv3d:
+      return "Conv3d";
     case OpId::kCount:
       break;
   }
@@ -514,11 +556,15 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
     slot.fallbacks.fetch_add(1, std::memory_order_relaxed);
     slot.resolved_none.store(true, std::memory_order_relaxed);
     // Refuse BY NAME. The integers stay for grep-ability, but a reader must not
-    // have to count enumerators in include/vt/ops.h to learn what was refused.
+    // have to count enumerators in include/vt/ops.h to learn what was refused —
+    // nor open this file to learn that a portable fallback exists and was
+    // withheld. The trailing clause says which of the tier's preconditions the
+    // device failed, which is the sentence #844 asked for.
     VT_CHECK(false, std::string("no kernel for op ") + OpNameImpl(op) + " (id " +
                         std::to_string(static_cast<int>(op)) + ") on device " +
                         DeviceTypeName(device) + " (type " +
-                        std::to_string(static_cast<int>(device)) + ")");
+                        std::to_string(static_cast<int>(device)) + "), and " +
+                        ReferenceTierRefusalReason(op, device));
     return nullptr;
   }
   // Reference-tier accounting: count it, and warn LOUDLY exactly once per
@@ -527,9 +573,17 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
     slot.ref_selected.store(true, std::memory_order_relaxed);
     RefTierHits().fetch_add(1, std::memory_order_relaxed);
     if (!slot.ref_announced.exchange(true, std::memory_order_relaxed)) {
+      // NOT "correct but slow". Those three words asserted a property instead of
+      // naming it, and #844 / docs/USAGE.md both quote them as what misled a
+      // reader past a SIGSEGV. What makes this dispatch valid is one checkable
+      // fact — the backend reports its device memory host-addressable — so the
+      // line states that fact and lets the reader verify it.
       std::fprintf(stderr,
                    "[vt reference-tier] op=%s device=%s has NO native kernel; "
-                   "running the PORTABLE CPU fallback (correct but slow)\n",
+                   "running the PORTABLE CPU host kernel, which this backend "
+                   "permits because it reports its device memory "
+                   "host-addressable. It is SLOW: this run is not a performance "
+                   "measurement\n",
                    OpNameImpl(op), DeviceTypeName(device));
     }
   }
@@ -783,13 +837,34 @@ bool ReferenceTierEligible(DeviceType device) {
   // The CPU is the SOURCE of the reference kernels, never a fallback target
   // (falling back to itself is a no-op at best and self-reference at worst).
   if (device == DeviceType::kCPU) return false;
-  // THE SAFETY GATE. A CPU kernel dereferences host pointers, which is correct
-  // ONLY where host and device memory alias. Gate on the unified-memory property
-  // of the ACTUAL registered backend, not on DeviceType: a discrete GPU (CUDA or
-  // Vulkan) answers false and never receives a CPU fallback. A device with no
-  // backend in this build is trivially ineligible.
+  // THE SAFETY GATE. A CPU kernel dereferences pointers that came out of
+  // `Backend::Alloc`, so the question is whether the HOST MAY DEREFERENCE THEM
+  // — `DeviceMemoryIsHostAddressable()` — and not whether the two address spaces
+  // happen to sit on the same physical RAM. Gate on the property of the ACTUAL
+  // registered backend, not on DeviceType. A device with no backend in this
+  // build is trivially ineligible.
+  //
+  // THIS USED TO ASK `UnifiedMemory()`, AND THAT COST TWO CRASHES (#844, #1435).
+  // The two properties are not the same, and include/vt/backend.h says so beside
+  // the narrow one: CUDA on GB10 reports unified memory because host and device
+  // address the same physical RAM, yet a plain `cudaMalloc` pointer is still not
+  // host-dereferenceable. `CudaBackend::Alloc` calls exactly that, so every CUDA
+  // op without a native kernel installed the CPU host kernel over device
+  // pointers and the process took SIGSEGV — `vt::QuantFp8Static` on sm_110
+  // (#960) and `vt::MatmulFp8BlockScaled` on a CUTLASS-less build (#1435).
+  //
+  // Metal (StorageModeShared) and ROCm (managed or pageable-access integrated
+  // allocations) answer the narrow predicate with the value they already report
+  // for unified memory, so neither changes. VULKAN WIDENS, and safely: it
+  // answers the narrow predicate `true` unconditionally, while its
+  // `UnifiedMemory()` is false when no HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL
+  // memory type exists. On such a device the tier was WITHHELD before and is
+  // installed now. That is sound rather than lucky — `VulkanContext` falls back
+  // to the host flags alone and then VT_CHECKs that a host-visible, host-coherent
+  // type was found, so every allocation it hands out is host memory the GPU also
+  // reads. A backend added later gets the safe default, which is `false`.
   Backend* b = TryGetBackend(device);
-  return b != nullptr && b->UnifiedMemory();
+  return b != nullptr && b->DeviceMemoryIsHostAddressable();
 }
 
 int RegisterReferenceTier(DeviceType target) {

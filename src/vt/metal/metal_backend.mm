@@ -112,6 +112,18 @@ class MetalBackend final : public Backend {
 
   bool UnifiedMemory() const override { return MetalContext::Get().unified_memory(); }
 
+  // Every buffer this backend allocates is MTLResourceStorageModeShared, whose
+  // `contents` pointer IS host memory the GPU also reads (src/vt/metal/
+  // metal_buffers.h). So the answer is the same one UnifiedMemory() gives, and
+  // stating it separately is not redundant: `DeviceMemoryIsHostAddressable()` is
+  // the STRICTLY NARROWER question, it defaults to false, and it is what gates
+  // the portable CPU reference tier this backend depends on for the ops it has
+  // no native kernel for. Metal answered it only through the wide property until
+  // #844 / #1435 measured that the two differ on CUDA.
+  bool DeviceMemoryIsHostAddressable() const override {
+    return MetalContext::Get().unified_memory();
+  }
+
   int DeviceCapabilityMajor() const override {
     return MetalContext::Get().gpu_family_apple();
   }

@@ -41,6 +41,7 @@ def valid_commands() -> list[dict[str, str]]:
         command("src/vt/cuda/cuda_nvfp4_sm12x.cu", ("120a", "121a")),
         command("src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu", ("120a", "121a")),
         command("src/vt/cuda/cuda_matmul_fp8_cutlass.cu", ("120a", "121a")),
+        command("src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu", ("120a", "121a")),
         command("src/vt/cuda/cuda_matmul_nvfp4_sm100.cu", ("100a",)),
         command("src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu", ("90a",)),
         command("src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu", ("100a",)),
@@ -162,3 +163,14 @@ class MarlinTracksTheFeatureTable(unittest.TestCase):
     def test_sm110_is_expected_for_marlin(self):
         """The specific regression, named: Thor's SM must not be audited away."""
         self.assertIn("110", checker.expected_sms("src/vt/cuda/cuda_moe_marlin.cu"))
+
+    def test_the_block_scaled_fp8_cutlass_tu_is_audited_as_sm12x(self):
+        """#1189 M5. cuda_matmul_fp8_block_cutlass.cu rides the cutlass-fp8 cell
+        (12.0a, 12.1a) and CMake compiles it for exactly that pair. A source this
+        checker does not know falls through to ALL_SMS, so the ten-SM fat build
+        would report the TU under-compiled on eight architectures it was never
+        meant to carry -- the audit failing on a correctly-compiled TU, which is
+        #394's failure mode in the other direction."""
+        source = "src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu"
+        self.assertEqual(checker.expected_sms(source), ("120a", "121a"))
+        self.assertIn(source, checker.REQUIRED_SOURCES)

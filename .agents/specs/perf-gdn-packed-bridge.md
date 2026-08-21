@@ -42,7 +42,7 @@ Stated first because it bounds every claim below.
 SACRED `test_qwen27_paged_engine` pins `models--unsloth--Qwen3.6-27B-NVFP4` at
 revision `890bdef7` (`tests/parity/hf_snapshot.h:31,36`). That is a **bf16-tower**
 checkpoint: `LoadGdnDense` only populates `in_proj_qkv_fp8` when the tensor dtype
-is `F8_E4M3` (`qwen3_5_dense_weights.cpp:426-429`), and on `890bdef7` it is not.
+is `F8_E4M3` (`qwen3_5_dense_weights.cpp:427-430`), and on `890bdef7` it is not.
 Every line this row changes is reachable **only** on a native-fp8 GDN tower —
 `nvidia/Qwen3.6-27B-NVFP4`@`0893e160`. So a green 235/235 says nothing whatsoever
 about this change: the gate never executes the branch.

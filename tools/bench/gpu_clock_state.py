@@ -122,6 +122,38 @@ MAX_WITHIN_RUN_SPREAD_PCT = 5.0
 # memory-bound kernel should, which is corroboration, not the argument.
 MAX_CROSS_ARM_OFFSET_PCT = 1.0
 #
+# Cross-arm MEAN offset, 1.0. The rule above bounds the two arms' MEDIANS, and a
+# median is not the statistic that carries the transfer it is bounding.
+# Throughput is an INTEGRAL over the window, so what it sees is the arm's mean
+# clock. On the three Qwen3.8-27B bf16 c1 pairings of 2026-08-19
+# (`/mnt/nas_share/rc/q38bf16/out/`) `median_offset_pct` reads exactly 0.0000% on
+# all three while the MEANS are 0.2521 / 0.1530 / 0.1035 points apart. The
+# excursion population is 5.74% of retained busy samples (97 of 1690) and sits
+# almost entirely below the median -- 95 of those 97 -- so a median over 155 to
+# 246 samples steps straight over the one part of the distribution that does NOT
+# cancel between the arms. #1546.
+#
+# The NUMBER is not a new one, deliberately. It is the same physics ceiling and
+# the same forward criterion that place MAX_CROSS_ARM_OFFSET_PCT: the transfer is
+# bounded above by 1.0 point of kernel time per point of clock, so a 1.0% mean
+# offset implies AT MOST a 1.0% effect on the ratio, which is under the 2.97%
+# smallest deficit this harness has been used to rank. On a flat window
+# mean == median and the two terms are identical, so every steady capture --
+# including the 2026-08-15 pinned series, flat 2184 MHz over n=861 -- scores the
+# same on both, and no new class of window is refused there.
+#
+# It bounds a CROSS-ARM quantity and not a per-arm one. A burden BOTH arms pay
+# divides out of the ratio and this term is silent on it; bounding the burden
+# each arm carries on its own is a different rule, specced under #1354 and not
+# implemented here.
+#
+# What it does NOT bound is a phase-scoped metric. The excursions are locked to
+# the request head, so the mean bounds output throughput and median inter-token
+# latency and does NOT bound time-to-first-token, whose repeat CV is 2.20%
+# against 0.01% for median inter-token latency in the same files. Argument,
+# rejected statistics and evidence: `.agents/specs/clock-cross-arm-mean.md`.
+MAX_CROSS_ARM_MEAN_OFFSET_PCT = 1.0
+#
 # Retained busy samples per window, 30. `spread_pct` over n == 1 is definitionally
 # 0.00% -- the BEST score the gate can award -- so without a floor the window the
 # sampler barely observed outscores the one it actually watched. Bounded on both
@@ -292,7 +324,14 @@ def query_once(*, smi: str = NVIDIA_SMI, timeout_s: float = 10.0) -> dict[str, A
 
 
 def summarize_sm_clocks(values: Sequence[float]) -> dict[str, float]:
-    """Return `{n, min, median, max, spread_pct}` over the measured window."""
+    """Return `{n, min, median, max, mean, spread_pct}` over the measured window.
+
+    `mean` is what an INTEGRAL metric was actually clocked at. The median steps
+    over the excursion population entirely -- 5.74% of the 2026-08-19 samples,
+    95 of 97 of them below their window's median -- and that population is the
+    part that does not cancel between two arms. Recording it is what makes
+    MAX_CROSS_ARM_MEAN_OFFSET_PCT computable (#1546).
+    """
 
     if not values:
         raise HarnessError("cannot summarize an empty SM-clock window")
@@ -303,6 +342,7 @@ def summarize_sm_clocks(values: Sequence[float]) -> dict[str, float]:
     median = statistics.median(numbers)
     return {
         "max": max(numbers),
+        "mean": statistics.fmean(numbers),
         "median": median,
         "min": min(numbers),
         "n": len(numbers),
@@ -403,6 +443,22 @@ def merge_clock_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     lowest = min(float(record["sm_clock_mhz"]["min"]) for record in records)
     highest = max(float(record["sm_clock_mhz"]["max"]) for record in records)
     median = statistics.median(medians)
+    # SAMPLE-COUNT WEIGHTED, because the arm's mean is over the arm's whole
+    # retained busy series and the legs are not the same length -- 155 / 155 /
+    # 156 at c1 and 245 / 246 / 244 at c8 in the one campaign this fold has run
+    # on. An unweighted mean of leg means is a different number and is wrong.
+    # A leg with no mean makes the ARM have none rather than a fabricated one, so
+    # the refusal in `compare_clock_records` propagates instead of being papered
+    # over by the two legs that do carry it.
+    leg_means = [_mean_or_none(record) for record in records]
+    weighted_mean: float | None = None
+    if all(value is not None for value in leg_means):
+        counts = [int(record["sm_clock_mhz"]["n"]) for record in records]
+        total = sum(counts)
+        if total > 0:
+            weighted_mean = (
+                sum(value * count for value, count in zip(leg_means, counts)) / total
+            )
     throttle: set[str] = set()
     for record in records:
         throttle.update(_normalize_throttle(value) for value in record["throttle_reasons_active"])
@@ -419,6 +475,7 @@ def merge_clock_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "persistence_mode": first["persistence_mode"],
         "sm_clock_mhz": {
             "max": highest,
+            **({} if weighted_mean is None else {"mean": weighted_mean}),
             "median": median,
             "min": lowest,
             "n": sum(int(record["sm_clock_mhz"]["n"]) for record in records),
@@ -611,6 +668,44 @@ def compare_clock_records(
                 f"{offset_pct:+.2f}% (>{MAX_CROSS_ARM_OFFSET_PCT}%), estimated to move "
                 f"kernel time by {effect_pct:+.2f}%; the ratio is NOT ESTABLISHED"
             )
+
+    # The same comparison on the statistic an integral metric was actually
+    # clocked at. Independent of the rule above on the recorded evidence: the
+    # median offset is exactly 0.0000% on all three 2026-08-19 c1 pairings while
+    # the mean offset is -0.2521 / -0.1530 / +0.1035 (#1546).
+    ours_mean = _mean_or_none(ours)
+    theirs_mean = _mean_or_none(theirs)
+    mean_offset_pct: float | None = None
+    for mean, label in ((ours_mean, ours_label), (theirs_mean, theirs_label)):
+        if mean is None:
+            # Fail closed. Every record written before this term lacks the field,
+            # and skipping the term on those is the absent hook that reads as an
+            # armed instrument: the block would print a clean verdict on a
+            # quantity nothing examined. Unknown is not absence or success.
+            reasons.append(
+                f"clock: {label} SM-clock record carries no usable mean, so the "
+                "cross-arm MEAN SM-clock comparison cannot be computed; the "
+                "record predates that term and the window must be re-recorded"
+            )
+    if ours_mean is not None and theirs_mean is not None and theirs_mean > 0.0:
+        mean_offset_pct = (ours_mean / theirs_mean - 1.0) * 100.0
+        if abs(mean_offset_pct) > MAX_CROSS_ARM_MEAN_OFFSET_PCT + _THRESHOLD_EPSILON:
+            reasons.append(
+                f"clock: {ours_label} and {theirs_label} ran at MEAN SM clocks "
+                f"{mean_offset_pct:+.2f}% apart ({ours_mean:.1f} vs {theirs_mean:.1f} "
+                f"MHz, >{MAX_CROSS_ARM_MEAN_OFFSET_PCT}%); the excursion population "
+                "does not cancel between the arms and the ratio is NOT ESTABLISHED"
+            )
+    ours_cost_pct = _mean_cost_pct(ours)
+    theirs_cost_pct = _mean_cost_pct(theirs)
+    # REPORTED, never gated on -- the same demotion `spread_pct` and
+    # CLOCK_TIME_TRANSFER carry. It is the quantity #1546 quotes, and §Design of
+    # `.agents/specs/clock-cross-arm-mean.md` measures the pairing where it reads
+    # exactly 0.0000 while the arms' mean clocks are 2.28% apart: an absolute
+    # value discards the sign, and two opposing excursion populations ADD.
+    burden_difference_pct: float | None = None
+    if ours_cost_pct is not None and theirs_cost_pct is not None:
+        burden_difference_pct = abs(ours_cost_pct) - abs(theirs_cost_pct)
     return {
         "allow_cross_boot": bool(allow_cross_boot),
         "caveats": caveats,
@@ -621,6 +716,10 @@ def compare_clock_records(
             "measured ONCE (marlin::Marlin 45.2845 -> 49.6544 ms/step over a "
             "12.79% clock offset, #543); reported, never gated on"
         ),
+        # Reported beside the two gated offsets so a reader can see WHICH part of
+        # each arm's distribution carried a refusal. Not gated on.
+        "excursion_burden_difference_pct": burden_difference_pct,
+        "mean_offset_pct": mean_offset_pct,
         "median_offset_pct": offset_pct,
         f"{ours_label}_boot_id": ours_boot,
         # How much of the window each side actually observed. Without these two
@@ -628,6 +727,8 @@ def compare_clock_records(
         # barely touched, and the latter scores a perfect 0.00% spread.
         f"{ours_label}_busy_samples": _busy_or_none(ours),
         f"{ours_label}_idle_samples_excluded": _idle_or_none(ours),
+        f"{ours_label}_mean_cost_pct": ours_cost_pct,
+        f"{ours_label}_mean_sm_mhz": ours_mean,
         f"{ours_label}_median_sm_mhz": ours_median,
         f"{ours_label}_spread_pct": _spread_or_none(ours),
         "reasons": reasons,
@@ -635,6 +736,8 @@ def compare_clock_records(
         f"{theirs_label}_boot_id": theirs_boot,
         f"{theirs_label}_busy_samples": _busy_or_none(theirs),
         f"{theirs_label}_idle_samples_excluded": _idle_or_none(theirs),
+        f"{theirs_label}_mean_cost_pct": theirs_cost_pct,
+        f"{theirs_label}_mean_sm_mhz": theirs_mean,
         f"{theirs_label}_median_sm_mhz": theirs_median,
         f"{theirs_label}_spread_pct": _spread_or_none(theirs),
     }
@@ -657,6 +760,34 @@ def _median_or_none(record: Mapping[str, Any]) -> float | None:
 
 def _spread_or_none(record: Mapping[str, Any]) -> float | None:
     return _summary_field(record, "spread_pct")
+
+
+def _mean_or_none(record: Mapping[str, Any]) -> float | None:
+    """The window's mean SM clock, or None for a record that predates the field.
+
+    A record written before #1546 has no `mean`, and there is no way to recover
+    one from `{n, min, median, max}`. `compare_clock_records` turns the None into
+    a refusal rather than into a skipped term.
+    """
+
+    value = _summary_field(record, "mean")
+    return value if value is not None and value > 0.0 else None
+
+
+def _mean_cost_pct(record: Mapping[str, Any]) -> float | None:
+    """`(median - mean) / median * 100`, SIGNED, over the retained busy series.
+
+    Positive means the mean sits BELOW the median, which is what a downward
+    excursion population does. Reported and never gated on: the gated quantity is
+    the CROSS-ARM mean offset, because two arms carrying the same burden cancel
+    and two arms carrying opposite ones add.
+    """
+
+    mean = _mean_or_none(record)
+    median = _median_or_none(record)
+    if mean is None or median is None or median <= 0.0:
+        return None
+    return (median - mean) / median * 100.0
 
 
 def _busy_or_none(record: Mapping[str, Any]) -> int | None:

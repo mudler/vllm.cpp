@@ -235,7 +235,7 @@ inline bool GateUpPairFusableShape(const Nvfp4Weight& gw, const Nvfp4Weight& uw)
 // is verbatim the defect recorded RED-first for the OTHER implementation at
 // tests/vllm/model_executor/layers/test_linear_method.cpp:185-201 — group-32 E8M0
 // scales misread as group-16 fp8-e4m3, "GROSSLY wrong". No dense loader sets
-// `is_mxfp4` today (`LoadNvfp4AnyNaming`, qwen3_5_dense_weights.cpp:358-395, only
+// `is_mxfp4` today (`LoadNvfp4AnyNaming`, qwen3_5_dense_weights.cpp:359-396, only
 // ever produces NVFP4), so the defect is latent, not live — one loader line away.
 // Refusing it here costs the currently-reached W4A16 NVFP4 config nothing
 // (`is_mxfp4` is false on both halves) and keeps the split pair, which DOES

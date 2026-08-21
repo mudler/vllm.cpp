@@ -28,11 +28,15 @@
 #include <cstring>
 #include <cctype>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <chrono>
+#include <thread>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -40,6 +44,7 @@
 #include "ltx2_video_fixture.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
+#include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
@@ -50,6 +55,7 @@
 #include "vt/backend.h"
 #include "vt/device.h"
 #include "vllm/multimodal/video_engine.h"
+#include "vllm/multimodal/render_phase_log.h"
 
 namespace {
 
@@ -77,6 +83,44 @@ struct Workspace {
   }
 };
 
+// The class a fixture load must DECLARE for a given pipeline kind — row
+// LTX25-CHECKPOINT-CLASS, issue #1137.
+//
+// RESOLVED FROM THE RECIPE TABLE rather than listed here on purpose. This is
+// fixture SETUP and not an assertion: the table's own gate is
+// `test_ltx2_pipeline`, and a per-case list here would be a second copy of it
+// that could disagree without anything saying so.
+//
+// `kFullOrDistilled` declares `distilled`, which is the arm that needs no
+// adapter. `kUnstated` declares nothing, which is what `dmd2` accepts.
+std::string FixtureCheckpointClass(const std::string& kind) {
+  // The fixture DiT declares `model_version` 2.5.0, so 2.5 is tried first; the
+  // older keys are there for the cases that override the version extra.
+  for (const char* version : {"2.5", "2.4", "2.3", "2"}) {
+    vllm::Ltx2PipelineRecipe recipe;
+    try {
+      recipe = vllm::ResolveLtx2PipelineRecipe(kind, version);
+    } catch (const std::exception&) {
+      continue;
+    }
+    switch (recipe.checkpoint_class) {
+      case vllm::Ltx2RequiredCheckpointClass::kFull:
+        return "full";
+      case vllm::Ltx2RequiredCheckpointClass::kDistilled:
+        return "distilled";
+      case vllm::Ltx2RequiredCheckpointClass::kKeyframeSlotSft:
+        return "keyframe_slot_sft";
+      case vllm::Ltx2RequiredCheckpointClass::kFullOrDistilled:
+        return "distilled";
+      case vllm::Ltx2RequiredCheckpointClass::kUnstated:
+        return "";
+    }
+  }
+  // A kind no version resolves is the caller's own refusal case; declare nothing
+  // and let the recipe table refuse it by name, which is what those cases assert.
+  return "";
+}
+
 vllm::multimodal::VideoModelParams FixtureParams(const ltx2_fixture::Paths& paths) {
   vllm::multimodal::VideoModelParams mp;
   mp.dit_path = paths.dit;
@@ -94,6 +138,17 @@ vllm::multimodal::VideoModelParams FixtureParams(const ltx2_fixture::Paths& path
   mp.extras[vllm::multimodal::kLtx2NegativePromptEmbedsExtra] = paths.negative_video_embeds;
   mp.extras[vllm::multimodal::kLtx2NegativeAudioPromptEmbedsExtra] = paths.negative_audio_embeds;
   mp.device = 0;
+  // THE CHECKPOINT CLASS (row LTX25-CHECKPOINT-CLASS, #1137). Every kind this
+  // family resolves except `dmd2` now refuses a load that does not declare which
+  // class of transformer it was handed, because nothing in a checkpoint header
+  // separates a distilled LTX-2.5 DiT from a full one. The default kind here is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  //
+  // DERIVED, NOT LISTED, by `FixtureCheckpointClass` above: a fixture that
+  // hard-coded a class per case would be a second copy of the recipe table, and
+  // the two would drift.
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("distilled_two_stage");
   return mp;
 }
 
@@ -802,6 +857,7 @@ TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, p
   SUBCASE("a one-stage width BELOW the divisor names 32 as the smallest legal size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os16");
@@ -845,6 +901,7 @@ TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, p
   SUBCASE("a one-stage width that is not a multiple of 32 is refused BY VALUE") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os100");
@@ -883,6 +940,7 @@ TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, p
   SUBCASE("96 is a legal ONE-STAGE size, because that divisor is 32") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/one_stage_96");
@@ -1093,6 +1151,16 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // unconditional forward.
       vllm::multimodal::kLtx2NegativePromptEmbedsExtra,
       vllm::multimodal::kLtx2NegativeAudioPromptEmbedsExtra,
+      // Row LTX25-CHECKPOINT-CLASS (#1137): the class the caller declares. Read
+      // where the recipe resolves, and the only thing that reads it is the
+      // refusal, which is what this key exists to produce.
+      vllm::multimodal::kLtx2CheckpointClassExtra,
+      // Row LTX25-DFR-ROUNDS (#986): the TEMPORAL x2 latent upsampler, DFR's
+      // second upsampler slot. It has three readers, which is why it is served
+      // rather than refused: the load parses its config and refuses the wrong
+      // arm by name, the request surface refuses positive rounds without it, and
+      // the rounds loop calls it once per round.
+      vllm::multimodal::kLtx2TemporalUpsamplerPathExtra,
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect #611 records.
@@ -1223,16 +1291,17 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
   }
   REQUIRE(array_end > array_line);
 
-  // The thirteen SERVED keys, by the token each is spelled with in the source.
+  // The fourteen SERVED keys, by the token each is spelled with in the source.
   // Order is irrelevant — the comparison is on the sorted set — so this list is
-  // not a second place the anchors live. The last two arrived with row
-  // LTX25-GUIDED-VIDEO (#1092).
+  // not a second place the anchors live. Two arrived with row
+  // LTX25-GUIDED-VIDEO (#1092) and the last with LTX25-CHECKPOINT-CLASS (#1137).
   const std::vector<std::string> served_tokens = {
       "kLtx2AudioPromptEmbedsExtra", "kLtx2PipelineKindExtra",  "kLtx2ModelVersionExtra",
       "kLtx2AllowUnportedExtra",     "kLtx2MaxPhaseExtra",      "kLtx2DitConfigPathExtra",
       "kLtx2PromptValidRowsExtra",   "kLtx2EncoderConfigPathExtra", "\"upsampler_path\"",
       "kLtx2LoraPathExtra",          "kLtx2LoraStrengthExtra",
       "kLtx2NegativePromptEmbedsExtra", "kLtx2NegativeAudioPromptEmbedsExtra",
+      "kLtx2CheckpointClassExtra",
   };
   std::vector<size_t> derived;
   for (const std::string& token : served_tokens) {
@@ -1967,6 +2036,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
   // Phase 0 only: phase 1 needs the latent spatial upsampler, and this case is
   // about the canvas and the slots rather than about the detailing stage.
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -2058,6 +2128,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     // outer one pins phase 0.
     vllm::multimodal::VideoModelParams two = FixtureParams(ws.paths);
     two.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    two.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
     two.extras["upsampler_path"] = ws.paths.upsampler;
     const std::unique_ptr<vllm::multimodal::VideoEngine> full =
         vllm::multimodal::LoadVideoEngine(two);
@@ -2074,6 +2145,23 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     CHECK(result.frame_count == 9);
     CHECK(result.width == 64);
     CHECK(result.height == 64);
+
+    // W0 (#1010) names "any latent-upsampler stage", and this leaf is the answer
+    // to it. The latent SPATIAL x2 upsampler used to run inside `phase.prepare`,
+    // a leaf whose name says nothing about it, and this two-phase render is the
+    // ONLY one in this file that reaches it — every other case pins `max_phase`
+    // at 0, where the input transform is never the spatial upsample.
+    REQUIRE_MESSAGE(!result.phase_log_path.empty(),
+                    "the two-phase render wrote no phase table");
+    const nlohmann::json upsample_table =
+        nlohmann::json::parse(ReadAll(result.phase_log_path));
+    bool named_upsample = false;
+    for (const nlohmann::json& entry : upsample_table["phases"]) {
+      if (entry["name"].get<std::string>() == "phase.upsample_latent") named_upsample = true;
+    }
+    CHECK_MESSAGE(named_upsample,
+                  "the two-phase render's table names no 'phase.upsample_latent' leaf, so the "
+                  "latent upsampler is back inside 'phase.prepare' with nothing saying so");
 
     const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2_full->last_conditioning();
     // The trace describes the LAST phase that ran, so a slot count here means
@@ -2217,12 +2305,31 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
   }
 }
 
-TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
-  // Row LTX25-DFR-PIPELINE (#986). The rounds LOOP is unported; the upsampler it
-  // drives is not, and neither is the canvas layout it tiles with. That
-  // distinction is the entire content of the refusal, and it is the distinction
-  // this campaign has now got wrong twice — `ltx2_video.cpp` keeps a tally of
-  // refusals whose stated reason turned out false.
+TEST_CASE("ltx2 video: temporal rounds are refused where they mean nothing") {
+  // Row LTX25-DFR-ROUNDS (#986). THE REFUSAL THIS REPLACES, and why it is retired
+  // rather than widened.
+  //
+  // Until this row the whole knob was refused above 0, and the message named the
+  // ROUNDS LOOP as what was missing while ruling three other causes out by name.
+  // The loop has landed, so that message is now false about this tree and the
+  // assertions that re-derived it go WITH it — the same disposal #920's tripwire
+  // got when the readback landed (see the retirement record above, around the
+  // `GENERATED keyframe slots are SERVED` case). Each of its assertions is
+  // replaced below by one about what replaced it, never deleted and never
+  // loosened to keep a green.
+  //
+  // ONE OF ITS FOUR STATED CAUSES WAS ALREADY FALSE WHEN THIS ROW READ IT, and
+  // that is the more useful record. The message ended with "AND ONE THING IS
+  // MISSING THAT NO CODE CAN SUPPLY: the checkpoint", asserting that
+  // `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` is not on the NAS,
+  // "re-verified 2026-08-16". It is on the NAS, and it arrived 2026-08-17 — one
+  // day after that check. Nothing in the tree could notice: a refusal's stated
+  // reason is prose, and the only instrument on it is a reader who goes and
+  // looks. This suite is that reader, for the claims it CAN reach.
+  //
+  // What survives the retirement is the part that is still true: a value outside
+  // upstream's own `{0, 1, 2}` is a malformed request and is still refused first,
+  // and the knob still belongs to `DFRPipeline` alone.
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -2244,52 +2351,46 @@ TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
 
   SUBCASE("a value outside {0,1,2} gets upstream's OWN refusal first") {
     // `dfr_pipeline.py:284-285` raises at the top of `__call__`, before any work
-    // is paid for. A malformed request and an unported loop are different
-    // answers, and upstream gives the malformed one first.
+    // is paid for. UNCHANGED by this row: a malformed request is still a
+    // different answer from a legal one, and it still comes first.
     const std::string msg = refusal("3", "tr3");
     INFO(msg);
     CHECK(msg.find("must be 0, 1, or 2") != std::string::npos);
     CHECK(msg.find("dfr_pipeline.py:284-285") != std::string::npos);
-    // NOT the unported-loop message: that would send a caller who typed 3 off to
-    // read about tiling.
-    CHECK(msg.find("ROUNDS LOOP") == std::string::npos);
   }
 
-  SUBCASE("a legal count names the LOOP, and rules three other causes OUT") {
-    const std::string msg = refusal("1", "tr1");
+  SUBCASE("a legal count on a NON-DFR pipeline is refused, and says whose knob it is") {
+    // THE BRANCH THAT BECAME REACHABLE IN THE SAME CHANGE THAT MADE IT TRUE.
+    // While the loop was unported this check could not fire — every caller was
+    // already refused by the "not served" message whatever their pipeline — so
+    // landing it then would have been the unselected-branch shape
+    // `.agents/reachability.md` enumerates. This engine is loaded on the DEFAULT
+    // `distilled_two_stage` kind, so the refusal below is the pipeline one.
+    const std::string msg = refusal("1", "trkind");
     INFO(msg);
-    // The upstream span a reader can go and check.
-    CHECK(msg.find("dfr_pipeline.py:402-529") != std::string::npos);
-    CHECK(msg.find("ROUNDS LOOP") != std::string::npos);
-    // WHAT IS NOT THE REASON — the shape this campaign requires for a ruled-out
-    // cause, so the next reader RE-CHECKS the refutation rather than re-deriving
-    // it. All three must be named.
-    CHECK(msg.find("NOT* THE REASON") != std::string::npos);
-    CHECK(msg.find("LTX25-TEMPORAL-UPSAMPLER") != std::string::npos);
-    CHECK(msg.find("PixelShuffle1d") != std::string::npos);
-    CHECK(msg.find("resolve_canvas") != std::string::npos);
-    // And the one thing no code can supply.
-    CHECK(msg.find("latent-temporal-upscaler") != std::string::npos);
-    CHECK(msg.find("#986") != std::string::npos);
+    CHECK(msg.find("dfr_pipeline.py:277") != std::string::npos);
+    CHECK(msg.find("distilled_two_stage") != std::string::npos);
+    // And it says what silently dropping the knob would have cost, which is the
+    // half that makes "refused rather than ignored" a reason instead of a slogan.
+    CHECK(msg.find("2**rounds") != std::string::npos);
+    // NOT the retired message. A caller must not be told the loop is unported.
+    CHECK(msg.find("are not served") == std::string::npos);
   }
 
-  SUBCASE("its LOCAL claims are re-derived from this tree, not read back from the message") {
-    // THE ASSERTION THE #920 REPAIR EXISTS FOR, carried forward to this refusal
-    // because the failure it guards is a property of refusals in general rather
-    // than of that one. Every assertion above is on an UPSTREAM symbol name, and
-    // no change to THIS tree can move one — so a suite built only on them stays
-    // green through exactly the event that falsifies the message.
+  SUBCASE("the canvas layout is still declared where the rounds loop reads it from") {
+    // THE ASSERTION THE #920 REPAIR EXISTS FOR, RETARGETED rather than retired
+    // with the message it used to guard. Its subject changed and its reason did
+    // not: every other check in this file is on an UPSTREAM symbol name, and no
+    // change to THIS tree can move one, so a suite built only on them stays green
+    // through exactly the event that falsifies what we claim about ourselves.
     //
-    // Measured on this campaign: a mutation that replaced the local-cause clause
-    // with a self-declared falsehood, leaving the upstream names alone, kept the
-    // #920 suite GREEN at 18/18, exit 0.
-    //
-    // The refusal claims the canvas layout is ported HERE. That is a claim about
-    // this tree, so it is checked against this tree — and against a DIFFERENT
-    // file from the one that makes it, which is what stops the check from being
-    // the tautology #911 records.
-    const std::string msg = refusal("2", "trclaims");
-    INFO(msg);
+    // What it guarded before: a refusal claiming the canvas layout was ported
+    // here. What it guards now: the rounds loop actually CALLING that layout.
+    // Those four symbols were the first production callers this row added, so a
+    // rename or a removal is no longer a stale sentence — it is a build failure
+    // in `ltx2_video.cpp`. This check is what makes the failure say why, and it
+    // reads a DIFFERENT file from the one that uses them, which is what stops it
+    // being the tautology #911 records.
     const std::vector<std::string> header_lines =
         SplitLines(ReadSourceFile(LTX2_DFR_HEADER_PATH));
     REQUIRE(header_lines.size() > 100);
@@ -2305,20 +2406,336 @@ TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
     // comment block would answer every check below for free.
     REQUIRE_MESSAGE(declarations.find("struct Ltx2DfrTileRange") != std::string::npos,
                     "comment stripping removed the declarations it was meant to keep");
-    // The message rules the canvas layout out as a blocker BECAUSE it is ported
-    // here. If a later change removes one of these, that clause becomes false
-    // and this goes red with the reason attached.
-    CHECK(msg.find("canvas layout") != std::string::npos);
     for (const char* name : {"Ltx2DfrResolveCanvas", "Ltx2DfrTileRanges",
-                             "Ltx2DfrStitchTileLatents", "Ltx2DfrMergeCarryForwardKeyframes"}) {
-      INFO("claimed ported HERE: " << name);
+                             "Ltx2DfrStitchTileLatents", "Ltx2DfrMergeCarryForwardKeyframes",
+                             "Ltx2DfrSliceLatentFrames", "Ltx2DfrConcatLatentFrames"}) {
+      INFO("called by the rounds loop: " << name);
       CHECK_MESSAGE(declarations.find(name) != std::string::npos,
-                    "the refusal rules the canvas layout out as a blocker because it is ported "
-                    "here, and '"
+                    "the DFR rounds loop calls '"
                         << name
-                        << "' is no longer declared in ltx2_dfr.h. The message is stale about "
-                           "THIS tree");
+                        << "' and it is no longer declared in ltx2_dfr.h");
     }
+  }
+}
+
+TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsampler") {
+  // Row LTX25-DFR-ROUNDS (#986). THIS CASE IS THE ROW'S REACHABILITY PROOF, and
+  // the reason the row exists at all.
+  //
+  // The temporal x2 latent upsampler has been ported, loader-parsed and gated
+  // against executed upstream at reduced dimensions since #644, and until this
+  // row NOTHING CALLED IT. `docs/FEATURES.md` carried that as
+  // `Temporal x2 ups gated, UNDRIVEN`, and `.agents/reachability.md` names the
+  // shape: a capability whose only driver is the test written for it. Its single
+  // upstream consumer is DFR's rounds loop (`dfr_pipeline.py:407`), so porting
+  // the loop is what retires the debt — and a unit test that hands the operator a
+  // latent by hand proves the class works, never that anything reaches it.
+  //
+  // So every subcase here enters at `LoadVideoEngine` then `VideoEngine::Generate`
+  // — the chain `vllm_video_generate` takes — and asks for the rounds through the
+  // same `temporal_upsample_rounds` extra a caller has.
+  //
+  // WHY A FIXTURE CHECKPOINT, stated rather than left to be discovered: DFR's
+  // base needs a `keyframe_slot_sft` transformer and NOBODY PUBLISHES ONE (#1137
+  // established that by authenticated reads at the pinned revision), so `dfr` is
+  // refused in practice on real weights. The reduced fixture below declares the
+  // class it genuinely implements, which is not the false declaration
+  // `docs/USAGE.md` warns about — that is declaring `keyframe_slot_sft` for a
+  // `dev` or `distilled` FILE to get past the refusal. Every claim in this case
+  // is therefore a reduced-dimension claim, and no real-weight temporal result
+  // exists or is implied. The real temporal upsampler checkpoint IS on the NAS as
+  // of 2026-08-17; the base it would run beside is what is missing.
+  Workspace ws;
+
+  // The TEMPORAL arm as its own checkpoint. DFR holds two upsamplers at once
+  // upstream — `spatial_upsampler_path` (dfr_pipeline.py:174) for stage 2's input
+  // transform and `temporal_upsampler_path` (:177) for the rounds — so this
+  // engine has two slots rather than one reinterpreted one.
+  vllm::Ltx2UpsamplerConfig temporal =
+      ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+  temporal.spatial_upsample = false;
+  temporal.temporal_upsample = true;
+  const std::string temporal_path = ws.root + "/dfr_temporal_upsampler.safetensors";
+  ltx2_fixture::WriteReducedUpsampler(temporal, temporal_path);
+
+  auto load = [&](bool with_temporal) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    mp.extras["upsampler_path"] = ws.paths.upsampler;  // stage 2, the SPATIAL arm
+    if (with_temporal) {
+      mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = temporal_path;
+    }
+    return vllm::multimodal::LoadVideoEngine(mp);
+  };
+
+  SUBCASE("one round doubles the caller's frame contract AND invokes the upsampler") {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_r1");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "1";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    // THE CONTRACT: `(requested - 1) * 2**rounds + 1` (dfr_pipeline.py:534). The
+    // fixture asks for 9, so one round owes 17 — and the canvas it was denoised
+    // on is larger again, which is the half no output can show.
+    CHECK(result.frame_count == 17);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.temporal_rounds == 1);
+    // THE REACHABILITY ASSERTION. Everything else in this subcase — the frame
+    // count, the shape, the exit status — is satisfied by a loop that resized the
+    // latent and never called the operator. This is the only line that separates
+    // "the rounds ran" from "the rounds drove the upsampler", which is exactly
+    // the distinction `.agents/reachability.md` says a green gate cannot make for
+    // you. Deleting the `Ltx2UpsampleVideoLatent` call in the rounds loop must
+    // turn this red; that mutation is the row's headline evidence.
+    CHECK(trace.temporal_upsample_calls == 1);
+    // (:415) `2**round_idx` windows — AND THE CLAMP, which this expectation got
+    // wrong on the first pass and which is worth recording rather than quietly
+    // fixing. `tile_ranges` takes `min(num_tiles, n_segments)`
+    // (dfr_layout.py:171), and this fixture's canvas has exactly ONE segment: a
+    // 9-frame request pads to 25 with its single keyframe position at 24, so the
+    // boundaries are [0, 24] and round 1 asks for 2 windows over 1 segment.
+    //
+    // So the value here is 1, and it is upstream's value rather than a shortfall.
+    // STATED PLAINLY BECAUSE IT BOUNDS THE CLAIM: this fixture cannot exercise
+    // the UNCLAMPED `2**round` tiling, and no assertion in this file gates it.
+    // What is gated is that the count comes from the layout at all — a loop that
+    // denoised the canvas whole reports 1 here too, which is why the round-2
+    // subcase below carries the assertion that separates them.
+    REQUIRE(trace.round_tile_counts.size() == 1);
+    CHECK(trace.round_tile_counts[0] == 1);
+    // PLAYBACK fps doubles (:542). Reporting the conditioning fps instead hands
+    // back a clip of the right length that plays at half speed, which no frame
+    // count can see.
+    CHECK(result.fps == 48);
+  }
+
+  SUBCASE("two rounds quadruple it, and the tile count doubles with the round") {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_r2");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    CHECK(result.frame_count == 33);  // (9 - 1) * 4 + 1
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.temporal_rounds == 2);
+    // ONE UPSAMPLE PER ROUND, not one per render and not one per tile. A loop
+    // that upsampled once and then re-tiled twice produces a clip of the right
+    // length at half the temporal detail.
+    CHECK(trace.temporal_upsample_calls == 2);
+    // THE TILE COUNT GROWS WITH THE ROUND, which is the assertion that separates
+    // a real re-tiling from a loop that denoises the canvas whole. Both values
+    // are clamped by `min(num_tiles, n_segments)` (dfr_layout.py:171) — see the
+    // round-1 subcase — but they are clamped to DIFFERENT numbers, and that is
+    // what makes the pair informative where either alone is not.
+    //
+    // Derived rather than observed: round 1 runs on boundaries [0, 24] (one
+    // segment, so `min(2, 1) = 1`) and invents a mid-segment slot at 12. Round 2
+    // therefore carries TWO positions, its seams double to [48, 96] against a
+    // 97-frame canvas, the boundaries become [0, 48, 96] — two segments — and it
+    // asks for 4, taking `min(4, 2) = 2`. A loop that re-tiled without carrying
+    // the round's new slots forward would report 1 again here.
+    REQUIRE(trace.round_tile_counts.size() == 2);
+    CHECK(trace.round_tile_counts[0] == 1);
+    CHECK(trace.round_tile_counts[1] == 2);
+    CHECK(trace.round_tile_counts[1] > trace.round_tile_counts[0]);
+    CHECK(result.fps == 96);
+  }
+
+  SUBCASE("the CONDITIONING fps is capped at 60 while playback is not") {
+    // dfr_pipeline.py:414 caps the conditioning fps at 60.0, and :74-78 says why
+    // in terms: RoPE time is `pixel_frame / fps`, so a 120 fps time base halves
+    // every token's temporal span against the trained distribution and the model
+    // can no longer lay out 8 pixel frames inside one latent token — it decodes
+    // as a motion spike at each latent border followed by a stall.
+    //
+    // THIS IS INVISIBLE TO EVERY OTHER ASSERTION IN THIS FILE. An uncapped port
+    // renders the right number of frames, at the right size, at the right
+    // playback rate, and reports success. The fixture runs at 24 fps, so round 1
+    // conditions at 48 (under the cap, unchanged) and round 2 would reach 96 and
+    // is held at 60 — which is what makes this two values rather than one.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_fps");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    REQUIRE(trace.round_conditioning_fps.size() == 2);
+    CHECK(trace.round_conditioning_fps[0] == doctest::Approx(48.0));
+    CHECK(trace.round_conditioning_fps[1] == doctest::Approx(60.0));
+    // And PLAYBACK went past the cap, which is the other half of the claim: one
+    // value capped and the other not. A port that capped both reports 60 here.
+    CHECK(result.fps == 96);
+  }
+
+  SUBCASE("the four PER-TILE guarantees, none of which the rendered clip can show") {
+    // Four values upstream's tile call overrides, mirrored in the rounds loop
+    // and, until this subcase, gated by NOTHING. A fresh review mutated each one
+    // and the full suite stayed green at 102 cases / 4141 assertions, which is
+    // the shape `.agents/reachability.md` calls unasserted-live code: the lines
+    // execute, they change the pixels, and no assertion in the tree reads them.
+    //
+    // They are gathered in one subcase because they are one render's worth of
+    // observations about the same three tile invocations — round 1's single tile
+    // and round 2's two — and separating them would run the same fixture three
+    // more times to assert on different fields of the same trace.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_tileguards");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 33);  // the render still has to be the render
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    // THREE tile invocations: round 1 clamps to 1 window, round 2 to 2. Read off
+    // the tile counts rather than restated, so this stays the same claim if the
+    // clamp ever changes.
+    REQUIRE(trace.round_tile_counts.size() == 2);
+    const size_t tiles = static_cast<size_t>(trace.round_tile_counts[0] + trace.round_tile_counts[1]);
+    REQUIRE(tiles == 3);
+
+    // ── 1. THE PER-TILE SEED (dfr_pipeline.py:496-498) ──────────────────────
+    // `seed + 1000 * round + tile`, and the seed is what the loop generator was
+    // CONSTRUCTED with rather than the offset that was asked for. Upstream names
+    // the failure: the tiles are positionally identical, so a shared seed injects
+    // byte-identical noise into every window and the clip renders with the same
+    // grain pattern repeating across it — right length, right shape, exit 0.
+    //
+    // `FixtureGen` seeds at 7, so round 1's single tile owes 1007 and round 2's
+    // two owe 2007 and 2008. THE LOAD-BEARING PART IS THAT THEY DIFFER, and the
+    // `+ tile` term is the only thing that separates the last two: dropping it
+    // leaves 2007 twice.
+    REQUIRE(trace.round_tile_seeds.size() == tiles);
+    CHECK(trace.round_tile_seeds[0] == 1007u);
+    CHECK(trace.round_tile_seeds[1] == 2007u);
+    CHECK(trace.round_tile_seeds[2] == 2008u);
+    CHECK(trace.round_tile_seeds[2] != trace.round_tile_seeds[1]);
+
+    // ── 2. THE ANCESTRAL ETA (dfr_pipeline.py:495) ──────────────────────────
+    // Recorded inside the ancestral branch when it takes a step, so a tile that
+    // fell onto the deterministic Euler arm contributes no entry at all and the
+    // size check below is red before any value is compared. At eta 0 the
+    // ancestral step degenerates to plain Euler: the round re-runs the denoiser
+    // over the upsampled latent and injects no new detail, which is the entire
+    // reason the round exists and is invisible in every count above.
+    REQUIRE(trace.round_stepper_eta.size() == tiles);
+    for (size_t i = 0; i < trace.round_stepper_eta.size(); ++i) {
+      INFO("tile ", i);
+      CHECK(trace.round_stepper_eta[i] == doctest::Approx(0.5));
+    }
+
+    // ── 3. THE SEAM ANCHOR STRENGTH (dfr_pipeline.py:466, :70-72) ───────────
+    // 0.95, "pinned just short of fully clean so a tile can still settle its seam
+    // frame". At 1.0 the seam frame is frozen and cannot move to meet the frames
+    // either side of it, so each window border keeps a discontinuity — and the
+    // token count, the tile count and the stitched length are all unchanged.
+    //
+    // The count is a floor rather than an equality: every tile pins at least its
+    // own local frame 0 (:453-468), so fewer entries than tiles means a tile
+    // denoised its window with no seam pinned at all.
+    REQUIRE(trace.round_anchor_strengths.size() >= tiles);
+    for (size_t i = 0; i < trace.round_anchor_strengths.size(); ++i) {
+      INFO("anchor ", i);
+      CHECK(trace.round_anchor_strengths[i] == doctest::Approx(0.95));
+    }
+
+    // ── 4. THE DEDUPE ORDER (dfr_pipeline.py:519-522) ───────────────────────
+    // `first_index.setdefault(position, index)` — FIRST WINS. A lead-in segment
+    // makes a later tile re-emit a slot an earlier tile already denoised, and the
+    // earlier copy is the one denoised inside the window that OWNS the slot
+    // rather than inside a lead-in.
+    //
+    // THE POSITIONS ARE IDENTICAL UNDER EITHER RULE. Both rules keep exactly one
+    // entry per position and both sort the bag, so the position list, its length,
+    // the carry-forward count and every downstream shape are byte-for-byte the
+    // same whichever copy is kept. The winning TILE is the only observable the
+    // rule moves, which is why it is recorded.
+    //
+    // This fixture: round 1 emits one slot at 24; round 2's tile 0 re-emits 24
+    // and its tile 1 emits 24 again as a lead-in plus 72 of its own. Four
+    // emissions, three survivors — so a duplicate genuinely occurred here and the
+    // rule genuinely decided something.
+    CHECK(trace.round_slots_emitted == 4);
+    REQUIRE(trace.round_merged_slot_positions.size() == 3);
+    CHECK(trace.round_slots_emitted > static_cast<int64_t>(trace.round_merged_slot_positions.size()));
+    CHECK(trace.round_merged_slot_positions[0] == 24);
+    CHECK(trace.round_merged_slot_positions[1] == 24);
+    CHECK(trace.round_merged_slot_positions[2] == 72);
+    // The assertion the rule lives or dies on. Under last-wins this reads
+    // `0 1 1`.
+    REQUIRE(trace.round_merged_slot_tiles.size() == 3);
+    CHECK(trace.round_merged_slot_tiles[0] == 0);
+    CHECK(trace.round_merged_slot_tiles[1] == 0);
+    CHECK(trace.round_merged_slot_tiles[2] == 1);
+  }
+
+  SUBCASE("rounds without a temporal upsampler are refused, not silently skipped") {
+    // Upstream's second refusal, raised at the top of `__call__` beside the
+    // malformed-value one (dfr_pipeline.py:286-287). Refused rather than run at
+    // 0 rounds because the rounds are what set the frame count: a skipped round
+    // returns a clip a fraction of the requested length, and nothing else about
+    // the render can flag it.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(false);
+    REQUIRE(engine != nullptr);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_nots");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "1";
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("rounds without a temporal upsampler must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("temporal_upsampler_path") != std::string::npos);
+      CHECK(msg.find("dfr_pipeline.py:286-287") != std::string::npos);
+    }
+  }
+
+  SUBCASE("zero rounds is unchanged, which is the refactor's floor") {
+    // THE CONTROL, and it matters more than any assertion above it. Landing the
+    // rounds meant turning this engine's inline per-phase denoise into a callable
+    // the tiles could enter — a refactor of the shipped render path that EVERY
+    // pipeline kind now runs through. A rounds loop that works while quietly
+    // moving the base path is a worse outcome than no rounds loop.
+    //
+    // At 0 rounds the seam must be a no-op: same frame count, same canvas, same
+    // slot grid, and no upsample call. The wider control is the other 100 cases
+    // in this file plus `test_ltx2_pipeline`, `test_ltx2_retake` and
+    // `test_ltx2_dfr`, all of which run through the new seam unchanged.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine = load(true);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr_r0");
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    CHECK(result.frame_count == 9);  // (9 - 1) * 2**0 + 1
+    CHECK(result.fps == 24);
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.temporal_rounds == 0);
+    // The upsampler is LOADED and still not called, which is the distinction
+    // between "the checkpoint is present" and "the rounds ran".
+    CHECK(trace.temporal_upsample_calls == 0);
+    CHECK(trace.round_tile_counts.empty());
+    CHECK(trace.canvas_frames == 25);  // the canvas still pads, exactly as before
   }
 }
 
@@ -2588,9 +3005,14 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
   Workspace ws;
   const std::string audio_embeds = ws.paths.audio_embeds;
   const std::string max_phase = "0";
+  // The CHECKPOINT CLASS rides the ABI like every other load extra (row
+  // LTX25-CHECKPOINT-CLASS, #1137). No kind is declared here, so the recipe is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  const std::string checkpoint_class = FixtureCheckpointClass("distilled_two_stage");
   const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
-                        vllm::multimodal::kLtx2MaxPhaseExtra};
-  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+                        vllm::multimodal::kLtx2MaxPhaseExtra,
+                        vllm::multimodal::kLtx2CheckpointClassExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str(), checkpoint_class.c_str()};
 
   vllm_video_model_params mp = vllm_video_model_params_default();
   mp.dit_path = ws.paths.dit.c_str();
@@ -2599,7 +3021,7 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
   mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
   mp.extra_keys = keys;
   mp.extra_values = values;
-  mp.n_extras = 2;
+  mp.n_extras = 3;
   mp.device = 0;  // the family refuses 1 by name; the ABI carries the refusal
 
   vllm_video_engine* engine = nullptr;
@@ -2659,6 +3081,2155 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
   vllm_video_result_free(&result);
   vllm_video_engine_free(engine);
 }
+
+
+// ─── W0 of LTX25-DEVICE-RESIDENCY: the phase instrument (issue #1010) ────────
+//
+// WHAT THIS GATES, and why the campaign put it first. Before this case the whole
+// LTX-2.5 render path emitted ONE line per render — the example's `wrote N
+// frames` — so a run that spent 1731 s somewhere could not say WHERE
+// (#1087 measures that phase and says in its own text "Do not guess it from the
+// duration"), and #1024's GPU-zero window is known NOT to be the denoise
+// (`ltx2_video.cpp` selects `Ltx2StreamDitToDevice` / `Ltx2DitForwardDevice` on
+// `on_device`) and NOT to be the decode (no frame had been written). A campaign
+// staged on that profile would be spending months against a subject nobody had
+// named. `.agents/specs/ltx25-device-residency.md` §Gates, stage W0.
+//
+// WHAT MAKES IT NON-VACUOUS, which is the whole difficulty of a "the parts sum
+// to the whole" gate. A single leaf called `render` covering everything would
+// sum to wall exactly and measure nothing, so the sum is only half of what is
+// asserted here: the table must ALSO carry the named boundaries below (the DiT
+// load, the denoise, the video decode, the frame writer). One without the other
+// is satisfiable by an instrument that names nothing, or by an instrument that
+// names everything and misses the time between the names.
+//
+// THE TOLERANCE IS STATED BEFORE THE RUN, per the spec's §Gates: the named
+// leaves must account for at least 95% of the instrumented wall. The residue is
+// emitted as `unaccounted_seconds` rather than distributed over the leaves,
+// because a phase table whose parts do not add up is a table with a phase nobody
+// named, and the spec's stop condition for W0 is that a partial table is worse
+// than none.
+//
+// It runs over the REDUCED fixture on the CPU arm, so its `peak_device_bytes`
+// column is the "no device probe on this arm" sentinel (-1). What that column
+// carries on a device render is owed to W1's lease; what is gated here is that
+// every entry carries a monotone timestamp and a host byte count, which is what
+// #1010 asks for.
+TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to wall") {
+  Workspace ws;
+  const std::string audio_embeds = ws.paths.audio_embeds;
+  const std::string max_phase = "0";
+  // The CHECKPOINT CLASS rides the ABI like every other load extra (row
+  // LTX25-CHECKPOINT-CLASS, #1137). No kind is declared here, so the recipe is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  const std::string checkpoint_class = FixtureCheckpointClass("distilled_two_stage");
+  const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
+                        vllm::multimodal::kLtx2MaxPhaseExtra,
+                        vllm::multimodal::kLtx2CheckpointClassExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str(), checkpoint_class.c_str()};
+
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = ws.paths.dit.c_str();
+  mp.video_vae_path = ws.paths.video_vae.c_str();
+  mp.audio_vae_path = ws.paths.audio_vae.c_str();
+  mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
+  mp.extra_keys = keys;
+  mp.extra_values = values;
+  mp.n_extras = 3;
+  mp.device = 0;
+
+  vllm_video_engine* engine = nullptr;
+  const vllm_status loaded = vllm_video_engine_load(&mp, &engine);
+  const std::string load_error = vllm_last_error() == nullptr ? "" : vllm_last_error();
+  INFO(load_error);
+  REQUIRE(loaded == VLLM_OK);
+  REQUIRE(engine != nullptr);
+
+  const std::string out_dir = ws.root + "/phase_out";
+  vllm_video_params gen = vllm_video_params_default();
+  gen.width = 64;
+  gen.height = 64;
+  gen.num_frames = 9;
+  gen.seed = 7;
+  gen.has_seed = 1;
+  gen.output_dir = out_dir.c_str();
+
+  vllm_video_result result;
+  std::memset(&result, 0, sizeof(result));
+  const vllm_status generated = vllm_video_generate(engine, &gen, &result);
+  const std::string gen_error = vllm_last_error() == nullptr ? "" : vllm_last_error();
+  INFO(gen_error);
+  REQUIRE(generated == VLLM_OK);
+
+  // (1) THE FILE. The deliverable is retrievable evidence, not a line on a
+  // console somebody has to have been watching (#1040 is made of exactly the
+  // evidence that existed only on a host that stopped answering), so the shipped
+  // default WRITES it beside the frames it explains.
+  const std::string log_path = out_dir + "/phase-log.json";
+  std::ifstream probe(log_path, std::ios::binary);
+  REQUIRE_MESSAGE(probe.good(), "the render wrote no phase table at ", log_path);
+  probe.close();
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(log_path));
+
+  // THE CAVEAT TRAVELS WITH THE FILE. A phase log is read by somebody who did
+  // not run it, months later, out of a directory named `benchmarks/`; the row's
+  // whole subject is evidence that got separated from its context. The emitter
+  // therefore writes what it knows about how far these numbers carry, and this
+  // is the assertion that keeps it there.
+  REQUIRE(table.contains("notice"));
+  CHECK(table["notice"].get<std::string>().find("NOT A BENCHMARK") != std::string::npos);
+  REQUIRE(table.contains("sum_rule"));
+  CHECK(!table["sum_rule"].get<std::string>().empty());
+  REQUIRE(table.contains("sampler_enabled"));
+
+  REQUIRE(table.contains("wall_seconds"));
+  REQUIRE(table.contains("phases"));
+  REQUIRE(table["phases"].is_array());
+  REQUIRE(!table["phases"].empty());
+  const double wall = table["wall_seconds"].get<double>();
+  CHECK(wall > 0.0);
+
+  // (2) EVERY ENTRY carries a monotone timestamp and a byte count. What the
+  // non-decreasing `start` sequence pins is the EMITTER'S SORT, and this comment
+  // used to say the opposite — that the sequence holds *because* the records are
+  // appended in completion order. Completion order is what would BREAK it: the
+  // `load` span closes at start 0.0001 and is appended AFTER
+  // `load.prompt_embeds`, which starts at 0.0625, so the appended order is not
+  // monotone in `start` at all. `ByStart`'s `stable_sort` in
+  // `render_phase_log.cpp` is what makes it monotone, and deleting that sort is
+  // what this line detects.
+  double previous_start = -1.0;
+  double leaves = 0.0;
+  std::vector<std::string> names;
+  for (const nlohmann::json& entry : table["phases"]) {
+    REQUIRE(entry.contains("name"));
+    REQUIRE(entry.contains("start_seconds"));
+    REQUIRE(entry.contains("end_seconds"));
+    REQUIRE(entry.contains("peak_host_bytes"));
+    REQUIRE(entry.contains("peak_device_bytes"));
+    const std::string name = entry["name"].get<std::string>();
+    const double start = entry["start_seconds"].get<double>();
+    const double end = entry["end_seconds"].get<double>();
+    INFO("phase = " << name);
+    CHECK(!name.empty());
+    CHECK_MESSAGE(start >= previous_start,
+                  "the table is emitted as a TIMELINE, sorted by start; the records are "
+                  "APPENDED in completion order, and an emitter that forgot to sort would "
+                  "hand a reader a table whose rows interleave two renders");
+    CHECK(start <= wall);
+    CHECK(end <= wall + 1e-6);
+    CHECK(end >= start);
+    previous_start = start;
+    // A byte count, not a placeholder: this process is resident and every phase
+    // of it holds the fixture's weights, so a zero here is an instrument that
+    // read nothing rather than a phase that allocated nothing.
+    CHECK(entry["peak_host_bytes"].get<int64_t>() > 0);
+    CHECK(entry["peak_device_bytes"].get<int64_t>() >= -1);
+    names.push_back(name);
+    // SPAN **AND** NESTED, which is what `render_phase_log.cpp`'s own `Sum`
+    // skips. Skipping only spans here made this loop silently assert something
+    // else — "no nested leaf has a non-trivial duration" — although the header
+    // advertises nesting as supported and recorded. A fresh review split the mel
+    // decode out as a nested leaf and this case failed the reconciliation below
+    // with `CHECK( 0.0118791 < 1e-06 )`, a message that says nothing about
+    // nesting and reads as "the emitter does not reconcile".
+    if (entry.value("span", false) || entry.value("nested", false)) continue;
+    leaves += end - start;
+  }
+
+  // (3) THE NAMED BOUNDARIES. Without these the sum below is satisfied by one
+  // leaf called `render`, which is an instrument that measures a stopwatch.
+  for (const std::string required : {"load.dit", "denoise", "decode.video", "decode.audio",
+                                    "artifacts.frames", "artifacts.audio"}) {
+    // `std::string`, not `const char*`: doctest stringifies a `char*` streamed
+    // into a message as a BOOL, so a failing case here would have printed
+    // "names no '1' phase" and said nothing about which name was missing.
+    CHECK_MESSAGE(std::find(names.begin(), names.end(), required) != names.end(),
+                  "the phase table names no '" << required << "' phase");
+  }
+
+  // (4) THE SUM. Stated as the tolerance the spec fixed before the run: the
+  // named leaves account for >= 95% of the instrumented wall, and whatever is
+  // left is reported as its own quantity rather than smeared over the leaves.
+  REQUIRE(table.contains("unaccounted_seconds"));
+  const double unaccounted = table["unaccounted_seconds"].get<double>();
+  MESSAGE("phase table: wall=" << wall << "s leaves=" << leaves << "s unaccounted="
+                               << unaccounted << "s over " << names.size() << " entries");
+  CHECK(std::fabs((wall - leaves) - unaccounted) < 1e-6);
+  CHECK_MESSAGE(leaves >= 0.95 * wall,
+                "the phase table does not sum: " << leaves << "s of named leaves against " << wall
+                                                 << "s of wall. The missing time is a phase "
+                                                    "nobody named, and W0 iterates until it is");
+
+  // (5) THE ABI CARRIES IT. `examples/ltx2_gen` is a client of `vllm.h` and
+  // nothing else, so a client that never guesses a filename beside the frames
+  // can still name the table it was handed.
+  REQUIRE(vllm_video_last_phase_log(engine) != nullptr);
+  CHECK(std::string(vllm_video_last_phase_log(engine)) == log_path);
+
+  vllm_video_result_free(&result);
+  vllm_video_engine_free(engine);
+}
+
+// ─── W0 repair: the table ATTRIBUTES its time, which a SUM cannot say ────────
+//
+// WHY A SECOND CASE, when the one above already passes. The case above pins two
+// things: that six names EXIST, and that the leaves ADD UP to wall within 5%.
+// A fresh review of this row's pull request built a table that satisfies both
+// and is worse than useless. Leave the `decode.video` leaf open across the audio
+// decode and give `decode.audio` its name with no work beneath it, and the case
+// above reports **1 case passed, 273 assertions, 0 failed, exit 0** at 99.9%
+// accounted — over a table that says the video decode is 32% of the render (it
+// is 2.4%) and that the audio decode is free (it is a quarter of it). W1 ranks
+// this campaign's levers off this table and W5 is its largest stage. Existence
+// plus a sum is NECESSARY and it is not SUFFICIENT, because neither ties a NAME
+// to the work beneath it.
+//
+// WHAT WAS TRIED FIRST AND REJECTED, MEASURED RATHER THAN ARGUED. The obvious
+// repair is a differential: render at two frame counts and require the phases
+// whose work scales with the clip to grow. It was written, built and run here,
+// and **this box cannot carry it**. Two renders of the same binary, minutes
+// apart, 9 frames against 33: the 9-frame render measured 8.03 s of leaves and
+// the 33-frame render 3.80 s — the 2.5x LONGER clip cost HALF the time, and an
+// earlier run of the same 9-frame render measured 4.80 s. Wall-clock noise here
+// is a factor of two in both directions, against a 2.5x signal, so a
+// seconds-differential is a coin flip wearing a gate. That is the same finding
+// `## Outcome — W0` already records at 76x, and it is why W1 is written as a
+// lease on an idle box.
+//
+// WHAT IS ASSERTED INSTEAD NEEDS NO CLOCK AT ALL. A phase's name is tied to its
+// work STRUCTURALLY: a leaf that claims to cover a piece of work must ENCLOSE
+// the scopes that sit on that work. Every number involved comes from one clock
+// in one run, and every threshold is a ratio of two intervals measured inside
+// the same contention window, so contention cannot move the verdict.
+//
+// AND IT IS ASSERTED FOR ALL THREE CARRYING PHASES, which is the second fresh
+// review's finding. The first repair gave `decode.audio` two sub-scopes and left
+// `denoise` and `decode.video` held by a share floor alone. The reviewer then ran
+// M4's shape one level over, on the phase #1024 and #1087 are actually about:
+// close `denoise` after the first sampler step and open `phase.finish` there. No
+// overlap, no nesting, the sum untouched — **exit 0 on both cases, 99.94%
+// accounted, and 82% of the denoise charged to a neighbour**, with the emitted
+// table reporting `phase.finish` at 55.0% against a `denoise` of 6.0% on a run
+// whose honest denoise was 73.4%. A gate blind to that is a gate this campaign
+// cannot rank levers with, because W1 ranks them off this very table.
+//
+// AND A THIRD FRESH REVIEW BROKE IT AGAIN, one level over from that. All four
+// assertions below are RATIOS taken against the sub-scope anchor, so an anchor
+// that moves WITH the leaf defeats all four at once. Two mutations, both
+// building clean, both exit 0 on both cases:
+//
+//   M12 emits `denoise.step` for `step_index == 0` only, closes `denoise` after
+//       step 0 and opens `phase.finish` over steps 1-7. **exit 0, 106/106 and
+//       350/350 assertions**, over a table reporting `phase.finish` at 28.73%
+//       against a `denoise` of 6.11% on a run whose honest denoise was 39.3%.
+//       That is M7's defect again, on M7's phase, through the gate M7 produced.
+//   M11 moves the two `Close`s in the driver's chunk sink to after the PPM
+//       write. **exit 0, 124/124 and 422/422**, coverage still 99.68%, with the
+//       whole PPM writer charged to `decode.video` — the leaf W5's lever is
+//       measured from — because a swallowed neighbour turns `nested`, leaves the
+//       sum, and overlaps nothing.
+//
+// So the case now asserts the list below, over TWO renders. Read it by what each
+// item is measured against, because that is what decides which defect it can
+// see. (0), (1b) and (5) are measured against nothing the instrument controls —
+// a count the render kept, an order the driver runs in, a flag the emitter sets
+// — and they are the three that survive an anchor moving with its leaf. (1),
+// (2), (3) and (4) are ratios against the anchor. (6) is a ratio between two
+// anchors, which is a weaker guarantee than (0) and a stronger one than nothing,
+// and nothing was what held it before.
+//
+//   0. RECORD COUNT   the anchor runs once per unit of work the RENDER counted.
+//                     `denoise.step` once per `Ltx2ConditioningTrace::
+//                     dit_evaluations`, `decode.video.chunk` once per
+//                     `video_decode_chunks` plus the reopen after the last one,
+//                     the audio pair once each. Neither counter is derived from
+//                     the phase table, so no placement of a scope can move them.
+//                     This is what M12 fails.
+//
+//   1. CONTAINMENT  every sub-scope interval lies inside one of the leaf's own
+//                   records. `denoise.step` wraps the denoiser evaluation inside
+//                   `Evaluate`, which every sampler arm reaches, so a `denoise`
+//                   that stops short of its loop no longer contains its steps.
+//                   `decode.video.chunk` ends when the streaming decoder hands a
+//                   chunk BACK, which is a production event and not an
+//                   instrument statement. `decode.audio.mel` and
+//                   `decode.audio.vocoder` wrap the two calls #1010 names.
+//  1b. SIBLING ORDER two sub-scopes of one leaf appear in the order the driver
+//                   runs them, compared on each name's first record. NOTHING
+//                   ELSE TIES A SUB-SCOPE NAME TO A POSITION — the counts are
+//                   per name, containment holds for either, the intervals are
+//                   sorted before the overlap check, and the nested check is a
+//                   set membership — so swapping the `decode.audio.mel` and
+//                   `decode.audio.vocoder` literals moved 96.8% of that leaf's
+//                   decomposed seconds onto the wrong name with everything
+//                   green. This is what N1 fails.
+//   2. COVERAGE     the sub-scopes together account for nearly all of the leaf,
+//                   so a leaf that encloses its own work PLUS a phase nobody
+//                   named still fails. The threshold is per phase and is set
+//                   from what the anchor can see, not from a round number.
+//   3. EXCLUSIVITY  no OTHER leaf overlaps the window the sub-scopes span, apart
+//                   from a partner the driver genuinely interleaves with
+//                   (`artifacts.frames` alternates with `decode.video`, because
+//                   the decoder streams chunks into the writer's callback). This
+//                   is the assertion that catches the transfer directly: M7's
+//                   `phase.finish` opens in the middle of the denoise window.
+//   4. NON-OVERLAP  the carrying leaves and the writer never overlap each other.
+//   5. NOTHING BUT AN ANCHOR IS NESTED, plus the writer is never enclosed by a
+//                     `decode.video` leaf. A leaf that grows over a NEIGHBOUR
+//                     does not overlap it and does not break the sum — the
+//                     neighbour turns `nested` and leaves the timeline — so this
+//                     is the assertion M11 fails, and it needs no clock.
+//                     `decode.video` also gains `decode.video.vae`, opened
+//                     inside `Ltx2ConvVideoDecodeTiled` around
+//                     `AccumulateTemporalGroup`, so that leaf has one sub-scope
+//                     whose ends are both production events rather than
+//                     statements adjacent to its own.
+//   6. VAE COVERAGE   `decode.video.vae` must cover at least half of this
+//                     render's `decode.video.chunk` seconds. Until this landed
+//                     the vae anchor was held by cardinality, `nested` and
+//                     containment alone and its DURATION was compared against
+//                     nothing, so moving it one statement up onto
+//                     `buffer.Allocate` reported `decode.video.vae = 0.000 s`
+//                     beside a five-millisecond `decode.video` with the tile
+//                     decode inside no sub-scope, both gates green. N6.
+//   7. THE COUNTS AT N > 1. The case renders twice — nine frames, which decode
+//                     in one temporal chunk, and 81, which chunk — and runs
+//                     assertions 0 through 6 over each render of one table.
+//                     Every decode-side count was previously 1 or 1+1, which
+//                     cannot distinguish "once per unit of work" from "once per
+//                     render". Both lookups are filtered by the record's
+//                     `render` field; see `RecordsNamed`.
+//
+// WHAT WAS TRIED FIRST AND REJECTED, MEASURED RATHER THAN ARGUED. The obvious
+// repair is a differential: render at two frame counts and require the phases
+// whose work scales with the clip to grow. It was written, built and run here,
+// and **this box cannot carry it**. Two renders of the same binary, minutes
+// apart, 9 frames against 33: the 9-frame render measured 8.03 s of leaves and
+// the 33-frame render 3.80 s — the 2.5x LONGER clip cost HALF the time, and an
+// earlier run of the same 9-frame render measured 4.80 s. Wall-clock noise here
+// is a factor of two in both directions, against a 2.5x signal, so a
+// seconds-differential is a coin flip wearing a gate. That is the same finding
+// `## Outcome — W0` already records at 76x, and it is why W1 is written as a
+// lease on an idle box.
+//
+// AND THE SHARE FLOOR STAYS, WITH ITS MARGIN NAMED RATHER THAN TIGHTENED. Each
+// carrying phase must still hold at least 0.05% of the leaf sum. That is a
+// backstop against a name with NOTHING beneath it — a detached leaf measures two
+// function calls, about a microsecond, five orders of magnitude below it — and
+// it is deliberately NOT tightened toward the measured share, because the
+// measured share is exactly the quantity this box destroys. The same binary at
+// the same geometry has reported `denoise` at 38.1% and at 73.4%,
+// `decode.audio` at 50.9% and at 16.7%, and `decode.video` at 5.27% and at
+// 2.13%. A floor set at "a fraction of the measured value" would be a flake, and
+// under M7 `denoise` sat at 6.0% and cleared any floor a quiet box could
+// justify. The floor is therefore a weak assertion ON PURPOSE, and the three
+// assertions above are what now bind. Read the floor as "this name is not
+// detached", never as "this phase is honest".
+namespace {
+
+// "any render", for a lookup that genuinely spans the whole table.
+constexpr int64_t kAnyRender = -1;
+
+// Every record of one name IN ONE RENDER, in emitted (start-sorted) order.
+//
+// THE RENDER ARGUMENT IS NOT DECORATION, and a fourth fresh review named the
+// hole it closes. `PhaseLog` is a PROCESS timeline that resets at LOAD
+// (`ltx2_video.cpp`, `Begin()` in the load path); `Ltx2ConditioningTrace` resets
+// on every `Generate` (`ltx2_video.cpp`, `im.trace = Ltx2ConditioningTrace{}`).
+// So a count taken over every record of a name is process-wide while every
+// denominator it is compared against is per-render, and the two agreed only
+// while this case rendered exactly once. It now renders twice into one table,
+// and without this filter the second render's counts would be the sum of both.
+std::vector<nlohmann::json> RecordsNamed(const nlohmann::json& table, const std::string& name,
+                                         int64_t render = kAnyRender) {
+  std::vector<nlohmann::json> out;
+  for (const nlohmann::json& e : table["phases"]) {
+    if (e["name"].get<std::string>() != name) continue;
+    if (render != kAnyRender && e.value("render", static_cast<int64_t>(0)) != render) continue;
+    out.push_back(e);
+  }
+  return out;
+}
+
+// The render index of the LAST generation in a table. The load is render 0 and a
+// table written by the second `Generate` of a process holds the load's records
+// and BOTH renders', so "this render" is a value the reader has to resolve
+// rather than assume.
+int64_t LastRender(const nlohmann::json& table) {
+  int64_t last = 0;
+  for (const nlohmann::json& e : table["phases"]) {
+    last = std::max(last, e.value("render", static_cast<int64_t>(0)));
+  }
+  return last;
+}
+
+// Leaf seconds per NAME, summed: `decode.video` alternates with
+// `artifacts.frames` and appears more than once per render, so a per-name total
+// is the only quantity that means anything. Leaves only — spans enclose leaves
+// and nested records decompose one, and the emitter's own `Sum` skips both.
+std::map<std::string, double> LeafSecondsByName(const nlohmann::json& table) {
+  std::map<std::string, double> out;
+  for (const nlohmann::json& e : table["phases"]) {
+    if (e.value("span", false) || e.value("nested", false)) continue;
+    out[e["name"].get<std::string>()] += e["duration_seconds"].get<double>();
+  }
+  return out;
+}
+
+struct NamedInterval {
+  std::string name;
+  double start = 0.0;
+  double end = 0.0;
+};
+
+// Every SUMMED leaf of one render as an interval, in start order.
+std::vector<NamedInterval> LeafIntervals(const nlohmann::json& table,
+                                         int64_t render = kAnyRender) {
+  std::vector<NamedInterval> out;
+  for (const nlohmann::json& e : table["phases"]) {
+    if (e.value("span", false) || e.value("nested", false)) continue;
+    if (render != kAnyRender && e.value("render", static_cast<int64_t>(0)) != render) continue;
+    NamedInterval iv;
+    iv.name = e["name"].get<std::string>();
+    iv.start = e["start_seconds"].get<double>();
+    iv.end = e["end_seconds"].get<double>();
+    out.push_back(iv);
+  }
+  std::sort(out.begin(), out.end(),
+            [](const NamedInterval& a, const NamedInterval& b) { return a.start < b.start; });
+  return out;
+}
+
+// One carrying phase and the anchor that ties its name to its work.
+struct Carrying {
+  std::string leaf;                    // the name that claims the seconds
+  std::vector<std::string> parts;      // the nested sub-scopes sitting on the work
+  double min_coverage = 0.0;           // of the leaf's own seconds
+  std::vector<std::string> partners;   // leaves the driver genuinely interleaves with
+  // HOW MANY RECORDS OF EACH PART, from a number the RENDER produced. One entry
+  // per name in `parts`. This is the only assertion here that is not a ratio
+  // against the leaf, and it is why the other four are worth making — see the
+  // note above this case.
+  std::vector<int64_t> part_counts;
+  std::string count_source;            // where those numbers came from, for the message
+  // EACH PART'S OWN FLOOR, as a share of the LEAF's seconds. One entry per name
+  // in `parts`, and 0.0 means "no floor, and the row's spec says which direction
+  // that leaves open".
+  //
+  // WHY IT IS PER PART AND NOT ONE NUMBER. `min_coverage` above is checked on
+  // the SUM of the parts, so ONE part covering everything satisfies it and the
+  // others may measure nothing. That is not a hypothetical: mutation R1b leaves
+  // `decode.audio.mel` open across the vocoder call and lets
+  // `decode.audio.vocoder` open and close EMPTY beside it — identical semantics,
+  // identical call order, two lines — and it moves ~100% of `decode.audio`'s
+  // decomposed seconds onto the wrong name, which is the same end state the
+  // NAME-SWAP mutation N1 produces. Every other assertion here survives it:
+  // (1b) passes because mel still OPENS first, so it proves an ORDER and not an
+  // IDENTITY; the counts are {1, 1} either way; containment, `nested` and
+  // non-overlap all hold. This field is what makes the two names measurable
+  // SEPARATELY.
+  //
+  // IT IS REQUIRED RATHER THAN DEFAULTED, and deliberately sits before `render`
+  // so that a future leaf cannot acquire a second part without answering the
+  // question. `decode.audio{mel, vocoder}` is the ONLY multi-part leaf today —
+  // `denoise`, `decode.video` and `artifacts.frames` have one part each, which
+  // is why (1b) and this assertion are both vacuous for them and why the hole
+  // above existed on exactly one pair.
+  std::vector<double> part_min_coverage;
+  // WHICH RENDER. The table is a process timeline and every count above is a
+  // per-render quantity; see `RecordsNamed`.
+  int64_t render = kAnyRender;
+};
+
+// The four assertions above, for one carrying phase. A free function rather than
+// three copies, because `decode.video` has N leaves and M sub-scopes while
+// `decode.audio` has one of each, and a form that only handles the second is how
+// `denoise` came to be ungated in the first place.
+void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
+  INFO("carrying phase = " << c.leaf);
+  const std::vector<nlohmann::json> leaves = RecordsNamed(table, c.leaf, c.render);
+  REQUIRE_MESSAGE(!leaves.empty(), "the table names no '" << c.leaf << "' leaf at all");
+  double leaf_seconds = 0.0;
+  for (const nlohmann::json& r : leaves) {
+    REQUIRE_FALSE(r.value("span", false));
+    REQUIRE_FALSE(r.value("nested", false));
+    leaf_seconds += r["end_seconds"].get<double>() - r["start_seconds"].get<double>();
+  }
+  REQUIRE(leaf_seconds > 0.0);
+
+  // (0) THE RECORD COUNT, and it is FIRST because it is the only one of the five
+  // that is not a ratio against `leaf_seconds`. See the note above this case:
+  // containment, coverage, exclusivity and non-overlap all measure the anchor
+  // AGAINST the leaf, so an anchor that moves WITH the leaf satisfies all four
+  // at once, and mutation M12 did exactly that — emit `denoise.step` for step 0
+  // only, close `denoise` there, open `phase.finish` over the remaining seven
+  // steps, and both cases in this file report exit 0 over a table that charges
+  // 82% of the largest phase to its neighbour.
+  //
+  // The counts come from `Ltx2ConditioningTrace`, which the RENDER maintains: an
+  // evaluation increments `dit_evaluations` inside the shared `Evaluate` lambda
+  // and the driver's own sink increments `video_decode_chunks` beside
+  // `rendered_frames`. Neither is derived from the phase table, so no placement
+  // of a phase scope can move them, and an anchor that runs a different number
+  // of times than the work it claims to wrap is caught whatever the clock did.
+  REQUIRE(c.part_counts.size() == c.parts.size());
+  for (size_t i = 0; i < c.parts.size(); ++i) {
+    const int64_t emitted =
+        static_cast<int64_t>(RecordsNamed(table, c.parts[i], c.render).size());
+    INFO("sub-scope = " << c.parts[i]);
+    CHECK_MESSAGE(emitted == c.part_counts[i],
+                  "'" << c.parts[i] << "' was emitted " << emitted << " time(s) and the render "
+                      << "did the work " << c.part_counts[i] << " time(s) (" << c.count_source
+                      << "). An anchor that does not run once per unit of work it names is not "
+                         "anchoring the name to the work — it is measuring whichever unit it "
+                         "happened to be opened around");
+  }
+
+  // (1) CONTAINMENT, and the sub-scopes' own intervals.
+  std::vector<std::pair<double, double>> subs;
+  // ...and the FIRST start of each part name, in the order `parts` lists them,
+  // which is assertion (1b) below.
+  std::vector<double> part_first;
+  // ...and each part's OWN seconds, kept separate from `subs` because `subs`
+  // collapses every part into one pool and assertion (2b) is precisely the
+  // question that pool cannot answer.
+  std::vector<double> part_seconds;
+  for (const std::string& part : c.parts) {
+    INFO("sub-scope = " << part);
+    const std::vector<nlohmann::json> found = RecordsNamed(table, part, c.render);
+    double seconds = 0.0;
+    REQUIRE_MESSAGE(!found.empty(),
+                    "the table names no '" << part << "' record. It is the anchor that ties the '"
+                        << c.leaf << "' name to the work beneath it, and without it this phase is "
+                                     "held by a share floor alone");
+    for (const nlohmann::json& r : found) {
+      // Recorded as a decomposition, not as a partition: a nested record is
+      // excluded from `sum_leaf_seconds`, which is what lets the split exist at
+      // all without changing what the table adds up to.
+      CHECK_MESSAGE(r.value("nested", false),
+                    "'" << part << "' is not marked nested, so it is being SUMMED as well as the "
+                                   "leaf that contains it, and the table double counts");
+      const double start = r["start_seconds"].get<double>();
+      const double end = r["end_seconds"].get<double>();
+      bool inside = false;
+      for (const nlohmann::json& leaf : leaves) {
+        if (start >= leaf["start_seconds"].get<double>() - 1e-9 &&
+            end <= leaf["end_seconds"].get<double>() + 1e-9) {
+          inside = true;
+        }
+      }
+      CHECK_MESSAGE(inside, "'" << part << "' runs [" << start << ", " << end << "] and NO '"
+                                << c.leaf << "' leaf encloses it. The name and the work are in "
+                                             "different places, which is the whole defect this "
+                                             "case exists for");
+      subs.push_back({start, end});
+      seconds += end - start;
+    }
+    part_seconds.push_back(seconds);
+    double first = found.front()["start_seconds"].get<double>();
+    for (const nlohmann::json& r : found) {
+      first = std::min(first, r["start_seconds"].get<double>());
+    }
+    part_first.push_back(first);
+  }
+  REQUIRE(!subs.empty());
+
+  // (1b) THE SIBLING SUB-SCOPES RUN IN THE ORDER `parts` LISTS THEM, which is
+  // the order the driver runs them in.
+  //
+  // WHY IT EXISTS, and it is the same defect assertion (6) was added for one
+  // review earlier. NOTHING ABOVE TIES A SUB-SCOPE NAME TO A POSITION: the
+  // counts are per name, containment holds for either name, `subs` is sorted by
+  // start BEFORE the overlap check, and `CheckOnlyAnchorsAreNested` is a
+  // set-membership test. So swapping the two string literals at the
+  // `decode.audio.mel` / `decode.audio.vocoder` scopes in the driver — two
+  // lines — moved 96.8% of `decode.audio`'s decomposed seconds onto the wrong
+  // name with every assertion in this file green, on a leaf that held 47.8% of
+  // that render's named leaf seconds and that #1010 asks for BY NAME. W1 would
+  // have ranked the wrong model.
+  //
+  // WHAT IT PROVES AND WHAT IT DOES NOT. It proves that the names appear in the
+  // driver's own order, so a swapped PAIR is a red. It does NOT prove that
+  // either name covers the call it is named after; that would need an anchor
+  // inside `Ltx2AudioDecoderForward` / `Ltx2VocoderWithBweForward`, which is the
+  // same shape `load.dit` is owed and is recorded beside it in the row's spec
+  // under `### Owed out of W0`. Compared on the FIRST record of each name, so a
+  // part that legitimately repeats (`decode.video.chunk`) is unaffected, and the
+  // assertion is vacuous for a leaf with a single part name.
+  //
+  // AND COMPARING FIRST RECORDS IS THE WHOLE ORDER ONLY BECAUSE THESE PARTS DO
+  // NOT INTERLEAVE. `decode.audio.mel` and `decode.audio.vocoder` emit one
+  // record each, so `first(A) <= first(B)` is exact. A future leaf with two
+  // REPEATING parts would satisfy this assertion while running `A, B, B, A, B,
+  // A` — the first pair is in order and every pair after it is not. That leaf
+  // owes a per-record pairing, and this one does not have to pay for it: the
+  // (0) count is what would make the difference visible, since `{1, 1}` is the
+  // premise the line above rests on.
+  for (size_t i = 1; i < part_first.size(); ++i) {
+    INFO("sub-scope pair = " << c.parts[i - 1] << " then " << c.parts[i]);
+    CHECK_MESSAGE(part_first[i] >= part_first[i - 1] - 1e-9,
+                  "'" << c.parts[i] << "' first runs at " << part_first[i] << " and '"
+                      << c.parts[i - 1] << "' at " << part_first[i - 1] << ", so the table "
+                      << "reports the sub-scopes of '" << c.leaf << "' in an order the driver "
+                         "does not run them in. Two SIBLING scope names that were swapped move "
+                         "their seconds onto each other and change nothing else in this file");
+  }
+
+  std::sort(subs.begin(), subs.end());
+  // The sub-scopes decompose one leaf, so they run in sequence and never overlap
+  // each other. Two that did would double count into the coverage below.
+  for (size_t i = 1; i < subs.size(); ++i) {
+    CHECK_MESSAGE(subs[i].first >= subs[i - 1].second - 1e-9,
+                  "two sub-scopes of '" << c.leaf << "' overlap: [" << subs[i - 1].first << ", "
+                      << subs[i - 1].second << "] and [" << subs[i].first << ", " << subs[i].second
+                      << "]");
+  }
+
+  // (1c) THE LEAF DOES NOT EXTEND BEYOND ITS ANCHORS, and this assertion is the
+  // one that catches what (2) below was written for -- down to its own
+  // resolution, which is stated here rather than left to be discovered.
+  //
+  // WHAT IT DOES NOT CATCH, MEASURED. At fixture scale this bounds a swallow at
+  // 30 ms per leaf record and sees nothing smaller. A mutation that opens
+  // `denoise` at the top of `phase.prepare`, so the whole prepare becomes
+  // un-named time inside the leaf, moves the span slack from 26.6 us to 124.6 us
+  // and the case stays GREEN, because `phase.prepare` is only about 125 us on
+  // this fixture. The coverage floor (2) misses it too -- it moved 0.4 points --
+  // so this is not a regression against the shape that shipped, but it IS the
+  // limit of the instrument at this geometry, and `### Owed out of W0` is where
+  // the leaf-by-leaf version lives.
+  //
+  // AND THE RESOLUTION IS NOW 30 ms RATHER THAN 0.25 ms, which is a real
+  // loss and is the price of a bound that survives a two-core contended runner.
+  // The 0.25 ms constant was inside its own honest distribution: at head
+  // 6b48edb2c, unmutated, it reddened 3 of 33 runs on a shared
+  // 20-core box and 2 of 10 under an added eight-way spin load.
+  // Nothing about the tree moved between a green run and a red one; the
+  // scheduler did. See `### The span-slack bound, fourth shape` in the row's
+  // spec for the whole distribution.
+  //
+  // MEASURED, because the previous shape of this gate was argued rather than
+  // measured and it decided by box load for two days (#1439, #1494). The
+  // un-covered seconds inside a leaf are TWO structurally different things and
+  // the old single share floor charged them to one number:
+  //
+  //   * the HEAD and TAIL -- the leaf's own seconds lying outside the span its
+  //     sub-scopes occupy. This is exactly where a leaf that opened early over a
+  //     phase nobody named, or stayed open over one, puts the whole swallow. It
+  //     is TWO instrument boundaries, so it does not grow with the render and it
+  //     does not grow with the step count.
+  //   * the INTERIOR gaps -- the time BETWEEN consecutive sub-scopes. For
+  //     `denoise` that is the sampler's per-step update, which is real work, runs
+  //     once per evaluation, and scales with the latent.
+  //
+  // The probe that separated them, run on the fixture's two renders: `denoise`
+  // is one leaf record with 8 sub-scopes, head 3.2-15.9 us and tail 19.6-102.5
+  // us, against SEVEN interior gaps of 62-67 us at nine frames and 463-549 us at
+  // 81. So 95% of the residue is interior and 5% is boundary, and the interior
+  // half is what moves with the box: `denoise` coverage measures 99.55% down to
+  // 88.85% across three boxes on an UNCHANGED tree, while head-plus-tail stays
+  // between 0.10% and 0.30% of the leaf in every one of those runs.
+  //
+  // THAT is why the 0.95 floor sat inside its own measurement and this one does
+  // not. A share floor on the SUM cannot separate "the sampler updated its state
+  // between evaluations" from "a phase nobody named is wearing this label"; the
+  // span slack can, because only the second one lands here.
+  //
+  // ONE CONSTANT PER LEAF RECORD, AND DELIBERATELY NOT A SHARE OF THE LEAF. This bound was
+  // first written `max(1 ms, 2% of the leaf)`, on the reasoning that a share is
+  // what keeps an assertion meaningful at production scale. A fresh review showed
+  // that reasoning inverts here, and the measurement agrees with the review:
+  //
+  //   * A share inside a `max` never tightens, so it is pure slack and it is
+  //     LARGEST exactly where the leaf is largest. Under load `denoise` reached
+  //     3.82 s with 38 us of slack against a 76 ms bound, and `decode.audio`
+  //     3.07 s with 39 us against 61 ms -- 500x to 2200x. At production scale a
+  //     swallowed phase of several seconds would have passed.
+  //   * The quantity does not grow with the render. It is two instrument
+  //     boundaries, and every measurement taken of it -- eight renders and four
+  //     leaves here, plus a fresh review's own runs under an eight-way spin load
+  //     where the denoise leaf ballooned to 3.82 s -- is at or under 135 us
+  //     whatever the leaf did. A constant therefore holds on all of them and is
+  //     strictly tighter than the share at every leaf size.
+  //
+  // AND IT IS CONFIGURATION-AWARE, which is the second thing a fresh review broke
+  // and the more interesting one. The flat 0.25 ms below was set from plain and
+  // spin-loaded builds only. NO measurement behind it came from a sanitizer
+  // build, and the premise "this quantity does not scale" turned out to be right
+  // about RENDER SIZE and silently wrong about BUILD CONFIGURATION. It reds on
+  // both sanitizer lanes.
+  //
+  // The reason is not a fudge and it is worth stating plainly: the slack is the
+  // cost of opening and closing a phase scope, and a sanitizer instruments
+  // exactly that path. ASan checks a shadow byte on every access in it; TSan
+  // additionally keeps per-access happens-before state and does it under a lock.
+  // A scope boundary therefore genuinely costs more in those builds -- it is a
+  // different machine, not a noisier one. Measured on this one test:
+  //
+  //   | lane | that test's wall | worst span slack observed |
+  //   |---|---|---|
+  //   | plain | 259 s | 121 us |
+  //   | `address,undefined` | 1165 s | 730 us |
+  //   | `thread` | 2116 s | 1658 us |
+  //
+  // (CI figures, which are the worst because those runners are two-core and
+  // contended. The same probe on a 20-core box read 94 us / 569 us / 895 us in
+  // the same order, so the ordering is the build and not the box.)
+  //
+  // A NORMALISED BOUND WOULD BE BETTER AND THERE IS NO NORMALISER. The old 0.95
+  // coverage floor tolerated instrumentation ACCIDENTALLY, by being a ratio of two
+  // quantities that inflate together: when TSan makes everything 8x slower both
+  // `covered` and `leaf_seconds` grow and the ratio survives. The span slack is an
+  // ABSOLUTE quantity, so the overhead lands on it undiluted -- which is the real
+  // reason "does not grow with the render" did not generalise. It does not grow
+  // with the RENDER; it grows with the INSTRUMENT.
+  //
+  // So the right question is whether some in-run reference scales the same way.
+  // Five candidates were tested over 24 observations -- four leaves x two renders
+  // x three build configurations -- and the spread of each, worst over best:
+  //
+  //   | candidate | spread | undefined |
+  //   |---|---|---|
+  //   | `slack / submin` | 78630x | 0 |
+  //   | `slack / leaf_seconds` | 4598x | 0 |
+  //   | `slack / mean sub-scope` | 2377x | 0 |
+  //   | `slack / mean interior gap` | 418x | 3 of 24 |
+  //   | **`slack` itself** | **44.6x** | 0 |
+  //
+  // EVERY RATIO IS WORSE THAN THE RAW QUANTITY, and the two most obvious ones are
+  // worse by two orders of magnitude. The gap normaliser is also undefined for a
+  // leaf with one sub-scope, which `artifacts.frames` is. Conditioned on the build
+  // instead, the raw quantity is tight: 20.1-93.6 us plain, 128-569 us under ASan,
+  // 52.1-895 us under TSan -- about 4.7x, 4.4x and 17.2x. So configuration is the
+  // variable that actually explains this quantity, and a per-configuration
+  // constant is the most stable bound available rather than a fallback.
+  //
+  // WHY NOT A SINGLE FLAT 4 ms COVERING ALL THREE: it would be ~30x slack on the
+  // plain lane, where the honest value is ~121 us and the assertion currently
+  // works, and that lane is the only one giving this file a clean signal today.
+  // Two numbers keep each lane held to its own instrument.
+  //
+  // 0.25 ms plain is ~2.1x the worst plain measurement; 3 ms under a sanitizer is
+  // ~1.8x the worst sanitizer measurement. Both are multiples of a measurement
+  // rather than numbers fitted to make a run pass. The sanitizer margin is the
+  // thinner of the two and that is disclosed rather than papered over: under TSan
+  // the instrument's own noise is within about 4x of the smallest leaf it
+  // measures, which is the honest state of this fixture at this scale.
+  //
+  // ONE BOUND PER LEAF RECORD, COMPARED AGAINST THAT RECORD ALONE. This line
+  // first shipped summing the slack of every record of the leaf and comparing the
+  // SUM against `kSpanSlackPerRecord * leaves.size()`. Both halves of that were
+  // defects, and the comment that stood here asserted the opposite of one of
+  // them (#1559):
+  //
+  //   * THE MULTIPLIER WAS READ FROM THE ARTIFACT UNDER TEST. `leaves.size()` is
+  //     whatever `RecordsNamed(table, c.leaf, c.render)` returned, guarded only
+  //     by `REQUIRE(!leaves.empty())` and tied to no independent number. A defect
+  //     that emitted one EXTRA leaf record therefore enlarged its own budget by a
+  //     whole constant. Assertion (0) counts the SUB-SCOPE records against
+  //     `Ltx2ConditioningTrace`; nothing counts the leaf's own.
+  //   * "STRICTER ON MULTI-RECORD LEAVES RATHER THAN LOOSER" WAS FALSE. A sum
+  //     against N constants lets ONE record spend the whole budget, so a swallow
+  //     concentrated in a single record of a three-record leaf got 3x the bound
+  //     it would have got alone. That looseness was load-bearing rather than
+  //     academic: under ASan `artifacts.frames` r2 measured 3.354 ms of slack
+  //     against a 6 ms bound and passed only because that leaf has two records.
+  //
+  // Checking each record against one constant removes both. It is what the
+  // failure message already claimed -- that ONE record's head and tail are
+  // bounded -- and it is strictly tighter than the sum on every leaf that has
+  // more than one record.
+  //
+  // AND THERE IS ONE CONSTANT NOW, NOT ONE PER BUILD CONFIGURATION. The third
+  // shape carried 0.25 ms plain and 3 ms under either sanitizer, on the measured
+  // ground that a sanitizer instruments the scope boundary this quantity IS. That
+  // ground is still true and it is no longer the biggest term. Within the PLAIN
+  // lane alone, on one host, one leaf record's own head-plus-tail spans 25.0 us
+  // to 10.032 ms -- 402x -- so the scheduler moves this quantity further than the
+  // sanitizer does, a second constant would have to clear the same tail anyway,
+  // and 30 ms against 33 ms is a distinction without a difference. The sanitizer
+  // lanes therefore get LOOSER here than the 3 ms they carried, which can only
+  // turn a red green; the worst sanitizer slack anybody has recorded is 3.354 ms.
+  //
+  // THE NESTED-`#if` FORM GOES WITH THE SECOND CONSTANT, and what it recorded is
+  // worth keeping, so it is kept in the row's spec and here: GCC does not define
+  // `__has_feature`, and `defined(__has_feature) && __has_feature(...)` still has
+  // to PARSE the call, which is a hard preprocessor error there. The one-line
+  // `||` form compiled on the TSan leg only because `||` short-circuits before
+  // reaching it, which is the kind of green that means nothing. Anyone
+  // reintroducing a per-configuration constant needs the nested form again.
+  const double kSpanSlackPerRecord = 0.03;  // 30 ms, every build configuration
+  // THE COVERAGE FLOOR (2) IS WHAT HOLDS A SINGLE-RECORD LEAF THE CAP BELOW
+  // SWALLOWS -- and ONLY a single-record leaf, which is the scope this line
+  // used to leave out. Where the cap binds, this bound degrades to "head plus
+  // tail is at most half the record". For a leaf of ONE record `covered >= 0.5 *
+  // leaf_seconds` says exactly that, so (2) is a genuine precondition of this
+  // assertion and the REQUIRE below keeps it available.
+  //
+  // ON A MULTI-RECORD LEAF THE HAND-OFF IS MUCH WEAKER AND THAT IS NOT HIDDEN
+  // HERE. (2) is a statement about the leaf SUM, so a short record of a long
+  // leaf draws on a budget it could never fill. Measured: `decode.video`'s
+  // reopen records are 0.019-5.66 ms inside a 0.17-1.39 s leaf whose 0.90 floor
+  // permits 17-139 ms, so a swallow that grows one of those records to just
+  // under the resolution floor -- up to 94x its honest size -- is seen by
+  // neither assertion. `### Owed out of W0` carries that escape as a ceiling
+  // rather than as the name of an assertion, and the fix for it is an anchor
+  // inside the reopen, not a wider bound.
+  REQUIRE_MESSAGE(c.min_coverage >= 0.5,
+                  "'" << c.leaf << "' carries a " << (100.0 * c.min_coverage)
+                      << "% coverage floor, under the 50% that (1c) hands its "
+                         "below-resolution records of a SINGLE-record leaf to");
+  // AND EACH RECORD'S BOUND IS CAPPED AT HALF OF THAT RECORD, WITH `min` --
+  // never `max`.
+  //
+  // The polarity is the whole point, and it is the inversion of the
+  // `max(constant, share)` an earlier review removed:
+  //
+  //   * under `max`, the share was a FLOOR, so it only ever made the bound
+  //     LOOSER, and it was loosest where the leaf was biggest -- 2200x slack on a
+  //     multi-second leaf, where a swallowed phase would have passed;
+  //   * under `min`, the share is a CEILING, so it only ever makes the bound
+  //     TIGHTER, and it makes `span_bound < record_seconds` true BY
+  //     CONSTRUCTION, which is what the REQUIRE below records rather than risks.
+  //
+  // WHERE THE CAP BINDS, THE RECORD IS BELOW THIS INSTRUMENT'S RESOLUTION, AND IT
+  // IS REPORTED RATHER THAN CHECKED. That is the one line in this block a reader
+  // should be suspicious of, so here is the whole argument.
+  //
+  // A capped bound is no longer the absolute quantity this assertion is about. It
+  // is "head plus tail is at most half of this record", which on a SINGLE-record
+  // leaf is exactly what `covered >= 0.5 * leaf_seconds` already says, and the
+  // REQUIRE above holds every leaf here to a floor of at least 0.5. So on that
+  // shape the capped arm adds nothing (2) does not already carry. On a
+  // multi-record leaf it would add something, and what is given up there is
+  // priced in the note beside the REQUIRE above rather than assumed away.
+  //
+  // AND IT IS WORSE THAN NOTHING, MEASURED. On the records where the cap binds,
+  // the honest head-plus-tail is 4.6% to 72.3% of the record's own duration
+  // (53 runs at head 6b48edb2c): `decode.video`'s reopen-after-the-last-chunk
+  // record is 19-89 us of which 8-32 us is its own two boundaries. A 50% share is
+  // inside that distribution, so the capped arm would decide by scheduler and not
+  // by tree -- the exact defect the 0.95 coverage floor had and that this whole
+  // assertion was added to replace.
+  //
+  // THE SKIP CANNOT HIDE A SWALLOW, and the direction is why. A swallowed phase
+  // makes a leaf record LONGER, never shorter, so it moves a record TOWARD the
+  // gated set and never out of it. What escapes is bounded and stated: a swallow
+  // that leaves the record under 60 ms in total. On this fixture that is
+  // `artifacts.frames` (0.90-61.0 ms over both renders) and `decode.video`'s two
+  // short reopen records (0.019-5.66 ms), and both are named in
+  // `### Owed out of W0` rather than left to be found.
+  size_t span_checked = 0;
+  size_t span_unresolvable = 0;
+  double worst_span_slack = 0.0;
+  for (size_t li = 0; li < leaves.size(); ++li) {
+    INFO("leaf record " << (li + 1) << " of " << leaves.size());
+    const double lo = leaves[li]["start_seconds"].get<double>();
+    const double hi = leaves[li]["end_seconds"].get<double>();
+    const double record_seconds = hi - lo;
+    double first_in = hi;
+    double last_in = lo;
+    bool any = false;
+    for (const std::pair<double, double>& iv : subs) {
+      if (iv.first < lo - 1e-9 || iv.second > hi + 1e-9) continue;
+      if (!any || iv.first < first_in) first_in = iv.first;
+      if (!any || iv.second > last_in) last_in = iv.second;
+      any = true;
+    }
+    // A leaf record containing NO sub-scope is entirely un-anchored, and every
+    // one of its seconds is slack. That is the honest reading and it is also the
+    // strictest one.
+    const double span_slack = any ? (first_in - lo) + (hi - last_in) : record_seconds;
+    worst_span_slack = std::max(worst_span_slack, span_slack);
+    const double span_bound = std::min(kSpanSlackPerRecord, 0.5 * record_seconds);
+    // THE BOUND MUST BE ABLE TO FAIL, and this is a REQUIRE because a check that
+    // cannot fail is worse than no check. `span_slack <= record_seconds` holds by
+    // construction above, so any bound at or above the record makes the CHECK
+    // below vacuous -- it passes at 100% slack. The 1 ms version this line first
+    // carried did exactly that on `artifacts.frames`, which measured 0.826-0.983
+    // ms at the time: ten of twelve checks reddened under a forced-strict probe
+    // and that leaf's two passed AT 100% SLACK.
+    //
+    // It is now true BY CONSTRUCTION, because the bound is capped at half the
+    // record. It is kept as a cheap invariant on the FORMULA: an edit that
+    // removes the cap, or reinstates a floor, reds here instead of silently
+    // restoring a vacuous check. A zero-length leaf record reds here too, which
+    // is the only way this line can fire today and is a defect either way.
+    REQUIRE_MESSAGE(span_bound < record_seconds,
+                    "record " << (li + 1) << " of the '" << c.leaf << "' leaf is "
+                        << record_seconds << "s, at or under the " << span_bound
+                        << "s span-slack bound, so a check against it could not fail: "
+                           "`span_slack <= record_seconds` already holds by construction");
+    if (span_bound < kSpanSlackPerRecord) {
+      ++span_unresolvable;
+      MESSAGE("  " << c.leaf << " record " << (li + 1) << " is " << record_seconds
+                   << "s, under the " << (2.0 * kSpanSlackPerRecord)
+                   << "s this bound can resolve: span slack " << span_slack << "s ("
+                   << (100.0 * span_slack / record_seconds)
+                   << "%) is NOT checked here. On a single-record leaf (2) below "
+                      "is exactly as strict; on a multi-record leaf it is a share "
+                      "of the SUM and much weaker -- see `### Owed out of W0` for "
+                      "what escapes on this leaf");
+      continue;
+    }
+    ++span_checked;
+    MESSAGE("  " << c.leaf << " record " << (li + 1) << " span slack = " << span_slack << "s of "
+                 << record_seconds << "s (" << (100.0 * span_slack / record_seconds)
+                 << "%), bound " << span_bound << "s");
+    CHECK_MESSAGE(span_slack <= span_bound,
+                  "record " << (li + 1) << " of '" << c.leaf << "' spends " << span_slack
+                      << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
+                         "occupy, over a bound of " << span_bound
+                      << "s. A leaf that opened before its work began, or stayed open after it "
+                         "ended, is carrying a phase nobody named under this one's name. This "
+                         "quantity is TWO INSTRUMENT BOUNDARIES and it does not grow with the "
+                         "render -- but it does move with the box and with the build: measured "
+                         "over one build configuration on one host it spans 402x, so read "
+                         "a red here against the run's own load before reading it as a swallowed "
+                         "phase");
+  }
+  MESSAGE("  " << c.leaf << " span slack: " << span_checked << " of " << leaves.size()
+               << " leaf record(s) checked at " << kSpanSlackPerRecord << "s, "
+               << span_unresolvable << " below this instrument's resolution; worst "
+               << worst_span_slack << "s");
+
+  // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
+  // named would satisfy containment while still hiding time.
+  //
+  // WHAT THIS NUMBER IS NOW, AND WHY IT IS NOT THE 0.95 IT WAS. It bounds the
+  // INTERIOR gaps -- the residue (1c) above cannot see -- and the interior is
+  // real work whose share of the leaf is a property of the BOX, not of the tree.
+  // The population, all on an unchanged `denoise`: 99.28%, 99.38%, 99.55% and
+  // 99.228% on the row's own box; 98.52%, 98.84%, 98.23%, 98.77% and 94.14% on a
+  // second x86 box as its load moved; 94.60%, 96.85% and 94.60% on the box #1494
+  // measured; and 92.39% and 88.85% on the GitHub runner that has to stay green.
+  // The 81-frame arm runs 85.85% to 97.09% over the same set. A 0.95 floor is
+  // therefore BELOW half of its own honest distribution, which is why `main`
+  // carried this red, and no floor near the measured share can be set without
+  // reopening it.
+  //
+  // So this floor is deliberately loose, on exactly the argument the
+  // `decode.video.vae` and `decode.audio.vocoder` floors beside it are set by:
+  // it is worth having where honest and defective separate by a wide margin, and
+  // it is not the assertion that carries this leaf. What carries it is (0), the
+  // record count taken from `Ltx2ConditioningTrace`, and (1c) above, which bounds
+  // the head and the tail of each leaf record at 30 ms where the record is
+  // long enough to resolve it. (1c) does NOT hold this leaf's short records --
+  // see the resolution note there -- so for `artifacts.frames` on the nine-frame
+  // render this floor is the only thing under the head and the tail.
+  // NOTHING WAS DELETED to get here: this number moved and an assertion was added
+  // beside it.
+  double covered = 0.0;
+  for (const std::pair<double, double>& iv : subs) covered += iv.second - iv.first;
+  MESSAGE("  " << c.leaf << " = " << leaf_seconds << "s over " << leaves.size()
+               << " leaf record(s), of which " << subs.size() << " sub-scope(s) cover " << covered
+               << "s (" << (100.0 * covered / leaf_seconds) << "%)");
+  CHECK_MESSAGE(covered >= c.min_coverage * leaf_seconds,
+                "the named parts of '" << c.leaf << "' cover only " << covered << "s of its "
+                    << leaf_seconds << "s, under the " << (100.0 * c.min_coverage)
+                    << "% this phase's anchor is expected to reach. The rest is a phase nobody "
+                       "named, wearing this one's label");
+
+  // (2b) AND EACH PART'S OWN SHARE, because (2) is checked on the SUM.
+  //
+  // WHAT IT CLOSES, and it is the fifth transfer shape this case has been shown.
+  // Assertion (2) permits ONE part to cover the whole leaf while its siblings
+  // measure nothing, and the SIBLING BOUNDARY is enough to do it: leave
+  // `decode.audio.mel` open across the vocoder call and open `decode.audio.
+  // vocoder` empty after it (mutation R1b, two lines, identical semantics and
+  // identical call order) and the vocoder — the model #1010 asks for BY NAME —
+  // reports 16 microseconds of a half-second leaf, with (0), (1b), (1), (2),
+  // (3), the `nested` invariant and the non-overlap check all green. It is the
+  // same 100% attribution transfer N1 achieves by swapping the two literals,
+  // reached without touching either literal.
+  //
+  // ONLY THE VOCODER CARRIES A FLOOR, and the mel's 0.0 is a MEASURED debt
+  // rather than an oversight. Honest, over the two renders of this case,
+  // `decode.audio.vocoder` holds 99.46% and 94.10% of its leaf (97.85%, 91.57%,
+  // 90.6% and 89.7% on earlier runs of this box); on the 21B artifact this row
+  // shipped it holds 97.0% and 99.99%. Under R1b it holds 0.00091% and 0.0035%.
+  // Between four and five orders of separation, which is the property the 0.50
+  // `decode.video.vae` floor below exploits, and why this number is 0.50 rather
+  // than tightened toward a measured share this box destroys. It also catches
+  // the NAME SWAP: under N1 the vocoder name lands on the mel's work and reads
+  // 2.76% and 7.68%, so that mutation now reds here as well as on (1b).
+  //
+  // THE MEL CANNOT HAVE ONE, AND THE REASON IS THAT THE TWO DISTRIBUTIONS
+  // OVERLAP. Honest, `decode.audio.mel` holds 0.53% and 5.90% here (2.13%,
+  // 8.43%, 9.4% and 10.3% on earlier runs) and 0.0004% to 2.9% on the artifact,
+  // because the audio VAE decode's cost RELATIVE to the vocoder is a property of
+  // the geometry. Under the MIRROR of R1b — mel emptied, the vocoder scope
+  // covering both calls — it holds 0.00063% and 0.0051%. The honest 21B render's
+  // 0.0004% is SMALLER than the mirror's 0.0051%, so no threshold separates
+  // them: any floor that reddens the mirror also reddens an honest render this
+  // row has already produced. The mirror is therefore measured, GREEN, and
+  // recorded as open in `### Owed out of W0` rather than closed by a number that
+  // cannot be justified.
+  //
+  // The two directions are not equally expensive, and that is why one is closed
+  // and one is disclosed. R1b moves the VOCODER's 90-99.99% onto the mel, which
+  // is the 100% attribution transfer that would have made W1 rank the wrong
+  // model. The mirror moves the MEL's 0.0004-10% onto the vocoder, so it
+  // overstates the name #1010 already asks for by at most the smaller share.
+  //
+  // AND IT IS A FLOOR, NOT A BAND. A partial transfer — an anchor covering half
+  // its call — passes 0.50 and is not detected here. Closing that needs a scope
+  // INSIDE the callee, which is the same debt the third row of the anchor table
+  // in `### Owed out of W0` carries for all six anchors.
+  REQUIRE(c.part_min_coverage.size() == c.parts.size());
+  REQUIRE(part_seconds.size() == c.parts.size());
+  for (size_t i = 0; i < c.parts.size(); ++i) {
+    INFO("sub-scope = " << c.parts[i]);
+    MESSAGE("    " << c.parts[i] << " = " << part_seconds[i] << "s, "
+                   << (100.0 * part_seconds[i] / leaf_seconds) << "% of " << c.leaf);
+    if (c.part_min_coverage[i] <= 0.0) continue;
+    CHECK_MESSAGE(part_seconds[i] >= c.part_min_coverage[i] * leaf_seconds,
+                  "'" << c.parts[i] << "' holds " << part_seconds[i] << "s of the "
+                      << leaf_seconds << "s its '" << c.leaf << "' leaf spent, under the "
+                      << (100.0 * c.part_min_coverage[i])
+                      << "% this name is expected to reach. A SIBLING scope that opened around "
+                         "this one's call carries its seconds under the sibling's name, and "
+                         "every other assertion in this case survives that");
+  }
+
+  // (3) EXCLUSIVITY. Nothing else may run in the window the anchor spans. This
+  // is the assertion that sees a TRANSFER directly rather than through a sum:
+  // M7 opens `phase.finish` in the middle of the denoise, and the denoise's own
+  // steps keep running around it.
+  const double window_start = subs.front().first;
+  const double window_end = subs.back().second;
+  for (const NamedInterval& iv : LeafIntervals(table, c.render)) {
+    if (iv.name == c.leaf) continue;
+    if (std::find(c.partners.begin(), c.partners.end(), iv.name) != c.partners.end()) continue;
+    // One bool, because doctest refuses to decompose a `||` inside an assertion.
+    const bool outside = iv.end <= window_start + 1e-9 || iv.start >= window_end - 1e-9;
+    CHECK_MESSAGE(outside,
+                  "the leaf '" << iv.name << "' runs [" << iv.start << ", " << iv.end
+                      << "], INSIDE the window that '" << c.leaf << "' work occupies ["
+                      << window_start << ", " << window_end
+                      << "]. Either the work is not where the name says, or a second name is "
+                         "charging itself for this phase's seconds");
+  }
+}
+
+// NOTHING BUT AN ANCHOR IS NESTED, and this is the assertion that closes the
+// GROWING direction the four above cannot see.
+//
+// A record is `nested` when it opened while another leaf was already open
+// (`render_phase_log.cpp`, `PhaseLog::Open`), and a nested record is dropped from
+// `sum_leaf_seconds`. So a carrying leaf that grows over one of its NEIGHBOURS
+// does not overlap anything and does not break any sum — the neighbour simply
+// turns nested and leaves the timeline. Mutation M11 is exactly that: move the
+// two `Close`s in the driver's chunk sink to after the PPM write and the whole
+// writer is charged to `decode.video`, which is the leaf W5's lever is measured
+// from. Containment held, coverage held at 99.68%, non-overlap held because the
+// leaves stayed disjoint, and exclusivity held because `artifacts.frames` is a
+// DECLARED PARTNER of `decode.video` and is skipped by name.
+//
+// The list is the anchors and nothing else, so the assertion needs no clock and
+// no threshold: any other name appearing nested means a leaf was left open
+// across work it does not name. The driver's own comment above the sink
+// (`ltx2_video.cpp`, "Folding the writes into `decode.video` would charge W5's
+// lever with the cost of a `write(2)`; nesting them would take the writer out of
+// the sum entirely") states both halves of this as a requirement; before this
+// line no gate held it.
+void CheckOnlyAnchorsAreNested(const nlohmann::json& table,
+                               const std::vector<std::string>& anchors) {
+  for (const nlohmann::json& e : table["phases"]) {
+    if (!e.value("nested", false)) continue;
+    const std::string name = e["name"].get<std::string>();
+    INFO("nested record = " << name);
+    CHECK_MESSAGE(std::find(anchors.begin(), anchors.end(), name) != anchors.end(),
+                  "'" << name << "' is emitted NESTED, and it is not one of this render's "
+                      "anchors. A nested record is excluded from `sum_leaf_seconds`, so a leaf "
+                      "that grew across this one moved its seconds onto itself and took it out "
+                      "of the table at the same time — with no overlap, no gap and no change to "
+                      "what the phases add up to");
+  }
+}
+
+// ...and the converse for the pair the driver INTERLEAVES. `artifacts.frames`
+// alternates with `decode.video` rather than nesting inside it, which is what
+// keeps the `write(2)` off W5's lever. Asserted over the INTERVALS as well as
+// over the `nested` flag, so a change in what the emitter means by `nested`
+// cannot quietly retire it.
+void CheckWriterIsBesideTheDecode(const nlohmann::json& table, int64_t render) {
+  const std::vector<nlohmann::json> writes = RecordsNamed(table, "artifacts.frames", render);
+  REQUIRE_MESSAGE(!writes.empty(), "the render wrote frames and named no 'artifacts.frames' leaf");
+  const std::vector<nlohmann::json> decodes = RecordsNamed(table, "decode.video", render);
+  REQUIRE(!decodes.empty());
+  for (const nlohmann::json& w : writes) {
+    const double ws = w["start_seconds"].get<double>();
+    const double we = w["end_seconds"].get<double>();
+    INFO("artifacts.frames = [" << ws << ", " << we << "]");
+    CHECK_FALSE_MESSAGE(w.value("nested", false),
+                        "the PPM writer is NESTED, so its seconds are charged to whatever leaf "
+                        "encloses it and dropped from the sum");
+    for (const nlohmann::json& d : decodes) {
+      const double ds = d["start_seconds"].get<double>();
+      const double de = d["end_seconds"].get<double>();
+      const bool outside = we <= ds + 1e-9 || ws >= de - 1e-9;
+      CHECK_MESSAGE(outside,
+                    "a 'decode.video' leaf runs [" << ds << ", " << de << "] and ENCLOSES the "
+                        << "writer at [" << ws << ", " << we << "]. W5 ranks this campaign's "
+                        << "levers off the `decode.video` number and it would be reading the "
+                        << "cost of a write(2)");
+    }
+  }
+}
+
+// THE PER-RENDER HALF OF THE CONTAINMENT CASE, for one render of the table.
+//
+// A free function because the case now runs it TWICE, and that is the repair for
+// a fourth fresh review's third finding: every decode-side count it made was 1
+// or 1+1, because the fixture renders nine frames as ONE temporal chunk. The
+// count assertion is the one that is not a ratio, and a count demonstrated only
+// at N=1 cannot tell "once per unit of work" from "once per render". The second
+// call renders 81 frames, which is the smallest request this fixture chunks (the
+// MULTI-CHUNK case above derives that number), and `min_chunks` makes a geometry
+// that silently stopped chunking a RED rather than a vacuous pass.
+//
+// `render` is the index the table's `render` field carries. It is threaded
+// through every lookup here because two renders now share one table; see
+// `RecordsNamed`.
+void CheckRenderPhases(const nlohmann::json& table,
+                       const vllm::multimodal::Ltx2ConditioningTrace& trace,
+                       const vllm::multimodal::VideoResult& result, int64_t latent_channels,
+                       int64_t render, int64_t min_chunks, double denoise_min_coverage) {
+  INFO("render = " << render);
+
+  // ── WHAT THE RENDER COUNTED, which is not what the instrument counted ──────
+  //
+  // Two numbers, both maintained by the render itself. `dit_evaluations` is
+  // incremented inside the shared `Evaluate` lambda every sampler arm goes
+  // through; `video_decode_chunks` is incremented in the driver's streaming sink
+  // beside `rendered_frames`. They are the anchors' denominators below.
+  REQUIRE(trace.completed);
+  REQUIRE(trace.dit_evaluations > 0);
+  REQUIRE(trace.video_decode_chunks > 0);
+
+  // AND THE CHUNK COUNT IS RE-DERIVED rather than taken on faith, in the shape
+  // the multi-chunk case above already uses: the tiling algebra the decoder runs
+  // is public, so the group count for this request is computable here. A counter
+  // that was incremented in the wrong place would agree with the phase table and
+  // disagree with this.
+  //
+  // EVERY INPUT COMES FROM THE FIXTURE OR FROM THE RESULT, which is the repair
+  // for the second half of the same finding. This block used to hardcode
+  // `Ltx2ScaleFactors{8, 32, 32}`, `Ltx2AutoTileSizeConfig(32, 32, ...)` and
+  // `Ltx2CreateTiles(latent_t, 1, 1, ...)` — three constants copied out of the
+  // fixture header's comment, which is a re-derivation of the algebra and not of
+  // the geometry. The factors now come from the fixture's OWN decoder block list
+  // through the same public helper the tiled decode calls, and the tile layout
+  // from the size the render reported. A fixture whose blocks changed would move
+  // both sides together before; now it moves only the engine's.
+  const vllm::Ltx2ConvVideoDecoderConfig vae_cfg =
+      ltx2_fixture::ReducedVideoDecoderConfig(latent_channels);
+  const vllm::Ltx2ScaleFactors factors =
+      vllm::Ltx2VideoScaleFactorsFromBlocks(vae_cfg.decoder_blocks, vae_cfg.patch_size);
+  const vllm::Ltx2TileSizeConfig layout =
+      vllm::Ltx2AutoTileSizeConfig(result.height, result.width, factors);
+  const int64_t latent_t = (result.frame_count - 1) / factors.time + 1;
+  const int64_t latent_h = result.height / factors.height;
+  const int64_t latent_w = result.width / factors.width;
+  REQUIRE(latent_h >= 1);
+  REQUIRE(latent_w >= 1);
+  const std::vector<vllm::Ltx2Tile> tiles =
+      vllm::Ltx2CreateTiles(latent_t, latent_h, latent_w, layout, factors);
+  const int64_t groups =
+      static_cast<int64_t>(vllm::Ltx2GroupTilesByTemporalSlice(tiles).size());
+  REQUIRE_MESSAGE(groups >= min_chunks,
+                  "this request decodes in " << groups << " temporal group(s) and this call "
+                      << "exists to exercise at least " << min_chunks
+                      << ". The counts below would be demonstrated at a chunk count the "
+                         "geometry no longer produces");
+  CHECK_MESSAGE(trace.video_decode_chunks == groups,
+                "the render counted " << trace.video_decode_chunks << " decoded chunk(s) and "
+                    << "this request's tiling produces " << groups << " temporal group(s)");
+
+  // (1)-(3) THE THREE PHASES THAT CARRY THIS RENDER, each with its anchor.
+  //
+  // The coverage thresholds are NOT round numbers and are not the same, because
+  // what each anchor can see differs:
+  //
+  //  * `decode.audio` is exactly two calls and the leaf holds nothing else, so
+  //    mel+vocoder measure 99.997%, 99.9995% and 99.995% of it across three
+  //    runs, over a leaf of 0.1 s to 1.2 s where a scheduling hiccup at a scope
+  //    boundary is noise. 0.99 is the threshold, and the 0.90 this case shipped
+  //    with was a HOLE the second review named: at 0.90 `decode.audio` could
+  //    open 11% early and swallow 0.13 s, which is 87% of this render's entire
+  //    `decode.video`, while passing everything in this file.
+  //  * `denoise.step` covers the denoiser EVALUATIONS, measured at 99.37% and
+  //    99.67% over 8 of them. The uncovered part is real work — the post-process
+  //    and the Euler or res_2s step, which no anchor wraps — PLUS two instrument
+  //    boundaries per evaluation. 0.95.
+  //
+  //    THE FALSE RED THE PREVIOUS COMMENT PREDICTED HAPPENED, AND ITS CAUSE IS
+  //    NOT THE ONE IT NAMED (#1494, and #1439 for the sibling assertion). It
+  //    reasoned that the uncovered part is 16 boundary samples whose cost is
+  //    fixed, so the ratio worsens as the hardware gets faster, put the crossing
+  //    point at a denoise leaf of about 3.1 ms, and left the number at 0.95.
+  //    `main` then carried this case RED for two days at leaves of 13.7 ms and
+  //    27.5 ms, which are four to nine times above that crossing point.
+  //
+  //    MEASURED, THE RESIDUE IS NOT BOUNDARIES. Probing the intervals over the
+  //    fixture's two renders: head 3.2-15.9 us and tail 19.6-102.5 us, against
+  //    SEVEN interior gaps of 62-67 us at nine frames and 463-549 us at 81. The
+  //    boundaries are about 5% of the residue; the other 95% is the sampler's
+  //    per-step update, which is real work, runs once per evaluation, and scales
+  //    with the latent. Its share of the leaf is a property of the BOX and not
+  //    of the tree, because a short serial stretch between two long parallel
+  //    ones is what loses to a contended scheduler. On an UNCHANGED `denoise`
+  //    the nine-frame arm measures 99.55%, 99.38%, 99.28% and 99.228% (the row's
+  //    own box), 98.84%, 98.77%, 98.52%, 98.23% and 94.14% (a second x86 box as
+  //    its load moved), 96.85%, 94.60% and 94.60% (the box #1494 measured), and
+  //    92.39% and 88.85% (the GitHub runner this lane has to stay green on). The
+  //    81-frame arm spans 97.09% down to 85.85% over the same set.
+  //
+  //    SO THE SHARE FLOOR CANNOT BE THE ASSERTION THAT CARRIES THIS LEAF. A
+  //    0.95 floor sits below half of its own honest distribution, and any floor
+  //    set near the measured share reopens the red on the next contended runner.
+  //    It is 0.75 on both arms: 10.85 points below the worst honest observation,
+  //    and worth having only where honest and defective separate widely, which
+  //    is the same argument the 0.50 floors on `decode.video.vae` and
+  //    `decode.audio.vocoder` are set by. The geometry dependence the previous
+  //    comment parameterised is real and is SMALLER than the box dependence, so
+  //    one number below both arms replaces two numbers sitting inside each.
+  //
+  //    WHAT REPLACES IT IS ASSERTION (1c), the span slack, which bounds the head
+  //    and the tail -- the only place a swallowed phase can land -- at
+  //    30 ms PER LEAF RECORD, on the records long enough to resolve it.
+  //    NO CLAIM IS MADE THAT THIS IS TIGHTER THAN 0.95 IN NUMBERS, because it is
+  //    not: 5% of a 13.7 ms leaf is 685 us. The point is a different one. The old
+  //    bound covered the head, the tail AND the interior together, while the
+  //    interior alone measured 1046 us on the runner that reported it -- so the
+  //    budget was already spent before any swallow, no honest tree could satisfy
+  //    it, and it therefore bounded nothing at all. (1c) is spent by the
+  //    boundaries alone, which do not grow with the render.
+  //
+  //    THEY DO MOVE WITH THE BOX, and the first two shapes of this bound were
+  //    calibrated as though they did not. Measured unmutated at head 6b48edb2c,
+  //    one build configuration, one host: 25.0 us to 10.032 ms on one leaf record, 402x. That is why the
+  //    constant is 30 ms and not the 0.25 ms this note used to quote, and
+  //    it is why a red here is read against the run's own load first (#1559).
+  //
+  //    NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY, which is what #1439
+  //    asks for first. A `denoise.update` scope over the sampler's per-step
+  //    update would put the interior residue under a name and make a tight share
+  //    floor honest again. That is a production scope in `ltx2_video.cpp` inside
+  //    both sampler arms, it makes `denoise` a multi-part leaf and so pulls in
+  //    (1b) and `part_min_coverage`, and it owes the phase names published in
+  //    `docs/models/ltx-2-5.md`. It stays owed rather than being folded into the
+  //    repair of a standing red, which is the same judgement #1439 and #1494
+  //    each recorded for themselves.
+  //  * `decode.video.chunk` runs from the leaf's own open to the moment the
+  //    decoder hands a chunk back, so the only uncovered part is TWO instrument
+  //    boundaries — measured 99.44% — and that is why its threshold is the
+  //    loosest of the three rather than the tightest. This leaf is 1.6 ms on
+  //    this fixture. One preemption between `Close(chunk)` and `Close(decode)`
+  //    is a millisecond, i.e. 60% of it, so a threshold set near the measured
+  //    value would be a coin flip and not a gate. 0.90 here permits 0.16 ms to
+  //    go unnamed, which is three orders of magnitude below the 0.13 s the same
+  //    0.90 permitted on the audio decode: the fraction is the same and the
+  //    stake is not, which is why these three numbers are not one number.
+  //
+  // AND EACH CARRIES ITS RECORD COUNT, which is assertion (0) and the one that
+  // is not a ratio. `denoise.step` runs once per denoiser evaluation.
+  // `decode.video.chunk` opens with the leaf and reopens after every chunk the
+  // sink is handed, so it emits one more record than there are chunks — the last
+  // one is the empty window between the final chunk and the end of the decode.
+  // The audio decode is exactly one mel pass and one vocoder pass.
+  const std::vector<Carrying> carrying = {
+      {"denoise",
+       {"denoise.step"},
+       denoise_min_coverage,
+       {},
+       {trace.dit_evaluations},
+       "Ltx2ConditioningTrace::dit_evaluations",
+       // ONE part, so (2) already IS the per-part assertion and a second copy of
+       // it would only be noise. `denoise.step`'s own placement debt is the
+       // third row of the anchor table in `### Owed out of W0`.
+       {0.0},
+       render},
+      {"decode.video",
+       {"decode.video.chunk"},
+       0.90,
+       {"artifacts.frames"},
+       {trace.video_decode_chunks + 1},
+       "Ltx2ConditioningTrace::video_decode_chunks + 1, the reopen after the last chunk",
+       // One part; and this leaf's real per-part floor is the `decode.video.vae`
+       // block below, which is a ratio between two ANCHORS rather than between an
+       // anchor and its leaf.
+       {0.0},
+       render},
+      {"decode.audio",
+       {"decode.audio.mel", "decode.audio.vocoder"},
+       0.99,
+       {},
+       {1, 1},
+       "the two calls #1010 names, once each per render",
+       // THE ONLY MULTI-PART LEAF, and therefore the only place (2b) is not
+       // vacuous. The vocoder carries 0.50 and the mel carries none; the note on
+       // `part_min_coverage` and on (2b) argues both numbers, and
+       // `### Owed out of W0` records what the mel's 0.0 leaves open.
+       {0.0, 0.50},
+       render},
+      // AND THE WRITER, which shipped with no anchor at all and is the leaf the
+      // `decode.video` number is protected by. `artifacts.frames.ppm` wraps the
+      // `WriteFileBytes` loop, so it moves with the WRITES: a mutation that
+      // empties `artifacts.frames` and leaves the `write(2)`s inside
+      // `decode.video` — the reviewer's M11, which reported four microseconds
+      // for nine PPM files — no longer has a leaf that contains this record.
+      //
+      // 0.50 is the threshold and it is loose ON PURPOSE. This leaf is about
+      // 0.2 ms on the fixture and holds nine scope boundaries of its own, so the
+      // uncovered part is instrument cost against a sub-millisecond leaf, which
+      // is the regime the `decode.video` note above already explains.
+      //
+      // WHAT BINDS HERE IS THE COUNT AND THE FACT THAT THE WRITER IS NOT
+      // NESTED, and this note used to say "the containment and the count", which
+      // a fourth fresh review showed is false. A count of one plus containment
+      // permits this leaf to be TWICE its anchor and still pass: the leaf may
+      // grow over any adjacent time nobody named, up to its coverage slack. It
+      // is harmless on this fixture only because nothing adjacent to the writer
+      // is stealable — `decode.video` is a declared partner that the `nested`
+      // assertion and `CheckWriterIsBesideTheDecode` both hold — and that is a
+      // property of the fixture rather than of this threshold.
+      {"artifacts.frames",
+       {"artifacts.frames.ppm"},
+       0.50,
+       {"decode.video"},
+       {trace.video_decode_chunks},
+       "Ltx2ConditioningTrace::video_decode_chunks, one write callback per chunk",
+       // One part, so (2) already is it.
+       {0.0},
+       render},
+  };
+  for (const Carrying& c : carrying) CheckCarryingPhase(table, c);
+
+  // (3b) THE VAE'S OWN SUB-SCOPE, which is where the video decode spends its
+  // seconds and the reason `decode.video.chunk` is not the whole answer.
+  //
+  // `decode.video.chunk` opens two statements after `Open("decode.video")` and
+  // closes one statement before `Close("decode.video")`, so containment and
+  // coverage over it hold BY CONSTRUCTION and cannot constrain the leaf in the
+  // growing direction — which is what M11 exploited. `decode.video.vae` is
+  // opened inside `Ltx2ConvVideoDecodeTiled` around `AccumulateTemporalGroup`,
+  // i.e. around the tile decode itself, so both of its ends are production
+  // events. One record per temporal group, which is one per chunk, and each one
+  // inside the chunk window that produced it.
+  //
+  // AND IT HAS A COVERAGE FLOOR, which is the repair for a fourth fresh review's
+  // second finding. Until this line the vae anchor was checked for cardinality,
+  // for `nested` and for containment in a chunk window, and its DURATION was
+  // compared against nothing: `Carrying{"decode.video", ...}` lists only
+  // `decode.video.chunk` in `parts`, so the vae contributed ZERO to any
+  // coverage. Moving the scope off `AccumulateTemporalGroup` and onto the
+  // `buffer.Allocate` beside it — seven lines — left the table reporting
+  // `decode.video.vae = 0.000 s` beside a five-millisecond `decode.video`, with
+  // the tile decode inside no sub-scope at all, and both cases in this file
+  // green. The claim that this leaf "finally has a sub-scope whose ends are both
+  // production events" was true of the source and unheld by the gate.
+  //
+  // THE DENOMINATOR IS `decode.video.chunk`, not the leaf, AND THE REOPEN IS NOT
+  // THE REASON. This note used to say the chunk windows are the tightest
+  // denominator available "without a second threshold for the reopen", which
+  // claims more than the numbers do. The reopen — the empty window between the
+  // final chunk and the end of the decode — is itself a `decode.video.chunk`
+  // record, so it sits inside BOTH candidate denominators and separates neither.
+  // Measured on the head this lands at, render 1: the leaf is 0.191059 s against
+  // 0.191044 s of chunk, a 0.0079% difference that is two scope boundaries;
+  // render 2: 0.408779 s against 0.408758 s, 0.0051%. An earlier run of the same
+  // binary at the same geometry read 1.06% and 0.39%, because the boundary cost
+  // is fixed while the leaf is not — which is the box, not the structure. Either
+  // way the two denominators are within about a percent of each other and the
+  // LEAF is the marginally stricter of the two, so nothing is loosened by this
+  // choice.
+  //
+  // The chunk is used because it is the same window the containment assertion
+  // below encloses each vae record IN, which keeps this ratio between two
+  // quantities at one granularity rather than comparing a per-group anchor
+  // against a whole-decode leaf. Measured at 91.1%, 93.6%, 97.4%, 98.2%, 98.5% and 98.6% of
+  // the chunk seconds across six renders here — the low end is the nine-frame
+  // render, whose single chunk is about a millisecond. The floor is 0.50
+  // because what is NOT covered is the per-group
+  // allocation, the overlap blend and the emit — real work whose share of a
+  // chunk grows as the tile shrinks — plus two instrument boundaries per group
+  // against a chunk of about a millisecond on this fixture. It is a floor on
+  // "the tile decode is where this leaf's seconds are", not on the fraction.
+  {
+    const std::vector<nlohmann::json> vae = RecordsNamed(table, "decode.video.vae", render);
+    CHECK_MESSAGE(static_cast<int64_t>(vae.size()) == trace.video_decode_chunks,
+                  "the tiled decode emitted " << vae.size() << " 'decode.video.vae' record(s) "
+                      << "against " << trace.video_decode_chunks << " chunk(s) the render "
+                      << "counted");
+    const std::vector<nlohmann::json> chunks = RecordsNamed(table, "decode.video.chunk", render);
+    double vae_seconds = 0.0;
+    double chunk_seconds = 0.0;
+    for (const nlohmann::json& ch : chunks) {
+      chunk_seconds += ch["end_seconds"].get<double>() - ch["start_seconds"].get<double>();
+    }
+    for (const nlohmann::json& v : vae) {
+      CHECK_MESSAGE(v.value("nested", false),
+                    "'decode.video.vae' is not marked nested, so the tile decode is being SUMMED "
+                    "as well as the leaf that contains it");
+      const double vs = v["start_seconds"].get<double>();
+      const double ve = v["end_seconds"].get<double>();
+      vae_seconds += ve - vs;
+      bool inside = false;
+      for (const nlohmann::json& ch : chunks) {
+        if (vs >= ch["start_seconds"].get<double>() - 1e-9 &&
+            ve <= ch["end_seconds"].get<double>() + 1e-9) {
+          inside = true;
+        }
+      }
+      CHECK_MESSAGE(inside, "a 'decode.video.vae' record runs [" << vs << ", " << ve
+                                << "] and no 'decode.video.chunk' window encloses it");
+    }
+    REQUIRE(chunk_seconds > 0.0);
+    const double kVaeMinCoverage = 0.50;
+    MESSAGE("  decode.video.vae = " << vae_seconds << "s over " << vae.size()
+                                    << " record(s), of " << chunk_seconds
+                                    << "s of decode.video.chunk ("
+                                    << (100.0 * vae_seconds / chunk_seconds) << "%)");
+    CHECK_MESSAGE(vae_seconds >= kVaeMinCoverage * chunk_seconds,
+                  "'decode.video.vae' covers " << vae_seconds << "s of the " << chunk_seconds
+                      << "s this render spent inside 'decode.video.chunk', under the "
+                      << (100.0 * kVaeMinCoverage)
+                      << "% the tile decode is expected to reach. The anchor is somewhere the "
+                         "work is not, and the leaf W5 ranks its levers from is held by a "
+                         "cardinality alone");
+  }
+
+  CheckWriterIsBesideTheDecode(table, render);
+
+  // (5) AND THE CARRYING LEAVES DO NOT OVERLAP. `decode.video` and
+  // `artifacts.frames` ALTERNATE, because the decoder streams chunks into the
+  // writer's callback; `decode.audio` follows both; `denoise` precedes all of
+  // them and is in this list because the review found it was in NO list — the
+  // loop that shipped covered the decode and the writer and left the largest
+  // phase of the render out of it. Any overlap would mean a leaf was left open
+  // across work it does not name, and it would double count into
+  // `sum_leaf_seconds`.
+  std::vector<std::pair<double, double>> spans;
+  for (const std::string name :
+       {"denoise", "decode.video", "artifacts.frames", "decode.audio"}) {
+    for (const nlohmann::json& r : RecordsNamed(table, name, render)) {
+      spans.push_back({r["start_seconds"].get<double>(), r["end_seconds"].get<double>()});
+    }
+  }
+  std::sort(spans.begin(), spans.end());
+  for (size_t i = 1; i < spans.size(); ++i) {
+    CHECK_MESSAGE(spans[i].first >= spans[i - 1].second - 1e-9,
+                  "two of the carrying/writer leaves overlap: [" << spans[i - 1].first << ", "
+                      << spans[i - 1].second << "] and [" << spans[i].first << ", "
+                      << spans[i].second << "]");
+  }
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: the three carrying phases contain their work and the load keeps its order") {
+  Workspace ws;
+  // `max_phase = 0` is a LOAD extra and is what keeps this on one recipe phase:
+  // the default `distilled_two_stage` kind would need the latent spatial
+  // upsampler for its second phase and refuse without one.
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  vllm::multimodal::Ltx2VideoEngine* ltx2 =
+      dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  // The fixture writes its video VAE from `ReducedVideoDecoderConfig(dit.in_channels)`
+  // (`ltx2_video_fixture.h`), and `CheckRenderPhases` re-derives the tiling from
+  // that same config rather than from constants.
+  const int64_t latent_channels = ltx2->dit_params().in_channels;
+
+  // ── RENDER 1: the nine-frame fixture, which decodes in ONE temporal chunk ──
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(FixtureGen(ws.root + "/attribution"));
+  REQUIRE(result.frame_count == 9);
+  REQUIRE_MESSAGE(!result.phase_log_path.empty(), "the render wrote no phase table");
+  const nlohmann::json first = nlohmann::json::parse(ReadAll(result.phase_log_path));
+  const int64_t render_one = LastRender(first);
+  REQUIRE(render_one > 0);
+  // TAKEN BEFORE THE SECOND GENERATION OVERWRITES IT: `im.trace` is reset on
+  // every `Generate`, which is half of why the counts here need a render filter.
+  const vllm::multimodal::Ltx2ConditioningTrace trace_one = ltx2->last_conditioning();
+  CheckRenderPhases(first, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
+                    /*denoise_min_coverage=*/0.75);
+
+  // ── RENDER 2: 81 frames, which CHUNKS, and every count above is checked at
+  // N > 1 ───────────────────────────────────────────────────────────────────
+  //
+  // WHY A SECOND RENDER. Every decode-side count in the first one is 1 or 1+1 —
+  // `video_decode_chunks == 1`, `decode.video.chunk == 2`, `artifacts.frames.ppm
+  // == 1`, `decode.video.vae == 1` — and the re-derivation is `1 == 1`. A count
+  // demonstrated only at one cannot tell "once per unit of work" from "once per
+  // render", which is exactly the distinction assertion (0) exists to make. 81
+  // frames is the smallest request this fixture chunks; the MULTI-CHUNK case
+  // above derives that number and asserts it, and `min_chunks` below makes a
+  // geometry that stopped chunking a red rather than a quiet regression to N=1.
+  //
+  // AND IT IS WHAT MAKES THE `render` FILTER LOAD-BEARING. `PhaseLog` resets at
+  // LOAD, so this second table holds the load AND both renders. Every count
+  // below is per render and would otherwise be the sum of two.
+  vllm::multimodal::VideoGenParams multi = FixtureGen(ws.root + "/attribution_multichunk");
+  multi.num_frames = 81;
+  const vllm::multimodal::VideoResult multi_result = engine->Generate(multi);
+  REQUIRE(multi_result.frame_count == 81);
+  REQUIRE_MESSAGE(!multi_result.phase_log_path.empty(), "the render wrote no phase table");
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(multi_result.phase_log_path));
+  const int64_t render_two = LastRender(table);
+  CHECK_MESSAGE(render_two == render_one + 1,
+                "the second generation carries render index " << render_two << " and the first "
+                    << render_one << "; the table's `render` field is not the per-generation "
+                                     "slice the counts below are taken over");
+  CheckRenderPhases(table, ltx2->last_conditioning(), multi_result, latent_channels, render_two,
+                    /*min_chunks=*/2, /*denoise_min_coverage=*/0.75);
+
+  // ...and the FIRST render's records are still in the second render's table and
+  // still hold, which is what says the filter above selects rather than hides.
+  CheckRenderPhases(table, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
+                    /*denoise_min_coverage=*/0.75);
+
+  // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
+  // swallow a NEIGHBOUR, which the four above cannot: see the note on
+  // `CheckOnlyAnchorsAreNested`.
+  CheckOnlyAnchorsAreNested(table, {"denoise.step", "decode.video.chunk", "decode.video.vae",
+                                    "decode.audio.mel", "decode.audio.vocoder",
+                                    "artifacts.frames.ppm"});
+
+  // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the
+  // note above this case for why it is not tightened toward the measured share.
+  const std::map<std::string, double> leaves = LeafSecondsByName(table);
+  double leaf_total = 0.0;
+  for (const std::pair<const std::string, double>& kv : leaves) leaf_total += kv.second;
+  REQUIRE(leaf_total > 0.0);
+  const double kFloor = 0.0005;
+  for (const std::string required : {"denoise", "decode.audio", "decode.video"}) {
+    INFO("phase = " << required);
+    REQUIRE(leaves.count(required) == 1);
+    const double share = leaves.at(required) / leaf_total;
+    MESSAGE("  " << required << " = " << leaves.at(required) << "s, " << (100.0 * share)
+                 << "% of " << leaf_total << "s of leaves");
+    CHECK_MESSAGE(share >= kFloor,
+                  "'" << required << "' holds " << (100.0 * share) << "% of this render's named "
+                      << "leaf seconds, under the " << (100.0 * kFloor)
+                      << "% floor. A phase that carries a render and measures nothing is a name "
+                         "with the work somewhere else");
+  }
+
+  // (6) THE LOAD LEAVES SIT IN THE DRIVER'S OWN ORDER, and this is the weakest
+  // assertion in the case as well as the only one the load has.
+  //
+  // WHY IT EXISTS. The three assertions above cover the three phases that carry
+  // a RENDER. They say nothing about the six the LOAD is made of, and a third
+  // fresh review showed what that costs: swap the `load.dit` and
+  // `load.prompt_embeds` scope NAMES in the driver — two lines — and every gate
+  // in this file stays green while 96% of the load's seconds move onto the wrong
+  // name. On the shipped 21B that name holds about seven and a half minutes of
+  // DiT staging, and it is the phase W2 and W3 both act on.
+  //
+  // WHY IT IS ONLY AN ORDER. An anchor for `load.dit` would have to open inside
+  // `Ltx2LoadDitFromSafetensors` / `Ltx2StreamDitToDevice`
+  // (`ltx2_loader.cpp`), which this stage's authority does not reach; the driver
+  // has exactly one statement between the scope's open and its close, so a
+  // sub-scope placed HERE would be the adjacent-statement anchor whose
+  // circularity M11 and M12 already demonstrated. The order is what remains
+  // checkable from the table alone: the driver loads the DiT, then the video
+  // VAE, then the audio VAE, then the upsampler, then the text encoder, then the
+  // prompt embeds, and a swapped pair of names shows up here as a swapped pair
+  // of start times. What is still NOT proven is that each of these names covers
+  // the work it is named after; `### Owed out of W0` in the row's spec lists
+  // every leaf in that state, and W2 and W3 must read it before they act on
+  // `load.dit`.
+  {
+    const std::vector<std::string> load_order = {"load.dit",       "load.video_vae",
+                                                 "load.audio_vae", "load.upsampler",
+                                                 "load.text_encoder", "load.prompt_embeds"};
+    double previous = -1.0;
+    std::string previous_name;
+    int64_t seen = 0;
+    for (const std::string& name : load_order) {
+      const std::vector<nlohmann::json> found = RecordsNamed(table, name, 0);
+      // A load phase that did not run emits nothing; this fixture carries no
+      // upsampler and no text encoder.
+      if (found.empty()) continue;
+      CHECK_MESSAGE(found.size() == 1u,
+                    "'" << name << "' was emitted " << found.size()
+                        << " times and the driver opens it once per load");
+      const double start = found.front()["start_seconds"].get<double>();
+      CHECK_MESSAGE(start >= previous,
+                    "'" << name << "' starts at " << start << " and '" << previous_name
+                        << "' starts at " << previous << ", so the table reports the load in an "
+                           "order the driver does not run it in. Two scope names that were "
+                           "swapped move their seconds onto each other and change nothing else "
+                           "in this file");
+      previous = start;
+      previous_name = name;
+      ++seen;
+    }
+    REQUIRE_MESSAGE(seen >= 4, "this fixture load names only " << seen
+                                   << " load phases; the order it checks is vacuous");
+  }
+}
+
+// ─── the CONSOLE copy is not a passenger of the FILE write ──────────────
+//
+// `VLLM_RENDER_PHASE_LOG_STDERR=1` exists for exactly one situation: a render
+// whose table cannot reach a file. An unwritable `--output-dir`, a read-only
+// mount, a full disk. If the console block is emitted only after the file write
+// has already succeeded, the lane is silent in the one case it was added for,
+// and `docs/ENVIRONMENT.md`'s "also prints" describes something the code does
+// not do. This case pins the ORDER rather than the text: the block reaches the
+// real fd 2, and `WriteJson` still reports the IO failure by name instead of
+// letting the console copy launder an error into a success.
+//
+// Real fd 2 by `dup`/`dup2`, not a test-only sink, for the reason the live
+// progress lane gives: a sink is a seam that can be armed in the test and absent
+// in production.
+TEST_CASE("ltx2 phase log: the stderr copy is emitted when the FILE write FAILS") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+  { phase::Scope denoise("denoise"); }
+  { phase::Scope decode("decode.video"); }
+
+  // A directory nobody created, so the `ofstream` is not `good()` at open. The
+  // precondition is asserted rather than assumed — a path that happened to exist
+  // would turn this case into a test of the success path.
+  const char* kMissingDir = "/vllm-cpp-no-such-directory-1010";
+  struct stat missing {};
+  REQUIRE(::stat(kMissingDir, &missing) != 0);
+  const std::string path = std::string(kMissingDir) + "/phase-log.json";
+
+  const char* prev = std::getenv("VLLM_RENDER_PHASE_LOG_STDERR");
+  const std::string saved_env = prev == nullptr ? std::string() : std::string(prev);
+  ::setenv("VLLM_RENDER_PHASE_LOG_STDERR", "1", 1);
+
+  char tmpl[] = "/tmp/vllm_phase_stderr_XXXXXX";
+  const int sink = ::mkstemp(tmpl);
+  REQUIRE(sink >= 0);
+  std::fflush(stderr);
+  const int saved_fd = ::dup(2);
+  REQUIRE(saved_fd >= 0);
+  REQUIRE(::dup2(sink, 2) >= 0);
+
+  std::string why;
+  const bool ok = log.WriteJson(path, "ltx2-video", "cpu", &why);
+
+  std::fflush(stderr);
+  ::dup2(saved_fd, 2);
+  ::close(saved_fd);
+  ::close(sink);
+
+  if (prev == nullptr) {
+    ::unsetenv("VLLM_RENDER_PHASE_LOG_STDERR");
+  } else {
+    ::setenv("VLLM_RENDER_PHASE_LOG_STDERR", saved_env.c_str(), 1);
+  }
+
+  std::ifstream in(tmpl, std::ios::binary);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string captured = buf.str();
+  in.close();
+  ::unlink(tmpl);
+
+  // The console copy never converts an IO error into a success.
+  CHECK_FALSE(ok);
+  CHECK(why.find("cannot open") != std::string::npos);
+
+  MESSAGE("captured " << captured.size() << " bytes of stderr on a FAILED file write");
+  REQUIRE_MESSAGE(!captured.empty(),
+                  "VLLM_RENDER_PHASE_LOG_STDERR printed nothing when the file write failed, "
+                  "which is the one case the lane exists for");
+  CHECK(captured.find("denoise") != std::string::npos);
+  CHECK(captured.find("decode.video") != std::string::npos);
+  log.Reset();
+}
+
+// ─── F10: the sampler STOPS when the last scope closes ───────────────────────
+//
+// THE FIRST UNIT CASE THIS INSTRUMENT HAS. Every other gate in this file reaches
+// `PhaseLog` through a complete render, which costs about 40 s and cannot see a
+// thread that is still running after the render ended. The row's spec said F10
+// was ungated because "F10 is an absence — a thread that keeps running — which
+// no assertion in this suite is positioned to observe". A fresh review refuted
+// that in twelve lines, and this is those twelve lines: the sample COUNT is
+// public (`PhaseLog::Samples()`), the worker increments it every 100 ms, and a
+// worker that outlived its timeline therefore moves a number a test can read.
+// No injected scheduler, no timing threshold that contention can cross — an idle
+// process either takes samples or it does not.
+//
+// F10 itself is `render_phase_log.cpp`'s last `Close`: when nothing is live any
+// more it takes the worker and joins it. Before the repair, only `Reset()` and
+// the destructor ever stopped the thread, so a SERVER that rendered one clip
+// kept a `/proc/self/statm` read under the process-wide mutex for the rest of
+// its life and folded that idle time into the next table's sample count.
+TEST_CASE("ltx2 phase log: the last Close stops the sampler") {
+  using vllm::multimodal::phase::PhaseLog;
+  PhaseLog& log = PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+  const int64_t before = log.Samples();
+  {
+    const vllm::multimodal::phase::Scope work("f10.probe");
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  const int64_t at_close = log.Samples();
+  // THE INSTRUMENT'S OWN PRECONDITION. With `VLLM_RENDER_PHASE_SAMPLER=0` no
+  // worker is ever started, and "the count did not move" would then be true for
+  // the wrong reason — a mute switch wearing a pass. 250 ms at a 100 ms period
+  // is at least one tick on top of the Open and Close samples.
+  REQUIRE_MESSAGE(at_close - before >= 3,
+                  "the sampler took " << (at_close - before) << " samples across a 250 ms scope, "
+                      "so it was not running and this case cannot observe whether it STOPS. Is "
+                      "VLLM_RENDER_PHASE_SAMPLER=0 set?");
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  const int64_t idle = log.Samples();
+  CHECK_MESSAGE(idle == at_close,
+                "the sample count moved by " << (idle - at_close)
+                    << " over 600 ms in which NOTHING was open, so the 100 ms sampler outlived "
+                       "the timeline that started it. A process that renders once then serves "
+                       "keeps that read under the process-wide mutex for life, and the next "
+                       "render's table inherits the idle samples");
+  log.Reset();
+}
+
+// ─── W0-live: the lane that runs WHILE the render is alive (issue #1413) ─────
+//
+// WHAT THIS GATES, and why the table above does not already gate it. That case
+// reads `phase-log.json`, which `Ltx2VideoEngine::Generate` writes after
+// `im.trace.completed = true` — the SUCCESS PATH ONLY. A render that is killed,
+// aborted by a lease governor, or still running writes no table at all, and that
+// is the population this campaign actually has: #1375 is `ABORT[92] PROJECTED
+// OVERRUN` / `child exit=-15` / 0 frames, and `ltx25-decode-speed.md`'s two
+// rungs are `EXIT=137` / 0 frames and `EXIT=1` / 0 frames. An instrument that
+// reports on completion reported on none of them.
+//
+// So the deliverable here is different in kind: a line emitted AS EACH PHASE
+// STARTS, so that the last line printed names the phase that is currently
+// running. That is the whole difference between a working render and a hung one,
+// which were byte-identical from outside for 2.5 hours at a time, and it is the
+// difference a close-only emitter would still not make — the 3002 s conditioning
+// stretch never closed.
+//
+// AND IT CAPTURES REAL STDERR, with `dup`/`dup2`, rather than installing a
+// test-only sink. A sink would be a seam that could be armed here and absent in
+// production, which is the exact defect class `.agents/reachability.md` is
+// about; what is asserted below is what a user sees on the shipped default with
+// nothing set.
+//
+// THE NON-VACUOUS HALF is the strictly-increasing forward index. An emitter that
+// printed a constant `dit forward 1` would satisfy "the marker appears" and would
+// report nothing — which is what the spike's external sampler did, and why
+// #1375's `dit_runs=0` is not evidence of absence. The count has to MOVE.
+//
+// Nothing between the redirect and its restore may assert: a doctest `REQUIRE`
+// that aborted the case in there would leave the process with stderr pointed at
+// a temporary file for every case that follows.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 video: a render through the ABI PRINTS its progress while it runs") {
+  Workspace ws;
+  const std::string audio_embeds = ws.paths.audio_embeds;
+  const std::string max_phase = "0";
+  // The CHECKPOINT CLASS rides the ABI like every other load extra (row
+  // LTX25-CHECKPOINT-CLASS, #1137). No kind is declared here, so the recipe is
+  // `distilled_two_stage`, whose upstream row is `Distilled only`.
+  const std::string checkpoint_class = FixtureCheckpointClass("distilled_two_stage");
+  const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
+                        vllm::multimodal::kLtx2MaxPhaseExtra,
+                        vllm::multimodal::kLtx2CheckpointClassExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str(), checkpoint_class.c_str()};
+
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = ws.paths.dit.c_str();
+  mp.video_vae_path = ws.paths.video_vae.c_str();
+  mp.audio_vae_path = ws.paths.audio_vae.c_str();
+  mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
+  mp.extra_keys = keys;
+  mp.extra_values = values;
+  mp.n_extras = 3;
+  mp.device = 0;
+
+  const std::string out_dir = ws.root + "/progress_out";
+  vllm_video_params gen = vllm_video_params_default();
+  gen.width = 64;
+  gen.height = 64;
+  gen.num_frames = 9;
+  gen.seed = 7;
+  gen.has_seed = 1;
+  gen.output_dir = out_dir.c_str();
+
+  vllm_video_engine* engine = nullptr;
+  vllm_video_result result;
+  std::memset(&result, 0, sizeof(result));
+  vllm_status loaded = VLLM_OK;
+  vllm_status generated = VLLM_OK;
+  std::string engine_error;
+  std::string captured;
+
+  // The LOAD is inside the capture as well as the generation: the timeline
+  // starts at the load because the DiT staging is minutes at 22B, and a lane
+  // that only spoke after the load would be silent for the phase #1021 is about.
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    loaded = vllm_video_engine_load(&mp, &engine);
+    if (loaded == VLLM_OK && engine != nullptr) {
+      generated = vllm_video_generate(engine, &gen, &result);
+    }
+    if (vllm_last_error() != nullptr) engine_error = vllm_last_error();
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+
+  INFO(engine_error);
+  REQUIRE(loaded == VLLM_OK);
+  REQUIRE(engine != nullptr);
+  REQUIRE(generated == VLLM_OK);
+
+  // ── the lines ────────────────────────────────────────────────────────────
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  MESSAGE("captured " << lines.size() << " [render] lines of " << captured.size()
+                      << " bytes of stderr");
+  REQUIRE_MESSAGE(!lines.empty(),
+                  "the render printed NOTHING while it ran; a working render and a hung one "
+                  "are still the same observation (#1413)");
+
+  // Every line carries the elapsed clock, and it never goes backwards. A `t=`
+  // that reset would mean two timelines interleaved in one capture.
+  double previous_t = -1.0;
+  for (const std::string& line : lines) {
+    INFO(line);
+    const size_t at = line.find(" t=");
+    REQUIRE_MESSAGE(at != std::string::npos, "a progress line carries no elapsed clock");
+    const double t = std::atof(line.c_str() + at + 3);
+    CHECK(t >= previous_t);
+    previous_t = t;
+  }
+
+  // ── the boundaries, opened AND closed ────────────────────────────────────
+  //
+  // The OPEN marker is the one that matters and it is asserted by name: a close
+  // marker alone names only phases that finished, and every render this row
+  // exists for stopped inside a phase that never did.
+  auto index_of = [&lines](const std::string& needle) -> long {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+    }
+    return -1;
+  };
+  // MATCH THE WHOLE NAME FIELD, NOT A PREFIX OF IT. The emitter writes the name
+  // with `%-24s`, so every phase shorter than 24 characters is followed by at
+  // least one space, and `"- denoise "` cannot match `- denoise.step`. Written as
+  // a helper because a prefix match here is not a stylistic point: W0's anchor
+  // scopes added `denoise.step` and `decode.video.chunk` beneath the two leaves
+  // this case asserts against, and a bare `find("- denoise")` then resolved to
+  // the FIRST sub-scope close, several lines before the forwards it was supposed
+  // to bracket. The case failed on seven true statements about the wrong line.
+  auto phase_line = [&index_of](const char* sign, const std::string& name) -> long {
+    return index_of(std::string(sign) + " " + name + " ");
+  };
+  for (const std::string name : {"load.dit", "denoise", "decode.video", "artifacts.frames"}) {
+    // `std::string`, never `const char*`: doctest stringifies a streamed `char*`
+    // as a BOOL, so a failure here would have printed "no '1' line".
+    CHECK_MESSAGE(phase_line("+", name) >= 0, "no OPEN line for phase '" << name << "'");
+    CHECK_MESSAGE(phase_line("-", name) >= 0, "no CLOSE line for phase '" << name << "'");
+    CHECK_MESSAGE(phase_line("-", name) > phase_line("+", name),
+                  "phase '" << name << "' closed before it opened");
+  }
+
+  // A close line reports what the phase cost, which is the number a reader takes
+  // off a killed run's log without waiting for a table that will never be
+  // written.
+  const long dit_close = phase_line("-", "load.dit");
+  REQUIRE(dit_close >= 0);
+  CHECK_MESSAGE(lines[static_cast<size_t>(dit_close)].find(" dur=") != std::string::npos,
+                "a phase closed without saying what it cost: "
+                    << lines[static_cast<size_t>(dit_close)]);
+
+  // ── the per-forward counter, and the proof that it MOVES ─────────────────
+  std::vector<long> forward_indices;
+  std::vector<size_t> forward_lines;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const size_t at = lines[i].find("dit forward ");
+    if (at == std::string::npos) continue;
+    forward_indices.push_back(std::atol(lines[i].c_str() + at + 12));
+    forward_lines.push_back(i);
+  }
+  REQUIRE_MESSAGE(forward_indices.size() >= 2,
+                  "the denoise loop printed " << forward_indices.size()
+                                              << " forward lines; #1375 measures ~162 s per "
+                                                 "forward and 60 of them is structural, so a "
+                                                 "loop that prints once is a loop that hangs");
+  for (size_t i = 1; i < forward_indices.size(); ++i) {
+    INFO(lines[forward_lines[i]]);
+    CHECK_MESSAGE(forward_indices[i] > forward_indices[i - 1],
+                  "the forward counter did not move: " << forward_indices[i - 1] << " then "
+                                                       << forward_indices[i]);
+    // `last=` is the per-forward cost #1375 could only get as a wall-clock
+    // interval between GPU busy/idle edges. Absent on the first tick by
+    // construction, required on every one after it.
+    CHECK_MESSAGE(lines[forward_lines[i]].find(" last=") != std::string::npos,
+                  "a forward tick carries no per-forward cost: " << lines[forward_lines[i]]);
+  }
+  // The sampler step, as a FRACTION. Without the denominator a reader knows the
+  // render moved and not whether it is a tenth or nine tenths of the way.
+  //
+  // Two statements rather than one `&&`: doctest's expression decomposer
+  // static-asserts "Expression Too Complex Please Rewrite As Binary Comparison"
+  // on a conjunction, so the compound form does not build — and a mutation that
+  // fails to build reads exactly like a passing test.
+  const std::string first_tick = lines[forward_lines[0]];
+  CHECK_MESSAGE(first_tick.find(" step ") != std::string::npos,
+                "a forward tick names no sampler step: " << first_tick);
+  CHECK_MESSAGE(first_tick.find("/") != std::string::npos,
+                "the sampler step carries no /N denominator, so a reader knows the render "
+                "moved and not whether it is a tenth or nine tenths of the way: "
+                    << first_tick);
+
+  // ── the ticks are INSIDE the phase they claim ────────────────────────────
+  const long denoise_open = phase_line("+", "denoise");
+  const long denoise_close = phase_line("-", "denoise");
+  REQUIRE(denoise_open >= 0);
+  REQUIRE(denoise_close >= 0);
+  for (size_t i = 0; i < forward_lines.size(); ++i) {
+    const long at = static_cast<long>(forward_lines[i]);
+    // Two comparisons, never one `&&`: doctest static-asserts on a conjunction.
+    CHECK_MESSAGE(at > denoise_open,
+                  "a DiT forward tick was printed BEFORE the denoise phase opened: "
+                      << lines[forward_lines[i]]);
+    CHECK_MESSAGE(at < denoise_close,
+                  "a DiT forward tick was printed AFTER the denoise phase closed: "
+                      << lines[forward_lines[i]]);
+  }
+
+  vllm_video_result_free(&result);
+  vllm_video_engine_free(engine);
+}
+#endif  // !_WIN32
+
+// ─── the tick's OWN contract: emitted at the call, not at the return ────────
+//
+// WHY THIS CASE EXISTS. The case above renders through the ABI and asserts that
+// the ticks appear, that the counter moves and that they sit inside `denoise`.
+// It cannot see the decision the design rests on. On a render that COMPLETES,
+// calling `Tick` before the forward and calling it after produce the same lines,
+// the same intervals and the same ordering against the phase boundaries — moving
+// the production call below the forward leaves that case green. The two
+// placements differ only on a run that dies mid-unit, and no gate here can stage
+// a `SIGKILL` inside `Ltx2DitForwardDevice` through `vllm.h`.
+//
+// So this pins the half that IS testable, which is the half the production
+// placement rests on: `Tick` reaches the real fd 2 and FLUSHES before the
+// caller's next statement runs. If the line were buffered, or emitted lazily, or
+// deferred to the end of the phase, then announcing a unit before starting it
+// would buy nothing — the announcement would die in the buffer with the process.
+// Below, a fake unit of work writes its own marker to the same stream, and the
+// tick has to be there first every time.
+//
+// AND THE SHAPE THAT MATTERS IS THE LAST ONE. The loop announces unit 4 and then
+// stops without finishing it, which is what a killed render looks like from
+// stderr: the log's last word is the unit that was in flight. Under an
+// after-the-work emitter that capture would end at unit 3, and #1375 would still
+// be un-attributed.
+//
+// Nothing between the redirect and its restore may assert, for the reason the
+// case above gives: a `REQUIRE` that aborted in there would leave every later
+// case writing stderr into a temporary file.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 phase log: a live tick is FLUSHED BEFORE the work it announces") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+
+  const int kFinished = 3;  // units 1..3 complete; unit 4 is announced and never does
+  std::string captured;
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    for (int k = 1; k <= kFinished; ++k) {
+      phase::Tick("unit", k, "step " + std::to_string(k) + "/4");
+      // The work. It writes its own marker to the SAME stream, so the ordering
+      // question is answered by the bytes rather than by a clock.
+      std::fprintf(stderr, "[work] unit %d finished\n", k);
+      std::fflush(stderr);
+    }
+    // Announced, then the "process dies" here. No marker follows.
+    phase::Tick("unit", kFinished + 1, "step 4/4");
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+  log.Reset();
+
+  MESSAGE("captured " << captured.size() << " bytes of stderr from the tick contract case");
+  REQUIRE_MESSAGE(!captured.empty(), "phase::Tick emitted nothing at all");
+
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+      if (line.rfind("[work] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  auto index_of = [&lines](const std::string& needle) -> long {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+    }
+    return -1;
+  };
+
+  // Each announcement precedes the work it announces. `std::string` and never a
+  // `char*` in a stream: doctest stringifies a streamed `char*` as a bool.
+  for (int k = 1; k <= kFinished; ++k) {
+    const std::string tick = "unit " + std::to_string(k) + " ";
+    const std::string work = "[work] unit " + std::to_string(k) + " finished";
+    const long at_tick = index_of(tick);
+    const long at_work = index_of(work);
+    CHECK_MESSAGE(at_tick >= 0, "no tick line for unit " << k);
+    CHECK_MESSAGE(at_work >= 0, "no work marker for unit " << k);
+    CHECK_MESSAGE(at_tick < at_work,
+                  "the tick for unit " << k << " was not flushed before the work it announces");
+  }
+
+  // The killed-run shape: unit 4 was announced, never finished, and the capture
+  // still names it — and names it LAST.
+  const long announced = index_of("unit 4 ");
+  CHECK_MESSAGE(announced >= 0,
+                "the unit that was in flight when the run stopped is missing from the log, "
+                "which is what an after-the-work emitter produces");
+  CHECK_MESSAGE(index_of("[work] unit 4 finished") < 0,
+                "the case did not stage an unfinished unit, so it proves nothing");
+  REQUIRE(!lines.empty());
+  CHECK_MESSAGE(lines.back().find("unit 4 ") != std::string::npos,
+                "the last line of the capture is not the unit in flight: " << lines.back());
+
+  // `last=` is the per-unit interval, absent on the first tick by construction
+  // and present on every one after it.
+  const long first = index_of("unit 1 ");
+  REQUIRE(first >= 0);
+  CHECK(lines[static_cast<size_t>(first)].find(" last=") == std::string::npos);
+  const long second = index_of("unit 2 ");
+  REQUIRE(second >= 0);
+  CHECK_MESSAGE(lines[static_cast<size_t>(second)].find(" last=") != std::string::npos,
+                "the second tick of a unit carries no interval: "
+                    << lines[static_cast<size_t>(second)]);
+}
+#endif  // !_WIN32
+
+// ─── `last=` belongs to ONE generation ───────────────────────────────────────
+//
+// The per-unit tick clock is keyed by unit NAME and lives in the `PhaseLog`, so
+// its lifetime is a decision rather than an accident. `Begin` and `Reset` clear
+// it. `SetRender` — the call a driver makes between two generations in one
+// process — did not, so the second render's first DiT forward would have carried
+// a `last=` measuring the gap between two renders. That number is shaped exactly
+// like one very slow forward, on the lane whose entire deliverable is per-forward
+// seconds, in a process (a server) that renders more than once.
+//
+// The wait is what makes this refutable. Without it the stale interval would be
+// microseconds and indistinguishable from a fresh one; 150 ms of sleep between
+// the two renders means an uncleared clock reports a number nobody could mistake
+// for a forward.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 phase log: a SECOND render's first tick carries no interval from the first") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+
+  std::string captured;
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    log.SetRender(1);
+    phase::Tick("dit forward", 1, "render one");
+    phase::Tick("dit forward", 2, "render one");
+    // The gap between two generations, long enough to be unmistakable.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    log.SetRender(2);
+    phase::Tick("dit forward", 1, "render two");
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+  log.Reset();
+
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  MESSAGE("captured " << lines.size() << " tick lines across two renders");
+  REQUIRE(lines.size() == 3);
+
+  // THE INSTRUMENT'S OWN PRECONDITION: the second tick of render one DOES carry
+  // an interval, so "no `last=`" below is a cleared clock and not a lane that is
+  // switched off. `VLLM_RENDER_PROGRESS=0` would have failed the size check above
+  // rather than passing this one silently.
+  REQUIRE_MESSAGE(lines[1].find(" last=") != std::string::npos,
+                  "the second tick of the FIRST render carries no interval, so this case cannot "
+                  "observe whether the clock is cleared: " << lines[1]);
+  CHECK_MESSAGE(lines[2].find(" last=") == std::string::npos,
+                "the first tick of the SECOND render carries an interval spanning the gap since "
+                "the first render ended, which reads as one very slow forward: " << lines[2]);
+}
+#endif  // !_WIN32
 
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────
 //
@@ -3441,6 +6012,8 @@ TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is tr
     // re-shift the entire trajectory the moment a keyframe was supplied.
     vllm::multimodal::VideoModelParams one_stage = FixtureParams(ws.paths);
     one_stage.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    one_stage.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+        FixtureCheckpointClass("one_stage");
 
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(one_stage);
@@ -3738,6 +6311,11 @@ vllm::multimodal::VideoModelParams EncoderParams(const ltx2_fixture::Paths& path
   mp.encoder_path = paths.encoder;
   mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = paths.encoder_config;
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  // This helper builds its params from scratch rather than from `FixtureParams`,
+  // so it declares the checkpoint class itself (row LTX25-CHECKPOINT-CLASS,
+  // #1137). No kind is set, so the recipe is `distilled_two_stage`.
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("distilled_two_stage");
   mp.device = 0;
   return mp;
 }
@@ -4767,6 +7345,7 @@ namespace {
 vllm::multimodal::VideoModelParams RetakeParams(const ltx2_fixture::Paths& paths) {
   vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "retake";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("retake");
   return mp;
 }
 
@@ -5087,6 +7666,7 @@ vllm::multimodal::VideoModelParams T2aParams(const ltx2_fixture::Paths& paths) {
   mp.encoder_path = paths.encoder;
   mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = paths.encoder_config;
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "t2a_one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("t2a_one_stage");
   mp.device = 0;
   return mp;
 }
@@ -5346,6 +7926,7 @@ TEST_CASE("ltx2: the AUDIO guider knobs are NOT t2a-only, and this case used to 
   // and refuses every override, so asking it would test the other guard.
   vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
   REQUIRE(engine != nullptr);
@@ -6145,6 +8726,7 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
   const auto forwards = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     // Stage 1 only. Both recipes' second phase needs the latent spatial
     // upsampler, which the fixture does not carry and which is refused BY NAME
     // in its own case above — that refusal is not what this case is about.
@@ -6254,6 +8836,7 @@ TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per eva
   const auto render = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     // Stage 1 only, for the reason the case above gives: the second phase needs
     // the latent spatial upsampler the fixture does not carry.
     mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -6316,6 +8899,7 @@ TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per eva
   // real render rather than computed from the HQ numbers.
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -6351,6 +8935,8 @@ TEST_CASE("ltx2 video: the res_2s SUBSTEP converts x0 against the midpoint, not 
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("res2s_two_stage");
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -6447,6 +9033,7 @@ namespace {
 vllm::multimodal::VideoModelParams OneStageParams(const ltx2_fixture::Paths& paths) {
   vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
   return mp;
 }
 
@@ -7229,6 +9816,8 @@ vllm::multimodal::VideoModelParams A2VidParams(const ltx2_fixture::Paths& paths,
                                                const std::string& lora) {
   vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "a2vid_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("a2vid_two_stage");
   mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
   return mp;
 }
@@ -7724,6 +10313,8 @@ vllm::multimodal::VideoModelParams Ti2VidParams(const ltx2_fixture::Paths& paths
                                                 const std::string& lora) {
   vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "ti2vid_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("ti2vid_two_stage");
   mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
   return mp;
 }
@@ -7923,6 +10514,7 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
                           const std::string& tag) -> Rendered {
     vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -8110,6 +10702,8 @@ vllm::multimodal::VideoModelParams KeyframeParams(const ltx2_fixture::Paths& pat
                                                   const std::string& lora) {
   vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "keyframe_interpolation";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("keyframe_interpolation");
   mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
   return mp;
 }
@@ -8163,6 +10757,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   auto render = [&](const char* kind, bool with_image, const std::string& tag) -> Conditioned {
     vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -8280,6 +10875,7 @@ TEST_CASE("ltx2 keyframe: BOTH ends pin at once - two appends, and each is locat
   auto render = [&](const char* kind, bool first, bool last, const std::string& tag) -> Pinned {
     vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -8517,6 +11113,7 @@ TEST_CASE("ltx2 keyframe: stage 1's sigma shift takes the 4096 anchor, not the t
   auto rendered_for = [&](const char* kind, int64_t size, const std::string& tag) -> Rendered {
     vllm::multimodal::VideoModelParams mp = KeyframeParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
         vllm::multimodal::LoadVideoEngine(mp);
     auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
@@ -8669,4 +11266,272 @@ TEST_CASE("ltx2 keyframe: the distilled-LoRA requirement refuses BY WHAT IS MISS
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(KeyframeParams(ws.paths, lora));
   CHECK_NOTHROW((void)engine->Generate(KeyframeGen(ws.root + "/no_take")));
+}
+
+
+// The conditioning half of the same instrument, which the case above cannot
+// reach: that engine conditions from a prompt-embeds FILE, so the tower and the
+// connector never run and a table naming them would be lying. This one types a
+// prompt, which is the arm #1269 and stage W4 are about — the spike bounds the
+// caption projection at 39-100% of a ~1731 s phase and cannot say which,
+// because nothing separated the tower from the connector.
+TEST_CASE("ltx2 video: a PROMPTED render names the tower and the connector separately") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(EncoderParams(ws.paths));
+  const std::string out_dir = ws.root + "/prompted_phases";
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(PromptedGen(out_dir, "a b c"));
+
+  REQUIRE_MESSAGE(!result.phase_log_path.empty(),
+                  "the seam-level render returned no phase table path");
+  CHECK(result.phase_log_path == out_dir + "/phase-log.json");
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
+  std::vector<std::string> names;
+  for (const nlohmann::json& entry : table["phases"]) {
+    names.push_back(entry["name"].get<std::string>());
+  }
+  for (const std::string required : {"conditioning.tower", "conditioning.connector"}) {
+    CHECK_MESSAGE(std::find(names.begin(), names.end(), required) != names.end(),
+                  "the phase table names no '" << required << "' phase");
+  }
+  // The two are SEPARATE leaves, not one bracket counted twice: the sum still
+  // holds, which is what says the split did not double count the tower.
+  CHECK(table["unaccounted_seconds"].get<double>() <=
+        0.05 * table["wall_seconds"].get<double>());
+}
+
+// ─── the CHECKPOINT CLASS, through the PRODUCTION ENTRY POINT ────────────────
+//
+// Row LTX25-CHECKPOINT-CLASS, issue #1137.
+//
+// THE DEFECT IS SILENCE, so the case that matters is a load that SUCCEEDED
+// before this row and must refuse after it. `one_stage` is `TI2VidOneStagePipeline`,
+// whose upstream `Model` column reads `Full` (ltx-pipelines CLAUDE.md:19 at
+// fd4ded7f). Before this row the engine never asked which transformer it was
+// handed, so pointing it at the distilled 22B file rendered a clip of the
+// requested size, frame count and sample rate, sampled in a regime those weights
+// were never trained for — and every output check this suite owns passed on it.
+//
+// EVERY CASE HERE ENTERS THROUGH `vllm_video_engine_load` or `LoadVideoEngine`,
+// which is what `include/vllm.h`, the server and `ltx2-gen` all reach.
+// `test_ltx2_pipeline` gates the recipe table and the pure decision; a case that
+// called `Ltx2CheckpointClassRefusal` by hand would prove the function works and
+// never that anything reaches it. Deleting the one call site in
+// `Ltx2VideoEngine::Load` reds every case below.
+
+namespace {
+
+// A fixture load with the class declaration REMOVED, which is what a caller who
+// has not heard of #1137 sends.
+vllm::multimodal::VideoModelParams UndeclaredParams(const ltx2_fixture::Paths& paths,
+                                                    const std::string& kind) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+  mp.extras.erase(vllm::multimodal::kLtx2CheckpointClassExtra);
+  return mp;
+}
+
+// The message of the refusal a load produced, or the empty string if it loaded.
+// Returning the message rather than a bool is deliberate: "it threw" is the
+// assertion that let a wrong refusal pass for a right one.
+std::string LoadRefusal(const vllm::multimodal::VideoModelParams& mp) {
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    return engine == nullptr ? std::string("LoadVideoEngine returned nullptr") : std::string();
+  } catch (const std::exception& e) {
+    return std::string(e.what());
+  }
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 checkpoint class: a FULL-model arm refuses a distilled declaration") {
+  Workspace ws;
+
+  // THE MISMATCH. `one_stage` needs the full transformer and the caller says it
+  // handed over the distilled one.
+  vllm::multimodal::VideoModelParams mismatch = UndeclaredParams(ws.paths, "one_stage");
+  mismatch.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "distilled";
+  const std::string msg = LoadRefusal(mismatch);
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  // The message names WHICH class was supplied, WHICH is needed, and the
+  // upstream row — the three things that make it actionable rather than a bare
+  // "wrong checkpoint".
+  CHECK(msg.find("'distilled'") != std::string::npos);
+  CHECK(msg.find("FULL") != std::string::npos);
+  CHECK(msg.find("one_stage") != std::string::npos);
+  CHECK(msg.find("CLAUDE.md:17-30") != std::string::npos);
+  // ...and it says WHY it refuses rather than renders, which is the whole reason
+  // the row exists: the render would finish.
+  CHECK(msg.find("no output check") != std::string::npos);
+
+  // THE CONTROL: the same load with the honest declaration goes through, so the
+  // case above measures the class check and not a broken `one_stage` fixture.
+  vllm::multimodal::VideoModelParams honest = UndeclaredParams(ws.paths, "one_stage");
+  honest.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  honest.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  CHECK(LoadRefusal(honest).empty());
+
+  // AND THE OTHER POLARITY, so this is not a one-way test. `distilled_two_stage`
+  // is `DistilledPipeline`, `Distilled only` (CLAUDE.md:25), and it refuses the
+  // full model just as hard.
+  vllm::multimodal::VideoModelParams reversed =
+      UndeclaredParams(ws.paths, "distilled_two_stage");
+  reversed.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  const std::string reversed_msg = LoadRefusal(reversed);
+  INFO(reversed_msg);
+  REQUIRE_FALSE(reversed_msg.empty());
+  CHECK(reversed_msg.find("'full'") != std::string::npos);
+  CHECK(reversed_msg.find("DISTILLED") != std::string::npos);
+}
+
+TEST_CASE("ltx2 checkpoint class: an UNDECLARED load refuses instead of rendering") {
+  Workspace ws;
+
+  // THE RED-FIRST CASE. Before row LTX25-CHECKPOINT-CLASS this load SUCCEEDED
+  // and rendered. Nothing about the checkpoint changed; what changed is that the
+  // engine now asks.
+  //
+  // THE ADAPTER FLAG DECIDES WHICH REFUSAL A CALLER READS, and the second column
+  // is where that is stated. The class check sits AFTER the
+  // `requires_distilled_lora` one deliberately: a two-stage load with no adapter
+  // fails both, and the adapter message names a missing file the caller can go
+  // and fetch, while a class message would send the same reader to a different
+  // question. So the three kinds that demand an adapter get a REAL one here.
+  //
+  // A real file and not a placeholder path, and that is measured rather than
+  // assumed: the load builds and READS the adapter before it resolves the
+  // recipe, so a non-existent path refuses with `safetensors: open failed` and
+  // this case would be gating the wrong refusal.
+  const std::string adapter =
+      WriteFixtureLora(ws.root + "/class_adapter.safetensors", kFixtureLoraTarget, 1.0F);
+  struct Arm {
+    const char* kind;
+    bool needs_adapter;
+  };
+  for (const Arm arm : {Arm{"one_stage", false}, Arm{"distilled_two_stage", false},
+                        Arm{"t2a_one_stage", false}, Arm{"a2vid_two_stage", true},
+                        Arm{"ti2vid_two_stage", true}, Arm{"keyframe_interpolation", true},
+                        Arm{"res2s_two_stage", false}, Arm{"dfr", false},
+                        Arm{"retake", false}}) {
+    INFO("kind = " << std::string(arm.kind));
+    vllm::multimodal::VideoModelParams mp = UndeclaredParams(ws.paths, arm.kind);
+    if (arm.needs_adapter) {
+      mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = adapter;
+    }
+    const std::string msg = LoadRefusal(mp);
+    INFO("refusal = " << msg);
+    REQUIRE_FALSE(msg.empty());
+    // It has to be THIS refusal and not some other one the kind happens to
+    // produce first — several of these kinds refuse for other reasons too.
+    CHECK(msg.find("checkpoint_class") != std::string::npos);
+    // The message carries the MEASUREMENT, because "declare the class" without
+    // it reads as bureaucracy rather than as a fact about these two files.
+    CHECK(msg.find("42,018,190,584") != std::string::npos);
+    CHECK(msg.find("byte-identical") != std::string::npos);
+    // ...and the three spellings, so the caller can act on it.
+    CHECK(msg.find("'full'") != std::string::npos);
+    CHECK(msg.find("'distilled'") != std::string::npos);
+    CHECK(msg.find("'keyframe_slot_sft'") != std::string::npos);
+  }
+
+  // THE DEFAULT KIND IS NOT EXEMPT. `pipeline_kind` defaults to
+  // `distilled_two_stage`, so a caller who names no kind at all still declares.
+  vllm::multimodal::VideoModelParams defaulted = FixtureParams(ws.paths);
+  defaulted.extras.erase(vllm::multimodal::kLtx2CheckpointClassExtra);
+  CHECK_FALSE(LoadRefusal(defaulted).empty());
+
+  // AN UNPARSEABLE VALUE is refused too, and with a DIFFERENT message: refused
+  // rather than defaulted, because every default here picks a sampling regime
+  // for the caller. `dev` is the realistic typo — it is what the full file is
+  // named after.
+  vllm::multimodal::VideoModelParams typo = UndeclaredParams(ws.paths, "one_stage");
+  typo.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "dev";
+  const std::string typo_msg = LoadRefusal(typo);
+  INFO(typo_msg);
+  REQUIRE_FALSE(typo_msg.empty());
+  CHECK(typo_msg.find("'dev'") != std::string::npos);
+  CHECK(typo_msg.find("'full'") != std::string::npos);
+  // NOT the absent-declaration message, which quotes the measurement.
+  CHECK(typo_msg.find("42,018,190,584") == std::string::npos);
+}
+
+TEST_CASE("ltx2 checkpoint class: `Full or distilled` is a CONDITION, not a hole") {
+  Workspace ws;
+
+  // `retake` is `RetakePipeline`, the one `Full or distilled` row
+  // (CLAUDE.md:29). This recipe mirrors upstream's `distilled=True` arm
+  // (retake.py:336, :359), which takes DISTILLED_SIGMAS (:287), and upstream's
+  // stated condition for that arm is "using distilled model or passing
+  // distillation lora with full model" (retake.py:71-73).
+  //
+  // So `full` with no adapter is refused: it would run the distilled schedule on
+  // undistilled weights, which is #1137 again on the one permissive row.
+  vllm::multimodal::VideoModelParams full_no_lora = UndeclaredParams(ws.paths, "retake");
+  full_no_lora.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  const std::string msg = LoadRefusal(full_no_lora);
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  CHECK(msg.find("retake.py:71-73") != std::string::npos);
+  CHECK(msg.find("lora_path") != std::string::npos);
+
+  // ...and `distilled` on the same recipe is accepted with no adapter at all,
+  // which is what makes the case above a condition on the CLASS rather than a
+  // blanket adapter requirement on the kind.
+  vllm::multimodal::VideoModelParams distilled = UndeclaredParams(ws.paths, "retake");
+  distilled.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "distilled";
+  CHECK(LoadRefusal(distilled).empty());
+}
+
+TEST_CASE("ltx2 checkpoint class: the refusal names the extras by the keys the engine reads") {
+  Workspace ws;
+
+  // The refusal text is assembled in `ltx2_pipeline.cpp`, which does not include
+  // a `multimodal` header and therefore spells `checkpoint_class` and
+  // `lora_path` as literals. This case is what makes that duplication GATED
+  // rather than trusted: it holds a REAL refusal against the constants the
+  // engine actually reads, so a rename on either side fails here instead of
+  // producing a message that names a key nothing consumes.
+  const std::string undeclared = LoadRefusal(UndeclaredParams(ws.paths, "one_stage"));
+  INFO(undeclared);
+  REQUIRE_FALSE(undeclared.empty());
+  CHECK(undeclared.find(vllm::multimodal::kLtx2CheckpointClassExtra) != std::string::npos);
+
+  vllm::multimodal::VideoModelParams retake_full = UndeclaredParams(ws.paths, "retake");
+  retake_full.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  const std::string retake_msg = LoadRefusal(retake_full);
+  INFO(retake_msg);
+  REQUIRE_FALSE(retake_msg.empty());
+  CHECK(retake_msg.find(vllm::multimodal::kLtx2LoraPathExtra) != std::string::npos);
+}
+
+TEST_CASE("ltx2 checkpoint class: the declaration is a CLAIM, and the engine says so") {
+  Workspace ws;
+
+  // WHAT THIS ROW DOES NOT BUY, asserted rather than left to the reader. The
+  // fixture DiT is neither the full nor the distilled 22B transformer, and the
+  // engine accepts BOTH declarations for it, because it never opens the file to
+  // check. There is nothing in the header to check against — that is the
+  // measurement in `.agents/specs/ltx25-checkpoint-class.md` section 2.
+  //
+  // What the row buys is that the wrong sampling regime now needs a deliberate
+  // false statement instead of silence. A case asserting the opposite would be
+  // asserting a detector this engine does not have.
+  vllm::multimodal::VideoModelParams as_full = UndeclaredParams(ws.paths, "one_stage");
+  as_full.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "full";
+  as_full.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  CHECK(LoadRefusal(as_full).empty());
+
+  vllm::multimodal::VideoModelParams as_distilled =
+      UndeclaredParams(ws.paths, "distilled_two_stage");
+  as_distilled.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = "distilled";
+  as_distilled.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  CHECK(LoadRefusal(as_distilled).empty());
+
+  // The SAME file, two contradictory declarations, both accepted. The pair is
+  // the assertion: it is one file and the two loads disagree about what it is.
+  CHECK(as_full.dit_path == as_distilled.dit_path);
 }

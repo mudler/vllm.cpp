@@ -7,8 +7,10 @@
 // Covers: (1) the gate backends self-register per DeviceType; (2) MakeAttention-
 // Backend constructs the named backend / throws when absent; (3) the CPU and
 // CUDA (per-capability) priority ORDER matches the vLLM-mirrored lists; (4) the
-// selection walk returns the first REGISTERED name (behavior-preserving
-// FLASH_ATTN on both, incl. CPU's CPU_ATTN→FLASH_ATTN fallthrough); (5) the
+// selection walk returns the first REGISTERED name (FLASH_ATTN on CUDA, and
+// CPU_ATTN on CPU — where the name used to be unregistered and the walk fell
+// through to FLASH_ATTN, until #1332 M1 gave FLASH_ATTN a head-size rule that
+// left a head_size-6 CPU request with no backend at all, issue #1371); (5) the
 // explicit-override path; (6) sm_100 (major 10) vs sm_121 (major 12) select
 // differently ONLY if their preferred backend is registered — here both resolve
 // to FLASH_ATTN because FLASHINFER is not implemented, which IS the
@@ -35,6 +37,8 @@ using vllm::platforms::Platform;
 using vllm::platforms::ResidencyPolicy;
 using vllm::v1::AttentionBackend;
 using vllm::v1::AttentionImpl;
+using vllm::v1::AttentionType;
+using vllm::v1::AttentionTypeName;
 using vllm::v1::AttentionLayer;
 using vllm::v1::MLACommonMetadata;
 using vllm::v1::TritonMLAImpl;
@@ -114,6 +118,25 @@ class TopIsTestBackendPlatform final : public Platform {
   }
 };
 
+// The real CpuPlatform's selection surface (src/vllm/platforms/cpu.cpp), with
+// only the vt::Backend composition faked so no accelerator is resolved. Hoisted
+// out of the head-size case at the #1371 repair so the fp32 and capability cases
+// below select through the SAME platform the runtime uses, rather than each
+// carrying its own copy of the priority list to drift.
+class FakeCpuPlatform final : public Platform {
+ public:
+  DeviceType device_type() const override { return DeviceType::kCPU; }
+  vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
+  DeviceCapability get_device_capability() const override { return {}; }
+  std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
+  ResidencyPolicy residency_policy() const override { return {}; }
+  std::vector<std::string> get_attn_backend_priority(
+      const AttnSelectorConfig& cfg) const override {
+    (void)cfg;
+    return {"CPU_ATTN", "FLASH_ATTN"};
+  }
+};
+
 }  // namespace
 
 TEST_CASE("gate backends self-register per DeviceType") {
@@ -128,11 +151,18 @@ TEST_CASE("gate backends self-register per DeviceType") {
   // and the ROCm paged-attn kernel reads the shared NHD layout.
   CHECK(HasAttentionBackend(DeviceType::kROCM, "ROCM_ATTN"));
 
+  // #1371: CPU_ATTN (cpu_attn.cpp) registers for kCPU. It was a name in
+  // CpuPlatform's priority list and nothing else, which is why a head size
+  // FLASH_ATTN declines left the CPU with no backend at all.
+  CHECK(HasAttentionBackend(DeviceType::kCPU, "CPU_ATTN"));
+  // ...and for kCPU ONLY. It is upstream's CPU answer (cpu.py:75-87); nothing
+  // registers it elsewhere, so a CUDA walk can never land on it.
+  CHECK_FALSE(HasAttentionBackend(DeviceType::kCUDA, "CPU_ATTN"));
+
   // Backends we name in the priority lists but do not implement are NOT
   // registered — the selection walk must skip them.
   CHECK_FALSE(HasAttentionBackend(DeviceType::kCUDA, "FLASHINFER"));
   CHECK_FALSE(HasAttentionBackend(DeviceType::kCUDA, "TRITON_ATTN"));
-  CHECK_FALSE(HasAttentionBackend(DeviceType::kCPU, "CPU_ATTN"));
 }
 
 TEST_CASE("MakeAttentionBackend constructs the named backend / throws when absent") {
@@ -481,25 +511,250 @@ TEST_CASE("the runner's KV-shape contract rejects a mis-shaped backend (M3)") {
                   std::invalid_argument);
 }
 
-TEST_CASE("CPU selection: CPU_ATTN preference falls through to FLASH_ATTN") {
-  // The real CpuPlatform priority is {CPU_ATTN, FLASH_ATTN}; CPU_ATTN is not
-  // implemented, so the walk returns FLASH_ATTN (the layout our CPU paged-attn
-  // kernel uses). Exercised here through a synthetic CPU platform mirroring
-  // cpu.cpp so no GPU/accelerator resolution is involved.
-  class FakeCpuPlatform final : public Platform {
-   public:
-    DeviceType device_type() const override { return DeviceType::kCPU; }
-    vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
-    DeviceCapability get_device_capability() const override { return {}; }
-    std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
-    ResidencyPolicy residency_policy() const override { return {}; }
-    std::vector<std::string> get_attn_backend_priority(
-        const AttnSelectorConfig& cfg) const override {
-      (void)cfg;
-      return {"CPU_ATTN", "FLASH_ATTN"};
-    }
-  } cpu;
-  CHECK(SelectAttentionBackendName(cpu) == "FLASH_ATTN");
+TEST_CASE("CPU selection resolves CPU_ATTN, at every head size the CPU runs") {
+  // Issue #1371. The real CpuPlatform priority is {CPU_ATTN, FLASH_ATTN} and
+  // CPU_ATTN is now registered, so the walk stops on it — which is the answer
+  // upstream cpu.py:75-87 gives for every CPU request. Exercised through a
+  // synthetic CPU platform mirroring cpu.cpp so no GPU/accelerator resolution
+  // is involved.
+  //
+  // The second half of this case is the regression itself: before CPU_ATTN was
+  // registered, the walk fell through to FLASH_ATTN, and once FLASH_ATTN
+  // acquired flash_attn.py's `head_size % 8 == 0` rule (#1332 M1) a CPU request
+  // with head_size 6 matched NOTHING and SelectAttentionBackendName threw out of
+  // GPUModelRunner::initialize_kv_cache. Our CPU paged-attention kernel is a
+  // scalar loop with no head-size specialization and runs head_size 6 fine.
+  FakeCpuPlatform cpu;
+  CHECK(SelectAttentionBackendName(cpu) == "CPU_ATTN");
+
+  // head_size 6: NOT a multiple of 8, so FLASH_ATTN declines it and CPU_ATTN is
+  // the only thing standing between this request and a throw. This is the exact
+  // geometry test_nemotron_h_paged_forward builds (kHeadDim = 6).
+  AttnSelectorConfig odd;
+  odd.head_size = 6;
+  odd.block_size = 16;
+  CHECK(SelectAttentionBackendName(cpu, "", odd) == "CPU_ATTN");
+  // ...and the FLASH_ATTN rule that made it necessary is still in force. This
+  // asserts the guard #1332 M1 added SURVIVES the fix: FLASH_ATTN must still
+  // refuse head_size 6, on CPU as on CUDA. Repairing #1371 by widening that
+  // rule would turn this line red.
+  CHECK_FALSE(
+      MakeAttentionBackend(DeviceType::kCPU, "FLASH_ATTN")->supports_head_size(6));
+  CHECK_FALSE(SelectAttentionBackendName(cpu, "", odd) == "FLASH_ATTN");
+  // A head size FLASH_ATTN accepts still resolves to CPU_ATTN, because CPU_ATTN
+  // is FIRST in the priority list — upstream's order, not a tie-break.
+  AttnSelectorConfig even;
+  even.head_size = 128;
+  even.block_size = 16;
+  CHECK(SelectAttentionBackendName(cpu, "", even) == "CPU_ATTN");
+}
+
+TEST_CASE("CPU_ATTN reports the KV shape the CPU engine actually allocates") {
+  // The recorded deviation (cpu_attn.h): upstream cpu_attn.py:94-104 returns the
+  // HND (num_blocks, num_kv_heads, block_size, 2 * head_size) shape, ours
+  // returns the NHD 5-dim shape src/vt/cpu/cpu_paged_attn.cpp reads by strides.
+  // CheckKvCacheShape compares the SELECTED backend's shape against the engine's
+  // own geometry, so an HND answer here would fail every CPU run at init — this
+  // case is what keeps the deviation deliberate rather than drift.
+  std::unique_ptr<AttentionBackend> cpu_attn =
+      MakeAttentionBackend(DeviceType::kCPU, "CPU_ATTN");
+  REQUIRE(cpu_attn != nullptr);
+  CHECK(cpu_attn->get_name() == "CPU_ATTN");
+  const std::vector<int64_t> shape = cpu_attn->get_kv_cache_shape(10, 16, 2, 6);
+  const std::vector<int64_t> expected{10, 2, 16, 2, 6};
+  CHECK(shape == expected);
+  // Identical to FLASH_ATTN's, dimension for dimension — which is exactly why
+  // the CPU could fall through to FLASH_ATTN for as long as it did.
+  CHECK(shape == MakeAttentionBackend(DeviceType::kCPU, "FLASH_ATTN")
+                     ->get_kv_cache_shape(10, 16, 2, 6));
+  CHECK_NOTHROW(CheckKvCacheShape(DeviceType::kCPU, "CPU_ATTN", 10, 16, 2, 6,
+                                  /*is_mla=*/false));
+  // Not an MLA backend: an MLA request must not land here.
+  CHECK_FALSE(cpu_attn->is_mla());
+}
+
+TEST_CASE("fp32 on a CPU platform resolves CPU_ATTN (ported test_fp32_fallback)") {
+  // PORTED FROM: vllm tests/kernels/attention/test_attention_selector.py:230-241
+  //   @ pin 5559679229bc961848b121ccdeaa8fa5d79bec98
+  //     @pytest.mark.parametrize("device", ["cpu", "cuda", "hip"])
+  //     def test_fp32_fallback(device: str):
+  //         ...
+  //         with patch("vllm.platforms.current_platform", CpuPlatform()):
+  //             backend = get_attn_backend(16, torch.float32, None)
+  //         assert backend.get_name() == "CPU_ATTN"
+  //
+  // Upstream's four positional inputs are head_size=16, dtype=torch.float32,
+  // kv_cache_dtype=None and the default block size; `get_attn_backend` is the
+  // selector entry point our `SelectAttentionBackendName` ports, so the case is
+  // carried over field for field. `kv_cache_dtype` is left EMPTY because that is
+  // what our `supports_kv_cache_dtype` documents as upstream's `None`
+  // (backend.py:167-173), not because the field was forgotten.
+  //
+  // WHY THIS CASE IS THE ONE THE #1371 CHANGE OWED. `supported_dtypes` is the
+  // one declaration in the new capability surface that changes a live answer:
+  // FLASH_ATTN declares {f16, bf16} (backend.py:59, which flash_attn.py:73
+  // repeats verbatim), so before CPU_ATTN was registered an f32 CPU request was
+  // REFUSED with "dtype not supported" and there was nothing behind it. Both
+  // halves are asserted below, so neither the refusal nor the fallback can move
+  // without a red line.
+  //
+  // HARNESS ADAPTATION — the other two arms of the upstream parametrization are
+  // NOT ported, and neither is a silent omission:
+  //   * "cuda" asserts FLEX_ATTENTION. This tree registers no FLEX_ATTENTION
+  //     (`CHECK_FALSE(HasAttentionBackend(kCUDA, "FLEX_ATTENTION"))` would be the
+  //     whole of it), so the arm has no answer to assert yet.
+  //   * "hip" asserts the selector RAISES, because every ROCm backend upstream
+  //     declares a minimum head size of 32 (rocm_attn.py:193) and 16 is below it.
+  //     Our `RocmAttentionBackend` declares no head-size list at all, so a throw
+  //     here would come from the f32 dtype instead, i.e. the right verdict for
+  //     the wrong reason. Porting it needs ROCM_ATTN's declared surface, which is
+  //     the same authoring job #1389 owns for Metal, Vulkan and Tenstorrent.
+  FakeCpuPlatform cpu;
+  AttnSelectorConfig fp32;
+  fp32.head_size = 16;
+  fp32.dtype = DType::kF32;
+  fp32.kv_cache_dtype = "";  // upstream's None
+  CHECK(SelectAttentionBackendName(cpu, "", fp32) == "CPU_ATTN");
+
+  // The mechanism, not just the answer: FLASH_ATTN is the name the walk used to
+  // stop on, and it declines f32 outright. This is the assertion that would go
+  // red if `supported_dtypes` on CPU_ATTN dropped kF32 and something else
+  // started answering.
+  std::unique_ptr<AttentionBackend> flash =
+      MakeAttentionBackend(DeviceType::kCPU, "FLASH_ATTN");
+  REQUIRE(flash != nullptr);
+  CHECK_FALSE(flash->supports_dtype(DType::kF32));
+  CHECK(flash->validate_configuration(fp32, DeviceCapability{}) ==
+        std::vector<std::string>{"dtype not supported"});
+
+  // ...and CPU_ATTN accepts the identical request with NO reasons at all, which
+  // is upstream's definition of a valid backend (backend.py:319-393).
+  std::unique_ptr<AttentionBackend> cpu_attn =
+      MakeAttentionBackend(DeviceType::kCPU, "CPU_ATTN");
+  REQUIRE(cpu_attn != nullptr);
+  CHECK(cpu_attn->validate_configuration(fp32, DeviceCapability{}).empty());
+
+  // The two half dtypes upstream lists beside f32 keep resolving CPU_ATTN too —
+  // cpu_attn.py:42-46 is a list of three, not an f32 special case.
+  for (const DType dt : {DType::kF16, DType::kBF16, DType::kF32}) {
+    AttnSelectorConfig cfg = fp32;
+    cfg.dtype = dt;
+    CAPTURE(static_cast<int>(dt));
+    CHECK(SelectAttentionBackendName(cpu, "", cfg) == "CPU_ATTN");
+  }
+}
+
+TEST_CASE("CPU_ATTN declares cpu_attn.py's capability surface, entry for entry") {
+  // Every declaration this backend overrides, pinned against
+  // vllm/v1/attention/backends/cpu_attn.py @ pin 5559679229. Six of the seven
+  // were unasserted when the class landed, so the reviewer could corrupt them —
+  // including WIDENING the block-size list from {16} to {1}, which would have let
+  // CPU_ATTN accept block_size 1 — with every binary still green. A declaration
+  // nothing reads is a claim, and this registry turns claims into selections.
+  //
+  // Each block asserts the DECLARED list and the PREDICATE the base class derives
+  // from it, because they fail differently: deleting an override moves the list
+  // to the base default, while corrupting the entries leaves the shape intact.
+  std::unique_ptr<AttentionBackend> b =
+      MakeAttentionBackend(DeviceType::kCPU, "CPU_ATTN");
+  REQUIRE(b != nullptr);
+  CHECK(b->get_name() == "CPU_ATTN");
+
+  // cpu_attn.py:42-46 — [float16, bfloat16, float32], in that order.
+  CHECK(b->supported_dtypes() ==
+        std::vector<vt::DType>{DType::kF16, DType::kBF16, DType::kF32});
+  CHECK(b->supports_dtype(DType::kF16));
+  CHECK(b->supports_dtype(DType::kBF16));
+  CHECK(b->supports_dtype(DType::kF32));
+  // ...and nothing else. A widened list would make an integer KV/query dtype
+  // selectable on a kernel that has no path for it.
+  CHECK_FALSE(b->supports_dtype(DType::kI8));
+  CHECK_FALSE(b->supports_dtype(DType::kQ8_0));
+
+  // cpu_attn.py:47-52 — ["auto", "fp8", "fp8_e4m3", "fp8_e5m2"], MINUS the last
+  // (recorded deviation 3 in cpu_attn.h). The refusal is the assertion: our CPU
+  // KV-fp8 arm resolves KvKind::kFp8 to LoadKvFp8E4M3 alone
+  // (src/vt/cpu/cpu_paged_attn.cpp), so claiming e5m2 would select this backend
+  // for a cache it cannot read.
+  CHECK(b->supported_kv_cache_dtypes() ==
+        std::vector<std::string>{"auto", "fp8", "fp8_e4m3"});
+  CHECK(b->supports_kv_cache_dtype("auto"));
+  CHECK(b->supports_kv_cache_dtype("fp8"));
+  CHECK(b->supports_kv_cache_dtype("fp8_e4m3"));
+  CHECK_FALSE(b->supports_kv_cache_dtype("fp8_e5m2"));
+  // Upstream's CPU list omits the explicit half-dtype names that FLASH_ATTN's
+  // carries (flash_attn.py:74-80), so ours does too — the deviation is e5m2 and
+  // ONLY e5m2.
+  CHECK_FALSE(b->supports_kv_cache_dtype("float16"));
+  CHECK_FALSE(b->supports_kv_cache_dtype("bfloat16"));
+  // An empty name is upstream's None and is accepted outright (backend.py:167-173).
+  CHECK(b->supports_kv_cache_dtype(""));
+
+  // cpu_attn.py:54-56 — [MultipleOf(16)]. NOT MultipleOf(1): the base default is
+  // {1} (backend.py:69-71), so losing this override widens the backend silently
+  // rather than narrowing it, and both lines below are what notice.
+  CHECK(b->get_supported_kernel_block_sizes() == std::vector<int>{16});
+  CHECK(b->supports_block_size(16));
+  CHECK(b->supports_block_size(32));
+  CHECK_FALSE(b->supports_block_size(1));
+  CHECK_FALSE(b->supports_block_size(8));
+  CHECK_FALSE(b->supports_block_size(24));
+  // 0 is upstream's None (backend.py:176-178), accepted by every backend.
+  CHECK(b->supports_block_size(0));
+
+  // DEVIATION 2 (cpu_attn.h): NO head-size constraint, where cpu_attn.py:58-60
+  // lists eleven sizes. An empty list is upstream's "unconstrained"
+  // (backend.py:158-161), and it is WIDER than upstream's CPU backend — which is
+  // the deliberate part: our CPU kernel is a scalar loop with no head-size
+  // specialization, so head_size 6 (the geometry #1371 was reported on) and every
+  // size upstream lists are all accepted here.
+  CHECK(b->get_supported_head_sizes().empty());
+  CHECK(b->supports_head_size(6));
+  CHECK(b->supports_head_size(3));
+  CHECK(b->supports_head_size(128));
+  CHECK(b->supports_head_size(512));
+  CHECK(b->supports_head_size(1024));
+
+  // cpu_attn.py:66-68 / :70-72 — both True, and both are FALSE on the base class
+  // (backend.py:261-274), so a deleted override reads as a refusal.
+  CHECK(b->supports_non_causal());
+  CHECK(b->supports_sliding_window());
+
+  // cpu_attn.py:74-83 — decoder, encoder, encoder-only AND encoder-decoder. The
+  // base supports decoder alone (backend.py:291-298), so the three non-decoder
+  // lines are the ones that fail if the override goes.
+  CHECK(b->supports_attn_type(AttentionTypeName(AttentionType::kDecoder)));
+  CHECK(b->supports_attn_type(AttentionTypeName(AttentionType::kEncoder)));
+  CHECK(b->supports_attn_type(AttentionTypeName(AttentionType::kEncoderOnly)));
+  CHECK(b->supports_attn_type(AttentionTypeName(AttentionType::kEncoderDecoder)));
+  CHECK_FALSE(b->supports_attn_type("not_an_attention_type"));
+
+  // The declarations upstream's CPU backend does NOT override, asserted so a
+  // future widening has to be deliberate: cpu_attn.py defines no `supports_sink`,
+  // no `supports_mm_prefix` and no `supports_per_head_quant_scales`, and it is not
+  // an MLA or a sparse backend.
+  CHECK_FALSE(b->supports_sink());
+  CHECK_FALSE(b->supports_mm_prefix());
+  CHECK_FALSE(b->supports_per_head_quant_scales());
+  CHECK_FALSE(b->is_mla());
+  CHECK_FALSE(b->is_sparse());
+
+  // Two of the above through the CONSUMER, so the declarations are bound to the
+  // selection the runtime performs and not only to their own getters. A sliding-
+  // window CPU request selects CPU_ATTN; a block_size the list refuses selects
+  // NOTHING, and the walk throws exactly as it did for head_size 6.
+  FakeCpuPlatform cpu;
+  AttnSelectorConfig sliding;
+  sliding.head_size = 6;
+  sliding.block_size = 16;
+  sliding.has_sliding_window = true;
+  sliding.use_non_causal = true;
+  CHECK(SelectAttentionBackendName(cpu, "", sliding) == "CPU_ATTN");
+
+  AttnSelectorConfig bad_block = sliding;
+  bad_block.block_size = 8;
+  CHECK_THROWS_AS(SelectAttentionBackendName(cpu, "", bad_block),
+                  std::runtime_error);
 }
 
 TEST_CASE("explicit backend override is honored / validated") {

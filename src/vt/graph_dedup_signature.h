@@ -51,6 +51,102 @@ inline void AppendNumber(std::string* out, long long value) {
   out->push_back(',');
 }
 
+// ===================================================================================
+// WHICH FIELDS A NODE PAYLOAD CARRIES — the key's coarseness, decided here rather than
+// inside the device header so a CPU test drives the SAME function production does.
+//
+// Row ENG-CUDAGRAPH-DEDUP, issue #1226. The device gate of 2026-08-18 measured the fold
+// never happening: `N == M` in every `VT_CUDA_GRAPH_DEDUP=1` cell over two and three
+// DISTINCT padded decode buckets. The cause was the key, not the driver. A kernel node's
+// payload carried `gridDim` and `blockDim` and a memcpy node's carried the copy extent,
+// the padded batch dimension lives in exactly those fields, so two decode buckets never
+// shared a signature, no candidate group ever formed and `cudaGraphExecUpdate` was NEVER
+// ATTEMPTED. The row's premise — "the decode graphs of two padded batch sizes are
+// usually the same node topology with different parameters" — was refuted by its own key.
+//
+// THE HYPOTHESIS THESE FUNCTIONS EXIST TO TEST: the key is stricter than the operation it
+// guards. `cudaGraphExecUpdate` requires the TOPOLOGY to match and is designed to permit
+// PARAMETER changes; a kernel node's launch configuration is a parameter. Under the
+// coarse key the extent-shaped fields leave the payload, two buckets group, and the probe
+// decides. That is a MEASUREMENT, and `VT_CUDA_GRAPH_DEDUP_COARSE_KEY` is default OFF
+// until it has one.
+//
+// WHY COARSENING IS SAFE TO TRY AT ALL, and this is the whole argument: the signature is
+// a LOOKUP KEY and never an authority. `GraphDedupRegistry::Register` probes every
+// candidate with the real driver update on a THROWAWAY executable before it folds, and a
+// refusal gives that capture its own executable. A key that groups two graphs the driver
+// then rejects costs one wasted probe, never a wrong replay. Do not weaken that property
+// to make this experiment succeed; it is what makes the experiment cheap.
+//
+// WHAT IS DROPPED, AND WHAT IS DELIBERATELY KEPT:
+//
+//  * DROPPED — `gridDim` and `blockDim`. These are the fields that carry the padded batch
+//    dimension, and they are pure launch configuration: `cudaGraphExecKernelNodeSetParams`
+//    exists to change them, and the update contract's kernel restrictions are about the
+//    function's CONTEXT and its use of device-side launch, not about its geometry.
+//  * DROPPED — the memcpy `extent`. The gate named it alongside the launch dimensions as
+//    the second place the batch size enters the key; leaving it in would separate exactly
+//    the buckets dropping the launch dimensions is meant to join.
+//  * DROPPED — the memset `width`, for the same reason and no other. A memset that clears
+//    a per-sequence buffer scales its width with the batch.
+//  * KEPT — `func`. Pointer identity is load-bearing and strictly stronger than the
+//    demangled name SGLang reads; two graphs that run DIFFERENT kernels are not a fold
+//    the probe should ever be asked about, and dropping this would turn the key into "a
+//    graph with N nodes" and make every capture in the process one candidate group.
+//  * KEPT — `sharedMemBytes`, and this is the argued one rather than the swept one. It is
+//    a kernel-node parameter like the dimensions are, so the same reasoning would drop it;
+//    two facts say do not. First, it is NOT where the batch dimension lives — decode
+//    dynamic shared memory is sized by head dimension and block geometry — so dropping it
+//    buys the hypothesis nothing. Second, a dynamic shared-memory size above the 48 KiB
+//    static limit is only legal for a function that opted in through
+//    `cudaFuncAttributeMaxDynamicSharedMemorySize`, an attribute of the FUNCTION and not
+//    of the node, so a changed size is the field most likely to make the driver
+//    re-instantiate rather than re-point. Keeping it preserves a real discriminator at no
+//    cost to the thing being measured, and it keeps this experiment to ONE variable.
+//  * KEPT — the memcpy `kind` and the memset `elementSize` and `height`. The update
+//    contract explicitly refuses a changed memcpy memory type and refuses to change any
+//    memset that is not 1-D, so these three are fields the driver itself treats as
+//    identity. A key that dropped them would manufacture probe refusals.
+//
+// The node TYPE is emitted by the caller before any of these run, so a kernel payload and
+// a memcpy payload can never collide however few fields either one carries.
+
+// (func, gridDim, blockDim, sharedMemBytes) — cuda_graph_dedup_mixin.py:105-114 minus the
+// driver-API attribute tuple. Under `coarse`, (func, sharedMemBytes).
+inline void AppendKernelFields(std::string* out, long long func, unsigned grid_x,
+                               unsigned grid_y, unsigned grid_z, unsigned block_x,
+                               unsigned block_y, unsigned block_z, unsigned shared_bytes,
+                               bool coarse) {
+  AppendNumber(out, func);
+  if (!coarse) {
+    AppendNumber(out, grid_x);
+    AppendNumber(out, grid_y);
+    AppendNumber(out, grid_z);
+    AppendNumber(out, block_x);
+    AppendNumber(out, block_y);
+    AppendNumber(out, block_z);
+  }
+  AppendNumber(out, shared_bytes);
+}
+
+// (kind, extent) — under `coarse`, (kind).
+inline void AppendMemcpyFields(std::string* out, long long kind, long long width,
+                               long long height, long long depth, bool coarse) {
+  AppendNumber(out, kind);
+  if (coarse) return;
+  AppendNumber(out, width);
+  AppendNumber(out, height);
+  AppendNumber(out, depth);
+}
+
+// (elementSize, width, height) — under `coarse`, (elementSize, height).
+inline void AppendMemsetFields(std::string* out, long long element_size, long long width,
+                               long long height, bool coarse) {
+  AppendNumber(out, element_size);
+  if (!coarse) AppendNumber(out, width);
+  AppendNumber(out, height);
+}
+
 // cuda_graph_dedup_mixin.py:139-179. Node order as the runtime reports it is not a
 // contract, so the nodes are re-indexed by a deterministic topological order (Kahn,
 // always taking the lowest available index, exactly as the upstream heapq does) and the

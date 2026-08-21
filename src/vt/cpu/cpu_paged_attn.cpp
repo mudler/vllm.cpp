@@ -128,6 +128,32 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const int32_t* slens = seq_lens.Ptr<int32_t>();
   const int32_t* btab = block_table.Ptr<int32_t>();
   const int64_t bt_row = block_table.stride[0], bt_col = block_table.stride[1];
+  // THE BLOCK TABLE HAS TO REACH THE LAST POSITION `seq_lens` DECLARES, and
+  // nothing checked that it did (#1394). The j loop below reads
+  // `btab[r * bt_row + (j / block_size) * bt_col]` for every j < seq_lens[r], so
+  // a table with fewer columns than `ceil(seq_lens[r] / block_size)` is read past
+  // its own last element. That read is SILENT: it lands inside whatever the
+  // scratch pool put next to the table, and then either attends to the WRONG page
+  // or dies, depending on what those bytes decode to.
+  // `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp` supplied exactly that.
+  // At `origin/main` it SIGSEGVs deterministically in one measured build (exit
+  // 139, three runs of three) and reads green in another, which is the shape of
+  // the hazard: the read is out of bounds unconditionally, and whether it faults
+  // is the allocator's business rather than the caller's. One compare per
+  // request, outside the token loop, turns it into a refusal that names the
+  // caller's mistake instead.
+  const int64_t bt_cols = block_table.rank >= 2 ? block_table.shape[1] : 0;
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    // Only the requests the token loop actually visits. A padded or inert row
+    // carries no query tokens, so its `seq_lens` entry is never read, and
+    // refusing on one would reject a batch the kernel handles correctly today.
+    if (qsl[r + 1] - qsl[r] <= 0) continue;
+    const int64_t need = (slens[r] + block_size - 1) / block_size;
+    VT_CHECK(need <= bt_cols,
+             "paged_attention: the block table is shorter than the sequence it "
+             "must address (a request needs more logical blocks than the table "
+             "has columns)");
+  }
   // Cache strides (unbind-slice aware): block / page(offset) / head / elem.
   const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
   const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];

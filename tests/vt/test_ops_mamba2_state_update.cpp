@@ -759,14 +759,23 @@ Backend* MaybeCuda() {
 }
 
 // A GREEN TEST DOES NOT PROVE THE DEVICE RAN IT. GB10 is
-// `integrated && pageable_memory_access`, so `Backend::UnifiedMemory()` is TRUE
-// and `ReferenceTierEligible(kCUDA)` with it: absent a native kernel, `GetOp`
-// does not throw — it installs the CPU HOST kernel as a `kReferenceProviderName`
-// provider and runs THAT over the device pointers (op_provider.h, "portable
+// `integrated && pageable_memory_access`, so `Backend::UnifiedMemory()` is TRUE,
+// and the reference tier USED TO gate on that: absent a native kernel, `GetOp`
+// did not throw — it installed the CPU HOST kernel as a `kReferenceProviderName`
+// provider and ran THAT over the device pointers (op_provider.h, "portable
 // reference tier"), so every assertion below would pass while nothing ran on the
 // GPU. Every CUDA case therefore asserts the SELECTED provider is native. These
 // are EAGER dispatches, so the counters are populated
 // ([[graph-replay-does-no-host-dispatch-counters-read-zero]]).
+//
+// SINCE #844 / #1435 that specific false-green is CLOSED, and the guard stays.
+// `ReferenceTierEligible` now reads `Backend::DeviceMemoryIsHostAddressable()`,
+// which CUDA answers FALSE because `CudaBackend::Alloc` calls `cudaMalloc`, so a
+// missing kernel is a named refusal rather than a silent host run. The paragraph
+// above is kept as the REASON this guard exists, not as current behaviour. Do not
+// delete the guard on the strength of the fix: it also catches a provider that
+// DECLINES at run time, and a future backend that answers the narrow predicate
+// true would restore the original hazard exactly.
 void RequireNativeCudaProvider(vt::OpId op, const std::string& what) {
   const vt::OpProviderStats st = vt::GetOpProviderStats(op, DeviceType::kCUDA);
   INFO(what << ": selected CUDA provider = "

@@ -11,14 +11,30 @@ Three audits, in the order a failure is cheapest to diagnose:
    nothing else. No compiler, no build tree, no source, no weights.
 3. BOOT -- what the image does: with a model mounted it serves /health and
    /version and shuts down cleanly on SIGTERM.
+4. HUB REACH -- whether the image can actually TALK to huggingface.co. It boots
+   the image with `--model does-not-exist/nope` and requires the failure to be
+   an ANSWER FROM THE HUB: a completed TLS session that ended in an HTTP
+   status. MEASURED on 20 August 2026, the live hub answers 401 rather than 404
+   for an unknown repository asked anonymously (`GET
+   /api/models/does-not-exist/nope/refs` -> 401), so both statuses count as
+   verified and the audit says which it saw. ENG-HF-MODEL-DOWNLOAD (#1280) makes
+   `--model org/repo` fetch a checkpoint, and that needs transport layer
+   security plus a trust store. Both are BUILD-TIME and IMAGE-TIME decisions
+   that can silently resolve OFF: `VLLM_CPP_HF_DOWNLOAD` downgrades itself with
+   a warning when no OpenSSL is found, and `ca-certificates`/`libssl3` can be
+   dropped from a layer. A symbol check on the binary passes in every one of
+   those states. Only a completed round trip to the hub does not.
 
 The boot audit is OPTIONAL and its absence is reported, never silently skipped:
 an image validated without --model has NO runtime evidence, which is exactly
-what the release contract means by build-verified but not runtime-verified.
+what the release contract means by build-verified but not runtime-verified. The
+hub-reach audit runs by default, needs network egress from the container, and
+reports UNVERIFIED rather than OK when the container could not reach the hub at
+all. An unknown is not a pass.
 
 Usage:
   scripts/validate-container-image.py --image REF --lane cpu --version 0.0.1 \
-      [--model DIR] [--expect-revision SHA]
+      [--model DIR] [--expect-revision SHA] [--skip-hub-reach]
 """
 
 from __future__ import annotations
@@ -322,6 +338,97 @@ def check_boot(
     return errors
 
 
+# The repository identifier the hub-reach audit asks for. It is a well-formed
+# `org/repo` -- `IsValidHfRepoId` accepts it -- that does not exist, so the hub
+# ANSWERS rather than serving, and nothing is downloaded. MEASURED on
+# 20 August 2026 the answer is HTTP 401, not 404: an anonymous `GET
+# /api/models/does-not-exist/nope/refs` cannot be told apart from a request for
+# a private repository, so the hub declines to say which. `classify_hub_reach`
+# accepts 401, 403 and 404 for that reason, and the module docstring above and
+# `HUB_ANSWER_AUTH` below record the same measurement.
+HUB_REACH_MODEL = "does-not-exist/nope"
+
+# The message `HfRefuseHttpsWithoutTls` prints when the build carries no
+# transport layer security. Seeing THIS instead of a hub answer is the exact
+# failure this audit exists for: the image shipped with the feature disabled.
+NO_TLS_MARKERS = ("cannot speak HTTPS", "VLLM_CPP_OPENSSL", "VLLM_CPP_HF_DOWNLOAD")
+
+# A completed HTTP conversation with the hub. 401 is what the live hub actually
+# returned when this was measured, and 403 and 404 are accepted as proof of the
+# same thing -- the handshake finished and the hub judged the request -- because
+# a mirror may answer an unknown, gated or renamed name any of those ways, and
+# each one rules out both failure modes the audit is looking for.
+HUB_ANSWER_404 = "HuggingFace answered HTTP 404"
+HUB_ANSWER_AUTH = "HuggingFace refused repository"
+
+# `HfParseUrl`/`ApiGet` report a transport failure this way. It means the
+# container never got an answer: no egress, no DNS, a proxy, or a missing trust
+# store. That is not evidence either way about the build, so it is UNVERIFIED.
+HUB_UNREACHABLE = "cannot reach https://"
+
+
+def classify_hub_reach(code: int, output: str) -> tuple[str, str]:
+    """Classify one `--model does-not-exist/nope` run.
+
+    Returns (status, detail) where status is "ok", "fail" or "unverified".
+    Pure string work, so tests/scripts/test_validate_container_image.py can
+    drive every branch without a docker daemon.
+    """
+    if code == 0:
+        return (
+            "fail",
+            "the container exited 0 for a repository that does not exist; the "
+            "resolver did not run or did not refuse",
+        )
+    for marker in NO_TLS_MARKERS:
+        if marker in output:
+            return (
+                "fail",
+                "this image cannot speak HTTPS: the binary printed the build-option "
+                f"message containing {marker!r}, so VLLM_CPP_HF_DOWNLOAD resolved "
+                "OFF or no TLS library was found at build time. `--model org/repo` "
+                "cannot reach huggingface.co from this image",
+            )
+    if HUB_ANSWER_404 in output:
+        return ("ok", f"the hub answered HTTP 404 for {HUB_REACH_MODEL}")
+    if HUB_ANSWER_AUTH in output:
+        return (
+            "ok",
+            f"the hub answered with an authorization status for {HUB_REACH_MODEL}; "
+            "the TLS session completed",
+        )
+    if HUB_UNREACHABLE in output:
+        return (
+            "unverified",
+            "the container could not reach the hub at all (no egress, no DNS, or "
+            "no trust store). This proves nothing about the build; rerun on a host "
+            f"with network access. Output: {output.strip()[-400:]}",
+        )
+    return (
+        "unverified",
+        "the container failed for a reason this audit does not recognise, so it "
+        f"says nothing about TLS. Output: {output.strip()[-400:]}",
+    )
+
+
+def check_hub_reach(image: str, timeout: float) -> tuple[str, str]:
+    """Boot the image against an unknown repository and read what it refused with."""
+    try:
+        code, output = run(
+            ["docker", "run", "--rm", image, "--model", HUB_REACH_MODEL],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # A hang is not a verdict. The server may be waiting on a proxy that
+        # never answers, which says nothing about how it was built.
+        return (
+            "unverified",
+            f"the container did not exit within {timeout:.0f}s, so the audit has "
+            "no reading",
+        )
+    return classify_hub_reach(code, output)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
@@ -339,6 +446,14 @@ def main() -> int:
         help="pass through to `docker run --gpus` (e.g. all) so the boot smoke is "
         "real runtime evidence for an accelerator lane",
     )
+    parser.add_argument(
+        "--skip-hub-reach",
+        action="store_true",
+        help="do not boot the image against huggingface.co. The absence is "
+        "REPORTED, so an image validated this way carries no evidence that "
+        "--model org/repo works",
+    )
+    parser.add_argument("--hub-reach-timeout", type=float, default=120.0)
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--boot-timeout", type=float, default=180.0)
     args = parser.parse_args()
@@ -346,6 +461,15 @@ def main() -> int:
     errors: list[str] = []
     errors += check_config(args.image, args.lane, args.version, args.expect_revision)
     errors += check_layout(args.image, args.version)
+
+    hub_reach_status = "skipped"
+    hub_reach_detail = "not run (--skip-hub-reach): this image has NO evidence that --model org/repo works"
+    if not args.skip_hub_reach:
+        hub_reach_status, hub_reach_detail = check_hub_reach(
+            args.image, args.hub_reach_timeout
+        )
+        if hub_reach_status == "fail":
+            errors.append(f"hub reach: {hub_reach_detail}")
 
     runtime_verified = False
     if args.model is not None:
@@ -384,6 +508,10 @@ def main() -> int:
         )
     else:
         print("  boot: NOT RUN (no --model): this image has NO runtime evidence")
+    if hub_reach_status == "ok":
+        print(f"  hub reach: verified, {hub_reach_detail}")
+    else:
+        print(f"  hub reach: {hub_reach_status.upper()}, {hub_reach_detail}")
     return 0
 
 

@@ -96,7 +96,13 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--dit-config <transformer-config.json>]   REQUIRED when the DiT\n"
       "                                                           carries no __metadata__\n"
       "                [--model-version 2.5] [--pipeline-kind distilled_two_stage]\n"
+      "                --checkpoint-class full|distilled|keyframe_slot_sft\n"
+      "                                                           REQUIRED: which class of\n"
+      "                                                           transformer --dit points at\n"
       "                [--upsampler <latent-spatial-x2.safetensors>]  phase 2 needs it\n"
+      "                [--temporal-upsampler <latent-temporal-x2.safetensors>]\n"
+      "                [--temporal-upsample-rounds 0|1|2]         dfr only; each round\n"
+      "                                                           doubles the frame count\n"
       "                [--max-phase N] [--allow-unported]\n"
       "                [--lora <ic-lora.safetensors> [STRENGTH]]  fused at load; 1.0\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
@@ -176,6 +182,15 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "freezes the clip instead; --regenerate-audio has no effect while the source is\n"
       "a frame folder, because a folder carries no audio and both of upstream\'s audio\n"
       "predicates test for one.\n\n"
+      "WHICH TRANSFORMER --dit POINTS AT is something this tool cannot work out, so\n"
+      "--checkpoint-class is REQUIRED on every pipeline kind but dmd2 (#1137).\n"
+      "Upstream keys a checkpoint class per pipeline and most read Full, while the\n"
+      "distilled arms need the distilled file. The two 22B bf16 transformers are the\n"
+      "same 42,018,190,584 bytes, carry a byte-identical embedded config and both\n"
+      "declare model_version 2.5.0, so no header field separates them. Passing the\n"
+      "wrong one used to RENDER: right size, right frame count, right sample rate,\n"
+      "in a sampling regime the weights were never trained for. It is refused now.\n"
+      "\n"
       "TEXT-TO-AUDIO renders a soundtrack and NO PICTURE. --pipeline-kind\n"
       "t2a_one_stage selects it; the result carries an audio.wav, zero frames and no\n"
       "ffmpeg argv, because there is nothing to mux. --video-vae is not needed and\n"
@@ -266,6 +281,7 @@ int main(int argc, char** argv) {
   // prompt` above is shared by both, which is why it is not repeated here.
   std::string video_cfg_scale, video_stg_scale, video_rescale, video_skip_step;
   std::string video_stg_blocks, a2v_scale, v2a_scale;
+  std::string temporal_rounds;  // DFR's temporal x2/x4 refinement rounds (#986)
   std::string negative_embeds, negative_audio_embeds;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
@@ -300,7 +316,24 @@ int main(int argc, char** argv) {
     else if (f == "--dit-config") SetExtra("dit_config_path", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--model-version") SetExtra("model_version", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--pipeline-kind") SetExtra("pipeline_kind", Need(argc, argv, ++i, f.c_str()));
+    // WHICH CLASS OF TRANSFORMER `--dit` points at: `full`, `distilled` or
+    // `keyframe_slot_sft` (row LTX25-CHECKPOINT-CLASS, issue #1137). REQUIRED on
+    // every pipeline kind whose upstream row states a class, which is every kind
+    // but `dmd2`. The library refuses the load without it and says why; this CLI
+    // forwards the flag rather than defaulting one, because every default here
+    // would pick a sampling regime for the caller.
+    else if (f == "--checkpoint-class")
+      SetExtra("checkpoint_class", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--upsampler") SetExtra("upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    // DFR's SECOND upsampler, and its round count (#986). Upstream splits these
+    // the same way: `--temporal-upsampler-path` is a constructor argument
+    // (dfr_pipeline.py:578-583, :177) and `--temporal-upsample-rounds` is a
+    // `__call__` argument (:584-590, :277), so one is a LOAD extra here and the
+    // other rides the per-generation array.
+    else if (f == "--temporal-upsampler")
+      SetExtra("temporal_upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    else if (f == "--temporal-upsample-rounds")
+      temporal_rounds = Need(argc, argv, ++i, f.c_str());
     else if (f == "--negative-prompt-embeds") {
       negative_embeds = Need(argc, argv, ++i, f.c_str());
       SetExtra("negative_prompt_embeds_path", negative_embeds);
@@ -490,7 +523,14 @@ int main(int argc, char** argv) {
                          std::make_pair("video_skip_step", &video_skip_step),
                          std::make_pair("video_stg_blocks", &video_stg_blocks),
                          std::make_pair("a2v_guidance_scale", &a2v_scale),
-                         std::make_pair("v2a_guidance_scale", &v2a_scale)};
+                         std::make_pair("v2a_guidance_scale", &v2a_scale),
+                         // DFR'S TEMPORAL ROUNDS (#986), mirroring upstream's own
+                         // `--temporal-upsample-rounds` (dfr_pipeline.py:584-590).
+                         // Per-generation because upstream takes it on `__call__`
+                         // (:277) rather than on the constructor, unlike the
+                         // temporal upsampler PATH beside it, which is a load knob
+                         // for the same reason (:177).
+                         std::make_pair("temporal_upsample_rounds", &temporal_rounds)};
   for (const auto& kv : retake_knobs) {
     if (kv.second->empty()) continue;
     gen_keys.emplace_back(kv.first);
@@ -538,6 +578,18 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "  wrote %d frames (%dx%d @ %d fps) + %s (%d Hz)\n", out.frame_count,
                out.width, out.height, out.fps, out.audio_path, out.sample_rate);
+  // WHERE THE RENDER SPENT ITS WALL (ABI v23, issue #1010). This example is a
+  // client of `vllm.h` and nothing else, so it names the table by asking the
+  // handle rather than by guessing a filename beside the frames. Printed on the
+  // shipped default: a render long enough to need the table is one nobody knew
+  // to instrument in advance, and a path printed after the fact is what makes
+  // the evidence retrievable at all.
+  const char* phase_log = vllm_video_last_phase_log(engine);
+  if (phase_log != nullptr) {
+    std::fprintf(stderr, "  phase table: %s\n", phase_log);
+  } else {
+    std::fprintf(stderr, "  phase table: none (this family emits no phase log)\n");
+  }
 
   int status = 0;
   if (!out_path.empty()) {

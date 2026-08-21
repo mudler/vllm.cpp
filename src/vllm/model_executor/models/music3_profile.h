@@ -65,6 +65,35 @@ inline bool& EnabledFlag() {
 
 inline bool Enabled() { return EnabledFlag(); }
 
+// A SECOND opt-in, for the intra-forward spans inside the device DiT
+// (`minimax_music3_device.cpp`, spec §21.3). It is separate from the flag above
+// and that separation is a property of the measurement rather than caution.
+//
+// Attributing time INSIDE one device forward needs a `Backend::Synchronize` at
+// every bracket, because the ops are asynchronous on one stream and an
+// un-drained bracket times the LAUNCH: it would report every GEMM as free and
+// charge its whole cost to whichever bracket happened to contain the next
+// synchronize. The drain is therefore mandatory for the split to mean anything,
+// and it perturbs the very total it is splitting.
+//
+// So `VLLM_CPP_MUSIC3_PROFILE=1` alone leaves the forward byte for byte the path
+// spec §20 timed — `denoise.dit_device` stays comparable to §15.7's and §20's
+// tables value for value — and `VLLM_CPP_MUSIC3_DIT_SPANS=1` opts additionally
+// into a perturbed run whose perturbation is MEASURED by taking both arms rather
+// than asserted to be small.
+//
+// A reference for the same reason `EnabledFlag` is one: a test drives both arms
+// in one process. Nothing on the synthesis path writes it.
+inline bool& DitSpansFlag() {
+  static bool enabled = ParseEnabled(std::getenv("VLLM_CPP_MUSIC3_DIT_SPANS"));
+  return enabled;
+}
+
+// The spans are a REFINEMENT of the profile, never a way to turn it on: with the
+// instrument off there is no table for a span to land in, so asking for spans
+// alone is a no-op rather than a partial arming.
+inline bool DitSpans() { return Enabled() && DitSpansFlag(); }
+
 // A bucket is a LEAF or a SPAN. Leaves partition the run and are summed; spans
 // enclose leaves and are printed for context but never added, because a table
 // whose parts sum past its whole is a table nobody can read. `unattributed` is

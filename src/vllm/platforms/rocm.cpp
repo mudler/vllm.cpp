@@ -57,6 +57,20 @@ class RocmPlatform final : public Platform {
   // whether it may treat host and device memory as one.
   bool is_integrated_gpu() const override { return backend().UnifiedMemory(); }
 
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). Answered from the two device
+  // attributes `ProbeDevice` already reads, through the HIP-free probe rather
+  // than through `UnifiedMemory()`: that one is widened by the managed-alloc
+  // branch, which makes the BACKEND's allocations migratable and says nothing
+  // about whether a kernel may follow a plain host pointer. So this is NARROWER
+  // than `is_integrated_gpu()` above, in the one direction that matters.
+  //
+  // Device 0, matching this leg's other single-device answers. NEVER RUN — no
+  // ROCm hardware is reachable from this project — which is why it reads the
+  // probe rather than hardcoding an answer for a board nobody here can check.
+  bool host_memory_is_device_addressable() const override {
+    return vt::rocm::HostMemoryIsDeviceAddressable(0);
+  }
+
   // --- W0 placeholders. Each is the BASE class answer, stated explicitly here
   // --- with what would change it, so nobody has to guess whether the omission
   // --- was considered.

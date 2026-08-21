@@ -522,6 +522,80 @@ TEST_CASE("adopt: the source pages are released even where device memory is NOT 
   CHECK(m.addr[0] == 0);
 }
 
+TEST_CASE("alias: an ALIASED direct-upload borrow still releases its source pages") {
+  // ENG-EXPERT-STREAM-DEVICE W0f (#1299), found by a fresh review. W0f gave
+  // `ResidentWeight` a third residency: on a platform whose kernels can
+  // dereference host storage it ALIASES the bytes and never populates `d_dev`,
+  // so `AdoptDeviceBytesAsHost` is never called for that weight. That function
+  // is the only other caller of `ReleaseDirectUploadSource`, so the alias branch
+  // became a third path past a release whose own ordering comment insists it
+  // happens on EVERY path, including the `VT_ADOPT_DEVICE_BYTES=0` arm.
+  //
+  // A borrow reaches the alias branch when it is already
+  // `kDeviceAliasAlignment`-aligned, and an `mmap` return always is, so this is
+  // not a corner case: it is every direct-upload borrow on such a platform.
+  // Without the fix the mapping's consumed pages stay resident for the life of
+  // the process, silently, and issue #150's measurement stops being true.
+  ForcedResidencyArm arm;
+  ObservableMapping m;
+  vllm::OwnedTensor w = BorrowedWeight(m, 2 * PageSize());
+  REQUIRE(w.bytes.borrowed());
+  REQUIRE(w.mmap_src == static_cast<const void*>(m.addr));
+  // Asserted, not assumed: the case proves nothing if the borrow declines.
+  REQUIRE(reinterpret_cast<uintptr_t>(w.bytes.data()) %
+              vllm::kDeviceAliasAlignment == 0);
+
+  CHECK(vllm::MakeHostBytesDeviceAliasable(w));
+
+  // The borrow is UNTOUCHED, because an alias moves nothing...
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == static_cast<const void*>(m.addr));
+  CHECK_FALSE(m.dropped);
+  // ...and the consumed source pages were released all the same. Zero means the
+  // madvise ran; the source pattern would mean it did not.
+  CHECK(m.addr[0] == 0);
+  // The record is SPENT, and clearing it is the memo. See the once-only case
+  // below for why this branch needs one at all.
+  CHECK(w.mmap_src == nullptr);
+  CHECK(w.mmap_src_bytes == 0);
+}
+
+TEST_CASE("alias: the source pages are released ONCE, not once per forward step") {
+  // THE REPEAT THE PAGE-RELEASE FIX INTRODUCED (a fresh review of #1299 caught
+  // it). `AdoptDeviceBytesAsHost` calls `ReleaseDirectUploadSource` from behind
+  // `if (!w.d_dev)`, so it ran exactly once per weight for the life of the
+  // process. The alias branch has NO such memo: `ResidentWeight` re-tests the
+  // alignment on every call, about 1,361 times per forward step on the target
+  // checkpoint. Left uncleared, `mmap_src` would make every one of those calls
+  // `madvise(MADV_DONTNEED)` the pages the GPU is about to read, and the kernel
+  // would fault them straight back in — correct output, and a throughput
+  // regression invisible to every token gate.
+  //
+  // THE FIRST VERSION OF THIS CASE ASSERTED ONLY THAT THE RELEASE HAPPENED. That
+  // is satisfied by a release that happens every time, which is the defect. This
+  // asserts the COUNT, by restoring the pattern and looking for it again.
+  ForcedResidencyArm arm;
+  ObservableMapping m;
+  vllm::OwnedTensor w = BorrowedWeight(m, 2 * PageSize());
+  REQUIRE(reinterpret_cast<uintptr_t>(w.bytes.data()) %
+              vllm::kDeviceAliasAlignment == 0);
+
+  CHECK(vllm::MakeHostBytesDeviceAliasable(w));
+  REQUIRE(m.addr[0] == 0);  // the first release ran; the case is not vacuous
+
+  // Re-arm the observation, then take the SAME branch again the way a second
+  // decode step would.
+  std::memset(m.addr, kSrcPattern, m.size);
+  CHECK(vllm::MakeHostBytesDeviceAliasable(w));
+  CHECK(vllm::MakeHostBytesDeviceAliasable(w));
+
+  // The pattern SURVIVES: no second madvise. The alias itself still succeeded
+  // above, so this is a count and not a disabled branch.
+  CHECK(m.addr[0] == kSrcPattern);
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == static_cast<const void*>(m.addr));
+}
+
 TEST_CASE("adopt: VT_ADOPT_DEVICE_BYTES=0 moves ONLY the adoption, not the page release") {
   ForcedResidencyArm arm;
   ScopedEnvVar adopt_off("VT_ADOPT_DEVICE_BYTES", "0");

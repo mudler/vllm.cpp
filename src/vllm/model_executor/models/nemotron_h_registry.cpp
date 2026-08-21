@@ -28,8 +28,10 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_reader.h"  // IsNemotronHGguf
 #include "vllm/model_executor/models/nemotron_h.h"
 #include "vllm/model_executor/models/nemotron_h_forward.h"
 #include "vllm/model_executor/models/nemotron_h_loader.h"
@@ -90,11 +92,12 @@ std::unique_ptr<LoadedModel> LoadNemotronHForCausalLM(
   if (source.kind != ModelSource::Kind::kSafetensors) {
     // AGENTS.md makes GGUF k-quants a standing requirement, not a per-model
     // choice; it is OWED here (spec §5b, W7) and refused BY NAME rather than
-    // routed to a supported path behind the caller's back.
-    throw std::runtime_error(
-        "Model architecture NemotronHForCausalLM does not support GGUF weights "
-        "yet: the GGUF k-quant/i-quant arm is not ported (see "
-        ".agents/specs/nemotron-h-model.md §5b W7)");
+    // routed to a supported path behind the caller's back. The text lives in
+    // `NemotronHGgufRefusal` because the entrypoint's GGUF architecture
+    // dispatch throws the SAME refusal before it ever gets here (#809): a real
+    // `nemotron_h*` file is refused at the door it actually arrives at, and
+    // this guard still covers a direct `Kind::kGguf` caller.
+    throw std::runtime_error(NemotronHGgufRefusal());
   }
   // The config descent IS the validation, and it refuses by name on anything
   // this bring-up cannot represent.
@@ -220,6 +223,22 @@ const ModelFactory kNemotronHFactory{
 };
 
 }  // namespace
+
+// The GGUF-side half of the arch entry points. Kept in THIS TU, next to the
+// factory whose guard throws the same string, so the refusal has one owner and
+// the entrypoint dispatch borrows it instead of restating it.
+bool IsNemotronHGguf(const GgufFile& gguf) {
+  const GgufValue* arch = gguf.FindKv("general.architecture");
+  if (arch == nullptr || arch->TypeId() != kGgufString) return false;
+  const std::string& name = std::get<std::string>(arch->v);
+  return name == kNemotronHGgufArch || name == kNemotronHMoeGgufArch;
+}
+
+std::string NemotronHGgufRefusal() {
+  return "Model architecture NemotronHForCausalLM does not support GGUF "
+         "weights yet: the GGUF k-quant/i-quant arm is not ported (see "
+         ".agents/specs/nemotron-h-model.md §5b W7)";
+}
 
 const NemotronHLoadReport& NemotronHLoadReportOf(const LoadedModel& model) {
   const auto* nh = dynamic_cast<const NemotronHLoadedModel*>(&model);

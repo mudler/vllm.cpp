@@ -46,6 +46,20 @@ the row did not support.
    measurement is four days old and the NAS is a shared mount. The temporal
    checkpoint named at `ltx-pipelines/docs/pipelines.md:176` is **absent**, so
    every temporal claim here is a reduced-dimension fixture claim.
+
+   **This bullet went false on 2026-08-17, one day after its own re-check, and
+   the re-check is exactly why that is visible.** `LTX25-DFR-ROUNDS`
+   ([#986](https://github.com/mudler/vllm.cpp/issues/986)) measured the directory
+   again on 2026-08-20 and found
+   `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` present, 261944000
+   bytes, complete by header arithmetic, declaring
+   `spatial_upsample: false, temporal_upsample: true`. The bullet is left as
+   written because the discipline it demonstrates is the point — dating a
+   measurement is what let the next row find the day it expired. The CONCLUSION
+   still holds for a different reason: every temporal claim is still a
+   reduced-dimension fixture claim, now because no `keyframe_slot_sft` BASE is
+   published rather than because the upsampler is missing. See
+   [`ltx25-dfr-rounds.md`](ltx25-dfr-rounds.md) §0.3 and §0.4.
 3. **The GPU is not used.** A render ladder holds `dgx.casa` and the box
    OOM-reboots when the 119 GiB unified pool is exhausted. CPU gate only.
 4. **Upstream ships no tests.** `find /home/mudler/_git/LTX-2 -name 'test_*.py'`
@@ -530,12 +544,13 @@ there.
 
 ## Owed
 
-- [#986](https://github.com/mudler/vllm.cpp/issues/986) — **DFR's temporal
+- ~~[#986](https://github.com/mudler/vllm.cpp/issues/986) — **DFR's temporal
   refinement rounds** (`dfr_pipeline.py:402-529`), which is what would DRIVE the
-  temporal x2 latent upsampler. Refused by name at the request surface. What is
-  unreached is the rounds loop itself; the operator, the canvas layout and the
-  slots it needs are all ported and gated here. §12.2 says why it is not in this
-  row, and `docs/FEATURES.md`'s UNDRIVEN cell is correct until it lands.
+  temporal x2 latent upsampler.~~ **DISCHARGED 2026-08-20 by `LTX25-DFR-ROUNDS`**
+  ([`ltx25-dfr-rounds.md`](ltx25-dfr-rounds.md)). That row extracted the callable
+  stage seam §12.2 named as the blocker, landed the loop, and made the rounds the
+  temporal upsampler's first production caller. `docs/FEATURES.md` now reads
+  `Temporal x2 ups DRIVEN.`
 - [#986](https://github.com/mudler/vllm.cpp/issues/986) — the standalone
   single-frame decode of a generated keyframe slot, and the surface that would
   return slot PIXELS to a caller. DFR keeps its slots in latent space (§2b), so
@@ -558,7 +573,36 @@ there.
 
 ## Now
 
-`ACTIVE`. The DFR base and the generated keyframe slots are implemented and
-gated on `row/LTX25-DFR-PIPELINE`, in review. The temporal rounds are refused
-by name and owed above, so the temporal upsampler remains UNDRIVEN and
-`docs/FEATURES.md` still says so.
+`DONE`. The DFR base and the generated keyframe slots are implemented, gated and
+landed. The temporal rounds this row owed are landed too, by `LTX25-DFR-ROUNDS`
+([`ltx25-dfr-rounds.md`](ltx25-dfr-rounds.md), #986), so the temporal upsampler
+is DRIVEN and `docs/FEATURES.md` says so. What stays owed on this row is a
+real-weights DFR render, blocked on a published `keyframe_slot_sft` base that
+nothing in this tree can supply.
+
+**The surfaces this `ACTIVE` -> `DONE` owes, decided rather than left implicit.**
+`AGENTS.md` `## Public documents` says a lifecycle change owes `docs/STATUS.md`,
+`docs/BENCHMARKS.md` and the moved row spec's `## Now`. The fresh review of
+[#1481](https://github.com/mudler/vllm.cpp/pull/1481) found the third written and
+the first two not, and raised it. Each is answered here:
+
+- **`docs/STATUS.md` is written, in the shape it has since #1491.** That change
+  reduced it to current state and REMOVED the per-capability table this row would
+  once have gained a line in; it now carries one row per user-facing SURFACE and
+  routes per-row lifecycle to the internal matrices it names, with
+  `docs/FEATURES.md` called out in the file as "the current keyed capability
+  projection". So there is no DFR row to write and never will be. What was
+  genuinely stale is the `Image, video, audio, speech, music, and diffusion
+  models` surface, whose limitation cell named three LTX-2.5 issues and not the
+  one that binds this arm, and that cell now carries the unpublished
+  `keyframe_slot_sft` base and the ungated tiling. The capability detail stays in
+  `docs/FEATURES.md`, because a fact stated in two projections is how two
+  projections drift apart.
+- **`docs/BENCHMARKS.md` is NOT owed, and the rule says so on its own terms.** It
+  changes when a row "gains an accepted or explicitly pending/failed/void
+  measurement". This row gained none of the four. It took no lease, ran no
+  oracle and made no throughput, latency or memory claim, and its arm is refused
+  on real weights, so there is no workload either side could run. Writing a row
+  there would be inventing a keyed record with no measurement in it, which is
+  worse than the silence: a reader would take it for a measurement that exists.
+- **The moved row's `## Now`** is this section.

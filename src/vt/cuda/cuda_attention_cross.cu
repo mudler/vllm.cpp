@@ -4,14 +4,21 @@
 // that kernel.
 //
 // WHY IT HAD TO BE WRITTEN NOW, and not deferred again. Before this TU the op had
-// a CPU kernel only. On a DISCRETE CUDA device `GetOp` refuses, which is at least
-// loud. On GB10 it is worse and quieter: `Backend::UnifiedMemory()` is true, so
-// `RegisterReferenceTier` installs the CPU kernel for the accelerator and every
-// cross-attention in the DiT would have executed on the HOST over unified memory
-// — running, correct, and making "the forward ran on the GPU" false. LTX-2.5's
-// block reaches this op six times per layer (two text cross-attentions, two
-// audio<->video cross-attentions, and both self-attentions whenever a mask
-// supplies a score bias), so that is most of the attention in the model.
+// a CPU kernel only, and `GetOp` on a CUDA device would have installed the
+// portable CPU tier: the gate read `Backend::UnifiedMemory()`, which GB10
+// reports true. Every cross-attention in the DiT would have left the GPU.
+// LTX-2.5's block reaches this op six times per layer (two text
+// cross-attentions, two audio<->video cross-attentions, and both self-attentions
+// whenever a mask supplies a score bias), so that is most of the attention in
+// the model.
+//
+// That gate now reads `Backend::DeviceMemoryIsHostAddressable()`, which CUDA
+// answers false because it allocates with `cudaMalloc` (#844, #1435), so the
+// same absence would be a named refusal today rather than a silent host run.
+// The original note called the host run "correct", and it was not: the host
+// kernel dereferences device pointers and the process gets SIGSEGV. Either way
+// the conclusion is unchanged — this kernel had to exist — and the refusal makes
+// the reason legible instead of leaving it to a crash.
 //
 // PORTED FROM, in structure: `AttentionDenseFlashKernel`
 // (src/vt/cuda/cuda_ops.cu:3229-3318), itself a 1:1 structural port of the

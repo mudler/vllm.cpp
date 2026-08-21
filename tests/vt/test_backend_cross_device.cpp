@@ -2134,6 +2134,212 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
   }
 }
 
+TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
+  // Port of upstream's tests/kernels/quantization/test_rocm_skinny_gemms.py
+  // ::test_rocm_wvsplitk_kernel @ pin 55596792 (review sweep on #506: the first
+  // version of this case had aggregate-NMSE tolerance that ten completely
+  // wrong elements would still pass, every K a multiple of the 512 stride so
+  // the K-tail path never ran, and no guard-boundary shapes at all).
+  //
+  // Preserved from upstream: the NKM factor list (the applicable subset — see
+  // below), the xavier on/off scaling, and the ELEMENTWISE tolerance
+  // atol = eps_bf16 * sqrt(K), rtol = 1e-2 (torch.testing.assert_close
+  // semantics). Deferred with reason: fp16 (our port is bf16-only), bias
+  // (the vt::MatmulBT seam has no bias operand), padded strides (our dispatch
+  // requires contiguous rows — a documented precondition), and the fp8/rc
+  // kernel variants (not ported). The (n,k,m) upstream triple = (tokens, K,
+  // features) here.
+  struct Shape { int64_t tok, k, feat; const char* why; };
+  const Shape shapes[] = {
+      // the upstream sweep (token counts 1-4 = our template arms)
+      {1, 32, 16, "upstream"}, {1, 64, 64, "upstream"}, {2, 256, 256, "upstream"},
+      {3, 1024, 1024, "upstream"}, {4, 4096, 4096, "upstream"},
+      // K-tail: K % 512 != 0 exercises the `if (k_ >= K) break` remainder path
+      {4, 4096 + 16, 4096, "k-tail"}, {1, 9216, 512, "upstream"},
+      // guard boundaries (must stay CORRECT via the BLAS fallback)
+      {2, 256, 8, "features<=8 declines (upstream m>8)"},
+      {2, 256, 254, "even below bound: takes skinny"},
+      {2, 256, 255, "odd features decline (YTILE=2 OOB class)"},
+      {2, 254, 256, "K%8!=0 declines"},
+  };
+  const double kEpsBf16 = 0.0078125;  // 2^-8
+  for (const Shape& sh : shapes) {
+    for (bool xnorm : {false, true}) {
+      CAPTURE(sh.why);
+      CAPTURE(sh.tok);
+      CAPTURE(sh.k);
+      CAPTURE(sh.feat);
+      CAPTURE(xnorm);
+      const int64_t M = sh.tok, N = sh.feat, K = sh.k;
+      const size_t an = static_cast<size_t>(M) * K, bn = static_cast<size_t>(N) * K;
+      const double xavier = xnorm ? std::sqrt(2.0 / static_cast<double>(K)) : 1.0;
+      std::vector<float> a = RandomVec(an, 991, -1.0f, 1.0f);
+      std::vector<float> b = RandomVec(bn, 992, -1.0f, 1.0f);
+      for (float& x : a) x = static_cast<float>(x * xavier);
+      for (float& x : b) x = static_cast<float>(x * xavier);
+      const std::vector<uint16_t> a_bf = Bf16Bits(a), b_bf = Bf16Bits(b);
+
+      std::vector<uint16_t> ref(static_cast<size_t>(M) * N, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint16_t> ca = a_bf, cb = b_bf;
+        Tensor ta = Tensor::Contiguous(ca.data(), DType::kBF16, cd, {M, K});
+        Tensor tb = Tensor::Contiguous(cb.data(), DType::kBF16, cd, {N, K});
+        Tensor to = Tensor::Contiguous(ref.data(), DType::kBF16, cd, {M, N});
+        vt::MatmulBT(cq, to, ta, tb);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMatmulBT, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        // Sentinel-padded output: the dispatch must never write past M*N
+        // elements (the odd-features OOB class from the review).
+        const size_t out_elems = static_cast<size_t>(M) * N;
+        const size_t guard_elems = 128;
+        DevBufBytes da(dev, q, an * 2), db(dev, q, bn * 2),
+            dout(dev, q, (out_elems + guard_elems) * 2);
+        std::vector<uint16_t> fill(out_elems + guard_elems, 0xDEAD);
+        dout.Upload(fill.data());
+        da.Upload(a_bf.data());
+        db.Upload(b_bf.data());
+        Tensor ta = Tensor::Contiguous(da.ptr(), DType::kBF16, d, {M, K});
+        Tensor tb = Tensor::Contiguous(db.ptr(), DType::kBF16, d, {N, K});
+        Tensor to = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+        vt::MatmulBT(q, to, ta, tb);
+        std::vector<uint16_t> got(out_elems + guard_elems);
+        dout.Download(got.data());
+        // Elementwise tolerance (upstream assert_close), never aggregate NMSE.
+        const double atol = kEpsBf16 * std::sqrt(static_cast<double>(K));
+        for (size_t i = 0; i < out_elems; ++i) {
+          uint32_t ug = static_cast<uint32_t>(got[i]) << 16, ur = static_cast<uint32_t>(ref[i]) << 16;
+          float gf, rf;
+          std::memcpy(&gf, &ug, 4);
+          std::memcpy(&rf, &ur, 4);
+          CHECK(std::fabs(gf - rf) <= atol + 1e-2 * std::fabs(rf));
+        }
+        // The guard band must be untouched by ANY path (skinny or BLAS).
+        for (size_t i = out_elems; i < out_elems + guard_elems; ++i)
+          CHECK(got[i] == 0xDEAD);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
+  // The "paged attention" case above hand-builds a contiguous KV cache; the
+  // real model path writes it with ReshapeAndCache and reads it back. This
+  // case is that composition, at real model dims (Dh=256, Hq=8, Hkv=2,
+  // block_size 16), a shuffled block table, and a non-sequential slot mapping
+  // — the layout a stride/scatter bug would live in and the contiguous case
+  // cannot see.
+  constexpr int64_t T = 20, Hq = 8, Hkv = 2, Dh = 256, BS = 16;
+  constexpr int64_t kBlocks = 4;                 // 4 blocks x 16 slots = 64 >= 20
+  const size_t qn = static_cast<size_t>(T) * Hq * Dh;
+  const size_t kvn = static_cast<size_t>(T) * Hkv * Dh;
+  const size_t cachen = static_cast<size_t>(kBlocks) * BS * Hkv * Dh;
+  const std::vector<float> q = RandomVec(qn, 711);
+  const std::vector<float> k = RandomVec(kvn, 712);
+  const std::vector<float> v = RandomVec(kvn, 713);
+  // The slot mapping must DERIVE from the logical position through the
+  // (shuffled) block table — exactly what the engine produces — otherwise the
+  // attention read of logical position p lands on a slot nothing wrote and
+  // both backends compare zeros (review on #497: the first version's
+  // (i*7+3)%64 scatter was disjoint from the block table, so the composition
+  // exercised mostly-unwritten cache).
+  std::vector<int32_t> block_table = {3, 1, 2, 0};  // shuffled physical blocks
+  std::vector<int64_t> slots(T);
+  for (int64_t i = 0; i < T; ++i)
+    slots[i] = static_cast<int64_t>(block_table[static_cast<size_t>(i / BS)]) * BS + (i % BS);
+  std::vector<int32_t> seq_lens = {T};
+  std::vector<int32_t> qsl = {0, T};
+  vt::PagedAttentionArgs pa;
+  pa.scale = 1.0f / std::sqrt(static_cast<float>(Dh));
+  pa.causal = true;
+
+  std::vector<float> ref_out(static_cast<size_t>(T) * Hq * Dh, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> q_host = q, ck = k, cv = v;
+    std::vector<float> ckc(cachen, 0.0f), cvc(cachen, 0.0f);
+    std::vector<int64_t> cslots = slots;
+    std::vector<int32_t> cbt = block_table, csl = seq_lens, cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(q_host.data(), DType::kF32, cd, {T, Hq, Dh});  // contiguous (op contract)
+    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {T, Hkv, Dh});
+    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {T, Hkv, Dh});
+    Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
+    Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
+    Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {T});
+    vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
+    Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
+    Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
+    Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
+    Tensor to = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, Hq, Dh});
+    vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kPagedAttention, dt) || !OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q_ = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q_, qn), dk(dev, q_, kvn), dv(dev, q_, kvn),
+        dkc(dev, q_, cachen), dvc(dev, q_, cachen), dout(dev, q_, static_cast<size_t>(T) * Hq * Dh);
+    DevBufBytes dsm(dev, q_, T * 8), dbt(dev, q_, kBlocks * 4), dsl_(dev, q_, 4), dqsl(dev, q_, 8);
+    dq.Upload(q); dk.Upload(k); dv.Upload(v);
+    dkc.Upload(std::vector<float>(cachen, 0.0f)); dvc.Upload(std::vector<float>(cachen, 0.0f));
+    dsm.Upload(slots.data()); dbt.Upload(block_table.data());
+    dsl_.Upload(seq_lens.data()); dqsl.Upload(qsl.data());
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, Hq, Dh});  // contiguous (op contract)
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, Hkv, Dh});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, Hkv, Dh});
+    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
+    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
+    Tensor tsm = Tensor::Contiguous(dsm.ptr(), DType::kI64, d, {T});
+    vt::ReshapeAndCache(q_, tk, tv, tkc, tvc, tsm);
+    Tensor tbt = Tensor::Contiguous(dbt.ptr(), DType::kI32, d, {1, kBlocks});
+    Tensor tsl = Tensor::Contiguous(dsl_.ptr(), DType::kI32, d, {1});
+    Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), DType::kI32, d, {2});
+    Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, Hq, Dh});
+    vt::PagedAttention(q_, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+
+    // Anti-vacuity guard (review on #497): a WRONG physical mapping must NOT
+    // reproduce the reference — if the composition were vacuous (reads never
+    // hitting writes), a corrupted table would compare equal. Blocks 0 and 2
+    // both carry real tokens under the true table, so swapping them must
+    // change the output.
+    // Swap the mapping of the first two LOGICAL blocks — both hold real
+    // tokens (0-15 and 16-19), so the read path changes. (The first version
+    // of this guard swapped two blocks OUTSIDE the logical range and was
+    // itself vacuous — the guard proved the guard.)
+    std::vector<int32_t> bad_table = {1, 3, 2, 0};
+    DevBufBytes dbt_bad(dev, q_, kBlocks * 4);
+    dbt_bad.Upload(bad_table.data());
+    DevBuf dout2(dev, q_, static_cast<size_t>(T) * Hq * Dh);
+    Tensor tbt2 = Tensor::Contiguous(dbt_bad.ptr(), DType::kI32, d, {1, kBlocks});
+    Tensor to2 = Tensor::Contiguous(dout2.ptr(), DType::kF32, d, {T, Hq, Dh});
+    vt::PagedAttention(q_, to2, tq, tkc, tvc, tbt2, tsl, tqsl, pa);
+    const std::vector<float> bad_out = dout2.Download();
+    bool any_diff = false;
+    for (size_t i = 0; i < ref_out.size(); ++i)
+      if (std::fabs(bad_out[i] - ref_out[i]) > 1e-3f) { any_diff = true; break; }
+    CHECK_MESSAGE(any_diff,
+                  "a corrupted block table must change the attention output — "
+                  "otherwise the composition test is vacuous");
+    dev.DestroyQueue(q_);
+  }
+}
+
+
 // Scalar bf16 RNE round-trip helpers for host-side oracles (the MoE combine
 // gate reference rounds the shared term through bf16 exactly like the kernel).
 static uint16_t F32ToBf16Rne(float f) {
@@ -2265,115 +2471,6 @@ TEST_CASE("MoE combine/gate ops match the CPU oracle") {
     dev.DestroyQueue(q);
   }
 }
-
-TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
-  // The "paged attention" case above hand-builds a contiguous KV cache; the
-  // real model path writes it with ReshapeAndCache and reads it back. This
-  // case is that composition, at real model dims (Dh=256, Hq=8, Hkv=2,
-  // block_size 16), a shuffled block table, and a non-sequential slot mapping
-  // — the layout a stride/scatter bug would live in and the contiguous case
-  // cannot see.
-  constexpr int64_t T = 20, Hq = 8, Hkv = 2, Dh = 256, BS = 16;
-  constexpr int64_t kBlocks = 4;                 // 4 blocks x 16 slots = 64 >= 20
-  const size_t qn = static_cast<size_t>(T) * Hq * Dh;
-  const size_t kvn = static_cast<size_t>(T) * Hkv * Dh;
-  const size_t cachen = static_cast<size_t>(kBlocks) * BS * Hkv * Dh;
-  const std::vector<float> q = RandomVec(qn, 711);
-  const std::vector<float> k = RandomVec(kvn, 712);
-  const std::vector<float> v = RandomVec(kvn, 713);
-  // The slot mapping must DERIVE from the logical position through the
-  // (shuffled) block table — exactly what the engine produces — otherwise the
-  // attention read of logical position p lands on a slot nothing wrote and
-  // both backends compare zeros (review on #497: the first version's
-  // (i*7+3)%64 scatter was disjoint from the block table, so the composition
-  // exercised mostly-unwritten cache).
-  std::vector<int32_t> block_table = {3, 1, 2, 0};  // shuffled physical blocks
-  std::vector<int64_t> slots(T);
-  for (int64_t i = 0; i < T; ++i)
-    slots[i] = static_cast<int64_t>(block_table[static_cast<size_t>(i / BS)]) * BS + (i % BS);
-  std::vector<int32_t> seq_lens = {T};
-  std::vector<int32_t> qsl = {0, T};
-  vt::PagedAttentionArgs pa;
-  pa.scale = 1.0f / std::sqrt(static_cast<float>(Dh));
-  pa.causal = true;
-
-  std::vector<float> ref_out(static_cast<size_t>(T) * Hq * Dh, 0.0f);
-  {
-    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-    Queue cq = cpu.CreateQueue();
-    const Device cd{DeviceType::kCPU, 0};
-    std::vector<float> q_host = q, ck = k, cv = v;
-    std::vector<float> ckc(cachen, 0.0f), cvc(cachen, 0.0f);
-    std::vector<int64_t> cslots = slots;
-    std::vector<int32_t> cbt = block_table, csl = seq_lens, cqsl = qsl;
-    Tensor tq = Tensor::Contiguous(q_host.data(), DType::kF32, cd, {T, Hq, Dh});  // contiguous (op contract)
-    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {T, Hkv, Dh});
-    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {T, Hkv, Dh});
-    Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
-    Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
-    Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {T});
-    vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
-    Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
-    Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
-    Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
-    Tensor to = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, Hq, Dh});
-    vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
-    cpu.DestroyQueue(cq);
-  }
-  for (DeviceType dt : RegisteredDevices()) {
-    if (!OpAvailable(vt::OpId::kPagedAttention, dt) || !OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
-    CAPTURE(DeviceName(dt));
-    vt::Backend& dev = vt::GetBackend(dt);
-    Queue q_ = dev.CreateQueue();
-    const Device d{dt, 0};
-    DevBuf dq(dev, q_, qn), dk(dev, q_, kvn), dv(dev, q_, kvn),
-        dkc(dev, q_, cachen), dvc(dev, q_, cachen), dout(dev, q_, static_cast<size_t>(T) * Hq * Dh);
-    DevBufBytes dsm(dev, q_, T * 8), dbt(dev, q_, kBlocks * 4), dsl_(dev, q_, 4), dqsl(dev, q_, 8);
-    dq.Upload(q); dk.Upload(k); dv.Upload(v);
-    dkc.Upload(std::vector<float>(cachen, 0.0f)); dvc.Upload(std::vector<float>(cachen, 0.0f));
-    dsm.Upload(slots.data()); dbt.Upload(block_table.data());
-    dsl_.Upload(seq_lens.data()); dqsl.Upload(qsl.data());
-    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, Hq, Dh});  // contiguous (op contract)
-    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, Hkv, Dh});
-    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, Hkv, Dh});
-    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
-    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
-    Tensor tsm = Tensor::Contiguous(dsm.ptr(), DType::kI64, d, {T});
-    vt::ReshapeAndCache(q_, tk, tv, tkc, tvc, tsm);
-    Tensor tbt = Tensor::Contiguous(dbt.ptr(), DType::kI32, d, {1, kBlocks});
-    Tensor tsl = Tensor::Contiguous(dsl_.ptr(), DType::kI32, d, {1});
-    Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), DType::kI32, d, {2});
-    Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, Hq, Dh});
-    vt::PagedAttention(q_, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
-    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
-
-    // Anti-vacuity guard (review on #497): a WRONG physical mapping must NOT
-    // reproduce the reference — if the composition were vacuous (reads never
-    // hitting writes), a corrupted table would compare equal. Blocks 0 and 2
-    // both carry real tokens under the true table, so swapping them must
-    // change the output.
-    // Swap the mapping of the first two LOGICAL blocks — both hold real
-    // tokens (0-15 and 16-19), so the read path changes. (The first version
-    // of this guard swapped two blocks OUTSIDE the logical range and was
-    // itself vacuous — the guard proved the guard.)
-    std::vector<int32_t> bad_table = {1, 3, 2, 0};
-    DevBufBytes dbt_bad(dev, q_, kBlocks * 4);
-    dbt_bad.Upload(bad_table.data());
-    DevBuf dout2(dev, q_, static_cast<size_t>(T) * Hq * Dh);
-    Tensor tbt2 = Tensor::Contiguous(dbt_bad.ptr(), DType::kI32, d, {1, kBlocks});
-    Tensor to2 = Tensor::Contiguous(dout2.ptr(), DType::kF32, d, {T, Hq, Dh});
-    vt::PagedAttention(q_, to2, tq, tkc, tvc, tbt2, tsl, tqsl, pa);
-    const std::vector<float> bad_out = dout2.Download();
-    bool any_diff = false;
-    for (size_t i = 0; i < ref_out.size(); ++i)
-      if (std::fabs(bad_out[i] - ref_out[i]) > 1e-3f) { any_diff = true; break; }
-    CHECK_MESSAGE(any_diff,
-                  "a corrupted block table must change the attention output — "
-                  "otherwise the composition test is vacuous");
-    dev.DestroyQueue(q_);
-  }
-}
-
 
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;

@@ -24,7 +24,7 @@ path's head, and anything on the `unsloth` repos.
 ## The gap, verified against current code
 
 `LoadLmHeadAnyDtype`'s `U8` branch
-(`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:266-306`) runs
+(`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:267-307`) runs
 `DequantCtNvfp4WeightToF32` into a full f32 array, rounds to BF16, then
 `TransposeBf16` into an `OwnedTensor {in_dim, out_dim}`. The comment at
 `:205-211` records this as deliberate deferral:
@@ -70,7 +70,7 @@ an Ampere tile on an `sm_121a` part.
 
    **Deviation, ratified in review:** the design said to retire the stale
    "lm_head is never quantized" rule in `IsQwen27QuantizedLinear`
-   (`qwen3_5_dense_weights.cpp:527` today, not `:506`). It was deliberately NOT
+   (`qwen3_5_dense_weights.cpp:528` today, not `:506`). It was deliberately NOT
    retired: the function has ZERO production callers — only its own routing test
    in `test_qwen27_dense_forward.cpp` — so changing it would move no behavior
    while invalidating a checked-in expectation. The routing that matters lives in

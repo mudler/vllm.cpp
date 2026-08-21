@@ -211,8 +211,14 @@ and `vllm-server` still binds plain hypertext transfer protocol on `0.0.0.0:8000
 exactly as before. Put a reverse proxy in front of it if you need TLS on the
 serving side.
 
-The container image carries both halves already: `libssl3` for the library and
-`ca-certificates` for the trust store.
+The container image carries all three parts: `libssl-dev` in the builder stage,
+which is what makes the server LINK OpenSSL at all, then `libssl3` for the
+library at run time and `ca-certificates` for the trust store. Naming only the
+last two was issue [#1517](https://github.com/mudler/vllm.cpp/issues/1517): the
+images shipped the runtime half without the build half, so `ldd` on the server
+listed no `libssl` and `--model org/repo` refused every repository while every
+gate stayed green. `scripts/check-build-runtime-deps.py` now refuses a builder
+stage or release lane that compiles the server without the development files.
 
 ## Current limitations
 

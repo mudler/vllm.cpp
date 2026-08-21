@@ -89,9 +89,11 @@ CHECKERS=(
   check-windows-release-state
   check-container-matrix
   check-container-workflow
+  check-build-runtime-deps
   check-role-discipline
   claim-view
   check-readme-structure
+  check-quickstart-recipes
   check-public-doc-tables
   check-model-checklist
   check-supported-models
@@ -122,6 +124,7 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_check_build_runtime_deps
   test_validate_container_image
   test_release_index
   test_release_metadata
@@ -138,6 +141,7 @@ SUITES=(
   test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
+  test_check_quickstart_recipes
   test_check_public_doc_tables
   test_check_model_checklist
   test_check_supported_models

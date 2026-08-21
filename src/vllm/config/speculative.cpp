@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -74,15 +75,39 @@ constexpr std::array<std::string_view, 26> kUpstreamUnimplementedKeys = {
     "synthetic_acceptance_length",            // :232
 };
 
+// Class 2: an upstream key whose value space we implement exactly ONE point of.
+// Named as a set (#1598) rather than spelled inline, because the chain's entry
+// admission has to make the SAME three-way split and a second hand-written
+// comparison is how the split was lost there in the first place. `CheckEntryKeys`
+// reads this array; so does the top-level admission loop.
+//
+// Both are ENGINE-WIDE. `draft_sample_method` describes how a draft is sampled
+// and `rejection_sample_method` describes the verify, and the verify is one
+// verify however many speculators propose into it — which is why the top level
+// honours them BESIDE a chain, and why an ENTRY is the one place they cannot be
+// spelled.
+constexpr std::array<std::string_view, 2> kEngineWideValueGatedKeys = {
+    "draft_sample_method",     // :77 alias, :283 field @ 555967922
+    "rejection_sample_method"  // :78 alias, :216 field @ 555967922
+};
+
 // The tail every refusal carries, so the message closes the user's search
 // instead of only ending it. Class 2 is spelled with its one accepted value
 // because "supported" would otherwise overstate what those keys accept.
 constexpr std::string_view kSupportedKeys =
     "supported keys: method, num_speculative_tokens, model, prompt_lookup_min, "
     "prompt_lookup_max, draft_sample_method (only \"greedy\"), "
-    "rejection_sample_method (only \"standard\")";
+    "rejection_sample_method (only \"standard\"), and this engine's own "
+    "vllm_cpp.drafter_chain (SPEC-DRAFTER-CHAIN)";
 
 bool Contains(const std::array<std::string_view, 5>& set, const std::string& key) {
+  for (std::string_view k : set) {
+    if (k == key) return true;
+  }
+  return false;
+}
+
+bool Contains(const std::array<std::string_view, 2>& set, const std::string& key) {
   for (std::string_view k : set) {
     if (k == key) return true;
   }
@@ -111,6 +136,253 @@ void CheckValueGatedKey(const nlohmann::json& doc, const char* key,
                               " is not implemented. " + reason);
 }
 
+
+// SPEC-DRAFTER-CHAIN W1 (#1522) — the `vllm_cpp.drafter_chain` extension.
+//
+// WHY THE FIELD IS NESTED UNDER `vllm_cpp` (.agents/specs/drafter-chain.md D6).
+// The developer's constraint is that the new name must not collide with a key
+// vLLM's `SpeculativeConfig` declares "now or plausibly". A bare `drafter_chain`
+// satisfies only the first half: nothing stops upstream from later choosing that
+// spelling, and if it did, the identical document would mean two different
+// things in the two engines with no error anywhere. One `vllm_cpp` object
+// reduces the collision surface to exactly ONE name, and a collision on THAT
+// name would be loud rather than silent. It is also the landed convention here:
+// `--offload-config` carries this engine's non-vLLM residency tier under exactly
+// the same key (src/vllm/config/weight_residency.cpp:451-478), so a reader who
+// has met one flag already knows what `vllm_cpp` means on the other.
+constexpr std::string_view kExtKey = "vllm_cpp";
+constexpr std::string_view kChainKey = "drafter_chain";
+constexpr std::string_view kChainPath = "vllm_cpp.drafter_chain";
+
+// The methods a chain entry may name. The four this engine implements AND the
+// four the row scopes (.agents/specs/drafter-chain.md `## Scope`). `draft_model`
+// is deliberately absent and is refused with that fact said out loud below: it
+// IS an implemented top-level method, so a message calling it unknown would send
+// the user looking for a typo that is not there — the same distinction #1160
+// draws for keys, applied to methods.
+constexpr std::array<std::string_view, 4> kChainMethods = {"mtp", "dflash",
+                                                           "dspark", "ngram"};
+
+constexpr std::string_view kChainMethodList =
+    "\"mtp\", \"dflash\", \"dspark\", \"ngram\"";
+
+std::string EntryPath(std::size_t index) {
+  return std::string(kChainPath) + "[" + std::to_string(index) + "]";
+}
+
+// The chain's own entry-key admission. It applies the SAME three classes #1160
+// established for the top-level document, and it applies class 2 DIFFERENTLY,
+// which is the whole of the difference between the two admissions:
+//
+//   class 1, honoured        — the five per-speculator keys, read below
+//   class 2, value-gated     — engine-wide, so honoured at the TOP LEVEL only
+//                              and refused here BY NAME with that said out loud
+//   class 3, unimplemented   — refused as a vLLM field we do not have
+//   anything else            — refused as unknown, with the accepted list
+//
+// An entry is not a weaker place to spell a config than the field it replaces,
+// so a name is honoured, refused, or refused — never dropped.
+//
+// #1598: class 2 was MISSING here, and the two keys in it fell through to the
+// unknown branch. `draft_sample_method` is a real `SpeculativeConfig` field
+// (`speculative.py:77,283` @ 555967922) that this engine HONOURS at the top
+// level of this very document, and it was answered with a message
+// byte-for-byte of the shape a misspelling gets — the exact failure #1160 split
+// the classes to prevent, arriving from the other direction. Neither of the two
+// existing refusals is right for it: "unknown" sends the user hunting for a typo
+// that is not there, and "this engine does not implement it" is simply false.
+// So class 2 gets its own message, and that message says WHERE the key goes.
+void CheckEntryKeys(const nlohmann::json& entry, const std::string& path) {
+  for (auto it = entry.begin(); it != entry.end(); ++it) {
+    const std::string& key = it.key();
+    if (Contains(kHonouredKeys, key)) continue;
+    if (Contains(kEngineWideValueGatedKeys, key)) {
+      throw std::invalid_argument(
+          "speculative-config: \"" + path + "." + key +
+          "\" is ENGINE-WIDE, not per drafter, so it cannot sit in a chain "
+          "entry. This engine honours it, at the TOP LEVEL of this same "
+          "document, beside \"vllm_cpp.drafter_chain\" — move it there. "
+          "\"draft_sample_method\" describes how a draft is sampled and "
+          "\"rejection_sample_method\" describes the verify, and the verify is "
+          "ONE verify however many speculators propose into it "
+          "(vllm/config/speculative.py:77,283 and :78,216 @ 555967922). A chain "
+          "entry accepts: method, num_speculative_tokens, model, "
+          "prompt_lookup_min, prompt_lookup_max");
+    }
+    if (Contains(kUpstreamUnimplementedKeys, key)) {
+      throw std::invalid_argument(
+          "speculative-config: \"" + path + "." + key +
+          "\" is a vLLM SpeculativeConfig field "
+          "(vllm/config/speculative.py:85-283 @ 555967922) that this engine does "
+          "not implement at this pin, so it is refused rather than dropped. A "
+          "chain entry accepts: method, num_speculative_tokens, model, "
+          "prompt_lookup_min, prompt_lookup_max");
+    }
+    throw std::invalid_argument(
+        "speculative-config: unknown key \"" + path + "." + key +
+        "\" (a chain entry accepts: method, num_speculative_tokens, model, "
+        "prompt_lookup_min, prompt_lookup_max)");
+  }
+}
+
+// A positive integer, read the way the top-level `num_speculative_tokens` and
+// `prompt_lookup_*` are read, including the "explicit null means absent" rule
+// the landed contract already has for both.
+std::optional<int> EntryInt(const nlohmann::json& entry, const char* key,
+                            const std::string& path, int minimum) {
+  if (!entry.contains(key) || entry.at(key).is_null()) return std::nullopt;
+  const nlohmann::json& v = entry.at(key);
+  if (!v.is_number_integer() || v.get<int>() < minimum) {
+    throw std::invalid_argument("speculative-config: \"" + path + "." + key +
+                                "\" must be an integer >= " +
+                                std::to_string(minimum));
+  }
+  return v.get<int>();
+}
+
+// Parse and validate one entry. Every refusal names the entry BY POSITION and
+// the offending value BY NAME, because a chain has several entries and "one of
+// them is wrong" closes nothing.
+SpeculativeChainEntry ParseChainEntry(const nlohmann::json& entry,
+                                      std::size_t index) {
+  const std::string path = EntryPath(index);
+  if (!entry.is_object()) {
+    throw std::invalid_argument(
+        "speculative-config: \"" + path +
+        "\" must be a JSON object naming one speculator, e.g. "
+        "{\"method\":\"dflash\",\"model\":\"z-lab/...\","
+        "\"num_speculative_tokens\":16}");
+  }
+  if (!entry.contains("method") || !entry.at("method").is_string()) {
+    throw std::invalid_argument("speculative-config: \"" + path +
+                                "\" requires a string \"method\" (one of " +
+                                std::string(kChainMethodList) + ")");
+  }
+  SpeculativeChainEntry out;
+  out.method = entry.at("method").get<std::string>();
+  bool known = false;
+  for (std::string_view m : kChainMethods) {
+    if (m == out.method) known = true;
+  }
+  if (!known) {
+    // `draft_model` is the one refusal that must not read as "no such method":
+    // it IS implemented as a top-level method, and only its CHAIN arm is owed.
+    const std::string owed =
+        out.method == "draft_model"
+            ? " \"draft_model\" IS an accepted top-level method here, but not "
+              "yet a chain entry: the chain arm is owed by row "
+              "SPEC-DRAFTER-CHAIN (.agents/specs/drafter-chain.md), issue "
+              "https://github.com/mudler/vllm.cpp/issues/1522."
+            : " A method this engine does not implement is refused by name "
+              "rather than skipped, because a silently shortened chain is a "
+              "different feature running under your document. Owed by row "
+              "SPEC-DRAFTER-CHAIN (.agents/specs/drafter-chain.md).";
+    throw std::invalid_argument("speculative-config: \"" + path +
+                                ".method\" \"" + out.method +
+                                "\" is not a chain entry method; accepted: " +
+                                std::string(kChainMethodList) + "." + owed);
+  }
+  CheckEntryKeys(entry, path);
+  out.num_speculative_tokens = EntryInt(entry, "num_speculative_tokens", path, 1);
+  out.prompt_lookup_min = EntryInt(entry, "prompt_lookup_min", path, 1);
+  out.prompt_lookup_max = EntryInt(entry, "prompt_lookup_max", path, 1);
+  if (entry.contains("model") && entry.at("model").is_string()) {
+    out.draft_model_path = entry.at("model").get<std::string>();
+  }
+  // The SAME required-key rules the top-level document applies to the same
+  // method. "dflash" and "dspark" each name a SEPARATE draft checkpoint
+  // (speculative.py:875), and "ngram" has no head depth to default a k from
+  // (speculative.py:1224-1234). "mtp" requires neither: its draft lives inside
+  // the target and its k defaults to the head depth.
+  if ((out.method == "dflash" || out.method == "dspark") &&
+      !out.draft_model_path.has_value()) {
+    throw std::invalid_argument(
+        "speculative-config: \"" + path + "\" method \"" + out.method +
+        "\" requires a \"model\" key naming the draft checkpoint (path or HF "
+        "repo id), exactly as the top-level method does");
+  }
+  if (out.method == "ngram" && !out.num_speculative_tokens.has_value()) {
+    throw std::invalid_argument(
+        "speculative-config: \"" + path +
+        "\" method \"ngram\" requires \"num_speculative_tokens\" "
+        "(speculative.py:1224-1234), exactly as the top-level method does");
+  }
+  return out;
+}
+
+// Parse and validate the whole extension object, and return the chain.
+std::vector<SpeculativeChainEntry> ParseDrafterChain(const nlohmann::json& doc) {
+  const nlohmann::json& ext = doc.at(std::string(kExtKey));
+  // PRESENCE is judged, including an explicit `null` — the #1160 polarity. A
+  // null on a name we DO implement must not read as "absent", or the user who
+  // deliberately spelled it gets told a string "method" is required and goes
+  // looking for a key they never wanted.
+  if (!ext.is_object()) {
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp\" must be a JSON object carrying this "
+        "engine's non-vLLM extensions; its only key at this pin is "
+        "\"drafter_chain\", a JSON array of speculator entries "
+        "(SPEC-DRAFTER-CHAIN, .agents/specs/drafter-chain.md)");
+  }
+  for (auto it = ext.begin(); it != ext.end(); ++it) {
+    if (it.key() != std::string(kChainKey)) {
+      throw std::invalid_argument(
+          "speculative-config: unknown key \"vllm_cpp." + it.key() +
+          "\" (the \"vllm_cpp\" extension object accepts only "
+          "\"drafter_chain\")");
+    }
+  }
+  if (!ext.contains(std::string(kChainKey))) {
+    // An extension object that configures nothing on the extension surface. It
+    // cannot mean "no chain", because omitting `vllm_cpp` already means that;
+    // accepting it would run a one-drafter engine under a document whose author
+    // believes it says otherwise.
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp\" carries no \"drafter_chain\". Omit "
+        "\"vllm_cpp\" entirely to run without a chain "
+        "(SPEC-DRAFTER-CHAIN, .agents/specs/drafter-chain.md)");
+  }
+  const nlohmann::json& arr = ext.at(std::string(kChainKey));
+  if (!arr.is_array()) {
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp.drafter_chain\" must be a JSON array of "
+        "speculator entries, in preference order — a list of OBJECTS and not a "
+        "list of names, because each entry carries its own \"model\" and its own "
+        "\"num_speculative_tokens\"");
+  }
+  if (arr.empty()) {
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp.drafter_chain\" is empty; a chain names "
+        "at least one speculator (" + std::string(kChainMethodList) +
+        "). Omit \"vllm_cpp\" entirely to run without a chain");
+  }
+  std::vector<SpeculativeChainEntry> chain;
+  chain.reserve(arr.size());
+  for (std::size_t i = 0; i < arr.size(); ++i) {
+    SpeculativeChainEntry entry = ParseChainEntry(arr[i], i);
+    // A method named twice makes the per-drafter attribution the row's gates
+    // depend on ambiguous: W2 keys the counters and the per-sequence winner on
+    // the method name, so two entries with the same one cannot be told apart in
+    // the numbers that decide whether a chain helps at all. Refusing now is
+    // reversible; shipping ambiguous counters is not
+    // (.agents/specs/drafter-chain.md D11).
+    for (std::size_t j = 0; j < chain.size(); ++j) {
+      if (chain[j].method == entry.method) {
+        throw std::invalid_argument(
+            "speculative-config: \"vllm_cpp.drafter_chain\" names method \"" +
+            entry.method + "\" twice, at entries " + std::to_string(j) +
+            " and " + std::to_string(i) +
+            ". A chain is a preference ORDER over DISTINCT methods at this pin, "
+            "because per-drafter attribution keys on the method name. Two "
+            "checkpoints of one method are owed by row SPEC-DRAFTER-CHAIN "
+            "(.agents/specs/drafter-chain.md)");
+      }
+    }
+    chain.push_back(std::move(entry));
+  }
+  return chain;
+}
+
 }  // namespace
 
 SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
@@ -126,14 +398,40 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   }
 
   SpeculativeConfig cfg;
+  // SPEC-DRAFTER-CHAIN W1 (#1522): presence of this engine's extension object,
+  // judged BEFORE the method requirement because the two are mutually exclusive
+  // and the method requirement would otherwise fire first with the wrong advice.
+  // Presence only — the object itself is validated further down, after the
+  // top-level key admission, so a typo'd top-level key still errors first and
+  // the landed error ORDERING is unchanged for every chain-free document.
+  const bool has_chain = doc.contains(std::string(kExtKey));
   // method (vllm/config/speculative.py `method`). Required for this CLI path;
   // upstream can auto-detect it from the draft checkpoint, but the entrypoint
   // that reaches here always passes an explicit method.
-  if (!doc.contains("method") || !doc.at("method").is_string()) {
-    throw std::invalid_argument(
-        "speculative-config: a string \"method\" is required");
+  //
+  // D7: `method` names ONE speculator and a chain names an ordered list. No rule
+  // here makes a top-level `method` the head of the chain, its tail, or a
+  // default, and inventing one would silently reinterpret a document. So exactly
+  // one of the two must be given, and with a chain present `method` is not
+  // merely optional — it is refused.
+  if (has_chain) {
+    if (doc.contains("method")) {
+      const nlohmann::json& m = doc.at("method");
+      throw std::invalid_argument(
+          "speculative-config: \"method\" and \"vllm_cpp.drafter_chain\" are "
+          "mutually exclusive. \"method\" names ONE speculator and the chain "
+          "names an ordered list of them, and nothing here makes a top-level "
+          "\"method\" the head, the tail or a default of the chain. Name every "
+          "speculator as a chain entry instead (got method " +
+          (m.is_string() ? "\"" + m.get<std::string>() + "\"" : m.dump()) + ")");
+    }
+  } else {
+    if (!doc.contains("method") || !doc.at("method").is_string()) {
+      throw std::invalid_argument(
+          "speculative-config: a string \"method\" is required");
+    }
+    cfg.method = doc.at("method").get<std::string>();
   }
-  cfg.method = doc.at("method").get<std::string>();
   // SPEC-DFLASH D4: accept "dflash" alongside "mtp". SPEC-NGRAM (ROAD-V1-D3):
   // accept "ngram" — the draft-free proposer. SPEC-DRAFT-MODEL: accept
   // "draft_model" — the classic model-agnostic SEPARATE draft model
@@ -147,8 +445,9 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   // extends DFlash with a Markov logit-bias head (speculative.py:62,310;
   // dspark/speculator.py:37). Like DFlash it names a SEPARATE draft checkpoint,
   // so it requires the `model` key below.
-  if (cfg.method != "mtp" && cfg.method != "dflash" && cfg.method != "ngram" &&
-      cfg.method != "draft_model" && cfg.method != "dspark") {
+  if (!has_chain && cfg.method != "mtp" && cfg.method != "dflash" &&
+      cfg.method != "ngram" && cfg.method != "draft_model" &&
+      cfg.method != "dspark") {
     throw std::invalid_argument(
         "speculative-config: only methods \"mtp\", \"dflash\", \"dspark\", "
         "\"ngram\" and \"draft_model\" are supported at this pin (got \"" +
@@ -164,7 +463,13 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   for (auto it = doc.begin(); it != doc.end(); ++it) {
     const std::string& key = it.key();
     if (Contains(kHonouredKeys, key)) continue;
-    if (key == "draft_sample_method" || key == "rejection_sample_method") continue;
+    // Class 2 (#1598): honoured here, value-gated below by `CheckValueGatedKey`.
+    if (Contains(kEngineWideValueGatedKeys, key)) continue;
+    // SPEC-DRAFTER-CHAIN W1: the ONE name this engine adds to vLLM's document.
+    // It is admitted here DELIBERATELY, which is the mechanism that kept the
+    // field inert until this wave: every other new name still falls through to
+    // one of the two refusals below.
+    if (key == std::string(kExtKey)) continue;
     if (Contains(kUpstreamUnimplementedKeys, key)) {
       throw std::invalid_argument(
           "speculative-config: \"" + key +
@@ -201,6 +506,38 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
       "rejection_sampler.h). The other two are owed by row SPEC-ACCEPT-VARIANTS "
       "(.agents/engine-matrix.md), vllm/config/speculative.py:78,216 and "
       "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:82-91 @ 555967922.");
+
+  // SPEC-DRAFTER-CHAIN W1 (#1522): the chain branch. Placed AFTER the two
+  // value-gated keys above, which are ENGINE-WIDE rather than per drafter —
+  // `draft_sample_method` describes how a draft is sampled and
+  // `rejection_sample_method` describes the verify, and the verify is one verify
+  // however many speculators propose into it. So those two may sit beside a
+  // chain and keep their gate, while every key below is per speculator and
+  // cannot.
+  if (has_chain) {
+    cfg.drafter_chain = ParseDrafterChain(doc);
+    // D7 again, one key at a time. `model` beside a two-entry chain names a
+    // checkpoint with no entry to belong to, and applying it to the first entry,
+    // to all of them, or to none are three different engines. There is no
+    // reading that is safe to guess, so the document is refused and the message
+    // says which key to move.
+    for (const char* key : {"model", "num_speculative_tokens",
+                            "prompt_lookup_min", "prompt_lookup_max"}) {
+      if (!doc.contains(key)) continue;
+      throw std::invalid_argument(
+          "speculative-config: \"" + std::string(key) +
+          "\" cannot be given beside \"vllm_cpp.drafter_chain\": it configures "
+          "ONE speculator and the chain has " +
+          std::to_string(cfg.drafter_chain.size()) +
+          ", so there is no entry it belongs to. Move it into the chain entry "
+          "that needs it");
+    }
+    // `cfg.method` stays EMPTY. Promoting an entry into it would make a chain
+    // document parse into a config a one-drafter engine runs without complaint,
+    // which is the failure this wave exists to prevent; the loader refuses the
+    // chain by name instead (LoadedEngine::ResolveSpecConfig).
+    return cfg;
+  }
 
   // num_speculative_tokens (k). Optional; the loader defaults it to n_predict
   // (mtp_num_hidden_layers) via ResolveMtp when absent (speculative.py:865-875).

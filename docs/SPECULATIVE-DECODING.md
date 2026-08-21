@@ -11,7 +11,9 @@ same JSON object vLLM takes, so a config written for vLLM works here.
 ## Methods
 
 The engine accepts five `method` strings. Anything else is refused at load with
-the list of accepted ones (`src/vllm/config/speculative.cpp`).
+the list of accepted ones (`src/vllm/config/speculative.cpp`). A `method` selects
+exactly one speculator; the [drafter chain](#the-drafter-chain-and-why-it-does-not-run-yet)
+below is the one place a document can name several, and it does not run yet.
 
 | `method` | Draft | k | State |
 |---|---|---|---|
@@ -42,6 +44,7 @@ that was typed.
 | `prompt_lookup_min`, `prompt_lookup_max` | an integer of at least 1, `ngram` only |
 | `draft_sample_method` | `greedy` only, which is upstream's default and what this engine does |
 | `rejection_sample_method` | `standard` only, which is upstream's default and what this engine does |
+| `vllm_cpp` | this engine's own extension object; its only key is `drafter_chain`, described below |
 
 There are two kinds of refusal, worded differently on purpose. A name vLLM's own
 `SpeculativeConfig` declares, such as `quantization` or `max_model_len`, is
@@ -49,6 +52,61 @@ reported as a real vLLM field this engine does not implement. Any other name is
 reported as unknown, together with the list above, because that one is usually a
 typo. `draft_sample_method: probabilistic` and the `synthetic` and `block`
 acceptance variants name row `SPEC-ACCEPT-VARIANTS`, which owes them.
+
+## The drafter chain, and why it does not run yet
+
+`--speculative-config` also accepts one key vLLM does not have. It lives under a
+`vllm_cpp` object so that it can never be confused with a vLLM field, which is
+the same place `--offload-config` keeps this engine's own residency keys:
+
+```json
+{"vllm_cpp": {"drafter_chain": [
+  {"method": "dflash", "model": "z-lab/Qwen3.6-27B-DFlash", "num_speculative_tokens": 16},
+  {"method": "ngram", "num_speculative_tokens": 4}
+]}}
+```
+
+It describes a **preference order**, not an ensemble: try the first speculator,
+and where it produces no draft for a sequence, try the next. One speculator wins
+per sequence, nothing merges proposals, and the verify is untouched.
+
+**The engine refuses this document today, by name, before it reads a byte of
+weights.** The field is parsed, validated and stored; nothing resolves it yet.
+Refusing is the point rather than an oversight: a chain that parsed and was then
+ignored would start a server drafting with one speculator, or with none, under a
+document whose author asked for several, and any measurement taken there would
+describe a configuration nobody chose. Resolution is owed by row
+`SPEC-DRAFTER-CHAIN`, [#1522](https://github.com/mudler/vllm.cpp/issues/1522).
+
+Everything about the field except the running is real, so a document can be
+written and checked now:
+
+| Rule | Refused |
+|---|---|
+| `method` at the top level, beside a chain | yes, they are mutually exclusive: name every speculator as an entry |
+| `model`, `num_speculative_tokens`, `prompt_lookup_min`, `prompt_lookup_max` at the top level, beside a chain | yes, each configures one speculator and there is no entry it belongs to |
+| `draft_sample_method`, `rejection_sample_method` at the TOP LEVEL, beside a chain | no, both describe the verify and the draft sampling rule, which are engine-wide |
+| either of those two INSIDE a chain entry | yes, by name (#1598): they are engine-wide rather than per drafter, and the message says the engine honours them and where to spell them |
+| an entry naming anything but `mtp`, `dflash`, `dspark` or `ngram` | yes, by name, including a real vLLM method such as `eagle3`, and including `draft_model`, whose chain arm is owed |
+| an entry missing the key its method requires | yes, by the same rules the top-level `method` follows |
+| any other entry key the top level does not honour | yes, by name, split the way #1160 splits the top-level document: a vLLM `SpeculativeConfig` field this engine does not implement is refused as that, and a name nobody declares is refused as unknown with the accepted list |
+| the same method named twice | yes: per-drafter attribution keys on the method name, so two entries of one method cannot be told apart in the counters |
+| an empty chain, or a `vllm_cpp` object with no `drafter_chain` | yes: omitting `vllm_cpp` is how a document says "no chain" |
+| a chain of one entry | no, that is the degenerate preference list and it is legal |
+
+**With no `vllm_cpp` key, nothing above applies.** Every document that worked
+before this field existed keeps its exact meaning, key for key, which is what
+makes the field additive rather than a fork of vLLM's surface.
+
+That is a claim about MEANING, and it is deliberately not a claim of
+byte-identity. There is exactly one visible delta on a chain-free document, it
+was measured, and it is stated here rather than left for a reader to find: the
+accepted-key list quoted at the end of an unknown-key or unimplemented-key
+refusal now also names `vllm_cpp.drafter_chain`. Every such refusal message is
+therefore longer by that tail. The change is required rather than incidental —
+an accepted-key list that omits an accepted key stops closing the user's search,
+which is the whole reason #1160 appends one. No document's parse result moves,
+no key changes meaning, and no error changes which guard produced it.
 
 The distinction matters beyond ergonomics. Draft sampling and verify are greedy
 here, so a dropped `probabilistic` produced a **deterministic** run when a sampled

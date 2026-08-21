@@ -637,6 +637,39 @@ TEST_CASE("attention-cross blocked: Hq > Hkv broadcasts on the blocked path too"
   CHECK(RunCuda(g, in, DType::kF32, false).declines == 0);
 }
 
+TEST_CASE("attention-cross blocked: head_dim 128 -- LTX-2.5's stream, which its OWN suite cannot reach") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // WHY THIS CASE HAS TO BE HERE. LTX-2.5's device forward runs head_dim 128 in
+  // production and therefore takes the blocked kernel, but every geometry in
+  // `ltx2_goldens.inc` is REDUCED-DIMENSION -- `kLtx2Arch_attention_head_dim` is
+  // 8 and `kLtx2VideoTokens` is 8 -- so every LTX-2.5 case DECLINES and its
+  // suites are byte-identical under this change. Their green says nothing about
+  // the path LTX-2.5 actually runs. That is the same defect this file's header
+  // was written for, and this is where the coverage lives instead.
+  //
+  // The 32x16 tiling is the one the 48 KiB shared budget forces at head_dim 128,
+  // and it is a DIFFERENT instantiation from the 64x32 one every case above
+  // drives: QT and KT fall to 2 and DT rises to 16, so the register tile, the
+  // cross-group reduction width and the output mapping are all different code.
+  const Geometry g{64, 100, 2, 2, 128};
+  REQUIRE(BlockedShape(g));
+  REQUIRE(g.tq % 32 == 0);
+  REQUIRE(g.s % 16 != 0);  // a ragged key tile at BC = 16
+  RunGeometry("blocked d=128 dense bias", g, 269u, /*bias_rows=*/64, DType::kF32, 2e-5);
+  const Inputs in = MakeInputs(g, 269u, /*bias_rows=*/64);
+  const CudaRun blocked = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
+  CHECK(std::string(blocked.selected) == kBlockedProvider);
+  CHECK(blocked.declines == 0);
+  const CudaRun native = RunCuda(g, in, DType::kF32, /*disable_blocked=*/true);
+  CHECK(std::string(native.selected) == vt::kNativeProviderName);
+  const double cross = vllm_test::MaxAbsDiff(blocked.out, native.out.data(), native.out.size());
+  MESSAGE("d=128 arm-vs-arm max|diff| = " << cross);
+  CHECK(cross < 2e-5);
+}
+
 TEST_CASE("attention-cross blocked: the bf16 stream takes it at head_dim 64") {
   if (!HasCuda()) {
     MESSAGE("SKIP: no CUDA backend registered");

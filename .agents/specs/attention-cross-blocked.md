@@ -377,7 +377,7 @@ with how it is gated, because "the callers pass" is not a statement about an op.
 |---|---|---|---|---|
 | MiniMax-Music3 DiT | `minimax_music3_device.cpp::DitForwardDevice` | f32, Tq=S=690, H=32, D=64, no bias | **YES** | `test_ops_attention_cross`, `test_minimax_music3_*` |
 | MiniMax-Music3 RVQ depth decoder | `minimax_music3_depth_device.cpp` | bf16, **Tq=1** | **no — declines** | a BYTE-FOR-BYTE case, below |
-| LTX-2.5 DiT cross/biased attention | `ltx2_device.cpp::AttentionDev` | D 64 and 128, optional dense bias | yes when Tq clears the floor | `test_ops_attention_cross`, `test_ltx2_device` |
+| LTX-2.5 DiT cross/biased attention | `ltx2_device.cpp::AttentionDev` | D 64 and 128, optional dense bias | yes when Tq clears the floor | `test_ops_attention_cross` (see §6.4) |
 | LTX-2.5 host arm | `ltx2.cpp` | CPU only | n/a — CPU kernel untouched | `test_ltx2` |
 | LTX-2.5 duration head | `ltx2_duration_head.cpp` | CPU only (`std::vector<float>`) | n/a | `test_ltx2` |
 
@@ -431,6 +431,28 @@ All in `tests/vt/test_ops_attention_cross.cpp`:
 8. an unhandled head_dim declines once per call, and still answers correctly;
 9. the catastrophic-cancellation case of §6.1;
 10. the same-binary A/B lever agrees with itself.
+
+### 6.4 LTX-2.5's own suites are BYTE-IDENTICAL, and that is a coverage finding
+
+Every geometry in `tests/vllm/models/ltx2_goldens.inc` is REDUCED-DIMENSION:
+`kLtx2Arch_attention_head_dim` is **8**, `kLtx2Arch_audio_attention_head_dim` is
+**4**, and `kLtx2VideoTokens` is **8**. All of them fail the shape gate, so every
+LTX-2.5 call declines and `test_ltx2` and `test_ltx2_device` are byte-identical
+under this change.
+
+**Their green therefore says nothing about the path LTX-2.5 actually runs**,
+which in production is head_dim 128 over thousands of tokens and DOES take the
+blocked kernel. That is the same defect
+`tests/vt/test_ops_attention_cross.cpp`'s own header was written for -- "a
+fixture that cannot reach the regime which discriminates is the same defect as a
+missing test, wearing different clothes" -- and it is why the head_dim 128
+coverage is a case in the op's own suite rather than an inherited one. The
+32x16 tiling is a DIFFERENT instantiation from the 64x32 one: `QT` and `KT` fall
+to 2 and `DT` rises to 16, so the register tile, the cross-group reduction and
+the output mapping are all different code.
+
+The LTX-2.5 suites are still run and reported, because byte-identical is a claim
+that has to be measured rather than asserted.
 
 ### 6.3 Evidence
 

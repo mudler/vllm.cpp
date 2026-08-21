@@ -152,7 +152,12 @@ is lossless.
 ## Work breakdown
 
 - **W1 — the field.** Parse, validate, refuse by name; inert when absent. G1 and
-  G5. Lands no chain behaviour.
+  G5. Lands no chain behaviour. **LANDED**, issue
+  [#1522](https://github.com/mudler/vllm.cpp/issues/1522): the document key is
+  `vllm_cpp.drafter_chain` (D6), it is parsed and validated by
+  `ParseSpeculativeConfigJson` and stored on
+  `SpeculativeConfig::drafter_chain`, and `LoadedEngine::ResolveSpecConfig`
+  refuses a well-formed chain by name because nothing resolves one yet.
 - **W2 — attribution.** Per-sequence winner and per-drafter counters, reachable
   from a production entry point. G2. This is deliberately BEFORE the chain runs,
   so the instrument exists before the thing it measures.
@@ -179,13 +184,121 @@ is lossless.
 - **D4 — llama.cpp is cited for semantics only.** It never outranks vLLM and never
   becomes the mirror source. Where vLLM later grows a composition surface, this row
   reconciles onto vLLM and the divergence is recorded.
+- **D6 — the field is `vllm_cpp.drafter_chain`, nested under one extension
+  object, not a bare top-level `drafter_chain`.** W1 decision. The constraint is
+  that the name must not collide with a key vLLM's `SpeculativeConfig` declares
+  "now or plausibly". A bare `drafter_chain` satisfies only the first half:
+  nothing prevents upstream from later choosing that spelling, and if it did,
+  one document would mean two different things in the two engines with no error
+  anywhere. Nesting reduces the collision surface to exactly ONE name, and a
+  collision on `vllm_cpp` would be loud rather than silent. It is also the
+  landed convention of this tree: `--offload-config` already carries this
+  engine's non-vLLM residency tier under exactly the same key
+  (`src/vllm/config/weight_residency.cpp:451-478`), so the two flags spell an
+  extension the same way. Rejected: a bare `drafter_chain`; and a `vllm_cpp_`
+  name prefix, which buys the same guarantee while making the document read as
+  though the prefix were part of each field's name.
+- **D7 — a top-level `method` and a chain are mutually exclusive, and so is
+  every top-level PER-SPECULATOR key.** W1 decision. `method` names one
+  speculator and the chain names an ordered list. No rule here makes a top-level
+  `method` the head of the chain, its tail, or a default, and inventing one
+  would silently reinterpret a document. The same argument holds one key at a
+  time for `model`, `num_speculative_tokens`, `prompt_lookup_min` and
+  `prompt_lookup_max`: beside a two-entry chain, `model` names a checkpoint with
+  no entry to belong to, and applying it to the first entry, to all of them, or
+  to none are three different engines. `draft_sample_method` and
+  `rejection_sample_method` DO coexist, because they describe the draft sampling
+  rule and the verify, and the verify is one verify however many speculators
+  propose into it. A parsed chain therefore leaves `SpeculativeConfig::method`
+  EMPTY; promoting an entry into it would make a chain document parse into a
+  config a one-drafter engine runs without complaint.
+- **D8 — a SINGLE-entry chain is legal.** W1 decision. It is the degenerate
+  preference list, exactly as `--spec-type mtp` is in llama.cpp, and refusing it
+  would force every generator of these documents to special-case `n == 1` into a
+  different spelling. It is not equivalent to a top-level `method`: the entry
+  lands in the chain, `method` stays empty, and the loader's chain refusal still
+  sees it.
+- **D9 — an EMPTY chain, and a `vllm_cpp` object with no `drafter_chain`, are
+  refused.** W1 decision. Both ask for a preference order over nothing. The only
+  two readings are "no speculation" and "whatever the engine would otherwise
+  have done", and both are silently different from what the document says, which
+  is the class of defect [#1160](https://github.com/mudler/vllm.cpp/issues/1160)
+  exists to end. Omitting `vllm_cpp` already means "no chain", so neither
+  spelling is needed for anything.
+- **D10 — the four chain entry methods are `mtp`, `dflash`, `dspark` and
+  `ngram`; `draft_model` is refused with that fact said out loud.** W1 decision,
+  from `## Scope`. `draft_model` IS an accepted top-level method here, so a
+  message calling it unknown would send a user hunting for a typo that is not
+  there — the same distinction #1160 draws for keys, applied to methods. Its
+  chain arm is listed under `## Owed`. Every other name, including a real vLLM
+  `SpeculativeMethod` such as `eagle3`, is refused by name rather than skipped,
+  because a silently shortened chain is a different feature running under the
+  user's document.
+- **D11 — a method named twice is refused.** W1 decision. W2 keys the
+  per-drafter counters and the per-sequence winner on the method name, so two
+  entries with the same method cannot be told apart in the numbers that decide
+  whether a chain helps at all — and those numbers are G2, G3 and G4. Refusing
+  now is reversible; shipping ambiguous counters is not. Two checkpoints of one
+  method become expressible when the attribution key is a `(method, model)` pair
+  rather than a method, which is a W2 design question and is listed under
+  `## Owed`.
+- **D12 — a well-formed chain is REFUSED at the loader, not accepted and
+  ignored.** W1 decision, and the reason W1 lands nothing dead. W1 stores a
+  field that nothing resolves. A malformed document was never the risk; a
+  WELL-FORMED one that parses, stores and is then ignored is, because the engine
+  would draft with one speculator, or with none, under a document whose author
+  believes it configures several — and a measurement taken there is a
+  measurement of a configuration nobody chose. `LoadedEngine::ResolveSpecConfig`
+  is therefore the production READER of the stored vector and refuses by name,
+  and `LoadedEngine::FromModelDir` calls it ahead of its path resolution so the
+  refusal precedes every weight operation. W3 lifts the refusal; until then the
+  stored field has a live consumer, which is what a reachability mutation can
+  delete.
+
 - **D5 — no ceiling and no ratio is claimed here.** If a chain does not help on a
   workload where it should, that is an open result with a named next hypothesis,
   not a conclusion about chains.
 
+## Owed
+
+Each item is refused BY NAME today, so none of them is a silent gap. All are
+owned by this row and tracked by
+[#1522](https://github.com/mudler/vllm.cpp/issues/1522).
+
+- **Chain RESOLUTION (W3).** `LoadedEngine::ResolveSpecConfig` refuses a
+  well-formed `vllm_cpp.drafter_chain` because nothing resolves one. This is the
+  one thing W1 landed that is not yet reached beyond its own refusal: the parsed
+  entries are read only to be named in that message. D12 records why the refusal
+  is the correct shape and W3 lifts it.
+- **Per-drafter ATTRIBUTION and ACCEPTANCE counters (W2, W4).** No analogue of
+  llama.cpp's `impl_last`, `n_gen_drafts` or `n_gen_tokens` exists, so G2, G3 and
+  G4 have no instrument yet.
+- **`draft_model` as a chain entry (D10).** Accepted at the top level, refused as
+  a chain entry by name, with the row named in the message.
+- **Two entries of the SAME method, with different checkpoints (D11).** Refused
+  by name. It becomes expressible when W2 keys attribution on a `(method, model)`
+  pair rather than on the method.
+- **`.agents/oracles/llama-cpp.md` must carry a recorded pin** before any gate
+  cites llama.cpp semantics. W1 cites none: its rules are this engine's
+  document-shape decisions, and the llama.cpp reading in `## Upstream chain` is
+  design context rather than a gate input.
+
 ## Now
 
-`SPEC-DRAFTER-CHAIN` is `READY`. The spec is committed and base-reachable, which
-is what a helper dispatch needs; no production code has landed. Next action: W1,
-the field, dispatched to a fresh implementer against this spec, red-first on the
-refusal cases — and not before `SPEC-DFLASH2` W6 reads.
+`SPEC-DRAFTER-CHAIN` is `ACTIVE`. **W1 has landed**: the
+`vllm_cpp.drafter_chain` field parses, validates and refuses by name, and a
+well-formed chain is refused at the loader before any weight I/O because
+nothing resolves one yet (D12). No chain behaviour landed, nothing changed which
+speculator drafts, and with the field absent the engine is byte-identical —
+which G1 asserts through real `--speculative-config` documents driven into
+`LoadedEngine::ResolveSpecConfig` and `LoadedEngine::FromModelDir`, not through
+a hand-built struct.
+
+Gates: **G1 PASS** and **G5 PASS**, both CPU-only, in
+`tests/vllm/config/test_speculative_drafter_chain.cpp` and
+`tests/vllm/entrypoints/test_drafter_chain_reach.cpp`. G2, G3 and G4 remain
+PENDING with no instrument, which is what W2 exists to build. No throughput
+number is claimed or claimable from this row.
+
+Next action: W2, per-drafter attribution — and still not before `SPEC-DFLASH2`
+W6 produces a measured number, which W3 in particular must wait for.

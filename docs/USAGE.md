@@ -113,6 +113,11 @@ draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
 value is refused at startup rather than silently ignored.
 
+The same flag also takes one key vLLM does not have, `vllm_cpp.drafter_chain`,
+which names several speculators in preference order. It is parsed and checked
+today and **refused at startup**, because nothing resolves a chain yet; the same
+page says what the document looks like and what each rule refuses.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in

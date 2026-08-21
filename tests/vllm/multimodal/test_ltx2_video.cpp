@@ -3860,16 +3860,26 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // reaching it, which is the kind of green that means nothing. Anyone
   // reintroducing a per-configuration constant needs the nested form again.
   const double kSpanSlackPerRecord = 0.03;  // 30 ms, every build configuration
-  // THE COVERAGE FLOOR (2) IS WHAT HOLDS A RECORD THE CAP BELOW SWALLOWS, so it
-  // is a precondition of this assertion and not only of its own. Where the cap
-  // binds, this bound degrades to "head plus tail is at most half the record",
-  // and `covered >= 0.5 * leaf_seconds` says exactly that for a single-record
-  // leaf. A future leaf with a floor under 0.5 would leave its short records
-  // held by nothing, so it reds here and has to answer the question.
+  // THE COVERAGE FLOOR (2) IS WHAT HOLDS A SINGLE-RECORD LEAF THE CAP BELOW
+  // SWALLOWS -- and ONLY a single-record leaf, which is the scope this line
+  // used to leave out. Where the cap binds, this bound degrades to "head plus
+  // tail is at most half the record". For a leaf of ONE record `covered >= 0.5 *
+  // leaf_seconds` says exactly that, so (2) is a genuine precondition of this
+  // assertion and the REQUIRE below keeps it available.
+  //
+  // ON A MULTI-RECORD LEAF THE HAND-OFF IS MUCH WEAKER AND THAT IS NOT HIDDEN
+  // HERE. (2) is a statement about the leaf SUM, so a short record of a long
+  // leaf draws on a budget it could never fill. Measured: `decode.video`'s
+  // reopen records are 0.019-5.66 ms inside a 0.17-1.39 s leaf whose 0.90 floor
+  // permits 17-139 ms, so a swallow that grows one of those records to just
+  // under the resolution floor -- up to 94x its honest size -- is seen by
+  // neither assertion. `### Owed out of W0` carries that escape as a ceiling
+  // rather than as the name of an assertion, and the fix for it is an anchor
+  // inside the reopen, not a wider bound.
   REQUIRE_MESSAGE(c.min_coverage >= 0.5,
                   "'" << c.leaf << "' carries a " << (100.0 * c.min_coverage)
                       << "% coverage floor, under the 50% that (1c) hands its "
-                         "below-resolution records to");
+                         "below-resolution records of a SINGLE-record leaf to");
   // AND EACH RECORD'S BOUND IS CAPPED AT HALF OF THAT RECORD, WITH `min` --
   // never `max`.
   //
@@ -3888,10 +3898,12 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // should be suspicious of, so here is the whole argument.
   //
   // A capped bound is no longer the absolute quantity this assertion is about. It
-  // is "head plus tail is at most half of this record", which for a single-record
+  // is "head plus tail is at most half of this record", which on a SINGLE-record
   // leaf is exactly what `covered >= 0.5 * leaf_seconds` already says, and the
-  // REQUIRE above holds every leaf here to a floor of at least 0.5. So the capped
-  // arm adds nothing that (2) does not already carry.
+  // REQUIRE above holds every leaf here to a floor of at least 0.5. So on that
+  // shape the capped arm adds nothing (2) does not already carry. On a
+  // multi-record leaf it would add something, and what is given up there is
+  // priced in the note beside the REQUIRE above rather than assumed away.
   //
   // AND IT IS WORSE THAN NOTHING, MEASURED. On the records where the cap binds,
   // the honest head-plus-tail is 4.6% to 72.3% of the record's own duration
@@ -3955,7 +3967,10 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                    << "s, under the " << (2.0 * kSpanSlackPerRecord)
                    << "s this bound can resolve: span slack " << span_slack << "s ("
                    << (100.0 * span_slack / record_seconds)
-                   << "%) is NOT checked here, and (2) below is what holds it");
+                   << "%) is NOT checked here. On a single-record leaf (2) below "
+                      "is exactly as strict; on a multi-record leaf it is a share "
+                      "of the SUM and much weaker -- see `### Owed out of W0` for "
+                      "what escapes on this leaf");
       continue;
     }
     ++span_checked;

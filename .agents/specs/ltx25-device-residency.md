@@ -1464,13 +1464,16 @@ which is where this spec's `### Decisions taken here` already said they would be
   the capped bound is a 50% share and the honest head-plus-tail on those records
   measured 4.6-72.3% of the record itself ([#1559](https://github.com/mudler/vllm.cpp/issues/1559)).
 
-  | Record | Measured range, 53 runs | Held instead by |
+  | Record | Measured range | What still holds it, and what escapes |
   |---|---|---|
-  | `artifacts.frames`, nine-frame render, one record | 0.90-6.21 ms | (2) at 0.50, the (0) count, `CheckWriterIsBesideTheDecode` |
-  | `artifacts.frames`, 81-frame render, two records | 4.39-61.0 ms | the same, plus (1c) on runs where a record clears the floor |
-  | `decode.video` reopen-after-a-chunk, one or two records | 0.019-5.66 ms | (2) at 0.90 and the (0) count |
+  | `artifacts.frames`, nine-frame render, ONE record | 0.90-6.21 ms | (2) at 0.50 holds it TIGHTLY, because a single-record leaf makes the coverage floor exactly the capped span bound. Plus the (0) count and `CheckWriterIsBesideTheDecode` |
+  | `artifacts.frames`, 81-frame render, TWO records | 4.39-61.0 ms | the same names, but (2) is on the SUM, so it is looser per record. (1c) checks a record on the runs where it clears the floor |
+  | `decode.video` reopen-after-a-chunk, one or two records | 0.019-5.66 ms | **nothing effective.** A swallow may grow such a record to just under 60 ms -- up to 94x its honest size -- and (2) at 0.90 does not see it: 10% of a 0.17-1.39 s leaf is 17-139 ms of budget, of which 60 ms is 43% at worst and 4.3% at best. Under the third shape the same escape was about 0.5-0.75 ms, so this is roughly an 80x widening on these records |
+  | `decode.video` record 0, on a FAST box | 25.0-59.6 ms when it falls | it is normally the third gated record, and it is not reliably one. Over 35 runs it fell below the floor in 4 of 60 shared-box observations and 8 of 30 two-core observations, and in 2 of 20 shared-box runs the whole leaf reported `0 of 2 leaf record(s) checked`. The checked minimum on two cores was 62.6 ms, 2.6 ms above the floor. CI's runner is FASTER than that box, so this gets worse there, not better |
 
-  What escapes is a swallow that leaves the record under the floor. **The fix is
+  What escapes is a swallow that leaves the record under the floor, and the row
+  above says what that is worth on each class rather than naming an assertion and
+  leaving the reader to assume it binds. **The fix is
   not a wider bound, it is naming the time**, which is what #1439 is owed as
   well: a production anchor inside the writer, and one inside the decode's own
   reopen, make those records measurable rather than tolerated. Both are scope
@@ -2743,10 +2746,23 @@ Four changes, and each answers one finding.
 * **ONE CONSTANT, 30 ms, FOR EVERY BUILD CONFIGURATION.** That is **2.99x the
   worst of 636 leaf-record observations**, the same idiom as the 2.1x and 1.8x
   the third shape used,
-  and it is bounded from ABOVE as well as below. The floor `2 * K` must stay
-  under the shortest record worth gating, and on the two-core geometry CI runs
-  `decode.video` record 0 measures 0.106-0.54 s, so a floor of 60 ms keeps it
-  gated while a floor of 200 ms would not. The third shape's two constants --
+  and something has to bound it from ABOVE, because the floor `2 * K` must stay
+  under the shortest record worth gating.
+  **What bounds it is `denoise` and `decode.audio`, and the reason first written
+  here was falsified by a bigger batch.** This paragraph said the two-core
+  geometry keeps `decode.video` record 0 gated at 0.106-0.54 s. Measured over 35
+  runs of the repaired shape it is not reliably gated at all: it fell below the
+  60 ms floor in 4 of 60 shared-box observations (25.0-26.6 ms) and 8 of 30
+  two-core observations (52.4-59.6 ms), the checked minimum on two cores was
+  62.6 ms, and in 2 of 20 shared-box runs the leaf reported `0 of 2 leaf
+  record(s) checked`. CI's runner is faster than that box, so it straddles there
+  too. The conclusion stands on the other two leaves instead, which is where it
+  should have stood: `denoise` and `decode.audio` are gated in 35 of 35 runs, are
+  seconds long in every configuration measured, and hold 96%+ of the leaf-seconds
+  -- a floor of 200 ms would still gate them, and a floor of 2 s would not. The
+  first claim came from the 53-run batch's `decode.video` range and was not
+  re-derived when the repaired shape was measured; it is corrected here rather
+  than quietly dropped. The third shape's two constants --
   0.25 ms plain, 3 ms under either sanitizer -- collapse to this one, because the
   plain lane's own scheduler tail is now 3x the largest sanitizer slack anybody
   has recorded (3.354 ms, ASan, `artifacts.frames` r2). A second constant would
@@ -2771,17 +2787,27 @@ Stated so the next reader does not have to derive it.
 2. **Everything about a leaf record under 60 ms.** On this fixture,
    measured over 53 runs:
 
-   | record | measured range | held instead by |
+   | record | measured range | what escapes, stated as a ceiling |
    |---|---|---|
-   | `artifacts.frames`, 9-frame render, 1 record | 0.90-6.21 ms | (2) at 0.50, the (0) count, `CheckWriterIsBesideTheDecode` |
-   | `artifacts.frames`, 81-frame render, 2 records | 4.39-61.0 ms | the same, and (1c) on the runs where a record clears the floor |
-   | `decode.video` reopen-after-a-chunk, 1-2 records | 0.019-5.66 ms | (2) at 0.90 and the (0) count |
+   | `artifacts.frames`, 9-frame render, 1 record | 0.90-6.21 ms | little: ONE record means (2) at 0.50 IS the capped span bound, so head plus tail stays under half the leaf. The (0) count and `CheckWriterIsBesideTheDecode` also hold |
+   | `artifacts.frames`, 81-frame render, 2 records | 4.39-61.0 ms | more, because (2) is on the SUM of two records rather than on each. (1c) checks a record on the runs where it clears the floor |
+   | `decode.video` reopen-after-a-chunk, 1-2 records | 0.019-5.66 ms | **anything up to the 60 ms floor**, i.e. up to 94x the record's honest size. (2) at 0.90 is not a backstop here: 10% of a 0.17-1.39 s leaf is 17-139 ms, so 60 ms is 4.3-43% of a budget the honest records barely touch. The third shape's escape on these records was about 0.5-0.75 ms |
+   | `decode.video` record 0 | 25.0-59.6 ms when it falls below | the same ceiling, on the runs where it falls. It is gated on most runs and not on all: 4 of 60 shared-box and 8 of 30 two-core observations were below the floor, checked minimum 62.6 ms |
+
+   **THE HAND-OFF TO (2) IS ONLY TIGHT FOR A SINGLE-RECORD LEAF**, and that is
+   one of the four rows above. `covered >= min_coverage * leaf_seconds` is a
+   statement about the leaf SUM. On a one-record leaf it is exactly the capped
+   span bound; on a multi-record leaf the budget is shared, and on
+   `decode.video` the leaf is three orders of magnitude longer than its reopen
+   records, so the coverage floor has room those records could never fill.
+   `REQUIRE(c.min_coverage >= 0.5)` at the site guards the single-record case and
+   claims nothing about the others.
 
    On the two-core geometry CI actually runs -- measured with `taskset -c 18,19`,
    where the render is *faster* because a 20-thread pool on a contended box is
-   worse than two threads on two cores -- the gated set is `denoise`,
-   `decode.audio` and `decode.video` record 0, and the same two leaves fall
-   below the floor.
+   worse than two threads on two cores (`denoise` 0.198-3.33 s pinned against
+   2.10-11.29 s unpinned) -- the reliably gated set is `denoise` and
+   `decode.audio` alone.
 3. **The interior gaps, unchanged.** (1c) never saw them and still does not; (2)
    is what bounds them, and #1439 is what is owed about the un-named time.
 

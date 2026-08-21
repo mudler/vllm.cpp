@@ -61,23 +61,48 @@ rather than inheriting the claim. The reconciliation the merge makes due is
 [#1561](https://github.com/mudler/vllm.cpp/issues/1561); `## Owed` O21 carries
 it.
 
-**THIS IS THE COMPLETE INVENTORY, and the first repair wave's was short.** That
-wave corrected the five spec statements and the index row and stopped there,
-which left the claim standing in the two places a USER can reach — in shipped
-product output and in a public header — for a second review to find:
+**THIS IS THE COMPLETE INVENTORY over `src/`, `include/`, `tests/`, `docs/` and
+`.agents/`, and the first repair wave's was short.** That wave corrected the five
+spec statements, SUPERSEDED the index row by appending a new one, and stopped
+there, which left the claim standing in the two places a USER can reach — in
+shipped product output and in a public header — for a second review to find. The
+five directories are the sweep's scope and are named because the sweep is not the
+whole tree; the one occurrence outside them is recorded under the table:
 
 | surface | what it said | state |
 |---|---|---|
 | 5 statements in this file, at `bb416e0ae` lines 46 (`## Upstream chain`), 332 and 383 (`## Gates`), 464 (`## Work breakdown`) and 1593 (`## Owed` O21) | "Not merged upstream" / "#52816 was still open" / "is still OPEN" | corrected by the first repair wave (`e8cb8d4a3`) |
-| the `#1538` row of `.agents/issue-index.md` | "while it is still open" | corrected by the first repair wave (`e8cb8d4a3`) |
+| the `#1538` row of `.agents/issue-index.md` | "while it is still open" | **SUPERSEDED, not corrected**, by the first repair wave (`e8cb8d4a3`) — see below |
 | `src/vllm/entrypoints/model_loader.cpp` — the DFlash2 startup notice, printed on **every** draft load, safetensors and GGUF alike | "which is OPEN upstream at head `66e5414c…`" | corrected by the SECOND repair wave |
 | `include/vllm/config/speculative.h` — the `IsDflash2Draft` BEYOND-PIN comment | "is OPEN at head `19c93519…`", the first of three heads, so doubly stale | corrected by the SECOND repair wave |
 
-The `#1561` index row states the inventory as "five statements in the spec plus
-the `#1538` index row", which is the short one. `.agents/issue-index.md` is
-append-only and a landed row is never edited, so **this table is the authority
-and that row is not**; #1561's own owed work is moving the gate head, which is a
-separate thing from the inventory of what said OPEN.
+**SUPERSEDED IS THE WORD, AND "CORRECTED" WOULD BE FALSE.** An earlier revision
+of this table said the `#1538` row was corrected by `e8cb8d4a3`, and it was not:
+`git show e8cb8d4a3 -- .agents/issue-index.md` is **3 insertions, 0 deletions**,
+appending the #1561, #1562 and #1564 rows. The `#1538` row is byte-identical to
+its `bb416e0ae` text — sha256 `c48fdd02…` on both — and it still reads "while it
+is still open" in the tree today. That is the rule working rather than the rule
+being broken: `.agents/issue-index.md` is append-only and a landed row is NEVER
+edited, so the only available repair is the one that was made, appending #1561
+to say what changed. A reader who wants the state of vllm#52816 reads #1561 and
+this table, not the #1538 row.
+
+The `#1561` row in turn states the inventory as "five statements in the spec plus
+the `#1538` index row", which is the short one, and it is likewise not edited.
+**This table is the authority and neither index row is**; #1561's own owed work
+is moving the gate head, which is a separate thing from the inventory of what
+said OPEN.
+
+**ONE OCCURRENCE LIVES OUTSIDE THE FIVE SWEPT DIRECTORIES, and it is history
+rather than a live claim.** `scripts/check-agent-record.py:637` reads "BEYOND-PIN
+on vLLM PR 52816 (OPEN at head `19c93519`, base `9842d701`)". It is the sole
+`52816` in `scripts/`, and it sits inside the dated append-only ratchet
+chronology that `b953bfe82` wrote on 2026-08-19 as the `165 since 2026-08-19`
+entry: that entry records what was true when the ratchet mark moved, which is a
+statement about 2026-08-19 and not about today. It is left as written for the
+same reason the `#1538` index row is, and it is recorded here so that a fourth
+sweep does not read it as a fifth stale surface. What would change it is the
+ratchet arithmetic being wrong, which it is not.
 
 **And the class is now gated rather than re-audited.** The startup-notice case in
 `tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` matched only the
@@ -86,6 +111,17 @@ across both false versions of the notice. It now asserts the merged wording and
 the merged head are PRESENT and both spellings of the open claim are ABSENT, so
 a third recurrence in that surface reds on every box with no checkpoint and no
 GPU.
+
+**A SECOND gate on the same notice was NOT strengthened, and that is recorded
+rather than left to be assumed.**
+`tests/vllm/entrypoints/test_dflash2_draft_routing.cpp:257` also asserts on the
+startup notice and also matches only the substring `"52816"`, so it is still
+blind to the word `OPEN`. It is not a finding: one strengthened gate catches the
+CLASS, because a false notice reds `test_dflash2_runner_reach` on every box with
+no checkpoint and no GPU, and hardening the second would add a second copy of one
+guarantee rather than a second guarantee. The third fresh review classified it
+that way. It is written here so that a later reader does not assume both were
+hardened.
 
 **THE HEAD MOVED under this row, and W3 is the wave that reconciles it**
 ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)). W1 and W2 were written
@@ -1886,15 +1922,50 @@ list items.
   against a 4-token output, and `edge.verified` should read 1 under `<` and 2
   under `<=`.
 
-  **The mutation that would prove it was NOT TAKEN.** It was attempted twice. The
-  first attempt was voided by a harness race (two concurrent instances; the
-  second baselined an already-mutated file, so it read `match count: 0`), and a
-  clean retake was unaffordable because every cycle in this build tree rebuilds
-  the whole 464-object library while the box ran at loadavg 145 and 12 objects
-  per ten minutes. Running against the library already on disk was REFUSED: it
+  **The mutation that would prove it was NOT TAKEN.** It was attempted ONCE, and
+  that attempt was voided by a harness race (two concurrent instances; the
+  second baselined an already-mutated file, so it read `match count: 0`); a
+  clean retake was then DECLINED as unaffordable, because every cycle in this
+  build tree rebuilds the whole 464-object library while the box ran at loadavg
+  145 and 12 objects per ten minutes. Running against the library already on disk was REFUSED: it
   had been compiled from the M1 mutation's source, so it would have measured a
   tree that no longer existed — the stale-binary trap `.agents/verification.md`
   names. Guessing the outcome would have been worse than recording the gap.
+
+  **One voided attempt and one declined retake is what `### W6's MUTATION SET`,
+  `.agents/benchmark-record.md` and the repair wave's own commit body all say.**
+  An earlier revision of this paragraph read "attempted twice", which counted the
+  declined retake as an attempt and left this row asserting two different
+  descriptions of the same event in three places.
+
+  **AN OUT-OF-SUITE COMPILATION SHOWS THE FIXTURE DISCRIMINATES, and it does NOT
+  discharge this.** The third fresh review could not afford the in-suite mutation
+  either, so it extracted `ReconstructAcceptance` into a standalone translation
+  unit and compiled it both ways. Reproduced independently on 2026-08-21 by the
+  repair wave: the function body copied VERBATIM from
+  `tests/parity/test_qwen38_dflash2_spec_decode.cpp:308-324` with the comparison
+  parameterised as `-DOP`, driven on the committed fixture's own literals,
+  `g++ -std=c++17 -O0` rc 0 both ways.
+
+  | case | `<`, the shipped operator | `<=`, the M2 mutant |
+  |---|---|---|
+  | `main` | verified 4, total 4, `[2,0,1,1]` | verified 4, total 4, `[2,0,1,1]` |
+  | `tail` | verified 4, total 4, `[2,0,1,1,0,0]` | verified 4, total 4, `[2,0,1,1,0,0]` |
+  | **`at_end`** | **verified 1**, total 2, `[2,0]` | **verified 2**, total 2, `[2,0]` |
+  | `shift` | verified 3, total 4, `[2,0,2]` | verified 3, total 4, `[2,0,2]` |
+
+  A `diff` of the two runs is ONE line, the `at_end` row. So `at_end` is the only
+  discriminating case in the fixture, and `CHECK(edge.verified == 1)` at
+  `tests/parity/test_qwen38_dflash2_spec_decode.cpp:1067` DOES red under M2. The
+  risk this owed item was really carrying -- that the new case proves nothing --
+  is removed.
+
+  **M2 STAYS NOT TAKEN.** What that compilation measures is a COPY of the
+  function under a compiler, not the committed test binary: it does not exercise
+  doctest's reporting, it cannot show that the built suite reaches the case, and
+  a copy that had silently drifted from its original would read exactly the same.
+  Those are the things an in-suite mutation is run for, so what is owed below
+  stands unchanged.
 
   So the arithmetic case is gated and the BOUNDARY case is present but unproven.
   What is owed is one mutation on a quiet box: flip `<` to `<=` at
@@ -1902,6 +1973,36 @@ list items.
   `test_qwen38_dflash2_spec_decode` clean, and confirm `edge.verified == 1` reds.
   If it does NOT red, the fixture does not span the boundary and LOW-D is not
   repaired.
+
+- **O25 — the DFlash2 startup notice prints TWICE on every draft load.** Owner:
+  `SPEC-DFLASH2`. Issue
+  [#1607](https://github.com/mudler/vllm.cpp/issues/1607).
+
+  `CheckDflash2DraftArm` (`src/vllm/entrypoints/model_loader.cpp:502`) ends in an
+  unconditional `std::cerr <<` with no once-flag, and the loader reaches it twice
+  on one load of one `EngineParams`: directly from `FromModelDir` at `:1929`,
+  and again from `ResolveSpecConfig` at `:1206`, which the `LoadedEngine`
+  constructor runs in its member initializer at `:1538` on all three
+  `new LoadedEngine(...)` returns (`:2172`, `:2341`, `:2359`). The server, the C
+  ABI and the bench client therefore each print the paragraph twice, on the
+  safetensors arm and the GGUF arm alike. The tree already states that the
+  resolution re-runs (`model_loader.cpp:2313`, `:871-874`); what nothing stated
+  is that the notice re-runs with it.
+
+  **ESTABLISHED STATICALLY, by reading the call graph rather than by executing
+  it.** Confirming it at runtime needs a DFlash2 checkpoint and a rebuild of the
+  whole 464-object library, which the wave that found it was barred from paying
+  for, so the mechanism is a reading and not a measurement.
+
+  `docs/USAGE.md` called it a "one-time notice" and now describes the two prints,
+  so the shipped documentation is no longer wrong about the behaviour while this
+  is open. The FIX is deliberately NOT taken here: it changes the production
+  loader and needs its own red-first test and its own fresh review. What would
+  close it is one owner for the notice -- a once-flag inside
+  `CheckDflash2DraftArm`, or dropping the constructor's call site, noting that
+  `FromModelDir`'s exists on purpose so a misclassified draft is caught before a
+  51.75 GiB target is mapped -- plus a test that loads a DFlash2 draft through a
+  production entry point and asserts the paragraph occurs exactly once.
 
 
 ## Now
@@ -2234,7 +2335,7 @@ count, `git diff --stat` and the compile rc printed. Unmutated the suites read
 | mutation | result |
 |---|---|
 | **M1** — the startup notice reverted to its exact pre-repair `"is OPEN upstream at head 66e5414c"` wording (match 1, `+3/-5`, compile rc 0) | 1 case / **4 of 90** red, `Status: FAILURE!`, rc 1 — and they are exactly the four new assertions: `MERGED upstream` absent, `3406ec1dae…` absent, `OPEN upstream` present, `is OPEN` present |
-| **M2** — `len < out.size()` becomes `len <= out.size()` on the `verified` guard | **NOT TAKEN — see below** |
+| **M2** — `len < out.size()` becomes `len <= out.size()` on the `verified` guard | **NOT TAKEN — see below.** An OUT-OF-SUITE compilation of the extracted function shows `at_end` is the discriminating case (verified 1 under `<`, 2 under `<=`); the IN-SUITE mutation is still owed |
 
 **M1 is the one that matters for MEDIUM-A**, because it reproduces the exact
 defect: it puts the false sentence back into the binary's own startup output and
@@ -2261,8 +2362,21 @@ its unconsumed blocks start at len 9 against an 8-token output, so `<` and `<=`
 answer identically there and the boundary was ungated. The fresh review measured
 that directly: it mutated `<` to `<=` and the whole suite stayed green. What M2
 would decide is whether the new case closes that hole, and the expected reading
-is `edge.verified == 1` red under `<=`. **That has not been observed here.** The
-box was starved, and a clean retake was not affordable: every mutation cycle in
+is `edge.verified == 1` red under `<=`.
+
+**AN OUT-OF-SUITE COMPILATION SAYS IT DOES, and the IN-SUITE mutation is still
+owed.** `ReconstructAcceptance` was copied VERBATIM out of the test into a
+standalone translation unit and compiled both ways on 2026-08-21
+(`g++ -std=c++17 -O0`, rc 0 each). `main`, `tail` and `shift` read identically
+under `<` and `<=`; `at_end` reads verified **1** under `<` and **2** under
+`<=`, and a `diff` of the two runs is that one line. So the fixture DOES
+discriminate and `CHECK(edge.verified == 1)` reds under M2. `## Owed` O24 carries
+the table. **That is not the mutation and does not discharge it**: it measures a
+copy of the function under a compiler, not the built test binary, doctest's
+reporting, or whether the suite reaches the case at all -- which is what a
+mutation is run for. **The in-suite mutation has still not been observed here.**
+
+The box was starved, and a clean retake was not affordable: every mutation cycle in
 this build tree rebuilds the WHOLE library (464 objects, not the one translation
 unit that changed), and at loadavg 145 with 12 objects per 10 minutes measured,
 one cycle is hours rather than minutes. Running the suite against the library

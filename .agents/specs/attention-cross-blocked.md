@@ -532,6 +532,42 @@ passed, 353 assertions, 353 passed, `Status: SUCCESS!`**.
 - **[#1131](https://github.com/mudler/vllm.cpp/issues/1131) is NOT closed by this
   row.** It remains open on the DiT device arm.
 
+## 7a. Reachability — a POSITIVE production observation, not a mutation
+
+`.agents/reachability.md` asks two questions and they are not the same question.
+
+**Does a production entry point reach this?** Yes, and it was observed rather
+than traced. `examples/minimax-music3-gen` is an ABI client; it loads the real
+28 517 617 303-byte checkpoint from local disk and runs `--device 1` at its
+DEFAULT configuration, and with `VT_OP_PROVIDER_STATS=1` the engine itself
+printed, on `thor:gpu0`, `rc` job `0fc0bd6e-754e-43d6-9210-a9dfb4075c41`:
+
+```text
+[vt op-provider] op=19 device=1 selected=vt-cross-blocked priority=10 registered=2
+```
+
+`OpId` 19 **is** `kAttentionCross` — the enum position, counted, not assumed.
+`registered=2` is both providers; every other op in the same run reads
+`registered=1`. The same binary with `VT_OP_PROVIDER_DISABLE=vt-cross-blocked`
+printed `selected=vt-native priority=0 registered=2`, so the control is
+two-sided and neither half is an inference.
+
+**This row's shape is not the `tp`-handle shape, and the difference matters.**
+The op already had five production call sites before this change; what is new is
+a provider UNDER an existing call site. So the question "is the call site
+reached" was already answered, and the question that could still fail — "does a
+production run SELECT the new provider" — is the one the line above answers, in
+the affirmative, on the real model.
+
+**Does a test enter through it?** The op's own suite asserts the routing
+two-sidedly through `GetOpProviderStats(...).declines` on every geometry, and
+the mutation suite (§8) removes the routing and shows the gate go red. The
+mutation is what proves the gate has teeth; the announce line above is what
+proves a user arrives there.
+
+**#1131 is NOT closed by this row.** It stays open on the DiT device arm, and
+this row's evidence is about which kernel serves an op, not about that.
+
 ## 8. Gates, and their state
 
 Filled in from the runs.

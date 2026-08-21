@@ -16,6 +16,7 @@ worked around, and the workarounds were what made the old gate unrepairable.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -482,6 +483,200 @@ class FeatureSurfaceTrigger(unittest.TestCase):
             [self.MODEL, "docs/FEATURES.md"], self.REGISTERED, self.ADDED
         )
         self.assertEqual(errors, [])
+
+
+class PartialIsALifecycleState(unittest.TestCase):
+    """GATE-DOC-CHECKPOINT-STATES (#1434).
+
+    `STATES` is the whole definition of what a lifecycle state IS for this gate.
+    `PARTIAL` was absent from it while being the second most used state in the
+    matrices -- 118 backticked cells at 947e5f648, against 77 for `DONE`. The
+    consequence is not a wrong label: `row_states` DROPS a row it cannot match,
+    and both `lifecycle_moves` and `moved_rows` iterate the AFTER map, so a row
+    leaving the matched set is never compared against its predecessor at all.
+
+    Measured with scratch commits at 947e5f648 on the unmodified checker, the
+    two transitions below returned rc 0 and this file had nothing that could
+    fail. The third returned rc 1 for the WRONG reason.
+    """
+
+    TABLE = ROW_TABLE
+
+    def errors(self, paths, before_text, after_text):
+        original = checker.blob
+
+        def fake(rev, path):
+            if path.startswith(".agents/specs/"):
+                return SPEC_WITH_NOW
+            return before_text if rev == "BEFORE" else after_text
+
+        checker.blob = fake
+        try:
+            return checker.errors_for(set(paths), "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    def reasons(self, before_text, after_text):
+        original = checker.blob
+        checker.blob = lambda rev, path: (
+            before_text if rev == "BEFORE" else after_text
+        )
+        try:
+            return checker.classify(
+                {".agents/kernel-matrix.md"}, "BEFORE", "AFTER"
+            )
+        finally:
+            checker.blob = original
+
+    def test_a_move_into_partial_is_a_lifecycle_move(self):
+        """RED-BEFORE. The reported case: LOAD-GGUF-MMPROJ moved READY -> PARTIAL.
+
+        The row vanishes from the AFTER map, so nothing iterates it and the
+        checkpoint surfaces are owed by a claim no gate can observe.
+        """
+        errors = self.errors(
+            [".agents/kernel-matrix.md"],
+            self.TABLE.format(alpha="READY", beta="DONE"),
+            self.TABLE.format(alpha="PARTIAL", beta="DONE"),
+        )
+        self.assertTrue(errors, "READY -> PARTIAL must be a lifecycle move")
+        joined = " ".join(errors)
+        for surface in ("docs/STATUS.md", "docs/BENCHMARKS.md", ".agents/specs/alpha.md"):
+            self.assertIn(surface, joined)
+
+    def test_a_move_out_of_partial_is_a_lifecycle_move(self):
+        """RED-BEFORE. Absent from BEFORE, and READY is not in the claim set."""
+        errors = self.errors(
+            [".agents/kernel-matrix.md"],
+            self.TABLE.format(alpha="PARTIAL", beta="DONE"),
+            self.TABLE.format(alpha="READY", beta="DONE"),
+        )
+        self.assertTrue(errors, "PARTIAL -> READY must be a lifecycle move")
+        self.assertIn("docs/STATUS.md", " ".join(errors))
+
+    def test_a_move_out_of_partial_names_the_transition_not_a_new_row(self):
+        """PARTIAL -> ACTIVE already red, for the wrong reason.
+
+        Unseen in BEFORE, the row looked BRAND NEW, so the gate said `added as
+        ACTIVE` about a row that had existed for months. The verdict was right
+        by accident; the reason a reader is handed has to be right too.
+        """
+        classes, reasons = self.reasons(
+            self.TABLE.format(alpha="PARTIAL", beta="DONE"),
+            self.TABLE.format(alpha="ACTIVE", beta="DONE"),
+        )
+        self.assertIn("lifecycle", classes)
+        joined = " ".join(reasons)
+        self.assertIn("KERNEL-ALPHA PARTIAL -> ACTIVE", joined)
+        self.assertNotIn("added as", joined)
+
+    def test_a_complete_partial_checkpoint_passes(self):
+        """The widening must be payable, not merely loud."""
+        errors = self.errors(
+            [
+                ".agents/kernel-matrix.md",
+                ".agents/specs/alpha.md",
+                "docs/STATUS.md",
+                "docs/BENCHMARKS.md",
+            ],
+            self.TABLE.format(alpha="READY", beta="DONE"),
+            self.TABLE.format(alpha="PARTIAL", beta="DONE"),
+        )
+        self.assertEqual(errors, [])
+
+    def test_prose_partial_does_not_beat_the_state_cell(self):
+        """The last-match heuristic still holds for the new token.
+
+        It is load-bearing here: `KV-BLOCK-POOL` writes `PARTIAL` (not `DONE`)
+        in its own evidence prose, which is why the gate resolved that row as
+        `DONE` before this change.
+        """
+        line = "| `KERNEL-X` | `PARTIAL` (not `DONE`) because two arms refuse | `PARTIAL` | ops |\n"
+        self.assertEqual(checker.row_states(line), {"KERNEL-X": "PARTIAL"})
+
+    def test_removing_partial_from_states_restores_the_blind_spot(self):
+        """MUTATION: proves the tuple entry is what makes the cases above fire.
+
+        STATE_CELL is derived from STATES at import, so a mutation that only
+        rebound STATES would apply to nothing and read as a passing test.
+        Both are rebound, and the assertion below is that the gate goes BLIND.
+        """
+        moved = (
+            self.TABLE.format(alpha="READY", beta="DONE"),
+            self.TABLE.format(alpha="PARTIAL", beta="DONE"),
+        )
+        self.assertTrue(self.errors([".agents/kernel-matrix.md"], *moved))
+
+        states, cell = checker.STATES, checker.STATE_CELL
+        narrowed = tuple(s for s in states if s != "PARTIAL")
+        self.assertNotEqual(narrowed, states, "the mutation applied to nothing")
+        checker.STATES = narrowed
+        checker.STATE_CELL = re.compile(
+            r"`(" + "|".join(re.escape(s) for s in narrowed) + r")`"
+        )
+        try:
+            self.assertEqual(
+                self.errors([".agents/kernel-matrix.md"], *moved),
+                [],
+                "without PARTIAL the gate must go blind; it did not, so these "
+                "tests are measuring something other than the tuple entry",
+            )
+        finally:
+            checker.STATES, checker.STATE_CELL = states, cell
+        self.assertTrue(self.errors([".agents/kernel-matrix.md"], *moved))
+
+    def test_a_new_row_added_as_partial_is_still_not_a_claim(self):
+        """A deliberate exclusion, pinned so a later widening is a decision.
+
+        The claim set governs rows ABSENT from the BEFORE map, and the dominant
+        real cause of that here is a record RELOCATION between matrices, not a
+        new capability. Widening it would red legitimate record moves for 118
+        more rows while fixing nothing #1434 reports.
+        """
+        one_row = "| `KERNEL-ALPHA` | alpha | `PARTIAL` | ops |\n"
+        classes, _ = self.reasons("", one_row)
+        self.assertNotIn("lifecycle", classes)
+
+
+class AnchorBackfillIsDeliberatelyExcluded(unittest.TestCase):
+    """The ruling #1434 asked for, kept executable rather than only argued.
+
+    `.agents/feature-matrix.md` names `PARTIAL`, `BLOCKED` and `ANCHOR-BACKFILL`
+    together, so "the matrix calls it a state" cannot be the test. The test is
+    whether `docs/STATUS.md` PROJECTS it, because `REQUIRED["lifecycle"]` is
+    (STATUS, BENCHMARKS) and carries all of them or none.
+    """
+
+    def test_partial_is_a_public_status_term(self):
+        status = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "| Partial | A usable path exists with named missing behavior or "
+            "evidence |",
+            status,
+        )
+        self.assertIn("PARTIAL", checker.STATES)
+
+    def test_anchor_backfill_is_not_a_public_status_term(self):
+        """If this ever fails, the exclusion below has to be revisited."""
+        status = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
+        self.assertNotIn("ANCHOR-BACKFILL", status)
+        self.assertNotIn("Anchor-backfill", status)
+
+    def test_anchor_backfill_stays_out_of_the_tuple(self):
+        """Admitting it demands a STATUS edit with nothing true to write.
+
+        That is the shape check-doc-checkpoint.py:4-17 records as the reason
+        this file was rewritten: 16 of 20 red CI runs and six hardcoded
+        escape-hatch path sets. Paying the `## Now` half it genuinely owes needs
+        REQUIRED to carry a spec-only class, which is a different change and is
+        listed under `## Owed` in doc-checkpoint-lifecycle-states.md.
+        """
+        self.assertNotIn("ANCHOR-BACKFILL", checker.STATES)
+        spec = (
+            ROOT / ".agents/specs/doc-checkpoint-lifecycle-states.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("## Owed", spec)
+        self.assertIn("ANCHOR-BACKFILL", spec.split("## Owed", 1)[1])
 
 
 if __name__ == "__main__":

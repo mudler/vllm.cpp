@@ -274,7 +274,7 @@ class RatchetTests(unittest.TestCase):
         self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
 
     def test_re_adding_done_to_the_gated_population_breaks_the_pin(self):
-        # MUTATION: restoring the departed lifecycle state must expose the four
+        # MUTATION: restoring the departed lifecycle state must expose the five
         # runnable DONE rows and disagree with the re-pinned baseline.
         original = gates.GATED_STATES
         gates.GATED_STATES = frozenset(original | {"DONE"})
@@ -289,6 +289,7 @@ class RatchetTests(unittest.TestCase):
             "SERVE-HTTP-TRANSPORT",
             "ENG-NOW-DERIVED",
             "ENG-TRAILER-MERGE-ARTIFACTS",
+            "SPEC-BPE-QUADRATIC-MERGE",
         }
         self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
         self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
@@ -815,26 +816,25 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
-    def test_bpe_quadratic_merge_earns_its_runnable_baseline_entry(self):
-        # SPEC-BPE-QUADRATIC-MERGE (#1365) was already gated and already carried
-        # a `## Gates` section; what changed is that the section now names the
-        # `g++` build and the run lines for `tools/bench/bpe_encode_cost.cpp`.
-        # So this is growth WITHIN the population, not arrival into it, and the
-        # baseline grows by one either way.
+    def test_bpe_quadratic_merge_left_the_gated_population_cleanly(self):
+        # SPEC-BPE-QUADRATIC-MERGE (#1365) entered the runnable population on
+        # 2026-08-19 as growth, when its `## Gates` section gained the `g++`
+        # build and the run lines for `tools/bench/bpe_encode_cost.cpp`. Its
+        # closing commit promoted the row `GATING` -> `DONE`, and `DONE` is not
+        # in GATED_STATES, so it leaves the AUDITED population entirely.
         #
-        # Same shape and same reason as the two rows above: set equality holds
-        # for any membership and cannot say this row belongs, so this case says
-        # it by removing the entry and requiring the equality to go red. Without
-        # it, an entry added to quiet a red gate is indistinguishable from an
-        # entry added because a row gained a command.
+        # Assert the departure on BOTH sides -- gone from the audit AND gone
+        # from the baseline -- because a row present in one and not the other is
+        # exactly what the exact pin exists to catch. Same shape and same reason
+        # as ENG-TRAILER-MERGE-ARTIFACTS and ENG-NOW-DERIVED above.
+        #
+        # The row is NOT re-verdicted downward and it did not lose its command:
+        # the recipe is still in the spec. This case pins the difference, since
+        # a row that leaves and a row that silently drops its gate command are
+        # the two things this classifier must never confuse.
         verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
-        self.assertEqual(verdicts.get("SPEC-BPE-QUADRATIC-MERGE"), "runnable")
-        reduced = set(gates.RUNNABLE_BASELINE) - {"SPEC-BPE-QUADRATIC-MERGE"}
-        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
-        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
-        self.assertNotEqual(runnable, reduced)
-        self.assertEqual(runnable - reduced, {"SPEC-BPE-QUADRATIC-MERGE"})
-        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+        self.assertIsNone(verdicts.get("SPEC-BPE-QUADRATIC-MERGE"))
+        self.assertNotIn("SPEC-BPE-QUADRATIC-MERGE", gates.RUNNABLE_BASELINE)
 
 
 if __name__ == "__main__":

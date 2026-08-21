@@ -501,7 +501,13 @@ the CLOCKS paragraph of the 2026-08-15 Qwen3.8-27B entry, and the c4 cell is
 - [#1354](https://github.com/mudler/vllm.cpp/issues/1354) stays open until the
   capability grant lands or is declined.
 - [#1546](https://github.com/mudler/vllm.cpp/issues/1546), the cross-arm
-  excursion-symmetry term, filed by this row and unimplemented.
+  excursion-symmetry term, filed by this row. **Implemented** by
+  `BENCH-CLOCK-CROSS-ARM` in
+  [`clock-cross-arm-mean.md`](clock-cross-arm-mean.md), which bounds the two
+  arms' MEAN SM clocks rather than the difference of their excursion burdens;
+  §The statistic there measures the pairing where the difference of burdens
+  reads exactly 0.0000 while the mean clocks are 2.28% apart. It refuses more
+  and never less, and it changes no verdict on any of the nine windows.
 - [#1386](https://github.com/mudler/vllm.cpp/issues/1386), the thermal and
   electrical fields. This row depends on it: without a die reading the throttle
   rule cannot be shown mis-scoped, and §Scoping the throttle rule is REFUSED is

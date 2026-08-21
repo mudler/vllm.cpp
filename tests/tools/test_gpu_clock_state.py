@@ -24,6 +24,7 @@ import unittest
 from tools.bench.gpu_clock_state import (
     BENIGN_THROTTLE_MASK,
     CLOCK_TIME_TRANSFER,
+    MAX_CROSS_ARM_MEAN_OFFSET_PCT,
     MAX_CROSS_ARM_OFFSET_PCT,
     MAX_WITHIN_RUN_SPREAD_PCT,
     MIN_BUSY_FRACTION,
@@ -719,6 +720,234 @@ class ThresholdProvenanceTests(unittest.TestCase):
         self.assertGreater(MIN_BUSY_FRACTION, 0.0)
         self.assertLessEqual(MIN_BUSY_FRACTION, 1.0)
 
+
+# n=155, median 2489 MHz, mean 2460.290323, spread 3.5757% -- UNDER the 5.0%
+# within-run ceiling, no throttle bit, well over MIN_BUSY_SAMPLES. Every existing
+# rule is silent on it, so the cases below measure the cross-arm mean term and
+# nothing else. The shape is the 2026-08-19 excursion population exaggerated
+# until it is worth more than a point of clock: the real legs read 0.12% to
+# 1.04%, and the three real pairings read 0.10 to 0.25 on the term.
+EXCURSION_WINDOW = [2489] * 105 + [2400] * 50
+EXCURSION_MEAN = 2460.290322580645
+EXCURSION_COST_PCT = 1.153462331030721
+# The same burden pointing UP instead of down. Median still 2489, spread still
+# 3.5757%, cost equal in magnitude and opposite in sign.
+LIFTED_WINDOW = [2489] * 105 + [2578] * 50
+FLAT_WINDOW = [2489] * 155
+
+
+def _uneven(values, *, boot_id=BOOT_GOOD, **kwargs):
+    """A record from a window taken VERBATIM, with no repetition to the floor.
+
+    `_record` repeats its pattern to clear `MIN_BUSY_SAMPLES`, which preserves
+    min, median and max -- and preserves the mean too, so it cannot express a
+    window whose excursion population is a specific FRACTION of the samples.
+    These windows are already 140 samples and over, and are used as written.
+    """
+
+    return build_clock_record(_samples(values, **kwargs), boot_id=boot_id)
+
+
+class CrossArmMeanTests(unittest.TestCase):
+    """The cross-arm rule bounded the two arms' MEDIANS and nothing else (#1546).
+
+    On the three recorded Qwen3.8-27B bf16 c1 pairings of 2026-08-19,
+    `median_offset_pct` reads exactly 0.0000% while the arms' MEAN clocks are
+    0.2521 / 0.1530 / 0.1035 points apart. The excursion population is 5.74% of
+    samples and sits almost entirely below the median -- 95 of the 97 labelled
+    samples -- so a median over 155 to 246 samples steps straight over the one
+    part of the distribution that does NOT cancel between the arms. Throughput
+    is an integral over the window, so the mean is what transfers.
+
+    Argument, thresholds, and the two statistics this one was chosen over:
+    `.agents/specs/clock-cross-arm-mean.md`.
+    """
+
+    def test_a_burden_both_arms_pay_cancels_out_of_the_ratio(self) -> None:
+        """The control, and the case that keeps this a CROSS-ARM term.
+
+        Each arm carries a 1.1535% excursion burden -- above the ceiling on its
+        own -- and the term is silent, because a burden both arms pay divides
+        out of the ratio. Bounding the burden per arm is a DIFFERENT rule
+        (Route B's `MAX_EXCURSION_MEAN_COST_PCT`, unimplemented under #1354) and
+        must not be smuggled in here.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(EXCURSION_WINDOW)
+        )
+        self.assertEqual(comparison["reasons"], [])
+        self.assertAlmostEqual(comparison["median_offset_pct"], 0.0)
+        self.assertAlmostEqual(comparison["mean_offset_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["ours_mean_cost_pct"], EXCURSION_COST_PCT, places=9
+        )
+        self.assertAlmostEqual(
+            comparison["vllm_mean_cost_pct"], EXCURSION_COST_PCT, places=9
+        )
+        self.assertAlmostEqual(comparison["excursion_burden_difference_pct"], 0.0)
+
+    def test_a_burden_only_one_arm_pays_refuses_at_a_zero_median_offset(self) -> None:
+        """The defect, in one pairing.
+
+        Identical medians, identical hardware, one boot, both windows inside
+        every existing rule -- and the arms ran 1.15% apart on the mean. Before
+        this term nothing in the module read that quantity, so the pairing
+        compared CLEAN.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(FLAT_WINDOW)
+        )
+        self.assertAlmostEqual(comparison["median_offset_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["mean_offset_pct"], -EXCURSION_COST_PCT, places=9
+        )
+        self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+        reason = comparison["reasons"][0]
+        self.assertIn("MEAN SM clocks", reason)
+        self.assertIn(str(MAX_CROSS_ARM_MEAN_OFFSET_PCT), reason)
+        self.assertIn("ours", reason)
+        self.assertIn("vllm", reason)
+
+    def test_opposing_burdens_add_although_their_magnitudes_cancel(self) -> None:
+        """Why the statistic is the mean OFFSET and not a difference of burdens.
+
+        #1546 quotes the arms' mean-clock COST, which is an absolute value. Here
+        both arms carry 1.1535% of it, so the difference of the two magnitudes
+        is exactly 0.0000 -- and the arms' mean clocks are 2.28% apart, because
+        an upward excursion on one arm and a downward one on the other ADD. A
+        gate on the difference of burdens passes this pairing.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(LIFTED_WINDOW)
+        )
+        self.assertAlmostEqual(comparison["median_offset_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["excursion_burden_difference_pct"], 0.0, places=9
+        )
+        self.assertAlmostEqual(comparison["mean_offset_pct"], -2.280619, places=5)
+        self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+        self.assertIn("MEAN SM clocks", comparison["reasons"][0])
+
+    def test_a_compensating_pair_is_the_median_rules_and_not_this_ones(self) -> None:
+        """And why it is not the SIGNED difference of burdens either.
+
+        This GPU sits in two boost states 26 MHz apart, 2515 and 2489, which are
+        91.07% of the 1690 retained busy samples of 2026-08-19. Two arms half in
+        each, whose medians snap to different states, have a signed cost
+        difference of 1.0325 points -- and IDENTICAL mean clocks, so nothing
+        transfers at all. The existing MEDIAN rule refuses this pairing at
+        1.0338%, and this term must stay silent on it.
+        """
+
+        comparison = compare_clock_records(
+            _uneven([2489] * 78 + [2515] * 77), _uneven([2489] * 77 + [2515] * 78)
+        )
+        self.assertAlmostEqual(comparison["median_offset_pct"], -1.033797, places=5)
+        self.assertLess(abs(comparison["mean_offset_pct"]), 0.01)
+        self.assertAlmostEqual(
+            comparison["ours_mean_cost_pct"] - comparison["vllm_mean_cost_pct"],
+            -1.0325,
+            places=3,
+        )
+        self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+        self.assertIn("median SM-clock offset", comparison["reasons"][0])
+        self.assertNotIn("MEAN SM clocks", comparison["reasons"][0])
+
+    def test_a_record_without_a_mean_refuses_and_names_the_arm(self) -> None:
+        """Unknown is not absence or success.
+
+        Every record written before this term lacks the field, including the
+        nine archived 2026-08-19 windows. Skipping the term on those is the
+        absent hook that looks like an armed instrument, so the record is
+        refused and the reason names the field, the arm, and why.
+        """
+
+        for arm, label in ((0, "ours"), (1, "vllm")):
+            with self.subTest(arm=label):
+                records = [_uneven(FLAT_WINDOW), _uneven(FLAT_WINDOW)]
+                records[arm]["sm_clock_mhz"].pop("mean")
+                comparison = compare_clock_records(*records)
+                self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+                reason = comparison["reasons"][0]
+                self.assertIn(label, reason)
+                self.assertIn("mean", reason)
+                self.assertIn("predates", reason)
+                self.assertIsNone(comparison["mean_offset_pct"])
+
+    def test_the_merged_mean_is_sample_count_weighted(self) -> None:
+        """An arm's mean is over its whole retained busy series, not per leg.
+
+        The legs differ in length in every recorded campaign -- 155 / 155 / 156
+        at c1 and 245 / 246 / 244 at c8 -- so an unweighted mean of leg means is
+        the wrong number. Here it would be 2444.5 against the true 2463.5714.
+        """
+
+        merged = merge_clock_records([_uneven([2489] * 100), _uneven([2400] * 40)])
+        self.assertEqual(merged["sm_clock_mhz"]["n"], 140)
+        self.assertAlmostEqual(merged["sm_clock_mhz"]["mean"], 2463.5714285714284)
+        self.assertNotAlmostEqual(merged["sm_clock_mhz"]["mean"], 2444.5)
+
+    def test_a_leg_without_a_mean_leaves_the_arm_without_one(self) -> None:
+        """The fold propagates the absence rather than papering over it."""
+
+        legs = [_uneven([2489] * 100), _uneven([2400] * 40)]
+        legs[1]["sm_clock_mhz"].pop("mean")
+        merged = merge_clock_records(legs)
+        self.assertNotIn("mean", merged["sm_clock_mhz"])
+
+    def test_the_means_and_burdens_are_surfaced_next_to_the_ratio(self) -> None:
+        """Reported, and reported PER ARM.
+
+        A refusal that says only "1.15% apart" leaves the reader unable to see
+        which arm's excursion population carried it, which is the whole content
+        of the finding this term encodes.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(FLAT_WINDOW)
+        )
+        self.assertAlmostEqual(comparison["ours_mean_sm_mhz"], EXCURSION_MEAN)
+        self.assertAlmostEqual(comparison["vllm_mean_sm_mhz"], 2489.0)
+        self.assertAlmostEqual(
+            comparison["ours_mean_cost_pct"], EXCURSION_COST_PCT, places=9
+        )
+        self.assertAlmostEqual(comparison["vllm_mean_cost_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["excursion_burden_difference_pct"],
+            EXCURSION_COST_PCT,
+            places=9,
+        )
+
+    def test_on_a_flat_window_the_two_cross_arm_terms_coincide(self) -> None:
+        """Which is what makes every pre-existing fixture behave identically.
+
+        Mean equals median on a flat window, so the new term scores exactly what
+        the old one scores, inclusive boundary included. The 2026-08-15 pinned
+        capture -- flat 2184 MHz over n=861 -- is that shape.
+        """
+
+        inside = compare_clock_records(_record([2020] * 3), _record([2000] * 3))
+        self.assertAlmostEqual(inside["mean_offset_pct"], inside["median_offset_pct"])
+        self.assertAlmostEqual(inside["mean_offset_pct"], 1.0)
+        self.assertEqual(inside["reasons"], [])
+        outside = compare_clock_records(_record([2021] * 3), _record([2000] * 3))
+        self.assertAlmostEqual(outside["mean_offset_pct"], outside["median_offset_pct"])
+        self.assertEqual(len(outside["reasons"]), 2, outside["reasons"])
+
+    def test_the_ceiling_is_the_one_the_median_rule_already_carries(self) -> None:
+        """No new number: the same physics ceiling, the same forward criterion.
+
+        A 1.0% mean offset implies at most 1.0% of the ratio, because the
+        transfer is bounded above by one point of kernel time per point of
+        clock, and 1.0 is under the 2.97% smallest deficit this harness has been
+        used to rank. Pinning the equality means a later edit that loosens one
+        of the two cross-arm terms without the other has to say so.
+        """
+
+        self.assertEqual(MAX_CROSS_ARM_MEAN_OFFSET_PCT, MAX_CROSS_ARM_OFFSET_PCT)
 
 if __name__ == "__main__":
     unittest.main()

@@ -200,10 +200,14 @@ def _clock_comparison(
             "caveats": [],
             "cross_boot_override": False,
             "estimated_effect_pct": None,
+            "excursion_burden_difference_pct": None,
+            "mean_offset_pct": None,
             "median_offset_pct": None,
             "ours_boot_id": None if ours is None else ours.get("boot_id"),
             "ours_busy_samples": None,
             "ours_idle_samples_excluded": None,
+            "ours_mean_cost_pct": None,
+            "ours_mean_sm_mhz": None,
             "ours_median_sm_mhz": None,
             "ours_spread_pct": None,
             "reasons": [
@@ -215,6 +219,8 @@ def _clock_comparison(
             "vllm_boot_id": None if floor is None else floor.get("boot_id"),
             "vllm_busy_samples": None,
             "vllm_idle_samples_excluded": None,
+            "vllm_mean_cost_pct": None,
+            "vllm_mean_sm_mhz": None,
             "vllm_median_sm_mhz": None,
             "vllm_spread_pct": None,
         }
@@ -1185,6 +1191,30 @@ def _report(runs: Mapping[str, Any], ratios: Mapping[str, Any]) -> str:
                 f"{_sample_count(clock, 'vllm_busy_samples')} busy / "
                 f"{_sample_count(clock, 'vllm_idle_samples_excluded')} idle"
             )
+            # The MEAN beside the median, because the two disagree exactly
+            # where it matters: on the 2026-08-19 c1 pairings the median offset
+            # reads +0.00% on all three while the means are 0.10 to 0.25 points
+            # apart, and throughput is an integral over the window (#1546).
+            # Printed for the same reason the busy counts are -- a quantity the
+            # gate reads and the report does not is a quantity nobody checks.
+            ours_mean = clock.get("ours_mean_sm_mhz")
+            floor_mean = clock.get("vllm_mean_sm_mhz")
+            mean_offset = clock.get("mean_offset_pct")
+            if ours_mean is None or floor_mean is None or mean_offset is None:
+                lines.append(
+                    "  - mean SM clock NOT RECORDED \u2014 this record predates "
+                    "the cross-arm mean term and cannot be checked against it"
+                )
+            else:
+                ours_cost = clock.get("ours_mean_cost_pct")
+                floor_cost = clock.get("vllm_mean_cost_pct")
+                lines.append(
+                    f"  - mean: ours {ours_mean:.1f} MHz vs vLLM {floor_mean:.1f} "
+                    f"MHz ({mean_offset:+.2f}%); excursion burden ours "
+                    + ("?" if ours_cost is None else f"{ours_cost:+.2f}%")
+                    + " vs vLLM "
+                    + ("?" if floor_cost is None else f"{floor_cost:+.2f}%")
+                )
         for reason in clock.get("reasons", []):
             lines.append(f"  - {reason}")
         for caveat in clock.get("caveats", []):

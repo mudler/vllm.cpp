@@ -94,8 +94,9 @@ is moving the gate head, which is a separate thing from the inventory of what
 said OPEN.
 
 **ONE OCCURRENCE LIVES OUTSIDE THE FIVE SWEPT DIRECTORIES, and it is history
-rather than a live claim.** `scripts/check-agent-record.py:637` reads "BEYOND-PIN
-on vLLM PR 52816 (OPEN at head `19c93519`, base `9842d701`)". It is the sole
+rather than a live claim.** `scripts/check-agent-record.py:637-638` reads
+"BEYOND-PIN on vLLM PR 52816 (OPEN at head `19c93519`, base `9842d701`)", which
+wraps across the two lines and is not readable at `:637` alone. It is the sole
 `52816` in `scripts/`, and it sits inside the dated append-only ratchet
 chronology that `b953bfe82` wrote on 2026-08-19 as the `165 since 2026-08-19`
 entry: that entry records what was true when the ratchet mark moved, which is a
@@ -502,8 +503,13 @@ wave, which re-read it: merged `05:27:22Z`, merge commit `b389ac29`, head
 `3406ec1d`.
 
 The oracle stays `66e5414c` because that is the wheel that was BUILT AND RUN on
-the lease, before the merge existed. `## Gates` G2 carries why that is a dated
-exception and not the rule, and
+the lease. `66e5414c` is an earlier head of #52816 than the merged `3406ec1d`,
+but nothing in the tree dates the build or the run, so where that run falls
+against the merge instant is unmeasured -- and it does no work either way, since
+what keeps the head is that it is what executed. The `#1561` index row states
+the same thing as "it predates the merge", which is that unmeasured ordering; it
+is append-only and is not edited, and this paragraph is the authority.
+`## Gates` G2 carries why the pin is a dated exception and not the rule, and
 [#1561](https://github.com/mudler/vllm.cpp/issues/1561) owns moving it.
 
 The artifact, so a later reader can tell whether they hold the same one:
@@ -1943,8 +1949,9 @@ list items.
   either, so it extracted `ReconstructAcceptance` into a standalone translation
   unit and compiled it both ways. Reproduced independently on 2026-08-21 by the
   repair wave: the function body copied VERBATIM from
-  `tests/parity/test_qwen38_dflash2_spec_decode.cpp:308-324` with the comparison
-  parameterised as `-DOP`, driven on the committed fixture's own literals,
+  `tests/parity/test_qwen38_dflash2_spec_decode.cpp:308-325` -- signature at
+  `:308-309`, `return r;` at `:324`, closing brace at `:325` -- with the
+  comparison parameterised as `-DOP`, driven on the committed fixture's own literals,
   `g++ -std=c++17 -O0` rc 0 both ways.
 
   | case | `<`, the shipped operator | `<=`, the M2 mutant |
@@ -1956,9 +1963,13 @@ list items.
 
   A `diff` of the two runs is ONE line, the `at_end` row. So `at_end` is the only
   discriminating case in the fixture, and `CHECK(edge.verified == 1)` at
-  `tests/parity/test_qwen38_dflash2_spec_decode.cpp:1067` DOES red under M2. The
-  risk this owed item was really carrying -- that the new case proves nothing --
-  is removed.
+  `tests/parity/test_qwen38_dflash2_spec_decode.cpp:1067` DOES red under M2 -- in
+  the copy. That answers the risk this owed item was really carrying, that the
+  new case proves nothing: the fixture discriminates. It answers it ON A COPY,
+  and the copy was taken VERBATIM from `:308-325`, so the drift the next
+  paragraph names as undetectable in general is nil HERE in fact rather than
+  merely bounded. What the compilation cannot answer is whether the BUILT SUITE
+  reaches the case, and that is a different question.
 
   **M2 STAYS NOT TAKEN.** What that compilation measures is a COPY of the
   function under a compiler, not the committed test binary: it does not exercise
@@ -1994,6 +2005,18 @@ list items.
   whole 464-object library, which the wave that found it was barred from paying
   for, so the mechanism is a reading and not a measurement.
 
+  **WHAT RE-RUNS IS THE WHOLE CHECK, not only its trailing `std::cerr`, and the
+  `#1607` index row's "nothing is loaded twice" is too strong for that.** On the
+  GGUF arm the second reach is a second `vllm::GgufFile::Open(resolved)`
+  (`src/vllm/entrypoints/model_loader.cpp:517`) and a second `IsDflash2Gguf`
+  scan; on the safetensors arm it is a second `ReadDflashDraftArchitectures`
+  read of the draft's `config.json` (`:531`). What is NOT duplicated is WEIGHTS,
+  which is plainly what the row meant, and neither re-read is expensive next to
+  the 51.75 GiB target load. The row is not edited, for the reason
+  `## Upstream chain` gives for the `#1538` row: `.agents/issue-index.md` is
+  append-only and a landed row is never edited. THIS ITEM IS THE AUTHORITY on
+  what re-runs, and the index row is not.
+
   `docs/USAGE.md` called it a "one-time notice" and now describes the two prints,
   so the shipped documentation is no longer wrong about the behaviour while this
   is open. The FIX is deliberately NOT taken here: it changes the production
@@ -2003,7 +2026,6 @@ list items.
   `FromModelDir`'s exists on purpose so a misclassified draft is caught before a
   51.75 GiB target is mapped -- plus a test that loads a DFlash2 draft through a
   production entry point and asserts the paragraph occurs exactly once.
-
 
 ## Now
 

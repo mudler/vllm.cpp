@@ -193,13 +193,15 @@ the ones that were measured.** vllm#52816 MERGED on 2026-08-21 at 05:27:22Z, at
 head `3406ec1d` and merge commit `b389ac29` -- 46 minutes before this row's W6
 work commit `bb416e0ae` was authored at `06:13:50Z`. **The 46 minutes is the
 interval between those two COMMITS, and it is not the gap to the run.** The
-wheel above was built and run before the merge existed, which is why the head
-is kept; how long before is NOT a number this document can state, because no
-timestamp for that build or that run survives anywhere in the tree -- not in the
-golden, not in the record -- and transferring the commit interval onto the run
-would be a measurement nobody took. The measurement stays pinned to `66e5414c`
-because that is what executed, and re-labelling a run with a head it never ran
-would be a false pin. Re-reading the gates at the merged head is owed under
+wheel above was built at head `66e5414c`, which is an earlier head of the same
+pull request than the merged `3406ec1d`. WHEN it was built and run is NOT a
+number this document can state, because no timestamp for that build or that run
+survives anywhere in the tree -- not in the golden, not in the record -- so
+where the run falls against the merge instant is unmeasured, and transferring
+the commit interval onto it would be a measurement nobody took. The measurement
+stays pinned to `66e5414c` because that is what executed, and re-labelling a run
+with a head it never ran would be a false pin. Re-reading the gates at the
+merged head is owed under
 [#1561](https://github.com/mudler/vllm.cpp/issues/1561).
 
 **The backend that comparison ran on is not vLLM's default here.** vLLM was run

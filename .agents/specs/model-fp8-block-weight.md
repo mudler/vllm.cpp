@@ -154,8 +154,13 @@ rung at all and would otherwise have sent a block-wise MLP into
 
 A dtype probe alone is not enough, for two measured reasons.
 
-**`modules_to_not_convert` is a ~400-entry list** that a probe reproduces only
-by accident. A projection this checkpoint deliberately left unquantized is
+**`modules_to_not_convert` is an 882-entry list** on
+`Qwen/Qwen3.8-27B-FP8` @`017b9c7a` -- 882 of them unique, 636 outside the vision
+tower -- that a probe reproduces only by accident. The "~400" this line carried
+until [#1614](https://github.com/mudler/vllm.cpp/issues/1614) was wrong by more
+than 2.2x, and no reading of the list produces it: the visual entries are
+duplicated under two naming conventions, so distinct modules are about 759, and
+half of 882 is 441. A projection this checkpoint deliberately left unquantized is
 `BF16` on disk and a probe agrees with the config by luck; the moment a
 checkpoint ships an `F8_E4M3` tensor for a module it also lists as excluded, the
 probe and the config disagree and only one of them is right.

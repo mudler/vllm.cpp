@@ -54,6 +54,17 @@ void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, cons
                               const Tensor& biases);
 // Companion MoE-path op (same TU): elementwise silu(gate)*up.
 void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
+// MoE-path combine/gate ops (rocm_moe_chain.hip): shared-expert gate and the
+// weighted expert combinations.
+void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
+void MoeCombineKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
+                          const Tensor& weights, const Tensor* shared, float routed_scale);
+void MoeCombineGateKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
+                              const Tensor& weights, const Tensor& sd, const Tensor& gl);
+// Grouped quant expert GEMM (rocm_grouped_gemm.hip): Q8_0/Q4_K/Q5_K/Q6_K native.
+void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
+                                    const Tensor& weight, const Tensor& expert_ids);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
 // pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
 void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
@@ -181,6 +192,19 @@ struct Registrar {
                    static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelRocm)));
+    RegisterOp(OpId::kSharedExpertGate, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<SharedExpertGateFn>(&SharedExpertGateKernelRocm)));
+    RegisterOp(OpId::kMoeCombine, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernelRocm)));
+    RegisterOp(OpId::kMoeCombineGate, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<MoeCombineGateFn>(&MoeCombineGateKernelRocm)));
+    RegisterOp(OpId::kMatmulBTQuant, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernelRocm)));
+    RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelRocm)));
     RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));

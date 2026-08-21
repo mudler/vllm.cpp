@@ -28,6 +28,8 @@
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_getblas_dualslot.h"
+#include "vt/rocm/rocm_runtime.h"
+#include "vt/rocm/rocm_skinny_gemm_arch.h"
 
 namespace vt::rocm {
 namespace {
@@ -150,6 +152,17 @@ bool GemvEnabled() {
   static const bool on = [] {
     if (const char* e = std::getenv("VT_ROCM_GEMV")) return e[0] == '1';
     return false;  // hipblasGemmEx wins A/B 2026-08-09 (~52 vs ~40 t/s)
+  }();
+  return on;
+}
+
+// wvSplitK skinny GEMM (rocm_skinny_gemm.hip, #487): the split-K/LDS-staged
+// decode path that beats the 128x128-tile rocBLAS GEMM at M<=4. Default ON for
+// decode-skinny shapes; VT_ROCM_SKINNY=0 restores the BLAS path for A/B.
+bool SkinnyGemmEnabled() {
+  static const bool on = [] {
+    if (const char* e = std::getenv("VT_ROCM_SKINNY")) return e[0] != '0';
+    return true;
   }();
   return on;
 }
@@ -454,6 +467,11 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 }
 
 // out[M,N] = a[M,K] @ b[N,K]^T
+// wvSplitK skinny-GEMM host entry (rocm_skinny_gemm.hip, #487). External
+// vt::rocm linkage to match the definition; declared beside its only caller.
+void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, int N,
+                int K, int device);
+
 // Row-major trick: gemm(OP_T, OP_N, N, M, K, B, K, A, a_rs, C, N)
 //   BLAS: C = op(A)*op(B) with opA=T => A is KxN in col form = row B[N,K]
 //   opB=N, B is KxM col = row A[M,K] with ld=a_rs
@@ -480,6 +498,26 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
   if (a.stride[0] < K) {
     throw std::runtime_error("vt rocm: matmul_bt: bad a stride");
+  }
+
+  // Decode-skinny (M<=4) bf16: the wvSplitK port wins over the 128-tile GEMM
+  // (#487). The dispatch guards mirror the donor EXACTLY (review sweep on
+  // #506 found all three of these dropped, two of them memory-unsafe):
+  //   * N > 8 (upstream `m > 8`, utils.py:181 — the feature-dim lower bound;
+  //     at N==1 the kernel's y=1 store writes C[1] past the end of a 1-wide
+  //     output);
+  //   * N % YTILE == 0 (skinny_gemms.cu:1217 `M_in % _YTILE == 0`; YTILE=2 —
+  //     the last wave's y=1 store lands at C[N] on odd N);
+  //   * wave32 arch only (the gfx9 ROW_BCAST reduction arm is not ported);
+  //   * K % 8 == 0 and the LDS-fit (K*M activation fits the staging buffer);
+  //   everything else stays on the BLAS path.
+  if (bf16 && out.dtype == DType::kBF16 && M >= 1 && M <= 4 && (K % 8) == 0 &&
+      N > 8 && (N % 2) == 0 && a.stride[0] == K && K * M <= 32768 &&
+      SkinnyGemmEnabled() &&
+      vt::rocm::SkinnyGemmArchOk(q.device.index, vt::rocm::DeviceArchName)) {
+    WvSplitKBT(s, out.data, a.data, b.data, static_cast<int>(M), static_cast<int>(N),
+               static_cast<int>(K), q.device.index);
+    return;
   }
 
   // Decode: M=1 BF16 GEMV

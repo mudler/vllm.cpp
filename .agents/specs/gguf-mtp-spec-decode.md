@@ -470,3 +470,94 @@ runs the bf16 GEMM, which resolves them.
   which is the point.
 - **NON-RISK, stated to close it:** `ngram` over GGUF already works and is
   untouched; the current rejection never covered it.
+
+## Gate repair 2026-08-21: the file's own gate reported a pass it never ran ([#1454](https://github.com/mudler/vllm.cpp/issues/1454))
+
+This row is `DONE` and its production code is unchanged. What follows is a
+repair of the row's own gate file, `tests/vllm/models/test_qwen3_5_gguf_mtp.cpp`.
+
+### What was wrong
+
+Both cases opened `if (path == nullptr) return;` on `VLLM_MTP_GGUF_MODEL`, and a
+bare `return` from a doctest case is a PASS. Re-derived on a clean Release
+CPU build at base `947e5f648`, variable unset:
+
+```text
+[doctest] test cases: 2 | 2 passed | 0 failed | 0 skipped
+[doctest] assertions: 0 | 0 passed | 0 failed |
+[doctest] Status: SUCCESS!            rc 0
+```
+
+Nothing printed. `VLLM_MTP_GGUF_MODEL` is set nowhere in `.github/workflows/`,
+so that was the state of every CI run this row has ever had, and the
+`2 cases / 18 assertions` this row recorded in `.agents/engine-matrix.md` was the
+LIVE count, reachable only by a person who had the asset.
+
+The second defect is one line. `:52-53` read:
+
+```cpp
+// them into block_count, so num_hidden_layers + depth == block_count.
+CHECK(c.num_hidden_layers > 0);
+```
+
+The comment names the invariant; the assertion is true of every valid model.
+
+### The invariant is now HERMETIC, and that is the substantive change
+
+The old file could not check the arithmetic without a 17 GB asset, so it never
+did. `HfConfigFromGguf` needs only scalars to derive the depth, so a KV-only
+GGUF carrying no tensor bytes at all drives the PRODUCTION config builder in
+CI. Three head-carrying arms and one head-less arm:
+
+| `block_count` | `nextn_predict_layers` | why this arm |
+|---:|---:|---|
+| 65 | 1 | the shipped `Qwen3.8-27B-Q4_K_M.gguf` pair |
+| 25 | 1 | the Qwen3.5-2B reference file this suite was developed against |
+| 28 | 3 | separates `- nextn` from `- 1`, which the two 1-block arms cannot |
+| 24 | absent | the head-less export: nothing published, whole count is the trunk |
+
+The head-less arm is the half `NumMtpLayers` cannot express. That helper
+answers 1 for an absent key on purpose (`qwen3_5_mtp.cpp:264` - it answers "how
+deep is the head we are running", not "does one exist"), so
+`num_hidden_layers + NumMtpLayers(c) == block_count` is FALSE on a head-less
+file and the correct statement there is that `mtp_num_hidden_layers` is absent
+and `num_hidden_layers == block_count`. Writing the invariant with that helper
+alone would have been a second tautology in a different disguise.
+
+The two env-gated cases stay, because no synthetic fixture can honestly stand in
+for what llama.cpp's converter really emits, and they now skip with a `MESSAGE`
+naming the variable in the shape `tests/vllm/entrypoints/test_gguf_mmproj_reach.cpp`
+landed. The live depth case re-derives the invariant from the file's OWN
+`block_count` kv rather than from a number written in the test.
+
+### Evidence
+
+| Run | Result |
+|---|---|
+| unset, repaired | 4 cases / 18 assertions / `Status: SUCCESS!` / rc 0 |
+| `VLLM_MTP_GGUF_MODEL=/mnt/nas_share/checkpoints/qwen3.8-27b-gguf/Qwen3.8-27B-Q4_K_M.gguf` | 4 cases / 38 assertions / `Status: SUCCESS!` / rc 0 |
+
+Mutation on `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:889`, each
+compiled clean (`compile_rc=0`, `git diff --stat` 1 file / 1 insertion / 1
+deletion) and each restored against a sha256 taken before the first mutation:
+
+| Mutant | Repaired file | PREVIOUS file |
+|---|---|---|
+| `c.num_hidden_layers = block_count;` | 3/4 cases, 9/18 assertions red, exit 1 | 2/2 cases, 0 assertions, `SUCCESS!`, exit 0 |
+| `c.num_hidden_layers = block_count - 1;` | 2/4 cases, 5/18 assertions red, exit 1 | not run; the first mutant already showed the file is blind |
+
+### What this repair does NOT claim
+
+The invariant was not globally unpinned. `tests/vllm/models/test_qwen38_27b_gguf_manifest.cpp:161`
+([#821](https://github.com/mudler/vllm.cpp/issues/821) W2, `0adeb8b0e`,
+2026-08-20) pins the same arithmetic hermetically for the 27B artifact on a
+committed manifest, and it catches mutant A (6/6 cases and 464 assertions green
+on the restored tree; 4/6 cases and 6 assertions red under the mutant). That
+file belongs to a different row. What #1454 found is that THIS row's gate,
+which the row's own records cite as its evidence, could not.
+
+`src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp` is untouched.
+`git blame` puts `block_count - nextn` at `1a4db5c3c` (2026-07-04) and the
+`mtp_num_hidden_layers` republication at `493327b4e` (2026-07-28); both are
+correct. This was a test defect, and no gate result recorded above this section
+is invalidated by it.

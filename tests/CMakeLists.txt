@@ -636,6 +636,9 @@ vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
 # case that wants a different one.
 vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
                   vllm/models/test_gemma4_moe_device_arm_guard.cpp)
+vllm_cpp_add_test(test_gemma4_indexed_max_t vllm/models/test_gemma4_indexed_max_t.cpp)
+target_compile_definitions(test_gemma4_indexed_max_t PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -2176,6 +2179,11 @@ vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.
 vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
+# KV-FP8 W2 (#1593): the CUDA fp8-e4m3 KV store + the fp8 dequant on the CUDA
+# paged-attention read, gated for parity against the W1 CPU reference. The
+# device cases skip with a MESSAGE when no CUDA backend is present; the
+# provider-routing case runs on every leg.
+vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
@@ -2522,6 +2530,17 @@ target_compile_definitions(test_qwen27_dflash_spec_decode PRIVATE
 target_include_directories(test_qwen27_dflash_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-DFLASH2 W6 — the DFlash2 e2e gate (#1314): G2 draft-token identity and
+# G3 SAME-TRAJECTORY acceptance against the beyond-pin oracle
+# (vllm-project/vllm#52816 @ 66e5414c6, TRITON_ATTN). dgx-only; loud SKIP
+# everywhere else, naming the two checkpoints and the golden it needs.
+vllm_cpp_add_test(test_qwen38_dflash2_spec_decode
+  parity/test_qwen38_dflash2_spec_decode.cpp)
+target_compile_definitions(test_qwen38_dflash2_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen38_dflash2_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # SPEC-MTP M-mtp-2 — the 35B MoE-MTP k=1 speculative-decode three-way identity
 # gate (Qwen3_5MoeMTP: our spec-ON == our spec-OFF == vLLM greedy) + measured
 # nonzero acceptance. Mirror of the 27B gate at 35B (MoE MTP draft head).
@@ -2634,6 +2653,25 @@ vllm_cpp_add_test(test_qwen38_27b_nvfp4_arm
 target_compile_definitions(test_qwen38_27b_nvfp4_arm PRIVATE
   QWEN38_27B_NVFP4_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_nvfp4")
 target_include_directories(test_qwen38_27b_nvfp4_arm PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# QUANT-QWEN38-27B-NVFP4-ARM W5 (#821, #1574,
+# .agents/specs/qwen38-27b-quant-arms.md): the ModelOpt `MIXED_PRECISION`
+# accounting + config/tensor cross-check for
+# `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`. A SECOND artifact of the same model,
+# and a second file rather than a widening of the gate above: that one pins the
+# 1968-name compressed-tensors set and this one pins a 2001-name ModelOpt set,
+# and a gate that accepted both by loosening would measure neither. Hermetic —
+# it reads the four COMMITTED manifests and the two COMMITTED config documents,
+# never a weight byte; the live re-verification arm is env-gated on
+# VLLM_CPP_QWEN38_27B_MODELOPT_MTP_DIR and SKIPS loudly without it. `src` is on
+# the include path because the resolver under test is a model-private header
+# under src/, not an include/vllm/ surface.
+vllm_cpp_add_test(test_qwen38_27b_modelopt_mtp_arm
+  vllm/models/test_qwen38_27b_modelopt_mtp_arm.cpp)
+target_compile_definitions(test_qwen38_27b_modelopt_mtp_arm PRIVATE
+  QWEN38_27B_MODELOPT_MTP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_modelopt_mtp")
+target_include_directories(test_qwen38_27b_modelopt_mtp_arm PRIVATE
   ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine

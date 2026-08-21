@@ -1457,6 +1457,34 @@ which is where this spec's `### Decisions taken here` already said they would be
 
   The `load` and `generate` records are SPANS and are never summed, so they are
   not in this list; `sum_rule` in every emitted table says which records add up.
+* **(1c) DOES NOT HOLD A LEAF RECORD SHORTER THAN 60 ms**, and this
+  entry names which ones so no later stage inherits the silence. The span-slack
+  bound is per leaf RECORD and its `min` cap binds below
+  `2 * kSpanSlackPerRecord`; a record there is reported and not checked, because
+  the capped bound is a 50% share and the honest head-plus-tail on those records
+  measured 4.6-72.3% of the record itself ([#1559](https://github.com/mudler/vllm.cpp/issues/1559)).
+
+  | Record | Measured range | What still holds it, and what escapes |
+  |---|---|---|
+  | `artifacts.frames`, nine-frame render, ONE record | 0.90-6.21 ms | (2) at 0.50 holds it TIGHTLY, because a single-record leaf makes the coverage floor exactly the capped span bound. Plus the (0) count and `CheckWriterIsBesideTheDecode` |
+  | `artifacts.frames`, 81-frame render, TWO records | 4.39-61.0 ms | the same names, but (2) is on the SUM, so it is looser per record. (1c) checks a record on the runs where it clears the floor |
+  | `decode.video` reopen-after-a-chunk, one or two records | 0.019-5.66 ms | **nothing effective.** A swallow may grow such a record to just under 60 ms -- up to 94x its honest size -- and (2) at 0.90 does not see it: 10% of a 0.17-1.39 s leaf is 17-139 ms of budget, of which 60 ms is 43% at worst and 4.3% at best. Under the third shape the same escape was about 0.5-0.75 ms, so this is roughly an 80x widening on these records |
+  | `decode.video` record 0, on a FAST box | 25.0-59.6 ms when it falls | it is normally the third gated record, and it is not reliably one. Over 35 runs it fell below the floor in 4 of 60 shared-box observations and 8 of 30 two-core observations, and in 2 of 20 shared-box runs the whole leaf reported `0 of 2 leaf record(s) checked`. The checked minimum on two cores was 62.6 ms, 2.6 ms above the floor. CI's runner is FASTER than that box, so this gets worse there, not better |
+
+  What escapes is a swallow that leaves the record under the floor, and the row
+  above says what that is worth on each class rather than naming an assertion and
+  leaving the reader to assume it binds. **The fix is
+  not a wider bound, it is naming the time**, which is what #1439 is owed as
+  well: a production anchor inside the writer, and one inside the decode's own
+  reopen, make those records measurable rather than tolerated. Both are scope
+  work in `ltx2_video.cpp` and neither belongs in the repair of a standing red.
+* **THE SANITIZER LANES' OWN DISTRIBUTION OF THIS QUANTITY IS NOT MEASURED HERE.**
+  The fourth shape retires the second constant, so both sanitizer lanes now
+  carry 30 ms where they carried 3 ms. That direction can only turn a red
+  green, and the worst sanitizer slack anybody has recorded is 3.354 ms (ASan,
+  `artifacts.frames` r2), 8.9x inside it. What is NOT measured is whether a
+  sanitizer build's own tail reaches 30 ms on this host, because the disk
+  had 7.1 GB free and a sanitizer tree is about 20 GB. Owed by [#1559](https://github.com/mudler/vllm.cpp/issues/1559).
 * **AND WHAT IS OWED ABOUT THE ANCHORS THEMSELVES**, which this entry was silent
   about until a fourth fresh review asked. The list above is honest and complete
   for LEAVES; it said the four carrying phases are anchored and stopped there, as
@@ -2573,3 +2601,270 @@ repair. Note the polarity while it is open: the GitHub runner measured 95.52% an
 97.69% on the two `main` runs that reported the `denoise` red, so this assertion
 is GREEN in CI with 0.52 and 2.69 points of margin, and it is the local boxes that
 see it fail.
+
+### The span-slack bound, fourth shape: it was inside its own distribution, and its multiplier came from the artifact (#1559)
+
+The third shape landed in `6b48edb2c` and a fresh review measured it on an
+UNMUTATED tree at that head. **It reds.** Not on a mutation, not under a
+sanitizer, not on a geometry nobody runs: on the plain `build-test-cpu` lane the
+change was written to keep green.
+
+That is the second time this bound was calibrated on too few runs, so the
+calibration is the part of this section worth reading first.
+
+#### The population, and what it took to see the defect
+
+| batch | runs | box | loadavg | runs RED at `6b48edb2c` |
+|---|---:|---|---|---:|
+| A | 33 | as shared, 20 cores | 79.7-118.0 | **3** |
+| B | 10 | as shared + an eight-way spin load | 91.7-145.9 | **2** |
+| C | 10 | pinned to two cores, `taskset -c 18,19` | 84.5-105.6 | 0 |
+
+53 runs, 424 leaf checks, 636 leaf-record observations, one binary, one build
+directory, `CMAKE_BUILD_TYPE` empty exactly as `build-test-cpu` configures it.
+**Five runs red, on an unmutated tree.**
+
+Two things about that population are worth carrying forward. The first is that
+batch C -- two cores, the geometry CI actually has -- is the FASTEST and the
+CLEANEST of the three: `denoise` runs 0.64-2.7 s there against 14-41 s in batch
+A, because a 20-thread pool on a box at loadavg 100 is worse than two threads on
+two cores. An oversubscribed many-core box is the harsh case for this quantity,
+not a small one. The second is that no configuration reproduces the tail on
+demand: the 10.032 ms observation is one of 636, and the eight-way spin load that
+was supposed to provoke it produced 0.963 ms.
+
+Three runs of a green suite is what the third shape was accepted on. Five of 53
+runs red, so a run reds about one time in ten and three runs had about a
+one-in-four chance of showing it. They did not, and the bound landed.
+
+#### F1 -- the constant was inside the honest distribution of the quantity it bounds
+
+`CHECK(span_slack <= span_bound)` compares two instrument boundaries against a
+constant. The constant was 0.25 ms on the plain lane. **The honest quantity
+reaches 10.032 ms on the same lane, on the same binary, with nothing mutated**,
+and the five reds below say nothing whatever about the tree:
+
+| run | leaf | records | slack | bound | leaf record |
+|---|---|---:|---:|---:|---|
+| A13 | `decode.video` r2 | 3 | 1.161 ms | 0.75 ms | 1.257 s |
+| A16 | `artifacts.frames` r2 | 2 | 1.387 ms | 0.50 ms | 4.826 ms |
+| A18 | `decode.audio` r1 | 1 | **10.032 ms** | 0.25 ms | 6.783 s |
+| B6 | `denoise` r2 | 1 | 0.410 ms | 0.25 ms | 24.181 s |
+| B8 | `denoise` r2 | 1 | 0.963 ms | 0.25 ms | 24.655 s |
+
+**AND RECALIBRATION ALONE CANNOT FIX IT, which is the finding under the
+finding.** The bound is capped at `0.5 * leaf_seconds`, so on a short leaf record
+no constant can lift it. `artifacts.frames` r2 record 1 measured 1.361 ms of
+slack on a 4.826 ms record: the cap forbids any bound above 2.413 ms, and the
+honest value is 56% of that. On the shortest records the cap forbids any bound at
+all worth having -- `decode.video`'s reopen-after-the-last-chunk record is 19-89
+us of which 7-32 us is its own two boundaries, so the capped bound of half the
+record sits at 35-72% of a distribution whose honest values reach 72%.
+
+So the cap, which the third shape added to keep the check able to fail, is itself
+the thing that makes a short record ungateable. That is not a defect in the cap.
+It is the instrument telling the truth: below a certain record length this
+quantity is the instrument and not the tree.
+
+#### F2 -- the multiplier was read from the artifact under test
+
+The bound was `min(kSpanSlackPerRecord * leaves.size(), 0.5 * leaf_seconds)`.
+`leaves.size()` is whatever `RecordsNamed(table, c.leaf, c.render)` returned,
+guarded only by `REQUIRE(!leaves.empty())` and tied to no independent number, so
+**a defect that emits one extra leaf record enlarges its own budget by a whole
+constant**. Assertion (0) counts the SUB-SCOPE records against
+`Ltx2ConditioningTrace`; nothing counts the leaf's own.
+
+The slack was also SUMMED, so a swallow concentrated in one record of a
+three-record leaf drew on the whole `3 * kSpanSlackPerRecord`. The comment at the
+site claimed the opposite -- that summing "makes the bound STRICTER on
+multi-record leaves rather than looser" -- and that is false for exactly this
+reason. It was load-bearing rather than academic: under ASan `artifacts.frames`
+r2 measured 3.354 ms of slack against a 6 ms bound and passed only because that
+leaf has two records.
+
+#### F3 -- the failure message named the wrong cause
+
+The message ended: *"unlike the coverage share below, this quantity is two
+instrument boundaries and does not move with the box"*. It is the first sentence
+the next person reads on a red, and it tells them to look for a swallowed phase.
+
+Measured on ONE build configuration, ONE host, ONE binary, the same leaf record
+across runs:
+
+| leaf record | best | worst | spread |
+|---|---:|---:|---:|
+| `decode.audio` r1 rec 0 | 25.0 us | 10032.0 us | **401.8x** |
+| `decode.video` r2 rec 0 | 7.7 us | 1114.9 us | 144.3x |
+| `artifacts.frames` r2 rec 1 | 14.6 us | 1360.9 us | 93.3x |
+| `denoise` r2 rec 0 | 73.2 us | 963.3 us | 13.2x |
+| `decode.video` r1 rec 0 | 6.8 us | 88.4 us | 13.1x |
+
+The half of the claim that survives is "does not grow with the RENDER", and that
+half is still measured and still true: the 81-frame arm's slack is not
+systematically larger than the nine-frame arm's, on leaves that differ by an
+order of magnitude in seconds. The half that does not survive is "does not move
+with the box". The same two comments that carry the stale claim also still quote
+"a flat 0.25 ms", which had not been true since the third shape made the bound
+per-record, configuration-dependent and capped. All three are corrected.
+
+#### The fourth shape
+
+    for each leaf record r:
+        span_bound = min(kSpanSlackPerRecord, 0.5 * record_seconds)
+        REQUIRE(span_bound < record_seconds)          # the formula tripwire
+        if span_bound < kSpanSlackPerRecord:          # the cap bound: unresolvable
+            report, do not check
+        else:
+            CHECK(slack(r) <= span_bound)             # == kSpanSlackPerRecord
+
+Four changes, and each answers one finding.
+
+* **PER RECORD, NOT PER SUM.** `leaves.size()` is gone from the arithmetic
+  entirely, so no count the artifact chose enters the bound. The claim the
+  message makes -- that ONE record's head and tail are bounded -- is now the
+  claim the code tests, and it is strictly tighter than the sum on every leaf
+  with more than one record.
+* **THE `min` CAP IS KEPT, AND IT IS PER RECORD.** The inversion is the reason:
+  `min(K, 0.5 * r) <= K`, so the share is a CEILING and can only tighten, exactly
+  as the third shape argued. It has to be per record rather than per leaf sum,
+  because a cap on the sum does not make the forced-strict probe red: with three
+  equal records the worst record's slack is a third of the leaf and a half-leaf
+  cap would not bite. Per record it is guaranteed -- `span_bound <= 0.5 * r < r`,
+  and forced-strict drives the slack to exactly `r`.
+* **WHERE THE CAP BINDS, THE RECORD IS BELOW THIS INSTRUMENT'S RESOLUTION AND IS
+  REPORTED RATHER THAN CHECKED.** Two reasons, and the second is the measured
+  one. A capped bound is no longer an absolute quantity; it is "head plus tail is
+  at most half of this record", which for a single-record leaf is exactly what
+  `covered >= 0.5 * leaf_seconds` already asserts -- and a new
+  `REQUIRE(c.min_coverage >= 0.5)` holds every case here to that floor, so the
+  implication is executable rather than asserted. And on the records where the
+  cap binds, the honest head-plus-tail measured 4.6% to 72.3% of the record, so a
+  50% share is INSIDE its own distribution. That is the 0.95-coverage-floor
+  defect again, and gating on it would be the mute switch this whole assertion
+  replaced.
+* **ONE CONSTANT, 30 ms, FOR EVERY BUILD CONFIGURATION.** That is **2.99x the
+  worst of 636 leaf-record observations**, the same idiom as the 2.1x and 1.8x
+  the third shape used,
+  and something has to bound it from ABOVE, because the floor `2 * K` must stay
+  under the shortest record worth gating.
+  **What bounds it is `denoise` and `decode.audio`, and the reason first written
+  here was falsified by a bigger batch.** This paragraph said the two-core
+  geometry keeps `decode.video` record 0 gated at 0.106-0.54 s. Measured over 35
+  runs of the repaired shape it is not reliably gated at all: it fell below the
+  60 ms floor in 4 of 60 shared-box observations (25.0-26.6 ms) and 8 of 30
+  two-core observations (52.4-59.6 ms), the checked minimum on two cores was
+  62.6 ms, and in 2 of 20 shared-box runs the leaf reported `0 of 2 leaf
+  record(s) checked`. CI's runner is faster than that box, so it straddles there
+  too. The conclusion stands on the other two leaves instead, which is where it
+  should have stood: `denoise` and `decode.audio` are gated in 35 of 35 runs, are
+  seconds long in every configuration measured, and hold 96%+ of the leaf-seconds
+  -- a floor of 200 ms would still gate them, and a floor of 2 s would not. The
+  first claim came from the 53-run batch's `decode.video` range and was not
+  re-derived when the repaired shape was measured; it is corrected here rather
+  than quietly dropped. The third shape's two constants --
+  0.25 ms plain, 3 ms under either sanitizer -- collapse to this one, because the
+  plain lane's own scheduler tail is now 3x the largest sanitizer slack anybody
+  has recorded (3.354 ms, ASan, `artifacts.frames` r2). A second constant would
+  have to clear the same tail, so it would read 30 ms against 33 ms. Both
+  sanitizer lanes therefore get a LOOSER bound than they carried, which can only
+  turn a red green.
+
+**The skip cannot hide a swallow, and the direction is the reason.** A swallowed
+phase makes a leaf record LONGER, never shorter, so it moves a record TOWARD the
+gated set and never out of it. What escapes is bounded and stated: a swallow that
+leaves the record under 60 ms in total.
+
+#### What it can no longer see
+
+Stated so the next reader does not have to derive it.
+
+1. **Any swallow under 30 ms, on every leaf.** The previous number was
+   0.25 ms and it was not real, because it reddened 5 of 53 honest runs.
+   Mutation M1 -- `denoise` opened over `phase.prepare`, about 125 us -- was
+   already invisible at 0.25 ms and stays invisible. What changes is the size of
+   an invisible swallow, from 0.25 ms to 30 ms.
+2. **Everything about a leaf record under 60 ms.** On this fixture,
+   measured over 53 runs:
+
+   | record | measured range | what escapes, stated as a ceiling |
+   |---|---|---|
+   | `artifacts.frames`, 9-frame render, 1 record | 0.90-6.21 ms | little: ONE record means (2) at 0.50 IS the capped span bound, so head plus tail stays under half the leaf. The (0) count and `CheckWriterIsBesideTheDecode` also hold |
+   | `artifacts.frames`, 81-frame render, 2 records | 4.39-61.0 ms | more, because (2) is on the SUM of two records rather than on each. (1c) checks a record on the runs where it clears the floor |
+   | `decode.video` reopen-after-a-chunk, 1-2 records | 0.019-5.66 ms | **anything up to the 60 ms floor**, i.e. up to 94x the record's honest size. (2) at 0.90 is not a backstop here: 10% of a 0.17-1.39 s leaf is 17-139 ms, so 60 ms is 4.3-43% of a budget the honest records barely touch. The third shape's escape on these records was about 0.5-0.75 ms |
+   | `decode.video` record 0 | 25.0-59.6 ms when it falls below | the same ceiling, on the runs where it falls. It is gated on most runs and not on all: 4 of 60 shared-box and 8 of 30 two-core observations were below the floor, checked minimum 62.6 ms |
+
+   **THE HAND-OFF TO (2) IS ONLY TIGHT FOR A SINGLE-RECORD LEAF**, and that is
+   one of the four rows above. `covered >= min_coverage * leaf_seconds` is a
+   statement about the leaf SUM. On a one-record leaf it is exactly the capped
+   span bound; on a multi-record leaf the budget is shared, and on
+   `decode.video` the leaf is three orders of magnitude longer than its reopen
+   records, so the coverage floor has room those records could never fill.
+   `REQUIRE(c.min_coverage >= 0.5)` at the site guards the single-record case and
+   claims nothing about the others.
+
+   On the two-core geometry CI actually runs -- measured with `taskset -c 18,19`,
+   where the render is *faster* because a 20-thread pool on a contended box is
+   worse than two threads on two cores (`denoise` 0.198-3.33 s pinned against
+   2.10-11.29 s unpinned) -- the reliably gated set is `denoise` and
+   `decode.audio` alone.
+3. **The interior gaps, unchanged.** (1c) never saw them and still does not; (2)
+   is what bounds them, and #1439 is what is owed about the un-named time.
+
+The fix for 2 is the same fix #1439 is owed and is not a wider bound: **name the
+time**. An anchor inside the writer, and one inside the decode's own reopen,
+make those records measurable instead of tolerated. That is production scope work
+in `ltx2_video.cpp` with its own row, and it is recorded under
+`### Owed out of W0`.
+
+#### Evidence
+
+Everything below is one x86_64 host, one build directory, `CMAKE_BUILD_TYPE`
+empty as `build-test-cpu` has it, GCC. Every mutation was applied by exact-text
+replacement that refuses unless the pattern occurs once, the compile status is
+printed, and the tree was restored and `sha256sum`-verified afterwards
+(`b7a9e14065aea4dd483d8bf0f2357dab85efceb9b554efab8a2a3cfa501f16d3`).
+
+**Red before.** 53 runs at `6b48edb2c`, unmutated, five red. Population and
+values in the table above. This is the falsification, and it is the one the
+third shape did not have.
+
+**Green after.** 40 runs of the fourth shape, same binary, same case:
+
+| batch | runs | box | loadavg | result | records checked | worst checked slack |
+|---|---:|---|---|---|---:|---:|
+| PA | 20 | as shared | 60.2-100.5 | 0 failures | 179 | 3.409 ms, 8.8x inside |
+| PB | 10 | + an eight-way spin load | 61.4-101.5 | 0 failures | 90 | 0.183 ms |
+| PC | 10 | `taskset -c 18,19` | 81.2-88.2 | 0 failures | 78 | 0.222 ms |
+
+347 records checked, 333 reported below the instrument's resolution, zero
+failures. `denoise`, `decode.audio` and `decode.video` record 0 are gated in
+every configuration; `artifacts.frames` cleared the floor once in 20 PA runs and
+never in PB or PC, which is the straddle `## Owed` records.
+
+**Mutation 1, forced-strict.** `span_slack` forced to the whole record, so every
+leaf is 100% un-anchored. Compile rc 0. Result: exit 1, **9 of 9 checked records
+RED**, 592 assertions / 9 failed, at 9.96 s, 0.32 s, 2.89 s, 11.28 s, 0.92 s and
+5.62 s against the 30 ms bound. No checked record survives, which is what the
+per-record `min` cap buys and is now guaranteed rather than observed.
+
+**Mutation 2, the concentrated swallow -- and this is F2's proof.** 45 ms, i.e.
+`1.5 * kSpanSlackPerRecord`, added to the slack of leaf record 0 only. Both
+shapes compiled at the IDENTICAL constant of 30 ms, so only the formula differs.
+
+| shape | compile | result | `decode.video` |
+|---|---|---|---|
+| the SUM, `leaves.size()` multiplier | rc 0 | exit 1, 578 assertions / 9 failed | **PASSES**: 45.0 ms of slack against a bound of 0.06 s (r1, 2 records) and 0.09 s (r2, 3 records) |
+| per record | rc 0 | exit 1, 592 assertions / 9 failed | **REDS**, at 45.0 ms against 30 ms |
+
+The old formula let one record of a multi-record leaf spend the whole leaf's
+budget, and the leaf with the most records was the one it protected most. That
+is the opposite of what the comment at the site claimed.
+
+**What is NOT measured here.** No sanitizer run. The disk had 7.1 GB free and a
+sanitizer tree is about 20 GB, so the sanitizer lanes' own distribution of this
+quantity stays owed and is recorded under `## Owed`. The direction is safe --
+they move from a 3 ms bound to 30 ms, which can only turn a red green -- and the
+worst sanitizer slack anybody has recorded, 3.354 ms, is 8.9x inside the new
+bound. The per-record split is the part that could newly red there, and it is
+that same 3.354 ms observation that shows it does not.

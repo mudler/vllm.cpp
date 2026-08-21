@@ -110,6 +110,35 @@ bool KeepF16DType(uint32_t ggml_type) { return ggml_type == 1; }
 // ggml type id 40 is the NVFP4 fork extension; see gguf_dequant.cpp case 40.
 bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 
+// Device-side keep-quant capability (review sweep on #523): the master
+// boolean `GgufQuantComputeAvailable()` only says the OP is registered; a
+// device's kernel set can be narrower than the CPU admission list, and on a
+// discrete backend with no CPU fallback tier a format the device cannot
+// execute must keep its pre-existing expand-bf16 residency -- flipping it to
+// a keep-quant block throws at FORWARD time with the whole model resident.
+// Per-device sets name what the registered kernels actually implement.
+bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
+  switch (dev) {
+    case vt::DeviceType::kROCM:
+      // src/vt/rocm/rocm_grouped_gemm.hip implements exactly these on both the
+      // grouped and non-grouped arms; Q4_0/Q2_K/Q3_K/IQ2_*/IQ3_*/MXFP4 are
+      // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
+      return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
+             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+    default:
+      // CUDA falls back to the CPU kernel for anything it lacks
+      // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
+      return true;
+  }
+}
+
+// keep-f16 needs an f16-capable MatmulBT on the running device; the ROCm
+// kernel accepts bf16/bf16 and f32/f32 only, so an F16 file weight must
+// expand there rather than be kept and refused at first forward (same review).
+bool DeviceKeepF16Supported(vt::DeviceType dev) {
+  return dev != vt::DeviceType::kROCM;
+}
+
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
@@ -142,9 +171,14 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
     const int64_t k = KeepQuantKDim(role, shape);
     vt::DType dt = vt::DType::kF32;
     // ggml_row_size's precondition: a row is a whole number of blocks. A weight
-    // whose K is ragged cannot be dotted block-wise, so it expands.
+    // whose K is ragged cannot be dotted block-wise, so it expands. The device
+    // gate (review #523): a format the RUNNING device cannot execute keeps its
+    // pre-existing expand-bf16 residency instead of flipping to a keep-quant
+    // block that throws at forward time on a card with no CPU fallback tier.
     if (k > 0 && KeepQuantDType(ggml_type, &dt) &&
-        k % vt::BlockElems(dt) == 0) {
+        k % vt::BlockElems(dt) == 0 &&
+        DeviceKeepQuantSupported(
+            dt, vllm::platforms::CurrentPlatform().device_type())) {
       return GgufResidency::kKeepQuant;
     }
   }
@@ -231,7 +265,9 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   //
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
-  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk;
+  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk &&
+               DeviceKeepF16Supported(
+                   vllm::platforms::CurrentPlatform().device_type());
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
   // build keeps expanding, which is correct but unquantized), with

@@ -36,6 +36,19 @@
 // weights, no forward path. Row MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm
 // W1, issue #517, spec `.agents/specs/nemotron-h-model.md`.
 //
+// WHO CONSUMES IT. `LoadQwen3_5Dense`
+// (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp`), the loader
+// every consumer of a Qwen3.5-family safetensors checkpoint arrives through.
+// It reads this config once for the whole checkpoint and refuses a declared
+// algorithm it has no loader for, or a declaration the shipped tensor names
+// contradict — `Refusal` and `RefusalForQuantizationConfig` at the bottom of
+// this file. `QUANT-QWEN38-27B-NVFP4-ARM` W5, issue #821, campaign #1574, spec
+// `.agents/specs/qwen38-27b-quant-arms.md`. Until that landed this header was
+// reachable ONLY from its own two unit tests, which is what `AGENTS.md`
+// §"Nothing lands dead" calls measuring a class rather than a capability; the
+// sentence in divergence 2 below that said so is kept, corrected, rather than
+// deleted, because the state it describes was real for the rows that read it.
+//
 // THREE DELIBERATE DIVERGENCES FROM UPSTREAM, each recorded here rather than
 // discovered later:
 //
@@ -62,15 +75,24 @@
 //     `check-doc-checkpoint` classifies the whole `include/vllm/` prefix as a
 //     USER-FACING surface and requires `docs/USAGE.md` to move with it — the
 //     list's own comment calls it "user-facing configuration/build/install
-//     entrypoints". Nothing consumes this resolver yet: it is not on the
-//     `include/vllm.h` ABI, no loader calls it, and no command, C API key,
-//     config key or install step changes because of it, which is exactly what
-//     AGENTS.md says `docs/USAGE.md` tracks. Putting an internal header there
-//     would have forced a `docs/USAGE.md` edit that documented nothing.
-//     `src/vllm/model_executor/models/*.h` is the established precedent for an
-//     internal header. **W3 should promote this to `include/` when it becomes
-//     part of the consumed surface**, and pay whatever public-document
-//     obligation genuinely applies at that point.
+//     entrypoints". When this was written nothing consumed the resolver: it was
+//     not on the `include/vllm.h` ABI, no loader called it, and no command, C
+//     API key, config key or install step changed because of it, which is
+//     exactly what AGENTS.md says `docs/USAGE.md` tracks. Putting an internal
+//     header there would have forced a `docs/USAGE.md` edit that documented
+//     nothing. `src/vllm/model_executor/models/*.h` is the established
+//     precedent for an internal header.
+//
+//     IT IS CONSUMED NOW, AND IT STAYS HERE. `LoadQwen3_5Dense` is a `src/`
+//     translation unit, so the consumer needs no `include/vllm/` surface, and
+//     the sibling that answers the same question for compressed-tensors
+//     (`compressed_tensors/compressed_tensors_config.h`) is consumed by the
+//     same file from the same place. Promoting one of two peers would say the
+//     two formats sit at different levels of the tree, which they do not.
+//     `docs/USAGE.md` still moves with this change, for the reason AGENTS.md
+//     §"Say which weights, and from where" gives rather than for a path
+//     classification: a second checkpoint became loadable and a reader cannot
+//     infer which bytes to feed it.
 //
 //  3. `Parse` IS TEMPLATED ON THE JSON TYPE so it accepts
 //     `nlohmann::ordered_json`. Upstream iterates a Python dict, whose order is
@@ -768,6 +790,341 @@ class MixedPrecisionConfig {
   std::string kv_cache_quant_algo_;
   int group_size_ = 16;
 };
+
+// ── from a TENSOR name to the MODULE name `quantized_layers` is written against
+//
+// `quantized_layers` and `exclude_modules` name MODULES
+// (`...self_attn.q_proj`); a checkpoint ships OPERANDS
+// (`...self_attn.q_proj.weight_scale`). Resolving an operand name against the
+// map matches nothing and reads as "unquantized", which is the silent-dequant
+// direction, so the split belongs to the resolver rather than to each caller.
+//
+// A SECOND suffix list, deliberately, and not a widening of the
+// compressed-tensors one in
+// `compressed_tensors/compressed_tensors_config.h`. The two formats spell the
+// same operands differently: ModelOpt writes `weight` + `weight_scale` +
+// `weight_scale_2` where compressed-tensors writes `weight_packed` +
+// `weight_scale` + `weight_global_scale`, and ModelOpt's `input_scale` has no
+// compressed-tensors counterpart on the checkpoints that resolver was verified
+// against. That resolver's list carries a "verified complete against
+// unsloth/Qwen3.8-27B-NVFP4" claim; editing it to carry names that artifact
+// does not ship would make the claim false without measuring anything. One
+// list per format is the same argument the tree already recorded for keeping
+// one resolver per format.
+//
+// LONGEST SUFFIX FIRST: `<proj>.weight_global_scale` must not be split on
+// `.weight`, which would leave `<proj>.weight_global` and resolve nothing.
+//
+// Verified complete against both ModelOpt `MIXED_PRECISION` checkpoints this
+// tree pins: `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` (2001 index
+// names: 937 `weight`, 401 `weight_scale`, 208 `input_scale`, 193
+// `weight_scale_2`, 166 `bias`, 48 `A_log`, 48 `dt_bias`) and
+// `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160` (2194 names: 937 `weight`, 401
+// `weight_scale`, 401 `input_scale`, 193 `weight_scale_2`, 166 `bias`, 48
+// `A_log`, 48 `dt_bias`). The compressed-tensors spellings and the two
+// KV-cache scales are carried too, so a name this list has never seen is a
+// genuinely new family rather than a format it already knows.
+inline const std::vector<std::string>& OperandSuffixes() {
+  static const std::vector<std::string>* s = new std::vector<std::string>{
+      ".weight_global_scale", ".input_global_scale", ".weight_packed",
+      ".weight_scale_2",      ".weight_scale",      ".input_scale",
+      ".weight",              ".bias",              ".A_log",
+      ".dt_bias",             ".k_scale",           ".v_scale"};
+  return *s;
+}
+
+// True when `name` ends in a known operand suffix; `module` and `suffix` are
+// then its two halves (`suffix` without the leading dot). False means this
+// resolver has never seen the family, and the caller must NOT read that as
+// "unquantized". `Refusal` is the one caller, and it REFUSES such a name rather
+// than skipping it, because a name that belongs to no module is cross-checked
+// in neither direction — which is the silent state this whole file exists to
+// close.
+inline bool SplitOperand(const std::string& name, std::string* module,
+                         std::string* suffix) {
+  for (const std::string& s : OperandSuffixes()) {
+    if (name.size() > s.size() &&
+        name.compare(name.size() - s.size(), s.size(), s) == 0) {
+      *module = name.substr(0, name.size() - s.size());
+      *suffix = s.substr(1);
+      return true;
+    }
+  }
+  return false;
+}
+
+// The two operands that belong to the KV cache rather than to any Linear.
+// `kv_cache_quant_algo` is a SIBLING of `quantized_layers`
+// (modelopt.py:294, :306-314) and no path in THIS loader reads a checkpoint
+// `k_scale`/`v_scale` tensor — `KV-FP8` (#1593) landed the CUDA fp8 KV store
+// itself, and feeding it from a checkpoint's scales is a different job; see
+// the refusal note below for why that is named as owed rather than refused
+// here. `ModuleOperands::Add` is the caller: a KV scale is
+// RECORDED against its module and then deliberately kept out of
+// `AnyQuantOperand`, so the decision is one branch a test can mutate rather
+// than a skip that changes no verdict.
+inline bool IsKvCacheScaleSuffix(const std::string& suffix) {
+  return suffix == "k_scale" || suffix == "v_scale";
+}
+
+// Which operands one module actually SHIPS, by name. Name-only on purpose: the
+// loader's own routing probes are name-only too
+// (`IsNvfp4Projection` = `has(<proj>.weight_packed) || has(<proj>.weight_scale_2)`),
+// so a name-only cross-check compares like with like. A dtype check would
+// answer a different question than the one that decides the arm.
+struct ModuleOperands {
+  bool weight = false;
+  bool weight_packed = false;
+  bool weight_scale = false;
+  bool weight_scale_2 = false;
+  bool weight_global_scale = false;
+  bool input_scale = false;
+  bool input_global_scale = false;
+  // Recorded, and deliberately NOT part of `AnyQuantOperand` — see below.
+  bool k_scale = false;
+  bool v_scale = false;
+
+  void Add(const std::string& suffix) {
+    if (suffix == "weight") weight = true;
+    else if (suffix == "weight_packed") weight_packed = true;
+    else if (suffix == "weight_scale") weight_scale = true;
+    else if (suffix == "weight_scale_2") weight_scale_2 = true;
+    else if (suffix == "weight_global_scale") weight_global_scale = true;
+    else if (suffix == "input_scale") input_scale = true;
+    else if (suffix == "input_global_scale") input_global_scale = true;
+    else if (IsKvCacheScaleSuffix(suffix)) {
+      (suffix == "k_scale" ? k_scale : v_scale) = true;
+    }
+  }
+
+  // A Linear ships one of these. A module carrying only `A_log`/`dt_bias`/
+  // `bias` is not a Linear and is not what `quantized_layers` names, so it is
+  // not cross-checked — see the note on `Refusal` for why that matters.
+  bool WeightBearing() const { return weight || weight_packed; }
+
+  // An operand whose presence means the WEIGHTS of this module are quantized.
+  //
+  // `k_scale` and `v_scale` are recorded above and are absent from this
+  // disjunction ON PURPOSE, because they quantize the KV CACHE and not the
+  // module's weights: `kv_cache_quant_algo` is a SIBLING of `quantized_layers`
+  // (modelopt.py:294, :306-314). A bf16 attention tower that ships a KV scale
+  // is therefore a checkpoint that `quantized_layers` correctly does not name,
+  // and refusing it for "shipping a quantized spelling" would refuse
+  // `nvidia/Qwen3.6-27B-NVFP4`'s successor the moment one ships the scales its
+  // `kv_cache_scheme` already declares. This is the executable half of the
+  // "THE KV CACHE IS NOT REFUSED HERE" decision argued on `Refusal`; adding
+  // either flag to this disjunction turns that case red.
+  bool AnyQuantOperand() const {
+    return weight_packed || weight_scale || weight_scale_2 ||
+           weight_global_scale || input_scale || input_global_scale;
+  }
+
+  // The ModelOpt NVFP4 spelling this tree's `LoadNvfp4AnyNaming` reads.
+  bool ModeloptNvfp4() const { return weight && weight_scale && weight_scale_2; }
+  // The compressed-tensors NVFP4 spelling the same function also reads.
+  bool CtNvfp4() const {
+    return weight_packed && weight_scale && weight_global_scale;
+  }
+  // The per-tensor static FP8 spelling this tree's `LoadFp8Raw` reads: a
+  // weight, ONE weight scale and ONE static input scale to fold into `alpha`.
+  bool StaticFp8() const {
+    return weight && weight_scale && input_scale && !weight_scale_2 &&
+           !weight_packed;
+  }
+
+  std::string Spelling() const {
+    std::string out;
+    const auto add = [&out](const char* s) {
+      if (!out.empty()) out += " + ";
+      out += s;
+    };
+    if (weight) add("weight");
+    if (weight_packed) add("weight_packed");
+    if (weight_scale) add("weight_scale");
+    if (weight_scale_2) add("weight_scale_2");
+    if (weight_global_scale) add("weight_global_scale");
+    if (input_scale) add("input_scale");
+    if (input_global_scale) add("input_global_scale");
+    if (k_scale) add("k_scale");
+    if (v_scale) add("v_scale");
+    return out.empty() ? std::string("<no operand>") : out;
+  }
+};
+
+namespace detail {
+
+inline std::string JoinModules(const std::set<std::string>& modules,
+                               std::size_t cap) {
+  std::string out;
+  std::size_t shown = 0;
+  for (const std::string& m : modules) {
+    if (shown == cap) break;
+    if (shown != 0) out += ", ";
+    out += m;
+    ++shown;
+  }
+  if (modules.size() > shown)
+    out += " (and " + std::to_string(modules.size() - shown) + " more)";
+  return out;
+}
+
+}  // namespace detail
+
+// The refusal a loader owes a ModelOpt `MIXED_PRECISION` checkpoint whose
+// DECLARED algorithm this build cannot execute, or whose declared algorithm and
+// SHIPPED operand names disagree. "" means every weight-bearing module's
+// declaration and spelling agree and every declared algorithm has a loader.
+//
+// WHY THIS IS THE CHECK, AND NOT A ROUTER. This tree routes each projection by
+// probing which tensor NAMES are present
+// (`qwen3_5_dense_weights.cpp` `IsNvfp4Projection`, then an `F8_E4M3` dtype
+// probe, then bf16). That probe cannot be wrong about the BYTES, and it can be
+// wrong about the CHECKPOINT: a module the producer declared FP8 that ships an
+// NVFP4 spelling routes to the NVFP4 arm, and a module declared unquantized
+// that ships scales routes to a quantized arm. Both produce finite, plausible
+// numbers and matching tokens while moving the wrong bytes, which is the one
+// defect class `AGENTS.md` §"Inherit vLLM defaults" says a token gate cannot
+// see. Refusing on disagreement makes the probe's answer CHECKED against the
+// producer's declaration without changing which arm a checkpoint takes, so no
+// artifact that loads today loads differently.
+//
+// ONLY WEIGHT-BEARING MODULES ARE CROSS-CHECKED. `quantized_layers` names
+// Linears. Splitting operand names also produces container names that own no
+// Linear weight — `...layers.<i>.linear_attn`, which ships `A_log` and
+// `dt_bias` — and upstream's strategy-3 prefix scan (modelopt.py:2449-2453)
+// resolves such a container to its first quantized CHILD's algorithm. That is
+// correct upstream, where the container IS the quantized layer, and it is not a
+// statement about the two scalars the container ships. Cross-checking it would
+// refuse both artifacts this was verified against for a disagreement neither
+// has.
+//
+// THE KV CACHE IS NOT REFUSED HERE, and that is a decision rather than an
+// omission. `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160` — a gate model this tree
+// loads and measures today — declares `kv_cache_scheme` 8-bit float static and
+// ships ZERO `k_scale`/`v_scale` tensors, and
+// `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` declares `kv_cache_quant_algo: "FP8"`
+// in `hf_quant_config.json`, a file no production path in this tree reads at
+// all. A refusal here would refuse a checkpoint that loads today. The FP8 KV
+// arm is owned by `KV-FP8` (issue #1593) and is listed under `## Owed` in
+// `.agents/specs/qwen38-27b-quant-arms.md`. `ModuleOperands` RECORDS a KV scale
+// and leaves it out of `AnyQuantOperand`, which is where that decision is
+// executable; this function no longer skips the suffix, because a skip that
+// changes no verdict is a claim no test can read.
+//
+// A TENSOR NAME WHOSE FAMILY THE SPLITTER HAS NEVER SEEN IS REFUSED, not
+// skipped. `SplitOperand` documents that `false` means "this resolver has never
+// seen the family, and the caller must NOT read that as unquantized", and a
+// `continue` here read it as exactly that: the name belonged to no module, so
+// NOTHING cross-checked it in either direction and the checkpoint loaded
+// silently. `.weight_scale_inv` is the case that makes this concrete — it is
+// the block-wise FP8 spelling `IsFp8BlockProjection` reads two rungs above the
+// call site in `qwen3_5_dense_weights.cpp`, so a ModelOpt checkpoint could ship
+// it, take the block-FP8 arm, and never be cross-checked at all. Both artifacts
+// this resolver is verified against classify EVERY shipped name (2001 of 2001
+// and 2194 of 2194), so this refusal cannot fire on either, and the suffix list
+// above carries the compressed-tensors spellings for the same reason.
+inline std::string Refusal(const MixedPrecisionConfig& c,
+                           const std::vector<std::string>& tensor_names) {
+  std::map<std::string, ModuleOperands> shipped;
+  std::set<std::string> unclassified;
+  for (const std::string& name : tensor_names) {
+    std::string module;
+    std::string suffix;
+    if (!SplitOperand(name, &module, &suffix)) {
+      unclassified.insert(name);
+      continue;
+    }
+    shipped[module].Add(suffix);
+  }
+
+  // Grouped by (declared algorithm, reason): on a real artifact one missing
+  // piece is shared by hundreds of modules, and 208 sentences about it is not a
+  // better message than one.
+  std::map<std::pair<std::string, std::string>, std::set<std::string>> refused;
+  for (const auto& entry : shipped) {
+    const std::string& module = entry.first;
+    const ModuleOperands& ops = entry.second;
+    if (!ops.WeightBearing()) continue;
+
+    // `Resolve` itself throws for an algorithm string this consumer does not
+    // implement (divergence 1 above), which names the module and the algorithm
+    // and is exactly the sentence this function would otherwise build.
+    const ModuleQuant q = c.Resolve(module);
+    const std::string algo = QuantAlgoName(q.algo);
+    std::string reason;
+    switch (q.algo) {
+      case QuantAlgo::kUnquantized:
+        if (ops.AnyQuantOperand()) {
+          reason =
+              "the config does not quantize them, and they ship a QUANTIZED "
+              "spelling (" + ops.Spelling() +
+              "). Loading them quantized overrules the producer's declaration; "
+              "loading them bf16 ignores tensors the file carries";
+        }
+        break;
+      case QuantAlgo::kFp8:
+        if (!ops.StaticFp8()) {
+          reason =
+              "this build reads a per-tensor STATIC FP8 spelling (weight + "
+              "weight_scale + input_scale), and they ship " + ops.Spelling();
+        }
+        break;
+      case QuantAlgo::kNvfp4:
+      case QuantAlgo::kW4A16Nvfp4:
+        if (!ops.ModeloptNvfp4() && !ops.CtNvfp4()) {
+          reason =
+              "this build reads an NVFP4 spelling (weight + weight_scale + "
+              "weight_scale_2, or weight_packed + weight_scale + "
+              "weight_global_scale), and they ship " + ops.Spelling();
+        }
+        break;
+      case QuantAlgo::kMxfp8:
+        reason =
+            "this build has no MXFP8 loader. Refusing rather than reading them "
+            "as FP8 or as bf16: both are numerically plausible and therefore "
+            "invisible to a token gate";
+        break;
+    }
+    if (!reason.empty()) refused[{algo, reason}].insert(module);
+  }
+  if (refused.empty() && unclassified.empty()) return std::string();
+
+  std::string out =
+      "modelopt MIXED_PRECISION quantization_config declares " +
+      std::to_string(c.num_quantized_layers()) +
+      " quantized layer(s), and the shipped tensors do not agree with it.";
+  if (!unclassified.empty()) {
+    out += "\n  " + std::to_string(unclassified.size()) +
+           " shipped tensor name(s) end in an operand family this resolver has "
+           "never seen, so no module owns them and NOTHING cross-checked them "
+           "in either direction.";
+    out += "\n  unclassified: " + detail::JoinModules(unclassified, 8);
+  }
+  for (const auto& kv : refused) {
+    out += "\n  " + std::to_string(kv.second.size()) +
+           " module(s) resolve to quant_algo \"" + kv.first.first + "\": " +
+           kv.first.second + ".";
+    out += "\n  refused: " + detail::JoinModules(kv.second, 8);
+  }
+  return out;
+}
+
+// The whole-config convenience a loader calls with the document's
+// `quantization_config` and its shipped tensor names. A config that is not a
+// ModelOpt `MIXED_PRECISION` one answers "" and reads nothing, so a caller that
+// adds this leaves every other checkpoint byte-identical.
+//
+// The `quant_method` precondition is `IsMixedPrecision`'s and not `Parse`'s,
+// for the reason argued on both: a loader holding a `config.json` has to tell a
+// ModelOpt `quantization_config` apart from a compressed-tensors one sitting in
+// the same field, and `quant_method` is how upstream does it
+// (modelopt.py:2333-2339).
+template <class Json>
+inline std::string RefusalForQuantizationConfig(
+    const Json& quant, const std::vector<std::string>& tensor_names) {
+  if (!MixedPrecisionConfig::IsMixedPrecision(quant)) return std::string();
+  return Refusal(MixedPrecisionConfig::Parse(quant), tensor_names);
+}
 
 }  // namespace modelopt
 }  // namespace layers

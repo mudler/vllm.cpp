@@ -148,6 +148,96 @@ def assert_oracle_commit(runtime_version: object) -> None:
         )
 
 
+# EVERY BENCHMARK SUBJECT, AND THE EXACT CHECKPOINT ITS KEY MEANS.
+#
+# A model key is a directory name -- `evidence/corpus/<key>/` and
+# `evidence/raw/<key>/<engine>/` -- and `summarize_serve_low.py` aggregates by
+# it.  So a key is a SUBJECT IDENTITY and never a size, and two checkpoints
+# accepted under one key do not crash: they complete, write plausible raw
+# results, and are averaged into one published number for a subject that never
+# ran (#1594).  A key that names no checkpoint has the same shape, because
+# nothing then says which weights produced the evidence under it.
+#
+# ONE record, read by every tool that keys on a subject, so that admitting a key
+# and pinning its checkpoint cannot be separate edits and cannot drift apart.
+# "27" and "27n" are DIFFERENT MODELS rather than two spellings of one, and
+# "q38mtp" is a THIRD 27B checkpoint that is neither -- which is why it is
+# deliberately not digit-prefixed, so no evidence path can be read as another
+# subject's.
+MODEL_CHECKPOINTS: dict[str, dict[str, str]] = {
+    "27": {
+        "repository": "unsloth/Qwen3.6-27B-NVFP4",
+        "revision": "890bdef7a42feba6d83b6e17a03315c694112f2a",
+    },
+    "27n": {
+        "repository": "nvidia/Qwen3.6-27B-NVFP4",
+        "revision": "0893e1606ff3d5f97a441f405d5fc541a6bdf404",
+    },
+    "35": {
+        "repository": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        "revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
+    },
+    "q3mxfp4": {
+        "repository": "Yi30/Qwen3-8B-MXFP4",
+        "revision": "b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47",
+    },
+    # #1574's subject: `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`, a 27B NVFP4
+    # checkpoint that is NOT the "27" subject.
+    "q38mtp": {
+        "repository": "r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121",
+        "revision": "36f717a22990e82c54c1d48ee77c491b87825680",
+    },
+}
+
+
+def model_checkpoint(model_key: str) -> dict[str, str]:
+    """Return the repository and revision *model_key* names, or refuse.
+
+    Fails closed on a key the registry does not carry, and on a registry entry
+    that does not pin a full commit ID: a floating revision is a subject whose
+    weights can be re-quantized in place under an unchanged name.
+    """
+
+    entry = MODEL_CHECKPOINTS.get(model_key)
+    if entry is None:
+        raise HarnessError(f"unknown model key: {model_key}")
+    revision = entry["revision"]
+    if len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
+        raise HarnessError(
+            f"model key {model_key} does not pin a full checkpoint revision"
+        )
+    return dict(entry)
+
+
+def admitted_model_keys(*model_keys: str) -> tuple[str, ...]:
+    """Return *model_keys* once each has been proven to name a checkpoint.
+
+    A harness declares the subjects it benches by calling this, so a key cannot
+    enter an admitted set -- an argparse `choices`, an evidence tree, a manifest
+    -- without the registry saying which weights it means.
+    """
+
+    for model_key in model_keys:
+        model_checkpoint(model_key)
+    return model_keys
+
+
+def require_model_checkpoint(model_key: str, revision: str, *, field: str) -> None:
+    """Require *revision* to be the revision *model_key* names.
+
+    This is the binding #1594 exists for: without it `--model-key` is a free
+    label beside a free `--model-revision`, and the pair can disagree while the
+    run exits 0.
+    """
+
+    expected = model_checkpoint(model_key)["revision"]
+    if revision != expected:
+        raise HarnessError(
+            f"{field}={revision!r} is not the checkpoint model key "
+            f"{model_key!r} names ({expected})"
+        )
+
+
 def canonical_json(value: Any) -> str:
     """Return deterministic UTF-8-safe JSON used by all hashed artifacts."""
 

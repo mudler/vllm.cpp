@@ -511,6 +511,38 @@ ill-conditioning assertion is what caught that.
 passed, 353 assertions, 353 passed, `Status: SUCCESS!`**.
 
 
+## 6.5 The RENDER is not bit-identical, and no gate in this tree bounds that
+
+Said here rather than left to be noticed in a diff. The two arms produce audio
+of identical length and different bytes -- `576cd9fd77e7f8ed14` against
+`61a8989763bba749ed`, both 3 530 796 bytes -- because the kernel is not
+bit-identical and never claimed to be.
+
+**What IS gated** is the DiT forward, at MiniMax-Music3's committed
+`kDitRelTol` / `kDitAbsFloor` / `kDitMeanAbsTol` (§14.4), unwidened, and the op
+itself against an independent f64 reference at `2e-5` f32. Both pass.
+
+**What is NOT gated, by anything, and was not before this row either**, is the
+ACCUMULATED difference over a 30-step denoise. A per-forward tolerance does not
+bound a fixed point reached by iterating that forward, and this tree has no
+render-level oracle for MiniMax-Music3 to bound it against -- vLLM and vLLM-Omni
+register nothing for this architecture (§21.9).
+
+One thing keeps that from being a hidden risk rather than a stated one: the
+direction is MEASURED, and it is TOWARD the reference rather than away. §6.3
+shows the blocked kernel 7.2x closer to f64 on the ill-conditioned case, because
+it trades 96 per-key softmax rescales for 3 per-tile ones.
+
+**What was NOT checked, and is not claimed:** nothing in this row inspected the
+SAMPLES. Both renders are 3 530 796 bytes and both processes exited 0, and that
+is the whole of it -- a byte count and an exit code are not evidence that audio
+was produced, which is the mistake the LTX-2.5 render row records. The follow-up
+job computes a peak and an RMS per arm so the next revision of this section can
+say something about the waveform instead of about its length.
+
+A render-level bound is a real gap and it is NOT this row's to close; it predates
+this row and applies equally to the kernel being replaced.
+
 ## 7. Owed
 
 - **[#1551](https://github.com/mudler/vllm.cpp/issues/1551)** already owns the

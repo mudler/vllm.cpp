@@ -712,12 +712,66 @@ nested braces, so it consumed the closing delimiter and substituted nothing — 
 pattern that silently matches nothing is EXACTLY the shape that reads as a
 passing test. M2 replaced `kBlockedPriority` with a literal, which orphaned that
 `constexpr` in an anonymous namespace, and `-Wunused-const-variable` is an error
-here. Both are re-run in §8.5 with a `!` delimiter and with -1 DERIVED from the
-constant so it stays referenced.
+here. Both are re-run in §8.5, where both are RED. M1 needed a third form as well,
+for a third distinct instrument reason.
 
-### 8.5 M1 and M2, re-run
+### 8.5 M1 and M2, re-run — both RED, and M1 took three attempts
 
-Filled in from that job.
+Two further leases, tree `22042caba` (byte-identical to the head under review in
+`cuda_attention_cross.cu` and `test_ops_attention_cross.cpp`, so the whole
+mutation suite sits at one tree). The third used the cached build,
+`REUSE_CACHED_BUILD=yes`, and both opened green: `BASELINE_TEST_RC=0`,
+**20 cases / 156 assertions / `Status: SUCCESS!`**.
+
+| mutation | hunks | compile rc | test rc | cases red | assertions red |
+|---|---:|---:|---:|---:|---:|
+| **M1** the shape gate routes nothing | 1 | 0 | **1** | **8 of 20** | 8 of 137 |
+| **M2** `vt-native` outranks the provider | 1 | 0 | **1** | **6 of 20** | 7 of 156 |
+
+Both restored `RESTORED_BYTE_FOR_BYTE`, `TREE_CLEAN`, and the tree re-gated
+`FINAL_TEST_RC=0` at **20 / 156 / `SUCCESS!`** afterwards. Each carries a
+distinct binary sha256 (`21987a98…`, `7b216199…`), so the rebuild demonstrably
+took.
+
+**M1 IS THE REACHABILITY MUTATION and this is its evidence.** The diff is two
+lines, printed by the harness and read rather than assumed:
+
+```text
+-  if (d == 64) return tq >= 64;
+-  if (d == 128) return tq >= 32;
++  if (d == 64) return tq < 0;
++  if (d == 128) return tq < 0;
+```
+
+The blocked kernel is still registered, still linked and still selected — and it
+now serves nothing. Every routing assertion in the suite inverts, in the same
+direction, with the same value: `declines` reads **1 where 0 is required**, at
+eight separate sites including a `REQUIRE` that aborts its case. A gate that
+stayed green here would be measuring a class rather than a capability, which is
+`.agents/reachability.md`'s whole subject.
+
+**M2 fails the complementary way.** With the priority inverted the provider is
+registered but not selected, so `OpProviderNameAt(…, 0)` reads `vt-native`,
+`last_selected` reads `vt-native` at four sites, and the two decline counts that
+should read 1 read 0 instead. The pair therefore brackets the routing claim from
+both sides: M1 breaks selection-does-something, M2 breaks selection-happens.
+
+**M1 FAILED TWICE AS AN INSTRUMENT BEFORE IT FAILED AS A TEST, and never once
+produced a wrong verdict.** Pass 1: `MUTATION_HUNKS=0`, never applied — perl's
+`s{...}{...}` counts nested braces and M1's replacement was the only one carrying
+an unmatched `{`, so it consumed the closing delimiter and substituted nothing.
+Pass 2: `MUTATION_COMPILE_RC=1` — `return false` orphaned `tq`, and this build
+runs `-Werror=all-warnings`, so `variable "tq" was declared but never referenced`
+failed the compile. Pass 3 answers false through `tq < 0`, which is always false
+for a shape and keeps the variable read.
+
+Both failures are the exact shapes this repository records as reading like a
+passing test, and neither could here, because the harness counts diff hunks and
+prints the compile return code **before** any test output. That ordering is not
+decoration: with it, a broken mutation is visibly broken; without it, M1 would
+have been reported twice as "the gate detects this" while nothing had been
+mutated at all.
+
 
 ### 8.6 The consumer suites, on the device
 

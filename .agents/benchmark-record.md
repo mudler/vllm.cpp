@@ -26464,8 +26464,18 @@ evidence of stability rather than used as denominators.
 
 ### What this entry does NOT contain
 
-The **M1 and M2 mutations** are re-run in a third lease after two INSTRUMENT
-failures -- M1 never applied and M2 did not build, both reported loudly and
-neither as a verdict about the code. M3 to M6 are clean reds with distinct binary
-hashes. Nothing else is outstanding: the 30-step pair above retires the
-projection this entry originally carried, and it landed within **0.52 %** of it.
+Nothing. The 30-step pair above retires the projection this entry originally
+carried, landing within **0.52 %** of it, and the mutation suite is complete:
+**all six are RED**, each with a distinct binary sha256, each restored byte for
+byte, and the tree re-gated green afterwards at 20 cases / 156 assertions.
+
+M1 -- the REACHABILITY mutation -- needed three attempts, and **failed twice as
+an INSTRUMENT before it failed as a test, never once producing a wrong verdict**.
+It never applied on the first pass (perl's `s{}{}` counts nested braces and its
+replacement carried an unmatched one, so it substituted nothing) and did not
+build on the second (`return false` orphaned `tq` under
+`-Werror=all-warnings`). Both are the exact shapes this repository records as
+reading like a passing test, and neither could, because the harness counts diff
+hunks and prints the compile return code before any test output. With the gate
+finally routing nothing, `declines` reads 1 where 0 is required at eight sites
+including an aborting `REQUIRE`.

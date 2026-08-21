@@ -93,6 +93,21 @@ The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
 DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
 picking a smaller quantization saves download and disk and does not save memory.
 
+Loading a DFlash2 draft prints a notice to **stderr**, on both the safetensors
+and the GGUF arm. **It prints TWICE per load**, on the server, the C API and the
+bench client alike: the loader reaches the same check from two places on one set
+of engine parameters — directly, before the target is mapped, and again through
+the speculative-config resolution the engine constructor runs — and the check
+carries no once-flag. That is a known defect and it is cosmetic: nothing is
+refused, and no WEIGHTS are loaded twice -- what re-runs is the classification
+and its paragraph
+([#1607](https://github.com/mudler/vllm.cpp/issues/1607)). The notice is purely
+informational. It names what runs, what is still owed (the bf16 residency
+above, and that no throughput number has been taken), and that the port mirrors
+[vllm#52816](https://github.com/vllm-project/vllm/pull/52816), which merged
+upstream on 2026-08-21 at `3406ec1d` and onto which this port is not yet
+reconciled ([#1561](https://github.com/mudler/vllm.cpp/issues/1561)).
+
 [Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
 draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
@@ -175,6 +190,9 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
+  expert blocks (Q8_0, Q4_K, Q5_K, Q6_K) instead of being dequantized to
+  bf16 at load time.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.

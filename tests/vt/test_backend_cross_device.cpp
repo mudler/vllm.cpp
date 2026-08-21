@@ -2231,6 +2231,175 @@ TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
   }
 }
 
+TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU oracle") {
+  // kMatmulBTQuant (op 74) on ROCm vs the CPU keep-quant reference. The
+  // non-grouped arm carries PR #523's headline mechanism and had NO coverage
+  // (review sweep 2026-08-13); the ROCm dispatcher's src-vs-out dtype mix-up
+  // in the fused preamble (the 0.8B divergence, row/ROCM-GDN-08B-FIX) is
+  // exactly the class an untested-but-registered op hides. REQUIRE (not skip)
+  // on ROCm so a dropped RegisterOp can never pass silently.
+  constexpr int64_t M = 3, N = 8, K = 512;
+  struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  const Fmt fmts[] = {
+    {vt::DType::kQ8_0, 34, 0, -1, "q8_0"},
+    {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+    {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+    {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+  };
+  const bool rocm_present = OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM);
+  const bool any_rocm = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (any_rocm) {
+    REQUIRE_MESSAGE(rocm_present,
+                    "kMatmulBTQuant must be registered on ROCm (the keep-quant "
+                    "loader flips on it) — a missing registration is a failure, "
+                    "never a skip");
+  }
+  for (const Fmt& f : fmts) {
+    CAPTURE(f.name);
+    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t blocks_per_row = K / elems_per_block;
+    const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(N) * row_bytes;
+    std::mt19937 rng(779);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < N; ++r)
+      for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) { uint16_t h = vt::F32ToF16(v); std::memcpy(blk + off, &h, 2); };
+        if (f.d_off >= 0) put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+    const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+    const std::vector<float> act = RandomVec(an, 780, -0.5f, 0.5f);
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      Tensor tout = T2(ref.data(), cd, M, N);
+      Tensor tact = T2(ca.data(), cd, M, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+      vt::MatmulBTQuant(cq, tout, tact, twt);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf da(dev, q, an);
+      DevBufBytes dwt(dev, q, wn);
+      DevBuf dout(dev, q, on);
+      da.Upload(act);
+      dwt.Upload(wt.data());
+      Tensor tact = T2(da.ptr(), d, M, K);
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
+  // kMatmulBTQuantGrouped on ROCm vs the CPU keep-quant reference
+  // (cpu_quant_gemm.cpp:305). Valid random blocks (valid f16 deltas, random
+  // quants) at a real expert-MLP shape. Integer cores are bit-exact ports;
+  // the f16/f32 scale sum reassociates across lanes, so NMSE <= 5e-4.
+  constexpr int64_t P = 3, N = 8, K = 512;         // K%256==0 (K-quant superblocks)
+  constexpr int64_t E = 4;                          // experts
+  const std::vector<int32_t> eids = {2, 0, 3};      // routed experts (non-sorted)
+
+  struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  // offsets from ggml-common.h (restated in cpu_quant_blocks.h)
+  const Fmt fmts[] = {
+    {vt::DType::kQ8_0, 34, 0, -1, "q8_0"},   // {d; qs[32]}        K blocks of 32
+    {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},   // {d,dmin,sc,qs}     superblocks of 256
+    {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},// {ql,qh,scales,d}   superblocks of 256
+    {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},   // {d,dmin,sc,qh,qs}  superblocks of 256
+  };
+
+  // REQUIRE-proven registration on ROCm (never a silent skip — review sweep
+  // on #523: an OpAvailable-guarded case passes green with the registration
+  // deleted).
+  const bool any_rocm = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (any_rocm) {
+    REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuantGrouped, DeviceType::kROCM),
+                    "kMatmulBTQuantGrouped must be registered on ROCm — a missing "
+                    "registration is a failure, never a skip");
+  }
+  for (const Fmt& f : fmts) {
+    CAPTURE(f.name);
+    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t blocks_per_row = K / elems_per_block;
+    const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(E) * N * row_bytes;
+    // Build valid random blocks: random quant bytes, small positive f16 deltas.
+    std::mt19937 rng(777);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < E * N; ++r)
+      for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) { uint16_t h = vt::F32ToF16(v); std::memcpy(blk + off, &h, 2); };
+        if (f.d_off >= 0) put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+    const size_t an = static_cast<size_t>(P) * K, on = static_cast<size_t>(P) * N;
+    const std::vector<float> act = RandomVec(an, 778, -0.5f, 0.5f);
+
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      std::vector<int32_t> ce = eids;
+      Tensor tout = T2(ref.data(), cd, P, N);
+      Tensor tact = T2(ca.data(), cd, P, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {E * N, K});
+      Tensor te = TI32(ce.data(), cd, P);
+      vt::MatmulBTQuantGrouped(cq, tout, tact, twt, te);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMatmulBTQuantGrouped, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf da(dev, q, an);
+      DevBufBytes dwt(dev, q, wn);
+      DevBufI32 de(dev, q, P);
+      DevBuf dout(dev, q, on);
+      da.Upload(act);
+      dwt.Upload(wt.data());
+      de.Upload(eids);
+      Tensor tact = T2(da.ptr(), d, P, K);
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {E * N, K});
+      Tensor te = TI32(de.ptr(), d, P);
+      Tensor tout = T2(dout.ptr(), d, P, N);
+      vt::MatmulBTQuantGrouped(q, tout, tact, twt, te);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
 TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
   // The "paged attention" case above hand-builds a contiguous KV cache; the
   // real model path writes it with ReshapeAndCache and reads it back. This

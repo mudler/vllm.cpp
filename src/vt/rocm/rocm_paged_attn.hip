@@ -1729,17 +1729,18 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   // at d==128 fell all the way to the generic PagedAttnOnline (#488 measured
   // that fallback at 41.1us/call against vLLM's 5.10us on gfx1200).
   //
-  // DEFAULT OFF, opt in with VT_ATTN_DECODE_D128=1 -- the SAME flag, default and
-  // reason as the merged CUDA arm (cuda_paged_attn.cu, DecodeD128Enabled, #382 /
-  // PR #425). It is correctness-complete but NOT byte-exact against the kernel it
-  // replaces: warp-strided online softmax reduces the KV sequence in a different
-  // ORDER than PagedAttnOnline's per-tile loop, so a greedy anchor can move at an
-  // exact bf16 tie. Shipping OFF keeps every existing golden byte-identical. The
-  // flip owes the near-tie razor + distributional gate + regen under the ratified-
-  // tie rule, on both backends, and is a separate change.
+  // DEFAULT ON (opt out with VT_ATTN_DECODE_D128=0) -- flipped from OFF with the
+  // ROCm near-tie razor + distributional gate + golden regen (gfx1151, Qwen3-0.6B:
+  // 16/16 prompts PASS, max gap 0.125 nats vs the pinned vLLM oracle, 0
+  // forward-divergent). It is correctness-complete but NOT byte-exact against the
+  // kernel it replaces: warp-strided online softmax reduces the KV sequence in a
+  // different ORDER than PagedAttnOnline's per-tile loop, so a greedy anchor can
+  // move at an exact bf16 tie. The re-captured ROCm device goldens are committed
+  // with this flip; the CUDA arm (cuda_paged_attn.cu, DecodeD128Enabled, #382 /
+  // PR #425) still ships OFF pending the same ceremony on that backend.
   static const bool decode_d128 = [] {
     const char* e = std::getenv("VT_ATTN_DECODE_D128");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   const bool bf16_decode_opt =
       decode_opt && ((d == 128 && decode_d128) || d == 256 || d == 512) &&

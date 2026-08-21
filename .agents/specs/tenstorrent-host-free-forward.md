@@ -199,7 +199,12 @@ Mistral-7B 12.2–13.8 vs 2.35 tok/s. The default path is now the slow one.
 4. Concurrency coverage under the new default: both paged-engine gates run
    multi-request and must complete green; the async-serving battery
    (`test_qwen3_dense_async_serving`) runs on TT if its harness selects the
-   device; the two flag-pinned default-path cases in
+   device — **measured outcome (2026-08-21, P150): 3 FATAL / 5
+   checkpoint-absent skip, pre-existing and orthogonal to this flip** — the
+   TT backend never advertised async sampled-token readback, so async
+   scheduling resolves OFF regardless of decode mode
+   ([#1627](https://github.com/mudler/vllm.cpp/issues/1627), under
+   `## Owed`); the two flag-pinned default-path cases in
    `test_tenstorrent_backend.cpp` (small-T `kRopeNeox` bit-exact; host-free
    helper inertness) move from `::unsetenv` to `VT_TT_HOST_FREE_DECODE=0`,
    and their meaning becomes "the opt-out path declines". The
@@ -328,6 +333,18 @@ investigation row but MUST be addressed by the item-5 port:
   `support_static_graph_mode()` declined by default (opt-in
   `VT_TT_DECODE_CAPTURE`); the captured 27.1 tok/s arm stays one hang fix
   away, and that fix owns flipping this default back.
+- **TT never advertises async sampled-token readback
+  ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)).** The
+  async-serving battery FATALs on TT at its anti-vacuous-pass guard
+  (`REQUIRE(loaded->async_scheduling_enabled())`,
+  `test_qwen3_dense_async_serving.cpp:124`) for every cached checkpoint —
+  3 FATAL / 5 checkpoint-absent skip on the P150 — because
+  `vt::Backend::SupportsAsyncSampledTokenReadback()` has no TT override, so
+  async scheduling resolves OFF (`max_concurrent_batches=1`). Pre-existing at
+  base `52e328789` (zero hits under `src/vt/tenstorrent/`) and orthogonal to
+  the decode-mode flip; enabling it needs a device-mirrored sampled-id design
+  (the CUDA `async_device_mirror` equivalent against the tt-metal allocator)
+  and owns the battery going green on TT.
 - **`DecodePosCache` is keyed on bare `num_reqs`, with no engine, queue or device
   identity, and is never cleared.** Two engine instances in one process at the same
   padded batch size therefore share one `cur_pos` device tensor: the second engine's

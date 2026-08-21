@@ -3313,6 +3313,38 @@ void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
       q, scores, pred_codebook, succ_codebook, candidate_ids, unary, hidden, anchors, args);
 }
 
+void Dflash2PathWalk(Queue& q, Tensor& tokens, const Tensor& scores,
+                     const Tensor& candidate_ids, const Dflash2PathWalkArgs& args) {
+  VT_CHECK(args.top_k >= 1, "dflash2-path-walk: top_k must be >= 1");
+  VT_CHECK(scores.rank == 4, "dflash2-path-walk: scores must be rank-4 [B,L,K,K]");
+  VT_CHECK(candidate_ids.rank == 3,
+           "dflash2-path-walk: candidate_ids must be rank-3 [B,L,K]");
+  VT_CHECK(tokens.rank == 2, "dflash2-path-walk: tokens must be rank-2 [B,L]");
+  const int64_t b = candidate_ids.shape[0], l = candidate_ids.shape[1];
+  const int64_t k = args.top_k;
+  VT_CHECK(candidate_ids.shape[2] == k,
+           "dflash2-path-walk: candidate_ids last dim must be top_k");
+  // BOTH trailing axes are checked. They are the PREDECESSOR axis and the CHILD
+  // axis and they have the same extent, so checking one and inferring the other
+  // would admit a lattice indexed the wrong way round -- which reads plausible
+  // scores from the wrong rows and moves acceptance without raising.
+  VT_CHECK(scores.shape[0] == b && scores.shape[1] == l && scores.shape[2] == k &&
+               scores.shape[3] == k,
+           "dflash2-path-walk: scores must be [B,L,K,K] matching candidate_ids");
+  VT_CHECK(tokens.shape[0] == b && tokens.shape[1] == l,
+           "dflash2-path-walk: tokens must be [B,L] matching candidate_ids");
+  VT_CHECK(scores.dtype == DType::kF32, "dflash2-path-walk: scores must be f32");
+  VT_CHECK(candidate_ids.dtype == DType::kI64 && tokens.dtype == DType::kI64,
+           "dflash2-path-walk: candidate_ids and tokens must be i64");
+  VT_CHECK(scores.IsContiguous() && candidate_ids.IsContiguous() && tokens.IsContiguous(),
+           "dflash2-path-walk: contiguous tensors required");
+  VT_CHECK(scores.device == q.device && candidate_ids.device == q.device &&
+               tokens.device == q.device,
+           "dflash2-path-walk: device mismatch");
+  reinterpret_cast<Dflash2PathWalkFn>(GetOp(OpId::kDflash2PathWalk, q.device.type))(
+      q, tokens, scores, candidate_ids, args);
+}
+
 void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
                        const TopKValuesIndicesArgs& args) {
   VT_CHECK(logits.rank == 2 && values.rank == 2 && indices.rank == 2,

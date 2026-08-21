@@ -66,6 +66,34 @@ checkpoints](guides/hugging-face-access.md) for the build options,
 release lanes that carry no fetch. `vllm-cli` and the C ABI still take a local
 path only.
 
+That command is measured, not illustrative. On 2026-08-20, on x86_64 with the
+default OpenSSL build and an empty `HF_HOME`, it fetched
+`Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca` from
+`huggingface.co`: `model.safetensors` (1503300328 bytes), `tokenizer.json`
+(11422654), `vocab.json` (2776833), `merges.txt` (1671853),
+`tokenizer_config.json` (9732), `config.json` (726) and
+`generation_config.json` (239), 1.5 GB of cache in total. The server then bound
+its port and answered `/v1/completions`. A second start with the same `HF_HOME`
+reports every file as `already in the cache` and transfers no bytes. Before
+[#1511](https://github.com/mudler/vllm.cpp/issues/1511) this command downloaded
+nothing at all, because the hub answers with a relative `Location` header that
+the client read as a URL.
+
+## Draft with a second checkpoint
+
+Speculative decoding runs a small draft model beside the target and verifies its
+proposals losslessly, so the emitted tokens do not change. Pass the draft with
+`--speculative-config`:
+
+```sh
+build/examples/vllm-server   --model /path/to/target   --speculative-config '{"method":"dflash","model":"/path/to/draft","num_speculative_tokens":7}'
+```
+
+[Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
+draft checkpoints each was gated against, and what each one refuses by name.
+Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
+value is refused at startup rather than silently ignored.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in

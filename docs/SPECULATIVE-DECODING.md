@@ -115,21 +115,38 @@ byte-identical.
 
 DFlash2 adds a grouped dynamic depthwise convolution and a candidate selector
 that replaces DFlash1's per-slot argmax with a scored path walk over the target
-head's top-K. A safetensors checkpoint that declares `DFlash2DraftModel` loads,
-runs the convolution around every attention and MLP sublayer, computes the
-selector's transition lattice, and then refuses BY NAME at the PATH WALK, which
-is not implemented. Startup prints a notice before that later refusal. The
-engine does not substitute the DFlash1 per-slot argmax, which would emit valid
-target tokens while silently reducing draft acceptance -- the failure this lane
-is built to avoid, because no token gate can see it.
+head's top-K. **A safetensors checkpoint that declares `DFlash2DraftModel` now
+drafts end to end**: it loads, runs the convolution around every attention and
+MLP sublayer, scores the selector's transition lattice, and walks that lattice
+from the verified anchor to produce the block's tokens. Use it exactly as a
+DFlash1 draft:
+
+```bash
+server --model /models/Qwen3.8-27B \
+  --speculative-config '{"method":"dflash","model":"<dflash2-draft-path>","num_speculative_tokens":7}'
+```
+
+Startup prints a notice naming what runs and what is still owed. The engine
+never substitutes the DFlash1 per-slot argmax for a DFlash2 block: that would
+emit valid target tokens while silently reducing draft acceptance, which is the
+failure this lane is built to avoid because no token gate can see it. If the
+walk cannot run, the draft is refused by name instead.
+
+Two limits are worth knowing before you use it. **Draft sampling is greedy
+only** -- `draft_sample_method: "probabilistic"` is refused by name here, as it
+is for every method, so DFlash2's noised walk and its cached proposal
+distribution are not built. And **no DFlash2 throughput number has been taken
+yet**: correctness comes first on this lane, and a DFlash2 draft additionally
+runs its block forward off the paged CUDA-graph fast path, because the candidate
+selector needs the hidden states of the same forward its logits came from.
 
 A GGUF DFlash2 checkpoint still refuses at startup because its weight path is
 not implemented. It is identified from DFlash2-specific metadata rather than
 from an architecture string, because a GGUF declares none and the published
 DFlash2 GGUF writes `general.architecture = dflash`, the same value a DFlash1
 drafter writes. Ordinary DFlash1 GGUF drafts are unchanged. No DFlash2 speed
-result is admissible until the path walk is implemented and its acceptance gate
-passes ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
+result is admissible until its acceptance gate passes
+([#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
 
 **The exact checkpoints this was built and gated against.** Every sha256 below
 was computed locally from the downloaded artifact. The HuggingFace tree API
@@ -138,7 +155,7 @@ evidence here.
 
 | Arm | Repo and revision | File | Bytes | sha256 |
 |---|---|---|---|---|
-| Draft, bf16 safetensors — ADMITTED to the candidate selector | `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `model.safetensors` | 3 848 817 896 | `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
+| Draft, bf16 safetensors — DRAFTS | `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `model.safetensors` | 3 848 817 896 | `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
 | Draft, GGUF — REFUSED at startup | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
 | Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
 | Draft, GGUF — REFUSED at startup | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |

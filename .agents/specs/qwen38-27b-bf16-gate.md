@@ -159,11 +159,96 @@ userspace sampler dies with the kernel. Neither half creates a denominator.
 Detail, trajectory and arithmetic in
 [`../benchmark-record.md`](../benchmark-record.md).
 
-**What advances this row next** is a c1 pairing taken in a window the clock gate
-will accept, which needs either clock pinning (unavailable in a lease, below) or
-a thermally quiet window, and a c8 denominator taken somewhere with more than
-6-7 GB of headroom at the recorded configuration. Neither is reachable from
-`dgx:gpu0` today.
+**What advances this row next is NOT a quieter box.** The 2026-08-20 re-measure
+was planned and DID NOT RUN, and the reason it did not run is recorded here
+rather than dropped: `dgx:gpu0` was held by other sessions for the whole window.
+`rc devices` read `busy` throughout, first `claude/dflash2-cuda-gate-w4r` and
+then `claude/mudler-ubuntu-box/fullmodel-guided-r12` at `BUDGET_S=14400`, with a
+job queued behind it. No lease was taken, no leg was measured, and no number
+below moves. What the window produced instead is the CAUSE of the c1 refusal,
+read out of the artifacts that already existed at
+`/mnt/nas_share/rc/q38bf16/out/`.
+
+**The SM-clock excursion that fails the clock gate is generated ONCE PER REQUEST
+by the measured workload.** It is not thermal weather, not heat soak and not
+contention, and this is established from TIMING alone, which is why it needs
+neither the die reading [#1386](https://github.com/mudler/vllm.cpp/issues/1386)
+asks for nor a fresh lease.
+
+- **The excursions land on the request train.** Across the three vLLM c1 legs,
+  all 12 flagged samples sit within **0.07 to 0.35 s** of a request start under
+  one constant per-leg offset, and the three offsets agree to 0.1 s
+  (15.60 / 15.59 / 15.69 s). Our three legs align the same way at a constant
+  **1.27 to 1.73 s** lag (offsets 21.94 / 19.81 / 19.82 s), so the phase differs
+  between the arms and the LOCK does not.
+- **The period is each arm's own per-request wall time, not a fixed interval.**
+  Seven of our ten gaps cluster in **28.39-28.67 s**, against
+  `128 / 4.4040 tok/s = 29.06 s` predicted from our own published c1 throughput;
+  all five of vLLM's span **29.61-29.67 s** against
+  `128 / 4.2835 tok/s = 29.88 s`. The two arms differ in the same direction and
+  by about the same proportion as their throughputs, which a free-running
+  hardware cycle would not do. Our remaining three gaps are the irregular ones
+  in the next bullet.
+- **The train reproduces an IRREGULARITY, not merely a period.** Our request
+  train carries one odd gap, request 3 to request 4, at 31.63 / 31.71 / 31.66 s
+  against 28.4-28.6 s everywhere else, because request index 2 carries the ~4 s
+  TTFT outlier of
+  [#1365](https://github.com/mudler/vllm.cpp/issues/1365). The excursion train
+  carries the same odd gap in the same three legs, at **31.77 / 31.79 / 31.82 s**.
+  A coincidence can match a period. It does not match a defect.
+- **c8 says the same thing at wave granularity.** Its 48 requests start in eight
+  waves (0, 33.9, 68.3, 102.8, 136.6, 170.3, 204.0, 237.7 s) in rep 1, where each
+  of the seven bursts that has a successor ends **2.2 to 5.3 s** before the next
+  wave starts. The burst also WIDENS with the batch rather than with elapsed
+  time: all **26** c1 bursts across the six c1 legs are exactly one sample wide,
+  while rep 1 of c8 runs 1, 4, 4, 3, 3, 4, 5, 2.
+- **No true gap is longer than one period.** Over the nine windows the 40
+  inter-burst gaps are 35 in 28.4-35.5 s plus five at 59.3 / 60.3 / 60.4 / 85.5 /
+  90.1 s, which are 2x and 3x the base period: excursions the 1.10 s sampler
+  stepped over, not quiet stretches.
+
+**Three consequences, and the first one closes a route this section used to
+name.** *Waiting for a thermally quiet window is not a route on any box*, because
+the cause is the work being measured and it will recur on an idle, cold machine.
+*The gate's observation floor and its spread rule are mutually exclusive on this
+workload*: `MIN_BUSY_SAMPLES = 30` at the measured 1.10 s cadence is ~33.0 s of
+observed busy GPU, and the excursion period is 28.4-35.5 s with a 33.2 s median,
+so the shortest admissible window is already about one period long and the real
+194 s leg spans six. *Pinning is the route with a precedent, and the
+reading of that precedent is INFERRED rather than measured here.* The one
+c1-class cell that ever passed, c4, was taken at a pinned FLAT 2184 MHz, below
+the 2489 MHz median this decode runs at. A cap under the governor's trip point
+would leave no headroom for the excursion, which would explain "flat" as a
+consequence of the pin rather than as luck — but that campaign's clock samples
+were not re-read here, so the explanation is a hypothesis and the only OBSERVED
+part is that the passing cell was pinned and the refused ones were not.
+
+**Stated at its own scope.** The excursion's proximate MECHANISM is not
+instrumented here. The prefill is the obvious candidate, being the one dense
+compute burst at the head of each request, but the sampler records no per-phase
+marker and this evidence establishes request-locking rather than prefill
+specifically. The excursions are also common-mode: both arms show them, both
+arms' medians are identical at 2489 MHz, and `median_offset_pct` is **0.0**. What
+refuses the pairing is the WITHIN-RUN spread rule, whose own comment in
+`tools/bench/gpu_clock_state.py` says its job is "to detect that a window was not
+ONE state at all". On this workload the window is honestly not one state, and the
+two states are prefill and decode.
+
+**The clock-gate repair is SPEC ONLY and has not landed in code.**
+`96ed8346f` changed exactly two files, `.agents/issue-index.md` and
+`.agents/specs/lease-clock-pinning.md`. `tools/bench/gpu_clock_state.py` still
+carries its single commit `51ec6bed5`, still sets `MAX_WITHIN_RUN_SPREAD_PCT =
+5.0` and has no drift term. Verified at two `main` tips half an hour apart,
+`a50c57d69` and `141402e6c`, which carry the same blob `c88ca348` — a moving ref
+is not a pin, so both SHAs are named. Re-running `compare` on the three archived c1 pairings at that tool
+returns **real exit code 1** on each, unpiped, naming both the spread rule and
+the throttle rule on both arms. So nothing about the recorded `DISCARD` has
+changed, and the spec that landed says so itself in its own opening.
+
+**Still true, and unchanged by any of the above.** The c8 vLLM denominator does
+not exist at the recorded configuration, and it must not be attempted on this
+box: that leg rebooted the host on 2026-08-19, `boot_id` changed, and a userspace
+sampler dies with the kernel so no watchdog at any floor guards it.
 
 ## Outcome
 
@@ -404,6 +489,39 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   clock gate and the c8 denominator does not exist, so the row's own question —
   what our speed is against vLLM's production configuration at c1 and c8 — is
   still unanswered.
+- **The c1 ratio now needs an INSTRUMENT decision, not another lease.** `## Now`
+  establishes that the excursion refusing the pairing is generated once per
+  request by the measured workload, so re-running the campaign reproduces it on
+  any box and at any temperature. Two routes exist and this row picks neither,
+  because both are somebody else's row. **Pin the clock**, which needs the host
+  path and is what [#1354](https://github.com/mudler/vllm.cpp/issues/1354) owns;
+  on the hypothesis in `## Now`, a cap below the 2489 MHz decode
+  median would remove the headroom the excursion needs, which would explain the
+  flat c4 window; re-reading that campaign's clock samples would confirm it. Or **scope the within-run
+  spread rule to the state it claims to police**, since its own comment says its
+  job is to detect that a window was not one state, and prefill against decode is
+  two states the benchmark exists to measure. That second route changes gate
+  semantics, so it owes its own row, spec, red-before mutation and green-after
+  evidence, and it must never be reached by widening the ceiling until the
+  recorded windows pass.
+- **A finding this row produced for a NEIGHBOURING issue, owed to its owner
+  rather than acted on here.**
+  [#1386](https://github.com/mudler/vllm.cpp/issues/1386) says the nine windows
+  "cannot distinguish a load transition from a thermal excursion" and proposes
+  adding `temperature.gpu` and `power.draw` to `QUERY_FIELDS` to settle it. The
+  alignment in `## Now` settles it from timing alone, and it settles it as a
+  **load transition**: the excursions are locked to the request train on both
+  arms, their period is each arm's own per-request wall time, and they reproduce
+  the irregular gap that #1365's TTFT outlier injects. The two proposed fields
+  stay worth having, and they are no longer what decides this question. This row
+  files nothing and edits nothing under #1386; relaying it is owed.
+- **The campaign `NOTES.txt` on the share names a superseded binary.** Its `PINS`
+  block records `ab0b9a1e...` as the measured binary, which was the
+  2026-08-18 build. The tree that produced every 2026-08-19 leg is
+  `7d0c3caf...`, which `out/RESULT.txt` records beside `BUILD_RC=0` and
+  `WANT_SHA=1dac4f9a70195b282d16c536f319e8b171c925f8`, and which re-hashes to
+  that value on the share today. The share is not a tracked surface, so the
+  correction is recorded here rather than applied there.
 - **The boot TIME, which is derived and one-sided.** The 2026-08-19 HOST reboot
   is OBSERVED from `boot_id` and owes nothing to this item. Only the derived
   bound — at or before 10:41:47.6Z — depends on the `dgx:gpu0` `rc` worker not

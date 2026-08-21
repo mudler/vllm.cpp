@@ -393,6 +393,35 @@ class SupportSurfaces(unittest.TestCase):
     def test_a_landing_source_permits_but_does_not_demand_readme(self):
         self.assertEqual(self.errors([".agents/mission.md"]), [])
 
+    def test_the_quickstart_page_is_a_landing_source(self):
+        """#1520: the page the README now defers to for starting a model.
+
+        The README `## Quickstart` block used to carry the commands. It now
+        points at `docs/QUICKSTART.md`, so the claim "this is where a reader
+        starts" changed BECAUSE that page exists. The page is not a projection
+        of a claim recorded elsewhere, so a change to it is a real reason for
+        the README pointer at it to change.
+        """
+        self.assertEqual(self.errors(["README.md", "docs/QUICKSTART.md"]), [])
+
+    def test_the_quickstart_page_permits_but_does_not_demand_readme(self):
+        """`landing_page` never demands the README, and #1520 does not add one."""
+        self.assertEqual(self.errors(["docs/QUICKSTART.md"]), [])
+
+    def test_an_unrelated_document_never_licenses_readme_churn(self):
+        """The property #1520 must not break, stated on a NON-projection doc.
+
+        `test_a_coedited_projection_never_licenses_readme_churn` covers a public
+        projection. This covers an ordinary document under `docs/`, which is the
+        class the quickstart page belongs to by path. Exactly one member of that
+        class is a landing source, and admitting it must not admit the class.
+        """
+        for document in ("docs/BUILD.md", "docs/ROCM.md", "docs/RELEASES.md"):
+            with self.subTest(document=document):
+                errors = self.errors(["README.md", document])
+                self.assertTrue(errors)
+                self.assertIn("landing source", errors[0])
+
 
 
 

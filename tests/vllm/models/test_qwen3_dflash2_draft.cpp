@@ -409,7 +409,7 @@ TEST_CASE("dflash draft config: the DFlash1 flat spellings are UNCHANGED") {
 //         -> the layer body -> DflashConvPrepare / DflashConvFinish
 //                           -> vt::DFlashGroupedConv
 //       -> vllm::v1::Dflash2SelectCandidates (W3)
-//       -> vllm::v1::RefuseDflash2PathWalk  (W4's boundary, by name)
+//       -> vllm::v1::Dflash2WalkPath -> vt::Dflash2PathWalk (W4) -> the drafts
 //
 // The cases below enter at `vllm::LoadQwen3DFlash` over a real safetensors file
 // -- the same function the loader calls, on the same tensor names the published
@@ -848,89 +848,6 @@ TEST_CASE("dflash2 forward: a ragged query block is REFUSED rather than mis-mask
                        doctest::Contains("conv_block_size"), std::exception);
 }
 
-TEST_CASE("dflash2 propose: the conv and the SELECTOR run, THEN the walk refuses") {
-  // The ORDER is the claim. `DflashProposeBlock` runs the draft block forward --
-  // grouped convolution and all -- and then `Dflash2SelectCandidates`, BEFORE
-  // anything samples. So a DFlash2 draft reaching here has already executed
-  // every line of W2 and W3, and what it is refused for is the path walk alone.
-  //
-  // Refusing before the forward would satisfy a "DFlash2 is refused" assertion
-  // while leaving the whole convolution unreachable from any production entry
-  // point, which is what .agents/reachability.md calls the test-only driver.
-  // Deleting the `Dflash2SelectCandidates` call inside `DflashProposeBlock` (and
-  // passing a default-constructed state, which compiles) turns this case red, and
-  // so does deleting the `RefuseDflash2PathWalk` call beside it.
-  //
-  // WHAT THIS CASE DOES AND DOES NOT PROVE, stated precisely because W2's first
-  // review found the equivalent claim overstated.
-  //
-  // It DOES prove that the selector runs before the refusal, and it proves it
-  // with the selector's own output rather than with the refusal's existence:
-  // the counts asserted below are the lattice the selector produced.
-  //
-  // It does NOT prove that the RUNNER's call site is entered. W3 collapses W2's
-  // two copies of the post-forward step into ONE function
-  // (`Dflash2SelectCandidates`), so the code this case drives IS the code
-  // `GPUModelRunner::propose_drafts_block` runs, and `DflashProposeBlock` still
-  // has no caller outside `tests/`. What proves the runner's own hop is a
-  // DIFFERENT file, in this same wave:
-  // `tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` drives a real
-  // `LoadedEngine` over a synthetic Qwen3.5-dense target and an in-memory
-  // DFlash2 draft and reads the walk refusal's own counts.
-  //
-  // An earlier revision of this comment said entering the runner's site "needs a
-  // populated `exec_state_.spec_aux` from a verify forward, which only a
-  // loader-built engine produces. That harness is W4's." That was the W2 reason
-  // `## Owed` O7 records as WRONG, and W3 falsified it in the same commit that
-  // left this sentence standing: the harness needed a fifteen-line in-memory
-  // `LoadedEngine` overload, not a loader-built engine, and it exists now.
-  Dims dm;
-  dm.conv_taps = 2;
-  dm.attn_conv_active = true;
-  dm.mlp_conv_active = true;
-  const ScratchCkpt ck(DraftEntries(dm));
-  const HfConfig c = DraftConfig(dm);
-  const Qwen3DFlashWeights w = LoadDraft(ck, dm, c);
-  REQUIRE(w.IsDflash2());
-
-  const int64_t T = dm.block;  // one request, one (1+k) query block
-  std::vector<int32_t> ids(static_cast<size_t>(T)), pos(static_cast<size_t>(T));
-  for (int64_t i = 0; i < T; ++i) {
-    ids[static_cast<size_t>(i)] = static_cast<int32_t>(i % c.vocab_size);
-    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
-  }
-  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
-  const std::vector<int32_t> ctx_cu = {0, 0};
-  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-  std::string what;
-  try {
-    (void)vllm::v1::DflashProposeBlock(w, c, {}, {}, ctx_cu, ids, pos, cu,
-                                       /*num_reqs=*/1, /*k=*/static_cast<int>(T - 1), q);
-    FAIL("expected the candidate-selector refusal");
-  } catch (const std::exception& e) {
-    what = e.what();
-  }
-  INFO("what: ", what);
-  // SPEC-DFLASH2 W3 (#1314): the boundary MOVED. The selector is now on the
-  // implemented side of the refusal, and the walk is what is missing.
-  CHECK(what.find("PATH WALK") != std::string::npos);
-  CHECK(what.find("CANDIDATE SELECTOR are") != std::string::npos);
-  CHECK(what.find("implemented and just ran") != std::string::npos);
-  CHECK(what.find("#1314") != std::string::npos);
-  // THE REACHABILITY ASSERTION, and the reason the refusal takes the scored
-  // lattice at all. These counts come from the selector's ACTUAL output on this
-  // block -- one request, k = block-1 = 7 steps, selector_top_k = 3, so
-  // 1*7*3*3 = 63 scored transitions. Delete the `Dflash2SelectCandidates` call
-  // in `DflashProposeBlock` and pass a default-constructed state (which
-  // compiles) and every one of these reads zero. A refusal that took no
-  // argument would fire identically whether the selector ran or not, which is
-  // exactly the shape spec `## Owed` O7 records for W2's refusal.
-  CHECK(what.find("scored-transitions=63") != std::string::npos);
-  CHECK(what.find("requests=1") != std::string::npos);
-  CHECK(what.find("steps=7") != std::string::npos);
-  CHECK(what.find("top_k=3") != std::string::npos);
-}
-
 TEST_CASE("dflash1 propose: a DFlash1 draft still proposes through the same entry") {
   // The instrument's precondition again: the refusal above must be about DFlash2
   // and not about `DflashProposeBlock`. The same call on a DFlash1 draft returns
@@ -1061,7 +978,7 @@ TEST_CASE("dflash2 forward: EACH conv reaches EACH layer body separately") {
 //            -> Qwen3DFlash2Model::ComputeCandidates  -> vt::TopKValuesIndices
 //            -> Qwen3DFlash2Model::SelectorEdgeScores -> vt::MatmulBT,
 //                                                        vt::Dflash2SelectorEdges
-//       -> vllm::v1::RefuseDflash2PathWalk       (W4's boundary, by name)
+//       -> vllm::v1::Dflash2WalkPath              (W4, and it IS the draft)
 //
 // The cases below enter at `vllm::LoadQwen3DFlash` over a real safetensors file
 // and at `Dflash2SelectCandidates`, which is the SAME function the runner calls
@@ -1084,6 +1001,15 @@ Dims Dflash2Dims(bool muse_glimmer_scalars) {
   return dm;
 }
 
+std::string VecStr(const std::vector<int32_t>& v) {
+  std::string out;
+  for (int32_t x : v) {
+    out += std::to_string(x);
+    out += ' ';
+  }
+  return out;
+}
+
 // A deterministic synthetic block, so the selector's inputs are chosen by this
 // file rather than by whatever the forward happens to produce. `[P*(1+k), W]`.
 std::vector<float> Ramp(int64_t rows, int64_t width, double seed) {
@@ -1095,6 +1021,214 @@ std::vector<float> Ramp(int64_t rows, int64_t width, double seed) {
 }
 
 }  // namespace
+
+TEST_CASE("dflash2 weights: the loader does NOT seed conv_block_size from the checkpoint") {
+  // SPEC-DFLASH2 W4 (#1314), spec `## Owed` O5 item 1. Through W3
+  // `LoadQwen3DFlash` copied `dflash_config.block_size` into `conv_block_size`
+  // so a direct caller had "a usable value". That is what made
+  // `LoadDflashDraft`'s own `draft->weights.conv_block_size = draft->k + 1;`
+  // ungateable: deleting it left the checkpoint's PLAUSIBLE default behind, the
+  // conv masked its taps against the wrong block, and the symptom is
+  // acceptance-only and token-invisible -- W2 measured every suite staying green
+  // under exactly that mutation.
+  //
+  // The seed is gone. A DFlash2 draft loaded and forwarded WITHOUT the resolved
+  // `k` now refuses BY NAME instead of running against the wrong block, so the
+  // silent-wrong has no shape left rather than a gate that has to reach an
+  // anonymous-namespace function. This case pins that polarity in both
+  // directions: unset refuses, set runs.
+  const Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  const ScratchCkpt ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(ck.shard()));
+  Qwen3DFlashWeights raw = vllm::LoadQwen3DFlash(shards, c, dm.taps_fc,
+                                                 /*mask_token_id=*/7);
+  REQUIRE(raw.IsDflash2());
+  // The precondition that makes this case non-vacuous: the checkpoint DOES carry
+  // a block_size, and it is a value the conv could plausibly have used.
+  REQUIRE(c.raw.contains("block_size"));
+  CHECK(c.raw.at("block_size").get<int64_t>() == dm.block);
+  CHECK(raw.conv_block_size == 0);
+
+  const int64_t T = dm.block;
+  std::vector<int32_t> ids(static_cast<size_t>(T)), pos(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) {
+    ids[static_cast<size_t>(i)] = static_cast<int32_t>(i % c.vocab_size);
+    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  CHECK_THROWS_WITH_AS(Qwen3DFlashModel::ForwardBlockLogits(ids, pos, cu, raw, c, q),
+                       doctest::Contains("conv_block_size"), std::exception);
+  // And with the resolved block -- what `LoadDflashDraft` writes -- it runs.
+  raw.conv_block_size = dm.block;
+  CHECK_NOTHROW(
+      (void)Qwen3DFlashModel::ForwardBlockLogits(ids, pos, cu, raw, c, q));
+  // A DFlash1 draft is untouched: it has no conv, so the field is meaningless
+  // and the forward never reads it.
+  const Dims one;  // conv_taps 0
+  const ScratchCkpt ck1(DraftEntries(one));
+  const HfConfig c1 = DraftConfig(one);
+  std::vector<vllm::SafetensorsFile> shards1;
+  shards1.push_back(vllm::SafetensorsFile::Open(ck1.shard()));
+  const Qwen3DFlashWeights w1 = vllm::LoadQwen3DFlash(shards1, c1, one.taps_fc,
+                                                      /*mask_token_id=*/7);
+  REQUIRE_FALSE(w1.IsDflash2());
+  CHECK(w1.conv_block_size == 0);
+  CHECK_NOTHROW(
+      (void)Qwen3DFlashModel::ForwardBlockLogits(ids, pos, cu, w1, c1, q));
+}
+
+TEST_CASE("dflash2 propose: the conv, the SELECTOR and the WALK all run, and it DRAFTS") {
+  // The ORDER is the claim, and as of W4 the END of it is a draft rather than a
+  // refusal. `DflashProposeBlock` runs the draft block forward -- grouped
+  // convolution and all -- then `Dflash2SelectCandidates`, then
+  // `Dflash2WalkPath`, whose output IS the returned draft. A DFlash2 draft
+  // reaching here executes every line of W2, W3 and W4.
+  //
+  // WHY "IT RETURNED TOKENS" IS NOT THE ASSERTION. Deleting the DFlash2 branch
+  // entirely also returns tokens -- the DFlash1 per-slot argmax over the block
+  // logits -- and they are well-formed, the verify is lossless, and only
+  // acceptance falls. That is the whole reason W1, W2 and W3 refused rather than
+  // fell back. So this case asserts two things an argmax fallback cannot do:
+  //
+  //   1. every drafted id is one of the SELECTOR's own candidates for its step.
+  //      The candidate set is `selector_top_k` = 3 wide over a vocabulary of 8,
+  //      so a full-vocab argmax lands outside it most of the time. (This is a
+  //      consistency check against the selector, and its value is exactly that
+  //      discrimination, not correctness of the selector itself -- which
+  //      test_ops_dflash2_selector_edges.cpp and the D9 cases below carry.)
+  //   2. the drafts MOVE when D9's output scalars move. Those scalars touch the
+  //      candidate VALUES and nothing else in the engine, so the block forward,
+  //      the convolution and the block logits are identical between the two arms
+  //      and the DFlash1 argmax would answer identically for both.
+  //
+  // And structurally: the argmax arm is entered on EMPTINESS and guarded by
+  // `RefuseDflash1ArgmaxOnDflash2Block`, so deleting the walk's call site throws
+  // by name instead of drafting quietly.
+  const Dims plain = Dflash2Dims(false);
+  const Dims muse = Dflash2Dims(true);
+  const ScratchCkpt ckp(DraftEntries(plain));
+  const ScratchCkpt ckm(DraftEntries(muse));
+  const HfConfig cp = DraftConfig(plain);
+  const HfConfig cm = DraftConfig(muse);
+  const Qwen3DFlashWeights wp = LoadDraft(ckp, plain, cp);
+  const Qwen3DFlashWeights wm = LoadDraft(ckm, muse, cm);
+  REQUIRE(wp.IsDflash2());
+  REQUIRE(wm.IsDflash2());
+
+  const int64_t T = plain.block;  // one request, one (1+k) query block
+  const int k = static_cast<int>(T - 1);
+  std::vector<int32_t> ids(static_cast<size_t>(T)), pos(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) {
+    ids[static_cast<size_t>(i)] = static_cast<int32_t>(i % cp.vocab_size);
+    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  const std::vector<int32_t> cu = {0, static_cast<int32_t>(T)};
+  const std::vector<int32_t> ctx_cu = {0, 0};
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  const vllm::v1::DflashProposeResult got =
+      vllm::v1::DflashProposeBlock(wp, cp, {}, {}, ctx_cu, ids, pos, cu,
+                                   /*num_reqs=*/1, k, q);
+  REQUIRE(got.draft_token_ids.size() == 1);
+  REQUIRE(got.draft_token_ids[0].size() == static_cast<size_t>(k));
+  for (int32_t id : got.draft_token_ids[0]) {
+    CHECK(id >= 0);
+    CHECK(id < static_cast<int32_t>(cp.vocab_size));
+  }
+
+  // (1) MEMBERSHIP in the selector's candidate set, step by step. The block
+  // logits and hidden come from the SAME forward the propose ran, so the
+  // candidate set below is the one the walk chose from.
+  std::vector<float> block_hidden;
+  const std::vector<float> block_logits = Qwen3DFlashModel::ForwardBlockLogits(
+      ids, pos, cu, wp, cp, q, nullptr, &block_hidden);
+  const std::vector<int32_t> anchors = {ids[0]};
+  const vllm::v1::Dflash2ProposeState sel = vllm::v1::Dflash2SelectCandidates(
+      block_logits, block_hidden, anchors, /*num_reqs=*/1, k, wp, cp, q);
+  REQUIRE(sel.top_k == 3);
+  int outside_top_k_ids = 0;
+  for (int step = 0; step < k; ++step) {
+    bool member = false;
+    for (int64_t c = 0; c < sel.top_k; ++c) {
+      if (sel.candidates.ids[static_cast<size_t>(step * sel.top_k + c)] ==
+          got.draft_token_ids[0][static_cast<size_t>(step)])
+        member = true;
+    }
+    INFO("step ", step, " drafted ", got.draft_token_ids[0][static_cast<size_t>(step)]);
+    CHECK(member);
+    // The instrument's precondition: the candidate set must be a PROPER subset
+    // of the vocabulary, or "member" is satisfied by everything.
+    CHECK(sel.top_k < cp.vocab_size);
+    if (got.draft_token_ids[0][static_cast<size_t>(step)] >= sel.top_k)
+      ++outside_top_k_ids;
+  }
+  // ...and the ids are not the identity permutation of the slots, so membership
+  // is a statement about token ids rather than about small integers.
+  INFO("drafted ids at or above top_k: ", outside_top_k_ids, " of ", k);
+  CHECK(outside_top_k_ids > 0);
+
+  // (2) THE DRAFT IS NOT THE DFlash1 ARGMAX'S DRAFT, over the SAME block logits.
+  // This is the discriminator the whole case exists for, and it is direct: the
+  // fallback the guard protects against is exactly this function, on exactly
+  // this input, and its answer is computed here rather than argued about.
+  const std::vector<std::vector<int32_t>> argmax_drafts =
+      vllm::v1::SampleDflashBlockDrafts(block_logits, /*num_reqs=*/1, k,
+                                        wp.draft_vocab_size);
+  REQUIRE(argmax_drafts.size() == 1);
+  int argmax_agreements = 0;
+  for (int step = 0; step < k; ++step)
+    if (argmax_drafts[0][static_cast<size_t>(step)] ==
+        got.draft_token_ids[0][static_cast<size_t>(step)])
+      ++argmax_agreements;
+  // MEASURED on 2026-08-20 at this fixture: walk `3 2 3 7 7 7 7` against argmax
+  // `2 2 2 7 7 7 7` -- 5 of the 7 slots agree, 2 do not. The margin is logged
+  // rather than assumed, because a fixture whose two answers coincided would
+  // make this assertion pass for the wrong reason and look identical from here.
+  INFO("walk ", VecStr(got.draft_token_ids[0]), " argmax ",
+       VecStr(argmax_drafts[0]), " agreeing slots ", argmax_agreements, " of ", k);
+  CHECK(argmax_drafts[0] != got.draft_token_ids[0]);
+
+  // (3) The scalars are wired into this entry too. D9's own gate below measures
+  // how often they flip the lattice's ORDER (8 of 45 predecessor slots over a
+  // sweep of blocks); the walk visits only `k` of those slots per block, so
+  // whether a given block's DRAFT moves is a property of the block. Asserted as
+  // a MEASURED sweep with the count logged rather than as a single block that
+  // might coincide.
+  int blocks_whose_draft_moved = 0, blocks_run = 0;
+  for (int shift = 0; shift < 6; ++shift) {
+    std::vector<int32_t> sids(static_cast<size_t>(T));
+    for (int64_t i = 0; i < T; ++i)
+      sids[static_cast<size_t>(i)] =
+          static_cast<int32_t>((i * 3 + shift) % cp.vocab_size);
+    const vllm::v1::DflashProposeResult a = vllm::v1::DflashProposeBlock(
+        wp, cp, {}, {}, ctx_cu, sids, pos, cu, /*num_reqs=*/1, k, q);
+    const vllm::v1::DflashProposeResult bmuse = vllm::v1::DflashProposeBlock(
+        wm, cm, {}, {}, ctx_cu, sids, pos, cu, /*num_reqs=*/1, k, q);
+    ++blocks_run;
+    if (a.draft_token_ids[0] != bmuse.draft_token_ids[0]) ++blocks_whose_draft_moved;
+    // The instrument's own precondition, per block: the same arm against itself
+    // must never differ, or the counter above measures nondeterminism.
+    const vllm::v1::DflashProposeResult again = vllm::v1::DflashProposeBlock(
+        wp, cp, {}, {}, ctx_cu, sids, pos, cu, /*num_reqs=*/1, k, q);
+    CHECK(again.draft_token_ids[0] == a.draft_token_ids[0]);
+  }
+  // MEASURED on 2026-08-20 at this fixture: 5 of 6 blocks moved.
+  INFO("blocks whose draft moved with the scalars: ", blocks_whose_draft_moved,
+       " of ", blocks_run);
+  CHECK(blocks_whose_draft_moved > 0);
+  // The precondition for THAT comparison: the block LOGITS are identical between
+  // the two arms, so any difference cannot come from the forward. The scalars
+  // live only in the config's `dflash_config`; the weight fixtures are generated
+  // from the same seeds.
+  std::vector<float> muse_hidden;
+  const std::vector<float> muse_logits = Qwen3DFlashModel::ForwardBlockLogits(
+      ids, pos, cu, wm, cm, q, nullptr, &muse_hidden);
+  CHECK(muse_logits == block_logits);
+  CHECK(muse_hidden == block_hidden);
+}
 
 TEST_CASE("dflash2 weights: the production loader reads the SELECTOR off a real shard") {
   const Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);

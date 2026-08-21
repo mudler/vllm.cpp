@@ -2655,6 +2655,25 @@ target_compile_definitions(test_qwen38_27b_nvfp4_arm PRIVATE
 target_include_directories(test_qwen38_27b_nvfp4_arm PRIVATE
   ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
+# QUANT-QWEN38-27B-NVFP4-ARM W5 (#821, #1574,
+# .agents/specs/qwen38-27b-quant-arms.md): the ModelOpt `MIXED_PRECISION`
+# accounting + config/tensor cross-check for
+# `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`. A SECOND artifact of the same model,
+# and a second file rather than a widening of the gate above: that one pins the
+# 1968-name compressed-tensors set and this one pins a 2001-name ModelOpt set,
+# and a gate that accepted both by loosening would measure neither. Hermetic —
+# it reads the four COMMITTED manifests and the two COMMITTED config documents,
+# never a weight byte; the live re-verification arm is env-gated on
+# VLLM_CPP_QWEN38_27B_MODELOPT_MTP_DIR and SKIPS loudly without it. `src` is on
+# the include path because the resolver under test is a model-private header
+# under src/, not an include/vllm/ surface.
+vllm_cpp_add_test(test_qwen38_27b_modelopt_mtp_arm
+  vllm/models/test_qwen38_27b_modelopt_mtp_arm.cpp)
+target_compile_definitions(test_qwen38_27b_modelopt_mtp_arm PRIVATE
+  QWEN38_27B_MODELOPT_MTP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_modelopt_mtp")
+target_include_directories(test_qwen38_27b_modelopt_mtp_arm PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine
   vllm/models/test_qwen3_32b_nvfp4a16_paged_engine.cpp)
 target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE

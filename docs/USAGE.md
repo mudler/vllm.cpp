@@ -170,6 +170,9 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, mixture-of-experts models run the shared-expert gate and both
+  expert-combine steps on device. Before these ops were registered the
+  engine refused with `no kernel for op` on that path.
 - On ROCm, decode-shaped GEMMs (batch of 4 or fewer, bf16) run on a split-K
   skinny-GEMM kernel rather than the tiled BLAS path. Set `VT_ROCM_SKINNY=0`
   to restore the BLAS path when you want to compare the two.

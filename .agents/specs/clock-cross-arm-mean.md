@@ -413,11 +413,13 @@ term nobody reads.
 - `PYTHONPATH=<root> python3 -m unittest discover -s tests/tools -p "test_*.py"`
   green, unpiped. The baseline is **330** cases at
   `e2a9e035dbf8662f4bd87fc21a768d184f547c73`, of which **63** are
-  `test_gpu_clock_state`. Report the before and after counts explicitly, and
-  report which existing cases changed meaning. This row expects **no** existing
-  case to be rewritten: every fixture is built through `build_clock_record` and
-  every threshold fixture is flat, where the new term is identically the old one.
-  A rewritten case here would mean the change is not additive after all.
+  `test_gpu_clock_state`. **Measured: 330 -> 341**, unpiped exit 0, being +10 in
+  `test_gpu_clock_state` and +1 in `test_online_gate_summary`, with **no existing
+  case rewritten and none removed** — which is the prediction this row made and
+  the executable half of "additive": every fixture is built through
+  `build_clock_record`, and every pre-existing threshold fixture is flat, where
+  the new term is identically the old one. A rewritten case here would have meant
+  the change is not additive after all.
 - The record checkers, each run unpiped with its real exit code read:
   `check-agent-record.py`, `check-issue-index-append-only.py`,
   `check-doc-checkpoint.py`, `check-now-current.py`, `check-commit-style.py`,
@@ -479,6 +481,44 @@ Sub-window figures in §Interaction: over every 30-sample sliding window of the
 nine legs, per-window mean cost spans -0.0696% to +0.8960% (ours c1 r1),
 +0.0335% to +1.3566% (ours c1 r2), -0.3482% to +0.7567% (ours c1 r3), +0.4480% to
 +1.4288% (the c8 legs) and -0.2799% to +0.7475% (the vLLM legs).
+
+**The superset check of §Tests case 9, measured.** The pre-change module was
+extracted with `git show e2a9e035dbf8662f4bd87fc21a768d184f547c73:tools/bench/gpu_clock_state.py`
+and verified byte-identical to the base file by sha256
+(`c6f44407a12d6a3231dc295147304b3011427c1f4de084b76ed9e390c84dbf8d`). A corpus of
+**36 records** — the nine real windows rebuilt from their raw samples, the six
+archived on-disk records as they sit on the NAS, the two folded arms, and
+nineteen synthetic windows covering the four design cases, the existing fixtures,
+a cross-boot record, an H100 record, a throttled record, a diluted record, a
+sub-floor record, a malformed record and a record with the mean removed — was
+compared as **2592 ordered pairings**, both override modes. Result: **0 superset
+violations, 0 pairings whose reason list shrank, 1606 grew, 986 unchanged.**
+
+**What the term reads on the recorded pairings, after the change.** Rebuilt from
+raw samples: `median_offset_pct` +0.0000% and `mean_offset_pct` -0.2521 /
+-0.1530 / +0.1035, each pairing carrying **four** reasons, all four of them the
+pre-existing spread and throttle refusals and **none** of them this term. From
+the archived on-disk records, which carry no mean: **six** reasons, the four
+above plus one per arm naming the missing field. No verdict moves in either
+direction, and the three pairings stay `DISCARD`.
+
+**The mutation set.** Each mutation applied to the committed implementation, with
+`git diff --numstat` printed to prove it applied, the exit code taken unpiped,
+and the tree restored and re-verified against a pre-taken sha256
+(`930f293bd8b5bb2fe06fe02097755c92df716376cc41f02520f5c20928af406e`), which
+is the file at this row's implementation commit:
+
+| mutation | exit | cases turned red |
+|---|---:|---|
+| ceiling 1.0 -> 100.0 | 1 | the asymmetric pairing, the anti-symmetric pairing, the flat-window coincidence, the ceiling equality, and the end-to-end report case |
+| ceiling 1.0 -> 0.0001 | 1 | the compensating pairing, the inclusive boundary, the flat-window coincidence, the ceiling equality |
+| a missing mean becomes a skip | 1 | the missing-mean refusal, both arms |
+| the fold's mean becomes unweighted | 1 | the sample-count-weighted fold |
+| gate the DIFFERENCE OF BURDENS instead of the mean offset | 1 | the anti-symmetric pairing, the asymmetric pairing, the flat-window coincidence, the end-to-end report case |
+
+The last row is the one that matters for §Design: swapping in the statistic
+#1546 quotes turns the anti-symmetric case red, so the choice is load-bearing
+rather than a preference.
 
 The helper at the base SHA carries `MAX_WITHIN_RUN_SPREAD_PCT = 5.0`,
 `MAX_CROSS_ARM_OFFSET_PCT = 1.0`, `MIN_BUSY_SAMPLES = 30`,

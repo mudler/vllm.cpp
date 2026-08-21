@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>Same tokens as vLLM. Same throughput. 140x less to install.</b><br>
-  <sub>Continuous batching, paged KV, 37 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
+  <sub>Continuous batching, paged KV, 40 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
 <p align="center">
@@ -37,6 +37,12 @@
 
 ## News
 
+- **2026-08** **MiniMax-Music3 generates music through the public API.** Every pipeline stage is
+  implemented and gated. The server exposes it through `POST /v1/audio/speech`; no reference speed
+  number is available yet.
+- **2026-08** **LTX-2.5 gains its video and audio pipeline surface.** Text-to-audio, retake,
+  audio-to-video, keyframe interpolation, and one-stage and two-stage video recipes are wired and
+  fixture-gated.
 - **2026-08** **v0.0.2 ships eight server archives.** Download CPU, CUDA, Vulkan, Metal, and MLX
   builds from [GitHub Releases](https://github.com/mudler/vllm.cpp/releases/tag/v0.0.2).
 - **2026-08** **MiniMax-H3 generates video with audio.** All tasks run through `POST /v1/videos`;
@@ -59,8 +65,9 @@ scheduling ideas (RadixAttention, LPM cache-aware admission, jump-forward decodi
 ABI, GGUF straight off the shelf, and compute directly on the quantized blocks). MLX's GEMM where it
 wins on Apple Silicon. Safetensors and GGUF, CUDA and CPU and Metal and Vulkan, from one source tree.
 
-Every architecture is gated **token-for-token against vLLM** on the same workload. Speed claims use
-the reference engine's production configuration.
+Completed architecture gates compare **token output against vLLM** on the same workload. Rows that
+have only a fixture or a blocked gate say so. Speed claims use the reference engine's production
+configuration.
 
 ![vllm.cpp vs vLLM on Qwen3.6-27B: identical output at every concurrency](benchmarks/media/concurrency_race.gif)
 
@@ -77,9 +84,9 @@ Where that stands today:
   ahead at all six concurrencies but only c1 outside our noise band. Also **1.18x llama.cpp's
   prefill** on the same GGUF file (denominator SUPERSEDED, see below), and **ahead of MLX-LM on
   prefill** on Apple Silicon. Most other architectures are speed-pending, and say so.
-- **Everything.** 37 registered architectures, 36 tool-parser families, structured output including
-  GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
-  metrics, and the SGLang knobs, all in a library you can `dlopen`.
+- **Everything.** 40 registered architectures, 38 tool-parser families, structured output including
+  GBNF, three speculative decoders, image, video, and audio input, music generation, external KV
+  offload, Prometheus metrics, and the SGLang knobs, all in a library you can `dlopen`.
 
 ## Performance
 
@@ -205,7 +212,7 @@ you get on top, most of it borrowed from whichever engine does it best:
   sample logprobs.
 - **Structured output.** JSON schema, JSON object, regex, choice, and GBNF grammar, enforced in the
   engine with a per-step logits bitmask.
-- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 12 reasoning
+- **Tool calling and reasoning.** 38 tool-parser families (42 accepted names) and 12 reasoning
   parser names, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
 - **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
@@ -225,10 +232,10 @@ Per-capability lifecycle state, active gaps, and the next gate for each:
 
 ## Supported models
 
-Every architecture below passes a token-for-token correctness gate against the pinned vLLM oracle on
-GB10. Where vLLM's own greedy is deterministic the bar is strict token-exact; where vLLM is
-self-inconsistent at bf16 near-ties, the bar is a near-tie-robust check. "Speed" is a separate bar
-(match or beat vLLM on every axis).
+Each row states its current correctness gate. Most completed gates compare tokens against the pinned
+vLLM oracle on GB10. Where vLLM's greedy output is deterministic, the bar is strict token identity.
+Where bf16 near-ties make vLLM self-inconsistent, the bar uses the ratified near-tie check. "Speed"
+is a separate bar (match or beat vLLM on every axis).
 
 **Gate models:** Qwen3.6-27B and Qwen3.6-35B-A3B (hybrid GDN + MoE, NVFP4), both token-exact, the
 27B at or above vLLM throughput on every axis. **Also running:** Llama-3.x, Mistral, Qwen3/Qwen2
@@ -238,7 +245,7 @@ InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus Qwen3-VL and Qwen3.6-27B vision
 and Voxtral (audio).
 
 <details>
-<summary><b>The full architecture matrix</b> (37 registered architectures grouped by family)</summary>
+<summary><b>The full architecture matrix</b> (40 registered architectures grouped by family)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -254,6 +261,8 @@ and Voxtral (audio).
 | GLM-4.7-Flash (MLA MoE) | zai-org/GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
 | Laguna-S / Laguna-XS 2.1 (MoE) | poolside/Laguna-S-2.1-NVFP4 | NVFP4 + Q4_K | Near-tie (byte-exact) | vLLM parity+ 1.03x by default |
 | Kimi-Linear-48B-A3B (KDA + MLA + MoE) | Kimi-Linear-48B-A3B | - | Near-tie (106/128) | 1.59 tok/s, default off |
+| Nemotron-H hybrid (Mamba2 + GQA + MoE) | Nemotron-3.5-Lightning-30B-A3B-NVFP4 | NVFP4 | Host gate strict 96/96; GB10 rerun pending | Speed-pending |
+| Muse Glimmer text + vision | Muse Glimmer 30B | GGUF text only | Text partial-depth gated; vision ungated | Speed-pending |
 | Gemma-3 / Gemma-2 / Gemma-1 dense | gemma-3-1b-it, gemma-2-2b-it, gemma-2b | - | Token-exact (48/48 each) | Speed-pending |
 | Gemma-4 text (Gemma4ForConditionalGeneration) | unsloth/gemma-4-E4B-it | - | Strict token-exact 32/32 (text path) | Speed-pending |
 | OLMo-2 dense | OLMo-2-0425-1B | - | Token-exact (near-tie-robust) | Speed-pending |
@@ -270,6 +279,8 @@ and Voxtral (audio).
 | Qwen3-VL (image + video) | Qwen3-VL-4B-Instruct | - | Strict token-exact 32/32 (image) | Speed-pending |
 | Qwen3.6-27B vision (image + video) | Qwen3.6-27B | - | Strict token-exact 32/32 | Speed-pending |
 | Voxtral (audio) | Voxtral-Mini-3B-2507 | - | Near-tie-robust (decoder 48/48 exact) | Speed-pending |
+| Pooling / embeddings | synthetic `LlamaModel` fixture | - | Fixture-gated; real checkpoint pending | Not applicable |
+| Parakeet ASR (CTC, RNNT, TDT) | Parakeet 0.6B / 1.1B families | - | Token IDs exact vs HF on retained runs | Speed-pending |
 | **MiniMax-H3 (video + audio GENERATION)** | MiniMaxAI/MiniMax-H3 | Q4_K_M / NVFP4 | Renders 864x480 / 124f with audio | **34.6 s/step, one Jetson Thor** |
 
 **Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3 renders end to
@@ -281,7 +292,7 @@ sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning mod
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
 sliding-window attention are gated feature-positive. The authoritative per-architecture list, bound
-to the C++ registry (all 37 registered architectures with their tested checkpoint and gate, plus the
+to the C++ registry (all 40 registered architectures with their tested checkpoint and gate, plus the
 standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
 [docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
 hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
@@ -374,7 +385,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`, 36 exported functions) suitable for `dlopen` / FFI.
+llama.cpp-style C ABI (`VLLM_ABI_VERSION 21`, 46 exported functions) suitable for `dlopen` / FFI.
 
 ```c
 vllm_model_params mp = vllm_model_params_default();

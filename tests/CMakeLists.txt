@@ -2179,6 +2179,11 @@ vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.
 vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
+# KV-FP8 W2 (#1593): the CUDA fp8-e4m3 KV store + the fp8 dequant on the CUDA
+# paged-attention read, gated for parity against the W1 CPU reference. The
+# device cases skip with a MESSAGE when no CUDA backend is present; the
+# provider-routing case runs on every leg.
+vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.

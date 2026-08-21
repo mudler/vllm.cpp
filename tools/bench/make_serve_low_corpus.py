@@ -18,13 +18,21 @@ from typing import Protocol
 
 from tools.bench.serve_low_common import (
     HarnessError,
+    MODEL_CHECKPOINTS,
     SGLANG_COMMIT,
     canonical_json,
+    require_model_checkpoint,
     sha256_bytes,
     sha256_file,
     write_json_atomic,
     write_jsonl_atomic,
 )
+
+# Every subject the registry names may have a corpus built for it.  This is the
+# whole registry rather than one harness's subset, because both the serve-low
+# harness and `online_gate.py` build their corpora with this tool; what must not
+# be possible is a corpus filed under a key NO subject declares (#1594).
+MODEL_KEYS = tuple(MODEL_CHECKPOINTS)
 
 
 class Tokenizer(Protocol):
@@ -147,6 +155,14 @@ def generate_corpus(
     *,
     tokenizer_sha256: str,
 ) -> dict:
+    # The corpus is consumed as `evidence/corpus/<model_key>/`, and the key is
+    # written verbatim into this manifest, so it is a claim about which
+    # tokenizer produced these prompt IDs.  The parser is not the only way in,
+    # and a corpus filed under an undeclared key -- or under a real key it was
+    # not tokenized for -- is a subject nobody can reproduce (#1594).
+    require_model_checkpoint(
+        config.model_key, config.tokenizer_revision, field="--tokenizer-revision"
+    )
     if config.target_input_len < 2 or config.output_len < 4:
         raise HarnessError("input length must be >=2 and output length must be >=4")
     if config.requests_per_partition <= 0 or config.warmup_requests <= 0:
@@ -227,7 +243,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer-json", type=pathlib.Path, required=True)
     parser.add_argument("--tokenizer-revision", required=True)
-    parser.add_argument("--model-key", required=True)
+    parser.add_argument("--model-key", choices=MODEL_KEYS, required=True)
     parser.add_argument("--out", type=pathlib.Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--target-input-len", type=int, default=1024)

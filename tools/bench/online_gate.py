@@ -44,8 +44,10 @@ from tools.bench.serve_low_common import (
     VLLM_COMMIT,
     VLLM_DISTRIBUTION_VERSION,
     VLLM_ORACLE_VERSION,
+    admitted_model_keys,
     assert_oracle_commit,
     canonical_json,
+    model_checkpoint,
     read_jsonl,
     require_complete_request_set,
     require_number,
@@ -241,17 +243,19 @@ POINTS_BY_MODEL = {
 # repo @890bdef7 ships a BF16 lm_head and a different mixed-precision layout;
 # the nvidia ModelOpt repo @0893e160 is NVFP4 MLP + FP8 W8A8 tower + NVFP4 head.
 # They do not share goldens and their ratios are not comparable.
+#
+# The subjects THIS gate runs, and the checkpoint each key means is read from
+# `serve_low_common.MODEL_CHECKPOINTS` rather than copied here. That record is
+# shared with the serve-low harness and the corpus generator, so admitting a key
+# and pinning the weights it names is one edit and the two cannot drift (#1594).
+# The admitted SET stays per harness: this gate has goldens, batched-token
+# bounds and model-gate contracts keyed on exactly these four.
+ONLINE_GATE_MODEL_KEYS = admitted_model_keys("27", "27n", "35", "q3mxfp4")
 MODEL_REVISIONS = {
-    "27": "890bdef7a42feba6d83b6e17a03315c694112f2a",
-    "27n": "0893e1606ff3d5f97a441f405d5fc541a6bdf404",
-    "35": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
-    "q3mxfp4": "b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47",
+    key: model_checkpoint(key)["revision"] for key in ONLINE_GATE_MODEL_KEYS
 }
 MODEL_REPOSITORIES = {
-    "27": "unsloth/Qwen3.6-27B-NVFP4",
-    "27n": "nvidia/Qwen3.6-27B-NVFP4",
-    "35": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-    "q3mxfp4": "Yi30/Qwen3-8B-MXFP4",
+    key: model_checkpoint(key)["repository"] for key in ONLINE_GATE_MODEL_KEYS
 }
 MAX_NUM_SEQS = 32
 MAX_NUM_BATCHED_TOKENS = {"27": 2048, "27n": 2048, "35": 8192, "q3mxfp4": 2048}

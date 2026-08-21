@@ -476,19 +476,282 @@ each rebinding every derived name so it cannot apply to nothing:
 4. `PARTIAL` removed from `CLAIM_ON_ARRIVAL` — a new `PARTIAL` row stops being a
    claim.
 
+## W3 — the repair: W2 loosened the gate on nine transitions
+
+W2 landed on `main` as `ba4634204` (#1609) **without an independent review**. A
+post-landing review returned FAIL. This section is the repair, on `main` rather
+than a revert: W2 makes 52 transitions observable and 9 of them regress, and the
+9 are one line.
+
+### The defect
+
+`transitions()` keyed the move class on **both** endpoints:
+
+```python
+kind = CLAIM if previous in STATES and state in STATES else RECORD
+```
+
+Before W2 a row sitting in `INVENTORIED`, `SPIKE` or `ANCHOR-BACKFILL` was
+**absent from the BEFORE map**, so `previous` was `None`, the ARRIVAL rule fired
+and pulled in `REQUIRED["lifecycle"] = (STATUS, BENCHMARKS)`. Resolving the
+record states made `previous` resolve, which made the arrival rule unreachable
+(`previous is not None`), and the both-endpoints test then sent the move down
+the RECORD branch and dropped both surfaces.
+
+**569 of the 793 resolved rows — 72% — sit in a record state**, so this is the
+exit path of nearly every row in the tree.
+
+W2's own justification for the polarity was that "the arrival rule below already
+governs a row that appears as `DONE`". It cannot: the arrival rule is guarded by
+`previous is None`, and resolving the record states is exactly what stopped that
+being true.
+
+### Nine transitions, red before `ba4634204`, green after
+
+Constructed scratch commits on `503e45900`, one pair per transition, each
+changing only `.agents/kernel-matrix.md` and the row's spec, with the spec's
+`## Now` **paid** and `docs/STATUS.md` / `docs/BENCHMARKS.md` **withheld**. Exit
+code taken from the checker directly, never through a pipe.
+
+| transition | `e2a9e035d` (pre-W2) | `ba4634204` == `503e45900` | W3 |
+|---|---|---|---|
+| `INVENTORIED -> ACTIVE` | rc 1 | **rc 0** | rc 1 |
+| `INVENTORIED -> GATING` | rc 1 | **rc 0** | rc 1 |
+| `INVENTORIED -> DONE` | rc 1 | **rc 0** | rc 1 |
+| `SPIKE -> ACTIVE` | rc 1 | **rc 0** | rc 1 |
+| `SPIKE -> GATING` | rc 1 | **rc 0** | rc 1 |
+| `SPIKE -> DONE` | rc 1 | **rc 0** | rc 1 |
+| `ANCHOR-BACKFILL -> ACTIVE` | rc 1 | **rc 0** | rc 1 |
+| `ANCHOR-BACKFILL -> GATING` | rc 1 | **rc 0** | rc 1 |
+| `ANCHOR-BACKFILL -> DONE` | rc 1 | **rc 0** | rc 1 |
+
+Pre-W2 reports `added as ACTIVE`; W3 reports `INVENTORIED -> ACTIVE`. The
+verdict is restored and the message is better than either.
+
+### The three real commits, and a correction to the report
+
+The review named `2a976eb9f` (`ENG-CUDAGRAPH-DEDUP` `INVENTORIED -> ACTIVE`),
+`678fc672c` (`ENG-RECORD-ANCHOR-RATCHET` `SPIKE -> ACTIVE`) and `7a0e6c82b`
+(`MODEL-MUSIC-minimax-music3…` `SPIKE -> ACTIVE`) as "ERROR under base, OK under
+W2". Re-derived: **all three are rc 0 under all three checkers**, because all
+three PAID `docs/STATUS.md` and `docs/BENCHMARKS.md` — the pre-W2 gate made
+them. The commits still prove the point, on the classification rather than the
+exit code. Withhold those two paths from the same tree change:
+
+| commit | pre-W2 | W2 | W3 |
+|---|---|---|---|
+| `2a976eb9f` | `added as ACTIVE`, demands STATUS | **no lifecycle move at all** | `INVENTORIED -> ACTIVE`, demands STATUS |
+| `678fc672c` | `READY -> ACTIVE`, demands STATUS | **no lifecycle move at all** | `SPIKE -> ACTIVE`, demands STATUS |
+| `7a0e6c82b` | `added as ACTIVE`, demands STATUS | **no lifecycle move at all** | `SPIKE -> ACTIVE`, demands STATUS |
+
+### Why W2's safety argument could not see this
+
+W2 replayed 400 commits and reported **0 newly green**. That number is an
+artifact, not evidence. The replay measures commits that were red under the base
+gate; the base gate **enforced** the obligation W2 removed, so every commit that
+would have gone green had already paid it. **A replay of already-gated history
+is structurally incapable of detecting the removal of the obligation that gated
+it.** The nine transitions are therefore pinned as CONSTRUCTED cases in
+`tests/scripts/test_doc_checkpoint.py`, and the replay is used only for the
+cost, which is what it can measure.
+
+### The fix, and what it costs
+
+```python
+kind = CLAIM if state in STATES else RECORD
+```
+
+Key on the **destination**. It closes all nine, preserves W1's
+`ANCHOR-BACKFILL` ruling (`DONE -> ANCHOR-BACKFILL` stays RECORD, and so do
+`DONE -> INVENTORIED` and `DONE -> SPIKE`), and matches the polarity
+`CLAIM_ON_ARRIVAL` already uses — a rule that reads where the row landed and
+ignores where it came from.
+
+Replayed over the same 400 non-merge commits ending at `e2a9e035d`:
+
+| verdict | commits |
+|---|---:|
+| red under pre-W2 | 44 |
+| red under W2 | 45 |
+| red under W3 | 47 |
+| **newly red, W3 against pre-W2** | **3** |
+| **newly green, W3 against pre-W2** | **0** |
+| newly red, W3 against W2 | 2 |
+| newly green, W3 against W2 | 0 |
+
+Each of the three is a genuinely unpaid surface:
+
+| commit | move | what is missing |
+|---|---|---|
+| `67e53e716` | `TOOLS-PARSER-BREADTH` `INVENTORIED -> PARTIAL` | `docs/BENCHMARKS.md` (STATUS paid) |
+| `33f570ea9` | `ENG-WEIGHT-OFFLOAD` `INVENTORIED -> READY` | `docs/BENCHMARKS.md` (STATUS paid) |
+| `ab6e65216` | `ENG-CUDAGRAPH-BREAK` `INVENTORIED -> READY` | `docs/BENCHMARKS.md`, `docs/STATUS.md` |
+
+**The `ab6e65216` accounting is corrected.** W2 counted it as one newly-red true
+positive. Its *lifecycle* half is a true positive under W3. Its `## Now` half —
+the only error W2 itself raised on it — is a **false positive**: the row's
+`Spike/spec` column links `specs/eng-cudagraph-break.md`, which that commit
+CREATES, 834 lines, with a populated `## Now` at `:818`. `spec_for_row` takes
+the FIRST link on the line, which is an evidence link to
+`specs/decode-graph-scratch-uaf-2026-07-18.md`, so the gate demanded a file the
+change had no reason to touch. The move being unobserved is true; the message is
+wrong. Pinned by `SpecForRowTakesTheFirstLink` and carried in `## Owed`.
+
+### The public-term criterion, re-derived per state
+
+W2's `RECORD_STATES` comment said the three are "real lifecycle positions that
+the public pages carry **NO** term for", and W2 made that criterion executable
+in `test_partial_is_a_public_status_term` /
+`test_anchor_backfill_is_not_a_public_status_term`. Applying W2's own criterion
+to `INVENTORIED` returns the **opposite** answer to the one W2 recorded, and
+neither the W2 spec nor the W2 tests contain the string `Inventoried` — it was
+derived for `ANCHOR-BACKFILL` and extended to two more states without being
+re-derived. The criterion is falsified in both directions:
+
+- **Not sufficient.** `docs/STATUS.md:42` defines
+  `| Inventoried | The gap has a stable record but no accepted implementation |`
+  and `:56` uses it in a live projection cell.
+- **Not necessary.** `READY`, `TODO`, `BLOCKED`, `DROPPED` and `N/A` are all in
+  `STATES` and `docs/STATUS.md` names none of them (grep count 0 each).
+
+The criterion that survives is whether the position belongs to the CAPABILITY or
+to the ROW'S RECORD. Re-derived separately for each of the three:
+
+**`INVENTORIED` — on the page, and still a record state.** `STATUS.md`'s own
+definition describes the RECORD ("the gap has a stable record") together with
+the ABSENCE of an implementation, so carrying the word does not make arriving
+there a capability claim. The two obvious costs were measured rather than
+argued, and neither decides it: moving `INVENTORIED` into `STATES` changes **0
+of 793** row resolutions, and the 400-commit replay is **identical** either way
+(47 red, 2 newly red vs W2, 0 newly green). What decides it is that
+`INVENTORIED` is where a PRE-CLAIM row and a DEMOTED row both sit. With it in
+`STATES`, `SPIKE -> INVENTORIED` would demand `docs/STATUS.md` and
+`docs/BENCHMARKS.md` for a row that has never claimed anything — the
+public-document edit with nothing true to write that
+`check-doc-checkpoint.py:4-17` records as the reason the file was rewritten. It
+stays a record state.
+
+**`SPIKE` — pre-claim by protocol.** `.agents/feature-matrix.md` gives a `SPIKE`
+row a `CLAIM-*` and not a spec, and `docs/STATUS.md` carries no term (grep 0).
+Neither limb argues for admitting it. Note that unlike `INVENTORIED`, `SPIKE`
+also carries a measured resolution cost: admitting it moves 2 of 793 rows to the
+wrong state (`MODEL-TEXT-deepseek-v2…` `BLOCKED -> SPIKE`,
+`MODEL-TEXT-kimi-linear…` `READY -> SPIKE`), because their evidence prose says
+"the row stays `SPIKE`". That is the measurement W2 recorded for the
+cell-anchoring asymmetry, and it belongs to `SPIKE` alone.
+
+**`ANCHOR-BACKFILL` — W1's ruling, re-derived independently and unchanged.** It
+is a property of the record by definition, `docs/STATUS.md` carries no term
+(grep 0), and a `DONE <-> ANCHOR-BACKFILL` move changes nothing a reader of that
+page could be told.
+
+### The residual this leaves, sized
+
+Destination-keying does not observe a **demotion**: `DONE -> INVENTORIED` is a
+retraction that `docs/STATUS.md` genuinely projects, and it stays a RECORD move
+owing only the spec's `## Now`. Sized rather than asserted: over the 400 commits
+ending at `e2a9e035d` the transition census is **11 claim -> claim, 6 record ->
+claim, 0 claim -> record, 0 record -> record**, plus 14 arrivals. The 6 are
+exactly the population W2 un-gated. The demotion has zero traffic. Carried in
+`## Owed`.
+
+### W3 tests
+
+`TheDestinationDecidesTheMoveClass` in `tests/scripts/test_doc_checkpoint.py`
+pins all nine transitions constructed, that paying both surfaces discharges
+them, and that the arrival rule is unreachable once `previous` resolves. Its
+mutation restores W2's both-endpoints line and requires all nine to go green,
+then re-asserts the red after restoring, so a mutation that never applied cannot
+read as a pass. `test_a_move_into_a_record_state_is_still_a_record_move` holds
+the other polarity for all three record states.
+
+Three W2 tests are repaired rather than added:
+
+1. `test_a_record_move_reaching_a_claim_state_stays_a_record_move` pinned the
+   defect on a false premise. Renamed to
+   `test_a_record_move_reaching_a_claim_state_is_a_claim_move`, with the premise
+   corrected in the docstring.
+2. `test_anchor_backfill_stays_out_of_the_tuple` asserted
+   `"ANCHOR-BACKFILL" in spec.split("## Owed", 1)[1]`. The first literal
+   `## Owed` is inline prose at `:59`, not the section at `:479`, so it scanned
+   420 lines of spec body and could not fail — and it did not: W2 rewrote
+   `## Owed` without `ANCHOR-BACKFILL` and the test stayed green. Re-anchored to
+   the section body through `owed_section()`, which is itself mutation-tested by
+   `test_the_owed_section_reader_is_not_the_whole_file`. **Red-before evidence:
+   the re-anchored assertion FAILS against W2's `## Owed` at `503e45900`.**
+3. `test_every_row_the_checker_could_resolve_there_is_a_phantom` catches
+   REPLACING a `FUSED` cell with `` `ACTIVE` `` and does not catch ADDING
+   `` `ACTIVE` `` as a new column beside it — 3 passed, rc 0 — because it
+   asserts `len(classification) == 1`. Given the file's header says the
+   classification stands "in place of a lifecycle state", the additive shape is
+   the likelier way it changes.
+   `test_no_resolved_row_carries_a_bare_state_cell` asks the other question:
+   every resolved row's only bare backticked cell is its own ID cell, so a real
+   State column is a second one however it arrives.
+
+### Two corrections to W2 record keeping
+
+- `spec_now_errors`'s comment said "52 of 52 `SPIKE` rows". Re-derived over the
+  seven `ROW_TABLES` at `503e45900`: **50 of 50**. The `ANCHOR-BACKFILL` figure
+  in the same sentence, 50 of 56, is correct, as is 416 of 463 for
+  `INVENTORIED`.
+- `TheSglangMatrixIsNotALifecycleTable` reported 46 keyed rows and four
+  classification values summing to 43 without reconciling the two.
+  Reconciled: 46 = `FUSED` 24 + `SGLANG-DISTINCT` 5 + `OUT-OF-SCOPE` 8 +
+  unbackticked `INVENTORIED` 6 + 3 rows whose axis cell is formatted differently
+  again (`SGLANG-SCHED-INBATCH` "ACTIVE (order-only)", `SGLANG-CONSTRAIN-JUMP`,
+  `SGLANG-ORACLE-PERF`).
+
+### W3 counters, re-measured
+
+W2 measured its counters and W3 measures them again on the same tree, base
+version restored from the index and the W3 version restored byte-for-byte
+afterwards against a pre-taken sha256.
+
+| counter | at `503e45900` | with W3 | why it cannot move |
+|---|---|---|---|
+| `check-gate-commands.py --check` | rc 0 | rc 0 | `GATED_STATES` (`:56`) is its own tuple and does not import this one; `RUNNABLE_BASELINE` (`:424`) keys on matrix rows, and `GATE-DOC-CHECKPOINT-STATES` has no matrix row |
+| `check-agent-record.py` | rc 0, `ENGINE=169 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` | identical | no matrix row and no index row changes; #1434's index row already names this owning row, so `UNOWNED_HIGH_WATER` cannot move |
+| record-anchor ratchet | unchanged | unchanged | no matrix row changes |
+| `docs/STATUS.md` prose ratchet | untouched | untouched | no public document changes |
+
+The `## Gates` section of this spec is NOT edited by W3, which is the #1376
+shape: filling a spec's `## Gates` moves its row into the runnable population.
+No row moves lifecycle state in this change either, so it owes no checkpoint
+surface.
+
 ## Owed
 
 - [#1434](https://github.com/mudler/vllm.cpp/issues/1434) is closed by W1 for
-  `PARTIAL` and by W2 for all four residuals it filed. What remains is narrower
-  than what it replaced, and each item is sized rather than asserted:
+  `PARTIAL`, by W2 for resolution of the record states, and by W3 for the move
+  classification. What remains is narrower than what it replaced, and each item
+  is sized rather than asserted:
+  - **A DEMOTION out of a claim state is still not projected.** `DONE ->
+    INVENTORIED` is a retraction `docs/STATUS.md` carries a term for, and
+    destination-keying makes it a RECORD move owing only the spec's `## Now`.
+    Admitting it means either putting `INVENTORIED` in `STATES`, which makes
+    `SPIKE -> INVENTORIED` demand both public surfaces for a row that has never
+    claimed anything, or splitting the class by direction — a different rule and
+    a different row. Measured traffic: **0 of the 17 non-arrival transitions in
+    400 commits**.
+  - `ANCHOR-BACKFILL` and `SPIKE` moves owe their spec's `## Now` and nothing
+    else, by the W1 ruling re-derived per state in `## W3`. That is a decision,
+    not debt, and it is listed here so the state names stay in this section.
   - `spec_for_row` returns the FIRST `specs/*.md` link on a row line, which is
     not always the `Spike/spec` column. **97 of 793 rows (12%)** link more than
-    one spec, so on those the error can name a spec the change did not have to
-    touch. `ab6e65216` above is exactly this: the move is real, the spec named is
-    an evidence link. Pre-existing and unchanged by W2, which raises its
-    exposure. Fixing it means deciding which column is authoritative per matrix,
-    or accepting any linked spec — the second is a loosening and needs its own
-    argument.
+    one spec. `ab6e65216` is exactly this: the move is real, the spec named is
+    an evidence link, and the file the row actually links is created by that same
+    commit with a populated `## Now`. Pinned by `SpecForRowTakesTheFirstLink`
+    so a repair is a deliberate edit. Fixing it means deciding which column is
+    authoritative per matrix, or accepting any linked spec — the second is a
+    loosening and needs its own argument.
+  - `row_states` lets a cell-anchored RECORD state win OUTRIGHT and `continue`
+    past `STATE_CELL`, so an evidence cell that OPENS with a backticked record
+    state demotes a claim row wherever the real State column sits. **Zero rows
+    do that today.** The repair is already sized: taking whichever of the last
+    `RECORD_CELL` and the last `STATE_CELL` match ends LATER in the line changes
+    **0 of 793** resolutions. Not made here because it is a separate semantic
+    change to the resolver and wants its own red-before case.
   - A row ID that leaves a table entirely is still unobserved. Measured at
     **zero occurrences in 400 commits**, so this is a hole with no known traffic
     rather than a live gap.
@@ -497,12 +760,29 @@ each rebinding every derived name so it cannot apply to nothing:
     and is a different row: it moves what counts as a move for rows this change
     does not touch.
   - `.agents/sglang-matrix.md` stays out of `ROW_TABLES` by decision, not by
-    omission. If it ever gains a real lifecycle State column,
-    `test_every_row_the_checker_could_resolve_there_is_a_phantom` fails and the
-    decision is made again.
+    omission. If it ever gains a real lifecycle State column, either
+    `test_every_row_the_checker_could_resolve_there_is_a_phantom` or
+    `test_no_resolved_row_carries_a_bare_state_cell` fails and the decision is
+    made again.
 
 ## Now
 
-W2 landed on `row/GATE-DOC-CHECKPOINT-STATES-W2` from base `e2a9e035d`. Next:
-fresh scoped review of the immutable head, re-running the four W2 mutations and
-the 400-commit replay to confirm the newly-red count is still 1.
+W2 landed on `main` as `ba4634204` (#1609) from base `e2a9e035d`, **without an
+independent review**. The post-landing fresh review reproduced the resolution
+work as sound — 52 transitions become observable — and returned **FAIL** on one
+finding: keying the move class on both endpoints removed
+`REQUIRED["lifecycle"]` from the nine
+`{INVENTORIED, SPIKE, ANCHOR-BACKFILL} -> {ACTIVE, GATING, DONE}` transitions,
+which the arrival rule had gated before resolution made `previous` non-`None`.
+The review also found the `INVENTORIED` public-term criterion applied without
+being re-derived, the `ab6e65216` cost accounting counting a false positive as a
+true one, an additive-column blind spot in the `sglang-matrix` decline, and a
+tautological `## Owed` assertion.
+
+W3 is the repair, on `main` rather than a revert, on branch
+`row/GATE-DOC-CHECKPOINT-STATES-W3` from base `503e45900`: one line in
+`transitions()`, the per-state re-derivation recorded in `## W3`, and the four
+test repairs. Next: fresh scoped review of the immutable head — mutate the
+destination-keyed line back to the both-endpoints form and confirm all nine go
+green, re-run the 400-commit replay for 3 newly red / 0 newly green against
+`e2a9e035d`, and confirm no pinned counter moved.

@@ -625,17 +625,20 @@ class PartialIsALifecycleState(unittest.TestCase):
             checker.STATES, checker.STATE_CELL = states, cell
         self.assertTrue(self.errors([".agents/kernel-matrix.md"], *moved))
 
-    def test_a_new_row_added_as_partial_is_still_not_a_claim(self):
-        """A deliberate exclusion, pinned so a later widening is a decision.
+    def test_a_new_row_added_as_partial_is_a_claim(self):
+        """OVERTURNED in W2 of this row (#1434), and the reversal is the point.
 
-        The claim set governs rows ABSENT from the BEFORE map, and the dominant
-        real cause of that here is a record RELOCATION between matrices, not a
-        new capability. Widening it would red legitimate record moves for 118
-        more rows while fixing nothing #1434 reports.
+        This test previously asserted the opposite. The exclusion it pinned
+        rested on "the dominant real cause of a row being absent from BEFORE is
+        a record RELOCATION between matrices", which was never measured. It is
+        now: over the 400 non-merge commits ending at e2a9e035d there were 45
+        arrivals, ALL genuinely new, and ZERO relocations. The reasoning and the
+        mutation live in ANewPartialRowIsAClaim below; this case stays here so
+        that the two halves of the PARTIAL decision are read together.
         """
         one_row = "| `KERNEL-ALPHA` | alpha | `PARTIAL` | ops |\n"
         classes, _ = self.reasons("", one_row)
-        self.assertNotIn("lifecycle", classes)
+        self.assertIn("lifecycle", classes)
 
 
 class AnchorBackfillIsDeliberatelyExcluded(unittest.TestCase):
@@ -677,6 +680,444 @@ class AnchorBackfillIsDeliberatelyExcluded(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("## Owed", spec)
         self.assertIn("ANCHOR-BACKFILL", spec.split("## Owed", 1)[1])
+
+
+
+# A table whose row links no spec at all. Pre-claim rows are shaped like this by
+# protocol -- .agents/feature-matrix.md gives a SPIKE row a `CLAIM-*`, not a spec
+# -- and 416 of the 463 INVENTORIED rows in the seven tables carry no spec link.
+UNLINKED_ROW_TABLE = """# Kernel matrix
+
+| ID | Item | Spike/spec | State | Owner |
+|---|---|---|---|---|
+| `KERNEL-ALPHA` | alpha | `CLAIM-ALPHA` | `{alpha}` | ops |
+"""
+
+
+class RecordStatesAreResolvedButNotClaims(unittest.TestCase):
+    """GATE-DOC-CHECKPOINT-STATES W2 (#1434), residuals 1 and 3.
+
+    INVENTORIED, SPIKE and ANCHOR-BACKFILL are real lifecycle positions that
+    docs/STATUS.md carries no term for. They were unresolvable, so `row_states`
+    dropped the row and NOTHING downstream ran: a row moving out of the matched
+    set looked like a deletion, and an ANCHOR-BACKFILL move was invisible.
+
+    The first wave recorded the fix as "REQUIRED needs a spec-only class". That
+    premise is wrong and measuring it is what closed the residual: `errors_for`
+    calls `spec_now_errors` DIRECTLY, never through `classify()` or `REQUIRED`,
+    so a spec-only obligation already existed. What was missing was resolution.
+    """
+
+    def errors(self, paths, before_text, after_text, specs=None):
+        specs = specs or {}
+        original = checker.blob
+
+        def fake(rev, path):
+            if path.startswith(".agents/specs/"):
+                return specs.get(path, SPEC_WITH_NOW)
+            return before_text if rev == "BEFORE" else after_text
+
+        checker.blob = fake
+        try:
+            return checker.errors_for(set(paths), "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    def classify(self, before_text, after_text):
+        original = checker.blob
+        checker.blob = lambda rev, path: (
+            before_text if rev == "BEFORE" else after_text
+        )
+        try:
+            return checker.classify({".agents/kernel-matrix.md"}, "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    def test_record_states_resolve(self):
+        """RED-BEFORE: `row_states` dropped every one of these rows."""
+        for state in ("INVENTORIED", "SPIKE", "ANCHOR-BACKFILL"):
+            with self.subTest(state=state):
+                states = checker.row_states(
+                    ROW_TABLE.format(alpha=state, beta="DONE")
+                )
+                self.assertEqual(states.get("KERNEL-ALPHA"), state)
+
+    def test_a_move_into_anchor_backfill_owes_the_spec_now(self):
+        """RED-BEFORE. Residual 1: the obligation #1434 named and did not pay.
+
+        DONE -> ANCHOR-BACKFILL is a record-hygiene move: the capability is
+        already implemented and only the row's anchors are missing.
+        """
+        errors = self.errors(
+            [".agents/kernel-matrix.md"],
+            ROW_TABLE.format(alpha="DONE", beta="DONE"),
+            ROW_TABLE.format(alpha="ANCHOR-BACKFILL", beta="DONE"),
+        )
+        self.assertTrue(errors, "DONE -> ANCHOR-BACKFILL must be seen")
+        self.assertIn(".agents/specs/alpha.md", " ".join(errors))
+
+    def test_a_record_move_does_not_demand_the_public_surfaces(self):
+        """The other half of the ruling, and the reason it is payable.
+
+        Admitting these states into `STATES` would have triggered
+        REQUIRED["lifecycle"] = (STATUS, BENCHMARKS), which carries all of its
+        surfaces or none. docs/STATUS.md has nothing true to write about a row
+        whose capability did not change, and demanding an edit with nothing to
+        say is the shape check-doc-checkpoint.py:4-17 records as the reason this
+        file was rewritten.
+        """
+        errors = self.errors(
+            [".agents/kernel-matrix.md", ".agents/specs/alpha.md"],
+            ROW_TABLE.format(alpha="DONE", beta="DONE"),
+            ROW_TABLE.format(alpha="ANCHOR-BACKFILL", beta="DONE"),
+        )
+        self.assertEqual(errors, [])
+
+        classes, _ = self.classify(
+            ROW_TABLE.format(alpha="DONE", beta="DONE"),
+            ROW_TABLE.format(alpha="ANCHOR-BACKFILL", beta="DONE"),
+        )
+        self.assertNotIn("lifecycle", classes)
+
+    def test_leaving_the_claim_set_is_no_longer_silent(self):
+        """RED-BEFORE. Residual 3: READY -> INVENTORIED looked like a deletion.
+
+        `transitions` iterates the AFTER map, so an unresolvable destination
+        state removed the row from the comparison entirely. Resolving the record
+        states fixes this WITHOUT reporting disappearances, which would red a
+        legitimate relocation between matrices.
+        """
+        for destination in ("INVENTORIED", "SPIKE", "ANCHOR-BACKFILL"):
+            with self.subTest(destination=destination):
+                errors = self.errors(
+                    [".agents/kernel-matrix.md"],
+                    ROW_TABLE.format(alpha="READY", beta="DONE"),
+                    ROW_TABLE.format(alpha=destination, beta="DONE"),
+                )
+                self.assertTrue(errors, f"READY -> {destination} must be seen")
+                self.assertIn(".agents/specs/alpha.md", " ".join(errors))
+
+    def test_entering_the_claim_set_from_a_record_state_is_seen(self):
+        """RED-BEFORE. INVENTORIED -> READY: absent from BEFORE, and READY is
+        not in the arrival set, so the row was invisible from both sides.
+
+        This is not hypothetical: ab6e65216 on main moved ENG-CUDAGRAPH-BREAK
+        INVENTORIED -> READY and the gate reported nothing.
+        """
+        errors = self.errors(
+            [".agents/kernel-matrix.md"],
+            ROW_TABLE.format(alpha="INVENTORIED", beta="DONE"),
+            ROW_TABLE.format(alpha="READY", beta="DONE"),
+        )
+        self.assertTrue(errors)
+        self.assertIn(".agents/specs/alpha.md", " ".join(errors))
+
+    def test_a_record_move_reaching_a_claim_state_stays_a_record_move(self):
+        """INVENTORIED -> DONE crosses the boundary, so which side wins?
+
+        The record side. STATUS.md can say what a DONE row does, but the move
+        itself starts from a position that page never carried, and the arrival
+        rule below already governs a row that appears as DONE. Pinned so that
+        the polarity is a decision rather than an accident of the `and`.
+        """
+        classes, _ = self.classify(
+            ROW_TABLE.format(alpha="INVENTORIED", beta="DONE"),
+            ROW_TABLE.format(alpha="DONE", beta="DONE"),
+        )
+        self.assertNotIn("lifecycle", classes)
+
+    def test_a_record_move_on_a_row_linking_no_spec_is_not_an_error(self):
+        """The one narrowing in this change, and it is stated as such.
+
+        For a CLAIM move a row linking no spec is an error naming the row. For a
+        RECORD move it cannot be: .agents/feature-matrix.md gives a pre-claim
+        row a `CLAIM-*` rather than a spec, and 416 of 463 INVENTORIED rows link
+        none. Demanding one would demand a document the protocol says does not
+        exist yet. Nothing is loosened -- before this change the move was not
+        observed at all.
+        """
+        errors = self.errors(
+            [".agents/kernel-matrix.md"],
+            UNLINKED_ROW_TABLE.format(alpha="INVENTORIED"),
+            UNLINKED_ROW_TABLE.format(alpha="SPIKE"),
+        )
+        self.assertEqual(errors, [])
+
+    def test_a_claim_move_on_a_row_linking_no_spec_is_still_an_error(self):
+        """The carve-out above must not leak into the claim path."""
+        errors = self.errors(
+            [".agents/kernel-matrix.md"],
+            UNLINKED_ROW_TABLE.format(alpha="READY"),
+            UNLINKED_ROW_TABLE.format(alpha="DONE"),
+        )
+        self.assertTrue(errors)
+        self.assertIn("links no spec", " ".join(errors))
+
+    def test_a_record_move_still_needs_a_non_empty_now(self):
+        """A linked spec is held to the same `## Now` contract as a claim move."""
+        for body, expected in (
+            (SPEC_WITHOUT_NOW, "has no `## Now` section"),
+            (SPEC_EMPTY_NOW, "`## Now` is empty"),
+        ):
+            with self.subTest(expected=expected):
+                errors = self.errors(
+                    [".agents/kernel-matrix.md", ".agents/specs/alpha.md"],
+                    ROW_TABLE.format(alpha="DONE", beta="DONE"),
+                    ROW_TABLE.format(alpha="ANCHOR-BACKFILL", beta="DONE"),
+                    specs={".agents/specs/alpha.md": body},
+                )
+                self.assertTrue(errors)
+                self.assertIn(expected, " ".join(errors))
+
+    def test_a_row_added_as_a_record_state_claims_nothing(self):
+        """A newly inventoried row has no prior position and asserts nothing."""
+        for state in ("INVENTORIED", "SPIKE", "ANCHOR-BACKFILL"):
+            with self.subTest(state=state):
+                errors = self.errors(
+                    [".agents/kernel-matrix.md"],
+                    "",
+                    ROW_TABLE.format(alpha=state, beta=state),
+                )
+                self.assertEqual(errors, [])
+
+    def test_prose_naming_a_record_state_does_not_beat_the_state_cell(self):
+        """MEASURED, not stylistic: this is why RECORD_CELL is cell-anchored.
+
+        The evidence prose in this repository narrates record states mid
+        sentence far more often than claim ones. Two model rows literally write
+        "the row stays `SPIKE`" while their State cells read `BLOCKED` and
+        `ACTIVE`, so a record state matched anywhere on the line resolved both
+        rows to `SPIKE` -- turning a correct resolution into a wrong one.
+        """
+        line = (
+            "| `KERNEL-X` | claimed by two campaigns, so the row stays `SPIKE` "
+            "until W3 lands | `BLOCKED` | ops |\n"
+        )
+        self.assertEqual(checker.row_states(line), {"KERNEL-X": "BLOCKED"})
+
+    def test_a_record_state_opening_a_cell_wins_over_later_prose(self):
+        """The converse, and the two rows this repairs.
+
+        engine-matrix KV-EXTERNAL-CACHE resolved `ACTIVE` and quantization-matrix
+        QUANT-GGUF-PRESETS resolved `READY`, both from prose after their real
+        State cells. A row whose State cell is a record state is by definition
+        making no claim, and resolving it to a claim state is the one error that
+        makes this gate demand the wrong surfaces.
+        """
+        line = (
+            "| `KERNEL-X` | anchors owed | `ANCHOR-BACKFILL` (W1-W5 landed) | "
+            "the seam is `ACTIVE` upstream | ops |\n"
+        )
+        self.assertEqual(checker.row_states(line), {"KERNEL-X": "ANCHOR-BACKFILL"})
+
+    def test_unanchoring_the_record_cell_breaks_two_real_rows(self):
+        """MUTATION on the ANCHORING, which nothing else here proves.
+
+        Drop the cell boundary from RECORD_CELL and the same prose line resolves
+        to `SPIKE`. That is not a fixture: `MODEL-TEXT-deepseek-v2-deepseek-v3`
+        and `MODEL-TEXT-kimi-linear` both narrate "the row stays `SPIKE`" while
+        their State cells read `BLOCKED` and `ACTIVE`, so the unanchored form
+        turns two correct resolutions into wrong ones.
+        """
+        line = (
+            "| `KERNEL-X` | claimed by two campaigns, so the row stays `SPIKE` "
+            "until W3 lands | `BLOCKED` | ops |\n"
+        )
+        self.assertEqual(checker.row_states(line), {"KERNEL-X": "BLOCKED"})
+
+        cell = checker.RECORD_CELL
+        unanchored = re.compile(
+            r"`(" + "|".join(re.escape(s) for s in checker.RECORD_STATES) + r")`"
+        )
+        self.assertNotEqual(unanchored.pattern, cell.pattern, "mutation applied to nothing")
+        checker.RECORD_CELL = unanchored
+        try:
+            self.assertEqual(
+                checker.row_states(line),
+                {"KERNEL-X": "SPIKE"},
+                "unanchored, the evidence prose must win; it did not, so the "
+                "anchoring is not what this test measures",
+            )
+        finally:
+            checker.RECORD_CELL = cell
+        self.assertEqual(checker.row_states(line), {"KERNEL-X": "BLOCKED"})
+
+    def test_removing_the_record_states_restores_the_blind_spot(self):
+        """MUTATION. RECORD_CELL is derived from RECORD_STATES at import, so a
+        mutation that rebound only the tuple would apply to nothing and read as
+        a passing test. Both are rebound.
+        """
+        moved = (
+            ROW_TABLE.format(alpha="DONE", beta="DONE"),
+            ROW_TABLE.format(alpha="ANCHOR-BACKFILL", beta="DONE"),
+        )
+        self.assertTrue(self.errors([".agents/kernel-matrix.md"], *moved))
+
+        record, cell = checker.RECORD_STATES, checker.RECORD_CELL
+        checker.RECORD_STATES = ()
+        checker.RECORD_CELL = re.compile(r"(?!x)x")
+        self.assertNotEqual(checker.RECORD_STATES, record, "mutation applied to nothing")
+        try:
+            self.assertEqual(
+                self.errors([".agents/kernel-matrix.md"], *moved),
+                [],
+                "without the record states the gate must go blind; it did not, "
+                "so these tests measure something other than the tuple",
+            )
+        finally:
+            checker.RECORD_STATES, checker.RECORD_CELL = record, cell
+        self.assertTrue(self.errors([".agents/kernel-matrix.md"], *moved))
+
+    def test_treating_a_record_move_as_a_claim_move_demands_status(self):
+        """MUTATION on the SPLIT, not on the tuple.
+
+        Resolution alone is not the change; classifying the move as RECORD is.
+        Force every move to CLAIM and the same DONE -> ANCHOR-BACKFILL edit
+        starts demanding docs/STATUS.md, which is the outcome the ruling rejects.
+        """
+        paid = [".agents/kernel-matrix.md", ".agents/specs/alpha.md"]
+        moved = (
+            ROW_TABLE.format(alpha="DONE", beta="DONE"),
+            ROW_TABLE.format(alpha="ANCHOR-BACKFILL", beta="DONE"),
+        )
+        self.assertEqual(self.errors(paid, *moved), [])
+
+        original = checker.transitions
+
+        def all_claim(paths, before, after):
+            return [
+                (path, row, previous, state, checker.CLAIM)
+                for path, row, previous, state, _kind in original(
+                    paths, before, after
+                )
+            ]
+
+        checker.transitions = all_claim
+        try:
+            errors = self.errors(paid, *moved)
+            self.assertTrue(errors)
+            self.assertIn("docs/STATUS.md", " ".join(errors))
+        finally:
+            checker.transitions = original
+        self.assertEqual(self.errors(paid, *moved), [])
+
+
+class ANewPartialRowIsAClaim(unittest.TestCase):
+    """GATE-DOC-CHECKPOINT-STATES W2 (#1434), residual 4.
+
+    This OVERTURNS a decision the first wave pinned. That exclusion rested on
+    "the dominant real cause of a row being absent from BEFORE is a record
+    RELOCATION between matrices", and the premise was never measured. Replayed
+    over the 400 non-merge commits ending at e2a9e035d, 126 of which touch a row
+    table: 45 arrivals, ALL genuinely new, ZERO relocations, ZERO departures.
+    Two arrived as PARTIAL. The case the exclusion protected does not occur.
+
+    Admitting it costs nothing historically: the one commit with PARTIAL
+    arrivals, 5498b4aea, already paid STATUS, BENCHMARKS and the spec.
+    """
+
+    def classify(self, before_text, after_text):
+        original = checker.blob
+        checker.blob = lambda rev, path: (
+            before_text if rev == "BEFORE" else after_text
+        )
+        try:
+            return checker.classify({".agents/model-matrix.md"}, "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    ROW = "| `MODEL-ALPHA` | alpha | [alpha](specs/alpha.md) | `{}` | ops |\n"
+
+    def test_a_new_row_added_as_partial_is_a_claim(self):
+        """RED-BEFORE: PARTIAL was not in the arrival set."""
+        classes, reasons = self.classify("", self.ROW.format("PARTIAL"))
+        self.assertIn("lifecycle", classes)
+        self.assertIn("MODEL-ALPHA added as PARTIAL", " ".join(reasons))
+
+    def test_the_pre_claim_arrivals_are_still_not_claims(self):
+        """The polarity is unchanged for everything that claims nothing."""
+        for state in ("TODO", "READY", "INVENTORIED", "SPIKE", "ANCHOR-BACKFILL"):
+            with self.subTest(state=state):
+                classes, _ = self.classify("", self.ROW.format(state))
+                self.assertNotIn("lifecycle", classes)
+
+    def test_removing_partial_from_the_arrival_set_restores_the_blind_spot(self):
+        """MUTATION. CLAIM_ON_ARRIVAL is read at call time, so rebinding it is
+        enough -- unlike STATE_CELL, nothing is derived from it at import.
+        """
+        self.assertIn("lifecycle", self.classify("", self.ROW.format("PARTIAL"))[0])
+
+        arrival = checker.CLAIM_ON_ARRIVAL
+        narrowed = frozenset(arrival - {"PARTIAL"})
+        self.assertNotEqual(narrowed, arrival, "the mutation applied to nothing")
+        checker.CLAIM_ON_ARRIVAL = narrowed
+        try:
+            self.assertNotIn(
+                "lifecycle",
+                self.classify("", self.ROW.format("PARTIAL"))[0],
+                "without PARTIAL in the arrival set the gate must go blind",
+            )
+        finally:
+            checker.CLAIM_ON_ARRIVAL = arrival
+        self.assertIn("lifecycle", self.classify("", self.ROW.format("PARTIAL"))[0])
+
+
+class TheSglangMatrixIsNotALifecycleTable(unittest.TestCase):
+    """GATE-DOC-CHECKPOINT-STATES W2 (#1434), residual 2: DECLINED, with the
+    measurement that declines it kept executable.
+
+    `.agents/sglang-matrix.md` is a keyed table with `SGLANG-*` row IDs, so it
+    LOOKS like a seventh sibling of ROW_TABLES. It is not: its own header says it
+    carries "a **classification** in place of a lifecycle state", and that axis
+    is FUSED / SGLANG-DISTINCT / INVENTORIED / OUT-OF-SCOPE, of which only
+    INVENTORIED is a lifecycle token and it is written unbackticked there.
+
+    Admitting the file would observe ZERO of its 46 keyed rows on their own axis
+    and three on prose about OTHER matrices' rows -- `ENG-ASYNC-SCHED` `DONE`,
+    `SPEC-MTP` `DONE`, `SPEC-DFLASH` `DONE`, each quoted inside the "our
+    implementation" column. Rewording one of those sentences would then read as
+    an SGLANG row changing lifecycle state and would demand docs/STATUS.md,
+    docs/BENCHMARKS.md and a spec `## Now` for a move that never happened.
+    """
+
+    LEGEND = ("FUSED", "SGLANG-DISTINCT", "OUT-OF-SCOPE")
+
+    def setUp(self):
+        self.text = (ROOT / ".agents/sglang-matrix.md").read_text(encoding="utf-8")
+
+    def test_the_file_stays_out_of_row_tables(self):
+        self.assertNotIn(".agents/sglang-matrix.md", checker.ROW_TABLES)
+
+    def test_its_axis_is_a_classification_not_a_lifecycle_state(self):
+        self.assertIn("**classification** in place of a lifecycle state", self.text)
+        for value in self.LEGEND:
+            self.assertNotIn(value, checker.LIFECYCLE_STATES)
+
+    def test_every_row_the_checker_could_resolve_there_is_a_phantom(self):
+        """The load-bearing half: each resolvable row HAS its own classification
+        cell, so the token the checker matched came from somewhere else.
+
+        If the file ever grows a real lifecycle State cell, that row will have no
+        classification cell and this fails -- which is the point. The exclusion
+        is then a decision someone makes again, not a drift.
+        """
+        resolved = checker.row_states(self.text)
+        self.assertTrue(
+            resolved, "the trap is that the file resolves rows, not that it is inert"
+        )
+        for line in self.text.splitlines():
+            identifier = checker.ROW_ID.match(line)
+            if not identifier or identifier.group(1) not in resolved:
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            classification = [cell for cell in cells if cell in self.LEGEND]
+            self.assertEqual(
+                len(classification),
+                1,
+                f"{identifier.group(1)} has no classification cell, so its "
+                f"resolved state {resolved[identifier.group(1)]!r} may be real; "
+                "re-decide whether this file belongs in ROW_TABLES",
+            )
 
 
 if __name__ == "__main__":

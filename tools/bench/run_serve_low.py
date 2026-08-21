@@ -30,12 +30,26 @@ from tools.bench.serve_low_common import (
     SGLANG_COMMIT,
     SGLANG_IMAGE,
     VLLM_COMMIT,
+    admitted_model_keys,
     canonical_json,
+    model_checkpoint,
     read_jsonl,
     require_complete_request_set,
+    require_model_checkpoint,
     require_number,
     write_json_atomic,
 )
+
+
+# The subjects this campaign benches.  Each is admitted only once
+# `serve_low_common.MODEL_CHECKPOINTS` says which weights it means, so the key
+# that labels an evidence tree and the checkpoint that filled it are one edit
+# and cannot drift apart.  "27" is `unsloth/Qwen3.6-27B-NVFP4`, so the third
+# subject -- also a 27B NVFP4 checkpoint -- is `q38mtp` rather than anything
+# digit-prefixed: `online_gate.py`'s neighbouring "27"/"27n" pair records that
+# two 27B checkpoints share no goldens and no comparable ratios, and a key that
+# reads as a spelling of another one is that mistake waiting in a path.
+MODEL_KEYS = admitted_model_keys("27", "35", "q38mtp")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,12 +354,31 @@ def build_bench_command(run: BenchRun) -> list[str]:
         raise HarnessError("benchmark image does not match the digest pin")
     if run.engine not in {"ours", "sglang", "vllm"}:
         raise HarnessError(f"unknown engine arm: {run.engine}")
+    # The parser is not the only way in, and an undeclared key would silently
+    # open an evidence tree nobody declared rather than fail (#1594).
+    if run.model_key not in MODEL_KEYS:
+        raise HarnessError(f"unknown model key: {run.model_key}")
+    # And an ADMITTED key beside a free-form revision is the same failure with
+    # the paperwork in order: the run completes, files a plausible result under
+    # this subject's key, and `summarize_serve_low.py` averages two checkpoints
+    # into one published subject.
+    require_model_checkpoint(
+        run.model_key, run.model_revision, field="--model-revision"
+    )
     if run.concurrency not in {1, 2, 4, 8, 16} or run.repetition not in {1, 2, 3}:
         raise HarnessError("run is outside the canonical concurrency/repetition grid")
     if not run.corpus_path.is_file():
         raise HarnessError(f"missing corpus partition: {run.corpus_path}")
     if not run.model_repo.is_dir():
         raise HarnessError(f"missing model repository: {run.model_repo}")
+    # `--model-repo` is bound to the key through the same revision: the command
+    # below hands the container `/models/gate/snapshots/<revision>`, so a
+    # repository that does not hold this subject's snapshot is the wrong
+    # checkpoint under the right name.  Refusing on the host also turns a
+    # confusing in-container tokenizer failure into one line here.
+    snapshot = run.model_repo / "snapshots" / run.model_revision
+    if not snapshot.is_dir():
+        raise HarnessError(f"model repository has no snapshot {snapshot}")
     backend = "sglang-oai" if run.engine == "sglang" else "vllm"
     container_corpus = f"/evidence/corpus/{run.model_key}/{run.corpus_path.name}"
     container_output = (
@@ -476,16 +509,11 @@ def build_dry_run_manifest(
             "python": platform.python_version(),
         },
         "image": image,
-        "models": {
-            "27": {
-                "repository": "unsloth/Qwen3.6-27B-NVFP4",
-                "revision": "890bdef7a42feba6d83b6e17a03315c694112f2a",
-            },
-            "35": {
-                "repository": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-                "revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
-            },
-        },
+        # Derived from the admitted keys, not listed again: this block is the
+        # evidence tree's own record of which checkpoint each subject is, so a
+        # key admitted here and absent there would write a manifest that names
+        # neither the subject nor its weights (#1594).
+        "models": {key: model_checkpoint(key) for key in MODEL_KEYS},
         "pending_preconditions": [
             "host_idle_proof",
             "image_platform_digest_and_revision",
@@ -660,7 +688,7 @@ def _parser() -> argparse.ArgumentParser:
     bench.add_argument("--model-repo", type=pathlib.Path, required=True)
     bench.add_argument("--model-revision", required=True)
     bench.add_argument("--evidence", type=pathlib.Path, required=True)
-    bench.add_argument("--model-key", choices=("27", "35"), required=True)
+    bench.add_argument("--model-key", choices=MODEL_KEYS, required=True)
     bench.add_argument("--engine", choices=("ours", "vllm", "sglang"), required=True)
     bench.add_argument("--base-url", required=True)
     bench.add_argument("--concurrency", type=int, required=True)

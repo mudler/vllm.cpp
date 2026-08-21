@@ -1121,7 +1121,7 @@ struct PagedAttentionArgs {
   // device read (companion to query_start_loc_host). 0 => that launcher falls
   // back to the D2H+sync.
   int32_t max_seq_len = 0;
-  // OPTIONAL fp8 KV-cache read (KV-FP8 W1). kAuto (default) => the cache holds
+  // OPTIONAL fp8 KV-cache read (KV-FP8 W1 CPU, W2 CUDA). kAuto (default) => the cache holds
   // the model float dtype and is read directly — every existing caller is
   // byte-identical. When != kAuto the K/V cache pages are 1-byte fp8 (DType::kI8
   // storage) and each read is DEQUANTIZED as Dequant(fp8) * k_scale|v_scale
@@ -1129,6 +1129,9 @@ struct PagedAttentionArgs {
   // (scaled_vec_conversion<float,uint8_t>, quant_utils.cuh:302-308). k_scale /
   // v_scale are the per-tensor scales from BaseKVCacheMethod (kv_cache.py:108-191)
   // — 1.0 is the uncalibrated default. Per-head scales are a later brick.
+  // Implemented on CPU and CUDA. kMETAL/kROCM register kPagedAttention for the
+  // FLOAT path only, and because these fields are ADDITIVE the provider table
+  // cannot tell the two arms apart, so src/vt/ops.cpp refuses them by name.
   Fp8KVCacheDataType kv_cache_dtype = Fp8KVCacheDataType::kAuto;
   float k_scale = 1.0f;
   float v_scale = 1.0f;
@@ -3446,9 +3449,10 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 // the fp8::scaled_convert scale convention, quant_utils.cuh:296-308) @ pin
 // 555967922. k_scale/v_scale are the per-tensor scales BaseKVCacheMethod loads
 // from the checkpoint (kv_cache.py:108-191); both must be > 0. Same shape/stride
-// contract as ReshapeAndCache; the ONLY difference is the fp8 store. CPU-only in
-// W1 (the CUDA fp8-KV store kernel is a named later brick); kFp8E5M2 CPU compute
-// is likewise a later brick.
+// contract as ReshapeAndCache; the ONLY difference is the fp8 store. Implemented
+// on CPU (W1, src/vt/cpu/cpu_cache.cpp) and CUDA (W2, src/vt/cuda/cuda_cache.cu,
+// gated byte-for-byte against the CPU arm); a backend that registers no provider
+// refuses by name in GetOp. kFp8E5M2 is a named later brick (spec W5).
 void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                         Tensor& v_cache, const Tensor& slot_mapping, Fp8KVCacheDataType kind,
                         float k_scale, float v_scale);

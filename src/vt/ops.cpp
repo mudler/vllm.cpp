@@ -3433,8 +3433,8 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(kind != Fp8KVCacheDataType::kAuto,
            "reshape_and_cache_fp8: kind must be an fp8 dtype (use ReshapeAndCache for auto)");
   VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
-           "reshape_and_cache_fp8: only fp8_e4m3 is implemented on CPU in W1 "
-           "(fp8_e5m2 CPU compute is a named later brick)");
+           "reshape_and_cache_fp8: only fp8_e4m3 is implemented "
+           "(fp8_e5m2 compute is a named later brick, spec W5)");
   VT_CHECK(k.rank == 3 && v.rank == 3,
            "reshape_and_cache_fp8: k/v must be rank-3 [num_tokens,num_kv_heads,head_size]");
   VT_CHECK(k_cache.rank == 4 && v_cache.rank == 4,
@@ -3475,9 +3475,11 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
            "reshape_and_cache_fp8: k_cache/v_cache page must be head-contiguous "
            "(stride[2] == head_size) — the NHD unbind-slice layout");
-  VT_CHECK(q.device.type == DeviceType::kCPU,
-           "reshape_and_cache_fp8: only the CPU fp8-KV store is implemented in W1 "
-           "(the CUDA fp8-KV store kernel is a named later brick)");
+  // NO device-class guard. W1 hard-refused every non-CPU queue here, which is
+  // what kept the CUDA arm unreachable; W2 lands that arm (cuda_cache.cu), so
+  // the op resolves through the provider table like every other op and a device
+  // with no registered fp8-KV store refuses BY NAME in GetOp
+  // (src/vt/op_provider.cpp:563-567) instead of by device class.
   VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
                v_cache.device == q.device && slot_mapping.device == q.device,
            "reshape_and_cache_fp8: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
@@ -3802,15 +3804,25 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
              "paged_attention: k_cache/v_cache must share one float dtype");
   } else {
     VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3,
-             "paged_attention: only fp8_e4m3 KV read is implemented on CPU in W1 "
-             "(fp8_e5m2 CPU read is a named later brick)");
+             "paged_attention: only the fp8_e4m3 KV read is implemented "
+             "(the fp8_e5m2 read is a named later brick, spec W5)");
     VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
              "paged_attention: fp8 KV read requires 1-byte fp8 cache (DType::kI8)");
     VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
              "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
-    VT_CHECK(q.device.type == DeviceType::kCPU,
-             "paged_attention: only the CPU fp8-KV read is implemented in W1 "
-             "(the CUDA fp8-KV paged-attention kernel is a named later brick)");
+    // WHICH BACKENDS HAVE AN fp8 READ. Unlike the fp8 STORE — a separate OpId
+    // that only the CPU and CUDA backends register, so an unimplemented backend
+    // refuses by name inside GetOp — the fp8 read rides ADDITIVE fields on
+    // PagedAttentionArgs of an op that kMETAL and kROCM already register for the
+    // float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider table can
+    // tell those two apart, so without this list an fp8 cache would reach a
+    // kernel that reads the same bytes as floats and returns silent garbage.
+    // AGENTS.md: refuse an unimplemented arm with a message that names the
+    // missing part. CPU landed in W1, CUDA in W2; Metal and ROCm are owed.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA,
+             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1) and "
+             "CUDA (KV-FP8 W2) only; this backend has no fp8 dequant on the cache read "
+             "and would read the fp8 bytes as its float dtype");
   }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.

@@ -26412,8 +26412,20 @@ per-tile ones.
 ### What this entry does NOT contain
 
 The **30-step shipped configuration** and the intra-DiT `dit.attn` attribution
-pair are being measured in a second lease and are **not in this table**. Scaling
+pair are being measured in a second lease and are **not in this table**.
+
+**That second lease is on a DIFFERENT BOOT**, and it matters. Its worker reports
+boot id `fabedc13-97a1-4cb9-909f-217a425d3f70` against this table's
+`c99b7805-6e26-47a7-bc9d-93d592d676a6`, so the box restarted between them.
+[#543](https://github.com/mudler/vllm.cpp/issues/543) measured a 12.79 % SM-clock
+difference between boots with no throttling on either, larger than the deficits
+it was being used to rank. So the second lease's RATIO is valid, because both of
+its arms are alternated inside it on one boot; its ABSOLUTE seconds are not
+comparable with the seconds in this table, and nothing below should be divided by
+anything above. Scaling
 the measured per-call cost predicts the shipped kernel's 30-step bucket at
-371.6 s against §20.5's independently measured **370.556 s** — 0.28 % — which is
-why the projection is stated at all, and it is still a projection until that pair
-lands.
+371.6 s, and §20.5 independently measured **370.556 s** — 0.28 % apart. That
+agreement is the reason a projection is stated at all, but read it for what it
+is: §20.5 ran on a THIRD boot, so this is a cross-boot comparison of absolute
+seconds and it supports the LINEARITY of the per-call scaling rather than
+licensing either number as the other's denominator.

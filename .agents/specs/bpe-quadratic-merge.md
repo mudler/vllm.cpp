@@ -1048,6 +1048,18 @@ Read them as gate margin. They are session readings and neither is a constant.
 Nothing was re-benchmarked: the W4 A/B stands as recorded, and no growth-ratio
 assertion was reintroduced in any form.
 
+**Rerun again after the merge, because the base moved under the branch.**
+`origin/main` advanced to `483cd3198` while the closing commit was being gated,
+so it was merged and all eight suites were run again on the merged head with no
+rebuild needed (`ninja: no work to do` -- the merge carries `README.md`, one
+spec and one index row, and touches no source). Same eight `exit 0`, same eight
+`SUCCESS!`, same case and assertion counts, and the same **320 id vectors, 0
+mismatches**. The cost case read 76.624 ms and 84.892 ms at a 1-minute load
+average of 91.79, against the same 2,000 ms bound. Two runs at two loads, 38.48
+and 91.79, moved those figures by about 6% and 1.5% while the bound has three
+orders of headroom, which is the whole argument for an absolute bound over a
+ratio, restated as a measurement instead of a claim.
+
 ### Promotion
 
 **Promoted `GATING` -> `DONE` on 2026-08-21.** The rerun above is the operator's

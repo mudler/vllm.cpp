@@ -643,6 +643,20 @@ TEST_CASE("dflash2 runner: the STARTUP notice names what runs, not what is owed"
   // And that the port is BEYOND-PIN, which is the one thing a user of a DFlash2
   // checkpoint cannot discover from the checkpoint.
   CHECK(captured.find("52816") != std::string::npos);
+  // THE UPSTREAM STATE, PINNED AS A WORD AND NOT ONLY AS A NUMBER. vllm#52816
+  // MERGED on 2026-08-21 at 05:27:22Z, and this notice went on telling every
+  // user who loads a DFlash2 draft that it "is OPEN upstream" -- through W6 and
+  // through W6's first repair wave, which corrected five statements in the spec
+  // and never reached the two live surfaces. The line above matches only
+  // "52816", so it could not see the difference. These four can: the merged
+  // wording and the merged head must be PRESENT, and both spellings of the open
+  // claim must be ABSENT. When #1561 reconciles the port onto the merged head,
+  // the notice and this case move together.
+  CHECK(captured.find("MERGED upstream") != std::string::npos);
+  CHECK(captured.find("3406ec1dae9916f920b90f0dbf90dcf54923d042") !=
+        std::string::npos);
+  CHECK(captured.find("OPEN upstream") == std::string::npos);
+  CHECK(captured.find("is OPEN") == std::string::npos);
 }
 
 TEST_CASE("dflash2 runner: D9's SCALARS move the drafted tokens, in production") {

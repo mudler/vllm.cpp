@@ -109,10 +109,24 @@ Dflash2ProposeState Dflash2SelectCandidates(const std::vector<float>& block_logi
   // the target it was trained on.
   //
   // The comparison is STRICT, which is stricter than the out-of-range read
-  // requires. That is deliberate and it is also OWED: `## Owed` O16 hands W6 the
-  // job of reading upstream's own condition at the PR-head oracle, because a
-  // strict `==` is a NEW refusal class on the already-shipping safetensors lane
-  // for any target whose head is padded relative to the draft's codebooks.
+  // requires. W6 SETTLED why, by reading the beyond-pin oracle rather than
+  // guessing (`## Owed` O16, #1314): UPSTREAM HAS NO COMPARISON AT ALL. Its
+  // `compute_candidates` masks the head's padded tail to -inf
+  // (`num_org_vocab_padding`) before the top-k, so no padded column can survive
+  // and every id reaching the codebooks lies in the target's ORIGINAL vocab
+  // range; the equality between that range and the draft's `vocab_size` is held
+  // by checkpoint pairing and enforced by nothing.
+  //
+  // So the OPERAND is the thing to watch, not the operator. `vocab` here is the
+  // MATERIALISED head width, and upstream's reachable span is that width minus
+  // its padding. The two are the same number in this engine and only because of
+  // what this engine is: single-device, no tensor parallelism, no head padding,
+  // so `Dflash2CandidateArgs::num_org_vocab_padding` is structurally 0 on every
+  // path that reaches here. THE FIRST TIME THIS ENGINE PADS AN LM HEAD -- a TP
+  // shard, or a checkpoint that ships padded rows -- this comparison must move
+  // to `vocab - num_org_vocab_padding` in the SAME edit, or a target vLLM would
+  // draft for is refused here. It is not written that way today because a
+  // subtraction of a provably-zero quantity is an arm no entry point can reach.
   const int64_t codebook_rows =
       weights.candidate_selector.predecessor_codebook.shape[0];
   VT_CHECK(codebook_rows == vocab,

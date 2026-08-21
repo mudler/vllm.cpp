@@ -2525,6 +2525,17 @@ target_compile_definitions(test_qwen27_dflash_spec_decode PRIVATE
 target_include_directories(test_qwen27_dflash_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-DFLASH2 W6 — the DFlash2 e2e gate (#1314): G2 draft-token identity and
+# G3 SAME-TRAJECTORY acceptance against the beyond-pin oracle
+# (vllm-project/vllm#52816 @ 66e5414c6, TRITON_ATTN). dgx-only; loud SKIP
+# everywhere else, naming the two checkpoints and the golden it needs.
+vllm_cpp_add_test(test_qwen38_dflash2_spec_decode
+  parity/test_qwen38_dflash2_spec_decode.cpp)
+target_compile_definitions(test_qwen38_dflash2_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen38_dflash2_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # SPEC-MTP M-mtp-2 — the 35B MoE-MTP k=1 speculative-decode three-way identity
 # gate (Qwen3_5MoeMTP: our spec-ON == our spec-OFF == vLLM greedy) + measured
 # nonzero acceptance. Mirror of the 27B gate at 35B (MoE MTP draft head).

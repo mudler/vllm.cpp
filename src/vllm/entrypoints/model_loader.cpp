@@ -553,9 +553,11 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
          "this architecture -- a DFlash2 draft runs its block forward off the "
          "paged CUDA-graph fast path, because the candidate selector needs the "
          "hidden states of the same forward its logits came from. This port "
-         "mirrors vllm-project/vllm#52816, which is OPEN upstream at head "
-         "66e5414c6d75a8529473d977f7458c140bbab8a0; it does not advance the "
-         "parity pin.\n";
+         "mirrors vllm-project/vllm#52816, which MERGED upstream on 2026-08-21 "
+         "at head 3406ec1dae9916f920b90f0dbf90dcf54923d042, merge commit "
+         "b389ac29465b33f9e9c534df221ea3c129e9793f. It does not advance the "
+         "parity pin, and the port is not yet reconciled onto that merged head "
+         "(issue #1561).\n";
 }
 
 // SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark

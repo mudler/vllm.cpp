@@ -26067,3 +26067,246 @@ never construct `Qwen3NextAttention`. The `Qwen3.8-27B` rows ran through
 `tools/bench/run_serve_low.py`, which has passed `--language-model-only` since it
 was written. The Qwen3.5-4B GDN prefill kernel row is conv and post-conv timing
 on the LINEAR-attention path, which the full-attention preamble does not touch.
+
+## SPEC-DFLASH2 W6 — the gates, taken against a beyond-pin oracle that had to be made to answer (2026-08-21, `row/SPEC-DFLASH2-W6`, `dgx:gpu0`, #1314 / #1456 / #1538)
+
+**The first time either engine has been asked what the OTHER's DFlash2 draft
+proposed.** Everything before this wave measured mechanisms; this measures the
+two claims the mechanisms were built to make.
+
+### The two engines, pinned
+
+| | ours | oracle |
+|---|---|---|
+| revision | tree `0ac277b3a66b5deabe4871959f0f03566c08deda` (RECONSTRUCTED, see below), base `origin/main` `5702d8f83` | vLLM `0.1.dev1+g66e5414c6` ([vllm#52816](https://github.com/vllm-project/vllm/pull/52816) head `66e5414c6`, **MERGED** `2026-08-21T05:27:22Z` at `3406ec1d`, merge commit `b389ac29`) |
+| artifact | built in-lease, `nvcc` 13.0, `sm_121a`, `CUDA_OBJECTS_BUILT=34` | wheel sha256 `fbc247ab1bda93a81ff7a68658cdda65b697e263ad2c43a2bc62c2591d207439` |
+| attention | our own kernels | `TRITON_ATTN`, read back off the built engine and asserted |
+| graphs | DFlash2 draft runs OFF the paged CUDA-graph fast path | `Capturing dflash2 CUDA graphs (FULL)`, 77 s |
+| concurrency | 1 | `max_num_seqs=1`, `enforce_eager=False` |
+
+**THE OURS-SIDE PIN WAS WRONG AND IS CORRECTED HERE (2026-08-21).** This entry
+originally pinned tree `81b530cff097db493e44e4de9a1c727530ed4467`. That tree is
+the FAILING run's tree: it lacks `Reconstructed::verified`, the per-prompt
+`CHECK(our_recon_here == their_acc)` and three instrument assertions — exactly
++8 executed assertions on this workload — and this entry's own text records the
+pre-fix run as 134 assertions with one failure against the spec's 142/0.
+`134 + 8 = 142`. The two recorded trees differ in exactly ONE compiled file
+(`tests/parity/test_qwen38_dflash2_spec_decode.cpp`; the goldens are data), so
+the passing binary's compiled sources are `81b530cff`'s with blob
+`47c53d17a58584987599028519148747b3f018e9` in that slot, which is tree
+`0ac277b3a66b5deabe4871959f0f03566c08deda`. It is a RECONSTRUCTION: no
+`git write-tree` was taken after the fix, so no recorded object names the passing
+run. An earlier revision of this entry added that "the dispatched mutation counts
+(5 and 37)" were taken on `81b530cff` by the same arithmetic; that clause is
+DELETED, because this entry's own `### Mutations` heading says W6 recorded none,
+`git grep "5 and 37" bb416e0ae` returns nothing, and W6's commit body carries no
+mutation prose — the two counts are unfindable, and the standing statement is
+that **W6 recorded no mutation count anywhere**. `81b530cff` also carries no
+`dflash2_27b` goldens at all, which is CONSISTENT with the run reading one
+through `VLLM_DFLASH2_GOLDEN` off the lease — an inference, not a reading, since
+an untracked golden in the run's worktree fits the same evidence and no log
+survives to separate them. Either way the golden's sha256 is what pins the DATA
+and it matches the committed file byte for byte.
+
+**AND THE ORACLE'S PULL REQUEST HAD ALREADY MERGED WHEN THIS WAS WRITTEN.**
+vllm#52816 merged at `2026-08-21T05:27:22Z`, 46 minutes before the wave's work
+commit. The capture is legitimately pinned to `66e5414c` because that is the
+wheel that ran, and it predates the merge — but the row's gate head is now one
+merge behind vLLM's `main`, which
+[#1561](https://github.com/mudler/vllm.cpp/issues/1561) owns.
+
+Target `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, 18
+shards, 51.75 GiB, verified against the pinned checkout by `config.json` and
+`model.safetensors.index.json` sha256 rather than by directory name. Draft
+`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+sha256 `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c`
+recomputed from the staged copy. k=7, greedy, `max_tokens` 64, the four
+`SPEC-DFLASH` D5 prompts.
+
+### G2 — 4/4 token-exact, 45/47 draft blocks byte-identical
+
+| prompt | tokens | shared | draft blocks identical |
+|---|---|---:|---:|
+| `The capital of France is` | exact | 64/64 | 14/15 |
+| `def fibonacci(n):` | exact | 64/64 | 10/10 |
+| `Q: What is 17 * 23?\nA:` | exact | 64/64 | 10/10 |
+| `The three laws of robotics are` | exact | 64/64 | 11/12 |
+
+The two blocks that differ each differ by ONE token at slot 2 and then emit the
+same target tokens: `[14227 369 14227 13 198 760 6511]` against
+`[14227 369 24844 ...]`, and `[39262 279 9861 2574 314 539 279]` against
+`[39262 279 10895 ...]`.
+
+**The attribution to "the selector's rank contraction" is WITHDRAWN**
+([#1564](https://github.com/mudler/vllm.cpp/issues/1564)). Nothing here measured
+which op moved: the golden records `{call, req_row, anchor, drafts}` and no
+values, no logits and no top-2 gap. The shape argues against the op that was
+named — in BOTH blocks only slot 2 changes while slots 3-6 are byte-identical,
+and `src/vt/cpu/cpu_ops.cpp:3219` has the walk read the predecessor row the
+previous step chose, so a flipped child index would move four later slots and
+did not. A rank swap at the same winning slot in `ComputeCandidates`' top-k
+explains it with no coincidences. Neither is measured; the next capture records
+the top-2 candidate margin on both sides, which both engines already compute.
+
+### G3 — acceptance IDENTICAL, same-trajectory — and a COROLLARY of G2, not a second measurement
+
+All four prompts produced the same token stream on both engines, so there is no
+trajectory to confound. "By construction" means by ADMISSION and not by teacher
+forcing: both engines run FREE and a prompt is admitted only when the two
+independently emitted the same stream.
+
+**The per-prompt equality below is very nearly ENTAILED by G2's result.**
+Established 2026-08-21 by recomputing the oracle side from the committed golden:
+outputs identical on all four prompts, 45 of 47 blocks byte-identical (so the
+reconstruction runs on identical inputs for 45 of them), and BOTH divergent
+blocks have their divergent slot rejected on both sides — record 0 block 13's
+output slot 2 is `31785`, neither draft's candidate, so both accept 2; record 3
+block 6 has `279` at slot 1 in both drafts against an output of `9861`, so both
+accept 1. Per-prompt equality follows arithmetically, and so do 216-vs-216 and
+the 7-token truncation deficit. The result is a real consistency check on the
+reconstruction and it is NOT withdrawn — had either flipped slot been accepted on
+one side the counts would have parted — but it must not be quoted as an
+independent second gate reading.
+
+| prompt | ours | oracle |
+|---|---:|---:|
+| 0 | 49 | 49 |
+| 1 | 54 | 54 |
+| 2 | 54 | 54 |
+| 3 | 52 | 52 |
+| total | **209** | **209** |
+
+Counted the same way on both sides, from drafts and output. On the other
+instrument they also agree: our runner's counter reads 216 and
+`vllm:spec_decode_num_accepted_tokens` reads 216; our reconstruction verifies 47
+blocks and `vllm:spec_decode_num_drafts` reads 47.
+
+**Both of those were PRINTED and neither was ASSERTED in the run this entry
+records.** `our_acc_sum` was a `MESSAGE` only, our verified block count was not
+computed at all, and the "47" the gate printed was `draft_blocks_compared` —
+bounded by the shared-prefix cut, so a count of blocks the gate could PAIR rather
+than blocks this engine verified. What the run DID assert is the oracle's
+reconstruction against vLLM's two counters and the per-prompt
+reconstruction-vs-reconstruction equality. Both are asserted now, guarded on
+`same_traj == total` because vLLM's counters are pooled, and NEITHER new
+assertion has yet executed on a device. The 209/216 gap is
+`max_tokens` truncating the last block of three of four requests, it appears on
+BOTH engines, and mixing the two instruments is the D8 shape in miniature.
+
+### G4 / O17 — a published artifact LOADED, and O13 measured at runtime
+
+`examples/vllm-cli` was pointed at `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`
+(1 143 006 752 B, sha256 `18a380ef...`) over the real 27B target. It loaded,
+proposed 7 speculative blocks and generated 24 tokens.
+
+| arm | on disk | peak RSS |
+|---|---:|---:|
+| Q4_K_M GGUF | 1.06 GiB | 47 028 616 KB (44.85 GiB) |
+| safetensors | 3.58 GiB | 46 701 608 KB (44.54 GiB) |
+
+0.70% apart on files 2.52 GiB apart, and the QUANTIZED arm is the LARGER by
+319 MiB. The two arms propose DIFFERENT drafts and emit the SAME tokens.
+
+### The oracle's own backend A/B, which reprices what G2 may demand
+
+Same wheel, same host, same workload, FULL decode graphs on both; only the
+attention backend differs.
+
+| | FLASH_ATTN | TRITON_ATTN |
+|---|---:|---:|
+| `spec_decode_num_drafts` | 50 | 47 |
+| `spec_decode_num_draft_tokens` | 350 | 329 |
+| `spec_decode_num_accepted_tokens` | 209 | 216 |
+| accepted / drafted | 0.597 | 0.657 |
+
+**Identical output on 3 of 4 prompts**; `def fibonacci(n):` diverges at
+generated index 4. vLLM does not reproduce its own greedy continuation across
+two of its own backends on this model, so a 4-of-4 strict bar would be one vLLM
+fails against itself.
+
+**AND THAT FLASH_ATTN ARM'S BACKEND LABEL IS A POST-HOC RELABEL**
+([#1562](https://github.com/mudler/vllm.cpp/issues/1562)). Its golden carries
+`attention_backend_source: "corrected from the run log by w6-relabel.py"`, not a
+value read back off the built engine, which is the rule `## Owed` O22 itself lays
+down. Neither the log nor the script is committed, so the label is unauditable.
+The TRITON_ATTN arm's label WAS read back and is unaffected. That golden also
+carries NO per-block drafts on any record, so it can answer output identity and
+cannot answer draft identity or acceptance; the gate now reports that as VOID
+rather than as a structural finding about our drafts.
+
+### FLASH_ATTN is USABLE here, which #1456 concluded it was not
+
+The first capture exported `VLLM_ATTENTION_BACKEND=TRITON_ATTN`, vLLM ignored it
+because that variable does not exist at this revision, auto-selection took
+`FLASH_ATTN`, and the run worked end to end -- 54.87 GiB loaded, graphs captured,
+256 coherent tokens, speculation live. #1456's SASS measurement stands;
+`sm_80` PTX JITs forward and `cudaErrorUnsupportedPtxVersion` is the opposite
+failure. Posted to #1456.
+
+### SPEED — NOT TAKEN
+
+No ratio is claimed and none should be inferred. No idle-host same-binary A/B was
+run. Our DFlash2 draft is off the paged CUDA-graph fast path while the oracle
+graphs its draft step. And every wall-clock here was dominated by reading a
+51.75 GiB checkpoint over CIFS: 11:17 and 12:15 for 24 tokens, `tok_s` 0.115 and
+0.090, which measure loading and are recorded so nobody quotes them as decode.
+
+### The device arms, on hardware, zero skips
+
+`test_ops_dflash2_grouped_conv` 9936 assertions, `test_ops_dflash2_selector_edges`
+3859, `test_ops_topk_values_indices` 560, `test_ops_dflash2_path_walk` 83,
+`test_qwen3_dflash2_draft` 277, `test_dflash2_runner_reach` 86,
+`test_dflash2_argmax_guard` 30. All `Status: SUCCESS!`, all
+`CUDA_SKIP_LINES=0`, `DEVICE_SUITES_FAILED=0`.
+
+### Four instrument defects, three in the oracle hook and one in our own gate
+
+Recorded in the spec's `## Owed` O23. The pattern is the finding: each presents
+as a verdict about the CODE. The engine core is a separate process by default;
+`capture_model()` calls the hooked method inside a CUDA graph capture; and
+`_generate_draft` is the wrong seam entirely because `propose` replays the
+captured graph. The third asserted `InprocClient`, `HOOK_ON_CLASS=traced` and
+the resolved backend, and was still blind. Only the abort-on-zero caught them.
+The fourth was ours: the gate compared 55 raw propose calls against vLLM's 47
+drafts, which counts only blocks starting inside the output. One assertion of
+134 failed on it.
+
+### Mutations
+
+W6 recorded none. Taken 2026-08-21 by the W6 repair wave on the CPU dev box at
+the merged tree, each with its match count, `git diff --stat` and compile rc
+printed, each restored sha256-verified and rebuilt. Unmutated the suite reads
+**4 cases / 65 assertions / 0 failed / `Status: SUCCESS!` / rc 0** there (the
+e2e case SKIPs without a checkpoint); before this wave it read 3 cases / 41, and
+after the SECOND repair wave it reads 4 cases / 70.
+
+| mutation | result |
+|---|---|
+| `ListField` drops the last id of every list | 1 case / 7 of 65 red, rc 1 |
+| `len += 1 + acc` becomes `len += acc` | 1 case / 7 of 65 red, rc 1 |
+| the `len + j >= out.size()` truncation guard deleted | **SIGSEGV, rc 139** |
+
+**SECOND repair wave (2026-08-21).** Unmutated `test_dflash2_runner_reach` reads
+3 cases / 90 assertions and `test_qwen38_dflash2_spec_decode` 4 cases / 70, both
+`SUCCESS!` / rc 0.
+
+| mutation | result |
+|---|---|
+| **M1** — the DFlash2 startup notice reverted to its pre-repair `"is OPEN upstream at head 66e5414c"` text (match 1, `+3/-5`, compile rc 0) | 1 case / **4 of 90** red, `Status: FAILURE!`, rc 1 — the four new merged-state assertions and nothing else |
+| **M2** — `len < out.size()` -> `len <= out.size()` on `Reconstructed::verified` | **NOT TAKEN.** Attempted and VOIDED by a harness race: two instances ran concurrently and the second took its baseline after the first had mutated, so it read `match count: 0` — its "before" hash `770bee0a` is the MUTATED file, against the clean `843d610b`. Tree verified undamaged (both files byte-identical to `HEAD`); harness now takes a `flock`. A clean retake was unaffordable because every cycle rebuilds the whole 464-object library and the box ran at loadavg 145 / 12 objects per 10 min. The `at_end` boundary fixture IS committed and is UNPROVEN; taking M2 on a quiet box is owed |
+| liveness by TOTAL block count instead of per record | 1 case / 1 red |
+| every golden declared live | 1 case / 2 red |
+| `with_blocks` counts drafts-less records too | 1 case / 4 red |
+| the `hook_stats` residual claimed 0 instead of 3 | 1 case / 1 red |
+
+**The third one is why a doctest assertion line is not a verdict.** It prints
+`assertions: 64 | 64 passed | 0 failed` — one FEWER than green and all passing —
+while the case failed and the process died on a signal. `Status:` and the exit
+code bind; the assertions line reads like a pass.
+
+NOT mutated, and named rather than assumed: the e2e case's own `gd.live` guards
+and its two new ours-vs-theirs assertions. That case is dgx-only and SKIPs here,
+so no mutation of it — and no production-call-site deletion — can be executed on
+this box. The always-on case exists so the liveness RULE is gated where it runs;
+the WIRING is owed a device run.
+

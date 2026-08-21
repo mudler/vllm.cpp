@@ -93,6 +93,21 @@ The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
 DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
 picking a smaller quantization saves download and disk and does not save memory.
 
+Loading a DFlash2 draft prints a notice to **stderr**, on both the safetensors
+and the GGUF arm. **It prints TWICE per load**, on the server, the C API and the
+bench client alike: the loader reaches the same check from two places on one set
+of engine parameters — directly, before the target is mapped, and again through
+the speculative-config resolution the engine constructor runs — and the check
+carries no once-flag. That is a known defect and it is cosmetic: nothing is
+refused, and no WEIGHTS are loaded twice -- what re-runs is the classification
+and its paragraph
+([#1607](https://github.com/mudler/vllm.cpp/issues/1607)). The notice is purely
+informational. It names what runs, what is still owed (the bf16 residency
+above, and that no throughput number has been taken), and that the port mirrors
+[vllm#52816](https://github.com/vllm-project/vllm/pull/52816), which merged
+upstream on 2026-08-21 at `3406ec1d` and onto which this port is not yet
+reconciled ([#1561](https://github.com/mudler/vllm.cpp/issues/1561)).
+
 [Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
 draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other

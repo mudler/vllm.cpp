@@ -115,9 +115,15 @@ struct SpeculativeConfig {
   // IsDflash2Draft: whether a DFlash draft is a DFlash2 one, by the architecture
   // upstream itself selects on.
   //
-  // BEYOND-PIN (SPEC-DFLASH2 W1, #1314). vllm-project/vllm#52816 is OPEN at head
-  // `19c9351904df4c63042671bc67a866ca48dc7d6f`; the parity pin `555967922` does
-  // not carry the architecture at all, and this row does NOT advance the pin.
+  // BEYOND-PIN (SPEC-DFLASH2 W1, #1314). vllm-project/vllm#52816 MERGED upstream
+  // on 2026-08-21 at 05:27:22Z, at head
+  // `3406ec1dae9916f920b90f0dbf90dcf54923d042`, merge commit
+  // `b389ac29465b33f9e9c534df221ea3c129e9793f`. This comment said OPEN at head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f` -- the FIRST of three heads the
+  // pull request carried -- and was doubly stale; corrected 2026-08-21 by the
+  // W6 repair wave. The parity pin `555967922` still does not carry the
+  // architecture at all, this row does NOT advance the pin, and reconciling the
+  // port onto the merged head is owed under #1561.
   // Upstream registers `"DFlash2DraftModel" -> ("qwen3_dflash2",
   // "DFlash2Qwen3ForCausalLM")` (`model_executor/models/registry.py:628`) and
   // asks exactly this question in two places: the speculator selection

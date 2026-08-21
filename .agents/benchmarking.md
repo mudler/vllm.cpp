@@ -93,7 +93,10 @@ returns `LGC_RC=4`, "The current user does not have permission to change
 clocks", even as root, measured 2026-08-19 on `dgx:gpu0` in three jobs. Fleet
 devices are reachable by lease only, so for them the SM clock can be SAMPLED and
 not pinned, and a pairing may be refused on within-run spread with no lever to
-fix it. Read
+fix it. **The missing capability is named and the ask is a one-line manifest
+change**: the worker's `CapBnd` is the default OCI set and holds no
+`CAP_SYS_ADMIN`, measured inside leases on two fleet devices
+([`specs/lease-gpu-capability.md`](specs/lease-gpu-capability.md), #1354). Read
 [`environment.md`](environment.md) before you plan a paired series.
 
 Pinning is a **shared-host mutation**. Never run `-lgc` or `-rgc` while another

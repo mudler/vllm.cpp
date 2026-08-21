@@ -3,6 +3,9 @@
 **Row:** `SPEC-DFLASH2` (engine-matrix, speculative decoding).
 **Issue:** [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
 **Predecessor:** [dflash-spec-decode.md](dflash-spec-decode.md) (`SPEC-DFLASH`, DONE).
+**In-flow fix:** [#1575](https://github.com/mudler/vllm.cpp/issues/1575) — W5's `tests/vllm/models/test_qwen3_dflash2_gguf.cpp` called `::getpid()` directly instead of the
+portable `tests/support/process_id.h` seam, which held `build-newest-gcc` red on `main` from
+`5702d8f83`. Fixed in flow; not owed.
 **Kind:** structured spec. No production code lands with this spec; the pull
 request shape for this row is SEPARATE spec and implementation pull requests,
 recorded at row claim on 2026-08-19.

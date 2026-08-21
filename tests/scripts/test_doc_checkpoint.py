@@ -42,6 +42,24 @@ ROW_TABLE = """# Kernel matrix
 | `KERNEL-BETA` | beta | [beta](specs/beta.md) | `{beta}` | ops |
 """
 
+SECTION = re.compile(r"^##\s+(?P<name>.+?)\s*$", re.MULTILINE)
+
+
+def owed_section(path: Path) -> str:
+    """The body of the `## Owed` SECTION, not the first place that text appears.
+
+    An inline mention of `## Owed` in prose is not the section, and splitting on
+    the literal makes an assertion about the section unfalsifiable -- see
+    test_the_owed_section_reader_is_not_the_whole_file.
+    """
+    body = path.read_text(encoding="utf-8")
+    for match in SECTION.finditer(body):
+        if match.group("name") == "Owed":
+            rest = body[match.end():]
+            return SECTION.split(rest, maxsplit=1)[0]
+    raise AssertionError(f"{path} has no `## Owed` section")
+
+
 # A row spec carrying the relocated live position (ENG-NOW-DERIVED, #374).
 SPEC_WITH_NOW = "# Alpha\n\n## Scope\n\nthings\n\n## Now\n\nRun the focused gate.\n"
 SPEC_WITHOUT_NOW = "# Alpha\n\n## Scope\n\nthings\n"
@@ -645,9 +663,16 @@ class AnchorBackfillIsDeliberatelyExcluded(unittest.TestCase):
     """The ruling #1434 asked for, kept executable rather than only argued.
 
     `.agents/feature-matrix.md` names `PARTIAL`, `BLOCKED` and `ANCHOR-BACKFILL`
-    together, so "the matrix calls it a state" cannot be the test. The test is
-    whether `docs/STATUS.md` PROJECTS it, because `REQUIRED["lifecycle"]` is
-    (STATUS, BENCHMARKS) and carries all of them or none.
+    together, so "the matrix calls it a state" cannot be the test.
+
+    W1 and W2 wrote the test as "does docs/STATUS.md PROJECT the word". W3
+    falsifies that as a CRITERION and keeps the falsification executable below:
+    `Inventoried` is on the page and is a record state, while READY, TODO,
+    BLOCKED, DROPPED and N/A are claim states the page has never named. The word
+    remains a useful piece of EVIDENCE about a state and it is not the rule. The
+    rule is whether the position belongs to the CAPABILITY or to the ROW'S
+    RECORD, because `REQUIRED["lifecycle"]` is (STATUS, BENCHMARKS) and carries
+    all of them or none.
     """
 
     def test_partial_is_a_public_status_term(self):
@@ -670,16 +695,83 @@ class AnchorBackfillIsDeliberatelyExcluded(unittest.TestCase):
 
         That is the shape check-doc-checkpoint.py:4-17 records as the reason
         this file was rewritten: 16 of 20 red CI runs and six hardcoded
-        escape-hatch path sets. Paying the `## Now` half it genuinely owes needs
-        REQUIRED to carry a spec-only class, which is a different change and is
-        listed under `## Owed` in doc-checkpoint-lifecycle-states.md.
+        escape-hatch path sets. The `## Now` half is paid -- spec_now_errors is
+        called from errors_for directly -- and the residual it leaves is the
+        DEMOTION out of a claim state into a record one, which is what the spec
+        section this test reads has to keep naming.
+
+        Anchored to the `## Owed` SECTION, not to the first literal `## Owed` in
+        the file. W2 split on the string, and the first occurrence is inline
+        prose 420 lines above the section, so the assertion scanned most of the
+        spec body and could not fail.
         """
         self.assertNotIn("ANCHOR-BACKFILL", checker.STATES)
-        spec = (
+        owed = owed_section(
             ROOT / ".agents/specs/doc-checkpoint-lifecycle-states.md"
-        ).read_text(encoding="utf-8")
-        self.assertIn("## Owed", spec)
-        self.assertIn("ANCHOR-BACKFILL", spec.split("## Owed", 1)[1])
+        )
+        self.assertIn("ANCHOR-BACKFILL", owed)
+
+    def test_the_owed_section_reader_is_not_the_whole_file(self):
+        """MUTATION on the reader above, because a tautology reads as a pass.
+
+        A section reader that silently returned the file would make the test
+        above green no matter what `## Owed` says. Prove it is a section: the
+        text it returns must be a strict, much smaller suffix of the spec, and
+        must not contain the spec's title line.
+        """
+        path = ROOT / ".agents/specs/doc-checkpoint-lifecycle-states.md"
+        body = path.read_text(encoding="utf-8")
+        owed = owed_section(path)
+        self.assertIn(owed, body)
+        self.assertNotIn(body.splitlines()[0], owed)
+        self.assertLess(len(owed), len(body) / 2)
+        self.assertGreater(len(owed), 0)
+
+    def test_inventoried_is_a_public_status_term_and_still_a_record_state(self):
+        """The half W2 never checked, and it inverts W2's stated criterion.
+
+        W2's `RECORD_STATES` comment said the three are "real lifecycle positions
+        that the public pages carry NO term for". `docs/STATUS.md` defines
+        `Inventoried` in the lifecycle table and uses it in a live projection
+        cell, so applying W2's own executable admission criterion to INVENTORIED
+        returns the OPPOSITE answer to the one W2 recorded. The ruling survives
+        re-derivation on a different argument -- INVENTORIED is where a pre-claim
+        row and a demoted row both sit, so admitting it makes SPIKE ->
+        INVENTORIED demand both public surfaces for a row that has never claimed
+        anything -- and this test holds the two facts together so nobody has to
+        take the comment's word for either.
+        """
+        status = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "| Inventoried | The gap has a stable record but no accepted "
+            "implementation |",
+            status,
+        )
+        self.assertIn("Inventoried", status.split("### User-facing surfaces", 1)[1])
+        self.assertIn("INVENTORIED", checker.RECORD_STATES)
+        self.assertNotIn("INVENTORIED", checker.STATES)
+
+    def test_the_public_term_test_is_neither_necessary_nor_sufficient(self):
+        """Both limbs, so the wrong criterion cannot come back by quotation.
+
+        NOT SUFFICIENT: `Inventoried` is on the page and is a record state.
+        NOT NECESSARY: five claim states appear nowhere on it.
+        """
+        status = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
+        self.assertIn("Inventoried", status)
+        self.assertIn("INVENTORIED", checker.RECORD_STATES)
+        for state in ("READY", "TODO", "BLOCKED", "DROPPED", "N/A"):
+            with self.subTest(state=state):
+                self.assertIn(state, checker.STATES)
+                self.assertNotIn(state, status)
+                self.assertNotIn(state.capitalize(), status)
+
+    def test_spike_is_not_a_public_status_term(self):
+        """Re-derived separately from ANCHOR-BACKFILL rather than bundled."""
+        status = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
+        self.assertNotIn("SPIKE", status)
+        self.assertNotIn("Spike", status)
+        self.assertIn("SPIKE", checker.RECORD_STATES)
 
 
 
@@ -812,19 +904,23 @@ class RecordStatesAreResolvedButNotClaims(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn(".agents/specs/alpha.md", " ".join(errors))
 
-    def test_a_record_move_reaching_a_claim_state_stays_a_record_move(self):
+    def test_a_record_move_reaching_a_claim_state_is_a_claim_move(self):
         """INVENTORIED -> DONE crosses the boundary, so which side wins?
 
-        The record side. STATUS.md can say what a DONE row does, but the move
-        itself starts from a position that page never carried, and the arrival
-        rule below already governs a row that appears as DONE. Pinned so that
-        the polarity is a decision rather than an accident of the `and`.
+        The CLAIM side, keyed on the destination. W2 pinned the opposite on a
+        false premise -- "the arrival rule below already governs a row that
+        appears as DONE" -- and the arrival rule fires only when `previous is
+        None`, which is exactly what W2 stopped being true. Resolving the record
+        states is what removed the arrival rule's cover, so the both-endpoints
+        test silently dropped (STATUS, BENCHMARKS) for the very moves that had
+        been gated through it. See TheDestinationDecidesTheMoveClass for all
+        nine and for the mutation that proves this line is what fires them.
         """
         classes, _ = self.classify(
             ROW_TABLE.format(alpha="INVENTORIED", beta="DONE"),
             ROW_TABLE.format(alpha="DONE", beta="DONE"),
         )
-        self.assertNotIn("lifecycle", classes)
+        self.assertIn("lifecycle", classes)
 
     def test_a_record_move_on_a_row_linking_no_spec_is_not_an_error(self):
         """The one narrowing in this change, and it is stated as such.
@@ -1002,6 +1098,197 @@ class RecordStatesAreResolvedButNotClaims(unittest.TestCase):
         self.assertEqual(self.errors(paid, *moved), [])
 
 
+class TheDestinationDecidesTheMoveClass(unittest.TestCase):
+    """GATE-DOC-CHECKPOINT-STATES W3 (#1434): the repair of a W2 LOOSENING.
+
+    W2 keyed the move class on both endpoints::
+
+        kind = CLAIM if previous in STATES and state in STATES else RECORD
+
+    Before W2 a row sitting in INVENTORIED, SPIKE or ANCHOR-BACKFILL was absent
+    from the BEFORE map, so `previous` was None and the ARRIVAL rule fired,
+    pulling in REQUIRED["lifecycle"] = (STATUS, BENCHMARKS). Resolving the record
+    states made `previous` resolve, which made the arrival rule unreachable, and
+    the both-endpoints test then sent the move down the RECORD branch. Nine
+    transitions went RED -> GREEN across W2 with the spec `## Now` paid and the
+    public surfaces withheld, and 569 of the 793 resolved rows sit in a record
+    state, so that is the exit path of most of the tree.
+
+    Measured on scratch commits with the real CLI, spec `## Now` paid and
+    docs/STATUS.md + docs/BENCHMARKS.md withheld: 9 of 9 rc 1 at e2a9e035d, 9 of
+    9 rc 0 at ba4634204 (== 503e45900), 9 of 9 rc 1 with the destination-keyed
+    form.
+
+    THESE CASES ARE CONSTRUCTED ON PURPOSE. W2's safety argument was a replay of
+    400 commits reporting 0 newly green, and a replay of already-gated history
+    cannot detect the removal of the obligation that gated it: every commit that
+    would have gone green had already paid, because the pre-W2 gate made it. The
+    three real commits that exercise these transitions -- 2a976eb9f, 678fc672c,
+    7a0e6c82b -- are green under every variant for exactly that reason. Withhold
+    the two public paths from the same tree change and W2 alone reports no
+    lifecycle move at all.
+    """
+
+    RECORD_SOURCES = ("INVENTORIED", "SPIKE", "ANCHOR-BACKFILL")
+    CLAIM_DESTINATIONS = ("ACTIVE", "GATING", "DONE")
+
+    def errors(self, paths, before_text, after_text):
+        original = checker.blob
+
+        def fake(rev, path):
+            if path.startswith(".agents/specs/"):
+                return SPEC_WITH_NOW
+            return before_text if rev == "BEFORE" else after_text
+
+        checker.blob = fake
+        try:
+            return checker.errors_for(set(paths), "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    def classify(self, before_text, after_text):
+        original = checker.blob
+        checker.blob = lambda rev, path: (
+            before_text if rev == "BEFORE" else after_text
+        )
+        try:
+            return checker.classify({".agents/kernel-matrix.md"}, "BEFORE", "AFTER")
+        finally:
+            checker.blob = original
+
+    def move(self, source, destination):
+        return (
+            ROW_TABLE.format(alpha=source, beta="DONE"),
+            ROW_TABLE.format(alpha=destination, beta="DONE"),
+        )
+
+    def test_every_exit_from_a_record_state_demands_the_public_surfaces(self):
+        """RED-BEFORE, all nine. The spec `## Now` is PAID in every case, so the
+        only thing under test is whether (STATUS, BENCHMARKS) is still owed."""
+        paid = [".agents/kernel-matrix.md", ".agents/specs/alpha.md"]
+        for source in self.RECORD_SOURCES:
+            for destination in self.CLAIM_DESTINATIONS:
+                with self.subTest(source=source, destination=destination):
+                    errors = self.errors(paid, *self.move(source, destination))
+                    self.assertTrue(
+                        errors, f"{source} -> {destination} must be a claim move"
+                    )
+                    joined = " ".join(errors)
+                    for surface in ("docs/STATUS.md", "docs/BENCHMARKS.md"):
+                        self.assertIn(surface, joined)
+                    self.assertIn(f"{source} -> {destination}", joined)
+
+    def test_all_nine_are_satisfiable_by_paying_the_surfaces(self):
+        """The obligation has to be dischargeable, or it is a wall not a gate."""
+        paid = [
+            ".agents/kernel-matrix.md",
+            ".agents/specs/alpha.md",
+            "docs/STATUS.md",
+            "docs/BENCHMARKS.md",
+        ]
+        for source in self.RECORD_SOURCES:
+            for destination in self.CLAIM_DESTINATIONS:
+                with self.subTest(source=source, destination=destination):
+                    self.assertEqual(
+                        self.errors(paid, *self.move(source, destination)), []
+                    )
+
+    def test_restoring_the_both_endpoint_form_loosens_all_nine(self):
+        """MUTATION. Put W2's line back and every one of the nine goes green.
+
+        Rebinding `checker.transitions` is the whole mutation: `lifecycle_moves`
+        and `spec_now_errors` both resolve it as a module global at call time,
+        so nothing else has to be rebuilt. Restored in `finally`, and the
+        post-restore assertion re-proves the red so a mutation that never
+        applied cannot read as a pass.
+        """
+        paid = [".agents/kernel-matrix.md", ".agents/specs/alpha.md"]
+        original = checker.transitions
+
+        def both_endpoints(paths, before, after):
+            return [
+                (
+                    path,
+                    row,
+                    previous,
+                    state,
+                    checker.CLAIM
+                    if previous in checker.STATES and state in checker.STATES
+                    else checker.RECORD,
+                )
+                for path, row, previous, state, _kind in original(
+                    paths, before, after
+                )
+            ]
+
+        checker.transitions = both_endpoints
+        try:
+            for source in self.RECORD_SOURCES:
+                for destination in self.CLAIM_DESTINATIONS:
+                    with self.subTest(source=source, destination=destination):
+                        self.assertEqual(
+                            self.errors(paid, *self.move(source, destination)),
+                            [],
+                            "the both-endpoints form must go blind here; it did "
+                            "not, so these cases measure something else",
+                        )
+        finally:
+            checker.transitions = original
+        for source in self.RECORD_SOURCES:
+            for destination in self.CLAIM_DESTINATIONS:
+                self.assertTrue(self.errors(paid, *self.move(source, destination)))
+
+    def test_a_move_into_a_record_state_is_still_a_record_move(self):
+        """W1's ANCHOR-BACKFILL ruling, and the two states it was extended to.
+
+        Destination-keying preserves all three: a row LEAVING the claim set owes
+        its spec's `## Now` and nothing the public pages could truthfully say.
+        This is the half the fix must NOT widen, and the residual it leaves --
+        a demotion out of a claim state going unprojected -- is `## Owed` in the
+        row's spec. It is 0 of the 17 non-arrival transitions in the 400 commits
+        ending at e2a9e035d.
+        """
+        for destination in checker.RECORD_STATES:
+            with self.subTest(destination=destination):
+                classes, _ = self.classify(*self.move("DONE", destination))
+                self.assertNotIn("lifecycle", classes)
+
+    def test_the_record_exit_still_owes_its_spec_now(self):
+        """The `## Now` half is not dropped by promoting the move to a claim."""
+        errors = self.errors(
+            [".agents/kernel-matrix.md", "docs/STATUS.md", "docs/BENCHMARKS.md"],
+            *self.move("SPIKE", "ACTIVE"),
+        )
+        self.assertTrue(errors)
+        self.assertIn(".agents/specs/alpha.md", " ".join(errors))
+
+    def test_the_arrival_rule_is_unreachable_for_a_resolved_row(self):
+        """The mechanism behind the loosening, pinned directly.
+
+        W2's justification for the both-endpoints polarity was that "the arrival
+        rule below already governs a row that appears as DONE". It cannot: the
+        arrival rule is guarded by `previous is None`, and resolving the record
+        states is precisely what stopped `previous` being None.
+        """
+        for source in self.RECORD_SOURCES:
+            with self.subTest(source=source):
+                original = checker.blob
+                before, after = self.move(source, "DONE")
+                checker.blob = lambda rev, path: (
+                    before if rev == "BEFORE" else after
+                )
+                try:
+                    moves = checker.transitions(
+                        {".agents/kernel-matrix.md"}, "BEFORE", "AFTER"
+                    )
+                finally:
+                    checker.blob = original
+                alpha = [m for m in moves if m[1] == "KERNEL-ALPHA"]
+                self.assertEqual(len(alpha), 1)
+                self.assertEqual(alpha[0][2], source, "previous must resolve")
+                self.assertEqual(alpha[0][4], checker.CLAIM)
+
+
 class ANewPartialRowIsAClaim(unittest.TestCase):
     """GATE-DOC-CHECKPOINT-STATES W2 (#1434), residual 4.
 
@@ -1062,6 +1349,44 @@ class ANewPartialRowIsAClaim(unittest.TestCase):
         self.assertIn("lifecycle", self.classify("", self.ROW.format("PARTIAL"))[0])
 
 
+class SpecForRowTakesTheFirstLink(unittest.TestCase):
+    """W3 (#1434): a KNOWN DEFECT, pinned so the cost accounting stops lying.
+
+    `spec_for_row` returns the FIRST `.agents/specs/...` link on a row's line,
+    and a matrix line reaches its `Spike/spec` column only after an evidence
+    column that often links a spec of its own. The gate then names a file the
+    change had no reason to touch.
+
+    It is not hypothetical. `ab6e65216` moved `ENG-CUDAGRAPH-BREAK` INVENTORIED
+    -> READY and CREATED `.agents/specs/eng-cudagraph-break.md`, 834 lines, with
+    a populated `## Now` at :818 -- the exact obligation. The row's earlier
+    "owed" column links `specs/decode-graph-scratch-uaf-2026-07-18.md`, so that
+    is what the gate demanded. The MOVE being unobserved before W2 is true; the
+    MESSAGE is wrong, and W2's replay counted it as a true positive.
+
+    NOT FIXED HERE. 97 of the 793 rows link more than one spec, so choosing the
+    Spike/spec column changes which file the gate demands for a whole population
+    and needs its own red-before measurement. Listed under `## Owed` in
+    .agents/specs/doc-checkpoint-lifecycle-states.md. This test pins the current
+    behaviour so that repairing it is a deliberate edit rather than a drift, and
+    it FAILS the day someone changes the resolution -- which is when the `##
+    Owed` entry gets closed.
+    """
+
+    LINE = (
+        "| `ROW-X` | item | owed: the contract of "
+        "[uaf](specs/decode-graph-scratch-uaf.md) enforced at the seam "
+        "| spec [x](specs/row-x.md) | `READY` | ops |"
+    )
+
+    def test_the_evidence_link_wins_over_the_spike_spec_column(self):
+        self.assertEqual(
+            checker.spec_for_row(self.LINE, "ROW-X"),
+            ".agents/specs/decode-graph-scratch-uaf.md",
+        )
+        self.assertIn("specs/row-x.md", self.LINE)
+
+
 class TheSglangMatrixIsNotALifecycleTable(unittest.TestCase):
     """GATE-DOC-CHECKPOINT-STATES W2 (#1434), residual 2: DECLINED, with the
     measurement that declines it kept executable.
@@ -1078,6 +1403,13 @@ class TheSglangMatrixIsNotALifecycleTable(unittest.TestCase):
     implementation" column. Rewording one of those sentences would then read as
     an SGLANG row changing lifecycle state and would demand docs/STATUS.md,
     docs/BENCHMARKS.md and a spec `## Now` for a move that never happened.
+
+    W3 reconciles the row count W2 reported without reconciling. 46 keyed rows =
+    37 carrying exactly one legend cell (FUSED 24, SGLANG-DISTINCT 5,
+    OUT-OF-SCOPE 8) + 6 whose axis cell reads a bare unbackticked `INVENTORIED`
+    + 3 whose axis cell is formatted differently again (`SGLANG-SCHED-INBATCH`
+    "ACTIVE (order-only)", `SGLANG-CONSTRAIN-JUMP`, `SGLANG-ORACLE-PERF`). That
+    is 24 + 5 + 8 + 6 + 3 = 46, and the "43" W2 recorded is the first four.
     """
 
     LEGEND = ("FUSED", "SGLANG-DISTINCT", "OUT-OF-SCOPE")
@@ -1117,6 +1449,43 @@ class TheSglangMatrixIsNotALifecycleTable(unittest.TestCase):
                 f"{identifier.group(1)} has no classification cell, so its "
                 f"resolved state {resolved[identifier.group(1)]!r} may be real; "
                 "re-decide whether this file belongs in ROW_TABLES",
+            )
+
+    def test_no_resolved_row_carries_a_bare_state_cell(self):
+        """W3: the ADDITIVE shape the count test above cannot see.
+
+        Replacing a `FUSED` cell with `` `ACTIVE` `` does fail the test above.
+        Adding `` `ACTIVE` `` as a NEW column while KEEPING `FUSED` does not --
+        the classification count is still exactly 1 and the file passes. Given
+        the header says the classification stands "in place of a lifecycle
+        state", growing a real State column ALONGSIDE it is the likelier way
+        this file changes.
+
+        So ask the other question directly: where did the token the checker
+        matched come from? Today, from prose. Every resolved row's only bare
+        backticked cell is its own ID cell; a real State column would be a
+        second one, whichever way it arrived.
+        """
+        bare = re.compile(r"^`[A-Z0-9][A-Za-z0-9_./-]*`$")
+        resolved = checker.row_states(self.text)
+        self.assertTrue(resolved)
+        for line in self.text.splitlines():
+            identifier = checker.ROW_ID.match(line)
+            if not identifier or identifier.group(1) not in resolved:
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            standalone = [
+                cell
+                for cell in cells[1:]
+                if bare.fullmatch(cell)
+                and cell.strip("`") in checker.LIFECYCLE_STATES
+            ]
+            self.assertEqual(
+                standalone,
+                [],
+                f"{identifier.group(1)} carries a standalone state cell "
+                f"{standalone}, so this file now has a real lifecycle axis; "
+                "re-decide whether it belongs in ROW_TABLES",
             )
 
 

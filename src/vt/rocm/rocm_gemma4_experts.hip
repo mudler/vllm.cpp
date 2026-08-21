@@ -542,6 +542,20 @@ bool RunGemma4Fp8TopKOnExpertDevice(vt::Queue& compute_q, int expert_dev, void* 
   return true;
 }
 
+namespace {
+struct IndexedPeerTls {
+  int cdev = -1, edev = -1, H = 0, Gcap = 0;
+  vt::Queue eq{};
+  void* x = nullptr;
+  void* y = nullptr;
+  int32_t* idx = nullptr;
+  float* wts = nullptr;
+  hipEvent_t ev_c = nullptr, ev_e = nullptr;
+  bool eq_live = false;
+};
+thread_local IndexedPeerTls g_idx_peer_tls;
+}  // namespace
+
 // Decode T=1 indexed: bases stay on expert_dev; peer only x + tiny idx/wts + y.
 bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev, void* ysum_compute,
                                            const void* x_compute, const void* gu_base,
@@ -558,17 +572,15 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
                                          sgu_base, sdn_base, idx_compute, wts_compute, G, I, H);
   }
 
-  struct Tls {
-    int cdev = -1, edev = -1, H = 0, Gcap = 0;
-    vt::Queue eq{};
-    void* x = nullptr;
-    void* y = nullptr;
-    int32_t* idx = nullptr;
-    float* wts = nullptr;
-    hipEvent_t ev_c = nullptr, ev_e = nullptr;
-    bool eq_live = false;
+  struct RestoreComputeDev {
+    int dev;
+    explicit RestoreComputeDev(int d) : dev(d) {}
+    ~RestoreComputeDev() {
+      if (dev >= 0) (void)hipSetDevice(dev);
+    }
   };
-  static thread_local Tls tls;
+  RestoreComputeDev restore(compute_dev);
+  auto& tls = g_idx_peer_tls;
   const size_t hb = static_cast<size_t>(H) * 2;
   hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
   vt::Device edev{vt::DeviceType::kROCM, expert_dev};
@@ -622,28 +634,62 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
   }
 
   hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
-  // Steady-state: no hipSetDevice between stream ops (graph-prep + less driver tax).
-  if (hipEventRecord(tls.ev_c, cst) != hipSuccess) return false;
-  if (hipStreamWaitEvent(est, tls.ev_c, 0) != hipSuccess) return false;
+  auto retire_fail = [&]() -> bool {
+    if (est) {
+      (void)hipSetDevice(expert_dev);
+      (void)hipStreamSynchronize(est);
+    }
+    if (cst) {
+      (void)hipSetDevice(compute_dev);
+      (void)hipStreamSynchronize(cst);
+    }
+    (void)hipSetDevice(compute_dev);
+    return false;
+  };
+  // Current-device ownership is explicit. HIP stream ops and peer copies run
+  // under the stream's owning device. RestoreComputeDev restores compute on
+  // every exit. The prior "no hipSetDevice" claim was false: init left
+  // current=expert and success set compute, so only the first peer call saw
+  // the expert current-device.
+  if (hipSetDevice(compute_dev) != hipSuccess) return retire_fail();
+  if (hipEventRecord(tls.ev_c, cst) != hipSuccess) return retire_fail();
+  if (hipSetDevice(expert_dev) != hipSuccess) return retire_fail();
+  if (hipStreamWaitEvent(est, tls.ev_c, 0) != hipSuccess) return retire_fail();
 
   auto peer = [&](void* dst, const void* src, size_t n) -> bool {
     return hipMemcpyPeerAsync(dst, expert_dev, const_cast<void*>(src), compute_dev, n, est) ==
            hipSuccess;
   };
-  if (!peer(tls.x, x_compute, hb)) return false;
-  if (!peer(tls.idx, idx_compute, sizeof(int32_t) * static_cast<size_t>(G))) return false;
-  if (!peer(tls.wts, wts_compute, sizeof(float) * static_cast<size_t>(G))) return false;
+  if (!peer(tls.x, x_compute, hb)) return retire_fail();
+  if (!peer(tls.idx, idx_compute, sizeof(int32_t) * static_cast<size_t>(G))) return retire_fail();
+  if (!peer(tls.wts, wts_compute, sizeof(float) * static_cast<size_t>(G))) return retire_fail();
 
   if (!vt::ExpertGeGLUFp8TopKIndexed(tls.eq, tls.y, tls.x, gu_base, dn_base, sgu_base, sdn_base,
                                      tls.idx, tls.wts, G, I, H))
-    return false;
+    return retire_fail();
 
-  if (hipEventRecord(tls.ev_e, est) != hipSuccess) return false;
-  if (hipStreamWaitEvent(cst, tls.ev_e, 0) != hipSuccess) return false;
+  if (hipEventRecord(tls.ev_e, est) != hipSuccess) return retire_fail();
+  if (hipSetDevice(compute_dev) != hipSuccess) return retire_fail();
+  if (hipStreamWaitEvent(cst, tls.ev_e, 0) != hipSuccess) return retire_fail();
   if (hipMemcpyPeerAsync(ysum_compute, compute_dev, tls.y, expert_dev, hb, cst) != hipSuccess)
-    return false;
-  if (hipSetDevice(compute_dev) != hipSuccess) return false;
+    return retire_fail();
   return true;
+}
+
+bool RetireGemma4Fp8TopKIndexedPeer(vt::Queue& compute_q, int expert_dev) {
+  const int compute_dev = compute_q.device.index;
+  hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
+  bool ok = true;
+  if (compute_dev >= 0 && hipSetDevice(compute_dev) != hipSuccess) ok = false;
+  if (cst && hipStreamSynchronize(cst) != hipSuccess) ok = false;
+  auto& tls = g_idx_peer_tls;
+  if (tls.eq_live && tls.cdev == compute_dev && (expert_dev < 0 || tls.edev == expert_dev)) {
+    hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
+    if (tls.edev >= 0 && hipSetDevice(tls.edev) != hipSuccess) ok = false;
+    if (est && hipStreamSynchronize(est) != hipSuccess) ok = false;
+  }
+  if (compute_dev >= 0 && hipSetDevice(compute_dev) != hipSuccess) ok = false;
+  return ok;
 }
 
 // Prefill: run ExpertGeGLU for M rows on expert_dev (weights resident there).

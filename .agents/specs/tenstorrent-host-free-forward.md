@@ -259,14 +259,22 @@ investigation row but MUST be addressed by the item-5 port:
   That is silently wrong rather than a refusal, and it is a candidate explanation for
   `test_qwen3_paged_engine` still timing out under the flag. Owned by
   [#1105](https://github.com/mudler/vllm.cpp/issues/1105).
-- **`VT_TT_RECAPTURE_EVERY` lags `cur_pos` by one per recapture cycle.**
-  `GraphCapturesCounter` is only ever `fetch_add`ed (`tenstorrent_ops.cpp:3225`, called
-  once from `:3297`); nothing resets it, and `DestroyGraph` does not. So the
-  recapture-triggered eager step re-seeds nothing and skips every `copy_to_device`,
-  and the following capture step captures a `cur_pos` one behind. The eager PA
-  consistency check at `:2410-2412` cannot see it: it compares `e.cp_host[0]` against
-  the same `seq_lens` that rewrote `e.cp_host` at `:3982`, so it validates the host
-  mirror against itself. Owned by [#1105](https://github.com/mudler/vllm.cpp/issues/1105).
+- **`VT_TT_RECAPTURE_EVERY` lagged `cur_pos` by one per recapture cycle; the
+  mechanism is fixed by [#1476](https://github.com/mudler/vllm.cpp/issues/1476).**
+  The regime flag no longer comes from the process-global `GraphCapturesDone()`
+  (never cleared by `Reset()`); the driver passes `s.graph.captured()`, so the
+  cold eager step after ANY reset — a block boundary or a
+  `VT_TT_RECAPTURE_EVERY` cycle — re-seeds `cur_pos`, and the RAC page_table
+  refreshes on content change. The deeper defect stays open on
+  [#1105](https://github.com/mudler/vllm.cpp/issues/1105): `DecodePosCache` is
+  keyed on bare `num_reqs` with no engine or device identity, and the real fix
+  is a per-cache-entry seed / generation field aliased on every warm call, not
+  any process-global counter. The eager PA consistency check remains
+  self-validating (`e.cp_host` against the `seq_lens` that wrote it). The
+  re-seed regime now has a gate arm: `VT_TT_RECAPTURE_EVERY=8` forces
+  mid-generation re-captures (9 captures over 80 tokens), byte-identical to
+  the plain captured arm, and the `GraphCapturesDone()`-early-return mutation
+  reds it (see `## Now`).
 
 The seven constraints above remain. A new batch size after the first
 capture is now refused (`VT_CHECK` in `WarmDecodePos` / `WarmPaMeta` /
@@ -275,6 +283,37 @@ per-cache-entry seed / generation field and aliasing on every warm call,
 not a process-global `GraphCapturesCounter`. Tracked on
 [#1105](https://github.com/mudler/vllm.cpp/issues/1105).
 
+- **The `retired_pts` keep-alive is unguarded defense-in-depth.** No gate
+  exercises it and none can on the current fixed-width setup: the engine
+  preallocates `block_table_num_cols=256`, so after the first allocation no
+  width change (growth or shrink) ever occurs and the retire branch in
+  `WarmRacIdx` is structurally unreachable there. A width change needs a
+  multi-request run whose longest request finishes (shrink) or a driver that
+  grows cols per block (growth) — neither is reachable through the current
+  decode-graph gate. It stays because freeing a device buffer a recorded
+  trace addresses is the worse failure; treat it as defense-in-depth until a
+  gate can reach it, and do not cite it as covered. The allocator itself now
+  handles ANY width change (`!=`, growth or the multi-request shrink when the
+  longest request finishes — the old `>` let the else-branch
+  `copy_to_device` TT_FATAL on a shape mismatch), mirroring the driver's
+  `cols_changed !=` reset.
+- **`test_tenstorrent_backend` exits 139 after a fully green doctest summary**
+  (23/23 cases, 831/831 assertions): static `std::optional<ttnn::Tensor>` cache
+  fields are destroyed after the UMD device closes and `deallocate_impl` reaches
+  a torn-down `GraphTracker`. Proven pre-existing at `origin/main` by an A/B
+  stash/build/run during the [#1476](https://github.com/mudler/vllm.cpp/issues/1476)
+  gate. Owned by
+  [#1486](https://github.com/mudler/vllm.cpp/issues/1486).
+- **`test_release_metadata` is red on every aarch64 host**: the fixture stages
+  the host `/bin/true` into an `x86_64`-named archive, so `agent-preflight`
+  cannot go green on the TT dev fleet. Found while running this row's preflight.
+  Owned by [#1487](https://github.com/mudler/vllm.cpp/issues/1487).
+- **The TT `test_qwen3_paged_engine` golden is stale**: anchor drift
+  prompt[1] tok=10 (engine=14126, committed=62901), identical before and after
+  the #1476 fix (that test runs the default path). Needs the `VT_DUMP_IDS` +
+  near-tie-gap re-adjudication. Owned by
+  [#1488](https://github.com/mudler/vllm.cpp/issues/1488).
+
 The operator must still rerun the 80-token no-hang gate and
 `test_qwen3_paged_engine` on a Blackhole P150. An implementer run is an
 input, not a gate result.
@@ -282,8 +321,66 @@ input, not a gate result.
 ## Now
 
 `ACTIVE`. R1-R3b and the R2 on-device `cur_pos` / `update_idxs` advance are
-implemented on this branch, env-gated by `VT_TT_HOST_FREE_DECODE`. A P150
-run of Qwen3-0.6B "Hello" at 80 tokens completed 79 replays with no hang
-and 22/22 argmax vs the per-step-copy baseline. Next: operator rerun of
-that 80-token gate and `test_qwen3_paged_engine` on card. A new batch
-size after the first capture now throws instead of emitting wrong tokens.
+implemented on this branch, env-gated by `VT_TT_HOST_FREE_DECODE`.
+
+The operator gate (2026-08-20, P150, `206afb63`) found
+[#1476](https://github.com/mudler/vllm.cpp/issues/1476): captured replay went
+degenerate at the first KV block boundary while host-free eager stayed
+coherent — the recorded 22/22 argmax predated the final `cur_pos` integration
+and did not reproduce on the landed tree. Root causes, both fixed in this
+change: the RAC `page_table` was `[C,1]` where the tt-metal reader indexes the
+full stick (`page_table_ptr[update_idx / block_size]`), so every write past
+block 1 landed in a garbage physical block; and `WarmDecodePos` keyed its
+skip on the process-global `GraphCapturesDone()`, which `Reset()` never
+clears, so a post-boundary re-capture read `cur_pos` one position behind.
+
+Implementer verification on the P150 (2026-08-20, this change, full-answer
+compares — never a `grep -m1` first-line artifact):
+
+- **The #1476 degeneration is gone.** Reverting either root cause in a
+  /tmp scratch clone (same TT build config) regenerates it: the G1 mutation
+  (page_table back to `[C,1]`, steady-state refresh removed) keeps 32 steps
+  of argmax agreement then reds at step 33 — the first step past
+  `block_size=32` — with a non-tie divergence (argmax 1555 gap 0.75 vs
+  eager 13) and the word salad ("straight line line line on road…");
+  the G2 mutation (`GraphCapturesDone() > 0` early-return) reds the
+  recapture arm at step 11, the first step of the second capture cycle.
+  Both restores are sha256-verified byte-for-byte, rebuilt, and rerun
+  green with answers byte-identical (284B md5 `3b5a579d…`) to the
+  worktree gate runs. A 160-token captured run is coherent and the
+  80-token captured answer is a strict byte-prefix of it (5 block
+  boundaries crossed).
+- **Captured vs host-free eager is NOT byte-identical** — the prior
+  byte-identical claim was a first-line compare artifact. Full answers:
+  captured 284B md5 `3b5a579d82d58396fe4e344826946403`, eager 286B md5
+  `f5ffdf6aa290e11fd187673c2f3c52bb`, first diff at byte 174, both arms
+  coherent. Adjudicated per-step (`VT_TT_DUMP_KV` top-2 dump; the top-2
+  raw-logit gap is the logprob gap in nats, the `qwen3-neartie-gap.py`
+  bar): argmax identical for 45/80 steps with top-2 values agreeing to
+  ≤0.5 logits (≤4 bf16 ULP at the ~20-logit scale); the FIRST divergence,
+  decode step 46, is a swapped top-2 near-tie — captured `[11:19.75,
+  311:19.50]` gap 0.25 nats vs eager `[311:19.625, 11:19.50]` gap 0.125
+  nats (1-2 bf16 ULP), cross-arm deltas at the tied pair 0.125/0.25 —
+  inside the near-tie band this repo already tracks for Qwen3-0.6B on TT
+  ([#1488](https://github.com/mudler/vllm.cpp/issues/1488) owes the
+  teacher-forced golden re-adjudication). The 34 argmax differences after
+  step 46 are prefix divergence (each arm greedy-decodes its own prefix),
+  not numeric evidence.
+- **The `cur_pos` re-seed regime (G2) is gate-covered.**
+  `VT_TT_RECAPTURE_EVERY=8` forces 9 captures / 71 replays (8
+  destroy+re-capture cycles mid-generation); that arm is byte-identical to
+  the plain captured arm (same 284B md5) and carries the same single
+  step-46 near-tie vs eager. Restoring the old
+  `GraphCapturesDone() > 0` early-return in a scratch build reds this arm
+  at step 11 (non-tie divergence, incoherent text); restoring the fix
+  greens it. Without the arm the fixed-width 80-token gate never fires a
+  `Reset()` (the engine preallocates bt_cols=256), so exactly 2 re-seeds
+  run and the guarantee was undetected.
+
+`test_tenstorrent_backend` 23/23 + 831/831 green with and without an
+ambient `VT_TT_HOST_FREE_DECODE` (its exit-time segfault is pre-existing,
+[#1486](https://github.com/mudler/vllm.cpp/issues/1486)).
+
+Next: operator rerun of the 80-token captured-vs-eager gate and
+`test_qwen3_paged_engine` on card; the paged-engine golden re-adjudication is
+[#1488](https://github.com/mudler/vllm.cpp/issues/1488).

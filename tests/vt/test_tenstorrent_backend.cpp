@@ -584,6 +584,12 @@ TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference (small)")
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
   }
+  // This case asserts the HOST apply path (bit-exact). An ambient
+  // VT_TT_HOST_FREE_DECODE (e.g. a suite run under the host-free gate) flips
+  // PreferDeviceRope to the device BF16 path even at small T*H and reds the
+  // bit-exact checks — so the case owns its own default-path env, mirroring
+  // the inertness-guard case below.
+  ::unsetenv("VT_TT_HOST_FREE_DECODE");
   REQUIRE(vt::OpRegistered(vt::OpId::kRopeNeox, DeviceType::kTENSTORRENT));
 
   constexpr int64_t T = 4, Hq = 2, Hk = 1, Dh = 8, Rot = 8;

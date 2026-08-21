@@ -278,6 +278,7 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_PREFILL_PEER_ACT` | on | Prefill MoE: run ExpertGeGLU on the expert GPU and peer activations only (not full weight PeerCopy). `0` restores weight PeerCopy |
 | `VT_GEMMA4_GPU0_HEADROOM_GB` | `12` | GiB kept free on GPU0 when packing resident experts (decode vs long-prefill trade). Lab dual R9700 + 49k KV: `8` survives 16k+ prefill; `6` OOMs ~11k |
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
+| `VT_GEMMA4_DECODE_INDEXED_MAX_T` | `63` | Widen device-indexed FP8 MoE from T=1 to `T<=N` (`N` clamped `[1,63]`). Unset = 63. `=1` restores the old T=1-only gate. T≥64 still uses prefill-batch |
 | `VT_GEMMA4_MLP_MOE_PARALLEL` | off | `=1` run Gemma4 MLP and MoE on two HIP streams (lab; wall ~flat on R9700). Not wired in this PR tip (decode-graph-free split) |
 | `VT_ATTN_PREFILL_FLASH` | off | `=1` SGLang-style BM×BN GQA flash prefill (lab A/B) |
 | `VT_GEMMA4_PREFILL_GEMM_M` | `2048` | Tokens per expert in prefill-batch GEMM chunks (`16..8192`; out-of-range values are ignored and the default is used). Larger M → fewer launches; lab `512` ~+37% prefill vs `64`, and `512`→`2048` ~+80 eng @11k vs the WMMA baseline (2026-08-10), which is why the default is `2048`. Lab KEEP on dual R9700 uses the default |

@@ -1,0 +1,23 @@
+  // Device-indexed FP8 MoE for small packed T — no router D2H, no host top-k gather.
+  // T=1: original KEEP decode path (hipGraph-stable TLS acc).
+  // T=2..min(MAX, batch_min-1): P1 concurrent-decode gap (research 2026-08-11).
+  // VT_GEMMA4_DECODE_INDEXED_MAX_T: default 63; =1 → T=1 only; clamp [1,63].
+  static const int64_t kDecodeIndexedMaxT = []() -> int64_t {
+    const char* e = std::getenv("VT_GEMMA4_DECODE_INDEXED_MAX_T");
+    if (e == nullptr || !e[0]) return 63;
+    const long v = std::strtol(e, nullptr, 10);
+    if (v < 1) return 1;
+    if (v > 63) return 63;
+    return static_cast<int64_t>(v);
+  }();
+  // P0 overlap enabler (default OFF): keep the enqueue-only indexed path for
+  // prefill T so layer-split does not hipStreamSynchronize after router D2H.
+  // Not a KEEP speed path — per-token launches. Cap 8192 (pipe ubatch).
+  static const int64_t kPrefillIndexedNoSyncMaxT = []() -> int64_t {
+    const char* e = std::getenv("VT_GEMMA4_PREFILL_INDEXED_NOSYNC");
+    if (!e || e[0] != '1') return 0;
+    return 8192;
+  }();
+  const int64_t indexed_max_t =
+      (kPrefillIndexedNoSyncMaxT > kDecodeIndexedMaxT) ? kPrefillIndexedNoSyncMaxT
+                                                      : kDecodeIndexedMaxT;

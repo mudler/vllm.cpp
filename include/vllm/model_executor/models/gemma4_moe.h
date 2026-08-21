@@ -124,6 +124,8 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
                                            const void* dn_base, const void* sgu_base,
                                            const void* sdn_base, const int32_t* idx_compute,
                                            const float* wts_compute, int G, int I, int H);
+// Drain compute + indexed peer streams before pooled scratch may return to DevicePool.
+bool RetireGemma4Fp8TopKIndexedPeer(vt::Queue& compute_q, int expert_dev);
 
 // hipHostRegister BF16 expert cache for faster H2D (no-op if already pinned).
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex);

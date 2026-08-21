@@ -170,6 +170,11 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, Gemma-4 FP8 mixture-of-experts decode uses the device-indexed
+  expert gate for batches up to 63 tokens; wider batches use the
+  prefill-batch path. Set `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` to restore the
+  previous single-token gate when you want to compare the two paths. See
+  [Environment variables](ENVIRONMENT.md).
 - `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
   means the tokenizer file names a merge whose left token, right token, or
   joined result is missing from its own vocabulary. Both `tokenizer.json` and a

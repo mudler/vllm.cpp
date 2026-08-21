@@ -25566,6 +25566,36 @@ WHAT the step-7 divergence is. Excluding one cause is not identifying another,
 and the next traceable hypothesis is a per-operation two-arm comparison of the
 step-7 forward, first differing tensor named.
 
+---
+
+## TT host-free decode: the 22/22 argmax is withdrawn; the operator gate records a step-46 near-tie (#1476, #1488) (2026-08-20)
+
+Row `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, evidence moved out of its
+`docs/BENCHMARKS.md` cell by the 220-char entry budget.
+
+The 2026-08-16 implementer figure "22/22 argmax vs the per-step-copy baseline"
+predates the final on-device `cur_pos` plus_one integration and does not
+reproduce on the landed tree. The operator gate at `206afb63` (2026-08-20) found
+captured replay deterministic-degenerate (word salad from ~generated token 30 =
+the first KV block boundary) while host-free eager stayed coherent; issue #1476
+carries the full derivation.
+
+After the fix (operator rerun at `2b06f98a`, identical bytes to the implementer
+and re-review runs): captured `Hello`/80-tok answer 284 bytes md5
+`3b5a579d82d58396fe4e344826946403`, eager 286 bytes md5
+`f5ffdf6aa290e11fd187673c2f3c52bb`, first divergence at byte 174 = decode step
+46, a swapped top-2 near-tie (captured gap 0.25 nats, eager 0.125 nats; the
+0.5-nat bar of `scripts/qwen3-neartie-gap.py`). 45/80 steps argmax-identical;
+the 34 later differences are prefix divergence. `VT_TT_RECAPTURE_EVERY=8` (9
+captures / mid-generation re-captures) is byte-identical to the plain captured
+arm. The #1476 degeneration is gone — G1 (`[C,1]` page_table) and G4
+(steady-state refresh suppressed) mutations each regenerate the exact word
+salad; G2 (regime early-return) reds at step 11 under the recapture arm.
+
+Whether the step-46 flip is teacher-forced-benign stays UNADJUDICATED on the
+full engine: that is #1488's `VT_DUMP_IDS` re-adjudication, the same band as
+the paged-engine anchor drift it owns. No speed number is quoted from any of
+these runs; a same-binary A/B on an idle host precedes any future figure.
 ## MUSIC3-E2E-ON-MAIN — five merges priced end to end, and the vocoder device arm answered on an idle box (2026-08-20, `row/MUSIC3-E2E-ON-MAIN`, arms `d0598a255` and `a50c57d69`, `thor:gpu0` sm_110, #672 / #1512 / #1516)
 
 ### What was measured
@@ -25988,3 +26018,52 @@ matched the GEMMs' measured 3.98 TFLOP/s, its 0.140 TFLOP would cost **35.2 ms
 instead of 688.1 ms**: forward 1569 -> 916 ms (**1.71x on the DiT**), bucket
 370.510 -> 216.3 s, run 598.207 -> 444.0 s (**1.35x end to end**). An upper
 bound from a flop ratio on a kernel nobody has written.
+### The Qwen3.5-4B `1.0283x` row ran against an UNFUSED denominator (#414, #1345)
+
+Found 2026-08-19 while landing [#607](https://github.com/mudler/vllm.cpp/issues/607)
+wave L4, which gated the CLI oracle-launch surface. This leg is on the OTHER
+surface, so the new checker does not see it, and it is the one published figure
+the L4 sweep found still carrying the #414 defect unmarked.
+
+The chain, each link checked rather than assumed:
+
+1. `docs/BENCHMARKS.md` cites `docs/bench-evidence/qwen35-4b-sm120-main-20260807.md`,
+   whose reproduction identity names `Qwen/Qwen3.5-4B` and the exact workload
+   (128 requests, 128 output tokens, concurrency 32,
+   `max_num_batched_tokens=2048`, greedy) that `tools/bench/run_qwen35_4b_compare.sh`
+   drives.
+2. `tools/bench/run_qwen35_4b_compare.sh:120` runs the vLLM arm through
+   `tools/bench/vllm_closed_loop_metrics.py`. Its `LLM(...)` at `:160` never
+   passes `language_model_only` and exposes no argument that could set it.
+3. Upstream registers `Qwen/Qwen3.5-4B` under `Qwen3_5ForConditionalGeneration`
+   (`tests/models/registry.py:1322-1324`, `extras={"4b": "Qwen/Qwen3.5-4B"}`), so
+   `multimodal_config` is non-`None` and `text_only` resolves `False`
+   (`vllm/config/multimodal.py:78`, `vllm/model_executor/models/qwen3_next.py:325`).
+4. The conjunct was live at the time of the run. `git log -S'use_fused_qk_norm_rope_gate'`
+   over `vllm/model_executor/models/qwen3_next.py` dates its introduction to
+   `16282a9c4` on 2026-06-10, two months before the 2026-08-07 measurement.
+5. The remaining conjuncts hold: sm_120 is CUDA, and Qwen3.5-4B carries
+   `attn_output_gate` with NeoX-style RoPE.
+
+So the oracle issued four ops per full-attention layer where its own production
+configuration issues one, against our single fused launch.
+
+**Direction: it flatters us**, for the reason #414 gives. **Magnitude: NOT
+MEASURED, and deliberately not estimated.** The model is GDN-hybrid, so only its
+full-attention layers are exposed, and the L4 wave took no measurement: both
+fleet devices were held and it carried no lease authority. Quoting a corrected
+ratio here would be a number nobody took.
+
+The row keeps its values and gains the attribution, per AGENTS.md: evidence is
+annotated, never deleted. Re-measurement is owed with
+[#1345](https://github.com/mudler/vllm.cpp/issues/1345), which also owns the
+repair to the three in-process harnesses.
+
+**Not affected, so the next reader does not re-derive it.** #414 reaches a figure
+only where the full-attention layers are `Qwen3NextAttention` AND the checkpoint
+loads as a `*ForConditionalGeneration`. That is the Qwen3.5/3.6/3.8 family alone.
+The OPT, GLM-4, InternLM2, Qwen3-dense, Qwen3-Coder and DeepSeek-V2-Lite legs
+never construct `Qwen3NextAttention`. The `Qwen3.8-27B` rows ran through
+`tools/bench/run_serve_low.py`, which has passed `--language-model-only` since it
+was written. The Qwen3.5-4B GDN prefill kernel row is conv and post-conv timing
+on the LINEAR-attention path, which the full-attention preamble does not touch.

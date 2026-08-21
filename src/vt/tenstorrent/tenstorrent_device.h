@@ -116,14 +116,21 @@ inline void WarmPaMeta(const int32_t*, int64_t, int64_t, int64_t, int64_t,
 #endif
 
 // R2 (on-device state advance): seed the persistent cur_pos device tensor
-// (= seq_lens - 1) for this step. Called on the capture/warm step (re-seed),
-// NOT every replay step — the captured plus_one advances it on-device.
-// Also warms the plus_one program (program cache) so CaptureDecodePosAdvance
-// can run inside the trace without a "load new binaries during capture" fatal.
+// (= seq_lens - 1) for this step. Called on every cold/warm/capture step
+// (re-seed), never on a replay step — the captured plus_one advances it
+// on-device. Also warms the plus_one program (program cache) so
+// CaptureDecodePosAdvance can run inside the trace without a "load new
+// binaries during capture" fatal.
 #ifdef VLLM_CPP_TENSTORRENT
-void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs);
+// replay_regime=true: this step replays a captured trace whose plus_one owns
+// the cur_pos advance — do not touch the tensor. replay_regime=false (cold,
+// warm, or capture step): re-seed cur_pos = seq_lens-1 for THIS step. The
+// re-seed is what makes a RE-capture correct (#1476): Reset() releases the
+// trace but the cold eager step that follows runs no plus_one, so without a
+// re-seed the newly captured trace reads cur_pos one position behind.
+void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime);
 #else
-inline void WarmDecodePos(const int32_t*, int64_t) {}
+inline void WarmDecodePos(const int32_t*, int64_t, bool) {}
 #endif
 
 // R2: capture ttnn::plus_one(cur_pos) at the END of the trace body (after all

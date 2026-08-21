@@ -1280,10 +1280,21 @@ list items.
   measurement on an artifact that does not exist yet: `z-lab/Muse-Glimmer-30B-DFlash2`
   is the checkpoint that SETS two of the scalars (#1327) and it has no published
   DFlash2 GGUF conversion. Refusing an unknown `dflash.*` key instead was
-  considered and rejected: the published files carry `dflash.context_length` and
-  `dflash.target_layers`, which this reader does not read, so a refusal on
-  unknown keys would refuse every artifact that exists. W6 discharges this by
-  converting that draft with llama.cpp and reading the keys it writes.
+  considered and rejected: the published files carry `dflash.context_length`,
+  which this reader does not read, so a refusal on unknown keys would refuse
+  every artifact that exists. Re-checked 2026-08-21 against the reader itself:
+  `dflash.target_layers`, named here through W5 as a second unread key, is in
+  fact read and REQUIRED -- `qwen3_dflash_gguf.cpp` `VT_CHECK`s it non-null and
+  then undoes llama.cpp's `+1` offset. `dflash.context_length` genuinely is
+  unread: `MakeDflashGgufConfig` reads twenty `dflash.*` keys -- seventeen
+  spelled literally plus the three optional output scalars above -- and that is
+  not one of them, and the only `context_length` reads anywhere in `src/` sit
+  under the `laguna.`, `<arch>.` (qwen35moe/qwen3next/qwen35), `deepseek4.` and
+  `muse-glimmer.` prefixes. Whether it is the ONLY unread key of the published
+  47 is not asserted here, because this checkout has never enumerated them; one
+  unread key refuses every artifact exactly as two would, so the disposition is
+  unchanged either way. W6 discharges this by converting that draft with
+  llama.cpp and reading the keys it writes.
 
 - **O16 — the codebook-span guard compares `==`, and upstream's own condition has
   NOT been read.** Owner: W6. Issue
@@ -1328,29 +1339,79 @@ list items.
   GPU run and not in a CPU suite that must stay CI-cheap. W6 loads at least the
   Q4_K_M arm end to end and records the residency it actually paid.
 
-- **O18 — the fixture's BLOCK SCALES are each exercised at ONE fp16 value.**
-  Owner: this row. Issue
+- **O18 — DISCHARGED 2026-08-21. The Q8_0 fixture's block scale now ALTERNATES,
+  and W5's stated reason for deferring it was wrong.** Issue
   [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
 
   W5's repair wave drove every PACKED INTEGER field across its width and counted
   it — the 6-bit scale in both halves of `get_scale_min_k4`, the 6-bit min in
   both, and the 4-bit quant in both nibble positions. The fp16 SCALARS in front
-  of them are not covered the same way: `EncodeQ8_0` fixes `d` at `0x1C00` in
+  of them were not covered the same way: `EncodeQ8_0` fixed `d` at `0x1C00` in
   every block of every tensor, and `EncodeQ4_K` fixes `d` at `0x2400` and `dmin`
-  at `0x2000`. That is the same class of instrument gap as #1314 F1, one field
-  over and lower in severity: `ReadF16` is a `memcpy` plus the shared
-  `vt::F16ToF32`, which its own suite gates across the exponent range, so the
-  defect this cannot see is confined to the block header's OFFSET and WIDTH —
-  and those two are pinned by the byte-count precondition and by every value
+  at `0x2000`.
+
+  **The reason W5 gave for leaving it — that varying `d` costs the BIT-EXACTNESS
+  this suite's comparison rests on — is refuted by the remedy W5 named in its own
+  next sentence.** A second POWER OF TWO keeps every decoded value `q / 2^p` with
+  `|q|` inside eight significant bits, so it survives the loader's bf16 store
+  exactly and the assertion stays equality rather than a tolerance. The cost the
+  refusal was built on is not paid, and recording it a fifth time with the owner
+  written as "this row" — a row at W5 and closing — would have left it owned by
+  no wave at all.
+
+  So it is FIXED here rather than deferred again. `EncodeQ8_0` alternates `d` by
+  BLOCK between `0x1C00` (2^-8) and `0x2000` (2^-7); `Q8Coverage` counts the
+  blocks written at each, and `CheckQuantArm` asserts BOTH nonzero on every
+  COMPARED tensor. Bit-exactness is proved by measurement rather than by the
+  argument above: the suite's L2 leg still compares bf16 bit-for-bit and reads
+  9 cases / 4746 assertions / `Status: SUCCESS!` / rc 0, up from 4730.
+
+  It was a live gap, not a theoretical one. `DequantQ8_0` reads `d` from EACH
+  block header, and rewriting `const float d = ReadF16(blk)` to `ReadF16(data)`
+  — the whole tensor decoded at block 0's scale — left the PRE-repair suite at
+  9 cases / 4730 assertions / `SUCCESS!` / rc 0, compile rc 0. Against the
+  repaired fixture the same mutation reddens 1 case / 7 assertions / rc 1, and
+  removing the alternation from the encoder reddens the same 7, so the counter
+  is armed rather than decorative.
+
+  What remains uncovered is narrower and stays that way: `EncodeQ4_K`'s `d` and
+  `dmin` are still one value each. Those two multiply an already fully driven
+  6-bit scale and min, `ReadF16` is a `memcpy` plus the shared `vt::F16ToF32`
+  gated across the exponent range by its own suite, and the Q4_K block header's
+  offset and width are pinned by the byte-count precondition and by every value
   after them decoding correctly.
 
-  It is recorded rather than fixed because varying `d` per block costs the
-  property that makes this suite's comparison BIT-EXACT: the fixed powers of two
-  are what keep every decoded value a small integer over 128, exactly
-  representable in the loader's bf16 store, so the assertion can be equality
-  rather than a tolerance. A wave that wants this covered should add ONE extra
-  Q8_0 tensor at a second `d` rather than vary `d` everywhere, keeping both
-  properties.
+- **O19 — CLOSED 2026-08-21, and recorded rather than owed. The coverage
+  counters now read the SAME POPULATION the comparison reads.** Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  Through W5 the Q4_K counters were summed over EVERY Q4_K tensor in the fixture
+  while L2 compares only the 11 `Dflash2Names()` slots, of which 7 are quantized.
+  Nothing was wrong at the shipped fixture — the 7 compared tensors reach the
+  full span on their own — but the precondition and the comparison were reading
+  different populations, so a change to a NON-compared tensor could have inflated
+  the counters while the compared set stopped driving the field. `BuiltGguf` now
+  keys coverage per HF tensor name and `CheckQuantArm` merges over
+  `Dflash2Names()` alone, which makes the two populations the same by
+  construction. `q[j] & 63` → `& 15` still reddens 1 case / 7 assertions under
+  the narrowed population, so the narrowing did not mute the Q4_K leg.
+
+- **O20 — CLOSED 2026-08-21, and recorded rather than owed. The asset case now
+  reports PER VARIABLE.** Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  The published-artifact case took its skip on `dflash2 == nullptr && dflash1 ==
+  nullptr`, so it announced the skip only when BOTH variables were unset. A run
+  with `VLLM_DFLASH2_GGUF_MODEL` alone printed "reading 3 published DFlash2 GGUF
+  arm(s)" and said nothing at all about the DFlash1 regression half it had just
+  skipped — the #1382 shape one level in, where a loud line invites the reader to
+  infer that the whole case ran. Each half now reports its own absence. Measured
+  2026-08-21 over all four combinations, with
+  `VLLM_DFLASH2_GGUF_MODEL=qwen3.8-27b-dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`
+  and `VLLM_DFLASH_GGUF_MODEL=muse-glimmer-30b-gguf/dflash-kquant.gguf`: neither
+  4746, DFlash1 only 4750, DFlash2 only 4941, both 4945, `Status: SUCCESS!` and
+  rc 0 in all four, and the unset half named by its own variable in each of the
+  first three.
 
 
 ## Now
@@ -1661,12 +1722,16 @@ bounded consequence named), O9 (`input_embedding_scale`), O10 (the CUDA top-k's
 NaN ordering, [#1489](https://github.com/mudler/vllm.cpp/issues/1489)), O11 (the
 walk's CUDA arm, never compiled here), O12 (the probabilistic arm), O13 (a GGUF
 drafter's bf16 residency, measured at 3.584 GiB against 1.06 GiB on disk), and
-the four the W5 REVIEW added: O15 (the three output-scalar GGUF key spellings are
-inferred and no published file declares any of them), O16 (the codebook-span
-guard is `==` and upstream's own condition is unread here), O17 (no wave has
-LOADED a published artifact — the asset case reads headers and the fixture runs
-at `H = 256`) and O18 (the fixture's fp16 block scales are each exercised at one
-value). O6, O7 and O8 stay discharged.
+three of the four the W5 REVIEW added: O15 (the three output-scalar GGUF key
+spellings are inferred and no published file declares any of them), O16 (the
+codebook-span guard is `==` and upstream's own condition is unread here) and O17
+(no wave has LOADED a published artifact — the asset case reads headers and the
+fixture runs at `H = 256`). O6, O7, O8 and O18 stay discharged; O18 was FIXED on
+2026-08-21 rather than deferred, because the bit-exactness cost its deferral was
+built on is not paid by a second power of two. O19 and O20 are recorded CLOSED on
+arrival, not owed: the coverage counters now read the same tensor population the
+comparison reads, and the asset-gated case reports each half's absence by its own
+variable instead of only when both are unset.
 
 Next action: W6's G2/G3 on a leased GPU against the PR-head oracle — which also
 carries O16 and O17 — then

@@ -174,23 +174,47 @@ struct Q4KCoverage {
   }
 };
 
+// Q8_0 only: WHAT THE ENCODER ACTUALLY DROVE in the block header's fp16 `d`.
+// Index i counts the blocks written at `kQ8Dfp16[i]`. Both must be nonzero on
+// EVERY compared tensor, which is what makes a decoder that reads `d` once per
+// TENSOR rather than once per BLOCK visible; see `EncodeQ8_0`.
+struct Q8Coverage {
+  int blocks_at[2] = {0, 0};
+};
+
 // A blob plus the values it decodes to, in the tensor's flat order.
 struct Encoded {
   std::string bytes;
   std::vector<float> expect;  // exact; every value below is a small n / 2^p
   Q4KCoverage q4k;            // Q4_K only; see above
+  Q8Coverage q8;              // Q8_0 only; see below
 };
 
 // Q8_0: { fp16 d; int8 qs[32] } per 32 elements, y = qs * d.
 //
-// `d` is FIXED at 2^-8 rather than derived from the block maximum, which is a
-// legal Q8_0 block and removes the only step that would need an fp16 rounding
-// helper. At |x| <= 0.3 the quantized magnitude stays under 77, well inside the
-// int8 range, and every decoded value is q/256 with |q| <= 127 — eight
-// significant bits, so it survives the loader's bf16 store EXACTLY and the
-// comparison can be bit-for-bit instead of within a tolerance.
-constexpr uint16_t kQ8Dfp16 = 0x1C00;  // 2^-8
-constexpr float kQ8D = 1.0f / 256.0f;
+// `d` is CHOSEN rather than derived from the block maximum, which is a legal
+// Q8_0 block and removes the only step that would need an fp16 rounding helper.
+//
+// IT ALTERNATES BY BLOCK between two powers of two, and the alternation is
+// COUNTED. Through W5 it was one fixed value in every block of every tensor,
+// which is the #1314 F1 class of instrument gap one field up from the packed
+// integers: `DequantQ8_0` reads `d` from EACH block header, and a fixture whose
+// blocks all carry the same `d` cannot tell that apart from a decoder that reads
+// it ONCE per tensor and reuses it. Measured 2026-08-21 on the pre-repair
+// fixture: rewriting `const float d = ReadF16(blk)` to `ReadF16(data)` -- the
+// whole tensor decoded at block 0's scale -- left this suite at 9 cases / 4730
+// assertions / `Status: SUCCESS!` / rc 0. After the alternation the same
+// mutation reddens 1 case / 7 assertions.
+//
+// IT COSTS NO BIT-EXACTNESS, which is why W5's recorded reason for leaving this
+// open (O18) was wrong. Both values are POWERS OF TWO, so every decoded value is
+// still q/2^p: at |x| <= 0.3 the magnitude is |q| <= 77 at 2^-8 and |q| <= 39 at
+// 2^-7, both well inside int8 and inside the eight significant bits a bf16 store
+// keeps. The comparison therefore stays equality rather than a tolerance, and
+// the suite passing it bit-for-bit after the change is the measurement of that,
+// rather than the argument above.
+constexpr uint16_t kQ8Dfp16[2] = {0x1C00, 0x2000};  // 2^-8, 2^-7
+constexpr float kQ8D[2] = {1.0f / 256.0f, 1.0f / 128.0f};
 
 Encoded EncodeQ8_0(const std::vector<float>& x) {
   REQUIRE(x.size() % 32 == 0);
@@ -198,13 +222,15 @@ Encoded EncodeQ8_0(const std::vector<float>& x) {
   e.expect.resize(x.size());
   e.bytes.reserve(x.size() / 32 * 34);
   for (size_t b = 0; b < x.size(); b += 32) {
-    e.bytes.push_back(static_cast<char>(kQ8Dfp16 & 0xff));
-    e.bytes.push_back(static_cast<char>(kQ8Dfp16 >> 8));
+    const int w = static_cast<int>((b / 32) % 2);
+    ++e.q8.blocks_at[w];
+    e.bytes.push_back(static_cast<char>(kQ8Dfp16[w] & 0xff));
+    e.bytes.push_back(static_cast<char>(kQ8Dfp16[w] >> 8));
     for (size_t l = 0; l < 32; ++l) {
-      int q = static_cast<int>(std::lround(x[b + l] / kQ8D));
+      int q = static_cast<int>(std::lround(x[b + l] / kQ8D[w]));
       q = std::max(-127, std::min(127, q));
       e.bytes.push_back(static_cast<char>(static_cast<int8_t>(q)));
-      e.expect[b + l] = static_cast<float>(q) * kQ8D;
+      e.expect[b + l] = static_cast<float>(q) * kQ8D[w];
     }
   }
   return e;
@@ -414,7 +440,13 @@ constexpr uint32_t kGgmlF32 = 0, kGgmlQ8_0 = 8, kGgmlQ4_K = 12, kGgmlBf16 = 30;
 struct BuiltGguf {
   std::string bytes;
   std::map<std::string, std::vector<float>> expect;
-  Q4KCoverage q4k;  // see Q4KCoverage; summed over every Q4_K tensor written
+  // Coverage is kept PER TENSOR, keyed by the HF name, and never pre-summed.
+  // A total over every quantized tensor in the file would let a tensor L2 does
+  // NOT compare satisfy the precondition for the ones it does: the counters
+  // would say the field was driven while the compared set never drove it. The
+  // merge therefore happens in `CheckQuantArm`, over `Dflash2Names()` alone.
+  std::map<std::string, Q4KCoverage> q4k_by_hf;
+  std::map<std::string, Q8Coverage> q8_by_hf;
 };
 
 BuiltGguf BuildDraftGguf(const Dims& d, Arm arm, bool dflash2) {
@@ -492,11 +524,12 @@ BuiltGguf BuildDraftGguf(const Dims& d, Arm arm, bool dflash2) {
       const Encoded e = EncodeQ8_0(src);
       b.AddTensor(t.gguf, dims, kGgmlQ8_0, e.bytes);
       out.expect[t.hf] = e.expect;
+      out.q8_by_hf[t.hf] = e.q8;
     } else {
       const Encoded e = EncodeQ4_K(src);
       b.AddTensor(t.gguf, dims, kGgmlQ4_K, e.bytes);
       out.expect[t.hf] = e.expect;
-      out.q4k.Merge(e.q4k);
+      out.q4k_by_hf[t.hf] = e.q4k;
     }
   }
   out.bytes = b.Build();
@@ -882,7 +915,18 @@ void CheckQuantArm(Arm arm, uint32_t ggml_type, int64_t block_elems,
   // from two bytes, and a fixture that only ever exercised one of the two would
   // pass every assertion here with the other deleted.
   if (arm == Arm::kQ4_K) {
-    const Q4KCoverage& cov = built.q4k;
+    // Over the COMPARED tensors only, not over every Q4_K tensor in the file.
+    Q4KCoverage cov;
+    int cov_tensors = 0;
+    for (const std::string& n : Dflash2Names()) {
+      const auto it = built.q4k_by_hf.find(n);
+      if (it == built.q4k_by_hf.end()) continue;  // F32 in every arm
+      cov.Merge(it->second);
+      ++cov_tensors;
+    }
+    INFO("Q4_K coverage merged over ", cov_tensors, " COMPARED tensors of ",
+         built.q4k_by_hf.size(), " encoded");
+    REQUIRE(cov_tensors > 0);
     for (int half = 0; half < 2; ++half) {
       INFO("Q4_K sub-blocks ", half == 0 ? "0..3 (whole field)" : "4..7 (split field)",
            ": ", cov.scale_above_15[half], " scales above 15, ",
@@ -899,6 +943,31 @@ void CheckQuantArm(Arm arm, uint32_t ggml_type, int64_t block_elems,
     INFO("Q4_K nibble bits: low ", cov.nibble_bits[0], " high ", cov.nibble_bits[1]);
     CHECK(cov.nibble_bits[0] == 15);
     CHECK(cov.nibble_bits[1] == 15);
+  }
+
+  // The Q8_0 arm's own precondition, on the field ITS blocks carry: the fp16
+  // `d` in each block header. Asserted PER COMPARED TENSOR rather than summed,
+  // because the defect it exists to expose -- a `d` read once and reused for a
+  // whole tensor -- is invisible unless the tensor being compared itself holds
+  // blocks at more than one `d`. A total would be satisfied by two tensors that
+  // each carry only one.
+  if (arm == Arm::kQ8_0) {
+    static_assert(kQ8Dfp16[0] != kQ8Dfp16[1],
+                  "the two block scales must differ, or the alternation counts "
+                  "nothing and the per-block read is untested");
+    int q8_tensors = 0;
+    for (const std::string& n : Dflash2Names()) {
+      const auto it = built.q8_by_hf.find(n);
+      if (it == built.q8_by_hf.end()) continue;  // F32 in every arm
+      INFO("Q8_0 tensor ", n, ": ", it->second.blocks_at[0], " blocks at 2^-8, ",
+           it->second.blocks_at[1], " blocks at 2^-7");
+      CHECK(it->second.blocks_at[0] > 0);
+      CHECK(it->second.blocks_at[1] > 0);
+      ++q8_tensors;
+    }
+    INFO("Q8_0 block-scale coverage checked over ", q8_tensors,
+         " COMPARED tensors of ", built.q8_by_hf.size(), " encoded");
+    REQUIRE(q8_tensors > 0);
   }
 
   // --- L3: DIFFERENCE from the bf16 arm, which is encoded from the SAME source.
@@ -1210,10 +1279,18 @@ TEST_CASE("REAL published DFlash2 GGUF drafters carry the names and types this a
   // so this costs kilobytes rather than the 7 GB the three arms weigh.
   const char* dflash2 = std::getenv("VLLM_DFLASH2_GGUF_MODEL");
   const char* dflash1 = std::getenv("VLLM_DFLASH_GGUF_MODEL");
-  if (dflash2 == nullptr && dflash1 == nullptr) {
-    MESSAGE("asset-gated: neither VLLM_DFLASH2_GGUF_MODEL nor "
-            "VLLM_DFLASH_GGUF_MODEL is set; 0 real-artifact assertions ran");
-    return;
+  // REPORTED PER VARIABLE, not once for the pair. The combined form said
+  // nothing whenever EITHER was set, so a run with only `VLLM_DFLASH2_GGUF_MODEL`
+  // exercised the DFlash2 half, printed a line about reading three arms, and
+  // left the DFlash1 regression half silently unexercised -- the #1382 shape one
+  // level in, since the reader sees a loud line and infers the whole case ran.
+  if (dflash2 == nullptr) {
+    MESSAGE("asset-gated: VLLM_DFLASH2_GGUF_MODEL unset; 0 published-DFlash2 "
+            "assertions ran");
+  }
+  if (dflash1 == nullptr) {
+    MESSAGE("asset-gated: VLLM_DFLASH_GGUF_MODEL unset; 0 published-DFlash1 "
+            "regression assertions ran");
   }
   if (dflash2 != nullptr) {
     std::vector<std::string> files;

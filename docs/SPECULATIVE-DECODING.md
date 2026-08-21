@@ -142,7 +142,11 @@ selector needs the hidden states of the same forward its logits came from.
 
 **A GGUF DFlash2 checkpoint now drafts too**, in all three published arms:
 bf16, Q8_0 and Q4_K_M. Point `--speculative-config` at the `.gguf` file exactly
-as you would at a safetensors directory.
+as you would at a safetensors directory. The file is identified from
+DFlash2-specific metadata rather than from an architecture string, because a
+GGUF declares none and the published DFlash2 GGUF writes
+`general.architecture = dflash`, the same value a DFlash1 drafter writes.
+Ordinary DFlash1 GGUF drafts are unchanged.
 
 What that claim rests on, so you can weigh it: the three ENCODINGS are gated by a
 synthetic draft this engine writes itself in each block format and then drafts
@@ -151,11 +155,7 @@ are read for their NAMES, SHAPES and TYPES. No test has yet loaded 7 GB of
 published tensor data end to end -- that lands with the acceptance gate below.
 `Q4_K_M` is also llama.cpp's usual mixture rather than one encoding: the
 published file is 32 F32, 45 Q4_K and 4 Q6_K tensors
-(`blk.{2,4}.{attn_v,ffn_down}.weight`), all of which this loader decodes. The file is identified from
-DFlash2-specific metadata rather than from an architecture string, because a
-GGUF declares none and the published DFlash2 GGUF writes
-`general.architecture = dflash`, the same value a DFlash1 drafter writes.
-Ordinary DFlash1 GGUF drafts are unchanged.
+(`blk.{2,4}.{attn_v,ffn_down}.weight`), all of which this loader decodes.
 
 One property of this container is worth knowing before you pick an arm: **a GGUF
 drafter is dequantized to bf16 at load.** That is this lane's design rather than

@@ -212,8 +212,12 @@ target_include_directories(test_minimax_music3_llm_real PRIVATE
 # (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
 # companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
 vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+# Reaches src/ for `music3_profile.h` — an INTERNAL instrument, deliberately not
+# on the public surface — because the intra-DiT spans (#1542) live inside
+# `DitForwardDevice` and this is the only suite that drives that forward.
 target_include_directories(test_minimax_music3_acoustic PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  ${CMAKE_SOURCE_DIR}/src)
 # The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
 # the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
 # vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;
@@ -577,6 +581,13 @@ target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}
 # runs the grouped convolution.
 vllm_cpp_add_test(test_qwen3_dflash2_draft vllm/models/test_qwen3_dflash2_draft.cpp)
 target_include_directories(test_qwen3_dflash2_draft PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W5 (#1314): the GGUF DFlash2 drafter arm. The container the other
+# suite cannot reach -- a GGUF declares no `architectures` and writes the same
+# `general.architecture = dflash` a DFlash1 drafter writes -- plus the LOWER
+# BOUND its k-quant arms need, because this lane dequantizes to bf16 by design
+# and a token gate therefore cannot see a quantized tensor that never decoded.
+vllm_cpp_add_test(test_qwen3_dflash2_gguf vllm/models/test_qwen3_dflash2_gguf.cpp)
+target_include_directories(test_qwen3_dflash2_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
 vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
 target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -963,6 +974,17 @@ vllm_cpp_add_test(test_tokenizer_metaspace_split
 target_compile_definitions(test_tokenizer_metaspace_split PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
+# The load-time MergeTokenOutOfVocabulary refusal asserts that every
+# committed HF golden still loads, so test_bpe reaches the goldens dir.
+target_compile_definitions(test_bpe PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+# SPEC-BPE-QUADRATIC-MERGE (#1365) — the long-pretoken equivalence corpus and
+# the absolute cost bound. The corpus ids are HF `tokenizers` 0.22.2 output over
+# the two committed goldens (an oracle, not a snapshot of ours); the cost case
+# is the row's ONLY timing assertion and it is RED against the O(n^2) merge.
+vllm_cpp_add_test(test_bpe_equivalence vllm/test_bpe_equivalence.cpp)
+target_compile_definitions(test_bpe_equivalence PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)

@@ -2341,3 +2341,235 @@ landed in `5ba99ac4e` and is inside the second merge, so all four are green here
 and are counted in the 574 rather than excused. `test_engine_core_proc`,
 `test_async_llm` and `test_cpu_x86_llamacpp_floor`, which starve or drift under
 parallel `ctest`, also passed at `-j 6` on this run and needed no serial rerun.
+
+## The phase-coverage residue bound (#1494, and what it measured about #1439)
+
+`ltx2 video: the three carrying phases contain their work and the load keeps its
+order` was RED on `main` in the `build-test-cpu` lane, on the `denoise` leaf, on
+both of the fixture's renders. This section records the repair and, more usefully,
+the measurement that says which repair was available.
+
+### The residue is TWO things and the gate charged them to one number
+
+A probe over the interval structure of the `denoise` leaf, both renders, this
+tree:
+
+| render | leaf | head | tail | interior gaps |
+|---|---|---|---|---|
+| 9 frames | 8.0-45.3 ms | 3.2-15.9 us | 19.6-49.1 us | 7 x 62-118 us |
+| 81 frames | 39.3-72.1 ms | 4.8-15.9 us | 53.5-102.5 us | 7 x 463-549 us |
+
+So about 5% of the un-covered seconds are the leaf's own boundaries and about 95%
+are the SEVEN gaps between consecutive `denoise.step` records. Those gaps are the
+sampler's per-step update: real work, once per evaluation, scaling with the
+latent, and NOT the "16 boundary samples of fixed cost" the previous comment at
+the site reasoned from. That reasoning put the crossing point at a 3.1 ms leaf
+and left the floor at 0.95; `main` then reported the red at leaves of 13.7 ms and
+27.5 ms, four to nine times above it.
+
+### The share is a property of the box, so no floor near it is stable
+
+`denoise` coverage on an UNCHANGED tree, nine-frame arm: 99.55%, 99.38%, 99.28%,
+99.228% (the row's own box); 98.84%, 98.77%, 98.52%, 98.23%, 94.14% (a second x86
+box as its load moved); 96.85%, 94.60%, 94.60% (the box #1494 measured); 92.39%
+and 88.85% (the GitHub runner, from CI jobs `96506970274` and `96466616360`). The
+81-frame arm spans 97.09% down to 85.85% over the same set. A 0.95 floor is below
+roughly half of its own honest distribution. The polarity is the one #1439
+recorded and it is the tell: a short serial stretch between two long parallel ones
+is what loses to a contended scheduler, so the ratio moves with the box and not
+with the tree.
+
+### The repair
+
+Assertion (1c), the SPAN SLACK, is new and is what now carries this leaf beside
+the (0) record count. It bounds the leaf's seconds lying outside the span its
+sub-scopes occupy -- computed per leaf record, because `decode.video` has two or
+three -- at a FLAT 0.25 ms. That is the only place a swallowed phase can land, it
+is two instrument boundaries rather than N intervals of work, and it measured
+11.4-64.3 us across all four leaves and both renders.
+
+The bound was first written `max(1 ms, 2% of the leaf)` and a fresh review broke
+that shape twice, both correctly:
+
+* **The share never tightens.** Inside a `max` it is pure slack, and it is
+  LARGEST where the leaf is largest -- under load `denoise` reached 3.82 s with
+  38 us of slack against a 76 ms bound, and `decode.audio` 3.07 s with 39 us
+  against 61 ms, 500x to 2200x. At production scale a swallowed phase of several
+  seconds would have passed, which is the opposite of what a share was added for.
+  The quantity does not grow with the render -- every measurement on both boxes
+  is at or under 135 us whatever the leaf did -- so a constant holds on all of
+  them and is strictly tighter at every leaf size. `kSpanSlackShare` is gone.
+* **The 1 ms term made the CHECK VACUOUS on the smallest leaf.** `span_slack <=
+  leaf_seconds` holds by construction, so any bound at or above the leaf cannot
+  fail. `artifacts.frames` measures 0.826-0.983 ms here, under the 1 ms bound:
+  forcing 100% slack on every leaf reddened only ten of twelve checks, and that
+  leaf's two PASSED AT 100% SLACK. It was also a coin flip, because on slower runs
+  the same leaf measured 1.35-13.9 ms and did bite -- so whether the assertion
+  existed depended on box speed, the exact property this change removes.
+
+Both are closed. The constant is 0.25 ms: ~2.4x the worst value measured here
+(102.5 us) and ~1.9x the worst the review measured (135 us), a multiple of a
+measurement rather than a number fitted to today's run, and below the smallest
+leaf so the check can fail. And a `REQUIRE(span_bound < leaf_seconds)` now sits
+above it, so a leaf that ever shrinks beneath the instrument's noise floor reds
+and says so instead of passing quietly. Re-run of the same forced-strict probe:
+**twelve of twelve red, `artifacts.frames` included.**
+
+The coverage floor (2) stays, and `denoise`'s parameter moves from 0.95/0.90 to
+0.75 on both arms: 10.85 points below the worst honest observation, kept for the
+range where honest and defective separate widely, which is the argument the 0.50
+floors on `decode.video.vae` and `decode.audio.vocoder` are already set by. The
+geometry dependence the previous comment parameterised is real and is SMALLER than
+the box dependence, so one number below both arms replaces two numbers sitting
+inside each. **Nothing was deleted:** a parameter moved and an assertion was added
+beside it.
+
+No claim is made that (1c) is tighter than 0.95 IN NUMBERS, because it is not:
+5% of a 13.7 ms leaf is 685 us against this 250 us, and against the 1 ms the bound
+first carried it was 1.5x LOOSER. The point is a different one. The old bound
+covered head, tail AND interior together while the interior alone measured 1046 us
+on the runner that reported it, so the budget was spent before any swallow, no
+honest tree could satisfy it, and it therefore bounded nothing at all. The new one
+is spent by 11.4-64.3 us and does not move with the box.
+
+### Evidence
+
+Two mutations in `src/vllm/multimodal/ltx2_video.cpp`, each applied by exact-text
+replacement refusing unless the pattern occurs once, compile status printed, tree
+restored and `sha256sum`-verified afterwards.
+
+| # | Mutation | compile | result |
+|---|---|---|---|
+| honest | none | rc 0 | exit 0, 1/1 cases, **566/566** assertions, 4 consecutive runs at loadavg 6.7-10.2, and 3 more at loadavg 54-61 |
+| **M1** | `denoise` opens at the top of `phase.prepare` instead of after it, so the prepare's seconds become un-named time inside the leaf | rc 0 | span slack moves **14 us -> 139 us** and PASSES; a fresh review reproduced it independently at **26.6 us -> 124.6 us**, 554 assertions green. `phase.prepare` is only ~125 us on this fixture, under even the tightened 0.25 ms bound. The coverage floor (2) misses it too, moving 0.4 points, so this is not a regression against the shape that shipped -- but it IS the instrument's resolution at this geometry, and it is now stated AT THE SITE rather than only here |
+| **M1 + calibration** | M1 with the bound lowered to 0.1 ms, to exercise the comparison itself | rc 0 | **RED**, exit 1, 1 case failed, 566 assertions / **3 failed**, each on (1c)'s own message quoting `0.000100121s` against `0.0001s`. The assertion is live and compares the quantity it names |
+| **M2** | `denoise` opens right after `generate.setup` opens, swallowing the whole conditioning and preparation stretch | rc 0 | **RED**, exit 1, 496 assertions / **14 failed**, on (3c) `CheckOnlyAnchorsAreNested` -- the swallowed leaves become `nested`, which is the assertion that owns that shape |
+
+Full suite on the landing head: **102 cases, 101 passed, 4194 assertions, 4193
+passed**. The one failure is #1439's `CHECK(leaves >= 0.95 * wall)`, which this
+change deliberately does not touch; see below. It flaps by box load on this host
+and is GREEN in CI, so a run of this suite here reports either 101 or 102 passed
+and neither is a statement about this change.
+
+### The span-slack bound, third shape: it is the BUILD that scales it (#1531 lane)
+
+The flat 0.25 ms constant passed the plain lane and reddened BOTH sanitizer lanes
+the moment #1532 made them able to run. The premise behind it -- "this quantity
+does not scale" -- was right about RENDER SIZE and wrong about BUILD
+CONFIGURATION, and every measurement behind it had come from uninstrumented
+builds. The slack is the cost of opening and closing a phase scope, and a
+sanitizer instruments exactly that path: ASan checks a shadow byte on every access
+in it, TSan additionally keeps per-access happens-before state under a lock. It is
+a different machine, not a noisier one.
+
+| lane | that test's wall | worst span slack, CI | worst span slack, 20-core box |
+|---|---|---|---|
+| plain | 259 s | 121 us | 74.7 us |
+| `address,undefined` | 1165 s | 730 us | 461 us |
+| `thread` | 2116 s | 1658 us | 895 us |
+
+The ordering is the build and not the box: both columns rank the same way, and CI
+is worse throughout because those runners are two-core and contended.
+
+**A NORMALISED bound would be better, and there is no normaliser.** The old 0.95
+coverage floor tolerated instrumentation ACCIDENTALLY, by being a ratio of two
+quantities that inflate together -- TSan makes both `covered` and `leaf_seconds`
+8x bigger and the ratio survives. The span slack is ABSOLUTE, so the overhead
+lands on it undiluted. That is the real reason the "does not grow with the render"
+premise did not generalise: it does not grow with the RENDER, it grows with the
+INSTRUMENT.
+
+Five candidate normalisers were tested over 24 observations (four leaves x two
+renders x three build configurations), scored by the spread of the resulting
+ratio, worst over best:
+
+| candidate | spread | undefined |
+|---|---|---|
+| `slack / smallest sub-scope` | 78630x | 0 |
+| `slack / leaf_seconds` | 4598x | 0 |
+| `slack / mean sub-scope` | 2377x | 0 |
+| `slack / mean interior gap` | 418x | 3 of 24 |
+| **`slack` itself** | **44.6x** | 0 |
+
+**Every ratio is worse than the raw quantity**, the two most obvious by two orders
+of magnitude, and the interior-gap normaliser is additionally undefined for a leaf
+with a single sub-scope, which `artifacts.frames` is. Conditioned on the BUILD
+instead, the raw quantity is tight: 20.1-93.6 us plain, 128-569 us under ASan,
+52.1-895 us under TSan, i.e. about 4.7x, 4.4x and 17.2x. Configuration is the
+variable that explains this quantity, so a per-configuration constant is the most
+stable bound available here rather than a fallback taken for want of anything
+better.
+
+**A single constant is impossible on this fixture, and the numbers say so
+exactly.** The worst slack is 1.658 ms while the SMALLEST leaf is 2.77 ms
+(`artifacts.frames`, ASan, measured). Those are 1.67x apart, so no number is both
+comfortably above the noise and below the leaf. This was not reasoned out in
+advance -- a 3 ms constant was tried and it reddened the anti-vacuity
+`REQUIRE(span_bound < leaf_seconds)` on exactly that leaf.
+
+**The bound is therefore three things, and the third one is the repair:**
+
+    span_bound = min(kSpanSlackPerRecord * leaf_records, 0.5 * leaf_seconds)
+
+* **Per leaf record**, because `decode.video` has two or three and each carries
+  its own pair of boundaries. This is a count of instrument boundaries, never a
+  share, so it is strictly tighter on multi-record leaves.
+* **Configuration-aware**: 0.25 ms plain, 3 ms under either sanitizer, selected at
+  compile time. ~2.1x the worst plain measurement and ~1.8x the worst sanitizer
+  measurement. The sanitizer margin is the thinner and is disclosed rather than
+  papered over. The guard is nested `#if`s, not one `||` expression, because GCC
+  does not define `__has_feature` and must still PARSE the call: the one-line form
+  compiled on the TSan leg only because `||` short-circuited before reaching it,
+  which is a green that means nothing.
+* **Capped at half the leaf with `min`, never `max`.** This is the polarity the
+  earlier review removed, inverted. Under `max` the share was a FLOOR, so it only
+  ever loosened the bound and loosened it most where the leaf was biggest -- 2200x
+  on a multi-second leaf. Under `min` it is a CEILING, so it only ever tightens:
+  on a big leaf the constant binds and production-scale behaviour is exactly the
+  constant, and on a leaf small enough that the constant would swallow it, the
+  leaf binds instead. It also makes `span_bound < leaf_seconds` true BY
+  CONSTRUCTION, so the anti-vacuity REQUIRE becomes an invariant on the FORMULA
+  rather than a live risk, and the forced-strict probe is guaranteed to red on
+  every leaf rather than happening to.
+
+**Verified in all three configurations**, four runs each, on the landing head:
+
+| lane | result | worst slack | smallest leaf | sanitizer findings |
+|---|---|---|---|---|
+| plain | 4/4 green, 578/578 | 74.7 us | 0.887 ms | - |
+| `address,undefined` | 4/4 green, 578/578 | 418 us | 2.92 ms | 0 ASan, 0 UBSan |
+| `thread` | 4/4 green, 578/578 | 870 us | 7.02 ms | 0 TSan |
+
+Forced-strict probe re-run under BOTH plain and ASan: **twelve of twelve red** in
+each. Full `test_ltx2_video` on the plain build: 102 cases, 101 passed, 4194
+assertions, 4193 passed, the single failure being #1439's untouched
+`CHECK(leaves >= 0.95 * wall)`.
+
+### #1439 is NOT repaired here, and the measurement says why not
+
+The obvious move was to give the sibling assertion the same two-term bound. The
+probe refuses it. Instrumenting where that residue sits, on a render with
+`wall = 0.343348 s` and `unaccounted = 0.0123761 s`:
+
+* the first leaf record starts at `0.0113197 s`, so **11.3 ms -- 91% of the whole
+  residue -- is ONE contiguous un-named interval at the head of the `load` span**,
+  before `load.dit` opens;
+* the interior gaps between named leaves total about 0.92 ms;
+* the tail past the last leaf is about 0.12 ms.
+
+That is not instrument noise. It is a real, nameable startup phase: the ~164 lines
+between `phase::Scope load_span("load")` and `phase::Scope dit_phase("load.dit")`
+-- device resolution, the platform probe, file discovery and option parsing. An
+absolute slack big enough to stop this assertion flapping would have to be larger
+than 12 ms, and would therefore HIDE that phase. That is the mute switch this
+repair exists to avoid, so the assertion is left exactly as it is.
+
+**What #1439 is owed is what its own text asks for first: name the time.** A
+`load.open` scope over that prologue drops the residue to about 1 ms of 343 ms,
+0.3%, and makes the 0.95 floor honest instead of marginal. It is a production
+scope in `ltx2_video.cpp` and it owes the phase names published in
+`docs/models/ltx-2-5.md`, so it is a unit of work rather than a rider on a red
+repair. Note the polarity while it is open: the GitHub runner measured 95.52% and
+97.69% on the two `main` runs that reported the `denoise` red, so this assertion
+is GREEN in CI with 0.52 and 2.69 points of margin, and it is the local boxes that
+see it fail.

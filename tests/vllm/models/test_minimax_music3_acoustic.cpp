@@ -30,6 +30,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,11 @@
 #include <vector>
 
 #include "minimax_music3_acoustic_goldens.inc"
+// The stage profiler is an INTERNAL instrument under src/ and deliberately not
+// on the public surface; this target reaches it the same way test_music3_profile
+// does (`-I src`, tests/CMakeLists.txt). It is here because the intra-DiT spans
+// live inside `DitForwardDevice` and only this file can drive that forward.
+#include "vllm/model_executor/models/music3_profile.h"
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
 #include "vllm/model_executor/models/minimax_music3_device.h"
 #include "vt/backend.h"
@@ -46,6 +52,7 @@
 namespace {
 
 namespace m3 = vllm::models::music3;
+namespace m3profile = vllm::models::music3::profile;
 
 constexpr double kRelTol = 1e-5;
 constexpr double kAbsFloor = 1e-6;
@@ -814,6 +821,190 @@ TEST_CASE("music3 acoustic: the DEVICE-resident DiT matches upstream on CUDA") {
   }
   vt::Queue q = cuda->CreateQueue();
   CheckDeviceDit(q, "cuda");
+}
+
+// ---------------------------------------------------------------------------
+// The INTRA-DiT SPANS (#1542, spec §21.3)
+//
+// WHY THIS GATE IS A CALL-COUNT GATE AND NOT A TIMING ONE. What can go wrong
+// with a hand-placed bracket is placement, not arithmetic: a mark left out, a
+// mark inside the layer loop that belonged outside it, a mark that names the
+// neighbour's bucket. Every one of those changes a CALL COUNT deterministically,
+// on any box, at any load — while the seconds themselves are the thing being
+// measured and cannot also be the assertion. So the counts are asserted exactly
+// and the times are asserted only for the two properties the accounting depends
+// on: that every intra-DiT bucket is a SPAN (so `sum(leaf)` and `unattributed`
+// in every §15/§20 table are untouched), and that the spans PARTITION the
+// forward rather than sample it.
+//
+// The CPU backend is the right place for it. `Backend::Synchronize` is a no-op
+// on a CPU queue, so the placement contract is tested without a device and
+// without the sync perturbation that is the whole reason the spans are a second
+// opt-in — and placement is architecture-independent, being a property of where
+// the calls sit in the source.
+namespace {
+
+// Restores BOTH flags, so a later case in this binary still sees the shipped
+// default. `test_music3_profile.cpp`'s ArmedProfile does the same for the outer
+// one; this file needs the pair.
+struct ArmedDitSpans {
+  ArmedDitSpans()
+      : profile_(m3profile::EnabledFlag()), spans_(m3profile::DitSpansFlag()) {
+    m3profile::EnabledFlag() = true;
+    m3profile::DitSpansFlag() = true;
+  }
+  ~ArmedDitSpans() {
+    m3profile::EnabledFlag() = profile_;
+    m3profile::DitSpansFlag() = spans_;
+  }
+  bool profile_;
+  bool spans_;
+};
+
+const m3profile::Bucket* FindBucket(const char* name) {
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name == name) return &bucket;
+  }
+  return nullptr;
+}
+
+// One device forward on a CPU queue, with the table freshly begun. Returns the
+// wall time of the FORWARD ALONE — the staging above it is outside the bracket,
+// because a partition assertion against a bracket that also contained a 36-block
+// weight upload would be measuring the upload.
+double RunOneProfiledDeviceForward() {
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+  const size_t latent_count =
+      static_cast<size_t>(config.in_channels * vllm_test::kMusic3DitLength);
+  const size_t condition_count =
+      static_cast<size_t>(vllm_test::kMusic3DitLength * config.condition_dim);
+  const std::vector<float> latents = ToVector(vllm_test::kMusic3DitLatents, latent_count);
+  const std::vector<float> condition = ToVector(vllm_test::kMusic3DitCondition, condition_count);
+  m3::DitWeights host = DitWeights();
+  vt::Queue q{vt::Device{}, nullptr};
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(q, config, host, /*release_host=*/false);
+  m3profile::Begin();
+  const auto t0 = m3profile::Now();
+  const std::vector<float> out = m3::DitForwardDevice(
+      q, latents, vllm_test::kMusic3DitLength, condition, vllm_test::kMusic3DitTimestep, config,
+      staged);
+  const double seconds = std::chrono::duration<double>(m3profile::Now() - t0).count();
+  // The forward has to have actually produced the tensor; a span table over a
+  // throw would be a green gate over no work at all.
+  REQUIRE(out.size() == latent_count);
+  return seconds;
+}
+
+// The nine spans that sit INSIDE the layer loop, so their call count is
+// `num_layers` per forward. Listed in source order.
+const char* const kPerLayerSpans[] = {"dit.norm1", "dit.qkv",    "dit.rope",
+                                      "dit.attn",  "dit.attn_out", "dit.norm2",
+                                      "dit.ff_in", "dit.silu",   "dit.ff_out"};
+
+// The seven that sit outside it, once per forward, in source order.
+const char* const kPerForwardSpans[] = {"dit.pack", "dit.pre",      "dit.temb",
+                                        "dit.rope_build", "dit.post", "dit.readback",
+                                        "dit.untranspose"};
+
+}  // namespace
+
+TEST_CASE("music3 acoustic: the intra-DiT spans are placed once per layer and once per forward") {
+  const ArmedDitSpans armed;
+  (void)RunOneProfiledDeviceForward();
+  const int64_t layers = DitConfig().num_layers;
+  REQUIRE(layers > 1);  // a 1-layer config could not tell the two groups apart
+
+  for (const char* name : kPerLayerSpans) {
+    const m3profile::Bucket* bucket = FindBucket(name);
+    const std::string missing = std::string("missing intra-DiT span: ") + name;
+    REQUIRE_MESSAGE(bucket != nullptr, missing);
+    const std::string wrong = std::string(name) + " ran " + std::to_string(bucket->calls) +
+                              " times, expected once per layer = " + std::to_string(layers);
+    CHECK_MESSAGE(bucket->calls == layers, wrong);
+  }
+  for (const char* name : kPerForwardSpans) {
+    const m3profile::Bucket* bucket = FindBucket(name);
+    const std::string missing = std::string("missing intra-DiT span: ") + name;
+    REQUIRE_MESSAGE(bucket != nullptr, missing);
+    const std::string wrong = std::string(name) + " ran " + std::to_string(bucket->calls) +
+                              " times, expected once per forward";
+    CHECK_MESSAGE(bucket->calls == 1, wrong);
+  }
+
+  // The geometry the split must be read against, so a reader never has to infer
+  // `seq` from a vocoder latent count the way spec §21.1 had to. Both are SUMS
+  // over the forwards in a run; here there is exactly one.
+  const m3profile::Bucket* seq_sum = FindBucket("dit.seq_sum");
+  REQUIRE(seq_sum != nullptr);
+  CHECK(seq_sum->calls == vllm_test::kMusic3DitLength + 1);
+  const m3profile::Bucket* length_sum = FindBucket("dit.length_sum");
+  REQUIRE(length_sum != nullptr);
+  CHECK(length_sum->calls == vllm_test::kMusic3DitLength);
+}
+
+TEST_CASE("music3 acoustic: every intra-DiT bucket is a SPAN, so no §20 table moves") {
+  const ArmedDitSpans armed;
+  (void)RunOneProfiledDeviceForward();
+
+  // THE ACCOUNTING PROPERTY THIS ROW RESTS ON. `music3_profile.h` sums LEAVES
+  // and only prints SPANS. If one of these landed as a leaf it would be added to
+  // `sum(leaf)` alongside the `denoise.dit_device` leaf that already contains
+  // it, every §15.7 and §20 table would double-count the DiT, and
+  // `unattributed` would go negative — a corrupted split that still prints.
+  int64_t timed = 0;
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name.rfind("dit.", 0) != 0) continue;
+    if (bucket.seconds < 0.0) continue;  // dit.seq_sum / dit.length_sum are pure counters
+    ++timed;
+    const std::string leaked = bucket.name + " landed as a LEAF; it must be a span";
+    CHECK_MESSAGE(bucket.span, leaked);
+  }
+  CHECK(timed == 16);  // 9 per-layer + 7 per-forward, and no more
+}
+
+TEST_CASE("music3 acoustic: the intra-DiT spans PARTITION the forward, they do not sample it") {
+  const ArmedDitSpans armed;
+  const double bracket = RunOneProfiledDeviceForward();
+
+  double summed = 0.0;
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name.rfind("dit.", 0) == 0 && bucket.seconds >= 0.0) summed += bucket.seconds;
+  }
+  MESSAGE("intra-DiT spans sum to " << summed << " s of a " << bracket
+                                    << " s bracket around the forward");
+  // Contiguity gives the upper bound by construction: each mark charges only the
+  // interval since the previous one, so the spans cannot exceed the whole.
+  CHECK(summed <= bracket);
+  // The lower bound is the one that catches a MISSING bracket. It is deliberately
+  // loose — the two host loops that open and close the forward sit inside the
+  // bracket and inside the spans alike, and the clock is read sixteen times — but
+  // it still fails hard on a dropped mark, because the largest of the sixteen
+  // (`dit.ff_in`) is most of the forward on its own.
+  CHECK(summed >= 0.5 * bracket);
+}
+
+TEST_CASE("music3 acoustic: with the spans OFF the DiT forward emits NO dit.* bucket") {
+  // G2, spec §21.4: the shipped profiled path. `VLLM_CPP_MUSIC3_PROFILE=1` alone
+  // must leave the forward exactly what §20 timed, so the perturbation of the
+  // sixteen synchronizes is opt-in and `denoise.dit_device` stays comparable to
+  // §15.7 and §20 value for value.
+  const bool prev_profile = m3profile::EnabledFlag();
+  const bool prev_spans = m3profile::DitSpansFlag();
+  m3profile::EnabledFlag() = true;
+  m3profile::DitSpansFlag() = false;
+  (void)RunOneProfiledDeviceForward();
+  int64_t found = 0;
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name.rfind("dit.", 0) == 0) ++found;
+  }
+  m3profile::EnabledFlag() = prev_profile;
+  m3profile::DitSpansFlag() = prev_spans;
+  CHECK(found == 0);
+
+  // And asking for spans with the instrument OFF is a no-op, not a partial
+  // arming: there is no table for a span to land in.
+  CHECK_FALSE(m3profile::DitSpans());
 }
 
 TEST_CASE("music3 acoustic: the ff_in HALF SWAP is load-bearing, and the gate sees it") {

@@ -561,15 +561,25 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   `output_throughput` up by more than that figure's own CV; `## Now` carries the
   bound. Quoting either total-token figure, or setting our 38.4776 beside vLLM's
   38.5516, compares two different workloads.
-- [#1365](https://github.com/mudler/vllm.cpp/issues/1365), a reproducible ~4 s
-  TTFT outlier on request 3 of every c1 leg of ours, which the oracle does not
-  have: index 2 reads 3.981 / 3.924 / 4.006 / 3.955 s across the warmup leg and
-  all three reps against 0.73-0.93 s for every other request, four legs of four,
-  on a 1024-token prompt like requests 4, 5 and 6. Nothing published is wrong,
-  because the median of six averages ranks three and four and the outlier never
-  occupies either; it moves the MEAN (ours 1347.6-1372.6 ms against the oracle's
-  873.3-900.2 ms) and costs ~3.1 s of the 174.39 s c1 wall. The cause is not
-  chased here.
+- [#1365](https://github.com/mudler/vllm.cpp/issues/1365) -- **NO LONGER OWED
+  HERE. Chased and fixed elsewhere; the ownership moved on 2026-08-21.** As
+  found, it was a reproducible ~4 s TTFT outlier on request 3 of every c1 leg of
+  ours that the oracle does not have: index 2 reads 3.981 / 3.924 / 4.006 /
+  3.955 s across the warmup leg and all three reps against 0.73-0.93 s for every
+  other request, four legs of four, on a 1024-token prompt like requests 4, 5
+  and 6. Nothing published was wrong, because the median of six averages ranks
+  three and four and the outlier never occupies either; it moved the MEAN (ours
+  1347.6-1372.6 ms against the oracle's 873.3-900.2 ms) and cost ~3.1 s of the
+  174.39 s c1 wall. This spec said the cause was not chased here, and that
+  stopped being true: `SPEC-BPE-QUADRATIC-MERGE` chased it, measured the cause
+  as the O(n^2) BPE merge loop, and fixed it in `67823aee2` (PR #1539). The
+  issue was re-titled and re-scoped in place onto that cause, and the row is
+  `DONE`. Everything about #1365 now lives in
+  [bpe-quadratic-merge.md](bpe-quadratic-merge.md); the entry is kept here
+  rather than deleted so that a reader who arrives at this list from the landed
+  index row, which still names this spec, is sent to the right one. **No GB10
+  end-to-end re-measure of these legs has been taken since the fix**, so what
+  this campaign's own numbers would read now is unmeasured rather than improved.
 - The checkpoint size disagrees between records: this spec's `## Outcome` says
   55,586,114,863 bytes and the campaign's `NOTES.txt` says 55,586,040,114, a
   difference of 74,749 bytes. The 2026-08-19 run DID re-derive it, and it agrees

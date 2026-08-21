@@ -629,9 +629,15 @@ TEST_CASE("dflash2 runner: the STARTUP notice names what runs, not what is owed"
   CHECK(captured.find("DFlash2DraftModel") != std::string::npos);
   CHECK(captured.find("PATH WALK are all implemented") != std::string::npos);
   CHECK(captured.find("this draft DRAFTS") != std::string::npos);
-  // What is still owed, named -- the GGUF drafter arm and the absent throughput
-  // number -- so the notice is not a claim that the row is finished.
-  CHECK(captured.find("wave W5") != std::string::npos);
+  // What is still owed, named -- the GGUF drafter's bf16 residency and the
+  // absent throughput number -- so the notice is not a claim that the row is
+  // finished. W5 (#1314) LANDED the GGUF arm, so the notice must no longer name
+  // it as owed; a text that kept saying so would tell a user running that arm
+  // that it is refused, which is the staleness this case exists to catch.
+  CHECK(captured.find("wave W5") == std::string::npos);
+  CHECK(captured.find("GGUF drafter arm is refused") == std::string::npos);
+  CHECK(captured.find("from safetensors and from GGUF alike") != std::string::npos);
+  CHECK(captured.find("DEQUANTIZED") != std::string::npos);
   CHECK(captured.find("no throughput number") != std::string::npos);
   CHECK(captured.find("#1314") != std::string::npos);
   // And that the port is BEYOND-PIN, which is the one thing a user of a DFlash2

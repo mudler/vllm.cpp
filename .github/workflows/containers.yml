@@ -128,6 +128,12 @@ jobs:
           echo "publish=$(python3 scripts/container_tags.py --build-matrix --release)" >> "$GITHUB_OUTPUT"
       - name: Gate this workflow against its own contract
         run: python3 scripts/check-container-workflow.py
+      - name: Builder stages can build what the runtime stage advertises
+        # Issue #1517. The runtime stage carried libssl3 while no builder
+        # stage carried libssl-dev, so every image this workflow published
+        # shipped a server that could not fetch from huggingface.co, and
+        # every other gate here stayed green.
+        run: python3 scripts/check-build-runtime-deps.py
 
   verify:
     needs: plan

@@ -4,6 +4,8 @@
 # set are in bijection, so a new doc cannot go missing from the sidebar and a
 # deleted one cannot linger here.
 docs:
+  - file: QUICKSTART.md
+    label: Quickstart
   - file: USAGE.md
     label: Usage
   - file: BUILD.md

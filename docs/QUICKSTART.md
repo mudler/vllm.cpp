@@ -1,0 +1,115 @@
+# Quickstart
+
+Run one model, from one command, without building the tree and without already
+holding a checkpoint. This page is the first thing to try.
+[`docs/USAGE.md`](USAGE.md) and [`docs/reference/`](reference/README.md) are the
+full reference. When this page and a reference page disagree, the reference is
+correct and this page is stale.
+
+`--model` takes four shapes. A directory, a `.gguf` file, `org/repo` for a
+Hugging Face snapshot, and `org/repo:TAG` for one GGUF file out of a repository.
+The last two fetch what your cache lacks.
+
+> **What on this page is not yet runnable.** The container lanes have never been
+> published, so no tag below resolves against the registry yet, and release
+> `v0.0.2` predates `--model org/repo`, so the archive you can download today
+> cannot run these lines either. Every such line is marked `PENDING` with the
+> issue that owes it. Nothing here is presented as verified when it is not.
+
+## Run a model with Docker
+
+This needs no build, no checkout, and no GPU. The entrypoint is `vllm-server`,
+so every flag after the image name goes to the server.
+
+```sh
+# PENDING(#1281): the first container publish has not happened, so this tag does
+# not resolve yet. The package carries only a `stage` tag today, which is a build
+# artifact and not a lane.
+docker run --rm -p 8000:8000 \
+  -v "$HOME/.cache/huggingface:/cache" \
+  ghcr.io/mudler/vllm.cpp:latest \
+  --model Qwen/Qwen3-0.6B
+```
+
+Answer it from another terminal:
+
+```sh
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "The capital of France is", "max_tokens": 32}'
+```
+
+Any OpenAI client works. Point its `base_url` at `http://localhost:8000/v1`.
+
+`:latest` selects the CPU lane, which runs anywhere. For an NVIDIA GPU use
+`ghcr.io/mudler/vllm.cpp:latest-cuda` and add `--gpus all`. On a Jetson or Tegra
+host you need `--runtime nvidia --gpus all` together. The lanes, the tag
+meanings, and the two flag families are in
+[`docs/guides/container-images.md`](guides/container-images.md).
+
+The container runs as UID `1000`. That user must be able to write to `/cache`,
+which is where the Hugging Face cache lives inside the image.
+
+## Run a model from a release archive
+
+For a host that does not run Docker. The archive carries `bin/vllm-server` and
+nothing else it needs, so you unpack it and run it.
+
+```sh
+# PENDING(#1281): release v0.0.2 predates `--model org/repo`, so this line needs
+# a release cut after that feature landed. Until one exists, build the tree as
+# docs/BUILD.md describes and run build/examples/vllm-server instead.
+tar -xzf vllm.cpp-<version>-linux-x86_64-glibc-cpu.tar.gz
+./bin/vllm-server --model Qwen/Qwen3-0.6B --port 8000
+```
+
+The same `curl` above answers it. Checksums, provenance sidecars, and the full
+list of published archives are in [`docs/RELEASES.md`](RELEASES.md).
+
+## Models that have been run
+
+**A row enters this table only after somebody ran it end to end.** The image was
+pulled, the model was fetched, and the server returned tokens. The row then
+records the date and the host it ran on. This page carries no row that was
+reasoned about rather than run, and it carries no row marked as expected to
+work.
+
+The table below holds one row, and every cell in it is a placeholder. It shows
+the shape a real row takes. Two things block filling it in, and neither is a
+judgement about any model:
+
+- [#1511](https://github.com/mudler/vllm.cpp/issues/1511): a relative HTTP
+  `Location` header is read as a URL, so `--model org/repo` fetches nothing from
+  the real Hub today.
+- No container image has been published, so no lane image can be pulled.
+
+| Model | Lane image | `--model` line | Memory needed | Date run | Host |
+|---|---|---|---|---|---|
+| PENDING | PENDING | `--model PENDING` | PENDING | PENDING(#1281) | PENDING |
+
+## Caches, tokens, and hosts with no network
+
+These three cases are documented once, in
+[`docs/guides/hugging-face-access.md`](guides/hugging-face-access.md), and that
+guide is the correct answer whenever it disagrees with this summary.
+
+- **Reusing a cache.** A cache that Python `huggingface_hub` already populated
+  is read rather than downloaded again, because the layout is the same one. Give
+  the container `-v "$HOME/.cache/huggingface:/cache"` and a second run opens no
+  socket.
+- **A gated repository.** Set `HF_TOKEN` to a token that can read it, or point
+  `HF_TOKEN_PATH` at a file holding one.
+- **A host with no network.** Set `HF_HUB_OFFLINE=1`. A warm cache then behaves
+  exactly as it would online. A cold one refuses and names the directory it
+  searched, so you can see which cache root the run chose.
+
+## Where the full reference lives
+
+| You want | Read |
+|---|---|
+| Every server flag, endpoint, and default | [`docs/reference/server.md`](reference/server.md) |
+| How `--model` resolves, and the cache it writes | [`docs/reference/model-loading.md`](reference/model-loading.md) |
+| The C API | [`docs/reference/c-api.md`](reference/c-api.md) |
+| Runnable workflows end to end | [`docs/USAGE.md`](USAGE.md) |
+| Building, and every CMake option | [`docs/BUILD.md`](BUILD.md) |
+| What is proven and what is not | [`docs/STATUS.md`](STATUS.md) |

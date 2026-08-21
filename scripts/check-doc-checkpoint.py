@@ -106,6 +106,18 @@ USER_USAGE_PREFIXES = (
 # README permission and obligation come only from underlying landing sources.
 # Co-edited public projections can NEVER justify README churn -- that rule is
 # deliberate and directly tested.
+#
+# docs/QUICKSTART.md joined the set on 2026-08-20 (#1520). Every other member is
+# something the README QUOTES: the mission, the build entry point, the demo
+# numbers, the two example mains. The quickstart page is the same relation with
+# the direction made explicit -- the README `## Quickstart` block stopped
+# carrying the commands and now points at that page, so the claim "this is where
+# a reader starts" changed BECAUSE the page exists. It is a source, not a
+# projection: nothing else records what it says, and the README defers to it.
+#
+# This admits exactly one document and no class. docs/BUILD.md, docs/STATUS.md
+# and every other page under docs/ still cannot license a README claim change,
+# which tests/scripts/test_doc_checkpoint.py pins directly.
 LANDING_SOURCE_FILES = frozenset(
     {
         ".agents/mission.md",
@@ -113,6 +125,7 @@ LANDING_SOURCE_FILES = frozenset(
         "benchmarks/demo/footprint_gb10.json",
         "benchmarks/demo/qwen36_27b_c1_c32.json",
         "benchmarks/demo/vulkan_27b_llamacpp.json",
+        "docs/QUICKSTART.md",
         "examples/cli/main.cpp",
         "examples/server/main.cpp",
     }

@@ -506,3 +506,16 @@ row's recorded prerequisites for the flip. R5 is now `ACTIVE` on
 `row/BACKEND-TENSTORRENT-HOST-FREE-1604` from main `52e328789`. The
 under-flag reproduction on that base (2026-08-21) is recorded under R5 scope
 item 2: fast anchor red, no timeout.
+
+**R5 implemented and gated on the branch (2026-08-21, commits `fdedfee12`
+spec, `b86e3705f` flip, `f85492992` capture-decline #1625, `9a7d9f4d4`
+golden refresh #1626/#1627).** All R5 gates green on the P150: both
+paged-engine gates 16/16 under the NEW default on the refreshed pairs
+(Qwen3 125/125 assertions, max gap 0.375 nats; Mistral 128/128 assertions,
+max gap 0.25 nats, 0 forward-divergent both, Mistral exit-139 is the #1486
+teardown class after the doctest SUCCESS); re-adjudication max gaps 375
+(Qwen3) / 250 (Mistral) mnats, zero cells outside top-K;
+`test_tenstorrent_backend` 23/23 + 831/831 with and without an ambient
+opt-out; default leg 10.94/10.95/11.06 tok/s vs the 5.34 opt-out (2.1x,
+same-binary A/B). The async-serving battery outcome is pre-existing and
+filed (#1627, under `## Owed`). Pending: fresh review, PR, operator merge.

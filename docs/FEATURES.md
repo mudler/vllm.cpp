@@ -279,7 +279,7 @@ both refuse, naming what is missing.
 | ROCm | W0: 5 gfx archs; dense/GDN all-native; 0.8B dispatch fixed. **M4:** Qwen3-0.6B/3.5-0.8B 16/16 (#41). **M3:** `ROCM_ATTN` registered (#1056/#1065, [spec](../.agents/specs/rocm-attn-backend.md)). CPU parity open (#269) | 49 registered ops: full GDN, MoE combine/gate, keep-quant GEMM; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCm guide](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
-| Tenstorrent host-free decode | ◐ env-gated `VT_TT_HOST_FREE_DECODE`; implementer P150 79-replay/5.8x. Default inert. New batch after capture refused. Engine golden owed | ☐ | ☐ | ☐ |
+| Tenstorrent host-free decode | ◐ DEFAULT since #1604 (`0` opts out): no per-step host readback; 2.1x default-leg tok/s; both golden pairs re-adjudicated, both paged gates 16/16. Capture opt-in only (#1625 hang); async off (#1627) | ☐ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,

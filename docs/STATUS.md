@@ -70,7 +70,7 @@ feature once. The [Usage index](USAGE.md) links each runnable workflow.
 | Metal | Partial runtime support on Apple Silicon | Only the operations and models listed in Features are covered |
 | Vulkan | Partial runtime support | The documented OPT and Qwen gates define the proved scope |
 | ROCm | Build and focused community test evidence | Model and oracle runtime gates remain open |
-| Tenstorrent Blackhole | Active, partial runtime support | Host-free decode fidelity rerun passed (#1476 fixed); the paged-engine golden re-adjudication (#1488) and the performance path remain open |
+| Tenstorrent Blackhole | Active, partial runtime support | Host-free eager decode is the default (#1604): both device golden pairs re-adjudicated (375/250 mnats max, 0 outside top-K), both paged-engine gates green, 2.1x default-leg tok/s. Captured decode opt-in only (#1625 hang); async scheduling stays off on TT (#1627) |
 | Intel XPU | Hardware-blocked | No accepted runtime gate |
 
 The eight v0.0.2 server bundles are published; Windows v0.0.3-pre.1 remains

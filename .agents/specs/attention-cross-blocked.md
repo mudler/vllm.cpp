@@ -618,7 +618,125 @@ this row's evidence is about which kernel serves an op, not about that.
 
 ## 8. Gates, and their state
 
-Filled in from the runs.
+### 8.1 The shipped configuration, MEASURED
+
+`rc` job on `thor:gpu0`, worker `rc-worker-m4d7t`, boot id
+**`fabedc13-97a1-4cb9-909f-217a425d3f70`** — a DIFFERENT boot from §6.3's
+`c99b7805`, so nothing here is divided by anything there. Tree `a04a4d2b1`,
+asserted equal to the requested sha before anything was built. Checkpoint staged:
+`STAGE_SECONDS=996`, `SRC_BYTES = DST_BYTES = 28517617303`, `findmnt -T /tmp/ckpt`
+-> `overlay overlay /`. Correctness ran FIRST and green
+(`BASELINE_TEST_RC=0`) before any figure below was taken.
+
+**`--duration 20 --steps 30 --device 1 --seed 7`, spans OFF, one alternated pair
+— the developer's own configuration:**
+
+| | arm A `vt-cross-blocked` | arm B `vt-native` | ratio |
+|---|---:|---:|---:|
+| `denoise.dit_device` (120 calls) | **225.352 s** | **370.955 s** | **1.6461x** |
+| DiT share of the run | 50.20 % | 62.37 % | — |
+| **wall** | **449.969 s** | **595.496 s** | **1.3234x** |
+
+**The DiT-bucket ratio is 1.6461x at 30 steps and 1.6461x at 2 steps** (§6.3's
+three pairs), on different boots and over a fifteen-fold longer run. §21.10's
+bound was 1.71x on the DiT from a flop ratio; the delivered 1.6461x is 96 % of
+it.
+
+**Two independent cross-checks the row did not arrange.** Arm B's 370.955 s
+against §20.5's separately measured **370.556 s** is **0.11 %** apart, and the
+`dit.attn` span below reproduces §21.9's 11.010 s to **0.22 %** — both on a
+different boot and a different tree. Read as evidence that the quantity is
+stable, not as a licence to divide across jobs.
+
+**The projection §6.3 carried was right and is now retired.** It predicted a
+449-453 s wall; the measurement is 449.969 s, **0.52 %** off. The 62 %-of-run
+figure is no longer a projection.
+
+### 8.2 The attribution — `dit.attn` itself
+
+One 2-step pair with `VLLM_CPP_MUSIC3_DIT_SPANS=1`. **NOT a headline**: §21
+measures the spans at 1.49 % perturbation, and `denoise.dit_device` reads 15.392
+and 25.167 here against 15.046 and 24.770 without them.
+
+| span | arm A | arm B | ratio |
+|---|---:|---:|---:|
+| **`dit.attn`** (576 calls) | **1.282 s** | **11.034 s** | **8.607x** |
+| `dit.attn_out` | 0.918 | 0.931 | 1.014 |
+
+`vt::AttentionCross` falls from **43.8 % of the DiT forward to 8.3 %**, and from
+4.44 % of the whole run to 0.54 %. The standalone probe predicted 7.62x on
+synthetic uniform data; in situ it is **8.607x**, so the probe understated it.
+`dit.attn_out` moving 1.4 % is the control: the GEMM beside it did not change.
+
+### 8.3 The audio, checked as SAMPLES rather than as a byte count
+
+§6.5 withdrew a claim about audio nobody had inspected. This is the measurement
+that replaces it — peak, RMS, non-zero fraction and clipped count over all
+1 765 376 samples of each 30-step render:
+
+| arm | samples | peak | RMS | non-zero | clipped | sha256 |
+|---|---:|---:|---:|---:|---:|---|
+| A blocked | 1 765 376 | 20 748 | 2 344.3 | 0.9998 | 0 | `572f8880d2b0c30a` |
+| B shipped | 1 765 376 | 20 748 | 2 344.3 | 0.9998 | 0 | `55856deb3b5b727a` |
+
+**Every waveform statistic is identical and the hashes differ.** So the render is
+real audio rather than silence, nothing clips, and the two arms differ only where
+a non-bit-identical kernel must make them differ. §6.5's gap — that nothing
+bounds the ACCUMULATED difference over 30 steps — is unchanged by this; four
+summary statistics are not such a bound.
+
+### 8.4 The mutation suite — four clean reds, and TWO INSTRUMENT FAILURES
+
+Every mutation is one line, rebuilt incrementally and re-gated, with the compile
+return code printed BEFORE any test result and the tree restored byte for byte
+afterwards.
+
+| mutation | hunks | compile rc | test rc | verdict |
+|---|---:|---:|---:|---|
+| M1 the shape gate routes nothing | **0** | — | — | **INSTRUMENT FAILED — never applied** |
+| M2 `vt-native` outranks the provider | 1 | **1** | — | **INSTRUMENT FAILED — did not build** |
+| M3 the ragged key-tile tail enters the softmax | 1 | 0 | **1** | **RED** |
+| M4 every query reads bias row 0 | 1 | 0 | **1** | **RED** |
+| M5 the kv-head is the query head | 1 | 0 | **1** | **RED** |
+| M6 no rescale at a tile boundary | 1 | 0 | **1** | **RED** |
+
+Each red carries a DISTINCT binary sha256, so the rebuild demonstrably took, and
+each reports `RESTORED_BYTE_FOR_BYTE`. `TREE_CLEAN` and `FINAL_TEST_RC=0`
+afterwards.
+
+**The two failures are the part worth keeping.** Neither produced a verdict about
+the code and neither could be mistaken for one, because the harness counts diff
+hunks and prints the compile return code first. M1 was the only mutation whose
+replacement text contained an unmatched `{`, and perl's `s{...}{...}` counts
+nested braces, so it consumed the closing delimiter and substituted nothing — a
+pattern that silently matches nothing is EXACTLY the shape that reads as a
+passing test. M2 replaced `kBlockedPriority` with a literal, which orphaned that
+`constexpr` in an anonymous namespace, and `-Wunused-const-variable` is an error
+here. Both are re-run in §8.5 with a `!` delimiter and with -1 DERIVED from the
+constant so it stays referenced.
+
+### 8.5 M1 and M2, re-run
+
+Filled in from that job.
+
+### 8.6 The consumer suites, on the device
+
+All six built and run in the same lease, at the tree under review:
+
+| suite | rc |
+|---|---:|
+| `test_ops_attention_cross` | 0 |
+| `test_ltx2_device` | 0 |
+| `test_ltx2` | 0 |
+| `test_ops_attention` | 0 |
+| `test_minimax_music3_acoustic` | 0 |
+| `test_minimax_music3_ar` | 0 |
+| `test_music3_profile` | 0 |
+
+`test_ltx2` and `test_ltx2_device` are green and BYTE-IDENTICAL for the reason
+§6.4 gives: their fixtures are reduced-dimension and decline. That is reported as
+a coverage finding, not as coverage.
+
 
 ## 9. Stop conditions
 

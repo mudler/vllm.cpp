@@ -26409,23 +26409,63 @@ kernel is **7.2x MORE accurate** than the one it replaces (worst 9.10163e-05
 against 8.50797e-04), because it trades 96 per-key softmax rescales for 3
 per-tile ones.
 
+### The SHIPPED configuration, MEASURED — a second lease, a different boot
+
+`rc` job on `thor:gpu0`, worker `rc-worker-m4d7t`, boot id
+**`fabedc13-97a1-4cb9-909f-217a425d3f70`**, tree `a04a4d2b1` asserted before the
+build, checkpoint staged `STAGE_SECONDS=996` with
+`SRC_BYTES = DST_BYTES = 28517617303` and `findmnt -T /tmp/ckpt` reading
+`overlay`. Correctness ran first and green.
+
+**`--duration 20 --steps 30 --device 1 --seed 7`, spans OFF, one alternated pair:**
+
+| | arm A `vt-cross-blocked` | arm B `vt-native` | ratio |
+|---|---:|---:|---:|
+| `denoise.dit_device` (120 calls) | **225.352 s** | **370.955 s** | **1.6461x** |
+| DiT share of the run | 50.20 % | 62.37 % | — |
+| **wall** | **449.969 s** | **595.496 s** | **1.3234x** |
+
+**The DiT-bucket ratio is 1.6461x here and 1.6461x at 2 steps**, on different
+boots, over a fifteen-fold longer run. §21.10's bound from a flop ratio was 1.71x
+on the DiT; delivered is 96 % of it.
+
+**Two cross-checks this row did not arrange.** Arm B against §20.5's separately
+measured 370.556 s is **0.11 %** apart, and the `dit.attn` span below reproduces
+§21.9's 11.010 s to **0.22 %** — both across a boundary this record elsewhere
+refuses to divide across. Read as evidence that the quantity is stable, not as a
+licence.
+
+**Attribution**, one 2-step spans pair, NOT a headline (1.49 % perturbation):
+`dit.attn` **11.034 -> 1.282 s, 8.607x**, falling from 43.8 % of the DiT forward
+to 8.3 %. `dit.attn_out` moves 1.4 % and is the control. The standalone probe
+predicted 7.62x on synthetic data; in situ it is 8.607x.
+
+**The audio, as SAMPLES.** Over all 1 765 376 samples of each 30-step render,
+both arms read peak **20 748**, RMS **2 344.3**, non-zero **0.9998**, clipped
+**0**, with different sha256. Real audio, nothing clipping, and the arms differ
+only where a non-bit-identical kernel must make them differ. This replaces an
+earlier sentence that claimed the renders had been checked when only their byte
+count had.
+
+### The two leases are on DIFFERENT BOOTS, and no figure crosses that line
+
+The A/B table above ran under boot `c99b7805-6e26-47a7-bc9d-93d592d676a6`; the
+30-step pair ran under `fabedc13-97a1-4cb9-909f-217a425d3f70`. `thor:gpu0`
+restarted between them, and this device reports `clocks.sm` as `[N/A]`, so
+nothing here could detect a clock difference if there were one.
+[#543](https://github.com/mudler/vllm.cpp/issues/543) measured 12.79 % between
+boots with no throttling on either side — larger than most deficits it was used
+to rank.
+
+**Every RATIO in this entry is therefore taken inside ONE boot**, because each
+job alternates its own two arms. No second from one job is divided by a second
+from the other, and the two cross-checks against §20.5 and §21.9 are reported as
+evidence of stability rather than used as denominators.
+
 ### What this entry does NOT contain
 
-The **30-step shipped configuration** and the intra-DiT `dit.attn` attribution
-pair are being measured in a second lease and are **not in this table**.
-
-**That second lease is on a DIFFERENT BOOT**, and it matters. Its worker reports
-boot id `fabedc13-97a1-4cb9-909f-217a425d3f70` against this table's
-`c99b7805-6e26-47a7-bc9d-93d592d676a6`, so the box restarted between them.
-[#543](https://github.com/mudler/vllm.cpp/issues/543) measured a 12.79 % SM-clock
-difference between boots with no throttling on either, larger than the deficits
-it was being used to rank. So the second lease's RATIO is valid, because both of
-its arms are alternated inside it on one boot; its ABSOLUTE seconds are not
-comparable with the seconds in this table, and nothing below should be divided by
-anything above. Scaling
-the measured per-call cost predicts the shipped kernel's 30-step bucket at
-371.6 s, and §20.5 independently measured **370.556 s** — 0.28 % apart. That
-agreement is the reason a projection is stated at all, but read it for what it
-is: §20.5 ran on a THIRD boot, so this is a cross-boot comparison of absolute
-seconds and it supports the LINEARITY of the per-call scaling rather than
-licensing either number as the other's denominator.
+The **M1 and M2 mutations** are re-run in a third lease after two INSTRUMENT
+failures -- M1 never applied and M2 did not build, both reported loudly and
+neither as a verdict about the code. M3 to M6 are clean reds with distinct binary
+hashes. Nothing else is outstanding: the 30-step pair above retires the
+projection this entry originally carried, and it landed within **0.52 %** of it.

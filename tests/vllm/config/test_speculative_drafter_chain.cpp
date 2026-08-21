@@ -302,7 +302,7 @@ TEST_CASE("G5: an entry naming a method this engine does not implement") {
   }
 }
 
-TEST_CASE("G5: an entry key is admitted by name, in the same two classes as #1160") {
+TEST_CASE("G5: an entry key is admitted by name, in the same THREE classes as #1160") {
   SUBCASE("a vLLM SpeculativeConfig field this engine does not implement") {
     const std::string msg =
         RefusalMessage(Chain(R"({"method":"mtp","quantization":"fp8"})"));
@@ -319,6 +319,45 @@ TEST_CASE("G5: an entry key is admitted by name, in the same two classes as #116
     CHECK(Mentions(msg, "num_speculatve_tokens"));
     CHECK(Mentions(msg, "unknown key"));
     CHECK(Mentions(msg, "num_speculative_tokens"));  // the right spelling
+  }
+  // #1598 — the class this admission loop originally LOST.
+  //
+  // `draft_sample_method` and `rejection_sample_method` are #1160's CLASS 2: a
+  // vLLM `SpeculativeConfig` field this engine implements at exactly one point
+  // of its value space (`speculative.py:77,283` and `:78,216` @ 555967922).
+  // Both are ENGINE-WIDE — one describes how a draft is sampled and the other
+  // describes the verify, and the verify is one verify however many speculators
+  // propose into it — so the top level HONOURS them beside a chain, and the case
+  // above asserts that it does.
+  //
+  // Inside an ENTRY they were in neither the honoured set nor the
+  // upstream-unimplemented set, so they fell through to the typo branch and got
+  // a message BYTE-FOR-BYTE of the shape a misspelling gets. That is #1160's own
+  // failure inverted: the split exists precisely so a key vLLM declares does not
+  // read as "unknown", and telling a user that a key this engine honours twelve
+  // characters up the same document is unknown sends them hunting for a spelling
+  // mistake that is not there.
+  //
+  // The correct refusal is neither "honoured" nor "not implemented at this pin",
+  // because it IS implemented: it is not PER-DRAFTER. So the message names the
+  // key, says the engine honours it, and says where to spell it.
+  SUBCASE("an ENGINE-WIDE sampling key belongs at the top level, not in an entry") {
+    for (const char* key : {"draft_sample_method", "rejection_sample_method"}) {
+      const std::string value =
+          std::string(key) == "draft_sample_method" ? "greedy" : "standard";
+      const std::string msg = RefusalMessage(Chain(
+          R"({"method":"mtp",")" + std::string(key) + R"(":")" + value + R"("})"));
+      REQUIRE(msg != "");
+      CHECK(Mentions(msg, "vllm_cpp.drafter_chain[0]"));
+      CHECK(Mentions(msg, key));
+      // NOT a typo. This is the assertion the defect failed.
+      CHECK_FALSE(Mentions(msg, "unknown key"));
+      // NOT "unimplemented" either — the engine honours it, one line up.
+      CHECK_FALSE(Mentions(msg, "does not implement"));
+      // It has to say WHERE, or the user has nowhere to go.
+      CHECK(Mentions(msg, "TOP LEVEL"));
+      CHECK(Mentions(msg, "vllm_cpp.drafter_chain"));
+    }
   }
   SUBCASE("the extension key does not nest inside an entry") {
     const std::string msg =

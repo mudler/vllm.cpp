@@ -48,6 +48,23 @@ constexpr const char* kChainJson =
     R"({"method":"dflash","model":"z-lab/Qwen3.6-27B-DFlash","num_speculative_tokens":16},)"
     R"({"method":"ngram","num_speculative_tokens":4}]}})";
 
+// A valid ONE-entry chain — D8's degenerate preference list.
+//
+// Every other case in this file uses two entries, and that left D8's loader
+// half unexecuted: `use_drafter_chain()` is `!drafter_chain.empty()`, and a
+// two-entry document cannot tell that predicate apart from a `size() > 1`. The
+// difference is not academic. D8 says a single-entry chain "is not equivalent to
+// a top-level `method`: the entry lands in the chain, `method` stays empty, and
+// the loader's chain refusal still sees it." Under `size() > 1` the parse still
+// succeeds, `method` is still empty, and `ResolveSpecConfig` then falls through
+// to the bottom of the function and tells the user that "" is not one of
+// mtp/dflash/ngram — a one-drafter document answered with a message about a
+// method they never wrote. That is precisely the "measured the wrong engine"
+// shape this wave exists to refuse, reached by a document D8 declares LEGAL.
+constexpr const char* kSingleEntryChainJson =
+    R"({"vllm_cpp":{"drafter_chain":[)"
+    R"({"method":"mtp"}]}})";
+
 // The refusal text from a call that is expected to throw, or "" when it did not.
 template <typename F>
 std::string ThrowMessage(F&& fn) {
@@ -113,6 +130,50 @@ TEST_CASE("chain reach: FromModelDir refuses BEFORE it looks at the path") {
   // started resolving the path; seeing it means the guard ran too late, or not
   // at all.
   CHECK_FALSE(Mentions(msg, "model path is not a directory"));
+}
+
+TEST_CASE("chain reach: a ONE-entry chain is seen by the loader too (D8)") {
+  // #1522 D8, the half no case executed before this one. Both production
+  // readers, on a chain of length one.
+  vllm::entrypoints::EngineParams params;
+  params.speculative_config =
+      vllm::ParseSpeculativeConfigJson(kSingleEntryChainJson);
+  // Facts of the PARSE only. `use_drafter_chain()` is deliberately NOT required
+  // here: a REQUIRE on the predicate aborts the subcase before either loader
+  // runs, so narrowing the predicate would be caught by this line and the two
+  // subcases below would never execute — proving the predicate moved rather than
+  // proving the loader stopped seeing a one-entry chain. Each subcase asserts
+  // the loader's own message instead, so each carries its own proof.
+  REQUIRE(params.speculative_config->drafter_chain.size() == 1);
+  // D8's own words: the entry lands in the CHAIN and `method` stays empty, so
+  // the document is NOT silently equivalent to `{"method":"mtp"}`.
+  REQUIRE(params.speculative_config->method.empty());
+  CHECK(params.speculative_config->drafter_chain[0].method == "mtp");
+  CHECK(params.speculative_config->use_drafter_chain());
+
+  SUBCASE("ResolveSpecConfig sees it") {
+    const std::string msg = ThrowMessage([&] {
+      (void)vllm::entrypoints::LoadedEngine::ResolveSpecConfig(params,
+                                                              vllm::HfConfig{});
+    });
+    REQUIRE(msg != "");
+    CHECK(Mentions(msg, "vllm_cpp.drafter_chain"));
+    CHECK(Mentions(msg, "SPEC-DRAFTER-CHAIN"));
+    CHECK(Mentions(msg, "mtp"));
+    // THE ASSERTION A TWO-ENTRY CASE CANNOT MAKE. This is the fallthrough at the
+    // bottom of `ResolveSpecConfig`, which an empty `method` reaches whenever the
+    // chain guard declines to fire. A guard narrowed to `size() > 1` lands here.
+    CHECK_FALSE(Mentions(msg, "supported (got \"\")"));
+  }
+
+  SUBCASE("FromModelDir sees it, still before the path") {
+    const std::string msg = ThrowMessage([&] {
+      (void)vllm::entrypoints::LoadedEngine::FromModelDir(kMissingModel, params);
+    });
+    REQUIRE(msg != "");
+    CHECK(Mentions(msg, "vllm_cpp.drafter_chain"));
+    CHECK_FALSE(Mentions(msg, "model path is not a directory"));
+  }
 }
 
 TEST_CASE("chain reach: the C ABI's speculative_config string carries the field") {

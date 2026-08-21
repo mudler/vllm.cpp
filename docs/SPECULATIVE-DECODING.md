@@ -85,10 +85,11 @@ written and checked now:
 |---|---|
 | `method` at the top level, beside a chain | yes, they are mutually exclusive: name every speculator as an entry |
 | `model`, `num_speculative_tokens`, `prompt_lookup_min`, `prompt_lookup_max` at the top level, beside a chain | yes, each configures one speculator and there is no entry it belongs to |
-| `draft_sample_method`, `rejection_sample_method` beside a chain | no, both describe the verify and the draft sampling rule, which are engine-wide |
+| `draft_sample_method`, `rejection_sample_method` at the TOP LEVEL, beside a chain | no, both describe the verify and the draft sampling rule, which are engine-wide |
+| either of those two INSIDE a chain entry | yes, by name (#1598): they are engine-wide rather than per drafter, and the message says the engine honours them and where to spell them |
 | an entry naming anything but `mtp`, `dflash`, `dspark` or `ngram` | yes, by name, including a real vLLM method such as `eagle3`, and including `draft_model`, whose chain arm is owed |
 | an entry missing the key its method requires | yes, by the same rules the top-level `method` follows |
-| an entry key the top level does not honour | yes, by name, in the same two classes as above |
+| any other entry key the top level does not honour | yes, by name, split the way #1160 splits the top-level document: a vLLM `SpeculativeConfig` field this engine does not implement is refused as that, and a name nobody declares is refused as unknown with the accepted list |
 | the same method named twice | yes: per-drafter attribution keys on the method name, so two entries of one method cannot be told apart in the counters |
 | an empty chain, or a `vllm_cpp` object with no `drafter_chain` | yes: omitting `vllm_cpp` is how a document says "no chain" |
 | a chain of one entry | no, that is the degenerate preference list and it is legal |
@@ -96,6 +97,16 @@ written and checked now:
 **With no `vllm_cpp` key, nothing above applies.** Every document that worked
 before this field existed keeps its exact meaning, key for key, which is what
 makes the field additive rather than a fork of vLLM's surface.
+
+That is a claim about MEANING, and it is deliberately not a claim of
+byte-identity. There is exactly one visible delta on a chain-free document, it
+was measured, and it is stated here rather than left for a reader to find: the
+accepted-key list quoted at the end of an unknown-key or unimplemented-key
+refusal now also names `vllm_cpp.drafter_chain`. Every such refusal message is
+therefore longer by that tail. The change is required rather than incidental —
+an accepted-key list that omits an accepted key stops closing the user's search,
+which is the whole reason #1160 appends one. No document's parse result moves,
+no key changes meaning, and no error changes which guard produced it.
 
 The distinction matters beyond ergonomics. Draft sampling and verify are greedy
 here, so a dropped `probabilistic` produced a **deterministic** run when a sampled

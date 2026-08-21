@@ -75,6 +75,22 @@ constexpr std::array<std::string_view, 26> kUpstreamUnimplementedKeys = {
     "synthetic_acceptance_length",            // :232
 };
 
+// Class 2: an upstream key whose value space we implement exactly ONE point of.
+// Named as a set (#1598) rather than spelled inline, because the chain's entry
+// admission has to make the SAME three-way split and a second hand-written
+// comparison is how the split was lost there in the first place. `CheckEntryKeys`
+// reads this array; so does the top-level admission loop.
+//
+// Both are ENGINE-WIDE. `draft_sample_method` describes how a draft is sampled
+// and `rejection_sample_method` describes the verify, and the verify is one
+// verify however many speculators propose into it — which is why the top level
+// honours them BESIDE a chain, and why an ENTRY is the one place they cannot be
+// spelled.
+constexpr std::array<std::string_view, 2> kEngineWideValueGatedKeys = {
+    "draft_sample_method",     // :77 alias, :283 field @ 555967922
+    "rejection_sample_method"  // :78 alias, :216 field @ 555967922
+};
+
 // The tail every refusal carries, so the message closes the user's search
 // instead of only ending it. Class 2 is spelled with its one accepted value
 // because "supported" would otherwise overstate what those keys accept.
@@ -85,6 +101,13 @@ constexpr std::string_view kSupportedKeys =
     "vllm_cpp.drafter_chain (SPEC-DRAFTER-CHAIN)";
 
 bool Contains(const std::array<std::string_view, 5>& set, const std::string& key) {
+  for (std::string_view k : set) {
+    if (k == key) return true;
+  }
+  return false;
+}
+
+bool Contains(const std::array<std::string_view, 2>& set, const std::string& key) {
   for (std::string_view k : set) {
     if (k == key) return true;
   }
@@ -147,14 +170,45 @@ std::string EntryPath(std::size_t index) {
   return std::string(kChainPath) + "[" + std::to_string(index) + "]";
 }
 
-// The chain's own entry-key admission, reusing the SAME three classes #1160
-// established for the top-level document. An entry is not a weaker place to
-// spell a config than the field it replaces, so a name is honoured, refused as
-// an unimplemented vLLM field, or refused as unknown — never dropped.
+// The chain's own entry-key admission. It applies the SAME three classes #1160
+// established for the top-level document, and it applies class 2 DIFFERENTLY,
+// which is the whole of the difference between the two admissions:
+//
+//   class 1, honoured        — the five per-speculator keys, read below
+//   class 2, value-gated     — engine-wide, so honoured at the TOP LEVEL only
+//                              and refused here BY NAME with that said out loud
+//   class 3, unimplemented   — refused as a vLLM field we do not have
+//   anything else            — refused as unknown, with the accepted list
+//
+// An entry is not a weaker place to spell a config than the field it replaces,
+// so a name is honoured, refused, or refused — never dropped.
+//
+// #1598: class 2 was MISSING here, and the two keys in it fell through to the
+// unknown branch. `draft_sample_method` is a real `SpeculativeConfig` field
+// (`speculative.py:77,283` @ 555967922) that this engine HONOURS at the top
+// level of this very document, and it was answered with a message
+// byte-for-byte of the shape a misspelling gets — the exact failure #1160 split
+// the classes to prevent, arriving from the other direction. Neither of the two
+// existing refusals is right for it: "unknown" sends the user hunting for a typo
+// that is not there, and "this engine does not implement it" is simply false.
+// So class 2 gets its own message, and that message says WHERE the key goes.
 void CheckEntryKeys(const nlohmann::json& entry, const std::string& path) {
   for (auto it = entry.begin(); it != entry.end(); ++it) {
     const std::string& key = it.key();
     if (Contains(kHonouredKeys, key)) continue;
+    if (Contains(kEngineWideValueGatedKeys, key)) {
+      throw std::invalid_argument(
+          "speculative-config: \"" + path + "." + key +
+          "\" is ENGINE-WIDE, not per drafter, so it cannot sit in a chain "
+          "entry. This engine honours it, at the TOP LEVEL of this same "
+          "document, beside \"vllm_cpp.drafter_chain\" — move it there. "
+          "\"draft_sample_method\" describes how a draft is sampled and "
+          "\"rejection_sample_method\" describes the verify, and the verify is "
+          "ONE verify however many speculators propose into it "
+          "(vllm/config/speculative.py:77,283 and :78,216 @ 555967922). A chain "
+          "entry accepts: method, num_speculative_tokens, model, "
+          "prompt_lookup_min, prompt_lookup_max");
+    }
     if (Contains(kUpstreamUnimplementedKeys, key)) {
       throw std::invalid_argument(
           "speculative-config: \"" + path + "." + key +
@@ -409,7 +463,8 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   for (auto it = doc.begin(); it != doc.end(); ++it) {
     const std::string& key = it.key();
     if (Contains(kHonouredKeys, key)) continue;
-    if (key == "draft_sample_method" || key == "rejection_sample_method") continue;
+    // Class 2 (#1598): honoured here, value-gated below by `CheckValueGatedKey`.
+    if (Contains(kEngineWideValueGatedKeys, key)) continue;
     // SPEC-DRAFTER-CHAIN W1: the ONE name this engine adds to vLLM's document.
     // It is admitted here DELIBERATELY, which is the mechanism that kept the
     // field inert until this wave: every other new name still falls through to

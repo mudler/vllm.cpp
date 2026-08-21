@@ -114,8 +114,8 @@ transcribed. Required:
   a suite that passes under both orders has not tested a preference list;
 - a sequence for which the first entry declines is shown to be served by the
   second, by attribution and not by inference from token counts;
-- an absent field leaves every existing single-method path byte-identical,
-  asserted against a real config rather than a synthetic one;
+- an absent field leaves every existing single-method path RESOLVING IDENTICALLY,
+  key for key, asserted against a real config rather than a synthetic one;
 - an unknown or malformed entry is refused BY NAME, with the accepted list, as
   #1160 established for every other key;
 - a chain naming a method this engine does not implement is refused by name rather
@@ -123,9 +123,21 @@ transcribed. Required:
 
 ## Gates
 
-- **G1 — additivity.** With the field absent, every existing speculative gate is
-  byte-identical. This is the gate that protects vLLM's surface, and it must run
-  on a real `--speculative-config` document, not a hand-built struct.
+- **G1 — additivity.** With the field absent, every document vLLM accepts
+  resolves to the same `SpeculativeConfig` it resolved to before, KEY FOR KEY,
+  and every existing speculative gate stays green. This is the gate that protects
+  vLLM's surface, and it must run on a real `--speculative-config` document, not
+  a hand-built struct.
+
+  **It is not a byte-identity claim, and the one delta is named rather than
+  waived.** Measured at W1: 152 refusal messages differ, all of them by the same
+  appended tail, because the accepted-key list at
+  `src/vllm/config/speculative.cpp` gained `vllm_cpp.drafter_chain`. That change
+  is required and not incidental — a list that omits an accepted key stops
+  closing the user's search, which is the reason #1160 appends one at all. No
+  parse result moves and no guard changes. A gate written as "byte-identical"
+  would be a gate this row cannot pass and should not try to, so G1 is written as
+  what is actually true.
 - **G2 — attribution.** For a constructed workload where the first entry provably
   declines, the per-sequence winner is the second entry, read from the engine's
   own counters. **A token gate cannot see this**, so the counters are the gate.
@@ -217,7 +229,17 @@ is lossless.
   would force every generator of these documents to special-case `n == 1` into a
   different spelling. It is not equivalent to a top-level `method`: the entry
   lands in the chain, `method` stays empty, and the loader's chain refusal still
-  sees it.
+  sees it. **The loader half of that sentence is EXECUTED**, by
+  `tests/vllm/entrypoints/test_drafter_chain_reach.cpp` "a ONE-entry chain is
+  seen by the loader too (D8)", which drives a one-entry document through both
+  `ResolveSpecConfig` and `FromModelDir`. It was added by the W1 repair because
+  every other reach case used a TWO-entry chain, and a two-entry chain cannot
+  tell `!drafter_chain.empty()` apart from `drafter_chain.size() > 1`. Under that
+  narrowing the parse still succeeds and `method` is still empty, so
+  `ResolveSpecConfig` falls through to its bottom and answers a legal one-drafter
+  document with `only methods "mtp", "dflash", "dspark", "ngram" and
+  "draft_model" are supported (got "")` — a message about a method the user never
+  wrote. That is the observed red, not a predicted one.
 - **D9 — an EMPTY chain, and a `vllm_cpp` object with no `drafter_chain`, are
   refused.** W1 decision. Both ask for a preference order over nothing. The only
   two readings are "no speculation" and "whatever the engine would otherwise
@@ -283,13 +305,50 @@ owned by this row and tracked by
   document-shape decisions, and the llama.cpp reading in `## Upstream chain` is
   design context rather than a gate input.
 
+Four more, filed by the W1 fresh review and owned by this row. The first was
+fixed in flow; the other three are refused-or-inherited today and are recorded
+here so that none of them is a silent gap.
+
+- **[#1598](https://github.com/mudler/vllm.cpp/issues/1598) — FIXED IN FLOW.** A
+  chain entry called `draft_sample_method` and `rejection_sample_method` a typo,
+  when this engine honours both at the top level of the same document. Class 2 of
+  #1160's split was missing from `CheckEntryKeys`. It now has its own refusal,
+  which names the key, says the engine honours it, and says to spell it at the
+  top level.
+- **[#1599](https://github.com/mudler/vllm.cpp/issues/1599) — a non-string
+  `model` is dropped in silence, and the required-key message that follows calls
+  the key MISSING when it was given.** INHERITED: `src/vllm/config/speculative.cpp`
+  has the same `is_string()` shape at the top level, so the entry is faithful to
+  the landed contract and repairing only the entry would leave two spellings of
+  one rule disagreeing. Out of W1's scope because the fix moves a landed
+  top-level refusal that other suites assert on.
+- **[#1600](https://github.com/mudler/vllm.cpp/issues/1600) — a misspelled or
+  mis-cased `vllm_cpp` on a chain-only document is answered with `a string
+  "method" is required`,** the one key such a document must not have. The
+  ORDERING is inherited from #1160 and deliberate; the document CLASS that hits
+  it is invented by this wave, which is why it is filed against this row. D9
+  argues the user must not be misled here, and this is the one shape where the
+  landed code misleads. Out of W1's scope because both candidate repairs change a
+  landed error ordering that existing suites assert on.
+- **[#1601](https://github.com/mudler/vllm.cpp/issues/1601) — the llama.cpp
+  citations carry no revision.** `include/vllm/config/speculative.h` and
+  `## Upstream chain` cite `common/arg.cpp:3754-3763` and
+  `common/speculative.cpp:2164-2186` by bare line, while
+  `.agents/oracles/llama-cpp.md` pins `10bf611e` (`b10451`, `gateable = no`).
+  Design context only, per the bullet above, but a bare line anchor on a moving
+  upstream goes stale silently and `scripts/check-symbol-anchors.py` states it
+  cannot verify a line citation.
+
 ## Now
 
 `SPEC-DRAFTER-CHAIN` is `ACTIVE`. **W1 has landed**: the
 `vllm_cpp.drafter_chain` field parses, validates and refuses by name, and a
 well-formed chain is refused at the loader before any weight I/O because
 nothing resolves one yet (D12). No chain behaviour landed, nothing changed which
-speculator drafts, and with the field absent the engine is byte-identical —
+speculator drafts, and with the field absent every document vLLM accepts
+resolves exactly as it did, key for key — the one measured delta being the
+accepted-key list quoted in an unknown-key refusal, which now also names
+`vllm_cpp.drafter_chain` (G1) —
 which G1 asserts through real `--speculative-config` documents driven into
 `LoadedEngine::ResolveSpecConfig` and `LoadedEngine::FromModelDir`, not through
 a hand-built struct.

@@ -72,12 +72,16 @@ scheduler/HTTP test and requires at least five request waves
 |---|---|---|---|---|
 | 27B dense | `unsloth/Qwen3.6-27B-NVFP4` at `890bdef7a42feba6d83b6e17a03315c694112f2a` | `Qwen3_5ForConditionalGeneration`; compressed-tensors `nvfp4-pack-quantized`, dynamic W4A4, group 16 | Qwen3.5 entry class ([model lines 2035-2048](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/models/qwen3_5.py#L2035-L2048)); compressed-tensors W4A4 creates packed weights/scales and dispatches FP4 GEMM ([scheme lines 32-169](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py#L32-L169)) | Native path exists. It becomes equivalent only after exact load, tensor/scale audit, and 16-prompt token check. |
 | 35B-A3B MoE | `nvidia/Qwen3.6-35B-A3B-NVFP4` at `491c2f1ea524c639598bf8fa787a93fed5a6fbce` | `Qwen3_5MoeForConditionalGeneration`; ModelOpt `MIXED_PRECISION`: selected FP8 linears/activations plus W4A16 NVFP4 MoE/shared-expert/lm-head layers; no FP8 KV-cache declaration | SGLang parses non-Nemotron `MIXED_PRECISION` as `w4afp8` ([model-config lines 1017-1033](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/configs/model_config.py#L1017-L1033)); that config uses FP8 linears and a legacy W4A8 MoE layout ([w4afp8 lines 35-105](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/layers/quantization/w4afp8.py#L35-L105)). SGLang also has a per-layer ModelOpt mixed dispatcher ([lines 605-779](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/layers/quantization/modelopt_quant.py#L605-L779)), but its parser selects that path only for Nemotron-H. | Compatibility is unresolved and must be probed. Source alone does not justify an equivalent claim. |
+| Qwen3.8 27B dense, MTP | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` at `36f717a22990e82c54c1d48ee77c491b87825680` | W4A16 NVFP4 `group_size` 16 on 193 modules, weight-only, plus a static per-tensor FP8 tower on 208 modules; `hf_quant_config.json` declares `kv_cache_quant_algo: "FP8"` while publishing no `k_scale`/`v_scale` | The same Qwen3.5 entry class as the 27B dense row above; the checkpoint's own compressed-tensors scheme differs | Added 2026-08-21 for [#1574](https://github.com/mudler/vllm.cpp/issues/1574), whose harness key is `q38mtp` ([#1594](https://github.com/mudler/vllm.cpp/issues/1594)). NOT the `27` subject: that key is `unsloth/Qwen3.6-27B-NVFP4`, a different 27B checkpoint with different quantization, so the two share no goldens and no comparable ratios. Unclassified for equivalence and unrun here; [bench-qwen38-27b-four-way.md](bench-qwen38-27b-four-way.md) owns its campaign. |
 
-Both architecture IDs are registered, and SGLang explicitly permits
+Both Qwen3.6 architecture IDs are registered, and SGLang explicitly permits
 `--language-only` for both Qwen3.5 wrappers
 ([server validation lines 3972-4020](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/server_args.py#L3972-L4020)).
 That establishes model-family and text-only support; it does not establish that
-these two particular NVFP4 snapshots load with the same quantization semantics.
+those two particular NVFP4 snapshots load with the same quantization semantics.
+The Qwen3.8 row is a NAMEABLE subject in the harness, not a classified one: what
+[#1594](https://github.com/mudler/vllm.cpp/issues/1594) added is a key that can
+own its own evidence tree, and nothing here has loaded that checkpoint.
 
 ### Exact-loader preflight
 
@@ -427,9 +431,9 @@ capture/JIT-contaminated trace do not.
 
 | Source test/spec | Local test | Required behavior |
 |---|---|---|
-| SGLang `test_bench_serving_functionality.py` ([file](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/test/registered/bench_fn/test_bench_serving_functionality.py)) | `tests/tools/test_serve_low_client.py` | Mock OpenAI SSE server: request body, concurrency cap, error propagation, raw detail retention. |
+| SGLang `test_bench_serving_functionality.py` ([file](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/test/registered/bench_fn/test_bench_serving_functionality.py)) | `tests/tools/test_serve_low_client.py` | Mock OpenAI SSE server: request body, concurrency cap, error propagation, raw detail retention. Plus the subject-identity contract ([#1594](https://github.com/mudler/vllm.cpp/issues/1594)), which the SGLang source has no equivalent of because it never files evidence by key: every admitted key routes its OWN corpus and raw paths and names no other key's tree, the dry-run manifest names exactly the admitted keys with each one's repository and exact revision, and a key refuses another subject's `--model-revision` and a `--model-repo` that holds no snapshot for it. |
 | SGLang native generation response ([lines 2640-2660](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/srt/managers/tokenizer_manager.py#L2640-L2660)) | `tests/tools/test_serve_low_token_ids.py` | Native `output_ids` are captured without text round-trip, exactly 128 IDs are required, and any 16-prompt mismatch prevents a binding result. |
-| SGLang custom dataset loader ([lines 54-147](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/benchmark/datasets/custom.py#L54-L147)) and vLLM custom-seed tests ([file](https://github.com/vllm-project/vllm/blob/e24d1b24fe96a56ba8b0d653efa076d03eb95d6c/tests/benchmarks/test_custom_dataset_seed.py)) | `tests/tools/test_serve_low_corpus.py` | Same seed/partition is byte-identical; different partitions are disjoint; every prompt has 1024 IDs; common-prefix bound and manifest hashes hold. |
+| SGLang custom dataset loader ([lines 54-147](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/benchmark/datasets/custom.py#L54-L147)) and vLLM custom-seed tests ([file](https://github.com/vllm-project/vllm/blob/e24d1b24fe96a56ba8b0d653efa076d03eb95d6c/tests/benchmarks/test_custom_dataset_seed.py)) | `tests/tools/test_serve_low_corpus.py` | Same seed/partition is byte-identical; different partitions are disjoint; every prompt has 1024 IDs; common-prefix bound and manifest hashes hold. A corpus is also filed under a subject key, so the generator and its command line both refuse a key no subject declares, and refuse a tokenizer revision that is not the one that key names ([#1594](https://github.com/mudler/vllm.cpp/issues/1594)). |
 | SGLang metric calculation ([lines 968-1140](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/bench_serving.py#L968-L1140)) | `tests/tools/test_serve_low_summary.py` | Hand-computed req/s, tok/s, TTFT, TPOT, ITL percentiles, repetition spreads, axis-wise best-floor ratios, and void-result propagation. |
 | vLLM streaming completion tests ([lines 271-284](https://github.com/vllm-project/vllm/blob/e24d1b24fe96a56ba8b0d653efa076d03eb95d6c/tests/entrypoints/openai/completion/test_completion.py#L271-L284)) | Extend [API-server tests](../../tests/vllm/entrypoints/openai/test_api_server.cpp) under `SERVE-ASYNC-LLM` | Streaming begins before generation completion, chunks concatenate to non-stream output, one-token interval, concurrent requests interleave safely. Initially SKIP the timing assertion with reason `SERVE-ASYNC-LLM not implemented`; do not delete it. |
 | Linux sampler contract | `tests/tools/test_process_memory_sampler.py` | Synthetic parent/children and short-lived PID cases; valid JSONL; no `N/A -> 0`; peak is monotonic. |
@@ -764,7 +768,15 @@ Three owned rows, three different states.
   `SERVE-ASYNC-LLM` blocker is discharged and 27B-NVFP4 c8 and c16 are measured
   over three repetitions with zero errors. Not supported yet: c1, c2 and c4, the
   vLLM arm inside the same series, the 35B arm, the `SGLANG-ORACLE-CORRECT`
-  token-ID cross-check, paired nsys traces, and any Qwen3.8-27B point.
+  token-ID cross-check, and paired nsys traces. **No Qwen3.8-27B point is
+  measured either.** Since [#1594](https://github.com/mudler/vllm.cpp/issues/1594)
+  the harness can NAME that subject -- key `q38mtp`,
+  `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2`, which owns its own
+  corpus and raw tree and cannot be run against another key's checkpoint -- so
+  what remains open is the measurement and the equivalence classification, not
+  the instrument. Its campaign is
+  [bench-qwen38-27b-four-way.md](bench-qwen38-27b-four-way.md)
+  ([#1574](https://github.com/mudler/vllm.cpp/issues/1574)).
 - `BACKEND-GATE-CUDA-SGLANG-PREFIX` is `READY`, unchanged. Its binding run still
   needs `KV-MAMBA-ALIGN` and exact v0.5.15 equivalence.
 

@@ -5,6 +5,9 @@
 //    layout — see the M1.6 Task-2 layout trap note).
 // Correctness-grade (M1.6): one block per token, threads stride over the page
 // (num_kv_heads*head_size). The perf kernel (vectorized / fp8) is M2.4.
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -94,6 +97,134 @@ void ReshapeAndCacheKernelCuda(Queue& q, const Tensor& k, const Tensor& v, Tenso
   Check(cudaGetLastError(), "reshape_and_cache launch");
 }
 
+// ─── fp8 KV-cache write (KV-FP8 W2, #1593) ─────────────────────────────────
+// The CUDA arm of vt::ReshapeAndCacheFp8, and the CUDA sibling of the CPU kernel
+// in src/vt/cpu/cpu_cache.cpp that is its ORACLE.
+//
+// Ported from the fp8 branch of vllm reshape_and_cache_flash_kernel
+// (csrc/libtorch_stable/cache_kernels.cu:314-401) + CopyWithScaleOp (:241-252) @
+// pin 555967922. Upstream's `is_contiguous_heads && kv_scale_stride == 0` fast
+// path (`:352-366`) is the ONLY one this op's wrapper admits: the vt paged cache
+// is the NHD unbind slice (head_stride == head_size) and the scales are
+// per-TENSOR (`kv_scale_stride == 0`). The HND / per-attention-head arm
+// (`:367-400`) is a named later brick (spec W5), and per-head scales cannot
+// reach here because ReshapeAndCacheFp8 takes two scalars.
+//
+// ELEMENTWISE-IDENTICAL, NOT INSTRUCTION-IDENTICAL. Upstream's contiguous-heads
+// arm moves the row through `vectorize_with_alignment<VEC_SIZE>` (`:360-363`,
+// VEC_SIZE 8 for a 2-byte source and 4 for f32), which converts the same
+// elements in the same order under a vectorized load/store. The loop below is a
+// SCALAR strided one, so it writes the same bytes and reads the same inputs
+// while moving them one at a time. That is a bandwidth difference, not a
+// numerical one, and W4 — which owns the memory/throughput measurement — owns
+// closing it. Do not read "ported" here as "the same instructions".
+//
+// THE CONVERTER IS UPSTREAM'S OWN, and its equality to the CPU codec is already
+// MEASURED. `fp8::scaled_convert<uint8_t, float, kFp8E4M3>` is
+// `__nv_cvt_float_to_fp8(a / scale, __NV_SATFINITE, __NV_E4M3)`
+// (quant_utils.cuh:497-503) — a true DIVIDE, unlike the activation-quant path's
+// hoisted reciprocal multiply (cuda_quant_fp8.cu:56-63), which matters because
+// the two differ by up to one f32 ulp before the round. That same intrinsic is
+// gated byte-for-byte at zero tolerance against the CPU software codec
+// vt::F32ToF8E4M3 on sm_110 and sm_121a
+// (.agents/specs/vt-fp8-quant-arch-gate.md G2), and
+// tests/vt/test_cuda_fp8_kv_cache.cpp re-takes that equality on this KV path.
+//
+// Destination arithmetic is the auto path's, with element size 1: the cache is
+// DType::kI8 (the "byte never guesses its semantic type" rule, include/vt/dtype.h)
+// and the fp8 INTERPRETATION travels as Fp8KVCacheDataType, exactly as upstream
+// carries cache_t = uint8_t plus a KV_DTYPE template parameter.
+
+// Pointer overloads, not by-value ones: __half and __nv_bfloat16 both carry an
+// implicit `operator float()`, so a by-value set would put a user conversion in
+// the overload resolution for every call. Same shape as cuda_quant_fp8.cu's
+// LoadIn and cuda_paged_attn.cu's Load.
+__device__ __forceinline__ float Fp8SrcToF32(const float* p, int64_t i) { return p[i]; }
+__device__ __forceinline__ float Fp8SrcToF32(const __nv_bfloat16* p, int64_t i) {
+  return __bfloat162float(p[i]);
+}
+__device__ __forceinline__ float Fp8SrcToF32(const __half* p, int64_t i) {
+  return __half2float(p[i]);
+}
+
+// fp8 = Quantize(hp / scale) — quant_utils.cuh:296-300 "Convention of the scale".
+__device__ __forceinline__ uint8_t StoreKvFp8E4M3Dev(float hp, float scale) {
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(hp / scale, __NV_SATFINITE, __NV_E4M3));
+}
+
+template <typename Tin>
+__global__ void ReshapeAndCacheFp8Kernel(
+    const Tin* __restrict__ key, const Tin* __restrict__ value,
+    uint8_t* __restrict__ key_cache, uint8_t* __restrict__ value_cache,
+    const int64_t* __restrict__ slot_mapping, int64_t block_size, int64_t n_elems,
+    int64_t k_block_stride, int64_t k_page_stride, int64_t v_block_stride,
+    int64_t v_page_stride, int64_t k_tok_stride, int64_t v_tok_stride, float k_scale,
+    float v_scale) {
+  const int64_t token = blockIdx.x;
+  const int64_t slot = slot_mapping[token];
+  if (slot < 0) return;  // padded token → skip (upstream `:328-331`)
+  const int64_t block = slot / block_size;
+  const int64_t offset = slot % block_size;
+  const int64_t kdst = block * k_block_stride + offset * k_page_stride;  // element offset
+  const int64_t vdst = block * v_block_stride + offset * v_page_stride;
+  const int64_t ksrc = token * k_tok_stride;
+  const int64_t vsrc = token * v_tok_stride;
+  for (int64_t e = threadIdx.x; e < n_elems; e += blockDim.x) {
+    key_cache[kdst + e] = StoreKvFp8E4M3Dev(Fp8SrcToF32(key, ksrc + e), k_scale);
+    value_cache[vdst + e] = StoreKvFp8E4M3Dev(Fp8SrcToF32(value, vsrc + e), v_scale);
+  }
+}
+
+void ReshapeAndCacheFp8KernelCuda(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                                  Tensor& v_cache, const Tensor& slot_mapping,
+                                  Fp8KVCacheDataType kind, float k_scale, float v_scale) {
+  VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
+           "cuda reshape_and_cache_fp8: only fp8_e4m3 is implemented "
+           "(fp8_e5m2 is a named later brick, spec W5)");
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];
+  if (num_slots == 0 || n_elems == 0) return;
+  const int64_t k_block_stride = k_cache.stride[0];
+  const int64_t k_page_stride = k_cache.stride[1];
+  const int64_t v_block_stride = v_cache.stride[0];
+  const int64_t v_page_stride = v_cache.stride[1];
+  const int64_t k_tok_stride = k.stride[0];
+  const int64_t v_tok_stride = v.stride[0];
+  const unsigned grid = static_cast<unsigned>(num_slots);
+  const unsigned block = static_cast<unsigned>(n_elems < 512 ? n_elems : 512);
+  const cudaStream_t s = AsStream(q);
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  uint8_t* kc = k_cache.Ptr<uint8_t>();
+  uint8_t* vc = v_cache.Ptr<uint8_t>();
+  // The SOURCE dtype is the model float dtype and is typed here, unlike the auto
+  // path's raw-word copy: the fp8 store converts, so it must know what it reads.
+  // Same set the CPU LoadSrcF32 serves (cpu_cache.cpp).
+  switch (k.dtype) {
+    case DType::kF32:
+      ReshapeAndCacheFp8Kernel<float><<<grid, block, 0, s>>>(
+          k.Ptr<float>(), v.Ptr<float>(), kc, vc, slots, block_size, n_elems, k_block_stride,
+          k_page_stride, v_block_stride, v_page_stride, k_tok_stride, v_tok_stride, k_scale,
+          v_scale);
+      break;
+    case DType::kBF16:
+      ReshapeAndCacheFp8Kernel<__nv_bfloat16><<<grid, block, 0, s>>>(
+          k.Ptr<__nv_bfloat16>(), v.Ptr<__nv_bfloat16>(), kc, vc, slots, block_size, n_elems,
+          k_block_stride, k_page_stride, v_block_stride, v_page_stride, k_tok_stride,
+          v_tok_stride, k_scale, v_scale);
+      break;
+    case DType::kF16:
+      ReshapeAndCacheFp8Kernel<__half><<<grid, block, 0, s>>>(
+          k.Ptr<__half>(), v.Ptr<__half>(), kc, vc, slots, block_size, n_elems, k_block_stride,
+          k_page_stride, v_block_stride, v_page_stride, k_tok_stride, v_tok_stride, k_scale,
+          v_scale);
+      break;
+    default:
+      VT_CHECK(false, "cuda reshape_and_cache_fp8: unsupported source dtype (f32/f16/bf16)");
+  }
+  Check(cudaGetLastError(), "reshape_and_cache_fp8 launch");
+}
+
 // ─── MLA cache write (W3) ──────────────────────────────────────────────────
 // Ported 1:1 from vllm/csrc/libtorch_stable/cache_kernels.cu:401-442
 // `concat_and_cache_mla_kernel` @ e24d1b24 — ONE block per token, threads stride
@@ -170,6 +301,9 @@ struct Registrar {
     RegisterOp(
         OpId::kReshapeAndCache, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernelCuda)));
+    RegisterOp(OpId::kReshapeAndCacheFp8, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<ReshapeAndCacheFp8Fn>(&ReshapeAndCacheFp8KernelCuda)));
     RegisterOp(
         OpId::kConcatAndCacheMla, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernelCuda)));

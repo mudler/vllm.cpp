@@ -1183,6 +1183,49 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     return std::nullopt;  // production default: no speculation.
   }
   const vllm::SpeculativeConfig& cli = *params.speculative_config;
+  // SPEC-DRAFTER-CHAIN W1 (#1522): THE PRODUCTION READER of the parsed chain,
+  // and the reason the field does not land dead.
+  //
+  // W1 lands the field, its validation and its refusals, and NO chain
+  // behaviour. Nothing resolves a chain and nothing changes which speculator
+  // drafts. That leaves exactly one way for the wave to be harmful, and it is
+  // not a malformed document: it is a WELL-FORMED one that parses, stores, and
+  // is then ignored. The engine would draft with one speculator — or with none —
+  // under a document whose author believes it configures several, and any
+  // measurement taken there is a measurement of a configuration nobody chose.
+  // That is #1160's failure with a larger blast radius, so the chain is REFUSED
+  // BY NAME rather than silently reduced.
+  //
+  // FIRST in this function, before every method branch, because two of those
+  // branches read a draft checkpoint's own config.json off disk
+  // (`CheckDflash2DraftArm`, `ReadDsparkDraftKeys`) and because `cli.method` is
+  // EMPTY on a chain config — it would otherwise fall through to the "only
+  // methods mtp, dflash and ngram are supported" line at the bottom and tell the
+  // user that "" is not one of them.
+  //
+  // `FromModelDir` calls this function ahead of its path resolution so the
+  // refusal also precedes every weight operation, which is what G5 means by
+  // "before any weight I/O"; `tests/vllm/entrypoints/test_drafter_chain_reach.cpp`
+  // asserts that ordering by refusing a chain against a path that does not
+  // exist.
+  if (cli.use_drafter_chain()) {
+    std::string listed;
+    for (const vllm::SpeculativeChainEntry& entry : cli.drafter_chain) {
+      if (!listed.empty()) listed += ", ";
+      listed += "\"" + entry.method + "\"";
+    }
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp.drafter_chain\" [" + listed +
+        "] parses and validates here, but NOTHING resolves a chain yet: this "
+        "engine still drafts with exactly one speculator per step. It is "
+        "refused rather than silently reduced to one drafter or to no "
+        "speculation at all, because a run under a configuration nobody chose "
+        "is worse than a run that does not start. Per-sequence resolution is "
+        "owed by row SPEC-DRAFTER-CHAIN wave W3, after the per-drafter "
+        "attribution of W2 (.agents/specs/drafter-chain.md), issue "
+        "https://github.com/mudler/vllm.cpp/issues/1522. Name one method at the "
+        "top level to run today.");
+  }
   // SPEC-DFLASH D5: the block-diffusion drafter. num_speculative_tokens is REQUIRED
   // (= the draft block_size, e.g. 16; speculative.py raises if None) and there is no
   // n_predict-module divisibility (the drafter is non-autoregressive). The concrete
@@ -1798,6 +1841,26 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
+  // SPEC-DRAFTER-CHAIN W1 (#1522): refuse a drafter chain BEFORE anything else
+  // this function does.
+  //
+  // G5 requires the refusal to land "before any weight I/O", and the ordering is
+  // the requirement rather than tidiness. Below this line the function installs
+  // two process-global configurations, resolves a device, stats the model
+  // directory, parses a config, builds a tokenizer and maps weights. A chain
+  // config cannot produce an engine, so every one of those is work spent on a
+  // load that will not happen — and the two installs are not free, because one
+  // of them latches decisions that a later engine in the same process cannot
+  // retake.
+  //
+  // It delegates to `ResolveSpecConfig` rather than repeating the test, so there
+  // is ONE chain refusal with ONE message. `ResolveSpecConfig` runs again in the
+  // constructor further down, which is what refuses a chain on the loader paths
+  // that do not come through this function.
+  if (params.speculative_config.has_value() &&
+      params.speculative_config->use_drafter_chain()) {
+    (void)ResolveSpecConfig(params, vllm::HfConfig{});
+  }
   // ENG-RESIDENCY-CONFIG (#1110): install the host-RAM -> DISK residency config
   // FIRST — before the offloader below, before the device resolution, before any
   // path or weight operation.

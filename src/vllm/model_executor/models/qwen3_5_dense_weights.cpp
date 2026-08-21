@@ -16,6 +16,7 @@
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
+#include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/platforms/interface.h"
@@ -875,6 +876,42 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   const std::string ct_refusal =
       layers::compressed_tensors::RefusalForHfConfigRaw(config.raw, all_names);
   VT_CHECK(ct_refusal.empty(), "qwen3_5 dense: " + ct_refusal);
+
+  // QUANT-QWEN38-27B-NVFP4-ARM W5 (#821, campaign #1574). The THIRD
+  // whole-checkpoint read, for the OTHER `mixed-precision` spelling: ModelOpt's.
+  //
+  // Two 27B artifacts in this family declare `quant_method: "modelopt"`,
+  // `quant_algo: "MIXED_PRECISION"` and a `quantized_layers` map of exact
+  // module names — `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160`, which this tree has
+  // loaded and measured since #466, and `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`
+  // @ `36f717a2`. Both split 401 Linears into 208 per-tensor STATIC FP8 and 193
+  // W4A16_NVFP4 group_size 16. Neither is compressed-tensors, so the read above
+  // stops at `quant_method` and answers "" for both, and until this call
+  // NOTHING in this tree read either config: every routing decision for them
+  // was made by probing which tensor NAMES are present.
+  //
+  // That probe cannot be wrong about the bytes and it can be wrong about the
+  // CHECKPOINT, in both directions. A module the producer declared FP8 that
+  // ships an NVFP4 spelling takes the NVFP4 arm; a module declared unquantized
+  // that ships scales takes a quantized arm. Both load, both produce plausible
+  // numbers, and both match tokens while moving the wrong bytes — the one
+  // defect class `AGENTS.md` §"Inherit vLLM defaults" says a token gate cannot
+  // see. So the declaration is CROSS-CHECKED against the shipped spelling and a
+  // disagreement is refused by name.
+  //
+  // This CHECKS the probe rather than replacing it: no checkpoint whose config
+  // and tensors agree takes a different arm than it did before this line, and
+  // every non-ModelOpt checkpoint answers "" without reading anything. Routing
+  // by the declared algorithm instead of by the probe is a larger change that
+  // would move a gate model's arm; it is listed under `## Owed` in
+  // `.agents/specs/qwen38-27b-quant-arms.md` and tracked by its own issue.
+  const nlohmann::json* quant =
+      layers::compressed_tensors::QuantizationConfigOf(config.raw);
+  if (quant != nullptr) {
+    const std::string modelopt_refusal =
+        layers::modelopt::RefusalForQuantizationConfig(*quant, all_names);
+    VT_CHECK(modelopt_refusal.empty(), "qwen3_5 dense: " + modelopt_refusal);
+  }
 
   Qwen3_5DenseWeights w;
   w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");

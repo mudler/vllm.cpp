@@ -79,6 +79,14 @@ Out of scope, and why:
   authoring host has no `nvcc` and no GPU. Bundling it here would put a change
   that only a leased box can verify inside a change that a CPU box verifies
   completely. Recorded under [`## Owed`](#owed).
+
+- [#1635](https://github.com/mudler/vllm.cpp/issues/1635) is OPEN and owned here. The record's
+  claim that `tests/vllm/platforms/test_platform.cpp` pins the CUDA
+  `DeviceMemoryIsHostAddressable()` default is FALSE: that fixture's `backend()` returns the CPU
+  backend, so the assertion never reads `CudaBackend` at all. The conclusion survives by absence of
+  an override; the pin does not exist. `docs/ENVIRONMENT.md` is corrected, but the copy in
+  `.agents/issue-index.md:552` is append-only and permanent. Pinning the real `CudaBackend` stays
+  owed and needs a CUDA device to exercise.
 - **Copy-in and copy-out instead of refusal.** Rejected under
   [Design](#design).
 - **Registering a CUDA kernel for `kMatmulFp8BlockScaled` on a CUTLASS-less

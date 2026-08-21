@@ -176,43 +176,62 @@ Mistral-7B 12.2–13.8 vs 2.35 tok/s. The default path is now the slow one.
 1. Default ON through one helper, `vt::tenstorrent::HostFreeDecodeEnabled()`:
    unset or any value except `"0"` → on, exactly `"0"` → off — the
    `vt::GraphCaptureEnabled()` idiom (`src/vt/breakable_graph.cpp:65-71`),
-   cached once per process. Every
-   `std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr` site moves to it
-   (~15 in `tenstorrent_ops.cpp` plus
+   but deliberately NOT cached (tests toggle the env per case in one
+   process). Every `std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr` site
+   moves to it (~17 in `tenstorrent_ops.cpp` plus
    `TenstorrentPlatform::support_static_graph_mode()`). The env var survives
    as the A/B opt-out: `VT_TT_HOST_FREE_DECODE=0` reproduces the pre-flip
    default path exactly.
-2. Both device golden pairs go stale the moment the default flips, so both
+2. **Capture stays declined by default on TT** (measured stop-condition,
+   below): `support_static_graph_mode()` additionally requires the explicit
+   investigation opt-in `VT_TT_DECODE_CAPTURE`. The captured 27.1 tok/s arm
+   is reachable under that env for single-request A/B; flipping THIS default
+   is owned by the capture-hang issue.
+3. Both device golden pairs go stale the moment the default flips, so both
    are re-captured and re-adjudicated in the same change:
    `qwen3_greedy_0_6b` (refreshed by #1514) and `mistral_greedy_7b`
    (captured 2026-08-12), via `VT_DUMP_IDS` +
-   `qwen3-neartie-gap-transformers.py` — the #1488 method. On the
-   post-#1514 main (`52e328789`) the flag already anchor-reds the Qwen3 gate
-   fast (prompt[0] tok=1 engine=14746 vs committed anchor=13; no timeout —
-   the #1105 hang candidate did not reproduce). That red is this staleness,
-   not a defect claim; the adjudication decides.
-3. Concurrency coverage under the new default: both paged-engine gates run
-   multi-request; the two flag-pinned default-path cases in
+   `qwen3-neartie-gap-transformers.py` — the #1488 method, dumped from the
+   NEW default (host-free eager) arm. On the post-#1514 main (`52e328789`)
+   the flag already anchor-reds the Qwen3 gate fast (prompt[0] tok=1
+   engine=14746 vs committed anchor=13); that red is this staleness, not a
+   defect claim; the adjudication decides.
+4. Concurrency coverage under the new default: both paged-engine gates run
+   multi-request and must complete green; the async-serving battery
+   (`test_qwen3_dense_async_serving`) runs on TT if its harness selects the
+   device; the two flag-pinned default-path cases in
    `test_tenstorrent_backend.cpp` (small-T `kRopeNeox` bit-exact; host-free
    helper inertness) move from `::unsetenv` to `VT_TT_HOST_FREE_DECODE=0`,
    and their meaning becomes "the opt-out path declines". The
    `VT_TT_RECAPTURE_EVERY=8` re-seed arm and the batch-size refusal
    (`VT_CHECK` in `WarmDecodePos`/`WarmPaMeta`/`WarmRacIdx`) keep their
-   existing coverage.
-4. Records: `docs/BENCHMARKS.md` rows + `.agents/benchmark-record.md` legs
-   for the new default vs `=0` on both models, plus host-free eager
-   (`VLLM_CPP_CUDAGRAPH=0`), unmeasured today.
+   existing coverage (capture opt-in arms).
+5. Records: `docs/BENCHMARKS.md` rows + `.agents/benchmark-record.md` legs
+   for the new default vs `=0` on both models, host-free eager (the new
+   default), and the captured opt-in single-request leg.
+
+**Measured on the flip tree (2026-08-21, P150, `b86e3705f`):** captured
+multi-request decode hangs deterministically — the 16-prompt gate stalls
+~10 s into stepping with one tt-metal worker spinning at 100% and the main
+thread blocked, both with the plain default and with
+`VT_TT_RECAPTURE_EVERY=8`; single-request captured legs (the 27.1 tok/s A/B,
+the 80-token gate) never hit it. Host-free EAGER completes the same gate in
+35 s (125/125 assertions) and measures 10.94/10.95/11.06 tok/s warm
+(Qwen3-0.6B, batch 1, greedy, `--repeat 4`, leg 1 discarded — JIT) vs the
+5.34 pre-flip default: a 2.1× default win that does not hang. The captured
+5.1× arm is one hang fix away.
 
 **Gates.** Both paged-engine gates green under the NEW default on the
 refreshed pairs; re-adjudication max gap within the 500-mnat band, zero
 cells outside top-K (the #1488 bars); `test_tenstorrent_backend` green with
 and without an ambient opt-out; the A/B re-run on the flip tree showing the
-default leg at the host-free rate.
+default leg at the host-free eager rate.
 
 **Stop conditions.** A non-near-tie divergence under the new default stops
 the flip and becomes the work. A hang or a refusal firing on an ordinary
 serving dynamic stops the flip until that path is fixed or refuses loudly —
-#1105's `DecodePosCache` identity fix is then in scope, not owed.
+the captured-arm hang is held out of the default by scope item 2 and owned
+by its issue; #1105's `DecodePosCache` identity fix stays owed.
 
 ## Dependencies
 
@@ -302,6 +321,13 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **Captured multi-request decode hangs ([#1625](https://github.com/mudler/vllm.cpp/issues/1625)).**
+  Measured on the R5 flip tree: the 16-prompt gate hangs ~10 s into stepping
+  under captured decode, with `VT_TT_RECAPTURE_EVERY=8` alike, while
+  host-free eager completes in 35 s (11.0 tok/s warm). R5 therefore ships
+  `support_static_graph_mode()` declined by default (opt-in
+  `VT_TT_DECODE_CAPTURE`); the captured 27.1 tok/s arm stays one hang fix
+  away, and that fix owns flipping this default back.
 - **`DecodePosCache` is keyed on bare `num_reqs`, with no engine, queue or device
   identity, and is never cleared.** Two engine instances in one process at the same
   padded batch size therefore share one `cur_pos` device tensor: the second engine's

@@ -255,6 +255,18 @@ curl -sSL -H 'Range: bytes=0-262143' -o head.bin "$B/<shard>"
 # every tensor's dtype, shape and data_offsets.
 ```
 
+**The audit also found one thing wrong in this tree, and it is repaired in the
+same flow rather than filed and deferred.** Three sites -- the comment above
+`IsFp8BlockProjection`, the comment above
+`Fp8BlockQuantConfig::modules_to_not_convert`, and
+`.agents/specs/model-fp8-block-weight.md` -- said this checkpoint ships "~400"
+`modules_to_not_convert` entries. It ships **882**, all unique, 636 of them
+outside the vision tower. The number is the evidence for an argument, namely why
+`IsFp8BlockProjection` reads the config AND the tensors instead of probing
+dtypes, so a figure wrong by more than 2.2x invites the next reader to re-derive
+what the records exist to settle. Tracked by
+[#1614](https://github.com/mudler/vllm.cpp/issues/1614).
+
 **What a gate run must record, and none of it is optional:** the oracle identity
 asserted with an ABORT on mismatch (`vllm.__version__`, `flashinfer`, and
 `vllm.__file__`, because both memory instruments have been blind here before);

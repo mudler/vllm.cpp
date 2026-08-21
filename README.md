@@ -49,9 +49,6 @@
   use Q4_K_M.
 - **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
   matches the vLLM oracle token for token, and decodes **45.45 vs 41.94 tok/s**.
-- **2026-08** **Vulkan matches llama.cpp on a 27B.** Qwen3.6-27B decodes **4.36 vs llama.cpp Vulkan
-  4.35 tok/s** on GB10, up from 2.40. A narrow pass: the 0.69% leg spread is the noise floor.
-  Prefill **21.5x**, a self-ratio. Denominator SUPERSEDED.
 
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
@@ -182,7 +179,7 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), ABI v19, 36 functions) for C, C++, Go, or Rust. No Python
+  ([`include/vllm.h`](include/vllm.h), ABI v23) for C, C++, Go, or Rust. No Python
   interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16

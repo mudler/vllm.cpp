@@ -1,0 +1,23 @@
+    }
+    static std::atomic<int> grp_fail{0};
+    if (grp_fail.fetch_add(1) < 4) {
+      std::fprintf(stderr, "gemma4 moe: device-group FAIL T=%lld — falling back\n",
+                   static_cast<long long>(T));
+      std::fflush(stderr);
+    }
+  }
+  const bool indexed_ok_t =
+      (T >= 1 && T <= indexed_max_t && top_k <= 8 && top_k > 0 && fp8_res &&
+       (kPrefillIndexedNoSyncMaxT > 0 || T < kPrefillBatchMinT));
+  // Indexed only while T is below the group-by-expert crossover (unless nosync).
+  if (indexed_ok_t) {
+    // per-expert scale on device (once per layer/E).
+    struct EscTls {
+      int dev = -1;
+      int64_t E = 0;
+      const void* host_key = nullptr;
+      std::optional<DBuf> sc;
+    };
+    static thread_local EscTls esc_slots[2];
+    EscTls& esc = esc_slots[(compute_dev == 1) ? 1 : 0];
+    float* escale_ptr = nullptr;

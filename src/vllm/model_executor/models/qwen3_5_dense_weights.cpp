@@ -416,8 +416,10 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
 // and the disagreement is where a silent wrong-scale bug lives: #1166 measured a
 // `[96, 40]` block grid passing a per-tensor scale reader's byte floor and being
 // applied to the whole `[N, K]` weight, stopped only by the tensor NAME. The
-// checkpoint's `modules_to_not_convert` is the other half -- ~400 entries on
-// `Qwen/Qwen3.8-27B-FP8` -- which a probe reproduces only by accident.
+// checkpoint's `modules_to_not_convert` is the other half -- 882 entries on
+// `Qwen/Qwen3.8-27B-FP8` @`017b9c7a`, 636 of them outside the vision tower --
+// which a probe reproduces only by accident (#1614; the "~400" this line
+// carried was wrong by more than 2.2x however the list is sliced).
 //
 // Six combinations, four of them refused by name; the table is in the spec.
 bool IsFp8BlockProjection(const TensorExists& has, const std::string& proj,

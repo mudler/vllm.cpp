@@ -212,3 +212,98 @@ because both touch `vllm_c.cpp` and request lifetime.
   the chosen contract.
 - **Decision:** GPU throughput is not a C-ABI property. This row takes no speed
   credit and never substitutes CPU adapter tests for a feature row's device gate.
+
+## Owed
+
+| Issue | Stage | State |
+|---|---|---|
+| [#1535](https://github.com/mudler/vllm.cpp/issues/1535) | W1 (export completeness), Apple leg | **owed, and UNMEASURED rather than unfixed.** See `### The ELF export guarantee has no Apple equivalent` below for what is confirmed, what is not, and what would close it |
+
+### The ELF export guarantee has no Apple equivalent
+
+**Confirmed from the tree, not inferred.** `cmake/vllm_export.map` declares
+`VLLM_ABI_1 { global: vllm_*; local: *; }` and `CMakeLists.txt` applies it to
+`vllm_shared` as `LINKER:--version-script,...` inside `if(UNIX AND NOT APPLE)`.
+On ELF that makes every non-`vllm_*` symbol in the force-linked `vllm` archive
+local, which is why `examples/video_studio/main.cpp` is safe: it links
+`vllm::shared`, `vllm_shared` links `vllm` PRIVATE so the example inherits
+neither `CPPHTTPLIB_OPENSSL_SUPPORT` nor `OpenSSL::SSL`, and it therefore
+compiles the vendored `third_party/httplib/httplib.h` in the **no-TLS layout**
+while the library holds the **TLS layout**. `CPPHTTPLIB_OPENSSL_SUPPORT` is a
+whole-header switch over the layout of `httplib::Result` and
+`httplib::ClientConnection`, so the two definitions are ODR-incompatible; the
+version script is what keeps them from ever meeting.
+
+**The version script is the ONLY mechanism, and a reader is likely to think
+otherwise.** `vllm_shared` is created with `CXX_VISIBILITY_PRESET hidden` and
+`VISIBILITY_INLINES_HIDDEN ON`, which looks like a second line of defence and is
+not one: those properties add `-fvisibility=hidden` to the target's OWN sources,
+and `vllm_shared`'s only source is the generated empty stub
+(`vllm_shared_stub.cpp`). The content comes from the force-linked `vllm` archive,
+which no `CMakeLists.txt` line compiles with hidden visibility — a repo-wide grep
+for `VISIBILITY_PRESET` returns exactly those two lines. So on the Apple leg,
+where the script is not applied, nothing localizes anything.
+
+**MEASURED on the ELF leg, which is the closest positive control this row can
+take.** One `Release`, `VLLM_CPP_CUDA=OFF` x86_64 build of this tree, one build
+directory, `libvllm.so.0.0.3` linked twice from the same objects — once as the
+build produces it, once with the `-Wl,--version-script` argument removed from the
+recorded ninja link line and nothing else changed:
+
+| link | dynamic defined symbols | non-`vllm_*` | `httplib` |
+|---|---:|---:|---:|
+| as built (version script) | 48 | **1** (the `VLLM_ABI_1` version node) | **0** |
+| script removed | 9376 | **9329** | **734** |
+
+The 734 break down as 505 `W`, 209 `V` and 20 `u` — weak text, weak data and
+unique-global, i.e. exactly the coalescable class. `libvllm.a` holds 2008 weak
+`httplib` definitions in total. So the version script is not belt-and-braces: it
+is the whole of the guarantee, and its absence exports 9329 internals including
+the `httplib` family. The Apple leg links without it.
+
+**One narrowing the issue does not make, and it matters for whoever measures
+this.** `httplib::Result` itself has NO out-of-line definition in either link —
+it is header-inline and gets inlined into its callers, so `grep`ing the export
+table for it finds nothing and that is not reassurance. What IS exported weak is
+the family whose signatures embed the layout-dependent types:
+`httplib::ClientImpl::handle_request`, `::write_request`, `::process_socket`,
+`::shutdown_ssl` and their neighbours, all taking `httplib::Request&` /
+`httplib::Response&`. A macOS measurement should look there, not for `Result`.
+
+**What is UNMEASURED, stated as one question.** Whether ld64's Mach-O
+weak-definition coalescing can bind the example's no-TLS `httplib::Result` /
+`httplib::ClientConnection` code against the dylib's TLS-layout definitions, or
+the reverse. If it can, the symptom is a silently corrupted response object with
+a clean link and no diagnostic — the failure mode `a50c57d69` avoided on the
+library side by putting the define on the target rather than per file.
+`tests/CMakeLists.txt` gates `capi_shared_exports_only_abi` on the same
+`UNIX AND NOT APPLE` condition, so no gate covers it either.
+
+**"We have no macOS host" is the wrong summary, and this is the part the issue
+does not say.** `.github/workflows/release.yml` runs `metal_arm64` and
+`mlx_arm64` on `macos-15`. What that lane does NOT do is build either artifact
+this question is about: `scripts/build-macos-release.sh` configures with
+`-DVLLM_CPP_BUILD_EXAMPLES=ON` but then builds `--target server
+test_metal_backend` only, and `server` links `vllm::vllm` (the static archive),
+not `vllm::shared`. So on macOS `libvllm.dylib` is never linked, `video-studio`
+is never compiled, and the two layouts have never been in the same process. The
+trigger is `workflow_dispatch` or a `v*` tag, so no pull request reaches it.
+The gap is a lane that builds the wrong two targets, not an absent machine.
+
+**What would close it, in either direction.** (1) MEASURE: on `macos-15`, build
+`vllm_shared` and `video-studio`, then read the dylib's exported weak definitions
+(`nm -gU` filtered on `__ZN7httplib`) and the example's resolved bindings
+(`nm -m`, `dyld_info -bind`), and record whether either side's `httplib` symbols
+resolve across the image boundary. (2) REMOVE THE QUESTION: give `vllm_shared`
+an `-exported_symbols_list` holding `_vllm_*` on the ld64 leg and extend
+`capi_shared_exports_only_abi` to macOS, which gives the Apple build the same
+by-construction guarantee ELF has. (2) is the smaller change and needs the same
+host to prove it, because an export list that silently exports nothing would
+also pass a link.
+
+**Severity: low, and the ELF leg is not at risk.** Every CI lane and every
+released Linux artifact carries the version script. `video-studio` is an example
+rather than a shipped path. Found while fixing
+[#1531](https://github.com/mudler/vllm.cpp/issues/1531); recorded rather than
+closed because both routes above need a macOS host and this row has not taken
+one.

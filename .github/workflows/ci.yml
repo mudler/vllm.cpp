@@ -262,6 +262,15 @@ jobs:
         run: |
           python3 scripts/check-surface-coverage.py
           python3 tests/scripts/test_check_surface_coverage.py
+      - name: No harness launches the pinned oracle on a handicapped path (#414)
+        # Without `--language-model-only` a Qwen3.6 checkpoint gives the oracle
+        # `text_only == False` (qwen3_next.py:324-331 at the pin), so it runs its
+        # UNFUSED QK-norm+RoPE+gate path against our fused one and every ratio it
+        # produces is FLATTERED. The 2026-08-13 series repaired the RUN; this
+        # repairs the HARNESS, which is what the next campaign reaches for.
+        run: |
+          python3 scripts/check-oracle-denominator-flags.py
+          python3 tests/scripts/test_check_oracle_denominator_flags.py
       - name: The x86_64 CPU floor harness runs from a clean checkout
         # It shipped unable to run at all: `OUT=evi` with no `mkdir -p`, so every
         # redirection failed, every leg was discarded for a non-zero exit, and

@@ -308,11 +308,32 @@ not a process-global `GraphCapturesCounter`. Tracked on
   the host `/bin/true` into an `x86_64`-named archive, so `agent-preflight`
   cannot go green on the TT dev fleet. Found while running this row's preflight.
   Owned by [#1487](https://github.com/mudler/vllm.cpp/issues/1487).
-- **The TT `test_qwen3_paged_engine` golden is stale**: anchor drift
-  prompt[1] tok=10 (engine=14126, committed=62901), identical before and after
-  the #1476 fix (that test runs the default path). Needs the `VT_DUMP_IDS` +
-  near-tie-gap re-adjudication. Owned by
+- **The TT `test_qwen3_paged_engine` golden was stale** — RESOLVED 2026-08-20
+  in this flow: the anchor drift prompt[1] tok=10 (engine=14126, committed
+  6290 — the logged `62901` was a print artifact, #1508) came from the default
+  decode path having moved since the 2026-08-10 capture. The before/after-#1476
+  comparison recorded in #1488 compared exit codes and only the p1-tok-10
+  engine token, so it does not establish that pre-fix TT matches the refreshed
+  cells (prompt 5 tail, prompt 7); the golden is derived from this branch's TT
+  output and the refresh stacks here. Re-adjudicated with `VT_DUMP_IDS` (eager
+  `VLLM_CPP_CUDAGRAPH=0` and captured dumps byte-identical, md5
+  `b5307e33…`) and `qwen3-neartie-gap-transformers.py` (transformers 4.57.1,
+  torch 2.10.0a0+cpu): 53 cells refreshed across 7 prompts — single
+  near-tie divergences at one token each (p1 tok10, p5 tok10, p10 tok5,
+  p11 tok4, p12 tok13, p15 tok12) whose greedy continuations then follow
+  the new prefix, plus prompt 7 rewritten from tok0; the new p7 row
+  matches the vLLM greedy sequence exactly, max gap 375 mnats, zero cells
+  above the 500-mnat band, zero outside-top-K. Fixed by
   [#1488](https://github.com/mudler/vllm.cpp/issues/1488).
+- **doctest `MessageBuilder` streams `const char*` as bool**: every
+  separately-bound `const char*` in a `MESSAGE`/`REQUIRE_MESSAGE` renders as
+  `1`, so the anchor-drift message printed `committed anchor=62901` for a
+  golden holding `6290` (and `96251` for `9625`), and `label` printed as `1`
+  instead of `qwen3-0.6B`. Reproduced against the pinned header with a
+  7-line harness; fixed by passing `std::string` in
+  `test_qwen3_paged_engine.cpp`. Found during the #1488 re-adjudication after
+  the garbled value had been misread as golden-buffer corruption. Fixed by
+  [#1508](https://github.com/mudler/vllm.cpp/issues/1508).
 
 The operator must still rerun the 80-token no-hang gate and
 `test_qwen3_paged_engine` on a Blackhole P150. An implementer run is an
@@ -383,4 +404,5 @@ ambient `VT_TT_HOST_FREE_DECODE` (its exit-time segfault is pre-existing,
 
 Next: operator rerun of the 80-token captured-vs-eager gate and
 `test_qwen3_paged_engine` on card; the paged-engine golden re-adjudication is
-[#1488](https://github.com/mudler/vllm.cpp/issues/1488).
+done ([#1488](https://github.com/mudler/vllm.cpp/issues/1488) closed by the
+stacked golden-refresh commit on this branch).

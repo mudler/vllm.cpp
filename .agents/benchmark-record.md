@@ -26017,10 +26017,17 @@ the passing binary's compiled sources are `81b530cff`'s with blob
 `47c53d17a58584987599028519148747b3f018e9` in that slot, which is tree
 `0ac277b3a66b5deabe4871959f0f03566c08deda`. It is a RECONSTRUCTION: no
 `git write-tree` was taken after the fix, so no recorded object names the passing
-run, and the dispatched mutation counts (5 and 37) were taken on `81b530cff` by
-the same arithmetic. `81b530cff` also carries no `dflash2_27b` goldens at all, so
-the run read one through `VLLM_DFLASH2_GOLDEN` off the lease; the golden's sha256
-is what pins the DATA and it matches the committed file byte for byte.
+run. An earlier revision of this entry added that "the dispatched mutation counts
+(5 and 37)" were taken on `81b530cff` by the same arithmetic; that clause is
+DELETED, because this entry's own `### Mutations` heading says W6 recorded none,
+`git grep "5 and 37" bb416e0ae` returns nothing, and W6's commit body carries no
+mutation prose — the two counts are unfindable, and the standing statement is
+that **W6 recorded no mutation count anywhere**. `81b530cff` also carries no
+`dflash2_27b` goldens at all, which is CONSISTENT with the run reading one
+through `VLLM_DFLASH2_GOLDEN` off the lease — an inference, not a reading, since
+an untracked golden in the run's worktree fits the same evidence and no log
+survives to separate them. Either way the golden's sha256 is what pins the DATA
+and it matches the committed file byte for byte.
 
 **AND THE ORACLE'S PULL REQUEST HAD ALREADY MERGED WHEN THIS WAS WRITTEN.**
 vllm#52816 merged at `2026-08-21T05:27:22Z`, 46 minutes before the wave's work
@@ -26191,13 +26198,23 @@ W6 recorded none. Taken 2026-08-21 by the W6 repair wave on the CPU dev box at
 the merged tree, each with its match count, `git diff --stat` and compile rc
 printed, each restored sha256-verified and rebuilt. Unmutated the suite reads
 **4 cases / 65 assertions / 0 failed / `Status: SUCCESS!` / rc 0** there (the
-e2e case SKIPs without a checkpoint); before this wave it read 3 cases / 41.
+e2e case SKIPs without a checkpoint); before this wave it read 3 cases / 41, and
+after the SECOND repair wave it reads 4 cases / 70.
 
 | mutation | result |
 |---|---|
 | `ListField` drops the last id of every list | 1 case / 7 of 65 red, rc 1 |
 | `len += 1 + acc` becomes `len += acc` | 1 case / 7 of 65 red, rc 1 |
 | the `len + j >= out.size()` truncation guard deleted | **SIGSEGV, rc 139** |
+
+**SECOND repair wave (2026-08-21).** Unmutated `test_dflash2_runner_reach` reads
+3 cases / 90 assertions and `test_qwen38_dflash2_spec_decode` 4 cases / 70, both
+`SUCCESS!` / rc 0.
+
+| mutation | result |
+|---|---|
+| **M1** — the DFlash2 startup notice reverted to its pre-repair `"is OPEN upstream at head 66e5414c"` text (match 1, `+3/-5`, compile rc 0) | 1 case / **4 of 90** red, `Status: FAILURE!`, rc 1 — the four new merged-state assertions and nothing else |
+| **M2** — `len < out.size()` -> `len <= out.size()` on `Reconstructed::verified` | **NOT TAKEN.** Attempted and VOIDED by a harness race: two instances ran concurrently and the second took its baseline after the first had mutated, so it read `match count: 0` — its "before" hash `770bee0a` is the MUTATED file, against the clean `843d610b`. Tree verified undamaged (both files byte-identical to `HEAD`); harness now takes a `flock`. A clean retake was unaffordable because every cycle rebuilds the whole 464-object library and the box ran at loadavg 145 / 12 objects per 10 min. The `at_end` boundary fixture IS committed and is UNPROVEN; taking M2 on a quiet box is owed |
 | liveness by TOTAL block count instead of per record | 1 case / 1 red |
 | every golden declared live | 1 case / 2 red |
 | `with_blocks` counts drafts-less records too | 1 case / 4 red |

@@ -51,15 +51,41 @@ opened 2026-08-18 on base `9842d701`. This row's gates were read against head
 `66e5414c6d75a8529473d977f7458c140bbab8a0`.
 
 **THIS SECTION SAID "Not merged upstream" AFTER THE MERGE HAD ALREADY HAPPENED,
-and so did four other places in this file plus the `#1538` index row.** The
-merge landed at `05:27:22Z`; W6's work commit `bb416e0ae` was authored at
-`06:13:50Z`, 46 minutes later. Every open-PR statement W6 wrote was therefore
-already false when it was written, and W6 did not re-read the forge before
-committing. Corrected on 2026-08-21 by the W6 repair wave, which read
-`gh api repos/vllm-project/vllm/pulls/52816` itself rather than inheriting the
-claim. The reconciliation the merge makes due is
+and so did four other places in this file, the `#1538` index row, and TWO LIVE
+SURFACES OUTSIDE THIS FILE.** The merge landed at `05:27:22Z`; W6's work commit
+`bb416e0ae` was authored at `06:13:50Z`, 46 minutes later. Every open-PR
+statement W6 wrote was therefore already false when it was written, and W6 did
+not re-read the forge before committing. Corrected on 2026-08-21 by the W6
+repair wave, which read `gh api repos/vllm-project/vllm/pulls/52816` itself
+rather than inheriting the claim. The reconciliation the merge makes due is
 [#1561](https://github.com/mudler/vllm.cpp/issues/1561); `## Owed` O21 carries
 it.
+
+**THIS IS THE COMPLETE INVENTORY, and the first repair wave's was short.** That
+wave corrected the five spec statements and the index row and stopped there,
+which left the claim standing in the two places a USER can reach — in shipped
+product output and in a public header — for a second review to find:
+
+| surface | what it said | state |
+|---|---|---|
+| 5 statements in this file, at `bb416e0ae` lines 46 (`## Upstream chain`), 332 and 383 (`## Gates`), 464 (`## Work breakdown`) and 1593 (`## Owed` O21) | "Not merged upstream" / "#52816 was still open" / "is still OPEN" | corrected by the first repair wave (`e8cb8d4a3`) |
+| the `#1538` row of `.agents/issue-index.md` | "while it is still open" | corrected by the first repair wave (`e8cb8d4a3`) |
+| `src/vllm/entrypoints/model_loader.cpp` — the DFlash2 startup notice, printed on **every** draft load, safetensors and GGUF alike | "which is OPEN upstream at head `66e5414c…`" | corrected by the SECOND repair wave |
+| `include/vllm/config/speculative.h` — the `IsDflash2Draft` BEYOND-PIN comment | "is OPEN at head `19c93519…`", the first of three heads, so doubly stale | corrected by the SECOND repair wave |
+
+The `#1561` index row states the inventory as "five statements in the spec plus
+the `#1538` index row", which is the short one. `.agents/issue-index.md` is
+append-only and a landed row is never edited, so **this table is the authority
+and that row is not**; #1561's own owed work is moving the gate head, which is a
+separate thing from the inventory of what said OPEN.
+
+**And the class is now gated rather than re-audited.** The startup-notice case in
+`tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp` matched only the
+substring `"52816"`, so it could not see the word `OPEN` at all and stayed green
+across both false versions of the notice. It now asserts the merged wording and
+the merged head are PRESENT and both spellings of the open claim are ABSENT, so
+a third recurrence in that surface reds on every box with no checkpoint and no
+GPU.
 
 **THE HEAD MOVED under this row, and W3 is the wave that reconciles it**
 ([#1404](https://github.com/mudler/vllm.cpp/issues/1404)). W1 and W2 were written
@@ -1846,6 +1872,37 @@ list items.
   check bounds only the failure it names, and a passing one is not evidence that
   the instrument SAW anything. Only the ABORT ON ZERO caught all three.
 
+- **O24 — the `at_end` boundary fixture is COMMITTED AND UNPROVEN, because its
+  mutation was never run.** Owner: `SPEC-DFLASH2`. Issue
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314).
+
+  `our_blocks_all == oracle_blocks_all` rests on `Reconstructed::verified`, which
+  turns on `len < out.size()`. W6's second fresh review mutated that `<` to `<=`
+  and **the whole suite stayed green**, because the pre-existing `tail` case has
+  no block starting at exactly `len == out.size()` — its unconsumed blocks start
+  at len 9 against an 8-token output, so the two operators agree there and the
+  boundary was ungated. The second repair wave added `at_end`, which puts a block
+  at exactly `out.size()`: block 0 accepts both drafts so the cursor lands on 4
+  against a 4-token output, and `edge.verified` should read 1 under `<` and 2
+  under `<=`.
+
+  **The mutation that would prove it was NOT TAKEN.** It was attempted twice. The
+  first attempt was voided by a harness race (two concurrent instances; the
+  second baselined an already-mutated file, so it read `match count: 0`), and a
+  clean retake was unaffordable because every cycle in this build tree rebuilds
+  the whole 464-object library while the box ran at loadavg 145 and 12 objects
+  per ten minutes. Running against the library already on disk was REFUSED: it
+  had been compiled from the M1 mutation's source, so it would have measured a
+  tree that no longer existed — the stale-binary trap `.agents/verification.md`
+  names. Guessing the outcome would have been worse than recording the gap.
+
+  So the arithmetic case is gated and the BOUNDARY case is present but unproven.
+  What is owed is one mutation on a quiet box: flip `<` to `<=` at
+  `tests/parity/test_qwen38_dflash2_spec_decode.cpp`, rebuild
+  `test_qwen38_dflash2_spec_decode` clean, and confirm `edge.verified == 1` reds.
+  If it does NOT red, the fixture does not span the boundary and LOW-D is not
+  repaired.
+
 
 ## Now
 
@@ -1861,10 +1918,12 @@ bytes the run read.
 
 **A RERUN TODAY WILL NOT PRINT 142, and the figure above is W6's run rather than
 the current one.** The repair wave added a fourth case and its own assertions, so
-the suite now reads 4 cases / 65 assertions on a box with no checkpoint (the e2e
-case SKIPs) against 3 / 41 before it; the device count moves by the same delta
-plus the two new ours-vs-theirs assertions. The 142 is retained because it is
-what was measured; it is not a number to reproduce.
+the suite now reads 4 cases / **70** assertions on a box with no checkpoint (the
+e2e case SKIPs) against 3 / 41 before it — 4 / 65 after the first repair wave and
+4 / 70 after the second, which added the `verified` boundary case's five
+assertions. The device count moves by the same delta plus the two new
+ours-vs-theirs assertions. The 142 is retained because it is what was measured;
+it is not a number to reproduce.
 
 Reproduce with
 
@@ -1899,12 +1958,22 @@ GIT_INDEX_FILE=$SAME git write-tree   # -> 0ac277b3a66b5deabe4871959f0f03566c08d
 **What is still not known, and is stated rather than papered over:** no
 `git write-tree` was taken after the fix, so no tree object recorded at the time
 names the passing run. `0ac277b3` is a RECONSTRUCTION resting on the inference
-above, not a value read off the run. The dispatched mutation counts W6 recorded
-(5 and 37) were taken on `81b530cff` by the same arithmetic and carry the same
-caveat. `81b530cff` also does not contain the goldens at all, so the run read one
-through `VLLM_DFLASH2_GOLDEN` from the lease rather than from the tree; the
-golden's sha256 above is what pins the DATA, and it matches the committed file
-byte for byte.
+above, not a value read off the run. An earlier revision of this paragraph added
+that "the dispatched mutation counts W6 recorded (5 and 37)" carry the same
+caveat; **that claim is DELETED rather than qualified, because it contradicts
+`### W6's MUTATION SET` further down this same `## Now` section and nothing in
+the tree supports it.** That subsection says W6 recorded no mutations anywhere,
+`git grep "5 and 37"
+bb416e0ae` returns nothing, W6's commit body carries no mutation prose, and
+`git show bb416e0ae:.agents/benchmark-record.md` has no mutation table in the W6
+entry. So the two counts are unfindable and the standing statement is the other
+one: **W6 recorded no mutation count anywhere**, and every count in this file was
+taken by a repair wave. `81b530cff` also does not contain the goldens at all,
+which is CONSISTENT with the run reading one through `VLLM_DFLASH2_GOLDEN` from
+the lease -- an inference, not a reading, because an untracked golden sitting in
+the run's worktree fits the same evidence and no log survives to separate them.
+Either way the golden's sha256 above is what pins the DATA, and it matches the
+committed file byte for byte.
 
 The FLASH_ATTN arm of the same capture is committed beside it as
 `dflash2_27b_spec_on_flash_attn.json` and is selected with
@@ -2124,9 +2193,10 @@ and there was no `CLAIM-SPEC-DFLASH2-W6`. Both are repaired. Every count below
 was taken by the W6 repair wave on the CPU dev box at the merged tree, each
 mutation applied to a file whose sha256 was taken first and restored and rebuilt
 after, with the match count, `git diff --stat` and the compile rc printed for
-each. The suite reads **4 cases / 65 assertions / 0 failed / `Status: SUCCESS!`
+each. The suite read **4 cases / 65 assertions / 0 failed / `Status: SUCCESS!`
 / rc 0** unmutated there (the e2e case SKIPs without a checkpoint); it read 3
-cases / 41 assertions before this wave.
+cases / 41 assertions before this wave, and it reads 4 cases / 70 assertions
+after the SECOND repair wave below.
 
 The three that gate what W6 landed:
 
@@ -2150,6 +2220,56 @@ The four that gate what this repair wave adds, all in the new always-on case:
 | every golden declared live (`g.live = true`) | 1 case / 2 assertions red |
 | `with_blocks` counts every record whether or not it carries drafts | 1 case / 4 assertions red |
 | the `hook_stats` residual claimed to be 0 instead of 3 | 1 case / 1 assertion red |
+
+### The SECOND repair wave's mutation set (2026-08-21)
+
+W6's second fresh review returned FAIL on 2 MEDIUM and 3 LOW/INFO. Two mutations
+gate what that wave landed. Both were taken on the CPU dev box at the merged
+tree, on a COMMITTED tree so the restore is `git checkout --`, with the match
+count, `git diff --stat` and the compile rc printed. Unmutated the suites read
+`test_dflash2_runner_reach` **3 cases / 90 assertions** and
+`test_qwen38_dflash2_spec_decode` **4 cases / 70 assertions**, both
+`Status: SUCCESS!` / rc 0.
+
+| mutation | result |
+|---|---|
+| **M1** — the startup notice reverted to its exact pre-repair `"is OPEN upstream at head 66e5414c"` wording (match 1, `+3/-5`, compile rc 0) | 1 case / **4 of 90** red, `Status: FAILURE!`, rc 1 — and they are exactly the four new assertions: `MERGED upstream` absent, `3406ec1dae…` absent, `OPEN upstream` present, `is OPEN` present |
+| **M2** — `len < out.size()` becomes `len <= out.size()` on the `verified` guard | **NOT TAKEN — see below** |
+
+**M1 is the one that matters for MEDIUM-A**, because it reproduces the exact
+defect: it puts the false sentence back into the binary's own startup output and
+the gate now refuses it. The pre-existing 86 assertions all stayed green, so the
++4 delta is accounted for exactly and nothing else moved.
+
+**M2 IS NOT TAKEN, and this says so rather than assuming its outcome.** It was
+attempted, and the attempt was VOIDED by a harness race worth recording. Two
+harness instances ran concurrently; the second took its `sha256` baseline AFTER
+the first had already applied the mutation, so it found `match count: 0` and
+reported `RESTORE FAILED`. The arithmetic proves the diagnosis rather than
+suggesting it: the second instance's recorded "before" hash `770bee0a` is the
+hash of the MUTATED file, and the clean file is `843d610b`. Neither instance
+produced a usable verdict, because the first was building against a source the
+second had already reverted underneath it. **The tree was never damaged** -- both
+touched files were verified byte-identical to their `HEAD` blobs afterwards. The
+harness now takes a `flock` before it mutates; a mutation harness with no mutual
+exclusion is the same defect class as two GPU mutexes that do not exclude each
+other. The
+fixture it would exercise IS committed: `at_end` in
+`dflash2 gate instrument: acceptance reconstructs from drafts and output` puts a
+block at EXACTLY `out.size()`, which the pre-existing `tail` case never reached —
+its unconsumed blocks start at len 9 against an 8-token output, so `<` and `<=`
+answer identically there and the boundary was ungated. The fresh review measured
+that directly: it mutated `<` to `<=` and the whole suite stayed green. What M2
+would decide is whether the new case closes that hole, and the expected reading
+is `edge.verified == 1` red under `<=`. **That has not been observed here.** The
+box was starved, and a clean retake was not affordable: every mutation cycle in
+this build tree rebuilds the WHOLE library (464 objects, not the one translation
+unit that changed), and at loadavg 145 with 12 objects per 10 minutes measured,
+one cycle is hours rather than minutes. Running the suite against the library
+still on disk was REFUSED, because it had been compiled from M1's mutated source
+and would have been a verdict about a tree that no longer existed. Owed:
+take M2 on a quiet box. Until then the `at_end` case is committed and unproven,
+which is a weaker claim than the rest of this section and is written as one.
 
 **NOT MUTATED, and named rather than left to be assumed:** the e2e case's own
 `gd.live` guards on the G2b/G3 hard bars and its two new ours-vs-theirs

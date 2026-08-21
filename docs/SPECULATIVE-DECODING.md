@@ -188,6 +188,14 @@ The two draft blocks that differ each differ by one token, in a part of the
 selector that is a floating-point reduction and is specified within an envelope
 rather than bit-exact; both blocks then produced the same output tokens.
 
+**That head is one merge behind vLLM's `main`, and the numbers above are still
+the ones that were measured.** vllm#52816 MERGED on 2026-08-21 at 05:27:22Z, at
+head `3406ec1d` and merge commit `b389ac29` -- 46 minutes after the wheel above
+was built and run. The measurement stays pinned to `66e5414c` because that is
+what executed, and re-labelling a run with a head it never ran would be a false
+pin. Re-reading the gates at the merged head is owed under
+[#1561](https://github.com/mudler/vllm.cpp/issues/1561).
+
 **The backend that comparison ran on is not vLLM's default here.** vLLM was run
 on `TRITON_ATTN` rather than on the flash-attention backend it auto-selects,
 which is a deliberate constraint recorded in

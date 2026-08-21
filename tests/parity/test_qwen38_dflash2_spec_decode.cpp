@@ -45,6 +45,20 @@
 // a golden captured under a different oracle or backend cannot be read as this
 // one.
 //
+// AND THAT HEAD IS A DATED EXCEPTION, NOT THE RULE. vllm#52816 MERGED on
+// 2026-08-21 at 05:27:22Z, at head 3406ec1dae9916f920b90f0dbf90dcf54923d042 and
+// merge commit b389ac29465b33f9e9c534df221ea3c129e9793f. `## Gates` G2's own
+// rule is "66e5414c if #52816 has not merged, and the merge commit if it has",
+// so the head the rule selects TODAY is b389ac29. This capture stays pinned to
+// 66e5414c because that is the wheel that was built and run on the lease, and
+// it predates the merge -- re-labelling a run with a head it never executed
+// would be a false pin. Nothing asserted below is false; what a reader has to
+// know is that the head asserted here is ONE MERGE BEHIND vLLM's main, and that
+// moving it and re-reading G2 and G3 there is owed under
+// https://github.com/mudler/vllm.cpp/issues/1561. The spec, the benchmark
+// record, docs/STATUS.md and docs/BENCHMARKS.md all carry this; this file is
+// the one surface that ASSERTS the head, so it carries it too.
+//
 // Checkpoint-GATED + dgx-only. On the CPU dev box and in CI the body emits a
 // loud SKIP naming exactly what is absent (it still compiles and links).
 #include <doctest/doctest.h>
@@ -402,6 +416,13 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
   if (want_backend.empty()) want_backend = "TRITON_ATTN";
   MESSAGE("golden oracle_version=" << oracle_version << " backend=" << backend
           << " (expected " << want_backend << ")");
+  // 66e5414c is the DATED exception recorded in the header above and owed under
+  // #1561, not the head `## Gates` G2's rule selects today: #52816 merged
+  // 2026-08-21T05:27:22Z at b389ac29, and this capture predates that merge.
+  MESSAGE("ORACLE HEAD IS DATED: 66e5414c is vllm#52816's pre-merge head, the "
+          "wheel this capture actually ran. #52816 MERGED 2026-08-21T05:27:22Z "
+          "at merge commit b389ac29; moving this gate onto it and re-reading G2 "
+          "and G3 there is owed under vllm.cpp#1561.");
   CHECK(oracle_version.find("66e5414c") != std::string::npos);
   CHECK(backend == want_backend);
   CHECK(golden.value("spec", std::string()) == "on");
@@ -678,7 +699,9 @@ TEST_CASE("qwen38 DFlash2 e2e gate: draft-token identity + same-trajectory accep
   }
 
   MESSAGE("DFLASH2 G2 OUTPUT: " << exact << "/" << total << " prompts token-exact "
-          "against the beyond-pin oracle (66e5414c, TRITON_ATTN).");
+          "against the beyond-pin oracle (66e5414c, TRITON_ATTN) -- vllm#52816's "
+          "pre-merge head, one merge behind vLLM main since "
+          "2026-08-21T05:27:22Z; re-reading at the merged head is vllm.cpp#1561.");
   MESSAGE("DFLASH2 G2 DRAFTS: " << draft_blocks_identical << "/"
           << draft_blocks_compared << " draft blocks identical on the "
           << same_traj << " same-trajectory prompts.");
@@ -872,8 +895,19 @@ TEST_CASE("dflash2 gate: a golden's drafts decide whether G2b and G3 are takeabl
   // AND THE hook_stats RESIDUAL IS REAL, not a rounding of it. 59 propose calls
   // less 1 dummy less 0 capture-skips is 58 expected records against 55
   // written: three unaccounted for, tracked by #1562. The gate's bound is
-  // one-sided, and this pins both the bound and the residual so neither can
-  // drift unnoticed.
+  // one-sided, and what pins it is the three `hs.value(...)` CHECKs -- they read
+  // the golden and red if any of the three numbers moves.
+  //
+  // WHAT THE RESIDUAL LINE DOES AND DOES NOT ADD, stated exactly because an
+  // earlier revision of this comment said the bound and the residual were pinned
+  // so "neither can drift unnoticed", which is one assertion too generous.
+  // `expected_records` is a LITERAL (59 - 1 - 0), written out so the arithmetic
+  // is readable, not re-derived from `hs`. So mutating the golden's
+  // `propose_calls` from 59 to 58 reds exactly ONE assertion -- the
+  // `hs.value("propose_calls", -1) == 59` above -- and the two lines below stay
+  // green, because against a literal 58 they only restate `t.total_blocks == 55`,
+  // which the case already checks. The drift is caught; it is caught once, by the
+  // `hs` pin, and not twice.
   REQUIRE(gt.contains("hook_stats"));
   const auto& hs = gt.at("hook_stats");
   CHECK(hs.value("propose_calls", -1) == 59);
@@ -1014,6 +1048,26 @@ TEST_CASE("dflash2 gate instrument: acceptance reconstructs from drafts and outp
   CHECK(tail.per_block.size() == 6);
   CHECK(tail.verified == 4);
   CHECK(tail.total == 4);
+
+  // THE BOUNDARY ITSELF, which the `tail` case above does NOT reach. `verified`
+  // is the whole basis of `our_blocks_all == oracle_blocks_all`, and it turns on
+  // `len < out.size()`. In `tail` the unconsumed blocks start at len 9 against
+  // an 8-token output, so `<` and `<=` answer identically there and the
+  // comparison itself was never gated -- MEASURED by the fresh review, which
+  // mutated `<` to `<=` and left the whole suite green.
+  //
+  // This case puts a block at EXACTLY `out.size()`. Block 0 accepts both drafts,
+  // so len advances 1 -> 1 + 1 + 2 = 4, and the output is 4 tokens long: block 1
+  // proposed from a position the run never emitted from, and it is NOT verified.
+  // With `<` this reads verified 1; with `<=` it reads 2, and the CHECK below
+  // reds.
+  const std::vector<int32_t> at_end = {100, 1, 2, 7};
+  const Reconstructed edge = ReconstructAcceptance({{1, 2}, {9, 9}}, at_end);
+  REQUIRE(edge.per_block.size() == 2);
+  CHECK(edge.verified == 1);
+  CHECK(edge.per_block[0] == 2);
+  CHECK(edge.per_block[1] == 0);
+  CHECK(edge.total == 2);
 
   // The `len` advance is 1 + accepted, not accepted. A routine that forgot the
   // bonus token would read block 2's draft against out[4] instead of out[5] and

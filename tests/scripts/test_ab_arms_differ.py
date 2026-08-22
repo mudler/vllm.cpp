@@ -128,7 +128,11 @@ class VerdictContract(unittest.TestCase):
             "--artifact-b", str(self.artifact("b", b"bbbb")),
         )
         self.assertEqual(result.returncode, EXIT_FATAL, result.stdout)
-        self.assertIn("NO_CONTROL", result.stdout)
+        # The COLON matters: `NO_CONTROL_MOVED` contains `NO_CONTROL`, so a
+        # substring assertion on the shorter token passes when the refusal came
+        # from the wrong rule. Caught by mutating the `if not controls` branch
+        # away, which left the suite green.
+        self.assertIn("VERDICT=FATAL NO_CONTROL:", result.stdout)
         self.assertIn("HASHES_DIFFER=yes", result.stdout)
 
     def test_a_control_that_did_not_move_is_fatal(self) -> None:
@@ -138,7 +142,7 @@ class VerdictContract(unittest.TestCase):
             "--control", "ar.depth_forward", "808", "808",
         )
         self.assertEqual(result.returncode, EXIT_FATAL, result.stdout)
-        self.assertIn("NO_CONTROL_MOVED", result.stdout)
+        self.assertIn("VERDICT=FATAL NO_CONTROL_MOVED:", result.stdout)
 
     def test_one_moved_control_among_several_passes(self) -> None:
         result = run_tool(
@@ -293,7 +297,7 @@ class IdenticalSourceReproduction(unittest.TestCase):
             "--control", "ar.depth_forward", control_old, control_new,
         )
         self.assertEqual(result.returncode, EXIT_FATAL, result.stdout)
-        self.assertIn("NO_CONTROL_MOVED", result.stdout)
+        self.assertIn("VERDICT=FATAL NO_CONTROL_MOVED:", result.stdout)
         self.assertIn("HASH_LOCATION_DEPENDENT=yes", result.stdout)
 
     def test_a_real_change_passes_both(self) -> None:

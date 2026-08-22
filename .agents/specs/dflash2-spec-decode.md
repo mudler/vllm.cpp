@@ -2372,8 +2372,9 @@ list items.
      skipped_capture: 0, skipped_dummy: 285}`, and `355 - 285 - 0 = 70` recorded
      blocks across the four records, which is exactly the block count the
      capture emitted (17 + 12 + 14 + 27). So the walk resolved on every
-     non-skipped call and missed nothing, over 7x the population of the first
-     discharge. The rest of this entry stands as the design it describes.
+     non-skipped call and missed nothing, across exactly 7x the first discharge's
+     population of 10 blocks. The rest of this entry stands as the design it
+     describes.
 
      The capture emits the golden's own shape -- `records[i].blocks` with
      `num_blocks`, each block carrying `call`, `req_row`, `anchor` and `drafts`,

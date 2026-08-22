@@ -505,18 +505,29 @@ dispatchable in order, under the constraints that answer imposes.
   `rc run -d thor:gpu0` lease, the baseline is 553 tests, **534 passed /
   3 skipped / 16 red** (`ctest -j1`, 419.97 s). It read 485 tests / 15 red at
   `2daa3287f`. A further re-measurement at `944d7d947` reached configure and
-  then lost the box to a `worker_lost` event, so **the baseline is one `main`
-  behind the tree that records it and says so**; re-measuring is owed under
-  [#955](https://github.com/mudler/vllm.cpp/issues/955). Four are the build correctly refusing what sm_110 does not have
-  (no vendored FA-2), two are tests that hardcode GB10, three are already red on
-  GB10, two are FP8 ops that fall through to the portable tier and crash
-  ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), which was closed three days
-  before the measurement), one is an absent
-  `shellcheck` ([#961](https://github.com/mudler/vllm.cpp/issues/961)), one is
-  the live Marlin NVFP4 disagreement
-  ([#962](https://github.com/mudler/vllm.cpp/issues/962)), and one
-  (`test_gguf_device_fit_reach`) arrived since 2026-08-15 and is not yet
-  attributed. None of those can be
+  then lost the box to a `worker_lost` event, so **the baseline is STALE by 144
+  commits** — 100 of them touching `src/`, `include/`, `tests/` or
+  `CMakeLists.txt` — and says so; re-measuring is owed under
+  [#955](https://github.com/mudler/vllm.cpp/issues/955).
+
+  **The 16 split into seven causes, and the split is non-overlapping so it sums
+  to 16.** An earlier draft's tally reached only 15, because the three
+  `qwen3_5_gdn_spec_routing` tests belong to two descriptions at once and were
+  counted under neither cleanly. They are counted once below, under GB10, with
+  the second fact noted rather than added.
+
+  | Cause | Count | Tests |
+  |---|---:|---|
+  | no vendored FA-2 — the build correctly refusing what the arch lacks | 4 | `test_deepseek_v2_forward`, `test_ops_mla_prefill`, `test_ops_mla_chunked_context`, `test_mla_attention_block` |
+  | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family), `test_op_parity` (a dgx-only golden that runs anyway) |
+  | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 5 | `test_linear_method`, `test_capi`, and the three `qwen3_5_gdn_spec_routing` tests — which ALSO improved `SEGFAULT` → `Failed` here, counted once |
+  | FP8 ops falling through to the portable tier and crashing ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed three days before the measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda` |
+  | an absent `shellcheck`, an instrument not a verdict ([#961](https://github.com/mudler/vllm.cpp/issues/961)) | 1 | `test_serve_low_tools` |
+  | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped` |
+  | arrived since 2026-08-15, UNATTRIBUTED | 1 | `test_gguf_device_fit_reach` |
+  | **total** | **16** | |
+
+  None of those can be
   made green by this row and none is this row's debt. Asking for "all green" on
   a host whose arch legitimately lacks features would either block every brick
   forever or invite someone to weaken a test to pass. **The gate that actually

@@ -302,12 +302,20 @@ would be a regression rather than a repair.
   that was repaired for #1629: `:58-61` gives the wrong reason for not widening
   the regex, `:93-96` attributes the exclusion of the fast rungs to the `\b`
   rather than to the trailing `\(`, and `:252-255` denies an equality that
-  holds. It held when this spec was written (9 sites, 6 marked, 3 excused) and it
-  holds now for a STRONGER reason: `47a918d8f` and `90e8c3c85` moved the tree to
-  8 sites and 8 marked, and #1663 then emptied the allowlist, so `excused` is 0
-  BY CONSTRUCTION -- with nothing allowlisted, any green tree has
-  `sites == marked` and `excused == 0`, and the equality cannot fail. The comment
-  is still wrong, and it is now wrong about a tree where it cannot be right. It cannot be fixed here, because
+  holds ON EVERY GREEN RUN, for ANY allowlist, and always did -- which is a
+  larger claim than the one this entry used to make about one tree, and it is
+  the one #1631 needs. The comment's stated reason is that "a marked call inside
+  an allowlisted file counts in `marked`". True, and it does not separate the
+  quantities: such a call is counted in `marked` AND excluded from `excused`, so
+  it cancels on both sides. The only shape that separates `excused` from
+  `sites - marked` is an UNMARKED call in a NON-allowlisted file -- which is
+  exactly `drift_sites`, so `main` returns 1 at `:248` and the OK line never
+  prints. Enumerated rather than argued: over all 64 green configurations of
+  marked and unmarked calls across one allowlisted and one non-allowlisted file,
+  zero break the equality, and the one configuration that breaks it is not
+  green. So the printed `excused` is never anything but `sites - marked`, and
+  the comment justifying a separate computation is wrong wherever a reader can
+  see it. It cannot be fixed here, because
   changing what the gate accepts is what AGENTS.md `## Changing the rules or a
   checker` routes to its own row, spec and red-before evidence; attaching the
   correction to an unrelated semantic change is the alternative that section

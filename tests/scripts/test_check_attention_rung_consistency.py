@@ -251,10 +251,14 @@ class ShippedTreeTests(unittest.TestCase):
         # DORMANT rather than dead now that the allowlist is empty: this iterates
         # over nothing and asserts nothing on the shipped tree. That is the
         # correct state for it -- it is a guard on a file that is currently
-        # empty, and it fires the moment anything is added, which is measured
-        # rather than assumed (appending one bogus stem reds this case and the
-        # pinning case together). Deleting it because it is quiet today would
-        # remove the typo report from exactly the edit that needs it.
+        # empty, and it fires on the first TYPO added to it. Not on the first
+        # addition: both arms were measured, and they differ. Appending
+        # `zzz_bogus_model` reds this case and the pinning case together, while
+        # appending `whisper_audio` -- a real stem, so a real source file -- reds
+        # the pinning case and `test_deleting_a_marker_goes_red` and leaves THIS
+        # case green, because the stem it names exists. Deleting this case
+        # because it is quiet today would remove the typo report from exactly
+        # the edit that needs it.
         #
         # Keyed on the FILE existing, never on scan membership. A stem stops having
         # a call site the moment its removing row lands -- that is the state the

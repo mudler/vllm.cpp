@@ -38,10 +38,12 @@ duplicate. Both are inherited by every branch that merges `main`.
 
 The two rows are not a bad merge and not a hand edit:
 
-| Line | Added by | Owning row | What it records |
+| Line at `038ff61e5` | Added by | Owning row | What it records |
 |---|---|---|---|
 | `:592` | `a7bb3130b` | `ENG-HF-MODEL-DOWNLOAD` | the bug, and the attribution to `a50c57d69` that introduced it |
 | `:632` | `2f2a70925` | `GATE-WINDOWS-PORTABILITY-TARGET-SCOPE` | the fix, plus a second red that `:592` did not record |
+
+The line numbers are read at `038ff61e5` and move on the next append, which is why the rows are identified by their commit here.
 
 One lane found and filed the bug while repairing something else. A different
 lane fixed it and recorded its own ownership. Neither branch could see the
@@ -204,28 +206,41 @@ proved discriminating by mutation in §7 rather than by reading.
 
 ## 7. Gates
 
-Each command is run on the real tree. The BEFORE column is measured at
-`038ff61e5`. The AFTER column is filled by the implementation commit, which is
-why it names the command rather than a number here.
+Measured on the real tree. BEFORE is `origin/main` at `038ff61e5`; AFTER is this
+branch at the implementation commit.
 
 | Gate | Before | After |
 |---|---|---|
-| `python3 -m unittest tests.scripts.test_agent_record` | 109 tests, 1 failure (`test_the_tracked_index_is_valid`) | every case green, four cases more |
-| `python3 scripts/check-agent-record.py` | rc 1, `issue #1649 listed twice` | rc 0 |
-| `python3 scripts/check-issue-index-append-only.py --base origin/main` | `OK` | `OK`, so the preamble insert and the appended row remove no line |
-| `scripts/agent-preflight.sh` | not applicable at the base | all gates green |
+| `python3 -m unittest tests.scripts.test_agent_record` | 109 tests, 1 failure (`test_the_tracked_index_is_valid`) | 113 tests, `OK` |
+| `python3 -m unittest tests.scripts.test_agent_record.IssueIntakeTable` | 11 tests, 4 failures | 11 tests, `OK` |
+| `python3 scripts/check-agent-record.py` | rc 1, `issue #1649 listed twice` | rc 0, `agent record OK: ENGINE=170 MODEL=377 QUANT=84 KERNEL=57 BACKEND=85 ANCHOR-ROT=37` |
+| `python3 scripts/check-issue-index-append-only.py --base origin/main` | `OK` | `OK` |
+| `git diff origin/main --numstat -- .agents/issue-index.md` | n/a | `8 0`, additions only |
+| `scripts/agent-preflight.sh --staged` | n/a | green except `test_cpu_x86_llamacpp_floor` |
 
-`git merge-base --is-ancestor origin/main HEAD` must exit 0 before any preflight
-trailer result is read. `scripts/agent-preflight.sh:452-459` takes a
+`test_cpu_x86_llamacpp_floor` is [#618](https://github.com/mudler/vllm.cpp/issues/618).
+Its contended leg exits 4 (`NO_QUIET_WINDOW`) instead of 2 at loadavg 88.06, and
+it failed the same way on the spec-only tree at loadavg 45.97. That earlier run
+is the control: it holds none of this change's code.
+
+`git merge-base --is-ancestor origin/main HEAD` exits 0 and `RANGE_COUNT` is 1,
+so the trailer gates ran. `scripts/agent-preflight.sh:452-459` takes a
 `TRAILER_BEHIND` arm when the head is behind the base and then reports nothing,
-so a green there would mean "not checked".
+so a green there without this check would mean "not checked".
 
-MUTATION, recorded in the pull request body with the `git diff --stat` that
-proves each mutation applied and an empty `git status --porcelain` after
-restoring: forcing the key back to the number alone must red exactly the cases
-the narrowing is for, and forcing the key to the owner alone must red the
-duplicate cases. A mutation that fails to run reads as a passing test, so the
-interpreter output is quoted for each one.
+MUTATION, both directions, on the real tree. `scripts/check-agent-record.py` is
+`7abe4aa4b3a8b0d776364207396be146e58dd9d34067b9f258c106a96e12d593` before and
+after, verified with `sha256sum -c`.
+
+| Mutation | File sha256 while mutated | Result |
+|---|---|---|
+| `key = (number, None)`, the pre-#1731 predicate | `710224b8...` | 3 of 113 red: the two admission cases and `test_the_tracked_index_is_valid` |
+| `first = None`, maximal widening | `8e7cfe09...` | 3 of 113 red: `test_a_duplicated_issue_is_rejected`, `test_a_byte_identical_duplicate_row_is_rejected`, `test_a_duplicate_under_one_owner_names_both_line_numbers` |
+
+The first mutation leaves `test_a_duplicate_under_one_owner_names_both_line_numbers`
+green, correctly: that case asserts the MESSAGE, which the mutation does not
+touch. Each mutated file was read back by `grep` for its marker before the run,
+so neither mutation could read as passing by never having applied.
 
 ## 8. Stop conditions
 
@@ -244,10 +259,12 @@ message.
 
 ## 9. Now
 
-The narrowed key and its cases are written. `main` is green on
+The narrowed key and its cases landed with this change. `main` is green on
 `check-agent-record.py` without any row being edited or deleted, and the two
 `#1649` rows both stand, each under the row that wrote it.
 
 ## 10. Outcome
 
-Recorded on landing.
+Recorded when the row reaches `DONE`. The measurements are in §7, and the two
+decisions most likely to be revisited are in §4: no cap on rows per issue, and
+no owner-ID existence check.

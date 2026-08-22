@@ -1895,6 +1895,13 @@ append a row merge without a conflict. That driver is only safe while the rule
 above holds. An edited row and an edited line of this preamble are duplicated
 rather than merged. `scripts/check-agent-record.py` gates both.
 
+A second row for one issue is a RECORD, not a duplicate, when it names a
+DIFFERENT owning row. Filing an issue and fixing it usually happen on different
+branches, and an append is the only update this file allows, so a hand-off
+reaches the index this way or not at all. `scripts/check-agent-record.py`
+refuses a repeat of one issue under the SAME owner, which is what one row
+appended twice looks like.
+
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
 """
@@ -1969,10 +1976,28 @@ def check_issue_index(
         else:
             errors.append(f"{label}: preamble is shorter than the checker's copy")
 
-    seen: set[str] = set()
+    # Keyed on the PAIR (issue, owning row), never on the issue alone (#1731).
+    # This file is append-only, so an UPDATE is an append: a fix that lands
+    # under a different row, and a row that adopts an issue owned through a
+    # spec's `## Owed`, can reach the index only by appending a second row.
+    # Keying on the number alone permitted one statement per issue for the life
+    # of the repository, and it red `main` on #1649 for the ordinary case of one
+    # lane filing and another lane fixing.
+    #
+    # The corruption this refusal was earning its keep against is unaffected.
+    # #1619 measured the `merge=union` driver duplicating a row BYTE-IDENTICALLY
+    # at two lines, which `git merge-tree` called clean and
+    # `check-issue-index-append-only.py` passed because a duplicate is an
+    # addition. A duplicated LINE carries its owner with it, so the pair still
+    # collides.
+    #
+    # The value is the line number of the first row for the key. It is derived
+    # here and stored nowhere: a line number written INTO an append-only file
+    # goes stale on the next append, silently.
+    seen: dict[tuple[str, str | None], int] = {}
     rows = 0
     unowned: list[str] = []
-    for line in text.splitlines():
+    for line_no, line in enumerate(text.splitlines(), 1):
         # Any table line that is not the header or the separator. Matching only
         # `| [#` would make a row that LOST its link invisible instead of
         # malformed, which is the failure this loop exists to report.
@@ -1989,12 +2014,23 @@ def check_issue_index(
         number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
         if number != url_number:
             errors.append(f"{label}: issue #{number} links to {url}, a different issue")
-        if number in seen:
-            errors.append(
-                f"{label}: issue #{number} listed twice. Under `merge=union` a "
-                "duplicate is what two branches appending the same issue look like"
+        key = (number, row_id)
+        first = seen.get(key)
+        if first is None:
+            seen[key] = line_no
+        else:
+            owner = (
+                f"under the same owner `{row_id}`"
+                if row_id is not None
+                else "and neither row names an owner"
             )
-        seen.add(number)
+            errors.append(
+                f"{label}:{line_no}: issue #{number} is listed twice {owner}, "
+                f"first at {label}:{first}. Under `merge=union` a duplicate is "
+                "what ONE row appended twice looks like. A second row for one "
+                "issue is a record when it names a DIFFERENT owning row, and a "
+                "repeat under the same owner is a duplicate"
+            )
         if row_id is None and number not in owed:
             unowned.append(number)
 

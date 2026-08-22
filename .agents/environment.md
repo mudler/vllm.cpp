@@ -1081,19 +1081,42 @@ environment:
     | `test_qwen3_5_gdn_spec_routing_fused_chain_off` | Failed | same assertion, same case | same, mode also changed from `SEGFAULT` |
     | `test_deepseek_v2_forward` | Failed | `:559` THREW `cuda mla_prefill_attention: built without the vendored FlashAttention-2` | no FA-2 on sm_110 |
     | `test_capi` | **SEGFAULT** | `test_capi.cpp:487` SIGSEGV, case "capi: custom logits processor forces the generated token (ABI v8)" | pre-existing and arch-independent; same crash on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)). The single name UNDERSTATES what is red — [#994](https://github.com/mudler/vllm.cpp/issues/994) — and doctest reports `4 cases | 3 passed | 1 failed | 61 skipped` beside it |
-    | `test_ops_fp8_cutlass` | **SEGFAULT** | `:191` SIGSEGV, after `[vt reference-tier] op=MatmulFp8Cutlass device=cuda has NO native kernel; running the PORTABLE CPU fallback` | [#960](https://github.com/mudler/vllm.cpp/issues/960) |
-    | `test_ops_matmul_fp8_block_cuda` | **SEGFAULT** | `:345` SIGSEGV, after the same reference-tier line for `MatmulFp8BlockScaled` | [#960](https://github.com/mudler/vllm.cpp/issues/960). **NEW NAME** since 2026-08-15 |
+    | `test_ops_fp8_cutlass` | **SEGFAULT** | `:191` SIGSEGV, after `[vt reference-tier] op=MatmulFp8Cutlass device=cuda has NO native kernel; running the PORTABLE CPU fallback` | [#1725](https://github.com/mudler/vllm.cpp/issues/1725). **NOT #960** — see below |
+    | `test_ops_matmul_fp8_block_cuda` | **SEGFAULT** | `:345` SIGSEGV, after the same reference-tier line for `MatmulFp8BlockScaled` | [#1725](https://github.com/mudler/vllm.cpp/issues/1725). **NEW NAME** since 2026-08-15 |
     | `test_ops_moe_grouped` | Failed | `:1262` `CHECK(bitdiff == 0)`, logged at `:1260` as `NVFP4 block8-vs-block16 M=8 K=4096 N=4096 bitdiff=15/32768` | **the one substantive standing sm_110 finding, [#962](https://github.com/mudler/vllm.cpp/issues/962).** `marlin-nvfp4` IS `ENABLED for [110]`, so this is a live kernel disagreeing with itself across block sizes, not an absent feature. Its MXFP4 sibling reads `bitdiff=0/32768` in the same run |
     | `test_ops_mla_prefill` | Failed | `:340` and `:437` THREW FA-2 absent | no FA-2 on sm_110 |
     | `test_ops_mla_chunked_context` | Failed | `:790` THREW FA-2 absent | same |
     | `test_mla_attention_block` | Failed | `:999` and `:1044` THREW FA-2 absent | same |
     | `test_op_parity` | Failed | `:2490` `output_cbor_sha256` mismatch TWICE in "qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle (**dgx-only**, CUDA)" | dgx-captured goldens replayed on Thor; the case names itself dgx-only and runs anyway |
 
+    **★ These two do NOT belong to #960, and an earlier draft of this table said
+    they did.** [#960](https://github.com/mudler/vllm.cpp/issues/960) was CLOSED COMPLETED on 2026-08-16 by
+    `d607fec4c`, three days before this measurement, and a closed issue cannot
+    own a live crash. Its fix was real and is visible in this very run —
+    `QuantFp8Static` moved into an unconditional TU, `test_ops_fp8_cpu` is GREEN,
+    and the three `qwen3_5_gdn_spec_routing` tests improved from `SEGFAULT` to
+    `Failed`. But `kMatmulFp8Cutlass` and `kMatmulFp8BlockScaled` are different
+    ops, registered from TUs that `CMakeLists.txt:1790-1791` compiles only for
+    `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so on sm_110 the same fall-through
+    shape survived the fix on two more ops. They now have an open owner,
+    [#1725](https://github.com/mudler/vllm.cpp/issues/1725).
+
+    **And the source asserts the opposite outcome, which is the part that needs a
+    measurement rather than an argument.**
+    `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:56-58` says an arch outside the
+    cell "keeps refusing by name — which is the honest answer and not the
+    #960/#844 fall-through". At `0764ded2b` it did not refuse; it fell through and
+    crashed. `cffe59b02` has since rewritten that dispatch on the unified-memory
+    axis, so either it is already fixed and these rows are stale, or two live
+    SEGFAULTs were unowned. Nobody has looked, and no CI lane can: `cutlass-fp8`
+    is ENABLED on GB10, so the fallback is unreachable on the gate host. That is
+    the original #960 blind spot, unchanged.
+
     **What moved between 2026-08-15 (`2daa3287f`, 485 tests / 15 red) and
     2026-08-19 (`0764ded2b`, 553 tests / 16 red), which is the differential gate
     demonstrating itself.** Three names arrived: `test_serve_low_tools`
     (instrument), `test_gguf_device_fit_reach` (unattributed) and
-    `test_ops_matmul_fp8_block_cuda` (#960). Two left, and they left by turning
+    `test_ops_matmul_fp8_block_cuda` (#1725). Two left, and they left by turning
     GREEN rather than by disappearing — checked, not assumed: `test_ops_fp8_cpu`
     and `test_ops_fused_chain` both ran and both `Passed`. And three MODES
     changed, all in the `qwen3_5_gdn_spec_routing` family, `SEGFAULT` →

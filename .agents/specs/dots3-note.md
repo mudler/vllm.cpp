@@ -509,8 +509,9 @@ dispatchable in order, under the constraints that answer imposes.
   behind the tree that records it and says so**; re-measuring is owed under
   [#955](https://github.com/mudler/vllm.cpp/issues/955). Four are the build correctly refusing what sm_110 does not have
   (no vendored FA-2), two are tests that hardcode GB10, three are already red on
-  GB10, three are one FP8 defect
-  ([#960](https://github.com/mudler/vllm.cpp/issues/960)), one is an absent
+  GB10, two are FP8 ops that fall through to the portable tier and crash
+  ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), which was closed three days
+  before the measurement), one is an absent
   `shellcheck` ([#961](https://github.com/mudler/vllm.cpp/issues/961)), one is
   the live Marlin NVFP4 disagreement
   ([#962](https://github.com/mudler/vllm.cpp/issues/962)), and one

@@ -826,8 +826,8 @@ environment:
     **2. Submit one bounded job, and NAME the device.**
 
     ```sh
-    rc run -d thor:gpu0 --max-runtime 120m --idle-timeout 0 \
-      -- bash /workspace/<your-dir>/run.sh
+    rc run -d thor:gpu0 --max-runtime 120m \
+      -- bash /workspace/<your-dir>/run.sh      # the job prints a heartbeat; see below
     ```
 
     Name it rather than selecting on `class=train`, which also matches `dgx:gpu0`
@@ -837,9 +837,30 @@ environment:
     here and matches nothing.
 
     **`--idle-timeout` counts the job's OWN stdout, and a build that logs to a
-    file is silent for its whole duration.** Pass `--idle-timeout 0`, or print a
-    heartbeat line every minute; both were used here. `--max-runtime` is the
-    bound that matters and it is not optional.
+    file is silent for its whole duration.** A `cmake --build` redirected into a
+    log prints nothing for twenty minutes, and the idle killer does not care why.
+
+    **Print a heartbeat. That is the remedy that was actually proven here, and
+    `--idle-timeout 0` is NOT a second way to do the same thing.**
+    `rc run --help` reads
+    `--idle-timeout duration   kill the job if it produces no output for this long (0 = device default)`,
+    so zero selects the DEVICE DEFAULT rather than disabling the kill. An earlier
+    draft of this section prescribed `--idle-timeout 0` as the fix, which would
+    hand a future agent a long quiet build and a false belief that it is
+    protected. A one-line background loop is the whole of it:
+
+    ```sh
+    ( while true; do sleep 60; echo "### hb $(date -u +%H:%M:%S)"; done ) &
+    HB=$!
+    # ... the quiet work ...
+    kill "$HB" 2>/dev/null; wait "$HB" 2>/dev/null
+    ```
+
+    The margin this closes is not theoretical. The 2026-08-19 run built for
+    22 min 44 s in silence against `--idle-timeout 25m` and survived with about
+    two minutes to spare. **`--max-runtime` is the bound that matters and it is
+    not optional**; the heartbeat is what stops the idle killer from firing
+    inside it.
 
     **3. What the job does.**
 

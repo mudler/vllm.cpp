@@ -942,6 +942,24 @@ environment:
     # cleanup() removes $SRC on the way out, on success AND on the kill path.
     ```
 
+    **`cuda-toolkit-13-0` is the package, and a bare `cuda-nvcc-13-0` is NOT a
+    usable fallback.** An earlier draft of this script fell back to it when the
+    full toolkit failed, and that fallback is worse than no fallback: it
+    satisfies `command -v nvcc`, so the guard passes, and then
+    `CMakeLists.txt:1717` runs `find_package(CUDAToolkit REQUIRED)` and `:1719`
+    links `CUDA::cudart CUDA::cublasLt`, neither of which a compiler-only package
+    supplies. The build dies at configure with the same misleading
+    missing-CUDA line as a partial leftover. This build's own `ldd` resolves
+    `libcudart.so.13` and `libcublasLt.so.13`, so those are requirements and not
+    conveniences. If you must install a minimal set rather than the metapackage,
+    it is `cuda-nvcc-13-0 cuda-cudart-dev-13-0 libcublas-dev-13-0` — and the
+    postcondition assertions above are what tell you whether you got it right.
+
+    **cuRAND is NOT among the requirements**, in case a reader reaches for it:
+    `grep -rn curand src include CMakeLists.txt cmake` returns nothing, so this
+    tree never uses it. The `curand` mention elsewhere in this file belongs to
+    DFlash2's flashinfer JIT on `dgx`, which is a different lane.
+
     Build in `/tmp` or `/root`, never on `/workspace`: the share is CIFS with
     `nounix`, so it stores no symlink and presents no exec bit, and `chmod +x`
     there fails with `Operation not permitted`. Write every environment repair

@@ -168,10 +168,13 @@ BACKEND_PROBES: tuple[str, ...] = (
 #: Where the PER-LAYER truth lives, and why one scalar is not enough.
 #:
 #: The same 2026-08-22 run walked `...model_runner.attn_groups` and resolved
-#: THREE backends at once on this model: `GDNAttentionBackend` over the 30
-#: `linear_attn` layers, `TritonAttentionBackend` over the 16 full-attention
-#: layers, and `FlashAttentionBackend` over the DFlash2 draft's five
-#: sliding-window layers (`model.layers.64-68`). A single `attention_backend`
+#: THREE backends at once on this model: `GDNAttentionBackend` over 48
+#: `linear_attn` layers in 10 groups, `TritonAttentionBackend` over 16
+#: `self_attn.attn` layers in 4 groups, and `FlashAttentionBackend` over the
+#: DFlash2 draft's five sliding-window layers (`model.layers.64-68`) in one
+#: group. The counts come from the run's own `c-probe-result.json`; the 30
+#: this comment carried until 2026-08-22 was the test stand-in's shape
+#: (#1666). A single `attention_backend`
 #: string cannot describe that, and the denominator's backend is exactly what W6
 #: measured vLLM disagreeing with ITSELF over -- 0.597 against 0.657 acceptance,
 #: and a divergent continuation on 1 of 4 prompts.

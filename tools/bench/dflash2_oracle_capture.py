@@ -641,10 +641,13 @@ def resolve_attention_backend_groups(llm: Any) -> dict[str, Any]:
     """The PER-GROUP backend map, recorded beside the scalar and never gated.
 
     One scalar under-describes this model: on 2026-08-22 `attn_groups` resolved
-    `GDNAttentionBackend` over 30 `linear_attn` layers, `TritonAttentionBackend`
-    over 16 full-attention layers and `FlashAttentionBackend` over the DFlash2
-    draft's five sliding-window layers, in one engine
-    ([#1658](https://github.com/mudler/vllm.cpp/issues/1658)).
+    `GDNAttentionBackend` over 48 `linear_attn` layers in 10 groups,
+    `TritonAttentionBackend` over 16 `self_attn.attn` layers in 4 groups and
+    `FlashAttentionBackend` over the DFlash2 draft's five sliding-window
+    layers in one group, in one engine
+    ([#1658](https://github.com/mudler/vllm.cpp/issues/1658)). The counts are
+    the run's own `c-probe-result.json`, not the test stand-in's shape
+    ([#1666](https://github.com/mudler/vllm.cpp/issues/1666)).
 
     A MISS is a named `miss` and never an empty map, because an empty map reads
     as "one backend" -- the exact false claim this field exists to prevent. The

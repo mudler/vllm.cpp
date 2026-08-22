@@ -1742,21 +1742,71 @@ class _StandInAttentionGroup:
         self.layer_names = list(layers)
 
 
+#: The GDN groups the O26C walk resolved, by layer index. Eight hold five
+#: layers and two hold four, which is the shape that makes the per-backend sum
+#: a sum over groups rather than a group's own length.
+_O26C_GDN_GROUPS: tuple[tuple[int, ...], ...] = (
+    (0, 13, 26, 40, 53),
+    (1, 14, 28, 41, 54),
+    (2, 16, 29, 42, 56),
+    (4, 17, 30, 44, 57),
+    (5, 18, 32, 45, 58),
+    (6, 20, 33, 46, 60),
+    (8, 21, 34, 48, 61),
+    (9, 22, 36, 49, 62),
+    (10, 24, 37, 50),
+    (12, 25, 38, 52),
+)
+
+#: The full-attention groups, at every 4th index from 3 to 63.
+_O26C_TRITON_GROUPS: tuple[tuple[int, ...], ...] = (
+    (3, 19, 35, 51),
+    (7, 23, 39, 55),
+    (11, 27, 43, 59),
+    (15, 31, 47, 63),
+)
+
+#: The DFlash2 draft's sliding-window layers, which carry no `language_model.`
+#: prefix because they belong to the draft and not to the target.
+_O26C_FLASH_LAYERS: tuple[int, ...] = (64, 65, 66, 67, 68)
+
+
 def _stand_in_attn_groups() -> list[list[_StandInAttentionGroup]]:
-    """The THREE backends #1658 measured resolving at once on this model."""
+    """The THREE backends #1658 measured resolving at once on this model.
+
+    THE SHAPE HERE IS THE MEASURED ONE, and that is the whole point of #1666.
+    This fixture used to return one group per backend over `range(30)`,
+    `range(30, 46)` and `range(64, 69)`; the arbitrary 30 was then lifted out
+    of it into four files as what the leased run had resolved. It had not. The
+    run resolved 48 GDN layers in 10 groups, 16 in 4 and 5 in 1, and those are
+    re-derivable from `candidate_walks[...attn_groups]` in the run's own
+    `c-probe-result.json`. A stand-in is what the next reader copies a count
+    from, so it carries the real census and the real layer names.
+    """
 
     return [
-        [_StandInAttentionGroup("GDNAttentionBackend", [f"model.layers.{i}" for i in range(30)])],
         [
             _StandInAttentionGroup(
-                "TritonAttentionBackend", [f"model.layers.{i}" for i in range(30, 46)]
+                "GDNAttentionBackend",
+                [f"language_model.model.layers.{i}.linear_attn" for i in group],
             )
-        ],
+        ]
+        for group in _O26C_GDN_GROUPS
+    ] + [
         [
             _StandInAttentionGroup(
-                "FlashAttentionBackend", [f"model.layers.{i}" for i in range(64, 69)]
+                "TritonAttentionBackend",
+                [f"language_model.model.layers.{i}.self_attn.attn" for i in group],
             )
-        ],
+        ]
+        for group in _O26C_TRITON_GROUPS
+    ] + [
+        [
+            _StandInAttentionGroup(
+                "FlashAttentionBackend",
+                [f"model.layers.{i}.self_attn.attn" for i in _O26C_FLASH_LAYERS],
+            )
+        ]
     ]
 
 
@@ -2145,9 +2195,12 @@ class CaptureRunTest(unittest.TestCase):
     def test_ONE_SCALAR_UNDER_DESCRIBES_this_model_so_the_MAP_is_recorded_too(self) -> None:
         """#1658: `attn_groups` resolved THREE backends at once on the box.
 
-        30 `linear_attn` layers on `GDNAttentionBackend`, 16 full-attention
-        layers on `TritonAttentionBackend`, and the DFlash2 draft's five
-        sliding-window layers (`model.layers.64-68`) on `FlashAttentionBackend`.
+        48 `linear_attn` layers in 10 groups on `GDNAttentionBackend`, 16
+        `self_attn.attn` layers in 4 groups on `TritonAttentionBackend`, and
+        the DFlash2 draft's five sliding-window layers (`model.layers.64-68`)
+        in one group on `FlashAttentionBackend`. The stand-in below carries
+        that shape because a fixture is what a later reader copies the count
+        from; it read 30/16/5 in one group each until #1666.
         The scalar stays -- it is what the DECLARED denominator is compared
         against and what the golden carries -- and the map is recorded beside
         it, because a run described by one string cannot show which layers ran
@@ -2160,16 +2213,43 @@ class CaptureRunTest(unittest.TestCase):
         self.assertEqual(
             groups["backends"],
             {
-                "GDNAttentionBackend": 30,
+                "GDNAttentionBackend": 48,
                 "TritonAttentionBackend": 16,
                 "FlashAttentionBackend": 5,
             },
         )
+        # THE SUM IS OVER GROUPS, not over one group's length: 15 groups carry
+        # the 69 layers, and eight of the ten GDN groups hold five while two
+        # hold four. The old one-group-per-backend fixture could not tell a
+        # correct sum from a `len()` of the last group it saw.
+        sequence = [entry["backend"] for entry in groups["groups"]]
         self.assertEqual(
-            [entry["backend"] for entry in groups["groups"]],
-            ["GDNAttentionBackend", "TritonAttentionBackend", "FlashAttentionBackend"],
+            sequence,
+            ["GDNAttentionBackend"] * 10
+            + ["TritonAttentionBackend"] * 4
+            + ["FlashAttentionBackend"],
         )
-        self.assertEqual(groups["groups"][2]["layers"][0], "model.layers.64")
+        self.assertEqual(
+            [entry["layer_count"] for entry in groups["groups"]],
+            [5, 5, 5, 5, 5, 5, 5, 5, 4, 4] + [4, 4, 4, 4] + [5],
+        )
+        self.assertEqual(
+            groups["groups"][0]["layers"][0],
+            "language_model.model.layers.0.linear_attn",
+        )
+        self.assertEqual(
+            groups["groups"][10]["layers"][0],
+            "language_model.model.layers.3.self_attn.attn",
+        )
+        self.assertEqual(
+            groups["groups"][14]["layers"][0], "model.layers.64.self_attn.attn"
+        )
+        # Layer names are unique across groups on the measured walk, so the
+        # per-backend sum is also the unique-layer count. A fixture that
+        # repeated a name would let a double-count read as correct.
+        every = [name for entry in groups["groups"] for name in entry["layers"]]
+        self.assertEqual(len(every), 69)
+        self.assertEqual(len(set(every)), 69)
         self.assertNotIn("miss", groups)
         # The SCALAR is unchanged and still the thing that is gated.
         self.assertEqual(record["attention_backend"], "TRITON_ATTN")

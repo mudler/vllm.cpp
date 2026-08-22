@@ -6,7 +6,7 @@
 **Follow-on issue:** [#1628](https://github.com/mudler/vllm.cpp/issues/1628) — the DFlash2 candidate
 selector could not consume a QUANTIZED target `lm_head`, which blocked the only speculative arm
 `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` has. `## Risks/decisions` D14 records the decision, and
-`## Owed` O28/O29/O30 record what it leaves owed.
+`## Owed` O28/O29/O30/O31 record what it leaves owed.
 **In-flow fix:** [#1575](https://github.com/mudler/vllm.cpp/issues/1575) — W5's `tests/vllm/models/test_qwen3_dflash2_gguf.cpp` called `::getpid()` directly instead of the
 portable `tests/support/process_id.h` seam, which held `build-newest-gcc` red on `main` from
 `5702d8f83`. Fixed in flow; not owed.
@@ -2258,10 +2258,16 @@ list items.
 
      **The same run also showed that ONE SCALAR under-describes this model.**
      `...model_runner.attn_groups` resolved three backends at once:
-     `GDNAttentionBackend` over the 30 `linear_attn` layers,
-     `TritonAttentionBackend` over the 16 full-attention layers, and
-     `FlashAttentionBackend` over the DFlash2 draft's five sliding-window layers
-     (`model.layers.64-68`). BOTH are recorded now and only the SCALAR is gated.
+     `GDNAttentionBackend` over 48 `linear_attn` layers in 10 groups,
+     `TritonAttentionBackend` over 16 `self_attn.attn` layers in 4 groups at
+     every 4th index 3-63, and `FlashAttentionBackend` over the DFlash2
+     draft's five sliding-window layers (`model.layers.64-68`) in one group.
+     Those three counts are re-derivable from the run's own
+     `c-probe-result.json` under `candidate_walks`, and this entry read 30
+     for the GDN arm until 2026-08-22: 30 is the shape of the TEST STAND-IN,
+     never a measured count
+     ([#1666](https://github.com/mudler/vllm.cpp/issues/1666)).
+     BOTH are recorded now and only the SCALAR is gated.
      The scalar is what the run declared, what `attention_backend_reasons`
      compares against, and what `test_qwen38_dflash2_spec_decode.cpp` reads off a
      golden; the map is what actually RAN. The map is NOT gated because the two
@@ -2429,6 +2435,14 @@ list items.
   [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. Two arms
   are named-and-refused rather than built.
 
+  **NOT the O28 that [#1657](https://github.com/mudler/vllm.cpp/issues/1657),
+  [#1658](https://github.com/mudler/vllm.cpp/issues/1658),
+  [#1659](https://github.com/mudler/vllm.cpp/issues/1659) and
+  [#1660](https://github.com/mudler/vllm.cpp/issues/1660) name.** Those index
+  rows were written on a branch that authored its entry as O28 while `main`
+  landed this one first; the rows are append-only and cannot be corrected, so
+  the redirect lives here. They mean **O30**.
+
   `LoadDsparkDraft` passes `head_fp4 = nullptr` to `SharedHeadSource::LoadInto`,
   so a DSpark draft off an NVFP4 target still dies at
   `dflash: target tensor lm_head.weight is not BF16 (got U8)`. The reason is
@@ -2460,6 +2474,9 @@ list items.
 
 - **O29 — the packed shared head is gated on CPU only; the CUDA arm and the real
   checkpoint are OWED a measurement.**
+  **Not the entry the `#1657`-`#1660` index rows mean either; see O30.** Those
+  rows say O28, this file's O28 and O29 both belong to the DSpark lane, and the
+  entry they were written for is O30.
   [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. The
   implementer had no GPU (`BENCH-QWEN38-27B-SOTA` held the fleet), so **THIS
   CHANGE'S OWN gates are all CPU**. That is a statement about this row and not
@@ -2614,6 +2631,39 @@ list items.
   3. **`FA_USABLE=0` on sm_12x needs a re-read** before it is quoted again: the
      same run watched the draft's five layers resolve `FlashAttentionBackend`
      and generate tokens. Tracked in #1658.
+  4. **THE GDN COUNT IN THIS ENTRY WAS THE TEST STAND-IN'S, and it read 30
+     until 2026-08-22.** The run resolved 48 `linear_attn` layers in 10 groups,
+     not 30 in 1. 30 was `_stand_in_attn_groups()`'s `range(30)`, generalised
+     into a sentence that four files then carried as a measurement, on the row
+     whose whole history is that failure class. Corrected in the four files and
+     in the fixture, which now carries the measured 10/4/1 group shape and the
+     real layer names, so the next reader lifts the census rather than the
+     stub. The fifth copy is in the `#1658` index row and stays: that file is
+     append-only. Re-derive from `candidate_walks[...attn_groups]` in the run's
+     own `c-probe-result.json`, never from this paragraph.
+     [#1666](https://github.com/mudler/vllm.cpp/issues/1666).
+
+- **O31 — both arms judge the LEGS before the arm record reaches disk, so an
+  ordinary refusal discards a lease.** Owner: `SPEC-DFLASH2`.
+  [#1667](https://github.com/mudler/vllm.cpp/issues/1667), 2026-08-22, filed
+  and deliberately NOT fixed in the flow that found it.
+
+  `require_no_reasons(hook_reasons(...) + leg_reasons(...))` sits after the
+  clock window and before the record is written, in `capture()` on the oracle
+  arm and in `main()` on ours. One prompt returning 63 completion tokens
+  instead of the asked 64 therefore takes `records`, `blocks`,
+  `output_token_ids` and the O26 provenance with it, after about two hours of
+  lease. Driving the existing `OurArmRunEntryPointTest` fixture at
+  `completion = 63` prints `arm JSON on disk: ABSENT` against the control run's
+  `PRESENT`.
+
+  It is a separate defect from #1657 and not a regression of it. #1657 moved
+  the CLOCK judgement after the write on exactly this reasoning, and both arms
+  carry the comment saying so; that guarantee is scoped to the clock and says
+  nothing about the leg and hook checks. `git log -S` places both call sites at
+  `208559a79` (#1653), which predates #1657 and predates the branch that found
+  it. The repair changes the refusal ordering of both arms and wants its own
+  red-first test per arm, which is why it is owed rather than taken here.
 
 ## Now
 
@@ -3333,7 +3383,7 @@ the `Owed after W5` line above, which this line supersedes), O12 (the probabilis
 three output-scalar GGUF key spellings), O21 (now a MERGED upstream, #1538 and
 #1561), O22/O23 (HALF discharged 2026-08-21: the instrument is committed, the
 run is not taken -- attempted 2026-08-22 and it measured the instrument, see
-O30), O26, O27, O28, O29 and O30. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
+O30), O26, O27, O28, O29, O30 and O31. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
 discharged.
 
 **And five things this row owes that W6 did not name**, all opened by the repair

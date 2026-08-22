@@ -72,6 +72,17 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   // plain rope, untied lm_head) — every op already registered, no new kernel.
   CHECK(p.supports_model_architecture("MistralForCausalLM"));
   CHECK_FALSE(p.supports_model_architecture("LlamaForCausalLM"));
+  // Capture decline (tenstorrent.cpp's support_static_graph_mode): host-free
+  // decode AND an explicit VT_TT_DECODE_CAPTURE opt-in — capture hangs
+  // deterministically on multi-request decode (#1625), so it is declined by
+  // default. These CHECKs go RED if the conjunct is dropped. The env is read
+  // live per call (HostFreeDecodeEnabled's no-caching contract,
+  // tenstorrent_device.h), so re-resolving after setenv/unsetenv proves that.
+  CHECK_FALSE(p.support_static_graph_mode());
+  ::setenv("VT_TT_DECODE_CAPTURE", "1", 1);  // opt-in arm
+  CHECK(vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT).support_static_graph_mode());
+  ::unsetenv("VT_TT_DECODE_CAPTURE");  // restore the default; nothing is cached
+  CHECK_FALSE(vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT).support_static_graph_mode());
 }
 
 TEST_CASE("kTENSTORRENT kMatmul matches a host F32 reference") {
@@ -589,7 +600,7 @@ TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference (small)")
   // PreferDeviceRope to the device BF16 path even at small T*H and reds the
   // bit-exact checks — so the case owns its own default-path env, mirroring
   // the inertness-guard case below.
-  ::unsetenv("VT_TT_HOST_FREE_DECODE");
+  ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1);  // opt-out path
   REQUIRE(vt::OpRegistered(vt::OpId::kRopeNeox, DeviceType::kTENSTORRENT));
 
   constexpr int64_t T = 4, Hq = 2, Hk = 1, Dh = 8, Rot = 8;
@@ -1543,7 +1554,7 @@ TEST_CASE("kTENSTORRENT host-free helpers decline by default (inertness guard)")
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
   }
-  ::unsetenv("VT_TT_HOST_FREE_DECODE");  // the guard is about the UNSET case
+  ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1);  // opt-out path; the guard is about the OPT-OUT case
   Backend& backend = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
 
   // Two same-shaped outputs, each given a current device shadow by a device

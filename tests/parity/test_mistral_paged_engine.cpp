@@ -99,7 +99,7 @@ const int32_t* AsI32(const parity::NpyArray& a) {
 }
 
 void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
-             const char* label) {
+             const std::string& label) {
   const std::string snap = FindSnapshot(repo_dir);
   if (snap.empty()) {
     MESSAGE(label << " checkpoint absent; skipping (dgx-only) — " << repo_dir
@@ -285,7 +285,12 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     int first_div = -1;
     for (int64_t j = 0; j < T; ++j)
       if (got[static_cast<size_t>(j)] != od[i * T + j]) { first_div = static_cast<int>(j); break; }
-    REQUIRE_MESSAGE(first_div < 0,
+    // RE-CAPTURE MODE. VT_DUMP_IDS replaces the anchor, so skip the hard
+    // REQUIRE — the dump + teacher-forced re-adjudication rebuild the pair
+    // (same mode the Qwen3 gate grew for #1488; Mistral needs it for the R5
+    // default flip, #1604).
+    const bool anchor_ok = dump || first_div < 0;
+    REQUIRE_MESSAGE(anchor_ok,
                     label << " anchor drift prompt[" << i << "] tok=" << first_div
                     << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
                     << " committed anchor=" << (first_div < 0 ? -1 : od[i * T + first_div])

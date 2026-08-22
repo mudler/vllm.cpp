@@ -427,6 +427,24 @@ class SupportSurfaces(unittest.TestCase):
         """`landing_page` never demands the README, and #1520 does not add one."""
         self.assertEqual(self.errors(["docs/QUICKSTART.md"]), [])
 
+    def test_the_c_abi_header_is_a_landing_source(self):
+        """#1655: the README quotes `VLLM_ABI_VERSION` out of include/vllm.h.
+
+        Every other member of the set is something the README QUOTES. This one
+        is too, and it was the only such source missing -- which made the ABI
+        claim unrepairable BY the change that invalidates it, so the README sat
+        two versions stale (`21` against the header's `23`) with no legal edit
+        that could fix it. `include/vllm.h` still owes docs/USAGE.md, which is
+        why that page is in the change set here.
+        """
+        self.assertEqual(
+            self.errors(["README.md", "include/vllm.h", "docs/USAGE.md"]), []
+        )
+
+    def test_the_c_abi_header_permits_but_does_not_demand_readme(self):
+        """Admitting it must not turn every ABI change into README churn."""
+        self.assertEqual(self.errors(["include/vllm.h", "docs/USAGE.md"]), [])
+
     def test_an_unrelated_document_never_licenses_readme_churn(self):
         """The property #1520 must not break, stated on a NON-projection doc.
 

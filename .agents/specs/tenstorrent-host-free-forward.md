@@ -163,6 +163,81 @@ verifies capture no longer aborts, and measures replay tok/s vs eager.
 (the current hybrid eager baseline) — this is the payoff that justifies
 all four rows.
 
+### R5 — Make host-free decode the default ([#1604](https://github.com/mudler/vllm.cpp/issues/1604))
+
+**Problem.** R1-R3b and item 5 landed env-gated, and the row's own bar for
+the flip is met: the golden re-adjudication landed (#1488 / #1514), and the
+same-binary A/B (2026-08-21, P150, head `8399d6121`, batch 1, greedy, warm
+legs under one lock) measured 5.1×/5.2× — Qwen3-0.6B 27.1 vs 5.34 tok/s,
+Mistral-7B 12.2–13.8 vs 2.35 tok/s. The default path is now the slow one.
+
+**Scope (one change, per #1604).**
+
+1. Default ON through one helper, `vt::tenstorrent::HostFreeDecodeEnabled()`:
+   unset or any value except `"0"` → on, exactly `"0"` → off — the
+   `vt::GraphCaptureEnabled()` idiom (`src/vt/breakable_graph.cpp:65-71`),
+   but deliberately NOT cached (tests toggle the env per case in one
+   process). Every `std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr` site
+   moves to it (~17 in `tenstorrent_ops.cpp` plus
+   `TenstorrentPlatform::support_static_graph_mode()`). The env var survives
+   as the A/B opt-out: `VT_TT_HOST_FREE_DECODE=0` reproduces the pre-flip
+   default path exactly.
+2. **Capture stays declined by default on TT** (measured stop-condition,
+   below): `support_static_graph_mode()` additionally requires the explicit
+   investigation opt-in `VT_TT_DECODE_CAPTURE`. The captured 27.1 tok/s arm
+   is reachable under that env for single-request A/B; flipping THIS default
+   is owned by the capture-hang issue.
+3. Both device golden pairs go stale the moment the default flips, so both
+   are re-captured and re-adjudicated in the same change:
+   `qwen3_greedy_0_6b` (refreshed by #1514) and `mistral_greedy_7b`
+   (captured 2026-08-12), via `VT_DUMP_IDS` +
+   `qwen3-neartie-gap-transformers.py` — the #1488 method, dumped from the
+   NEW default (host-free eager) arm. On the post-#1514 main (`52e328789`)
+   the flag already anchor-reds the Qwen3 gate fast (prompt[0] tok=1
+   engine=14746 vs committed anchor=13); that red is this staleness, not a
+   defect claim; the adjudication decides.
+4. Concurrency coverage under the new default: both paged-engine gates run
+   multi-request and must complete green; the async-serving battery
+   (`test_qwen3_dense_async_serving`) runs on TT if its harness selects the
+   device — **measured outcome (2026-08-21, P150): 3 FATAL / 5
+   checkpoint-absent skip, pre-existing and orthogonal to this flip** — the
+   TT backend never advertised async sampled-token readback, so async
+   scheduling resolves OFF regardless of decode mode
+   ([#1627](https://github.com/mudler/vllm.cpp/issues/1627), under
+   `## Owed`); the two flag-pinned default-path cases in
+   `test_tenstorrent_backend.cpp` (small-T `kRopeNeox` bit-exact; host-free
+   helper inertness) move from `::unsetenv` to `VT_TT_HOST_FREE_DECODE=0`,
+   and their meaning becomes "the opt-out path declines". The
+   `VT_TT_RECAPTURE_EVERY=8` re-seed arm and the batch-size refusal
+   (`VT_CHECK` in `WarmDecodePos`/`WarmPaMeta`/`WarmRacIdx`) keep their
+   existing coverage (capture opt-in arms).
+5. Records: `docs/BENCHMARKS.md` rows + `.agents/benchmark-record.md` legs
+   for the new default vs `=0` on both models, host-free eager (the new
+   default), and the captured opt-in single-request leg.
+
+**Measured on the flip tree (2026-08-21, P150, `b86e3705f`):** captured
+multi-request decode hangs deterministically — the 16-prompt gate stalls
+~10 s into stepping with one tt-metal worker spinning at 100% and the main
+thread blocked, both with the plain default and with
+`VT_TT_RECAPTURE_EVERY=8`; single-request captured legs (the 27.1 tok/s A/B,
+the 80-token gate) never hit it. Host-free EAGER completes the same gate in
+35 s (125/125 assertions) and measures 10.94/10.95/11.06 tok/s warm
+(Qwen3-0.6B, batch 1, greedy, `--repeat 4`, leg 1 discarded — JIT) vs the
+5.34 pre-flip default: a 2.1× default win that does not hang. The captured
+5.1× arm is one hang fix away.
+
+**Gates.** Both paged-engine gates green under the NEW default on the
+refreshed pairs; re-adjudication max gap within the 500-mnat band, zero
+cells outside top-K (the #1488 bars); `test_tenstorrent_backend` green with
+and without an ambient opt-out; the A/B re-run on the flip tree showing the
+default leg at the host-free eager rate.
+
+**Stop conditions.** A non-near-tie divergence under the new default stops
+the flip and becomes the work. A hang or a refusal firing on an ordinary
+serving dynamic stops the flip until that path is fixed or refuses loudly —
+the captured-arm hang is held out of the default by scope item 2 and owned
+by its issue; #1105's `DecodePosCache` identity fix stays owed.
+
 ## Dependencies
 
 ```
@@ -251,6 +326,39 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **No case pins `HostFreeDecodeEnabled()`'s no-caching contract on the RAC
+  path ([#1688](https://github.com/mudler/vllm.cpp/issues/1688)).** The R5
+  fresh review found `ReshapeAndCacheKernel` still latching the flag in a
+  function-local `static`, which after the default flip cached ON and stripped
+  `VT_TT_HOST_FREE_DECODE=0` of its effect on that path for the rest of the
+  process. The latch is FIXED IN FLOW (live read, matching every other
+  converted site), but no test reds on it: `ReshapeAndCacheKernel` needs a real
+  Blackhole device, so every case that reaches it sits behind
+  `TenstorrentPresent()` and skips on every host in the `rc` fleet. Closing it
+  means a `thalia` case that drives the RAC path twice across a
+  `setenv`/`unsetenv` of the flag and asserts the second call takes the other
+  branch — the same shape the flip already used for
+  `support_static_graph_mode`, which could be written host-side because the
+  platform accessor needs no card.
+- **Captured multi-request decode hangs ([#1625](https://github.com/mudler/vllm.cpp/issues/1625)).**
+  Measured on the R5 flip tree: the 16-prompt gate hangs ~10 s into stepping
+  under captured decode, with `VT_TT_RECAPTURE_EVERY=8` alike, while
+  host-free eager completes in 35 s (11.0 tok/s warm). R5 therefore ships
+  `support_static_graph_mode()` declined by default (opt-in
+  `VT_TT_DECODE_CAPTURE`); the captured 27.1 tok/s arm stays one hang fix
+  away, and that fix owns flipping this default back.
+- **TT never advertises async sampled-token readback
+  ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)).** The
+  async-serving battery FATALs on TT at its anti-vacuous-pass guard
+  (`REQUIRE(loaded->async_scheduling_enabled())`,
+  `test_qwen3_dense_async_serving.cpp:124`) for every cached checkpoint —
+  3 FATAL / 5 checkpoint-absent skip on the P150 — because
+  `vt::Backend::SupportsAsyncSampledTokenReadback()` has no TT override, so
+  async scheduling resolves OFF (`max_concurrent_batches=1`). Pre-existing at
+  base `52e328789` (zero hits under `src/vt/tenstorrent/`) and orthogonal to
+  the decode-mode flip; enabling it needs a device-mirrored sampled-id design
+  (the CUDA `async_device_mirror` equivalent against the tt-metal allocator)
+  and owns the battery going green on TT.
 - **`DecodePosCache` is keyed on bare `num_reqs`, with no engine, queue or device
   identity, and is never cleared.** Two engine instances in one process at the same
   padded batch size therefore share one `cur_pos` device tensor: the second engine's
@@ -406,3 +514,22 @@ Next: operator rerun of the 80-token captured-vs-eager gate and
 `test_qwen3_paged_engine` on card; the paged-engine golden re-adjudication is
 done ([#1488](https://github.com/mudler/vllm.cpp/issues/1488) closed by the
 stacked golden-refresh commit on this branch).
+
+#1498 and #1514 merged (2026-08-21, `d27639e71` / `49c64bbc8`), closing the
+row's recorded prerequisites for the flip. R5 is now `ACTIVE` on
+`row/BACKEND-TENSTORRENT-HOST-FREE-1604` from main `52e328789`. The
+under-flag reproduction on that base (2026-08-21) is recorded under R5 scope
+item 2: fast anchor red, no timeout.
+
+**R5 implemented and gated on the branch (2026-08-21, commits `fdedfee12`
+spec, `b86e3705f` flip, `f85492992` capture-decline #1625, `9a7d9f4d4`
+golden refresh #1626/#1627).** All R5 gates green on the P150: both
+paged-engine gates 16/16 under the NEW default on the refreshed pairs
+(Qwen3 125/125 assertions, max gap 0.375 nats; Mistral 128/128 assertions,
+max gap 0.25 nats, 0 forward-divergent both, Mistral exit-139 is the #1486
+teardown class after the doctest SUCCESS); re-adjudication max gaps 375
+(Qwen3) / 250 (Mistral) mnats, zero cells outside top-K;
+`test_tenstorrent_backend` 23/23 + 831/831 with and without an ambient
+opt-out; default leg 10.94/10.95/11.06 tok/s vs the 5.34 opt-out (2.1x,
+same-binary A/B). The async-serving battery outcome is pre-existing and
+filed (#1627, under `## Owed`). Pending: fresh review, PR, operator merge.

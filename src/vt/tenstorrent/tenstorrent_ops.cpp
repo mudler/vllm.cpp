@@ -353,7 +353,7 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   EnsureHost(t);
   const auto host = ToHostF32(t);
   ttnn::Tensor dev = UploadRows(host.data(), rows, cols, device);
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr) {
+  if (HostFreeDecodeEnabled()) {
     // Prime the persistent-zero cache for this spec during the eager warmup
     // (capture-safe zeroing replays ttnn::copy(zero, dst) — see MemsetDevice).
     ZeroCachePrime(ttnn::Shape({rows, cols}), ttnn::DataType::BFLOAT16,
@@ -1250,10 +1250,9 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
   constexpr uint32_t kDeviceResidualMinRows = 32;
   // HOST-FREE-FORWARD R1: force the residual merge + RMS device path at T=1 when
   // capture is desired (ttnn trace prohibits host ops in the captured region).
-  // Opt-in via VT_TT_HOST_FREE_DECODE; inert by default (keeps the 12.5 tok/s
-  // hybrid baseline). Numerics proven by BACKEND-TENSTORRENT-RESIDUAL-GOLDEN.
-  const bool host_free_decode =
-      std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  // Default ON since the R5 flip; VT_TT_HOST_FREE_DECODE=0 opts out (the
+  // pre-flip default). Numerics proven by BACKEND-TENSTORRENT-RESIDUAL-GOLDEN.
+  const bool host_free_decode = HostFreeDecodeEnabled();
   const bool host_residual = !host_free_decode &&
       (args.gemma || (residual != nullptr && rows < kDeviceResidualMinRows));
   if (host_residual) {
@@ -1611,7 +1610,7 @@ void RopeApplyHost(Tensor& qs, Tensor* ks, const float* cos_t, const float* sin_
 // (measured regression when always-device-for-resident was forced).
 inline bool PreferDeviceRope(int64_t tokens, int64_t heads) {
   // HOST-FREE-FORWARD R1: force device RoPE at T=1 for capture (see RmsNorm note).
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr) return true;
+  if (HostFreeDecodeEnabled()) return true;
   return tokens * heads >= 64;
 }
 
@@ -2128,8 +2127,10 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   // straight into paged_update_cache with persistent idx/page-table tensors.
   // Conditions: capturing (or host-free flag), all inputs device-shadowed,
   // TILE-legal dims, and the warm hook already staged the idx tensors.
-  static const bool host_free_rac =
-      std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  // Live read, NOT a function-local static: a latch here would cache the
+  // now-default-ON value and silently strip VT_TT_HOST_FREE_DECODE=0 of its
+  // effect on this path for the rest of the process (#1688).
+  const bool host_free_rac = HostFreeDecodeEnabled();
   if (host_free_rac || tt_capture_active()) {
     if (TryReshapeAndCacheDeviceDecode(k, v, k_cache, v_cache, slot_mapping)) {
       return;
@@ -3371,7 +3372,7 @@ std::mutex& DecodeIdsMutex() {
 }  // namespace
 
 void WarmDecodeIds(const int32_t* ids, int64_t n) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   if (ids == nullptr || n < 1) return;
   MeshDevice& device = SharedMeshDevice();
   std::vector<uint32_t> host(static_cast<size_t>(n));
@@ -3546,7 +3547,7 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src) {
   // test_tenstorrent_backend unsets the env mid-process and must observe the
   // decline, and a suite run under an ambient flag must not pin the armed
   // behavior for cases that unset it.
-  const bool host_free = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  const bool host_free = HostFreeDecodeEnabled();
   if (!tt_capture_active() && !host_free) return false;
   static bool once = [&] {
     // Enable program cache once on the first host-free path use — ttnn trace
@@ -3592,7 +3593,7 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src) {
 // existing device shadow's numel (zeros is the only value the forward uses).
 bool MemsetDeviceIfCapture(void* p, int value) {
   // Live read for the same reason as CopyDeviceDeviceIfCapture above.
-  const bool host_free = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  const bool host_free = HostFreeDecodeEnabled();
   if (!tt_capture_active() && !host_free) return false;
   if (value != 0) return false;  // only zero-fill is handled on-device
   // Need an existing shadow to know shape/dtype; or allocate from the slot.
@@ -3640,7 +3641,7 @@ bool MemsetDeviceIfCapture(void* p, int value) {
 // hq/hk select the expanded layouts to warm; base/args must match RopeNeox.
 void WarmRopeCosSin(const int32_t* positions, int64_t tokens, int64_t hq,
                     int64_t hk, int64_t rot, double base) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   MeshDevice& device = SharedMeshDevice();
   std::vector<float> cos_t, sin_t;
   Tensor pos = Tensor::Contiguous(const_cast<int32_t*>(positions), DType::kI32,
@@ -3710,7 +3711,7 @@ void WarmPagedKvShadow(void* k_cache_data, void* v_cache_data,
                       int64_t num_blocks, int64_t block_size,
                       int64_t num_kv_heads, int64_t head_size,
                       int64_t used_blocks) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   if (num_blocks < 1 || block_size < 1 || used_blocks < 1) return;
   MeshDevice& device = SharedMeshDevice();
   auto warm_one = [&](void* data) {
@@ -3737,7 +3738,7 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
                 int64_t num_slots, int64_t block_size,
                 const int32_t* block_table, int64_t block_table_cols,
                 const int32_t* seq_lens) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
     std::fprintf(stderr, "[TT-TRACE] WarmRacIdx n=%lld bs=%lld slot0=%lld sl0=%d\n",
                  (long long)num_slots, (long long)block_size, (long long)slots[0],
@@ -3746,7 +3747,7 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
   // after the first capture (stale idx/page-table on device, numerically
   // wrong, mechanics test only).
   if (ReplayRegimeBisectSkip("VT_TT_NO_IDX_WARM")) return;
-  const bool r2_steady = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr
+  const bool r2_steady = HostFreeDecodeEnabled()
                          && GraphCapturesDone() > 0;
   if (num_slots < 1) return;
   MeshDevice& device = SharedMeshDevice();
@@ -3819,7 +3820,7 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
     // num_slots == num_reqs). plus_one on cur_pos then advances update_idxs
     // too, eliminating the per-replay update_idxs copy_to_device (toxic class).
     bool aliased = false;
-    if (std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr) {
+    if (HostFreeDecodeEnabled()) {
       std::lock_guard<std::mutex> dg(DecodePosMutex());
       auto dit = DecodePosCache().find(num_slots);
       if (dit != DecodePosCache().end() && dit->second.allocated) {
@@ -3932,7 +3933,7 @@ void WarmRacIdx(const void* /*slot_mapping_owner*/, const int64_t* slots,
 void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks,
                 int64_t bt_row_stride, int64_t bt_col_stride,
                 const int32_t* seq_lens) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   if (num_reqs < 1) return;
   MeshDevice& device = SharedMeshDevice();
   std::vector<int32_t> pt(static_cast<size_t>(num_reqs * max_blocks));
@@ -3950,7 +3951,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
   const auto key = std::make_pair(num_reqs, max_blocks);
   // VT_TT_NO_IDX_WARM: legacy bisection override (skip ALL per-step copies).
   if (ReplayRegimeBisectSkip("VT_TT_NO_IDX_WARM")) return;
-  const bool r2_steady = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr
+  const bool r2_steady = HostFreeDecodeEnabled()
                          && GraphCapturesDone() > 0;
   // R2 steady state: cur_pos/update_idxs advance on-device (plus_one); only
   // page_table needs a host refresh, and only when it actually changed (block
@@ -3971,7 +3972,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
     // sdpa_decode reads this tensor; plus_one advances it → no per-replay
     // copy_to_device (the toxic ~38-replay hang class).
     bool aliased = false;
-    if (std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr) {
+    if (HostFreeDecodeEnabled()) {
       std::lock_guard<std::mutex> dg(DecodePosMutex());
       auto dit = DecodePosCache().find(num_reqs);
       if (dit != DecodePosCache().end() && dit->second.allocated) {
@@ -4017,7 +4018,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
 // plus_one program (program cache) so CaptureDecodePosAdvance can run inside
 // the trace. Called on the capture/warm step (re-seed), NOT every replay.
 void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   if (num_reqs < 1 || seq_lens == nullptr) return;
   // Replay regime: cur_pos advances on-device by the captured plus_one —
   // re-seeding here would overwrite the advance and break correctness.
@@ -4077,7 +4078,7 @@ void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime
 // replay sees cur_pos+1. Must be called INSIDE BeginCapture/EndCapture, after
 // all reads of cur_pos (sdpa_decode / paged_update_cache) in the body.
 void CaptureDecodePosAdvance(int64_t num_reqs) {
-  if (std::getenv("VT_TT_HOST_FREE_DECODE") == nullptr) return;
+  if (!HostFreeDecodeEnabled()) return;
   std::lock_guard<std::mutex> g(DecodePosMutex());
   auto it = DecodePosCache().find(num_reqs);
   if (it == DecodePosCache().end() || !it->second.allocated) {

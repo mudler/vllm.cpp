@@ -27430,3 +27430,72 @@ median of three rounds, 0.34977 → 0.29552 s, **1.18x**.
 **Nothing regresses**, against the unconditional arm's 0.82x and 0.89x on the
 same two b0 shapes. `conv_out`'s `user/wall` goes from **1.00 to 12.26** — the
 `rows == 1` inline path being reached for the first time.
+---
+
+## TT host-free decode DEFAULT FLIP: both golden pairs re-adjudicated under the new default and the default-rate A/B taken (#1604) (2026-08-21, `row/BACKEND-TENSTORRENT-HOST-FREE-1604`, P150 `thalia`)
+
+Row `BACKEND-TENSTORRENT-HOST-FREE-FORWARD` R5. Base `52e328789` (post-#1514
+main); flip commit `b86e3705f`, capture-decline `f85492992`, golden refresh
+`9a7d9f4d4`. TT Release build against
+`/home/lu_zero/Sources/tt/tt-metal/build_Release`, `-j $(nproc)`, GPU work under
+`flock ${GPU_LOCK:-$HOME/gpu.lock}`.
+
+**The flip.** `HostFreeDecodeEnabled()` (`include/vt/tenstorrent/tenstorrent_device.h`)
+centralizes the polarity — unset or any spelling other than exact `0` is ON,
+`0` is the pre-flip host-hybrid opt-out — and the 17 `getenv` sites in
+`src/vt/tenstorrent/tenstorrent_ops.cpp` route through it. Deliberately not
+cached (unlike the `GraphCaptureEnabled` static idiom): the unit tests toggle
+the env per case. `support_static_graph_mode()` additionally requires the
+opt-in `VT_TT_DECODE_CAPTURE`.
+
+**Why capture is declined (#1625).** Captured multi-request decode hangs
+deterministically — the 16-prompt Qwen3 gate stalls ~10 s into stepping, one
+tt-metal worker at 100%, main thread blocked; identical under
+`VT_TT_RECAPTURE_EVERY=8`; the last device line is the allocator's "Allocating
+device buffers is unsafe due to the existence of an active trace"
+(allocator.cpp:123). Single-request captured legs never hang (27.1 tok/s A/B).
+Host-free EAGER completes the same gate in 35 s.
+
+**Re-adjudication (the #1488 method, `VT_DUMP_IDS` from the NEW default arm +
+`scripts/qwen3-neartie-gap-transformers.py`, transformers 4.57.1 torch-cpu in
+`/tmp/tt1604-venv`).** Both pairs re-dumped and re-adjudicated within the
+500-mnat band, zero cells outside top-K:
+
+- `qwen3_greedy_0_6b`: max gap **375 mnats** — the same band the pair already
+  carried under #1488. Drift vs the old (captured-default) anchor: 64/256
+  cells. Gate re-run on the refreshed pair: **16/16 green, 125/125
+  assertions**, max gap 0.375 nats, 0 forward-divergent.
+- `mistral_greedy_7b`: max gap **250 mnats**; 36 divergent cells, every one a
+  near-tie where the transformers teacher's argmax agrees with ours. Drift vs
+  the 2026-08-12 anchor: anchor-red by prompt[3]. Gate re-run on the refreshed
+  pair (this change's build): **16/16 green, 128/128 assertions** — STRICT
+  token-exact vs vLLM greedy 11/16, near-tie-band 5/16, max gap 0.25 nats,
+  0 forward-divergent, backend proof kMatmul 256 / kPagedAttention 8192
+  selections, 0 declines. Exit 139 AFTER the doctest SUCCESS summary is the
+  #1486 teardown class (same `GraphTracker::is_enabled` ->
+  `ttnn::Tensor::deallocate_impl` -> `~Tensor` stack), not a gate failure.
+
+**Default-rate A/B (Qwen3-0.6B, batch 1, greedy, `--repeat 4`, leg 1 discarded
+— JIT):** host-free eager default **10.94 / 10.95 / 11.06 tok/s** warm vs the
+`VT_TT_HOST_FREE_DECODE=0` opt-out **5.34 tok/s** — a **2.1x default-leg win**
+that does not hang. The captured arm's 5.1x remains one hang fix away (#1625).
+No vLLM ratio exists or can: vLLM has no Tenstorrent backend (tt-forge is the
+secondary oracle lane, `.agents/oracles/tt-forge.md`).
+
+**Async-serving battery on TT (#1627, pre-existing, out of scope).**
+`test_qwen3_dense_async_serving`: 3 FATAL (every cached checkpoint: Qwen3-0.6B,
+Mistral-7B) / 5 checkpoint-absent skip. Mechanism: no TT override of
+`vt::Backend::SupportsAsyncSampledTokenReadback()` (`backend.h:186` default
+false; only CPU `cpu_backend.cpp:38` and CUDA override), so
+`runner_supports_async()` is false, async scheduling resolves OFF
+(`max_concurrent_batches=1`) and the battery's anti-vacuous-pass REQUIRE fires.
+Zero hits under `src/vt/tenstorrent/` at base `52e328789`; the flip commits
+touch none of that path. Filed as #1627 with ownership recorded in the spec's
+`## Owed`.
+
+**Unit gates:** `test_tenstorrent_backend` 23/23 + 831/831 green with and
+without an ambient opt-out; the two default-path cases now pin
+`VT_TT_HOST_FREE_DECODE=0` and assert the opt-out path. Preflight green except
+the documented pre-existing aarch64 `test_release_metadata` (#1487); the
+env-doc red this wave introduced (`VT_TT_DECODE_CAPTURE` undocumented) is
+fixed in the same change (`docs/ENVIRONMENT.md` row + sibling polarity update).

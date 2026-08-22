@@ -38,7 +38,7 @@ open gaps that a plausible-looking number would close on paper only.
         --speculative-config '{"model":"/workspace/dflash2/draft.gguf","num_speculative_tokens":7}' \\
         --repeat 5 --max-tokens 64 \\
         --artifact target=/workspace/dflash2/target.gguf=<sha256> \\
-        --lease-id "$RC_LEASE_ID" --our-revision "$(git rev-parse HEAD)" \\
+        --lease-id "$RC_JOB_ID" --our-revision "$(git rev-parse HEAD)" \\
         --our-build-recipe "cmake --preset cuda-release" \\
         --clock-summary evidence/clock-ours.json \\
         --output evidence/our-arm.json
@@ -58,8 +58,11 @@ from typing import Any
 
 from tools.bench.dflash2_oracle_capture import (
     PROMPTS,
-    _load_clock,
+    ClockWindow,
     _parse_artifact,
+    add_clock_arguments,
+    clock_evidence_reasons,
+    clock_window,
     sample_compute_processes,
 )
 from tools.bench.dflash2_speed_harness import (
@@ -208,18 +211,33 @@ def warm_leg_spans(legs: Sequence[Mapping[str, Any]]) -> list[tuple[float, float
 
 
 def spanned_clock(
-    args: argparse.Namespace, legs: Sequence[Mapping[str, Any]]
+    window: ClockWindow, legs: Sequence[Mapping[str, Any]]
 ) -> tuple[dict[str, Any] | None, str | None]:
     """This arm's clock record, restricted to the warm legs it folded.
 
-    Returns `(record, error)`. A failure is RETURNED rather than raised because
-    the legs already cost a lease by the time it can happen, and the caller
-    writes the arm record before it judges the clock. Nothing quotable is
-    printed either way: `clock_state_reasons` refuses a `None` record.
+    READ FROM THE WINDOW THE ARM OWNS. `ClockWindow` starts the sampler after
+    the precheck and stops it after the last leg (#1657), so `window.samples` is
+    the stream that sampler wrote and nothing else could have written it. It is
+    read AFTER the `with` block, and by then `ClockWindow.close` has signalled
+    the sampler and waited for the process to exit -- so the file is complete
+    and closed, which is strictly stronger than the per-line flush
+    `read_sample_stream` tolerates a partial tail for.
+
+    `(None, None)` when NO sampler ran, which is what `--clock-summary` unset
+    means. That is not a spanning failure and gets no message of its own:
+    `clock_state_reasons` already refuses a `None` record with the words that
+    name it.
+
+    Otherwise returns `(record, error)`. A failure is RETURNED rather than
+    raised because the legs already cost a lease by the time it can happen, and
+    the caller writes the arm record before it judges the clock. Nothing
+    quotable is printed either way.
     """
 
+    if window.samples is None:
+        return None, None
     try:
-        stream = read_sample_stream(args.clock_samples)
+        stream = read_sample_stream(window.samples)
         boot = read_boot_id()
         return (
             build_spanned_clock_record(stream, warm_leg_spans(legs), boot_id=boot),
@@ -289,16 +307,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-id", default="")
     parser.add_argument("--our-revision", default="")
     parser.add_argument("--our-build-recipe", default="")
-    parser.add_argument("--clock-summary", type=pathlib.Path)
-    parser.add_argument(
-        "--clock-samples",
-        type=pathlib.Path,
-        help="the sampler's RAW per-sample stream (`gpu_clock_state sample "
-        "--output`). Given it, this arm builds its clock record from the samples "
-        "inside the WARM LEG SPANS `vllm-cli` marked, rather than from a summary "
-        "over the whole process lifetime -- which on 2026-08-22 was 18.37% busy "
-        "and refused, correctly (#1671)",
-    )
+    # BOTH clock paths come from here. `--clock-samples` is where THIS arm's
+    # own sampler writes its raw stream, and it is also what the arm reads back
+    # to restrict the window to its warm legs (#1671) -- one path, one file, no
+    # second spelling of the same flag.
+    add_clock_arguments(parser)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--precheck-only", action="store_true")
     parser.add_argument("--assume-compute-processes", type=json.loads, default=None)
@@ -338,6 +351,7 @@ def precheck(args: argparse.Namespace, env: Mapping[str, str]) -> dict[str, Any]
     reasons += model_binding_reasons(models, artifacts, label="ours")
     reasons += repeat_reasons(args.repeat, label="ours")
     reasons += build_recipe_reasons(build, label="ours")
+    reasons += clock_evidence_reasons(args, label="ours")
     reasons += spec_reasons
     require_no_reasons(reasons, what="DFlash2 our-arm capture")
     return {
@@ -371,40 +385,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(canonical_json({"precheck": "PASS", **checked}))
         return 0
 
-    # THE WINDOW IS THE WORK, NOT THE PROCESS (#1671). With `--clock-samples`
-    # the record is built AFTER the legs, from the samples inside the spans
-    # `vllm-cli` marked, so the four checkpoint reads this arm pays are outside
-    # it. Without it the old whole-window summary is read first, unchanged --
-    # that path is not laxer, it is the one that refused, and it stays readable
-    # so an archived evidence tree still summarizes.
-    clock: dict[str, Any] | None = None
-    clock_error: str | None = None
-    if args.clock_samples is None:
-        clock = _load_clock(args.clock_summary)
-        require_no_reasons(
-            clock_state_reasons(clock, label="ours"), what="DFlash2 our-arm capture"
-        )
-
+    # THE ARM OWNS ITS WINDOW (#1657), AND THE WINDOW IS THE WORK (#1671).
+    # Two repairs, one path, and neither is optional.
+    #
+    # `ClockWindow` starts the sampler HERE rather than in the shell, because
+    # `gpu_clock_state` writes its summary when the sampler STOPS: an arm handed
+    # a summary before it ran could never read one. It also waits for the first
+    # sample, so no leg runs outside the window, and it keeps a stop failure in
+    # `close_error` instead of raising it over legs that already cost a lease.
+    #
+    # The record this arm is JUDGED on is then built from the samples inside the
+    # WARM LEG SPANS `vllm-cli` marked, not from the sampler's whole-process
+    # summary. Unlike the oracle arm, ours is one `vllm-cli` process per prompt
+    # and each one loads its own checkpoint, so the sampler's window necessarily
+    # spans four loads: on 2026-08-22 that was 3222 s sampled against 93 s of
+    # warm generation, 18.37% busy, and `clock_reasons` refused it -- correctly.
+    # Spanning is not a relaxation of that floor. `build_spanned_clock_record`
+    # runs `build_clock_record` over a smaller and truer set of samples and
+    # `clock_reasons` judges the result unchanged.
     legs: list[dict[str, Any]] = []
-    for prompt in checked["prompts"]:
-        # NOT `parse_legs`. A leg with no boundary marker is a refusal, because
-        # the clock window is built out of those boundaries and a leg that
-        # cannot be placed in time would shrink it silently.
-        legs += legs_with_spans(run_binary(args, prompt))
+    window = clock_window(args)
+    with window:
+        for prompt in checked["prompts"]:
+            # NOT `parse_legs`. A leg with no boundary marker is a refusal,
+            # because the window is built out of those boundaries and a leg that
+            # cannot be placed in time would shrink it silently.
+            legs += legs_with_spans(run_binary(args, prompt))
     require_no_reasons(
         leg_reasons(legs, max_tokens=args.max_tokens), what="DFlash2 our-arm capture"
     )
 
-    if args.clock_samples is not None:
-        clock, clock_error = spanned_clock(args, legs)
-
+    clock, span_error = spanned_clock(window, legs)
+    # THE SAMPLER'S FAILURE OUTRANKS THE SPANNING READER'S, because it causes
+    # it: a sampler that died at stop wrote the truncated stream the spanning
+    # then could not use, and the first message names the cause.
+    clock_error = window.close_error or span_error
     record = {
         **checked,
         **fold_legs(legs),
         "clock": clock,
-        # NULL on a healthy run; the sampler's or the reader's own words when
-        # there is no window to judge. The legs already cost a lease, so the
-        # failure is kept here and refused below rather than thrown over them.
+        # NULL on a healthy run; the sampler's or the spanning reader's own
+        # words when there is no window to judge. `ClockWindow.__exit__` keeps a
+        # stop failure rather than raising it, and `spanned_clock` returns
+        # rather than raises, so this arm's legs reach the disk either way.
         "clock_error": clock_error,
         "binary": args.binary,
     }
@@ -413,10 +436,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # refuses the same record again through `clock_pairing`.
     if args.output is not None:
         write_json_atomic(args.output, record)
-    reasons = clock_state_reasons(clock, label="ours")
-    if clock_error:
+    reasons = clock_state_reasons(clock, label="ours", detail=str(clock_error or ""))
+    if clock is not None and window.close_error:
+        # THE SPANNED WINDOW CAN SURVIVE A SAMPLER THAT DID NOT, because the raw
+        # stream is flushed per line and the summary is written last. It is
+        # still refused: a sampler that failed at stop is a sampler whose stream
+        # nobody can vouch for, and `clock_state_reasons` cannot say so here
+        # because it was handed a record that looks healthy.
         reasons.append(
-            f"clock: ours could not build a window over its warm legs: {clock_error}"
+            f"clock: the ours arm's sampler did not stop cleanly, so the window it "
+            f"describes is not established: {window.close_error}"
         )
     require_no_reasons(reasons, what="DFlash2 our-arm capture")
     print(canonical_json(record))

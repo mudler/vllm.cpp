@@ -2127,8 +2127,10 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   // straight into paged_update_cache with persistent idx/page-table tensors.
   // Conditions: capturing (or host-free flag), all inputs device-shadowed,
   // TILE-legal dims, and the warm hook already staged the idx tensors.
-  static const bool host_free_rac =
-      HostFreeDecodeEnabled();
+  // Live read, NOT a function-local static: a latch here would cache the
+  // now-default-ON value and silently strip VT_TT_HOST_FREE_DECODE=0 of its
+  // effect on this path for the rest of the process (#1688).
+  const bool host_free_rac = HostFreeDecodeEnabled();
   if (host_free_rac || tt_capture_active()) {
     if (TryReshapeAndCacheDeviceDecode(k, v, k_cache, v_cache, slot_mapping)) {
       return;

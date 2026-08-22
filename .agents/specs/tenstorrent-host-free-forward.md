@@ -326,6 +326,20 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **No case pins `HostFreeDecodeEnabled()`'s no-caching contract on the RAC
+  path ([#1688](https://github.com/mudler/vllm.cpp/issues/1688)).** The R5
+  fresh review found `ReshapeAndCacheKernel` still latching the flag in a
+  function-local `static`, which after the default flip cached ON and stripped
+  `VT_TT_HOST_FREE_DECODE=0` of its effect on that path for the rest of the
+  process. The latch is FIXED IN FLOW (live read, matching every other
+  converted site), but no test reds on it: `ReshapeAndCacheKernel` needs a real
+  Blackhole device, so every case that reaches it sits behind
+  `TenstorrentPresent()` and skips on every host in the `rc` fleet. Closing it
+  means a `thalia` case that drives the RAC path twice across a
+  `setenv`/`unsetenv` of the flag and asserts the second call takes the other
+  branch — the same shape the flip already used for
+  `support_static_graph_mode`, which could be written host-side because the
+  platform accessor needs no card.
 - **Captured multi-request decode hangs ([#1625](https://github.com/mudler/vllm.cpp/issues/1625)).**
   Measured on the R5 flip tree: the 16-prompt gate hangs ~10 s into stepping
   under captured decode, with `VT_TT_RECAPTURE_EVERY=8` alike, while

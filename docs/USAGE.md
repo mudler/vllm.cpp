@@ -220,6 +220,13 @@ supported.
   prefill-batch path. Set `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` to restore the
   previous single-token gate when you want to compare the two paths. See
   [Environment variables](ENVIRONMENT.md).
+- `--speech-device 1` REFUSES by name instead of falling back to the CPU. It
+  refuses when the build registers no accelerator backend, and separately when
+  the platform it resolves declines the speech family because that backend is
+  partial; the message says which of the two it is. One flag places every stage
+  a family can move -- for MiniMax-Music3 the language model, the RVQ depth
+  decoder and the flow-matching transformer -- and there is no per-stage switch
+  and no environment variable that turns one of them on by itself.
 - `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
   means the tokenizer file names a merge whose left token, right token, or
   joined result is missing from its own vocabulary. Both `tokenizer.json` and a

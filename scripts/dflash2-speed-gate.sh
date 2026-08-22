@@ -285,6 +285,7 @@ python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" --precheck-onl
   > "${EVIDENCE}/precheck.json"
 python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" --precheck-only \
   --clock-summary "${EVIDENCE}/clock-ours.json" \
+  --clock-samples "${EVIDENCE}/clock-ours-samples.jsonl" \
   > "${EVIDENCE}/precheck-ours.json"
 
 # ONE WINDOW PER ARM, never one window spanning both: a single window cannot
@@ -315,8 +316,27 @@ python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" \
   --output "${EVIDENCE}/vllm-arm.json"
 
 echo "== our arm, identical workload, through the public ABI (vllm-cli)"
+# THE ARM IS JUDGED ON ITS WARM LEGS, NOT ON ITS FOUR PROCESSES (#1671).
+# `vllm-cli` is one process per prompt and reads a 52 GiB checkpoint before it
+# decodes anything, so the window this arm's sampler covers is the four
+# PROCESSES: on 2026-08-22 that was 3222 s carrying 93.2 s of warm generation,
+# 18.37% busy, and `clock_reasons` refused it on the 50% floor. That refusal is
+# correct and the floor stays. What changes is the WINDOW: `vllm-cli` now marks
+# each leg's generation boundaries, and the arm builds its clock record from the
+# samples inside the WARM leg spans -- the legs the median is folded from.
+#
+# `--clock-samples` IS PASSED EXPLICITLY, although `add_clock_arguments` would
+# default it beside the summary. The arm both writes and reads this file, so the
+# gate names it rather than inheriting it, and
+# `tests/tools/test_dflash2_speed_harness.py` binds the flag to the script:
+# delete the line and the gate reddens.
+#
+# The ORACLE arm needs no such spanning, and that is not an oversight. It owns
+# its window in-process and opens it AFTER `LLM(...)` has loaded, so its summary
+# already covers only its prompt loop (85 samples, 98.82% busy on the same run).
 python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" \
   --clock-summary "${EVIDENCE}/clock-ours.json" \
+  --clock-samples "${EVIDENCE}/clock-ours-samples.jsonl" \
   --clock-interval "${CLOCK_INTERVAL}" \
   --output "${EVIDENCE}/our-arm.json"
 

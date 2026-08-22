@@ -16,9 +16,11 @@ ms/step across that pair.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 import tempfile
+import time
 import unittest
 
 from tools.bench.gpu_clock_state import (
@@ -30,11 +32,13 @@ from tools.bench.gpu_clock_state import (
     MIN_BUSY_FRACTION,
     MIN_BUSY_SAMPLES,
     build_clock_record,
+    build_spanned_clock_record,
     clock_reasons,
     compare_clock_records,
     merge_clock_records,
     parse_query_row,
     read_boot_id,
+    read_sample_stream,
     run_sampler,
     summarize_sm_clocks,
     validate_clock_record,
@@ -948,6 +952,267 @@ class CrossArmMeanTests(unittest.TestCase):
         """
 
         self.assertEqual(MAX_CROSS_ARM_MEAN_OFFSET_PCT, MAX_CROSS_ARM_OFFSET_PCT)
+
+
+# --------------------------------------------------------------------------
+# RESTRICTING A WINDOW TO THE SPANS THAT DID THE WORK (#1671).
+#
+# `MIN_BUSY_FRACTION` asks that the retained window DESCRIBE the measured work.
+# A driver that samples across a whole process lifetime does not satisfy it by
+# accident: the DFlash2 our-arm run of 2026-08-22 sampled 3222 seconds, of which
+# 93 were warm generation, and the floor refused it at 18.37% busy. The refusal
+# was right, so the repair cannot be to the floor. It is to the WINDOW: the
+# driver hands over the spans the work actually ran in, and the record is built
+# from the samples inside them.
+#
+# Nothing below relaxes a rule. Every threshold still applies, to a smaller and
+# truer set of samples, and three cases here exist to prove that a span cannot
+# be used to buy a pass.
+# --------------------------------------------------------------------------
+
+#: One second apart, which is the sampler's own default interval.
+_EPOCH = 1_755_000_000.0
+
+
+def _stream(count, *, busy_from=0, start=_EPOCH, step=1.0):
+    """`count` samples one `step` apart, idle until `busy_from`.
+
+    Shaped like the run this exists for: a long idle head (four `vllm-cli`
+    processes reading a 52 GiB checkpoint off CIFS) followed by the generation
+    the number is folded from.
+    """
+
+    samples = []
+    for index in range(count):
+        sample = _samples([2470], utilization=97 if index >= busy_from else 0)[0]
+        stamp = dt.datetime.fromtimestamp(start + index * step, dt.timezone.utc)
+        sample["timestamp_utc"] = stamp.isoformat()
+        sample["elapsed_s"] = index * step
+        samples.append(sample)
+    return samples
+
+
+class SpannedWindowTests(unittest.TestCase):
+    def test_the_whole_stream_FAILS_the_busy_floor_and_the_spans_do_not(self) -> None:
+        """The #1671 shape, both verdicts in one case.
+
+        Without this pair the repair could be read as a threshold change. The
+        SAME samples and the SAME `clock_reasons` produce both verdicts; only
+        the window differs.
+        """
+
+        stream = _stream(120, busy_from=80)
+        whole = build_clock_record(stream, boot_id=BOOT_GOOD)
+        reasons = clock_reasons(whole, label="ours")
+        self.assertTrue(
+            any("below the 50% floor" in reason for reason in reasons), reasons
+        )
+
+        spanned = build_spanned_clock_record(
+            stream, [(_EPOCH + 80.0, _EPOCH + 119.0)], boot_id=BOOT_GOOD
+        )
+        self.assertEqual(clock_reasons(spanned, label="ours"), [])
+        self.assertEqual(spanned["sm_clock_mhz"]["n"], 40)
+        self.assertEqual(spanned["idle_samples_excluded"], 0)
+
+    def test_a_span_the_gpu_was_IDLE_through_is_still_refused(self) -> None:
+        """A span is not a licence. The floor holds inside it."""
+
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH, _EPOCH + 79.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("idle", str(raised.exception))
+
+    def test_a_span_TOO_SHORT_to_observe_still_fails_the_count_floor(self) -> None:
+        """`MIN_BUSY_SAMPLES` is what stops a one-sample window scoring 0.00%."""
+
+        stream = _stream(120, busy_from=80)
+        spanned = build_spanned_clock_record(
+            stream, [(_EPOCH + 80.0, _EPOCH + 84.0)], boot_id=BOOT_GOOD
+        )
+        self.assertEqual(spanned["sm_clock_mhz"]["n"], 5)
+        reasons = clock_reasons(spanned, label="ours")
+        self.assertTrue(
+            any(f"below the {MIN_BUSY_SAMPLES} floor" in reason for reason in reasons),
+            reasons,
+        )
+
+    def test_NO_span_is_a_refusal_and_never_the_whole_window(self) -> None:
+        """The one silent failure that would make this a laxer gate.
+
+        A driver whose markers did not parse hands over an empty list. Falling
+        back to the whole stream would restore exactly the window #1671 refused,
+        under a record that CLAIMS to be spanned.
+        """
+
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(stream, [], boot_id=BOOT_GOOD)
+        self.assertIn("no span", str(raised.exception))
+
+    def test_a_span_that_ENDS_BEFORE_it_starts_is_a_refusal(self) -> None:
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH + 100.0, _EPOCH + 90.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("ends before it starts", str(raised.exception))
+
+    def test_a_span_that_RETAINED_NOTHING_names_what_it_asked_for(self) -> None:
+        """A span outside the stream is a driver defect, not a fast window."""
+
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH + 500.0, _EPOCH + 600.0)], boot_id=BOOT_GOOD
+            )
+        message = str(raised.exception)
+        self.assertIn("retained none", message)
+        self.assertIn("120", message)
+
+    def test_the_record_SAYS_what_it_kept_and_what_it_dropped(self) -> None:
+        stream = _stream(120, busy_from=80)
+        spanned = build_spanned_clock_record(
+            stream,
+            [(_EPOCH + 80.0, _EPOCH + 89.0), (_EPOCH + 100.0, _EPOCH + 119.0)],
+            boot_id=BOOT_GOOD,
+        )
+        window = spanned["window"]
+        self.assertEqual(window["stream_samples"], 120)
+        self.assertEqual(window["retained_samples"], 30)
+        self.assertEqual(window["spans"], 2)
+        self.assertAlmostEqual(window["spanned_s"], 9.0 + 19.0, places=9)
+        # And it still validates as an ordinary record, so every downstream
+        # rule -- merge, compare, the pairing block -- reads it unchanged.
+        validate_clock_record(spanned, label="ours")
+
+    def test_a_sample_with_NO_timestamp_cannot_be_placed_in_a_span(self) -> None:
+        stream = _stream(40, busy_from=0)
+        del stream[7]["timestamp_utc"]
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH, _EPOCH + 39.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("timestamp_utc", str(raised.exception))
+
+    def test_a_NAIVE_timestamp_is_a_refusal_because_an_unknown_zone_is_not_UTC(
+        self,
+    ) -> None:
+        """`elapsed_s` and a local stamp both look plausible and both misplace.
+
+        The sampler writes an aware stamp. A record that silently accepted a
+        naive one would shift every span by the host's offset, which on this
+        fleet is a whole hour of a window nobody would notice was wrong.
+        """
+
+        stream = _stream(40, busy_from=0)
+        stream[3]["timestamp_utc"] = "2026-08-22T13:04:05.123456"
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH, _EPOCH + 39.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("time zone", str(raised.exception))
+
+    def test_the_sampler_s_OWN_stream_reads_back(self) -> None:
+        """The producer is `run_sampler`, so the reader is held to its format.
+
+        A hand-written fixture would pass while the two disagreed. This writes
+        the stream the way the sampler writes it and reads it the way the arm
+        reads it.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "clock-ours-samples.jsonl"
+            stream = _stream(40, busy_from=0)
+            path.write_text(
+                "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in stream),
+                encoding="utf-8",
+            )
+            read = read_sample_stream(path)
+            self.assertEqual(len(read), 40)
+            spanned = build_spanned_clock_record(
+                read, [(_EPOCH, _EPOCH + 39.0)], boot_id=BOOT_GOOD
+            )
+            self.assertEqual(spanned["sm_clock_mhz"]["n"], 40)
+
+    def test_a_TAIL_still_being_written_is_dropped_and_nothing_else_is(self) -> None:
+        """The arm reads the file while the sampler is still appending to it.
+
+        Refusing the partial tail would end a two-hour leased run on the newest
+        sample in the file, which is after the last leg and outside every span.
+        A hole in the MIDDLE is a different thing and still refuses.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "clock-ours-samples.jsonl"
+            whole = "".join(
+                json.dumps(s, sort_keys=True) + "\n" for s in _stream(4, busy_from=0)
+            )
+            path.write_text(whole + '{"sm_clock_mhz": 24', encoding="utf-8")
+            self.assertEqual(len(read_sample_stream(path)), 4)
+
+            path.write_text(
+                whole.replace(whole.splitlines()[1], '{"sm_clock', 1) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(HarnessError) as raised:
+                read_sample_stream(path)
+            self.assertIn("line 2", str(raised.exception))
+
+    def test_the_REAL_sampler_s_stream_spans_against_a_REAL_wall_clock(self) -> None:
+        """Producer and consumer in one case, with neither side hand-written.
+
+        Every other case here supplies the stream itself, so the two would agree
+        on a `timestamp_utc` shape the sampler does not write. `run_sampler` is
+        the producer, `time.time()` is the base a marking driver reads, and the
+        span below is taken across the sampler's own run.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = pathlib.Path(raw)
+            stub = directory / "nvidia-smi-stub"
+            stub.write_text(
+                "#!/bin/sh\necho '0, NVIDIA GB10, 580.159.03, 2470, 3003, 2418, "
+                "0x0000000000000000, Enabled, 97'\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            boot = directory / "boot_id"
+            boot.write_text(BOOT_GOOD + "\n", encoding="utf-8")
+            opened = time.time()
+            run_sampler(
+                samples_output=directory / "r1.samples.jsonl",
+                summary_output=directory / "r1.summary.json",
+                interval_s=0.001,
+                max_duration_s=1.0,
+                smi=str(stub),
+                boot_id_path=boot,
+            )
+            closed = time.time()
+            stream = read_sample_stream(directory / "r1.samples.jsonl")
+            spanned = build_spanned_clock_record(
+                stream, [(opened, closed)], boot_id=BOOT_GOOD
+            )
+            # EVERY sample the sampler wrote is inside the window it ran in. A
+            # timestamp the reader mis-parses lands outside and drops out here.
+            self.assertEqual(spanned["window"]["retained_samples"], len(stream))
+            self.assertEqual(clock_reasons(spanned, label="ours"), [])
+            # And a span that ENDS before the sampler started retains nothing.
+            with self.assertRaises(HarnessError):
+                build_spanned_clock_record(
+                    stream, [(opened - 600.0, opened - 300.0)], boot_id=BOOT_GOOD
+                )
+
+    def test_a_stream_that_is_ONLY_a_partial_tail_is_still_a_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "clock-ours-samples.jsonl"
+            path.write_text('{"sm_clock_mhz": 24', encoding="utf-8")
+            with self.assertRaises(HarnessError) as raised:
+                read_sample_stream(path)
+            self.assertIn("holds no sample", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -839,6 +839,19 @@ def repeat_reasons(repeat: object, *, label: str) -> list[str]:
     return []
 
 
+def is_warm_leg(leg: Mapping[str, Any]) -> bool:
+    """Is this leg one the median is folded from?
+
+    ONE PREDICATE, TWO CONSUMERS. `fold_legs` discards run 1 for a named cause,
+    and `dflash2_our_arm.warm_leg_spans` restricts the clock window to the legs
+    the median is folded from (#1671). Inlining `run > 1` in both would let the
+    number and the clock that qualifies it come to describe different legs,
+    which is the defect #1671 filed at three orders of magnitude.
+    """
+
+    return int(leg["run"]) > 1
+
+
 def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Median of the WARM legs, with the cold discard recorded, not applied silently.
 
@@ -861,7 +874,7 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     Every leg stays in `legs` so a reader can see what was dropped.
     """
 
-    warm = [leg for leg in legs if int(leg["run"]) > 1]
+    warm = [leg for leg in legs if is_warm_leg(leg)]
     if not warm:
         raise HarnessError(
             "legs: every leg is a cold leg, so the discard leaves nothing to fold"

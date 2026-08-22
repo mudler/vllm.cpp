@@ -926,6 +926,14 @@ environment:
     # --- CUDA_CUDART_LIBRARY)", which names the version and denies the toolkit
     # --- in one line. apt-get is idempotent, so paying it every run costs
     # --- seconds and removes the whole class.
+    # `cuda-toolkit-13-0` is NOT in Ubuntu's own archive. Add NVIDIA's repo
+    # first, or the install fails to resolve on a freshly recreated pod -- and
+    # succeeds on a pod where some earlier job already added it, which is the
+    # same leftover-state trap in a second guise.
+    apt-get update -qq
+    apt-get install -y -qq wget ca-certificates gnupg
+    wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb -O /tmp/ck.deb
+    dpkg -i /tmp/ck.deb
     apt-get update -qq
     apt-get install -y -qq cuda-toolkit-13-0
     export PATH=/usr/local/cuda/bin:$PATH
@@ -968,6 +976,14 @@ environment:
     conveniences. If you must install a minimal set rather than the metapackage,
     it is `cuda-nvcc-13-0 cuda-cudart-dev-13-0 libcublas-dev-13-0` — and the
     postcondition assertions above are what tell you whether you got it right.
+
+    **The `sbsa` path in that keyring URL is the aarch64 one**, and it is what
+    both this box and `dgx` need; an `x86_64` URL resolves and then installs
+    nothing usable here. The concurrent `gate-fp8-thorbuild` job took the same
+    route on 2026-08-22 and its configure reported
+    `The CUDA compiler identification is NVIDIA 13.0.88` at
+    `/usr/local/cuda-13.0/bin/nvcc`, which is independent corroboration of both
+    the package and the version.
 
     **cuRAND is NOT among the requirements**, in case a reader reaches for it:
     `grep -rn curand src include CMakeLists.txt cmake` returns nothing, so this

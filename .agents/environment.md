@@ -988,11 +988,13 @@ environment:
     `unhealthy (no contact)` with `out of the pool: worker_lost`, and the job
     died at SIGTERM. Host memory was NOT the cause — the sampler read 116 GiB
     available one minute before contact was lost, so this is not the
-    overcommit-collapse signature below. **`worker_lost` on this box did not
-    self-heal**: the device still read `unhealthy (no contact 2h38m)` more than
-    two and a half hours later, and clearing a quarantined device needs an admin
-    token and is a human's call. There is no second sm_110 device to fall back
-    to, so an sm_110 gate simply stops until somebody restores it. **Report free space, reclaim every tree
+    overcommit-collapse signature below. **`worker_lost` did not self-heal
+    QUICKLY, and it did eventually clear.** The device still read
+    `unhealthy (no contact 2h38m)` two and a half hours later; by 2026-08-22 it
+    was `ready` again with `disk_free_bytes` back to about 123 GiB. Do not clear
+    a quarantined device yourself — that needs an admin token and is a human's
+    call — and do plan for hours rather than minutes, because there is no second
+    sm_110 device to fall back to and an sm_110 gate simply stops meanwhile. **Report free space, reclaim every tree
     the lane has left behind rather than only your own, refuse rather than build
     into a nearly full disk, and remove your tree when you finish.** A CUDA build
     that runs out of space surfaces as unrelated compile errors, which is the
@@ -1153,11 +1155,13 @@ environment:
     A re-measurement at `944d7d947` got as far as configure — which is where the
     `marlin-nvfp4: ENABLED for [110]` reading above comes from — and then lost
     the box to the `worker_lost` event described under "Disk is shared".
-    **Re-measuring is OWED** ([#955](https://github.com/mudler/vllm.cpp/issues/955)),
-    and it is blocked on the fleet rather than on anyone's willingness. Recording
-    a stale baseline with its SHA and its true distance attached is honest;
-    recording it as current would be the exact trap the next paragraph warns
-    about.
+    **Re-measuring is OWED** ([#955](https://github.com/mudler/vllm.cpp/issues/955)).
+    It WAS blocked on the fleet while `thor:gpu0` sat `unhealthy` on 2026-08-22;
+    **that excuse has since expired** — the device returned to the pool the same
+    day — so the debt is now simply unpaid rather than impossible, and it needs a
+    build plus a full `ctest` from somebody holding a lease. Recording a stale
+    baseline with its SHA and its true distance attached is honest; recording it
+    as current would be the exact trap the next paragraph warns about.
 
     **The gate is `(name, failure mode)` PAIRS. A row regresses on Thor when it
     adds a NAME, or when it changes a recorded MODE FOR THE WORSE.** Counting

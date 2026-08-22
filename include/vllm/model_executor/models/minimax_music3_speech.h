@@ -223,6 +223,44 @@ struct Music3DenoiseDeviceArm {
   bool half_set() const { return (queue != nullptr) != (dit != nullptr); }
 };
 
+// THE PRODUCTION SELECTION of that arm, as a function rather than as an `if` in
+// the engine ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), spec
+// `music3-dit-arm-reachability.md` §3).
+//
+// WHY IT IS A FUNCTION, and it is the whole of #1131's repair. The engine's
+// condition is `queue_.device.type != kCPU`, and on a CPU-only runner that
+// condition can never be true:
+// `src/vllm/multimodal/speech_engine.cpp::SpeechEngineDeviceType` REFUSES
+// `--speech-device 1` outright when no accelerator backend is registered, so
+// `queue_` there is kCPU or the engine never constructs at all. An `if` written
+// at that line is therefore the one line no gate CI owns can enter — which is
+// #1131 exactly. The same function
+// runs on BOTH sides of the condition, so a gate CAN enter it: with a CPU queue,
+// and with a fabricated non-CPU one.
+//
+// THREE OUTCOMES, AND THE THIRD IS THE DEFECT. A CPU queue stages nothing and
+// returns an arm that is not engaged, so `Music3DenoiseChunks` keeps the host
+// `DitForward` every Music3 gate was taken on. Any other device stages the DiT
+// into `*staged` and returns an ENGAGED arm — or, on a build or a box with no
+// provider for it, `StageMusic3DitWeights` REFUSES by name and that refusal
+// propagates. What must never happen is a non-CPU queue quietly taking the host
+// arm: that is a caller who asked for the GPU, was given 660 scalar host
+// forwards, and was told nothing. `test_minimax_music3_acoustic` asserts that
+// over every non-CPU `vt::DeviceType`.
+//
+// `release_host` EMPTIES each source tensor as it uploads (see
+// `StageMusic3DitWeights`); it is honoured ONLY on the device path, because the
+// host path is what the CPU queue selected and the host loops read those very
+// vectors. Pass true from the serving path, false from a gate that needs both
+// arms.
+//
+// `staged` outlives the returned arm's use or the arm dangles; the engine holds
+// both in the same scope. Throws if it is null.
+Music3DenoiseDeviceArm Music3SelectDitArm(vt::Queue& queue,
+                                          const MiniMaxMusic3TransformerConfig& config,
+                                          DitWeights& weights, bool release_host,
+                                          Music3DitDeviceWeights* staged);
+
 std::vector<std::vector<float>> Music3DenoiseChunks(
     const std::vector<float>& frame_hiddens, int64_t num_frames,
     const MiniMaxMusic3Config& config, const Music3AcousticWeights& weights,

@@ -1817,5 +1817,87 @@ class BpeQuadraticMergeRowIsCounted(unittest.TestCase):
         self.assertIn(self.ROW, {r.item_id for r in engine})
 
 
+class RequestLengthGuardRowIsCounted(unittest.TestCase):
+    """The ENGINE ratchet bump 169 -> 170 is backed by a real row (#1541).
+
+    Same shape and the same reason as `BpeQuadraticMergeRowIsCounted`, applied
+    to the pin this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump
+    with nothing behind it looks exactly like a bump for a row that landed, and
+    `scripts/check-pr-size.py`'s `governance_checker` contract refuses a checker
+    constant whose only artifact is the constant.
+
+    This class asserts nothing about `.agents/issue-index.md`, and that is not
+    an omission. #1541's row already landed with the closing commit of
+    `SPEC-BPE-QUADRATIC-MERGE`, the index is append-only, and a second row for
+    one issue number is what `check-agent-record.py` reports as `issue #1541
+    listed twice`.
+    """
+
+    ROW = "SERVE-REQUEST-LENGTH-GUARD"
+
+    def test_the_row_exists_in_the_engine_matrix(self) -> None:
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_spec(self) -> None:
+        """A row whose spec lives only in the PR body is untraceable."""
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("serve-request-length-guard.md", row)
+        self.assertTrue(
+            (ROOT / ".agents/specs/serve-request-length-guard.md").is_file(),
+            "the spec the row cites must exist",
+        )
+
+    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the ENGINE matrix at a mutated copy on disk, for the
+        reason `BpeQuadraticMergeRowIsCounted` records: patching `read_text`
+        globally would feed engine content to every matrix, and this case would
+        then pass on errors that have nothing to do with the removal.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "engine rows" in e], [])
+
+        path = agent_record.ENGINE_MATRIX
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "engine-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("engine rows" in e for e in errors),
+            f"removing {self.ROW} must break the engine count; got {errors}",
+        )
+
+    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
+        """MUTATION TARGET: `ENGINE_ROWS` back at 169 must be an error.
+
+        The pin and the matrix are two hand-maintained records of one number.
+        This asserts they agree at the value this change lands, so lowering the
+        constant to the previous 169 while the row is present reds here.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([e for e in errors if "engine rows" in e], [])
+        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
+        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
+        self.assertIn(self.ROW, {r.item_id for r in engine})
+
+
 if __name__ == "__main__":
     unittest.main()

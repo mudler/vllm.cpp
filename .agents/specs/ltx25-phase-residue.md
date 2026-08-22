@@ -27,10 +27,15 @@ CHECK( leaves >= 0.95 * wall )                       // the table sums to wall
 CHECK( covered >= c.min_coverage * leaf_seconds )    // a leaf is covered by its parts
 ```
 
-Both were red, and four issues across three months argued about whether the
-tolerances were right. This row's question was different: **where is the un-named
-time actually going**, measured rather than argued, so that a phase gets a NAME
-instead of a threshold getting a wider number.
+Both were red, and four issues argued about whether the tolerances were right:
+#1439, #1470, #1494 and #1536, filed between 2026-08-20T05:23Z and
+2026-08-21T04:40Z. That is under 24 hours, not the "three months" #1556's
+spec recorded -- this repository's first commit is `accfae2de`, 2026-07-02, so
+no dispute in it can be three months old.
+
+This row's question was different: **where is the un-named time actually going**,
+measured rather than argued, so that a phase gets a NAME instead of a threshold
+getting a wider number.
 
 IN SCOPE: naming the un-named regions of the LTX-2.5 render, and giving the
 instrument a way to report its own cost, so a reader can subtract it before
@@ -169,7 +174,8 @@ and close point rather than by name: `src/vllm/multimodal/ltx2_video.cpp:794` an
 
 `6b48edb2c` separately repaired the `denoise` red on `main` by moving the share
 floor to 0.75 and adding assertion (1c). Its own comment records that as a
-holding action, in terms, and that comment is still in the tree at
+holding action -- in substance rather than in those words, which the tree does not
+use -- and the comment is still in the tree at
 `tests/vllm/multimodal/test_ltx2_video.cpp:4324-4331`:
 
 > NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY, which is what #1439 asks for
@@ -223,13 +229,13 @@ once, at `tests/vllm/multimodal/test_ltx2_video.cpp:4325`, asking for it.
 | Issue | Owed |
 |---|---|
 | [#1668](https://github.com/mudler/vllm.cpp/issues/1668) | **the three anchors and the instrument self-cost, as one implementable unit.** `load.dit_config`, `artifacts.mux`, `denoise.update` plus `Ltx2ConditioningTrace::sampler_updates`, and `Record::instrument_seconds` with its conservation invariant. The reference implementation, the gate report and the mutation table stay readable at `refs/pull/1556/head` = `b45ea3bbb` |
-| [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | the res_2s arm's `denoise.update` anchor. `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it beside the first-order arm would land dead code |
+| [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | the res_2s arm's `denoise.update` anchor. `Ltx2Res2sDenoisingLoop` runs its own post-process and step behind `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. It lives in `ltx2_samplers.cpp`, is declared in `ltx2_samplers.h` beside the hooks struct, and is called from `ltx2_video.cpp`. **NOT `ltx2_res2s.cpp`**: #1556's spec named that file and it has never existed here, which `git log --all --diff-filter=A` confirms; #1567's forge text names no file at all, so the wrong anchor came from the spec rather than from the issue. No gate in this tree renders on that arm, so landing it beside the first-order arm would land dead code |
 | [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | the `denoise.step` / `denoise.update` seconds transfer. (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), while moving 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee |
 | [#1569](https://github.com/mudler/vllm.cpp/issues/1569) | a gate on `WriteJson`'s clock ORDERING, **measured green under its own mutation**. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable |
 | [#1570](https://github.com/mudler/vllm.cpp/issues/1570) | an upper bound on the instrument's own share of a leaf. `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
 | [#1571](https://github.com/mudler/vllm.cpp/issues/1571) | a per-gap decomposition IN the emitted table. The 92% region above was found with a scratch script; a reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
 | [#1572](https://github.com/mudler/vllm.cpp/issues/1572) | assertion (1c)'s span slack reds intermittently on `main` — `decode.video` at `0.00256913` against a `0.00075` bound, 3.4x. Pre-existing from `6b48edb2c` and not this row's |
-| [#1619](https://github.com/mudler/vllm.cpp/issues/1619) | **the `merge=union` driver duplicates a row, MEASURED on this row's own merges.** Both sides appended before the same trailing anchor rather than at the true end, so the driver concatenated two regions that each carried `#1546` and the resolved index held it TWICE, byte-identical, at 538 lines where the correct union is 537. `git merge-tree` called that merge clean, `check-agent-record.py` passed it, and `check-issue-index-append-only.py` passed it too, because a duplicate is an ADDITION and that checker only collects removals. De-duplicating in place then FAILS the same checker, because moving the anchor back behind the other side's rows is a relocation and a line diff reads a relocation as a removal — so the gate that exists reds a correct repair while the corruption passes. The same driver dropped `#838` on a later re-merge, so it recurs |
+| [#1619](https://github.com/mudler/vllm.cpp/issues/1619) | **the `merge=union` driver duplicates a row, MEASURED on this row's own merges.** Both sides appended before the same trailing anchor rather than at the true end, so the driver concatenated two regions that each carried `#1546` and the resolved index held it TWICE, byte-identical, at 538 lines where the correct union is 537. `git merge-tree` called that merge clean and `check-issue-index-append-only.py` passed it, because a duplicate is an ADDITION and that checker only collects removals. `check-agent-record.py` did NOT pass it -- a claim #1556's spec made and this row REFUTED by reproduction: regenerating the raw driver output and running that same tree's checker returns rc=1 with `issue #1546 listed twice`, and the refusal has existed since `8dd6508da` (2026-08-09), before the merge. So the blind gate is exactly one checker, not two, and the gap is narrower than #1556 recorded. De-duplicating in place then FAILS the same checker, because moving the anchor back behind the other side's rows is a relocation and a line diff reads a relocation as a removal — so the gate that exists reds a correct repair while the corruption passes. #1556's spec added that the same driver dropped `#838` on a later re-merge, making this a recurring class; that is WITHDRAWN as unreproducible. Re-running `git merge-file --union` at every later merge where `#838` was on a side leaves it present in all of them, and `git log -S` finds it absent from no committed state -- mechanically a union driver cannot drop a line that is an addition on one side. If it ever went missing, that points at a wholesale take-ours resolution rather than at the driver |
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** See `## Risks and decisions` D4 |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | `test_ltx2_video` false-redded once on `main` under load and the failing case's identity was never captured. Untouched here |
 
@@ -250,9 +256,13 @@ prologue repair under a different name. The pull request body — which
 `squash_merge_commit_message = PR_BODY` makes the permanent commit message —
 argued at length for `load.setup` as new work, so merging it would have written a
 materially false narrative onto `main` irreversibly. The branch also carried its
-own withdrawn bound, a `build-newest-gcc` repair that `d27639e71` and `13548db8f`
-had already landed twice over, and an `## Outcome` section for an outcome that
-did not happen.
+own withdrawn bound, a `build-newest-gcc` repair the tree had already received
+twice, and an `## Outcome` section for an outcome that did not happen. On that
+repair, one detail #1556's body got wrong and this record does not repeat:
+`13548db8f` (#1581) is the `build-newest-gcc` fix, while `d27639e71` is
+`BACKEND-TENSTORRENT-HOST-FREE-FORWARD` (#1476/#1595) and merely added the same
+`<unistd.h>` in passing. The duplicate include was real; only one of the two
+commits was about the lane.
 
 Closed on 2026-08-22 with the record above. The reference implementation, its
 full gate report, its mutation table and the three review threads remain readable
@@ -262,4 +272,14 @@ at `refs/pull/1556/head` = `b45ea3bbb`, cited from
 Nothing is blocked. Both reds this row was filed against are green on `main`: the
 sum floor by `519303d15`, which is the right repair, and the coverage floor by
 `6b48edb2c`'s 0.75, which is a holding action by its own account and is why
-`denoise.update` stays owed under #1668.
+`denoise.update` stays owed under #1668. Stated narrowly on purpose: that is the
+two floors this row was filed against, and it is NOT a claim that
+`test_ltx2_video` is quiet -- `## Owed` #1572 records assertion (1c)'s span slack
+redding intermittently on `main`, which this row neither causes nor repairs.
+
+**LTX25-PHASE-RESIDUE has no matrix row, so it has no lifecycle state**, and
+`scripts/now.py` and `audit-live-rows` will never surface it. That is deliberate
+rather than an omission: with the implementation unlanded there is nothing to
+give a state to, and creating a row would put an empty one in the runnable
+population. The forward owner is [#1668](https://github.com/mudler/vllm.cpp/issues/1668),
+and whoever picks it up creates the row with the implementation.

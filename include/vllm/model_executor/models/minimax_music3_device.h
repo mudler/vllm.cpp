@@ -112,6 +112,14 @@ struct Music3DitDeviceWeights {
   DitWeights host_time_embed;
 
   std::vector<std::shared_ptr<void>> storage;
+
+  // Did anything actually land on a device? The layer vector is the honest
+  // witness: `StageMusic3DitWeights` fills one entry per transformer block and
+  // a default-constructed struct has none. A gate needs this to tell "the CPU
+  // arm was selected and nothing was staged" from "something was staged and the
+  // arm was dropped on the floor", and those two are indistinguishable from the
+  // returned arm alone. Mirrors `Music3DepthDeviceWeights::staged()`.
+  bool staged() const { return !layers.empty(); }
 };
 
 // Upload the DiT to `queue`'s device, once.

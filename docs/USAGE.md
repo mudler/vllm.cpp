@@ -220,6 +220,13 @@ supported.
   prefill-batch path. Set `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` to restore the
   previous single-token gate when you want to compare the two paths. See
   [Environment variables](ENVIRONMENT.md).
+- `--speech-device 1` REFUSES by name instead of falling back to the CPU. It
+  refuses when the build registers no accelerator backend, and separately when
+  the platform it resolves declines the speech family because that backend is
+  partial; the message says which of the two it is. One flag places every stage
+  a family can move -- for MiniMax-Music3 the language model, the RVQ depth
+  decoder and the flow-matching transformer -- and there is no per-stage switch
+  and no environment variable that turns one of them on by itself.
 - `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
   means the tokenizer file names a merge whose left token, right token, or
   joined result is missing from its own vocabulary. Both `tokenizer.json` and a
@@ -228,6 +235,14 @@ supported.
   is malformed rather than unsupported; a GGUF that fails this and whose
   original `tokenizer.json` loads was damaged by its converter. Before this
   check the same file loaded and then failed on some prompts instead.
+- `prompt length N bytes exceeds the maximum allowed prompt length of M bytes`
+  is a 400 from `/tokenize`, `/v1/completions` or `/v1/chat/completions`. The
+  server refuses a prompt it could never serve BEFORE tokenizing it, and it
+  never truncates one. There is no option to raise the limit, because it is
+  derived rather than configured: it is `max_model_len` multiplied by the
+  longest token in the loaded vocabulary, so any prompt above it needs more
+  than `max_model_len` tokens and would be refused after tokenizing anyway.
+  Send a shorter prompt, or load a checkpoint with a longer context.
 
 ## Find a focused guide
 

@@ -1,7 +1,10 @@
 # MiniMax-Music3
 
-MiniMax-Music3 generates 44.1 kHz stereo WAV files. Use this page for its
-checkpoint, commands, supported arms, and current limits.
+MiniMax-Music3 generates music as 44.1 kHz stereo WAV files.
+
+The supported checkpoint layout is 28,517,617,303 bytes on disk. The loader runs
+the language model, the RVQ depth decoder, and the condition encoder in BF16, and
+the transformer and the vocoder in F32.
 
 ## Download the checkpoint
 

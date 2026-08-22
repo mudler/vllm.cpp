@@ -1,8 +1,15 @@
 # Qwen3-Next
 
-Use this page for Qwen3-Next checkpoints, commands, supported arms, and current limitations.
+Qwen3-Next is a Gated DeltaNet (GDN) architecture. It runs through the shared
+paths, so [the quickstart](../QUICKSTART.md) and
+[the usage guide](../USAGE.md) cover starting a server and sending a request.
+Qwen3.5 shares the architecture and [its page](qwen3-5.md) carries the same gate
+rule.
 
-## GDN checkpoints: the `output_gate_type` key
+This page carries the one config key that changes the arithmetic and that a
+checkpoint can get wrong.
+
+## The `output_gate_type` key
 
 A Gated DeltaNet checkpoint (the Qwen3.5 / Qwen3-Next family) chooses its
 output-gate activation in `config.json`:

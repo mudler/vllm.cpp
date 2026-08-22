@@ -1,14 +1,19 @@
 # Nemotron 3.5 Lightning
 
-Use this page for Nemotron 3.5 Lightning checkpoints, commands, supported arms, and current limitations.
+Nemotron-3.5-Lightning-30B-A3B is a hybrid architecture. `NemotronHForCausalLM`
+runs 6 grouped-query attention layers over a paged KV cache and 23 Mamba2 layers
+over a recurrent convolution and SSM state, with mixture-of-experts blocks
+between them.
 
-## Nemotron-3.5-Lightning-30B: the exact weights, and which arms run
+**No token gate result exists for this checkpoint yet.** The example below is the
+vehicle for it and the golden is committed, but the run is pending. Nothing about
+the released checkpoint's output is claimed here until it is green.
 
-`NemotronHForCausalLM` is a hybrid: 6 GQA attention layers over a paged KV cache
-and 23 Mamba2 layers over a recurrent conv/SSM state, with MoE blocks between
-them. `examples/nemotron_h_gen` (`nemotron-h-gen`) drives it through the public
-C ABI and nothing else — `vllm_engine_load` + `vllm_complete_tokens` — against
-the committed oracle golden:
+## Run it
+
+`examples/nemotron_h_gen`, installed as `nemotron-h-gen`, drives the model
+through the public C ABI and nothing else, using `vllm_engine_load` and
+`vllm_complete_tokens`, against the committed oracle golden:
 
 ```sh
 nemotron-h-gen --model "$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4" \
@@ -89,10 +94,13 @@ the largest SINGLE re-expansion in the model by 12.7x — one call, a 704.6 MB
 transient bf16 buffer — which is why it matters more than its 11.4% share
 suggests on a unified-memory box that reboots rather than OOM-kills.
 
-## What has NOT been measured
+## What has not been measured
 
 **No token gate result exists for this checkpoint yet.** The example above is the
-vehicle for it and the golden is committed, but the run itself is pending; the
-current state is recorded in `docs/BENCHMARKS.md` rather than left as silence,
-and nothing about the released checkpoint's output is claimed here until it is
-green.
+vehicle for it and the golden is committed, but the run itself is pending. The
+current state is recorded in [`docs/BENCHMARKS.md`](../BENCHMARKS.md) rather than
+left as silence, and nothing about the released checkpoint's output is claimed
+here until it is green.
+
+The `lm_head` device arm's own numeric gate has also not run. It needs a
+`dgx:gpu0` window, and until then that row is implemented and unmeasured.

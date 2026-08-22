@@ -888,7 +888,14 @@ environment:
     #!/bin/bash
     set -u
     SRC=/tmp/src
-    NEED_GB=90
+    # NEED_GB is an UNMEASURED PLACEHOLDER. Nobody has recorded `du -sh` of a
+    # finished build-cuda on this box, so this number was chosen, not derived.
+    # The two real data points are: a build that COMPLETED with 154 G free
+    # (2026-08-19) and one that did NOT complete with 58 G free (2026-08-22,
+    # though the worker was lost and disk is a hypothesis rather than a proven
+    # cause). Replace it with the figure the block at the end of this script
+    # prints, and delete this comment when you do.
+    NEED_GB=${NEED_GB:-60}
     free_gb() { df -BG --output=avail /tmp | tail -1 | tr -dc '0-9'; }
 
     # --- clean up on ANY exit, including the kill. A job that dies holding its
@@ -905,7 +912,9 @@ environment:
     du -sh /tmp/* 2>/dev/null | sort -rh | head -10
     rm -rf /tmp/src /tmp/thor-w05-src*          # reclaim this lane's old trees, not just mine
     if [ "$(free_gb)" -lt "$NEED_GB" ]; then
-      echo "REFUSING: /tmp has $(free_gb) GiB free, this build needs about ${NEED_GB}."
+      echo "REFUSING: /tmp has $(free_gb) GiB free, below the NEED_GB=${NEED_GB} floor."
+      echo "That floor is an UNMEASURED placeholder -- read its comment above before"
+      echo "believing it, and raise NEED_GB deliberately if you think it is wrong."
       echo "A CUDA build that runs out of space fails as unrelated compile errors."
       exit 95
     fi
@@ -939,6 +948,11 @@ environment:
       -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
     cmake --build "$SRC/build-cuda" -j 4
     ( cd "$SRC/build-cuda" && ctest -j1 --timeout 1800 )
+
+    # --- MEASURE what this actually cost, so NEED_GB stops being a guess.
+    # --- Record these two numbers in this file and replace the placeholder.
+    du -sh "$SRC" "$SRC/build-cuda"
+    echo "### /tmp free at end: $(free_gb) GiB"
     # cleanup() removes $SRC on the way out, on success AND on the kill path.
     ```
 

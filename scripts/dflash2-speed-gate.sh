@@ -7,10 +7,11 @@
 # procedure in prose and committed none of it
 # (https://github.com/mudler/vllm.cpp/issues/1562). The DFlash2 speed axis is
 # recorded NOT TAKEN, and an unreproducible harness is why a number taken now
-# would be worth little. This script is the runnable procedure: it takes the
-# clock window, drives both arms on an identical workload, folds them into the
+# would be worth little. This script is the runnable procedure: it prechecks
+# both arms, drives them on an identical workload, folds them into the
 # machine-readable result `.agents/benchmark-record.md` can cite, and refuses
-# out loud when a precondition is absent.
+# out loud when a precondition is absent. It does NOT take the clock window --
+# each arm owns its own, for the reason rule 2 gives below.
 #
 # THREE RULES THIS FILE OBEYS, EACH FROM A LOST RUN
 # -------------------------------------------------
@@ -19,9 +20,12 @@
 #    could not write. The marker here carries the exit STATUS, so a waiter reads
 #    a verdict and never a presence.
 # 2. STATE IS RESTORED FROM THE SAME TRAP. A dead harness once left a source
-#    file mutated and unrestored. Nothing here mutates a source file, and the
-#    clock sampler, which is the one background process, is stopped from the
-#    trap on every path.
+#    file mutated and unrestored. Nothing here mutates a source file, and this
+#    script no longer runs a background process at all: each ARM opens and
+#    closes its own clock window, because the summary is written when the
+#    sampler STOPS and a summary handed to the arm BEFORE it ran could not
+#    exist (https://github.com/mudler/vllm.cpp/issues/1657). The sampler also
+#    carries its own `--clock-max-duration` ceiling, so an orphan expires.
 # 3. NEVER EDIT THIS FILE WHILE BASH IS EXECUTING IT. Bash re-reads a script
 #    from its byte offset, so an edit mid-run runs a spliced program. Run
 #    `bash -n` before every run; the gate below does it for you.
@@ -62,12 +66,16 @@
 # arm refuses when no entry it was given identifies a model it loads.
 # `--our-speculative-config` is REQUIRED, and the k inside it is the k recorded.
 #
-# `--lease-id` defaults to `$RC_LEASE_ID`, which `rc` exports into the job.
+# `--lease-id` defaults to `$RC_JOB_ID`, which is the variable this fleet's
+# leased worker ACTUALLY exports: it carries `RC_DEVICE`, `RC_JOB_ID` and
+# `RC_TOKEN`, and no `RC_LEASE_ID` at all. The recipe committed with this gate
+# read `$RC_LEASE_ID`, so run verbatim it refused with "no lease id" before it
+# touched anything (https://github.com/mudler/vllm.cpp/issues/1660).
+# `$RC_LEASE_ID` stays as a fallback for a controller that does export it.
 
 set -euo pipefail
 
 MARKER=""
-CLOCK_PID=""
 SELF_CHECK=0
 EVIDENCE=""
 TARGET=""
@@ -79,7 +87,7 @@ OUR_BINARY=""
 OUR_BUILD_RECIPE=""
 OUR_MODEL=""
 OUR_SPECULATIVE_CONFIG=""
-LEASE_ID="${RC_LEASE_ID:-}"
+LEASE_ID="${RC_JOB_ID:-${RC_LEASE_ID:-}}"
 CLOCK_INTERVAL="1.0"
 REPEAT="5"
 # THE DRAFT DEPTH, THREADED TO BOTH ARMS. It was exposed on neither, so this
@@ -100,10 +108,6 @@ OUR_ARTIFACTS=()
 # that can fail, so a refusal during argument parsing still produces a marker.
 finish() {
   status=$?
-  if [ -n "${CLOCK_PID}" ] && kill -0 "${CLOCK_PID}" 2>/dev/null; then
-    kill -TERM "${CLOCK_PID}" 2>/dev/null || true
-    wait "${CLOCK_PID}" 2>/dev/null || true
-  fi
   if [ -n "${MARKER}" ]; then
     printf 'status=%s\nfinished_utc=%s\n' \
       "${status}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${MARKER}.tmp" || true
@@ -268,46 +272,53 @@ our_common_args=(
 )
 
 echo "== precheck BOTH ARMS (no GPU work yet; the failure that costs a lease is found before the lease)"
+# THE SUMMARY PATHS ARE PASSED HERE TOO, and they are the same two strings the
+# arms are given below. `gpu_clock_state` refuses to overwrite clock evidence,
+# and since the sampler moved inside the arm that refusal first fires when the
+# ARM opens its window -- for the oracle arm after `LLM(...)`, 702 s on
+# `dgx:gpu0` on 2026-08-22. `mkdir -p "${EVIDENCE}"` above asks nothing, so a
+# rerun into a used directory paid a full model load to be told. Threading the
+# paths through the precheck moves that `path.exists()` back before the lease
+# does any work.
 python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" --precheck-only \
+  --clock-summary "${EVIDENCE}/clock-vllm.json" \
   > "${EVIDENCE}/precheck.json"
 python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" --precheck-only \
+  --clock-summary "${EVIDENCE}/clock-ours.json" \
   > "${EVIDENCE}/precheck-ours.json"
 
 # ONE WINDOW PER ARM, never one window spanning both: a single window cannot
 # see the cross-arm offset, and the offset is the term that transfers into the
 # ratio (#543). `gpu_clock_state` refuses to overwrite existing evidence, so a
 # rerun into a used evidence directory stops rather than silently blending two
-# runs.
-open_clock_window() {
-  python3 -m tools.bench.gpu_clock_state sample \
-    --output "${EVIDENCE}/clock-$1-samples.jsonl" \
-    --summary "${EVIDENCE}/clock-$1.json" \
-    --interval "${CLOCK_INTERVAL}" &
-  CLOCK_PID="$!"
-}
-
-close_clock_window() {
-  if [ -n "${CLOCK_PID}" ]; then
-    kill -TERM "${CLOCK_PID}" 2>/dev/null || true
-    wait "${CLOCK_PID}" 2>/dev/null || true
-    CLOCK_PID=""
-  fi
-}
+# runs -- in the PRECHECK above, not here.
+#
+# THE ARM OPENS ITS OWN WINDOW, and this script no longer runs the sampler.
+# This file used to start it here and hand the arm the summary path, and
+# `gpu_clock_state` writes that summary only when the sampler STOPS -- so the
+# arm refused with `[Errno 2] No such file or directory` before the model
+# loaded, and closing the window first produced `every one of 98 clock samples
+# was idle`. The summary had to describe the arm and to exist before it, and
+# both cannot hold (#1657). The arm runs, its sampler stops, the summary is
+# written, and only then is it read and judged.
+#
+# The oracle arm gets one more thing out of owning it: its window opens AFTER
+# `LLM(...)` has loaded, so the 12-minute load is outside the samples that must
+# be 50% busy.
 
 echo "== vLLM arm, PRODUCTION configuration (never --enforce-eager)"
 echo "   clock is SAMPLED, not pinned: LGC_RC=4 inside a lease even as root (#1354)"
-open_clock_window vllm
+echo "   the ARM owns its clock window; nothing is sampled before it (#1657)"
 python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" \
   --clock-summary "${EVIDENCE}/clock-vllm.json" \
-  --output "${EVIDENCE}/vllm-arm.json" || { close_clock_window; exit 1; }
-close_clock_window
+  --clock-interval "${CLOCK_INTERVAL}" \
+  --output "${EVIDENCE}/vllm-arm.json"
 
 echo "== our arm, identical workload, through the public ABI (vllm-cli)"
-open_clock_window ours
 python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" \
   --clock-summary "${EVIDENCE}/clock-ours.json" \
-  --output "${EVIDENCE}/our-arm.json" || { close_clock_window; exit 1; }
-close_clock_window
+  --clock-interval "${CLOCK_INTERVAL}" \
+  --output "${EVIDENCE}/our-arm.json"
 
 echo "== fold into the citable result"
 python3 -m tools.bench.dflash2_speed_harness summarize \

@@ -6,7 +6,7 @@
 **Follow-on issue:** [#1628](https://github.com/mudler/vllm.cpp/issues/1628) — the DFlash2 candidate
 selector could not consume a QUANTIZED target `lm_head`, which blocked the only speculative arm
 `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` has. `## Risks/decisions` D14 records the decision, and
-`## Owed` O28/O29 record what it leaves owed.
+`## Owed` O28/O29/O30/O31 record what it leaves owed.
 **In-flow fix:** [#1575](https://github.com/mudler/vllm.cpp/issues/1575) — W5's `tests/vllm/models/test_qwen3_dflash2_gguf.cpp` called `::getpid()` directly instead of the
 portable `tests/support/process_id.h` seam, which held `build-newest-gcc` red on `main` from
 `5702d8f83`. Fixed in flow; not owed.
@@ -2204,6 +2204,16 @@ list items.
   `--our-speculative-config` is required because our arm would otherwise run a
   plain decode against a drafting oracle and still fingerprint-match its k.
 
+  **Provision the container first.** No CUDA toolkit is preinstalled, and two
+  packages beyond the metapackage are required: `cuda-libraries-dev-13-0`,
+  because `flashinfer.topk` JIT-compiles a `topk.cu` that includes
+  `<curand.h>` and `cuda-toolkit-13-0` omits it, and `python3-dev`, without
+  which Triton's driver JIT fails and reports
+  `Model architectures ['Qwen3_5ForConditionalGeneration'] failed to be inspected`.
+  The first of those killed a leg INSIDE `profile_run`, after a 12-minute model
+  load. `.agents/environment.md` carries both
+  ([#1660](https://github.com/mudler/vllm.cpp/issues/1660)).
+
   ```sh
   rc run --device dgx:gpu0 -- scripts/dflash2-speed-gate.sh \
       --evidence /workspace/evidence/dflash2-speed \
@@ -2232,13 +2242,46 @@ list items.
   **Four residuals, each stated because a harness that hides one is worse than
   none:**
 
-  1. **`BACKEND_PROBES` is UNVERIFIED against the beyond-pin wheel.** The
-     authoring host has no wheel at that head, so the three dotted walks are
-     candidates read off the pinned tree's object graph. A stale list is a LOUD
-     REFUSAL naming every probe it tried -- never a fallback and never a
-     plausible label -- so the failure mode is a stopped run, and the repair is
-     one entry. It is written down because "the probe list is right" is a claim
-     nobody has measured.
+  1. **`BACKEND_PROBES` was UNVERIFIED against the beyond-pin wheel. DISCHARGED
+     2026-08-22, by a leased run that MISSED on every probe and named the
+     repair.** The prediction this entry made held exactly: all three walks
+     raised `AttributeError: 'GPUModelRunner' object has no attribute
+     'attn_backend'`, the refusal was loud, listed every probe it tried, took no
+     fallback and invented no plausible label, and the repair was one entry.
+     Two walks were then measured against the live engine and both returned
+     `TRITON_ATTN`: `llm_engine.vllm_config.attention_config.backend` and
+     `llm_engine.engine_core.engine_core.vllm_config.attention_config.backend`.
+     Both are now first in `BACKEND_PROBES`; the three retired walks are KEPT
+     after them, because the list is ordered, an older wheel still answers on
+     them, and a walk that resolves nothing costs one `AttributeError`
+     ([#1658](https://github.com/mudler/vllm.cpp/issues/1658)).
+
+     **The same run also showed that ONE SCALAR under-describes this model.**
+     `...model_runner.attn_groups` resolved three backends at once:
+     `GDNAttentionBackend` over 48 `linear_attn` layers in 10 groups,
+     `TritonAttentionBackend` over 16 `self_attn.attn` layers in 4 groups at
+     every 4th index 3-63, and `FlashAttentionBackend` over the DFlash2
+     draft's five sliding-window layers (`model.layers.64-68`) in one group.
+     Those three counts are re-derivable from the run's own
+     `c-probe-result.json` under `candidate_walks`, and this entry read 30
+     for the GDN arm until 2026-08-22: 30 is the shape of the TEST STAND-IN,
+     never a measured count
+     ([#1666](https://github.com/mudler/vllm.cpp/issues/1666)).
+     BOTH are recorded now and only the SCALAR is gated.
+     The scalar is what the run declared, what `attention_backend_reasons`
+     compares against, and what `test_qwen38_dflash2_spec_decode.cpp` reads off a
+     golden; the map is what actually RAN. The map is NOT gated because the two
+     spellings are not comparable -- the scalar is an enum name (`TRITON_ATTN`)
+     and the map holds class names (`TritonAttentionBackend`) -- so a checker
+     that equated them would refuse every correct run. A missed group walk is a
+     named `miss` and never an empty map, because an empty map reads as "one
+     backend over every layer", which is the false claim the field exists to
+     prevent.
+
+     **NOT DISCHARGED, and new:** the run observed the draft's five layers
+     resolving `FlashAttentionBackend` and generating tokens, while
+     `FA-CONSTRAINT.txt` records `FA_USABLE=0` on sm_12x from #1456. #1456
+     needs a re-read before that constraint is quoted again. Tracked in #1658.
   2. **ONE OF THE FOUR AXES IS MEASURED.** `output_throughput_tok_s` is, on both
      arms: the oracle arm times `llm.generate` with `time.perf_counter()` and our
      arm reads `vllm-cli`'s own `tok_s`, and BOTH fold through the one shared
@@ -2282,7 +2325,13 @@ list items.
      len(prompt_token_ids)`, and `elapsed = 1.0` with no `perf_counter`) were
      green before this change and are red after it. The count now stated as one
      of four is a count of what the code does.
-  3. **The ANCHOR WALK is unverified, on the same footing as `BACKEND_PROBES`.**
+  3. **The ANCHOR WALK was unverified, on the same footing as
+     `BACKEND_PROBES`. DISCHARGED 2026-08-22 by the same leased run: the walk
+     RESOLVED.** 10 of 10 recorded blocks carried an anchor and the capture
+     reported `anchor_misses: 0`, so the consumer pairs on the anchor rather
+     than falling back to ordinal pairing. The rest of this entry stands as the
+     design it describes.
+
      The capture emits the golden's own shape -- `records[i].blocks` with
      `num_blocks`, each block carrying `call`, `req_row`, `anchor` and `drafts`,
      beside the top-level keys `GOLDEN_TOP_LEVEL_KEYS` names -- because a capture
@@ -2386,6 +2435,14 @@ list items.
   [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. Two arms
   are named-and-refused rather than built.
 
+  **NOT the O28 that [#1657](https://github.com/mudler/vllm.cpp/issues/1657),
+  [#1658](https://github.com/mudler/vllm.cpp/issues/1658),
+  [#1659](https://github.com/mudler/vllm.cpp/issues/1659) and
+  [#1660](https://github.com/mudler/vllm.cpp/issues/1660) name.** Those index
+  rows were written on a branch that authored its entry as O28 while `main`
+  landed this one first; the rows are append-only and cannot be corrected, so
+  the redirect lives here. They mean **O30**.
+
   `LoadDsparkDraft` passes `head_fp4 = nullptr` to `SharedHeadSource::LoadInto`,
   so a DSpark draft off an NVFP4 target still dies at
   `dflash: target tensor lm_head.weight is not BF16 (got U8)`. The reason is
@@ -2417,6 +2474,9 @@ list items.
 
 - **O29 — the packed shared head is gated on CPU only; the CUDA arm and the real
   checkpoint are OWED a measurement.**
+  **Not the entry the `#1657`-`#1660` index rows mean either; see O30.** Those
+  rows say O28, this file's O28 and O29 both belong to the DSpark lane, and the
+  entry they were written for is O30.
   [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. The
   implementer had no GPU (`BENCH-QWEN38-27B-SOTA` held the fleet), so **THIS
   CHANGE'S OWN gates are all CPU**. That is a statement about this row and not
@@ -2458,6 +2518,152 @@ list items.
   dequantized bf16 head operands rather than one. On CUDA neither is built. The
   policy is deliberately the target's own and not a second opinion; the measured
   cost on a non-CUDA backend is owed with the rest.
+
+- **O30 — the committed gate could NOT produce a number, and four issues say
+  why.**
+
+  **This entry was authored as O28 and renumbered on the merge with
+  `origin/main`, which landed its own O28 and O29 first.** The append-only
+  `#1657`, `#1658`, `#1659` and `#1660` rows in `.agents/issue-index.md` still
+  say `## Owed` O28, because they were written before that merge and an index
+  row is never edited. This is the entry they mean; O28 above is the DSpark
+  lane and is unrelated to them. Owner: `SPEC-DFLASH2`. Issues
+  [#1657](https://github.com/mudler/vllm.cpp/issues/1657),
+  [#1658](https://github.com/mudler/vllm.cpp/issues/1658),
+  [#1659](https://github.com/mudler/vllm.cpp/issues/1659),
+  [#1660](https://github.com/mudler/vllm.cpp/issues/1660).
+
+  O26 asked for the run. The run happened on `dgx:gpu0` on 2026-08-22 at
+  `bed3feae6`, over leases `11cee02a`, `52ac5673` and `a03f34e4`, and it
+  measured the INSTRUMENT rather than the engines: the gate as committed cannot
+  emit a ratio by any path. Two residuals of O26 were discharged by it and are
+  marked so above; four defects were filed. Three of them block a measurement
+  independently, so fixing any one alone still yields nothing.
+
+  | Issue | What it stopped | Repaired here |
+  |---|---|---|
+  | #1657 | the clock summary must describe the arm AND exist before it | the ARM owns its window: it runs, its sampler stops, the summary is written, and only then is it read and judged |
+  | #1658 | all three `BACKEND_PROBES` walks raised `AttributeError` | the two measured walks lead the list, and the per-group map is recorded beside the scalar |
+  | #1659 | `LLM(...)` took no backend kwarg, so `resolved == declared` was unreachable | the declared backend is passed, over the spellings `ATTENTION_BACKEND_KWARGS` names |
+  | #1660 | `--lease-id` defaulted to `$RC_LEASE_ID`, which this fleet does not export | the default is `$RC_JOB_ID`, and the recipe above names the two packages a lease needs |
+
+  **Why #1657 was invisible to a green suite.** `setUp` pre-wrote `clock.json`,
+  so every case received a summary that already existed and no case drove the
+  DRIVER's ordering. The suite could not fail the way the lease failed. Nothing
+  is pre-written now, a stub sampler writes the summary on STOP, and a
+  `.running` marker makes "the window is open right now" observable -- the
+  samples file survives the sampler, so reading it would have answered yes to a
+  window that had already closed.
+
+  **The design choice, stated because a reviewer must be able to reject it.**
+  The clock is a precondition of the MEASUREMENT, not of the arm's execution, so
+  a run whose clock later proves unusable is discarded at judgement time rather
+  than prevented from starting. Two consequences are deliberate. The arm record
+  is WRITTEN BEFORE the verdict, because a leased arm costs about two hours and
+  discarding its evidence makes the next run pay the same lease to see the same
+  thing; nothing quotable is emitted, since the refusal precedes the `print` and
+  `build_speed_result` refuses the same record again through `clock_pairing`.
+  And the oracle arm's window opens AFTER `LLM(...)` has loaded, so the load is
+  outside the samples `clock_reasons` floors at 50% busy.
+
+  **That guarantee was FALSE on the one branch it was written for, and a fresh
+  review found it.** It held only where the sampler had written a summary.
+  `gpu_clock_state.run_sampler` builds the record BEFORE it writes it, and
+  `build_clock_record` refuses an entirely idle window -- `every one of N clock
+  samples was idle`, the exact string this run met -- and refuses a mid-window
+  field change, while `query_once` refuses a failed `nvidia-smi`. On any of
+  those the sampler exits 2 with NO summary, `ClockWindow.close(read=True)`
+  raised, the exception left the `with` block and `capture()`, and `main()`
+  never reached `write_json_atomic`. The whole golden went with it -- records,
+  blocks, token ids, legs -- which is the provenance O26 needs. The
+  `stop_timeout` kill path lost it identically, and both existing
+  "unusable window" cases fed a summary the sampler DID write, so neither ever
+  reached this branch. `ClockWindow.__exit__` now keeps the failure in
+  `close_error`, leaves `record` None, and the driver refuses on it through
+  `clock_state_reasons` with the sampler's own words appended. Three cases drive
+  it: refuse-at-stop on both arms and the kill path on the oracle arm.
+
+  **The overwrite refusal cost a full model load, and no longer does.**
+  `gpu_clock_state` refuses to overwrite either file it writes, and since the
+  sampler moved inside the arm that refusal was first evaluated when the ARM
+  opened its window -- for the oracle arm after `LLM(...)`, 702 s on this box.
+  `scripts/dflash2-speed-gate.sh` does `mkdir -p "${EVIDENCE}"` and asked
+  nothing. `clock_evidence_reasons` now runs both `path.exists()` checks inside
+  each arm's `precheck`, the gate threads `--clock-summary` into both
+  `--precheck-only` invocations, and a rerun into a used evidence directory
+  stops before the lease does any work.
+
+  **Two sizes describe this one load and they are not the same measurement.**
+  `out-o26c/c-r1-oracle.log` on the share carries both, from the same
+  `LLM(...)`: `weight_utils.py:858` reports `Checkpoint size: 51.75 GiB` for the
+  target and `3.58 GiB` for the draft, both read off CIFS; `model_runner.py:385`
+  reports `Model loading took 54.87 GiB memory and 702.391374 seconds`, which is
+  what the finished load HOLDS. So 51.75 GiB is the target checkpoint on disk
+  and 54.87 GiB is resident memory. Neither figure was wrong; the two sites that
+  quoted them said "load" for both, and each now names what it measures.
+
+  **THREE THINGS STAY OWED, and the next leased run finds them.**
+
+  1. **The kwarg SPELLING is UNVERIFIED**, on the same footing `BACKEND_PROBES`
+     was on before this run. `attention_config={"backend": ...}` is tried first
+     because the measured read-back walk is `vllm_config.attention_config.backend`,
+     `attention_backend=...` second. A wheel that takes NEITHER is a loud refusal
+     naming both, raised by `EngineArgs` before anything loads, so the search
+     costs no lease time; `--attention-backend-kwarg` pins the answer once it is
+     known, with no code change. A spelling that is ACCEPTED and IGNORED is
+     caught by the read-back, which is the refusal #1659 already describes.
+
+     **The fall-through is `TypeError` ONLY, which is a second exposure in the
+     same place.** A wheel that DECLARES `attention_config` and validates its
+     shape raises something else -- a `ValueError`, a pydantic
+     `ValidationError` -- and that propagates and stops the arm rather than
+     trying `attention_backend`. It is named rather than repaired: the failure
+     is loud, it is pre-load so it costs no lease time, and
+     `--attention-backend-kwarg` is the lever. Catching more would be WORSE, in
+     a way that costs a measurement: a wheel that rejects our VALUE would be
+     retried under another spelling and the refusal would then name the wrong
+     cause. Widen it when a second shape is measured, never in advance.
+  2. **OUR ARM'S WINDOW SPANS FOUR MODEL LOADS.** `vllm-cli` is one process per
+     prompt and loads inside the window, so ours cannot exclude a load the way
+     the oracle arm can. If `clock_reasons` refuses it on the 50% busy floor,
+     the lever is `vllm-cli` marking its own leg boundaries, which this row does
+     not own. Recorded rather than worked around.
+  3. **`FA_USABLE=0` on sm_12x needs a re-read** before it is quoted again: the
+     same run watched the draft's five layers resolve `FlashAttentionBackend`
+     and generate tokens. Tracked in #1658.
+  4. **THE GDN COUNT IN THIS ENTRY WAS THE TEST STAND-IN'S, and it read 30
+     until 2026-08-22.** The run resolved 48 `linear_attn` layers in 10 groups,
+     not 30 in 1. 30 was `_stand_in_attn_groups()`'s `range(30)`, generalised
+     into a sentence that four files then carried as a measurement, on the row
+     whose whole history is that failure class. Corrected in the four files and
+     in the fixture, which now carries the measured 10/4/1 group shape and the
+     real layer names, so the next reader lifts the census rather than the
+     stub. The fifth copy is in the `#1658` index row and stays: that file is
+     append-only. Re-derive from `candidate_walks[...attn_groups]` in the run's
+     own `c-probe-result.json`, never from this paragraph.
+     [#1666](https://github.com/mudler/vllm.cpp/issues/1666).
+
+- **O31 — both arms judge the LEGS before the arm record reaches disk, so an
+  ordinary refusal discards a lease.** Owner: `SPEC-DFLASH2`.
+  [#1667](https://github.com/mudler/vllm.cpp/issues/1667), 2026-08-22, filed
+  and deliberately NOT fixed in the flow that found it.
+
+  `require_no_reasons(hook_reasons(...) + leg_reasons(...))` sits after the
+  clock window and before the record is written, in `capture()` on the oracle
+  arm and in `main()` on ours. One prompt returning 63 completion tokens
+  instead of the asked 64 therefore takes `records`, `blocks`,
+  `output_token_ids` and the O26 provenance with it, after about two hours of
+  lease. Driving the existing `OurArmRunEntryPointTest` fixture at
+  `completion = 63` prints `arm JSON on disk: ABSENT` against the control run's
+  `PRESENT`.
+
+  It is a separate defect from #1657 and not a regression of it. #1657 moved
+  the CLOCK judgement after the write on exactly this reasoning, and both arms
+  carry the comment saying so; that guarantee is scoped to the clock and says
+  nothing about the leg and hook checks. `git log -S` places both call sites at
+  `208559a79` (#1653), which predates #1657 and predates the branch that found
+  it. The repair changes the refusal ordering of both arms and wants its own
+  red-first test per arm, which is why it is owed rather than taken here.
 
 ## Now
 
@@ -3176,7 +3382,8 @@ the `Owed after W5` line above, which this line supersedes), O12 (the probabilis
 (a GGUF drafter's bf16 residency, 3.584 GiB against 1.06 GiB on disk), O15 (the
 three output-scalar GGUF key spellings), O21 (now a MERGED upstream, #1538 and
 #1561), O22/O23 (HALF discharged 2026-08-21: the instrument is committed, the
-run is not taken), O26 and O27. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
+run is not taken -- attempted 2026-08-22 and it measured the instrument, see
+O30), O26, O27, O28, O29, O30 and O31. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
 discharged.
 
 **And five things this row owes that W6 did not name**, all opened by the repair
@@ -3195,13 +3402,20 @@ wave on 2026-08-21:
    client assertion, the backend read-back), `tools/bench/dflash2_our_arm.py`
    (our arm, through the public ABI only), `scripts/dflash2-speed-gate.sh` (the
    lease-side procedure, marker written from `trap ... EXIT`) and
-   `tests/tools/test_dflash2_speed_harness.py` (115 cases, CPU, no GPU and no
-   wheel; it was 104 when this line first said 100, and the count is now
-   re-measured rather than transcribed). `w6-relabel.py` and the W6 run log are recorded LOST WITH THE LEASE
-   rather than owed. What remains owed is O26: the run itself, on the head #1561
-   selects. That run is the only thing that can give the FLASH_ATTN golden's
-   label a provenance, and the capture now emits the golden's own shape, so its
-   output can become that golden rather than merely describe one.
+   `tests/tools/test_dflash2_speed_harness.py` (CPU, no GPU and no wheel). **No
+   case count is written here any more.** It has been wrong three times -- 100,
+   then 104, then 115 -- because a number about one file, stored in another,
+   goes stale on every edit to the first, which is the record shape `AGENTS.md`
+   §Records forbids. Derive it instead:
+   `python3 -m unittest tests.tools.test_dflash2_speed_harness 2>&1 | grep '^Ran '`.
+   `w6-relabel.py` and the W6 run log are recorded LOST WITH THE LEASE
+   rather than owed. **The run was ATTEMPTED on 2026-08-22 and it measured the
+   INSTRUMENT**: the gate as committed could emit no ratio by any path, four
+   issues were filed, and O30 holds what each one stopped and what stays owed.
+   So O26's run is still owed, on the head #1561 selects. That run is the only
+   thing that can give the FLASH_ATTN golden's label a provenance, and the
+   capture emits the golden's own shape, so its output can become that golden
+   rather than merely describe one.
 3. **The two divergent draft blocks are UNATTRIBUTED.**
    [#1564](https://github.com/mudler/vllm.cpp/issues/1564). The instrument is
    named — the top-2 candidate margin at the flipping slot, on both sides — and

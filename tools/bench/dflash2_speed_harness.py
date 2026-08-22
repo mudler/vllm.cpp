@@ -56,7 +56,11 @@ Every rule below is a measurement this repository has already lost.
   the one helper that samples, folds and asserts it, and which
   `.agents/benchmarking.md` requires any new harness to import rather than
   reimplement. Inside an `rc` lease the clock can be SAMPLED and not pinned
-  (`LGC_RC=4`, #1354), so `clock_pinned` is RECORDED and never required.
+  (`LGC_RC=4`, #1354), so `clock_pinned` is RECORDED and never required. Each
+  ARM owns its window (`dflash2_oracle_capture.ClockWindow`), because the
+  summary is written when the sampler stops and a summary handed to an arm
+  before it ran could not describe it (#1657); this module still judges the
+  pair, and a record whose window is unusable never becomes a ratio.
 - **Contention.** The lease id, and the GPU's own compute-process list. Two
   mutexes that do not exclude each other already cost `minimax-music3` a whole
   speed axis (#777 again, 2026-08-17).
@@ -85,7 +89,10 @@ Reasons, not exceptions
 -----------------------
 Every checker returns a LIST of reasons and `require_no_reasons` raises once
 with all of them. A harness that dies on the first defect makes the operator pay
-a 51.75 GiB model load per defect, which is the cost O23 exists to stop. The
+a 51.75 GiB model load per defect -- that is the TARGET CHECKPOINT read off
+CIFS, `weight_utils.py:858`, and the finished load holds 54.87 GiB resident per
+`model_runner.py:385`; the two numbers are the same load measured differently
+-- which is the cost O23 exists to stop. The
 functions are pure, so the test suite drives them directly and the drivers call
 exactly the same code the gate proves.
 
@@ -135,15 +142,90 @@ BACKEND_SOURCE_READ_BACK = "read_back_from_engine"
 #: read the label off, in order. They live HERE rather than beside the reader so
 #: that the summarizer can check the recorded probe against the same list: a
 #: record that names a source must also name a walk this module recognises.
-#: They are CANDIDATES and not a contract -- the beyond-pin wheel is not on the
-#: authoring host, and vLLM moves this object graph between releases. A miss on
-#: every probe is a LOUD REFUSAL rather than a fallback, so the worst outcome of
-#: a stale list is a run that stops and names what it could not read.
+#: They are CANDIDATES and not a contract -- vLLM moves this object graph
+#: between releases. A miss on every probe is a LOUD REFUSAL rather than a
+#: fallback, so the worst outcome of a stale list is a run that stops and names
+#: what it could not read.
+#:
+#: **The first two are MEASURED and the last three are not.** On `dgx:gpu0` on
+#: 2026-08-22, inside the beyond-pin wheel and after a load `model_runner.py:385`
+#: reported as `Model loading took 54.87 GiB memory and 702.391374 seconds`, all
+#: three
+#: of the `attn_backend` walks raised `AttributeError: 'GPUModelRunner' object
+#: has no attribute 'attn_backend'` and the two `attention_config` walks each
+#: returned `TRITON_ATTN`
+#: ([#1658](https://github.com/mudler/vllm.cpp/issues/1658)). The retired walks
+#: are KEPT rather than deleted: this list is ordered, an older wheel still
+#: answers on them, and a walk that resolves nothing costs one `AttributeError`.
 BACKEND_PROBES: tuple[str, ...] = (
+    "llm_engine.vllm_config.attention_config.backend",
+    "llm_engine.engine_core.engine_core.vllm_config.attention_config.backend",
     "llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.attn_backend",
     "llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner.attn_backend",
     "llm_engine.model_executor.driver_worker.model_runner.attn_backend",
 )
+
+#: Where the PER-LAYER truth lives, and why one scalar is not enough.
+#:
+#: The same 2026-08-22 run walked `...model_runner.attn_groups` and resolved
+#: THREE backends at once on this model: `GDNAttentionBackend` over 48
+#: `linear_attn` layers in 10 groups, `TritonAttentionBackend` over 16
+#: `self_attn.attn` layers in 4 groups, and `FlashAttentionBackend` over the
+#: DFlash2 draft's five sliding-window layers (`model.layers.64-68`) in one
+#: group. The counts come from the run's own `c-probe-result.json`; the 30
+#: this comment carried until 2026-08-22 was the test stand-in's shape
+#: (#1666). A single `attention_backend`
+#: string cannot describe that, and the denominator's backend is exactly what W6
+#: measured vLLM disagreeing with ITSELF over -- 0.597 against 0.657 acceptance,
+#: and a divergent continuation on 1 of 4 prompts.
+#:
+#: So BOTH are recorded and only the SCALAR is gated. The scalar is what the run
+#: DECLARED and what `attention_backend_reasons` compares against, and it is the
+#: key `tests/parity/test_qwen38_dflash2_spec_decode.cpp` reads off a golden.
+#: The map is what actually RAN. It is not gated because the two spellings are
+#: not comparable -- the scalar is an enum name (`TRITON_ATTN`) and the map
+#: holds class names (`TritonAttentionBackend`) -- and a checker that equated
+#: them would refuse every correct run. A MISS is recorded as a named `miss`
+#: rather than an empty map, because an empty map reads as "one backend", which
+#: is the false claim this field exists to prevent.
+BACKEND_GROUP_PROBES: tuple[str, ...] = (
+    "llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner.attn_groups",
+    "llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.attn_groups",
+    "llm_engine.model_executor.driver_worker.model_runner.attn_groups",
+)
+
+#: How the engine is ASKED for a backend, in the order the arm tries them.
+#:
+#: `capture()` built `LLM(...)` with no backend kwarg at all while
+#: `attention_backend_reasons` requires `resolved == declared`, so under a
+#: declared `TRITON_ATTN` the arm logged `Using FLASH_ATTN attention backend`
+#: and the declared denominator was unreachable by ANY path
+#: ([#1659](https://github.com/mudler/vllm.cpp/issues/1659)). That matters here
+#: rather than merely being untidy: #1456 measured vLLM's vendored
+#: flash-attention emitting `sm_80`/`sm_75` at `CUDA_ARCHS=12.0`, which is why
+#: `TRITON_ATTN` is the declared oracle backend on this box.
+#:
+#: UNVERIFIED at the beyond-pin head, on the same footing as `BACKEND_PROBES`
+#: and for the same reason. A wheel REJECTS a kwarg it does not declare with a
+#: `TypeError`, raised while `EngineArgs` is built and therefore before anything
+#: loads, so trying both costs no lease time; a spelling that is accepted and
+#: IGNORED is caught by the read-back, which is the refusal that already exists.
+#: `--attention-backend-kwarg` pins the working one once it is known, without a
+#: code change.
+ATTENTION_BACKEND_KWARGS: tuple[str, ...] = ("attention_config", "attention_backend")
+
+
+def attention_backend_kwargs(spelling: str, backend: str) -> dict[str, Any]:
+    """The one kwarg pair a given spelling means."""
+
+    if spelling not in ATTENTION_BACKEND_KWARGS:
+        raise HarnessError(
+            f"unknown attention-backend kwarg spelling {spelling!r}; "
+            f"ATTENTION_BACKEND_KWARGS admits {list(ATTENTION_BACKEND_KWARGS)}"
+        )
+    if spelling == "attention_config":
+        return {"attention_config": {"backend": backend}}
+    return {spelling: backend}
 
 #: Workload keys that must be IDENTICAL on both arms. `.agents/benchmarking.md`:
 #: "If the two sides differ in any of those, the ratio means nothing."
@@ -803,7 +885,9 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def clock_state_reasons(record: Mapping[str, Any] | None, *, label: str) -> list[str]:
+def clock_state_reasons(
+    record: Mapping[str, Any] | None, *, label: str, detail: str = ""
+) -> list[str]:
     """Reasons the clock does not attribute this arm's number.
 
     Delegated whole to `tools/bench/gpu_clock_state.py`, which
@@ -811,14 +895,24 @@ def clock_state_reasons(record: Mapping[str, Any] | None, *, label: str) -> list
     new harness to import rather than reimplement. An ABSENT record is the
     refusal this wrapper adds: the helper judges a window, and a window nobody
     sampled is not a healthy one.
+
+    `detail` is the SAMPLER'S own message when it produced no summary to judge
+    -- an entirely idle window, a mid-window field change, a failed
+    `nvidia-smi`, a sampler that had to be killed. It is appended rather than
+    substituted, because the rule is the same one either way and only the cause
+    differs. Omit it and the refusal cannot tell those four apart, which costs
+    the next run a lease to learn what this one already knew.
     """
 
     if record is None:
-        return [
+        reason = (
             f"clock: the {label} arm sampled no clock window. A number is quotable only "
             "with the clock it was taken at -- a byte-identical kernel moved 9.65% "
             "between two boots with nothing throttling (#543)"
-        ]
+        )
+        if detail.strip():
+            reason += f". Its sampler: {detail.strip()}"
+        return [reason]
     return clock_reasons(record, label=label)
 
 
@@ -965,6 +1059,12 @@ def build_speed_result(
             "oracle_expected_commit": theirs.get("oracle_expected_commit"),
             "attention_backend": theirs.get("attention_backend"),
             "attention_backend_source": theirs.get("attention_backend_source"),
+            # WHAT ACTUALLY RAN, beside the one label the ratio is compared
+            # against. Three backends resolve at once on this model (#1658), so
+            # a citable result that carried only the scalar would under-describe
+            # the denominator in the field a reader looks at first.
+            "attention_backend_groups": theirs.get("attention_backend_groups"),
+            "attention_backend_kwarg": theirs.get("attention_backend_kwarg"),
             "sse_ping_s": (ours.get("env") or {}).get(SSE_PING_ENV),
             "enforce_eager": (theirs.get("config") or {}).get("enforce_eager"),
             "workload": dict(ours.get("workload") or {}),

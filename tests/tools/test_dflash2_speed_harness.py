@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -77,6 +78,121 @@ def clock_record(*, boot: str = "boot-a", median: float = 2470.0) -> dict:
         },
         "throttle_reasons_active": ["0x0"],
     }
+
+
+#: A stand-in for `python3 -m tools.bench.gpu_clock_state sample`, which needs a
+#: GPU and an `nvidia-smi` and therefore cannot run in CPU CI.
+#:
+#: It keeps the ONE property #1657 is about: **the summary is written when the
+#: sampler STOPS, never before**, and the first SAMPLE line appears as soon as
+#: the window is open. A fixture that pre-writes the summary -- which is what
+#: `setUp` used to do -- cannot fail the way the leased run failed, because
+#: every case then receives a file that already exists.
+#:
+#: `--summary` and `--output` are read positionally out of `sys.argv`, so the
+#: driver appends exactly the flags the real sampler's argparse declares.
+CLOCK_STUB_SOURCE = """
+import json, pathlib, signal, sys, time
+
+argv = sys.argv
+record = json.loads(argv[1])
+summary = pathlib.Path(argv[argv.index('--summary') + 1])
+samples = pathlib.Path(argv[argv.index('--output') + 1])
+
+
+running = samples.with_name(samples.name + '.running')
+
+
+def stop(*_):
+    running.unlink(missing_ok=True)
+    summary.write_text(json.dumps(record), encoding='utf-8')
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+# THE MARKER FIRST, THEN THE SAMPLES FILE. `_await_first_sample` returns as
+# soon as the samples file is non-empty, so writing it first leaves a window
+# in which a poll sees an open window and no marker -- a spurious
+# ('generate', False). Test-only: the real sampler has no marker.
+running.write_text('1', encoding='utf-8')
+samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
+while True:
+    time.sleep(0.02)
+"""
+
+#: The refusal the LEASED run met, verbatim. `run_sampler` calls
+#: `build_clock_record` BEFORE `write_json_atomic`, and that call raises on an
+#: entirely idle window, so the sampler exits 2 having written NO SUMMARY at
+#: all (`gpu_clock_state.__main__` prints it and exits 2).
+IDLE_WINDOW_REFUSAL = (
+    "gpu-clock-state: every one of 98 clock samples was idle; there is no "
+    "window to attribute the measurement to"
+)
+
+#: A sampler that opens its window and then REFUSES AT STOP. This is the branch
+#: the two `unusable window` cases never reach: they hand the arm a summary the
+#: sampler DID write, so they exercise `clock_reasons` on a bad window rather
+#: than the sampler that produced none.
+CLOCK_STUB_REFUSE_AT_STOP_SOURCE = """
+import json, pathlib, signal, sys, time
+
+argv = sys.argv
+message = json.loads(argv[1])
+samples = pathlib.Path(argv[argv.index('--output') + 1])
+running = samples.with_name(samples.name + '.running')
+
+
+def stop(*_):
+    running.unlink(missing_ok=True)
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+running.write_text('1', encoding='utf-8')
+samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
+while True:
+    time.sleep(0.02)
+"""
+
+#: A sampler that will not stop, so `close` kills it. Same evidence question,
+#: a different exit: the summary is missing because the process was killed
+#: rather than because it refused, and the kill path raised out of the `with`
+#: block just as the refusal did.
+CLOCK_STUB_IGNORES_STOP_SOURCE = """
+import json, pathlib, signal, sys, time
+
+argv = sys.argv
+samples = pathlib.Path(argv[argv.index('--output') + 1])
+running = samples.with_name(samples.name + '.running')
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+running.write_text('1', encoding='utf-8')
+samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
+while True:
+    time.sleep(0.02)
+"""
+
+
+def clock_stub_argv(record: dict | None = None) -> list[str]:
+    """The `--clock-sampler` prefix, which the driver completes with paths."""
+
+    return [sys.executable, "-c", CLOCK_STUB_SOURCE, json.dumps(record or clock_record())]
+
+
+def clock_stub_refusing_at_stop_argv(message: str = IDLE_WINDOW_REFUSAL) -> list[str]:
+    """A `--clock-sampler` that exits 2 at stop and writes no summary."""
+
+    return [sys.executable, "-c", CLOCK_STUB_REFUSE_AT_STOP_SOURCE, json.dumps(message)]
+
+
+def clock_stub_ignoring_stop_argv() -> list[str]:
+    """A `--clock-sampler` that ignores SIGTERM, so `close` has to kill it."""
+
+    return [sys.executable, "-c", CLOCK_STUB_IGNORES_STOP_SOURCE]
 
 
 class OracleIdentityTest(unittest.TestCase):
@@ -642,6 +758,52 @@ class OracleCapturePrecheckTest(unittest.TestCase):
             capture.main(argv)
         self.assertIn("foreign compute process", str(raised.exception))
 
+    def test_a_USED_EVIDENCE_DIRECTORY_stops_the_run_BEFORE_the_model_loads(self) -> None:
+        """The overwrite refusal exists; it just fired 12 minutes too late.
+
+        `gpu_clock_state.run_sampler` refuses to overwrite clock evidence, and
+        since the sampler moved INSIDE the arm that refusal is first evaluated
+        when the arm opens its window -- for the oracle arm after `LLM(...)`,
+        which was 702 s on `dgx:gpu0` on 2026-08-22. It is a CPU-only
+        `path.exists()`, so it belongs in the phase whose whole purpose is that
+        the failure costing a lease is found before the lease.
+        """
+
+        summary = self.root / "clock-vllm.json"
+        summary.write_text("{}", encoding="utf-8")
+        with self.assertRaises(HarnessError) as raised:
+            capture.main(
+                precheck_argv(self.root, self.digest)
+                + ["--clock-summary", str(summary)]
+            )
+        message = str(raised.exception)
+        self.assertIn(str(summary), message)
+        self.assertIn("already exists", message)
+
+    def test_a_LEFTOVER_SAMPLE_STREAM_stops_the_run_too(self) -> None:
+        """`run_sampler` refuses on EITHER path, so both are checked."""
+
+        summary = self.root / "clock-vllm.json"
+        capture.default_clock_samples_path(summary).write_text("", encoding="utf-8")
+        # A ZERO-BYTE leftover is still a refusal upstream: `run_sampler` asks
+        # `path.exists()`, not whether it holds anything.
+        self.assertFalse(summary.exists())
+        with self.assertRaises(HarnessError) as raised:
+            capture.main(
+                precheck_argv(self.root, self.digest)
+                + ["--clock-summary", str(summary)]
+            )
+        self.assertIn(
+            str(capture.default_clock_samples_path(summary)), str(raised.exception)
+        )
+
+    def test_an_UNUSED_evidence_directory_still_passes(self) -> None:
+        rc = capture.main(
+            precheck_argv(self.root, self.digest)
+            + ["--clock-summary", str(self.root / "fresh" / "clock-vllm.json")]
+        )
+        self.assertEqual(rc, 0)
+
     def test_a_re_quantized_checkpoint_stops_the_run(self) -> None:
         with self.assertRaises(HarnessError) as raised:
             capture.main(precheck_argv(self.root, "c" * 64))
@@ -1118,6 +1280,18 @@ class OurArmPrecheckEntryPointTest(unittest.TestCase):
             our_arm.main(argv)
         self.assertIn("no lease id", str(raised.exception))
 
+    def test_a_USED_EVIDENCE_DIRECTORY_stops_OUR_ARM_in_its_precheck_too(self) -> None:
+        """Both arms take `--clock-summary`, so both check it in the phase."""
+
+        summary = self.root / "clock-ours.json"
+        summary.write_text("{}", encoding="utf-8")
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(
+                our_arm_argv(self.root, self.digest) + ["--clock-summary", str(summary)]
+            )
+        self.assertIn(str(summary), str(raised.exception))
+        self.assertIn("already exists", str(raised.exception))
+
     def test_a_foreign_job_on_the_device_stops_the_run(self) -> None:
         with self.assertRaises(HarnessError) as raised:
             our_arm.main(
@@ -1400,6 +1574,58 @@ class ShellDriverTest(unittest.TestCase):
                     checked["workload"]["num_speculative_tokens"], 3, name
                 )
 
+    def test_a_USED_EVIDENCE_DIRECTORY_stops_the_GATE_in_its_PRECHECK_PHASE(self) -> None:
+        """The early stop, restored end to end.
+
+        `mkdir -p "${EVIDENCE}"` never asked whether the directory was already
+        used, and the precheck invocations passed no `--clock-summary`, so the
+        overwrite refusal was first evaluated when the ORACLE ARM opened its
+        window -- after `LLM(...)`. Here the oracle arm is reached only if the
+        precheck let it through, and it announces itself on stdout, so the
+        banner is the assertion.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            # WHAT A RERUN INTO A USED DIRECTORY FINDS.
+            (evidence / "clock-vllm.json").write_text("{}", encoding="utf-8")
+            payload = b"stand-in weights"
+            artifact = root / "model.safetensors"
+            artifact.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            completed = subprocess.run(
+                [
+                    "bash", str(self.SCRIPT),
+                    "--evidence", str(evidence),
+                    "--target", tmp,
+                    "--draft", tmp,
+                    "--oracle-commit", ORACLE_COMMIT,
+                    "--oracle-build-recipe", "pip install -e . at the beyond-pin head",
+                    "--attention-backend", "TRITON_ATTN",
+                    "--artifact", f"target={artifact}={digest}",
+                    "--our-binary", "/nonexistent/vllm-cli",
+                    "--our-model", str(artifact),
+                    "--our-artifact", f"our_target={artifact}={digest}",
+                    "--our-speculative-config",
+                    '{"method":"dflash","model":"' + str(artifact) + '","num_speculative_tokens":7}',
+                    "--our-build-recipe", "cmake --preset cuda-release",
+                    "--lease-id", "rc-42",
+                    "--assume-compute-processes", "[]",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+                env={"PATH": "/usr/bin:/bin", "HOME": tmp},
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("already exists", completed.stderr)
+            self.assertIn("clock-vllm.json", completed.stderr)
+            # THE ARM WAS NEVER STARTED, so no model was loaded to find out.
+            self.assertNotIn("== vLLM arm", completed.stdout)
+            self.assertFalse((evidence / "vllm-arm.json").exists())
+
     def test_a_run_with_no_lease_never_reaches_the_gpu(self) -> None:
         completed = subprocess.run(
             [
@@ -1418,6 +1644,39 @@ class ShellDriverTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("never ssh to a fleet box", completed.stderr)
+
+    def test_the_lease_id_DEFAULTS_to_the_variable_THIS_FLEET_EXPORTS(self) -> None:
+        """#1660: `RC_LEASE_ID` does not exist on this fleet; `RC_JOB_ID` does.
+
+        The leased `dgx:gpu0` worker carries `RC_DEVICE`, `RC_JOB_ID` and
+        `RC_TOKEN` and nothing else, so the `## Owed` O26 recipe run VERBATIM
+        on 2026-08-22 refused with "no lease id" before it touched anything.
+        The refusal is correct on a missing lease; the defect is that the
+        committed procedure could not satisfy its own gate.
+
+        Getting PAST the lease check and stopping on the NEXT required flag is
+        the assertion, because it is positive evidence rather than the absence
+        of one string.
+        """
+
+        completed = subprocess.run(
+            [
+                "bash", str(self.SCRIPT),
+                "--evidence", "/tmp/unused-dflash2-evidence",
+                "--target", "t", "--draft", "d",
+                "--oracle-commit", ORACLE_COMMIT,
+                "--attention-backend", "TRITON_ATTN",
+                "--artifact", "target=/x=" + "0" * 64,
+                "--our-binary", "b", "--our-model", "m",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp", "RC_JOB_ID": "a03f34e4"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("never ssh to a fleet box", completed.stderr)
+        self.assertIn("--our-artifact", completed.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -1439,8 +1698,19 @@ COMPLETION_TOKENS = 64
 
 
 class _StandInClock:
+    """Stands in for the MEASURED clock only, never for waiting.
+
+    `setUp` replaces the capture module's whole `time`, so `monotonic` and
+    `sleep` are delegated to the real one: `ClockWindow` waits for its sampler
+    through them, and a fake `monotonic` would either never time out or time
+    out at once. What the test owns is `perf_counter`, which is the clock the
+    arm's legs are measured with.
+    """
+
     def __init__(self) -> None:
         self.now = 1000.0
+        self.monotonic = time.monotonic
+        self.sleep = time.sleep
 
     def perf_counter(self) -> float:
         return self.now
@@ -1464,6 +1734,82 @@ class _StandInBackend:
     """`resolve_attention_backend` reads `__name__` off whatever it walks to."""
 
 
+class _StandInAttentionGroup:
+    """`vllm.v1.worker.gpu_model_runner`'s per-KV-cache-group attention group."""
+
+    def __init__(self, backend: str, layers: list[str]) -> None:
+        self.backend = type(backend, (), {})
+        self.layer_names = list(layers)
+
+
+#: The GDN groups the O26C walk resolved, by layer index. Eight hold five
+#: layers and two hold four, which is the shape that makes the per-backend sum
+#: a sum over groups rather than a group's own length.
+_O26C_GDN_GROUPS: tuple[tuple[int, ...], ...] = (
+    (0, 13, 26, 40, 53),
+    (1, 14, 28, 41, 54),
+    (2, 16, 29, 42, 56),
+    (4, 17, 30, 44, 57),
+    (5, 18, 32, 45, 58),
+    (6, 20, 33, 46, 60),
+    (8, 21, 34, 48, 61),
+    (9, 22, 36, 49, 62),
+    (10, 24, 37, 50),
+    (12, 25, 38, 52),
+)
+
+#: The full-attention groups, at every 4th index from 3 to 63.
+_O26C_TRITON_GROUPS: tuple[tuple[int, ...], ...] = (
+    (3, 19, 35, 51),
+    (7, 23, 39, 55),
+    (11, 27, 43, 59),
+    (15, 31, 47, 63),
+)
+
+#: The DFlash2 draft's sliding-window layers, which carry no `language_model.`
+#: prefix because they belong to the draft and not to the target.
+_O26C_FLASH_LAYERS: tuple[int, ...] = (64, 65, 66, 67, 68)
+
+
+def _stand_in_attn_groups() -> list[list[_StandInAttentionGroup]]:
+    """The THREE backends #1658 measured resolving at once on this model.
+
+    THE SHAPE HERE IS THE MEASURED ONE, and that is the whole point of #1666.
+    This fixture used to return one group per backend over `range(30)`,
+    `range(30, 46)` and `range(64, 69)`; the arbitrary 30 was then lifted out
+    of it into four files as what the leased run had resolved. It had not. The
+    run resolved 48 GDN layers in 10 groups, 16 in 4 and 5 in 1, and those are
+    re-derivable from `candidate_walks[...attn_groups]` in the run's own
+    `c-probe-result.json`. A stand-in is what the next reader copies a count
+    from, so it carries the real census and the real layer names.
+    """
+
+    return [
+        [
+            _StandInAttentionGroup(
+                "GDNAttentionBackend",
+                [f"language_model.model.layers.{i}.linear_attn" for i in group],
+            )
+        ]
+        for group in _O26C_GDN_GROUPS
+    ] + [
+        [
+            _StandInAttentionGroup(
+                "TritonAttentionBackend",
+                [f"language_model.model.layers.{i}.self_attn.attn" for i in group],
+            )
+        ]
+        for group in _O26C_TRITON_GROUPS
+    ] + [
+        [
+            _StandInAttentionGroup(
+                "FlashAttentionBackend",
+                [f"model.layers.{i}.self_attn.attn" for i in _O26C_FLASH_LAYERS],
+            )
+        ]
+    ]
+
+
 class _StandInLLM:
     """Enough of `vllm.LLM` for the capture loop, and nothing else.
 
@@ -1472,24 +1818,62 @@ class _StandInLLM:
     measurement. `generate` advances it by `GENERATE_SECS`.
     """
 
-    def __init__(self, clock, speculator, backend_name: str, completion_tokens: int, **kwargs):
+    def __init__(
+        self,
+        clock,
+        speculator,
+        backend_name: str,
+        completion_tokens: int,
+        observe=None,
+        legacy_attn_backend: bool = False,
+        attn_groups=None,
+        honours_kwarg: bool = True,
+        **kwargs,
+    ):
         self.kwargs = dict(kwargs)
         self._clock = clock
         self._speculator = speculator
         self._completion_tokens = completion_tokens
+        self._observe = observe or (lambda label: None)
+        self._observe("load")
         clock.now += LOAD_SECS
         backend = type(backend_name, (_StandInBackend,), {})
-        runner = type("ModelRunner", (), {"attn_backend": backend})()
+        # THE WHEEL THE LEASE MET. `GPUModelRunner` no longer carries
+        # `attn_backend` at the beyond-pin head (#1658): the resolved backend
+        # lives on `vllm_config.attention_config.backend`, and the per-layer
+        # truth lives in `attn_groups`, which resolves THREE backends at once
+        # on this model. `legacy_attn_backend` puts the retired attribute back,
+        # so the retired walks stay exercised rather than deleted.
+        runner_fields: dict = {"attn_groups": attn_groups or []}
+        if legacy_attn_backend:
+            runner_fields["attn_backend"] = backend
+        runner = type("ModelRunner", (), runner_fields)()
         driver = type("Worker", (), {"model_runner": runner})()
         executor = type("Executor", (), {"driver_worker": driver})()
         core = type("InprocClient", (), {})()
+        # The kwarg the run ASKED for decides what the engine RESOLVES, so a
+        # driver that never passes it cannot reach its declared denominator.
+        asked = self.kwargs.get("attention_backend")
+        config = self.kwargs.get("attention_config")
+        if isinstance(config, dict):
+            asked = config.get("backend", asked)
+        resolved = str(asked) if (asked and honours_kwarg) else backend_name
+        attention_config = type("AttentionConfig", (), {"backend": resolved})()
+        vllm_config = type("VllmConfig", (), {"attention_config": attention_config})()
         self.llm_engine = type(
-            "LLMEngine", (), {"engine_core": core, "model_executor": executor}
+            "LLMEngine",
+            (),
+            {
+                "engine_core": core,
+                "model_executor": executor,
+                "vllm_config": vllm_config,
+            },
         )()
         self.generate_calls = 0
 
     def generate(self, prompts, sampling):
         self.generate_calls += 1
+        self._observe("generate")
         self._speculator.propose()
         self._clock.now += GENERATE_SECS
         return [_StandInOutput(prompts[0], self._completion_tokens)]
@@ -1519,7 +1903,14 @@ class CaptureRunTest(unittest.TestCase):
         (self.root / "draft").mkdir()
         (self.root / "draft" / "draft.safetensors").write_bytes(payload)
         self.digest = hashlib.sha256(payload).hexdigest()
-        (self.root / "clock.json").write_text(json.dumps(clock_record()), encoding="utf-8")
+        # NOTHING IS PRE-WRITTEN HERE. `setUp` used to author `clock.json`, so
+        # every case received a summary that already existed and the driver's
+        # ORDERING was untestable -- which is why #1657 shipped green. The
+        # summary below is written by the arm's OWN sampler when it stops.
+        self.clock_summary = self.root / "clock-vllm.json"
+        self.clock_samples = self.root / "clock-vllm-samples.jsonl"
+        self.clock_running = self.root / "clock-vllm-samples.jsonl.running"
+        self.observed: list[tuple[str, bool]] = []
         self.env = {harness.SSE_PING_ENV: "0"}
         self._real_environ = capture.os.environ
         capture.os.environ = self.env  # type: ignore[assignment]
@@ -1543,7 +1934,14 @@ class CaptureRunTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def install_wheel(
-        self, *, backend_name: str = "TRITON_ATTN", completion_tokens: int = COMPLETION_TOKENS
+        self,
+        *,
+        backend_name: str = "TRITON_ATTN",
+        completion_tokens: int = COMPLETION_TOKENS,
+        legacy_attn_backend: bool = False,
+        attn_groups=None,
+        honours_kwarg: bool = True,
+        accepts: tuple[str, ...] = ("attention_config", "attention_backend"),
     ) -> types.SimpleNamespace:
         """Register a stand-in `vllm`, `torch` and speculator module."""
 
@@ -1563,10 +1961,38 @@ class CaptureRunTest(unittest.TestCase):
 
         speculator = DFlashSpeculator()
         built: list[_StandInLLM] = []
+        attempted: list[dict] = []
+
+        def _observe(label: str) -> None:
+            # WAS THE WINDOW OPEN AT THIS MOMENT? Not "did it ever open": the
+            # samples file SURVIVES the sampler, so reading it would answer
+            # yes to a window that had already closed, and a mutation that
+            # closes the window before the legs would then read as passing.
+            # The stub holds a `.running` marker for exactly as long as it is
+            # sampling and removes it when it stops.
+            self.observed.append((label, self.clock_running.is_file()))
 
         def _llm(**kwargs):
+            # A WHEEL REJECTS A KWARG IT DOES NOT DECLARE, with a `TypeError`,
+            # before it loads anything. `accepts` is which spelling THIS
+            # stand-in wheel knows, so the driver's search over the spellings
+            # is exercised rather than assumed.
+            for spelling in ("attention_config", "attention_backend"):
+                if spelling in kwargs and spelling not in accepts:
+                    raise TypeError(
+                        f"__init__() got an unexpected keyword argument {spelling!r}"
+                    )
+            attempted.append(dict(kwargs))
             llm = _StandInLLM(
-                self.clock, speculator, backend_name, completion_tokens, **kwargs
+                self.clock,
+                speculator,
+                backend_name,
+                completion_tokens,
+                observe=_observe,
+                legacy_attn_backend=legacy_attn_backend,
+                attn_groups=attn_groups,
+                honours_kwarg=honours_kwarg,
+                **kwargs,
             )
             built.append(llm)
             return llm
@@ -1578,7 +2004,7 @@ class CaptureRunTest(unittest.TestCase):
         vllm_mod.__file__ = "/workspace/wheel/vllm/__init__.py"
         sys.modules["vllm"] = vllm_mod
         return _types.SimpleNamespace(
-            built=built, speculator=speculator, cuda=torch_mod.cuda
+            built=built, attempted=attempted, speculator=speculator, cuda=torch_mod.cuda
         )
 
     def argv(self, **overrides: object) -> list[str]:
@@ -1590,7 +2016,8 @@ class CaptureRunTest(unittest.TestCase):
         return argv + [
             "--repeat", "2",
             "--max-tokens", str(COMPLETION_TOKENS),
-            "--clock-summary", str(self.root / "clock.json"),
+            "--clock-summary", str(self.clock_summary),
+            "--clock-sampler", json.dumps(clock_stub_argv()),
             "--output", str(self.root / "vllm-arm.json"),
         ]
 
@@ -1671,7 +2098,10 @@ class CaptureRunTest(unittest.TestCase):
         """The refusal is reachable through the arm, not only through the rule."""
 
         with self.assertRaises(HarnessError) as raised:
-            self.run_capture(backend_name="FLASH_ATTN")
+            # A WHEEL THAT IGNORES THE ASK. This is #1659 as it was measured:
+            # under a declared TRITON_ATTN the engine logged "Using FLASH_ATTN
+            # attention backend", because nothing had been passed to it.
+            self.run_capture(backend_name="FLASH_ATTN", honours_kwarg=False)
         self.assertIn("FLASH_ATTN", str(raised.exception))
         self.assertIn("TRITON_ATTN", str(raised.exception))
 
@@ -1717,6 +2147,310 @@ class CaptureRunTest(unittest.TestCase):
             self.run_capture(completion_tokens=COMPLETION_TOKENS - 1)
         self.assertIn("did not do the same amount of work", str(raised.exception))
 
+    def test_the_PROBE_LIST_reaches_the_wheel_the_LEASE_actually_met(self) -> None:
+        """#1658: all three committed walks raised `AttributeError` on the box.
+
+            REFUSED: backend: no probe resolved an attention backend off the
+            built engine (tried 3: ...model_runner.attn_backend, ...) --
+            AttributeError: 'GPUModelRunner' object has no attribute
+            'attn_backend'
+
+        The refusal was correct, loud and fallback-free, and O26 residual 1 is
+        DISCHARGED by it. The repair is the entry. This stand-in carries ONLY
+        the graph the live engine answered on -- `attn_backend` is absent --
+        so a list without the measured walk fails here rather than on a lease.
+        """
+
+        record = self.run_capture()
+        self.assertEqual(
+            record["attention_backend_probe"],
+            "llm_engine.vllm_config.attention_config.backend",
+        )
+        self.assertEqual(record["attention_backend"], "TRITON_ATTN")
+        for measured in (
+            "llm_engine.vllm_config.attention_config.backend",
+            "llm_engine.engine_core.engine_core.vllm_config.attention_config.backend",
+        ):
+            self.assertIn(measured, harness.BACKEND_PROBES)
+
+    def test_the_RETIRED_walk_still_resolves_where_it_still_EXISTS(self) -> None:
+        """The repair ADDS; it never drops a walk an older wheel answers on."""
+
+        record = self.run_capture(legacy_attn_backend=True)
+        self.assertIn(record["attention_backend_probe"], harness.BACKEND_PROBES)
+        self.assertEqual(record["attention_backend"], "TRITON_ATTN")
+
+    def test_a_wheel_that_answers_NO_walk_is_still_a_LOUD_REFUSAL(self) -> None:
+        """No fallback, no plausible label, every walk named."""
+
+        broken = types.SimpleNamespace(llm_engine=types.SimpleNamespace())
+        with self.assertRaises(HarnessError) as raised:
+            capture.resolve_attention_backend(broken)
+        message = str(raised.exception)
+        for probe in harness.BACKEND_PROBES:
+            self.assertIn(probe, message)
+        self.assertIn(f"tried {len(harness.BACKEND_PROBES)}", message)
+        self.assertIn("REFUSING rather than labelling the run", message)
+
+    def test_ONE_SCALAR_UNDER_DESCRIBES_this_model_so_the_MAP_is_recorded_too(self) -> None:
+        """#1658: `attn_groups` resolved THREE backends at once on the box.
+
+        48 `linear_attn` layers in 10 groups on `GDNAttentionBackend`, 16
+        `self_attn.attn` layers in 4 groups on `TritonAttentionBackend`, and
+        the DFlash2 draft's five sliding-window layers (`model.layers.64-68`)
+        in one group on `FlashAttentionBackend`. The stand-in below carries
+        that shape because a fixture is what a later reader copies the count
+        from; it read 30/16/5 in one group each until #1666.
+        The scalar stays -- it is what the DECLARED denominator is compared
+        against and what the golden carries -- and the map is recorded beside
+        it, because a run described by one string cannot show which layers ran
+        on what.
+        """
+
+        record = self.run_capture(attn_groups=_stand_in_attn_groups())
+        groups = record["attention_backend_groups"]
+        self.assertIn("attn_groups", groups["probe"])
+        self.assertEqual(
+            groups["backends"],
+            {
+                "GDNAttentionBackend": 48,
+                "TritonAttentionBackend": 16,
+                "FlashAttentionBackend": 5,
+            },
+        )
+        # THE SUM IS OVER GROUPS, not over one group's length: 15 groups carry
+        # the 69 layers, and eight of the ten GDN groups hold five while two
+        # hold four. The old one-group-per-backend fixture could not tell a
+        # correct sum from a `len()` of the last group it saw.
+        sequence = [entry["backend"] for entry in groups["groups"]]
+        self.assertEqual(
+            sequence,
+            ["GDNAttentionBackend"] * 10
+            + ["TritonAttentionBackend"] * 4
+            + ["FlashAttentionBackend"],
+        )
+        self.assertEqual(
+            [entry["layer_count"] for entry in groups["groups"]],
+            [5, 5, 5, 5, 5, 5, 5, 5, 4, 4] + [4, 4, 4, 4] + [5],
+        )
+        self.assertEqual(
+            groups["groups"][0]["layers"][0],
+            "language_model.model.layers.0.linear_attn",
+        )
+        self.assertEqual(
+            groups["groups"][10]["layers"][0],
+            "language_model.model.layers.3.self_attn.attn",
+        )
+        self.assertEqual(
+            groups["groups"][14]["layers"][0], "model.layers.64.self_attn.attn"
+        )
+        # Layer names are unique across groups on the measured walk, so the
+        # per-backend sum is also the unique-layer count. A fixture that
+        # repeated a name would let a double-count read as correct.
+        every = [name for entry in groups["groups"] for name in entry["layers"]]
+        self.assertEqual(len(every), 69)
+        self.assertEqual(len(set(every)), 69)
+        self.assertNotIn("miss", groups)
+        # The SCALAR is unchanged and still the thing that is gated.
+        self.assertEqual(record["attention_backend"], "TRITON_ATTN")
+
+    def test_a_MISSED_group_walk_is_RECORDED_and_never_an_EMPTY_MAP(self) -> None:
+        """An empty map reads as "one backend", which is the false claim."""
+
+        record = self.run_capture()  # no `attn_groups` payload at all
+        groups = record["attention_backend_groups"]
+        self.assertIsNone(groups["probe"])
+        self.assertIn("miss", groups)
+        self.assertNotIn("backends", groups)
+        # ...and it does NOT stop the arm: the map is descriptive, the scalar
+        # is what the ratio is compared against.
+        self.assertEqual(record["attention_backend"], "TRITON_ATTN")
+
+    def test_the_DECLARED_BACKEND_IS_PASSED_TO_THE_ENGINE(self) -> None:
+        """#1659: `capture()` built `LLM(...)` with no backend kwarg at all.
+
+        `attention_backend_reasons` requires `resolved == declared`, so with
+        the probe list repaired ALONE the arm would resolve `FLASH_ATTN`,
+        compare it against the declared `TRITON_ATTN` and refuse -- making the
+        declared denominator unreachable by ANY path. The ask is asserted on
+        the kwargs the engine was built with, not on the label read back.
+        """
+
+        record = self.run_capture()
+        self.assertEqual(len(self.wheel.attempted), 1)
+        self.assertEqual(
+            self.wheel.attempted[0]["attention_config"], {"backend": "TRITON_ATTN"}
+        )
+        self.assertEqual(record["attention_backend_kwarg"], "attention_config")
+
+    def test_a_wheel_that_SPELLS_IT_DIFFERENTLY_is_reached_by_the_SECOND_ask(self) -> None:
+        """The spelling is UNVERIFIED at the beyond-pin head, like the probes.
+
+        A rejected kwarg is a `TypeError` raised before anything loads, so the
+        search costs no lease time; a spelling that is ACCEPTED and ignored is
+        caught by the read-back, which is the same refusal as before.
+        """
+
+        record = self.run_capture(accepts=("attention_backend",))
+        # ONE engine was built: the first spelling was rejected before any
+        # load, so the search costs a `TypeError` rather than a model load.
+        self.assertEqual(len(self.wheel.built), 1)
+        self.assertEqual(len(self.wheel.attempted), 1)
+        self.assertEqual(self.wheel.attempted[0]["attention_backend"], "TRITON_ATTN")
+        self.assertNotIn("attention_config", self.wheel.attempted[0])
+        self.assertEqual(record["attention_backend_kwarg"], "attention_backend")
+
+    def test_a_wheel_that_takes_NEITHER_spelling_REFUSES_naming_BOTH(self) -> None:
+        with self.assertRaises(HarnessError) as raised:
+            self.run_capture(accepts=())
+        message = str(raised.exception)
+        for spelling in harness.ATTENTION_BACKEND_KWARGS:
+            self.assertIn(spelling, message)
+        self.assertIn("--attention-backend-kwarg", message)
+
+    def test_the_ARM_OWNS_ITS_CLOCK_WINDOW_so_the_SUMMARY_CAN_DESCRIBE_IT(self) -> None:
+        """#1657: the summary had to exist before the arm and describe it.
+
+        `open_clock_window` started the sampler and handed the arm
+        `--clock-summary <path>`; `gpu_clock_state` writes that path only when
+        the sampler STOPS, which is after the arm. On `dgx:gpu0` on 2026-08-22
+        the arm therefore refused before the model loaded:
+
+            REFUSED: cannot read the clock summary .../clock-vllm.json:
+            [Errno 2] No such file or directory
+
+        Pre-closing the window instead produced `every one of 98 clock samples
+        was idle; there is no window to attribute the measurement to`. Both
+        cannot hold, so the ARM owns the window now.
+
+        NOTHING is pre-written here: the summary does not exist when `main()`
+        is called, and the record carries the one the arm's own sampler wrote.
+        """
+
+        self.assertFalse(self.clock_summary.exists())
+        self.assertFalse(self.clock_samples.exists())
+        record = self.run_capture()
+        self.assertTrue(self.clock_summary.is_file())
+        self.assertEqual(record["clock"], clock_record())
+
+    def test_the_WINDOW_OPENS_AFTER_THE_LOAD_AND_COVERS_EVERY_TIMED_LEG(self) -> None:
+        """The window is the TIMED SPAN, which is why a pre-run one was idle.
+
+        A window that spans the 51.75 GiB load is mostly idle samples, and
+        `clock_reasons` floors the busy FRACTION at 50%. So the ordering is
+        asserted rather than assumed: the load is outside, every `generate` is
+        inside.
+        """
+
+        self.run_capture()
+        self.assertEqual(self.observed[0], ("load", False))
+        self.assertEqual(len(self.observed), 1 + 8)  # one load, 4 prompts x 2
+        for label, sampling in self.observed[1:]:
+            self.assertEqual((label, sampling), ("generate", True))
+
+    def test_a_run_whose_CLOCK_IS_UNUSABLE_yields_NO_NUMBER(self) -> None:
+        """The arm may run. The MEASUREMENT may not survive a bad window.
+
+        Moving the check after the arm must not weaken it, so an idle window --
+        the exact shape the pre-run window produced -- still refuses, and the
+        refusal names the arm. The record is written first, because 100 minutes
+        of leased evidence is the diagnosis and discarding it costs the next
+        run the same lease.
+        """
+
+        idle = clock_record()
+        idle["sm_clock_mhz"]["n"] = 2
+        idle["idle_samples_excluded"] = 96
+        wheel = self.install_wheel()
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(clock_stub_argv(idle))
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                capture.main(argv)
+        self.assertIn("DFlash2 oracle capture REFUSED", str(raised.exception))
+        self.assertIn("busy SM-clock sample", str(raised.exception))
+        # No number was printed...
+        self.assertEqual(sink.getvalue(), "")
+        # ...and the arm's evidence was kept, because it cost a lease.
+        self.assertTrue((self.root / "vllm-arm.json").is_file())
+        self.assertEqual(wheel.built[0].generate_calls, 8)
+
+    def test_a_sampler_that_REFUSES_AT_STOP_still_leaves_the_LEASES_EVIDENCE(self) -> None:
+        """The kept-evidence guarantee, on the branch that actually failed.
+
+        The case above and its our-arm twin hand the arm a summary the sampler
+        DID write, so both exercise `clock_reasons` on a bad window. The leased
+        run never got that far. `run_sampler` calls `build_clock_record` BEFORE
+        `write_json_atomic`, and that call raises on an entirely idle window --
+        the exact string #1657 quotes off `dgx:gpu0` -- so the sampler exits 2
+        having written NO summary. `close(read=True)` then raised out of the
+        `with` block, propagated out of `capture()`, and `main()` never reached
+        `write_json_atomic`: the whole golden went with it, records, blocks,
+        token ids and legs, which is the provenance O26 needs.
+        """
+
+        wheel = self.install_wheel()
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(
+            clock_stub_refusing_at_stop_argv()
+        )
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                capture.main(argv)
+        message = str(raised.exception)
+        self.assertIn("DFlash2 oracle capture REFUSED", message)
+        self.assertIn("sampled no clock window", message)
+        # The SAMPLER'S OWN diagnosis reaches the refusal, or the run stops
+        # with no way to tell an idle window from a dead `nvidia-smi`.
+        self.assertIn("every one of 98 clock samples was idle", message)
+        # Nothing quotable escaped...
+        self.assertEqual(sink.getvalue(), "")
+        # ...no summary was ever written, so the record's clock is NULL and
+        # says why...
+        self.assertFalse(self.clock_summary.exists())
+        record = json.loads((self.root / "vllm-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(record["clock"])
+        self.assertIn("every one of 98 clock samples was idle", record["clock_error"])
+        # ...and the two hours of leased evidence is on disk.
+        self.assertEqual(len(record["legs"]), 8)
+        self.assertEqual(len(record["records"]), 4)
+        self.assertEqual(record["records"][0]["blocks"][0]["anchor"], 4242)
+        self.assertEqual(wheel.built[0].generate_calls, 8)
+
+    def test_a_sampler_that_WILL_NOT_STOP_is_killed_and_the_EVIDENCE_SURVIVES(self) -> None:
+        """The kill path loses the golden identically, and separately.
+
+        `close` raises `did not stop within ...s and was killed` from its own
+        `TimeoutExpired` branch, which is a second exit out of the same `with`
+        block. Repairing only the non-zero-return branch would leave this one
+        discarding the lease.
+        """
+
+        wheel = self.install_wheel()
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(
+            clock_stub_ignoring_stop_argv()
+        )
+        saved = capture.CLOCK_STOP_TIMEOUT_S
+        capture.CLOCK_STOP_TIMEOUT_S = 0.5
+        self.addCleanup(setattr, capture, "CLOCK_STOP_TIMEOUT_S", saved)
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                capture.main(argv)
+        message = str(raised.exception)
+        self.assertIn("DFlash2 oracle capture REFUSED", message)
+        self.assertIn("sampled no clock window", message)
+        self.assertIn("was killed", message)
+        self.assertEqual(sink.getvalue(), "")
+        record = json.loads((self.root / "vllm-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(record["clock"])
+        self.assertIn("was killed", record["clock_error"])
+        self.assertEqual(len(record["legs"]), 8)
+        self.assertEqual(wheel.built[0].generate_calls, 8)
+
 
 class OurArmRunEntryPointTest(unittest.TestCase):
     """Past the precheck, into the loop -- where the SECOND refusal lives.
@@ -1736,7 +2470,11 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         (self.root / "target.gguf").write_bytes(payload)
         (self.root / "draft.gguf").write_bytes(payload)
         self.digest = hashlib.sha256(payload).hexdigest()
-        (self.root / "clock.json").write_text(json.dumps(clock_record()), encoding="utf-8")
+        # PRE-WRITES NOTHING, for the #1657 reason `CaptureRunTest` gives.
+        self.clock_summary = self.root / "clock-ours.json"
+        self.clock_samples = self.root / "clock-ours-samples.jsonl"
+        self.clock_running = self.root / "clock-ours-samples.jsonl.running"
+        self.observed: list[bool] = []
         self.env = {harness.SSE_PING_ENV: "0"}
         self._real_environ = our_arm.os.environ
         our_arm.os.environ = self.env  # type: ignore[assignment]
@@ -1751,6 +2489,10 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def fake_run(self, args, prompt: str) -> str:
+        # WAS THE WINDOW OPEN while this leg ran? `vllm-cli` is one process per
+        # prompt, so the arm's window necessarily spans its loads as well as
+        # its legs; what it may never do is miss a leg.
+        self.observed.append(self.clock_running.is_file())
         line = (
             "vllm-cli: run={run}/2 finish_reason=length prompt_tokens=5 "
             "completion_tokens={completion} secs=1.250 tok_s={tps}\n"
@@ -1769,7 +2511,8 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         return argv + [
             "--repeat", "2",
             "--max-tokens", "64",
-            "--clock-summary", str(self.root / "clock.json"),
+            "--clock-summary", str(self.clock_summary),
+            "--clock-sampler", json.dumps(clock_stub_argv()),
             "--output", str(self.root / "our-arm.json"),
         ]
 
@@ -1792,6 +2535,54 @@ class OurArmRunEntryPointTest(unittest.TestCase):
             self.run_arm()
         self.assertIn("did not do the same amount of work", str(raised.exception))
         self.assertIn("DFlash2 our-arm capture", str(raised.exception))
+
+    def test_OUR_ARM_OWNS_ITS_WINDOW_TOO_and_every_leg_ran_inside_it(self) -> None:
+        """#1657 blocked BOTH arms, so both are driven, not only the oracle."""
+
+        self.assertFalse(self.clock_summary.exists())
+        record = self.run_arm()
+        self.assertTrue(self.clock_summary.is_file())
+        self.assertEqual(record["clock"], clock_record())
+        self.assertEqual(self.observed, [True, True, True, True])
+
+    def test_our_arm_with_an_UNUSABLE_window_yields_NO_NUMBER_either(self) -> None:
+        idle = clock_record()
+        idle["sm_clock_mhz"]["n"] = 2
+        idle["idle_samples_excluded"] = 96
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(clock_stub_argv(idle))
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                our_arm.main(argv)
+        self.assertIn("DFlash2 our-arm capture REFUSED", str(raised.exception))
+        self.assertIn("busy SM-clock sample", str(raised.exception))
+        self.assertEqual(sink.getvalue(), "")
+        self.assertTrue((self.root / "our-arm.json").is_file())
+
+    def test_our_arm_KEEPS_ITS_EVIDENCE_when_the_sampler_REFUSES_AT_STOP(self) -> None:
+        """Both arms share `ClockWindow`, so both lost the run the same way."""
+
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(
+            clock_stub_refusing_at_stop_argv()
+        )
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                our_arm.main(argv)
+        message = str(raised.exception)
+        self.assertIn("DFlash2 our-arm capture REFUSED", message)
+        self.assertIn("sampled no clock window", message)
+        self.assertIn("every one of 98 clock samples was idle", message)
+        self.assertEqual(sink.getvalue(), "")
+        self.assertFalse(self.clock_summary.exists())
+        record = json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(record["clock"])
+        self.assertIn("every one of 98 clock samples was idle", record["clock_error"])
+        self.assertEqual(record["warm_legs"], 4)
+        self.assertEqual(self.observed, [True, True, True, True])
+
 
 if __name__ == "__main__":
     unittest.main()

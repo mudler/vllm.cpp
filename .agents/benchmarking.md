@@ -49,11 +49,30 @@ and the **boot id**.
 
 **Two harnesses call it today.** `scripts/dgx-online-serving.sh` records a
 clock window per leg, and `tools/bench/online_gate_summary.py` asserts it.
-`scripts/dflash2-speed-gate.sh` opens ONE WINDOW PER ARM and
+The DFlash2 speed gate takes ONE WINDOW PER ARM and
 `tools/bench/dflash2_speed_harness.py` delegates the whole judgement to this
 helper, including the cross-arm pairing — a single window spanning both arms
 cannot see the offset, and the offset is the term that transfers into the
-ratio. The
+ratio. **The ARM opens that window, not the shell that drives it**
+(`tools/bench/dflash2_oracle_capture.ClockWindow`, which runs this helper's own
+`sample` CLI). `scripts/dflash2-speed-gate.sh` used to start the sampler itself
+and hand the arm the summary path, and this helper writes that summary only when
+the sampler STOPS — so the arm refused with `[Errno 2] No such file or
+directory` before the model loaded, and closing the window first produced `every
+one of 98 clock samples was idle`. The summary had to describe the arm and to
+exist before it, and both cannot hold
+([#1657](https://github.com/mudler/vllm.cpp/issues/1657)). **The clock is a
+precondition of the MEASUREMENT and not of the arm's execution**: the arm runs,
+its sampler stops, the summary is written, and only then is it read and judged —
+and a run whose window turns out unusable writes its evidence and still yields no
+number. **That last clause is load-bearing on the branch where the sampler
+writes NOTHING**, which is the one the leased run met: this helper builds the
+record before it writes it, and it refuses an entirely idle window, so the
+sampler exits 2 with no summary at all. A window object that raises there
+discards the arm that already ran — every leg, record and token id — so it
+records the failure instead and lets the driver refuse once the evidence is on
+disk. A new harness that takes a window around work it drives itself should
+take the same shape. The
 trace and per-kernel harnesses — `finalize_*_trace.py`,
 `summarize_torch_kernels.py`, `gdn_packed_component.py` — are **not wired**, so
 a `us/call` or per-kernel figure from those paths carries **no clock

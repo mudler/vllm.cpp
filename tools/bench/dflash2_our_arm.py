@@ -38,7 +38,7 @@ open gaps that a plausible-looking number would close on paper only.
         --speculative-config '{"model":"/workspace/dflash2/draft.gguf","num_speculative_tokens":7}' \\
         --repeat 5 --max-tokens 64 \\
         --artifact target=/workspace/dflash2/target.gguf=<sha256> \\
-        --lease-id "$RC_LEASE_ID" --our-revision "$(git rev-parse HEAD)" \\
+        --lease-id "$RC_JOB_ID" --our-revision "$(git rev-parse HEAD)" \\
         --our-build-recipe "cmake --preset cuda-release" \\
         --clock-summary evidence/clock-ours.json \\
         --output evidence/our-arm.json
@@ -58,8 +58,9 @@ from typing import Any
 
 from tools.bench.dflash2_oracle_capture import (
     PROMPTS,
-    _load_clock,
     _parse_artifact,
+    add_clock_arguments,
+    clock_window,
     sample_compute_processes,
 )
 from tools.bench.dflash2_speed_harness import (
@@ -173,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-id", default="")
     parser.add_argument("--our-revision", default="")
     parser.add_argument("--our-build-recipe", default="")
-    parser.add_argument("--clock-summary", type=pathlib.Path)
+    add_clock_arguments(parser)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--precheck-only", action="store_true")
     parser.add_argument("--assume-compute-processes", type=json.loads, default=None)
@@ -246,18 +247,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(canonical_json({"precheck": "PASS", **checked}))
         return 0
 
-    clock = _load_clock(args.clock_summary)
-    require_no_reasons(clock_state_reasons(clock, label="ours"), what="DFlash2 our-arm capture")
-
+    # THE ARM OWNS ITS WINDOW, for the #1657 reason `ClockWindow` states: the
+    # summary is written when the sampler STOPS, so a driver that read it first
+    # could never start. Unlike the oracle arm, ours cannot exclude a model
+    # load from the window -- `vllm-cli` is one process per prompt and loads
+    # inside it -- so this window spans four loads and their legs. That is
+    # recorded rather than worked around: bounding it needs `vllm-cli` to mark
+    # its own leg boundaries, which this row does not own.
     legs: list[dict[str, Any]] = []
-    for prompt in checked["prompts"]:
-        legs += parse_legs(run_binary(args, prompt))
+    window = clock_window(args)
+    with window:
+        for prompt in checked["prompts"]:
+            legs += parse_legs(run_binary(args, prompt))
     require_no_reasons(
         leg_reasons(legs, max_tokens=args.max_tokens), what="DFlash2 our-arm capture"
     )
-    record = {**checked, **fold_legs(legs), "clock": clock, "binary": args.binary}
+    record = {**checked, **fold_legs(legs), "clock": window.record, "binary": args.binary}
+    # WRITTEN BEFORE THE CLOCK IS JUDGED, and nothing quotable is printed until
+    # it passes. Same rule as the oracle arm, same reason.
     if args.output is not None:
         write_json_atomic(args.output, record)
+    require_no_reasons(
+        clock_state_reasons(window.record, label="ours"), what="DFlash2 our-arm capture"
+    )
     print(canonical_json(record))
     return 0
 

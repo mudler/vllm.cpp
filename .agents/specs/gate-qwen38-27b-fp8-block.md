@@ -25,7 +25,10 @@ still owes. It is no longer blocked on the checkpoint, which was staged and
 verified on 2026-08-21; the arm is measured REACHED on that checkpoint; and the
 pinned oracle is measured on 2026-08-22 to LOAD that checkpoint on GB10 and
 generate from it, so the stop condition that would have ended this row before it
-started does not hold and the token gate is RUNNABLE. See [`## Now`](#now) and
+started does not hold and the token gate is RUNNABLE. On the same date that
+oracle's greedy decode was measured token-identical across three repeats and its
+attention backend was measured pinnable through the argument this pin honours,
+so the gate is WELL-POSED as well as runnable. See [`## Now`](#now) and
 [`## Owed`](#owed).
 **Owner:** unassigned
 
@@ -258,8 +261,12 @@ instruments beside it, each of which fails LOUDLY rather than degrading:
   ([#1679](https://github.com/mudler/vllm.cpp/issues/1679)), and
   `VLLM_ATTENTION_BACKEND` does not exist at the pin, so the backend each side
   executes is not yet pinned and `attention_backend="FLASHINFER"` is the lever
-  the pin honours. A refusal at gate time is still a finding this row reports
-  rather than substituting a weaker reference.
+  the pin honours. **That lever is now MEASURED to work**: on 2026-08-22 the
+  argument was accepted and the language-model path logged FLASHINFER, while the
+  vision tower and the multimodal encoder logged `FLASH_ATTN` in the same
+  process, because vLLM selects per path. What stays open in #1679 is why a
+  `FLASH_ATTN` path runs on this device at all. A refusal at gate time is still
+  a finding this row reports rather than substituting a weaker reference.
 - **R4. Memory.** 27.89 GiB of non-visual weights against the bf16 arm's ~54 GiB,
   which already ran on this box. Fit is expected, not established. Note that
   `gpu_memory_utilization` does not bound host RAM on GB10.
@@ -429,6 +436,74 @@ that the backend is chosen by the `LLM(..., attention_backend=...)` argument, so
 the probe may never have asked for FLASHINFER through a lever the pin honours.
 That is a recipe defect the gate run must not repeat.
 
+**The precondition probe, and every number it produced.** `rc` job
+`ebc8214b-9813-4a53-8711-9bacd4261d6f` ran on `dgx:gpu0` -- NVIDIA GB10, driver
+580.173.02, compute capability 12.1 -- on 2026-08-22. Its logs are on the share
+at `/mnt/nas_share/rc/fp8-precond/`: `job.log`, `precond.out` and `result.json`.
+**Only the ORACLE side ran**, on the same staged checkpoint
+`/workspace/ckpt/qwen38-27b-fp8`. The identity was asserted before anything
+else, from `/` so that no source tree could be imported by accident:
+`vllm.__version__` read `0.1.dev1+g555967922`, which carries the pin
+`5559679229bc961848b121ccdeaa8fa5d79bec98`, and `IDENTITY_RC=0`. The engine
+logged `Selected CutlassFp8BlockScaledMMKernel for Fp8LinearMethod` again. The
+verdict lines are `RESULT=PRECONDITIONS_MET` and `DONE_MARKER rc=0`.
+
+**Greedy determinism is MET on this workload.** Three identical greedy calls --
+`temperature=0.0`, `max_tokens=24`, prompt `"The capital of Italy is"`,
+`max_model_len=512`, `gpu_memory_utilization=0.55`, `enforce_eager=True` --
+returned byte-identical token ids all three times, compared on TOKEN IDS and not
+on text:
+
+```
+[21047, 13, 198, 760, 6511, 314, 14898, 369, 21047, 13, 198, 760,
+ 6511, 314, 14898, 369, 21047, 13, 198, 760, 6511, 314, 14898, 369]
+```
+
+`DETERMINISTIC=true`. That is the precondition
+[`## Design of the gate`](#design-of-the-gate) sets, so the token gate is
+well-posed and no distributional gate has to be ratified. **It is one prompt of
+24 tokens, on one device, on one date.** Determinism in general is not claimed
+here, and the gate run re-establishes it over its own seven-prompt set.
+
+**The backend is pinnable, and two backends run in one process.** The run passed
+`LLM(..., attention_backend="FLASHINFER")`, the lever `README-WHEELS.md` records
+this pin as honouring in place of the `VLLM_ATTENTION_BACKEND` environment
+variable that does not exist at the pin. The argument was accepted
+(`BACKEND_OK=FLASHINFER`) and the engine logged, in one process:
+
+| Engine log line | The path it names |
+|---|---|
+| `[cuda.py:422] Using AttentionBackendEnum.FLASHINFER backend.` | the language-model path |
+| `[flashinfer.py:822] FlashInfer resolved query dtypes: prefill=torch.bfloat16, decode=torch.bfloat16, decode_backend=flashinfer-native` | the same path, resolved |
+| `[cuda.py:541] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention` | the vision tower |
+| `[mm_encoder_attention.py:373] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.` | the multimodal encoder |
+
+**vLLM selects the attention backend PER PATH**, so the language-model path ran
+FLASHINFER while the tower and the encoder ran `FLASH_ATTN` beside it. Only the
+FLASHINFER configuration was attempted in this job and no fallback was reached.
+Read the four lines above as the measurement and not the job's own summary
+field, which reads `EXECUTED='unknown'` because it greps for the earlier log
+shape.
+
+**What this does to [#1679](https://github.com/mudler/vllm.cpp/issues/1679), and
+what it does not.** #1679 records that the feasibility run logged `FLASH_ATTN`
+against a recorded measurement that this wheel's FlashAttention carries no
+sm_12x code and should fail on GB10 with `cudaErrorUnsupportedPtxVersion`. This
+probe supplies a PARTIAL explanation: because the selection is per path, the
+earlier bare `Using FLASH_ATTN` line **may** have named the vision path rather
+than the decode path. **That is a hypothesis consistent with this evidence and
+it is not a demonstrated fact.** Nobody has re-read the earlier log to attribute
+its line to a path, and it does not explain why a `FLASH_ATTN` path ran at all
+on this device without the recorded PTX failure. #1679 stays OPEN on that
+second part.
+
+**This is not a gate result and it is not a speed result.** Our engine was not
+started in this job, no output was compared with anything, no teacher forcing
+was used, and [`## Gates`](#gates) is byte-for-byte what it was before the
+probe. No timing figure from this job is recorded anywhere or is admissible as
+one: no clock control (#1354), no denominator, no contention record,
+`enforce_eager=True`, and a cold load.
+
 **What a gate run must record, and none of it is optional:** the oracle identity
 asserted with an ABORT on mismatch (`vllm.__version__`, `flashinfer`, and
 `vllm.__file__`, because both memory instruments have been blind here before);
@@ -468,7 +543,13 @@ holds.
   revision must still stop rather than substitute another artifact, and because
   the share also holds two Qwen3.8 artifacts that are not this row's subject.
 - The oracle's greedy decode is not deterministic across three repeats. A
-  distributional gate is not pre-ratified and may not be substituted.
+  distributional gate is not pre-ratified and may not be substituted. **This
+  condition was MEASURED on 2026-08-22 and it does not fire.** `rc` job
+  `ebc8214b-9813-4a53-8711-9bacd4261d6f` captured three greedy decodes of one
+  prompt and compared them by token id: three byte-identical sequences,
+  `DETERMINISTIC=true`. The condition stays written, because one prompt of 24
+  tokens on one device on one date is not determinism in general, and a later
+  run that meets a non-deterministic decode must still stop and ask.
 - The oracle refuses `Qwen/Qwen3.8-27B-FP8` on GB10. **This condition was
   TESTED on 2026-08-22 and it did not fire.** `rc` job
   `0d5dfa6a-195f-4475-8527-538ad91102c8` measured the pinned oracle loading the
@@ -486,9 +567,11 @@ holds.
 
 `BLOCKED`. The gate is designed, its preconditions are audited, the checkpoint
 is staged, the arm is REACHED on that checkpoint, the pinned oracle is measured
-to load that checkpoint and generate from it, and the gate has not run. **No
-token of ours has been adjudicated against a token of the oracle's on this arm,
-on any device**, and no sentence in this tree may say otherwise.
+to load that checkpoint and generate from it, its greedy decode is measured
+token-identical across three repeats, its attention backend is measured
+pinnable, and the gate has not run. **No token of ours has been adjudicated
+against a token of the oracle's on this arm, on any device**, and no sentence in
+this tree may say otherwise.
 
 **The oracle-refusal stop condition is now MEASURED, and it does not hold.**
 `rc` job `0d5dfa6a-195f-4475-8527-538ad91102c8` on `dgx:gpu0`, 2026-08-22, ran
@@ -520,6 +603,44 @@ asserted here and the reason is unknown.
 [#1679](https://github.com/mudler/vllm.cpp/issues/1679) owns it, and the gate
 run has to pin the executed backend on both sides.
 
+**Two of the three unmeasured preconditions are now MEASURED, and both are
+met.** `rc` job `ebc8214b-9813-4a53-8711-9bacd4261d6f` on `dgx:gpu0`, 2026-08-22,
+ran the pinned oracle alone against the same staged checkpoint with the identity
+asserted first (`0.1.dev1+g555967922`, `IDENTITY_RC=0`).
+`RESULT=PRECONDITIONS_MET`, `DONE_MARKER rc=0`.
+
+1. **Greedy determinism.** Three identical greedy calls returned byte-identical
+   token ids all three times, compared by token id rather than by text:
+   `DETERMINISTIC=true`. The stop condition "the oracle's greedy decode is not
+   deterministic across three repeats" therefore does not fire, and the token
+   gate is well-posed rather than needing a ratified distributional gate. **This
+   is one prompt of 24 tokens on one device on one date**, so the gate run still
+   has to re-establish it over its own prompt set.
+2. **The backend is pinnable, and two backends run at once.** Passing
+   `LLM(..., attention_backend="FLASHINFER")` was accepted
+   (`BACKEND_OK=FLASHINFER`), the language-model path logged
+   `Using AttentionBackendEnum.FLASHINFER backend`, and the vision tower and the
+   multimodal encoder logged `FLASH_ATTN` in the same process. vLLM selects the
+   attention backend PER PATH. Only the FLASHINFER configuration was attempted
+   and no fallback was reached.
+
+**That gives [#1679](https://github.com/mudler/vllm.cpp/issues/1679) a PARTIAL
+explanation and does not close it.** Because the selection is per path, the
+earlier bare `Using FLASH_ATTN` line **may** have been the vision path rather
+than the decode path. **That is a hypothesis consistent with this evidence and
+not a demonstrated fact**: nobody has re-read the earlier log to attribute its
+line to a path, and it explains nothing about why a `FLASH_ATTN` path ran at all
+on GB10 without the recorded PTX failure. #1679 stays OPEN on that part.
+
+**And that probe is not a gate result either.** Only the oracle side ran, our
+engine was not started, nothing was compared, no teacher forcing was used, and
+[`## Gates`](#gates) is byte-for-byte unchanged by it. It produced no speed
+result and none may be derived from it: no clock control (#1354), no
+denominator, no contention record, `enforce_eager=True`, and a cold load. **The
+third precondition is untouched.** Whether `enforce_eager=True` is a deliberate
+gate choice or a feasibility shortcut is still owed, and this probe ran eager
+too, so it settles nothing there.
+
 **Staged is not reached, and reached is not gated. This row took the first of
 those two steps and not the second.** The REACHABILITY probe has RUN and
 returned `RESULT=REACHED`: `rc` job `15e0bfa4-53bc-4f1e-93ad-b9e939e22235` on
@@ -546,10 +667,10 @@ configurations are therefore UNEXERCISED on the model path by this run.
 `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` covers all three on seven shapes
 (#1437), and it stays the only coverage the other two have.
 
-**This row has taken two leases, both for probes and neither for the gate.** The
-first ran our side alone and no oracle; the second ran the oracle alone and no
-engine of ours. Neither compared a token, neither produced a performance number,
-and the row's gate is unchanged by both.
+**This row has taken three leases, all three for probes and none for the gate.**
+The first ran our side alone and no oracle; the second and the third ran the
+oracle alone and no engine of ours. None of them compared a token, none produced
+a performance number, and the row's gate is unchanged by all three.
 
 ## Owed
 
@@ -600,18 +721,29 @@ and the row's gate is unchanged by both.
   and it loaded it and generated from it: `rc` job
   `0d5dfa6a-195f-4475-8527-538ad91102c8`, `RESULT=ORACLE_FEASIBLE`,
   `DONE_MARKER rc=0`, with the identity asserted first. **The refusal this
-  bullet used to fear is measured and absent, and that is the whole of what it
-  discharges.** Three parts of gateability stay unmeasured, and the run
-  discharges none of them. The oracle's greedy decode has NOT been captured
-  three times and compared with itself, which
-  [`## Design of the gate`](#design-of-the-gate) makes the precondition of a
-  well-posed token gate. The executed attention backend is NOT pinned: the run
-  selected `FLASH_ATTN` after being asked for FLASHINFER through a variable that
-  does not exist at the pin
-  ([#1679](https://github.com/mudler/vllm.cpp/issues/1679)). And it ran under
+  bullet used to fear is measured and absent.** Three parts of gateability were
+  left unmeasured by that run. **Two of them were measured on 2026-08-22 by `rc`
+  job `ebc8214b-9813-4a53-8711-9bacd4261d6f`, and both are met.** The oracle's
+  greedy decode was captured three times and compared with itself by token id:
+  three byte-identical sequences, `DETERMINISTIC=true`, which is the precondition
+  [`## Design of the gate`](#design-of-the-gate) makes the condition of a
+  well-posed token gate, so no distributional gate has to be ratified. And the
+  backend is PINNABLE: `LLM(..., attention_backend="FLASHINFER")` was accepted,
+  the language-model path logged FLASHINFER, and the vision tower and the
+  multimodal encoder logged `FLASH_ATTN` beside it, because vLLM selects per
+  path. **Neither measurement is a promise about the gate run.** Determinism was
+  established on one prompt of 24 tokens on one device on one date, and the gate
+  run re-establishes it over its own seven-prompt set and records the backend
+  each side executed.
+  **The third part is UNCHANGED and still owed.** The probe ran under
   `enforce_eager=True`, a feasibility setting the gate run must choose
   deliberately rather than inherit, since [`## Gates`](#gates) forbids it as a
-  denominator. A refusal at gate time is still a finding.
+  denominator; running eager again settles nothing about it. A refusal at gate
+  time is still a finding.
+  [#1679](https://github.com/mudler/vllm.cpp/issues/1679) also stays OPEN. The
+  per-path selection is a PARTIAL and hypothetical explanation of its bare
+  `Using FLASH_ATTN` line, and it does not explain why a `FLASH_ATTN` path runs
+  on GB10 at all against the recorded sm_12x measurement.
 - **Every speed axis, by construction.** #1354 puts clock control outside a
   lease, so this row cannot produce a defensible ratio and does not try. The
   reachability probe took a lease under exactly that constraint, so its `tok_s`

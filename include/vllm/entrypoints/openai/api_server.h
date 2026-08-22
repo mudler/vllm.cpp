@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -267,12 +268,25 @@ class ApiServer {
   }
 
   // Attach the tokenizer + max_model_len backing /tokenize and /detokenize
-  // (non-owning; must outlive the server).
+  // (non-owning; must outlive the server). ALSO derives the request-boundary
+  // prompt-length bound below, because that bound is a property of exactly this
+  // pair and of nothing else. Defined out of line: it reads the tokenizer's
+  // vocabulary, and this header only forward-declares the type.
   void set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
-                     int64_t max_model_len) {
-    tokenizer_ = tokenizer;
-    max_model_len_ = max_model_len;
-  }
+                     int64_t max_model_len);
+
+  // SERVE-REQUEST-LENGTH-GUARD (#1541). The largest prompt, in BYTES, this
+  // server will hand to the tokenizer; 0 means unbounded.
+  //
+  // DERIVED, never configured: `max_model_len * tokenizer.MaxTokenBytes()`. The
+  // token texts of an encode concatenate back to the input, so a prompt of B
+  // bytes costs at least B / MaxTokenBytes() tokens; anything above this bound
+  // therefore exceeds max_model_len tokens and is already unservable. The bound
+  // thus refuses nothing InputProcessor::ValidatePromptLen would have accepted
+  // -- it only moves the refusal AHEAD of the encode that pays for it. Zero
+  // when no tokenizer is attached, or when max_model_len <= 0, which is the
+  // same "no context length is known" state ValidatePromptLen early-outs on.
+  size_t max_prompt_bytes() const { return max_prompt_bytes_; }
   // Enable GET /tokenizer_info (mirrors vLLM's `enable_tokenizer_info_endpoint`
   // CLI flag: off by default, so the route is absent → 404 unless enabled AND a
   // tokenizer is attached).
@@ -339,6 +353,16 @@ class ApiServer {
   std::mutex video_workers_mutex_;
   const vllm::tok::Tokenizer* tokenizer_ = nullptr;
   int64_t max_model_len_ = 0;
+  size_t max_prompt_bytes_ = 0;  // see max_prompt_bytes(); 0 == unbounded
+  size_t max_token_bytes_ = 0;   // the derivation's second factor, for the message
+
+  // SERVE-REQUEST-LENGTH-GUARD (#1541). nullopt when `prompt_bytes` is within
+  // max_prompt_bytes() (or the bound is unset); otherwise the 400
+  // BadRequestError NAMING the limit. It REFUSES. It never truncates, because a
+  // silently shortened prompt returns model output for text the caller did not
+  // send.
+  std::optional<DispatchResult> refuse_oversized_prompt(
+      size_t prompt_bytes) const;
   bool tokenizer_info_enabled_ = false;
   std::function<bool(bool, bool)> reset_prefix_cache_;
   std::function<int(const std::vector<std::string>&)> abort_requests_;

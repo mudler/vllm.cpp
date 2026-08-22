@@ -1634,6 +1634,240 @@ TEST_CASE("api_server: ConfigureUtilityEndpoints wires the production C8 surface
   }
 }
 
+// ─── SERVE-REQUEST-LENGTH-GUARD (#1541) ─────────────────────────────────────
+// #1365's algorithmic fix removed the QUADRATIC term from the BPE merge loop
+// (`67823aee2`: 64 KB in one pretoken, 23,620.695 ms -> 7.797 ms, exponent ~2
+// -> ~1). It added no BOUND, and a linear cost against httplib's 100 MB
+// CPPHTTPLIB_PAYLOAD_MAX_LENGTH is a smaller problem than a quadratic one
+// rather than the absence of one. There is no authentication anywhere in
+// src/vllm/entrypoints/, and /tokenize needs neither an engine nor a model, so
+// that cost is paid on an HTTP worker for an unauthenticated caller.
+//
+// The guard REFUSES and never truncates: a silently shortened prompt returns
+// model output for text the caller did not send. It sits at the REQUEST
+// BOUNDARY, before any tokenization -- NOT in
+// vllm::v1::InputProcessor::ValidatePromptLen, which needs the token count the
+// expensive step produces and therefore cannot run before it.
+//
+// THE BOUND IS DERIVED, not chosen. The token texts of an encode concatenate
+// back to the input, so a prompt of B bytes costs at least B / max_token_bytes
+// tokens, where max_token_bytes is the longest STORED token text in the loaded
+// vocabulary. A prompt longer than `max_model_len * max_token_bytes` therefore
+// exceeds max_model_len tokens and is already unservable, so the bound refuses
+// nothing ValidatePromptLen would have accepted. For this fixture
+// max_token_bytes is 9 -- the added token "<|end|>of"; the longest vocab entry
+// "Ġworld" is 7, since 'Ġ' is two UTF-8 bytes -- and kMaxModelLen is 32.
+//
+// Every case runs OVER A REAL SOCKET through the production wiring seam
+// ConfigureUtilityEndpoints, because a guard that only fires when a test calls
+// the parse function is the unpassed-parameter shape (.agents/reachability.md).
+constexpr size_t kMaxPromptBytes = static_cast<size_t>(kMaxModelLen) * 9;
+
+// Read the OpenAI ErrorResponse fields WITHOUT throwing when the body is not
+// one: a subcase whose request was (wrongly) served answers 200 with a normal
+// payload, and an .at() there would abort the whole TEST_CASE and hide every
+// later subcase's own verdict.
+std::string ErrType(const json& j) {
+  return j.value("error", json::object()).value("type", std::string());
+}
+int ErrCode(const json& j) {
+  return j.value("error", json::object()).value("code", 0);
+}
+std::string ErrMsg(const json& j) {
+  return j.value("error", json::object()).value("message", std::string());
+}
+
+TEST_CASE("api_server: an oversized prompt is REFUSED at the request boundary") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  auto with_server = [](ServerHarness& h, auto&& body) {
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    ScopedServerThread server_thread(h.server);
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(30, 0);
+    body(client);
+    server_thread.join();  // stops the server, then joins
+  };
+
+  // The unauthenticated, engine-free surface: /tokenize needs no model and no
+  // scheduler, so it is the one an anonymous caller reaches most cheaply.
+  SUBCASE("/tokenize: one byte over the bound is 400 and NOTHING is tokenized") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    with_server(h, [](httplib::Client& client) {
+      json req;
+      req["prompt"] = std::string(kMaxPromptBytes + 1, 'h');
+      auto r = client.Post("/tokenize", req.dump(), "application/json");
+      REQUIRE(r);
+      CHECK(r->status == 400);
+      json j = json::parse(r->body);
+      CHECK(ErrType(j) == "BadRequestError");
+      CHECK(ErrCode(j) == 400);
+      const std::string msg = ErrMsg(j);
+      // The refusal NAMES the limit and what arrived, which is what makes it
+      // actionable rather than a bare 400.
+      CHECK(msg.find("289") != std::string::npos);
+      CHECK(msg.find("288") != std::string::npos);
+      CHECK(msg.find("bytes") != std::string::npos);
+      // TRUNCATION DETECTOR. A guard that shortened the prompt to the bound
+      // instead of refusing it would answer 200 carrying a token list for text
+      // the caller never sent. There is no token list here at all.
+      CHECK_FALSE(j.contains("tokens"));
+      CHECK_FALSE(j.contains("count"));
+    });
+  }
+
+  // The bound is INCLUSIVE and it does not truncate below itself: a prompt AT
+  // the bound is tokenized whole, so the guard cannot be satisfied by a
+  // shortening step hidden anywhere on the path.
+  SUBCASE("/tokenize: a prompt AT the bound is tokenized in FULL") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    const std::string at_bound(kMaxPromptBytes, 'h');
+    const size_t expected = Fixture().EncodeWithSpecialTokens(at_bound).size();
+    REQUIRE(expected > 0);
+    with_server(h, [&](httplib::Client& client) {
+      json req;
+      req["prompt"] = at_bound;
+      auto r = client.Post("/tokenize", req.dump(), "application/json");
+      REQUIRE(r);
+      CHECK(r->status == 200);
+      json j = json::parse(r->body);
+      REQUIRE(j.contains("count"));
+      CHECK(j.at("count").get<size_t>() == expected);
+      CHECK(j.at("tokens").size() == expected);
+    });
+  }
+
+  // /v1/completions already answers 400 on an over-long prompt -- but only
+  // AFTER the encode, from ValidatePromptLen, and its message names the TOKEN
+  // limit. The byte bound has to fire FIRST, and say so.
+  SUBCASE("/v1/completions: refused on BYTES, before the encode") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    with_server(h, [](httplib::Client& client) {
+      json req;
+      req["model"] = "test-model";
+      req["prompt"] = std::string(kMaxPromptBytes + 1, 'h');
+      req["max_tokens"] = 1;
+      req["temperature"] = 0.0;
+      auto r = client.Post("/v1/completions", req.dump(), "application/json");
+      REQUIRE(r);
+      CHECK(r->status == 400);
+      json j = json::parse(r->body);
+      CHECK(ErrType(j) == "BadRequestError");
+      const std::string msg = ErrMsg(j);
+      CHECK(msg.find("289") != std::string::npos);
+      CHECK(msg.find("288") != std::string::npos);
+      CHECK(msg.find("bytes") != std::string::npos);
+      // It is the BYTE refusal, not the post-encode token one.
+      CHECK(msg.find("maximum model length") == std::string::npos);
+    });
+  }
+
+  SUBCASE("/v1/chat/completions: refused on the summed message BYTES") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    with_server(h, [](httplib::Client& client) {
+      // Split across two turns, so the sum is what is measured rather than any
+      // single field.
+      json req;
+      req["model"] = "test-model";
+      req["messages"] = json::array(
+          {{{"role", "user"}, {"content", std::string(200, 'h')}},
+           {{"role", "assistant"}, {"content", std::string(89, 'h')}}});
+      req["max_tokens"] = 1;
+      req["temperature"] = 0.0;
+      auto r =
+          client.Post("/v1/chat/completions", req.dump(), "application/json");
+      REQUIRE(r);
+      CHECK(r->status == 400);
+      json j = json::parse(r->body);
+      CHECK(ErrType(j) == "BadRequestError");
+      const std::string msg = ErrMsg(j);
+      CHECK(msg.find("289") != std::string::npos);
+      CHECK(msg.find("288") != std::string::npos);
+      CHECK(msg.find("bytes") != std::string::npos);
+    });
+  }
+
+  // The bound is a property of the REQUEST, so it is decided before the model
+  // is looked up -- mirroring vLLM, where validate_prompt_list_length is a
+  // pydantic model_validator (completion/protocol.py:536-553) and therefore
+  // runs at body validation, ahead of the router's check_model.
+  SUBCASE("/v1/completions: the bound is decided before the model lookup") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    with_server(h, [](httplib::Client& client) {
+      json req;
+      req["model"] = "no-such-model";
+      req["prompt"] = std::string(kMaxPromptBytes + 1, 'h');
+      req["max_tokens"] = 1;
+      auto r = client.Post("/v1/completions", req.dump(), "application/json");
+      REQUIRE(r);
+      CHECK(r->status == 400);  // not the 404 an unknown model would earn
+      CHECK(ErrMsg(json::parse(r->body)).find("288") != std::string::npos);
+    });
+  }
+}
+
+
+// The bound is DERIVED, so the derivation is what is pinned -- not the number.
+// A literal 288 in the cases above would still pass if the bound came from
+// somewhere else entirely.
+TEST_CASE("api_server: the prompt bound IS max_model_len x MaxTokenBytes") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  // The fixture's longest STORED token text: the added token "<|end|>of".
+  // "Ġworld" is 7, because the byte-level mark 'Ġ' (U+0120) is two UTF-8 bytes.
+  REQUIRE(Fixture().MaxTokenBytes() == 9);
+
+  SUBCASE("attached through the production seam: the product, exactly") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    CHECK(h.server.max_prompt_bytes() ==
+          static_cast<size_t>(kMaxModelLen) * Fixture().MaxTokenBytes());
+    CHECK(h.server.max_prompt_bytes() == kMaxPromptBytes);
+  }
+
+  SUBCASE("no tokenizer attached: unbounded, and the guard is inert") {
+    ServerHarness h(c, w, Fixture());
+    CHECK(h.server.max_prompt_bytes() == 0);
+    // Inert, not "small": an oversized prompt reaches the engine and earns the
+    // POST-encode token refusal instead, exactly as before this row.
+    json req;
+    req["prompt"] = std::string(kMaxPromptBytes + 1, 'h');
+    req["max_tokens"] = 1;
+    ApiServer::DispatchResult r = h.server.handle_completions(req.dump());
+    CHECK(r.status == 400);
+    CHECK(ErrMsg(json::parse(r.body)).find("maximum model length") !=
+          std::string::npos);
+  }
+
+  // Upstream's own "no context length is known" state
+  // (InputProcessor::ValidatePromptLen early-outs on max_model_len <= 0). A
+  // bound cannot be derived from it, so there is none.
+  SUBCASE("max_model_len <= 0: unbounded") {
+    ServerHarness h(c, w, Fixture());
+    h.server.set_tokenizer(&Fixture(), 0);
+    CHECK(h.server.max_prompt_bytes() == 0);
+    h.server.set_tokenizer(&Fixture(), kMaxModelLen);
+    CHECK(h.server.max_prompt_bytes() == kMaxPromptBytes);
+  }
+}
+
 // W2 port of test_async_llm.test_load at the HTTP boundary: concurrent workers
 // submit into one AsyncLLM queue and complete as one scheduler batch; there is
 // no server-wide engine mutex.

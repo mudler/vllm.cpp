@@ -22,8 +22,11 @@ pinning is unavailable inside an `rc` lease, which is why this row makes no
 speed claim.
 **Lifecycle:** `BLOCKED` -- on the gate RUN, which is the only thing this row
 still owes. It is no longer blocked on the checkpoint, which was staged and
-verified on 2026-08-21, and the arm is measured REACHED on that checkpoint; see
-[`## Now`](#now) and [`## Owed`](#owed).
+verified on 2026-08-21; the arm is measured REACHED on that checkpoint; and the
+pinned oracle is measured on 2026-08-22 to LOAD that checkpoint on GB10 and
+generate from it, so the stop condition that would have ended this row before it
+started does not hold and the token gate is RUNNABLE. See [`## Now`](#now) and
+[`## Owed`](#owed).
 **Owner:** unassigned
 
 ## Scope
@@ -244,12 +247,18 @@ instruments beside it, each of which fails LOUDLY rather than degrading:
 - **R2. A pass that measured the wrong kernel.** Mitigated by the three
   instruments above; each of them, not the token count, is what makes the pass
   mean something.
-- **R3. The oracle cannot load this checkpoint on GB10.** The FLASHINFER wheel
-  runs `Qwen/Qwen3.8-27B` bf16 there; it has **never** been run on the FP8 arm of
-  it. FlashAttention has no sm_12x code and cannot be built for it, which is
-  upstream and unfixable, so `attention_backend="FLASHINFER"` is the only
-  denominator available and `VLLM_ATTENTION_BACKEND` does not exist at the pin.
-  If the oracle refuses the checkpoint, that is a finding and the row reports it
+- **R3. The oracle cannot load this checkpoint on GB10. MEASURED 2026-08-22,
+  and it does not hold.** The pinned oracle loaded
+  `/workspace/ckpt/qwen38-27b-fp8` and generated from it on `dgx:gpu0`; the
+  numbers and the log paths are in [`## Evidence`](#evidence). Before that probe
+  the FLASHINFER wheel had been run on `Qwen/Qwen3.8-27B` bf16 there and
+  **never** on the FP8 arm of it, which is what made this risk live. The risk
+  stays written because what replaced it is narrower and still open: the run
+  selected `FLASH_ATTN` rather than the backend it was asked for
+  ([#1679](https://github.com/mudler/vllm.cpp/issues/1679)), and
+  `VLLM_ATTENTION_BACKEND` does not exist at the pin, so the backend each side
+  executes is not yet pinned and `attention_backend="FLASHINFER"` is the lever
+  the pin honours. A refusal at gate time is still a finding this row reports
   rather than substituting a weaker reference.
 - **R4. Memory.** 27.89 GiB of non-visual weights against the bf16 arm's ~54 GiB,
   which already ran on this box. Fit is expected, not established. Note that
@@ -350,6 +359,76 @@ not quoted here or anywhere else, because the run had no clock control (#1354),
 no contention record and no denominator, and because it was a cold first load.
 **No timing figure from that job is admissible as a performance number.**
 
+**The oracle-feasibility probe, and every number it produced.** `rc` job
+`0d5dfa6a-195f-4475-8527-538ad91102c8` ran on `dgx:gpu0` -- NVIDIA GB10, driver
+580.173.02, compute capability 12.1, aarch64 -- on 2026-08-22. Its logs are on
+the share at `/mnt/nas_share/rc/fp8-oracle/`: `job.log`, `probe.out` and
+`identity.log`. **Only the ORACLE side ran in that job.** Our engine was not
+started, no output was compared with anything, no teacher forcing was used, and
+[`## Gates`](#gates) is untouched by it.
+
+The oracle identity was asserted before anything else, from `/` so that the
+source tree could not be imported by accident.
+
+| What | Value |
+|---|---|
+| `vllm.__file__` | `/tmp/oracle-venv/lib/python3.12/site-packages/vllm/__init__.py` |
+| `vllm.__version__` | `0.1.dev1+g555967922`, which carries the pin `5559679229bc961848b121ccdeaa8fa5d79bec98` |
+| torch | `2.13.0+cu130`, with `cuda_available True` |
+| identity verdict | `IDENTITY_RC=0` |
+
+The wheel is the prebuilt one already on the share, and no oracle was rebuilt.
+
+**The oracle accepted the model.** It logged
+`Selected CutlassFp8BlockScaledMMKernel for Fp8LinearMethod`, then
+`Starting to load model /workspace/ckpt/qwen38-27b-fp8`, and reported
+`ORACLE_LOADED=1`. **It then generated**, greedy, at `temperature=0.0`,
+`max_tokens=24`, `max_model_len=512`, `gpu_memory_utilization=0.55`,
+`enforce_eager=True` and `trust_remote_code=True`, on the prompt
+`"The capital of Italy is"`:
+
+- text: `' Rome.\nThe capital of Italy is Rome.\nThe capital of Italy is Rome.\nThe capital of Italy is'`
+- token ids: `[21047, 13, 198, 760, 6511, 314, 14898, 369, 21047, 13, 198, 760, 6511, 314, 14898, 369, 21047, 13, 198, 760, 6511, 314, 14898, 369]`
+
+The verdict lines are `RESULT=ORACLE_FEASIBLE` and `DONE_MARKER rc=0`.
+
+**This is not a gate result and it is not a speed result.** It establishes
+exactly one thing: the stop condition "the oracle refuses
+`Qwen/Qwen3.8-27B-FP8` on GB10" does not hold, so the gate can be attempted. No
+timing figure from this job is recorded anywhere or is admissible as one -- the
+run had no clock control (#1354), no denominator and no contention record, it
+ran `enforce_eager=True`, and it was a cold load.
+
+**Do NOT read this decode against the reachability probe's decode.** The
+reachability job continued a list of capitals and this one repeats one sentence,
+and that difference is NOT evidence of divergence. The two runs used different
+harnesses and different sampling configuration and neither was teacher forced,
+so they are not comparable. Only a controlled two-sided run -- identical
+prompts, token counts, batching and sampling, both arms on the same artifact
+bytes, with teacher forcing at the adjudicated position -- can adjudicate a
+token, and this row still owes it.
+
+**The probe also produced one OPEN DISCREPANCY, which is filed rather than
+resolved.** The run exported `VLLM_ATTENTION_BACKEND=FLASHINFER`, and the engine
+logged `Using FLASH_ATTN attention backend out of potential backends:
+['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION']`, then loaded and
+generated on `FLASH_ATTN` with no attention-backend failure.
+`/mnt/nas_share/rc/oracle-vllm/README-WHEELS.md` records as a MEASURED claim
+that this wheel's FlashAttention carries no sm_12x code and that FA2 on GB10
+fails with `cudaErrorUnsupportedPtxVersion`, and
+[#1456](https://github.com/mudler/vllm.cpp/issues/1456) reaches the same
+conclusion from a from-source build at another revision. It did not fail here.
+**Neither side is asserted:** the README is not declared wrong, and `FLASH_ATTN`
+is not declared safe on GB10 because one decode completed. The reason is
+unknown. It matters because a gate pins the executed backend on both sides, and
+the oracle's selection here did not do what the environment asked.
+[#1679](https://github.com/mudler/vllm.cpp/issues/1679) owns it. One part of the
+run is already known to be wrong and explains nothing about the discrepancy: the
+same README records that `VLLM_ATTENTION_BACKEND` does not exist at this pin and
+that the backend is chosen by the `LLM(..., attention_backend=...)` argument, so
+the probe may never have asked for FLASHINFER through a lever the pin honours.
+That is a recipe defect the gate run must not repeat.
+
 **What a gate run must record, and none of it is optional:** the oracle identity
 asserted with an ABORT on mismatch (`vllm.__version__`, `flashinfer`, and
 `vllm.__file__`, because both memory instruments have been blind here before);
@@ -390,7 +469,13 @@ holds.
   the share also holds two Qwen3.8 artifacts that are not this row's subject.
 - The oracle's greedy decode is not deterministic across three repeats. A
   distributional gate is not pre-ratified and may not be substituted.
-- The oracle refuses `Qwen/Qwen3.8-27B-FP8` on GB10.
+- The oracle refuses `Qwen/Qwen3.8-27B-FP8` on GB10. **This condition was
+  TESTED on 2026-08-22 and it did not fire.** `rc` job
+  `0d5dfa6a-195f-4475-8527-538ad91102c8` measured the pinned oracle loading the
+  staged checkpoint on that device and generating from it
+  (`RESULT=ORACLE_FEASIBLE`), so the gate is runnable. The condition stays
+  written, because a later run that meets a refusal must still stop, and because
+  one load on one device on one date is not a promise about the next one.
 - The pinned oracle's checkout is not at `5559679229bc961848b121ccdeaa8fa5d79bec98`.
 - Any first divergence falls outside the band. Report the divergence, run no
   benchmark on this checkpoint, and do not attempt a fix.
@@ -400,9 +485,40 @@ holds.
 ## Now
 
 `BLOCKED`. The gate is designed, its preconditions are audited, the checkpoint
-is staged, the arm is REACHED on that checkpoint, and the gate has not run.
-`Qwen/Qwen3.8-27B-FP8` has still never been executed against the pinned oracle on
-this arm, on any device, and no sentence in this tree may say otherwise.
+is staged, the arm is REACHED on that checkpoint, the pinned oracle is measured
+to load that checkpoint and generate from it, and the gate has not run. **No
+token of ours has been adjudicated against a token of the oracle's on this arm,
+on any device**, and no sentence in this tree may say otherwise.
+
+**The oracle-refusal stop condition is now MEASURED, and it does not hold.**
+`rc` job `0d5dfa6a-195f-4475-8527-538ad91102c8` on `dgx:gpu0`, 2026-08-22, ran
+the pinned oracle -- identity asserted first, `vllm.__version__` reading
+`0.1.dev1+g555967922`, `IDENTITY_RC=0` -- against
+`/workspace/ckpt/qwen38-27b-fp8`. It logged
+`Selected CutlassFp8BlockScaledMMKernel for Fp8LinearMethod`, loaded the model,
+and generated 24 greedy tokens. `RESULT=ORACLE_FEASIBLE`, `DONE_MARKER rc=0`.
+That moves this row in exactly one way: the reference side is available on this
+device, so the token gate is RUNNABLE rather than hypothetical. The numbers and
+the log paths are in [`## Evidence`](#evidence).
+
+**What that probe did NOT do, written out because that distance is the point.**
+It ran the ORACLE side alone. Our engine was not started in that job, nothing
+was compared, no teacher forcing was used, and the token gate in
+[`## Gates`](#gates) is untouched and entirely owed. It produced no speed result
+and none may be derived from it: no clock control (#1354), no denominator, no
+contention record, `enforce_eager=True`, and a cold load. **And its decode may
+not be set against the reachability probe's decode.** Different harness,
+different sampling configuration, no teacher forcing on either side; the two
+outputs are not comparable, and the difference between them is not evidence of
+divergence. Only a controlled two-sided run under identical prompts, token
+counts, batching and sampling can adjudicate a token.
+
+**One open discrepancy came out of it.** The run asked for FLASHINFER through
+`VLLM_ATTENTION_BACKEND` and the oracle selected and ran `FLASH_ATTN`, which a
+recorded measurement says carries no sm_12x code on this device. Neither side is
+asserted here and the reason is unknown.
+[#1679](https://github.com/mudler/vllm.cpp/issues/1679) owns it, and the gate
+run has to pin the executed backend on both sides.
 
 **Staged is not reached, and reached is not gated. This row took the first of
 those two steps and not the second.** The REACHABILITY probe has RUN and
@@ -430,8 +546,10 @@ configurations are therefore UNEXERCISED on the model path by this run.
 `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` covers all three on seven shapes
 (#1437), and it stays the only coverage the other two have.
 
-**This row has taken a lease for the probe alone.** That lease ran no oracle, it
-produced no measurement, and the row's gate is unchanged by it.
+**This row has taken two leases, both for probes and neither for the gate.** The
+first ran our side alone and no oracle; the second ran the oracle alone and no
+engine of ours. Neither compared a token, neither produced a performance number,
+and the row's gate is unchanged by both.
 
 ## Owed
 
@@ -476,12 +594,24 @@ produced no measurement, and the row's gate is unchanged by it.
   the three tile configurations**: 912 of 912 GEMMs took swap_ab, because decode
   runs at `M = 1` against `swap_ab = (M <= 64) || (M % 4 != 0)`, so pingpong and
   default stay unexercised on the model path.
-- **The oracle's gateability on this arm.** The FLASHINFER wheel is measured to
-  run `Qwen/Qwen3.8-27B` bf16 on GB10. It has never been asked to load the FP8
-  artifact, so `gateable` for THIS arm is unmeasured rather than yes. The
-  reachability probe did not change this, because that lease ran our side alone
-  and never started the oracle. The lease that takes the gate measures it before
-  anything else, and a refusal is a finding.
+- **The oracle's gateability on this arm, which is now PARTLY measured.** The
+  FLASHINFER wheel was already measured to run `Qwen/Qwen3.8-27B` bf16 on GB10.
+  On **2026-08-22** it was asked for the first time to load the FP8 artifact,
+  and it loaded it and generated from it: `rc` job
+  `0d5dfa6a-195f-4475-8527-538ad91102c8`, `RESULT=ORACLE_FEASIBLE`,
+  `DONE_MARKER rc=0`, with the identity asserted first. **The refusal this
+  bullet used to fear is measured and absent, and that is the whole of what it
+  discharges.** Three parts of gateability stay unmeasured, and the run
+  discharges none of them. The oracle's greedy decode has NOT been captured
+  three times and compared with itself, which
+  [`## Design of the gate`](#design-of-the-gate) makes the precondition of a
+  well-posed token gate. The executed attention backend is NOT pinned: the run
+  selected `FLASH_ATTN` after being asked for FLASHINFER through a variable that
+  does not exist at the pin
+  ([#1679](https://github.com/mudler/vllm.cpp/issues/1679)). And it ran under
+  `enforce_eager=True`, a feasibility setting the gate run must choose
+  deliberately rather than inherit, since [`## Gates`](#gates) forbids it as a
+  denominator. A refusal at gate time is still a finding.
 - **Every speed axis, by construction.** #1354 puts clock control outside a
   lease, so this row cannot produce a defensible ratio and does not try. The
   reachability probe took a lease under exactly that constraint, so its `tok_s`

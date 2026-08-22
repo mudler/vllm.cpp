@@ -15,6 +15,7 @@ RAW_PROTOCOL_MARKER = "FOLLOWING_AGENTS_PROTOCOL"
 CHECKER = "scripts/check-commit-trailers.py"
 PROTOCOL_RULE = "trailers"
 ATTRIBUTION_RULE = "attribution"
+FRAMING_RULE = "framing"
 # The exact string the pull request template ships. Only the literal is
 # rejected, and only under --filled, so a real value containing it cannot exist.
 PLACEHOLDER_ASSISTED_BY = "AGENT:MODEL [TOOL]"
@@ -156,6 +157,41 @@ def parsed_trailers(message: str) -> str:
     return result.stdout
 
 
+# git's `find_patch_start` (trailer.c) ends a message at the first line that
+# begins `---` and whose NEXT character is whitespace. That is the
+# `git format-patch` divider convention, and `git interpret-trailers --parse`
+# honours it, so a trailer below one is not read. ASCII whitespace only, because
+# C's `isspace` in the default locale is ASCII and `str.isspace` is not: a
+# non-breaking space after `---` is a divider to Python and is not one to git.
+PATCH_DIVIDER_WHITESPACE = " \t\n\r\v\f"
+
+
+def patch_section_line(message: str) -> int | None:
+    """The 1-based line number of git's patch divider, or ``None``.
+
+    Mirrors `find_patch_start` character for character rather than describing
+    it, including the end-of-string case: git tests the character AFTER `---`,
+    and a message ending in a bare `---` with no newline has none, so it is not
+    a divider. `tests/scripts/test_check_commit_trailers.py` asserts every form
+    in this comment against `git interpret-trailers --parse` itself.
+    """
+
+    text = message.replace("\r\n", "\n").replace("\r", "\n")
+    number = 1
+    index = 0
+    while index < len(text):
+        if text.startswith("---", index):
+            following = text[index + 3 : index + 4]
+            if following and following in PATCH_DIVIDER_WHITESPACE:
+                return number
+        break_at = text.find("\n", index)
+        if break_at == -1:
+            break
+        index = break_at + 1
+        number += 1
+    return None
+
+
 def _paragraphs(message: str) -> list[str]:
     normalized = message.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     return re.split(r"\n[ \t]*\n+", normalized) if normalized else []
@@ -183,6 +219,34 @@ def _strict_errors(message: str) -> list[str]:
             f"[{PROTOCOL_RULE}] {RAW_PROTOCOL_MARKER} must appear exactly once "
             "as a separate paragraph before the trailer paragraph"
         )
+
+    # Reported INSTEAD of everything below, and reported before anything reads
+    # the trailer map. Once git has stopped reading at line N, that map is a
+    # measurement of a message nobody sent: on the body that opened #1563 it
+    # produced "Following-Agents-Protocol must appear exactly once" about a body
+    # carrying it exactly once, which sends the reader to count occurrences
+    # instead of to the framing. The marker check above reads the raw
+    # paragraphs, is unaffected by the truncation, and therefore stays.
+    #
+    # NOT repaired with `git interpret-trailers --no-divider`, which is one flag
+    # and would report the body clean. A `git format-patch`/`git am` round trip
+    # of such a commit returns the subject and the first paragraph with
+    # `%(trailers)` EMPTY, and exits 0. The divider deletes the rest of the
+    # message; the gate's job is to predict what lands (#1563).
+    divider = patch_section_line(message)
+    if divider is not None:
+        line = message.replace("\r\n", "\n").replace("\r", "\n").split("\n")[
+            divider - 1
+        ]
+        errors.append(
+            f"[{FRAMING_RULE}] line {divider} is {line!r}, which git reads as the "
+            "PATCH DIVIDER: everything below it leaves the message, so no "
+            "trailer under it can be parsed and a `git am` round trip deletes "
+            "it. Under `squash_merge_commit_message = PR_BODY` this body IS the "
+            "commit message. Delete the line, or write the horizontal rule as "
+            "`***` or `___`, neither of which is a divider"
+        )
+        return errors
 
     trailers = _trailer_map(message)
     protocol = trailers.get("following-agents-protocol", [])
@@ -482,7 +546,11 @@ def main() -> int:
         # placeholder, which this repository's own specs and pull request bodies
         # do whenever they document the flag. Found by running this check on the
         # body of the pull request that introduces it.
-        if args.filled:
+        # Skipped when the framing rule fired, for the same reason that rule
+        # returns early: the trailer map read past a divider is not evidence.
+        if args.filled and not any(
+            error.startswith(f"[{FRAMING_RULE}]") for error in errors
+        ):
             placeholders = [
                 value
                 for _, value in _trailer_map(message).get("assisted-by", [])

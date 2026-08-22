@@ -235,6 +235,14 @@ supported.
   is malformed rather than unsupported; a GGUF that fails this and whose
   original `tokenizer.json` loads was damaged by its converter. Before this
   check the same file loaded and then failed on some prompts instead.
+- `prompt length N bytes exceeds the maximum allowed prompt length of M bytes`
+  is a 400 from `/tokenize`, `/v1/completions` or `/v1/chat/completions`. The
+  server refuses a prompt it could never serve BEFORE tokenizing it, and it
+  never truncates one. There is no option to raise the limit, because it is
+  derived rather than configured: it is `max_model_len` multiplied by the
+  longest token in the loaded vocabulary, so any prompt above it needs more
+  than `max_model_len` tokens and would be refused after tokenizing anyway.
+  Send a shorter prompt, or load a checkpoint with a longer context.
 
 ## Find a focused guide
 

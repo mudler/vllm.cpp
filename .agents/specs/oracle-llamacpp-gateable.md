@@ -205,7 +205,63 @@ deletes its own tree, and it installs nothing globally.
   because that is #857 again on a new object and it is a record decision.
 - Do not run the quant-matched comparison. Return to the operator instead.
 
+## Outcome
+
+**The pin builds and runs. `gateable` is `yes`.** The measurement ran on
+2026-08-22 in one `rc` lease on `thor:gpu0`, job
+`d96c2867-4344-4064-84e3-d3a04a1b1925`, and every gate in §"Gates" passed. The
+identity chain, both recipes, the generated text and the raw log are in
+[`../../docs/bench-evidence/oracle-llamacpp-b10451-gateable-20260822.md`](../../docs/bench-evidence/oracle-llamacpp-b10451-gateable-20260822.md).
+
+| Gate | Result |
+|---|---|
+| 1. Object and label agree on the remote | PASS. `fetch_commit_rc=0`, `fetch_tag_rc=0`, `src_head` = `tag_b10451_commit` = the pin |
+| 2. Source tree is the pin and nothing else | PASS. `git_status_porcelain_bytes=0` |
+| 3. Artifact is the recorded one | PASS. Header parses, data end equals file size, and the worker-local sha256 equals `7e78da5d...c6fe169` |
+| 4. Build produces a binary | PASS. `configure_rc=0`, `build_rc=0`, `llama-completion` executable |
+| 5. Model generates | PASS. `run_rc=0`, 228 stdout bytes against a 29-byte prompt, `common_perf_print` present |
+| 6. Timings not gated | Held. Recorded and marked unquotable in the evidence file |
+| 7. Record gate agrees | PASS, and mutation-proved four ways |
+
+What was measured, and it changed the plan: at `b10451` `llama-cli` is a
+server-backed chat client behind `LLAMA_BUILD_SERVER`, so the one-shot binary is
+`llama-completion`. The spec fixed that before the run rather than discovering
+it in a failure.
+
+What was rejected: `dgx:gpu0`, because it was held with four jobs queued and
+this work uses no GPU; `orin:gpu0`, because its `/workspace` is local disk
+without the artifact and 32 GB leaves no headroom over a 17 GB model; running
+the artifact from CIFS, because llama.cpp mmaps it; and `llama-bench`, which was
+built but deliberately not run, so this row produces no number anyone can quote
+as a floor.
+
+Why each default has its value: `-j 4` because unconstrained parallelism has
+OOM-rebooted a fleet box. `GGML_NATIVE=ON` because a user gets a native build,
+so a floor must be one, at the cost of a per-host binary sha256. Static
+libraries so the recorded sha256 covers the whole binary.
+
+One fact the run produced that outlives it: llama.cpp loads 851 of the
+artifact's 866 tensors and ignores all 15 of `blk.64`, including the four
+`nextn.*` multi-token prediction tensors. A quant-matched comparison is
+therefore not automatically a matched-work comparison. Recorded for #821 and
+#1003 in the evidence file and in the oracle record.
+
+The checker mutations, all four red and each restored byte-for-byte:
+
+| Mutation | Reported |
+|---|---|
+| `gateable = yes` with `evidence = #857` | `an issue is a promise of a measurement, not one` |
+| `gateable = yes` with a non-existent path | `evidence path ... does not exist in this tree` |
+| `gateable = no` with a path | refused: a `no` record must name the owing issue as an issue reference |
+| Evidence file deleted, record untouched | `evidence path ... does not exist in this tree` |
+
+The fourth is the one that matters most: it proves the flag is tied to a file
+that has to keep existing, not to a string somebody typed once.
+
 ## Now
 
 Claimed 2026-08-22 from `08c81a89218906cac08209a63c6301f03fdc8ec7`. The spec
-lands before the measurement, and the measurement decides the record edit.
+landed before the measurement, the measurement passed, and the record now says
+`yes` against a path in this tree. #857 is discharged. Owed elsewhere and not
+here: every floor (#1003), the vllm.cpp comparison (#821 W3), and a GB10 build,
+which #1003's per-host re-takes carry.

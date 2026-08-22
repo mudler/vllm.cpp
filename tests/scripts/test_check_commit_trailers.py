@@ -872,5 +872,241 @@ class LandedMessageExceptions(unittest.TestCase):
         self.assertIn("malformed Assisted-by", result.stderr)
 
 
+class PatchSectionFraming(unittest.TestCase):
+    """A `---` line is git's PATCH DIVIDER, and the checker must say so (#1563).
+
+    `squash_merge_commit_message = PR_BODY` makes a body the landed commit
+    message, and git's `find_patch_start` ends a message at the first line that
+    begins `---` and continues with whitespace. Everything below one leaves the
+    message. Three shapes were measured at `db648fb88` with the `---` as the
+    only difference, and none of them reported the cause: the rule ABOVE the
+    trailers reported the trailers as missing while the body carried each
+    exactly once, and the rule BELOW the trailers, plus the three-hyphen
+    separator shape, both passed GREEN.
+
+    This is the AUTHOR-side half of the class `SquashShapes` covers from the
+    FORGE side. The forge writes `---------`, which is NOT a divider, and its
+    treatment is unchanged; the two cases sit in one file so the difference
+    between nine hyphens and three stays executable.
+    """
+
+    BODY = (
+        "policy(ROW): a subject (#1)\n\n"
+        "A body paragraph that explains the reason.\n\n"
+        "FOLLOWING_AGENTS_PROTOCOL\n\n"
+        "Following-Agents-Protocol: true\n"
+        "AI-Assisted: true\n"
+        "Assisted-by: AGENT:claude-opus-5 [Claude Code]"
+    )
+    COAUTHOR = "Co-authored-by: Ettore Di Giacinto <mudler@localai.io>"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.checker = load_checker()
+
+    def framing(self, message: str) -> list[str]:
+        return [
+            error
+            for error in self.checker.validate_commit_message(message, strict=True)
+            if error.startswith("[framing]")
+        ]
+
+    def test_the_detector_agrees_with_git_line_for_line(self) -> None:
+        """The rule is git's, so it is asserted against git and not restated.
+
+        Each form is handed to `git interpret-trailers --parse`, which is the
+        program the checker already shells out to. A divider truncates the
+        message, so the trailer below it disappears from the parse; a form that
+        is not a divider leaves it there. The detector must predict exactly
+        that, for every form, with no case left to a description.
+        """
+        forms = {
+            "---": True,
+            "--- ": True,
+            "--- a/file.c": True,
+            "\t---": False,
+            "----": False,
+            "---x": False,
+            "---------": False,
+            # NOT a divider, and the case that makes the ASCII guard
+            # load-bearing: `str.isspace()` calls U+00A0 whitespace and
+            # git's ASCII `isspace` does not, so a detector written with
+            # the obvious Python idiom reports a line git walks past.
+            "---\u00a0": False,
+        }
+        for line, is_divider in forms.items():
+            with self.subTest(line=line):
+                message = f"subject\n\n{line}\n\nTrailer-Key: value\n"
+                parsed = subprocess.run(
+                    ["git", "interpret-trailers", "--parse"],
+                    input=message, text=True, capture_output=True, check=True,
+                )
+                git_lost_the_trailer = "Trailer-Key: value" not in parsed.stdout
+                self.assertEqual(
+                    git_lost_the_trailer, is_divider,
+                    f"git 2.x disagrees about {line!r}: {parsed.stdout!r}",
+                )
+                detected = self.checker.patch_section_line(message)
+                self.assertEqual(
+                    detected == 3, is_divider,
+                    f"detector said {detected!r} for {line!r}",
+                )
+
+    def test_a_divider_as_the_last_line_without_a_newline_is_not_one(self) -> None:
+        """git tests the character AFTER `---`, and at end of string there is
+        none. Mirrored exactly rather than rounded off, because a detector that
+        is stricter than git reports a line git does not act on."""
+        self.assertIsNone(self.checker.patch_section_line("subject\n\n---"))
+        self.assertEqual(self.checker.patch_section_line("subject\n\n---\n"), 3)
+
+    def test_a_rule_above_the_trailers_names_the_line_not_the_trailers(self) -> None:
+        """The reported defect at `db648fb88`. The body carries
+        `Following-Agents-Protocol` exactly once and the checker said it must
+        appear exactly once, which sends the reader to count occurrences."""
+        message = (
+            "subject\n\nprose\n\n---\n\nmore prose\n\n"
+            "FOLLOWING_AGENTS_PROTOCOL\n\n"
+            "Following-Agents-Protocol: true\nAI-Assisted: true\n"
+            "Assisted-by: AGENT:claude-opus-5 [Claude Code]\n"
+        )
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(self.framing(message), errors)
+        self.assertTrue(any("line 5" in error for error in errors), errors)
+        self.assertFalse(
+            any("must appear exactly once" in error for error in errors),
+            f"the trailer map is not evidence once git stopped reading: {errors}",
+        )
+
+    def test_a_rule_below_the_trailers_is_red(self) -> None:
+        """Was GREEN. `test_prose_after_the_trailers_still_fails` pins that
+        trailing prose is red; writing `---` above that prose made the same body
+        pass, because git truncates there and the block becomes the last
+        paragraph of what it reads."""
+        message = f"{self.BODY}\n\n---\n\nnotes nobody parses\n"
+        self.assertTrue(self.framing(message), "a divider below the block is red")
+
+    def test_a_three_hyphen_separator_before_the_co_author_is_red(self) -> None:
+        """Was GREEN. `join_trailing_trailer_paragraphs` steps over a paragraph
+        of three or more hyphens, so the fuse deleted the divider before git saw
+        it while the LANDED message still carries it."""
+        message = f"{self.BODY}\n\n---\n\n{self.COAUTHOR}\n"
+        self.assertTrue(self.framing(message), "the fuse must not hide a divider")
+
+    def test_a_diff_header_is_red(self) -> None:
+        """The convention this exists for. A message that quotes a diff was
+        already broken; now it says so."""
+        message = f"{self.BODY}\n\n--- a/src/vt/gemm.cpp\n+++ b/src/vt/gemm.cpp\n"
+        self.assertTrue(self.framing(message), "a diff header is a divider")
+
+    def test_the_forge_separator_is_untouched(self) -> None:
+        """The regression this row must not cause. `---------` is not a divider
+        and `617d6f452` is the landed proof; Part 1's treatment of it stands."""
+        message = f"{self.BODY}\n\n---------\n\n{self.COAUTHOR}\n"
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+    def test_the_other_markdown_rules_are_not_dividers(self) -> None:
+        """What the error tells the author to use instead has to actually pass,
+        or the message sends them to a second red."""
+        for rule in ("***", "___", "----"):
+            with self.subTest(rule=rule):
+                block = self.BODY[self.BODY.index("FOLLOWING"):]
+                message = (
+                    f"subject\n\nprose\n\n{rule}\n\nmore prose\n\n{block}\n"
+                )
+                self.assertEqual(self.framing(message), [])
+
+    def test_the_shipped_template_carries_no_divider(self) -> None:
+        """The template is what an author starts from, so a divider in it would
+        be shipped rather than authored."""
+        template = (ROOT / ".github/pull_request_template.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIsNone(self.checker.patch_section_line(template))
+
+    def test_the_template_warns_the_author(self) -> None:
+        """The gate refuses the body; the template is where the author is told
+        before they write it."""
+        template = (ROOT / ".github/pull_request_template.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("---", template)
+        self.assertRegex(template, r"(?s)horizontal rule.*\*\*\*")
+
+    def test_no_reachable_commit_carries_a_divider(self) -> None:
+        """The measurement that licenses applying this to the RANGE walk too.
+
+        A landed message cannot be repaired, so a rule that any landed commit
+        already violates would turn the main lane permanently red. Zero of the
+        3118 commits reachable from `main` at `db648fb88` carry a divider line.
+        This re-derives it rather than quoting it, and it fails loudly and by
+        name if one ever lands, instead of the range walk going red for a
+        reason nobody can see.
+        """
+        log = subprocess.run(
+            ["git", "-C", str(ROOT), "log", "--format=%H%x00%B%x00", "HEAD"],
+            text=True, capture_output=True, check=True,
+        ).stdout
+        records = [r for r in log.split("\x00") if r]
+        offenders = []
+        checked = 0
+        for sha, message in zip(records[0::2], records[1::2]):
+            checked += 1
+            line = self.checker.patch_section_line(message)
+            if line is not None:
+                offenders.append((sha.strip()[:12], line))
+        self.assertGreater(checked, 3000, f"only {checked} commits were read")
+        self.assertEqual(offenders, [], f"{checked} commits read")
+
+    def test_the_cli_reports_the_framing_rule_and_exits_one(self) -> None:
+        """The door that CI and `scripts/agent-pr-body.py` both drive."""
+        with tempfile.TemporaryDirectory() as directory:
+            body = Path(directory) / "body"
+            body.write_text(
+                f"{self.BODY}\n\n---\n\nnotes\n", encoding="utf-8"
+            )
+            result = subprocess.run(
+                [sys.executable, str(CHECKER), "--message-file", str(body),
+                 "--filled"],
+                text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("[framing]", result.stderr)
+        self.assertIn("patch divider", result.stderr.casefold())
+
+
+class WhichBodyIsRead(unittest.TestCase):
+    """The two doors read DIFFERENT bytes, and this row does not blur that.
+
+    The framing rule lands in the shared `validate_commit_message`, so both
+    doors gain it. That is not the same as the two doors agreeing about WHICH
+    body they hold to it, and #1263 is what happens when the difference is
+    assumed away: CI reads the FROZEN `pull_request` event payload from the last
+    push, `scripts/agent-pr-body.py --pr` reads the LIVE body, and the squash
+    lands the live body. A body edited after the final push is therefore green
+    in CI and lands unread.
+    """
+
+    def test_ci_reads_the_frozen_event_payload(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("PR_BODY: ${{ github.event.pull_request.body }}", workflow)
+        self.assertIn('--message-file "$body_file" --filled', workflow)
+        self.assertNotIn("gh pr view", workflow)
+
+    def test_the_local_command_reads_the_live_body(self) -> None:
+        tool = (ROOT / "scripts/agent-pr-body.py").read_text(encoding="utf-8")
+        self.assertIn('"gh", "pr", "view", str(number)', tool)
+        self.assertIn('"--json", "body"', tool)
+        self.assertNotIn("github.event", tool)
+
+    def test_the_spec_names_which_is_which(self) -> None:
+        spec = (ROOT / ".agents/specs/squash-separator.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FROZEN event payload", spec)
+        self.assertIn("the LIVE body", spec)
+
+
 if __name__ == "__main__":
     unittest.main()

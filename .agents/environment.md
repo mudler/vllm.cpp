@@ -761,7 +761,7 @@ environment:
     | | |
     |---|---|
     | user | `uid=0(root) gid=0(root)` in the k3s pod `rc-worker-<id>`, 14 CPUs, aarch64 |
-    | present | `bash git curl wget gcc/g++ 13.3.0 make cmake 3.28.3 ninja 1.11.1 pkg-config python3 3.12.3 pip flock readelf` |
+    | present | `bash sh git curl wget gcc/g++ 13.3.0 make cmake 3.28.3 ninja 1.11.1 pkg-config python3 3.12.3 pip flock` — this list is exactly what was probed, and `readelf`/`objdump` were NOT among them |
     | `nvcc` | NOT on `PATH`, but **installed**: `/usr/local/cuda`, `/usr/local/cuda-13`, `/usr/local/cuda-13.0`. One `export PATH=/usr/local/cuda/bin:$PATH` gives **nvcc 13.0.88**, the same version the deleted image supplied |
     | ABSENT | **`shellcheck`**, **`cuobjdump`**, **`nsys`**, `sudo`, `docker` — and `cuobjdump` stays absent after the `PATH` prepend, which matters below |
     | `nvidia-smi` | plain, no `sudo`, **exit 0 with ZERO bytes on stderr**, reporting `NVIDIA Thor`, driver 595.78, `compute_cap 11.0` |
@@ -838,7 +838,11 @@ environment:
     `unhealthy (no contact)` with `out of the pool: worker_lost`, and the job
     died at SIGTERM. Host memory was NOT the cause — the sampler read 116 GiB
     available one minute before contact was lost, so this is not the
-    overcommit-collapse signature below. **Report free space, reclaim every tree
+    overcommit-collapse signature below. **`worker_lost` on this box did not
+    self-heal**: the device still read `unhealthy (no contact 2h38m)` more than
+    two and a half hours later, and clearing a quarantined device needs an admin
+    token and is a human's call. There is no second sm_110 device to fall back
+    to, so an sm_110 gate simply stops until somebody restores it. **Report free space, reclaim every tree
     the lane has left behind rather than only your own, refuse rather than build
     into a nearly full disk, and remove your tree when you finish.** A CUDA build
     that runs out of space surfaces as unrelated compile errors, which is the
@@ -867,10 +871,13 @@ environment:
     stderr discarded, an absent tool and a clean-but-empty result look
     identical, which is how a run on 2026-08-19 recorded an empty histogram
     without noticing. **Install the reader explicitly and assert it**
-    (`apt-get install -y cuda-cuobjdump-13-0`), or fall back to `readelf -S`
-    for a `.nv_fatbin` section plus the arch strings in the fatbin headers — and
-    label that substitute as the weaker check it is, because it shows what the
-    object CONTAINS but not that each object carries exactly one cubin. **Until
+    (`apt-get install -y cuda-cuobjdump-13-0`), and assert the binary is there
+    before you trust the histogram. A `readelf -S` fallback reading the
+    `.nv_fatbin` section, plus the arch strings in the fatbin headers, would be a
+    weaker substitute — weaker because it shows what an object CONTAINS but not
+    that each object carries exactly one cubin — and **whether `readelf` is even
+    in the worker is itself UNMEASURED**, so do not plan on it without probing
+    first. **Until
     somebody runs it with the reader present, treat "30 objects, one `sm_110`
     cubin each" as an unverified 2026-08-15 claim rather than a standing fact.**
     It is recorded here as owed.

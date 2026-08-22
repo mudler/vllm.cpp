@@ -160,12 +160,17 @@ Owned by row `MUSIC3-DIT-ARM-REACH`, per `.agents/reachability.md` and
   the identical residual `minimax-music3.md` §19.7 carries for the depth arm, and
   it closes with a `thor:gpu0` leg under an `rc` lease, not on a CPU runner.
   **#1131 stays open for it.**
-* **The engine's `release_host=true` staging is exercised only at reduced
-  geometry** ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
-  `MUSIC3-DIT-ARM-REACH`). The selector honours the flag and the CPU path's
-  non-release is gated; the 9.7 GB peak the flag exists for is a property of the
-  real checkpoint on Jetson Thor and is measured by `minimax-music3.md` §14, not
-  here.
+* **The selector's `release_host` pass-through on the DEVICE path is not
+  gated** ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
+  `MUSIC3-DIT-ARM-REACH`). MEASURED, not assumed: mutation M4b below replaces
+  `release_host` with a literal `false` inside `Music3SelectDitArm` and every
+  suite stays green. The reason is the same structural one — on a CPU-only build
+  the device path is either not taken or refuses at staging, so the flag never
+  reaches `StageMusic3DitWeights` from the selector. What IS gated is
+  `release_host`'s own semantics (`release_host EMPTIES the source, and the
+  staged copy still runs`, same file) and the CPU path's non-release (the new
+  selection case). The 9.7 GB peak the flag exists for is a property of the real
+  checkpoint on Jetson Thor and belongs to `minimax-music3.md` §14.
 
 ## Stop conditions
 
@@ -175,3 +180,88 @@ the design is wrong, not the test); a fabricated non-CPU queue reaches a CUDA
 code path on a CUDA build; the fixture's denoise cannot be made to run without
 touching a file the concurrent vocoder row owns; or closing the engine's call
 site would need a GPU lease.
+
+## Outcome
+
+Taken on a Release CPU-only build (gcc 13.3.0, `-Werror`,
+`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_METAL=OFF
+-DVLLM_CPP_TENSTORRENT=OFF`). No GPU, no `rc` lease, no checkpoint.
+
+**Which head the numbers are from, because two are involved and pretending
+otherwise would be the easy lie.** The six-mutation sweep ran at `1edbd74a0`.
+That commit was then amended to `d307c3587` to add the `docs/USAGE.md` claim its
+`include/vllm/` edit obliges — `scripts/check-doc-checkpoint.py` classifies every
+path under `include/vllm/` as `user_usage`, and it judges each commit
+individually. The amend touched no compiled input, and that is measured rather
+than argued: all four test binaries hash **identically** across it
+(`test_minimax_music3_acoustic` `65415857…`, `_speech` `f4238f8a…`, `_ar`
+`7f35c50e…`, `test_music3_profile` `e86c7f47…`). M1 and M5 — the acceptance
+criterion and the residual — were additionally re-run at `d307c3587` and gave
+the identical verdicts recorded below.
+
+### The green gate
+
+| suite | test cases | assertions | Status |
+|---|---|---|---|
+| `test_minimax_music3_acoustic` | 39 / 39 passed | 386 / 386 passed | SUCCESS! |
+| `test_minimax_music3_speech` | 9 / 9 passed | 223 / 223 passed | SUCCESS! |
+| `test_minimax_music3_ar` | 37 / 37 passed | 649 / 649 passed | SUCCESS! |
+| `test_music3_profile` | 7 / 7 passed | 50 / 50 passed | SUCCESS! |
+| `test_speech_engine` | 11 / 11 passed | 38 / 38 passed | SUCCESS! |
+
+The three new cases are 3 cases and 41 assertions of the acoustic total (14 + 6
++ 21); with them excluded the suite is 36 cases / 345 assertions. The counts are
+reported because a count is the only thing that separates a gate from a case that
+returned early, and this suite already carries one of those: `the DEVICE-resident
+DiT matches upstream on CUDA` runs **0 assertions** on a CPU-only build and
+prints a loud SKIP. Pre-existing, unchanged, and named here so no reader takes
+the 386 as CUDA coverage.
+
+`non-CPU DiT selection: 0 staged, 5 refused by name` on this build — every
+fabricated device took the refusal arm, which is the honest outcome when no
+second backend is registered, and the case asserts the third outcome cannot
+happen either way.
+
+### The mutations
+
+Every row reports `compile_rc` **before** any verdict, the applied hunk count,
+`git diff --stat`, and the mutated binary `sha256`; the tree was restored
+byte-for-byte after each and all four binaries hashed back to baseline
+(`RESTORE VERIFIED: True`, six times).
+
+| id | mutation | compile_rc | `test_minimax_music3_acoustic` |
+|---|---|---|---|
+| M1 | `on_device = false` in `Music3DenoiseChunks` — **#1131's own mutation 1, the production call site** | 0 | **RED** — 38/39 cases, 375/376 assertions, `FAILURE!`; `REQUIRE(device_bucket != nullptr)` |
+| M2 | `Music3DenoiseDeviceArm::half_set() -> false` — **#1131's own mutation 2** | 0 | **RED** — 38/39 cases, 382/386 assertions, `FAILURE!`; both predicates and both loop refusals |
+| M3 | `Music3SelectDitArm` returns a disengaged arm for every queue | 0 | **RED** — 38/39 cases, 380/386 assertions, `FAILURE!`; 5 devices silently took the host arm plus the outcome count |
+| M4 | selector drops `release_host` (first spelling) | **1** | **NO VERDICT** — `-Werror=unused-parameter` orphaned the parameter. Recorded rather than dropped: a mutation that fails to build reads as a passing test |
+| M4b | the same, in a form that compiles | 0 | GREEN — the residual `## Owed` names |
+| M6 | the `denoise.dit_device` LABEL kept and `DitForwardDevice`'s body replaced by `DitForward` | 0 | **RED** — 38/39 cases, 378/379 assertions, `FAILURE!`; `REQUIRE(pack != nullptr)` |
+| M5 | the ENGINE's one-line call to `Music3SelectDitArm` deleted | 0 | GREEN — the residual `## Owed` names |
+
+M1 is the acceptance criterion of `.agents/reachability.md` `## The reachability
+mutation`: deleting the production call site reds the focused gate. M6 is why the
+gate reads two instruments and not one — with only the profile bucket, a forward
+that had been swapped for the host one under an unchanged label would have passed.
+
+M1's assertion total is 376 rather than 386 because `REQUIRE` aborts the case; the
+count is reported as measured rather than normalised.
+
+### What was rejected, and why
+
+**A gate that constructs `Music3SpeechEngine` was rejected.** It would be the
+direct answer to M5 and it cannot exist here: the constructor resolves a 28.5 GB
+checkpoint, and `SpeechEngineDeviceType` refuses device 1 on a CPU-only build
+before a queue is made. Building a synthetic checkpoint would gate the loader,
+not the switch.
+
+**Moving the staging inside `Music3DenoiseChunks` was rejected.** It would remove
+the deletable engine line entirely, and it changes a public seam with an `= {}`
+default that `test_minimax_music3_e2e_real.cpp` already uses, for a gain that is
+a mutation artefact rather than a capability.
+
+**An `Music3DitDeviceForwardCount()` counter was rejected in favour of the
+existing spans.** #1309 already landed `Music3DepthDeviceForwardCount()` and no
+production run reads it; the `dit.*` spans and the `denoise.dit_*` buckets are
+instruments the engine's own `profile::Report` prints, so they answer the
+reachability question without adding a symbol whose only reader is a test.

@@ -443,6 +443,40 @@ FIRST on the truncating build are the truncation detectors —
 the gate distinguishes a refusal from a shortened success rather than only
 checking that the request did not hang.
 
+### The post-merge rerun
+
+`origin/main` advanced to `5539686c7` (`MUSIC3-DIT-ARM-REACH`, #1131) while this
+row was being gated, so it was merged at `73964532d` and everything was run
+again on the merged head. The incoming change touches the MiniMax-Music3 speech
+model, its device header, one test and `docs/USAGE.md`; the only file both sides
+edit is `docs/USAGE.md`, where the two additions land in different sections.
+
+Rebuild from the same directory: **566 of 566 targets, zero compiler warnings**,
+then `ninja: no work to do` on a confirming pass. All twelve suites re-run as
+their own executables: identical case and assertion counts to the table above,
+every one `SUCCESS!` and exit 0.
+
+Every record checker re-run with `--base 5539686c7`: `check-commit-trailers`,
+`check-commit-style`, `check-doc-checkpoint`, `check-now-current`,
+`check-issue-index-append-only`, `check-pr-size`, `check-agent-record`,
+`check-public-doc-tables`, `check-symbol-anchors`, `check-test-registration`,
+`check-surface-coverage`, `check-conflict-markers`, `check-env-doc`,
+`check-readme-structure`, `check-role-discipline`, `check-prompt-contract`,
+`check-supported-models`, `check-quickstart-recipes`, `check-site`,
+`check-model-checklist`, `check-fusion-consistency`,
+`check-runner-routing-consistency`, `check-oracle-pins`, `check-snapshot-pins`,
+`check-gate-commands --check` -- 25 of 25 rc 0. The range gates EXECUTED against
+the real landing tree rather than skipping on a stale base.
+
+**Two known non-findings are recorded rather than left implicit.**
+`scripts/check-windows-portability.py` exits 1 on this tree AND at `db648fb88`
+with the identical message, `CMakeLists.txt: MSVC /W4 /WX policy is negated on
+the C/C++ compile by /w`; this row does not touch `CMakeLists.txt`.
+`scripts/agent-preflight.sh` reported `test_cpu_x86_llamacpp_floor` failing at a
+1-minute load average of 30.96 on a 20-core box shared with another session's
+build; re-run at load 15.21 it is 10 of 10 `OK`, exit 0. That is the load
+sensitivity #618 records, not a regression.
+
 ### Why each default has its value
 
 **The bound is `max_model_len * MaxTokenBytes()` and not a round number.** It is

@@ -441,3 +441,41 @@ loud failure, which is the protection #577 asked for and did not get.
   refuted as that cause: the pool was 36 against an offered concurrency of 8. It
   is a real mirror gap and needs its own change, because the next person raising
   `--max-num-seqs` for throughput silently raises the HTTP ceiling with it.
+- [#1737](https://github.com/mudler/vllm.cpp/issues/1737) — **a request the
+  scheduler can never admit hangs forever with zero bytes, and our advertised
+  `max_model_len` is one block larger than the servable KV.** Found on
+  2026-08-22 while chasing the sharper stall the 2026-08-22 comment on
+  [#931](https://github.com/mudler/vllm.cpp/issues/931) reported on `dgx:gpu0`,
+  which that reporter could not pursue because the box is bounded by
+  [#1647](https://github.com/mudler/vllm.cpp/issues/1647). **#931's own cause is
+  fixed and closed; this is a second defect with the same client-visible
+  signature**, and it reproduces OFF-GPU: a CPU build of `vllm-server` on
+  `facebook/opt-125m` with `--num-blocks 4 --block-size 16` and one
+  non-streaming `/v1/completions` request of 6 prompt + 56 output tokens
+  returns `curl: (28) ... with 0 bytes received` after 150 s, while `/health`
+  answers 200 and `/metrics` reads `num_requests_waiting 1`,
+  `num_requests_running 0`, `kv_cache_usage_perc 0.0` and
+  `num_preemptions_total 1`. `VT_SERVER_VERBOSE=1` shows 48,285 consecutive
+  `core-step end model_executed=0` heartbeats — the CPU equivalent of the
+  `0 %, 11.43 W` GPU reading in the #931 comment. **Mechanism, measured:** the
+  auto-fit advertises `max_model_len = num_blocks x block_size` because
+  `ResolveMaxModelLen` (`model_loader.cpp:1508`) reconstructs `available` from
+  the full block count, while only `(num_blocks - 1) x block_size` is
+  allocatable — block 0 is the reserved null block (`block_pool.cpp:53-57`,
+  `:453`). A request inside the advertised context is therefore admitted,
+  decodes until the pool is exhausted, preempts ITSELF (it is the only request
+  in flight), and can never be re-admitted. **Two halves, and they separate.**
+  The silent-wedge half is shared with vLLM, whose v1 scheduler breaks out of
+  the same loop and leaves the request waiting (`sched/scheduler.py:934-938` at
+  the pinned `555967922`), so changing it is a DIVERGENCE and needs a decision
+  rather than a patch. The off-by-one half is ours. Neither is fixed here: the
+  arithmetic change tightens an assertion
+  `tests/vllm/entrypoints/test_loaded_engine_dense.cpp:635-660` currently pins
+  (`params.num_blocks = 1` asserting `max_model_len == 32`), which the in-flow
+  rule excludes and which needs its own row, spec and fresh review. **It is NOT
+  established that this is what the #931 comment hit** — that report used a
+  22-token request against a 27B checkpoint, nowhere near any advertised
+  context. What transfers is the SHAPE and a one-command discriminator that
+  needs no new code: restart that server with `VT_SERVER_VERBOSE=1` and read the
+  heartbeat during the stall, because `model_executed=0` against a non-zero
+  `unfinished` count puts the search on the KV pool rather than on `AsyncLLM`.

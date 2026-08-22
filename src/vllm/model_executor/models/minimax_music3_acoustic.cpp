@@ -21,6 +21,7 @@
 // former.
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
 #include "vllm/model_executor/models/vocoder1d.h"
+#include "music3_profile.h"  // profile::Timer -- the vocoder.decode_window split (#1664)
 
 #include <algorithm>
 #include <cmath>
@@ -684,6 +685,9 @@ VocoderWeights VocoderWeightsFromLoader(const MiniMaxMusic3VocoderConfig& config
 
 void VocoderSnake(std::vector<float>& x, int64_t channels, int64_t length,
                   const std::vector<float>& alpha) {
+  // A LEAF of the `vocoder.decode_window` split (#1664). The bracket is free
+  // with `VLLM_CPP_MUSIC3_PROFILE` unset: one predicted branch, no clock read.
+  profile::Timer timer("vocoder.snake");
   RequireSize(x, channels * length, "snake input");
   RequireSize(alpha, channels, "snake alpha");
   // W1's finding: Music3's `MiniMaxMusic3Snake1d` IS this function with a null
@@ -697,18 +701,28 @@ std::vector<float> VocoderResidualUnit(const std::vector<float>& in, int64_t dim
                                        const VocoderResidualUnitWeights& weights,
                                        int64_t* out_len) {
   RequireSize(in, dim * length, "residual unit input");
-  std::vector<float> hidden = in;
+  std::vector<float> hidden;
+  {
+    profile::Timer timer("vocoder.copy");
+    hidden = in;
+  }
   VocoderSnake(hidden, dim, length, weights.snake1_alpha);
   // `pad = (7 - 1) * dilation // 2` (minimax_music3_vocoder.py:39) — a
   // symmetric ZERO pad, the `padding=` argument of the nn.Conv1d itself.
   const int64_t pad = (7 - 1) * dilation / 2;
   int64_t padded_len = 0;
-  const std::vector<float> padded =
-      vocoder1d::Pad1d(hidden, dim, length, pad, pad, /*replicate=*/false, &padded_len);
+  std::vector<float> padded;
+  {
+    profile::Timer timer("vocoder.pad");
+    padded = vocoder1d::Pad1d(hidden, dim, length, pad, pad, /*replicate=*/false, &padded_len);
+  }
   int64_t conv_len = 0;
-  std::vector<float> conv =
-      vocoder1d::Conv1d(padded, dim, padded_len, weights.conv1_weight, &weights.conv1_bias, dim,
-                        /*kernel=*/7, /*stride=*/1, dilation, /*groups=*/1, &conv_len);
+  std::vector<float> conv;
+  {
+    profile::Timer timer("vocoder.conv1d");
+    conv = vocoder1d::Conv1d(padded, dim, padded_len, weights.conv1_weight, &weights.conv1_bias,
+                             dim, /*kernel=*/7, /*stride=*/1, dilation, /*groups=*/1, &conv_len);
+  }
   if (conv_len != length) {
     Fail("MiniMax-Music3 vocoder: residual unit at dilation " + std::to_string(dilation) +
          " changed the length from " + std::to_string(length) + " to " +
@@ -716,10 +730,16 @@ std::vector<float> VocoderResidualUnit(const std::vector<float>& in, int64_t dim
   }
   VocoderSnake(conv, dim, conv_len, weights.snake2_alpha);
   int64_t final_len = 0;
-  std::vector<float> out =
-      vocoder1d::Conv1d(conv, dim, conv_len, weights.conv2_weight, &weights.conv2_bias, dim,
-                        /*kernel=*/1, /*stride=*/1, /*dilation=*/1, /*groups=*/1, &final_len);
-  for (size_t i = 0; i < out.size(); ++i) out[i] += in[i];
+  std::vector<float> out;
+  {
+    profile::Timer timer("vocoder.conv1d");
+    out = vocoder1d::Conv1d(conv, dim, conv_len, weights.conv2_weight, &weights.conv2_bias, dim,
+                            /*kernel=*/1, /*stride=*/1, /*dilation=*/1, /*groups=*/1, &final_len);
+  }
+  {
+    profile::Timer timer("vocoder.residual_add");
+    for (size_t i = 0; i < out.size(); ++i) out[i] += in[i];
+  }
   *out_len = final_len;
   return out;
 }
@@ -733,14 +753,22 @@ std::vector<float> VocoderBlock(const std::vector<float>& in, int64_t input_dim,
          std::to_string(weights.res_units.size()) + " residual units, upstream has " +
          std::to_string(kVocoderResidualUnits));
   }
-  std::vector<float> hidden = in;
+  std::vector<float> hidden;
+  {
+    profile::Timer timer("vocoder.copy");
+    hidden = in;
+  }
   VocoderSnake(hidden, input_dim, length, weights.snake1_alpha);
   // `padding=ceil(stride / 2)` (minimax_music3_vocoder.py:57).
   const int64_t padding = (stride + 1) / 2;
   int64_t up_len = 0;
-  std::vector<float> up = vocoder1d::ConvTranspose1d(
-      hidden, input_dim, length, weights.conv_t1_weight, &weights.conv_t1_bias, output_dim,
-      /*kernel=*/2 * stride, stride, padding, /*groups=*/1, &up_len);
+  std::vector<float> up;
+  {
+    profile::Timer timer("vocoder.conv_transpose");
+    up = vocoder1d::ConvTranspose1d(hidden, input_dim, length, weights.conv_t1_weight,
+                                    &weights.conv_t1_bias, output_dim, /*kernel=*/2 * stride,
+                                    stride, padding, /*groups=*/1, &up_len);
+  }
   for (int64_t unit = 0; unit < kVocoderResidualUnits; ++unit) {
     int64_t next = 0;
     up = VocoderResidualUnit(up, output_dim, up_len, kVocoderResidualDilations[unit],
@@ -782,19 +810,28 @@ std::vector<float> VocoderDecode(const std::vector<float>& latents, int64_t leng
     }
     int64_t current = length;
     int64_t produced = 0;
-    hidden = vocoder1d::Conv1d(hidden, stream, current, weights.dec_in_proj_weight,
-                               &weights.dec_in_proj_bias, config.decoder_input_dim,
-                               /*kernel=*/1, /*stride=*/1, /*dilation=*/1, /*groups=*/1,
-                               &produced);
+    {
+      profile::Timer timer("vocoder.conv1d");
+      hidden = vocoder1d::Conv1d(hidden, stream, current, weights.dec_in_proj_weight,
+                                 &weights.dec_in_proj_bias, config.decoder_input_dim,
+                                 /*kernel=*/1, /*stride=*/1, /*dilation=*/1, /*groups=*/1,
+                                 &produced);
+    }
     current = produced;
     // `nn.Conv1d(..., kernel_size=7, padding=3)` (:89).
     int64_t padded_len = 0;
-    hidden = vocoder1d::Pad1d(hidden, config.decoder_input_dim, current, 3, 3,
-                              /*replicate=*/false, &padded_len);
-    hidden = vocoder1d::Conv1d(hidden, config.decoder_input_dim, padded_len,
-                               weights.conv_in_weight, &weights.conv_in_bias,
-                               config.decoder_hidden_dim, /*kernel=*/7, /*stride=*/1,
-                               /*dilation=*/1, /*groups=*/1, &produced);
+    {
+      profile::Timer timer("vocoder.pad");
+      hidden = vocoder1d::Pad1d(hidden, config.decoder_input_dim, current, 3, 3,
+                                /*replicate=*/false, &padded_len);
+    }
+    {
+      profile::Timer timer("vocoder.conv1d");
+      hidden = vocoder1d::Conv1d(hidden, config.decoder_input_dim, padded_len,
+                                 weights.conv_in_weight, &weights.conv_in_bias,
+                                 config.decoder_hidden_dim, /*kernel=*/7, /*stride=*/1,
+                                 /*dilation=*/1, /*groups=*/1, &produced);
+    }
     current = produced;
 
     int64_t last_output = config.decoder_hidden_dim;
@@ -807,18 +844,27 @@ std::vector<float> VocoderDecode(const std::vector<float>& latents, int64_t leng
       current = produced;
     }
     VocoderSnake(hidden, last_output, current, weights.snake_out_alpha);
-    hidden = vocoder1d::Pad1d(hidden, last_output, current, 3, 3, /*replicate=*/false,
-                              &padded_len);
-    hidden = vocoder1d::Conv1d(hidden, last_output, padded_len, weights.conv_out_weight,
-                               &weights.conv_out_bias, /*out_channels=*/1, /*kernel=*/7,
-                               /*stride=*/1, /*dilation=*/1, /*groups=*/1, &produced);
+    {
+      profile::Timer timer("vocoder.pad");
+      hidden = vocoder1d::Pad1d(hidden, last_output, current, 3, 3, /*replicate=*/false,
+                                &padded_len);
+    }
+    {
+      profile::Timer timer("vocoder.conv1d");
+      hidden = vocoder1d::Conv1d(hidden, last_output, padded_len, weights.conv_out_weight,
+                                 &weights.conv_out_bias, /*out_channels=*/1, /*kernel=*/7,
+                                 /*stride=*/1, /*dilation=*/1, /*groups=*/1, &produced);
+    }
     current = produced;
     if (current != length * hop) {
       Fail("MiniMax-Music3 vocoder: " + std::to_string(length) + " latent frames decoded to " +
            std::to_string(current) + " samples, the upsampling ratios imply " +
            std::to_string(length * hop));
     }
-    for (float& value : hidden) value = static_cast<float>(std::tanh(value));
+    {
+      profile::Timer timer("vocoder.tanh");
+      for (float& value : hidden) value = static_cast<float>(std::tanh(value));
+    }
     if (channel == 0) {
       samples = current;
       waveform.resize(static_cast<size_t>(2 * samples));

@@ -40,6 +40,7 @@
 
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
+#include "vllm/model_executor/models/music3_profile.h"
 
 namespace {
 
@@ -165,6 +166,11 @@ int main(int argc, char** argv) {
         Fill(lrng, static_cast<size_t>(config.latent_channels * length));
     double best = 1e30;
     uint64_t fp = 0;
+    // ARMED ONLY BY THE ENVIRONMENT, and armed per length so the split belongs
+    // to the leg it is printed under. With `VLLM_CPP_MUSIC3_PROFILE` unset every
+    // bracket is one predicted branch and the timing below is byte for byte the
+    // path spec §18.8a measured.
+    vllm::models::music3::profile::Begin();
     for (int r = 0; r < repeats; ++r) {
       int64_t samples = 0;
       const auto t0 = std::chrono::steady_clock::now();
@@ -185,6 +191,16 @@ int main(int argc, char** argv) {
                 best, best / static_cast<double>(length),
                 static_cast<unsigned long long>(fp));
     std::fflush(stdout);
+    // The split of `vocoder.decode_window` into its leaves, over ALL the
+    // repeats rather than the best one -- so it is a share, not a duration
+    // comparable to `best_s` above, and the report says so by printing the
+    // repeat count.
+    {
+      char banner[128];
+      std::snprintf(banner, sizeof(banner), "vocoder decode, latents=%lld, %d repeats",
+                    static_cast<long long>(length), repeats);
+      vllm::models::music3::profile::Report(banner);
+    }
   }
   return 0;
 }

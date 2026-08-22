@@ -113,6 +113,9 @@ vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
 vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
+# For src/vt/cpu/cpu_conv1d_block.h: the multi-block case asserts the geometry
+# it claims rather than assuming it (#1664). Same reach as test_host_parallel.
+target_include_directories(test_vocoder1d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # The bit-identity gate for the row-wise parallelisation of the host-reference
 # kernels (#672). It carries VERBATIM copies of the pre-parallel serial loops as
 # its oracle, so it reaches src/ for `host_parallel.h` (the size guard whose

@@ -217,6 +217,34 @@ propagating that is the reason the instrumented image exists. Link `vllm::vllm`
 as above and let the build choose; naming the internal image yourself is not
 supported.
 
+## Re-derive a benchmark rather than read one
+
+Two figures in [Benchmarks](BENCHMARKS.md) come from executables that the
+ordinary build compiles and that no test runs, so a reader can reproduce them
+without a checkpoint. Both allocate hundreds of megabytes and spend tens of
+seconds per sweep, which is why CI compiles them and runs neither.
+
+```sh
+cmake --build build --target vllm_music3_vocoder_conv_ab vllm_conv1d_scaling_probe
+
+# The MiniMax-Music3 vocoder decode window at the shipped geometry, over a
+# sweep of latent window lengths. It prints an FNV-1a fingerprint of the whole
+# stereo waveform, so two builds can be compared for BIT identity rather than
+# for closeness.
+./build/vllm_music3_vocoder_conv_ab --lengths=20,86,344 --repeats=3
+
+# The same window split into its leaves -- conv1d, conv_transpose, snake, pad,
+# copy, residual_add, tanh -- through the production instrument.
+VLLM_CPP_MUSIC3_PROFILE=1 ./build/vllm_music3_vocoder_conv_ab --lengths=86
+
+# `vt::Conv1d` alone at the vocoder's eleven geometries, with a residency
+# sweep, the pool's dispatch cost and CPU-over-wall per leg.
+./build/vllm_conv1d_scaling_probe --latents=86 --repeats=2
+```
+
+`VLLM_CPP_CPU_THREADS` selects the pool size for both, and both print the
+thread count they actually got beside the count that was asked for.
+
 ## First-line troubleshooting
 
 - Run the executable with `--help` and confirm that you are using the expected

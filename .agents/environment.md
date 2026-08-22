@@ -1024,14 +1024,34 @@ environment:
     `test_voxtral_e2e`, `test_qwen35_paged_engine`. These 16 are the sm_110
     baseline and are NOT to be "fixed" by a row that merely builds here.
 
-    **This baseline is one `main` behind the tree that ships it, and says so
-    rather than pretending otherwise.** A re-measurement at `944d7d947` got as
-    far as configure — which is where the `marlin-nvfp4: ENABLED for [110]`
-    reading above comes from — and then lost the box to the `worker_lost` event
-    described under "Disk is shared". **Re-measuring at a current SHA is OWED**
-    ([#955](https://github.com/mudler/vllm.cpp/issues/955)). Recording a stale
-    baseline with its SHA attached is honest; recording it as current would be
-    the exact trap the next paragraph warns about.
+    **★ This baseline is STALE, and the distance is 144 commits rather than the
+    "one `main` behind" an earlier draft of this section claimed.** Measured
+    `0764ded2b..08c81a892`: **144 commits, 100 of them touching `src/`,
+    `include/`, `tests/` or `CMakeLists.txt`, for 319 files and +76,570 lines.**
+    The re-measure rule two paragraphs down has therefore fired a hundred times
+    over. "One behind" was literally true of the branch base and reads as
+    "essentially current", which is the opposite of the truth.
+
+    **One of those commits lands directly on the mechanism this table blames for
+    two of its entries.** `cffe59b02` (2026-08-20,
+    "the reference tier gated on unified memory, not on whether the host can
+    address it", #844/#1435) rewrites `src/vt/op_provider.cpp`, which is the
+    dispatch that prints
+    `[vt reference-tier] op=... has NO native kernel; running the PORTABLE CPU fallback`
+    immediately before `test_ops_fp8_cutlass` and
+    `test_ops_matmul_fp8_block_cuda` segfault. It changes that gate on the axis
+    of unified memory, and Thor is a unified-memory box. **So both FP8 SEGFAULT
+    rows below are specifically suspect at current `main`** — they may be
+    fixed, they may have moved mode, and nobody has looked.
+
+    A re-measurement at `944d7d947` got as far as configure — which is where the
+    `marlin-nvfp4: ENABLED for [110]` reading above comes from — and then lost
+    the box to the `worker_lost` event described under "Disk is shared".
+    **Re-measuring is OWED** ([#955](https://github.com/mudler/vllm.cpp/issues/955)),
+    and it is blocked on the fleet rather than on anyone's willingness. Recording
+    a stale baseline with its SHA and its true distance attached is honest;
+    recording it as current would be the exact trap the next paragraph warns
+    about.
 
     **The gate is `(name, failure mode)` PAIRS. A row regresses on Thor when it
     adds a NAME or CHANGES a recorded MODE.** Counting names is provably too

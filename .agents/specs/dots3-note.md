@@ -664,9 +664,13 @@ package list never contained.
 
 **Baseline, re-measured in the environment now prescribed:** `0764ded2b`,
 `ctest -j1` inside an `rc run -d thor:gpu0` lease, 419.97 s — **553 tests, 534
-passed / 3 skipped / 16 red.** It is one `main` behind the tree that records it,
-because the re-measurement at `944d7d947` lost the box mid-build; that is stated
-in `environment.md` and owed under
+passed / 3 skipped / 16 red.** **It is STALE by 144 commits** — 100 of them
+touching `src/`, `include/`, `tests/` or `CMakeLists.txt`, 319 files and
++76,570 lines — because the re-measurement at `944d7d947` lost the box mid-build.
+One of those commits, `cffe59b02`, rewrites the reference-tier dispatch this
+baseline names as the cause of its two FP8 SEGFAULTs, on the unified-memory axis
+that Thor sits on, so those two rows are specifically suspect. Stated in
+`environment.md` and owed under
 [#955](https://github.com/mudler/vllm.cpp/issues/955) rather than papered over. One of the 16, `test_serve_low_tools`, is the
 absent `shellcheck` ([#961](https://github.com/mudler/vllm.cpp/issues/961)) and
 is carried as a named entry rather than installed away; the same job proved it

@@ -95,7 +95,7 @@ cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=86 \
 Of these, only `sm_87` (Orin) and `sm_110` (Thor) have been run on real
 hardware. `sm_80/86/89`, `sm_90a` and `sm_100a/103a` are build-verified: they
 compile `-Werror`-clean and emit the expected SASS, but no board here has
-executed them. See [STATUS.md](STATUS.md) for what that label means and
+executed them. See [Project status](../README.md#project-status) for what that label means and
 `.agents/specs/cuda-arch-ampere-fastpath.md` for the per-arch detail. Reports
 from those boards are welcome.
 
@@ -244,7 +244,7 @@ defaults.
 
 Build success does not imply runtime coverage. See [Features](FEATURES.md) for
 the current backend and quantization support table. See
-[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+[Status](../README.md#project-status) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
 measured results.
 
 Runtime environment variables are in the

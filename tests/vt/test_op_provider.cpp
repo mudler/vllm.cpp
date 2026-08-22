@@ -158,6 +158,75 @@ TEST_CASE("op provider: a provider declines a call and falls back to the one bel
 }
 
 // ---------------------------------------------------------------------------
+// 2b. THE CACHED-FALLBACK PATTERN, and whether its COUNT is exact
+//     ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)).
+// ---------------------------------------------------------------------------
+// `op_provider.h` prescribes this shape for a SHAPE-GATED provider -- one that
+// declines on the HOT path rather than rarely: resolve the fallback ONCE into a
+// function-local static and count each decline with `NoteOpDecline`, so a decode
+// run that declines ~21,500 times pays no provider-stack walk per decline. The
+// header states that `OpProviderStats::declines` "stays exact" under that shape.
+// This case is what makes the statement checkable, because `declines` is the
+// ONLY thing that separates a served call from a forwarded one for a provider
+// that is always the SELECTED one.
+//
+// Built to be red in a FULL run as well as under `-tc=`. The defect it pins is
+// one extra increment per STATIC, not per process, so a case that shares its
+// static with an earlier case reads correct and hides it -- which is exactly how
+// it hid in tests/vt/test_ops_attention_cross.cpp until a single-case filter was
+// run. This slot and this static are reachable from this case and nothing else,
+// and the reset opens the counted window BEFORE the static resolves.
+constexpr OpId kCachedFallbackOp = OpId::kMoeCombine;
+constexpr const char* kShapeGated = "shape-gated";
+
+void* CachedFallbackPtr() {
+  static void* f = vt::GetOpFallbackUncounted(kCachedFallbackOp, DeviceType::kXPU, kShapeGated);
+  return f;
+}
+
+TEST_CASE("op provider: the cached fallback pattern counts exactly one decline per decline") {
+  vt::RegisterOpProvider(kCachedFallbackOp, DeviceType::kXPU, P("vt-native", 0, Fn(&KernelA)));
+  vt::RegisterOpProvider(kCachedFallbackOp, DeviceType::kXPU, P(kShapeGated, 10, Fn(&KernelB)));
+  REQUIRE(vt::GetOp(kCachedFallbackOp, DeviceType::kXPU) == Fn(&KernelB));
+
+  vt::ResetOpProviderStats(kCachedFallbackOp, DeviceType::kXPU);
+  constexpr int kDeclines = 3;
+  for (int i = 0; i < kDeclines; ++i) {
+    // The order the two live providers use: count, then forward through the
+    // cached pointer (cuda_attention_cross.cu, metal_mlx_provider.mm).
+    vt::NoteOpDecline(kCachedFallbackOp, DeviceType::kXPU);
+    CHECK(CachedFallbackPtr() == Fn(&KernelA));
+  }
+  // EXACT, and two-sided. 4 is the #1584 double count of the first decline; 1 or
+  // 0 is a decline that went unrecorded, which is the failure every
+  // `declines == 0` assertion in this tree is built to catch.
+  CHECK(vt::GetOpProviderStats(kCachedFallbackOp, DeviceType::kXPU).declines == kDeclines);
+}
+
+TEST_CASE("op provider: GetOpFallbackUncounted resolves the same provider without counting") {
+  const OpId op = OpId::kAttnGateSplit;
+  vt::RegisterOpProvider(op, DeviceType::kXPU, P("vt-native", 0, Fn(&KernelA)));
+  vt::RegisterOpProvider(op, DeviceType::kXPU, P("accel", 10, Fn(&KernelB)));
+  vt::ResetOpProviderStats(op, DeviceType::kXPU);
+
+  // Same answer as the counting spelling, and no increment.
+  CHECK(vt::GetOpFallbackUncounted(op, DeviceType::kXPU, "accel") == Fn(&KernelA));
+  CHECK(vt::GetOpProviderStats(op, DeviceType::kXPU).declines == 0);
+  // The counting spelling still counts. This is what keeps the five per-call
+  // callers that never cache -- vulkan_ops.cpp:950/1067/1488/1509 and
+  // tenstorrent_ops.cpp:1341 -- reporting exactly what they report today.
+  CHECK(vt::GetOpFallback(op, DeviceType::kXPU, "accel") == Fn(&KernelA));
+  CHECK(vt::GetOpProviderStats(op, DeviceType::kXPU).declines == 1);
+  // Nothing below the floor still throws in BOTH spellings, and the counting one
+  // still counts a decline that throws -- the position of the increment relative
+  // to that check is load-bearing for the `>= 3` assertion above.
+  CHECK_THROWS(vt::GetOpFallbackUncounted(op, DeviceType::kXPU, "vt-native"));
+  CHECK(vt::GetOpProviderStats(op, DeviceType::kXPU).declines == 1);
+  CHECK_THROWS(vt::GetOpFallback(op, DeviceType::kXPU, "vt-native"));
+  CHECK(vt::GetOpProviderStats(op, DeviceType::kXPU).declines == 2);
+}
+
+// ---------------------------------------------------------------------------
 // 3. OBSERVABILITY — "did the accelerator actually run?" must be answerable.
 // ---------------------------------------------------------------------------
 TEST_CASE("op provider: selection is observable through the stats counters") {

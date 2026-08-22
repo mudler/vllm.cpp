@@ -54,19 +54,6 @@ class WindowsReleaseStateContract(unittest.TestCase):
                 )
                 self.assertTrue(self.checker.validate_texts(mutant))
 
-    def test_benchmarks_pending_projection_is_fail_closed(self) -> None:
-        texts = self.checker.read_surfaces(ROOT)
-        for fragment in self.checker.BENCHMARKS_PENDING_FRAGMENTS:
-            with self.subTest(fragment=fragment):
-                mutant = dict(texts)
-                mutant["docs/BENCHMARKS.md"] = mutant[
-                    "docs/BENCHMARKS.md"
-                ].replace(fragment, "[REMOVED]", 1)
-                self.assertIn(
-                    "benchmarks must retain pending native Windows evidence",
-                    self.checker.validate_texts(mutant),
-                )
-
     def test_truth_checker_and_mutations_are_wired_into_preflight_and_ci(self) -> None:
         preflight = PREFLIGHT.read_text(encoding="utf-8")
         ci = CI.read_text(encoding="utf-8")

@@ -45,7 +45,7 @@ links to its own.
 
 | You want | Read |
 |---|---|
-| What is proven and what is not | [`docs/STATUS.md`](../STATUS.md) |
+| What is proven and what is not | [Project status](../../README.md#project-status) |
 | The complete measurement record | [`docs/BENCHMARKS.md`](../BENCHMARKS.md) |
 | Which features, backends, and quantizations exist | [`docs/FEATURES.md`](../FEATURES.md) |
 | Every server flag and endpoint | [server reference](../reference/server.md) |

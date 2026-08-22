@@ -685,7 +685,7 @@ a prediction to be tested, and *The A/B* is the test.
 this spec under `## Outcome` when the row reaches `DONE`, per `AGENTS.md`. An
 accepted or explicitly void measurement additionally goes to
 [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md), and a lifecycle move goes to
-[`docs/STATUS.md`](../../docs/STATUS.md) and this spec's `## Now`. Raw A/B output,
+[`docs/STATUS.md`](../../README.md#project-status) and this spec's `## Now`. Raw A/B output,
 clock manifests and nsys windows stay under an evidence directory named in
 `## Outcome`, never summarized away.
 

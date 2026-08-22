@@ -14,7 +14,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue"></a>
   <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_same_throughput-3ec8e0"></a>
-  <a href="docs/STATUS.md"><img alt="Architectures" src="https://img.shields.io/badge/architectures-25%2B_gated-7ee787"></a>
+  <a href="#project-status"><img alt="Architectures" src="https://img.shields.io/badge/architectures-25%2B_gated-7ee787"></a>
   <a href="#performance"><img alt="Binary size" src="https://img.shields.io/badge/one_binary-66_MiB,_no_Python-6e7681"></a>
   <a href="https://github.com/mudler/LocalAI"><img alt="LocalAI" src="https://img.shields.io/badge/LocalAI-Run_Locally-orange"></a>
 </p>
@@ -61,6 +61,13 @@ scheduling ideas (RadixAttention, LPM cache-aware admission, jump-forward decodi
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s deployment story (one library behind a flat C
 ABI, GGUF straight off the shelf, and compute directly on the quantized blocks). MLX's GEMM where it
 wins on Apple Silicon. Safetensors and GGUF, CUDA and CPU and Metal and Vulkan, from one source tree.
+
+## Project status
+
+vllm.cpp is under heavy development. The README carries the stable public
+overview; [Features](docs/FEATURES.md) lists shipped surfaces and
+[Benchmarks](docs/BENCHMARKS.md) indexes published measurements. Contributors
+derive detailed lifecycle state and history from Git, row specs, and matrices.
 
 Completed architecture gates compare **token output against vLLM** on the same workload. Rows that
 have only a fixture or a blocked gate say so. Speed claims use the reference engine's production
@@ -159,7 +166,7 @@ every figure traces back to the run that produced it.
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
 > vLLM oracle across 27 gated architectures. Speed is proven on one GPU (GB10, sm_121a) plus a CPU
 > path that matches or beats llama.cpp on GGUF, against a SUPERSEDED fork denominator (#1003).
-> Every capability is labelled honestly in [docs/STATUS.md](docs/STATUS.md).
+> The current public overview is kept in [Project status](#project-status).
 
 ## Quickstart
 
@@ -223,7 +230,7 @@ you get on top, most of it borrowed from whichever engine does it best:
   `/detokenize`, and `/reset_prefix_cache`.
 
 Per-capability lifecycle state, active gaps, and the next gate for each:
-[docs/STATUS.md](docs/STATUS.md).
+[Project status](#project-status).
 
 </details>
 
@@ -284,7 +291,7 @@ and Voxtral (audio).
 end: prompt -> Qwen3-VL-32B encoder -> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE
 -> MP4 with a stereo track. The project's first DIFFUSION architecture (no KV cache, no
 sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning modes and
-`POST /v1/videos`. Use **Q4_K_M**. Detail: [docs/STATUS.md](docs/STATUS.md).
+`POST /v1/videos`. Use **Q4_K_M**. See [Project status](#project-status).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
@@ -292,7 +299,7 @@ sliding-window attention are gated feature-positive. The authoritative per-archi
 to the C++ registry (all 40 registered architectures with their tested checkpoint and gate, plus the
 standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
 [docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
-hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
+hardware-blocked and why, is linked from [Project status](#project-status).
 
 </details>
 
@@ -435,7 +442,7 @@ the number stays in the README and the label says *speed-pending*.
 | [docs/BUILD.md](docs/BUILD.md) | Backend recipes, CMake options, hardware and quantization |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured grids, memory and repro recipes |
 | [docs/FEATURES.md](docs/FEATURES.md) | Feature comparison: vLLM, SGLang and llama.cpp |
-| [docs/STATUS.md](docs/STATUS.md) | Capability lifecycle, gaps and next gate |
+| [Project status](#project-status) | Stable public overview and contributor sources of truth |
 | [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | SGLang knobs and when to use them |
 | [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |
 | [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | CPU/disk KV offload, LMCache and events |

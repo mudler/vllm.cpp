@@ -681,7 +681,13 @@ void* GetOp(OpId op, DeviceType device) {
   return fn;
 }
 
-void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) {
+namespace {
+
+// The one body behind both spellings of a fallback resolution. `count` is the
+// ONLY difference: the resolution order, the reference-tier install, the drain
+// and every throw are shared, so the two spellings can never answer differently
+// ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)).
+void* ResolveFallback(OpId op, DeviceType device, const char* declining_provider, bool count) {
   VT_CHECK(declining_provider != nullptr, "op provider fallback requires a provider name");
   Slot& slot = At(op, device);
   const OpProvider* floor = nullptr;
@@ -706,7 +712,9 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
   if (next == nullptr && MaybeInstallReferenceTier(op, device)) {
     next = Choose(slot, caps, floor);
   }
-  slot.declines.fetch_add(1, std::memory_order_relaxed);
+  // BEFORE the check below and not after: a decline that finds nothing underneath
+  // it is still a decline, and tests/vt/test_op_provider.cpp asserts that count.
+  if (count) slot.declines.fetch_add(1, std::memory_order_relaxed);
   VT_CHECK(next != nullptr,
            std::string("provider '") + declining_provider + "' declined op " +
                std::to_string(static_cast<int>(op)) + " on device type " +
@@ -722,6 +730,16 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
     if (b != nullptr) b->FlushPending();
   }
   return next->fn;
+}
+
+}  // namespace
+
+void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) {
+  return ResolveFallback(op, device, declining_provider, /*count=*/true);
+}
+
+void* GetOpFallbackUncounted(OpId op, DeviceType device, const char* declining_provider) {
+  return ResolveFallback(op, device, declining_provider, /*count=*/false);
 }
 
 void NoteOpDecline(OpId op, DeviceType device) {

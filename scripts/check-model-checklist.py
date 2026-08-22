@@ -13,7 +13,7 @@ a pure `checklist_errors(text) -> list[str]` so it is unit- and mutation-testabl
 
 The invariant this enforces: a change that advances (or regresses) a model's
 lifecycle state must update its checklist entry AND the rollup in the same commit,
-exactly like check-doc-checkpoint.py forces the README/BENCHMARKS refresh.
+without coupling the result to a public-document refresh.
 """
 
 from __future__ import annotations

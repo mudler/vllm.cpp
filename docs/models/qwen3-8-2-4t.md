@@ -252,6 +252,11 @@ median over two runs, and the second consumed all 30 625 MiB of the box's swap.
 The extra 9.27 GiB of arena takes the free memory that the borrowed 370 GiB
 expert mapping is served out of.
 
+The arena is also measurably not what exhausted the box in
+[#1299](https://github.com/mudler/vllm.cpp/issues/1299): a 64-slot 0.15 GiB arena
+failed exactly where an 8000-slot 18.55 GiB one did, so this knob was never the
+lever there either.
+
 ## What this does not establish
 
 - **The quantization is extreme.** The expert towers hold 1.1875 bits per
@@ -287,6 +292,30 @@ divergence is not identified.** The host-weight alias is excluded, measured on
 GB10 with bit-identical output from a `cudaMalloc` operand and from a 256-aligned
 host one, but excluding one cause is not identifying another.
 
+**On 21 August 2026 a router dump moved the failure upstream of the sampler.** On
+a later tree, source `cffe59b`, the two arms already select different MoE experts
+in the first block of the first forward, eight tokens before any emitted token
+differs, and they differ there in the router GEMM input rather than in anything
+the router does with it.
+
+Three probes narrow it further, and none of them names the cause:
+
+- **The router gate weights are excluded by measurement.** Their fingerprint is
+  identical on both arms.
+- **The two top-k implementations agree** with a plain lowest-index-wins rank of
+  each arm's own logits. That held on only 5 of the 552 token-rows the dumps
+  hold, so read it as a sample and not as a property of either implementation.
+- **The embedding output is bit-identical.** A third probe dumped the hidden
+  state before any GEMM, norm, or attention touches it, and 0 of 40,960 bf16
+  values differ.
+
+So the weights are the same at both ends of the stack, and the divergence starts
+in the compute inside the first block. The cause is still not identified, because
+the expert projections, the attention weights, and the norms were never
+fingerprinted. The CUDA continuation also degenerates into a mechanical recursion
+after the tokens the two arms share, which a coin flip between two equally good
+tokens does not produce.
+
 Five further conditions gate the arm, and all of them must hold at once.
 
 - **The device must be probed capable, and most are not.** The condition is
@@ -309,7 +338,7 @@ Five further conditions gate the arm, and all of them must hold at once.
 - **No speed claim is attached.** Device access to host-resident weights on that
   part has a recorded penalty, and this lane reads about 6.95 GB of expert bytes
   per token that way, so a CUDA arm slower than the CPU arm remains a real
-  possible outcome.
+  possible outcome. No published figure bounds this either way.
 
 ### When CUDA refuses at load
 

@@ -87,7 +87,6 @@ exit 0
 # each one is invoked with. Every one of them must be handed `BASE_SHA`.
 BASE_ARGUMENT_GATES = (
     "scripts/check-now-current.py",
-    "scripts/check-doc-checkpoint.py",
     "scripts/check-issue-index-append-only.py",
     "scripts/check-commit-trailers.py",
     "scripts/check-commit-style.py",
@@ -414,7 +413,6 @@ class SkipIsReportedTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "doc-checkpoint range",
             "issue-index append-only",
             "commit-trailers",
             "commit-style",
@@ -518,7 +516,7 @@ class ThePinnedBaseReachesTheCheckersTests(PreflightHarness):
         # below. Count first, and count ALL of them, so a gate that stops being
         # invoked at all cannot pass as a gate invoked correctly.
         self.assertEqual(
-            5,
+            4,
             sum(len(lines) for lines in recorded.values()),
             f"precondition failed: the stub recorded {recorded}, which is not "
             f"one base-carrying invocation per gate.\n{report}",
@@ -581,7 +579,6 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "doc-checkpoint range",
             "issue-index append-only",
             "commit-trailers",
             "commit-style",
@@ -668,7 +665,6 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
         # three. Asserting it on the other two would pass on the wrong message.
         for label in (
             "now-current range",
-            "doc-checkpoint range",
             "issue-index append-only",
         ):
             with self.subTest(gate=label):
@@ -765,7 +761,6 @@ class StderrIsNotTheValueTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "doc-checkpoint range",
             "issue-index append-only",
             "commit-trailers",
             "commit-style",
@@ -822,7 +817,6 @@ class StderrIsNotTheValueTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "doc-checkpoint range",
             "issue-index append-only",
             "commit-trailers",
             "commit-style",
@@ -993,6 +987,20 @@ class RegistrationTests(unittest.TestCase):
             f"python3 tests/scripts/{SUITE_NAME}.py",
             CI.read_text(encoding="utf-8"),
             "CI does not run this suite",
+        )
+
+
+class BenchmarkIndexRegistrationTests(PreflightHarness):
+    def test_preflight_executes_the_benchmark_index_checker(self) -> None:
+        """Deleting the production call must leave a red reachability test."""
+
+        report = self.preflight()
+        self.assert_ran_something(report)
+        invocations = self.argv_log.read_text(encoding="utf-8").splitlines()
+        self.assertIn(
+            "scripts/check-benchmark-index.py",
+            invocations,
+            "preflight did not execute the mechanical benchmark-index checker",
         )
 
 

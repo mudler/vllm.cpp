@@ -65,26 +65,10 @@ VALID = "\n".join(
         "",
         "Link libvllm.",
         "",
-        "Status ledger: docs/STATUS.md",
         "Contributor guide: CONTRIBUTING.md",
         "",
     ]
 )
-
-# A minimal docs/STATUS.md that satisfies the ledger rules.
-VALID_STATUS = "\n".join(
-    [
-        "# vllm.cpp status",
-        "",
-        "## Capability status",
-        "",
-        "| Capability | State |",
-        "|---|---|",
-        "| Thing | Works |",
-        "",
-    ]
-)
-
 
 class ReadmeStructureTests(unittest.TestCase):
     def test_minimal_valid_document_passes(self) -> None:
@@ -187,11 +171,6 @@ class ReadmeStructureTests(unittest.TestCase):
             readme_structure.readme_errors(long_cell),
         )
 
-    def test_missing_status_link_fails(self) -> None:
-        mutated = VALID.replace("Status ledger: docs/STATUS.md", "No ledger.")
-        errors = readme_structure.readme_errors(mutated)
-        self.assertTrue(any("STATUS.md" in e for e in errors), errors)
-
     def test_checker_exposes_the_literal_contributor_link(self) -> None:
         self.assertEqual(
             getattr(readme_structure, "CONTRIBUTOR_LINK", None),
@@ -209,24 +188,18 @@ class ReadmeStructureTests(unittest.TestCase):
         missing_link = VALID.replace(
             f"Contributor guide: {EXPECTED_CONTRIBUTOR_LINK}", "No guide."
         )
-        self.assertEqual(readme_structure.status_errors(VALID_STATUS), [])
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             readme = root / "README.md"
-            status = root / "docs/STATUS.md"
-            status.parent.mkdir()
             readme.write_text(missing_link, encoding="utf-8")
-            status.write_text(VALID_STATUS, encoding="utf-8")
 
             saved_readme, readme_structure.README = readme_structure.README, readme
-            saved_status, readme_structure.STATUS = readme_structure.STATUS, status
             out, err = io.StringIO(), io.StringIO()
             try:
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     code = readme_structure.main()
             finally:
                 readme_structure.README = saved_readme
-                readme_structure.STATUS = saved_status
 
         self.assertEqual(code, 1)
         self.assertIn(EXPECTED_CONTRIBUTOR_LINK, err.getvalue())
@@ -237,21 +210,5 @@ class ReadmeStructureTests(unittest.TestCase):
         mutated = VALID.replace("| Thing | Works |", f"| Thing | {cell} |")
         errors = readme_structure.readme_errors(mutated)
         self.assertTrue(any("wall-of-prose" in e for e in errors), errors)
-
-
-class StatusStructureTests(unittest.TestCase):
-    def test_minimal_valid_status_passes(self) -> None:
-        self.assertEqual(readme_structure.status_errors(VALID_STATUS), [])
-
-    def test_shipped_status_passes(self) -> None:
-        text = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
-        self.assertEqual(readme_structure.status_errors(text), [])
-
-    def test_missing_capability_table_fails(self) -> None:
-        mutated = VALID_STATUS.replace("## Capability status", "## Misc notes")
-        errors = readme_structure.status_errors(mutated)
-        self.assertTrue(any("capability status" in e for e in errors), errors)
-
-
 if __name__ == "__main__":
     unittest.main()

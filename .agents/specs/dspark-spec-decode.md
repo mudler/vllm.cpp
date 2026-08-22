@@ -2069,7 +2069,7 @@ already exists.
 | [roadmap_v1.md](../roadmap_v1.md) §DSpark grounding note | `SPEC-DSPARK` "(engine matrix, `INVENTORIED`)", spike "future" | `ACTIVE`, spike written |
 | [spec-decode-inventory.md](spec-decode-inventory.md) `dspark` row + lifecycle summary | **INVENTORIED** | **ACTIVE** |
 | [spec-decode-inventory.md](spec-decode-inventory.md) §HF speculators | "no `speculators`-format adapter" | W3 shipped the DSpark one (`qwen3_dspark.cpp:227-300`) |
-| [docs/STATUS.md](../../docs/STATUS.md) method surface | `dspark` INVENTORIED, contradicting the same page's own DSpark paragraph | ships DSpark |
+| [docs/STATUS.md](../../README.md#project-status) method surface | `dspark` INVENTORIED, contradicting the same page's own DSpark paragraph | ships DSpark |
 | This spec's `Status` field | 2026-08-10 "W1-W5 … W6 PARTIAL … ~2% BEHIND spec-off" | W1-W8; cross-engine 0.975x/1.012x on the pre-reimage box, SUPERSEDED by 0.834x matched-and-warm on the rebuilt stack |
 | [roadmap_v1.md](../roadmap_v1.md) Open issues | #436, #442, #513 absent from the intake table | listed |
 

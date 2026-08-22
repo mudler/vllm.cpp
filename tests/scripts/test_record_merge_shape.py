@@ -229,33 +229,6 @@ class NoReintroduction(unittest.TestCase):
             "never the file -- see AGENTS.md 'No surface that every PR must write'",
         )
 
-    def test_the_status_ratchet_measures_defects_not_length(self) -> None:
-        sys.path.insert(0, str(ROOT / "scripts"))
-        try:
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location(
-                "doc_tables", ROOT / "scripts/check-public-doc-tables.py"
-            )
-            module = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(module)
-        finally:
-            sys.path.pop(0)
-
-        self.assertNotIn(
-            "chars",
-            module.STATUS_RATCHET,
-            "a byte count of docs/STATUS.md is pinned in check-public-doc-tables.py "
-            "again; that couples every PR to lines it does not own",
-        )
-        # And the keys that remain must still be the quality counters, or the
-        # obligation left with the byte count.
-        self.assertEqual(
-            set(module.STATUS_RATCHET),
-            {"h2_sections", "long_paragraphs", "oversized_cells"},
-        )
-
     def test_the_live_digest_has_headroom(self) -> None:
         """Zero headroom is the tell that a budget has become a lock.
 

@@ -269,7 +269,10 @@ Three conditions gate it, and all must hold at once:
   `DeepseekV4ForCausalLM` is the case to have in mind: a `deepseek4` GGUF loads
   and its export carries the same `_exps.weight` tensor names, but its forward
   stages every tower, so charging the device for a slot arena instead would
-  under-count what the load needs.
+  under-count what the load needs. `LagunaForCausalLM` is not that case and is
+  not evidence for anything here: no `laguna` GGUF architecture arm exists, so a
+  Laguna GGUF is refused as an unsupported architecture well before this check
+  runs.
 - **The expert towers keep the form the file stores them in**, which means
   keep-quant or keep-f16. Those two are one arm rather than two: the loader sends
   both into the same stacked tower, and the slice seam sizes a row with

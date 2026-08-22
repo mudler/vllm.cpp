@@ -2,7 +2,7 @@
 """Render the live position on demand instead of storing it in a shared file.
 
 `.agents/NOW.md` used to carry a per-row live-claims table, and
-`check-doc-checkpoint.py` required every lifecycle move to edit it. That made one
+every lifecycle move once had to edit it. That made one
 file a surface EVERY row-advancing PR writes, which is a lock: it conflicted in 5
 of the 16 conflicting open PRs measured at origin/main d928e2c3, and it violated
 the `AGENTS.md` invariant "no surface that every PR must write".

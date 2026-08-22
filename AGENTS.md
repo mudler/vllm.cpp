@@ -406,15 +406,16 @@ projections, not narratives. Each fact lives in one document.
 
 | Surface | Changes when |
 |---|---|
-| `docs/STATUS.md` | a row changes lifecycle state |
-| `docs/BENCHMARKS.md` | a row gains an accepted or explicitly pending/failed/void measurement |
+| `docs/BENCHMARKS.md` | a public benchmark ID is added, removed, or changes disposition |
 | `docs/FEATURES.md` | a feature, model, backend, or quantization surface changes |
 | `docs/USAGE.md` | a command, C API, config key, install step, or workflow changes |
 | `README.md` | a user-visible headline, positioning, or quick start changes |
 | the moved row spec's `## Now` | a row changes lifecycle state |
 
 Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
-lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
+lifecycle change owes only the moved row spec's `## Now`; Git and the row's
+records carry detailed status and history. Publishing a benchmark owns one
+`docs/benchmarks/<benchmark-id>.md` detail file and its index row.
 `.agents/NOW.md` is authored only at operator cadence and is never a per-row
 lifecycle write.
 

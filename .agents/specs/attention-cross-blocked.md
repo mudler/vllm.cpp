@@ -298,7 +298,8 @@ The blocked kernel is registered as a SECOND provider for
 `OpId::kAttentionCross` on CUDA through `include/vt/op_provider.h`, at priority
 10 above `vt-native`'s 0, under the name `vt-cross-blocked`. It inspects the
 shape per call and, when it has no tiling for it, counts a decline with
-`NoteOpDecline` and forwards to a once-resolved `GetOpFallback` pointer — the
+`NoteOpDecline` and forwards to a once-resolved `GetOpFallbackUncounted`
+pointer (#1584) — the
 `DECLINE-AND-FALL-BACK` axis that header describes and that
 `src/vt/metal/metal_mlx_provider.mm::MlxMatmulKernel` already uses, including its
 measured reason for caching the fallback.
@@ -562,15 +563,22 @@ this row and applies equally to the kernel being replaced.
 - **`Tq < 64` at head_dim 64 keeps the warp-per-query kernel** and therefore
   keeps its cost. That regime is not measured by this row.
 - **[#1584](https://github.com/mudler/vllm.cpp/issues/1584) — the provider seam
-  double-counts the FIRST decline of every process.** `GetOpFallback` increments
-  `OpProviderStats::declines` itself (`op_provider.cpp:709`) and the caching
-  pattern `op_provider.h` prescribes calls `NoteOpDecline` beside it, so the
-  header's "stays exact" is one too high, once. Found by this row's own audit and
-  **worked around here rather than fixed**: the suite warms the fallback static
-  outside every counted window, so its routing assertions are order-independent
-  instead of depending on which case declined first. The seam fix changes
-  semantics for four backends and for the callers that use `GetOpFallback`
-  WITHOUT the caching pattern, so it needs its own row.
+  double-counted the FIRST decline of every process. FIXED**, by row
+  `KERNEL-ACCEL-PROVIDER-DECLINE-EXACT`
+  ([op-provider-decline-exact.md](op-provider-decline-exact.md)). `GetOpFallback`
+  incremented `OpProviderStats::declines` itself and the caching pattern
+  `op_provider.h` prescribes called `NoteOpDecline` beside it, so the header's
+  "stays exact" was one too high, once. Found by this row's own audit and worked
+  around here at the time: the suite warmed the fallback static outside every
+  counted window. `BlockedFallback` now hoists `GetOpFallbackUncounted`, which
+  counts nothing, so **the warm-up is removed and this suite's `declines ==`
+  cases are exact standalone and under `-tc=`.** The four-backend blast radius
+  that deferred the fix was measured rather than inherited, and it is zero: the
+  repair adds a second resolver instead of removing the count from
+  `GetOpFallback`, so the five per-call callers in `vulkan_ops.cpp` and
+  `tenstorrent_ops.cpp` are untouched. What is still owed is EXECUTION —
+  this suite has never run on a CUDA device since the change
+  ([#1692](https://github.com/mudler/vllm.cpp/issues/1692)).
 - **The op does not check that `key.dtype` and `value.dtype` equal
   `query.dtype`.** `Tensor::Ptr<T>` is an unchecked `static_cast`, so an f32
   query against a bf16 key reads twice the buffer. This is a contract-level

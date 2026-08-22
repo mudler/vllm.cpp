@@ -59,12 +59,10 @@ ANCHORS = {
     # per-ROW line inside .agents/NOW.md, which is one of the requirements that
     # made that file a surface every PR had to keep current. The row's live
     # position now lives in the row's OWN spec under `## Now` -- one writer, and
-    # the same place check-doc-checkpoint.py requires it.
+    # the row-owned source of its live position.
     ".agents/specs/release-binary-matrix.md": "**ACTIVE; required W1-W11/W13 implemented and v0.0.2 published.**",
     ".agents/coordination.md": "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": "# W6 installed server package green",
-    "docs/STATUS.md": "v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
-    "docs/BENCHMARKS.md": "| **Binary release (ACTIVE; Windows pre-alpha pending)** |",
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
@@ -116,15 +114,6 @@ LIFECYCLE_RECORD_MUTATIONS = (
         "The row is `DONE`. Every release gate is complete",
         "state release lifecycle",
     ),
-)
-
-BENCHMARKS_RELEASE_ROW = (
-    "| **Binary release (ACTIVE; Windows pre-alpha pending)** | v0.0.2 shipped eight primary archive/checksum/provenance triplets + two indexes (26 assets) from source SHA `7020de93652ca920424a10ac5255b34810dd2f24`, run `31466516224` | "
-    "Windows W14-W16 implemented. **PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit | W12 optional/non-primary |"
-)
-
-STATUS_RELEASE_FRAGMENTS = (
-    "Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
 )
 
 BACKEND_POLICY_PROSE = {
@@ -277,16 +266,16 @@ WORK_CONTENT = {
 
 PUBLIC_PENDING_MUTATIONS = (
     (
-        "docs/BENCHMARKS.md",
-        "**PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit",
-        "**SHIPPED:** Windows v0.0.3-pre.1 runtime, artifacts, and audit complete",
-        "docs/BENCHMARKS.md release row",
+        ".agents/specs/release-binary-matrix.md",
+        "**ACTIVE; required W1-W11/W13 implemented and v0.0.2 published.**",
+        "**DONE; all release work published.**",
+        "missing required release anchor",
     ),
     (
-        "docs/STATUS.md",
-        "Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
-        "Supported; Windows v0.0.3-pre.1 published",
-        "docs/STATUS.md release row",
+        ".agents/roadmap_v1.md",
+        "Windows W14-W16 are implemented for one PR; native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, `v0.0.3-pre.1` publication and 32-asset audit remain pending",
+        "Windows publication is complete",
+        "roadmap release lifecycle",
     ),
 )
 
@@ -426,8 +415,7 @@ TEST_LITERAL_INVENTORIES = {
         "required_anchor_paths": (
             ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
             ".agents/coordination.md,.agents/completed/state-events/2026-08/"
-            "STATE-20260809T160000-001.md,docs/STATUS.md,"
-            "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
+            "STATE-20260809T160000-001.md,release/manifest-v1.schema.json,"
             "scripts/release_manifest.py,tests/scripts/test_release_manifest.py,"
             "examples/CMakeLists.txt,scripts/package-server.py,"
             "tests/scripts/test_server_package.py"
@@ -604,8 +592,7 @@ EXACT_MACHINE_FIELDS = {
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/completed/state-events/2026-08/"
-        "STATE-20260809T160000-001.md,docs/STATUS.md,"
-        "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
+        "STATE-20260809T160000-001.md,release/manifest-v1.schema.json,"
         "scripts/release_manifest.py,tests/scripts/test_release_manifest.py,"
         "examples/CMakeLists.txt,scripts/package-server.py,"
         "tests/scripts/test_server_package.py"
@@ -1369,24 +1356,6 @@ def contract_errors(root: Path) -> list[str]:
         if not path.is_file() or anchor not in path.read_text(encoding="utf-8"):
             errors.append(f"{relative} is missing required release anchor {anchor!r}")
     errors.extend(_release_lifecycle_errors(root))
-    benchmarks = root / "docs/BENCHMARKS.md"
-    if not benchmarks.is_file() or BENCHMARKS_RELEASE_ROW not in benchmarks.read_text(
-        encoding="utf-8"
-    ):
-        errors.append(
-            "docs/BENCHMARKS.md release row must keep v0.0.2 published and "
-            "Windows validation/publication pending"
-        )
-    status = root / "docs/STATUS.md"
-    status_text = status.read_text(encoding="utf-8") if status.is_file() else ""
-    status_row = next(
-        (line for line in status_text.splitlines() if line.startswith("| OpenAI server |")),
-        "",
-    )
-    if not all(fragment in status_row for fragment in STATUS_RELEASE_FRAGMENTS):
-        errors.append(
-            "docs/STATUS.md release row must keep v0.0.2 published and Windows pending"
-        )
     preflight = root / PREFLIGHT_PATH
     ci = root / CI_PATH
     if not preflight.is_file() or not ci.is_file():

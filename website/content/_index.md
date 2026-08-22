@@ -43,7 +43,7 @@ here owns are among the most useful contributions we get.
 appending, and only bumps on an incompatible change. Internals and CLI flags
 move fast. That header is the part we keep still.
 
-It is not finished, and the gaps are listed in [Status](STATUS.md) rather than
+It is not finished, and the stable overview is in [Project status](../README.md#project-status) rather than
 implied away. It is also not a competitor to vLLM in any sense that matters:
 this project is measured against vLLM on every commit, it exists because their
 design is good, and it is an independent community port that is not affiliated

@@ -75,7 +75,11 @@ def scanned_scripts() -> list[Path]:
         text=True,
         check=True,
     ).stdout.split()
-    return [ROOT / p for p in out if p.endswith((".sh", ".py"))]
+    return [
+        ROOT / p
+        for p in out
+        if p.endswith((".sh", ".py")) and (ROOT / p).is_file()
+    ]
 
 
 def bare_path_offenders(path: Path, text: str) -> list[str]:

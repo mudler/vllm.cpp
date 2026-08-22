@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import math
 import pathlib
 import signal
@@ -405,6 +406,194 @@ def build_clock_record(
         "sm_clock_mhz": summarize_sm_clocks(busy),
         "throttle_reasons_active": sorted(throttle),
     }
+
+
+def sample_instant_s(sample: Mapping[str, Any]) -> float:
+    """The wall-clock instant this sample was taken at, in Unix epoch seconds.
+
+    `run_sampler` writes `timestamp_utc` as an AWARE ISO-8601 stamp, and this is
+    the only field that can place a sample against a span a DIFFERENT process
+    measured. `elapsed_s` cannot: it is relative to the sampler's own start, and
+    the arm that marks its legs has no access to that origin.
+
+    A naive stamp is a REFUSAL rather than an assumed UTC. An unknown zone
+    shifts every span by the host's offset, which is a whole hour on this fleet
+    and moves a window nobody would see was wrong.
+    """
+
+    raw = sample.get("timestamp_utc")
+    if raw is None:
+        raise HarnessError(
+            "clock sample omits timestamp_utc, so it cannot be placed in a span"
+        )
+    text = str(raw).strip()
+    # `fromisoformat` takes `Z` from 3.11 on; normalizing keeps this module on
+    # the standard library floor the rest of it holds to.
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = dt.datetime.fromisoformat(text)
+    except ValueError as error:
+        raise HarnessError(
+            f"clock sample timestamp_utc is not ISO-8601: {raw!r}: {error}"
+        ) from error
+    if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+        raise HarnessError(
+            f"clock sample timestamp_utc {raw!r} carries no time zone; an unknown "
+            "zone is not UTC and would shift every span by the host's offset"
+        )
+    return moment.timestamp()
+
+
+def normalize_spans(spans: Sequence[Sequence[float]]) -> list[tuple[float, float]]:
+    """Validate the spans a driver measured its work in, or refuse.
+
+    An EMPTY list is the refusal that matters most. It is what a driver whose
+    leg markers did not parse hands over, and falling back to the whole stream
+    there would silently restore the very window the busy floor refused -- under
+    a record that claims to be spanned.
+    """
+
+    if not spans:
+        raise HarnessError(
+            "a spanned clock record was asked for with no span at all; there is "
+            "no window to attribute the measurement to, and the whole stream is "
+            "not a fallback"
+        )
+    normalized: list[tuple[float, float]] = []
+    for index, span in enumerate(spans):
+        pair = tuple(span)
+        if len(pair) != 2:
+            raise HarnessError(
+                f"clock span {index + 1} is not a (start, end) pair: {span!r}"
+            )
+        start, end = (float(pair[0]), float(pair[1]))
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise HarnessError(f"clock span {index + 1} is not finite: {span!r}")
+        if end < start:
+            raise HarnessError(
+                f"clock span {index + 1} ends before it starts: {start!r} -> {end!r}"
+            )
+        normalized.append((start, end))
+    return normalized
+
+
+def samples_within_spans(
+    samples: Sequence[Mapping[str, Any]], spans: Sequence[Sequence[float]]
+) -> list[Mapping[str, Any]]:
+    """The samples whose instant lies inside the union of `spans`.
+
+    Both ends are inclusive. The sampler ticks on its own interval and the spans
+    come from another process's clock, so an exclusive end would drop a sample
+    that lands exactly on a boundary for no reason anyone could state.
+    """
+
+    bounds = normalize_spans(spans)
+    return [
+        sample
+        for sample in samples
+        if any(start <= sample_instant_s(sample) <= end for start, end in bounds)
+    ]
+
+
+def build_spanned_clock_record(
+    samples: Sequence[Mapping[str, Any]],
+    spans: Sequence[Sequence[float]],
+    *,
+    boot_id: str,
+) -> dict[str, Any]:
+    """Reduce a sampled stream to the record for the WORK, not for the process.
+
+    `MIN_BUSY_FRACTION` asks that the retained window describe the measured
+    work. A driver that samples across a whole process lifetime does not satisfy
+    it by accident: the DFlash2 our-arm run of 2026-08-22 sampled 3222 seconds
+    of which 93 were warm generation, and `clock_reasons` refused it at 18.37%
+    busy ([#1671](https://github.com/mudler/vllm.cpp/issues/1671)). The refusal
+    was correct, so the repair is not to the floor. It is to the WINDOW: a
+    driver that can say when its work ran hands the spans over here, and the
+    record is built from the samples inside them.
+
+    **Nothing here relaxes a rule.** The result is an ordinary clock record and
+    `clock_reasons` judges it unchanged -- the busy fraction, the retained
+    count, the spread, the throttle reasons and persistence mode all apply, to a
+    smaller and truer set of samples. A span the GPU was idle through is refused
+    below; a span too short to observe fails the count floor; and no span at all
+    is refused rather than widened back to the stream.
+
+    It reuses `build_clock_record` rather than re-deriving anything, so the
+    statistics, the idle accounting and the mid-window field check are the same
+    code the unrestricted path runs.
+    """
+
+    if not samples:
+        raise HarnessError("cannot build a clock record from an empty window")
+    bounds = normalize_spans(spans)
+    kept = samples_within_spans(samples, bounds)
+    if not kept:
+        raise HarnessError(
+            f"the {len(bounds)} measured span(s) retained none of the "
+            f"{len(samples)} clock samples in the stream; the driver's spans and "
+            "the sampler's window do not overlap, which is a driver defect and "
+            "never a fast window"
+        )
+    record = build_clock_record(kept, boot_id=boot_id)
+    #: WHAT WAS RESTRICTED, beside the record it produced. Without it a reader
+    #: cannot tell a window that covered the work from one that covered a
+    #: fraction of it, and both score the same on `spread_pct`.
+    record["window"] = {
+        "retained_samples": len(kept),
+        "spanned_s": sum(end - start for start, end in bounds),
+        "spans": len(bounds),
+        "stream_samples": len(samples),
+    }
+    return record
+
+
+def read_sample_stream(path: pathlib.Path) -> list[dict[str, Any]]:
+    """Read the raw per-sample stream `run_sampler` writes, or refuse.
+
+    ONE TRUNCATED FINAL LINE IS TOLERATED, and nothing else is. `run_sampler`
+    flushes after every sample, so a consumer that reads the file while the
+    sampler is still appending sees whole lines and, at worst, a partial tail.
+    Refusing that would end a two-hour leased run on the newest sample in the
+    file -- which is by construction AFTER the last leg and therefore outside
+    every span the caller asked for, so it can cost the measurement nothing.
+
+    A malformed line ANYWHERE ELSE is a refusal. A stream with a hole in the
+    middle is not a shorter stream, and a shorter stream is exactly what the
+    coverage floors exist to catch.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise HarnessError(f"cannot read the clock sample stream {path}: {error}") from error
+    lines = text.splitlines()
+    # `splitlines` cannot tell `{...}\n` from `{...}`, and only the latter is a
+    # tail still being written. The final line is exempt only when the file does
+    # not end in a newline.
+    partial_tail_allowed = bool(lines) and not text.endswith("\n")
+    samples: list[dict[str, Any]] = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError as error:
+            if number == len(lines) and partial_tail_allowed:
+                break
+            raise HarnessError(
+                f"clock sample stream {path} line {number} is not JSON: {error}"
+            ) from error
+        if not isinstance(sample, dict):
+            raise HarnessError(
+                f"clock sample stream {path} line {number} is not an object"
+            )
+        samples.append(sample)
+    if not samples:
+        raise HarnessError(f"clock sample stream {path} holds no sample")
+    return samples
+
 
 
 def merge_clock_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -899,11 +1088,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(canonical_json(record))
         return 0
 
-    import json as _json
-
+    # `json` is imported at module scope since `read_sample_stream` needed it;
+    # the function-local `import json as _json` this replaced is now redundant.
     comparison = compare_clock_records(
-        _json.loads(args.ours.read_text(encoding="utf-8")),
-        _json.loads(args.vllm.read_text(encoding="utf-8")),
+        json.loads(args.ours.read_text(encoding="utf-8")),
+        json.loads(args.vllm.read_text(encoding="utf-8")),
         allow_cross_boot=args.allow_cross_boot,
     )
     print(canonical_json(comparison))

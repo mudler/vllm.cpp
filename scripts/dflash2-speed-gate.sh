@@ -303,9 +303,25 @@ python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" \
 close_clock_window
 
 echo "== our arm, identical workload, through the public ABI (vllm-cli)"
+# THE ARM IS GIVEN THE RAW SAMPLE STREAM, NOT ONLY THE SUMMARY (#1671).
+# `vllm-cli` is one process per prompt and reads a 52 GiB checkpoint before it
+# decodes anything, so the window this shell opens is the four PROCESSES: on
+# 2026-08-22 it was 3377 s carrying 93.2 s of warm generation, 18.37% busy, and
+# `clock_reasons` refused it on the 50% floor. That refusal is correct and the
+# floor stays. What changes is the WINDOW: `vllm-cli` now marks each leg's
+# generation boundaries, and the arm builds its clock record from the samples
+# inside the WARM leg spans -- the legs the median is folded from. The path
+# below is the one `open_clock_window ours` writes; the two must stay equal, and
+# `tests/tools/test_dflash2_speed_harness.py` binds them.
+#
+# The ORACLE arm gets no such flag, and that is not an oversight. It does not
+# own its window here, so the summary the shell closes after it exits already
+# spans only its prompt loop (85 samples, 98.82% busy on the same run).
+# Restricting the oracle arm to its own legs is owed, not silent.
 open_clock_window ours
 python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" \
   --clock-summary "${EVIDENCE}/clock-ours.json" \
+  --clock-samples "${EVIDENCE}/clock-ours-samples.jsonl" \
   --output "${EVIDENCE}/our-arm.json" || { close_clock_window; exit 1; }
 close_clock_window
 

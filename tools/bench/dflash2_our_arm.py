@@ -69,6 +69,7 @@ from tools.bench.dflash2_speed_harness import (
     clock_state_reasons,
     contention_reasons,
     fold_legs,
+    is_warm_leg,
     leg_reasons,
     model_binding_reasons,
     repeat_reasons,
@@ -77,12 +78,25 @@ from tools.bench.dflash2_speed_harness import (
     sse_keepalive_reasons,
     workload_fingerprint,
 )
+from tools.bench.gpu_clock_state import (
+    build_spanned_clock_record,
+    read_boot_id,
+    read_sample_stream,
+)
 
 #: Re-exported so `our_arm.leg_reasons` and `our_arm.fold_legs` keep naming the
 #: rule this arm applies. The rule itself lives in `dflash2_speed_harness`
 #: because the ORACLE ARM APPLIES THE SAME ONE: a ratio between a median folded
 #: here and a median folded there is a ratio between two statistics.
-__all__ = ["fold_legs", "leg_reasons", "parse_legs", "main"]
+__all__ = [
+    "fold_legs",
+    "leg_reasons",
+    "legs_with_spans",
+    "parse_leg_spans",
+    "parse_legs",
+    "warm_leg_spans",
+    "main",
+]
 from tools.bench.serve_low_common import HarnessError, canonical_json, write_json_atomic
 
 #: Positional against `examples/cli/main.cpp`'s own format string. A rename
@@ -111,6 +125,108 @@ def parse_legs(stderr_text: str) -> list[dict[str, Any]]:
             }
         )
     return legs
+
+
+#: The leg-boundary marker, positional against the SECOND format string
+#: `examples/cli/main.cpp` prints per leg (#1671). Separate from `LEG_RE` on
+#: purpose: the timing line is parsed by evidence and readers that predate this
+#: marker, so it keeps its bytes and the span arrives on its own line.
+#:
+#: Epoch seconds, because the sampler stamps `timestamp_utc` and the two have to
+#: be comparable without either side guessing a time zone.
+LEG_SPAN_RE = re.compile(
+    r"run=(?P<run>\d+)/(?P<of>\d+)\s+generate_start_unix=(?P<start>[0-9.]+)\s+"
+    r"generate_end_unix=(?P<end>[0-9.]+)"
+)
+
+
+def parse_leg_spans(stderr_text: str) -> dict[int, tuple[float, float]]:
+    """Every leg boundary `vllm-cli` marked, keyed by its run number.
+
+    ONE PROCESS AT A TIME. `--repeat N` numbers its legs 1..N and this harness
+    launches one process per prompt, so the key is unique within the text of a
+    single invocation and would collide across four of them.
+    """
+
+    spans: dict[int, tuple[float, float]] = {}
+    for match in LEG_SPAN_RE.finditer(stderr_text):
+        spans[int(match.group("run"))] = (
+            float(match.group("start")),
+            float(match.group("end")),
+        )
+    return spans
+
+
+def legs_with_spans(stderr_text: str) -> list[dict[str, Any]]:
+    """This process's legs, each carrying the instants it generated between.
+
+    A leg with no marker is a REFUSAL and never a leg with no span. The clock
+    window is built from these spans, so a leg that cannot be placed in time
+    would silently shrink the window that has to describe the measurement --
+    and a binary built before the marker existed would produce exactly that,
+    quietly, on a leased run nobody wants to repeat.
+    """
+
+    legs = parse_legs(stderr_text)
+    spans = parse_leg_spans(stderr_text)
+    for leg in legs:
+        span = spans.get(int(leg["run"]))
+        if span is None:
+            raise HarnessError(
+                f"legs: run {leg['run']} printed a timing line and NO leg-boundary "
+                "marker, so the clock cannot be attributed to it. The marker is "
+                "`generate_start_unix=`/`generate_end_unix=`, printed by "
+                "`examples/cli/main.cpp`; a binary built before it cannot drive "
+                "this arm"
+            )
+        leg["generate_start_unix"], leg["generate_end_unix"] = span
+    return legs
+
+
+def warm_leg_spans(legs: Sequence[Mapping[str, Any]]) -> list[tuple[float, float]]:
+    """The spans of the legs the median is folded from, and ONLY those.
+
+    Not every leg. `fold_legs` discards run 1 of each repetition group for a
+    named cause, so a window that kept run 1's span would attribute the number to
+    samples taken during work the number excludes. On the 2026-08-22 run those
+    four legs were 959.3 s against 93.2 s of warm generation, so this is not a
+    rounding decision.
+
+    THE MODEL LOAD IS ALREADY OUTSIDE EVERY SPAN, and not because of this
+    function. `examples/cli/main.cpp` brackets `vllm_complete` alone, and
+    `vllm_engine_load` runs before the repeat loop, so no leg of this arm has
+    ever contained a load. What run 1 does carry is the first graph capture, the
+    first KV allocation and the first touch of weights the loader mapped -- which
+    is why it is 240 s to a warm leg's 5.8 s and why it is discarded.
+    """
+
+    return [
+        (float(leg["generate_start_unix"]), float(leg["generate_end_unix"]))
+        for leg in legs
+        if is_warm_leg(leg)
+    ]
+
+
+def spanned_clock(
+    args: argparse.Namespace, legs: Sequence[Mapping[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """This arm's clock record, restricted to the warm legs it folded.
+
+    Returns `(record, error)`. A failure is RETURNED rather than raised because
+    the legs already cost a lease by the time it can happen, and the caller
+    writes the arm record before it judges the clock. Nothing quotable is
+    printed either way: `clock_state_reasons` refuses a `None` record.
+    """
+
+    try:
+        stream = read_sample_stream(args.clock_samples)
+        boot = read_boot_id()
+        return (
+            build_spanned_clock_record(stream, warm_leg_spans(legs), boot_id=boot),
+            None,
+        )
+    except HarnessError as error:
+        return None, str(error)
 
 
 def run_binary(args: argparse.Namespace, prompt: str) -> str:
@@ -174,6 +290,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--our-revision", default="")
     parser.add_argument("--our-build-recipe", default="")
     parser.add_argument("--clock-summary", type=pathlib.Path)
+    parser.add_argument(
+        "--clock-samples",
+        type=pathlib.Path,
+        help="the sampler's RAW per-sample stream (`gpu_clock_state sample "
+        "--output`). Given it, this arm builds its clock record from the samples "
+        "inside the WARM LEG SPANS `vllm-cli` marked, rather than from a summary "
+        "over the whole process lifetime -- which on 2026-08-22 was 18.37% busy "
+        "and refused, correctly (#1671)",
+    )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--precheck-only", action="store_true")
     parser.add_argument("--assume-compute-processes", type=json.loads, default=None)
@@ -246,18 +371,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(canonical_json({"precheck": "PASS", **checked}))
         return 0
 
-    clock = _load_clock(args.clock_summary)
-    require_no_reasons(clock_state_reasons(clock, label="ours"), what="DFlash2 our-arm capture")
+    # THE WINDOW IS THE WORK, NOT THE PROCESS (#1671). With `--clock-samples`
+    # the record is built AFTER the legs, from the samples inside the spans
+    # `vllm-cli` marked, so the four checkpoint reads this arm pays are outside
+    # it. Without it the old whole-window summary is read first, unchanged --
+    # that path is not laxer, it is the one that refused, and it stays readable
+    # so an archived evidence tree still summarizes.
+    clock: dict[str, Any] | None = None
+    clock_error: str | None = None
+    if args.clock_samples is None:
+        clock = _load_clock(args.clock_summary)
+        require_no_reasons(
+            clock_state_reasons(clock, label="ours"), what="DFlash2 our-arm capture"
+        )
 
     legs: list[dict[str, Any]] = []
     for prompt in checked["prompts"]:
-        legs += parse_legs(run_binary(args, prompt))
+        # NOT `parse_legs`. A leg with no boundary marker is a refusal, because
+        # the clock window is built out of those boundaries and a leg that
+        # cannot be placed in time would shrink it silently.
+        legs += legs_with_spans(run_binary(args, prompt))
     require_no_reasons(
         leg_reasons(legs, max_tokens=args.max_tokens), what="DFlash2 our-arm capture"
     )
-    record = {**checked, **fold_legs(legs), "clock": clock, "binary": args.binary}
+
+    if args.clock_samples is not None:
+        clock, clock_error = spanned_clock(args, legs)
+
+    record = {
+        **checked,
+        **fold_legs(legs),
+        "clock": clock,
+        # NULL on a healthy run; the sampler's or the reader's own words when
+        # there is no window to judge. The legs already cost a lease, so the
+        # failure is kept here and refused below rather than thrown over them.
+        "clock_error": clock_error,
+        "binary": args.binary,
+    }
+    # WRITTEN BEFORE THE CLOCK IS JUDGED, and nothing quotable is printed until
+    # it passes: the refusal precedes the `print`, and `build_speed_result`
+    # refuses the same record again through `clock_pairing`.
     if args.output is not None:
         write_json_atomic(args.output, record)
+    reasons = clock_state_reasons(clock, label="ours")
+    if clock_error:
+        reasons.append(
+            f"clock: ours could not build a window over its warm legs: {clock_error}"
+        )
+    require_no_reasons(reasons, what="DFlash2 our-arm capture")
     print(canonical_json(record))
     return 0
 

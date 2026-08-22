@@ -864,10 +864,40 @@ environment:
 
     **3. What the job does.**
 
+    **This script is the whole recipe, including the disk discipline the prose
+    below mandates.** An earlier draft printed a shorter version and left the
+    disk rules to the prose; "copy it rather than re-deriving it" means the
+    script is what actually gets run, so a guard that lives only in a paragraph
+    is a guard nobody executes.
+
     ```sh
-    # The CUDA toolkit is NOT in the worker image. Install it, unconditionally,
-    # and assert it -- a previous job's leftover install is not a precondition
-    # you may rely on.
+    #!/bin/bash
+    set -u
+    SRC=/tmp/src
+    NEED_GB=90
+    free_gb() { df -BG --output=avail /tmp | tail -1 | tr -dc '0-9'; }
+
+    # --- clean up on ANY exit, including the kill. A job that dies holding its
+    # --- tree is what took this box out of the pool.
+    cleanup() { rm -rf "$SRC"; kill "${HB:-}" 2>/dev/null; wait "${HB:-}" 2>/dev/null; }
+    trap cleanup EXIT INT TERM
+
+    ( while true; do sleep 60; echo "### hb $(date -u +%H:%M:%S) disk=$(free_gb)G"; done ) &
+    HB=$!
+
+    # --- DISK, before anything else. The container is REUSED, so other jobs'
+    # --- trees are still here and the free space is shared with them.
+    df -h /tmp
+    du -sh /tmp/* 2>/dev/null | sort -rh | head -10
+    rm -rf /tmp/src /tmp/thor-w05-src*          # reclaim this lane's old trees, not just mine
+    if [ "$(free_gb)" -lt "$NEED_GB" ]; then
+      echo "REFUSING: /tmp has $(free_gb) GiB free, this build needs about ${NEED_GB}."
+      echo "A CUDA build that runs out of space fails as unrelated compile errors."
+      exit 95
+    fi
+
+    # --- The CUDA toolkit is NOT in the worker image. Install it unconditionally
+    # --- and assert it; a previous job's leftover is not a precondition.
     export PATH=/usr/local/cuda/bin:$PATH
     if ! command -v nvcc >/dev/null 2>&1; then
       apt-get update -qq
@@ -875,17 +905,17 @@ environment:
       export PATH=/usr/local/cuda/bin:$PATH
     fi
     command -v nvcc >/dev/null || { echo "FATAL: no nvcc after install"; exit 90; }
-    nvcc --version | tail -2          # record WHICH toolkit built this
+    nvcc --version | tail -2                    # record WHICH toolkit built this
 
-    rm -rf /tmp/src && mkdir -p /tmp/src        # the container is REUSED between jobs
-    tar -xzf /workspace/<your-dir>/src.tar.gz -C /tmp/src
-    test -f /tmp/src/CMakeLists.txt || { echo "FATAL: untar"; exit 92; }
+    mkdir -p "$SRC"
+    tar -xzf /workspace/<your-dir>/src.tar.gz -C "$SRC"
+    test -f "$SRC/CMakeLists.txt" || { echo "FATAL: untar"; exit 92; }
 
-    cmake -S /tmp/src -B /tmp/src/build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    cmake -S "$SRC" -B "$SRC/build-cuda" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
-    cmake --build /tmp/src/build-cuda -j 4
-    ( cd /tmp/src/build-cuda && ctest -j1 --timeout 1800 )
-    rm -rf /tmp/src                             # see "Disk is shared"
+    cmake --build "$SRC/build-cuda" -j 4
+    ( cd "$SRC/build-cuda" && ctest -j1 --timeout 1800 )
+    # cleanup() removes $SRC on the way out, on success AND on the kill path.
     ```
 
     Build in `/tmp` or `/root`, never on `/workspace`: the share is CIFS with

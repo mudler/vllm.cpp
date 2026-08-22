@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import platform
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,24 @@ class ReleaseMetadataContract(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.metadata = load(METADATA, "release_metadata")
         cls.package = load(PACKAGE, "package_server")
+        # #1487: the fixture stages the HOST's /bin/true as the server, so the
+        # declared artifact must follow the staged ELF's machine instead of a
+        # hardcoded x86_64 — on every other host the fixture builds a manifest
+        # that lies about its own payload and the validator rightly refuses it
+        # (ELF host architecture does not match manifest). CPU_TIER_POLICY
+        # carries both linux CPU entries, so the tier report follows the same
+        # arch and the whole contract runs identically per host.
+        machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(
+            platform.machine(), platform.machine()
+        )
+        if machine not in cls.metadata.release_manifest.CPU_TIER_POLICY:
+            raise unittest.SkipTest(
+                f"host machine {machine!r} has no declared linux CPU artifact "
+                "to fixture"
+            )
+        cls.machine = machine
+        cls.artifact_id = f"linux-{machine}-glibc-cpu"
+        cls.policy = cls.metadata.release_manifest.CPU_TIER_POLICY[machine]
 
     def fixture(self, scratch: Path):
         build = scratch / "build"
@@ -73,18 +92,18 @@ class ReleaseMetadataContract(unittest.TestCase):
             "".join(f"{key}:{kind}={value}\n" for key, (kind, value) in cache.items()),
             encoding="utf-8",
         )
-        policy = self.metadata.release_manifest.CPU_TIER_POLICY["x86_64"]
+        policy = self.policy
         report = {
             "commands": [f"VT_CPU_MATMUL_TIER={name} test_ops_matmul_elem" for name in policy["tiers"]],
             "schema": "vllm.cpp.cpu-tier-report.v1",
-            "selected_tier": "avx512f",
+            "selected_tier": policy["tiers"][-1],
             "tiers": {name: passed(f"force {name}") for name in policy["tiers"]},
         }
         report_path = scratch / "tier-report.json"
         report_path.write_text(json.dumps(report), encoding="utf-8")
         args = argparse.Namespace(
             abi_version="2.31",
-            artifact_id="linux-x86_64-glibc-cpu",
+            artifact_id=self.artifact_id,
             build_dir=build,
             c_abi_version=17,
             channel="stable",
@@ -109,7 +128,7 @@ class ReleaseMetadataContract(unittest.TestCase):
             self.assertEqual(manifest["artifact"]["channel"], "stable")
             self.assertEqual(
                 [tier["execution_evidence"]["state"] for tier in manifest["cpu"]["compiled_tiers"]],
-                ["passed"] * 4,
+                ["passed"] * len(self.policy["tiers"]),
             )
             sbom = json.loads((args.output_dir / "sbom.spdx.json").read_text())
             self.assertEqual(sbom["spdxVersion"], "SPDX-2.3")
@@ -118,14 +137,15 @@ class ReleaseMetadataContract(unittest.TestCase):
     def test_stable_metadata_refuses_a_missing_or_unexecuted_tier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args, report = self.fixture(Path(temporary))
-            del report["tiers"]["avx512f"]
+            deprived = self.policy["tiers"][-1]
+            del report["tiers"][deprived]
             args.tier_report.write_text(json.dumps(report), encoding="utf-8")
             with self.assertRaises(ValueError):
                 self.metadata.prepare_cpu_metadata(args)
             args, report = self.fixture(Path(temporary) / "second")
-            report["tiers"]["avx512f"] = {
+            report["tiers"][deprived] = {
                 "command": "",
-                "reason": "runner lacks AVX-512",
+                "reason": f"runner lacks {deprived}",
                 "result": "",
                 "state": "absent",
                 "url": "",
@@ -142,7 +162,7 @@ class ReleaseMetadataContract(unittest.TestCase):
             packaged = scratch / "packaged"
             shutil.copytree(args.stage_dir, packaged)
             self.package.install_metadata(args.output_dir, packaged)
-            archive = scratch / "vllm.cpp-0.0.1-linux-x86_64-glibc-cpu.tar.gz"
+            archive = scratch / f"vllm.cpp-0.0.1-{args.artifact_id}.tar.gz"
             self.package.write_archive(packaged, archive, 0, "tar.gz")
             self.package.write_archive_sidecars(archive, packaged)
             result = subprocess.run(

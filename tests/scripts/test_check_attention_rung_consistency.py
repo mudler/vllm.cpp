@@ -248,6 +248,14 @@ class ShippedTreeTests(unittest.TestCase):
         # Pins that every allowlisted stem names a model source that exists, so a
         # typo is reported at the typo.
         #
+        # DORMANT rather than dead now that the allowlist is empty: this iterates
+        # over nothing and asserts nothing on the shipped tree. That is the
+        # correct state for it -- it is a guard on a file that is currently
+        # empty, and it fires the moment anything is added, which is measured
+        # rather than assumed (appending one bogus stem reds this case and the
+        # pinning case together). Deleting it because it is quiet today would
+        # remove the typo report from exactly the edit that needs it.
+        #
         # Keyed on the FILE existing, never on scan membership. A stem stops having
         # a call site the moment its removing row lands -- that is the state the
         # allowlist is built to survive, which the checker's own

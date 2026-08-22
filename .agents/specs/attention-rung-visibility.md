@@ -301,10 +301,13 @@ would be a regression rather than a repair.
   `scripts/check-attention-rung-consistency.py` ship unrepaired beside a suite
   that was repaired for #1629: `:58-61` gives the wrong reason for not widening
   the regex, `:93-96` attributes the exclusion of the fast rungs to the `\b`
-  rather than to the trailing `\(`, and `:252-255` denies an equality that held
-  on the tree this spec was written against (9 sites, 6 marked, 3 excused) and
-  no longer does (8 sites, 8 marked, 0 excused, as of #1663) -- the comment is
-  still wrong, and it is now wrong about a different tree. It cannot be fixed here, because
+  rather than to the trailing `\(`, and `:252-255` denies an equality that
+  holds. It held when this spec was written (9 sites, 6 marked, 3 excused) and it
+  holds now for a STRONGER reason: `47a918d8f` and `90e8c3c85` moved the tree to
+  8 sites and 8 marked, and #1663 then emptied the allowlist, so `excused` is 0
+  BY CONSTRUCTION -- with nothing allowlisted, any green tree has
+  `sites == marked` and `excused == 0`, and the equality cannot fail. The comment
+  is still wrong, and it is now wrong about a tree where it cannot be right. It cannot be fixed here, because
   changing what the gate accepts is what AGENTS.md `## Changing the rules or a
   checker` routes to its own row, spec and red-before evidence; attaching the
   correction to an unrelated semantic change is the alternative that section
@@ -324,7 +327,7 @@ that remain in `ltx2.cpp` and `ltx2_device.cpp` are the host CPU-only arm and th
 D4 predicted the checker would report those entries STALE and not fail, and it
 did, for the whole window from `90e8c3c85` to #1663. What D4 did not say is what
 that window COSTS: a listed stem excuses its entire translation unit, so deleting
-the live marker at `ltx2.cpp:958` left the checker at rc=0 (`7 carry a recorded
+the live marker at `ltx2.cpp:959` left the checker at rc=0 (`7 carry a recorded
 reason, 1 unmarked and excused`) while the stem sat there, and reds at rc=1
 naming `ltx2.cpp:966` once it is gone. Both arms measured on `db648fb88` and
 restored byte-for-byte against a pre-taken sha256. The deferral D4 designs for is

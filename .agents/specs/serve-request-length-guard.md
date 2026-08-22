@@ -349,4 +349,148 @@ Named gaps, none of them a defect this row leaves behind:
 
 ## Outcome
 
-Recorded on the branch, before the merge.
+Recorded on the branch, before the merge. Base `db648fb88`, branch
+`row/SERVE-REQUEST-LENGTH-GUARD`, five commits.
+
+### What landed
+
+`vllm::tok::Tokenizer::MaxTokenBytes()` is the longest stored token text,
+computed once in `FinalizeTables`. `ApiServer::set_tokenizer` derives
+`max_prompt_bytes_ = max_model_len * MaxTokenBytes()`, clamped on overflow and
+0 when either factor is unknown. `ApiServer::refuse_oversized_prompt` returns a
+400 `BadRequestError` naming the length received, the limit and the derivation,
+called from `handle_tokenize` immediately before the encode and from
+`handle_completions` / `handle_chat_completions` after the body parses and
+before `check_model`.
+
+**No config key, no CLI flag, no environment variable.** `## Design` carries the
+argument. `docs/USAGE.md` gains a troubleshooting entry for the message rather
+than a key row, because there is no key.
+
+### Red, then green
+
+| stage | command | cases | assertions | `Status:` | exit |
+|---|---|---:|---:|---|---:|
+| RED, at `bfe25bc51` | `test_openai_api_server -tc="api_server: an oversized prompt is REFUSED at the request boundary"` | 1 | 41, **15 failed** | `FAILURE!` | **1** |
+| GREEN, at `a5dbf60e3` | the same command | 1 | 41, 0 failed | `SUCCESS!` | 0 |
+
+The red is the finding, not a step toward one: `/tokenize` answered **200** with
+a token list to a 289-byte prompt against a 288-byte bound, on a route that
+needs no engine, no model and no credential. `/v1/completions` and
+`/v1/chat/completions` already answered 400 — from `ValidatePromptLen`, after
+the encode — so their cases assert the MESSAGE, and it is the message that was
+red. `/v1/completions` with an unknown model answered 404, so the bound was not
+yet ahead of the model lookup.
+
+**The first red run reported 6 assertions, not 41**, because `.at("error")` on a
+200 body threw out of the whole `TEST_CASE` and hid four of the five subcases.
+The accessors are non-throwing for that reason, and the number recorded above is
+the one taken after the fix.
+
+### The full focused gate, at `a5dbf60e3`
+
+One fresh `cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_BUILD_EXAMPLES=OFF`, then `ninja -C build -j 16`: **1122 of 1122
+targets, zero compiler warnings**, so no stale binary is printing this green.
+Every suite run as its own executable so `Status:` could be read beside
+`assertions:`, and every one reports a NON-ZERO case count.
+
+| suite | cases | assertions | `Status:` | exit |
+|---|---:|---:|---|---:|
+| `test_openai_api_server` | 68 | 874 | `SUCCESS!` | 0 |
+| `test_openai_conformance` | 23 | 252 | `SUCCESS!` | 0 |
+| `test_openai_serving` | 42 | 556 | `SUCCESS!` | 0 |
+| `test_bpe` | 24 | 971 | `SUCCESS!` | 0 |
+| `test_bpe_equivalence` | 2 | 334 | `SUCCESS!` | 0 |
+| `test_detokenizer` | 12 | 221 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity` | 4 | 1175 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity_mistral` | 6 | 421 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity_deepseek` | 6 | 2461 | `SUCCESS!` | 0 |
+| `test_tokenizer_parity_gpt4o` | 5 | 1000 | `SUCCESS!` | 0 |
+| `test_tokenizer_metaspace_split` | 7 | 28 | `SUCCESS!` | 0 |
+
+### The two mutations
+
+Both applied in the worktree against a pre-taken sha256
+(`1788a62b18f42df259ac4f761bff69a85fa01980c8917940d80985b753284429` for
+`src/vllm/entrypoints/openai/api_server.cpp`), with the compiler return code and
+the applied diff printed each time, and both restored byte-for-byte to that hash
+with the suite re-run green after.
+
+**REACHABILITY — delete all three production call sites.** `git diff --no-index`
+against the pristine copy: `1 file changed, 9 deletions(-)`, the nine lines being
+the three `if (auto refusal = refuse_oversized_prompt(...)) { return *refusal; }`
+blocks. `compile_rc=0`, so this is a real mutation and not a build failure
+wearing a pass.
+
+| case | result |
+|---|---|
+| the five socket cases | **41 assertions, 15 failed, `FAILURE!`, exit 1** |
+| the derivation case | 10 assertions, 0 failed, `SUCCESS!`, exit 0 |
+
+**That split is itself the finding, and it is why the socket cases exist.** The
+derivation case constructs the bound and reads it back; it stays green with the
+guard reaching nothing, so on its own it measures a class rather than a
+capability — exactly the shape `.agents/reachability.md` names. Only the cases
+that enter through the registered route over a real socket detect the deletion.
+
+**TRUNCATION — replace the refusal with `resize(max_prompt_bytes_)` in
+`handle_tokenize` and `handle_completions`.** `git diff --no-index`:
+`1 file changed, 4 insertions(+), 4 deletions(-)`. `compile_rc=0`. Result: **41
+assertions, 13 failed, `FAILURE!`, exit 1**, and the two assertions that fire
+FIRST on the truncating build are the truncation detectors —
+`CHECK_FALSE(j.contains("tokens"))` and `CHECK_FALSE(j.contains("count"))` — so
+the gate distinguishes a refusal from a shortened success rather than only
+checking that the request did not hang.
+
+### Why each default has its value
+
+**The bound is `max_model_len * MaxTokenBytes()` and not a round number.** It is
+the largest prompt that could still fit in the model's context, so it is the
+tightest bound that provably refuses nothing `ValidatePromptLen` would have
+accepted. Anything smaller is a policy choice that changes behaviour; anything
+larger is inert on the generate paths. At a 40,960-token context it is 10 MB on
+a Qwen3.6-class checkpoint and 1.9 MB on a Mistral-class one, against httplib's
+100 MB.
+
+**`MaxTokenBytes()` reads the STORED text, not the decoded text.** The stored
+form is never shorter, so the bound is never tighter than the true one. An
+under-estimate would refuse a servable prompt, which is the one failure this
+design cannot have.
+
+**The refusal is 400 `BadRequestError`.** The register of every sibling refusal
+in the same file, and the status `InputValidationError` already maps to for the
+post-encode token refusal. 413 was considered and not taken: this is not a
+payload-size limit at the transport, it is a request-validation refusal, and it
+must carry the OpenAI `ErrorResponse` body an SDK reads.
+
+**It is not configurable.** Argued in `## Design`. This diverges from vLLM's
+register for its own analogues, and the divergence is recorded rather than
+hidden: vLLM's numbers are arbitrary policy and must be tunable; ours is derived
+and has nothing to tune.
+
+### What was rejected
+
+- **A raw request-BODY byte bound.** Earlier still, and it would bound the JSON
+  parse too — but `/v1/chat/completions` carries inline base64 media that is
+  never tokenized as text, so a text-derived bound would refuse legitimate
+  multimodal requests and a bound loose enough not to would not bound the text.
+- **Truncation.** Forbidden by the row's first binding constraint, and the gate
+  detects it (above) rather than trusting the prohibition.
+- **`ValidatePromptLen`.** Forbidden by the second, and it needs the token count
+  the expensive step produces.
+- **A number transcribed from vLLM.** `h11_max_incomplete_event_size`'s 4 MB was
+  the tempting one. It bounds the header block, not the body, and taking it
+  would have been a constant with a citation that does not support it.
+
+### Limitations, disclosed rather than closed
+
+1. **No end-to-end measurement of what the bound saves.** After `67823aee2` a
+   64 KB prompt encodes in tens of milliseconds, so the guard protects against a
+   regression and against a 100 MB body rather than against today's measured
+   cost. No throughput or latency figure is claimed, and `docs/BENCHMARKS.md` is
+   therefore not edited.
+2. **Four routes and the C ABI are unbounded**, listed under `## Owed` with the
+   one that has a direct vLLM mirror to port named.
+3. **The chat arm measures the summed message text, not the rendered prompt.**
+   Also under `## Owed`.

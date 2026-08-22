@@ -421,7 +421,14 @@ def audit() -> list[dict]:
 # verdict. Found while merging origin/main into row/ENG-HF-MODEL-DOWNLOAD and
 # fixed in that flow under #1376, because the fix is small and clear and a red
 # main blocks every other row's gate. Growth, so the set is re-pinned.
+# 2026-08-22: +SERVE-REQUEST-LENGTH-GUARD enters the runnable population with the
+# row itself (#1541). GROWTH, so the set is re-pinned in the same change, per the
+# note above. Its spec `## Gates` names a configure, a ninja target list and three
+# suite invocations that genuinely fail on a broken guard -- the same three the
+# implementing branch's red-then-green evidence was taken from -- so the credit is
+# the row's own and not inherited.
 RUNNABLE_BASELINE = frozenset({
+    "SERVE-REQUEST-LENGTH-GUARD",
     "ENG-CUDAGRAPH-BREAK",
     "ENG-HF-MODEL-DOWNLOAD",
     "ENG-RESIDENCY-CONFIG",

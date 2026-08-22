@@ -1822,6 +1822,52 @@ TEST_CASE("api_server: an oversized prompt is REFUSED at the request boundary") 
 }
 
 
+// The bound is DERIVED, so the derivation is what is pinned -- not the number.
+// A literal 288 in the cases above would still pass if the bound came from
+// somewhere else entirely.
+TEST_CASE("api_server: the prompt bound IS max_model_len x MaxTokenBytes") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  // The fixture's longest STORED token text: the added token "<|end|>of".
+  // "Ġworld" is 7, because the byte-level mark 'Ġ' (U+0120) is two UTF-8 bytes.
+  REQUIRE(Fixture().MaxTokenBytes() == 9);
+
+  SUBCASE("attached through the production seam: the product, exactly") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    CHECK(h.server.max_prompt_bytes() ==
+          static_cast<size_t>(kMaxModelLen) * Fixture().MaxTokenBytes());
+    CHECK(h.server.max_prompt_bytes() == kMaxPromptBytes);
+  }
+
+  SUBCASE("no tokenizer attached: unbounded, and the guard is inert") {
+    ServerHarness h(c, w, Fixture());
+    CHECK(h.server.max_prompt_bytes() == 0);
+    // Inert, not "small": an oversized prompt reaches the engine and earns the
+    // POST-encode token refusal instead, exactly as before this row.
+    json req;
+    req["prompt"] = std::string(kMaxPromptBytes + 1, 'h');
+    req["max_tokens"] = 1;
+    ApiServer::DispatchResult r = h.server.handle_completions(req.dump());
+    CHECK(r.status == 400);
+    CHECK(ErrMsg(json::parse(r.body)).find("maximum model length") !=
+          std::string::npos);
+  }
+
+  // Upstream's own "no context length is known" state
+  // (InputProcessor::ValidatePromptLen early-outs on max_model_len <= 0). A
+  // bound cannot be derived from it, so there is none.
+  SUBCASE("max_model_len <= 0: unbounded") {
+    ServerHarness h(c, w, Fixture());
+    h.server.set_tokenizer(&Fixture(), 0);
+    CHECK(h.server.max_prompt_bytes() == 0);
+    h.server.set_tokenizer(&Fixture(), kMaxModelLen);
+    CHECK(h.server.max_prompt_bytes() == kMaxPromptBytes);
+  }
+}
+
 // W2 port of test_async_llm.test_load at the HTTP boundary: concurrent workers
 // submit into one AsyncLLM queue and complete as one scheduler batch; there is
 // no server-wide engine mutex.

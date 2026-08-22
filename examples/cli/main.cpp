@@ -278,9 +278,16 @@ int main(int argc, char** argv) {
     // ── Blocking: load once, optionally repeat for warm tok/s. ───────────────
     for (int r = 0; r < args.repeat; ++r) {
       vllm_completion out{};
+      // TWO CLOCKS, DELIBERATELY, because they answer different questions.
+      // steady_clock measures the DURATION and cannot jump; system_clock names
+      // the INSTANT, which is the only thing an out-of-process observer can
+      // line its own samples up against. Reporting a duration from the wall
+      // clock, or an instant from the monotonic one, would each be wrong.
+      const auto w0 = std::chrono::system_clock::now();
       const auto t0 = std::chrono::steady_clock::now();
       st = vllm_complete(engine, args.prompt.c_str(), &sp, &out);
       const auto t1 = std::chrono::steady_clock::now();
+      const auto w1 = std::chrono::system_clock::now();
       const double secs =
           std::chrono::duration<double>(t1 - t0).count();
       if (st != VLLM_OK) {
@@ -301,6 +308,22 @@ int main(int argc, char** argv) {
                    r + 1, args.repeat,
                    out.finish_reason != nullptr ? out.finish_reason : "(none)",
                    out.prompt_tokens, ct, secs, tps);
+      // THE LEG'S BOUNDARIES, as Unix epoch seconds (#1671). A benchmark
+      // sampling the GPU from outside this process sees the PROCESS, and one
+      // `vllm-cli` run is a 52 GiB checkpoint read followed by a few seconds of
+      // generation: the DFlash2 speed gate's window came out 18.37% busy over
+      // 3222 samples and its clock rule refused it, correctly, because the
+      // retained window did not describe the measured work. Only this process
+      // knows when the generation was, so only this process can say. Epoch
+      // seconds rather than an ISO stamp because there is no time zone to get
+      // wrong, and printed on their own line so the timing line above keeps the
+      // format every existing reader already parses.
+      std::fprintf(stderr,
+                   "vllm-cli: run=%d/%d generate_start_unix=%.6f "
+                   "generate_end_unix=%.6f\n",
+                   r + 1, args.repeat,
+                   std::chrono::duration<double>(w0.time_since_epoch()).count(),
+                   std::chrono::duration<double>(w1.time_since_epoch()).count());
       std::fflush(stderr);
       vllm_completion_free(&out);
     }

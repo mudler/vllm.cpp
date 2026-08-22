@@ -4,6 +4,7 @@
 // merge-ranked BPE -> vocab ids. Anything unsupported throws loudly.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -96,6 +97,15 @@ class Tokenizer {
   // detokenizer's skip_special_tokens; encoding is unaffected.
   bool IsSpecial(int32_t id) const;
 
+  // The longest STORED token text in bytes, over every assigned id. An UPPER
+  // BOUND on how many input bytes one token can account for, because the token
+  // texts of an encode concatenate back to the input and the stored form is
+  // never shorter than the decoded one (see FinalizeTables). A request boundary
+  // uses it to reject, WITHOUT tokenizing, a prompt that cannot possibly fit in
+  // max_model_len tokens: a prompt of B bytes costs at least
+  // B / MaxTokenBytes() tokens.
+  size_t MaxTokenBytes() const { return max_token_bytes_; }
+
   // Number of id slots (max id + 1); ids in [0, VocabSize) may still be
   // unassigned for vocabs with holes.
   int32_t VocabSize() const { return static_cast<int32_t>(token_text_.size()); }
@@ -150,6 +160,7 @@ class Tokenizer {
   MergeRanks merge_ranks_;
   std::vector<SpecialToken> added_tokens_;
   std::vector<std::string> token_text_;  // id -> stored text ("" = unassigned)
+  size_t max_token_bytes_ = 0;           // longest token_text_ entry, in bytes
   // id -> 0 plain vocab, 1 added, 2 added+special. Nonzero decodes literally.
   std::vector<uint8_t> is_added_;
   Family family_ = Family::kByteLevel;

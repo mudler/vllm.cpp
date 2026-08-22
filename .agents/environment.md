@@ -407,6 +407,34 @@ container is REUSED between jobs**, so a repair inside a staging branch is
 skipped on the next run and reports `nvcc already in place`. Write an
 environment repair unconditionally, and assert its postcondition.
 
+### Two packages a DFlash2 oracle lease needs, and the lease variable that exists, measured 2026-08-22
+
+Measured on `dgx:gpu0` across leases `11cee02a`, `52ac5673` and `a03f34e4`
+([#1660](https://github.com/mudler/vllm.cpp/issues/1660)). This is the "install
+what you lack" instruction above, made specific for the one job that has paid
+for the gap.
+
+**`cuda-libraries-dev-13-0`, and the failure arrives 12 minutes late.**
+DFlash2's `compute_candidates` -> `_topk` -> `flashinfer.topk` JIT-compiles
+`topk.cu`, which includes `<curand.h>`. The `cuda-toolkit-13-0` metapackage does
+NOT install that header. Leg B died on it INSIDE `profile_run`, after a
+12-minute model load, and it presented as a model failure rather than as a
+missing header; leg C installed `cuda-libraries-dev-13-0` and got past it. A job
+that compiles CUDA therefore installs both, not just the metapackage.
+
+**`python3-dev`, and it lies about what failed.** Without it Triton's driver JIT
+fails, and the failure surfaces as
+`Model architectures ['Qwen3_5ForConditionalGeneration'] failed to be inspected`
+— which names the model and not the toolchain. The `thor:gpu0` staging recipe
+two sections above already installs it for the same reason.
+
+**`RC_LEASE_ID` DOES NOT EXIST on this fleet.** The leased worker carries
+`RC_DEVICE`, `RC_JOB_ID` and `RC_TOKEN`. A script that defaults a lease id from
+`$RC_LEASE_ID` therefore reads empty and refuses, which is what
+`scripts/dflash2-speed-gate.sh` did when the `## Owed` O26 recipe was run
+verbatim. Take `$RC_JOB_ID`. Read the variable off the worker rather than out of
+a document, including this one: the fleet is not ours and the names can change.
+
 ### The `flock` orphan hazard that motivated the replacement
 
 The harness family in this repository puts the `flock` handle on a **subshell**,

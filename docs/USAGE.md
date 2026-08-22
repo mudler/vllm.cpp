@@ -25,6 +25,27 @@ build/examples/vllm-cli \
 
 Run `build/examples/vllm-cli --help` to list the flags in your build.
 
+`--repeat N` loads the model once and runs N completions, which is how a warm
+decode rate is read off this client. It writes two lines to standard error per
+completion. The first carries the result and the timing:
+
+```text
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=1.234 tok_s=51.863
+```
+
+The second carries the wall-clock instants that completion generated between, as
+Unix epoch seconds:
+
+```text
+vllm-cli: run=2/5 generate_start_unix=1755000000.500000 generate_end_unix=1755000006.250000
+```
+
+Those instants are what lets a benchmark attribute an out-of-process measurement
+-- a GPU clock sampler, a power meter, a profiler -- to the generation rather
+than to the whole process, which for a large checkpoint is mostly the load. Both
+lines go to standard error, so a pipeline reading the completion off standard
+output is unaffected.
+
 ## Start the OpenAI-compatible server
 
 Start the server with a local model directory:
@@ -235,6 +256,14 @@ supported.
   is malformed rather than unsupported; a GGUF that fails this and whose
   original `tokenizer.json` loads was damaged by its converter. Before this
   check the same file loaded and then failed on some prompts instead.
+- `prompt length N bytes exceeds the maximum allowed prompt length of M bytes`
+  is a 400 from `/tokenize`, `/v1/completions` or `/v1/chat/completions`. The
+  server refuses a prompt it could never serve BEFORE tokenizing it, and it
+  never truncates one. There is no option to raise the limit, because it is
+  derived rather than configured: it is `max_model_len` multiplied by the
+  longest token in the loaded vocabulary, so any prompt above it needs more
+  than `max_model_len` tokens and would be refused after tokenizing anyway.
+  Send a shorter prompt, or load a checkpoint with a longer context.
 
 ## Find a focused guide
 

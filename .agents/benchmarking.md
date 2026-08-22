@@ -49,11 +49,30 @@ and the **boot id**.
 
 **Two harnesses call it today.** `scripts/dgx-online-serving.sh` records a
 clock window per leg, and `tools/bench/online_gate_summary.py` asserts it.
-`scripts/dflash2-speed-gate.sh` opens ONE WINDOW PER ARM and
+The DFlash2 speed gate takes ONE WINDOW PER ARM and
 `tools/bench/dflash2_speed_harness.py` delegates the whole judgement to this
 helper, including the cross-arm pairing — a single window spanning both arms
 cannot see the offset, and the offset is the term that transfers into the
-ratio. The
+ratio. **The ARM opens that window, not the shell that drives it**
+(`tools/bench/dflash2_oracle_capture.ClockWindow`, which runs this helper's own
+`sample` CLI). `scripts/dflash2-speed-gate.sh` used to start the sampler itself
+and hand the arm the summary path, and this helper writes that summary only when
+the sampler STOPS — so the arm refused with `[Errno 2] No such file or
+directory` before the model loaded, and closing the window first produced `every
+one of 98 clock samples was idle`. The summary had to describe the arm and to
+exist before it, and both cannot hold
+([#1657](https://github.com/mudler/vllm.cpp/issues/1657)). **The clock is a
+precondition of the MEASUREMENT and not of the arm's execution**: the arm runs,
+its sampler stops, the summary is written, and only then is it read and judged —
+and a run whose window turns out unusable writes its evidence and still yields no
+number. **That last clause is load-bearing on the branch where the sampler
+writes NOTHING**, which is the one the leased run met: this helper builds the
+record before it writes it, and it refuses an entirely idle window, so the
+sampler exits 2 with no summary at all. A window object that raises there
+discards the arm that already ran — every leg, record and token id — so it
+records the failure instead and lets the driver refuse once the evidence is on
+disk. A new harness that takes a window around work it drives itself should
+take the same shape. The
 trace and per-kernel harnesses — `finalize_*_trace.py`,
 `summarize_torch_kernels.py`, `gdn_packed_component.py` — are **not wired**, so
 a `us/call` or per-kernel figure from those paths carries **no clock
@@ -127,6 +146,51 @@ regression. Compare their absolute numbers before believing either; ratios are
 scale-invariant and hide an order-of-magnitude mismatch completely. If the
 change between the readings is provably inert (a byte-identical refactor),
 suspect the measurement, not the code.
+
+## Two arms have to BE two arms
+
+A pair that measured one artifact twice already produced a "no speedup" result in
+this tree and was nearly reported as a refutation
+([#672](https://github.com/mudler/vllm.cpp/issues/672),
+[`specs/minimax-music3.md`](specs/minimax-music3.md) §16.6a). The tell was not
+the times, which were 0.26 % apart and read as noise. It was the **identical call
+count**: equal times are noise, equal counts are identity.
+
+**A different `sha256` does not establish it**
+([#1516](https://github.com/mudler/vllm.cpp/issues/1516)). Measured on a minimal
+project of the shape this repository's examples have — one `SHARED` library
+carrying the change, one thin client linking it — two byte-identical source trees
+built into two build directories give two clients of equal size with different
+hashes, and making the library change for real leaves the client byte-for-byte
+the hash it already had. CMake writes the build-tree RPATH into a client and no
+`CMAKE_SKIP_BUILD_RPATH` is set here. Hashing the library instead only moves the
+problem: it is stable across two build directories and differs across two SOURCE
+directories, because `VT_CHECK` embeds `__FILE__` and nothing sets
+`-ffile-prefix-map`. In the two-clone shape a two-tree A/B is required to use,
+**no artifact hash in this tree is falsifiable**.
+
+**Prefer a same-binary A/B.** Where a runtime switch turns the change off inside
+one binary there is no second artifact and no hash to be vacuous:
+`VT_OP_PROVIDER_DISABLE=<provider>` is that lever for anything behind the op
+provider seam (`src/vt/cuda/cuda_attention_cross.cu:636`), and
+`GetOpProviderStats` says which kernel actually ran.
+
+**Otherwise render the verdict with the control, not the hash.**
+
+```sh
+scripts/ab-arms-differ.py --artifact-a A --artifact-b B \
+    --root-a /tmp/b-old --root-b /tmp/b-new \
+    --control ar.depth_forward 1414 808
+```
+
+Equal hashes stay `FATAL`. A hash-only verdict is refused by name, and an
+artifact that embeds its own build or source root is reported with the offset, so
+the hash leg's worth is stated instead of assumed. At least one control must have
+moved. Two kinds catch different failures and neither subsumes the other: a
+**behavioural** control is a value the arms computed and is the only leg that
+catches a stale binary; a **source** control is the hash of the file the change
+lives in and catches two arms that are one source.
+`scripts/music3-vocoder-conv-ab.sh` is the worked example.
 
 ## Reading a profile
 

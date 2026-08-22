@@ -365,6 +365,13 @@ CREATION_MUTATIONS = {
     # code of 1 or an examined count out of the report goes red, which is what
     # makes the stub a mutation rather than a weaker checker.
     "scripts/check-conflict-markers.py": DISABLED_CREATION_CHECKER,
+    # KERNEL-ATTN-DENSE-FLASH (#1544). Created in this range, so there is no BASE
+    # version to mutate. Its suite loads the checker as a module at import time and
+    # then calls scan_file / has_marker / drift_sites / stale_allowlist_entries /
+    # main on it, none of which the stub defines, so every case that touches the
+    # checker raises AttributeError. Measured: 31 of 31 red under the stub, because
+    # the suite has no case that passes without calling into the checker at all.
+    "scripts/check-attention-rung-consistency.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120

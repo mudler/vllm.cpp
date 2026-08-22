@@ -523,6 +523,10 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
         // grid_t==1 == single 784-patch window). Default flash-tiled (byte-identical
         // to warp; see vis_attn above). kAttention (text/audio) is untouched.
         const vt::AttentionArgs aargs{scale, /*causal=*/false};
+        // VT-ATTN-NAIVE: the EAGER rung of the same-binary A/B above, reachable
+        // only with VT_QWEN3VL_ATTN_EAGER=1, which nothing in the tree sets. The
+        // default is the flash-tiled rung two branches down. Rerouting this arm
+        // would delete the baseline the other two are measured against (#1544).
         if (vis_attn == 0)
           vt::Attention(q, aof, qf, kf, vf, aargs);
         else if (vis_attn == 1)

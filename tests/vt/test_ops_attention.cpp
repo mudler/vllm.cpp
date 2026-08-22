@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
@@ -348,4 +349,100 @@ TEST_CASE("attention CUDA matches CPU (causal, GQA, real head_dim)") {
               /*causal=*/true, /*seed=*/1234);
   RunCudaCase(/*T=*/6, /*Hq=*/4, /*Hk=*/2, /*D=*/8, 0.35f, true, 77);
   RunCudaCase(/*T=*/5, /*Hq=*/2, /*Hk=*/1, /*D=*/16, 0.25f, /*causal=*/false, 999);
+}
+
+// --- AttentionDenseFlash's head_dim contract (#1544) -------------------------
+//
+// The op advertised `head_dim <= 256` while requesting `2*64*d*sizeof(Tin)` bytes
+// of dynamic shared memory with no `cudaFuncSetAttribute` anywhere in
+// src/vt/cuda/, so the driver's default 48 KiB cap made the real ceiling 192 in
+// bf16 and 96 in f32. A caller at head_dim 256 got a bare launch failure naming
+// nothing it could do instead. These cases pin the arithmetic that fixes it, and
+// they run with no GPU because that arithmetic is a pure host function — which is
+// the whole reason it lives in include/vt/ops.h rather than inside the .cu.
+TEST_CASE("attention-dense-flash: the advertised head_dim is the launchable one") {
+  // The tile the CTA stages: K and V, 64 columns each, head_dim wide.
+  CHECK(vt::AttentionDenseFlashSmemBytes(64, 2) == 16384);
+  CHECK(vt::AttentionDenseFlashSmemBytes(96, 2) == 24576);   // Muse Glimmer, #1545
+  CHECK(vt::AttentionDenseFlashSmemBytes(192, 2) == 49152);  // exactly the cap
+  CHECK(vt::AttentionDenseFlashSmemBytes(256, 2) == 65536);  // over it
+  CHECK(vt::AttentionDenseFlashSmemBytes(96, 4) == 49152);   // exactly the cap
+  CHECK(vt::AttentionDenseFlashSmemBytes(192, 4) == 98304);  // Kimi, over it
+  CHECK(vt::AttentionDenseFlashSmemBytes(256, 4) == 131072);
+
+  // The honest bounds. These are the widths the launcher now refuses above.
+  CHECK(vt::AttentionDenseFlashMaxHeadDim(/*bf16=*/2) == 192);
+  CHECK(vt::AttentionDenseFlashMaxHeadDim(/*f32=*/4) == 96);
+
+  // Neither is the 256 the op used to advertise, and that gap IS the defect.
+  CHECK(vt::AttentionDenseFlashMaxHeadDim(2) < vt::kAttentionDenseMaxHeadDim);
+  CHECK(vt::AttentionDenseFlashMaxHeadDim(4) < vt::kAttentionDenseMaxHeadDim);
+
+  // The bound is INCLUSIVE at the cap and exclusive one element past it. head_dim
+  // 192 in bf16 sits exactly on 49152 and launches today, so a bound that refused
+  // it would be a regression rather than a repair.
+  CHECK(vt::AttentionDenseFlashSmemBytes(vt::AttentionDenseFlashMaxHeadDim(2), 2) <=
+        vt::kCudaDefaultDynamicSmemBytes);
+  CHECK(vt::AttentionDenseFlashSmemBytes(vt::AttentionDenseFlashMaxHeadDim(2) + 1, 2) >
+        vt::kCudaDefaultDynamicSmemBytes);
+  CHECK(vt::AttentionDenseFlashSmemBytes(vt::AttentionDenseFlashMaxHeadDim(4), 4) <=
+        vt::kCudaDefaultDynamicSmemBytes);
+  CHECK(vt::AttentionDenseFlashSmemBytes(vt::AttentionDenseFlashMaxHeadDim(4) + 1, 4) >
+        vt::kCudaDefaultDynamicSmemBytes);
+
+  // The register blocking still bounds it from the other side: a hypothetical
+  // 1-byte input would clear the shared-memory cap far past what the kernel can
+  // hold in registers, and the bound must report the register limit there.
+  CHECK(vt::AttentionDenseFlashMaxHeadDim(1) == vt::kAttentionDenseMaxHeadDim);
+}
+
+TEST_CASE("attention-dense-flash: an over-cap head_dim is REFUSED, naming the rung") {
+  // This one needs a device: the refusal lives in the CUDA launcher, and nothing
+  // on a CPU-only box executes it. Loud on purpose — a quiet skip here would let
+  // the launcher lose the bound with every gate still green (spec R1, #1573).
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; the AttentionDenseFlash head_dim refusal is PENDING");
+    return;
+  }
+  const int64_t T = 4, Hq = 2, Hk = 2, D = 256;  // f32 => a 128 KiB K/V tile
+  auto q = RandF32(static_cast<size_t>(T * Hq * D), 5150);
+  auto k = RandF32(static_cast<size_t>(T * Hk * D), 5151);
+  auto v = RandF32(static_cast<size_t>(T * Hk * D), 5152);
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kF32, {T, Hq, D}, q.data());
+  DeviceTensor dk(gpu, g.q, DType::kF32, {T, Hk, D}, k.data());
+  DeviceTensor dv(gpu, g.q, DType::kF32, {T, Hk, D}, v.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {T, Hq, D});
+  bool threw = false;
+  std::string what;
+  try {
+    vt::AttentionDenseFlash(g.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(),
+                            AttentionArgs{std::pow(256.0f, -0.5f), /*causal=*/false});
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    what = e.what();
+  }
+  CHECK(threw);
+  // Refusing is only half of it. The message must name the rung that DOES serve
+  // this width, or the caller is left where the opaque launch error left them.
+  CHECK(what.find("AttentionDenseFast") != std::string::npos);
+  CHECK(what.find("head_dim") != std::string::npos);
+
+  // ...and the honest bound is not a blanket refusal: head_dim 96 in f32 lands
+  // exactly on the cap and must still run.
+  const int64_t Dok = 96;
+  auto q2 = RandF32(static_cast<size_t>(T * Hq * Dok), 5153);
+  auto k2 = RandF32(static_cast<size_t>(T * Hk * Dok), 5154);
+  auto v2 = RandF32(static_cast<size_t>(T * Hk * Dok), 5155);
+  DeviceTensor dq2(gpu, g.q, DType::kF32, {T, Hq, Dok}, q2.data());
+  DeviceTensor dk2(gpu, g.q, DType::kF32, {T, Hk, Dok}, k2.data());
+  DeviceTensor dv2(gpu, g.q, DType::kF32, {T, Hk, Dok}, v2.data());
+  DeviceTensor dout2(gpu, g.q, DType::kF32, {T, Hq, Dok});
+  vt::AttentionDenseFlash(g.q, dout2.tensor(), dq2.tensor(), dk2.tensor(),
+                          dv2.tensor(),
+                          AttentionArgs{std::pow(96.0f, -0.5f), /*causal=*/false});
+  std::vector<float> got(static_cast<size_t>(T * Hq * Dok), 0.0f);
+  dout2.Download(g.q, got.data());
+  CHECK(std::isfinite(got[0]));
 }

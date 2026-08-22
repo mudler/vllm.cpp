@@ -1,0 +1,36 @@
+# Attention-rung allowlist — model TUs whose `vt::Attention` call (the naive,
+# correctness-grade kernel) is being REMOVED by a row already in flight, so
+# scripts/check-attention-rung-consistency.py stays green without this change
+# editing the very lines those rows replace.
+#
+# This is NOT the place to park a naive call you intend to keep. A deliberate
+# call records its reason IN THE FILE, beside the call:
+#
+#     // VT-ATTN-NAIVE: <why this call must stay on kAttention>
+#
+# which is why the six deliberate sites (whisper_audio, qwen3_vl_vision,
+# kimi_linear_device, qwen3_5, nemotron_h, nemotron_h_device) are NOT listed here.
+# Full reasoning: .agents/specs/attention-rung-visibility.md D4.
+#
+# Each entry is a model-file stem (src/vllm/model_executor/models/<stem>.cpp) and
+# names the issue that owns its removal. Deleting a stem here, after that row
+# routes the call to a fast rung, is the enforcement closing. The checker reports
+# a stem whose sites are gone or now marked as STALE and does NOT fail on it, so
+# the removing row is free to leave the deletion to whoever runs preflight next.
+#
+# The CHECKER does not fail on it. A TEST does, and it lives in another file:
+# tests/scripts/test_check_attention_rung_consistency.py
+# ::ShippedTreeTests::test_allowlist_holds_only_the_in_flight_stems pins this set
+# exactly, so adding OR deleting a stem here reds that case until the expected set
+# is updated in the same change. That is deliberate -- growth of a parking lot must
+# be a review decision and not a silent edit -- but it means "the removing row owes
+# this file nothing" is true of the checker only. A row that deletes its stem edits
+# that test too.
+
+# --- IN FLIGHT: the naive call is the defect, and another row is removing it ---
+muse_glimmer_vision   # 50 layers, H=16, head_dim=96, non-causal, sole path, no knob.
+                      # Issue #1545; the fix is vt::AttentionDenseFlash (24 KB of
+                      # shared memory at head_dim 96, inside the honest bound).
+ltx2                  # DiT self-attention; 47.84 s measured per forward (#1544).
+                      # LTX-2.5 routing row in flight.
+ltx2_device           # the device arm of the same DiT forward, same row.

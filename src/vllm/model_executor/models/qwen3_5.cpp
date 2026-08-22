@@ -5276,6 +5276,11 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
+  // VT-ATTN-NAIVE: the REFERENCE (non-paged) dense arm, as the comment on the V
+  // upcast above already says. Production decode runs `FullAttnBlockPaged`, which
+  // replaces this call with vt::ReshapeAndCache + vt::PagedAttention; this arm is
+  // what that path is compared against, so a rung change here moves the golden
+  // rather than the shipping kernel (#1544).
   vt::Attention(d.q, dattn.t(), qn3, kn3, v3, vt::AttentionArgs{scale, true});
 
   // Sigmoid output gate on the raw gate split, folded into the o_proj activation

@@ -3239,8 +3239,15 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 
   // (3) THE NAMED BOUNDARIES. Without these the sum below is satisfied by one
   // leaf called `render`, which is an instrument that measures a stopwatch.
-  for (const std::string required : {"load.dit", "denoise", "decode.video", "decode.audio",
-                                    "artifacts.frames", "artifacts.audio"}) {
+  // `load.open` is here for #1439, and it is the name that keeps this case's own
+  // 95% floor honest. Before it the driver's ~164-line prologue -- device
+  // resolution, the platform probe, the DiT header open, option parsing -- ran
+  // inside the `load` SPAN and inside no leaf, so it landed in
+  // `unaccounted_seconds` and pushed the ratio below its floor on a quiet box.
+  // Requiring the NAME rather than widening the floor is the difference between
+  // measuring that phase and tolerating it.
+  for (const std::string required : {"load.open", "load.dit", "denoise", "decode.video",
+                                    "decode.audio", "artifacts.frames", "artifacts.audio"}) {
     // `std::string`, not `const char*`: doctest stringifies a `char*` streamed
     // into a message as a BOOL, so a failing case here would have printed
     // "names no '1' phase" and said nothing about which name was missing.
@@ -4648,9 +4655,10 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // every leaf in that state, and W2 and W3 must read it before they act on
   // `load.dit`.
   {
-    const std::vector<std::string> load_order = {"load.dit",       "load.video_vae",
-                                                 "load.audio_vae", "load.upsampler",
-                                                 "load.text_encoder", "load.prompt_embeds"};
+    const std::vector<std::string> load_order = {"load.open",      "load.dit",
+                                                 "load.video_vae", "load.audio_vae",
+                                                 "load.upsampler", "load.text_encoder",
+                                                 "load.prompt_embeds"};
     double previous = -1.0;
     std::string previous_name;
     int64_t seen = 0;

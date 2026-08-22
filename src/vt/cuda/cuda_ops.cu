@@ -3234,12 +3234,24 @@ void AttentionDenseFastKernelCuda(Queue& q, Tensor& out, const Tensor& query, co
 // untouched. One q-head per CTA (all warps share the same GQA kv-head g).
 constexpr int kFlashBr = 16;  // query-warps per CTA (= K/V global-read reuse factor)
 constexpr int kFlashBc = 64;  // key/value columns streamed per shared-memory tile
+// The register blocking: head_dim elements each of the 32 lanes holds. It lives at
+// file scope rather than inside the kernel body precisely so the static_assert below
+// can READ it -- a per-kernel local is invisible here, and asserting the literal 8
+// instead would compare the header's constant against a number nothing else uses.
+constexpr int kFlashMaxPerLane = 8;  // head_dim up to 8 * 32
+// The head_dim bound this kernel advertises is computed in include/vt/ops.h so a box
+// with no GPU can execute it. These tie the two together: change the tile width or the
+// register blocking here and the arithmetic there stops describing this kernel, which
+// is how the op came to advertise a head_dim it could not launch (#1544).
+static_assert(kFlashBc == kAttentionDenseFlashTileCols,
+              "AttentionDenseFlashSmemBytes must use this kernel's tile width");
+static_assert(kFlashMaxPerLane * 32 == kAttentionDenseMaxHeadDim,
+              "kFlashMaxPerLane * warp size must equal the advertised register bound");
 
 template <typename Tin, typename Tout>
 __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin* key,
                                           const Tin* value, int64_t hq, int64_t hk, int64_t d,
                                           int64_t t, float scale, bool causal) {
-  constexpr int kMaxPerLane = 8;  // head_dim up to 256
   extern __shared__ __align__(16) char flash_smem[];
   Tin* sK = reinterpret_cast<Tin*>(flash_smem);
   Tin* sV = sK + static_cast<int64_t>(kFlashBc) * d;
@@ -3254,10 +3266,10 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
   const int npl = static_cast<int>((d + 31) / 32);  // head_dim elements this lane owns
 
   // This warp's query row, in registers (identical layout to AttentionWarpKernel).
-  float qreg[kMaxPerLane];
-  float acc[kMaxPerLane];
+  float qreg[kFlashMaxPerLane];
+  float acc[kFlashMaxPerLane];
 #pragma unroll
-  for (int k = 0; k < kMaxPerLane; ++k) {
+  for (int k = 0; k < kFlashMaxPerLane; ++k) {
     qreg[k] = 0.0f;
     acc[k] = 0.0f;
   }
@@ -3298,7 +3310,7 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
       const int64_t base = j * d;
       float part = 0.0f;
 #pragma unroll
-      for (int k = 0; k < kMaxPerLane; ++k) {
+      for (int k = 0; k < kFlashMaxPerLane; ++k) {
         const int e = lane + 32 * k;
         if (k < npl && e < d) part += qreg[k] * Load(sK, base + e);
       }
@@ -3309,7 +3321,7 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
       const float corr = expf(m - m_new);
       const float p = expf(s - m_new);
 #pragma unroll
-      for (int k = 0; k < kMaxPerLane; ++k) {
+      for (int k = 0; k < kFlashMaxPerLane; ++k) {
         const int e = lane + 32 * k;
         if (k < npl && e < d) acc[k] = acc[k] * corr + p * Load(sV, base + e);
       }
@@ -3332,10 +3344,40 @@ void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query,
   const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
   const int64_t hk = key.shape[1];
   if (t == 0 || hq == 0 || d == 0) return;
-  VT_CHECK(d <= 256, "cuda attention-dense-flash: head_dim <= 256 only");
+  // The honest bound, not the register bound. `kFlashMaxPerLane` allows head_dim 256, but
+  // the K/V tile below asks for `2*kFlashBc*d*sizeof(Tin)` bytes of DYNAMIC shared
+  // memory, and no `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemory
+  // Size, ...)` exists anywhere in src/vt/cuda/ — so the driver caps the request at
+  // its default 48 KiB and the real ceiling is 192 (bf16) / 96 (f32). This op used to
+  // advertise `d <= 256` and hand a wider caller a bare launch failure from the
+  // `cudaGetLastError` at the bottom of this function, naming nothing it could do
+  // about it (#1544). REFUSING here rather than falling back to AttentionDenseFast is
+  // deliberate: that rung re-reads K and V from global once per (query, head), which
+  // is the exact redundancy this kernel exists to remove, so taking it silently would
+  // be an unannounced slowdown. Name it and let the caller choose.
+  const int64_t dmax = AttentionDenseFlashMaxHeadDim(static_cast<int64_t>(sizeof(Tin)));
+  VT_CHECK(d <= dmax,
+           std::string("cuda attention-dense-flash: head_dim ") + std::to_string(d) +
+               " needs " +
+               std::to_string(AttentionDenseFlashSmemBytes(
+                   d, static_cast<int64_t>(sizeof(Tin)))) +
+               " bytes of dynamic shared memory, over CUDA's default cap of " +
+               std::to_string(kCudaDefaultDynamicSmemBytes) +
+               "; this kernel serves head_dim <= " + std::to_string(dmax) +
+               " for this input dtype. Use vt::AttentionDenseFast, which uses no "
+               "shared memory and serves head_dim <= " +
+               std::to_string(kAttentionDenseMaxHeadDim));
   const unsigned nblk = static_cast<unsigned>((t + kFlashBr - 1) / kFlashBr);
   const dim3 grid(nblk, static_cast<unsigned>(hq));
-  const size_t shmem = static_cast<size_t>(2) * kFlashBc * d * sizeof(Tin);  // sK + sV
+  // The request the guard above admitted. They are two functions, and
+  // AttentionDenseFlashMaxHeadDim RE-DERIVES the division rather than inverting
+  // AttentionDenseFlashSmemBytes, so agreement is a property to be tested, not one
+  // the code makes structural. tests/vt/test_ops_attention.cpp pins it in both
+  // directions at the inclusive edge; mutating the `2 *` in SmemBytes to `3 *` turns
+  // those cases RED, which is what keeps the two halves honest. Open-coding the byte
+  // count here instead is how this contract drifted the first time.
+  const size_t shmem = static_cast<size_t>(
+      AttentionDenseFlashSmemBytes(d, static_cast<int64_t>(sizeof(Tin))));  // sK + sV
   switch (out.dtype) {
     case DType::kF32:
       AttentionDenseFlashKernel<Tin, float><<<grid, kFlashBr * 32, shmem, s>>>(
@@ -3376,9 +3418,15 @@ void AttentionDenseFlashKernelCuda(Queue& q, Tensor& out, const Tensor& query, c
 // The fast path is deliberately NARROW — bf16, head_dim 64, non-causal, MHA, and the
 // vendored kernels compiled in — because head_dim 64 non-split is the only extra
 // instantiation this change compiles. Anything else falls through to
-// AttentionDenseFlash, so callers get the best available kernel for their shape rather
-// than a hard refusal, and every non-encoder caller of this op is byte-identical to
+// AttentionDenseFlash, and every non-encoder caller of this op is byte-identical to
 // the flash-tiled path by construction.
+//
+// The fall-through is not a promise that every shape runs. AttentionDenseFlash has
+// its own head_dim domain — the K/V tile's shared-memory request against CUDA's
+// default 48 KiB cap, so 192 in bf16 and 96 in f32 (#1544) — and refuses above it
+// naming vt::AttentionDenseFast. A shape wider than that reaches a NAMED refusal
+// through here, not a kernel. Every caller of this op today is far inside the bound
+// (max head_dim 80), so nothing that runs takes that path.
 #ifdef VLLM_CPP_FLASH_ATTN
 // Same-binary A/B + RED knob, mirroring VT_FA2_PREFILL / VT_FA2_DECODE
 // (cuda_paged_attn.cu): VT_FA2_DENSE=0 restores the scalar flash-tiled kernel so both

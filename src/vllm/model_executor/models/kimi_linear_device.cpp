@@ -595,6 +595,13 @@ DBuf MlaAttnCoreDevice(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
   Tensor query = MakeTensor(dq.ptr(), DType::kF32, d.q.device, {T, nah, qk});
   DBuf attn(d, DType::kF32, {T, nah, qk});
   const float scale = static_cast<float>(std::pow(static_cast<double>(qk), -0.5));
+  // VT-ATTN-NAIVE: the whole point of this arm is that the attention core runs on
+  // the SAME f32 online max-subtracted softmax as the host reference, as the
+  // MlaAttnCoreDevice design note at the top of this file records, and it is
+  // behind VT_KIMI_DEVICE_MLA, default OFF, recorded there as a measured
+  // negative (4.24 -> 3.89 tok/s). No fast rung is available here either: the
+  // padded head_dim is qk=192 in f32, and vt::AttentionDenseFlash would need 96 KB
+  // of dynamic shared memory, twice CUDA's default cap (#1544, cuda_ops.cu).
   vt::Attention(d.q, attn.t(), query, key.t(), val.t(), vt::AttentionArgs{scale, true});
 
   // slice out[:, :, :vh] -> [T, nah*vh] (the pad-V tail is 0 by construction).

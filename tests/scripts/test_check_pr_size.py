@@ -507,6 +507,14 @@ class BudgetEnforcement(unittest.TestCase):
             # them; every case that reads an exit code of 1 or an examined count
             # goes red.
             "scripts/check-conflict-markers.py",
+            # 2026-08-21: the attention-rung gate (#1544). Created in the same
+            # range, so it has no BASE version to mutate. Its suite loads the
+            # checker as a module at import time and every case then calls into
+            # it, so the disabled stub -- which defines none of scan_file,
+            # has_marker, drift_sites, stale_allowlist_entries or main -- takes
+            # all 31 cases red on AttributeError. Measured, not asserted: the
+            # suite has no case that passes without touching the checker.
+            "scripts/check-attention-rung-consistency.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

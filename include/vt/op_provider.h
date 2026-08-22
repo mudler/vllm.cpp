@@ -145,8 +145,24 @@ void* GetOp(OpId op, DeviceType device);
 // forwards to it. This is the second fallback axis of the tactic registry
 // (`ArchTacticLaunchFn` returning false) expressed where a shape is actually
 // visible — inside the kernel — which is what keeps the ~70 op entry points
-// edit-free. Counted in `OpProviderStats::declines`. Throws if nothing is below.
+// edit-free. Counts ONE decline in `OpProviderStats::declines` -- including a
+// decline that finds nothing below it and throws. Throws if nothing is below.
 void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider);
+
+// The same resolution, counting NOTHING. Exists for exactly one shape: a
+// SHAPE-GATED provider that declines on the hot path and therefore hoists the
+// lookup into a function-local static, then counts each decline with
+// `NoteOpDecline`. Hoisting a COUNTING resolver silently hoists the accounting
+// with it, and the static's one-time initialisation then adds a second
+// increment to the first decline of the process -- which is what this header
+// used to prescribe, and what
+// [#1584](https://github.com/mudler/vllm.cpp/issues/1584) measured.
+//
+// Reach for it only WITH `NoteOpDecline` beside it. A caller that uses it and
+// counts nothing reports a forwarded call as a served one, and no gate in this
+// tree can see the difference. `GetOpFallback` stays the ordinary spelling and
+// stays correct by default; this one is the opt-out and says so in its name.
+void* GetOpFallbackUncounted(OpId op, DeviceType device, const char* declining_provider);
 
 // Non-throwing probes. `OpRegistered` keeps its exact prior meaning: is ANY
 // kernel realized for (op, device) — the fused-recipe fast-realization ladder
@@ -177,10 +193,13 @@ OpProviderStats GetOpProviderStats(OpId op, DeviceType device);
 void EnableOpProviderCallStats(bool on);
 // Counts one decline WITHOUT re-resolving the fallback. `GetOpFallback` walks the
 // provider stack and re-reads device caps, which is fine when declines are rare
-// but not when a SHAPE-GATED provider declines on the hot path — a decode run
-// declines ~21,500 times. Such a provider caches the fallback pointer once and
-// calls this per decline, so `OpProviderStats::declines` stays exact while the
-// lookup cost disappears.
+// but not when a SHAPE-GATED provider declines on the hot path -- a decode run
+// declines ~21,500 times. Such a provider caches `GetOpFallbackUncounted` once
+// and calls this per decline, and `OpProviderStats::declines` is then exact from
+// the FIRST decline while the lookup cost disappears. Pairing it with the
+// COUNTING `GetOpFallback` instead is the #1584 defect: the count reads N+1 over
+// N declines, and a routing gate asserting an exact count then passes or fails
+// on whether something else in the same binary already warmed the static.
 void NoteOpDecline(OpId op, DeviceType device);
 
 void ResetOpProviderStats(OpId op, DeviceType device);

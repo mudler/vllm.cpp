@@ -78,8 +78,26 @@ Six limits, stated plainly rather than left to be discovered.
   GB10 — same shapes, same algorithm, bit-identical output from a `cudaMalloc`
   operand and from a 256-aligned host one — but excluding one cause is not
   identifying another, and that the two arms simply run different GEMM kernels
-  over a near-tie is a standing hypothesis rather than a reading. Treat the CUDA
-  arm as unverified against the CPU arm until that gate is settled, and **use
+  over a near-tie is a standing hypothesis rather than a reading.
+  **2026-08-21: a router dump moved the failure UPSTREAM of the sampler.** On a
+  later tree, source `cffe59b`, the two arms already select different MoE
+  experts in the FIRST block of the FIRST forward, eight tokens before any
+  emitted token differs, and they differ there in the router GEMM input rather
+  than in anything the router does with it. One more cause is excluded by
+  measurement: the router gate weights, whose fingerprint is identical on both
+  arms. The two top-k implementations were checked as well and agreed with a
+  plain lowest-index-wins rank of each arm's own logits, but only on 5 of the
+  552 token-rows the dumps hold, so read that as a sample and not as a property
+  of either implementation. A third probe then dumped the
+  EMBEDDING OUTPUT, the hidden state before any GEMM, norm or attention touches
+  it, and the two arms are BIT-IDENTICAL there: 0 of 40,960 bf16 values differ.
+  So the weights are the same at both ends of the stack and the divergence
+  starts in the compute inside the first block. The cause is STILL not
+  identified, because the expert projections, the attention weights and the
+  norms were never fingerprinted. The CUDA continuation also degenerates into a
+  mechanical recursion after the tokens the two arms share, which a coin flip
+  between two equally good tokens does not produce. Treat the CUDA arm as
+  unverified against the CPU arm until that gate is settled, and **use
   `--device cpu` for this checkpoint today**: it is the arm every published
   number here was measured on.
 * **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
@@ -89,6 +107,7 @@ Six limits, stated plainly rather than left to be discovered.
   that figure holds for. Device access to host-resident weights on that part also has
   a recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
   way, so a CUDA arm slower than the CPU arm remains a real possible outcome.
+  No published figure bounds this either way.
 * **More slots is not a free knob, and the reason is the page cache rather than
   the arena.** The same binary at 8000 slots measured a 39.98-45.40 s/token
   median over two runs, and the second consumed all 30,625 MiB of the box's swap:

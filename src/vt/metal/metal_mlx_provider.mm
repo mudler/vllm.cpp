@@ -204,22 +204,25 @@ bool TryMlxMatmul(Tensor& out, const Tensor& a, const Tensor& b, bool bt) {
   return true;
 }
 
-// The fallback pointer is resolved ONCE, and the decline is counted separately
-// via NoteOpDecline so `OpProviderStats::declines` stays exact — hoisting the
-// lookup must not silently hoist the accounting with it. GetOpFallback walks the provider stack,
-// re-reads the device caps and does an atomic decline count on every call — fine
-// when declines are rare, but a shape-gated provider declines on the hot path:
-// a 128-token decode run declines ~21,500 times, and paying the lookup each time
-// measured as a 27.2 -> 17.8 tok/s regression. The provider stack is immutable
-// after registration, so a function-local static is the right lifetime.
+// The fallback pointer is resolved ONCE through the UNCOUNTED resolver, and the
+// decline is counted separately via NoteOpDecline, so `OpProviderStats::declines`
+// is exact from the FIRST decline -- hoisting the lookup must not silently hoist
+// the accounting with it, which is precisely what `GetOpFallback` in this static
+// used to do ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)).
+// GetOpFallback walks the provider stack, re-reads the device caps and does an
+// atomic decline count on every call -- fine when declines are rare, but a
+// shape-gated provider declines on the hot path: a 128-token decode run declines
+// ~21,500 times, and paying the lookup each time measured as a 27.2 -> 17.8
+// tok/s regression. The provider stack is immutable after registration, so a
+// function-local static is the right lifetime.
 MatmulFn MlxFallback(OpId op) {
   if (op == OpId::kMatmul) {
     static MatmulFn f = reinterpret_cast<MatmulFn>(
-        GetOpFallback(OpId::kMatmul, DeviceType::kMETAL, kMlxProvider));
+        GetOpFallbackUncounted(OpId::kMatmul, DeviceType::kMETAL, kMlxProvider));
     return f;
   }
   static MatmulFn f = reinterpret_cast<MatmulFn>(
-      GetOpFallback(OpId::kMatmulBT, DeviceType::kMETAL, kMlxProvider));
+      GetOpFallbackUncounted(OpId::kMatmulBT, DeviceType::kMETAL, kMlxProvider));
   return f;
 }
 

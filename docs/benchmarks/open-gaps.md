@@ -2,6 +2,7 @@
 
 | Track | Status | Next gate |
 |---|---|---|
+| Device expert slices, CUDA against CPU (`ENG-EXPERT-STREAM-DEVICE`, [#1299](https://github.com/mudler/vllm.cpp/issues/1299)) | **G0-SPEED VOID** behind **G0-CORRECT FAIL**; no ratio is accepted | Resolve the block-0 router-input divergence, then run a clock-controlled repeat |
 | Surface coverage (`ARCH-ONE-SURFACE`) | **CORRECTNESS COMPLETE:** #139 restores DSR 32 (`kcuda=0`) via registry/name resolution; ABI-v14 selection unchanged; no speed claim | Selector 2/2·11 plus execution-bound CMake/File-API/CTest + CI/preflight + manifest-integrity guard 52/52; CPU platform/loader/C-ABI tests green; CUDA A/B remains residual |
 | 35B prefill TTFT | **0.920x c1 / 0.849x c4** against a correctly FUSED denominator at the pin; the 0.93x-0.98x reading came from an UNFUSED oracle (#414) and is void | Re-attribute the residual against the fused denominator, then close |
 | c16 and above, both models (#577) | **VOID, not a number.** 93/96 against the pin's 96/96, the three missing being the SLOWEST: our SSE keepalive was ON. Recurred on Qwen3.8-27B at 5/6 and 36/48 ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | Keepalive now default OFF and rate harnesses refuse `failed != 0`; re-run c16/c32 on a binary carrying both |

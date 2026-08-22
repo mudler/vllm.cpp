@@ -589,9 +589,15 @@ bool BlockedShape(const Tensor& out, const Tensor& query, const Tensor& key) {
 // shape-gated provider declines on the hot path, and re-walking the provider
 // stack per decline is a real cost. The stack is immutable after registration,
 // so a function-local static is the right lifetime.
+//
+// The resolver is the UNCOUNTED one, and that is the whole of the count's
+// exactness ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)):
+// `GetOpFallback` counts a decline itself, so hoisting IT into this static gave
+// the first decline of the process two increments and made every exact
+// `declines ==` assertion depend on what else had already run in the binary.
 AttentionCrossFn BlockedFallback() {
   static AttentionCrossFn f = reinterpret_cast<AttentionCrossFn>(
-      GetOpFallback(OpId::kAttentionCross, DeviceType::kCUDA, kBlockedProvider));
+      GetOpFallbackUncounted(OpId::kAttentionCross, DeviceType::kCUDA, kBlockedProvider));
   return f;
 }
 

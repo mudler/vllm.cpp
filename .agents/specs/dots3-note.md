@@ -534,10 +534,14 @@ dispatchable in order, under the constraints that answer imposes.
   forever or invite someone to weaken a test to pass. **The gate that actually
   binds is therefore differential, over `(name, failure mode)` PAIRS: a row
   regresses on Thor when it adds a name, or changes a recorded mode FOR THE
-  WORSE — `SEGFAULT` is worse than `Failed`, `Failed` is worse than absent, and a
-  crash becoming a clean assertion failure is progress rather than a regression.
-  This lane's own run saw three such improvements, so the direction is not a
-  hypothetical refinement.** The list
+  WORSE — worst first, `SEGFAULT`/`Subprocess aborted`/`Timeout`, then `Failed`,
+  then `Skipped`/`Not Run`, then passing. A crash becoming a clean assertion
+  failure is progress rather than a regression, and this lane's own run saw
+  three such improvements, so the direction is not a hypothetical refinement.
+  `Skipped` ranks BELOW `Failed`: a red test that starts skipping has stopped
+  being measured, not started passing, and three tests already skip here for an
+  absent checkpoint. A name leaving the list therefore counts as an improvement
+  only when it has been SEEN to pass.** The list
   itself, with a mode and a first-failing assertion per test, is
   [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110 counterpart
   of [#907](https://github.com/mudler/vllm.cpp/issues/907).

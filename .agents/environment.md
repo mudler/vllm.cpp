@@ -1185,12 +1185,24 @@ environment:
     worded — "adds a name or changes a mode" — the gate would have told the
     author of that fix they had regressed the box three times.
 
-    Rank the modes, worst first: **`SEGFAULT` / `Subprocess aborted` / `Timeout`
-    worse than `Failed`, and `Failed` worse than absent.** A crash becoming a
+    Rank the modes, worst first: **`SEGFAULT` / `Subprocess aborted` / `Timeout`,
+    then `Failed`, then `Skipped` / `Not Run`, then PASSING.** A crash becoming a
     clean assertion failure is progress, because a crash takes the rest of its
     binary's cases with it — `test_capi` reports `61 skipped` behind its SIGSEGV.
     Only movement DOWN that ranking, or a new name, is a regression. Record every
     move in either direction; score only the bad ones.
+
+    **`Skipped` sits BELOW `Failed` on that list and is NOT an improvement, which
+    is the trap in ranking at all.** Three tests already skip on this host for an
+    absent checkpoint, so the mode is live in this very baseline: a red test that
+    starts skipping has stopped being measured, not started passing, and a
+    checkpoint that quietly goes missing looks exactly like a fix. **So a name
+    that LEAVES the failure list is only an improvement when you have seen it
+    PASS.** That is not a counsel of perfection — it is what was done here, and
+    it is one `grep`: when `test_ops_fp8_cpu` and `test_ops_fused_chain` left the
+    list, both were confirmed `Passed` in the same log rather than assumed. A
+    departure you cannot show green is an unexplained change, and it goes in the
+    report as one.
 
     **The table is keyed on NAME, never on the `ctest` ordinal.** Ordinals move
     whenever a test file is added, and they moved between every pair of runs this

@@ -306,8 +306,8 @@ The final reviewer proved six guarantees by mutation:
 - Deleting `memory.md` fails with a missing-detail error.
 - Duplicating the `memory` row and link fails with a duplicate-ID error.
 - Adding `orphan.md` fails with an orphan-detail error.
-- Changing the link to `./benchmarks/memory.md` fails the noncanonical-link and
-  orphan-detail checks.
+- Changing the link to `./benchmarks/memory.md` is rejected because `memory.md`
+  becomes an orphan detail.
 - Removing the preflight registration fails the execution-level unit test, and
   the captured argument vector no longer contains the checker.
 - Restoring `path.Base` fails the output-level site test on

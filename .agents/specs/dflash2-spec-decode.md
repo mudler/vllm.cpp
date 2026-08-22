@@ -2507,14 +2507,26 @@ list items.
 
   **The choice, stated so a reviewer can reject it.** #1671 offered two shapes:
   (a) leg-boundary markers, and (b) a resident engine across prompts, as the
-  oracle has. **(a) is implemented, and (b) would not have cleared the floor.**
-  One resident engine replaces four loads with one, which on this box is about
-  580 s of checkpoint read against 93.2 s of warm generation — roughly 13% busy
-  on the arm's own figures, still under the floor, and still refused. (b) is a
-  comparability improvement and never a fix for this refusal. (a) is also the
-  only one of the two that puts the clock on the statistic: without spans, even
-  a perfectly resident arm would attribute its median over sixteen warm legs to a
-  window that also covers a load and four discarded cold legs.
+  oracle has. **(a) is implemented, and the decisive argument is not the busy
+  fraction.** It is that (b) cannot put the clock on the statistic at all. The
+  number is a median over sixteen warm legs; a resident arm's window still spans
+  a load and four discarded cold legs, so its record would still describe work
+  the number excludes. Only spans remove that, and once there are spans the
+  window is generation whether the engine is resident or not.
+
+  **The busy fraction says the same thing less certainly, and the estimate is
+  written with its uncertainty rather than as a figure.** The run retained 592
+  busy samples of 3222 (18.37%), and about 2325 s of the window sat inside no leg
+  — call it 581 s per load. Dropping three of the four loads shortens the window
+  to roughly 1634 s against the same 592 busy samples, about **36%** busy: under
+  the 50% floor, and refused. That estimate assumes the four cold legs cost with
+  one load what they cost with four, which they would NOT — three of them would
+  no longer pay a first touch — so the true figure is higher than 36% and this
+  run cannot say by how much. An earlier draft of this entry read "roughly 13%",
+  computed as warm generation over load plus warm generation, which drops the
+  cold legs from the numerator while a busy sample does not care whether the leg
+  it landed in was folded. It is corrected here rather than left standing,
+  because a false count in this entry is the failure this row keeps having.
 
   **The window is the WARM legs, not all twenty.** `fold_legs` discards run 1 of
   each repetition group for a named cause, so a window that kept run 1's span

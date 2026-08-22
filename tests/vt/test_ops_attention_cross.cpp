@@ -466,3 +466,432 @@ TEST_CASE("attention-cross: the CUDA provider is registered and is not the CPU k
   CHECK(vt::OpRegistered(vt::OpId::kAttentionCross, DeviceType::kCUDA));
   CHECK(vt::OpRegistered(vt::OpId::kAttentionCross, DeviceType::kCPU));
 }
+// ---------------------------------------------------------------------------
+// The BLOCKED CUDA provider (#1555)
+//
+// `vt-cross-blocked` is a SECOND CUDA kernel for this op, selected above
+// `vt-native` and declining per call on a shape it has no tiling for. Every case
+// below states which arm it means to reach and ASSERTS it through
+// `GetOpProviderStats`, because the two kernels compute the same function and no
+// numerical check can tell them apart.
+//
+// `declines` is the discriminator, not `last_selected`: the blocked provider is
+// always the SELECTED one, and what separates a served call from a forwarded one
+// is whether it declined.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kBlockedProvider = "vt-cross-blocked";
+
+// MEASURED, not chosen. On `thor:gpu0`, worst of four seeds, the cancellation
+// case below reports the SHIPPED kernel at 8.50797e-04 and the BLOCKED one at
+// 9.10163e-05 -- a ratio of 0.1398, so the restructure is 7.2x MORE accurate
+// there, not less. The absolute bound is set on the binding arm (the shipped
+// kernel, 2.35x of margin) rather than on the better one.
+//
+// The RATIO bound is 2.0 and not the measured 0.14 plus a margin, because what
+// it has to catch is a DEGRADATION: the blocked kernel must not become less
+// accurate than the kernel it replaces. 2.0 gives that claim 14x of headroom
+// against today's reading while still failing on any real inversion.
+constexpr double kCancellationTol = 2e-3;
+constexpr double kCancellationRatio = 2.0;
+
+// The shape gate, restated from cuda_attention_cross.cu so a case can assert the
+// regime it claims rather than believe its own comment. A copy is deliberate:
+// if the kernel's gate moves and this does not, the REQUIREs below go red, which
+// is the point of writing it twice.
+bool BlockedShape(const Geometry& g) {
+  if (g.hk == 0 || g.hq % g.hk != 0) return false;
+  if (g.d == 64) return g.tq >= 64;
+  if (g.d == 128) return g.tq >= 32;
+  return false;
+}
+
+// THE FALLBACK STATIC HAS TO BE WARM BEFORE ANY COUNTED WINDOW, and the reason
+// is a defect in the seam rather than in this file
+// ([#1584](https://github.com/mudler/vllm.cpp/issues/1584)). `GetOpFallback`
+// increments `OpProviderStats::declines` itself (`op_provider.cpp:709`), and the
+// caching pattern `op_provider.h` prescribes ALSO calls `NoteOpDecline`, so the
+// FIRST decline in a process counts twice while the header says the count "stays
+// exact". Without this warm-up every `declines ==` assertion below would pass or
+// fail on whether some earlier case in the same binary happened to decline first
+// -- so a full run would be green and `doctest -tc=` on one case would be red,
+// which is a test passing for a reason unrelated to what it claims.
+//
+// One declining call, made OUTSIDE any reset window, resolves the static once per
+// process. It is a decline by construction: head_dim 8 is not a blocked tiling.
+void WarmDeclineOnce() {
+  static bool done = false;
+  if (done || !HasCuda()) return;
+  done = true;
+  // ENABLED for the duration, or a first call made on the disabled arm would mark
+  // this done without the blocked provider ever being selected -- and so without
+  // resolving the static it exists to resolve. The caller sets the arm it wants
+  // immediately after this returns.
+  vt::DisableOpProvider(kBlockedProvider, false);
+  Backend& gpu = *vt::TryGetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  AttentionCrossArgs args;
+  args.scale = 1.0f;
+  DeviceTensor dq(gpu, guard.q, DType::kF32, {1, 1, 8});
+  DeviceTensor dk(gpu, guard.q, DType::kF32, {1, 1, 8});
+  DeviceTensor dv(gpu, guard.q, DType::kF32, {1, 1, 8});
+  DeviceTensor dout(gpu, guard.q, DType::kF32, {1, 1, 8});
+  vt::AttentionCross(guard.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), nullptr, args);
+  gpu.Synchronize(guard.q);
+}
+
+struct ProviderStatsGuard {
+  ProviderStatsGuard() {
+    vt::EnableOpProviderCallStats(true);
+    vt::ResetOpProviderStats(vt::OpId::kAttentionCross, DeviceType::kCUDA);
+  }
+  ~ProviderStatsGuard() {
+    vt::ResetOpProviderStats(vt::OpId::kAttentionCross, DeviceType::kCUDA);
+    vt::EnableOpProviderCallStats(false);
+  }
+};
+
+// Runs ONE CUDA AttentionCross and returns the raw bytes plus the decline count
+// it produced. `disable_blocked` takes the same lever the A/B measurement uses,
+// so a test and a benchmark exercise the same switch.
+struct CudaRun {
+  std::vector<float> out;
+  unsigned long long declines = 0;
+  const char* selected = nullptr;
+};
+
+CudaRun RunCuda(const Geometry& g, const Inputs& in, DType stream, bool disable_blocked) {
+  Backend& gpu = *vt::TryGetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  AttentionCrossArgs args;
+  args.scale = in.scale;
+  CudaRun r;
+  r.out.assign(static_cast<size_t>(g.tq * g.hq * g.d), 0.0f);
+
+  // Before the arm is selected and before any counted window opens (#1584).
+  WarmDeclineOnce();
+  vt::DisableOpProvider(kBlockedProvider, disable_blocked);
+  ProviderStatsGuard stats;
+  {
+    DeviceTensor dout(gpu, guard.q, DType::kF32, {g.tq, g.hq, g.d});
+    DeviceTensor dbias(gpu, guard.q, DType::kF32, {in.has_bias ? in.bias_rows : 1, g.s},
+                       in.has_bias ? in.bias.data() : nullptr);
+    if (stream == DType::kF32) {
+      DeviceTensor dq(gpu, guard.q, DType::kF32, {g.tq, g.hq, g.d}, in.query.data());
+      DeviceTensor dk(gpu, guard.q, DType::kF32, {g.s, g.hk, g.d}, in.key.data());
+      DeviceTensor dv(gpu, guard.q, DType::kF32, {g.s, g.hk, g.d}, in.value.data());
+      vt::AttentionCross(guard.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(),
+                         in.has_bias ? &dbias.tensor() : nullptr, args);
+      dout.Download(guard.q, r.out.data());
+    } else {
+      auto pack = [](const std::vector<float>& src) {
+        std::vector<uint16_t> dst(src.size());
+        for (size_t i = 0; i < src.size(); ++i) {
+          uint32_t bits = 0;
+          std::memcpy(&bits, &src[i], sizeof(bits));
+          dst[i] = static_cast<uint16_t>(bits >> 16);
+        }
+        return dst;
+      };
+      const std::vector<uint16_t> qb = pack(in.query), kb = pack(in.key), vb = pack(in.value);
+      DeviceTensor dq(gpu, guard.q, DType::kBF16, {g.tq, g.hq, g.d}, qb.data());
+      DeviceTensor dk(gpu, guard.q, DType::kBF16, {g.s, g.hk, g.d}, kb.data());
+      DeviceTensor dv(gpu, guard.q, DType::kBF16, {g.s, g.hk, g.d}, vb.data());
+      vt::AttentionCross(guard.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(),
+                         in.has_bias ? &dbias.tensor() : nullptr, args);
+      dout.Download(guard.q, r.out.data());
+    }
+    const vt::OpProviderStats s =
+        vt::GetOpProviderStats(vt::OpId::kAttentionCross, DeviceType::kCUDA);
+    r.declines = s.declines;
+    r.selected = s.last_selected;
+  }
+  vt::DisableOpProvider(kBlockedProvider, false);
+  return r;
+}
+
+}  // namespace
+
+TEST_CASE("attention-cross blocked: the provider is registered ABOVE vt-native") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // Two providers, and the blocked one first in the deterministic selection
+  // order. If this inverts, every case below still passes numerically while
+  // measuring the wrong kernel — which is the whole reason it is asserted.
+  REQUIRE(vt::OpProviderCount(vt::OpId::kAttentionCross, DeviceType::kCUDA) == 2);
+  CHECK(std::string(vt::OpProviderNameAt(vt::OpId::kAttentionCross, DeviceType::kCUDA, 0)) ==
+        kBlockedProvider);
+  CHECK(std::string(vt::OpProviderNameAt(vt::OpId::kAttentionCross, DeviceType::kCUDA, 1)) ==
+        vt::kNativeProviderName);
+}
+
+TEST_CASE("attention-cross blocked: the DiT's own head_dim 64, with a ragged query tile") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // MiniMax-Music3's DiT is head_dim 64. Tq = 80 gives TWO query tiles at BR = 64
+  // whose second one is RAGGED (80 = 64 + 16), and S = 200 gives 7 key tiles at
+  // BC = 32 with a ragged last one (200 = 6*32 + 8) — so the tail guard on BOTH
+  // axes and the cross-tile rescale all run together.
+  const Geometry g{80, 200, 4, 4, 64};
+  REQUIRE(BlockedShape(g));
+  REQUIRE(g.tq % 64 != 0);
+  REQUIRE(g.s % 32 != 0);
+  RunGeometry("blocked d=64 ragged", g, 211u, /*bias_rows=*/0, DType::kF32, 2e-5);
+
+  const Inputs in = MakeInputs(g, 211u, /*bias_rows=*/0);
+  const CudaRun blocked = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
+  // TWO-SIDED. The positive half alone is an addition proof; the zero is what
+  // makes it a routing proof.
+  CHECK(std::string(blocked.selected) == kBlockedProvider);
+  CHECK(blocked.declines == 0);
+}
+
+TEST_CASE("attention-cross blocked: a DENSE bias across tiles, on the blocked path") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // The bias arm has NO vLLM equivalent (its Triton prefill kernel carries no
+  // additive bias), so it is the arm most likely to be dropped by a restructure.
+  // Dense [Tq, S], multi-tile on both axes, so reading row 0 for every query or
+  // indexing by the within-tile column is caught.
+  const Geometry g{96, 150, 2, 2, 64};
+  REQUIRE(BlockedShape(g));
+  RunGeometry("blocked d=64 dense bias", g, 223u, /*bias_rows=*/96, DType::kF32, 2e-5);
+  const Inputs in = MakeInputs(g, 223u, /*bias_rows=*/96);
+  CHECK(RunCuda(g, in, DType::kF32, false).declines == 0);
+}
+
+TEST_CASE("attention-cross blocked: Hq > Hkv broadcasts on the blocked path too") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const Geometry g{128, 100, 8, 2, 64};
+  REQUIRE(BlockedShape(g));
+  REQUIRE(g.hq > g.hk);
+  RunGeometry("blocked gqa 8/2", g, 227u, /*bias_rows=*/0, DType::kF32, 2e-5);
+  const Inputs in = MakeInputs(g, 227u, /*bias_rows=*/0);
+  CHECK(RunCuda(g, in, DType::kF32, false).declines == 0);
+}
+
+TEST_CASE("attention-cross blocked: head_dim 128 -- LTX-2.5's stream, which its OWN suite cannot reach") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // WHY THIS CASE HAS TO BE HERE. LTX-2.5's device forward runs head_dim 128 in
+  // production and therefore takes the blocked kernel, but every geometry in
+  // `ltx2_goldens.inc` is REDUCED-DIMENSION -- `kLtx2Arch_attention_head_dim` is
+  // 8 and `kLtx2VideoTokens` is 8 -- so every LTX-2.5 case DECLINES and its
+  // suites are byte-identical under this change. Their green says nothing about
+  // the path LTX-2.5 actually runs. That is the same defect this file's header
+  // was written for, and this is where the coverage lives instead.
+  //
+  // The 32x16 tiling is the one the 48 KiB shared budget forces at head_dim 128,
+  // and it is a DIFFERENT instantiation from the 64x32 one every case above
+  // drives: QT and KT fall to 2 and DT rises to 16, so the register tile, the
+  // cross-group reduction width and the output mapping are all different code.
+  const Geometry g{64, 100, 2, 2, 128};
+  REQUIRE(BlockedShape(g));
+  REQUIRE(g.tq % 32 == 0);
+  REQUIRE(g.s % 16 != 0);  // a ragged key tile at BC = 16
+  RunGeometry("blocked d=128 dense bias", g, 269u, /*bias_rows=*/64, DType::kF32, 2e-5);
+  const Inputs in = MakeInputs(g, 269u, /*bias_rows=*/64);
+  const CudaRun blocked = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
+  CHECK(std::string(blocked.selected) == kBlockedProvider);
+  CHECK(blocked.declines == 0);
+  const CudaRun native = RunCuda(g, in, DType::kF32, /*disable_blocked=*/true);
+  CHECK(std::string(native.selected) == vt::kNativeProviderName);
+  const double cross = vllm_test::MaxAbsDiff(blocked.out, native.out.data(), native.out.size());
+  MESSAGE("d=128 arm-vs-arm max|diff| = " << cross);
+  CHECK(cross < 2e-5);
+}
+
+TEST_CASE("attention-cross blocked: the bf16 stream takes it at head_dim 64") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // The gate is on head_dim and query count, NOT on dtype: a bf16 caller with a
+  // long query tile gets the blocked kernel too, and the staging tiles widen the
+  // operand once instead of on every read.
+  const Geometry g{64, 130, 2, 2, 64};
+  REQUIRE(BlockedShape(g));
+  RunGeometry("blocked bf16 d=64", g, 229u, /*bias_rows=*/1, DType::kBF16, 5e-3);
+  const Inputs in = MakeInputs(g, 229u, /*bias_rows=*/1);
+  CHECK(RunCuda(g, in, DType::kBF16, false).declines == 0);
+}
+
+TEST_CASE("attention-cross blocked: a fully masked key still degenerates, not NaNs") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // The same guarantee the warp kernel's case asserts, re-asserted on the
+  // blocked path — where the max and the sum are reduced across EIGHT key groups
+  // through shared memory, so an all-masked row travels a different route.
+  const Geometry g{64, 130, 1, 1, 64};
+  REQUIRE(BlockedShape(g));
+  Inputs in = MakeInputs(g, 233u, /*bias_rows=*/1);
+  for (int64_t j = 0; j < g.s; ++j) {
+    in.bias[static_cast<size_t>(j)] = (j >= 70 && j < 100) ? -3.40282347e+38F : 0.0f;
+  }
+  const std::vector<float> want =
+      Reference(g, in.query, in.key, in.value, &in.bias, 1, in.scale);
+  const CudaRun got = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
+  CHECK(got.declines == 0);
+  // MaxAbsDiff treats a non-finite operand as a FAILURE (#449), so a NaN cannot
+  // read as agreement here.
+  const double diff = vllm_test::MaxAbsDiff(got.out, want.data(), want.size());
+  MESSAGE("blocked masked-tile max|diff| = " << diff);
+  CHECK(diff < 2e-5);
+}
+
+TEST_CASE("attention-cross blocked: the DEPTH-DECODER shape declines, byte for byte") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // MiniMax-Music3's RVQ depth decoder calls this op with ONE query row against
+  // its cached history (minimax_music3_depth_device.cpp). That is the regime the
+  // warp-per-query kernel is the right shape for, and the blocked gate must
+  // leave it alone. Not "within tolerance" — BYTE FOR BYTE, which is the only
+  // claim worth making about a path that did not change.
+  const Geometry g{1, 200, 4, 4, 64};
+  REQUIRE(!BlockedShape(g));
+  const Inputs in = MakeInputs(g, 239u, /*bias_rows=*/0);
+  const CudaRun with = RunCuda(g, in, DType::kBF16, /*disable_blocked=*/false);
+  const CudaRun without = RunCuda(g, in, DType::kBF16, /*disable_blocked=*/true);
+  // ONE call, ONE decline: the provider was selected and forwarded.
+  CHECK(with.declines == 1);
+  // With the provider disabled it is not selected at all, so nothing declines.
+  CHECK(without.declines == 0);
+  CHECK(std::string(without.selected) == vt::kNativeProviderName);
+  REQUIRE(with.out.size() == without.out.size());
+  size_t bitdiff = 0;
+  for (size_t i = 0; i < with.out.size(); ++i) {
+    uint32_t a = 0, b = 0;
+    std::memcpy(&a, &with.out[i], sizeof(a));
+    std::memcpy(&b, &without.out[i], sizeof(b));
+    if (a != b) ++bitdiff;
+  }
+  MESSAGE("depth-decoder shape bitdiff = " << bitdiff << " / " << with.out.size());
+  CHECK(bitdiff == 0);
+}
+
+TEST_CASE("attention-cross blocked: an unhandled head_dim declines once per call") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // head_dim 32 has no blocked tiling. The decline count is the behavioural
+  // control the A/B rests on: it must move with the shape and with nothing else.
+  const Geometry g{128, 100, 2, 2, 32};
+  REQUIRE(!BlockedShape(g));
+  const Inputs in = MakeInputs(g, 241u, /*bias_rows=*/0);
+  const CudaRun r = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
+  CHECK(r.declines == 1);
+  const std::vector<float> want =
+      Reference(g, in.query, in.key, in.value, nullptr, 0, in.scale);
+  CHECK(vllm_test::MaxAbsDiff(r.out, want.data(), want.size()) < 2e-5);
+}
+
+TEST_CASE("attention-cross blocked: CATASTROPHIC CANCELLATION in the head-dim sum") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // THE CASE WITH TEETH, and the reason it has to exist. The restructure moves
+  // the head-dim reduction from a 32-lane PAIRWISE butterfly to a SEQUENTIAL f32
+  // accumulation over `head_dim` terms. On benign data a wide accumulator makes
+  // that reordering unobservable: every other case in this file reports
+  // max|diff| near 1e-6 and would report the same if the summation had not moved
+  // at all.
+  //
+  // CONSTRUCTION. K alternates sign along the head dim while Q does not, so
+  // consecutive products cancel: the leading term sums to EXACTLY zero over 64
+  // terms, the partial sums reach ~2.6e5, and what survives is a random walk of
+  // order 3e3. Pairwise and sequential summation genuinely differ there.
+  //
+  // THE SCALE IS PART OF THE CONSTRUCTION, and a first draft of this case got it
+  // wrong in a way worth recording. At the natural 1/sqrt(D) the score SPREAD is
+  // ~4e2, the softmax is a one-hot, both kernels return one row of V exactly and
+  // BOTH report max|diff| = 0 -- a case that passes while measuring nothing. The
+  // scale here puts the spread near unity so an error in the dot product
+  // actually reaches the output.
+  //
+  // WHAT IS ASSERTED, and why it is three things over FOUR seeds. (1) The case is
+  // ill-conditioned ENOUGH -- the EXISTING kernel must itself miss the f64
+  // reference by more than the benign 2e-5 band, or the bounds below are a mute
+  // switch. (2) Both arms stay inside one committed absolute bound. (3) The NEW
+  // summation is within a committed RATIO of the old one, which is the actual
+  // question a reordering raises and the one an absolute bound cannot answer.
+  // Four seeds because a bound fitted to one sample is a bound fitted to one
+  // sample.
+  const Geometry g{64, 96, 2, 2, 64};
+  REQUIRE(BlockedShape(g));
+  double worst_blocked = 0.0, worst_native = 0.0, worst_ratio = 0.0;
+  for (uint32_t seed : {251u, 263u, 271u, 281u}) {
+    Inputs in = MakeInputs(g, seed, /*bias_rows=*/0);
+    for (size_t i = 0; i < in.query.size(); ++i) {
+      in.query[i] = 512.0f + 0.5f * in.query[i];
+    }
+    for (size_t i = 0; i < in.key.size(); ++i) {
+      const size_t e = i % static_cast<size_t>(g.d);
+      in.key[i] = ((e % 2 == 0) ? 1.0f : -1.0f) * (512.0f + 0.5f * in.key[i]);
+    }
+    in.scale = 1.0f / 1024.0f;
+    const std::vector<float> want =
+        Reference(g, in.query, in.key, in.value, nullptr, 0, in.scale);
+    const CudaRun blocked = RunCuda(g, in, DType::kF32, /*disable_blocked=*/false);
+    const CudaRun native = RunCuda(g, in, DType::kF32, /*disable_blocked=*/true);
+    REQUIRE(blocked.declines == 0);
+    REQUIRE(native.declines == 0);
+    const double d_blocked = vllm_test::MaxAbsDiff(blocked.out, want.data(), want.size());
+    const double d_native = vllm_test::MaxAbsDiff(native.out, want.data(), want.size());
+    MESSAGE("cancellation seed=" << seed << ": blocked max|diff| = " << d_blocked
+                                 << "  native max|diff| = " << d_native
+                                 << "  ratio = " << (d_blocked / d_native));
+    worst_blocked = worst_blocked > d_blocked ? worst_blocked : d_blocked;
+    worst_native = worst_native > d_native ? worst_native : d_native;
+    const double ratio = d_blocked / d_native;
+    worst_ratio = worst_ratio > ratio ? worst_ratio : ratio;
+  }
+  MESSAGE("cancellation WORST: blocked = " << worst_blocked << "  native = " << worst_native
+                                           << "  ratio = " << worst_ratio);
+  CHECK(worst_native > 2e-5);  // the case is genuinely hard, not a mute switch
+  CHECK(worst_native < kCancellationTol);
+  CHECK(worst_blocked < kCancellationTol);
+  CHECK(worst_ratio < kCancellationRatio);
+}
+
+TEST_CASE("attention-cross blocked: the same-binary A/B lever agrees with itself") {
+  if (!HasCuda()) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  // `VT_OP_PROVIDER_DISABLE=vt-cross-blocked` is what the speed measurement uses
+  // to run both arms from one build, so the two arms have to be the same
+  // function. Held at the op's committed f32 band, NOT bit-identical — the
+  // reduction order differs by construction and this file says so rather than
+  // implying otherwise.
+  const Geometry g{128, 200, 2, 2, 64};
+  REQUIRE(BlockedShape(g));
+  const Inputs in = MakeInputs(g, 257u, /*bias_rows=*/0);
+  const CudaRun blocked = RunCuda(g, in, DType::kF32, false);
+  const CudaRun native = RunCuda(g, in, DType::kF32, true);
+  CHECK(blocked.declines == 0);
+  CHECK(native.declines == 0);
+  CHECK(std::string(blocked.selected) == kBlockedProvider);
+  CHECK(std::string(native.selected) == vt::kNativeProviderName);
+  const double cross = vllm_test::MaxAbsDiff(blocked.out, native.out.data(), native.out.size());
+  MESSAGE("A/B arm-vs-arm max|diff| = " << cross);
+  CHECK(cross < 2e-5);
+}

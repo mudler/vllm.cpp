@@ -3320,6 +3320,46 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
 void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                          const Tensor& value, const AttentionArgs& args);
 
+// The head_dim domain AttentionDenseFlash can actually LAUNCH, as arithmetic a
+// host without a GPU can execute and a test can pin (#1544).
+//
+// The tiling is what bounds it: each CTA stages `kAttentionDenseFlashTileCols`
+// columns of BOTH K and V in dynamic shared memory, so it asks the driver for
+// `2 * cols * head_dim * sizeof(input element)` bytes. There is no
+// `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
+// anywhere in src/vt/cuda/, so that request is capped at CUDA's DEFAULT 48 KiB per
+// block on every architecture — not at the 256 the kernel's register blocking
+// allows, which is what this op used to advertise on its own. head_dim 256 in bf16
+// wants 64 KiB and in f32 wants 128 KiB; both are refused by the driver, and the
+// caller used to learn that from a bare launch error one `cudaGetLastError` later.
+//
+// This mirrors what vLLM makes every backend declare — `get_supported_head_sizes`
+// / `supports_head_size`, vllm/v1/attention/backend.py:155-163 @ 555967922 — where
+// the domain is consulted BEFORE dispatch rather than discovered by launching.
+// AttentionDenseFast (kAttentionDenseFast) uses NO shared memory and is the rung
+// that serves head_dim above the bound below.
+inline constexpr int64_t kAttentionDenseFlashTileCols = 64;
+// The register blocking: 8 elements per lane across 32 lanes.
+inline constexpr int64_t kAttentionDenseMaxHeadDim = 256;
+// CUDA's default per-block dynamic shared-memory cap, and it is INCLUSIVE. That
+// direction matters: head_dim 192 in bf16 lands on exactly 49152 bytes and launches
+// today, so an exclusive bound would refuse work that currently runs.
+inline constexpr int64_t kCudaDefaultDynamicSmemBytes = 49152;
+
+// Bytes of dynamic shared memory one CTA requests for `head_dim` at `elem_size`.
+constexpr int64_t AttentionDenseFlashSmemBytes(int64_t head_dim, int64_t elem_size) {
+  return 2 * kAttentionDenseFlashTileCols * head_dim * elem_size;
+}
+
+// The largest head_dim AttentionDenseFlash can launch for an input element size.
+// bf16 -> 192, f32 -> 96.
+constexpr int64_t AttentionDenseFlashMaxHeadDim(int64_t elem_size) {
+  if (elem_size <= 0) return 0;  // no element size, no admissible head_dim
+  const int64_t by_smem =
+      kCudaDefaultDynamicSmemBytes / (2 * kAttentionDenseFlashTileCols * elem_size);
+  return by_smem < kAttentionDenseMaxHeadDim ? by_smem : kAttentionDenseMaxHeadDim;
+}
+
 // Same contract as AttentionDenseFlash, but the CUDA impl runs the VENDORED
 // FlashAttention-2 forward (src/vt/cuda/flash_attn/) on its tensor cores instead of a
 // scalar per-warp recurrence — the kernel vLLM itself dispatches for dense non-causal

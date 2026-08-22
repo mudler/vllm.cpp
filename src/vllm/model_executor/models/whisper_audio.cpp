@@ -320,6 +320,10 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
       if (f2 != nullptr && f2[0] == '1') return 3;  // FA-2 tensor cores (opt-in)
       return 2;                                     // flash-tiled (default, byte-exact)
     }();
+    // VT-ATTN-NAIVE: the EAGER rung of the same-binary A/B above, reachable only
+    // with VT_WHISPER_ENC_EAGER=1, which nothing in the tree sets. The default is
+    // the flash-tiled rung two branches down. Rerouting this arm would delete the
+    // baseline the other three are measured against (#1544).
     if (enc_attn == 0)
       vt::Attention(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
     else if (enc_attn == 1)

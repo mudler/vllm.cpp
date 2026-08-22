@@ -668,6 +668,11 @@ std::vector<float> NemotronHAttentionMixer(const NemotronHAttentionWeights& w,
     // `self.scaling = self.head_dim**-0.5` (nemotron_h.py:440).
     args.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(Dh)));
     args.causal = true;
+    // VT-ATTN-NAIVE: the HOST reference arm. `NemotronHAttnBlock` in
+    // nemotron_h_device.cpp is the device arm, and the equivalence gate between
+    // them holds only while both run the same kernel — the fast rungs are NOT
+    // bit-identical to this one. Changing one side reroutes the comparison
+    // rather than the model (#1544).
     vt::Attention(queue, ot, qt, kt, vt_, args);
   }
 

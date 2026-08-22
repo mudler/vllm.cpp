@@ -414,7 +414,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 902 912 913 981 1077 1093 1159 1163 1256 1318 1426 1468 1510 1512
+// 930 940 941 1012 1108 1124 1190 1194 1287 1349 1457 1499 1541 1543
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -764,6 +764,34 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   phase::PhaseLog::Instance().Begin();
   phase::PhaseLog::Instance().SetRender(0);
   const phase::Scope load_span("load", /*span=*/true);
+  // ── W0 / #1439: the prologue is a PHASE, and it was landing in the residue ──
+  //
+  // Everything between here and `load.dit` -- resolving the device, probing the
+  // platform, refusing a partial backend, installing the device probe, opening
+  // the DiT safetensors header, parsing the LoRA options -- ran inside the
+  // `load` SPAN and inside no LEAF. A span is printed for context and never
+  // summed, so those seconds went to `unaccounted_seconds`, and the phase-table
+  // gate's `leaves >= 0.95 * wall` floor is a RATIO: at the 64x64/9-frame
+  // fixture scale, where the whole instrumented render is a fraction of a
+  // second, one un-named startup interval is several percent of the wall and the
+  // case decided by coin flip.
+  //
+  // THE FIX IS THE NAME, NOT A WIDER FLOOR, and the measurement is why. The
+  // probe recorded in `.agents/specs/ltx25-device-residency.md` located 91% of
+  // that residue -- 11.3 ms of 12.4 ms on a 343 ms render -- in ONE contiguous
+  // interval at the head of this span. An absolute slack big enough to stop the
+  // assertion flapping would have to exceed 12 ms and would therefore HIDE this
+  // phase: a floor below the real value is a mute switch, which is the failure
+  // two earlier shapes of the neighbouring span-slack bound already had. Naming
+  // it MEASURES the phase instead of tolerating it, and it is the half of
+  // #1439's own proposal the probe left standing.
+  //
+  // `Close()` rather than a block, because this driver's regions are sequential
+  // statements in one function -- the shape `render_phase_log.h` documents
+  // `Scope::Close` for. A `Fail()` throw out of the prologue closes it through
+  // the destructor instead, which costs nothing: a load that throws writes no
+  // table at all.
+  phase::Scope open_phase("load.open");
 
   // ── where this engine runs (phase L8) ─────────────────────────────────────
   //
@@ -923,6 +951,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     if (!lora_strength.empty()) spec.strength = ParseLoraStrength(lora_strength);
     dit_options.loras.push_back(std::move(spec));
   }
+  // The prologue ends where the DiT load begins: `load.open` must not absorb any
+  // of `load.dit`, which is the phase W2 and W3 both act on.
+  open_phase.Close();
   {
     // W0: the phase the campaign's W2 and W3 both act on. It covers the
     // materialization AND the per-tensor device staging, because from the

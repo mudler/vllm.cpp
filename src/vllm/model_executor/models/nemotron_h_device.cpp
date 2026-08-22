@@ -327,6 +327,11 @@ DBuf NemotronHAttnBlock(Dev d, const NemotronHAttentionWeights& w,
     // narrowing, so the two arms feed `vt::Attention` bit-identical scales.
     args.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(Dh)));
     args.causal = true;
+    // VT-ATTN-NAIVE: the DEVICE half of the pair above. `NemotronHAttentionMixer`
+    // in nemotron_h.cpp is the host reference, and this arm exists to be
+    // bit-comparable to it — same scale, same rounding, same kernel. A fast rung
+    // here would make the two arms measure different things instead of the same
+    // one (#1544).
     vt::Attention(d.q, attn.t(), qt, kt, vt_, args);
   }
 

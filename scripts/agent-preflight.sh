@@ -99,6 +99,7 @@ CHECKERS=(
   check-supported-models
   check-env-doc
   check-fusion-consistency
+  check-attention-rung-consistency
   check-fp4-resident-consistency
   check-cuda-op-arch-gate
   check-runner-routing-consistency
@@ -149,6 +150,7 @@ SUITES=(
   test_check_env_doc
   test_checker_text
   test_check_fusion_consistency
+  test_check_attention_rung_consistency
   test_check_fp4_resident_consistency
   test_check_cuda_op_arch_gate
   test_check_runner_routing_consistency

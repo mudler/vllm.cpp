@@ -12,9 +12,10 @@
 `9035151d6`, last touched `170592a93` (2026-08-13,
 [vllm#52172](https://github.com/vllm-project/vllm/pull/52172) "Disable sequence
 parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
-**Designated CUDA host (developer directive, 2026-08-14):** Thor
-`192.168.68.23` for end-to-end verification. §6.3 records what that host can and
-cannot carry for this model, measured.
+**Designated CUDA host (developer directive, 2026-08-14):** Thor, reached as the
+fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
+address is recorded in `environment.md` to identify the box, not as a way into
+it. §6.3 records what that host can and cannot carry for this model, measured.
 **Status:** W0 — spec committed, no engine code, nothing built, nothing
 downloaded, no GPU used.
 

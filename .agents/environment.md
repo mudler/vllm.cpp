@@ -40,9 +40,16 @@ collision below, in which two mutexes could not see each other.
 
 **This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
 in this file still describe.** Read a historical recipe as evidence of what ran
-at the time, not as an instruction for what to run now. The file mutex is still
-real and still required, and it now lives INSIDE a lease rather than instead of
-one.
+at the time, not as an instruction for what to run now.
+
+**"The file mutex is still real and still required" is the stale half of this
+paragraph, and the Jetson Thor profile below now contradicts it.** On a FLEET
+device the lease IS the mutex — `rc` hands the whole device to one job — so a
+job that also takes `${GPU_LOCK}` serialises against nobody. That profile
+deletes the `flock` wrapper from its recipe for exactly that reason. The file
+mutex stays real and required on a GPU that is NOT a fleet device, which is the
+conditional form `AGENTS.md` states, and where both apply it runs inside the
+lease rather than instead of one.
 
 **The bypass has already voided a measurement, so this is a measured cost and
 not a rule for its own sake.** `.agents/specs/minimax-music3.md` §13.10 records
@@ -813,7 +820,14 @@ environment:
     **1. Stage the tree where the worker can see it.** `rc` copies nothing.
 
     ```sh
-    D=/mnt/nas_share/rc/<your-dir>          # the worker sees this as /workspace/<your-dir>
+    # WHERE THE SHARE IS MOUNTED DEPENDS ON THE HOST YOU TYPE THIS ON.
+    # On the devbox it is /mnt/nas_share/rc; on the dgx HOST that path is GONE
+    # and the share is /usr/local/nas_share/rc (see the DGX profile). Resolve it,
+    # never assume it -- staging to a stale path silently stages nothing, and the
+    # job then fails for a reason that looks unrelated.
+    for c in /mnt/nas_share/rc /usr/local/nas_share/rc; do [ -d "$c" ] && NAS=$c && break; done
+    test -n "${NAS:-}" || { echo "FATAL: no NAS mount on this host"; exit 96; }
+    D=$NAS/<your-dir>                       # the worker always sees this as /workspace/<your-dir>
     mkdir -p "$D"
     git rev-parse HEAD > "$D/BASE_SHA"      # a baseline with no SHA beside it is not a baseline
     git archive --format=tar HEAD | gzip -1 > "$D/src.tar.gz"
@@ -1010,7 +1024,9 @@ environment:
     Neither phase goes near the wall, so `-j4` for the build is cheap and now has
     an artifact. **That is a statement about a BUILD and a unit suite and it
     transfers to nothing else** — a model load here is what took the box down
-    three times.
+    three times, and the whole-tree build that correlates with a later
+    `unknown (no contact)` on this device is
+    [#1380](https://github.com/mudler/vllm.cpp/issues/1380), recorded further down this same profile.
 
     **7. `nvidia-smi`, corrected.** The earlier record said it "dies"
     unprivileged with `NvRmMemInitNvmap failed: error Permission denied`, works
@@ -1293,7 +1309,10 @@ environment:
     ([[kairos-oem-rw-paths-change-cost-a-boot]]), and a host that did not reboot
     would falsify it and point at the worker pod instead.
     **The instruction that already existed is the one to follow.** The build
-    recipe above says `-j4` is deliberate, and every NAMED-TARGET build in that
+    recipe above prescribes `cmake --build ... -j 4`. It used to say "`-j4` is
+    deliberate"; that phrasing is gone, replaced by the measured sampler table
+    under "Parallelism, and what is actually measured", and the instruction is
+    unchanged. Every NAMED-TARGET build in that
     campaign — five jobs, `-j 8`, one to four targets each — completed without
     incident. It is the whole-tree build that correlates. Use `-j 4` for a full
     build, and prefer named targets.

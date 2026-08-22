@@ -89,7 +89,10 @@ Reasons, not exceptions
 -----------------------
 Every checker returns a LIST of reasons and `require_no_reasons` raises once
 with all of them. A harness that dies on the first defect makes the operator pay
-a 51.75 GiB model load per defect, which is the cost O23 exists to stop. The
+a 51.75 GiB model load per defect -- that is the TARGET CHECKPOINT read off
+CIFS, `weight_utils.py:858`, and the finished load holds 54.87 GiB resident per
+`model_runner.py:385`; the two numbers are the same load measured differently
+-- which is the cost O23 exists to stop. The
 functions are pure, so the test suite drives them directly and the drivers call
 exactly the same code the gate proves.
 
@@ -145,7 +148,9 @@ BACKEND_SOURCE_READ_BACK = "read_back_from_engine"
 #: what it could not read.
 #:
 #: **The first two are MEASURED and the last three are not.** On `dgx:gpu0` on
-#: 2026-08-22, inside the beyond-pin wheel and after a 54.87 GiB load, all three
+#: 2026-08-22, inside the beyond-pin wheel and after a load `model_runner.py:385`
+#: reported as `Model loading took 54.87 GiB memory and 702.391374 seconds`, all
+#: three
 #: of the `attn_backend` walks raised `AttributeError: 'GPUModelRunner' object
 #: has no attribute 'attn_backend'` and the two `attention_config` walks each
 #: returned `TRITON_ATTN`
@@ -877,7 +882,9 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def clock_state_reasons(record: Mapping[str, Any] | None, *, label: str) -> list[str]:
+def clock_state_reasons(
+    record: Mapping[str, Any] | None, *, label: str, detail: str = ""
+) -> list[str]:
     """Reasons the clock does not attribute this arm's number.
 
     Delegated whole to `tools/bench/gpu_clock_state.py`, which
@@ -885,14 +892,24 @@ def clock_state_reasons(record: Mapping[str, Any] | None, *, label: str) -> list
     new harness to import rather than reimplement. An ABSENT record is the
     refusal this wrapper adds: the helper judges a window, and a window nobody
     sampled is not a healthy one.
+
+    `detail` is the SAMPLER'S own message when it produced no summary to judge
+    -- an entirely idle window, a mid-window field change, a failed
+    `nvidia-smi`, a sampler that had to be killed. It is appended rather than
+    substituted, because the rule is the same one either way and only the cause
+    differs. Omit it and the refusal cannot tell those four apart, which costs
+    the next run a lease to learn what this one already knew.
     """
 
     if record is None:
-        return [
+        reason = (
             f"clock: the {label} arm sampled no clock window. A number is quotable only "
             "with the clock it was taken at -- a byte-identical kernel moved 9.65% "
             "between two boots with nothing throttling (#543)"
-        ]
+        )
+        if detail.strip():
+            reason += f". Its sampler: {detail.strip()}"
+        return [reason]
     return clock_reasons(record, label=label)
 
 

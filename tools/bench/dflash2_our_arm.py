@@ -60,6 +60,7 @@ from tools.bench.dflash2_oracle_capture import (
     PROMPTS,
     _parse_artifact,
     add_clock_arguments,
+    clock_evidence_reasons,
     clock_window,
     sample_compute_processes,
 )
@@ -214,6 +215,7 @@ def precheck(args: argparse.Namespace, env: Mapping[str, str]) -> dict[str, Any]
     reasons += model_binding_reasons(models, artifacts, label="ours")
     reasons += repeat_reasons(args.repeat, label="ours")
     reasons += build_recipe_reasons(build, label="ours")
+    reasons += clock_evidence_reasons(args, label="ours")
     reasons += spec_reasons
     require_no_reasons(reasons, what="DFlash2 our-arm capture")
     return {
@@ -262,13 +264,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     require_no_reasons(
         leg_reasons(legs, max_tokens=args.max_tokens), what="DFlash2 our-arm capture"
     )
-    record = {**checked, **fold_legs(legs), "clock": window.record, "binary": args.binary}
+    record = {
+        **checked,
+        **fold_legs(legs),
+        "clock": window.record,
+        # NULL on a healthy run; the sampler's own words when there is no
+        # window to judge. `ClockWindow.__exit__` keeps that failure rather
+        # than raising it, so this arm's legs reach the disk either way.
+        "clock_error": window.close_error,
+        "binary": args.binary,
+    }
     # WRITTEN BEFORE THE CLOCK IS JUDGED, and nothing quotable is printed until
     # it passes. Same rule as the oracle arm, same reason.
     if args.output is not None:
         write_json_atomic(args.output, record)
     require_no_reasons(
-        clock_state_reasons(window.record, label="ours"), what="DFlash2 our-arm capture"
+        clock_state_reasons(
+            window.record, label="ours", detail=str(window.close_error or "")
+        ),
+        what="DFlash2 our-arm capture",
     )
     print(canonical_json(record))
     return 0

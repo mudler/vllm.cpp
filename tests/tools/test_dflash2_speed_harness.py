@@ -111,8 +111,67 @@ def stop(*_):
 
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
-samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
+# THE MARKER FIRST, THEN THE SAMPLES FILE. `_await_first_sample` returns as
+# soon as the samples file is non-empty, so writing it first leaves a window
+# in which a poll sees an open window and no marker -- a spurious
+# ('generate', False). Test-only: the real sampler has no marker.
 running.write_text('1', encoding='utf-8')
+samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
+while True:
+    time.sleep(0.02)
+"""
+
+#: The refusal the LEASED run met, verbatim. `run_sampler` calls
+#: `build_clock_record` BEFORE `write_json_atomic`, and that call raises on an
+#: entirely idle window, so the sampler exits 2 having written NO SUMMARY at
+#: all (`gpu_clock_state.__main__` prints it and exits 2).
+IDLE_WINDOW_REFUSAL = (
+    "gpu-clock-state: every one of 98 clock samples was idle; there is no "
+    "window to attribute the measurement to"
+)
+
+#: A sampler that opens its window and then REFUSES AT STOP. This is the branch
+#: the two `unusable window` cases never reach: they hand the arm a summary the
+#: sampler DID write, so they exercise `clock_reasons` on a bad window rather
+#: than the sampler that produced none.
+CLOCK_STUB_REFUSE_AT_STOP_SOURCE = """
+import json, pathlib, signal, sys, time
+
+argv = sys.argv
+message = json.loads(argv[1])
+samples = pathlib.Path(argv[argv.index('--output') + 1])
+running = samples.with_name(samples.name + '.running')
+
+
+def stop(*_):
+    running.unlink(missing_ok=True)
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+running.write_text('1', encoding='utf-8')
+samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
+while True:
+    time.sleep(0.02)
+"""
+
+#: A sampler that will not stop, so `close` kills it. Same evidence question,
+#: a different exit: the summary is missing because the process was killed
+#: rather than because it refused, and the kill path raised out of the `with`
+#: block just as the refusal did.
+CLOCK_STUB_IGNORES_STOP_SOURCE = """
+import json, pathlib, signal, sys, time
+
+argv = sys.argv
+samples = pathlib.Path(argv[argv.index('--output') + 1])
+running = samples.with_name(samples.name + '.running')
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+running.write_text('1', encoding='utf-8')
+samples.write_text(json.dumps({'elapsed_s': 0.0}) + '\\n', encoding='utf-8')
 while True:
     time.sleep(0.02)
 """
@@ -122,6 +181,18 @@ def clock_stub_argv(record: dict | None = None) -> list[str]:
     """The `--clock-sampler` prefix, which the driver completes with paths."""
 
     return [sys.executable, "-c", CLOCK_STUB_SOURCE, json.dumps(record or clock_record())]
+
+
+def clock_stub_refusing_at_stop_argv(message: str = IDLE_WINDOW_REFUSAL) -> list[str]:
+    """A `--clock-sampler` that exits 2 at stop and writes no summary."""
+
+    return [sys.executable, "-c", CLOCK_STUB_REFUSE_AT_STOP_SOURCE, json.dumps(message)]
+
+
+def clock_stub_ignoring_stop_argv() -> list[str]:
+    """A `--clock-sampler` that ignores SIGTERM, so `close` has to kill it."""
+
+    return [sys.executable, "-c", CLOCK_STUB_IGNORES_STOP_SOURCE]
 
 
 class OracleIdentityTest(unittest.TestCase):
@@ -687,6 +758,52 @@ class OracleCapturePrecheckTest(unittest.TestCase):
             capture.main(argv)
         self.assertIn("foreign compute process", str(raised.exception))
 
+    def test_a_USED_EVIDENCE_DIRECTORY_stops_the_run_BEFORE_the_model_loads(self) -> None:
+        """The overwrite refusal exists; it just fired 12 minutes too late.
+
+        `gpu_clock_state.run_sampler` refuses to overwrite clock evidence, and
+        since the sampler moved INSIDE the arm that refusal is first evaluated
+        when the arm opens its window -- for the oracle arm after `LLM(...)`,
+        which was 702 s on `dgx:gpu0` on 2026-08-22. It is a CPU-only
+        `path.exists()`, so it belongs in the phase whose whole purpose is that
+        the failure costing a lease is found before the lease.
+        """
+
+        summary = self.root / "clock-vllm.json"
+        summary.write_text("{}", encoding="utf-8")
+        with self.assertRaises(HarnessError) as raised:
+            capture.main(
+                precheck_argv(self.root, self.digest)
+                + ["--clock-summary", str(summary)]
+            )
+        message = str(raised.exception)
+        self.assertIn(str(summary), message)
+        self.assertIn("already exists", message)
+
+    def test_a_LEFTOVER_SAMPLE_STREAM_stops_the_run_too(self) -> None:
+        """`run_sampler` refuses on EITHER path, so both are checked."""
+
+        summary = self.root / "clock-vllm.json"
+        capture.default_clock_samples_path(summary).write_text("", encoding="utf-8")
+        # A ZERO-BYTE leftover is still a refusal upstream: `run_sampler` asks
+        # `path.exists()`, not whether it holds anything.
+        self.assertFalse(summary.exists())
+        with self.assertRaises(HarnessError) as raised:
+            capture.main(
+                precheck_argv(self.root, self.digest)
+                + ["--clock-summary", str(summary)]
+            )
+        self.assertIn(
+            str(capture.default_clock_samples_path(summary)), str(raised.exception)
+        )
+
+    def test_an_UNUSED_evidence_directory_still_passes(self) -> None:
+        rc = capture.main(
+            precheck_argv(self.root, self.digest)
+            + ["--clock-summary", str(self.root / "fresh" / "clock-vllm.json")]
+        )
+        self.assertEqual(rc, 0)
+
     def test_a_re_quantized_checkpoint_stops_the_run(self) -> None:
         with self.assertRaises(HarnessError) as raised:
             capture.main(precheck_argv(self.root, "c" * 64))
@@ -1163,6 +1280,18 @@ class OurArmPrecheckEntryPointTest(unittest.TestCase):
             our_arm.main(argv)
         self.assertIn("no lease id", str(raised.exception))
 
+    def test_a_USED_EVIDENCE_DIRECTORY_stops_OUR_ARM_in_its_precheck_too(self) -> None:
+        """Both arms take `--clock-summary`, so both check it in the phase."""
+
+        summary = self.root / "clock-ours.json"
+        summary.write_text("{}", encoding="utf-8")
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.main(
+                our_arm_argv(self.root, self.digest) + ["--clock-summary", str(summary)]
+            )
+        self.assertIn(str(summary), str(raised.exception))
+        self.assertIn("already exists", str(raised.exception))
+
     def test_a_foreign_job_on_the_device_stops_the_run(self) -> None:
         with self.assertRaises(HarnessError) as raised:
             our_arm.main(
@@ -1444,6 +1573,58 @@ class ShellDriverTest(unittest.TestCase):
                 self.assertEqual(
                     checked["workload"]["num_speculative_tokens"], 3, name
                 )
+
+    def test_a_USED_EVIDENCE_DIRECTORY_stops_the_GATE_in_its_PRECHECK_PHASE(self) -> None:
+        """The early stop, restored end to end.
+
+        `mkdir -p "${EVIDENCE}"` never asked whether the directory was already
+        used, and the precheck invocations passed no `--clock-summary`, so the
+        overwrite refusal was first evaluated when the ORACLE ARM opened its
+        window -- after `LLM(...)`. Here the oracle arm is reached only if the
+        precheck let it through, and it announces itself on stdout, so the
+        banner is the assertion.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            # WHAT A RERUN INTO A USED DIRECTORY FINDS.
+            (evidence / "clock-vllm.json").write_text("{}", encoding="utf-8")
+            payload = b"stand-in weights"
+            artifact = root / "model.safetensors"
+            artifact.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            completed = subprocess.run(
+                [
+                    "bash", str(self.SCRIPT),
+                    "--evidence", str(evidence),
+                    "--target", tmp,
+                    "--draft", tmp,
+                    "--oracle-commit", ORACLE_COMMIT,
+                    "--oracle-build-recipe", "pip install -e . at the beyond-pin head",
+                    "--attention-backend", "TRITON_ATTN",
+                    "--artifact", f"target={artifact}={digest}",
+                    "--our-binary", "/nonexistent/vllm-cli",
+                    "--our-model", str(artifact),
+                    "--our-artifact", f"our_target={artifact}={digest}",
+                    "--our-speculative-config",
+                    '{"method":"dflash","model":"' + str(artifact) + '","num_speculative_tokens":7}',
+                    "--our-build-recipe", "cmake --preset cuda-release",
+                    "--lease-id", "rc-42",
+                    "--assume-compute-processes", "[]",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+                env={"PATH": "/usr/bin:/bin", "HOME": tmp},
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("already exists", completed.stderr)
+            self.assertIn("clock-vllm.json", completed.stderr)
+            # THE ARM WAS NEVER STARTED, so no model was loaded to find out.
+            self.assertNotIn("== vLLM arm", completed.stdout)
+            self.assertFalse((evidence / "vllm-arm.json").exists())
 
     def test_a_run_with_no_lease_never_reaches_the_gpu(self) -> None:
         completed = subprocess.run(
@@ -2115,6 +2296,81 @@ class CaptureRunTest(unittest.TestCase):
         self.assertTrue((self.root / "vllm-arm.json").is_file())
         self.assertEqual(wheel.built[0].generate_calls, 8)
 
+    def test_a_sampler_that_REFUSES_AT_STOP_still_leaves_the_LEASES_EVIDENCE(self) -> None:
+        """The kept-evidence guarantee, on the branch that actually failed.
+
+        The case above and its our-arm twin hand the arm a summary the sampler
+        DID write, so both exercise `clock_reasons` on a bad window. The leased
+        run never got that far. `run_sampler` calls `build_clock_record` BEFORE
+        `write_json_atomic`, and that call raises on an entirely idle window --
+        the exact string #1657 quotes off `dgx:gpu0` -- so the sampler exits 2
+        having written NO summary. `close(read=True)` then raised out of the
+        `with` block, propagated out of `capture()`, and `main()` never reached
+        `write_json_atomic`: the whole golden went with it, records, blocks,
+        token ids and legs, which is the provenance O26 needs.
+        """
+
+        wheel = self.install_wheel()
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(
+            clock_stub_refusing_at_stop_argv()
+        )
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                capture.main(argv)
+        message = str(raised.exception)
+        self.assertIn("DFlash2 oracle capture REFUSED", message)
+        self.assertIn("sampled no clock window", message)
+        # The SAMPLER'S OWN diagnosis reaches the refusal, or the run stops
+        # with no way to tell an idle window from a dead `nvidia-smi`.
+        self.assertIn("every one of 98 clock samples was idle", message)
+        # Nothing quotable escaped...
+        self.assertEqual(sink.getvalue(), "")
+        # ...no summary was ever written, so the record's clock is NULL and
+        # says why...
+        self.assertFalse(self.clock_summary.exists())
+        record = json.loads((self.root / "vllm-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(record["clock"])
+        self.assertIn("every one of 98 clock samples was idle", record["clock_error"])
+        # ...and the two hours of leased evidence is on disk.
+        self.assertEqual(len(record["legs"]), 8)
+        self.assertEqual(len(record["records"]), 4)
+        self.assertEqual(record["records"][0]["blocks"][0]["anchor"], 4242)
+        self.assertEqual(wheel.built[0].generate_calls, 8)
+
+    def test_a_sampler_that_WILL_NOT_STOP_is_killed_and_the_EVIDENCE_SURVIVES(self) -> None:
+        """The kill path loses the golden identically, and separately.
+
+        `close` raises `did not stop within ...s and was killed` from its own
+        `TimeoutExpired` branch, which is a second exit out of the same `with`
+        block. Repairing only the non-zero-return branch would leave this one
+        discarding the lease.
+        """
+
+        wheel = self.install_wheel()
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(
+            clock_stub_ignoring_stop_argv()
+        )
+        saved = capture.CLOCK_STOP_TIMEOUT_S
+        capture.CLOCK_STOP_TIMEOUT_S = 0.5
+        self.addCleanup(setattr, capture, "CLOCK_STOP_TIMEOUT_S", saved)
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                capture.main(argv)
+        message = str(raised.exception)
+        self.assertIn("DFlash2 oracle capture REFUSED", message)
+        self.assertIn("sampled no clock window", message)
+        self.assertIn("was killed", message)
+        self.assertEqual(sink.getvalue(), "")
+        record = json.loads((self.root / "vllm-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(record["clock"])
+        self.assertIn("was killed", record["clock_error"])
+        self.assertEqual(len(record["legs"]), 8)
+        self.assertEqual(wheel.built[0].generate_calls, 8)
+
 
 class OurArmRunEntryPointTest(unittest.TestCase):
     """Past the precheck, into the loop -- where the SECOND refusal lives.
@@ -2223,6 +2479,30 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.assertIn("busy SM-clock sample", str(raised.exception))
         self.assertEqual(sink.getvalue(), "")
         self.assertTrue((self.root / "our-arm.json").is_file())
+
+    def test_our_arm_KEEPS_ITS_EVIDENCE_when_the_sampler_REFUSES_AT_STOP(self) -> None:
+        """Both arms share `ClockWindow`, so both lost the run the same way."""
+
+        argv = self.argv()
+        argv[argv.index("--clock-sampler") + 1] = json.dumps(
+            clock_stub_refusing_at_stop_argv()
+        )
+        sink = io.StringIO()
+        with self.assertRaises(HarnessError) as raised:
+            with contextlib.redirect_stdout(sink):
+                our_arm.main(argv)
+        message = str(raised.exception)
+        self.assertIn("DFlash2 our-arm capture REFUSED", message)
+        self.assertIn("sampled no clock window", message)
+        self.assertIn("every one of 98 clock samples was idle", message)
+        self.assertEqual(sink.getvalue(), "")
+        self.assertFalse(self.clock_summary.exists())
+        record = json.loads((self.root / "our-arm.json").read_text(encoding="utf-8"))
+        self.assertIsNone(record["clock"])
+        self.assertIn("every one of 98 clock samples was idle", record["clock_error"])
+        self.assertEqual(record["warm_legs"], 4)
+        self.assertEqual(self.observed, [True, True, True, True])
+
 
 if __name__ == "__main__":
     unittest.main()

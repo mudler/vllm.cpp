@@ -2343,8 +2343,44 @@ list items.
   discarding its evidence makes the next run pay the same lease to see the same
   thing; nothing quotable is emitted, since the refusal precedes the `print` and
   `build_speed_result` refuses the same record again through `clock_pairing`.
-  And the oracle arm's window opens AFTER `LLM(...)` has loaded, so the
-  12-minute load is outside the samples `clock_reasons` floors at 50% busy.
+  And the oracle arm's window opens AFTER `LLM(...)` has loaded, so the load is
+  outside the samples `clock_reasons` floors at 50% busy.
+
+  **That guarantee was FALSE on the one branch it was written for, and a fresh
+  review found it.** It held only where the sampler had written a summary.
+  `gpu_clock_state.run_sampler` builds the record BEFORE it writes it, and
+  `build_clock_record` refuses an entirely idle window -- `every one of N clock
+  samples was idle`, the exact string this run met -- and refuses a mid-window
+  field change, while `query_once` refuses a failed `nvidia-smi`. On any of
+  those the sampler exits 2 with NO summary, `ClockWindow.close(read=True)`
+  raised, the exception left the `with` block and `capture()`, and `main()`
+  never reached `write_json_atomic`. The whole golden went with it -- records,
+  blocks, token ids, legs -- which is the provenance O26 needs. The
+  `stop_timeout` kill path lost it identically, and both existing
+  "unusable window" cases fed a summary the sampler DID write, so neither ever
+  reached this branch. `ClockWindow.__exit__` now keeps the failure in
+  `close_error`, leaves `record` None, and the driver refuses on it through
+  `clock_state_reasons` with the sampler's own words appended. Three cases drive
+  it: refuse-at-stop on both arms and the kill path on the oracle arm.
+
+  **The overwrite refusal cost a full model load, and no longer does.**
+  `gpu_clock_state` refuses to overwrite either file it writes, and since the
+  sampler moved inside the arm that refusal was first evaluated when the ARM
+  opened its window -- for the oracle arm after `LLM(...)`, 702 s on this box.
+  `scripts/dflash2-speed-gate.sh` does `mkdir -p "${EVIDENCE}"` and asked
+  nothing. `clock_evidence_reasons` now runs both `path.exists()` checks inside
+  each arm's `precheck`, the gate threads `--clock-summary` into both
+  `--precheck-only` invocations, and a rerun into a used evidence directory
+  stops before the lease does any work.
+
+  **Two sizes describe this one load and they are not the same measurement.**
+  `out-o26c/c-r1-oracle.log` on the share carries both, from the same
+  `LLM(...)`: `weight_utils.py:858` reports `Checkpoint size: 51.75 GiB` for the
+  target and `3.58 GiB` for the draft, both read off CIFS; `model_runner.py:385`
+  reports `Model loading took 54.87 GiB memory and 702.391374 seconds`, which is
+  what the finished load HOLDS. So 51.75 GiB is the target checkpoint on disk
+  and 54.87 GiB is resident memory. Neither figure was wrong; the two sites that
+  quoted them said "load" for both, and each now names what it measures.
 
   **THREE THINGS STAY OWED, and the next leased run finds them.**
 
@@ -2356,6 +2392,17 @@ list items.
      costs no lease time; `--attention-backend-kwarg` pins the answer once it is
      known, with no code change. A spelling that is ACCEPTED and IGNORED is
      caught by the read-back, which is the refusal #1659 already describes.
+
+     **The fall-through is `TypeError` ONLY, which is a second exposure in the
+     same place.** A wheel that DECLARES `attention_config` and validates its
+     shape raises something else -- a `ValueError`, a pydantic
+     `ValidationError` -- and that propagates and stops the arm rather than
+     trying `attention_backend`. It is named rather than repaired: the failure
+     is loud, it is pre-load so it costs no lease time, and
+     `--attention-backend-kwarg` is the lever. Catching more would be WORSE, in
+     a way that costs a measurement: a wheel that rejects our VALUE would be
+     retried under another spelling and the refusal would then name the wrong
+     cause. Widen it when a second shape is measured, never in advance.
   2. **OUR ARM'S WINDOW SPANS FOUR MODEL LOADS.** `vllm-cli` is one process per
      prompt and loads inside the window, so ours cannot exclude a load the way
      the oracle arm can. If `clock_reasons` refuses it on the 50% busy floor,

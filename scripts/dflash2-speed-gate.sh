@@ -7,10 +7,11 @@
 # procedure in prose and committed none of it
 # (https://github.com/mudler/vllm.cpp/issues/1562). The DFlash2 speed axis is
 # recorded NOT TAKEN, and an unreproducible harness is why a number taken now
-# would be worth little. This script is the runnable procedure: it takes the
-# clock window, drives both arms on an identical workload, folds them into the
+# would be worth little. This script is the runnable procedure: it prechecks
+# both arms, drives them on an identical workload, folds them into the
 # machine-readable result `.agents/benchmark-record.md` can cite, and refuses
-# out loud when a precondition is absent.
+# out loud when a precondition is absent. It does NOT take the clock window --
+# each arm owns its own, for the reason rule 2 gives below.
 #
 # THREE RULES THIS FILE OBEYS, EACH FROM A LOST RUN
 # -------------------------------------------------
@@ -271,16 +272,26 @@ our_common_args=(
 )
 
 echo "== precheck BOTH ARMS (no GPU work yet; the failure that costs a lease is found before the lease)"
+# THE SUMMARY PATHS ARE PASSED HERE TOO, and they are the same two strings the
+# arms are given below. `gpu_clock_state` refuses to overwrite clock evidence,
+# and since the sampler moved inside the arm that refusal first fires when the
+# ARM opens its window -- for the oracle arm after `LLM(...)`, 702 s on
+# `dgx:gpu0` on 2026-08-22. `mkdir -p "${EVIDENCE}"` above asks nothing, so a
+# rerun into a used directory paid a full model load to be told. Threading the
+# paths through the precheck moves that `path.exists()` back before the lease
+# does any work.
 python3 -m tools.bench.dflash2_oracle_capture "${common_args[@]}" --precheck-only \
+  --clock-summary "${EVIDENCE}/clock-vllm.json" \
   > "${EVIDENCE}/precheck.json"
 python3 -m tools.bench.dflash2_our_arm "${our_common_args[@]}" --precheck-only \
+  --clock-summary "${EVIDENCE}/clock-ours.json" \
   > "${EVIDENCE}/precheck-ours.json"
 
 # ONE WINDOW PER ARM, never one window spanning both: a single window cannot
 # see the cross-arm offset, and the offset is the term that transfers into the
 # ratio (#543). `gpu_clock_state` refuses to overwrite existing evidence, so a
 # rerun into a used evidence directory stops rather than silently blending two
-# runs.
+# runs -- in the PRECHECK above, not here.
 #
 # THE ARM OPENS ITS OWN WINDOW, and this script no longer runs the sampler.
 # This file used to start it here and hand the arm the summary path, and

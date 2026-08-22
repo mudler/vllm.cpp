@@ -268,6 +268,18 @@ class ClockWindow:
     quotable, and `build_speed_result` refuses the same record a second time
     through `clock_pairing`.
 
+    **That guarantee held only where a summary EXISTED**, which is not the case
+    the leased run met. `gpu_clock_state.run_sampler` calls `build_clock_record`
+    BEFORE `write_json_atomic`, and it refuses an entirely idle window and a
+    mid-window field change; `query_once` refuses a failed `nvidia-smi`. On any
+    of those the sampler exits 2 with no summary at all, and `close(read=True)`
+    raised out of this block and out of `capture()` -- so the driver's own
+    `write_json_atomic` was never reached and the whole golden went with it. The
+    kill path lost it identically. `__exit__` therefore keeps the failure in
+    `close_error` rather than raising it, `record` stays None, and
+    `clock_state_reasons` refuses on the None with the sampler's own words
+    beside it.
+
     Two things follow from the arm owning it rather than the shell.
 
     1. **The window is the TIMED SPAN.** The oracle arm opens it after
@@ -315,6 +327,12 @@ class ClockWindow:
         ]
         self.argv: list[str] | None = None
         self.record: dict[str, Any] | None = None
+        #: WHY there is no record, when there is none. `close(read=True)` can
+        #: fail three ways -- the sampler exited non-zero, it wrote no summary,
+        #: or it had to be killed -- and none of them may discard the arm that
+        #: already ran. The failure is kept HERE and refused by the driver,
+        #: after the evidence is on disk.
+        self.close_error: str | None = None
         self._process: subprocess.Popen[str] | None = None
 
     def __enter__(self) -> ClockWindow:
@@ -351,7 +369,18 @@ class ClockWindow:
             with contextlib.suppress(Exception):
                 self.close(read=False)
             return False
-        self.close(read=True)
+        # THE ARM RAN. Whatever the sampler did, the legs, the records, the
+        # blocks and the token ids exist and cost a lease, so a clock failure
+        # may not leave by this door: it is RECORDED and the driver refuses on
+        # it once the evidence is written. Raising here is what discarded the
+        # 2026-08-22 run -- `build_clock_record` refuses an entirely idle
+        # window BEFORE `write_json_atomic`, so the sampler exits 2 with no
+        # summary, and `main()` never reached its own `write_json_atomic`.
+        try:
+            self.close(read=True)
+        except HarnessError as error:
+            self.record = None
+            self.close_error = str(error)
         return False
 
     def _await_first_sample(self) -> None:
@@ -415,9 +444,12 @@ def add_clock_arguments(parser: argparse.ArgumentParser) -> None:
         "--clock-summary",
         type=pathlib.Path,
         help="where this arm's OWN sampler writes the window it measured in. The "
-        "file must NOT exist: gpu_clock_state refuses to overwrite clock evidence, "
-        "so a rerun into a used evidence directory stops rather than blending two "
-        "runs",
+        "file must NOT exist, and neither must its sample stream: gpu_clock_state "
+        "refuses to overwrite clock evidence, so a rerun into a used evidence "
+        "directory stops rather than blending two runs. Pass it to --precheck-only "
+        "as well, which is where `clock_evidence_reasons` reads it -- the sampler's "
+        "own refusal fires when the ARM opens its window, and for the oracle arm "
+        "that is after the model load",
     )
     parser.add_argument(
         "--clock-samples",
@@ -445,13 +477,57 @@ def add_clock_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def clock_window(args: argparse.Namespace) -> ClockWindow:
+    # THE TWO TIMEOUTS ARE READ HERE, at call time, rather than inherited from
+    # the constructor's defaults, which bind once at import. Same values; the
+    # difference is that the module constant is the ONE place that sets them,
+    # so a case can drive the kill path in under a second instead of waiting
+    # out `CLOCK_STOP_TIMEOUT_S`.
     return ClockWindow(
         args.clock_summary,
         samples=args.clock_samples,
         interval_s=args.clock_interval,
         max_duration_s=args.clock_max_duration,
         sampler=args.clock_sampler,
+        start_timeout_s=CLOCK_START_TIMEOUT_S,
+        stop_timeout_s=CLOCK_STOP_TIMEOUT_S,
     )
+
+
+def clock_evidence_reasons(args: argparse.Namespace, *, label: str) -> list[str]:
+    """Refuse a USED evidence directory in the phase that costs nothing.
+
+    `gpu_clock_state.run_sampler` refuses to overwrite either of the two files
+    it writes, which is right: blending two runs into one window is worse than
+    stopping. Since the sampler moved INSIDE the arm (#1657) that refusal is
+    first evaluated when the arm opens its window, and for the ORACLE arm that
+    is after `LLM(...)` -- 702 s of model load on `dgx:gpu0` on 2026-08-22, and
+    the shell's own `mkdir -p "${EVIDENCE}"` asks nothing.
+
+    It is a `path.exists()` on two paths. It needs no GPU, no wheel and no
+    lease, so it belongs in the phase whose stated purpose is that the failure
+    costing a lease is found before the lease. The check is HERE rather than in
+    the shell because both arms take the flag and the tests drive both `main()`
+    entry points from CPU CI.
+    """
+
+    summary = getattr(args, "clock_summary", None)
+    if summary is None:
+        return []
+    summary = pathlib.Path(summary)
+    declared = getattr(args, "clock_samples", None)
+    samples = (
+        pathlib.Path(declared)
+        if declared is not None
+        else default_clock_samples_path(summary)
+    )
+    return [
+        f"clock: {path} already exists, so the {label} arm's sampler would refuse "
+        "to overwrite clock evidence the moment it started -- which is AFTER the "
+        "model load. Point --clock-summary at an unused evidence directory, or "
+        "move the finished run aside; never blend two runs into one window"
+        for path in (summary, samples)
+        if path.exists()
+    ]
 
 
 def precheck(args: argparse.Namespace, env: Mapping[str, str]) -> dict[str, Any]:
@@ -506,6 +582,7 @@ def precheck(args: argparse.Namespace, env: Mapping[str, str]) -> dict[str, Any]
     reasons += model_binding_reasons(models, artifacts, label="vllm")
     reasons += repeat_reasons(args.repeat, label="vllm")
     reasons += build_recipe_reasons(harness_build, label="ours")
+    reasons += clock_evidence_reasons(args, label="vllm")
     # NOT `build_recipe_reasons`: that only asks whether the block is populated,
     # and the block was populated with OUR revision. `oracle_build_reasons` holds
     # it to the oracle head this same run declares.
@@ -570,10 +647,21 @@ def resolve_attention_backend_groups(llm: Any) -> dict[str, Any]:
     ([#1658](https://github.com/mudler/vllm.cpp/issues/1658)).
 
     A MISS is a named `miss` and never an empty map, because an empty map reads
-    as "one backend" -- the exact false claim this field exists to prevent. It
-    does not raise: the map is descriptive, the SCALAR is what the ratio is
-    compared against, and a stopped 51.75 GiB run is the wrong answer to a moved
-    attribute (the rule `read_anchors` already follows).
+    as "one backend" -- the exact false claim this field exists to prevent. The
+    map is descriptive, the SCALAR is what the ratio is compared against, and a
+    stopped 51.75 GiB run is the wrong answer to a moved attribute (the rule
+    `read_anchors` already follows).
+
+    **It traps TWO exceptions and no more**: `AttributeError` from the walk,
+    which is how a moved attribute presents, and `TypeError` from iterating what
+    the walk returned, which is how a changed container presents. Those are the
+    two shapes measured on this wheel. Anything else -- a property that raises
+    on access, a `__getattr__` that raises `RuntimeError` -- propagates and
+    stops the arm, which is the outcome the paragraph above says is wrong. A
+    broader `except Exception` is worse: it would swallow a defect in this
+    function itself and record a `miss` that blames the wheel. So the narrowness
+    is deliberate and the exposure is named rather than claimed away; widen the
+    tuple when a THIRD shape is measured, never in advance.
     """
 
     tried: list[str] = []
@@ -915,6 +1003,17 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
     # beyond-pin head, so both are tried in order and a wheel that takes
     # neither is a LOUD REFUSAL naming both -- a `TypeError` from `EngineArgs`
     # is raised before anything loads, so the search costs no lease time.
+    #
+    # THE FALL-THROUGH IS `TypeError` ONLY, and that is a real exposure rather
+    # than an oversight. A wheel that DECLARES `attention_config` and validates
+    # its shape would raise something else -- `ValueError`, a pydantic
+    # `ValidationError` -- and that propagates and stops the arm instead of
+    # trying `attention_backend`. It is not repaired here because the failure is
+    # loud, it is pre-load so it costs no lease time, and the lever already
+    # exists: `--attention-backend-kwarg` pins the spelling this wheel takes and
+    # skips the search entirely. Catching more would be worse -- a wheel that
+    # rejects our VALUE would then be retried under another spelling and the
+    # refusal would name the wrong cause. O28 carries this as owed.
     declared = str(args.attention_backend or "").strip()
     spellings: tuple[str, ...] = ()
     if declared:
@@ -991,10 +1090,25 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
     records: list[dict[str, Any]] = []
     legs: list[dict[str, Any]] = []
     # THE WINDOW IS THE TIMED SPAN, and the arm owns it. It opens here, after
-    # `LLM(...)` has loaded, so the 51.75 GiB load is outside it -- a window
-    # spanning that load is mostly idle samples and `clock_reasons` floors the
-    # retained window at 50% busy. `ClockWindow.__enter__` returns only once
-    # the sampler has taken its first sample, so no leg runs outside it (#1657).
+    # `LLM(...)` has loaded, so the load is outside it -- a window spanning that
+    # load is mostly idle samples and `clock_reasons` floors the retained window
+    # at 50% busy. `ClockWindow.__enter__` returns only once the sampler has
+    # taken its first sample, so no leg runs outside it (#1657).
+    #
+    # TWO SIZES DESCRIBE THIS ONE LOAD AND THEY ARE NOT THE SAME MEASUREMENT.
+    # Both come off the same `dgx:gpu0` run on 2026-08-22, in
+    # `out-o26c/c-r1-oracle.log` on the share:
+    #
+    #   weight_utils.py:858  Checkpoint size: 51.75 GiB   <- the TARGET on disk
+    #   weight_utils.py:858  Checkpoint size: 3.58 GiB    <- the DRAFT on disk
+    #   model_runner.py:385  Model loading took 54.87 GiB memory and
+    #                        702.391374 seconds           <- what it COST
+    #
+    # So 51.75 GiB is the target checkpoint read from CIFS, and 54.87 GiB is the
+    # memory the finished load holds, target plus draft plus the runtime's own.
+    # This file says "a 51.75 GiB load" as shorthand for the read that dominates
+    # the 702 s; where a number stands for RESIDENT memory it is 54.87 GiB and
+    # says so.
     window = clock_window(args)
     with window:
         for index, prompt in enumerate(checked["prompts"]):
@@ -1063,6 +1177,10 @@ def capture(args: argparse.Namespace, checked: Mapping[str, Any]) -> dict[str, A
         # HOW THE ENGINE WAS ASKED, so the next run does not search again.
         "attention_backend_kwarg": accepted_kwarg,
         "clock": window.record,
+        # NULL on a healthy run. When the window is absent this says WHY, in
+        # the sampler's own words, so the kept evidence carries its own
+        # diagnosis rather than an unexplained missing key.
+        "clock_error": window.close_error,
         "speculator_seam": f"{args.speculator_module}.{args.speculator_class}.propose",
         "hook_stats": recorder.stats(),
         "draft_hook_installed": True,
@@ -1163,7 +1281,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output is not None:
         write_json_atomic(args.output, record)
     require_no_reasons(
-        clock_state_reasons(record.get("clock"), label="vllm"),
+        clock_state_reasons(
+            record.get("clock"),
+            label="vllm",
+            # THE SAMPLER'S OWN WORDS, when it produced no summary to judge.
+            # Without them the refusal cannot separate an idle window from a
+            # dead `nvidia-smi`, and the next run pays a lease to find out.
+            detail=str(record.get("clock_error") or ""),
+        ),
         what="DFlash2 oracle capture",
     )
     print(canonical_json(record))

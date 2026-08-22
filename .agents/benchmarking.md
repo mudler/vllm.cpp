@@ -65,7 +65,13 @@ exist before it, and both cannot hold
 precondition of the MEASUREMENT and not of the arm's execution**: the arm runs,
 its sampler stops, the summary is written, and only then is it read and judged —
 and a run whose window turns out unusable writes its evidence and still yields no
-number. A new harness that takes a window around work it drives itself should
+number. **That last clause is load-bearing on the branch where the sampler
+writes NOTHING**, which is the one the leased run met: this helper builds the
+record before it writes it, and it refuses an entirely idle window, so the
+sampler exits 2 with no summary at all. A window object that raises there
+discards the arm that already ran — every leg, record and token id — so it
+records the failure instead and lets the driver refuse once the evidence is on
+disk. A new harness that takes a window around work it drives itself should
 take the same shape. The
 trace and per-kernel harnesses — `finalize_*_trace.py`,
 `summarize_torch_kernels.py`, `gdn_packed_component.py` — are **not wired**, so

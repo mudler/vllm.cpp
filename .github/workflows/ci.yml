@@ -375,6 +375,20 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: The benchmark-tool suites actually run (#1646)
+        # `tests/tools/` carried 351 cases across 20 suites that NO lane
+        # executed: not this workflow, not CTest, not preflight. The parity
+        # ledger quotes them as evidence ("all tools 34/34"), so they were
+        # believed to be gating while being reachable only by an agent who
+        # typed the command by hand. A suite nobody runs is not a weak gate, it
+        # is no gate, and the two are indistinguishable from the outside.
+        #
+        # DISCOVERED, not enumerated: an enumeration is a shared file every new
+        # suite must edit, which is the record-lock shape AGENTS.md §Records
+        # forbids. Standard library only, no GPU, no vLLM wheel; 21.1 s
+        # measured.
+        run: |
+          python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
       - name: A citation that names a symbol still finds it (#1143, #1139)
         # The tree already carried 539 `path::Symbol` citations and had never
         # checked one. Line anchors are what rot: one 45-line insertion near the

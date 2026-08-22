@@ -1830,6 +1830,19 @@ list items.
   that reading is now unauditable. The TRITON_ATTN golden's label WAS read back
   off the built engine and is not affected.
 
+  **THE RULE IS NOW A COMMITTED REFUSAL, AND THE LABEL IS STILL WRONG.**
+  `tools/bench/dflash2_speed_harness.py::attention_backend_reasons` admits
+  exactly one provenance, `read_back_from_engine`, and
+  `tools/bench/dflash2_oracle_capture.py::resolve_attention_backend` is the only
+  thing that produces that string -- it walks the BUILT engine and REFUSES when
+  no probe resolves, rather than falling back to the request kwarg.
+  `tests/tools/test_dflash2_speed_harness.py` drives the golden's own relabel
+  sentence through the checker and requires the refusal, so the #1562 defect
+  cannot be reintroduced verbatim. What that does NOT do is repair the committed
+  `FLASH_ATTN` golden: its label was never read back, the log it was corrected
+  from was lost with the lease, and only a RE-CAPTURE can give it a provenance.
+  That capture is owed under O26.
+
   **Taking both bought something the row needed anyway: A CONTROL ON THE NEAR-TIE
   ENVELOPE, measured on vLLM AGAINST ITSELF.** Same wheel, same host, same
   workload, same k, greedy, `max_num_seqs` 1, FULL decode graphs on both — only
@@ -1887,15 +1900,25 @@ list items.
      preconditions it checked were TRUE and the instrument was still blind. The
      hook moved to `propose`, below the branch.
 
-  **AND NONE OF THE REPAIRED INSTRUMENT IS COMMITTED**
-  ([#1562](https://github.com/mudler/vllm.cpp/issues/1562)). This entry exists so
-  the next agent does not pay the three 51.75 GiB loads again, and it describes
-  the hook on `propose` below the `cg_mode == FULL` branch, the
-  `torch.cuda.is_current_stream_capturing()` delegation, the backend read-back
-  and the abort-on-zero -- as PROSE. There is no script in the tree, no run log
-  and no `w6-relabel.py`. So the next agent rewrites the harness from this
-  paragraph, which is exactly the cost this entry was written to prevent, and the
-  entry is only half of what it claims to be until the code lands beside it.
+  **THE REPAIRED INSTRUMENT IS NOW COMMITTED**
+  ([#1562](https://github.com/mudler/vllm.cpp/issues/1562)). Every element this
+  entry described as prose is code in the tree, and the paragraph above is now
+  the ARGUMENT for the code rather than a substitute for it:
+
+  | O23 element | Where it lives |
+  |---|---|
+  | the hook on `propose`, below the `cg_mode == FULL` branch | `tools/bench/dflash2_oracle_capture.py::DraftRecorder.install` |
+  | `torch.cuda.is_current_stream_capturing()` delegation | the same, counted as `skipped_capture` |
+  | the in-process client assertion, on the RESOLVED CLASS | `::_assert_inproc_client` |
+  | the resolved-backend read-back off the built engine | `::resolve_attention_backend` |
+  | the abort on zero, and the one-sided bound | `tools/bench/dflash2_speed_harness.py::hook_reasons` |
+  | the refusal gate over all of it, on CPU, with no wheel | `tests/tools/test_dflash2_speed_harness.py` |
+  | the lease-side procedure, with the marker written from `trap ... EXIT` | `scripts/dflash2-speed-gate.sh` |
+
+  What is NOT recovered: `w6-relabel.py` and the W6 run log were lost with the
+  lease and are recorded here as lost rather than owed, because nothing can
+  reconstruct them. The committed harness is what makes the NEXT capture
+  re-derivable; it cannot make the previous one so.
 
   A related residual the harness would explain and nothing currently does: the
   TRITON_ATTN golden's `hook_stats` reads
@@ -2029,6 +2052,54 @@ list items.
   `FromModelDir`'s exists on purpose so a misclassified draft is caught before a
   51.75 GiB target is mapped -- plus a test that loads a DFlash2 draft through a
   production entry point and asserts the paragraph occurs exactly once.
+
+- **O26 — the harness is committed and the MEASUREMENT is not taken, and three
+  parts of it cannot be taken from a keyboard.** Owner: `SPEC-DFLASH2`. Issue
+  [#1562](https://github.com/mudler/vllm.cpp/issues/1562).
+
+  What landed 2026-08-21 is the instrument and every refusal around it, gated on
+  CPU with no GPU and no wheel:
+
+  ```sh
+  scripts/dflash2-speed-gate.sh --self-check     # syntax only, touches no GPU
+  python3 -m unittest tests.tools.test_dflash2_speed_harness
+  ```
+
+  and, on a leased `dgx:gpu0`, the whole procedure end to end:
+
+  ```sh
+  rc run --device dgx:gpu0 -- scripts/dflash2-speed-gate.sh \
+      --evidence /workspace/evidence/dflash2-speed \
+      --target /workspace/ckpt/qwen3.8-27b-hf \
+      --draft /workspace/dflash2/draft-st \
+      --oracle-commit <the merged head #1561 selects> \
+      --attention-backend TRITON_ATTN \
+      --artifact target=<path>=<sha256> --artifact draft=<path>=<sha256> \
+      --our-binary /workspace/build/bin/vllm-cli \
+      --our-model <our target> \
+      --our-speculative-config '{"model":"<our drafter>","num_speculative_tokens":7}' \
+      --our-build-recipe "<the exact cmake line>"
+  ```
+
+  **Three residuals, each stated because a harness that hides one is worse than
+  none:**
+
+  1. **`BACKEND_PROBES` is UNVERIFIED against the beyond-pin wheel.** The
+     authoring host has no wheel at that head, so the three dotted walks are
+     candidates read off the pinned tree's object graph. A stale list is a LOUD
+     REFUSAL naming every probe it tried -- never a fallback and never a
+     plausible label -- so the failure mode is a stopped run, and the repair is
+     one entry. It is written down because "the probe list is right" is a claim
+     nobody has measured.
+  2. **`ttft_ms` and `peak_device_bytes` are NOT MEASURED on our arm.**
+     `examples/cli` reports wall time and completion tokens and nothing else, so
+     `axis_rows` renders both axes `NOT MEASURED` rather than imputing them. Two
+     of the three axes `AGENTS.md` §Gates requires are therefore open, and the
+     result object says so in the field a reader looks at first.
+  3. **Inside a lease the SM clock can be SAMPLED and NOT PINNED** (`LGC_RC=4`
+     even as root, #1354), so a pairing may be refused on within-run spread with
+     no lever to fix it. The harness does not attempt `-lgc` and does not pretend
+     the window was pinned.
 
 ## Now
 
@@ -2746,7 +2817,8 @@ suites there with zero skips; what is stale is the "never compiled here" gloss i
 the `Owed after W5` line above, which this line supersedes), O12 (the probabilistic arm), O13
 (a GGUF drafter's bf16 residency, 3.584 GiB against 1.06 GiB on disk), O15 (the
 three output-scalar GGUF key spellings), O21 (now a MERGED upstream, #1538 and
-#1561) and O22/O23. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
+#1561), O22/O23 (HALF discharged 2026-08-21: the instrument is committed, the
+run is not taken) and O26. O16 is SETTLED by W6. O6, O7, O8, O18, O19 and O20 stay
 discharged.
 
 **And five things this row owes that W6 did not name**, all opened by the repair
@@ -2756,13 +2828,20 @@ wave on 2026-08-21:
    [#1561](https://github.com/mudler/vllm.cpp/issues/1561). `## Gates` G2's own
    rule selects `b389ac29`; the W6 capture is dated at `66e5414c` and re-reading
    G2/G3 at the merged head is owed. O21's parked D12 decision comes due with it.
-2. **The oracle capture harness exists only as PROSE.**
-   [#1562](https://github.com/mudler/vllm.cpp/issues/1562). O22 and O23 describe
-   the repaired hook, the backend read-back, the abort-on-zero and
-   `w6-relabel.py`; none of it, and no run log, is in the tree. The next agent to
-   instrument this oracle rewrites it, which is the cost O23 was written to
-   prevent. The FLASH_ATTN golden's post-hoc backend label and O17's
-   unreproducible discharge are the same issue.
+2. **The oracle capture harness is COMMITTED as of 2026-08-21, and the
+   measurement is still not taken.**
+   [#1562](https://github.com/mudler/vllm.cpp/issues/1562). O23's table names
+   where each described element now lives:
+   `tools/bench/dflash2_speed_harness.py` (the preconditions and every refusal),
+   `tools/bench/dflash2_oracle_capture.py` (the hook on `propose`, the in-process
+   client assertion, the backend read-back), `tools/bench/dflash2_our_arm.py`
+   (our arm, through the public ABI only), `scripts/dflash2-speed-gate.sh` (the
+   lease-side procedure, marker written from `trap ... EXIT`) and
+   `tests/tools/test_dflash2_speed_harness.py` (63 cases, CPU, no GPU and no
+   wheel). `w6-relabel.py` and the W6 run log are recorded LOST WITH THE LEASE
+   rather than owed. What remains owed is O26: the run itself, on the head #1561
+   selects, which is also the only thing that can give the FLASH_ATTN golden's
+   label a provenance.
 3. **The two divergent draft blocks are UNATTRIBUTED.**
    [#1564](https://github.com/mudler/vllm.cpp/issues/1564). The instrument is
    named — the top-2 candidate margin at the flipping slot, on both sides — and

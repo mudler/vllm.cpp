@@ -372,6 +372,18 @@ run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
 run "commit style suites" python3 -m unittest \
   tests.scripts.test_check_commit_style
+# THE BENCHMARK-TOOL SUITES, which nothing ran until #1646. `tests/tools/` held
+# 351 cases across 20 suites -- the oracle pin, the clock-state assertions, the
+# online-gate client and summary, the serve-low request-set completeness -- and
+# no workflow, no CTest registration and no preflight line executed one of them.
+# They were quoted as evidence ("all tools 34/34") in the parity ledger while
+# being reachable only by an agent who happened to type the command.
+#
+# DISCOVERED rather than enumerated. An enumeration is a shared list every new
+# suite must edit, which is the record-lock shape AGENTS.md §Records forbids;
+# discovery makes the file's existence the registration. Measured at 21.1 s,
+# standard library only, no GPU and no wheel.
+run "tools suites" python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
 # --staged block: `--staged` inspects staged paths and is therefore VACUOUS after

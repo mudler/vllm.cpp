@@ -12,9 +12,10 @@
 `9035151d6`, last touched `170592a93` (2026-08-13,
 [vllm#52172](https://github.com/vllm-project/vllm/pull/52172) "Disable sequence
 parallelism for Dots3 NOTE"). **NOT present at our parity pin.**
-**Designated CUDA host (developer directive, 2026-08-14):** Thor
-`192.168.68.23` for end-to-end verification. §6.3 records what that host can and
-cannot carry for this model, measured.
+**Designated CUDA host (developer directive, 2026-08-14):** Thor, reached as the
+fleet device **`thor:gpu0` through an `rc` lease and never by `ssh`** — the host
+address is recorded in `environment.md` to identify the box, not as a way into
+it. §6.3 records what that host can and cannot carry for this model, measured.
 **Status:** W0 — spec committed, no engine code, nothing built, nothing
 downloaded, no GPU used.
 
@@ -371,8 +372,10 @@ and unlike that row there is no smaller published checkpoint to retreat to.
 
 ### 6.3 Thor as the designated e2e host — what it can carry
 
-Developer directive 2026-08-14: use `192.168.68.23` as the CUDA host for
-end-to-end verification. Probed read-only the same day:
+Developer directive 2026-08-14: use Thor as the CUDA host for end-to-end
+verification. Reach it as the fleet device `thor:gpu0` through an `rc` lease and
+never by `ssh`; [environment.md](../environment.md) carries the recipe. Probed
+read-only over `ssh` on 2026-08-14, before that rule existed:
 
 ```
 hostname   kairos-4db2      aarch64, 14 cores
@@ -383,27 +386,44 @@ nvidia-smi refuses under non-interactive ssh:
            "NvRmMemInitNvmap failed: error Permission denied"
 ```
 
+**Two of those five lines are false now, and the block stays as the probe it
+was rather than being corrected in place.** Free disk read 362 GB when it was
+measured again on 2026-08-15, and `nvidia-smi` does not refuse. The points below
+carry both corrections.
+
 Three facts follow, and they are recorded rather than worked around.
 
-1. **Thor cannot host the oracle for this model.** 290 GB FP8 exceeds both its
-   122 GB of RAM and its 123 GiB of free disk — the checkpoint will not even
-   land. Designating the host does not change §6.2; it fixes *where our arm and
-   our unit gates run*, which is a real and separate thing.
-2. **Thor needed provisioning first** (W0.5) — **DONE 2026-08-15**, recipe and
-   `ctest` baseline in [environment.md](../environment.md). Two corrections to
-   the read-only probe above. `nvidia-smi` was never broken: it works under
-   `sudo -n` and fails only unprivileged, so `NvRmMemInitNvmap failed:
-   Permission denied` was a privilege problem, not a driver one. And the
-   toolchain does not go on the host at all — `/` is a read-only loop on an
-   immutable image, so the CUDA toolkit lives in a digest-pinned container and
-   the box keeps no host CUDA. Free disk on `/home` measured 362 GB, not the
-   123 GiB the earlier probe read. Still owed if oracle work is ever wanted
-   here: a vLLM build, which §6.2 says cannot serve THIS model regardless.
-3. **Thor's standing traps apply.** `vm.overcommit_memory=1` with zero swap: the
-   kernel grants memory it cannot back and touching those pages takes the whole
-   machine down (observed three times on 2026-08-11). Any run here is sized
-   conservatively and never `-j` parallel across model gates. The reimage changed
-   the host key.
+1. **Thor cannot host the oracle for this model, and the reason is RAM.** The
+   290 GB FP8 checkpoint is more than twice the box's 122 GB of memory, so the
+   model cannot be resident whatever the disk holds. **The disk half of this
+   argument is WITHDRAWN.** W0 wrote it as "290 GB exceeds both its 122 GB of
+   RAM and its 123 GiB of free disk — the checkpoint will not even land", and
+   the very next measurement of the same volume read 362 GB free, which is more
+   than 290. On that number the checkpoint lands and then fails to load. Both
+   probes were correct when they were taken, which is the point: free space is
+   not a stable premise and a memory ceiling is. Designating the host does not
+   change §6.2; it fixes *where our arm and our unit gates run*, which is a real
+   and separate thing.
+2. **Thor needed provisioning first** (W0.5) — **DONE 2026-08-15, and its
+   recipe was REPLACED on 2026-08-19**; both the recipe and the `ctest` baseline
+   live in [environment.md](../environment.md). Two corrections to the read-only
+   probe above. `nvidia-smi` was never broken: it runs plainly inside a leased
+   worker, exit 0, with no `NvRm` line at all, so `NvRmMemInitNvmap failed:
+   Permission denied` was a privilege artefact of the unprivileged `ssh` shell
+   and not a driver fault. And the toolchain does not go on the host at all —
+   `/` is a read-only loop on an immutable image, so the box keeps no host CUDA
+   and the CUDA 13.0.88 toolkit comes from the leased worker's own
+   `/usr/local/cuda`. Free disk on `/home` measured 362 GB, not the 123 GiB the
+   earlier probe read. Still owed if oracle work is ever wanted here: a vLLM
+   build, which §6.2 says cannot serve THIS model regardless.
+3. **Thor's standing traps apply.** `vm.overcommit_memory=1`: the kernel grants
+   memory it cannot back and touching those pages takes the whole machine down
+   (observed three times on 2026-08-11). Any run here is sized conservatively
+   and never `-j` parallel across model gates. **The "zero swap" half of that
+   trap is now stale** — a leased worker read 30 GiB of swap, all free, on
+   2026-08-19 — but the reboots were observed and the hazard stands; see
+   [environment.md](../environment.md) for the measurement and what it does and
+   does not change.
 
 What Thor *is* good for on this row: sm_110 runtime coverage (it is our only
 non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate in
@@ -455,36 +475,95 @@ dispatchable in order, under the constraints that answer imposes.
 
 - **W0 — scope (this).** Arch map, reuse-vs-new, config traps, quant/HW fit,
   oracle plan, rows. **DONE.**
-- **W0.5 — provision Thor. DONE 2026-08-15.** The recipe is
-  [environment.md](../environment.md), under the Jetson Thor profile: a
-  digest-pinned CUDA 13.0.1 container (nvcc 13.0.88, cmake 3.28.3, ninja 1.11.1)
-  run `--runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1` over a `git archive`
-  checkout on `/home`. A HOST toolchain was rejected on evidence, not taste:
-  `/` is a read-only 4.4 G loop on an immutable Kairos image, so `apt install`
-  into it does not exist. The build is CUDA-real and proved three ways —
-  configure prints `CUDA target architectures: 110`, all 30 `*.cu.o` carry
-  exactly one `sm_110` cubin each, and `libvllm.so` links `libcudart.so.13`. A
-  kernel ran on the device: `test_cuda_backend` reports `sm_110`,
-  `integrated=1`, `UnifiedMemory=true`, 25/25 assertions.
+- **W0.5 — provision Thor. DONE 2026-08-15; recipe REPLACED 2026-08-19.** The
+  recipe is [environment.md](../environment.md), under the Jetson Thor profile:
+  one `rc run -d thor:gpu0` job that builds and tests inside the leased worker,
+  which carries cmake 3.28.3, ninja 1.11.1, gcc 13.3.0 and python3, and which
+  apt-installs the CUDA toolkit as a step because **the toolkit is NOT in the
+  worker image** — both of this lane's jobs found nvcc already present and both
+  were reading another job's leftover install in a long-lived container. **The
+  recipe this row first landed is withdrawn, not merely superseded.** It
+  prescribed `ssh` to the box plus `sudo -n docker build` and `sudo -n docker
+  run` against a digest-pinned image, which bypasses the GPU lease and makes the
+  fleet report the box free while a job is on it. The image was also
+  unnecessary: a job installs the toolkit itself in one step, which is what
+  `dgx:gpu0` jobs already do (#1213). A HOST toolchain was
+  and remains rejected on evidence rather than taste — `/` is a read-only 4.4 G
+  loop on an immutable Kairos image, so `apt install` into it does not exist.
+  The build is CUDA-real, and the proof is now two checks rather than three:
+  configure prints `CUDA target architectures: 110`, and `libvllm.so` links
+  `libcudart.so.13` and `libcublasLt.so.13` over 32 `*.cu.o` objects. **The
+  third check cannot be run as W0.5 wrote it** — it called for
+  `cuobjdump --list-elf`, and `cuobjdump` is absent from the leased worker even
+  after the CUDA `PATH` prepend, so the command yields an empty result that
+  looks like a clean one. `environment.md` records the fix and marks
+  "30 objects, one `sm_110` cubin each" as an unverified 2026-08-15 claim. A
+  kernel does run on the device: `test_cuda_backend` reports `sm_110`,
+  `integrated=1`, `UnifiedMemory=true`, 6/6 cases and 25/25 assertions.
 
   **The gate as written — "the existing suite passes there" — is NOT met, and
-  it was the wrong gate.** At `2daa3287f` the baseline is 485 tests, **468
-  passed / 2 skipped / 15 red**. Four are the build correctly refusing what
-  sm_110 does not have (no vendored FA-2), two are tests that hardcode GB10, two
-  are already red on GB10, and six are one FP8 defect
-  ([#960](https://github.com/mudler/vllm.cpp/issues/960)). None of those can be
+  it was the wrong gate.** Re-measured at `0764ded2b` on 2026-08-19 inside an
+  `rc run -d thor:gpu0` lease, the baseline is 553 tests, **534 passed /
+  3 skipped / 16 red** (`ctest -j1`, 419.97 s). It read 485 tests / 15 red at
+  `2daa3287f`. A further re-measurement at `944d7d947` reached configure and
+  then lost the box to a `worker_lost` event, so **the baseline is STALE by 144
+  commits** — 100 of them touching `src/`, `include/`, `tests/` or
+  `CMakeLists.txt` — and says so; re-measuring is owed under
+  [#955](https://github.com/mudler/vllm.cpp/issues/955).
+
+  **The 16 split into seven causes, and the split is non-overlapping so it sums
+  to 16.** An earlier draft's tally reached only 15, because the three
+  `qwen3_5_gdn_spec_routing` tests belong to two descriptions at once and were
+  counted under neither cleanly. They are counted once below, under GB10, with
+  the second fact noted rather than added.
+
+  | Cause | Count | Tests |
+  |---|---:|---|
+  | no vendored FA-2 — the build correctly refusing what the arch lacks | 4 | `test_deepseek_v2_forward`, `test_ops_mla_prefill`, `test_ops_mla_chunked_context`, `test_mla_attention_block` |
+  | the TEST hardcodes GB10 | 2 | `test_platform` (sm_12x family), `test_op_parity` (a dgx-only golden that runs anyway) |
+  | already red on GB10, so not an sm_110 fact ([#907](https://github.com/mudler/vllm.cpp/issues/907)) | 5 | `test_linear_method`, `test_capi`, and the three `qwen3_5_gdn_spec_routing` tests — which ALSO improved `SEGFAULT` → `Failed` here, counted once |
+  | FP8 ops falling through to the portable tier and crashing ([#1725](https://github.com/mudler/vllm.cpp/issues/1725) — **not** [#960](https://github.com/mudler/vllm.cpp/issues/960), closed three days before the measurement) | 2 | `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda` |
+  | an absent `shellcheck`, an instrument not a verdict ([#961](https://github.com/mudler/vllm.cpp/issues/961)) | 1 | `test_serve_low_tools` |
+  | the live Marlin NVFP4 disagreement ([#962](https://github.com/mudler/vllm.cpp/issues/962)) | 1 | `test_ops_moe_grouped` |
+  | arrived since 2026-08-15, UNATTRIBUTED | 1 | `test_gguf_device_fit_reach` |
+  | **total** | **16** | |
+
+  None of those can be
   made green by this row and none is this row's debt. Asking for "all green" on
   a host whose arch legitimately lacks features would either block every brick
   forever or invite someone to weaken a test to pass. **The gate that actually
-  binds is therefore differential: a row regresses on Thor only if it lengthens
-  that list.** The list itself, with per-test first-failing assertions, is
+  binds is therefore differential, over `(name, failure mode)` PAIRS: a row
+  regresses on Thor when it adds a name, or changes a recorded mode FOR THE
+  WORSE — worst first, `SEGFAULT`/`Subprocess aborted`/`Timeout`, then `Failed`,
+  then `Skipped`/`Not Run`, then passing. A crash becoming a clean assertion
+  failure is progress rather than a regression, and this lane's own run saw
+  three such improvements, so the direction is not a hypothetical refinement.
+  `Skipped` ranks BELOW `Failed`: a red test that starts skipping has stopped
+  being measured, not started passing, and three tests already skip here for an
+  absent checkpoint. A name leaving the list therefore counts as an improvement
+  only when it has been SEEN to pass.** The list
+  itself, with a mode and a first-failing assertion per test, is
   [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110 counterpart
   of [#907](https://github.com/mudler/vllm.cpp/issues/907).
 
-  That gate has to be re-derived, not remembered: the baseline was measured at
-  two SHAs a few hours apart and it MOVED (484/14 → 485/15), because a change on
-  `main` turned a clean FP8 refusal into a segfault. **Re-measure whenever the
-  base moves across `src/`, `tests/` or `CMakeLists.txt`.**
+  **"Only if it lengthens the list" is what this gate said when W0.5 landed, and
+  it is provably too weak.** Counting names scores a crash as no change. Between
+  `5a0ffe9e3` and `2daa3287f` five tests went `Failed` → `SEGFAULT` with no name
+  change, and the list grew by one only because the same upstream change also
+  shipped a new test file. A name-counting gate would have scored
+  [#960](https://github.com/mudler/vllm.cpp/issues/960) GREEN on five of the six
+  crashes it introduced. The mode column is part of the baseline, not
+  decoration, and it costs no extra measurement because `ctest` prints the mode
+  beside every failure.
+
+  That gate has to be re-derived, not remembered, and it has now moved twice.
+  Two SHAs a few hours apart on 2026-08-15 read 484/14 → 485/15, because a
+  change on `main` turned a clean FP8 refusal into a segfault. Four days later
+  at `0764ded2b` it reads 553/16: three names arrived, two left, and the three
+  `qwen3_5_gdn_spec_routing` tests went `SEGFAULT` → `Failed`, which a
+  name-counting gate would have reported as a single regression and nothing
+  else. **Re-measure whenever the base moves across `src/`, `include/`,
+  `tests/` or `CMakeLists.txt`.**
 
   Two consequences this row carries forward. Thor's MLA prefill throws rather
   than computes, so the W3/W4 attention bricks cannot be verified end to end
@@ -584,22 +663,52 @@ W0 complete; **§6.4 answered on 2026-08-15 with option B**, so the row is no
 longer blocked on a decision. **W0.5 landed the same day.** The row stays
 `SPIKE` until W1 lands code — provisioning a host is not porting a model.
 
-**W0.5 — DONE.** Thor at `192.168.68.23` builds vllm.cpp with CUDA ON for
-sm_110 in a digest-pinned CUDA 13.0.1 container, runs kernels on the device, and
-has a recorded `ctest` baseline of 468 passed / 2 skipped / **15 red** of 485 at
-`2daa3287f`. The full recipe — image digest, the three container flags, the
-build command, why `nvidia-smi` needs `sudo -n`, and the per-test failure table
-— is in [environment.md](../environment.md) under the Jetson Thor profile, not
-here: Thor is the project's only non-GB10 CUDA host, so it belongs to every row
-that wants sm_110 coverage rather than to this one. The earlier probe's
-"`nvidia-smi` refuses" reading was a privilege problem, and the toolchain lives
-in a container because `/` is a read-only loop on an immutable image.
+**W0.5 — DONE, and its RECIPE was replaced on 2026-08-19.** `thor:gpu0` builds
+vllm.cpp with CUDA ON for sm_110, runs kernels on the device, and has a recorded
+`ctest` baseline. The full recipe — how to stage a tree for the lease, the one
+`PATH` prepend that produces `nvcc`, the build and `ctest` flags, the corrected
+`nvidia-smi` reading and the per-test failure table — is in
+[environment.md](../environment.md) under the Jetson Thor profile, not here:
+Thor is the project's only non-GB10 CUDA host, so it belongs to every row that
+wants sm_110 coverage rather than to this one.
+
+**What the first version of W0.5 got wrong, corrected in place because `main`
+is never rewritten.** It prescribed `ssh` to the box plus `sudo -n docker build`
+and `sudo -n docker run` against a digest-pinned image. That reaches a fleet
+device outside its lease, so the fleet reports `thor:gpu0` free while a job is
+on it, and the image was never needed — the leased worker already carries nvcc
+13.0.88, cmake 3.28.3, ninja 1.11.1 and python 3.12.3. The recipe is deleted
+rather than kept as an alternative. Two of its factual claims went with it: that
+`nvidia-smi` "dies" unprivileged, which was reading a successful report's stderr
+as a verdict, and that `shellcheck` was in the recorded Dockerfile, which its
+package list never contained.
+
+**Baseline, re-measured in the environment now prescribed:** `0764ded2b`,
+`ctest -j1` inside an `rc run -d thor:gpu0` lease, 419.97 s — **553 tests, 534
+passed / 3 skipped / 16 red.** **It is STALE by 144 commits** — 100 of them
+touching `src/`, `include/`, `tests/` or `CMakeLists.txt`, 319 files and
++76,570 lines — because the re-measurement at `944d7d947` lost the box mid-build.
+One of those commits, `cffe59b02`, rewrites the reference-tier dispatch this
+baseline names as the cause of its two FP8 SEGFAULTs, on the unified-memory axis
+that Thor sits on, so those two rows are specifically suspect. Stated in
+`environment.md` and owed under
+[#955](https://github.com/mudler/vllm.cpp/issues/955) rather than papered over. One of the 16, `test_serve_low_tools`, is the
+absent `shellcheck` ([#961](https://github.com/mudler/vllm.cpp/issues/961)) and
+is carried as a named entry rather than installed away; the same job proved it
+is exactly the instrument by installing `shellcheck` and re-running that test
+alone to green.
 
 The W0.5 gate as originally written ("the existing suite passes there") is not
 met and was the wrong gate; §7 records the differential gate that replaces it
-and the reasoning for it. The lane earned its keep immediately by finding
+and the reasoning for it. That gate is keyed on `(name, failure mode)` pairs,
+not on the length of the list — the version that shipped counted names, and
+five `Failed` → `SEGFAULT` transitions prove counting names is too weak. The
+lane earned its keep immediately by finding
 [#960](https://github.com/mudler/vllm.cpp/issues/960) — an FP8 refusal on `main`
-that became a silent portable-CPU fallback and a segfault, invisible on GB10.
+that became a silent portable-CPU fallback and a segfault, invisible on GB10 —
+and it earned it again on 2026-08-19, when the same three tests came back as
+`Failed` rather than `SEGFAULT` and a name-counting gate would have seen
+nothing.
 
 **Next dispatchable: W1 — `dots3_note` config + registry**, with the six §4
 traps RED-first, and owing the §8.1 heading restructure in the same change as

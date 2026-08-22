@@ -261,6 +261,13 @@ thread count they actually got beside the count that was asked for.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.
+- A KV-cache block size that is not a multiple of 16 is refused while the
+  engine SELECTS an attention backend, with `No valid attention backend for
+  device type ...` naming each candidate and `block_size not supported`. On
+  ROCm this refusal used to arrive later and read `Block size must be a
+  multiple of 16.`, because `ROCM_ATTN` advertised block sizes its cache
+  allocation then rejected. Every device now refuses at the same point with the
+  same message.
 - On ROCm, decode-shaped GEMMs (batch of 4 or fewer, bf16) run on a split-K
   skinny-GEMM kernel rather than the tiled BLAS path. Set `VT_ROCM_SKINNY=0`
   to restore the BLAS path when you want to compare the two.

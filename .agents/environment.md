@@ -1102,7 +1102,8 @@ environment:
     about.
 
     **The gate is `(name, failure mode)` PAIRS. A row regresses on Thor when it
-    adds a NAME or CHANGES a recorded MODE.** Counting names is provably too
+    adds a NAME, or when it changes a recorded MODE FOR THE WORSE.** Counting
+    names is provably too
     weak, and this baseline's own history is the proof: between `5a0ffe9e3` and
     `2daa3287f` five tests went `Failed` → `SEGFAULT` with no name change, and
     the list lengthened by one only because the same upstream change also shipped
@@ -1113,6 +1114,21 @@ environment:
     beside every failure. Recorded as
     [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110
     counterpart of [#907](https://github.com/mudler/vllm.cpp/issues/907).
+
+    **Direction matters, and an earlier draft of this gate left it out.** Two
+    kinds of movement are IMPROVEMENTS and must not be scored as regressions.
+    A name LEAVING the list is one. A mode getting BETTER is the other, and it
+    is not hypothetical: this lane's own 2026-08-19 run saw three of them, the
+    `qwen3_5_gdn_spec_routing` family going `SEGFAULT` → `Failed`. As first
+    worded — "adds a name or changes a mode" — the gate would have told the
+    author of that fix they had regressed the box three times.
+
+    Rank the modes, worst first: **`SEGFAULT` / `Subprocess aborted` / `Timeout`
+    worse than `Failed`, and `Failed` worse than absent.** A crash becoming a
+    clean assertion failure is progress, because a crash takes the rest of its
+    binary's cases with it — `test_capi` reports `61 skipped` behind its SIGSEGV.
+    Only movement DOWN that ranking, or a new name, is a regression. Record every
+    move in either direction; score only the bad ones.
 
     **The table is keyed on NAME, never on the `ctest` ordinal.** Ordinals move
     whenever a test file is added, and they moved between every pair of runs this

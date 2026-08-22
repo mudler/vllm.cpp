@@ -521,7 +521,11 @@ dispatchable in order, under the constraints that answer imposes.
   a host whose arch legitimately lacks features would either block every brick
   forever or invite someone to weaken a test to pass. **The gate that actually
   binds is therefore differential, over `(name, failure mode)` PAIRS: a row
-  regresses on Thor when it adds a name OR changes a recorded mode.** The list
+  regresses on Thor when it adds a name, or changes a recorded mode FOR THE
+  WORSE — `SEGFAULT` is worse than `Failed`, `Failed` is worse than absent, and a
+  crash becoming a clean assertion failure is progress rather than a regression.
+  This lane's own run saw three such improvements, so the direction is not a
+  hypothetical refinement.** The list
   itself, with a mode and a first-failing assertion per test, is
   [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110 counterpart
   of [#907](https://github.com/mudler/vllm.cpp/issues/907).

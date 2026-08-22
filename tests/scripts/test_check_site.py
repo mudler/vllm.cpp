@@ -125,11 +125,20 @@ class SiteGuardTests(unittest.TestCase):
         self.assertIn("does not exist", result.stderr)
 
     def test_rendered_benchmark_index_links_resolve_to_emitted_pages(self) -> None:
+        # #1722: resolve the renderer BEFORE running it. `subprocess.run` raises
+        # FileNotFoundError on a host without the binary rather than returning a
+        # returncode the assertion below could report, so an absent Hugo lands as
+        # an ERROR and reds the whole suite. The `agent-record` runner installs
+        # no Hugo, so that red rode on `main` and on every branch cut from it.
+        # Same rule as #1661: skip, do not error, when the tool is absent.
+        hugo = shutil.which("hugo")
+        if hugo is None:
+            self.skipTest("hugo is not on PATH")
         public = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, public, ignore_errors=True)
         result = subprocess.run(
             [
-                "hugo",
+                hugo,
                 "--minify",
                 "-s",
                 str(ROOT / "website"),

@@ -26717,3 +26717,58 @@ keyed on the source SHA so a resumed run does not re-spend the 18-minute compile
 and runs the **naive arm first**. The previous order took the cheap arm first and
 lost the box before the expensive one, which is how a two-arm measurement became
 a one-arm one.
+
+## MUSIC3-DEPTH-THOR-PAIR-2 — CORRECTION: which of that pair's two preconditions is load-bearing (2026-08-22, [#1516](https://github.com/mudler/vllm.cpp/issues/1516), row `BENCH-AB-ARMS-CONTROL`)
+
+**The figures above are NOT withdrawn and are not restated.** This corrects one
+inference drawn beside them: `MUSIC3-DEPTH-THOR-PAIR-2` reads its
+`ARMS_DIFFER=yes` on two `minimax-music3-gen` hashes as the precondition the
+entry exists to insist on, and that leg proves nothing.
+
+`minimax-music3-gen` is a **72 744-byte client** of `libvllm_shared.so`
+([`examples/CMakeLists.txt:425-426`](../examples/CMakeLists.txt),
+[`CMakeLists.txt:2633`](../CMakeLists.txt)), every line of the change under test
+lives in the library, and no `CMAKE_SKIP_BUILD_RPATH` is set anywhere in this
+tree. CMake therefore writes the build-tree RPATH into the client and two build
+directories hash apart whatever the source says. Both arms of that pair were
+72 744 bytes to the byte.
+
+Reproduced on a minimal CMake project of the same shape — one `SHARED` library
+carrying the change, one thin client linking it:
+
+```text
+two BYTE-IDENTICAL source trees, two build dirs
+  16016 bytes  d4ead254e9b3461d91ffc96807de171aa5bfe888f1893981862b48833fe488ac  bld-old/abdemo-client
+  16016 bytes  7a791ed2bac9790b6b01121234ad48346f798e21e872e74f056639f71426b11f  bld-new/abdemo-client
+  RUNPATH [.../bld-old] vs RUNPATH [.../bld-new]   <- the whole difference
+  ar.depth_forward calls=808  on BOTH arms
+
+then the library change is made for real (frames*8 -> frames*4)
+  7a791ed2bac9790b6b01121234ad48346f798e21e872e74f056639f71426b11f  bld-new/abdemo-client
+  ar.depth_forward calls=404
+```
+
+The client comes back **byte-for-byte the hash it already had**. Its hash is a
+function of the build directory, not of the code under test.
+
+**What IS load-bearing for `MUSIC3-DEPTH-THOR-PAIR-2`: the call counts.**
+`ar.depth_forward` moves 1414 -> 808 and `ar.depth_projection` 1414 -> 707 in
+that entry's own table. A pair that could not have contained the change cannot
+move a call count, which is the same tell that voided
+`MUSIC3-DEPTH-THOR-PAIR-1`, read in the other direction. The
+`STAGE_SECONDS`/`SRC_BYTES`/`DST_BYTES` staging assertion is unaffected.
+
+**Hashing the library instead is not the general repair.** It is stable across
+two BUILD directories and differs across two SOURCE directories, because
+`VT_CHECK` ([`include/vt/dtype.h:11-17`](../include/vt/dtype.h)) embeds
+`__FILE__` and nothing sets `-ffile-prefix-map`; separate clones are the shape
+the corrected-pair recipe mandates. `CMAKE_SKIP_BUILD_RPATH` is worse: it makes
+the client insensitive in both directions, so a correct pair would fire FATAL.
+
+**What to use instead:** `scripts/ab-arms-differ.py`, which keeps the equal-hash
+FATAL, reports whether an artifact embeds its own build or source root, and takes
+its verdict from a control that must move. Prefer a same-binary A/B
+(`VT_OP_PROVIDER_DISABLE`) where the seam allows one. Method in
+[`benchmarking.md`](benchmarking.md) §Two arms have to BE two arms; the row's
+reasoning and both rejected repairs in
+[`specs/ab-arms-control.md`](specs/ab-arms-control.md).

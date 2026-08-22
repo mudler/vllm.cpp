@@ -128,6 +128,51 @@ scale-invariant and hide an order-of-magnitude mismatch completely. If the
 change between the readings is provably inert (a byte-identical refactor),
 suspect the measurement, not the code.
 
+## Two arms have to BE two arms
+
+A pair that measured one artifact twice already produced a "no speedup" result in
+this tree and was nearly reported as a refutation
+([#672](https://github.com/mudler/vllm.cpp/issues/672),
+[`specs/minimax-music3.md`](specs/minimax-music3.md) §16.6a). The tell was not
+the times, which were 0.26 % apart and read as noise. It was the **identical call
+count**: equal times are noise, equal counts are identity.
+
+**A different `sha256` does not establish it**
+([#1516](https://github.com/mudler/vllm.cpp/issues/1516)). Measured on a minimal
+project of the shape this repository's examples have — one `SHARED` library
+carrying the change, one thin client linking it — two byte-identical source trees
+built into two build directories give two clients of equal size with different
+hashes, and making the library change for real leaves the client byte-for-byte
+the hash it already had. CMake writes the build-tree RPATH into a client and no
+`CMAKE_SKIP_BUILD_RPATH` is set here. Hashing the library instead only moves the
+problem: it is stable across two build directories and differs across two SOURCE
+directories, because `VT_CHECK` embeds `__FILE__` and nothing sets
+`-ffile-prefix-map`. In the two-clone shape a two-tree A/B is required to use,
+**no artifact hash in this tree is falsifiable**.
+
+**Prefer a same-binary A/B.** Where a runtime switch turns the change off inside
+one binary there is no second artifact and no hash to be vacuous:
+`VT_OP_PROVIDER_DISABLE=<provider>` is that lever for anything behind the op
+provider seam (`src/vt/cuda/cuda_attention_cross.cu:636`), and
+`GetOpProviderStats` says which kernel actually ran.
+
+**Otherwise render the verdict with the control, not the hash.**
+
+```sh
+scripts/ab-arms-differ.py --artifact-a A --artifact-b B \
+    --root-a /tmp/b-old --root-b /tmp/b-new \
+    --control ar.depth_forward 1414 808
+```
+
+Equal hashes stay `FATAL`. A hash-only verdict is refused by name, and an
+artifact that embeds its own build or source root is reported with the offset, so
+the hash leg's worth is stated instead of assumed. At least one control must have
+moved. Two kinds catch different failures and neither subsumes the other: a
+**behavioural** control is a value the arms computed and is the only leg that
+catches a stale binary; a **source** control is the hash of the file the change
+lives in and catches two arms that are one source.
+`scripts/music3-vocoder-conv-ab.sh` is the worked example.
+
 ## Reading a profile
 
 **A whole-run kernel ranking is a trap.** It sums prefill and decode, so the

@@ -200,6 +200,31 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
 }
 
 // ---------------------------------------------------------------------------
+// The DiT's device arm, selected
+// ---------------------------------------------------------------------------
+
+Music3DenoiseDeviceArm Music3SelectDitArm(vt::Queue& queue,
+                                          const MiniMaxMusic3TransformerConfig& config,
+                                          DitWeights& weights, bool release_host,
+                                          Music3DitDeviceWeights* staged) {
+  // See minimax_music3_speech.h for why this is a function and not an `if` in
+  // the engine: the engine's condition is false on every runner CI owns, and
+  // #1131 is what an ungateable selection costs.
+  if (staged == nullptr) {
+    Fail("MiniMax-Music3: the DiT arm selection needs somewhere to stage into");
+  }
+  Music3DenoiseDeviceArm arm;
+  if (queue.device.type == vt::DeviceType::kCPU) return arm;
+  // Timed HERE rather than at the call site so the span exists only when
+  // something is actually staged; a CPU queue returns above and records nothing.
+  profile::Timer stage_timer("acoustic.dit_staging");
+  *staged = StageMusic3DitWeights(queue, config, weights, release_host);
+  arm.queue = &queue;
+  arm.dit = staged;
+  return arm;
+}
+
+// ---------------------------------------------------------------------------
 // The denoise loop
 // ---------------------------------------------------------------------------
 
@@ -655,15 +680,26 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     // 18.5 GB autoregressive half and the 10 GB acoustic half are never
     // co-resident (upstream drives the same split by hand, encoders.py:302-309).
     // Staging follows the weights, not the engine.
+    //
+    // THE PRODUCTION SELECTION, on the SAME switch the depth arm rides:
+    // `--speech-device 1` resolves `queue_` to the platform's device, and a
+    // non-CPU queue takes the device arm. There is no separate flag and no
+    // environment variable, because a capability behind an option nothing turns
+    // on is the shape `.agents/reachability.md` calls dead.
+    //
+    // The rule itself lives in `Music3SelectDitArm` rather than in an `if` here,
+    // and that placement is the #1131 repair this row landed: the condition
+    // `queue_` has to satisfy is false on every runner CI owns, so a branch
+    // written at this line is unreachable from any gate, while the function is
+    // driven by `test_minimax_music3_acoustic` on both sides of it. The CALL
+    // below is what remains ungated, and `music3-dit-arm-reachability.md`
+    // `## Owed` says so rather than leaving it to be found again.
+    //
+    // `release_host` is TRUE: once the DiT is resident, the staged tensors are
+    // the only thing the denoise loop reads.
     Music3DitDeviceWeights staged_dit;
-    Music3DenoiseDeviceArm arm;
-    if (queue_.device.type != vt::DeviceType::kCPU) {
-      profile::Timer stage_timer("acoustic.dit_staging");
-      staged_dit = StageMusic3DitWeights(queue_, config_.transformer, acoustic.dit,
-                                         /*release_host=*/true);
-      arm.queue = &queue_;
-      arm.dit = &staged_dit;
-    }
+    const Music3DenoiseDeviceArm arm = Music3SelectDitArm(
+        queue_, config_.transformer, acoustic.dit, /*release_host=*/true, &staged_dit);
     profile::Mark("acoustic.dit_staged");
     std::vector<std::vector<float>> chunks;
     {

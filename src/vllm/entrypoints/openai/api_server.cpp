@@ -12,6 +12,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -155,6 +156,75 @@ ApiServer::~ApiServer() {
   }
 }
 
+// ── SERVE-REQUEST-LENGTH-GUARD (#1541) ──────────────────────────────────────
+// A REFUSING byte bound at the request boundary, checked BEFORE any
+// tokenization. Its two constraints come from
+// .agents/specs/bpe-quadratic-merge.md `## Defence in depth`:
+//
+//   1. It refuses and NEVER truncates. Shortening a prompt returns model output
+//      for text the caller did not send.
+//   2. It is here, at the boundary, and not in
+//      vllm::v1::InputProcessor::ValidatePromptLen, which needs the token count
+//      the expensive step produces and so cannot run before that step.
+//
+// vLLM HAS NO EQUIVALENT for a prompt BYTE bound, and this is checked rather
+// than assumed at pin 555967922:
+//   - vllm/entrypoints/openai/cli_args.py:292-294 `h11_max_incomplete_event_size`
+//     (default 4 MB, vllm/entrypoints/serve/utils/constants.py:9) is an h11
+//     PARSER limit. Its own docstring says "header or body", but h11 applies it
+//     to the undrained receive buffer only (h11/_connection.py:485, whose
+//     comment reads "431 is Request header fields too large which is pretty
+//     much the only situation where we can get here"), so a body is not bounded
+//     by it.
+//   - vllm/entrypoints/openai/completion/protocol.py:536-553
+//     `validate_prompt_list_length` bounds the COUNT of prompts in a list
+//     (VLLM_MAX_COMPLETION_PROMPTS, default 1024, vllm/envs.py:110), not their
+//     bytes. It is the REGISTER this refusal mirrors: refused during request
+//     validation, ahead of the router, with the limit named in the message.
+//   - vllm/entrypoints/speech_to_text/base/utils.py:38-46
+//     `read_upload_with_limit` IS a refusing byte bound at the request boundary
+//     (VLLM_MAX_AUDIO_CLIP_FILESIZE_MB, default 25, vllm/envs.py:79) -- on the
+//     audio-upload surface, not on a text prompt.
+// So the shape is mirrored and the number is ours, which is why it is derived
+// below rather than picked.
+std::optional<ApiServer::DispatchResult> ApiServer::refuse_oversized_prompt(
+    size_t prompt_bytes) const {
+  if (max_prompt_bytes_ == 0 || prompt_bytes <= max_prompt_bytes_) {
+    return std::nullopt;
+  }
+  return MakeError(
+      400, "BadRequestError",
+      "prompt length " + std::to_string(prompt_bytes) +
+          " bytes exceeds the maximum allowed prompt length of " +
+          std::to_string(max_prompt_bytes_) + " bytes (max_model_len " +
+          std::to_string(max_model_len_) + " x " +
+          std::to_string(max_token_bytes_) +
+          " bytes, the longest token in this tokenizer's vocabulary). A prompt "
+          "this long cannot fit in " +
+          std::to_string(max_model_len_) +
+          " tokens, so it is refused here rather than tokenized first. The "
+          "request is refused, not truncated.");
+}
+
+void ApiServer::set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
+                              int64_t max_model_len) {
+  tokenizer_ = tokenizer;
+  max_model_len_ = max_model_len;
+  // The bound is exactly `max_model_len * MaxTokenBytes()` -- see
+  // max_prompt_bytes(). Unset (0 == unbounded) whenever either factor is
+  // unknown, and clamped rather than wrapped on the overflow a hostile
+  // max_model_len could otherwise produce.
+  max_token_bytes_ = tokenizer != nullptr ? tokenizer->MaxTokenBytes() : 0;
+  if (tokenizer == nullptr || max_model_len <= 0 || max_token_bytes_ == 0) {
+    max_prompt_bytes_ = 0;
+    return;
+  }
+  const size_t len = static_cast<size_t>(max_model_len);
+  max_prompt_bytes_ = len > std::numeric_limits<size_t>::max() / max_token_bytes_
+                          ? std::numeric_limits<size_t>::max()
+                          : len * max_token_bytes_;
+}
+
 ApiServer::DispatchResult ApiServer::handle_completions(
     const std::string& request_body) {
   if (completion_ == nullptr) {
@@ -180,6 +250,15 @@ ApiServer::DispatchResult ApiServer::handle_completions(
   } catch (const std::exception& e) {
     return MakeError(400, "BadRequestError",
                      std::string("Invalid request: ") + e.what());
+  }
+  // SERVE-REQUEST-LENGTH-GUARD (#1541): before check_model and before the
+  // encode inside create_completion. Ahead of the model lookup because the
+  // bound is a property of the REQUEST, which is where vLLM decides its own
+  // analogue too -- validate_prompt_list_length is a pydantic model_validator
+  // (completion/protocol.py:536), so it runs at body validation, ahead of the
+  // router's check_model.
+  if (auto refusal = refuse_oversized_prompt(request.prompt.size())) {
+    return *refusal;
   }
   if (!models_.check_model(request.model)) {
     return MakeError(404, "NotFoundError",
@@ -247,6 +326,20 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
   } catch (const std::exception& e) {
     return MakeError(400, "BadRequestError",
                      std::string("Invalid request: ") + e.what());
+  }
+  // SERVE-REQUEST-LENGTH-GUARD (#1541). The measured quantity is the SUM of the
+  // message texts, because that is what the chat template concatenates into the
+  // one prompt the tokenizer then sees. `content` carries the joined text spans
+  // even when the wire form was a content-part ARRAY (protocol.h ChatMessage),
+  // so inline base64 media -- which lives in `content_parts`, is never
+  // tokenized as text, and would make a raw body-byte bound refuse legitimate
+  // multimodal requests -- is correctly not counted here.
+  size_t prompt_bytes = 0;
+  for (const ChatMessage& m : request.messages) {
+    if (m.content.has_value()) prompt_bytes += m.content->size();
+  }
+  if (auto refusal = refuse_oversized_prompt(prompt_bytes)) {
+    return *refusal;
   }
   if (!models_.check_model(request.model)) {
     return MakeError(404, "NotFoundError",
@@ -770,6 +863,15 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
     add_special_tokens = body.value("add_special_tokens", true);
   }
 
+  // SERVE-REQUEST-LENGTH-GUARD (#1541). THE surface this row exists for:
+  // /tokenize needs no engine and no model, and there is no authentication
+  // anywhere in src/vllm/entrypoints/, so an anonymous caller reaches the
+  // tokenizer here more cheaply than anywhere else. Measured on the FINAL
+  // prompt, after the chat form's template render, because that string is
+  // exactly what the encode below is handed.
+  if (auto refusal = refuse_oversized_prompt(prompt.size())) {
+    return *refusal;
+  }
   std::vector<int32_t> ids = add_special_tokens
                                  ? tokenizer_->EncodeWithSpecialTokens(prompt)
                                  : tokenizer_->Encode(prompt);

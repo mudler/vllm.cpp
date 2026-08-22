@@ -694,7 +694,14 @@ ENGINE_PREFIXES = (
 # llama.cpp as a secondary oracle for semantics only, not a port. `READY`, spec
 # `specs/drafter-chain.md`, issue #1522.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 169
+# 170 since 2026-08-22: +`SERVE-REQUEST-LENGTH-GUARD` (the REFUSING byte bound at
+# the request boundary, #1541). A genuinely-new serving capability rather than a
+# state move: `67823aee2` removed the quadratic term from the BPE merge loop and
+# added no bound, and nothing between an unauthenticated body and the tokenizer
+# limited its size except httplib's 100 MB default. `GATING`, spec
+# `specs/serve-request-length-guard.md`. Bumped for a real new row, never to make
+# a failing state transition pass.
+ENGINE_ROWS = 170
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

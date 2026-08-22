@@ -168,6 +168,7 @@ SUITES=(
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
   test_check_conflict_markers
+  test_ab_arms_differ
 )
 
 failed=()

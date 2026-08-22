@@ -47,6 +47,11 @@
      Assisted-by to the agent and model that did the work. CI validates this
      body with the same checker that walks the landed commit. -->
 
+<!-- NO BARE `---` ANYWHERE IN THIS BODY. Git reads a line of `---` as the patch
+     divider, so everything below the first one leaves the commit message and
+     the trailers under it become unparseable. Write a horizontal rule as `***`
+     or `___` instead (#1563). -->
+
 FOLLOWING_AGENTS_PROTOCOL
 
 Following-Agents-Protocol: true

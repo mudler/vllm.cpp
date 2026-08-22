@@ -363,6 +363,42 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
 
+    def test_dropping_the_request_length_guard_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1541 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and the equality assertion above has to go red, which is
+        # what proves the row was pinned because it ENTERED the population and
+        # not to quiet a gate. Same shape and reason as SERVE-RECIPE-ARGS above.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"SERVE-REQUEST-LENGTH-GUARD"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"SERVE-REQUEST-LENGTH-GUARD"})
+
+    def test_the_request_length_guard_is_credited_for_real_commands(self):
+        # The entry in RUNNABLE_BASELINE is the WHOLE of what this row changed
+        # in the checker, so without a case that reads the SPEC the constant is
+        # the only artifact and the credit is plausible rather than checkable --
+        # which `scripts/check-pr-size.py`'s `governance_checker` contract
+        # refuses, and it refused this row's first commit by name.
+        #
+        # Three things are pinned, not one: the row is in the exact pin, the
+        # audit really verdicts it `runnable`, and its `## Gates` section really
+        # does name commands that can fail rather than a `git diff --stat` that
+        # exits 0 unconditionally.
+        self.assertIn("SERVE-REQUEST-LENGTH-GUARD", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("SERVE-REQUEST-LENGTH-GUARD"), "runnable")
+        spec = (
+            gates.ROOT / ".agents/specs/serve-request-length-guard.md"
+        ).read_text(encoding="utf-8")
+        # Split on the HEADING, not on the string: the spec's `## Now`
+        # section names `## Gates` in prose, and splitting on the bare
+        # text takes that mention instead of the section.
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("ninja -C build", gate_section)
+        self.assertIn("./build/tests/test_openai_api_server", gate_section)
+
     def test_residency_config_is_credited_for_real_commands(self):
         # ENG-RESIDENCY-CONFIG (#1110) is a NEW row arriving at ACTIVE, which is
         # the first state that puts it in GATED_STATES at all, so it joins the

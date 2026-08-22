@@ -577,6 +577,20 @@ void Tokenizer::FinalizeTables() {
     slot = t.text;
     is_added_[static_cast<size_t>(t.id)] = t.special ? 2 : 1;
   }
+
+  // The longest STORED token text, computed once here rather than per request.
+  // Callers use it as an upper bound on the bytes ONE token can account for in
+  // the input, so it has to be an over-estimate and never an under-estimate.
+  // The stored form gives that for free on both families: a byte-level token
+  // stores one mapped CODEPOINT per input byte (1-2 UTF-8 bytes each), and a
+  // SentencePiece token stores its literal text with the metaspace mark (3
+  // bytes) standing in for one space and "<0xNN>" (6 bytes) for one fallback
+  // byte. Measured over the four committed goldens: 256 (Qwen3.6, DeepSeek-V2),
+  // 192 (muse_glimmer), 48 (Mistral).
+  max_token_bytes_ = 0;
+  for (const std::string& text : token_text_) {
+    if (text.size() > max_token_bytes_) max_token_bytes_ = text.size();
+  }
 }
 
 Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
